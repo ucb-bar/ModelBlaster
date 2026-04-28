@@ -519,8 +519,16 @@ def _generate_one_llm_for_algorithm(
                     f.write(candidate)
                 log(f"  [{spec.op}/{algorithm.name}] cached -> {cache_path}")
             return candidate
-        log(f"  [{spec.op}/{algorithm.name}] verify FAIL — "
-            f"{vres.message.splitlines()[0]}")
+        # Print the first line of the diagnostic on the verify-FAIL line,
+        # then dump the full message at low verbosity. Knowing exactly
+        # which compile error / golden mismatch fired is essential when
+        # the LLM keeps regenerating the same broken pattern.
+        first_line = vres.message.splitlines()[0] if vres.message.strip() \
+            else "(no diagnostic returned)"
+        log(f"  [{spec.op}/{algorithm.name}] verify FAIL — {first_line}")
+        if vres.message.strip() and len(vres.message.splitlines()) > 1:
+            for line in vres.message.splitlines()[1:]:
+                log(f"      {line}")
         prev_code = candidate
         prev_diag = vres.message
     log(f"  [{spec.op}/{algorithm.name}] gave up after {max_retries} attempts")

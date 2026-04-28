@@ -82,10 +82,15 @@ def _west_build(
         cmd, cwd=repo_root, env=env, capture_output=True, text=True,
     )
     if proc.returncode != 0:
+        # west/ninja put the actual gcc compile errors on stdout; only the
+        # "FATAL ERROR: ..." final-status line lands on stderr. Show both
+        # so the LLM retry sees the actual diagnostic, not just the
+        # "command exited with status 1" wrapper.
         return False, (
             f"west build failed (rc={proc.returncode}):\n"
             f"  cmd: {' '.join(cmd)}\n"
-            f"  stderr (tail):\n{proc.stderr[-2000:]}"
+            f"  stdout (tail):\n{proc.stdout[-2500:]}\n"
+            f"  stderr (tail):\n{proc.stderr[-1000:]}"
         )
     return True, ""
 
@@ -117,8 +122,13 @@ def build_and_run(
     pristine: bool = False,
     timeout: float = 60.0,
     io_path: Optional[str] = None,
-    atol: float = 1e-4,
-    rtol: float = 1e-3,
+    # Tolerance for the end-to-end model-output check inside this builder.
+    # Match spike_runner._check_one's defaults (atol=1e-5, rtol=1e-4) so a
+    # kernel that PASSes here is also safe to combine in run-level
+    # validation. Looser tolerances here would let FP-reordering drift
+    # accumulate across ops past the run-level gate.
+    atol: float = 1e-5,
+    rtol: float = 1e-4,
     model_name: Optional[str] = None,
 ) -> HarnessResult:
     """Build the harness with `impls` substituted in, run spike, parse profile
