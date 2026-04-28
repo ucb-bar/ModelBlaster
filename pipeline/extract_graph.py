@@ -87,9 +87,11 @@ def _annotate_dispatches(ops: list[dict]) -> list[int]:
 SUPPORTED_MODULES = (
     torch.nn.Linear,
     torch.nn.ReLU,
+    torch.nn.ReLU6,        # MobileNetV2 activations — clamped at 6
     torch.nn.ELU,
     torch.nn.Conv2d,
     torch.nn.MaxPool2d,
+    torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
     torch.nn.Sigmoid,
@@ -854,11 +856,6 @@ def extract(
                 })
 
             elif isinstance(mod, torch.nn.Conv2d):
-                if mod.groups != 1:
-                    raise NotImplementedError(
-                        f"Conv2d with groups={mod.groups} not supported yet "
-                        f"at {node.name}"
-                    )
                 if mod.dilation != (1, 1):
                     raise NotImplementedError(
                         f"Conv2d with dilation={mod.dilation} not supported "
@@ -877,21 +874,50 @@ def extract(
                 KH, KW = _pair(mod.kernel_size)
                 SH, SW = _pair(mod.stride)
                 PH, PW = _pair(mod.padding)
-                ops.append({
-                    "name": str(node.target),
-                    "op": "conv2d",
-                    "inputs": [in_name],
-                    "outputs": [out_name],
-                    "weight": w_key,
-                    "bias": b_key,
-                    "shape": {
-                        "N": N_, "IC": IC, "IH": IH, "IW": IW,
-                        "OC": OC, "OH": OH, "OW": OW,
-                        "KH": KH, "KW": KW,
-                        "SH": SH, "SW": SW,
-                        "PH": PH, "PW": PW,
-                    },
-                })
+                # Depthwise conv: each output channel reads from one input
+                # channel via its own [1, KH, KW] filter. Detected when
+                # groups == in_channels == out_channels. Different memory
+                # access pattern (no IC reduction) so it gets its own kernel.
+                if mod.groups == 1:
+                    ops.append({
+                        "name": str(node.target),
+                        "op": "conv2d",
+                        "inputs": [in_name],
+                        "outputs": [out_name],
+                        "weight": w_key,
+                        "bias": b_key,
+                        "shape": {
+                            "N": N_, "IC": IC, "IH": IH, "IW": IW,
+                            "OC": OC, "OH": OH, "OW": OW,
+                            "KH": KH, "KW": KW,
+                            "SH": SH, "SW": SW,
+                            "PH": PH, "PW": PW,
+                        },
+                    })
+                elif mod.groups == IC and IC == OC:
+                    ops.append({
+                        "name": str(node.target),
+                        "op": "conv2d_dw",
+                        "inputs": [in_name],
+                        "outputs": [out_name],
+                        "weight": w_key,
+                        "bias": b_key,
+                        "shape": {
+                            "N": N_, "C": IC,
+                            "IH": IH, "IW": IW,
+                            "OH": OH, "OW": OW,
+                            "KH": KH, "KW": KW,
+                            "SH": SH, "SW": SW,
+                            "PH": PH, "PW": PW,
+                        },
+                    })
+                else:
+                    raise NotImplementedError(
+                        f"Conv2d with groups={mod.groups} (IC={IC}, OC={OC}) "
+                        f"not supported — only groups=1 (standard) and "
+                        f"groups=IC=OC (depthwise) are wired up at "
+                        f"{node.name}"
+                    )
 
             elif isinstance(mod, torch.nn.MaxPool2d):
                 in_shape = tensors[in_name]["shape"]
@@ -966,6 +992,37 @@ def extract(
                     "shape": {"n": n},
                 })
 
+            elif isinstance(mod, torch.nn.ReLU6):
+                n = int(np.prod(tensors[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "relu6",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+
+            elif isinstance(mod, torch.nn.AdaptiveAvgPool2d):
+                in_shape = tensors[in_name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                out_shape = tensors[out_name]["shape"]
+                # Only output_size=(1,1) is wired up — that's what classifier
+                # heads use. Detect by checking the output spatial dims.
+                out_h = int(out_shape[2]) if len(out_shape) >= 4 else 1
+                out_w = int(out_shape[3]) if len(out_shape) >= 4 else 1
+                if out_h != 1 or out_w != 1:
+                    raise NotImplementedError(
+                        f"AdaptiveAvgPool2d only supports output_size=(1,1) "
+                        f"for now; got {(out_h, out_w)} at {node.name}"
+                    )
+                ops.append({
+                    "name": str(node.target),
+                    "op": "adaptive_avg_pool2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": IH, "IW": IW},
+                })
+
         elif node.op == "call_function":
             out_name = node.name
             tensors[out_name] = _tensor_meta(node)
@@ -1008,6 +1065,38 @@ def extract(
                     "name": node.name,
                     "op": "add",
                     "inputs": [a_name, b_name],
+                    "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+            elif tname == "adaptive_avg_pool2d" or \
+                    target is torch.nn.functional.adaptive_avg_pool2d:
+                # Functional global avg pool. Only output_size=(1,1) is wired.
+                in_name = node.args[0].name
+                in_shape = tensors[in_name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                out_shape = tensors[out_name]["shape"]
+                out_h = int(out_shape[2]) if len(out_shape) >= 4 else 1
+                out_w = int(out_shape[3]) if len(out_shape) >= 4 else 1
+                if out_h != 1 or out_w != 1:
+                    raise NotImplementedError(
+                        f"adaptive_avg_pool2d only supports output_size=(1,1) "
+                        f"for now; got {(out_h, out_w)} at {node.name}"
+                    )
+                ops.append({
+                    "name": node.name,
+                    "op": "adaptive_avg_pool2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": IH, "IW": IW},
+                })
+            elif tname == "relu6" or \
+                    target is torch.nn.functional.relu6:
+                in_name = node.args[0].name
+                n = int(np.prod(tensors[in_name]["shape"]))
+                ops.append({
+                    "name": node.name,
+                    "op": "relu6",
+                    "inputs": [in_name],
                     "outputs": [out_name],
                     "shape": {"n": n},
                 })
@@ -1083,7 +1172,8 @@ def extract(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
-                    choices=["mlp_generic", "mlp_control", "lenet", "dronet"])
+                    choices=["mlp_generic", "mlp_control", "lenet", "dronet",
+                             "mobilenet_v2"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32",
                     help="quantization mode (fp32 only for now; recorded in "
@@ -1103,6 +1193,8 @@ def main() -> None:
         from agents.models import lenet as model_mod
     elif args.model == "dronet":
         from agents.models import dronet as model_mod
+    elif args.model == "mobilenet_v2":
+        from agents.models import mobilenet_v2 as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()

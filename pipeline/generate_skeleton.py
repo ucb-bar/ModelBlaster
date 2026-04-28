@@ -578,6 +578,28 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
             call = f"kernel_sigmoid({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "relu6":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_relu6({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "conv2d_dw":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_conv2d_dw({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PH']}, {sh['PW']})"
+            )
+        elif op["op"] == "adaptive_avg_pool2d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_adaptive_avg_pool2d({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']})"
+            )
         elif op["op"] == "linear_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             w = _weight_name(model_name, op["weight"])
