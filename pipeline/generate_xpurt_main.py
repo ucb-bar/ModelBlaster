@@ -64,13 +64,14 @@ def _emit(networks: list[str], schedule_name: str,
                    identical to `core_kinds`, but separated to allow
                    binaries with backend pools larger than the schedule
                    used (e.g. a future fallback path).
-    `pool_sizes`   is parallel to `core_kinds`; element k is the number of
-                   EXTRA worker threads to put in kind k's pthreadpool
-                   (i.e. one less than the kind's hart count, since the
-                   scheduler worker itself is one of those harts). 0 ⇒
-                   NULL pool, parallel_<op> runs synchronously on the
-                   scheduler worker; intra-op parallelism kicks in only
-                   when a kind has >1 hart."""
+    `pool_sizes`   is parallel to `core_kinds`; element k is the
+                   pthreadpool_create() argument for kind k. pthreadpool's
+                   thread count INCLUDES the calling thread, so a kind
+                   with N harts wants pool_size=N (caller + N-1 helpers =
+                   N total threads matching N harts). 0 ⇒ NULL pool;
+                   parallel_<op> runs synchronously on the scheduler
+                   worker. Intra-op parallelism kicks in only when a kind
+                   has >=2 harts."""
     inc_lines: list[str] = []
     state_decls: list[str] = []
     state_inits: list[str] = []
@@ -582,7 +583,11 @@ def main() -> None:
             harts_per_kind.setdefault(kind, set()).update(harts)
         for k in core_kinds:
             n_harts = len(harts_per_kind.get(k, set()))
-            pool_sizes_map[k] = max(0, n_harts - 1)
+            # pthreadpool_create(N) makes a pool of N threads INCLUDING
+            # the caller, so use n_harts directly. 1-hart kinds still get
+            # 0 (NULL pool, serial fallback) since create(1) just allocates
+            # a degenerate pool with no helpers.
+            pool_sizes_map[k] = n_harts if n_harts >= 2 else 0
     pool_sizes = [pool_sizes_map.get(k, 0) for k in core_kinds]
 
     src = _emit(networks, args.name, args.dispatch_table_header,
