@@ -197,6 +197,150 @@ for (int oh = 0; oh < OH; oh++) {
 }
 ```
 
+### When OW is small, vectorize over OC instead
+
+The OW-vectorized pattern wastes lanes when `OW < vlmax/2` (e.g.
+DroNet's `conv_modules.7` has OW=4 — half the typical vlmax=8 with
+LMUL=1). For these, swap the inner shape: vectorize over **OC** so each
+lane computes a different output channel for the same (n, oh, ow), and
+broadcast the input pixel:
+
+```c
+for (int oc0 = 0; oc0 < OC; oc0 += vl) {
+    vl = __riscv_vsetvl_e32m1(OC - oc0);
+    vfloat32m1_t vacc = bias
+        ? __riscv_vle32_v_f32m1(bias + oc0, vl)
+        : __riscv_vfmv_v_f_f32m1(0.0f, vl);
+    for (int ic = 0; ic < IC; ic++) {
+        for (int kh = 0; kh < KH; kh++) {
+            int ih = oh * SH - PH + kh;
+            if (ih < 0 || ih >= IH) continue;
+            for (int kw = 0; kw < KW; kw++) {
+                int iw = ow * SW - PW + kw;
+                if (iw < 0 || iw >= IW) continue;
+                /* Input is the SAME SCALAR for all lanes (same n, ic,
+                 * ih, iw). Broadcast it. */
+                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                /* Weight differs per lane — `oc + lane`, same (ic, kh,
+                 * kw). Adjacent in OIHW memory: stride =
+                 * IC*KH*KW * sizeof(float). */
+                vfloat32m1_t vweight = __riscv_vlse32_v_f32m1(
+                    weight + ((oc0*IC + ic)*KH + kh)*KW + kw,
+                    (ptrdiff_t)IC*KH*KW * (ptrdiff_t)sizeof(float), vl);
+                vacc = __riscv_vfmacc_vf_f32m1(vacc, v, vweight, vl);
+            }
+        }
+    }
+    /* Strided store across the output_channel dimension. */
+    __riscv_vsse32_v_f32m1(output + ((n*OC + oc0)*OH + oh)*OW + ow,
+                           (ptrdiff_t)OH*OW * (ptrdiff_t)sizeof(float),
+                           vacc, vl);
+}
+```
+
+Pick this pattern whenever `OC ≥ 2*OW` and the OC stride is not so
+big that strided loads dominate. It's an especially good fit for the
+deeper layers of dense CNNs — DroNet's last block is OC=128, OW=4.
+
+### When KH=1 and KW=1, the inner dims collapse — use im2col_gemm
+
+For 1×1 convolutions there's no gather work; im2col_gemm degenerates
+into a `[OC, IC] @ [IC, OH*OW]` matmul which has a clean RVV reduction.
+Even if you keep the direct algorithm for 3×3, switching to
+`im2col_gemm` for 1×1 strides through the inner-product dimension
+contiguously and lets you use higher LMUL.
+
+### LMUL=4 for the OW-vectorized conv2d body
+
+Replace `_f32m1` with `_f32m4` and `vsetvl_e32m1` with `vsetvl_e32m4`
+in the inner accumulator + load. Keep all reduction-style intrinsics
+on `_f32m1` (per the LMUL section above). This typically lifts conv2d
+throughput 1.3-1.6x on Rocket-class cores because the FMA dependency
+chain is amortized over 4× more lanes per `vsetvl`.
+
+### Maxpool / avgpool: stride matters for lane mapping
+
+The OW-vectorized pattern for maxpool2d looks superficially like conv2d's
+inner load, but you can't reuse a contiguous load when `SW > 1`. Adjacent
+OUTPUT columns `ow, ow+1, ow+2, ...` map to input columns
+`ow*SW, (ow+1)*SW, (ow+2)*SW, ...` — i.e. strided by `SW` floats.
+
+**Wrong** (treats input columns as adjacent in memory):
+```c
+int iw = ow * SW + kw;
+vfloat32m1_t v = __riscv_vle32_v_f32m1(  // contiguous load
+    input + ((n*C + c)*IH + ih)*IW + iw, vl);
+```
+
+**Correct** for `SW=1`:
+```c
+int iw = ow + kw;  /* SW=1, no scaling needed */
+vfloat32m1_t v = __riscv_vle32_v_f32m1(
+    input + ((n*C + c)*IH + ih)*IW + iw, vl);
+```
+
+**Correct** for `SW>1`:
+```c
+int iw0 = ow * SW + kw;
+vfloat32m1_t v = __riscv_vlse32_v_f32m1(  /* note: vlse, not vle */
+    input + ((n*C + c)*IH + ih)*IW + iw0,
+    (ptrdiff_t)SW * (ptrdiff_t)sizeof(float),  /* byte stride */
+    vl);
+```
+
+DroNet's first maxpool has `SW=2`, so the contiguous-load form will
+produce subtly wrong outputs (max over the wrong elements per lane —
+typically larger values because adjacent elements often correlate).
+The verify catches this with a small absolute error (~0.04) that
+compounds across the network.
+
+### `vfmacc_vf` vs `vfmacc_vv`: pick by what's the scalar
+
+Both intrinsics fuse-multiply-accumulate, but they take different
+shapes:
+
+- `vfmacc_vv(acc_vec, a_vec, b_vec, vl)` — both operands vectors
+- `vfmacc_vf(acc_vec, a_scalar_float, b_vec, vl)` — first multiplicand scalar
+
+**The order matters.** `vfmacc_vf` is `acc += a_scalar * b_vec`. If you
+have `acc += b_vec * a_scalar` you must call it with `(acc, a_scalar,
+b_vec, vl)`, not `(acc, b_vec, a_scalar, vl)`. Don't pass two vectors
+to `vfmacc_vf` — the compiler error is
+"incompatible type for argument 2 of '__riscv_vfmacc_vf_f32m1'
+expected 'float' but argument is of type 'vfloat32m1_t'".
+
+If both operands are vectors, use `vfmacc_vv`. If one is scalar and
+you can identify which, broadcast the scalar (`vfmv_v_f`) once outside
+the loop and use `vfmacc_vv` — easier than getting the `_vf` argument
+order right.
+
+### Mask types are `vbool*_t`, not `vfloat*_t`
+
+Predicate intrinsics like `vfgt_vf`, `vmflt_vv`, `vmsne_vv` return a
+**bool vector** — `vbool32_t` for `e32m1`, `vbool16_t` for `e32m2`, etc.
+You can't assign that to a `vfloat32m1_t`. The two patterns that
+compile:
+
+```c
+/* Right: take a mask, then merge with it */
+vbool32_t mask = __riscv_vmfgt_vf_f32m1_b32(v, 0.0f, vl);  /* note: vmfgt, not vfgt */
+v = __riscv_vmerge_vvm_f32m1(v_neg_branch, v_pos_branch, mask, vl);
+```
+
+For elu specifically, the merge pattern is:
+
+```c
+size_t vl = __riscv_vsetvl_e32m1(remaining);
+vfloat32m1_t v = __riscv_vle32_v_f32m1(input + i, vl);
+vbool32_t neg_mask = __riscv_vmflt_vf_f32m1_b32(v, 0.0f, vl);
+/* neg branch: alpha * (expf(x) - 1).  expf is scalar — fall back to
+ * a scalar tail loop for the negative lanes; vector path computes
+ * positives in-register. */
+```
+
+**But for elu in practice, the simplest working pattern is plain
+scalar** (see the elu code block in the transcendentals section).
+
 ### CRITICAL antipatterns in OW-vectorized conv
 
 The single most common bug is **vector-loading the weight** when it should
@@ -244,19 +388,48 @@ because there's no reduction overhead.
 
 ## RVV does NOT have transcendental intrinsics
 
-There is **no** `__riscv_vfexp`, `__riscv_vflog`, `__riscv_vfsin`,
-`__riscv_vftanh`, `__riscv_vsigmoid`, etc. The base RVV ISA only has
-arithmetic, comparison, mask, reduction, slide, and bit ops on vectors.
-For transcendentals (exp, log, sin, cos, tanh, sigmoid):
+There is **no** `__riscv_vfexp`, `__riscv_vexpf`, `__riscv_vflog`,
+`__riscv_vfsin`, `__riscv_vftanh`, `__riscv_vsigmoid`, `__riscv_vferf`,
+`__riscv_vfpow` etc. **None of these exist.** Do not call them.
+The base RVV ISA only has arithmetic, comparison, mask, reduction,
+slide, and bit ops on vectors.
 
-- Either fall back to **scalar** evaluation per lane using `expf`/`logf` etc.
-  from `<math.h>` (already in scope), e.g. an unvectorized loop is fine.
-- Or implement a polynomial / minimax approximation manually using only
-  vfmul/vfadd/vfmadd. (Not necessary for first-pass correctness — leave the
-  optimization phase to add this if it's worth it.)
+This applies to **every** op whose math involves a transcendental:
 
-For ops like sigmoid that may run on a tiny tensor (n=1 at a model output
-head), do not bother vectorizing — a plain scalar loop wins.
+| op | math | strategy |
+|---|---|---|
+| sigmoid | `1 / (1 + expf(-x))` | scalar `expf` per lane (`n=1` at model output head — don't bother vectorizing at all) |
+| **elu** | `x >= 0 ? x : alpha * (expf(x) - 1)` | scalar `expf` per lane; vectorize the `x >= 0` short-circuit if you must |
+| tanh | `(expf(x)-expf(-x))/(expf(x)+expf(-x))` | scalar `tanhf` per lane |
+| softmax | `expf(x) / sum(expf(x))` | scalar pass for `expf`, vector pass for the divide |
+
+**The correct shape for an elu kernel on RVV** is plain scalar inside
+a length-`n` loop. There is no win from `vsetvl` here because every
+lane needs a separate `expf` call:
+
+```c
+#include <math.h>
+void kernel_elu(const float *input, float *output, int n, float alpha) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        output[i] = x >= 0.0f ? x : alpha * (expf(x) - 1.0f);
+    }
+}
+```
+
+If you really want vectorization for elu, the **only** correct pattern
+is: copy positives through with vector ops (using `vfmax_vf` against 0
+to clear negatives, etc.) but compute the negative branch's `expf`
+elementwise in scalar. There is no speed gain from the half-vectorized
+approach at typical n; **stick with the plain scalar version above**.
+
+Or implement a polynomial / minimax approximation manually using only
+vfmul/vfadd/vfmadd. (Not necessary for first-pass correctness — leave
+the optimization phase to add this if it's worth it.)
+
+For ops like sigmoid that may run on a tiny tensor (n=1 at a model
+output head), the scalar version is strictly faster — vector overhead
+exceeds the math.
 
 ## Constraints — same as scalar with two additions
 
@@ -274,9 +447,28 @@ head), do not bother vectorizing — a plain scalar loop wins.
 ## Numerical-equivalence reminders
 
 The reference is the **scalar** implementation. Verify tolerances are
-`atol=1e-4, rtol=1e-3`. Reordering FP ops via vector reduction is allowed
-and expected — the reduction order differs between scalar and vector, and
-the result drifts by a few ULPs. That's fine.
+`atol=1e-5, rtol=1e-4` for both per-op and end-to-end model-output
+checks. The two MUST match — a kernel that PASSes per-op verify must
+also be safe in composition with the rest of the model (otherwise
+multi-op drift accumulates past the run-level gate).
+
+Reordering FP ops via vector reduction is allowed and expected within
+the tolerance — what matters is that the reordering is *bounded*:
+
+- **Single horizontal reduction is fine.** `vfredusum_vs` produces
+  results that differ by a few ULPs from the scalar accumulator.
+- **Multiple parallel accumulators (e.g. for unrolling) are fine** as
+  long as you reduce them at the end. The total drift scales with the
+  number of accumulators, not the loop length.
+- **AVOID Kahan-style or pairwise reordering on top of vector
+  reduction.** The drift compounds.
+- **AVOID reading partial sums into FP32 from int8 accumulator paths.**
+  Stay in int32 / float32 throughout the reduction.
+
+If a candidate "wins" by 5–10x and the per-op error is borderline
+(near the 1e-5 atol), assume it will fail at run level and reject it.
+A 2x kernel that passes cleanly is worth more than a 6x kernel that
+breaks composition.
 
 ---
 
