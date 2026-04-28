@@ -129,6 +129,27 @@ def _sigmoid_argtypes():
     return [fp, fp, ctypes.c_int]
 
 
+def _conv2d_dw_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW
+    # OC == IC == groups (depthwise) — folded into a single C param.
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 10
+
+
+def _relu6_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+def _adaptive_avg_pool2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW (output is always [N, C, 1, 1] for now)
+    return [fp, fp] + [ctypes.c_int] * 4
+
+
 def _linear_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -1094,12 +1115,156 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
 )
 
 
+CONV2D_DW = KernelSpec(
+    op="conv2d_dw",
+    signature=(
+        "void kernel_conv2d_dw(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "Depthwise 2D convolution — each input channel has its OWN filter,\n"
+        "applied independently. Equivalent to torch.nn.Conv2d with\n"
+        "groups=in_channels=out_channels=C and dilation=1.\n"
+        "Layout (row-major):\n"
+        "  input:  [N, C, IH, IW]\n"
+        "  weight: [C, 1, KH, KW]   (one KHxKW filter per channel)\n"
+        "  bias:   [C] (may be NULL — treat as zeros)\n"
+        "  output: [N, C, OH, OW]   with\n"
+        "    OH = (IH + 2*PH - KH) / SH + 1\n"
+        "    OW = (IW + 2*PW - KW) / SW + 1\n"
+        "Definition (zero-padding):\n"
+        "  output[n, c, oh, ow] = bias[c] + sum over kh, kw of\n"
+        "    input[n, c, oh*SH - PH + kh, ow*SW - PW + kw]\n"
+        "    * weight[c, 0, kh, kw]\n"
+        "  with input reads outside [0, IH) x [0, IW) treated as 0.\n"
+        "All tensors are float32."
+    ),
+    reference_impl="""\
+void kernel_conv2d_dw(const float *input, const float *weight, const float *bias,
+                      float *output,
+                      int N, int C, int IH, int IW,
+                      int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[c] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = input[((n*C + c)*IH + ih)*IW + iw];
+                            float w = weight[(c*KH + kh)*KW + kw];
+                            acc += v * w;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # MobileNetV2 width_mult=0.25 first-block 3x3 stride=1 dw conv
+        {"N": 1, "C": 8, "IH": 56, "IW": 56,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        # MobileNetV2 stride=2 dw transition
+        {"N": 1, "C": 24, "IH": 56, "IW": 56,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        # Asymmetric / odd shapes
+        {"N": 1, "C": 4, "IH": 7, "IW": 5,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_dw_argtypes,
+)
+
+
+RELU6 = KernelSpec(
+    op="relu6",
+    signature="void kernel_relu6(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise ReLU6 on a contiguous float32 buffer:\n"
+        "  output[i] = min(max(0.0f, input[i]), 6.0f)  for i in [0, n)\n"
+        "It must be safe for `input` and `output` to alias."
+    ),
+    reference_impl="""\
+void kernel_relu6(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        if (v < 0.0f) v = 0.0f;
+        if (v > 6.0f) v = 6.0f;
+        output[i] = v;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 1024},
+    ],
+    argtypes_factory=_relu6_argtypes,
+)
+
+
+ADAPTIVE_AVG_POOL2D = KernelSpec(
+    op="adaptive_avg_pool2d",
+    signature=(
+        "void kernel_adaptive_avg_pool2d(const float *input, float *output, "
+        "int N, int C, int IH, int IW)"
+    ),
+    semantics=(
+        "Global average pooling — collapses [N, C, IH, IW] to [N, C, 1, 1]\n"
+        "by averaging over each channel's HxW plane. Matches\n"
+        "torch.nn.AdaptiveAvgPool2d(output_size=1).\n"
+        "Definition:\n"
+        "  output[n, c, 0, 0] = (1 / (IH*IW)) * sum over ih, iw of\n"
+        "    input[n, c, ih, iw]\n"
+        "All tensors are float32. (Generic AdaptiveAvgPool2d to non-1x1\n"
+        "outputs would partition the spatial dims into output-sized chunks;\n"
+        "we only support 1x1 outputs since that's what classifiers use.)"
+    ),
+    reference_impl="""\
+void kernel_adaptive_avg_pool2d(const float *input, float *output,
+                                int N, int C, int IH, int IW) {
+    int n_per_chan = IH * IW;
+    float inv = 1.0f / (float)n_per_chan;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            const float *src = input + ((n*C + c) * IH) * IW;
+            float acc = 0.0f;
+            for (int i = 0; i < n_per_chan; i++) {
+                acc += src[i];
+            }
+            output[n*C + c] = acc * inv;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 7, "IW": 7},
+        {"N": 1, "C": 320, "IH": 7, "IW": 7},
+        {"N": 1, "C": 4, "IH": 1, "IW": 1},
+    ],
+    argtypes_factory=_adaptive_avg_pool2d_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "relu": RELU,
+    "relu6": RELU6,
     "elu": ELU,
     "conv2d": CONV2D,
+    "conv2d_dw": CONV2D_DW,
     "maxpool2d": MAXPOOL2D,
+    "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
     "sigmoid": SIGMOID,

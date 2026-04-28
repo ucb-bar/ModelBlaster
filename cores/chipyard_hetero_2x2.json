@@ -1,0 +1,23 @@
+{
+  "system": "chipyard-rocket+rvv-2x2-clusters",
+  "description": "Two clusters of two harts each: rocket (scalar) on harts 0-1, rvv on harts 2-3. Each cluster is a single registry core with two harts; XPU-RT treats it as one machine but the runtime uses both harts (1 scheduler worker + 1 pthreadpool helper) for intra-op fanout.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rocket_cluster",
+      "kind": "scalar",
+      "isa": "rv64imafdc",
+      "harts": [0, 1],
+      "description": "Two scalar harts treated as a single cluster.",
+      "capabilities": ["linear", "conv2d", "relu", "elu", "add", "maxpool2d", "batchnorm2d", "sigmoid"]
+    },
+    {
+      "name": "rvv_cluster",
+      "kind": "rvv",
+      "isa": "rv64gcv",
+      "harts": [2, 3],
+      "description": "Two RVV harts treated as a single cluster.",
+      "capabilities": ["linear", "conv2d", "relu", "elu", "add", "maxpool2d", "batchnorm2d", "sigmoid"]
+    }
+  ]
+}

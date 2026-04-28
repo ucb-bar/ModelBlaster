@@ -43,10 +43,18 @@ CACHE_DIR="${EXAMPLE_DIR}/${QUANT}/cache/${TARGET}"
 mkdir -p "${GEN_DIR}" "${BUILD_DIR%/*}" "${CACHE_DIR}"
 
 echo "[1/5] extract_graph (quant=${QUANT}) -> ${IR_DIR}"
-python -m agents.pipeline.extract_graph \
-    --model "${MODEL_NAME}" \
-    --out-dir "${IR_DIR}" \
-    --quant "${QUANT}"
+# Skip the PyTorch extract pass when the IR is already on disk. Useful
+# when (a) the active env lacks the model's PyTorch deps (set up the IR
+# in a different env first), or (b) iterating on later stages without
+# re-running tracing. Set FORCE_EXTRACT=1 to override.
+if [[ -f "${IR_DIR}/graph.json" && -f "${IR_DIR}/weights.npz" && -f "${IR_DIR}/io.npz" && "${FORCE_EXTRACT:-0}" != "1" ]]; then
+    echo "  (skipped — IR present at ${IR_DIR}; set FORCE_EXTRACT=1 to re-run)"
+else
+    python -m agents.pipeline.extract_graph \
+        --model "${MODEL_NAME}" \
+        --out-dir "${IR_DIR}" \
+        --quant "${QUANT}"
+fi
 
 echo "[2/5] generate_skeleton -> ${GEN_DIR}"
 python -m agents.pipeline.generate_skeleton \
