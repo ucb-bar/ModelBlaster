@@ -197,50 +197,91 @@ for (int oh = 0; oh < OH; oh++) {
 }
 ```
 
-### When OW is small, vectorize over OC instead
+### Preferred direct conv2d pattern: vectorize over OC, broadcast input
 
-The OW-vectorized pattern wastes lanes when `OW < vlmax/2` (e.g.
-DroNet's `conv_modules.7` has OW=4 — half the typical vlmax=8 with
-LMUL=1). For these, swap the inner shape: vectorize over **OC** so each
-lane computes a different output channel for the same (n, oh, ow), and
-broadcast the input pixel:
+This is the XNNPACK f32-gemm/f32-igemm pattern (SiFive 2024). It avoids
+the boundary-mask gymnastics that plague OW-vectorization with padded
+strided convs. Use this pattern as the default for `kernel_conv2d` on
+RVV unless OW is provably much larger than OC and PH=PW=0:
 
 ```c
-for (int oc0 = 0; oc0 < OC; oc0 += vl) {
-    vl = __riscv_vsetvl_e32m1(OC - oc0);
-    vfloat32m1_t vacc = bias
-        ? __riscv_vle32_v_f32m1(bias + oc0, vl)
-        : __riscv_vfmv_v_f_f32m1(0.0f, vl);
-    for (int ic = 0; ic < IC; ic++) {
-        for (int kh = 0; kh < KH; kh++) {
-            int ih = oh * SH - PH + kh;
-            if (ih < 0 || ih >= IH) continue;
-            for (int kw = 0; kw < KW; kw++) {
-                int iw = ow * SW - PW + kw;
-                if (iw < 0 || iw >= IW) continue;
-                /* Input is the SAME SCALAR for all lanes (same n, ic,
-                 * ih, iw). Broadcast it. */
-                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
-                /* Weight differs per lane — `oc + lane`, same (ic, kh,
-                 * kw). Adjacent in OIHW memory: stride =
-                 * IC*KH*KW * sizeof(float). */
-                vfloat32m1_t vweight = __riscv_vlse32_v_f32m1(
-                    weight + ((oc0*IC + ic)*KH + kh)*KW + kw,
-                    (ptrdiff_t)IC*KH*KW * (ptrdiff_t)sizeof(float), vl);
-                vacc = __riscv_vfmacc_vf_f32m1(vacc, v, vweight, vl);
+int OH = (IH + 2*PH - KH) / SH + 1;
+int OW = (IW + 2*PW - KW) / SW + 1;
+const ptrdiff_t oc_stride_bytes =
+    (ptrdiff_t)IC * (ptrdiff_t)KH * (ptrdiff_t)KW * (ptrdiff_t)sizeof(float);
+const ptrdiff_t out_oc_stride_bytes =
+    (ptrdiff_t)OH * (ptrdiff_t)OW * (ptrdiff_t)sizeof(float);
+
+for (int n = 0; n < N; n++) {
+    for (int oh = 0; oh < OH; oh++) {
+        for (int ow = 0; ow < OW; ow++) {
+            int oc = 0;
+            while (oc < OC) {
+                size_t vl = __riscv_vsetvl_e32m4((size_t)(OC - oc));
+
+                /* Init from bias (contiguous along OC). */
+                vfloat32m4_t vacc = bias
+                    ? __riscv_vle32_v_f32m4(bias + oc, vl)
+                    : __riscv_vfmv_v_f_f32m4(0.0f, vl);
+
+                /* Padding/stride bounds checks happen ONCE per (kh, kw),
+                 * not per lane. Each lane shares the same input scalar. */
+                for (int ic = 0; ic < IC; ic++) {
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                            const float *w_ptr =
+                                weight + ((oc*IC + ic)*KH + kh)*KW + kw;
+                            /* Strided load: vl OC entries, each spaced
+                             * IC*KH*KW floats apart in OIHW. */
+                            vfloat32m4_t vw = __riscv_vlse32_v_f32m4(
+                                w_ptr, oc_stride_bytes, vl);
+                            /* Broadcast input scalar, multiply-add. */
+                            vacc = __riscv_vfmacc_vf_f32m4(vacc, v, vw, vl);
+                        }
+                    }
+                }
+
+                /* Strided store: NCHW means OC dim has stride OH*OW. */
+                __riscv_vsse32_v_f32m4(
+                    output + ((n*OC + oc)*OH + oh)*OW + ow,
+                    out_oc_stride_bytes, vacc, vl);
+                oc += (int)vl;
             }
         }
     }
-    /* Strided store across the output_channel dimension. */
-    __riscv_vsse32_v_f32m1(output + ((n*OC + oc0)*OH + oh)*OW + ow,
-                           (ptrdiff_t)OH*OW * (ptrdiff_t)sizeof(float),
-                           vacc, vl);
 }
 ```
 
-Pick this pattern whenever `OC ≥ 2*OW` and the OC stride is not so
-big that strided loads dominate. It's an especially good fit for the
-deeper layers of dense CNNs — DroNet's last block is OC=128, OW=4.
+Why this is the right default:
+- **Input bounds checks are scalar, evaluated once per (oh, ow, kh, kw).**
+  No per-lane masking, no fall-back scalar path. The OW-vectorized
+  approach has at minimum 4 distinct boundary cases per kw step
+  (left padding, right padding, ih out of range, iw out of range);
+  this one has 2 (ih bounds, iw bounds), both scalar.
+- **Loads are uniform.** Input is a single scalar broadcast via
+  `vfmacc_vf`. Weight is a strided load with constant stride. Output
+  is a strided store. No gather, no scatter, no mask register usage.
+- **LMUL=4 amortizes vsetvl overhead.** Reductions never appear, so
+  the m1-vs-m4 reduction pitfalls don't apply.
+- **Numerically identical to scalar reference.** Each lane runs an
+  independent (ic, kh, kw) FMA chain; lane k computes
+  `output[n, oc+k, oh, ow]` exactly. No cross-lane reduction; the
+  rounding error is ULP-bounded per output element.
+
+Antipatterns to avoid:
+- `__riscv_vfmacc_vv` with two vectors when one is "the input scalar
+  for all lanes". The right intrinsic is `vfmacc_vf` taking a `float`
+  scalar.
+- Building a mask for input bounds and using `vfmacc_vv` with a masked
+  load. The scalar-bounds-check + skip-if-OOB pattern above is simpler
+  AND faster.
+- Letting the inner two loops re-evaluate `oh*SH - PH + kh`. Hoist
+  `ih` and `iw` to scalar pre-checks before any vector work.
 
 ### When KH=1 and KW=1, the inner dims collapse — use im2col_gemm
 
@@ -249,14 +290,6 @@ into a `[OC, IC] @ [IC, OH*OW]` matmul which has a clean RVV reduction.
 Even if you keep the direct algorithm for 3×3, switching to
 `im2col_gemm` for 1×1 strides through the inner-product dimension
 contiguously and lets you use higher LMUL.
-
-### LMUL=4 for the OW-vectorized conv2d body
-
-Replace `_f32m1` with `_f32m4` and `vsetvl_e32m1` with `vsetvl_e32m4`
-in the inner accumulator + load. Keep all reduction-style intrinsics
-on `_f32m1` (per the LMUL section above). This typically lifts conv2d
-throughput 1.3-1.6x on Rocket-class cores because the FMA dependency
-chain is amortized over 4× more lanes per `vsetvl`.
 
 ### Maxpool / avgpool: stride matters for lane mapping
 
