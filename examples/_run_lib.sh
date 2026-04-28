@@ -107,7 +107,32 @@ for a in ${SPIKE_ARGS}; do
     # Use --spike-arg=<...> form so argparse accepts values starting with --.
     SPIKE_FLAGS+=("--spike-arg=${a}")
 done
+
+# Optional IREE-shape per-dispatch profile (PROFILE_OUT_ROOT env). The
+# single-model case treats the run as a 1-hart "topo_0" trace by default
+# — overrideable via PROFILE_CORES.
+PROFILE_FLAGS=()
+if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
+    if [[ -z "${PROFILE_BACKEND:-}" ]]; then
+        case "${TARGET}" in
+            rvv) PROFILE_BACKEND="RVV" ;;
+            *)   PROFILE_BACKEND="${TARGET}" ;;
+        esac
+    fi
+    PROFILE_FLAGS+=(
+        "--profile-out-root=${PROFILE_OUT_ROOT}"
+        "--profile-source=${PROFILE_SOURCE:-spike}"
+        "--profile-backend=${PROFILE_BACKEND}"
+        "--profile-cores=${PROFILE_CORES:-0}"
+        "--profile-clock-mhz=${PROFILE_CLOCK_MHZ:-1000.0}"
+    )
+    if [[ -n "${PROFILE_CPU:-}" ]]; then
+        PROFILE_FLAGS+=("--profile-cpu=${PROFILE_CPU}")
+    fi
+fi
+
 python -m agents.validation.spike_runner \
     --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
     --io "${IR_DIR}/io.npz" \
-    "${SPIKE_FLAGS[@]}"
+    "${SPIKE_FLAGS[@]}" \
+    "${PROFILE_FLAGS[@]}"

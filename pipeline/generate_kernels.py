@@ -230,11 +230,40 @@ Produce a faster equivalent. Output the function definition only, in one
 # File emit
 # ---------------------------------------------------------------------------
 
-def emit_kernels_h(specs: list[KernelSpec], out_dir: str) -> None:
+def _kernel_mangled_name(op: str, model_name: Optional[str]) -> str:
+    """Mangled kernel function name. Cache files stay unmangled (`kernel_op`)
+    so they're reusable across models; mangling happens at emit time so two
+    models' kernels.c can link side-by-side without collisions."""
+    if model_name is None:
+        return f"kernel_{op}"
+    # _c_ident is in generate_skeleton; import lazily to avoid a hard dep loop.
+    from agents.pipeline.generate_skeleton import _c_ident
+    return f"kernel_{op}_{_c_ident(model_name)}"
+
+
+def _mangle_kernel_in_text(text: str, op: str, model_name: Optional[str]) -> str:
+    """Rename every `kernel_<op>` token to `kernel_<op>_<mid>` in `text`.
+
+    Conservative: matches the bare identifier `kernel_<op>` followed by either
+    `(` (call/definition site) or whitespace/`;`/`,` (declaration). Doesn't
+    touch identifiers that just have `kernel_<op>` as a prefix
+    (e.g. `kernel_linear_s8` is unchanged when op=`linear`).
+    """
+    if model_name is None:
+        return text
+    import re
+    new_name = _kernel_mangled_name(op, model_name)
+    pattern = re.compile(rf"\bkernel_{re.escape(op)}\b")
+    return pattern.sub(new_name, text)
+
+
+def emit_kernels_h(specs: list[KernelSpec], out_dir: str,
+                   model_name: Optional[str] = None) -> None:
     lines = [HEADER, "#pragma once", "", '#ifdef __cplusplus',
              'extern "C" {', "#endif", ""]
     for spec in specs:
-        lines.append(f"{spec.signature};")
+        sig = _mangle_kernel_in_text(spec.signature, spec.op, model_name)
+        lines.append(f"{sig};")
     lines += ["", "#ifdef __cplusplus", "}", "#endif", ""]
     with open(os.path.join(out_dir, "kernels.h"), "w") as f:
         f.write("\n".join(lines))
@@ -246,6 +275,7 @@ _BASE_KERNEL_INCLUDES = ("<stddef.h>", "<float.h>", "<stdint.h>", "<math.h>")
 def emit_kernels_c(
     impls: dict[str, str], source_label: str, out_dir: str,
     backend: Optional[Backend] = None,
+    model_name: Optional[str] = None,
 ) -> None:
     parts = [HEADER, f"/* source: {source_label} */"]
     # Universal headers (FLT_MAX/INT64_MAX/size_t are kernel-friendly and free).
@@ -257,7 +287,8 @@ def emit_kernels_c(
             parts.append(f"#include {inc}")
     parts += ['#include "kernels.h"', ""]
     for op in sorted(impls):
-        parts.append(impls[op].rstrip())
+        body = _mangle_kernel_in_text(impls[op], op, model_name)
+        parts.append(body.rstrip())
         parts.append("")
     with open(os.path.join(out_dir, "kernels.c"), "w") as f:
         f.write("\n".join(parts))
@@ -514,9 +545,12 @@ def generate_one_llm(
     io_path: Optional[str],
     cache_dir: Optional[str] = None,
     algorithm_filter: Optional[set[str]] = None,
-) -> Optional[str]:
+) -> Optional[tuple[str, str]]:
     """Try each algorithm in spec.algorithms in order. First one that
-    produces a passing kernel wins. `algorithm_filter` (if set) restricts
+    produces a passing kernel wins. Returns ``(code, algorithm_name)`` so
+    callers can track which algorithm was selected (e.g. to write the
+    optimized variant back to the right cache file).
+    `algorithm_filter` (if set) restricts
     to a subset of algorithm names — but if NO algorithms on this spec
     match the filter (e.g. user asked for 'im2col_gemm' but `linear` only
     has 'direct'), fall back to the spec's full algorithm list rather than
@@ -554,7 +588,7 @@ def generate_one_llm(
         )
         if code is not None:
             log(f"  [{spec.op}] using algorithm '{algorithm.name}'")
-            return code
+            return code, algorithm.name
     log(f"  [{spec.op}] all {len(candidates)} algorithms exhausted")
     return None
 
@@ -752,6 +786,10 @@ def generate(
 
     log = lambda msg: print(msg, flush=True)
     impls: dict[str, str] = {}
+    # Per-op tracking of which algorithm was selected during baseline gen.
+    # Used by the optimize loop to write the optimized kernel back to the
+    # right cache file (same key the baseline read from).
+    chosen_algo: dict[str, str] = {}
 
     needs_harness_paths = (
         target.verify_method == VERIFY_SPIKE_HARNESS
@@ -780,12 +818,12 @@ def generate(
         for spec in specs:
             impls[spec.op] = spec.reference_impl
         # First pass: write reference + emit so the harness can build at all.
-        emit_kernels_h(specs, out_dir)
-        emit_kernels_c(impls, "seed", out_dir, backend=target)
+        emit_kernels_h(specs, out_dir, model_name=ir["name"])
+        emit_kernels_c(impls, "seed", out_dir, backend=target, model_name=ir["name"])
         for spec in specs:
             shapes = collect_shapes(ir, spec.op, spec)
             log(f"  [{spec.op}] verify shapes={shapes}")
-            code = generate_one_llm(
+            result = generate_one_llm(
                 spec, shapes, client, target, correctness_system,
                 max_retries, log,
                 impls=impls, specs=specs,
@@ -794,17 +832,19 @@ def generate(
                 cache_dir=cache_dir,
                 algorithm_filter=algorithm_filter,
             )
-            if code is None:
+            if result is None:
                 raise SystemExit(
                     f"failed to generate kernel for op '{spec.op}' "
                     f"after {max_retries} attempts"
                 )
+            code, chosen = result
             impls[spec.op] = code
+            chosen_algo[spec.op] = chosen
     else:
         raise SystemExit(f"unknown --backend: {backend_name}")
 
-    emit_kernels_h(specs, out_dir)
-    emit_kernels_c(impls, backend_name, out_dir, backend=target)
+    emit_kernels_h(specs, out_dir, model_name=ir["name"])
+    emit_kernels_c(impls, backend_name, out_dir, backend=target, model_name=ir["name"])
     print(f"wrote {os.path.join(out_dir, 'kernels.h')}")
     print(f"wrote {os.path.join(out_dir, 'kernels.c')}  "
           f"(source={backend_name} target={target.name})")
@@ -871,9 +911,23 @@ def generate(
             "improvement_pct": (baseline_op - best_cycles) / baseline_op * 100.0,
             "history": history,
         }
+        # Persist the optimized kernel back to the same cache slot the
+        # baseline read from so a subsequent OPTIMIZE=0 sweep finds the
+        # already-improved code on cache HIT and reuses it. Only overwrite
+        # when we actually found an improvement — preserves the
+        # "baseline LLM" cached file otherwise.
+        if cache_dir and best_cycles < baseline_op and spec.op in chosen_algo:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(
+                cache_dir,
+                f"{target.name}_{spec.op}_{chosen_algo[spec.op]}.c",
+            )
+            with open(cache_path, "w") as f:
+                f.write(best_code)
+            log(f"  [{spec.op}] cached optimized -> {cache_path}")
 
-    emit_kernels_h(specs, out_dir)
-    emit_kernels_c(impls, f"{backend_name}-optimized", out_dir, backend=target)
+    emit_kernels_h(specs, out_dir, model_name=ir["name"])
+    emit_kernels_c(impls, f"{backend_name}-optimized", out_dir, backend=target, model_name=ir["name"])
     print(f"\nwrote {os.path.join(out_dir, 'kernels.c')}  "
           f"(source={backend_name}-optimized target={target.name})")
 

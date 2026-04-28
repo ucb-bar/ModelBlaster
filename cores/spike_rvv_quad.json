@@ -1,0 +1,18 @@
+{
+  "system": "spike-rvv-quad",
+  "description": "Spike with rv64gcv (V extension) — same 4 harts as the rocket-quad system but with RVV capabilities. AGENTS_BACKEND=rvv.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rvv0",
+      "kind": "rvv",
+      "isa": "rv64gcv_zicntr",
+      "harts": [0],
+      "capabilities": ["linear", "conv2d", "relu", "elu", "add", "maxpool2d", "batchnorm2d", "sigmoid",
+                        "linear_s8", "conv2d_s8", "relu_s8", "add_s8", "maxpool2d_s8", "batchnorm2d_s8", "sigmoid_s8"]
+    },
+    {"name": "rvv1", "kind": "rvv", "isa": "rv64gcv_zicntr", "harts": [1], "capabilities_ref": "rvv0"},
+    {"name": "rvv2", "kind": "rvv", "isa": "rv64gcv_zicntr", "harts": [2], "capabilities_ref": "rvv0"},
+    {"name": "rvv3", "kind": "rvv", "isa": "rv64gcv_zicntr", "harts": [3], "capabilities_ref": "rvv0"}
+  ]
+}

@@ -50,11 +50,12 @@ def _emit_kernels_files(
     specs: list[KernelSpec],
     backend: Backend,
     out_dir: str,
+    model_name: Optional[str] = None,
 ) -> None:
     # Local import to avoid a cycle with generate_kernels.
     from agents.pipeline.generate_kernels import emit_kernels_h, emit_kernels_c
-    emit_kernels_h(specs, out_dir)
-    emit_kernels_c(impls, "optimize", out_dir, backend=backend)
+    emit_kernels_h(specs, out_dir, model_name=model_name)
+    emit_kernels_c(impls, "optimize", out_dir, backend=backend, model_name=model_name)
 
 
 def _west_build(
@@ -118,6 +119,7 @@ def build_and_run(
     io_path: Optional[str] = None,
     atol: float = 1e-4,
     rtol: float = 1e-3,
+    model_name: Optional[str] = None,
 ) -> HarnessResult:
     """Build the harness with `impls` substituted in, run spike, parse profile
     and (optionally) compare model output to a PyTorch golden.
@@ -126,7 +128,22 @@ def build_and_run(
     against a provided golden does NOT raise — it's recorded on the returned
     HarnessResult so callers can decide what to do (verify-fail vs warn).
     """
-    _emit_kernels_files(impls, specs, backend, model_dir)
+    # If model_name not passed, peek at graph.json in the parent IR dir.
+    # Path layout: model_dir = <ir_dir>/<target>/, graph.json lives at
+    # <ir_dir>/graph.json. This makes every existing call site automatically
+    # get the right kernel-mangling without having to thread model_name
+    # explicitly.
+    if model_name is None:
+        for candidate in (
+            os.path.join(model_dir, "graph.json"),
+            os.path.join(os.path.dirname(model_dir), "graph.json"),
+        ):
+            if os.path.exists(candidate):
+                import json as _json
+                with open(candidate) as _f:
+                    model_name = _json.load(_f).get("name")
+                break
+    _emit_kernels_files(impls, specs, backend, model_dir, model_name=model_name)
 
     ok, err = _west_build(
         harness_dir=harness_dir, build_dir=build_dir, model_dir=model_dir,

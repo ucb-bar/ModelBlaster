@@ -20,7 +20,10 @@ int main(void)
     printf("agents harness: model=%s in=%d out=%d\n",
            MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE);
 
-    run_model(model_test_input, model_output);
+    /* Single-model harness has no thread pool — pass NULL. The
+     * generated kernel bodies ignore it; only the parallel-for wrapper
+     * (when emitted) will dispatch onto a real pthreadpool_t. */
+    run_model(model_test_input, model_output, NULL);
 
     /* Print output tensor in a stable, machine-parseable format.
      * Use %.9g to round-trip f32 cleanly. */
@@ -34,13 +37,19 @@ int main(void)
     int n_records = 0;
     const model_op_record_t *records = model_profile_records(&n_records);
     printf("=== AGENTS_PROFILE_BEGIN ===\n");
-    printf("name,op,shape,cycles\n");
+    printf("dispatch_id,name,op,shape,cycles\n");
     for (int i = 0; i < n_records; i++) {
-        printf("%s,%s,%s,%lu\n",
+        printf("%d,%s,%s,%s,%lu\n",
+               records[i].dispatch_id,
                records[i].name, records[i].op, records[i].shape,
                records[i].cycles);
     }
     printf("=== AGENTS_PROFILE_END ===\n");
+
+    /* Wall-clock total for the run (k_cycle_get_64 / mtime delta). The
+     * spike_runner reads this line to get the cross-hart-correct number;
+     * per-op rdcycle deltas above are used for relative comparisons. */
+    printf("=== AGENTS_WALL_CYCLES === %lu\n", model_wall_cycles());
 
     sys_reboot(SYS_REBOOT_COLD);
     return 0;
