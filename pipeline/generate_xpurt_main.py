@@ -141,6 +141,19 @@ def _emit(networks: list[str], schedule_name: str,
             f'        if (e_->network[0] == \'{net[0]}\' && '
             f'strcmp(e_->network, "{net}") == 0) {{\n'
             f"            if (e_->dispatch_id == 0) {{\n"
+            f"                /* Honor the schedule's per-instance start\n"
+            f"                 * time. Only enforced on dispatch_id==0 so\n"
+            f"                 * subsequent ops still chain via data deps;\n"
+            f"                 * this models periodic tasks waking at\n"
+            f"                 * deterministic boundaries (e.g. mlp_control\n"
+            f"                 * every 5 ms) without forcing the rest of\n"
+            f"                 * the instance into lockstep. */\n"
+            f"                uint64_t target_start = run_t0 +\n"
+            f"                    (uint64_t)((double)e_->start_time_ms *\n"
+            f"                               (double)XPURT_CYCLES_PER_MS);\n"
+            f"                while ((uint64_t)k_cycle_get_64() < target_start) {{\n"
+            f"                    k_yield();\n"
+            f"                }}\n"
             + "\n".join(
                 f"                model_{mid}_reset_profile_{bs}();"
                 for bs in backends
@@ -303,6 +316,14 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
  * scheduler worker. */
 static pthreadpool_t pools[{n_kinds}] = {{ NULL }};
 
+/* mtime baseline for the run, captured immediately before workers spawn.
+ * Used by the worker to (a) honor per-instance schedule start times for
+ * periodic networks (gating dispatch_id==0 entries until run_t0 +
+ * start_time_ms), and (b) tag actual_start/end_cycles in the trace. */
+static uint64_t run_t0;
+#define XPURT_CYCLES_PER_MS \\
+    ((uint64_t)(CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC / 1000))
+
 #ifdef AGENTS_XPURT_TRACE
 /* Per-entry execution trace. Each slot is touched by exactly one
  * worker (the one whose core_kind matches) so concurrent writes never
@@ -316,7 +337,6 @@ struct xpurt_trace_slot {{
     int      worker_kind_idx;   /* index into kinds[] */
 }};
 static struct xpurt_trace_slot xpurt_trace[{upper}_N_ENTRIES];
-static uint64_t run_t0;
 #endif
 
 struct xpurt_worker_arg {{
@@ -409,12 +429,10 @@ int main(void)
     union xpurt_attr_slot {{ pthread_attr_t a; char _pad[64]; }};
     static union xpurt_attr_slot attrs[{n_kinds}];
 
-#ifdef AGENTS_XPURT_TRACE
-    /* All trace timestamps are recorded as offsets from this baseline,
-     * captured just before the workers spawn. Avoids large absolute
-     * cycle counts in the printed output. */
+    /* Run baseline for both the trace and the periodic-start-time gate.
+     * Captured just before workers spawn so it's the moment "t=0" of the
+     * schedule maps to. */
     run_t0 = (uint64_t)k_cycle_get_64();
-#endif
 
     for (int k = 0; k < {n_kinds}; k++) {{
         int pinned_hart = -1;
