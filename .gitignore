@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Per-model artifacts (IR, weights, generated C, build trees) live under
+# examples/<model>/<quant>/{generated,build}/ and are reproduced by run.sh.
+# Cache (PASSing kernels) is intentionally NOT ignored so successful
+# kernels persist across machines and get reused.
+examples/*/*/generated/
+examples/*/*/build/
+
+# Legacy paths from before the <quant> refactor (kept ignored so stale
+# files don't show up in git status).
+examples/*/generated/
+examples/*/build/
+examples/*/cache/
