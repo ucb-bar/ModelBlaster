@@ -104,6 +104,12 @@ WEST_CMAKE_ARGS=(
 if [[ -n "${KERNEL_CFLAGS}" ]]; then
     WEST_CMAKE_ARGS+=("-DAGENTS_KERNEL_CFLAGS=${KERNEL_CFLAGS}")
 fi
+# Optional execution-trace capture (XPURT_TRACE={0,1}, default 0). When
+# enabled, the binary emits an AGENTS_XPURT_TRACE_BEGIN..END CSV block
+# that agents/scripts/plot_xpurt_trace.py renders into a Gantt chart.
+if [[ "${XPURT_TRACE:-0}" == "1" ]]; then
+    WEST_CMAKE_ARGS+=("-DAGENTS_XPURT_TRACE=ON")
+fi
 west build -p -b spike_riscv64 agents/harness_xpurt \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}"

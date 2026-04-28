@@ -81,7 +81,16 @@ def _emit(networks: list[str], schedule_name: str,
             f"                model_{mid}_reset_profile();\n"
             f"                wall_start_{mid} = (unsigned long)k_cycle_get_64();\n"
             f"            }}\n"
+            f"#ifdef AGENTS_XPURT_TRACE\n"
+            f"            xpurt_trace[i_].start_cycles =\n"
+            f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
+            f"#endif\n"
             f"            MODEL_{umid}_DISPATCH_FNS[e_->dispatch_id](&s_{mid});\n"
+            f"#ifdef AGENTS_XPURT_TRACE\n"
+            f"            xpurt_trace[i_].end_cycles =\n"
+            f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
+            f"            xpurt_trace[i_].worker_kind_idx = my_kind_idx;\n"
+            f"#endif\n"
             f"            if (e_->dispatch_id == MODEL_{umid}_OP_COUNT - 1) {{\n"
             f"                model_{mid}_set_wall_cycles(\n"
             f"                    (unsigned long)k_cycle_get_64() - wall_start_{mid});\n"
@@ -185,15 +194,35 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
  * walker already routes by (network, dispatch_id). */
 {chr(10).join("static " + d.lstrip() for d in wall_decls).rstrip()}
 
+#ifdef AGENTS_XPURT_TRACE
+/* Per-entry execution trace. Each slot is touched by exactly one
+ * worker (the one whose core_kind matches) so concurrent writes never
+ * overlap. Cycles are mtime-based (k_cycle_get_64) and offset against
+ * `run_t0`, captured immediately before the first worker starts. The
+ * host parser reconstructs (start_ms, end_ms) by dividing by the
+ * configured clock_mhz. */
+struct xpurt_trace_slot {{
+    uint64_t start_cycles;
+    uint64_t end_cycles;
+    int      worker_kind_idx;   /* index into kinds[] */
+}};
+static struct xpurt_trace_slot xpurt_trace[{upper}_N_ENTRIES];
+static uint64_t run_t0;
+#endif
+
 struct xpurt_worker_arg {{
     const char *kind;
     int hart;
+    int kind_idx;
 }};
 
 static void *xpurt_worker(void *arg)
 {{
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
     const char *my_kind = wa->kind;
+#ifdef AGENTS_XPURT_TRACE
+    int my_kind_idx = wa->kind_idx;
+#endif
     /* Take entries that match `my_kind`, in start_time order. */
     for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
         const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
@@ -254,6 +283,13 @@ int main(void)
     static pthread_t tids[{n_kinds}];
     static pthread_attr_t attrs[{n_kinds}];
 
+#ifdef AGENTS_XPURT_TRACE
+    /* All trace timestamps are recorded as offsets from this baseline,
+     * captured just before the workers spawn. Avoids large absolute
+     * cycle counts in the printed output. */
+    run_t0 = (uint64_t)k_cycle_get_64();
+#endif
+
     for (int k = 0; k < {n_kinds}; k++) {{
         int pinned_hart = -1;
         for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
@@ -264,6 +300,7 @@ int main(void)
         }}
         wargs[k].kind = kinds[k];
         wargs[k].hart = pinned_hart;
+        wargs[k].kind_idx = k;
 
         pthread_attr_init(&attrs[k]);
 #ifdef CONFIG_POSIX_THREADS_AFFINITY
@@ -289,6 +326,28 @@ int main(void)
         pthread_join(tids[k], NULL);
         pthread_attr_destroy(&attrs[k]);
     }}
+
+#ifdef AGENTS_XPURT_TRACE
+    /* Trace dump — one CSV row per scheduled entry, with the actual
+     * mtime-cycle window the worker ran and the kind-index of the
+     * worker that owned it. The host parser cross-references this
+     * with the dispatch table for op/network/predicted-time fields. */
+    printf("=== AGENTS_XPURT_TRACE_BEGIN ===\\n");
+    printf("entry_id,network,instance,dispatch_id,op,name,core_kind,hart,"
+           "predicted_start_ms,predicted_duration_ms,worker_kind_idx,"
+           "actual_start_cycles,actual_end_cycles\\n");
+    for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+        const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
+        printf("%d,%s,%d,%d,%s,%s,%s,%d,%.6f,%.6f,%d,%llu,%llu\\n",
+               e->entry_id, e->network, e->instance, e->dispatch_id,
+               e->op, e->name, e->core_kind, e->hart,
+               (double)e->start_time_ms, (double)e->duration_ms,
+               xpurt_trace[i].worker_kind_idx,
+               (unsigned long long)xpurt_trace[i].start_cycles,
+               (unsigned long long)xpurt_trace[i].end_cycles);
+    }}
+    printf("=== AGENTS_XPURT_TRACE_END ===\\n");
+#endif
 
 {chr(10).join(print_blocks)}
 

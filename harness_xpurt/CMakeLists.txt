@@ -107,6 +107,14 @@ if(DEFINED AGENTS_POOL_THREADS)
     target_compile_definitions(app PRIVATE AGENTS_POOL_THREADS=${AGENTS_POOL_THREADS})
 endif()
 
+# Optional trace collection. When ON, the schedule-driven main records
+# each entry's actual start/end mtime-cycle window and prints a
+# parseable CSV block at the end. Host-side `agents/scripts/plot_xpurt_trace.py`
+# reads it and renders a Gantt timeline overlaying XPU-RT's prediction.
+if(AGENTS_XPURT_TRACE)
+    target_compile_definitions(app PRIVATE AGENTS_XPURT_TRACE=1)
+endif()
+
 foreach(_name ${MODEL_NAMES})
     target_link_libraries(app PRIVATE agents_${_name}_objs)
 endforeach()
