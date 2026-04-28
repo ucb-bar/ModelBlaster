@@ -6,23 +6,32 @@ table). Together they close the round trip:
     XPU-RT schedule.json
         -> ingest_xpurt_schedule  -> <name>_dispatch_table.{h,c}
         -> generate_xpurt_main    -> <name>_main.c
-        -> west build (harness_multi)
+        -> west build (harness_xpurt)
         -> spike
+
+The harness can link multiple HW backends per model (e.g. scalar + rvv);
+the walker dispatches each entry to whichever backend's per-model table
+matches the entry's ``core_kind``. Symbol disambiguation is handled at
+compile time by ``backend_rename.py`` — each model's externally-visible
+symbols (kernels, dispatch table, profile API) get suffixed with
+``_<bs>`` per backend.
 
 The generated main:
 
     1. Creates one pthreadpool (worker count from AGENTS_POOL_THREADS).
-    2. Resets every involved model's profile counter.
-    3. Walks the dispatch table in start_time order, dispatching each
-       entry to ``MODEL_<NET>_DISPATCH_FNS[entry.dispatch_id]`` with the
-       per-network state it shares across all instances of that network.
-    4. Prints each network's final output between the standard
+    2. Resets every involved (model, backend) profile counter.
+    3. Spawns one Zephyr worker per distinct core_kind, pinned to the
+       schedule-assigned hart. Each worker walks the table in start-time
+       order taking entries that match its kind.
+    4. Inside the dispatch branch, selects the right per-backend table
+       by ``core_kind`` and invokes ``MODEL_<UMID>_DISPATCH_FNS_<BS>``.
+    5. Tracks per-network wall cycles inline (no model-side setter
+       call — keeps wall-cycle bookkeeping backend-agnostic).
+    6. Prints each network's final output between the standard
        ``=== AGENTS_OUTPUT_BEGIN [<network>] ===`` markers so
-       ``spike_runner`` can verify against the golden.
-
-The current walker is sequential (`for i in 0..n-1`). Cross-dispatch
-parallelism + k_sem-driven sync (task #61) is left as the natural
-follow-up — once that lands, only the loop body changes here.
+       ``spike_runner`` can verify against the golden, plus per-backend
+       profile records so post-run analysis can split per-op cycles by
+       backend.
 """
 
 from __future__ import annotations
@@ -41,17 +50,32 @@ def _c_ident(name: str) -> str:
 
 def _emit(networks: list[str], schedule_name: str,
           dispatch_table_header: str,
-          core_kinds: list[str]) -> str:
+          core_kinds: list[str],
+          backends: list[str],
+          pool_sizes: list[int]) -> str:
     """Render xpurt_main.c source.
 
-    `networks` is the ordered list of distinct network names the
-    schedule references; `core_kinds` is the ordered list of distinct
-    core_kind values (one Zephyr worker thread per kind, pinned via
-    pthread_attr_setaffinity_np)."""
+    `networks`     is the ordered list of distinct network names the
+                   schedule references.
+    `core_kinds`   is the ordered list of distinct core_kind values; one
+                   scheduler-worker thread is spawned per kind.
+    `backends`     is the ordered list of HW backends compiled into the
+                   binary (== the per-model OBJECT-lib suffixes). Usually
+                   identical to `core_kinds`, but separated to allow
+                   binaries with backend pools larger than the schedule
+                   used (e.g. a future fallback path).
+    `pool_sizes`   is parallel to `core_kinds`; element k is the number of
+                   EXTRA worker threads to put in kind k's pthreadpool
+                   (i.e. one less than the kind's hart count, since the
+                   scheduler worker itself is one of those harts). 0 ⇒
+                   NULL pool, parallel_<op> runs synchronously on the
+                   scheduler worker; intra-op parallelism kicks in only
+                   when a kind has >1 hart."""
     inc_lines: list[str] = []
     state_decls: list[str] = []
     state_inits: list[str] = []
     output_buf_decls: list[str] = []
+    forward_decls: list[str] = []
     reset_calls: list[str] = []
     branch_lines: list[str] = []
     print_blocks: list[str] = []
@@ -67,91 +91,164 @@ def _emit(networks: list[str], schedule_name: str,
             f"static model_{mid}_output_t out_{mid}[MODEL_{umid}_OUTPUT_SIZE];"
         )
         state_decls.append(f"    model_{mid}_state_t s_{mid};")
-        wall_decls.append(f"    unsigned long wall_start_{mid} = 0;")
+        # Inline wall-cycle tracking so we don't have to pick which
+        # backend's setter to call when an instance is split across
+        # backends.
+        wall_decls.append(f"static uint64_t wall_start_{mid} = 0;")
+        wall_decls.append(f"static uint64_t wall_cycles_{mid} = 0;")
         state_inits.append(
             f"    s_{mid}.input  = model_{mid}_test_input;\n"
             f"    s_{mid}.output = out_{mid};\n"
-            f"    s_{mid}.pool   = (void *)pool;"
+            f"    s_{mid}.pool   = NULL;  /* set per-dispatch by the worker */"
         )
-        reset_calls.append(f"    model_{mid}_reset_profile();")
+
+        # For each (model, backend) pair: forward-declare the per-backend
+        # dispatch table + the renamed profile API. The harness CMakeLists
+        # builds a separate OBJECT lib per pair so these live in distinct
+        # TUs and link without collision.
+        for bs in backends:
+            BS = bs.upper()
+            forward_decls.append(
+                f"extern const model_{mid}_dispatch_fn "
+                f"MODEL_{umid}_DISPATCH_FNS_{BS}[MODEL_{umid}_OP_COUNT];"
+            )
+            forward_decls.append(
+                f"void model_{mid}_reset_profile_{bs}(void);")
+            forward_decls.append(
+                f"const model_{mid}_op_record_t *"
+                f"model_{mid}_profile_records_{bs}(int *count);")
+            reset_calls.append(f"    model_{mid}_reset_profile_{bs}();")
+
+        # Build the per-backend selection inside the dispatch branch.
+        # core_kind comes from the schedule and matches the backend tag.
+        bs_select_lines: list[str] = []
+        for i, bs in enumerate(backends):
+            BS = bs.upper()
+            kw = "if" if i == 0 else "else if"
+            bs_select_lines.append(
+                f'            {kw} (strcmp(e_->core_kind, "{bs}") == 0) {{\n'
+                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid});\n"
+                f"            }}"
+            )
+        bs_select_lines.append(
+            "            else {\n"
+            f'                printf("xpurt: WARN unknown core_kind \'%s\' for {net}\\n", e_->core_kind);\n'
+            "            }"
+        )
+        bs_select = "\n".join(bs_select_lines)
+
         branch_lines.append(
             f'        if (e_->network[0] == \'{net[0]}\' && '
             f'strcmp(e_->network, "{net}") == 0) {{\n'
             f"            if (e_->dispatch_id == 0) {{\n"
-            f"                model_{mid}_reset_profile();\n"
-            f"                wall_start_{mid} = (unsigned long)k_cycle_get_64();\n"
+            + "\n".join(
+                f"                model_{mid}_reset_profile_{bs}();"
+                for bs in backends
+            ) + "\n"
+            f"                wall_start_{mid} = (uint64_t)k_cycle_get_64();\n"
             f"            }}\n"
+            f"            /* Steer intra-op parallel_<op> wrappers at this\n"
+            f"             * kind's pool only. NULL when the kind has 1\n"
+            f"             * hart — parallel_<op> then runs synchronously\n"
+            f"             * on this scheduler worker. Safe to write here\n"
+            f"             * because each network's state is touched by at\n"
+            f"             * most one worker at a time (data deps serialize\n"
+            f"             * dispatches within a network). */\n"
+            f"            s_{mid}.pool = (void *)pools[my_kind_idx];\n"
             f"#ifdef AGENTS_XPURT_TRACE\n"
             f"            xpurt_trace[i_].start_cycles =\n"
             f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
             f"#endif\n"
-            f"            MODEL_{umid}_DISPATCH_FNS[e_->dispatch_id](&s_{mid});\n"
+            f"{bs_select}\n"
             f"#ifdef AGENTS_XPURT_TRACE\n"
             f"            xpurt_trace[i_].end_cycles =\n"
             f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
             f"            xpurt_trace[i_].worker_kind_idx = my_kind_idx;\n"
             f"#endif\n"
             f"            if (e_->dispatch_id == MODEL_{umid}_OP_COUNT - 1) {{\n"
-            f"                model_{mid}_set_wall_cycles(\n"
-            f"                    (unsigned long)k_cycle_get_64() - wall_start_{mid});\n"
+            f"                wall_cycles_{mid} =\n"
+            f"                    (uint64_t)k_cycle_get_64() - wall_start_{mid};\n"
             f"            }}\n"
             f"            k_sem_give(&completion_sems[i_]);\n"
             f"            continue;\n"
             f"        }}"
         )
+
+        # Per-backend profile record dump. Each backend's TU has its own
+        # records array; entries that ran on backend X land in X's array.
+        # We tag rows with the backend so the host can split per-op cost
+        # by backend.
+        per_bs_profile_blocks: list[str] = []
+        for bs in backends:
+            per_bs_profile_blocks.append(f"""\
+        {{
+            int n_records = 0;
+            const model_{mid}_op_record_t *records =
+                model_{mid}_profile_records_{bs}(&n_records);
+            for (int i = 0; i < n_records; i++) {{
+                printf("{bs},%d,%s,%s,%s,%lu\\n",
+                       records[i].dispatch_id,
+                       records[i].name, records[i].op, records[i].shape,
+                       records[i].cycles);
+            }}
+        }}""")
+        per_bs_profile = "\n".join(per_bs_profile_blocks)
+
         print_blocks.append(f"""\
     printf("=== AGENTS_OUTPUT_BEGIN [{net}] ===\\n");
     for (int i = 0; i < MODEL_{umid}_OUTPUT_SIZE; i++) {{
         printf("%.9g\\n", (double)out_{mid}[i]);
     }}
     printf("=== AGENTS_OUTPUT_END [{net}] ===\\n");
-    {{
-        int n_records = 0;
-        const model_{mid}_op_record_t *records =
-            model_{mid}_profile_records(&n_records);
-        printf("=== AGENTS_PROFILE_BEGIN [{net}] ===\\n");
-        printf("dispatch_id,name,op,shape,cycles\\n");
-        for (int i = 0; i < n_records; i++) {{
-            printf("%d,%s,%s,%s,%lu\\n",
-                   records[i].dispatch_id,
-                   records[i].name, records[i].op, records[i].shape,
-                   records[i].cycles);
-        }}
-        printf("=== AGENTS_PROFILE_END [{net}] ===\\n");
-    }}
+    printf("=== AGENTS_PROFILE_BEGIN [{net}] ===\\n");
+    printf("backend,dispatch_id,name,op,shape,cycles\\n");
+{per_bs_profile}
+    printf("=== AGENTS_PROFILE_END [{net}] ===\\n");
     printf("=== AGENTS_WALL_CYCLES [{net}] === %lu\\n",
-           model_{mid}_wall_cycles());""")
+           (unsigned long)wall_cycles_{mid});""")
 
     upper = schedule_name.replace(".", "_").replace("-", "_").upper()
 
-    # Build the per-(core_kind, instance, dispatch_id) dispatch branch.
-    # Same matching predicate as before, just used inside a worker now.
+    # Build the per-(network, instance, dispatch_id) dispatch branch.
     dispatch_branch = "\n".join(branch_lines)
 
     # One Zephyr worker thread per distinct core_kind. Each pins itself
     # to a hart (the entry's .hart) and pulls only entries whose
-    # core_kind matches. Workers wait on per-entry k_sem completions for
-    # data deps + time_dep edges; the master gives at the end.
+    # core_kind matches.
     n_kinds = len(core_kinds)
     kind_strs = ", ".join(f'"{k}"' for k in core_kinds)
+    if len(pool_sizes) != n_kinds:
+        raise SystemExit(
+            f"pool_sizes length ({len(pool_sizes)}) must match core_kinds "
+            f"length ({n_kinds})")
+    pool_size_strs = ", ".join(str(s) for s in pool_sizes)
+
+    # Forward decls go right after the model headers — they reference
+    # types from those headers (model_<mid>_dispatch_fn etc.).
+    forward_decl_block = "\n".join(forward_decls)
 
     return f"""{HEADER}
 /*
  * Schedule-driven multi-network entry point with per-core-kind worker
- * threads. Each worker:
+ * threads and HETEROGENEOUS per-backend dispatch tables. Each worker:
  *   1. Walks the XPU-RT-emitted dispatch table in start_time order,
  *      taking entries whose .core_kind matches its own kind.
  *   2. Before invoking, waits on k_sems posted by the producers of its
  *      .deps[] (intra-job data deps) and .time_dep_entry_id (cross-job
  *      ordering edges).
- *   3. After invoking, gives the entry's k_sem so consumers unblock.
+ *   3. Selects the per-(model, backend) dispatch table by .core_kind
+ *      and invokes the matching kernel. backend_rename.py at compile
+ *      time has suffixed every model's externally-visible symbol with
+ *      _<bs>, so multiple backends per model link cleanly.
+ *   4. After invoking, gives the entry's k_sem so consumers unblock.
  * Workers are pinned to harts via pthread_attr_setaffinity_np (Phase A
  * patch). The xnnpack-style pthreadpool is still here — parallel_<op>
  * wrappers inside dispatched kernels use it for intra-op parallelism.
  *
  * Outputs follow the same multi-line marker protocol as the
  * straight-line multi_main, so spike_runner verifies them against
- * PyTorch goldens unchanged.
+ * PyTorch goldens unchanged. The PROFILE block now has a leading
+ * `backend` column so per-op cycles can be split per backend.
  */
 
 #define AGENTS_DISABLE_UNMANGLED
@@ -167,6 +264,11 @@ def _emit(networks: list[str], schedule_name: str,
 
 {chr(10).join(inc_lines)}
 #include "{dispatch_table_header}"
+
+/* Per-(model, backend) externs — the harness compiles a separate
+ * OBJECT lib per pair, with externally-visible symbols suffixed _<bs>
+ * via -D renames (see agents/pipeline/backend_rename.py). */
+{forward_decl_block}
 
 {chr(10).join(output_buf_decls)}
 
@@ -189,10 +291,17 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
  * Initialized in main() before workers start. */
 {chr(10).join("static " + d.lstrip() for d in state_decls).rstrip()}
 
-/* Per-network wall-clock timer state — written when the first/last
- * dispatch of an instance runs. The kind worker sets these because the
- * walker already routes by (network, dispatch_id). */
-{chr(10).join("static " + d.lstrip() for d in wall_decls).rstrip()}
+/* Per-network wall-clock state (start cycles when the instance begins,
+ * total cycles when the last dispatch completes). Tracked locally so
+ * we don't have to pick a backend's setter when an instance straddles
+ * backends. */
+{chr(10).join(wall_decls)}
+
+/* Per-kind intra-op pthreadpool. Set up in main() before workers spawn,
+ * read by xpurt_worker when stamping s_<mid>.pool. NULL ⇒ kind has only
+ * 1 hart, so parallel_<op> wrappers run synchronously on the calling
+ * scheduler worker. */
+static pthreadpool_t pools[{n_kinds}] = {{ NULL }};
 
 #ifdef AGENTS_XPURT_TRACE
 /* Per-entry execution trace. Each slot is touched by exactly one
@@ -220,9 +329,7 @@ static void *xpurt_worker(void *arg)
 {{
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
     const char *my_kind = wa->kind;
-#ifdef AGENTS_XPURT_TRACE
     int my_kind_idx = wa->kind_idx;
-#endif
     /* Take entries that match `my_kind`, in start_time order. */
     for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
         const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
@@ -252,17 +359,27 @@ int main(void)
     printf("xpurt-runner: schedule={schedule_name} entries=%d kinds=%d on %s\\n",
            {upper}_N_ENTRIES, {n_kinds}, CONFIG_BOARD_TARGET);
 
-#ifndef AGENTS_POOL_THREADS
-#define AGENTS_POOL_THREADS 0
-#endif
-    pthreadpool_t pool = pthreadpool_create(AGENTS_POOL_THREADS);
-    if (pool == NULL) {{
-        printf("FATAL: pthreadpool_create returned NULL\\n");
-        sys_reboot(SYS_REBOOT_COLD);
-        return -1;
+    /* Per-kind pthreadpool sizes. Element k's helper thread count is
+     * (harts_of_kind_k - 1) — one less than the kind's hart count, since
+     * the scheduler-worker thread for that kind is itself one of those
+     * harts. 0 ⇒ NULL pool, parallel_<op> wrappers run synchronously on
+     * the calling scheduler worker. We never oversubscribe a backend's
+     * harts; on real silicon this maps each pool's helper threads onto
+     * the kind's idle harts. */
+    static const int pool_sizes[{n_kinds}] = {{ {pool_size_strs} }};
+    for (int k = 0; k < {n_kinds}; k++) {{
+        if (pool_sizes[k] > 0) {{
+            pools[k] = pthreadpool_create(pool_sizes[k]);
+            if (pools[k] == NULL) {{
+                printf("FATAL: pthreadpool_create kind=%d size=%d failed\\n",
+                       k, pool_sizes[k]);
+                sys_reboot(SYS_REBOOT_COLD);
+                return -1;
+            }}
+        }}
+        printf("pthreadpool[kind=%d]: %u helpers (intra-op)\\n",
+               k, (unsigned)(pools[k] ? pthreadpool_get_threads_count(pools[k]) : 0));
     }}
-    printf("pthreadpool: %u threads (intra-op)\\n",
-           (unsigned)pthreadpool_get_threads_count(pool));
 
 {chr(10).join(state_inits)}
 
@@ -277,11 +394,20 @@ int main(void)
     /* One worker per distinct core_kind. Each pins itself to the first
      * matching entry's hart (good enough — assumes all entries of the
      * same kind share a hart, which is true for our singleton-machine
-     * schedules; multi-hart-per-kind would need a per-hart subdivision). */
+     * schedules; multi-hart-per-kind would need a per-hart subdivision).
+     *
+     * Zephyr quirk: pthread_attr_init() casts the public pthread_attr_t*
+     * to the internal `struct posix_thread_attr*` and zeroes it; with
+     * CONFIG_POSIX_THREADS_AFFINITY the internal struct extends past the
+     * public 16 bytes (cpu_affinity sits at offset 16). Without padding,
+     * pthread_attr_setaffinity_np(&attrs[k+1]) silently corrupts the
+     * adjacent wargs[k]. Pad each slot to 64 bytes so the cast stays in
+     * its lane. */
     static const char *kinds[] = {{ {kind_strs} }};
     static struct xpurt_worker_arg wargs[{n_kinds}];
     static pthread_t tids[{n_kinds}];
-    static pthread_attr_t attrs[{n_kinds}];
+    union xpurt_attr_slot {{ pthread_attr_t a; char _pad[64]; }};
+    static union xpurt_attr_slot attrs[{n_kinds}];
 
 #ifdef AGENTS_XPURT_TRACE
     /* All trace timestamps are recorded as offsets from this baseline,
@@ -302,16 +428,16 @@ int main(void)
         wargs[k].hart = pinned_hart;
         wargs[k].kind_idx = k;
 
-        pthread_attr_init(&attrs[k]);
+        pthread_attr_init(&attrs[k].a);
 #ifdef CONFIG_POSIX_THREADS_AFFINITY
         if (pinned_hart >= 0) {{
             cpu_set_t cs;
             CPU_ZERO(&cs);
             CPU_SET(pinned_hart, &cs);
-            pthread_attr_setaffinity_np(&attrs[k], sizeof(cs), &cs);
+            pthread_attr_setaffinity_np(&attrs[k].a, sizeof(cs), &cs);
         }}
 #endif
-        int rc = pthread_create(&tids[k], &attrs[k], xpurt_worker, &wargs[k]);
+        int rc = pthread_create(&tids[k], &attrs[k].a, xpurt_worker, &wargs[k]);
         if (rc != 0) {{
             printf("FATAL: pthread_create kind=%s rc=%d\\n", kinds[k], rc);
             sys_reboot(SYS_REBOOT_COLD);
@@ -324,7 +450,7 @@ int main(void)
     /* Wait for every worker to drain. */
     for (int k = 0; k < {n_kinds}; k++) {{
         pthread_join(tids[k], NULL);
-        pthread_attr_destroy(&attrs[k]);
+        pthread_attr_destroy(&attrs[k].a);
     }}
 
 #ifdef AGENTS_XPURT_TRACE
@@ -351,7 +477,9 @@ int main(void)
 
 {chr(10).join(print_blocks)}
 
-    pthreadpool_destroy(pool);
+    for (int k = 0; k < {n_kinds}; k++) {{
+        if (pools[k] != NULL) pthreadpool_destroy(pools[k]);
+    }}
     sys_reboot(SYS_REBOOT_COLD);
     return 0;
 }}
@@ -372,9 +500,25 @@ def main() -> None:
                          "(included from xpurt_main.c)")
     ap.add_argument("--core-kinds", default="rvv,scalar",
                     help="comma list of distinct core_kind values the schedule "
-                         "uses — must match the --cpu-p-kind / --cpu-e-kind "
-                         "passed to ingest_xpurt_schedule. One worker thread "
-                         "is spawned per kind. (default: rvv,scalar)")
+                         "uses. One worker thread is spawned per kind. "
+                         "(default: rvv,scalar)")
+    ap.add_argument("--backends", default=None,
+                    help="comma list of HW backends the harness was compiled "
+                         "for (== per-model OBJECT-lib suffixes). The walker "
+                         "forward-declares MODEL_<UMID>_DISPATCH_FNS_<BS> for "
+                         "each backend and dispatches by core_kind. "
+                         "Defaults to --core-kinds.")
+    ap.add_argument("--registry", default=None,
+                    help="path to the cores/*.json registry that drove the "
+                         "schedule. Used to derive each kind's pool size as "
+                         "(harts_of_kind - 1). If both --registry and "
+                         "--pool-sizes are absent, all kinds get pool=0 "
+                         "(NULL) and intra-op parallel_<op> calls run "
+                         "synchronously on the scheduler worker.")
+    ap.add_argument("--pool-sizes", default=None,
+                    help='explicit per-kind pool helper-thread count, '
+                         'e.g. "rvv:0,scalar:0". Overrides --registry. '
+                         "Use 0 for kinds with one hart (NULL pool).")
     args = ap.parse_args()
 
     with open(args.schedule) as f:
@@ -390,12 +534,46 @@ def main() -> None:
     core_kinds = [k.strip() for k in args.core_kinds.split(",") if k.strip()]
     if not core_kinds:
         raise SystemExit("--core-kinds must be a non-empty comma list")
+    if args.backends is None:
+        backends = list(core_kinds)
+    else:
+        backends = [b.strip() for b in args.backends.split(",") if b.strip()]
+        if not backends:
+            raise SystemExit("--backends must be a non-empty comma list")
 
-    src = _emit(networks, args.name, args.dispatch_table_header, core_kinds)
+    # Pool size resolution:
+    #   1. explicit --pool-sizes wins
+    #   2. else --registry: harts_of_kind - 1 per kind
+    #   3. else default 0 per kind (NULL pool, no intra-op fanout)
+    pool_sizes_map: dict[str, int] = {}
+    if args.pool_sizes:
+        for kv in args.pool_sizes.split(","):
+            k, _, v = kv.strip().partition(":")
+            if not k or not v:
+                raise SystemExit(f"--pool-sizes: bad entry '{kv}'")
+            pool_sizes_map[k] = int(v)
+    elif args.registry:
+        with open(args.registry) as f:
+            reg = json.load(f)
+        harts_per_kind: dict[str, set[int]] = {}
+        for c in reg.get("cores", []):
+            kind = c.get("kind")
+            harts = c.get("harts", []) or []
+            if kind is None:
+                continue
+            harts_per_kind.setdefault(kind, set()).update(harts)
+        for k in core_kinds:
+            n_harts = len(harts_per_kind.get(k, set()))
+            pool_sizes_map[k] = max(0, n_harts - 1)
+    pool_sizes = [pool_sizes_map.get(k, 0) for k in core_kinds]
+
+    src = _emit(networks, args.name, args.dispatch_table_header,
+                core_kinds, backends, pool_sizes)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
-    print(f"wrote {args.out}  (networks: {networks} kinds: {core_kinds})")
+    print(f"wrote {args.out}  (networks: {networks} kinds: {core_kinds} "
+          f"backends: {backends} pool_sizes: {pool_sizes})")
 
 
 if __name__ == "__main__":
