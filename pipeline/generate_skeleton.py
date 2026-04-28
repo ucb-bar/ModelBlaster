@@ -105,13 +105,193 @@ def _buf_name(tensor: str) -> str:
     return f"buf_{_c_ident(tensor)}"
 
 
-def emit_weights(weights: dict[str, np.ndarray], out_dir: str) -> None:
+# Ops the skeleton routes through a parallel_for wrapper. Wrappers are
+# emitted as static inlines in model.c with two implementations selected
+# by AGENTS_USE_POOL: dispatch onto pthreadpool when defined; plain
+# sequential call to the mangled kernel otherwise. When a build doesn't
+# need threading (single-model harness), the no-op fallback keeps
+# pthreadpool.h out of model.c so the harness has no POSIX dep.
+_PARALLELIZED_OPS = {"linear", "conv2d"}
+
+
+_LINEAR_WRAPPER = """
+/* ---- linear: split outer N (output features), M==1 only ----------------- */
+typedef struct {{
+    const float *in;
+    const float *w;
+    const float *b;
+    float *out;
+    int M;
+    int K;
+    int N_total;
+    int chunks;
+}} parallel_linear_ctx_t;
+
+static void parallel_linear_fn(void *ctx_, size_t i) {{
+    parallel_linear_ctx_t *c = (parallel_linear_ctx_t *)ctx_;
+    int n_per = (c->N_total + c->chunks - 1) / c->chunks;
+    int n0 = (int)i * n_per;
+    int n1 = n0 + n_per;
+    if (n1 > c->N_total) n1 = c->N_total;
+    if (n0 >= n1) return;
+    kernel_linear_{mid}(c->in,
+                        c->w + (size_t)n0 * (size_t)c->K,
+                        c->b ? c->b + n0 : NULL,
+                        c->out + n0,
+                        c->M, c->K, n1 - n0);
+}}
+
+static inline void parallel_linear(void *pool_,
+                                   const float *in, const float *w,
+                                   const float *b, float *out,
+                                   int M, int K, int N) {{
+#ifdef AGENTS_USE_POOL
+    pthreadpool_t pool = (pthreadpool_t)pool_;
+    if (pool == NULL || M != 1) {{
+        kernel_linear_{mid}(in, w, b, out, M, K, N);
+        return;
+    }}
+    size_t T = pthreadpool_get_threads_count(pool);
+    if (T <= 1 || (size_t)N < T) {{
+        kernel_linear_{mid}(in, w, b, out, M, K, N);
+        return;
+    }}
+    parallel_linear_ctx_t ctx = {{
+        .in = in, .w = w, .b = b, .out = out,
+        .M = M, .K = K, .N_total = N, .chunks = (int)T,
+    }};
+    pthreadpool_parallelize_1d(pool, parallel_linear_fn, &ctx, T, 0);
+#else
+    (void)pool_;
+    kernel_linear_{mid}(in, w, b, out, M, K, N);
+#endif
+}}
+"""
+
+_CONV2D_WRAPPER = """
+/* ---- conv2d: split outer OC (output channels), N==1 only ---------------- */
+typedef struct {{
+    const float *in;
+    const float *w;
+    const float *b;
+    float *out;
+    int N;
+    int IC;
+    int IH;
+    int IW;
+    int OC_total;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int OH;
+    int OW;
+    int chunks;
+}} parallel_conv2d_ctx_t;
+
+static void parallel_conv2d_fn(void *ctx_, size_t i) {{
+    parallel_conv2d_ctx_t *c = (parallel_conv2d_ctx_t *)ctx_;
+    int oc_per = (c->OC_total + c->chunks - 1) / c->chunks;
+    int oc0 = (int)i * oc_per;
+    int oc1 = oc0 + oc_per;
+    if (oc1 > c->OC_total) oc1 = c->OC_total;
+    if (oc0 >= oc1) return;
+    size_t per_filter = (size_t)c->IC * (size_t)c->KH * (size_t)c->KW;
+    size_t per_oc_out = (size_t)c->OH * (size_t)c->OW;
+    kernel_conv2d_{mid}(c->in,
+                        c->w + (size_t)oc0 * per_filter,
+                        c->b ? c->b + oc0 : NULL,
+                        c->out + (size_t)oc0 * per_oc_out,
+                        c->N, c->IC, c->IH, c->IW,
+                        oc1 - oc0, c->KH, c->KW,
+                        c->SH, c->SW, c->PH, c->PW);
+}}
+
+static inline void parallel_conv2d(void *pool_,
+                                   const float *in, const float *w,
+                                   const float *b, float *out,
+                                   int N, int IC, int IH, int IW,
+                                   int OC, int KH, int KW,
+                                   int SH, int SW, int PH, int PW) {{
+#ifdef AGENTS_USE_POOL
+    pthreadpool_t pool = (pthreadpool_t)pool_;
+    if (pool == NULL || N != 1) {{
+        kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
+                            OC, KH, KW, SH, SW, PH, PW);
+        return;
+    }}
+    size_t T = pthreadpool_get_threads_count(pool);
+    if (T <= 1 || (size_t)OC < T) {{
+        kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
+                            OC, KH, KW, SH, SW, PH, PW);
+        return;
+    }}
+    int OH = (IH + 2 * PH - KH) / SH + 1;
+    int OW = (IW + 2 * PW - KW) / SW + 1;
+    parallel_conv2d_ctx_t ctx = {{
+        .in = in, .w = w, .b = b, .out = out,
+        .N = N, .IC = IC, .IH = IH, .IW = IW,
+        .OC_total = OC, .KH = KH, .KW = KW,
+        .SH = SH, .SW = SW, .PH = PH, .PW = PW,
+        .OH = OH, .OW = OW, .chunks = (int)T,
+    }};
+    pthreadpool_parallelize_1d(pool, parallel_conv2d_fn, &ctx, T, 0);
+#else
+    (void)pool_;
+    kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
+                        OC, KH, KW, SH, SW, PH, PW);
+#endif
+}}
+"""
+
+_PARALLEL_WRAPPER_TEMPLATES = {
+    "linear": _LINEAR_WRAPPER,
+    "conv2d": _CONV2D_WRAPPER,
+}
+
+
+def _emit_parallel_wrappers(mid: str, used_ops: set[str]) -> str:
+    """Emit static parallel_for wrappers ONLY for ops the model actually uses.
+    Emitting for every parallelizable op leaks `kernel_<op>_<mid>` references
+    that the kernels.c doesn't define when the model has no such op (e.g.
+    mlp_control has no conv2d → no kernel_conv2d_mlp_control symbol)."""
+    parts = ["\n/* ---------- parallel_for wrappers (Path 2 — skeleton-driven) ---------- */"]
+    parts.append("#ifdef AGENTS_USE_POOL")
+    parts.append("#include <pthreadpool.h>")
+    parts.append("#endif")
+    for op in sorted(_PARALLELIZED_OPS & used_ops):
+        parts.append(_PARALLEL_WRAPPER_TEMPLATES[op].format(mid=mid))
+    return "\n".join(parts)
+
+
+
+
+def _mid(model_name: str) -> str:
+    """Model identifier — c-safe lowercase form used as a prefix on every
+    globally-visible symbol the skeleton emits. Drives symbol-mangling so
+    multiple models can co-exist in one binary."""
+    return _c_ident(model_name)
+
+
+def _umid(model_name: str) -> str:
+    """Uppercase model identifier for #define macros."""
+    return _c_ident(model_name).upper()
+
+
+def _weight_name(model_name: str, weight_key: str) -> str:
+    """Mangled weight-blob symbol name: <model>_<weight_key>."""
+    return f"{_mid(model_name)}_{_c_ident(weight_key)}"
+
+
+def emit_weights(model_name: str, weights: dict[str, np.ndarray], out_dir: str) -> None:
     keys = sorted(weights.keys())
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
                "", "#ifdef __cplusplus", 'extern "C" {', "#endif", ""]
     for k in keys:
-        ident = _c_ident(k)
+        ident = _weight_name(model_name, k)
         c_type, _ = _np_to_c_dtype(weights[k].dtype)
         size = weights[k].size
         h_lines.append(f"extern const {c_type} {ident}[{size}];")
@@ -121,7 +301,7 @@ def emit_weights(weights: dict[str, np.ndarray], out_dir: str) -> None:
 
     c_lines = [HEADER, "#include <stdint.h>", '#include "weights.h"', ""]
     for k in keys:
-        ident = _c_ident(k)
+        ident = _weight_name(model_name, k)
         arr = weights[k]
         c_type, _ = _np_to_c_dtype(arr.dtype)
         c_lines.append(f"const {c_type} {ident}[{arr.size}] = {{")
@@ -150,6 +330,9 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
     tensors = ir["tensors"]
     in_size = _prod(tensors[in_tensor]["shape"])
     in_c_type = _dtype_to_c(tensors[in_tensor]["dtype"])
+    model_name = ir["name"]
+    mid = _mid(model_name)
+    umid = _umid(model_name)
     # All outputs must share a dtype (we concatenate into one output buffer).
     out_dtypes = {tensors[t]["dtype"] for t in out_tensors_list}
     if len(out_dtypes) != 1:
@@ -182,46 +365,121 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
     # Number of ops that actually emit a kernel call (used to size the profile
     # record array).
     op_count = sum(1 for op in ir["ops"] if op["op"] != "view")
+    used_ops = {op["op"] for op in ir["ops"] if op["op"] != "view"}
 
+    # All exported symbols are mangled by model name (model_<mid>_*,
+    # MODEL_<UMID>_*) so multiple models can co-exist in one binary.
+    # Unmangled aliases (model_input_t, run_model, MODEL_NAME, ...) are
+    # provided under #ifndef AGENTS_DISABLE_UNMANGLED for the
+    # single-model harness's convenience. The multi-model harness defines
+    # AGENTS_DISABLE_UNMANGLED before any model.h to prevent collisions.
     h = f"""{HEADER}
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define MODEL_NAME           "{ir["name"]}"
-#define MODEL_INPUT_SIZE     {in_size}
-#define MODEL_OUTPUT_SIZE    {out_size}
-#define MODEL_OP_COUNT       {op_count}
-#define MODEL_QUANT          "{ir.get("quant", "fp32")}"
+/* Mangled name macros (always defined). */
+#define MODEL_{umid}_NAME         "{model_name}"
+#define MODEL_{umid}_INPUT_SIZE   {in_size}
+#define MODEL_{umid}_OUTPUT_SIZE  {out_size}
+#define MODEL_{umid}_OP_COUNT     {op_count}
+#define MODEL_{umid}_QUANT        "{ir.get("quant", "fp32")}"
 
-/* Model I/O scalar types — driven by the IR's per-tensor dtype field. The
- * harness's main.c uses these to declare its output buffer and parse types,
- * so the same main.c builds for fp32 and int8 unchanged. */
-typedef {in_c_type}  model_input_t;
-typedef {out_c_type} model_output_t;
+/* Mangled I/O scalar types. */
+typedef {in_c_type}  model_{mid}_input_t;
+typedef {out_c_type} model_{mid}_output_t;
 
 #ifdef __cplusplus
 extern "C" {{
 #endif
 
-/* Per-kernel profile record. Populated by run_model() — one entry per kernel
- * invocation, in execution order. `cycles` is rdcycle delta. */
+/* Per-kernel profile record. Populated by run_model_{mid}() — one entry per
+ * kernel invocation, in execution order. `cycles` is rdcycle delta
+ * (per-hart mcycle CSR — high-res; cross-hart wall time is reported
+ * separately via model_<mid>_wall_cycles()). */
 typedef struct {{
+    int dispatch_id;    /* IR-assigned dispatch id (matches graph.json) */
     const char *name;   /* node name from IR (e.g. "fc1") */
     const char *op;     /* op kind (e.g. "linear", "linear_s8") */
     const char *shape;  /* shape descriptor, e.g. "M=1;K=16;N=32" */
     unsigned long cycles;
-}} model_op_record_t;
+}} model_{mid}_op_record_t;
 
-void run_model(const model_input_t *input, model_output_t *output);
+/* `pool` is an optional pthreadpool_t (typed as void* here so this
+ * header doesn't pull in pthreadpool.h — single-model harness uses
+ * NULL). Sequential kernel bodies ignore it; the parallel-for wrapper
+ * (emitted by a later pipeline stage) casts and dispatches onto it. */
+void run_model_{mid}(const model_{mid}_input_t *input,
+                     model_{mid}_output_t *output,
+                     void *pool);
+
+/* Per-dispatch state passed to dispatch_<mid>_<id>() invocations.
+ * Lives on the stack of run_model_{mid}() in the straight-line path,
+ * or is owned by the schedule-driven runtime when it walks an XPU-RT
+ * dispatch table. Intermediate buffers are file-static (see model.c)
+ * and outlive any individual dispatch call. */
+typedef struct {{
+    const model_{mid}_input_t *input;
+    model_{mid}_output_t      *output;
+    void                       *pool;
+}} model_{mid}_state_t;
+
+typedef void (*model_{mid}_dispatch_fn)(model_{mid}_state_t *);
+
+/* One invoke fn per dispatch_id, indexed in execution order
+ * (= IR's `dispatches` array order). The schedule-driven runtime uses
+ * this to call individual dispatches out-of-order; the straight-line
+ * run_model_{mid}() walks it from 0..N-1. */
+extern const model_{mid}_dispatch_fn
+    MODEL_{umid}_DISPATCH_FNS[MODEL_{umid}_OP_COUNT];
+
+/* Reset profile counter before invoking dispatches via the table.
+ * run_model_{mid}() does this internally; the schedule-driven runtime
+ * must call it once per inference. */
+void model_{mid}_reset_profile(void);
+
+/* Set the wall-clock delta for the most recent inference. The
+ * schedule-driven runtime measures it externally (since it owns the
+ * outer loop) and reports it via this setter — keeps the
+ * model_{mid}_wall_cycles() reader consistent across both run paths. */
+void model_{mid}_set_wall_cycles(unsigned long c);
 
 /* Returns pointer to the static profile array; *count gets the number of
- * records written by the most recent run_model() call. */
-const model_op_record_t *model_profile_records(int *count);
+ * records written by the most recent run_model_{mid}() call. */
+const model_{mid}_op_record_t *model_{mid}_profile_records(int *count);
+
+/* Wall-clock cycles for the most recent run_model_{mid}() call. Sourced
+ * from k_cycle_get_64() (mtime on RISC-V) — lower resolution than the
+ * per-op rdcycle deltas above, but cross-hart-correct. */
+unsigned long model_{mid}_wall_cycles(void);
 
 #ifdef __cplusplus
 }}
+#endif
+
+/* ---------------------------------------------------------------------- */
+/* Unmangled aliases for single-model use. The multi-model harness should */
+/* `#define AGENTS_DISABLE_UNMANGLED` before including any model.h to     */
+/* avoid name collisions across models.                                   */
+/* ---------------------------------------------------------------------- */
+#ifndef AGENTS_DISABLE_UNMANGLED
+#define MODEL_NAME            MODEL_{umid}_NAME
+#define MODEL_INPUT_SIZE      MODEL_{umid}_INPUT_SIZE
+#define MODEL_OUTPUT_SIZE     MODEL_{umid}_OUTPUT_SIZE
+#define MODEL_OP_COUNT        MODEL_{umid}_OP_COUNT
+#define MODEL_QUANT           MODEL_{umid}_QUANT
+typedef model_{mid}_input_t   model_input_t;
+typedef model_{mid}_output_t  model_output_t;
+typedef model_{mid}_op_record_t model_op_record_t;
+#define run_model             run_model_{mid}
+#define model_profile_records model_{mid}_profile_records
+#define model_wall_cycles     model_{mid}_wall_cycles
+#define model_set_wall_cycles model_{mid}_set_wall_cycles
+#define model_reset_profile   model_{mid}_reset_profile
+#define model_dispatch_fns    MODEL_{umid}_DISPATCH_FNS
+typedef model_{mid}_state_t       model_state_t;
+typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 #endif
 """
     with open(os.path.join(out_dir, "model.h"), "w") as f:
@@ -249,7 +507,9 @@ const model_op_record_t *model_profile_records(int *count);
             return "output" if off == 0 else f"(output + {off})"
         return _buf_name(tensor)
 
-    call_blocks: list[str] = []
+    call_blocks: list[str] = []  # legacy — no longer used in run_model body
+    dispatch_fns: list[str] = []
+    invoke_table_rows: list[str] = []
     for op in ir["ops"]:
         if op["op"] == "view":
             # No-op at runtime — buffer alias was set above.
@@ -258,11 +518,15 @@ const model_op_record_t *model_profile_records(int *count);
         shape_lit = _shape_str(op)
         if op["op"] == "linear":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _c_ident(op["weight"])
-            b = _c_ident(op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
             sh = op["shape"]
+            # Parallel-for variant: dispatches the outer N dimension onto
+            # `pool` when M==1 and the pool has >1 worker. In single-model
+            # builds (AGENTS_USE_POOL undefined) the wrapper is a static
+            # inline that just calls kernel_linear_<mid>() directly.
             call = (
-                f"kernel_linear({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"parallel_linear(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']})"
             )
         elif op["op"] == "relu":
@@ -276,11 +540,14 @@ const model_op_record_t *model_profile_records(int *count);
             call = f"kernel_elu({in_ptr}, {out_ptr}, {n}, {_f32(alpha)})"
         elif op["op"] == "conv2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _c_ident(op["weight"])
-            b = _c_ident(op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
             sh = op["shape"]
+            # Parallel-for variant: dispatches the outer OC dimension onto
+            # `pool` when N==1 and the pool has >1 worker. Falls back to
+            # the sequential kernel inside the wrapper otherwise.
             call = (
-                f"kernel_conv2d({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"parallel_conv2d(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
                 f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
@@ -300,8 +567,8 @@ const model_op_record_t *model_profile_records(int *count);
             call = f"kernel_add({a_ptr}, {b_ptr}, {out_ptr}, {n})"
         elif op["op"] == "batchnorm2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _c_ident(op["weight"])
-            b = _c_ident(op["bias"])
+            s = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"])
             sh = op["shape"]
             call = (
                 f"kernel_batchnorm2d({in_ptr}, {s}, {b}, {out_ptr}, "
@@ -313,8 +580,8 @@ const model_op_record_t *model_profile_records(int *count);
             call = f"kernel_sigmoid({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "linear_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _c_ident(op["weight"])
-            b = _c_ident(op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -331,8 +598,8 @@ const model_op_record_t *model_profile_records(int *count);
             call = f"kernel_relu_s8({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _c_ident(op["weight"])
-            b = _c_ident(op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -366,8 +633,8 @@ const model_op_record_t *model_profile_records(int *count);
             )
         elif op["op"] == "batchnorm2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _c_ident(op["weight"])
-            b = _c_ident(op["bias"])
+            s = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"])
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -387,54 +654,133 @@ const model_op_record_t *model_profile_records(int *count);
             )
         else:
             raise NotImplementedError(f"unsupported op {op['op']}")
-        call_blocks.append(
-            f'    {{\n'
-            f'        unsigned long _s = rdcycle();\n'
-            f'        {call};\n'
-            f'        unsigned long _e = rdcycle();\n'
-            f'        model_op_records_[model_op_n_].name   = "{op["name"]}";\n'
-            f'        model_op_records_[model_op_n_].op     = "{op["op"]}";\n'
-            f'        model_op_records_[model_op_n_].shape  = "{shape_lit}";\n'
-            f'        model_op_records_[model_op_n_].cycles = _e - _s;\n'
-            f'        model_op_n_++;\n'
-            f'    }}'
+        # Mangle the kernel call: every kernels.c emits kernel_<op>_<mid>
+        # (set via emit_kernels_h/c's model_name arg) so multiple models can
+        # link side-by-side without colliding on bare kernel_<op> symbols.
+        # Parallelized ops route through a static parallel_<op>() wrapper
+        # whose body already calls the mangled kernel — skip the rewrite
+        # so we don't accidentally mangle the wrapper name itself.
+        if op["op"] not in _PARALLELIZED_OPS:
+            call = call.replace(
+                f"kernel_{op['op']}(", f"kernel_{op['op']}_{mid}(", 1
+            )
+        # dispatch_id comes from the IR (assigned by extract_graph's
+        # _annotate_dispatches). Propagating it here means the C-level
+        # profile, the host-side CSV writer, and the IR all agree on
+        # the same dispatch numbering — single source of truth.
+        dispatch_id = op["dispatch_id"]
+        # Rewrite "input"/"output" pointer references so they read from
+        # the model_<mid>_state_t the dispatch fn is invoked with. Buffer
+        # references (buf_<...>) stay as-is — those are file-static.
+        per_disp_call = (call
+                         .replace("input,", "s->input,")
+                         .replace("input)", "s->input)")
+                         .replace("output,", "s->output,")
+                         .replace("output)", "s->output)")
+                         .replace("(output + ", "(s->output + ")
+                         .replace("(pool, ", "(s->pool, "))
+        dispatch_fns.append(
+            f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
+            f"    unsigned long _s = rdcycle();\n"
+            f"    {per_disp_call};\n"
+            f"    unsigned long _e = rdcycle();\n"
+            f"    int slot = n_++;\n"
+            f'    records_[slot].dispatch_id = {dispatch_id};\n'
+            f'    records_[slot].name   = "{op["name"]}";\n'
+            f'    records_[slot].op     = "{op["op"]}";\n'
+            f'    records_[slot].shape  = "{shape_lit}";\n'
+            f"    records_[slot].cycles = _e - _s;\n"
+            f"}}"
         )
+        invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
 
     c = f"""{HEADER}
 #include <stddef.h>
 #include <stdint.h>
+#include <zephyr/kernel.h>   /* for k_cycle_get_64() — static inline in this header */
 #include "model.h"
 #include "kernels.h"
 #include "weights.h"
 
-/* RISC-V cycle counter: 1-instruction read of the mcycle CSR. */
+/* Per-op timer: per-hart mcycle CSR. High resolution (one count per
+ * retired instruction) and accurate enough for relative comparisons
+ * between ops on spike. Caveat: on real Chipyard silicon mcycle pauses
+ * during WFI, so when the master thread sleeps waiting on threadpool
+ * workers this UNDERCOUNTS wall time. We additionally measure
+ * end-to-end wall cycles via k_cycle_get_64() (mtime) — that's the
+ * cross-hart-correct number; per-op rdcycle is only sound when run
+ * sequentially or while the master itself participates in parallel
+ * dispatch (which pthreadpool_parallelize_1d does). */
 static inline unsigned long rdcycle(void)
 {{
     unsigned long cc;
     __asm__ volatile("rdcycle %0" : "=r"(cc));
     return cc;
 }}
+{_emit_parallel_wrappers(mid, used_ops)}
 
+/* Per-model intermediate buffers. File-static so they don't collide across
+ * model TUs even without name mangling, but tagged with model_<mid>_ for
+ * debuggability. */
 {chr(10).join(buf_decls)}
 
-static model_op_record_t model_op_records_[MODEL_OP_COUNT];
-static int model_op_n_;
+/* File-static — invisible across TUs, no need to mangle. Locals to this .c. */
+static model_{mid}_op_record_t records_[MODEL_{umid}_OP_COUNT];
+static int n_;
+/* Wall-clock cycles for the most recent run_model_<mid>() call, sourced
+ * from k_cycle_get_64() (mtime). Cross-hart correct, lower resolution
+ * than per-op rdcycle. */
+static unsigned long wall_cycles_;
 
-void run_model(const model_input_t *input, model_output_t *output) {{
-    model_op_n_ = 0;
-{chr(10).join(call_blocks)}
+/* ---------- per-dispatch invoke fns (one per non-view IR op) ----------- */
+{chr(10).join(dispatch_fns)}
+
+/* Invoke table indexed by IR dispatch_id. The schedule-driven runtime
+ * uses this to call individual dispatches out-of-order; the
+ * straight-line run_model_{mid}() below walks it from 0..N-1. */
+const model_{mid}_dispatch_fn
+MODEL_{umid}_DISPATCH_FNS[MODEL_{umid}_OP_COUNT] = {{
+{chr(10).join(invoke_table_rows)}
+}};
+
+void model_{mid}_reset_profile(void) {{
+    n_ = 0;
 }}
 
-const model_op_record_t *model_profile_records(int *count) {{
-    *count = model_op_n_;
-    return model_op_records_;
+void model_{mid}_set_wall_cycles(unsigned long c) {{
+    wall_cycles_ = c;
+}}
+
+void run_model_{mid}(const model_{mid}_input_t *input,
+                     model_{mid}_output_t *output,
+                     void *pool) {{
+    model_{mid}_state_t s = {{ .input = input, .output = output, .pool = pool }};
+    n_ = 0;
+    unsigned long _wall_s = (unsigned long)k_cycle_get_64();
+    for (int i = 0; i < MODEL_{umid}_OP_COUNT; i++) {{
+        MODEL_{umid}_DISPATCH_FNS[i](&s);
+    }}
+    wall_cycles_ = (unsigned long)k_cycle_get_64() - _wall_s;
+}}
+
+const model_{mid}_op_record_t *model_{mid}_profile_records(int *count) {{
+    *count = n_;
+    return records_;
+}}
+
+unsigned long model_{mid}_wall_cycles(void) {{
+    return wall_cycles_;
 }}
 """
     with open(os.path.join(out_dir, "model.c"), "w") as f:
         f.write(c)
 
 
-def emit_test_io(io_npz: str, out_dir: str) -> None:
+def emit_test_io(model_name: str, io_npz: str, out_dir: str) -> None:
+    """Emit test_io.h with mangled `static const` arrays so two models'
+    test_io.h files can co-exist in a single TU."""
+    mid = _mid(model_name)
+    umid = _umid(model_name)
     data = np.load(io_npz)
     inp = data["input"].reshape(-1)
     out = data["output"].reshape(-1)
@@ -446,23 +792,37 @@ def emit_test_io(io_npz: str, out_dir: str) -> None:
         "",
         "#include <stdint.h>",
         "",
-        f"#define MODEL_TEST_INPUT_LEN  {inp.size}",
-        f"#define MODEL_TEST_OUTPUT_LEN {out.size}",
+        f"/* Mangled (always defined). */",
+        f"#define MODEL_{umid}_TEST_INPUT_LEN  {inp.size}",
+        f"#define MODEL_{umid}_TEST_OUTPUT_LEN {out.size}",
         "",
-        f"static const {in_c} model_test_input[{inp.size}] = {{",
+        f"static const {in_c} model_{mid}_test_input[{inp.size}] = {{",
     ]
     if inp.dtype == np.float32:
         lines += _array_lines(inp)
     else:
         lines += _array_lines_int(inp)
     lines += ["};", ""]
-    lines.append(f"/* Reference output (host-side compare; not used at runtime). */")
-    lines.append(f"static const {out_c} model_test_golden[{out.size}] = {{")
+    lines.append("/* Reference output (host-side compare; not used at runtime). */")
+    lines.append(f"static const {out_c} model_{mid}_test_golden[{out.size}] = {{")
     if out.dtype == np.float32:
         lines += _array_lines(out)
     else:
         lines += _array_lines_int(out)
-    lines += ["};", ""]
+    lines += [
+        "};",
+        "",
+        "/* Unmangled aliases for single-model use. The multi-model harness",
+        " * defines AGENTS_DISABLE_UNMANGLED before including any test_io.h",
+        " * to keep names from colliding. */",
+        "#ifndef AGENTS_DISABLE_UNMANGLED",
+        f"#define MODEL_TEST_INPUT_LEN  MODEL_{umid}_TEST_INPUT_LEN",
+        f"#define MODEL_TEST_OUTPUT_LEN MODEL_{umid}_TEST_OUTPUT_LEN",
+        f"#define model_test_input      model_{mid}_test_input",
+        f"#define model_test_golden     model_{mid}_test_golden",
+        "#endif",
+        "",
+    ]
     with open(os.path.join(out_dir, "test_io.h"), "w") as f:
         f.write("\n".join(lines))
 
@@ -472,10 +832,11 @@ def generate(ir_path: str, weights_path: str, io_path: str, out_dir: str) -> Non
     with open(ir_path) as f:
         ir = json.load(f)
     weights = dict(np.load(weights_path))
+    model_name = ir["name"]
 
-    emit_weights(weights, out_dir)
+    emit_weights(model_name, weights, out_dir)
     emit_model(ir, out_dir)
-    emit_test_io(io_path, out_dir)
+    emit_test_io(model_name, io_path, out_dir)
 
     files = ["weights.h", "weights.c", "model.h", "model.c", "test_io.h"]
     for fn in files:

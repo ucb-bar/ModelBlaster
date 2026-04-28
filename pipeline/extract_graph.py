@@ -13,11 +13,15 @@ IR shape (v1):
       {"name": <node name>, "op": "linear",
        "inputs": [<name>], "outputs": [<name>],
        "weight": <name>, "bias": <name>,
-       "shape": {"M": ..., "K": ..., "N": ...}},
-      {"name": ..., "op": "relu", "inputs": [<name>], "outputs": [<name>],
-       "shape": {"n": ...}},
+       "shape": {"M": ..., "K": ..., "N": ...},
+       /* dispatch fields, post-processed by _annotate_dispatches: */
+       "dispatch_id": <int|null>,        # null for view ops; else 0..N-1
+       "hardware_target": "any",         # "scalar","rvv","gemmini",...; "any" = whatever the build picks
+       "depends_on": [<dispatch_id>...]  # other dispatches that must complete first (data deps)
+      },
       ...
-    ]
+    ],
+    "dispatches": [<dispatch_id>...]      # ordered list of non-view dispatch_ids
   }
 
 Quantization fields are reserved (`dtype`/`quant` per tensor) so the int8 PT2E
@@ -35,6 +39,49 @@ import numpy as np
 import torch
 import torch.fx
 from torch.fx.passes.shape_prop import ShapeProp
+
+
+def _annotate_dispatches(ops: list[dict]) -> list[int]:
+    """Promote each non-view op to a first-class dispatch.
+
+    Adds three fields to each op (in-place):
+      * dispatch_id: 0..N-1 across non-view ops in execution order.
+        view ops get None — they're zero-cost tensor aliases, not
+        runnable dispatches.
+      * hardware_target: forward-compat for the heterogeneous core
+        registry (task 62). Defaults to "any" — the build picks.
+      * depends_on: list of dispatch_ids whose outputs feed this op,
+        derived from the data-flow graph. view ops propagate their
+        producer transitively so dependents see the real source.
+
+    Returns the ordered list of dispatch_ids (= ir["dispatches"])."""
+    producer_of: dict[str, int] = {}
+    next_id = 0
+    dispatches: list[int] = []
+    for op in ops:
+        if op["op"] == "view":
+            # view aliases input tensor; propagate producer info so
+            # downstream ops see the real upstream dispatch.
+            for t_in, t_out in zip(op.get("inputs", []), op.get("outputs", [])):
+                if t_in in producer_of:
+                    producer_of[t_out] = producer_of[t_in]
+            op["dispatch_id"] = None
+            op["hardware_target"] = "any"
+            op["depends_on"] = []
+            continue
+
+        deps: set[int] = set()
+        for t_in in op.get("inputs", []):
+            if t_in in producer_of:
+                deps.add(producer_of[t_in])
+        op["dispatch_id"] = next_id
+        op["hardware_target"] = "any"
+        op["depends_on"] = sorted(deps)
+        for t_out in op.get("outputs", []):
+            producer_of[t_out] = next_id
+        dispatches.append(next_id)
+        next_id += 1
+    return dispatches
 
 
 SUPPORTED_MODULES = (
@@ -561,6 +608,7 @@ def extract_int8(
                       if output_names_multi is not None
                       else [output_name])
 
+    dispatches = _annotate_dispatches(ops)
     ir = {
         "name": name,
         "version": 1,
@@ -572,6 +620,7 @@ def extract_int8(
         },
         "tensors": tensors_meta,
         "ops": ops,
+        "dispatches": dispatches,
     }
 
     # Quantize the input once with the IR's input scale.
@@ -982,6 +1031,7 @@ def extract(
     if input_name is None or not output_names:
         raise RuntimeError("graph missing input/output")
 
+    dispatches = _annotate_dispatches(ops)
     ir = {
         "name": name,
         "version": 1,
@@ -995,6 +1045,7 @@ def extract(
         },
         "tensors": tensors,
         "ops": ops,
+        "dispatches": dispatches,
     }
 
     # Run reference to capture golden I/O.
@@ -1037,6 +1088,11 @@ def main() -> None:
     ap.add_argument("--quant", default="fp32",
                     help="quantization mode (fp32 only for now; recorded in "
                          "the IR for downstream stages)")
+    ap.add_argument("--core-registry", default=None,
+                    help="optional path to an agents/cores/*.json registry. "
+                         "When provided, the post-extraction pass validates "
+                         "every dispatch's hardware_target against the listed "
+                         "cores' capabilities and aborts on mismatch.")
     args = ap.parse_args()
 
     if args.model == "mlp_generic":
@@ -1054,6 +1110,21 @@ def main() -> None:
 
     extract(model, sample, name=args.model, out_dir=args.out_dir,
             quant=args.quant)
+
+    if args.core_registry:
+        from agents.pipeline import core_registry
+        reg = core_registry.load(args.core_registry)
+        ir = json.load(open(os.path.join(args.out_dir, "graph.json")))
+        errs = core_registry.validate_dispatch_targets(reg, ir.get("ops", []))
+        if errs:
+            for e in errs:
+                print(f"core_registry: {e}")
+            raise SystemExit(
+                f"{len(errs)} dispatch(es) cannot run on registry "
+                f"{reg.system!r}; refine hardware_target or pick a different "
+                f"system descriptor.")
+        print(f"core_registry: validated against {reg.system}: "
+              f"{len(ir.get('ops', []))} ops match")
 
 
 if __name__ == "__main__":

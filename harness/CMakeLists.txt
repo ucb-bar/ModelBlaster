@@ -58,6 +58,14 @@ target_sources(app PRIVATE
     ${MODEL_DIR}/kernels.c
     ${MODEL_DIR}/weights.c
 )
+
+# Big models (mlp_control's hidden layers, dronet's conv weights) push
+# .sdata past the ±2KB window that the linker tries to fold into
+# `gp`-relative loads via R_RISCV_GPREL_I, producing
+# "relocation truncated to fit" against e.g. z_malloc_heap. Disable
+# linker relaxation here — medany still gives ±2GB addressing, we just
+# lose the gp-relative shortcut. No measurable code-size impact.
+zephyr_link_libraries(-Wl,--no-relax)
 target_include_directories(app PRIVATE
     src
     ${MODEL_DIR}

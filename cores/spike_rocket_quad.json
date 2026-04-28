@@ -1,0 +1,18 @@
+{
+  "system": "spike-rocket-quad",
+  "description": "Spike ISA simulator with 4 homogeneous Rocket-class harts. Used by the scalar backend; AGENTS_BACKEND=scalar.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rocket0",
+      "kind": "scalar",
+      "isa": "rv64imafdc",
+      "harts": [0],
+      "capabilities": ["linear", "conv2d", "relu", "elu", "add", "maxpool2d", "batchnorm2d", "sigmoid",
+                        "linear_s8", "conv2d_s8", "relu_s8", "add_s8", "maxpool2d_s8", "batchnorm2d_s8", "sigmoid_s8"]
+    },
+    {"name": "rocket1", "kind": "scalar", "isa": "rv64imafdc", "harts": [1], "capabilities_ref": "rocket0"},
+    {"name": "rocket2", "kind": "scalar", "isa": "rv64imafdc", "harts": [2], "capabilities_ref": "rocket0"},
+    {"name": "rocket3", "kind": "scalar", "isa": "rv64imafdc", "harts": [3], "capabilities_ref": "rocket0"}
+  ]
+}

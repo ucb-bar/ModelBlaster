@@ -1,0 +1,37 @@
+{
+  "system": "chipyard-rocket+boom+gemmini",
+  "description": "Forward-compat example: heterogeneous Chipyard config with mixed core types. XPU-RT picks per-dispatch hardware_target from this registry; the runtime maps each kind to its own worker queue. Today's runtime collapses everything to one pthreadpool — only valid descriptors below are honored when this scaffolding lights up.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rocket0",
+      "kind": "scalar",
+      "isa": "rv64imafdc",
+      "harts": [0],
+      "capabilities": ["linear", "conv2d", "relu", "elu", "add", "maxpool2d", "batchnorm2d", "sigmoid"]
+    },
+    {
+      "name": "boom0",
+      "kind": "boom",
+      "isa": "rv64imafdc",
+      "harts": [1],
+      "description": "Out-of-order BOOM — best for branchy / control-heavy dispatches.",
+      "capabilities_ref": "rocket0"
+    },
+    {
+      "name": "rvv0",
+      "kind": "rvv",
+      "isa": "rv64gcv",
+      "harts": [2],
+      "description": "Vector-extension hart — preferred for parallel linear/conv kernels.",
+      "capabilities": ["linear", "conv2d", "linear_s8", "conv2d_s8", "relu", "add", "elu"]
+    },
+    {
+      "name": "gemmini0",
+      "kind": "gemmini",
+      "harts": [3],
+      "description": "Gemmini systolic-array accelerator — only matmul/conv at int8.",
+      "capabilities": ["linear_s8", "conv2d_s8"]
+    }
+  ]
+}
