@@ -433,6 +433,7 @@ def _verify(
             f"cycles={res.cycles_by_op})",
             max_abs_err=res.golden_max_abs_err,
             max_rel_err=res.golden_max_rel_err,
+            cycles_by_op=dict(res.cycles_by_op) if res.cycles_by_op else None,
         )
 
     return VerifyResult(False, f"unknown verify_method {backend.verify_method}")
@@ -585,6 +586,52 @@ def generate_one_llm(
         return None
     log(f"  [{spec.op}] algorithm queue: "
         f"{[a.name for a in candidates]}")
+
+    # First pass: probe the cache across ALL candidate algorithms and
+    # pick the one whose cached kernel is fastest in the spike harness.
+    # This avoids picking the lexically-first algorithm when a slower
+    # one is cached but a faster alternative also is — e.g. when both
+    # `direct` (slow) and `im2col_gemm` (fast) are cached for conv2d on
+    # RVV, we want to use im2col_gemm. The probe is a harness build+run
+    # per cache HIT, but builds are incremental so this is cheap once
+    # warmed up.
+    if cache_dir is not None:
+        best_cached_code: Optional[str] = None
+        best_cached_algo: Optional[str] = None
+        best_cached_cycles: Optional[int] = None
+        for algorithm in candidates:
+            cache_path = os.path.join(
+                cache_dir, f"{backend.name}_{spec.op}_{algorithm.name}.c")
+            if not os.path.exists(cache_path):
+                continue
+            cached = open(cache_path).read()
+            log(f"  [{spec.op}/{algorithm.name}] probing cached kernel")
+            vres = _verify(
+                spec, cached, shapes, backend=backend,
+                impls=impls, specs=specs,
+                repo_root=repo_root, model_dir=model_dir,
+                build_dir=build_dir, harness_dir=harness_dir, io_path=io_path,
+                algorithm_name=algorithm.name,
+            )
+            if not vres.ok:
+                log(f"  [{spec.op}/{algorithm.name}] cache stale "
+                    f"({vres.message.splitlines()[0]})")
+                continue
+            cyc = (vres.cycles_by_op or {}).get(spec.op)
+            log(f"  [{spec.op}/{algorithm.name}] cache HIT — "
+                f"{cyc if cyc is not None else '?'} cycles")
+            if best_cached_cycles is None or (cyc is not None and cyc < best_cached_cycles):
+                best_cached_code = cached
+                best_cached_algo = algorithm.name
+                best_cached_cycles = cyc
+        if best_cached_code is not None:
+            log(f"  [{spec.op}] using cached algorithm '{best_cached_algo}' "
+                f"({best_cached_cycles} cycles, fastest of cached options)")
+            return best_cached_code, best_cached_algo
+
+    # No cache hits — generate for each algorithm in order, take the
+    # first one that verifies. (This is the original behavior; it's
+    # the correct shape when there's no prior cycle data to compare.)
     for algorithm in candidates:
         code = _generate_one_llm_for_algorithm(
             spec, algorithm, shapes, client, backend, correctness_system,

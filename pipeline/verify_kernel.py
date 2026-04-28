@@ -322,6 +322,10 @@ class VerifyResult:
     failing_shape: Optional[dict] = None
     max_abs_err: float = 0.0
     max_rel_err: float = 0.0
+    # Per-op cycle counts as reported by the spike harness (only populated
+    # for spike-harness verify; host-ctypes verify leaves it None). Used
+    # by callers to compare cached algorithm options by speed.
+    cycles_by_op: Optional[dict] = None
 
 
 def verify(
