@@ -85,26 +85,54 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(agents_harness_multi)
 
-# pthreadpool — same source the samples/xnnpack project pulls in. Build it
-# directly (not through XNNPACK) so we get the threadpool target with
-# minimal extra surface. PTHREADPOOL_SOURCE_DIR / FXDIV_SOURCE_DIR point
-# at the executorch-vendored submodules so CMake doesn't try to download
-# them at configure time.
+# AGENTS_POOL_BACKEND={pthreadpool,raw} chooses the parallel-for pool
+# implementation. `pthreadpool` (default) is the historical
+# xnnpack-vendored library; `raw` is agents/runtime/agents_pool, a
+# raw-pthread + k_sem pool measured at ~650x lower per-call dispatch
+# overhead on the FireSim quad-rocket-saturn build (see
+# agents/microbench/threadpool/results/REPORT.md). The switch lets each
+# phase of the pthreadpool->agents_pool migration validate
+# independently without breaking existing builds.
+if(NOT DEFINED AGENTS_POOL_BACKEND)
+    set(AGENTS_POOL_BACKEND "pthreadpool")
+endif()
+set(_VALID_POOL_BACKENDS "pthreadpool" "raw")
+list(FIND _VALID_POOL_BACKENDS "${AGENTS_POOL_BACKEND}" _pb_idx)
+if(_pb_idx EQUAL -1)
+    message(FATAL_ERROR
+        "AGENTS_POOL_BACKEND='${AGENTS_POOL_BACKEND}' must be one of: "
+        "${_VALID_POOL_BACKENDS}")
+endif()
+message(STATUS "agents harness_multi: AGENTS_POOL_BACKEND=${AGENTS_POOL_BACKEND}")
+
 set(_REPO_ROOT_ABS "${CMAKE_CURRENT_LIST_DIR}/../..")
-set(PTHREADPOOL_SOURCE_DIR
-    "${_REPO_ROOT_ABS}/third-party/executorch/backends/xnnpack/third-party/pthreadpool"
-    CACHE STRING "pthreadpool source directory")
-set(FXDIV_SOURCE_DIR
-    "${_REPO_ROOT_ABS}/third-party/executorch/backends/xnnpack/third-party/FXdiv"
-    CACHE STRING "FXdiv source directory")
-set(PTHREADPOOL_BUILD_TESTS      OFF CACHE BOOL "")
-set(PTHREADPOOL_BUILD_BENCHMARKS OFF CACHE BOOL "")
-set(PTHREADPOOL_ALLOW_DEPRECATED_API OFF CACHE BOOL "")
-add_subdirectory("${PTHREADPOOL_SOURCE_DIR}" pthreadpool_build)
-# pthreadpool's CMake builds it without Zephyr's interface flags by
-# default; pull them in so it sees the same -march/-mabi and includes as
-# the rest of the app.
-target_link_libraries(pthreadpool PRIVATE zephyr_interface)
+
+if(AGENTS_POOL_BACKEND STREQUAL "pthreadpool")
+    # pthreadpool — same source the samples/xnnpack project pulls in. Build it
+    # directly (not through XNNPACK) so we get the threadpool target with
+    # minimal extra surface. PTHREADPOOL_SOURCE_DIR / FXDIV_SOURCE_DIR point
+    # at the executorch-vendored submodules so CMake doesn't try to download
+    # them at configure time.
+    set(PTHREADPOOL_SOURCE_DIR
+        "${_REPO_ROOT_ABS}/third-party/executorch/backends/xnnpack/third-party/pthreadpool"
+        CACHE STRING "pthreadpool source directory")
+    set(FXDIV_SOURCE_DIR
+        "${_REPO_ROOT_ABS}/third-party/executorch/backends/xnnpack/third-party/FXdiv"
+        CACHE STRING "FXdiv source directory")
+    set(PTHREADPOOL_BUILD_TESTS      OFF CACHE BOOL "")
+    set(PTHREADPOOL_BUILD_BENCHMARKS OFF CACHE BOOL "")
+    set(PTHREADPOOL_ALLOW_DEPRECATED_API OFF CACHE BOOL "")
+    add_subdirectory("${PTHREADPOOL_SOURCE_DIR}" pthreadpool_build)
+    # pthreadpool's CMake builds it without Zephyr's interface flags by
+    # default; pull them in so it sees the same -march/-mabi and includes as
+    # the rest of the app.
+    target_link_libraries(pthreadpool PRIVATE zephyr_interface)
+else()
+    # raw — agents/runtime/agents_pool. Object library; we link it into
+    # every per-model objs lib + the app itself.
+    add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/agents_pool"
+                     agents_pool_build)
+endif()
 
 # Stage per-model headers under build/agents_multi/<name>_model.h and
 # <name>_test_io.h so multi_main.c can include all of them with
@@ -147,7 +175,12 @@ foreach(_i RANGE ${_last})
     # against the pthreadpool target propagates pthreadpool.h's include
     # dir to model.c.
     target_compile_definitions(agents_${_name}_objs PRIVATE AGENTS_USE_POOL=1)
-    target_link_libraries(agents_${_name}_objs PRIVATE pthreadpool)
+    if(AGENTS_POOL_BACKEND STREQUAL "raw")
+        target_compile_definitions(agents_${_name}_objs PRIVATE AGENTS_POOL_BACKEND_RAW=1)
+        target_link_libraries(agents_${_name}_objs PRIVATE agents_pool)
+    else()
+        target_link_libraries(agents_${_name}_objs PRIVATE pthreadpool)
+    endif()
 
     # Apply per-backend kernel cflags (e.g. -march=rv64gcv) ONLY to
     # kernels.c, not to model.c / weights.c. Same convention as the
@@ -217,7 +250,12 @@ foreach(_name ${MODEL_NAMES})
     target_link_libraries(app PRIVATE agents_${_name}_objs)
 endforeach()
 
-target_link_libraries(app PRIVATE pthreadpool)
+if(AGENTS_POOL_BACKEND STREQUAL "raw")
+    target_compile_definitions(app PRIVATE AGENTS_POOL_BACKEND_RAW=1)
+    target_link_libraries(app PRIVATE agents_pool)
+else()
+    target_link_libraries(app PRIVATE pthreadpool)
+endif()
 
 # Mirror the single-model harness: disable RISC-V gp-relative
 # relaxation so big-data models (mlp_control, dronet) don't blow the

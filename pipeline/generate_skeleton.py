@@ -156,6 +156,24 @@ static inline void parallel_linear(void *pool_,
                                    const float *b, float *out,
                                    int M, int K, int N) {{
 #ifdef AGENTS_USE_POOL
+#ifdef AGENTS_POOL_BACKEND_RAW
+    /* agents_pool path: opaque agents_pool_t cast in/out via void *. */
+    agents_pool_t pool = (agents_pool_t)pool_;
+    if (pool == NULL || M != 1) {{
+        kernel_linear_{mid}(in, w, b, out, M, K, N);
+        return;
+    }}
+    size_t T = agents_pool_get_threads_count(pool);
+    if (T <= 1 || (size_t)N < T) {{
+        kernel_linear_{mid}(in, w, b, out, M, K, N);
+        return;
+    }}
+    parallel_linear_ctx_t ctx = {{
+        .in = in, .w = w, .b = b, .out = out,
+        .M = M, .K = K, .N_total = N, .chunks = (int)T,
+    }};
+    agents_pool_parallelize_1d(pool, parallel_linear_fn, &ctx, T, 0);
+#else
     pthreadpool_t pool = (pthreadpool_t)pool_;
     if (pool == NULL || M != 1) {{
         kernel_linear_{mid}(in, w, b, out, M, K, N);
@@ -171,6 +189,7 @@ static inline void parallel_linear(void *pool_,
         .M = M, .K = K, .N_total = N, .chunks = (int)T,
     }};
     pthreadpool_parallelize_1d(pool, parallel_linear_fn, &ctx, T, 0);
+#endif
 #else
     (void)pool_;
     kernel_linear_{mid}(in, w, b, out, M, K, N);
@@ -226,6 +245,30 @@ static inline void parallel_conv2d(void *pool_,
                                    int OC, int KH, int KW,
                                    int SH, int SW, int PH, int PW) {{
 #ifdef AGENTS_USE_POOL
+#ifdef AGENTS_POOL_BACKEND_RAW
+    agents_pool_t pool = (agents_pool_t)pool_;
+    if (pool == NULL || N != 1) {{
+        kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
+                            OC, KH, KW, SH, SW, PH, PW);
+        return;
+    }}
+    size_t T = agents_pool_get_threads_count(pool);
+    if (T <= 1 || (size_t)OC < T) {{
+        kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
+                            OC, KH, KW, SH, SW, PH, PW);
+        return;
+    }}
+    int OH = (IH + 2 * PH - KH) / SH + 1;
+    int OW = (IW + 2 * PW - KW) / SW + 1;
+    parallel_conv2d_ctx_t ctx = {{
+        .in = in, .w = w, .b = b, .out = out,
+        .N = N, .IC = IC, .IH = IH, .IW = IW,
+        .OC_total = OC, .KH = KH, .KW = KW,
+        .SH = SH, .SW = SW, .PH = PH, .PW = PW,
+        .OH = OH, .OW = OW, .chunks = (int)T,
+    }};
+    agents_pool_parallelize_1d(pool, parallel_conv2d_fn, &ctx, T, 0);
+#else
     pthreadpool_t pool = (pthreadpool_t)pool_;
     if (pool == NULL || N != 1) {{
         kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
@@ -248,6 +291,7 @@ static inline void parallel_conv2d(void *pool_,
         .OH = OH, .OW = OW, .chunks = (int)T,
     }};
     pthreadpool_parallelize_1d(pool, parallel_conv2d_fn, &ctx, T, 0);
+#endif
 #else
     (void)pool_;
     kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
@@ -266,10 +310,21 @@ def _emit_parallel_wrappers(mid: str, used_ops: set[str]) -> str:
     """Emit static parallel_for wrappers ONLY for ops the model actually uses.
     Emitting for every parallelizable op leaks `kernel_<op>_<mid>` references
     that the kernels.c doesn't define when the model has no such op (e.g.
-    mlp_control has no conv2d → no kernel_conv2d_mlp_control symbol)."""
+    mlp_control has no conv2d → no kernel_conv2d_mlp_control symbol).
+
+    Two parallel-pool backends are supported (selected at compile time by
+    the harness CMake's AGENTS_POOL_BACKEND switch):
+      AGENTS_POOL_BACKEND_RAW defined  ⇒ #include "agents_pool.h"
+      otherwise                        ⇒ #include <pthreadpool.h>
+    The wrapper bodies (above) carry both code paths gated on the same
+    symbol so generate_skeleton's output is valid under either build."""
     parts = ["\n/* ---------- parallel_for wrappers (Path 2 — skeleton-driven) ---------- */"]
     parts.append("#ifdef AGENTS_USE_POOL")
+    parts.append("#ifdef AGENTS_POOL_BACKEND_RAW")
+    parts.append('#include "agents_pool.h"')
+    parts.append("#else")
     parts.append("#include <pthreadpool.h>")
+    parts.append("#endif")
     parts.append("#endif")
     for op in sorted(_PARALLELIZED_OPS & used_ops):
         parts.append(_PARALLEL_WRAPPER_TEMPLATES[op].format(mid=mid))
