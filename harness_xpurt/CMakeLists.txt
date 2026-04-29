@@ -87,7 +87,8 @@ project(agents_harness_xpurt)
 # rationale. `pthreadpool` is the historical default; `raw` swaps in
 # agents/runtime/agents_pool.
 if(NOT DEFINED AGENTS_POOL_BACKEND)
-    set(AGENTS_POOL_BACKEND "pthreadpool")
+    # Phase 3 default — see agents/harness_multi/CMakeLists.txt rationale.
+    set(AGENTS_POOL_BACKEND "raw")
 endif()
 set(_VALID_POOL_BACKENDS "pthreadpool" "raw")
 list(FIND _VALID_POOL_BACKENDS "${AGENTS_POOL_BACKEND}" _pb_idx)
