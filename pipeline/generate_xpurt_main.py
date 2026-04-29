@@ -462,14 +462,25 @@ int main(void)
             sys_reboot(SYS_REBOOT_COLD);
             return -1;
         }}
-        printf("xpurt: worker[%d] kind=%s pinned_hart=%d\\n",
-               k, kinds[k], pinned_hart);
+        /* Per-worker spawn diagnostic deferred to after pthread_join.
+         * Inline printf here costs ~tens-of-ms over FireSim HTIF UART
+         * and starves any worker pinned to the same hart as main
+         * (the scalar worker pinned to hart 0). The (kind, pinned_hart)
+         * info is already aggregated in wargs[k]; print at the end so
+         * it doesn't perturb the schedule's actual_start cycle counts. */
     }}
 
     /* Wait for every worker to drain. */
     for (int k = 0; k < {n_kinds}; k++) {{
         pthread_join(tids[k], NULL);
         pthread_attr_destroy(&attrs[k].a);
+    }}
+
+    /* Now safe to flush the spawn diagnostics — workers are done, so
+     * nothing pinned to hart 0 is competing with main for UART time. */
+    for (int k = 0; k < {n_kinds}; k++) {{
+        printf("xpurt: worker[%d] kind=%s pinned_hart=%d\\n",
+               k, wargs[k].kind, wargs[k].hart);
     }}
 
 #ifdef AGENTS_XPURT_TRACE
