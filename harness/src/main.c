@@ -22,7 +22,7 @@ int main(void)
 
     /* Single-model harness has no thread pool — pass NULL. The
      * generated kernel bodies ignore it; only the parallel-for wrapper
-     * (when emitted) will dispatch onto a real pthreadpool_t. */
+     * (when emitted) would dispatch onto a real agents_pool_t. */
     run_model(model_test_input, model_output, NULL);
 
     /* Print output tensor in a stable, machine-parseable format.

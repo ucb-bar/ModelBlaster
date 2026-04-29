@@ -20,7 +20,7 @@
 #   QUANT           fp32 (default)
 #   CPU_P_KIND      registry kind for CPU_P slots (default: rvv)
 #   CPU_E_KIND      registry kind for CPU_E slots (default: scalar)
-#   AGENTS_POOL_THREADS  pthreadpool worker count (default: 4)
+#   AGENTS_POOL_THREADS  agents_pool worker count (default: 4)
 #   FORCE_REGEN     {0,1}   re-run each model's run.sh first (default: 1)
 #   XPURT_TRACE     {0,1}   enable execution-trace capture (default: 0)
 #   RUNNER          {spike,firesim}  default spike. firesim picks the
@@ -140,12 +140,6 @@ WEST_CMAKE_ARGS=(
     "-DXPURT_INCLUDE_DIR=${GEN_DIR}"
     "-DAGENTS_POOL_THREADS=${AGENTS_POOL_THREADS}"
 )
-# AGENTS_POOL_BACKEND={pthreadpool,raw} — Phase 2 of the pthreadpool
-# replacement. Default leaves the historical pthreadpool path live; CI /
-# user can opt into the agents_pool path.
-if [[ -n "${AGENTS_POOL_BACKEND:-}" ]]; then
-    WEST_CMAKE_ARGS+=("-DAGENTS_POOL_BACKEND=${AGENTS_POOL_BACKEND}")
-fi
 # Per-backend kernel cflags. Read each from agents.pipeline.backends and
 # splice into a -DAGENTS_KERNEL_CFLAGS_<BS> variable; the harness CMake
 # applies them to that backend's kernels.c source-property only.

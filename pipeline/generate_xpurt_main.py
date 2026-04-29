@@ -18,7 +18,7 @@ symbols (kernels, dispatch table, profile API) get suffixed with
 
 The generated main:
 
-    1. Creates one pthreadpool (worker count from AGENTS_POOL_THREADS).
+    1. Creates one agents_pool (worker count from AGENTS_POOL_THREADS).
     2. Resets every involved (model, backend) profile counter.
     3. Spawns one Zephyr worker per distinct core_kind, pinned to the
        schedule-assigned hart. Each worker walks the table in start-time
@@ -65,7 +65,7 @@ def _emit(networks: list[str], schedule_name: str,
                    binaries with backend pools larger than the schedule
                    used (e.g. a future fallback path).
     `pool_sizes`   is parallel to `core_kinds`; element k is the
-                   pthreadpool_create() argument for kind k. pthreadpool's
+                   agents_pool_create() argument for kind k. agents_pool's
                    thread count INCLUDES the calling thread, so a kind
                    with N harts wants pool_size=N (caller + N-1 helpers =
                    N total threads matching N harts). 0 ⇒ NULL pool;
@@ -256,7 +256,7 @@ def _emit(networks: list[str], schedule_name: str,
  *      _<bs>, so multiple backends per model link cleanly.
  *   4. After invoking, gives the entry's k_sem so consumers unblock.
  * Workers are pinned to harts via pthread_attr_setaffinity_np (Phase A
- * patch). The xnnpack-style pthreadpool is still here — parallel_<op>
+ * patch). agents_pool is the parallel-for primitive — parallel_<op>
  * wrappers inside dispatched kernels use it for intra-op parallelism.
  *
  * Outputs follow the same multi-line marker protocol as the
@@ -272,11 +272,7 @@ def _emit(networks: list[str], schedule_name: str,
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
-#ifdef AGENTS_POOL_BACKEND_RAW
 #include "agents_pool.h"
-#else
-#include <pthreadpool.h>
-#endif
 #include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem */
 #include <zephyr/sys/reboot.h>
 
@@ -289,19 +285,6 @@ def _emit(networks: list[str], schedule_name: str,
 {forward_decl_block}
 
 {chr(10).join(output_buf_decls)}
-
-#ifndef AGENTS_POOL_BACKEND_RAW
-/* picolibc memalign workaround — see generate_multi_main.py.
- * Only needed when linking pthreadpool; the agents_pool path uses
- * plain malloc(). */
-void *memalign(size_t alignment, size_t size) {{ return aligned_alloc(alignment, size); }}
-int posix_memalign(void **out, size_t alignment, size_t size)
-{{
-    void *p = aligned_alloc(alignment, size);
-    if (p == NULL) {{ return 12; }}
-    *out = p; return 0;
-}}
-#endif
 
 /* Per-entry completion sem: posted once when the dispatch finishes;
  * dependents take it before invoking. Initialized as 0/1 (binary, but
@@ -323,7 +306,8 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
  * by xpurt_worker when stamping s_<mid>.pool. NULL ⇒ kind has only 1
  * hart, so parallel_<op> wrappers run synchronously on the calling
  * scheduler worker. Type erased to void* here so the same generated
- * source compiles under both pthreadpool and agents_pool backends. */
+ * source remained backend-agnostic during the migration; agents_pool
+ * is the only path now. */
 static void *pools[{n_kinds}] = {{ NULL }};
 
 /* mtime baseline for the run, captured immediately before workers spawn.
@@ -389,7 +373,7 @@ int main(void)
     printf("xpurt-runner: schedule={schedule_name} entries=%d kinds=%d on %s\\n",
            {upper}_N_ENTRIES, {n_kinds}, CONFIG_BOARD_TARGET);
 
-    /* Per-kind pthreadpool sizes. Element k's helper thread count is
+    /* Per-kind agents_pool sizes. Element k's helper thread count is
      * (harts_of_kind_k - 1) — one less than the kind's hart count, since
      * the scheduler-worker thread for that kind is itself one of those
      * harts. 0 ⇒ NULL pool, parallel_<op> wrappers run synchronously on
@@ -399,25 +383,16 @@ int main(void)
     static const int pool_sizes[{n_kinds}] = {{ {pool_size_strs} }};
     for (int k = 0; k < {n_kinds}; k++) {{
         if (pool_sizes[k] > 0) {{
-#ifdef AGENTS_POOL_BACKEND_RAW
             pools[k] = (void *)agents_pool_create(pool_sizes[k]);
-#else
-            pools[k] = (void *)pthreadpool_create(pool_sizes[k]);
-#endif
             if (pools[k] == NULL) {{
-                printf("FATAL: pool_create kind=%d size=%d failed\\n",
+                printf("FATAL: agents_pool_create kind=%d size=%d failed\\n",
                        k, pool_sizes[k]);
                 sys_reboot(SYS_REBOOT_COLD);
                 return -1;
             }}
         }}
-#ifdef AGENTS_POOL_BACKEND_RAW
         printf("agents_pool[kind=%d]: %u helpers (intra-op)\\n",
                k, (unsigned)(pools[k] ? agents_pool_get_threads_count((agents_pool_t)pools[k]) : 0));
-#else
-        printf("pthreadpool[kind=%d]: %u helpers (intra-op)\\n",
-               k, (unsigned)(pools[k] ? pthreadpool_get_threads_count((pthreadpool_t)pools[k]) : 0));
-#endif
     }}
 
 {chr(10).join(state_inits)}
@@ -527,11 +502,7 @@ int main(void)
 
     for (int k = 0; k < {n_kinds}; k++) {{
         if (pools[k] != NULL) {{
-#ifdef AGENTS_POOL_BACKEND_RAW
             agents_pool_destroy((agents_pool_t)pools[k]);
-#else
-            pthreadpool_destroy((pthreadpool_t)pools[k]);
-#endif
         }}
     }}
     sys_reboot(SYS_REBOOT_COLD);
@@ -618,7 +589,7 @@ def main() -> None:
             harts_per_kind.setdefault(kind, set()).update(harts)
         for k in core_kinds:
             n_harts = len(harts_per_kind.get(k, set()))
-            # pthreadpool_create(N) makes a pool of N threads INCLUDING
+            # agents_pool_create(N) makes a pool of N threads INCLUDING
             # the caller, so use n_harts directly. 1-hart kinds still get
             # 0 (NULL pool, serial fallback) since create(1) just allocates
             # a degenerate pool with no helpers.
