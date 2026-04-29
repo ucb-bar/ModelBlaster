@@ -12,19 +12,36 @@
 #   TARGET={scalar,rvv}                shared HW backend for all models
 #   QUANT={fp32,int8}                  shared quant for all models
 #   FORCE_REGEN={0,1}                  re-run each constituent's run.sh first
+#   RUNNER={spike,firesim}             simulator (default spike)
+#   POOL_SIZES=1,2,4                   when set, build pool-sweep harness
+#                                      that runs each model once per pool
+#                                      size; emits topo_<cores> profiles
+#                                      reflecting that hart layout in a
+#                                      single binary (amortizes infrasetup
+#                                      on firesim).
 set -euo pipefail
 
 MODELS="${MODELS:-mlp_generic,mlp_control}"
 TARGET="${TARGET:-scalar}"
 QUANT="${QUANT:-fp32}"
 FORCE_REGEN="${FORCE_REGEN:-0}"
+RUNNER="${RUNNER:-spike}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${REPO_ROOT}"
 export PATH="/usr/bin:${PATH}"
 
 EXAMPLE_DIR="${REPO_ROOT}/agents/examples/multi_demo"
-BUILD_DIR="${EXAMPLE_DIR}/${QUANT}/build/${TARGET}"
+BUILD_TAG="${TARGET}"
+if [[ -n "${POOL_SIZES:-}" ]]; then
+    # Distinct build dir for sweep — different multi_main.c, different
+    # AGENTS_POOL_SIZES define. Avoids stomping on the single-pool build.
+    BUILD_TAG="${TARGET}_sweep_${POOL_SIZES//,/_}"
+fi
+if [[ "${RUNNER}" == "firesim" ]]; then
+    BUILD_TAG="${BUILD_TAG}_firesim"
+fi
+BUILD_DIR="${EXAMPLE_DIR}/${QUANT}/build/${BUILD_TAG}"
 mkdir -p "${BUILD_DIR%/*}"
 
 # Split MODELS into an array, dedupe nothing (caller controls order).
@@ -50,8 +67,26 @@ for m in "${MODEL_LIST[@]}"; do
     MODEL_NAMES+="${MODEL_NAMES:+;}${m}"
 done
 
-echo "[multi] west build (TARGET=${TARGET} QUANT=${QUANT})"
+# Pick a board target up front: spike uses spike_riscv64; firesim uses the
+# chipyard_riscv64 quad-rocket-saturn board with its prj.conf overlay.
+case "${RUNNER}" in
+    spike)
+        BOARD_TARGET="spike_riscv64"
+        ;;
+    firesim)
+        BOARD_TARGET="chipyard_riscv64/rocketchip_virt_riscv64"
+        ;;
+    *)
+        echo "ERROR: unsupported RUNNER=${RUNNER} (expected spike|firesim)" >&2
+        exit 1
+        ;;
+esac
+
+echo "[multi] west build (TARGET=${TARGET} QUANT=${QUANT} RUNNER=${RUNNER} BOARD=${BOARD_TARGET})"
 echo "[multi]   models: ${MODEL_NAMES}"
+if [[ -n "${POOL_SIZES:-}" ]]; then
+    echo "[multi]   pool-sweep: ${POOL_SIZES}"
+fi
 
 KERNEL_CFLAGS=$(python -c "
 from agents.pipeline.backends import get
@@ -72,31 +107,30 @@ fi
 if [[ -n "${AGENTS_POOL_THREADS:-}" ]]; then
     WEST_CMAKE_ARGS+=("-DAGENTS_POOL_THREADS=${AGENTS_POOL_THREADS}")
 fi
+# Pool-sweep mode: tell the harness CMake to forward --pool-sizes to the
+# multi_main.c generator. The emitted main re-creates the pool per size
+# inside one binary.
+if [[ -n "${POOL_SIZES:-}" ]]; then
+    WEST_CMAKE_ARGS+=("-DAGENTS_POOL_SIZES=${POOL_SIZES}")
+fi
 
-west build -p -b spike_riscv64 agents/harness_multi \
+WEST_BUILD_EXTRA=()
+if [[ "${RUNNER}" == "firesim" ]]; then
+    WEST_BUILD_EXTRA+=(
+        -DEXTRA_CONF_FILE="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+    )
+fi
+
+west build -p -b "${BOARD_TARGET}" agents/harness_multi \
     --build-dir "${BUILD_DIR}" \
-    -- "${WEST_CMAKE_ARGS[@]}"
-
-echo "[multi] spike"
-SPIKE_ARGS=$(python -c "
-from agents.pipeline.backends import get
-b = get('${TARGET}')
-print(' '.join(b.spike_args))
-")
-SPIKE_FLAGS=("--spike-arg=-p${SPIKE_HARTS:-4}")
-for a in ${SPIKE_ARGS}; do
-    SPIKE_FLAGS+=("--spike-arg=${a}")
-done
+    -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
 # IREE-shape per-dispatch profile emission (opt-in via PROFILE_OUT_ROOT
-# env). When set, spike_runner additionally writes results.csv per model
+# env). When set, the runner additionally writes results.csv per model
 # under <root>/<backend>/<cpu>/<model>/.../topo_<cores>/. See
 # agents/pipeline/profile_writer.py.
 PROFILE_FLAGS=()
 if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
-    # Codegen uses lowercase backend names (matches agents/pipeline/backends.py);
-    # XPU-RT's directory lookup expects "RVV" uppercase. Default the label to
-    # an uppercased TARGET, overrideable via PROFILE_BACKEND.
     if [[ -z "${PROFILE_BACKEND:-}" ]]; then
         case "${TARGET}" in
             rvv) PROFILE_BACKEND="RVV" ;;
@@ -105,7 +139,7 @@ if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     fi
     PROFILE_FLAGS+=(
         "--profile-out-root=${PROFILE_OUT_ROOT}"
-        "--profile-source=${PROFILE_SOURCE:-spike}"
+        "--profile-source=${PROFILE_SOURCE:-${RUNNER}}"
         "--profile-backend=${PROFILE_BACKEND}"
         "--profile-cores=${PROFILE_CORES:-0,1,2,3}"
         "--profile-clock-mhz=${PROFILE_CLOCK_MHZ:-1000.0}"
@@ -115,11 +149,52 @@ if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     fi
 fi
 
-python -m agents.validation.spike_runner \
-    --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-    --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
-    --models "${MODELS}" \
-    --quant "${QUANT}" \
-    --timeout "${SPIKE_TIMEOUT:-600}" \
-    "${SPIKE_FLAGS[@]}" \
-    "${PROFILE_FLAGS[@]}"
+POOL_FLAGS=()
+if [[ -n "${POOL_SIZES:-}" ]]; then
+    POOL_FLAGS+=("--pool-sizes=${POOL_SIZES}")
+fi
+
+if [[ "${RUNNER}" == "spike" ]]; then
+    echo "[multi] spike"
+    SPIKE_ARGS=$(python -c "
+from agents.pipeline.backends import get
+b = get('${TARGET}')
+print(' '.join(b.spike_args))
+")
+    SPIKE_FLAGS=("--spike-arg=-p${SPIKE_HARTS:-4}")
+    for a in ${SPIKE_ARGS}; do
+        SPIKE_FLAGS+=("--spike-arg=${a}")
+    done
+    python -m agents.validation.spike_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
+        --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --models "${MODELS}" \
+        --quant "${QUANT}" \
+        --timeout "${SPIKE_TIMEOUT:-600}" \
+        "${SPIKE_FLAGS[@]}" \
+        "${POOL_FLAGS[@]}" \
+        "${PROFILE_FLAGS[@]}"
+else
+    echo "[multi] firesim"
+    FIRESIM_FLAGS=()
+    if [[ -n "${FIRESIM_ROOT:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-root=${FIRESIM_ROOT}")
+    fi
+    if [[ -n "${FIRESIM_ENV:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-env=${FIRESIM_ENV}")
+    fi
+    if [[ -n "${FIRESIM_SLOT:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-slot=${FIRESIM_SLOT}")
+    fi
+    if [[ -n "${FIRESIM_TIMEOUT:-}" ]]; then
+        FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
+    fi
+    python -m agents.validation.firesim_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
+        --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --models "${MODELS}" \
+        --quant "${QUANT}" \
+        "${FIRESIM_FLAGS[@]}" \
+        "${POOL_FLAGS[@]}" \
+        "${PROFILE_FLAGS[@]}"
+fi
