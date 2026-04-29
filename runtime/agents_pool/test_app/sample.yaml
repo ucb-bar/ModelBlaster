@@ -1,0 +1,16 @@
+sample:
+  description: agents_pool unit test (raw-pthread parallel-for)
+  name: agents_pool_test_app
+common:
+  tags: agents runtime agents_pool
+  integration_platforms:
+    - spike_riscv64
+  harness: console
+  harness_config:
+    type: multi_line
+    regex:
+      - "=== AGENTS_POOL_TEST_BEGIN ==="
+      - "=== AGENTS_POOL_TEST_END ==="
+tests:
+  sample.agents.runtime.agents_pool:
+    tags: agents

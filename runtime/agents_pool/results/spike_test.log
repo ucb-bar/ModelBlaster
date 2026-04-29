@@ -1,0 +1,7 @@
+*** Booting Zephyr OS build 5a06eb0d14f9 ***
+agents_pool_test: starting on spike_riscv64/rocketchip_virt_riscv64 (MP_MAX_NUM_CPUS=4)
+agents_pool_test: pool create OK, threads=4
+=== AGENTS_POOL_TEST_BEGIN ===
+PASS: 3/3 sub-tests passed
+PERF: range=32 N=4 reps=16 per_call_cycles min=571 avg=8416
+=== AGENTS_POOL_TEST_END ===
