@@ -101,8 +101,18 @@ def _prod(shape: list[int]) -> int:
     return n
 
 
-def _buf_name(tensor: str) -> str:
-    return f"buf_{_c_ident(tensor)}"
+def _buf_name(mid: str, tensor: str) -> str:
+    """Intermediate-buffer symbol name. Mangled with the model id so
+    multiple models can have a `buf_x` and still link without collision
+    when the buffers are emitted with external (non-static) linkage.
+    External linkage is required by the heterogeneous (harness_xpurt)
+    flow: each (model, backend) is its own OBJECT lib, so file-static
+    buffers would give each backend its own private copy and cross-
+    backend dispatches would read zeroed scratch. The buffers TU is
+    compiled once per model (NOT per backend) and shared by all
+    backends; same model.c source compiled per backend re-uses the
+    single shared definition via `extern` declarations."""
+    return f"buf_{mid}_{_c_ident(tensor)}"
 
 
 # Ops the skeleton routes through a parallel_for wrapper. Wrappers are
@@ -485,18 +495,22 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     with open(os.path.join(out_dir, "model.h"), "w") as f:
         f.write(h)
 
-    # Allocate one static buffer per intermediate tensor (skip input, any
-    # final output tensor, and any tensor that is just a view alias).
+    # Allocate one buffer per intermediate tensor (skip input, any final
+    # output tensor, and any tensor that is just a view alias).
+    # Definitions live in a sibling buffers.c so every backend's copy of
+    # model.c sees the SAME storage via extern (see _buf_name for why).
     out_tensor_set = set(out_tensors_list)
     intermediates = [
         t for t in tensors
         if t != in_tensor and t not in out_tensor_set and t not in aliases
     ]
-    buf_decls = []
+    buf_defs: list[str] = []   # for buffers.c (definitions, no `static`)
+    buf_externs: list[str] = []  # for model.c (declarations)
     for t in intermediates:
         size = _prod(tensors[t]["shape"])
         c_type = _dtype_to_c(tensors[t]["dtype"])
-        buf_decls.append(f"static {c_type} {_buf_name(t)}[{size}];")
+        buf_defs.append(f"{c_type} {_buf_name(mid, t)}[{size}];")
+        buf_externs.append(f"extern {c_type} {_buf_name(mid, t)}[{size}];")
 
     def ptr_for(tensor: str, role: str) -> str:
         tensor = resolve_alias(tensor)
@@ -505,7 +519,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         if tensor in out_tensor_to_offset:
             off = out_tensor_to_offset[tensor]
             return "output" if off == 0 else f"(output + {off})"
-        return _buf_name(tensor)
+        return _buf_name(mid, tensor)
 
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
     dispatch_fns: list[str] = []
@@ -741,10 +755,13 @@ static inline unsigned long rdcycle(void)
 }}
 {_emit_parallel_wrappers(mid, used_ops)}
 
-/* Per-model intermediate buffers. File-static so they don't collide across
- * model TUs even without name mangling, but tagged with model_<mid>_ for
- * debuggability. */
-{chr(10).join(buf_decls)}
+/* Per-model intermediate buffers. Defined in a sibling buffers.c (one
+ * TU per model, NOT per backend) so the heterogeneous harness's two
+ * model.c TUs (rvv + scalar) share the same scratch — otherwise each
+ * backend's file-static buf_* would shadow the other and cross-backend
+ * dispatches would read zeroed scratch. Names are mangled with the
+ * model id (buf_<mid>_*) so different models don't collide at link. */
+{chr(10).join(buf_externs)}
 
 /* File-static — invisible across TUs, no need to mangle. Locals to this .c. */
 static model_{mid}_op_record_t records_[MODEL_{umid}_OP_COUNT];
@@ -796,6 +813,26 @@ unsigned long model_{mid}_wall_cycles(void) {{
 """
     with open(os.path.join(out_dir, "model.c"), "w") as f:
         f.write(c)
+
+    # Sibling buffers.c — definitions for the intermediate scratch
+    # buffers that model.c references via extern. Compiled exactly once
+    # per model (NOT per backend) so heterogeneous binaries share a
+    # single instance across rvv/scalar/etc. dispatch tables.
+    buf_c = f"""{HEADER}
+/*
+ * Per-model intermediate buffer storage. Definitions only — declarations
+ * live alongside the dispatch fns in model.c. This file must be linked
+ * EXACTLY ONCE per model into any binary (single-backend, multi-model,
+ * or heterogeneous). The heterogeneous harness compiles model.c per
+ * backend but pulls in this TU only once, so all backends end up
+ * pointing at the same scratch storage and cross-backend dispatches
+ * within one network see consistent intermediate state.
+ */
+
+{chr(10).join(buf_defs)}
+"""
+    with open(os.path.join(out_dir, "buffers.c"), "w") as f:
+        f.write(buf_c)
 
 
 def emit_test_io(model_name: str, io_npz: str, out_dir: str) -> None:
@@ -860,7 +897,8 @@ def generate(ir_path: str, weights_path: str, io_path: str, out_dir: str) -> Non
     emit_model(ir, out_dir)
     emit_test_io(model_name, io_path, out_dir)
 
-    files = ["weights.h", "weights.c", "model.h", "model.c", "test_io.h"]
+    files = ["weights.h", "weights.c", "model.h", "model.c",
+             "buffers.c", "test_io.h"]
     for fn in files:
         print(f"wrote {os.path.join(out_dir, fn)}")
 

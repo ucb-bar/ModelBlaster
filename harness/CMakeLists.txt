@@ -43,7 +43,7 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(agents_harness)
 
-foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h test_io.h)
+foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h)
     if(NOT EXISTS "${MODEL_DIR}/${_required}")
         message(FATAL_ERROR
             "MODEL_DIR='${MODEL_DIR}' is missing required file: ${_required}. "
@@ -57,6 +57,7 @@ target_sources(app PRIVATE
     ${MODEL_DIR}/model.c
     ${MODEL_DIR}/kernels.c
     ${MODEL_DIR}/weights.c
+    ${MODEL_DIR}/buffers.c
 )
 
 # Big models (mlp_control's hidden layers, dronet's conv weights) push

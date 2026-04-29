@@ -194,6 +194,23 @@ foreach(_i RANGE ${_last})
     target_include_directories(${_weights_tgt} PRIVATE "${_primary_dir}")
     target_link_libraries(${_weights_tgt} PRIVATE zephyr_interface)
     target_compile_definitions(${_weights_tgt} PRIVATE AGENTS_DISABLE_UNMANGLED=1)
+
+    # Intermediate-buffer storage — also single OBJECT lib per model, NOT
+    # per backend. Without this, each per-backend model.c TU would carry
+    # its own private file-static `buf_*` and cross-backend dispatches
+    # within one network would read zeroed scratch (caused dronet output
+    # corruption on FireSim where rvv ran maxpool1 but scalar's
+    # conv_modules.3 read its own backend's `buf_maxpool1`). model.c's
+    # extern declarations resolve against this single TU's definitions.
+    if(NOT EXISTS "${_primary_dir}/buffers.c")
+        message(FATAL_ERROR
+            "MODEL_DIRS_BASE[${_i}]/${_PRIMARY_BS}='${_primary_dir}' missing buffers.c — "
+            "regenerate the skeleton with the latest agents/pipeline/generate_skeleton.py")
+    endif()
+    set(_buffers_tgt "agents_${_name}_buffers_obj")
+    add_library(${_buffers_tgt} OBJECT "${_primary_dir}/buffers.c")
+    target_include_directories(${_buffers_tgt} PRIVATE "${_primary_dir}")
+    target_link_libraries(${_buffers_tgt} PRIVATE zephyr_interface)
 endforeach()
 
 # Schedule-driven app: xpurt_main.c + the dispatch table .c.
@@ -213,13 +230,16 @@ if(AGENTS_XPURT_TRACE)
     target_compile_definitions(app PRIVATE AGENTS_XPURT_TRACE=1)
 endif()
 
-# Link every (model, backend) OBJECT lib + the per-model weights OBJECT lib
-# into the final binary.
+# Link every (model, backend) OBJECT lib + the per-model weights and
+# buffers OBJECT libs into the final binary. weights and buffers are
+# shared across all backends of one model — see comments where they're
+# declared.
 foreach(_name ${MODEL_NAMES})
     foreach(_bs IN LISTS MODEL_BACKENDS)
         target_link_libraries(app PRIVATE agents_${_name}_${_bs}_objs)
     endforeach()
     target_link_libraries(app PRIVATE agents_${_name}_weights_obj)
+    target_link_libraries(app PRIVATE agents_${_name}_buffers_obj)
 endforeach()
 target_link_libraries(app PRIVATE pthreadpool)
 

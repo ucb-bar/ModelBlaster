@@ -118,7 +118,7 @@ foreach(_i RANGE ${_last})
     list(GET MODEL_NAMES ${_i} _name)
     list(GET MODEL_DIRS  ${_i} _dir)
 
-    foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h test_io.h)
+    foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h)
         if(NOT EXISTS "${_dir}/${_required}")
             message(FATAL_ERROR
                 "MODEL_DIRS[${_i}]='${_dir}' is missing ${_required}")
@@ -128,11 +128,17 @@ foreach(_i RANGE ${_last})
     # Per-model OBJECT library: each compiled with its OWN include path
     # so its model.c sees the right kernels.h / weights.h / model.h. This
     # is the key to letting two models with same-named headers (different
-    # mangled symbols inside) link into one binary.
+    # mangled symbols inside) link into one binary. buffers.c lives here
+    # too — model.c references its symbols via extern, so the per-model
+    # OBJECT lib must define them. (For harness_xpurt's heterogeneous
+    # case the buffers TU is hoisted into a separate per-model lib so
+    # multiple backends can share storage; here it's safe to inline since
+    # there's just one backend per model.)
     add_library(agents_${_name}_objs OBJECT
         "${_dir}/model.c"
         "${_dir}/kernels.c"
         "${_dir}/weights.c"
+        "${_dir}/buffers.c"
     )
     target_include_directories(agents_${_name}_objs PRIVATE "${_dir}")
     target_link_libraries(agents_${_name}_objs PRIVATE zephyr_interface)
