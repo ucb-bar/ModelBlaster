@@ -94,7 +94,11 @@ project(agents_harness_multi)
 # phase of the pthreadpool->agents_pool migration validate
 # independently without breaking existing builds.
 if(NOT DEFINED AGENTS_POOL_BACKEND)
-    set(AGENTS_POOL_BACKEND "pthreadpool")
+    # Phase 3: default flipped from `pthreadpool` to `raw`. The
+    # agents_pool path is ~650x cheaper per dispatch on FireSim.
+    # `pthreadpool` is still selectable for A/B comparisons until
+    # Phase 4 retires it.
+    set(AGENTS_POOL_BACKEND "raw")
 endif()
 set(_VALID_POOL_BACKENDS "pthreadpool" "raw")
 list(FIND _VALID_POOL_BACKENDS "${AGENTS_POOL_BACKEND}" _pb_idx)

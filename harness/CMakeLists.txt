@@ -37,7 +37,10 @@ endif()
 # switch position confirms the codegen path remains backend-agnostic
 # when AGENTS_USE_POOL is undefined.
 if(NOT DEFINED AGENTS_POOL_BACKEND)
-    set(AGENTS_POOL_BACKEND "pthreadpool")
+    # Phase 3 default — kept aligned with the multi/xpurt harnesses for
+    # consistency, though this single-model harness never engages a pool
+    # (AGENTS_USE_POOL is undefined in its model.c builds).
+    set(AGENTS_POOL_BACKEND "raw")
 endif()
 set(_VALID_POOL_BACKENDS "pthreadpool" "raw")
 list(FIND _VALID_POOL_BACKENDS "${AGENTS_POOL_BACKEND}" _pb_idx)
