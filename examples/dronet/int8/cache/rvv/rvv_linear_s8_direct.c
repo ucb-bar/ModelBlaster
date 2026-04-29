@@ -6,20 +6,40 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
                       int activation_min, int activation_max) {
     for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
-            int32_t acc = bias ? bias[n] : 0;
-            for (int k = 0; k < K; k++) {
-                int32_t in_v = (int32_t)input[m * K + k] + input_offset;
-                int32_t w_v  = (int32_t)weight[n * K + k] + filter_offset;
-                acc += in_v * w_v;
+            size_t vl;
+            vint32m4_t vacc = __riscv_vmv_v_x_i32m4(0, __riscv_vsetvlmax_e32m4());
+            const int8_t *in_row  = input + m * K;
+            const int8_t *w_row   = weight + n * K;
+            int k = 0;
+            for (; k + 2*(__riscv_vsetvlmax_e8m1()) <= K; k += 2*(__riscv_vsetvlmax_e8m1())) {
+                vl = __riscv_vsetvl_e8m1(K - k);
+                vint8m1_t va = __riscv_vle8_v_i8m1(in_row + k, vl);
+                vint8m1_t vb = __riscv_vle8_v_i8m1(w_row + k, vl);
+                vint16m2_t prod = __riscv_vwmul_vv_i16m2(va, vb, vl);
+                vacc = __riscv_vwadd_wv_i32m4(vacc, prod, vl);
+                va = __riscv_vle8_v_i8m1(in_row + k + vl, vl);
+                vb = __riscv_vle8_v_i8m1(w_row + k + vl, vl);
+                prod = __riscv_vwmul_vv_i16m2(va, vb, vl);
+                vacc = __riscv_vwadd_wv_i32m4(vacc, prod, vl);
             }
-            /* Q0.31 rounding multiply. */
+            for (; k < K; k += vl) {
+                vl = __riscv_vsetvl_e8m1(K - k);
+                vint8m1_t va = __riscv_vle8_v_i8m1(in_row + k, vl);
+                vint8m1_t vb = __riscv_vle8_v_i8m1(w_row + k, vl);
+                vint16m2_t prod = __riscv_vwmul_vv_i16m2(va, vb, vl);
+                vacc = __riscv_vwadd_wv_i32m4(vacc, prod, vl);
+            }
+            vint32m1_t vinit = __riscv_vmv_s_x_i32m1(0, 1);
+            vint32m1_t vsum  = __riscv_vredsum_vs_i32m4_i32m1(vacc, vinit, __riscv_vsetvlmax_e32m4());
+            int32_t acc = __riscv_vmv_x_s_i32m1_i32(vsum);
+            if (bias) acc += bias[n];
             int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
             prod = (prod + (1LL << 30)) >> 31;
             int32_t scaled = (int32_t)prod;
             if (output_shift > 0) {
                 int32_t round = (1 << (output_shift - 1));
                 scaled = (scaled + round) >> output_shift;
-            } else if (output_shift < 0) {
+            } else {
                 scaled = scaled << (-output_shift);
             }
             scaled += output_offset;
@@ -29,4 +49,3 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
         }
     }
 }
-
