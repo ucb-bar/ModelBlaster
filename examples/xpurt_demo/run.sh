@@ -23,6 +23,9 @@
 #   AGENTS_POOL_THREADS  pthreadpool worker count (default: 4)
 #   FORCE_REGEN     {0,1}   re-run each model's run.sh first (default: 1)
 #   XPURT_TRACE     {0,1}   enable execution-trace capture (default: 0)
+#   RUNNER          {spike,firesim}  default spike. firesim picks the
+#                   chipyard_riscv64 board + firesim_chipyard.conf overlay
+#                   and dispatches to firesim_runner.py instead of spike.
 #
 # Pre-reqs (from repo root):
 #   source tools/miniforge3/etc/profile.d/conda.sh && conda activate zephyr
@@ -43,12 +46,30 @@ CPU_E_KIND="${CPU_E_KIND:-scalar}"
 AGENTS_POOL_THREADS="${AGENTS_POOL_THREADS:-4}"
 FORCE_REGEN="${FORCE_REGEN:-1}"
 SCHED_NAME="${SCHED_NAME:-xpurt_demo_schedule}"
+RUNNER="${RUNNER:-spike}"
+
+case "${RUNNER}" in
+    spike)
+        BOARD_TARGET="spike_riscv64"
+        ;;
+    firesim)
+        BOARD_TARGET="chipyard_riscv64/rocketchip_virt_riscv64"
+        ;;
+    *)
+        echo "ERROR: unsupported RUNNER=${RUNNER} (expected spike|firesim)" >&2
+        exit 1
+        ;;
+esac
 
 EXAMPLE_DIR="${REPO_ROOT}/agents/examples/xpurt_demo"
 GEN_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 # Build dir tag carries the full backend set so cross-backend builds
-# don't clobber each other.
+# don't clobber each other; appended _firesim when targeting the chipyard
+# board so the spike build doesn't get reused.
 BUILD_TAG="$(echo "${BACKENDS}" | tr ',' '_')"
+if [[ "${RUNNER}" == "firesim" ]]; then
+    BUILD_TAG="${BUILD_TAG}_firesim"
+fi
 BUILD_DIR="${EXAMPLE_DIR}/${QUANT}/build/${BUILD_TAG}"
 mkdir -p "${GEN_DIR}" "${BUILD_DIR%/*}"
 
@@ -67,7 +88,13 @@ for m in "${MODEL_LIST[@]}"; do
         m_gen_dir="${m_base}/${bs}"
         if [[ "${FORCE_REGEN}" == "1" || ! -f "${m_gen_dir}/model.h" ]]; then
             echo "[stage] running agents/examples/${m}/run.sh (TARGET=${bs})"
-            TARGET="${bs}" QUANT="${QUANT}" \
+            # Staging just needs the generated/ artifacts (graph.json,
+            # model.{h,c}, kernels.c, weights.c, buffers.c, test_io.h);
+            # the per-model run.sh's [4/5] west build + [5/5] simulator
+            # run are wasted work here. Force RUNNER=spike so we don't
+            # accidentally fire up FireSim N times (one per model x
+            # backend) while xpurt_demo itself is targeting firesim.
+            TARGET="${bs}" QUANT="${QUANT}" RUNNER=spike \
                 bash "${REPO_ROOT}/agents/examples/${m}/run.sh" >/dev/null
         fi
     done
@@ -134,15 +161,25 @@ done
 if [[ "${XPURT_TRACE:-0}" == "1" ]]; then
     WEST_CMAKE_ARGS+=("-DAGENTS_XPURT_TRACE=ON")
 fi
-west build -p -b spike_riscv64 agents/harness_xpurt \
-    --build-dir "${BUILD_DIR}" \
-    -- "${WEST_CMAKE_ARGS[@]}"
 
-# 4) Run on spike + verify. Use the union of all backends' spike-args
-#    (deduped) so the simulator's --isa is broad enough for whichever
-#    backend the schedule routes a given dispatch to.
-echo "[xpurt] spike + verify"
-SPIKE_ARGS=$(python -c "
+WEST_BUILD_EXTRA=()
+if [[ "${RUNNER}" == "firesim" ]]; then
+    WEST_BUILD_EXTRA+=(
+        -DEXTRA_CONF_FILE="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+    )
+fi
+
+west build -p -b "${BOARD_TARGET}" agents/harness_xpurt \
+    --build-dir "${BUILD_DIR}" \
+    -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
+
+# 4) Run + verify. Spike: union of all backends' spike-args (deduped) so
+#    the simulator's --isa covers whichever backend the schedule routes a
+#    given dispatch to. FireSim: hardware is fixed (RVV-capable rocket),
+#    so just hand the elf to firesim_runner.
+echo "[xpurt] ${RUNNER} + verify"
+if [[ "${RUNNER}" == "spike" ]]; then
+    SPIKE_ARGS=$(python -c "
 from agents.pipeline.backends import get
 seen = set()
 out = []
@@ -152,14 +189,35 @@ for bs in '${BACKENDS}'.split(','):
             seen.add(a); out.append(a)
 print(' '.join(out))
 ")
-SPIKE_FLAGS=("--spike-arg=-p${SPIKE_HARTS:-4}")
-for a in ${SPIKE_ARGS}; do
-    SPIKE_FLAGS+=("--spike-arg=${a}")
-done
-python -m agents.validation.spike_runner \
-    --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-    --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
-    --models "${MODELS}" \
-    --quant "${QUANT}" \
-    --timeout "${SPIKE_TIMEOUT:-900}" \
-    "${SPIKE_FLAGS[@]}"
+    SPIKE_FLAGS=("--spike-arg=-p${SPIKE_HARTS:-4}")
+    for a in ${SPIKE_ARGS}; do
+        SPIKE_FLAGS+=("--spike-arg=${a}")
+    done
+    python -m agents.validation.spike_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
+        --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --models "${MODELS}" \
+        --quant "${QUANT}" \
+        --timeout "${SPIKE_TIMEOUT:-900}" \
+        "${SPIKE_FLAGS[@]}"
+else
+    FIRESIM_FLAGS=()
+    if [[ -n "${FIRESIM_ROOT:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-root=${FIRESIM_ROOT}")
+    fi
+    if [[ -n "${FIRESIM_ENV:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-env=${FIRESIM_ENV}")
+    fi
+    if [[ -n "${FIRESIM_SLOT:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-slot=${FIRESIM_SLOT}")
+    fi
+    if [[ -n "${FIRESIM_TIMEOUT:-}" ]]; then
+        FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
+    fi
+    python -m agents.validation.firesim_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
+        --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --models "${MODELS}" \
+        --quant "${QUANT}" \
+        "${FIRESIM_FLAGS[@]}"
+fi
