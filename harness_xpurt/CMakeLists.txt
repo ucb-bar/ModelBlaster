@@ -83,40 +83,11 @@ endforeach()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(agents_harness_xpurt)
 
-# AGENTS_POOL_BACKEND={pthreadpool,raw} — see agents/harness_multi for
-# rationale. `pthreadpool` is the historical default; `raw` swaps in
-# agents/runtime/agents_pool.
-if(NOT DEFINED AGENTS_POOL_BACKEND)
-    # Phase 3 default — see agents/harness_multi/CMakeLists.txt rationale.
-    set(AGENTS_POOL_BACKEND "raw")
-endif()
-set(_VALID_POOL_BACKENDS "pthreadpool" "raw")
-list(FIND _VALID_POOL_BACKENDS "${AGENTS_POOL_BACKEND}" _pb_idx)
-if(_pb_idx EQUAL -1)
-    message(FATAL_ERROR
-        "AGENTS_POOL_BACKEND='${AGENTS_POOL_BACKEND}' must be one of: "
-        "${_VALID_POOL_BACKENDS}")
-endif()
-message(STATUS "agents harness_xpurt: AGENTS_POOL_BACKEND=${AGENTS_POOL_BACKEND}")
-
+# Parallel-for pool: agents/runtime/agents_pool. See
+# agents/harness_multi/CMakeLists.txt for the migration rationale.
 set(_REPO_ROOT_ABS "${CMAKE_CURRENT_LIST_DIR}/../..")
-if(AGENTS_POOL_BACKEND STREQUAL "pthreadpool")
-    # pthreadpool — same vendored source path.
-    set(PTHREADPOOL_SOURCE_DIR
-        "${_REPO_ROOT_ABS}/third-party/executorch/backends/xnnpack/third-party/pthreadpool"
-        CACHE STRING "")
-    set(FXDIV_SOURCE_DIR
-        "${_REPO_ROOT_ABS}/third-party/executorch/backends/xnnpack/third-party/FXdiv"
-        CACHE STRING "")
-    set(PTHREADPOOL_BUILD_TESTS      OFF CACHE BOOL "")
-    set(PTHREADPOOL_BUILD_BENCHMARKS OFF CACHE BOOL "")
-    set(PTHREADPOOL_ALLOW_DEPRECATED_API OFF CACHE BOOL "")
-    add_subdirectory("${PTHREADPOOL_SOURCE_DIR}" pthreadpool_build)
-    target_link_libraries(pthreadpool PRIVATE zephyr_interface)
-else()
-    add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/agents_pool"
-                     agents_pool_build)
-endif()
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/agents_pool"
+                 agents_pool_build)
 
 # Stage per-model headers under <build>/agents_xpurt/<name>_model.h
 # matching harness_multi's convention so xpurt_main.c #include lines line up.
@@ -185,20 +156,12 @@ foreach(_i RANGE ${_last})
             "${_backend_dir}/model.c" "${_backend_dir}/kernels.c")
         target_include_directories(${_obj_tgt} PRIVATE "${_backend_dir}")
         target_link_libraries(${_obj_tgt} PRIVATE zephyr_interface)
-        if(AGENTS_POOL_BACKEND STREQUAL "raw")
-            target_link_libraries(${_obj_tgt} PRIVATE agents_pool)
-        else()
-            target_link_libraries(${_obj_tgt} PRIVATE pthreadpool)
-        endif()
+        target_link_libraries(${_obj_tgt} PRIVATE agents_pool)
         # AGENTS_DISABLE_UNMANGLED keeps the unmangled aliases out of these
         # TUs (multi-model linking would alias-collide otherwise).
         target_compile_definitions(${_obj_tgt} PRIVATE
             AGENTS_USE_POOL=1
             AGENTS_DISABLE_UNMANGLED=1)
-        if(AGENTS_POOL_BACKEND STREQUAL "raw")
-            target_compile_definitions(${_obj_tgt} PRIVATE
-                AGENTS_POOL_BACKEND_RAW=1)
-        endif()
         if(_rename_defs)
             target_compile_definitions(${_obj_tgt} PRIVATE ${_rename_defs})
         endif()
@@ -270,12 +233,7 @@ foreach(_name ${MODEL_NAMES})
     target_link_libraries(app PRIVATE agents_${_name}_weights_obj)
     target_link_libraries(app PRIVATE agents_${_name}_buffers_obj)
 endforeach()
-if(AGENTS_POOL_BACKEND STREQUAL "raw")
-    target_compile_definitions(app PRIVATE AGENTS_POOL_BACKEND_RAW=1)
-    target_link_libraries(app PRIVATE agents_pool)
-else()
-    target_link_libraries(app PRIVATE pthreadpool)
-endif()
+target_link_libraries(app PRIVATE agents_pool)
 
 # Same RISC-V gp-relative relax fix as harness_multi.
 zephyr_link_libraries(-Wl,--no-relax)

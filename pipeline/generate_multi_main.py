@@ -41,7 +41,7 @@ def _emit(models: list[tuple[str, str]],
 
     If `pool_sizes` is provided, each model runs once per pool size; the
     output blocks are tagged `[<model>@p<N>]`. Each iteration tears down
-    and re-creates the pthreadpool so the per-op profile records reflect
+    and re-creates the agents_pool so the per-op profile records reflect
     that exact pool width. Useful for collecting topo_0 / topo_0_1 /
     topo_0_1_2_3 results in a single FireSim run, amortizing the
     infrasetup + flash + boot overhead.
@@ -110,25 +110,15 @@ def _emit(models: list[tuple[str, str]],
             ps_block_parts = [
                 f"""\
     /* === pool_size = {ps} ============================================ */
-#ifdef AGENTS_POOL_BACKEND_RAW
     agents_pool_destroy(pool);
     pool = agents_pool_create({ps});
-#else
-    pthreadpool_destroy(pool);
-    pool = pthreadpool_create({ps});
-#endif
     if (pool == NULL && {ps} > 0) {{
-        printf("FATAL: pool_create({ps}) returned NULL\\n");
+        printf("FATAL: agents_pool_create({ps}) returned NULL\\n");
         sys_reboot(SYS_REBOOT_COLD);
         return -1;
     }}
-#ifdef AGENTS_POOL_BACKEND_RAW
     printf("agents_pool resized to %u workers\\n",
            (unsigned)agents_pool_get_threads_count(pool));
-#else
-    printf("pthreadpool resized to %u workers\\n",
-           (unsigned)pthreadpool_get_threads_count(pool));
-#endif
 """
             ]
             for name, _ in models:
@@ -145,7 +135,7 @@ def _emit(models: list[tuple[str, str]],
  * unmangled aliases (run_model, model_input_t, MODEL_NAME, ...) that would
  * collide across models.
  *
- * The harness owns a single pthreadpool. It's created here and threaded
+ * The harness owns a single agents_pool. It's created here and threaded
  * through every run_model_<name>() call so per-op kernels can dispatch
  * work onto it (intra-model parallelism). Kernels that are still
  * sequential simply ignore the handle.
@@ -155,59 +145,27 @@ def _emit(models: list[tuple[str, str]],
 
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef AGENTS_POOL_BACKEND_RAW
 #include "agents_pool.h"
-#else
-#include <pthreadpool.h>
-#endif
 #include <zephyr/sys/reboot.h>
 
 {chr(10).join(inc_lines)}
 
 {chr(10).join(buf_decls)}
 
-#ifndef AGENTS_POOL_BACKEND_RAW
-/* pthreadpool's memory.c calls posix_memalign() (non-Android, non-Win
- * branch). The picolibc object that supplies posix_memalign also
- * defines memalign + aligned_alloc, and Zephyr's COMMON_LIBC_MALLOC
- * already defines aligned_alloc -- which produces a duplicate-definition
- * link error. Defining memalign here forces the linker to satisfy the
- * memalign reference from this TU, so picolibc's combined object is
- * never pulled in. (samples/xnnpack avoids this implicitly via
- * CONFIG_GLIBCXX_LIBCPP, which we don't enable since we have no C++.)
- *
- * The agents_pool path doesn't need this — it allocates only via plain
- * malloc() which Zephyr's COMMON_LIBC_MALLOC supplies directly.
- */
-void *memalign(size_t alignment, size_t size)
-{{
-    return aligned_alloc(alignment, size);
-}}
-
-int posix_memalign(void **out, size_t alignment, size_t size)
-{{
-    void *p = aligned_alloc(alignment, size);
-    if (p == NULL) {{
-        return 12; /* ENOMEM */
-    }}
-    *out = p;
-    return 0;
-}}
-#endif
-
 int main(void)
 {{
     printf("agents multi-model harness: %d models on %s\\n",
            {len(models)}, CONFIG_BOARD_TARGET);
 
-    /* AGENTS_POOL_THREADS lets the build pick a fixed worker count; 0 (the
-     * default) lets pthreadpool auto-pick CONFIG_MP_MAX_NUM_CPUS. The
-     * sweep harness sets this per-run to compare 1- vs N-thread costs.
+    /* AGENTS_POOL_THREADS lets the build pick a fixed worker count; 0
+     * (the default) makes agents_pool_create return NULL and the
+     * generated parallel_<op> wrappers fall back to a sequential kernel
+     * call. The sweep harness sets this per-run to compare 1- vs
+     * N-thread costs.
      */
 #ifndef AGENTS_POOL_THREADS
 #define AGENTS_POOL_THREADS 0
 #endif
-#ifdef AGENTS_POOL_BACKEND_RAW
     agents_pool_t pool = agents_pool_create(AGENTS_POOL_THREADS);
     if (pool == NULL && AGENTS_POOL_THREADS > 0) {{
         printf("FATAL: agents_pool_create returned NULL\\n");
@@ -216,24 +174,10 @@ int main(void)
     }}
     printf("agents_pool: %u threads\\n",
            (unsigned)agents_pool_get_threads_count(pool));
-#else
-    pthreadpool_t pool = pthreadpool_create(AGENTS_POOL_THREADS);
-    if (pool == NULL) {{
-        printf("FATAL: pthreadpool_create returned NULL\\n");
-        sys_reboot(SYS_REBOOT_COLD);
-        return -1;
-    }}
-    printf("pthreadpool: %u threads\\n",
-           (unsigned)pthreadpool_get_threads_count(pool));
-#endif
 
 {chr(10).join(run_blocks)}
 
-#ifdef AGENTS_POOL_BACKEND_RAW
     agents_pool_destroy(pool);
-#else
-    pthreadpool_destroy(pool);
-#endif
     sys_reboot(SYS_REBOOT_COLD);
     return 0;
 }}

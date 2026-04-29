@@ -29,29 +29,6 @@ if(NOT DEFINED AGENTS_BACKEND)
     set(AGENTS_BACKEND "scalar")
 endif()
 
-# AGENTS_POOL_BACKEND={pthreadpool,raw} accepted for symmetry with the
-# multi-model and xpurt harnesses, but unused here: the single-model
-# harness compiles model.c without AGENTS_USE_POOL, so the
-# parallel_<op> wrappers fall back to a sequential kernel call and no
-# pool implementation is linked. Validating this harness under either
-# switch position confirms the codegen path remains backend-agnostic
-# when AGENTS_USE_POOL is undefined.
-if(NOT DEFINED AGENTS_POOL_BACKEND)
-    # Phase 3 default — kept aligned with the multi/xpurt harnesses for
-    # consistency, though this single-model harness never engages a pool
-    # (AGENTS_USE_POOL is undefined in its model.c builds).
-    set(AGENTS_POOL_BACKEND "raw")
-endif()
-set(_VALID_POOL_BACKENDS "pthreadpool" "raw")
-list(FIND _VALID_POOL_BACKENDS "${AGENTS_POOL_BACKEND}" _pb_idx)
-if(_pb_idx EQUAL -1)
-    message(FATAL_ERROR
-        "AGENTS_POOL_BACKEND='${AGENTS_POOL_BACKEND}' must be one of: "
-        "${_VALID_POOL_BACKENDS}")
-endif()
-message(STATUS "agents harness: AGENTS_POOL_BACKEND=${AGENTS_POOL_BACKEND} "
-               "(no-op for single-model harness)")
-
 # Splice the backend prj.conf overlay BEFORE find_package(Zephyr) so its
 # CONFIG_* lines reach Kconfig.
 set(CONF_FILE "prj.conf")
