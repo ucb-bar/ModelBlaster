@@ -154,8 +154,14 @@ def _summary(rows: list[TraceEntry]) -> str:
     )
 
 
-def render_plot(rows: list[TraceEntry], out_path: str) -> None:
-    """Two stacked Gantt charts (predicted on top, actual below)."""
+def render_plot(rows: list[TraceEntry], out_path: str,
+                source: str = "spike") -> None:
+    """Two stacked Gantt charts (predicted on top, actual below).
+
+    `source` is the simulator that produced the trace — used in the
+    bottom subplot title (e.g. "Actual execution on FireSim"). Free-form
+    so future runners can pass their own label.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -220,7 +226,7 @@ def render_plot(rows: list[TraceEntry], out_path: str) -> None:
     ax_actual.set_yticks(list(actual_lane_idx.values()))
     ax_actual.set_yticklabels([f"worker[{i}]" for i in actual_lane_keys])
     ax_actual.set_title(
-        f"Actual execution on spike "
+        f"Actual execution on {source} "
         f"(red border = ran past predicted finish)")
     ax_actual.set_xlabel("time (ms)")
     ax_actual.invert_yaxis()
@@ -261,6 +267,9 @@ def main() -> None:
                     help="path for the rendered PNG (omit to skip the plot)")
     ap.add_argument("--csv", default=None,
                     help="path for a flat trace CSV (predicted+actual per entry)")
+    ap.add_argument("--source", default="spike",
+                    help="simulator label for the bottom-subplot title "
+                         "(e.g. 'spike', 'FireSim', 'rtl-sim'). Default: spike.")
     args = ap.parse_args()
 
     text = _read_text(args.input)
@@ -271,7 +280,7 @@ def main() -> None:
         write_csv(rows, args.csv)
         print(f"wrote {args.csv}")
     if args.out:
-        render_plot(rows, args.out)
+        render_plot(rows, args.out, source=args.source)
         print(f"wrote {args.out}")
     elif not args.csv:
         # No outputs requested — print the trace to stdout for piping.
