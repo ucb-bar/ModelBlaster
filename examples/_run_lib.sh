@@ -84,6 +84,25 @@ if [[ "${OPTIMIZE}" == "1" ]]; then
         --expansions "${EXPANSIONS:-3}"
         --iterations "${ITERATIONS:-2}"
     )
+    # Memory-aware optimize knobs. Both default off — set FIRESIM_EVAL=1
+    # to re-rank top-K spike survivors on the FireSim FPGA and promote
+    # the firesim-best to cache. Pair with CACHE_AWARE_PROMPT=1 to also
+    # splice the target's memory-hierarchy stanza into the LLM optimize
+    # prompt. FIRESIM_OPS is a comma-list to limit re-rank to specific
+    # ops (e.g. "conv2d,linear") and skip cheap elementwise ops that
+    # don't benefit.
+    if [[ "${FIRESIM_EVAL:-0}" == "1" ]]; then
+        GEN_KERNELS_ARGS+=(
+            --firesim-eval
+            --firesim-top-k "${FIRESIM_TOP_K:-3}"
+        )
+        if [[ -n "${FIRESIM_OPS:-}" ]]; then
+            GEN_KERNELS_ARGS+=(--firesim-ops "${FIRESIM_OPS}")
+        fi
+    fi
+    if [[ "${CACHE_AWARE_PROMPT:-0}" == "1" ]]; then
+        GEN_KERNELS_ARGS+=(--cache-aware-prompt)
+    fi
 fi
 python -m agents.pipeline.generate_kernels "${GEN_KERNELS_ARGS[@]}"
 

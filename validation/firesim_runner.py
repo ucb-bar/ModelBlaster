@@ -198,6 +198,21 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
     deadline = time.monotonic() + timeout
     last_size = 0
     last_progress = time.monotonic()
+    # Fast-fail: if Zephyr's fatal-error printer fires (load fault, store
+    # fault, illegal instruction, etc.) the workload will never reach the
+    # OUTPUT marker. Detect that in the uartlog and short-circuit the
+    # poll loop instead of waiting for the full timeout. Saves ~3 minutes
+    # per LLM-generated kernel that builds clean for spike but
+    # mis-addresses on the FPGA.
+    _fault_markers = (
+        "Load access fault",
+        "Store access fault",
+        "Illegal instruction",
+        "Instruction access fault",
+        ">>> ZEPHYR FATAL ERROR",
+        "k_oops",
+    )
+    fault_seen_at: Optional[float] = None
     try:
         while True:
             if time.monotonic() > deadline:
@@ -235,6 +250,30 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                               f"({expected_ends} WALL_CYCLES seen)",
                               flush=True)
                     break
+            # Fast-fail on Zephyr fatal-error printer.
+            if fault_seen_at is None:
+                for marker in _fault_markers:
+                    if marker in text:
+                        fault_seen_at = time.monotonic()
+                        if verbose:
+                            print(f"firesim: detected '{marker}' in "
+                                  f"uartlog — workload faulted, "
+                                  f"will short-circuit after a brief "
+                                  f"settle window",
+                                  flush=True)
+                        break
+            # Once a fault is detected, give the kernel a short window
+            # to finish printing the fault frame (regs, stack), then
+            # raise. Don't break on first sight — we want the diagnostic
+            # in the message we hand back.
+            if fault_seen_at is not None and (
+                time.monotonic() - fault_seen_at > 5.0
+            ):
+                tail = text[-2000:]
+                raise RuntimeError(
+                    f"firesim workload faulted (Zephyr fatal-error "
+                    f"printer triggered). uartlog tail:\n{tail}"
+                )
             # Surface a heartbeat if uartlog is silent for a long stretch
             # so the user sees we're alive.
             if (verbose and time.monotonic() - last_progress > 30.0

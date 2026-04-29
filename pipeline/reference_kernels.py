@@ -556,6 +556,109 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
 }
 """,
         ),
+        AlgorithmCandidate(
+            name="oc_blocked",
+            description=(
+                "Cache-blocked direct convolution. Same arithmetic as the "
+                "`direct` algorithm — six nested loops over (n, oc, oh, "
+                "ow, ic, kh, kw) — but the OUTPUT-CHANNEL dimension is "
+                "tiled so that one slab of the weight tensor stays "
+                "resident in L1D across the entire OH*OW spatial sweep. "
+                "This is purely a loop-restructuring optimization: the "
+                "compiler emits the same FMACs in the same order; we just "
+                "change which dimension is outermost so weight reuse "
+                "happens at L1D rather than L2/LLC.\n\n"
+                "STRUCTURE (the LLM MUST follow this exactly):\n"
+                "  Define TILE_OC at the top of the function. Aim for "
+                "TILE_OC * IC * KH * KW * 4 bytes <= ~24 KB so the slab "
+                "fits in 32 KB L1D with room for input/output. For "
+                "OC>=128 IC>=128 K=3 use TILE_OC=4. For smaller IC use "
+                "TILE_OC=8 or 16.\n\n"
+                "  for (oc_outer = 0; oc_outer < OC; oc_outer += TILE_OC) {\n"
+                "      // Hot weight slab: weight[oc_outer .. oc_outer + tile - 1]\n"
+                "      // is now reused across the (oh, ow) sweep below.\n"
+                "      for (n = 0; n < N; n++)\n"
+                "      for (oh = 0; oh < OH; oh++)\n"
+                "      for (ow = 0; ow < OW; ow++)\n"
+                "      for (oc_inner = 0; oc_inner < tile; oc_inner++) {\n"
+                "          int oc = oc_outer + oc_inner;\n"
+                "          float acc = bias ? bias[oc] : 0.0f;\n"
+                "          // standard 3-deep ic/kh/kw reduction here\n"
+                "          output[((n*OC + oc)*OH + oh)*OW + ow] = acc;\n"
+                "      }\n"
+                "  }\n\n"
+                "Why this matters: a direct conv2d with the OC loop in "
+                "the middle pulls the entire weight tensor through L1D "
+                "OH*OW times. With OC blocked outermost, each weight "
+                "loaded into L1D once is reused OH*OW times before "
+                "eviction. For dronet's heavy 3x3 conv (OC=128, IC=128, "
+                "OH=4, OW=4) that's a 16x reduction in weight traffic to "
+                "L2/LLC.\n\n"
+                "TAIL HANDLING: when OC is not a multiple of TILE_OC, "
+                "the final outer iteration uses tile = OC - oc_outer "
+                "(may be < TILE_OC). Compute it inside the outer loop:\n"
+                "  int tile = TILE_OC;\n"
+                "  if (oc_outer + tile > OC) tile = OC - oc_outer;\n\n"
+                "RVV vectorization (rvv backend only): you may vectorize "
+                "the IC reduction inside the inner per-output-element "
+                "block exactly the same way as the `direct` algorithm — "
+                "this transformation only restructures the OC loop, not "
+                "the inner reduction.\n\n"
+                "DO NOT remove the `oc_outer += TILE_OC` outer loop — "
+                "it's the entire point of this algorithm. DO NOT pick "
+                "TILE_OC = 1 (that's just the direct algorithm with "
+                "extra overhead). DO NOT pick TILE_OC = OC (that's also "
+                "just the direct algorithm). Pick a fixed TILE_OC "
+                "constant; do not compute it from runtime IC — the "
+                "compiler needs the constant to keep the inner-loop "
+                "indexing cheap."
+            ),
+            reference_impl="""\
+void kernel_conv2d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int IH, int IW, int OC,
+                   int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    /* Tile so one OC-slab of weights fits in ~24 KB of L1D.
+     * For OC=128 IC=128 K=3: 4 * 128 * 9 * 4 = 18 KB. */
+    const int TILE_OC = 4;
+
+    for (int oc_outer = 0; oc_outer < OC; oc_outer += TILE_OC) {
+        int tile = TILE_OC;
+        if (oc_outer + tile > OC) tile = OC - oc_outer;
+        for (int n = 0; n < N; n++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    for (int oc_inner = 0; oc_inner < tile; oc_inner++) {
+                        int oc = oc_outer + oc_inner;
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int ic = 0; ic < IC; ic++) {
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh * SH - PH + kh;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow * SW - PW + kw;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                    float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                    acc += v * w;
+                                }
+                            }
+                        }
+                        output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+            # OC-blocked is only worth the loop-restructure cost when
+            # the weight tensor is too large to stay in L1D. Skip on
+            # tiny channel counts where direct already wins easily.
+            applicable=lambda s: s.get("OC", 0) >= 32 and s.get("IC", 0) >= 16,
+        ),
     ],
 )
 
