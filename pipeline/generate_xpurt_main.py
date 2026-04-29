@@ -272,7 +272,11 @@ def _emit(networks: list[str], schedule_name: str,
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
+#ifdef AGENTS_POOL_BACKEND_RAW
+#include "agents_pool.h"
+#else
 #include <pthreadpool.h>
+#endif
 #include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem */
 #include <zephyr/sys/reboot.h>
 
@@ -286,7 +290,10 @@ def _emit(networks: list[str], schedule_name: str,
 
 {chr(10).join(output_buf_decls)}
 
-/* picolibc memalign workaround — see generate_multi_main.py. */
+#ifndef AGENTS_POOL_BACKEND_RAW
+/* picolibc memalign workaround — see generate_multi_main.py.
+ * Only needed when linking pthreadpool; the agents_pool path uses
+ * plain malloc(). */
 void *memalign(size_t alignment, size_t size) {{ return aligned_alloc(alignment, size); }}
 int posix_memalign(void **out, size_t alignment, size_t size)
 {{
@@ -294,6 +301,7 @@ int posix_memalign(void **out, size_t alignment, size_t size)
     if (p == NULL) {{ return 12; }}
     *out = p; return 0;
 }}
+#endif
 
 /* Per-entry completion sem: posted once when the dispatch finishes;
  * dependents take it before invoking. Initialized as 0/1 (binary, but
@@ -311,11 +319,12 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
  * backends. */
 {chr(10).join(wall_decls)}
 
-/* Per-kind intra-op pthreadpool. Set up in main() before workers spawn,
- * read by xpurt_worker when stamping s_<mid>.pool. NULL ⇒ kind has only
- * 1 hart, so parallel_<op> wrappers run synchronously on the calling
- * scheduler worker. */
-static pthreadpool_t pools[{n_kinds}] = {{ NULL }};
+/* Per-kind intra-op pool. Set up in main() before workers spawn, read
+ * by xpurt_worker when stamping s_<mid>.pool. NULL ⇒ kind has only 1
+ * hart, so parallel_<op> wrappers run synchronously on the calling
+ * scheduler worker. Type erased to void* here so the same generated
+ * source compiles under both pthreadpool and agents_pool backends. */
+static void *pools[{n_kinds}] = {{ NULL }};
 
 /* mtime baseline for the run, captured immediately before workers spawn.
  * Used by the worker to (a) honor per-instance schedule start times for
@@ -390,16 +399,25 @@ int main(void)
     static const int pool_sizes[{n_kinds}] = {{ {pool_size_strs} }};
     for (int k = 0; k < {n_kinds}; k++) {{
         if (pool_sizes[k] > 0) {{
-            pools[k] = pthreadpool_create(pool_sizes[k]);
+#ifdef AGENTS_POOL_BACKEND_RAW
+            pools[k] = (void *)agents_pool_create(pool_sizes[k]);
+#else
+            pools[k] = (void *)pthreadpool_create(pool_sizes[k]);
+#endif
             if (pools[k] == NULL) {{
-                printf("FATAL: pthreadpool_create kind=%d size=%d failed\\n",
+                printf("FATAL: pool_create kind=%d size=%d failed\\n",
                        k, pool_sizes[k]);
                 sys_reboot(SYS_REBOOT_COLD);
                 return -1;
             }}
         }}
+#ifdef AGENTS_POOL_BACKEND_RAW
+        printf("agents_pool[kind=%d]: %u helpers (intra-op)\\n",
+               k, (unsigned)(pools[k] ? agents_pool_get_threads_count((agents_pool_t)pools[k]) : 0));
+#else
         printf("pthreadpool[kind=%d]: %u helpers (intra-op)\\n",
-               k, (unsigned)(pools[k] ? pthreadpool_get_threads_count(pools[k]) : 0));
+               k, (unsigned)(pools[k] ? pthreadpool_get_threads_count((pthreadpool_t)pools[k]) : 0));
+#endif
     }}
 
 {chr(10).join(state_inits)}
@@ -508,7 +526,13 @@ int main(void)
 {chr(10).join(print_blocks)}
 
     for (int k = 0; k < {n_kinds}; k++) {{
-        if (pools[k] != NULL) pthreadpool_destroy(pools[k]);
+        if (pools[k] != NULL) {{
+#ifdef AGENTS_POOL_BACKEND_RAW
+            agents_pool_destroy((agents_pool_t)pools[k]);
+#else
+            pthreadpool_destroy((pthreadpool_t)pools[k]);
+#endif
+        }}
     }}
     sys_reboot(SYS_REBOOT_COLD);
     return 0;

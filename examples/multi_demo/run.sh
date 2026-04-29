@@ -107,6 +107,11 @@ fi
 if [[ -n "${AGENTS_POOL_THREADS:-}" ]]; then
     WEST_CMAKE_ARGS+=("-DAGENTS_POOL_THREADS=${AGENTS_POOL_THREADS}")
 fi
+# AGENTS_POOL_BACKEND={pthreadpool,raw} — Phase 2 of the pthreadpool
+# replacement. Default leaves the historical pthreadpool path live.
+if [[ -n "${AGENTS_POOL_BACKEND:-}" ]]; then
+    WEST_CMAKE_ARGS+=("-DAGENTS_POOL_BACKEND=${AGENTS_POOL_BACKEND}")
+fi
 # Pool-sweep mode: tell the harness CMake to forward --pool-sizes to the
 # multi_main.c generator. The emitted main re-creates the pool per size
 # inside one binary.

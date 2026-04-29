@@ -14,3 +14,6 @@ examples/*/*/build/
 examples/*/generated/
 examples/*/build/
 examples/*/cache/
+
+# agents_pool unit-test build trees.
+runtime/agents_pool/test_app/build/
