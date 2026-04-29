@@ -87,7 +87,30 @@ if [[ "${OPTIMIZE}" == "1" ]]; then
 fi
 python -m agents.pipeline.generate_kernels "${GEN_KERNELS_ARGS[@]}"
 
-echo "[4/5] west build -> ${BUILD_DIR}"
+# RUNNER selects the simulator behind stages 4-5: spike (default; in-process
+# spike subprocess) or firesim (build for chipyard_riscv64, copy elf into
+# the FireSim sim slot, runworkload, tail uartlog). The build (4/5) and
+# run (5/5) split is identical across runners — only the board name and
+# the verifier differ.
+RUNNER="${RUNNER:-spike}"
+case "${RUNNER}" in
+    spike)
+        BOARD_TARGET="spike_riscv64"
+        ;;
+    firesim)
+        # Chipyard's quad-rocket-saturn board target. Pulls in the
+        # firesim_chipyard.conf overlay (shrunk stack + SMP knobs that
+        # the working FireSim Zephyr samples use) so Zephyr boots on
+        # the FPGA — the spike-only prj.conf hangs pre-banner there.
+        BOARD_TARGET="chipyard_riscv64/rocketchip_virt_riscv64"
+        ;;
+    *)
+        echo "ERROR: unsupported RUNNER=${RUNNER} (expected spike|firesim)" >&2
+        exit 1
+        ;;
+esac
+
+echo "[4/5] west build (board=${BOARD_TARGET}) -> ${BUILD_DIR}"
 KERNEL_CFLAGS=$(python -c "
 from agents.pipeline.backends import get
 b = get('${TARGET}')
@@ -100,25 +123,22 @@ WEST_CMAKE_ARGS=(
 if [[ -n "${KERNEL_CFLAGS}" ]]; then
     WEST_CMAKE_ARGS+=(-DAGENTS_KERNEL_CFLAGS="${KERNEL_CFLAGS}")
 fi
-west build -p -b spike_riscv64 agents/harness \
+WEST_BUILD_EXTRA=()
+if [[ "${RUNNER}" == "firesim" ]]; then
+    # Splice the firesim overlay through Zephyr's EXTRA_CONF_FILE knob.
+    # `west build -- -DEXTRA_CONF_FILE=...` arrives as a CMake -D, which
+    # Zephyr picks up before find_package(Zephyr) processes Kconfig.
+    WEST_BUILD_EXTRA+=(
+        -DEXTRA_CONF_FILE="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+    )
+fi
+west build -p -b "${BOARD_TARGET}" agents/harness \
     --build-dir "${BUILD_DIR}" \
-    -- "${WEST_CMAKE_ARGS[@]}"
+    -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
-echo "[5/5] spike + compare"
-SPIKE_ARGS=$(python -c "
-from agents.pipeline.backends import get
-b = get('${TARGET}')
-print(' '.join(b.spike_args))
-")
-SPIKE_FLAGS=()
-for a in ${SPIKE_ARGS}; do
-    # Use --spike-arg=<...> form so argparse accepts values starting with --.
-    SPIKE_FLAGS+=("--spike-arg=${a}")
-done
+echo "[5/5] ${RUNNER} + compare"
 
-# Optional IREE-shape per-dispatch profile (PROFILE_OUT_ROOT env). The
-# single-model case treats the run as a 1-hart "topo_0" trace by default
-# — overrideable via PROFILE_CORES.
+# Optional IREE-shape per-dispatch profile (PROFILE_OUT_ROOT env).
 PROFILE_FLAGS=()
 if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     if [[ -z "${PROFILE_BACKEND:-}" ]]; then
@@ -129,7 +149,7 @@ if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     fi
     PROFILE_FLAGS+=(
         "--profile-out-root=${PROFILE_OUT_ROOT}"
-        "--profile-source=${PROFILE_SOURCE:-spike}"
+        "--profile-source=${PROFILE_SOURCE:-${RUNNER}}"
         "--profile-backend=${PROFILE_BACKEND}"
         "--profile-cores=${PROFILE_CORES:-0}"
         "--profile-clock-mhz=${PROFILE_CLOCK_MHZ:-1000.0}"
@@ -139,8 +159,42 @@ if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     fi
 fi
 
-python -m agents.validation.spike_runner \
-    --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-    --io "${IR_DIR}/io.npz" \
-    "${SPIKE_FLAGS[@]}" \
-    "${PROFILE_FLAGS[@]}"
+if [[ "${RUNNER}" == "spike" ]]; then
+    SPIKE_ARGS=$(python -c "
+from agents.pipeline.backends import get
+b = get('${TARGET}')
+print(' '.join(b.spike_args))
+")
+    SPIKE_FLAGS=()
+    for a in ${SPIKE_ARGS}; do
+        SPIKE_FLAGS+=("--spike-arg=${a}")
+    done
+    python -m agents.validation.spike_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
+        --io "${IR_DIR}/io.npz" \
+        "${SPIKE_FLAGS[@]}" \
+        "${PROFILE_FLAGS[@]}"
+else
+    # firesim: the runner copies the elf into the sim slot, runs
+    # firesim runworkload, tails the uartlog until OUTPUT_END, then
+    # firesim kill. FIRESIM_ROOT / FIRESIM_ENV / FIRESIM_SLOT env vars
+    # override the install paths.
+    FIRESIM_FLAGS=()
+    if [[ -n "${FIRESIM_ROOT:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-root=${FIRESIM_ROOT}")
+    fi
+    if [[ -n "${FIRESIM_ENV:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-env=${FIRESIM_ENV}")
+    fi
+    if [[ -n "${FIRESIM_SLOT:-}" ]]; then
+        FIRESIM_FLAGS+=("--firesim-slot=${FIRESIM_SLOT}")
+    fi
+    if [[ -n "${FIRESIM_TIMEOUT:-}" ]]; then
+        FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
+    fi
+    python -m agents.validation.firesim_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
+        --io "${IR_DIR}/io.npz" \
+        "${FIRESIM_FLAGS[@]}" \
+        "${PROFILE_FLAGS[@]}"
+fi

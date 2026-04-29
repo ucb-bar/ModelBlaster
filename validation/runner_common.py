@@ -1,0 +1,292 @@
+"""Shared parsing / golden-compare / IREE-profile helpers.
+Used by both the spike and firesim runners; the only thing each runner
+adds on top is *how* it gets the harness's stdout text.
+
+Markers (the agent harness prints these unchanged across simulators):
+    === AGENTS_OUTPUT_BEGIN [<model>] ===
+    <one float per line>
+    === AGENTS_OUTPUT_END   [<model>] ===
+    === AGENTS_PROFILE_BEGIN[<model>] ===
+    dispatch_id,name,op,shape,cycles
+    ...
+    === AGENTS_PROFILE_END  [<model>] ===
+    === AGENTS_WALL_CYCLES  [<model>] === <int>
+
+The single-model harness omits the [<model>] tag and emits one block of
+each kind. Multi-model harnesses tag every block.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+
+
+BEGIN = "=== AGENTS_OUTPUT_BEGIN ==="
+END = "=== AGENTS_OUTPUT_END ==="
+PROF_BEGIN = "=== AGENTS_PROFILE_BEGIN ==="
+PROF_END = "=== AGENTS_PROFILE_END ==="
+
+# Tagged variants — used by the multi-model harness.
+_BEGIN_BARE = re.compile(r"=== AGENTS_OUTPUT_BEGIN(?: \[([^\]]+)\])? ===")
+_END_BARE = re.compile(r"=== AGENTS_OUTPUT_END(?: \[([^\]]+)\])? ===")
+_PROF_BEGIN_BARE = re.compile(r"=== AGENTS_PROFILE_BEGIN(?: \[([^\]]+)\])? ===")
+_PROF_END_BARE = re.compile(r"=== AGENTS_PROFILE_END(?: \[([^\]]+)\])? ===")
+_WALL_RE = re.compile(
+    r"=== AGENTS_WALL_CYCLES(?: \[([^\]]+)\])? === (\d+)"
+)
+
+
+def has_output_marker(text: str) -> bool:
+    """Quick check that the harness reached the OUTPUT phase. Useful as
+    a stop condition for streamed runners."""
+    return bool(_BEGIN_BARE.search(text))
+
+
+def output_block_count(text: str) -> int:
+    """Number of distinct OUTPUT_END markers seen — counts how many of
+    the expected tagged blocks have completed."""
+    return len(list(_END_BARE.finditer(text)))
+
+
+def _output_block(text: str, tag: Optional[str] = None) -> str:
+    if tag is None:
+        b = re.escape(BEGIN); e = re.escape(END)
+    else:
+        b = re.escape(f"=== AGENTS_OUTPUT_BEGIN [{tag}] ===")
+        e = re.escape(f"=== AGENTS_OUTPUT_END [{tag}] ===")
+    m = re.search(rf"{b}\n(.*?)\n{e}", text, re.S)
+    if not m:
+        raise RuntimeError(
+            f"could not find AGENTS_OUTPUT_{{BEGIN,END}} "
+            f"{'(bare)' if tag is None else f'[{tag}]'} block"
+        )
+    return m.group(1)
+
+
+def parse_output(text: str, tag: Optional[str] = None) -> np.ndarray:
+    body = _output_block(text, tag)
+    nums = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        nums.append(float(line))
+    return np.array(nums, dtype=np.float32)
+
+
+def parse_wall_cycles(text: str, tag: Optional[str] = None) -> Optional[int]:
+    for m in _WALL_RE.finditer(text):
+        if (m.group(1) or None) == tag:
+            return int(m.group(2))
+    return None
+
+
+def parse_profile(text: str, tag: Optional[str] = None) -> Optional[list[dict]]:
+    if tag is None:
+        b = re.escape(PROF_BEGIN); e = re.escape(PROF_END)
+    else:
+        b = re.escape(f"=== AGENTS_PROFILE_BEGIN [{tag}] ===")
+        e = re.escape(f"=== AGENTS_PROFILE_END [{tag}] ===")
+    m = re.search(rf"{b}\n(.*?)\n{e}", text, re.S)
+    if not m:
+        return None
+    lines = [ln for ln in m.group(1).splitlines() if ln.strip()]
+    if not lines:
+        return []
+    header = [c.strip() for c in lines[0].split(",")]
+    out = []
+    for ln in lines[1:]:
+        cells = [c.strip() for c in ln.split(",")]
+        rec = dict(zip(header, cells))
+        if "cycles" in rec:
+            rec["cycles"] = int(rec["cycles"])
+        if "dispatch_id" in rec:
+            rec["dispatch_id"] = int(rec["dispatch_id"])
+        out.append(rec)
+    return out
+
+
+def write_profile_csv(records: list[dict], path: str) -> None:
+    if not records:
+        return
+    header = list(records[0].keys())
+    with open(path, "w") as f:
+        f.write(",".join(header) + "\n")
+        for rec in records:
+            f.write(",".join(str(rec[k]) for k in header) + "\n")
+
+
+def print_profile_summary(records: list[dict]) -> None:
+    if not records:
+        print("(no profile records emitted)")
+        return
+    name_w = max(4, max(len(r["name"]) for r in records))
+    op_w = max(2, max(len(r["op"]) for r in records))
+    shape_w = max(5, max(len(r["shape"]) for r in records))
+    total = sum(int(r["cycles"]) for r in records)
+    print(f"{'name':<{name_w}}  {'op':<{op_w}}  {'shape':<{shape_w}}  "
+          f"{'cycles':>10}  {'%':>5}")
+    print("-" * (name_w + op_w + shape_w + 22))
+    for r in records:
+        cyc = int(r["cycles"])
+        pct = (100.0 * cyc / total) if total else 0.0
+        print(f"{r['name']:<{name_w}}  {r['op']:<{op_w}}  {r['shape']:<{shape_w}}  "
+              f"{cyc:>10}  {pct:>5.1f}")
+    print("-" * (name_w + op_w + shape_w + 22))
+    print(f"{'TOTAL':<{name_w + op_w + shape_w + 4}}{total:>10}")
+
+
+def compare(actual: np.ndarray, golden: np.ndarray,
+            atol: float = 1e-5, rtol: float = 1e-4) -> tuple[bool, dict]:
+    if actual.shape != golden.shape:
+        return False, {
+            "error": f"shape mismatch: actual={actual.shape} golden={golden.shape}",
+        }
+    abs_err = np.abs(actual - golden)
+    rel_err = abs_err / np.maximum(np.abs(golden), 1e-12)
+    ok = bool(np.all(abs_err <= atol + rtol * np.abs(golden)))
+    return ok, {
+        "max_abs_err": float(abs_err.max()),
+        "max_rel_err": float(rel_err.max()),
+        "atol": atol,
+        "rtol": rtol,
+    }
+
+
+def check_one(actual: np.ndarray, golden_npz_path: str,
+              atol: Optional[float], rtol: Optional[float],
+              label: str = "") -> tuple[bool, dict]:
+    raw_golden = np.load(golden_npz_path)["output"]
+    is_int = raw_golden.dtype.kind in ("i", "u")
+    golden = raw_golden.astype(np.float32).reshape(-1)
+    a = atol if atol is not None else (0.0 if is_int else 1e-5)
+    r = rtol if rtol is not None else (0.0 if is_int else 1e-4)
+    ok, stats = compare(actual, golden, atol=a, rtol=r)
+    if "error" in stats:
+        print(f"{label}FAIL: {stats['error']}")
+        return False, stats
+    print(f"{label}actual: {actual.tolist()}")
+    print(f"{label}golden: {golden.tolist()}")
+    print(
+        f"{label}max_abs_err={stats['max_abs_err']:.3g} "
+        f"max_rel_err={stats['max_rel_err']:.3g} "
+        f"(atol={stats['atol']:g} rtol={stats['rtol']:g})"
+    )
+    print(f"{label}{'PASS' if ok else 'FAIL'}")
+    return ok, stats
+
+
+def model_io_path(repo_root: str, name: str, quant: str) -> str:
+    return os.path.join(
+        repo_root, "agents", "examples", name, quant, "generated", "io.npz"
+    )
+
+
+@dataclass
+class IREEProfileArgs:
+    """Subset of CLI args needed by emit_iree_profile.
+    Both runners surface these as flags."""
+    profile_out_root: Optional[str]
+    profile_source: str
+    profile_cpu: Optional[str]
+    profile_cores: str
+    profile_clock_mhz: float
+    quant: str
+
+
+def emit_iree_profile(records: list[dict], model: str,
+                      args: IREEProfileArgs, backend: str) -> Optional[str]:
+    """Build a ProfileMeta and write an IREE-shape CSV.
+    Returns the written path, or None if --profile-out-root is unset."""
+    if not args.profile_out_root or not records:
+        return None
+    from agents.pipeline import profile_writer
+    cores = [int(c) for c in args.profile_cores.split(",") if c.strip()]
+    cpu = args.profile_cpu or args.profile_source
+    meta = profile_writer.ProfileMeta(
+        model=model,
+        quant=args.quant,
+        backend=backend,
+        cores=cores,
+        source=args.profile_source,
+        cpu=cpu,
+        clock_mhz=args.profile_clock_mhz,
+    )
+    return profile_writer.write_profile(records, meta, args.profile_out_root)
+
+
+def report_run(text: str, *, models: Optional[list[str]],
+               io_path: Optional[str], quant: str,
+               atol: Optional[float], rtol: Optional[float],
+               profile_csv: Optional[str],
+               iree_args: IREEProfileArgs, backend_tag: str,
+               repo_root: str) -> bool:
+    """Single entry point used by both runners after they've captured
+    the harness stdout. Walks the OUTPUT/PROFILE/WALL blocks, compares
+    each against its golden, prints summaries, writes per-model CSV,
+    and emits IREE-shape profile data when configured. Returns overall
+    PASS/FAIL boolean."""
+    if models:
+        names = [n.strip() for n in models if n.strip()]
+        all_ok = True
+        for name in names:
+            print(f"\n--- model: {name} ---")
+            actual = parse_output(text, tag=name)
+            golden_path = model_io_path(repo_root, name, quant)
+            if not os.path.exists(golden_path):
+                print(f"FAIL: golden not found at {golden_path}")
+                all_ok = False
+                continue
+            ok, _ = check_one(actual, golden_path, atol, rtol,
+                              label=f"  [{name}] ")
+            all_ok = all_ok and ok
+            profile = parse_profile(text, tag=name)
+            if profile is not None:
+                csv_path = os.path.join(
+                    os.path.dirname(golden_path), f"{name}_profile.csv"
+                )
+                write_profile_csv(profile, csv_path)
+                print(f"  [{name}] profile -> {csv_path}")
+                print_profile_summary(profile)
+            wall = parse_wall_cycles(text, tag=name)
+            if wall is not None:
+                print(f"  [{name}] wall_clock_cycles={wall} (mtime)")
+            iree_path = emit_iree_profile(profile or [], name,
+                                          iree_args, backend_tag)
+            if iree_path:
+                print(f"  [{name}] iree_profile -> {iree_path}")
+        print()
+        print(f"OVERALL: {'PASS' if all_ok else 'FAIL'} ({len(names)} models)")
+        return all_ok
+
+    # Single-model.
+    if not io_path:
+        raise ValueError("io_path required for single-model mode")
+    actual = parse_output(text)
+    ok, _ = check_one(actual, io_path, atol, rtol)
+    profile = parse_profile(text)
+    if profile is not None:
+        out_csv = profile_csv or os.path.join(
+            os.path.dirname(os.path.abspath(io_path)), "profile.csv"
+        )
+        write_profile_csv(profile, out_csv)
+        print()
+        print(f"profile -> {out_csv}")
+        print_profile_summary(profile)
+    wall = parse_wall_cycles(text)
+    if wall is not None:
+        print(f"wall_clock_cycles={wall} (mtime)")
+    if profile is not None and iree_args.profile_out_root:
+        io_abs = os.path.abspath(io_path)
+        model_name = os.path.basename(
+            os.path.dirname(os.path.dirname(os.path.dirname(io_abs)))
+        )
+        iree_path = emit_iree_profile(profile, model_name, iree_args, backend_tag)
+        if iree_path:
+            print(f"iree_profile -> {iree_path}")
+    return ok
