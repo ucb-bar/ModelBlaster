@@ -327,6 +327,11 @@ def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
 _ALGORITHM_REQUIRED_SUBSTRINGS: dict[str, tuple[str, ...]] = {
     # im2col_gemm: must allocate and populate the im2col buffer.
     "im2col_gemm": ("im2col_buf",),
+    # oc_blocked: must have an outer OC tile loop. Looking for the
+    # `oc_outer` identifier from the seed example is enough to catch the
+    # most common LLM mistake (collapsing the outer-OC loop and writing
+    # the direct algorithm under the cache-blocked label).
+    "oc_blocked": ("oc_outer", "TILE_OC"),
 }
 
 
@@ -680,7 +685,15 @@ def beam_search_optimize(
     expansions: int,
     iterations: int,
     log,
-) -> tuple[str, int, list[dict]]:
+) -> tuple[str, int, list[dict], list[tuple[str, int]]]:
+    """Returns (best_code, best_cycles, history, all_viable_proposals).
+
+    `all_viable_proposals` is every distinct (code, spike_cycles) pair
+    that survived build+verify across all iterations, sorted by
+    cycles ascending. Used downstream by the firesim re-rank step
+    to pick the top-K spike survivors and re-score them on real RTL.
+    Note: the baseline is NOT in this list — callers should add it.
+    """
     from agents.pipeline.profile_kernel import build_and_run, ProfileError
 
     Beam = list[tuple[str, int]]
@@ -688,6 +701,10 @@ def beam_search_optimize(
     best_code, best_cycles = baseline_code, baseline_cycles
     seen: set[str] = {_normalize(baseline_code)}
     history: list[dict] = []
+    # Cumulative list of every distinct candidate that built+verified
+    # successfully (across all iterations). The firesim re-rank step
+    # consumes the top-K of this list to score on real RTL.
+    all_viable: list[tuple[str, int]] = []
 
     for it in range(1, iterations + 1):
         log(f"  [{spec.op}] iter {it}/{iterations}  beam=[{', '.join(str(c) for _, c in beam_set)}]  best={best_cycles}")
@@ -770,6 +787,7 @@ def beam_search_optimize(
                     "result": "ok", "cycles": new_cycles,
                 })
                 proposals.append((candidate, new_cycles))
+                all_viable.append((candidate, new_cycles))
                 if new_cycles < best_cycles:
                     best_code, best_cycles = candidate, new_cycles
 
@@ -784,7 +802,17 @@ def beam_search_optimize(
 
     log(f"  [{spec.op}] BEST: {baseline_cycles} -> {best_cycles} "
         f"({(baseline_cycles - best_cycles) / baseline_cycles * 100:+.1f}%)")
-    return best_code, best_cycles, history
+    # Sort viable proposals cheapest-spike first; dedupe identical
+    # bodies that may have come up across iterations.
+    viable_sorted: list[tuple[str, int]] = []
+    seen_norm: set[str] = set()
+    for code, cyc in sorted(all_viable, key=lambda x: x[1]):
+        key = _normalize(code)
+        if key in seen_norm:
+            continue
+        seen_norm.add(key)
+        viable_sorted.append((code, cyc))
+    return best_code, best_cycles, history, viable_sorted
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +837,19 @@ def generate(
     cache_dir: Optional[str] = None,
     algorithm_filter: Optional[set[str]] = None,
     quant: str = "fp32",
+    # Opt-in: after the spike beam search picks a best, re-rank the
+    # top-K spike survivors on FireSim RTL. The cache slot is replaced
+    # with the firesim-best only if the firesim cycles drop by >=
+    # FiresimEvalConfig.replacement_threshold_pct vs. the baseline. Off
+    # by default — it's expensive (1-3 min per candidate FPGA build+run).
+    firesim_eval: bool = False,
+    firesim_top_k: int = 3,
+    # Opt-in: include the memory-hierarchy stanza in the optimize-phase
+    # system prompt. Only useful when firesim_eval=True (otherwise the
+    # spike scorer is blind to cache wins, so the LLM has no incentive
+    # to produce them).
+    cache_aware_prompt: bool = False,
+    firesim_op_filter: Optional[set[str]] = None,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
@@ -938,7 +979,36 @@ def generate(
 
     guide = _load_backend_guide(target)
     optimize_system = _optimize_system_prompt(target, guide)
+    # When firesim_eval is requested with cache_aware_prompt, splice the
+    # memory-model stanza into the optimize prompt so the LLM has an
+    # explicit incentive to produce cache-locality wins. Only does any
+    # good when firesim is also scoring — without it spike still ranks.
+    if cache_aware_prompt:
+        from agents.optimize.firesim_eval import memory_model_stanza
+        stanza = memory_model_stanza()
+        optimize_system = optimize_system + "\n\n" + stanza
+        log("optimize: prompt enriched with target memory-hierarchy stanza")
     client = BedrockClient()
+
+    # Pre-instantiate the firesim evaluator (one per generate() call). It
+    # reuses a separate chipyard build dir from the spike build_dir so
+    # the spike beam can rebuild while a firesim run is in flight.
+    firesim_evaluator = None
+    if firesim_eval:
+        from agents.optimize.firesim_eval import (
+            FiresimEvaluator, FiresimEvalConfig,
+        )
+        firesim_build_dir = (build_dir or "") + "_firesim_eval"
+        firesim_evaluator = FiresimEvaluator(
+            backend=target, impls=impls, specs=specs,
+            repo_root=repo_root, model_dir=out_dir,  # type: ignore[arg-type]
+            firesim_build_dir=firesim_build_dir,
+            harness_dir=harness_dir, io_path=io_path,  # type: ignore[arg-type]
+            config=FiresimEvalConfig(),
+            log=log,
+        )
+        log(f"optimize: firesim re-rank ENABLED "
+            f"(top_k={firesim_top_k}, build_dir={firesim_build_dir})")
 
     optimize_summary: dict[str, dict] = {}
     for spec in specs:
@@ -948,7 +1018,7 @@ def generate(
             continue
         log(f"\noptimize [{spec.op}] baseline={baseline_op}")
         shapes = collect_shapes(ir, spec.op, spec)
-        best_code, best_cycles, history = beam_search_optimize(
+        best_code, best_cycles, history, viable = beam_search_optimize(
             spec, shapes, impls[spec.op], baseline_op,
             impls=impls, specs=specs, backend=target, client=client,
             optimize_system=optimize_system,
@@ -959,12 +1029,53 @@ def generate(
             beam=beam, expansions=expansions, iterations=iterations,
             log=log,
         )
+
+        # FireSim re-rank: take the spike top-K survivors + spike-best
+        # baseline and re-score on real RTL. Whichever has the lowest
+        # firesim cycles wins for cache promotion. The spike-best stays
+        # in `impls` as the in-process working copy (we don't want to
+        # let firesim regress correctness silently).
+        firesim_history: list[dict] = []
+        firesim_best_cycles: Optional[int] = None
+        if firesim_evaluator is not None and viable:
+            run_op = (
+                firesim_op_filter is None
+                or spec.op in firesim_op_filter
+            )
+            if not run_op:
+                log(f"  [{spec.op}/firesim] skipped (not in op filter)")
+            else:
+                # Refresh the evaluator's impls so non-targeted ops use
+                # the spike-best from this iteration (otherwise stale
+                # reference impls ride along and skew the harness).
+                trial_impls = dict(impls)
+                trial_impls[spec.op] = best_code
+                firesim_evaluator.impls = trial_impls
+                from agents.optimize.firesim_eval import evaluate_top_k
+                fbest_code, fbest_cycles, firesim_history = evaluate_top_k(
+                    spec, viable,
+                    evaluator=firesim_evaluator,
+                    spike_baseline=(best_code, best_cycles),
+                    log=log, k=firesim_top_k,
+                )
+                if fbest_code is not None and fbest_cycles is not None:
+                    firesim_best_cycles = fbest_cycles
+                    # Promote to in-process impls + cache only if the
+                    # firesim winner differs from the spike baseline.
+                    # Identity check is on the normalized code body.
+                    if _normalize(fbest_code) != _normalize(best_code):
+                        log(f"  [{spec.op}/firesim] promoting firesim-best "
+                            f"({fbest_cycles} cyc) over spike-best")
+                        best_code = fbest_code
+
         impls[spec.op] = best_code
         optimize_summary[spec.op] = {
             "baseline": baseline_op,
             "best": best_cycles,
             "improvement_pct": (baseline_op - best_cycles) / baseline_op * 100.0,
             "history": history,
+            "firesim_history": firesim_history,
+            "firesim_best_cycles": firesim_best_cycles,
         }
         # Persist the optimized kernel back to the same cache slot the
         # baseline read from so a subsequent OPTIMIZE=0 sweep finds the
@@ -1030,6 +1141,26 @@ def main() -> None:
                     help="quantization mode (fp32 only for now). Must match "
                          "the IR's recorded quant or generate_kernels errors "
                          "out.")
+    ap.add_argument("--firesim-eval", action="store_true",
+                    help="opt-in: after the spike beam search, re-rank the "
+                         "top-K spike survivors on FireSim RTL and promote "
+                         "the firesim-best to cache. Expensive (1-3 min "
+                         "FPGA build+run per candidate) but the only way "
+                         "to capture cache-locality wins. Requires --io.")
+    ap.add_argument("--firesim-top-k", type=int, default=3,
+                    help="how many spike-best candidates to re-score on "
+                         "firesim per op. Total firesim runs per op = K + 1 "
+                         "(K survivors + the spike-baseline). Default 3.")
+    ap.add_argument("--cache-aware-prompt", action="store_true",
+                    help="splice the target's memory-hierarchy stanza into "
+                         "the optimize-phase system prompt. Steers the LLM "
+                         "toward cache-locality wins. Only useful with "
+                         "--firesim-eval (otherwise the scorer is blind).")
+    ap.add_argument("--firesim-ops", default=None,
+                    help="comma-separated op kinds to firesim re-rank. "
+                         "Useful when iterating on just conv2d / linear "
+                         "without paying FPGA time on every elementwise op. "
+                         "Default (unset) = all ops.")
     args = ap.parse_args()
 
     if args.algorithms == "all":
@@ -1042,6 +1173,12 @@ def main() -> None:
     else:
         algorithm_filter = {n.strip() for n in args.algorithms.split(",") if n.strip()}
 
+    firesim_op_filter = None
+    if args.firesim_ops:
+        firesim_op_filter = {
+            n.strip() for n in args.firesim_ops.split(",") if n.strip()
+        }
+
     generate(
         args.ir, args.out_dir, args.backend, args.target,
         max_retries=args.max_retries,
@@ -1052,6 +1189,10 @@ def main() -> None:
         cache_dir=args.cache_dir,
         algorithm_filter=algorithm_filter,
         quant=args.quant,
+        firesim_eval=args.firesim_eval,
+        firesim_top_k=args.firesim_top_k,
+        cache_aware_prompt=args.cache_aware_prompt,
+        firesim_op_filter=firesim_op_filter,
     )
 
 
