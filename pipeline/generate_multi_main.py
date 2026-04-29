@@ -35,39 +35,53 @@ def _ir_for(model_dir: str) -> dict:
     raise FileNotFoundError(f"could not find graph.json near {model_dir}")
 
 
-def _emit(models: list[tuple[str, str]]) -> str:
-    """Render multi_main.c source. `models` is a list of (name, model_dir) pairs."""
-    # Preflight: every model_dir must have its mangled headers staged in the
-    # build dir as <name>_model.h and <name>_test_io.h. CMake's configure_file
-    # is responsible for that — this file just emits the includes.
+def _emit(models: list[tuple[str, str]],
+          pool_sizes: list[int] | None = None) -> str:
+    """Render multi_main.c source. `models` is a list of (name, model_dir).
+
+    If `pool_sizes` is provided, each model runs once per pool size; the
+    output blocks are tagged `[<model>@p<N>]`. Each iteration tears down
+    and re-creates the pthreadpool so the per-op profile records reflect
+    that exact pool width. Useful for collecting topo_0 / topo_0_1 /
+    topo_0_1_2_3 results in a single FireSim run, amortizing the
+    infrasetup + flash + boot overhead.
+
+    If `pool_sizes` is None, falls back to the original single-pass
+    behavior: each model runs once, output blocks tagged just
+    `[<model>]`. The pool is created once at start of main.
+    """
     inc_lines: list[str] = []
     buf_decls: list[str] = []
-    run_blocks: list[str] = []
-
     for name, model_dir in models:
         umid = name.replace(".", "_").replace("-", "_").upper()
         mid = name.replace(".", "_").replace("-", "_")
         inc_lines.append(f'#include "{name}_model.h"')
         inc_lines.append(f'#include "{name}_test_io.h"')
-
         buf_decls.append(
             f"static model_{mid}_output_t out_{mid}[MODEL_{umid}_OUTPUT_SIZE];"
         )
 
-        run_blocks.append(f"""\
-    /* --- {name} ----------------------------------------------------------- */
-    printf("running model: {name}\\n");
+    def _per_model_run_block(name: str, tag: str) -> str:
+        """The OUTPUT/PROFILE/WALL print sequence for one (model, tag)
+        pair. `tag` is what shows up between [] in the output markers —
+        either the bare model name or `<model>@p<N>` in pool-sweep mode."""
+        umid = name.replace(".", "_").replace("-", "_").upper()
+        mid = name.replace(".", "_").replace("-", "_")
+        return f"""\
+    /* --- {tag} ----------------------------------------------------------- */
+    printf("running model: {tag}\\n");
+    model_{mid}_reset_profile();
     run_model_{mid}(model_{mid}_test_input, out_{mid}, (void *)pool);
-    printf("=== AGENTS_OUTPUT_BEGIN [{name}] ===\\n");
+    printf("=== AGENTS_OUTPUT_BEGIN [{tag}] ===\\n");
     for (int i = 0; i < MODEL_{umid}_OUTPUT_SIZE; i++) {{
         printf("%.9g\\n", (double)out_{mid}[i]);
     }}
-    printf("=== AGENTS_OUTPUT_END [{name}] ===\\n");
+    printf("=== AGENTS_OUTPUT_END [{tag}] ===\\n");
     {{
         int n_records = 0;
         const model_{mid}_op_record_t *records =
             model_{mid}_profile_records(&n_records);
-        printf("=== AGENTS_PROFILE_BEGIN [{name}] ===\\n");
+        printf("=== AGENTS_PROFILE_BEGIN [{tag}] ===\\n");
         printf("dispatch_id,name,op,shape,cycles\\n");
         for (int i = 0; i < n_records; i++) {{
             printf("%d,%s,%s,%s,%lu\\n",
@@ -75,11 +89,41 @@ def _emit(models: list[tuple[str, str]]) -> str:
                    records[i].name, records[i].op, records[i].shape,
                    records[i].cycles);
         }}
-        printf("=== AGENTS_PROFILE_END [{name}] ===\\n");
+        printf("=== AGENTS_PROFILE_END [{tag}] ===\\n");
     }}
-    printf("=== AGENTS_WALL_CYCLES [{name}] === %lu\\n",
+    printf("=== AGENTS_WALL_CYCLES [{tag}] === %lu\\n",
            model_{mid}_wall_cycles());
-""")
+"""
+
+    run_blocks: list[str] = []
+    if not pool_sizes:
+        # Original behavior: single pool created in main(); each model
+        # runs once tagged with its bare name.
+        for name, _ in models:
+            run_blocks.append(_per_model_run_block(name, name))
+    else:
+        # Pool-sweep: outer loop over pool sizes recreates the pool per
+        # iteration; inner loop runs every model under that pool. Tag
+        # looks like `<model>@p<N>` so the host runner can split per-N
+        # results.csv files.
+        for ps in pool_sizes:
+            ps_block_parts = [
+                f"""\
+    /* === pool_size = {ps} ============================================ */
+    pthreadpool_destroy(pool);
+    pool = pthreadpool_create({ps});
+    if (pool == NULL) {{
+        printf("FATAL: pthreadpool_create({ps}) returned NULL\\n");
+        sys_reboot(SYS_REBOOT_COLD);
+        return -1;
+    }}
+    printf("pthreadpool resized to %u workers\\n",
+           (unsigned)pthreadpool_get_threads_count(pool));
+"""
+            ]
+            for name, _ in models:
+                ps_block_parts.append(_per_model_run_block(name, f"{name}@p{ps}"))
+            run_blocks.append("\n".join(ps_block_parts))
 
     return f"""{HEADER}
 /*
@@ -169,6 +213,12 @@ def main() -> None:
                          "generated/<target>/ dir that holds model.c, kernels.c, "
                          "weights.c, model.h, test_io.h)")
     ap.add_argument("--out", required=True, help="path for the emitted multi_main.c")
+    ap.add_argument("--pool-sizes", default=None,
+                    help="comma-separated pool sizes to sweep (e.g. '1,2,4'). "
+                         "When set, the generated main runs each model once "
+                         "per pool size; output blocks are tagged "
+                         "[<model>@p<N>]. Default: single run per model with "
+                         "AGENTS_POOL_THREADS-defaulted pool.")
     args = ap.parse_args()
 
     pairs: list[tuple[str, str]] = []
@@ -178,7 +228,6 @@ def main() -> None:
         name, model_dir = spec.split(":", 1)
         if not os.path.isdir(model_dir):
             raise SystemExit(f"model_dir does not exist: {model_dir}")
-        # Sanity-check the IR's recorded name matches the user-supplied name.
         ir = _ir_for(model_dir)
         ir_name = ir.get("name")
         if ir_name and ir_name != name:
@@ -188,11 +237,21 @@ def main() -> None:
             )
         pairs.append((name, model_dir))
 
-    src = _emit(pairs)
+    pool_sizes = None
+    if args.pool_sizes:
+        pool_sizes = [int(p) for p in args.pool_sizes.split(",") if p.strip()]
+        if any(p < 1 for p in pool_sizes):
+            raise SystemExit(f"--pool-sizes must be positive integers")
+
+    src = _emit(pairs, pool_sizes=pool_sizes)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
-    print(f"wrote {args.out}  ({len(pairs)} models)")
+    if pool_sizes:
+        print(f"wrote {args.out}  ({len(pairs)} models × {len(pool_sizes)} "
+              f"pool sizes = {len(pairs)*len(pool_sizes)} runs)")
+    else:
+        print(f"wrote {args.out}  ({len(pairs)} models)")
 
 
 if __name__ == "__main__":

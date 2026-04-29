@@ -53,6 +53,15 @@ def output_block_count(text: str) -> int:
     return len(list(_END_BARE.finditer(text)))
 
 
+def wall_cycles_count(text: str) -> int:
+    """Number of AGENTS_WALL_CYCLES markers seen. The harness prints
+    this AFTER OUTPUT_END and PROFILE_END for each block, so it's the
+    correct end-of-block sentinel for a streamed runner: waiting for
+    OUTPUT_END alone races the trailing PROFILE/WALL prints and the
+    last block's profile gets cut off when the sim is killed."""
+    return len(list(_WALL_RE.finditer(text)))
+
+
 def _output_block(text: str, tag: Optional[str] = None) -> str:
     if tag is None:
         b = re.escape(BEGIN); e = re.escape(END)
@@ -218,6 +227,66 @@ def emit_iree_profile(records: list[dict], model: str,
         clock_mhz=args.profile_clock_mhz,
     )
     return profile_writer.write_profile(records, meta, args.profile_out_root)
+
+
+def report_pool_sweep_run(text: str, *,
+                          models: list[str],
+                          pool_sizes: list[int],
+                          quant: str,
+                          atol: Optional[float], rtol: Optional[float],
+                          iree_args: IREEProfileArgs,
+                          backend_tag: str,
+                          repo_root: str) -> bool:
+    """Walk OUTPUT/PROFILE/WALL blocks tagged `[<model>@p<N>]` — one
+    block per (model, pool_size) pair from the multi_main_sweep harness.
+    For each tag we:
+      - parse the model name and pool size
+      - compare against the model's golden (same tolerance regardless
+        of pool size — pool only changes timing, not numerics)
+      - emit the profile under topo_<cores> reflecting THIS pool's hart
+        layout (cores = list(range(N))), so XPU-RT's existing per-topo
+        loader picks each results.csv up at the right path
+    Returns True iff every (model, pool_size) verifies."""
+    all_ok = True
+    print(f"\n=== pool sweep: {len(models)} models × {len(pool_sizes)} pool sizes ===")
+    for ps in pool_sizes:
+        for name in models:
+            tag = f"{name}@p{ps}"
+            print(f"\n--- {tag} ---")
+            actual = parse_output(text, tag=tag)
+            golden_path = model_io_path(repo_root, name, quant)
+            if not os.path.exists(golden_path):
+                print(f"FAIL: golden not found at {golden_path}")
+                all_ok = False
+                continue
+            ok, _ = check_one(actual, golden_path, atol, rtol,
+                              label=f"  [{tag}] ")
+            all_ok = all_ok and ok
+            profile = parse_profile(text, tag=tag)
+            wall = parse_wall_cycles(text, tag=tag)
+            if wall is not None:
+                print(f"  [{tag}] wall_clock_cycles={wall} (mtime)")
+            # Emit per-(model, pool) profile under topo_<cores>. We
+            # rebuild IREEProfileArgs so cores reflects this pool size
+            # (cores=[0] for p1, [0,1] for p2, [0,1,2,3] for p4, ...).
+            if profile is not None and iree_args.profile_out_root:
+                cores = ",".join(str(i) for i in range(ps))
+                per_pool_args = IREEProfileArgs(
+                    profile_out_root=iree_args.profile_out_root,
+                    profile_source=iree_args.profile_source,
+                    profile_cpu=iree_args.profile_cpu,
+                    profile_cores=cores,
+                    profile_clock_mhz=iree_args.profile_clock_mhz,
+                    quant=iree_args.quant,
+                )
+                iree_path = emit_iree_profile(
+                    profile, name, per_pool_args, backend_tag)
+                if iree_path:
+                    print(f"  [{tag}] iree_profile -> {iree_path}")
+    print()
+    print(f"OVERALL: {'PASS' if all_ok else 'FAIL'} "
+          f"({len(models) * len(pool_sizes)} runs)")
+    return all_ok
 
 
 def report_run(text: str, *, models: Optional[list[str]],

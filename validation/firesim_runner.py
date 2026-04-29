@@ -37,7 +37,9 @@ from agents.validation.runner_common import (
     IREEProfileArgs,
     has_output_marker,
     output_block_count,
+    report_pool_sweep_run,
     report_run,
+    wall_cycles_count,
 )
 
 
@@ -136,13 +138,19 @@ def _firesim_run_async(firesim_env: str, firesim_root: str,
     )
 
 
-def _expected_end_count(models: Optional[list[str]]) -> int:
+def _expected_end_count(models: Optional[list[str]],
+                        pool_sizes: Optional[list[int]] = None) -> int:
     """How many OUTPUT_END markers do we wait for? Multi-model harness
-    emits one per model; single-model harness emits a single bare END."""
+    emits one per model; single-model harness emits a single bare END.
+    Pool-sweep harness emits len(models) * len(pool_sizes) blocks."""
+    if pool_sizes:
+        assert models, "pool_sizes implies models"
+        return len(models) * len(pool_sizes)
     return max(1, len(models)) if models else 1
 
 
 def run_firesim(elf: str, *, models: Optional[list[str]] = None,
+                pool_sizes: Optional[list[int]] = None,
                 firesim_root: str = DEFAULT_FIRESIM_ROOT,
                 firesim_env: str = DEFAULT_FIRESIM_ENV,
                 firesim_slot: str = DEFAULT_FIRESIM_SLOT,
@@ -178,10 +186,10 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             print(f"firesim: stage {elf} -> {paths['elf_target']}", flush=True)
         _stage_elf(elf, paths)
     _truncate_uartlog(paths)
-    expected_ends = _expected_end_count(models)
+    expected_ends = _expected_end_count(models, pool_sizes)
     if verbose:
         print(f"firesim: runworkload (waiting for {expected_ends} "
-              f"AGENTS_OUTPUT_END marker{'s' if expected_ends>1 else ''})",
+              f"AGENTS_WALL_CYCLES marker{'s' if expected_ends>1 else ''})",
               flush=True)
 
     runworkload_log = os.path.join(paths["sim_slot"],
@@ -216,10 +224,15 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             if len(text) != last_size:
                 last_size = len(text)
                 last_progress = time.monotonic()
+            # Stop on the LAST block's AGENTS_WALL_CYCLES line — that's
+            # the trailing per-block sentinel (OUTPUT_END comes earlier
+            # in the same block, so racing on it cut the last block's
+            # PROFILE+WALL prints off when we killed the sim).
             if has_output_marker(text):
-                if output_block_count(text) >= expected_ends:
+                if wall_cycles_count(text) >= expected_ends:
                     if verbose:
-                        print("firesim: all expected output blocks present",
+                        print("firesim: all expected blocks complete "
+                              f"({expected_ends} WALL_CYCLES seen)",
                               flush=True)
                     break
             # Surface a heartbeat if uartlog is silent for a long stretch
@@ -287,16 +300,28 @@ def main() -> int:
     ap.add_argument("--profile-clock-mhz", type=float, default=1000.0,
                     help="clock rate used to convert per-op cycles to ns. "
                          "Default 1000.0 = 1 GHz, the typical Rocket clock.")
+    ap.add_argument("--pool-sizes", default=None,
+                    help="comma-list of pool sizes the harness was built "
+                         "with (multi-model pool-sweep). Switches the "
+                         "runner to walk [<model>@p<N>] tags and emit "
+                         "per-(model, pool) profiles under topo_<cores>.")
     args = ap.parse_args()
 
     if not args.models and not args.io:
         ap.error("must pass either --io (single-model) or --models (multi)")
+    if args.pool_sizes and not args.models:
+        ap.error("--pool-sizes requires --models")
     if args.profile_cpu is None:
         args.profile_cpu = "firesim_rocket_saturn"
+
+    pool_sizes = None
+    if args.pool_sizes:
+        pool_sizes = [int(p) for p in args.pool_sizes.split(",") if p.strip()]
 
     out = run_firesim(
         args.elf,
         models=(args.models.split(",") if args.models else None),
+        pool_sizes=pool_sizes,
         firesim_root=args.firesim_root,
         firesim_env=args.firesim_env,
         firesim_slot=args.firesim_slot,
@@ -317,17 +342,29 @@ def main() -> int:
         quant=args.quant,
     )
     models_list = (args.models.split(",") if args.models else None)
-    ok = report_run(
-        out,
-        models=models_list,
-        io_path=args.io,
-        quant=args.quant,
-        atol=args.atol, rtol=args.rtol,
-        profile_csv=args.profile_csv,
-        iree_args=iree_args,
-        backend_tag=args.profile_backend,
-        repo_root=repo_root,
-    )
+    if pool_sizes:
+        ok = report_pool_sweep_run(
+            out,
+            models=models_list,
+            pool_sizes=pool_sizes,
+            quant=args.quant,
+            atol=args.atol, rtol=args.rtol,
+            iree_args=iree_args,
+            backend_tag=args.profile_backend,
+            repo_root=repo_root,
+        )
+    else:
+        ok = report_run(
+            out,
+            models=models_list,
+            io_path=args.io,
+            quant=args.quant,
+            atol=args.atol, rtol=args.rtol,
+            profile_csv=args.profile_csv,
+            iree_args=iree_args,
+            backend_tag=args.profile_backend,
+            repo_root=repo_root,
+        )
     return 0 if ok else 1
 
 

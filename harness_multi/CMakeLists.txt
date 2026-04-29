@@ -172,15 +172,25 @@ foreach(_dir ${MODEL_DIRS})
     list(APPEND _GEN_DEPS "${_dir}/model.h" "${_dir}/test_io.h")
 endforeach()
 
+# Optional: pool-sweep mode. When AGENTS_POOL_SIZES is set (comma-list),
+# the generator emits a binary that runs every model once per pool size
+# and tags blocks `[<model>@p<N>]`. Lets us collect topo_0 / topo_0_1 /
+# topo_0_1_2_3 results in a single FireSim run, amortizing infrasetup.
+set(_POOL_SIZES_ARG "")
+if(DEFINED AGENTS_POOL_SIZES AND NOT "${AGENTS_POOL_SIZES}" STREQUAL "")
+    set(_POOL_SIZES_ARG --pool-sizes "${AGENTS_POOL_SIZES}")
+endif()
+
 add_custom_command(
     OUTPUT "${_MULTI_MAIN}"
     COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${_REPO_ROOT}"
             python3 -m agents.pipeline.generate_multi_main
             --models ${_MODEL_SPECS}
             --out "${_MULTI_MAIN}"
+            ${_POOL_SIZES_ARG}
     DEPENDS ${_GEN_PY} ${_GEN_DEPS}
     WORKING_DIRECTORY "${_REPO_ROOT}"
-    COMMENT "Generating multi_main.c for: ${_MODEL_SPECS}"
+    COMMENT "Generating multi_main.c for: ${_MODEL_SPECS} pool_sizes=${AGENTS_POOL_SIZES}"
     VERBATIM
 )
 add_custom_target(agents_multi_main_gen ALL DEPENDS "${_MULTI_MAIN}")

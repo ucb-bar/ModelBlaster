@@ -31,6 +31,7 @@ from agents.validation.runner_common import (
     has_output_marker,
     parse_output,         # re-exported
     parse_profile,        # re-exported
+    report_pool_sweep_run,
     report_run,
 )
 
@@ -112,10 +113,17 @@ def main() -> int:
                          "from --spike-arg=--isa=... if omitted")
     ap.add_argument("--profile-cores", default="0,1,2,3")
     ap.add_argument("--profile-clock-mhz", type=float, default=1000.0)
+    ap.add_argument("--pool-sizes", default=None,
+                    help="comma-list of pool sizes the harness was built "
+                         "with (multi-model pool-sweep). Switches the "
+                         "runner to walk [<model>@p<N>] tags and emit "
+                         "per-(model, pool) profiles under topo_<cores>.")
     args = ap.parse_args()
 
     if not args.models and not args.io:
         ap.error("must pass either --io (single-model) or --models (multi)")
+    if args.pool_sizes and not args.models:
+        ap.error("--pool-sizes requires --models")
 
     spike = find_spike(args.spike)
     print(f"spike: {spike}")
@@ -135,17 +143,30 @@ def main() -> int:
         quant=args.quant,
     )
     models_list = (args.models.split(",") if args.models else None)
-    ok = report_run(
-        out,
-        models=models_list,
-        io_path=args.io,
-        quant=args.quant,
-        atol=args.atol, rtol=args.rtol,
-        profile_csv=args.profile_csv,
-        iree_args=iree_args,
-        backend_tag=backend_tag,
-        repo_root=repo_root,
-    )
+    if args.pool_sizes:
+        pool_sizes = [int(p) for p in args.pool_sizes.split(",") if p.strip()]
+        ok = report_pool_sweep_run(
+            out,
+            models=models_list,
+            pool_sizes=pool_sizes,
+            quant=args.quant,
+            atol=args.atol, rtol=args.rtol,
+            iree_args=iree_args,
+            backend_tag=backend_tag,
+            repo_root=repo_root,
+        )
+    else:
+        ok = report_run(
+            out,
+            models=models_list,
+            io_path=args.io,
+            quant=args.quant,
+            atol=args.atol, rtol=args.rtol,
+            profile_csv=args.profile_csv,
+            iree_args=iree_args,
+            backend_tag=backend_tag,
+            repo_root=repo_root,
+        )
     return 0 if ok else 1
 
 
