@@ -75,6 +75,86 @@ def _gen_inputs_linear(shape: dict, rng: np.random.Generator):
     return inp, w, b, np.zeros((M, N), dtype=np.float32)
 
 
+def _gen_inputs_matmul(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((M, K), dtype=np.float32)
+    B = rng.standard_normal((K, N), dtype=np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+    return A, B, C
+
+
+def _gen_inputs_matmul_ta(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((K, M), dtype=np.float32)  # stored (K, M)
+    B = rng.standard_normal((K, N), dtype=np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+    return A, B, C
+
+
+def _gen_inputs_matmul_tb(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((M, K), dtype=np.float32)
+    B = rng.standard_normal((N, K), dtype=np.float32)  # stored (N, K)
+    C = np.zeros((M, N), dtype=np.float32)
+    return A, B, C
+
+
+def _gen_inputs_matmul_tatb(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((K, M), dtype=np.float32)  # stored (K, M)
+    B = rng.standard_normal((N, K), dtype=np.float32)  # stored (N, K)
+    C = np.zeros((M, N), dtype=np.float32)
+    return A, B, C
+
+
+def _gen_inputs_bmm(shape: dict, rng: np.random.Generator):
+    batch, M, K, N = shape["batch"], shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((batch, M, K), dtype=np.float32)
+    B = rng.standard_normal((batch, K, N), dtype=np.float32)
+    C = np.zeros((batch, M, N), dtype=np.float32)
+    return A, B, C
+
+
+def _gen_inputs_matmul_f16(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((M, K), dtype=np.float32).astype(np.float16)
+    B = rng.standard_normal((K, N), dtype=np.float32).astype(np.float16)
+    C = np.zeros((M, N), dtype=np.float16)
+    return A, B, C
+
+
+def _gen_inputs_matmul_ta_f16(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((K, M), dtype=np.float32).astype(np.float16)
+    B = rng.standard_normal((K, N), dtype=np.float32).astype(np.float16)
+    C = np.zeros((M, N), dtype=np.float16)
+    return A, B, C
+
+
+def _gen_inputs_matmul_tb_f16(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((M, K), dtype=np.float32).astype(np.float16)
+    B = rng.standard_normal((N, K), dtype=np.float32).astype(np.float16)
+    C = np.zeros((M, N), dtype=np.float16)
+    return A, B, C
+
+
+def _gen_inputs_matmul_tatb_f16(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((K, M), dtype=np.float32).astype(np.float16)
+    B = rng.standard_normal((N, K), dtype=np.float32).astype(np.float16)
+    C = np.zeros((M, N), dtype=np.float16)
+    return A, B, C
+
+
+def _gen_inputs_bmm_f16(shape: dict, rng: np.random.Generator):
+    batch, M, K, N = shape["batch"], shape["M"], shape["K"], shape["N"]
+    A = rng.standard_normal((batch, M, K), dtype=np.float32).astype(np.float16)
+    B = rng.standard_normal((batch, K, N), dtype=np.float32).astype(np.float16)
+    C = np.zeros((batch, M, N), dtype=np.float16)
+    return A, B, C
+
+
 def _gen_inputs_relu(shape: dict, rng: np.random.Generator):
     n = shape["n"]
     inp = rng.standard_normal((n,), dtype=np.float32)
@@ -86,6 +166,34 @@ def _gen_inputs_elu(shape: dict, rng: np.random.Generator):
     # Modest range so expf doesn't get too far into the saturation tail.
     inp = rng.standard_normal((n,), dtype=np.float32) * 4.0
     return inp, np.zeros((n,), dtype=np.float32)
+
+
+def _gen_inputs_pointwise(shape: dict, rng: np.random.Generator):
+    """Default input gen for pointwise activations whose only knob is
+    the element count `n`. Modest scaling keeps expf-style activations
+    away from saturation tails (matches _gen_inputs_elu)."""
+    n = shape["n"]
+    inp = rng.standard_normal((n,), dtype=np.float32) * 4.0
+    return inp, np.zeros((n,), dtype=np.float32)
+
+
+def _gen_inputs_reduce(shape: dict, rng: np.random.Generator):
+    """Reduction kernels — input is logically [outer, reduce, inner],
+    flattened. Output is [outer, inner]. Float-output reductions
+    (sum/mean/max/min/prod) use the standard-normal-distributed
+    input; arg-reductions output int64 indices and need a separate
+    output buffer dtype, but they share the float input."""
+    outer, reduce, inner = shape["outer"], shape["reduce"], shape["inner"]
+    inp = rng.standard_normal((outer * reduce * inner,), dtype=np.float32)
+    out = np.zeros((outer * inner,), dtype=np.float32)
+    return inp, out
+
+
+def _gen_inputs_argreduce(shape: dict, rng: np.random.Generator):
+    outer, reduce, inner = shape["outer"], shape["reduce"], shape["inner"]
+    inp = rng.standard_normal((outer * reduce * inner,), dtype=np.float32)
+    out = np.zeros((outer * inner,), dtype=np.int64)
+    return inp, out
 
 
 def _conv2d_oh_ow(shape: dict) -> tuple[int, int]:
@@ -109,8 +217,10 @@ def _gen_inputs_conv2d(shape: dict, rng: np.random.Generator):
 def _gen_inputs_maxpool2d(shape: dict, rng: np.random.Generator):
     N, C, IH, IW = shape["N"], shape["C"], shape["IH"], shape["IW"]
     KH, KW, SH, SW = shape["KH"], shape["KW"], shape["SH"], shape["SW"]
-    OH = (IH - KH) // SH + 1
-    OW = (IW - KW) // SW + 1
+    PH, PW = shape.get("PH", 0), shape.get("PW", 0)
+    DH, DW = shape.get("DH", 1), shape.get("DW", 1)
+    OH = (IH + 2*PH - DH*(KH-1) - 1) // SH + 1
+    OW = (IW + 2*PW - DW*(KW-1) - 1) // SW + 1
     inp = rng.standard_normal((N, C, IH, IW), dtype=np.float32)
     out = np.zeros((N, C, OH, OW), dtype=np.float32)
     return inp, out
@@ -173,8 +283,10 @@ def _gen_inputs_conv2d_s8(shape: dict, rng: np.random.Generator):
 def _gen_inputs_maxpool2d_s8(shape: dict, rng: np.random.Generator):
     N, C, IH, IW = shape["N"], shape["C"], shape["IH"], shape["IW"]
     KH, KW, SH, SW = shape["KH"], shape["KW"], shape["SH"], shape["SW"]
-    OH = (IH - KH) // SH + 1
-    OW = (IW - KW) // SW + 1
+    PH, PW = shape.get("PH", 0), shape.get("PW", 0)
+    DH, DW = shape.get("DH", 1), shape.get("DW", 1)
+    OH = (IH + 2*PH - DH*(KH-1) - 1) // SH + 1
+    OW = (IW + 2*PW - DW*(KW-1) - 1) // SW + 1
     inp = rng.integers(-128, 128, size=(N, C, IH, IW), dtype=np.int8)
     out = np.zeros((N, C, OH, OW), dtype=np.int8)
     return inp, out
@@ -212,6 +324,10 @@ def _i8p(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
 
 
+def _h16p(arr: np.ndarray):
+    return arr.view(np.uint16).ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+
+
 def _i32p(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
 
@@ -241,7 +357,9 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         inp, out = inputs
         fn(_fp(inp), _fp(out),
            shape["N"], shape["C"], shape["IH"], shape["IW"],
-           shape["KH"], shape["KW"], shape["SH"], shape["SW"])
+           shape["KH"], shape["KW"], shape["SH"], shape["SW"],
+           shape.get("PH", 0), shape.get("PW", 0),
+           shape.get("DH", 1), shape.get("DW", 1))
         return out
     if op == "add":
         a, b, out = inputs
@@ -253,6 +371,40 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
            shape["N"], shape["C"], shape["H"], shape["W"])
         return out
     if op == "sigmoid":
+        inp, out = inputs
+        fn(_fp(inp), _fp(out), shape["n"])
+        return out
+    # KernelBench Phase 2 activations.
+    if op in ("tanh", "gelu", "gelu_exact", "selu",
+              "hardsigmoid", "softplus", "softsign", "swish"):
+        inp, out = inputs
+        fn(_fp(inp), _fp(out), shape["n"])
+        return out
+    if op == "leaky_relu":
+        inp, out = inputs
+        fn(_fp(inp), _fp(out), shape["n"], ctypes.c_float(0.01))
+        return out
+    if op == "hardtanh":
+        inp, out = inputs
+        fn(_fp(inp), _fp(out), shape["n"],
+           ctypes.c_float(-1.0), ctypes.c_float(1.0))
+        return out
+    # KernelBench Phase 2 reductions.
+    if op in ("sum_dim", "mean_dim", "max_dim", "min_dim", "prod_dim"):
+        inp, out = inputs
+        fn(_fp(inp), _fp(out), shape["outer"], shape["reduce"], shape["inner"])
+        return out
+    if op in ("argmax_dim", "argmin_dim"):
+        inp, out = inputs
+        i64p = ctypes.POINTER(ctypes.c_int64)
+        fn(_fp(inp), out.ctypes.data_as(i64p),
+           shape["outer"], shape["reduce"], shape["inner"])
+        return out
+    if op in ("l1_norm", "l2_norm"):
+        inp, out = inputs
+        fn(_fp(inp), _fp(out), shape["outer"], shape["reduce"], shape["inner"])
+        return out
+    if op == "frobenius_norm":
         inp, out = inputs
         fn(_fp(inp), _fp(out), shape["n"])
         return out
@@ -286,7 +438,9 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         inp, out = inputs
         fn(_i8p(inp), _i8p(out),
            shape["N"], shape["C"], shape["IH"], shape["IW"],
-           shape["KH"], shape["KW"], shape["SH"], shape["SW"])
+           shape["KH"], shape["KW"], shape["SH"], shape["SW"],
+           shape.get("PH", 0), shape.get("PW", 0),
+           shape.get("DH", 1), shape.get("DW", 1))
         return out
     if op == "add_s8":
         a, b, out = inputs
@@ -306,6 +460,22 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         fn(_i8p(inp), _i8p(out), shape["n"],
            ctypes.c_float(0.05), ctypes.c_float(0.01), 0, 127)
         return out
+    if op in ("matmul", "matmul_ta", "matmul_tb", "matmul_tatb"):
+        A, B, C = inputs
+        fn(_fp(A), _fp(B), _fp(C), shape["M"], shape["K"], shape["N"])
+        return C
+    if op == "bmm":
+        A, B, C = inputs
+        fn(_fp(A), _fp(B), _fp(C), shape["batch"], shape["M"], shape["K"], shape["N"])
+        return C
+    if op in ("matmul_f16", "matmul_ta_f16", "matmul_tb_f16", "matmul_tatb_f16"):
+        A, B, C = inputs
+        fn(_h16p(A), _h16p(B), _h16p(C), shape["M"], shape["K"], shape["N"])
+        return C
+    if op == "bmm_f16":
+        A, B, C = inputs
+        fn(_h16p(A), _h16p(B), _h16p(C), shape["batch"], shape["M"], shape["K"], shape["N"])
+        return C
     raise NotImplementedError(op)
 
 
@@ -386,6 +556,27 @@ def verify(
                     inputs_ref = _gen_inputs_batchnorm2d(shape, rng)
                 elif op == "sigmoid":
                     inputs_ref = _gen_inputs_sigmoid(shape, rng)
+                elif op in ("leaky_relu", "tanh", "swish",
+                            "gelu", "gelu_exact", "selu",
+                            "hardsigmoid", "softplus", "softsign",
+                            "hardtanh"):
+                    inputs_ref = _gen_inputs_pointwise(shape, rng)
+                elif op in ("sum_dim", "mean_dim", "max_dim",
+                            "min_dim", "prod_dim"):
+                    inputs_ref = _gen_inputs_reduce(shape, rng)
+                elif op in ("argmax_dim", "argmin_dim"):
+                    inputs_ref = _gen_inputs_argreduce(shape, rng)
+                elif op in ("l1_norm", "l2_norm"):
+                    # Same shape as a reduction but the output is the
+                    # full input shape (broadcast division), so size
+                    # the output buffer accordingly.
+                    outer = shape["outer"]; reduce = shape["reduce"]; inner = shape["inner"]
+                    inp = rng.standard_normal((outer * reduce * inner,),
+                                              dtype=np.float32)
+                    out = np.zeros((outer * reduce * inner,), dtype=np.float32)
+                    inputs_ref = (inp, out)
+                elif op == "frobenius_norm":
+                    inputs_ref = _gen_inputs_pointwise(shape, rng)
                 elif op == "linear_s8":
                     inputs_ref = _gen_inputs_linear_s8(shape, rng)
                 elif op == "relu_s8":
@@ -400,6 +591,26 @@ def verify(
                     inputs_ref = _gen_inputs_batchnorm2d_s8(shape, rng)
                 elif op == "sigmoid_s8":
                     inputs_ref = _gen_inputs_sigmoid_s8(shape, rng)
+                elif op == "matmul":
+                    inputs_ref = _gen_inputs_matmul(shape, rng)
+                elif op == "matmul_ta":
+                    inputs_ref = _gen_inputs_matmul_ta(shape, rng)
+                elif op == "matmul_tb":
+                    inputs_ref = _gen_inputs_matmul_tb(shape, rng)
+                elif op == "matmul_tatb":
+                    inputs_ref = _gen_inputs_matmul_tatb(shape, rng)
+                elif op == "bmm":
+                    inputs_ref = _gen_inputs_bmm(shape, rng)
+                elif op == "matmul_f16":
+                    inputs_ref = _gen_inputs_matmul_f16(shape, rng)
+                elif op == "matmul_ta_f16":
+                    inputs_ref = _gen_inputs_matmul_ta_f16(shape, rng)
+                elif op == "matmul_tb_f16":
+                    inputs_ref = _gen_inputs_matmul_tb_f16(shape, rng)
+                elif op == "matmul_tatb_f16":
+                    inputs_ref = _gen_inputs_matmul_tatb_f16(shape, rng)
+                elif op == "bmm_f16":
+                    inputs_ref = _gen_inputs_bmm_f16(shape, rng)
                 else:
                     return VerifyResult(False, f"unsupported op {op}")
                 inputs_cand = tuple(a.copy() for a in inputs_ref)

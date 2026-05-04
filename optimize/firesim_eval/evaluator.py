@@ -66,9 +66,14 @@ class FiresimEvalConfig:
     firesim_slot: str = os.environ.get(
         "FIRESIM_SLOT", "firesim_rundir/sim_slot_0")
     # Per-run wall-time budget for the firesim_runner.run_firesim() call.
-    # Must cover the longest single-model harness run (sequential dronet
-    # is <15 s @ 1 GHz target, but firesim manager startup adds ~30 s).
-    firesim_timeout_sec: float = 240.0
+    # Override via FIRESIM_TIMEOUT env. Default 1800 s — the per-element
+    # output-dump in the harness can drain HTIF UART for several minutes
+    # on kernelbench-shaped tensors (4k+ outputs each). Manager startup
+    # adds another ~30s. The previous 240s default was sized for the
+    # single-network sequential dronet (<15 s @ 1 GHz target) and timed
+    # out on every kernelbench bench's stock-shape printf dump.
+    firesim_timeout_sec: float = float(
+        os.environ.get("FIRESIM_TIMEOUT", "1800"))
     # FPGA queue politeness: how long we wait for a busy FPGA before
     # giving up. Re-ranks take 1-3 min each so blocking 10-15 min on a
     # contended FPGA is reasonable.
@@ -369,7 +374,8 @@ class FiresimEvaluator:
         # Local imports — same lazy pattern; firesim_runner is heavy.
         from agents.validation.firesim_runner import run_firesim
         from agents.validation.runner_common import (
-            parse_output, parse_profile, parse_wall_cycles, compare,
+            parse_output, parse_profile, parse_verify, parse_wall_cycles,
+            compare,
         )
         import numpy as np
 
@@ -388,10 +394,11 @@ class FiresimEvaluator:
         except Exception as e:
             return False, f"firesim run threw: {type(e).__name__}: {e}", {}
 
-        try:
-            actual = parse_output(uart)
-        except Exception as e:
-            return False, f"firesim output parse failed: {e}", {}
+        # Modern harness emits a single AGENTS_VERIFY summary; legacy
+        # binaries ship the per-element OUTPUT block. Prefer the
+        # summary on FireSim — the OUTPUT path's per-element printf
+        # over HTIF UART used to dominate the wall budget.
+        verify = parse_verify(uart)
 
         profile = parse_profile(uart) or []
         cycles_by_op: dict[str, int] = {}
@@ -399,21 +406,41 @@ class FiresimEvaluator:
             cycles_by_op[row["op"]] = (
                 cycles_by_op.get(row["op"], 0) + int(row["cycles"])
             )
-
         wall = parse_wall_cycles(uart)
 
-        # Numerical compare against PyTorch golden (io.npz).
-        golden = np.load(self.io_path)["output"].astype(
-            np.float32).reshape(-1)
-        is_int = np.load(self.io_path)["output"].dtype.kind in ("i", "u")
-        atol = 0.0 if is_int else 1e-5
-        rtol = 0.0 if is_int else 1e-4
-        ok, stats = compare(actual, golden, atol=atol, rtol=rtol)
+        raw_golden = np.load(self.io_path)["output"]
+        is_int = raw_golden.dtype.kind in ("i", "u")
+        is_fp16 = raw_golden.dtype == np.float16
+        if is_int:
+            atol = rtol = 0.0
+        elif is_fp16:
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 1e-5, 1e-4
+
+        if verify is not None:
+            n_golden = int(np.asarray(raw_golden).reshape(-1).size)
+            if verify["n"] != n_golden:
+                ok = False
+                max_ae = float("inf")
+            else:
+                max_ae = verify["max_abs_err"]
+                max_re = verify["max_rel_err"]
+                ok = (max_ae <= atol) or (max_re <= rtol)
+        else:
+            try:
+                actual = parse_output(uart)
+            except Exception as e:
+                return False, f"firesim output parse failed: {e}", {}
+            golden = raw_golden.astype(np.float32).reshape(-1)
+            ok, stats = compare(actual, golden, atol=atol, rtol=rtol)
+            max_ae = stats.get("max_abs_err")
+
         return True, "ok", {
             "cycles_by_op": cycles_by_op,
             "wall_cycles": wall,
             "golden_ok": ok,
-            "golden_max_abs_err": stats.get("max_abs_err"),
+            "golden_max_abs_err": max_ae,
         }
 
 

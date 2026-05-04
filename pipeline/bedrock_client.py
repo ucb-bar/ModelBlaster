@@ -20,9 +20,14 @@ DEFAULT_REGION = "us-east-1"
 
 # Models that Bedrock only serves through cross-region inference profiles
 # (i.e. on-demand invocation by the bare model id is rejected). For these we
-# silently prepend the us. prefix if missing.
+# silently prepend the us. prefix if missing. The Anthropic Claude family
+# from sonnet-4 onward joined this list — older models (3.5 sonnet, opus,
+# haiku) still accept on-demand by bare id.
 _INFERENCE_PROFILE_REQUIRED = (
     "meta.llama4-",
+    "anthropic.claude-sonnet-4",
+    "anthropic.claude-opus-4",
+    "anthropic.claude-haiku-4",
 )
 
 
@@ -69,7 +74,12 @@ class BedrockClient:
         system: Optional[str] = None,
         max_tokens: int = 4096,
         temperature: float = 0.2,
-        timeout: float = 180.0,
+        # Sonnet 4.6 at max_tokens=32k can stream for several minutes
+        # (especially with `--cache-aware-prompt` adding context). The
+        # earlier 180s default cut off mid-stream on the longer
+        # generations. 600s is generous; the connection idle-timeouts
+        # in urllib3 will trip first if the server actually wedged.
+        timeout: float = 600.0,
     ) -> ConverseResult:
         url = f"{self.endpoint}/model/{self.model_id}/converse"
         body = {
