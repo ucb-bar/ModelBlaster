@@ -251,6 +251,33 @@ def _gen_inputs_sigmoid(shape: dict, rng: np.random.Generator):
     return inp, out
 
 
+def _gen_inputs_upsample_nearest(shape: dict, rng: np.random.Generator):
+    N, C = shape["N"], shape["C"]
+    IH, IW, scale = shape["IH"], shape["IW"], shape["scale"]
+    inp = rng.standard_normal((N * C * IH * IW,), dtype=np.float32)
+    out = np.zeros((N * C * IH * scale * IW * scale,), dtype=np.float32)
+    return inp, out
+
+
+def _gen_inputs_cat_c1(shape: dict, rng: np.random.Generator, n_inputs: int):
+    """Channel-cat input set: n_inputs of shape (N, c_i, H, W), one
+    output of (N, sum(c_i), H, W). c_i pulled from shape['C_inputs']
+    (when running off an IR op) or from individual c0, c1, ... keys
+    (when running from extra_shapes)."""
+    N, H, W = shape["N"], shape["H"], shape["W"]
+    if "C_inputs" in shape:
+        cs = list(shape["C_inputs"])
+    else:
+        cs = [shape[f"c{i}"] for i in range(n_inputs)]
+    if len(cs) != n_inputs:
+        raise ValueError(
+            f"cat{n_inputs}_c1: expected {n_inputs} channel counts, got {cs}"
+        )
+    arrs = [rng.standard_normal((N * c * H * W,), dtype=np.float32) for c in cs]
+    out = np.zeros((N * sum(cs) * H * W,), dtype=np.float32)
+    return (*arrs, out)
+
+
 def _gen_inputs_linear_s8(shape: dict, rng: np.random.Generator):
     M, K, N = shape["M"], shape["K"], shape["N"]
     inp = rng.integers(-128, 128, size=(M, K), dtype=np.int8)
@@ -373,6 +400,28 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
     if op == "sigmoid":
         inp, out = inputs
         fn(_fp(inp), _fp(out), shape["n"])
+        return out
+    # YOLOv8-nano: silu / upsample_nearest / catN_c1.
+    if op == "silu":
+        inp, out = inputs
+        fn(_fp(inp), _fp(out), shape["n"])
+        return out
+    if op == "upsample_nearest":
+        inp, out = inputs
+        fn(_fp(inp), _fp(out),
+           shape["N"], shape["C"], shape["IH"], shape["IW"], shape["scale"])
+        return out
+    if op in ("cat2_c1", "cat3_c1", "cat4_c1"):
+        n_inputs = int(op[3])
+        cs = list(shape.get("C_inputs",
+                            [shape[f"c{i}"] for i in range(n_inputs)]))
+        ins = inputs[:n_inputs]
+        out = inputs[n_inputs]
+        flat_args = []
+        for src, c in zip(ins, cs):
+            flat_args.append(_fp(src))
+            flat_args.append(c)
+        fn(*flat_args, _fp(out), shape["N"], shape["H"], shape["W"])
         return out
     # KernelBench Phase 2 activations.
     if op in ("tanh", "gelu", "gelu_exact", "selu",
@@ -556,6 +605,12 @@ def verify(
                     inputs_ref = _gen_inputs_batchnorm2d(shape, rng)
                 elif op == "sigmoid":
                     inputs_ref = _gen_inputs_sigmoid(shape, rng)
+                elif op == "silu":
+                    inputs_ref = _gen_inputs_pointwise(shape, rng)
+                elif op == "upsample_nearest":
+                    inputs_ref = _gen_inputs_upsample_nearest(shape, rng)
+                elif op in ("cat2_c1", "cat3_c1", "cat4_c1"):
+                    inputs_ref = _gen_inputs_cat_c1(shape, rng, int(op[3]))
                 elif op in ("leaky_relu", "tanh", "swish",
                             "gelu", "gelu_exact", "selu",
                             "hardsigmoid", "softplus", "softsign",

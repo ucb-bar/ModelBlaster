@@ -3027,6 +3027,235 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
 )
 
 
+# ---------------------------------------------------------------------------
+# YOLOv8-nano support: silu / upsample_nearest / cat{2,3,4}_c1.
+# silu and upsample_nearest are pointwise enough that the reference is
+# obviously correct; the cat kernels are pure memcpy along the channel
+# axis (NCHW). All four are needed end-to-end in the YOLOv8n graph.
+# ---------------------------------------------------------------------------
+
+
+def _silu_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+SILU = KernelSpec(
+    op="silu",
+    signature="void kernel_silu(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise SiLU (a.k.a. Swish) on a contiguous float32 buffer:\n"
+        "  output[i] = input[i] / (1.0f + expf(-input[i]))   for i in [0, n)\n"
+        "Equivalent to x * sigmoid(x). It must be safe for `input` and "
+        "`output` to alias."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_silu(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        float s = 1.0f / (1.0f + expf(-v));
+        output[i] = v * s;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_silu_argtypes,
+)
+
+
+def _upsample_nearest_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW, scale
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+
+
+UPSAMPLE_NEAREST = KernelSpec(
+    op="upsample_nearest",
+    signature=(
+        "void kernel_upsample_nearest(const float *input, float *output, "
+        "int N, int C, int IH, int IW, int scale)"
+    ),
+    semantics=(
+        "Nearest-neighbor 2D upsampling along H and W by an integer factor.\n"
+        "Output shape is (N, C, IH*scale, IW*scale). Each output pixel\n"
+        "(oh, ow) reads the input pixel (oh/scale, ow/scale).\n"
+        "Buffers are NCHW-laid-out; stride math:\n"
+        "  in_idx  = ((n*C + c)*IH + ih)*IW + iw\n"
+        "  out_idx = ((n*C + c)*OH + oh)*OW + ow\n"
+        "where OH=IH*scale, OW=IW*scale, ih=oh/scale, iw=ow/scale."
+    ),
+    reference_impl="""\
+void kernel_upsample_nearest(const float *input, float *output,
+                             int N, int C, int IH, int IW, int scale) {
+    int OH = IH * scale, OW = IW * scale;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih = oh / scale;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw = ow / scale;
+                    output[((n*C + c)*OH + oh)*OW + ow] =
+                        input[((n*C + c)*IH + ih)*IW + iw];
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4,  "IH": 5,  "IW": 5,  "scale": 2},
+        {"N": 1, "C": 16, "IH": 10, "IW": 10, "scale": 2},
+    ],
+    argtypes_factory=_upsample_nearest_argtypes,
+)
+
+
+def _cat2_c1_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # in0, c0, in1, c1, out, N, H, W
+    return [fp, ctypes.c_int, fp, ctypes.c_int,
+            fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _cat3_c1_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, ctypes.c_int, fp, ctypes.c_int, fp, ctypes.c_int,
+            fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _cat4_c1_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, ctypes.c_int, fp, ctypes.c_int, fp, ctypes.c_int,
+            fp, ctypes.c_int,
+            fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+# Common cat semantics — only the input count varies. Pulled out so the
+# three KernelSpecs share wording.
+_CAT_SEMANTICS = (
+    "Channel-wise concat (NCHW, dim=1) of {n} fp32 inputs into one output.\n"
+    "Each input is N×c_i×H×W; the output is N×(c_0+c_1+...)×H×W.\n"
+    "For each (n, h, w) the channel axis is filled by appending\n"
+    "in0[n, :c0, h, w], then in1[n, :c1, h, w], then ... All inputs\n"
+    "share the same N, H, W. Pure memcpy — no arithmetic."
+)
+
+
+CAT2_C1 = KernelSpec(
+    op="cat2_c1",
+    signature=(
+        "void kernel_cat2_c1(const float *in0, int c0, "
+        "const float *in1, int c1, float *out, int N, int H, int W)"
+    ),
+    semantics=_CAT_SEMANTICS.format(n=2),
+    reference_impl="""\
+void kernel_cat2_c1(const float *in0, int c0,
+                    const float *in1, int c1,
+                    float *out, int N, int H, int W) {
+    int C = c0 + c1;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        float *dst = out + n * C * HW;
+        const float *s0 = in0 + n * c0 * HW;
+        const float *s1 = in1 + n * c1 * HW;
+        for (int i = 0; i < c0 * HW; i++) dst[i] = s0[i];
+        dst += c0 * HW;
+        for (int i = 0; i < c1 * HW; i++) dst[i] = s1[i];
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 16, "c1": 16, "N": 1, "H": 8,  "W": 8},
+        {"c0": 64, "c1": 32, "N": 1, "H": 10, "W": 10},
+    ],
+    argtypes_factory=_cat2_c1_argtypes,
+)
+
+
+CAT3_C1 = KernelSpec(
+    op="cat3_c1",
+    signature=(
+        "void kernel_cat3_c1(const float *in0, int c0, "
+        "const float *in1, int c1, const float *in2, int c2, "
+        "float *out, int N, int H, int W)"
+    ),
+    semantics=_CAT_SEMANTICS.format(n=3),
+    reference_impl="""\
+void kernel_cat3_c1(const float *in0, int c0,
+                    const float *in1, int c1,
+                    const float *in2, int c2,
+                    float *out, int N, int H, int W) {
+    int C = c0 + c1 + c2;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        float *dst = out + n * C * HW;
+        const float *s0 = in0 + n * c0 * HW;
+        const float *s1 = in1 + n * c1 * HW;
+        const float *s2 = in2 + n * c2 * HW;
+        for (int i = 0; i < c0 * HW; i++) dst[i] = s0[i];
+        dst += c0 * HW;
+        for (int i = 0; i < c1 * HW; i++) dst[i] = s1[i];
+        dst += c1 * HW;
+        for (int i = 0; i < c2 * HW; i++) dst[i] = s2[i];
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 16, "c1": 16, "c2": 16, "N": 1, "H": 8, "W": 8},
+    ],
+    argtypes_factory=_cat3_c1_argtypes,
+)
+
+
+CAT4_C1 = KernelSpec(
+    op="cat4_c1",
+    signature=(
+        "void kernel_cat4_c1(const float *in0, int c0, "
+        "const float *in1, int c1, const float *in2, int c2, "
+        "const float *in3, int c3, "
+        "float *out, int N, int H, int W)"
+    ),
+    semantics=_CAT_SEMANTICS.format(n=4),
+    reference_impl="""\
+void kernel_cat4_c1(const float *in0, int c0,
+                    const float *in1, int c1,
+                    const float *in2, int c2,
+                    const float *in3, int c3,
+                    float *out, int N, int H, int W) {
+    int C = c0 + c1 + c2 + c3;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        float *dst = out + n * C * HW;
+        const float *s0 = in0 + n * c0 * HW;
+        const float *s1 = in1 + n * c1 * HW;
+        const float *s2 = in2 + n * c2 * HW;
+        const float *s3 = in3 + n * c3 * HW;
+        for (int i = 0; i < c0 * HW; i++) dst[i] = s0[i];
+        dst += c0 * HW;
+        for (int i = 0; i < c1 * HW; i++) dst[i] = s1[i];
+        dst += c1 * HW;
+        for (int i = 0; i < c2 * HW; i++) dst[i] = s2[i];
+        dst += c2 * HW;
+        for (int i = 0; i < c3 * HW; i++) dst[i] = s3[i];
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 64, "c1": 64, "c2": 64, "c3": 64, "N": 1, "H": 5, "W": 5},
+    ],
+    argtypes_factory=_cat4_c1_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -3086,6 +3315,12 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "matmul_tb_f16": MATMUL_TB_F16,
     "matmul_tatb_f16": MATMUL_TATB_F16,
     "bmm_f16": BMM_F16,
+    # YOLOv8-nano support.
+    "silu": SILU,
+    "upsample_nearest": UPSAMPLE_NEAREST,
+    "cat2_c1": CAT2_C1,
+    "cat3_c1": CAT3_C1,
+    "cat4_c1": CAT4_C1,
 }
 
 
