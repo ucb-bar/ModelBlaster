@@ -341,9 +341,20 @@ def emit_weights(model_name: str, weights: dict[str, np.ndarray], out_dir: str) 
 
 
 def _shape_str(op: dict) -> str:
-    """Stable, parseable per-op shape string for the profile CSV."""
+    """Stable, parseable per-op shape string for the profile CSV.
+
+    Lists are joined with `|` (rather than printed as Python list literals)
+    so the comma-delimited CSV parser doesn't get confused — e.g. a cat3
+    op with C_inputs=[16, 16, 16] becomes ``C_inputs=16|16|16``.
+    """
     sh = op.get("shape", {})
-    return ";".join(f"{k}={sh[k]}" for k in sh)
+    parts: list[str] = []
+    for k in sh:
+        v = sh[k]
+        if isinstance(v, (list, tuple)):
+            v = "|".join(str(x) for x in v)
+        parts.append(f"{k}={v}")
+    return ";".join(parts)
 
 
 def emit_model(ir: dict[str, Any], out_dir: str) -> None:
@@ -385,6 +396,12 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
     # the output tensor name aliases the input's buffer. Build the alias map
     # before assigning intermediate buffers so views never get their own.
     aliases: dict[str, str] = {}
+    # Offset aliases: tensor → (base_tensor_name, element_offset). Used by
+    # chunk2_c1 to express "y0 is the first half of cv1_out, y1 is the
+    # second half" without copying — generated C just uses pointer math
+    # (`buf_cv1_out + 0` vs `buf_cv1_out + c_each*H*W`). The aliased
+    # tensors don't need their own intermediate buffers.
+    offset_aliases: dict[str, tuple[str, int]] = {}
     def resolve_alias(name: str) -> str:
         seen: set[str] = set()
         while name in aliases:
@@ -396,11 +413,21 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
     for op in ir["ops"]:
         if op["op"] == "view":
             aliases[op["outputs"][0]] = op["inputs"][0]
+        elif op["op"] == "chunk2_c1":
+            # Two outputs: first half at offset 0, second half at offset
+            # c_each*H*W (in floats — pointer arithmetic on the base type).
+            base = op["inputs"][0]
+            sh = op["shape"]
+            elem_offset = sh["c_each"] * sh["H"] * sh["W"]
+            offset_aliases[op["outputs"][0]] = (base, 0)
+            offset_aliases[op["outputs"][1]] = (base, elem_offset)
 
     # Number of ops that actually emit a kernel call (used to size the profile
-    # record array).
-    op_count = sum(1 for op in ir["ops"] if op["op"] != "view")
-    used_ops = {op["op"] for op in ir["ops"] if op["op"] != "view"}
+    # record array). chunk2_c1 is a no-op at runtime (just sets up offset
+    # aliases at codegen time), so it doesn't contribute either.
+    _zero_cost_ops = {"view", "chunk2_c1"}
+    op_count = sum(1 for op in ir["ops"] if op["op"] not in _zero_cost_ops)
+    used_ops = {op["op"] for op in ir["ops"] if op["op"] not in _zero_cost_ops}
 
     # All exported symbols are mangled by model name (model_<mid>_*,
     # MODEL_<UMID>_*) so multiple models can co-exist in one binary.
@@ -527,7 +554,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     out_tensor_set = set(out_tensors_list)
     intermediates = [
         t for t in tensors
-        if t not in input_names_set and t not in out_tensor_set and t not in aliases
+        if t not in input_names_set and t not in out_tensor_set
+        and t not in aliases and t not in offset_aliases
     ]
     buf_defs: list[str] = []   # for buffers.c (definitions, no `static`)
     buf_externs: list[str] = []  # for model.c (declarations)
@@ -539,6 +567,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 
     def ptr_for(tensor: str, role: str) -> str:
         tensor = resolve_alias(tensor)
+        if tensor in offset_aliases:
+            base, off = offset_aliases[tensor]
+            base_ptr = ptr_for(base, role)
+            return base_ptr if off == 0 else f"({base_ptr} + {off})"
         if tensor in input_offsets:
             off = input_offsets[tensor]
             return "input" if off == 0 else f"(input + {off})"
@@ -551,8 +583,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     dispatch_fns: list[str] = []
     invoke_table_rows: list[str] = []
     for op in ir["ops"]:
-        if op["op"] == "view":
-            # No-op at runtime — buffer alias was set above.
+        if op["op"] in _zero_cost_ops:
+            # view / chunk2_c1: no kernel call. Aliases were set up above
+            # (plain aliases for view, offset aliases for chunk2_c1).
             continue
         out_ptr = ptr_for(op["outputs"][0], "out")
         shape_lit = _shape_str(op)
@@ -621,6 +654,37 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
             call = f"kernel_sigmoid({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "silu":
+            # YOLOv8 Conv block activation. SiLU(x) = x * sigmoid(x).
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_silu({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "upsample_nearest":
+            # YOLOv8 neck nearest-neighbor 2× upsample.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_upsample_nearest({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['scale']})"
+            )
+        elif op["op"] in ("cat2_c1", "cat3_c1", "cat4_c1"):
+            # Channel-wise concat. Per-input channel counts are baked into
+            # the call so the kernel can compute its destination offsets
+            # without a runtime lookup table.
+            sh = op["shape"]
+            in_ptrs = [ptr_for(n, "in") for n in op["inputs"]]
+            cs = sh["C_inputs"]
+            call = (
+                f"kernel_{op['op']}("
+                + ", ".join(f"{p}, {c}" for p, c in zip(in_ptrs, cs))
+                + f", {out_ptr}, {sh['N']}, {sh['H']}, {sh['W']})"
+            )
+        elif op["op"] == "chunk2_c1":
+            # No-op at runtime: the two halves are aliases of the input
+            # buffer at offsets 0 and c_each*H*W. Codegen handles this via
+            # `offset_aliases` (see below) — emit no kernel call.
+            call = None
         elif op["op"] == "relu6":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]

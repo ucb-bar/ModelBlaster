@@ -915,9 +915,13 @@ def generate(
 
     target = backends_mod.get(target_name)
 
-    # `view` ops (flatten / dropout in eval mode) compile to a buffer alias in
-    # the skeleton and have no kernel — skip them here.
-    op_kinds = sorted({op["op"] for op in ir["ops"] if op["op"] != "view"})
+    # Zero-cost ops compile to buffer aliases / pointer arithmetic in the
+    # skeleton and have no kernel:
+    #   * `view`     — flatten / dropout in eval mode
+    #   * `chunk2_c1` — channel-wise split (YOLOv8 C2f), maps to two
+    #                   offset aliases into the input buffer.
+    _zero_cost = {"view", "chunk2_c1"}
+    op_kinds = sorted({op["op"] for op in ir["ops"] if op["op"] not in _zero_cost})
     for k in op_kinds:
         if k not in KERNEL_SPECS:
             raise SystemExit(f"unknown op kind in IR: {k}")

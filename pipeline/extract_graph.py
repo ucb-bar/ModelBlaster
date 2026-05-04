@@ -424,6 +424,9 @@ SUPPORTED_MODULES = (
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
     torch.nn.Sigmoid,
+    # YOLOv8 backbone uses SiLU activation throughout; neck uses Upsample.
+    torch.nn.SiLU,
+    torch.nn.Upsample,
 )
 
 
@@ -1495,6 +1498,41 @@ def extract(
                     "max_val": float(mod.max_val),
                 })
 
+            elif isinstance(mod, torch.nn.SiLU):
+                # SiLU = x * sigmoid(x). Pointwise; same IR shape as ReLU.
+                # YOLOv8's Conv block ends with this.
+                n = int(np.prod(tensors[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target), "op": "silu",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+
+            elif isinstance(mod, torch.nn.Upsample):
+                # Only nearest-neighbor with integer scale_factor is wired
+                # up — that's what YOLOv8's neck uses (×2 nearest). Bilinear
+                # / arbitrary scales would need a different kernel.
+                if mod.mode != "nearest":
+                    raise NotImplementedError(
+                        f"Upsample mode={mod.mode!r} at {node.name}: only "
+                        f"'nearest' is supported."
+                    )
+                sf = mod.scale_factor
+                if sf is None or float(sf) != int(sf):
+                    raise NotImplementedError(
+                        f"Upsample scale_factor={sf} at {node.name}: only "
+                        f"integer scales are supported."
+                    )
+                sf = int(sf)
+                in_shape = tensors[in_name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                ops.append({
+                    "name": str(node.target), "op": "upsample_nearest",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": IH, "IW": IW,
+                              "scale": sf},
+                })
+
         elif node.op == "call_function":
             out_name = node.name
             target = node.target
@@ -1943,8 +1981,115 @@ def extract(
                         "N": int(b_shape[2]),
                     },
                 })
+            elif target is torch.cat or tname == "cat":
+                # torch.cat(tensors_list, dim). YOLOv8 uses dim=1 (channel
+                # concat) exclusively — restrict to that for now since the
+                # other dims need different memory layout in the kernel.
+                tensors_arg = node.args[0]
+                if not isinstance(tensors_arg, (list, tuple)):
+                    raise NotImplementedError(
+                        f"cat at {node.name}: first arg must be a list/tuple "
+                        f"of tensors, got {type(tensors_arg).__name__}."
+                    )
+                dim = node.args[1] if len(node.args) > 1 else \
+                    node.kwargs.get("dim", 0)
+                dim = int(dim)
+                if dim != 1:
+                    raise NotImplementedError(
+                        f"cat at {node.name}: dim={dim}, only dim=1 (channel "
+                        f"concat) is supported."
+                    )
+                in_names = [t.name for t in tensors_arg]
+                first_shape = list(tensors[in_names[0]]["shape"])
+                if len(first_shape) != 4:
+                    raise NotImplementedError(
+                        f"cat at {node.name}: only 4D NCHW inputs supported."
+                    )
+                N_, _, H_, W_ = (int(s) for s in first_shape)
+                c_inputs = [int(tensors[n]["shape"][1]) for n in in_names]
+                op_kind = f"cat{len(in_names)}_c1"
+                if len(in_names) not in (2, 3, 4):
+                    raise NotImplementedError(
+                        f"cat at {node.name}: {len(in_names)} inputs; only "
+                        f"2/3/4-input cat kernels are wired up."
+                    )
+                ops.append({
+                    "name": node.name, "op": op_kind,
+                    "inputs": in_names, "outputs": [out_name],
+                    "shape": {"N": N_, "H": H_, "W": W_,
+                              "C_inputs": c_inputs,
+                              "C_total": sum(c_inputs)},
+                })
             else:
                 raise NotImplementedError(f"unsupported function {tname} at {node.name}")
+
+        elif node.op == "call_method":
+            # Currently only `chunk` is wired in. Tensor.chunk(2, 1) is the
+            # split-channel pattern in YOLOv8's C2f block. The chunk node
+            # itself doesn't produce a tensor; getitem(_, 0)/(_, 1) do —
+            # find them and emit a chunk2_c1 op with both output names.
+            target = node.target
+            if target == "chunk":
+                in_name = node.args[0].name
+                n_chunks = int(node.args[1])
+                dim = int(node.args[2]) if len(node.args) > 2 \
+                    else int(node.kwargs.get("dim", 0))
+                if n_chunks != 2 or dim != 1:
+                    raise NotImplementedError(
+                        f"chunk at {node.name}: only chunk(2, dim=1) is "
+                        f"supported; got chunk({n_chunks}, dim={dim})."
+                    )
+                in_shape = list(tensors[in_name]["shape"])
+                if len(in_shape) != 4:
+                    raise NotImplementedError(
+                        f"chunk at {node.name}: only 4D NCHW inputs supported."
+                    )
+                N_, C, H_, W_ = (int(s) for s in in_shape)
+                if C % 2 != 0:
+                    raise NotImplementedError(
+                        f"chunk at {node.name}: input C={C} is odd; can't "
+                        f"split evenly."
+                    )
+                c_each = C // 2
+                # Find getitem(_, 0) and getitem(_, 1) consumers — both must
+                # exist for the IR to be well-defined (we don't emit a
+                # tensor for the chunk node itself, only for its halves).
+                gi0 = None
+                gi1 = None
+                op_getitem = __import__("operator").getitem
+                for user in node.users:
+                    if (user.op == "call_function" and user.target is op_getitem
+                            and len(user.args) >= 2 and isinstance(user.args[1], int)):
+                        idx = user.args[1]
+                        if idx == 0:
+                            gi0 = user
+                        elif idx == 1:
+                            gi1 = user
+                if gi0 is None or gi1 is None:
+                    raise NotImplementedError(
+                        f"chunk at {node.name}: expected both getitem(_, 0) "
+                        f"and getitem(_, 1) consumers; got "
+                        f"gi0={gi0} gi1={gi1}."
+                    )
+                # The two output tensors are named after the getitem nodes,
+                # not the chunk node. Both halves have shape [N, C/2, H, W].
+                tensors[gi0.name] = {"shape": [N_, c_each, H_, W_],
+                                     "dtype": "f32", "quant": None}
+                tensors[gi1.name] = {"shape": [N_, c_each, H_, W_],
+                                     "dtype": "f32", "quant": None}
+                _skip_nodes.add(gi0)
+                _skip_nodes.add(gi1)
+                ops.append({
+                    "name": node.name, "op": "chunk2_c1",
+                    "inputs": [in_name],
+                    "outputs": [gi0.name, gi1.name],
+                    "shape": {"N": N_, "C": C, "H": H_, "W": W_,
+                              "c_each": c_each},
+                })
+            else:
+                raise NotImplementedError(
+                    f"unhandled call_method '{target}' at {node.name}"
+                )
 
         elif node.op == "output":
             arg = node.args[0]
@@ -2060,7 +2205,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2"])
+                             "mobilenet_v2", "yolov8_nano"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2084,6 +2229,8 @@ def main() -> None:
         from agents.models import dronet as model_mod
     elif args.model == "mobilenet_v2":
         from agents.models import mobilenet_v2 as model_mod
+    elif args.model == "yolov8_nano":
+        from agents.models import yolov8_nano as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()
