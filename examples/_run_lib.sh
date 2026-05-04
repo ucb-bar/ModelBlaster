@@ -29,6 +29,15 @@ TARGET="${TARGET:-scalar}"
 QUANT="${QUANT:-fp32}"
 OPTIMIZE="${OPTIMIZE:-0}"
 
+# When quant=fp16, promote the target to its fp16-capable backend variant
+# (e.g. rvv → rvv_f16) for stages that need zvfh/zfh compiler flags and
+# spike ISA extensions. Directory layout still uses TARGET so fp32 and
+# fp16 builds share the same paths under the quant-namespaced tree.
+GEN_TARGET="${TARGET}"
+if [[ "${QUANT}" == "fp16" ]]; then
+    GEN_TARGET="${TARGET}_f16"
+fi
+
 EXAMPLE_DIR_REL="agents/examples/${MODEL_NAME}"
 EXAMPLE_DIR="${REPO_ROOT}/${EXAMPLE_DIR_REL}"
 
@@ -63,12 +72,12 @@ python -m agents.pipeline.generate_skeleton \
     --io "${IR_DIR}/io.npz" \
     --out-dir "${GEN_DIR}"
 
-echo "[3/5] generate_kernels (backend=${BACKEND} target=${TARGET} quant=${QUANT} optimize=${OPTIMIZE}) -> ${GEN_DIR}"
+echo "[3/5] generate_kernels (backend=${BACKEND} target=${GEN_TARGET} quant=${QUANT} optimize=${OPTIMIZE}) -> ${GEN_DIR}"
 GEN_KERNELS_ARGS=(
     --ir "${IR_DIR}/graph.json"
     --out-dir "${GEN_DIR}"
     --backend "${BACKEND}"
-    --target "${TARGET}"
+    --target "${GEN_TARGET}"
     --quant "${QUANT}"
     --io "${IR_DIR}/io.npz"
     --repo-root "${REPO_ROOT}"
@@ -132,12 +141,12 @@ esac
 echo "[4/5] west build (board=${BOARD_TARGET}) -> ${BUILD_DIR}"
 KERNEL_CFLAGS=$(python -c "
 from agents.pipeline.backends import get
-b = get('${TARGET}')
+b = get('${GEN_TARGET}')
 print(';'.join(b.kernel_cflags))
 ")
 WEST_CMAKE_ARGS=(
     -DMODEL_DIR="${GEN_DIR}"
-    -DAGENTS_BACKEND="${TARGET}"
+    -DAGENTS_BACKEND="${GEN_TARGET}"
 )
 if [[ -n "${KERNEL_CFLAGS}" ]]; then
     WEST_CMAKE_ARGS+=(-DAGENTS_KERNEL_CFLAGS="${KERNEL_CFLAGS}")
@@ -181,7 +190,7 @@ fi
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "
 from agents.pipeline.backends import get
-b = get('${TARGET}')
+b = get('${GEN_TARGET}')
 print(' '.join(b.spike_args))
 ")
     SPIKE_FLAGS=()
@@ -191,6 +200,7 @@ print(' '.join(b.spike_args))
     python -m agents.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
+        --timeout "${SPIKE_TIMEOUT:-600}" \
         "${SPIKE_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
 else
