@@ -2,9 +2,17 @@
  * Copyright (c) 2026 Dima Nikiforov <vnikiforov@berkeley.edu>
  * SPDX-License-Identifier: Apache-2.0
  *
- * Agents harness entry point. Runs a generated DNN model on a fixed test
- * input and prints the output tensor between marker lines for the host-side
- * spike_runner to parse.
+ * Agents harness entry point. Runs a generated DNN model on a fixed
+ * test input, validates the model output IN-BINARY against the baked-in
+ * test_golden (already in rodata via test_io.S's .incbin), and prints
+ * a single summary line for the host-side runner to parse.
+ *
+ * The on-device verify replaced an earlier per-element printf dump.
+ * That dump was fast on spike (functional sim, fast HTIF UART) but
+ * dominated FireSim runtime on real RTL (4k+ floats per bench at one
+ * line each, several minutes per run). The summary path keeps spike
+ * fast and lets FireSim re-rank candidates in seconds instead of
+ * blowing the timeout.
  */
 
 #include <stdio.h>
@@ -25,13 +33,33 @@ int main(void)
      * (when emitted) would dispatch onto a real agents_pool_t. */
     run_model(model_test_input, model_output, NULL);
 
-    /* Print output tensor in a stable, machine-parseable format.
-     * Use %.9g to round-trip f32 cleanly. */
-    printf("=== AGENTS_OUTPUT_BEGIN ===\n");
-    for (int i = 0; i < MODEL_OUTPUT_SIZE; i++) {
-        printf("%.9g\n", (double)model_output[i]);
+    /* In-binary golden compare.
+     *
+     * Both `model_output[i]` and `model_test_golden[i]` are widened to
+     * float for the comparison so the same loop body works for f32,
+     * f16, and integer outputs. We track the global max absolute error
+     * and max relative error; the host gates on
+     *
+     *   (max_abs_err <= atol) || (max_rel_err <= rtol)
+     *
+     * which is a sufficient PASS condition for numpy.allclose-style
+     * tolerance — every element satisfies at least one bound globally,
+     * so it satisfies them element-wise too. Conservative vs the
+     * per-element threshold but correct, and avoids shipping the full
+     * tensor over UART. */
+    float max_abs_err = 0.0f;
+    float max_rel_err = 0.0f;
+    for (int i = 0; i < MODEL_TEST_OUTPUT_LEN; i++) {
+        float a = (float)model_output[i];
+        float g = (float)model_test_golden[i];
+        float ae = a > g ? a - g : g - a;
+        float ag = g > 0.0f ? g : -g;
+        float re = ae / (ag > 1e-12f ? ag : 1e-12f);
+        if (ae > max_abs_err) max_abs_err = ae;
+        if (re > max_rel_err) max_rel_err = re;
     }
-    printf("=== AGENTS_OUTPUT_END ===\n");
+    printf("=== AGENTS_VERIFY === max_abs_err=%.9g max_rel_err=%.9g n=%d\n",
+           (double)max_abs_err, (double)max_rel_err, MODEL_TEST_OUTPUT_LEN);
 
     /* Per-kernel profile (rdcycle deltas, populated by run_model). */
     int n_records = 0;
@@ -47,7 +75,7 @@ int main(void)
     printf("=== AGENTS_PROFILE_END ===\n");
 
     /* Wall-clock total for the run (k_cycle_get_64 / mtime delta). The
-     * spike_runner reads this line to get the cross-hart-correct number;
+     * runner reads this line to get the cross-hart-correct number;
      * per-op rdcycle deltas above are used for relative comparisons. */
     printf("=== AGENTS_WALL_CYCLES === %lu\n", model_wall_cycles());
 
