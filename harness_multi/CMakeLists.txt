@@ -111,10 +111,15 @@ foreach(_i RANGE ${_last})
     list(GET MODEL_NAMES ${_i} _name)
     list(GET MODEL_DIRS  ${_i} _dir)
 
-    foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h)
+    foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h test_io.S test_input.bin test_golden.bin)
         if(NOT EXISTS "${_dir}/${_required}")
             message(FATAL_ERROR
-                "MODEL_DIRS[${_i}]='${_dir}' is missing ${_required}")
+                "MODEL_DIRS[${_i}]='${_dir}' is missing ${_required}. "
+                "Re-run agents/pipeline/generate_skeleton.py — older "
+                "checkouts emitted decimal-formatted const arrays in "
+                "test_io.h; the current pipeline emits test_io.S "
+                "(.incbin pulls test_input.bin / test_golden.bin into "
+                "rodata, sidesteps cc1 OOM on kernelbench-scale inputs).")
         endif()
     endforeach()
 
@@ -123,16 +128,18 @@ foreach(_i RANGE ${_last})
     # is the key to letting two models with same-named headers (different
     # mangled symbols inside) link into one binary. buffers.c lives here
     # too — model.c references its symbols via extern, so the per-model
-    # OBJECT lib must define them. (For harness_xpurt's heterogeneous
-    # case the buffers TU is hoisted into a separate per-model lib so
-    # multiple backends can share storage; here it's safe to inline since
-    # there's just one backend per model.)
+    # OBJECT lib must define them. test_io.S uses .incbin to pull
+    # test_input.bin / test_golden.bin into rodata at link time —
+    # avoids cc1 choking on multi-GB decimal const arrays for
+    # kernelbench-shaped tensors.
     add_library(agents_${_name}_objs OBJECT
         "${_dir}/model.c"
         "${_dir}/kernels.c"
         "${_dir}/weights.c"
         "${_dir}/buffers.c"
+        "${_dir}/test_io.S"
     )
+    set_source_files_properties("${_dir}/test_io.S" PROPERTIES LANGUAGE ASM)
     target_include_directories(agents_${_name}_objs PRIVATE "${_dir}")
     target_link_libraries(agents_${_name}_objs PRIVATE zephyr_interface)
     # AGENTS_USE_POOL switches the static parallel_<op> wrappers from a

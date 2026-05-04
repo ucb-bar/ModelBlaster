@@ -72,11 +72,30 @@ def _emit(models: list[tuple[str, str]],
     printf("running model: {tag}\\n");
     model_{mid}_reset_profile();
     run_model_{mid}(model_{mid}_test_input, out_{mid}, (void *)pool);
-    printf("=== AGENTS_OUTPUT_BEGIN [{tag}] ===\\n");
-    for (int i = 0; i < MODEL_{umid}_OUTPUT_SIZE; i++) {{
-        printf("%.9g\\n", (double)out_{mid}[i]);
+    /* In-binary golden compare. Both arrays widen to float so the
+     * same loop handles f32, f16, and integer outputs. Replaces the
+     * per-element printf dump that used to dominate FireSim runtime
+     * for kernelbench-shaped tensors. Host gates on
+     *   (max_abs_err <= atol) || (max_rel_err <= rtol)
+     * which is a sufficient PASS condition for the numpy.allclose-style
+     * tolerance the runner expects. */
+    {{
+        float max_abs_err = 0.0f;
+        float max_rel_err = 0.0f;
+        for (int i = 0; i < MODEL_{umid}_TEST_OUTPUT_LEN; i++) {{
+            float a = (float)out_{mid}[i];
+            float g = (float)model_{mid}_test_golden[i];
+            float ae = a > g ? a - g : g - a;
+            float ag = g > 0.0f ? g : -g;
+            float re = ae / (ag > 1e-12f ? ag : 1e-12f);
+            if (ae > max_abs_err) max_abs_err = ae;
+            if (re > max_rel_err) max_rel_err = re;
+        }}
+        printf("=== AGENTS_VERIFY [{tag}] === "
+               "max_abs_err=%.9g max_rel_err=%.9g n=%d\\n",
+               (double)max_abs_err, (double)max_rel_err,
+               MODEL_{umid}_TEST_OUTPUT_LEN);
     }}
-    printf("=== AGENTS_OUTPUT_END [{tag}] ===\\n");
     {{
         int n_records = 0;
         const model_{mid}_op_record_t *records =
