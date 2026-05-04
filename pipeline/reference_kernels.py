@@ -83,6 +83,34 @@ def _linear_argtypes():
     return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
 
+def _matmul_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # A, B, C, M, K, N
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _bmm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # A, B, C, batch, M, K, N
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _matmul_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # A, B, C, M, K, N
+    return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _bmm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # A, B, C, batch, M, K, N
+    return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
 def _relu_argtypes():
     import ctypes
     fp = ctypes.POINTER(ctypes.c_float)
@@ -106,8 +134,8 @@ def _conv2d_argtypes():
 def _maxpool2d_argtypes():
     import ctypes
     fp = ctypes.POINTER(ctypes.c_float)
-    # input, output, N, C, IH, IW, KH, KW, SH, SW
-    return [fp, fp] + [ctypes.c_int] * 8
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW, DH, DW
+    return [fp, fp] + [ctypes.c_int] * 12
 
 
 def _add_argtypes():
@@ -150,6 +178,33 @@ def _adaptive_avg_pool2d_argtypes():
     return [fp, fp] + [ctypes.c_int] * 4
 
 
+# KernelBench Phase 2 activations — all pointwise, signatures shaped
+# like the existing relu / sigmoid / elu kernels. The parametric ones
+# (leaky_relu, hardtanh) take their constants as float scalar args; the
+# rest match (input, output, n).
+
+def _pointwise_argtypes():
+    """Standard signature for parameter-free pointwise activations:
+    void kernel(const float *in, float *out, int n)."""
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+def _leaky_relu_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, n, negative_slope
+    return [fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+def _hardtanh_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, n, min_val, max_val
+    return [fp, fp, ctypes.c_int, ctypes.c_float, ctypes.c_float]
+
+
 def _linear_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -183,7 +238,8 @@ def _conv2d_s8_argtypes():
 def _maxpool2d_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
-    return [i8p, i8p] + [ctypes.c_int] * 8
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW, DH, DW
+    return [i8p, i8p] + [ctypes.c_int] * 12
 
 
 def _add_s8_argtypes():
@@ -214,6 +270,94 @@ def _sigmoid_s8_argtypes():
     return [i8p, i8p, ctypes.c_int,
             ctypes.c_float, ctypes.c_float,
             ctypes.c_int, ctypes.c_int]
+
+
+# ---------------------------------------------------------------------------
+# fp16 (half-precision) argtypes. ctypes has no native _Float16, so the host
+# verify path uses c_uint16 as a 16-bit opaque blob — bit-identical layout
+# to _Float16, just with the math done in numpy. Only relevant for
+# BACKEND=llm verify; BACKEND=reference dumps the C reference impl directly
+# and never touches ctypes.
+# ---------------------------------------------------------------------------
+
+def _relu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+def _elu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # input, output, n, alpha (passed as fp32 — gets converted in the kernel)
+    return [h, h, ctypes.c_int, ctypes.c_float]
+
+
+def _sigmoid_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+def _conv2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h] + [ctypes.c_int] * 11
+
+
+def _maxpool2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 12
+
+
+def _batchnorm2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # input, scale, bias, output, N, C, H, W
+    return [h, h, h, h] + [ctypes.c_int] * 4
+
+
+# Phase 2 fp16 argtypes — same C-side ABI shapes as the fp32 specs,
+# with c_uint16 standing in for _Float16 since Python ctypes has no
+# native half. The host-verify (LLM optimize loop) is by-bits compares
+# anyway; only the reference_impl C body sees the actual _Float16.
+
+def _pointwise_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+def _leaky_relu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_float]
+
+
+def _hardtanh_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_float, ctypes.c_float]
+
+
+def _reduce_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _argreduce_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    i64p = ctypes.POINTER(ctypes.c_int64)
+    return [h, i64p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _frobenius_norm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
 
 
 LINEAR = KernelSpec(
@@ -255,6 +399,326 @@ void kernel_linear(const float *input, const float *weight, const float *bias,
         {"M": 1, "K": 64, "N": 64},     # power-of-two
     ],
     argtypes_factory=_linear_argtypes,
+)
+
+
+_MATMUL_EXTRA_SHAPES = [
+    {"M": 1,  "K": 1,  "N": 1},
+    {"M": 1,  "K": 7,  "N": 13},
+    {"M": 4,  "K": 17, "N": 23},
+    {"M": 1,  "K": 64, "N": 64},
+    {"M": 32, "K": 32, "N": 32},
+]
+
+MATMUL = KernelSpec(
+    op="matmul",
+    signature=(
+        "void kernel_matmul(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B (row-major contiguous):\n"
+        "  A: [M, K],  B: [K, N],  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[m*K+k] * B[k*N+n]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul(const float *A, const float *B, float *C,
+                   int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[m * K + k] * B[k * N + n];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+MATMUL_TA = KernelSpec(
+    op="matmul_ta",
+    signature=(
+        "void kernel_matmul_ta(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B (A stored in (K,M) order):\n"
+        "  A stored: [K, M] — A[k, m] = A[k*M+m]\n"
+        "  B: [K, N],  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[k*M+m] * B[k*N+n]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul_ta(const float *A, const float *B, float *C,
+                      int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[k * M + m] * B[k * N + n];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+MATMUL_TB = KernelSpec(
+    op="matmul_tb",
+    signature=(
+        "void kernel_matmul_tb(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B.T (B stored in (N,K) order):\n"
+        "  A: [M, K],  B stored: [N, K] — B[n, k] = B[n*K+k]\n"
+        "  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[m*K+k] * B[n*K+k]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul_tb(const float *A, const float *B, float *C,
+                      int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[m * K + k] * B[n * K + k];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+MATMUL_TATB = KernelSpec(
+    op="matmul_tatb",
+    signature=(
+        "void kernel_matmul_tatb(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B.T (both stored transposed):\n"
+        "  A stored: [K, M] — A[k, m] = A[k*M+m]\n"
+        "  B stored: [N, K] — B[n, k] = B[n*K+k]\n"
+        "  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[k*M+m] * B[n*K+k]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul_tatb(const float *A, const float *B, float *C,
+                        int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[k * M + m] * B[n * K + k];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+BMM = KernelSpec(
+    op="bmm",
+    signature=(
+        "void kernel_bmm(const float *A, const float *B, float *C, "
+        "int batch, int M, int K, int N)"
+    ),
+    semantics=(
+        "Batched matrix multiply C[b] = A[b] @ B[b] (row-major contiguous):\n"
+        "  A: [batch, M, K],  B: [batch, K, N],  C: [batch, M, N]\n"
+        "  C[b,m,n] = sum_{k=0..K-1} A[b*M*K + m*K+k] * B[b*K*N + k*N+n]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_bmm(const float *A, const float *B, float *C,
+                int batch, int M, int K, int N) {
+    for (int b = 0; b < batch; b++) {
+        const float *Ab = A + b * M * K;
+        const float *Bb = B + b * K * N;
+        float *Cb = C + b * M * N;
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (int k = 0; k < K; k++)
+                    acc += Ab[m * K + k] * Bb[k * N + n];
+                Cb[m * N + n] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"batch": 1, "M": 1,  "K": 1,  "N": 1},
+        {"batch": 2, "M": 4,  "K": 8,  "N": 4},
+        {"batch": 4, "M": 8,  "K": 16, "N": 8},
+        {"batch": 1, "M": 32, "K": 32, "N": 32},
+    ],
+    argtypes_factory=_bmm_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# fp16 matmul / bmm variants — same semantics, _Float16 storage.
+# The accumulator widens to float for numerics then narrows back.
+# ---------------------------------------------------------------------------
+
+MATMUL_F16 = KernelSpec(
+    op="matmul_f16",
+    signature=(
+        "void kernel_matmul_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B, _Float16 storage:\n"
+        "  A: [M, K],  B: [K, N],  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[m*K+k] * B[k*N+n]  (fp16 arithmetic)"
+    ),
+    reference_impl="""\
+void kernel_matmul_f16(const _Float16 *A, const _Float16 *B,
+                       _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[m * K + k] * (float)B[k * N + n];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+MATMUL_TA_F16 = KernelSpec(
+    op="matmul_ta_f16",
+    signature=(
+        "void kernel_matmul_ta_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B, _Float16 storage:\n"
+        "  A stored: [K, M],  B: [K, N],  C: [M, N]"
+    ),
+    reference_impl="""\
+void kernel_matmul_ta_f16(const _Float16 *A, const _Float16 *B,
+                          _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[k * M + m] * (float)B[k * N + n];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+MATMUL_TB_F16 = KernelSpec(
+    op="matmul_tb_f16",
+    signature=(
+        "void kernel_matmul_tb_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B.T, _Float16 storage:\n"
+        "  A: [M, K],  B stored: [N, K],  C: [M, N]"
+    ),
+    reference_impl="""\
+void kernel_matmul_tb_f16(const _Float16 *A, const _Float16 *B,
+                          _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[m * K + k] * (float)B[n * K + k];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+MATMUL_TATB_F16 = KernelSpec(
+    op="matmul_tatb_f16",
+    signature=(
+        "void kernel_matmul_tatb_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B.T, _Float16 storage:\n"
+        "  A stored: [K, M],  B stored: [N, K],  C: [M, N]"
+    ),
+    reference_impl="""\
+void kernel_matmul_tatb_f16(const _Float16 *A, const _Float16 *B,
+                            _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[k * M + m] * (float)B[n * K + k];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+BMM_F16 = KernelSpec(
+    op="bmm_f16",
+    signature=(
+        "void kernel_bmm_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int batch, int M, int K, int N)"
+    ),
+    semantics=(
+        "Batched matrix multiply C[b] = A[b] @ B[b], _Float16 storage:\n"
+        "  A: [batch, M, K],  B: [batch, K, N],  C: [batch, M, N]"
+    ),
+    reference_impl="""\
+void kernel_bmm_f16(const _Float16 *A, const _Float16 *B,
+                   _Float16 *C, int batch, int M, int K, int N) {
+    for (int b = 0; b < batch; b++) {
+        const _Float16 *Ab = A + b * M * K;
+        const _Float16 *Bb = B + b * K * N;
+        _Float16 *Cb = C + b * M * N;
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (int k = 0; k < K; k++)
+                    acc += (float)Ab[m * K + k] * (float)Bb[k * N + n];
+                Cb[m * N + n] = (_Float16)acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"batch": 1, "M": 1,  "K": 1,  "N": 1},
+        {"batch": 2, "M": 4,  "K": 8,  "N": 4},
+        {"batch": 4, "M": 8,  "K": 16, "N": 8},
+        {"batch": 1, "M": 32, "K": 32, "N": 32},
+    ],
+    argtypes_factory=_bmm_f16_argtypes,
 )
 
 
@@ -668,36 +1132,45 @@ MAXPOOL2D = KernelSpec(
     signature=(
         "void kernel_maxpool2d(const float *input, float *output, "
         "int N, int C, int IH, int IW, "
-        "int KH, int KW, int SH, int SW)"
+        "int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int DH, int DW)"
     ),
     semantics=(
-        "2D max pooling matching torch.nn.MaxPool2d semantics with no padding "
-        "and dilation=1.\n"
+        "2D max pooling matching torch.nn.MaxPool2d semantics with padding\n"
+        "and dilation.\n"
         "Layout (NCHW, row-major):\n"
         "  input:  [N, C, IH, IW]\n"
         "  output: [N, C, OH, OW]  with\n"
-        "    OH = (IH - KH) / SH + 1\n"
-        "    OW = (IW - KW) / SW + 1\n"
+        "    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n"
+        "    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n"
         "  output[n, c, oh, ow] = max over kh in [0,KH), kw in [0,KW) of\n"
-        "    input[n, c, oh*SH + kh, ow*SW + kw].\n"
-        "All tensors are float32."
+        "    val(n, c, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW)\n"
+        "  where val(...) returns input[n, c, ih, iw] when 0<=ih<IH and\n"
+        "  0<=iw<IW, else -INF (out-of-bounds lanes never win the max).\n"
+        "All tensors are float32. PH/PW are zero-padding amounts on the\n"
+        "spatial dims; DH/DW are kernel-element strides (dilation)."
     ),
     reference_impl="""\
+#include <float.h>
+
 void kernel_maxpool2d(const float *input, float *output,
                      int N, int C, int IH, int IW,
-                     int KH, int KW, int SH, int SW) {
-    int OH = (IH - KH) / SH + 1;
-    int OW = (IW - KW) / SW + 1;
+                     int KH, int KW, int SH, int SW,
+                     int PH, int PW, int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             for (int oh = 0; oh < OH; oh++) {
                 for (int ow = 0; ow < OW; ow++) {
-                    int ih0 = oh * SH;
-                    int iw0 = ow * SW;
-                    float m = input[((n*C + c)*IH + ih0)*IW + iw0];
+                    float m = -FLT_MAX;
                     for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh*DH;
+                        if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
-                            float v = input[((n*C + c)*IH + ih0+kh)*IW + iw0+kw];
+                            int iw = ow*SW - PW + kw*DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = input[((n*C + c)*IH + ih)*IW + iw];
                             if (v > m) m = v;
                         }
                     }
@@ -710,12 +1183,19 @@ void kernel_maxpool2d(const float *input, float *output,
 """,
     extra_shapes=[
         # LeNet
-        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2},
-        {"N": 1, "C": 16, "IH": 8, "IW": 8, "KH": 2, "KW": 2, "SH": 2, "SW": 2},
+        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        {"N": 1, "C": 16, "IH": 8, "IW": 8, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
         # DroNet
-        {"N": 1, "C": 32, "IH": 64, "IW": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2},
+        {"N": 1, "C": 32, "IH": 64, "IW": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
         # Generalization
-        {"N": 1, "C": 4, "IH": 9, "IW": 7, "KH": 3, "KW": 3, "SH": 2, "SW": 2},
+        {"N": 1, "C": 4, "IH": 9, "IW": 7, "KH": 3, "KW": 3, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # KernelBench 42: padding=1, dilation=3
+        {"N": 1, "C": 8, "IH": 16, "IW": 16, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 1, "PW": 1, "DH": 3, "DW": 3},
     ],
     argtypes_factory=_maxpool2d_argtypes,
 )
@@ -1298,35 +1778,46 @@ MAXPOOL2D_S8 = KernelSpec(
     signature=(
         "void kernel_maxpool2d_s8(const int8_t *input, int8_t *output, "
         "int N, int C, int IH, int IW, "
-        "int KH, int KW, int SH, int SW)"
+        "int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int DH, int DW)"
     ),
     semantics=(
         "Quantized 2D max-pool. Identical dataflow to fp32 maxpool2d but "
         "operating on int8 lanes. No requantize is needed — max is just a "
         "compare, and selecting an int8 input directly produces an int8 "
-        "output at the same scale.\n"
+        "output at the same scale. Padding is filled with INT8_MIN so OOB "
+        "lanes never win the max (the int8 analogue of -INF).\n"
         "Layout (NCHW):\n"
         "  input:  int8 [N, C, IH, IW]\n"
-        "  output: int8 [N, C, OH, OW]  with OH = (IH-KH)/SH + 1, OW analog\n"
+        "  output: int8 [N, C, OH, OW]  with\n"
+        "    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n"
+        "    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n"
         "  output[n, c, oh, ow] = max over kh in [0,KH), kw in [0,KW) of\n"
-        "    input[n, c, oh*SH + kh, ow*SW + kw]"
+        "    val(n, c, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW)\n"
+        "  where val(...) returns input[n,c,ih,iw] when in bounds, else\n"
+        "  INT8_MIN."
     ),
     reference_impl="""\
+#include <stdint.h>
+
 void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
                          int N, int C, int IH, int IW,
-                         int KH, int KW, int SH, int SW) {
-    int OH = (IH - KH) / SH + 1;
-    int OW = (IW - KW) / SW + 1;
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             for (int oh = 0; oh < OH; oh++) {
                 for (int ow = 0; ow < OW; ow++) {
-                    int ih0 = oh * SH;
-                    int iw0 = ow * SW;
-                    int8_t m = input[((n*C + c)*IH + ih0)*IW + iw0];
+                    int8_t m = INT8_MIN;
                     for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh*DH;
+                        if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
-                            int8_t v = input[((n*C + c)*IH + ih0+kh)*IW + iw0+kw];
+                            int iw = ow*SW - PW + kw*DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            int8_t v = input[((n*C + c)*IH + ih)*IW + iw];
                             if (v > m) m = v;
                         }
                     }
@@ -1339,10 +1830,13 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
 """,
     extra_shapes=[
         # LeNet
-        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2},
-        {"N": 1, "C": 16, "IH": 8, "IW": 8, "KH": 2, "KW": 2, "SH": 2, "SW": 2},
+        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        {"N": 1, "C": 16, "IH": 8, "IW": 8, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
         # DroNet
-        {"N": 1, "C": 32, "IH": 64, "IW": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2},
+        {"N": 1, "C": 32, "IH": 64, "IW": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
     ],
     argtypes_factory=_maxpool2d_s8_argtypes,
 )
@@ -1566,6 +2060,685 @@ void kernel_relu6(const float *input, float *output, int n) {
 )
 
 
+# ---------------------------------------------------------------------------
+# KernelBench Phase 2 activations (10 ops). All pointwise, fp32. The
+# matching fp16 variants live below alongside the other _f16 specs so
+# the existing fp16 mode picks them up via the op-suffix mechanism.
+# ---------------------------------------------------------------------------
+
+LEAKY_RELU = KernelSpec(
+    op="leaky_relu",
+    signature=(
+        "void kernel_leaky_relu(const float *input, float *output, "
+        "int n, float negative_slope)"
+    ),
+    semantics=(
+        "Elementwise LeakyReLU on a contiguous float32 buffer:\n"
+        "  output[i] = input[i]                if input[i] >= 0\n"
+        "  output[i] = input[i] * negative_slope otherwise\n"
+        "Same shape as ReLU; the slope on the negative half-line is the\n"
+        "only difference. Safe to alias input/output."
+    ),
+    reference_impl="""\
+void kernel_leaky_relu(const float *input, float *output,
+                       int n, float negative_slope) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        output[i] = v >= 0.0f ? v : v * negative_slope;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_leaky_relu_argtypes,
+)
+
+
+TANH = KernelSpec(
+    op="tanh",
+    signature="void kernel_tanh(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise tanh on a contiguous float32 buffer.\n"
+        "Uses libm's tanhf — already accurate to <1ulp on Zephyr's\n"
+        "newlib/picolibc."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_tanh(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = tanhf(input[i]);
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SWISH = KernelSpec(
+    op="swish",
+    signature="void kernel_swish(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise Swish (also called SiLU): output[i] = x * sigmoid(x).\n"
+        "sigmoid(x) = 1 / (1 + expf(-x))."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_swish(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float s = 1.0f / (1.0f + expf(-x));
+        output[i] = x * s;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+GELU = KernelSpec(
+    op="gelu",
+    signature="void kernel_gelu(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise GELU using the EXACT erf formulation, matching\n"
+        "torch.nn.GELU and torch.nn.functional.gelu's `approximate='none'`\n"
+        "default (PyTorch 1.10+):\n"
+        "  output = 0.5 * x * (1 + erf(x / sqrt(2)))\n"
+        "The tanh approximation lives under the separate `gelu_exact`\n"
+        "op (used by the MinGPT-style hand-rolled expression). The two\n"
+        "agree to ~5e-4 absolute on randn inputs — close but distinct,\n"
+        "and PyTorch ships the erf form as default so we use it here."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_gelu(const float *input, float *output, int n) {
+    /* 1 / sqrt(2) = 0.70710678118654752440f. */
+    const float inv_sqrt2 = 0.7071067811865475f;
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        output[i] = 0.5f * x * (1.0f + erff(x * inv_sqrt2));
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+# The tanh-based GELU approximation — what MinGPT (and the original
+# BERT / GPT-2 papers) hand-rolled. PyTorch reaches this form via
+# `F.gelu(x, approximate='tanh')` or by tracing the explicit
+# expression. We keep a separate op for it so the IR cleanly captures
+# which surface the bench used; numerically the two agree to ~5e-4.
+GELU_EXACT = KernelSpec(
+    op="gelu_exact",
+    signature=(
+        "void kernel_gelu_exact(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise GELU computed via the MinGPT / BERT formula:\n"
+        "  output = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))\n"
+        "Approximation of the exact erf form; the two agree to ~5e-4 on\n"
+        "randn inputs. Used by 88_MinGPTNewGelu and `F.gelu(approximate='tanh')`."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_gelu_exact(const float *input, float *output, int n) {
+    /* sqrtf(2.0f / M_PI) = 0.79788456080286535588f. */
+    const float k = 0.7978845608028654f;
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float u = k * (x + 0.044715f * x * x * x);
+        output[i] = 0.5f * x * (1.0f + tanhf(u));
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SELU = KernelSpec(
+    op="selu",
+    signature="void kernel_selu(const float *input, float *output, int n)",
+    semantics=(
+        "Scaled Exponential Linear Unit. PyTorch uses fixed constants:\n"
+        "  alpha  = 1.6732632423543772\n"
+        "  scale  = 1.0507009873554805\n"
+        "  output = scale * (x       if x > 0\n"
+        "                    alpha * (expf(x) - 1)   otherwise)"
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_selu(const float *input, float *output, int n) {
+    const float alpha = 1.6732632423543772f;
+    const float scale = 1.0507009873554805f;
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float y = x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+        output[i] = scale * y;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+HARDSIGMOID = KernelSpec(
+    op="hardsigmoid",
+    signature=(
+        "void kernel_hardsigmoid(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Piecewise-linear sigmoid approximation matching\n"
+        "torch.nn.functional.hardsigmoid:\n"
+        "  output[i] =   0          if x <= -3\n"
+        "              1            if x >=  3\n"
+        "              x/6 + 0.5    otherwise"
+    ),
+    reference_impl="""\
+void kernel_hardsigmoid(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float y;
+        if (x <= -3.0f)      y = 0.0f;
+        else if (x >=  3.0f) y = 1.0f;
+        else                 y = x * (1.0f / 6.0f) + 0.5f;
+        output[i] = y;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SOFTPLUS = KernelSpec(
+    op="softplus",
+    signature=(
+        "void kernel_softplus(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise softplus: output = log(1 + expf(x)).\n"
+        "For numerical stability we pivot on the sign of x so we never\n"
+        "compute expf of a large positive: large-x reduces to x +\n"
+        "log(1 + expf(-x)) ~= x. PyTorch defaults to beta=1, threshold=20\n"
+        "but the threshold-passthrough only matters for extreme inputs;\n"
+        "the unconditional formula via log1pf(expf(...)) is fine in fp32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_softplus(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        /* Pivot keeps expf's argument <= 0, avoiding overflow. */
+        float y = x > 0.0f
+            ? x + log1pf(expf(-x))
+            : log1pf(expf(x));
+        output[i] = y;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SOFTSIGN = KernelSpec(
+    op="softsign",
+    signature=(
+        "void kernel_softsign(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise softsign: output = x / (1 + |x|). Smooth, bounded\n"
+        "alternative to tanh; no transcendental cost."
+    ),
+    reference_impl="""\
+void kernel_softsign(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float ax = x < 0.0f ? -x : x;
+        output[i] = x / (1.0f + ax);
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+HARDTANH = KernelSpec(
+    op="hardtanh",
+    signature=(
+        "void kernel_hardtanh(const float *input, float *output, "
+        "int n, float min_val, float max_val)"
+    ),
+    semantics=(
+        "Pointwise clamp to [min_val, max_val]. PyTorch's hardtanh\n"
+        "defaults to min=-1, max=+1. Same dataflow as relu6 with\n"
+        "configurable bounds."
+    ),
+    reference_impl="""\
+void kernel_hardtanh(const float *input, float *output,
+                     int n, float min_val, float max_val) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        if (x < min_val) x = min_val;
+        if (x > max_val) x = max_val;
+        output[i] = x;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_hardtanh_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# KernelBench Phase 2 reductions over a single dimension. Each kernel
+# treats the input as logically 3D — [outer, reduce, inner] — so any
+# Nd input with `dim=k` flattens to outer=prod(shape[:k]),
+# reduce=shape[k], inner=prod(shape[k+1:]). The output is [outer, inner]
+# (or [outer, 1, inner] for keepdim) — same flat layout for both, so
+# the kernels don't need to know about keepdim.
+# ---------------------------------------------------------------------------
+
+def _reduce_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _argreduce_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    i64p = ctypes.POINTER(ctypes.c_int64)
+    return [fp, i64p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+SUM_DIM = KernelSpec(
+    op="sum_dim",
+    signature=(
+        "void kernel_sum_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-sum along the middle axis of a logically [outer, reduce,\n"
+        "inner] flattened tensor. Output is [outer, inner].\n"
+        "  output[o, i] = sum over r in [0, reduce) of\n"
+        "    input[(o * reduce + r) * inner + i]"
+    ),
+    reference_impl="""\
+void kernel_sum_dim(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                acc += input[(o * reduce + r) * inner + i];
+            }
+            output[o * inner + i] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+MEAN_DIM = KernelSpec(
+    op="mean_dim",
+    signature=(
+        "void kernel_mean_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-mean along the middle axis. Same dataflow as sum_dim,\n"
+        "with a final divide by `reduce`."
+    ),
+    reference_impl="""\
+void kernel_mean_dim(const float *input, float *output,
+                     int outer, int reduce, int inner) {
+    float inv = 1.0f / (float)reduce;
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                acc += input[(o * reduce + r) * inner + i];
+            }
+            output[o * inner + i] = acc * inv;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+MAX_DIM = KernelSpec(
+    op="max_dim",
+    signature=(
+        "void kernel_max_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-max (values only, not indices) along the middle axis.\n"
+        "Initialized to -FLT_MAX so a single-element reduce returns the\n"
+        "input value directly."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_max_dim(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = -FLT_MAX;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v > m) m = v;
+            }
+            output[o * inner + i] = m;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+MIN_DIM = KernelSpec(
+    op="min_dim",
+    signature=(
+        "void kernel_min_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-min (values only) along the middle axis. Mirror of\n"
+        "max_dim with FLT_MAX init and `<` compare."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_min_dim(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = FLT_MAX;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v < m) m = v;
+            }
+            output[o * inner + i] = m;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+PROD_DIM = KernelSpec(
+    op="prod_dim",
+    signature=(
+        "void kernel_prod_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-product along the middle axis. Init=1.0, multiply-fold."
+    ),
+    reference_impl="""\
+void kernel_prod_dim(const float *input, float *output,
+                     int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 1.0f;
+            for (int r = 0; r < reduce; r++) {
+                acc *= input[(o * reduce + r) * inner + i];
+            }
+            output[o * inner + i] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+ARGMAX_DIM = KernelSpec(
+    op="argmax_dim",
+    signature=(
+        "void kernel_argmax_dim(const float *input, int64_t *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Argmax along the middle axis. Returns int64 indices (same dtype\n"
+        "as torch.argmax). On ties, returns the FIRST index (matches\n"
+        "torch's behavior on CPU)."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+#include <float.h>
+
+void kernel_argmax_dim(const float *input, int64_t *output,
+                       int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = -FLT_MAX;
+            int64_t idx = 0;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v > m) { m = v; idx = (int64_t)r; }
+            }
+            output[o * inner + i] = idx;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_argreduce_argtypes,
+)
+
+
+ARGMIN_DIM = KernelSpec(
+    op="argmin_dim",
+    signature=(
+        "void kernel_argmin_dim(const float *input, int64_t *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Argmin along the middle axis. Returns int64 indices. Same\n"
+        "tie-breaking as torch (first index)."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+#include <float.h>
+
+void kernel_argmin_dim(const float *input, int64_t *output,
+                       int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = FLT_MAX;
+            int64_t idx = 0;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v < m) { m = v; idx = (int64_t)r; }
+            }
+            output[o * inner + i] = idx;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_argreduce_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# KernelBench Phase 2 norms (subset). Each divides the input by some
+# reduction-derived scalar/vector. L1Norm / L2Norm share the
+# (outer, reduce, inner) shape with the reductions; FrobeniusNorm
+# uses a single global denominator over the whole tensor.
+# ---------------------------------------------------------------------------
+
+L1_NORM = KernelSpec(
+    op="l1_norm",
+    signature=(
+        "void kernel_l1_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Per-(outer, inner) L1 normalization:\n"
+        "  denom[o, i] = sum over r of |input[(o*reduce + r)*inner + i]|\n"
+        "  output[o, r, i] = input[o, r, i] / denom[o, i]\n"
+        "Same flat layout as the reduction kernels, but the output\n"
+        "preserves the reduce axis (broadcast division)."
+    ),
+    reference_impl="""\
+void kernel_l1_norm(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float denom = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                denom += v < 0.0f ? -v : v;
+            }
+            float inv = 1.0f / denom;
+            for (int r = 0; r < reduce; r++) {
+                int idx = (o * reduce + r) * inner + i;
+                output[idx] = input[idx] * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "reduce": 17, "inner": 1},
+        {"outer": 16, "reduce": 16384, "inner": 1},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+L2_NORM = KernelSpec(
+    op="l2_norm",
+    signature=(
+        "void kernel_l2_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Per-(outer, inner) L2 normalization:\n"
+        "  denom[o, i] = sqrt(sum over r of input[o, r, i]^2)\n"
+        "  output[o, r, i] = input[o, r, i] / denom[o, i]"
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_l2_norm(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float ssq = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                ssq += v * v;
+            }
+            float inv = 1.0f / sqrtf(ssq);
+            for (int r = 0; r < reduce; r++) {
+                int idx = (o * reduce + r) * inner + i;
+                output[idx] = input[idx] * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "reduce": 17, "inner": 1},
+        {"outer": 16, "reduce": 16384, "inner": 1},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+def _frobenius_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+FROBENIUS_NORM = KernelSpec(
+    op="frobenius_norm",
+    signature=(
+        "void kernel_frobenius_norm(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Global Frobenius normalization — whole tensor flattened.\n"
+        "  denom = sqrt(sum over i of input[i]^2)\n"
+        "  output[i] = input[i] / denom\n"
+        "torch.norm(x, p='fro') == torch.norm(x, p=2) on a flattened\n"
+        "tensor; we compute it as a sum-of-squares + sqrtf."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_frobenius_norm(const float *input, float *output, int n) {
+    float ssq = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        ssq += v * v;
+    }
+    float inv = 1.0f / sqrtf(ssq);
+    for (int i = 0; i < n; i++) {
+        output[i] = input[i] * inv;
+    }
+}
+""",
+    extra_shapes=[{"n": 17}, {"n": 1024}],
+    argtypes_factory=_frobenius_norm_argtypes,
+)
+
+
 ADAPTIVE_AVG_POOL2D = KernelSpec(
     op="adaptive_avg_pool2d",
     signature=(
@@ -1609,11 +2782,285 @@ void kernel_adaptive_avg_pool2d(const float *input, float *output,
 )
 
 
+# ---------------------------------------------------------------------------
+# fp16 (half-precision) kernel specs. Mirror the fp32 pointwise / pool /
+# conv / batchnorm shapes but use _Float16 storage. For accumulating ops
+# (conv2d, batchnorm-fold) we accumulate in fp32 then cast back — same
+# pattern Tensor Cores use, and the accuracy gap to a pure-fp16 accumulator
+# is significant enough that torch.float16 conv goes through this path too.
+# Element-wise transcendentals (sigmoid, elu) round-trip through float for
+# the math kernel since libm has no half-precision expf yet.
+# ---------------------------------------------------------------------------
+
+RELU_F16 = KernelSpec(
+    op="relu_f16",
+    signature="void kernel_relu_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Elementwise ReLU on a contiguous _Float16 buffer:\n"
+        "  output[i] = max(0, input[i])  for i in [0, n)\n"
+        "Same semantics as the fp32 RELU kernel — only the storage type "
+        "changes. It must be safe for `input` and `output` to alias."
+    ),
+    reference_impl="""\
+void kernel_relu_f16(const _Float16 *input, _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        _Float16 v = input[i];
+        output[i] = v > (_Float16)0.0f ? v : (_Float16)0.0f;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_relu_f16_argtypes,
+)
+
+
+SIGMOID_F16 = KernelSpec(
+    op="sigmoid_f16",
+    signature="void kernel_sigmoid_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Elementwise sigmoid on a contiguous _Float16 buffer:\n"
+        "  output[i] = 1 / (1 + expf(-input[i]))\n"
+        "Math is done in float (libm has no expf16), then the result is\n"
+        "cast back to _Float16. This is what torch.float16 sigmoid does\n"
+        "internally on CPU."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_sigmoid_f16(const _Float16 *input, _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)input[i];
+        output[i] = (_Float16)(1.0f / (1.0f + expf(-v)));
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_sigmoid_f16_argtypes,
+)
+
+
+ELU_F16 = KernelSpec(
+    op="elu_f16",
+    signature=("void kernel_elu_f16(const _Float16 *input, _Float16 *output, "
+               "int n, float alpha)"),
+    semantics=(
+        "Elementwise ELU on a contiguous _Float16 buffer:\n"
+        "  output[i] = input[i]                       if input[i] > 0\n"
+        "  output[i] = alpha * (expf(input[i]) - 1)   otherwise\n"
+        "alpha is passed as float and used directly by expf — the cast back\n"
+        "to _Float16 happens at store. nn.ELU defaults to alpha=1.0."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_elu_f16(const _Float16 *input, _Float16 *output,
+                    int n, float alpha) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)input[i];
+        float r = v > 0.0f ? v : alpha * (expf(v) - 1.0f);
+        output[i] = (_Float16)r;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 16}, {"n": 256}, {"n": 1024},
+    ],
+    argtypes_factory=_elu_f16_argtypes,
+)
+
+
+BATCHNORM2D_F16 = KernelSpec(
+    op="batchnorm2d_f16",
+    signature=(
+        "void kernel_batchnorm2d_f16(const _Float16 *input, "
+        "const _Float16 *scale, const _Float16 *bias, _Float16 *output, "
+        "int N, int C, int H, int W)"
+    ),
+    semantics=(
+        "Apply pre-folded affine BatchNorm to a [N, C, H, W] _Float16 input:\n"
+        "  output[n, c, h, w] = scale[c] * input[n, c, h, w] + bias[c]\n"
+        "scale and bias are the gamma/(running_var+eps) and beta-mean*scale\n"
+        "fold pre-computed in fp32 by extract_graph and cast to _Float16 at\n"
+        "save time."
+    ),
+    reference_impl="""\
+void kernel_batchnorm2d_f16(const _Float16 *input,
+                            const _Float16 *scale, const _Float16 *bias,
+                            _Float16 *output,
+                            int N, int C, int H, int W) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            _Float16 s = scale[c];
+            _Float16 b = bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    output[idx] = s * input[idx] + b;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4, "H": 8, "W": 8},
+        {"N": 1, "C": 64, "H": 7, "W": 7},
+    ],
+    argtypes_factory=_batchnorm2d_f16_argtypes,
+)
+
+
+MAXPOOL2D_F16 = KernelSpec(
+    op="maxpool2d_f16",
+    signature=(
+        "void kernel_maxpool2d_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int DH, int DW)"
+    ),
+    semantics=(
+        "Half-precision 2D max pool. Same dataflow as the fp32 MAXPOOL2D\n"
+        "kernel; only the storage type differs. OOB padding lanes are\n"
+        "initialized with -65504 (the most-negative finite _Float16) so they\n"
+        "never win the max — equivalent to -INF for the representable range."
+    ),
+    reference_impl="""\
+void kernel_maxpool2d_f16(const _Float16 *input, _Float16 *output,
+                          int N, int C, int IH, int IW,
+                          int KH, int KW, int SH, int SW,
+                          int PH, int PW, int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    /* -FLT16_MAX equivalent: -65504 is the most-negative finite half. */
+    const _Float16 NEG_HALF_INF = (_Float16)-65504.0f;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    _Float16 m = NEG_HALF_INF;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh*DH;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw*DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            _Float16 v = input[((n*C + c)*IH + ih)*IW + iw];
+                            if (v > m) m = v;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = m;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # KernelBench 42 shape (padding+dilation)
+        {"N": 1, "C": 8, "IH": 16, "IW": 16, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 1, "PW": 1, "DH": 3, "DW": 3},
+    ],
+    argtypes_factory=_maxpool2d_f16_argtypes,
+)
+
+
+CONV2D_F16 = KernelSpec(
+    op="conv2d_f16",
+    signature=(
+        "void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight, "
+        "const _Float16 *bias, _Float16 *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "Half-precision 2D convolution. groups=1, dilation=1.\n"
+        "Storage is _Float16 for input/weight/bias/output, but the inner\n"
+        "accumulator is fp32 to avoid catastrophic cancellation when summing\n"
+        "many partial products — same pattern as Tensor Cores and what\n"
+        "torch.float16 conv2d does on CPU. The accumulator is cast back to\n"
+        "_Float16 only at the final store."
+    ),
+    reference_impl="""\
+void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int N, int IC, int IH, int IW, int OC,
+                       int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? (float)bias[oc] : 0.0f;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                if (iw < 0 || iw >= IW) continue;
+                                float v = (float)input[((n*IC + ic)*IH + ih)*IW + iw];
+                                float w = (float)weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (_Float16)acc;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # LeNet-shape, KernelBench 63
+        {"N": 1, "IC": 3, "IH": 16, "IW": 16, "OC": 4,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_conv2d_f16_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
+    "matmul": MATMUL,
+    "matmul_ta": MATMUL_TA,
+    "matmul_tb": MATMUL_TB,
+    "matmul_tatb": MATMUL_TATB,
+    "bmm": BMM,
     "relu": RELU,
     "relu6": RELU6,
     "elu": ELU,
+    # KernelBench Phase 2 activations.
+    "leaky_relu": LEAKY_RELU,
+    "tanh": TANH,
+    "swish": SWISH,
+    "gelu": GELU,
+    "gelu_exact": GELU_EXACT,
+    "selu": SELU,
+    "hardsigmoid": HARDSIGMOID,
+    "softplus": SOFTPLUS,
+    "softsign": SOFTSIGN,
+    "hardtanh": HARDTANH,
+    # KernelBench Phase 2 reductions over a dim.
+    "sum_dim": SUM_DIM,
+    "mean_dim": MEAN_DIM,
+    "max_dim": MAX_DIM,
+    "min_dim": MIN_DIM,
+    "prod_dim": PROD_DIM,
+    "argmax_dim": ARGMAX_DIM,
+    "argmin_dim": ARGMIN_DIM,
+    # KernelBench Phase 2 norms (subset — see Tier 3 follow-on for the
+    # affine-bearing nn.Module ones).
+    "l1_norm": L1_NORM,
+    "l2_norm": L2_NORM,
+    "frobenius_norm": FROBENIUS_NORM,
     "conv2d": CONV2D,
     "conv2d_dw": CONV2D_DW,
     "maxpool2d": MAXPOOL2D,
@@ -1628,6 +3075,17 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "add_s8": ADD_S8,
     "batchnorm2d_s8": BATCHNORM2D_S8,
     "sigmoid_s8": SIGMOID_S8,
+    "relu_f16": RELU_F16,
+    "sigmoid_f16": SIGMOID_F16,
+    "elu_f16": ELU_F16,
+    "batchnorm2d_f16": BATCHNORM2D_F16,
+    "maxpool2d_f16": MAXPOOL2D_F16,
+    "conv2d_f16": CONV2D_F16,
+    "matmul_f16": MATMUL_F16,
+    "matmul_ta_f16": MATMUL_TA_F16,
+    "matmul_tb_f16": MATMUL_TB_F16,
+    "matmul_tatb_f16": MATMUL_TATB_F16,
+    "bmm_f16": BMM_F16,
 }
 
 

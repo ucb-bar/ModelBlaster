@@ -69,11 +69,16 @@ def _array_lines_int(arr: np.ndarray, per_line: int = 16) -> list[str]:
 
 
 # Map our IR dtype tags to C scalar types (used everywhere — buffer decls,
-# run_model signature, weights.h, test_io.h).
+# run_model signature, weights.h, test_io.h). _Float16 is the standard
+# scalar half-precision type in C — gcc supports it natively when
+# compiling with `-march=...zfh` for RISC-V (Dima's Aug-13 patch wires
+# this up automatically when CONFIG_RISCV_ISA_EXT_ZFH=y).
 _DTYPE_TO_C = {
     "f32": "float",
+    "f16": "_Float16",
     "i8":  "int8_t",
     "i32": "int32_t",
+    "i64": "int64_t",
 }
 
 
@@ -87,10 +92,14 @@ def _np_to_c_dtype(np_dtype) -> tuple[str, str]:
     """(c_type, ir_dtype_tag) for a numpy weight blob's dtype."""
     if np_dtype == np.float32:
         return "float", "f32"
+    if np_dtype == np.float16:
+        return "_Float16", "f16"
     if np_dtype == np.int8:
         return "int8_t", "i8"
     if np_dtype == np.int32:
         return "int32_t", "i32"
+    if np_dtype == np.int64:
+        return "int64_t", "i64"
     raise NotImplementedError(f"unsupported weight dtype: {np_dtype}")
 
 
@@ -318,7 +327,10 @@ def emit_weights(model_name: str, weights: dict[str, np.ndarray], out_dir: str) 
         arr = weights[k]
         c_type, _ = _np_to_c_dtype(arr.dtype)
         c_lines.append(f"const {c_type} {ident}[{arr.size}] = {{")
-        if arr.dtype == np.float32:
+        if arr.dtype in (np.float32, np.float16):
+            # fp16 weights: widen to fp32 for the literal text (lossless),
+            # implicit narrow happens at compile time when initializing the
+            # _Float16 array.
             c_lines += _array_lines(arr)
         else:
             c_lines += _array_lines_int(arr)
@@ -335,14 +347,24 @@ def _shape_str(op: dict) -> str:
 
 
 def emit_model(ir: dict[str, Any], out_dir: str) -> None:
-    in_tensor = ir["input"]["tensor"]
+    in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
         list(out_field["tensors"]) if out_field.get("tensors") else [out_field["tensor"]]
     )
     tensors = ir["tensors"]
-    in_size = _prod(tensors[in_tensor]["shape"])
     in_c_type = _dtype_to_c(tensors[in_tensor]["dtype"])
+    # Build input offset map: {tensor_name: flat_offset_in_packed_input_buffer}.
+    # Single-input models have no "packed_inputs" key — offset is always 0.
+    if "packed_inputs" in ir["input"]:
+        input_offsets: dict[str, int] = {
+            p["name"]: p["offset"] for p in ir["input"]["packed_inputs"]
+        }
+        in_size = sum(p["size"] for p in ir["input"]["packed_inputs"])
+    else:
+        input_offsets = {in_tensor: 0}
+        in_size = _prod(tensors[in_tensor]["shape"])
+    input_names_set = set(input_offsets.keys())
     model_name = ir["name"]
     mid = _mid(model_name)
     umid = _umid(model_name)
@@ -498,14 +520,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     with open(os.path.join(out_dir, "model.h"), "w") as f:
         f.write(h)
 
-    # Allocate one buffer per intermediate tensor (skip input, any final
+    # Allocate one buffer per intermediate tensor (skip all inputs, any final
     # output tensor, and any tensor that is just a view alias).
     # Definitions live in a sibling buffers.c so every backend's copy of
     # model.c sees the SAME storage via extern (see _buf_name for why).
     out_tensor_set = set(out_tensors_list)
     intermediates = [
         t for t in tensors
-        if t != in_tensor and t not in out_tensor_set and t not in aliases
+        if t not in input_names_set and t not in out_tensor_set and t not in aliases
     ]
     buf_defs: list[str] = []   # for buffers.c (definitions, no `static`)
     buf_externs: list[str] = []  # for model.c (declarations)
@@ -517,8 +539,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 
     def ptr_for(tensor: str, role: str) -> str:
         tensor = resolve_alias(tensor)
-        if tensor == in_tensor:
-            return "input"
+        if tensor in input_offsets:
+            off = input_offsets[tensor]
+            return "input" if off == 0 else f"(input + {off})"
         if tensor in out_tensor_to_offset:
             off = out_tensor_to_offset[tensor]
             return "output" if off == 0 else f"(output + {off})"
@@ -572,10 +595,13 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         elif op["op"] == "maxpool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
+            PH, PW = sh.get("PH", 0), sh.get("PW", 0)
+            DH, DW = sh.get("DH", 1), sh.get("DW", 1)
             call = (
                 f"kernel_maxpool2d({in_ptr}, {out_ptr}, "
                 f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']})"
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{PH}, {PW}, {DH}, {DW})"
             )
         elif op["op"] == "add":
             a_ptr = ptr_for(op["inputs"][0], "in")
@@ -599,6 +625,76 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
             call = f"kernel_relu6({in_ptr}, {out_ptr}, {n})"
+        # KernelBench Phase 2 activations.
+        elif op["op"] == "leaky_relu":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            slope = op.get("negative_slope", 0.01)
+            call = (
+                f"kernel_leaky_relu({in_ptr}, {out_ptr}, {n}, {_f32(slope)})"
+            )
+        elif op["op"] == "tanh":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_tanh({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "gelu":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_gelu({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "gelu_exact":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_gelu_exact({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "selu":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_selu({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "hardsigmoid":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_hardsigmoid({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "softplus":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_softplus({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "softsign":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_softsign({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "swish":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_swish({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "hardtanh":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            mn = op.get("min_val", -1.0)
+            mx = op.get("max_val",  1.0)
+            call = (
+                f"kernel_hardtanh({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(mn)}, {_f32(mx)})"
+            )
+        # KernelBench Phase 2 reductions (sum/mean/max/min/prod/argmax/argmin
+        # over a single dimension). All share the (outer, reduce, inner) shape.
+        elif op["op"] in ("sum_dim", "mean_dim", "max_dim", "min_dim",
+                          "prod_dim", "argmax_dim", "argmin_dim"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['reduce']}, {sh['inner']})"
+            )
+        elif op["op"] in ("l1_norm", "l2_norm"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['reduce']}, {sh['inner']})"
+            )
+        elif op["op"] == "frobenius_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_frobenius_norm({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "conv2d_dw":
             in_ptr = ptr_for(op["inputs"][0], "in")
             w = _weight_name(model_name, op["weight"])
@@ -654,10 +750,13 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         elif op["op"] == "maxpool2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
+            PH, PW = sh.get("PH", 0), sh.get("PW", 0)
+            DH, DW = sh.get("DH", 1), sh.get("DW", 1)
             call = (
                 f"kernel_maxpool2d_s8({in_ptr}, {out_ptr}, "
                 f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']})"
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{PH}, {PW}, {DH}, {DW})"
             )
         elif op["op"] == "add_s8":
             a_ptr = ptr_for(op["inputs"][0], "in")
@@ -691,6 +790,72 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        # ---- fp16 (half-precision) variants. Same dataflow as fp32 but
+        #      the kernel signature takes _Float16 storage. No quantization
+        #      knobs — that's what fp16 is FOR. ----
+        elif op["op"] == "relu_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_relu_f16({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "elu_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            alpha = op.get("alpha", 1.0)
+            call = (
+                f"kernel_elu_f16({in_ptr}, {out_ptr}, {n}, {_f32(alpha)})"
+            )
+        elif op["op"] == "sigmoid_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_sigmoid_f16({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "batchnorm2d_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            s = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"])
+            sh = op["shape"]
+            call = (
+                f"kernel_batchnorm2d_f16({in_ptr}, {s}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['H']}, {sh['W']})"
+            )
+        elif op["op"] == "maxpool2d_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            PH, PW = sh.get("PH", 0), sh.get("PW", 0)
+            DH, DW = sh.get("DH", 1), sh.get("DW", 1)
+            call = (
+                f"kernel_maxpool2d_f16({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{PH}, {PW}, {DH}, {DW})"
+            )
+        elif op["op"] == "conv2d_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+            )
+        elif op["op"] in ("matmul", "matmul_ta", "matmul_tb", "matmul_tatb",
+                           "matmul_f16", "matmul_ta_f16", "matmul_tb_f16", "matmul_tatb_f16"):
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']})"
+            )
+        elif op["op"] in ("bmm", "bmm_f16"):
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['batch']}, {sh['M']}, {sh['K']}, {sh['N']})"
+            )
         else:
             raise NotImplementedError(f"unsupported op {op['op']}")
         # Mangle the kernel call: every kernels.c emits kernel_<op>_<mid>
@@ -712,6 +877,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # the model_<mid>_state_t the dispatch fn is invoked with. Buffer
         # references (buf_<...>) stay as-is — those are file-static.
         per_disp_call = (call
+                         .replace("(input + ", "(s->input + ")
                          .replace("input,", "s->input,")
                          .replace("input)", "s->input)")
                          .replace("output,", "s->output,")
@@ -839,16 +1005,70 @@ unsigned long model_{mid}_wall_cycles(void) {{
 
 
 def emit_test_io(model_name: str, io_npz: str, out_dir: str) -> None:
-    """Emit test_io.h with mangled `static const` arrays so two models'
-    test_io.h files can co-exist in a single TU."""
+    """Emit per-model test inputs + goldens.
+
+    Layout:
+      test_io.h       — extern declarations + size constants. No data.
+      test_io.S       — uses .incbin to pull the raw .bin files into
+                        rodata at link time (the assembler streams them
+                        verbatim — no parsing cost).
+      test_input.bin  — raw little-endian fp32/int8 bytes from io.npz.
+      test_golden.bin — same.
+
+    Why .incbin instead of `static const T arr[N] = { 0.123f, ... };`:
+    the latter forces the C compiler to parse one decimal literal per
+    element. KernelBench's stock shapes are big — 33_BatchNorm at
+    16x64x256x256 = 67M floats = ~2 GB of decimal text — and cc1
+    chokes (we measured 22 GB RAM, no sign of finishing). The
+    .incbin path makes test_io effectively zero-cost at compile time
+    regardless of size.
+    """
     mid = _mid(model_name)
     umid = _umid(model_name)
     data = np.load(io_npz)
-    inp = data["input"].reshape(-1)
-    out = data["output"].reshape(-1)
+    inp = np.ascontiguousarray(data["input"].reshape(-1))
+    out = np.ascontiguousarray(data["output"].reshape(-1))
     in_c, _ = _np_to_c_dtype(inp.dtype)
     out_c, _ = _np_to_c_dtype(out.dtype)
-    lines = [
+
+    # 1) raw binary blobs.
+    in_bin = os.path.join(out_dir, "test_input.bin")
+    out_bin = os.path.join(out_dir, "test_golden.bin")
+    inp.tofile(in_bin)
+    out.tofile(out_bin)
+
+    # 2) test_io.S — assembler with .incbin pointing at the .bin files.
+    # Use absolute paths so the assembler resolves them regardless of
+    # the build's working directory or -I search path. Symbols are
+    # .globl so the extern decls in test_io.h resolve.
+    in_sym  = f"model_{mid}_test_input"
+    out_sym = f"model_{mid}_test_golden"
+    in_bin_abs  = os.path.abspath(in_bin)
+    out_bin_abs = os.path.abspath(out_bin)
+    s_lines = [
+        f"/* @generated by agents/pipeline/generate_skeleton.py */",
+        f"    .section .rodata",
+        f"    .align 4",
+        f"    .globl  {in_sym}",
+        f"    .type   {in_sym}, @object",
+        f"{in_sym}:",
+        f'    .incbin "{in_bin_abs}"',
+        f"    .size   {in_sym}, . - {in_sym}",
+        f"",
+        f"    .align 4",
+        f"    .globl  {out_sym}",
+        f"    .type   {out_sym}, @object",
+        f"{out_sym}:",
+        f'    .incbin "{out_bin_abs}"',
+        f"    .size   {out_sym}, . - {out_sym}",
+        f"",
+    ]
+    with open(os.path.join(out_dir, "test_io.S"), "w") as f:
+        f.write("\n".join(s_lines))
+
+    # 3) test_io.h — declarations only. Size macros stay #define so
+    # they're constant-foldable; arrays are extern.
+    h_lines = [
         HEADER,
         "#pragma once",
         "",
@@ -858,21 +1078,11 @@ def emit_test_io(model_name: str, io_npz: str, out_dir: str) -> None:
         f"#define MODEL_{umid}_TEST_INPUT_LEN  {inp.size}",
         f"#define MODEL_{umid}_TEST_OUTPUT_LEN {out.size}",
         "",
-        f"static const {in_c} model_{mid}_test_input[{inp.size}] = {{",
-    ]
-    if inp.dtype == np.float32:
-        lines += _array_lines(inp)
-    else:
-        lines += _array_lines_int(inp)
-    lines += ["};", ""]
-    lines.append("/* Reference output (host-side compare; not used at runtime). */")
-    lines.append(f"static const {out_c} model_{mid}_test_golden[{out.size}] = {{")
-    if out.dtype == np.float32:
-        lines += _array_lines(out)
-    else:
-        lines += _array_lines_int(out)
-    lines += [
-        "};",
+        f"/* Definitions in test_io.S (.incbin from test_input.bin /",
+        f" * test_golden.bin). Const so the linker can keep them in",
+        f" * rodata; the assembler emits them in .rodata directly. */",
+        f"extern const {in_c}  {in_sym}[MODEL_{umid}_TEST_INPUT_LEN];",
+        f"extern const {out_c} {out_sym}[MODEL_{umid}_TEST_OUTPUT_LEN];",
         "",
         "/* Unmangled aliases for single-model use. The multi-model harness",
         " * defines AGENTS_DISABLE_UNMANGLED before including any test_io.h",
@@ -880,13 +1090,13 @@ def emit_test_io(model_name: str, io_npz: str, out_dir: str) -> None:
         "#ifndef AGENTS_DISABLE_UNMANGLED",
         f"#define MODEL_TEST_INPUT_LEN  MODEL_{umid}_TEST_INPUT_LEN",
         f"#define MODEL_TEST_OUTPUT_LEN MODEL_{umid}_TEST_OUTPUT_LEN",
-        f"#define model_test_input      model_{mid}_test_input",
-        f"#define model_test_golden     model_{mid}_test_golden",
+        f"#define model_test_input      {in_sym}",
+        f"#define model_test_golden     {out_sym}",
         "#endif",
         "",
     ]
     with open(os.path.join(out_dir, "test_io.h"), "w") as f:
-        f.write("\n".join(lines))
+        f.write("\n".join(h_lines))
 
 
 def generate(ir_path: str, weights_path: str, io_path: str, out_dir: str) -> None:
