@@ -3325,14 +3325,22 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
 
 
 def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
-    """Pull every distinct shape combo for `op` out of an IR graph."""
+    """Pull every distinct shape combo for `op` out of an IR graph.
+
+    Shape values are usually ints, but some ops carry lists (e.g.
+    catN_c1's C_inputs=[16, 16, 16]). Lists aren't hashable so we
+    coerce to tuples before building the dedup key.
+    """
     seen: set[tuple] = set()
     out: list[dict[str, int]] = []
     for node in ir.get("ops", []):
         if node["op"] != op:
             continue
         shape = node.get("shape", {})
-        key = tuple(sorted(shape.items()))
+        key = tuple(sorted(
+            (k, tuple(v) if isinstance(v, list) else v)
+            for k, v in shape.items()
+        ))
         if key in seen:
             continue
         seen.add(key)
