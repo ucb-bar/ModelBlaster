@@ -243,13 +243,15 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             # the trailing per-block sentinel (OUTPUT_END comes earlier
             # in the same block, so racing on it cut the last block's
             # PROFILE+WALL prints off when we killed the sim).
-            if has_output_marker(text):
-                if wall_cycles_count(text) >= expected_ends:
-                    if verbose:
-                        print("firesim: all expected blocks complete "
-                              f"({expected_ends} WALL_CYCLES seen)",
-                              flush=True)
-                    break
+            # harness_multi emits no OUTPUT_BEGIN/END (only VERIFY+PROFILE+WALL),
+            # so allow WALL_CYCLES count alone to satisfy in multi-model mode.
+            wall_done = wall_cycles_count(text) >= expected_ends
+            if wall_done and (has_output_marker(text) or models):
+                if verbose:
+                    print("firesim: all expected blocks complete "
+                          f"({expected_ends} WALL_CYCLES seen)",
+                          flush=True)
+                break
             # Fast-fail on Zephyr fatal-error printer.
             if fault_seen_at is None:
                 for marker in _fault_markers:
