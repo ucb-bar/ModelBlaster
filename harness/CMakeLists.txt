@@ -43,7 +43,7 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(agents_harness)
 
-foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h)
+foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h test_io.S test_input.bin test_golden.bin)
     if(NOT EXISTS "${MODEL_DIR}/${_required}")
         message(FATAL_ERROR
             "MODEL_DIR='${MODEL_DIR}' is missing required file: ${_required}. "
@@ -58,7 +58,9 @@ target_sources(app PRIVATE
     ${MODEL_DIR}/kernels.c
     ${MODEL_DIR}/weights.c
     ${MODEL_DIR}/buffers.c
+    ${MODEL_DIR}/test_io.S
 )
+set_source_files_properties(${MODEL_DIR}/test_io.S PROPERTIES LANGUAGE ASM)
 
 # Big models (mlp_control's hidden layers, dronet's conv weights) push
 # .sdata past the ±2KB window that the linker tries to fold into

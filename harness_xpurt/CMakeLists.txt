@@ -203,6 +203,20 @@ foreach(_i RANGE ${_last})
     add_library(${_buffers_tgt} OBJECT "${_primary_dir}/buffers.c")
     target_include_directories(${_buffers_tgt} PRIVATE "${_primary_dir}")
     target_link_libraries(${_buffers_tgt} PRIVATE zephyr_interface)
+
+    # test_io.S — same per-model rationale as weights/buffers; one TU
+    # per model (not per backend) since test_input/test_golden are
+    # backend-agnostic. .incbin pulls test_input.bin / test_golden.bin
+    # into rodata at link time (avoids cc1 OOM on kernelbench-scale
+    # decimal const arrays).
+    if(EXISTS "${_primary_dir}/test_io.S")
+        set(_test_io_tgt "agents_${_name}_test_io_obj")
+        add_library(${_test_io_tgt} OBJECT "${_primary_dir}/test_io.S")
+        set_source_files_properties("${_primary_dir}/test_io.S"
+            PROPERTIES LANGUAGE ASM)
+        target_include_directories(${_test_io_tgt} PRIVATE "${_primary_dir}")
+        target_link_libraries(${_test_io_tgt} PRIVATE zephyr_interface)
+    endif()
 endforeach()
 
 # Schedule-driven app: xpurt_main.c + the dispatch table .c.
@@ -232,6 +246,9 @@ foreach(_name ${MODEL_NAMES})
     endforeach()
     target_link_libraries(app PRIVATE agents_${_name}_weights_obj)
     target_link_libraries(app PRIVATE agents_${_name}_buffers_obj)
+    if(TARGET agents_${_name}_test_io_obj)
+        target_link_libraries(app PRIVATE agents_${_name}_test_io_obj)
+    endif()
 endforeach()
 target_link_libraries(app PRIVATE agents_pool)
 

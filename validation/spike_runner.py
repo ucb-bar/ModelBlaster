@@ -33,6 +33,8 @@ from agents.validation.runner_common import (
     parse_profile,        # re-exported
     report_pool_sweep_run,
     report_run,
+    _VERIFY_RE,           # in-binary verify summary (modern harness)
+    _WALL_RE,             # AGENTS_WALL_CYCLES — last line of every block
 )
 
 __all__ = [
@@ -68,9 +70,17 @@ def run_spike(spike: str, elf: str, timeout: float = 60.0,
         cmd, capture_output=True, text=True, timeout=timeout
     )
     out = proc.stdout + proc.stderr
-    if not has_output_marker(out):
+    # The harness reached its end-of-bench point if it emitted an
+    # AGENTS_WALL_CYCLES line (always last), an AGENTS_OUTPUT_END
+    # (legacy per-element dump), or an AGENTS_VERIFY line (modern
+    # in-binary compare path). Any of those means the run completed
+    # cleanly enough to parse.
+    has_modern = bool(_VERIFY_RE.search(out))
+    has_wall = bool(_WALL_RE.search(out))
+    if not (has_output_marker(out) or has_modern or has_wall):
         raise RuntimeError(
-            f"spike output missing AGENTS_OUTPUT_BEGIN marker. cmd={cmd!r}\n"
+            f"spike output missing AGENTS_VERIFY / AGENTS_WALL_CYCLES "
+            f"/ AGENTS_OUTPUT_BEGIN markers. cmd={cmd!r}\n"
             f"--- output ---\n{out}"
         )
     return out

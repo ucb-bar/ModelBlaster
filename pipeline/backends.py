@@ -68,9 +68,44 @@ RVV = Backend(
 )
 
 
+# fp16 variants: same shape as scalar/rvv but with Zfh (and Zvfh on rvv)
+# enabled. The Kconfig overlay (scalar_f16.conf / rvv_f16.conf) tells
+# Zephyr to context-switch the half-precision register state and tells
+# target_riscv.cmake to append _zfh / _zvfh to the global -march. For
+# rvv we additionally pin kernel_cflags to a march that includes the
+# vector half-prec extension — the per-source -march would otherwise
+# preempt the Kconfig-driven global -march and kernels.c would lose
+# Zvfh.
+SCALAR_F16 = Backend(
+    name="scalar_f16",
+    description="rv64imafdc + Zfh scalar half-precision.",
+    optimization_guide="optimization_guide_scalar.md",
+    verify_method=VERIFY_HOST_CTYPES,
+    prj_conf_overlay="scalar_f16.conf",
+    # Default spike ISA is rv64gc (no Zfh) — fadd.h / fcvt.h.s would
+    # fault as illegal instruction. Pass an explicit isa so the
+    # simulator decodes Zfh.
+    spike_args=("--isa=rv64gc_zicntr_zfh",),
+)
+
+
+RVV_F16 = Backend(
+    name="rvv_f16",
+    description="rv64gcv + Zfh + Zvfh (vector half-precision).",
+    kernel_cflags=("-march=rv64gcv_zfh_zvfh", "-mabi=lp64d"),
+    kernel_includes=("<riscv_vector.h>",),
+    prj_conf_overlay="rvv_f16.conf",
+    spike_args=("--isa=rv64gcv_zicntr_zfh_zvfh",),
+    optimization_guide="optimization_guide_rvv.md",
+    verify_method=VERIFY_SPIKE_HARNESS,
+)
+
+
 BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
+    SCALAR_F16.name: SCALAR_F16,
+    RVV_F16.name: RVV_F16,
 }
 
 

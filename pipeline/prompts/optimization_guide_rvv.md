@@ -530,6 +530,83 @@ match. Mixing widths in one expression won't compile.
 
 ---
 
+## Half-precision (fp16 / Zvfh) kernels
+
+For ops with the `_f16` suffix (e.g. `kernel_relu_f16`, `kernel_conv2d_f16`,
+`kernel_maxpool2d_f16`), the inputs and outputs are half-precision floats.
+On RISC-V the build uses `-march=rv64gcv_zfh_zvfh` so both scalar Zfh
+(`fadd.h` / `flh` / `fsh`) and vector Zvfh (`vfadd.vv` with eew=16) are
+available.
+
+### CRITICAL: the C type is `_Float16`, NOT `__fp16`
+
+Use **`_Float16`** everywhere — that's what gcc on RISC-V supports natively
+and what the kernel signatures already declare. Do NOT use `__fp16` (an
+ARM-specific name) — it is undeclared on RISC-V and the build will fail
+with `error: unknown type name '__fp16'`.
+
+```c
+/* CORRECT — kernel signature is already _Float16 */
+void kernel_relu_f16(const _Float16 *input, _Float16 *output, int n);
+
+/* WRONG — won't compile on RISC-V */
+void kernel_relu_f16(const __fp16 *input, __fp16 *output, int n);   /* NO */
+```
+
+### Vector intrinsic types and pointer arguments
+
+The `riscv_vector.h` half-precision intrinsics use these names:
+* element type: `_Float16` (for scalars passed to `_vf` variants)
+* vector type:  `vfloat16m1_t`, `vfloat16m2_t`, `vfloat16m4_t`, `vfloat16m8_t`
+* boolean mask: `vbool16_t` (for `vfloat16m1_t`), `vbool8_t` (for `m2`), etc.
+* load/store:   `__riscv_vle16_v_f16m1` / `__riscv_vse16_v_f16m1` (and
+                their m2/m4/m8 siblings) — they take a `const _Float16 *`
+                / `_Float16 *` directly, no cast needed.
+
+```c
+/* CORRECT */
+size_t vl = __riscv_vsetvl_e16m1(n - i);
+vfloat16m1_t v = __riscv_vle16_v_f16m1(input + i, vl);
+vfloat16m1_t r = __riscv_vfmax_vf_f16m1(v, (_Float16)0.0f, vl);
+__riscv_vse16_v_f16m1(output + i, r, vl);
+
+/* WRONG — DO NOT cast to (__fp16 *), the cast is unnecessary AND
+ * `__fp16` is undeclared on RISC-V. */
+__riscv_vle16_v_f16m1((const __fp16 *)(input + i), vl);   /* NO */
+```
+
+### Canonical patterns
+
+* **Elementwise (relu, add, mul, sigmoid, etc.)**: same as the fp32 pattern,
+  just use `e16` in `vsetvl` and the `f16m*` intrinsics. Higher LMUL
+  (`m4` or `m8`) is usually the right choice — twice as many half lanes
+  fit per register group as floats.
+* **Reductions / matmul / conv**: Saturn supports both pure-fp16 accumulate
+  (faster) and fp16-input/fp32-accumulate (more accurate). The reference
+  `kernel_conv2d_f16` uses an fp32 accumulator; preserve that contract
+  when vectorizing — do the multiplies in fp16 (`vfmacc_vv_f16`) but
+  keep the running sum in `vfloat32m*_t` via `vfwmacc_vv_f32m*` (widen
+  fp16 × fp16 into fp32 in one step). Cast back to `_Float16` at the
+  final store. This matches torch.float16 conv2d's CPU behavior and
+  Tensor-Core-style mixed precision.
+* **Constants / vfadd_vf**: write half literals as `(_Float16)0.0f` (NOT
+  bare `0.0f` — that's a `float` and the `_vf_f16m*` intrinsic expects
+  a `_Float16` scalar argument; passing `float` triggers an implicit
+  conversion warning and may silently widen).
+* **Maxpool** with fp16: pad with `(_Float16)-65504.0f` (the most-negative
+  finite half — `_Float16` analogue of `-INFINITY`) so OOB lanes lose
+  every max comparison.
+
+### Numerical envelope
+
+fp16 has ~3.3 sig digits and a max of 65504. For accumulating ops
+(matmul, conv) the inner reduction can overflow even on small kernels
+when inputs aren't in the [-1, 1] band. If you go pure-fp16-accumulate,
+add a mid-loop clamp or rescale; otherwise stick with the
+fp16×fp16→fp32 widen-multiply pattern.
+
+---
+
 ## Quantized (int8) kernels
 
 For ops with the `_s8` suffix (e.g. `kernel_linear_s8`, `kernel_conv2d_s8`),
