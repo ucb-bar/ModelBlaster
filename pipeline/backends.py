@@ -46,6 +46,18 @@ class Backend:
     # How verify is performed.
     verify_method: str = VERIFY_HOST_CTYPES
 
+    def resolved_kernel_cflags(self, repo_root: str) -> tuple[str, ...]:
+        """kernel_cflags with `<repo_root>` placeholders substituted.
+
+        Used for backends that need an -isystem / -I path into the
+        vendored driver headers under agents/cores/<backend>/include/
+        — gemmini's the first one. The placeholder is intentional
+        (over hardcoding `${REPO_ROOT}`-prefixed paths) so the
+        Backend definition stays repo-relative and serializable.
+        """
+        return tuple(f.replace("<repo_root>", repo_root)
+                     for f in self.kernel_cflags)
+
 
 SCALAR = Backend(
     name="scalar",
@@ -101,11 +113,57 @@ RVV_F16 = Backend(
 )
 
 
+# Gemmini integer accelerator (chipyard's default int8 RoCC config —
+# DIM=16, elem_t=int8, acc_t=int32). Stage 1 is RoCC-only; ReRoCC
+# variants will be added later behind separate target names.
+#
+# kernel_cflags: rv64gc_zicntr (no V — gemmini ops are custom RoCC
+# instructions, not vector). The -isystem points at the vendored
+# headers under agents/cores/gemmini/include/. -DGEMMINI_ROCC tells
+# the gemmini.h header to take the RoCC code paths (vs ReRoCC).
+#
+# CMake substitutes `<repo_root>` at build time when injecting these
+# into the kernel TU's COMPILE_OPTIONS — see harness CMakeLists.txt
+# AGENTS_KERNEL_CFLAGS handling.
+GEMMINI = Backend(
+    name="gemmini",
+    description=(
+        "rv64imafdc + Gemmini int8 RoCC accelerator (chipyard default "
+        "config, DIM=16). Tiled int8 conv/matmul via tiled_conv_auto / "
+        "tiled_matmul_auto."
+    ),
+    kernel_cflags=(
+        "-march=rv64imafdc",
+        "-mabi=lp64d",
+        # Two include paths needed:
+        #   .../include — so kernels.c's `#include "gemmini.h"` resolves
+        #   .../        — so gemmini.h's `#include "include/gemmini_params.h"`
+        #                 and `#include "rocc-software/src/xcustom.h"` resolve
+        # The asymmetric layout is gemmini-rocc-tests' upstream convention.
+        "-isystem<repo_root>/agents/cores/gemmini/include",
+        "-isystem<repo_root>/agents/cores/gemmini",
+        "-DGEMMINI_ROCC",
+        "-DBAREMETAL",
+    ),
+    kernel_includes=("\"gemmini.h\"",),
+    prj_conf_overlay="gemmini.conf",
+    # Chipyard's spike with --extension=gemmini decodes the custom RoCC
+    # opcode (XCUSTOM_ACC=3) and routes the instructions through
+    # libgemmini.so. The agents-flow spike binary doesn't ship that
+    # extension; spike_runner.py picks the chipyard spike via
+    # AGENTS_GEMMINI_SPIKE env when this backend is selected.
+    spike_args=("--extension=gemmini", "--isa=rv64gc_zicntr"),
+    optimization_guide="optimization_guide_scalar.md",
+    verify_method=VERIFY_SPIKE_HARNESS,
+)
+
+
 BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,
+    GEMMINI.name: GEMMINI,
 }
 
 

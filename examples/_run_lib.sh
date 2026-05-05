@@ -142,7 +142,7 @@ echo "[4/5] west build (board=${BOARD_TARGET}) -> ${BUILD_DIR}"
 KERNEL_CFLAGS=$(python -c "
 from agents.pipeline.backends import get
 b = get('${GEN_TARGET}')
-print(';'.join(b.kernel_cflags))
+print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}')))
 ")
 WEST_CMAKE_ARGS=(
     -DMODEL_DIR="${GEN_DIR}"

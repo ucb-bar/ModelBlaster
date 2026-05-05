@@ -1062,6 +1062,8 @@ unsigned long model_{mid}_wall_cycles(void) {{
  * within one network see consistent intermediate state.
  */
 
+#include <stdint.h>
+
 {chr(10).join(buf_defs)}
 """
     with open(os.path.join(out_dir, "buffers.c"), "w") as f:
