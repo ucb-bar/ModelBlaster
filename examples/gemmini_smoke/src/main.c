@@ -66,11 +66,12 @@ static void scalar_conv(void)
             acc += (int32_t)input[((n*IC+ic)*IH+ih)*IW+iw]
                  * (int32_t)weight[((oc*IC+ic)*KH+kh)*KW+kw];
         }
-        /* SCALE=1.0 path: just clamp + saturate to match gemmini's
-         * ACC_SCALE_IDENTITY behavior. */
-        int32_t scaled = acc;
-        if (scaled < -128) scaled = -128;
-        if (scaled > 127)  scaled = 127;
+        int64_t prod = (int64_t)acc * (int64_t)MULT;
+        prod = (prod + (1LL << 30)) >> 31;
+        int32_t scaled = (int32_t)prod;
+        scaled = (scaled + (1 << (SHIFT - 1))) >> SHIFT;
+        if (scaled < ACT_MIN) scaled = ACT_MIN;
+        if (scaled > ACT_MAX) scaled = ACT_MAX;
         out_scalar[((n*OC+oc)*OH+oh)*OW+ow] = (int8_t)scaled;
     }
 }
@@ -91,16 +92,18 @@ static void gemmini_conv(void)
         ws_input[((n*IH + h)*IW + w)*IC + c] =
             input[((n*IC + c)*IH + h)*IW + w];
 
-    /* OIHW -> OHWI. */
+    /* OIHW -> patch-major (KH*KW*IC) x OC. Matches what gemmini's
+     * bareMetalC/conv.c flatten_weights() produces — gemmini reads
+     * weights as a [K*K*IC, OC] matrix, NOT OHWI. */
     for (int oc = 0; oc < OC; oc++)
     for (int kh = 0; kh < KH; kh++)
     for (int kw = 0; kw < KW; kw++)
     for (int ic = 0; ic < IC; ic++)
-        ws_weight[((oc*KH + kh)*KW + kw)*IC + ic] =
+        ws_weight[((kh*KW + kw)*IC + ic)*OC + oc] =
             weight[((oc*IC + ic)*KH + kh)*KW + kw];
 
-    float scale = ACC_SCALE_IDENTITY;   /* 1.0 — debug: conv math only */
-    printf("scale = %g (DEBUG: ACC_SCALE_IDENTITY)\n", (double)scale);
+    float scale = ldexpf((float)MULT, -(31 + SHIFT));
+    printf("scale = %g (mult=%d, shift=%d)\n", (double)scale, MULT, SHIFT);
 
     tiled_conv_auto(
         N, IH, IW, IC,

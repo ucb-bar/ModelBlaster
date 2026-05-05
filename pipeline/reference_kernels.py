@@ -1875,6 +1875,11 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         return;
     }
 
+    /* gemmini_flush(0) puts the accelerator in a known state. Idempotent;
+     * the bareMetalC reference tests call this once at boot, but here we
+     * call it per-kernel since kernels.c has no other init hook. */
+    gemmini_flush(0);
+
     /* NCHW -> NHWC transpose. Input shape: [N, IC, IH, IW] -> [N, IH, IW, IC]. */
     for (int n = 0; n < N; n++) {
         for (int h = 0; h < IH; h++) {
@@ -1887,12 +1892,18 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         }
     }
 
-    /* OIHW -> OHWI transpose. Weight: [OC, IC, KH, KW] -> [OC, KH, KW, IC]. */
+    /* OIHW -> patch-major (KH*KW*IC) x OC. tiled_conv_auto reads
+     * weights as a flattened [K*K*IC, OC] matrix — see
+     * gemmini-rocc-tests' bareMetalC/conv.c flatten_weights() — NOT
+     * the OHWI [OC, KH, KW, IC] layout the input uses. Getting this
+     * wrong silently gives ~random output (max_abs_err ≈ 130 even
+     * with ACC_SCALE_IDENTITY); ws_weight rows must be (kh,kw,ic) in
+     * patch order, columns are oc. */
     for (int oc = 0; oc < OC; oc++) {
         for (int kh = 0; kh < KH; kh++) {
             for (int kw = 0; kw < KW; kw++) {
                 for (int ic = 0; ic < IC; ic++) {
-                    ws_weight[((oc*KH + kh)*KW + kw)*IC + ic] =
+                    ws_weight[((kh*KW + kw)*IC + ic)*OC + oc] =
                         weight[((oc*IC + ic)*KH + kh)*KW + kw];
                 }
             }
