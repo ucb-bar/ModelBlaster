@@ -351,6 +351,12 @@ _ALGORITHM_REQUIRED_SUBSTRINGS: dict[str, tuple[str, ...]] = {
     # most common LLM mistake (collapsing the outer-OC loop and writing
     # the direct algorithm under the cache-blocked label).
     "oc_blocked": ("oc_outer", "TILE_OC"),
+    # gemmini_tiled_conv: must call into the gemmini library's tiled
+    # conv path. Without this gate the LLM tends to fall back to plain
+    # scalar (which trivially "verifies" because it matches the
+    # reference impl bit-for-bit) — defeating the whole point of the
+    # algorithm seed.
+    "gemmini_tiled_conv": ("tiled_conv_auto",),
 }
 
 
@@ -426,6 +432,12 @@ def _verify(
             _atol = max(1e-2, 1e-3 * _math.sqrt(_max_k))
         else:
             _atol = max(1e-5, 1e-4 * _math.sqrt(_max_k))
+        # Per-backend tolerance overrides win over the dtype-derived
+        # default. Used by gemmini's float-scale requantize path —
+        # ~3 int8 LSBs of drift vs the Q0.31 PyTorch golden.
+        _rtol_override = getattr(backend, "rtol_override", None)
+        if backend.atol_override is not None:
+            _atol = backend.atol_override
         trial = dict(impls)  # type: ignore[arg-type]
         trial[spec.op] = candidate
         try:
@@ -437,7 +449,7 @@ def _verify(
                 harness_dir=harness_dir,  # type: ignore[arg-type]
                 pristine=False, io_path=io_path,
                 timeout=_verify_timeout(),
-                atol=_atol,
+                atol=_atol, rtol=_rtol_override,
             )
         except ProfileError as e:
             return VerifyResult(False, f"spike-harness build/run failed:\n{e}")

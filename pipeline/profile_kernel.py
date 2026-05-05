@@ -76,7 +76,12 @@ def _west_build(
             f"-DMODEL_DIR={model_dir}",
             f"-DAGENTS_BACKEND={backend.name}"]
     if backend.kernel_cflags:
-        cmd.append(f"-DAGENTS_KERNEL_CFLAGS={';'.join(backend.kernel_cflags)}")
+        # Resolve <repo_root> placeholders (gemmini's -isystem paths use
+        # them so the Backend def stays repo-relative). _run_lib.sh /
+        # multi_demo/run.sh resolve at their level; this is the LLM
+        # verify path's equivalent.
+        cflags = backend.resolved_kernel_cflags(repo_root)
+        cmd.append(f"-DAGENTS_KERNEL_CFLAGS={';'.join(cflags)}")
     env = os.environ.copy()
     env["PATH"] = "/usr/bin:" + env.get("PATH", "")
     proc = subprocess.run(

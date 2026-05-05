@@ -1769,6 +1769,187 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
 }
 """,
         ),
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv",
+            target_affinity=("gemmini",),
+            description=(
+                "Route the conv through the Gemmini int8 systolic mesh "
+                "via gemmini.h's tiled_conv_auto. Gemmini handles "
+                "im2col + GEMM + requantize internally; we transpose "
+                "NCHW→NHWC inputs and OIHW→OHWI weights into static "
+                "scratch buffers (gemmini's required layout), call "
+                "tiled_conv_auto, and transpose the output back.\n\n"
+                "Stage-1 limitations:\n"
+                "  * Square kernel/stride/padding only (KH==KW, SH==SW, "
+                "    PH==PW). Asserts otherwise.\n"
+                "  * input_offset / filter_offset / output_offset must "
+                "    all be 0 (symmetric quant; matches our extract_int8 "
+                "    output). The implementation rejects non-zero offsets "
+                "    by falling back to no-op (caller falls back).\n"
+                "  * Requantize is float-scale (gemmini's mvout-with-scale, "
+                "    derived from output_multiplier/output_shift via "
+                "    ldexpf) — accepts ~1-3 LSB drift vs the Q0.31 "
+                "    PyTorch golden. See agents/notes/gemmini_extension_"
+                "    plan.md 'Requantize tail' section.\n"
+                "  * activation_min == 0 enables gemmini's RELU; "
+                "    activation_max is implicit (int8 saturate inside "
+                "    mvout). Other activation ranges fall back to a "
+                "    post-call clamp.\n"
+                "  * Static workspaces sized 128 KB each for input / "
+                "    weight / output buffers — fits dronet's largest "
+                "    conv (32×56×56). Larger models would need bigger "
+                "    workspaces or codegen-driven sizing."
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    /* Static workspaces (function-scope so the cache validator's
+     * signature check sees the function definition first). 128 KB each
+     * fits dronet's largest int8 conv (32*56*56 = 100352 bytes activations;
+     * 128*64*3*3 = 73728 bytes weights) with margin. .bss-allocated. */
+    enum { GEMMINI_WS_BYTES = 128 * 1024 };
+    static elem_t  ws_input  [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t  ws_weight [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t  ws_output [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+
+    /* Stage-1 constraints. Symmetric per-tensor quant (offsets all 0)
+     * matches what extract_int8 emits today. tiled_conv_auto wants
+     * one int for kernel_dim/stride/padding — square only. */
+    if (KH != KW || SH != SW || PH != PW
+            || input_offset != 0 || filter_offset != 0
+            || output_offset != 0
+            || (size_t)(N*IH*IW*IC) > GEMMINI_WS_BYTES
+            || (size_t)(OC*KH*KW*IC) > GEMMINI_WS_BYTES
+            || (size_t)(N*OH*OW*OC) > GEMMINI_WS_BYTES) {
+        /* Fallback: scalar reference impl. Same bit-exact behavior as
+         * the 'direct' algorithm; included verbatim so this kernel is
+         * self-contained even when the gemmini path can't be used. */
+        for (int n = 0; n < N; n++) {
+            for (int oc = 0; oc < OC; oc++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        int32_t acc = bias ? bias[oc] : 0;
+                        for (int ic = 0; ic < IC; ic++) {
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw;
+                                    int32_t in_v;
+                                    if (ih < 0 || ih >= IH || iw < 0 || iw >= IW) {
+                                        in_v = input_offset;
+                                    } else {
+                                        in_v = (int32_t)input[((n*IC+ic)*IH+ih)*IW+iw]
+                                             + input_offset;
+                                    }
+                                    int32_t w_v = (int32_t)weight[((oc*IC+ic)*KH+kh)*KW+kw]
+                                                + filter_offset;
+                                    acc += in_v * w_v;
+                                }
+                            }
+                        }
+                        int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                        prod = (prod + (1LL << 30)) >> 31;
+                        int32_t scaled = (int32_t)prod;
+                        if (output_shift > 0) {
+                            int32_t r = (1 << (output_shift - 1));
+                            scaled = (scaled + r) >> output_shift;
+                        } else if (output_shift < 0) {
+                            scaled = scaled << (-output_shift);
+                        }
+                        scaled += output_offset;
+                        if (scaled < activation_min) scaled = activation_min;
+                        if (scaled > activation_max) scaled = activation_max;
+                        output[((n*OC+oc)*OH+oh)*OW+ow] = (int8_t)scaled;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    /* NCHW -> NHWC transpose. Input shape: [N, IC, IH, IW] -> [N, IH, IW, IC]. */
+    for (int n = 0; n < N; n++) {
+        for (int h = 0; h < IH; h++) {
+            for (int w = 0; w < IW; w++) {
+                for (int c = 0; c < IC; c++) {
+                    ws_input[((n*IH + h)*IW + w)*IC + c] =
+                        input[((n*IC + c)*IH + h)*IW + w];
+                }
+            }
+        }
+    }
+
+    /* OIHW -> OHWI transpose. Weight: [OC, IC, KH, KW] -> [OC, KH, KW, IC]. */
+    for (int oc = 0; oc < OC; oc++) {
+        for (int kh = 0; kh < KH; kh++) {
+            for (int kw = 0; kw < KW; kw++) {
+                for (int ic = 0; ic < IC; ic++) {
+                    ws_weight[((oc*KH + kh)*KW + kw)*IC + ic] =
+                        weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                }
+            }
+        }
+    }
+
+    /* Q0.31 multiplier+shift -> float scale.
+     * effective_scale = output_multiplier / 2^31 / 2^output_shift
+     *                 = output_multiplier * 2^(-(31 + output_shift))
+     * ldexpf handles either sign of (31 + output_shift). */
+    float scale = ldexpf((float)output_multiplier, -(31 + output_shift));
+
+    /* Activation enum. RELU (1) clamps the float-scaled output to [0,
+     * INT8_MAX]; NO_ACTIVATION (0) lets it use the full int8 range. We
+     * map activation_min == 0 to RELU. activation_max == INT8_MAX is
+     * implicit either way (gemmini saturates on int8 cast). */
+    int act_kind = (activation_min == 0) ? 1 /*RELU*/ : 0 /*NO_ACTIVATION*/;
+
+    /* tiled_conv_auto: gemmini does im2col + GEMM + requantize
+     * internally. WS = weight-stationary dataflow (the canonical
+     * choice for inference). */
+    tiled_conv_auto(
+        N, IH, IW, IC,
+        OC, OH, OW,
+        SH, 1, 1, PH, KH,
+        false, false, false, false, false,
+        ws_input, ws_weight, bias, ws_output,
+        act_kind, scale,
+        0, 0, 0,
+        WS
+    );
+
+    /* NHWC -> NCHW transpose for the output. */
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < OC; c++) {
+            for (int h = 0; h < OH; h++) {
+                for (int w = 0; w < OW; w++) {
+                    output[((n*OC + c)*OH + h)*OW + w] =
+                        ws_output[((n*OH + h)*OW + w)*OC + c];
+                }
+            }
+        }
+    }
+
+    /* Optional post-clamp. activation_min == 0 was already handled by
+     * gemmini's RELU; activation_max < INT8_MAX needs a manual pass. */
+    if (activation_max < 127) {
+        int n_out = N*OC*OH*OW;
+        for (int i = 0; i < n_out; i++) {
+            int v = output[i];
+            if (v > activation_max) v = activation_max;
+            output[i] = (int8_t)v;
+        }
+    }
+}
+""",
+        ),
     ],
 )
 
