@@ -156,6 +156,98 @@ core path is proven.
 | 5 — LLM optimization | 2–3 | low — same Plan B infrastructure |
 | **total (1 engineer)** | **8–13 weeks** | |
 
+## Requantize tail — float-scale today, fixed-point shift is a different bitstream
+
+The default chipyard integer Gemmini config (the one we vendored under
+`agents/cores/gemmini/`) has `acc_scale_t = float` — see the
+`ACC_SCALE_T_IS_FLOAT` marker in `gemmini_params.h`. That means
+`tiled_conv_auto` and `tiled_matmul_auto` apply requantize as a float
+multiply (`ROUND_NEAR_EVEN(acc * scale)` then int8 saturate) on
+mvout.
+
+Our `conv2d_s8` reference uses Q0.31 fixed-point requantize
+(`(acc * output_multiplier + 1<<30) >> 31; >> output_shift; +
+output_offset; clamp`). The two requantizes round differently — float
+mantissa drops bits the Q0.31 path keeps — so a Gemmini-routed
+conv2d_s8 will diverge from the existing PyTorch int8 golden by ~1-3
+LSBs per output. Verify must run with a loosened tolerance
+(`atol≈3 rtol≈0` for int8) until we either:
+
+- **Build a different Gemmini bitstream**: the RTL can be parameterized
+  with `acc_scale_t = scale_t_bits` (integer); then mvout's requantize
+  is the configurable shift via `gemmini_extended_config_ex(..., shift,
+  ...)` — bit-exact with our Q0.31 (modulo round-to-nearest-even vs
+  round-half-up, which is configurable too). That's a chipyard config
+  change + bitstream rebuild (hours offline, not minutes), so it's
+  Stage 2+ work.
+
+- **Drain raw int32 accumulator** and requantize in scalar after
+  (`ACC_READ_FULL_WIDTH` is set, so the hardware path exists). Bit-
+  exact, but adds one elementwise pass over the int32 output buffer
+  per conv. A reasonable middle option if we want the existing golden
+  preserved without changing the bitstream — Stage 1.5 candidate.
+
+Stage 1 takes the float-scale path with loosened verify tolerance to
+get an end-to-end Gemmini kernel working today. Tracked in the
+Backend's atol_override / rtol_override fields.
+
+## Stage 1 bringup status (May 2026)
+
+**Structurally complete**: TARGET=gemmini routes through the agents
+pipeline; kernels.c with `tiled_conv_auto` calls compiles and links
+under the vendored gemmini.h; the elf contains 9 custom-3 RoCC
+opcodes (verified via objdump search for `\.insn 4, 0x[0-9a-f]+07b`,
+which is how the disassembler renders the custom-3 R-type opcode 0x07b
+— a `\bcustom3\b` grep misses these).
+
+**Runtime blocked by libgemmini.so / vendored-headers config drift**:
+
+```
+$ /scratch2/dima/misc_sw/spike --extension=gemmini ...
+*** Booting Zephyr OS build ***
+agents harness: model=dronet in=37632 out=2
+terminate called after throwing an instance of 'std::out_of_range'
+  what():  vector::_M_range_check: __n (which is 4) >= this->size() (which is 4)
+Gemmini extension configured with:
+    dim = 4
+```
+
+The chipyard install ships TWO `gemmini_params.h` files:
+
+| Path | Built | DIM | elem_t | Used by |
+|---|---|---|---|---|
+| `software/libgemmini/gemmini_params.h` | Aug 2025 | **4** | **float** | The compiled `libgemmini.so` simulator that `--extension=gemmini` loads at runtime |
+| `software/gemmini-rocc-tests/include/gemmini_params.h` | May 2026 | **16** | **int8** | Source headers we vendored — what kernels.c is built against |
+
+Our int8 kernel issues `tiled_conv_auto` calls assuming DIM=16 int8;
+libgemmini.so processes them under DIM=4 fp32, which structurally
+can't handle the data layout — hence the vector overflow.
+
+This is exactly the **library version drift** bite item #5 below
+predicted. Resolving it is a Stage 1.5 prerequisite for end-to-end
+on-spike validation:
+
+1. **Rebuild libgemmini.so against the int8 DIM=16 config**
+   (`software/libgemmini` build with the
+   `software/gemmini-rocc-tests/include/gemmini_params.h` config). Drop
+   the rebuilt `.so` at
+   `chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so`. ~1 hr
+   build. Lowest-friction.
+
+2. **Move to FireSim with a matched int8 DIM=16 RTL bitstream**.
+   Unblocks Stage 3 anyway (real per-op cycles). Hours of bitstream
+   build offline; we have machinery already from
+   `agents/validation/firesim_runner.py`.
+
+3. **Switch the demo to fp32 DIM=4** to match the bundled
+   libgemmini. Trivial pipeline-side (re-vendor the libgemmini headers,
+   recompile kernels with float instead of int8) but loses the int8
+   PTQ path and the dronet golden alignment we already validated.
+
+For Stage-1 sign-off I'd land option (1) — rebuild libgemmini with the
+int8 config — keeping spike as the correctness gate, and defer
+real-cycles validation to Stage 3 firesim (option 2).
+
 ## What's likely to bite
 
 1. **Quant layout mismatches.** Gemmini wants int8 weights in a

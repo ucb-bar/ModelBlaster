@@ -197,10 +197,24 @@ print(' '.join(b.spike_args))
     for a in ${SPIKE_ARGS}; do
         SPIKE_FLAGS+=("--spike-arg=${a}")
     done
+    # Per-backend verify tolerance: gemmini's float-scale requantize
+    # produces values that differ from the PyTorch Q0.31 golden by ~1-3
+    # int8 LSBs. Backend.atol_override / rtol_override carry that.
+    TOL_FLAGS=$(python -c "
+from agents.pipeline.backends import get
+b = get('${GEN_TARGET}')
+parts = []
+if b.atol_override is not None:
+    parts.append(f'--atol={b.atol_override}')
+if b.rtol_override is not None:
+    parts.append(f'--rtol={b.rtol_override}')
+print(' '.join(parts))
+")
     python -m agents.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
         --timeout "${SPIKE_TIMEOUT:-600}" \
+        ${TOL_FLAGS} \
         "${SPIKE_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
 else

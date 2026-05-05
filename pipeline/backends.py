@@ -45,6 +45,16 @@ class Backend:
     optimization_guide: str = "optimization_guide_scalar.md"
     # How verify is performed.
     verify_method: str = VERIFY_HOST_CTYPES
+    # Per-backend verify-tolerance overrides for the spike-harness end-to-
+    # end model golden compare. None means "use the dtype-derived default
+    # from runner_common._select_tolerance". Set non-None when this backend
+    # produces values that differ from the PyTorch golden by more than the
+    # default tolerance for *known structural reasons* — e.g. gemmini's
+    # float-scale requantize differs from the PyTorch Q0.31 reference by
+    # ~1-3 LSBs per int8 output. Used by generate_kernels._verify and
+    # build_and_run.
+    atol_override: float | None = None
+    rtol_override: float | None = None
 
     def resolved_kernel_cflags(self, repo_root: str) -> tuple[str, ...]:
         """kernel_cflags with `<repo_root>` placeholders substituted.
@@ -155,6 +165,13 @@ GEMMINI = Backend(
     spike_args=("--extension=gemmini", "--isa=rv64gc_zicntr"),
     optimization_guide="optimization_guide_scalar.md",
     verify_method=VERIFY_SPIKE_HARNESS,
+    # Float-scale requantize (vs the Q0.31 fixed-point our PyTorch int8
+    # golden was generated under) can drift up to ~3 int8 LSBs. See
+    # agents/notes/gemmini_extension_plan.md "Requantize tail" section.
+    # Tighten or remove once we move to the int-acc-scale bitstream
+    # variant or the int32-drain + scalar-tail path.
+    atol_override=3.0,
+    rtol_override=0.0,
 )
 
 
