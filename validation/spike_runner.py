@@ -66,10 +66,29 @@ def find_spike(explicit: Optional[str] = None) -> str:
 def run_spike(spike: str, elf: str, timeout: float = 60.0,
               extra_args: tuple[str, ...] = ()) -> str:
     cmd = [spike, *extra_args, elf]
-    proc = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout
-    )
-    out = proc.stdout + proc.stderr
+    timed_out = False
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+        out = proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        # exc.stdout/stderr hold whatever spike printed before it was killed.
+        # With text=True they should be str, but CPython's second communicate()
+        # call after kill() can return bytes on some paths — decode defensively.
+        def _as_str(x: object) -> str:
+            if x is None:
+                return ''
+            if isinstance(x, bytes):
+                return x.decode('utf-8', errors='replace')
+            return str(x)
+        out = _as_str(exc.stdout) + _as_str(exc.stderr)
+        print(
+            f"WARNING: spike timed out after {timeout:.0f}s — "
+            f"using {len(out)} chars of partial output",
+            file=sys.stderr,
+        )
     # The harness reached its end-of-bench point if it emitted an
     # AGENTS_WALL_CYCLES line (always last), an AGENTS_OUTPUT_END
     # (legacy per-element dump), or an AGENTS_VERIFY line (modern
@@ -77,11 +96,16 @@ def run_spike(spike: str, elf: str, timeout: float = 60.0,
     # cleanly enough to parse.
     has_modern = bool(_VERIFY_RE.search(out))
     has_wall = bool(_WALL_RE.search(out))
-    if not (has_output_marker(out) or has_modern or has_wall):
+    if not timed_out and not (has_output_marker(out) or has_modern or has_wall):
         raise RuntimeError(
             f"spike output missing AGENTS_VERIFY / AGENTS_WALL_CYCLES "
             f"/ AGENTS_OUTPUT_BEGIN markers. cmd={cmd!r}\n"
             f"--- output ---\n{out}"
+        )
+    if timed_out and not (has_output_marker(out) or has_modern or has_wall):
+        raise RuntimeError(
+            f"spike timed out after {timeout:.0f}s with no parseable output. "
+            f"cmd={cmd!r}"
         )
     return out
 
@@ -128,6 +152,12 @@ def main() -> int:
                          "with (multi-model pool-sweep). Switches the "
                          "runner to walk [<model>@p<N>] tags and emit "
                          "per-(model, pool) profiles under topo_<cores>.")
+    ap.add_argument("--save-output", default=None,
+                    help="path to write the full captured spike stdout. "
+                         "Useful for harvesting AGENTS_XPURT_TRACE blocks "
+                         "(built with -DAGENTS_XPURT_TRACE=ON) for the "
+                         "trace plotter — spike output is otherwise "
+                         "hidden behind subprocess.run(capture_output).")
     args = ap.parse_args()
 
     if not args.models and not args.io:
@@ -139,6 +169,10 @@ def main() -> int:
     print(f"spike: {spike}")
     out = run_spike(spike, args.elf, timeout=args.timeout,
                     extra_args=tuple(args.spike_arg))
+    if args.save_output:
+        with open(args.save_output, "w") as f:
+            f.write(out)
+        print(f"spike: saved {len(out)} bytes of stdout to {args.save_output}")
 
     backend_tag = args.profile_backend or _detect_backend(args.spike_arg)
     repo_root = args.repo_root or os.path.abspath(

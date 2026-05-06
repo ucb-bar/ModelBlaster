@@ -142,13 +142,16 @@ WEST_CMAKE_ARGS=(
 )
 # Per-backend kernel cflags. Read each from agents.pipeline.backends and
 # splice into a -DAGENTS_KERNEL_CFLAGS_<BS> variable; the harness CMake
-# applies them to that backend's kernels.c source-property only.
+# applies them to that backend's kernels.c source-property only.  Use
+# `resolved_kernel_cflags(repo_root)` so backends that bake the repo
+# root into include paths (gemmini's -isystem<repo_root>/agents/cores/gemmini)
+# get those substitutions applied.
 for bs in "${BACKEND_LIST[@]}"; do
     BS_UPPER=$(echo "${bs}" | tr '[:lower:]' '[:upper:]')
     KERNEL_CFLAGS=$(python -c "
 from agents.pipeline.backends import get
 b = get('${bs}')
-print(';'.join(b.kernel_cflags))
+print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}')))
 ")
     if [[ -n "${KERNEL_CFLAGS}" ]]; then
         WEST_CMAKE_ARGS+=("-DAGENTS_KERNEL_CFLAGS_${BS_UPPER}=${KERNEL_CFLAGS}")
@@ -163,11 +166,33 @@ if [[ "${XPURT_TRACE:-0}" == "1" ]]; then
 fi
 
 WEST_BUILD_EXTRA=()
+# Per-target overlay sets CONFIG_MP_MAX_NUM_CPUS — not in prj.conf, so
+# every target callsite has to declare its topology.
 if [[ "${RUNNER}" == "firesim" ]]; then
-    WEST_BUILD_EXTRA+=(
-        -DEXTRA_CONF_FILE="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
-    )
+    # Honor FIRESIM_CONF override (e.g. firesim_chipyard_dual_gemmini.conf
+    # for the 2-core saturn-gemmini bitstream).  Otherwise auto-pick by
+    # backend list: gemmini in the build → dual-gemmini overlay (2 harts),
+    # else default 4-hart overlay.
+    if [[ -n "${FIRESIM_CONF:-}" ]]; then
+        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/${FIRESIM_CONF}"
+    elif [[ ",${BACKENDS}," == *,gemmini,* ]]; then
+        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard_dual_gemmini.conf"
+    else
+        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+    fi
+elif [[ "${RUNNER}" == "spike" ]]; then
+    # Spike runs default to -p4 (see SPIKE_FLAGS below); the overlay
+    # matches with MP_MAX_NUM_CPUS=4. Override SPIKE_CONF if you point
+    # spike_runner at a different -p value.
+    EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
 fi
+if [[ -z "${EXTRA_CONF:-}" || ! -f "${EXTRA_CONF}" ]]; then
+    echo "ERROR: per-target overlay not found (RUNNER=${RUNNER}, EXTRA_CONF=${EXTRA_CONF:-<unset>})" >&2
+    exit 1
+fi
+WEST_BUILD_EXTRA+=(
+    -DEXTRA_CONF_FILE="${EXTRA_CONF}"
+)
 
 west build -p -b "${BOARD_TARGET}" agents/harness_xpurt \
     --build-dir "${BUILD_DIR}" \
@@ -183,16 +208,50 @@ if [[ "${RUNNER}" == "spike" ]]; then
 from agents.pipeline.backends import get
 seen = set()
 out = []
+isa_candidates = []
 for bs in '${BACKENDS}'.split(','):
     for a in get(bs).spike_args:
+        if a.startswith('--isa='):
+            # Spike accepts only ONE --isa flag — collect candidates and
+            # keep the longest (each extension letter expands the
+            # decoded ISA, so the longest string is a superset of any
+            # shorter ones we'd merge with). gemmini emits 'rv64gc_zicntr'
+            # and rvv emits 'rv64gcv_zicntr' — picking the longer one
+            # (gcv) preserves both backends' opcodes.
+            isa_candidates.append(a)
+            continue
         if a not in seen:
             seen.add(a); out.append(a)
+if isa_candidates:
+    out.append(max(isa_candidates, key=len))
 print(' '.join(out))
 ")
     SPIKE_FLAGS=("--spike-arg=-p${SPIKE_HARTS:-4}")
     for a in ${SPIKE_ARGS}; do
         SPIKE_FLAGS+=("--spike-arg=${a}")
     done
+    # When the build mixes gemmini in (BACKENDS=gemmini,...), the spike
+    # binary needs --extension=gemmini support, which only the
+    # chipyard-built spike has. Default-pick that one if it exists;
+    # SPIKE_BIN env var overrides explicitly.
+    SPIKE_BIN_DEFAULT="/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike"
+    if [[ ",${BACKENDS}," == *,gemmini,* && -z "${SPIKE_BIN:-}" ]]; then
+        if [[ -x "${SPIKE_BIN_DEFAULT}" ]]; then
+            SPIKE_BIN="${SPIKE_BIN_DEFAULT}"
+        else
+            echo "ERROR: BACKENDS includes gemmini but no chipyard spike found at ${SPIKE_BIN_DEFAULT}; set SPIKE_BIN explicitly" >&2
+            exit 1
+        fi
+    fi
+    if [[ -n "${SPIKE_BIN:-}" ]]; then
+        SPIKE_FLAGS+=("--spike" "${SPIKE_BIN}")
+    fi
+    # When XPURT_TRACE=1 (auto-enabled by setting XPURT_SAVE_OUTPUT, or
+    # explicit), capture full spike stdout so plot_xpurt_trace.py can
+    # find the AGENTS_XPURT_TRACE_BEGIN..END block.
+    if [[ -n "${XPURT_SAVE_OUTPUT:-}" ]]; then
+        SPIKE_FLAGS+=("--save-output" "${XPURT_SAVE_OUTPUT}")
+    fi
     python -m agents.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \

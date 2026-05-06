@@ -1,0 +1,22 @@
+{
+  "system": "spike-rvv-scalar-hetero",
+  "description": "Spike with two harts advertising different kinds — rvv0@hart0, scalar0@hart1. Used to spike-debug the firesim-generated cross-kind schedule (re-ingest with --cpu-p-kind rvv --cpu-e-kind scalar). Spike is a software ISA simulator so both harts physically run rv64gcv_zicntr; the kind label is purely a routing hint to the xpurt walker so it picks the matching per-backend dispatch table. Spike --p4 is fine — we only use harts 0/1, harts 2/3 stay idle. Used to flush out concurrent-cross-kind synchronization bugs without paying a FireSim turnaround.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rvv0",
+      "kind": "rvv",
+      "isa": "rv64gcv_zicntr",
+      "harts": [0],
+      "capabilities": ["linear", "conv2d", "relu", "elu", "add", "maxpool2d", "batchnorm2d", "sigmoid",
+                       "linear_s8", "conv2d_s8", "relu_s8", "add_s8", "maxpool2d_s8", "batchnorm2d_s8", "sigmoid_s8"]
+    },
+    {
+      "name": "scalar0",
+      "kind": "scalar",
+      "isa": "rv64imafdc",
+      "harts": [1],
+      "capabilities_ref": "rvv0"
+    }
+  ]
+}
