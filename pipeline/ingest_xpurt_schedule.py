@@ -133,23 +133,101 @@ def load(schedule_path: str,
     if not isinstance(raw, dict) or not raw:
         raise ValueError(f"{schedule_path}: 'dispatches' missing or empty")
 
-    # Build dispatch_id index per network IR (skip view ops).
+    # Build dispatch_id index per network IR + remap from IR-space
+    # dispatch_id to codegen-space dispatch table index.
+    #
+    # `generate_skeleton.py` filters out zero-cost IR ops (view,
+    # chunk2_c1) — they're aliasing-only and produce no kernel call.
+    # The dispatch table `MODEL_<UMID>_DISPATCH_FNS_<BS>[]` is built by
+    # appending fns for each non-zero-cost op IN IR ORDER, so the table
+    # is sized OP_COUNT == n(non-zero-cost) and indexed sequentially —
+    # NOT by IR dispatch_id.
+    #
+    # If we passed the IR dispatch_id straight to the runtime, the
+    # walker would call `MODEL_<UMID>_DISPATCH_FNS_<BS>[ir_did]` which
+    # for ir_did >= n(non-zero-cost) reads past the end of the table
+    # into adjacent static data and jalrs garbage. We saw exactly this
+    # crash (mepc=garbage int8 weight bytes) on yolov8_nano which has 8
+    # chunk2_c1 ops, so codegen produced a 204-entry table but
+    # ir_dids ran 0..211.
+    #
+    # Fix: remap each schedule entry's IR-space dispatch_id to its
+    # codegen index here. Zero-cost ops get codegen_idx=-1 — runtime
+    # skips them but still posts the completion sem so dependents
+    # unblock.
+    _ZERO_COST_OPS = {"view", "chunk2_c1"}
     network_dispatches: dict[str, set[int]] = {}
     network_op_by_did: dict[str, dict[int, dict]] = {}
+    network_remap: dict[str, dict[int, int]] = {}  # ir_did -> codegen_idx (-1 = zero-cost skip)
     for net, ir in irs_by_network.items():
         idx: dict[int, dict] = {}
+        remap: dict[int, int] = {}
+        codegen_idx = 0
         for op in ir.get("ops", []):
             d = op.get("dispatch_id")
-            if d is not None:
-                idx[d] = op
+            if d is None:
+                continue
+            idx[d] = op
+            if op.get("op") in _ZERO_COST_OPS:
+                remap[d] = -1
+            else:
+                remap[d] = codegen_idx
+                codegen_idx += 1
         network_dispatches[net] = set(idx)
         network_op_by_did[net] = idx
+        network_remap[net] = remap
 
-    # Stable in-table order: by start_time, ties broken by schedule_key.
-    sorted_keys = sorted(
-        raw.keys(),
-        key=lambda k: (float(raw[k].get("start_time", 0.0) or 0.0), k),
-    )
+    # In-table order: priority topological sort, where the priority
+    # key is start_time. Pure start_time-then-alphabetical sort breaks
+    # down for zero-cost ops — the scheduler legitimately gives a
+    # zero-cost dep and its dependent the SAME start_time (dep ends
+    # the instant it starts, dependent's earliest_start = dep's end =
+    # dep's start). The tie was being broken by `k` lexicographically,
+    # which ranks "...dispatch_10" < "...dispatch_9" and put the
+    # dependent before its dep. Kahn's-algorithm-with-heap respects
+    # deps always (a dependent only becomes "runnable" after every dep
+    # has been emitted) while still emitting in start_time order
+    # whenever the priority queue has multiple runnable entries.
+    import heapq
+    from collections import defaultdict
+    adj: dict[str, list[str]] = defaultdict(list)
+    indeg: dict[str, int] = {k: 0 for k in raw}
+    for k, d in raw.items():
+        # Both data deps and time_dep are ordering edges and must
+        # appear before this entry in the table walk.
+        edges = list(d.get("dependencies", []) or [])
+        time_dep_key = d.get("time_dependency")
+        if time_dep_key:
+            edges.append(time_dep_key)
+        for dep in edges:
+            if dep not in raw:
+                # Will be flagged later when we resolve to entry_ids;
+                # don't bookkeep an edge to a non-existent node here.
+                continue
+            adj[dep].append(k)
+            indeg[k] += 1
+
+    heap: list[tuple[float, str]] = []
+    for k, n in indeg.items():
+        if n == 0:
+            heapq.heappush(heap, (float(raw[k].get("start_time", 0.0) or 0.0), k))
+    sorted_keys: list[str] = []
+    while heap:
+        _, k = heapq.heappop(heap)
+        sorted_keys.append(k)
+        for nxt in adj[k]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                heapq.heappush(heap,
+                               (float(raw[nxt].get("start_time", 0.0) or 0.0), nxt))
+    if len(sorted_keys) != len(raw):
+        # Indicates a cycle in the schedule's dep graph — an XPU-RT bug.
+        unscheduled = [k for k in raw if k not in sorted_keys]
+        raise ValueError(
+            f"schedule dep graph has a cycle — could not topologically "
+            f"order all {len(raw)} entries (only {len(sorted_keys)} placed). "
+            f"Stuck entries (first 10): {unscheduled[:10]}"
+        )
     key_to_entry_id = {k: i for i, k in enumerate(sorted_keys)}
 
     entries: list[XpurtEntry] = []
@@ -172,13 +250,27 @@ def load(schedule_path: str,
             d["hardware_target"], cpu_p_kind, cpu_e_kind, reg)
 
         # Resolve deps (intra-job data deps) + time_dep (cross-job edge)
-        # to in-table entry_ids.
+        # to in-table entry_ids. The walker's deadlock-freedom argument
+        # (see agents/notes/xpurt_walker_semantics.md §4.6) requires every
+        # edge to point STRICTLY BACKWARD in entry_id order — i.e. only at
+        # entries that have already been walked past, regardless of which
+        # kind owns them. The table is start_time-sorted, so XPU-RT can
+        # only legitimately produce backward edges anyway; assert it
+        # explicitly here so an out-of-spec scheduler emission fails at
+        # ingest instead of deadlocking the harness mid-walk.
         deps_ids: list[int] = []
         for dep_key in d.get("dependencies", []) or []:
             if dep_key not in key_to_entry_id:
                 raise ValueError(
                     f"{key!r} depends on unknown entry {dep_key!r}")
-            deps_ids.append(key_to_entry_id[dep_key])
+            dep_id = key_to_entry_id[dep_key]
+            if dep_id >= entry_id:
+                raise ValueError(
+                    f"{key!r} (entry_id={entry_id}) has FORWARD dep "
+                    f"{dep_key!r} (entry_id={dep_id}); deps must point "
+                    f"backward in start_time order. Likely a scheduler "
+                    f"bug — XPU-RT should not emit forward edges.")
+            deps_ids.append(dep_id)
         time_dep_id = -1
         time_dep_key = d.get("time_dependency")
         if time_dep_key:
@@ -186,14 +278,23 @@ def load(schedule_path: str,
                 raise ValueError(
                     f"{key!r} time_dependency points at unknown {time_dep_key!r}")
             time_dep_id = key_to_entry_id[time_dep_key]
+            if time_dep_id >= entry_id:
+                raise ValueError(
+                    f"{key!r} (entry_id={entry_id}) has FORWARD time_dep "
+                    f"{time_dep_key!r} (entry_id={time_dep_id}); "
+                    f"time_dep must point backward in start_time order.")
 
+        codegen_did = network_remap[network][did]
         entries.append(XpurtEntry(
             entry_id=entry_id,
             schedule_key=key,
             job_name=job,
             network=network,
             instance=instance,
-            dispatch_id=did,
+            # codegen-space index, matches MODEL_<UMID>_DISPATCH_FNS_<BS>[]
+            # layout. -1 means "zero-cost op, runtime should skip the
+            # dispatch fn call but still post the completion sem".
+            dispatch_id=codegen_did,
             op=op_record["op"],
             name=op_record.get("name", f"dispatch_{did}"),
             core_name=core_name,
