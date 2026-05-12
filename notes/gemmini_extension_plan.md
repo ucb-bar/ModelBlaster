@@ -185,11 +185,33 @@ LSBs per output. Verify must run with a loosened tolerance
   (`ACC_READ_FULL_WIDTH` is set, so the hardware path exists). Bit-
   exact, but adds one elementwise pass over the int32 output buffer
   per conv. A reasonable middle option if we want the existing golden
-  preserved without changing the bitstream — Stage 1.5 candidate.
+  preserved without changing the bitstream — **Stage 1.5: DONE**.
 
 Stage 1 takes the float-scale path with loosened verify tolerance to
 get an end-to-end Gemmini kernel working today. Tracked in the
 Backend's atol_override / rtol_override fields.
+
+## Stage 1.5 bringup status (May 2026) — COMPLETE
+
+**Algorithm**: `gemmini_im2col_full_C` — im2col + `tiled_matmul_auto(full_C=true)` + scalar Q0.31 requantize.
+
+**Result on Saturn-Gemmini RTL FireSim**: `max_abs_err=0 max_rel_err=0` — bit-exact with the PyTorch int8 golden.
+
+**How it works**: Instead of using `tiled_conv_auto` (which applies requantize via float-scale mvout in hardware), we call `tiled_matmul_auto` with `full_C=true`. This flag (encoded as bit 1 of rs1 in `gemmini_loop_ws`) tells Saturn to write raw `int32` accumulators to the output pointer instead of scaled int8. The CPU then applies the exact Q0.31 fixed-point requantize from the reference kernel. Requires `ACC_READ_FULL_WIDTH` in `gemmini_params.h` (already set).
+
+**FireSim profile (dronet int8, wall_clock_cycles)**:
+- Baseline scalar: 89,392 cycles
+- gemmini_im2col_full_C: 98,137 cycles (~10% slower)
+- Root cause of overhead: `gemmini_flush(0)` is called once per `DIM=16`-row tile to synchronize DMA writes to `ws_acc_out`. conv_modules.0 (M=3136) needs 196 such flushes; conv_modules.8 (M=16, 75% of total cycles) needs just 1.
+
+**Cache file**: `agents/examples/dronet/int8/cache/gemmini/gemmini_conv2d_s8_gemmini_im2col_full_C.c`
+
+**Pipeline integration**: `gemmini_im2col_full_C` is now registered as an `AlgorithmCandidate` in `CONV2D_S8` in `reference_kernels.py` with `target_affinity=("gemmini",)`. The structural validator in `generate_kernels.py` checks for `tiled_matmul_auto` (not `tiled_conv_auto`). The cache probe in `generate_one_llm` will prefer `gemmini_im2col_full_C` over `gemmini_tiled_conv` if both are cached and the cycle comparison favors it.
+
+**Next**: Reduce per-tile flush overhead. Options:
+1. Larger tile batches (increase tile size from DIM to DIM*N, grow ws_acc_out accordingly) — reduces flush count for large-M convs.
+2. Pipeline: issue gemmini_loop_ws for tile i while building im2col for tile i+1, then flush tile i before reading it (one-tile lookahead).
+3. Stage 2 bitstream with `acc_scale_t = int` — eliminates the float-scale mvout issue at source, allowing `tiled_conv_auto` to produce bit-exact results without the per-tile drain pattern.
 
 ## Stage 1 bringup status (May 2026)
 

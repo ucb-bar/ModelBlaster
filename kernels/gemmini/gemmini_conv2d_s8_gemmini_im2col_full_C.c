@@ -1,5 +1,12 @@
 /* source: curated */
 /* algorithm: gemmini_im2col_full_C */
+/* accuracy_class: bit_exact */
+/* WEIGHT LAYOUT CONTRACT: like the sibling tiled_conv variant, this
+ * kernel expects `weight` already in flat HWIO layout
+ * ([KH*KW*IC, OC]) — the form tiled_matmul_auto consumes directly.
+ * The skeleton emitter (generate_skeleton.py::_backend_pack_weight)
+ * permutes OIHW→HWIO at codegen time when --backend gemmini, so
+ * we pass weight straight through without a workspace copy. */
 /* origin: im2col → tiled_matmul_auto(full_C=true) → scalar Q0.31 requantize.
  *         Bypasses Saturn-Gemmini float-scale mvout; bit-exact with the
  *         Q0.31 PyTorch golden (max_abs_err=0 validated on Saturn FireSim
@@ -14,9 +21,10 @@
 /*
  * Static workspace limits.  512 KB covers all square conv layers in
  * dronet and yolov8_nano:
- *   WS_BYTES:     max weight = IC=128,K=3,OC=256 → 288 KB (yolov8 l7)
- *                 max input  = IC=3,IH=160,IW=160 →  75 KB (yolov8 l0)
+ *   WS_BYTES:     max input  = IC=3,IH=160,IW=160 →  75 KB (yolov8 l0)
  *                 max output = IC=16,OH=80,OW=80  → 100 KB (yolov8 l0)
+ *                 (ws_weight is gone — weight is pre-packed HWIO at
+ *                  codegen time and passed straight to tiled_matmul_auto)
  *   IM2COL_ELEMS: max K_inner = IC=256,K=3×3     → 2304 (yolov8 detect head)
  *   ACC_ELEMS:    max OC      = 256               (yolov8 l7/l8/l9)
  */
@@ -34,8 +42,10 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                       int output_multiplier, int output_shift,
                       int activation_min, int activation_max)
 {
+    /* ws_weight is gone — generate_skeleton.py::_backend_pack_weight
+     * pre-packs weights to flat HWIO at codegen time, so we pass
+     * `weight` straight into tiled_matmul_auto below. */
     static elem_t ws_input  [WS_BYTES]     __attribute__((aligned(64)));
-    static elem_t ws_weight [WS_BYTES]     __attribute__((aligned(64)));
     static elem_t ws_output [WS_BYTES]     __attribute__((aligned(64)));
     static elem_t ws_im2col [IM2COL_ELEMS] __attribute__((aligned(64)));
     static acc_t  ws_acc_out[ACC_ELEMS]    __attribute__((aligned(64)));
@@ -71,7 +81,9 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                     else
                                         in_v = (int32_t)input[((n*IC+ic)*IH+ih)*IW+iw]
                                              + input_offset;
-                                    acc += in_v * ((int32_t)weight[((oc*IC+ic)*KH+kh)*KW+kw]
+                                    /* weight is HWIO-packed:
+                                     * idx = ((kh*KW + kw)*IC + ic)*OC + oc */
+                                    acc += in_v * ((int32_t)weight[((kh*KW+kw)*IC+ic)*OC+oc]
                                                    + filter_offset);
                                 }
                             }
@@ -110,17 +122,15 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                     ws_input[((n*IH + h)*IW + w)*IC + c] =
                         input[((n*IC + c)*IH + h)*IW + w];
 
-    /* Transpose weights OIHW → patch-major [K_inner, OC] into ws_weight.
-     * Rows are (kh, kw, ic) in patch order; columns are oc.
-     * This matches the B-matrix layout that tiled_matmul_auto expects. */
-    for (int oc = 0; oc < OC; oc++)
-        for (int kh = 0; kh < KH; kh++)
-            for (int kw = 0; kw < KW; kw++)
-                for (int ic = 0; ic < IC; ic++)
-                    ws_weight[((kh*KW + kw)*IC + ic)*OC + oc] =
-                        weight[((oc*IC + ic)*KH + kh)*KW + kw];
+    /* Weight is already HWIO-packed by the codegen
+     * (generate_skeleton.py::_backend_pack_weight, --backend gemmini).
+     * Layout = `[KH*KW*IC, OC]` flat — exactly the B-matrix layout
+     * tiled_matmul_auto wants — so no ws_weight copy needed; we'll
+     * pass `weight` directly to tiled_matmul_auto below. */
 
-    /* Drain CPU store buffer before gemmini mvin reads ws_weight. */
+    /* Drain CPU store buffer (covers ws_input writes — the weight
+     * was a const blob so already coherent, but keep the fence here
+     * as gemmini mvin sets up A and B together). */
     asm volatile("fence" ::: "memory");
 
     /* Process output positions in tiles of DIM rows. */
@@ -158,11 +168,13 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         /* Drain CPU stores to ws_im2col before gemmini mvin. */
         asm volatile("fence" ::: "memory");
 
-        /* GEMM: ws_im2col [DIM × K_inner] × ws_weight [K_inner × OC] + bias[OC].
+        /* GEMM: ws_im2col [DIM × K_inner] × weight [K_inner × OC] + bias[OC].
+         * weight is pre-packed HWIO from codegen — flat [KH*KW*IC, OC] is
+         * exactly the B-matrix layout tiled_matmul_auto wants.
          * full_C=true → raw int32 accumulator output (no float-scale mvout). */
         tiled_matmul_auto(
             DIM, OC, K_inner,
-            ws_im2col, ws_weight,
+            ws_im2col, weight,
             (const void *)bias, (void *)ws_acc_out,
             K_inner, OC, OC, OC,
             MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, (scale_acc_t)1,
@@ -173,7 +185,15 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             0, WS
         );
 
-        /* Wait for gemmini DMA writes to ws_acc_out to reach L2. */
+        /* Wait for gemmini DMA writes to ws_acc_out to reach L2.
+         * gemmini_fence drains the in-flight mvout DMAs; gemmini_flush
+         * resets the controller. Both are needed — without the fence,
+         * yolov8-scale tiles (DIM * OC * K_inner large) can race with
+         * the CPU's subsequent ws_acc_out reads in the requantize loop,
+         * which corrupts the stack and surfaces as mcause=1 mepc=0
+         * (return-address-zeroed) several frames later. See
+         * agents/notes/gemmini_tiled_conv_fence_required.md. */
+        gemmini_fence();
         gemmini_flush(0);
 
         /* Scalar Q0.31 requantize: int32 accumulator → int8 NHWC.
