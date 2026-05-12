@@ -283,6 +283,92 @@ Antipatterns to avoid:
 - Letting the inner two loops re-evaluate `oh*SH - PH + kh`. Hoist
   `ih` and `iw` to scalar pre-checks before any vector work.
 
+### Cache blocking — make the inner-loop working set fit L1D
+
+The compiler will not block your loops. At -O2 it cannot reorder loop
+nests across array dependencies; you must restructure the source. Skip
+this section only when you can prove every tensor your inner loop
+touches fits in 32 KB.
+
+**Hardware budget (FireSim alveo_u250 quad-rocket-saturn-llc4mb):**
+- L1D: 32 KB per hart, 8-way, 64-byte lines, hit ≈ 1 cycle.
+- LLC: 4 MB shared across 4 harts, hit ≈ 20–30 cycles.
+- DRAM: ~60–100 cycles per miss.
+
+So an L1 miss that hits LLC is ~25× an L1 hit; a full DRAM miss is
+~75×. RVV vector loads warm L1D one cache line per 64-byte chunk; the
+prefetcher does **not** auto-stride for you — every strided load past
+64 B is an independent cache fill.
+
+**Pre-tiling working set check.** Before writing a new conv2d / matmul
+inner loop, compute how big the data the inner loop touches actually
+is. If
+
+    weight_footprint = OC * IC * KH * KW * sizeof(weight)
+
+is more than ~24 KB (leaving 8 KB headroom for input/output), you are
+guaranteed to refetch every weight from LLC on every reuse pass. The
+remedy is to tile.
+
+**OC-tile blocking template (the highest-leverage rewrite for our
+conv2d shapes — dronet OC=128/IC=128/KH=3/KW=3 has 144 KB weights = 5×
+L1D).** Pick TILE_OC such that one OC-tile of weights fits in L1D:
+
+```c
+/* Tile the OC dimension. Keep one OC-slab of weights resident in L1D
+ * for the entire (oh, ow) sweep, instead of refetching the full weight
+ * tensor for every output position. */
+const int OC_BUDGET_BYTES = 24 * 1024;     /* leave ~8KB for input/output */
+const int oc_slab_bytes   = IC * KH * KW * (int)sizeof(int8_t);
+int TILE_OC               = OC_BUDGET_BYTES / (oc_slab_bytes > 0 ? oc_slab_bytes : 1);
+if (TILE_OC < (int)__riscv_vsetvlmax_e32m4()) TILE_OC = (int)__riscv_vsetvlmax_e32m4();
+if (TILE_OC > OC) TILE_OC = OC;
+
+for (int oc_outer = 0; oc_outer < OC; oc_outer += TILE_OC) {
+    int oc_end = oc_outer + TILE_OC;
+    if (oc_end > OC) oc_end = OC;
+    /* On entry the first reference to weight[oc_outer*IC*KH*KW..]
+     * misses; subsequent references for this OC tile hit L1D. */
+    for (int n = 0; n < N; n++) {
+      for (int oh = 0; oh < OH; oh++) {
+        for (int ow = 0; ow < OW; ow++) {
+            int oc = oc_outer;
+            while (oc < oc_end) {
+                size_t vl = __riscv_vsetvl_e32m4((size_t)(oc_end - oc));
+                /* … same accumulator init + (ic, kh, kw) reduction as
+                 *   the un-blocked version, but the weight pointer
+                 *   stays inside [oc_outer .. oc_end), so the OC-slab
+                 *   stays hot in L1D across all (oh, ow). … */
+                oc += (int)vl;
+            }
+        }
+      }
+    }
+}
+```
+
+Effect on the dronet 3×3 IC=OC=128 layer: weight refetch count drops
+from `OH*OW*N = 16` LLC misses per byte to **1** miss per byte per OC
+tile — i.e. ~16× less LLC traffic on the inner-loop weights. Spike
+won't reward the rewrite (it doesn't model caches). FireSim will. Apply
+the same shape of reasoning to any kernel where the inner-loop working
+set exceeds 24 KB.
+
+**Tile-size selection rule of thumb:**
+- weight slab `TILE_OC * IC * KH * KW * sizeof(elem) ≤ 24 KB` (L1D minus
+  margin for input/output rows and stack frame).
+- `TILE_OC` must be a multiple of `vsetvlmax` for the OC-vectorized
+  reduction loop, otherwise the vsetvl-tail in the inner loop costs more
+  than the blocking saves.
+- Round down to a power of 2 (e.g. 4, 8, 16) to keep RVV intrinsics
+  on a clean LMUL alignment.
+
+**Anti-pattern**: blocking just on OC when **input** is the dominant
+working set. For a 1×1 IC=128 OC=256 H=W=80 conv, the *input* footprint
+is 80*80*128 = 819 KB — way more than the weights. There you tile the
+spatial dimension (OH or OW) instead. Always identify the largest
+tensor the inner loop touches first, then tile *that* dim.
+
 ### When KH=1 and KW=1, the inner dims collapse — use im2col_gemm
 
 For 1×1 convolutions there's no gather work; im2col_gemm degenerates

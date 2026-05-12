@@ -278,10 +278,43 @@ def _emit(networks: list[str], schedule_name: str,
         # below. The per-instance variant uses
         # `=== AGENTS_WALL_CYCLES_INST [<net>#<i>] ===` and is captured
         # for analysis by the host parser.
+        # Output dump strategy: HTIF UART throughput is ~6 KB/sec on
+        # FireSim Saturn. Dumping every output value as ASCII works for
+        # small models (dronet: 2 values, mlp_control: 4) but is the
+        # workflow bottleneck for yolov8-scale outputs (75600 values
+        # blow well past the FIRESIM_TIMEOUT). For large outputs we
+        # emit a *sampled* dump — first 8, last 8, plus a checksum/L1
+        # summary for spot-check parity — and rely on per-model unit
+        # tests (or a separate dedicated verify run) for full
+        # bit-exactness. The marker tags stay the same so existing
+        # parsers continue to find OUTPUT_BEGIN/END.
         print_blocks.append(f"""\
     printf("=== AGENTS_OUTPUT_BEGIN [{net}] ===\\n");
-    for (int i = 0; i < MODEL_{umid}_OUTPUT_SIZE; i++) {{
-        printf("%.9g\\n", (double)out_{mid}[i]);
+    {{
+        const int _osz = MODEL_{umid}_OUTPUT_SIZE;
+        const int _SAMPLE_THRESHOLD = 64;
+        if (_osz <= _SAMPLE_THRESHOLD) {{
+            for (int i = 0; i < _osz; i++)
+                printf("%.9g\\n", (double)out_{mid}[i]);
+        }} else {{
+            /* Sampled dump + summary. */
+            double _sum = 0.0, _abs_sum = 0.0;
+            double _omax = -1.0/0.0, _omin = 1.0/0.0;
+            for (int i = 0; i < _osz; i++) {{
+                double v = (double)out_{mid}[i];
+                _sum += v;
+                _abs_sum += (v < 0) ? -v : v;
+                if (v > _omax) _omax = v;
+                if (v < _omin) _omin = v;
+            }}
+            printf("OUTPUT_SAMPLED size=%d head=8 tail=8\\n", _osz);
+            for (int i = 0; i < 8; i++)
+                printf("  [%d] %.9g\\n", i, (double)out_{mid}[i]);
+            for (int i = _osz - 8; i < _osz; i++)
+                printf("  [%d] %.9g\\n", i, (double)out_{mid}[i]);
+            printf("OUTPUT_SUMMARY sum=%.6g abs_sum=%.6g min=%.6g max=%.6g\\n",
+                   _sum, _abs_sum, _omin, _omax);
+        }}
     }}
     printf("=== AGENTS_OUTPUT_END [{net}] ===\\n");
     printf("=== AGENTS_PROFILE_BEGIN [{net}] ===\\n");

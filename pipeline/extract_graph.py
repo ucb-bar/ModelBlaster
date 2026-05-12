@@ -610,7 +610,12 @@ def extract_int8(
                 and nxt.args[0] is node:
             fused_relu_after.add(nxt.name)
 
+    # Nodes to skip during the main walk (e.g. getitem consumers of chunk).
+    _skip_nodes: set = set()
+
     for node in nodes:
+        if node in _skip_nodes:
+            continue
         if node.op == "placeholder":
             input_name = node.name
             _record(node.name, dtype="i8")
@@ -863,6 +868,51 @@ def extract_int8(
                     },
                 })
 
+            elif isinstance(mod, torch.nn.SiLU):
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "silu_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in":  scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128,
+                        "activation_max": 127,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.Upsample):
+                if mod.mode != "nearest":
+                    raise NotImplementedError(
+                        f"int8 extract: Upsample mode={mod.mode!r} at "
+                        f"{node.name}: only 'nearest' is supported."
+                    )
+                sf = mod.scale_factor
+                if sf is None or float(sf) != int(float(sf)):
+                    raise NotImplementedError(
+                        f"int8 extract: Upsample scale_factor={sf} at "
+                        f"{node.name}: only integer scales are supported."
+                    )
+                sf = int(float(sf))
+                _record(node.name, dtype="i8")
+                # Nearest upsample copies pixels without change — no requant.
+                tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
+                scales[node.name] = scales[in_name]
+                in_shape = tensors_meta[in_name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "upsample_nearest_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"N": N_, "C": C, "IH": IH, "IW": IW,
+                              "scale": sf},
+                })
+
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported module {type(mod).__name__} "
@@ -918,9 +968,118 @@ def extract_int8(
                         "activation_max": 127,
                     },
                 })
+            elif target is torch.cat or tname == "cat":
+                tensors_arg = node.args[0]
+                if not isinstance(tensors_arg, (list, tuple)):
+                    raise NotImplementedError(
+                        f"int8 extract: cat at {node.name}: first arg must "
+                        f"be a list/tuple of tensors."
+                    )
+                dim = int(node.args[1] if len(node.args) > 1 else
+                          node.kwargs.get("dim", 0))
+                if dim != 1:
+                    raise NotImplementedError(
+                        f"int8 extract: cat at {node.name}: dim={dim}, "
+                        f"only dim=1 (channel concat) is supported."
+                    )
+                in_names = [t.name for t in tensors_arg]
+                first_shape = list(tensors_meta[in_names[0]]["shape"])
+                if len(first_shape) != 4:
+                    raise NotImplementedError(
+                        f"int8 extract: cat at {node.name}: only 4D NCHW "
+                        f"inputs supported."
+                    )
+                N_, _, H_, W_ = (int(s) for s in first_shape)
+                c_inputs = [int(tensors_meta[n]["shape"][1]) for n in in_names]
+                n_inputs = len(in_names)
+                if n_inputs not in (2, 3, 4):
+                    raise NotImplementedError(
+                        f"int8 extract: cat at {node.name}: {n_inputs} "
+                        f"inputs; only 2/3/4-input cat is supported."
+                    )
+                op_kind = f"cat{n_inputs}_c1_s8"
+                _record(node.name, dtype="i8")
+                ops.append({
+                    "name": node.name, "op": op_kind,
+                    "inputs": in_names, "outputs": [node.name],
+                    "shape": {"N": N_, "H": H_, "W": W_,
+                              "C_inputs": c_inputs,
+                              "C_total": sum(c_inputs)},
+                    "quant": {
+                        "scales_in": [scales[n] for n in in_names],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128,
+                        "activation_max": 127,
+                    },
+                })
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported function {tname} at {node.name}"
+                )
+
+        elif node.op == "call_method":
+            target_name = node.target
+            if target_name == "chunk":
+                in_name = node.args[0].name
+                n_chunks = int(node.args[1])
+                dim_arg = int(node.args[2]) if len(node.args) > 2 else \
+                    int(node.kwargs.get("dim", 0))
+                if n_chunks != 2 or dim_arg != 1:
+                    raise NotImplementedError(
+                        f"int8 extract: chunk at {node.name}: only "
+                        f"chunk(2, dim=1) is supported."
+                    )
+                in_shape = list(tensors_meta[in_name]["shape"])
+                if len(in_shape) != 4:
+                    raise NotImplementedError(
+                        f"int8 extract: chunk at {node.name}: only 4D "
+                        f"NCHW inputs supported."
+                    )
+                N_, C, H_, W_ = (int(s) for s in in_shape)
+                if C % 2 != 0:
+                    raise NotImplementedError(
+                        f"int8 extract: chunk at {node.name}: C={C} is "
+                        f"odd; can't split evenly."
+                    )
+                c_each = C // 2
+                import operator as _op_mod
+                gi0 = gi1 = None
+                for user in node.users:
+                    if (user.op == "call_function"
+                            and user.target is _op_mod.getitem
+                            and len(user.args) >= 2
+                            and isinstance(user.args[1], int)):
+                        if user.args[1] == 0:
+                            gi0 = user
+                        elif user.args[1] == 1:
+                            gi1 = user
+                if gi0 is None or gi1 is None:
+                    raise NotImplementedError(
+                        f"int8 extract: chunk at {node.name}: expected "
+                        f"both getitem(_, 0) and getitem(_, 1) consumers."
+                    )
+                for gi in (gi0, gi1):
+                    tensors_meta[gi.name] = {
+                        "shape": [N_, c_each, H_, W_],
+                        "dtype": "i8",
+                        "quant": {
+                            "scale": scales.get(gi.name, scales[in_name]),
+                            "zero_point": 0,
+                        },
+                    }
+                    scales[gi.name] = scales.get(gi.name, scales[in_name])
+                    _skip_nodes.add(gi)
+                ops.append({
+                    "name": node.name, "op": "chunk2_c1",
+                    "inputs": [in_name],
+                    "outputs": [gi0.name, gi1.name],
+                    "shape": {"N": N_, "C": C, "H": H_, "W": W_,
+                              "c_each": c_each},
+                })
+            else:
+                raise NotImplementedError(
+                    f"int8 extract: unsupported call_method "
+                    f"'{target_name}' at {node.name}"
                 )
 
         elif node.op == "output":
@@ -1092,6 +1251,42 @@ def extract_int8(
             v = np.round(sig.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "silu_s8":
+            q = op["quant"]
+            fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            silu_out = fv / (np.float32(1.0) + np.exp(-fv).astype(np.float32))
+            v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
+            v = np.clip(v, q["activation_min"], q["activation_max"])
+            activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "upsample_nearest_s8":
+            sh = op["shape"]
+            scale = sh["scale"]
+            in_4d = in_arr.reshape(sh["N"], sh["C"], sh["IH"], sh["IW"])
+            OH, OW = sh["IH"] * scale, sh["IW"] * scale
+            out = np.zeros((sh["N"], sh["C"], OH, OW), dtype=np.int8)
+            for oh in range(OH):
+                for ow in range(OW):
+                    out[:, :, oh, ow] = in_4d[:, :, oh // scale, ow // scale]
+            activations[out_name] = out
+        elif op["op"] in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
+            sh = op["shape"]
+            q = op["quant"]
+            N_, H_, W_ = sh["N"], sh["H"], sh["W"]
+            parts = []
+            for inp_name, s_in, c in zip(op["inputs"], q["scales_in"],
+                                         sh["C_inputs"]):
+                t = activations[inp_name].reshape(N_, c, H_, W_).astype(np.float32)
+                fv = t * np.float32(s_in)
+                v = np.round(fv / np.float32(q["scale_out"])).astype(np.int32)
+                v = np.clip(v, q["activation_min"], q["activation_max"])
+                parts.append(v.astype(np.int8))
+            activations[out_name] = np.concatenate(parts, axis=1)
+        elif op["op"] == "chunk2_c1":
+            sh = op["shape"]
+            in_4d = in_arr.reshape(sh["N"], sh["C"], sh["H"], sh["W"])
+            c_each = sh["c_each"]
+            activations[op["outputs"][0]] = in_4d[:, :c_each, :, :].astype(np.int8)
+            activations[op["outputs"][1]] = in_4d[:, c_each:, :, :].astype(np.int8)
         else:
             raise NotImplementedError(
                 f"int8 simulator: unsupported op {op['op']}"
