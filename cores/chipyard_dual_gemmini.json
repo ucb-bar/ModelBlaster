@@ -1,0 +1,23 @@
+{
+  "system": "chipyard-dual-rocket-saturn-gemmini",
+  "description": "Two-rocket Saturn-vector + shared Gemmini bitstream (alveo_u250_firesim-dual-rocket-saturn-gemmini-no-nic-l2-llc4mb-ddr3). Both rockets have saturn vector; one Gemmini accelerator hangs off the system bus and is reachable from both harts via custom-3 ROCC opcodes. We model that as: hart 0 = gemmini-attached (CPU_P), hart 1 = saturn-RVV-only (CPU_E). MP_MAX_NUM_CPUS=2 in the harness conf; AGENTS_POOL_THREADS=2 to match.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rocket0",
+      "kind": "gemmini",
+      "isa": "rv64gcv",
+      "harts": [0],
+      "description": "Rocket with saturn vector + gemmini accelerator. Routes int8 conv2d/linear via gemmini's ROCC tiled_conv_auto path; falls back to scalar/RVV for ops gemmini can't accelerate.",
+      "capabilities": ["linear_s8", "conv2d_s8"]
+    },
+    {
+      "name": "rocket1",
+      "kind": "rvv",
+      "isa": "rv64gcv",
+      "harts": [1],
+      "description": "Rocket with saturn vector only (no gemmini). Handles RVV-int8 conv2d / linear, plus all the non-int8 / non-conv ops (silu, sigmoid, batchnorm, maxpool, relu, add, cat, upsample) that fall back to scalar/RVV everywhere.",
+      "capabilities": ["linear_s8", "conv2d_s8", "relu", "add", "elu", "silu", "sigmoid", "batchnorm2d", "maxpool2d", "cat", "upsample"]
+    }
+  ]
+}
