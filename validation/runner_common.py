@@ -391,6 +391,11 @@ def report_pool_sweep_run(text: str, *,
             print(f"\n--- {tag} ---")
             verify = parse_verify(text, tag=tag)
             actual = None if verify is not None else parse_output(text, tag=tag)
+            if verify is None and actual is None:
+                print(f"  [{tag}] SKIP: tag not found in spike output "
+                      f"(partial run / timeout?)")
+                all_ok = False
+                continue
             golden_path = model_io_path(repo_root, name, quant)
             if not os.path.exists(golden_path):
                 print(f"FAIL: golden not found at {golden_path}")
