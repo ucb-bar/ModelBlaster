@@ -41,6 +41,18 @@ MODELS="${MODELS:-dronet,mlp_control}"
 REGISTRY="${REGISTRY:-${REPO_ROOT}/agents/cores/chipyard_hetero_example.json}"
 BACKENDS="${BACKENDS:-scalar,rvv}"
 QUANT="${QUANT:-fp32}"
+# Optional per-model quant override (parallel to MODELS, comma list).
+# Lets you build a binary that mixes e.g. fp32 mlp_control with int8
+# dronet/yolov8 — each model picks its own
+# agents/examples/<m>/<quant>/generated/<backend> tree at stage time.
+# Nothing in the harness CMake or generated C requires a shared quant:
+# each model's kernels are model-suffixed (kernel_conv2d_s8_dronet vs
+# kernel_linear_mlp_control), each has its own model_{input,output}_t,
+# and each has its own weights.c — so int8 weight arrays and fp32
+# weight arrays coexist in one binary fine. Default falls back to the
+# single QUANT for every model so the dronet+mlp_control fp32 demo
+# keeps working without changes.
+QUANTS="${QUANTS:-}"
 CPU_P_KIND="${CPU_P_KIND:-rvv}"
 CPU_E_KIND="${CPU_E_KIND:-scalar}"
 AGENTS_POOL_THREADS="${AGENTS_POOL_THREADS:-4}"
@@ -76,25 +88,42 @@ mkdir -p "${GEN_DIR}" "${BUILD_DIR%/*}"
 IFS=',' read -ra MODEL_LIST <<< "${MODELS}"
 IFS=',' read -ra BACKEND_LIST <<< "${BACKENDS}"
 
+# Resolve per-model quant. If QUANTS is set, must have one entry per
+# model in MODELS; otherwise every model uses the single QUANT default.
+if [[ -n "${QUANTS}" ]]; then
+    IFS=',' read -ra QUANT_LIST <<< "${QUANTS}"
+    if [[ "${#QUANT_LIST[@]}" -ne "${#MODEL_LIST[@]}" ]]; then
+        echo "ERROR: QUANTS must have one entry per MODELS (got ${#QUANT_LIST[@]} vs ${#MODEL_LIST[@]})" >&2
+        exit 1
+    fi
+else
+    QUANT_LIST=()
+    for _ in "${MODEL_LIST[@]}"; do
+        QUANT_LIST+=("${QUANT}")
+    done
+fi
+
 # Stage each (model, backend) pair's per-target artifacts. We need
 # every backend's generated/<bs>/{model.c,kernels.c,weights.c} to exist
 # so the harness can link them all.
 MODEL_NAMES=""
 MODEL_DIRS_BASE=""
 IR_ARGS=()
-for m in "${MODEL_LIST[@]}"; do
-    m_base="${REPO_ROOT}/agents/examples/${m}/${QUANT}/generated"
+for idx in "${!MODEL_LIST[@]}"; do
+    m="${MODEL_LIST[$idx]}"
+    m_quant="${QUANT_LIST[$idx]}"
+    m_base="${REPO_ROOT}/agents/examples/${m}/${m_quant}/generated"
     for bs in "${BACKEND_LIST[@]}"; do
         m_gen_dir="${m_base}/${bs}"
         if [[ "${FORCE_REGEN}" == "1" || ! -f "${m_gen_dir}/model.h" ]]; then
-            echo "[stage] running agents/examples/${m}/run.sh (TARGET=${bs})"
+            echo "[stage] running agents/examples/${m}/run.sh (TARGET=${bs}, QUANT=${m_quant})"
             # Staging just needs the generated/ artifacts (graph.json,
             # model.{h,c}, kernels.c, weights.c, buffers.c, test_io.h);
             # the per-model run.sh's [4/5] west build + [5/5] simulator
             # run are wasted work here. Force RUNNER=spike so we don't
             # accidentally fire up FireSim N times (one per model x
             # backend) while xpurt_demo itself is targeting firesim.
-            TARGET="${bs}" QUANT="${QUANT}" RUNNER=spike \
+            TARGET="${bs}" QUANT="${m_quant}" RUNNER=spike \
                 bash "${REPO_ROOT}/agents/examples/${m}/run.sh" >/dev/null
         fi
     done
@@ -175,7 +204,11 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # else default 4-hart overlay.
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
         EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/${FIRESIM_CONF}"
-    elif [[ ",${BACKENDS}," == *,gemmini,* ]]; then
+    elif [[ ",${BACKENDS}," == *,gemmini,* || ",${BACKENDS}," == *,gemmini_q31,* ]]; then
+        # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants run
+        # on the same dual-rocket-saturn-gemmini SoC topology — the
+        # bitstream selection is driven by config_runtime.yaml's
+        # default_hw_config, not by the Zephyr Kconfig overlay.
         EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
         EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"

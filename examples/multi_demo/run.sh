@@ -58,6 +58,15 @@ for m in "${MODEL_LIST[@]}"; do
     m_gen_dir="${REPO_ROOT}/agents/examples/${m}/${QUANT}/generated/${TARGET}"
     if [[ "${FORCE_REGEN}" == "1" || ! -f "${m_gen_dir}/model.h" ]]; then
         echo "[stage] running agents/examples/${m}/run.sh (TARGET=${TARGET} QUANT=${QUANT} BACKEND=${BACKEND:-reference} OPTIMIZE=${OPTIMIZE:-0})"
+        # `var=value cmd` env assignments must be lexically on the
+        # command line — `${VAR:+VAR=value}` expands AFTER tokenization
+        # so the result is treated as a command word, not an env
+        # assignment ("GLOBAL_CURATED_DIR=...: No such file or directory").
+        # Export GLOBAL_CURATED_DIR explicitly so the child run.sh sees it
+        # via the environment.
+        if [[ -n "${GLOBAL_CURATED_DIR:-}" ]]; then
+            export GLOBAL_CURATED_DIR
+        fi
         TARGET="${TARGET}" QUANT="${QUANT}" \
         BACKEND="${BACKEND:-reference}" OPTIMIZE="${OPTIMIZE:-0}" \
         BEAM="${BEAM:-2}" EXPANSIONS="${EXPANSIONS:-3}" ITERATIONS="${ITERATIONS:-2}" \
@@ -116,8 +125,15 @@ fi
 
 WEST_BUILD_EXTRA=()
 if [[ "${RUNNER}" == "firesim" ]]; then
+    if [[ -n "${FIRESIM_CONF:-}" ]]; then
+        FS_CONF="${REPO_ROOT}/agents/harness/backends/${FIRESIM_CONF}"
+    elif [[ "${TARGET}" == "gemmini" ]]; then
+        FS_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard_dual_gemmini.conf"
+    else
+        FS_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+    fi
     WEST_BUILD_EXTRA+=(
-        -DEXTRA_CONF_FILE="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+        -DEXTRA_CONF_FILE="${FS_CONF}"
     )
 fi
 
@@ -165,12 +181,22 @@ print(' '.join(b.spike_args))
     for a in ${SPIKE_ARGS}; do
         SPIKE_FLAGS+=("--spike-arg=${a}")
     done
+    SPIKE_BIN_FLAGS=()
+    if [[ "${TARGET}" == "gemmini" ]]; then
+        _GEMMINI_SPIKE="${AGENTS_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
+        _GEMMINI_LIB_DIR="${AGENTS_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+        if [[ -f "${_GEMMINI_SPIKE}" ]]; then
+            SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
+            export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+        fi
+    fi
     python -m agents.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
         --timeout "${SPIKE_TIMEOUT:-600}" \
+        "${SPIKE_BIN_FLAGS[@]}" \
         "${SPIKE_FLAGS[@]}" \
         "${POOL_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
