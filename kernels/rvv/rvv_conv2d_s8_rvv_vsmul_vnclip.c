@@ -27,9 +27,6 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
 {
     int OH = (IH + 2*PH - KH) / SH + 1;
     int OW = (IW + 2*PW - KW) / SW + 1;
-    /* Byte stride between consecutive OC filter elements in OIHW weight. */
-    const ptrdiff_t oc_stride = (ptrdiff_t)IC * KH * KW;
-
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             for (int ow = 0; ow < OW; ow++) {
@@ -56,13 +53,11 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                     in_byte = input[((n*IC + ic)*IH + ih)*IW + iw];
                                 int32_t in_v = (int32_t)in_byte + input_offset;
 
-                                /* Strided load: one i8 per OC channel.
-                                 * Stride = IC*KH*KW (OIHW layout). */
+                                /* IHWOC: weight[ic][kh][kw][oc] — OC contiguous */
                                 const int8_t *wp = weight
-                                    + (size_t)oc_base * (size_t)oc_stride
-                                    + ((size_t)ic * KH + kh) * KW + kw;
-                                vint8m1_t vw8 = __riscv_vlse8_v_i8m1(
-                                    wp, oc_stride, vl);
+                                    + ((size_t)ic * KH * KW + (size_t)kh * KW + kw) * OC
+                                    + oc_base;
+                                vint8m1_t vw8 = __riscv_vle8_v_i8m1(wp, vl);
 
                                 /* Sign-extend i8m1 → i16m2, fold filter_offset. */
                                 vint16m2_t vw16 = __riscv_vwadd_vx_i16m2(
@@ -117,11 +112,13 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                     /* Truncate i16m2 → i8m1 (already clamped, no saturation needed). */
                     vint8m1_t vout8 = __riscv_vnsra_wx_i8m1(vout16, 0, vl);
 
-                    /* Strided store: OC elements are OH*OW bytes apart in NCHW. */
                     int8_t *op = output
                         + ((size_t)n * OC + oc_base) * OH * OW
                         + (size_t)oh * OW + ow;
-                    __riscv_vsse8_v_i8m1(op, (ptrdiff_t)OH * OW, vout8, vl);
+                    int8_t _obuf[256];
+                    __riscv_vse8_v_i8m1(_obuf, vout8, vl);
+                    for (size_t _vi = 0; _vi < vl; _vi++)
+                        op[_vi * (ptrdiff_t)(OH * OW)] = _obuf[_vi];
 
                     oc_base += (int)vl;
                 }
