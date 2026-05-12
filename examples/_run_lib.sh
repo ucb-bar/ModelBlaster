@@ -47,7 +47,20 @@ export PATH="/usr/bin:${PATH}"
 
 IR_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 GEN_DIR="${IR_DIR}/${TARGET}"
-BUILD_DIR="${EXAMPLE_DIR}/${QUANT}/build/${TARGET}"
+# Two build dirs because the LLM verify path (inside generate_kernels)
+# always invokes spike with board=spike_riscv64, while RUNNER=firesim's
+# runtime build uses chipyard_riscv64. west refuses to mix board
+# targets in the same build dir, so:
+#   VERIFY_BUILD_DIR — always spike, used by the BACKEND=llm verify loop
+#   BUILD_DIR        — runtime, suffixed _firesim when applicable
+# For RUNNER=spike the two are the same (no suffix). cache/ is shared
+# (kernel source isn't board-dependent).
+VERIFY_BUILD_DIR="${EXAMPLE_DIR}/${QUANT}/build/${TARGET}"
+BUILD_SUFFIX=""
+if [[ "${RUNNER:-spike}" == "firesim" ]]; then
+    BUILD_SUFFIX="_firesim"
+fi
+BUILD_DIR="${EXAMPLE_DIR}/${QUANT}/build/${TARGET}${BUILD_SUFFIX}"
 CACHE_DIR="${EXAMPLE_DIR}/${QUANT}/cache/${TARGET}"
 mkdir -p "${GEN_DIR}" "${BUILD_DIR%/*}" "${CACHE_DIR}"
 
@@ -65,12 +78,13 @@ else
         --quant "${QUANT}"
 fi
 
-echo "[2/5] generate_skeleton -> ${GEN_DIR}"
+echo "[2/5] generate_skeleton (backend=${TARGET}) -> ${GEN_DIR}"
 python -m agents.pipeline.generate_skeleton \
     --ir "${IR_DIR}/graph.json" \
     --weights "${IR_DIR}/weights.npz" \
     --io "${IR_DIR}/io.npz" \
-    --out-dir "${GEN_DIR}"
+    --out-dir "${GEN_DIR}" \
+    --backend "${TARGET}"
 
 echo "[3/5] generate_kernels (backend=${BACKEND} target=${GEN_TARGET} quant=${QUANT} optimize=${OPTIMIZE}) -> ${GEN_DIR}"
 GEN_KERNELS_ARGS=(
@@ -81,11 +95,21 @@ GEN_KERNELS_ARGS=(
     --quant "${QUANT}"
     --io "${IR_DIR}/io.npz"
     --repo-root "${REPO_ROOT}"
-    --build-dir "${BUILD_DIR}"
+    --build-dir "${VERIFY_BUILD_DIR}"
     --harness-dir "agents/harness"
     --cache-dir "${CACHE_DIR}"
     --algorithms "${ALGORITHMS:-all}"
 )
+if [[ -n "${GLOBAL_CURATED_DIR:-}" ]]; then
+    GEN_KERNELS_ARGS+=(--global-curated-dir "${GLOBAL_CURATED_DIR}")
+fi
+# MAX_ACCURACY_CLASS=bit_exact|numeric_drift|approximate restricts kernel
+# selection to algorithms that meet at least the given accuracy class. Use
+# bit_exact for golden-regression runs; default (unset) keeps the
+# atol=8 envelope behavior.
+if [[ -n "${MAX_ACCURACY_CLASS:-}" ]]; then
+    GEN_KERNELS_ARGS+=(--max-accuracy-class "${MAX_ACCURACY_CLASS}")
+fi
 if [[ "${OPTIMIZE}" == "1" ]]; then
     GEN_KERNELS_ARGS+=(
         --optimize
@@ -156,8 +180,23 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # Splice the firesim overlay through Zephyr's EXTRA_CONF_FILE knob.
     # `west build -- -DEXTRA_CONF_FILE=...` arrives as a CMake -D, which
     # Zephyr picks up before find_package(Zephyr) processes Kconfig.
+    # Pick the overlay matching the active FireSim hwconfig — the
+    # quad-rocket and dual-rocket-gemmini bitstreams have different
+    # hart counts so MP_MAX_NUM_CPUS must match. Override via
+    # FIRESIM_CONF env if running a different config.
+    if [[ -n "${FIRESIM_CONF:-}" ]]; then
+        FS_CONF="${REPO_ROOT}/agents/harness/backends/${FIRESIM_CONF}"
+    elif [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" ]]; then
+        # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants ride
+        # the same dual-rocket-saturn-gemmini SoC topology, so the same
+        # Zephyr SMP overlay applies. The runtime bitstream is selected
+        # via config_runtime.yaml::default_hw_config.
+        FS_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard_dual_gemmini.conf"
+    else
+        FS_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+    fi
     WEST_BUILD_EXTRA+=(
-        -DEXTRA_CONF_FILE="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+        -DEXTRA_CONF_FILE="${FS_CONF}"
     )
 fi
 west build -p -b "${BOARD_TARGET}" agents/harness \
@@ -187,6 +226,21 @@ if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     fi
 fi
 
+# Per-backend verify tolerance applies to BOTH spike and firesim — gemmini's
+# float-scale and Q0.31 requantize paths each drift ~1 int8 LSB per layer
+# vs the PyTorch Q0.31 golden, well-covered by atol=8 on shallow nets.
+# Backend.atol_override / rtol_override are the authoritative source.
+TOL_FLAGS=$(python -c "
+from agents.pipeline.backends import get
+b = get('${GEN_TARGET}')
+parts = []
+if b.atol_override is not None:
+    parts.append(f'--atol={b.atol_override}')
+if b.rtol_override is not None:
+    parts.append(f'--rtol={b.rtol_override}')
+print(' '.join(parts))
+")
+
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "
 from agents.pipeline.backends import get
@@ -197,24 +251,23 @@ print(' '.join(b.spike_args))
     for a in ${SPIKE_ARGS}; do
         SPIKE_FLAGS+=("--spike-arg=${a}")
     done
-    # Per-backend verify tolerance: gemmini's float-scale requantize
-    # produces values that differ from the PyTorch Q0.31 golden by ~1-3
-    # int8 LSBs. Backend.atol_override / rtol_override carry that.
-    TOL_FLAGS=$(python -c "
-from agents.pipeline.backends import get
-b = get('${GEN_TARGET}')
-parts = []
-if b.atol_override is not None:
-    parts.append(f'--atol={b.atol_override}')
-if b.rtol_override is not None:
-    parts.append(f'--rtol={b.rtol_override}')
-print(' '.join(parts))
-")
+    # Gemmini backend needs the chipyard spike (has --extension=gemmini support
+    # + libgemmini.so). Use AGENTS_GEMMINI_SPIKE env if set, else chipyard path.
+    SPIKE_BIN_FLAGS=()
+    if [[ "${GEN_TARGET}" == "gemmini" ]]; then
+        _GEMMINI_SPIKE="${AGENTS_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
+        _GEMMINI_LIB_DIR="${AGENTS_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+        if [[ -f "${_GEMMINI_SPIKE}" ]]; then
+            SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
+            export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+        fi
+    fi
     python -m agents.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
         --timeout "${SPIKE_TIMEOUT:-600}" \
         ${TOL_FLAGS} \
+        "${SPIKE_BIN_FLAGS[@]}" \
         "${SPIKE_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
 else
@@ -238,6 +291,7 @@ else
     python -m agents.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
+        ${TOL_FLAGS} \
         "${FIRESIM_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
 fi
