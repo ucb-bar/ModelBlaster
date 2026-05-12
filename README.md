@@ -5,6 +5,14 @@ extract a small IR, have an LLM write per-op C kernels, build them into a
 Zephyr app, and validate + profile on `spike`. The same harness extends to
 real boards once we have one.
 
+> **Looking for the full pipeline from a multi-network workload spec to a
+> FireSim run?** See
+> [`docs/end_to_end_xpurt_firesim.md`](../../docs/end_to_end_xpurt_firesim.md)
+> in the parent FreshScheduler repo for the canonical end-to-end
+> walkthrough (workload JSON → scheduler → codegen+build → FireSim →
+> trace plot → compare vs microros baseline). This README covers the
+> per-model pipeline that walkthrough plugs into.
+
 ## Status
 
 Working end-to-end on every model × every backend × every quant axis below:
