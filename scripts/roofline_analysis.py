@@ -94,12 +94,19 @@ SOL_CONFIGS: dict[tuple[str, str], BackendSOL] = {
         name="gemmini", target="firesim_rocket_saturn",
         clock_mhz=1000.0, peak_ops_per_cycle=512.0, peak_bytes_per_cycle=32.0,
     ),
-    # RVV Saturn V8: VLEN=128 → 16 int8 lanes × LMUL=4 = 64 elements/op.
-    # Sustained MAC throughput depends on whether the kernel uses
-    # widening macc or vsmul+vnclip; both peak around 64 ops/cyc.
-    # Memory: similar 16 B/cyc effective.
+    # V256D128_rvv = saturn quad-rocket-saturn-llc4mb bitstream: VLEN=256,
+    # DLEN=128. With LMUL=4 the LMUL-effective vlen is 1024 bits → 128
+    # int8 lanes; sustained MAC throughput peaks around 64 ops/cyc gated
+    # by DLEN=128 (one 128-bit FMA per cycle on this microarch).
+    # Memory: ~16 B/cyc effective on the L2 bus.
+    ("V256D128_rvv", "firesim_rocket_saturn"): BackendSOL(
+        name="V256D128_rvv", target="firesim_rocket_saturn",
+        clock_mhz=1000.0, peak_ops_per_cycle=64.0, peak_bytes_per_cycle=16.0,
+    ),
+    # Legacy alias — kept so older CSVs / scripts that still emit
+    # backend="RVV" keep finding a SOL entry.
     ("RVV", "firesim_rocket_saturn"): BackendSOL(
-        name="RVV", target="firesim_rocket_saturn",
+        name="V256D128_rvv", target="firesim_rocket_saturn",
         clock_mhz=1000.0, peak_ops_per_cycle=64.0, peak_bytes_per_cycle=16.0,
     ),
     # scalar Rocket: 1 MAC/cyc, modest L1 throughput.

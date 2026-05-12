@@ -123,6 +123,30 @@ def _firesim_kill(firesim_env: str, firesim_root: str) -> None:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _firesim_infrasetup(firesim_env: str, firesim_root: str,
+                        verbose: bool = True) -> None:
+    """Run `firesim infrasetup` to reset XDMA / FPGA state.
+
+    `runworkload` alone does not reset the FPGA — after a prior aborted
+    sim, XDMA buffers and bridge state are stale, and the next
+    `runworkload` intermittently crashes mid-run (mtval surfaces as a
+    bus error rather than a Zephyr-side bug).  `infrasetup` re-stages
+    the bitstream pieces and clears the half-configured state.
+    """
+    if verbose:
+        print(f"firesim: infrasetup (XDMA / FPGA reset)", flush=True)
+    res = subprocess.run(
+        _firesim_cmd(firesim_env, firesim_root, "infrasetup"),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if res.returncode != 0 and verbose:
+        # Don't fatal — some setups treat infrasetup as already-done
+        # and exit nonzero with a benign message.  Surface the tail for
+        # diagnosis.
+        tail = (res.stdout or b"")[-1200:].decode("utf-8", errors="replace")
+        print(f"firesim infrasetup rc={res.returncode}; tail:\n{tail}",
+              flush=True)
+
+
 def _firesim_run_async(firesim_env: str, firesim_root: str,
                        log_path: str) -> subprocess.Popen:
     """Spawn `firesim runworkload` and return the Popen handle. We do
@@ -181,6 +205,16 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
         if verbose:
             print(f"firesim: kill any prior sim", flush=True)
         _firesim_kill(firesim_env, firesim_root)
+    # firesim kill causes the xdma kernel module to re-probe, which resets
+    # /dev/xdma* permissions back to root:root 0600. Fix up before runworkload.
+    subprocess.run(["sudo", "chmod", "666"] + [
+        f"/dev/{n}" for n in os.listdir("/dev") if n.startswith("xdma")
+    ], check=False)
+    # Re-run infrasetup so XDMA / FPGA state is freshly configured.  Without
+    # this, runworkload can pick up half-configured XDMA from a previous
+    # aborted sim and crash mid-run with a bus error that's not a Zephyr bug.
+    if os.environ.get("FIRESIM_SKIP_INFRASETUP", "0") != "1":
+        _firesim_infrasetup(firesim_env, firesim_root, verbose=verbose)
     if stage_elf:
         if verbose:
             print(f"firesim: stage {elf} -> {paths['elf_target']}", flush=True)
@@ -204,13 +238,27 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
     # poll loop instead of waiting for the full timeout. Saves ~3 minutes
     # per LLM-generated kernel that builds clean for spike but
     # mis-addresses on the FPGA.
+    # Zephyr's fatal-error printer (zephyr_ws/zephyr/arch/riscv/core/fatal.c)
+    # emits these verbatim including capitalization. Match exactly — adding
+    # `.lower()` would cost CPU per poll iteration and risk picking up
+    # markers in trace data. Variants intentionally enumerated:
+    #   "Instruction Access fault"  ← capital A (from RISC-V exception
+    #                                  table "Instruction Access fault")
+    #   "Instruction access fault"  ← legacy lowercase (older Zephyr fork)
+    # Both kept so the fast-fail short-circuits on every dialect we've
+    # seen on FireSim Saturn.
     _fault_markers = (
         "Load access fault",
         "Store access fault",
+        "Store/AMO access fault",
         "Illegal instruction",
         "Instruction access fault",
+        "Instruction Access fault",
+        "Load Access fault",
+        "Store Access fault",
         ">>> ZEPHYR FATAL ERROR",
         "k_oops",
+        "HARNESS_FATAL_BEGIN",
     )
     fault_seen_at: Optional[float] = None
     try:
@@ -232,7 +280,12 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                 )
             text = ""
             try:
-                with open(paths["uartlog"]) as f:
+                # Use errors='replace' because micro-DDS topic data
+                # (e.g., XCDR-encoded "rt/<net>/done" payloads) contains
+                # non-UTF8 bytes that would otherwise abort the loop
+                # right when we want to wait for the fault dump.
+                with open(paths["uartlog"], encoding="utf-8",
+                          errors="replace") as f:
                     text = f.read()
             except FileNotFoundError:
                 pass
@@ -240,13 +293,12 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                 last_size = len(text)
                 last_progress = time.monotonic()
             # Stop on the LAST block's AGENTS_WALL_CYCLES line — that's
-            # the trailing per-block sentinel (OUTPUT_END comes earlier
-            # in the same block, so racing on it cut the last block's
-            # PROFILE+WALL prints off when we killed the sim).
-            # harness_multi emits no OUTPUT_BEGIN/END (only VERIFY+PROFILE+WALL),
-            # so allow WALL_CYCLES count alone to satisfy in multi-model mode.
+            # the trailing per-block sentinel. Neither single-model nor
+            # multi-model harness emits OUTPUT_BEGIN/END (they use
+            # VERIFY+PROFILE+WALL_CYCLES), so WALL_CYCLES count alone
+            # is the correct termination condition in all modes.
             wall_done = wall_cycles_count(text) >= expected_ends
-            if wall_done and (has_output_marker(text) or models):
+            if wall_done:
                 if verbose:
                     print("firesim: all expected blocks complete "
                           f"({expected_ends} WALL_CYCLES seen)",
@@ -268,10 +320,11 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             # to finish printing the fault frame (regs, stack), then
             # raise. Don't break on first sight — we want the diagnostic
             # in the message we hand back.
+            _settle = float(os.environ.get("FIRESIM_FAULT_SETTLE", "5.0"))
             if fault_seen_at is not None and (
-                time.monotonic() - fault_seen_at > 5.0
+                time.monotonic() - fault_seen_at > _settle
             ):
-                tail = text[-2000:]
+                tail = text[-4000:]
                 raise RuntimeError(
                     f"firesim workload faulted (Zephyr fatal-error "
                     f"printer triggered). uartlog tail:\n{tail}"
@@ -291,7 +344,7 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    with open(paths["uartlog"]) as f:
+    with open(paths["uartlog"], encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
