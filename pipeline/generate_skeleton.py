@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -130,7 +130,7 @@ def _buf_name(mid: str, tensor: str) -> str:
 # sequential call to the mangled kernel otherwise. When a build doesn't
 # need threading (single-model harness), the no-op fallback keeps
 # agents_pool.h out of model.c so the harness has no POSIX dep.
-_PARALLELIZED_OPS = {"linear", "conv2d"}
+_PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 
 
 _LINEAR_WRAPPER = """
@@ -268,9 +268,201 @@ static inline void parallel_conv2d(void *pool_,
 }}
 """
 
+_LINEAR_S8_WRAPPER = """
+/* ---- linear_s8: split outer N (output features), M==1 only -------------- */
+typedef struct {{
+    const int8_t  *in;
+    const int8_t  *w;
+    const int32_t *b;
+    int8_t        *out;
+    int M;
+    int K;
+    int N_total;
+    int input_offset;
+    int filter_offset;
+    int output_offset;
+    int output_multiplier;
+    int output_shift;
+    int activation_min;
+    int activation_max;
+    int chunks;
+}} parallel_linear_s8_ctx_t;
+
+static void parallel_linear_s8_fn(void *ctx_, size_t i) {{
+    parallel_linear_s8_ctx_t *c = (parallel_linear_s8_ctx_t *)ctx_;
+    int n_per = (c->N_total + c->chunks - 1) / c->chunks;
+    int n0 = (int)i * n_per;
+    int n1 = n0 + n_per;
+    if (n1 > c->N_total) n1 = c->N_total;
+    if (n0 >= n1) return;
+    kernel_linear_s8_{mid}(c->in,
+                           c->w + (size_t)n0 * (size_t)c->K,
+                           c->b ? c->b + n0 : NULL,
+                           c->out + n0,
+                           c->M, c->K, n1 - n0,
+                           c->input_offset, c->filter_offset,
+                           c->output_offset,
+                           c->output_multiplier, c->output_shift,
+                           c->activation_min, c->activation_max);
+}}
+
+static inline void parallel_linear_s8(void *pool_,
+                                      const int8_t *in, const int8_t *w,
+                                      const int32_t *b, int8_t *out,
+                                      int M, int K, int N,
+                                      int input_offset, int filter_offset,
+                                      int output_offset,
+                                      int output_multiplier, int output_shift,
+                                      int activation_min, int activation_max) {{
+#ifdef AGENTS_USE_POOL
+    agents_pool_t pool = (agents_pool_t)pool_;
+    if (pool == NULL || M != 1) {{
+        kernel_linear_s8_{mid}(in, w, b, out, M, K, N,
+                               input_offset, filter_offset, output_offset,
+                               output_multiplier, output_shift,
+                               activation_min, activation_max);
+        return;
+    }}
+    size_t T = agents_pool_get_threads_count(pool);
+    if (T <= 1 || (size_t)N < T) {{
+        kernel_linear_s8_{mid}(in, w, b, out, M, K, N,
+                               input_offset, filter_offset, output_offset,
+                               output_multiplier, output_shift,
+                               activation_min, activation_max);
+        return;
+    }}
+    parallel_linear_s8_ctx_t ctx = {{
+        .in = in, .w = w, .b = b, .out = out,
+        .M = M, .K = K, .N_total = N,
+        .input_offset = input_offset, .filter_offset = filter_offset,
+        .output_offset = output_offset,
+        .output_multiplier = output_multiplier, .output_shift = output_shift,
+        .activation_min = activation_min, .activation_max = activation_max,
+        .chunks = (int)T,
+    }};
+    agents_pool_parallelize_1d(pool, parallel_linear_s8_fn, &ctx, T, 0);
+#else
+    (void)pool_;
+    kernel_linear_s8_{mid}(in, w, b, out, M, K, N,
+                           input_offset, filter_offset, output_offset,
+                           output_multiplier, output_shift,
+                           activation_min, activation_max);
+#endif
+}}
+"""
+
+_CONV2D_S8_WRAPPER = """
+/* ---- conv2d_s8: split outer OC (output channels), N==1 only ------------- */
+typedef struct {{
+    const int8_t  *in;
+    const int8_t  *w;
+    const int32_t *b;
+    int8_t        *out;
+    int N;
+    int IC;
+    int IH;
+    int IW;
+    int OC_total;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int OH;
+    int OW;
+    int input_offset;
+    int filter_offset;
+    int output_offset;
+    int output_multiplier;
+    int output_shift;
+    int activation_min;
+    int activation_max;
+    int chunks;
+}} parallel_conv2d_s8_ctx_t;
+
+static void parallel_conv2d_s8_fn(void *ctx_, size_t i) {{
+    parallel_conv2d_s8_ctx_t *c = (parallel_conv2d_s8_ctx_t *)ctx_;
+    int oc_per = (c->OC_total + c->chunks - 1) / c->chunks;
+    int oc0 = (int)i * oc_per;
+    int oc1 = oc0 + oc_per;
+    if (oc1 > c->OC_total) oc1 = c->OC_total;
+    if (oc0 >= oc1) return;
+    size_t per_filter = (size_t)c->IC * (size_t)c->KH * (size_t)c->KW;
+    size_t per_oc_out = (size_t)c->OH * (size_t)c->OW;
+    kernel_conv2d_s8_{mid}(c->in,
+                           c->w + (size_t)oc0 * per_filter,
+                           c->b ? c->b + oc0 : NULL,
+                           c->out + (size_t)oc0 * per_oc_out,
+                           c->N, c->IC, c->IH, c->IW,
+                           oc1 - oc0, c->KH, c->KW,
+                           c->SH, c->SW, c->PH, c->PW,
+                           c->input_offset, c->filter_offset,
+                           c->output_offset,
+                           c->output_multiplier, c->output_shift,
+                           c->activation_min, c->activation_max);
+}}
+
+static inline void parallel_conv2d_s8(void *pool_,
+                                      const int8_t *in, const int8_t *w,
+                                      const int32_t *b, int8_t *out,
+                                      int N, int IC, int IH, int IW,
+                                      int OC, int KH, int KW,
+                                      int SH, int SW, int PH, int PW,
+                                      int input_offset, int filter_offset,
+                                      int output_offset,
+                                      int output_multiplier, int output_shift,
+                                      int activation_min, int activation_max) {{
+#ifdef AGENTS_USE_POOL
+    agents_pool_t pool = (agents_pool_t)pool_;
+    if (pool == NULL || N != 1) {{
+        kernel_conv2d_s8_{mid}(in, w, b, out, N, IC, IH, IW,
+                               OC, KH, KW, SH, SW, PH, PW,
+                               input_offset, filter_offset, output_offset,
+                               output_multiplier, output_shift,
+                               activation_min, activation_max);
+        return;
+    }}
+    size_t T = agents_pool_get_threads_count(pool);
+    if (T <= 1 || (size_t)OC < T) {{
+        kernel_conv2d_s8_{mid}(in, w, b, out, N, IC, IH, IW,
+                               OC, KH, KW, SH, SW, PH, PW,
+                               input_offset, filter_offset, output_offset,
+                               output_multiplier, output_shift,
+                               activation_min, activation_max);
+        return;
+    }}
+    int OH = (IH + 2 * PH - KH) / SH + 1;
+    int OW = (IW + 2 * PW - KW) / SW + 1;
+    parallel_conv2d_s8_ctx_t ctx = {{
+        .in = in, .w = w, .b = b, .out = out,
+        .N = N, .IC = IC, .IH = IH, .IW = IW,
+        .OC_total = OC, .KH = KH, .KW = KW,
+        .SH = SH, .SW = SW, .PH = PH, .PW = PW,
+        .OH = OH, .OW = OW,
+        .input_offset = input_offset, .filter_offset = filter_offset,
+        .output_offset = output_offset,
+        .output_multiplier = output_multiplier, .output_shift = output_shift,
+        .activation_min = activation_min, .activation_max = activation_max,
+        .chunks = (int)T,
+    }};
+    agents_pool_parallelize_1d(pool, parallel_conv2d_s8_fn, &ctx, T, 0);
+#else
+    (void)pool_;
+    kernel_conv2d_s8_{mid}(in, w, b, out, N, IC, IH, IW,
+                           OC, KH, KW, SH, SW, PH, PW,
+                           input_offset, filter_offset, output_offset,
+                           output_multiplier, output_shift,
+                           activation_min, activation_max);
+#endif
+}}
+"""
+
 _PARALLEL_WRAPPER_TEMPLATES = {
-    "linear": _LINEAR_WRAPPER,
-    "conv2d": _CONV2D_WRAPPER,
+    "linear":    _LINEAR_WRAPPER,
+    "conv2d":    _CONV2D_WRAPPER,
+    "linear_s8": _LINEAR_S8_WRAPPER,
+    "conv2d_s8": _CONV2D_S8_WRAPPER,
 }
 
 
@@ -307,7 +499,80 @@ def _weight_name(model_name: str, weight_key: str) -> str:
     return f"{_mid(model_name)}_{_c_ident(weight_key)}"
 
 
-def emit_weights(model_name: str, weights: dict[str, np.ndarray], out_dir: str) -> None:
+def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
+    """Derive the conv weight layout for a backend from its algorithm declarations.
+
+    Queries reference_kernels' conv2d_s8 spec: if all algorithms with
+    target_affinity matching this backend agree on weight_layout, returns
+    that layout. If they disagree (or no algorithms match), returns None.
+
+    This keeps the layout decision co-located with the algorithm (where it
+    belongs as a SW implementation choice) while allowing the weight emitter
+    — which runs before algorithm selection — to apply the transform early.
+    """
+    if backend is None:
+        return None
+    from agents.pipeline.reference_kernels import CONV2D_S8
+    # Only consider algorithms explicitly targeting this backend.
+    # Universal algorithms (empty target_affinity) are fallbacks that
+    # handle any layout via #ifdef and don't dictate the choice.
+    layouts = set()
+    for algo in CONV2D_S8.algorithms:
+        if not algo.target_affinity or backend not in algo.target_affinity:
+            continue
+        if algo.weight_layout != "oihw":
+            layouts.add(algo.weight_layout)
+    if len(layouts) == 1:
+        return layouts.pop()
+    if len(layouts) > 1:
+        raise SystemExit(
+            f"backend '{backend}': conv2d_s8 algorithms disagree on "
+            f"weight_layout: {layouts}. All target-affined algorithms "
+            f"for a backend must declare the same layout."
+        )
+    return None
+
+
+# Physical permutation (2,3,1,0) on OIHW gives both HWIO and IHWOC
+# (same transpose, different semantic interpretation depending on how
+# the kernel indexes it).
+_LAYOUT_PERMUTATION = {
+    "hwio": (2, 3, 1, 0),
+    "ihwoc": (2, 3, 1, 0),
+}
+
+_LAYOUT_TAG = {
+    "hwio": "HWIO (gemmini packed)",
+    "ihwoc": "IHWOC (rvv packed)",
+}
+
+
+def _backend_pack_weight(arr: np.ndarray, backend: Optional[str]) -> tuple[np.ndarray, Optional[str]]:
+    """Apply layout transformation to a 4D conv weight tensor at codegen time.
+
+    The target layout is derived from the algorithm declarations for this
+    backend (see _conv_weight_layout_for_backend). This keeps the weight
+    format as a per-algorithm SW decision rather than a per-backend HW
+    property — if all conv2d algorithms on a backend agree on layout, we
+    apply that layout here; otherwise we leave the tensor in OIHW.
+    """
+    if arr.ndim != 4:
+        return arr, None
+    layout = _conv_weight_layout_for_backend(backend)
+    if layout is None or layout == "oihw":
+        return arr, None
+    perm = _LAYOUT_PERMUTATION.get(layout)
+    if perm is None:
+        return arr, None
+    return np.ascontiguousarray(np.transpose(arr, perm)), _LAYOUT_TAG[layout]
+
+
+def emit_weights(
+    model_name: str,
+    weights: dict[str, np.ndarray],
+    out_dir: str,
+    backend: Optional[str] = None,
+) -> None:
     keys = sorted(weights.keys())
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
@@ -321,19 +586,28 @@ def emit_weights(model_name: str, weights: dict[str, np.ndarray], out_dir: str) 
     with open(os.path.join(out_dir, "weights.h"), "w") as f:
         f.write("\n".join(h_lines))
 
-    c_lines = [HEADER, "#include <stdint.h>", '#include "weights.h"', ""]
+    c_lines = [HEADER, "#include <stdint.h>", '#include "weights.h"']
+    if backend:
+        c_lines.append(f"/* backend-packed layout: {backend} */")
+    c_lines.append("")
     for k in keys:
         ident = _weight_name(model_name, k)
-        arr = weights[k]
-        c_type, _ = _np_to_c_dtype(arr.dtype)
-        c_lines.append(f"const {c_type} {ident}[{arr.size}] = {{")
-        if arr.dtype in (np.float32, np.float16):
+        arr_in = weights[k]
+        arr_out, layout_tag = _backend_pack_weight(arr_in, backend)
+        c_type, _ = _np_to_c_dtype(arr_out.dtype)
+        if layout_tag:
+            c_lines.append(
+                f"/* {ident}: shape {tuple(arr_in.shape)} OIHW → "
+                f"{tuple(arr_out.shape)} {layout_tag} */"
+            )
+        c_lines.append(f"const {c_type} {ident}[{arr_out.size}] = {{")
+        if arr_out.dtype in (np.float32, np.float16):
             # fp16 weights: widen to fp32 for the literal text (lossless),
             # implicit narrow happens at compile time when initializing the
             # _Float16 array.
-            c_lines += _array_lines(arr)
+            c_lines += _array_lines(arr_out)
         else:
-            c_lines += _array_lines_int(arr)
+            c_lines += _array_lines_int(arr_out)
         c_lines.append("};")
         c_lines.append("")
     with open(os.path.join(out_dir, "weights.c"), "w") as f:
@@ -784,7 +1058,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             sh = op["shape"]
             q = op["quant"]
             call = (
-                f"kernel_linear_s8({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"parallel_linear_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']}, "
                 f"{q['input_offset']}, {q['filter_offset']}, "
                 f"{q['output_offset']}, "
@@ -802,7 +1076,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             sh = op["shape"]
             q = op["quant"]
             call = (
-                f"kernel_conv2d_s8({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"parallel_conv2d_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
                 f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
@@ -852,6 +1126,39 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_sigmoid_s8({in_ptr}, {out_ptr}, {n}, "
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "silu_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_silu_s8({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "upsample_nearest_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_upsample_nearest_s8({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['scale']})"
+            )
+        elif op["op"] in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
+            sh = op["shape"]
+            q = op["quant"]
+            in_ptrs = [ptr_for(inp, "in") for inp in op["inputs"]]
+            cs = sh["C_inputs"]
+            scales_in = q["scales_in"]
+            call = (
+                f"kernel_{op['op']}("
+                + ", ".join(
+                    f"{p}, {c}, {_f32(s)}"
+                    for p, c, s in zip(in_ptrs, cs, scales_in)
+                )
+                + f", {out_ptr}, {sh['N']}, {sh['H']}, {sh['W']}, "
+                f"{_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
         # ---- fp16 (half-precision) variants. Same dataflow as fp32 but
@@ -1165,14 +1472,20 @@ def emit_test_io(model_name: str, io_npz: str, out_dir: str) -> None:
         f.write("\n".join(h_lines))
 
 
-def generate(ir_path: str, weights_path: str, io_path: str, out_dir: str) -> None:
+def generate(
+    ir_path: str,
+    weights_path: str,
+    io_path: str,
+    out_dir: str,
+    backend: Optional[str] = None,
+) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
         ir = json.load(f)
     weights = dict(np.load(weights_path))
     model_name = ir["name"]
 
-    emit_weights(model_name, weights, out_dir)
+    emit_weights(model_name, weights, out_dir, backend=backend)
     emit_model(ir, out_dir)
     emit_test_io(model_name, io_path, out_dir)
 
@@ -1188,8 +1501,16 @@ def main() -> None:
     ap.add_argument("--weights", required=True, help="weights.npz")
     ap.add_argument("--io", required=True, help="io.npz")
     ap.add_argument("--out-dir", required=True, help="harness src/ dir")
+    ap.add_argument("--backend", default=None,
+                    help="HW backend tag (rvv, gemmini, scalar, ...). "
+                         "Used to apply per-backend weight-tensor layout "
+                         "transforms — gemmini permutes 4D conv weights "
+                         "from PyTorch OIHW to the flat HWIO layout that "
+                         "tiled_conv_auto consumes directly, eliminating "
+                         "the per-inference weight-transpose loop in the "
+                         "kernel. Other backends are pass-through.")
     args = ap.parse_args()
-    generate(args.ir, args.weights, args.io, args.out_dir)
+    generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend)
 
 
 if __name__ == "__main__":

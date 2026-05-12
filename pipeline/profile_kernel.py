@@ -83,7 +83,16 @@ def _west_build(
         cflags = backend.resolved_kernel_cflags(repo_root)
         cmd.append(f"-DAGENTS_KERNEL_CFLAGS={';'.join(cflags)}")
     env = os.environ.copy()
-    env["PATH"] = "/usr/bin:" + env.get("PATH", "")
+    # Ensure cmake is found (Vitis puts a broken cmake first in $PATH).
+    # Also ensure west is findable via AGENTS_WEST or the miniforge zephyr env.
+    _WEST_FALLBACK = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "tools", "miniforge3", "envs", "zephyr", "bin",
+    )
+    _extra = "/usr/bin"
+    if os.path.isdir(_WEST_FALLBACK):
+        _extra += os.pathsep + _WEST_FALLBACK
+    env["PATH"] = _extra + os.pathsep + env.get("PATH", "")
     proc = subprocess.run(
         cmd, cwd=repo_root, env=env, capture_output=True, text=True,
     )
@@ -104,11 +113,38 @@ def _west_build(
 
 
 def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
-    spike = find_spike()
+    # Gemmini backend needs a spike binary with --extension=gemmini support
+    # (the default /scratch2/dima/misc_sw/spike doesn't have it). Check
+    # AGENTS_GEMMINI_SPIKE first, then fall back to the chipyard toolchain.
+    _GEMMINI_SPIKE_FALLBACK = (
+        "/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike"
+    )
+    _GEMMINI_LIB_FALLBACK = (
+        "/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so"
+    )
+    if "--extension=gemmini" in backend.spike_args:
+        spike = os.environ.get("AGENTS_GEMMINI_SPIKE")
+        if not spike:
+            if os.path.exists(_GEMMINI_SPIKE_FALLBACK):
+                spike = _GEMMINI_SPIKE_FALLBACK
+            else:
+                spike = find_spike()
+        # Inject libgemmini.so into LD_LIBRARY_PATH if not already there
+        _lib_dir = os.path.dirname(
+            os.environ.get("AGENTS_GEMMINI_LIB", _GEMMINI_LIB_FALLBACK)
+        )
+        _env = os.environ.copy()
+        _env["LD_LIBRARY_PATH"] = (
+            _lib_dir + ":" + _env.get("LD_LIBRARY_PATH", "")
+        ).rstrip(":")
+    else:
+        spike = find_spike()
+        _env = None
     cmd = [spike, *backend.spike_args, elf]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True, timeout=timeout,
+            env=_env if _env is not None else None,
         )
     except subprocess.TimeoutExpired:
         # subprocess.run() kills the child before raising, so no cleanup needed.

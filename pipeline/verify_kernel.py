@@ -343,6 +343,30 @@ def _gen_inputs_sigmoid_s8(shape: dict, rng: np.random.Generator):
     return inp, out
 
 
+def _gen_inputs_silu_s8(shape: dict, rng: np.random.Generator):
+    n = shape["n"]
+    inp = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    out = np.zeros((n,), dtype=np.int8)
+    return inp, out
+
+
+def _gen_inputs_upsample_nearest_s8(shape: dict, rng: np.random.Generator):
+    N, C = shape["N"], shape["C"]
+    IH, IW, scale = shape["IH"], shape["IW"], shape["scale"]
+    inp = rng.integers(-128, 128, size=(N * C * IH * IW,), dtype=np.int8)
+    out = np.zeros((N * C * IH * scale * IW * scale,), dtype=np.int8)
+    return inp, out
+
+
+def _gen_inputs_cat_c1_s8(shape: dict, rng: np.random.Generator, n_inputs: int):
+    """Channel-cat int8 input set: n_inputs of shape (N, c_i, H, W)."""
+    N, H, W = shape["N"], shape["H"], shape["W"]
+    cs = list(shape["C_inputs"]) if "C_inputs" in shape else [shape[f"c{i}"] for i in range(n_inputs)]
+    arrs = [rng.integers(-128, 128, size=(N * c * H * W,), dtype=np.int8) for c in cs]
+    out = np.zeros((N * sum(cs) * H * W,), dtype=np.int8)
+    return (*arrs, out)
+
+
 def _fp(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
@@ -509,6 +533,29 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         fn(_i8p(inp), _i8p(out), shape["n"],
            ctypes.c_float(0.05), ctypes.c_float(0.01), 0, 127)
         return out
+    if op == "silu_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out), shape["n"],
+           ctypes.c_float(0.05), ctypes.c_float(0.05), -128, 127)
+        return out
+    if op == "upsample_nearest_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out),
+           shape["N"], shape["C"], shape["IH"], shape["IW"], shape["scale"])
+        return out
+    if op in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
+        n_inputs = int(op[3])
+        cs = list(shape["C_inputs"]) if "C_inputs" in shape else [shape[f"c{i}"] for i in range(n_inputs)]
+        ins = inputs[:n_inputs]
+        out = inputs[n_inputs]
+        flat_args = []
+        for src, c in zip(ins, cs):
+            flat_args.append(_i8p(src))
+            flat_args.append(c)
+            flat_args.append(ctypes.c_float(0.05))
+        fn(*flat_args, _i8p(out), shape["N"], shape["H"], shape["W"],
+           ctypes.c_float(0.05), -128, 127)
+        return out
     if op in ("matmul", "matmul_ta", "matmul_tb", "matmul_tatb"):
         A, B, C = inputs
         fn(_fp(A), _fp(B), _fp(C), shape["M"], shape["K"], shape["N"])
@@ -531,7 +578,9 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
 # Op kinds that produce integer outputs — verify must compare bit-exactly
 # (no atol/rtol tolerance) since integer math is deterministic.
 _INTEGER_OPS = {"linear_s8", "relu_s8", "conv2d_s8", "maxpool2d_s8",
-                "add_s8", "batchnorm2d_s8", "sigmoid_s8"}
+                "add_s8", "batchnorm2d_s8", "sigmoid_s8",
+                "silu_s8", "upsample_nearest_s8",
+                "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"}
 
 
 @dataclass
@@ -646,6 +695,12 @@ def verify(
                     inputs_ref = _gen_inputs_batchnorm2d_s8(shape, rng)
                 elif op == "sigmoid_s8":
                     inputs_ref = _gen_inputs_sigmoid_s8(shape, rng)
+                elif op == "silu_s8":
+                    inputs_ref = _gen_inputs_silu_s8(shape, rng)
+                elif op == "upsample_nearest_s8":
+                    inputs_ref = _gen_inputs_upsample_nearest_s8(shape, rng)
+                elif op in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
+                    inputs_ref = _gen_inputs_cat_c1_s8(shape, rng, int(op[3]))
                 elif op == "matmul":
                     inputs_ref = _gen_inputs_matmul(shape, rng)
                 elif op == "matmul_ta":
