@@ -5213,6 +5213,69 @@ void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
 )
 
 
+def _slice_c_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, IC, C_start, C_end, H, W,
+    # scale_in, scale_out, act_min, act_max
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+SLICE_C_S8 = KernelSpec(
+    op="slice_c_s8",
+    signature=(
+        "void kernel_slice_c_s8(const int8_t *input, int8_t *output, "
+        "int N, int IC, int C_start, int C_end, int H, int W, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Contiguous channel-axis slice of an NCHW int8 tensor:\n"
+        "  output[n, c-C_start, h, w] = round(\n"
+        "      input[n, c, h, w] * scale_in / scale_out)\n"
+        "for c in [C_start, C_end), result shape (N, C_end-C_start, H, W).\n"
+        "When scale_in == scale_out the body reduces to a memcpy of\n"
+        "(C_end - C_start) * H * W bytes per batch — the requantize tail\n"
+        "is structurally a no-op (round((x*s)/s) = x). Used by ViNT's\n"
+        "goal-encoder path: obs_img[:, 3*context_size:3*(context_size+1)]."
+    ),
+    reference_impl="""\
+void kernel_slice_c_s8(const int8_t *input, int8_t *output,
+                       int N, int IC, int C_start, int C_end, int H, int W,
+                       float scale_in, float scale_out,
+                       int activation_min, int activation_max) {
+    int OC = C_end - C_start;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < OC; c++) {
+            const int8_t *src = input  + ((n * IC + (c + C_start)) * H) * W;
+            int8_t       *dst = output + ((n * OC +  c)            * H) * W;
+            if (scale_in == scale_out) {
+                for (int i = 0; i < H * W; i++) dst[i] = src[i];
+            } else {
+                for (int i = 0; i < H * W; i++) {
+                    int32_t v = (int32_t)roundf(
+                        (float)src[i] * scale_in / scale_out);
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    dst[i] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 18, "C_start": 15, "C_end": 18, "H": 64, "W": 85},
+        {"N": 1, "IC": 32, "C_start": 0,  "C_end": 16, "H": 32, "W": 32},
+    ],
+    argtypes_factory=_slice_c_s8_argtypes,
+)
+
+
 def _softmax_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -5357,6 +5420,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "matmul_s8": MATMUL_S8,
     "softmax_s8": SOFTMAX_S8,
     "depthwise_conv2d_s8": DEPTHWISE_CONV2D_S8,
+    "slice_c_s8": SLICE_C_S8,
 }
 
 
