@@ -1,31 +1,33 @@
-"""Trajectory-space comparison: PyTorch fp32 vs our int8 (quant+dequant).
+"""Three-way trajectory comparison: PyTorch fp32 / int8 ceiling / spike actual.
 
-Element-wise int8 max_abs_err doesn't translate cleanly to "is this
-model still usable for navigation?". This script dequantizes the int8
-golden in io.npz back to fp32 using the output scales recorded in
-graph.json, then compares the waypoint sequences against the fp32
-PyTorch reference in the units the steering loop actually consumes
-(meters, degrees, rad/s).
+ViNT outputs a (1, 5, 4) waypoint tensor (cumsum'd (x, y) + L2-normalized
+(sin θ, cos θ)) plus a dist_pred scalar. There are three meaningful
+versions of those outputs on a given input:
 
-The output answers: "how much does our int8 forward bend the
-trajectory away from the fp32 baseline, in robot-frame coordinates?"
+ 1. PyTorch fp32 — the ground truth the trained model emits.
+ 2. "int8 representation ceiling" — quantize PyTorch fp32 to int8 with
+    our extracted output scales, then dequantize. This is what we'd see
+    if our int8 forward were magically bit-exact against PyTorch.
+ 3. Spike actual — the binary's output after running 354 int8 ops
+    through the EfficientNet body + transformer + composite tail.
+    Read from the AGENTS_OUTPUT_BEGIN/END block in the spike stdout.
+
+This script runs all three on the same input (the first calibration
+sample, which is also what io.npz pinned the golden against) and prints
+a side-by-side table in waypoint-space units.
 
 Run via:
-    conda activate xpurt
+    conda activate zephyr   # zephyr env has spike on PATH
     cd zephyr-chipyard-sw
+    # Build first if you haven't (bash agents/examples/vint/run.sh).
     PYTHONPATH=. python agents/examples/vint/compare_waypoints.py
-
-Outputs (per calibration sample):
-  * fp32 (x, y, θ) waypoints from PyTorch ViNT
-  * int8-quantized waypoints from io.npz
-  * per-waypoint position delta (meters)
-  * per-waypoint heading delta (degrees)
-  * pilot steering signal: ω from waypoint idx=2 atan2 + gain=2
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,101 +40,126 @@ if str(_VINT_TRAIN) not in sys.path:
     sys.path.insert(0, str(_VINT_TRAIN))
 
 
-def _dequantize(int8_arr: np.ndarray, scale: float) -> np.ndarray:
-    return int8_arr.astype(np.float32) * scale
+def _run_spike(elf: str, spike_bin: str) -> str:
+    """Run spike on the elf, return stdout text."""
+    res = subprocess.run(
+        [spike_bin, "--isa=rv64gcv_zicntr", elf],
+        capture_output=True, text=True, timeout=600,
+    )
+    return res.stdout + res.stderr
+
+
+def _parse_output_block(text: str) -> np.ndarray:
+    """Extract the fp32 values inside the AGENTS_OUTPUT_BEGIN/END markers
+    the harness emits (one float per line)."""
+    m = re.search(
+        r"=== AGENTS_OUTPUT_BEGIN ===\n(.*?)\n=== AGENTS_OUTPUT_END ===",
+        text, re.DOTALL,
+    )
+    if not m:
+        raise RuntimeError("no AGENTS_OUTPUT block in spike stdout — did "
+                           "the harness build with the dump enabled?")
+    vals = [float(line) for line in m.group(1).strip().split("\n") if line.strip()]
+    return np.asarray(vals, dtype=np.float32)
+
+
+def _apply_tail_to_fp32(deltas_fp32: np.ndarray) -> np.ndarray:
+    """Numpy mirror of the C kernel's tail (matches our reference impl)."""
+    deltas = deltas_fp32.reshape(5, 4)
+    out = np.zeros_like(deltas)
+    out[:, 0] = np.cumsum(deltas[:, 0])
+    out[:, 1] = np.cumsum(deltas[:, 1])
+    norms = np.linalg.norm(deltas[:, 2:], axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-12, None)
+    out[:, 2:] = deltas[:, 2:] / norms
+    return out
+
+
+def _print_wp_row(label: str, dist: float, wp_arr: np.ndarray, *,
+                  ref: np.ndarray | None = None):
+    """Print a (5, 4) waypoint table with optional Δ-vs-reference column."""
+    print(f"--- {label} ---")
+    print(f"  dist_pred = {dist:+.3f}")
+    hdr = f"  {'wp':>2s} | {'x':>8s} {'y':>8s} {'sin':>8s} {'cos':>8s}"
+    if ref is not None:
+        hdr += f" | {'Δpos':>8s} {'Δθ°':>7s}"
+    print(hdr)
+    for wp in range(5):
+        x, y, s, c = wp_arr[wp]
+        line = f"  {wp:>2d} | {x:+8.3f} {y:+8.3f} {s:+8.3f} {c:+8.3f}"
+        if ref is not None:
+            rx, ry, rs, rc = ref[wp]
+            dpos = float(np.hypot(x - rx, y - ry))
+            ang_a = np.degrees(np.arctan2(s, c))
+            ang_r = np.degrees(np.arctan2(rs, rc))
+            dtheta = abs(ang_a - ang_r)
+            if dtheta > 180: dtheta = 360 - dtheta
+            line += f" | {dpos:>7.3f}m {dtheta:>6.1f}"
+        print(line)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ir-dir", default="agents/examples/vint/int8/generated",
-                   help="dir containing graph.json + io.npz (output dir of "
-                        "extract_graph_export).")
-    p.add_argument("--n-samples", type=int, default=4,
-                   help="number of calibration samples to evaluate.")
-    p.add_argument("--waypoint-idx", type=int, default=2,
-                   help="which of ViNT's 5 waypoints to map to a steering "
-                        "command (matches pilot_forest_with_vint.py default).")
-    p.add_argument("--omega-gain", type=float, default=2.0,
-                   help="atan2(y,x) → ω gain, matching the pilot's default.")
+    p.add_argument("--build-dir",
+                   default="agents/examples/vint/int8/build/scalar")
+    p.add_argument("--ir-dir",
+                   default="agents/examples/vint/int8/generated")
+    p.add_argument("--spike",
+                   default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
+    p.add_argument("--waypoint-idx", type=int, default=2)
+    p.add_argument("--omega-gain", type=float, default=2.0)
     args = p.parse_args()
 
-    ir = json.load(open(Path(args.ir_dir) / "graph.json"))
-    io = np.load(Path(args.ir_dir) / "io.npz")
-    out_names = ir["output"]["tensors"]
-    out_scales = [ir["tensors"][n]["quant"]["scale"] for n in out_names]
-    # ViNT output layout: dist (1 elem, scale 0) + action (20 elem, scale 1).
-    if len(out_scales) != 2:
-        raise SystemExit(f"expected 2 output tensors, got {len(out_scales)}")
-    print(f"output scales: dist={out_scales[0]:.5f}  action={out_scales[1]:.5f}")
-    print(f"action int8 dynamic range: ±{127*out_scales[1]:.3f} (m)")
-    print()
+    elf = Path(args.build_dir) / "zephyr" / "zephyr.elf"
+    if not elf.exists():
+        sys.exit(f"build the binary first: bash agents/examples/vint/run.sh "
+                 f"(missing {elf})")
 
+    # ---- (1) PyTorch fp32 on the same input the binary saw ---------------
     from agents.models import vint as vint_mod
-    samples = vint_mod.get_calibration_samples(max(args.n_samples, 1))
+    samples = vint_mod.get_calibration_samples(1)
+    obs0, goal0 = samples[0]
     model = vint_mod.get_model()
+    with torch.no_grad():
+        dist_t, action_t = model(obs0, goal0)
+    fp32_dist = float(dist_t[0, 0])
+    fp32_wp = action_t[0].cpu().numpy()  # (5, 4), already cumsum'd by ViNT
 
-    # The int8 golden in io.npz was computed from samples[0] only —
-    # so the int8 row is meaningful only for sample 0; for the rest
-    # the script just prints fp32 baseline waypoints (useful to show
-    # how the fp32 trajectory varies across inputs).
-    int8_out = io["output"]   # int8 buffer for sample[0]
-    dist_int8_s0 = float(int8_out[0]) * out_scales[0]
-    # The io.npz "action" portion is the PRE-cumsum, PRE-normalize
-    # delta tensor (linear_24's output in ViNT) — the IR resolved
-    # `reshape_2` through the tail-op alias chain back to that
-    # captured intermediate. Apply the tail post-process in scalar
-    # here so the comparison matches what the pilot's steering
-    # consumes (cumsum'd waypoints + L2-normalized angle).
-    action_int8_deltas = (
-        int8_out[1:21].astype(np.float32) * out_scales[1]
-    ).reshape(5, 4)
-    action_int8_s0 = action_int8_deltas.copy()
-    # cumsum the (dx, dy) cols.
-    action_int8_s0[:, :2] = np.cumsum(action_int8_s0[:, :2], axis=0)
-    # L2-normalize the (sin, cos) cols.
-    n = np.linalg.norm(action_int8_s0[:, 2:], axis=1, keepdims=True)
-    n = np.clip(n, 1e-12, None)
-    action_int8_s0[:, 2:] = action_int8_s0[:, 2:] / n
+    # ---- (2) int8 representation ceiling ---------------------------------
+    # io.npz["output"] is the captured tensor (PyTorch fp32 at linear_24,
+    # which is the pre-tail intermediate), passed through our composite
+    # kernel's numpy oracle to apply cumsum + normalize. So this is the
+    # "perfect int8 forward" upper bound on accuracy.
+    io = np.load(Path(args.ir_dir) / "io.npz")
+    # io.npz["output"] is the composite's expected output (21 fp32):
+    ceil_dist = float(io["output"][0])
+    ceil_wp = io["output"][1:21].reshape(5, 4)
 
-    for i in range(args.n_samples):
-        obs, goal = samples[i]
-        with torch.no_grad():
-            dist_fp32, action_fp32 = model(obs, goal)
-        a_fp = action_fp32[0].cpu().numpy()
-        print(f"=== sample {i} ===   "
-              f"fp32 dist_pred = {float(dist_fp32[0,0]):+.3f}")
-        if i == 0:
-            print(f"  (int8 dist_pred = {dist_int8_s0:+.3f})")
-        header = (f"  {'wp':>2s} | {'fp32 (x,y)':>18s} | "
-                  f"{'int8 (x,y)':>18s} | Δpos(m) | "
-                  f"fp32_θ°  int8_θ°  Δθ°")
-        print(header)
-        for wp in range(5):
-            fx, fy, fs, fc = a_fp[wp]
-            fang = np.degrees(np.arctan2(fs, fc))
-            if i == 0:
-                ix, iy, isin, ico = action_int8_s0[wp]
-                iang = np.degrees(np.arctan2(isin, ico))
-                err = float(np.hypot(fx - ix, fy - iy))
-                print(f"  {wp:>2d} | ({fx:+6.3f},{fy:+6.3f})  | "
-                      f"({ix:+6.3f},{iy:+6.3f})  | {err:>6.3f}  | "
-                      f"{fang:+7.1f} {iang:+7.1f}  {abs(fang-iang):>5.1f}")
-            else:
-                print(f"  {wp:>2d} | ({fx:+6.3f},{fy:+6.3f})  | "
-                      f"{'-':>18s} | {'-':>6s}  | "
-                      f"{fang:+7.1f} {'-':>7s}  {'-':>5s}")
-        f_pick = a_fp[args.waypoint_idx]
-        f_omega = np.arctan2(f_pick[1], f_pick[0]) * args.omega_gain
-        if i == 0:
-            i_pick = action_int8_s0[args.waypoint_idx]
-            i_omega = np.arctan2(i_pick[1], i_pick[0]) * args.omega_gain
-            print(f"  pilot ω@idx{args.waypoint_idx}: "
-                  f"fp32={f_omega:+.3f}rad/s  int8={i_omega:+.3f}rad/s  "
-                  f"Δ={abs(f_omega - i_omega):.3f}rad/s")
-        else:
-            print(f"  pilot ω@idx{args.waypoint_idx}: "
-                  f"fp32={f_omega:+.3f}rad/s")
-        print()
+    # ---- (3) Spike actual output -----------------------------------------
+    print(f"running spike on {elf} ...", flush=True)
+    spike_text = _run_spike(str(elf), args.spike)
+    spike_arr = _parse_output_block(spike_text)
+    spike_dist = float(spike_arr[0])
+    spike_wp = spike_arr[1:21].reshape(5, 4)
+
+    # ---- Side-by-side ---------------------------------------------------
+    print()
+    _print_wp_row("PyTorch fp32 (ground truth)", fp32_dist, fp32_wp)
+    print()
+    _print_wp_row("int8 representation ceiling", ceil_dist, ceil_wp, ref=fp32_wp)
+    print()
+    _print_wp_row("spike actual output", spike_dist, spike_wp, ref=fp32_wp)
+
+    # Pilot steering signal at the chosen waypoint
+    pick = args.waypoint_idx
+    def _omega(wp):
+        return np.arctan2(wp[pick, 1], wp[pick, 0]) * args.omega_gain
+    print(f"\nPilot ω@wp{pick}:")
+    print(f"  fp32:   {_omega(fp32_wp):+.3f} rad/s")
+    print(f"  ceiling:{_omega(ceil_wp):+.3f} rad/s  Δ vs fp32 = "
+          f"{abs(_omega(ceil_wp) - _omega(fp32_wp)):.3f}")
+    print(f"  spike:  {_omega(spike_wp):+.3f} rad/s  Δ vs fp32 = "
+          f"{abs(_omega(spike_wp) - _omega(fp32_wp)):.3f}")
 
 
 if __name__ == "__main__":

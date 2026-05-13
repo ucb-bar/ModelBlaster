@@ -61,6 +61,24 @@ int main(void)
     printf("=== AGENTS_VERIFY === max_abs_err=%.9g max_rel_err=%.9g n=%d\n",
            (double)max_abs_err, (double)max_rel_err, MODEL_TEST_OUTPUT_LEN);
 
+    /* Optional: dump the raw model output buffer so the host can
+     * compare in domain-specific units (e.g. waypoint coordinates for
+     * a navigation policy, not int8 LSBs). Guarded on output size to
+     * avoid blowing past FIRESIM_TIMEOUT on detection-class models
+     * (yolov8's ~75k-element output would take ~10s over HTIF). The
+     * Per-element format is printf("%.9g\n", ...) — host parses one
+     * float per line between BEGIN / END markers. */
+#if !defined(AGENTS_DUMP_OUTPUT_MAX_ELEMS)
+#define AGENTS_DUMP_OUTPUT_MAX_ELEMS 256
+#endif
+    if (MODEL_TEST_OUTPUT_LEN <= AGENTS_DUMP_OUTPUT_MAX_ELEMS) {
+        printf("=== AGENTS_OUTPUT_BEGIN ===\n");
+        for (int i = 0; i < MODEL_TEST_OUTPUT_LEN; i++) {
+            printf("%.9g\n", (double)(float)model_output[i]);
+        }
+        printf("=== AGENTS_OUTPUT_END ===\n");
+    }
+
     /* Per-kernel profile (rdcycle deltas, populated by run_model). */
     int n_records = 0;
     const model_op_record_t *records = model_profile_records(&n_records);
