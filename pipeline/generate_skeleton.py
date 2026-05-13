@@ -1299,6 +1299,20 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['M']}, {sh['K']}, "
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])})"
             )
+        # ---- Application-specific composite ops ----
+        elif op["op"] == "vint_action_post":
+            dist_ptr = ptr_for(op["inputs"][0], "in")
+            deltas_ptr = ptr_for(op["inputs"][1], "in")
+            q = op["quant"]
+            # Output is fp32 — cast the buffer pointer; the buffer
+            # was sized fp32 because the IR's output tensor dtype is
+            # "f32".
+            call = (
+                f"kernel_vint_action_post({dist_ptr}, "
+                f"{_f32(q['scale_dist'])}, "
+                f"{deltas_ptr}, {_f32(q['scale_deltas'])}, "
+                f"(float *){out_ptr})"
+            )
         elif op["op"] == "slice_c_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]

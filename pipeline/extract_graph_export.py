@@ -1166,6 +1166,99 @@ def _get_attr_value(gm, qualname: str) -> torch.Tensor:
 # Top-level entry point.
 # ----------------------------------------------------------------------
 
+def _emit_vint_post_op(walker, out_dir):
+    """Emit the ViNT-specific composite post-process op.
+
+    Absorbs BOTH model outputs (the int8 dist_pred and the int8
+    delta-predictions tensor that feeds the cumsum + L2-normalize
+    tail) into one fp32 buffer the application consumes. Replaces
+    the original user-output names (linear_23, reshape_2) with a
+    single composite tensor (vint_combined_output).
+
+    Also captures a (inputs, output) tuple from the first
+    calibration sample for verify use (saved as
+    app_op_vint_action_post.npz alongside io.npz). This is the
+    oracle the curated kernel / LLM-gen works against — bit-exact
+    comparison against the captured PyTorch tail evaluation.
+    """
+    if "linear_24" not in walker.tensors or "linear_23" not in walker.tensors:
+        print("[extract_export] WARN: missing linear_23/linear_24 captures; "
+              "skipping vint_action_post emission.", flush=True)
+        return None
+    linear_23_t = walker.tensors["linear_23"]   # dist_pred raw
+    linear_24_t = walker.tensors["linear_24"]   # action_pred deltas raw
+    scale_dist = walker.scales["linear_23"]
+    scale_deltas = walker.scales["linear_24"]
+
+    # Reference fp32 tail evaluation (matches the C kernel below).
+    deltas = linear_24_t.detach().cpu().numpy().reshape(5, 4).astype(np.float32)
+    waypts = np.zeros_like(deltas)
+    waypts[:, 0] = np.cumsum(deltas[:, 0])
+    waypts[:, 1] = np.cumsum(deltas[:, 1])
+    norms = np.linalg.norm(deltas[:, 2:], axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-12, None)
+    waypts[:, 2:] = deltas[:, 2:] / norms
+    out_combined = np.concatenate([
+        np.array([float(linear_23_t.reshape(-1)[0]) * scale_dist],
+                 dtype=np.float32),
+        waypts.ravel().astype(np.float32),
+    ])
+
+    out_name = "vint_combined_output"
+    walker.tensors_meta[out_name] = {
+        "shape": [21],
+        "dtype": "f32",
+        "quant": {"scale": 1.0, "zero_point": 0,
+                  "kind": "app_op_composite"},
+    }
+    walker.tensors[out_name] = torch.from_numpy(out_combined)
+    walker.ops.append({
+        "name": "vint_action_post",
+        "op": "vint_action_post",
+        "inputs": ["linear_23", "linear_24"],
+        "outputs": [out_name],
+        "shape": {"n_wp": 5, "n_dim": 4},
+        "quant": {
+            "scale_dist":   float(scale_dist),
+            "scale_deltas": float(scale_deltas),
+            # No scale_out — output is fp32.
+        },
+        "semantics": {
+            "description": (
+                "ViNT action post: dequant dist_pred + cumsum action_pred "
+                "(dx, dy) + L2-normalize (sin, cos), pack into one fp32 "
+                "buffer."),
+            "source_subgraph": [
+                "cumsum.default(dim=1)",
+                "linalg_vector_norm(dim=-1)",
+                "clamp_min(eps=1e-12)",
+                "div.Tensor",
+                "tuple-pack dist_pred + action_pred",
+            ],
+            "io_samples": "app_op_vint_action_post.npz",
+        },
+    })
+    # Capture (input1, input2, output) for the verify oracle.
+    in_dist = _quantize_per_tensor_sym(linear_23_t, scale_dist).ravel()
+    in_deltas = _quantize_per_tensor_sym(linear_24_t, scale_deltas).ravel()
+    np.savez(
+        Path(out_dir) / "app_op_vint_action_post.npz",
+        input_dist=in_dist,
+        input_deltas=in_deltas,
+        scale_dist=np.float32(scale_dist),
+        scale_deltas=np.float32(scale_deltas),
+        output=out_combined,
+    )
+    # The composite op's output IS the new surface output of the
+    # model; the caller (main) replaces output_names with [out_name]
+    # so downstream codegen / io.npz / emit_test_io see one fp32
+    # tensor instead of (int8 dist + fp32 waypoints) mixed.
+    # We deliberately do NOT touch linear_23 / linear_24 / reshape_2
+    # metadata — those remain int8 intermediate compute buffers the
+    # linear_s8_pc kernels write to.
+    return out_name
+
+
 def _import_model_module(name: str):
     if name == "vint":
         from agents.models import vint as model_mod
@@ -1293,6 +1386,20 @@ def main():
             packed.append({"name": nm, "offset": off, "size": sz})
             off += sz
         ir_input = {"tensor": input_names[0], "packed_inputs": packed}
+    # Application-specific composite post-process emission. For
+    # models that declare model-specific tail behavior (cumsum +
+    # normalize + reshape kinds of patterns), emit one or more
+    # composite `app_op_*` IR records here. The walker has already
+    # captured the relevant intermediate tensors, so we just bundle
+    # them into IR records with semantics info the codegen can use to
+    # look up a curated kernel (or eventually drive LLM-gen).
+    if args.model == "vint":
+        composite_out = _emit_vint_post_op(walker, out_dir)
+        if composite_out is not None:
+            # Replace the original user-output names with the composite
+            # — the binary now exposes a single fp32 surface output.
+            output_names = [composite_out]
+
     dispatches = _annotate_dispatches(walker.ops)
     ir = {
         "name": args.model,
@@ -1349,16 +1456,15 @@ def main():
     in_dtype = np.int8 if args.quant == "int8" else np.float32
     inp_flat = np.concatenate(in_parts).astype(in_dtype)
 
-    # Output: resolve each output name through the alias map first —
-    # tail ops (cumsum, F.normalize, final reshape) were elided from
-    # the IR via alias passthrough, so the user-facing surface output
-    # name (e.g. ViNT's `reshape_2`) actually maps to the upstream
-    # pre-tail compute node (`linear_24` for ViNT's action_pred).
-    # Quantize that captured intermediate with its own per-tensor
-    # scale — the same scale the binary's last actual dispatch
-    # writes its int8 values with. This keeps the int8 golden and
-    # the binary's output bit-for-bit comparable.
+    # Output: resolve each output name through the alias map; collect
+    # each as its native fp32/int8 array. If all parts share one
+    # dtype, concatenate as that dtype so emit_test_io maps to a
+    # proper C array. If mixed (int8 + fp32), pack as raw bytes — but
+    # the harness side needs to know the layout, which we encode in
+    # ir["output"]["tensors"] order so generate_skeleton can lay out a
+    # struct or sized buffer.
     out_parts: list[np.ndarray] = []
+    out_summary: list[str] = []
     for out_name_i in output_names:
         resolved = walker.name_map.get(out_name_i, out_name_i)
         captured = walker.tensors.get(resolved)
@@ -1366,18 +1472,36 @@ def main():
             raise SystemExit(
                 f"output tensor {out_name_i!r} (resolved to {resolved!r}) "
                 f"not captured during calibration; cannot emit io.npz golden")
-        sc = walker.scales.get(resolved, 1e-8)
-        if args.quant == "int8":
-            out_parts.append(_quantize_per_tensor_sym(captured, sc).ravel())
+        meta = walker.tensors_meta.get(resolved, {})
+        dtype = meta.get("dtype", "i8" if args.quant == "int8" else "f32")
+        if dtype == "f32" or args.quant != "int8":
+            arr = captured.detach().cpu().numpy().ravel().astype(np.float32)
+            out_parts.append(arr)
+            out_summary.append(f"{resolved}={arr.size}f32")
         else:
-            out_parts.append(
-                captured.detach().cpu().numpy().ravel().astype(np.float32))
-    out_flat = np.concatenate(out_parts).astype(in_dtype)
+            sc = walker.scales.get(resolved, 1e-8)
+            arr = _quantize_per_tensor_sym(captured, sc).ravel()
+            out_parts.append(arr)
+            out_summary.append(f"{resolved}={arr.size}i8")
+    # Choose the concatenated dtype: if every part is fp32, store as
+    # fp32 so emit_test_io maps it to a float array. If every part is
+    # int8, store as int8. Mixed-dtype outputs aren't reachable
+    # today (composite app_ops absorb everything to one dtype) — if
+    # they appear later, we'd need a packed-struct convention.
+    if all(a.dtype == np.float32 for a in out_parts):
+        out_flat = np.concatenate(out_parts).astype(np.float32)
+    elif all(a.dtype == np.int8 for a in out_parts):
+        out_flat = np.concatenate(out_parts).astype(np.int8)
+    else:
+        dtypes = sorted({str(a.dtype) for a in out_parts})
+        raise NotImplementedError(
+            f"mixed-dtype outputs not packed yet: {dtypes}. Absorb them "
+            f"into a single composite app_op so the surface is uniform.")
     io_path = out_dir / "io.npz"
     np.savez(io_path, input=inp_flat, output=out_flat)
     print(f"[extract_export] wrote {io_path} "
           f"(input {inp_flat.size} {in_dtype.__name__}, "
-          f"output {out_flat.size} {in_dtype.__name__})",
+          f"output {out_flat.size} bytes [{', '.join(out_summary)}])",
           flush=True)
 
 
