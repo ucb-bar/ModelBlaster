@@ -42,10 +42,12 @@ import torch
 # extractor. Keeps the on-disk format identical (downstream codegen +
 # verify don't have to know which extractor produced the IR).
 from agents.pipeline.extract_graph import (  # noqa: E402
+    _annotate_dispatches,
     _CaptureTensors,
     _INT8_RANGE,  # noqa: F401  — used implicitly via _scale_from_max_abs
     _scale_from_max_abs,
     _quantize_per_tensor_sym,
+    _requantize_multiplier_shift,
 )
 
 
@@ -663,11 +665,17 @@ class _ExportWalker:
         out_scale = self.scales.get(post_name, 1e-8)
 
         w_q = _quantize_per_tensor_sym(w, w_scale)
-        weights_key = f"{n.name}.weights"
-        self.weights_blob[weights_key] = w_q
+        w_key = f"{n.name}.weights"
+        self.weights_blob[w_key] = w_q
+        b_key = None
         if b is not None:
             b_q = (b.detach().cpu().numpy() / (in_scale * w_scale)).round().astype(np.int32)
-            self.weights_blob[f"{n.name}.bias"] = b_q
+            b_key = f"{n.name}.bias"
+            self.weights_blob[b_key] = b_q
+
+        # Q0.31 requantize: real_mult = (in_scale * w_scale) / out_scale.
+        real_mult = (in_scale * w_scale) / max(out_scale, 1e-30)
+        multiplier, shift = _requantize_multiplier_shift(real_mult)
 
         self._record_tensor(post_name)
         rec = {
@@ -675,6 +683,8 @@ class _ExportWalker:
             "op": op_kind,
             "inputs": [in_name],
             "outputs": [post_name],
+            "weight": w_key,
+            "bias": b_key,
             "shape": {
                 "N": int(self.tensors[post_name].shape[0]),
                 "IC": int(w.shape[1] if not is_depthwise else 1),
@@ -687,14 +697,13 @@ class _ExportWalker:
                 "groups": int(groups),
             },
             "quant": {
-                "scale_in":   in_scale,
-                "scale_w":    w_scale,
-                "scale_out":  out_scale,
-                "input_offset":  0,
-                "filter_offset": 0,
-                "output_offset": 0,
-                "weights_key": weights_key,
-                "bias_key": f"{n.name}.bias" if b is not None else None,
+                "input_offset":     0,
+                "filter_offset":    0,
+                "output_offset":    0,
+                "output_multiplier": multiplier,
+                "output_shift":      shift,
+                "activation_min":   -128,
+                "activation_max":    127,
             },
         }
         self.ops.append(rec)
@@ -709,24 +718,38 @@ class _ExportWalker:
         in_scale = self.scales.get(in_name, 1e-8)
         out_scale = self.scales.get(out_name, 1e-8)
         w_scale = _scale_from_max_abs(w)
-        self.weights_blob[f"{n.name}.weights"] = _quantize_per_tensor_sym(w, w_scale)
+        w_key = f"{n.name}.weights"
+        self.weights_blob[w_key] = _quantize_per_tensor_sym(w, w_scale)
+        b_key = None
         if b is not None:
-            self.weights_blob[f"{n.name}.bias"] = (
+            b_key = f"{n.name}.bias"
+            self.weights_blob[b_key] = (
                 b.detach().cpu().numpy() / (in_scale * w_scale)
             ).round().astype(np.int32)
+        real_mult = (in_scale * w_scale) / max(out_scale, 1e-30)
+        multiplier, shift = _requantize_multiplier_shift(real_mult)
+        # linear_s8 is M×K @ K×N with M = product of leading dims of
+        # the input. For ViNT the transformer FFN linears see M = seq
+        # × batch.
+        in_shape = self.tensors[in_name].shape
+        M = 1
+        for d in in_shape[:-1]: M *= int(d)
         self.ops.append({
             "name": str(n.name),
             "op": "linear_s8",
             "inputs": [in_name],
             "outputs": [out_name],
-            "shape": {"M": 1, "K": int(IF), "N": int(OF)},
+            "weight": w_key,
+            "bias": b_key,
+            "shape": {"M": M, "K": int(IF), "N": int(OF)},
             "quant": {
-                "scale_in": in_scale,
-                "scale_w":  w_scale,
-                "scale_out": out_scale,
-                "input_offset": 0, "filter_offset": 0, "output_offset": 0,
-                "weights_key": f"{n.name}.weights",
-                "bias_key": f"{n.name}.bias" if b is not None else None,
+                "input_offset":     0,
+                "filter_offset":    0,
+                "output_offset":    0,
+                "output_multiplier": multiplier,
+                "output_shift":      shift,
+                "activation_min":   -128,
+                "activation_max":    127,
             },
         })
 
@@ -775,14 +798,32 @@ class _ExportWalker:
         self._record_tensor(out_name)
         n_inputs = len(names)
         op_kind = f"cat{n_inputs}_c{dim}_s8" if n_inputs <= 4 else f"cat_n_c{dim}_s8"
+        # Build the shape dict the cat_*_s8 codegen expects:
+        # {N, H, W, C_inputs: [c_0, c_1, ...]} for 4-D cat along
+        # channel dim. Per-input C is the dim==1 size of each operand.
+        out_shape = list(self.tensors[out_name].shape)
+        shape: dict = {}
+        if len(out_shape) == 4:
+            shape["N"] = int(out_shape[0])
+            shape["H"] = int(out_shape[2])
+            shape["W"] = int(out_shape[3])
+            shape["C_total"] = int(out_shape[1])
+            shape["C_inputs"] = [
+                int(self.tensors[nm].shape[dim]) if nm in self.tensors else 0
+                for nm in names
+            ]
+        else:
+            shape = dict(self._shape_kv(out_name))
         self.ops.append({
             "name": str(n.name), "op": op_kind,
             "inputs": names, "outputs": [out_name],
-            "shape": dict(self._shape_kv(out_name)),
+            "shape": shape,
             "quant": {
                 "scales_in": [self.scales.get(nm, 1e-8) for nm in names],
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "dim": dim,
+                "activation_min": -128,
+                "activation_max": 127,
             },
         })
 
@@ -979,12 +1020,34 @@ def main():
     output_names = [s.arg.name for s in sig.output_specs
                     if hasattr(s, "arg") and s.kind.name == "USER_OUTPUT"]
 
+    # Match the IR shape generate_skeleton consumes (see
+    # extract_graph::extract_int8 for the canonical form):
+    # * ir["input"] is {"tensor": <first_name>, "packed_inputs": [...]}
+    #   for multi-input; just {"tensor": <name>} for single-input.
+    # * ir["output"] is {"tensor": <name>, "tensors": [<names>]}.
+    if len(input_names) == 1:
+        ir_input: dict = {"tensor": input_names[0]}
+    else:
+        packed: list[dict] = []
+        off = 0
+        for nm in input_names:
+            sz = int(np.prod(walker.tensors_meta[nm]["shape"]))
+            packed.append({"name": nm, "offset": off, "size": sz})
+            off += sz
+        ir_input = {"tensor": input_names[0], "packed_inputs": packed}
+    dispatches = _annotate_dispatches(walker.ops)
     ir = {
         "name": args.model,
-        "input": input_names[0] if len(input_names) == 1 else input_names,
-        "output": output_names[0] if len(output_names) == 1 else output_names,
+        "version": 1,
+        "quant": args.quant,
+        "input": ir_input,
+        "output": {
+            "tensors": output_names,
+            "tensor": output_names[0] if len(output_names) == 1 else None,
+        },
         "tensors": walker.tensors_meta,
         "ops": walker.ops,
+        "dispatches": dispatches,
     }
 
     graph_path = out_dir / "graph.json"
