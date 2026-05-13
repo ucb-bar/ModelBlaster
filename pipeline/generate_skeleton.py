@@ -1161,6 +1161,91 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        # ---- ViNT s8 ops ----
+        elif op["op"] == "mul_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_mul_s8({a_ptr}, {b_ptr}, {out_ptr}, {n}, "
+                f"{_f32(q['scale_a'])}, {_f32(q['scale_b'])}, "
+                f"{_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "gelu_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_gelu_s8({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "pad_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_pad_s8({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['pad_left']}, {sh['pad_right']}, "
+                f"{sh['pad_top']}, {sh['pad_bottom']}, "
+                f"{q.get('pad_value', 0)})"
+            )
+        elif op["op"] == "adaptive_avg_pool2d_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_adaptive_avg_pool2d_s8({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OH']}, {sh['OW']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "layer_norm_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            gamma = _weight_name(model_name, q["gamma_key"]) if q.get("gamma_key") else "NULL"
+            beta = _weight_name(model_name, q["beta_key"]) if q.get("beta_key") else "NULL"
+            call = (
+                f"kernel_layer_norm_s8({in_ptr}, {gamma}, {beta}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_gamma'])}, "
+                f"{_f32(q['scale_beta'])}, {_f32(q['scale_out'])}, "
+                f"{_f32(q.get('eps', 1e-5))}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "matmul_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_matmul_s8({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{_f32(q['scale_a'])}, {_f32(q['scale_b'])}, "
+                f"{_f32(q['scale_out'])}, "
+                f"{int(q.get('transpose_b', 0))}, "
+                f"{_f32(q.get('scale_div_sqrt_dk', 1.0))}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "softmax_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_softmax_s8({in_ptr}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])})"
+            )
         # ---- fp16 (half-precision) variants. Same dataflow as fp32 but
         #      the kernel signature takes _Float16 storage. No quantization
         #      knobs — that's what fp16 is FOR. ----
