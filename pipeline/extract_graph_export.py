@@ -802,6 +802,18 @@ class _ExportWalker:
         out_name = n.name
         self._record_tensor(out_name)
         n_inputs = len(names)
+        # Layout-reinterpret special case: all inputs resolved to the
+        # same upstream tensor name (typical for ViNT's split-then-
+        # concat pattern that just shuffles the leading dims of obs_img
+        # — the underlying memory is the same). Emit an alias so the
+        # codegen reuses the source buffer with the concat's new
+        # logical shape; no kernel call.
+        if all(nm == names[0] for nm in names) and names[0] in self.tensors:
+            src_size = int(np.prod(self.tensors[names[0]].shape))
+            out_size = int(np.prod(self.tensors[out_name].shape))
+            if src_size == out_size:
+                self.name_map[out_name] = self.name_map.get(names[0], names[0])
+                return
         op_kind = f"cat{n_inputs}_c{dim}_s8" if n_inputs <= 4 else f"cat_n_c{dim}_s8"
         # Build the shape dict the cat_*_s8 codegen expects:
         # {N, H, W, C_inputs: [c_0, c_1, ...]} for 4-D cat along
