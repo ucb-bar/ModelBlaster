@@ -1161,6 +1161,41 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        # ---- ViNT per-channel weight-scale variants (Phase B.2) ----
+        elif op["op"] == "conv2d_s8_pc":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"])
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"])
+            call = (
+                f"kernel_conv2d_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{mult}, {shift}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "linear_s8_pc":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"])
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"])
+            call = (
+                f"kernel_linear_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{mult}, {shift}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
         # ---- ViNT s8 ops ----
         elif op["op"] == "depthwise_conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
