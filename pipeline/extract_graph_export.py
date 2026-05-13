@@ -192,9 +192,14 @@ class _ExportWalker:
     """
 
     def __init__(self, ep, calibration_tensors: list[dict[str, torch.Tensor]],
-                 input_order: list[str]):
+                 input_order: list[str], per_channel: bool = False):
         self.ep = ep
         self.gm = ep.graph_module
+        # When True, conv2d / linear / matmul emit their per-channel
+        # weight-scale variants (one Q0.31 multiplier + shift per
+        # output channel) instead of the per-tensor form. Activations
+        # remain per-tensor symmetric.
+        self.per_channel = per_channel
         # Aten graph runs over ``flat_args`` (placeholders include
         # params, buffers, then user inputs). The ExportedProgram knows
         # how to materialize those for us via ``module()``.
@@ -224,10 +229,26 @@ class _ExportWalker:
         self.name_map: dict[str, str] = {}
 
     # ------------------------------------------------------------------
-    # Phase 1: run the model, capture every tensor + accumulate max-abs.
+    # Phase 1: run the model, capture every tensor's value distribution,
+    # then derive per-tensor activation scales. Two modes:
+    #   * max_abs  — scale = max(|t|) / 127  (default; tight but
+    #                outlier-sensitive)
+    #   * percentile — scale = quantile(|t|, p) / 127  (clips outliers,
+    #                better typical-range precision)
+    # The percentile mode is controlled by AGENTS_ACT_PERCENTILE env
+    # var (e.g. 99.99 for 99.99th percentile). Defaults to None
+    # (max_abs).
     # ------------------------------------------------------------------
     def calibrate(self):
+        import os as _os
+        pct_env = _os.environ.get("AGENTS_ACT_PERCENTILE", "")
+        pct = float(pct_env) if pct_env else None
         max_abs: dict[str, float] = {}
+        # When percentile mode is active, accumulate sorted samples of
+        # the absolute values per tensor (capped at 1000 elements per
+        # sample to bound memory) so we can compute the percentile
+        # across the whole calibration set.
+        pct_samples: dict[str, list] = {}
         captured_first: dict[str, torch.Tensor] = {}
         for i, sample in enumerate(self.calib):
             # ep.module() returns a callable Module; we call it with
@@ -258,14 +279,31 @@ class _ExportWalker:
             for nname, t in cap.tensors.items():
                 if not isinstance(t, torch.Tensor):
                     continue
-                m = float(t.detach().abs().max().item())
+                abs_t = t.detach().abs()
+                m = float(abs_t.max().item())
                 if nname not in max_abs or m > max_abs[nname]:
                     max_abs[nname] = m
+                if pct is not None:
+                    flat = abs_t.flatten()
+                    # Subsample large tensors to keep memory bounded.
+                    if flat.numel() > 2048:
+                        idx = torch.randperm(flat.numel())[:2048]
+                        flat = flat[idx]
+                    pct_samples.setdefault(nname, []).extend(
+                        flat.cpu().tolist())
             if i == 0:
                 captured_first = dict(cap.tensors)
         self.tensors = captured_first
         for nname, m in max_abs.items():
-            self.scales[nname] = max(m, 1e-8) / 127.0
+            if pct is not None and nname in pct_samples and pct_samples[nname]:
+                # Percentile-based scale: clip outliers above the
+                # configured quantile so the typical-range precision
+                # isn't wasted on rare spikes.
+                arr = np.asarray(pct_samples[nname], dtype=np.float32)
+                clip = float(np.percentile(arr, pct))
+                self.scales[nname] = max(clip, 1e-8) / 127.0
+            else:
+                self.scales[nname] = max(m, 1e-8) / 127.0
         # Input placeholders aren't in cap.tensors — seed their scales
         # from the first calibration sample directly.
         first = self.calib[0]
@@ -664,24 +702,60 @@ class _ExportWalker:
                 in_name = self._resolve_input(pad_node)
 
         is_depthwise = (groups == OC and groups != 1)
-        op_kind = "depthwise_conv2d_s8" if is_depthwise else "conv2d_s8"
-
-        w_scale = _scale_from_max_abs(w)
         in_scale = self.scales.get(in_name, 1e-8)
         out_scale = self.scales.get(post_name, 1e-8)
 
-        w_q = _quantize_per_tensor_sym(w, w_scale)
-        w_key = f"{n.name}.weights"
-        self.weights_blob[w_key] = w_q
-        b_key = None
-        if b is not None:
-            b_q = (b.detach().cpu().numpy() / (in_scale * w_scale)).round().astype(np.int32)
-            b_key = f"{n.name}.bias"
-            self.weights_blob[b_key] = b_q
-
-        # Q0.31 requantize: real_mult = (in_scale * w_scale) / out_scale.
-        real_mult = (in_scale * w_scale) / max(out_scale, 1e-30)
-        multiplier, shift = _requantize_multiplier_shift(real_mult)
+        # Per-channel weight scale: one scale per output channel.
+        # Depthwise stays per-tensor for now — its kernel doesn't yet
+        # accept per-channel arrays and it's a smaller accuracy win
+        # (per-channel matters most where output dim is large; depthwise
+        # outputs are typically small after the channel mix).
+        use_pc = self.per_channel and not is_depthwise
+        if use_pc:
+            # Per-OC max_abs over the (IC, KH, KW) dims that contribute
+            # to each OC.
+            w_np = w.detach().cpu().numpy()
+            per_oc_max = np.abs(w_np).reshape(OC, -1).max(axis=1)
+            w_scales_per_oc = np.maximum(per_oc_max, 1e-8) / 127.0
+            w_q = np.empty_like(w_np, dtype=np.int8)
+            for oc in range(OC):
+                w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)
+            op_kind = "conv2d_s8_pc"
+            w_key = f"{n.name}.weights"
+            self.weights_blob[w_key] = w_q
+            b_key = None
+            if b is not None:
+                b_np = b.detach().cpu().numpy()
+                b_q = np.zeros(OC, dtype=np.int32)
+                for oc in range(OC):
+                    b_q[oc] = int(round(b_np[oc] / (in_scale * w_scales_per_oc[oc])))
+                b_key = f"{n.name}.bias"
+                self.weights_blob[b_key] = b_q
+            mult_arr = np.zeros(OC, dtype=np.int32)
+            shift_arr = np.zeros(OC, dtype=np.int32)
+            for oc in range(OC):
+                real_mult = (in_scale * float(w_scales_per_oc[oc])) / max(out_scale, 1e-30)
+                m, s = _requantize_multiplier_shift(real_mult)
+                mult_arr[oc] = m
+                shift_arr[oc] = s
+            mult_key = f"{n.name}.output_multiplier_per_oc"
+            shift_key = f"{n.name}.output_shift_per_oc"
+            self.weights_blob[mult_key] = mult_arr
+            self.weights_blob[shift_key] = shift_arr
+        else:
+            op_kind = "depthwise_conv2d_s8" if is_depthwise else "conv2d_s8"
+            w_scale = _scale_from_max_abs(w)
+            w_q = _quantize_per_tensor_sym(w, w_scale)
+            w_key = f"{n.name}.weights"
+            self.weights_blob[w_key] = w_q
+            b_key = None
+            if b is not None:
+                b_q = (b.detach().cpu().numpy() / (in_scale * w_scale)).round().astype(np.int32)
+                b_key = f"{n.name}.bias"
+                self.weights_blob[b_key] = b_q
+            real_mult = (in_scale * w_scale) / max(out_scale, 1e-30)
+            multiplier, shift = _requantize_multiplier_shift(real_mult)
+            mult_key = shift_key = None
 
         self._record_tensor(post_name)
         rec = {
@@ -706,12 +780,16 @@ class _ExportWalker:
                 "input_offset":     0,
                 "filter_offset":    0,
                 "output_offset":    0,
-                "output_multiplier": multiplier,
-                "output_shift":      shift,
                 "activation_min":   -128,
                 "activation_max":    127,
             },
         }
+        if use_pc:
+            rec["quant"]["output_multiplier_per_oc_key"] = mult_key
+            rec["quant"]["output_shift_per_oc_key"] = shift_key
+        else:
+            rec["quant"]["output_multiplier"] = multiplier
+            rec["quant"]["output_shift"] = shift
         self.ops.append(rec)
 
     def _emit_linear(self, n):
@@ -723,40 +801,70 @@ class _ExportWalker:
         self._record_tensor(out_name)
         in_scale = self.scales.get(in_name, 1e-8)
         out_scale = self.scales.get(out_name, 1e-8)
-        w_scale = _scale_from_max_abs(w)
-        w_key = f"{n.name}.weights"
-        self.weights_blob[w_key] = _quantize_per_tensor_sym(w, w_scale)
-        b_key = None
-        if b is not None:
-            b_key = f"{n.name}.bias"
-            self.weights_blob[b_key] = (
-                b.detach().cpu().numpy() / (in_scale * w_scale)
-            ).round().astype(np.int32)
-        real_mult = (in_scale * w_scale) / max(out_scale, 1e-30)
-        multiplier, shift = _requantize_multiplier_shift(real_mult)
-        # linear_s8 is M×K @ K×N with M = product of leading dims of
-        # the input. For ViNT the transformer FFN linears see M = seq
-        # × batch.
         in_shape = self.tensors[in_name].shape
         M = 1
         for d in in_shape[:-1]: M *= int(d)
+
+        w_key = f"{n.name}.weights"
+        b_key = f"{n.name}.bias" if b is not None else None
+
+        if self.per_channel:
+            w_np = w.detach().cpu().numpy()
+            per_oc_max = np.abs(w_np).reshape(OF, -1).max(axis=1)
+            w_scales_per_oc = np.maximum(per_oc_max, 1e-8) / 127.0
+            w_q = np.empty_like(w_np, dtype=np.int8)
+            for oc in range(OF):
+                w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)
+            self.weights_blob[w_key] = w_q
+            if b is not None:
+                b_np = b.detach().cpu().numpy()
+                b_q = np.zeros(OF, dtype=np.int32)
+                for oc in range(OF):
+                    b_q[oc] = int(round(b_np[oc] / (in_scale * w_scales_per_oc[oc])))
+                self.weights_blob[b_key] = b_q
+            mult_arr = np.zeros(OF, dtype=np.int32)
+            shift_arr = np.zeros(OF, dtype=np.int32)
+            for oc in range(OF):
+                real_mult = (in_scale * float(w_scales_per_oc[oc])) / max(out_scale, 1e-30)
+                m, s = _requantize_multiplier_shift(real_mult)
+                mult_arr[oc] = m
+                shift_arr[oc] = s
+            mult_key = f"{n.name}.output_multiplier_per_oc"
+            shift_key = f"{n.name}.output_shift_per_oc"
+            self.weights_blob[mult_key] = mult_arr
+            self.weights_blob[shift_key] = shift_arr
+            quant = {
+                "input_offset": 0, "filter_offset": 0, "output_offset": 0,
+                "output_multiplier_per_oc_key": mult_key,
+                "output_shift_per_oc_key": shift_key,
+                "activation_min": -128, "activation_max": 127,
+            }
+            op_kind = "linear_s8_pc"
+        else:
+            w_scale = _scale_from_max_abs(w)
+            self.weights_blob[w_key] = _quantize_per_tensor_sym(w, w_scale)
+            if b is not None:
+                self.weights_blob[b_key] = (
+                    b.detach().cpu().numpy() / (in_scale * w_scale)
+                ).round().astype(np.int32)
+            real_mult = (in_scale * w_scale) / max(out_scale, 1e-30)
+            multiplier, shift = _requantize_multiplier_shift(real_mult)
+            quant = {
+                "input_offset": 0, "filter_offset": 0, "output_offset": 0,
+                "output_multiplier": multiplier,
+                "output_shift": shift,
+                "activation_min": -128, "activation_max": 127,
+            }
+            op_kind = "linear_s8"
         self.ops.append({
             "name": str(n.name),
-            "op": "linear_s8",
+            "op": op_kind,
             "inputs": [in_name],
             "outputs": [out_name],
             "weight": w_key,
             "bias": b_key,
             "shape": {"M": M, "K": int(IF), "N": int(OF)},
-            "quant": {
-                "input_offset":     0,
-                "filter_offset":    0,
-                "output_offset":    0,
-                "output_multiplier": multiplier,
-                "output_shift":      shift,
-                "activation_min":   -128,
-                "activation_max":    127,
-            },
+            "quant": quant,
         })
 
     def _emit_relu(self, n):
@@ -1085,6 +1193,11 @@ def main():
     p.add_argument("--inventory-only", action="store_true",
                    help="Only print the aten-op classification report; "
                         "don't emit IR.")
+    p.add_argument("--per-channel", action="store_true",
+                   help="Enable per-channel weight-scale quant for conv2d "
+                        "and linear ops (one Q0.31 multiplier+shift per "
+                        "output channel). Big accuracy win on trained "
+                        "models — recommended for any int8 deployment.")
     p.add_argument("--num-calibration", type=int, default=1,
                    help="Number of calibration samples (currently uses the "
                         "model's get_sample_input() repeatedly with fresh "
@@ -1147,7 +1260,8 @@ def main():
         {name: t for name, t in zip(input_order, s)}
         for s in calib_samples_tuples
     ]
-    walker = _ExportWalker(ep, calib_dicts, input_order)
+    walker = _ExportWalker(ep, calib_dicts, input_order,
+                           per_channel=args.per_channel)
     print(f"[extract_export] calibrating + capturing intermediates ...",
           flush=True)
     walker.calibrate()

@@ -5111,6 +5111,257 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
 )
 
 
+# ---------------------------------------------------------------------------
+# Per-channel weight-scale (PC) variants of conv2d_s8 / linear_s8 / matmul_s8.
+# Identical algebra to the per-tensor versions except output_multiplier and
+# output_shift become per-OC arrays. This is the standard CMSIS-NN / TFLite
+# Micro shape: weight tensors carry per-channel scales (one per output
+# channel for conv/linear, one per N column for matmul); the int32 bias is
+# scaled by (input_scale * weight_scale_per_oc); the requantize tail picks
+# the OC-specific (mult, shift) for each output element.
+# ---------------------------------------------------------------------------
+
+
+def _conv2d_s8_pc_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            i32p, i32p,    # per-OC multiplier + shift arrays
+            ctypes.c_int, ctypes.c_int]
+
+
+CONV2D_S8_PC = KernelSpec(
+    op="conv2d_s8_pc",
+    signature=(
+        "void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "const int32_t *output_multiplier, const int32_t *output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-channel-weight-scale variant of conv2d_s8. Same int32-acc\n"
+        "dataflow; the requantize tail picks (output_multiplier[oc],\n"
+        "output_shift[oc]) for each output channel:\n"
+        "  acc = SAT_ROUND_SAT_ADD(acc, output_multiplier[oc],\n"
+        "                                output_shift[oc])\n"
+        "  out = clamp(acc + output_offset, act_min, act_max)\n"
+        "Bias is already pre-scaled by (input_scale * weight_scale_per_oc)\n"
+        "at codegen time, so the kernel adds it to the accumulator before\n"
+        "the per-OC requantize."
+    ),
+    reference_impl="""\
+void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
+                         const int32_t *bias, int8_t *output,
+                         int N, int IC, int IH, int IW, int OC,
+                         int KH, int KW, int SH, int SW, int PH, int PW,
+                         int input_offset, int filter_offset, int output_offset,
+                         const int32_t *output_multiplier,
+                         const int32_t *output_shift,
+                         int activation_min, int activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int32_t mult = output_multiplier[oc];
+            int32_t shift = output_shift[oc];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                if (iw < 0 || iw >= IW) continue;
+                                int32_t iv = (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
+                                int32_t wv = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw] + filter_offset;
+                                acc += iv * wv;
+                            }
+                        }
+                    }
+                    int64_t prod = ((int64_t)acc * (int64_t)mult + (1LL << 30)) >> 31;
+                    int32_t v;
+                    if (shift > 0) {
+                        int32_t r = 1 << (shift - 1);
+                        v = ((int32_t)prod + r) >> shift;
+                    } else {
+                        v = ((int32_t)prod) << (-shift);
+                    }
+                    v += output_offset;
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 3, "IH": 16, "IW": 16, "OC": 8,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_s8_pc_argtypes,
+)
+
+
+def _linear_s8_pc_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            i32p, i32p,
+            ctypes.c_int, ctypes.c_int]
+
+
+LINEAR_S8_PC = KernelSpec(
+    op="linear_s8_pc",
+    signature=(
+        "void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int M, int K, int N, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "const int32_t *output_multiplier, const int32_t *output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-N-channel-scale linear: out[m, n] picks\n"
+        "(output_multiplier[n], output_shift[n]) for the requantize.\n"
+        "Same dataflow as linear_s8 otherwise. Weight is [N, K]\n"
+        "row-major; bias is per-output-channel int32 pre-scaled by\n"
+        "(input_scale * weight_scale_per_n)."
+    ),
+    reference_impl="""\
+void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
+                         const int32_t *bias, int8_t *output,
+                         int M, int K, int N,
+                         int input_offset, int filter_offset, int output_offset,
+                         const int32_t *output_multiplier,
+                         const int32_t *output_shift,
+                         int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            int32_t mult = output_multiplier[n];
+            int32_t shift = output_shift[n];
+            int32_t acc = bias ? bias[n] : 0;
+            for (int k = 0; k < K; k++) {
+                int32_t iv = (int32_t)input[m*K + k] + input_offset;
+                int32_t wv = (int32_t)weight[n*K + k] + filter_offset;
+                acc += iv * wv;
+            }
+            int64_t prod = ((int64_t)acc * (int64_t)mult + (1LL << 30)) >> 31;
+            int32_t v;
+            if (shift > 0) {
+                int32_t r = 1 << (shift - 1);
+                v = ((int32_t)prod + r) >> shift;
+            } else {
+                v = ((int32_t)prod) << (-shift);
+            }
+            v += output_offset;
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[m*N + n] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 16, "N": 8},
+        {"M": 7, "K": 512, "N": 256},
+    ],
+    argtypes_factory=_linear_s8_pc_argtypes,
+)
+
+
+def _matmul_s8_pc_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+            i32p, i32p,
+            ctypes.c_int, ctypes.c_int]
+
+
+MATMUL_S8_PC = KernelSpec(
+    op="matmul_s8_pc",
+    signature=(
+        "void kernel_matmul_s8_pc(const int8_t *a, const int8_t *b, "
+        "int8_t *output, int M, int K, int N, "
+        "int transpose_b, float scale_div, "
+        "const int32_t *output_multiplier, const int32_t *output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-N-channel-scale matmul. Same int32-acc / transpose_b /\n"
+        "scale_div behavior as matmul_s8; the requantize tail uses\n"
+        "(output_multiplier[n], output_shift[n]) per output column.\n"
+        "scale_div folds 1/sqrt(d_k) for attention scores into the\n"
+        "Q0.31 multiplier at codegen time (or stays as a fp factor\n"
+        "applied to acc before the per-N requantize, depending on\n"
+        "what the codegen baked in)."
+    ),
+    reference_impl="""\
+void kernel_matmul_s8_pc(const int8_t *a, const int8_t *b, int8_t *output,
+                         int M, int K, int N,
+                         int transpose_b, float scale_div,
+                         const int32_t *output_multiplier,
+                         const int32_t *output_shift,
+                         int activation_min, int activation_max) {
+    float inv_div = 1.0f / scale_div;
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t mult = output_multiplier[j];
+            int32_t shift = output_shift[j];
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++) {
+                int8_t av = a[i*K + k];
+                int8_t bv = transpose_b ? b[j*K + k] : b[k*N + j];
+                acc += (int32_t)av * (int32_t)bv;
+            }
+            /* scale_div folded into the requantize as a float scale
+             * applied to the int32 accumulator before the Q0.31 mult.
+             * For the common attention case scale_div = sqrt(d_k); the
+             * fp32 fold is acceptable since the matmul is the dominant
+             * cost (this multiply happens once per output element). */
+            int32_t acc_div = (int32_t)roundf((float)acc * inv_div);
+            int64_t prod = ((int64_t)acc_div * (int64_t)mult + (1LL << 30)) >> 31;
+            int32_t v;
+            if (shift > 0) {
+                int32_t r = 1 << (shift - 1);
+                v = ((int32_t)prod + r) >> shift;
+            } else {
+                v = ((int32_t)prod) << (-shift);
+            }
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[i*N + j] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 7, "K": 128, "N": 7, "transpose_b": 1, "scale_div": 11.3},
+        {"M": 7, "K": 7,   "N": 128, "transpose_b": 0, "scale_div": 1.0},
+    ],
+    argtypes_factory=_matmul_s8_pc_argtypes,
+)
+
+
 def _depthwise_conv2d_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -5421,6 +5672,10 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "softmax_s8": SOFTMAX_S8,
     "depthwise_conv2d_s8": DEPTHWISE_CONV2D_S8,
     "slice_c_s8": SLICE_C_S8,
+    # Per-channel-weight-scale variants (Phase B.2).
+    "conv2d_s8_pc": CONV2D_S8_PC,
+    "linear_s8_pc": LINEAR_S8_PC,
+    "matmul_s8_pc": MATMUL_S8_PC,
 }
 
 
