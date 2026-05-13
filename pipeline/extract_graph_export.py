@@ -457,16 +457,19 @@ class _ExportWalker:
         in_name = self._resolve_input(n.args[0])
         out_name = n.name
         self._record_tensor(out_name)
+        # Default shape: flat "n" for elementwise ops. Per-op overrides
+        # below set 4-D / 2-D shape dicts when needed.
         rec = {
             "name": str(n.name),
             "op": s8_name,
             "inputs": [in_name] if not isinstance(n.args[0], (list, tuple))
                        else self._resolve_input(n.args[0]),
             "outputs": [out_name],
-            "shape": dict(self._shape_kv(out_name)),
+            "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
             "quant": {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
+                "activation_min": -128, "activation_max": 127,
             },
         }
         if op_kind == "mul.Tensor":
@@ -476,6 +479,7 @@ class _ExportWalker:
                 "scale_a":   self.scales.get(in_name, 1e-8),
                 "scale_b":   self.scales.get(b, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
+                "activation_min": -128, "activation_max": 127,
             }
         elif op_kind == "layer_norm.default":
             # aten signature: layer_norm(input, normalized_shape, weight,
@@ -787,6 +791,7 @@ class _ExportWalker:
                 "scale_a":   self.scales.get(a, 1e-8),
                 "scale_b":   self.scales.get(b, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
+                "activation_min": -128, "activation_max": 127,
             },
         })
 
