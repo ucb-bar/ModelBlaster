@@ -367,6 +367,70 @@ def _gen_inputs_cat_c1_s8(shape: dict, rng: np.random.Generator, n_inputs: int):
     return (*arrs, out)
 
 
+# ---------------------------------------------------------------------------
+# ViNT int8 input generators.
+# ---------------------------------------------------------------------------
+
+def _gen_inputs_mul_s8(shape: dict, rng: np.random.Generator):
+    n = shape["n"]
+    a = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    b = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    out = np.zeros((n,), dtype=np.int8)
+    return a, b, out
+
+
+def _gen_inputs_gelu_s8(shape: dict, rng: np.random.Generator):
+    n = shape["n"]
+    inp = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    out = np.zeros((n,), dtype=np.int8)
+    return inp, out
+
+
+def _gen_inputs_pad_s8(shape: dict, rng: np.random.Generator):
+    N, C, IH, IW = shape["N"], shape["C"], shape["IH"], shape["IW"]
+    pl, pr = shape["pad_left"], shape["pad_right"]
+    pt, pb = shape["pad_top"], shape["pad_bottom"]
+    OH = IH + pt + pb
+    OW = IW + pl + pr
+    inp = rng.integers(-128, 128, size=(N * C * IH * IW,), dtype=np.int8)
+    out = np.zeros((N * C * OH * OW,), dtype=np.int8)
+    return inp, out
+
+
+def _gen_inputs_adaptive_avg_pool2d_s8(shape: dict, rng: np.random.Generator):
+    N, C, IH, IW = shape["N"], shape["C"], shape["IH"], shape["IW"]
+    OH, OW = shape["OH"], shape["OW"]
+    inp = rng.integers(-128, 128, size=(N * C * IH * IW,), dtype=np.int8)
+    out = np.zeros((N * C * OH * OW,), dtype=np.int8)
+    return inp, out
+
+
+def _gen_inputs_layer_norm_s8(shape: dict, rng: np.random.Generator):
+    M, K = shape["M"], shape["K"]
+    inp = rng.integers(-64, 64, size=(M * K,), dtype=np.int8)
+    gamma = rng.integers(-64, 64, size=(K,), dtype=np.int8)
+    beta = rng.integers(-64, 64, size=(K,), dtype=np.int8)
+    out = np.zeros((M * K,), dtype=np.int8)
+    return inp, gamma, beta, out
+
+
+def _gen_inputs_matmul_s8(shape: dict, rng: np.random.Generator):
+    M, K, N = shape["M"], shape["K"], shape["N"]
+    # Keep operands well inside int8 range so the int32 accumulator doesn't
+    # saturate the requantize tail before the clamp.
+    a = rng.integers(-64, 64, size=(M * K,), dtype=np.int8)
+    b = rng.integers(-64, 64, size=(K * N,), dtype=np.int8)
+    out = np.zeros((M * N,), dtype=np.int8)
+    return a, b, out
+
+
+def _gen_inputs_softmax_s8(shape: dict, rng: np.random.Generator):
+    M, K = shape["M"], shape["K"]
+    inp = rng.integers(-128, 128, size=(M * K,), dtype=np.int8)
+    out = np.zeros((M * K,), dtype=np.int8)
+    return inp, out
+
+
 def _fp(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
@@ -556,6 +620,55 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         fn(*flat_args, _i8p(out), shape["N"], shape["H"], shape["W"],
            ctypes.c_float(0.05), -128, 127)
         return out
+    if op == "mul_s8":
+        a, b, out = inputs
+        fn(_i8p(a), _i8p(b), _i8p(out), shape["n"],
+           ctypes.c_float(0.05), ctypes.c_float(0.05), ctypes.c_float(0.05),
+           -128, 127)
+        return out
+    if op == "gelu_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out), shape["n"],
+           ctypes.c_float(0.05), ctypes.c_float(0.05), -128, 127)
+        return out
+    if op == "pad_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out),
+           shape["N"], shape["C"], shape["IH"], shape["IW"],
+           shape["pad_left"], shape["pad_right"],
+           shape["pad_top"], shape["pad_bottom"],
+           shape.get("pad_value", 0))
+        return out
+    if op == "adaptive_avg_pool2d_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out),
+           shape["N"], shape["C"], shape["IH"], shape["IW"],
+           shape["OH"], shape["OW"],
+           ctypes.c_float(0.05), ctypes.c_float(0.05), -128, 127)
+        return out
+    if op == "layer_norm_s8":
+        inp, gamma, beta, out = inputs
+        fn(_i8p(inp), _i8p(gamma), _i8p(beta), _i8p(out),
+           shape["M"], shape["K"],
+           ctypes.c_float(0.05), ctypes.c_float(0.05),
+           ctypes.c_float(0.05), ctypes.c_float(0.05),
+           ctypes.c_float(1e-5),
+           -128, 127)
+        return out
+    if op == "matmul_s8":
+        a, b, out = inputs
+        fn(_i8p(a), _i8p(b), _i8p(out),
+           shape["M"], shape["K"], shape["N"],
+           ctypes.c_float(0.005), ctypes.c_float(0.005), ctypes.c_float(0.1),
+           int(shape.get("transpose_b", 0)),
+           ctypes.c_float(shape.get("scale_div", 1.0)),
+           -128, 127)
+        return out
+    if op == "softmax_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out), shape["M"], shape["K"],
+           ctypes.c_float(0.1), ctypes.c_float(1.0 / 127))
+        return out
     if op in ("matmul", "matmul_ta", "matmul_tb", "matmul_tatb"):
         A, B, C = inputs
         fn(_fp(A), _fp(B), _fp(C), shape["M"], shape["K"], shape["N"])
@@ -580,7 +693,11 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
 _INTEGER_OPS = {"linear_s8", "relu_s8", "conv2d_s8", "maxpool2d_s8",
                 "add_s8", "batchnorm2d_s8", "sigmoid_s8",
                 "silu_s8", "upsample_nearest_s8",
-                "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"}
+                "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8",
+                # ViNT s8 ops (Phase A.2)
+                "mul_s8", "gelu_s8", "pad_s8",
+                "adaptive_avg_pool2d_s8", "layer_norm_s8",
+                "matmul_s8", "softmax_s8"}
 
 
 @dataclass
@@ -701,6 +818,20 @@ def verify(
                     inputs_ref = _gen_inputs_upsample_nearest_s8(shape, rng)
                 elif op in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
                     inputs_ref = _gen_inputs_cat_c1_s8(shape, rng, int(op[3]))
+                elif op == "mul_s8":
+                    inputs_ref = _gen_inputs_mul_s8(shape, rng)
+                elif op == "gelu_s8":
+                    inputs_ref = _gen_inputs_gelu_s8(shape, rng)
+                elif op == "pad_s8":
+                    inputs_ref = _gen_inputs_pad_s8(shape, rng)
+                elif op == "adaptive_avg_pool2d_s8":
+                    inputs_ref = _gen_inputs_adaptive_avg_pool2d_s8(shape, rng)
+                elif op == "layer_norm_s8":
+                    inputs_ref = _gen_inputs_layer_norm_s8(shape, rng)
+                elif op == "matmul_s8":
+                    inputs_ref = _gen_inputs_matmul_s8(shape, rng)
+                elif op == "softmax_s8":
+                    inputs_ref = _gen_inputs_softmax_s8(shape, rng)
                 elif op == "matmul":
                     inputs_ref = _gen_inputs_matmul(shape, rng)
                 elif op == "matmul_ta":
