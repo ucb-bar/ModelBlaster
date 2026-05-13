@@ -1185,22 +1185,33 @@ def _emit_vint_post_op(walker, out_dir):
         print("[extract_export] WARN: missing linear_23/linear_24 captures; "
               "skipping vint_action_post emission.", flush=True)
         return None
-    linear_23_t = walker.tensors["linear_23"]   # dist_pred raw
-    linear_24_t = walker.tensors["linear_24"]   # action_pred deltas raw
+    linear_23_t = walker.tensors["linear_23"]   # dist_pred raw fp32
+    linear_24_t = walker.tensors["linear_24"]   # action_pred deltas raw fp32
     scale_dist = walker.scales["linear_23"]
     scale_deltas = walker.scales["linear_24"]
 
-    # Reference fp32 tail evaluation (matches the C kernel below).
-    deltas = linear_24_t.detach().cpu().numpy().reshape(5, 4).astype(np.float32)
-    waypts = np.zeros_like(deltas)
-    waypts[:, 0] = np.cumsum(deltas[:, 0])
-    waypts[:, 1] = np.cumsum(deltas[:, 1])
-    norms = np.linalg.norm(deltas[:, 2:], axis=1, keepdims=True)
+    # Reference fp32 tail evaluation — MUST mirror what the C kernel
+    # would compute given the *quantized* inputs (the binary feeds the
+    # kernel int8 values from the buffers the upstream linear ops
+    # wrote). That means: quantize → dequantize → apply tail. This is
+    # the "int8 representation ceiling": what the composite outputs
+    # when the int8 forward is bit-exact against PyTorch fp32 at
+    # linear_23 / linear_24. Using the raw fp32 captured tensors
+    # instead would over-estimate the ceiling — the composite never
+    # actually sees pre-quant float values.
+    in_dist_int8 = _quantize_per_tensor_sym(linear_23_t, scale_dist).ravel()
+    in_deltas_int8 = _quantize_per_tensor_sym(
+        linear_24_t, scale_deltas).ravel()
+    deq_deltas = in_deltas_int8.astype(np.float32).reshape(5, 4) * scale_deltas
+    waypts = np.zeros_like(deq_deltas)
+    waypts[:, 0] = np.cumsum(deq_deltas[:, 0])
+    waypts[:, 1] = np.cumsum(deq_deltas[:, 1])
+    norms = np.linalg.norm(deq_deltas[:, 2:], axis=1, keepdims=True)
     norms = np.clip(norms, 1e-12, None)
-    waypts[:, 2:] = deltas[:, 2:] / norms
+    waypts[:, 2:] = deq_deltas[:, 2:] / norms
+    deq_dist = float(in_dist_int8[0]) * scale_dist
     out_combined = np.concatenate([
-        np.array([float(linear_23_t.reshape(-1)[0]) * scale_dist],
-                 dtype=np.float32),
+        np.array([deq_dist], dtype=np.float32),
         waypts.ravel().astype(np.float32),
     ])
 
