@@ -1162,6 +1162,24 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q['activation_min']}, {q['activation_max']})"
             )
         # ---- ViNT s8 ops ----
+        elif op["op"] == "depthwise_conv2d_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            # Channel count for depthwise: groups == OC == IC.
+            C = sh.get("OC") or sh.get("C") or sh.get("groups")
+            call = (
+                f"kernel_depthwise_conv2d_s8({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {C}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{q['output_multiplier']}, {q['output_shift']}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
         elif op["op"] == "mul_s8":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")

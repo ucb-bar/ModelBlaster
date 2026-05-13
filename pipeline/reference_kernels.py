@@ -5111,6 +5111,108 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
 )
 
 
+def _depthwise_conv2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, weight, bias, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW,
+    # input_offset, filter_offset, output_offset, output_multiplier,
+    # output_shift, activation_min, activation_max
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+
+
+DEPTHWISE_CONV2D_S8 = KernelSpec(
+    op="depthwise_conv2d_s8",
+    signature=(
+        "void kernel_depthwise_conv2d_s8(const int8_t *input, "
+        "const int8_t *weight, const int32_t *bias, int8_t *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized depthwise 2D convolution — each input channel has\n"
+        "its own KH×KW filter, applied independently (groups=C).\n"
+        "Layout:\n"
+        "  input:  int8  [N, C, IH, IW]\n"
+        "  weight: int8  [C, 1, KH, KW]  (or [C, KH, KW] flat)\n"
+        "  bias:   int32 [C] (may be NULL)\n"
+        "  output: int8  [N, C, OH, OW]\n"
+        "Compute (per output element, per channel c):\n"
+        "  acc = bias[c] (or 0)\n"
+        "  for kh, kw with ih = oh*SH-PH+kh, iw = ow*SW-PW+kw:\n"
+        "    if (ih, iw) in bounds:\n"
+        "      acc += (input[n,c,ih,iw] + input_offset)\n"
+        "           * (weight[c, kh, kw] + filter_offset)\n"
+        "Q0.31 requantize tail identical to conv2d_s8:\n"
+        "  acc = SAT_ROUND_SAT_ADD(acc, output_multiplier, output_shift)\n"
+        "  out = clamp(acc + output_offset, act_min, act_max)\n"
+        "Used heavily by EfficientNet's MBConv blocks (~32 of them in\n"
+        "ViNT's obs/goal encoders)."
+    ),
+    reference_impl="""\
+void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
+                                const int32_t *bias, int8_t *output,
+                                int N, int C, int IH, int IW,
+                                int KH, int KW, int SH, int SW, int PH, int PW,
+                                int input_offset, int filter_offset, int output_offset,
+                                int output_multiplier, int output_shift,
+                                int activation_min, int activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[c] : 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            int32_t iv = (int32_t)input[((n*C + c)*IH + ih)*IW + iw] + input_offset;
+                            int32_t wv = (int32_t)weight[(c*KH + kh)*KW + kw] + filter_offset;
+                            acc += iv * wv;
+                        }
+                    }
+                    int64_t prod = ((int64_t)acc * (int64_t)output_multiplier + (1LL << 30)) >> 31;
+                    int32_t v;
+                    if (output_shift > 0) {
+                        int32_t r = 1 << (output_shift - 1);
+                        v = ((int32_t)prod + r) >> output_shift;
+                    } else {
+                        v = ((int32_t)prod) << (-output_shift);
+                    }
+                    v += output_offset;
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n*C + c)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # MBConv-style depthwise (EfficientNet pattern)
+        {"N": 1, "C": 32, "IH": 32, "IW": 32,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        {"N": 1, "C": 16, "IH": 16, "IW": 16,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_depthwise_conv2d_s8_argtypes,
+)
+
+
 def _softmax_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -5254,6 +5356,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "layer_norm_s8": LAYER_NORM_S8,
     "matmul_s8": MATMUL_S8,
     "softmax_s8": SOFTMAX_S8,
+    "depthwise_conv2d_s8": DEPTHWISE_CONV2D_S8,
 }
 
 
