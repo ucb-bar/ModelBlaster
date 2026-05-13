@@ -4718,6 +4718,463 @@ CAT4_C1_S8 = KernelSpec(
 )
 
 
+# ---------------------------------------------------------------------------
+# ViNT int8 support: mul_s8 / gelu_s8 / pad_s8 / adaptive_avg_pool2d_s8 /
+# layer_norm_s8 / matmul_s8 / softmax_s8. Same float-tail pattern as the
+# yolov8_nano s8 kernels above — dequantize, compute, requantize.
+# ---------------------------------------------------------------------------
+
+
+def _mul_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # a, b, output, n, scale_a, scale_b, scale_out, act_min, act_max
+    return [i8p, i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+MUL_S8 = KernelSpec(
+    op="mul_s8",
+    signature=(
+        "void kernel_mul_s8(const int8_t *a, const int8_t *b, "
+        "int8_t *output, int n, "
+        "float scale_a, float scale_b, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise multiply. The two inputs may have different\n"
+        "scales — both are dequantized to float, multiplied, then\n"
+        "requantized into the output's scale:\n"
+        "  output[i] = clamp(\n"
+        "      roundf((a[i]*scale_a) * (b[i]*scale_b) / scale_out),\n"
+        "      activation_min, activation_max)\n"
+        "Use roundf to match numpy.round (banker's rounding compatible).\n"
+        "Common shapes in ViNT: SE gating (per-channel multiply onto an\n"
+        "NCHW activation, with `b` broadcast or pre-expanded) and the\n"
+        "Swish-as-x*sigmoid pattern. Both forms compile to a single\n"
+        "elementwise pass once the broadcast is materialized upstream."
+    ),
+    reference_impl="""\
+void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
+                   float scale_a, float scale_b, float scale_out,
+                   int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        float fa = (float)a[i] * scale_a;
+        float fb = (float)b[i] * scale_b;
+        float fout = (fa * fb) / scale_out;
+        int32_t v = (int32_t)roundf(fout);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}, {"n": 8192}],
+    argtypes_factory=_mul_s8_argtypes,
+)
+
+
+def _gelu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+GELU_S8 = KernelSpec(
+    op="gelu_s8",
+    signature=(
+        "void kernel_gelu_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized GELU (Gaussian Error Linear Unit) on a contiguous int8\n"
+        "buffer with per-tensor symmetric quant (zero_point = 0).\n"
+        "Reference uses the exact erf-based form to match torch.nn.GELU\n"
+        "default; an LUT/tanh-approx variant can be added as a curated\n"
+        "kernel later:\n"
+        "  f = input[i] * scale_in\n"
+        "  y = 0.5f * f * (1.0f + erff(f / sqrtf(2)))\n"
+        "  output[i] = clamp(round(y / scale_out), activation_min, activation_max)"
+    ),
+    reference_impl="""\
+void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
+                    float scale_in, float scale_out,
+                    int activation_min, int activation_max) {
+    const float kInvSqrt2 = 0.70710678118f;
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = 0.5f * f * (1.0f + erff(f * kInvSqrt2));
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 32}, {"n": 2048}],
+    argtypes_factory=_gelu_s8_argtypes,
+)
+
+
+def _pad_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, pad_left, pad_right, pad_top, pad_bottom, pad_value
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int]
+
+
+PAD_S8 = KernelSpec(
+    op="pad_s8",
+    signature=(
+        "void kernel_pad_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int IH, int IW, "
+        "int pad_left, int pad_right, int pad_top, int pad_bottom, "
+        "int pad_value)"
+    ),
+    semantics=(
+        "Constant-value spatial pad for NCHW int8 tensors. Output shape:\n"
+        "  OH = IH + pad_top + pad_bottom\n"
+        "  OW = IW + pad_left + pad_right\n"
+        "Copies input[n, c, ih, iw] into output[n, c, ih + pad_top,\n"
+        "iw + pad_left] and fills the surrounding border with pad_value\n"
+        "(cast to int8). No quant rescaling: input and output share the\n"
+        "same scale (per-tensor symmetric quant; zero_point = 0 → pad with\n"
+        "the int8 representation of zero, which is 0).\n"
+        "Used by EfficientNet's same-padding-with-stride pattern where\n"
+        "the pad is asymmetric and can't fold into a Conv2D's padding."
+    ),
+    reference_impl="""\
+void kernel_pad_s8(const int8_t *input, int8_t *output,
+                   int N, int C, int IH, int IW,
+                   int pad_left, int pad_right, int pad_top, int pad_bottom,
+                   int pad_value) {
+    int OH = IH + pad_top + pad_bottom;
+    int OW = IW + pad_left + pad_right;
+    int8_t pad_v = (int8_t)pad_value;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih = oh - pad_top;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw = ow - pad_left;
+                    int8_t v = pad_v;
+                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                        v = input[((n*C+c)*IH+ih)*IW+iw];
+                    }
+                    output[((n*C+c)*OH+oh)*OW+ow] = v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 16, "IW": 16,
+         "pad_left": 0, "pad_right": 1, "pad_top": 0, "pad_bottom": 1, "pad_value": 0},
+        {"N": 1, "C": 32, "IH": 32, "IW": 32,
+         "pad_left": 1, "pad_right": 1, "pad_top": 1, "pad_bottom": 1, "pad_value": 0},
+    ],
+    argtypes_factory=_pad_s8_argtypes,
+)
+
+
+def _adaptive_avg_pool2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, OH, OW, scale_in, scale_out, act_min, act_max
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+ADAPTIVE_AVG_POOL2D_S8 = KernelSpec(
+    op="adaptive_avg_pool2d_s8",
+    signature=(
+        "void kernel_adaptive_avg_pool2d_s8(const int8_t *input, "
+        "int8_t *output, int N, int C, int IH, int IW, int OH, int OW, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Adaptive average-pool over an NCHW int8 tensor. For each output\n"
+        "cell (oh, ow) the source window is the half-open interval\n"
+        "  ih ∈ [floor(oh * IH / OH), ceil((oh+1) * IH / OH))\n"
+        "  iw ∈ [floor(ow * IW / OW), ceil((ow+1) * IW / OW))\n"
+        "Matches torch.nn.functional.adaptive_avg_pool2d. The mean is\n"
+        "computed in float, then requantized:\n"
+        "  acc = sum_{ih, iw} input[n, c, ih, iw] * scale_in\n"
+        "  mean = acc / window_size\n"
+        "  output[n, c, oh, ow] = clamp(\n"
+        "      round(mean / scale_out), activation_min, activation_max)\n"
+        "Common ViNT shape: OH=OW=1 (SE-block global average plus\n"
+        "EfficientNet's pre-FC pool) where the window covers the whole\n"
+        "(IH, IW)."
+    ),
+    reference_impl="""\
+void kernel_adaptive_avg_pool2d_s8(const int8_t *input, int8_t *output,
+                                   int N, int C, int IH, int IW,
+                                   int OH, int OW,
+                                   float scale_in, float scale_out,
+                                   int activation_min, int activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih0 = (oh * IH) / OH;
+                int ih1 = ((oh + 1) * IH + OH - 1) / OH;
+                if (ih1 > IH) ih1 = IH;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw0 = (ow * IW) / OW;
+                    int iw1 = ((ow + 1) * IW + OW - 1) / OW;
+                    if (iw1 > IW) iw1 = IW;
+                    int win = (ih1 - ih0) * (iw1 - iw0);
+                    if (win <= 0) win = 1;
+                    int32_t acc = 0;
+                    for (int ih = ih0; ih < ih1; ih++) {
+                        for (int iw = iw0; iw < iw1; iw++) {
+                            acc += (int32_t)input[((n*C+c)*IH+ih)*IW+iw];
+                        }
+                    }
+                    float mean = (float)acc * scale_in / (float)win;
+                    int32_t v = (int32_t)roundf(mean / scale_out);
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n*C+c)*OH+oh)*OW+ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 8, "IW": 8, "OH": 1, "OW": 1},
+        {"N": 1, "C": 128, "IH": 4, "IW": 4, "OH": 1, "OW": 1},
+        {"N": 1, "C": 1280, "IH": 2, "IW": 3, "OH": 1, "OW": 1},
+    ],
+    argtypes_factory=_adaptive_avg_pool2d_s8_argtypes,
+)
+
+
+def _layer_norm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, gamma, beta, output, M (rows), K (cols), scale_in, scale_gamma,
+    # scale_beta, scale_out, eps, act_min, act_max
+    return [i8p, i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+LAYER_NORM_S8 = KernelSpec(
+    op="layer_norm_s8",
+    signature=(
+        "void kernel_layer_norm_s8(const int8_t *input, const int8_t *gamma, "
+        "const int8_t *beta, int8_t *output, int M, int K, "
+        "float scale_in, float scale_gamma, float scale_beta, "
+        "float scale_out, float eps, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Layer normalization over the last axis of a 2-D row-major view\n"
+        "(M rows × K cols). Per-row mean and variance computed in float;\n"
+        "normalized values are scaled by gamma and shifted by beta\n"
+        "(per-channel parameters of length K, themselves int8-quantized):\n"
+        "  mu_m  = mean_{k=0..K-1}( input[m,k] * scale_in )\n"
+        "  var_m = mean_{k=0..K-1}( (input[m,k]*scale_in - mu_m)^2 )\n"
+        "  inv   = 1 / sqrtf(var_m + eps)\n"
+        "  y[m,k] = ((input[m,k]*scale_in - mu_m) * inv) * (gamma[k]*scale_gamma)\n"
+        "           + beta[k]*scale_beta\n"
+        "  output[m,k] = clamp(round(y / scale_out),\n"
+        "                      activation_min, activation_max)\n"
+        "Gamma/beta arrive as int8 with their own per-tensor scales (the\n"
+        "extractor stores them via _record_constant). When gamma == NULL\n"
+        "or beta == NULL pass 0 for the corresponding scale and treat\n"
+        "the affine term as identity / zero."
+    ),
+    reference_impl="""\
+void kernel_layer_norm_s8(const int8_t *input, const int8_t *gamma,
+                          const int8_t *beta, int8_t *output,
+                          int M, int K,
+                          float scale_in, float scale_gamma, float scale_beta,
+                          float scale_out, float eps,
+                          int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row_in  = input  + m * K;
+        int8_t       *row_out = output + m * K;
+        float mu = 0.0f;
+        for (int k = 0; k < K; k++) mu += (float)row_in[k] * scale_in;
+        mu /= (float)K;
+        float var = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float d = (float)row_in[k] * scale_in - mu;
+            var += d * d;
+        }
+        var /= (float)K;
+        float inv = 1.0f / sqrtf(var + eps);
+        for (int k = 0; k < K; k++) {
+            float n = ((float)row_in[k] * scale_in - mu) * inv;
+            float g = (gamma ? (float)gamma[k] * scale_gamma : 1.0f);
+            float b = (beta  ? (float)beta[k]  * scale_beta  : 0.0f);
+            float y = n * g + b;
+            int32_t v = (int32_t)roundf(y / scale_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            row_out[k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1,   "K": 64},
+        {"M": 7,   "K": 512},   # ViNT transformer: seq=7 tokens, embed=512
+        {"M": 32,  "K": 256},
+    ],
+    argtypes_factory=_layer_norm_s8_argtypes,
+)
+
+
+def _matmul_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # a, b, output, M, K, N, scale_a, scale_b, scale_out, transpose_b,
+    # scale_div, act_min, act_max
+    return [i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+MATMUL_S8 = KernelSpec(
+    op="matmul_s8",
+    signature=(
+        "void kernel_matmul_s8(const int8_t *a, const int8_t *b, "
+        "int8_t *output, int M, int K, int N, "
+        "float scale_a, float scale_b, float scale_out, "
+        "int transpose_b, float scale_div, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Int8 matrix multiplication out[M,N] = a[M,K] @ b[K,N] (or\n"
+        "a @ b.T if transpose_b is non-zero — used for Q·Kᵀ in attention).\n"
+        "Accumulator is int32; the per-element output is rescaled and\n"
+        "optionally divided by scale_div (e.g. 1/sqrt(d_k) for attention\n"
+        "scores; pass 1.0 if unused):\n"
+        "  acc[i,j] = sum_{k} a[i,k] * (transpose_b ? b[j,k] : b[k,j])\n"
+        "  output[i,j] = clamp(\n"
+        "      round(acc * scale_a * scale_b / (scale_out * scale_div)),\n"
+        "      activation_min, activation_max)\n"
+        "Float math is used for the requantize tail to match the agents\n"
+        "linear_s8 numerics; the curated gemmini_q31 / RVV kernels can\n"
+        "implement the Q0.31 path bit-exactly."
+    ),
+    reference_impl="""\
+void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
+                      int M, int K, int N,
+                      float scale_a, float scale_b, float scale_out,
+                      int transpose_b, float scale_div,
+                      int activation_min, int activation_max) {
+    float total = (scale_a * scale_b) / (scale_out * scale_div);
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++) {
+                int8_t av = a[i*K + k];
+                int8_t bv = transpose_b ? b[j*K + k] : b[k*N + j];
+                acc += (int32_t)av * (int32_t)bv;
+            }
+            int32_t v = (int32_t)roundf((float)acc * total);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[i*N + j] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 7, "K": 64, "N": 7,   "transpose_b": 1, "scale_div": 8.0},  # attention Q·Kᵀ, head_dim=64
+        {"M": 7, "K": 7,  "N": 64,  "transpose_b": 0, "scale_div": 1.0},  # attention ·V
+        {"M": 7, "K": 512, "N": 512, "transpose_b": 0, "scale_div": 1.0}, # FFN-style
+    ],
+    argtypes_factory=_matmul_s8_argtypes,
+)
+
+
+def _softmax_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, M (rows), K (cols), scale_in, scale_out
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float]
+
+
+SOFTMAX_S8 = KernelSpec(
+    op="softmax_s8",
+    signature=(
+        "void kernel_softmax_s8(const int8_t *input, int8_t *output, "
+        "int M, int K, float scale_in, float scale_out)"
+    ),
+    semantics=(
+        "Row-wise softmax over a 2-D row-major view (M rows × K cols).\n"
+        "Numerically stable: subtract the row max before exponentiating.\n"
+        "  shift = max_k(input[m,k])\n"
+        "  num[k] = expf((input[m,k] - shift) * scale_in)\n"
+        "  denom  = sum_k num[k]\n"
+        "  output[m,k] = clamp(round(num[k] / denom / scale_out), -128, 127)\n"
+        "Output activations sum to ~1.0 per row in float space. Caller\n"
+        "should set scale_out so the dynamic range covers [0, 1]\n"
+        "(typically 1/127 — every value fits in [0, 127] with one bit\n"
+        "of headroom)."
+    ),
+    reference_impl="""\
+void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
+                       float scale_in, float scale_out) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row_in  = input  + m * K;
+        int8_t       *row_out = output + m * K;
+        int8_t shift = row_in[0];
+        for (int k = 1; k < K; k++) {
+            if (row_in[k] > shift) shift = row_in[k];
+        }
+        /* Two-pass over the row: first accumulate the denominator,
+         * then quantize. Curated kernels can elide the second pass by
+         * caching exp values in a scratch buffer (LUT or fp16 store). */
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += expf(((float)row_in[k] - (float)shift) * scale_in);
+        }
+        for (int k = 0; k < K; k++) {
+            float e = expf(((float)row_in[k] - (float)shift) * scale_in);
+            float p = e / sum;
+            int32_t v = (int32_t)roundf(p / scale_out);
+            if (v < -128) v = -128;
+            if (v >  127) v =  127;
+            row_out[k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1,   "K": 7},     # ViNT attention head: 7 tokens
+        {"M": 4,   "K": 7},     # 4 heads × 7 keys
+        {"M": 16,  "K": 64},    # broader test
+    ],
+    argtypes_factory=_softmax_s8_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -4789,6 +5246,14 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "cat2_c1_s8": CAT2_C1_S8,
     "cat3_c1_s8": CAT3_C1_S8,
     "cat4_c1_s8": CAT4_C1_S8,
+    # ViNT int8 support.
+    "mul_s8": MUL_S8,
+    "gelu_s8": GELU_S8,
+    "pad_s8": PAD_S8,
+    "adaptive_avg_pool2d_s8": ADAPTIVE_AVG_POOL2D_S8,
+    "layer_norm_s8": LAYER_NORM_S8,
+    "matmul_s8": MATMUL_S8,
+    "softmax_s8": SOFTMAX_S8,
 }
 
 
