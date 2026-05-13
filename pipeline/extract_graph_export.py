@@ -1325,8 +1325,19 @@ def main():
     # in the model's surface dtype (int8 for QUANT=int8). The walker
     # quantizes via the same per-tensor scales the IR baked in for
     # the user-input + model-output tensors.
-    with torch.no_grad():
-        out = model(*sample)
+    #
+    # Output golden: use the WALKER-CAPTURED intermediate tensor at
+    # each output name (e.g. linear_24's pre-cumsum delta predictions
+    # for ViNT) — NOT the model's surface output. Two reasons:
+    # (1) "tail" ops (cumsum / F.normalize / final reshape) are
+    #     elided from the IR by design (we expect the C harness to
+    #     apply them in scalar post-process), so the binary's last
+    #     dispatch writes the pre-tail tensor's int8 values.
+    # (2) the per-tensor scale stored in the IR for an output tensor
+    #     is the captured tensor's max_abs, not the post-tail tensor's.
+    # Using the captured intermediate keeps "what spike writes" and
+    # "what we quantize the golden against" pointing at the same op
+    # in the aten graph at the same scale.
     in_parts: list[np.ndarray] = []
     for k in input_names:
         t = calib_sample[k]
@@ -1338,18 +1349,29 @@ def main():
     in_dtype = np.int8 if args.quant == "int8" else np.float32
     inp_flat = np.concatenate(in_parts).astype(in_dtype)
 
-    # Output: same dtype treatment. For multi-output models we
-    # concatenate every output's flat bytes (test_io.h's golden cmp is
-    # done in one buffer comparison).
-    out_list = out if isinstance(out, (list, tuple)) else (out,)
+    # Output: resolve each output name through the alias map first —
+    # tail ops (cumsum, F.normalize, final reshape) were elided from
+    # the IR via alias passthrough, so the user-facing surface output
+    # name (e.g. ViNT's `reshape_2`) actually maps to the upstream
+    # pre-tail compute node (`linear_24` for ViNT's action_pred).
+    # Quantize that captured intermediate with its own per-tensor
+    # scale — the same scale the binary's last actual dispatch
+    # writes its int8 values with. This keeps the int8 golden and
+    # the binary's output bit-for-bit comparable.
     out_parts: list[np.ndarray] = []
-    for i, t in enumerate(out_list):
-        out_name_i = output_names[i] if i < len(output_names) else None
-        sc = walker.scales.get(out_name_i, 1e-8) if out_name_i else 1e-8
+    for out_name_i in output_names:
+        resolved = walker.name_map.get(out_name_i, out_name_i)
+        captured = walker.tensors.get(resolved)
+        if captured is None:
+            raise SystemExit(
+                f"output tensor {out_name_i!r} (resolved to {resolved!r}) "
+                f"not captured during calibration; cannot emit io.npz golden")
+        sc = walker.scales.get(resolved, 1e-8)
         if args.quant == "int8":
-            out_parts.append(_quantize_per_tensor_sym(t, sc).ravel())
+            out_parts.append(_quantize_per_tensor_sym(captured, sc).ravel())
         else:
-            out_parts.append(t.detach().cpu().numpy().ravel().astype(np.float32))
+            out_parts.append(
+                captured.detach().cpu().numpy().ravel().astype(np.float32))
     out_flat = np.concatenate(out_parts).astype(in_dtype)
     io_path = out_dir / "io.npz"
     np.savez(io_path, input=inp_flat, output=out_flat)
