@@ -5591,6 +5591,90 @@ void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
 )
 
 
+# ---------------------------------------------------------------------------
+# Application-specific composite ops. These sit at the model/application
+# boundary and absorb the open-ended pre/post-process code that's
+# specific to each model. Same KernelSpec contract as everything else
+# (signature + semantics + reference_impl + argtypes), so the existing
+# kernel-pick / verify / cache / LLM-gen pipeline works without changes.
+# ---------------------------------------------------------------------------
+
+
+def _vint_action_post_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    f32p = ctypes.POINTER(ctypes.c_float)
+    # dist_int8, scale_dist, deltas_int8, scale_deltas, output_fp32
+    return [i8p, ctypes.c_float, i8p, ctypes.c_float, f32p]
+
+
+VINT_ACTION_POST = KernelSpec(
+    op="vint_action_post",
+    signature=(
+        "void kernel_vint_action_post("
+        "const int8_t *dist_int8, float scale_dist, "
+        "const int8_t *deltas_int8, float scale_deltas, "
+        "float *output)"
+    ),
+    semantics=(
+        "Composite ViNT post-process: absorbs every tail op the int8\n"
+        "model graph elided (dequant + cumsum + L2-normalize + tuple\n"
+        "pack) so the binary's surface output is a single fp32 buffer\n"
+        "the application (pilot / IsaacLab adapter) can consume\n"
+        "directly.\n"
+        "\n"
+        "Inputs:\n"
+        "  dist_int8[1]    — int8 temporal-distance estimate\n"
+        "  deltas_int8[20] — int8 (5,4) (dx, dy, sin, cos) per-step\n"
+        "                    deltas\n"
+        "Output (21 fp32 values):\n"
+        "  out[0]          — dequantized fp32 temporal distance\n"
+        "  out[1..20]      — (5,4) fp32 waypoints:\n"
+        "                      [wp][0] = cumulative x (m)\n"
+        "                      [wp][1] = cumulative y (m)\n"
+        "                      [wp][2] = sin θ (unit vector)\n"
+        "                      [wp][3] = cos θ (unit vector)\n"
+        "\n"
+        "Reference algebra (matches PyTorch ViNT.forward tail):\n"
+        "  out[0] = dist_int8[0] * scale_dist\n"
+        "  f[wp][i] = deltas_int8[wp*4 + i] * scale_deltas  for i in 0..3\n"
+        "  cum_x = cumsum(f[:, 0]); out[1 + wp*4 + 0] = cum_x[wp]\n"
+        "  cum_y = cumsum(f[:, 1]); out[1 + wp*4 + 1] = cum_y[wp]\n"
+        "  n = max(sqrt(f[wp][2]^2 + f[wp][3]^2), 1e-12)\n"
+        "  out[1 + wp*4 + 2] = f[wp][2] / n\n"
+        "  out[1 + wp*4 + 3] = f[wp][3] / n\n"
+    ),
+    reference_impl="""\
+void kernel_vint_action_post(const int8_t *dist_int8, float scale_dist,
+                             const int8_t *deltas_int8, float scale_deltas,
+                             float *output) {
+    const int N_WP = 5;
+    /* Slot 0: dequant the dist scalar. */
+    output[0] = (float)dist_int8[0] * scale_dist;
+    /* Slots [1..10]: cumsum the (dx, dy) cols of the action_pred (5,4). */
+    float cum_x = 0.0f, cum_y = 0.0f;
+    for (int wp = 0; wp < N_WP; wp++) {
+        cum_x += (float)deltas_int8[wp*4 + 0] * scale_deltas;
+        cum_y += (float)deltas_int8[wp*4 + 1] * scale_deltas;
+        output[1 + wp*4 + 0] = cum_x;
+        output[1 + wp*4 + 1] = cum_y;
+    }
+    /* Slots [3..20] mixed in above; L2-normalize the (sin, cos) cols. */
+    for (int wp = 0; wp < N_WP; wp++) {
+        float s = (float)deltas_int8[wp*4 + 2] * scale_deltas;
+        float c = (float)deltas_int8[wp*4 + 3] * scale_deltas;
+        float n = sqrtf(s*s + c*c);
+        if (n < 1e-12f) n = 1e-12f;
+        output[1 + wp*4 + 2] = s / n;
+        output[1 + wp*4 + 3] = c / n;
+    }
+}
+""",
+    extra_shapes=[{}],  # composite op, no shape parametrization
+    argtypes_factory=_vint_action_post_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -5676,6 +5760,14 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "conv2d_s8_pc": CONV2D_S8_PC,
     "linear_s8_pc": LINEAR_S8_PC,
     "matmul_s8_pc": MATMUL_S8_PC,
+    # Application-specific composite ops. The op-kind family
+    # "app_op_<name>" is reserved for these — codegen looks up the
+    # implementation either in agents/kernels/<backend>/<op>.c (curated)
+    # or generates it via the LLM path using the semantics block in
+    # the IR record. Stock impls below cover the common patterns; a
+    # model-specific spec can override by registering with the same
+    # name.
+    "vint_action_post": VINT_ACTION_POST,
 }
 
 
