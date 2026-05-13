@@ -431,6 +431,14 @@ def _gen_inputs_softmax_s8(shape: dict, rng: np.random.Generator):
     return inp, out
 
 
+def _gen_inputs_slice_c_s8(shape: dict, rng: np.random.Generator):
+    N, IC, H, W = shape["N"], shape["IC"], shape["H"], shape["W"]
+    Cs, Ce = shape["C_start"], shape["C_end"]
+    inp = rng.integers(-128, 128, size=(N * IC * H * W,), dtype=np.int8)
+    out = np.zeros((N * (Ce - Cs) * H * W,), dtype=np.int8)
+    return inp, out
+
+
 def _fp(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
@@ -669,6 +677,15 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         fn(_i8p(inp), _i8p(out), shape["M"], shape["K"],
            ctypes.c_float(0.1), ctypes.c_float(1.0 / 127))
         return out
+    if op == "slice_c_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out),
+           shape["N"], shape["IC"],
+           shape["C_start"], shape["C_end"],
+           shape["H"], shape["W"],
+           ctypes.c_float(0.05), ctypes.c_float(0.05),
+           -128, 127)
+        return out
     if op in ("matmul", "matmul_ta", "matmul_tb", "matmul_tatb"):
         A, B, C = inputs
         fn(_fp(A), _fp(B), _fp(C), shape["M"], shape["K"], shape["N"])
@@ -697,7 +714,8 @@ _INTEGER_OPS = {"linear_s8", "relu_s8", "conv2d_s8", "maxpool2d_s8",
                 # ViNT s8 ops (Phase A.2)
                 "mul_s8", "gelu_s8", "pad_s8",
                 "adaptive_avg_pool2d_s8", "layer_norm_s8",
-                "matmul_s8", "softmax_s8"}
+                "matmul_s8", "softmax_s8",
+                "depthwise_conv2d_s8", "slice_c_s8"}
 
 
 @dataclass
@@ -832,6 +850,8 @@ def verify(
                     inputs_ref = _gen_inputs_matmul_s8(shape, rng)
                 elif op == "softmax_s8":
                     inputs_ref = _gen_inputs_softmax_s8(shape, rng)
+                elif op == "slice_c_s8":
+                    inputs_ref = _gen_inputs_slice_c_s8(shape, rng)
                 elif op == "matmul":
                     inputs_ref = _gen_inputs_matmul(shape, rng)
                 elif op == "matmul_ta":

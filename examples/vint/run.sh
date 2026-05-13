@@ -38,7 +38,13 @@ if [[ "${FORCE_EXTRACT:-0}" == "1" \
         --model "${MODEL_NAME}" --quant "${QUANT}" --out-dir "${IR_DIR}"
 fi
 
-# Stage 2–5 — delegate to _run_lib.sh. It checks for the IR triple
-# on disk and skips its own extract_graph step when they're present.
+# Stage 2–5 — delegate to _run_lib.sh. Re-source the Zephyr SDK env
+# unconditionally before this hand-off: the xpurt python in stage 1
+# is invoked via full path (no `conda activate`), so the shell's
+# active env is whatever the caller was in — could be xpurt without
+# the build-aware west extension, could be base, etc. Forcing
+# set_envvars_sdk here means run.sh works from any starting env as
+# long as the conda zephyr binaries are reachable.
+source "${REPO_ROOT}/scripts/set_envvars_sdk.sh"
 export MODEL_NAME REPO_ROOT QUANT TARGET BACKEND RUNNER
 source "${REPO_ROOT}/agents/examples/_run_lib.sh"

@@ -388,16 +388,18 @@ class _ExportWalker:
         op_kind = _op_name(n)
         cls = _classify(op_kind)
         if cls in ("noop", "tail", "alias"):
+            # Special case: slice.Tensor along an NCHW channel dim
+            # (dim=1) of a 4-D tensor that has a downstream cat
+            # consumer. We CAN'T alias-collapse it because doing so
+            # would lose the (C_start, C_end) range info downstream,
+            # and the cat would end up reading the full source buffer.
+            # Emit a slice_c_s8 op instead.
+            if op_kind == "slice.Tensor" and self._is_channel_slice_used_by_cat(n):
+                self._emit_slice_c(n)
+                return
             # Pass-through: alias this node's name to its first tensor
             # input so downstream consumers resolve to the underlying
-            # tensor. Covers getitem (tuple unpack from an op return),
-            # dropout (eval-time identity), view/transpose/slice/...,
-            # and the scalar-tail ops (no compute, no IR record).
-            #
-            # Use _resolve_input on each arg — that path records buffer
-            # / get_attr placeholders if they haven't been seen, and
-            # returns the canonical tensor name. Pick the first arg
-            # whose resolved name is now in tensors or tensors_meta.
+            # tensor.
             self._record_tensor(n.name)
             src_name: Optional[str] = None
             for a in n.args:
@@ -797,50 +799,143 @@ class _ExportWalker:
 
     def _emit_cat(self, n):
         tensor_list = n.args[0]
+        # Pull per-input shapes from the aten meta['val'] (which has the
+        # actual shapes at the cat call site) — self._resolve_input may
+        # have alias-collapsed slice/select outputs back to their source,
+        # which would lose the per-input shape along the cat axis.
+        in_meta_shapes = []
+        for t in tensor_list:
+            ms = None
+            if hasattr(t, 'meta') and 'val' in t.meta:
+                ms = tuple(int(s) for s in t.meta['val'].shape)
+            in_meta_shapes.append(ms)
         names = [self._resolve_input(t) for t in tensor_list]
         dim = int(n.args[1]) if len(n.args) > 1 else 0
         out_name = n.name
         self._record_tensor(out_name)
         n_inputs = len(names)
         # Layout-reinterpret special case: all inputs resolved to the
-        # same upstream tensor name (typical for ViNT's split-then-
-        # concat pattern that just shuffles the leading dims of obs_img
-        # — the underlying memory is the same). Emit an alias so the
-        # codegen reuses the source buffer with the concat's new
-        # logical shape; no kernel call.
+        # same upstream tensor name (e.g. ViNT's split-then-concat that
+        # shuffles obs_img's leading dims). When the underlying memory
+        # is byte-identical, emit an alias and skip the kernel call.
         if all(nm == names[0] for nm in names) and names[0] in self.tensors:
             src_size = int(np.prod(self.tensors[names[0]].shape))
             out_size = int(np.prod(self.tensors[out_name].shape))
             if src_size == out_size:
                 self.name_map[out_name] = self.name_map.get(names[0], names[0])
                 return
-        op_kind = f"cat{n_inputs}_c{dim}_s8" if n_inputs <= 4 else f"cat_n_c{dim}_s8"
-        # Build the shape dict the cat_*_s8 codegen expects:
-        # {N, H, W, C_inputs: [c_0, c_1, ...]} for 4-D cat along
-        # channel dim. Per-input C is the dim==1 size of each operand.
+        # Out shape (from captured forward pass; rank-correct).
         out_shape = list(self.tensors[out_name].shape)
-        shape: dict = {}
+        # Reinterpret any non-4-D cat as 4-D NCHW (N=outer, C=cat-axis,
+        # H=1, W=inner) so the existing cat{2,3,4}_c1_s8 skeleton works
+        # without per-rank variants. The "axis" of the reinterpreted
+        # form is always the channel dim (index 1).
         if len(out_shape) == 4:
-            shape["N"] = int(out_shape[0])
-            shape["H"] = int(out_shape[2])
-            shape["W"] = int(out_shape[3])
-            shape["C_total"] = int(out_shape[1])
-            shape["C_inputs"] = [
-                int(self.tensors[nm].shape[dim]) if nm in self.tensors else 0
-                for nm in names
-            ]
+            N = int(out_shape[0])
+            H = int(out_shape[2])
+            W = int(out_shape[3])
+            C_total = int(out_shape[1])
+            C_inputs = []
+            for nm, ms in zip(names, in_meta_shapes):
+                if ms is not None and len(ms) == 4:
+                    C_inputs.append(int(ms[dim]))
+                elif nm in self.tensors:
+                    C_inputs.append(int(self.tensors[nm].shape[dim]))
+                else:
+                    C_inputs.append(0)
         else:
-            shape = dict(self._shape_kv(out_name))
+            # Fold dims-before-cat into N, dims-after-cat into W.
+            N = 1
+            for d in out_shape[:dim]: N *= int(d)
+            W = 1
+            for d in out_shape[dim+1:]: W *= int(d)
+            H = 1
+            C_total = int(out_shape[dim])
+            C_inputs = []
+            for nm, ms in zip(names, in_meta_shapes):
+                src = ms if ms is not None else (
+                    tuple(self.tensors[nm].shape) if nm in self.tensors else None)
+                if src is not None and len(src) > dim:
+                    C_inputs.append(int(src[dim]))
+                else:
+                    C_inputs.append(0)
+        # Use the 4-D channel-dim cat skeleton for both native-4-D and
+        # reinterpreted cases — they share the same kernel signature.
+        op_kind = f"cat{n_inputs}_c1_s8" if n_inputs <= 4 else "cat_n_c1_s8"
         self.ops.append({
             "name": str(n.name), "op": op_kind,
             "inputs": names, "outputs": [out_name],
-            "shape": shape,
+            "shape": {
+                "N": N, "H": H, "W": W,
+                "C_total": C_total, "C_inputs": C_inputs,
+            },
             "quant": {
                 "scales_in": [self.scales.get(nm, 1e-8) for nm in names],
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "dim": dim,
                 "activation_min": -128,
                 "activation_max": 127,
+            },
+        })
+
+    def _is_channel_slice_used_by_cat(self, n) -> bool:
+        """True iff this slice.Tensor is a NCHW dim=1 slice whose output
+        flows into a cat/concat (so the alias collapse would lose the
+        slice range info the cat needs)."""
+        # aten::slice.Tensor(self, dim, start, end, step=1).
+        if len(n.args) < 3:
+            return False
+        dim = int(n.args[1])
+        if dim != 1:
+            return False
+        # Source must be 4-D (NCHW).
+        src = n.args[0]
+        if not (hasattr(src, 'meta') and 'val' in src.meta
+                and len(src.meta['val'].shape) == 4):
+            return False
+        # Walk users looking for a cat/concat consumer (possibly through
+        # one alias hop).
+        seen = set()
+        stack = list(n.users)
+        while stack:
+            u = stack.pop()
+            if u.name in seen: continue
+            seen.add(u.name)
+            t = _op_name(u)
+            if t in ("cat.default", "concat.default"):
+                return True
+            if _classify(t) == "alias":
+                stack.extend(u.users)
+        return False
+
+    def _emit_slice_c(self, n):
+        """Channel-axis slice of NCHW int8: aten::slice(input, dim=1,
+        start, end). Emits a slice_c_s8 op record consuming
+        (C_end - C_start) channels."""
+        src = n.args[0]
+        src_name = self._resolve_input(src)
+        C_start = int(n.args[2]) if len(n.args) > 2 else 0
+        C_end = int(n.args[3]) if len(n.args) > 3 else None
+        src_shape = tuple(int(s) for s in src.meta['val'].shape)
+        IC, H, W = src_shape[1], src_shape[2], src_shape[3]
+        if C_end is None or C_end > IC:
+            C_end = IC
+        out_name = n.name
+        self._record_tensor(out_name)
+        in_scale = self.scales.get(src_name, 1e-8)
+        out_scale = self.scales.get(out_name, in_scale)
+        self.ops.append({
+            "name": str(n.name), "op": "slice_c_s8",
+            "inputs": [src_name], "outputs": [out_name],
+            "shape": {
+                "N": int(src_shape[0]), "IC": int(IC),
+                "C_start": int(C_start), "C_end": int(C_end),
+                "H": int(H), "W": int(W),
+            },
+            "quant": {
+                "scale_in":  in_scale,
+                "scale_out": out_scale,
+                "activation_min": -128, "activation_max": 127,
             },
         })
 
@@ -1080,22 +1175,42 @@ def main():
     print(f"[extract_export] wrote {weights_path} "
           f"({len(walker.weights_blob)} weight tensors)", flush=True)
 
-    # io.npz: store one calibration sample input + the model's output
-    # for that input (used by the spike harness to verify).
+    # io.npz: emit_test_io expects flat "input" and "output" arrays
+    # in the model's surface dtype (int8 for QUANT=int8). The walker
+    # quantizes via the same per-tensor scales the IR baked in for
+    # the user-input + model-output tensors.
     with torch.no_grad():
         out = model(*sample)
-    io_npz: dict[str, np.ndarray] = {}
-    for k, v in calib_sample.items():
-        io_npz[f"input_{k}"] = v.detach().cpu().numpy()
-    if isinstance(out, (list, tuple)):
-        for i, t in enumerate(out):
-            io_npz[f"output_{i}"] = t.detach().cpu().numpy()
-    else:
-        io_npz["output_0"] = out.detach().cpu().numpy()
+    in_parts: list[np.ndarray] = []
+    for k in input_names:
+        t = calib_sample[k]
+        if args.quant == "int8":
+            in_parts.append(
+                _quantize_per_tensor_sym(t, walker.scales[k]).ravel())
+        else:
+            in_parts.append(t.detach().cpu().numpy().ravel().astype(np.float32))
+    in_dtype = np.int8 if args.quant == "int8" else np.float32
+    inp_flat = np.concatenate(in_parts).astype(in_dtype)
+
+    # Output: same dtype treatment. For multi-output models we
+    # concatenate every output's flat bytes (test_io.h's golden cmp is
+    # done in one buffer comparison).
+    out_list = out if isinstance(out, (list, tuple)) else (out,)
+    out_parts: list[np.ndarray] = []
+    for i, t in enumerate(out_list):
+        out_name_i = output_names[i] if i < len(output_names) else None
+        sc = walker.scales.get(out_name_i, 1e-8) if out_name_i else 1e-8
+        if args.quant == "int8":
+            out_parts.append(_quantize_per_tensor_sym(t, sc).ravel())
+        else:
+            out_parts.append(t.detach().cpu().numpy().ravel().astype(np.float32))
+    out_flat = np.concatenate(out_parts).astype(in_dtype)
     io_path = out_dir / "io.npz"
-    np.savez(io_path, **io_npz)
+    np.savez(io_path, input=inp_flat, output=out_flat)
     print(f"[extract_export] wrote {io_path} "
-          f"({len(io_npz)} tensors)", flush=True)
+          f"(input {inp_flat.size} {in_dtype.__name__}, "
+          f"output {out_flat.size} {in_dtype.__name__})",
+          flush=True)
 
 
 if __name__ == "__main__":

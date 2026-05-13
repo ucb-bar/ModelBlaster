@@ -1264,6 +1264,19 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['M']}, {sh['K']}, "
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])})"
             )
+        elif op["op"] == "slice_c_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_slice_c_s8({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, "
+                f"{sh['C_start']}, {sh['C_end']}, "
+                f"{sh['H']}, {sh['W']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
         # ---- fp16 (half-precision) variants. Same dataflow as fp32 but
         #      the kernel signature takes _Float16 storage. No quantization
         #      knobs — that's what fp16 is FOR. ----
