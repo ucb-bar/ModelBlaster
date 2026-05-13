@@ -77,9 +77,22 @@ def main():
     # how the fp32 trajectory varies across inputs).
     int8_out = io["output"]   # int8 buffer for sample[0]
     dist_int8_s0 = float(int8_out[0]) * out_scales[0]
-    action_int8_s0 = (
+    # The io.npz "action" portion is the PRE-cumsum, PRE-normalize
+    # delta tensor (linear_24's output in ViNT) — the IR resolved
+    # `reshape_2` through the tail-op alias chain back to that
+    # captured intermediate. Apply the tail post-process in scalar
+    # here so the comparison matches what the pilot's steering
+    # consumes (cumsum'd waypoints + L2-normalized angle).
+    action_int8_deltas = (
         int8_out[1:21].astype(np.float32) * out_scales[1]
     ).reshape(5, 4)
+    action_int8_s0 = action_int8_deltas.copy()
+    # cumsum the (dx, dy) cols.
+    action_int8_s0[:, :2] = np.cumsum(action_int8_s0[:, :2], axis=0)
+    # L2-normalize the (sin, cos) cols.
+    n = np.linalg.norm(action_int8_s0[:, 2:], axis=1, keepdims=True)
+    n = np.clip(n, 1e-12, None)
+    action_int8_s0[:, 2:] = action_int8_s0[:, 2:] / n
 
     for i in range(args.n_samples):
         obs, goal = samples[i]
