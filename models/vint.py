@@ -40,6 +40,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import torch
 import yaml
@@ -126,8 +127,10 @@ def get_sample_input() -> tuple[torch.Tensor, torch.Tensor]:
     """Return one ``(obs, goal)`` tuple sized per the published config.
 
     Single sample is fine for graph tracing. For PTQ calibration the
-    caller should iterate over many samples (the extract_graph_export
-    path supports this via ``--calibration-glob``).
+    caller should use ``get_calibration_samples(n)`` instead — random
+    gaussian doesn't activate ViNT's learned filters anywhere near
+    the deployment distribution, and per-tensor max_abs scales
+    computed from torch.randn() are essentially noise.
     """
     cfg = _load_config()
     W, H = cfg["image_size"]
@@ -137,3 +140,83 @@ def get_sample_input() -> tuple[torch.Tensor, torch.Tensor]:
     obs = torch.randn(1, n_obs_channels, H, W, generator=g)
     goal = torch.randn(1, 3, H, W, generator=g)
     return obs, goal
+
+
+def _load_idsia_image(path: Path, image_size: tuple[int, int]) -> torch.Tensor:
+    """ImageNet-normalized resize → tensor pipeline (matches ViNT's training
+    preprocessing — see pilot_forest_with_vint.py::_vint_transform)."""
+    # Local imports keep the module light when only get_model() is needed.
+    from PIL import Image as PILImage  # noqa: PLC0415
+    from torchvision import transforms  # noqa: PLC0415
+    W, H = image_size  # yaml stores as (W, H)
+    tfm = transforms.Compose([
+        transforms.Resize((H, W)),  # torchvision Resize takes (H, W)
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    return tfm(PILImage.open(path).convert("RGB"))
+
+
+def get_calibration_samples(
+    n_samples: int = 32,
+    sample_dir: Optional[str] = None,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Return a list of ``(obs, goal)`` calibration tuples drawn from the
+    IDSIA forest-trail samples that the pilot script uses.
+
+    Each sample's obs is a rolling 6-frame stack along channel dim
+    (matching ViNT's ``context_size+1=6`` input) and the goal is a
+    fixed end-of-trail image. The first ``context_size`` frames of
+    obs are repeats of the first image (to bootstrap the rolling
+    window without padding artifacts).
+
+    Override the source directory with the ``AGENTS_VINT_CALIB_DIR``
+    env var. Falls back to ``torch.randn()`` samples if the dir is
+    missing — useful for CI / smoke tests on machines without the
+    IDSIA data.
+    """
+    import os
+    cfg = _load_config()
+    W, H = cfg["image_size"]
+    ctx = cfg["context_size"]
+    n_obs_channels = 3 * (ctx + 1)
+
+    sample_dir = sample_dir or os.environ.get(
+        "AGENTS_VINT_CALIB_DIR",
+        str(_REPO_ROOT / "datasets/idsia/samples/sc"),
+    )
+    samples_root = Path(sample_dir)
+    if not samples_root.is_dir():
+        print(f"[vint.get_calibration_samples] WARN: {samples_root} not "
+              f"found; falling back to torch.randn calibration. The "
+              f"extracted activation scales will reflect noise, not "
+              f"real navigation imagery.", flush=True)
+        g = torch.Generator().manual_seed(0)
+        return [(
+            torch.randn(1, n_obs_channels, H, W, generator=g),
+            torch.randn(1, 3, H, W, generator=g),
+        ) for _ in range(n_samples)]
+
+    image_paths = sorted(samples_root.glob("*.jpg"))
+    if not image_paths:
+        image_paths = sorted(samples_root.glob("*.png"))
+    if len(image_paths) < 2:
+        raise RuntimeError(
+            f"{samples_root} has fewer than 2 images; need at least one "
+            f"frame for the goal and one for the rolling obs window.")
+    images = [_load_idsia_image(p, (W, H)) for p in image_paths]
+    goal_full = images[-1].unsqueeze(0)  # (1, 3, H, W) — fixed end-of-trail
+    samples: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for i in range(n_samples):
+        # Build a rolling 6-frame context. When the calibration count
+        # exceeds the available image count we cycle with stride so
+        # consecutive obs windows differ.
+        anchor = (i * max(1, len(images) // n_samples)) % len(images)
+        context = []
+        for k in range(ctx + 1):
+            idx = max(0, anchor - (ctx - k)) % len(images)
+            context.append(images[idx])
+        obs = torch.cat(context, dim=0).unsqueeze(0)  # (1, 3*(ctx+1), H, W)
+        samples.append((obs, goal_full))
+    return samples

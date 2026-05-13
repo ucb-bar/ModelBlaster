@@ -1058,7 +1058,7 @@ def _get_attr_value(gm, qualname: str) -> torch.Tensor:
 # Top-level entry point.
 # ----------------------------------------------------------------------
 
-def _load_model(name: str):
+def _import_model_module(name: str):
     if name == "vint":
         from agents.models import vint as model_mod
     else:
@@ -1066,6 +1066,11 @@ def _load_model(name: str):
             f"--model {name} doesn't need extract_graph_export; "
             f"use extract_graph.py (FX-based) instead."
         )
+    return model_mod
+
+
+def _load_model(name: str):
+    model_mod = _import_model_module(name)
     sample = model_mod.get_sample_input()
     if isinstance(sample, torch.Tensor):
         sample = (sample,)
@@ -1103,11 +1108,10 @@ def main():
     if args.inventory_only:
         return
 
-    # Build calibration dict. Inputs are keyed by the aten graph's
-    # user-input placeholder names (NOT our chosen labels) so the
-    # walker can resolve `obs_img`/`goal_img` references the same way
-    # ViNT.forward declared them. Find those names from the export
-    # signature.
+    # Build the calibration dataset. Inputs are keyed by the aten
+    # graph's user-input placeholder names (NOT our chosen labels)
+    # so the walker can resolve `obs_img`/`goal_img` references the
+    # same way ViNT.forward declared them.
     sig = ep.graph_signature
     user_input_names = [s.arg.name for s in sig.input_specs
                          if s.kind.name == "USER_INPUT"]
@@ -1116,15 +1120,43 @@ def main():
             f"export user_input count {len(user_input_names)} != "
             f"sample length {len(sample)}")
     input_order = user_input_names
-    calib_sample = {name: t for name, t in zip(input_order, sample)}
-    walker = _ExportWalker(ep, [calib_sample], input_order)
+
+    # Multi-sample calibration: if the model module exposes
+    # ``get_calibration_samples(n)``, use it. Otherwise fall back to
+    # repeating the single ``get_sample_input()`` we already traced
+    # with (single-sample max_abs == 1-shot calibration).
+    calib_samples_tuples: list[tuple] = []
+    if args.num_calibration > 1:
+        mod = _import_model_module(args.model)
+        if hasattr(mod, "get_calibration_samples"):
+            print(f"[extract_export] loading {args.num_calibration} "
+                  f"calibration samples via {args.model}."
+                  f"get_calibration_samples ...", flush=True)
+            calib_samples_tuples = mod.get_calibration_samples(
+                args.num_calibration)
+        else:
+            print(f"[extract_export] WARN: {args.model} module has no "
+                  f"get_calibration_samples; using single sample "
+                  f"(scale quality will be poor for trained nets).",
+                  flush=True)
+            calib_samples_tuples = [sample]
+    else:
+        calib_samples_tuples = [sample]
+
+    calib_dicts = [
+        {name: t for name, t in zip(input_order, s)}
+        for s in calib_samples_tuples
+    ]
+    walker = _ExportWalker(ep, calib_dicts, input_order)
     print(f"[extract_export] calibrating + capturing intermediates ...",
           flush=True)
     walker.calibrate()
     print(f"[extract_export] emitting IR ...", flush=True)
     walker.emit()
 
-    # Inputs / outputs from the export's user signature.
+    # Inputs / outputs from the export's user signature. Use the
+    # first calibration sample for sizing / golden capture.
+    calib_sample = calib_dicts[0]
     input_names = list(calib_sample.keys())
     for k in input_names:
         walker._record_tensor(k)
