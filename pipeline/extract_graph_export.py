@@ -442,11 +442,12 @@ class _ExportWalker:
         raise NotImplementedError(f"supported but no emit branch: {op_kind}")
 
     def _emit_new(self, n):
-        """Emit IR records for the ViNT-new ops. Kernels for these are
-        added op-by-op in follow-up commits — for now the IR is
-        well-formed and codegen will fail with a clear missing-kernel
-        message until a matching reference impl lands.
-        """
+        """Emit IR records for the ViNT-new ops. Most lower to a single
+        s8 kernel call; SDPA gets decomposed into matmul+softmax+matmul
+        so the scheduler can place them independently. Layer-norm pulls
+        gamma + beta from its aten args (positions 2 and 3) and records
+        them as constant_buffer tensors so the skeleton emitter can
+        reference them by name."""
         op_kind = _op_name(n)
         if op_kind == "scaled_dot_product_attention.default":
             self._emit_sdpa_decomposed(n); return
@@ -465,7 +466,6 @@ class _ExportWalker:
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
             },
-            "_pending_kernel": True,
         }
         if op_kind == "mul.Tensor":
             b = self._resolve_input(n.args[1])
@@ -475,57 +475,135 @@ class _ExportWalker:
                 "scale_b":   self.scales.get(b, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
             }
+        elif op_kind == "layer_norm.default":
+            # aten signature: layer_norm(input, normalized_shape, weight,
+            # bias, eps). Pull gamma + beta refs via _resolve_input so
+            # they get recorded in weights_blob (constant_buffer path).
+            gamma = self._resolve_input(n.args[2]) if len(n.args) > 2 and n.args[2] is not None else None
+            beta = self._resolve_input(n.args[3]) if len(n.args) > 3 and n.args[3] is not None else None
+            eps = float(n.args[4]) if len(n.args) > 4 else 1e-5
+            in_shape = self.tensors[in_name].shape
+            # Flatten leading dims into M; last dim is K (LayerNorm normalizes
+            # over the last axis when normalized_shape == [K]).
+            K = int(in_shape[-1])
+            M = 1
+            for d in in_shape[:-1]: M *= int(d)
+            rec["shape"] = {"M": M, "K": K}
+            rec["quant"] = {
+                "scale_in":    self.scales.get(in_name, 1e-8),
+                "scale_gamma": self.scales.get(gamma, 1e-8) if gamma else 0.0,
+                "scale_beta":  self.scales.get(beta, 1e-8) if beta else 0.0,
+                "scale_out":   self.scales.get(out_name, 1e-8),
+                "eps": eps,
+                "gamma_key": gamma,
+                "beta_key":  beta,
+                "activation_min": -128, "activation_max": 127,
+            }
+        elif op_kind == "adaptive_avg_pool2d.default":
+            in_shape = self.tensors[in_name].shape
+            out_shape = self.tensors[out_name].shape
+            rec["shape"] = {
+                "N": int(out_shape[0]), "C": int(out_shape[1]),
+                "IH": int(in_shape[2]), "IW": int(in_shape[3]),
+                "OH": int(out_shape[2]), "OW": int(out_shape[3]),
+            }
+            rec["quant"]["activation_min"] = -128
+            rec["quant"]["activation_max"] = 127
+        elif op_kind in ("sigmoid.default", "gelu.default"):
+            rec["shape"] = {"n": int(np.prod(self.tensors[out_name].shape))}
+            rec["quant"]["activation_min"] = -128
+            rec["quant"]["activation_max"] = 127
         self.ops.append(rec)
 
     def _emit_sdpa_decomposed(self, n):
         """SDPA(Q, K, V) → matmul(Q, Kᵀ)/√d → softmax → matmul(_, V)
 
-        We emit three IR records sharing the SDPA node's name as a
-        prefix (so debug printouts make the lineage obvious) and pin
-        each one to a separate output tensor.
+        Emits three records (matmul, softmax, matmul) sharing the SDPA
+        node's name as a prefix and synthesizing the intermediate
+        tensor names (scores, weights). Each gets pinned to its own
+        output buffer so the runtime can place them on different harts.
         """
-        q, k, v = (self._resolve_input(a) for a in n.args[:3])
-        head_dim = self.tensors[q.split('::')[0] if '::' in q else q].shape[-1] \
-            if q in self.tensors else None
-        scores_name = f"{n.name}::scores"
-        weights_name = f"{n.name}::weights"
+        import math
+        q = self._resolve_input(n.args[0])
+        k = self._resolve_input(n.args[1])
+        v = self._resolve_input(n.args[2])
+        # Pull Q/K/V shapes directly from the export's meta['val'] so we
+        # don't get confused by upstream view/transpose aliases that
+        # would route us to a pre-split QKV tensor with the wrong rank.
+        def _shape(node):
+            if hasattr(node, 'meta') and 'val' in node.meta:
+                return tuple(int(s) for s in node.meta['val'].shape)
+            return None
+        q_shape = _shape(n.args[0])
+        k_shape = _shape(n.args[1])
+        v_shape = _shape(n.args[2])
+        # Q layout: (..., L_q, head_dim). Last two dims are what matters.
+        if q_shape and len(q_shape) >= 2:
+            L_q = q_shape[-2]
+            head_dim = q_shape[-1]
+        else:
+            L_q, head_dim = 0, 1
+        if k_shape and len(k_shape) >= 2:
+            L_k = k_shape[-2]
+        else:
+            L_k = 0
+        if v_shape and len(v_shape) >= 2:
+            head_dim_v = v_shape[-1]
+        else:
+            head_dim_v = head_dim
+        scale_div = math.sqrt(max(head_dim, 1))
+        scores_name = f"{n.name}__scores"
+        weights_name = f"{n.name}__weights"
         out_name = n.name
-        self._record_tensor(scores_name)
-        self._record_tensor(weights_name)
+        # Synthesize intermediate-tensor scales (no real capture for
+        # these): scores use Q's range × √d, weights are [0, 1] mapped
+        # to scale 1/127.
+        self.scales[scores_name] = self.scales.get(q, 1e-8) * scale_div
+        self.scales[weights_name] = 1.0 / 127.0
+        # Record meta records so downstream alias resolution finds them.
+        self.tensors_meta[scores_name] = {
+            "shape": [L_q, L_k], "dtype": "i8",
+            "quant": {"scale": self.scales[scores_name], "zero_point": 0},
+        }
+        self.tensors_meta[weights_name] = {
+            "shape": [L_q, L_k], "dtype": "i8",
+            "quant": {"scale": self.scales[weights_name], "zero_point": 0},
+        }
         self._record_tensor(out_name)
         self.ops.append({
             "name": f"{n.name}_qk", "op": "matmul_s8",
             "inputs": [q, k], "outputs": [scores_name],
-            "shape": dict(self._shape_kv(scores_name)),
+            "shape": {"M": L_q, "K": head_dim, "N": L_k},
             "quant": {
                 "scale_a":   self.scales.get(q, 1e-8),
                 "scale_b":   self.scales.get(k, 1e-8),
-                "scale_out": self.scales.get(scores_name, 1e-8),
-                "transpose_b": True,
-                "scale_div_sqrt_dk": head_dim or 1,
+                "scale_out": self.scales[scores_name],
+                "transpose_b": 1,
+                "scale_div_sqrt_dk": scale_div,
+                "activation_min": -128, "activation_max": 127,
             },
-            "_pending_kernel": True,
         })
         self.ops.append({
             "name": f"{n.name}_softmax", "op": "softmax_s8",
             "inputs": [scores_name], "outputs": [weights_name],
-            "shape": dict(self._shape_kv(weights_name)),
+            "shape": {"M": L_q, "K": L_k},
             "quant": {
-                "scale_in":  self.scales.get(scores_name, 1e-8),
-                "scale_out": self.scales.get(weights_name, 1e-8),
+                "scale_in":  self.scales[scores_name],
+                "scale_out": self.scales[weights_name],
             },
-            "_pending_kernel": True,
         })
         self.ops.append({
             "name": f"{n.name}_av", "op": "matmul_s8",
             "inputs": [weights_name, v], "outputs": [out_name],
-            "shape": dict(self._shape_kv(out_name)),
+            "shape": {"M": L_q, "K": L_k, "N": head_dim_v},
             "quant": {
-                "scale_a":   self.scales.get(weights_name, 1e-8),
+                "scale_a":   self.scales[weights_name],
                 "scale_b":   self.scales.get(v, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
+                "transpose_b": 0,
+                "scale_div_sqrt_dk": 1.0,
+                "activation_min": -128, "activation_max": 127,
             },
-            "_pending_kernel": True,
         })
 
     # ------------------------------------------------------------------
@@ -734,7 +812,6 @@ class _ExportWalker:
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "pad_value": 0,  # zero-pad in int8 domain
             },
-            "_pending_kernel": True,
         })
 
     def _emit_maxpool(self, n):
