@@ -19,6 +19,9 @@ QUANT="${QUANT:-int8}"
 TARGET="${TARGET:-scalar}"
 BACKEND="${BACKEND:-reference}"
 RUNNER="${RUNNER:-spike}"
+# Default to 16 IDSIA samples for activation-scale calibration.
+# Override via AGENTS_VINT_CALIB_DIR for the data source.
+N_CALIB="${VINT_NUM_CALIBRATION:-16}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${REPO_ROOT}"
@@ -35,7 +38,8 @@ if [[ "${FORCE_EXTRACT:-0}" == "1" \
     mkdir -p "${IR_DIR}"
     XPURT_PY="${XPURT_PY:-/scratch2/dima/miniforge3/envs/xpurt/bin/python}"
     PYTHONPATH="${REPO_ROOT}" "${XPURT_PY}" -m agents.pipeline.extract_graph_export \
-        --model "${MODEL_NAME}" --quant "${QUANT}" --out-dir "${IR_DIR}"
+        --model "${MODEL_NAME}" --quant "${QUANT}" \
+        --num-calibration "${N_CALIB}" --out-dir "${IR_DIR}"
 fi
 
 # Stage 2–5 — delegate to _run_lib.sh. Re-source the Zephyr SDK env
