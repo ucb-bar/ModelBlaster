@@ -142,92 +142,77 @@ def get_sample_input() -> tuple[torch.Tensor, torch.Tensor]:
     return obs, goal
 
 
-def _load_idsia_image(path: Path, image_size: tuple[int, int]) -> torch.Tensor:
-    """ImageNet-normalized resize → tensor pipeline (matches ViNT's training
-    preprocessing — see pilot_forest_with_vint.py::_vint_transform)."""
-    # Local imports keep the module light when only get_model() is needed.
-    from PIL import Image as PILImage  # noqa: PLC0415
-    from torchvision import transforms  # noqa: PLC0415
-    W, H = image_size  # yaml stores as (W, H)
-    tfm = transforms.Compose([
-        transforms.Resize((H, W)),  # torchvision Resize takes (H, W)
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-    return tfm(PILImage.open(path).convert("RGB"))
+def get_calibration_spec(num_samples: int = 16) -> dict:
+    """Return a declarative calibration spec for the agents/datasets
+    loader. The walker materializes (obs, goal) tuples from this and
+    serializes the spec into the generated/ dir for reproducibility.
 
-
-def get_calibration_samples(
-    n_samples: int = 32,
-    sample_dir: Optional[str] = None,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Return a list of ``(obs, goal)`` calibration tuples drawn from the
-    IDSIA forest-trail samples that the pilot script uses.
-
-    Each sample's obs is a rolling 6-frame stack along channel dim
-    (matching ViNT's ``context_size+1=6`` input) and the goal is a
-    fixed end-of-trail image. The first ``context_size`` frames of
-    obs are repeats of the first image (to bootstrap the rolling
-    window without padding artifacts).
-
-    Override the source directory with the ``AGENTS_VINT_CALIB_DIR``
-    env var. Falls back to ``torch.randn()`` samples if the dir is
-    missing — useful for CI / smoke tests on machines without the
-    IDSIA data.
+    Two inputs:
+     * obs_img: rolling 6-frame stack along channel dim — drawn from
+       IDSIA still images by default. Override the dir with
+       ``AGENTS_VINT_OBS_DATASET`` (path under datasets/).
+     * goal_img: one image per sample — IsaacLab forest renders by
+       preference (matches the deployment distribution; the
+       goal_encoder was the main int8 drift source when calibrated
+       with IDSIA stills, see inspect_intermediates.py results).
+       Falls back to IDSIA if the IsaacLab render dir doesn't exist
+       (with a clear warning).
     """
     import os
     cfg = _load_config()
     W, H = cfg["image_size"]
     ctx = cfg["context_size"]
-    n_obs_channels = 3 * (ctx + 1)
+    obs_dir = os.environ.get(
+        "AGENTS_VINT_OBS_DATASET", "datasets/idsia/samples/sc")
+    goal_render_dir = _REPO_ROOT.parent / "datasets/isaaclab_forest_renders"
+    if goal_render_dir.is_dir():
+        goal_input = {
+            "loader": "isaaclab_forest_render",
+            "path": str(goal_render_dir),
+            "image_size": [W, H],
+        }
+    else:
+        print(f"[vint.get_calibration_spec] WARN: {goal_render_dir} not "
+              f"found — falling back to IDSIA images for goal calibration. "
+              f"For real deployment accuracy, render IsaacLab forest goals "
+              f"via sims/scripts/utils/render_vint_calibration.py.",
+              flush=True)
+        goal_input = {
+            "loader": "image_dir",
+            "path": obs_dir,
+            "image_size": [W, H],
+        }
+    return {
+        "num_samples": num_samples,
+        "inputs": {
+            "obs_img": {
+                "loader": "image_dir",
+                "path": obs_dir,
+                "image_size": [W, H],
+                "compose": {
+                    "kind": "rolling_window",
+                    "frames_per_sample": ctx + 1,
+                },
+            },
+            "goal_img": {
+                **goal_input,
+                "compose": {"kind": "one_per_sample"},
+            },
+        },
+    }
 
-    sample_dir = sample_dir or os.environ.get(
-        "AGENTS_VINT_CALIB_DIR",
-        str(_REPO_ROOT / "datasets/idsia/samples/sc"),
-    )
-    samples_root = Path(sample_dir)
-    if not samples_root.is_dir():
-        print(f"[vint.get_calibration_samples] WARN: {samples_root} not "
-              f"found; falling back to torch.randn calibration. The "
-              f"extracted activation scales will reflect noise, not "
-              f"real navigation imagery.", flush=True)
-        g = torch.Generator().manual_seed(0)
-        return [(
-            torch.randn(1, n_obs_channels, H, W, generator=g),
-            torch.randn(1, 3, H, W, generator=g),
-        ) for _ in range(n_samples)]
 
-    image_paths = sorted(samples_root.glob("*.jpg"))
-    if not image_paths:
-        image_paths = sorted(samples_root.glob("*.png"))
-    if len(image_paths) < 2:
-        raise RuntimeError(
-            f"{samples_root} has fewer than 2 images; need at least one "
-            f"frame for the goal and one for the rolling obs window.")
-    images = [_load_idsia_image(p, (W, H)) for p in image_paths]
-    samples: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for i in range(n_samples):
-        # Build a rolling 6-frame context. When the calibration count
-        # exceeds the available image count we cycle with stride so
-        # consecutive obs windows differ.
-        anchor = (i * max(1, len(images) // n_samples)) % len(images)
-        context = []
-        for k in range(ctx + 1):
-            idx = max(0, anchor - (ctx - k)) % len(images)
-            context.append(images[idx])
-        obs = torch.cat(context, dim=0).unsqueeze(0)  # (1, 3*(ctx+1), H, W)
-        # Vary the goal too — earlier versions pinned it to images[-1]
-        # for "every sample sees the end of trail", but that meant the
-        # goal_encoder calibration only saw ONE input distribution.
-        # On ViNT the goal pipeline produces large-magnitude activations
-        # (max_abs ~164 at the compress output vs ~28 for obs); without
-        # diverse goal samples the per-tensor scale fits poorly and the
-        # int8 forward of the goal encoder collapses information
-        # (cos-sim vs PyTorch fp32 → ~0 at the goal_encoder output).
-        # Use a stride-offset goal so each calibration sample sees a
-        # different goal image while still covering the IDSIA spread.
-        goal_idx = (anchor + len(images) // 2) % len(images)
-        goal = images[goal_idx].unsqueeze(0)
-        samples.append((obs, goal))
-    return samples
+def get_calibration_samples(
+    n_samples: int = 32,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Materialize (obs, goal) calibration tuples via the agents.datasets
+    spec resolver. Returns ``[(obs (1, 18, H, W), goal (1, 3, H, W)), ...]``
+    in the order the model's forward expects.
+
+    Back-compat wrapper around ``get_calibration_spec`` for callers
+    that don't want to plumb the spec themselves.
+    """
+    from agents.datasets import materialize_calibration_samples  # noqa: PLC0415
+    spec = get_calibration_spec(n_samples)
+    materialized = materialize_calibration_samples(spec)
+    return [(d["obs_img"], d["goal_img"]) for d in materialized]

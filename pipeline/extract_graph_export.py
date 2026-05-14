@@ -1345,14 +1345,32 @@ def main():
             f"sample length {len(sample)}")
     input_order = user_input_names
 
-    # Multi-sample calibration: if the model module exposes
-    # ``get_calibration_samples(n)``, use it. Otherwise fall back to
-    # repeating the single ``get_sample_input()`` we already traced
-    # with (single-sample max_abs == 1-shot calibration).
+    # Multi-sample calibration. The model module declares a
+    # *calibration spec* (the canonical, reproducible source-of-truth
+    # for where activation scales come from). The spec gets resolved
+    # via agents.datasets.materialize_calibration_samples and
+    # serialized into the generated/ dir for later reference. If the
+    # model doesn't ship a spec yet, fall back to its
+    # get_calibration_samples helper, then finally the single trace
+    # sample.
     calib_samples_tuples: list[tuple] = []
+    calib_spec: dict | None = None
     if args.num_calibration > 1:
         mod = _import_model_module(args.model)
-        if hasattr(mod, "get_calibration_samples"):
+        if hasattr(mod, "get_calibration_spec"):
+            from agents.datasets import materialize_calibration_samples  # noqa: PLC0415
+            calib_spec = mod.get_calibration_spec(args.num_calibration)
+            print(f"[extract_export] resolving calibration spec "
+                  f"({args.num_calibration} samples) ...", flush=True)
+            for k, v in calib_spec["inputs"].items():
+                src = v.get("path") or v.get("loader")
+                print(f"    {k}: {v['loader']} from {src}", flush=True)
+            materialized = materialize_calibration_samples(calib_spec)
+            # Re-tuple in the order of the model's forward.
+            calib_samples_tuples = [
+                tuple(d[k] for k in d.keys()) for d in materialized
+            ]
+        elif hasattr(mod, "get_calibration_samples"):
             print(f"[extract_export] loading {args.num_calibration} "
                   f"calibration samples via {args.model}."
                   f"get_calibration_samples ...", flush=True)
@@ -1360,9 +1378,9 @@ def main():
                 args.num_calibration)
         else:
             print(f"[extract_export] WARN: {args.model} module has no "
-                  f"get_calibration_samples; using single sample "
-                  f"(scale quality will be poor for trained nets).",
-                  flush=True)
+                  f"get_calibration_spec / get_calibration_samples; "
+                  f"using single sample (scale quality will be poor for "
+                  f"trained nets).", flush=True)
             calib_samples_tuples = [sample]
     else:
         calib_samples_tuples = [sample]
@@ -1545,6 +1563,14 @@ def main():
           f"(input {inp_flat.size} {in_dtype.__name__}, "
           f"output {out_flat.size} bytes [{', '.join(out_summary)}])",
           flush=True)
+
+    # Persist the calibration spec for reproducibility — anyone with
+    # this file + the source data can re-derive the same scales.
+    if calib_spec is not None:
+        spec_path = out_dir / "calibration_spec.json"
+        with open(spec_path, "w") as f:
+            json.dump(calib_spec, f, indent=2)
+        print(f"[extract_export] wrote {spec_path}", flush=True)
 
 
 if __name__ == "__main__":
