@@ -1420,11 +1420,41 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                          .replace("output)", "s->output)")
                          .replace("(output + ", "(s->output + ")
                          .replace("(pool, ", "(s->pool, "))
+        # Optional intermediate-tensor inspection: if any of this op's
+        # output tensors are in ir["inspect_tensors"], emit a print
+        # block after the dispatch so the host can compare to
+        # PyTorch fp32 at that point. Format is structured (one int
+        # per line between BEGIN/END markers, with scale + dtype in
+        # the header) so a runner-side parser can build a dict of
+        # {tensor_name: numpy array} from the spike stdout.
+        inspect_block = ""
+        inspect_set = set(ir.get("inspect_tensors", []) or [])
+        for out_t in op.get("outputs", []):
+            if out_t not in inspect_set:
+                continue
+            t_meta = ir["tensors"].get(out_t, {})
+            t_shape = t_meta.get("shape", [])
+            n_elems = 1
+            for d in t_shape: n_elems *= int(d)
+            t_dtype = t_meta.get("dtype", "i8")
+            t_scale = (t_meta.get("quant", {}) or {}).get("scale", 1.0)
+            out_ptr = _buf_name(mid, out_t)
+            cast = "int8_t" if t_dtype == "i8" else "float"
+            inspect_block += (
+                f'    printf("=== AGENTS_INSPECT_BEGIN [{out_t}] === '
+                f'scale=%g dtype={t_dtype} n=%d\\n", '
+                f'{_f32(t_scale)}, {n_elems});\n'
+                f"    {{ const {cast} *_p = (const {cast} *){out_ptr};\n"
+                f"      for (int _i = 0; _i < {n_elems}; _i++) "
+                f'printf("%g\\n", (double)(float)_p[_i]); }}\n'
+                f'    printf("=== AGENTS_INSPECT_END [{out_t}] ===\\n");\n'
+            )
         dispatch_fns.append(
             f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
             f"    unsigned long _s = rdcycle();\n"
             f"    {per_disp_call};\n"
             f"    unsigned long _e = rdcycle();\n"
+            f"{inspect_block}"
             f"    int slot = n_++;\n"
             f'    records_[slot].dispatch_id = {dispatch_id};\n'
             f'    records_[slot].name   = "{op["name"]}";\n'
