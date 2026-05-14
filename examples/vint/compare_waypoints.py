@@ -1,18 +1,24 @@
-"""Three-way trajectory comparison: PyTorch fp32 / int8 ceiling / spike actual.
+"""Four-way trajectory comparison: PyTorch fp32 / int8 ceiling / ONNX
+int8 (QDQ) / spike actual.
 
 ViNT outputs a (1, 5, 4) waypoint tensor (cumsum'd (x, y) + L2-normalized
-(sin θ, cos θ)) plus a dist_pred scalar. There are three meaningful
-versions of those outputs on a given input:
+(sin θ, cos θ)) plus a dist_pred scalar. The four versions:
 
  1. PyTorch fp32 — the ground truth the trained model emits.
- 2. "int8 representation ceiling" — quantize PyTorch fp32 to int8 with
-    our extracted output scales, then dequantize. This is what we'd see
-    if our int8 forward were magically bit-exact against PyTorch.
- 3. Spike actual — the binary's output after running 354 int8 ops
-    through the EfficientNet body + transformer + composite tail.
-    Read from the AGENTS_OUTPUT_BEGIN/END block in the spike stdout.
+ 2. "int8 representation ceiling" — quantize PyTorch fp32 outputs to
+    int8 with our extracted scales, then dequantize + apply tail.
+    Upper bound on accuracy if our int8 forward were lossless.
+ 3. ONNX int8 (QDQ) — vint_int8.onnx from the existing
+    sims/scripts/utils/quantize_vint.py. The QDQ format stores int8
+    values between ops but the underlying compute is fp32, so this is
+    a strong reference for "what stock industry-tooling int8 PTQ
+    produces". A big gap between this and (4) means our true-int8
+    forward (not the quant scheme) is the dominant drift source.
+ 4. Spike actual — our binary's output after running 354 real int8
+    ops through the EfficientNet body + transformer + composite tail.
+    Read from the AGENTS_OUTPUT_BEGIN/END block in spike stdout.
 
-This script runs all three on the same input (the first calibration
+The script runs all four on the same input (the first calibration
 sample, which is also what io.npz pinned the golden against) and prints
 a side-by-side table in waypoint-space units.
 
@@ -108,6 +114,10 @@ def main():
                    default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
     p.add_argument("--waypoint-idx", type=int, default=2)
     p.add_argument("--omega-gain", type=float, default=2.0)
+    p.add_argument("--onnx-int8", default=str(
+        _REPO_ROOT.parent / "sims/external/visualnav-transformer/"
+                            "deployment/model_weights/vint_int8.onnx"),
+                   help="QDQ int8 ONNX path; set empty string to skip.")
     args = p.parse_args()
 
     elf = Path(args.build_dir) / "zephyr" / "zephyr.elf"
@@ -135,7 +145,25 @@ def main():
     ceil_dist = float(io["output"][0])
     ceil_wp = io["output"][1:21].reshape(5, 4)
 
-    # ---- (3) Spike actual output -----------------------------------------
+    # ---- (3) QDQ ONNX int8 ------------------------------------------------
+    onnx_dist, onnx_wp = None, None
+    if args.onnx_int8 and Path(args.onnx_int8).is_file():
+        try:
+            import onnxruntime as ort  # noqa: PLC0415
+            sess = ort.InferenceSession(
+                args.onnx_int8, providers=["CPUExecutionProvider"])
+            in_names = [i.name for i in sess.get_inputs()]
+            feed = {in_names[0]: obs0.numpy().astype(np.float32),
+                    in_names[1]: goal0.numpy().astype(np.float32)}
+            onnx_outs = sess.run(None, feed)
+            onnx_dist = float(onnx_outs[0].ravel()[0])
+            onnx_wp = onnx_outs[1][0]  # (5, 4)
+        except Exception as e:
+            print(f"[warn] ONNX int8 inference failed ({e}); skipping row 3.")
+    else:
+        print(f"[info] {args.onnx_int8} not present; skipping ONNX int8 row.")
+
+    # ---- (4) Spike actual output -----------------------------------------
     print(f"running spike on {elf} ...", flush=True)
     spike_text = _run_spike(str(elf), args.spike)
     spike_arr = _parse_output_block(spike_text)
@@ -147,18 +175,26 @@ def main():
     _print_wp_row("PyTorch fp32 (ground truth)", fp32_dist, fp32_wp)
     print()
     _print_wp_row("int8 representation ceiling", ceil_dist, ceil_wp, ref=fp32_wp)
+    if onnx_wp is not None:
+        print()
+        _print_wp_row("ONNX int8 (QDQ — int8 storage, fp32 compute)",
+                       onnx_dist, onnx_wp, ref=fp32_wp)
     print()
-    _print_wp_row("spike actual output", spike_dist, spike_wp, ref=fp32_wp)
+    _print_wp_row("spike actual (real int8 compute)", spike_dist, spike_wp,
+                  ref=fp32_wp)
 
     # Pilot steering signal at the chosen waypoint
     pick = args.waypoint_idx
     def _omega(wp):
         return np.arctan2(wp[pick, 1], wp[pick, 0]) * args.omega_gain
     print(f"\nPilot ω@wp{pick}:")
-    print(f"  fp32:   {_omega(fp32_wp):+.3f} rad/s")
-    print(f"  ceiling:{_omega(ceil_wp):+.3f} rad/s  Δ vs fp32 = "
+    print(f"  fp32:    {_omega(fp32_wp):+.3f} rad/s")
+    print(f"  ceiling: {_omega(ceil_wp):+.3f} rad/s  Δ vs fp32 = "
           f"{abs(_omega(ceil_wp) - _omega(fp32_wp)):.3f}")
-    print(f"  spike:  {_omega(spike_wp):+.3f} rad/s  Δ vs fp32 = "
+    if onnx_wp is not None:
+        print(f"  onnx:    {_omega(onnx_wp):+.3f} rad/s  Δ vs fp32 = "
+              f"{abs(_omega(onnx_wp) - _omega(fp32_wp)):.3f}")
+    print(f"  spike:   {_omega(spike_wp):+.3f} rad/s  Δ vs fp32 = "
           f"{abs(_omega(spike_wp) - _omega(fp32_wp)):.3f}")
 
 
