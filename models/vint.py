@@ -206,7 +206,6 @@ def get_calibration_samples(
             f"{samples_root} has fewer than 2 images; need at least one "
             f"frame for the goal and one for the rolling obs window.")
     images = [_load_idsia_image(p, (W, H)) for p in image_paths]
-    goal_full = images[-1].unsqueeze(0)  # (1, 3, H, W) — fixed end-of-trail
     samples: list[tuple[torch.Tensor, torch.Tensor]] = []
     for i in range(n_samples):
         # Build a rolling 6-frame context. When the calibration count
@@ -218,5 +217,17 @@ def get_calibration_samples(
             idx = max(0, anchor - (ctx - k)) % len(images)
             context.append(images[idx])
         obs = torch.cat(context, dim=0).unsqueeze(0)  # (1, 3*(ctx+1), H, W)
-        samples.append((obs, goal_full))
+        # Vary the goal too — earlier versions pinned it to images[-1]
+        # for "every sample sees the end of trail", but that meant the
+        # goal_encoder calibration only saw ONE input distribution.
+        # On ViNT the goal pipeline produces large-magnitude activations
+        # (max_abs ~164 at the compress output vs ~28 for obs); without
+        # diverse goal samples the per-tensor scale fits poorly and the
+        # int8 forward of the goal encoder collapses information
+        # (cos-sim vs PyTorch fp32 → ~0 at the goal_encoder output).
+        # Use a stride-offset goal so each calibration sample sees a
+        # different goal image while still covering the IDSIA spread.
+        goal_idx = (anchor + len(images) // 2) % len(images)
+        goal = images[goal_idx].unsqueeze(0)
+        samples.append((obs, goal))
     return samples

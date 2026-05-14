@@ -1302,6 +1302,13 @@ def main():
                         "and linear ops (one Q0.31 multiplier+shift per "
                         "output channel). Big accuracy win on trained "
                         "models — recommended for any int8 deployment.")
+    p.add_argument("--inspect", default="",
+                   help="Comma list of tensor names to dump at runtime "
+                       "(AGENTS_INSPECT_BEGIN/END blocks in stdout, one "
+                       "ASCII int per line, plus a scale= header so the "
+                       "host can dequantize). Useful for staged accuracy "
+                       "debugging: see which intermediate first diverges "
+                       "from PyTorch fp32.")
     p.add_argument("--num-calibration", type=int, default=1,
                    help="Number of calibration samples (currently uses the "
                         "model's get_sample_input() repeatedly with fresh "
@@ -1412,6 +1419,29 @@ def main():
             output_names = [composite_out]
 
     dispatches = _annotate_dispatches(walker.ops)
+    inspect_tensors = (
+        [s.strip() for s in args.inspect.split(",") if s.strip()]
+        if args.inspect else []
+    )
+    if inspect_tensors:
+        # Also save the captured fp32 values at each inspected tensor
+        # so the host comparison knows the PyTorch reference.
+        ref = {}
+        for t in inspect_tensors:
+            resolved = walker.name_map.get(t, t)
+            captured = walker.tensors.get(resolved)
+            if captured is None:
+                print(f"[extract_export] WARN: inspect tensor {t!r} "
+                      f"(resolved {resolved!r}) not captured; skipping ref",
+                      flush=True)
+                continue
+            ref[t] = captured.detach().cpu().numpy().astype(np.float32)
+            ref[f"{t}__scale"] = np.float32(walker.scales.get(resolved, 1e-8))
+        if ref:
+            np.savez(out_dir / "inspect_ref.npz", **ref)
+            print(f"[extract_export] wrote {out_dir / 'inspect_ref.npz'} "
+                  f"({len([k for k in ref if not k.endswith('__scale')])} "
+                  f"inspected tensors)", flush=True)
     ir = {
         "name": args.model,
         "version": 1,
@@ -1424,6 +1454,7 @@ def main():
         "tensors": walker.tensors_meta,
         "ops": walker.ops,
         "dispatches": dispatches,
+        "inspect_tensors": inspect_tensors,
     }
 
     graph_path = out_dir / "graph.json"
