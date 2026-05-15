@@ -1227,6 +1227,17 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q.get('activation_min', -128)}, "
                 f"{q.get('activation_max', 127)})"
             )
+        elif op["op"] == "mul_c1_s8":
+            gate_ptr = ptr_for(op["inputs"][0], "in")
+            x_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_mul_c1_s8({gate_ptr}, {x_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['HW']}, "
+                f"{_f32(q['scale_gate'])}, {_f32(q['scale_x'])}, "
+                f"{_f32(q['scale_out'])})"
+            )
         elif op["op"] == "gelu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
