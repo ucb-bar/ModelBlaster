@@ -108,9 +108,19 @@ _ALIAS = {
 # Eval-time / artifact no-ops. Skipped entirely.
 _NOOP = {
     "dropout.default",
-    "wrap_with_set_grad_enabled",
     "<built-in function getitem>",
     "copy_.default",
+}
+
+# torch.export wraps custom-autograd-Function activations (e.g. EfficientNet's
+# MemoryEfficientSwish) in a `wrap_with_set_grad_enabled` call to a sub-
+# GraphModule. The sub-graph for MemoryEfficientSwish is just
+# `mul(sigmoid(x), x)` (= silu). We decompose those wraps back into a
+# sigmoid + mul pair so the missing activation isn't silently dropped from
+# the IR — that was the cause of ~50% compounding magnitude drift through
+# the 16 MBConv blocks in the fp16 ViNT path.
+_SWISH = {
+    "wrap_with_set_grad_enabled",
 }
 
 # Tail post-process — runs in scalar code in the C harness's main, not
@@ -130,6 +140,7 @@ _TAIL = {
 def _classify(name: str) -> str:
     if name in _SUPPORTED_COMPUTE: return "supported"
     if name in _NEW_COMPUTE:        return "new"
+    if name in _SWISH:              return "swish"
     if name in _ALIAS:              return "alias"
     if name in _FOLD:               return "fold"
     if name in _NOOP:               return "noop"
@@ -192,7 +203,8 @@ class _ExportWalker:
     """
 
     def __init__(self, ep, calibration_tensors: list[dict[str, torch.Tensor]],
-                 input_order: list[str], per_channel: bool = False):
+                 input_order: list[str], per_channel: bool = False,
+                 quant: str = "int8"):
         self.ep = ep
         self.gm = ep.graph_module
         # When True, conv2d / linear / matmul emit their per-channel
@@ -200,6 +212,17 @@ class _ExportWalker:
         # output channel) instead of the per-tensor form. Activations
         # remain per-tensor symmetric.
         self.per_channel = per_channel
+        # "int8" (default — existing PTQ path) or "fp16" (half-precision,
+        # no calibration; weights cast to float16, op records carry
+        # "_f16" suffix, no scale/multiplier/shift metadata). The fp16
+        # path still walks the same aten graph and applies the same
+        # batchnorm/pad folding — only the numeric encoding differs.
+        if quant not in ("int8", "fp16"):
+            raise ValueError(f"quant must be 'int8' or 'fp16' (got {quant!r})")
+        self.quant = quant
+        self.op_suffix = "_s8" if quant == "int8" else "_f16"
+        self.tensor_dtype = "i8" if quant == "int8" else "f16"
+        self.weight_np_dtype = np.int8 if quant == "int8" else np.float16
         # Aten graph runs over ``flat_args`` (placeholders include
         # params, buffers, then user inputs). The ExportedProgram knows
         # how to materialize those for us via ``module()``.
@@ -294,6 +317,11 @@ class _ExportWalker:
             if i == 0:
                 captured_first = dict(cap.tensors)
         self.tensors = captured_first
+        # fp16 doesn't need activation scales — skip the derivation.
+        # The first-sample shapes captured above are all the fp16 path
+        # needs from calibrate().
+        if self.quant != "int8":
+            return
         for nname, m in max_abs.items():
             if pct is not None and nname in pct_samples and pct_samples[nname]:
                 # Percentile-based scale: clip outliers above the
@@ -384,17 +412,25 @@ class _ExportWalker:
         if not isinstance(t, torch.Tensor):
             return
         self.tensors[name] = t.detach().clone()
-        sc = _scale_from_max_abs(t)
-        self.scales[name] = sc
-        self.tensors_meta[name] = {
-            "shape": list(t.shape),
-            "dtype": "i8",
-            "quant": {"scale": sc, "zero_point": 0,
-                      "kind": "constant_buffer"},
-        }
-        self.weights_blob[name] = _quantize_per_tensor_sym(t, sc)
+        if self.quant == "int8":
+            sc = _scale_from_max_abs(t)
+            self.scales[name] = sc
+            self.tensors_meta[name] = {
+                "shape": list(t.shape),
+                "dtype": "i8",
+                "quant": {"scale": sc, "zero_point": 0,
+                          "kind": "constant_buffer"},
+            }
+            self.weights_blob[name] = _quantize_per_tensor_sym(t, sc)
+        else:  # fp16
+            self.tensors_meta[name] = {
+                "shape": list(t.shape),
+                "dtype": "f16",
+                "quant": {"kind": "constant_buffer"},
+            }
+            self.weights_blob[name] = t.detach().cpu().numpy().astype(np.float16)
 
-    def _record_tensor(self, name: str, dtype: str = "i8"):
+    def _record_tensor(self, name: str, dtype: Optional[str] = None):
         if name in self.tensors_meta:
             return
         t = self.tensors.get(name)
@@ -406,14 +442,21 @@ class _ExportWalker:
                     break
         if t is None:
             return  # constant / unused
-        self.tensors_meta[name] = {
-            "shape": list(t.shape),
-            "dtype": dtype,
-            "quant": {
-                "scale": self.scales.get(name, 1e-8),
-                "zero_point": 0,
-            },
-        }
+        eff_dtype = dtype if dtype is not None else self.tensor_dtype
+        if self.quant == "int8":
+            self.tensors_meta[name] = {
+                "shape": list(t.shape),
+                "dtype": eff_dtype,
+                "quant": {
+                    "scale": self.scales.get(name, 1e-8),
+                    "zero_point": 0,
+                },
+            }
+        else:  # fp16 — no per-tensor quant metadata
+            self.tensors_meta[name] = {
+                "shape": list(t.shape),
+                "dtype": eff_dtype,
+            }
 
     def _visit(self, n):
         # Skip structural nodes — those don't represent computation.
@@ -462,6 +505,9 @@ class _ExportWalker:
         if cls == "new":
             self._emit_new(n)
             return
+        if cls == "swish":
+            self._emit_swish(n)
+            return
         raise NotImplementedError(
             f"extract_graph_export: don't know how to handle aten op "
             f"{op_kind!r} (node {n.name}). Add a case to _visit()."
@@ -493,34 +539,80 @@ class _ExportWalker:
         op_kind = _op_name(n)
         if op_kind == "scaled_dot_product_attention.default":
             self._emit_sdpa_decomposed(n); return
-        s8_name = _NEW_COMPUTE[op_kind]
+        kern_base = _NEW_COMPUTE[op_kind].removesuffix("_s8")
+        kern_name = f"{kern_base}{self.op_suffix}"
         in_name = self._resolve_input(n.args[0])
         out_name = n.name
         self._record_tensor(out_name)
+        is_fp16 = (self.quant == "fp16")
         # Default shape: flat "n" for elementwise ops. Per-op overrides
         # below set 4-D / 2-D shape dicts when needed.
         rec = {
             "name": str(n.name),
-            "op": s8_name,
+            "op": kern_name,
             "inputs": [in_name] if not isinstance(n.args[0], (list, tuple))
                        else self._resolve_input(n.args[0]),
             "outputs": [out_name],
             "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
-            "quant": {
+        }
+        if not is_fp16:
+            rec["quant"] = {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "activation_min": -128, "activation_max": 127,
-            },
-        }
+            }
         if op_kind == "mul.Tensor":
             b = self._resolve_input(n.args[1])
             rec["inputs"] = [in_name, b]
-            rec["quant"] = {
-                "scale_a":   self.scales.get(in_name, 1e-8),
-                "scale_b":   self.scales.get(b, 1e-8),
-                "scale_out": self.scales.get(out_name, 1e-8),
-                "activation_min": -128, "activation_max": 127,
-            }
+            # Detect channel-axis broadcast: one input is [B, C, 1, 1] (or
+            # equivalently a length-C tensor) while the other is [B, C, H, W].
+            # EfficientNet's SE block multiplies a per-channel gate by an
+            # NCHW feature map — without the broadcast variant, mul_f16
+            # would read past the end of the gate buffer and produce
+            # garbage. Switch to mul_c1_{f16,s8} when this shape pattern
+            # is detected; otherwise keep the plain elementwise mul.
+            in_a_shape = self.tensors[in_name].shape if in_name in self.tensors else None
+            in_b_shape = self.tensors[b].shape if b in self.tensors else None
+            def _is_channel_gate(sh, nchw_shape):
+                if sh is None or nchw_shape is None or len(nchw_shape) != 4:
+                    return False
+                # Accept gate as either (B, C, 1, 1), (1, C, 1, 1), or just (C,).
+                if len(sh) == 4 and sh[0] in (1, nchw_shape[0]) and \
+                        sh[1] == nchw_shape[1] and sh[2] == 1 and sh[3] == 1:
+                    return True
+                if len(sh) == 1 and sh[0] == nchw_shape[1]:
+                    return True
+                return False
+            gate_name = None
+            nchw_name = None
+            nchw_shape = None
+            if in_a_shape is not None and in_b_shape is not None:
+                if _is_channel_gate(in_a_shape, in_b_shape):
+                    gate_name, nchw_name, nchw_shape = in_name, b, in_b_shape
+                elif _is_channel_gate(in_b_shape, in_a_shape):
+                    gate_name, nchw_name, nchw_shape = b, in_name, in_a_shape
+            if gate_name is not None:
+                # Rewrite this record to mul_c1_*.
+                N = int(nchw_shape[0])
+                C = int(nchw_shape[1])
+                HW = int(nchw_shape[2]) * int(nchw_shape[3])
+                rec["op"] = "mul_c1_f16" if is_fp16 else "mul_c1_s8"
+                rec["inputs"] = [gate_name, nchw_name]
+                rec["shape"] = {"N": N, "C": C, "HW": HW}
+                if not is_fp16:
+                    rec["quant"] = {
+                        "scale_gate": self.scales.get(gate_name, 1e-8),
+                        "scale_x":    self.scales.get(nchw_name, 1e-8),
+                        "scale_out":  self.scales.get(out_name, 1e-8),
+                        "activation_min": -128, "activation_max": 127,
+                    }
+            elif not is_fp16:
+                rec["quant"] = {
+                    "scale_a":   self.scales.get(in_name, 1e-8),
+                    "scale_b":   self.scales.get(b, 1e-8),
+                    "scale_out": self.scales.get(out_name, 1e-8),
+                    "activation_min": -128, "activation_max": 127,
+                }
         elif op_kind == "layer_norm.default":
             # aten signature: layer_norm(input, normalized_shape, weight,
             # bias, eps). Pull gamma + beta refs via _resolve_input so
@@ -535,16 +627,21 @@ class _ExportWalker:
             M = 1
             for d in in_shape[:-1]: M *= int(d)
             rec["shape"] = {"M": M, "K": K}
-            rec["quant"] = {
-                "scale_in":    self.scales.get(in_name, 1e-8),
-                "scale_gamma": self.scales.get(gamma, 1e-8) if gamma else 0.0,
-                "scale_beta":  self.scales.get(beta, 1e-8) if beta else 0.0,
-                "scale_out":   self.scales.get(out_name, 1e-8),
-                "eps": eps,
-                "gamma_key": gamma,
-                "beta_key":  beta,
-                "activation_min": -128, "activation_max": 127,
-            }
+            if is_fp16:
+                rec["gamma_key"] = gamma
+                rec["beta_key"] = beta
+                rec["eps"] = eps
+            else:
+                rec["quant"] = {
+                    "scale_in":    self.scales.get(in_name, 1e-8),
+                    "scale_gamma": self.scales.get(gamma, 1e-8) if gamma else 0.0,
+                    "scale_beta":  self.scales.get(beta, 1e-8) if beta else 0.0,
+                    "scale_out":   self.scales.get(out_name, 1e-8),
+                    "eps": eps,
+                    "gamma_key": gamma,
+                    "beta_key":  beta,
+                    "activation_min": -128, "activation_max": 127,
+                }
         elif op_kind == "adaptive_avg_pool2d.default":
             in_shape = self.tensors[in_name].shape
             out_shape = self.tensors[out_name].shape
@@ -553,12 +650,8 @@ class _ExportWalker:
                 "IH": int(in_shape[2]), "IW": int(in_shape[3]),
                 "OH": int(out_shape[2]), "OW": int(out_shape[3]),
             }
-            rec["quant"]["activation_min"] = -128
-            rec["quant"]["activation_max"] = 127
         elif op_kind in ("sigmoid.default", "gelu.default"):
             rec["shape"] = {"n": int(np.prod(self.tensors[out_name].shape))}
-            rec["quant"]["activation_min"] = -128
-            rec["quant"]["activation_max"] = 127
         self.ops.append(rec)
 
     def _emit_sdpa_decomposed(self, n):
@@ -601,21 +694,50 @@ class _ExportWalker:
         scores_name = f"{n.name}__scores"
         weights_name = f"{n.name}__weights"
         out_name = n.name
-        # Synthesize intermediate-tensor scales (no real capture for
-        # these): scores use Q's range × √d, weights are [0, 1] mapped
-        # to scale 1/127.
-        self.scales[scores_name] = self.scales.get(q, 1e-8) * scale_div
-        self.scales[weights_name] = 1.0 / 127.0
-        # Record meta records so downstream alias resolution finds them.
-        self.tensors_meta[scores_name] = {
-            "shape": [L_q, L_k], "dtype": "i8",
-            "quant": {"scale": self.scales[scores_name], "zero_point": 0},
-        }
-        self.tensors_meta[weights_name] = {
-            "shape": [L_q, L_k], "dtype": "i8",
-            "quant": {"scale": self.scales[weights_name], "zero_point": 0},
-        }
+        is_fp16 = (self.quant == "fp16")
+        if not is_fp16:
+            # Synthesize intermediate-tensor scales (no real capture for
+            # these): scores use Q's range × √d, weights are [0, 1] mapped
+            # to scale 1/127.
+            self.scales[scores_name] = self.scales.get(q, 1e-8) * scale_div
+            self.scales[weights_name] = 1.0 / 127.0
+            self.tensors_meta[scores_name] = {
+                "shape": [L_q, L_k], "dtype": "i8",
+                "quant": {"scale": self.scales[scores_name], "zero_point": 0},
+            }
+            self.tensors_meta[weights_name] = {
+                "shape": [L_q, L_k], "dtype": "i8",
+                "quant": {"scale": self.scales[weights_name], "zero_point": 0},
+            }
+        else:
+            self.tensors_meta[scores_name] = {
+                "shape": [L_q, L_k], "dtype": "f16",
+            }
+            self.tensors_meta[weights_name] = {
+                "shape": [L_q, L_k], "dtype": "f16",
+            }
         self._record_tensor(out_name)
+        if is_fp16:
+            # matmul_tb_f16 = matmul with B transposed = Q · Kᵀ.
+            # The 1/√d_k pre-softmax scale is folded into softmax_f16's
+            # input_scale parameter so we don't need an extra pointwise op.
+            self.ops.append({
+                "name": f"{n.name}_qk", "op": "matmul_tb_f16",
+                "inputs": [q, k], "outputs": [scores_name],
+                "shape": {"M": L_q, "K": head_dim, "N": L_k},
+            })
+            self.ops.append({
+                "name": f"{n.name}_softmax", "op": "softmax_f16",
+                "inputs": [scores_name], "outputs": [weights_name],
+                "shape": {"M": L_q, "K": L_k},
+                "input_scale": 1.0 / scale_div,
+            })
+            self.ops.append({
+                "name": f"{n.name}_av", "op": "matmul_f16",
+                "inputs": [weights_name, v], "outputs": [out_name],
+                "shape": {"M": L_q, "K": L_k, "N": head_dim_v},
+            })
+            return
         self.ops.append({
             "name": f"{n.name}_qk", "op": "matmul_s8",
             "inputs": [q, k], "outputs": [scores_name],
@@ -653,6 +775,95 @@ class _ExportWalker:
         })
 
     # ------------------------------------------------------------------
+    # Memory-efficient swish (SiLU) emit. EfficientNet wraps its swish
+    # activations in a `wrap_with_set_grad_enabled(False, submod_N, x)`
+    # call that invokes a 2-node sub-graph (`mul(sigmoid(x), x)`). The
+    # walker doesn't recurse into sub-graphs, so we need to detect the
+    # wrap nodes and emit the equivalent sigmoid + mul pair directly
+    # against the parent graph.
+    # ------------------------------------------------------------------
+    def _emit_swish(self, n):
+        # Args: (no_grad_flag: bool, submod_node: get_attr, x: tensor).
+        # The 3rd arg is always the data tensor.
+        input_node = n.args[2]
+        input_name = self._resolve_input(input_node)
+        out_name = n.name
+
+        # Compute fp32 reference so _record_tensor can find shape + value.
+        # cap.tensors stores the wrap node's output as a tuple (because the
+        # wrap returns whatever submod returns wrapped in single-element
+        # tuple) — we'd rather hold a tensor, so recompute silu directly.
+        input_t = self.tensors.get(input_name)
+        if input_t is None:
+            return  # input not captured; nothing to do
+        with torch.no_grad():
+            self.tensors[out_name] = (
+                input_t * torch.sigmoid(input_t)).detach()
+
+        self._record_tensor(out_name)
+        sig_name = f"{n.name}__sigmoid"
+        # Intermediate sigmoid output: same shape as input, fp16/i8 dtype.
+        if sig_name not in self.tensors_meta:
+            self.tensors[sig_name] = torch.sigmoid(input_t).detach()
+            if self.quant == "int8":
+                # sigmoid output ∈ (0, 1) — scale is 1/127.
+                self.scales[sig_name] = 1.0 / 127.0
+                self.tensors_meta[sig_name] = {
+                    "shape": list(input_t.shape),
+                    "dtype": "i8",
+                    "quant": {"scale": 1.0 / 127.0, "zero_point": 0},
+                }
+            else:
+                self.tensors_meta[sig_name] = {
+                    "shape": list(input_t.shape),
+                    "dtype": "f16",
+                }
+        n_elems = int(np.prod(input_t.shape))
+        if self.quant == "fp16":
+            self.ops.append({
+                "name": sig_name,
+                "op": "sigmoid_f16",
+                "inputs": [input_name],
+                "outputs": [sig_name],
+                "shape": {"n": n_elems},
+            })
+            self.ops.append({
+                "name": str(n.name),
+                "op": "mul_f16",
+                "inputs": [sig_name, input_name],
+                "outputs": [out_name],
+                "shape": {"n": n_elems},
+            })
+        else:
+            in_scale = self.scales.get(input_name, 1e-8)
+            out_scale = self.scales.get(out_name, 1e-8)
+            self.ops.append({
+                "name": sig_name,
+                "op": "sigmoid_s8",
+                "inputs": [input_name],
+                "outputs": [sig_name],
+                "shape": {"n": n_elems},
+                "quant": {
+                    "scale_in": in_scale,
+                    "scale_out": 1.0 / 127.0,
+                    "activation_min": -128, "activation_max": 127,
+                },
+            })
+            self.ops.append({
+                "name": str(n.name),
+                "op": "mul_s8",
+                "inputs": [sig_name, input_name],
+                "outputs": [out_name],
+                "shape": {"n": n_elems},
+                "quant": {
+                    "scale_a": 1.0 / 127.0,
+                    "scale_b": in_scale,
+                    "scale_out": out_scale,
+                    "activation_min": -128, "activation_max": 127,
+                },
+            })
+
+    # ------------------------------------------------------------------
     # Conv2d emit — incl. batchnorm/pad fold + depthwise branch.
     # ------------------------------------------------------------------
     def _emit_conv2d(self, n):
@@ -668,6 +879,16 @@ class _ExportWalker:
         w = self._get_param_tensor(weight_node)
         b = self._get_param_tensor(bias_node) if bias_node is not None else None
         OC, _IC_per_g, KH, KW = w.shape
+
+        # Save originals before any BN-fold so the fp16 path can emit a
+        # SEPARATE batchnorm2d_f16 op instead of folding gamma/var into
+        # the conv weights. Folding-into-conv then casting to fp16 was
+        # the previous fp16 strategy; it diverged from torch.float16
+        # because PyTorch's `model.half()` rounds *between* conv and BN
+        # (two fp16 stores), and that rounding pattern compounds across
+        # the 16 MBConv blocks. Emitting BN separately matches PyTorch.
+        w_orig = w
+        b_orig = b
 
         # Look ahead: is the next user of this conv's output a batch_norm?
         bn_user = self._find_bn_user(n)
@@ -702,6 +923,83 @@ class _ExportWalker:
                 in_name = self._resolve_input(pad_node)
 
         is_depthwise = (groups == OC and groups != 1)
+
+        # fp16 path: emit conv2d_f16 with ORIGINAL (un-folded) weights so
+        # the conv output gets stored as fp16 before BN is applied — that
+        # intermediate fp16 rounding is what torch.float16 does, and not
+        # doing it (the previous "fold BN into conv weights, cast to fp16"
+        # strategy) compounded ~2-3x magnitude drift per layer through the
+        # 16 MBConv blocks. If a BN follows, emit a SEPARATE
+        # batchnorm2d_f16 right after with pre-computed affine
+        # (scale=gamma/sqrt(var+eps), bias=beta-mean*scale).
+        if self.quant == "fp16":
+            # Conv writes to the conv's own aten node name (n.name); if a
+            # BN follows, batchnorm2d_f16 then writes to bn_user.name.
+            # If no BN, conv writes directly to its own n.name (which is
+            # what downstream consumers will reference).
+            conv_out_name = n.name
+            w_key = f"{n.name}.weights"
+            self.weights_blob[w_key] = w_orig.detach().cpu().numpy().astype(np.float16)
+            b_key = None
+            if b_orig is not None:
+                b_key = f"{n.name}.bias"
+                self.weights_blob[b_key] = b_orig.detach().cpu().numpy().astype(np.float16)
+            self._record_tensor(conv_out_name)
+            op_kind = "depthwise_conv2d_f16" if is_depthwise else "conv2d_f16"
+            self.ops.append({
+                "name": str(n.name),
+                "op": op_kind,
+                "inputs": [in_name],
+                "outputs": [conv_out_name],
+                "weight": w_key,
+                "bias": b_key,
+                "shape": {
+                    "N": int(self.tensors[conv_out_name].shape[0]),
+                    "IC": int(w_orig.shape[1] if not is_depthwise else 1),
+                    "IH": int(self.tensors[in_name].shape[2]),
+                    "IW": int(self.tensors[in_name].shape[3]),
+                    "OC": int(OC), "KH": int(KH), "KW": int(KW),
+                    "SH": int(stride[0]), "SW": int(stride[1]),
+                    "PH": int(padding[0]), "PW": int(padding[1]),
+                    "DH": int(dilation[0]), "DW": int(dilation[1]),
+                    "groups": int(groups),
+                },
+            })
+
+            # If BN follows, emit it as its own batchnorm2d_f16 op. The
+            # affine is precomputed in fp32 (gamma, beta, running_mean,
+            # running_var live in the bn aten node's args 1..4) then
+            # stored as fp16 — kernel just applies `scale[c] * x + bias[c]`.
+            if bn_user is not None:
+                gamma = self._get_param_tensor(bn_user.args[1])
+                beta = self._get_param_tensor(bn_user.args[2])
+                running_mean = self._get_param_tensor(bn_user.args[3])
+                running_var = self._get_param_tensor(bn_user.args[4])
+                eps = float(bn_user.kwargs.get("eps", 1e-5))
+                scale_fp32 = gamma / torch.sqrt(running_var + eps)
+                bn_bias_fp32 = beta - running_mean * scale_fp32
+                scale_key = f"{bn_user.name}.scale"
+                bn_bias_key = f"{bn_user.name}.bias"
+                self.weights_blob[scale_key] = (
+                    scale_fp32.detach().cpu().numpy().astype(np.float16))
+                self.weights_blob[bn_bias_key] = (
+                    bn_bias_fp32.detach().cpu().numpy().astype(np.float16))
+                self._record_tensor(bn_user.name)
+                t_shape = self.tensors[bn_user.name].shape
+                self.ops.append({
+                    "name": str(bn_user.name),
+                    "op": "batchnorm2d_f16",
+                    "inputs": [conv_out_name],
+                    "outputs": [bn_user.name],
+                    "weight": scale_key,
+                    "bias": bn_bias_key,
+                    "shape": {
+                        "N": int(t_shape[0]), "C": int(t_shape[1]),
+                        "H": int(t_shape[2]), "W": int(t_shape[3]),
+                    },
+                })
+            return
+
         in_scale = self.scales.get(in_name, 1e-8)
         out_scale = self.scales.get(post_name, 1e-8)
 
@@ -799,14 +1097,32 @@ class _ExportWalker:
         OF, IF = w.shape
         out_name = n.name
         self._record_tensor(out_name)
-        in_scale = self.scales.get(in_name, 1e-8)
-        out_scale = self.scales.get(out_name, 1e-8)
         in_shape = self.tensors[in_name].shape
         M = 1
         for d in in_shape[:-1]: M *= int(d)
 
         w_key = f"{n.name}.weights"
         b_key = f"{n.name}.bias" if b is not None else None
+
+        # fp16 path: cast weights + bias to fp16, emit a single
+        # linear_f16 record (no scale/multiplier/shift).
+        if self.quant == "fp16":
+            self.weights_blob[w_key] = w.detach().cpu().numpy().astype(np.float16)
+            if b is not None:
+                self.weights_blob[b_key] = b.detach().cpu().numpy().astype(np.float16)
+            self.ops.append({
+                "name": str(n.name),
+                "op": "linear_f16",
+                "inputs": [in_name],
+                "outputs": [out_name],
+                "weight": w_key,
+                "bias": b_key,
+                "shape": {"M": M, "K": int(IF), "N": int(OF)},
+            })
+            return
+
+        in_scale = self.scales.get(in_name, 1e-8)
+        out_scale = self.scales.get(out_name, 1e-8)
 
         if self.per_channel:
             w_np = w.detach().cpu().numpy()
@@ -871,17 +1187,19 @@ class _ExportWalker:
         in_name = self._resolve_input(n.args[0])
         out_name = n.name
         self._record_tensor(out_name)
-        self.ops.append({
-            "name": str(n.name), "op": "relu_s8",
+        rec = {
+            "name": str(n.name), "op": f"relu{self.op_suffix}",
             "inputs": [in_name], "outputs": [out_name],
             "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
-            "quant": {
+        }
+        if self.quant == "int8":
+            rec["quant"] = {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "activation_min": 0,  # int8: 0 maps to symmetric -128 + 128
                 "activation_max": 127,
-            },
-        })
+            }
+        self.ops.append(rec)
 
     def _emit_add(self, n):
         a = self._resolve_input(n.args[0])
@@ -893,17 +1211,19 @@ class _ExportWalker:
         b = self._resolve_input(bv)
         out_name = n.name
         self._record_tensor(out_name)
-        self.ops.append({
-            "name": str(n.name), "op": "add_s8",
+        rec = {
+            "name": str(n.name), "op": f"add{self.op_suffix}",
             "inputs": [a, b], "outputs": [out_name],
             "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
-            "quant": {
+        }
+        if self.quant == "int8":
+            rec["quant"] = {
                 "scale_a":   self.scales.get(a, 1e-8),
                 "scale_b":   self.scales.get(b, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "activation_min": -128, "activation_max": 127,
-            },
-        })
+            }
+        self.ops.append(rec)
 
     def _emit_cat(self, n):
         tensor_list = n.args[0]
@@ -969,22 +1289,29 @@ class _ExportWalker:
                     C_inputs.append(0)
         # Use the 4-D channel-dim cat skeleton for both native-4-D and
         # reinterpreted cases — they share the same kernel signature.
-        op_kind = f"cat{n_inputs}_c1_s8" if n_inputs <= 4 else "cat_n_c1_s8"
-        self.ops.append({
+        if n_inputs <= 4:
+            op_kind = f"cat{n_inputs}_c1{self.op_suffix}"
+        else:
+            op_kind = f"cat_n_c1{self.op_suffix}"
+        rec = {
             "name": str(n.name), "op": op_kind,
             "inputs": names, "outputs": [out_name],
             "shape": {
                 "N": N, "H": H, "W": W,
                 "C_total": C_total, "C_inputs": C_inputs,
             },
-            "quant": {
+        }
+        if self.quant == "int8":
+            rec["quant"] = {
                 "scales_in": [self.scales.get(nm, 1e-8) for nm in names],
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "dim": dim,
                 "activation_min": -128,
                 "activation_max": 127,
-            },
-        })
+            }
+        else:
+            rec["dim"] = dim
+        self.ops.append(rec)
 
     def _is_channel_slice_used_by_cat(self, n) -> bool:
         """True iff this slice.Tensor is a NCHW dim=1 slice whose output
@@ -1030,22 +1357,24 @@ class _ExportWalker:
             C_end = IC
         out_name = n.name
         self._record_tensor(out_name)
-        in_scale = self.scales.get(src_name, 1e-8)
-        out_scale = self.scales.get(out_name, in_scale)
-        self.ops.append({
-            "name": str(n.name), "op": "slice_c_s8",
+        rec = {
+            "name": str(n.name), "op": f"slice_c{self.op_suffix}",
             "inputs": [src_name], "outputs": [out_name],
             "shape": {
                 "N": int(src_shape[0]), "IC": int(IC),
                 "C_start": int(C_start), "C_end": int(C_end),
                 "H": int(H), "W": int(W),
             },
-            "quant": {
+        }
+        if self.quant == "int8":
+            in_scale = self.scales.get(src_name, 1e-8)
+            out_scale = self.scales.get(out_name, in_scale)
+            rec["quant"] = {
                 "scale_in":  in_scale,
                 "scale_out": out_scale,
                 "activation_min": -128, "activation_max": 127,
-            },
-        })
+            }
+        self.ops.append(rec)
 
     def _emit_pad(self, n):
         """Asymmetric pad_s8. Pads tuple is aten's
@@ -1055,8 +1384,8 @@ class _ExportWalker:
         out_name = n.name
         self._record_tensor(out_name)
         out_shape = self.tensors[out_name].shape if out_name in self.tensors else None
-        self.ops.append({
-            "name": str(n.name), "op": "pad_s8",
+        rec = {
+            "name": str(n.name), "op": f"pad{self.op_suffix}",
             "inputs": [in_name], "outputs": [out_name],
             "shape": {
                 "N": int(out_shape[0]) if out_shape is not None else 1,
@@ -1068,12 +1397,14 @@ class _ExportWalker:
                 "pad_top":    int(pads[2]) if len(pads) > 2 else 0,
                 "pad_bottom": int(pads[3]) if len(pads) > 3 else 0,
             },
-            "quant": {
+        }
+        if self.quant == "int8":
+            rec["quant"] = {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "pad_value": 0,  # zero-pad in int8 domain
-            },
-        })
+            }
+        self.ops.append(rec)
 
     def _emit_maxpool(self, n):
         in_name = self._resolve_input(n.args[0])
@@ -1083,8 +1414,8 @@ class _ExportWalker:
         self._record_tensor(out_name)
         shape = self.tensors[out_name].shape
         in_shape = self.tensors[in_name].shape
-        self.ops.append({
-            "name": str(n.name), "op": "maxpool2d_s8",
+        rec = {
+            "name": str(n.name), "op": f"maxpool2d{self.op_suffix}",
             "inputs": [in_name], "outputs": [out_name],
             "shape": {
                 "N": int(shape[0]), "C": int(shape[1]),
@@ -1093,11 +1424,13 @@ class _ExportWalker:
                 "SH": int(st[0]), "SW": int(st[1]),
                 "PH": 0, "PW": 0, "DH": 1, "DW": 1,
             },
-            "quant": {
+        }
+        if self.quant == "int8":
+            rec["quant"] = {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
-            },
-        })
+            }
+        self.ops.append(rec)
 
     # ------------------------------------------------------------------
     # Fusion helpers
@@ -1292,7 +1625,7 @@ def _load_model(name: str):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", required=True, choices=["vint"])
-    p.add_argument("--quant", default="int8", choices=["fp32", "int8"])
+    p.add_argument("--quant", default="int8", choices=["fp32", "int8", "fp16"])
     p.add_argument("--out-dir", required=True)
     p.add_argument("--inventory-only", action="store_true",
                    help="Only print the aten-op classification report; "
@@ -1315,7 +1648,7 @@ def main():
                         "RNG; will grow into a real dataset hook).")
     args = p.parse_args()
 
-    if args.quant != "int8":
+    if args.quant == "fp32":
         raise SystemExit("--quant fp32 not implemented in the export path yet")
 
     model, sample = _load_model(args.model)
@@ -1390,7 +1723,8 @@ def main():
         for s in calib_samples_tuples
     ]
     walker = _ExportWalker(ep, calib_dicts, input_order,
-                           per_channel=args.per_channel)
+                           per_channel=args.per_channel,
+                           quant=args.quant)
     print(f"[extract_export] calibrating + capturing intermediates ...",
           flush=True)
     walker.calibrate()
@@ -1406,6 +1740,13 @@ def main():
     sig = ep.graph_signature
     output_names = [s.arg.name for s in sig.output_specs
                     if hasattr(s, "arg") and s.kind.name == "USER_OUTPUT"]
+    # Walk the walker's alias chain (e.g. reshape_2 → linear_24) so each
+    # surface output names a tensor that an actual kernel writes to —
+    # generate_skeleton's ptr_for routes only top-level output names to
+    # the surface buffer, and view/reshape aliases would otherwise leave
+    # those slots un-written. The aliased name still appears in
+    # walker.tensors_meta with the same shape, so downstream wiring works.
+    output_names = [walker.name_map.get(n, n) for n in output_names]
 
     # Match the IR shape generate_skeleton consumes (see
     # extract_graph::extract_int8 for the canonical form):
@@ -1429,7 +1770,13 @@ def main():
     # captured the relevant intermediate tensors, so we just bundle
     # them into IR records with semantics info the codegen can use to
     # look up a curated kernel (or eventually drive LLM-gen).
-    if args.model == "vint":
+    # The vint composite app_op exists to absorb the int8 walker's
+    # mixed-dtype tail (int8 dist + fp32 waypoints) into a single fp32
+    # surface output. In fp16 mode everything is already fp16 and the
+    # model's surface output IS the desired output, so the composite
+    # isn't needed (and emitting it would inject int8 metadata into an
+    # otherwise fp16-clean IR).
+    if args.model == "vint" and args.quant == "int8":
         composite_out = _emit_vint_post_op(walker, out_dir)
         if composite_out is not None:
             # Replace the original user-output names with the composite
@@ -1511,22 +1858,62 @@ def main():
         if args.quant == "int8":
             in_parts.append(
                 _quantize_per_tensor_sym(t, walker.scales[k]).ravel())
+        elif args.quant == "fp16":
+            in_parts.append(t.detach().cpu().numpy().ravel().astype(np.float16))
         else:
             in_parts.append(t.detach().cpu().numpy().ravel().astype(np.float32))
-    in_dtype = np.int8 if args.quant == "int8" else np.float32
+    if args.quant == "int8":
+        in_dtype = np.int8
+    elif args.quant == "fp16":
+        in_dtype = np.float16
+    else:
+        in_dtype = np.float32
     inp_flat = np.concatenate(in_parts).astype(in_dtype)
 
     # Output: resolve each output name through the alias map; collect
-    # each as its native fp32/int8 array. If all parts share one
+    # each as its native fp32/int8/fp16 array. If all parts share one
     # dtype, concatenate as that dtype so emit_test_io maps to a
-    # proper C array. If mixed (int8 + fp32), pack as raw bytes — but
-    # the harness side needs to know the layout, which we encode in
-    # ir["output"]["tensors"] order so generate_skeleton can lay out a
-    # struct or sized buffer.
+    # proper C array.
+    #
+    # fp16 path: re-run the model in half precision on the same input
+    # so the golden reflects genuine fp16 numerics rather than
+    # fp32-traced numerics down-cast at the boundary. The IR's surface
+    # output is the captured intermediate tensor; we recompute it
+    # under .half() so spike's fp16 output can be compared bit-by-bit
+    # against the PyTorch fp16 reference.
     out_parts: list[np.ndarray] = []
     out_summary: list[str] = []
+    fp16_golden: dict[str, np.ndarray] = {}
+    if args.quant == "fp16":
+        with torch.no_grad():
+            half_model = model.half()
+            half_inputs = tuple(calib_sample[k].half() for k in input_names)
+            half_out = half_model(*half_inputs)
+            if isinstance(half_out, (tuple, list)):
+                half_outs = list(half_out)
+            else:
+                half_outs = [half_out]
+            for nm, t in zip(output_names, half_outs):
+                fp16_golden[nm] = t.detach().cpu().numpy().astype(np.float16).ravel()
     for out_name_i in output_names:
         resolved = walker.name_map.get(out_name_i, out_name_i)
+        if args.quant == "fp16":
+            if out_name_i in fp16_golden:
+                arr = fp16_golden[out_name_i]
+            else:
+                # Walker captured the intermediate in fp32; the surface
+                # output in fp16 mode is the model's actual fp16 forward,
+                # but if the IR has a renamed/composite output we fall
+                # back to a cast of the captured fp32 tensor.
+                captured = walker.tensors.get(resolved)
+                if captured is None:
+                    raise SystemExit(
+                        f"output {out_name_i!r}: no fp16 golden and no "
+                        f"captured tensor under {resolved!r}")
+                arr = captured.detach().cpu().numpy().ravel().astype(np.float16)
+            out_parts.append(arr)
+            out_summary.append(f"{resolved}={arr.size}f16")
+            continue
         captured = walker.tensors.get(resolved)
         if captured is None:
             raise SystemExit(
@@ -1543,13 +1930,10 @@ def main():
             arr = _quantize_per_tensor_sym(captured, sc).ravel()
             out_parts.append(arr)
             out_summary.append(f"{resolved}={arr.size}i8")
-    # Choose the concatenated dtype: if every part is fp32, store as
-    # fp32 so emit_test_io maps it to a float array. If every part is
-    # int8, store as int8. Mixed-dtype outputs aren't reachable
-    # today (composite app_ops absorb everything to one dtype) — if
-    # they appear later, we'd need a packed-struct convention.
     if all(a.dtype == np.float32 for a in out_parts):
         out_flat = np.concatenate(out_parts).astype(np.float32)
+    elif all(a.dtype == np.float16 for a in out_parts):
+        out_flat = np.concatenate(out_parts).astype(np.float16)
     elif all(a.dtype == np.int8 for a in out_parts):
         out_flat = np.concatenate(out_parts).astype(np.int8)
     else:

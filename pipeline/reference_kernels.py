@@ -4110,12 +4110,17 @@ void kernel_batchnorm2d_f16(const _Float16 *input,
                             int N, int C, int H, int W) {
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
-            _Float16 s = scale[c];
-            _Float16 b = bias[c];
+            /* Match PyTorch CPU fp16 BN: upcast operands to fp32 for the
+             * scale*input + bias multiply-add, then cast result back to
+             * fp16. Pure-fp16 arithmetic (the previous reference body)
+             * accumulated rounding error per channel and produced 30-50%
+             * magnitude drift through the EfficientNet body. */
+            float s = (float)scale[c];
+            float b = (float)bias[c];
             for (int h = 0; h < H; h++) {
                 for (int w = 0; w < W; w++) {
                     int idx = ((n*C + c)*H + h)*W + w;
-                    output[idx] = s * input[idx] + b;
+                    output[idx] = (_Float16)(s * (float)input[idx] + b);
                 }
             }
         }
@@ -4240,6 +4245,586 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
          "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
     ],
     argtypes_factory=_conv2d_f16_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# ViNT fp16 op set. Same dataflow as the corresponding fp32 ops; storage
+# is _Float16. For accumulating ops (matmul / conv / layer_norm reduction)
+# the inner accumulator is fp32 to avoid fp16-precision drift, matching
+# what torch.float16 does on CPU and what Tensor Cores do in hardware.
+# Transcendentals (gelu, softmax) round-trip through float for the math
+# kernel since libm has no half-precision expf/erf yet.
+# ---------------------------------------------------------------------------
+
+def _linear_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+LINEAR_F16 = KernelSpec(
+    op="linear_f16",
+    signature=(
+        "void kernel_linear_f16(const _Float16 *input, const _Float16 *weight, "
+        "const _Float16 *bias, _Float16 *output, int M, int K, int N)"
+    ),
+    semantics=(
+        "Half-precision fully-connected (matmul + bias), nn.Linear semantics:\n"
+        "  output[m, n] = bias[n] + sum_k input[m, k] * weight[n, k]\n"
+        "Shapes (row-major):\n"
+        "  input:  [M, K]   weight: [N, K]   bias: [N] (may be NULL)\n"
+        "  output: [M, N]\n"
+        "All tensors are _Float16; the inner accumulator is fp32."
+    ),
+    reference_impl="""\
+void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = bias ? (float)bias[n] : 0.0f;
+            for (int k = 0; k < K; k++) {
+                acc += (float)input[m * K + k] * (float)weight[n * K + k];
+            }
+            output[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 1, "N": 1},
+        {"M": 1, "K": 7, "N": 13},
+        {"M": 4, "K": 17, "N": 23},
+        {"M": 1, "K": 64, "N": 64},
+    ],
+    argtypes_factory=_linear_f16_argtypes,
+)
+
+
+def _depthwise_conv2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h] + [ctypes.c_int] * 12
+
+
+DEPTHWISE_CONV2D_F16 = KernelSpec(
+    op="depthwise_conv2d_f16",
+    signature=(
+        "void kernel_depthwise_conv2d_f16(const _Float16 *input, "
+        "const _Float16 *weight, const _Float16 *bias, _Float16 *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "Half-precision depthwise 2D convolution. groups == OC == IC, so each\n"
+        "output channel reads from exactly one input channel via its own\n"
+        "(1, KH, KW) filter. Storage _Float16; inner accumulator fp32."
+    ),
+    reference_impl="""\
+void kernel_depthwise_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                                 const _Float16 *bias, _Float16 *output,
+                                 int N, int IC, int IH, int IW, int OC,
+                                 int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? (float)bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = (float)input[((n*OC + oc)*IH + ih)*IW + iw];
+                            float w = (float)weight[((oc*KH) + kh)*KW + kw];
+                            acc += v * w;
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (_Float16)acc;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 16, "IH": 8, "IW": 8, "OC": 16,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_depthwise_conv2d_f16_argtypes,
+)
+
+
+def _layer_norm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+LAYER_NORM_F16 = KernelSpec(
+    op="layer_norm_f16",
+    signature=(
+        "void kernel_layer_norm_f16(const _Float16 *input, "
+        "const _Float16 *gamma, const _Float16 *beta, _Float16 *output, "
+        "int M, int K, float eps)"
+    ),
+    semantics=(
+        "Half-precision LayerNorm over the last axis of an [M, K] tensor:\n"
+        "  mu     = mean(input[m, :])\n"
+        "  sigma  = sqrt(var(input[m, :]) + eps)\n"
+        "  output[m, k] = gamma[k] * (input[m, k] - mu) / sigma + beta[k]\n"
+        "Mean/variance computed in fp32, applied + stored as _Float16. gamma\n"
+        "and beta are _Float16 buffers of length K."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_layer_norm_f16(const _Float16 *input, const _Float16 *gamma,
+                           const _Float16 *beta, _Float16 *output,
+                           int M, int K, float eps) {
+    for (int m = 0; m < M; m++) {
+        float sum = 0.0f, sqsum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float v = (float)input[m*K + k];
+            sum += v;
+            sqsum += v * v;
+        }
+        float mean = sum / (float)K;
+        float var  = sqsum / (float)K - mean * mean;
+        float inv_sigma = 1.0f / sqrtf(var + eps);
+        for (int k = 0; k < K; k++) {
+            float v = (float)input[m*K + k];
+            float g = (float)gamma[k];
+            float b = (float)beta[k];
+            output[m*K + k] = (_Float16)(g * (v - mean) * inv_sigma + b);
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 16, "eps": 1e-5},
+        {"M": 7, "K": 512, "eps": 1e-5},
+    ],
+    argtypes_factory=_layer_norm_f16_argtypes,
+)
+
+
+GELU_F16 = KernelSpec(
+    op="gelu_f16",
+    signature="void kernel_gelu_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Half-precision GELU (PyTorch's 'tanh' approximation):\n"
+        "  output[i] = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))\n"
+        "Math is done in fp32, result cast to _Float16."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_gelu_f16(const _Float16 *input, _Float16 *output, int n) {
+    const float SQRT_2_OVER_PI = 0.7978845608028654f;  /* sqrt(2/pi) */
+    for (int i = 0; i < n; i++) {
+        float x = (float)input[i];
+        float x3 = x * x * x;
+        float arg = SQRT_2_OVER_PI * (x + 0.044715f * x3);
+        float r = 0.5f * x * (1.0f + tanhf(arg));
+        output[i] = (_Float16)r;
+    }
+}
+""",
+    extra_shapes=[{"n": 17}, {"n": 1024}, {"n": 14336}],
+    argtypes_factory=_pointwise_f16_argtypes,
+)
+
+
+def _softmax_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+SOFTMAX_F16 = KernelSpec(
+    op="softmax_f16",
+    signature=(
+        "void kernel_softmax_f16(const _Float16 *input, _Float16 *output, "
+        "int M, int K, float input_scale)"
+    ),
+    semantics=(
+        "Half-precision softmax over the last axis of an [M, K] tensor with\n"
+        "a fused input scale (used by SDPA to absorb 1/√d_k without an extra\n"
+        "pointwise pass):\n"
+        "  x_k  = input[m, k] * input_scale\n"
+        "  m_i  = max(x_:)\n"
+        "  e    = exp(x_k - m_i)\n"
+        "  output[m, k] = e / sum(e)\n"
+        "input_scale == 1.0 disables the pre-multiply. Math in fp32 (no fp16\n"
+        "expf), result cast to _Float16."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_softmax_f16(const _Float16 *input, _Float16 *output,
+                        int M, int K, float input_scale) {
+    for (int m = 0; m < M; m++) {
+        float maxv = -65504.0f;
+        for (int k = 0; k < K; k++) {
+            float v = (float)input[m*K + k] * input_scale;
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float v = (float)input[m*K + k] * input_scale;
+            float e = expf(v - maxv);
+            output[m*K + k] = (_Float16)e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] = (_Float16)((float)output[m*K + k] * inv_sum);
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 7, "input_scale": 1.0},
+                  {"M": 7, "K": 7, "input_scale": 0.0883883476}],  # 1/√128
+    argtypes_factory=_softmax_f16_argtypes,
+)
+
+
+def _pointwise2_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, ctypes.c_int]
+
+
+ADD_F16 = KernelSpec(
+    op="add_f16",
+    signature=(
+        "void kernel_add_f16(const _Float16 *a, const _Float16 *b, "
+        "_Float16 *output, int n)"
+    ),
+    semantics=(
+        "Half-precision elementwise add:\n"
+        "  output[i] = a[i] + b[i]\n"
+        "Addition is in fp32 (to dodge subnormal denormals), result cast back."
+    ),
+    reference_impl="""\
+void kernel_add_f16(const _Float16 *a, const _Float16 *b,
+                    _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = (_Float16)((float)a[i] + (float)b[i]);
+    }
+}
+""",
+    extra_shapes=[{"n": 16}, {"n": 3584}],
+    argtypes_factory=_pointwise2_f16_argtypes,
+)
+
+
+MUL_F16 = KernelSpec(
+    op="mul_f16",
+    signature=(
+        "void kernel_mul_f16(const _Float16 *a, const _Float16 *b, "
+        "_Float16 *output, int n)"
+    ),
+    semantics=(
+        "Half-precision elementwise multiply:\n"
+        "  output[i] = a[i] * b[i]\n"
+        "Multiply in fp32, result cast to _Float16."
+    ),
+    reference_impl="""\
+void kernel_mul_f16(const _Float16 *a, const _Float16 *b,
+                    _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = (_Float16)((float)a[i] * (float)b[i]);
+    }
+}
+""",
+    extra_shapes=[{"n": 16}, {"n": 1024}],
+    argtypes_factory=_pointwise2_f16_argtypes,
+)
+
+
+def _mul_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+MUL_C1_F16 = KernelSpec(
+    op="mul_c1_f16",
+    signature=(
+        "void kernel_mul_c1_f16(const _Float16 *gate, const _Float16 *x, "
+        "_Float16 *output, int N, int C, int HW)"
+    ),
+    semantics=(
+        "Half-precision channel-axis broadcast multiply (EfficientNet SE):\n"
+        "  output[n, c, h, w] = gate[c] * x[n, c, h, w]\n"
+        "where `gate` has shape [1, C, 1, 1] (= C contiguous values) and\n"
+        "`x` has shape [N, C, HW]. Without broadcast support, the elementwise\n"
+        "mul_f16 reads past the end of the gate buffer (32 channels of gate\n"
+        "vs 32*H*W of x) — that was the cause of the SE-block magnitude blow-up\n"
+        "in the fp16 ViNT path. Math in fp32, result cast to _Float16."
+    ),
+    reference_impl="""\
+void kernel_mul_c1_f16(const _Float16 *gate, const _Float16 *x,
+                       _Float16 *output, int N, int C, int HW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float g = (float)gate[c];
+            for (int i = 0; i < HW; i++) {
+                int idx = (n*C + c)*HW + i;
+                output[idx] = (_Float16)(g * (float)x[idx]);
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "HW": 32*42},
+        {"N": 1, "C": 1152, "HW": 4*5},
+    ],
+    argtypes_factory=_mul_c1_f16_argtypes,
+)
+
+
+MUL_C1_S8 = KernelSpec(
+    op="mul_c1_s8",
+    signature=(
+        "void kernel_mul_c1_s8(const int8_t *gate, const int8_t *x, "
+        "int8_t *output, int N, int C, int HW, "
+        "float scale_gate, float scale_x, float scale_out)"
+    ),
+    semantics=(
+        "Int8 channel-axis broadcast multiply (EfficientNet SE):\n"
+        "  output[n, c, h, w] = round(\n"
+        "    scale_gate * gate[c] * scale_x * x[n, c, h, w] / scale_out)\n"
+        "Output clipped to [-128, 127]. Math is int32 accumulator → fp32\n"
+        "scale → int8 store, same pattern as mul_s8 but with the gate\n"
+        "broadcast across the H*W axis."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+static int32_t _mul_c1_s8_round(float v) {
+    int32_t i = (int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+    if (i < -128) i = -128;
+    if (i > 127)  i = 127;
+    return i;
+}
+
+void kernel_mul_c1_s8(const int8_t *gate, const int8_t *x, int8_t *output,
+                      int N, int C, int HW,
+                      float scale_gate, float scale_x, float scale_out) {
+    float k = (scale_gate * scale_x) / scale_out;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float g_real = (float)gate[c] * scale_gate;
+            for (int i = 0; i < HW; i++) {
+                int idx = (n*C + c)*HW + i;
+                float prod = g_real * ((float)x[idx] * scale_x);
+                output[idx] = (int8_t)_mul_c1_s8_round(prod / scale_out);
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "HW": 32*42,
+         "scale_gate": 1.0/127.0, "scale_x": 0.08, "scale_out": 0.08},
+    ],
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
+)
+
+
+def _adaptive_avg_pool2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 6
+
+
+ADAPTIVE_AVG_POOL2D_F16 = KernelSpec(
+    op="adaptive_avg_pool2d_f16",
+    signature=(
+        "void kernel_adaptive_avg_pool2d_f16(const _Float16 *input, "
+        "_Float16 *output, int N, int C, int IH, int IW, int OH, int OW)"
+    ),
+    semantics=(
+        "Half-precision adaptive average pool: for each output position\n"
+        "(oh, ow), compute the average of the input window mapped from\n"
+        "torch.nn.AdaptiveAvgPool2d's index arithmetic:\n"
+        "  h_start = floor(oh * IH / OH); h_end = ceil((oh+1) * IH / OH);\n"
+        "  similarly for w. Average is fp32, cast to _Float16 at store."
+    ),
+    reference_impl="""\
+void kernel_adaptive_avg_pool2d_f16(const _Float16 *input, _Float16 *output,
+                                    int N, int C, int IH, int IW,
+                                    int OH, int OW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int h_start = (oh * IH) / OH;
+                int h_end   = ((oh + 1) * IH + OH - 1) / OH;
+                for (int ow = 0; ow < OW; ow++) {
+                    int w_start = (ow * IW) / OW;
+                    int w_end   = ((ow + 1) * IW + OW - 1) / OW;
+                    float sum = 0.0f;
+                    int cnt = 0;
+                    for (int h = h_start; h < h_end; h++) {
+                        for (int w = w_start; w < w_end; w++) {
+                            sum += (float)input[((n*C + c)*IH + h)*IW + w];
+                            cnt++;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] =
+                        (_Float16)(sum / (float)(cnt > 0 ? cnt : 1));
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4, "IH": 8, "IW": 8, "OH": 1, "OW": 1},
+        {"N": 1, "C": 64, "IH": 7, "IW": 7, "OH": 1, "OW": 1},
+    ],
+    argtypes_factory=_adaptive_avg_pool2d_f16_argtypes,
+)
+
+
+def _slice_c_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 6
+
+
+SLICE_C_F16 = KernelSpec(
+    op="slice_c_f16",
+    signature=(
+        "void kernel_slice_c_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int IC, int C_start, int C_end, int H, int W)"
+    ),
+    semantics=(
+        "Half-precision channel-axis slice of a [N, IC, H, W] tensor:\n"
+        "  output[n, oc, h, w] = input[n, C_start + oc, h, w]\n"
+        "  where oc in [0, C_end - C_start).\n"
+        "Pure copy (no math)."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_slice_c_f16(const _Float16 *input, _Float16 *output,
+                        int N, int IC, int C_start, int C_end,
+                        int H, int W) {
+    int OC = C_end - C_start;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int ic = C_start + oc;
+            const _Float16 *src = input + ((n*IC + ic)*H*W);
+            _Float16 *dst = output + ((n*OC + oc)*H*W);
+            memcpy(dst, src, sizeof(_Float16) * (size_t)(H*W));
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 18, "C_start": 15, "C_end": 18, "H": 64, "W": 85},
+    ],
+    argtypes_factory=_slice_c_f16_argtypes,
+)
+
+
+def _cat2_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h] + [ctypes.c_int] * 5
+
+
+CAT2_C1_F16 = KernelSpec(
+    op="cat2_c1_f16",
+    signature=(
+        "void kernel_cat2_c1_f16(const _Float16 *a, const _Float16 *b, "
+        "_Float16 *output, int N, int H, int W, int Ca, int Cb)"
+    ),
+    semantics=(
+        "Half-precision concatenation of two NCHW tensors along the channel\n"
+        "axis (dim=1). a has shape [N, Ca, H, W], b has [N, Cb, H, W],\n"
+        "output has [N, Ca+Cb, H, W]. Pure copy."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_cat2_c1_f16(const _Float16 *a, const _Float16 *b,
+                        _Float16 *output,
+                        int N, int H, int W, int Ca, int Cb) {
+    int Cout = Ca + Cb;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        memcpy(output + n*Cout*HW,
+               a + n*Ca*HW,
+               sizeof(_Float16) * (size_t)(Ca * HW));
+        memcpy(output + n*Cout*HW + Ca*HW,
+               b + n*Cb*HW,
+               sizeof(_Float16) * (size_t)(Cb * HW));
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "H": 64, "W": 85, "Ca": 3, "Cb": 3},
+        {"N": 1, "H": 1,  "W": 1,  "Ca": 1024, "Cb": 512},
+    ],
+    argtypes_factory=_cat2_c1_f16_argtypes,
+)
+
+
+def _pad_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 8
+
+
+PAD_F16 = KernelSpec(
+    op="pad_f16",
+    signature=(
+        "void kernel_pad_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int C, int IH, int IW, "
+        "int pad_left, int pad_right, int pad_top, int pad_bottom)"
+    ),
+    semantics=(
+        "Half-precision zero-pad an [N, C, IH, IW] tensor on H and W axes.\n"
+        "OH = IH + pad_top + pad_bottom; OW = IW + pad_left + pad_right.\n"
+        "Out-of-bounds positions are filled with 0.0."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_pad_f16(const _Float16 *input, _Float16 *output,
+                    int N, int C, int IH, int IW,
+                    int pad_left, int pad_right, int pad_top, int pad_bottom) {
+    int OH = IH + pad_top + pad_bottom;
+    int OW = IW + pad_left + pad_right;
+    int OHW = OH * OW;
+    memset(output, 0, sizeof(_Float16) * (size_t)(N * C * OHW));
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int h = 0; h < IH; h++) {
+                const _Float16 *src = input + ((n*C + c)*IH + h)*IW;
+                _Float16 *dst = output +
+                    ((n*C + c)*OH + (h + pad_top))*OW + pad_left;
+                memcpy(dst, src, sizeof(_Float16) * (size_t)IW);
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 8, "IW": 8,
+         "pad_left": 1, "pad_right": 1, "pad_top": 1, "pad_bottom": 1},
+    ],
+    argtypes_factory=_pad_f16_argtypes,
 )
 
 
@@ -5734,6 +6319,20 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "matmul_tb_f16": MATMUL_TB_F16,
     "matmul_tatb_f16": MATMUL_TATB_F16,
     "bmm_f16": BMM_F16,
+    # ViNT fp16 op set.
+    "linear_f16": LINEAR_F16,
+    "depthwise_conv2d_f16": DEPTHWISE_CONV2D_F16,
+    "layer_norm_f16": LAYER_NORM_F16,
+    "gelu_f16": GELU_F16,
+    "softmax_f16": SOFTMAX_F16,
+    "add_f16": ADD_F16,
+    "mul_f16": MUL_F16,
+    "mul_c1_f16": MUL_C1_F16,
+    "mul_c1_s8": MUL_C1_S8,
+    "adaptive_avg_pool2d_f16": ADAPTIVE_AVG_POOL2D_F16,
+    "slice_c_f16": SLICE_C_F16,
+    "cat2_c1_f16": CAT2_C1_F16,
+    "pad_f16": PAD_F16,
     # YOLOv8-nano fp32 support.
     "silu": SILU,
     "upsample_nearest": UPSAMPLE_NEAREST,

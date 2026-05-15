@@ -1375,6 +1375,98 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
                 f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
             )
+        # ---- ViNT fp16 op set ----
+        elif op["op"] == "linear_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_linear_f16({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']})"
+            )
+        elif op["op"] == "depthwise_conv2d_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_depthwise_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+            )
+        elif op["op"] == "layer_norm_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            gamma = _weight_name(model_name, op["gamma_key"])
+            beta = _weight_name(model_name, op["beta_key"])
+            sh = op["shape"]
+            eps = op.get("eps", 1e-5)
+            call = (
+                f"kernel_layer_norm_f16({in_ptr}, {gamma}, {beta}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {_f32(eps)})"
+            )
+        elif op["op"] == "gelu_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_gelu_f16({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "softmax_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            input_scale = op.get("input_scale", 1.0)
+            call = (
+                f"kernel_softmax_f16({in_ptr}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {_f32(input_scale)})"
+            )
+        elif op["op"] in ("add_f16", "mul_f16"):
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            n = op["shape"]["n"]
+            call = (
+                f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, {n})"
+            )
+        elif op["op"] == "mul_c1_f16":
+            gate_ptr = ptr_for(op["inputs"][0], "in")
+            x_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_mul_c1_f16({gate_ptr}, {x_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['HW']})"
+            )
+        elif op["op"] == "adaptive_avg_pool2d_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_adaptive_avg_pool2d_f16({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OH']}, {sh['OW']})"
+            )
+        elif op["op"] == "slice_c_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_slice_c_f16({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, "
+                f"{sh['C_start']}, {sh['C_end']}, {sh['H']}, {sh['W']})"
+            )
+        elif op["op"] == "cat2_c1_f16":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            ca, cb = sh["C_inputs"][0], sh["C_inputs"][1]
+            call = (
+                f"kernel_cat2_c1_f16({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['H']}, {sh['W']}, {ca}, {cb})"
+            )
+        elif op["op"] == "pad_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_pad_f16({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['pad_left']}, {sh['pad_right']}, "
+                f"{sh['pad_top']}, {sh['pad_bottom']})"
+            )
         elif op["op"] in ("matmul", "matmul_ta", "matmul_tb", "matmul_tatb",
                            "matmul_f16", "matmul_ta_f16", "matmul_tb_f16", "matmul_tatb_f16"):
             a_ptr = ptr_for(op["inputs"][0], "in")
@@ -1438,13 +1530,32 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             for d in t_shape: n_elems *= int(d)
             t_dtype = t_meta.get("dtype", "i8")
             t_scale = (t_meta.get("quant", {}) or {}).get("scale", 1.0)
-            out_ptr = _buf_name(mid, out_t)
-            cast = "int8_t" if t_dtype == "i8" else "float"
+            # Reuse the same ptr the kernel just wrote to (could be an
+            # intermediate buffer OR an offset into the surface output
+            # for tensors that ARE the surface output). Calling
+            # _buf_name unconditionally would reference a buffer that
+            # doesn't exist for surface outputs. Run the same
+            # `output → s->output` / `input → s->input` substitution as
+            # the kernel call so the inspect block reads via the
+            # dispatch function's `s` parameter.
+            _raw_inspect_ptr = ptr_for(out_t, "out")
+            out_ptr_for_inspect = (
+                _raw_inspect_ptr
+                .replace("(input + ", "(s->input + ")
+                .replace("(output + ", "(s->output + "))
+            if out_ptr_for_inspect in ("input", "output"):
+                out_ptr_for_inspect = f"s->{out_ptr_for_inspect}"
+            if t_dtype == "i8":
+                cast = "int8_t"
+            elif t_dtype == "f16":
+                cast = "_Float16"
+            else:
+                cast = "float"
             inspect_block += (
                 f'    printf("=== AGENTS_INSPECT_BEGIN [{out_t}] === '
                 f'scale=%g dtype={t_dtype} n=%d\\n", '
                 f'{_f32(t_scale)}, {n_elems});\n'
-                f"    {{ const {cast} *_p = (const {cast} *){out_ptr};\n"
+                f"    {{ const {cast} *_p = (const {cast} *){out_ptr_for_inspect};\n"
                 f"      for (int _i = 0; _i < {n_elems}; _i++) "
                 f'printf("%g\\n", (double)(float)_p[_i]); }}\n'
                 f'    printf("=== AGENTS_INSPECT_END [{out_t}] ===\\n");\n'

@@ -73,6 +73,11 @@ def main():
                    default="agents/examples/vint/int8/generated")
     p.add_argument("--spike",
                    default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
+    p.add_argument("--spike-isa", default="rv64gcv_zicntr",
+                   help="ISA passed via --isa= to spike. Use "
+                        "rv64gcv_zicntr_zfh for fp16 binaries — without "
+                        "zfh, the fp16 ops soft-emulate at ~10x cost and "
+                        "blow past the 900s timeout for ViNT-scale models.")
     args = p.parse_args()
 
     elf = Path(args.build_dir) / "zephyr" / "zephyr.elf"
@@ -91,8 +96,8 @@ def main():
 
     print(f"running spike on {elf} ...", flush=True)
     res = subprocess.run(
-        [args.spike, "--isa=rv64gcv_zicntr", str(elf)],
-        capture_output=True, text=True, timeout=900,
+        [args.spike, f"--isa={args.spike_isa}", str(elf)],
+        capture_output=True, text=True, timeout=1800,
     )
     spike_blocks = _parse_inspects(res.stdout + res.stderr)
     if not spike_blocks:
