@@ -164,7 +164,9 @@ def get_calibration_spec(num_samples: int = 16) -> dict:
     ctx = cfg["context_size"]
     obs_dir = os.environ.get(
         "AGENTS_VINT_OBS_DATASET", "datasets/idsia/samples/sc")
-    goal_render_dir = _REPO_ROOT.parent / "datasets/isaaclab_forest_renders"
+    # _REPO_ROOT (= parents[3]) is already FreshScheduler; the renders
+    # live directly under it, not under its parent.
+    goal_render_dir = _REPO_ROOT / "datasets/isaaclab_forest_renders"
     if goal_render_dir.is_dir():
         goal_input = {
             "loader": "isaaclab_forest_render",
