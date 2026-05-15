@@ -797,8 +797,18 @@ class _ExportWalker:
         if input_t is None:
             return  # input not captured; nothing to do
         with torch.no_grad():
-            self.tensors[out_name] = (
-                input_t * torch.sigmoid(input_t)).detach()
+            silu_t = (input_t * torch.sigmoid(input_t)).detach()
+            self.tensors[out_name] = silu_t
+
+        # For int8 mode, the calibrate() loop's max-abs scan skips the
+        # wrap_with_set_grad_enabled node because cap.tensors stores
+        # its output as a TUPLE (the wrap convention) and the scan only
+        # accepts Tensors. That left silu outputs with a fallback scale
+        # of 1e-8, which clipped every downstream consumer to near zero.
+        # Seed the scale from the synthesised silu tensor here so the
+        # rest of the int8 path sees a real range.
+        if self.quant == "int8" and out_name not in self.scales:
+            self.scales[out_name] = _scale_from_max_abs(silu_t)
 
         self._record_tensor(out_name)
         sig_name = f"{n.name}__sigmoid"
