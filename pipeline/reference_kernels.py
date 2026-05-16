@@ -4249,6 +4249,87 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
 
 
 # ---------------------------------------------------------------------------
+# Mixed-precision cast kernels — i8↔f16 boundaries inserted by the
+# walker's auto-cast pass when a fp16 op consumes an int8-produced
+# tensor (or vice versa). Scale is the int8 tensor's per-tensor scale
+# (precomputed at calibration time). See agents/notes/mixed_precision_plan.md.
+# ---------------------------------------------------------------------------
+
+def _cast_i8_to_f16_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [i8p, h, ctypes.c_int, ctypes.c_float]
+
+
+CAST_I8_TO_F16 = KernelSpec(
+    op="cast_i8_to_f16",
+    signature=(
+        "void kernel_cast_i8_to_f16(const int8_t *in, _Float16 *out, "
+        "int n, float scale)"
+    ),
+    semantics=(
+        "Dequantize an int8 tensor to _Float16:\n"
+        "  out[i] = (_Float16)((float)in[i] * scale)\n"
+        "Where `scale` is the int8 tensor's per-tensor symmetric scale\n"
+        "(zero-point = 0). Inserted by the walker's auto-cast pass at\n"
+        "i8 → f16 dtype boundaries when a fp16 op consumes an int8 producer."
+    ),
+    reference_impl="""\
+void kernel_cast_i8_to_f16(const int8_t *in, _Float16 *out,
+                           int n, float scale) {
+    for (int i = 0; i < n; i++) {
+        out[i] = (_Float16)((float)in[i] * scale);
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 256}, {"n": 4096}],
+    argtypes_factory=_cast_i8_to_f16_argtypes,
+)
+
+
+def _cast_f16_to_i8_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [h, i8p, ctypes.c_int, ctypes.c_float]
+
+
+CAST_F16_TO_I8 = KernelSpec(
+    op="cast_f16_to_i8",
+    signature=(
+        "void kernel_cast_f16_to_i8(const _Float16 *in, int8_t *out, "
+        "int n, float inv_scale)"
+    ),
+    semantics=(
+        "Quantize a _Float16 tensor to int8 (per-tensor symmetric):\n"
+        "  q = round((float)in[i] * inv_scale)\n"
+        "  out[i] = clamp(q, -128, 127)\n"
+        "Where `inv_scale = 1.0 / scale` and `scale` is the destination\n"
+        "int8 tensor's per-tensor scale (precomputed at calibration time\n"
+        "from the fp32 reference). Inserted by the walker's auto-cast\n"
+        "pass at f16 → i8 dtype boundaries."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_cast_f16_to_i8(const _Float16 *in, int8_t *out,
+                           int n, float inv_scale) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)in[i] * inv_scale;
+        int32_t q = (int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+        if (q > 127)  q = 127;
+        if (q < -128) q = -128;
+        out[i] = (int8_t)q;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 256}, {"n": 4096}],
+    argtypes_factory=_cast_f16_to_i8_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
 # ViNT fp16 op set. Same dataflow as the corresponding fp32 ops; storage
 # is _Float16. For accumulating ops (matmul / conv / layer_norm reduction)
 # the inner accumulator is fp32 to avoid fp16-precision drift, matching
@@ -6319,6 +6400,9 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "matmul_tb_f16": MATMUL_TB_F16,
     "matmul_tatb_f16": MATMUL_TATB_F16,
     "bmm_f16": BMM_F16,
+    # Mixed-precision i8↔f16 cast kernels (auto-cast pass output).
+    "cast_i8_to_f16": CAST_I8_TO_F16,
+    "cast_f16_to_i8": CAST_F16_TO_I8,
     # ViNT fp16 op set.
     "linear_f16": LINEAR_F16,
     "depthwise_conv2d_f16": DEPTHWISE_CONV2D_F16,

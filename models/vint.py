@@ -204,6 +204,41 @@ def get_calibration_spec(num_samples: int = 16) -> dict:
     }
 
 
+def get_precision_spec() -> dict:
+    """Default per-op precision overrides for the ViNT extract path.
+
+    The int8 PTQ flow is accurate everywhere except the goal-encoder's
+    final ``linear`` op: that tensor has |max|≈181 vs typical magnitudes
+    ~5, so per-tensor symmetric int8 wastes 36× of its representable
+    resolution on the long tail. Per-op fp16 promotion lets one linear
+    keep its dynamic range while the rest of the network stays in int8.
+
+    See ``agents/notes/mixed_precision_plan.md`` for the architecture.
+    The auto-cast pass in ``extract_graph_export`` inserts
+    ``cast_i8_to_f16`` before this op and ``cast_f16_to_i8`` after it
+    (when its downstream consumer is back in int8 land).
+
+    The CLI ``--fp16-ops a,b,c`` flag is additive to this spec.
+    """
+    return {
+        "default": "int8",
+        # Promote a contiguous region from goal-encoder output through
+        # the transformer's first LayerNorm. A single-op promotion of
+        # `linear` alone gave zero accuracy benefit because the auto-
+        # cast pass immediately re-quantizes the f16 output back to i8
+        # (with the same wide-range per-tensor scale that was the
+        # original drift source). Keeping cat_1 + the first
+        # layer_norm in f16 too lets the LayerNorm zero-mean its input
+        # *before* we cast back to int8 — the cast then runs against a
+        # tight-range tensor, not the 181-magnitude goal output.
+        "fp16_ops": [
+            "linear",          # goal-encoder output projection
+            "cat_1",           # obs+goal token concatenation
+            "layer_norm",      # transformer's first LayerNorm
+        ],
+    }
+
+
 def get_calibration_samples(
     n_samples: int = 32,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
