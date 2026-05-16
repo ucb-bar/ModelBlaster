@@ -222,19 +222,19 @@ def get_precision_spec() -> dict:
     """
     return {
         "default": "int8",
-        # Promote a contiguous region from goal-encoder output through
-        # the transformer's first LayerNorm. A single-op promotion of
-        # `linear` alone gave zero accuracy benefit because the auto-
-        # cast pass immediately re-quantizes the f16 output back to i8
-        # (with the same wide-range per-tensor scale that was the
-        # original drift source). Keeping cat_1 + the first
-        # layer_norm in f16 too lets the LayerNorm zero-mean its input
-        # *before* we cast back to int8 — the cast then runs against a
-        # tight-range tensor, not the 181-magnitude goal output.
-        "fp16_ops": [
-            "linear",          # goal-encoder output projection
-            "cat_1",           # obs+goal token concatenation
-            "layer_norm",      # transformer's first LayerNorm
+        # Promote the entire goal-encoder subgraph to fp16. Earlier
+        # experiments (just `linear`, or linear+cat_1+layer_norm) gave
+        # no measurable improvement: the goal-encoder drift accumulates
+        # *evenly* through ~49 BN-folded conv blocks (cos_sim 1.0 →
+        # 0.97 gradually), so partial promotion still feeds an int8-
+        # discretized signal into the fp16 island and the cast at the
+        # i8→f16 boundary recovers no precision. Promoting the whole
+        # subgraph by naming its output (`linear`) lets
+        # _resolve_op_precision walk all_input_nodes backwards and
+        # promote every aten ancestor.
+        "fp16_upstream_of": [
+            "linear",          # goal-encoder output projection (and
+                               # everything that feeds into it)
         ],
     }
 
