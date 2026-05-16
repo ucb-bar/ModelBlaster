@@ -222,19 +222,36 @@ def get_precision_spec() -> dict:
     """
     return {
         "default": "int8",
-        # Promote the entire goal-encoder subgraph to fp16. Earlier
-        # experiments (just `linear`, or linear+cat_1+layer_norm) gave
-        # no measurable improvement: the goal-encoder drift accumulates
-        # *evenly* through ~49 BN-folded conv blocks (cos_sim 1.0 →
-        # 0.97 gradually), so partial promotion still feeds an int8-
-        # discretized signal into the fp16 island and the cast at the
-        # i8→f16 boundary recovers no precision. Promoting the whole
-        # subgraph by naming its output (`linear`) lets
-        # _resolve_op_precision walk all_input_nodes backwards and
-        # promote every aten ancestor.
+        # Promote the entire goal-encoder subgraph (everything upstream
+        # of `linear`) to fp16. That brings goal_encoder output to
+        # near-fp16-ceiling accuracy (cos_sim ~0.999) and reduces
+        # pilot ω error by ~32% vs all-int8.
+        #
+        # Also promote the output head (linear_19..linear_24 plus their
+        # interleaved relus) to fp16 to recover wp4 heading. The output
+        # MLP is tiny (~5K MACs total — relu_X, linear_19..linear_24)
+        # but heading is highly sensitive to per-element noise here
+        # because the cumsum + L2-normalize tail in the harness
+        # amplifies small int8 quant errors into degrees of wp4 drift.
+        #
+        # See agents/notes/vint_mixed_precision_experiments.md for the
+        # measured impact of each region.
         "fp16_upstream_of": [
-            "linear",          # goal-encoder output projection (and
-                               # everything that feeds into it)
+            "linear",          # goal-encoder output (and ancestors)
+        ],
+        "fp16_ops": [
+            # Output MLP head (post-transformer-tail aggregation).
+            # NOTE: linear_23 + linear_24 are intentionally LEFT IN
+            # int8: their outputs feed `vint_action_post`, the curated
+            # composite kernel that does cumsum + L2-normalize, and
+            # that kernel's ABI takes int8 inputs. The fp16 lift on
+            # linear_19..linear_22 + relus still helps because
+            # quantization noise compounds through this 5-layer MLP;
+            # promoting them keeps the signal in fp16 until the last
+            # cast back to int8 at linear_23/24 input.
+            "linear_19", "linear_20", "linear_21", "linear_22",
+            # The ReLUs that interleave the linears.
+            "relu", "relu_1", "relu_2", "relu_3", "relu_4",
         ],
     }
 
