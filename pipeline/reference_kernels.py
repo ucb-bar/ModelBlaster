@@ -4245,6 +4245,89 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
          "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
     ],
     argtypes_factory=_conv2d_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="widening",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh fp16 conv2d with vfwmacc IC-vectorized "
+                "reduction. The scalar reference iterates 6 nested loops "
+                "(n, oc, oh, ow, kh, kw) with an innermost IC scalar MAC "
+                "loop. Vectorize that innermost IC reduction: each lane "
+                "consumes one (ic, kh, kw) tap, the fp32 accumulator "
+                "stays in LMUL=4 across iterations, and one vfredusum "
+                "at the end folds it into the scalar that gets cast to "
+                "fp16 + biased.\n\n"
+                "The IC tap and the weight tap are both strided across "
+                "IC (input stride = IH*IW per IC element, weight stride "
+                "= KH*KW per IC element with OIHW layout), so we use "
+                "vlse16. Strided fp16 loads are slower than unit-stride "
+                "on V256 but still better than scalar MAC chains for the "
+                "IC=32..480 reductions common in EfficientNet MBConvs.\n\n"
+                "ALGORITHM:\n"
+                "  for each (n, oc, oh, ow):\n"
+                "    vacc = vfmv.v.f f32m4(0)  // fp32 accumulator\n"
+                "    for kh, kw (with padding bounds check):\n"
+                "      for ic_base in [0, IC) step vl=vsetvl(e16m2, IC-ic_base):\n"
+                "        va = vlse16 f16m2(input, IH*IW*2, vl)\n"
+                "        vb = vlse16 f16m2(weight, KH*KW*2, vl)\n"
+                "        vacc = vfwmacc.vv(vacc, va, vb, vl)\n"
+                "    acc = vfredusum(vacc, bias[oc])\n"
+                "    output[...] = (_Float16)acc\n"
+            ),
+            reference_impl="""\
+#include <stddef.h>
+#include <riscv_vector.h>
+
+void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int N, int IC, int IH, int IW, int OC,
+                       int KH, int KW, int SH, int SW, int PH, int PW)
+{
+    const int OH = (IH + 2*PH - KH) / SH + 1;
+    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const size_t vlmax_e32m4 = __riscv_vsetvlmax_e32m4();
+    const ptrdiff_t in_ic_stride_bytes = (ptrdiff_t)IH * IW * sizeof(_Float16);
+    const ptrdiff_t w_ic_stride_bytes  = (ptrdiff_t)KH * KW * sizeof(_Float16);
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            const _Float16 *w_oc = weight + (size_t)oc * IC * KH * KW;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    vfloat32m4_t vacc = __riscv_vfmv_v_f_f32m4(0.0f, vlmax_e32m4);
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            const _Float16 *in_base = input + ((size_t)n * IC * IH + ih) * IW + iw;
+                            const _Float16 *w_base  = w_oc + (size_t)kh * KW + kw;
+                            int ic = 0;
+                            while (ic < IC) {
+                                size_t vl = __riscv_vsetvl_e16m2((size_t)(IC - ic));
+                                vfloat16m2_t va = __riscv_vlse16_v_f16m2(
+                                    in_base + (size_t)ic * IH * IW, in_ic_stride_bytes, vl);
+                                vfloat16m2_t vb = __riscv_vlse16_v_f16m2(
+                                    w_base  + (size_t)ic * KH * KW, w_ic_stride_bytes, vl);
+                                vacc = __riscv_vfwmacc_vv_f32m4(vacc, va, vb, vl);
+                                ic += (int)vl;
+                            }
+                        }
+                    }
+                    float seed = bias ? (float)bias[oc] : 0.0f;
+                    vfloat32m1_t vsum0 = __riscv_vfmv_v_f_f32m1(seed, 1);
+                    vfloat32m1_t vred  = __riscv_vfredusum_vs_f32m4_f32m1(vacc, vsum0, vlmax_e32m4);
+                    float acc = __riscv_vfmv_f_s_f32m1_f32(vred);
+                    output[((size_t)n * OC + oc) * OH * OW + (size_t)oh * OW + ow] = (_Float16)acc;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
 )
 
 
