@@ -4586,6 +4586,102 @@ void kernel_depthwise_conv2d_f16(const _Float16 *input, const _Float16 *weight,
          "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
     ],
     argtypes_factory=_depthwise_conv2d_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="oc_vec",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh depthwise conv2d, vectorize across OC channels.\n\n"
+                "WHY THIS HELPS:\n"
+                "  Depthwise has no IC reduction — each output channel "
+                "reads from exactly one input channel via its own (1, KH, "
+                "KW) filter. Vectorizing the IC dim (what conv2d_f16's "
+                "widening does) would give vl=1; instead we vectorize "
+                "across OC, with each lane handling one channel's "
+                "(kh, kw) accumulation independently. No vfredusum at "
+                "the end — each lane's accumulator is already that "
+                "channel's output.\n\n"
+                "MEMORY ACCESS:\n"
+                "  input  [n, oc:oc+vl, ih, iw]:  stride IH*IW per OC\n"
+                "  weight [oc:oc+vl, 0, kh, kw]:  stride KH*KW per OC\n"
+                "  output [n, oc:oc+vl, oh, ow]:  stride OH*OW per OC\n"
+                "All three use vlse16/vsse16 (strided). For EfficientNet "
+                "depthwise (OC=32..1152, KH=KW=3 or 5), the inner per-OC "
+                "compute over 9..25 (kh, kw) taps gets folded into "
+                "vlmax_e16m2-wide vector ops vs the scalar reference's "
+                "9..25 scalar MACs * OC iterations.\n\n"
+                "ALGORITHM:\n"
+                "  for n, oh, ow:\n"
+                "    for oc_base in [0, OC) step vl=vsetvl(e16m2, OC-oc_base):\n"
+                "      vacc = vfwcvt(vle16(bias + oc_base, vl))  // fp32 m4\n"
+                "      for kh, kw (with padding bounds check):\n"
+                "        va = vlse16(input ..., IH*IW*2, vl)\n"
+                "        vw = vlse16(weight ..., KH*KW*2, vl)\n"
+                "        vacc = vfwmacc.vv(vacc, va, vw, vl)\n"
+                "      vsse16(output, OH*OW*2, vfncvt(vacc), vl)\n"
+            ),
+            reference_impl="""\
+#include <stddef.h>
+#include <riscv_vector.h>
+
+void kernel_depthwise_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                                 const _Float16 *bias, _Float16 *output,
+                                 int N, int IC, int IH, int IW, int OC,
+                                 int KH, int KW, int SH, int SW,
+                                 int PH, int PW)
+{
+    (void)IC;
+    const int OH = (IH + 2*PH - KH) / SH + 1;
+    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const ptrdiff_t in_c_stride_bytes  = (ptrdiff_t)IH * IW * sizeof(_Float16);
+    const ptrdiff_t w_c_stride_bytes   = (ptrdiff_t)KH * KW * sizeof(_Float16);
+    const ptrdiff_t out_c_stride_bytes = (ptrdiff_t)OH * OW * sizeof(_Float16);
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                int oc_base = 0;
+                while (oc_base < OC) {
+                    size_t vl = __riscv_vsetvl_e16m2((size_t)(OC - oc_base));
+                    vfloat32m4_t vacc;
+                    if (bias != NULL) {
+                        vfloat16m2_t vb16 = __riscv_vle16_v_f16m2(bias + oc_base, vl);
+                        vacc = __riscv_vfwcvt_f_f_v_f32m4(vb16, vl);
+                    } else {
+                        vacc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                    }
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            const _Float16 *in_p = input
+                                + ((size_t)n * OC + oc_base) * IH * IW
+                                + (size_t)ih * IW + iw;
+                            vfloat16m2_t va = __riscv_vlse16_v_f16m2(
+                                in_p, in_c_stride_bytes, vl);
+                            const _Float16 *w_p = weight
+                                + (size_t)oc_base * KH * KW
+                                + (size_t)kh * KW + kw;
+                            vfloat16m2_t vw = __riscv_vlse16_v_f16m2(
+                                w_p, w_c_stride_bytes, vl);
+                            vacc = __riscv_vfwmacc_vv_f32m4(vacc, va, vw, vl);
+                        }
+                    }
+                    vfloat16m2_t vout = __riscv_vfncvt_f_f_w_f16m2(vacc, vl);
+                    _Float16 *out_p = output
+                        + ((size_t)n * OC + oc_base) * OH * OW
+                        + (size_t)oh * OW + ow;
+                    __riscv_vsse16_v_f16m2(out_p, out_c_stride_bytes, vout, vl);
+                    oc_base += (int)vl;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
 )
 
 
