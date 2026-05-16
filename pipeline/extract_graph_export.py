@@ -801,7 +801,7 @@ class _ExportWalker:
         scores_name = f"{n.name}__scores"
         weights_name = f"{n.name}__weights"
         out_name = n.name
-        is_fp16 = (self.quant == "fp16")
+        is_fp16 = (self._quant_for(n) == "fp16")
         if not is_fp16:
             # Synthesize intermediate-tensor scales (no real capture for
             # these): scores use Q's range × √d, weights are [0, 1] mapped
@@ -907,22 +907,24 @@ class _ExportWalker:
             silu_t = (input_t * torch.sigmoid(input_t)).detach()
             self.tensors[out_name] = silu_t
 
-        # For int8 mode, the calibrate() loop's max-abs scan skips the
-        # wrap_with_set_grad_enabled node because cap.tensors stores
-        # its output as a TUPLE (the wrap convention) and the scan only
-        # accepts Tensors. That left silu outputs with a fallback scale
-        # of 1e-8, which clipped every downstream consumer to near zero.
-        # Seed the scale from the synthesised silu tensor here so the
-        # rest of the int8 path sees a real range.
-        if self.quant == "int8" and out_name not in self.scales:
+        # Always seed the silu output's scale from the synthesised
+        # tensor, regardless of this swish's own precision — the
+        # auto-cast pass uses this scale when a downstream int8
+        # consumer reads from a fp16 silu (or vice-versa). The
+        # calibrate() loop skips wrap_with_set_grad_enabled because
+        # cap.tensors stores its output as a TUPLE and the scan only
+        # accepts Tensors.
+        if out_name not in self.scales:
             self.scales[out_name] = _scale_from_max_abs(silu_t)
 
-        self._record_tensor(out_name)
+        op_q = self._quant_for(n)
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(op_q))
         sig_name = f"{n.name}__sigmoid"
-        # Intermediate sigmoid output: same shape as input, fp16/i8 dtype.
+        # Intermediate sigmoid output: same shape as input, dtype
+        # follows the swish op's precision.
         if sig_name not in self.tensors_meta:
             self.tensors[sig_name] = torch.sigmoid(input_t).detach()
-            if self.quant == "int8":
+            if op_q == "int8":
                 # sigmoid output ∈ (0, 1) — scale is 1/127.
                 self.scales[sig_name] = 1.0 / 127.0
                 self.tensors_meta[sig_name] = {
@@ -936,7 +938,7 @@ class _ExportWalker:
                     "dtype": "f16",
                 }
         n_elems = int(np.prod(input_t.shape))
-        if self.quant == "fp16":
+        if op_q == "fp16":
             self.ops.append({
                 "name": sig_name,
                 "op": "sigmoid_f16",
@@ -1049,7 +1051,7 @@ class _ExportWalker:
         # 16 MBConv blocks. If a BN follows, emit a SEPARATE
         # batchnorm2d_f16 right after with pre-computed affine
         # (scale=gamma/sqrt(var+eps), bias=beta-mean*scale).
-        if self.quant == "fp16":
+        if self._quant_for(n) == "fp16":
             # Conv writes to the conv's own aten node name (n.name); if a
             # BN follows, batchnorm2d_f16 then writes to bn_user.name.
             # If no BN, conv writes directly to its own n.name (which is
@@ -1061,11 +1063,12 @@ class _ExportWalker:
             if b_orig is not None:
                 b_key = f"{n.name}.bias"
                 self.weights_blob[b_key] = b_orig.detach().cpu().numpy().astype(np.float16)
-            self._record_tensor(conv_out_name)
+            self._record_tensor(conv_out_name, dtype="f16")
             op_kind = "depthwise_conv2d_f16" if is_depthwise else "conv2d_f16"
             self.ops.append({
                 "name": str(n.name),
                 "op": op_kind,
+                "precision": "fp16",
                 "inputs": [in_name],
                 "outputs": [conv_out_name],
                 "weight": w_key,
@@ -1101,11 +1104,12 @@ class _ExportWalker:
                     scale_fp32.detach().cpu().numpy().astype(np.float16))
                 self.weights_blob[bn_bias_key] = (
                     bn_bias_fp32.detach().cpu().numpy().astype(np.float16))
-                self._record_tensor(bn_user.name)
+                self._record_tensor(bn_user.name, dtype="f16")
                 t_shape = self.tensors[bn_user.name].shape
                 self.ops.append({
                     "name": str(bn_user.name),
                     "op": "batchnorm2d_f16",
+                    "precision": "fp16",
                     "inputs": [conv_out_name],
                     "outputs": [bn_user.name],
                     "weight": scale_key,
@@ -1758,11 +1762,32 @@ def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
     stays empty).
     """
     import fnmatch as _fn
-    aten_names = [n.name for n in ep.graph_module.graph.nodes]
+    nodes = list(ep.graph_module.graph.nodes)
+    aten_names = [n.name for n in nodes]
+    node_by_name = {n.name: n for n in nodes}
     explicit_fp16: set[str] = set()
     explicit_int8: set[str] = set()
     spec = (model_mod.get_precision_spec()
             if hasattr(model_mod, "get_precision_spec") else None)
+
+    def _upstream(target_name: str) -> set[str]:
+        """All ancestor aten node names of `target_name`, traversed
+        backwards through n.all_input_nodes. Used to promote a whole
+        subgraph (e.g. the goal_encoder) by naming just its output."""
+        if target_name not in node_by_name:
+            return set()
+        seen: set[str] = set()
+        stack = [node_by_name[target_name]]
+        while stack:
+            cur = stack.pop()
+            if cur.name in seen:
+                continue
+            seen.add(cur.name)
+            for parent in cur.all_input_nodes:
+                if parent.name not in seen:
+                    stack.append(parent)
+        return seen
+
     if spec:
         for nm in spec.get("fp16_ops", []) or []:
             explicit_fp16.add(nm)
@@ -1772,6 +1797,11 @@ def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
             for nm in aten_names:
                 if _fn.fnmatch(nm, pat):
                     explicit_fp16.add(nm)
+        for target in spec.get("fp16_upstream_of", []) or []:
+            # Promote `target` + every aten node feeding into it (the
+            # entire subgraph). Cheap-and-precise alternative to listing
+            # ops by name for big regions like an encoder branch.
+            explicit_fp16.update(_upstream(target))
     if fp16_ops_cli.strip():
         for nm in [s.strip() for s in fp16_ops_cli.split(",") if s.strip()]:
             explicit_fp16.add(nm)
@@ -1945,6 +1975,13 @@ def main():
     walker.calibrate()
     print(f"[extract_export] emitting IR ...", flush=True)
     walker.emit()
+    # Register user-input placeholders in tensors_meta BEFORE the
+    # auto-cast pass — otherwise the cast pass can't see their dtype
+    # and won't insert i8→f16 casts where an fp16 op consumes a
+    # surface input directly (e.g. ViNT's cat takes obs slice + goal
+    # placeholder; if cat is fp16-promoted, goal_img needs casting).
+    for k in list(calib_dicts[0].keys()):
+        walker._record_tensor(k)
     # Splice in i8↔f16 cast ops at any dtype boundaries the walker
     # produced. When no op was promoted (all-int8 or all-fp16 mode),
     # this pass is a no-op — every tensor's producer and consumer dtype
