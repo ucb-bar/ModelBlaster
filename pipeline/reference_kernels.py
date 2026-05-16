@@ -4380,6 +4380,72 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
         {"M": 1, "K": 64, "N": 64},
     ],
     argtypes_factory=_linear_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="widening",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh widening fp16 MAC. The reference impl reads a "
+                "scalar fp32 accumulator across K iterations of\n"
+                "  acc += (float)input[m*K+k] * (float)weight[n*K+k];\n"
+                "and casts to fp16 at the final store. Vectorize that "
+                "inner K-loop with vfwmacc: each lane consumes one fp16 "
+                "input + one fp16 weight, widens the product to fp32, "
+                "and accumulates into a fp32 LMUL=4 vector. After the "
+                "loop, vfredusum reduces the vector to a scalar (sum "
+                "order differs from the scalar impl, but both keep fp32 "
+                "precision so the result agrees with the reference within "
+                "~1 ulp at the final fp16 cast).\n\n"
+                "WHY THIS HELPS:\n"
+                "  The reference impl is 5+ instructions per MAC on RVV "
+                "scalar (two fp16 loads, two fcvt.s.h, one fmul.s, one "
+                "fadd.s). vfwmacc.vv collapses load+widen+mul+add into "
+                "one vector instruction operating on vlmax_e16m2 lanes "
+                "per iteration. For ViNT's typical linear (M=1, K=512, "
+                "N=512), the inner-K loop drops from 512 scalar MACs to "
+                "~16 vector iterations on a V256 implementation.\n\n"
+                "ALGORITHM:\n"
+                "  for each (m, n):\n"
+                "    vacc = vfmv.v.f f32m4(0)\n"
+                "    for k_base in [0, K) step vl=vsetvl(e16m2, K-k_base):\n"
+                "      va = vle16.v f16m2(input + m*K + k_base, vl)\n"
+                "      vb = vle16.v f16m2(weight + n*K + k_base, vl)\n"
+                "      vacc = vfwmacc.vv f32m4(vacc, va, vb, vl)\n"
+                "    acc = vfredusum(vacc) + (bias ? bias[n] : 0)\n"
+                "    output[m*N+n] = (_Float16)acc\n"
+            ),
+            reference_impl="""\
+#include <riscv_vector.h>
+
+void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int M, int K, int N) {
+    const size_t vlmax_e32m4 = __riscv_vsetvlmax_e32m4();
+    for (int m = 0; m < M; m++) {
+        const _Float16 *in_row = input + (size_t)m * (size_t)K;
+        for (int n = 0; n < N; n++) {
+            const _Float16 *w_row = weight + (size_t)n * (size_t)K;
+            vfloat32m4_t vacc = __riscv_vfmv_v_f_f32m4(0.0f, vlmax_e32m4);
+            int k = 0;
+            while (k < K) {
+                size_t vl = __riscv_vsetvl_e16m2((size_t)(K - k));
+                vfloat16m2_t va = __riscv_vle16_v_f16m2(in_row + k, vl);
+                vfloat16m2_t vb = __riscv_vle16_v_f16m2(w_row  + k, vl);
+                vacc = __riscv_vfwmacc_vv_f32m4(vacc, va, vb, vl);
+                k += (int)vl;
+            }
+            vfloat32m1_t vsum0 = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+            vfloat32m1_t vred  = __riscv_vfredusum_vs_f32m4_f32m1(
+                vacc, vsum0, vlmax_e32m4);
+            float acc = __riscv_vfmv_f_s_f32m1_f32(vred);
+            if (bias) acc += (float)bias[n];
+            output[(size_t)m * (size_t)N + (size_t)n] = (_Float16)acc;
+        }
+    }
+}
+""",
+        ),
+    ],
 )
 
 
