@@ -534,7 +534,15 @@ class _ExportWalker:
             self.weights_blob[name] = t.detach().cpu().numpy().astype(np.float16)
 
     def _record_tensor(self, name: str, dtype: Optional[str] = None):
+        # If an explicit dtype is passed, it always wins — that's how the
+        # per-op emit paths re-stamp a tensor's dtype to match the op's
+        # precision when the tensor was previously recorded with the
+        # walker default (e.g. pad is fold-classified, gets _record_tensor
+        # called at int8 default, then _emit_pad re-emits at fp16 from
+        # conv2d's pad-fold look-behind — we must update the meta).
         if name in self.tensors_meta:
+            if dtype is not None and self.tensors_meta[name].get("dtype") != dtype:
+                self.tensors_meta[name]["dtype"] = dtype
             return
         t = self.tensors.get(name)
         if t is None:
@@ -546,7 +554,7 @@ class _ExportWalker:
         if t is None:
             return  # constant / unused
         eff_dtype = dtype if dtype is not None else self.tensor_dtype
-        if self.quant == "int8":
+        if eff_dtype == "i8":
             self.tensors_meta[name] = {
                 "shape": list(t.shape),
                 "dtype": eff_dtype,
@@ -1318,13 +1326,15 @@ class _ExportWalker:
     def _emit_relu(self, n):
         in_name = self._resolve_input(n.args[0])
         out_name = n.name
-        self._record_tensor(out_name)
+        q = self._quant_for(n)
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
         rec = {
-            "name": str(n.name), "op": f"relu{self.op_suffix}",
+            "name": str(n.name), "op": f"relu{self._op_suffix_for(q)}",
+            "precision": q,
             "inputs": [in_name], "outputs": [out_name],
             "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
         }
-        if self.quant == "int8":
+        if q == "int8":
             rec["quant"] = {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
@@ -1342,13 +1352,15 @@ class _ExportWalker:
             return
         b = self._resolve_input(bv)
         out_name = n.name
-        self._record_tensor(out_name)
+        q = self._quant_for(n)
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
         rec = {
-            "name": str(n.name), "op": f"add{self.op_suffix}",
+            "name": str(n.name), "op": f"add{self._op_suffix_for(q)}",
+            "precision": q,
             "inputs": [a, b], "outputs": [out_name],
             "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
         }
-        if self.quant == "int8":
+        if q == "int8":
             rec["quant"] = {
                 "scale_a":   self.scales.get(a, 1e-8),
                 "scale_b":   self.scales.get(b, 1e-8),
@@ -1484,9 +1496,9 @@ class _ExportWalker:
         return False
 
     def _emit_slice_c(self, n):
-        """Channel-axis slice of NCHW int8: aten::slice(input, dim=1,
-        start, end). Emits a slice_c_s8 op record consuming
-        (C_end - C_start) channels."""
+        """Channel-axis slice of NCHW: aten::slice(input, dim=1,
+        start, end). Emits a slice_c_{s8,f16} op record consuming
+        (C_end - C_start) channels. Precision follows _quant_for(n)."""
         src = n.args[0]
         src_name = self._resolve_input(src)
         C_start = int(n.args[2]) if len(n.args) > 2 else 0
@@ -1496,9 +1508,11 @@ class _ExportWalker:
         if C_end is None or C_end > IC:
             C_end = IC
         out_name = n.name
-        self._record_tensor(out_name)
+        q = self._quant_for(n)
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
         rec = {
-            "name": str(n.name), "op": f"slice_c{self.op_suffix}",
+            "name": str(n.name), "op": f"slice_c{self._op_suffix_for(q)}",
+            "precision": q,
             "inputs": [src_name], "outputs": [out_name],
             "shape": {
                 "N": int(src_shape[0]), "IC": int(IC),
@@ -1506,7 +1520,7 @@ class _ExportWalker:
                 "H": int(H), "W": int(W),
             },
         }
-        if self.quant == "int8":
+        if q == "int8":
             in_scale = self.scales.get(src_name, 1e-8)
             out_scale = self.scales.get(out_name, in_scale)
             rec["quant"] = {
@@ -1517,15 +1531,18 @@ class _ExportWalker:
         self.ops.append(rec)
 
     def _emit_pad(self, n):
-        """Asymmetric pad_s8. Pads tuple is aten's
-        (left, right, top, bottom) for a 4-d tensor."""
+        """Asymmetric pad_{s8,f16}. Pads tuple is aten's
+        (left, right, top, bottom) for a 4-d tensor. Precision follows
+        _quant_for(n)."""
         in_name = self._resolve_input(n.args[0])
         pads = list(n.args[1])
         out_name = n.name
-        self._record_tensor(out_name)
+        q = self._quant_for(n)
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
         out_shape = self.tensors[out_name].shape if out_name in self.tensors else None
         rec = {
-            "name": str(n.name), "op": f"pad{self.op_suffix}",
+            "name": str(n.name), "op": f"pad{self._op_suffix_for(q)}",
+            "precision": q,
             "inputs": [in_name], "outputs": [out_name],
             "shape": {
                 "N": int(out_shape[0]) if out_shape is not None else 1,
@@ -1538,7 +1555,7 @@ class _ExportWalker:
                 "pad_bottom": int(pads[3]) if len(pads) > 3 else 0,
             },
         }
-        if self.quant == "int8":
+        if q == "int8":
             rec["quant"] = {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
@@ -1551,11 +1568,13 @@ class _ExportWalker:
         ks = _pair(n.args[1]) if len(n.args) > 1 else (2, 2)
         st = _pair(n.args[2]) if len(n.args) > 2 else ks
         out_name = n.name
-        self._record_tensor(out_name)
+        q = self._quant_for(n)
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
         shape = self.tensors[out_name].shape
         in_shape = self.tensors[in_name].shape
         rec = {
-            "name": str(n.name), "op": f"maxpool2d{self.op_suffix}",
+            "name": str(n.name), "op": f"maxpool2d{self._op_suffix_for(q)}",
+            "precision": q,
             "inputs": [in_name], "outputs": [out_name],
             "shape": {
                 "N": int(shape[0]), "C": int(shape[1]),
@@ -1565,7 +1584,7 @@ class _ExportWalker:
                 "PH": 0, "PW": 0, "DH": 1, "DW": 1,
             },
         }
-        if self.quant == "int8":
+        if q == "int8":
             rec["quant"] = {
                 "scale_in":  self.scales.get(in_name, 1e-8),
                 "scale_out": self.scales.get(out_name, 1e-8),
