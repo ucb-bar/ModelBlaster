@@ -654,10 +654,15 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
     mid = _mid(model_name)
     umid = _umid(model_name)
     # All outputs must share a dtype (we concatenate into one output buffer).
+    # If the IR has mixed-dtype surface outputs, the extract pass should
+    # have inserted casts so every surface tensor lands at one dtype —
+    # see walker.insert_casts() in extract_graph_export.py.
     out_dtypes = {tensors[t]["dtype"] for t in out_tensors_list}
     if len(out_dtypes) != 1:
         raise NotImplementedError(
-            f"multi-output models with mixed dtypes not supported: {out_dtypes}"
+            f"multi-output models with mixed surface-dtype not supported: "
+            f"{out_dtypes}. Promote a cast to the surface in extract to "
+            f"unify dtypes before generate_skeleton."
         )
     out_c_type = _dtype_to_c(next(iter(out_dtypes)))
     # Multi-output: concatenate outputs into a single output buffer in order.
@@ -1385,6 +1390,24 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
                 f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+            )
+        # ---- Mixed-precision cast kernels ----
+        elif op["op"] == "cast_i8_to_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            scale = op["quant"]["scale"]
+            call = (
+                f"kernel_cast_i8_to_f16({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(scale)})"
+            )
+        elif op["op"] == "cast_f16_to_i8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            scale = op["quant"]["scale"]
+            inv_scale = 1.0 / max(float(scale), 1e-30)
+            call = (
+                f"kernel_cast_f16_to_i8({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(inv_scale)})"
             )
         # ---- ViNT fp16 op set ----
         elif op["op"] == "linear_f16":

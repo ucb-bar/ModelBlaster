@@ -204,7 +204,8 @@ class _ExportWalker:
 
     def __init__(self, ep, calibration_tensors: list[dict[str, torch.Tensor]],
                  input_order: list[str], per_channel: bool = False,
-                 quant: str = "int8"):
+                 quant: str = "int8",
+                 op_precision: Optional[dict[str, str]] = None):
         self.ep = ep
         self.gm = ep.graph_module
         # When True, conv2d / linear / matmul emit their per-channel
@@ -212,13 +213,20 @@ class _ExportWalker:
         # output channel) instead of the per-tensor form. Activations
         # remain per-tensor symmetric.
         self.per_channel = per_channel
-        # "int8" (default — existing PTQ path) or "fp16" (half-precision,
-        # no calibration; weights cast to float16, op records carry
-        # "_f16" suffix, no scale/multiplier/shift metadata). The fp16
-        # path still walks the same aten graph and applies the same
-        # batchnorm/pad folding — only the numeric encoding differs.
+        # Default precision for ops without an explicit override:
+        #   "int8" — existing PTQ path
+        #   "fp16" — half-precision (weights cast to float16, op records
+        #            carry "_f16" suffix, no scale/multiplier/shift)
+        # Mixed-precision overrides live in self.op_precision[node.name];
+        # ops without an entry use self.default_quant. See
+        # agents/notes/mixed_precision_plan.md.
         if quant not in ("int8", "fp16"):
             raise ValueError(f"quant must be 'int8' or 'fp16' (got {quant!r})")
+        self.default_quant = quant
+        # node_name → "int8" | "fp16" override for this op.
+        self.op_precision: dict[str, str] = dict(op_precision or {})
+        # Legacy aliases — kept for any code that still reads walker-wide
+        # state. New code should call _quant_for() and dispatch on that.
         self.quant = quant
         self.op_suffix = "_s8" if quant == "int8" else "_f16"
         self.tensor_dtype = "i8" if quant == "int8" else "f16"
@@ -262,6 +270,25 @@ class _ExportWalker:
     # var (e.g. 99.99 for 99.99th percentile). Defaults to None
     # (max_abs).
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Mixed-precision helpers. Each aten node's emit decision flows
+    # through _quant_for(); call sites use this instead of self.quant
+    # so a per-op override (from a model's get_precision_spec or a
+    # --fp16-ops CLI flag) flips the emit branch for that op alone.
+    # ------------------------------------------------------------------
+    def _quant_for(self, n) -> str:
+        """Return "int8" or "fp16" for this aten node — honoring the
+        per-op precision override map, falling back to default_quant."""
+        name = n.name if hasattr(n, "name") else str(n)
+        return self.op_precision.get(name, self.default_quant)
+
+    def _dtype_for_quant(self, q: str) -> str:
+        return "f16" if q == "fp16" else "i8"
+
+    def _op_suffix_for(self, q: str) -> str:
+        return "_f16" if q == "fp16" else "_s8"
+
     def calibrate(self):
         import os as _os
         pct_env = _os.environ.get("AGENTS_ACT_PERCENTILE", "")
@@ -376,6 +403,82 @@ class _ExportWalker:
         # Walk in topological order (already true for fx Graph).
         for n in self.gm.graph.nodes:
             self._visit(n)
+
+    # ------------------------------------------------------------------
+    # Auto-cast pass: for each op, if its declared precision (from the
+    # op record's "precision" field or — for ops without an explicit
+    # precision tag — inferred from the suffix) demands a different
+    # tensor dtype than what an input tensor was produced at, splice in
+    # a cast_<i8_to_f16|f16_to_i8> op before the consumer. Mixed
+    # precision becomes a property of the assembled IR; per-op emit code
+    # stays single-precision-per-op.
+    # See agents/notes/mixed_precision_plan.md.
+    # ------------------------------------------------------------------
+    def insert_casts(self):
+        def consumer_dtype(op) -> str:
+            p = op.get("precision")
+            if p is None:
+                p = "fp16" if op["op"].endswith("_f16") else "int8"
+            return "f16" if p == "fp16" else "i8"
+
+        new_ops: list[dict] = []
+        # (src_tensor_name, dst_dtype) → reusable cast-output name. If
+        # two consumers want the same cast, share the buffer.
+        cast_intermediates: dict[tuple[str, str], str] = {}
+
+        for op in self.ops:
+            dst_dtype = consumer_dtype(op)
+            for i, in_name in enumerate(op.get("inputs", [])):
+                # The IR's input list can include weight refs for some
+                # ops; for cast purposes we only care about actual
+                # tensor inputs (those that have a tensors_meta entry).
+                meta = self.tensors_meta.get(in_name)
+                if meta is None:
+                    continue
+                src_dtype = meta.get("dtype", "i8")
+                if src_dtype == dst_dtype:
+                    continue
+                # Only handle i8 <-> f16 boundaries; other dtypes (i32
+                # bias, etc.) aren't real activations and should pass
+                # through untouched.
+                if (src_dtype, dst_dtype) not in (("i8", "f16"), ("f16", "i8")):
+                    continue
+                key = (in_name, dst_dtype)
+                cast_out = cast_intermediates.get(key)
+                if cast_out is None:
+                    cast_out = f"{in_name}__cast_{dst_dtype}"
+                    self.tensors_meta[cast_out] = {
+                        "shape": list(meta["shape"]),
+                        "dtype": dst_dtype,
+                    }
+                    # The scale stored on the cast op record is the
+                    # int8 tensor's per-tensor symmetric scale. For
+                    # i8 → f16, that's the source's scale (dequant).
+                    # For f16 → i8, that's the destination's scale,
+                    # which we approximate as the source's scale (same
+                    # tensor's calibrated max-abs / 127) since the
+                    # cast just reinterprets the same activation.
+                    scale = self.scales.get(in_name, 1e-8)
+                    if src_dtype == "i8" and dst_dtype == "f16":
+                        cast_op_kind = "cast_i8_to_f16"
+                    else:
+                        cast_op_kind = "cast_f16_to_i8"
+                    n_elems = 1
+                    for d in meta["shape"]:
+                        n_elems *= int(d)
+                    new_ops.append({
+                        "name": cast_out,
+                        "op": cast_op_kind,
+                        "precision": "int8" if dst_dtype == "i8" else "fp16",
+                        "inputs": [in_name],
+                        "outputs": [cast_out],
+                        "shape": {"n": n_elems},
+                        "quant": {"scale": float(scale), "zero_point": 0},
+                    })
+                    cast_intermediates[key] = cast_out
+                op["inputs"][i] = cast_out
+            new_ops.append(op)
+        self.ops = new_ops
 
     def _resolve_input(self, val) -> str:
         """Map an fx-Node arg to the canonical tensor name used in IR.
@@ -540,16 +643,20 @@ class _ExportWalker:
         if op_kind == "scaled_dot_product_attention.default":
             self._emit_sdpa_decomposed(n); return
         kern_base = _NEW_COMPUTE[op_kind].removesuffix("_s8")
-        kern_name = f"{kern_base}{self.op_suffix}"
+        kern_name = f"{kern_base}{self._op_suffix_for(self._quant_for(n))}"
         in_name = self._resolve_input(n.args[0])
         out_name = n.name
-        self._record_tensor(out_name)
-        is_fp16 = (self.quant == "fp16")
+        # Record the output tensor at the per-op precision's dtype so
+        # the auto-cast pass sees the right boundary type.
+        op_q = self._quant_for(n)
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(op_q))
+        is_fp16 = (op_q == "fp16")
         # Default shape: flat "n" for elementwise ops. Per-op overrides
         # below set 4-D / 2-D shape dicts when needed.
         rec = {
             "name": str(n.name),
             "op": kern_name,
+            "precision": op_q,
             "inputs": [in_name] if not isinstance(n.args[0], (list, tuple))
                        else self._resolve_input(n.args[0]),
             "outputs": [out_name],
@@ -1116,13 +1223,23 @@ class _ExportWalker:
 
         # fp16 path: cast weights + bias to fp16, emit a single
         # linear_f16 record (no scale/multiplier/shift).
-        if self.quant == "fp16":
+        # Consults the per-op precision override map so a single linear
+        # op (e.g. ViNT's goal-encoder output `linear`) can be promoted
+        # to fp16 while the rest of the network stays int8.
+        if self._quant_for(n) == "fp16":
             self.weights_blob[w_key] = w.detach().cpu().numpy().astype(np.float16)
             if b is not None:
                 self.weights_blob[b_key] = b.detach().cpu().numpy().astype(np.float16)
+            # Stamp the output tensor's dtype as f16 so the auto-cast
+            # pass and downstream codegen see the right buffer type.
+            self.tensors_meta[out_name] = {
+                "shape": list(self.tensors[out_name].shape),
+                "dtype": "f16",
+            }
             self.ops.append({
                 "name": str(n.name),
                 "op": "linear_f16",
+                "precision": "fp16",
                 "inputs": [in_name],
                 "outputs": [out_name],
                 "weight": w_key,
@@ -1185,6 +1302,7 @@ class _ExportWalker:
         self.ops.append({
             "name": str(n.name),
             "op": op_kind,
+            "precision": "int8",
             "inputs": [in_name],
             "outputs": [out_name],
             "weight": w_key,
@@ -1299,19 +1417,27 @@ class _ExportWalker:
                     C_inputs.append(0)
         # Use the 4-D channel-dim cat skeleton for both native-4-D and
         # reinterpreted cases — they share the same kernel signature.
+        op_q = self._quant_for(n)
+        op_suffix = self._op_suffix_for(op_q)
+        # Re-stamp output dtype to match op precision.
+        self.tensors_meta[out_name] = {
+            "shape": list(self.tensors[out_name].shape) if out_name in self.tensors else self.tensors_meta[out_name]["shape"],
+            "dtype": self._dtype_for_quant(op_q),
+        }
         if n_inputs <= 4:
-            op_kind = f"cat{n_inputs}_c1{self.op_suffix}"
+            op_kind = f"cat{n_inputs}_c1{op_suffix}"
         else:
-            op_kind = f"cat_n_c1{self.op_suffix}"
+            op_kind = f"cat_n_c1{op_suffix}"
         rec = {
             "name": str(n.name), "op": op_kind,
+            "precision": op_q,
             "inputs": names, "outputs": [out_name],
             "shape": {
                 "N": N, "H": H, "W": W,
                 "C_total": C_total, "C_inputs": C_inputs,
             },
         }
-        if self.quant == "int8":
+        if op_q == "int8":
             rec["quant"] = {
                 "scales_in": [self.scales.get(nm, 1e-8) for nm in names],
                 "scale_out": self.scales.get(out_name, 1e-8),
@@ -1613,6 +1739,57 @@ def _emit_vint_post_op(walker, out_dir):
     return out_name
 
 
+def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
+                          fp16_patterns_cli: str, default: str) -> dict[str, str]:
+    """Resolve per-op precision overrides into a {node_name: 'fp16'|'int8'}
+    map. Sources, in order (later wins on conflict):
+
+      1. ``model_mod.get_precision_spec()`` — per-model defaults if the
+         module defines the hook. Spec shape:
+           {"default": "int8" | "fp16",
+            "fp16_ops": [<aten node names>],
+            "fp16_patterns": [<fnmatch globs>],
+            "int8_ops": [<aten node names>]}
+      2. ``--fp16-ops`` CLI list — explicit promotions.
+      3. ``--fp16-patterns`` CLI list — glob promotions.
+
+    Only emits entries that DIFFER from ``default`` so the walker's
+    per-op lookup is a true override map (and the all-default path
+    stays empty).
+    """
+    import fnmatch as _fn
+    aten_names = [n.name for n in ep.graph_module.graph.nodes]
+    explicit_fp16: set[str] = set()
+    explicit_int8: set[str] = set()
+    spec = (model_mod.get_precision_spec()
+            if hasattr(model_mod, "get_precision_spec") else None)
+    if spec:
+        for nm in spec.get("fp16_ops", []) or []:
+            explicit_fp16.add(nm)
+        for nm in spec.get("int8_ops", []) or []:
+            explicit_int8.add(nm)
+        for pat in spec.get("fp16_patterns", []) or []:
+            for nm in aten_names:
+                if _fn.fnmatch(nm, pat):
+                    explicit_fp16.add(nm)
+    if fp16_ops_cli.strip():
+        for nm in [s.strip() for s in fp16_ops_cli.split(",") if s.strip()]:
+            explicit_fp16.add(nm)
+    if fp16_patterns_cli.strip():
+        for pat in [s.strip() for s in fp16_patterns_cli.split(",") if s.strip()]:
+            for nm in aten_names:
+                if _fn.fnmatch(nm, pat):
+                    explicit_fp16.add(nm)
+    overrides: dict[str, str] = {}
+    for nm in explicit_fp16:
+        if "fp16" != default:
+            overrides[nm] = "fp16"
+    for nm in explicit_int8:
+        if "int8" != default:
+            overrides[nm] = "int8"
+    return overrides
+
+
 def _import_model_module(name: str):
     if name == "vint":
         from agents.models import vint as model_mod
@@ -1656,6 +1833,17 @@ def main():
                    help="Number of calibration samples (currently uses the "
                         "model's get_sample_input() repeatedly with fresh "
                         "RNG; will grow into a real dataset hook).")
+    p.add_argument("--fp16-ops", default="",
+                   help="Comma-separated aten node names to promote to "
+                        "fp16 (overriding --quant for these ops alone). "
+                        "Additive to the model's get_precision_spec() if "
+                        "the model defines one. Example: "
+                        "--fp16-ops linear,linear_24")
+    p.add_argument("--fp16-patterns", default="",
+                   help="Comma-separated fnmatch globs applied to aten "
+                        "node names; matching ops are promoted to fp16. "
+                        "Additive to --fp16-ops and the model's spec. "
+                        "Example: --fp16-patterns 'layer_norm_*'")
     args = p.parse_args()
 
     if args.quant == "fp32":
@@ -1698,8 +1886,11 @@ def main():
     # sample.
     calib_samples_tuples: list[tuple] = []
     calib_spec: dict | None = None
+    # Always import the model module so we can inspect its optional
+    # hooks (get_calibration_spec, get_precision_spec, ...). Cheap; the
+    # actual model weights have already been loaded by _load_model.
+    mod = _import_model_module(args.model)
     if args.num_calibration > 1:
-        mod = _import_model_module(args.model)
         if hasattr(mod, "get_calibration_spec"):
             from agents.datasets import materialize_calibration_samples  # noqa: PLC0415
             calib_spec = mod.get_calibration_spec(args.num_calibration)
@@ -1732,14 +1923,66 @@ def main():
         {name: t for name, t in zip(input_order, s)}
         for s in calib_samples_tuples
     ]
+    # Resolve per-op precision overrides — union of (a) the model's
+    # get_precision_spec() if it defines one, (b) --fp16-ops explicit
+    # node names, (c) --fp16-patterns fnmatch globs against aten node
+    # names. Empty spec ⇒ all ops follow --quant (single-mode behavior).
+    op_precision = _resolve_op_precision(
+        ep, mod, args.fp16_ops, args.fp16_patterns, default=args.quant)
+    if op_precision:
+        n_fp16 = sum(1 for q in op_precision.values() if q == "fp16")
+        n_int8 = sum(1 for q in op_precision.values() if q == "int8")
+        print(f"[extract_export] precision overrides: "
+              f"{n_fp16} ops → fp16, {n_int8} ops → int8 (rest = "
+              f"{args.quant})", flush=True)
+
     walker = _ExportWalker(ep, calib_dicts, input_order,
                            per_channel=args.per_channel,
-                           quant=args.quant)
+                           quant=args.quant,
+                           op_precision=op_precision)
     print(f"[extract_export] calibrating + capturing intermediates ...",
           flush=True)
     walker.calibrate()
     print(f"[extract_export] emitting IR ...", flush=True)
     walker.emit()
+    # Splice in i8↔f16 cast ops at any dtype boundaries the walker
+    # produced. When no op was promoted (all-int8 or all-fp16 mode),
+    # this pass is a no-op — every tensor's producer and consumer dtype
+    # match by construction.
+    _before = len(walker.ops)
+    walker.insert_casts()
+    _added = len(walker.ops) - _before
+    if _added:
+        print(f"[extract_export] auto-cast pass: inserted {_added} cast ops "
+              f"at i8↔f16 boundaries", flush=True)
+    # Weight-dtype reconciliation: when an op was promoted to fp16 but
+    # its weight tensors (gamma/beta for layer_norm, the cast scale
+    # tensors, etc.) were stored as int8 by _record_constant_buffer
+    # (which honored the walker default), re-cast them to fp16 storage.
+    # Weights are static so we just re-store at extract time — no
+    # runtime cast needed. The auto-cast pass intentionally doesn't
+    # touch weight refs (they pass through op["inputs"] unchanged).
+    _LAYER_NORM_WEIGHT_KEYS = ("gamma_key", "beta_key")
+    for _op in walker.ops:
+        if _op.get("precision") != "fp16":
+            continue
+        for _key in _LAYER_NORM_WEIGHT_KEYS:
+            _tname = _op.get(_key)
+            if not _tname:
+                continue
+            _meta = walker.tensors_meta.get(_tname, {})
+            if _meta.get("dtype") == "f16":
+                continue
+            # Re-store as fp16 (use original fp32 captured value).
+            _t = walker.tensors.get(_tname)
+            if _t is None:
+                continue
+            walker.weights_blob[_tname] = (
+                _t.detach().cpu().numpy().astype(np.float16))
+            walker.tensors_meta[_tname] = {
+                "shape": list(_t.shape), "dtype": "f16",
+                "quant": {"kind": "constant_buffer"},
+            }
 
     # Inputs / outputs from the export's user signature. Use the
     # first calibration sample for sizing / golden capture.
