@@ -1586,6 +1586,30 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
 }
 """,
         ),
+        AlgorithmCandidate(
+            name="outerprod",
+            target_affinity=("rvv_opu",),
+            description=(
+                "Saturn OPU i8 outer-product MAC with bias broadcast.\n"
+                "Ported from\n"
+                "  hw/chipyard/generators/saturn/benchmarks/opu-gemm/kernel.h\n"
+                "(branch origin/opu-fp8, `i8_mm_bme_sq` + bias variant).\n\n"
+                "ALGORITHM:\n"
+                "  if bias: vle32.v v0 <- bias[0..N-1]\n"
+                "  else:    vmv.v.i v0, 0\n"
+                "  OPMVINBCAST m1 <- v0  (broadcast bias to all M rows)\n"
+                "  for k in [0, K):\n"
+                "    vlse8.v v16, &input[k],  stride=K  -- input[r,k] per row\n"
+                "    vlse8.v v18, &weight[k], stride=K  -- weight[c,k] per col\n"
+                "    VOPACC m1, v18, v16\n"
+                "  drain m1 rows; per-element Q0.31 requantize + clamp + i8.\n\n"
+                "Strided loads avoid pre-transpose scratch (supports K up to\n"
+                "any size). Symmetric quant only (input_offset = filter_offset\n"
+                "= 0); asymmetric falls back to scalar reference. Single OPU\n"
+                "tile: M, N <= mlmax = VLEN/8."
+            ),
+            reference_impl="",  # the curated file supplies the impl
+        ),
     ],
 )
 
@@ -6019,6 +6043,34 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
         {"M": 7, "K": 512, "N": 512, "transpose_b": 0, "scale_div": 1.0}, # FFN-style
     ],
     argtypes_factory=_matmul_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="outerprod",
+            target_affinity=("rvv_opu",),
+            description=(
+                "Saturn OPU i8 outer-product matmul (VOPACC). Ported from\n"
+                "  hw/chipyard/generators/saturn/benchmarks/opu-gemm/kernel.h\n"
+                "(branch origin/opu-fp8, function `i8_mm_bme_sq`). The OPU\n"
+                "computes m[r,c] += vs1[r] * vs2[c] across K iterations of\n"
+                "VOPACC; one tile covers M×N up to mlmax=VLEN/8 per dim.\n\n"
+                "ALGORITHM:\n"
+                "  transpose a [M,K] -> at [K,M] (stack scratch)\n"
+                "  if transpose_b: transpose b [N,K] -> b_kn [K,N]\n"
+                "  OPMVINBCAST m1 <- 0   (no bias in matmul_s8)\n"
+                "  for k in [0, K) two-way unrolled:\n"
+                "    vle8.v v16 <- at[k*M..k*M+M]\n"
+                "    vle8.v v18 <- b[k*N..k*N+N]\n"
+                "    VOPACC m1, v18, v16\n"
+                "  drain rows of m1 into i32 scratch, apply matmul_s8\n"
+                "  requantize tail (float scale + round + clamp + i8).\n\n"
+                "Single-tile only: M,N <= 64 (OPU_MAX_TILE for V512),\n"
+                "K <= 1024 (OPU_MAX_K). Larger shapes fall back to the\n"
+                "embedded scalar reference; tiled OPU coverage is a\n"
+                "follow-up curation."
+            ),
+            reference_impl="",  # the curated file supplies the impl
+        ),
+    ],
 )
 
 
