@@ -33,6 +33,12 @@ OPTIMIZE="${OPTIMIZE:-0}"
 # (e.g. rvv → rvv_f16) for stages that need zvfh/zfh compiler flags and
 # spike ISA extensions. Directory layout still uses TARGET so fp32 and
 # fp16 builds share the same paths under the quant-namespaced tree.
+#
+# For mixed-precision (QUANT=int8 with fp16 ops via get_precision_spec), the
+# graph.json contains _f16 ops + cast_{i8_to_f16,f16_to_i8} nodes — we need
+# Zfh/Zvfh too. Detected after extract by scanning the IR (deferred to the
+# post-extract block below; the initial assignment honors only the static
+# QUANT-based override).
 GEN_TARGET="${TARGET}"
 if [[ "${QUANT}" == "fp16" ]]; then
     GEN_TARGET="${TARGET}_f16"
@@ -78,13 +84,38 @@ else
         --quant "${QUANT}"
 fi
 
-echo "[2/5] generate_skeleton (backend=${TARGET}) -> ${GEN_DIR}"
+# Post-extract auto-promote: if the IR contains any fp16 ops (mixed
+# precision via get_precision_spec) and we haven't already promoted via
+# QUANT=fp16, switch GEN_TARGET to the _f16 variant so generate_kernels
+# / west build / spike all pull in Zfh + Zvfh.
+#
+# Only auto-promote from {rvv, scalar} — backends with explicit
+# trailing-suffix variants (rvv_opu, rvv_f16, gemmini_q31, ...) need to
+# be selected by the user. Auto-promoting rvv_opu→rvv_opu_f16 would
+# silently route to a non-existent backend; instead, surface the
+# unsupported combination as a hard error at the kernels stage so the
+# user knows fp16 ops + that target aren't wired yet.
+if [[ ("${TARGET}" == "rvv" || "${TARGET}" == "scalar") \
+      && "${GEN_TARGET}" == "${TARGET}" \
+      && -f "${IR_DIR}/graph.json" ]]; then
+    _HAS_F16=$(python -c "
+import json
+g = json.load(open('${IR_DIR}/graph.json'))
+print('1' if any('f16' in n['op'] for n in g.get('ops', [])) else '0')
+" 2>/dev/null || echo "0")
+    if [[ "${_HAS_F16}" == "1" ]]; then
+        GEN_TARGET="${TARGET}_f16"
+        echo "  (auto-promoted GEN_TARGET=${GEN_TARGET} — IR has fp16 ops)"
+    fi
+fi
+
+echo "[2/5] generate_skeleton (backend=${GEN_TARGET}) -> ${GEN_DIR}"
 python -m agents.pipeline.generate_skeleton \
     --ir "${IR_DIR}/graph.json" \
     --weights "${IR_DIR}/weights.npz" \
     --io "${IR_DIR}/io.npz" \
     --out-dir "${GEN_DIR}" \
-    --backend "${TARGET}"
+    --backend "${GEN_TARGET}"
 
 echo "[3/5] generate_kernels (backend=${BACKEND} target=${GEN_TARGET} quant=${QUANT} optimize=${OPTIMIZE}) -> ${GEN_DIR}"
 GEN_KERNELS_ARGS=(
@@ -260,6 +291,19 @@ print(' '.join(b.spike_args))
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
             export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+        fi
+    fi
+    # rvv_opu backend needs the OPU-extended spike from
+    # hw/chipyard/toolchains/riscv-tools/riscv-isa-sim (built via
+    # customext/saturn_opu.cc). Use AGENTS_OPU_SPIKE env if set, else
+    # the local chipyard-tree path. The customext .so lives next to
+    # the binary so LD_LIBRARY_PATH points at the same install lib dir.
+    if [[ "${GEN_TARGET}" == "rvv_opu" ]]; then
+        _OPU_SPIKE="${AGENTS_OPU_SPIKE:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/bin/spike}"
+        _OPU_LIB_DIR="${AGENTS_OPU_LIB_DIR:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/lib}"
+        if [[ -f "${_OPU_SPIKE}" ]]; then
+            SPIKE_BIN_FLAGS+=(--spike "${_OPU_SPIKE}")
+            export LD_LIBRARY_PATH="${_OPU_LIB_DIR}:${LD_LIBRARY_PATH:-}"
         fi
     fi
     python -m agents.validation.spike_runner \

@@ -1150,6 +1150,29 @@ def generate(
         log(f"backend=reference  target={target.name}  ops={op_kinds}")
         for spec in specs:
             impls[spec.op] = spec.reference_impl
+        # Also probe the global curated dir under the reference path so
+        # hand-written curated kernels can be exercised without needing
+        # LLM credentials. For each spec, look up any algorithm whose file
+        # exists at <global_curated_dir>/<target>/<backend>_<op>_<algo>.c
+        # and swap in the curated source instead of the scalar reference.
+        # First-found-wins (algorithms are queue-ordered by target_affinity
+        # in spec.algorithms). No verify pass here — that's a deliberate
+        # tradeoff for the no-LLM path; the spike/firesim run downstream
+        # will catch correctness regressions just like a normal verify.
+        if global_curated_dir is not None:
+            for spec in specs:
+                for algorithm in spec.algorithms:
+                    filename = (
+                        f"{target.name}_{spec.op}_{algorithm.name}.c"
+                    )
+                    curated_path = os.path.join(
+                        global_curated_dir, target.name, filename
+                    )
+                    if os.path.exists(curated_path):
+                        log(f"  [{spec.op}/{algorithm.name}] reference + "
+                            f"curated swap from {curated_path}")
+                        impls[spec.op] = open(curated_path).read()
+                        break
     elif backend_name == "llm":
         # Lazy proxy: BedrockClient() is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
@@ -1256,7 +1279,7 @@ def generate(
     # it also won't penalize one, and FireSim re-rank (when active)
     # picks it up. `cache_aware_prompt=False` opts out for cases where
     # the user wants a strictly flat-memory prompt.
-    _CACHE_AWARE_TARGETS = {"rvv", "rvv_f16", "scalar", "scalar_f16"}
+    _CACHE_AWARE_TARGETS = {"rvv", "rvv_f16", "rvv_opu", "scalar", "scalar_f16"}
     if cache_aware_prompt or target.name in _CACHE_AWARE_TARGETS:
         from agents.optimize.firesim_eval import memory_model_stanza
         stanza = memory_model_stanza()
