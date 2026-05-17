@@ -130,6 +130,77 @@ RVV_F16 = Backend(
 )
 
 
+# Saturn OPU (Outer Product Unit) — integer matrix MAC engine layered on
+# top of the V opcode. Encoded as custom .insn r 0x57 ops (no extra
+# -march extension needed); the actual decode happens in Saturn HW via
+# the OuterProductSequencer / OuterProductUnit modules. See
+#   agents/cores/saturn_opu/include/saturn_opu.h
+# for the asm-macro programming model and
+#   agents/notes/saturn_opu_backend.md
+# for design notes and current status.
+#
+# Stage 1 is integer-only (i8 x i8 -> i32 accumulator via VOPACC). FP
+# variants (opuMxParams / fp8 / fp16 OPU) will land behind separate
+# backend names once that path is validated.
+#
+# Build requirements:
+#   - Saturn bitstream / verilator with VectorParams.opuParams (e.g.
+#     chipyard `REFV256D128DualRocketSaturnOPUGemmini32x32Q31WsConfig`
+#     or one of the Shuttle-side `OPUV*ShuttleConfig` classes from
+#     chipyard/OPUConfigs.scala on the saturn opu-fp8 branch).
+#   - rv64gcv toolchain — no Zfh/Zvfh needed for integer OPU.
+#
+# Spike status: upstream spike does NOT decode the OPU custom
+# instructions today. Building this backend's elf and running it on
+# stock spike will trap as illegal instruction on the first VOPACC.
+# The verify path is therefore FireSim-only (or a custom spike fork);
+# the spike_args field stays empty as a load-bearing marker, and
+# spike_runner.py / generate_kernels._verify treat empty spike_args +
+# verify_method=VERIFY_SPIKE_HARNESS as "spike unsupported, skip verify"
+# (TODO once that flag exists; until then, set BACKEND=reference + a
+# curated kernel and run on FireSim directly via run.sh RUNNER=firesim).
+RVV_OPU = Backend(
+    name="rvv_opu",
+    description=(
+        "rv64gcv + Saturn OPU integer matrix engine (i8×i8→i32 via "
+        "VOPACC custom .insn). Layered on the V extension; OPU custom "
+        "instructions encoded as .insn r 0x57 + custom funct fields."
+    ),
+    kernel_cflags=(
+        "-march=rv64gcv",
+        "-mabi=lp64d",
+        # Vendored OPU header location. Same `<repo_root>` placeholder
+        # convention as gemmini; resolved_kernel_cflags() substitutes
+        # at build time.
+        "-isystem<repo_root>/agents/cores/saturn_opu/include",
+        # Marker for kernels that want to gate code on "OPU available".
+        "-DAGENTS_SATURN_OPU=1",
+        # NOTE: deliberately does NOT carry AGENTS_RVV_IHWOC_WEIGHTS
+        # forward from the plain rvv backend. That flag tells
+        # universal (non-target-affined) kernels to assume IHWOC
+        # packing, but the skeleton only packs weights when an
+        # rvv_opu-affined conv2d algorithm declares weight_layout=ihwoc.
+        # Until that algorithm exists, weights stay OIHW and the
+        # universal scalar fallback expects OIHW. When the first OPU
+        # conv2d_s8 algorithm lands, decide whether OPU wants IHWOC
+        # (probably yes, since OPU benefits from contiguous K-stride
+        # input loads) and add the flag back then alongside the
+        # AlgorithmCandidate.weight_layout = "ihwoc" declaration.
+    ),
+    kernel_includes=("<riscv_vector.h>", "\"saturn_opu.h\""),
+    prj_conf_overlay="rvv_opu.conf",
+    # Custom OPU-extension spike, built from
+    # hw/chipyard/toolchains/riscv-tools/riscv-isa-sim/customext/saturn_opu.cc.
+    # `--extension=saturn_opu` loads the libcustomext.so that registers
+    # VOPACC / OPMVINBCAST / VMV_VR / VMV_RV decoders. _run_lib.sh
+    # routes this backend at the OPU-built spike via AGENTS_OPU_SPIKE
+    # (mirror of AGENTS_GEMMINI_SPIKE).
+    spike_args=("--extension=saturn_opu", "--isa=rv64gcv_zicntr"),
+    optimization_guide="optimization_guide_rvv.md",
+    verify_method=VERIFY_SPIKE_HARNESS,
+)
+
+
 # Gemmini integer accelerator (chipyard's default int8 RoCC config —
 # DIM=16, elem_t=int8, acc_t=int32). Stage 1 is RoCC-only; ReRoCC
 # variants will be added later behind separate target names.
@@ -244,6 +315,7 @@ BACKENDS: dict[str, Backend] = {
     RVV.name: RVV,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,
+    RVV_OPU.name: RVV_OPU,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,
 }
