@@ -4351,6 +4351,26 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
 }
 """,
         ),
+        AlgorithmCandidate(
+            name="oc_blocked",
+            target_affinity=("rvv_f16",),
+            description=(
+                "OC-parallel conv2d_f16. Vectorize over OC (each lane "
+                "carries one output channel of the current output pixel); "
+                "scalar-loop the (ic, kh, kw) reduction. Trades the "
+                "widening kernel's strided fp16 input load (slow on V256 "
+                "Saturn when IH*IW is small) for unit-stride scalar input "
+                "+ strided weight. Useful for layers with tiny spatial "
+                "dim (1×1 convs in EfficientNet MBConv expand/project) "
+                "where the strided-by-IH*IW input load gathers from "
+                "scattered addresses. Numerics equivalent to the widening "
+                "kernel modulo summation order (fp32 accumulator both "
+                "paths). Registered as the second candidate so 'widening' "
+                "stays the default; pick this via --algorithms=oc_blocked "
+                "or via the LLM optimize loop's FireSim re-rank."
+            ),
+            reference_impl="",  # curated file supplies the impl
+        ),
     ],
 )
 
