@@ -1,4 +1,4 @@
-"""Dataset protocol + calibration-spec resolver for the agents pipeline.
+"""Dataset protocol + calibration-spec resolver for the modelblaster pipeline.
 
 Goals:
  1. Calibration data is a *declared spec*, not hidden Python code per model.
@@ -9,7 +9,7 @@ Goals:
     ViNT's obs_img comes from a rolling window of IDSIA images, while
     goal_img comes from IsaacLab forest renders).
  3. Adding a new data source is one file: drop a loader module under
-    ``agents/datasets/<name>.py`` exporting ``load(spec) -> list[DatasetItem]``.
+    ``modelblaster/datasets/<name>.py`` exporting ``load(spec) -> list[DatasetItem]``.
 
 Spec schema (saved to ``<example>/<quant>/generated/calibration_spec.json``):
 
@@ -17,7 +17,7 @@ Spec schema (saved to ``<example>/<quant>/generated/calibration_spec.json``):
       "num_samples": 16,
       "inputs": {
         "<input_tensor_name>": {
-          "loader": "<module under agents.datasets>",
+          "loader": "<module under modelblaster.datasets>",
           # rest is loader-specific
           "image_size": [85, 64],
           ...
@@ -74,16 +74,16 @@ def load_dataset(spec: dict) -> list[DatasetItem]:
     Loader modules are auto-imported on first reference; they register
     themselves under their canonical name on import. So
     ``{"loader": "image_dir", ...}`` triggers import of
-    ``agents.datasets.image_dir``.
+    ``modelblaster.datasets.image_dir``.
     """
     name = spec["loader"]
     if name not in _LOADERS:
         # Lazy import: each loader module registers itself at top level.
-        importlib.import_module(f"agents.datasets.{name}")
+        importlib.import_module(f"modelblaster.datasets.{name}")
     if name not in _LOADERS:
         raise KeyError(
             f"loader {name!r} not registered; check that "
-            f"agents/datasets/{name}.py calls register_loader at top level")
+            f"modelblaster/datasets/{name}.py calls register_loader at top level")
     return _LOADERS[name](spec)
 
 

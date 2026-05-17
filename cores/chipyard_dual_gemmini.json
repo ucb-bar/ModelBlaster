@@ -1,6 +1,6 @@
 {
   "system": "chipyard-dual-rocket-saturn-gemmini",
-  "description": "Two-rocket Saturn-vector + shared Gemmini bitstream (alveo_u250_firesim-dual-rocket-saturn-gemmini-no-nic-l2-llc4mb-ddr3). Both rockets have saturn vector; one Gemmini accelerator hangs off the system bus and is reachable from both harts via custom-3 ROCC opcodes. We model that as: hart 0 = gemmini-attached (CPU_P), hart 1 = saturn-RVV-only (CPU_E). MP_MAX_NUM_CPUS=2 in the harness conf; AGENTS_POOL_THREADS=2 to match.",
+  "description": "Two-rocket Saturn-vector + shared Gemmini bitstream (alveo_u250_firesim-dual-rocket-saturn-gemmini-no-nic-l2-llc4mb-ddr3). Both rockets have saturn vector; one Gemmini accelerator hangs off the system bus and is reachable from both harts via custom-3 ROCC opcodes. We model that as: hart 0 = gemmini-attached (CPU_P), hart 1 = saturn-RVV-only (CPU_E). MP_MAX_NUM_CPUS=2 in the harness conf; MODELBLASTER_POOL_THREADS=2 to match.",
   "default_dispatch_target": "any",
   "cores": [
     {

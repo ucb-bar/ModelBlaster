@@ -13,14 +13,14 @@
 # Env knobs:
 #   SCHEDULE_JSON   path to scheduled_*.json
 #   MODELS          comma list of constituent network names (default: dronet,mlp_control)
-#   REGISTRY        path to agents/cores/*.json (default: chipyard_hetero_example.json)
+#   REGISTRY        path to modelblaster/cores/*.json (default: chipyard_hetero_example.json)
 #   BACKENDS        comma list of HW backends to BUILD into the binary
 #                   (default: scalar,rvv). Must cover every core_kind in
 #                   the schedule.
 #   QUANT           fp32 (default)
 #   CPU_P_KIND      registry kind for CPU_P slots (default: rvv)
 #   CPU_E_KIND      registry kind for CPU_E slots (default: scalar)
-#   AGENTS_POOL_THREADS  agents_pool worker count (default: 4)
+#   MODELBLASTER_POOL_THREADS  modelblaster_pool worker count (default: 4)
 #   FORCE_REGEN     {0,1}   re-run each model's run.sh first (default: 1)
 #   XPURT_TRACE     {0,1}   enable execution-trace capture (default: 0)
 #   RUNNER          {spike,firesim}  default spike. firesim picks the
@@ -38,13 +38,13 @@ export PATH="/usr/bin:${PATH}"
 
 SCHEDULE_JSON="${SCHEDULE_JSON:-/scratch2/dima/misc_sw/FreshScheduler/schedules/scheduled_networks_mlp_dronet_profile_zephyr_profiled.json}"
 MODELS="${MODELS:-dronet,mlp_control}"
-REGISTRY="${REGISTRY:-${REPO_ROOT}/agents/cores/chipyard_hetero_example.json}"
+REGISTRY="${REGISTRY:-${REPO_ROOT}/modelblaster/cores/chipyard_hetero_example.json}"
 BACKENDS="${BACKENDS:-scalar,rvv}"
 QUANT="${QUANT:-fp32}"
 # Optional per-model quant override (parallel to MODELS, comma list).
 # Lets you build a binary that mixes e.g. fp32 mlp_control with int8
 # dronet/yolov8 — each model picks its own
-# agents/examples/<m>/<quant>/generated/<backend> tree at stage time.
+# modelblaster/examples/<m>/<quant>/generated/<backend> tree at stage time.
 # Nothing in the harness CMake or generated C requires a shared quant:
 # each model's kernels are model-suffixed (kernel_conv2d_s8_dronet vs
 # kernel_linear_mlp_control), each has its own model_{input,output}_t,
@@ -55,7 +55,7 @@ QUANT="${QUANT:-fp32}"
 QUANTS="${QUANTS:-}"
 CPU_P_KIND="${CPU_P_KIND:-rvv}"
 CPU_E_KIND="${CPU_E_KIND:-scalar}"
-AGENTS_POOL_THREADS="${AGENTS_POOL_THREADS:-4}"
+MODELBLASTER_POOL_THREADS="${MODELBLASTER_POOL_THREADS:-4}"
 FORCE_REGEN="${FORCE_REGEN:-1}"
 SCHED_NAME="${SCHED_NAME:-xpurt_demo_schedule}"
 RUNNER="${RUNNER:-spike}"
@@ -73,7 +73,7 @@ case "${RUNNER}" in
         ;;
 esac
 
-EXAMPLE_DIR="${REPO_ROOT}/agents/examples/xpurt_demo"
+EXAMPLE_DIR="${REPO_ROOT}/modelblaster/examples/xpurt_demo"
 GEN_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 # Build dir tag carries the full backend set so cross-backend builds
 # don't clobber each other; appended _firesim when targeting the chipyard
@@ -112,11 +112,11 @@ IR_ARGS=()
 for idx in "${!MODEL_LIST[@]}"; do
     m="${MODEL_LIST[$idx]}"
     m_quant="${QUANT_LIST[$idx]}"
-    m_base="${REPO_ROOT}/agents/examples/${m}/${m_quant}/generated"
+    m_base="${REPO_ROOT}/modelblaster/examples/${m}/${m_quant}/generated"
     for bs in "${BACKEND_LIST[@]}"; do
         m_gen_dir="${m_base}/${bs}"
         if [[ "${FORCE_REGEN}" == "1" || ! -f "${m_gen_dir}/model.h" ]]; then
-            echo "[stage] running agents/examples/${m}/run.sh (TARGET=${bs}, QUANT=${m_quant})"
+            echo "[stage] running modelblaster/examples/${m}/run.sh (TARGET=${bs}, QUANT=${m_quant})"
             # Staging just needs the generated/ artifacts (graph.json,
             # model.{h,c}, kernels.c, weights.c, buffers.c, test_io.h);
             # the per-model run.sh's [4/5] west build + [5/5] simulator
@@ -124,7 +124,7 @@ for idx in "${!MODEL_LIST[@]}"; do
             # accidentally fire up FireSim N times (one per model x
             # backend) while xpurt_demo itself is targeting firesim.
             TARGET="${bs}" QUANT="${m_quant}" RUNNER=spike \
-                bash "${REPO_ROOT}/agents/examples/${m}/run.sh" >/dev/null
+                bash "${REPO_ROOT}/modelblaster/examples/${m}/run.sh" >/dev/null
         fi
     done
     MODEL_NAMES+="${MODEL_NAMES:+;}${m}"
@@ -136,7 +136,7 @@ done
 echo "[xpurt] ingest schedule"
 SCHED_C="${GEN_DIR}/${SCHED_NAME}.c"
 SCHED_H="${GEN_DIR}/${SCHED_NAME}.h"
-python -m agents.pipeline.ingest_xpurt_schedule \
+python -m modelblaster.pipeline.ingest_xpurt_schedule \
     --schedule "${SCHEDULE_JSON}" \
     --registry "${REGISTRY}" \
     "${IR_ARGS[@]}" \
@@ -149,7 +149,7 @@ python -m agents.pipeline.ingest_xpurt_schedule \
 #    (the schedule's core_kind values map 1:1 to our backend tags).
 echo "[xpurt] generate main"
 MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
-python -m agents.pipeline.generate_xpurt_main \
+python -m modelblaster.pipeline.generate_xpurt_main \
     --schedule "${SCHEDULE_JSON}" \
     --out "${MAIN_C}" \
     --name "${SCHED_NAME}" \
@@ -159,7 +159,7 @@ python -m agents.pipeline.generate_xpurt_main \
     --registry "${REGISTRY}"
 
 # 3) west build harness_xpurt with the generated sources + all backends.
-echo "[xpurt] west build (BACKENDS=${BACKENDS}, pool=${AGENTS_POOL_THREADS})"
+echo "[xpurt] west build (BACKENDS=${BACKENDS}, pool=${MODELBLASTER_POOL_THREADS})"
 WEST_CMAKE_ARGS=(
     "-DMODEL_BACKENDS=${BACKENDS}"
     "-DMODEL_NAMES=${MODEL_NAMES}"
@@ -167,31 +167,31 @@ WEST_CMAKE_ARGS=(
     "-DXPURT_SCHEDULE_C=${SCHED_C}"
     "-DXPURT_MAIN_C=${MAIN_C}"
     "-DXPURT_INCLUDE_DIR=${GEN_DIR}"
-    "-DAGENTS_POOL_THREADS=${AGENTS_POOL_THREADS}"
+    "-DMODELBLASTER_POOL_THREADS=${MODELBLASTER_POOL_THREADS}"
 )
-# Per-backend kernel cflags. Read each from agents.pipeline.backends and
-# splice into a -DAGENTS_KERNEL_CFLAGS_<BS> variable; the harness CMake
+# Per-backend kernel cflags. Read each from modelblaster.pipeline.backends and
+# splice into a -DMODELBLASTER_KERNEL_CFLAGS_<BS> variable; the harness CMake
 # applies them to that backend's kernels.c source-property only.  Use
 # `resolved_kernel_cflags(repo_root)` so backends that bake the repo
-# root into include paths (gemmini's -isystem<repo_root>/agents/cores/gemmini)
+# root into include paths (gemmini's -isystem<repo_root>/modelblaster/cores/gemmini)
 # get those substitutions applied.
 for bs in "${BACKEND_LIST[@]}"; do
     BS_UPPER=$(echo "${bs}" | tr '[:lower:]' '[:upper:]')
     KERNEL_CFLAGS=$(python -c "
-from agents.pipeline.backends import get
+from modelblaster.pipeline.backends import get
 b = get('${bs}')
 print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}')))
 ")
     if [[ -n "${KERNEL_CFLAGS}" ]]; then
-        WEST_CMAKE_ARGS+=("-DAGENTS_KERNEL_CFLAGS_${BS_UPPER}=${KERNEL_CFLAGS}")
+        WEST_CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CFLAGS_${BS_UPPER}=${KERNEL_CFLAGS}")
     fi
 done
 
 # Optional execution-trace capture (XPURT_TRACE={0,1}, default 0). When
-# enabled, the binary emits an AGENTS_XPURT_TRACE_BEGIN..END CSV block
-# that agents/scripts/plot_xpurt_trace.py renders into a Gantt chart.
+# enabled, the binary emits an MODELBLASTER_XPURT_TRACE_BEGIN..END CSV block
+# that modelblaster/scripts/plot_xpurt_trace.py renders into a Gantt chart.
 if [[ "${XPURT_TRACE:-0}" == "1" ]]; then
-    WEST_CMAKE_ARGS+=("-DAGENTS_XPURT_TRACE=ON")
+    WEST_CMAKE_ARGS+=("-DMODELBLASTER_XPURT_TRACE=ON")
 fi
 
 WEST_BUILD_EXTRA=()
@@ -203,21 +203,21 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # backend list: gemmini in the build → dual-gemmini overlay (2 harts),
     # else default 4-hart overlay.
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/${FIRESIM_CONF}"
+        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
     elif [[ ",${BACKENDS}," == *,gemmini,* || ",${BACKENDS}," == *,gemmini_q31,* ]]; then
         # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants run
         # on the same dual-rocket-saturn-gemmini SoC topology — the
         # bitstream selection is driven by config_runtime.yaml's
         # default_hw_config, not by the Zephyr Kconfig overlay.
-        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
     fi
 elif [[ "${RUNNER}" == "spike" ]]; then
     # Spike runs default to -p4 (see SPIKE_FLAGS below); the overlay
     # matches with MP_MAX_NUM_CPUS=4. Override SPIKE_CONF if you point
     # spike_runner at a different -p value.
-    EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
+    EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
 fi
 if [[ -z "${EXTRA_CONF:-}" || ! -f "${EXTRA_CONF}" ]]; then
     echo "ERROR: per-target overlay not found (RUNNER=${RUNNER}, EXTRA_CONF=${EXTRA_CONF:-<unset>})" >&2
@@ -227,7 +227,7 @@ WEST_BUILD_EXTRA+=(
     -DEXTRA_CONF_FILE="${EXTRA_CONF}"
 )
 
-west build -p -b "${BOARD_TARGET}" agents/harness_xpurt \
+west build -p -b "${BOARD_TARGET}" modelblaster/harness_xpurt \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
@@ -238,7 +238,7 @@ west build -p -b "${BOARD_TARGET}" agents/harness_xpurt \
 echo "[xpurt] ${RUNNER} + verify"
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "
-from agents.pipeline.backends import get
+from modelblaster.pipeline.backends import get
 seen = set()
 out = []
 isa_candidates = []
@@ -281,13 +281,13 @@ print(' '.join(out))
     fi
     # When XPURT_TRACE=1 (auto-enabled by setting XPURT_SAVE_OUTPUT, or
     # explicit), capture full spike stdout so plot_xpurt_trace.py can
-    # find the AGENTS_XPURT_TRACE_BEGIN..END block.
+    # find the MODELBLASTER_XPURT_TRACE_BEGIN..END block.
     if [[ -n "${XPURT_SAVE_OUTPUT:-}" ]]; then
         SPIKE_FLAGS+=("--save-output" "${XPURT_SAVE_OUTPUT}")
     fi
-    python -m agents.validation.spike_runner \
+    python -m modelblaster.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
         --timeout "${SPIKE_TIMEOUT:-900}" \
@@ -306,9 +306,9 @@ else
     if [[ -n "${FIRESIM_TIMEOUT:-}" ]]; then
         FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
     fi
-    python -m agents.validation.firesim_runner \
+    python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
         "${FIRESIM_FLAGS[@]}"

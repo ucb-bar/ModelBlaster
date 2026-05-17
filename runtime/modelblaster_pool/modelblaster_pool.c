@@ -2,8 +2,8 @@
  * Copyright (c) 2026 Dima Nikiforov <vnikiforov@berkeley.edu>
  * SPDX-License-Identifier: Apache-2.0
  *
- * agents_pool implementation — see agents_pool.h for design rationale
- * and the microbench under agents/microbench/threadpool/ for the
+ * modelblaster_pool implementation — see modelblaster_pool.h for design rationale
+ * and the microbench under modelblaster/microbench/threadpool/ for the
  * measurements that motivated this layout.
  *
  * Lifecycle of one parallelize_1d call:
@@ -21,7 +21,7 @@
  * them in destroy).
  */
 
-#include "agents_pool.h"
+#include "modelblaster_pool.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -32,14 +32,14 @@
 #include <zephyr/kernel.h>
 
 /* Hard cap so we can size the embedded sem arrays without dynamic
- * malloc per worker. The bench under agents/microbench/threadpool/
+ * malloc per worker. The bench under modelblaster/microbench/threadpool/
  * uses 4 (CONFIG_MP_MAX_NUM_CPUS on the FireSim quad-rocket-saturn
  * build); pick a generous bound — 16 covers any plausible Chipyard
  * hwconfig we'd build for. Pools that ask for more than this fail
  * create() returning NULL. */
-#define AGENTS_POOL_MAX_WORKERS 16
+#define MODELBLASTER_POOL_MAX_WORKERS 16
 
-struct agents_pool_state {
+struct modelblaster_pool_state {
 	int n_workers;          /* total thread count (master + helpers) */
 	int quit;               /* set on destroy; workers re-read after wake */
 
@@ -55,24 +55,24 @@ struct agents_pool_state {
 	/* Per-helper state. Index 0 is unused (= master); index w in
 	 * [1..n_workers-1] is the w'th helper. Sized for the max so we
 	 * can place the structs in a single allocation. */
-	pthread_t      tids[AGENTS_POOL_MAX_WORKERS];
-	pthread_attr_t attrs[AGENTS_POOL_MAX_WORKERS];
-	struct k_sem   start[AGENTS_POOL_MAX_WORKERS];
-	struct k_sem   done[AGENTS_POOL_MAX_WORKERS];
+	pthread_t      tids[MODELBLASTER_POOL_MAX_WORKERS];
+	pthread_attr_t attrs[MODELBLASTER_POOL_MAX_WORKERS];
+	struct k_sem   start[MODELBLASTER_POOL_MAX_WORKERS];
+	struct k_sem   done[MODELBLASTER_POOL_MAX_WORKERS];
 };
 
 /* Worker arg packs (pool_state*, my worker index) without forcing the
  * helper to read its index out of the state struct (avoids a small
  * per-iteration indirection). */
-struct agents_pool_worker_arg {
-	struct agents_pool_state *pool;
+struct modelblaster_pool_worker_arg {
+	struct modelblaster_pool_state *pool;
 	int wid;
 };
 
-static void *agents_pool_worker_fn(void *arg_)
+static void *modelblaster_pool_worker_fn(void *arg_)
 {
-	struct agents_pool_worker_arg *wa = (struct agents_pool_worker_arg *)arg_;
-	struct agents_pool_state *p = wa->pool;
+	struct modelblaster_pool_worker_arg *wa = (struct modelblaster_pool_worker_arg *)arg_;
+	struct modelblaster_pool_state *p = wa->pool;
 	int wid = wa->wid;
 
 	for (;;) {
@@ -104,18 +104,18 @@ static void *agents_pool_worker_fn(void *arg_)
 	}
 }
 
-agents_pool_t agents_pool_create(int n_workers)
+modelblaster_pool_t modelblaster_pool_create(int n_workers)
 {
 	if (n_workers <= 0) {
 		/* Match pthreadpool_create(0) behavior: caller treats NULL
 		 * as "no pool, run sequentially". */
 		return NULL;
 	}
-	if (n_workers > AGENTS_POOL_MAX_WORKERS) {
+	if (n_workers > MODELBLASTER_POOL_MAX_WORKERS) {
 		return NULL;
 	}
 
-	struct agents_pool_state *p = calloc(1, sizeof(*p));
+	struct modelblaster_pool_state *p = calloc(1, sizeof(*p));
 	if (p == NULL) {
 		return NULL;
 	}
@@ -136,7 +136,7 @@ agents_pool_t agents_pool_create(int n_workers)
 	 * affinity change on whoever instantiated us). */
 	int spawned = 0;
 	for (int w = 1; w < n_workers; w++) {
-		struct agents_pool_worker_arg *wa = malloc(sizeof(*wa));
+		struct modelblaster_pool_worker_arg *wa = malloc(sizeof(*wa));
 		if (wa == NULL) {
 			goto fail;
 		}
@@ -158,7 +158,7 @@ agents_pool_t agents_pool_create(int n_workers)
 		}
 #endif
 		if (pthread_create(&p->tids[w], &p->attrs[w],
-				   agents_pool_worker_fn, wa) != 0) {
+				   modelblaster_pool_worker_fn, wa) != 0) {
 			pthread_attr_destroy(&p->attrs[w]);
 			free(wa);
 			goto fail;
@@ -184,7 +184,7 @@ fail:
 	return NULL;
 }
 
-void agents_pool_destroy(agents_pool_t pool)
+void modelblaster_pool_destroy(modelblaster_pool_t pool)
 {
 	if (pool == NULL) {
 		return;
@@ -200,7 +200,7 @@ void agents_pool_destroy(agents_pool_t pool)
 	free(pool);
 }
 
-unsigned agents_pool_get_threads_count(agents_pool_t pool)
+unsigned modelblaster_pool_get_threads_count(modelblaster_pool_t pool)
 {
 	if (pool == NULL) {
 		return 0;
@@ -208,7 +208,7 @@ unsigned agents_pool_get_threads_count(agents_pool_t pool)
 	return (unsigned)pool->n_workers;
 }
 
-void agents_pool_parallelize_1d(agents_pool_t pool,
+void modelblaster_pool_parallelize_1d(modelblaster_pool_t pool,
 				void (*fn)(void *, size_t),
 				void *ctx,
 				size_t range,

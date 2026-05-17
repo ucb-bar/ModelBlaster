@@ -1,9 +1,9 @@
-# `agents/notes/`
+# `modelblaster/notes/`
 
 Focused design notes captured before or alongside implementation. Each
 file is self-contained so it can be picked back up later without the
 chat history that produced it. **Not user-facing docs** — promote
-stable bits to `agents/README.md` once they've crystallized.
+stable bits to `modelblaster/README.md` once they've crystallized.
 
 ## Pipeline & flow
 
@@ -14,7 +14,7 @@ stable bits to `agents/README.md` once they've crystallized.
 | `mixed_precision_plan.md` | Architecture for per-op precision overrides via `get_precision_spec()` + auto-cast IR pass. Eight implementation phases, ordered. |
 | `vint_mixed_precision_experiments.md` | Per-configuration accuracy log: which ViNT op sets promoted to fp16 give which navigation-accuracy wins, with cos_sim and wp4 Δpos numbers. |
 | `vint_int8_op_coverage.md` | ViNT-specific op inventory: which ops needed implementing for int8 path. |
-| `conv_weight_layout_decisions.md` | How OIHW / HWIO / IHWOC layouts are negotiated per-backend (gemmini packs HWIO, rvv packs IHWOC, scalar stays OIHW), where the packing happens, and how universal kernels detect via `-DAGENTS_*_WEIGHTS=1`. |
+| `conv_weight_layout_decisions.md` | How OIHW / HWIO / IHWOC layouts are negotiated per-backend (gemmini packs HWIO, rvv packs IHWOC, scalar stays OIHW), where the packing happens, and how universal kernels detect via `-DMODELBLASTER_*_WEIGHTS=1`. |
 | `xpurt_walker_semantics.md` | How the IR walker emits dispatches + buffers + scratch — the model of how skeleton.c becomes runnable C. |
 
 ## Profiling & runtime
@@ -26,7 +26,7 @@ stable bits to `agents/README.md` once they've crystallized.
 | `firesim_eval_design.md`, `firesim_sweep_v8_results.md`, `firesim_co_execution_baseline_plan.md` | FireSim flow design + results capture. |
 | `multi_model_threading.md` | Architectural plan for running multiple models in one binary with optional intra-model threading. Phased delivery (1-7) with concrete file/symbol changes. |
 | `posix_affinity_investigation.md` | What's needed to add `pthread_setaffinity_np` to Zephyr's POSIX layer (currently absent). ~90 LOC patch shape, Phase A/B/upstream tradeoffs. |
-| `dispatch_and_cores.md` | Core-registry model (`agents/cores/*.json`): how core kinds (CPU_P, CPU_E, GEMMINI) map to backends and to physical hart IDs in the harness. |
+| `dispatch_and_cores.md` | Core-registry model (`modelblaster/cores/*.json`): how core kinds (CPU_P, CPU_E, GEMMINI) map to backends and to physical hart IDs in the harness. |
 | `scheduler_investigation.md` | Inspection of XPURT-emitted schedule JSON. Documents the dispatch / time_dependency / hardware_target / module_name format and how `harness_xpurt` consumes it. |
 
 ## Hardware-specific
@@ -50,7 +50,7 @@ stable bits to `agents/README.md` once they've crystallized.
 | `freshscheduler_chipyard_port_plan.md` | Plan for moving the FreshScheduler-side chipyard tree from the FireSim shared copy to a self-contained `hw/chipyard/`. |
 | `freshscheduler_area_sweep_v1.md` | FPGA area sweep design + first round of results. |
 | `ku040_bitstream_plan.md` | VCU118 / KU040 bitstream build plan; relevant when porting a config off Alveo U250. |
-| `vint_zephyr_plan.md` | Original plan for getting ViNT through the agents flow (torch.export path motivation, op coverage gap). |
+| `vint_zephyr_plan.md` | Original plan for getting ViNT through the modelblaster flow (torch.export path motivation, op coverage gap). |
 
-These are working notes — promote bits to `agents/README.md` once
+These are working notes — promote bits to `modelblaster/README.md` once
 they're implemented, stable, and worth surfacing to a new reader.

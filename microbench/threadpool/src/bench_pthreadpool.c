@@ -4,7 +4,7 @@
  *
  * Bench #1: pthreadpool dispatch overhead.
  *
- * Mirrors the way agents/harness_multi/ uses pthreadpool: create a pool
+ * Mirrors the way modelblaster/harness_multi/ uses pthreadpool: create a pool
  * of N workers, then call pthreadpool_parallelize_1d in a tight loop
  * with a trivial body. Per-call cycles are read via rdcycle() at the
  * caller (the master thread), bracketing each parallelize_1d call —

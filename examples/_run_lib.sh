@@ -14,10 +14,10 @@
 #   BEAM/EXPANSIONS/ITERATIONS               # optimize-loop knobs
 #
 # Layout (per-model, per-quant, per-target):
-#   agents/examples/<model>/<quant>/generated/             # IR (target-indep)
-#   agents/examples/<model>/<quant>/generated/<target>/    # generated C
-#   agents/examples/<model>/<quant>/build/<target>/        # west build
-#   agents/examples/<model>/<quant>/cache/<target>/        # kernel cache
+#   modelblaster/examples/<model>/<quant>/generated/             # IR (target-indep)
+#   modelblaster/examples/<model>/<quant>/generated/<target>/    # generated C
+#   modelblaster/examples/<model>/<quant>/build/<target>/        # west build
+#   modelblaster/examples/<model>/<quant>/cache/<target>/        # kernel cache
 
 set -euo pipefail
 
@@ -44,7 +44,7 @@ if [[ "${QUANT}" == "fp16" ]]; then
     GEN_TARGET="${TARGET}_f16"
 fi
 
-EXAMPLE_DIR_REL="agents/examples/${MODEL_NAME}"
+EXAMPLE_DIR_REL="modelblaster/examples/${MODEL_NAME}"
 EXAMPLE_DIR="${REPO_ROOT}/${EXAMPLE_DIR_REL}"
 
 cd "${REPO_ROOT}"
@@ -78,7 +78,7 @@ echo "[1/5] extract_graph (quant=${QUANT}) -> ${IR_DIR}"
 if [[ -f "${IR_DIR}/graph.json" && -f "${IR_DIR}/weights.npz" && -f "${IR_DIR}/io.npz" && "${FORCE_EXTRACT:-0}" != "1" ]]; then
     echo "  (skipped — IR present at ${IR_DIR}; set FORCE_EXTRACT=1 to re-run)"
 else
-    python -m agents.pipeline.extract_graph \
+    python -m modelblaster.pipeline.extract_graph \
         --model "${MODEL_NAME}" \
         --out-dir "${IR_DIR}" \
         --quant "${QUANT}"
@@ -110,7 +110,7 @@ print('1' if any('f16' in n['op'] for n in g.get('ops', [])) else '0')
 fi
 
 echo "[2/5] generate_skeleton (backend=${GEN_TARGET}) -> ${GEN_DIR}"
-python -m agents.pipeline.generate_skeleton \
+python -m modelblaster.pipeline.generate_skeleton \
     --ir "${IR_DIR}/graph.json" \
     --weights "${IR_DIR}/weights.npz" \
     --io "${IR_DIR}/io.npz" \
@@ -127,7 +127,7 @@ GEN_KERNELS_ARGS=(
     --io "${IR_DIR}/io.npz"
     --repo-root "${REPO_ROOT}"
     --build-dir "${VERIFY_BUILD_DIR}"
-    --harness-dir "agents/harness"
+    --harness-dir "modelblaster/harness"
     --cache-dir "${CACHE_DIR}"
     --algorithms "${ALGORITHMS:-all}"
 )
@@ -168,7 +168,7 @@ if [[ "${OPTIMIZE}" == "1" ]]; then
         GEN_KERNELS_ARGS+=(--cache-aware-prompt)
     fi
 fi
-python -m agents.pipeline.generate_kernels "${GEN_KERNELS_ARGS[@]}"
+python -m modelblaster.pipeline.generate_kernels "${GEN_KERNELS_ARGS[@]}"
 
 # RUNNER selects the simulator behind stages 4-5: spike (default; in-process
 # spike subprocess) or firesim (build for chipyard_riscv64, copy elf into
@@ -195,16 +195,16 @@ esac
 
 echo "[4/5] west build (board=${BOARD_TARGET}) -> ${BUILD_DIR}"
 KERNEL_CFLAGS=$(python -c "
-from agents.pipeline.backends import get
+from modelblaster.pipeline.backends import get
 b = get('${GEN_TARGET}')
 print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}')))
 ")
 WEST_CMAKE_ARGS=(
     -DMODEL_DIR="${GEN_DIR}"
-    -DAGENTS_BACKEND="${GEN_TARGET}"
+    -DMODELBLASTER_BACKEND="${GEN_TARGET}"
 )
 if [[ -n "${KERNEL_CFLAGS}" ]]; then
-    WEST_CMAKE_ARGS+=(-DAGENTS_KERNEL_CFLAGS="${KERNEL_CFLAGS}")
+    WEST_CMAKE_ARGS+=(-DMODELBLASTER_KERNEL_CFLAGS="${KERNEL_CFLAGS}")
 fi
 WEST_BUILD_EXTRA=()
 if [[ "${RUNNER}" == "firesim" ]]; then
@@ -216,21 +216,21 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # hart counts so MP_MAX_NUM_CPUS must match. Override via
     # FIRESIM_CONF env if running a different config.
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        FS_CONF="${REPO_ROOT}/agents/harness/backends/${FIRESIM_CONF}"
+        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
     elif [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" ]]; then
         # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants ride
         # the same dual-rocket-saturn-gemmini SoC topology, so the same
         # Zephyr SMP overlay applies. The runtime bitstream is selected
         # via config_runtime.yaml::default_hw_config.
-        FS_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        FS_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
     fi
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
     )
 fi
-west build -p -b "${BOARD_TARGET}" agents/harness \
+west build -p -b "${BOARD_TARGET}" modelblaster/harness \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
@@ -262,7 +262,7 @@ fi
 # vs the PyTorch Q0.31 golden, well-covered by atol=8 on shallow nets.
 # Backend.atol_override / rtol_override are the authoritative source.
 TOL_FLAGS=$(python -c "
-from agents.pipeline.backends import get
+from modelblaster.pipeline.backends import get
 b = get('${GEN_TARGET}')
 parts = []
 if b.atol_override is not None:
@@ -274,7 +274,7 @@ print(' '.join(parts))
 
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "
-from agents.pipeline.backends import get
+from modelblaster.pipeline.backends import get
 b = get('${GEN_TARGET}')
 print(' '.join(b.spike_args))
 ")
@@ -283,11 +283,11 @@ print(' '.join(b.spike_args))
         SPIKE_FLAGS+=("--spike-arg=${a}")
     done
     # Gemmini backend needs the chipyard spike (has --extension=gemmini support
-    # + libgemmini.so). Use AGENTS_GEMMINI_SPIKE env if set, else chipyard path.
+    # + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE env if set, else chipyard path.
     SPIKE_BIN_FLAGS=()
     if [[ "${GEN_TARGET}" == "gemmini" ]]; then
-        _GEMMINI_SPIKE="${AGENTS_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-        _GEMMINI_LIB_DIR="${AGENTS_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
+        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
             export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
@@ -295,18 +295,18 @@ print(' '.join(b.spike_args))
     fi
     # rvv_opu backend needs the OPU-extended spike from
     # hw/chipyard/toolchains/riscv-tools/riscv-isa-sim (built via
-    # customext/saturn_opu.cc). Use AGENTS_OPU_SPIKE env if set, else
+    # customext/saturn_opu.cc). Use MODELBLASTER_OPU_SPIKE env if set, else
     # the local chipyard-tree path. The customext .so lives next to
     # the binary so LD_LIBRARY_PATH points at the same install lib dir.
     if [[ "${GEN_TARGET}" == "rvv_opu" ]]; then
-        _OPU_SPIKE="${AGENTS_OPU_SPIKE:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/bin/spike}"
-        _OPU_LIB_DIR="${AGENTS_OPU_LIB_DIR:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/lib}"
+        _OPU_SPIKE="${MODELBLASTER_OPU_SPIKE:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/bin/spike}"
+        _OPU_LIB_DIR="${MODELBLASTER_OPU_LIB_DIR:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/lib}"
         if [[ -f "${_OPU_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_OPU_SPIKE}")
             export LD_LIBRARY_PATH="${_OPU_LIB_DIR}:${LD_LIBRARY_PATH:-}"
         fi
     fi
-    python -m agents.validation.spike_runner \
+    python -m modelblaster.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
         --timeout "${SPIKE_TIMEOUT:-600}" \
@@ -332,7 +332,7 @@ else
     if [[ -n "${FIRESIM_TIMEOUT:-}" ]]; then
         FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
     fi
-    python -m agents.validation.firesim_runner \
+    python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
         ${TOL_FLAGS} \

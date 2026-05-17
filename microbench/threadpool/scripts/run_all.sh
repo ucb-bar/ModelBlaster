@@ -8,7 +8,7 @@
 #   k_thread      (variant=k_sem)    — bare Zephyr threads + k_sem
 #
 # Outputs a merged CSV under
-#   agents/microbench/threadpool/results/<runner>_overhead.csv
+#   modelblaster/microbench/threadpool/results/<runner>_overhead.csv
 #
 # Env:
 #   RUNNER=<spike|firesim>          default firesim
@@ -19,7 +19,7 @@ RUNNER="${RUNNER:-firesim}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-OUT_DIR="${REPO_ROOT}/agents/microbench/threadpool/results"
+OUT_DIR="${REPO_ROOT}/modelblaster/microbench/threadpool/results"
 mkdir -p "${OUT_DIR}"
 
 case "${RUNNER}" in
@@ -51,8 +51,8 @@ for cfg in "${CONFIGS[@]}"; do
     echo "========================================="
     BENCH="${BENCH}" VARIANT="${VARIANT}" RUNNER="${RUNNER}" \
         SKIP_BUILD="${SKIP_BUILD:-0}" \
-        bash "${REPO_ROOT}/agents/microbench/threadpool/scripts/run_bench.sh"
-    SUB_CSV="${REPO_ROOT}/agents/microbench/threadpool/build/${BENCH}_${VARIANT}_${RUNNER}/bench.csv"
+        bash "${REPO_ROOT}/modelblaster/microbench/threadpool/scripts/run_bench.sh"
+    SUB_CSV="${REPO_ROOT}/modelblaster/microbench/threadpool/build/${BENCH}_${VARIANT}_${RUNNER}/bench.csv"
     if [[ ! -s "${SUB_CSV}" ]]; then
         echo "FAIL: ${SUB_CSV} not produced" >&2
         exit 3

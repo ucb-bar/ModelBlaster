@@ -39,7 +39,7 @@
 #                                          model graph every period_ms;
 #                                          zero means run once and publish
 #                                          /done.
-#   -DAGENTS_KERNEL_CFLAGS_<BS>=...         per-backend kernel cflags
+#   -DMODELBLASTER_KERNEL_CFLAGS_<BS>=...         per-backend kernel cflags
 #                                          (same as harness_xpurt).
 
 cmake_minimum_required(VERSION 3.20.0)
@@ -112,15 +112,15 @@ list(APPEND ZEPHYR_EXTRA_MODULES
 add_compile_definitions(__STDC_WANT_LIB_EXT1__=0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(agents_harness_microros)
+project(modelblaster_harness_microros)
 
-# agents_pool: same parallel-for backend the model code expects.
-add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/agents_pool"
-                 agents_pool_build)
+# modelblaster_pool: same parallel-for backend the model code expects.
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/modelblaster_pool"
+                 modelblaster_pool_build)
 
-# Stage per-model headers under <build>/agents_microros/<name>_model.h
+# Stage per-model headers under <build>/modelblaster_microros/<name>_model.h
 # so main.c #include lines line up regardless of MODEL_DIRS_BASE.
-set(_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/agents_microros")
+set(_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/modelblaster_microros")
 file(MAKE_DIRECTORY "${_STAGE_DIR}")
 
 list(GET MODEL_BACKENDS 0 _PRIMARY_BS)
@@ -157,7 +157,7 @@ foreach(_i RANGE ${_last})
         endif()
         execute_process(
             COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${_REPO_ROOT_ABS}"
-                python -m agents.pipeline.backend_rename
+                python -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}"
                     --backend "${_bs}"
                     --separator ";"
@@ -173,20 +173,20 @@ foreach(_i RANGE ${_last})
             list(APPEND _rename_defs "${_kv}")
         endforeach()
 
-        set(_obj_tgt "agents_microros_${_name}_${_bs}_objs")
+        set(_obj_tgt "modelblaster_microros_${_name}_${_bs}_objs")
         add_library(${_obj_tgt} OBJECT
             "${_backend_dir}/model.c" "${_backend_dir}/kernels.c")
         target_include_directories(${_obj_tgt} PRIVATE "${_backend_dir}")
         target_link_libraries(${_obj_tgt} PRIVATE zephyr_interface)
-        target_link_libraries(${_obj_tgt} PRIVATE agents_pool)
+        target_link_libraries(${_obj_tgt} PRIVATE modelblaster_pool)
         target_compile_definitions(${_obj_tgt} PRIVATE
-            AGENTS_USE_POOL=1
-            AGENTS_DISABLE_UNMANGLED=1)
+            MODELBLASTER_USE_POOL=1
+            MODELBLASTER_DISABLE_UNMANGLED=1)
         if(_rename_defs)
             target_compile_definitions(${_obj_tgt} PRIVATE ${_rename_defs})
         endif()
 
-        set(_cflags_var "AGENTS_KERNEL_CFLAGS_${_bs}")
+        set(_cflags_var "MODELBLASTER_KERNEL_CFLAGS_${_bs}")
         string(TOUPPER "${_cflags_var}" _cflags_var)
         if(DEFINED ${_cflags_var} AND NOT "${${_cflags_var}}" STREQUAL "")
             set_source_files_properties("${_backend_dir}/kernels.c"
@@ -200,23 +200,23 @@ foreach(_i RANGE ${_last})
     # Backend-agnostic weights + buffers + test_io — single TU per model
     # (matches harness_xpurt's reasoning: cross-backend dispatches in one
     # network must read each other's writes through one buffer storage).
-    set(_weights_tgt "agents_microros_${_name}_weights_obj")
+    set(_weights_tgt "modelblaster_microros_${_name}_weights_obj")
     add_library(${_weights_tgt} OBJECT "${_primary_dir}/weights.c")
     target_include_directories(${_weights_tgt} PRIVATE "${_primary_dir}")
     target_link_libraries(${_weights_tgt} PRIVATE zephyr_interface)
-    target_compile_definitions(${_weights_tgt} PRIVATE AGENTS_DISABLE_UNMANGLED=1)
+    target_compile_definitions(${_weights_tgt} PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
 
     if(NOT EXISTS "${_primary_dir}/buffers.c")
         message(FATAL_ERROR
             "MODEL_DIRS_BASE[${_i}]/${_PRIMARY_BS}='${_primary_dir}' missing buffers.c")
     endif()
-    set(_buffers_tgt "agents_microros_${_name}_buffers_obj")
+    set(_buffers_tgt "modelblaster_microros_${_name}_buffers_obj")
     add_library(${_buffers_tgt} OBJECT "${_primary_dir}/buffers.c")
     target_include_directories(${_buffers_tgt} PRIVATE "${_primary_dir}")
     target_link_libraries(${_buffers_tgt} PRIVATE zephyr_interface)
 
     if(EXISTS "${_primary_dir}/test_io.S")
-        set(_test_io_tgt "agents_microros_${_name}_test_io_obj")
+        set(_test_io_tgt "modelblaster_microros_${_name}_test_io_obj")
         add_library(${_test_io_tgt} OBJECT "${_primary_dir}/test_io.S")
         set_source_files_properties("${_primary_dir}/test_io.S"
             PROPERTIES LANGUAGE ASM)
@@ -230,7 +230,7 @@ endforeach()
 # each network's symbols + pinning without cmake-list parsing in C.
 target_sources(app PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/main.c")
 target_include_directories(app PRIVATE "${_STAGE_DIR}")
-target_compile_definitions(app PRIVATE AGENTS_DISABLE_UNMANGLED=1)
+target_compile_definitions(app PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
 
 # Surface MODEL_NAMES + per-model pinning to main.c via -D flags.
 # NET_A + NET_B are always present; NET_C is conditional (3 models).
@@ -315,23 +315,23 @@ if(_n_names GREATER_EQUAL 3)
          "#include \"${_n2}_model.h\"\n#include \"${_n2}_test_io.h\"\n")
 endif()
 
-if(DEFINED AGENTS_POOL_THREADS)
+if(DEFINED MODELBLASTER_POOL_THREADS)
     target_compile_definitions(app PRIVATE
-        AGENTS_POOL_THREADS=${AGENTS_POOL_THREADS})
+        MODELBLASTER_POOL_THREADS=${MODELBLASTER_POOL_THREADS})
 endif()
 
 # Link every (model, backend) + the per-model weights/buffers/test_io.
 foreach(_name ${MODEL_NAMES})
     foreach(_bs IN LISTS MODEL_BACKENDS)
-        target_link_libraries(app PRIVATE agents_microros_${_name}_${_bs}_objs)
+        target_link_libraries(app PRIVATE modelblaster_microros_${_name}_${_bs}_objs)
     endforeach()
-    target_link_libraries(app PRIVATE agents_microros_${_name}_weights_obj)
-    target_link_libraries(app PRIVATE agents_microros_${_name}_buffers_obj)
-    if(TARGET agents_microros_${_name}_test_io_obj)
-        target_link_libraries(app PRIVATE agents_microros_${_name}_test_io_obj)
+    target_link_libraries(app PRIVATE modelblaster_microros_${_name}_weights_obj)
+    target_link_libraries(app PRIVATE modelblaster_microros_${_name}_buffers_obj)
+    if(TARGET modelblaster_microros_${_name}_test_io_obj)
+        target_link_libraries(app PRIVATE modelblaster_microros_${_name}_test_io_obj)
     endif()
 endforeach()
-target_link_libraries(app PRIVATE agents_pool)
+target_link_libraries(app PRIVATE modelblaster_pool)
 
 # Same RISC-V gp-relative relax fix as harness_xpurt.
 zephyr_link_libraries(-Wl,--no-relax)

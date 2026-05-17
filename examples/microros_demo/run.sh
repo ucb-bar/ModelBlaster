@@ -20,7 +20,7 @@
 #                  Default 50,0.
 #   QUANT          quant mode (default: int8). Must match what's
 #                  generated under each model's <quant>/generated/<bs>/.
-#   AGENTS_POOL_THREADS  agents_pool worker count (default: 1).
+#   MODELBLASTER_POOL_THREADS  modelblaster_pool worker count (default: 1).
 #                  Baseline is sequential; >1 turns on intra-op parallel
 #                  IF the kernels emit parallel_<op> primitives.
 #   FORCE_REGEN    {0,1}  re-run each model's run.sh first (default: 1).
@@ -44,7 +44,7 @@ PIN_HARTS="${PIN_HARTS:-0,1}"
 PERIODS_MS="${PERIODS_MS:-50,0}"
 QUANT="${QUANT:-int8}"
 QUANTS="${QUANTS:-}"
-AGENTS_POOL_THREADS="${AGENTS_POOL_THREADS:-1}"
+MODELBLASTER_POOL_THREADS="${MODELBLASTER_POOL_THREADS:-1}"
 FORCE_REGEN="${FORCE_REGEN:-1}"
 RUNNER="${RUNNER:-spike}"
 
@@ -61,7 +61,7 @@ case "${RUNNER}" in
         ;;
 esac
 
-EXAMPLE_DIR="${REPO_ROOT}/agents/examples/microros_demo"
+EXAMPLE_DIR="${REPO_ROOT}/modelblaster/examples/microros_demo"
 GEN_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 BUILD_TAG="$(echo "${BACKENDS}" | tr ',' '_')"
 if [[ "${RUNNER}" == "firesim" ]]; then
@@ -115,13 +115,13 @@ for idx in "${!MODEL_LIST[@]}"; do
             echo "[microros_demo] regen ${m}/${bs} (quant=${m_quant})"
             TARGET="${bs}" QUANT="${m_quant}" \
             BACKEND=llm OPTIMIZE=0 FORCE_REGEN=1 \
-            GLOBAL_CURATED_DIR="${REPO_ROOT}/agents/kernels" \
-                bash "${REPO_ROOT}/agents/examples/${m}/run.sh"
+            GLOBAL_CURATED_DIR="${REPO_ROOT}/modelblaster/kernels" \
+                bash "${REPO_ROOT}/modelblaster/examples/${m}/run.sh"
         fi
-        gen="${REPO_ROOT}/agents/examples/${m}/${m_quant}/generated/${bs}"
+        gen="${REPO_ROOT}/modelblaster/examples/${m}/${m_quant}/generated/${bs}"
         for f in model.c kernels.c weights.c model.h test_io.h buffers.c; do
             if [[ ! -f "${gen}/${f}" ]]; then
-                echo "ERROR: ${gen} missing ${f} (run with FORCE_REGEN=1 or run agents/examples/${m}/run.sh first)" >&2
+                echo "ERROR: ${gen} missing ${f} (run with FORCE_REGEN=1 or run modelblaster/examples/${m}/run.sh first)" >&2
                 exit 1
             fi
         done
@@ -135,7 +135,7 @@ for idx in "${!MODEL_LIST[@]}"; do
     m="${MODEL_LIST[$idx]}"
     m_quant="${QUANT_LIST[$idx]}"
     MODEL_NAMES="${MODEL_NAMES};${m}"
-    MODEL_DIRS_BASE="${MODEL_DIRS_BASE};${REPO_ROOT}/agents/examples/${m}/${m_quant}/generated"
+    MODEL_DIRS_BASE="${MODEL_DIRS_BASE};${REPO_ROOT}/modelblaster/examples/${m}/${m_quant}/generated"
 done
 MODEL_NAMES="${MODEL_NAMES#;}"
 MODEL_DIRS_BASE="${MODEL_DIRS_BASE#;}"
@@ -151,13 +151,13 @@ WEST_CMAKE_ARGS=(
     "-DMODEL_PIN_BACKENDS=${PIN_BACKENDS_LIST}"
     "-DMODEL_PIN_HARTS=${PIN_HARTS_LIST}"
     "-DMODEL_PERIODS_MS=${PERIODS_LIST}"
-    "-DAGENTS_POOL_THREADS=${AGENTS_POOL_THREADS}"
+    "-DMODELBLASTER_POOL_THREADS=${MODELBLASTER_POOL_THREADS}"
 )
 if [[ -n "${MICROROS_BROKER_HART:-}" ]]; then
     WEST_CMAKE_ARGS+=("-DMICROROS_BROKER_HART=${MICROROS_BROKER_HART}")
 fi
 # run_graph_b interrupt-mask debug knob (default MICROROS_MASK_TIMER).
-# See agents/harness_microros/src/main.c::run_graph_b.
+# See modelblaster/harness_microros/src/main.c::run_graph_b.
 for _knob in MICROROS_MASK_ALL MICROROS_MASK_TIMER MICROROS_MASK_IPI MICROROS_MASK_EXT \
              MICROROS_SINGLE_EXECUTOR MICROROS_NO_BROKER MICROROS_NO_MICROROS \
              MICROROS_NO_PUBLISH MICROROS_SKIP_TRACE MICROROS_NO_LOCK_A \
@@ -173,12 +173,12 @@ done
 for bs in "${BACKEND_LIST[@]}"; do
     BS_UPPER="$(echo "${bs}" | tr '[:lower:]' '[:upper:]')"
     KERNEL_CFLAGS=$(python -c "
-from agents.pipeline.backends import get
+from modelblaster.pipeline.backends import get
 b = get('${bs}')
 print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}')))
 ")
     if [[ -n "${KERNEL_CFLAGS}" ]]; then
-        WEST_CMAKE_ARGS+=("-DAGENTS_KERNEL_CFLAGS_${BS_UPPER}=${KERNEL_CFLAGS}")
+        WEST_CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CFLAGS_${BS_UPPER}=${KERNEL_CFLAGS}")
     fi
 done
 
@@ -187,14 +187,14 @@ done
 WEST_BUILD_EXTRA=()
 if [[ "${RUNNER}" == "firesim" ]]; then
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/${FIRESIM_CONF}"
+        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
     elif [[ ",${BACKENDS}," == *,gemmini,* || ",${BACKENDS}," == *,gemmini_q31,* ]]; then
-        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf"
+        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
     fi
 elif [[ "${RUNNER}" == "spike" ]]; then
-    EXTRA_CONF="${REPO_ROOT}/agents/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
+    EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
 fi
 if [[ -z "${EXTRA_CONF:-}" || ! -f "${EXTRA_CONF}" ]]; then
     echo "ERROR: per-target overlay not found (RUNNER=${RUNNER}, EXTRA_CONF=${EXTRA_CONF:-<unset>})" >&2
@@ -204,7 +204,7 @@ WEST_BUILD_EXTRA+=(-DEXTRA_CONF_FILE="${EXTRA_CONF}")
 
 # 5) west build.
 echo "[microros_demo] west build (BACKENDS=${BACKENDS}, MODELS=${MODELS})"
-west build -p -b "${BOARD_TARGET}" agents/harness_microros \
+west build -p -b "${BOARD_TARGET}" modelblaster/harness_microros \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
@@ -215,8 +215,8 @@ if [[ "${RUNNER}" == "spike" ]]; then
     if [[ -z "${SPIKE_BIN}" ]]; then
         if [[ ",${BACKENDS}," == *,gemmini,* || ",${BACKENDS}," == *,gemmini_q31,* ]]; then
             # gemmini ROCC ops → chipyard spike with --extension=gemmini
-            SPIKE_BIN="${AGENTS_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-            export LD_LIBRARY_PATH="${AGENTS_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}:${LD_LIBRARY_PATH:-}"
+            SPIKE_BIN="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
+            export LD_LIBRARY_PATH="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}:${LD_LIBRARY_PATH:-}"
         fi
     fi
     SPIKE_CMD=()
@@ -247,9 +247,9 @@ else
     [[ -n "${FIRESIM_ENV:-}"    ]] && FIRESIM_FLAGS+=("--firesim-env=${FIRESIM_ENV}")
     [[ -n "${FIRESIM_SLOT:-}"   ]] && FIRESIM_FLAGS+=("--firesim-slot=${FIRESIM_SLOT}")
     [[ -n "${FIRESIM_TIMEOUT:-}" ]] && FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
-    python -m agents.validation.firesim_runner \
+    python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/agents/examples/${MODEL_LIST[0]}/${QUANT_LIST[0]}/generated/io.npz" \
+        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT_LIST[0]}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT_LIST[0]}" \
         "${FIRESIM_FLAGS[@]}"

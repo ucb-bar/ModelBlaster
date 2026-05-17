@@ -11,7 +11,7 @@ speedup = baseline_cycles / variant_cycles, and renders:
     (= speedup of the whole network's serial execution).
 
 Usage:
-    python -m agents.scripts.plot_speedup \\
+    python -m modelblaster.scripts.plot_speedup \\
         --baseline scalar=path/to/scalar.csv \\
         --variant  rvv=path/to/rvv.csv \\
         --variant  gemmini_q31=path/to/gemmini_q31.csv \\

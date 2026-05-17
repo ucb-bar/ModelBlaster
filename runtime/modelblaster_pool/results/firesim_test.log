@@ -37,17 +37,17 @@ tsibridge_t::tick skipping tick
 tsibridge_t::tick skipping tick
 *** Booting Zephyr OS build 5a06eb0d14f9 ***
 
-agents_pool_test: starting on chipyard_riscv64/rocketchip_virt_riscv64 (MP_MAX_NUM_CPUS=4)
+modelblaster_pool_test: starting on chipyard_riscv64/rocketchip_virt_riscv64 (MP_MAX_NUM_CPUS=4)
 
-agents_pool_test: pool create OK, threads=4
+modelblaster_pool_test: pool create OK, threads=4
 
-=== AGENTS_POOL_TEST_BEGIN ===
+=== MODELBLASTER_POOL_TEST_BEGIN ===
 
 PASS: 3/3 sub-tests passed
 
 PERF: range=32 N=4 reps=16 per_call_cycles min=14262 avg=15153
 
-=== AGENTS_POOL_TEST_END ===
+=== MODELBLASTER_POOL_TEST_END ===
 
 
 Simulation complete.

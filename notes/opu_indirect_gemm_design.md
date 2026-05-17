@@ -91,7 +91,7 @@ The compile-time table is the right answer architecturally, but it
 requires invasive skeleton changes: every conv2d_s8 dispatch needs
 its own `static const int8_t *const __indir_conv2d_N[]` and the kernel
 signature must gain an extra arg to receive it. That's a real change
-to the agents-flow `KernelSpec.signature` convention (all conv2d_s8
+to the modelblaster-flow `KernelSpec.signature` convention (all conv2d_s8
 implementations must accept the same signature).
 
 **Sidestep**: build the indirection **per-tile at runtime, never
@@ -244,7 +244,7 @@ not worth optimizing yet).
 - **Strided convs with stride > KW**: the indirection step pattern
   is uniform `p * SW`, no special handling needed.
 - **Dilated convs**: same as strided; just `kh*dilation_h` in the
-  indirection-table build. Agents-flow IR doesn't emit dilation > 1
+  indirection-table build. Modelblaster-flow IR doesn't emit dilation > 1
   for conv2d_s8 today; v1 punts dilation > 1 to scalar fallback.
 - **Asymmetric quant**: same constraint as the matmul/linear OPU
   kernels — `input_offset != 0` or `filter_offset != 0` falls back
@@ -276,6 +276,6 @@ output pixels — that's the whole point of indirect GEMM.
 
 - XNNPACK indirection design:
   https://github.com/google/XNNPACK/blob/master/src/conv-hwc-indirection.c
-- OPU programming model: `agents/cores/saturn_opu/include/saturn_opu.h`
-- This kernel: `agents/kernels/rvv_opu/rvv_opu_conv2d_s8_indir_gemm.c`
+- OPU programming model: `modelblaster/cores/saturn_opu/include/saturn_opu.h`
+- This kernel: `modelblaster/kernels/rvv_opu/rvv_opu_conv2d_s8_indir_gemm.c`
 - RVV indexed load semantics: V spec §7.5 (vluxei*)

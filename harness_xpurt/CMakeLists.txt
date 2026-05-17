@@ -4,7 +4,7 @@
 #
 # Each model is compiled once per HW backend (e.g. scalar + rvv) into a
 # separate OBJECT library. The externally-visible symbols of model.c +
-# kernels.c get suffixed via -D renames (see agents/pipeline/backend_rename.py)
+# kernels.c get suffixed via -D renames (see modelblaster/pipeline/backend_rename.py)
 # so both copies can link into one binary without collision. The walker
 # (xpurt_main.c) dispatches per entry by matching the entry's core_kind to
 # one of the per-backend dispatch tables.
@@ -20,14 +20,14 @@
 #                                          kernels.c, weights.c) for every
 #                                          backend in MODEL_BACKENDS, plus a
 #                                          graph.json for the renamer.
-#   -DAGENTS_KERNEL_CFLAGS_<BS>=...         optional cflags for that backend's
+#   -DMODELBLASTER_KERNEL_CFLAGS_<BS>=...         optional cflags for that backend's
 #                                          kernels.c (e.g. -march=rv64gcv).
 #                                          Applied to each (model, backend)
 #                                          OBJECT lib.
 #   -DXPURT_SCHEDULE_C=<path>               generated dispatch_table.c
 #   -DXPURT_MAIN_C=<path>                   generated xpurt_main.c
 #   -DXPURT_INCLUDE_DIR=<path>              dir holding the .h files
-#   -DAGENTS_XPURT_TRACE=ON                 (optional) enable trace capture
+#   -DMODELBLASTER_XPURT_TRACE=ON                 (optional) enable trace capture
 
 cmake_minimum_required(VERSION 3.20.0)
 
@@ -81,19 +81,19 @@ foreach(_bs IN LISTS MODEL_BACKENDS)
 endforeach()
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(agents_harness_xpurt)
+project(modelblaster_harness_xpurt)
 
-# Parallel-for pool: agents/runtime/agents_pool. See
-# agents/harness_multi/CMakeLists.txt for the migration rationale.
+# Parallel-for pool: modelblaster/runtime/modelblaster_pool. See
+# modelblaster/harness_multi/CMakeLists.txt for the migration rationale.
 set(_REPO_ROOT_ABS "${CMAKE_CURRENT_LIST_DIR}/../..")
-add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/agents_pool"
-                 agents_pool_build)
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/modelblaster_pool"
+                 modelblaster_pool_build)
 
-# Stage per-model headers under <build>/agents_xpurt/<name>_model.h
+# Stage per-model headers under <build>/modelblaster_xpurt/<name>_model.h
 # matching harness_multi's convention so xpurt_main.c #include lines line up.
 # The header is backend-agnostic (struct types & macros are identical across
 # backends) — pick the first backend's copy.
-set(_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/agents_xpurt")
+set(_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/modelblaster_xpurt")
 file(MAKE_DIRECTORY "${_STAGE_DIR}")
 
 list(GET MODEL_BACKENDS 0 _PRIMARY_BS)
@@ -132,7 +132,7 @@ foreach(_i RANGE ${_last})
         endif()
         execute_process(
             COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${_REPO_ROOT_ABS}"
-                python -m agents.pipeline.backend_rename
+                python -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}"
                     --backend "${_bs}"
                     --separator ";"
@@ -151,24 +151,24 @@ foreach(_i RANGE ${_last})
             list(APPEND _rename_defs "${_kv}")
         endforeach()
 
-        set(_obj_tgt "agents_${_name}_${_bs}_objs")
+        set(_obj_tgt "modelblaster_${_name}_${_bs}_objs")
         add_library(${_obj_tgt} OBJECT
             "${_backend_dir}/model.c" "${_backend_dir}/kernels.c")
         target_include_directories(${_obj_tgt} PRIVATE "${_backend_dir}")
         target_link_libraries(${_obj_tgt} PRIVATE zephyr_interface)
-        target_link_libraries(${_obj_tgt} PRIVATE agents_pool)
-        # AGENTS_DISABLE_UNMANGLED keeps the unmangled aliases out of these
+        target_link_libraries(${_obj_tgt} PRIVATE modelblaster_pool)
+        # MODELBLASTER_DISABLE_UNMANGLED keeps the unmangled aliases out of these
         # TUs (multi-model linking would alias-collide otherwise).
         target_compile_definitions(${_obj_tgt} PRIVATE
-            AGENTS_USE_POOL=1
-            AGENTS_DISABLE_UNMANGLED=1)
+            MODELBLASTER_USE_POOL=1
+            MODELBLASTER_DISABLE_UNMANGLED=1)
         if(_rename_defs)
             target_compile_definitions(${_obj_tgt} PRIVATE ${_rename_defs})
         endif()
 
         # Per-backend kernel cflags. Applied only to kernels.c (model.c
         # doesn't use intrinsics; keeping the flag scoped avoids surprises).
-        set(_cflags_var "AGENTS_KERNEL_CFLAGS_${_bs}")
+        set(_cflags_var "MODELBLASTER_KERNEL_CFLAGS_${_bs}")
         string(TOUPPER "${_cflags_var}" _cflags_var)
         if(DEFINED ${_cflags_var} AND NOT "${${_cflags_var}}" STREQUAL "")
             set_source_files_properties("${_backend_dir}/kernels.c"
@@ -181,11 +181,11 @@ foreach(_i RANGE ${_last})
 
     # Backend-agnostic weights — single OBJECT lib, picked from the
     # primary backend's dir (all copies are identical).
-    set(_weights_tgt "agents_${_name}_weights_obj")
+    set(_weights_tgt "modelblaster_${_name}_weights_obj")
     add_library(${_weights_tgt} OBJECT "${_primary_dir}/weights.c")
     target_include_directories(${_weights_tgt} PRIVATE "${_primary_dir}")
     target_link_libraries(${_weights_tgt} PRIVATE zephyr_interface)
-    target_compile_definitions(${_weights_tgt} PRIVATE AGENTS_DISABLE_UNMANGLED=1)
+    target_compile_definitions(${_weights_tgt} PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
 
     # Intermediate-buffer storage — also single OBJECT lib per model, NOT
     # per backend. Without this, each per-backend model.c TU would carry
@@ -197,9 +197,9 @@ foreach(_i RANGE ${_last})
     if(NOT EXISTS "${_primary_dir}/buffers.c")
         message(FATAL_ERROR
             "MODEL_DIRS_BASE[${_i}]/${_PRIMARY_BS}='${_primary_dir}' missing buffers.c — "
-            "regenerate the skeleton with the latest agents/pipeline/generate_skeleton.py")
+            "regenerate the skeleton with the latest modelblaster/pipeline/generate_skeleton.py")
     endif()
-    set(_buffers_tgt "agents_${_name}_buffers_obj")
+    set(_buffers_tgt "modelblaster_${_name}_buffers_obj")
     add_library(${_buffers_tgt} OBJECT "${_primary_dir}/buffers.c")
     target_include_directories(${_buffers_tgt} PRIVATE "${_primary_dir}")
     target_link_libraries(${_buffers_tgt} PRIVATE zephyr_interface)
@@ -210,7 +210,7 @@ foreach(_i RANGE ${_last})
     # into rodata at link time (avoids cc1 OOM on kernelbench-scale
     # decimal const arrays).
     if(EXISTS "${_primary_dir}/test_io.S")
-        set(_test_io_tgt "agents_${_name}_test_io_obj")
+        set(_test_io_tgt "modelblaster_${_name}_test_io_obj")
         add_library(${_test_io_tgt} OBJECT "${_primary_dir}/test_io.S")
         set_source_files_properties("${_primary_dir}/test_io.S"
             PROPERTIES LANGUAGE ASM)
@@ -222,18 +222,18 @@ endforeach()
 # Schedule-driven app: xpurt_main.c + the dispatch table .c.
 target_sources(app PRIVATE "${XPURT_MAIN_C}" "${XPURT_SCHEDULE_C}")
 target_include_directories(app PRIVATE "${_STAGE_DIR}" "${XPURT_INCLUDE_DIR}")
-target_compile_definitions(app PRIVATE AGENTS_DISABLE_UNMANGLED=1)
+target_compile_definitions(app PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
 
-if(DEFINED AGENTS_POOL_THREADS)
-    target_compile_definitions(app PRIVATE AGENTS_POOL_THREADS=${AGENTS_POOL_THREADS})
+if(DEFINED MODELBLASTER_POOL_THREADS)
+    target_compile_definitions(app PRIVATE MODELBLASTER_POOL_THREADS=${MODELBLASTER_POOL_THREADS})
 endif()
 
 # Optional trace collection. When ON, the schedule-driven main records
 # each entry's actual start/end mtime-cycle window and prints a
-# parseable CSV block at the end. Host-side `agents/scripts/plot_xpurt_trace.py`
+# parseable CSV block at the end. Host-side `modelblaster/scripts/plot_xpurt_trace.py`
 # reads it and renders a Gantt timeline overlaying XPU-RT's prediction.
-if(AGENTS_XPURT_TRACE)
-    target_compile_definitions(app PRIVATE AGENTS_XPURT_TRACE=1)
+if(MODELBLASTER_XPURT_TRACE)
+    target_compile_definitions(app PRIVATE MODELBLASTER_XPURT_TRACE=1)
 endif()
 
 # Link every (model, backend) OBJECT lib + the per-model weights and
@@ -242,15 +242,15 @@ endif()
 # declared.
 foreach(_name ${MODEL_NAMES})
     foreach(_bs IN LISTS MODEL_BACKENDS)
-        target_link_libraries(app PRIVATE agents_${_name}_${_bs}_objs)
+        target_link_libraries(app PRIVATE modelblaster_${_name}_${_bs}_objs)
     endforeach()
-    target_link_libraries(app PRIVATE agents_${_name}_weights_obj)
-    target_link_libraries(app PRIVATE agents_${_name}_buffers_obj)
-    if(TARGET agents_${_name}_test_io_obj)
-        target_link_libraries(app PRIVATE agents_${_name}_test_io_obj)
+    target_link_libraries(app PRIVATE modelblaster_${_name}_weights_obj)
+    target_link_libraries(app PRIVATE modelblaster_${_name}_buffers_obj)
+    if(TARGET modelblaster_${_name}_test_io_obj)
+        target_link_libraries(app PRIVATE modelblaster_${_name}_test_io_obj)
     endif()
 endforeach()
-target_link_libraries(app PRIVATE agents_pool)
+target_link_libraries(app PRIVATE modelblaster_pool)
 
 # Same RISC-V gp-relative relax fix as harness_multi.
 zephyr_link_libraries(-Wl,--no-relax)

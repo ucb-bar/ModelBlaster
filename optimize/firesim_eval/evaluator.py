@@ -44,8 +44,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from agents.pipeline.backends import Backend
-from agents.pipeline.reference_kernels import KernelSpec
+from modelblaster.pipeline.backends import Backend
+from modelblaster.pipeline.reference_kernels import KernelSpec
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +301,7 @@ class FiresimEvaluator:
         Returns (ok, diagnostic, elf_path)."""
         # Local import — same lazy pattern profile_kernel uses to avoid
         # the generate_kernels <-> profile_kernel cycle.
-        from agents.pipeline.generate_kernels import (
+        from modelblaster.pipeline.generate_kernels import (
             emit_kernels_h, emit_kernels_c,
         )
 
@@ -331,18 +331,18 @@ class FiresimEvaluator:
             cmd.insert(2, "-p")
             self._first_build = False
         overlay = os.path.join(
-            self.repo_root, "agents", "harness", "backends",
+            self.repo_root, "modelblaster", "harness", "backends",
             "firesim_chipyard.conf",
         )
         cmd += [
             "--",
             f"-DMODEL_DIR={self.model_dir}",
-            f"-DAGENTS_BACKEND={self.backend.name}",
+            f"-DMODELBLASTER_BACKEND={self.backend.name}",
             f"-DEXTRA_CONF_FILE={overlay}",
         ]
         if self.backend.kernel_cflags:
             cmd.append(
-                f"-DAGENTS_KERNEL_CFLAGS="
+                f"-DMODELBLASTER_KERNEL_CFLAGS="
                 f"{';'.join(self.backend.kernel_cflags)}"
             )
 
@@ -372,8 +372,8 @@ class FiresimEvaluator:
         Returns (ok, diagnostic, parsed_dict). parsed_dict holds
         cycles_by_op, wall_cycles, golden_ok, golden_max_abs_err."""
         # Local imports — same lazy pattern; firesim_runner is heavy.
-        from agents.validation.firesim_runner import run_firesim
-        from agents.validation.runner_common import (
+        from modelblaster.validation.firesim_runner import run_firesim
+        from modelblaster.validation.runner_common import (
             parse_output, parse_profile, parse_verify, parse_wall_cycles,
             compare,
         )
@@ -394,7 +394,7 @@ class FiresimEvaluator:
         except Exception as e:
             return False, f"firesim run threw: {type(e).__name__}: {e}", {}
 
-        # Modern harness emits a single AGENTS_VERIFY summary; legacy
+        # Modern harness emits a single MODELBLASTER_VERIFY summary; legacy
         # binaries ship the per-element OUTPUT block. Prefer the
         # summary on FireSim — the OUTPUT path's per-element printf
         # over HTIF UART used to dominate the wall budget.

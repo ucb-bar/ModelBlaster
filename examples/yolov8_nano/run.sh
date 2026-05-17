@@ -4,4 +4,4 @@ set -euo pipefail
 MODEL_NAME=yolov8_nano
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 export MODEL_NAME REPO_ROOT
-source "${REPO_ROOT}/agents/examples/_run_lib.sh"
+source "${REPO_ROOT}/modelblaster/examples/_run_lib.sh"

@@ -38,8 +38,8 @@ Backend SOL configs are theoretical (DIM, VLEN, clock) and should be
 calibrated against a packed peak-microbench when we have one.
 
 Usage:
-    python -m agents.scripts.roofline_analysis <profile-root-or-csv>
-    python -m agents.scripts.roofline_analysis gen/profile/sweep_v8 \\
+    python -m modelblaster.scripts.roofline_analysis <profile-root-or-csv>
+    python -m modelblaster.scripts.roofline_analysis gen/profile/sweep_v8 \\
         --backend RVV --network yolov8_nano --target firesim_rocket_saturn
 
 The future home for the (ops, bytes) formulas is in extract_graph.py /
@@ -469,8 +469,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python -m agents.scripts.roofline_analysis gen/profile/sweep_v8\n"
-            "  python -m agents.scripts.roofline_analysis gen/profile/sweep_v8 \\\n"
+            "  python -m modelblaster.scripts.roofline_analysis gen/profile/sweep_v8\n"
+            "  python -m modelblaster.scripts.roofline_analysis gen/profile/sweep_v8 \\\n"
             "      --backend RVV --network yolov8_nano --top 20\n"
         ),
     )

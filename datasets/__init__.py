@@ -1,4 +1,4 @@
-"""Calibration data loaders for the agents pipeline.
+"""Calibration data loaders for the modelblaster pipeline.
 
 Each model declares a ``calibration_spec`` dict describing where each of
 its inputs comes from. The walker (extract_graph_export) resolves that
@@ -9,12 +9,12 @@ of the IR artifacts so any extracted model is reproducible from disk
 alone: anyone with the same dataset and the same spec gets the same
 calibration scales.
 
-See ``agents/datasets/base.py`` for the dispatcher + protocol; each
+See ``modelblaster/datasets/base.py`` for the dispatcher + protocol; each
 concrete loader lives in its own file (``image_dir.py``,
 ``isaaclab_forest_render.py``, etc).
 """
 
-from agents.datasets.base import (  # noqa: F401
+from modelblaster.datasets.base import (  # noqa: F401
     DatasetItem,
     load_dataset,
     materialize_calibration_samples,

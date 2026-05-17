@@ -1,6 +1,6 @@
-# FireSim sweep — LLM kernels, agents_pool vs pthreadpool
+# FireSim sweep — LLM kernels, modelblaster_pool vs pthreadpool
 
-Multi-model pool sweep (`agents/examples/multi_demo/run.sh` with
+Multi-model pool sweep (`modelblaster/examples/multi_demo/run.sh` with
 `POOL_SIZES=1,2,4`) on FireSim quad-rocket-saturn. Same LLM-cached
 kernels in both columns; only the parallel-for pool implementation
 changed. Cycle counts are profile-sum (per-op `rdcycle` deltas) at the
@@ -8,7 +8,7 @@ changed. Cycle counts are profile-sum (per-op `rdcycle` deltas) at the
 
 ## Headline
 
-| model | target | p | pthreadpool baseline | agents_pool | speedup |
+| model | target | p | pthreadpool baseline | modelblaster_pool | speedup |
 |---|---|---|---|---|---|
 | dronet | RVV | 1 | 39.273 ms | 38.212 ms | 1.03× |
 | dronet | RVV | 2 | 167.397 ms | **24.869 ms** | **6.73×** |
@@ -25,20 +25,20 @@ changed. Cycle counts are profile-sum (per-op `rdcycle` deltas) at the
 
 ## Reading the table
 
-- **p=1 sequential** is parity in every row (1.00–1.04×). agents_pool
+- **p=1 sequential** is parity in every row (1.00–1.04×). modelblaster_pool
   doesn't engage when there's only one worker, so this is the noise
   floor. Confirms no regression on the sequential path.
 - **dronet** wins are bounded by the actual kernel work: at p=4
   scalar where the pool engages but each conv slice is still 100 k–
-  10 M cycles, agents_pool reclaims ~7×. The pthreadpool dispatch
+  10 M cycles, modelblaster_pool reclaims ~7×. The pthreadpool dispatch
   was meaningful but not the whole story for a heavy network.
 - **mlp_control** wins are extreme (300–700×) because the kernels are
   tiny — `linear M=1;K=64;N=4` is ~3 k cycles of work. pthreadpool's
   ~13 M-cycle dispatch had been 99.8 %+ of total wall time. With
-  agents_pool's ~20 k-cycle dispatch, the work and the dispatch
+  modelblaster_pool's ~20 k-cycle dispatch, the work and the dispatch
   finally have the same order of magnitude.
 
-The agent's prediction at the end of the agents_pool refactor — "(1)
+The agent's prediction at the end of the modelblaster_pool refactor — "(1)
 Re-run the multi_demo sweep with the LLM-optimized cached kernels to
 double-check the per-op ratios at p=4 (likely closer to 4-5x for
 dronet since the kernel cost dominates more)" — lands within ballistic

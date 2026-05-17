@@ -16,7 +16,7 @@ ViNT outputs a (1, 5, 4) waypoint tensor (cumsum'd (x, y) + L2-normalized
     forward (not the quant scheme) is the dominant drift source.
  4. Spike actual — our binary's output after running 354 real int8
     ops through the EfficientNet body + transformer + composite tail.
-    Read from the AGENTS_OUTPUT_BEGIN/END block in spike stdout.
+    Read from the MODELBLASTER_OUTPUT_BEGIN/END block in spike stdout.
 
 The script runs all four on the same input (the first calibration
 sample, which is also what io.npz pinned the golden against) and prints
@@ -25,8 +25,8 @@ a side-by-side table in waypoint-space units.
 Run via:
     conda activate zephyr   # zephyr env has spike on PATH
     cd zephyr-chipyard-sw
-    # Build first if you haven't (bash agents/examples/vint/run.sh).
-    PYTHONPATH=. python agents/examples/vint/compare_waypoints.py
+    # Build first if you haven't (bash modelblaster/examples/vint/run.sh).
+    PYTHONPATH=. python modelblaster/examples/vint/compare_waypoints.py
 """
 from __future__ import annotations
 
@@ -56,14 +56,14 @@ def _run_spike(elf: str, spike_bin: str) -> str:
 
 
 def _parse_output_block(text: str) -> np.ndarray:
-    """Extract the fp32 values inside the AGENTS_OUTPUT_BEGIN/END markers
+    """Extract the fp32 values inside the MODELBLASTER_OUTPUT_BEGIN/END markers
     the harness emits (one float per line)."""
     m = re.search(
-        r"=== AGENTS_OUTPUT_BEGIN ===\n(.*?)\n=== AGENTS_OUTPUT_END ===",
+        r"=== MODELBLASTER_OUTPUT_BEGIN ===\n(.*?)\n=== MODELBLASTER_OUTPUT_END ===",
         text, re.DOTALL,
     )
     if not m:
-        raise RuntimeError("no AGENTS_OUTPUT block in spike stdout — did "
+        raise RuntimeError("no MODELBLASTER_OUTPUT block in spike stdout — did "
                            "the harness build with the dump enabled?")
     vals = [float(line) for line in m.group(1).strip().split("\n") if line.strip()]
     return np.asarray(vals, dtype=np.float32)
@@ -107,9 +107,9 @@ def _print_wp_row(label: str, dist: float, wp_arr: np.ndarray, *,
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--build-dir",
-                   default="agents/examples/vint/int8/build/scalar")
+                   default="modelblaster/examples/vint/int8/build/scalar")
     p.add_argument("--ir-dir",
-                   default="agents/examples/vint/int8/generated")
+                   default="modelblaster/examples/vint/int8/generated")
     p.add_argument("--spike",
                    default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
     p.add_argument("--waypoint-idx", type=int, default=2)
@@ -122,11 +122,11 @@ def main():
 
     elf = Path(args.build_dir) / "zephyr" / "zephyr.elf"
     if not elf.exists():
-        sys.exit(f"build the binary first: bash agents/examples/vint/run.sh "
+        sys.exit(f"build the binary first: bash modelblaster/examples/vint/run.sh "
                  f"(missing {elf})")
 
     # ---- (1) PyTorch fp32 on the same input the binary saw ---------------
-    from agents.models import vint as vint_mod
+    from modelblaster.models import vint as vint_mod
     samples = vint_mod.get_calibration_samples(1)
     obs0, goal0 = samples[0]
     model = vint_mod.get_model()

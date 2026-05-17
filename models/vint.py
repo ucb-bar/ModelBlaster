@@ -1,4 +1,4 @@
-"""ViNT model wrapper for the agents flow.
+"""ViNT model wrapper for the modelblaster flow.
 
 Sources the canonical ViNT PyTorch class from the vendored
 ``visualnav-transformer`` repo (under ``sims/external/``) and loads the
@@ -14,18 +14,18 @@ published pretrained checkpoint by default. Architecture is taken from
     mha attention      = 4 heads × 4 layers, ff_dim_factor=4
     image_size         = (85, 64)  # W, H
 
-Override the checkpoint with ``AGENTS_VINT_CKPT``; override the config
-yaml with ``AGENTS_VINT_CFG``.
+Override the checkpoint with ``MODELBLASTER_VINT_CKPT``; override the config
+yaml with ``MODELBLASTER_VINT_CFG``.
 
 NOTE: ViNT cannot be traced with ``torch.fx.symbolic_trace`` —
 EfficientNet's internals use ``len(...)`` calls plus ViNT.forward has
 in-place index assignments and the TransformerEncoder uses
 ``nn.MultiheadAttention`` whose lowered form is not FX-traceable.
 ``torch.export`` does trace cleanly (1690 aten nodes), so the
-agents-pipeline extractor that consumes this model has to use the
+modelblaster-pipeline extractor that consumes this model has to use the
 export-based ingest path, not the FX-based one. See
-``agents/pipeline/extract_graph_export.py`` (Phase A of the ViNT
-plan in ``agents/notes/vint_zephyr_plan.md``).
+``modelblaster/pipeline/extract_graph_export.py`` (Phase A of the ViNT
+plan in ``modelblaster/notes/vint_zephyr_plan.md``).
 
 Calibration: ``get_sample_input()`` returns a single
 ``(obs, goal)`` tuple of shape ``(1, 18, H, W)`` and ``(1, 3, H, W)``
@@ -61,10 +61,10 @@ if str(_VINT_TRAIN) not in sys.path:
 
 
 def _load_config() -> dict:
-    cfg_path = Path(os.environ.get("AGENTS_VINT_CFG", _DEFAULT_CFG))
+    cfg_path = Path(os.environ.get("MODELBLASTER_VINT_CFG", _DEFAULT_CFG))
     if not cfg_path.is_file():
         raise FileNotFoundError(
-            f"ViNT config yaml not found at {cfg_path}. Set AGENTS_VINT_CFG "
+            f"ViNT config yaml not found at {cfg_path}. Set MODELBLASTER_VINT_CFG "
             f"to override."
         )
     with open(cfg_path, "r") as f:
@@ -94,7 +94,7 @@ def get_model() -> torch.nn.Module:
     cfg = _load_config()
     model = _build_module(cfg).eval()
 
-    ckpt_path = Path(os.environ.get("AGENTS_VINT_CKPT", _DEFAULT_CKPT))
+    ckpt_path = Path(os.environ.get("MODELBLASTER_VINT_CKPT", _DEFAULT_CKPT))
     if not ckpt_path.is_file():
         print(
             f"[vint.get_model] WARN: checkpoint not found at {ckpt_path}; "
@@ -143,14 +143,14 @@ def get_sample_input() -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def get_calibration_spec(num_samples: int = 16) -> dict:
-    """Return a declarative calibration spec for the agents/datasets
+    """Return a declarative calibration spec for the modelblaster/datasets
     loader. The walker materializes (obs, goal) tuples from this and
     serializes the spec into the generated/ dir for reproducibility.
 
     Two inputs:
      * obs_img: rolling 6-frame stack along channel dim — drawn from
        IDSIA still images by default. Override the dir with
-       ``AGENTS_VINT_OBS_DATASET`` (path under datasets/).
+       ``MODELBLASTER_VINT_OBS_DATASET`` (path under datasets/).
      * goal_img: one image per sample — IsaacLab forest renders by
        preference (matches the deployment distribution; the
        goal_encoder was the main int8 drift source when calibrated
@@ -163,7 +163,7 @@ def get_calibration_spec(num_samples: int = 16) -> dict:
     W, H = cfg["image_size"]
     ctx = cfg["context_size"]
     obs_dir = os.environ.get(
-        "AGENTS_VINT_OBS_DATASET", "datasets/idsia/samples/sc")
+        "MODELBLASTER_VINT_OBS_DATASET", "datasets/idsia/samples/sc")
     # _REPO_ROOT (= parents[3]) is already FreshScheduler; the renders
     # live directly under it, not under its parent.
     goal_render_dir = _REPO_ROOT / "datasets/isaaclab_forest_renders"
@@ -213,7 +213,7 @@ def get_precision_spec() -> dict:
     resolution on the long tail. Per-op fp16 promotion lets one linear
     keep its dynamic range while the rest of the network stays in int8.
 
-    See ``agents/notes/mixed_precision_plan.md`` for the architecture.
+    See ``modelblaster/notes/mixed_precision_plan.md`` for the architecture.
     The auto-cast pass in ``extract_graph_export`` inserts
     ``cast_i8_to_f16`` before this op and ``cast_f16_to_i8`` after it
     (when its downstream consumer is back in int8 land).
@@ -234,7 +234,7 @@ def get_precision_spec() -> dict:
         # because the cumsum + L2-normalize tail in the harness
         # amplifies small int8 quant errors into degrees of wp4 drift.
         #
-        # See agents/notes/vint_mixed_precision_experiments.md for the
+        # See modelblaster/notes/vint_mixed_precision_experiments.md for the
         # measured impact of each region.
         "fp16_upstream_of": [
             "linear",          # goal-encoder output (and ancestors)
@@ -259,14 +259,14 @@ def get_precision_spec() -> dict:
 def get_calibration_samples(
     n_samples: int = 32,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Materialize (obs, goal) calibration tuples via the agents.datasets
+    """Materialize (obs, goal) calibration tuples via the modelblaster.datasets
     spec resolver. Returns ``[(obs (1, 18, H, W), goal (1, 3, H, W)), ...]``
     in the order the model's forward expects.
 
     Back-compat wrapper around ``get_calibration_spec`` for callers
     that don't want to plumb the spec themselves.
     """
-    from agents.datasets import materialize_calibration_samples  # noqa: PLC0415
+    from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
     spec = get_calibration_spec(n_samples)
     materialized = materialize_calibration_samples(spec)
     return [(d["obs_img"], d["goal_img"]) for d in materialized]

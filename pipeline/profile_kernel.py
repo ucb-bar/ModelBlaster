@@ -24,12 +24,12 @@ from typing import Optional
 
 import numpy as np
 
-from agents.pipeline.backends import Backend
-from agents.pipeline.reference_kernels import KernelSpec
-from agents.validation.spike_runner import (
+from modelblaster.pipeline.backends import Backend
+from modelblaster.pipeline.reference_kernels import KernelSpec
+from modelblaster.validation.spike_runner import (
     BEGIN, find_spike, parse_output, parse_profile,
 )
-from agents.validation.runner_common import parse_verify
+from modelblaster.validation.runner_common import parse_verify
 
 
 @dataclass
@@ -54,7 +54,7 @@ def _emit_kernels_files(
     model_name: Optional[str] = None,
 ) -> None:
     # Local import to avoid a cycle with generate_kernels.
-    from agents.pipeline.generate_kernels import emit_kernels_h, emit_kernels_c
+    from modelblaster.pipeline.generate_kernels import emit_kernels_h, emit_kernels_c
     emit_kernels_h(specs, out_dir, model_name=model_name)
     emit_kernels_c(impls, "optimize", out_dir, backend=backend, model_name=model_name)
 
@@ -74,17 +74,17 @@ def _west_build(
         cmd.insert(2, "-p")
     cmd += ["--",
             f"-DMODEL_DIR={model_dir}",
-            f"-DAGENTS_BACKEND={backend.name}"]
+            f"-DMODELBLASTER_BACKEND={backend.name}"]
     if backend.kernel_cflags:
         # Resolve <repo_root> placeholders (gemmini's -isystem paths use
         # them so the Backend def stays repo-relative). _run_lib.sh /
         # multi_demo/run.sh resolve at their level; this is the LLM
         # verify path's equivalent.
         cflags = backend.resolved_kernel_cflags(repo_root)
-        cmd.append(f"-DAGENTS_KERNEL_CFLAGS={';'.join(cflags)}")
+        cmd.append(f"-DMODELBLASTER_KERNEL_CFLAGS={';'.join(cflags)}")
     env = os.environ.copy()
     # Ensure cmake is found (Vitis puts a broken cmake first in $PATH).
-    # Also ensure west is findable via AGENTS_WEST or the miniforge zephyr env.
+    # Also ensure west is findable via MODELBLASTER_WEST or the miniforge zephyr env.
     _WEST_FALLBACK = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
         "tools", "miniforge3", "envs", "zephyr", "bin",
@@ -115,7 +115,7 @@ def _west_build(
 def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
     # Gemmini backend needs a spike binary with --extension=gemmini support
     # (the default /scratch2/dima/misc_sw/spike doesn't have it). Check
-    # AGENTS_GEMMINI_SPIKE first, then fall back to the chipyard toolchain.
+    # MODELBLASTER_GEMMINI_SPIKE first, then fall back to the chipyard toolchain.
     _GEMMINI_SPIKE_FALLBACK = (
         "/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike"
     )
@@ -123,7 +123,7 @@ def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
         "/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so"
     )
     if "--extension=gemmini" in backend.spike_args:
-        spike = os.environ.get("AGENTS_GEMMINI_SPIKE")
+        spike = os.environ.get("MODELBLASTER_GEMMINI_SPIKE")
         if not spike:
             if os.path.exists(_GEMMINI_SPIKE_FALLBACK):
                 spike = _GEMMINI_SPIKE_FALLBACK
@@ -131,7 +131,7 @@ def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
                 spike = find_spike()
         # Inject libgemmini.so into LD_LIBRARY_PATH if not already there
         _lib_dir = os.path.dirname(
-            os.environ.get("AGENTS_GEMMINI_LIB", _GEMMINI_LIB_FALLBACK)
+            os.environ.get("MODELBLASTER_GEMMINI_LIB", _GEMMINI_LIB_FALLBACK)
         )
         _env = os.environ.copy()
         _env["LD_LIBRARY_PATH"] = (
@@ -159,11 +159,11 @@ def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
             f"cmd: {' '.join(cmd)}"
         )
     out = proc.stdout + proc.stderr
-    # Accept either the legacy AGENTS_OUTPUT_BEGIN marker or the modern
-    # AGENTS_VERIFY summary as proof-of-life. Both are emitted by the
+    # Accept either the legacy MODELBLASTER_OUTPUT_BEGIN marker or the modern
+    # MODELBLASTER_VERIFY summary as proof-of-life. Both are emitted by the
     # harness — the verify replaces the per-element output dump for
     # speed but the legacy path is still present in older binaries.
-    if (BEGIN not in out) and ("=== AGENTS_VERIFY " not in out):
+    if (BEGIN not in out) and ("=== MODELBLASTER_VERIFY " not in out):
         return False, (
             f"spike output missing markers. cmd: {' '.join(cmd)}\n"
             f"--- output (tail) ---\n{out[-2000:]}"
@@ -241,8 +241,8 @@ def build_and_run(
     for row in profile:
         cycles_by_op[row["op"]] = cycles_by_op.get(row["op"], 0) + int(row["cycles"])
 
-    # Modern harness emits a single AGENTS_VERIFY summary line; legacy
-    # binaries still ship the per-element AGENTS_OUTPUT block. Prefer
+    # Modern harness emits a single MODELBLASTER_VERIFY summary line; legacy
+    # binaries still ship the per-element MODELBLASTER_OUTPUT block. Prefer
     # the summary when present (saves shipping the full tensor over
     # the slow HTIF UART on FireSim). `actual` is left unset when the
     # summary is used since callers don't need per-element values.
@@ -305,7 +305,7 @@ def build_and_run(
         else:
             # Legacy per-element path. Identical to before this branch
             # was added; kept for older harness binaries / int8 paths
-            # that haven't moved to AGENTS_VERIFY yet.
+            # that haven't moved to MODELBLASTER_VERIFY yet.
             golden = raw_golden.astype(np.float32).reshape(-1)
             if actual is None or actual.shape != golden.shape:
                 result.golden_ok = False

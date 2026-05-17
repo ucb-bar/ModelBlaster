@@ -8,7 +8,7 @@ The registry is consumed by:
     today's collapse-to-one-pthreadpool runtime ignores everything
     except whether a target is reachable).
 
-A registry is a small JSON document. See agents/cores/*.json for
+A registry is a small JSON document. See modelblaster/cores/*.json for
 shipped examples (spike_rocket_quad, spike_rvv_quad, and a heterogeneous
 chipyard_hetero_example with rocket+boom+rvv+gemmini).
 
@@ -192,7 +192,7 @@ def validate_dispatch_targets(reg: CoreRegistry,
 def _main() -> None:
     import argparse
     ap = argparse.ArgumentParser(
-        description="Inspect / validate an agents/cores/*.json registry")
+        description="Inspect / validate an modelblaster/cores/*.json registry")
     ap.add_argument("registry", help="path to a registry JSON")
     ap.add_argument("--ir", default=None,
                     help="optional graph.json — checks every dispatch's "

@@ -10,7 +10,7 @@
  *         WEIGHT LAYOUT CONTRACT: this kernel expects `weight` to already
  *         be in flat HWIO layout (= `[KH*KW*IC, OC]`, the form
  *         `tiled_conv_auto` consumes directly).  The skeleton emitter at
- *         agents/pipeline/generate_skeleton.py::_backend_pack_weight
+ *         modelblaster/pipeline/generate_skeleton.py::_backend_pack_weight
  *         applies the OIHW→HWIO permutation at codegen time when
  *         `--backend gemmini`, so the runtime weight-transpose loop that
  *         used to live here (which copied into a per-call ws_weight
@@ -60,7 +60,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     if (KH != KW || SH != SW || PH != PW
             || input_offset != 0 || filter_offset != 0
             || output_offset != 0
-#ifdef AGENTS_GEMMINI_Q31_ACC_SCALE
+#ifdef MODELBLASTER_GEMMINI_Q31_ACC_SCALE
             || output_shift < 0 || output_shift > 30
 #endif
             || (size_t)(N * IH * IW * IC) > GEMMINI_WS_BYTES
@@ -126,14 +126,14 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     /* Weight is already in flat HWIO layout ([KH*KW*IC, OC]) — see the
      * file-header WEIGHT LAYOUT CONTRACT.  The OIHW→HWIO permutation
      * happens at codegen time in
-     * agents/pipeline/generate_skeleton.py::_backend_pack_weight when
+     * modelblaster/pipeline/generate_skeleton.py::_backend_pack_weight when
      * --backend=gemmini, so we pass `weight` directly into
      * tiled_conv_auto without going through a ws_weight workspace. */
 
-#ifdef AGENTS_GEMMINI_Q31_ACC_SCALE
+#ifdef MODELBLASTER_GEMMINI_Q31_ACC_SCALE
     /* Q31 gemmini config: acc_scale_t = SInt(32). HW mvout requantize is
      *   y = sat_int8((acc * scale + (1<<30)) >> 31)
-     * The TFLite/agents formula we want is
+     * The TFLite/modelblaster formula we want is
      *   y = sat_int8((acc * mult + (1<<30)) >> (31 + output_shift))
      * Fold (mult, shift) → single Q0.31 multiplier:
      *   scale = (mult + (1<<(s-1))) >> s   (compile-time round-to-nearest).

@@ -2,7 +2,7 @@
 # Sweep per-dispatch profile data across (HW backend) x (pool size).
 #
 # For each combination, this rebuilds the multi-model harness with
-# AGENTS_POOL_THREADS pinned to the sweep's pool size, runs spike with
+# MODELBLASTER_POOL_THREADS pinned to the sweep's pool size, runs spike with
 # matching `-p<N>`, and lets spike_runner emit one IREE-shape
 # results.csv per model under PROFILE_OUT_ROOT.
 #
@@ -24,7 +24,7 @@
 #   source scripts/set_envvars_sdk.sh
 #
 # Run from repo root:
-#   bash agents/scripts/sweep_profile.sh
+#   bash modelblaster/scripts/sweep_profile.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -55,13 +55,13 @@ for backend in "${BACKEND_LIST[@]}"; do
         echo "===> sweep: backend=${backend} pool=${pool} cores=${cores}"
         # Spike is always launched with -p4 (the harness's
         # CONFIG_MP_MAX_NUM_CPUS=4 — Zephyr's SMP boot stalls if fewer
-        # harts respond). Only AGENTS_POOL_THREADS varies, which
+        # harts respond). Only MODELBLASTER_POOL_THREADS varies, which
         # controls how many of those harts pthreadpool actually spawns
         # workers on. Idle harts cost nothing in the sim.
         TARGET="${backend}" \
         QUANT="${QUANT}" \
         SPIKE_HARTS=4 \
-        AGENTS_POOL_THREADS="${pool}" \
+        MODELBLASTER_POOL_THREADS="${pool}" \
         FORCE_REGEN=1 \
         MODELS="${MODELS}" \
         BACKEND="${KERNEL_BACKEND:-reference}" \
@@ -74,7 +74,7 @@ for backend in "${BACKEND_LIST[@]}"; do
         PROFILE_CPU="${PROFILE_CPU:-${PROFILE_SOURCE:-spike}}" \
         PROFILE_CORES="${cores}" \
         PROFILE_CLOCK_MHZ="${PROFILE_CLOCK_MHZ:-1000.0}" \
-            bash "${REPO_ROOT}/agents/examples/multi_demo/run.sh"
+            bash "${REPO_ROOT}/modelblaster/examples/multi_demo/run.sh"
     done
 done
 

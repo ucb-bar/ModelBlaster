@@ -19,7 +19,7 @@ from typing import Optional
 
 import numpy as np
 
-from agents.pipeline.reference_kernels import KernelSpec
+from modelblaster.pipeline.reference_kernels import KernelSpec
 
 
 HOST_CC = os.environ.get("HOST_CC", "cc")

@@ -1,16 +1,16 @@
 sample:
-  description: Generated DNN inference harness (agents flow)
-  name: agents_harness
+  description: Generated DNN inference harness (modelblaster flow)
+  name: modelblaster_harness
 common:
-  tags: agents dnn
+  tags: modelblaster dnn
   integration_platforms:
     - spike_riscv64
   harness: console
   harness_config:
     type: multi_line
     regex:
-      - "=== AGENTS_OUTPUT_BEGIN ==="
-      - "=== AGENTS_OUTPUT_END ==="
+      - "=== MODELBLASTER_OUTPUT_BEGIN ==="
+      - "=== MODELBLASTER_OUTPUT_END ==="
 tests:
-  sample.agents.harness:
-    tags: agents
+  sample.modelblaster.harness:
+    tags: modelblaster

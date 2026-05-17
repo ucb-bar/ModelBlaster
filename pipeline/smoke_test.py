@@ -2,12 +2,12 @@
 
 Run:
     source ../../../set_api_keys.sh
-    python -m agents.pipeline.smoke_test
+    python -m modelblaster.pipeline.smoke_test
 """
 
 from __future__ import annotations
 
-from agents.pipeline.bedrock_client import BedrockClient
+from modelblaster.pipeline.bedrock_client import BedrockClient
 
 
 def main() -> None:

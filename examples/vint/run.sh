@@ -4,7 +4,7 @@
 # ViNT can't be traced via torch.fx.symbolic_trace (EfficientNet's
 # len(...) plus nn.TransformerEncoder internals defeat it). We use
 # torch.export through extract_graph_export.py instead — see
-# agents/notes/vint_zephyr_plan.md.
+# modelblaster/notes/vint_zephyr_plan.md.
 #
 # Two-env split: extract_graph_export runs in the xpurt conda env
 # (where vint_train + efficientnet_pytorch live); codegen + west
@@ -20,7 +20,7 @@ TARGET="${TARGET:-scalar}"
 BACKEND="${BACKEND:-reference}"
 RUNNER="${RUNNER:-spike}"
 # Default to 16 IDSIA samples for activation-scale calibration.
-# Override via AGENTS_VINT_CALIB_DIR for the data source.
+# Override via MODELBLASTER_VINT_CALIB_DIR for the data source.
 N_CALIB="${VINT_NUM_CALIBRATION:-16}"
 # Per-channel weight quant for conv + linear. 1 = on (default for
 # trained nets; needed for ViNT to verify against the fp32 golden).
@@ -28,7 +28,7 @@ PC_FLAG="${VINT_PER_CHANNEL:-1}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${REPO_ROOT}"
-EXAMPLE_DIR="${REPO_ROOT}/agents/examples/${MODEL_NAME}"
+EXAMPLE_DIR="${REPO_ROOT}/modelblaster/examples/${MODEL_NAME}"
 IR_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 
 # Stage 1 — extract IR via torch.export. Runs in the xpurt env where
@@ -42,7 +42,7 @@ if [[ "${FORCE_EXTRACT:-0}" == "1" \
     XPURT_PY="${XPURT_PY:-/scratch2/dima/miniforge3/envs/xpurt/bin/python}"
     EXTRA_ARGS=()
     if [[ "${PC_FLAG}" == "1" ]]; then EXTRA_ARGS+=(--per-channel); fi
-    PYTHONPATH="${REPO_ROOT}" "${XPURT_PY}" -m agents.pipeline.extract_graph_export \
+    PYTHONPATH="${REPO_ROOT}" "${XPURT_PY}" -m modelblaster.pipeline.extract_graph_export \
         --model "${MODEL_NAME}" --quant "${QUANT}" \
         --num-calibration "${N_CALIB}" \
         "${EXTRA_ARGS[@]}" --out-dir "${IR_DIR}"
@@ -61,4 +61,4 @@ source "${REPO_ROOT}/scripts/set_envvars_sdk.sh"
 # disk from the xpurt-side extract_graph_export above.
 unset FORCE_EXTRACT
 export MODEL_NAME REPO_ROOT QUANT TARGET BACKEND RUNNER
-source "${REPO_ROOT}/agents/examples/_run_lib.sh"
+source "${REPO_ROOT}/modelblaster/examples/_run_lib.sh"

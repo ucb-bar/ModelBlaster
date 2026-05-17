@@ -1,7 +1,7 @@
 """Reconstruct a Gantt timeline from a harness_microros execution trace.
 
 The fixed-HW ROS baseline (`harness_microros`) emits a CSV block between
-``=== AGENTS_ROS_TRACE_BEGIN ===`` and ``=== AGENTS_ROS_TRACE_END ===``
+``=== MODELBLASTER_ROS_TRACE_BEGIN ===`` and ``=== MODELBLASTER_ROS_TRACE_END ===``
 once net_b (the long-running, one-shot network) completes. Each row carries:
 
   entry_id, network, instance, dispatch_id, op, name, kind, hart,
@@ -18,7 +18,7 @@ dispatch_id in each model's graph.json (passed via --graph
 network=path).
 
 Usage:
-    python -m agents.scripts.plot_ros_trace baseline.uartlog \\
+    python -m modelblaster.scripts.plot_ros_trace baseline.uartlog \\
         --clock-mhz 1 --source firesim \\
         --out plots/ros_baseline.png --csv plots/ros_baseline.csv
 """
@@ -34,8 +34,8 @@ import sys
 from dataclasses import dataclass
 
 
-_BEGIN = "=== AGENTS_ROS_TRACE_BEGIN ==="
-_END = "=== AGENTS_ROS_TRACE_END ==="
+_BEGIN = "=== MODELBLASTER_ROS_TRACE_BEGIN ==="
+_END = "=== MODELBLASTER_ROS_TRACE_END ==="
 
 
 @dataclass
@@ -66,7 +66,7 @@ def _read_text(path: str) -> str:
 def _extract_block(text: str) -> str:
     if _BEGIN not in text or _END not in text:
         raise SystemExit(
-            "AGENTS_ROS_TRACE markers not found — was the binary built "
+            "MODELBLASTER_ROS_TRACE markers not found — was the binary built "
             "from harness_microros and was the full uartlog captured?"
         )
     start = text.index(_BEGIN) + len(_BEGIN)

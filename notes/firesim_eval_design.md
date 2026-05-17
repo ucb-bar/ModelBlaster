@@ -21,13 +21,13 @@ scorer.
 
 | Path | Role |
 |---|---|
-| `agents/optimize/firesim_eval/__init__.py` | Public surface (FiresimEvaluator, evaluate_top_k, memory_model_stanza) |
-| `agents/optimize/firesim_eval/cache_aware_prompt.py` | MemoryModel dataclass + `memory_model_stanza()` renderer; ships one model (the quad-rocket-saturn hwconfig) |
-| `agents/optimize/firesim_eval/evaluator.py` | `FiresimEvaluator` (build for chipyard, FPGA-queue, run, parse cycles), `evaluate_top_k` (re-rank K spike survivors against firesim) |
-| `agents/optimize/firesim_eval/test_evaluator.py` | Stub-evaluator unit tests for `evaluate_top_k` ordering / dedupe / fail-handling, and a render check for `memory_model_stanza` |
-| `agents/pipeline/generate_kernels.py` | New flags `--firesim-eval / --firesim-top-k / --cache-aware-prompt / --firesim-ops`; threads them through the optimize loop. `beam_search_optimize` now also returns the ranked list of viable candidates so the rerank can pick the top-K. |
-| `agents/pipeline/reference_kernels.py` | New `oc_blocked` algorithm seed for conv2d (cache-blocked direct convolution with a fixed `TILE_OC=4`). |
-| `agents/examples/_run_lib.sh` | Threads new env knobs (`FIRESIM_EVAL=1`, `FIRESIM_TOP_K`, `FIRESIM_OPS`, `CACHE_AWARE_PROMPT=1`) through the optimize CLI |
+| `modelblaster/optimize/firesim_eval/__init__.py` | Public surface (FiresimEvaluator, evaluate_top_k, memory_model_stanza) |
+| `modelblaster/optimize/firesim_eval/cache_aware_prompt.py` | MemoryModel dataclass + `memory_model_stanza()` renderer; ships one model (the quad-rocket-saturn hwconfig) |
+| `modelblaster/optimize/firesim_eval/evaluator.py` | `FiresimEvaluator` (build for chipyard, FPGA-queue, run, parse cycles), `evaluate_top_k` (re-rank K spike survivors against firesim) |
+| `modelblaster/optimize/firesim_eval/test_evaluator.py` | Stub-evaluator unit tests for `evaluate_top_k` ordering / dedupe / fail-handling, and a render check for `memory_model_stanza` |
+| `modelblaster/pipeline/generate_kernels.py` | New flags `--firesim-eval / --firesim-top-k / --cache-aware-prompt / --firesim-ops`; threads them through the optimize loop. `beam_search_optimize` now also returns the ranked list of viable candidates so the rerank can pick the top-K. |
+| `modelblaster/pipeline/reference_kernels.py` | New `oc_blocked` algorithm seed for conv2d (cache-blocked direct convolution with a fixed `TILE_OC=4`). |
+| `modelblaster/examples/_run_lib.sh` | Threads new env knobs (`FIRESIM_EVAL=1`, `FIRESIM_TOP_K`, `FIRESIM_OPS`, `CACHE_AWARE_PROMPT=1`) through the optimize CLI |
 
 The new code is fully opt-in. Default `OPTIMIZE=1` runs are unchanged
 (`firesim_eval` defaults to off everywhere). The existing
@@ -174,7 +174,7 @@ The first end-to-end memory-aware optimize run:
     BEAM=2 EXPANSIONS=2 ITERATIONS=2 \\
     FIRESIM_EVAL=1 FIRESIM_TOP_K=3 FIRESIM_OPS=conv2d \\
     CACHE_AWARE_PROMPT=1 \\
-    bash agents/examples/dronet/run.sh
+    bash modelblaster/examples/dronet/run.sh
 
 Spike-side optimize summary:
 
@@ -204,7 +204,7 @@ spike-equivalent candidate that would have been silently cached (had
 the +0% candidate been the spike best, it would have been written to
 cache) now gets rejected at the firesim gate. After this run I added
 a `Load access fault / Store access fault / Illegal instruction`
-short-circuit to `agents/validation/firesim_runner.py` so future
+short-circuit to `modelblaster/validation/firesim_runner.py` so future
 faulting kernels fail in ~5 s instead of waiting out the 240 s timeout.
 
 ### Per-shape FireSim numbers, before / after
@@ -230,7 +230,7 @@ Single-model dronet, RVV, single-hart, sequential:
 | sigmoid | | 371 | 650 | **+75%** (noise — n=1 op) |
 | **dronet TOTAL (sum)** | | **39,273,242** | **38,488,204** | **-2.0%** |
 
-`AGENTS_WALL_CYCLES` (mtime, source-of-truth wall-clock):
+`MODELBLASTER_WALL_CYCLES` (mtime, source-of-truth wall-clock):
 **39,273 → 38,494** = **-2.0%** end-to-end speedup. Golden compare PASS.
 
 ### End-to-end XPU-RT impact

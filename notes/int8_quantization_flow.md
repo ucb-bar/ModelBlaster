@@ -32,7 +32,7 @@ Q0.31 fixed-point requantize tail (CMSIS-NN / muRISCV-NN convention).
 ### Symmetric per-tensor scale
 
 ```python
-# agents/pipeline/extract_graph.py:460
+# modelblaster/pipeline/extract_graph.py:460
 def _scale_from_max_abs(t):
     m = float(t.detach().abs().max().item())
     return max(m, 1e-8) / 127.0   # _INT8_RANGE
@@ -45,7 +45,7 @@ the asymmetric range.
 ### Tensor quantize
 
 ```python
-# agents/pipeline/extract_graph.py:466
+# modelblaster/pipeline/extract_graph.py:466
 def _quantize_per_tensor_sym(t, scale):
     return torch.round(t.detach() / scale).clamp(-127, 127).to(torch.int8)
 ```
@@ -65,7 +65,7 @@ The "real-multiplier" `M = (in_scale * w_scale) / out_scale` is
 decomposed into `(multiplier, shift)`:
 
 ```python
-# agents/pipeline/extract_graph.py:490
+# modelblaster/pipeline/extract_graph.py:490
 def _requantize_multiplier_shift(real_mult):
     mantissa, exp = np.frexp(real_mult)         # mantissa ∈ [0.5, 1.0)
     multiplier = int(round(mantissa * (1 << 31)))
@@ -94,13 +94,13 @@ output[i] = (int8_t)scaled;
 ```
 
 Bit-exact across the kernel and `_requantize_int()` Python mirror
-(`agents/pipeline/extract_graph.py:472`) — they're tested against
+(`modelblaster/pipeline/extract_graph.py:472`) — they're tested against
 each other by the `_s8` `KernelSpec.reference_impl`s.
 
 ## Calibration
 
 ```python
-# agents/pipeline/extract_graph.py:514
+# modelblaster/pipeline/extract_graph.py:514
 class _CaptureTensors(torch.fx.Interpreter):
     """FX Interpreter that records every tensor produced by every node."""
 ```
@@ -141,13 +141,13 @@ requantize. Fusion would be a Stage-2 perf win.
 ## Op coverage
 
 Every op below has:
-1. An `extract_int8` handler in `agents/pipeline/extract_graph.py` that
+1. An `extract_int8` handler in `modelblaster/pipeline/extract_graph.py` that
    converts the fp32 nn.Module into an int8 IR node.
 2. A matching `<OP>_S8 = KernelSpec(...)` entry in
-   `agents/pipeline/reference_kernels.py` with a scalar reference impl
+   `modelblaster/pipeline/reference_kernels.py` with a scalar reference impl
    and ctypes argtypes.
 3. A dispatch case in `emit_model()` of
-   `agents/pipeline/generate_skeleton.py` that wires the IR op to a
+   `modelblaster/pipeline/generate_skeleton.py` that wires the IR op to a
    `kernel_<op>_s8(...)` call in the generated `model.c`.
 
 | nn.Module | IR op kind | reference_kernels.py spec |
@@ -178,7 +178,7 @@ For each missing op, the steps to add:
    tensors of the spec's `extra_shapes`.
 
 Currently missing (drives the gap matrix in
-`agents/notes/` of-the-overall-quant-coverage discussion):
+`modelblaster/notes/` of-the-overall-quant-coverage discussion):
 
 - `relu6_s8` (mobilenet_v2)
 - `conv2d_dw_s8` (mobilenet_v2 depthwise — see per-channel caveat above)
@@ -193,7 +193,7 @@ Currently missing (drives the gap matrix in
 
 ## Validated models
 
-End-to-end on spike, in-binary `AGENTS_VERIFY` PASS at atol=0 / rtol=0
+End-to-end on spike, in-binary `MODELBLASTER_VERIFY` PASS at atol=0 / rtol=0
 against the PyTorch int8 golden:
 
 | Model | Op coverage | Profile rows |
@@ -203,7 +203,7 @@ against the PyTorch int8 golden:
 | **dronet** | `conv2d_s8`, `linear_s8`, `relu_s8`, `sigmoid_s8`, `maxpool2d_s8`, `batchnorm2d_s8`, `add_s8`, `view` | 30 |
 
 LLM-RVV optimized cache exists for all three under
-`agents/examples/<model>/int8/cache/rvv/rvv_<op>_<algo>.c`. Dronet's
+`modelblaster/examples/<model>/int8/cache/rvv/rvv_<op>_<algo>.c`. Dronet's
 `conv2d_s8` cache includes both the default `direct` algorithm and a
 hand-tuned `rvv_widening_oc` seed (see CONV2D_S8 in
 `reference_kernels.py`).
@@ -214,7 +214,7 @@ hand-tuned `rvv_widening_oc` seed (see CONV2D_S8 in
 ## End-to-end pipeline path (int8)
 
 ```
-agents/models/<model>.py           # fp32 PyTorch model
+modelblaster/models/<model>.py           # fp32 PyTorch model
               │
               ▼
 extract_graph.py --quant int8      # extract_int8(...): FX trace + ShapeProp
@@ -238,7 +238,7 @@ generate_kernels.py --backend ...  # picks + verifies kernel impls
 west build -b spike_riscv64        # Zephyr harness compiles + links
               │
               ▼
-spike + AGENTS_VERIFY              # in-binary max_abs_err vs test_golden
+spike + MODELBLASTER_VERIFY              # in-binary max_abs_err vs test_golden
                                    # int8 outputs widened to float for compare;
                                    # default tolerance for int dtype is atol=0
                                    # rtol=0 (bit-exact); per-backend overrides
@@ -267,10 +267,10 @@ spike + AGENTS_VERIFY              # in-binary max_abs_err vs test_golden
 
 | File | Role |
 |---|---|
-| `agents/pipeline/extract_graph.py:526` (`extract_int8`) | int8 IR extraction, calibration, weight quantize |
-| `agents/pipeline/reference_kernels.py` (`*_S8` specs) | per-op signatures, scalar reference impls, ctypes argtypes |
-| `agents/pipeline/generate_skeleton.py` (`emit_model`) | dispatch case per `_s8` op kind |
-| `agents/pipeline/verify_kernel.py` (`_gen_inputs_*_s8`) | int8 input generators for the host-ctypes verify path |
-| `agents/pipeline/generate_kernels.py` | backend=reference vs LLM kernel generation, cache, optimize loop |
-| `agents/examples/<model>/int8/cache/<target>/` | persisted LLM kernel outputs |
-| `agents/examples/<model>/int8/generated/` | extracted IR + per-target codegen |
+| `modelblaster/pipeline/extract_graph.py:526` (`extract_int8`) | int8 IR extraction, calibration, weight quantize |
+| `modelblaster/pipeline/reference_kernels.py` (`*_S8` specs) | per-op signatures, scalar reference impls, ctypes argtypes |
+| `modelblaster/pipeline/generate_skeleton.py` (`emit_model`) | dispatch case per `_s8` op kind |
+| `modelblaster/pipeline/verify_kernel.py` (`_gen_inputs_*_s8`) | int8 input generators for the host-ctypes verify path |
+| `modelblaster/pipeline/generate_kernels.py` | backend=reference vs LLM kernel generation, cache, optimize loop |
+| `modelblaster/examples/<model>/int8/cache/<target>/` | persisted LLM kernel outputs |
+| `modelblaster/examples/<model>/int8/generated/` | extracted IR + per-target codegen |

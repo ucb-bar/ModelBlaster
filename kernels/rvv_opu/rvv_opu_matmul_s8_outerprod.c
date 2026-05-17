@@ -7,7 +7,7 @@
  * Upstream's `i8_mm_bme_sq` iterates over mlmax-sized tiles of (i, j),
  * with a per-tile MAC loop that VOPACC's K i8 inputs into m1. We
  * preserve that tile-walking shape faithfully here, with three
- * adaptations for the agents-flow matmul_s8 signature:
+ * adaptations for the modelblaster-flow matmul_s8 signature:
  *
  *   1. Layout normalization. Upstream takes `at` laid out as [K, M]
  *      (i.e., a's transpose, so unit-stride loads can sweep K rows of
@@ -27,7 +27,7 @@
  *      tile loop here always uses square mlmax tiles, falling back
  *      to the embedded scalar reference for (M, N) shapes that
  *      aren't multiples of mlmax. Easier to read; perf-equivalent
- *      for the agents-flow's typical shapes (M, N either small <= 8
+ *      for the modelblaster-flow's typical shapes (M, N either small <= 8
  *      or pure multiples like 64).
  *
  * MAC body itself (VOPACC inner loop with two-way unroll) is byte-

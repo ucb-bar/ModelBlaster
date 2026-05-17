@@ -1,16 +1,16 @@
 # YOLOv8n — architectural divergence from vanilla ultralytics
 
-Documents what `agents/models/yolov8_nano.py` changes relative to the
+Documents what `modelblaster/models/yolov8_nano.py` changes relative to the
 upstream ultralytics `yolov8n` reference. The divergences are all in
 service of getting a pure-PyTorch model that **traces cleanly through
-`torch.fx.symbolic_trace`** — which the agents-flow extract pass
+`torch.fx.symbolic_trace`** — which the modelblaster-flow extract pass
 requires — without changing the trained-weight numerics.
 
 The COCO-pretrained weights from `yolov8n.pt` stream into this model
 unchanged; backbone / neck channel counts and per-layer Conv shapes
 are byte-for-byte identical. The PyTorch forward pass of this model
 matches ultralytics' to within fp32 rounding (validated against the
-agents-flow's PyTorch-vs-spike golden compare).
+modelblaster-flow's PyTorch-vs-spike golden compare).
 
 ## Why we needed a wrapper
 
@@ -125,9 +125,9 @@ or even tiny-NN post-process.
 ### 4. Input resolution defaults to 160, not 640
 
 Upstream YOLOv8n is trained and inferenced at 640×640. Our default
-is `AGENTS_YOLOV8N_INPUT=160` because:
+is `MODELBLASTER_YOLOV8N_INPUT=160` because:
 
-- 640²×3 = 1.2 MB per input frame; the agents harness allocates that
+- 640²×3 = 1.2 MB per input frame; the modelblaster harness allocates that
   on stack (or in the buffer arena) per dispatch — workable but
   expensive on Zephyr stack.
 - The intermediate-tensor pyramid is ~7× larger at 640: P3 is
@@ -136,7 +136,7 @@ is `AGENTS_YOLOV8N_INPUT=160` because:
 - At 640 spike inference takes >30 minutes per frame. 160 fits in
   ~2 minutes — useful for iteration.
 
-The model is **resolution-agnostic** by design (`AGENTS_YOLOV8N_INPUT`
+The model is **resolution-agnostic** by design (`MODELBLASTER_YOLOV8N_INPUT`
 must be a multiple of 32 since the stride-32 head requires it).
 Real deployments would set this to 320 or 640 depending on the
 target latency budget; the trained weights work at any resolution.
@@ -160,7 +160,7 @@ fused-inference path that folds BN into the conv weights and bias.
 We keep them separate `nn.Conv2d` + `nn.BatchNorm2d` + `nn.SiLU`
 because:
 
-- The agents extract pass folds BN into the preceding conv at
+- The modelblaster extract pass folds BN into the preceding conv at
   IR-emission time (see `_fold_bn_into_conv` in `extract_graph.py`),
   so by the time the C codegen sees the model, BN is gone anyway.
 - Keeping BN as its own module makes the FX graph more uniform
@@ -199,7 +199,7 @@ of these, the trained weights stop loading correctly:
 
 ## Op inventory (int8 PTQ pass)
 
-The full agents-flow IR at default `AGENTS_YOLOV8N_INPUT=160`:
+The full modelblaster-flow IR at default `MODELBLASTER_YOLOV8N_INPUT=160`:
 
 ```
 conv2d_s8                63
@@ -222,7 +222,7 @@ total dispatches        212
 
 Compare to dronet's 30 dispatches and ViNT's 605. YOLOv8n sits in
 the middle of the model-complexity spectrum supported by the
-agents flow.
+modelblaster flow.
 
 ## Weight loading
 
@@ -244,7 +244,7 @@ Layer 10 (Upsample) and layers 11/14/17/20 (Concat) are
 parameter-less so they don't appear in the state_dict — only our
 forward references them.
 
-Verified end-to-end: `get_model()` with `AGENTS_YOLOV8N_PRETRAINED=1`
+Verified end-to-end: `get_model()` with `MODELBLASTER_YOLOV8N_PRETRAINED=1`
 copies 235 of ultralytics' tensors (the full backbone + neck + Conv
 layers of the head; the DFL and end2end branches are intentionally
 skipped). PyTorch forward of the loaded model matches ultralytics'
@@ -267,7 +267,7 @@ Anyone integrating this on-device needs to know:
 
 2. **Calibration data matters.** The default int8 PTQ uses ONE
    random-init synthetic frame (see `get_sample_input`). Real
-   deployment needs a representative calibration set (the agents
+   deployment needs a representative calibration set (the modelblaster
    flow's `--num-calibration` knob takes care of this once the
    harness has a dataset loader for it). Without calibration, the
    int8 accuracy degrades visibly; not catastrophic for detection
@@ -283,8 +283,8 @@ Anyone integrating this on-device needs to know:
 
 - Upstream YAML: `ultralytics/cfg/models/v8/yolov8.yaml`
 - Upstream layers: `ultralytics.nn.modules.{conv,block,head}`
-- Our model: `agents/models/yolov8_nano.py`
-- Example runner: `agents/examples/yolov8_nano/run.sh`
+- Our model: `modelblaster/models/yolov8_nano.py`
+- Example runner: `modelblaster/examples/yolov8_nano/run.sh`
 - BN-fold pass (where the 57 BatchNorm dispatches in the int8 IR get
-  collapsed for the fp32 path): `agents/pipeline/extract_graph.py`
-- IR + weights: `agents/examples/yolov8_nano/<quant>/generated/`
+  collapsed for the fp32 path): `modelblaster/pipeline/extract_graph.py`
+- IR + weights: `modelblaster/examples/yolov8_nano/<quant>/generated/`

@@ -15,7 +15,7 @@
 #
 # Each placement: rebuild harness_microros, run on FireSim, snapshot
 # uartlog to /tmp/microros_baseline_<tag>.log + into the example's
-# baselines/ dir. Plot afterwards via agents/scripts/plot_ros_trace.py.
+# baselines/ dir. Plot afterwards via modelblaster/scripts/plot_ros_trace.py.
 #
 # dronet runs on a 50ms timer; yolov8 is one-shot; the harness terminates
 # when yolov8 completes (matches the xpurt schedule's run window).
@@ -35,7 +35,7 @@ FIRESIM_TIMEOUT="${FIRESIM_TIMEOUT:-2400}"
 SPIKE_OK="${SPIKE_OK:-0}"   # if 1, also run on spike (for smoke)
 RUNNER="${RUNNER:-firesim}"
 
-BASELINES_DIR="${REPO_ROOT}/agents/examples/microros_demo/baselines"
+BASELINES_DIR="${REPO_ROOT}/modelblaster/examples/microros_demo/baselines"
 mkdir -p "${BASELINES_DIR}"
 
 # Each entry: tag : pin_backends_csv : pin_harts_csv
@@ -82,11 +82,11 @@ for entry in "${PLACEMENTS[@]}"; do
     PERIODS_MS=50,0 \
     MICROROS_BROKER_HART="${BROKER_HART}" \
     QUANT="${QUANT}" \
-    AGENTS_POOL_THREADS=1 \
+    MODELBLASTER_POOL_THREADS=1 \
     FORCE_REGEN="${FORCE_REGEN}" \
     RUNNER="${RUNNER}" \
     FIRESIM_TIMEOUT="${FIRESIM_TIMEOUT}" \
-    bash agents/examples/microros_demo/run.sh || rc=$?
+    bash modelblaster/examples/microros_demo/run.sh || rc=$?
 
     LOG_DST="${BASELINES_DIR}/${TAG}.uartlog.log"
     SRC_LOG="/scratch2/dima/chipyard-fsim/sims/firesim/firesim_rundir/sim_slot_0/uartlog"

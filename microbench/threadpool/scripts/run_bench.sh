@@ -33,21 +33,21 @@ case "${RUNNER}" in
 esac
 
 TAG="${BENCH}_${VARIANT}_${RUNNER}"
-BUILD_DIR="agents/microbench/threadpool/build/${TAG}"
+BUILD_DIR="modelblaster/microbench/threadpool/build/${TAG}"
 
 WEST_ARGS=( "-DBENCH_TARGET=${BENCH}" )
 if [[ "${BENCH}" == "pthreadpool" ]]; then
     WEST_ARGS+=( "-DBENCH_PTHREADPOOL_VARIANT=${VARIANT}" )
 fi
 if [[ "${RUNNER}" == "firesim" ]]; then
-    WEST_ARGS+=( "-DEXTRA_CONF_FILE=${REPO_ROOT}/agents/harness/backends/firesim_chipyard.conf" )
+    WEST_ARGS+=( "-DEXTRA_CONF_FILE=${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf" )
 fi
 
 if [[ "${SKIP_BUILD:-0}" == "1" && -f "${BUILD_DIR}/zephyr/zephyr.elf" ]]; then
     echo "[microbench] SKIP_BUILD=1 — reusing ${BUILD_DIR}/zephyr/zephyr.elf"
 else
     echo "[microbench] west build BENCH=${BENCH} VARIANT=${VARIANT} RUNNER=${RUNNER}"
-    west build -p -b "${BOARD}" agents/microbench/threadpool \
+    west build -p -b "${BOARD}" modelblaster/microbench/threadpool \
         --build-dir "${BUILD_DIR}" -- "${WEST_ARGS[@]}"
 fi
 
@@ -78,7 +78,7 @@ case "${RUNNER}" in
             echo "  ... another FireSim run active; sleeping 30s"
             sleep 30
         done
-        python3 "${REPO_ROOT}/agents/microbench/threadpool/scripts/run_firesim_bench.py" \
+        python3 "${REPO_ROOT}/modelblaster/microbench/threadpool/scripts/run_firesim_bench.py" \
             --elf "${ELF}" \
             --firesim-root "${FIRESIM_ROOT}" \
             --firesim-env "${FIRESIM_ENV}" \
@@ -91,7 +91,7 @@ esac
 
 # For spike, parse out the THREADPOOL_BENCH_{BEGIN,END} block.
 if [[ "${RUNNER}" == "spike" ]]; then
-    python3 "${REPO_ROOT}/agents/microbench/threadpool/scripts/parse_log.py" \
+    python3 "${REPO_ROOT}/modelblaster/microbench/threadpool/scripts/parse_log.py" \
         --raw "${RAW_LOG}" --out "${CSV_OUT}"
 fi
 

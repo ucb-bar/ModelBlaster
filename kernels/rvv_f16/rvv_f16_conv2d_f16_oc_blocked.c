@@ -48,7 +48,7 @@
  *
  * For 3×3 convs the input slice is shared across kh×kw=9 macc'd taps
  * per output element, so the input-reload reduction is less impactful;
- * the widening kernel may still win on those. The agents picker
+ * the widening kernel may still win on those. The modelblaster picker
  * keeps both registered as algorithm candidates and uses the
  * fastest-verifying option per spec — leave the widening kernel as
  * the queue's first entry so it's tried first; the oc_blocked file
