@@ -1820,6 +1820,36 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     argtypes_factory=_conv2d_s8_argtypes,
     algorithms=[
         AlgorithmCandidate(
+            name="indir_gemm",
+            target_affinity=("rvv_opu",),
+            description=(
+                "Saturn OPU indirect-GEMM conv2d_s8 (XNNPACK-style).\n"
+                "Maps conv onto the OPU outer-product MAC by addressing\n"
+                "the input tensor in its native [N,IC,IH,IW] layout via\n"
+                "a per-tile indirection pointer array — no im2col data\n"
+                "duplication.\n\n"
+                "ALGORITHM:\n"
+                "  outer (n, oh, ow_tile in OW step OW_BLK=mlmax):\n"
+                "    build indir[KH*KW][OW_BLK]: ptr to IC slice or zero_buf\n"
+                "    for oc_tile in OC step mlmax:\n"
+                "      OPMVINBCAST m1 <- bias[oc_tile..+mlmax] (padded)\n"
+                "      for (kh, kw, ic) in K-reduction:\n"
+                "        vs1 = gather i8 lanes from indir[kk][p]+ic (1 per pixel)\n"
+                "        vs2 = vlse8 weight[oc_tile..+mlmax, ic, kh, kw]\n"
+                "        VOPACC m1, vs2, vs1\n"
+                "      drain m1 rows, Q0.31 requantize, i8 store with OC stride\n\n"
+                "Indirection is per-tile (~KH*KW*mlmax pointers, stack-safe).\n"
+                "Padded entries point at a static __opu_zero_buf so vluxei\n"
+                "gathers zeros and VOPACC contributes nothing — branch-free.\n"
+                "Symmetric quant only; falls back to scalar reference for\n"
+                "asymmetric quant or shapes that exceed scratch caps.\n\n"
+                "See agents/notes/opu_indirect_gemm_design.md for the\n"
+                "compile-time-indirection follow-up (Option A) once the\n"
+                "skeleton supports per-algorithm signatures."
+            ),
+            reference_impl="",  # the curated file supplies the impl
+        ),
+        AlgorithmCandidate(
             name="direct",
             # Same nested-loop math as the spec's reference_impl (verify
             # oracle); reads weights from whichever layout the codegen
