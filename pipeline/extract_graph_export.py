@@ -1,4 +1,4 @@
-"""Export-based graph extractor for agents pipeline.
+"""Export-based graph extractor for modelblaster pipeline.
 
 Companion to ``extract_graph.py`` (FX-based). Use this path when
 ``torch.fx.symbolic_trace`` can't trace the model — e.g. ViNT, which
@@ -18,7 +18,7 @@ Two execution modes:
 Usage:
 
     conda activate xpurt   # ViNT/efficientnet deps live here
-    PYTHONPATH=. python -m agents.pipeline.extract_graph_export \\
+    PYTHONPATH=. python -m modelblaster.pipeline.extract_graph_export \\
         --model vint --quant int8 --out-dir <out-dir>
 
 Run via the ``xpurt`` env so the vendored vint_train + efficientnet
@@ -41,7 +41,7 @@ import torch
 # Reuse the scale + capture helpers + IR conventions from the FX-based
 # extractor. Keeps the on-disk format identical (downstream codegen +
 # verify don't have to know which extractor produced the IR).
-from agents.pipeline.extract_graph import (  # noqa: E402
+from modelblaster.pipeline.extract_graph import (  # noqa: E402
     _annotate_dispatches,
     _CaptureTensors,
     _INT8_RANGE,  # noqa: F401  — used implicitly via _scale_from_max_abs
@@ -71,7 +71,7 @@ _SUPPORTED_COMPUTE = {
 # New compute ops we identified for ViNT. The extractor emits IR
 # records for these so the downstream skeleton/codegen pipeline can
 # wire them up incrementally. Kernels are added op-by-op in follow-ups
-# (see agents/notes/vint_zephyr_plan.md §B for the order).
+# (see modelblaster/notes/vint_zephyr_plan.md §B for the order).
 _NEW_COMPUTE = {
     "mul.Tensor":                  "mul_s8",
     "sigmoid.default":             "sigmoid_s8",
@@ -189,7 +189,7 @@ def _print_inventory(graph_module, out_dir: Path):
 
 class _ExportWalker:
     """Walk an aten-level fx Graph (from ``torch.export``) and emit the
-    agents IR records (one per supported op kind).
+    modelblaster IR records (one per supported op kind).
 
     Conventions match ``extract_graph.py::extract_int8``:
     * per-tensor symmetric quant (zero_point = 0)
@@ -219,7 +219,7 @@ class _ExportWalker:
         #            carry "_f16" suffix, no scale/multiplier/shift)
         # Mixed-precision overrides live in self.op_precision[node.name];
         # ops without an entry use self.default_quant. See
-        # agents/notes/mixed_precision_plan.md.
+        # modelblaster/notes/mixed_precision_plan.md.
         if quant not in ("int8", "fp16"):
             raise ValueError(f"quant must be 'int8' or 'fp16' (got {quant!r})")
         self.default_quant = quant
@@ -266,7 +266,7 @@ class _ExportWalker:
     #                outlier-sensitive)
     #   * percentile — scale = quantile(|t|, p) / 127  (clips outliers,
     #                better typical-range precision)
-    # The percentile mode is controlled by AGENTS_ACT_PERCENTILE env
+    # The percentile mode is controlled by MODELBLASTER_ACT_PERCENTILE env
     # var (e.g. 99.99 for 99.99th percentile). Defaults to None
     # (max_abs).
     # ------------------------------------------------------------------
@@ -291,7 +291,7 @@ class _ExportWalker:
 
     def calibrate(self):
         import os as _os
-        pct_env = _os.environ.get("AGENTS_ACT_PERCENTILE", "")
+        pct_env = _os.environ.get("MODELBLASTER_ACT_PERCENTILE", "")
         pct = float(pct_env) if pct_env else None
         max_abs: dict[str, float] = {}
         # When percentile mode is active, accumulate sorted samples of
@@ -412,7 +412,7 @@ class _ExportWalker:
     # a cast_<i8_to_f16|f16_to_i8> op before the consumer. Mixed
     # precision becomes a property of the assembled IR; per-op emit code
     # stays single-precision-per-op.
-    # See agents/notes/mixed_precision_plan.md.
+    # See modelblaster/notes/mixed_precision_plan.md.
     # ------------------------------------------------------------------
     def insert_casts(self):
         def consumer_dtype(op) -> str:
@@ -1841,7 +1841,7 @@ def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
 
 def _import_model_module(name: str):
     if name == "vint":
-        from agents.models import vint as model_mod
+        from modelblaster.models import vint as model_mod
     else:
         raise SystemExit(
             f"--model {name} doesn't need extract_graph_export; "
@@ -1873,7 +1873,7 @@ def main():
                         "models — recommended for any int8 deployment.")
     p.add_argument("--inspect", default="",
                    help="Comma list of tensor names to dump at runtime "
-                       "(AGENTS_INSPECT_BEGIN/END blocks in stdout, one "
+                       "(MODELBLASTER_INSPECT_BEGIN/END blocks in stdout, one "
                        "ASCII int per line, plus a scale= header so the "
                        "host can dequantize). Useful for staged accuracy "
                        "debugging: see which intermediate first diverges "
@@ -1928,7 +1928,7 @@ def main():
     # Multi-sample calibration. The model module declares a
     # *calibration spec* (the canonical, reproducible source-of-truth
     # for where activation scales come from). The spec gets resolved
-    # via agents.datasets.materialize_calibration_samples and
+    # via modelblaster.datasets.materialize_calibration_samples and
     # serialized into the generated/ dir for later reference. If the
     # model doesn't ship a spec yet, fall back to its
     # get_calibration_samples helper, then finally the single trace
@@ -1941,7 +1941,7 @@ def main():
     mod = _import_model_module(args.model)
     if args.num_calibration > 1:
         if hasattr(mod, "get_calibration_spec"):
-            from agents.datasets import materialize_calibration_samples  # noqa: PLC0415
+            from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
             calib_spec = mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_export] resolving calibration spec "
                   f"({args.num_calibration} samples) ...", flush=True)

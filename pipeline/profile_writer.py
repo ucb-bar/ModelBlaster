@@ -6,7 +6,7 @@ see e.g.
         dronet_spacemit_x60_RVV_dronet.q.int8/topo_0_1_2_3/results.csv
 
 This module produces a CSV of the same shape from any per-op timing
-source so XPU-RT can ingest data from our agents flow on spike today,
+source so XPU-RT can ingest data from our modelblaster flow on spike today,
 and from FireSim or RTL sim runs later, without changing format. The
 provenance is encoded in:
 

@@ -1,8 +1,8 @@
-# Plan — ViNT on the Zephyr/agents flow
+# Plan — ViNT on the Zephyr/modelblaster flow
 
 Goal: take the same ViNT checkpoint we validated in IsaacLab
 (`sims/scripts/pilot/pilot_forest_with_vint.py`) and run it under the
-agents pipeline on FireSim Saturn-Gemmini-Q31, eventually scheduled
+modelblaster pipeline on FireSim Saturn-Gemmini-Q31, eventually scheduled
 alongside the existing dronet/yolov8/mlp_control workloads.
 
 ## 0. What ViNT actually is
@@ -28,7 +28,7 @@ So we already have a bit-exact int8 golden and the calibration pipeline.
 
 ## 1. Missing ops in our pipeline today
 
-`agents/pipeline/extract_graph.py` + `reference_kernels.py` +
+`modelblaster/pipeline/extract_graph.py` + `reference_kernels.py` +
 `verify_kernel.py` cover the dronet/yolov8/mlp_control op set. ViNT adds:
 
 | op | source | first appears in | priority | notes |
@@ -50,7 +50,7 @@ P2 = nice-to-have.
 
 ## 2. Phased delivery
 
-### Phase A — Get the model into the agents IR (no kernel work yet)
+### Phase A — Get the model into the modelblaster IR (no kernel work yet)
 
 **Source-of-truth decision.** The published `vint_int8.onnx` is QDQ:
 int8 values flow between ops, but inside each op the compute typically
@@ -102,7 +102,7 @@ Steps:
    Won't be bit-exact (different quant rounding, possibly different
    per-tensor scales) but should be small. Useful sanity step.
 
-Exit criterion: `agents/examples/vint/int8/generated/scalar/graph.json`
+Exit criterion: `modelblaster/examples/vint/int8/generated/scalar/graph.json`
 exists, lists only the ops in §1, and a fresh `BACKEND=reference`
 spike run matches PyTorch waypoint MAE within a small tolerance.
 
@@ -110,16 +110,16 @@ spike run matches PyTorch waypoint MAE within a small tolerance.
 
 For each P0 op (depthwise conv, gap, sigmoid, mul, matmul, softmax):
 
-1. Reference impl in `agents/pipeline/reference_kernels.py` (numpy
+1. Reference impl in `modelblaster/pipeline/reference_kernels.py` (numpy
    ground truth + atol_class registration).
-2. Verify input/output generators in `agents/pipeline/verify_kernel.py`.
-3. Skeleton emitter snippet in `agents/pipeline/generate_skeleton.py`
+2. Verify input/output generators in `modelblaster/pipeline/verify_kernel.py`.
+3. Skeleton emitter snippet in `modelblaster/pipeline/generate_skeleton.py`
    for the universal-direct scalar kernel.
 4. Spike harness verify against onnxruntime golden, per op shape that
    actually appears in ViNT (extract the shape set from §A.3).
 
 Exit criterion: `BACKEND=reference QUANT=int8 bash
-agents/examples/vint/run.sh` produces a `PASS` on spike with
+modelblaster/examples/vint/run.sh` produces a `PASS` on spike with
 `max_abs_err ≤ atol_class`.
 
 ### Phase C — Curated kernels for FireSim performance
@@ -145,7 +145,7 @@ appears in ViNT.
 
 ### Phase D — Single-model harness on FireSim
 
-1. Add `agents/examples/vint/` with `run.sh` (mirror dronet's pattern).
+1. Add `modelblaster/examples/vint/` with `run.sh` (mirror dronet's pattern).
 2. **Memory layout.** 26 MB int8 weights + worst-case activations
    (~6 MB for the 7-frame EfficientNet stack + 4 transformer layers)
    need `CONFIG_HEAP_MEM_POOL_SIZE` ≈ 40 MB. Saturn FireSim's DDR is
@@ -161,7 +161,7 @@ appears in ViNT.
    dronet/yolov8 today: `results.csv` per backend+target).
 
 Exit criterion: `RUNNER=firesim TARGET=gemmini_q31 QUANT=int8 bash
-agents/examples/vint/run.sh` produces a clean trace + matches the
+modelblaster/examples/vint/run.sh` produces a clean trace + matches the
 onnxruntime int8 golden within atol.
 
 ### Phase E — Multi-model + scheduler integration
@@ -176,7 +176,7 @@ onnxruntime int8 golden within atol.
    are the interesting placement decision — gemmini is bit-exact via
    `tiled_matmul_auto(full_C=true)` but startup cost dominates for
    small per-head dimensions; RVV wins below a threshold.
-3. Run via `agents/examples/xpurt_demo/run.sh` with the new spec.
+3. Run via `modelblaster/examples/xpurt_demo/run.sh` with the new spec.
 4. Compare against a fixed-pinning microros baseline (mirror the
    existing dronet/yolov8/mlp_control comparison in `ROS_FLOW.md`).
 
@@ -202,7 +202,7 @@ end-to-end runtime + a meaningful speedup over the pinned baseline.
 | Inputs from host (pre-stacked 18ch) or rolling on-target? | **Pre-stacked first; rolling later.** | Decouples model bring-up from the runtime state plumbing. The rolling buffer is a runtime feature, not a model feature. |
 | EfficientNet on gemmini or RVV? | **Mostly RVV (depthwise-heavy).** | Gemmini wins on dense conv2d but loses on depthwise (no reduction → poor utilization). Pointwise (1×1) is fine on either. Let the scheduler pick. |
 | matmul_s8 for attention on gemmini or RVV? | **Both, scheduler picks.** | gemmini_q31 has a bit-exact `tiled_matmul_auto(full_C=true)` path already proven on yolov8; competitive once M ≥ 32. RVV wins at small head_dim. |
-| Cross-frame rolling buffer in `agents_pool` or in harness? | **Harness.** | This is application state, not a kernel concern. Keep `agents_pool` model-agnostic. |
+| Cross-frame rolling buffer in `modelblaster_pool` or in harness? | **Harness.** | This is application state, not a kernel concern. Keep `modelblaster_pool` model-agnostic. |
 
 ## 4. Risks
 
@@ -247,13 +247,13 @@ E + F.
 
 ## 6. Where each artifact will live
 
-* `agents/examples/vint/` — example dir (run.sh, fp32/, int8/)
-* `agents/pipeline/extract_graph_onnx.py` — new ONNX ingest
-* `agents/pipeline/reference_kernels.py` — new ref impls (extend)
-* `agents/pipeline/verify_kernel.py` — new input/output gens (extend)
-* `agents/pipeline/generate_skeleton.py` — new op snippets (extend)
-* `agents/kernels/rvv/rvv_{depthwise_conv2d,gap,sigmoid,mul,matmul,softmax,layernorm}_s8_direct.c`
-* `agents/kernels/gemmini_q31/gemmini_q31_matmul_s8_*.c` (and any
+* `modelblaster/examples/vint/` — example dir (run.sh, fp32/, int8/)
+* `modelblaster/pipeline/extract_graph_onnx.py` — new ONNX ingest
+* `modelblaster/pipeline/reference_kernels.py` — new ref impls (extend)
+* `modelblaster/pipeline/verify_kernel.py` — new input/output gens (extend)
+* `modelblaster/pipeline/generate_skeleton.py` — new op snippets (extend)
+* `modelblaster/kernels/rvv/rvv_{depthwise_conv2d,gap,sigmoid,mul,matmul,softmax,layernorm}_s8_direct.c`
+* `modelblaster/kernels/gemmini_q31/gemmini_q31_matmul_s8_*.c` (and any
   other gemmini-friendly ones)
 * `data/toplevel/networks_vint_dronet_mlp_firesim.json` — Phase E spec
 * `docs/end_to_end_xpurt_firesim.md` — add ViNT to the list of

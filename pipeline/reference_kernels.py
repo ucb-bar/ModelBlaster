@@ -1744,7 +1744,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
      * (generate_skeleton.py::_backend_pack_weight) so the gemmini ROCC
      * kernel can pass the blob straight into tiled_conv_auto without
      * a per-call transpose. backends.py wires
-     * AGENTS_GEMMINI_HWIO_WEIGHTS=1 into kernel_cflags only for the
+     * MODELBLASTER_GEMMINI_HWIO_WEIGHTS=1 into kernel_cflags only for the
      * gemmini backend; all other backends keep PyTorch OIHW. */
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
@@ -1776,7 +1776,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                     in_v = (int32_t)input[(in_row_base + ih) * IW + iw]
                                          + input_offset;
                                 }
-#if defined(AGENTS_GEMMINI_HWIO_WEIGHTS) || defined(AGENTS_RVV_IHWOC_WEIGHTS)
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
                                             + filter_offset;
 #else
@@ -1843,7 +1843,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "gathers zeros and VOPACC contributes nothing — branch-free.\n"
                 "Symmetric quant only; falls back to scalar reference for\n"
                 "asymmetric quant or shapes that exceed scratch caps.\n\n"
-                "See agents/notes/opu_indirect_gemm_design.md for the\n"
+                "See modelblaster/notes/opu_indirect_gemm_design.md for the\n"
                 "compile-time-indirection follow-up (Option A) once the\n"
                 "skeleton supports per-algorithm signatures."
             ),
@@ -1853,7 +1853,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             name="direct",
             # Same nested-loop math as the spec's reference_impl (verify
             # oracle); reads weights from whichever layout the codegen
-            # produces (OIHW or HWIO via #ifdef AGENTS_GEMMINI_HWIO_WEIGHTS)
+            # produces (OIHW or HWIO via #ifdef MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
             # but the arithmetic is bit-for-bit identical.
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
@@ -1897,7 +1897,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                          + input_offset;
                                 }
 
-#if defined(AGENTS_GEMMINI_HWIO_WEIGHTS) || defined(AGENTS_RVV_IHWOC_WEIGHTS)
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
                                             + filter_offset;
 #else
@@ -2415,7 +2415,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "  * Requantize is float-scale (gemmini's mvout-with-scale, "
                 "    derived from output_multiplier/output_shift via "
                 "    ldexpf) — accepts ~1-3 LSB drift vs the Q0.31 "
-                "    PyTorch golden. See agents/notes/gemmini_extension_"
+                "    PyTorch golden. See modelblaster/notes/gemmini_extension_"
                 "    plan.md 'Requantize tail' section.\n"
                 "  * activation_min == 0 enables gemmini's RELU; "
                 "    activation_max is implicit (int8 saturate inside "
@@ -2621,7 +2621,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             weight_layout="hwio",
             # CPU im2col + tiled_matmul_auto(full_C=true) raw int32 mvout +
             # scalar two-stage Q0.31 requantize on the host. Matches the
-            # TFLite/agents reference math element-for-element.
+            # TFLite/modelblaster reference math element-for-element.
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "im2col + tiled_matmul_auto(full_C=true) + scalar Q0.31 "
@@ -3065,12 +3065,12 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
             # Gemmini's tiled_resadd_auto: C[i] = sat_int8(round(A_scale*A[i]
             # + B_scale*B[i]) * C_scale) with optional fused ReLU. Same
             # mvin float-scale path as conv2d's mvin_scale; no Q0.31 drift
-            # vs the float reference because the agents add_s8 reference
+            # vs the float reference because the modelblaster add_s8 reference
             # is itself a float computation.
             accuracy_class=AccuracyClass.NUMERIC_DRIFT,
             description=(
                 "Route the elementwise add through Gemmini's "
-                "tiled_resadd_auto. Maps the agents add_s8 contract "
+                "tiled_resadd_auto. Maps the modelblaster add_s8 contract "
                 "(output = round((a*scale_a + b*scale_b) / scale_out), "
                 "clamp [activation_min, activation_max]) to gemmini's "
                 "A_scale = scale_a/scale_out, B_scale = scale_b/scale_out, "
@@ -4409,7 +4409,7 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
 # Mixed-precision cast kernels — i8↔f16 boundaries inserted by the
 # walker's auto-cast pass when a fp16 op consumes an int8-produced
 # tensor (or vice versa). Scale is the int8 tensor's per-tensor scale
-# (precomputed at calibration time). See agents/notes/mixed_precision_plan.md.
+# (precomputed at calibration time). See modelblaster/notes/mixed_precision_plan.md.
 # ---------------------------------------------------------------------------
 
 def _cast_i8_to_f16_argtypes():
@@ -6060,7 +6060,7 @@ MATMUL_S8 = KernelSpec(
         "  output[i,j] = clamp(\n"
         "      round(acc * scale_a * scale_b / (scale_out * scale_div)),\n"
         "      activation_min, activation_max)\n"
-        "Float math is used for the requantize tail to match the agents\n"
+        "Float math is used for the requantize tail to match the modelblaster\n"
         "linear_s8 numerics; the curated gemmini_q31 / RVV kernels can\n"
         "implement the Q0.31 path bit-exactly."
     ),
@@ -6792,7 +6792,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "matmul_s8_pc": MATMUL_S8_PC,
     # Application-specific composite ops. The op-kind family
     # "app_op_<name>" is reserved for these — codegen looks up the
-    # implementation either in agents/kernels/<backend>/<op>.c (curated)
+    # implementation either in modelblaster/kernels/<backend>/<op>.c (curated)
     # or generates it via the LLM path using the semantics block in
     # the IR record. Stock impls below cover the common patterns; a
     # model-specific spec can override by registering with the same

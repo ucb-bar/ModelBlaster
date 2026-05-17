@@ -1,4 +1,4 @@
-"""YOLOv8-nano wrapper for the agents flow.
+"""YOLOv8-nano wrapper for the modelblaster flow.
 
 Pure-PyTorch reimplementation of the ultralytics YOLOv8n architecture
 that traces cleanly through torch.fx.symbolic_trace. The original
@@ -21,9 +21,9 @@ backbone/neck channel counts are identical; head re-init to a smaller
 `nc` would be a fine-tune-time concern, out of scope here.
 
 Env knobs:
-  AGENTS_YOLOV8N_INPUT       default 160 (must be a multiple of 32)
-  AGENTS_YOLOV8N_NC          default 80 (COCO classes)
-  AGENTS_YOLOV8N_PRETRAINED  default 1 (load yolov8n.pt; 0 → random init)
+  MODELBLASTER_YOLOV8N_INPUT       default 160 (must be a multiple of 32)
+  MODELBLASTER_YOLOV8N_NC          default 80 (COCO classes)
+  MODELBLASTER_YOLOV8N_PRETRAINED  default 1 (load yolov8n.pt; 0 → random init)
 """
 
 from __future__ import annotations
@@ -330,7 +330,7 @@ def _load_ultralytics_weights(model: YOLOv8Nano) -> int:
     except ImportError as e:
         raise RuntimeError(
             "ultralytics not installed. `pip install ultralytics` and retry, "
-            "or set AGENTS_YOLOV8N_PRETRAINED=0 to use random init."
+            "or set MODELBLASTER_YOLOV8N_PRETRAINED=0 to use random init."
         ) from e
     yolo = YOLO("yolov8n.pt")
     src_state = yolo.model.state_dict()
@@ -354,19 +354,19 @@ def _load_ultralytics_weights(model: YOLOv8Nano) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Module entry points (matching the agents/models/<x>.py interface)
+# Module entry points (matching the modelblaster/models/<x>.py interface)
 # ---------------------------------------------------------------------------
 
 
 def _cfg() -> tuple[int, int, bool]:
-    img = int(os.environ.get("AGENTS_YOLOV8N_INPUT", 160))
+    img = int(os.environ.get("MODELBLASTER_YOLOV8N_INPUT", 160))
     if img % 32 != 0:
         raise SystemExit(
-            f"AGENTS_YOLOV8N_INPUT={img} must be a multiple of 32 "
+            f"MODELBLASTER_YOLOV8N_INPUT={img} must be a multiple of 32 "
             f"(YOLOv8 stride-32 head requires it)."
         )
-    nc = int(os.environ.get("AGENTS_YOLOV8N_NC", 80))
-    pretrained = os.environ.get("AGENTS_YOLOV8N_PRETRAINED", "1") == "1"
+    nc = int(os.environ.get("MODELBLASTER_YOLOV8N_NC", 80))
+    pretrained = os.environ.get("MODELBLASTER_YOLOV8N_PRETRAINED", "1") == "1"
     return img, nc, pretrained
 
 
@@ -380,8 +380,8 @@ def get_model(seed: int = 0):
             # nc-dependent shape and would shape-mismatch. Refuse to silently
             # skip — force the user to acknowledge.
             raise SystemExit(
-                f"AGENTS_YOLOV8N_NC={nc} ≠ 80 with pretrained weights: cv3 "
-                f"head shapes don't match. Set AGENTS_YOLOV8N_PRETRAINED=0 "
+                f"MODELBLASTER_YOLOV8N_NC={nc} ≠ 80 with pretrained weights: cv3 "
+                f"head shapes don't match. Set MODELBLASTER_YOLOV8N_PRETRAINED=0 "
                 f"or fine-tune from a custom checkpoint (out of scope here)."
             )
         n = _load_ultralytics_weights(m)

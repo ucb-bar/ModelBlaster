@@ -36,12 +36,12 @@ class Backend:
     kernel_cflags: tuple[str, ...] = ()
     # Headers prepended to kernels.c above `#include "kernels.h"`.
     kernel_includes: tuple[str, ...] = ()
-    # Per-backend prj.conf overlay file under agents/harness/backends/.
+    # Per-backend prj.conf overlay file under modelblaster/harness/backends/.
     # Conventionally named "<name>.conf". Empty string means "no overlay".
     prj_conf_overlay: str = ""
     # Args appended to the spike command line (e.g. --isa=rv64gcv_zicntr).
     spike_args: tuple[str, ...] = ()
-    # Optimization guide markdown file under agents/pipeline/prompts/.
+    # Optimization guide markdown file under modelblaster/pipeline/prompts/.
     optimization_guide: str = "optimization_guide_scalar.md"
     # How verify is performed.
     verify_method: str = VERIFY_HOST_CTYPES
@@ -60,7 +60,7 @@ class Backend:
         """kernel_cflags with `<repo_root>` placeholders substituted.
 
         Used for backends that need an -isystem / -I path into the
-        vendored driver headers under agents/cores/<backend>/include/
+        vendored driver headers under modelblaster/cores/<backend>/include/
         — gemmini's the first one. The placeholder is intentional
         (over hardcoding `${REPO_ROOT}`-prefixed paths) so the
         Backend definition stays repo-relative and serializable.
@@ -87,7 +87,7 @@ RVV = Backend(
         # Tells universal (non-target-affined) algorithms that conv2d
         # weights are IHWOC-packed. Target-specific RVV algorithms
         # unconditionally assume IHWOC (declared via weight_layout field).
-        "-DAGENTS_RVV_IHWOC_WEIGHTS=1",
+        "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
     ),
     kernel_includes=("<riscv_vector.h>",),
     prj_conf_overlay="rvv.conf",
@@ -134,9 +134,9 @@ RVV_F16 = Backend(
 # top of the V opcode. Encoded as custom .insn r 0x57 ops (no extra
 # -march extension needed); the actual decode happens in Saturn HW via
 # the OuterProductSequencer / OuterProductUnit modules. See
-#   agents/cores/saturn_opu/include/saturn_opu.h
+#   modelblaster/cores/saturn_opu/include/saturn_opu.h
 # for the asm-macro programming model and
-#   agents/notes/saturn_opu_backend.md
+#   modelblaster/notes/saturn_opu_backend.md
 # for design notes and current status.
 #
 # Stage 1 is integer-only (i8 x i8 -> i32 accumulator via VOPACC). FP
@@ -172,10 +172,10 @@ RVV_OPU = Backend(
         # Vendored OPU header location. Same `<repo_root>` placeholder
         # convention as gemmini; resolved_kernel_cflags() substitutes
         # at build time.
-        "-isystem<repo_root>/agents/cores/saturn_opu/include",
+        "-isystem<repo_root>/modelblaster/cores/saturn_opu/include",
         # Marker for kernels that want to gate code on "OPU available".
-        "-DAGENTS_SATURN_OPU=1",
-        # NOTE: deliberately does NOT carry AGENTS_RVV_IHWOC_WEIGHTS
+        "-DMODELBLASTER_SATURN_OPU=1",
+        # NOTE: deliberately does NOT carry MODELBLASTER_RVV_IHWOC_WEIGHTS
         # forward from the plain rvv backend. That flag tells
         # universal (non-target-affined) kernels to assume IHWOC
         # packing, but the skeleton only packs weights when an
@@ -193,8 +193,8 @@ RVV_OPU = Backend(
     # hw/chipyard/toolchains/riscv-tools/riscv-isa-sim/customext/saturn_opu.cc.
     # `--extension=saturn_opu` loads the libcustomext.so that registers
     # VOPACC / OPMVINBCAST / VMV_VR / VMV_RV decoders. _run_lib.sh
-    # routes this backend at the OPU-built spike via AGENTS_OPU_SPIKE
-    # (mirror of AGENTS_GEMMINI_SPIKE).
+    # routes this backend at the OPU-built spike via MODELBLASTER_OPU_SPIKE
+    # (mirror of MODELBLASTER_GEMMINI_SPIKE).
     spike_args=("--extension=saturn_opu", "--isa=rv64gcv_zicntr"),
     optimization_guide="optimization_guide_rvv.md",
     verify_method=VERIFY_SPIKE_HARNESS,
@@ -207,12 +207,12 @@ RVV_OPU = Backend(
 #
 # kernel_cflags: rv64gc_zicntr (no V — gemmini ops are custom RoCC
 # instructions, not vector). The -isystem points at the vendored
-# headers under agents/cores/gemmini/include/. -DGEMMINI_ROCC tells
+# headers under modelblaster/cores/gemmini/include/. -DGEMMINI_ROCC tells
 # the gemmini.h header to take the RoCC code paths (vs ReRoCC).
 #
 # CMake substitutes `<repo_root>` at build time when injecting these
 # into the kernel TU's COMPILE_OPTIONS — see harness CMakeLists.txt
-# AGENTS_KERNEL_CFLAGS handling.
+# MODELBLASTER_KERNEL_CFLAGS handling.
 GEMMINI = Backend(
     name="gemmini",
     description=(
@@ -228,8 +228,8 @@ GEMMINI = Backend(
         #   .../        — so gemmini.h's `#include "include/gemmini_params.h"`
         #                 and `#include "rocc-software/src/xcustom.h"` resolve
         # The asymmetric layout is gemmini-rocc-tests' upstream convention.
-        "-isystem<repo_root>/agents/cores/gemmini/include",
-        "-isystem<repo_root>/agents/cores/gemmini",
+        "-isystem<repo_root>/modelblaster/cores/gemmini/include",
+        "-isystem<repo_root>/modelblaster/cores/gemmini",
         "-DGEMMINI_ROCC",
         "-DBAREMETAL",
         # Tells gemmini-target kernels — including the scalar reference
@@ -239,15 +239,15 @@ GEMMINI = Backend(
         # define, kernels read OIHW and produce garbage when handed an
         # HWIO blob. Other backends (scalar/rvv) leave weights in OIHW,
         # so the define is gemmini-only.
-        "-DAGENTS_GEMMINI_HWIO_WEIGHTS=1",
+        "-DMODELBLASTER_GEMMINI_HWIO_WEIGHTS=1",
     ),
     kernel_includes=("\"gemmini.h\"",),
     prj_conf_overlay="gemmini.conf",
     # Chipyard's spike with --extension=gemmini decodes the custom RoCC
     # opcode (XCUSTOM_ACC=3) and routes the instructions through
-    # libgemmini.so. The agents-flow spike binary doesn't ship that
+    # libgemmini.so. The modelblaster-flow spike binary doesn't ship that
     # extension; spike_runner.py picks the chipyard spike via
-    # AGENTS_GEMMINI_SPIKE env when this backend is selected.
+    # MODELBLASTER_GEMMINI_SPIKE env when this backend is selected.
     spike_args=("--extension=gemmini", "--isa=rv64gc_zicntr"),
     optimization_guide="optimization_guide_scalar.md",
     verify_method=VERIFY_SPIKE_HARNESS,
@@ -257,7 +257,7 @@ GEMMINI = Backend(
     # The legacy gemmini_tiled_conv algorithm uses float-scale mvout and
     # drifts ~6 LSBs through dronet's 9 conv layers; atol=8 covers that
     # path if it gets picked by the cache probe. See
-    # agents/notes/gemmini_extension_plan.md "Stage 1.5" section.
+    # modelblaster/notes/gemmini_extension_plan.md "Stage 1.5" section.
     atol_override=8.0,
     rtol_override=0.0,
 )
@@ -271,13 +271,13 @@ GEMMINI = Backend(
 # scale. See gemmini_q31_acc_scale_validated memory entry for status.
 #
 # To use:
-#   1. Replace agents/cores/gemmini/include/gemmini_params.h with the
-#      Q31-emitted header (agents/cores/gemmini/include/gemmini_params_q31.h
+#   1. Replace modelblaster/cores/gemmini/include/gemmini_params.h with the
+#      Q31-emitted header (modelblaster/cores/gemmini/include/gemmini_params_q31.h
 #      or copy from chipyard verilog gen output).
 #   2. cp libgemmini.so.q31 → libgemmini.so in the spike lib dir
-#      (or set AGENTS_GEMMINI_LIB_DIR to a dir that has libgemmini.so.q31
+#      (or set MODELBLASTER_GEMMINI_LIB_DIR to a dir that has libgemmini.so.q31
 #      renamed to libgemmini.so).
-#   3. TARGET=gemmini_q31 agents/examples/<m>/run.sh ...
+#   3. TARGET=gemmini_q31 modelblaster/examples/<m>/run.sh ...
 GEMMINI_Q31 = Backend(
     name="gemmini_q31",
     description=(
@@ -289,7 +289,7 @@ GEMMINI_Q31 = Backend(
         # Tells gemmini_conv2d_s8_gemmini_tiled_conv.c to fold (mult, shift)
         # into a single Q0.31 scale instead of computing a float scale via
         # ldexpf. Required when acc_scale_t is int32 (Q31 gemmini config).
-        "-DAGENTS_GEMMINI_Q31_ACC_SCALE=1",
+        "-DMODELBLASTER_GEMMINI_Q31_ACC_SCALE=1",
     ),
     kernel_includes=GEMMINI.kernel_includes,
     prj_conf_overlay=GEMMINI.prj_conf_overlay,

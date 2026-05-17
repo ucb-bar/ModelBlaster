@@ -12,14 +12,14 @@ layer; this isn't.
 
 ## What we already have that's reusable
 
-- **Per-target kernel codegen** in `agents/pipeline/reference_kernels.py`
+- **Per-target kernel codegen** in `modelblaster/pipeline/reference_kernels.py`
   — already structured around `(op, target)` seeds. Adding `gemmini`
   is a new column.
-- **Per-target Kconfig overlays** at `agents/harness/backends/<bs>.conf`
+- **Per-target Kconfig overlays** at `modelblaster/harness/backends/<bs>.conf`
   — same shape as `rvv.conf` and `scalar.conf`.
-- **Per-target build metadata** in `agents/pipeline/backends.py`
+- **Per-target build metadata** in `modelblaster/pipeline/backends.py`
   (compile flags, spike args). Adding gemmini = one new entry.
-- **Heterogeneous core registry** — `agents/cores/chipyard_hetero_example.json`
+- **Heterogeneous core registry** — `modelblaster/cores/chipyard_hetero_example.json`
   already declares a `gemmini0` core with `kind="gemmini"` and
   capabilities `["linear_s8", "conv2d_s8"]`. So the **scheduling**
   side already knows how to route a dispatch to Gemmini; what's
@@ -36,7 +36,7 @@ The headers (`gemmini_params.h`, etc.) are auto-generated per-config
 by chipyard's gen step. Proposed shape:
 
 ```
-agents/cores/gemmini/<config>.json
+modelblaster/cores/gemmini/<config>.json
 {
   "name":           "saturn_ws_int8_16x16_rocc",
   "dim":            16,
@@ -98,9 +98,9 @@ core path is proven.
 **Stage 1 — RoCC scalar Gemmini path through the pipeline (2–3 weeks)**
 - Pick one chipyard config: e.g. `saturn_ws_int8_16x16_rocc`. Vendor
   its `gemmini_params.h` + tiled lib into
-  `agents/runtime/gemmini/<config>/`.
+  `modelblaster/runtime/gemmini/<config>/`.
 - Add `target=gemmini_<config>` to `backends.py`; new Kconfig overlay
-  at `agents/harness/backends/gemmini.conf`.
+  at `modelblaster/harness/backends/gemmini.conf`.
 - Reference kernels for `linear_s8` and `conv2d_s8` using
   `tiled_matmul_auto` / `tiled_conv_auto`. PyTorch goldens already
   exist (we have int8 dronet + mlp_generic).
@@ -112,7 +112,7 @@ core path is proven.
 - Same kernels.c source, two configs (e.g. 8×8 vs 16×16, both WS
   int8 RoCC). Confirms the include-path / lib-swap is the only delta.
 - Add config descriptor schema + loader
-  (`agents/pipeline/gemmini_configs.py`).
+  (`modelblaster/pipeline/gemmini_configs.py`).
 
 **Stage 3 — FireSim integration with the existing xpurt schedule (1–2 weeks)**
 - Build a chipyard FireSim hwconfig with one Gemmini per rocket
@@ -159,7 +159,7 @@ core path is proven.
 ## Requantize tail — float-scale today, fixed-point shift is a different bitstream
 
 The default chipyard integer Gemmini config (the one we vendored under
-`agents/cores/gemmini/`) has `acc_scale_t = float` — see the
+`modelblaster/cores/gemmini/`) has `acc_scale_t = float` — see the
 `ACC_SCALE_T_IS_FLOAT` marker in `gemmini_params.h`. That means
 `tiled_conv_auto` and `tiled_matmul_auto` apply requantize as a float
 multiply (`ROUND_NEAR_EVEN(acc * scale)` then int8 saturate) on
@@ -204,7 +204,7 @@ Backend's atol_override / rtol_override fields.
 - gemmini_im2col_full_C: 98,137 cycles (~10% slower)
 - Root cause of overhead: `gemmini_flush(0)` is called once per `DIM=16`-row tile to synchronize DMA writes to `ws_acc_out`. conv_modules.0 (M=3136) needs 196 such flushes; conv_modules.8 (M=16, 75% of total cycles) needs just 1.
 
-**Cache file**: `agents/examples/dronet/int8/cache/gemmini/gemmini_conv2d_s8_gemmini_im2col_full_C.c`
+**Cache file**: `modelblaster/examples/dronet/int8/cache/gemmini/gemmini_conv2d_s8_gemmini_im2col_full_C.c`
 
 **Pipeline integration**: `gemmini_im2col_full_C` is now registered as an `AlgorithmCandidate` in `CONV2D_S8` in `reference_kernels.py` with `target_affinity=("gemmini",)`. The structural validator in `generate_kernels.py` checks for `tiled_matmul_auto` (not `tiled_conv_auto`). The cache probe in `generate_one_llm` will prefer `gemmini_im2col_full_C` over `gemmini_tiled_conv` if both are cached and the cycle comparison favors it.
 
@@ -215,7 +215,7 @@ Backend's atol_override / rtol_override fields.
 
 ## Stage 1 bringup status (May 2026)
 
-**Structurally complete**: TARGET=gemmini routes through the agents
+**Structurally complete**: TARGET=gemmini routes through the modelblaster
 pipeline; kernels.c with `tiled_conv_auto` calls compiles and links
 under the vendored gemmini.h; the elf contains 9 custom-3 RoCC
 opcodes (verified via objdump search for `\.insn 4, 0x[0-9a-f]+07b`,
@@ -227,7 +227,7 @@ which is how the disassembler renders the custom-3 R-type opcode 0x07b
 ```
 $ /scratch2/dima/misc_sw/spike --extension=gemmini ...
 *** Booting Zephyr OS build ***
-agents harness: model=dronet in=37632 out=2
+modelblaster harness: model=dronet in=37632 out=2
 terminate called after throwing an instance of 'std::out_of_range'
   what():  vector::_M_range_check: __n (which is 4) >= this->size() (which is 4)
 Gemmini extension configured with:
@@ -259,7 +259,7 @@ on-spike validation:
 2. **Move to FireSim with a matched int8 DIM=16 RTL bitstream**.
    Unblocks Stage 3 anyway (real per-op cycles). Hours of bitstream
    build offline; we have machinery already from
-   `agents/validation/firesim_runner.py`.
+   `modelblaster/validation/firesim_runner.py`.
 
 3. **Switch the demo to fp32 DIM=4** to match the bundled
    libgemmini. Trivial pipeline-side (re-vendor the libgemmini headers,
@@ -347,7 +347,7 @@ utilization fast, but dronet doesn't go below.
    `min(M, K, N) < mesh_dim`, prefer a non-Gemmini machine. dronet
    doesn't trip this in practice but mobilenet_v2's depthwise convs
    would (K = KH·KW = 9 only). Easiest implementation: a
-   `min_matmul_dim` field in `agents/cores/<core>.json`.
+   `min_matmul_dim` field in `modelblaster/cores/<core>.json`.
 3. **The Plan-B firesim re-rank already handles the perf side.** If
    we keep `linear_s8` capability on gemmini0 and let the planner
    pick by profiled time, the firesim sweep will show `linear@M=1`

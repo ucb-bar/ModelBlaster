@@ -1,12 +1,12 @@
 # TCM-aware codegen — design note
 
-How to extend the agents flow so kernels and codegen can take advantage
+How to extend the modelblaster flow so kernels and codegen can take advantage
 of **tightly-coupled SW-managed memories** (TCMs / scratchpads) when
 the HW config exposes them.
 
 Today's flow assumes a single flat (cached) memory hierarchy. The
 existing `MemoryModel` dataclass in
-`agents/optimize/firesim_eval/cache_aware_prompt.py` describes cached
+`modelblaster/optimize/firesim_eval/cache_aware_prompt.py` describes cached
 L1/L2/DRAM and feeds the optimize-phase LLM prompt. That model is fine
 for FireSim quad-rocket-saturn, but breaks down for configs like:
 
@@ -15,7 +15,7 @@ for FireSim quad-rocket-saturn, but breaks down for configs like:
 - **KU040 scratchpad-only SoC** (no DDR; entire working set in BRAM-
   backed SRAM — see `notes/ku040_bitstream_plan.md`).
 - **Gemmini-style accelerator** (already has its own scratchpad + acc,
-  but the agents flow currently routes it via the vendored `gemmini.h`
+  but the modelblaster flow currently routes it via the vendored `gemmini.h`
   tiled-conv API, not as a generic TCM).
 
 The point of this note: design the *generic* TCM-awareness layer that
@@ -39,7 +39,7 @@ streams in once and gets reused over many output pixels, staging
 through TCM is the difference between a memory-bound kernel and a
 compute-bound one.
 
-The agents flow has two kinds of memory consumers that need TCM
+The modelblaster flow has two kinds of memory consumers that need TCM
 visibility independently:
 
 - **Curated / LLM-generated kernels** (compute-side reuse): the kernel
@@ -54,7 +54,7 @@ allocator. Treat as two independent slices.
 
 ## Layer 1: backend declaration
 
-Extend `agents/pipeline/backends.py::Backend` with an optional `tcm`
+Extend `modelblaster/pipeline/backends.py::Backend` with an optional `tcm`
 field describing the scratchpad:
 
 ```python
@@ -106,9 +106,9 @@ KU040_SRAM = TCMSpec(
 Plumbing: at codegen time the backend's `tcm` is propagated through
 `generate_skeleton.py` and `generate_kernels.py` as:
 
-1. A C macro `-DAGENTS_TCM_BASE=0x...`, `-DAGENTS_TCM_SIZE=...`, etc.
+1. A C macro `-DMODELBLASTER_TCM_BASE=0x...`, `-DMODELBLASTER_TCM_SIZE=...`, etc.
    exported via `Backend.kernel_cflags`. Curated kernels can `#ifdef
-   AGENTS_TCM_BASE` to gate their TCM-aware paths.
+   MODELBLASTER_TCM_BASE` to gate their TCM-aware paths.
 2. A Python-visible field that `generate_skeleton.py` reads when
    deciding whether to issue prefetch directives.
 
@@ -120,7 +120,7 @@ a `chosen { zephyr,sram-tcm = &tcm; }` style entry.
 
 For each backend with `tcm` set, the harness needs:
 
-1. **A devicetree fragment** at `agents/harness/backends/<name>.overlay`
+1. **A devicetree fragment** at `modelblaster/harness/backends/<name>.overlay`
    describing the TCM region with the correct base+size.
 2. **A linker symbol** `__tcm_start`, `__tcm_end` carved out by the
    linker so C code can refer to the region.
@@ -130,22 +130,22 @@ For each backend with `tcm` set, the harness needs:
 
 Existing precedent: gemmini's tiled scratchpad allocator is handled
 inside `gemmini.h` (private). The TCM allocator should mirror that
-pattern but live in `agents/harness/src/tcm_allocator.c`, shared
+pattern but live in `modelblaster/harness/src/tcm_allocator.c`, shared
 across kernels.
 
 ## Layer 3: TCM-aware kernel macros
 
-Curated kernels gate on the `AGENTS_TCM_BASE` define. The convention
+Curated kernels gate on the `MODELBLASTER_TCM_BASE` define. The convention
 for kernel sources:
 
 ```c
 #include "saturn_opu.h"
-#ifdef AGENTS_TCM_BASE
+#ifdef MODELBLASTER_TCM_BASE
   #include "tcm_allocator.h"
 #endif
 
 void kernel_linear_s8(...) {
-#ifdef AGENTS_TCM_BASE
+#ifdef MODELBLASTER_TCM_BASE
     /* Stage the per-call weight slice into TCM. */
     int8_t *w_tcm = (int8_t *)tcm_alloc(N * K * sizeof(int8_t));
     if (w_tcm) {
@@ -158,7 +158,7 @@ void kernel_linear_s8(...) {
     ...
     /* MAC body unchanged */
     ...
-#ifdef AGENTS_TCM_BASE
+#ifdef MODELBLASTER_TCM_BASE
     if (w_tcm) tcm_free(w_tcm);
 #endif
 }
@@ -175,7 +175,7 @@ void kernel_linear_s8(...) {
 
 For curated kernel authors the rule is: if your working set is bigger
 than L1 *and* TCM is large enough to fit it, prefer staging through
-TCM. The compile-time `#ifdef AGENTS_TCM_BASE` keeps the same source
+TCM. The compile-time `#ifdef MODELBLASTER_TCM_BASE` keeps the same source
 file working on TCM-less backends.
 
 ## Layer 4: skeleton-side scratchpad allocator (cross-kernel)
@@ -233,10 +233,10 @@ emits:
 
 Existing code paths that already exist as plumbing surfaces:
 
-- `agents/pipeline/generate_skeleton.py::_backend_pack_weight` is the
+- `modelblaster/pipeline/generate_skeleton.py::_backend_pack_weight` is the
   one place that decides weight tensor layout per-backend — extend
   alongside it to decide weight tensor *placement* per-backend.
-- `agents/harness/src/main.c` already understands extern-shared
+- `modelblaster/harness/src/main.c` already understands extern-shared
   buffers across the multi-net flow; extending to TCM-section
   externs is a one-line addition.
 
@@ -270,7 +270,7 @@ regenerate skeleton, profile again, compare.
 Today's XPURT scheduling assigns each entry to a core_kind (CPU_P,
 CPU_E, GEMMINI). Some core_kinds may have their own TCM. Extension:
 
-1. `agents/cores/<config>.json` core-registry entries gain an
+1. `modelblaster/cores/<config>.json` core-registry entries gain an
    optional `"tcm": {...}` block matching the `TCMSpec` Python shape:
    ```json
    {
@@ -284,7 +284,7 @@ CPU_E, GEMMINI). Some core_kinds may have their own TCM. Extension:
      }
    }
    ```
-2. `agents/pipeline/ingest_xpurt_schedule.py` plumbs the per-core
+2. `modelblaster/pipeline/ingest_xpurt_schedule.py` plumbs the per-core
    TCM spec into the per-entry codegen context. Kernel calls
    targeting a SHUTTLE_TCM-kind entry get `weight_ptr = tcm_ptr_X`,
    while kernel calls on CPU_E get the DRAM pointer.
@@ -331,10 +331,10 @@ Phase 1 (~1 day): backend-side declaration only.
   kernels using it yet.
 
 Phase 2 (~2 days): kernel-side macros.
-- `agents/cores/tcm/include/tcm_allocator.h` with `tcm_alloc /
+- `modelblaster/cores/tcm/include/tcm_allocator.h` with `tcm_alloc /
   tcm_free / memcpy_dma` (initially `memcpy` fallback).
 - One curated kernel (e.g. `rvv_linear_s8` with TCM staging) gated
-  on `AGENTS_TCM_BASE`.
+  on `MODELBLASTER_TCM_BASE`.
 - Verify correctness on spike (TCM region is just normal SRAM there).
 
 Phase 3 (~3 days): skeleton-side allocator.
@@ -348,7 +348,7 @@ Phase 4 (~2 days): profile-driven allocator.
 - Loop: flat profile → place → repacked profile → compare.
 
 Phase 5 (later): XPURT core-registry integration.
-- `agents/cores/<config>.json` entries carry TCM specs.
+- `modelblaster/cores/<config>.json` entries carry TCM specs.
 - Per-core TCM staging at harness startup.
 
 The first two phases are independently useful (a curated kernel can
@@ -381,9 +381,9 @@ we have a real config to validate against.
 
 ## References
 
-- Existing cache-only model: `agents/optimize/firesim_eval/cache_aware_prompt.py`
-- KU040 scratchpad-only SoC plan: `agents/notes/ku040_bitstream_plan.md`
+- Existing cache-only model: `modelblaster/optimize/firesim_eval/cache_aware_prompt.py`
+- KU040 scratchpad-only SoC plan: `modelblaster/notes/ku040_bitstream_plan.md`
 - Shuttle TCM declaration: `hw/chipyard/generators/saturn/chipyard/OPUConfigs.scala` (`OPUV128D64DualShuttleConfig`)
-- Gemmini's scratchpad (existing, accelerator-private model): `agents/notes/gemmini_extension_plan.md`
-- Multi-core core-registry format: `agents/notes/dispatch_and_cores.md`
-- IREE-shape profile schema: `agents/notes/profile_emission.md`
+- Gemmini's scratchpad (existing, accelerator-private model): `modelblaster/notes/gemmini_extension_plan.md`
+- Multi-core core-registry format: `modelblaster/notes/dispatch_and_cores.md`
+- IREE-shape profile schema: `modelblaster/notes/profile_emission.md`

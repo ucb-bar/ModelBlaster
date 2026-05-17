@@ -10,8 +10,8 @@ Two views:
     deciding how to place dispatches.
 
 Usage:
-  python -m agents.scripts.summarize_profile gen/profile
-  python -m agents.scripts.summarize_profile gen/profile --model mlp_control --backend scalar
+  python -m modelblaster.scripts.summarize_profile gen/profile
+  python -m modelblaster.scripts.summarize_profile gen/profile --model mlp_control --backend scalar
 """
 
 from __future__ import annotations

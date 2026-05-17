@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the agents_pool unit-test elf on FireSim, capture uartlog.
+"""Run the modelblaster_pool unit-test elf on FireSim, capture uartlog.
 
-Slim adaptation of agents/microbench/threadpool/scripts/run_firesim_bench.py.
-Polls the uartlog for the AGENTS_POOL_TEST_END marker (or PASS/FAIL line)
+Slim adaptation of modelblaster/microbench/threadpool/scripts/run_firesim_bench.py.
+Polls the uartlog for the MODELBLASTER_POOL_TEST_END marker (or PASS/FAIL line)
 and tears down. The caller (run_test.sh) is responsible for grepping the
 captured log for PASS/FAIL.
 """
@@ -112,8 +112,8 @@ def main() -> int:
             if len(text) != last_size:
                 last_size = len(text)
                 last_progress = time.monotonic()
-            if "=== AGENTS_POOL_TEST_END ===" in text:
-                print("firesim: agents_pool test end marker seen", flush=True)
+            if "=== MODELBLASTER_POOL_TEST_END ===" in text:
+                print("firesim: modelblaster_pool test end marker seen", flush=True)
                 break
             if (time.monotonic() - last_progress > 60.0
                     and last_size > 0):

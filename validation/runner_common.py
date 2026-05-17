@@ -3,19 +3,19 @@ Used by both the spike and firesim runners; the only thing each runner
 adds on top is *how* it gets the harness's stdout text.
 
 Markers (the agent harness prints these unchanged across simulators):
-    === AGENTS_VERIFY [<model>] === max_abs_err=<g> max_rel_err=<g> n=<int>
-    === AGENTS_PROFILE_BEGIN[<model>] ===
+    === MODELBLASTER_VERIFY [<model>] === max_abs_err=<g> max_rel_err=<g> n=<int>
+    === MODELBLASTER_PROFILE_BEGIN[<model>] ===
     dispatch_id,name,op,shape,cycles
     ...
-    === AGENTS_PROFILE_END  [<model>] ===
-    === AGENTS_WALL_CYCLES  [<model>] === <int>
+    === MODELBLASTER_PROFILE_END  [<model>] ===
+    === MODELBLASTER_WALL_CYCLES  [<model>] === <int>
 
 The single-model harness omits the [<model>] tag and emits one block of
 each kind. Multi-model harnesses tag every block.
 
-The legacy `=== AGENTS_OUTPUT_BEGIN [<model>] === / END ===` per-element
+The legacy `=== MODELBLASTER_OUTPUT_BEGIN [<model>] === / END ===` per-element
 output dump is still recognized for back-compat with older harness
-binaries, but the modern harness prints `AGENTS_VERIFY` instead — the
+binaries, but the modern harness prints `MODELBLASTER_VERIFY` instead — the
 in-binary compare against the baked-in test_golden saves shipping the
 full output tensor over HTIF UART (which dominated FireSim runtime).
 """
@@ -30,21 +30,21 @@ from typing import Optional
 import numpy as np
 
 
-BEGIN = "=== AGENTS_OUTPUT_BEGIN ==="
-END = "=== AGENTS_OUTPUT_END ==="
-PROF_BEGIN = "=== AGENTS_PROFILE_BEGIN ==="
-PROF_END = "=== AGENTS_PROFILE_END ==="
+BEGIN = "=== MODELBLASTER_OUTPUT_BEGIN ==="
+END = "=== MODELBLASTER_OUTPUT_END ==="
+PROF_BEGIN = "=== MODELBLASTER_PROFILE_BEGIN ==="
+PROF_END = "=== MODELBLASTER_PROFILE_END ==="
 
 # Tagged variants — used by the multi-model harness.
-_BEGIN_BARE = re.compile(r"=== AGENTS_OUTPUT_BEGIN(?: \[([^\]]+)\])? ===")
-_END_BARE = re.compile(r"=== AGENTS_OUTPUT_END(?: \[([^\]]+)\])? ===")
-_PROF_BEGIN_BARE = re.compile(r"=== AGENTS_PROFILE_BEGIN(?: \[([^\]]+)\])? ===")
-_PROF_END_BARE = re.compile(r"=== AGENTS_PROFILE_END(?: \[([^\]]+)\])? ===")
+_BEGIN_BARE = re.compile(r"=== MODELBLASTER_OUTPUT_BEGIN(?: \[([^\]]+)\])? ===")
+_END_BARE = re.compile(r"=== MODELBLASTER_OUTPUT_END(?: \[([^\]]+)\])? ===")
+_PROF_BEGIN_BARE = re.compile(r"=== MODELBLASTER_PROFILE_BEGIN(?: \[([^\]]+)\])? ===")
+_PROF_END_BARE = re.compile(r"=== MODELBLASTER_PROFILE_END(?: \[([^\]]+)\])? ===")
 _WALL_RE = re.compile(
-    r"=== AGENTS_WALL_CYCLES(?: \[([^\]]+)\])? === (\d+)"
+    r"=== MODELBLASTER_WALL_CYCLES(?: \[([^\]]+)\])? === (\d+)"
 )
 _VERIFY_RE = re.compile(
-    r"=== AGENTS_VERIFY(?: \[([^\]]+)\])? === "
+    r"=== MODELBLASTER_VERIFY(?: \[([^\]]+)\])? === "
     r"max_abs_err=(\S+) max_rel_err=(\S+) n=(\d+)"
 )
 
@@ -68,7 +68,7 @@ def parse_verify(text: str, tag: Optional[str] = None
 
 
 def verify_count(text: str) -> int:
-    """How many AGENTS_VERIFY summary lines have appeared. Mirrors
+    """How many MODELBLASTER_VERIFY summary lines have appeared. Mirrors
     wall_cycles_count for streamed runners that need an end-of-bench
     sentinel without parsing the per-element output dump."""
     return len(list(_VERIFY_RE.finditer(text)))
@@ -87,7 +87,7 @@ def output_block_count(text: str) -> int:
 
 
 def wall_cycles_count(text: str) -> int:
-    """Number of AGENTS_WALL_CYCLES markers seen. The harness prints
+    """Number of MODELBLASTER_WALL_CYCLES markers seen. The harness prints
     this AFTER OUTPUT_END and PROFILE_END for each block, so it's the
     correct end-of-block sentinel for a streamed runner: waiting for
     OUTPUT_END alone races the trailing PROFILE/WALL prints and the
@@ -99,12 +99,12 @@ def _output_block(text: str, tag: Optional[str] = None) -> str:
     if tag is None:
         b = re.escape(BEGIN); e = re.escape(END)
     else:
-        b = re.escape(f"=== AGENTS_OUTPUT_BEGIN [{tag}] ===")
-        e = re.escape(f"=== AGENTS_OUTPUT_END [{tag}] ===")
+        b = re.escape(f"=== MODELBLASTER_OUTPUT_BEGIN [{tag}] ===")
+        e = re.escape(f"=== MODELBLASTER_OUTPUT_END [{tag}] ===")
     m = re.search(rf"{b}\n(.*?)\n{e}", text, re.S)
     if not m:
         raise RuntimeError(
-            f"could not find AGENTS_OUTPUT_{{BEGIN,END}} "
+            f"could not find MODELBLASTER_OUTPUT_{{BEGIN,END}} "
             f"{'(bare)' if tag is None else f'[{tag}]'} block"
         )
     return m.group(1)
@@ -132,8 +132,8 @@ def parse_profile(text: str, tag: Optional[str] = None) -> Optional[list[dict]]:
     if tag is None:
         b = re.escape(PROF_BEGIN); e = re.escape(PROF_END)
     else:
-        b = re.escape(f"=== AGENTS_PROFILE_BEGIN [{tag}] ===")
-        e = re.escape(f"=== AGENTS_PROFILE_END [{tag}] ===")
+        b = re.escape(f"=== MODELBLASTER_PROFILE_BEGIN [{tag}] ===")
+        e = re.escape(f"=== MODELBLASTER_PROFILE_END [{tag}] ===")
     m = re.search(rf"{b}\n(.*?)\n{e}", text, re.S)
     if not m:
         return None
@@ -268,7 +268,7 @@ def check_one(actual: np.ndarray, golden_npz_path: str,
               verify: Optional[dict] = None) -> tuple[bool, dict]:
     """Validate `actual` against the io.npz golden.
 
-    `verify` (preferred): the in-binary `AGENTS_VERIFY` summary dict
+    `verify` (preferred): the in-binary `MODELBLASTER_VERIFY` summary dict
     from `parse_verify`. When supplied, we use the device-computed
     `max_abs_err` / `max_rel_err` directly and skip the on-host
     per-element compare. Pass condition is the OR of the two bounds —
@@ -286,7 +286,7 @@ def check_one(actual: np.ndarray, golden_npz_path: str,
         n_expected = int(np.asarray(raw_golden).reshape(-1).size)
         if verify["n"] != n_expected:
             stats = {
-                "error": (f"AGENTS_VERIFY n={verify['n']} mismatches "
+                "error": (f"MODELBLASTER_VERIFY n={verify['n']} mismatches "
                           f"golden size {n_expected}"),
                 "max_abs_err": float("inf"),
                 "max_rel_err": float("inf"),
@@ -328,7 +328,7 @@ def check_one(actual: np.ndarray, golden_npz_path: str,
 
 def model_io_path(repo_root: str, name: str, quant: str) -> str:
     return os.path.join(
-        repo_root, "agents", "examples", name, quant, "generated", "io.npz"
+        repo_root, "modelblaster", "examples", name, quant, "generated", "io.npz"
     )
 
 
@@ -350,7 +350,7 @@ def emit_iree_profile(records: list[dict], model: str,
     Returns the written path, or None if --profile-out-root is unset."""
     if not args.profile_out_root or not records:
         return None
-    from agents.pipeline import profile_writer
+    from modelblaster.pipeline import profile_writer
     cores = [int(c) for c in args.profile_cores.split(",") if c.strip()]
     cpu = args.profile_cpu or args.profile_source
     meta = profile_writer.ProfileMeta(

@@ -1,8 +1,8 @@
 sample:
   description: Cross-hart threadpool dispatch microbenchmarks
-  name: agents_microbench_threadpool
+  name: modelblaster_microbench_threadpool
 common:
-  tags: agents microbench threadpool
+  tags: modelblaster microbench threadpool
   integration_platforms:
     - spike_riscv64
   harness: console
@@ -11,5 +11,5 @@ common:
     regex:
       - "=== THREADPOOL_BENCH_BEGIN ==="
 tests:
-  sample.agents.microbench_threadpool:
-    tags: agents
+  sample.modelblaster.microbench_threadpool:
+    tags: modelblaster

@@ -50,7 +50,7 @@
  *                funct3=0x1 funct7=0x4b
  *
  * NOTE: This header intentionally does NOT touch matrix register
- * context save/restore. The agents flow enters generated kernels with
+ * context save/restore. The modelblaster flow enters generated kernels with
  * irq_lock held (see run_graph_b's irq mask path), so a kernel cannot
  * be preempted mid-OPU-sequence — matrix state stays consistent within
  * a single dispatch. Cross-dispatch state is not assumed: each kernel
@@ -66,8 +66,8 @@
  *     OPU is implemented as a Saturn-internal decode hook on V opcode
  *     0x57, not a separate ISA extension.
  */
-#ifndef AGENTS_SATURN_OPU_H
-#define AGENTS_SATURN_OPU_H
+#ifndef MODELBLASTER_SATURN_OPU_H
+#define MODELBLASTER_SATURN_OPU_H
 
 /* HACK: matrix and vector register names piggy-back the assembler's
  * scalar-register parser. The HW decoder reads the same 5-bit slot to
@@ -162,4 +162,4 @@
 #define OPFMACC(md, vs2, vs1) \
     asm volatile(".insn r 0x57, 0x1, 0x4b, " md ", " vs1 ", " vs2);
 
-#endif /* AGENTS_SATURN_OPU_H */
+#endif /* MODELBLASTER_SATURN_OPU_H */

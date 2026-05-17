@@ -2,7 +2,7 @@
 
 Wraps the actor MLP from the rsl_rl PPO runner trained on the
 crazyflie_steering_tracking task. Architecture comes from
-SteeringTrackingPPORunnerCfg (sims/.../crazyflie/agents/rsl_rl_ppo_cfg.py):
+SteeringTrackingPPORunnerCfg (sims/.../crazyflie/modelblaster/rsl_rl_ppo_cfg.py):
 
     obs_dim=16, action_dim=4, hidden_dims=[256, 128, 64], activation=elu
 
@@ -26,7 +26,7 @@ _ACTION_DIM = 4
 _HIDDEN_DIMS = [256, 128, 64]
 
 # Latest trained MLP checkpoint at the time of writing. Updates pick up via
-# AGENTS_MLP_CONTROL_CKPT env var.
+# MODELBLASTER_MLP_CONTROL_CKPT env var.
 _DEFAULT_CKPT = (
     "/scratch2/dima/misc_sw/FreshScheduler/logs/rsl_rl/"
     "crazyflie_steering_tracking/2026-04-13_12-23-08/model_6998.pt"
@@ -88,11 +88,11 @@ def get_model(seed: int = 0) -> MLPControl:
     """Build + load the trained actor for inference."""
     torch.manual_seed(seed)
     m = MLPControl()
-    ckpt_path = os.environ.get("AGENTS_MLP_CONTROL_CKPT", _DEFAULT_CKPT)
+    ckpt_path = os.environ.get("MODELBLASTER_MLP_CONTROL_CKPT", _DEFAULT_CKPT)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"MLP control checkpoint not found at {ckpt_path}. "
-            f"Set AGENTS_MLP_CONTROL_CKPT to override."
+            f"Set MODELBLASTER_MLP_CONTROL_CKPT to override."
         )
     _load_actor_weights(m, ckpt_path)
     m.eval()

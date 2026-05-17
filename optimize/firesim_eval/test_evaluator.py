@@ -11,18 +11,18 @@ when --firesim-eval is passed; that's covered by the design report's
 results table, not by an automated unit test.
 
 Run from the zephyr-chipyard-sw repo root:
-    python -m agents.optimize.firesim_eval.test_evaluator
+    python -m modelblaster.optimize.firesim_eval.test_evaluator
 """
 
 from __future__ import annotations
 
 import sys
 
-from agents.optimize.firesim_eval import (
+from modelblaster.optimize.firesim_eval import (
     FiresimEvalConfig, FiresimEvalResult,
     evaluate_top_k, memory_model_stanza, QUAD_ROCKET_SATURN_MEMORY_MODEL,
 )
-from agents.pipeline.reference_kernels import KERNEL_SPECS
+from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
 
 
 # ---------------------------------------------------------------------------

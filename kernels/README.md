@@ -6,9 +6,9 @@ signature from `reference_kernels.py` with no shape-specific assumptions.
 
 ## **Not** an auto-generated cache
 
-Don't confuse this directory with `agents/examples/<model>/<quant>/cache/<backend>/`.
+Don't confuse this directory with `modelblaster/examples/<model>/<quant>/cache/<backend>/`.
 
-| | `agents/kernels/` (this dir) | `agents/examples/*/cache/*/` |
+| | `modelblaster/kernels/` (this dir) | `modelblaster/examples/*/cache/*/` |
 |---|---|---|
 | **Content** | Curated, hand-written or post-LLM-promoted kernels | Per-model LLM-optimized kernels + reference seeds |
 | **Origin** | Authored by humans, or promoted from a cache after a kernel proves itself across models | Generated/cached by `generate_kernels.py` for one specific model |
@@ -16,14 +16,14 @@ Don't confuse this directory with `agents/examples/<model>/<quant>/cache/<backen
 | **Lifecycle** | Tracked in git, committed deliberately | Regenerable; the pipeline rewrites it if missing |
 | **Role in LLM loop** | Optional **seed** for the LLM optimizer (`--seed-from-curated`) and a fast-path probe before LLM is invoked | Output of the LLM loop; gets promoted *into* this dir if it stays winning across models |
 
-If you delete `agents/examples/<m>/<q>/cache/`, the pipeline regenerates
-it. If you delete `agents/kernels/`, you lose the curated seeds — they
+If you delete `modelblaster/examples/<m>/<q>/cache/`, the pipeline regenerates
+it. If you delete `modelblaster/kernels/`, you lose the curated seeds — they
 won't come back unless someone re-authors them.
 
 ## Directory layout
 
 ```
-agents/kernels/
+modelblaster/kernels/
   <target>/
     <backend>_<op>_<algorithm>.c    # one file per (target, op, algorithm)
 ```
@@ -41,7 +41,7 @@ gemmini/gemmini_conv2d_s8_gemmini_im2col_full_C.c  # software im2col + tiled_mat
 
 ## How it integrates with the pipeline
 
-Pass `--global-curated-dir agents/kernels` (or set `GLOBAL_CURATED_DIR`) to
+Pass `--global-curated-dir modelblaster/kernels` (or set `GLOBAL_CURATED_DIR`) to
 `generate_kernels.py` / any `run.sh`. The pipeline then:
 
 1. For each op and each algorithm candidate, checks this directory first.
@@ -62,7 +62,7 @@ Pass `--global-curated-dir agents/kernels` (or set `GLOBAL_CURATED_DIR`) to
 3. The algorithm name must be registered as an `AlgorithmCandidate` in
    `reference_kernels.py` (add it if new) so the pipeline knows to probe it.
 4. Test by running any model's `run.sh` with
-   `BACKEND=llm GLOBAL_CURATED_DIR=agents/kernels` and confirming the log
+   `BACKEND=llm GLOBAL_CURATED_DIR=modelblaster/kernels` and confirming the log
    shows `curated HIT` for the op.
 
 ## Source tagging

@@ -2,17 +2,17 @@
 
 Usage:
     # 1. Tell the extractor which tensors to inspect, rebuild:
-    bash agents/examples/vint/run.sh    # but pass VINT_INSPECT=t1,t2,...
+    bash modelblaster/examples/vint/run.sh    # but pass VINT_INSPECT=t1,t2,...
     # OR run extract_graph_export directly:
-    PYTHONPATH=. python -m agents.pipeline.extract_graph_export \\
+    PYTHONPATH=. python -m modelblaster.pipeline.extract_graph_export \\
         --model vint --quant int8 --num-calibration 16 --per-channel \\
         --inspect linear,linear_1,cat_1,linear_24 \\
-        --out-dir agents/examples/vint/int8/generated
+        --out-dir modelblaster/examples/vint/int8/generated
     # then rebuild + run spike via run.sh (FORCE_EXTRACT=0).
 
     # 2. Run this script — it executes spike, parses the inspect blocks,
     #    and prints a per-tensor summary of spike vs PyTorch.
-    PYTHONPATH=. python agents/examples/vint/inspect_intermediates.py
+    PYTHONPATH=. python modelblaster/examples/vint/inspect_intermediates.py
 
 Output for each inspected tensor:
     name    n_elems    fp32 max_abs    spike max_abs    Δ max_abs    cosine_sim
@@ -33,10 +33,10 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _INSPECT_RE = re.compile(
-    r"=== AGENTS_INSPECT_BEGIN \[(?P<name>[^\]]+)\] === "
+    r"=== MODELBLASTER_INSPECT_BEGIN \[(?P<name>[^\]]+)\] === "
     r"scale=(?P<scale>[^ ]+) dtype=(?P<dtype>\w+) n=(?P<n>\d+)\n"
     r"(?P<body>.*?)"
-    r"=== AGENTS_INSPECT_END \[\1\] ===",
+    r"=== MODELBLASTER_INSPECT_END \[\1\] ===",
     re.DOTALL,
 )
 
@@ -68,9 +68,9 @@ def _cos(a: np.ndarray, b: np.ndarray) -> float:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--build-dir",
-                   default="agents/examples/vint/int8/build/scalar")
+                   default="modelblaster/examples/vint/int8/build/scalar")
     p.add_argument("--ir-dir",
-                   default="agents/examples/vint/int8/generated")
+                   default="modelblaster/examples/vint/int8/generated")
     p.add_argument("--spike",
                    default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
     p.add_argument("--spike-isa", default="rv64gcv_zicntr",
@@ -101,7 +101,7 @@ def main():
     )
     spike_blocks = _parse_inspects(res.stdout + res.stderr)
     if not spike_blocks:
-        sys.exit("no AGENTS_INSPECT_BEGIN/END blocks in spike stdout — "
+        sys.exit("no MODELBLASTER_INSPECT_BEGIN/END blocks in spike stdout — "
                  "did the build pick up the inspect tensors?")
     print(f"  spike dumped {len(spike_blocks)} inspect blocks",
           flush=True)

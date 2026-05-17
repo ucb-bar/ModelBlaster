@@ -30,8 +30,8 @@ Output path (XPU-RT convention, matching IREE):
 with `<basename> = <model>.<quant>` (e.g. `mlp_control.fp32`).
 
 Usage:
-    python -m agents.pipeline.emit_dispatch_graph \\
-        --ir agents/examples/mlp_control/fp32/generated/graph.json \\
+    python -m modelblaster.pipeline.emit_dispatch_graph \\
+        --ir modelblaster/examples/mlp_control/fp32/generated/graph.json \\
         --out-root gen/vmfb \\
         --target generic_riscv64 \\
         --hw RVV

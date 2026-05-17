@@ -3,7 +3,7 @@
 Goal: a functional spike that can execute Saturn OPU kernels (the
 `bme.h` asm-macro programming model — `VOPACC`, `OPMVINBCAST`,
 `VMV_VR`, `VMV_RV`) so we can iterate on `rvv_opu` curated kernels in
-the agents flow without round-tripping through FireSim.
+the modelblaster flow without round-tripping through FireSim.
 
 Integer-only (i8×i8 → i32 acc, `opuParams`) is the v1 target. The fp8
 OPU (`opuMxParams`) layers on top once the int path works.
@@ -321,7 +321,7 @@ parameterization debt.
 
 ## What spike will NOT model
 
-These would be true HW differences spike can't reproduce — agents-flow
+These would be true HW differences spike can't reproduce — modelblaster-flow
 correctness verify is still sufficient because the model output is
 deterministic w.r.t. the asm sequence:
 
@@ -333,10 +333,10 @@ deterministic w.r.t. the asm sequence:
 - **FP latency stalls** (Saturn's `latency=2` MulAddRecFNPipe for
   fp8 — not relevant for the integer-only v1).
 
-## Integration with agents flow
+## Integration with modelblaster flow
 
-Once `spike-opu` is built, the agents flow needs one small change in
-`agents/pipeline/backends.py::RVV_OPU`:
+Once `spike-opu` is built, the modelblaster flow needs one small change in
+`modelblaster/pipeline/backends.py::RVV_OPU`:
 
 ```python
 spike_args=(
@@ -345,8 +345,8 @@ spike_args=(
 ),
 ```
 
-and `spike_runner.py` picks up an `AGENTS_OPU_SPIKE` env var (mirror
-of `AGENTS_GEMMINI_SPIKE`) pointing to the OPU-built spike binary.
+and `spike_runner.py` picks up an `MODELBLASTER_OPU_SPIKE` env var (mirror
+of `MODELBLASTER_GEMMINI_SPIKE`) pointing to the OPU-built spike binary.
 The build wiring change in spike_runner is one-line, following the
 gemmini precedent.
 

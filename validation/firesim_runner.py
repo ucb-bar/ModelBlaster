@@ -1,6 +1,6 @@
 """Run a built zephyr.elf on FireSim and parse the harness's stdout.
 
-Mirrors agents.validation.spike_runner: same CLI shape, same OUTPUT/PROFILE/
+Mirrors modelblaster.validation.spike_runner: same CLI shape, same OUTPUT/PROFILE/
 WALL_CYCLES parsing (via runner_common), same IREE-shape profile
 emission. The only thing that differs is *how* we get the harness's
 stdout — instead of running spike in-process, we stage the elf into the
@@ -14,7 +14,7 @@ Pre-conditions (one-time per session, same as the manual flow):
     firesim infrasetup       # only when the FPGA bitstream is stale
 
 Then per run:
-    python -m agents.validation.firesim_runner \\
+    python -m modelblaster.validation.firesim_runner \\
         --elf <path-to-zephyr.elf> \\
         --io  <path-to-io.npz> \\
         --profile-out-root gen/profile --profile-source firesim \\
@@ -33,7 +33,7 @@ import sys
 import time
 from typing import Optional
 
-from agents.validation.runner_common import (
+from modelblaster.validation.runner_common import (
     IREEProfileArgs,
     has_output_marker,
     output_block_count,
@@ -186,7 +186,7 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
     """Run `elf` on FireSim, return the captured uartlog.
 
     The run is considered "done" as soon as the harness has printed all
-    expected `=== AGENTS_OUTPUT_END ===` markers (one per model in
+    expected `=== MODELBLASTER_OUTPUT_END ===` markers (one per model in
     multi-model mode). At that point we issue `firesim kill` to release
     the FPGA — we don't wait for the simulator to exit on its own
     (some Zephyr binaries spin-loop after the printout)."""
@@ -223,7 +223,7 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
     expected_ends = _expected_end_count(models, pool_sizes)
     if verbose:
         print(f"firesim: runworkload (waiting for {expected_ends} "
-              f"AGENTS_WALL_CYCLES marker{'s' if expected_ends>1 else ''})",
+              f"MODELBLASTER_WALL_CYCLES marker{'s' if expected_ends>1 else ''})",
               flush=True)
 
     runworkload_log = os.path.join(paths["sim_slot"],
@@ -292,7 +292,7 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             if len(text) != last_size:
                 last_size = len(text)
                 last_progress = time.monotonic()
-            # Stop on the LAST block's AGENTS_WALL_CYCLES line — that's
+            # Stop on the LAST block's MODELBLASTER_WALL_CYCLES line — that's
             # the trailing per-block sentinel. Neither single-model nor
             # multi-model harness emits OUTPUT_BEGIN/END (they use
             # VERIFY+PROFILE+WALL_CYCLES), so WALL_CYCLES count alone

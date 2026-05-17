@@ -7,8 +7,8 @@
  *
  *   References:
  *     - XNNPACK indirect-conv design (Marat Dukhan, Google).
- *     - Saturn OPU programming model: agents/cores/saturn_opu/include/saturn_opu.h
- *     - Design note: agents/notes/opu_indirect_gemm_design.md
+ *     - Saturn OPU programming model: modelblaster/cores/saturn_opu/include/saturn_opu.h
+ *     - Design note: modelblaster/notes/opu_indirect_gemm_design.md
  *
  *   Indirection table size is BOUNDED PER TILE (not per layer): the
  *   kernel handles OW_BLK = mlmax output pixels at a time, so the
@@ -30,7 +30,7 @@
 
 #define OPU_MAX_TILE  64    /* mlmax cap (V512) */
 #define OPU_MAX_K     1024  /* fits the K=IC*KH*KW reduction in our scratch */
-#define OPU_MAX_IC    1280  /* largest IC across agents-flow models today */
+#define OPU_MAX_IC    1280  /* largest IC across modelblaster-flow models today */
 #define OPU_INDIR_PAD ((int32_t)-1)  /* sentinel: this entry is padding, read 0 */
 
 /* Mirror reference_kernels.py CONV2D_S8.reference_impl byte-for-byte:

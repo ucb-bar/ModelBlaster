@@ -2,10 +2,10 @@
 
 How the FireSim/spike harness drives an XPU-RT schedule end-to-end. Cross-references:
 
-- IR / ingest:  `agents/pipeline/ingest_xpurt_schedule.py`
-- Codegen:     `agents/pipeline/generate_xpurt_main.py`
-- Harness:     `agents/harness_xpurt/{prj.conf, CMakeLists.txt}`
-- Pool runtime: `agents/runtime/agents_pool/`
+- IR / ingest:  `modelblaster/pipeline/ingest_xpurt_schedule.py`
+- Codegen:     `modelblaster/pipeline/generate_xpurt_main.py`
+- Harness:     `modelblaster/harness_xpurt/{prj.conf, CMakeLists.txt}`
+- Pool runtime: `modelblaster/runtime/modelblaster_pool/`
 
 ## 1. Inputs
 
@@ -21,7 +21,7 @@ Three artifacts feed the harness:
    for periodic networks (e.g. `dronet0`, `dronet1`, … with period=200 ms).
 2. **Per-network IR `*_dispatch_graph.json`** — the static op graph. Each op
    has `dispatch_id`, `op`, `name`, plus shape metadata.
-3. **Core registry `agents/cores/*.json`** — abstract `CPU_P/CPU_E#n` slots
+3. **Core registry `modelblaster/cores/*.json`** — abstract `CPU_P/CPU_E#n` slots
    resolve into `(core_name, core_kind, hart)`. For our dual-rocket-saturn-gemmini
    bitstream, `cpu_p → gemmini@hart0`, `cpu_e → rvv@hart1`.
 
@@ -92,7 +92,7 @@ static model_<m>_state_t  s_<m>;           // ONE state struct per network m
 static <out_t>            out_<m>[...];    // shared output buffer
 
 static struct k_sem completion_sems[N_ENTRIES];   // one per entry
-static void *pools[N_KINDS] = { NULL };           // per-kind agents_pool
+static void *pools[N_KINDS] = { NULL };           // per-kind modelblaster_pool
 static uint64_t run_t0;                            // mtime baseline at worker spawn
 ```
 
@@ -211,7 +211,7 @@ is deadlock-free because:
   hold-and-wait cycle with any other worker — each worker only ever waits on
   *earlier* entries, regardless of kind.
 
-### 4.4 Intra-op parallelism (`agents_pool`)
+### 4.4 Intra-op parallelism (`modelblaster_pool`)
 
 **Spec.** Inside a dispatched kernel, `parallel_<op>(s->pool, ...)` should
 fan out onto helper threads pinned to other harts of the *kind that is
@@ -248,9 +248,9 @@ in the previous emitter. Status as of now:
    `wall_cycles_<m>[K]` arrays where K = max instance index + 1
    (computed from the schedule). Each entry indexes by
    `e_->instance`, so back-to-back periodic instances cannot clobber
-   each other. The walker prints `=== AGENTS_WALL_CYCLES_INST
+   each other. The walker prints `=== MODELBLASTER_WALL_CYCLES_INST
    [<net>#<inst>] === <cycles>` per instance, plus the existing
-   single `=== AGENTS_WALL_CYCLES [<net>] === <max_cycles>` line per
+   single `=== MODELBLASTER_WALL_CYCLES [<net>] === <max_cycles>` line per
    network for streamed-runner end-of-run sentinels.
 
 4. **`completion_sems` re-give pattern relies on no-overflow.** Step
@@ -319,14 +319,14 @@ Auditing `generate_xpurt_main.py` + `model.c` against that:
 | # | Spec property | Impl status | Evidence |
 |---|---|---|---|
 | 1 | Independent ops within a network can start concurrently across kinds. | **OK** — workers walk independently, gated only by `deps[]`/`time_dep_entry_id`. No global "one network at a time" lock. | `generate_xpurt_main.py:_emit` outer worker loop |
-| 2 | Data flow correct under concurrent dispatch. | **OK** — intermediate buffers live in a shared per-model `buffers.c` (one TU per model, not per backend), so cross-kind dispatches in the same network read each other's writes. | `agents/examples/dronet/int8/generated/rvv/model.c:218` extern decls |
+| 2 | Data flow correct under concurrent dispatch. | **OK** — intermediate buffers live in a shared per-model `buffers.c` (one TU per model, not per backend), so cross-kind dispatches in the same network read each other's writes. | `modelblaster/examples/dronet/int8/generated/rvv/model.c:218` extern decls |
 | 3 | Intra-op fanout uses the *running kind's* pool. | **OK** (was broken; landed). The walker now declares `s_<m>_<kind>` per (network, kind), `.pool` is bound once in `main()`, and the dispatch path passes `&s_<m>_<core_kind>` so two kinds dispatching the same network never share a state struct. | `generate_xpurt_main.py` state_decls / state_pool_assigns |
 | 4 | Profile records correctly attribute cycles to their backend. | **OK for current shape** — `n_`/`records_[]` are file-static per `(model, backend)` TU, and we run one worker per kind, so no two concurrent ops share a `(model, backend)`'s `n_`. **Will break** if we ever add multi-hart-per-kind workers. | `model.c:254` |
-| 5 | Periodic-instance wall cycles correctly attributed. | **OK** (was broken; landed). `wall_start_<m>[K]` / `wall_cycles_<m>[K]` arrays indexed by `e_->instance`; per-instance lines printed under `AGENTS_WALL_CYCLES_INST [<net>#<inst>]`, summary line under the existing `AGENTS_WALL_CYCLES [<net>]` keeps streamed-runner counters intact. | `generate_xpurt_main.py` `wall_decls`, print_blocks |
+| 5 | Periodic-instance wall cycles correctly attributed. | **OK** (was broken; landed). `wall_start_<m>[K]` / `wall_cycles_<m>[K]` arrays indexed by `e_->instance`; per-instance lines printed under `MODELBLASTER_WALL_CYCLES_INST [<net>#<inst>]`, summary line under the existing `MODELBLASTER_WALL_CYCLES [<net>]` keeps streamed-runner counters intact. | `generate_xpurt_main.py` `wall_decls`, print_blocks |
 | 6 | Deadlock-free walk. | **OK** — invariant `time_dep_id < entry_id` (and `dep_id < entry_id`) is now asserted at ingest time and fails fast on out-of-spec scheduler output. | `ingest_xpurt_schedule.py::load` |
 | 7 | Per-instance start time honored on `dispatch_id==0`. | **OK** — busy-yield on `k_cycle_get_64()`. The emitter still resets every backend's `model_<m>_reset_profile_<bs>()` at the gate, which is correct (each backend's `records_/n_` arrays get a clean slate per instance, even if the instance crosses kinds). | step (c) in §3.3 |
 | 8 | Single-kind-multi-hart concurrency. | **Not supported.** Single worker per kind. Today's schedules don't need it; if a registry declares `harts=[a,b]` for one kind, the walker only uses one of them. Combined with the row-4 caveat: a future multi-hart-per-kind change requires both more workers AND atomic profile counters. | `_emit` thread spawn loop |
-| 9 | Per-bitstream hart count comes from one place. | **OK** — `harness_xpurt/prj.conf` no longer sets `CONFIG_MP_MAX_NUM_CPUS`; `run.sh` always applies a per-target overlay (`spike_quad.conf` / `firesim_chipyard.conf` / `firesim_chipyard_dual_gemmini.conf`) and fails fast if none is found. | `agents/harness/backends/*.conf` + `xpurt_demo/run.sh` |
+| 9 | Per-bitstream hart count comes from one place. | **OK** — `harness_xpurt/prj.conf` no longer sets `CONFIG_MP_MAX_NUM_CPUS`; `run.sh` always applies a per-target overlay (`spike_quad.conf` / `firesim_chipyard.conf` / `firesim_chipyard_dual_gemmini.conf`) and fails fast if none is found. | `modelblaster/harness/backends/*.conf` + `xpurt_demo/run.sh` |
 | 10 | IR-vs-codegen `dispatch_id` are kept consistent. | **OK** — ingest now remaps each schedule entry's IR `dispatch_id` to the codegen-space index (zero-cost ops → -1 sentinel). The walker short-circuits on `dispatch_id < 0` (still posts the completion sem so dependents unblock). Closes the "table indexed past its end → garbage `jalr` to `0x01e2f185f0fe15ec`" crash that was masquerading as a sync bug on FireSim. | `ingest_xpurt_schedule.py::load` remap, `_emit` early-out |
 
 ### Validation
@@ -353,7 +353,7 @@ After both workers `pthread_join`:
   externally-visible symbol). The walker prints them tagged with `<bs>` so
   the host can split per-op cycles by backend.
 - `spike_runner` / `firesim_runner` parse the
-  `=== AGENTS_OUTPUT_BEGIN [<network>] ===` markers and check against a
+  `=== MODELBLASTER_OUTPUT_BEGIN [<network>] ===` markers and check against a
   PyTorch golden.
 
 ## 7. Where things can go wrong
@@ -388,10 +388,10 @@ python scripts/run_xpurt_schedule.py \
 # 3. Run the schedule on spike via the xpurt harness.
 SCHEDULE_JSON=schedules/scheduled_networks_periodic_dronet_yolov8_spike_profiled.json \
 MODELS=dronet,yolov8_nano \
-REGISTRY=agents/cores/spike_quad_rvv_scalar.json \
+REGISTRY=modelblaster/cores/spike_quad_rvv_scalar.json \
 BACKENDS=rvv,scalar  CPU_P_KIND=rvv  CPU_E_KIND=scalar \
-RUNNER=spike  AGENTS_POOL_THREADS=2 \
-bash zephyr-chipyard-sw/agents/examples/xpurt_demo/run.sh
+RUNNER=spike  MODELBLASTER_POOL_THREADS=2 \
+bash zephyr-chipyard-sw/modelblaster/examples/xpurt_demo/run.sh
 ```
 
 Once spike passes, the same schedule rebuilt against the firesim_rocket_saturn

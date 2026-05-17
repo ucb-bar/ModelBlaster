@@ -1,6 +1,6 @@
 /* source: curated */
 /* algorithm: outerprod */
-/* origin: Saturn OPU i8 outer-product MAC, adapted for the agents-flow
+/* origin: Saturn OPU i8 outer-product MAC, adapted for the modelblaster-flow
  *   linear_s8 signature. Ported from
  *     hw/chipyard/generators/saturn/benchmarks/opu-gemm/kernel.h
  *   (branch origin/opu-fp8), function `i8_mm_bme_sq` + the bias-aware
@@ -22,7 +22,7 @@
  *      the CMSIS-NN / muRISCV-NN linear_s8 reference exactly.
  *   4. Symmetric quant only (input_offset == filter_offset == 0):
  *      the asymmetric path needs sum(x), sum(w) precomputation
- *      which adds complexity; agents-flow extract emits symmetric
+ *      which adds complexity; modelblaster-flow extract emits symmetric
  *      quant today so falling back is fine until that changes.
  *
  * The OPU MAC body (the inner VOPACC loop) is unchanged from upstream.
@@ -34,7 +34,7 @@
 #include "saturn_opu.h"
 
 /* Q0.31 fixed-point requantize — matches the linear_s8 reference impl in
- * agents/pipeline/reference_kernels.py::LINEAR_S8 (CMSIS-NN canonical
+ * modelblaster/pipeline/reference_kernels.py::LINEAR_S8 (CMSIS-NN canonical
  * round-multiply-and-shift). */
 static inline int32_t q31_requantize(int32_t x, int32_t mult, int32_t shift) {
     int64_t prod = (int64_t)x * (int64_t)mult;

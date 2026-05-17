@@ -1,6 +1,6 @@
 {
   "system": "spike-rocket-quad",
-  "description": "Spike ISA simulator with 4 homogeneous Rocket-class harts. Used by the scalar backend; AGENTS_BACKEND=scalar.",
+  "description": "Spike ISA simulator with 4 homogeneous Rocket-class harts. Used by the scalar backend; MODELBLASTER_BACKEND=scalar.",
   "default_dispatch_target": "any",
   "cores": [
     {

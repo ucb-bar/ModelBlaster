@@ -1,6 +1,6 @@
 {
   "system": "spike-rvv-quad",
-  "description": "Spike with rv64gcv (V extension) — same 4 harts as the rocket-quad system but with RVV capabilities. AGENTS_BACKEND=rvv.",
+  "description": "Spike with rv64gcv (V extension) — same 4 harts as the rocket-quad system but with RVV capabilities. MODELBLASTER_BACKEND=rvv.",
   "default_dispatch_target": "any",
   "cores": [
     {

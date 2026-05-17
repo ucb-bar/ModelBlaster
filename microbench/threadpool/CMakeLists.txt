@@ -16,7 +16,7 @@
 #       distinct CMake target names so they can co-exist.
 #
 # Includes the same vendored POSIX-affinity patch hook as
-# agents/harness_multi/CMakeLists.txt and a copy of the patch file in
+# modelblaster/harness_multi/CMakeLists.txt and a copy of the patch file in
 # zephyr_patches/.
 
 cmake_minimum_required(VERSION 3.20.0)
@@ -72,7 +72,7 @@ if(EXISTS "${_AFFINITY_PATCH}" AND IS_DIRECTORY "${_ZEPHYR_TREE}")
 endif()
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(agents_microbench_threadpool)
+project(modelblaster_microbench_threadpool)
 
 # Wire pthreadpool only if the target needs it. We keep the same
 # vendored copy as harness_multi.

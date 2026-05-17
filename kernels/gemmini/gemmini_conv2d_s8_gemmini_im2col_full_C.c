@@ -192,7 +192,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
          * the CPU's subsequent ws_acc_out reads in the requantize loop,
          * which corrupts the stack and surfaces as mcause=1 mepc=0
          * (return-address-zeroed) several frames later. See
-         * agents/notes/gemmini_tiled_conv_fence_required.md. */
+         * modelblaster/notes/gemmini_tiled_conv_fence_required.md. */
         gemmini_fence();
         gemmini_flush(0);
 

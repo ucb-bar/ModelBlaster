@@ -2408,24 +2408,24 @@ def main() -> None:
                          "_Float16 C kernels, validated against half-cast "
                          "torch golden), int8 = symmetric per-tensor PTQ.")
     ap.add_argument("--core-registry", default=None,
-                    help="optional path to an agents/cores/*.json registry. "
+                    help="optional path to an modelblaster/cores/*.json registry. "
                          "When provided, the post-extraction pass validates "
                          "every dispatch's hardware_target against the listed "
                          "cores' capabilities and aborts on mismatch.")
     args = ap.parse_args()
 
     if args.model == "mlp_generic":
-        from agents.models import mlp_generic as model_mod
+        from modelblaster.models import mlp_generic as model_mod
     elif args.model == "mlp_control":
-        from agents.models import mlp_control as model_mod
+        from modelblaster.models import mlp_control as model_mod
     elif args.model == "lenet":
-        from agents.models import lenet as model_mod
+        from modelblaster.models import lenet as model_mod
     elif args.model == "dronet":
-        from agents.models import dronet as model_mod
+        from modelblaster.models import dronet as model_mod
     elif args.model == "mobilenet_v2":
-        from agents.models import mobilenet_v2 as model_mod
+        from modelblaster.models import mobilenet_v2 as model_mod
     elif args.model == "yolov8_nano":
-        from agents.models import yolov8_nano as model_mod
+        from modelblaster.models import yolov8_nano as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()
@@ -2435,7 +2435,7 @@ def main() -> None:
             quant=args.quant)
 
     if args.core_registry:
-        from agents.pipeline import core_registry
+        from modelblaster.pipeline import core_registry
         reg = core_registry.load(args.core_registry)
         ir = json.load(open(os.path.join(args.out_dir, "graph.json")))
         errs = core_registry.validate_dispatch_targets(reg, ir.get("ops", []))

@@ -66,16 +66,16 @@ def main() -> int:
     only_after = sorted(set(after) - set(baseline))
 
     lines: list[str] = []
-    lines.append("# pthreadpool vs agents_pool — FireSim per-(model, pool) totals\n")
+    lines.append("# pthreadpool vs modelblaster_pool — FireSim per-(model, pool) totals\n")
     lines.append("Per-row: sum of `mean_time_ns` across every dispatch in the "
                  "results.csv. Lower is better; ratio = after / baseline.")
     lines.append("")
     lines.append("Both runs use the same generated kernels.c — the only "
                  "variable is the parallel-for pool implementation: "
-                 "pthreadpool (xnnpack-vendored) vs agents_pool (raw "
+                 "pthreadpool (xnnpack-vendored) vs modelblaster_pool (raw "
                  "pthreads + k_sem).")
     lines.append("")
-    lines.append("| profile_dir | baseline_ns (pthreadpool) | after_ns (agents_pool) | ratio |")
+    lines.append("| profile_dir | baseline_ns (pthreadpool) | after_ns (modelblaster_pool) | ratio |")
     lines.append("|---|---:|---:|---:|")
     for rel, b, a, ratio in rows:
         lines.append(f"| `{rel}` | {b:,} | {a:,} | {ratio:.3f}x |")

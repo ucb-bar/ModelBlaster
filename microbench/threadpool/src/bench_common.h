@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Shared helpers for the cross-hart synchronization microbenchmarks under
- * agents/microbench/threadpool/. The three harnesses (pthreadpool,
+ * modelblaster/microbench/threadpool/. The three harnesses (pthreadpool,
  * raw POSIX pthreads, native k_thread+k_sem) all share:
  *   - rdcycle() for per-call cycle deltas (matches the existing
  *     harness's profiling primitive at the 1 GHz target frequency)
@@ -19,8 +19,8 @@
  * printf calls are deferred until after every measurement loop.
  */
 
-#ifndef AGENTS_MICROBENCH_THREADPOOL_BENCH_COMMON_H
-#define AGENTS_MICROBENCH_THREADPOOL_BENCH_COMMON_H
+#ifndef MODELBLASTER_MICROBENCH_THREADPOOL_BENCH_COMMON_H
+#define MODELBLASTER_MICROBENCH_THREADPOOL_BENCH_COMMON_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -153,7 +153,7 @@ static inline uint64_t bench_max(const uint64_t *buf, size_t n)
 }
 
 /* Emit one CSV block. Markers are intentionally distinct from
- * AGENTS_OUTPUT_BEGIN/END so the existing runner doesn't try to parse
+ * MODELBLASTER_OUTPUT_BEGIN/END so the existing runner doesn't try to parse
  * floats out of them.
  *
  * Schema:
@@ -208,4 +208,4 @@ static const int BENCH_NWORKERS[BENCH_NWORKERS_COUNT] = { 1, 2, 4 };
  * separate elf builds). */
 #define BENCH_MAX_RANGE 4096
 
-#endif /* AGENTS_MICROBENCH_THREADPOOL_BENCH_COMMON_H */
+#endif /* MODELBLASTER_MICROBENCH_THREADPOOL_BENCH_COMMON_H */

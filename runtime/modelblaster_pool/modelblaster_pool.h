@@ -2,17 +2,17 @@
  * Copyright (c) 2026 Dima Nikiforov <vnikiforov@berkeley.edu>
  * SPDX-License-Identifier: Apache-2.0
  *
- * agents_pool — minimal raw-pthread parallel-for pool for the agents
+ * modelblaster_pool — minimal raw-pthread parallel-for pool for the modelblaster
  * runtime. Drop-in replacement for the subset of pthreadpool that the
  * generated `parallel_<op>` wrappers actually use:
  *
- *     pthreadpool_create(N)             -> agents_pool_create(N)
- *     pthreadpool_destroy(p)            -> agents_pool_destroy(p)
- *     pthreadpool_get_threads_count(p)  -> agents_pool_get_threads_count(p)
+ *     pthreadpool_create(N)             -> modelblaster_pool_create(N)
+ *     pthreadpool_destroy(p)            -> modelblaster_pool_destroy(p)
+ *     pthreadpool_get_threads_count(p)  -> modelblaster_pool_get_threads_count(p)
  *     pthreadpool_parallelize_1d(p, fn, ctx, range, flags)
- *                                       -> agents_pool_parallelize_1d(...)
+ *                                       -> modelblaster_pool_parallelize_1d(...)
  *
- * The microbench in agents/microbench/threadpool/ established that
+ * The microbench in modelblaster/microbench/threadpool/ established that
  * pthreadpool's wrapper costs ~13 M target cycles per dispatch on the
  * FireSim quad-rocket-saturn build, while a raw pthreads + k_sem
  * rendezvous (the pattern this lib promotes from
@@ -23,7 +23,7 @@
  *
  *  - Workers are POSIX pthreads spawned at create time and pinned via
  *    pthread_attr_setaffinity_np (vendored Phase A patch — see
- *    agents/harness_multi/zephyr_patches/posix-affinity.patch). We use
+ *    modelblaster/harness_multi/zephyr_patches/posix-affinity.patch). We use
  *    pthreads, not k_thread, so the API stays portable to non-Zephyr
  *    builds; the bench measured the POSIX layer cost as essentially
  *    zero on top of k_thread.
@@ -46,12 +46,12 @@
  *    pthreadpool_create(0).
  *
  *  - n_workers == 1 returns a non-NULL pool whose
- *    agents_pool_get_threads_count() reports 1; in that case
+ *    modelblaster_pool_get_threads_count() reports 1; in that case
  *    parallelize_1d runs the function on the master with no fanout.
  */
 
-#ifndef AGENTS_RUNTIME_AGENTS_POOL_H
-#define AGENTS_RUNTIME_AGENTS_POOL_H
+#ifndef MODELBLASTER_RUNTIME_MODELBLASTER_POOL_H
+#define MODELBLASTER_RUNTIME_MODELBLASTER_POOL_H
 
 #include <stddef.h>
 
@@ -59,8 +59,8 @@
 extern "C" {
 #endif
 
-struct agents_pool_state;
-typedef struct agents_pool_state *agents_pool_t;
+struct modelblaster_pool_state;
+typedef struct modelblaster_pool_state *modelblaster_pool_t;
 
 /* Create a pool with `n_workers` total threads (caller participates as
  * worker 0; n_workers-1 helper threads are spawned and pinned via
@@ -70,15 +70,15 @@ typedef struct agents_pool_state *agents_pool_t;
  * or on hard failure (out of memory, pthread_create failed). On any
  * partial failure during create we tear down anything we already
  * allocated and return NULL — never leak workers. */
-agents_pool_t agents_pool_create(int n_workers);
+modelblaster_pool_t modelblaster_pool_create(int n_workers);
 
 /* Tear down: post a "die" signal to every worker, join them, free the
  * state. Safe on a NULL pointer (no-op). */
-void agents_pool_destroy(agents_pool_t pool);
+void modelblaster_pool_destroy(modelblaster_pool_t pool);
 
 /* Total thread count (caller + helpers). pthreadpool_get_threads_count
  * returns the same convention. */
-unsigned agents_pool_get_threads_count(agents_pool_t pool);
+unsigned modelblaster_pool_get_threads_count(modelblaster_pool_t pool);
 
 /* Parallel-for across [0, range): invoke fn(ctx, i) for every i. The
  * range is partitioned across `min(range, T)` slices where T is the
@@ -89,7 +89,7 @@ unsigned agents_pool_get_threads_count(agents_pool_t pool);
  * NO_YIELD bit) — currently ignored.
  *
  * If pool == NULL, runs the loop sequentially on the calling thread. */
-void agents_pool_parallelize_1d(agents_pool_t pool,
+void modelblaster_pool_parallelize_1d(modelblaster_pool_t pool,
                                 void (*fn)(void *ctx, size_t i),
                                 void *ctx,
                                 size_t range,
@@ -99,4 +99,4 @@ void agents_pool_parallelize_1d(agents_pool_t pool,
 }
 #endif
 
-#endif /* AGENTS_RUNTIME_AGENTS_POOL_H */
+#endif /* MODELBLASTER_RUNTIME_MODELBLASTER_POOL_H */

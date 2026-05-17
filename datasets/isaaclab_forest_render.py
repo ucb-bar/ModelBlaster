@@ -28,8 +28,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agents.datasets.base import DatasetItem, register_loader
-from agents.datasets.image_dir import _resolve_path, _make_transform
+from modelblaster.datasets.base import DatasetItem, register_loader
+from modelblaster.datasets.image_dir import _resolve_path, _make_transform
 
 
 def load(spec: dict) -> list[DatasetItem]:

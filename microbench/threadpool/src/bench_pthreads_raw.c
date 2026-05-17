@@ -7,7 +7,7 @@
  *
  * Spawns N pthreads, each pinned to a hart via
  * pthread_attr_setaffinity_np (the vendored Phase-A patch — see
- * agents/harness_multi/zephyr_patches/posix-affinity.patch). Each
+ * modelblaster/harness_multi/zephyr_patches/posix-affinity.patch). Each
  * worker spins on a per-worker semaphore, processes its slice, signals
  * a per-worker done semaphore. The master gives all start sems then
  * takes all done sems.

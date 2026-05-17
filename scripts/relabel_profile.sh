@@ -8,7 +8,7 @@
 # the same labels), keeping CSV contents untouched.
 #
 # Usage:
-#   bash agents/scripts/relabel_profile.sh \
+#   bash modelblaster/scripts/relabel_profile.sh \
 #       --src-hw=rvv     --dst-hw=RVV \
 #       --src-cpu=spike  --dst-cpu=generic_riscv64
 set -euo pipefail

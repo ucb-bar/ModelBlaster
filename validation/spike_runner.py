@@ -2,16 +2,16 @@
 
 Single-model mode (single-model harness): spike stdout has one block
 between
-    === AGENTS_OUTPUT_BEGIN ===
+    === MODELBLASTER_OUTPUT_BEGIN ===
     <one float per line>
-    === AGENTS_OUTPUT_END ===
+    === MODELBLASTER_OUTPUT_END ===
 and the runner compares against the golden in --io.
 
 Multi-model mode (--models name1,name2,...): spike stdout has N blocks
 tagged by model name; the runner compares each block against
-    agents/examples/<name>/<quant>/generated/io.npz
+    modelblaster/examples/<name>/<quant>/generated/io.npz
 
-Parsing/compare/IREE-emit logic lives in agents.validation.runner_common
+Parsing/compare/IREE-emit logic lives in modelblaster.validation.runner_common
 so the firesim runner reuses it.
 """
 
@@ -24,7 +24,7 @@ import subprocess
 import sys
 from typing import Optional
 
-from agents.validation.runner_common import (
+from modelblaster.validation.runner_common import (
     BEGIN,                # re-exported for back-compat (profile_kernel.py)
     END,
     IREEProfileArgs,
@@ -34,7 +34,7 @@ from agents.validation.runner_common import (
     report_pool_sweep_run,
     report_run,
     _VERIFY_RE,           # in-binary verify summary (modern harness)
-    _WALL_RE,             # AGENTS_WALL_CYCLES — last line of every block
+    _WALL_RE,             # MODELBLASTER_WALL_CYCLES — last line of every block
 )
 
 __all__ = [
@@ -90,16 +90,16 @@ def run_spike(spike: str, elf: str, timeout: float = 60.0,
             file=sys.stderr,
         )
     # The harness reached its end-of-bench point if it emitted an
-    # AGENTS_WALL_CYCLES line (always last), an AGENTS_OUTPUT_END
-    # (legacy per-element dump), or an AGENTS_VERIFY line (modern
+    # MODELBLASTER_WALL_CYCLES line (always last), an MODELBLASTER_OUTPUT_END
+    # (legacy per-element dump), or an MODELBLASTER_VERIFY line (modern
     # in-binary compare path). Any of those means the run completed
     # cleanly enough to parse.
     has_modern = bool(_VERIFY_RE.search(out))
     has_wall = bool(_WALL_RE.search(out))
     if not timed_out and not (has_output_marker(out) or has_modern or has_wall):
         raise RuntimeError(
-            f"spike output missing AGENTS_VERIFY / AGENTS_WALL_CYCLES "
-            f"/ AGENTS_OUTPUT_BEGIN markers. cmd={cmd!r}\n"
+            f"spike output missing MODELBLASTER_VERIFY / MODELBLASTER_WALL_CYCLES "
+            f"/ MODELBLASTER_OUTPUT_BEGIN markers. cmd={cmd!r}\n"
             f"--- output ---\n{out}"
         )
     if timed_out and not (has_output_marker(out) or has_modern or has_wall):
@@ -154,8 +154,8 @@ def main() -> int:
                          "per-(model, pool) profiles under topo_<cores>.")
     ap.add_argument("--save-output", default=None,
                     help="path to write the full captured spike stdout. "
-                         "Useful for harvesting AGENTS_XPURT_TRACE blocks "
-                         "(built with -DAGENTS_XPURT_TRACE=ON) for the "
+                         "Useful for harvesting MODELBLASTER_XPURT_TRACE blocks "
+                         "(built with -DMODELBLASTER_XPURT_TRACE=ON) for the "
                          "trace plotter — spike output is otherwise "
                          "hidden behind subprocess.run(capture_output).")
     args = ap.parse_args()

@@ -96,8 +96,8 @@ body + obs_encoder stay int8 = ~280 ops vs ~600 if pure fp16).
 
 ## Implementation references
 
-- Plan: agents/notes/mixed_precision_plan.md
-- Walker: agents/pipeline/extract_graph_export.py `_ExportWalker`,
+- Plan: modelblaster/notes/mixed_precision_plan.md
+- Walker: modelblaster/pipeline/extract_graph_export.py `_ExportWalker`,
   `_quant_for`, `insert_casts`, `_resolve_op_precision`
-- Per-model API: `get_precision_spec()` in `agents/models/<name>.py`
+- Per-model API: `get_precision_spec()` in `modelblaster/models/<name>.py`
 - CLI overrides: `--fp16-ops`, `--fp16-patterns`

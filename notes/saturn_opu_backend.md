@@ -23,7 +23,7 @@ tile. The tile size depends on the bitstream's `opuParams` — at
 `V256D128 opuParams`, mlmax=16 → m1 is a 16×16 i32 tile, equivalent
 to a Gemmini 16×16 = 256 INT8 PE mesh.
 
-See `agents/cores/saturn_opu/include/saturn_opu.h` for the full
+See `modelblaster/cores/saturn_opu/include/saturn_opu.h` for the full
 encoding table and the asm-macro programming model. The canonical
 i8 matmul body, distilled from upstream
 `generators/saturn/benchmarks/opu-gemm/kernel.h::i8_mm_bme_sq`:
@@ -56,10 +56,10 @@ step.
 
 | file | purpose |
 |---|---|
-| `agents/pipeline/backends.py::RVV_OPU` | backend registration |
-| `agents/harness/backends/rvv_opu.conf` | Kconfig overlay (V kernel-only, same hygiene as rvv) |
-| `agents/cores/saturn_opu/include/saturn_opu.h` | vendored asm macros |
-| `agents/kernels/rvv_opu/` | curated-kernel directory (empty + README) |
+| `modelblaster/pipeline/backends.py::RVV_OPU` | backend registration |
+| `modelblaster/harness/backends/rvv_opu.conf` | Kconfig overlay (V kernel-only, same hygiene as rvv) |
+| `modelblaster/cores/saturn_opu/include/saturn_opu.h` | vendored asm macros |
+| `modelblaster/kernels/rvv_opu/` | curated-kernel directory (empty + README) |
 
 Plus a few one-line wiring updates: added `rvv_opu` to
 `_CACHE_AWARE_TARGETS` in `generate_kernels.py` (so the memory-model
@@ -71,9 +71,9 @@ silently rewrite to `rvv_opu_f16` (which doesn't exist).
 
 1. ~~**Curated kernels.** The first candidate is
    `rvv_opu_linear_s8_outerprod_acc.c`...~~ **First curated kernel
-   landed 2026-05-16**: `agents/kernels/rvv_opu/rvv_opu_matmul_s8_outerprod.c`,
+   landed 2026-05-16**: `modelblaster/kernels/rvv_opu/rvv_opu_matmul_s8_outerprod.c`,
    ported from upstream `opu-gemm/kernel.h::i8_mm_bme_sq`. Targets
-   the agents-flow `matmul_s8` op (used in ViNT attention's Q·Kᵀ
+   the modelblaster-flow `matmul_s8` op (used in ViNT attention's Q·Kᵀ
    and ·V matmuls — M=N=7, K=64..512). Validated 5/5 on the
    OPU-extended spike (`--extension=saturn_opu`); spike -l confirms
    `vopacc`/`opmvinbcast` actually firing in-kernel. Out-of-tile
@@ -113,9 +113,9 @@ silently rewrite to `rvv_opu_f16` (which doesn't exist).
    a scalar reference on a 4×4×3 i8 matmul and a 16×16×8 randomized
    matmul. Built into `hw/chipyard/.conda-env/riscv-tools/`. Backend's
    `spike_args=("--extension=saturn_opu","--isa=rv64gcv_zicntr")` and
-   `_run_lib.sh` auto-routes to that spike via `AGENTS_OPU_SPIKE` env.
-   See `agents/notes/saturn_opu_spike_support.md` for the design;
-   commit-ready as one atomic change with the agents-side backend code.
+   `_run_lib.sh` auto-routes to that spike via `MODELBLASTER_OPU_SPIKE` env.
+   See `modelblaster/notes/saturn_opu_spike_support.md` for the design;
+   commit-ready as one atomic change with the modelblaster-side backend code.
 
 5. **FireSim bitstream.** Needs a build with `opuParams`. Chipyard's
    `REFV256D128DualRocketSaturnOPUGemmini32x32Q31WsConfig` (currently
@@ -146,7 +146,7 @@ silently rewrite to `rvv_opu_f16` (which doesn't exist).
 - **VOPACC is destructive in md.** The accumulator IS the destination
   (`md += ...`), so any subsequent OPMVINBCAST resets it.
 
-- **No matrix-reg context switch in Zephyr.** Today the agents flow
+- **No matrix-reg context switch in Zephyr.** Today the modelblaster flow
   enters generated kernels with `irq_lock` held, so a kernel can't
   be preempted mid-OPU-sequence. If we ever drop that mask (e.g. to
   let kernel workers run preemptably), we'll need Zephyr code in
@@ -157,11 +157,11 @@ silently rewrite to `rvv_opu_f16` (which doesn't exist).
 ```
 # Build the model with rvv_opu backend, run on FireSim:
 TARGET=rvv_opu BACKEND=reference RUNNER=firesim \
-  GLOBAL_CURATED_DIR=$PWD/agents/kernels \
-  bash agents/examples/<model>/run.sh
+  GLOBAL_CURATED_DIR=$PWD/modelblaster/kernels \
+  bash modelblaster/examples/<model>/run.sh
 ```
 
-For a quick sanity check before the agents-flow integration, the
+For a quick sanity check before the modelblaster-flow integration, the
 upstream `opu-gemm` benchmark can run standalone on chipyard sims:
 
 ```
@@ -176,4 +176,4 @@ spike pk opu-gemm   # only on a Saturn-OPU-aware spike fork
 - Saturn OPU sequencer: `hw/chipyard/generators/saturn/src/main/scala/backend/OuterProductSequencer.scala`
 - Chipyard OPU configs: `hw/chipyard/generators/chipyard/src/main/scala/config/OPUConfigs.scala` (on `origin/opu-fp8`)
 - Upstream programming examples: `hw/chipyard/generators/saturn/benchmarks/opu-*` (on `origin/opu-fp8`)
-- Vendored header: `agents/cores/saturn_opu/include/saturn_opu.h`
+- Vendored header: `modelblaster/cores/saturn_opu/include/saturn_opu.h`

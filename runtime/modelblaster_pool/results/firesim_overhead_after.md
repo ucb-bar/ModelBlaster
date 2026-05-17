@@ -1,10 +1,10 @@
-# pthreadpool vs agents_pool — FireSim per-(model, pool) totals
+# pthreadpool vs modelblaster_pool — FireSim per-(model, pool) totals
 
 Per-row: sum of `mean_time_ns` across every dispatch in the results.csv. Lower is better; ratio = after / baseline.
 
-Both runs use the same generated kernels.c — the only variable is the parallel-for pool implementation: pthreadpool (xnnpack-vendored) vs agents_pool (raw pthreads + k_sem).
+Both runs use the same generated kernels.c — the only variable is the parallel-for pool implementation: pthreadpool (xnnpack-vendored) vs modelblaster_pool (raw pthreads + k_sem).
 
-| profile_dir | baseline_ns (pthreadpool) | after_ns (agents_pool) | ratio |
+| profile_dir | baseline_ns (pthreadpool) | after_ns (modelblaster_pool) | ratio |
 |---|---:|---:|---:|
 | `RVV/firesim_rocket_saturn/dronet/dronet.fp32/dronet_firesim_rocket_saturn_RVV_dronet.fp32/topo_0/results.csv` | 297,640,163 | 298,386,647 | 1.003x |
 | `RVV/firesim_rocket_saturn/dronet/dronet.fp32/dronet_firesim_rocket_saturn_RVV_dronet.fp32/topo_0_1/results.csv` | 385,112,938 | 152,624,345 | 0.396x |
@@ -37,7 +37,7 @@ Both runs use the same generated kernels.c — the only variable is the parallel
 - `topo_0_1_2_3` (pool=4): mean 13x faster (1/0.076).
 - Smaller-op model (mlp_control) sees the largest ratio (~500x) because
   its per-op work is on the order of pthreadpool's per-call overhead,
-  so dispatch cost dominated the original numbers. agents_pool's
+  so dispatch cost dominated the original numbers. modelblaster_pool's
   ~20k-cycle overhead leaves the mlp_control kernels essentially
   bottlenecked on the kernel itself again.
 - Larger-op model (dronet) sees ~6.7x at p=4, where the conv kernels
@@ -57,7 +57,7 @@ networks PASS goldens.
 
 Per-instance wall times (mtime ticks; 1 tick = 1 µs at 1 GHz target):
 
-| network    | pthreadpool | agents_pool | ratio |
+| network    | pthreadpool | modelblaster_pool | ratio |
 |---|---:|---:|---:|
 | dronet     | 281,060     | 280,936     | 1.000x |
 | mlp_control| 503         | 503         | 1.000x |

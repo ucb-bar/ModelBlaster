@@ -1,4 +1,4 @@
-"""MobileNetV2 model wrapper for the agents flow.
+"""MobileNetV2 model wrapper for the modelblaster flow.
 
 Uses torchvision's MobileNetV2 with a small width_mult and modest input
 resolution to keep the on-spike runtime bounded — the architecture (DW +
@@ -8,12 +8,12 @@ and input resolution via env vars; defaults pick a configuration that's
 small enough to verify end-to-end on spike in single-digit minutes.
 
 Env knobs:
-  AGENTS_MOBILENETV2_WIDTH_MULT   default 0.25 (8x channel reduction
+  MODELBLASTER_MOBILENETV2_WIDTH_MULT   default 0.25 (8x channel reduction
                                   vs the standard 1.0)
-  AGENTS_MOBILENETV2_INPUT        default 96 (input is 1x3xNxN); pick a
+  MODELBLASTER_MOBILENETV2_INPUT        default 96 (input is 1x3xNxN); pick a
                                   multiple of 32 so the strided blocks
                                   don't fight rounding
-  AGENTS_MOBILENETV2_NUM_CLASSES  default 1000
+  MODELBLASTER_MOBILENETV2_NUM_CLASSES  default 1000
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ import torch
 
 
 def _cfg() -> tuple[float, int, int]:
-    width_mult = float(os.environ.get("AGENTS_MOBILENETV2_WIDTH_MULT", 0.25))
-    input_size = int(os.environ.get("AGENTS_MOBILENETV2_INPUT", 96))
-    num_classes = int(os.environ.get("AGENTS_MOBILENETV2_NUM_CLASSES", 1000))
+    width_mult = float(os.environ.get("MODELBLASTER_MOBILENETV2_WIDTH_MULT", 0.25))
+    input_size = int(os.environ.get("MODELBLASTER_MOBILENETV2_INPUT", 96))
+    num_classes = int(os.environ.get("MODELBLASTER_MOBILENETV2_NUM_CLASSES", 1000))
     return width_mult, input_size, num_classes
 
 

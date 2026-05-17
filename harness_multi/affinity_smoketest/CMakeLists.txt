@@ -4,7 +4,7 @@
 # hart id each thread observes via arch_curr_cpu()->id.
 #
 # Build (from repo root, after sourcing scripts/set_envvars_sdk.sh):
-#   west build -p -b spike_riscv64 agents/harness_multi/affinity_smoketest \
+#   west build -p -b spike_riscv64 modelblaster/harness_multi/affinity_smoketest \
 #       --build-dir build/affinity_smoketest
 #   spike -p4 build/affinity_smoketest/zephyr/zephyr.elf
 

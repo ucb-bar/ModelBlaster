@@ -49,7 +49,7 @@ Consumers expecting a different dtype read through an inserted cast.
 
 ## Per-model precision spec
 
-In `agents/models/<name>.py`:
+In `modelblaster/models/<name>.py`:
 
 ```python
 def get_precision_spec() -> dict:
@@ -188,7 +188,7 @@ single-output, two scalar params.
   1 cast inserted before linear, 1 after.
 
 ### Phase 4 — user-facing API
-* `get_precision_spec()` per-model hook in `agents/models/vint.py`.
+* `get_precision_spec()` per-model hook in `modelblaster/models/vint.py`.
 * CLI: `--fp16-ops`, `--fp16-patterns` (additive to model spec).
 * `_load_model` plumbs the spec into walker init.
 

@@ -14,7 +14,7 @@ prj.conf (Kconfig)                      │ libmicroros.mk              │
                                          │  → libmicroros.a + headers │
                                          └────────────┬───────────────┘
                                                       │
-agents/examples/microros_demo/run.sh ─── west build ──┴── zephyr.elf
+modelblaster/examples/microros_demo/run.sh ─── west build ──┴── zephyr.elf
     MODELS, BACKENDS, PIN_BACKENDS,
     PIN_HARTS, PERIODS_MS, QUANTS,
     MICROROS_* knobs                                  ┌──────────────┐
@@ -27,7 +27,7 @@ agents/examples/microros_demo/run.sh ─── west build ──┴── zephyr
                                                              │
                                        uartlog (HTIF, ~6 KB/s)
                                                              │
-              ┌─── grep AGENTS_ROS_TRACE_{BEGIN,END}  ───────┘
+              ┌─── grep MODELBLASTER_ROS_TRACE_{BEGIN,END}  ───────┘
               │      WALL_CYCLES per net
               ▼
 scripts/plot_microros_trace.py ──→ Gantt PNG (per-hart lanes)
@@ -87,7 +87,7 @@ MICROROS_NO_PUBLISH=1 \
 MICROROS_2EXEC_BC=1 \
 MICROROS_2EXEC_FUSE_BC=1 \
 FIRESIM_TIMEOUT=1500 \
-bash agents/examples/microros_demo/run.sh
+bash modelblaster/examples/microros_demo/run.sh
 ```
 
 Analyze:
@@ -136,7 +136,7 @@ either being baked into `run.sh`, a new helper script, or `firesim_runner.py`.
 2. **Trace cleanup when FireSim times out.** With high periodic
    iter counts (or a `MICROROS_FUSE_BC` run that never reaches yolov8's
    cap quickly), FireSim hits its timeout before the harness emits the
-   final `=== AGENTS_ROS_TRACE_END (skipped=N corrupted) ===` line. We
+   final `=== MODELBLASTER_ROS_TRACE_END (skipped=N corrupted) ===` line. We
    then have to hand-append a synthetic END marker for plot scripts.
    The plot scripts should treat EOF or non-CSV lines as an implicit
    end-of-trace.
@@ -148,8 +148,8 @@ either being baked into `run.sh`, a new helper script, or `firesim_runner.py`.
    who want strict timing.
 
 4. **Knob plumbing.** Adding a new `MICROROS_*` knob requires touching:
-   - `agents/harness_microros/CMakeLists.txt` `foreach(knob ...)` list
-   - `agents/examples/microros_demo/run.sh` `for _knob in ...` list
+   - `modelblaster/harness_microros/CMakeLists.txt` `foreach(knob ...)` list
+   - `modelblaster/examples/microros_demo/run.sh` `for _knob in ...` list
    - source code in `main.c`
    A single Kconfig file driving both would remove two of the three
    forward-edits.
@@ -194,12 +194,12 @@ either being baked into `run.sh`, a new helper script, or `firesim_runner.py`.
 
 ## 7. Files of record
 
-* Source: `agents/harness_microros/src/main.c`,
-  `agents/harness_microros/prj.conf`,
-  `agents/harness_microros/CMakeLists.txt`
-* Build wrapper: `agents/examples/microros_demo/run.sh`
+* Source: `modelblaster/harness_microros/src/main.c`,
+  `modelblaster/harness_microros/prj.conf`,
+  `modelblaster/harness_microros/CMakeLists.txt`
+* Build wrapper: `modelblaster/examples/microros_demo/run.sh`
 * Plot scripts: `scripts/plot_microros_trace.py`,
   `scripts/plot_microros_vs_xpurt.py`, `scripts/plot_microros_compare.py`
-* Notes: `agents/examples/microros_demo/NOTES_3NET.md` (historical
+* Notes: `modelblaster/examples/microros_demo/NOTES_3NET.md` (historical
   debug log), `data/microros_vs_xpurt_3net_summary.md` (canonical
   result + fix writeup)

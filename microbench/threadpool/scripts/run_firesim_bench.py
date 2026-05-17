@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run a microbench .elf on FireSim, capture uartlog, extract CSV.
 
-This is a slim adaptation of agents/validation/firesim_runner.py. The
+This is a slim adaptation of modelblaster/validation/firesim_runner.py. The
 harness emits one or more THREADPOOL_BENCH_BEGIN/END blocks instead of
-the AGENTS_OUTPUT_BEGIN/END blocks the production runner expects, so we
+the MODELBLASTER_OUTPUT_BEGIN/END blocks the production runner expects, so we
 roll our own poll loop that stops on the first "bench_*: done" line —
 that's the marker each microbench prints right after the final CSV
 block. Polite-wait coordination (against another concurrent FireSim

@@ -15,5 +15,5 @@ examples/*/generated/
 examples/*/build/
 examples/*/cache/
 
-# agents_pool unit-test build trees.
-runtime/agents_pool/test_app/build/
+# modelblaster_pool unit-test build trees.
+runtime/modelblaster_pool/test_app/build/

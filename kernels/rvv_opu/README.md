@@ -4,8 +4,8 @@ RVV + Saturn OPU (Outer Product Unit, integer-only) hand-written kernels.
 
 ## Backend
 
-See `agents/pipeline/backends.py::RVV_OPU` and
-`agents/cores/saturn_opu/include/saturn_opu.h` for the programming
+See `modelblaster/pipeline/backends.py::RVV_OPU` and
+`modelblaster/cores/saturn_opu/include/saturn_opu.h` for the programming
 model. The OPU exposes 4 matrix registers (m0..m3) and four custom
 .insn-encoded operations (`OPMVINBCAST`, `VOPACC`, `VMV_VR`, `VMV_RV`)
 that overlay the V opcode (0x57).
@@ -17,10 +17,10 @@ to this hardware is **gemm with int8 inputs and int32 accumulator**.
 ## File naming
 
 ```
-agents/kernels/rvv_opu/rvv_opu_<op>_<algorithm>.c
+modelblaster/kernels/rvv_opu/rvv_opu_<op>_<algorithm>.c
 ```
 
-The pipeline picks these up when `--global-curated-dir agents/kernels`
+The pipeline picks these up when `--global-curated-dir modelblaster/kernels`
 is passed and the `AlgorithmCandidate` in `reference_kernels.py`
 declares `target_affinity=("rvv_opu",)` for the matching op/algorithm.
 
@@ -49,8 +49,8 @@ These live in chipyard's saturn submodule, not in this repo. Use
 
 ```
 TARGET=rvv_opu BACKEND=reference RUNNER=firesim \
-  GLOBAL_CURATED_DIR=/abs/path/to/zephyr-chipyard-sw/agents/kernels \
-  bash agents/examples/<model>/run.sh
+  GLOBAL_CURATED_DIR=/abs/path/to/zephyr-chipyard-sw/modelblaster/kernels \
+  bash modelblaster/examples/<model>/run.sh
 ```
 
 `RUNNER=spike` will currently fail on the first OPU instruction —

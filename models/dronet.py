@@ -1,4 +1,4 @@
-"""DroNet model wrapper for the agents flow.
+"""DroNet model wrapper for the modelblaster flow.
 
 Sources the canonical PyTorch class from qnn_models/dronet.py and loads the
 latest trained checkpoint by default. The trained config is:
@@ -10,7 +10,7 @@ Both 128×128×1 (the original demo) and 112×112×3 (the trained config) yield
 linear_in=2048 with small=True; we follow the trained config so the loaded
 weights match.
 
-Override the checkpoint path via AGENTS_DRONET_CKPT.
+Override the checkpoint path via MODELBLASTER_DRONET_CKPT.
 """
 
 from __future__ import annotations
@@ -52,11 +52,11 @@ def get_model(seed: int = 0):
         output_dim=1,
         small=True,
     )
-    ckpt_path = os.environ.get("AGENTS_DRONET_CKPT", _DEFAULT_CKPT)
+    ckpt_path = os.environ.get("MODELBLASTER_DRONET_CKPT", _DEFAULT_CKPT)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"DroNet checkpoint not found at {ckpt_path}. "
-            f"Set AGENTS_DRONET_CKPT to override."
+            f"Set MODELBLASTER_DRONET_CKPT to override."
         )
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "model_state_dict" in sd:

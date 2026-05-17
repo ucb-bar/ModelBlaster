@@ -9,7 +9,7 @@ networks contribute to the same bucket, so e.g. the "Conv" bucket
 mixes every conv2d_s8 dispatch from dronet + yolov8_nano.
 
 Inputs: per-(network, backend) profile.csv files. Each row has
-`dispatch_id, name, op, shape, cycles` (the AGENTS_PROFILE_BEGIN/END
+`dispatch_id, name, op, shape, cycles` (the MODELBLASTER_PROFILE_BEGIN/END
 schema emitted by harness/src/main.c) OR
 `dispatch_id, ..., op, shape, cycles` (the sweep_v8 results.csv
 schema, post-processed).
@@ -18,7 +18,7 @@ Default cycle counter: k_cycle_get_64 mtime ticks at 1 MHz, so ms =
 cycles / 1000.
 
 Usage:
-    python -m agents.scripts.plot_firesim_op_distributions \\
+    python -m modelblaster.scripts.plot_firesim_op_distributions \\
         --backend scalar=dronet=plots/speedup/dronet_scalar_firesim.csv \\
         --backend scalar=yolov8_nano=plots/speedup/yolov8_scalar_firesim.csv \\
         --backend rvv=dronet=$DRONET_RVV_CSV \\
@@ -251,7 +251,7 @@ def main():
     if not points:
         raise SystemExit("no (bucket, backend) data points collected.")
 
-    # The "cycles" column in the sweep_v8 CSVs and the harness AGENTS_PROFILE
+    # The "cycles" column in the sweep_v8 CSVs and the harness MODELBLASTER_PROFILE
     # output is actually nanoseconds (matches mean_time_ns; 1 unit = 1 ns
     # at the FireSim Saturn target frequency, ~60 MHz). To get ms we
     # divide by 1e6.

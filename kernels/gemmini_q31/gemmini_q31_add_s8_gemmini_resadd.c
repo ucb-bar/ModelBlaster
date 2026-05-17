@@ -5,7 +5,7 @@
  *         C[i] = sat_int8(round(A_scale * A[i] + B_scale * B[i]) * C_scale)
  *         with optional ReLU fused into the requantize tail.
  *
- *         Maps the agents add_s8 contract:
+ *         Maps the modelblaster add_s8 contract:
  *           output[i] = round((a[i]*scale_a + b[i]*scale_b) / scale_out)
  *           clamp to [activation_min, activation_max]
  *         to gemmini parameters:

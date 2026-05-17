@@ -9,7 +9,7 @@ mlp_control → gemmini/hart0.
 
 ## Changes Made
 
-### 1. `agents/harness_microros/prj.conf`
+### 1. `modelblaster/harness_microros/prj.conf`
 ```diff
 -CONFIG_MICROROS_NODES="2"
 -CONFIG_MICROROS_PUBLISHERS="2"
@@ -22,7 +22,7 @@ in `colcon.meta`. With MAX_NODES=2, the 3rd `rclc_node_init_default` call
 failed because the global node pool was full. Setting to 4 allows up to 4
 simultaneous ROS nodes.
 
-### 2. `agents/harness_microros/src/main.c` — NET_C support (MICROROS_3NET)
+### 2. `modelblaster/harness_microros/src/main.c` — NET_C support (MICROROS_3NET)
 - Added `#include "net_c_includes.h"`, dispatch table extern, output buffer,
   state struct, thread stack, thread struct for net_c.
 - Added `run_graph_c()` dispatch loop (mirrors `run_graph_a` pattern).
@@ -35,13 +35,13 @@ simultaneous ROS nodes.
 - `irq_lock()` around `run_graph_a` and `run_graph_c` to prevent V-state
   context-switch corruption (same as existing `run_graph_b` protection).
 
-### 3. `agents/harness_microros/CMakeLists.txt`
+### 3. `modelblaster/harness_microros/CMakeLists.txt`
 - Extended to accept 2 or 3 models.
 - When 3 models: defines `MICROROS_3NET=1`, `NET_C_NAME`, `NET_C_BACKEND`,
   `NET_C_HART`, `NET_C_PERIOD_MS`.
 - Generates `net_c_includes.h`.
 
-### 4. `agents/examples/microros_demo/run.sh`
+### 4. `modelblaster/examples/microros_demo/run.sh`
 - Changed model count check from `-ne 2` to `-lt 2 || -gt 3`.
 - Added `QUANTS` env variable: comma list of per-model quant modes
   (parallel to MODELS). Falls back to uniform `$QUANT` if unset.
@@ -77,7 +77,7 @@ RUNNER=firesim \
 FORCE_REGEN=0 \
 MICROROS_NO_PUBLISH=1 \
 FIRESIM_TIMEOUT=900 \
-bash agents/examples/microros_demo/run.sh
+bash modelblaster/examples/microros_demo/run.sh
 ```
 
 ### Env Variables Explained

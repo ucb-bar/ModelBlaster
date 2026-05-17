@@ -23,14 +23,14 @@
  * Run window: net_a (periodic) keeps firing on its timer until net_b
  * (one-shot, the "long-running" network) completes its first iteration.
  * On net_b done both threads exit, main prints a CSV trace block + the
- * AGENTS_WALL_CYCLES markers, then reboots. Mirrors the periodic-dronet-
+ * MODELBLASTER_WALL_CYCLES markers, then reboots. Mirrors the periodic-dronet-
  * during-yolov8-window pattern that the xpurt schedule expresses, so the
  * two harnesses' traces are directly comparable.
  *
  * Each dispatch within a network call is wrapped with k_cycle_get_64()
  * reads; tuples are appended to ros_trace[] and emitted as a single CSV
  * block once net_b completes — same trace-CSV shape as harness_xpurt's
- * AGENTS_XPURT_TRACE block (entry_id, network, instance, dispatch_id,
+ * MODELBLASTER_XPURT_TRACE block (entry_id, network, instance, dispatch_id,
  * op, name, kind, hart, start_cycles, end_cycles), with op+name left
  * blank (the host plotter resolves them by dispatch_id from the model's
  * graph.json). Cycle values are wall-relative to a single global t0
@@ -354,7 +354,7 @@ static void run_graph_b(void) {
 #  if !defined(MICROROS_MASK_TIMER) && !defined(MICROROS_MASK_IPI) && !defined(MICROROS_MASK_EXT)
     /* Default: MSIE (M-mode software interrupt = IPI) — bisected as
      * the minimum sufficient mask to suppress the yolov8 vtype-desync
-     * fault on hart 1.  See agents/notes/zephyr_rvv_fix_summary.md
+     * fault on hart 1.  See modelblaster/notes/zephyr_rvv_fix_summary.md
      * "ISR bisection (2026-05-08, fifth pass)".  MASK_TIMER alone and
      * MASK_EXT alone both fail to suppress; only MSIE-or-broader masks
      * produce a clean PASSED run with the irq_lock baseline's
@@ -1137,7 +1137,7 @@ static void emit_trace_block(void) {
     }
     printk("=== TRACE_MAGIC_AUDIT: %d/%d slots missing ROS_TRACE_MAGIC ===\n",
            no_magic, n);
-    printk("=== AGENTS_ROS_TRACE_BEGIN ===\n");
+    printk("=== MODELBLASTER_ROS_TRACE_BEGIN ===\n");
     printk("entry_id,network,instance,dispatch_id,op,name,kind,hart,start_cycles,end_cycles\n");
     int skipped = 0;
     for (int i = 0; i < n; i++) {
@@ -1153,7 +1153,7 @@ static void emit_trace_block(void) {
                (unsigned long long)s->start_cycles,
                (unsigned long long)s->end_cycles);
     }
-    printk("=== AGENTS_ROS_TRACE_END (skipped=%d corrupted) ===\n", skipped);
+    printk("=== MODELBLASTER_ROS_TRACE_END (skipped=%d corrupted) ===\n", skipped);
 }
 
 int main(void) {
@@ -1360,12 +1360,12 @@ int main(void) {
 #ifndef MICROROS_SKIP_TRACE
     emit_trace_block();
 #endif
-    printk("=== AGENTS_WALL_CYCLES [" NET_A_NAME "] === %llu\n",
+    printk("=== MODELBLASTER_WALL_CYCLES [" NET_A_NAME "] === %llu\n",
            (unsigned long long)ctx_a.wall_cycles);
-    printk("=== AGENTS_WALL_CYCLES [" NET_B_NAME "] === %llu\n",
+    printk("=== MODELBLASTER_WALL_CYCLES [" NET_B_NAME "] === %llu\n",
            (unsigned long long)ctx_b.wall_cycles);
 #ifdef MICROROS_3NET
-    printk("=== AGENTS_WALL_CYCLES [" NET_C_NAME "] === %llu\n",
+    printk("=== MODELBLASTER_WALL_CYCLES [" NET_C_NAME "] === %llu\n",
            (unsigned long long)ctx_c.wall_cycles);
 #endif
     sys_reboot(SYS_REBOOT_COLD);

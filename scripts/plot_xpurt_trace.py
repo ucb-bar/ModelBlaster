@@ -1,8 +1,8 @@
 """Reconstruct a Gantt timeline from an xpurt execution trace.
 
 The schedule-driven harness (`harness_xpurt`) emits a CSV block between
-``=== AGENTS_XPURT_TRACE_BEGIN ===`` and ``=== AGENTS_XPURT_TRACE_END ===``
-when built with ``-DAGENTS_XPURT_TRACE=ON``. Each row carries:
+``=== MODELBLASTER_XPURT_TRACE_BEGIN ===`` and ``=== MODELBLASTER_XPURT_TRACE_END ===``
+when built with ``-DMODELBLASTER_XPURT_TRACE=ON``. Each row carries:
 
   entry_id, network, instance, dispatch_id, op, name, core_kind, hart,
   predicted_start_ms, predicted_duration_ms, worker_kind_idx,
@@ -20,11 +20,11 @@ for tuning the schedule against measured cost.
 
 Usage:
     spike -p4 build/.../zephyr.elf > trace.log
-    python -m agents.scripts.plot_xpurt_trace trace.log \\
+    python -m modelblaster.scripts.plot_xpurt_trace trace.log \\
         --clock-mhz 1000 --out plots/xpurt_trace.png
 
 Or pipe directly:
-    spike -p4 .../zephyr.elf | python -m agents.scripts.plot_xpurt_trace - \\
+    spike -p4 .../zephyr.elf | python -m modelblaster.scripts.plot_xpurt_trace - \\
         --out plots/xpurt_trace.png
 """
 
@@ -38,8 +38,8 @@ import sys
 from dataclasses import dataclass
 
 
-_BEGIN = "=== AGENTS_XPURT_TRACE_BEGIN ==="
-_END = "=== AGENTS_XPURT_TRACE_END ==="
+_BEGIN = "=== MODELBLASTER_XPURT_TRACE_BEGIN ==="
+_END = "=== MODELBLASTER_XPURT_TRACE_END ==="
 
 
 @dataclass
@@ -74,7 +74,7 @@ def _extract_block(text: str) -> str:
     if _BEGIN not in text or _END not in text:
         raise SystemExit(
             "trace markers not found — was the binary built with "
-            "-DAGENTS_XPURT_TRACE=ON, and was the full spike output "
+            "-DMODELBLASTER_XPURT_TRACE=ON, and was the full spike output "
             "captured into the input?"
         )
     start = text.index(_BEGIN) + len(_BEGIN)
