@@ -81,7 +81,8 @@ else
     python -m modelblaster.pipeline.extract_graph \
         --model "${MODEL_NAME}" \
         --out-dir "${IR_DIR}" \
-        --quant "${QUANT}"
+        --quant "${QUANT}" \
+        --num-calibration "${NUM_CALIBRATION:-1}"
 fi
 
 # Post-extract auto-promote: if the IR contains any fp16 ops (mixed

@@ -528,15 +528,19 @@ def extract_int8(
     sample_input: torch.Tensor,
     name: str,
     out_dir: str,
+    calibration_samples: "list[torch.Tensor] | None" = None,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
     Approach (intentionally minimal first cut):
       * Per-tensor symmetric quant for both weights and activations
         (zero_point = 0 throughout).
-      * Activation scales calibrated from a single forward pass on
-        `sample_input`. Crude but reproducible; replace with a real
-        calibration set later.
+      * Activation scales calibrated from a forward pass on
+        `sample_input` (for the IR's tensor shapes + io.npz golden).
+        When ``calibration_samples`` is provided, per-tensor activation
+        max-abs is aggregated across all of them so the int8 scale of
+        each tensor reflects the worst-case dynamic range over the
+        whole calibration set (not just the io-pinned single sample).
       * Fuses `linear -> relu` into a single `linear_s8` op with
         `activation_min = 0` (the relu becomes a clamp inside the requantize
         tail). Standalone relu nodes get an explicit `relu_s8` op.
@@ -559,11 +563,36 @@ def extract_int8(
     # to special-case here.
     _ = final
 
-    # Per-tensor scales (input + every node output).
-    scales: dict[str, float] = {}
-    scales[next(iter(gm.graph.nodes)).name] = _scale_from_max_abs(sample_input)
+    # Per-tensor activation max-abs, aggregated across the full
+    # calibration set when one is supplied. Each extra sample widens the
+    # per-tensor max-abs to its true distribution-wide bound, which is
+    # what fixes the cls-logit saturation seen with single-sample
+    # calibration on detection models.
+    input_node_name = next(iter(gm.graph.nodes)).name
+    max_abs: dict[str, float] = {}
+    max_abs[input_node_name] = float(sample_input.detach().abs().max().item())
     for nname, t in cap.tensors.items():
-        scales[nname] = _scale_from_max_abs(t)
+        max_abs[nname] = float(t.detach().abs().max().item())
+
+    if calibration_samples:
+        extra = [s for s in calibration_samples
+                 if s is not sample_input]
+        for i, s in enumerate(extra):
+            cap_i = _CaptureTensors(gm)
+            cap_i.run(s)
+            cur = float(s.detach().abs().max().item())
+            if cur > max_abs[input_node_name]:
+                max_abs[input_node_name] = cur
+            for nname, t in cap_i.tensors.items():
+                cur = float(t.detach().abs().max().item())
+                if cur > max_abs.get(nname, 0.0):
+                    max_abs[nname] = cur
+        print(f"[extract_int8] calibrated across "
+              f"{1 + len(extra)} samples", flush=True)
+
+    scales: dict[str, float] = {
+        k: max(v, 1e-8) / _INT8_RANGE for k, v in max_abs.items()
+    }
 
     tensors_meta: dict[str, dict] = {}
     weights_blob: dict[str, np.ndarray] = {}
@@ -1321,6 +1350,7 @@ def extract(
     name: str,
     out_dir: str,
     quant: str = "fp32",
+    calibration_samples: "list[torch.Tensor] | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -1336,7 +1366,10 @@ def extract(
     fp32-traced numerics down-cast at the boundary.
     """
     if quant == "int8":
-        return extract_int8(model, sample_input, name, out_dir)
+        return extract_int8(
+            model, sample_input, name, out_dir,
+            calibration_samples=calibration_samples,
+        )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
             f"quant={quant!r} not supported (have: fp32, fp16, int8)"
@@ -2412,6 +2445,15 @@ def main() -> None:
                          "When provided, the post-extraction pass validates "
                          "every dispatch's hardware_target against the listed "
                          "cores' capabilities and aborts on mismatch.")
+    ap.add_argument("--num-calibration", type=int, default=1,
+                    help="number of calibration samples for int8 PTQ. With "
+                         ">1, per-tensor activation max-abs is aggregated "
+                         "across the model's get_calibration_spec() or "
+                         "get_calibration_samples() result so scales reflect "
+                         "the worst-case dynamic range over the whole set "
+                         "instead of a single frame. Detection / segmentation "
+                         "models need ~16 to avoid cls-logit saturation. "
+                         "No-op for fp32 / fp16.")
     args = ap.parse_args()
 
     if args.model == "mlp_generic":
@@ -2431,8 +2473,40 @@ def main() -> None:
     model = model_mod.get_model()
     sample = model_mod.get_sample_input()
 
+    calibration_samples = None
+    if args.quant == "int8" and args.num_calibration > 1:
+        if hasattr(model_mod, "get_calibration_spec"):
+            from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
+            spec = model_mod.get_calibration_spec(args.num_calibration)
+            print(f"[extract_graph] resolving calibration spec "
+                  f"({args.num_calibration} samples) ...", flush=True)
+            materialized = materialize_calibration_samples(spec)
+            # FX path is single-input; pull the first declared input tensor
+            # out of each sample dict (preserves spec ordering).
+            input_keys = list(spec["inputs"].keys())
+            primary = input_keys[0]
+            calibration_samples = [d[primary] for d in materialized]
+            # The first sample becomes the io.npz golden anchor so the
+            # in-binary verify continues to match. Order is preserved by
+            # get_calibration_spec; the rest just widen activation ranges.
+            sample = calibration_samples[0]
+        elif hasattr(model_mod, "get_calibration_samples"):
+            print(f"[extract_graph] loading {args.num_calibration} "
+                  f"calibration samples via {args.model}."
+                  f"get_calibration_samples ...", flush=True)
+            calibration_samples = list(model_mod.get_calibration_samples(
+                args.num_calibration))
+            sample = calibration_samples[0]
+        else:
+            print(f"[extract_graph] WARN: --num-calibration "
+                  f"{args.num_calibration} requested but {args.model} "
+                  f"defines neither get_calibration_spec nor "
+                  f"get_calibration_samples; falling back to single "
+                  f"get_sample_input()", flush=True)
+
     extract(model, sample, name=args.model, out_dir=args.out_dir,
-            quant=args.quant)
+            quant=args.quant,
+            calibration_samples=calibration_samples)
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry

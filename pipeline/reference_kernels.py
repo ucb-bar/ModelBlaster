@@ -5229,6 +5229,182 @@ void kernel_pad_f16(const _Float16 *input, _Float16 *output,
 
 
 # ---------------------------------------------------------------------------
+# YOLOv8-nano fp16 op set: silu_f16, upsample_nearest_f16, cat{3,4}_c1_f16.
+# Same semantics as the fp32 versions, _Float16 buffers throughout.
+# ---------------------------------------------------------------------------
+
+
+def _silu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+SILU_F16 = KernelSpec(
+    op="silu_f16",
+    signature="void kernel_silu_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Elementwise SiLU (Swish) on a contiguous _Float16 buffer:\n"
+        "  output[i] = input[i] * sigmoid(input[i])  for i in [0, n)\n"
+        "Reference computes sigmoid in float32 (to avoid the exp underflow\n"
+        "stall on small _Float16 inputs) then casts the product back to\n"
+        "_Float16. Safe for `input` and `output` to alias."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_silu_f16(const _Float16 *input, _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)input[i];
+        float s = 1.0f / (1.0f + expf(-v));
+        output[i] = (_Float16)(v * s);
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_silu_f16_argtypes,
+)
+
+
+def _upsample_nearest_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+
+
+UPSAMPLE_NEAREST_F16 = KernelSpec(
+    op="upsample_nearest_f16",
+    signature=(
+        "void kernel_upsample_nearest_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int C, int IH, int IW, int scale)"
+    ),
+    semantics=(
+        "Nearest-neighbor 2D upsampling along H and W by integer factor `scale`,\n"
+        "for _Float16 NCHW tensors. Output shape (N, C, IH*scale, IW*scale);\n"
+        "each output pixel (oh, ow) reads input pixel (oh/scale, ow/scale)."
+    ),
+    reference_impl="""\
+void kernel_upsample_nearest_f16(const _Float16 *input, _Float16 *output,
+                                 int N, int C, int IH, int IW, int scale) {
+    int OH = IH * scale, OW = IW * scale;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih = oh / scale;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw = ow / scale;
+                    output[((n*C + c)*OH + oh)*OW + ow] =
+                        input[((n*C + c)*IH + ih)*IW + iw];
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4,  "IH": 5,  "IW": 5,  "scale": 2},
+        {"N": 1, "C": 16, "IH": 10, "IW": 10, "scale": 2},
+    ],
+    argtypes_factory=_upsample_nearest_f16_argtypes,
+)
+
+
+def _cat3_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, ctypes.c_int, h, ctypes.c_int, h, ctypes.c_int,
+            h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _cat4_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, ctypes.c_int, h, ctypes.c_int, h, ctypes.c_int,
+            h, ctypes.c_int,
+            h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+CAT3_C1_F16 = KernelSpec(
+    op="cat3_c1_f16",
+    signature=(
+        "void kernel_cat3_c1_f16(const _Float16 *in0, int c0, "
+        "const _Float16 *in1, int c1, const _Float16 *in2, int c2, "
+        "_Float16 *out, int N, int H, int W)"
+    ),
+    semantics=(
+        "Half-precision channel-wise concat of three NCHW tensors (dim=1).\n"
+        "Output shape (N, c0+c1+c2, H, W). Pure copy."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_cat3_c1_f16(const _Float16 *in0, int c0,
+                        const _Float16 *in1, int c1,
+                        const _Float16 *in2, int c2,
+                        _Float16 *out, int N, int H, int W) {
+    int C = c0 + c1 + c2;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        _Float16 *dst = out + n * C * HW;
+        memcpy(dst, in0 + n*c0*HW, sizeof(_Float16) * (size_t)(c0*HW));
+        dst += c0 * HW;
+        memcpy(dst, in1 + n*c1*HW, sizeof(_Float16) * (size_t)(c1*HW));
+        dst += c1 * HW;
+        memcpy(dst, in2 + n*c2*HW, sizeof(_Float16) * (size_t)(c2*HW));
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 16, "c1": 16, "c2": 16, "N": 1, "H": 8, "W": 8},
+    ],
+    argtypes_factory=_cat3_c1_f16_argtypes,
+)
+
+
+CAT4_C1_F16 = KernelSpec(
+    op="cat4_c1_f16",
+    signature=(
+        "void kernel_cat4_c1_f16(const _Float16 *in0, int c0, "
+        "const _Float16 *in1, int c1, const _Float16 *in2, int c2, "
+        "const _Float16 *in3, int c3, "
+        "_Float16 *out, int N, int H, int W)"
+    ),
+    semantics=(
+        "Half-precision channel-wise concat of four NCHW tensors (dim=1).\n"
+        "Output shape (N, c0+c1+c2+c3, H, W). Pure copy."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_cat4_c1_f16(const _Float16 *in0, int c0,
+                        const _Float16 *in1, int c1,
+                        const _Float16 *in2, int c2,
+                        const _Float16 *in3, int c3,
+                        _Float16 *out, int N, int H, int W) {
+    int C = c0 + c1 + c2 + c3;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        _Float16 *dst = out + n * C * HW;
+        memcpy(dst, in0 + n*c0*HW, sizeof(_Float16) * (size_t)(c0*HW));
+        dst += c0 * HW;
+        memcpy(dst, in1 + n*c1*HW, sizeof(_Float16) * (size_t)(c1*HW));
+        dst += c1 * HW;
+        memcpy(dst, in2 + n*c2*HW, sizeof(_Float16) * (size_t)(c2*HW));
+        dst += c2 * HW;
+        memcpy(dst, in3 + n*c3*HW, sizeof(_Float16) * (size_t)(c3*HW));
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 8, "c1": 8, "c2": 8, "c3": 8, "N": 1, "H": 8, "W": 8},
+    ],
+    argtypes_factory=_cat4_c1_f16_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
 # YOLOv8-nano support: silu / upsample_nearest / cat{2,3,4}_c1.
 # silu and upsample_nearest are pointwise enough that the reference is
 # obviously correct; the cat kernels are pure memcpy along the channel
@@ -6763,7 +6939,11 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "adaptive_avg_pool2d_f16": ADAPTIVE_AVG_POOL2D_F16,
     "slice_c_f16": SLICE_C_F16,
     "cat2_c1_f16": CAT2_C1_F16,
+    "cat3_c1_f16": CAT3_C1_F16,
+    "cat4_c1_f16": CAT4_C1_F16,
     "pad_f16": PAD_F16,
+    "silu_f16": SILU_F16,
+    "upsample_nearest_f16": UPSAMPLE_NEAREST_F16,
     # YOLOv8-nano fp32 support.
     "silu": SILU,
     "upsample_nearest": UPSAMPLE_NEAREST,
