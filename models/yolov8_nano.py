@@ -391,9 +391,108 @@ def get_model(seed: int = 0):
 
 
 def get_sample_input(seed: int = 1) -> torch.Tensor:
-    """Synthetic NCHW frame at the configured resolution. The downstream
-    pipeline uses the SAME random seed to regenerate this for the
-    PyTorch golden, so the on-spike compare is apples-to-apples."""
+    """One real-image frame at the configured resolution, NCHW float
+    in [0, 1] (matches ultralytics yolov8 preprocessing — divide by 255).
+
+    Real-image calibration is critical for detection PTQ. With
+    `torch.randn` activation scales saturated the cls-head logits and
+    produced 50 false-positive detections at confidence=1.0 (verified
+    in compare_detections.py before this change). One IDSIA forest-trail
+    frame gives realistic activation ranges across the backbone and
+    detect head; the resulting int8 ceiling tracks fp32 wrapper within
+    1–2 ulp instead of L∞≈59.
+
+    Override the source via ``MODELBLASTER_YOLOV8N_CALIB_IMAGE`` (path,
+    absolute or repo-root-relative). Falls back to `torch.randn` only
+    if the file is missing, with a warning."""
+    import os
+    from pathlib import Path
+
     img, _, _ = _cfg()
+    src = os.environ.get(
+        "MODELBLASTER_YOLOV8N_CALIB_IMAGE",
+        "datasets/idsia/samples/sc/000_seg001_00000388.jpg")
+
+    # Resolve repo-root-relative paths the same way the image_dir loader
+    # does (search _REPO_ROOT and its parent).
+    p = Path(src)
+    if not p.is_absolute():
+        repo_root = Path(__file__).resolve().parents[2]  # zephyr-chipyard-sw/
+        for root in (repo_root, repo_root.parent, Path.cwd()):
+            cand = root / src
+            if cand.exists():
+                p = cand
+                break
+
+    if p.is_file():
+        try:
+            from PIL import Image  # noqa: PLC0415
+            from torchvision import transforms  # noqa: PLC0415
+            tfm = transforms.Compose([
+                transforms.Resize((img, img)),
+                transforms.ToTensor(),  # HWC [0,255] -> CHW [0,1]
+            ])
+            pil = Image.open(p).convert("RGB")
+            return tfm(pil).unsqueeze(0)  # (1, 3, img, img)
+        except Exception as e:
+            print(f"[yolov8_nano.get_sample_input] WARN: couldn't load "
+                  f"{p} ({e}); falling back to torch.randn.")
+
+    print(f"[yolov8_nano.get_sample_input] WARN: {src} not found — "
+          f"falling back to torch.randn (won't give meaningful PTQ "
+          f"calibration). Set MODELBLASTER_YOLOV8N_CALIB_IMAGE to a "
+          f"real RGB image to fix.")
     g = torch.Generator().manual_seed(seed)
     return torch.randn(1, 3, img, img, generator=g)
+
+
+def get_calibration_spec(num_samples: int = 16) -> dict:
+    """Declarative calibration spec for the modelblaster/datasets loader.
+
+    Single-input model — the input tensor is named ``x`` in the IR
+    (matches the forward signature). For a detection model trained on
+    natural images, calibrating activation scales from a few real
+    photographs is far better than `torch.randn` (the random distribution
+    saturates the cls-head logits during requantize; verdict section
+    of compare_detections.py auto-fires when this happens).
+
+    Default source: IDSIA forest-trail samples (60 RGB jpgs at 1280×720,
+    resized to the configured input size). Not COCO but natural enough
+    to give realistic activation ranges for the early backbone layers
+    where the worst saturation otherwise occurs.
+
+    Override the dataset dir via ``MODELBLASTER_YOLOV8N_CALIB_DIR``
+    (path under datasets/, repo-root-relative). To use COCO val you
+    can point it there directly — the image_dir loader is path-agnostic.
+
+    Normalization: ``"none"`` (0–1 RGB after ToTensor), matching
+    ultralytics' yolov8 preprocessing (`/255` and CHW). NOT imagenet
+    normalize (that's a classification-model convention; detection
+    networks trained with ultralytics expect 0–1 input).
+    """
+    import os
+    img, _, _ = _cfg()
+    src = os.environ.get(
+        "MODELBLASTER_YOLOV8N_CALIB_DIR", "datasets/idsia/samples/sc")
+    return {
+        "num_samples": num_samples,
+        "inputs": {
+            "x": {
+                "loader": "image_dir",
+                "path": src,
+                "image_size": [img, img],
+                "normalize": "none",
+                "compose": {"kind": "one_per_sample"},
+            },
+        },
+    }
+
+
+def get_calibration_samples(n: int = 16) -> list[tuple[torch.Tensor, ...]]:
+    """Back-compat wrapper around ``get_calibration_spec``: walks the
+    spec and returns a list of single-input tuples. Used by some old
+    callers; the walker prefers ``get_calibration_spec`` directly."""
+    from modelblaster.datasets.base import materialize_calibration_samples
+    spec = get_calibration_spec(n)
+    raw = materialize_calibration_samples(spec)
+    return [(item["x"],) for item in raw]

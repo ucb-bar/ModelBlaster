@@ -692,9 +692,12 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
     for op in ir["ops"]:
         if op["op"] == "view":
             aliases[op["outputs"][0]] = op["inputs"][0]
-        elif op["op"] == "chunk2_c1":
+        elif op["op"] in ("chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"):
             # Two outputs: first half at offset 0, second half at offset
-            # c_each*H*W (in floats — pointer arithmetic on the base type).
+            # c_each*H*W (in elements — pointer arithmetic on the base type).
+            # All three dtype variants share identical offset semantics; only
+            # the base buffer's element size differs, and the codegen below
+            # uses typed pointers so we don't need to special-case here.
             base = op["inputs"][0]
             sh = op["shape"]
             elem_offset = sh["c_each"] * sh["H"] * sh["W"]
@@ -704,7 +707,7 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
     # Number of ops that actually emit a kernel call (used to size the profile
     # record array). chunk2_c1 is a no-op at runtime (just sets up offset
     # aliases at codegen time), so it doesn't contribute either.
-    _zero_cost_ops = {"view", "chunk2_c1"}
+    _zero_cost_ops = {"view", "chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"}
     op_count = sum(1 for op in ir["ops"] if op["op"] not in _zero_cost_ops)
     used_ops = {op["op"] for op in ir["ops"] if op["op"] not in _zero_cost_ops}
 
@@ -1491,6 +1494,27 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_cat2_c1_f16({a_ptr}, {b_ptr}, {out_ptr}, "
                 f"{sh['N']}, {sh['H']}, {sh['W']}, {ca}, {cb})"
+            )
+        elif op["op"] in ("cat3_c1_f16", "cat4_c1_f16"):
+            sh = op["shape"]
+            in_ptrs = [ptr_for(n, "in") for n in op["inputs"]]
+            cs = sh["C_inputs"]
+            call = (
+                f"kernel_{op['op']}("
+                + ", ".join(f"{p}, {c}" for p, c in zip(in_ptrs, cs))
+                + f", {out_ptr}, {sh['N']}, {sh['H']}, {sh['W']})"
+            )
+        elif op["op"] == "silu_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_silu_f16({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "upsample_nearest_f16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_upsample_nearest_f16({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['scale']})"
             )
         elif op["op"] == "pad_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
