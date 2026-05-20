@@ -1,0 +1,97 @@
+# Per-LLM-model token pricing. Used by aggregate.compute_cost_usd to
+# derive `dollars_equivalent` from tokens_input_cached / _uncached /
+# output. Rates are $ per million tokens (MTok).
+#
+# Rates rotate. Update this file (and only this file) to re-price the
+# entire dashboard.
+
+last_updated: 2026-05-20
+sources:
+  anthropic: https://platform.claude.com/docs/en/about-claude/pricing
+  bedrock:   https://aws.amazon.com/bedrock/pricing/
+
+# Claude API (first-party) rates. Cache writes have two flavors:
+# 5-minute and 1-hour. The 5-minute write is the default and what the
+# Claude Code session JSONL records. If 1-hour writes ever appear in
+# session telemetry, extend the aggregator and the schema accordingly.
+models:
+
+  claude-opus-4-7:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: anthropic
+
+  claude-opus-4-6:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: anthropic
+
+  claude-opus-4-5:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: anthropic
+
+  claude-sonnet-4-6:
+    input_uncached:        3.00
+    cache_write_5m:        3.75
+    cache_write_1h:        6.00
+    cache_read:            0.30
+    output:               15.00
+    provider: anthropic
+
+  claude-sonnet-4-5:
+    input_uncached:        3.00
+    cache_write_5m:        3.75
+    cache_write_1h:        6.00
+    cache_read:            0.30
+    output:               15.00
+    provider: anthropic
+
+  claude-haiku-4-5:
+    input_uncached:        1.00
+    cache_write_5m:        1.25
+    cache_write_1h:        2.00
+    cache_read:            0.10
+    output:                5.00
+    provider: anthropic
+
+  # AWS Bedrock — Arm B per-op kernel synthesis + beam reranker.
+  # The Bedrock pricing page does not surface current Llama 4 rates;
+  # the values below are placeholders. Update once published rates are
+  # available, or once the actual Bedrock invoice line items can be
+  # cross-referenced.
+  us.meta.llama4-maverick-17b-instruct-v1:0:
+    input_uncached:        null
+    cache_read:            null
+    output:                null
+    provider: bedrock
+    placeholder: true
+
+  # Claude on Bedrock — different rates from first-party Anthropic
+  # because Bedrock prices Claude separately. The Sonnet 3.5 rate
+  # below is the one published on the Bedrock pricing page; Claude 4.x
+  # on Bedrock follows a similar pattern but is not always surfaced.
+  us.anthropic.claude-3-5-sonnet-v2:
+    input_uncached:        6.00
+    cache_write_5m:        7.50
+    cache_read:            0.60
+    output:               30.00
+    provider: bedrock
+
+# Fallback applied when a model id in the logs has no match here. The
+# aggregator emits a warning so missing entries surface immediately
+# rather than silently zero-costing.
+fallback:
+  input_uncached:        3.00
+  cache_read:            0.30
+  output:               15.00
+  provider: unknown

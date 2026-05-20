@@ -1,0 +1,45 @@
+# The things being measured — workload + execution environment. One
+# row per (model, quant, slice?, target, runner). Independent of which
+# arm produced the artifacts; the same workload is measured across all
+# arms that the matrix allows.
+#
+# `blocked_by` marks workloads whose prerequisites haven't landed yet.
+# The matrix doesn't exclude them — they just stay empty in the
+# dashboard until the prereq commits. This makes the "what's missing"
+# question concrete.
+
+workloads:
+
+  # ───── Smoke (cheap, fast — used to validate the harness itself) ─────
+  - id: dronet_rvv_smoke
+    model: dronet
+    target: rvv
+    quant: int8
+    runner: spike
+    tags: [smoke]
+
+  - id: dronet_scalar_smoke
+    model: dronet
+    target: scalar
+    quant: fp32
+    runner: host
+    tags: [smoke]
+
+  # ───── DroNet — the well-understood small baseline ─────
+  - { id: dronet_rvv_opu_int8,    model: dronet, target: rvv_opu,            quant: int8, runner: firesim }
+  - { id: dronet_gemmini_int8,    model: dronet, target: gemmini,            quant: int8, runner: firesim }
+  - { id: dronet_gemmini_q31_int8, model: dronet, target: gemmini_q31,       quant: int8, runner: firesim }
+  - { id: dronet_hetero_int8,     model: dronet, target: hetero_gemmini_opu, quant: int8, runner: firesim, blocked_by: P2.1 }
+
+  # ───── yolov8n — recent focus, exercises silu/depthwise/upsample ─────
+  - { id: yolov8n_rvv_opu_fp16,   model: yolov8n, target: rvv_opu,            quant: fp16, runner: firesim }
+  - { id: yolov8n_gemmini_q31_int8, model: yolov8n, target: gemmini_q31,      quant: int8, runner: firesim }
+  - { id: yolov8n_hetero_int8,    model: yolov8n, target: hetero_gemmini_opu, quant: int8, runner: firesim, blocked_by: P2.1 }
+
+  # ───── ViNT — transformer, exercises attention + LayerNorm via torch.export ─────
+  - { id: vint_rvv_opu_fp16,      model: vint,    target: rvv_opu,            quant: fp16, runner: firesim }
+  - { id: vint_hetero_fp16,       model: vint,    target: hetero_gemmini_opu, quant: fp16, runner: firesim, blocked_by: P2.1 }
+
+  # ───── SmolVLA — fusion-heavy VLA; admission in progress ─────
+  - { id: smolvla_scalar_fp16_step, model: smolvla, target: scalar, quant: fp16, runner: host,    slice: single_step, blocked_by: P2.2 }
+  - { id: smolvla_rvv_opu_fp16_step, model: smolvla, target: rvv_opu, quant: fp16, runner: firesim, slice: single_step, blocked_by: P2.2 }
