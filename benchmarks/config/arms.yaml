@@ -1,0 +1,35 @@
+# The treatments — the compile flows being compared. One row per arm.
+#
+# Adding a new arm = one row here + one driver file in ../arms/<id>.py
+# that emits run.json conforming to the shared schema. No aggregator
+# code change required.
+
+arms:
+  - id: A
+    name: deterministic_curated
+    description: |
+      Current ModelBlaster pipeline, BACKEND=curated (or scalar fallback).
+      No LLM in the loop. Baseline reference for compiler quality.
+    driver: modelblaster.benchmarks.arms.arm_a_curated
+    requires_llm: null
+
+  - id: B
+    name: optimize_beam_search
+    description: |
+      Current ModelBlaster pipeline + BACKEND=llm + --optimize beam search
+      with FIRESIM_EVAL re-rank where time permits. Bedrock-billed token
+      cost is logged per call (pipeline/bedrock_client.py extension).
+    driver: modelblaster.benchmarks.arms.arm_b_optimize
+    requires_llm: bedrock
+
+  - id: C
+    name: agentic_claude_code
+    description: |
+      Agentic flow (Phase 4 — gated): dossier + analytical cost models +
+      pass cards + plan/replan driven by Claude Code via MCP tools and
+      subagents. No Bedrock/Gemini in this arm. Per-decision token cost
+      from Claude Code session JSONL is authoritative; tool-call traces
+      are reconciliation only.
+    driver: modelblaster.benchmarks.arms.arm_c_agentic
+    requires_llm: claude_code
+    gated_by: phase_3_dashboard_review

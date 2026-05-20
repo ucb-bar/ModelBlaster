@@ -1,0 +1,29 @@
+# Which (arm × workload) pairs to populate. Default is cross-product
+# of arms.yaml and workloads.yaml; include/exclude rules carve out
+# the actual matrix.
+#
+# Predicates are matched against arm.id, workload.id, workload.tags,
+# and arm.gated_by / workload.blocked_by. The aggregator applies
+# excludes first, then includes. A cell that's blocked_by a prereq is
+# still in the matrix — it just renders empty until artifacts appear.
+
+default: cross_product
+
+exclude:
+  # Arm C is gated by the Phase 3 dashboard review (see
+  # notes/agentic_baselines_plan.md). Until that gate opens, Arm C is
+  # not in the matrix and the dashboard doesn't render columns for it.
+  - { arm: C }
+
+  # Smoke workloads are correctness-only — Arm B's optimize cost is
+  # never worth paying on them, and they're not interesting for Arm C
+  # reasoning either. Keep Arm A only.
+  - { workload_tag: smoke, arm: [B, C] }
+
+  # SmolVLA single-step slice doesn't justify Arm B's beam-search cost
+  # yet. Revisit after admission lands and we have an accuracy floor.
+  - { workload_id_pattern: "smolvla_*", arm: B, reason: "single-step slice — beam-search cost not justified pre-admission" }
+
+# include rules override exclude. None needed today; left here as the
+# extension point for "always populate this cell, no matter what."
+include: []

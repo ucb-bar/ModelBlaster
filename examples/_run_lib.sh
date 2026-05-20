@@ -44,7 +44,7 @@ if [[ "${QUANT}" == "fp16" ]]; then
     GEN_TARGET="${TARGET}_f16"
 fi
 
-EXAMPLE_DIR_REL="modelblaster/examples/${MODEL_NAME}"
+EXAMPLE_DIR_REL="examples/${MODEL_NAME}"
 EXAMPLE_DIR="${REPO_ROOT}/${EXAMPLE_DIR_REL}"
 
 cd "${REPO_ROOT}"
@@ -217,15 +217,15 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # hart counts so MP_MAX_NUM_CPUS must match. Override via
     # FIRESIM_CONF env if running a different config.
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
+        FS_CONF="${REPO_ROOT}/harness/backends/${FIRESIM_CONF}"
     elif [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" ]]; then
         # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants ride
         # the same dual-rocket-saturn-gemmini SoC topology, so the same
         # Zephyr SMP overlay applies. The runtime bitstream is selected
         # via config_runtime.yaml::default_hw_config.
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
+        FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard.conf"
     fi
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
