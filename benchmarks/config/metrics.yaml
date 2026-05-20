@@ -1,0 +1,166 @@
+# Declarative metric extraction. Adding a new metric here + one
+# extractor function in ingest/ is the entire path to a new dashboard
+# column.
+#
+# Source paths are relative to results/<arm-id>/<workload-id>/<run-id>/
+# (or results/<arm-id>/<workload-id>/latest/ when the aggregator
+# resolves the symlink). Placeholders: {runner} for runner-suffixed
+# files; the aggregator fills these from the workload row.
+#
+# Fields:
+#   source         path under results/<arm>/<workload>/<run-id>/
+#                  (placeholders: {runner})
+#   extractor      module:function — applied to the parsed source file
+#   unit           string used in summary.md headers
+#   arms           which arms produce this metric (others render as "—")
+#   nullable_if    expression over workload fields (e.g. "runner != 'firesim'");
+#                  when true, this cell does not produce the metric and the
+#                  aggregator suppresses it without flagging it as missing
+#   derived_from   list of other metric names (for computed metrics like dollars_equivalent)
+#   note           free-form notes that surface in summary.md
+
+metrics:
+
+  # ──────────── compiler quality ────────────
+
+  cycles_firesim:
+    source: "profile_firesim.csv"
+    extractor: "modelblaster.benchmarks.ingest.profile_csv:sum_cycles"
+    unit: cycles
+    arms: [A, B, C]
+    nullable_if: "runner != 'firesim'"
+    note: |
+      Primary cycle metric for rvv_opu / gemmini / gemmini_q31 / hetero_gemmini_opu.
+      Aggregator REFUSES to compute Arm-vs-Arm deltas on accelerator targets
+      using cycles_spike — those extensions execute atomically in spike.
+
+  cycles_spike:
+    source: "profile_spike.csv"
+    extractor: "modelblaster.benchmarks.ingest.profile_csv:sum_cycles"
+    unit: cycles
+    arms: [A, B, C]
+    note: |
+      Recorded for {scalar, scalar_f16, rvv, rvv_f16} as primary.
+      For {rvv_opu, gemmini, gemmini_q31, hetero_gemmini_opu} this is
+      correctness instrumentation only. Spike runs the Gemmini and
+      Saturn-OPU extensions atomically (no microarchitectural model),
+      so cycle counts on those targets are not authoritative.
+
+  accuracy_linf:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:linf"
+    unit: dimensionless
+    arms: [A, B, C]
+    note: respects per-backend atol_override from pipeline.backends.Backend
+
+  accuracy_rmse:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:rmse"
+    unit: dimensionless
+    arms: [A, B, C]
+
+  accuracy_cos:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:cosine"
+    unit: dimensionless
+    arms: [A, B, C]
+
+  compile_wall_clock_s:
+    source: "run.json"
+    extractor: "modelblaster.benchmarks.ingest.run_json:wall_clock_s"
+    unit: s
+    arms: [A, B, C]
+
+  compile_peak_rss_mb:
+    source: "run.json"
+    extractor: "modelblaster.benchmarks.ingest.run_json:peak_rss_mb"
+    unit: MB
+    arms: [A, B, C]
+
+  # ──────────── agent efficiency (Arms B + C only) ────────────
+
+  tokens_input_cached:
+    source: "llm_tokens.json"
+    extractor: "modelblaster.benchmarks.ingest.tokens:sum_input_cached"
+    unit: tokens
+    arms: [B, C]
+    note: |
+      Arm B: llm_tokens.json synthesized at end-of-run from llm_calls.jsonl
+        (emitted per call by pipeline.bedrock_client).
+      Arm C: llm_tokens.json synthesized from session_tokens.json
+        (parsed from ~/.claude/projects/.../<session_id>.jsonl).
+      Both arms produce the same schema; the aggregator is provider-agnostic.
+
+  tokens_input_uncached:
+    source: "llm_tokens.json"
+    extractor: "modelblaster.benchmarks.ingest.tokens:sum_input_uncached"
+    unit: tokens
+    arms: [B, C]
+
+  tokens_output:
+    source: "llm_tokens.json"
+    extractor: "modelblaster.benchmarks.ingest.tokens:sum_output"
+    unit: tokens
+    arms: [B, C]
+
+  dollars_equivalent:
+    derived_from: [tokens_input_cached, tokens_input_uncached, tokens_output]
+    extractor: "modelblaster.benchmarks.aggregate:compute_cost_usd"
+    unit: USD
+    arms: [B, C]
+    note: rates from config/pricing.yaml
+
+  warm_cache_hit_rate:
+    source: "cache_hits.json"
+    extractor: "modelblaster.benchmarks.ingest.run_json:cache_hit_rate"
+    unit: fraction
+    arms: [B, C]
+
+  decisions_total:
+    source: "decision_log.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.tokens:count_lines"
+    unit: count
+    arms: [C]
+
+  decisions_rejected_by_validator:
+    source: "decision_log.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.tokens:count_rejections"
+    unit: count
+    arms: [C]
+
+  # ──────────── scheduler / heterogeneous (hetero_gemmini_opu only) ────────────
+
+  makespan_cycles:
+    source: "wall_cycles.txt"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:makespan"
+    unit: cycles
+    arms: [A, B, C]
+    nullable_if: "target != 'hetero_gemmini_opu'"
+
+  accelerator_utilization_gemmini:
+    source: "xpurt_trace.csv"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:utilization_gemmini"
+    unit: fraction
+    arms: [A, B, C]
+    nullable_if: "target != 'hetero_gemmini_opu'"
+
+  accelerator_utilization_opu:
+    source: "xpurt_trace.csv"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:utilization_opu"
+    unit: fraction
+    arms: [A, B, C]
+    nullable_if: "target != 'hetero_gemmini_opu'"
+
+  cross_tile_bytes:
+    source: "xpurt_trace.csv"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:cross_tile_bytes"
+    unit: bytes
+    arms: [A, B, C]
+    nullable_if: "target != 'hetero_gemmini_opu'"
+
+  deadline_met_rate:
+    source: "wall_cycles.txt"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:deadline_met_rate"
+    unit: fraction
+    arms: [A, B, C]
+    nullable_if: "target != 'hetero_gemmini_opu' or scenario != 'periodic'"

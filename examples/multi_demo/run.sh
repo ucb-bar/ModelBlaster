@@ -27,11 +27,11 @@ QUANT="${QUANT:-fp32}"
 FORCE_REGEN="${FORCE_REGEN:-0}"
 RUNNER="${RUNNER:-spike}"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 export PATH="/usr/bin:${PATH}"
 
-EXAMPLE_DIR="${REPO_ROOT}/modelblaster/examples/multi_demo"
+EXAMPLE_DIR="${REPO_ROOT}/examples/multi_demo"
 BUILD_TAG="${TARGET}"
 if [[ -n "${POOL_SIZES:-}" ]]; then
     # Distinct build dir for sweep — different multi_main.c, different
@@ -55,7 +55,7 @@ IFS=',' read -ra MODEL_LIST <<< "${MODELS}"
 MODEL_DIRS=""
 MODEL_NAMES=""
 for m in "${MODEL_LIST[@]}"; do
-    m_gen_dir="${REPO_ROOT}/modelblaster/examples/${m}/${QUANT}/generated/${TARGET}"
+    m_gen_dir="${REPO_ROOT}/examples/${m}/${QUANT}/generated/${TARGET}"
     if [[ "${FORCE_REGEN}" == "1" || ! -f "${m_gen_dir}/model.h" ]]; then
         echo "[stage] running modelblaster/examples/${m}/run.sh (TARGET=${TARGET} QUANT=${QUANT} BACKEND=${BACKEND:-reference} OPTIMIZE=${OPTIMIZE:-0})"
         # `var=value cmd` env assignments must be lexically on the
@@ -70,7 +70,7 @@ for m in "${MODEL_LIST[@]}"; do
         TARGET="${TARGET}" QUANT="${QUANT}" \
         BACKEND="${BACKEND:-reference}" OPTIMIZE="${OPTIMIZE:-0}" \
         BEAM="${BEAM:-2}" EXPANSIONS="${EXPANSIONS:-3}" ITERATIONS="${ITERATIONS:-2}" \
-            bash "${REPO_ROOT}/modelblaster/examples/${m}/run.sh" >/dev/null
+            bash "${REPO_ROOT}/examples/${m}/run.sh" >/dev/null
     fi
     MODEL_DIRS+="${MODEL_DIRS:+;}${m_gen_dir}"
     MODEL_NAMES+="${MODEL_NAMES:+;}${m}"
@@ -126,11 +126,11 @@ fi
 WEST_BUILD_EXTRA=()
 if [[ "${RUNNER}" == "firesim" ]]; then
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
+        FS_CONF="${REPO_ROOT}/harness/backends/${FIRESIM_CONF}"
     elif [[ "${TARGET}" == "gemmini" ]]; then
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
+        FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard.conf"
     fi
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
@@ -192,7 +192,7 @@ print(' '.join(b.spike_args))
     fi
     python -m modelblaster.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
         --timeout "${SPIKE_TIMEOUT:-600}" \
@@ -217,7 +217,7 @@ else
     fi
     python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
         "${FIRESIM_FLAGS[@]}" \

@@ -33,7 +33,7 @@
 #   source scripts/set_envvars_sdk.sh
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 export PATH="/usr/bin:${PATH}"
 
@@ -61,7 +61,7 @@ case "${RUNNER}" in
         ;;
 esac
 
-EXAMPLE_DIR="${REPO_ROOT}/modelblaster/examples/microros_demo"
+EXAMPLE_DIR="${REPO_ROOT}/examples/microros_demo"
 GEN_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 BUILD_TAG="$(echo "${BACKENDS}" | tr ',' '_')"
 if [[ "${RUNNER}" == "firesim" ]]; then
@@ -115,10 +115,10 @@ for idx in "${!MODEL_LIST[@]}"; do
             echo "[microros_demo] regen ${m}/${bs} (quant=${m_quant})"
             TARGET="${bs}" QUANT="${m_quant}" \
             BACKEND=llm OPTIMIZE=0 FORCE_REGEN=1 \
-            GLOBAL_CURATED_DIR="${REPO_ROOT}/modelblaster/kernels" \
-                bash "${REPO_ROOT}/modelblaster/examples/${m}/run.sh"
+            GLOBAL_CURATED_DIR="${REPO_ROOT}/kernels" \
+                bash "${REPO_ROOT}/examples/${m}/run.sh"
         fi
-        gen="${REPO_ROOT}/modelblaster/examples/${m}/${m_quant}/generated/${bs}"
+        gen="${REPO_ROOT}/examples/${m}/${m_quant}/generated/${bs}"
         for f in model.c kernels.c weights.c model.h test_io.h buffers.c; do
             if [[ ! -f "${gen}/${f}" ]]; then
                 echo "ERROR: ${gen} missing ${f} (run with FORCE_REGEN=1 or run modelblaster/examples/${m}/run.sh first)" >&2
@@ -135,7 +135,7 @@ for idx in "${!MODEL_LIST[@]}"; do
     m="${MODEL_LIST[$idx]}"
     m_quant="${QUANT_LIST[$idx]}"
     MODEL_NAMES="${MODEL_NAMES};${m}"
-    MODEL_DIRS_BASE="${MODEL_DIRS_BASE};${REPO_ROOT}/modelblaster/examples/${m}/${m_quant}/generated"
+    MODEL_DIRS_BASE="${MODEL_DIRS_BASE};${REPO_ROOT}/examples/${m}/${m_quant}/generated"
 done
 MODEL_NAMES="${MODEL_NAMES#;}"
 MODEL_DIRS_BASE="${MODEL_DIRS_BASE#;}"
@@ -187,14 +187,14 @@ done
 WEST_BUILD_EXTRA=()
 if [[ "${RUNNER}" == "firesim" ]]; then
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
+        EXTRA_CONF="${REPO_ROOT}/harness/backends/${FIRESIM_CONF}"
     elif [[ ",${BACKENDS}," == *,gemmini,* || ",${BACKENDS}," == *,gemmini_q31,* ]]; then
-        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        EXTRA_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
+        EXTRA_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard.conf"
     fi
 elif [[ "${RUNNER}" == "spike" ]]; then
-    EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
+    EXTRA_CONF="${REPO_ROOT}/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
 fi
 if [[ -z "${EXTRA_CONF:-}" || ! -f "${EXTRA_CONF}" ]]; then
     echo "ERROR: per-target overlay not found (RUNNER=${RUNNER}, EXTRA_CONF=${EXTRA_CONF:-<unset>})" >&2
@@ -249,7 +249,7 @@ else
     [[ -n "${FIRESIM_TIMEOUT:-}" ]] && FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
     python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT_LIST[0]}/generated/io.npz" \
+        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT_LIST[0]}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT_LIST[0]}" \
         "${FIRESIM_FLAGS[@]}"
