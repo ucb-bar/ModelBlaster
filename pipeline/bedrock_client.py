@@ -1,4 +1,9 @@
-"""Bedrock Converse client using AWS_BEARER_TOKEN_BEDROCK."""
+"""Bedrock Converse client using AWS_BEARER_TOKEN_BEDROCK.
+
+Per-call token usage is written to a JSONL file when `log_path` (or
+the BEDROCK_CALLS_LOG env var) is set. The benchmark harness uses
+this to attribute costs back to specific Arm B runs without changing
+the kernel-generation / optimize-loop code paths."""
 
 from __future__ import annotations
 
@@ -6,7 +11,9 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 
 import requests
 
@@ -37,6 +44,14 @@ class ConverseResult:
     stop_reason: str
     input_tokens: int
     output_tokens: int
+    # Prompt-caching counters. Populated when the model + region support
+    # it and the request opted in; zero otherwise.
+    cache_read_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
+    # Server-assigned request id from the x-amzn-requestid header.
+    # Useful as a stable key when correlating with CloudTrail / billing
+    # downstream of a benchmark run.
+    request_id: Optional[str] = None
 
     @property
     def total_tokens(self) -> int:
@@ -55,6 +70,7 @@ class BedrockClient:
         model_id: Optional[str] = None,
         region: Optional[str] = None,
         token: Optional[str] = None,
+        log_path: Optional[str] = None,
     ):
         self.model_id = _normalize_model_id(
             model_id or os.environ.get("MODEL", DEFAULT_MODEL)
@@ -67,6 +83,7 @@ class BedrockClient:
                 "Source set_api_keys.sh before running."
             )
         self.endpoint = f"https://bedrock-runtime.{self.region}.amazonaws.com"
+        self.log_path = log_path or os.environ.get("BEDROCK_CALLS_LOG") or None
 
     def converse(
         self,
@@ -80,6 +97,13 @@ class BedrockClient:
         # generations. 600s is generous; the connection idle-timeouts
         # in urllib3 will trip first if the server actually wedged.
         timeout: float = 600.0,
+        # The benchmark harness records `phase` and `parent_call_id`
+        # alongside the per-call usage so a beam-search reranker call
+        # can be reattributed to the kernel-synthesis call that
+        # spawned it. Both are passthrough; the client does not
+        # interpret them.
+        phase: Optional[str] = None,
+        parent_call_id: Optional[str] = None,
     ) -> ConverseResult:
         url = f"{self.endpoint}/model/{self.model_id}/converse"
         body = {
@@ -115,12 +139,57 @@ class BedrockClient:
         msg = data["output"]["message"]
         text = "".join(part.get("text", "") for part in msg["content"])
         usage = data.get("usage", {})
-        return ConverseResult(
+        result = ConverseResult(
             text=text,
             stop_reason=data.get("stopReason", ""),
             input_tokens=usage.get("inputTokens", 0),
             output_tokens=usage.get("outputTokens", 0),
+            cache_read_input_tokens=(
+                usage.get("cacheReadInputTokenCount")
+                or usage.get("cacheReadInputTokens")
+                or 0
+            ),
+            cache_write_input_tokens=(
+                usage.get("cacheWriteInputTokenCount")
+                or usage.get("cacheWriteInputTokens")
+                or 0
+            ),
+            request_id=r.headers.get("x-amzn-requestid"),
         )
+        if self.log_path:
+            _append_call_log(self.log_path, self.model_id, result,
+                             phase=phase, parent_call_id=parent_call_id)
+        return result
+
+
+def _append_call_log(
+    path: str,
+    model_id: str,
+    result: ConverseResult,
+    *,
+    phase: Optional[str],
+    parent_call_id: Optional[str],
+) -> None:
+    """Append one JSON record describing this call. Each line is a
+    standalone JSON object so the file can be read incrementally and
+    tail-rotated without parsing the whole thing."""
+    record: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "provider": "bedrock",
+        "model_id": model_id,
+        "request_id": result.request_id,
+        "parent_call_id": parent_call_id,
+        "phase": phase,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "cache_read_input_tokens": result.cache_read_input_tokens,
+        "cache_write_input_tokens": result.cache_write_input_tokens,
+        "stop_reason": result.stop_reason,
+    }
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def extract_code_block(text: str, lang: str = "c") -> str:
