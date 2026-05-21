@@ -57,6 +57,13 @@ def make_llm_client(
         # google-genai to be installed.
         from modelblaster.pipeline.gemini_client import GeminiClient
         return GeminiClient(log_path=log_path)
+    if name in ("claude_code", "claude-code", "claudecode"):
+        # Lazy import: the subprocess client checks for the `claude`
+        # CLI on PATH at construction time, which would fail at module
+        # import in shells that don't have Claude Code installed.
+        from modelblaster.pipeline.claude_code_client import ClaudeCodeClient
+        return ClaudeCodeClient(log_path=log_path)
     raise RuntimeError(
-        f"unknown LLM_PROVIDER={name!r} (expected 'gemini' or 'bedrock')"
+        f"unknown LLM_PROVIDER={name!r} "
+        "(expected 'gemini', 'bedrock', or 'claude_code')"
     )

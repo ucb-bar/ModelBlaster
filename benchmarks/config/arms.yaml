@@ -38,13 +38,12 @@ arms:
     name: optimize_beam_search_claude_code
     description: |
       Same pipeline as Arm B-bedrock / B-gemini with Claude Code driving
-      kernel synthesis through a `claude --print --session-id` subprocess
-      per call. Token usage is harvested from the Claude Code session
-      JSONL at end-of-run. (Driver lands in a follow-up commit; stub
-      today.)
+      kernel synthesis through a `claude --print --output-format json
+      --bare` subprocess per call. Token usage and Claude Code's
+      self-reported `total_cost_usd` are captured in the JSONL per
+      call; the same provider-agnostic rollup feeds dollars_equivalent.
     driver: modelblaster.benchmarks.arms.arm_b_claude
     requires_llm: claude_code
-    gated_by: phase_1_6_implementation
 
   - id: C
     name: agentic_claude_code
