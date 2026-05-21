@@ -53,6 +53,17 @@ class Workload:
     slice: Optional[str] = None
     blocked_by: Optional[str] = None
     firesim_eval: bool = False
+    # Hetero workloads need a pre-generated XPU-RT schedule and a
+    # cores registry; both are pinned on the workload row so the
+    # driver knows what to hand to examples/xpurt_demo/run.sh.
+    xpurt_schedule_path: Optional[str] = None
+    xpurt_cores_registry: Optional[str] = None
+    xpurt_backends: Optional[str] = None
+
+
+# Targets that don't have a per-model run.sh of their own; the harness
+# instead dispatches through the multi-backend XPU-RT demo runner.
+HETERO_TARGETS = frozenset({"hetero_gemmini_opu"})
 
 
 def load_workload(workload_id: str) -> Workload:
@@ -69,6 +80,9 @@ def load_workload(workload_id: str) -> Workload:
                 slice=r.get("slice"),
                 blocked_by=r.get("blocked_by"),
                 firesim_eval=bool(r.get("firesim_eval", False)),
+                xpurt_schedule_path=r.get("xpurt_schedule_path"),
+                xpurt_cores_registry=r.get("xpurt_cores_registry"),
+                xpurt_backends=r.get("xpurt_backends"),
             )
     raise SystemExit(f"workload not found: {workload_id}")
 
@@ -94,6 +108,64 @@ def example_run_sh(model: str) -> Path:
     if not p.exists():
         raise SystemExit(f"missing example run script: {p}")
     return p
+
+
+def xpurt_demo_run_sh() -> Path:
+    p = REPO_ROOT / "examples" / "xpurt_demo" / "run.sh"
+    if not p.exists():
+        raise SystemExit(f"missing xpurt_demo runner: {p}")
+    return p
+
+
+# Default cores registry + backend set for the `hetero_gemmini_opu`
+# target. Per-workload overrides come from the workload row's
+# `xpurt_cores_registry` / `xpurt_backends` fields.
+_HETERO_GEMMINI_OPU_DEFAULTS = {
+    "registry": "cores/chipyard_gemmini_opu_hetero.json",
+    "backends": "gemmini,rvv_opu",
+}
+
+
+def _hetero_defaults(target: str) -> dict[str, str]:
+    if target == "hetero_gemmini_opu":
+        return _HETERO_GEMMINI_OPU_DEFAULTS
+    return {}
+
+
+def hetero_env_overlay(workload: Workload, env: dict[str, str]) -> None:
+    """Add the env vars the multi-backend `xpurt_demo/run.sh` expects
+    on top of the per-workload env the caller already populated. Sets:
+
+      MODELS, BACKENDS, REGISTRY, SCHEDULE_JSON, QUANT, RUNNER,
+      MODELBLASTER_HETERO_SPIKE (when RUNNER=spike on the
+      hetero_gemmini_opu target).
+    """
+    defaults = _hetero_defaults(workload.target)
+
+    env["MODELS"] = workload.model
+    env["BACKENDS"] = workload.xpurt_backends or defaults.get("backends", "")
+    env["QUANT"] = workload.quant
+    env["RUNNER"] = workload.runner
+
+    registry_rel = workload.xpurt_cores_registry or defaults.get("registry")
+    if registry_rel:
+        env["REGISTRY"] = str(REPO_ROOT / registry_rel)
+    if workload.xpurt_schedule_path:
+        env["SCHEDULE_JSON"] = str(
+            (REPO_ROOT / workload.xpurt_schedule_path).resolve()
+        )
+
+    # spike-hetero is the merlin-side wrapper that loads both Gemmini
+    # and Saturn-OPU extensions into one spike process. Point at it so
+    # `examples/xpurt_demo/run.sh` picks it up for the hetero target;
+    # the user can override by setting MODELBLASTER_HETERO_SPIKE
+    # themselves before invoking the driver.
+    if (workload.target == "hetero_gemmini_opu"
+            and workload.runner == "spike"
+            and "MODELBLASTER_HETERO_SPIKE" not in env):
+        candidate = Path("/scratch2/agustin/merlin/tools/spike-hetero/spike-hetero")
+        if candidate.exists():
+            env["MODELBLASTER_HETERO_SPIKE"] = str(candidate)
 
 
 def require_tools(tools: list[str]) -> None:
@@ -141,7 +213,10 @@ def peak_rss_mb_delta(before, after) -> float:
 _ENV_KEEP_PATTERN = re.compile(
     r"^(MODEL_NAME|TARGET|QUANT|BACKEND|RUNNER|OPTIMIZE|"
     r"BEAM|EXPANSIONS|ITERATIONS|FIRESIM_EVAL|"
-    r"GLOBAL_CURATED_DIR|BEDROCK_CALLS_LOG|"
+    r"MODELS|BACKENDS|REGISTRY|SCHEDULE_JSON|"
+    r"GLOBAL_CURATED_DIR|"
+    r"BEDROCK_CALLS_LOG|GEMINI_CALLS_LOG|CLAUDE_CODE_CALLS_LOG|"
+    r"LLM_PROVIDER|GEMINI_MODEL|CLAUDE_CODE_MODEL|"
     r"PROFILE_|FIRESIM_|MODELBLASTER_)"
 )
 
@@ -229,7 +304,20 @@ def execute_run_sh(
     rusage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     t0 = time.monotonic()
 
-    run_sh = example_run_sh(workload.model)
+    if workload.target in HETERO_TARGETS:
+        if not workload.xpurt_schedule_path:
+            raise SystemExit(
+                f"workload {workload.id!r} targets {workload.target} but "
+                f"its row in workloads.yaml has no xpurt_schedule_path. "
+                f"Generate a schedule via FreshScheduler "
+                f"(/scratch2/dima/misc_sw/FreshScheduler/scripts/"
+                f"run_xpurt_schedule.py) and point the workload at it."
+            )
+        hetero_env_overlay(workload, env)
+        run_sh = xpurt_demo_run_sh()
+    else:
+        run_sh = example_run_sh(workload.model)
+
     proc = subprocess.run(
         ["bash", str(run_sh)],
         env=env, cwd=str(REPO_ROOT),

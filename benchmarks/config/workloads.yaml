@@ -29,17 +29,46 @@ workloads:
   - { id: dronet_rvv_opu_int8,    model: dronet, target: rvv_opu,            quant: int8, runner: firesim }
   - { id: dronet_gemmini_int8,    model: dronet, target: gemmini,            quant: int8, runner: firesim }
   - { id: dronet_gemmini_q31_int8, model: dronet, target: gemmini_q31,       quant: int8, runner: firesim }
-  - { id: dronet_hetero_int8,     model: dronet, target: hetero_gemmini_opu, quant: int8, runner: firesim, blocked_by: P2.1 }
+  - id: dronet_hetero_int8
+    model: dronet
+    target: hetero_gemmini_opu
+    quant: int8
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    # Schedule is the hand-authored fixture from scripts/gen_hetero_schedule.py
+    # (gemmini_main_opu_skip policy). Replace with FreshScheduler-emitted
+    # output against profiled per-op cycles when the harness produces them.
+    xpurt_schedule_path: schedule_fixtures/dronet_hetero_gemmini_opu.json
 
   # ───── yolov8n — recent focus, exercises silu/depthwise/upsample ─────
   - { id: yolov8n_rvv_opu_fp16,   model: yolov8n, target: rvv_opu,            quant: fp16, runner: firesim }
   - { id: yolov8n_gemmini_q31_int8, model: yolov8n, target: gemmini_q31,      quant: int8, runner: firesim }
-  - { id: yolov8n_hetero_int8,    model: yolov8n, target: hetero_gemmini_opu, quant: int8, runner: firesim, blocked_by: P2.1 }
+  - id: yolov8n_hetero_int8
+    model: yolov8n
+    target: hetero_gemmini_opu
+    quant: int8
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    xpurt_schedule_path: schedule_fixtures/yolov8n_hetero_gemmini_opu.json
+    blocked_by: P2.1-schedule
 
   # ───── ViNT — transformer, exercises attention + LayerNorm via torch.export ─────
   - { id: vint_rvv_opu_fp16,      model: vint,    target: rvv_opu,            quant: fp16, runner: firesim }
-  - { id: vint_hetero_fp16,       model: vint,    target: hetero_gemmini_opu, quant: fp16, runner: firesim, blocked_by: P2.1 }
+  - id: vint_hetero_fp16
+    model: vint
+    target: hetero_gemmini_opu
+    quant: fp16
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    xpurt_schedule_path: schedule_fixtures/vint_hetero_gemmini_opu.json
+    blocked_by: P2.1-schedule
 
-  # ───── SmolVLA — fusion-heavy VLA; admission in progress ─────
-  - { id: smolvla_scalar_fp16_step, model: smolvla, target: scalar, quant: fp16, runner: host,    slice: single_step, blocked_by: P2.2 }
-  - { id: smolvla_rvv_opu_fp16_step, model: smolvla, target: rvv_opu, quant: fp16, runner: firesim, slice: single_step, blocked_by: P2.2 }
+  # ───── SmolVLA — admission done (loads + exports via models/smolvla.py);
+  #       end-to-end codegen waits on walker support for the attention
+  #       block (scaled_dot_product_attention, rotary_emb, masked
+  #       embeddings). See notes/smolvla_admission.md.
+  - { id: smolvla_scalar_fp16_step, model: smolvla, target: scalar, quant: fp16, runner: host,    slice: single_step, blocked_by: walker-smolvla-ops }
+  - { id: smolvla_rvv_opu_fp16_step, model: smolvla, target: rvv_opu, quant: fp16, runner: firesim, slice: single_step, blocked_by: walker-smolvla-ops }
