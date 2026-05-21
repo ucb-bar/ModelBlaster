@@ -13,23 +13,46 @@ arms:
     driver: modelblaster.benchmarks.arms.arm_a_curated
     requires_llm: null
 
-  - id: B
-    name: optimize_beam_search
+  - id: B-bedrock
+    name: optimize_beam_search_bedrock
     description: |
       Current ModelBlaster pipeline + BACKEND=llm + --optimize beam search
-      with FIRESIM_EVAL re-rank where time permits. Bedrock-billed token
-      cost is logged per call (pipeline/bedrock_client.py extension).
-    driver: modelblaster.benchmarks.arms.arm_b_optimize
+      with FIRESIM_EVAL re-rank where time permits, using AWS Bedrock for
+      kernel synthesis and beam reranking. Per-call token usage is logged
+      to llm_calls.jsonl via pipeline.bedrock_client; the driver rolls it
+      up into llm_tokens.json at end-of-run.
+    driver: modelblaster.benchmarks.arms.arm_b_bedrock
     requires_llm: bedrock
+
+  - id: B-gemini
+    name: optimize_beam_search_gemini
+    description: |
+      Same pipeline as Arm B-bedrock with the LLM provider swapped to
+      Google's Gemini API (default model: gemini-2.5-flash). Matched on
+      every other axis so the comparison isolates the LLM-provider
+      effect on kernel quality and token economics.
+    driver: modelblaster.benchmarks.arms.arm_b_gemini
+    requires_llm: gemini
+
+  - id: B-claude
+    name: optimize_beam_search_claude_code
+    description: |
+      Same pipeline as Arm B-bedrock / B-gemini with Claude Code driving
+      kernel synthesis through a `claude --print --session-id` subprocess
+      per call. Token usage is harvested from the Claude Code session
+      JSONL at end-of-run. (Driver lands in a follow-up commit; stub
+      today.)
+    driver: modelblaster.benchmarks.arms.arm_b_claude
+    requires_llm: claude_code
+    gated_by: phase_1_6_implementation
 
   - id: C
     name: agentic_claude_code
     description: |
       Agentic flow (Phase 4 — gated): dossier + analytical cost models +
       pass cards + plan/replan driven by Claude Code via MCP tools and
-      subagents. No Bedrock/Gemini in this arm. Per-decision token cost
-      from Claude Code session JSONL is authoritative; tool-call traces
-      are reconciliation only.
+      subagents. Per-decision token cost from Claude Code session JSONL
+      is authoritative; tool-call traces are reconciliation only.
     driver: modelblaster.benchmarks.arms.arm_c_agentic
     requires_llm: claude_code
     gated_by: phase_3_dashboard_review

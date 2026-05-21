@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -287,3 +288,77 @@ def finalize(
 
     print(f"OK: {workload.id} -> {outcome.out_dir}")
     return 0
+
+
+def synthesize_llm_tokens(
+    calls_log: Path, out_path: Path, *, provider: str,
+) -> None:
+    """Roll up a JSONL of per-call LLM usage records into the
+    aggregator's `llm_tokens.json` schema. Provider-agnostic: works
+    against any JSONL whose lines have `model_id`, `input_tokens`,
+    `output_tokens`, and `cache_read_input_tokens` fields (the shape
+    that `pipeline.bedrock_client` and `pipeline.gemini_client` both
+    emit). The aggregator's dollars_equivalent extractor then prices
+    each model_id against `config/pricing.yaml`.
+
+    `provider` is recorded in the rollup but does not affect pricing
+    — pricing.yaml keys on model_id, which is what matters for cost.
+    """
+    if not calls_log.exists():
+        # No LLM calls happened (e.g. all-curated runs); emit a zero
+        # rollup so the aggregator does not flag the cell as
+        # "missing tokens" when the run was legitimately free.
+        empty: dict[str, Any] = {
+            "schema_version": 1,
+            "provider": provider,
+            "tokens_input_cached": 0,
+            "tokens_input_uncached": 0,
+            "tokens_output": 0,
+            "n_calls": 0,
+            "by_model": {},
+        }
+        out_path.write_text(json.dumps(empty, indent=2))
+        return
+
+    per_model: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"input_cached": 0, "input_uncached": 0, "output": 0,
+                 "calls": 0}
+    )
+    total_in_cached = total_in_uncached = total_out = total_calls = 0
+    with open(calls_log) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            mid = rec.get("model_id") or "unknown"
+            slot = per_model[mid]
+            cached = int(rec.get("cache_read_input_tokens") or 0)
+            input_t = int(rec.get("input_tokens") or 0)
+            output_t = int(rec.get("output_tokens") or 0)
+            # Bedrock/Gemini both report `input_tokens` as the total
+            # input (cache-read inclusive); subtract to land in the
+            # uncached/cached buckets the cost extractor expects.
+            uncached = max(0, input_t - cached)
+            slot["input_cached"] += cached
+            slot["input_uncached"] += uncached
+            slot["output"] += output_t
+            slot["calls"] += 1
+            total_in_cached += cached
+            total_in_uncached += uncached
+            total_out += output_t
+            total_calls += 1
+
+    rollup: dict[str, Any] = {
+        "schema_version": 1,
+        "provider": provider,
+        "tokens_input_cached": total_in_cached,
+        "tokens_input_uncached": total_in_uncached,
+        "tokens_output": total_out,
+        "n_calls": total_calls,
+        "by_model": {k: dict(v) for k, v in per_model.items()},
+    }
+    out_path.write_text(json.dumps(rollup, indent=2))

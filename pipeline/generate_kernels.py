@@ -29,7 +29,8 @@ from modelblaster.pipeline import backends as backends_mod
 from modelblaster.pipeline.backends import (
     Backend, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
 )
-from modelblaster.pipeline.bedrock_client import BedrockClient, extract_code_block
+from modelblaster.pipeline.bedrock_client import extract_code_block
+from modelblaster.pipeline.llm_client import LLMClient, make_llm_client
 from modelblaster.pipeline.reference_kernels import (
     AccuracyClass, ACCURACY_CLASS_ATOL,
     KERNEL_SPECS, KernelSpec, shapes_from_ir,
@@ -562,7 +563,7 @@ def _generate_one_llm_for_algorithm(
     spec: KernelSpec,
     algorithm,  # AlgorithmCandidate
     shapes: list[dict],
-    client: BedrockClient,
+    client: LLMClient,
     backend: Backend,
     correctness_system: str,
     max_retries: int,
@@ -658,7 +659,7 @@ def _generate_one_llm_for_algorithm(
 def generate_one_llm(
     spec: KernelSpec,
     shapes: list[dict],
-    client: BedrockClient,
+    client: LLMClient,
     backend: Backend,
     correctness_system: str,
     max_retries: int,
@@ -913,7 +914,7 @@ def beam_search_optimize(
     impls: dict[str, str],
     specs: list[KernelSpec],
     backend: Backend,
-    client: BedrockClient,
+    client: LLMClient,
     optimize_system: str,
     repo_root: str,
     model_dir: str,
@@ -1174,7 +1175,7 @@ def generate(
                         impls[spec.op] = open(curated_path).read()
                         break
     elif backend_name == "llm":
-        # Lazy proxy: BedrockClient() is only instantiated when actually needed
+        # Lazy proxy: the LLM client is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
         # runs that hit all curated kernels don't require AWS credentials.
         class _LazyClient:
@@ -1183,7 +1184,7 @@ def generate(
             def __getattr__(self_, name):
                 real = object.__getattribute__(self_, '_real')
                 if real is None:
-                    real = BedrockClient()
+                    real = make_llm_client()
                     object.__setattr__(self_, '_real', real)
                 return getattr(real, name)
         client = _LazyClient()
@@ -1286,7 +1287,7 @@ def generate(
         optimize_system = optimize_system + "\n\n" + stanza
         log(f"optimize: prompt enriched with target memory-hierarchy stanza "
             f"(target={target.name})")
-    client = BedrockClient()
+    client = make_llm_client()
 
     # Pre-instantiate the firesim evaluator (one per generate() call). It
     # reuses a separate chipyard build dir from the spike build_dir so
