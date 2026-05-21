@@ -15,14 +15,14 @@ exclude:
   # not in the matrix and the dashboard doesn't render columns for it.
   - { arm: C }
 
-  # Smoke workloads are correctness-only — Arm B's optimize cost is
+  # Smoke workloads are correctness-only — the optimize arms' cost is
   # never worth paying on them, and they're not interesting for Arm C
   # reasoning either. Keep Arm A only.
-  - { workload_tag: smoke, arm: [B, C] }
+  - { workload_tag: smoke, arm: [B-bedrock, B-gemini, B-claude, C] }
 
-  # SmolVLA single-step slice doesn't justify Arm B's beam-search cost
+  # SmolVLA single-step slice doesn't justify the beam-search arms' cost
   # yet. Revisit after admission lands and we have an accuracy floor.
-  - { workload_id_pattern: "smolvla_*", arm: B, reason: "single-step slice — beam-search cost not justified pre-admission" }
+  - { workload_id_pattern: "smolvla_*", arm: [B-bedrock, B-gemini, B-claude], reason: "single-step slice — beam-search cost not justified pre-admission" }
 
 # include rules override exclude. None needed today; left here as the
 # extension point for "always populate this cell, no matter what."
