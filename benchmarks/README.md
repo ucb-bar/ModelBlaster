@@ -99,6 +99,17 @@ benchmarks/
 
 ## Quick start
 
+The Arm A driver shells out to `examples/<m>/run.sh`, which in turn
+invokes `west build` and `spike`. Activate the Zephyr build env once
+per shell first (same prerequisite as a manual `bash examples/<m>/run.sh`):
+
+```bash
+source tools/miniforge3/etc/profile.d/conda.sh && conda activate zephyr
+source scripts/set_envvars_sdk.sh
+```
+
+Then run the harness:
+
 ```bash
 # Smoke: one workload end-to-end, Arm A.
 uv run python -m modelblaster.benchmarks.arms.arm_a_curated \
@@ -108,8 +119,13 @@ uv run python -m modelblaster.benchmarks.arms.arm_a_curated \
 uv run python -m modelblaster.benchmarks.aggregate
 
 # Inspect.
-cat modelblaster/benchmarks/results/summary.md
+cat benchmarks/results/summary.md
 ```
+
+The driver checks for `west` (and `spike`, when the workload's
+runner is `spike`) on PATH before invoking the shell pipeline; a
+missing tool fails fast with the activation instructions above
+rather than mid-`west build` with `command not found`.
 
 ## Adding a workload, metric, arm, or matrix rule
 
