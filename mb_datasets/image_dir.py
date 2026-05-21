@@ -26,7 +26,7 @@ from pathlib import Path
 
 import torch
 
-from modelblaster.datasets.base import DatasetItem, register_loader
+from modelblaster.mb_datasets.base import DatasetItem, register_loader
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]

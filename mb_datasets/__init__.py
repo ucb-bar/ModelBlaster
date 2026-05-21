@@ -14,7 +14,7 @@ concrete loader lives in its own file (``image_dir.py``,
 ``isaaclab_forest_render.py``, etc).
 """
 
-from modelblaster.datasets.base import (  # noqa: F401
+from modelblaster.mb_datasets.base import (  # noqa: F401
     DatasetItem,
     load_dataset,
     materialize_calibration_samples,

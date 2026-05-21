@@ -17,7 +17,7 @@ Spec schema (saved to ``<example>/<quant>/generated/calibration_spec.json``):
       "num_samples": 16,
       "inputs": {
         "<input_tensor_name>": {
-          "loader": "<module under modelblaster.datasets>",
+          "loader": "<module under modelblaster.mb_datasets>",
           # rest is loader-specific
           "image_size": [85, 64],
           ...
@@ -74,12 +74,12 @@ def load_dataset(spec: dict) -> list[DatasetItem]:
     Loader modules are auto-imported on first reference; they register
     themselves under their canonical name on import. So
     ``{"loader": "image_dir", ...}`` triggers import of
-    ``modelblaster.datasets.image_dir``.
+    ``modelblaster.mb_datasets.image_dir``.
     """
     name = spec["loader"]
     if name not in _LOADERS:
         # Lazy import: each loader module registers itself at top level.
-        importlib.import_module(f"modelblaster.datasets.{name}")
+        importlib.import_module(f"modelblaster.mb_datasets.{name}")
     if name not in _LOADERS:
         raise KeyError(
             f"loader {name!r} not registered; check that "
