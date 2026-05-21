@@ -7,7 +7,7 @@ name = "modelblaster"
 version = "0.1.0"
 description = "PyTorch -> Zephyr/RISC-V end-to-end compile + run + validate pipeline."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "torch>=2.4",
     "numpy",
@@ -31,13 +31,35 @@ benchmarks = [
     # Aggregator + dashboard rendering.
     "pyyaml>=6.0",
 ]
+smolvla = [
+    # SmolVLA admission pulls the canonical lerobot checkout in editable
+    # mode so its policies.smolvla.modeling_smolvla module is importable
+    # without re-implementing it. The path matches the dev-box clone at
+    # /scratch2/agustin/merlin/third_party/lerobot; override via
+    # `uv pip install -e <other-path>` if your checkout lives elsewhere.
+    "lerobot @ file:///scratch2/agustin/merlin/third_party/lerobot",
+    "lerobot[transformers-dep] @ file:///scratch2/agustin/merlin/third_party/lerobot",
+    # SmolVLM's text processor turns digits into words via num2words at
+    # tokenization time. Not in lerobot's base deps, but the processor
+    # raises at __init__ if it is missing.
+    "num2words>=0.5",
+]
+
+[tool.hatch.metadata]
+# The `smolvla` optional-dependency entry uses a `file://` direct
+# reference to a sibling checkout of lerobot; hatch requires this opt-in
+# before it will pass the metadata to the wheel.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["modelblaster"]
-# The `modelblaster/` directory is a thin shim (one __init__.py) whose
-# __path__ points back at the repo root so existing top-level
-# subdirectories (pipeline/, optimize/, ...) resolve as
-# modelblaster.<subpackage>. Editable install only.
+packages = ["src/modelblaster"]
+# `src/modelblaster/` is a thin shim (one __init__.py) whose __path__
+# points back at the repo root so existing top-level subdirectories
+# (pipeline/, optimize/, ...) resolve as modelblaster.<subpackage>.
+# The src/ layout matters: an editable install adds `src/` (not the
+# repo root) to sys.path, so top-level `import datasets` resolves to
+# HuggingFace's datasets pip package rather than our local
+# `datasets/` directory. Editable install only.
 
 [tool.ruff]
 line-length = 100

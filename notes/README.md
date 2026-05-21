@@ -51,6 +51,7 @@ stable bits to `modelblaster/README.md` once they've crystallized.
 | `freshscheduler_area_sweep_v1.md` | FPGA area sweep design + first round of results. |
 | `ku040_bitstream_plan.md` | VCU118 / KU040 bitstream build plan; relevant when porting a config off Alveo U250. |
 | `vint_zephyr_plan.md` | Original plan for getting ViNT through the modelblaster flow (torch.export path motivation, op coverage gap). |
+| `smolvla_admission.md` | SmolVLA (`lerobot/smolvla_base`) admission status: loads + exports + runs through `extract_graph_export`. Dependency story for the sibling `lerobot` / `Understanding-PI0` checkouts, env-var overrides, and what's out of scope (int8 PTQ on the attention block, real calibration data). |
 
 These are working notes — promote bits to `modelblaster/README.md` once
 they're implemented, stable, and worth surfacing to a new reader.

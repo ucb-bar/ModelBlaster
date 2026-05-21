@@ -2476,7 +2476,7 @@ def main() -> None:
     calibration_samples = None
     if args.quant == "int8" and args.num_calibration > 1:
         if hasattr(model_mod, "get_calibration_spec"):
-            from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
+            from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             spec = model_mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_graph] resolving calibration spec "
                   f"({args.num_calibration} samples) ...", flush=True)

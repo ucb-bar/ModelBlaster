@@ -259,14 +259,14 @@ def get_precision_spec() -> dict:
 def get_calibration_samples(
     n_samples: int = 32,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Materialize (obs, goal) calibration tuples via the modelblaster.datasets
+    """Materialize (obs, goal) calibration tuples via the modelblaster.mb_datasets
     spec resolver. Returns ``[(obs (1, 18, H, W), goal (1, 3, H, W)), ...]``
     in the order the model's forward expects.
 
     Back-compat wrapper around ``get_calibration_spec`` for callers
     that don't want to plumb the spec themselves.
     """
-    from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
+    from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
     spec = get_calibration_spec(n_samples)
     materialized = materialize_calibration_samples(spec)
     return [(d["obs_img"], d["goal_img"]) for d in materialized]
