@@ -1842,6 +1842,8 @@ def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
 def _import_model_module(name: str):
     if name == "vint":
         from modelblaster.models import vint as model_mod
+    elif name == "smolvla":
+        from modelblaster.models import smolvla as model_mod
     else:
         raise SystemExit(
             f"--model {name} doesn't need extract_graph_export; "
@@ -1860,7 +1862,7 @@ def _load_model(name: str):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True, choices=["vint"])
+    p.add_argument("--model", required=True, choices=["vint", "smolvla"])
     p.add_argument("--quant", default="int8", choices=["fp32", "int8", "fp16"])
     p.add_argument("--out-dir", required=True)
     p.add_argument("--inventory-only", action="store_true",
@@ -1928,7 +1930,7 @@ def main():
     # Multi-sample calibration. The model module declares a
     # *calibration spec* (the canonical, reproducible source-of-truth
     # for where activation scales come from). The spec gets resolved
-    # via modelblaster.datasets.materialize_calibration_samples and
+    # via modelblaster.mb_datasets.materialize_calibration_samples and
     # serialized into the generated/ dir for later reference. If the
     # model doesn't ship a spec yet, fall back to its
     # get_calibration_samples helper, then finally the single trace
@@ -1941,7 +1943,7 @@ def main():
     mod = _import_model_module(args.model)
     if args.num_calibration > 1:
         if hasattr(mod, "get_calibration_spec"):
-            from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
+            from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             calib_spec = mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_export] resolving calibration spec "
                   f"({args.num_calibration} samples) ...", flush=True)
