@@ -25,35 +25,67 @@ according to an XPU-RT schedule.
   ``xpurt_cores_registry`` + ``xpurt_backends`` + ``xpurt_schedule_path``
   fields the dispatch reads.
 
-## What's gated
+## Schedule fixtures
 
-- **Schedule JSON fixtures**: each hetero workload's
-  ``xpurt_schedule_path`` points at a file under
-  ``schedule_fixtures/`` that does not exist yet. The dispatch
-  surface refuses to run without a valid schedule and prints the
-  path the workload row references. Generate via FreshScheduler
-  (``/scratch2/dima/misc_sw/FreshScheduler/scripts/run_xpurt_schedule.py``)
-  against a profiled run of the model on the gemmini+rvv_opu
-  topology; check the resulting JSON into
-  ``schedule_fixtures/<workload>.json`` (or stage it locally and
-  point the workload row there).
+Two routes to a schedule, in order of preference:
 
-  Workload-side scheduler input shape (from
-  ``notes/04_xpurt_integration.md``, but inlined here for
-  reference):
+1. **FreshScheduler (canonical, awaits profile data)**
 
-  ```jsonc
-  {
-    "machines": {
-      "GEMMINI": "gemmini",
-      "OPU":     "rvv_opu"
-    },
-    "networks": [
-      {"name": "dronet", "period_ms": 50}
-    ],
-    "profile_target": "firesim_chipyard_dual_gemmini_opu"
-  }
-  ```
+   ``/scratch2/dima/misc_sw/FreshScheduler/scripts/run_xpurt_schedule.py``
+   reads a workload.json + profile.csv (per-op cycles measured on the
+   target backends) and emits an XPU-RT schedule. Workload-side
+   scheduler input shape:
+
+   ```jsonc
+   {
+     "machines": {
+       "GEMMINI": "gemmini",
+       "OPU":     "rvv_opu"
+     },
+     "networks": [
+       {"name": "dronet", "period_ms": 50}
+     ],
+     "profile_target": "firesim_chipyard_dual_gemmini_opu"
+   }
+   ```
+
+   Requires per-op profiling against single-target Gemmini and
+   single-target rvv_opu runs first (chicken-and-egg with the harness
+   we're standing up).
+
+2. **`scripts/gen_hetero_schedule.py` (hand-authored stop-gap)**
+
+   Generates a VALID schedule (DAG matches the IR, hardware_target
+   labels resolve, start_time monotonic) from a `graph.json` IR
+   alone, with placeholder per-op durations. Useful for smoking the
+   dispatch path before FreshScheduler is wired up. Replace with a
+   FreshScheduler-emitted fixture when real cycle data exists.
+
+   ```bash
+   # Extract dronet's IR (pure Python, no zephyr required).
+   uv run python -m modelblaster.pipeline.extract_graph \
+       --model dronet --quant int8 \
+       --out-dir /tmp/dronet-graph
+
+   # Author the schedule under the gemmini_main_opu_skip policy:
+   #   - main-path conv2d_s8 / linear_s8 -> CPU_P (gemmini)
+   #   - residual-skip conv2d_s8         -> CPU_E (rvv_opu)
+   #   - all elementwise / norm / pool / activation -> CPU_E
+   uv run python scripts/gen_hetero_schedule.py \
+       --ir /tmp/dronet-graph/graph.json \
+       --out schedule_fixtures/dronet_hetero_gemmini_opu.json \
+       --job-name dronet
+   # -> wrote schedule_fixtures/dronet_hetero_gemmini_opu.json
+   #    (30 dispatches: CPU_E#0=21, CPU_P#0=9)
+   ```
+
+   For yolov8n / vint, use the equivalent extract_graph[_export]
+   invocation and rerun the generator. yolov8n's pretrained-weight
+   loader requires `ultralytics` installed (or
+   `MODELBLASTER_YOLOV8N_PRETRAINED=0` to use random init for trace
+   purposes); vint requires
+   `MODELBLASTER_VINT_CFG=<path-to-visualnav-transformer-vint.yaml>`
+   plus the corresponding checkpoint and sys.path for `vint_train`.
 
 - **FireSim bitstream**: the
   ``firesim_chipyard_dual_gemmini.conf`` overlay targets the
@@ -71,24 +103,23 @@ according to an XPU-RT schedule.
   ``hetero_gemmini_opu`` is correctness-only; only ``cycles_firesim``
   (once the bitstream exists) counts toward arm-vs-arm cycle deltas.
 
-## End-to-end smoke (once a schedule is staged)
+## End-to-end smoke
+
+The dronet fixture is committed; the workload row is unblocked. From
+a zephyr-activated shell:
 
 ```bash
-# 1. Build a schedule for dronet on the 2-tile config (one-shot).
-python /scratch2/dima/misc_sw/FreshScheduler/scripts/run_xpurt_schedule.py \
-    --workload <workload-config-pointing-at-GEMMINI+OPU> \
-    --profile  <profiled-dronet-on-gemmini-rvv_opu-results-csv> \
-    --output   schedule_fixtures/dronet_hetero_gemmini_opu.json
+source tools/miniforge3/etc/profile.d/conda.sh && conda activate zephyr
+source scripts/set_envvars_sdk.sh
 
-# 2. Drop schedule_fixtures/dronet_hetero_gemmini_opu.json's path into
-#    the workload row (already done; just create the file).
-
-# 3. Drop the blocked_by entry on the workload row.
-
-# 4. Run any arm; the driver auto-detects the hetero target.
 uv run python -m modelblaster.benchmarks.arms.arm_a_curated \
     --workload dronet_hetero_int8
 ```
+
+The arm driver detects the hetero target, shells into
+`examples/xpurt_demo/run.sh` with the right env (BACKENDS, REGISTRY,
+SCHEDULE_JSON, MODELBLASTER_HETERO_SPIKE), and the rest of the path
+is the existing xpurt_demo flow.
 
 ## Architectural notes
 
