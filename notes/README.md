@@ -52,6 +52,7 @@ stable bits to `modelblaster/README.md` once they've crystallized.
 | `ku040_bitstream_plan.md` | VCU118 / KU040 bitstream build plan; relevant when porting a config off Alveo U250. |
 | `vint_zephyr_plan.md` | Original plan for getting ViNT through the modelblaster flow (torch.export path motivation, op coverage gap). |
 | `smolvla_admission.md` | SmolVLA (`lerobot/smolvla_base`) admission status: loads + exports + runs through `extract_graph_export`. Dependency story for the sibling `lerobot` / `Understanding-PI0` checkouts, env-var overrides, and what's out of scope (int8 PTQ on the attention block, real calibration data). |
+| `hetero_gemmini_opu.md` | Heterogeneous 2-tile target wiring (Gemmini RoCC + Saturn OPU vector). Cores registry + dispatch through `examples/xpurt_demo/run.sh`, spike-hetero wrapper integration, what's gated (per-workload schedule.json from FreshScheduler, FireSim bitstream for the actual `GemminiAndOPUShuttleConfig`). |
 
 These are working notes — promote bits to `modelblaster/README.md` once
 they're implemented, stable, and worth surfacing to a new reader.
