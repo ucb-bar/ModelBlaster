@@ -32,13 +32,13 @@
 #   source scripts/set_envvars_sdk.sh
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 export PATH="/usr/bin:${PATH}"
 
 SCHEDULE_JSON="${SCHEDULE_JSON:-/scratch2/dima/misc_sw/FreshScheduler/schedules/scheduled_networks_mlp_dronet_profile_zephyr_profiled.json}"
 MODELS="${MODELS:-dronet,mlp_control}"
-REGISTRY="${REGISTRY:-${REPO_ROOT}/modelblaster/cores/chipyard_hetero_example.json}"
+REGISTRY="${REGISTRY:-${REPO_ROOT}/cores/chipyard_hetero_example.json}"
 BACKENDS="${BACKENDS:-scalar,rvv}"
 QUANT="${QUANT:-fp32}"
 # Optional per-model quant override (parallel to MODELS, comma list).
@@ -73,7 +73,7 @@ case "${RUNNER}" in
         ;;
 esac
 
-EXAMPLE_DIR="${REPO_ROOT}/modelblaster/examples/xpurt_demo"
+EXAMPLE_DIR="${REPO_ROOT}/examples/xpurt_demo"
 GEN_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 # Build dir tag carries the full backend set so cross-backend builds
 # don't clobber each other; appended _firesim when targeting the chipyard
@@ -112,7 +112,7 @@ IR_ARGS=()
 for idx in "${!MODEL_LIST[@]}"; do
     m="${MODEL_LIST[$idx]}"
     m_quant="${QUANT_LIST[$idx]}"
-    m_base="${REPO_ROOT}/modelblaster/examples/${m}/${m_quant}/generated"
+    m_base="${REPO_ROOT}/examples/${m}/${m_quant}/generated"
     for bs in "${BACKEND_LIST[@]}"; do
         m_gen_dir="${m_base}/${bs}"
         if [[ "${FORCE_REGEN}" == "1" || ! -f "${m_gen_dir}/model.h" ]]; then
@@ -124,7 +124,7 @@ for idx in "${!MODEL_LIST[@]}"; do
             # accidentally fire up FireSim N times (one per model x
             # backend) while xpurt_demo itself is targeting firesim.
             TARGET="${bs}" QUANT="${m_quant}" RUNNER=spike \
-                bash "${REPO_ROOT}/modelblaster/examples/${m}/run.sh" >/dev/null
+                bash "${REPO_ROOT}/examples/${m}/run.sh" >/dev/null
         fi
     done
     MODEL_NAMES+="${MODEL_NAMES:+;}${m}"
@@ -203,21 +203,21 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # backend list: gemmini in the build → dual-gemmini overlay (2 harts),
     # else default 4-hart overlay.
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
+        EXTRA_CONF="${REPO_ROOT}/harness/backends/${FIRESIM_CONF}"
     elif [[ ",${BACKENDS}," == *,gemmini,* || ",${BACKENDS}," == *,gemmini_q31,* ]]; then
         # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants run
         # on the same dual-rocket-saturn-gemmini SoC topology — the
         # bitstream selection is driven by config_runtime.yaml's
         # default_hw_config, not by the Zephyr Kconfig overlay.
-        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        EXTRA_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
+        EXTRA_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard.conf"
     fi
 elif [[ "${RUNNER}" == "spike" ]]; then
     # Spike runs default to -p4 (see SPIKE_FLAGS below); the overlay
     # matches with MP_MAX_NUM_CPUS=4. Override SPIKE_CONF if you point
     # spike_runner at a different -p value.
-    EXTRA_CONF="${REPO_ROOT}/modelblaster/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
+    EXTRA_CONF="${REPO_ROOT}/harness/backends/${SPIKE_CONF:-spike_quad.conf}"
 fi
 if [[ -z "${EXTRA_CONF:-}" || ! -f "${EXTRA_CONF}" ]]; then
     echo "ERROR: per-target overlay not found (RUNNER=${RUNNER}, EXTRA_CONF=${EXTRA_CONF:-<unset>})" >&2
@@ -287,7 +287,7 @@ print(' '.join(out))
     fi
     python -m modelblaster.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
         --timeout "${SPIKE_TIMEOUT:-900}" \
@@ -308,7 +308,7 @@ else
     fi
     python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/modelblaster/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
         "${FIRESIM_FLAGS[@]}"
