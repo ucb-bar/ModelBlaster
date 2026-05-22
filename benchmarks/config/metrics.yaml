@@ -94,6 +94,46 @@ metrics:
       consumes the most cycles. High values flag a likely bottleneck
       kernel; per-cell breakdown is rendered in summary.md.
 
+  passes_fired_total:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:passes_fired_total"
+    unit: count
+    arms: [A, B, C]
+    note: |
+      Total fusion / fold sites where the IR pipeline's passes
+      matched and absorbed an op. Adding a new fusion pattern that
+      bumps this number is direct evidence the pass fired; a value
+      of 0 means none of the existing patterns matched this model
+      (e.g. dronet's conv->BN->relu does not match conv->relu).
+
+  linear_relu_fuse_fired:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:linear_relu_fuse_fired"
+    unit: count
+    arms: [A, B, C]
+    note: linear+relu fusions absorbed during the FX-based extract_graph pass
+
+  conv2d_relu_fuse_fired:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:conv2d_relu_fuse_fired"
+    unit: count
+    arms: [A, B, C]
+    note: conv2d+relu fusions absorbed during the FX-based extract_graph pass
+
+  bn_fold_fired:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:bn_fold_fired"
+    unit: count
+    arms: [A, B, C]
+    note: BatchNorm-into-Conv2d folds in the torch.export extract path
+
+  pad_fold_fired:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:pad_fold_fired"
+    unit: count
+    arms: [A, B, C]
+    note: Pad-into-Conv2d folds in the torch.export extract path
+
   # ──────────── agent efficiency (Arms B + C only) ────────────
 
   tokens_input_cached:

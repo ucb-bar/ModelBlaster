@@ -352,6 +352,11 @@ def execute_run_sh(
     if workload.target in HETERO_TARGETS:
         _emit_cross_tile_estimate(workload, out_dir)
 
+    # All cells: snapshot the pipeline's passes_applied.json so the
+    # aggregator can answer "which fusion/fold passes fired during
+    # this IR build?" without re-running extract_graph.
+    _copy_passes_applied(workload, out_dir)
+
     write_env_snapshot(out_dir, env)
 
     return RunOutcome(
@@ -413,6 +418,18 @@ def _emit_cross_tile_estimate(workload: Workload, out_dir: Path) -> None:
         graph_path if graph_path.exists() else None,
         schedule_path if schedule_path.exists() else None,
     )
+
+
+def _copy_passes_applied(workload: Workload, out_dir: Path) -> None:
+    """Snapshot the IR extractor's passes_applied.json into the cell
+    run dir so the aggregator can read it via metrics.yaml's
+    relative-path source. The pipeline writes it next to graph.json
+    in examples/<model>/<quant>/generated/; if it's missing (older
+    IR build), we skip silently and the dashboard column stays blank."""
+    src = (REPO_ROOT / "examples" / workload.model
+           / workload.quant / "generated" / "passes_applied.json")
+    if src.exists():
+        (out_dir / "passes_applied.json").write_text(src.read_text())
 
 
 def synthesize_llm_tokens(
