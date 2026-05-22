@@ -119,13 +119,21 @@ def utilization_scalar(path: Path) -> Optional[float]:
 
 
 def cross_tile_bytes(path: Path) -> Optional[int]:
-    """Not yet implemented. Computing this needs the per-dispatch
-    output-tensor size (from graph.json) paired with the schedule's
-    (producer_kind, consumer_kind) edges -- the harness trace alone
-    does not carry tensor sizes. Returning None keeps the cell empty
-    in the dashboard until a runner-side helper writes a
-    `cross_tile_bytes.json` alongside the trace."""
-    return None
+    """Static upper bound on bytes that must cross tile boundaries,
+    computed by the runner's hetero-artifacts helper from graph.json
+    + schedule.json edges (see runners._hetero_artifacts). The path
+    points at `cross_tile_estimate.json` -- this extractor returns
+    the total. Per-edge detail lives in the JSON for offline
+    inspection."""
+    import json as _json
+    if not path.exists():
+        return None
+    try:
+        data = _json.loads(path.read_text())
+    except Exception:
+        return None
+    v = data.get("total_bytes")
+    return int(v) if v is not None else None
 
 
 def deadline_met_rate(path: Path) -> Optional[float]:

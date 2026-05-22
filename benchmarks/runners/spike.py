@@ -40,12 +40,14 @@ def parse_stdout(stdout: str, *, tag: Optional[str] = None
     verify = runner_common.parse_verify(stdout, tag=tag)
     profile = runner_common.parse_profile(stdout, tag=tag) or []
     wall = runner_common.parse_wall_cycles(stdout, tag=tag)
-    trace = _extract_xpurt_trace(stdout)
+    trace_csv = _extract_xpurt_trace(stdout)
+    trace_rows = cycles_per_op.parse_xpurt_trace_csv(trace_csv) if trace_csv else []
     return {
         "verify": verify,
         "profile": profile,
         "wall_cycles": wall,
-        "xpurt_trace": trace,
+        "xpurt_trace": trace_csv,
+        "xpurt_trace_rows": trace_rows,
     }
 
 
@@ -90,13 +92,20 @@ def write_accuracy(out_dir: Path, verify: Optional[dict[str, Any]],
         json.dump(data, f, indent=2)
 
 
-def write_profile_csv(out_dir: Path, profile: list[dict[str, Any]]
+def write_profile_csv(out_dir: Path, profile: list[dict[str, Any]],
+                      trace_rows: Optional[list[dict[str, Any]]] = None,
                       ) -> None:
     """Write the profile rows in IREE-shape (dispatch_id,name,op,
     shape,cycles), suffixed by the runner name. Also emits the
     per-op-kind breakdown into `cycles_per_op.json` so the aggregator
     can surface dominant-op metrics and the top-5 table in summary.md
-    without re-parsing the CSV."""
+    without re-parsing the CSV.
+
+    When `trace_rows` are supplied (hetero workloads with the XPURT
+    trace block in stdout), each by_dispatch entry is enriched with
+    its core_kind + hart, and a `by_op_kind_x_tile` rollup is added
+    so "conv2d_s8 on gemmini vs conv2d_s8 on rvv_opu" is visible at
+    a glance."""
     if not profile:
         return
     path = out_dir / f"profile_{RUNNER_NAME}.csv"
@@ -106,7 +115,7 @@ def write_profile_csv(out_dir: Path, profile: list[dict[str, Any]]
         w.writeheader()
         for row in profile:
             w.writerow(row)
-    breakdown = cycles_per_op.synthesize(profile)
+    breakdown = cycles_per_op.synthesize(profile, trace_rows=trace_rows)
     with open(out_dir / "cycles_per_op.json", "w") as f:
         json.dump(breakdown, f, indent=2)
 

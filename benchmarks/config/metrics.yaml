@@ -174,11 +174,17 @@ metrics:
     nullable_if: "target != 'hetero_gemmini_opu'"
 
   cross_tile_bytes:
-    source: "xpurt_trace.csv"
+    source: "cross_tile_estimate.json"
     extractor: "modelblaster.benchmarks.ingest.xpurt_trace:cross_tile_bytes"
     unit: bytes
     arms: [A, B, C]
     nullable_if: "target != 'hetero_gemmini_opu'"
+    note: |
+      Static upper bound on bytes crossing tile boundaries, computed
+      at runtime by the runner from graph.json + schedule.json edges.
+      A placement heuristic that lowers makespan but raises this
+      metric is paying communication cost for compute parallelism;
+      one that lowers both is unambiguously better.
 
   deadline_met_rate:
     source: "wall_cycles.txt"

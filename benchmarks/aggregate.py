@@ -575,6 +575,13 @@ def write_summary_md(cells: list[Cell], metrics: list[Metric],
             lines.extend(per_op_lines)
             lines.append("")
 
+        per_tile_lines = _render_per_op_x_tile(cells_in_wl, arm_ids)
+        if per_tile_lines:
+            lines.append("**Per op kind x tile (cycles attributed by XPURT trace):**")
+            lines.append("")
+            lines.extend(per_tile_lines)
+            lines.append("")
+
     # Section for workloads with no data at all.
     missing = [wl.id for wl in workloads if wl.id not in by_wl]
     if missing:
@@ -622,6 +629,52 @@ def _render_per_op_breakdown(cells_in_wl: dict[str, "Cell"],
     for aid, top in rows:
         for op, share, total in top:
             lines.append(f"| {aid} | {op} | {share*100:.1f}% | {_fmt(total)} |")
+    return lines
+
+
+def _render_per_op_x_tile(cells_in_wl: dict[str, "Cell"],
+                          arm_ids: list[str]) -> list[str]:
+    """Hetero cells only: surface the by_op_kind_x_tile rollup from
+    cycles_per_op.json so "conv2d_s8 on gemmini vs conv2d_s8 on
+    rvv_opu" is one glance. Returns an empty list when no cell has
+    tile-attributed data (single-target workloads, or hetero runs
+    without the XPURT trace block in stdout)."""
+    rows: list[tuple[str, list[tuple[str, dict]]]] = []
+    for aid in arm_ids:
+        cell = cells_in_wl[aid]
+        if cell.run_dir is None:
+            continue
+        src = cell.run_dir / "cycles_per_op.json"
+        if not src.exists():
+            continue
+        try:
+            with open(src) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        by_tile = data.get("by_op_kind_x_tile") or {}
+        if not by_tile:
+            continue
+        # Sort by share descending so the dominant op-on-tile is first.
+        items = sorted(by_tile.items(),
+                       key=lambda kv: kv[1].get("share", 0.0),
+                       reverse=True)
+        rows.append((aid, items))
+
+    if not rows:
+        return []
+
+    lines: list[str] = []
+    lines.append("| arm | op@tile | count | total cycles | share | mean |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for aid, items in rows:
+        for key, slot in items:
+            lines.append(
+                f"| {aid} | {key} | {slot.get('count', 0)} | "
+                f"{_fmt(int(slot.get('total', 0)))} | "
+                f"{slot.get('share', 0.0)*100:.1f}% | "
+                f"{slot.get('mean', 0.0):.0f} |"
+            )
     return lines
 
 

@@ -35,12 +35,14 @@ def parse_stdout(stdout: str, *, tag: Optional[str] = None
     verify = runner_common.parse_verify(stdout, tag=tag)
     profile = runner_common.parse_profile(stdout, tag=tag) or []
     wall = runner_common.parse_wall_cycles(stdout, tag=tag)
-    trace = _extract_xpurt_trace(stdout)
+    trace_csv = _extract_xpurt_trace(stdout)
+    trace_rows = cycles_per_op.parse_xpurt_trace_csv(trace_csv) if trace_csv else []
     return {
         "verify": verify,
         "profile": profile,
         "wall_cycles": wall,
-        "xpurt_trace": trace,
+        "xpurt_trace": trace_csv,
+        "xpurt_trace_rows": trace_rows,
     }
 
 
@@ -75,7 +77,8 @@ def write_accuracy(out_dir: Path, verify: Optional[dict[str, Any]],
         json.dump(data, f, indent=2)
 
 
-def write_profile_csv(out_dir: Path, profile: list[dict[str, Any]]
+def write_profile_csv(out_dir: Path, profile: list[dict[str, Any]],
+                      trace_rows: Optional[list[dict[str, Any]]] = None,
                       ) -> None:
     if not profile:
         return
@@ -86,7 +89,7 @@ def write_profile_csv(out_dir: Path, profile: list[dict[str, Any]]
         w.writeheader()
         for row in profile:
             w.writerow(row)
-    breakdown = cycles_per_op.synthesize(profile)
+    breakdown = cycles_per_op.synthesize(profile, trace_rows=trace_rows)
     with open(out_dir / "cycles_per_op.json", "w") as f:
         json.dump(breakdown, f, indent=2)
 
