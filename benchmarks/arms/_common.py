@@ -357,6 +357,14 @@ def execute_run_sh(
     # this IR build?" without re-running extract_graph.
     _copy_passes_applied(workload, out_dir)
 
+    # Arm B-* only: snapshot the optimize-loop trajectory so the
+    # aggregator can read per-candidate progress, yield rate, and
+    # token cost. Single-target workloads write to
+    # generated/<target>/; the hetero path writes per-model files
+    # under each model's generated/<target>/ via the xpurt_demo
+    # regen step.
+    _copy_optimize_artifacts(workload, workload.target, out_dir)
+
     write_env_snapshot(out_dir, env)
 
     return RunOutcome(
@@ -430,6 +438,21 @@ def _copy_passes_applied(workload: Workload, out_dir: Path) -> None:
            / workload.quant / "generated" / "passes_applied.json")
     if src.exists():
         (out_dir / "passes_applied.json").write_text(src.read_text())
+
+
+def _copy_optimize_artifacts(workload: Workload, target: str,
+                             out_dir: Path) -> None:
+    """For Arm B-* runs (BACKEND=llm + OPTIMIZE=1), snapshot
+    optimize_summary.json + beam_search_trajectory.jsonl from
+    examples/<model>/<quant>/generated/<target>/ into the cell run
+    dir. Arm A never produces them (no LLM calls); Arm B-* always
+    does when the optimize loop runs."""
+    src_dir = (REPO_ROOT / "examples" / workload.model
+               / workload.quant / "generated" / target)
+    for fname in ("optimize_summary.json", "beam_search_trajectory.jsonl"):
+        src = src_dir / fname
+        if src.exists():
+            (out_dir / fname).write_text(src.read_text())
 
 
 def synthesize_llm_tokens(

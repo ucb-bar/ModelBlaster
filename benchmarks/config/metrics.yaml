@@ -134,6 +134,71 @@ metrics:
     arms: [A, B, C]
     note: Pad-into-Conv2d folds in the torch.export extract path
 
+  # ──────────── beam-search trajectory (Arm B-* only) ────────────
+
+  beam_n_candidates_total:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_total"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    note: Total LLM-produced candidates across all ops/iters/parents/expansions.
+
+  beam_n_candidates_viable:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_viable"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    note: |
+      Candidates that built + verified + reported cycles. Ratio
+      against beam_n_candidates_total is the LLM's effective yield --
+      tuning the prompt or temperature can move this number.
+
+  beam_n_candidates_build_fail:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_build_fail"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+
+  beam_n_candidates_verify_fail:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_verify_fail"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+
+  beam_n_candidates_duplicate:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_duplicate"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    note: Suggestions the LLM repeated; tokens paid but no new code tested.
+
+  beam_tokens_per_candidate_mean:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:tokens_per_candidate_mean"
+    unit: tokens
+    arms: [B-bedrock, B-gemini, B-claude]
+    note: Mean (input + output) tokens per LLM-generated candidate.
+
+  beam_best_improvement_pct:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:best_improvement_pct"
+    unit: percent
+    arms: [B-bedrock, B-gemini, B-claude]
+    note: |
+      Largest baseline-vs-best percent improvement across ops in
+      this cell's optimize call. Near-zero means the beam search
+      didn't help on this workload/target; tune knobs or move on.
+
+  beam_iter_to_best:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:candidates_to_best_iter"
+    unit: iteration
+    arms: [B-bedrock, B-gemini, B-claude]
+    note: |
+      Which iteration the best candidate landed in (for the op with
+      the largest improvement). Lower than --iterations means you
+      plateaued early -- a knob signal for tuning the iteration count.
+
   # ──────────── agent efficiency (Arms B + C only) ────────────
 
   tokens_input_cached:
