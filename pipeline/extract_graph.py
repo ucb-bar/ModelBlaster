@@ -618,26 +618,36 @@ def extract_int8(
     output_names_multi: Optional[list[str]] = None
 
     # Two-pass walk: first collect linear→relu and conv2d→relu fusions so the
-    # relu node is absorbed into the producer's op kind.
+    # relu node is absorbed into the producer's op kind. Split by producer
+    # type so the passes_applied.json artifact can credit linear+relu and
+    # conv2d+relu separately -- that distinction matters when evaluating
+    # which fusion pattern is paying off on which workload.
     nodes = list(gm.graph.nodes)
-    fused_relu_after: set[str] = set()  # names of relu nodes that get fused
+    fused_linear_relu: set[str] = set()
+    fused_conv2d_relu: set[str] = set()
     for i, node in enumerate(nodes):
         if i + 1 >= len(nodes):
             continue
         nxt = nodes[i + 1]
-        is_fusable_producer = node.op == "call_module" and isinstance(
-            gm.get_submodule(node.target),
-            (torch.nn.Linear, torch.nn.Conv2d),
-        )
+        if node.op != "call_module":
+            continue
+        producer_mod = gm.get_submodule(node.target)
+        is_linear = isinstance(producer_mod, torch.nn.Linear)
+        is_conv2d = isinstance(producer_mod, torch.nn.Conv2d)
+        if not (is_linear or is_conv2d):
+            continue
         is_next_relu = (
             (nxt.op == "call_module"
              and isinstance(gm.get_submodule(nxt.target), torch.nn.ReLU))
             or (nxt.op == "call_function" and nxt.target in (
                 torch.relu, torch.nn.functional.relu))
         )
-        if is_fusable_producer and is_next_relu and len(nxt.args) == 1 \
-                and nxt.args[0] is node:
-            fused_relu_after.add(nxt.name)
+        if is_next_relu and len(nxt.args) == 1 and nxt.args[0] is node:
+            if is_linear:
+                fused_linear_relu.add(nxt.name)
+            else:
+                fused_conv2d_relu.add(nxt.name)
+    fused_relu_after: set[str] = fused_linear_relu | fused_conv2d_relu
 
     # Nodes to skip during the main walk (e.g. getitem consumers of chunk).
     _skip_nodes: set = set()
@@ -1330,13 +1340,39 @@ def extract_int8(
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
     io_path = os.path.join(out_dir, "io.npz")
+    passes_path = os.path.join(out_dir, "passes_applied.json")
     with open(ir_path, "w") as f:
         json.dump(ir, f, indent=2)
     np.savez(weights_path, **weights_blob)
     np.savez(io_path, input=inp_q, output=out_q)
+    # passes_applied.json records each fusion / fold pass that fired
+    # during this IR extraction plus the IR-side op counts that
+    # downstream tooling uses to answer "did my new fusion pattern
+    # actually run?" without grepping stdout.
+    passes_log = {
+        "schema_version": 1,
+        "extractor": "extract_graph",
+        "n_fx_nodes": len(nodes),
+        "n_ir_ops": len(ir["ops"]),
+        "passes": {
+            "linear_relu_fuse": {
+                "fired": len(fused_linear_relu),
+                "sites": sorted(fused_linear_relu),
+            },
+            "conv2d_relu_fuse": {
+                "fired": len(fused_conv2d_relu),
+                "sites": sorted(fused_conv2d_relu),
+            },
+        },
+    }
+    with open(passes_path, "w") as f:
+        json.dump(passes_log, f, indent=2)
     print(f"wrote {ir_path}")
     print(f"wrote {weights_path}  ({len(weights_blob)} tensors)")
     print(f"wrote {io_path}  (input dtype={inp_q.dtype}, output dtype={out_q.dtype})")
+    print(f"wrote {passes_path}  ("
+          f"linear_relu_fuse={len(fused_linear_relu)}, "
+          f"conv2d_relu_fuse={len(fused_conv2d_relu)})")
     return ir
 
 

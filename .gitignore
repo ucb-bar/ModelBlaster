@@ -17,3 +17,5 @@ examples/*/cache/
 
 # modelblaster_pool unit-test build trees.
 runtime/modelblaster_pool/test_app/build/
+
+tmp/
