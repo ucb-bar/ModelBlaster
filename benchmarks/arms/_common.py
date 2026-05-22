@@ -36,6 +36,7 @@ import yaml
 
 from modelblaster.benchmarks.runners import spike as spike_runner
 from modelblaster.benchmarks.runners import firesim as firesim_runner
+from modelblaster.benchmarks.runners import _hetero_artifacts
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -339,9 +340,17 @@ def execute_run_sh(
 
     parsed = runner.parse_stdout(proc.stdout)
     runner.write_accuracy(out_dir, parsed["verify"])
-    runner.write_profile_csv(out_dir, parsed["profile"])
+    runner.write_profile_csv(out_dir, parsed["profile"],
+                             trace_rows=parsed.get("xpurt_trace_rows"))
     runner.write_wall_cycles(out_dir, parsed["wall_cycles"])
     runner.write_xpurt_trace(out_dir, parsed.get("xpurt_trace"))
+
+    # Hetero-only: emit a static cross-tile bytes estimate by joining
+    # graph.json (per-op output tensor sizes) with the workload's
+    # schedule.json (per-dispatch slot label). The aggregator's
+    # cross_tile_bytes extractor reads the resulting file.
+    if workload.target in HETERO_TARGETS:
+        _emit_cross_tile_estimate(workload, out_dir)
 
     write_env_snapshot(out_dir, env)
 
@@ -383,6 +392,27 @@ def finalize(
 
     print(f"OK: {workload.id} -> {outcome.out_dir}")
     return 0
+
+
+def _emit_cross_tile_estimate(workload: Workload, out_dir: Path) -> None:
+    """Resolve the canonical graph.json + schedule.json paths for a
+    hetero workload and call the runner-side helper to compute the
+    cross-tile bytes upper bound. Silent on missing inputs --
+    `cross_tile_estimate.json` simply won't be created and the
+    aggregator's nullable_if rule leaves the metric blank."""
+    if workload.xpurt_schedule_path is None:
+        return
+    schedule_path = (REPO_ROOT / workload.xpurt_schedule_path).resolve()
+    # Convention: per-model IRs land at examples/<model>/<quant>/generated/graph.json.
+    # That's what extract_graph and the xpurt_demo regen step both
+    # produce, so it's the right place to read from.
+    graph_path = (REPO_ROOT / "examples" / workload.model
+                  / workload.quant / "generated" / "graph.json")
+    _hetero_artifacts.write_cross_tile_estimate(
+        out_dir,
+        graph_path if graph_path.exists() else None,
+        schedule_path if schedule_path.exists() else None,
+    )
 
 
 def synthesize_llm_tokens(
