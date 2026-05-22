@@ -961,10 +961,23 @@ def beam_search_optimize(
                     max_tokens=32768, temperature=0.5,
                 )
                 log(f"      tokens in={res.input_tokens} out={res.output_tokens}")
+                # Token usage attaches to every history record produced
+                # for this call, regardless of how the candidate exits
+                # (duplicate / build_fail / verify_fail / ok). Lets the
+                # trajectory log answer "how much did we pay per
+                # successful candidate?" without re-joining JSONL logs.
+                tokens_in = int(res.input_tokens or 0)
+                tokens_out = int(res.output_tokens or 0)
                 candidate = extract_code_block(res.text, lang="c")
                 key = _normalize(candidate)
                 if key in seen:
                     log(f"      duplicate, skip")
+                    history.append({
+                        "iter": it, "parent_idx": parent_idx,
+                        "exp_idx": exp, "parent_cycles": parent_cycles,
+                        "result": "duplicate",
+                        "tokens_in": tokens_in, "tokens_out": tokens_out,
+                    })
                     continue
                 seen.add(key)
 
@@ -991,8 +1004,10 @@ def beam_search_optimize(
                     for ln in head:
                         log(f"        {ln[:300]}")
                     history.append({
-                        "iter": it, "parent_cycles": parent_cycles,
+                        "iter": it, "parent_idx": parent_idx,
+                        "exp_idx": exp, "parent_cycles": parent_cycles,
                         "result": "build_fail",
+                        "tokens_in": tokens_in, "tokens_out": tokens_out,
                         "diag": " | ".join(head)[:2000],
                     })
                     continue
@@ -1001,8 +1016,10 @@ def beam_search_optimize(
                     log(f"      verify FAIL: golden mismatch "
                         f"(max_abs_err={hres.golden_max_abs_err:.3g})")
                     history.append({
-                        "iter": it, "parent_cycles": parent_cycles,
+                        "iter": it, "parent_idx": parent_idx,
+                        "exp_idx": exp, "parent_cycles": parent_cycles,
                         "result": "verify_fail",
+                        "tokens_in": tokens_in, "tokens_out": tokens_out,
                         "diag": f"golden mismatch ({hres.golden_max_abs_err:.3g})",
                     })
                     continue
@@ -1015,8 +1032,10 @@ def beam_search_optimize(
                     if not vres.ok:
                         log(f"      host verify FAIL: {vres.message.splitlines()[0]}")
                         history.append({
-                            "iter": it, "parent_cycles": parent_cycles,
+                            "iter": it, "parent_idx": parent_idx,
+                            "exp_idx": exp, "parent_cycles": parent_cycles,
                             "result": "verify_fail",
+                            "tokens_in": tokens_in, "tokens_out": tokens_out,
                             "diag": vres.message.splitlines()[0],
                         })
                         continue
@@ -1025,8 +1044,10 @@ def beam_search_optimize(
                 log(f"      {parent_cycles} -> {new_cycles} cyc"
                     f" ({(parent_cycles-new_cycles)/parent_cycles*100:+.1f}%)")
                 history.append({
-                    "iter": it, "parent_cycles": parent_cycles,
+                    "iter": it, "parent_idx": parent_idx,
+                    "exp_idx": exp, "parent_cycles": parent_cycles,
                     "result": "ok", "cycles": new_cycles,
+                    "tokens_in": tokens_in, "tokens_out": tokens_out,
                 })
                 proposals.append((candidate, new_cycles))
                 all_viable.append((candidate, new_cycles))
@@ -1437,6 +1458,21 @@ def generate(
     with open(summary_path, "w") as f:
         json.dump(optimize_summary, f, indent=2)
     log(f"wrote {summary_path}")
+
+    # beam_search_trajectory.jsonl: one line per candidate (across
+    # every op + iter + parent + expansion in this optimize call) so
+    # the harness can answer "did we plateau early?" / "how much did
+    # we pay per surviving candidate?" / "what was the best-of-K
+    # curve?" without re-parsing the nested summary.
+    trajectory_path = os.path.join(out_dir, "beam_search_trajectory.jsonl")
+    with open(trajectory_path, "w") as f:
+        for op, entry in optimize_summary.items():
+            baseline = entry.get("baseline")
+            for rec in entry.get("history") or []:
+                line = {"spec": op, "baseline_cycles": baseline}
+                line.update(rec)
+                f.write(json.dumps(line) + "\n")
+    log(f"wrote {trajectory_path}")
     log("")
     log("optimize summary:")
     for op, s in sorted(optimize_summary.items()):
