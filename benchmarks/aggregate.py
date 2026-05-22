@@ -32,6 +32,7 @@ import csv
 import fnmatch
 import importlib
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -275,46 +276,102 @@ def _resolve_extractor(spec: str):
 class Cell:
     arm: Arm
     workload: Workload
+    # `run_dir` is the canonical run for per-cell artifacts the
+    # aggregator reads beyond the numeric metric extraction (e.g. the
+    # cycles_per_op.json used in the per-op breakdown table). For
+    # N=1 it's the latest; for N>1 it's the most recent of the N.
     run_dir: Optional[Path]
+    # All N run dirs the metrics are averaged over (ordered most
+    # recent first). N=1 -> single-entry list.
+    run_dirs: list[Path] = field(default_factory=list)
+    # Mean of each metric across the N runs.
     values: dict[str, Any] = field(default_factory=dict)
+    # Sample standard deviation (Bessel-corrected) per metric, when
+    # N>1 and the metric is numeric across all N. Absent for N=1.
+    stddevs: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
-def _find_run_dir(arm: Arm, workload: Workload,
-                  pin_run_id: Optional[str]) -> Optional[Path]:
+def _find_run_dirs(arm: Arm, workload: Workload,
+                   pin_run_id: Optional[str],
+                   n_runs: int) -> list[Path]:
+    """Return up to `n_runs` most-recent run directories for this
+    (arm, workload). N=1 with no pin returns the `latest` symlink
+    target (or the most-recent subdir if no symlink exists). N>1
+    walks every run-id subdir and sorts by name -- ISO-8601 UTC
+    timestamps as filenames are lexicographically ordered."""
     base = RESULTS_DIR / arm.id / workload.id
     if not base.exists():
-        return None
+        return []
     if pin_run_id is not None:
         d = base / pin_run_id
-        return d if d.exists() else None
-    latest = base / "latest"
-    if latest.is_symlink() or latest.is_dir():
-        return latest.resolve() if latest.is_symlink() else latest
-    # Fall back to the most recent subdir by mtime if no `latest` symlink.
-    subs = [d for d in base.iterdir() if d.is_dir()]
+        return [d] if d.exists() else []
+    subs = [d for d in base.iterdir() if d.is_dir() and d.name != "latest"]
     if not subs:
-        return None
-    return max(subs, key=lambda d: d.stat().st_mtime)
+        return []
+    if n_runs <= 1:
+        latest = base / "latest"
+        if latest.is_symlink():
+            return [latest.resolve()]
+        return [max(subs, key=lambda d: d.stat().st_mtime)]
+    # Most-recent first by name; tiebreak on mtime for safety.
+    subs.sort(key=lambda d: (d.name, d.stat().st_mtime), reverse=True)
+    return subs[:n_runs]
 
 
 def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any]
-                    ) -> Optional[Any]:
-    # Arm filter.
+                    ) -> tuple[Optional[Any], Optional[float]]:
+    """Extract `metric` from every run dir on `cell` and reduce to
+    a (mean, stddev) pair. `stddev` is None when N=1 or the metric
+    is non-numeric (e.g. a string returned by an extractor). For
+    derived metrics the per-run values come from re-evaluating the
+    derivation against each run dir's tokens log -- so
+    dollars_equivalent also gets a stddev when N>1."""
     if cell.arm.id not in metric.arms:
-        return None
-    # Workload-driven nullable.
+        return None, None
     if _nullable(metric, cell.workload):
-        return None
+        return None, None
+
+    samples: list[Any] = []
+    for run_dir in cell.run_dirs:
+        v = _extract_one(cell, metric, pricing, run_dir)
+        if v is not None:
+            samples.append(v)
+
+    if not samples:
+        return None, None
+
+    numeric = [float(x) for x in samples
+               if isinstance(x, (int, float)) and not isinstance(x, bool)]
+    if numeric and len(numeric) == len(samples):
+        mean = sum(numeric) / len(numeric)
+        stddev = None
+        if len(numeric) > 1:
+            var = sum((x - mean) ** 2 for x in numeric) / (len(numeric) - 1)
+            stddev = math.sqrt(var)
+        # Preserve int output when all inputs are int and the mean
+        # is exact (avoids "12500.0" in the dashboard).
+        if (all(isinstance(x, int) and not isinstance(x, bool)
+                for x in samples)
+                and mean == int(mean)):
+            return int(mean), stddev
+        return mean, stddev
+
+    # Non-numeric metric -- emit the most-recent value and skip stddev.
+    return samples[0], None
+
+
+def _extract_one(cell: Cell, metric: Metric, pricing: dict[str, Any],
+                 run_dir: Path) -> Optional[Any]:
     # Derived metric (e.g. dollars_equivalent).
     if metric.derived_from:
         if metric.name == "dollars_equivalent":
-            return compute_cost_usd(cell, pricing)
+            return _compute_cost_usd_for(cell, run_dir, pricing)
         return None
     # File-backed metric.
-    if cell.run_dir is None or metric.source is None or metric.extractor is None:
+    if metric.source is None or metric.extractor is None:
         return None
-    src = cell.run_dir / metric.source
+    src = run_dir / metric.source
     if not src.exists():
         return None
     fn = _resolve_extractor(metric.extractor)
@@ -329,13 +386,20 @@ def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any]
 
 
 def compute_cost_usd(cell: Cell, pricing: dict[str, Any]) -> Optional[float]:
-    """USD equivalent of the cell's token usage. Reads per-model
-    breakdown from llm_tokens.json::by_model so different LLMs in the
-    same run are priced separately. Returns None when the cell has no
-    tokens or the breakdown is unavailable."""
+    """Back-compat wrapper -- prices the latest run only. The
+    per-replicate version lives in `_compute_cost_usd_for`."""
     if cell.run_dir is None:
         return None
-    src = cell.run_dir / "llm_tokens.json"
+    return _compute_cost_usd_for(cell, cell.run_dir, pricing)
+
+
+def _compute_cost_usd_for(cell: Cell, run_dir: Path,
+                          pricing: dict[str, Any]) -> Optional[float]:
+    """USD equivalent of one run dir's token usage. Reads per-model
+    breakdown from llm_tokens.json::by_model so different LLMs in the
+    same run are priced separately. Returns None when the run dir
+    has no tokens or the breakdown is unavailable."""
+    src = run_dir / "llm_tokens.json"
     if not src.exists():
         return None
     try:
@@ -387,19 +451,25 @@ def compute_cost_usd(cell: Cell, pricing: dict[str, Any]) -> Optional[float]:
 
 def write_dashboard_csv(cells: list[Cell], metrics: list[Metric],
                         out_path: Path) -> None:
+    """Long-format CSV: one row per (arm, workload, metric). `stddev`
+    is empty when N=1 or the metric is non-numeric. `n_runs` is the
+    actual replicate count for this cell (may be less than the
+    aggregator's --runs request when only some runs exist)."""
     header = [
         "arm", "workload", "model", "target", "quant", "runner",
-        "metric", "value", "unit",
+        "metric", "value", "stddev", "n_runs", "unit",
     ]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
         for cell in cells:
+            n_runs = len(cell.run_dirs)
             for m in metrics:
                 v = cell.values.get(m.name)
                 if v is None:
                     continue
+                stddev = cell.stddevs.get(m.name)
                 w.writerow([
                     cell.arm.id,
                     cell.workload.id,
@@ -409,6 +479,8 @@ def write_dashboard_csv(cells: list[Cell], metrics: list[Metric],
                     cell.workload.runner,
                     m.name,
                     v,
+                    "" if stddev is None else f"{stddev:.6g}",
+                    n_runs,
                     m.unit,
                 ])
 
@@ -457,10 +529,24 @@ def write_summary_md(cells: list[Cell], metrics: list[Metric],
             row_vals = []
             any_value = False
             for aid in arm_ids:
-                v = cells_in_wl[aid].values.get(m.name)
-                row_vals.append("—" if v is None else _fmt(v))
-                if v is not None:
+                cell = cells_in_wl[aid]
+                v = cell.values.get(m.name)
+                if v is None:
+                    row_vals.append("—")
+                else:
                     any_value = True
+                    stddev = cell.stddevs.get(m.name)
+                    n_runs = len(cell.run_dirs)
+                    if n_runs <= 1:
+                        row_vals.append(_fmt(v))
+                    elif stddev is None or stddev <= 1e-9 * max(abs(float(v)), 1.0):
+                        # Replicates ran but the value didn't vary --
+                        # surface N without the noise of a tiny stddev.
+                        row_vals.append(f"{_fmt(v)} (N={n_runs})")
+                    else:
+                        row_vals.append(
+                            f"{_fmt(v)} ± {_fmt(stddev)} (N={n_runs})"
+                        )
             if not any_value:
                 continue  # skip metrics that are blank across all arms
 
@@ -569,10 +655,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--run-id", default=None,
                     help="pin to a specific run-id under each cell "
                          "(default: follow `latest`)")
+    ap.add_argument("--runs", type=int, default=1,
+                    help="when > 1, average each metric over the N most-recent "
+                         "run-ids per cell and emit mean ± stddev (N=k). "
+                         "Mutually exclusive with --run-id (which always pins "
+                         "to a single run).")
     ap.add_argument("--include-arm", action="append", default=None,
                     help="restrict to these arms (repeatable). Default: all "
                          "arms in arms.yaml")
     args = ap.parse_args(argv)
+
+    if args.runs < 1:
+        raise SystemExit("--runs must be >= 1")
+    if args.run_id and args.runs != 1:
+        raise SystemExit("--run-id pins one run; --runs > 1 averages over many. "
+                         "Pick one.")
 
     arms = load_arms()
     workloads = load_workloads()
@@ -588,12 +685,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cells: list[Cell] = []
     for arm, wl in pairs:
-        run_dir = _find_run_dir(arm, wl, args.run_id)
-        cell = Cell(arm=arm, workload=wl, run_dir=run_dir)
+        run_dirs = _find_run_dirs(arm, wl, args.run_id, args.runs)
+        cell = Cell(
+            arm=arm, workload=wl,
+            run_dir=run_dirs[0] if run_dirs else None,
+            run_dirs=run_dirs,
+        )
         for m in metrics:
-            v = _collect_metric(cell, m, pricing)
-            if v is not None:
-                cell.values[m.name] = v
+            mean, stddev = _collect_metric(cell, m, pricing)
+            if mean is not None:
+                cell.values[m.name] = mean
+                if stddev is not None:
+                    cell.stddevs[m.name] = stddev
         cells.append(cell)
 
     write_dashboard_csv(cells, metrics, RESULTS_DIR / "dashboard.csv")
@@ -601,9 +704,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                      RESULTS_DIR / "summary.md")
 
     populated = sum(1 for c in cells if c.values)
+    n_runs_msg = "" if args.runs == 1 else f", up to {args.runs} runs/cell"
     print(f"wrote {RESULTS_DIR / 'dashboard.csv'} and "
           f"{RESULTS_DIR / 'summary.md'} "
-          f"({populated}/{len(cells)} cells populated)")
+          f"({populated}/{len(cells)} cells populated{n_runs_msg})")
     return 0
 
 
