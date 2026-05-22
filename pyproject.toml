@@ -30,6 +30,8 @@ dev = [
 benchmarks = [
     # Aggregator + dashboard rendering.
     "pyyaml>=6.0",
+    # Live cost monitor TUI (modelblaster.benchmarks.tools.cost_monitor).
+    "rich>=13.0",
 ]
 smolvla = [
     # SmolVLA admission pulls the canonical lerobot checkout in editable

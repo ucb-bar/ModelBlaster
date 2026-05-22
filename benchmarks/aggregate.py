@@ -89,6 +89,13 @@ class Metric:
     nullable_if: Optional[str]
     derived_from: tuple[str, ...]
     note: str
+    # Two-phase taxonomy from metrics.yaml:
+    #   pre_kernel       — graph-side, deterministic across arms.
+    #   kernel_synthesis — depends on which kernel C the synthesis loop
+    #                      emitted (so it diverges per arm).
+    # Unknown / missing values render at the bottom of each workload's
+    # table under an "other" header so typos surface.
+    phase: str = "kernel_synthesis"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -140,6 +147,7 @@ def load_metrics() -> list[Metric]:
             nullable_if=m.get("nullable_if"),
             derived_from=tuple(m.get("derived_from", [])),
             note=m.get("note", ""),
+            phase=m.get("phase", "kernel_synthesis"),
         ))
     return out
 
@@ -495,12 +503,34 @@ def write_summary_md(cells: list[Cell], metrics: list[Metric],
     lines: list[str] = []
     lines.append("# Benchmark dashboard\n")
     lines.append(
-        "One section per workload. The first table compares the arms\n"
-        "side-by-side across the metrics that apply; the second (when\n"
-        "data is present) lists the top op kinds by cycle share per\n"
-        "arm so you can see at a glance which kernel is the bottleneck.\n"
+        "One section per workload, split into two phases:\n"
+        "\n"
+        "- **pre-kernel**: graph-side metrics (fusion / fold pass fires,\n"
+        "  IR op counts, static cross-tile traffic). Deterministic across\n"
+        "  arms — A and B should agree here; divergence is a bug.\n"
+        "- **kernel synthesis**: properties of the compiled artifact\n"
+        "  (cycles, accuracy, makespan, LLM token cost, beam trajectory).\n"
+        "  Diverges per arm because the synthesis strategy differs.\n"
+        "\n"
+        "Each per-workload section is followed by a top-op breakdown\n"
+        "and (when hetero) a per-op-x-tile rollup.\n"
     )
     lines.append("")
+
+    # Stable phase order: pre_kernel first, then kernel_synthesis, then
+    # anything else (catches typos in metrics.yaml's phase field).
+    phase_order = ["pre_kernel", "kernel_synthesis"]
+    phase_titles = {
+        "pre_kernel": "pre-kernel — graph compilation",
+        "kernel_synthesis": "kernel synthesis — compiled-artifact + LLM loop",
+    }
+    metrics_by_phase: dict[str, list[Metric]] = {}
+    for m in metrics:
+        metrics_by_phase.setdefault(m.phase, []).append(m)
+    phases_present = [p for p in phase_order if p in metrics_by_phase]
+    for p in metrics_by_phase:
+        if p not in phases_present:
+            phases_present.append(p)
 
     for wl in workloads:
         if wl.id not in by_wl:
@@ -520,43 +550,51 @@ def write_summary_md(cells: list[Cell], metrics: list[Metric],
         lines.append(meta)
         lines.append("")
 
-        header = ["metric"] + arm_ids + ["unit"]
-        sep = ["---"] + ["---"] * len(arm_ids) + ["---"]
-        lines.append("| " + " | ".join(header) + " |")
-        lines.append("| " + " | ".join(sep) + " |")
-
-        for m in metrics:
-            row_vals = []
-            any_value = False
-            for aid in arm_ids:
-                cell = cells_in_wl[aid]
-                v = cell.values.get(m.name)
-                if v is None:
-                    row_vals.append("—")
-                else:
-                    any_value = True
-                    stddev = cell.stddevs.get(m.name)
-                    n_runs = len(cell.run_dirs)
-                    if n_runs <= 1:
-                        row_vals.append(_fmt(v))
-                    elif stddev is None or stddev <= 1e-9 * max(abs(float(v)), 1.0):
-                        # Replicates ran but the value didn't vary --
-                        # surface N without the noise of a tiny stddev.
-                        row_vals.append(f"{_fmt(v)} (N={n_runs})")
+        for phase in phases_present:
+            phase_metrics = metrics_by_phase[phase]
+            phase_rows: list[str] = []
+            for m in phase_metrics:
+                row_vals = []
+                any_value = False
+                for aid in arm_ids:
+                    cell = cells_in_wl[aid]
+                    v = cell.values.get(m.name)
+                    if v is None:
+                        row_vals.append("—")
                     else:
-                        row_vals.append(
-                            f"{_fmt(v)} ± {_fmt(stddev)} (N={n_runs})"
-                        )
-            if not any_value:
-                continue  # skip metrics that are blank across all arms
+                        any_value = True
+                        stddev = cell.stddevs.get(m.name)
+                        n_runs = len(cell.run_dirs)
+                        if n_runs <= 1:
+                            row_vals.append(_fmt(v))
+                        elif stddev is None or stddev <= 1e-9 * max(abs(float(v)), 1.0):
+                            row_vals.append(f"{_fmt(v)} (N={n_runs})")
+                        else:
+                            row_vals.append(
+                                f"{_fmt(v)} ± {_fmt(stddev)} (N={n_runs})"
+                            )
+                if not any_value:
+                    continue
 
-            # Cycle-source-honesty: tag spike-on-accel as non-authoritative.
-            name = m.name
-            if name == "cycles_spike" and wl.target in ACCEL_TARGETS:
-                name = f"{name} *(not authoritative on {wl.target})*"
+                name = m.name
+                if name == "cycles_spike" and wl.target in ACCEL_TARGETS:
+                    name = f"{name} *(not authoritative on {wl.target})*"
 
-            lines.append("| " + " | ".join([name] + row_vals + [m.unit]) + " |")
-        lines.append("")
+                phase_rows.append("| " + " | ".join(
+                    [name] + row_vals + [m.unit]
+                ) + " |")
+
+            if not phase_rows:
+                continue
+
+            lines.append(f"### {phase_titles.get(phase, phase)}")
+            lines.append("")
+            header = ["metric"] + arm_ids + ["unit"]
+            sep = ["---"] + ["---"] * len(arm_ids) + ["---"]
+            lines.append("| " + " | ".join(header) + " |")
+            lines.append("| " + " | ".join(sep) + " |")
+            lines.extend(phase_rows)
+            lines.append("")
 
         notes_seen: set[str] = set()
         for aid in arm_ids:
@@ -709,10 +747,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="pin to a specific run-id under each cell "
                          "(default: follow `latest`)")
     ap.add_argument("--runs", type=int, default=1,
-                    help="when > 1, average each metric over the N most-recent "
-                         "run-ids per cell and emit mean ± stddev (N=k). "
-                         "Mutually exclusive with --run-id (which always pins "
-                         "to a single run).")
+                    help="default replicate count for all arms. When > 1, "
+                         "average each metric over the N most-recent run-ids "
+                         "per cell and emit mean ± stddev. Mutually exclusive "
+                         "with --run-id.")
+    ap.add_argument("--runs-arm", action="append", default=None,
+                    metavar="ARM=N",
+                    help="override --runs for a specific arm (repeatable). "
+                         "E.g. --runs-arm A=3 --runs-arm B-bedrock=5. Useful "
+                         "when deterministic arms need fewer replicates than "
+                         "LLM-driven arms.")
     ap.add_argument("--include-arm", action="append", default=None,
                     help="restrict to these arms (repeatable). Default: all "
                          "arms in arms.yaml")
@@ -723,6 +767,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.run_id and args.runs != 1:
         raise SystemExit("--run-id pins one run; --runs > 1 averages over many. "
                          "Pick one.")
+
+    # Parse --runs-arm overrides into a {arm_id: n_runs} dict.
+    runs_by_arm: dict[str, int] = {}
+    for entry in (args.runs_arm or []):
+        if "=" not in entry:
+            raise SystemExit(f"--runs-arm expects ARM=N, got: {entry!r}")
+        aid, n_str = entry.split("=", 1)
+        try:
+            n = int(n_str)
+        except ValueError:
+            raise SystemExit(f"--runs-arm N must be an int, got: {n_str!r}")
+        if n < 1:
+            raise SystemExit(f"--runs-arm N must be >= 1, got: {n}")
+        if args.run_id and n != 1:
+            raise SystemExit("--run-id pins one run; --runs-arm N>1 conflicts.")
+        runs_by_arm[aid] = n
 
     arms = load_arms()
     workloads = load_workloads()
@@ -738,7 +798,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cells: list[Cell] = []
     for arm, wl in pairs:
-        run_dirs = _find_run_dirs(arm, wl, args.run_id, args.runs)
+        n_runs = runs_by_arm.get(arm.id, args.runs)
+        run_dirs = _find_run_dirs(arm, wl, args.run_id, n_runs)
         cell = Cell(
             arm=arm, workload=wl,
             run_dir=run_dirs[0] if run_dirs else None,
@@ -757,7 +818,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                      RESULTS_DIR / "summary.md")
 
     populated = sum(1 for c in cells if c.values)
-    n_runs_msg = "" if args.runs == 1 else f", up to {args.runs} runs/cell"
+    if runs_by_arm:
+        per_arm = ", ".join(f"{a}={n}" for a, n in sorted(runs_by_arm.items()))
+        n_runs_msg = f", runs: default={args.runs} ({per_arm})"
+    elif args.runs == 1:
+        n_runs_msg = ""
+    else:
+        n_runs_msg = f", up to {args.runs} runs/cell"
     print(f"wrote {RESULTS_DIR / 'dashboard.csv'} and "
           f"{RESULTS_DIR / 'summary.md'} "
           f"({populated}/{len(cells)} cells populated{n_runs_msg})")
