@@ -77,6 +77,23 @@ metrics:
     unit: MB
     arms: [A, B, C]
 
+  n_ops_profiled:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:n_ops"
+    unit: count
+    arms: [A, B, C]
+    note: number of profile-CSV rows (dispatches with a measured cycle count)
+
+  dominant_op_share:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:dominant_share"
+    unit: fraction
+    arms: [A, B, C]
+    note: |
+      Fraction of total profiled cycles in the single op kind that
+      consumes the most cycles. High values flag a likely bottleneck
+      kernel; per-cell breakdown is rendered in summary.md.
+
   # ──────────── agent efficiency (Arms B + C only) ────────────
 
   tokens_input_cached:
@@ -131,11 +148,16 @@ metrics:
   # ──────────── scheduler / heterogeneous (hetero_gemmini_opu only) ────────────
 
   makespan_cycles:
-    source: "wall_cycles.txt"
+    source: "xpurt_trace.csv"
     extractor: "modelblaster.benchmarks.ingest.xpurt_trace:makespan"
     unit: cycles
     arms: [A, B, C]
     nullable_if: "target != 'hetero_gemmini_opu'"
+    note: |
+      Max of actual_end_cycles across all trace entries. Reflects the
+      wall-clock cycles end of the run. Pair with the schedule's
+      predicted makespan (start_time + duration in xpurt_trace.csv)
+      to spot under/over budget runs.
 
   accelerator_utilization_gemmini:
     source: "xpurt_trace.csv"

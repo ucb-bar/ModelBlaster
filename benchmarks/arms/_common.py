@@ -167,6 +167,12 @@ def hetero_env_overlay(workload: Workload, env: dict[str, str]) -> None:
         if candidate.exists():
             env["MODELBLASTER_HETERO_SPIKE"] = str(candidate)
 
+    # Turn on the harness's per-entry execution trace so the aggregator
+    # has makespan / per-tile utilization metrics to read. The trace
+    # block is otherwise compiled out (saves a few hundred bytes of
+    # data + the cycle-counter reads around each dispatch).
+    env.setdefault("XPURT_TRACE", "1")
+
 
 def require_tools(tools: list[str]) -> None:
     """Fail fast when a required tool is missing on PATH. The Zephyr
@@ -335,6 +341,7 @@ def execute_run_sh(
     runner.write_accuracy(out_dir, parsed["verify"])
     runner.write_profile_csv(out_dir, parsed["profile"])
     runner.write_wall_cycles(out_dir, parsed["wall_cycles"])
+    runner.write_xpurt_trace(out_dir, parsed.get("xpurt_trace"))
 
     write_env_snapshot(out_dir, env)
 
