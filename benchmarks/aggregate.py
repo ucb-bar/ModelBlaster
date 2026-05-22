@@ -423,8 +423,10 @@ def write_summary_md(cells: list[Cell], metrics: list[Metric],
     lines: list[str] = []
     lines.append("# Benchmark dashboard\n")
     lines.append(
-        "One section per workload. Each section's table compares the arms\n"
-        "side by side across the metrics that apply.\n"
+        "One section per workload. The first table compares the arms\n"
+        "side-by-side across the metrics that apply; the second (when\n"
+        "data is present) lists the top op kinds by cycle share per\n"
+        "arm so you can see at a glance which kernel is the bottleneck.\n"
     )
     lines.append("")
 
@@ -480,6 +482,13 @@ def write_summary_md(cells: list[Cell], metrics: list[Metric],
         if notes_seen:
             lines.append("")
 
+        per_op_lines = _render_per_op_breakdown(cells_in_wl, arm_ids)
+        if per_op_lines:
+            lines.append("**Top op kinds by cycle share:**")
+            lines.append("")
+            lines.extend(per_op_lines)
+            lines.append("")
+
     # Section for workloads with no data at all.
     missing = [wl.id for wl in workloads if wl.id not in by_wl]
     if missing:
@@ -494,6 +503,42 @@ def write_summary_md(cells: list[Cell], metrics: list[Metric],
     out_path.write_text("\n".join(lines))
 
 
+def _render_per_op_breakdown(cells_in_wl: dict[str, "Cell"],
+                             arm_ids: list[str]) -> list[str]:
+    """For each arm that has a `cycles_per_op.json`, list the top-5
+    op kinds by cycle share. Returns a list of markdown lines (table
+    + rows). When no arm has the artifact, returns an empty list and
+    the dashboard renderer skips the section."""
+    from modelblaster.benchmarks.ingest import cycles_per_op as cpo
+
+    rows: list[tuple[str, list[tuple[str, float, int]]]] = []
+    for aid in arm_ids:
+        cell = cells_in_wl[aid]
+        if cell.run_dir is None:
+            continue
+        src = cell.run_dir / "cycles_per_op.json"
+        if not src.exists():
+            continue
+        try:
+            top = cpo.top_op_breakdown(src, k=5)
+        except Exception as e:
+            cell.notes.append(f"cycles_per_op extractor raised: {e}")
+            continue
+        if top:
+            rows.append((aid, top))
+
+    if not rows:
+        return []
+
+    lines: list[str] = []
+    lines.append("| arm | op kind | share | cycles |")
+    lines.append("| --- | --- | --- | --- |")
+    for aid, top in rows:
+        for op, share, total in top:
+            lines.append(f"| {aid} | {op} | {share*100:.1f}% | {_fmt(total)} |")
+    return lines
+
+
 def _fmt(v: Any) -> str:
     if isinstance(v, bool):
         return "yes" if v else "no"
@@ -504,6 +549,12 @@ def _fmt(v: Any) -> str:
             return f"{v:,.0f}"
         if abs(v) >= 1:
             return f"{v:.4g}"
+        # Fractions / probabilities read better in decimal than in
+        # scientific notation (0.93 vs 9.3e-01). Only fall back to
+        # scientific for genuinely tiny floats where decimals would
+        # lose precision.
+        if abs(v) >= 1e-3:
+            return f"{v:.4f}"
         return f"{v:.3e}"
     if isinstance(v, int):
         return f"{v:,}"
