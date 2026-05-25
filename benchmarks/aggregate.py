@@ -156,8 +156,47 @@ def load_pricing() -> dict[str, Any]:
     return _load_yaml(CONFIG_DIR / "pricing.yaml")
 
 
+def load_clocks() -> dict[str, Any]:
+    """Per-target clock_hz used to derive latency_ms_* from cycles_*."""
+    return _load_yaml(CONFIG_DIR / "clocks.yaml")
+
+
 def load_matrix_rules() -> dict[str, Any]:
     return _load_yaml(CONFIG_DIR / "matrix.yaml")
+
+
+def _clock_hz_for(clocks: dict[str, Any], runner: str,
+                  target: str) -> Optional[int]:
+    """Resolve clock_hz for a (runner, target) pair from clocks.yaml.
+    `null` in the config means "do not derive latency for this pair"
+    -- the caller treats it as "no latency available."""
+    rt = clocks.get(runner) or {}
+    per_target = rt.get("per_target") or {}
+    if target in per_target:
+        v = per_target[target]
+        return int(v) if v is not None else None
+    default = rt.get("default_clock_hz")
+    return int(default) if default is not None else None
+
+
+def _compute_latency_ms_for(cell: "Cell", run_dir: Path,
+                            clocks: dict[str, Any],
+                            runner: str) -> Optional[float]:
+    """Read the appropriate profile CSV's total cycles for a (runner,
+    target) pair, divide by clock_hz, return milliseconds. Returns
+    None when the profile CSV is absent for this runner or the clock
+    is explicitly null."""
+    clock_hz = _clock_hz_for(clocks, runner, cell.workload.target)
+    if clock_hz is None or clock_hz <= 0:
+        return None
+    src = run_dir / f"profile_{runner}.csv"
+    if not src.exists():
+        return None
+    from modelblaster.benchmarks.ingest import profile_csv as _pc
+    cycles = _pc.sum_cycles(src)
+    if cycles is None:
+        return None
+    return float(cycles) / float(clock_hz) * 1000.0
 
 
 # ───────────────────── matrix expansion ─────────────────────
@@ -327,7 +366,8 @@ def _find_run_dirs(arm: Arm, workload: Workload,
     return subs[:n_runs]
 
 
-def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any]
+def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any],
+                    clocks: Optional[dict[str, Any]] = None,
                     ) -> tuple[Optional[Any], Optional[float]]:
     """Extract `metric` from every run dir on `cell` and reduce to
     a (mean, stddev) pair. `stddev` is None when N=1 or the metric
@@ -342,7 +382,7 @@ def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any]
 
     samples: list[Any] = []
     for run_dir in cell.run_dirs:
-        v = _extract_one(cell, metric, pricing, run_dir)
+        v = _extract_one(cell, metric, pricing, run_dir, clocks)
         if v is not None:
             samples.append(v)
 
@@ -370,11 +410,18 @@ def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any]
 
 
 def _extract_one(cell: Cell, metric: Metric, pricing: dict[str, Any],
-                 run_dir: Path) -> Optional[Any]:
-    # Derived metric (e.g. dollars_equivalent).
+                 run_dir: Path,
+                 clocks: Optional[dict[str, Any]] = None) -> Optional[Any]:
+    # Derived metric (e.g. dollars_equivalent, latency_ms_*).
     if metric.derived_from:
         if metric.name == "dollars_equivalent":
             return _compute_cost_usd_for(cell, run_dir, pricing)
+        if metric.name == "latency_ms_firesim":
+            return _compute_latency_ms_for(cell, run_dir, clocks or {},
+                                           "firesim")
+        if metric.name == "latency_ms_spike":
+            return _compute_latency_ms_for(cell, run_dir, clocks or {},
+                                           "spike")
         return None
     # File-backed metric.
     if metric.source is None or metric.extractor is None:
@@ -788,6 +835,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     workloads = load_workloads()
     metrics = load_metrics()
     pricing = load_pricing()
+    clocks = load_clocks()
     rules = load_matrix_rules()
 
     if args.include_arm:
@@ -806,7 +854,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             run_dirs=run_dirs,
         )
         for m in metrics:
-            mean, stddev = _collect_metric(cell, m, pricing)
+            mean, stddev = _collect_metric(cell, m, pricing, clocks)
             if mean is not None:
                 cell.values[m.name] = mean
                 if stddev is not None:

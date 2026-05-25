@@ -98,6 +98,76 @@ metrics:
       metric is paying communication cost for compute parallelism;
       one that lowers both is unambiguously better.
 
+  ir_op_count:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:ir_op_count"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Number of compute ops in the IR after all front-end folds /
+      fuses fired. Pair with `n_input_nodes` to see how aggressive
+      the extractor was at collapsing the source graph.
+
+  n_input_nodes:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:n_input_nodes"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Front-end graph node count BEFORE lowering. n_fx_nodes for the
+      FX extractor (dronet / yolov8 / ViNT), n_aten_nodes for the
+      torch.export extractor (SmolVLA / mobilenet_v2).
+
+  lowering_ratio:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:lowering_ratio"
+    unit: fraction
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      ir_op_count / n_input_nodes. Lower means the extractor folded /
+      fused more aggressively. Comparing this column across arms
+      should always tie (graph passes are deterministic); divergence
+      is a bug.
+
+  n_dispatches_graph:
+    source: "graph_summary.json"
+    extractor: "modelblaster.benchmarks.ingest.graph_summary:n_dispatches_graph"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Number of compute records in graph.json. Different from
+      `n_ops_profiled` (which is post-run; aliases and noops drop
+      out of profile rows but stay in the graph).
+
+  n_distinct_op_kinds:
+    source: "graph_summary.json"
+    extractor: "modelblaster.benchmarks.ingest.graph_summary:n_distinct_op_kinds"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Unique `op` strings across the IR. Tells you how many distinct
+      kernel implementations the cell needs (curated for Arm A,
+      LLM-synthesized for Arm B). A workload with 32 dispatches but
+      only 4 op kinds has a 4-kernel implementation surface.
+
+  n_distinct_shapes:
+    source: "graph_summary.json"
+    extractor: "modelblaster.benchmarks.ingest.graph_summary:n_distinct_shapes"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Unique (op, shape) pairs. Captures shape diversity: a high
+      value relative to `n_distinct_op_kinds` means many shape-
+      specialized kernel variants (high LLM cost if every shape
+      needs its own synthesized C). Low value = a few parametric
+      kernels cover all dispatches.
+
   # ──────────── kernel-synthesis: compiled-artifact metrics ────────────
   #
   # Depend on what the synthesis loop emitted as kernels.c. Arm A's
@@ -152,6 +222,220 @@ metrics:
     arms: [A, B, C]
     phase: kernel_synthesis
 
+  verify_pass:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:verify_pass"
+    unit: bool
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Did the harness output pass the backend's atol/rtol envelope vs
+      the PyTorch reference? Per-backend overrides come from
+      pipeline.backends.Backend.atol_override. A failing verify is
+      always the most important signal -- the cell's cycle/cost data
+      describes a broken kernel.
+
+  bit_exact:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:bit_exact"
+    unit: bool
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      True only when linf == 0 -- the output matched the reference
+      at every element. Separate column from verify_pass because
+      verify_pass tolerates the backend's atol/rtol envelope; a
+      kernel can have verify_pass=true with bit_exact=false when it
+      has small but real drift. Relevant for tuning int8 quant
+      schemes where drift compounds across layers.
+
+  # ──────────── kernel-synthesis: latency (derived from cycles + clock) ────────────
+
+  latency_ms_firesim:
+    derived_from: [cycles_firesim]
+    extractor: "modelblaster.benchmarks.aggregate:_compute_latency_ms_for"
+    unit: ms
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    nullable_if: "runner != 'firesim'"
+    note: |
+      cycles_firesim / clock_hz * 1000. clock_hz looked up in
+      config/clocks.yaml::firesim.per_target (default 100 MHz on
+      chipyard bitstreams). Null entries in clocks.yaml suppress the
+      derivation for (target, runner) pairs where cycles are not a
+      valid latency input.
+
+  latency_ms_spike:
+    derived_from: [cycles_spike]
+    extractor: "modelblaster.benchmarks.aggregate:_compute_latency_ms_for"
+    unit: ms
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      cycles_spike / clock_hz * 1000. clocks.yaml::spike marks accel
+      targets (rvv_opu / gemmini*) as null because spike runs those
+      extensions atomically -- latency_ms_spike on them is meaningless.
+      On scalar / rvv paths, treats spike cycles as ~1 GHz nominal.
+
+  # ──────────── kernel-synthesis: binary / artifact size ────────────
+
+  zephyr_elf_bytes:
+    source: "binary_size.json"
+    extractor: "modelblaster.benchmarks.ingest.binary_size:zephyr_elf_bytes"
+    unit: bytes
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Final zephyr.elf size. Embedded target = small budget; a kernel
+      set that doubles the binary may be a regression even if cycles
+      improve. Single-target layout; hetero builds land under
+      examples/xpurt_demo and may not populate this column yet.
+
+  kernels_c_bytes:
+    source: "binary_size.json"
+    extractor: "modelblaster.benchmarks.ingest.binary_size:kernels_c_bytes"
+    unit: bytes
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  kernels_c_loc:
+    source: "binary_size.json"
+    extractor: "modelblaster.benchmarks.ingest.binary_size:kernels_c_loc"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Line count of the generated kernels.c. Compare across arms:
+      LLM-synthesized kernels are typically much longer than scalar
+      reference; "did the LLM trade C lines for cycles?" reads off
+      against cycles_firesim.
+
+  weights_npz_bytes:
+    source: "binary_size.json"
+    extractor: "modelblaster.benchmarks.ingest.binary_size:weights_npz_bytes"
+    unit: bytes
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  # ──────────── kernel-synthesis: per-stage wall-clock breakdown ────────────
+
+  extract_s:
+    source: "stage_timings.json"
+    extractor: "modelblaster.benchmarks.ingest.stage_timings:extract_s"
+    unit: s
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: "Time in extract_graph (PyTorch trace + folds). Skipped runs measure ~0."
+
+  generate_skeleton_s:
+    source: "stage_timings.json"
+    extractor: "modelblaster.benchmarks.ingest.stage_timings:generate_skeleton_s"
+    unit: s
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  generate_kernels_s:
+    source: "stage_timings.json"
+    extractor: "modelblaster.benchmarks.ingest.stage_timings:generate_kernels_s"
+    unit: s
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Time inside generate_kernels. On Arm A this is the curated-probe
+      + emit time (seconds); on Arm B this is dominated by the LLM
+      loop (minutes). The single column makes the LLM cost in wall
+      time legible.
+
+  build_s:
+    source: "stage_timings.json"
+    extractor: "modelblaster.benchmarks.ingest.stage_timings:build_s"
+    unit: s
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  run_s:
+    source: "stage_timings.json"
+    extractor: "modelblaster.benchmarks.ingest.stage_timings:run_s"
+    unit: s
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  total_stage_s:
+    source: "stage_timings.json"
+    extractor: "modelblaster.benchmarks.ingest.stage_timings:total_stage_s"
+    unit: s
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Sum of the 5 stage timers. Should be close to compile_wall_clock_s;
+      a meaningful gap surfaces wall time consumed outside any tagged
+      stage (e.g. arm-driver overhead, env snapshot, finalize).
+
+  # ──────────── kernel-synthesis: kernel-source breakdown ────────────
+
+  n_kernels_curated:
+    source: "kernel_picks.json"
+    extractor: "modelblaster.benchmarks.ingest.kernel_picks:n_kernels_curated"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Ops served by a hand-written file from kernels/<target>/. For
+      Arm A, this is the "curated coverage" headline: low values mean
+      the cell relied heavily on scalar fallback for the target ISA.
+
+  n_kernels_reference:
+    source: "kernel_picks.json"
+    extractor: "modelblaster.benchmarks.ingest.kernel_picks:n_kernels_reference"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Ops that ran the inline reference_impl (scalar C). On
+      accelerator targets, this is the "did NOT exercise the ISA"
+      count -- the gap a curator or LLM would need to close.
+
+  n_kernels_cached:
+    source: "kernel_picks.json"
+    extractor: "modelblaster.benchmarks.ingest.kernel_picks:n_kernels_cached"
+    unit: count
+    arms: [B, C]
+    phase: kernel_synthesis
+    note: |
+      Ops served by a previously-PASSed cached kernel (no LLM tokens
+      spent this run for these ops). Today subsumed in n_kernels_llm
+      until generate_one_llm surfaces source distinctions.
+
+  n_kernels_llm:
+    source: "kernel_picks.json"
+    extractor: "modelblaster.benchmarks.ingest.kernel_picks:n_kernels_llm"
+    unit: count
+    arms: [B, C]
+    phase: kernel_synthesis
+    note: |
+      Ops where the LLM produced the kernel this run. Today includes
+      cache hits served by the LLM path (the per-op source split
+      lives inside generate_one_llm and isn't yet plumbed out).
+
+  n_kernels_total:
+    source: "kernel_picks.json"
+    extractor: "modelblaster.benchmarks.ingest.kernel_picks:n_kernels_total"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  algorithms_distinct_count:
+    source: "kernel_picks.json"
+    extractor: "modelblaster.benchmarks.ingest.kernel_picks:algorithms_distinct_count"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Distinct algorithm names picked across all ops in the cell.
+      Arm A inherits the diversity of curated files present. For
+      Arm B, low values = LLM converged on one style; high values =
+      shape-specialized picks.
+
   compile_wall_clock_s:
     source: "run.json"
     extractor: "modelblaster.benchmarks.ingest.run_json:wall_clock_s"
@@ -190,6 +474,43 @@ metrics:
       consumes the most cycles. High values flag a likely bottleneck
       kernel; per-cell breakdown is rendered in summary.md.
 
+  mean_cycles_per_dispatch:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:mean_cycles_per_dispatch"
+    unit: cycles
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: "total_cycles / n_ops -- typical cost of one dispatch."
+
+  stddev_cycles_per_dispatch:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:stddev_cycles_per_dispatch"
+    unit: cycles
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Spread of per-dispatch cycles across the whole cell. High values
+      flag mixed tiny+huge ops (potential fusion / granularity headroom).
+
+  op_kind_p95_max_cycles:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:op_kind_p95_max"
+    unit: cycles
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Largest p95 across op kinds -- surfaces the worst-tail kernel.
+      Pair with dominant_op_share: high dominant share + high p95 =
+      one specific dispatch is the bottleneck.
+
+  op_kind_median_max_cycles:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:op_kind_median_max"
+    unit: cycles
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: "Largest median cycles across op kinds (robust to outliers)."
+
   makespan_cycles:
     source: "xpurt_trace.csv"
     extractor: "modelblaster.benchmarks.ingest.xpurt_trace:makespan"
@@ -218,6 +539,48 @@ metrics:
     arms: [A, B, C]
     phase: kernel_synthesis
     nullable_if: "target != 'hetero_gemmini_opu'"
+
+  dispatches_per_tile_gemmini:
+    source: "xpurt_trace.csv"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:dispatches_per_tile_gemmini"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    nullable_if: "target != 'hetero_gemmini_opu'"
+    note: "Trace rows landed on a gemmini tile. Pair with the OPU count for the placement split."
+
+  dispatches_per_tile_opu:
+    source: "xpurt_trace.csv"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:dispatches_per_tile_opu"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    nullable_if: "target != 'hetero_gemmini_opu'"
+
+  tile_load_imbalance:
+    source: "xpurt_trace.csv"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:tile_load_imbalance"
+    unit: ratio
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    nullable_if: "target != 'hetero_gemmini_opu'"
+    note: |
+      max(busy_cycles) / min(busy_cycles) across tile kinds. 1.0 =
+      perfectly balanced; high values mean one tile saturated while
+      another idled. Read alongside makespan: a placement that lowers
+      makespan and lowers imbalance is unambiguously better.
+
+  schedule_parallelism_max:
+    source: "xpurt_trace.csv"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:schedule_parallelism_max"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    nullable_if: "target != 'hetero_gemmini_opu'"
+    note: |
+      Max concurrent dispatches at any instant (interval-sweep over
+      trace rows). =1 means schedule is serial; <n_tiles means
+      inter-dispatch dependencies kept tiles waiting.
 
   deadline_met_rate:
     source: "wall_cycles.txt"
