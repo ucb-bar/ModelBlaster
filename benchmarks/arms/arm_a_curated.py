@@ -41,9 +41,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="workload id from config/workloads.yaml")
     ap.add_argument("--run-id", default=None,
                     help="override run-id (default: UTC timestamp)")
+    ap.add_argument("--runner-override", default=None,
+                    choices=["spike", "firesim"],
+                    help="swap the workload's runner. On hetero workloads "
+                         "this routes the inner verify through spike-hetero "
+                         "(functional-only, iteration-speed knob); use the "
+                         "workload's default for baseline captures.")
     args = ap.parse_args(argv)
 
     workload = _common.load_workload(args.workload)
+    workload = _common.apply_runner_override(workload, args.runner_override)
     if workload.blocked_by:
         print(f"workload {workload.id} is blocked_by: {workload.blocked_by}",
               file=sys.stderr)

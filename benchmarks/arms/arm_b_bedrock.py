@@ -70,9 +70,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--no-firesim-eval", action="store_true",
                     help="suppress FIRESIM_EVAL=1 even when the workload "
                          "would normally request it")
+    ap.add_argument("--runner-override", default=None,
+                    choices=["spike", "firesim"],
+                    help="swap the workload's runner. On hetero workloads "
+                         "this routes through spike-hetero (functional-"
+                         "only); use the workload's default for the "
+                         "baseline capture.")
     args = ap.parse_args(argv)
 
     workload = _common.load_workload(args.workload)
+    workload = _common.apply_runner_override(workload, args.runner_override)
     if workload.blocked_by:
         print(f"workload {workload.id} is blocked_by: {workload.blocked_by}",
               file=sys.stderr)

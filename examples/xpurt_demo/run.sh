@@ -267,6 +267,21 @@ print(' '.join(out))
     # binary needs --extension=gemmini support, which only the
     # chipyard-built spike has. Default-pick that one if it exists;
     # SPIKE_BIN env var overrides explicitly.
+    # spike-hetero is the merlin-side wrapper that loads BOTH the
+    # Gemmini and Saturn-OPU extensions into one spike process; it is
+    # the only spike build capable of running hetero workloads where
+    # BACKENDS contains both gemmini and rvv_opu. The arm driver's
+    # hetero_env_overlay points this env var at it when RUNNER=spike on
+    # a hetero workload. Takes precedence over the chipyard-spike
+    # autopick below so an explicitly-set wrapper is honored.
+    if [[ -n "${MODELBLASTER_HETERO_SPIKE:-}" && -z "${SPIKE_BIN:-}" ]]; then
+        if [[ -x "${MODELBLASTER_HETERO_SPIKE}" ]]; then
+            SPIKE_BIN="${MODELBLASTER_HETERO_SPIKE}"
+        else
+            echo "ERROR: MODELBLASTER_HETERO_SPIKE=${MODELBLASTER_HETERO_SPIKE} is not executable" >&2
+            exit 1
+        fi
+    fi
     SPIKE_BIN_DEFAULT="/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike"
     if [[ ",${BACKENDS}," == *,gemmini,* && -z "${SPIKE_BIN:-}" ]]; then
         if [[ -x "${SPIKE_BIN_DEFAULT}" ]]; then
