@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -86,6 +86,38 @@ def load_workload(workload_id: str) -> Workload:
                 xpurt_backends=r.get("xpurt_backends"),
             )
     raise SystemExit(f"workload not found: {workload_id}")
+
+
+def apply_runner_override(
+    workload: Workload, override: Optional[str],
+) -> Workload:
+    """Return a Workload with `runner` swapped to `override` if set.
+
+    The override is the iteration-speed knob the user reaches for when
+    a workload's default runner is FireSim but they only want functional
+    correctness + the inner-loop verify to ride spike. On the
+    hetero_gemmini_opu target this auto-selects spike-hetero via
+    `hetero_env_overlay`; the resulting cycle counts on accelerator
+    ops are NOT authoritative, so this override is for iteration only,
+    not baseline capture.
+    """
+    if override is None or override == workload.runner:
+        return workload
+    if override not in ("spike", "firesim"):
+        raise SystemExit(
+            f"--runner-override must be spike|firesim, got {override!r}"
+        )
+    if (workload.target in HETERO_TARGETS and override == "spike"):
+        # Surface the cycle-source caveat on stderr so it lands in the
+        # cell's run dir alongside the data.
+        print(
+            f"NOTE: --runner-override spike on hetero target "
+            f"{workload.target}: cycles on accelerator ops are functional-"
+            f"only (spike-hetero atomic exec). Use firesim for the "
+            f"baseline capture.",
+            file=sys.stderr,
+        )
+    return replace(workload, runner=override)
 
 
 def new_run_id() -> str:
