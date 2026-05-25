@@ -136,6 +136,75 @@ def cross_tile_bytes(path: Path) -> Optional[int]:
     return int(v) if v is not None else None
 
 
+def _dispatches_of_kind(path: Path, kind: str) -> Optional[int]:
+    """Count trace rows whose core_kind matches. None when the trace is
+    empty (e.g. binary built without -DMODELBLASTER_XPURT_TRACE)."""
+    rows = _read(path)
+    if not rows:
+        return None
+    return sum(1 for r in rows
+               if r.get("core_kind", "").strip() == kind)
+
+
+def dispatches_per_tile_gemmini(path: Path) -> Optional[int]:
+    return _dispatches_of_kind(path, "gemmini")
+
+
+def dispatches_per_tile_opu(path: Path) -> Optional[int]:
+    return _dispatches_of_kind(path, "rvv_opu")
+
+
+def dispatches_per_tile_rvv(path: Path) -> Optional[int]:
+    return _dispatches_of_kind(path, "rvv")
+
+
+def dispatches_per_tile_scalar(path: Path) -> Optional[int]:
+    return _dispatches_of_kind(path, "scalar")
+
+
+def tile_load_imbalance(path: Path) -> Optional[float]:
+    """Ratio of busiest tile's busy cycles to least-busy tile's busy
+    cycles. Reads `_busy_cycles_by_kind` and divides max/min over the
+    distinct core_kinds. Returns None when only one tile-kind ran
+    (single-target metrics already cover that case). High ratios on
+    hetero workloads point at placement decisions that left one tile
+    idle while another saturated."""
+    busy = _busy_cycles_by_kind(_read(path))
+    nonzero = [v for v in busy.values() if v > 0]
+    if len(nonzero) < 2:
+        return None
+    return float(max(nonzero)) / float(min(nonzero))
+
+
+def schedule_parallelism_max(path: Path) -> Optional[int]:
+    """Maximum number of dispatches running concurrently at any point
+    in time, computed via a sweep over (start, end) intervals. A value
+    of 1 means the schedule is fully serial; 2 means at some instant
+    two tiles ran ops at the same time. The theoretical max equals
+    the number of tiles in the registry; lower values mean
+    inter-dispatch dependencies kept tiles waiting."""
+    rows = _read(path)
+    if not rows:
+        return None
+    events: list[tuple[int, int]] = []
+    for r in rows:
+        start = r.get("actual_start_cycles", "").strip()
+        end = r.get("actual_end_cycles", "").strip()
+        if not start or not end:
+            continue
+        events.append((int(start), +1))
+        events.append((int(end), -1))
+    if not events:
+        return None
+    events.sort()
+    cur = peak = 0
+    for _, delta in events:
+        cur += delta
+        if cur > peak:
+            peak = cur
+    return peak
+
+
 def deadline_met_rate(path: Path) -> Optional[float]:
     """Not yet implemented. Requires the workload row to declare a
     `period_ms` (or `deadline_ms`), and the harness's per-instance

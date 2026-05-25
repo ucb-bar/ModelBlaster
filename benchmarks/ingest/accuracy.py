@@ -49,3 +49,14 @@ def cosine(path: Path) -> Optional[float]:
 def verify_pass(path: Path) -> Optional[bool]:
     v = _load(path).get("verify_pass")
     return bool(v) if v is not None else None
+
+
+def bit_exact(path: Path) -> Optional[bool]:
+    """True when the harness output matched the reference at every
+    element (linf == 0). Surfaces as a separate column from verify_pass
+    because verify_pass tolerates the backend's atol/rtol envelope --
+    a kernel that's "verify_pass=true but bit_exact=false" is correct
+    by spec but has measurable drift from the reference, which is the
+    relevant signal when tuning an int8 quant scheme."""
+    v = _load(path).get("bit_exact")
+    return bool(v) if v is not None else None

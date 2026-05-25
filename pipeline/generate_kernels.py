@@ -1155,6 +1155,15 @@ def generate(
     # Used by the optimize loop to write the optimized kernel back to the
     # right cache file (same key the baseline read from).
     chosen_algo: dict[str, str] = {}
+    # Per-op record of where each kernel ended up coming from. Written
+    # to kernel_picks.json next to kernels.c so the benchmark harness
+    # can answer "Arm A: how many curated kernels matched vs scalar
+    # fallback?" and "Arm B: which algorithm did the LLM pick per op?"
+    # The schema is provider-agnostic and arm-agnostic:
+    #   {op: {source: reference|curated|cached|llm,
+    #         algorithm: str|null,
+    #         path: str|null}}
+    kernel_picks: dict[str, dict[str, Optional[str]]] = {}
 
     needs_harness_paths = (
         target.verify_method == VERIFY_SPIKE_HARNESS
@@ -1172,6 +1181,9 @@ def generate(
         log(f"backend=reference  target={target.name}  ops={op_kinds}")
         for spec in specs:
             impls[spec.op] = spec.reference_impl
+            kernel_picks[spec.op] = {
+                "source": "reference", "algorithm": None, "path": None,
+            }
         # Also probe the global curated dir under the reference path so
         # hand-written curated kernels can be exercised without needing
         # LLM credentials. For each spec, look up any algorithm whose file
@@ -1194,6 +1206,11 @@ def generate(
                         log(f"  [{spec.op}/{algorithm.name}] reference + "
                             f"curated swap from {curated_path}")
                         impls[spec.op] = open(curated_path).read()
+                        kernel_picks[spec.op] = {
+                            "source": "curated",
+                            "algorithm": algorithm.name,
+                            "path": curated_path,
+                        }
                         break
     elif backend_name == "llm":
         # Lazy proxy: the LLM client is only instantiated when actually needed
@@ -1248,14 +1265,35 @@ def generate(
             code, chosen = result
             impls[spec.op] = code
             chosen_algo[spec.op] = chosen
+            # generate_one_llm may have hit a cache / curated probe
+            # internally; today we can't distinguish those cleanly
+            # from a fresh LLM synthesis without further plumbing.
+            # Record as "llm" (the path that reached this point through
+            # the LLM backend) with the chosen algorithm name. A
+            # follow-up that propagates the actual code source out of
+            # generate_one_llm can refine cached/curated/llm.
+            kernel_picks[spec.op] = {
+                "source": "llm",
+                "algorithm": chosen,
+                "path": None,
+            }
     else:
         raise SystemExit(f"unknown --backend: {backend_name}")
 
     emit_kernels_h(specs, out_dir, model_name=ir["name"])
     emit_kernels_c(impls, backend_name, out_dir, backend=target, model_name=ir["name"])
+    # Emit the per-op kernel_picks alongside kernels.c. The benchmark
+    # harness's arm driver copies this into the cell's run dir; the
+    # aggregator's kernel_picks extractors derive per-source counts +
+    # algorithm diversity.
+    picks_path = os.path.join(out_dir, "kernel_picks.json")
+    with open(picks_path, "w") as _f:
+        json.dump({"schema_version": 1, "target": target.name,
+                   "picks": kernel_picks}, _f, indent=2)
     print(f"wrote {os.path.join(out_dir, 'kernels.h')}")
     print(f"wrote {os.path.join(out_dir, 'kernels.c')}  "
           f"(source={backend_name} target={target.name})")
+    print(f"wrote {picks_path}")
 
     if not optimize:
         return
