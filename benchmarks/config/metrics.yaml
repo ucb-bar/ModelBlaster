@@ -13,6 +13,14 @@
 #   extractor      module:function — applied to the parsed source file
 #   unit           string used in summary.md headers
 #   arms           which arms produce this metric (others render as "—")
+#   phase          pre_kernel        — graph-side metric, deterministic;
+#                                      same value regardless of synthesis
+#                                      strategy (curated vs LLM vs agentic).
+#                  kernel_synthesis  — depends on what the synthesis loop
+#                                      produced (cycles of the emitted
+#                                      kernels, LLM token cost, beam-search
+#                                      yield, etc.). Different arms in the
+#                                      same workload row diverge here.
 #   nullable_if    expression over workload fields (e.g. "runner != 'firesim'");
 #                  when true, this cell does not produce the metric and the
 #                  aggregator suppresses it without flagging it as missing
@@ -21,84 +29,22 @@
 
 metrics:
 
-  # ──────────── compiler quality ────────────
-
-  cycles_firesim:
-    source: "profile_firesim.csv"
-    extractor: "modelblaster.benchmarks.ingest.profile_csv:sum_cycles"
-    unit: cycles
-    arms: [A, B, C]
-    nullable_if: "runner != 'firesim'"
-    note: |
-      Primary cycle metric for rvv_opu / gemmini / gemmini_q31 / hetero_gemmini_opu.
-      Aggregator REFUSES to compute Arm-vs-Arm deltas on accelerator targets
-      using cycles_spike — those extensions execute atomically in spike.
-
-  cycles_spike:
-    source: "profile_spike.csv"
-    extractor: "modelblaster.benchmarks.ingest.profile_csv:sum_cycles"
-    unit: cycles
-    arms: [A, B, C]
-    note: |
-      Recorded for {scalar, scalar_f16, rvv, rvv_f16} as primary.
-      For {rvv_opu, gemmini, gemmini_q31, hetero_gemmini_opu} this is
-      correctness instrumentation only. Spike runs the Gemmini and
-      Saturn-OPU extensions atomically (no microarchitectural model),
-      so cycle counts on those targets are not authoritative.
-
-  accuracy_linf:
-    source: "accuracy.json"
-    extractor: "modelblaster.benchmarks.ingest.accuracy:linf"
-    unit: dimensionless
-    arms: [A, B, C]
-    note: respects per-backend atol_override from pipeline.backends.Backend
-
-  accuracy_rmse:
-    source: "accuracy.json"
-    extractor: "modelblaster.benchmarks.ingest.accuracy:rmse"
-    unit: dimensionless
-    arms: [A, B, C]
-
-  accuracy_cos:
-    source: "accuracy.json"
-    extractor: "modelblaster.benchmarks.ingest.accuracy:cosine"
-    unit: dimensionless
-    arms: [A, B, C]
-
-  compile_wall_clock_s:
-    source: "run.json"
-    extractor: "modelblaster.benchmarks.ingest.run_json:wall_clock_s"
-    unit: s
-    arms: [A, B, C]
-
-  compile_peak_rss_mb:
-    source: "run.json"
-    extractor: "modelblaster.benchmarks.ingest.run_json:peak_rss_mb"
-    unit: MB
-    arms: [A, B, C]
-
-  n_ops_profiled:
-    source: "cycles_per_op.json"
-    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:n_ops"
-    unit: count
-    arms: [A, B, C]
-    note: number of profile-CSV rows (dispatches with a measured cycle count)
-
-  dominant_op_share:
-    source: "cycles_per_op.json"
-    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:dominant_share"
-    unit: fraction
-    arms: [A, B, C]
-    note: |
-      Fraction of total profiled cycles in the single op kind that
-      consumes the most cycles. High values flag a likely bottleneck
-      kernel; per-cell breakdown is rendered in summary.md.
+  # ──────────── pre-kernel: graph-quality metrics ────────────
+  #
+  # Properties of the IR after extract_graph + fusion/fold passes,
+  # plus static analyses (cross_tile_bytes) computed from graph.json +
+  # schedule.json. These do not depend on which arm produced the
+  # kernels; for a given (model, target, git_sha) all arms see the
+  # same numbers here. Changes that move these are graph/IR-level:
+  # new fusion patterns, new fold passes, new placement heuristics
+  # for the hetero schedule.
 
   passes_fired_total:
     source: "passes_applied.json"
     extractor: "modelblaster.benchmarks.ingest.passes_applied:passes_fired_total"
     unit: count
     arms: [A, B, C]
+    phase: pre_kernel
     note: |
       Total fusion / fold sites where the IR pipeline's passes
       matched and absorbed an op. Adding a new fusion pattern that
@@ -111,6 +57,7 @@ metrics:
     extractor: "modelblaster.benchmarks.ingest.passes_applied:linear_relu_fuse_fired"
     unit: count
     arms: [A, B, C]
+    phase: pre_kernel
     note: linear+relu fusions absorbed during the FX-based extract_graph pass
 
   conv2d_relu_fuse_fired:
@@ -118,6 +65,7 @@ metrics:
     extractor: "modelblaster.benchmarks.ingest.passes_applied:conv2d_relu_fuse_fired"
     unit: count
     arms: [A, B, C]
+    phase: pre_kernel
     note: conv2d+relu fusions absorbed during the FX-based extract_graph pass
 
   bn_fold_fired:
@@ -125,6 +73,7 @@ metrics:
     extractor: "modelblaster.benchmarks.ingest.passes_applied:bn_fold_fired"
     unit: count
     arms: [A, B, C]
+    phase: pre_kernel
     note: BatchNorm-into-Conv2d folds in the torch.export extract path
 
   pad_fold_fired:
@@ -132,131 +81,121 @@ metrics:
     extractor: "modelblaster.benchmarks.ingest.passes_applied:pad_fold_fired"
     unit: count
     arms: [A, B, C]
+    phase: pre_kernel
     note: Pad-into-Conv2d folds in the torch.export extract path
 
-  # ──────────── beam-search trajectory (Arm B-* only) ────────────
-
-  beam_n_candidates_total:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_total"
-    unit: count
-    arms: [B-bedrock, B-gemini, B-claude]
-    note: Total LLM-produced candidates across all ops/iters/parents/expansions.
-
-  beam_n_candidates_viable:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_viable"
-    unit: count
-    arms: [B-bedrock, B-gemini, B-claude]
+  cross_tile_bytes:
+    source: "cross_tile_estimate.json"
+    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:cross_tile_bytes"
+    unit: bytes
+    arms: [A, B, C]
+    phase: pre_kernel
+    nullable_if: "target != 'hetero_gemmini_opu'"
     note: |
-      Candidates that built + verified + reported cycles. Ratio
-      against beam_n_candidates_total is the LLM's effective yield --
-      tuning the prompt or temperature can move this number.
+      Static upper bound on bytes crossing tile boundaries, computed
+      at runtime by the runner from graph.json + schedule.json edges.
+      A placement heuristic that lowers makespan but raises this
+      metric is paying communication cost for compute parallelism;
+      one that lowers both is unambiguously better.
 
-  beam_n_candidates_build_fail:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_build_fail"
-    unit: count
-    arms: [B-bedrock, B-gemini, B-claude]
+  # ──────────── kernel-synthesis: compiled-artifact metrics ────────────
+  #
+  # Depend on what the synthesis loop emitted as kernels.c. Arm A's
+  # rows reflect the curated + reference_impl path; Arm B's rows
+  # reflect what the LLM produced. Comparing these rows side-by-side
+  # is the core "did the LLM beat hand-curated?" question.
 
-  beam_n_candidates_verify_fail:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_verify_fail"
-    unit: count
-    arms: [B-bedrock, B-gemini, B-claude]
-
-  beam_n_candidates_duplicate:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_duplicate"
-    unit: count
-    arms: [B-bedrock, B-gemini, B-claude]
-    note: Suggestions the LLM repeated; tokens paid but no new code tested.
-
-  beam_tokens_per_candidate_mean:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:tokens_per_candidate_mean"
-    unit: tokens
-    arms: [B-bedrock, B-gemini, B-claude]
-    note: Mean (input + output) tokens per LLM-generated candidate.
-
-  beam_best_improvement_pct:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:best_improvement_pct"
-    unit: percent
-    arms: [B-bedrock, B-gemini, B-claude]
+  cycles_firesim:
+    source: "profile_firesim.csv"
+    extractor: "modelblaster.benchmarks.ingest.profile_csv:sum_cycles"
+    unit: cycles
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    nullable_if: "runner != 'firesim'"
     note: |
-      Largest baseline-vs-best percent improvement across ops in
-      this cell's optimize call. Near-zero means the beam search
-      didn't help on this workload/target; tune knobs or move on.
+      Primary cycle metric for rvv_opu / gemmini / gemmini_q31 / hetero_gemmini_opu.
+      Aggregator REFUSES to compute Arm-vs-Arm deltas on accelerator targets
+      using cycles_spike — those extensions execute atomically in spike.
 
-  beam_iter_to_best:
-    source: "beam_search_trajectory.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.beam_search:candidates_to_best_iter"
-    unit: iteration
-    arms: [B-bedrock, B-gemini, B-claude]
+  cycles_spike:
+    source: "profile_spike.csv"
+    extractor: "modelblaster.benchmarks.ingest.profile_csv:sum_cycles"
+    unit: cycles
+    arms: [A, B, C]
+    phase: kernel_synthesis
     note: |
-      Which iteration the best candidate landed in (for the op with
-      the largest improvement). Lower than --iterations means you
-      plateaued early -- a knob signal for tuning the iteration count.
+      Recorded for {scalar, scalar_f16, rvv, rvv_f16} as primary.
+      For {rvv_opu, gemmini, gemmini_q31, hetero_gemmini_opu} this is
+      correctness instrumentation only. Spike runs the Gemmini and
+      Saturn-OPU extensions atomically (no microarchitectural model),
+      so cycle counts on those targets are not authoritative.
 
-  # ──────────── agent efficiency (Arms B + C only) ────────────
+  accuracy_linf:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:linf"
+    unit: dimensionless
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: respects per-backend atol_override from pipeline.backends.Backend
 
-  tokens_input_cached:
-    source: "llm_tokens.json"
-    extractor: "modelblaster.benchmarks.ingest.tokens:sum_input_cached"
-    unit: tokens
-    arms: [B, C]
+  accuracy_rmse:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:rmse"
+    unit: dimensionless
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  accuracy_cos:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:cosine"
+    unit: dimensionless
+    arms: [A, B, C]
+    phase: kernel_synthesis
+
+  compile_wall_clock_s:
+    source: "run.json"
+    extractor: "modelblaster.benchmarks.ingest.run_json:wall_clock_s"
+    unit: s
+    arms: [A, B, C]
+    phase: kernel_synthesis
     note: |
-      Arm B: llm_tokens.json synthesized at end-of-run from llm_calls.jsonl
-        (emitted per call by pipeline.bedrock_client).
-      Arm C: llm_tokens.json synthesized from session_tokens.json
-        (parsed from ~/.claude/projects/.../<session_id>.jsonl).
-      Both arms produce the same schema; the aggregator is provider-agnostic.
+      End-to-end run.sh time. Dominated by the LLM loop on Arm B/C
+      and by FireSim eval otherwise. Belongs in kernel_synthesis
+      because the LLM step inflates this on B/C but leaves A
+      untouched, so the column diverges by arm.
 
-  tokens_input_uncached:
-    source: "llm_tokens.json"
-    extractor: "modelblaster.benchmarks.ingest.tokens:sum_input_uncached"
-    unit: tokens
-    arms: [B, C]
+  compile_peak_rss_mb:
+    source: "run.json"
+    extractor: "modelblaster.benchmarks.ingest.run_json:peak_rss_mb"
+    unit: MB
+    arms: [A, B, C]
+    phase: kernel_synthesis
 
-  tokens_output:
-    source: "llm_tokens.json"
-    extractor: "modelblaster.benchmarks.ingest.tokens:sum_output"
-    unit: tokens
-    arms: [B, C]
+  n_ops_profiled:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:n_ops"
+    unit: count
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: number of profile-CSV rows (dispatches with a measured cycle count)
 
-  dollars_equivalent:
-    derived_from: [tokens_input_cached, tokens_input_uncached, tokens_output]
-    extractor: "modelblaster.benchmarks.aggregate:compute_cost_usd"
-    unit: USD
-    arms: [B, C]
-    note: rates from config/pricing.yaml
-
-  warm_cache_hit_rate:
-    source: "cache_hits.json"
-    extractor: "modelblaster.benchmarks.ingest.run_json:cache_hit_rate"
+  dominant_op_share:
+    source: "cycles_per_op.json"
+    extractor: "modelblaster.benchmarks.ingest.cycles_per_op:dominant_share"
     unit: fraction
-    arms: [B, C]
-
-  decisions_total:
-    source: "decision_log.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.tokens:count_lines"
-    unit: count
-    arms: [C]
-
-  decisions_rejected_by_validator:
-    source: "decision_log.jsonl"
-    extractor: "modelblaster.benchmarks.ingest.tokens:count_rejections"
-    unit: count
-    arms: [C]
-
-  # ──────────── scheduler / heterogeneous (hetero_gemmini_opu only) ────────────
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Fraction of total profiled cycles in the single op kind that
+      consumes the most cycles. High values flag a likely bottleneck
+      kernel; per-cell breakdown is rendered in summary.md.
 
   makespan_cycles:
     source: "xpurt_trace.csv"
     extractor: "modelblaster.benchmarks.ingest.xpurt_trace:makespan"
     unit: cycles
     arms: [A, B, C]
+    phase: kernel_synthesis
     nullable_if: "target != 'hetero_gemmini_opu'"
     note: |
       Max of actual_end_cycles across all trace entries. Reflects the
@@ -269,6 +208,7 @@ metrics:
     extractor: "modelblaster.benchmarks.ingest.xpurt_trace:utilization_gemmini"
     unit: fraction
     arms: [A, B, C]
+    phase: kernel_synthesis
     nullable_if: "target != 'hetero_gemmini_opu'"
 
   accelerator_utilization_opu:
@@ -276,24 +216,144 @@ metrics:
     extractor: "modelblaster.benchmarks.ingest.xpurt_trace:utilization_opu"
     unit: fraction
     arms: [A, B, C]
+    phase: kernel_synthesis
     nullable_if: "target != 'hetero_gemmini_opu'"
-
-  cross_tile_bytes:
-    source: "cross_tile_estimate.json"
-    extractor: "modelblaster.benchmarks.ingest.xpurt_trace:cross_tile_bytes"
-    unit: bytes
-    arms: [A, B, C]
-    nullable_if: "target != 'hetero_gemmini_opu'"
-    note: |
-      Static upper bound on bytes crossing tile boundaries, computed
-      at runtime by the runner from graph.json + schedule.json edges.
-      A placement heuristic that lowers makespan but raises this
-      metric is paying communication cost for compute parallelism;
-      one that lowers both is unambiguously better.
 
   deadline_met_rate:
     source: "wall_cycles.txt"
     extractor: "modelblaster.benchmarks.ingest.xpurt_trace:deadline_met_rate"
     unit: fraction
     arms: [A, B, C]
+    phase: kernel_synthesis
     nullable_if: "target != 'hetero_gemmini_opu' or scenario != 'periodic'"
+
+  # ──────────── kernel-synthesis: beam-search trajectory (Arm B-* only) ────────────
+
+  beam_n_candidates_total:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_total"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+    note: Total LLM-produced candidates across all ops/iters/parents/expansions.
+
+  beam_n_candidates_viable:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_viable"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+    note: |
+      Candidates that built + verified + reported cycles. Ratio
+      against beam_n_candidates_total is the LLM's effective yield --
+      tuning the prompt or temperature can move this number.
+
+  beam_n_candidates_build_fail:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_build_fail"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+
+  beam_n_candidates_verify_fail:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_verify_fail"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+
+  beam_n_candidates_duplicate:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:n_candidates_duplicate"
+    unit: count
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+    note: Suggestions the LLM repeated; tokens paid but no new code tested.
+
+  beam_tokens_per_candidate_mean:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:tokens_per_candidate_mean"
+    unit: tokens
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+    note: Mean (input + output) tokens per LLM-generated candidate.
+
+  beam_best_improvement_pct:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:best_improvement_pct"
+    unit: percent
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+    note: |
+      Largest baseline-vs-best percent improvement across ops in
+      this cell's optimize call. Near-zero means the beam search
+      didn't help on this workload/target; tune knobs or move on.
+
+  beam_iter_to_best:
+    source: "beam_search_trajectory.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.beam_search:candidates_to_best_iter"
+    unit: iteration
+    arms: [B-bedrock, B-gemini, B-claude]
+    phase: kernel_synthesis
+    note: |
+      Which iteration the best candidate landed in (for the op with
+      the largest improvement). Lower than --iterations means you
+      plateaued early -- a knob signal for tuning the iteration count.
+
+  # ──────────── kernel-synthesis: agent efficiency (Arms B + C only) ────────────
+
+  tokens_input_cached:
+    source: "llm_tokens.json"
+    extractor: "modelblaster.benchmarks.ingest.tokens:sum_input_cached"
+    unit: tokens
+    arms: [B, C]
+    phase: kernel_synthesis
+    note: |
+      Arm B: llm_tokens.json synthesized at end-of-run from llm_calls.jsonl
+        (emitted per call by pipeline.bedrock_client).
+      Arm C: llm_tokens.json synthesized from session_tokens.json
+        (parsed from ~/.claude/projects/.../<session_id>.jsonl).
+      Both arms produce the same schema; the aggregator is provider-agnostic.
+
+  tokens_input_uncached:
+    source: "llm_tokens.json"
+    extractor: "modelblaster.benchmarks.ingest.tokens:sum_input_uncached"
+    unit: tokens
+    arms: [B, C]
+    phase: kernel_synthesis
+
+  tokens_output:
+    source: "llm_tokens.json"
+    extractor: "modelblaster.benchmarks.ingest.tokens:sum_output"
+    unit: tokens
+    arms: [B, C]
+    phase: kernel_synthesis
+
+  dollars_equivalent:
+    derived_from: [tokens_input_cached, tokens_input_uncached, tokens_output]
+    extractor: "modelblaster.benchmarks.aggregate:compute_cost_usd"
+    unit: USD
+    arms: [B, C]
+    phase: kernel_synthesis
+    note: rates from config/pricing.yaml
+
+  warm_cache_hit_rate:
+    source: "cache_hits.json"
+    extractor: "modelblaster.benchmarks.ingest.run_json:cache_hit_rate"
+    unit: fraction
+    arms: [B, C]
+    phase: kernel_synthesis
+
+  decisions_total:
+    source: "decision_log.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.tokens:count_lines"
+    unit: count
+    arms: [C]
+    phase: kernel_synthesis
+
+  decisions_rejected_by_validator:
+    source: "decision_log.jsonl"
+    extractor: "modelblaster.benchmarks.ingest.tokens:count_rejections"
+    unit: count
+    arms: [C]
+    phase: kernel_synthesis
