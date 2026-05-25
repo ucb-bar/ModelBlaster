@@ -98,6 +98,76 @@ metrics:
       metric is paying communication cost for compute parallelism;
       one that lowers both is unambiguously better.
 
+  ir_op_count:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:ir_op_count"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Number of compute ops in the IR after all front-end folds /
+      fuses fired. Pair with `n_input_nodes` to see how aggressive
+      the extractor was at collapsing the source graph.
+
+  n_input_nodes:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:n_input_nodes"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Front-end graph node count BEFORE lowering. n_fx_nodes for the
+      FX extractor (dronet / yolov8 / ViNT), n_aten_nodes for the
+      torch.export extractor (SmolVLA / mobilenet_v2).
+
+  lowering_ratio:
+    source: "passes_applied.json"
+    extractor: "modelblaster.benchmarks.ingest.passes_applied:lowering_ratio"
+    unit: fraction
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      ir_op_count / n_input_nodes. Lower means the extractor folded /
+      fused more aggressively. Comparing this column across arms
+      should always tie (graph passes are deterministic); divergence
+      is a bug.
+
+  n_dispatches_graph:
+    source: "graph_summary.json"
+    extractor: "modelblaster.benchmarks.ingest.graph_summary:n_dispatches_graph"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Number of compute records in graph.json. Different from
+      `n_ops_profiled` (which is post-run; aliases and noops drop
+      out of profile rows but stay in the graph).
+
+  n_distinct_op_kinds:
+    source: "graph_summary.json"
+    extractor: "modelblaster.benchmarks.ingest.graph_summary:n_distinct_op_kinds"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Unique `op` strings across the IR. Tells you how many distinct
+      kernel implementations the cell needs (curated for Arm A,
+      LLM-synthesized for Arm B). A workload with 32 dispatches but
+      only 4 op kinds has a 4-kernel implementation surface.
+
+  n_distinct_shapes:
+    source: "graph_summary.json"
+    extractor: "modelblaster.benchmarks.ingest.graph_summary:n_distinct_shapes"
+    unit: count
+    arms: [A, B, C]
+    phase: pre_kernel
+    note: |
+      Unique (op, shape) pairs. Captures shape diversity: a high
+      value relative to `n_distinct_op_kinds` means many shape-
+      specialized kernel variants (high LLM cost if every shape
+      needs its own synthesized C). Low value = a few parametric
+      kernels cover all dispatches.
+
   # ──────────── kernel-synthesis: compiled-artifact metrics ────────────
   #
   # Depend on what the synthesis loop emitted as kernels.c. Arm A's
@@ -151,6 +221,33 @@ metrics:
     unit: dimensionless
     arms: [A, B, C]
     phase: kernel_synthesis
+
+  verify_pass:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:verify_pass"
+    unit: bool
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      Did the harness output pass the backend's atol/rtol envelope vs
+      the PyTorch reference? Per-backend overrides come from
+      pipeline.backends.Backend.atol_override. A failing verify is
+      always the most important signal -- the cell's cycle/cost data
+      describes a broken kernel.
+
+  bit_exact:
+    source: "accuracy.json"
+    extractor: "modelblaster.benchmarks.ingest.accuracy:bit_exact"
+    unit: bool
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      True only when linf == 0 -- the output matched the reference
+      at every element. Separate column from verify_pass because
+      verify_pass tolerates the backend's atol/rtol envelope; a
+      kernel can have verify_pass=true with bit_exact=false when it
+      has small but real drift. Relevant for tuning int8 quant
+      schemes where drift compounds across layers.
 
   compile_wall_clock_s:
     source: "run.json"

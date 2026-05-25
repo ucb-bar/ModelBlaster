@@ -389,6 +389,13 @@ def execute_run_sh(
     # this IR build?" without re-running extract_graph.
     _copy_passes_applied(workload, out_dir)
 
+    # All cells: synthesize graph_summary.json from the pipeline's
+    # graph.json so the aggregator can read n_dispatches /
+    # n_distinct_op_kinds / n_distinct_shapes per cell. The full
+    # graph.json stays out of the run dir (large; per-model, not
+    # per-cell).
+    _emit_graph_summary(workload, out_dir)
+
     # Arm B-* only: snapshot the optimize-loop trajectory so the
     # aggregator can read per-candidate progress, yield rate, and
     # token cost. Single-target workloads write to
@@ -457,6 +464,29 @@ def _emit_cross_tile_estimate(workload: Workload, out_dir: Path) -> None:
         out_dir,
         graph_path if graph_path.exists() else None,
         schedule_path if schedule_path.exists() else None,
+    )
+
+
+def _emit_graph_summary(workload: Workload, out_dir: Path) -> None:
+    """Synthesize a compact `graph_summary.json` from the pipeline's
+    full `graph.json` (which is large and stays out of the run dir).
+    Lets the aggregator answer "how many dispatches / distinct op
+    kinds / distinct (op, shape) pairs does this cell have" without
+    re-parsing the whole graph each aggregation. Silent on missing
+    graph.json — single-target only; hetero cells have a per-model
+    graph.json each but the dashboard renders the per-cell view, so
+    we summarize the model that drove this run."""
+    src = (REPO_ROOT / "examples" / workload.model
+           / workload.quant / "generated" / "graph.json")
+    if not src.exists():
+        return
+    try:
+        from modelblaster.benchmarks.ingest import graph_summary
+        summary = graph_summary.synthesize(src)
+    except Exception:
+        return
+    (out_dir / "graph_summary.json").write_text(
+        json.dumps(summary, indent=2)
     )
 
 

@@ -55,6 +55,33 @@ def ir_op_count(path: Path) -> Optional[int]:
     return int(v) if v is not None else None
 
 
+def n_input_nodes(path: Path) -> Optional[int]:
+    """Number of nodes in the front-end graph BEFORE lowering / fusion.
+    `n_fx_nodes` for the FX-based extractor (dronet, yolov8, ViNT path),
+    `n_aten_nodes` for the torch.export path (SmolVLA, BN-fold path).
+    Combined with `ir_op_count` this gives lowering_ratio --
+    how much the extractor collapsed."""
+    data = _load(path)
+    v = data.get("n_fx_nodes")
+    if v is None:
+        v = data.get("n_aten_nodes")
+    return int(v) if v is not None else None
+
+
+def lowering_ratio(path: Path) -> Optional[float]:
+    """ir_op_count / n_input_nodes. A value of 0.5 means the lowering
+    collapsed roughly half the input graph (folds + fusions). Close to
+    1.0 means the extractor passed the graph through without simplifying.
+    Front-end folds (BN + pad in extract_graph_export) push this
+    fraction down; missing fusions push it up."""
+    data = _load(path)
+    inp = data.get("n_fx_nodes") or data.get("n_aten_nodes")
+    out = data.get("n_ir_ops")
+    if not inp or not out or inp <= 0:
+        return None
+    return float(out) / float(inp)
+
+
 def linear_relu_fuse_fired(path: Path) -> Optional[int]:
     """Count of Linear+ReLU fusions in the FX extractor. None when
     the file is from the export extractor (different pass set)."""
