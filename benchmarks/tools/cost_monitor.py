@@ -201,14 +201,98 @@ def discover_jsonls(root: Path) -> list[Path]:
     return sorted(root.rglob("llm_calls.jsonl"))
 
 
+def discover_claude_code_sessions(cwd: Optional[Path] = None
+                                  ) -> list[Path]:
+    """Find Claude Code session JSONLs scoped to ``cwd`` (default:
+    current working directory). Claude Code stores its conversation
+    logs at ``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl``
+    where the encoded path replaces ``/`` with ``-``. Returns an
+    empty list when Claude Code hasn't created any sessions for this
+    project. Files in that directory are typically only readable by
+    the user (mode 600); we let the caller surface permission
+    errors via the normal poll path."""
+    here = (cwd or Path.cwd()).resolve()
+    # Encoding matches Claude Code: leading '-' + path parts joined by '-'.
+    encoded = "-" + "-".join(here.parts[1:])
+    home = Path.home()
+    session_dir = home / ".claude" / "projects" / encoded
+    if not session_dir.exists():
+        return []
+    return sorted(session_dir.glob("*.jsonl"))
+
+
 def derive_cell_label(path: Path) -> str:
+    """Compact label for the recent-calls table. For Claude Code
+    session JSONLs (which live outside benchmarks/results/), label as
+    ``claude-code/<uuid-prefix>`` so they're distinguishable from
+    benchmark cells."""
     parts = path.parts
     if "results" in parts:
         i = parts.index("results")
         tail = parts[i + 1: -1]
         if tail:
             return "/".join(tail[-3:])
+    if ".claude" in parts and "projects" in parts:
+        return f"claude-code/{path.stem[:8]}"
     return path.parent.name
+
+
+def _normalize_record(rec: dict) -> Optional[dict]:
+    """Return a record in our canonical ``llm_calls.jsonl`` shape, or
+    None if the source record has no token usage we can attribute.
+
+    Handles two source schemas:
+
+    1. ``llm_calls.jsonl`` (our format, written by bedrock_client /
+       gemini_client / claude_code_client). Top-level keys include
+       ``model_id``, ``input_tokens``, ``output_tokens``, etc.
+    2. Claude Code session JSONL (``~/.claude/projects/<enc>/*.jsonl``).
+       Token usage lives on records where ``type == "assistant"`` in
+       ``message.usage.{input_tokens, output_tokens,
+       cache_read_input_tokens, cache_creation_input_tokens}``. The
+       model id is at ``message.model``; the timestamp at
+       ``timestamp``; the request id at ``requestId``. Non-assistant
+       records (user messages, snapshots, permission events) are
+       skipped (None return).
+    """
+    # Our own ``llm_calls.jsonl`` shape -- pass through.
+    if "model_id" in rec and (
+        "input_tokens" in rec or "output_tokens" in rec
+    ):
+        return rec
+    # Claude Code session record.
+    if rec.get("type") == "assistant":
+        msg = rec.get("message") or {}
+        usage = msg.get("usage") if isinstance(msg, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        # Skip records with zero useful usage (occurs on cache-only
+        # iterations Claude Code logs for housekeeping).
+        if not any(usage.get(k) for k in (
+            "input_tokens", "output_tokens",
+            "cache_read_input_tokens", "cache_creation_input_tokens",
+        )):
+            return None
+        return {
+            "ts": rec.get("timestamp", ""),
+            "provider": "claude_code",
+            "model_id": msg.get("model") or "unknown",
+            "request_id": rec.get("requestId"),
+            "phase": None,   # no per-kernel attribution for prompts
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "cache_read_input_tokens": int(
+                usage.get("cache_read_input_tokens", 0) or 0
+            ),
+            # Claude Code uses `cache_creation_input_tokens`; our
+            # internal field is `cache_write_input_tokens`. Same
+            # semantics, both billed at the cache-write rate.
+            "cache_write_input_tokens": int(
+                usage.get("cache_creation_input_tokens", 0) or 0
+            ),
+            "stop_reason": "",
+        }
+    return None
 
 
 def poll_files(files: list[Path], state: WatcherState,
@@ -237,7 +321,13 @@ def poll_files(files: list[Path], state: WatcherState,
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    _ingest(rec, path, state, pricing)
+                    # Normalize across source schemas. Unsupported /
+                    # uninteresting records (user messages, snapshots)
+                    # return None and get skipped.
+                    norm = _normalize_record(rec)
+                    if norm is None:
+                        continue
+                    _ingest(norm, path, state, pricing)
                     new += 1
                 state.offsets[path] = f.tell()
         except OSError:
@@ -1330,8 +1420,15 @@ def cmd_live(args) -> int:
 
     def _files() -> list[Path]:
         if args.paths:
-            return [p for p in args.paths if p.exists()]
-        return discover_jsonls(args.root)
+            paths = [p for p in args.paths if p.exists()]
+        else:
+            paths = list(discover_jsonls(args.root))
+            # Augment with Claude Code session logs for this project
+            # so conversation tokens land in the monitor too. The
+            # _normalize_record path detects + translates the schema.
+            if not args.no_watch_claude_code:
+                paths.extend(discover_claude_code_sessions())
+        return paths
 
     files = _files()
     poll_files(files, state, pricing)
@@ -1442,7 +1539,9 @@ def cmd_session_list(args) -> int:
     ledger = SessionLedger.load()
     pricing = load_pricing(args.pricing)
     state = WatcherState()
-    files = discover_jsonls(args.root)
+    files = list(discover_jsonls(args.root))
+    if not getattr(args, "no_watch_claude_code", False):
+        files.extend(discover_claude_code_sessions())
     poll_files(files, state, pricing)
 
     sessions = ledger.list_all()
@@ -1545,7 +1644,9 @@ def cmd_report(args) -> int:
     pricing = load_pricing(args.pricing)
     ledger = SessionLedger.load()
     state = WatcherState()
-    files = discover_jsonls(args.root)
+    files = list(discover_jsonls(args.root))
+    if not args.no_watch_claude_code:
+        files.extend(discover_claude_code_sessions())
     poll_files(files, state, pricing)
     windows = compute_windows(state, ledger)
 
@@ -1596,6 +1697,11 @@ def _add_common_args(ap: argparse.ArgumentParser) -> None:
                          "(overrides --root)")
     ap.add_argument("--pricing", type=Path, default=DEFAULT_PRICING,
                     help="pricing.yaml path")
+    ap.add_argument("--no-watch-claude-code", action="store_true",
+                    help="don't tail Claude Code session JSONLs at "
+                         "~/.claude/projects/<encoded-cwd>/*.jsonl. "
+                         "Default: ON so prompts you type in another "
+                         "terminal show up in the monitor too.")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
