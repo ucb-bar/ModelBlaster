@@ -172,7 +172,7 @@ RVV_OPU = Backend(
         # Vendored OPU header location. Same `<repo_root>` placeholder
         # convention as gemmini; resolved_kernel_cflags() substitutes
         # at build time.
-        "-isystem<repo_root>/modelblaster/cores/saturn_opu/include",
+        "-isystem<repo_root>/cores/saturn_opu/include",
         # Marker for kernels that want to gate code on "OPU available".
         "-DMODELBLASTER_SATURN_OPU=1",
         # NOTE: deliberately does NOT carry MODELBLASTER_RVV_IHWOC_WEIGHTS
@@ -228,8 +228,8 @@ GEMMINI = Backend(
         #   .../        — so gemmini.h's `#include "include/gemmini_params.h"`
         #                 and `#include "rocc-software/src/xcustom.h"` resolve
         # The asymmetric layout is gemmini-rocc-tests' upstream convention.
-        "-isystem<repo_root>/modelblaster/cores/gemmini/include",
-        "-isystem<repo_root>/modelblaster/cores/gemmini",
+        "-isystem<repo_root>/cores/gemmini/include",
+        "-isystem<repo_root>/cores/gemmini",
         "-DGEMMINI_ROCC",
         "-DBAREMETAL",
         # Tells gemmini-target kernels — including the scalar reference
