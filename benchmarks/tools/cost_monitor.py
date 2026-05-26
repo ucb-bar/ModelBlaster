@@ -50,9 +50,12 @@ from typing import Optional
 
 import yaml
 from rich.align import Align
+from rich.box import DOUBLE, HEAVY, ROUNDED
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
+from rich.progress_bar import ProgressBar
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
@@ -159,6 +162,12 @@ class WatcherState:
     records: list[IngestedRecord] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     unknown_cost_models: set[str] = field(default_factory=set)
+    # Mascot state -- tracks distinct kernels seen so the blaster
+    # animates exactly once per new kernel. The animation frame
+    # counter ticks down each render so the shot only lasts a few
+    # frames before settling back to idle.
+    seen_kernels: set[str] = field(default_factory=set)
+    blaster_anim_frame: int = 0   # >0 means actively animating
 
     @property
     def total_calls(self) -> int:
@@ -246,6 +255,7 @@ def _ingest(rec: dict, path: Path, state: WatcherState,
     cost = price_call(model_id, rec, pricing)
     if cost is None:
         state.unknown_cost_models.add(model_id)
+    phase = rec.get("phase")
     state.records.append(IngestedRecord(
         ts=str(rec.get("ts", "")),
         model_id=model_id,
@@ -255,8 +265,15 @@ def _ingest(rec: dict, path: Path, state: WatcherState,
         input_cached_write=cached_write,
         output=out_t,
         cell=derive_cell_label(path),
-        phase=rec.get("phase"),
+        phase=phase,
     ))
+    # Fire the blaster mascot when we encounter a new kernel.
+    # _BLASTER_ANIM_FRAMES is the number of redraw frames the shot
+    # animation persists before settling back to idle.
+    kernel = _kernel_from_phase(phase)
+    if kernel is not None and kernel not in state.seen_kernels:
+        state.seen_kernels.add(kernel)
+        state.blaster_anim_frame = _BLASTER_ANIM_FRAMES
 
 
 def _reset_offsets(state: WatcherState) -> None:
@@ -372,15 +389,145 @@ def _fmt_short_ts(ts: str) -> str:
 
 
 def _budget_style(frac: float, cost_known: bool) -> tuple[str, str]:
+    """(hero_style, border_style) for a budget fraction.
+    Six-tier semantic palette: muted green (0-30%), bright green
+    (30-50%), cyan (50-65%), yellow (65-80%), bright red (80-100%),
+    red blink (>=100%)."""
     if not cost_known:
         return "bold yellow", "yellow"
     if frac >= 1.0:
-        return "bold red", "red"
+        return "bold red blink", "red"
     if frac >= 0.8:
+        return "bold bright_red", "bright_red"
+    if frac >= 0.65:
         return "bold yellow", "yellow"
     if frac >= 0.5:
-        return "bold yellow", "yellow"
+        return "bold cyan", "cyan"
+    if frac >= 0.3:
+        return "bold bright_green", "bright_green"
     return "bold green", "green"
+
+
+# Unicode block ramp for inline sparklines. Each char is roughly
+# one-eighth of the column height; combined they sketch a small
+# trend chart of recent call costs in O(N chars).
+_SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[float], width: int = 20) -> str:
+    """Render the last `width` floats as a single-line unicode chart.
+    Returns "" when the input is empty. Each value gets exactly one
+    char; small values map to lower blocks, large values to higher
+    blocks. Normalization is independent of absolute magnitude --
+    just relative shape."""
+    if not values:
+        return ""
+    tail = values[-width:]
+    lo = min(tail)
+    hi = max(tail)
+    if hi <= lo:
+        # Constant series -- middle block.
+        return _SPARK_BLOCKS[len(_SPARK_BLOCKS) // 2] * len(tail)
+    span = hi - lo
+    out = []
+    for v in tail:
+        idx = int((v - lo) / span * (len(_SPARK_BLOCKS) - 1))
+        out.append(_SPARK_BLOCKS[idx])
+    return "".join(out)
+
+
+# ───────────────────── mascot: 🔫 BLAZER the blaster ─────────────────────
+#
+# Tiny 3-line ASCII blaster pinned to the top-right corner. Idle most
+# of the time; fires a pew-pew across the panel when a new kernel
+# (synth:<op> / optimize:<op>) appears in the JSONL records. Decays
+# back to idle over _BLASTER_ANIM_FRAMES redraws so the firing
+# animation is visible at 4 Hz without being epileptic.
+#
+# Why three frames: idle / recoil / aftermath gives a perceptible
+# "shot" without needing complex sprite work. The projectile chars
+# add the pew-pew across the rest of the line.
+
+_BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
+
+
+_BLASTER_FRAMES = {
+    # Idle: blaster pointed slightly down-right, no smoke.
+    "idle": [
+        "   ___",
+        "  /[#]\\__",
+        "   \\___ \\",
+    ],
+    # Recoil 1: muzzle flash + pulled back.
+    "recoil": [
+        "   ___    *",
+        "  /[#]>+ * ",
+        "   \\____\\  ",
+    ],
+    # Recoil 2: projectile mid-air + spent smoke.
+    "trail": [
+        "   ___  ~~",
+        "  /[#]\\___",
+        "   \\___ \\  ",
+    ],
+    # Aftermath: little puff of smoke.
+    "puff": [
+        "   ___ ° ",
+        "  /[#]\\__",
+        "   \\___ \\",
+    ],
+}
+
+
+def _blaster_frame_for(frame: int) -> tuple[str, str]:
+    """(frame_key, projectile_trail) for the given countdown frame.
+    `frame` is _BLASTER_ANIM_FRAMES at the start of the shot, ticking
+    down to 0. We pick the visual sub-frame based on which band of
+    the countdown we're in."""
+    if frame <= 0:
+        return "idle", ""
+    if frame >= _BLASTER_ANIM_FRAMES - 1:
+        # First frame: recoil + bright muzzle.
+        return "recoil", ""
+    if frame >= _BLASTER_ANIM_FRAMES - 4:
+        # Projectile traveling across the panel.
+        travelled = _BLASTER_ANIM_FRAMES - frame  # 2..4
+        return "trail", "─" * (travelled * 4) + "▶"
+    return "puff", ""
+
+
+def _mascot_panel(state: WatcherState) -> Panel:
+    """The blaster mascot panel. Always 3 lines tall so the layout
+    above doesn't reflow when the animation fires."""
+    key, projectile = _blaster_frame_for(state.blaster_anim_frame)
+    art = _BLASTER_FRAMES[key]
+    # Compose the lines with semantic color: orange muzzle + flash
+    # while firing, dim grey while idle.
+    if key == "idle":
+        body = Text("\n".join(art), style="grey50")
+        title = "[dim]🔫 BLAZER  idle[/dim]"
+        border = "grey42"
+    elif key == "recoil":
+        body = Text()
+        for line in art:
+            body.append(line + "\n", style="bold orange3")
+        title = "[bold yellow]🔫 BLAZER  ⚡ NEW KERNEL ⚡[/bold yellow]"
+        border = "yellow"
+    elif key == "trail":
+        body = Text()
+        for line in art:
+            body.append(line + "\n", style="bold yellow")
+        if projectile:
+            body.append("       " + projectile + "  pew!\n",
+                        style="bold red")
+        title = "[bold red]🔫 BLAZER  FIRING[/bold red]"
+        border = "red"
+    else:  # puff
+        body = Text("\n".join(art), style="grey70")
+        title = "[dim]🔫 BLAZER[/dim]"
+        border = "grey42"
+    return Panel(body, title=title, border_style=border, box=ROUNDED,
+                 padding=(0, 1), width=28)
 
 
 # ───────────────────── rendering ─────────────────────
@@ -458,16 +605,43 @@ def _summary_panel(state: WatcherState, ledger: SessionLedger,
     ]
 
     if frac is not None:
-        bar = Text(justify="center")
-        bar.append("BUDGET ", style="dim")
-        bar.append(_fmt_usd(cumul.total_cost), style=hero_style)
-        bar.append(" / ", style="dim")
-        bar.append(_fmt_usd(budget_usd), style="bold")
-        bar.append(f"   ({frac * 100:.1f}%)", style=hero_style)
+        # Two-line budget visual: a real progress bar (colored by tier)
+        # plus the numeric breakdown beneath.
+        bar_text = Text(justify="center")
+        bar_text.append("BUDGET ", style="dim")
+        bar_text.append(_fmt_usd(cumul.total_cost), style=hero_style)
+        bar_text.append(" / ", style="dim")
+        bar_text.append(_fmt_usd(budget_usd), style="bold")
+        bar_text.append(f"   ({frac * 100:.1f}%)", style=hero_style)
         if frac >= 1.0:
-            bar.append("   OVER BUDGET", style="bold red blink")
+            bar_text.append("   ⚠ OVER BUDGET ⚠",
+                            style="bold red blink")
         parts.append(Text(""))
-        parts.append(Align.center(bar))
+        parts.append(Align.center(bar_text))
+        pb = ProgressBar(
+            total=100.0,
+            completed=min(100.0, frac * 100.0),
+            width=50,
+            complete_style=hero_style,
+            finished_style="bold red",
+            style="dim",
+        )
+        parts.append(Align.center(pb))
+
+    # Sparkline of recent call costs -- visual heartbeat showing
+    # whether spending is steady, ramping, or bursty.
+    recent_costs = [(r.cost_usd or 0.0)
+                    for r in state.records[-20:]]
+    if recent_costs:
+        spark = _sparkline(recent_costs, width=20)
+        spark_line = Text(justify="center")
+        spark_line.append("recent ", style="dim")
+        spark_line.append(spark, style=hero_style)
+        spark_line.append(f"  Δ {_fmt_usd(recent_costs[-1])}",
+                          style="dim")
+        parts.append(Text(""))
+        parts.append(Align.center(spark_line))
+
     parts.append(Text(""))
     body = Group(*parts)
 
@@ -480,26 +654,32 @@ def _summary_panel(state: WatcherState, ledger: SessionLedger,
         body = Group(body, Align.center(warn), Text(""))
 
     if frac is not None and frac >= 1.0:
-        title = "[bold red]LLM SPEND  (OVER BUDGET)[/bold red]"
+        title = "[bold red blink]💸 LLM SPEND — OVER BUDGET 💸[/bold red blink]"
     elif not cumul.cost_known:
-        title = "[bold yellow]LLM SPEND  (rates incomplete)[/bold yellow]"
+        title = "[bold yellow]💵 LLM SPEND  (rates incomplete)[/bold yellow]"
     else:
-        title = "[bold]LLM SPEND[/bold]"
+        title = "[bold green]💵 LLM SPEND[/bold green]"
     return Panel(body, title=title, border_style=border_style,
-                 padding=(0, 1))
+                 padding=(0, 2), box=HEAVY)
 
 
 def _per_model_table(by_model: dict[str, ModelTally],
                      sort_mode: str) -> Table:
-    table = Table(title=f"Per-model breakdown (sort: {sort_mode})",
-                  show_lines=False, expand=True, border_style="dim")
-    table.add_column("Model", overflow="fold", no_wrap=False)
-    table.add_column("Calls", justify="right")
+    table = Table(
+        title=f"[bold cyan]🤖 Per-model breakdown[/bold cyan]  "
+              f"[dim](sort: {sort_mode})[/dim]",
+        show_lines=False, expand=True, border_style="cyan",
+        header_style="bold cyan", row_styles=["", "dim"],
+        box=ROUNDED, title_justify="left",
+    )
+    table.add_column("Model", overflow="fold", no_wrap=False,
+                     style="white")
+    table.add_column("Calls", justify="right", style="cyan")
     table.add_column("In (uncached)", justify="right")
-    table.add_column("In (cache read)", justify="right")
+    table.add_column("In (cache read)", justify="right", style="green")
     table.add_column("In (cache write)", justify="right")
     table.add_column("Out", justify="right")
-    table.add_column("USD", justify="right")
+    table.add_column("USD", justify="right", style="bold green")
 
     items = list(by_model.items())
     if sort_mode == "calls":
@@ -535,15 +715,17 @@ def _per_kernel_table(by_kernel: dict[str, ModelTally],
     if not by_kernel:
         return None
     table = Table(
-        title=f"Per-kernel breakdown (sort: {sort_mode}; "
-              f"phase: synth/optimize:<op>)",
-        show_lines=False, expand=True, border_style="dim",
+        title=f"[bold magenta]⚙  Per-kernel breakdown[/bold magenta]  "
+              f"[dim](sort: {sort_mode}; phase: synth/optimize:<op>)[/dim]",
+        show_lines=False, expand=True, border_style="magenta",
+        header_style="bold magenta", row_styles=["", "dim"],
+        box=ROUNDED, title_justify="left",
     )
-    table.add_column("Kernel", overflow="fold")
-    table.add_column("Calls", justify="right")
+    table.add_column("Kernel", overflow="fold", style="bold white")
+    table.add_column("Calls", justify="right", style="magenta")
     table.add_column("In", justify="right")
     table.add_column("Out", justify="right")
-    table.add_column("USD", justify="right")
+    table.add_column("USD", justify="right", style="bold green")
 
     items = list(by_kernel.items())
     if sort_mode == "calls":
@@ -569,18 +751,24 @@ def _recent_table(records: list[IngestedRecord],
                   scroll: int, max_visible: int) -> Table:
     """Scrollable per-call detail. ``scroll`` is the offset from the
     newest record (0 = newest visible at top)."""
+    title = (f"[bold blue]📞 Recent calls[/bold blue]  "
+             f"[dim](newest first; j/k to scroll")
+    if scroll > 0:
+        title += f", offset={scroll}"
+    title += ")[/dim]"
     table = Table(
-        title=f"Recent calls (newest first; j/k to scroll, "
-              f"offset={scroll})",
-        show_lines=False, expand=True, border_style="dim",
+        title=title,
+        show_lines=False, expand=True, border_style="blue",
+        header_style="bold blue", row_styles=["", "dim"],
+        box=ROUNDED, title_justify="left",
     )
-    table.add_column("Time", no_wrap=True)
+    table.add_column("Time", no_wrap=True, style="cyan")
     table.add_column("Cell", overflow="fold")
-    table.add_column("Model", overflow="fold")
-    table.add_column("Phase")
+    table.add_column("Model", overflow="fold", style="white")
+    table.add_column("Phase", style="magenta")
     table.add_column("In", justify="right")
     table.add_column("Out", justify="right")
-    table.add_column("USD", justify="right")
+    table.add_column("USD", justify="right", style="bold green")
     # records are append-order (oldest first); newest is at the end.
     # Reverse + slice from scroll.
     reversed_recs = list(reversed(records))
@@ -603,47 +791,80 @@ def _recent_table(records: list[IngestedRecord],
 
 def _status_bar(*, paused: bool, sort_mode: str, watching: int,
                 budget_usd: Optional[float],
-                ledger: SessionLedger) -> Panel:
+                ledger: SessionLedger,
+                spinner: Optional[Spinner] = None) -> Panel:
+    """Status bar at the very bottom. Spinner is the live-state
+    heartbeat; freezes when paused so the eye registers the change."""
     line = Text()
     if paused:
-        line.append("PAUSED  ", style="bold red on white")
+        line.append("⏸  PAUSED  ", style="bold yellow on grey23")
     else:
-        line.append("LIVE  ", style="bold green")
-    line.append(f"watching {watching} file(s)  ", style="dim")
+        line.append("●  LIVE  ", style="bold green")
+    line.append(f"📂 {watching}  ", style="cyan")
     line.append(f"sort:{sort_mode}  ", style="dim")
     if budget_usd is not None:
         line.append(f"budget:{_fmt_usd(budget_usd)}  ", style="dim")
     if ledger.active is not None:
-        line.append(f"session:{ledger.active.id}  ", style="magenta")
+        line.append(f"⚑ {ledger.active.id}  ",
+                    style="bold magenta")
     else:
-        line.append("no-session  ", style="dim")
-    line.append("|  ", style="dim")
-    line.append("[q]uit  [p]ause  [s]ort  [j/k]scroll  "
-                "[r]eset  [?]help",
-                style="bold")
-    return Panel(line, border_style="dim", padding=(0, 1))
+        line.append("no session  ", style="dim italic")
+    line.append("│  ", style="grey42")
+    line.append("[", style="dim")
+    line.append("q", style="bold red")
+    line.append("]uit  [", style="dim")
+    line.append("p", style="bold")
+    line.append("]ause  [", style="dim")
+    line.append("s", style="bold")
+    line.append("]ort  [", style="dim")
+    line.append("j", style="bold")
+    line.append("/", style="dim")
+    line.append("k", style="bold")
+    line.append("] scroll  [", style="dim")
+    line.append("r", style="bold")
+    line.append("]eset  [", style="dim")
+    line.append("?", style="bold cyan")
+    line.append("] help", style="dim")
+    return Panel(line, border_style="grey42", padding=(0, 1),
+                 box=ROUNDED)
 
 
 def _help_overlay() -> Panel:
     text = Text()
-    text.append("Keyboard\n", style="bold underline")
-    text.append("  q / Ctrl-C    quit (terminal restored)\n")
-    text.append("  p             pause / resume polling\n")
-    text.append("  s             cycle per-model sort "
-                "(cost → calls → name)\n")
-    text.append("  j / k         scroll recent calls down / up\n")
-    text.append("  r             reset state + re-scan all files\n")
-    text.append("  ?             toggle this help\n")
-    text.append("\nSessions (run in a separate terminal)\n",
-                style="bold underline")
-    text.append("  uv run mb-cost session start NAME [--label TEXT]\n")
-    text.append("  uv run mb-cost session end\n")
-    text.append("  uv run mb-cost session list\n")
-    text.append("\nReport (no TUI; one-shot text)\n",
-                style="bold underline")
-    text.append("  uv run mb-cost report\n")
-    return Panel(text, title="[bold]HELP[/bold]",
-                 border_style="cyan", padding=(1, 2))
+    text.append("⌨  Keyboard\n", style="bold underline cyan")
+    text.append("  q / Ctrl-C    ", style="bold")
+    text.append("quit (terminal restored)\n", style="dim")
+    text.append("  p             ", style="bold")
+    text.append("pause / resume polling\n", style="dim")
+    text.append("  s             ", style="bold")
+    text.append("cycle per-model sort (cost → calls → name)\n",
+                style="dim")
+    text.append("  j / k         ", style="bold")
+    text.append("scroll recent calls down / up\n", style="dim")
+    text.append("  r             ", style="bold")
+    text.append("reset state + re-scan all files\n", style="dim")
+    text.append("  ?             ", style="bold")
+    text.append("toggle this help\n", style="dim")
+    text.append("\n⚑ Sessions ", style="bold underline magenta")
+    text.append("(run in a separate terminal)\n",
+                style="dim italic")
+    text.append("  uv run mb-cost session start NAME [--label TEXT]\n",
+                style="green")
+    text.append("  uv run mb-cost session end\n", style="green")
+    text.append("  uv run mb-cost session list\n", style="green")
+    text.append("  uv run mb-cost run NAME -- <command...>",
+                style="bold green")
+    text.append("   (auto-scoped session)\n", style="dim italic")
+    text.append("\n📊 Report ", style="bold underline yellow")
+    text.append("(no TUI; one-shot text)\n", style="dim italic")
+    text.append("  uv run mb-cost report\n", style="green")
+    text.append("\n💰 Budget guards\n", style="bold underline yellow")
+    text.append("  --budget-usd N", style="bold")
+    text.append("   visual alarm (this monitor)\n", style="dim")
+    text.append("  --max-usd N", style="bold")
+    text.append("      hard kill (arm_b_* drivers)\n", style="dim")
+    return Panel(text, title="[bold cyan]❔ HELP[/bold cyan]",
+                 border_style="cyan", padding=(1, 2), box=DOUBLE)
 
 
 def render(state: WatcherState, ledger: SessionLedger,
@@ -652,7 +873,21 @@ def render(state: WatcherState, ledger: SessionLedger,
            budget_usd: Optional[float]) -> Group:
     windows = compute_windows(state, ledger)
     cumul = windows["cumulative"]
-    parts: list = [_summary_panel(state, ledger, windows, budget_usd)]
+
+    # Top row: big summary panel on the left + the BLAZER mascot
+    # tucked into the upper-right. rich.Table with no borders gives
+    # us a side-by-side that reflows on resize -- the summary panel
+    # gets the rest of the width, the mascot stays its compact 28
+    # columns.
+    top_row = Table.grid(expand=True)
+    top_row.add_column(ratio=1)
+    top_row.add_column(width=30, justify="right")
+    top_row.add_row(
+        _summary_panel(state, ledger, windows, budget_usd),
+        _mascot_panel(state),
+    )
+
+    parts: list = [top_row]
     if show_help:
         parts.append(_help_overlay())
     else:
@@ -664,6 +899,11 @@ def render(state: WatcherState, ledger: SessionLedger,
     parts.append(_status_bar(paused=paused, sort_mode=sort_mode,
                              watching=watching, budget_usd=budget_usd,
                              ledger=ledger))
+    # Tick the blaster animation countdown so each redraw moves it
+    # one step closer to idle. Doing it here (post-render) means the
+    # NEXT frame uses the decremented value.
+    if state.blaster_anim_frame > 0:
+        state.blaster_anim_frame -= 1
     return Group(*parts)
 
 

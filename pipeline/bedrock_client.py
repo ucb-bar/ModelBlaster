@@ -64,12 +64,7 @@ def _normalize_model_id(model_id: str) -> str:
     return model_id
 
 
-class BudgetExceeded(RuntimeError):
-    """Raised by BedrockClient.converse() when the cumulative spend
-    has crossed the budget cap. The arm driver catches this and
-    writes exit_status=budget_exceeded into run.json. Carries the
-    cumulative cost + cap for the message so the trace is legible
-    in the captured stderr."""
+from modelblaster.pipeline.llm_budget import BudgetExceeded, BudgetTracker  # noqa: F401
 
 
 class BedrockClient:
@@ -94,22 +89,11 @@ class BedrockClient:
             )
         self.endpoint = f"https://bedrock-runtime.{self.region}.amazonaws.com"
         self.log_path = log_path or os.environ.get("BEDROCK_CALLS_LOG") or None
-        # Hard budget cap. The arm driver passes --max-usd as the
-        # MODELBLASTER_MAX_USD env var; the client refuses further
-        # calls once the cumulative cost crosses the cap. Pricing is
-        # loaded lazily from config/pricing.yaml on the first call
-        # that needs it, unless an explicit dict was passed in.
-        env_max = os.environ.get("MODELBLASTER_MAX_USD")
-        if max_usd is None and env_max:
-            try:
-                max_usd = float(env_max)
-            except ValueError:
-                max_usd = None
-        self.max_usd: Optional[float] = max_usd
-        self._pricing_override = pricing
-        self._pricing_cache: Optional[dict] = None
-        self.cumulative_cost_usd: float = 0.0
-        self._budget_tripped: bool = False
+        # Shared budget tracker -- same code path used across the
+        # bedrock / gemini / claude_code clients. Reads MODELBLASTER_MAX_USD
+        # env when max_usd kwarg is None.
+        self.budget = BudgetTracker(max_usd=max_usd, pricing=pricing,
+                                     label="bedrock")
 
     def converse(
         self,
@@ -134,12 +118,7 @@ class BedrockClient:
         # Pre-call budget check: refuse if a previous call already
         # crossed the cap. Cheaper to fail fast than to make another
         # paid call.
-        if self._budget_tripped:
-            raise BudgetExceeded(
-                f"cumulative cost ${self.cumulative_cost_usd:.4f} "
-                f"already exceeds --max-usd ${self.max_usd:.4f}; "
-                f"aborting before next call."
-            )
+        self.budget.check_before_call()
         url = f"{self.endpoint}/model/{self.model_id}/converse"
         body = {
             "messages": [{"role": "user", "content": [{"text": user}]}],
@@ -195,85 +174,17 @@ class BedrockClient:
             _append_call_log(self.log_path, self.model_id, result,
                              phase=phase, parent_call_id=parent_call_id)
         # Post-call budget accumulation. If this call pushed the
-        # running total past the cap, mark the client tripped so the
-        # NEXT call raises BudgetExceeded -- we don't void the response
-        # we just paid for, but we refuse to keep spending.
-        if self.max_usd is not None:
-            self.cumulative_cost_usd += self._price_call(result)
-            if self.cumulative_cost_usd >= self.max_usd:
-                self._budget_tripped = True
-                # Loud single-line stderr marker so callers / aggregators
-                # can grep for the trip event after the fact.
-                import sys as _sys
-                print(
-                    f"MODELBLASTER_BUDGET_EXCEEDED: "
-                    f"cumulative=${self.cumulative_cost_usd:.4f} "
-                    f"cap=${self.max_usd:.4f} "
-                    f"model={self.model_id}",
-                    file=_sys.stderr, flush=True,
-                )
+        # running total past the cap, the shared tracker marks itself
+        # tripped + emits MODELBLASTER_BUDGET_EXCEEDED to stderr; the
+        # NEXT converse() call raises BudgetExceeded.
+        self.budget.account_usage(
+            self.model_id,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_input_tokens=result.cache_read_input_tokens,
+            cache_write_input_tokens=result.cache_write_input_tokens,
+        )
         return result
-
-    def _price_call(self, result: "ConverseResult") -> float:
-        """Same math as benchmarks/tools/cost_monitor.price_call -- per
-        the AWS prompt-caching docs, inputTokens is the non-cached
-        portion only; cache_read / cache_write are billed separately."""
-        rates = self._rates_for_model()
-        if rates is None:
-            return 0.0
-        r_in = rates.get("input_uncached")
-        r_cache_read = rates.get("cache_read")
-        r_cache_write_5m = rates.get("cache_write_5m")
-        r_out = rates.get("output")
-        if r_in is None or r_out is None:
-            return 0.0
-        uncached = float(result.input_tokens)
-        cached_read = float(result.cache_read_input_tokens)
-        cached_write = float(result.cache_write_input_tokens)
-        out_t = float(result.output_tokens)
-        total = uncached * r_in / 1_000_000.0
-        if cached_read:
-            total += cached_read * (r_cache_read if r_cache_read is not None
-                                    else r_in) / 1_000_000.0
-        if cached_write:
-            total += cached_write * (r_cache_write_5m if r_cache_write_5m is
-                                     not None else r_in) / 1_000_000.0
-        total += out_t * r_out / 1_000_000.0
-        return total
-
-    def _rates_for_model(self) -> Optional[dict]:
-        """Lookup rates for self.model_id in pricing.yaml. Cached so
-        we don't re-parse on every call. Returns None when there's no
-        match or the entry is a placeholder; the budget check then
-        treats this call as free (the cap can only ever be enforced
-        for priced models)."""
-        if self._pricing_override is not None:
-            table = self._pricing_override.get("models") or {}
-            entry = table.get(self.model_id)
-            if entry and not entry.get("placeholder"):
-                return entry
-            return None
-        if self._pricing_cache is None:
-            try:
-                import yaml as _yaml
-                from pathlib import Path as _Path
-                candidate = (
-                    _Path(__file__).resolve().parents[1]
-                    / "benchmarks" / "config" / "pricing.yaml"
-                )
-                if candidate.exists():
-                    self._pricing_cache = _yaml.safe_load(
-                        candidate.read_text()
-                    )
-                else:
-                    self._pricing_cache = {}
-            except Exception:
-                self._pricing_cache = {}
-        table = (self._pricing_cache or {}).get("models") or {}
-        entry = table.get(self.model_id)
-        if entry and not entry.get("placeholder"):
-            return entry
-        return None
 
 
 def _append_call_log(
