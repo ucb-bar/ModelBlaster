@@ -366,6 +366,23 @@ def _find_run_dirs(arm: Arm, workload: Workload,
     return subs[:n_runs]
 
 
+def _arm_matches(arm_id: str, allowed: frozenset[str]) -> bool:
+    """An arm's metrics-yaml allow-list match. Supports family
+    prefixes: a metric tagged `arms: [B, C]` matches every arm whose
+    id starts with `B-` (B-bedrock, B-gemini, B-claude) plus the
+    exact arm `B` or `C`. A metric tagged with a specific id
+    (`arms: [B-bedrock]`) only matches that exact id. This keeps
+    provider-agnostic metrics (tokens, cost) wired across the whole
+    Arm-B family without re-listing every provider variant."""
+    if arm_id in allowed:
+        return True
+    if "-" in arm_id:
+        family = arm_id.split("-", 1)[0]
+        if family in allowed:
+            return True
+    return False
+
+
 def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any],
                     clocks: Optional[dict[str, Any]] = None,
                     ) -> tuple[Optional[Any], Optional[float]]:
@@ -375,7 +392,7 @@ def _collect_metric(cell: Cell, metric: Metric, pricing: dict[str, Any],
     derived metrics the per-run values come from re-evaluating the
     derivation against each run dir's tokens log -- so
     dollars_equivalent also gets a stddev when N>1."""
-    if cell.arm.id not in metric.arms:
+    if not _arm_matches(cell.arm.id, metric.arms):
         return None, None
     if _nullable(metric, cell.workload):
         return None, None
