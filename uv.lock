@@ -1250,6 +1250,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
+    { name = "pillow" },
     { name = "pyyaml" },
     { name = "requests" },
     { name = "torch" },
@@ -1279,6 +1280,7 @@ requires-dist = [
     { name = "lerobot", extras = ["transformers-dep"], marker = "extra == 'smolvla'", directory = "../merlin/third_party/lerobot" },
     { name = "num2words", marker = "extra == 'smolvla'", specifier = ">=0.5" },
     { name = "numpy" },
+    { name = "pillow", specifier = ">=12.2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "pyyaml", marker = "extra == 'benchmarks'", specifier = ">=6.0" },

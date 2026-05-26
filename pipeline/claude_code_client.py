@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from modelblaster.pipeline.bedrock_client import ConverseResult
+from modelblaster.pipeline.llm_budget import BudgetTracker
 
 
 DEFAULT_MODEL = "sonnet"
@@ -47,13 +48,22 @@ class ClaudeCodeClient:
         log_path: Optional[str] = None,
         command: str = "claude",
         max_budget_usd: Optional[float] = None,
+        max_usd: Optional[float] = None,
         extra_args: Optional[list[str]] = None,
+        pricing: Optional[dict] = None,
     ):
         self.model = model or os.environ.get("CLAUDE_CODE_MODEL", DEFAULT_MODEL)
         self.command = command
         self.log_path = log_path or os.environ.get("CLAUDE_CODE_CALLS_LOG") or None
+        # `max_budget_usd` (legacy) forwards to claude --max-budget-usd
+        # (the CLI itself enforces). `max_usd` (new) hooks the shared
+        # BudgetTracker so we get the same MODELBLASTER_BUDGET_EXCEEDED
+        # marker + raise behavior as bedrock / gemini. Both can be set
+        # for belt-and-suspenders.
         self.max_budget_usd = max_budget_usd
         self.extra_args = list(extra_args or [])
+        self.budget = BudgetTracker(max_usd=max_usd, pricing=pricing,
+                                     label="claude_code")
         if shutil.which(self.command) is None:
             raise RuntimeError(
                 f"'{self.command}' is not on PATH. Install Claude Code "
@@ -71,6 +81,10 @@ class ClaudeCodeClient:
         phase: Optional[str] = None,
         parent_call_id: Optional[str] = None,
     ) -> ConverseResult:
+        # Pre-call budget check: refuse if a previous call already
+        # crossed the cap. Belt-and-suspenders with claude's own
+        # --max-budget-usd flag.
+        self.budget.check_before_call()
         # The Claude Code CLI takes a single prompt argument. There is
         # no separate user/system split in --print mode; we concatenate
         # so the system instruction lands at the top of the user turn.
@@ -146,6 +160,24 @@ class ClaudeCodeClient:
                 total_cost_usd=data.get("total_cost_usd"),
                 duration_ms=data.get("duration_ms"),
                 num_turns=data.get("num_turns"),
+            )
+        # Post-call budget accumulation. Claude Code returns its own
+        # priced cost in `total_cost_usd`; use it directly via
+        # account_prepriced rather than re-deriving from tokens +
+        # pricing.yaml (the CLI already knows the negotiated rate).
+        total_cost = data.get("total_cost_usd")
+        if total_cost is not None:
+            self.budget.account_prepriced(resolved_model,
+                                           float(total_cost))
+        else:
+            # Fall back to token-based pricing when the CLI didn't
+            # surface a cost (older claude versions).
+            self.budget.account_usage(
+                resolved_model,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cache_read_input_tokens=result.cache_read_input_tokens,
+                cache_write_input_tokens=result.cache_write_input_tokens,
             )
         return result
 

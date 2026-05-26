@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from modelblaster.pipeline.bedrock_client import ConverseResult
+from modelblaster.pipeline.llm_budget import BudgetTracker
 
 
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -67,11 +68,18 @@ class GeminiClient:
         model_id: Optional[str] = None,
         api_key: Optional[str] = None,
         log_path: Optional[str] = None,
+        max_usd: Optional[float] = None,
+        pricing: Optional[dict] = None,
     ):
         self.model_id = model_id or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
         self.api_key = _resolve_api_key(api_key)
         self.log_path = log_path or os.environ.get("GEMINI_CALLS_LOG") or None
         self._client = None  # lazy
+        # Shared budget tracker -- same code path used across the
+        # bedrock / gemini / claude_code clients. Reads
+        # MODELBLASTER_MAX_USD env when max_usd kwarg is None.
+        self.budget = BudgetTracker(max_usd=max_usd, pricing=pricing,
+                                     label="gemini")
 
     def _ensure_client(self, *, timeout_s: float) -> Any:
         if self._client is None:
@@ -97,6 +105,9 @@ class GeminiClient:
         phase: Optional[str] = None,
         parent_call_id: Optional[str] = None,
     ) -> ConverseResult:
+        # Pre-call budget check: refuse if a previous call already
+        # crossed the cap.
+        self.budget.check_before_call()
         client = self._ensure_client(timeout_s=timeout)
         from google.genai import types as genai_types  # type: ignore[import]
 
@@ -122,14 +133,21 @@ class GeminiClient:
             pass
 
         usage = getattr(response, "usage_metadata", None)
-        input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+        # Gemini's `prompt_token_count` is the TOTAL input (cached +
+        # uncached) -- opposite of Bedrock's `inputTokens` (uncached
+        # only). To keep ConverseResult.input_tokens semantically
+        # identical across providers (uncached-only), subtract the
+        # cached portion. cost_monitor.price_call + BudgetTracker
+        # both rely on this convention.
+        prompt_tokens_total = int(getattr(usage, "prompt_token_count", 0) or 0)
         output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
         cache_read = int(getattr(usage, "cached_content_token_count", 0) or 0)
+        input_tokens_uncached = max(0, prompt_tokens_total - cache_read)
 
         result = ConverseResult(
             text=text,
             stop_reason=finish_reason,
-            input_tokens=input_tokens,
+            input_tokens=input_tokens_uncached,
             output_tokens=output_tokens,
             cache_read_input_tokens=cache_read,
             cache_write_input_tokens=0,
@@ -138,6 +156,14 @@ class GeminiClient:
         if self.log_path:
             _append_call_log(self.log_path, self.model_id, result,
                              phase=phase, parent_call_id=parent_call_id)
+        # Post-call budget accumulation; same code path as bedrock_client.
+        self.budget.account_usage(
+            self.model_id,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_input_tokens=result.cache_read_input_tokens,
+            cache_write_input_tokens=result.cache_write_input_tokens,
+        )
         return result
 
 

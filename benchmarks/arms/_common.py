@@ -429,6 +429,30 @@ def execute_run_sh(
     )
 
 
+def detect_budget_trip(run_dir: Path,
+                       extra: dict[str, Any]) -> bool:
+    """Scan stderr.log for the MODELBLASTER_BUDGET_EXCEEDED marker
+    that the shared BudgetTracker writes when an LLM client client
+    crosses --max-usd. On a hit, stamps the trip line + arms an
+    `exit_status_override='budget_exceeded'` field on `extra` so
+    finalize() writes it to run.json. Returns True when tripped.
+
+    Shared across Arm B-bedrock / B-gemini / B-claude so the trip
+    semantics are identical regardless of provider."""
+    stderr_path = run_dir / "stderr.log"
+    if not stderr_path.exists():
+        return False
+    try:
+        for line in stderr_path.read_text().splitlines():
+            if line.startswith("MODELBLASTER_BUDGET_EXCEEDED:"):
+                extra["budget_trip_marker"] = line
+                extra["exit_status_override"] = "budget_exceeded"
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def finalize(
     outcome: RunOutcome, *, arm: str, workload: Workload, run_id: str,
     extra_run_json: Optional[dict[str, Any]] = None,

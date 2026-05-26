@@ -50,9 +50,12 @@ from typing import Optional
 
 import yaml
 from rich.align import Align
+from rich.box import DOUBLE, HEAVY, ROUNDED
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
+from rich.progress_bar import ProgressBar
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
@@ -159,6 +162,12 @@ class WatcherState:
     records: list[IngestedRecord] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     unknown_cost_models: set[str] = field(default_factory=set)
+    # Mascot state -- tracks distinct kernels seen so the blaster
+    # animates exactly once per new kernel. The animation frame
+    # counter ticks down each render so the shot only lasts a few
+    # frames before settling back to idle.
+    seen_kernels: set[str] = field(default_factory=set)
+    blaster_anim_frame: int = 0   # >0 means actively animating
 
     @property
     def total_calls(self) -> int:
@@ -246,6 +255,7 @@ def _ingest(rec: dict, path: Path, state: WatcherState,
     cost = price_call(model_id, rec, pricing)
     if cost is None:
         state.unknown_cost_models.add(model_id)
+    phase = rec.get("phase")
     state.records.append(IngestedRecord(
         ts=str(rec.get("ts", "")),
         model_id=model_id,
@@ -255,8 +265,15 @@ def _ingest(rec: dict, path: Path, state: WatcherState,
         input_cached_write=cached_write,
         output=out_t,
         cell=derive_cell_label(path),
-        phase=rec.get("phase"),
+        phase=phase,
     ))
+    # Fire the blaster mascot when we encounter a new kernel.
+    # _BLASTER_ANIM_FRAMES is the number of redraw frames the shot
+    # animation persists before settling back to idle.
+    kernel = _kernel_from_phase(phase)
+    if kernel is not None and kernel not in state.seen_kernels:
+        state.seen_kernels.add(kernel)
+        state.blaster_anim_frame = _BLASTER_ANIM_FRAMES
 
 
 def _reset_offsets(state: WatcherState) -> None:
@@ -372,15 +389,472 @@ def _fmt_short_ts(ts: str) -> str:
 
 
 def _budget_style(frac: float, cost_known: bool) -> tuple[str, str]:
+    """(hero_style, border_style) for a budget fraction.
+    Six-tier semantic palette: muted green (0-30%), bright green
+    (30-50%), cyan (50-65%), yellow (65-80%), bright red (80-100%),
+    red blink (>=100%)."""
     if not cost_known:
         return "bold yellow", "yellow"
     if frac >= 1.0:
-        return "bold red", "red"
+        return "bold red blink", "red"
     if frac >= 0.8:
+        return "bold bright_red", "bright_red"
+    if frac >= 0.65:
         return "bold yellow", "yellow"
     if frac >= 0.5:
-        return "bold yellow", "yellow"
+        return "bold cyan", "cyan"
+    if frac >= 0.3:
+        return "bold bright_green", "bright_green"
     return "bold green", "green"
+
+
+# Unicode block ramp for inline sparklines. Each char is roughly
+# one-eighth of the column height; combined they sketch a small
+# trend chart of recent call costs in O(N chars).
+_SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[float], width: int = 20) -> str:
+    """Render the last `width` floats as a single-line unicode chart.
+    Returns "" when the input is empty. Each value gets exactly one
+    char; small values map to lower blocks, large values to higher
+    blocks. Normalization is independent of absolute magnitude --
+    just relative shape."""
+    if not values:
+        return ""
+    tail = values[-width:]
+    lo = min(tail)
+    hi = max(tail)
+    if hi <= lo:
+        # Constant series -- middle block.
+        return _SPARK_BLOCKS[len(_SPARK_BLOCKS) // 2] * len(tail)
+    span = hi - lo
+    out = []
+    for v in tail:
+        idx = int((v - lo) / span * (len(_SPARK_BLOCKS) - 1))
+        out.append(_SPARK_BLOCKS[idx])
+    return "".join(out)
+
+
+# ───────────────────── splash screen ─────────────────────
+#
+# Big sci-fi blaster ASCII for the startup splash. Codepage-437-ish
+# shading (`#`/`+`/`-`/`.`) -- the inspiration the user picked from
+# the four reference variants. Plain ASCII so it renders in any
+# terminal regardless of font / locale.
+
+_BLASTER_BIG = r"""
+                                ########+--+########
+                            ###+                    +###
+                         ###                            ###
+                      ###                #                 ##.
+                    -##                  ##                  ##
+          ---      ##                                          ##
+        --.  -                                                  ##
+         -.. .                           -+###.                  .#
+           ###               #######-         #####
+            #### +#  ######. #  #           ##   .+######                  -.
+           ##+#####      ## ## -#          #   ###---## +###            +  - +
+           ###                            #.  #+----#+ ##++##         -
+         ##           ##############      #  #+----+# ###+.###    --.+    -
+        #       #####++ - + # #++--#     #  ##-----#  ##    ##   -- -.+   -.
+     ###    ####++++ +++####### #+-+#    #  #------# ##  -      -.  .-+
+  ## #+#  ##+----#  #+  #    +#   +-+#####  #------# ## .       -.
+ #  .+#  #+------#  ++#########   +------#  #------# ## . ----- -. +-++--+---++
++#  #-#  #-------+# +#  #    +# ##+------#  #------# ## .       -.
+#-  #+#  #--------+ -#  #  #.+# #---######  #------# ##+ ..  ## --  --     +
+ #  .+#+ #+-------- +########## #---#    #  ##-----#. ##    ##   ----   +--++
+  ## #-#  ####-----+           ++--+#     #  #+-----# ########    --
+    #####     -++###################      ##  #+----+# ######                +
+          #####-                           #   ####++##  ##                . -
+               #+#######################+-  +#     .#+##
+               #--------+#     .###-###############-              ##
+              ##--------+  .      ###                            +#
+              #-+#####+-#  .      ##                            ##
+             #+-+     +-+#  .   ###                            ##
+            ##--######++#-######                    +-       .##
+            #--+    +--#                            .       ##
+           #+--+####+-+#                                  ##
+          ##---.   +--#                                ###
+           ##+--+#++--#                             ###
+             #####+--+##   ######             #####.
+                 .####            ###########
+"""
+
+
+def render_splash(console: Console) -> None:
+    """Print the BLASTER splash screen + title block + tagline. Caller
+    decides how long to leave it on screen before transitioning to the
+    live TUI. Skipped automatically when stdout isn't a tty (CI / pipe)
+    or when the user passed --no-splash."""
+    art = Text(_BLASTER_BIG.strip("\n"), style="bright_red")
+    title = Text(
+        "  ███╗   ███╗ ██████╗ ██████╗ ███████╗██╗     \n"
+        "  ████╗ ████║██╔═══██╗██╔══██╗██╔════╝██║     \n"
+        "  ██╔████╔██║██║   ██║██║  ██║█████╗  ██║     \n"
+        "  ██║╚██╔╝██║██║   ██║██║  ██║██╔══╝  ██║     \n"
+        "  ██║ ╚═╝ ██║╚██████╔╝██████╔╝███████╗███████╗\n"
+        "  ╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝\n"
+        "      ██████╗ ██╗      █████╗ ███████╗████████╗███████╗██████╗\n"
+        "      ██╔══██╗██║     ██╔══██╗██╔════╝╚══██╔══╝██╔════╝██╔══██╗\n"
+        "      ██████╔╝██║     ███████║███████╗   ██║   █████╗  ██████╔╝\n"
+        "      ██╔══██╗██║     ██╔══██║╚════██║   ██║   ██╔══╝  ██╔══██╗\n"
+        "      ██████╔╝███████╗██║  ██║███████║   ██║   ███████╗██║  ██║\n"
+        "      ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝\n",
+        style="bold bright_cyan",
+    )
+    tagline = Text("live LLM cost monitor   •   sessions   •   "
+                   "per-kernel + per-model spend",
+                   style="dim italic")
+    console.clear()
+    console.print()
+    console.print(Align.center(title))
+    console.print(Align.center(art))
+    console.print()
+    console.print(Align.center(tagline))
+    console.print()
+
+
+# ───────────────────── mascot: 🔫 BLASTER the blaster ─────────────────────
+#
+# Tiny 3-line ASCII blaster pinned to the top-right corner. Idle most
+# of the time; fires a pew-pew across the panel when a new kernel
+# (synth:<op> / optimize:<op>) appears in the JSONL records. Decays
+# back to idle over _BLASTER_ANIM_FRAMES redraws so the firing
+# animation is visible at 4 Hz without being epileptic.
+#
+# Why three frames: idle / recoil / aftermath gives a perceptible
+# "shot" without needing complex sprite work. The projectile chars
+# add the pew-pew across the rest of the line.
+
+_BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
+
+
+# Sci-fi blaster ASCII -- riff on the classic "hjw" revolver silhouette
+# scaled down to 3 lines and stylized with a power cell + barrel vent.
+# The PROJECTILE is rendered as a starburst sparkle pattern inspired by
+# old-school sci-fi laser art:
+#
+#         .              .   .'.     \   /
+#       \   /      .'. .' '.'   '  -=  o  =-
+#     -=  o  =-  .'   '              /   \
+#       /   \                          '
+#         '
+#
+# Each frame: the blaster sits in columns 0-13. The "shot" is a
+# starburst centered some columns to the right of the muzzle, with
+# sparkle dots `.` and tick marks `'` around it. As the animation
+# progresses, the starburst drifts further from the muzzle and decays
+# (bright `-= o =-` -> thin `'.'` -> just `.` sparkles -> gone).
+#
+# Composition rules:
+#   * Top line  -- power cell + barrel housing
+#   * Mid line  -- barrel + muzzle (where the projectile launches)
+#   * Bottom    -- grip + trigger
+#
+# Whichever frame is rendered, the silhouette stays 3 lines tall + the
+# same column count so the surrounding layout doesn't twitch.
+
+# Blaster art -- frozen, character-exact, taken verbatim from the
+# user's spec. The silhouette is the same across all phases; only
+# COLORS and side-effects (firework / smoke / idle sparkles) change.
+#
+# Anatomy (rows are 0-indexed, columns 0-19):
+#   row 0    top fin / sight
+#   row 1    fin connecting into body
+#   row 2    top of body
+#   row 3    barrel detail + muzzle (extends to col 19, the rightmost █)
+#   row 4    bottom of body
+#   row 5    bottom of body break
+#   row 6    grip top
+#   row 7    grip bottom
+
+_BLASTER_ART = [
+    "   █▓███            ",
+    "   █▓▓▓▓▓▓█         ",
+    " █▒▒▒▒▒▒▒▒▒▒█ █     ",
+    "██▒█  █▒ █▒▒█░░█░░░█",
+    " █▒▒▒▒▒▒▒▒▒▒█ █     ",
+    "   ▓▓▓▓ ▓█          ",
+    "  █▓▓▓              ",
+    "  █▓▓█              ",
+]
+
+
+# Firework explosion overlay -- styled exactly like the user's brief:
+#
+#                                 .
+#    .              .   .'.     \   /
+#  \   /      .'. .' '.'   '  -=  o  =-
+# -=  o  =-  .'   '              /   \
+#   /   \                          '
+#     '
+#
+# Drawn to the right of the muzzle (column 21+) during recoil + trail
+# frames. Frame 0 is brightest; subsequent frames decay through the
+# user's exact star → sparkle → dot progression.
+_FIREWORK_FRAMES = [
+    # Frame 0 -- peak: the user's signature `-=  o  =-` starburst.
+    [
+        r"   \   /",
+        r"    .",
+        r" -=  o  =-",
+        r"    '",
+        r"   /   \ ",
+    ],
+    # Frame 1 -- still bright but contracting; opening diagonals
+    # have shrunk to single chars + sparkle dots emerging.
+    [
+        r"   \ /",
+        r"  .'.",
+        r" -= o =-",
+        r"  '.'",
+        r"   / \ ",
+    ],
+    # Frame 2 -- sparkle phase: starburst gone, only `.'. '.'` left.
+    [
+        r"    .",
+        r"   .'.",
+        r"  '. .'",
+        r"   '.'",
+        r"    '",
+    ],
+    # Frame 3 -- dot phase: just a few drifting sparkles.
+    [
+        r"",
+        r"    .",
+        r"   . .",
+        r"    .",
+        r"",
+    ],
+    # Frame 4 -- almost gone: lone dot.
+    [
+        r"",
+        r"",
+        r"     .",
+        r"",
+        r"",
+    ],
+]
+
+
+# Color palette for the firework lifecycle. Index matches
+# _FIREWORK_FRAMES; the brightest frame uses white-hot rays,
+# decaying through yellow → red → grey.
+_FIREWORK_PALETTE = [
+    "bold bright_white",
+    "bold bright_yellow",
+    "bold yellow",
+    "bold bright_red",
+    "red",
+]
+
+
+# Idle subtle sparkle patterns -- cycled by wall-clock time so the
+# gun isn't 100% static when nothing's happening. Each pattern is a
+# list of (row, col, char) overlays painted AROUND the gun -- never
+# on top of it.
+_IDLE_SPARKLES = [
+    [(0, 22, "·"), (3, 24, "."), (7, 23, "·")],
+    [(2, 23, "·"), (5, 21, "."), (1, 25, "·")],
+    [(1, 21, "·"), (4, 24, "."), (6, 25, "·")],
+    [(0, 24, "·"), (6, 22, "."), (3, 26, "·")],
+]
+
+
+# Positions inside the silhouette that LIGHT UP during charging.
+# The "two squares" are the interior gaps in row 3 of the base art:
+# columns 4-5 (left window) and column 8 (right window). Filling
+# them with progressively brighter chars makes the gun visibly
+# build energy before the shot.
+_CHARGE_FILLS = {
+    # row -> dict of {col: char}
+    3: {4: "▒", 5: "▒", 8: "▒"},
+}
+
+
+# Starburst variants used for the moving projectile, in decay order
+# (most-intense first). Each entry is (top, mid, bottom) -- three
+# lines vertically centered on the bolt path. After the brightest
+# starburst we step down to thinner sparkles + finally just dots.
+_STARBURST_DECAY = [
+    ("\\   /",
+     "-= o =-",
+     " /   \\"),
+    ("  .'.  ",
+     " '.o.' ",
+     "  '.'  "),
+    ("       ",
+     " .'.   ",
+     "  .    "),
+    ("       ",
+     "  .    ",
+     "       "),
+]
+
+
+def _blaster_frame_for(frame: int) -> tuple[str, int]:
+    """(frame_key, decay_index) for the countdown frame. `frame` is
+    _BLASTER_ANIM_FRAMES at the start of the shot, ticking down to 0.
+    Sub-frames: charge -> recoil -> trail*N (with decaying starburst
+    intensity) -> puff -> idle. ``decay_index`` is the index into
+    ``_STARBURST_DECAY`` for the trail variant; -1 means no starburst."""
+    if frame <= 0:
+        return "idle", -1
+    if frame >= _BLASTER_ANIM_FRAMES:
+        return "charge", -1
+    if frame == _BLASTER_ANIM_FRAMES - 1:
+        return "recoil", -1
+    if frame >= _BLASTER_ANIM_FRAMES - 4:
+        # Trail phase: 3 frames worth of starburst drift + decay.
+        # decay_index = 0 (brightest) -> len(_STARBURST_DECAY)-1.
+        travelled = _BLASTER_ANIM_FRAMES - 1 - frame  # 1..4
+        decay_idx = min(travelled - 1, len(_STARBURST_DECAY) - 1)
+        return "trail", decay_idx
+    return "puff", -1
+
+
+def _mascot_render(state: WatcherState) -> Group:
+    """Render the BLASTER mascot as RAW art (no panel border) so it
+    sits cleanly in the top-right corner without competing with the
+    spend panel's heavy box. One small caption line above the gun
+    indicates state (standby / charging / firing / venting).
+
+    Color palette is sci-fi: cyan power cell housing, orange muzzle
+    glow on recoil, bright red starburst on firing frames, grey vent
+    smoke on puff. Total height is fixed at 8 lines (caption + 4
+    gun + 3 trail-or-pad) so the layout above doesn't reflow."""
+    key, decay_idx = _blaster_frame_for(state.blaster_anim_frame)
+    body = Text()
+
+    titles = {
+        "idle":   (" ⌬ BLASTER  standby",         "dim cyan"),
+        "charge": (" ⌬ BLASTER  charging…",        "bold bright_cyan"),
+        "recoil": (" ⌬ BLASTER  ▸ NEW KERNEL",     "bold bright_yellow"),
+        "trail":  (" ⌬ BLASTER  ▸ FIRING ▸ pew!",  "bold bright_yellow"),
+        "puff":   (" ⌬ BLASTER  venting…",         "grey62"),
+    }
+    title, title_style = titles[key]
+    body.append(title + "\n", style=title_style)
+
+    # Per-row gun color. Same style for every row -- shading is in
+    # the art itself (▓ ▒ ░), so we just tint it.
+    gun_style = {
+        "idle":   "cyan",
+        "charge": "bold bright_cyan",
+        "recoil": "bold bright_yellow",
+        "trail":  "bold yellow",
+        "puff":   "grey62",
+    }[key]
+
+    # Mutable copy so we can paint the interior charging windows.
+    grid = [list(row) for row in _BLASTER_ART]
+
+    if key in ("charge", "recoil"):
+        # Light up the two interior "windows" the user pointed at:
+        # row 3 cols 4-5 and col 8 (the gaps inside the body).
+        for r, cols in _CHARGE_FILLS.items():
+            for c, ch in cols.items():
+                if r < len(grid) and c < len(grid[r]):
+                    grid[r][c] = ch
+
+    # Build the overlay table: (row, col) -> (char, style). These
+    # paint OVER the art / empty space without changing the gun
+    # silhouette itself.
+    overlays: dict[tuple[int, int], tuple[str, str]] = {}
+    if key == "idle":
+        # Subtle wall-clock-cycled sparkles around the gun. These
+        # are painted OFF the silhouette (in the empty area to the
+        # right of the body) so the gun chars themselves never
+        # change between idle frames.
+        sparkle_idx = int(time.time() * 2) % len(_IDLE_SPARKLES)
+        for r, c, ch in _IDLE_SPARKLES[sparkle_idx]:
+            overlays[(r, c)] = (ch, "bright_cyan")
+    elif key == "charge":
+        # Energy particles flowing INTO the muzzle from off-screen
+        # right -- visual cue that the gun is gathering power.
+        for c, ch in [(22, "·"), (25, "."), (28, "·")]:
+            overlays[(3, c)] = (ch, "bold bright_cyan")
+    elif key == "puff":
+        # Lingering vent smoke to the right of the muzzle. Kept
+        # entirely OFF the gun silhouette so the gun stays
+        # character-identical to the user's spec.
+        overlays.update({
+            (2, 23): ("°", "grey70"),
+            (3, 25): ("'", "grey62"),
+            (4, 27): (".", "grey50"),
+        })
+
+    # Firework block (5 rows tall, vertically centered on row 3 of
+    # the gun -> occupies gun rows 1..5).
+    firework_block: Optional[list[str]] = None
+    firework_offset = 0
+    firework_style = ""
+    if key == "recoil":
+        firework_block = _FIREWORK_FRAMES[0]
+        firework_offset = 2
+        firework_style = _FIREWORK_PALETTE[0]
+    elif key == "trail":
+        idx = max(0, min(decay_idx + 1, len(_FIREWORK_FRAMES) - 1))
+        firework_block = _FIREWORK_FRAMES[idx]
+        firework_offset = 2 + decay_idx * 3
+        firework_style = _FIREWORK_PALETTE[idx]
+
+    GUN_WIDTH = 20
+    fw_start_col = GUN_WIDTH + firework_offset
+
+    # Render each row of the gun + any overlays in its band.
+    # CRITICAL: every row is padded to exactly _MASCOT_CELL_WIDTH
+    # chars before the newline. Without this, rich's renderer can
+    # strip / re-align trailing whitespace per line, and since each
+    # art row has different visible widths the gun appears to
+    # "morph" between frames as lines drift left/right.
+    _MASCOT_CELL_WIDTH = 44
+    for r, row_chars in enumerate(grid):
+        col_cursor = 0
+        # Base art cells (with overlays for cells inside the art).
+        for c, ch in enumerate(row_chars):
+            if (r, c) in overlays:
+                och, ostyle = overlays[(r, c)]
+                body.append(och, style=ostyle)
+            elif ch == " ":
+                body.append(" ")
+            else:
+                body.append(ch, style=gun_style)
+            col_cursor += 1
+        # Overlays right of the art (sparkles, smoke).
+        beyond = sorted(
+            (c, ch, st) for (rr, c), (ch, st) in overlays.items()
+            if rr == r and c >= len(row_chars)
+        )
+        for c, ch, st in beyond:
+            if c > col_cursor:
+                body.append(" " * (c - col_cursor))
+                col_cursor = c
+            body.append(ch, style=st)
+            col_cursor += 1
+        # Firework overlay (only on rows 1..5; row offsets 0..4).
+        if firework_block is not None and 1 <= r <= 5:
+            fw_line = firework_block[r - 1]
+            if fw_line.strip():
+                pad_needed = fw_start_col - col_cursor
+                if pad_needed > 0:
+                    body.append(" " * pad_needed)
+                    col_cursor = fw_start_col
+                body.append(fw_line, style=firework_style)
+                col_cursor += len(fw_line)
+        # Pad to fixed cell width so rich doesn't strip trailing
+        # whitespace + re-align per line (which made the silhouette
+        # "morph" between frames in narrow / right-justified cells).
+        if col_cursor < _MASCOT_CELL_WIDTH:
+            body.append(" " * (_MASCOT_CELL_WIDTH - col_cursor))
+        body.append("\n")
+
+    # Pad to a fixed height (1 title + 8 gun + 4 trailing pad lines)
+    # so the layout above doesn't reflow when the animation fires.
+    for _ in range(4):
+        body.append("\n", style="dim")
+    return body
 
 
 # ───────────────────── rendering ─────────────────────
@@ -458,16 +932,43 @@ def _summary_panel(state: WatcherState, ledger: SessionLedger,
     ]
 
     if frac is not None:
-        bar = Text(justify="center")
-        bar.append("BUDGET ", style="dim")
-        bar.append(_fmt_usd(cumul.total_cost), style=hero_style)
-        bar.append(" / ", style="dim")
-        bar.append(_fmt_usd(budget_usd), style="bold")
-        bar.append(f"   ({frac * 100:.1f}%)", style=hero_style)
+        # Two-line budget visual: a real progress bar (colored by tier)
+        # plus the numeric breakdown beneath.
+        bar_text = Text(justify="center")
+        bar_text.append("BUDGET ", style="dim")
+        bar_text.append(_fmt_usd(cumul.total_cost), style=hero_style)
+        bar_text.append(" / ", style="dim")
+        bar_text.append(_fmt_usd(budget_usd), style="bold")
+        bar_text.append(f"   ({frac * 100:.1f}%)", style=hero_style)
         if frac >= 1.0:
-            bar.append("   OVER BUDGET", style="bold red blink")
+            bar_text.append("   ⚠ OVER BUDGET ⚠",
+                            style="bold red blink")
         parts.append(Text(""))
-        parts.append(Align.center(bar))
+        parts.append(Align.center(bar_text))
+        pb = ProgressBar(
+            total=100.0,
+            completed=min(100.0, frac * 100.0),
+            width=50,
+            complete_style=hero_style,
+            finished_style="bold red",
+            style="dim",
+        )
+        parts.append(Align.center(pb))
+
+    # Sparkline of recent call costs -- visual heartbeat showing
+    # whether spending is steady, ramping, or bursty.
+    recent_costs = [(r.cost_usd or 0.0)
+                    for r in state.records[-20:]]
+    if recent_costs:
+        spark = _sparkline(recent_costs, width=20)
+        spark_line = Text(justify="center")
+        spark_line.append("recent ", style="dim")
+        spark_line.append(spark, style=hero_style)
+        spark_line.append(f"  Δ {_fmt_usd(recent_costs[-1])}",
+                          style="dim")
+        parts.append(Text(""))
+        parts.append(Align.center(spark_line))
+
     parts.append(Text(""))
     body = Group(*parts)
 
@@ -480,26 +981,32 @@ def _summary_panel(state: WatcherState, ledger: SessionLedger,
         body = Group(body, Align.center(warn), Text(""))
 
     if frac is not None and frac >= 1.0:
-        title = "[bold red]LLM SPEND  (OVER BUDGET)[/bold red]"
+        title = "[bold red blink]💸 LLM SPEND — OVER BUDGET 💸[/bold red blink]"
     elif not cumul.cost_known:
-        title = "[bold yellow]LLM SPEND  (rates incomplete)[/bold yellow]"
+        title = "[bold yellow]💵 LLM SPEND  (rates incomplete)[/bold yellow]"
     else:
-        title = "[bold]LLM SPEND[/bold]"
+        title = "[bold green]💵 LLM SPEND[/bold green]"
     return Panel(body, title=title, border_style=border_style,
-                 padding=(0, 1))
+                 padding=(0, 2), box=HEAVY)
 
 
 def _per_model_table(by_model: dict[str, ModelTally],
                      sort_mode: str) -> Table:
-    table = Table(title=f"Per-model breakdown (sort: {sort_mode})",
-                  show_lines=False, expand=True, border_style="dim")
-    table.add_column("Model", overflow="fold", no_wrap=False)
-    table.add_column("Calls", justify="right")
+    table = Table(
+        title=f"[bold cyan]🤖 Per-model breakdown[/bold cyan]  "
+              f"[dim](sort: {sort_mode})[/dim]",
+        show_lines=False, expand=True, border_style="cyan",
+        header_style="bold cyan", row_styles=["", "dim"],
+        box=ROUNDED, title_justify="left",
+    )
+    table.add_column("Model", overflow="fold", no_wrap=False,
+                     style="white")
+    table.add_column("Calls", justify="right", style="cyan")
     table.add_column("In (uncached)", justify="right")
-    table.add_column("In (cache read)", justify="right")
+    table.add_column("In (cache read)", justify="right", style="green")
     table.add_column("In (cache write)", justify="right")
     table.add_column("Out", justify="right")
-    table.add_column("USD", justify="right")
+    table.add_column("USD", justify="right", style="bold green")
 
     items = list(by_model.items())
     if sort_mode == "calls":
@@ -535,15 +1042,17 @@ def _per_kernel_table(by_kernel: dict[str, ModelTally],
     if not by_kernel:
         return None
     table = Table(
-        title=f"Per-kernel breakdown (sort: {sort_mode}; "
-              f"phase: synth/optimize:<op>)",
-        show_lines=False, expand=True, border_style="dim",
+        title=f"[bold magenta]⚙  Per-kernel breakdown[/bold magenta]  "
+              f"[dim](sort: {sort_mode}; phase: synth/optimize:<op>)[/dim]",
+        show_lines=False, expand=True, border_style="magenta",
+        header_style="bold magenta", row_styles=["", "dim"],
+        box=ROUNDED, title_justify="left",
     )
-    table.add_column("Kernel", overflow="fold")
-    table.add_column("Calls", justify="right")
+    table.add_column("Kernel", overflow="fold", style="bold white")
+    table.add_column("Calls", justify="right", style="magenta")
     table.add_column("In", justify="right")
     table.add_column("Out", justify="right")
-    table.add_column("USD", justify="right")
+    table.add_column("USD", justify="right", style="bold green")
 
     items = list(by_kernel.items())
     if sort_mode == "calls":
@@ -569,18 +1078,24 @@ def _recent_table(records: list[IngestedRecord],
                   scroll: int, max_visible: int) -> Table:
     """Scrollable per-call detail. ``scroll`` is the offset from the
     newest record (0 = newest visible at top)."""
+    title = (f"[bold blue]📞 Recent calls[/bold blue]  "
+             f"[dim](newest first; j/k to scroll")
+    if scroll > 0:
+        title += f", offset={scroll}"
+    title += ")[/dim]"
     table = Table(
-        title=f"Recent calls (newest first; j/k to scroll, "
-              f"offset={scroll})",
-        show_lines=False, expand=True, border_style="dim",
+        title=title,
+        show_lines=False, expand=True, border_style="blue",
+        header_style="bold blue", row_styles=["", "dim"],
+        box=ROUNDED, title_justify="left",
     )
-    table.add_column("Time", no_wrap=True)
+    table.add_column("Time", no_wrap=True, style="cyan")
     table.add_column("Cell", overflow="fold")
-    table.add_column("Model", overflow="fold")
-    table.add_column("Phase")
+    table.add_column("Model", overflow="fold", style="white")
+    table.add_column("Phase", style="magenta")
     table.add_column("In", justify="right")
     table.add_column("Out", justify="right")
-    table.add_column("USD", justify="right")
+    table.add_column("USD", justify="right", style="bold green")
     # records are append-order (oldest first); newest is at the end.
     # Reverse + slice from scroll.
     reversed_recs = list(reversed(records))
@@ -603,47 +1118,94 @@ def _recent_table(records: list[IngestedRecord],
 
 def _status_bar(*, paused: bool, sort_mode: str, watching: int,
                 budget_usd: Optional[float],
-                ledger: SessionLedger) -> Panel:
-    line = Text()
+                ledger: SessionLedger,
+                spinner: Optional[Spinner] = None) -> Panel:
+    """Two-row keybindings panel that's ALWAYS visible at the bottom
+    of the TUI. Row 1: state + counters. Row 2: keys as labeled
+    chips, each key in a bordered cell. Even if the terminal is
+    narrow and rich wraps the cells, every key stays legible.
+
+    The keys themselves never change, so the eye learns where each
+    one lives -- much better than burying them in a single dim
+    status line that scrolls off-screen when the terminal is small."""
+    # --- Row 1: state line ---
+    line1 = Text()
     if paused:
-        line.append("PAUSED  ", style="bold red on white")
+        line1.append(" ⏸  PAUSED ", style="bold yellow on grey23")
     else:
-        line.append("LIVE  ", style="bold green")
-    line.append(f"watching {watching} file(s)  ", style="dim")
-    line.append(f"sort:{sort_mode}  ", style="dim")
+        line1.append(" ●  LIVE ", style="bold black on green")
+    line1.append("  📂 ", style="dim")
+    line1.append(f"{watching}", style="bold cyan")
+    line1.append("  file" + ("s" if watching != 1 else "") + "  ",
+                 style="dim")
+    line1.append("  ⇅ ", style="dim")
+    line1.append(f"sort:{sort_mode}", style="bold")
     if budget_usd is not None:
-        line.append(f"budget:{_fmt_usd(budget_usd)}  ", style="dim")
+        line1.append(f"   💵 budget:{_fmt_usd(budget_usd)}", style="dim")
     if ledger.active is not None:
-        line.append(f"session:{ledger.active.id}  ", style="magenta")
+        line1.append("   ⚑ ", style="bold magenta")
+        line1.append(ledger.active.id, style="bold magenta")
     else:
-        line.append("no-session  ", style="dim")
-    line.append("|  ", style="dim")
-    line.append("[q]uit  [p]ause  [s]ort  [j/k]scroll  "
-                "[r]eset  [?]help",
-                style="bold")
-    return Panel(line, border_style="dim", padding=(0, 1))
+        line1.append("   ⚑ no session", style="dim italic")
+
+    # --- Row 2: keybindings, each in a labeled "chip" ---
+    key_chips = [
+        ("q",   "quit",      "bold white on red"),
+        ("p",   "pause",     "bold white on grey35"),
+        ("s",   "sort",      "bold white on grey35"),
+        ("j/k", "scroll",    "bold white on grey35"),
+        ("r",   "reset",     "bold white on grey35"),
+        ("?",   "help",      "bold white on cyan"),
+    ]
+    line2 = Text()
+    for i, (key, label, chip_style) in enumerate(key_chips):
+        if i > 0:
+            line2.append("  ", style="dim")
+        line2.append(f" {key} ", style=chip_style)
+        line2.append(f" {label}", style="bold")
+
+    body = Group(line1, Text(""), line2)
+    return Panel(body, title="[bold]controls[/bold]",
+                 border_style="grey50", padding=(0, 1),
+                 box=ROUNDED)
 
 
 def _help_overlay() -> Panel:
     text = Text()
-    text.append("Keyboard\n", style="bold underline")
-    text.append("  q / Ctrl-C    quit (terminal restored)\n")
-    text.append("  p             pause / resume polling\n")
-    text.append("  s             cycle per-model sort "
-                "(cost → calls → name)\n")
-    text.append("  j / k         scroll recent calls down / up\n")
-    text.append("  r             reset state + re-scan all files\n")
-    text.append("  ?             toggle this help\n")
-    text.append("\nSessions (run in a separate terminal)\n",
-                style="bold underline")
-    text.append("  uv run mb-cost session start NAME [--label TEXT]\n")
-    text.append("  uv run mb-cost session end\n")
-    text.append("  uv run mb-cost session list\n")
-    text.append("\nReport (no TUI; one-shot text)\n",
-                style="bold underline")
-    text.append("  uv run mb-cost report\n")
-    return Panel(text, title="[bold]HELP[/bold]",
-                 border_style="cyan", padding=(1, 2))
+    text.append("⌨  Keyboard\n", style="bold underline cyan")
+    text.append("  q / Ctrl-C    ", style="bold")
+    text.append("quit (terminal restored)\n", style="dim")
+    text.append("  p             ", style="bold")
+    text.append("pause / resume polling\n", style="dim")
+    text.append("  s             ", style="bold")
+    text.append("cycle per-model sort (cost → calls → name)\n",
+                style="dim")
+    text.append("  j / k         ", style="bold")
+    text.append("scroll recent calls down / up\n", style="dim")
+    text.append("  r             ", style="bold")
+    text.append("reset state + re-scan all files\n", style="dim")
+    text.append("  ?             ", style="bold")
+    text.append("toggle this help\n", style="dim")
+    text.append("\n⚑ Sessions ", style="bold underline magenta")
+    text.append("(run in a separate terminal)\n",
+                style="dim italic")
+    text.append("  uv run mb-cost session start NAME [--label TEXT]\n",
+                style="green")
+    text.append("  uv run mb-cost session end\n", style="green")
+    text.append("  uv run mb-cost session list\n", style="green")
+    text.append("  uv run mb-cost run NAME -- <command...>",
+                style="bold green")
+    text.append("   (auto-scoped session)\n", style="dim italic")
+    text.append("\n📊 Report ", style="bold underline yellow")
+    text.append("(no TUI; one-shot text)\n", style="dim italic")
+    text.append("  uv run mb-cost report\n", style="green")
+    text.append("\n💰 Budget guards\n", style="bold underline yellow")
+    text.append("  --budget-usd N", style="bold")
+    text.append("   visual alarm (this monitor)\n", style="dim")
+    text.append("  --max-usd N", style="bold")
+    text.append("      hard kill (arm_b_* drivers)\n", style="dim")
+    return Panel(text, title="[bold cyan]❔ HELP[/bold cyan]",
+                 border_style="cyan", padding=(1, 2), box=DOUBLE)
 
 
 def render(state: WatcherState, ledger: SessionLedger,
@@ -652,7 +1214,33 @@ def render(state: WatcherState, ledger: SessionLedger,
            budget_usd: Optional[float]) -> Group:
     windows = compute_windows(state, ledger)
     cumul = windows["cumulative"]
-    parts: list = [_summary_panel(state, ledger, windows, budget_usd)]
+
+    # Top row: big summary panel on the left + the BLASTER mascot
+    # tucked into the upper-right. rich.Table with no borders gives
+    # us a side-by-side that reflows on resize -- the summary panel
+    # gets the rest of the width, the mascot stays its compact 28
+    # columns.
+    top_row = Table.grid(expand=True)
+    top_row.add_column(ratio=1)
+    # Mascot column: left-justified so every row of the gun art
+    # starts at the SAME X-coordinate inside the cell. justify="right"
+    # made each line right-align independently -- with each art row
+    # having different visible widths (due to trailing whitespace
+    # being stripped by rich), the gun appeared to "morph" between
+    # frames. The cell itself stays on the right of the table via
+    # column ordering; only the lines within the cell are now
+    # consistently aligned.
+    #
+    # Width 44 accommodates: 20-char gun + up to 14-col firework
+    # drift + ~10-char firework chars = 44. Smaller and the trail
+    # frames wrap, making the gun look broken.
+    top_row.add_column(width=44, justify="left")
+    top_row.add_row(
+        _summary_panel(state, ledger, windows, budget_usd),
+        _mascot_render(state),
+    )
+
+    parts: list = [top_row]
     if show_help:
         parts.append(_help_overlay())
     else:
@@ -664,6 +1252,11 @@ def render(state: WatcherState, ledger: SessionLedger,
     parts.append(_status_bar(paused=paused, sort_mode=sort_mode,
                              watching=watching, budget_usd=budget_usd,
                              ledger=ledger))
+    # Tick the blaster animation countdown so each redraw moves it
+    # one step closer to idle. Doing it here (post-render) means the
+    # NEXT frame uses the decremented value.
+    if state.blaster_anim_frame > 0:
+        state.blaster_anim_frame -= 1
     return Group(*parts)
 
 
@@ -725,6 +1318,15 @@ def cmd_live(args) -> int:
     state = WatcherState()
     console = Console()
     poll_interval = 1.0 / max(args.refresh_hz, 0.1)
+
+    # Startup splash: big ASCII blaster + ModelBlaster banner. Skipped
+    # automatically when stdout isn't a tty (CI / pipes / no-tty
+    # subprocesses) or when --no-splash is passed.
+    if (not args.no_splash) and sys.stdout.isatty():
+        render_splash(console)
+        # 1.5s is enough to read the title without delaying real work.
+        time.sleep(1.5)
+        console.clear()
 
     def _files() -> list[Path]:
         if args.paths:
@@ -1013,6 +1615,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                       help="recent calls visible (default: 15)")
     live.add_argument("--budget-usd", type=float, default=None,
                       help="visual budget alarm threshold")
+    live.add_argument("--no-splash", action="store_true",
+                      help="skip the startup BLASTER splash screen")
 
     # session start / end / list
     sess = sub.add_parser("session", help="manage named sessions")
