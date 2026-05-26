@@ -174,6 +174,16 @@ def main() -> int:
             f.write(out)
         print(f"spike: saved {len(out)} bytes of stdout to {args.save_output}")
 
+    # Re-emit raw spike stdout (with MODELBLASTER_VERIFY / PROFILE_BEGIN /
+    # PROFILE_END / WALL_CYCLES markers intact) so downstream parsers
+    # that key on those markers can find them in the captured run.sh
+    # stdout. The benchmarks harness (benchmarks/runners/spike.py
+    # parse_stdout) needs this. Bracket with our own markers so it's
+    # easy to extract just this block if needed.
+    print("=== MODELBLASTER_RAW_SPIKE_BEGIN ===")
+    print(out, end="" if out.endswith("\n") else "\n")
+    print("=== MODELBLASTER_RAW_SPIKE_END ===")
+
     backend_tag = args.profile_backend or _detect_backend(args.spike_arg)
     repo_root = args.repo_root or os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..")

@@ -21,8 +21,8 @@ workloads:
   - id: dronet_scalar_smoke
     model: dronet
     target: scalar
-    quant: fp32
-    runner: host
+    quant: int8
+    runner: spike
     tags: [smoke]
 
   # ───── DroNet — the well-understood small baseline ─────
@@ -70,5 +70,5 @@ workloads:
   #       end-to-end codegen waits on walker support for the attention
   #       block (scaled_dot_product_attention, rotary_emb, masked
   #       embeddings). See notes/smolvla_admission.md.
-  - { id: smolvla_scalar_fp16_step, model: smolvla, target: scalar, quant: fp16, runner: host,    slice: single_step, blocked_by: walker-smolvla-ops }
+  - { id: smolvla_scalar_fp16_step, model: smolvla, target: scalar, quant: fp16, runner: spike,   slice: single_step, blocked_by: walker-smolvla-ops }
   - { id: smolvla_rvv_opu_fp16_step, model: smolvla, target: rvv_opu, quant: fp16, runner: firesim, slice: single_step, blocked_by: walker-smolvla-ops }
