@@ -429,6 +429,55 @@ def execute_run_sh(
     )
 
 
+def maybe_auto_session(arm: str, workload: Workload, run_id: str
+                       ) -> Optional[str]:
+    """Open a session if none is currently active. Returns the session
+    id we opened (caller passes back to `end_auto_session`), or None
+    when a manual session was already active (we leave it alone).
+
+    Auto-attribution lets Claude Code (or any wrapper) trigger an
+    arm_b_* run without the operator needing to remember
+    `mb-cost session start` first -- every run gets a uniquely named
+    session in the ledger automatically. Manual sessions still take
+    precedence: if the user opened one, we don't clobber it.
+    """
+    try:
+        from modelblaster.benchmarks.tools.sessions import SessionLedger
+    except ImportError:
+        return None
+    L = SessionLedger.load()
+    if L.active is not None:
+        return None
+    # Compact, unique, sortable name. Trim run_id's UTC timestamp to
+    # the date-time portion (no microseconds or trailing Z) so the
+    # session list reads cleanly.
+    short = run_id.replace("Z", "").replace(":", "")[:15]
+    name = f"auto-{arm}-{workload.id}-{short}"
+    label = (f"auto-opened by arm driver {arm} for workload "
+             f"{workload.id!r} ({workload.target}/{workload.runner})")
+    try:
+        L.start(name, label=label)
+        return name
+    except ValueError:
+        # Duplicate name (extremely unlikely given the run-id); skip.
+        return None
+
+
+def end_auto_session(auto_session_id: Optional[str]) -> None:
+    """Close an auto-opened session. No-op when the caller didn't
+    open one, OR when the active session id has drifted (e.g. the
+    user manually opened a different session mid-run -- leave it)."""
+    if auto_session_id is None:
+        return
+    try:
+        from modelblaster.benchmarks.tools.sessions import SessionLedger
+    except ImportError:
+        return
+    L = SessionLedger.load()
+    if L.active is not None and L.active.id == auto_session_id:
+        L.end()
+
+
 def detect_budget_trip(run_dir: Path,
                        extra: dict[str, Any]) -> bool:
     """Scan stderr.log for the MODELBLASTER_BUDGET_EXCEEDED marker

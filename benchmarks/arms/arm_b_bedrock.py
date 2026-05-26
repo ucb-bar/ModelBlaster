@@ -122,9 +122,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_usd=args.max_usd,
     )
 
-    outcome = _common.execute_run_sh(
-        arm=ARM_ID, workload=workload, env=env, run_id=run_id,
-    )
+    # Auto-open a session for this run if none is active. mb-cost
+    # session list will show every run distinctly even when Claude
+    # Code or any other wrapper drives the run.
+    auto_session = _common.maybe_auto_session(ARM_ID, workload, run_id)
+    try:
+        outcome = _common.execute_run_sh(
+            arm=ARM_ID, workload=workload, env=env, run_id=run_id,
+        )
+    finally:
+        _common.end_auto_session(auto_session)
 
     # Roll the per-call records into the aggregator's tokens schema
     # regardless of subprocess exit code -- partial runs still consumed

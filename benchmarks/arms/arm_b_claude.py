@@ -122,9 +122,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_usd=args.max_usd,
     )
 
-    outcome = _common.execute_run_sh(
-        arm=ARM_ID, workload=workload, env=env, run_id=run_id,
-    )
+    auto_session = _common.maybe_auto_session(ARM_ID, workload, run_id)
+    try:
+        outcome = _common.execute_run_sh(
+            arm=ARM_ID, workload=workload, env=env, run_id=run_id,
+        )
+    finally:
+        _common.end_auto_session(auto_session)
 
     _common.synthesize_llm_tokens(
         calls_log, run_dir / "llm_tokens.json", provider=PROVIDER,
