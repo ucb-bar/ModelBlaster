@@ -101,11 +101,21 @@ benchmarks/
 
 The Arm A driver shells out to `examples/<m>/run.sh`, which in turn
 invokes `west build` and `spike`. Activate the Zephyr build env once
-per shell first (same prerequisite as a manual `bash examples/<m>/run.sh`):
+per shell first — one source line handles conda, the Zephyr SDK paths,
+and the `.env` for Bedrock creds:
 
 ```bash
-source tools/miniforge3/etc/profile.d/conda.sh && conda activate zephyr
-source scripts/set_envvars_sdk.sh
+source scripts/setup_benchmark_env.sh
+# expect: "OK: benchmark env ready"
+```
+
+The script is idempotent (safe to re-source) and calls
+`scripts/check_benchmark_env.sh` at the end to assert every
+prerequisite. Run that checker on its own any time you want to confirm
+a shell is still good:
+
+```bash
+scripts/check_benchmark_env.sh
 ```
 
 Then run the harness:
