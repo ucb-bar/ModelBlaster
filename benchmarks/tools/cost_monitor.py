@@ -436,7 +436,7 @@ def _sparkline(values: list[float], width: int = 20) -> str:
     return "".join(out)
 
 
-# ───────────────────── mascot: 🔫 BLAZER the blaster ─────────────────────
+# ───────────────────── mascot: 🔫 BLASTER the blaster ─────────────────────
 #
 # Tiny 3-line ASCII blaster pinned to the top-right corner. Idle most
 # of the time; fires a pew-pew across the panel when a new kernel
@@ -451,81 +451,165 @@ def _sparkline(values: list[float], width: int = 20) -> str:
 _BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
 
 
+# Sci-fi blaster ASCII -- riff on the classic "hjw" revolver silhouette
+# scaled down to 3 lines and stylized with a power cell + barrel vent.
+# The PROJECTILE is rendered as a starburst sparkle pattern inspired by
+# old-school sci-fi laser art:
+#
+#         .              .   .'.     \   /
+#       \   /      .'. .' '.'   '  -=  o  =-
+#     -=  o  =-  .'   '              /   \
+#       /   \                          '
+#         '
+#
+# Each frame: the blaster sits in columns 0-13. The "shot" is a
+# starburst centered some columns to the right of the muzzle, with
+# sparkle dots `.` and tick marks `'` around it. As the animation
+# progresses, the starburst drifts further from the muzzle and decays
+# (bright `-= o =-` -> thin `'.'` -> just `.` sparkles -> gone).
+#
+# Composition rules:
+#   * Top line  -- power cell + barrel housing
+#   * Mid line  -- barrel + muzzle (where the projectile launches)
+#   * Bottom    -- grip + trigger
+#
+# Whichever frame is rendered, the silhouette stays 3 lines tall + the
+# same column count so the surrounding layout doesn't twitch.
+
 _BLASTER_FRAMES = {
-    # Idle: blaster pointed slightly down-right, no smoke.
+    # Idle: dim outline, no glow. Power cell visible.
     "idle": [
-        "   ___",
-        "  /[#]\\__",
-        "   \\___ \\",
+        "  ╔═══╦═════╕",
+        "  ║▒▒▒║──── ·",
+        "   `═╧╗_ ",
     ],
-    # Recoil 1: muzzle flash + pulled back.
+    # Charging: power cell pulses ▓, muzzle tightens to ◆.
+    "charge": [
+        "  ╔═══╦═════╕",
+        "  ║▓▓▓║════ ◆",
+        "   `═╧╗_ ",
+    ],
+    # Muzzle flash: starburst right at the muzzle tip. The `-= o =-`
+    # signature borrowed straight from the sci-fi art inspiration.
     "recoil": [
-        "   ___    *",
-        "  /[#]>+ * ",
-        "   \\____\\  ",
+        "  ╔═══╦═════╕  \\   /",
+        "  ║▓▓▓║═════►-= o =-",
+        "   `═╧╗_       /   \\",
     ],
-    # Recoil 2: projectile mid-air + spent smoke.
+    # Trail: starburst has drifted right, fading into sparkles.
+    # The actual sparkles are positioned dynamically below via the
+    # projectile string so the trail can move further on each frame.
     "trail": [
-        "   ___  ~~",
-        "  /[#]\\___",
-        "   \\___ \\  ",
+        "  ╔═══╦═════╕",
+        "  ║▒▒▒║═════►",
+        "   `═╧╗_ ",
     ],
-    # Aftermath: little puff of smoke.
+    # Aftermath: vent puff (° rises above barrel) + lingering ' .
     "puff": [
-        "   ___ ° ",
-        "  /[#]\\__",
-        "   \\___ \\",
+        "  ╔═══╦═════╕ °",
+        "  ║▒▒▒║──── °  '",
+        "   `═╧╗_      .",
     ],
 }
 
 
-def _blaster_frame_for(frame: int) -> tuple[str, str]:
-    """(frame_key, projectile_trail) for the given countdown frame.
-    `frame` is _BLASTER_ANIM_FRAMES at the start of the shot, ticking
-    down to 0. We pick the visual sub-frame based on which band of
-    the countdown we're in."""
+# Starburst variants used for the moving projectile, in decay order
+# (most-intense first). Each entry is (top, mid, bottom) -- three
+# lines vertically centered on the bolt path. After the brightest
+# starburst we step down to thinner sparkles + finally just dots.
+_STARBURST_DECAY = [
+    ("\\   /",
+     "-= o =-",
+     " /   \\"),
+    ("  .'.  ",
+     " '.o.' ",
+     "  '.'  "),
+    ("       ",
+     " .'.   ",
+     "  .    "),
+    ("       ",
+     "  .    ",
+     "       "),
+]
+
+
+def _blaster_frame_for(frame: int) -> tuple[str, int]:
+    """(frame_key, decay_index) for the countdown frame. `frame` is
+    _BLASTER_ANIM_FRAMES at the start of the shot, ticking down to 0.
+    Sub-frames: charge -> recoil -> trail*N (with decaying starburst
+    intensity) -> puff -> idle. ``decay_index`` is the index into
+    ``_STARBURST_DECAY`` for the trail variant; -1 means no starburst."""
     if frame <= 0:
-        return "idle", ""
-    if frame >= _BLASTER_ANIM_FRAMES - 1:
-        # First frame: recoil + bright muzzle.
-        return "recoil", ""
+        return "idle", -1
+    if frame >= _BLASTER_ANIM_FRAMES:
+        return "charge", -1
+    if frame == _BLASTER_ANIM_FRAMES - 1:
+        return "recoil", -1
     if frame >= _BLASTER_ANIM_FRAMES - 4:
-        # Projectile traveling across the panel.
-        travelled = _BLASTER_ANIM_FRAMES - frame  # 2..4
-        return "trail", "─" * (travelled * 4) + "▶"
-    return "puff", ""
+        # Trail phase: 3 frames worth of starburst drift + decay.
+        # decay_index = 0 (brightest) -> len(_STARBURST_DECAY)-1.
+        travelled = _BLASTER_ANIM_FRAMES - 1 - frame  # 1..4
+        decay_idx = min(travelled - 1, len(_STARBURST_DECAY) - 1)
+        return "trail", decay_idx
+    return "puff", -1
 
 
 def _mascot_panel(state: WatcherState) -> Panel:
-    """The blaster mascot panel. Always 3 lines tall so the layout
-    above doesn't reflow when the animation fires."""
-    key, projectile = _blaster_frame_for(state.blaster_anim_frame)
+    """The blaster mascot panel. Always 5 lines tall so the layout
+    above doesn't reflow when the trail starburst extends below the
+    barrel.
+
+    Color palette is sci-fi: cyan power cell housing, orange muzzle
+    glow on recoil, bright red starburst on trail frames, grey vent
+    smoke on puff. The trail frames overlay the starburst from
+    _STARBURST_DECAY drifting right + fading."""
+    key, decay_idx = _blaster_frame_for(state.blaster_anim_frame)
     art = _BLASTER_FRAMES[key]
-    # Compose the lines with semantic color: orange muzzle + flash
-    # while firing, dim grey while idle.
+    body = Text()
     if key == "idle":
-        body = Text("\n".join(art), style="grey50")
-        title = "[dim]🔫 BLAZER  idle[/dim]"
-        border = "grey42"
-    elif key == "recoil":
-        body = Text()
         for line in art:
-            body.append(line + "\n", style="bold orange3")
-        title = "[bold yellow]🔫 BLAZER  ⚡ NEW KERNEL ⚡[/bold yellow]"
-        border = "yellow"
-    elif key == "trail":
-        body = Text()
+            body.append(line + "\n", style="cyan")
+        body.append("\n\n", style="dim")  # pad to fixed height
+        title = "[dim cyan]⌬ BLASTER  standby[/dim cyan]"
+        border = "cyan"
+    elif key == "charge":
+        for line in art:
+            colored = line.replace("▓▓▓",
+                                   "[bold bright_cyan]▓▓▓[/bold bright_cyan]")
+            body.append(Text.from_markup(colored, style="cyan"))
+            body.append("\n")
+        body.append("\n\n", style="dim")
+        title = "[bold bright_cyan]⌬ BLASTER  charging…[/bold bright_cyan]"
+        border = "bright_cyan"
+    elif key == "recoil":
+        # Recoil frame -- starburst already embedded in the art lines.
         for line in art:
             body.append(line + "\n", style="bold yellow")
-        if projectile:
-            body.append("       " + projectile + "  pew!\n",
-                        style="bold red")
-        title = "[bold red]🔫 BLAZER  FIRING[/bold red]"
-        border = "red"
+        body.append("\n\n", style="dim")
+        title = "[bold yellow]⌬ BLASTER  ▸ NEW KERNEL[/bold yellow]"
+        border = "yellow"
+    elif key == "trail":
+        # 3 lines of blaster + 3 lines of drifting starburst below.
+        # Total = 6 lines but we crop to 5 for layout consistency
+        # by overlaying the top starburst line on the blaster's last
+        # row (the grip line gets the starburst's leading char).
+        for line in art:
+            body.append(line + "\n", style="bold red")
+        burst = _STARBURST_DECAY[max(0, decay_idx)]
+        # Offset the starburst to the right of the muzzle and further
+        # each frame so it visibly drifts.
+        offset = 6 + decay_idx * 3
+        pad = " " * offset
+        body.append(pad + burst[0] + "\n", style="bold bright_red")
+        body.append(pad + burst[1] + "\n", style="bold bright_yellow")
+        title = "[bold bright_red]⌬ BLASTER  ▸ FIRING ▸ pew![/bold bright_red]"
+        border = "bright_red"
     else:  # puff
-        body = Text("\n".join(art), style="grey70")
-        title = "[dim]🔫 BLAZER[/dim]"
-        border = "grey42"
+        for line in art:
+            body.append(line + "\n", style="grey62")
+        body.append("\n\n", style="dim")
+        title = "[dim cyan]⌬ BLASTER  venting…[/dim cyan]"
+        border = "grey50"
     return Panel(body, title=title, border_style=border, box=ROUNDED,
                  padding=(0, 1), width=28)
 
@@ -874,7 +958,7 @@ def render(state: WatcherState, ledger: SessionLedger,
     windows = compute_windows(state, ledger)
     cumul = windows["cumulative"]
 
-    # Top row: big summary panel on the left + the BLAZER mascot
+    # Top row: big summary panel on the left + the BLASTER mascot
     # tucked into the upper-right. rich.Table with no borders gives
     # us a side-by-side that reflows on resize -- the summary panel
     # gets the rest of the width, the mascot stays its compact 28
