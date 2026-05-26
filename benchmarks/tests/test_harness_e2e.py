@@ -471,7 +471,11 @@ def main() -> int:
         print(f"    OK ({n_with_stddev}/{len(sample_rows)} sampled rows have "
               f"stddev; n_runs={n_runs_set})")
 
-    # Cost monitor parses the synthesized JSONL.
+    # Cost monitor parses the synthesized JSONL with the correct
+    # Bedrock semantics: input_tokens is the non-cached portion only;
+    # cached_read tokens are billed separately at ~10% of input rate.
+    # See pipeline/bedrock_client.py and the AWS prompt-caching docs
+    # quoted there.
     print("[9] Verify cost monitor extractor on synthesized llm_calls.jsonl")
     from modelblaster.benchmarks.tools.cost_monitor import (
         load_pricing, price_call,
@@ -483,11 +487,29 @@ def main() -> int:
     }
     cost = price_call(
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0", sample_rec, pricing)
-    expected = (2000 - 1200) * 3.0 / 1e6 + 1200 * 0.30 / 1e6 + 500 * 15.0 / 1e6
+    # Expected: 2000 uncached * $3/MTok + 1200 cached_read * $0.30/MTok
+    #         + 500 output * $15/MTok = $0.006 + $0.00036 + $0.0075 = $0.01386
+    expected = 2000 * 3.0 / 1e6 + 1200 * 0.30 / 1e6 + 500 * 15.0 / 1e6
     if cost is None or abs(cost - expected) > 1e-9:
         failures.append(f"price_call: got {cost}, expected {expected}")
     else:
         print(f"    OK (priced 1 call at ${cost:.5f})")
+
+    # Also verify the no-cache case (matches the smoke test we ran
+    # against real Bedrock) -- 56 input, 27 output, no cache.
+    cold_rec = {
+        "input_tokens": 56, "output_tokens": 27,
+        "cache_read_input_tokens": 0, "cache_write_input_tokens": 0,
+    }
+    cold_cost = price_call(
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0", cold_rec, pricing)
+    cold_expected = 56 * 3.0 / 1e6 + 27 * 15.0 / 1e6
+    if cold_cost is None or abs(cold_cost - cold_expected) > 1e-9:
+        failures.append(f"price_call (cold): got {cold_cost}, "
+                        f"expected {cold_expected}")
+    else:
+        print(f"    OK (cold call $​{cold_cost:.6f} -- matches the "
+              f"real Bedrock smoke test)")
 
     # Summary.md must render both phase tables.
     print("[10] Verify summary.md two-phase sectioning")
