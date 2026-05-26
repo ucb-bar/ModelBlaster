@@ -555,102 +555,122 @@ _BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
 # Whichever frame is rendered, the silhouette stays 3 lines tall + the
 # same column count so the surrounding layout doesn't twitch.
 
-# Cartoon ray-gun silhouette traced from the reference image
-# (tmp/Screenshot 22-32-07: purple/yellow blaster). Composition:
+# Blaster art -- frozen, character-exact, taken verbatim from the
+# user's spec. The silhouette is the same across all phases; only
+# COLORS and side-effects (firework / smoke / idle sparkles) change.
 #
-#       ╭──╮            <- top fin / sight (line 0)
-#     ╔═╧══╧═╗          <- top of body (line 1)
-#     ║◉ . ◉ ╠══╤═  ·   <- body with two "eyes" + barrel + muzzle (line 2)
-#     ╚╤════╤╝          <- bottom of body + trigger guard tabs (line 3)
-#      │    ╲           <- trigger curl on the right + grip top (line 4)
-#      │    │           <- grip mid (line 5)
-#      ╰────╯           <- grip bottom (line 6)
-#
-# 7 lines tall, same width across phases so layout above doesn't
-# twitch. The MUZZLE char on line 2 + the centre chip change between
-# idle / charging / firing; firework bursts render to the right of
-# the muzzle during recoil / trail.
+# Anatomy (rows are 0-indexed, columns 0-19):
+#   row 0    top fin / sight
+#   row 1    fin connecting into body
+#   row 2    top of body
+#   row 3    barrel detail + muzzle (extends to col 19, the rightmost █)
+#   row 4    bottom of body
+#   row 5    bottom of body break
+#   row 6    grip top
+#   row 7    grip bottom
 
-_BLASTER_FRAMES = {
-    # IDLE: dim cyan, no chip lit, " · " muzzle.
-    "idle": [
-        "       ╭──╮",
-        "     ╔═╧══╧═╗",
-        "     ║◉    ◉╠══╤═  ·",
-        "     ╚╤════╤╝",
-        "      │    ╲",
-        "      │    │",
-        "      ╰────╯",
-    ],
-    # CHARGING: chip ▣ lit in the centre, " ◆ " muzzle focus.
-    "charge": [
-        "       ╭──╮",
-        "     ╔═╧══╧═╗",
-        "     ║◉ ▣ ◉ ╠══╤═  ◆",
-        "     ╚╤════╤╝",
-        "      │    ╲",
-        "      │    │",
-        "      ╰────╯",
-    ],
-    # RECOIL: muzzle fires, firework starburst centred just right of
-    # the muzzle tip. The starburst chars occupy columns past the
-    # muzzle so the gun silhouette stays clean.
-    "recoil": [
-        "       ╭──╮         \\|/",
-        "     ╔═╧══╧═╗      .-✦-.",
-        "     ║◉ ▣ ◉ ╠══►  *  ✦  *",
-        "     ╚╤════╤╝      `-✦-´",
-        "      │    ╲        /|\\",
-        "      │    │",
-        "      ╰────╯",
-    ],
-    # TRAIL: chamber returns to orbs, muzzle still emitting; the
-    # firework starburst drifts further right + decays each frame
-    # (rendered below the gun lines via _FIREWORK_DECAY).
-    "trail": [
-        "       ╭──╮",
-        "     ╔═╧══╧═╗",
-        "     ║◉    ◉╠══►",
-        "     ╚╤════╤╝",
-        "      │    ╲",
-        "      │    │",
-        "      ╰────╯",
-    ],
-    # PUFF: vent smoke (°) above + lingering sparkles trail right.
-    "puff": [
-        "       ╭──╮     °",
-        "     ╔═╧══╧═╗ °",
-        "     ║◉    ◉╠─── '",
-        "     ╚╤════╤╝    .",
-        "      │    ╲",
-        "      │    │",
-        "      ╰────╯",
-    ],
-}
-
-
-# Firework-style starbursts for the projectile trail. Each entry is
-# (top, mid, bottom) drifting further right + fading each frame.
-# Mimics a small explosion pattern with lines + sparkles, intentionally
-# kept small so they don't compete with the gun silhouette.
-_FIREWORK_DECAY = [
-    # Fresh: full starburst with star + crossing lines + sparkles.
-    (" \\ | /",
-     "--✦--✦",
-     " / | \\"),
-    # Mid: thinner cross, fewer sparkles.
-    (" .'.",
-     " -✦-",
-     " '.'"),
-    # Decaying: lone sparkles + dots.
-    ("  .",
-     " .✦.",
-     "  ."),
-    # Last: just two dots.
-    ("",
-     "  ·  ·",
-     ""),
+_BLASTER_ART = [
+    "   █▓███            ",
+    "   █▓▓▓▓▓▓█         ",
+    " █▒▒▒▒▒▒▒▒▒▒█ █     ",
+    "██▒█  █▒ █▒▒█░░█░░░█",
+    " █▒▒▒▒▒▒▒▒▒▒█ █     ",
+    "   ▓▓▓▓ ▓█          ",
+    "  █▓▓▓              ",
+    "  █▓▓█              ",
 ]
+
+
+# Firework explosion overlay -- styled exactly like the user's brief:
+#
+#                                 .
+#    .              .   .'.     \   /
+#  \   /      .'. .' '.'   '  -=  o  =-
+# -=  o  =-  .'   '              /   \
+#   /   \                          '
+#     '
+#
+# Drawn to the right of the muzzle (column 21+) during recoil + trail
+# frames. Frame 0 is brightest; subsequent frames decay through the
+# user's exact star → sparkle → dot progression.
+_FIREWORK_FRAMES = [
+    # Frame 0 -- peak: the user's signature `-=  o  =-` starburst.
+    [
+        r"   \   /",
+        r"    .",
+        r" -=  o  =-",
+        r"    '",
+        r"   /   \ ",
+    ],
+    # Frame 1 -- still bright but contracting; opening diagonals
+    # have shrunk to single chars + sparkle dots emerging.
+    [
+        r"   \ /",
+        r"  .'.",
+        r" -= o =-",
+        r"  '.'",
+        r"   / \ ",
+    ],
+    # Frame 2 -- sparkle phase: starburst gone, only `.'. '.'` left.
+    [
+        r"    .",
+        r"   .'.",
+        r"  '. .'",
+        r"   '.'",
+        r"    '",
+    ],
+    # Frame 3 -- dot phase: just a few drifting sparkles.
+    [
+        r"",
+        r"    .",
+        r"   . .",
+        r"    .",
+        r"",
+    ],
+    # Frame 4 -- almost gone: lone dot.
+    [
+        r"",
+        r"",
+        r"     .",
+        r"",
+        r"",
+    ],
+]
+
+
+# Color palette for the firework lifecycle. Index matches
+# _FIREWORK_FRAMES; the brightest frame uses white-hot rays,
+# decaying through yellow → red → grey.
+_FIREWORK_PALETTE = [
+    "bold bright_white",
+    "bold bright_yellow",
+    "bold yellow",
+    "bold bright_red",
+    "red",
+]
+
+
+# Idle subtle sparkle patterns -- cycled by wall-clock time so the
+# gun isn't 100% static when nothing's happening. Each pattern is a
+# list of (row, col, char) overlays painted AROUND the gun -- never
+# on top of it.
+_IDLE_SPARKLES = [
+    [(0, 22, "·"), (3, 24, "."), (7, 23, "·")],
+    [(2, 23, "·"), (5, 21, "."), (1, 25, "·")],
+    [(1, 21, "·"), (4, 24, "."), (6, 25, "·")],
+    [(0, 24, "·"), (6, 22, "."), (3, 26, "·")],
+]
+
+
+# Positions inside the silhouette that LIGHT UP during charging.
+# The "two squares" are the interior gaps in row 3 of the base art:
+# columns 4-5 (left window) and column 8 (right window). Filling
+# them with progressively brighter chars makes the gun visibly
+# build energy before the shot.
+_CHARGE_FILLS = {
+    # row -> dict of {col: char}
+    3: {4: "▒", 5: "▒", 8: "▒"},
+}
 
 
 # Starburst variants used for the moving projectile, in decay order
@@ -705,47 +725,119 @@ def _mascot_render(state: WatcherState) -> Group:
     smoke on puff. Total height is fixed at 8 lines (caption + 4
     gun + 3 trail-or-pad) so the layout above doesn't reflow."""
     key, decay_idx = _blaster_frame_for(state.blaster_anim_frame)
-    art = _BLASTER_FRAMES[key]
     body = Text()
 
+    titles = {
+        "idle":   (" ⌬ BLASTER  standby",         "dim cyan"),
+        "charge": (" ⌬ BLASTER  charging…",        "bold bright_cyan"),
+        "recoil": (" ⌬ BLASTER  ▸ NEW KERNEL",     "bold bright_yellow"),
+        "trail":  (" ⌬ BLASTER  ▸ FIRING ▸ pew!",  "bold bright_yellow"),
+        "puff":   (" ⌬ BLASTER  venting…",         "grey62"),
+    }
+    title, title_style = titles[key]
+    body.append(title + "\n", style=title_style)
+
+    # Per-row gun color. Same style for every row -- shading is in
+    # the art itself (▓ ▒ ░), so we just tint it.
+    gun_style = {
+        "idle":   "cyan",
+        "charge": "bold bright_cyan",
+        "recoil": "bold bright_yellow",
+        "trail":  "bold yellow",
+        "puff":   "grey62",
+    }[key]
+
+    # Mutable copy so we can paint the interior charging windows.
+    grid = [list(row) for row in _BLASTER_ART]
+
+    if key in ("charge", "recoil"):
+        # Light up the two interior "windows" the user pointed at:
+        # row 3 cols 4-5 and col 8 (the gaps inside the body).
+        for r, cols in _CHARGE_FILLS.items():
+            for c, ch in cols.items():
+                if r < len(grid) and c < len(grid[r]):
+                    grid[r][c] = ch
+
+    # Build the overlay table: (row, col) -> (char, style). These
+    # paint OVER the art / empty space without changing the gun
+    # silhouette itself.
+    overlays: dict[tuple[int, int], tuple[str, str]] = {}
     if key == "idle":
-        body.append(" ⌬ BLASTER  standby\n", style="dim cyan")
-        for line in art:
-            body.append(line + "\n", style="cyan")
-        body.append("\n\n\n", style="dim")  # pad to fixed height
+        sparkle_idx = int(time.time() * 2) % len(_IDLE_SPARKLES)
+        for r, c, ch in _IDLE_SPARKLES[sparkle_idx]:
+            overlays[(r, c)] = (ch, "bright_cyan")
     elif key == "charge":
-        body.append(" ⌬ BLASTER  charging…\n",
-                    style="bold bright_cyan")
-        for line in art:
-            colored = line.replace("▓▓▓▓▓▓▓▓▓",
-                                   "[bold bright_cyan]"
-                                   "▓▓▓▓▓▓▓▓▓"
-                                   "[/bold bright_cyan]")
-            body.append(Text.from_markup(colored, style="cyan"))
-            body.append("\n")
-        body.append("\n\n\n", style="dim")
-    elif key == "recoil":
-        body.append(" ⌬ BLASTER  ▸ NEW KERNEL\n", style="bold yellow")
-        for line in art:
-            body.append(line + "\n", style="bold yellow")
-        body.append("\n\n\n", style="dim")
+        # Energy particles flowing INTO the muzzle from off-screen
+        # right -- visual cue that the gun is gathering power.
+        for c, ch in [(22, "·"), (25, "."), (28, "·")]:
+            overlays[(3, c)] = (ch, "bold bright_cyan")
+    elif key == "puff":
+        # Rising smoke above + lingering sparkles right of muzzle.
+        overlays.update({
+            (0, 8):  ("°", "bright_white"),
+            (1, 11): ("·", "grey70"),
+            (2, 21): ("°", "grey70"),
+            (3, 23): ("'", "grey62"),
+            (4, 25): (".", "grey50"),
+        })
+
+    # Firework block (5 rows tall, vertically centered on row 3 of
+    # the gun -> occupies gun rows 1..5).
+    firework_block: Optional[list[str]] = None
+    firework_offset = 0
+    firework_style = ""
+    if key == "recoil":
+        firework_block = _FIREWORK_FRAMES[0]
+        firework_offset = 2
+        firework_style = _FIREWORK_PALETTE[0]
     elif key == "trail":
-        body.append(" ⌬ BLASTER  ▸ FIRING ▸ pew!\n",
-                    style="bold bright_yellow")
-        for line in art:
-            body.append(line + "\n", style="bold yellow")
-        # Firework starburst drifts right + decays through 4 frames.
-        burst = _FIREWORK_DECAY[max(0, decay_idx)]
-        offset = 16 + decay_idx * 2  # off-screen right of the muzzle
-        pad = " " * offset
-        body.append(pad + burst[0] + "\n", style="bold bright_yellow")
-        body.append(pad + burst[1] + "\n", style="bold bright_red")
-        body.append(pad + burst[2] + "\n", style="bold bright_yellow")
-    else:  # puff
-        body.append(" ⌬ BLASTER  venting…\n", style="dim cyan")
-        for line in art:
-            body.append(line + "\n", style="grey62")
-        body.append("\n\n\n", style="dim")
+        idx = max(0, min(decay_idx + 1, len(_FIREWORK_FRAMES) - 1))
+        firework_block = _FIREWORK_FRAMES[idx]
+        firework_offset = 2 + decay_idx * 3
+        firework_style = _FIREWORK_PALETTE[idx]
+
+    GUN_WIDTH = 20
+    fw_start_col = GUN_WIDTH + firework_offset
+
+    # Render each row of the gun + any overlays in its band.
+    for r, row_chars in enumerate(grid):
+        col_cursor = 0
+        # Base art cells (with overlays for cells inside the art).
+        for c, ch in enumerate(row_chars):
+            if (r, c) in overlays:
+                och, ostyle = overlays[(r, c)]
+                body.append(och, style=ostyle)
+            elif ch == " ":
+                body.append(" ")
+            else:
+                body.append(ch, style=gun_style)
+            col_cursor += 1
+        # Overlays right of the art (sparkles, smoke).
+        beyond = sorted(
+            (c, ch, st) for (rr, c), (ch, st) in overlays.items()
+            if rr == r and c >= len(row_chars)
+        )
+        for c, ch, st in beyond:
+            if c > col_cursor:
+                body.append(" " * (c - col_cursor))
+                col_cursor = c
+            body.append(ch, style=st)
+            col_cursor += 1
+        # Firework overlay (only on rows 1..5; row offsets 0..4).
+        if firework_block is not None and 1 <= r <= 5:
+            fw_line = firework_block[r - 1]
+            if fw_line.strip():
+                pad_needed = fw_start_col - col_cursor
+                if pad_needed > 0:
+                    body.append(" " * pad_needed)
+                    col_cursor = fw_start_col
+                body.append(fw_line, style=firework_style)
+        body.append("\n")
+
+    # Pad to a fixed height (1 title + 8 gun + 4 trailing pad lines)
+    # so the layout above doesn't reflow when the animation fires.
+    for _ in range(4):
+        body.append("\n", style="dim")
     return body
 
 
