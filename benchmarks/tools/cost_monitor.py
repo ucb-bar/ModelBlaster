@@ -436,6 +436,85 @@ def _sparkline(values: list[float], width: int = 20) -> str:
     return "".join(out)
 
 
+# ───────────────────── splash screen ─────────────────────
+#
+# Big sci-fi blaster ASCII for the startup splash. Codepage-437-ish
+# shading (`#`/`+`/`-`/`.`) -- the inspiration the user picked from
+# the four reference variants. Plain ASCII so it renders in any
+# terminal regardless of font / locale.
+
+_BLASTER_BIG = r"""
+                                ########+--+########
+                            ###+                    +###
+                         ###                            ###
+                      ###                #                 ##.
+                    -##                  ##                  ##
+          ---      ##                                          ##
+        --.  -                                                  ##
+         -.. .                           -+###.                  .#
+           ###               #######-         #####
+            #### +#  ######. #  #           ##   .+######                  -.
+           ##+#####      ## ## -#          #   ###---## +###            +  - +
+           ###                            #.  #+----#+ ##++##         -
+         ##           ##############      #  #+----+# ###+.###    --.+    -
+        #       #####++ - + # #++--#     #  ##-----#  ##    ##   -- -.+   -.
+     ###    ####++++ +++####### #+-+#    #  #------# ##  -      -.  .-+
+  ## #+#  ##+----#  #+  #    +#   +-+#####  #------# ## .       -.
+ #  .+#  #+------#  ++#########   +------#  #------# ## . ----- -. +-++--+---++
++#  #-#  #-------+# +#  #    +# ##+------#  #------# ## .       -.
+#-  #+#  #--------+ -#  #  #.+# #---######  #------# ##+ ..  ## --  --     +
+ #  .+#+ #+-------- +########## #---#    #  ##-----#. ##    ##   ----   +--++
+  ## #-#  ####-----+           ++--+#     #  #+-----# ########    --
+    #####     -++###################      ##  #+----+# ######                +
+          #####-                           #   ####++##  ##                . -
+               #+#######################+-  +#     .#+##
+               #--------+#     .###-###############-              ##
+              ##--------+  .      ###                            +#
+              #-+#####+-#  .      ##                            ##
+             #+-+     +-+#  .   ###                            ##
+            ##--######++#-######                    +-       .##
+            #--+    +--#                            .       ##
+           #+--+####+-+#                                  ##
+          ##---.   +--#                                ###
+           ##+--+#++--#                             ###
+             #####+--+##   ######             #####.
+                 .####            ###########
+"""
+
+
+def render_splash(console: Console) -> None:
+    """Print the BLASTER splash screen + title block + tagline. Caller
+    decides how long to leave it on screen before transitioning to the
+    live TUI. Skipped automatically when stdout isn't a tty (CI / pipe)
+    or when the user passed --no-splash."""
+    art = Text(_BLASTER_BIG.strip("\n"), style="bright_red")
+    title = Text(
+        "  ███╗   ███╗ ██████╗ ██████╗ ███████╗██╗     \n"
+        "  ████╗ ████║██╔═══██╗██╔══██╗██╔════╝██║     \n"
+        "  ██╔████╔██║██║   ██║██║  ██║█████╗  ██║     \n"
+        "  ██║╚██╔╝██║██║   ██║██║  ██║██╔══╝  ██║     \n"
+        "  ██║ ╚═╝ ██║╚██████╔╝██████╔╝███████╗███████╗\n"
+        "  ╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝\n"
+        "      ██████╗ ██╗      █████╗ ███████╗████████╗███████╗██████╗\n"
+        "      ██╔══██╗██║     ██╔══██╗██╔════╝╚══██╔══╝██╔════╝██╔══██╗\n"
+        "      ██████╔╝██║     ███████║███████╗   ██║   █████╗  ██████╔╝\n"
+        "      ██╔══██╗██║     ██╔══██║╚════██║   ██║   ██╔══╝  ██╔══██╗\n"
+        "      ██████╔╝███████╗██║  ██║███████║   ██║   ███████╗██║  ██║\n"
+        "      ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝\n",
+        style="bold bright_cyan",
+    )
+    tagline = Text("live LLM cost monitor   •   sessions   •   "
+                   "per-kernel + per-model spend",
+                   style="dim italic")
+    console.clear()
+    console.print()
+    console.print(Align.center(title))
+    console.print(Align.center(art))
+    console.print()
+    console.print(Align.center(tagline))
+    console.print()
+
+
 # ───────────────────── mascot: 🔫 BLASTER the blaster ─────────────────────
 #
 # Tiny 3-line ASCII blaster pinned to the top-right corner. Idle most
@@ -476,41 +555,94 @@ _BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
 # Whichever frame is rendered, the silhouette stays 3 lines tall + the
 # same column count so the surrounding layout doesn't twitch.
 
+# Chunky retro ray-gun silhouette modeled on the reference image:
+#   • Big round CHAMBER on the left with an embedded chip (▣) and
+#     a power orb (◉).
+#   • Tapered BARREL+NOZZLE narrowing toward the muzzle on the right.
+#   • Angled GRIP hanging down-and-back from the bottom of the
+#     chamber (the diagonal "\\\\" lines).
+#   • Trigger sits in the notch between the chamber and the grip.
+#
+# 6 lines tall, same width across all phases so the layout above
+# doesn't twitch when the animation fires. The muzzle character +
+# the chip char are what change between idle / charging / firing.
+
 _BLASTER_FRAMES = {
-    # Idle: dim outline, no glow. Power cell visible.
+    # IDLE: chamber dim, chip off (·), nothing at the muzzle.
     "idle": [
-        "  ╔═══╦═════╕",
-        "  ║▒▒▒║──── ·",
-        "   `═╧╗_ ",
+        "     ╭─────╮",
+        "    ╱ ┌───┐ ╲╮",
+        "   │  │ ◉ │  ╞════ ·",
+        "    ╲ └───┘ ╱╯",
+        "     ╰┬───┬╯",
+        "      ╲___╲",
     ],
-    # Charging: power cell pulses ▓, muzzle tightens to ◆.
+    # CHARGING: chip lights (▣), chamber housing pulses bright cyan,
+    # muzzle ramps to a focus char (◆) as the orb spins up.
     "charge": [
-        "  ╔═══╦═════╕",
-        "  ║▓▓▓║════ ◆",
-        "   `═╧╗_ ",
+        "     ╭─────╮",
+        "    ╱ ┌───┐ ╲╮",
+        "   │  │ ▣ │  ╞════ ◆",
+        "    ╲ └───┘ ╱╯",
+        "     ╰┬───┬╯",
+        "      ╲___╲",
     ],
-    # Muzzle flash: starburst right at the muzzle tip. The `-= o =-`
-    # signature borrowed straight from the sci-fi art inspiration.
+    # RECOIL: starburst right at the muzzle tip + chip stays lit.
     "recoil": [
-        "  ╔═══╦═════╕  \\   /",
-        "  ║▓▓▓║═════►-= o =-",
-        "   `═╧╗_       /   \\",
+        "     ╭─────╮      \\   /",
+        "    ╱ ┌───┐ ╲╮     ╲ /",
+        "   │  │ ▣ │  ╞═══►-= ◉ =-",
+        "    ╲ └───┘ ╱╯     ╱ \\",
+        "     ╰┬───┬╯      /   \\",
+        "      ╲___╲",
     ],
-    # Trail: starburst has drifted right, fading into sparkles.
-    # The actual sparkles are positioned dynamically below via the
-    # projectile string so the trail can move further on each frame.
+    # TRAIL: chamber settles back to orb (◉), muzzle still emitting.
+    # The circuit-style trail bolt is rendered dynamically below the
+    # gun (see _mascot_render trail branch).
     "trail": [
-        "  ╔═══╦═════╕",
-        "  ║▒▒▒║═════►",
-        "   `═╧╗_ ",
+        "     ╭─────╮",
+        "    ╱ ┌───┐ ╲╮",
+        "   │  │ ◉ │  ╞═══►",
+        "    ╲ └───┘ ╱╯",
+        "     ╰┬───┬╯",
+        "      ╲___╲",
     ],
-    # Aftermath: vent puff (° rises above barrel) + lingering ' .
+    # PUFF: vent smoke (°) above the chamber, lingering sparkles
+    # trailing right of the muzzle as the system cools.
     "puff": [
-        "  ╔═══╦═════╕ °",
-        "  ║▒▒▒║──── °  '",
-        "   `═╧╗_      .",
+        "     ╭─────╮  °",
+        "    ╱ ┌───┐ ╲╮  '",
+        "   │  │ ◉ │  ╞── .",
+        "    ╲ └───┘ ╱╯",
+        "     ╰┬───┬╯",
+        "      ╲___╲",
     ],
 }
+
+
+# Circuit-pattern bolts mimicking the green branching laser in the
+# reference image. Replaces the older `\ / -= o =- / \` starburst
+# during the trail frames -- the starburst is now reserved for the
+# recoil muzzle flash. Each entry is (top, mid, bottom) drawn below
+# the gun, drifting further right + fading each frame.
+_CIRCUIT_DECAY = [
+    # Fresh: thick branching bolt with multiple paths.
+    ("╭─┬─╮  •",
+     "─┤ ├─┴──•",
+     "╰─┴─╯  •"),
+    # Decaying: thinner, fewer branches.
+    ("─┐",
+     "─┴──•",
+     "─┘"),
+    # Sparse: lone dots remain.
+    ("",
+     " •  •",
+     ""),
+    # Empty: trail is gone.
+    ("",
+     "",
+     ""),
+]
 
 
 # Starburst variants used for the moving projectile, in decay order
@@ -554,64 +686,60 @@ def _blaster_frame_for(frame: int) -> tuple[str, int]:
     return "puff", -1
 
 
-def _mascot_panel(state: WatcherState) -> Panel:
-    """The blaster mascot panel. Always 5 lines tall so the layout
-    above doesn't reflow when the trail starburst extends below the
-    barrel.
+def _mascot_render(state: WatcherState) -> Group:
+    """Render the BLASTER mascot as RAW art (no panel border) so it
+    sits cleanly in the top-right corner without competing with the
+    spend panel's heavy box. One small caption line above the gun
+    indicates state (standby / charging / firing / venting).
 
     Color palette is sci-fi: cyan power cell housing, orange muzzle
-    glow on recoil, bright red starburst on trail frames, grey vent
-    smoke on puff. The trail frames overlay the starburst from
-    _STARBURST_DECAY drifting right + fading."""
+    glow on recoil, bright red starburst on firing frames, grey vent
+    smoke on puff. Total height is fixed at 8 lines (caption + 4
+    gun + 3 trail-or-pad) so the layout above doesn't reflow."""
     key, decay_idx = _blaster_frame_for(state.blaster_anim_frame)
     art = _BLASTER_FRAMES[key]
     body = Text()
+
     if key == "idle":
+        body.append(" ⌬ BLASTER  standby\n", style="dim cyan")
         for line in art:
             body.append(line + "\n", style="cyan")
-        body.append("\n\n", style="dim")  # pad to fixed height
-        title = "[dim cyan]⌬ BLASTER  standby[/dim cyan]"
-        border = "cyan"
+        body.append("\n\n\n", style="dim")  # pad to fixed height
     elif key == "charge":
+        body.append(" ⌬ BLASTER  charging…\n",
+                    style="bold bright_cyan")
         for line in art:
-            colored = line.replace("▓▓▓",
-                                   "[bold bright_cyan]▓▓▓[/bold bright_cyan]")
+            colored = line.replace("▓▓▓▓▓▓▓▓▓",
+                                   "[bold bright_cyan]"
+                                   "▓▓▓▓▓▓▓▓▓"
+                                   "[/bold bright_cyan]")
             body.append(Text.from_markup(colored, style="cyan"))
             body.append("\n")
-        body.append("\n\n", style="dim")
-        title = "[bold bright_cyan]⌬ BLASTER  charging…[/bold bright_cyan]"
-        border = "bright_cyan"
+        body.append("\n\n\n", style="dim")
     elif key == "recoil":
-        # Recoil frame -- starburst already embedded in the art lines.
+        body.append(" ⌬ BLASTER  ▸ NEW KERNEL\n", style="bold yellow")
         for line in art:
             body.append(line + "\n", style="bold yellow")
-        body.append("\n\n", style="dim")
-        title = "[bold yellow]⌬ BLASTER  ▸ NEW KERNEL[/bold yellow]"
-        border = "yellow"
+        body.append("\n\n\n", style="dim")
     elif key == "trail":
-        # 3 lines of blaster + 3 lines of drifting starburst below.
-        # Total = 6 lines but we crop to 5 for layout consistency
-        # by overlaying the top starburst line on the blaster's last
-        # row (the grip line gets the starburst's leading char).
+        body.append(" ⌬ BLASTER  ▸ FIRING ▸ pew!\n",
+                    style="bold bright_yellow")
         for line in art:
-            body.append(line + "\n", style="bold red")
-        burst = _STARBURST_DECAY[max(0, decay_idx)]
-        # Offset the starburst to the right of the muzzle and further
-        # each frame so it visibly drifts.
-        offset = 6 + decay_idx * 3
+            body.append(line + "\n", style="bold yellow")
+        # Circuit-pattern laser bolt drifts right + decays. Mimics
+        # the branching green laser in the reference image.
+        bolt = _CIRCUIT_DECAY[max(0, decay_idx)]
+        offset = 16 + decay_idx * 2  # off-screen right of the muzzle
         pad = " " * offset
-        body.append(pad + burst[0] + "\n", style="bold bright_red")
-        body.append(pad + burst[1] + "\n", style="bold bright_yellow")
-        title = "[bold bright_red]⌬ BLASTER  ▸ FIRING ▸ pew![/bold bright_red]"
-        border = "bright_red"
+        body.append(pad + bolt[0] + "\n", style="bold bright_green")
+        body.append(pad + bolt[1] + "\n", style="bold green")
+        body.append(pad + bolt[2] + "\n", style="bold bright_green")
     else:  # puff
+        body.append(" ⌬ BLASTER  venting…\n", style="dim cyan")
         for line in art:
             body.append(line + "\n", style="grey62")
-        body.append("\n\n", style="dim")
-        title = "[dim cyan]⌬ BLASTER  venting…[/dim cyan]"
-        border = "grey50"
-    return Panel(body, title=title, border_style=border, box=ROUNDED,
-                 padding=(0, 1), width=28)
+        body.append("\n\n\n", style="dim")
+    return body
 
 
 # ───────────────────── rendering ─────────────────────
@@ -968,7 +1096,7 @@ def render(state: WatcherState, ledger: SessionLedger,
     top_row.add_column(width=30, justify="right")
     top_row.add_row(
         _summary_panel(state, ledger, windows, budget_usd),
-        _mascot_panel(state),
+        _mascot_render(state),
     )
 
     parts: list = [top_row]
@@ -1049,6 +1177,15 @@ def cmd_live(args) -> int:
     state = WatcherState()
     console = Console()
     poll_interval = 1.0 / max(args.refresh_hz, 0.1)
+
+    # Startup splash: big ASCII blaster + ModelBlaster banner. Skipped
+    # automatically when stdout isn't a tty (CI / pipes / no-tty
+    # subprocesses) or when --no-splash is passed.
+    if (not args.no_splash) and sys.stdout.isatty():
+        render_splash(console)
+        # 1.5s is enough to read the title without delaying real work.
+        time.sleep(1.5)
+        console.clear()
 
     def _files() -> list[Path]:
         if args.paths:
@@ -1337,6 +1474,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                       help="recent calls visible (default: 15)")
     live.add_argument("--budget-usd", type=float, default=None,
                       help="visual budget alarm threshold")
+    live.add_argument("--no-splash", action="store_true",
+                      help="skip the startup BLASTER splash screen")
 
     # session start / end / list
     sess = sub.add_parser("session", help="manage named sessions")
