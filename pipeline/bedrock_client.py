@@ -22,7 +22,7 @@ import requests
 _TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
-DEFAULT_MODEL = "us.meta.llama4-maverick-17b-instruct-v1:0"
+DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 DEFAULT_REGION = "us-east-1"
 
 # Models that Bedrock only serves through cross-region inference profiles
