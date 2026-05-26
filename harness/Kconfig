@@ -1,0 +1,36 @@
+# Application-level Kconfig for the ModelBlaster harness.
+#
+# Zephyr picks this up automatically when APPLICATION_SOURCE_DIR is this
+# directory (see ZEPHYR/cmake/modules/kconfig.cmake L48-50). We use it to
+# declare any project-local Kconfig symbols that aren't in the upstream
+# Zephyr tree the workspace happens to ship, then source the standard
+# Zephyr Kconfig so the rest of the build pulls in everything else.
+
+# ---- ModelBlaster-local symbols ----
+
+config RISCV_V_KERNEL_ONLY
+	bool "Restrict V codegen to kernel files only"
+	depends on RISCV_ISA_EXT_V
+	default n
+	help
+	  Restrict V codegen to kernel files + arch/riscv/core/v.c only.
+	  Without this, GCC auto-vectorizes struct-init/memset in vprintk,
+	  libc, micro-ROS, broker, etc. via fractional-LMUL vector stores
+	  — which on multi-hart Saturn FireSim makes scalar code paths
+	  interrupt-corruptible (mid-V instruction preemption can clobber
+	  scalar regs). We want V live ONLY inside the generated kernel
+	  functions, where preemption is masked already (run_graph_b's
+	  irq mask path).
+
+	  Not required on single-hart spike runs (no preemption) but
+	  must be y for FireSim multi-hart Saturn.
+
+	  The actual enforcement (V codegen restriction) is opt-in: enabling
+	  this symbol declares the intent and the build system / make rules
+	  add -fno-tree-vectorize to the non-kernel TUs in the appropriate
+	  passes. Upstream Zephyr doesn't have this option yet; tracked
+	  under tmp/07_gotchas.md #9.
+
+# ---- pull in standard Zephyr Kconfig ----
+
+source "Kconfig.zephyr"
