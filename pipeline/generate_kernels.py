@@ -1192,9 +1192,19 @@ def generate(
         # exists at <global_curated_dir>/<target>/<backend>_<op>_<algo>.c
         # and swap in the curated source instead of the scalar reference.
         # First-found-wins (algorithms are queue-ordered by target_affinity
-        # in spec.algorithms). No verify pass here — that's a deliberate
-        # tradeoff for the no-LLM path; the spike/firesim run downstream
-        # will catch correctness regressions just like a normal verify.
+        # in spec.algorithms).
+        #
+        # Per-kernel verification: when MODELBLASTER_CURATED_VERIFY=1 (the
+        # default) and the surrounding harness is wired (build_dir / repo_root
+        # / harness_dir / io_path present), we call _verify on each curated
+        # source against the spec's extra_shapes BEFORE accepting the swap.
+        # If verify fails, fall back to spec.reference_impl with a warning
+        # so the e2e build proceeds. Set MODELBLASTER_CURATED_VERIFY=0 to
+        # skip (one extra spike build per curated kernel takes ~10-30s).
+        curated_verify = (
+            os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
+            and needs_harness_paths
+        )
         if global_curated_dir is not None:
             for spec in specs:
                 for algorithm in spec.algorithms:
@@ -1204,16 +1214,50 @@ def generate(
                     curated_path = os.path.join(
                         global_curated_dir, target.name, filename
                     )
-                    if os.path.exists(curated_path):
-                        log(f"  [{spec.op}/{algorithm.name}] reference + "
-                            f"curated swap from {curated_path}")
-                        impls[spec.op] = open(curated_path).read()
+                    if not os.path.exists(curated_path):
+                        continue
+                    curated_src = open(curated_path).read()
+                    log(f"  [{spec.op}/{algorithm.name}] reference + "
+                        f"curated swap from {curated_path}")
+                    accepted = True
+                    if curated_verify:
+                        shapes = collect_shapes(ir, spec.op, spec)
+                        log(f"  [{spec.op}/{algorithm.name}] verify curated "
+                            f"at {len(shapes)} shape(s) vs reference_impl")
+                        try:
+                            vres = _verify(
+                                spec, curated_src, shapes,
+                                backend=target, impls=impls, specs=specs,
+                                repo_root=repo_root, model_dir=out_dir,
+                                build_dir=build_dir,
+                                harness_dir=harness_dir, io_path=io_path,
+                                algorithm_name=algorithm.name,
+                            )
+                        except Exception as e:
+                            log(f"  [{spec.op}/{algorithm.name}] curated "
+                                f"verify raised {type(e).__name__}: {e}; "
+                                f"falling back to reference_impl")
+                            accepted = False
+                            vres = None
+                        if vres is not None and not vres.ok:
+                            log(f"  [{spec.op}/{algorithm.name}] curated "
+                                f"verify FAIL — {vres.message}; "
+                                f"falling back to reference_impl")
+                            accepted = False
+                        elif vres is not None:
+                            log(f"  [{spec.op}/{algorithm.name}] curated "
+                                f"verify PASS — {vres.message}")
+                    if accepted:
+                        impls[spec.op] = curated_src
                         kernel_picks[spec.op] = {
                             "source": "curated",
                             "algorithm": algorithm.name,
                             "path": curated_path,
                         }
-                        break
+                        break  # first-accepted-wins; try next spec
+                    # If verify failed, continue to next algorithm; if
+                    # all algorithms fail, kernel_picks keeps the original
+                    # "reference" entry and impls keeps reference_impl.
     elif backend_name == "llm":
         # Lazy proxy: the LLM client is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
