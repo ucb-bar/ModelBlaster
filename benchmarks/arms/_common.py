@@ -435,6 +435,15 @@ def finalize(
 ) -> int:
     """Write run.json, swing the latest symlink, return an exit code
     suitable for the driver's main()."""
+    # Pop the override so it doesn't land as an extra field in run.json
+    # (we use it to set exit_status instead).
+    override = None
+    if extra_run_json and "exit_status_override" in extra_run_json:
+        override = extra_run_json.pop("exit_status_override")
+    exit_status = override or (
+        "ok" if outcome.returncode == 0
+        else f"exit_{outcome.returncode}"
+    )
     write_run_json(
         outcome.out_dir,
         arm=arm,
@@ -444,8 +453,7 @@ def finalize(
         ended_at=outcome.ended_at,
         wall_clock_s=outcome.wall_clock_s,
         peak_rss_mb=outcome.peak_rss_mb,
-        exit_status=("ok" if outcome.returncode == 0
-                     else f"exit_{outcome.returncode}"),
+        exit_status=exit_status,
         extra=extra_run_json,
     )
     update_latest_symlink(outcome.out_dir)

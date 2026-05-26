@@ -277,11 +277,32 @@ def _fmt_short_ts(ts: str) -> str:
         return ts[-8:] if len(ts) >= 8 else ts
 
 
-def _summary_panel(state: WatcherState, watching: int) -> Panel:
+def _budget_style(frac: float, cost_known: bool) -> tuple[str, str]:
+    """Return (hero_style, border_style) for a budget fraction.
+    Thresholds: <50% green, 50-80% yellow, 80-100% bright_yellow,
+    >=100% red. Unknown-cost falls back to plain yellow regardless."""
+    if not cost_known:
+        return "bold yellow", "yellow"
+    if frac >= 1.0:
+        return "bold red", "red"
+    if frac >= 0.8:
+        return "bold yellow", "yellow"
+    if frac >= 0.5:
+        return "bold yellow", "yellow"
+    return "bold green", "green"
+
+
+def _summary_panel(state: WatcherState, watching: int,
+                   budget_usd: Optional[float] = None) -> Panel:
     """Big-total summary. The default view's job is to make the running
     $ spend the focal point at any terminal size, so the dollar amount
     gets a dedicated centered line in bold green and the supporting
-    counters live as a single subtitle line beneath it."""
+    counters live as a single subtitle line beneath it.
+
+    When `budget_usd` is set, the hero recolors as a soft alarm
+    (green / yellow / red as the running spend crosses 50% / 80% /
+    100% of budget) and a "BUDGET: $X / $Y (Z%)" line is added.
+    The terminal bell rings once on the first 100% crossing."""
     total_cost = 0.0
     cost_known = True
     total_in_uncached = 0
@@ -297,11 +318,19 @@ def _summary_panel(state: WatcherState, watching: int) -> Panel:
     elapsed = max(time.time() - state.started_at, 0.001)
     rate = state.total_calls / elapsed * 60.0  # calls/min
 
+    # Resolve hero color via budget threshold (or default green/yellow).
+    if budget_usd is not None and budget_usd > 0 and cost_known:
+        frac = total_cost / budget_usd
+        hero_style, border_style = _budget_style(frac, cost_known)
+    else:
+        frac = None
+        hero_style = "bold green" if cost_known else "bold yellow"
+        border_style = "green" if cost_known else "yellow"
+
     # Hero line: the running spend, centered, oversized via bold + padding.
     spend_text = _fmt_usd(total_cost)
     if not cost_known:
         spend_text += "+"   # the "+" hints that some models lack rates
-    hero_style = "bold green" if cost_known else "bold yellow"
     hero = Text(f"  {spend_text}  ", style=hero_style)
 
     # Subtitle line(s): everything else, dim but readable.
@@ -318,13 +347,26 @@ def _summary_panel(state: WatcherState, watching: int) -> Panel:
     sub.append(f"  •  watching {watching} file{'s' if watching != 1 else ''}",
                style="dim")
 
-    body = Group(
+    parts = [
         Text(""),
         Align.center(hero),
         Text(""),
         Align.center(sub),
-        Text(""),
-    )
+    ]
+    if frac is not None:
+        # Render budget line with explicit color matching the hero.
+        bar = Text(justify="center")
+        bar.append("BUDGET ", style="dim")
+        bar.append(_fmt_usd(total_cost), style=hero_style)
+        bar.append(" / ", style="dim")
+        bar.append(_fmt_usd(budget_usd), style="bold")
+        bar.append(f"   ({frac * 100:.1f}%)", style=hero_style)
+        if frac >= 1.0:
+            bar.append("   OVER BUDGET", style="bold red blink")
+        parts.append(Text(""))
+        parts.append(Align.center(bar))
+    parts.append(Text(""))
+    body = Group(*parts)
     if state.unknown_cost_models:
         warn = Text(
             f"Pricing missing for: {', '.join(sorted(state.unknown_cost_models))}",
@@ -332,10 +374,13 @@ def _summary_panel(state: WatcherState, watching: int) -> Panel:
         )
         body = Group(body, Align.center(warn), Text(""))
 
-    title = "[bold]LLM SPEND[/bold]" if cost_known \
-        else "[bold yellow]LLM SPEND  (rates incomplete)[/bold yellow]"
-    return Panel(body, title=title, border_style="green" if cost_known
-                 else "yellow", padding=(0, 1))
+    if frac is not None and frac >= 1.0:
+        title = "[bold red]LLM SPEND  (OVER BUDGET)[/bold red]"
+    elif not cost_known:
+        title = "[bold yellow]LLM SPEND  (rates incomplete)[/bold yellow]"
+    else:
+        title = "[bold]LLM SPEND[/bold]"
+    return Panel(body, title=title, border_style=border_style, padding=(0, 1))
 
 
 def _per_model_table(state: WatcherState) -> Table:
@@ -394,9 +439,10 @@ def _recent_table(state: WatcherState) -> Table:
     return table
 
 
-def render(state: WatcherState, watching: int) -> Group:
+def render(state: WatcherState, watching: int,
+           budget_usd: Optional[float] = None) -> Group:
     return Group(
-        _summary_panel(state, watching),
+        _summary_panel(state, watching, budget_usd=budget_usd),
         _per_model_table(state),
         _recent_table(state),
     )
@@ -419,6 +465,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="redraw + file-poll rate in Hz (default: 4)")
     ap.add_argument("--max-recent", type=int, default=12,
                     help="max recent calls to keep on screen (default: 12)")
+    ap.add_argument("--budget-usd", type=float, default=None,
+                    metavar="N",
+                    help="visual budget alarm: hero turns yellow at 50%%, "
+                         "bright yellow at 80%%, red at 100%%, and the "
+                         "terminal bell rings once on the first crossing. "
+                         "Purely visual -- does NOT stop the run (use "
+                         "--max-usd on the arm driver for a hard kill).")
     args = ap.parse_args(argv)
 
     if not args.pricing.exists():
@@ -440,19 +493,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     files = _files()
     poll_files(files, state, pricing, args.max_recent)
 
+    bell_rung = False  # ring the terminal bell once on first 100% crossing
+
     try:
-        with Live(render(state, len(files)),
+        with Live(render(state, len(files), budget_usd=args.budget_usd),
                   console=console,
                   refresh_per_second=args.refresh_hz,
                   screen=False) as live:
             while True:
                 files = _files()
                 poll_files(files, state, pricing, args.max_recent)
-                live.update(render(state, len(files)))
+                # Budget alarm: ring bell on the transition into >=100%.
+                if args.budget_usd is not None and not bell_rung:
+                    total = sum(t.cost_usd for t in state.by_model.values())
+                    if total >= args.budget_usd:
+                        console.bell()
+                        bell_rung = True
+                live.update(render(state, len(files),
+                                    budget_usd=args.budget_usd))
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         # Clean exit; one final dump so the user keeps the totals.
-        console.print(render(state, len(files)))
+        console.print(render(state, len(files), budget_usd=args.budget_usd))
         console.print(
             f"\nTotal: {_fmt_usd(sum(t.cost_usd for t in state.by_model.values()))} "
             f"across {state.total_calls} call(s).",
