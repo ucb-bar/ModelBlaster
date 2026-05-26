@@ -133,10 +133,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         calls_log, run_dir / "llm_tokens.json", provider=PROVIDER,
     )
 
-    # Budget trip: bedrock_client writes a MODELBLASTER_BUDGET_EXCEEDED
-    # line to stderr right before raising. Detect that here and override
-    # the run.json exit_status so the dashboard can flag the cell
-    # distinctly from a generic run failure.
     extra: dict[str, Any] = {
         "beam": args.beam,
         "expansions": args.expansions,
@@ -146,30 +142,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
     if args.max_usd is not None:
         extra["max_usd"] = args.max_usd
-    budget_tripped = False
-    stderr_path = run_dir / "stderr.log"
-    if stderr_path.exists():
-        for line in stderr_path.read_text().splitlines():
-            if line.startswith("MODELBLASTER_BUDGET_EXCEEDED:"):
-                budget_tripped = True
-                extra["budget_trip_marker"] = line
-                break
-    if budget_tripped:
-        # Forcefully relabel the outcome so finalize() writes the
-        # right exit_status. The subprocess will have exited non-zero
-        # (BudgetExceeded propagated through run.sh as a Python
-        # exception -> non-zero exit) but "budget_exceeded" is the
-        # more useful label than "exit_1".
-        outcome = _common.RunOutcome(
-            out_dir=outcome.out_dir,
-            returncode=outcome.returncode,
-            started_at=outcome.started_at,
-            ended_at=outcome.ended_at,
-            wall_clock_s=outcome.wall_clock_s,
-            peak_rss_mb=outcome.peak_rss_mb,
-        )
-        extra["exit_status_override"] = "budget_exceeded"
-
+    # Shared budget-trip detector: scans stderr.log for the
+    # MODELBLASTER_BUDGET_EXCEEDED marker the BudgetTracker writes
+    # when the cap is crossed, and arms exit_status_override on extra.
+    budget_tripped = _common.detect_budget_trip(run_dir, extra)
     rc = _common.finalize(
         outcome, arm=ARM_ID, workload=workload, run_id=run_id,
         extra_run_json=extra,

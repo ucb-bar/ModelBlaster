@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from modelblaster.benchmarks.arms import _common
 
@@ -33,6 +33,7 @@ def _build_env(
     iterations: int,
     firesim_eval: bool,
     calls_log_path,
+    max_usd: Optional[float] = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["MODEL_NAME"] = workload.model
@@ -49,6 +50,11 @@ def _build_env(
     if firesim_eval:
         env["FIRESIM_EVAL"] = "1"
     env["GEMINI_CALLS_LOG"] = str(calls_log_path)
+    # Hard budget cap, plumbed via env so gemini_client picks it up.
+    # gemini_client raises BudgetExceeded once cumulative spend
+    # crosses the cap; arm driver detects via stderr marker below.
+    if max_usd is not None:
+        env["MODELBLASTER_MAX_USD"] = str(max_usd)
     return env
 
 
@@ -76,6 +82,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--no-firesim-eval", action="store_true",
                     help="suppress FIRESIM_EVAL=1 even when the workload "
                          "would normally request it")
+    ap.add_argument("--max-usd", type=float, default=None,
+                    metavar="N",
+                    help="hard kill: gemini_client stops calling once "
+                         "cumulative spend >= N USD. Writes "
+                         "exit_status=budget_exceeded to run.json.")
     args = ap.parse_args(argv)
 
     workload = _common.load_workload(args.workload)
@@ -105,6 +116,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         workload, beam=args.beam, expansions=args.expansions,
         iterations=args.iterations, firesim_eval=firesim_eval,
         calls_log_path=calls_log,
+        max_usd=args.max_usd,
     )
 
     outcome = _common.execute_run_sh(
@@ -115,17 +127,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         calls_log, run_dir / "llm_tokens.json", provider=PROVIDER,
     )
 
-    return _common.finalize(
+    extra: dict[str, Any] = {
+        "beam": args.beam,
+        "expansions": args.expansions,
+        "iterations": args.iterations,
+        "firesim_eval": firesim_eval,
+        "llm_provider": PROVIDER,
+        "gemini_model": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+    }
+    if args.max_usd is not None:
+        extra["max_usd"] = args.max_usd
+    budget_tripped = _common.detect_budget_trip(run_dir, extra)
+
+    rc = _common.finalize(
         outcome, arm=ARM_ID, workload=workload, run_id=run_id,
-        extra_run_json={
-            "beam": args.beam,
-            "expansions": args.expansions,
-            "iterations": args.iterations,
-            "firesim_eval": firesim_eval,
-            "llm_provider": PROVIDER,
-            "gemini_model": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-        },
+        extra_run_json=extra,
     )
+    return 2 if budget_tripped else rc
 
 
 if __name__ == "__main__":

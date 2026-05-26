@@ -36,6 +36,25 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 export PATH="/usr/bin:${PATH}"
 
+# Per-stage timing markers. Mirrors the helper in examples/_run_lib.sh
+# so hetero workloads (which dispatch through this runner) emit the
+# same MODELBLASTER_STAGE_BEGIN/END events the arm driver's stdout
+# parser already understands. Without this, hetero cells had
+# extract_s / generate_kernels_s / build_s / run_s all null in the
+# dashboard.
+_MB_STAGE_T=0
+_mb_stage_begin() {
+    _MB_STAGE_T="$(date +%s.%N)"
+    echo "MODELBLASTER_STAGE_BEGIN:$1"
+}
+_mb_stage_end() {
+    local end="$(date +%s.%N)"
+    local delta
+    delta=$(awk -v a="${_MB_STAGE_T}" -v b="${end}" \
+            'BEGIN{printf "%.3f", b-a}')
+    echo "MODELBLASTER_STAGE_END:$1:${delta}"
+}
+
 SCHEDULE_JSON="${SCHEDULE_JSON:-/scratch2/dima/misc_sw/FreshScheduler/schedules/scheduled_networks_mlp_dronet_profile_zephyr_profiled.json}"
 MODELS="${MODELS:-dronet,mlp_control}"
 REGISTRY="${REGISTRY:-${REPO_ROOT}/cores/chipyard_hetero_example.json}"
@@ -133,6 +152,15 @@ for idx in "${!MODEL_LIST[@]}"; do
 done
 
 # 1) Ingest the schedule into a C dispatch table.
+# Hetero workloads have no distinct extract/skeleton stages here --
+# the per-model run.sh invocations at the top of the file already
+# emitted those for each (model, backend) pair. So the hetero
+# pipeline only meaningfully measures ingest + generate_kernels (as
+# one "generate_kernels" bucket for symmetry with the single-target
+# stage taxonomy) + build + run. The arm driver tolerates missing
+# stages (records null) so we don't need to backfill extract /
+# generate_skeleton from here.
+_mb_stage_begin generate_kernels
 echo "[xpurt] ingest schedule"
 SCHED_C="${GEN_DIR}/${SCHED_NAME}.c"
 SCHED_H="${GEN_DIR}/${SCHED_NAME}.h"
@@ -159,6 +187,8 @@ python -m modelblaster.pipeline.generate_xpurt_main \
     --registry "${REGISTRY}"
 
 # 3) west build harness_xpurt with the generated sources + all backends.
+_mb_stage_end generate_kernels
+_mb_stage_begin build
 echo "[xpurt] west build (BACKENDS=${BACKENDS}, pool=${MODELBLASTER_POOL_THREADS})"
 WEST_CMAKE_ARGS=(
     "-DMODEL_BACKENDS=${BACKENDS}"
@@ -235,6 +265,8 @@ west build -p -b "${BOARD_TARGET}" harness_xpurt \
 #    the simulator's --isa covers whichever backend the schedule routes a
 #    given dispatch to. FireSim: hardware is fixed (RVV-capable rocket),
 #    so just hand the elf to firesim_runner.
+_mb_stage_end build
+_mb_stage_begin run
 echo "[xpurt] ${RUNNER} + verify"
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "
@@ -328,3 +360,4 @@ else
         --quant "${QUANT}" \
         "${FIRESIM_FLAGS[@]}"
 fi
+_mb_stage_end run
