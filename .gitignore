@@ -19,3 +19,10 @@ examples/*/cache/
 runtime/modelblaster_pool/test_app/build/
 
 tmp/
+
+# Secrets. The repo's bedrock/gemini/HF clients read tokens from
+# environment variables; the .env file is sourced by `set -a; . .env;
+# set +a` (or equivalent) at the start of any run. Never commit.
+.env
+.env.*
+!.env.example
