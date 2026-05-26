@@ -227,7 +227,7 @@ WEST_BUILD_EXTRA+=(
     -DEXTRA_CONF_FILE="${EXTRA_CONF}"
 )
 
-west build -p -b "${BOARD_TARGET}" modelblaster/harness_xpurt \
+west build -p -b "${BOARD_TARGET}" harness_xpurt \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
