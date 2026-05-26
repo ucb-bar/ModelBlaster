@@ -52,6 +52,7 @@ import yaml
 from rich.align import Align
 from rich.box import DOUBLE, HEAVY, ROUNDED
 from rich.console import Console, Group
+from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
@@ -201,14 +202,98 @@ def discover_jsonls(root: Path) -> list[Path]:
     return sorted(root.rglob("llm_calls.jsonl"))
 
 
+def discover_claude_code_sessions(cwd: Optional[Path] = None
+                                  ) -> list[Path]:
+    """Find Claude Code session JSONLs scoped to ``cwd`` (default:
+    current working directory). Claude Code stores its conversation
+    logs at ``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl``
+    where the encoded path replaces ``/`` with ``-``. Returns an
+    empty list when Claude Code hasn't created any sessions for this
+    project. Files in that directory are typically only readable by
+    the user (mode 600); we let the caller surface permission
+    errors via the normal poll path."""
+    here = (cwd or Path.cwd()).resolve()
+    # Encoding matches Claude Code: leading '-' + path parts joined by '-'.
+    encoded = "-" + "-".join(here.parts[1:])
+    home = Path.home()
+    session_dir = home / ".claude" / "projects" / encoded
+    if not session_dir.exists():
+        return []
+    return sorted(session_dir.glob("*.jsonl"))
+
+
 def derive_cell_label(path: Path) -> str:
+    """Compact label for the recent-calls table. For Claude Code
+    session JSONLs (which live outside benchmarks/results/), label as
+    ``claude-code/<uuid-prefix>`` so they're distinguishable from
+    benchmark cells."""
     parts = path.parts
     if "results" in parts:
         i = parts.index("results")
         tail = parts[i + 1: -1]
         if tail:
             return "/".join(tail[-3:])
+    if ".claude" in parts and "projects" in parts:
+        return f"claude-code/{path.stem[:8]}"
     return path.parent.name
+
+
+def _normalize_record(rec: dict) -> Optional[dict]:
+    """Return a record in our canonical ``llm_calls.jsonl`` shape, or
+    None if the source record has no token usage we can attribute.
+
+    Handles two source schemas:
+
+    1. ``llm_calls.jsonl`` (our format, written by bedrock_client /
+       gemini_client / claude_code_client). Top-level keys include
+       ``model_id``, ``input_tokens``, ``output_tokens``, etc.
+    2. Claude Code session JSONL (``~/.claude/projects/<enc>/*.jsonl``).
+       Token usage lives on records where ``type == "assistant"`` in
+       ``message.usage.{input_tokens, output_tokens,
+       cache_read_input_tokens, cache_creation_input_tokens}``. The
+       model id is at ``message.model``; the timestamp at
+       ``timestamp``; the request id at ``requestId``. Non-assistant
+       records (user messages, snapshots, permission events) are
+       skipped (None return).
+    """
+    # Our own ``llm_calls.jsonl`` shape -- pass through.
+    if "model_id" in rec and (
+        "input_tokens" in rec or "output_tokens" in rec
+    ):
+        return rec
+    # Claude Code session record.
+    if rec.get("type") == "assistant":
+        msg = rec.get("message") or {}
+        usage = msg.get("usage") if isinstance(msg, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        # Skip records with zero useful usage (occurs on cache-only
+        # iterations Claude Code logs for housekeeping).
+        if not any(usage.get(k) for k in (
+            "input_tokens", "output_tokens",
+            "cache_read_input_tokens", "cache_creation_input_tokens",
+        )):
+            return None
+        return {
+            "ts": rec.get("timestamp", ""),
+            "provider": "claude_code",
+            "model_id": msg.get("model") or "unknown",
+            "request_id": rec.get("requestId"),
+            "phase": None,   # no per-kernel attribution for prompts
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "cache_read_input_tokens": int(
+                usage.get("cache_read_input_tokens", 0) or 0
+            ),
+            # Claude Code uses `cache_creation_input_tokens`; our
+            # internal field is `cache_write_input_tokens`. Same
+            # semantics, both billed at the cache-write rate.
+            "cache_write_input_tokens": int(
+                usage.get("cache_creation_input_tokens", 0) or 0
+            ),
+            "stop_reason": "",
+        }
+    return None
 
 
 def poll_files(files: list[Path], state: WatcherState,
@@ -237,7 +322,13 @@ def poll_files(files: list[Path], state: WatcherState,
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    _ingest(rec, path, state, pricing)
+                    # Normalize across source schemas. Unsupported /
+                    # uninteresting records (user messages, snapshots)
+                    # return None and get skipped.
+                    norm = _normalize_record(rec)
+                    if norm is None:
+                        continue
+                    _ingest(norm, path, state, pricing)
                     new += 1
                 state.offsets[path] = f.tell()
         except OSError:
@@ -991,11 +1082,18 @@ def _summary_panel(state: WatcherState, ledger: SessionLedger,
 
 
 def _per_model_table(by_model: dict[str, ModelTally],
-                     sort_mode: str) -> Table:
+                     sort_mode: str,
+                     *, max_rows: Optional[int] = None,
+                     highlighted: bool = False) -> Table:
+    title_label = (
+        "[bold cyan]🤖 Per-model breakdown[/bold cyan]"
+        if not highlighted
+        else "[bold reverse cyan]🤖 Per-model breakdown[/bold reverse cyan]"
+    )
+    border = "bright_cyan" if highlighted else "cyan"
     table = Table(
-        title=f"[bold cyan]🤖 Per-model breakdown[/bold cyan]  "
-              f"[dim](sort: {sort_mode})[/dim]",
-        show_lines=False, expand=True, border_style="cyan",
+        title=f"{title_label}  [dim](sort: {sort_mode})[/dim]",
+        show_lines=False, expand=True, border_style=border,
         header_style="bold cyan", row_styles=["", "dim"],
         box=ROUNDED, title_justify="left",
     )
@@ -1016,6 +1114,11 @@ def _per_model_table(by_model: dict[str, ModelTally],
     else:  # cost (default)
         items.sort(key=lambda kv: -kv[1].cost_usd)
 
+    if max_rows is not None and len(items) > max_rows:
+        truncated = len(items) - max_rows
+        items = items[:max_rows]
+    else:
+        truncated = 0
     for model_id, tally in items:
         cost_repr = _fmt_usd(tally.cost_usd)
         if not tally.cost_known:
@@ -1029,22 +1132,32 @@ def _per_model_table(by_model: dict[str, ModelTally],
             _fmt_tok(tally.output),
             cost_repr,
         )
-    if not items:
+    if not items and truncated == 0:
         table.add_row("(none yet)", "0", "0", "0", "0", "0", "—")
+    if truncated > 0:
+        table.add_row(f"[dim]+{truncated} more…[/dim]",
+                      "", "", "", "", "", "")
     return table
 
 
 def _per_kernel_table(by_kernel: dict[str, ModelTally],
-                      sort_mode: str) -> Optional[Table]:
+                      sort_mode: str,
+                      *, max_rows: Optional[int] = None,
+                      highlighted: bool = False) -> Optional[Table]:
     """Per-op cost breakdown. Returns None when no records carry a
     kernel-scoped phase so the panel doesn't render empty on smoke
     tests / non-arm-B runs."""
     if not by_kernel:
         return None
+    title_label = (
+        "[bold magenta]⚙  Per-kernel breakdown[/bold magenta]"
+        if not highlighted
+        else "[bold reverse magenta]⚙  Per-kernel breakdown[/bold reverse magenta]"
+    )
+    border = "bright_magenta" if highlighted else "magenta"
     table = Table(
-        title=f"[bold magenta]⚙  Per-kernel breakdown[/bold magenta]  "
-              f"[dim](sort: {sort_mode}; phase: synth/optimize:<op>)[/dim]",
-        show_lines=False, expand=True, border_style="magenta",
+        title=f"{title_label}  [dim](sort: {sort_mode}; phase: synth/optimize:<op>)[/dim]",
+        show_lines=False, expand=True, border_style=border,
         header_style="bold magenta", row_styles=["", "dim"],
         box=ROUNDED, title_justify="left",
     )
@@ -1062,6 +1175,11 @@ def _per_kernel_table(by_kernel: dict[str, ModelTally],
     else:
         items.sort(key=lambda kv: -kv[1].cost_usd)
 
+    if max_rows is not None and len(items) > max_rows:
+        truncated = len(items) - max_rows
+        items = items[:max_rows]
+    else:
+        truncated = 0
     for kernel, tally in items:
         cost_repr = _fmt_usd(tally.cost_usd) + (
             "+" if not tally.cost_known else "")
@@ -1071,21 +1189,38 @@ def _per_kernel_table(by_kernel: dict[str, ModelTally],
             kernel, str(tally.n_calls),
             _fmt_tok(in_tok), _fmt_tok(tally.output), cost_repr,
         )
+    if truncated > 0:
+        table.add_row(f"[dim]+{truncated} more…[/dim]", "", "", "", "")
     return table
 
 
 def _recent_table(records: list[IngestedRecord],
-                  scroll: int, max_visible: int) -> Table:
+                  scroll: int, max_visible: int,
+                  *, frozen: bool = False,
+                  highlighted: bool = False) -> Table:
     """Scrollable per-call detail. ``scroll`` is the offset from the
-    newest record (0 = newest visible at top)."""
-    title = (f"[bold blue]📞 Recent calls[/bold blue]  "
-             f"[dim](newest first; j/k to scroll")
+    newest record (0 = newest visible at top). When ``frozen`` is
+    True (explore mode) the title indicates the user is navigating
+    history; ``highlighted`` thickens the border to show this is the
+    active pane for arrow-key input."""
+    if frozen:
+        marker = " 🔍 EXPLORE"
+    else:
+        marker = ""
+    title_label = (
+        f"[bold blue]📞 Recent calls{marker}[/bold blue]"
+        if not highlighted
+        else f"[bold reverse blue]📞 Recent calls{marker}[/bold reverse blue]"
+    )
+    border = "bright_blue" if highlighted else "blue"
+    hint = "(newest first; "
+    hint += "↑↓ or j/k to scroll" if frozen else "j/k to scroll, e to explore"
     if scroll > 0:
-        title += f", offset={scroll}"
-    title += ")[/dim]"
+        hint += f", offset={scroll}"
+    hint += ")"
     table = Table(
-        title=title,
-        show_lines=False, expand=True, border_style="blue",
+        title=f"{title_label}  [dim]{hint}[/dim]",
+        show_lines=False, expand=True, border_style=border,
         header_style="bold blue", row_styles=["", "dim"],
         box=ROUNDED, title_justify="left",
     )
@@ -1119,6 +1254,8 @@ def _recent_table(records: list[IngestedRecord],
 def _status_bar(*, paused: bool, sort_mode: str, watching: int,
                 budget_usd: Optional[float],
                 ledger: SessionLedger,
+                explore_mode: bool = False,
+                active_pane: str = "recent",
                 spinner: Optional[Spinner] = None) -> Panel:
     """Two-row keybindings panel that's ALWAYS visible at the bottom
     of the TUI. Row 1: state + counters. Row 2: keys as labeled
@@ -1132,6 +1269,8 @@ def _status_bar(*, paused: bool, sort_mode: str, watching: int,
     line1 = Text()
     if paused:
         line1.append(" ⏸  PAUSED ", style="bold yellow on grey23")
+    elif explore_mode:
+        line1.append(" 🔍 EXPLORE ", style="bold black on yellow")
     else:
         line1.append(" ●  LIVE ", style="bold black on green")
     line1.append("  📂 ", style="dim")
@@ -1140,6 +1279,9 @@ def _status_bar(*, paused: bool, sort_mode: str, watching: int,
                  style="dim")
     line1.append("  ⇅ ", style="dim")
     line1.append(f"sort:{sort_mode}", style="bold")
+    if explore_mode:
+        line1.append("   pane:", style="dim")
+        line1.append(f"{active_pane}", style="bold yellow")
     if budget_usd is not None:
         line1.append(f"   💵 budget:{_fmt_usd(budget_usd)}", style="dim")
     if ledger.active is not None:
@@ -1149,14 +1291,24 @@ def _status_bar(*, paused: bool, sort_mode: str, watching: int,
         line1.append("   ⚑ no session", style="dim italic")
 
     # --- Row 2: keybindings, each in a labeled "chip" ---
-    key_chips = [
-        ("q",   "quit",      "bold white on red"),
-        ("p",   "pause",     "bold white on grey35"),
-        ("s",   "sort",      "bold white on grey35"),
-        ("j/k", "scroll",    "bold white on grey35"),
-        ("r",   "reset",     "bold white on grey35"),
-        ("?",   "help",      "bold white on cyan"),
-    ]
+    if explore_mode:
+        key_chips = [
+            ("e",    "exit explore", "bold white on yellow"),
+            ("↑↓",   "scroll rows",  "bold white on grey35"),
+            ("←→",   "switch pane",  "bold white on grey35"),
+            ("q",    "quit",         "bold white on red"),
+            ("?",    "help",         "bold white on cyan"),
+        ]
+    else:
+        key_chips = [
+            ("q",   "quit",      "bold white on red"),
+            ("p",   "pause",     "bold white on grey35"),
+            ("s",   "sort",      "bold white on grey35"),
+            ("j/k", "scroll",    "bold white on grey35"),
+            ("e",   "explore",   "bold white on yellow"),
+            ("r",   "reset",     "bold white on grey35"),
+            ("?",   "help",      "bold white on cyan"),
+        ]
     line2 = Text()
     for i, (key, label, chip_style) in enumerate(key_chips):
         if i > 0:
@@ -1211,63 +1363,109 @@ def _help_overlay() -> Panel:
 def render(state: WatcherState, ledger: SessionLedger,
            *, sort_mode: str, scroll: int, max_recent: int,
            watching: int, paused: bool, show_help: bool,
-           budget_usd: Optional[float]) -> Group:
+           explore_mode: bool, active_pane: str,
+           budget_usd: Optional[float],
+           terminal_height: int = 40) -> Layout:
+    """rich.Layout with three rows pinned proportionally:
+      TOP    -- summary panel + mascot (fixed ~14 lines)
+      MIDDLE -- per-model + per-kernel + recent-calls (fills rest)
+      BOTTOM -- controls bar (fixed 6 lines, ALWAYS visible)
+
+    The middle section is height-budgeted to whatever vertical space
+    remains after top+bottom. When content exceeds that, the per-model
+    and per-kernel tables cap their row counts and the recent-calls
+    table caps to the remainder. Press `e` for explore mode: arrow
+    keys navigate the active pane through history without auto-scroll.
+    """
     windows = compute_windows(state, ledger)
     cumul = windows["cumulative"]
 
-    # Top row: big summary panel on the left + the BLASTER mascot
-    # tucked into the upper-right. rich.Table with no borders gives
-    # us a side-by-side that reflows on resize -- the summary panel
-    # gets the rest of the width, the mascot stays its compact 28
-    # columns.
+    # ─── TOP: summary + mascot, side-by-side ───
     top_row = Table.grid(expand=True)
     top_row.add_column(ratio=1)
-    # Mascot column: left-justified so every row of the gun art
-    # starts at the SAME X-coordinate inside the cell. justify="right"
-    # made each line right-align independently -- with each art row
-    # having different visible widths (due to trailing whitespace
-    # being stripped by rich), the gun appeared to "morph" between
-    # frames. The cell itself stays on the right of the table via
-    # column ordering; only the lines within the cell are now
-    # consistently aligned.
-    #
-    # Width 44 accommodates: 20-char gun + up to 14-col firework
-    # drift + ~10-char firework chars = 44. Smaller and the trail
-    # frames wrap, making the gun look broken.
     top_row.add_column(width=44, justify="left")
     top_row.add_row(
         _summary_panel(state, ledger, windows, budget_usd),
         _mascot_render(state),
     )
 
-    parts: list = [top_row]
+    # ─── BOTTOM: controls bar -- always visible, exactly 6 lines ───
+    bottom = _status_bar(paused=paused, sort_mode=sort_mode,
+                         watching=watching, budget_usd=budget_usd,
+                         ledger=ledger, explore_mode=explore_mode,
+                         active_pane=active_pane)
+
+    # ─── MIDDLE: dynamic tables, height-budgeted ───
+    TOP_LINES = 14
+    BOTTOM_LINES = 6
+    MARGIN = 2
+    middle_h = max(8, terminal_height - TOP_LINES - BOTTOM_LINES - MARGIN)
+
     if show_help:
-        parts.append(_help_overlay())
+        middle = _help_overlay()
     else:
-        parts.append(_per_model_table(cumul.by_model, sort_mode))
-        kernel_table = _per_kernel_table(cumul.by_kernel, sort_mode)
-        if kernel_table is not None:
-            parts.append(kernel_table)
-        parts.append(_recent_table(state.records, scroll, max_recent))
-    parts.append(_status_bar(paused=paused, sort_mode=sort_mode,
-                             watching=watching, budget_usd=budget_usd,
-                             ledger=ledger))
-    # Tick the blaster animation countdown so each redraw moves it
-    # one step closer to idle. Doing it here (post-render) means the
-    # NEXT frame uses the decremented value.
+        has_kernels = bool(cumul.by_kernel)
+        per_model_rows = min(4, max(1, middle_h // 4))
+        per_kernel_rows = min(4, max(1, middle_h // 5)) if has_kernels else 0
+        per_model_h = per_model_rows + 4    # title + header + border padding
+        per_kernel_h = (per_kernel_rows + 4) if has_kernels else 0
+        recent_h = max(5, middle_h - per_model_h - per_kernel_h)
+        recent_rows = max(1, recent_h - 4)
+
+        middle_parts: list = [
+            _per_model_table(cumul.by_model, sort_mode,
+                              max_rows=per_model_rows,
+                              highlighted=(explore_mode
+                                            and active_pane == "model")),
+        ]
+        if has_kernels:
+            kt = _per_kernel_table(cumul.by_kernel, sort_mode,
+                                    max_rows=per_kernel_rows,
+                                    highlighted=(explore_mode
+                                                  and active_pane == "kernel"))
+            if kt is not None:
+                middle_parts.append(kt)
+        middle_parts.append(
+            _recent_table(state.records, scroll, recent_rows,
+                          frozen=explore_mode,
+                          highlighted=(explore_mode
+                                        and active_pane == "recent"))
+        )
+        middle = Group(*middle_parts)
+
+    # ─── compose with Layout so bottom STAYS PINNED ───
+    layout = Layout()
+    layout.split_column(
+        Layout(top_row, name="top", size=TOP_LINES),
+        Layout(middle, name="middle", ratio=1),
+        Layout(bottom, name="bottom", size=BOTTOM_LINES),
+    )
+
+    # Tick blaster animation countdown post-render.
     if state.blaster_anim_frame > 0:
         state.blaster_anim_frame -= 1
-    return Group(*parts)
+    return layout
 
 
 # ───────────────────── interactive control ─────────────────────
 
 
 class _StdinReader:
-    """Best-effort single-keystroke reader. Switches stdin to cbreak
-    on enter, restores on exit. read_key() returns one char or None
-    (non-blocking, ~0ms select). Falls back to no-op when stdin is
-    not a tty (so the same code works in pipes / CI)."""
+    """Best-effort keystroke reader with multi-byte escape-sequence
+    handling. Switches stdin to cbreak on enter, restores on exit.
+
+    read_key() returns:
+        * a single printable char ("q", "p", "e", ...)
+        * a logical name for arrow keys ("UP", "DOWN", "LEFT", "RIGHT")
+        * None when nothing is pending (non-blocking poll)
+
+    Arrow keys arrive as 3 bytes: 0x1b 0x5b 0x41..0x44. We read the
+    introducer (ESC), then peek a few more bytes within a tiny
+    timeout to assemble the full sequence -- otherwise the ESC by
+    itself would be treated as a literal keypress.
+    """
+
+    _ARROWS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
 
     def __init__(self):
         self._enabled = sys.stdin.isatty()
@@ -1286,13 +1484,32 @@ class _StdinReader:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN,
                               self._old_attrs)
 
-    def read_key(self) -> Optional[str]:
-        if not self._enabled:
-            return None
-        r, _, _ = select.select([sys.stdin], [], [], 0)
+    def _read_with_timeout(self, timeout: float) -> Optional[str]:
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
         if not r:
             return None
         return sys.stdin.read(1)
+
+    def read_key(self) -> Optional[str]:
+        if not self._enabled:
+            return None
+        ch = self._read_with_timeout(0)
+        if ch is None:
+            return None
+        if ch != "\x1b":
+            return ch
+        # Possible escape sequence: peek up to 2 more bytes with a
+        # short timeout. If nothing follows quickly, treat the ESC
+        # itself as a keypress (some terminals send a bare ESC for
+        # the Escape key).
+        bracket = self._read_with_timeout(0.01)
+        if bracket != "[":
+            return "ESC"
+        code = self._read_with_timeout(0.01)
+        if code in self._ARROWS:
+            return self._ARROWS[code]
+        # Unknown escape -- swallow + ignore.
+        return None
 
 
 _SORT_CYCLE = ["cost", "calls", "name"]
@@ -1330,8 +1547,19 @@ def cmd_live(args) -> int:
 
     def _files() -> list[Path]:
         if args.paths:
-            return [p for p in args.paths if p.exists()]
-        return discover_jsonls(args.root)
+            paths = [p for p in args.paths if p.exists()]
+        else:
+            paths = list(discover_jsonls(args.root))
+            # Optionally tail Claude Code session JSONLs. Default OFF
+            # because the logs include any interactive conversation
+            # (design / debug chats, not benchmark calls) which would
+            # double-count any session that ALSO ran an arm_b_claude
+            # cell. Benchmark Claude Code calls always land in
+            # benchmarks/results/**/llm_calls.jsonl via the arm
+            # driver -- those paths are watched unconditionally.
+            if args.watch_claude_code:
+                paths.extend(discover_claude_code_sessions())
+        return paths
 
     files = _files()
     poll_files(files, state, pricing)
@@ -1341,15 +1569,22 @@ def cmd_live(args) -> int:
     paused = False
     show_help = False
     bell_rung = False
+    explore_mode = False
+    active_pane = "recent"   # one of: "recent", "model", "kernel"
+    PANE_CYCLE = ["recent", "model", "kernel"]
+
+    def _initial_layout():
+        return render(state, ledger, sort_mode=sort_mode,
+                      scroll=scroll, max_recent=args.max_recent,
+                      watching=len(files), paused=paused,
+                      show_help=show_help, explore_mode=explore_mode,
+                      active_pane=active_pane,
+                      budget_usd=args.budget_usd,
+                      terminal_height=console.size.height)
 
     try:
         with _StdinReader() as keyreader, \
-             Live(render(state, ledger, sort_mode=sort_mode,
-                         scroll=scroll, max_recent=args.max_recent,
-                         watching=len(files), paused=paused,
-                         show_help=show_help,
-                         budget_usd=args.budget_usd),
-                  console=console,
+             Live(_initial_layout(), console=console,
                   refresh_per_second=args.refresh_hz,
                   screen=True) as live:
             while True:
@@ -1364,24 +1599,42 @@ def cmd_live(args) -> int:
                         paused = not paused
                     elif ch == "s":
                         sort_mode = _cycle_sort(sort_mode)
-                    elif ch == "j":
-                        scroll = min(scroll + 1,
-                                     max(0, len(state.records) - 1))
-                    elif ch == "k":
-                        scroll = max(0, scroll - 1)
                     elif ch == "?":
                         show_help = not show_help
+                    elif ch == "e":
+                        explore_mode = not explore_mode
+                        # Reset to "recent" pane when entering.
+                        if explore_mode:
+                            active_pane = "recent"
+                            scroll = 0
                     elif ch == "r":
                         _reset_offsets(state)
                         ledger = SessionLedger.load()
                         scroll = 0
+                    # Scroll keys: arrows are explore-only; j/k work
+                    # in both modes so the legacy behavior still
+                    # functions if you don't know about explore.
+                    elif ch in ("UP", "k"):
+                        scroll = max(0, scroll - 1)
+                    elif ch in ("DOWN", "j"):
+                        scroll = min(scroll + 1,
+                                     max(0, len(state.records) - 1))
+                    elif ch == "LEFT" and explore_mode:
+                        idx = PANE_CYCLE.index(active_pane)
+                        active_pane = PANE_CYCLE[(idx - 1) % len(PANE_CYCLE)]
+                    elif ch == "RIGHT" and explore_mode:
+                        idx = PANE_CYCLE.index(active_pane)
+                        active_pane = PANE_CYCLE[(idx + 1) % len(PANE_CYCLE)]
 
                 if not paused:
                     files = _files()
                     poll_files(files, state, pricing)
-                    # Re-read ledger periodically so session
-                    # start/end in another terminal lands within ~1s.
                     ledger = SessionLedger.load()
+                # In explore mode we DON'T auto-scroll; the user is
+                # navigating frozen history. In live mode the scroll
+                # offset stays 0 so new records appear at the top.
+                if not explore_mode:
+                    scroll = 0
 
                 # Budget alarm: ring bell on the transition into >=100%.
                 if (args.budget_usd is not None and not bell_rung):
@@ -1396,7 +1649,10 @@ def cmd_live(args) -> int:
                                     max_recent=args.max_recent,
                                     watching=len(files), paused=paused,
                                     show_help=show_help,
-                                    budget_usd=args.budget_usd))
+                                    explore_mode=explore_mode,
+                                    active_pane=active_pane,
+                                    budget_usd=args.budget_usd,
+                                    terminal_height=console.size.height))
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         pass
@@ -1442,7 +1698,9 @@ def cmd_session_list(args) -> int:
     ledger = SessionLedger.load()
     pricing = load_pricing(args.pricing)
     state = WatcherState()
-    files = discover_jsonls(args.root)
+    files = list(discover_jsonls(args.root))
+    if getattr(args, "watch_claude_code", False):
+        files.extend(discover_claude_code_sessions())
     poll_files(files, state, pricing)
 
     sessions = ledger.list_all()
@@ -1545,7 +1803,9 @@ def cmd_report(args) -> int:
     pricing = load_pricing(args.pricing)
     ledger = SessionLedger.load()
     state = WatcherState()
-    files = discover_jsonls(args.root)
+    files = list(discover_jsonls(args.root))
+    if getattr(args, "watch_claude_code", False):
+        files.extend(discover_claude_code_sessions())
     poll_files(files, state, pricing)
     windows = compute_windows(state, ledger)
 
@@ -1596,6 +1856,16 @@ def _add_common_args(ap: argparse.ArgumentParser) -> None:
                          "(overrides --root)")
     ap.add_argument("--pricing", type=Path, default=DEFAULT_PRICING,
                     help="pricing.yaml path")
+    ap.add_argument("--watch-claude-code", action="store_true",
+                    help="ALSO tail Claude Code session JSONLs at "
+                         "~/.claude/projects/<encoded-cwd>/*.jsonl. "
+                         "Default: OFF -- those logs include any "
+                         "interactive Claude Code conversation in this "
+                         "project directory (e.g. design / debug chats), "
+                         "which inflates the dashboard with non-benchmark "
+                         "spend. Benchmark LLM calls always land in "
+                         "benchmarks/results/**/llm_calls.jsonl via the "
+                         "arm drivers; that path is watched unconditionally.")
 
 
 def main(argv: Optional[list[str]] = None) -> int:

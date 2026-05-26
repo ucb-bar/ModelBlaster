@@ -57,9 +57,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     run_id = args.run_id or _common.new_run_id()
-    outcome = _common.execute_run_sh(
-        arm=ARM_ID, workload=workload, env=_build_env(workload), run_id=run_id,
-    )
+    # Auto-open a session if none is active (symmetry with arm_b_*).
+    auto_session = _common.maybe_auto_session(ARM_ID, workload, run_id)
+    try:
+        outcome = _common.execute_run_sh(
+            arm=ARM_ID, workload=workload, env=_build_env(workload),
+            run_id=run_id,
+        )
+    finally:
+        _common.end_auto_session(auto_session)
     return _common.finalize(
         outcome, arm=ARM_ID, workload=workload, run_id=run_id,
     )
