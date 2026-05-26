@@ -617,37 +617,42 @@ def extract_int8(
     # Default: single-output. The output handler may overwrite this.
     output_names_multi: Optional[list[str]] = None
 
-    # Two-pass walk: first collect linear→relu and conv2d→relu fusions so the
-    # relu node is absorbed into the producer's op kind. Split by producer
-    # type so the passes_applied.json artifact can credit linear+relu and
-    # conv2d+relu separately -- that distinction matters when evaluating
-    # which fusion pattern is paying off on which workload.
+    # Two-pass walk: first collect linear→relu, conv2d→relu, and add→relu
+    # fusions so the relu node is absorbed into the producer's op kind.
+    # Split by producer type so the passes_applied.json artifact can credit
+    # each fusion pattern separately -- that distinction matters when
+    # evaluating which pattern is paying off on which workload.
     nodes = list(gm.graph.nodes)
     fused_linear_relu: set[str] = set()
     fused_conv2d_relu: set[str] = set()
+    fused_add_relu: set[str] = set()
     for i, node in enumerate(nodes):
         if i + 1 >= len(nodes):
             continue
         nxt = nodes[i + 1]
-        if node.op != "call_module":
-            continue
-        producer_mod = gm.get_submodule(node.target)
-        is_linear = isinstance(producer_mod, torch.nn.Linear)
-        is_conv2d = isinstance(producer_mod, torch.nn.Conv2d)
-        if not (is_linear or is_conv2d):
-            continue
         is_next_relu = (
             (nxt.op == "call_module"
              and isinstance(gm.get_submodule(nxt.target), torch.nn.ReLU))
             or (nxt.op == "call_function" and nxt.target in (
                 torch.relu, torch.nn.functional.relu))
         )
-        if is_next_relu and len(nxt.args) == 1 and nxt.args[0] is node:
-            if is_linear:
+        if not (is_next_relu and len(nxt.args) == 1 and nxt.args[0] is node):
+            continue
+        if node.op == "call_module":
+            producer_mod = gm.get_submodule(node.target)
+            if isinstance(producer_mod, torch.nn.Linear):
                 fused_linear_relu.add(nxt.name)
-            else:
+            elif isinstance(producer_mod, torch.nn.Conv2d):
                 fused_conv2d_relu.add(nxt.name)
-    fused_relu_after: set[str] = fused_linear_relu | fused_conv2d_relu
+        elif node.op == "call_function":
+            t = node.target
+            tname = getattr(t, "__name__", "")
+            if (tname == "add" or t is torch.add
+                    or t is __import__("operator").add):
+                fused_add_relu.add(nxt.name)
+    fused_relu_after: set[str] = (
+        fused_linear_relu | fused_conv2d_relu | fused_add_relu
+    )
 
     # Nodes to skip during the main walk (e.g. getitem consumers of chunk).
     _skip_nodes: set = set()
@@ -993,20 +998,35 @@ def extract_int8(
                 b_name = node.args[1].name
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[a_name]["shape"]))
+                # add→relu fusion: clamp at 0 instead of -128 and alias the
+                # relu's output name to this add's buffer (mirrors the
+                # linear/conv2d fusion logic above).
+                next_node = (nodes[nodes.index(node) + 1]
+                             if nodes.index(node) + 1 < len(nodes) else None)
+                fuse_relu = (next_node is not None
+                             and next_node.name in fused_add_relu)
+                act_min = 0 if fuse_relu else -128
+                if fuse_relu:
+                    _skip_nodes.add(next_node)
                 ops.append({
                     "name": node.name,
                     "op": "add_s8",
                     "inputs": [a_name, b_name],
-                    "outputs": [node.name],
+                    "outputs": [
+                        next_node.name if fuse_relu else node.name
+                    ],
                     "shape": {"n": n},
                     "quant": {
                         "scale_a":   scales[a_name],
                         "scale_b":   scales[b_name],
                         "scale_out": scales[node.name],
-                        "activation_min": -128,
+                        "activation_min": act_min,
                         "activation_max": 127,
                     },
                 })
+                if fuse_relu and next_node.name not in tensors_meta:
+                    tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                    scales[next_node.name] = scales[node.name]
             elif target is torch.cat or tname == "cat":
                 tensors_arg = node.args[0]
                 if not isinstance(tensors_arg, (list, tuple)):
@@ -1363,6 +1383,10 @@ def extract_int8(
                 "fired": len(fused_conv2d_relu),
                 "sites": sorted(fused_conv2d_relu),
             },
+            "add_relu_fuse": {
+                "fired": len(fused_add_relu),
+                "sites": sorted(fused_add_relu),
+            },
         },
     }
     with open(passes_path, "w") as f:
@@ -1372,7 +1396,8 @@ def extract_int8(
     print(f"wrote {io_path}  (input dtype={inp_q.dtype}, output dtype={out_q.dtype})")
     print(f"wrote {passes_path}  ("
           f"linear_relu_fuse={len(fused_linear_relu)}, "
-          f"conv2d_relu_fuse={len(fused_conv2d_relu)})")
+          f"conv2d_relu_fuse={len(fused_conv2d_relu)}, "
+          f"add_relu_fuse={len(fused_add_relu)})")
     return ir
 
 
