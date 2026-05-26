@@ -216,10 +216,8 @@ def require_tools(tools: list[str]) -> None:
     if missing:
         raise SystemExit(
             "missing tools on PATH: " + ", ".join(missing) + ". "
-            "Activate the zephyr build env first, e.g.:\n"
-            "  source tools/miniforge3/etc/profile.d/conda.sh && "
-            "conda activate zephyr\n"
-            "  source scripts/set_envvars_sdk.sh"
+            "Activate the benchmark env first:\n"
+            "  source scripts/setup_benchmark_env.sh"
         )
 
 
