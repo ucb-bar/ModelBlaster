@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import select
 import sys
 import time
@@ -477,6 +478,35 @@ def _fmt_short_ts(ts: str) -> str:
         return datetime.fromisoformat(ts).strftime("%H:%M:%S")
     except ValueError:
         return ts[-8:] if len(ts) >= 8 else ts
+
+
+def _short_model(model_id: str) -> str:
+    """Strip provider/version cruft so the Model column doesn't wrap to
+    three rows. ``us.anthropic.claude-sonnet-4-5-20250929-v1:0`` →
+    ``claude-sonnet-4-5``. Conservative: only collapses well-known
+    Anthropic / Google patterns, falls back to raw id otherwise."""
+    s = model_id
+    for prefix in ("us.anthropic.", "anthropic.", "us.", "eu."):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    # Drop trailing date (-YYYYMMDD) and version (-vN:N).
+    s = re.sub(r"-\d{8}(-v\d+(:\d+)?)?$", "", s)
+    s = re.sub(r"-v\d+(:\d+)?$", "", s)
+    return s
+
+
+def _short_cell(cell: str) -> str:
+    """Compact arm/workload/run_id into something that fits one line.
+    Keeps the leading arm + workload, shortens the trailing run-id
+    timestamp to just HHMMSSZ."""
+    parts = cell.split("/")
+    if len(parts) >= 3:
+        run_id = parts[-1]
+        m = re.search(r"T(\d{2})-(\d{2})-(\d{2})Z", run_id)
+        if m:
+            parts[-1] = f"{m.group(1)}{m.group(2)}{m.group(3)}Z"
+    return "/".join(parts)
 
 
 def _budget_style(frac: float, cost_known: bool) -> tuple[str, str]:
@@ -1097,8 +1127,8 @@ def _per_model_table(by_model: dict[str, ModelTally],
         header_style="bold cyan", row_styles=["", "dim"],
         box=ROUNDED, title_justify="left",
     )
-    table.add_column("Model", overflow="fold", no_wrap=False,
-                     style="white")
+    table.add_column("Model", overflow="ellipsis", no_wrap=True,
+                     style="white", max_width=28)
     table.add_column("Calls", justify="right", style="cyan")
     table.add_column("In (uncached)", justify="right")
     table.add_column("In (cache read)", justify="right", style="green")
@@ -1124,7 +1154,7 @@ def _per_model_table(by_model: dict[str, ModelTally],
         if not tally.cost_known:
             cost_repr += "+"
         table.add_row(
-            model_id,
+            _short_model(model_id),
             str(tally.n_calls),
             _fmt_tok(tally.input_uncached),
             _fmt_tok(tally.input_cached_read),
@@ -1225,9 +1255,12 @@ def _recent_table(records: list[IngestedRecord],
         box=ROUNDED, title_justify="left",
     )
     table.add_column("Time", no_wrap=True, style="cyan")
-    table.add_column("Cell", overflow="fold")
-    table.add_column("Model", overflow="fold", style="white")
-    table.add_column("Phase", style="magenta")
+    table.add_column("Cell", overflow="ellipsis", no_wrap=True,
+                     max_width=34)
+    table.add_column("Model", overflow="ellipsis", no_wrap=True,
+                     style="white", max_width=22)
+    table.add_column("Phase", style="magenta", overflow="ellipsis",
+                     no_wrap=True, max_width=20)
     table.add_column("In", justify="right")
     table.add_column("Out", justify="right")
     table.add_column("USD", justify="right", style="bold green")
@@ -1238,8 +1271,8 @@ def _recent_table(records: list[IngestedRecord],
     for r in slice_:
         table.add_row(
             _fmt_short_ts(r.ts),
-            r.cell,
-            r.model_id,
+            _short_cell(r.cell),
+            _short_model(r.model_id),
             r.phase or "—",
             _fmt_tok(r.input_uncached + r.input_cached_read
                      + r.input_cached_write),
