@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "provider": "bedrock",
+  "tokens_input_cached": 0,
+  "tokens_input_uncached": 0,
+  "tokens_output": 0,
+  "n_calls": 0,
+  "by_model": {}
+}

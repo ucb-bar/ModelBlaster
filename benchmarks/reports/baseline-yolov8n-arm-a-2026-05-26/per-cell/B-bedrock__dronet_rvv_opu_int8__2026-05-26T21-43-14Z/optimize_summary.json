@@ -1,0 +1,387 @@
+{
+  "add_s8": {
+    "baseline": 9383,
+    "best": 9383,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 9383,
+        "result": "ok",
+        "cycles": 20839,
+        "tokens_in": 16553,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 9383,
+        "result": "duplicate",
+        "tokens_in": 16553,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 9383,
+        "result": "duplicate",
+        "tokens_in": 16553,
+        "tokens_out": 840
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 20839,
+        "result": "ok",
+        "cycles": 9383,
+        "tokens_in": 16475,
+        "tokens_out": 764
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 20839,
+        "result": "duplicate",
+        "tokens_in": 16475,
+        "tokens_out": 764
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 20839,
+        "result": "duplicate",
+        "tokens_in": 16475,
+        "tokens_out": 764
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "batchnorm2d_s8": {
+    "baseline": 45190,
+    "best": 42782,
+    "improvement_pct": 5.328612524894888,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 45190,
+        "result": "build_fail",
+        "tokens_in": 16756,
+        "tokens_out": 1278,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1 |   stdout (tail): | _opu/kernels.c:85:59: error: incompatible type for argument 3 of '__riscv_vfmadd_vf_f32m8' |    85 |                 vf_lo = __riscv_vfmadd_vf_f32m8(vf_lo, s, b, vl); |       |                                                           ^ |       |                                                           | |       |                                                           float | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vfloat32m8_t' but argument is of type 'float' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c:86:59: error: incompatible type for argument 3 of '__riscv_vfmadd_vf_f32m8' |    86 |                 vf_hi = __riscv_vfmadd_vf_f32m8(vf_hi, s, b, vl - vl / 2); |       |                                                           ^ |       |                                                           | |       |                                                           float | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vfloat32m8_t' but argument is of type 'float' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c:103:60: error: incompatible type for argument 2 of '__riscv_"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 45190,
+        "result": "build_fail",
+        "tokens_in": 16756,
+        "tokens_out": 1153,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1 |   stdout (tail): | ustin/ModelBlaster/cores/saturn_opu/include -DMODELBLASTER_SATURN_OPU=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c | /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c: In function 'kernel_batchnorm2d_s8_dronet': | /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c:85:59: error: incompatible type for argument 3 of '__riscv_vfmadd_vf_f32m8' |    85 |                 vf_lo = __riscv_vfmadd_vf_f32m8(vf_lo, s, b, vl); |       |                                                           ^ |       |                                                           | |       |                                                           float | In file included from /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vfloat32m8_t' but argument is of type 'float' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c:86:59: error: incompatible type"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 45190,
+        "result": "ok",
+        "cycles": 42782,
+        "tokens_in": 16756,
+        "tokens_out": 975
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "conv2d_s8": {
+    "baseline": 15089334,
+    "best": 15089334,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 15089334,
+        "result": "ok",
+        "cycles": 26996717,
+        "tokens_in": 19253,
+        "tokens_out": 1974
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 15089334,
+        "result": "duplicate",
+        "tokens_in": 19253,
+        "tokens_out": 1974
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 15089334,
+        "result": "duplicate",
+        "tokens_in": 19253,
+        "tokens_out": 1974
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 26996717,
+        "result": "ok",
+        "cycles": 28032390,
+        "tokens_in": 19303,
+        "tokens_out": 2015
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 26996717,
+        "result": "ok",
+        "cycles": 24322883,
+        "tokens_in": 19303,
+        "tokens_out": 2238
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 26996717,
+        "result": "verify_fail",
+        "tokens_in": 19303,
+        "tokens_out": 2019,
+        "diag": "golden mismatch (19)"
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "linear_s8": {
+    "baseline": 3061,
+    "best": 2325,
+    "improvement_pct": 24.04442992486116,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 3061,
+        "result": "ok",
+        "cycles": 2325,
+        "tokens_in": 17934,
+        "tokens_out": 2346
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 3061,
+        "result": "ok",
+        "cycles": 2325,
+        "tokens_in": 17934,
+        "tokens_out": 2332
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 3061,
+        "result": "ok",
+        "cycles": 2889,
+        "tokens_in": 17934,
+        "tokens_out": 2344
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "maxpool2d_s8": {
+    "baseline": 194978,
+    "best": 185403,
+    "improvement_pct": 4.910810450409789,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 194978,
+        "result": "ok",
+        "cycles": 206102,
+        "tokens_in": 17459,
+        "tokens_out": 859
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 194978,
+        "result": "ok",
+        "cycles": 194978,
+        "tokens_in": 17459,
+        "tokens_out": 1297
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 194978,
+        "result": "ok",
+        "cycles": 206102,
+        "tokens_in": 17459,
+        "tokens_out": 859
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 194978,
+        "result": "ok",
+        "cycles": 206102,
+        "tokens_in": 18341,
+        "tokens_out": 886
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 194978,
+        "result": "ok",
+        "cycles": 206102,
+        "tokens_in": 18341,
+        "tokens_out": 884
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 194978,
+        "result": "ok",
+        "cycles": 221793,
+        "tokens_in": 18341,
+        "tokens_out": 1277
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 1,
+        "parent_cycles": 206102,
+        "result": "ok",
+        "cycles": 218278,
+        "tokens_in": 18341,
+        "tokens_out": 1572
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 2,
+        "parent_cycles": 206102,
+        "result": "ok",
+        "cycles": 185403,
+        "tokens_in": 18341,
+        "tokens_out": 781
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 3,
+        "parent_cycles": 206102,
+        "result": "ok",
+        "cycles": 206179,
+        "tokens_in": 18341,
+        "tokens_out": 1570
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "relu_s8": {
+    "baseline": 3714,
+    "best": 3366,
+    "improvement_pct": 9.36995153473344,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 3714,
+        "result": "ok",
+        "cycles": 3366,
+        "tokens_in": 15751,
+        "tokens_out": 348
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 3714,
+        "result": "duplicate",
+        "tokens_in": 15751,
+        "tokens_out": 189
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 3714,
+        "result": "ok",
+        "cycles": 3366,
+        "tokens_in": 15751,
+        "tokens_out": 352
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "sigmoid_s8": {
+    "baseline": 145,
+    "best": 132,
+    "improvement_pct": 8.96551724137931,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 145,
+        "result": "ok",
+        "cycles": 132,
+        "tokens_in": 15828,
+        "tokens_out": 267
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 145,
+        "result": "duplicate",
+        "tokens_in": 15828,
+        "tokens_out": 267
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 145,
+        "result": "ok",
+        "cycles": 134,
+        "tokens_in": 15828,
+        "tokens_out": 267
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  }
+}

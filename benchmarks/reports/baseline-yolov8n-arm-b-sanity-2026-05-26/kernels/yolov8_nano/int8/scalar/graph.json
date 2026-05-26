@@ -1,0 +1,9808 @@
+{
+  "name": "yolov8_nano",
+  "version": 1,
+  "quant": "int8",
+  "input": {
+    "tensor": "x"
+  },
+  "output": {
+    "tensors": [
+      "cat_13",
+      "cat_14",
+      "cat_15"
+    ],
+    "tensor": null
+  },
+  "tensors": {
+    "x": {
+      "shape": [
+        1,
+        3,
+        160,
+        160
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0350564033027709,
+        "zero_point": 0
+      }
+    },
+    "l0_conv": {
+      "shape": [
+        1,
+        16,
+        80,
+        80
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0424402191882997,
+        "zero_point": 0
+      }
+    },
+    "l0_bn": {
+      "shape": [
+        1,
+        16,
+        80,
+        80
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 1.0770463117464322,
+        "zero_point": 0
+      }
+    },
+    "l0_act": {
+      "shape": [
+        1,
+        16,
+        80,
+        80
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 1.0770463117464322,
+        "zero_point": 0
+      }
+    },
+    "l1_conv": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.5853506974347933,
+        "zero_point": 0
+      }
+    },
+    "l1_bn": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 2.061787282388041,
+        "zero_point": 0
+      }
+    },
+    "l1_act": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 2.061787282388041,
+        "zero_point": 0
+      }
+    },
+    "l2_cv1_conv": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.9280340840497355,
+        "zero_point": 0
+      }
+    },
+    "l2_cv1_bn": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 1.7280690350870447,
+        "zero_point": 0
+      }
+    },
+    "l2_cv1_act": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.5965576772614727,
+        "zero_point": 0
+      }
+    },
+    "getitem": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.5965576772614727,
+        "zero_point": 0
+      }
+    },
+    "getitem_1": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.23400270657276545,
+        "zero_point": 0
+      }
+    },
+    "l2_m0_cv1_conv": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.101996654600609,
+        "zero_point": 0
+      }
+    },
+    "l2_m0_cv1_bn": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.5504686250461368,
+        "zero_point": 0
+      }
+    },
+    "l2_m0_cv1_act": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.4670071939783772,
+        "zero_point": 0
+      }
+    },
+    "l2_m0_cv2_conv": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.2524695509062039,
+        "zero_point": 0
+      }
+    },
+    "l2_m0_cv2_bn": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.5168319461852546,
+        "zero_point": 0
+      }
+    },
+    "l2_m0_cv2_act": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.4690301249346395,
+        "zero_point": 0
+      }
+    },
+    "add": {
+      "shape": [
+        1,
+        16,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.5289313849501722,
+        "zero_point": 0
+      }
+    },
+    "cat": {
+      "shape": [
+        1,
+        48,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.5965576772614727,
+        "zero_point": 0
+      }
+    },
+    "l2_cv2_conv": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.16056912339578464,
+        "zero_point": 0
+      }
+    },
+    "l2_cv2_bn": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.34824221152958906,
+        "zero_point": 0
+      }
+    },
+    "l2_cv2_act": {
+      "shape": [
+        1,
+        32,
+        40,
+        40
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.13530343724048044,
+        "zero_point": 0
+      }
+    },
+    "l3_conv": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.075965160459984,
+        "zero_point": 0
+      }
+    },
+    "l3_bn": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.10471630847360205,
+        "zero_point": 0
+      }
+    },
+    "l3_act": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.060605090434157,
+        "zero_point": 0
+      }
+    },
+    "l4_cv1_conv": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.028795268591933362,
+        "zero_point": 0
+      }
+    },
+    "l4_cv1_bn": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.10024888496699295,
+        "zero_point": 0
+      }
+    },
+    "l4_cv1_act": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05514831242598887,
+        "zero_point": 0
+      }
+    },
+    "getitem_2": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05514831242598887,
+        "zero_point": 0
+      }
+    },
+    "getitem_3": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02650588891637607,
+        "zero_point": 0
+      }
+    },
+    "l4_m0_cv1_conv": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.017798748542004684,
+        "zero_point": 0
+      }
+    },
+    "l4_m0_cv1_bn": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.040652027280311885,
+        "zero_point": 0
+      }
+    },
+    "l4_m0_cv1_act": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02503994881637453,
+        "zero_point": 0
+      }
+    },
+    "l4_m0_cv2_conv": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.010077687699025072,
+        "zero_point": 0
+      }
+    },
+    "l4_m0_cv2_bn": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03059682883615569,
+        "zero_point": 0
+      }
+    },
+    "l4_m0_cv2_act": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02461226343169926,
+        "zero_point": 0
+      }
+    },
+    "add_1": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.035305916793703096,
+        "zero_point": 0
+      }
+    },
+    "l4_m1_cv1_conv": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.017406384775957722,
+        "zero_point": 0
+      }
+    },
+    "l4_m1_cv1_bn": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03250332704679234,
+        "zero_point": 0
+      }
+    },
+    "l4_m1_cv1_act": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.011420421712980496,
+        "zero_point": 0
+      }
+    },
+    "l4_m1_cv2_conv": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.004454966135851042,
+        "zero_point": 0
+      }
+    },
+    "l4_m1_cv2_bn": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.038990155918391674,
+        "zero_point": 0
+      }
+    },
+    "l4_m1_cv2_act": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03871639131561039,
+        "zero_point": 0
+      }
+    },
+    "add_2": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05062998373677412,
+        "zero_point": 0
+      }
+    },
+    "cat_1": {
+      "shape": [
+        1,
+        128,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05514831242598887,
+        "zero_point": 0
+      }
+    },
+    "l4_cv2_conv": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.018978188357015296,
+        "zero_point": 0
+      }
+    },
+    "l4_cv2_bn": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05028058975700318,
+        "zero_point": 0
+      }
+    },
+    "l4_cv2_act": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.031507488310806395,
+        "zero_point": 0
+      }
+    },
+    "l5_conv": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.016447699914767046,
+        "zero_point": 0
+      }
+    },
+    "l5_bn": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0439483424809974,
+        "zero_point": 0
+      }
+    },
+    "l5_act": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.024195759315190354,
+        "zero_point": 0
+      }
+    },
+    "l6_cv1_conv": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008332582909291186,
+        "zero_point": 0
+      }
+    },
+    "l6_cv1_bn": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.08423010007602962,
+        "zero_point": 0
+      }
+    },
+    "l6_cv1_act": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03470022847333292,
+        "zero_point": 0
+      }
+    },
+    "getitem_4": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03470022847333292,
+        "zero_point": 0
+      }
+    },
+    "getitem_5": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.023816136863287977,
+        "zero_point": 0
+      }
+    },
+    "l6_m0_cv1_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.014606254307303841,
+        "zero_point": 0
+      }
+    },
+    "l6_m0_cv1_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05815973056582954,
+        "zero_point": 0
+      }
+    },
+    "l6_m0_cv1_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.026069639235969604,
+        "zero_point": 0
+      }
+    },
+    "l6_m0_cv2_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.006764732946561078,
+        "zero_point": 0
+      }
+    },
+    "l6_m0_cv2_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.025352703304741327,
+        "zero_point": 0
+      }
+    },
+    "l6_m0_cv2_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.015953080860648568,
+        "zero_point": 0
+      }
+    },
+    "add_3": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.028212092992827648,
+        "zero_point": 0
+      }
+    },
+    "l6_m1_cv1_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008538576561634936,
+        "zero_point": 0
+      }
+    },
+    "l6_m1_cv1_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.027576609859316367,
+        "zero_point": 0
+      }
+    },
+    "l6_m1_cv1_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01236960456127257,
+        "zero_point": 0
+      }
+    },
+    "l6_m1_cv2_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.006702547936927615,
+        "zero_point": 0
+      }
+    },
+    "l6_m1_cv2_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.028054393182589312,
+        "zero_point": 0
+      }
+    },
+    "l6_m1_cv2_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02584997687752791,
+        "zero_point": 0
+      }
+    },
+    "add_4": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.034507207044466276,
+        "zero_point": 0
+      }
+    },
+    "cat_2": {
+      "shape": [
+        1,
+        256,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03470022847333292,
+        "zero_point": 0
+      }
+    },
+    "l6_cv2_conv": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.015491906113511934,
+        "zero_point": 0
+      }
+    },
+    "l6_cv2_bn": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03694900377528874,
+        "zero_point": 0
+      }
+    },
+    "l6_cv2_act": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.016864530683502438,
+        "zero_point": 0
+      }
+    },
+    "l7_conv": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008299510310015341,
+        "zero_point": 0
+      }
+    },
+    "l7_bn": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.04128670129250354,
+        "zero_point": 0
+      }
+    },
+    "l7_act": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02100896459864819,
+        "zero_point": 0
+      }
+    },
+    "l8_cv1_conv": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.005075631179208831,
+        "zero_point": 0
+      }
+    },
+    "l8_cv1_bn": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05822551532054511,
+        "zero_point": 0
+      }
+    },
+    "l8_cv1_act": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05818975628830317,
+        "zero_point": 0
+      }
+    },
+    "getitem_6": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05818975628830317,
+        "zero_point": 0
+      }
+    },
+    "getitem_7": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.016074398371178335,
+        "zero_point": 0
+      }
+    },
+    "l8_m0_cv1_conv": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.005455979681390477,
+        "zero_point": 0
+      }
+    },
+    "l8_m0_cv1_bn": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03470181292436254,
+        "zero_point": 0
+      }
+    },
+    "l8_m0_cv1_act": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01911665135481226,
+        "zero_point": 0
+      }
+    },
+    "l8_m0_cv2_conv": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.016925139690008688,
+        "zero_point": 0
+      }
+    },
+    "l8_m0_cv2_bn": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05893637063935047,
+        "zero_point": 0
+      }
+    },
+    "l8_m0_cv2_act": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03702321015005037,
+        "zero_point": 0
+      }
+    },
+    "add_5": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03574434040099617,
+        "zero_point": 0
+      }
+    },
+    "cat_3": {
+      "shape": [
+        1,
+        384,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05818975628830317,
+        "zero_point": 0
+      }
+    },
+    "l8_cv2_conv": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.010919200153801385,
+        "zero_point": 0
+      }
+    },
+    "l8_cv2_bn": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03452031443438192,
+        "zero_point": 0
+      }
+    },
+    "l8_cv2_act": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02252406773604746,
+        "zero_point": 0
+      }
+    },
+    "l9_cv1_conv": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.006528291176623247,
+        "zero_point": 0
+      }
+    },
+    "l9_cv1_bn": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03645714812391386,
+        "zero_point": 0
+      }
+    },
+    "l9_cv1_act": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03610497196828286,
+        "zero_point": 0
+      }
+    },
+    "l9_m1": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03610497196828286,
+        "zero_point": 0
+      }
+    },
+    "l9_m2": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03610497196828286,
+        "zero_point": 0
+      }
+    },
+    "l9_m3": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03610497196828286,
+        "zero_point": 0
+      }
+    },
+    "cat_4": {
+      "shape": [
+        1,
+        512,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03610497196828286,
+        "zero_point": 0
+      }
+    },
+    "l9_cv2_conv": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01881530341200941,
+        "zero_point": 0
+      }
+    },
+    "l9_cv2_bn": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03692165509922298,
+        "zero_point": 0
+      }
+    },
+    "l9_cv2_act": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.022113056633416124,
+        "zero_point": 0
+      }
+    },
+    "l10": {
+      "shape": [
+        1,
+        256,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.022113056633416124,
+        "zero_point": 0
+      }
+    },
+    "cat_5": {
+      "shape": [
+        1,
+        384,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.022113056633416124,
+        "zero_point": 0
+      }
+    },
+    "l12_cv1_conv": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.006381873070724367,
+        "zero_point": 0
+      }
+    },
+    "l12_cv1_bn": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03387257808775414,
+        "zero_point": 0
+      }
+    },
+    "l12_cv1_act": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.023193723573459415,
+        "zero_point": 0
+      }
+    },
+    "getitem_8": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.018704592712282194,
+        "zero_point": 0
+      }
+    },
+    "getitem_9": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.023193723573459415,
+        "zero_point": 0
+      }
+    },
+    "l12_m0_cv1_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.009509852552038478,
+        "zero_point": 0
+      }
+    },
+    "l12_m0_cv1_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03736973559762549,
+        "zero_point": 0
+      }
+    },
+    "l12_m0_cv1_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.015285429053419218,
+        "zero_point": 0
+      }
+    },
+    "l12_m0_cv2_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.004544494189615325,
+        "zero_point": 0
+      }
+    },
+    "l12_m0_cv2_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02525625266428069,
+        "zero_point": 0
+      }
+    },
+    "l12_m0_cv2_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01872047101418803,
+        "zero_point": 0
+      }
+    },
+    "cat_6": {
+      "shape": [
+        1,
+        192,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.023193723573459415,
+        "zero_point": 0
+      }
+    },
+    "l12_cv2_conv": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008015148282989742,
+        "zero_point": 0
+      }
+    },
+    "l12_cv2_bn": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03113780246944878,
+        "zero_point": 0
+      }
+    },
+    "l12_cv2_act": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01839844072897603,
+        "zero_point": 0
+      }
+    },
+    "l13": {
+      "shape": [
+        1,
+        128,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01839844072897603,
+        "zero_point": 0
+      }
+    },
+    "cat_7": {
+      "shape": [
+        1,
+        192,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.031507488310806395,
+        "zero_point": 0
+      }
+    },
+    "l15_cv1_conv": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.009591851647444598,
+        "zero_point": 0
+      }
+    },
+    "l15_cv1_bn": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.043114391837533066,
+        "zero_point": 0
+      }
+    },
+    "l15_cv1_act": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01936891135268324,
+        "zero_point": 0
+      }
+    },
+    "getitem_10": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.016165703300416,
+        "zero_point": 0
+      }
+    },
+    "getitem_11": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01936891135268324,
+        "zero_point": 0
+      }
+    },
+    "l15_m0_cv1_conv": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008817537563053642,
+        "zero_point": 0
+      }
+    },
+    "l15_m0_cv1_bn": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.030306902457409957,
+        "zero_point": 0
+      }
+    },
+    "l15_m0_cv1_act": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.015353158703000526,
+        "zero_point": 0
+      }
+    },
+    "l15_m0_cv2_conv": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.006148752734417052,
+        "zero_point": 0
+      }
+    },
+    "l15_m0_cv2_bn": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03362727728415662,
+        "zero_point": 0
+      }
+    },
+    "l15_m0_cv2_act": {
+      "shape": [
+        1,
+        32,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03316389294121209,
+        "zero_point": 0
+      }
+    },
+    "cat_8": {
+      "shape": [
+        1,
+        96,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03316389294121209,
+        "zero_point": 0
+      }
+    },
+    "l15_cv2_conv": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008308523283230038,
+        "zero_point": 0
+      }
+    },
+    "l15_cv2_bn": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03917479702806848,
+        "zero_point": 0
+      }
+    },
+    "l15_cv2_act": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.023813273963027112,
+        "zero_point": 0
+      }
+    },
+    "l16_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008904252465315692,
+        "zero_point": 0
+      }
+    },
+    "l16_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.030854854058092972,
+        "zero_point": 0
+      }
+    },
+    "l16_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.029222938958115466,
+        "zero_point": 0
+      }
+    },
+    "cat_9": {
+      "shape": [
+        1,
+        192,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.029222938958115466,
+        "zero_point": 0
+      }
+    },
+    "l18_cv1_conv": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.007269432225565272,
+        "zero_point": 0
+      }
+    },
+    "l18_cv1_bn": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.033914746261957125,
+        "zero_point": 0
+      }
+    },
+    "l18_cv1_act": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.025857435436699334,
+        "zero_point": 0
+      }
+    },
+    "getitem_12": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.018757621134360004,
+        "zero_point": 0
+      }
+    },
+    "getitem_13": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.025857435436699334,
+        "zero_point": 0
+      }
+    },
+    "l18_m0_cv1_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008875890979616661,
+        "zero_point": 0
+      }
+    },
+    "l18_m0_cv1_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.034058852458563375,
+        "zero_point": 0
+      }
+    },
+    "l18_m0_cv1_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.017162281697190654,
+        "zero_point": 0
+      }
+    },
+    "l18_m0_cv2_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.004975964703897792,
+        "zero_point": 0
+      }
+    },
+    "l18_m0_cv2_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.051078372114286646,
+        "zero_point": 0
+      }
+    },
+    "l18_m0_cv2_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.031642902554489497,
+        "zero_point": 0
+      }
+    },
+    "cat_10": {
+      "shape": [
+        1,
+        192,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.031642902554489497,
+        "zero_point": 0
+      }
+    },
+    "l18_cv2_conv": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.006709422182849073,
+        "zero_point": 0
+      }
+    },
+    "l18_cv2_bn": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.06003264179379921,
+        "zero_point": 0
+      }
+    },
+    "l18_cv2_act": {
+      "shape": [
+        1,
+        128,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02004847000903032,
+        "zero_point": 0
+      }
+    },
+    "l19_conv": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.007596582408965103,
+        "zero_point": 0
+      }
+    },
+    "l19_bn": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.06005655498955193,
+        "zero_point": 0
+      }
+    },
+    "l19_act": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02363851689916896,
+        "zero_point": 0
+      }
+    },
+    "cat_11": {
+      "shape": [
+        1,
+        384,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02363851689916896,
+        "zero_point": 0
+      }
+    },
+    "l21_cv1_conv": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0048166194300013265,
+        "zero_point": 0
+      }
+    },
+    "l21_cv1_bn": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.04150058716300904,
+        "zero_point": 0
+      }
+    },
+    "l21_cv1_act": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0303006059541477,
+        "zero_point": 0
+      }
+    },
+    "getitem_14": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02144656782075176,
+        "zero_point": 0
+      }
+    },
+    "getitem_15": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0303006059541477,
+        "zero_point": 0
+      }
+    },
+    "l21_m0_cv1_conv": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.00661490282674474,
+        "zero_point": 0
+      }
+    },
+    "l21_m0_cv1_bn": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.051605716465026374,
+        "zero_point": 0
+      }
+    },
+    "l21_m0_cv1_act": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.025704796858659878,
+        "zero_point": 0
+      }
+    },
+    "l21_m0_cv2_conv": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0064945033216100975,
+        "zero_point": 0
+      }
+    },
+    "l21_m0_cv2_bn": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.04361754515039639,
+        "zero_point": 0
+      }
+    },
+    "l21_m0_cv2_act": {
+      "shape": [
+        1,
+        128,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.031195321420984943,
+        "zero_point": 0
+      }
+    },
+    "cat_12": {
+      "shape": [
+        1,
+        384,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.031195321420984943,
+        "zero_point": 0
+      }
+    },
+    "l21_cv2_conv": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.005776418475654181,
+        "zero_point": 0
+      }
+    },
+    "l21_cv2_bn": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.08263558665598471,
+        "zero_point": 0
+      }
+    },
+    "l21_cv2_act": {
+      "shape": [
+        1,
+        256,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03225957314799151,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_0_0_conv": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008766103917219508,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_0_0_bn": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.048428092415877214,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_0_0_act": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.02901811862555076,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_0_1_conv": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008832512878057525,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_0_1_bn": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.16049312982033556,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_0_1_act": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.16049312982033556,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_0_2": {
+      "shape": [
+        1,
+        64,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.08941464912234329,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_0_0_conv": {
+      "shape": [
+        1,
+        80,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008172722313347765,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_0_0_bn": {
+      "shape": [
+        1,
+        80,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0384392813434751,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_0_0_act": {
+      "shape": [
+        1,
+        80,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.021337708150307964,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_0_1_conv": {
+      "shape": [
+        1,
+        80,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.007390868945384588,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_0_1_bn": {
+      "shape": [
+        1,
+        80,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.12050582104780543,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_0_1_act": {
+      "shape": [
+        1,
+        80,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.12050579101081908,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_0_2": {
+      "shape": [
+        1,
+        80,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.15180701909102792,
+        "zero_point": 0
+      }
+    },
+    "cat_13": {
+      "shape": [
+        1,
+        144,
+        20,
+        20
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.15180701909102792,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_1_0_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.007305627732765017,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_1_0_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.06187797155905896,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_1_0_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.03935792877918153,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_1_1_conv": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.01118113487724244,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_1_1_bn": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.10951170583409588,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_1_1_act": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.1094233745665062,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_1_2": {
+      "shape": [
+        1,
+        64,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.07722050373948465,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_1_0_conv": {
+      "shape": [
+        1,
+        80,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.006994858970792275,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_1_0_bn": {
+      "shape": [
+        1,
+        80,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.05750460887518455,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_1_0_act": {
+      "shape": [
+        1,
+        80,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.026091493020846148,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_1_1_conv": {
+      "shape": [
+        1,
+        80,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.008055220438739446,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_1_1_bn": {
+      "shape": [
+        1,
+        80,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.3083521925558255,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_1_1_act": {
+      "shape": [
+        1,
+        80,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.3083521925558255,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_1_2": {
+      "shape": [
+        1,
+        80,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.1883678886834092,
+        "zero_point": 0
+      }
+    },
+    "cat_14": {
+      "shape": [
+        1,
+        144,
+        10,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.1883678886834092,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_2_0_conv": {
+      "shape": [
+        1,
+        64,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0075983719562921,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_2_0_bn": {
+      "shape": [
+        1,
+        64,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.051004064364696115,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_2_0_act": {
+      "shape": [
+        1,
+        64,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.04409660504558894,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_2_1_conv": {
+      "shape": [
+        1,
+        64,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.013167214205884558,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_2_1_bn": {
+      "shape": [
+        1,
+        64,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.09668323186438853,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_2_1_act": {
+      "shape": [
+        1,
+        64,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.09668278130959337,
+        "zero_point": 0
+      }
+    },
+    "detect_cv2_2_2": {
+      "shape": [
+        1,
+        64,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.08016772533026267,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_2_0_conv": {
+      "shape": [
+        1,
+        80,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.007507533538998581,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_2_0_bn": {
+      "shape": [
+        1,
+        80,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.09927902071494756,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_2_0_act": {
+      "shape": [
+        1,
+        80,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.04360158424677811,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_2_1_conv": {
+      "shape": [
+        1,
+        80,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.00868006015387107,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_2_1_bn": {
+      "shape": [
+        1,
+        80,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.44704214982160434,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_2_1_act": {
+      "shape": [
+        1,
+        80,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.44704214982160434,
+        "zero_point": 0
+      }
+    },
+    "detect_cv3_2_2": {
+      "shape": [
+        1,
+        80,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.24662043353704016,
+        "zero_point": 0
+      }
+    },
+    "cat_15": {
+      "shape": [
+        1,
+        144,
+        5,
+        5
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.24662043353704016,
+        "zero_point": 0
+      }
+    }
+  },
+  "ops": [
+    {
+      "name": "l0.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "x"
+      ],
+      "outputs": [
+        "l0_conv"
+      ],
+      "weight": "l0.conv.weight_q",
+      "bias": "l0.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 3,
+        "IH": 160,
+        "IW": 160,
+        "OC": 16,
+        "OH": 80,
+        "OW": 80,
+        "KH": 3,
+        "KW": 3,
+        "SH": 2,
+        "SW": 2,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1826238863,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 0,
+      "hardware_target": "any",
+      "depends_on": []
+    },
+    {
+      "name": "l0.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l0_conv"
+      ],
+      "outputs": [
+        "l0_bn"
+      ],
+      "weight": "l0.bn.scale",
+      "bias": "l0.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 16,
+        "H": 80,
+        "W": 80
+      },
+      "quant": {
+        "scale_in": 0.0424402191882997,
+        "scale_out": 1.0770463117464322,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 1,
+      "hardware_target": "any",
+      "depends_on": [
+        0
+      ]
+    },
+    {
+      "name": "l0.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l0_bn"
+      ],
+      "outputs": [
+        "l0_act"
+      ],
+      "shape": {
+        "n": 102400
+      },
+      "quant": {
+        "scale_in": 1.0770463117464322,
+        "scale_out": 1.0770463117464322,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 2,
+      "hardware_target": "any",
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "name": "l1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l0_act"
+      ],
+      "outputs": [
+        "l1_conv"
+      ],
+      "weight": "l1.conv.weight_q",
+      "bias": "l1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 16,
+        "IH": 80,
+        "IW": 80,
+        "OC": 32,
+        "OH": 40,
+        "OW": 40,
+        "KH": 3,
+        "KW": 3,
+        "SH": 2,
+        "SW": 2,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1075349236,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 3,
+      "hardware_target": "any",
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "name": "l1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l1_conv"
+      ],
+      "outputs": [
+        "l1_bn"
+      ],
+      "weight": "l1.bn.scale",
+      "bias": "l1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 40,
+        "W": 40
+      },
+      "quant": {
+        "scale_in": 0.5853506974347933,
+        "scale_out": 2.061787282388041,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 4,
+      "hardware_target": "any",
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "name": "l1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l1_bn"
+      ],
+      "outputs": [
+        "l1_act"
+      ],
+      "shape": {
+        "n": 51200
+      },
+      "quant": {
+        "scale_in": 2.061787282388041,
+        "scale_out": 2.061787282388041,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 5,
+      "hardware_target": "any",
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "name": "l2.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l1_act"
+      ],
+      "outputs": [
+        "l2_cv1_conv"
+      ],
+      "weight": "l2.cv1.conv.weight_q",
+      "bias": "l2.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 40,
+        "IW": 40,
+        "OC": 32,
+        "OH": 40,
+        "OW": 40,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1371194109,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 6,
+      "hardware_target": "any",
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "name": "l2.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l2_cv1_conv"
+      ],
+      "outputs": [
+        "l2_cv1_bn"
+      ],
+      "weight": "l2.cv1.bn.scale",
+      "bias": "l2.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 40,
+        "W": 40
+      },
+      "quant": {
+        "scale_in": 0.9280340840497355,
+        "scale_out": 1.7280690350870447,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 7,
+      "hardware_target": "any",
+      "depends_on": [
+        6
+      ]
+    },
+    {
+      "name": "l2.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l2_cv1_bn"
+      ],
+      "outputs": [
+        "l2_cv1_act"
+      ],
+      "shape": {
+        "n": 51200
+      },
+      "quant": {
+        "scale_in": 1.7280690350870447,
+        "scale_out": 0.5965576772614727,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 8,
+      "hardware_target": "any",
+      "depends_on": [
+        7
+      ]
+    },
+    {
+      "name": "chunk",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l2_cv1_act"
+      ],
+      "outputs": [
+        "getitem",
+        "getitem_1"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 40,
+        "W": 40,
+        "c_each": 16
+      },
+      "dispatch_id": 9,
+      "hardware_target": "any",
+      "depends_on": [
+        8
+      ]
+    },
+    {
+      "name": "l2.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_1"
+      ],
+      "outputs": [
+        "l2_m0_cv1_conv"
+      ],
+      "weight": "l2.m0.cv1.conv.weight_q",
+      "bias": "l2.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 16,
+        "IH": 40,
+        "IW": 40,
+        "OC": 16,
+        "OH": 40,
+        "OW": 40,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1248671916,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 10,
+      "hardware_target": "any",
+      "depends_on": [
+        9
+      ]
+    },
+    {
+      "name": "l2.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l2_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l2_m0_cv1_bn"
+      ],
+      "weight": "l2.m0.cv1.bn.scale",
+      "bias": "l2.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 16,
+        "H": 40,
+        "W": 40
+      },
+      "quant": {
+        "scale_in": 0.101996654600609,
+        "scale_out": 0.5504686250461368,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 11,
+      "hardware_target": "any",
+      "depends_on": [
+        10
+      ]
+    },
+    {
+      "name": "l2.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l2_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l2_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.5504686250461368,
+        "scale_out": 0.4670071939783772,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 12,
+      "hardware_target": "any",
+      "depends_on": [
+        11
+      ]
+    },
+    {
+      "name": "l2.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l2_m0_cv1_act"
+      ],
+      "outputs": [
+        "l2_m0_cv2_conv"
+      ],
+      "weight": "l2.m0.cv2.conv.weight_q",
+      "bias": "l2.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 16,
+        "IH": 40,
+        "IW": 40,
+        "OC": 16,
+        "OH": 40,
+        "OW": 40,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1683154089,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 13,
+      "hardware_target": "any",
+      "depends_on": [
+        12
+      ]
+    },
+    {
+      "name": "l2.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l2_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l2_m0_cv2_bn"
+      ],
+      "weight": "l2.m0.cv2.bn.scale",
+      "bias": "l2.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 16,
+        "H": 40,
+        "W": 40
+      },
+      "quant": {
+        "scale_in": 0.2524695509062039,
+        "scale_out": 0.5168319461852546,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 14,
+      "hardware_target": "any",
+      "depends_on": [
+        13
+      ]
+    },
+    {
+      "name": "l2.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l2_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l2_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.5168319461852546,
+        "scale_out": 0.4690301249346395,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 15,
+      "hardware_target": "any",
+      "depends_on": [
+        14
+      ]
+    },
+    {
+      "name": "add",
+      "op": "add_s8",
+      "inputs": [
+        "getitem_1",
+        "l2_m0_cv2_act"
+      ],
+      "outputs": [
+        "add"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_a": 0.23400270657276545,
+        "scale_b": 0.4690301249346395,
+        "scale_out": 0.5289313849501722,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 16,
+      "hardware_target": "any",
+      "depends_on": [
+        9,
+        15
+      ]
+    },
+    {
+      "name": "cat",
+      "op": "cat3_c1_s8",
+      "inputs": [
+        "getitem",
+        "getitem_1",
+        "add"
+      ],
+      "outputs": [
+        "cat"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 40,
+        "W": 40,
+        "C_inputs": [
+          16,
+          16,
+          16
+        ],
+        "C_total": 48
+      },
+      "quant": {
+        "scales_in": [
+          0.5965576772614727,
+          0.23400270657276545,
+          0.5289313849501722
+        ],
+        "scale_out": 0.5965576772614727,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 17,
+      "hardware_target": "any",
+      "depends_on": [
+        9,
+        16
+      ]
+    },
+    {
+      "name": "l2.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat"
+      ],
+      "outputs": [
+        "l2_cv2_conv"
+      ],
+      "weight": "l2.cv2.conv.weight_q",
+      "bias": "l2.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 48,
+        "IH": 40,
+        "IW": 40,
+        "OC": 32,
+        "OH": 40,
+        "OW": 40,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1834618949,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 18,
+      "hardware_target": "any",
+      "depends_on": [
+        17
+      ]
+    },
+    {
+      "name": "l2.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l2_cv2_conv"
+      ],
+      "outputs": [
+        "l2_cv2_bn"
+      ],
+      "weight": "l2.cv2.bn.scale",
+      "bias": "l2.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 40,
+        "W": 40
+      },
+      "quant": {
+        "scale_in": 0.16056912339578464,
+        "scale_out": 0.34824221152958906,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 19,
+      "hardware_target": "any",
+      "depends_on": [
+        18
+      ]
+    },
+    {
+      "name": "l2.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l2_cv2_bn"
+      ],
+      "outputs": [
+        "l2_cv2_act"
+      ],
+      "shape": {
+        "n": 51200
+      },
+      "quant": {
+        "scale_in": 0.34824221152958906,
+        "scale_out": 0.13530343724048044,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 20,
+      "hardware_target": "any",
+      "depends_on": [
+        19
+      ]
+    },
+    {
+      "name": "l3.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l2_cv2_act"
+      ],
+      "outputs": [
+        "l3_conv"
+      ],
+      "weight": "l3.conv.weight_q",
+      "bias": "l3.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 40,
+        "IW": 40,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 2,
+        "SW": 2,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2027291667,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 21,
+      "hardware_target": "any",
+      "depends_on": [
+        20
+      ]
+    },
+    {
+      "name": "l3.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l3_conv"
+      ],
+      "outputs": [
+        "l3_bn"
+      ],
+      "weight": "l3.bn.scale",
+      "bias": "l3.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.075965160459984,
+        "scale_out": 0.10471630847360205,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 22,
+      "hardware_target": "any",
+      "depends_on": [
+        21
+      ]
+    },
+    {
+      "name": "l3.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l3_bn"
+      ],
+      "outputs": [
+        "l3_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.10471630847360205,
+        "scale_out": 0.060605090434157,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 23,
+      "hardware_target": "any",
+      "depends_on": [
+        22
+      ]
+    },
+    {
+      "name": "l4.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l3_act"
+      ],
+      "outputs": [
+        "l4_cv1_conv"
+      ],
+      "weight": "l4.cv1.conv.weight_q",
+      "bias": "l4.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1415769460,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 24,
+      "hardware_target": "any",
+      "depends_on": [
+        23
+      ]
+    },
+    {
+      "name": "l4.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l4_cv1_conv"
+      ],
+      "outputs": [
+        "l4_cv1_bn"
+      ],
+      "weight": "l4.cv1.bn.scale",
+      "bias": "l4.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.028795268591933362,
+        "scale_out": 0.10024888496699295,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 25,
+      "hardware_target": "any",
+      "depends_on": [
+        24
+      ]
+    },
+    {
+      "name": "l4.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l4_cv1_bn"
+      ],
+      "outputs": [
+        "l4_cv1_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.10024888496699295,
+        "scale_out": 0.05514831242598887,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 26,
+      "hardware_target": "any",
+      "depends_on": [
+        25
+      ]
+    },
+    {
+      "name": "chunk_1",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l4_cv1_act"
+      ],
+      "outputs": [
+        "getitem_2",
+        "getitem_3"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20,
+        "c_each": 32
+      },
+      "dispatch_id": 27,
+      "hardware_target": "any",
+      "depends_on": [
+        26
+      ]
+    },
+    {
+      "name": "l4.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_3"
+      ],
+      "outputs": [
+        "l4_m0_cv1_conv"
+      ],
+      "weight": "l4.m0.cv1.conv.weight_q",
+      "bias": "l4.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 20,
+        "IW": 20,
+        "OC": 32,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1935816465,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 28,
+      "hardware_target": "any",
+      "depends_on": [
+        27
+      ]
+    },
+    {
+      "name": "l4.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l4_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l4_m0_cv1_bn"
+      ],
+      "weight": "l4.m0.cv1.bn.scale",
+      "bias": "l4.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.017798748542004684,
+        "scale_out": 0.040652027280311885,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 29,
+      "hardware_target": "any",
+      "depends_on": [
+        28
+      ]
+    },
+    {
+      "name": "l4.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l4_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l4_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.040652027280311885,
+        "scale_out": 0.02503994881637453,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 30,
+      "hardware_target": "any",
+      "depends_on": [
+        29
+      ]
+    },
+    {
+      "name": "l4.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l4_m0_cv1_act"
+      ],
+      "outputs": [
+        "l4_m0_cv2_conv"
+      ],
+      "weight": "l4.m0.cv2.conv.weight_q",
+      "bias": "l4.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 20,
+        "IW": 20,
+        "OC": 32,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1445559680,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 31,
+      "hardware_target": "any",
+      "depends_on": [
+        30
+      ]
+    },
+    {
+      "name": "l4.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l4_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l4_m0_cv2_bn"
+      ],
+      "weight": "l4.m0.cv2.bn.scale",
+      "bias": "l4.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.010077687699025072,
+        "scale_out": 0.03059682883615569,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 32,
+      "hardware_target": "any",
+      "depends_on": [
+        31
+      ]
+    },
+    {
+      "name": "l4.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l4_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l4_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.03059682883615569,
+        "scale_out": 0.02461226343169926,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 33,
+      "hardware_target": "any",
+      "depends_on": [
+        32
+      ]
+    },
+    {
+      "name": "add_1",
+      "op": "add_s8",
+      "inputs": [
+        "getitem_3",
+        "l4_m0_cv2_act"
+      ],
+      "outputs": [
+        "add_1"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_a": 0.02650588891637607,
+        "scale_b": 0.02461226343169926,
+        "scale_out": 0.035305916793703096,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 34,
+      "hardware_target": "any",
+      "depends_on": [
+        27,
+        33
+      ]
+    },
+    {
+      "name": "l4.m1.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "add_1"
+      ],
+      "outputs": [
+        "l4_m1_cv1_conv"
+      ],
+      "weight": "l4.m1.cv1.conv.weight_q",
+      "bias": "l4.m1.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 20,
+        "IW": 20,
+        "OC": 32,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1094311145,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 35,
+      "hardware_target": "any",
+      "depends_on": [
+        34
+      ]
+    },
+    {
+      "name": "l4.m1.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l4_m1_cv1_conv"
+      ],
+      "outputs": [
+        "l4_m1_cv1_bn"
+      ],
+      "weight": "l4.m1.cv1.bn.scale",
+      "bias": "l4.m1.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.017406384775957722,
+        "scale_out": 0.03250332704679234,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 36,
+      "hardware_target": "any",
+      "depends_on": [
+        35
+      ]
+    },
+    {
+      "name": "l4.m1.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l4_m1_cv1_bn"
+      ],
+      "outputs": [
+        "l4_m1_cv1_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.03250332704679234,
+        "scale_out": 0.011420421712980496,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 37,
+      "hardware_target": "any",
+      "depends_on": [
+        36
+      ]
+    },
+    {
+      "name": "l4.m1.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l4_m1_cv1_act"
+      ],
+      "outputs": [
+        "l4_m1_cv2_conv"
+      ],
+      "weight": "l4.m1.cv2.conv.weight_q",
+      "bias": "l4.m1.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 20,
+        "IW": 20,
+        "OC": 32,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1257754293,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 38,
+      "hardware_target": "any",
+      "depends_on": [
+        37
+      ]
+    },
+    {
+      "name": "l4.m1.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l4_m1_cv2_conv"
+      ],
+      "outputs": [
+        "l4_m1_cv2_bn"
+      ],
+      "weight": "l4.m1.cv2.bn.scale",
+      "bias": "l4.m1.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.004454966135851042,
+        "scale_out": 0.038990155918391674,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 39,
+      "hardware_target": "any",
+      "depends_on": [
+        38
+      ]
+    },
+    {
+      "name": "l4.m1.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l4_m1_cv2_bn"
+      ],
+      "outputs": [
+        "l4_m1_cv2_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.038990155918391674,
+        "scale_out": 0.03871639131561039,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 40,
+      "hardware_target": "any",
+      "depends_on": [
+        39
+      ]
+    },
+    {
+      "name": "add_2",
+      "op": "add_s8",
+      "inputs": [
+        "add_1",
+        "l4_m1_cv2_act"
+      ],
+      "outputs": [
+        "add_2"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_a": 0.035305916793703096,
+        "scale_b": 0.03871639131561039,
+        "scale_out": 0.05062998373677412,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 41,
+      "hardware_target": "any",
+      "depends_on": [
+        34,
+        40
+      ]
+    },
+    {
+      "name": "cat_1",
+      "op": "cat4_c1_s8",
+      "inputs": [
+        "getitem_2",
+        "getitem_3",
+        "add_1",
+        "add_2"
+      ],
+      "outputs": [
+        "cat_1"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 20,
+        "W": 20,
+        "C_inputs": [
+          32,
+          32,
+          32,
+          32
+        ],
+        "C_total": 128
+      },
+      "quant": {
+        "scales_in": [
+          0.05514831242598887,
+          0.02650588891637607,
+          0.035305916793703096,
+          0.05062998373677412
+        ],
+        "scale_out": 0.05514831242598887,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 42,
+      "hardware_target": "any",
+      "depends_on": [
+        27,
+        34,
+        41
+      ]
+    },
+    {
+      "name": "l4.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_1"
+      ],
+      "outputs": [
+        "l4_cv2_conv"
+      ],
+      "weight": "l4.cv2.conv.weight_q",
+      "bias": "l4.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1827261073,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 43,
+      "hardware_target": "any",
+      "depends_on": [
+        42
+      ]
+    },
+    {
+      "name": "l4.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l4_cv2_conv"
+      ],
+      "outputs": [
+        "l4_cv2_bn"
+      ],
+      "weight": "l4.cv2.bn.scale",
+      "bias": "l4.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.018978188357015296,
+        "scale_out": 0.05028058975700318,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 44,
+      "hardware_target": "any",
+      "depends_on": [
+        43
+      ]
+    },
+    {
+      "name": "l4.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l4_cv2_bn"
+      ],
+      "outputs": [
+        "l4_cv2_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.05028058975700318,
+        "scale_out": 0.031507488310806395,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 45,
+      "hardware_target": "any",
+      "depends_on": [
+        44
+      ]
+    },
+    {
+      "name": "l5.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l4_cv2_act"
+      ],
+      "outputs": [
+        "l5_conv"
+      ],
+      "weight": "l5.conv.weight_q",
+      "bias": "l5.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 20,
+        "IW": 20,
+        "OC": 128,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 2,
+        "SW": 2,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1638821395,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 46,
+      "hardware_target": "any",
+      "depends_on": [
+        45
+      ]
+    },
+    {
+      "name": "l5.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l5_conv"
+      ],
+      "outputs": [
+        "l5_bn"
+      ],
+      "weight": "l5.bn.scale",
+      "bias": "l5.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.016447699914767046,
+        "scale_out": 0.0439483424809974,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 47,
+      "hardware_target": "any",
+      "depends_on": [
+        46
+      ]
+    },
+    {
+      "name": "l5.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l5_bn"
+      ],
+      "outputs": [
+        "l5_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.0439483424809974,
+        "scale_out": 0.024195759315190354,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 48,
+      "hardware_target": "any",
+      "depends_on": [
+        47
+      ]
+    },
+    {
+      "name": "l6.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l5_act"
+      ],
+      "outputs": [
+        "l6_cv1_conv"
+      ],
+      "weight": "l6.cv1.conv.weight_q",
+      "bias": "l6.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 10,
+        "IW": 10,
+        "OC": 128,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1559707503,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 49,
+      "hardware_target": "any",
+      "depends_on": [
+        48
+      ]
+    },
+    {
+      "name": "l6.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l6_cv1_conv"
+      ],
+      "outputs": [
+        "l6_cv1_bn"
+      ],
+      "weight": "l6.cv1.bn.scale",
+      "bias": "l6.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.008332582909291186,
+        "scale_out": 0.08423010007602962,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 50,
+      "hardware_target": "any",
+      "depends_on": [
+        49
+      ]
+    },
+    {
+      "name": "l6.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l6_cv1_bn"
+      ],
+      "outputs": [
+        "l6_cv1_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.08423010007602962,
+        "scale_out": 0.03470022847333292,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 51,
+      "hardware_target": "any",
+      "depends_on": [
+        50
+      ]
+    },
+    {
+      "name": "chunk_2",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l6_cv1_act"
+      ],
+      "outputs": [
+        "getitem_4",
+        "getitem_5"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10,
+        "c_each": 64
+      },
+      "dispatch_id": 52,
+      "hardware_target": "any",
+      "depends_on": [
+        51
+      ]
+    },
+    {
+      "name": "l6.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_5"
+      ],
+      "outputs": [
+        "l6_m0_cv1_conv"
+      ],
+      "weight": "l6.m0.cv1.conv.weight_q",
+      "bias": "l6.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1658591211,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 53,
+      "hardware_target": "any",
+      "depends_on": [
+        52
+      ]
+    },
+    {
+      "name": "l6.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l6_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l6_m0_cv1_bn"
+      ],
+      "weight": "l6.m0.cv1.bn.scale",
+      "bias": "l6.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.014606254307303841,
+        "scale_out": 0.05815973056582954,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 54,
+      "hardware_target": "any",
+      "depends_on": [
+        53
+      ]
+    },
+    {
+      "name": "l6.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l6_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l6_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.05815973056582954,
+        "scale_out": 0.026069639235969604,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 55,
+      "hardware_target": "any",
+      "depends_on": [
+        54
+      ]
+    },
+    {
+      "name": "l6.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l6_m0_cv1_act"
+      ],
+      "outputs": [
+        "l6_m0_cv2_conv"
+      ],
+      "weight": "l6.m0.cv2.conv.weight_q",
+      "bias": "l6.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1759439240,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 56,
+      "hardware_target": "any",
+      "depends_on": [
+        55
+      ]
+    },
+    {
+      "name": "l6.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l6_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l6_m0_cv2_bn"
+      ],
+      "weight": "l6.m0.cv2.bn.scale",
+      "bias": "l6.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.006764732946561078,
+        "scale_out": 0.025352703304741327,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 57,
+      "hardware_target": "any",
+      "depends_on": [
+        56
+      ]
+    },
+    {
+      "name": "l6.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l6_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l6_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.025352703304741327,
+        "scale_out": 0.015953080860648568,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 58,
+      "hardware_target": "any",
+      "depends_on": [
+        57
+      ]
+    },
+    {
+      "name": "add_3",
+      "op": "add_s8",
+      "inputs": [
+        "getitem_5",
+        "l6_m0_cv2_act"
+      ],
+      "outputs": [
+        "add_3"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_a": 0.023816136863287977,
+        "scale_b": 0.015953080860648568,
+        "scale_out": 0.028212092992827648,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 59,
+      "hardware_target": "any",
+      "depends_on": [
+        52,
+        58
+      ]
+    },
+    {
+      "name": "l6.m1.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "add_3"
+      ],
+      "outputs": [
+        "l6_m1_cv1_conv"
+      ],
+      "weight": "l6.m1.cv1.conv.weight_q",
+      "bias": "l6.m1.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1391503546,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 60,
+      "hardware_target": "any",
+      "depends_on": [
+        59
+      ]
+    },
+    {
+      "name": "l6.m1.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l6_m1_cv1_conv"
+      ],
+      "outputs": [
+        "l6_m1_cv1_bn"
+      ],
+      "weight": "l6.m1.cv1.bn.scale",
+      "bias": "l6.m1.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.008538576561634936,
+        "scale_out": 0.027576609859316367,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 61,
+      "hardware_target": "any",
+      "depends_on": [
+        60
+      ]
+    },
+    {
+      "name": "l6.m1.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l6_m1_cv1_bn"
+      ],
+      "outputs": [
+        "l6_m1_cv1_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.027576609859316367,
+        "scale_out": 0.01236960456127257,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 62,
+      "hardware_target": "any",
+      "depends_on": [
+        61
+      ]
+    },
+    {
+      "name": "l6.m1.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l6_m1_cv1_act"
+      ],
+      "outputs": [
+        "l6_m1_cv2_conv"
+      ],
+      "weight": "l6.m1.cv2.conv.weight_q",
+      "bias": "l6.m1.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1461819283,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 63,
+      "hardware_target": "any",
+      "depends_on": [
+        62
+      ]
+    },
+    {
+      "name": "l6.m1.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l6_m1_cv2_conv"
+      ],
+      "outputs": [
+        "l6_m1_cv2_bn"
+      ],
+      "weight": "l6.m1.cv2.bn.scale",
+      "bias": "l6.m1.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.006702547936927615,
+        "scale_out": 0.028054393182589312,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 64,
+      "hardware_target": "any",
+      "depends_on": [
+        63
+      ]
+    },
+    {
+      "name": "l6.m1.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l6_m1_cv2_bn"
+      ],
+      "outputs": [
+        "l6_m1_cv2_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.028054393182589312,
+        "scale_out": 0.02584997687752791,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 65,
+      "hardware_target": "any",
+      "depends_on": [
+        64
+      ]
+    },
+    {
+      "name": "add_4",
+      "op": "add_s8",
+      "inputs": [
+        "add_3",
+        "l6_m1_cv2_act"
+      ],
+      "outputs": [
+        "add_4"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_a": 0.028212092992827648,
+        "scale_b": 0.02584997687752791,
+        "scale_out": 0.034507207044466276,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 66,
+      "hardware_target": "any",
+      "depends_on": [
+        59,
+        65
+      ]
+    },
+    {
+      "name": "cat_2",
+      "op": "cat4_c1_s8",
+      "inputs": [
+        "getitem_4",
+        "getitem_5",
+        "add_3",
+        "add_4"
+      ],
+      "outputs": [
+        "cat_2"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 10,
+        "W": 10,
+        "C_inputs": [
+          64,
+          64,
+          64,
+          64
+        ],
+        "C_total": 256
+      },
+      "quant": {
+        "scales_in": [
+          0.03470022847333292,
+          0.023816136863287977,
+          0.028212092992827648,
+          0.034507207044466276
+        ],
+        "scale_out": 0.03470022847333292,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 67,
+      "hardware_target": "any",
+      "depends_on": [
+        52,
+        59,
+        66
+      ]
+    },
+    {
+      "name": "l6.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_2"
+      ],
+      "outputs": [
+        "l6_cv2_conv"
+      ],
+      "weight": "l6.cv2.conv.weight_q",
+      "bias": "l6.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 256,
+        "IH": 10,
+        "IW": 10,
+        "OC": 128,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1112580638,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 68,
+      "hardware_target": "any",
+      "depends_on": [
+        67
+      ]
+    },
+    {
+      "name": "l6.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l6_cv2_conv"
+      ],
+      "outputs": [
+        "l6_cv2_bn"
+      ],
+      "weight": "l6.cv2.bn.scale",
+      "bias": "l6.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.015491906113511934,
+        "scale_out": 0.03694900377528874,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 69,
+      "hardware_target": "any",
+      "depends_on": [
+        68
+      ]
+    },
+    {
+      "name": "l6.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l6_cv2_bn"
+      ],
+      "outputs": [
+        "l6_cv2_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.03694900377528874,
+        "scale_out": 0.016864530683502438,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 70,
+      "hardware_target": "any",
+      "depends_on": [
+        69
+      ]
+    },
+    {
+      "name": "l7.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l6_cv2_act"
+      ],
+      "outputs": [
+        "l7_conv"
+      ],
+      "weight": "l7.conv.weight_q",
+      "bias": "l7.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 10,
+        "IW": 10,
+        "OC": 256,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 2,
+        "SW": 2,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1119907791,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 71,
+      "hardware_target": "any",
+      "depends_on": [
+        70
+      ]
+    },
+    {
+      "name": "l7.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l7_conv"
+      ],
+      "outputs": [
+        "l7_bn"
+      ],
+      "weight": "l7.bn.scale",
+      "bias": "l7.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.008299510310015341,
+        "scale_out": 0.04128670129250354,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 72,
+      "hardware_target": "any",
+      "depends_on": [
+        71
+      ]
+    },
+    {
+      "name": "l7.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l7_bn"
+      ],
+      "outputs": [
+        "l7_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.04128670129250354,
+        "scale_out": 0.02100896459864819,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 73,
+      "hardware_target": "any",
+      "depends_on": [
+        72
+      ]
+    },
+    {
+      "name": "l8.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l7_act"
+      ],
+      "outputs": [
+        "l8_cv1_conv"
+      ],
+      "weight": "l8.cv1.conv.weight_q",
+      "bias": "l8.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 256,
+        "IH": 5,
+        "IW": 5,
+        "OC": 256,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1855848865,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 74,
+      "hardware_target": "any",
+      "depends_on": [
+        73
+      ]
+    },
+    {
+      "name": "l8.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l8_cv1_conv"
+      ],
+      "outputs": [
+        "l8_cv1_bn"
+      ],
+      "weight": "l8.cv1.bn.scale",
+      "bias": "l8.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.005075631179208831,
+        "scale_out": 0.05822551532054511,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 75,
+      "hardware_target": "any",
+      "depends_on": [
+        74
+      ]
+    },
+    {
+      "name": "l8.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l8_cv1_bn"
+      ],
+      "outputs": [
+        "l8_cv1_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.05822551532054511,
+        "scale_out": 0.05818975628830317,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 76,
+      "hardware_target": "any",
+      "depends_on": [
+        75
+      ]
+    },
+    {
+      "name": "chunk_3",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l8_cv1_act"
+      ],
+      "outputs": [
+        "getitem_6",
+        "getitem_7"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5,
+        "c_each": 128
+      },
+      "dispatch_id": 77,
+      "hardware_target": "any",
+      "depends_on": [
+        76
+      ]
+    },
+    {
+      "name": "l8.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_7"
+      ],
+      "outputs": [
+        "l8_m0_cv1_conv"
+      ],
+      "weight": "l8.m0.cv1.conv.weight_q",
+      "bias": "l8.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 5,
+        "IW": 5,
+        "OC": 128,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1619091857,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 78,
+      "hardware_target": "any",
+      "depends_on": [
+        77
+      ]
+    },
+    {
+      "name": "l8.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l8_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l8_m0_cv1_bn"
+      ],
+      "weight": "l8.m0.cv1.bn.scale",
+      "bias": "l8.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.005455979681390477,
+        "scale_out": 0.03470181292436254,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 79,
+      "hardware_target": "any",
+      "depends_on": [
+        78
+      ]
+    },
+    {
+      "name": "l8.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l8_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l8_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 3200
+      },
+      "quant": {
+        "scale_in": 0.03470181292436254,
+        "scale_out": 0.01911665135481226,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 80,
+      "hardware_target": "any",
+      "depends_on": [
+        79
+      ]
+    },
+    {
+      "name": "l8.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l8_m0_cv1_act"
+      ],
+      "outputs": [
+        "l8_m0_cv2_conv"
+      ],
+      "weight": "l8.m0.cv2.conv.weight_q",
+      "bias": "l8.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 5,
+        "IW": 5,
+        "OC": 128,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1560131866,
+        "output_shift": 9,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 81,
+      "hardware_target": "any",
+      "depends_on": [
+        80
+      ]
+    },
+    {
+      "name": "l8.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l8_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l8_m0_cv2_bn"
+      ],
+      "weight": "l8.m0.cv2.bn.scale",
+      "bias": "l8.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.016925139690008688,
+        "scale_out": 0.05893637063935047,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 82,
+      "hardware_target": "any",
+      "depends_on": [
+        81
+      ]
+    },
+    {
+      "name": "l8.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l8_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l8_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 3200
+      },
+      "quant": {
+        "scale_in": 0.05893637063935047,
+        "scale_out": 0.03702321015005037,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 83,
+      "hardware_target": "any",
+      "depends_on": [
+        82
+      ]
+    },
+    {
+      "name": "add_5",
+      "op": "add_s8",
+      "inputs": [
+        "getitem_7",
+        "l8_m0_cv2_act"
+      ],
+      "outputs": [
+        "add_5"
+      ],
+      "shape": {
+        "n": 3200
+      },
+      "quant": {
+        "scale_a": 0.016074398371178335,
+        "scale_b": 0.03702321015005037,
+        "scale_out": 0.03574434040099617,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 84,
+      "hardware_target": "any",
+      "depends_on": [
+        77,
+        83
+      ]
+    },
+    {
+      "name": "cat_3",
+      "op": "cat3_c1_s8",
+      "inputs": [
+        "getitem_6",
+        "getitem_7",
+        "add_5"
+      ],
+      "outputs": [
+        "cat_3"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 5,
+        "W": 5,
+        "C_inputs": [
+          128,
+          128,
+          128
+        ],
+        "C_total": 384
+      },
+      "quant": {
+        "scales_in": [
+          0.05818975628830317,
+          0.016074398371178335,
+          0.03574434040099617
+        ],
+        "scale_out": 0.05818975628830317,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 85,
+      "hardware_target": "any",
+      "depends_on": [
+        77,
+        84
+      ]
+    },
+    {
+      "name": "l8.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_3"
+      ],
+      "outputs": [
+        "l8_cv2_conv"
+      ],
+      "weight": "l8.cv2.conv.weight_q",
+      "bias": "l8.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 384,
+        "IH": 5,
+        "IW": 5,
+        "OC": 256,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1086974066,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 86,
+      "hardware_target": "any",
+      "depends_on": [
+        85
+      ]
+    },
+    {
+      "name": "l8.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l8_cv2_conv"
+      ],
+      "outputs": [
+        "l8_cv2_bn"
+      ],
+      "weight": "l8.cv2.bn.scale",
+      "bias": "l8.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.010919200153801385,
+        "scale_out": 0.03452031443438192,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 87,
+      "hardware_target": "any",
+      "depends_on": [
+        86
+      ]
+    },
+    {
+      "name": "l8.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l8_cv2_bn"
+      ],
+      "outputs": [
+        "l8_cv2_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.03452031443438192,
+        "scale_out": 0.02252406773604746,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 88,
+      "hardware_target": "any",
+      "depends_on": [
+        87
+      ]
+    },
+    {
+      "name": "l9.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l8_cv2_act"
+      ],
+      "outputs": [
+        "l9_cv1_conv"
+      ],
+      "weight": "l9.cv1.conv.weight_q",
+      "bias": "l9.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 256,
+        "IH": 5,
+        "IW": 5,
+        "OC": 128,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1916135382,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 89,
+      "hardware_target": "any",
+      "depends_on": [
+        88
+      ]
+    },
+    {
+      "name": "l9.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l9_cv1_conv"
+      ],
+      "outputs": [
+        "l9_cv1_bn"
+      ],
+      "weight": "l9.cv1.bn.scale",
+      "bias": "l9.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.006528291176623247,
+        "scale_out": 0.03645714812391386,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 90,
+      "hardware_target": "any",
+      "depends_on": [
+        89
+      ]
+    },
+    {
+      "name": "l9.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l9_cv1_bn"
+      ],
+      "outputs": [
+        "l9_cv1_act"
+      ],
+      "shape": {
+        "n": 3200
+      },
+      "quant": {
+        "scale_in": 0.03645714812391386,
+        "scale_out": 0.03610497196828286,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 91,
+      "hardware_target": "any",
+      "depends_on": [
+        90
+      ]
+    },
+    {
+      "name": "l9.m1",
+      "op": "maxpool2d_s8",
+      "inputs": [
+        "l9_cv1_act"
+      ],
+      "outputs": [
+        "l9_m1"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "IH": 5,
+        "IW": 5,
+        "OH": 5,
+        "OW": 5,
+        "KH": 5,
+        "KW": 5,
+        "SH": 1,
+        "SW": 1,
+        "PH": 2,
+        "PW": 2,
+        "DH": 1,
+        "DW": 1
+      },
+      "dispatch_id": 92,
+      "hardware_target": "any",
+      "depends_on": [
+        91
+      ]
+    },
+    {
+      "name": "l9.m2",
+      "op": "maxpool2d_s8",
+      "inputs": [
+        "l9_m1"
+      ],
+      "outputs": [
+        "l9_m2"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "IH": 5,
+        "IW": 5,
+        "OH": 5,
+        "OW": 5,
+        "KH": 5,
+        "KW": 5,
+        "SH": 1,
+        "SW": 1,
+        "PH": 2,
+        "PW": 2,
+        "DH": 1,
+        "DW": 1
+      },
+      "dispatch_id": 93,
+      "hardware_target": "any",
+      "depends_on": [
+        92
+      ]
+    },
+    {
+      "name": "l9.m3",
+      "op": "maxpool2d_s8",
+      "inputs": [
+        "l9_m2"
+      ],
+      "outputs": [
+        "l9_m3"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "IH": 5,
+        "IW": 5,
+        "OH": 5,
+        "OW": 5,
+        "KH": 5,
+        "KW": 5,
+        "SH": 1,
+        "SW": 1,
+        "PH": 2,
+        "PW": 2,
+        "DH": 1,
+        "DW": 1
+      },
+      "dispatch_id": 94,
+      "hardware_target": "any",
+      "depends_on": [
+        93
+      ]
+    },
+    {
+      "name": "cat_4",
+      "op": "cat4_c1_s8",
+      "inputs": [
+        "l9_cv1_act",
+        "l9_m1",
+        "l9_m2",
+        "l9_m3"
+      ],
+      "outputs": [
+        "cat_4"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 5,
+        "W": 5,
+        "C_inputs": [
+          128,
+          128,
+          128,
+          128
+        ],
+        "C_total": 512
+      },
+      "quant": {
+        "scales_in": [
+          0.03610497196828286,
+          0.03610497196828286,
+          0.03610497196828286,
+          0.03610497196828286
+        ],
+        "scale_out": 0.03610497196828286,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 95,
+      "hardware_target": "any",
+      "depends_on": [
+        91,
+        92,
+        93,
+        94
+      ]
+    },
+    {
+      "name": "l9.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_4"
+      ],
+      "outputs": [
+        "l9_cv2_conv"
+      ],
+      "weight": "l9.cv2.conv.weight_q",
+      "bias": "l9.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 512,
+        "IH": 5,
+        "IW": 5,
+        "OC": 256,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1721748203,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 96,
+      "hardware_target": "any",
+      "depends_on": [
+        95
+      ]
+    },
+    {
+      "name": "l9.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l9_cv2_conv"
+      ],
+      "outputs": [
+        "l9_cv2_bn"
+      ],
+      "weight": "l9.cv2.bn.scale",
+      "bias": "l9.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.01881530341200941,
+        "scale_out": 0.03692165509922298,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 97,
+      "hardware_target": "any",
+      "depends_on": [
+        96
+      ]
+    },
+    {
+      "name": "l9.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l9_cv2_bn"
+      ],
+      "outputs": [
+        "l9_cv2_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.03692165509922298,
+        "scale_out": 0.022113056633416124,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 98,
+      "hardware_target": "any",
+      "depends_on": [
+        97
+      ]
+    },
+    {
+      "name": "l10",
+      "op": "upsample_nearest_s8",
+      "inputs": [
+        "l9_cv2_act"
+      ],
+      "outputs": [
+        "l10"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "IH": 5,
+        "IW": 5,
+        "scale": 2
+      },
+      "dispatch_id": 99,
+      "hardware_target": "any",
+      "depends_on": [
+        98
+      ]
+    },
+    {
+      "name": "cat_5",
+      "op": "cat2_c1_s8",
+      "inputs": [
+        "l10",
+        "l6_cv2_act"
+      ],
+      "outputs": [
+        "cat_5"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 10,
+        "W": 10,
+        "C_inputs": [
+          256,
+          128
+        ],
+        "C_total": 384
+      },
+      "quant": {
+        "scales_in": [
+          0.022113056633416124,
+          0.016864530683502438
+        ],
+        "scale_out": 0.022113056633416124,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 100,
+      "hardware_target": "any",
+      "depends_on": [
+        70,
+        99
+      ]
+    },
+    {
+      "name": "l12.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_5"
+      ],
+      "outputs": [
+        "l12_cv1_conv"
+      ],
+      "weight": "l12.cv1.conv.weight_q",
+      "bias": "l12.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 384,
+        "IH": 10,
+        "IW": 10,
+        "OC": 128,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1256032561,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 101,
+      "hardware_target": "any",
+      "depends_on": [
+        100
+      ]
+    },
+    {
+      "name": "l12.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l12_cv1_conv"
+      ],
+      "outputs": [
+        "l12_cv1_bn"
+      ],
+      "weight": "l12.cv1.bn.scale",
+      "bias": "l12.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.006381873070724367,
+        "scale_out": 0.03387257808775414,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 102,
+      "hardware_target": "any",
+      "depends_on": [
+        101
+      ]
+    },
+    {
+      "name": "l12.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l12_cv1_bn"
+      ],
+      "outputs": [
+        "l12_cv1_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.03387257808775414,
+        "scale_out": 0.023193723573459415,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 103,
+      "hardware_target": "any",
+      "depends_on": [
+        102
+      ]
+    },
+    {
+      "name": "chunk_4",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l12_cv1_act"
+      ],
+      "outputs": [
+        "getitem_8",
+        "getitem_9"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10,
+        "c_each": 64
+      },
+      "dispatch_id": 104,
+      "hardware_target": "any",
+      "depends_on": [
+        103
+      ]
+    },
+    {
+      "name": "l12.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_9"
+      ],
+      "outputs": [
+        "l12_m0_cv1_conv"
+      ],
+      "weight": "l12.m0.cv1.conv.weight_q",
+      "bias": "l12.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1147642925,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 105,
+      "hardware_target": "any",
+      "depends_on": [
+        104
+      ]
+    },
+    {
+      "name": "l12.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l12_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l12_m0_cv1_bn"
+      ],
+      "weight": "l12.m0.cv1.bn.scale",
+      "bias": "l12.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.009509852552038478,
+        "scale_out": 0.03736973559762549,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 106,
+      "hardware_target": "any",
+      "depends_on": [
+        105
+      ]
+    },
+    {
+      "name": "l12.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l12_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l12_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.03736973559762549,
+        "scale_out": 0.015285429053419218,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 107,
+      "hardware_target": "any",
+      "depends_on": [
+        106
+      ]
+    },
+    {
+      "name": "l12.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l12_m0_cv1_act"
+      ],
+      "outputs": [
+        "l12_m0_cv2_conv"
+      ],
+      "weight": "l12.m0.cv2.conv.weight_q",
+      "bias": "l12.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1910630524,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 108,
+      "hardware_target": "any",
+      "depends_on": [
+        107
+      ]
+    },
+    {
+      "name": "l12.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l12_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l12_m0_cv2_bn"
+      ],
+      "weight": "l12.m0.cv2.bn.scale",
+      "bias": "l12.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.004544494189615325,
+        "scale_out": 0.02525625266428069,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 109,
+      "hardware_target": "any",
+      "depends_on": [
+        108
+      ]
+    },
+    {
+      "name": "l12.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l12_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l12_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.02525625266428069,
+        "scale_out": 0.01872047101418803,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 110,
+      "hardware_target": "any",
+      "depends_on": [
+        109
+      ]
+    },
+    {
+      "name": "cat_6",
+      "op": "cat3_c1_s8",
+      "inputs": [
+        "getitem_8",
+        "getitem_9",
+        "l12_m0_cv2_act"
+      ],
+      "outputs": [
+        "cat_6"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 10,
+        "W": 10,
+        "C_inputs": [
+          64,
+          64,
+          64
+        ],
+        "C_total": 192
+      },
+      "quant": {
+        "scales_in": [
+          0.018704592712282194,
+          0.023193723573459415,
+          0.01872047101418803
+        ],
+        "scale_out": 0.023193723573459415,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 111,
+      "hardware_target": "any",
+      "depends_on": [
+        104,
+        110
+      ]
+    },
+    {
+      "name": "l12.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_6"
+      ],
+      "outputs": [
+        "l12_cv2_conv"
+      ],
+      "weight": "l12.cv2.conv.weight_q",
+      "bias": "l12.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 192,
+        "IH": 10,
+        "IW": 10,
+        "OC": 128,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1326491787,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 112,
+      "hardware_target": "any",
+      "depends_on": [
+        111
+      ]
+    },
+    {
+      "name": "l12.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l12_cv2_conv"
+      ],
+      "outputs": [
+        "l12_cv2_bn"
+      ],
+      "weight": "l12.cv2.bn.scale",
+      "bias": "l12.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.008015148282989742,
+        "scale_out": 0.03113780246944878,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 113,
+      "hardware_target": "any",
+      "depends_on": [
+        112
+      ]
+    },
+    {
+      "name": "l12.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l12_cv2_bn"
+      ],
+      "outputs": [
+        "l12_cv2_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.03113780246944878,
+        "scale_out": 0.01839844072897603,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 114,
+      "hardware_target": "any",
+      "depends_on": [
+        113
+      ]
+    },
+    {
+      "name": "l13",
+      "op": "upsample_nearest_s8",
+      "inputs": [
+        "l12_cv2_act"
+      ],
+      "outputs": [
+        "l13"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "IH": 10,
+        "IW": 10,
+        "scale": 2
+      },
+      "dispatch_id": 115,
+      "hardware_target": "any",
+      "depends_on": [
+        114
+      ]
+    },
+    {
+      "name": "cat_7",
+      "op": "cat2_c1_s8",
+      "inputs": [
+        "l13",
+        "l4_cv2_act"
+      ],
+      "outputs": [
+        "cat_7"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 20,
+        "W": 20,
+        "C_inputs": [
+          128,
+          64
+        ],
+        "C_total": 192
+      },
+      "quant": {
+        "scales_in": [
+          0.01839844072897603,
+          0.031507488310806395
+        ],
+        "scale_out": 0.031507488310806395,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 116,
+      "hardware_target": "any",
+      "depends_on": [
+        45,
+        115
+      ]
+    },
+    {
+      "name": "l15.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_7"
+      ],
+      "outputs": [
+        "l15_cv1_conv"
+      ],
+      "weight": "l15.cv1.conv.weight_q",
+      "bias": "l15.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 192,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1867668389,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 117,
+      "hardware_target": "any",
+      "depends_on": [
+        116
+      ]
+    },
+    {
+      "name": "l15.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l15_cv1_conv"
+      ],
+      "outputs": [
+        "l15_cv1_bn"
+      ],
+      "weight": "l15.cv1.bn.scale",
+      "bias": "l15.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.009591851647444598,
+        "scale_out": 0.043114391837533066,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 118,
+      "hardware_target": "any",
+      "depends_on": [
+        117
+      ]
+    },
+    {
+      "name": "l15.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l15_cv1_bn"
+      ],
+      "outputs": [
+        "l15_cv1_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.043114391837533066,
+        "scale_out": 0.01936891135268324,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 119,
+      "hardware_target": "any",
+      "depends_on": [
+        118
+      ]
+    },
+    {
+      "name": "chunk_5",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l15_cv1_act"
+      ],
+      "outputs": [
+        "getitem_10",
+        "getitem_11"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20,
+        "c_each": 32
+      },
+      "dispatch_id": 120,
+      "hardware_target": "any",
+      "depends_on": [
+        119
+      ]
+    },
+    {
+      "name": "l15.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_11"
+      ],
+      "outputs": [
+        "l15_m0_cv1_conv"
+      ],
+      "weight": "l15.m0.cv1.conv.weight_q",
+      "bias": "l15.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 20,
+        "IW": 20,
+        "OC": 32,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1789857406,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 121,
+      "hardware_target": "any",
+      "depends_on": [
+        120
+      ]
+    },
+    {
+      "name": "l15.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l15_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l15_m0_cv1_bn"
+      ],
+      "weight": "l15.m0.cv1.bn.scale",
+      "bias": "l15.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.008817537563053642,
+        "scale_out": 0.030306902457409957,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 122,
+      "hardware_target": "any",
+      "depends_on": [
+        121
+      ]
+    },
+    {
+      "name": "l15.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l15_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l15_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.030306902457409957,
+        "scale_out": 0.015353158703000526,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 123,
+      "hardware_target": "any",
+      "depends_on": [
+        122
+      ]
+    },
+    {
+      "name": "l15.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l15_m0_cv1_act"
+      ],
+      "outputs": [
+        "l15_m0_cv2_conv"
+      ],
+      "weight": "l15.m0.cv2.conv.weight_q",
+      "bias": "l15.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 32,
+        "IH": 20,
+        "IW": 20,
+        "OC": 32,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2113729402,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 124,
+      "hardware_target": "any",
+      "depends_on": [
+        123
+      ]
+    },
+    {
+      "name": "l15.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l15_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l15_m0_cv2_bn"
+      ],
+      "weight": "l15.m0.cv2.bn.scale",
+      "bias": "l15.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 32,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.006148752734417052,
+        "scale_out": 0.03362727728415662,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 125,
+      "hardware_target": "any",
+      "depends_on": [
+        124
+      ]
+    },
+    {
+      "name": "l15.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l15_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l15_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.03362727728415662,
+        "scale_out": 0.03316389294121209,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 126,
+      "hardware_target": "any",
+      "depends_on": [
+        125
+      ]
+    },
+    {
+      "name": "cat_8",
+      "op": "cat3_c1_s8",
+      "inputs": [
+        "getitem_10",
+        "getitem_11",
+        "l15_m0_cv2_act"
+      ],
+      "outputs": [
+        "cat_8"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 20,
+        "W": 20,
+        "C_inputs": [
+          32,
+          32,
+          32
+        ],
+        "C_total": 96
+      },
+      "quant": {
+        "scales_in": [
+          0.016165703300416,
+          0.01936891135268324,
+          0.03316389294121209
+        ],
+        "scale_out": 0.03316389294121209,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 127,
+      "hardware_target": "any",
+      "depends_on": [
+        120,
+        126
+      ]
+    },
+    {
+      "name": "l15.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_8"
+      ],
+      "outputs": [
+        "l15_cv2_conv"
+      ],
+      "weight": "l15.cv2.conv.weight_q",
+      "bias": "l15.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 96,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1977375305,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 128,
+      "hardware_target": "any",
+      "depends_on": [
+        127
+      ]
+    },
+    {
+      "name": "l15.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l15_cv2_conv"
+      ],
+      "outputs": [
+        "l15_cv2_bn"
+      ],
+      "weight": "l15.cv2.bn.scale",
+      "bias": "l15.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.008308523283230038,
+        "scale_out": 0.03917479702806848,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 129,
+      "hardware_target": "any",
+      "depends_on": [
+        128
+      ]
+    },
+    {
+      "name": "l15.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l15_cv2_bn"
+      ],
+      "outputs": [
+        "l15_cv2_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.03917479702806848,
+        "scale_out": 0.023813273963027112,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 130,
+      "hardware_target": "any",
+      "depends_on": [
+        129
+      ]
+    },
+    {
+      "name": "l16.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l15_cv2_act"
+      ],
+      "outputs": [
+        "l16_conv"
+      ],
+      "weight": "l16.conv.weight_q",
+      "bias": "l16.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 2,
+        "SW": 2,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1667553656,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 131,
+      "hardware_target": "any",
+      "depends_on": [
+        130
+      ]
+    },
+    {
+      "name": "l16.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l16_conv"
+      ],
+      "outputs": [
+        "l16_bn"
+      ],
+      "weight": "l16.bn.scale",
+      "bias": "l16.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.008904252465315692,
+        "scale_out": 0.030854854058092972,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 132,
+      "hardware_target": "any",
+      "depends_on": [
+        131
+      ]
+    },
+    {
+      "name": "l16.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l16_bn"
+      ],
+      "outputs": [
+        "l16_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.030854854058092972,
+        "scale_out": 0.029222938958115466,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 133,
+      "hardware_target": "any",
+      "depends_on": [
+        132
+      ]
+    },
+    {
+      "name": "cat_9",
+      "op": "cat2_c1_s8",
+      "inputs": [
+        "l16_act",
+        "l12_cv2_act"
+      ],
+      "outputs": [
+        "cat_9"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 10,
+        "W": 10,
+        "C_inputs": [
+          64,
+          128
+        ],
+        "C_total": 192
+      },
+      "quant": {
+        "scales_in": [
+          0.029222938958115466,
+          0.01839844072897603
+        ],
+        "scale_out": 0.029222938958115466,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 134,
+      "hardware_target": "any",
+      "depends_on": [
+        114,
+        133
+      ]
+    },
+    {
+      "name": "l18.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_9"
+      ],
+      "outputs": [
+        "l18_cv1_conv"
+      ],
+      "weight": "l18.cv1.conv.weight_q",
+      "bias": "l18.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 192,
+        "IH": 10,
+        "IW": 10,
+        "OC": 128,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1625028569,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 135,
+      "hardware_target": "any",
+      "depends_on": [
+        134
+      ]
+    },
+    {
+      "name": "l18.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l18_cv1_conv"
+      ],
+      "outputs": [
+        "l18_cv1_bn"
+      ],
+      "weight": "l18.cv1.bn.scale",
+      "bias": "l18.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.007269432225565272,
+        "scale_out": 0.033914746261957125,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 136,
+      "hardware_target": "any",
+      "depends_on": [
+        135
+      ]
+    },
+    {
+      "name": "l18.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l18_cv1_bn"
+      ],
+      "outputs": [
+        "l18_cv1_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.033914746261957125,
+        "scale_out": 0.025857435436699334,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 137,
+      "hardware_target": "any",
+      "depends_on": [
+        136
+      ]
+    },
+    {
+      "name": "chunk_6",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l18_cv1_act"
+      ],
+      "outputs": [
+        "getitem_12",
+        "getitem_13"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10,
+        "c_each": 64
+      },
+      "dispatch_id": 138,
+      "hardware_target": "any",
+      "depends_on": [
+        137
+      ]
+    },
+    {
+      "name": "l18.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_13"
+      ],
+      "outputs": [
+        "l18_m0_cv1_conv"
+      ],
+      "weight": "l18.m0.cv1.conv.weight_q",
+      "bias": "l18.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1377757207,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 139,
+      "hardware_target": "any",
+      "depends_on": [
+        138
+      ]
+    },
+    {
+      "name": "l18.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l18_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l18_m0_cv1_bn"
+      ],
+      "weight": "l18.m0.cv1.bn.scale",
+      "bias": "l18.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.008875890979616661,
+        "scale_out": 0.034058852458563375,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 140,
+      "hardware_target": "any",
+      "depends_on": [
+        139
+      ]
+    },
+    {
+      "name": "l18.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l18_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l18_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.034058852458563375,
+        "scale_out": 0.017162281697190654,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 141,
+      "hardware_target": "any",
+      "depends_on": [
+        140
+      ]
+    },
+    {
+      "name": "l18.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l18_m0_cv1_act"
+      ],
+      "outputs": [
+        "l18_m0_cv2_conv"
+      ],
+      "weight": "l18.m0.cv2.conv.weight_q",
+      "bias": "l18.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1529099908,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 142,
+      "hardware_target": "any",
+      "depends_on": [
+        141
+      ]
+    },
+    {
+      "name": "l18.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l18_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l18_m0_cv2_bn"
+      ],
+      "weight": "l18.m0.cv2.bn.scale",
+      "bias": "l18.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.004975964703897792,
+        "scale_out": 0.051078372114286646,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 143,
+      "hardware_target": "any",
+      "depends_on": [
+        142
+      ]
+    },
+    {
+      "name": "l18.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l18_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l18_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.051078372114286646,
+        "scale_out": 0.031642902554489497,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 144,
+      "hardware_target": "any",
+      "depends_on": [
+        143
+      ]
+    },
+    {
+      "name": "cat_10",
+      "op": "cat3_c1_s8",
+      "inputs": [
+        "getitem_12",
+        "getitem_13",
+        "l18_m0_cv2_act"
+      ],
+      "outputs": [
+        "cat_10"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 10,
+        "W": 10,
+        "C_inputs": [
+          64,
+          64,
+          64
+        ],
+        "C_total": 192
+      },
+      "quant": {
+        "scales_in": [
+          0.018757621134360004,
+          0.025857435436699334,
+          0.031642902554489497
+        ],
+        "scale_out": 0.031642902554489497,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 145,
+      "hardware_target": "any",
+      "depends_on": [
+        138,
+        144
+      ]
+    },
+    {
+      "name": "l18.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_10"
+      ],
+      "outputs": [
+        "l18_cv2_conv"
+      ],
+      "weight": "l18.cv2.conv.weight_q",
+      "bias": "l18.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 192,
+        "IH": 10,
+        "IW": 10,
+        "OC": 128,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1111481449,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 146,
+      "hardware_target": "any",
+      "depends_on": [
+        145
+      ]
+    },
+    {
+      "name": "l18.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l18_cv2_conv"
+      ],
+      "outputs": [
+        "l18_cv2_bn"
+      ],
+      "weight": "l18.cv2.bn.scale",
+      "bias": "l18.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.006709422182849073,
+        "scale_out": 0.06003264179379921,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 147,
+      "hardware_target": "any",
+      "depends_on": [
+        146
+      ]
+    },
+    {
+      "name": "l18.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l18_cv2_bn"
+      ],
+      "outputs": [
+        "l18_cv2_act"
+      ],
+      "shape": {
+        "n": 12800
+      },
+      "quant": {
+        "scale_in": 0.06003264179379921,
+        "scale_out": 0.02004847000903032,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 148,
+      "hardware_target": "any",
+      "depends_on": [
+        147
+      ]
+    },
+    {
+      "name": "l19.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l18_cv2_act"
+      ],
+      "outputs": [
+        "l19_conv"
+      ],
+      "weight": "l19.conv.weight_q",
+      "bias": "l19.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 10,
+        "IW": 10,
+        "OC": 128,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 2,
+        "SW": 2,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1111469295,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 149,
+      "hardware_target": "any",
+      "depends_on": [
+        148
+      ]
+    },
+    {
+      "name": "l19.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l19_conv"
+      ],
+      "outputs": [
+        "l19_bn"
+      ],
+      "weight": "l19.bn.scale",
+      "bias": "l19.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.007596582408965103,
+        "scale_out": 0.06005655498955193,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 150,
+      "hardware_target": "any",
+      "depends_on": [
+        149
+      ]
+    },
+    {
+      "name": "l19.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l19_bn"
+      ],
+      "outputs": [
+        "l19_act"
+      ],
+      "shape": {
+        "n": 3200
+      },
+      "quant": {
+        "scale_in": 0.06005655498955193,
+        "scale_out": 0.02363851689916896,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 151,
+      "hardware_target": "any",
+      "depends_on": [
+        150
+      ]
+    },
+    {
+      "name": "cat_11",
+      "op": "cat2_c1_s8",
+      "inputs": [
+        "l19_act",
+        "l9_cv2_act"
+      ],
+      "outputs": [
+        "cat_11"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 5,
+        "W": 5,
+        "C_inputs": [
+          128,
+          256
+        ],
+        "C_total": 384
+      },
+      "quant": {
+        "scales_in": [
+          0.02363851689916896,
+          0.022113056633416124
+        ],
+        "scale_out": 0.02363851689916896,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 152,
+      "hardware_target": "any",
+      "depends_on": [
+        98,
+        151
+      ]
+    },
+    {
+      "name": "l21.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_11"
+      ],
+      "outputs": [
+        "l21_cv1_conv"
+      ],
+      "weight": "l21.cv1.conv.weight_q",
+      "bias": "l21.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 384,
+        "IH": 5,
+        "IW": 5,
+        "OC": 256,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1278500721,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 153,
+      "hardware_target": "any",
+      "depends_on": [
+        152
+      ]
+    },
+    {
+      "name": "l21.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l21_cv1_conv"
+      ],
+      "outputs": [
+        "l21_cv1_bn"
+      ],
+      "weight": "l21.cv1.bn.scale",
+      "bias": "l21.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.0048166194300013265,
+        "scale_out": 0.04150058716300904,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 154,
+      "hardware_target": "any",
+      "depends_on": [
+        153
+      ]
+    },
+    {
+      "name": "l21.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l21_cv1_bn"
+      ],
+      "outputs": [
+        "l21_cv1_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.04150058716300904,
+        "scale_out": 0.0303006059541477,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 155,
+      "hardware_target": "any",
+      "depends_on": [
+        154
+      ]
+    },
+    {
+      "name": "chunk_7",
+      "op": "chunk2_c1",
+      "inputs": [
+        "l21_cv1_act"
+      ],
+      "outputs": [
+        "getitem_14",
+        "getitem_15"
+      ],
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5,
+        "c_each": 128
+      },
+      "dispatch_id": 156,
+      "hardware_target": "any",
+      "depends_on": [
+        155
+      ]
+    },
+    {
+      "name": "l21.m0.cv1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "getitem_15"
+      ],
+      "outputs": [
+        "l21_m0_cv1_conv"
+      ],
+      "weight": "l21.m0.cv1.conv.weight_q",
+      "bias": "l21.m0.cv1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 5,
+        "IW": 5,
+        "OC": 128,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1501916530,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 157,
+      "hardware_target": "any",
+      "depends_on": [
+        156
+      ]
+    },
+    {
+      "name": "l21.m0.cv1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l21_m0_cv1_conv"
+      ],
+      "outputs": [
+        "l21_m0_cv1_bn"
+      ],
+      "weight": "l21.m0.cv1.bn.scale",
+      "bias": "l21.m0.cv1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.00661490282674474,
+        "scale_out": 0.051605716465026374,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 158,
+      "hardware_target": "any",
+      "depends_on": [
+        157
+      ]
+    },
+    {
+      "name": "l21.m0.cv1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l21_m0_cv1_bn"
+      ],
+      "outputs": [
+        "l21_m0_cv1_act"
+      ],
+      "shape": {
+        "n": 3200
+      },
+      "quant": {
+        "scale_in": 0.051605716465026374,
+        "scale_out": 0.025704796858659878,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 159,
+      "hardware_target": "any",
+      "depends_on": [
+        158
+      ]
+    },
+    {
+      "name": "l21.m0.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l21_m0_cv1_act"
+      ],
+      "outputs": [
+        "l21_m0_cv2_conv"
+      ],
+      "weight": "l21.m0.cv2.conv.weight_q",
+      "bias": "l21.m0.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 5,
+        "IW": 5,
+        "OC": 128,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1241266751,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 160,
+      "hardware_target": "any",
+      "depends_on": [
+        159
+      ]
+    },
+    {
+      "name": "l21.m0.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l21_m0_cv2_conv"
+      ],
+      "outputs": [
+        "l21_m0_cv2_bn"
+      ],
+      "weight": "l21.m0.cv2.bn.scale",
+      "bias": "l21.m0.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 128,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.0064945033216100975,
+        "scale_out": 0.04361754515039639,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 161,
+      "hardware_target": "any",
+      "depends_on": [
+        160
+      ]
+    },
+    {
+      "name": "l21.m0.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l21_m0_cv2_bn"
+      ],
+      "outputs": [
+        "l21_m0_cv2_act"
+      ],
+      "shape": {
+        "n": 3200
+      },
+      "quant": {
+        "scale_in": 0.04361754515039639,
+        "scale_out": 0.031195321420984943,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 162,
+      "hardware_target": "any",
+      "depends_on": [
+        161
+      ]
+    },
+    {
+      "name": "cat_12",
+      "op": "cat3_c1_s8",
+      "inputs": [
+        "getitem_14",
+        "getitem_15",
+        "l21_m0_cv2_act"
+      ],
+      "outputs": [
+        "cat_12"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 5,
+        "W": 5,
+        "C_inputs": [
+          128,
+          128,
+          128
+        ],
+        "C_total": 384
+      },
+      "quant": {
+        "scales_in": [
+          0.02144656782075176,
+          0.0303006059541477,
+          0.031195321420984943
+        ],
+        "scale_out": 0.031195321420984943,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 163,
+      "hardware_target": "any",
+      "depends_on": [
+        156,
+        162
+      ]
+    },
+    {
+      "name": "l21.cv2.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "cat_12"
+      ],
+      "outputs": [
+        "l21_cv2_conv"
+      ],
+      "weight": "l21.cv2.conv.weight_q",
+      "bias": "l21.cv2.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 384,
+        "IH": 5,
+        "IW": 5,
+        "OC": 256,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1289155019,
+        "output_shift": 6,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 164,
+      "hardware_target": "any",
+      "depends_on": [
+        163
+      ]
+    },
+    {
+      "name": "l21.cv2.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "l21_cv2_conv"
+      ],
+      "outputs": [
+        "l21_cv2_bn"
+      ],
+      "weight": "l21.cv2.bn.scale",
+      "bias": "l21.cv2.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 256,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.005776418475654181,
+        "scale_out": 0.08263558665598471,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 165,
+      "hardware_target": "any",
+      "depends_on": [
+        164
+      ]
+    },
+    {
+      "name": "l21.cv2.act",
+      "op": "silu_s8",
+      "inputs": [
+        "l21_cv2_bn"
+      ],
+      "outputs": [
+        "l21_cv2_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.08263558665598471,
+        "scale_out": 0.03225957314799151,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 166,
+      "hardware_target": "any",
+      "depends_on": [
+        165
+      ]
+    },
+    {
+      "name": "detect.cv2_0_0.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l15_cv2_act"
+      ],
+      "outputs": [
+        "detect_cv2_0_0_conv"
+      ],
+      "weight": "detect.cv2_0_0.conv.weight_q",
+      "bias": "detect.cv2_0_0.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1100273921,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 167,
+      "hardware_target": "any",
+      "depends_on": [
+        130
+      ]
+    },
+    {
+      "name": "detect.cv2_0_0.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv2_0_0_conv"
+      ],
+      "outputs": [
+        "detect_cv2_0_0_bn"
+      ],
+      "weight": "detect.cv2_0_0.bn.scale",
+      "bias": "detect.cv2_0_0.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.008766103917219508,
+        "scale_out": 0.048428092415877214,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 168,
+      "hardware_target": "any",
+      "depends_on": [
+        167
+      ]
+    },
+    {
+      "name": "detect.cv2_0_0.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv2_0_0_bn"
+      ],
+      "outputs": [
+        "detect_cv2_0_0_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.048428092415877214,
+        "scale_out": 0.02901811862555076,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 169,
+      "hardware_target": "any",
+      "depends_on": [
+        168
+      ]
+    },
+    {
+      "name": "detect.cv2_0_1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv2_0_0_act"
+      ],
+      "outputs": [
+        "detect_cv2_0_1_conv"
+      ],
+      "weight": "detect.cv2_0_1.conv.weight_q",
+      "bias": "detect.cv2_0_1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1449598110,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 170,
+      "hardware_target": "any",
+      "depends_on": [
+        169
+      ]
+    },
+    {
+      "name": "detect.cv2_0_1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv2_0_1_conv"
+      ],
+      "outputs": [
+        "detect_cv2_0_1_bn"
+      ],
+      "weight": "detect.cv2_0_1.bn.scale",
+      "bias": "detect.cv2_0_1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.008832512878057525,
+        "scale_out": 0.16049312982033556,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 171,
+      "hardware_target": "any",
+      "depends_on": [
+        170
+      ]
+    },
+    {
+      "name": "detect.cv2_0_1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv2_0_1_bn"
+      ],
+      "outputs": [
+        "detect_cv2_0_1_act"
+      ],
+      "shape": {
+        "n": 25600
+      },
+      "quant": {
+        "scale_in": 0.16049312982033556,
+        "scale_out": 0.16049312982033556,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 172,
+      "hardware_target": "any",
+      "depends_on": [
+        171
+      ]
+    },
+    {
+      "name": "detect.cv2_0_2",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv2_0_1_act"
+      ],
+      "outputs": [
+        "detect_cv2_0_2"
+      ],
+      "weight": "detect.cv2_0_2.weight_q",
+      "bias": "detect.cv2_0_2.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 20,
+        "IW": 20,
+        "OC": 64,
+        "OH": 20,
+        "OW": 20,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1199815482,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 173,
+      "hardware_target": "any",
+      "depends_on": [
+        172
+      ]
+    },
+    {
+      "name": "detect.cv3_0_0.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l15_cv2_act"
+      ],
+      "outputs": [
+        "detect_cv3_0_0_conv"
+      ],
+      "weight": "detect.cv3_0_0.conv.weight_q",
+      "bias": "detect.cv3_0_0.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 20,
+        "IW": 20,
+        "OC": 80,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1685942081,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 174,
+      "hardware_target": "any",
+      "depends_on": [
+        130
+      ]
+    },
+    {
+      "name": "detect.cv3_0_0.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv3_0_0_conv"
+      ],
+      "outputs": [
+        "detect_cv3_0_0_bn"
+      ],
+      "weight": "detect.cv3_0_0.bn.scale",
+      "bias": "detect.cv3_0_0.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 80,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.008172722313347765,
+        "scale_out": 0.0384392813434751,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 175,
+      "hardware_target": "any",
+      "depends_on": [
+        174
+      ]
+    },
+    {
+      "name": "detect.cv3_0_0.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv3_0_0_bn"
+      ],
+      "outputs": [
+        "detect_cv3_0_0_act"
+      ],
+      "shape": {
+        "n": 32000
+      },
+      "quant": {
+        "scale_in": 0.0384392813434751,
+        "scale_out": 0.021337708150307964,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 176,
+      "hardware_target": "any",
+      "depends_on": [
+        175
+      ]
+    },
+    {
+      "name": "detect.cv3_0_1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv3_0_0_act"
+      ],
+      "outputs": [
+        "detect_cv3_0_1_conv"
+      ],
+      "weight": "detect.cv3_0_1.conv.weight_q",
+      "bias": "detect.cv3_0_1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 80,
+        "IH": 20,
+        "IW": 20,
+        "OC": 80,
+        "OH": 20,
+        "OW": 20,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1903895121,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 177,
+      "hardware_target": "any",
+      "depends_on": [
+        176
+      ]
+    },
+    {
+      "name": "detect.cv3_0_1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv3_0_1_conv"
+      ],
+      "outputs": [
+        "detect_cv3_0_1_bn"
+      ],
+      "weight": "detect.cv3_0_1.bn.scale",
+      "bias": "detect.cv3_0_1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 80,
+        "H": 20,
+        "W": 20
+      },
+      "quant": {
+        "scale_in": 0.007390868945384588,
+        "scale_out": 0.12050582104780543,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 178,
+      "hardware_target": "any",
+      "depends_on": [
+        177
+      ]
+    },
+    {
+      "name": "detect.cv3_0_1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv3_0_1_bn"
+      ],
+      "outputs": [
+        "detect_cv3_0_1_act"
+      ],
+      "shape": {
+        "n": 32000
+      },
+      "quant": {
+        "scale_in": 0.12050582104780543,
+        "scale_out": 0.12050579101081908,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 179,
+      "hardware_target": "any",
+      "depends_on": [
+        178
+      ]
+    },
+    {
+      "name": "detect.cv3_0_2",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv3_0_1_act"
+      ],
+      "outputs": [
+        "detect_cv3_0_2"
+      ],
+      "weight": "detect.cv3_0_2.weight_q",
+      "bias": "detect.cv3_0_2.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 80,
+        "IH": 20,
+        "IW": 20,
+        "OC": 80,
+        "OH": 20,
+        "OW": 20,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1643450634,
+        "output_shift": 9,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 180,
+      "hardware_target": "any",
+      "depends_on": [
+        179
+      ]
+    },
+    {
+      "name": "cat_13",
+      "op": "cat2_c1_s8",
+      "inputs": [
+        "detect_cv2_0_2",
+        "detect_cv3_0_2"
+      ],
+      "outputs": [
+        "cat_13"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 20,
+        "W": 20,
+        "C_inputs": [
+          64,
+          80
+        ],
+        "C_total": 144
+      },
+      "quant": {
+        "scales_in": [
+          0.08941464912234329,
+          0.15180701909102792
+        ],
+        "scale_out": 0.15180701909102792,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 181,
+      "hardware_target": "any",
+      "depends_on": [
+        173,
+        180
+      ]
+    },
+    {
+      "name": "detect.cv2_1_0.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l18_cv2_act"
+      ],
+      "outputs": [
+        "detect_cv2_1_0_conv"
+      ],
+      "weight": "detect.cv2_1_0.conv.weight_q",
+      "bias": "detect.cv2_1_0.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2128756165,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 182,
+      "hardware_target": "any",
+      "depends_on": [
+        148
+      ]
+    },
+    {
+      "name": "detect.cv2_1_0.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv2_1_0_conv"
+      ],
+      "outputs": [
+        "detect_cv2_1_0_bn"
+      ],
+      "weight": "detect.cv2_1_0.bn.scale",
+      "bias": "detect.cv2_1_0.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.007305627732765017,
+        "scale_out": 0.06187797155905896,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 183,
+      "hardware_target": "any",
+      "depends_on": [
+        182
+      ]
+    },
+    {
+      "name": "detect.cv2_1_0.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv2_1_0_bn"
+      ],
+      "outputs": [
+        "detect_cv2_1_0_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.06187797155905896,
+        "scale_out": 0.03935792877918153,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 184,
+      "hardware_target": "any",
+      "depends_on": [
+        183
+      ]
+    },
+    {
+      "name": "detect.cv2_1_1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv2_1_0_act"
+      ],
+      "outputs": [
+        "detect_cv2_1_1_conv"
+      ],
+      "weight": "detect.cv2_1_1.conv.weight_q",
+      "bias": "detect.cv2_1_1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1751228594,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 185,
+      "hardware_target": "any",
+      "depends_on": [
+        184
+      ]
+    },
+    {
+      "name": "detect.cv2_1_1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv2_1_1_conv"
+      ],
+      "outputs": [
+        "detect_cv2_1_1_bn"
+      ],
+      "weight": "detect.cv2_1_1.bn.scale",
+      "bias": "detect.cv2_1_1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.01118113487724244,
+        "scale_out": 0.10951170583409588,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 186,
+      "hardware_target": "any",
+      "depends_on": [
+        185
+      ]
+    },
+    {
+      "name": "detect.cv2_1_1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv2_1_1_bn"
+      ],
+      "outputs": [
+        "detect_cv2_1_1_act"
+      ],
+      "shape": {
+        "n": 6400
+      },
+      "quant": {
+        "scale_in": 0.10951170583409588,
+        "scale_out": 0.1094233745665062,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 187,
+      "hardware_target": "any",
+      "depends_on": [
+        186
+      ]
+    },
+    {
+      "name": "detect.cv2_1_2",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv2_1_1_act"
+      ],
+      "outputs": [
+        "detect_cv2_1_2"
+      ],
+      "weight": "detect.cv2_1_2.weight_q",
+      "bias": "detect.cv2_1_2.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 10,
+        "IW": 10,
+        "OC": 64,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2047161712,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 188,
+      "hardware_target": "any",
+      "depends_on": [
+        187
+      ]
+    },
+    {
+      "name": "detect.cv3_1_0.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l18_cv2_act"
+      ],
+      "outputs": [
+        "detect_cv3_1_0_conv"
+      ],
+      "weight": "detect.cv3_1_0.conv.weight_q",
+      "bias": "detect.cv3_1_0.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 128,
+        "IH": 10,
+        "IW": 10,
+        "OC": 80,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2049161725,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 189,
+      "hardware_target": "any",
+      "depends_on": [
+        148
+      ]
+    },
+    {
+      "name": "detect.cv3_1_0.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv3_1_0_conv"
+      ],
+      "outputs": [
+        "detect_cv3_1_0_bn"
+      ],
+      "weight": "detect.cv3_1_0.bn.scale",
+      "bias": "detect.cv3_1_0.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 80,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.006994858970792275,
+        "scale_out": 0.05750460887518455,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 190,
+      "hardware_target": "any",
+      "depends_on": [
+        189
+      ]
+    },
+    {
+      "name": "detect.cv3_1_0.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv3_1_0_bn"
+      ],
+      "outputs": [
+        "detect_cv3_1_0_act"
+      ],
+      "shape": {
+        "n": 8000
+      },
+      "quant": {
+        "scale_in": 0.05750460887518455,
+        "scale_out": 0.026091493020846148,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 191,
+      "hardware_target": "any",
+      "depends_on": [
+        190
+      ]
+    },
+    {
+      "name": "detect.cv3_1_1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv3_1_0_act"
+      ],
+      "outputs": [
+        "detect_cv3_1_1_conv"
+      ],
+      "weight": "detect.cv3_1_1.conv.weight_q",
+      "bias": "detect.cv3_1_1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 80,
+        "IH": 10,
+        "IW": 10,
+        "OC": 80,
+        "OH": 10,
+        "OW": 10,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1283686374,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 192,
+      "hardware_target": "any",
+      "depends_on": [
+        191
+      ]
+    },
+    {
+      "name": "detect.cv3_1_1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv3_1_1_conv"
+      ],
+      "outputs": [
+        "detect_cv3_1_1_bn"
+      ],
+      "weight": "detect.cv3_1_1.bn.scale",
+      "bias": "detect.cv3_1_1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 80,
+        "H": 10,
+        "W": 10
+      },
+      "quant": {
+        "scale_in": 0.008055220438739446,
+        "scale_out": 0.3083521925558255,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 193,
+      "hardware_target": "any",
+      "depends_on": [
+        192
+      ]
+    },
+    {
+      "name": "detect.cv3_1_1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv3_1_1_bn"
+      ],
+      "outputs": [
+        "detect_cv3_1_1_act"
+      ],
+      "shape": {
+        "n": 8000
+      },
+      "quant": {
+        "scale_in": 0.3083521925558255,
+        "scale_out": 0.3083521925558255,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 194,
+      "hardware_target": "any",
+      "depends_on": [
+        193
+      ]
+    },
+    {
+      "name": "detect.cv3_1_2",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv3_1_1_act"
+      ],
+      "outputs": [
+        "detect_cv3_1_2"
+      ],
+      "weight": "detect.cv3_1_2.weight_q",
+      "bias": "detect.cv3_1_2.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 80,
+        "IH": 10,
+        "IW": 10,
+        "OC": 80,
+        "OH": 10,
+        "OW": 10,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2046591082,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 195,
+      "hardware_target": "any",
+      "depends_on": [
+        194
+      ]
+    },
+    {
+      "name": "cat_14",
+      "op": "cat2_c1_s8",
+      "inputs": [
+        "detect_cv2_1_2",
+        "detect_cv3_1_2"
+      ],
+      "outputs": [
+        "cat_14"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 10,
+        "W": 10,
+        "C_inputs": [
+          64,
+          80
+        ],
+        "C_total": 144
+      },
+      "quant": {
+        "scales_in": [
+          0.07722050373948465,
+          0.1883678886834092
+        ],
+        "scale_out": 0.1883678886834092,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 196,
+      "hardware_target": "any",
+      "depends_on": [
+        188,
+        195
+      ]
+    },
+    {
+      "name": "detect.cv2_2_0.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l21_cv2_act"
+      ],
+      "outputs": [
+        "detect_cv2_2_0_conv"
+      ],
+      "weight": "detect.cv2_2_0.conv.weight_q",
+      "bias": "detect.cv2_2_0.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 256,
+        "IH": 5,
+        "IW": 5,
+        "OC": 64,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1109941364,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 197,
+      "hardware_target": "any",
+      "depends_on": [
+        166
+      ]
+    },
+    {
+      "name": "detect.cv2_2_0.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv2_2_0_conv"
+      ],
+      "outputs": [
+        "detect_cv2_2_0_bn"
+      ],
+      "weight": "detect.cv2_2_0.bn.scale",
+      "bias": "detect.cv2_2_0.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.0075983719562921,
+        "scale_out": 0.051004064364696115,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 198,
+      "hardware_target": "any",
+      "depends_on": [
+        197
+      ]
+    },
+    {
+      "name": "detect.cv2_2_0.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv2_2_0_bn"
+      ],
+      "outputs": [
+        "detect_cv2_2_0_act"
+      ],
+      "shape": {
+        "n": 1600
+      },
+      "quant": {
+        "scale_in": 0.051004064364696115,
+        "scale_out": 0.04409660504558894,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 199,
+      "hardware_target": "any",
+      "depends_on": [
+        198
+      ]
+    },
+    {
+      "name": "detect.cv2_2_1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv2_2_0_act"
+      ],
+      "outputs": [
+        "detect_cv2_2_1_conv"
+      ],
+      "weight": "detect.cv2_2_1.conv.weight_q",
+      "bias": "detect.cv2_2_1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 5,
+        "IW": 5,
+        "OC": 64,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1421029081,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 200,
+      "hardware_target": "any",
+      "depends_on": [
+        199
+      ]
+    },
+    {
+      "name": "detect.cv2_2_1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv2_2_1_conv"
+      ],
+      "outputs": [
+        "detect_cv2_2_1_bn"
+      ],
+      "weight": "detect.cv2_2_1.bn.scale",
+      "bias": "detect.cv2_2_1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 64,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.013167214205884558,
+        "scale_out": 0.09668323186438853,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 201,
+      "hardware_target": "any",
+      "depends_on": [
+        200
+      ]
+    },
+    {
+      "name": "detect.cv2_2_1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv2_2_1_bn"
+      ],
+      "outputs": [
+        "detect_cv2_2_1_act"
+      ],
+      "shape": {
+        "n": 1600
+      },
+      "quant": {
+        "scale_in": 0.09668323186438853,
+        "scale_out": 0.09668278130959337,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 202,
+      "hardware_target": "any",
+      "depends_on": [
+        201
+      ]
+    },
+    {
+      "name": "detect.cv2_2_2",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv2_2_1_act"
+      ],
+      "outputs": [
+        "detect_cv2_2_2"
+      ],
+      "weight": "detect.cv2_2_2.weight_q",
+      "bias": "detect.cv2_2_2.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 64,
+        "IH": 5,
+        "IW": 5,
+        "OC": 64,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1668381567,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 203,
+      "hardware_target": "any",
+      "depends_on": [
+        202
+      ]
+    },
+    {
+      "name": "detect.cv3_2_0.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "l21_cv2_act"
+      ],
+      "outputs": [
+        "detect_cv3_2_0_conv"
+      ],
+      "weight": "detect.cv3_2_0.conv.weight_q",
+      "bias": "detect.cv3_2_0.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 256,
+        "IH": 5,
+        "IW": 5,
+        "OC": 80,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1744943517,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 204,
+      "hardware_target": "any",
+      "depends_on": [
+        166
+      ]
+    },
+    {
+      "name": "detect.cv3_2_0.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv3_2_0_conv"
+      ],
+      "outputs": [
+        "detect_cv3_2_0_bn"
+      ],
+      "weight": "detect.cv3_2_0.bn.scale",
+      "bias": "detect.cv3_2_0.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 80,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.007507533538998581,
+        "scale_out": 0.09927902071494756,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 205,
+      "hardware_target": "any",
+      "depends_on": [
+        204
+      ]
+    },
+    {
+      "name": "detect.cv3_2_0.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv3_2_0_bn"
+      ],
+      "outputs": [
+        "detect_cv3_2_0_act"
+      ],
+      "shape": {
+        "n": 2000
+      },
+      "quant": {
+        "scale_in": 0.09927902071494756,
+        "scale_out": 0.04360158424677811,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 206,
+      "hardware_target": "any",
+      "depends_on": [
+        205
+      ]
+    },
+    {
+      "name": "detect.cv3_2_1.conv",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv3_2_0_act"
+      ],
+      "outputs": [
+        "detect_cv3_2_1_conv"
+      ],
+      "weight": "detect.cv3_2_1.conv.weight_q",
+      "bias": "detect.cv3_2_1.conv.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 80,
+        "IH": 5,
+        "IW": 5,
+        "OC": 80,
+        "OH": 5,
+        "OW": 5,
+        "KH": 3,
+        "KW": 3,
+        "SH": 1,
+        "SW": 1,
+        "PH": 1,
+        "PW": 1
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2038529126,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 207,
+      "hardware_target": "any",
+      "depends_on": [
+        206
+      ]
+    },
+    {
+      "name": "detect.cv3_2_1.bn",
+      "op": "batchnorm2d_s8",
+      "inputs": [
+        "detect_cv3_2_1_conv"
+      ],
+      "outputs": [
+        "detect_cv3_2_1_bn"
+      ],
+      "weight": "detect.cv3_2_1.bn.scale",
+      "bias": "detect.cv3_2_1.bn.bias_fused",
+      "shape": {
+        "N": 1,
+        "C": 80,
+        "H": 5,
+        "W": 5
+      },
+      "quant": {
+        "scale_in": 0.00868006015387107,
+        "scale_out": 0.44704214982160434,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 208,
+      "hardware_target": "any",
+      "depends_on": [
+        207
+      ]
+    },
+    {
+      "name": "detect.cv3_2_1.act",
+      "op": "silu_s8",
+      "inputs": [
+        "detect_cv3_2_1_bn"
+      ],
+      "outputs": [
+        "detect_cv3_2_1_act"
+      ],
+      "shape": {
+        "n": 2000
+      },
+      "quant": {
+        "scale_in": 0.44704214982160434,
+        "scale_out": 0.44704214982160434,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 209,
+      "hardware_target": "any",
+      "depends_on": [
+        208
+      ]
+    },
+    {
+      "name": "detect.cv3_2_2",
+      "op": "conv2d_s8",
+      "inputs": [
+        "detect_cv3_2_1_act"
+      ],
+      "outputs": [
+        "detect_cv3_2_2"
+      ],
+      "weight": "detect.cv3_2_2.weight_q",
+      "bias": "detect.cv3_2_2.bias_q",
+      "shape": {
+        "N": 1,
+        "IC": 80,
+        "IH": 5,
+        "IW": 5,
+        "OC": 80,
+        "OH": 5,
+        "OW": 5,
+        "KH": 1,
+        "KW": 1,
+        "SH": 1,
+        "SW": 1,
+        "PH": 0,
+        "PW": 0
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1455925559,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 210,
+      "hardware_target": "any",
+      "depends_on": [
+        209
+      ]
+    },
+    {
+      "name": "cat_15",
+      "op": "cat2_c1_s8",
+      "inputs": [
+        "detect_cv2_2_2",
+        "detect_cv3_2_2"
+      ],
+      "outputs": [
+        "cat_15"
+      ],
+      "shape": {
+        "N": 1,
+        "H": 5,
+        "W": 5,
+        "C_inputs": [
+          64,
+          80
+        ],
+        "C_total": 144
+      },
+      "quant": {
+        "scales_in": [
+          0.08016772533026267,
+          0.24662043353704016
+        ],
+        "scale_out": 0.24662043353704016,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 211,
+      "hardware_target": "any",
+      "depends_on": [
+        203,
+        210
+      ]
+    }
+  ],
+  "dispatches": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70,
+    71,
+    72,
+    73,
+    74,
+    75,
+    76,
+    77,
+    78,
+    79,
+    80,
+    81,
+    82,
+    83,
+    84,
+    85,
+    86,
+    87,
+    88,
+    89,
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    127,
+    128,
+    129,
+    130,
+    131,
+    132,
+    133,
+    134,
+    135,
+    136,
+    137,
+    138,
+    139,
+    140,
+    141,
+    142,
+    143,
+    144,
+    145,
+    146,
+    147,
+    148,
+    149,
+    150,
+    151,
+    152,
+    153,
+    154,
+    155,
+    156,
+    157,
+    158,
+    159,
+    160,
+    161,
+    162,
+    163,
+    164,
+    165,
+    166,
+    167,
+    168,
+    169,
+    170,
+    171,
+    172,
+    173,
+    174,
+    175,
+    176,
+    177,
+    178,
+    179,
+    180,
+    181,
+    182,
+    183,
+    184,
+    185,
+    186,
+    187,
+    188,
+    189,
+    190,
+    191,
+    192,
+    193,
+    194,
+    195,
+    196,
+    197,
+    198,
+    199,
+    200,
+    201,
+    202,
+    203,
+    204,
+    205,
+    206,
+    207,
+    208,
+    209,
+    210,
+    211
+  ]
+}

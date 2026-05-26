@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "arm": "A",
+  "workload_id": "dronet_scalar_smoke",
+  "run_id": "2026-05-26T18-05-41Z",
+  "git_sha": "6744d45",
+  "started_at": "2026-05-26T18:05:41.595404+00:00",
+  "ended_at": "2026-05-26T18:05:50.161129+00:00",
+  "wall_clock_s": 8.566,
+  "peak_rss_mb": 99.8,
+  "exit_status": "ok",
+  "model": "dronet",
+  "target": "scalar",
+  "quant": "int8",
+  "runner": "spike"
+}
