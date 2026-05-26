@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "arm": "A",
+  "workload_id": "dronet_rvv_opu_int8",
+  "run_id": "2026-05-26T19-53-22Z",
+  "git_sha": "cae2b54",
+  "started_at": "2026-05-26T19:53:22.843989+00:00",
+  "ended_at": "2026-05-26T19:53:40.914950+00:00",
+  "wall_clock_s": 18.071,
+  "peak_rss_mb": 118.4,
+  "exit_status": "exit_1",
+  "model": "dronet",
+  "target": "rvv_opu",
+  "quant": "int8",
+  "runner": "spike"
+}
