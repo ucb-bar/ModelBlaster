@@ -18,7 +18,7 @@ import argparse
 import os
 import shutil
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from modelblaster.benchmarks.arms import _common
 
@@ -36,6 +36,7 @@ def _build_env(
     firesim_eval: bool,
     calls_log_path,
     claude_code_model: str,
+    max_usd: Optional[float] = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["MODEL_NAME"] = workload.model
@@ -53,6 +54,12 @@ def _build_env(
     if firesim_eval:
         env["FIRESIM_EVAL"] = "1"
     env["CLAUDE_CODE_CALLS_LOG"] = str(calls_log_path)
+    # Hard budget cap via the shared BudgetTracker plumbed through
+    # MODELBLASTER_MAX_USD. claude_code_client uses total_cost_usd
+    # from the CLI response (pre-priced by Claude Code) and accumulates
+    # via account_prepriced.
+    if max_usd is not None:
+        env["MODELBLASTER_MAX_USD"] = str(max_usd)
     return env
 
 
@@ -77,6 +84,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="--model arg passed to `claude --print` (alias "
                          "like 'sonnet'/'opus'/'haiku' or full id like "
                          "'claude-sonnet-4-6'; default: sonnet)")
+    ap.add_argument("--max-usd", type=float, default=None,
+                    metavar="N",
+                    help="hard kill: claude_code_client stops calling "
+                         "once cumulative spend >= N USD. Writes "
+                         "exit_status=budget_exceeded to run.json.")
     args = ap.parse_args(argv)
 
     workload = _common.load_workload(args.workload)
@@ -107,6 +119,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         workload, beam=args.beam, expansions=args.expansions,
         iterations=args.iterations, firesim_eval=firesim_eval,
         calls_log_path=calls_log, claude_code_model=args.claude_model,
+        max_usd=args.max_usd,
     )
 
     outcome = _common.execute_run_sh(
@@ -117,17 +130,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         calls_log, run_dir / "llm_tokens.json", provider=PROVIDER,
     )
 
-    return _common.finalize(
+    extra: dict[str, Any] = {
+        "beam": args.beam,
+        "expansions": args.expansions,
+        "iterations": args.iterations,
+        "firesim_eval": firesim_eval,
+        "llm_provider": PROVIDER,
+        "claude_code_model": args.claude_model,
+    }
+    if args.max_usd is not None:
+        extra["max_usd"] = args.max_usd
+    budget_tripped = _common.detect_budget_trip(run_dir, extra)
+    rc = _common.finalize(
         outcome, arm=ARM_ID, workload=workload, run_id=run_id,
-        extra_run_json={
-            "beam": args.beam,
-            "expansions": args.expansions,
-            "iterations": args.iterations,
-            "firesim_eval": firesim_eval,
-            "llm_provider": PROVIDER,
-            "claude_code_model": args.claude_model,
-        },
+        extra_run_json=extra,
     )
+    return 2 if budget_tripped else rc
 
 
 if __name__ == "__main__":
