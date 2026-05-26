@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "arm": "A",
+  "workload_id": "dronet_rvv_smoke",
+  "run_id": "2026-05-26T19-51-57Z",
+  "git_sha": "cfc41b2",
+  "started_at": "2026-05-26T19:51:57.503334+00:00",
+  "ended_at": "2026-05-26T19:52:46.636196+00:00",
+  "wall_clock_s": 49.133,
+  "peak_rss_mb": 137.2,
+  "exit_status": "ok",
+  "model": "dronet",
+  "target": "rvv",
+  "quant": "int8",
+  "runner": "spike"
+}
