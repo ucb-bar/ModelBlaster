@@ -555,92 +555,100 @@ _BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
 # Whichever frame is rendered, the silhouette stays 3 lines tall + the
 # same column count so the surrounding layout doesn't twitch.
 
-# Chunky retro ray-gun silhouette modeled on the reference image:
-#   • Big round CHAMBER on the left with an embedded chip (▣) and
-#     a power orb (◉).
-#   • Tapered BARREL+NOZZLE narrowing toward the muzzle on the right.
-#   • Angled GRIP hanging down-and-back from the bottom of the
-#     chamber (the diagonal "\\\\" lines).
-#   • Trigger sits in the notch between the chamber and the grip.
+# Cartoon ray-gun silhouette traced from the reference image
+# (tmp/Screenshot 22-32-07: purple/yellow blaster). Composition:
 #
-# 6 lines tall, same width across all phases so the layout above
-# doesn't twitch when the animation fires. The muzzle character +
-# the chip char are what change between idle / charging / firing.
+#       ╭──╮            <- top fin / sight (line 0)
+#     ╔═╧══╧═╗          <- top of body (line 1)
+#     ║◉ . ◉ ╠══╤═  ·   <- body with two "eyes" + barrel + muzzle (line 2)
+#     ╚╤════╤╝          <- bottom of body + trigger guard tabs (line 3)
+#      │    ╲           <- trigger curl on the right + grip top (line 4)
+#      │    │           <- grip mid (line 5)
+#      ╰────╯           <- grip bottom (line 6)
+#
+# 7 lines tall, same width across phases so layout above doesn't
+# twitch. The MUZZLE char on line 2 + the centre chip change between
+# idle / charging / firing; firework bursts render to the right of
+# the muzzle during recoil / trail.
 
 _BLASTER_FRAMES = {
-    # IDLE: chamber dim, chip off (·), nothing at the muzzle.
+    # IDLE: dim cyan, no chip lit, " · " muzzle.
     "idle": [
-        "     ╭─────╮",
-        "    ╱ ┌───┐ ╲╮",
-        "   │  │ ◉ │  ╞════ ·",
-        "    ╲ └───┘ ╱╯",
-        "     ╰┬───┬╯",
-        "      ╲___╲",
+        "       ╭──╮",
+        "     ╔═╧══╧═╗",
+        "     ║◉    ◉╠══╤═  ·",
+        "     ╚╤════╤╝",
+        "      │    ╲",
+        "      │    │",
+        "      ╰────╯",
     ],
-    # CHARGING: chip lights (▣), chamber housing pulses bright cyan,
-    # muzzle ramps to a focus char (◆) as the orb spins up.
+    # CHARGING: chip ▣ lit in the centre, " ◆ " muzzle focus.
     "charge": [
-        "     ╭─────╮",
-        "    ╱ ┌───┐ ╲╮",
-        "   │  │ ▣ │  ╞════ ◆",
-        "    ╲ └───┘ ╱╯",
-        "     ╰┬───┬╯",
-        "      ╲___╲",
+        "       ╭──╮",
+        "     ╔═╧══╧═╗",
+        "     ║◉ ▣ ◉ ╠══╤═  ◆",
+        "     ╚╤════╤╝",
+        "      │    ╲",
+        "      │    │",
+        "      ╰────╯",
     ],
-    # RECOIL: starburst right at the muzzle tip + chip stays lit.
+    # RECOIL: muzzle fires, firework starburst centred just right of
+    # the muzzle tip. The starburst chars occupy columns past the
+    # muzzle so the gun silhouette stays clean.
     "recoil": [
-        "     ╭─────╮      \\   /",
-        "    ╱ ┌───┐ ╲╮     ╲ /",
-        "   │  │ ▣ │  ╞═══►-= ◉ =-",
-        "    ╲ └───┘ ╱╯     ╱ \\",
-        "     ╰┬───┬╯      /   \\",
-        "      ╲___╲",
+        "       ╭──╮         \\|/",
+        "     ╔═╧══╧═╗      .-✦-.",
+        "     ║◉ ▣ ◉ ╠══►  *  ✦  *",
+        "     ╚╤════╤╝      `-✦-´",
+        "      │    ╲        /|\\",
+        "      │    │",
+        "      ╰────╯",
     ],
-    # TRAIL: chamber settles back to orb (◉), muzzle still emitting.
-    # The circuit-style trail bolt is rendered dynamically below the
-    # gun (see _mascot_render trail branch).
+    # TRAIL: chamber returns to orbs, muzzle still emitting; the
+    # firework starburst drifts further right + decays each frame
+    # (rendered below the gun lines via _FIREWORK_DECAY).
     "trail": [
-        "     ╭─────╮",
-        "    ╱ ┌───┐ ╲╮",
-        "   │  │ ◉ │  ╞═══►",
-        "    ╲ └───┘ ╱╯",
-        "     ╰┬───┬╯",
-        "      ╲___╲",
+        "       ╭──╮",
+        "     ╔═╧══╧═╗",
+        "     ║◉    ◉╠══►",
+        "     ╚╤════╤╝",
+        "      │    ╲",
+        "      │    │",
+        "      ╰────╯",
     ],
-    # PUFF: vent smoke (°) above the chamber, lingering sparkles
-    # trailing right of the muzzle as the system cools.
+    # PUFF: vent smoke (°) above + lingering sparkles trail right.
     "puff": [
-        "     ╭─────╮  °",
-        "    ╱ ┌───┐ ╲╮  '",
-        "   │  │ ◉ │  ╞── .",
-        "    ╲ └───┘ ╱╯",
-        "     ╰┬───┬╯",
-        "      ╲___╲",
+        "       ╭──╮     °",
+        "     ╔═╧══╧═╗ °",
+        "     ║◉    ◉╠─── '",
+        "     ╚╤════╤╝    .",
+        "      │    ╲",
+        "      │    │",
+        "      ╰────╯",
     ],
 }
 
 
-# Circuit-pattern bolts mimicking the green branching laser in the
-# reference image. Replaces the older `\ / -= o =- / \` starburst
-# during the trail frames -- the starburst is now reserved for the
-# recoil muzzle flash. Each entry is (top, mid, bottom) drawn below
-# the gun, drifting further right + fading each frame.
-_CIRCUIT_DECAY = [
-    # Fresh: thick branching bolt with multiple paths.
-    ("╭─┬─╮  •",
-     "─┤ ├─┴──•",
-     "╰─┴─╯  •"),
-    # Decaying: thinner, fewer branches.
-    ("─┐",
-     "─┴──•",
-     "─┘"),
-    # Sparse: lone dots remain.
+# Firework-style starbursts for the projectile trail. Each entry is
+# (top, mid, bottom) drifting further right + fading each frame.
+# Mimics a small explosion pattern with lines + sparkles, intentionally
+# kept small so they don't compete with the gun silhouette.
+_FIREWORK_DECAY = [
+    # Fresh: full starburst with star + crossing lines + sparkles.
+    (" \\ | /",
+     "--✦--✦",
+     " / | \\"),
+    # Mid: thinner cross, fewer sparkles.
+    (" .'.",
+     " -✦-",
+     " '.'"),
+    # Decaying: lone sparkles + dots.
+    ("  .",
+     " .✦.",
+     "  ."),
+    # Last: just two dots.
     ("",
-     " •  •",
-     ""),
-    # Empty: trail is gone.
-    ("",
-     "",
+     "  ·  ·",
      ""),
 ]
 
@@ -726,14 +734,13 @@ def _mascot_render(state: WatcherState) -> Group:
                     style="bold bright_yellow")
         for line in art:
             body.append(line + "\n", style="bold yellow")
-        # Circuit-pattern laser bolt drifts right + decays. Mimics
-        # the branching green laser in the reference image.
-        bolt = _CIRCUIT_DECAY[max(0, decay_idx)]
+        # Firework starburst drifts right + decays through 4 frames.
+        burst = _FIREWORK_DECAY[max(0, decay_idx)]
         offset = 16 + decay_idx * 2  # off-screen right of the muzzle
         pad = " " * offset
-        body.append(pad + bolt[0] + "\n", style="bold bright_green")
-        body.append(pad + bolt[1] + "\n", style="bold green")
-        body.append(pad + bolt[2] + "\n", style="bold bright_green")
+        body.append(pad + burst[0] + "\n", style="bold bright_yellow")
+        body.append(pad + burst[1] + "\n", style="bold bright_red")
+        body.append(pad + burst[2] + "\n", style="bold bright_yellow")
     else:  # puff
         body.append(" ⌬ BLASTER  venting…\n", style="dim cyan")
         for line in art:
