@@ -763,6 +763,10 @@ def _mascot_render(state: WatcherState) -> Group:
     # silhouette itself.
     overlays: dict[tuple[int, int], tuple[str, str]] = {}
     if key == "idle":
+        # Subtle wall-clock-cycled sparkles around the gun. These
+        # are painted OFF the silhouette (in the empty area to the
+        # right of the body) so the gun chars themselves never
+        # change between idle frames.
         sparkle_idx = int(time.time() * 2) % len(_IDLE_SPARKLES)
         for r, c, ch in _IDLE_SPARKLES[sparkle_idx]:
             overlays[(r, c)] = (ch, "bright_cyan")
@@ -772,13 +776,13 @@ def _mascot_render(state: WatcherState) -> Group:
         for c, ch in [(22, "·"), (25, "."), (28, "·")]:
             overlays[(3, c)] = (ch, "bold bright_cyan")
     elif key == "puff":
-        # Rising smoke above + lingering sparkles right of muzzle.
+        # Lingering vent smoke to the right of the muzzle. Kept
+        # entirely OFF the gun silhouette so the gun stays
+        # character-identical to the user's spec.
         overlays.update({
-            (0, 8):  ("°", "bright_white"),
-            (1, 11): ("·", "grey70"),
-            (2, 21): ("°", "grey70"),
-            (3, 23): ("'", "grey62"),
-            (4, 25): (".", "grey50"),
+            (2, 23): ("°", "grey70"),
+            (3, 25): ("'", "grey62"),
+            (4, 27): (".", "grey50"),
         })
 
     # Firework block (5 rows tall, vertically centered on row 3 of
@@ -800,6 +804,12 @@ def _mascot_render(state: WatcherState) -> Group:
     fw_start_col = GUN_WIDTH + firework_offset
 
     # Render each row of the gun + any overlays in its band.
+    # CRITICAL: every row is padded to exactly _MASCOT_CELL_WIDTH
+    # chars before the newline. Without this, rich's renderer can
+    # strip / re-align trailing whitespace per line, and since each
+    # art row has different visible widths the gun appears to
+    # "morph" between frames as lines drift left/right.
+    _MASCOT_CELL_WIDTH = 44
     for r, row_chars in enumerate(grid):
         col_cursor = 0
         # Base art cells (with overlays for cells inside the art).
@@ -832,6 +842,12 @@ def _mascot_render(state: WatcherState) -> Group:
                     body.append(" " * pad_needed)
                     col_cursor = fw_start_col
                 body.append(fw_line, style=firework_style)
+                col_cursor += len(fw_line)
+        # Pad to fixed cell width so rich doesn't strip trailing
+        # whitespace + re-align per line (which made the silhouette
+        # "morph" between frames in narrow / right-justified cells).
+        if col_cursor < _MASCOT_CELL_WIDTH:
+            body.append(" " * (_MASCOT_CELL_WIDTH - col_cursor))
         body.append("\n")
 
     # Pad to a fixed height (1 title + 8 gun + 4 trailing pad lines)
@@ -1104,39 +1120,53 @@ def _status_bar(*, paused: bool, sort_mode: str, watching: int,
                 budget_usd: Optional[float],
                 ledger: SessionLedger,
                 spinner: Optional[Spinner] = None) -> Panel:
-    """Status bar at the very bottom. Spinner is the live-state
-    heartbeat; freezes when paused so the eye registers the change."""
-    line = Text()
+    """Two-row keybindings panel that's ALWAYS visible at the bottom
+    of the TUI. Row 1: state + counters. Row 2: keys as labeled
+    chips, each key in a bordered cell. Even if the terminal is
+    narrow and rich wraps the cells, every key stays legible.
+
+    The keys themselves never change, so the eye learns where each
+    one lives -- much better than burying them in a single dim
+    status line that scrolls off-screen when the terminal is small."""
+    # --- Row 1: state line ---
+    line1 = Text()
     if paused:
-        line.append("⏸  PAUSED  ", style="bold yellow on grey23")
+        line1.append(" ⏸  PAUSED ", style="bold yellow on grey23")
     else:
-        line.append("●  LIVE  ", style="bold green")
-    line.append(f"📂 {watching}  ", style="cyan")
-    line.append(f"sort:{sort_mode}  ", style="dim")
+        line1.append(" ●  LIVE ", style="bold black on green")
+    line1.append("  📂 ", style="dim")
+    line1.append(f"{watching}", style="bold cyan")
+    line1.append("  file" + ("s" if watching != 1 else "") + "  ",
+                 style="dim")
+    line1.append("  ⇅ ", style="dim")
+    line1.append(f"sort:{sort_mode}", style="bold")
     if budget_usd is not None:
-        line.append(f"budget:{_fmt_usd(budget_usd)}  ", style="dim")
+        line1.append(f"   💵 budget:{_fmt_usd(budget_usd)}", style="dim")
     if ledger.active is not None:
-        line.append(f"⚑ {ledger.active.id}  ",
-                    style="bold magenta")
+        line1.append("   ⚑ ", style="bold magenta")
+        line1.append(ledger.active.id, style="bold magenta")
     else:
-        line.append("no session  ", style="dim italic")
-    line.append("│  ", style="grey42")
-    line.append("[", style="dim")
-    line.append("q", style="bold red")
-    line.append("]uit  [", style="dim")
-    line.append("p", style="bold")
-    line.append("]ause  [", style="dim")
-    line.append("s", style="bold")
-    line.append("]ort  [", style="dim")
-    line.append("j", style="bold")
-    line.append("/", style="dim")
-    line.append("k", style="bold")
-    line.append("] scroll  [", style="dim")
-    line.append("r", style="bold")
-    line.append("]eset  [", style="dim")
-    line.append("?", style="bold cyan")
-    line.append("] help", style="dim")
-    return Panel(line, border_style="grey42", padding=(0, 1),
+        line1.append("   ⚑ no session", style="dim italic")
+
+    # --- Row 2: keybindings, each in a labeled "chip" ---
+    key_chips = [
+        ("q",   "quit",      "bold white on red"),
+        ("p",   "pause",     "bold white on grey35"),
+        ("s",   "sort",      "bold white on grey35"),
+        ("j/k", "scroll",    "bold white on grey35"),
+        ("r",   "reset",     "bold white on grey35"),
+        ("?",   "help",      "bold white on cyan"),
+    ]
+    line2 = Text()
+    for i, (key, label, chip_style) in enumerate(key_chips):
+        if i > 0:
+            line2.append("  ", style="dim")
+        line2.append(f" {key} ", style=chip_style)
+        line2.append(f" {label}", style="bold")
+
+    body = Group(line1, Text(""), line2)
+    return Panel(body, title="[bold]controls[/bold]",
+                 border_style="grey50", padding=(0, 1),
                  box=ROUNDED)
 
 
@@ -1192,7 +1222,19 @@ def render(state: WatcherState, ledger: SessionLedger,
     # columns.
     top_row = Table.grid(expand=True)
     top_row.add_column(ratio=1)
-    top_row.add_column(width=30, justify="right")
+    # Mascot column: left-justified so every row of the gun art
+    # starts at the SAME X-coordinate inside the cell. justify="right"
+    # made each line right-align independently -- with each art row
+    # having different visible widths (due to trailing whitespace
+    # being stripped by rich), the gun appeared to "morph" between
+    # frames. The cell itself stays on the right of the table via
+    # column ordering; only the lines within the cell are now
+    # consistently aligned.
+    #
+    # Width 44 accommodates: 20-char gun + up to 14-col firework
+    # drift + ~10-char firework chars = 44. Smaller and the trail
+    # frames wrap, making the gun look broken.
+    top_row.add_column(width=44, justify="left")
     top_row.add_row(
         _summary_panel(state, ledger, windows, budget_usd),
         _mascot_render(state),
