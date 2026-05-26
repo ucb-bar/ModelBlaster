@@ -620,7 +620,8 @@ def _generate_one_llm_for_algorithm(
         # 2048 cap got hit on sigmoid_f16 / conv2d_f16 mid-expression and
         # produced unparseable truncations.
         res = client.converse(user=user, system=correctness_system,
-                              max_tokens=32768, temperature=temp)
+                              max_tokens=32768, temperature=temp,
+                              phase=f"synth:{spec.op}")
         log(f"  [{spec.op}/{algorithm.name}] tokens "
             f"in={res.input_tokens} out={res.output_tokens} "
             f"stop={res.stop_reason}")
@@ -959,6 +960,7 @@ def beam_search_optimize(
                 res = client.converse(
                     user=user, system=optimize_system,
                     max_tokens=32768, temperature=0.5,
+                    phase=f"optimize:{spec.op}",
                 )
                 log(f"      tokens in={res.input_tokens} out={res.output_tokens}")
                 # Token usage attaches to every history record produced

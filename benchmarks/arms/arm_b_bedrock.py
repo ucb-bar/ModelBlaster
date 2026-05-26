@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from modelblaster.benchmarks.arms import _common
 
@@ -34,6 +34,7 @@ def _build_env(
     iterations: int,
     firesim_eval: bool,
     calls_log_path,
+    max_usd: Optional[float] = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["MODEL_NAME"] = workload.model
@@ -50,6 +51,11 @@ def _build_env(
     if firesim_eval:
         env["FIRESIM_EVAL"] = "1"
     env["BEDROCK_CALLS_LOG"] = str(calls_log_path)
+    # Hard kill: bedrock_client reads MODELBLASTER_MAX_USD on init and
+    # raises BudgetExceeded once cumulative spend crosses the cap.
+    # Without this var, the client tracks no budget and never trips.
+    if max_usd is not None:
+        env["MODELBLASTER_MAX_USD"] = str(max_usd)
     return env
 
 
@@ -76,6 +82,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "this routes through spike-hetero (functional-"
                          "only); use the workload's default for the "
                          "baseline capture.")
+    ap.add_argument("--max-usd", type=float, default=None,
+                    metavar="N",
+                    help="hard kill: BedrockClient stops calling once "
+                         "cumulative spend >= N USD. Writes "
+                         "exit_status=budget_exceeded to run.json and the "
+                         "trip event lands as a MODELBLASTER_BUDGET_EXCEEDED "
+                         "line in stderr.log. Default: no cap.")
     args = ap.parse_args(argv)
 
     workload = _common.load_workload(args.workload)
@@ -106,6 +119,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         workload, beam=args.beam, expansions=args.expansions,
         iterations=args.iterations, firesim_eval=firesim_eval,
         calls_log_path=calls_log,
+        max_usd=args.max_usd,
     )
 
     outcome = _common.execute_run_sh(
@@ -119,16 +133,51 @@ def main(argv: Optional[list[str]] = None) -> int:
         calls_log, run_dir / "llm_tokens.json", provider=PROVIDER,
     )
 
-    return _common.finalize(
+    # Budget trip: bedrock_client writes a MODELBLASTER_BUDGET_EXCEEDED
+    # line to stderr right before raising. Detect that here and override
+    # the run.json exit_status so the dashboard can flag the cell
+    # distinctly from a generic run failure.
+    extra: dict[str, Any] = {
+        "beam": args.beam,
+        "expansions": args.expansions,
+        "iterations": args.iterations,
+        "firesim_eval": firesim_eval,
+        "llm_provider": PROVIDER,
+    }
+    if args.max_usd is not None:
+        extra["max_usd"] = args.max_usd
+    budget_tripped = False
+    stderr_path = run_dir / "stderr.log"
+    if stderr_path.exists():
+        for line in stderr_path.read_text().splitlines():
+            if line.startswith("MODELBLASTER_BUDGET_EXCEEDED:"):
+                budget_tripped = True
+                extra["budget_trip_marker"] = line
+                break
+    if budget_tripped:
+        # Forcefully relabel the outcome so finalize() writes the
+        # right exit_status. The subprocess will have exited non-zero
+        # (BudgetExceeded propagated through run.sh as a Python
+        # exception -> non-zero exit) but "budget_exceeded" is the
+        # more useful label than "exit_1".
+        outcome = _common.RunOutcome(
+            out_dir=outcome.out_dir,
+            returncode=outcome.returncode,
+            started_at=outcome.started_at,
+            ended_at=outcome.ended_at,
+            wall_clock_s=outcome.wall_clock_s,
+            peak_rss_mb=outcome.peak_rss_mb,
+        )
+        extra["exit_status_override"] = "budget_exceeded"
+
+    rc = _common.finalize(
         outcome, arm=ARM_ID, workload=workload, run_id=run_id,
-        extra_run_json={
-            "beam": args.beam,
-            "expansions": args.expansions,
-            "iterations": args.iterations,
-            "firesim_eval": firesim_eval,
-            "llm_provider": PROVIDER,
-        },
+        extra_run_json=extra,
     )
+    # Budget trip exits 2 (vs 0 OK / 1 generic run failure) so the
+    # caller of a loop over workloads can distinguish "skip rest of
+    # baseline" from "this cell broke."
+    return 2 if budget_tripped else rc
 
 
 if __name__ == "__main__":

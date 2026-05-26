@@ -511,6 +511,93 @@ def main() -> int:
         print(f"    OK (cold call $​{cold_cost:.6f} -- matches the "
               f"real Bedrock smoke test)")
 
+    # ────────── session ledger + multi-window aggregation ──────────
+    print("[12] Verify session ledger CRUD + auto-end on overlap")
+    from modelblaster.benchmarks.tools.sessions import SessionLedger
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        from pathlib import Path as _P
+        lp = _P(td) / "sessions.json"
+        L = SessionLedger.load(lp)
+        s1 = L.start("alpha", "first")
+        assert L.active and L.active.id == "alpha"
+        L.start("beta")
+        if s1.ended_at is None:
+            failures.append("alpha should have auto-ended when beta opened")
+        L.end()
+        if L.active is not None:
+            failures.append("active should be None after end()")
+        # persistence
+        L2 = SessionLedger.load(lp)
+        if len(L2.list_all()) != 2:
+            failures.append(f"persistence: expected 2 sessions, got {len(L2.list_all())}")
+    if not any("session" in f for f in failures):
+        print("    OK (start/end/auto-end/persistence)")
+
+    print("[13] Verify cost_monitor multi-window aggregation + by_kernel")
+    from modelblaster.benchmarks.tools.cost_monitor import (
+        WatcherState, IngestedRecord, _aggregate, compute_windows,
+        _kernel_from_phase,
+    )
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    state = WatcherState()
+    # 3 records: 2 in this month tagged conv2d_s8 (one synth + one
+    # optimize) and 1 from the start of the year tagged linear_s8.
+    state.records.extend([
+        IngestedRecord(
+            ts=now.isoformat(),
+            model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            cost_usd=0.01, input_uncached=1000, input_cached_read=0,
+            input_cached_write=0, output=200,
+            cell="B-bedrock/foo/bar", phase="synth:conv2d_s8",
+        ),
+        IngestedRecord(
+            ts=now.isoformat(),
+            model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            cost_usd=0.02, input_uncached=2000, input_cached_read=500,
+            input_cached_write=0, output=300,
+            cell="B-bedrock/foo/bar", phase="optimize:conv2d_s8",
+        ),
+        IngestedRecord(
+            ts=now.replace(month=1, day=1).isoformat(),
+            model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            cost_usd=0.005, input_uncached=500, input_cached_read=0,
+            input_cached_write=0, output=100,
+            cell="B-bedrock/baz/qux", phase="synth:linear_s8",
+        ),
+    ])
+
+    # _kernel_from_phase
+    if _kernel_from_phase("synth:conv2d_s8") != "conv2d_s8":
+        failures.append("_kernel_from_phase('synth:conv2d_s8') wrong")
+    if _kernel_from_phase("optimize:linear_s8") != "linear_s8":
+        failures.append("_kernel_from_phase('optimize:linear_s8') wrong")
+    if _kernel_from_phase(None) is not None or \
+       _kernel_from_phase("kernel_synthesis") is not None:
+        failures.append("_kernel_from_phase should return None on non-kernel phases")
+
+    # Aggregate cumulative across all 3
+    cumul = _aggregate(state.records, "CUMULATIVE")
+    if abs(cumul.total_cost - 0.035) > 1e-9:
+        failures.append(f"cumulative cost mismatch: {cumul.total_cost}")
+    if cumul.n_calls != 3:
+        failures.append(f"cumulative n_calls: {cumul.n_calls}")
+    if "conv2d_s8" not in cumul.by_kernel or "linear_s8" not in cumul.by_kernel:
+        failures.append(f"by_kernel missing entries: {list(cumul.by_kernel.keys())}")
+    conv_tally = cumul.by_kernel.get("conv2d_s8")
+    if conv_tally and abs(conv_tally.cost_usd - 0.03) > 1e-9:
+        failures.append(f"conv2d_s8 kernel cost: {conv_tally.cost_usd}")
+
+    # Window-filter by current month (drops the Jan record)
+    monthly_recs = [r for r in state.records
+                    if r.ts.startswith(now.strftime("%Y-%m"))]
+    monthly = _aggregate(monthly_recs, "THIS MONTH")
+    if monthly.n_calls != 2:
+        failures.append(f"monthly n_calls: {monthly.n_calls}")
+    if not any("monthly" in f or "cost_monitor" in f for f in failures):
+        print("    OK (3 records, conv kernel=$0.030, monthly filter=2 calls)")
+
     # Summary.md must render both phase tables.
     print("[10] Verify summary.md two-phase sectioning")
     summary = (RESULTS / "summary.md").read_text()
