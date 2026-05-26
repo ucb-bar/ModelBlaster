@@ -253,6 +253,94 @@ is crossed. The arm driver writes `exit_status=budget_exceeded` to
 Set an AWS Budget alert at the Billing console for the absolute backstop
 ("don't spend more than $X/month").
 
+### Sharing reports across teammates
+
+The whole point of capturing all this data is to compare methodologies.
+Three subcommands turn local state into portable bundles that any team
+transport (git, Slack, email, S3 sync) can deliver:
+
+```bash
+# 1. Lightweight: just cost aggregates. Good for Slack updates.
+uv run mb-cost export NAME [--session NAME] [--since YYYY-MM-DD]
+# -> benchmarks/reports/NAME.json + NAME.md
+
+# 2. Full experiment bundle: cost + per-cell artifacts + actual kernel
+#    C source + IR graphs + beam-search trajectory + methodology.md
+#    template. Good for "is your approach better than mine?" comparisons.
+uv run mb-cost export --full NAME
+# -> benchmarks/reports/NAME/ (directory)
+#      report.json + report.md
+#      methodology.md  (EDIT BEFORE SHARING)
+#      per-cell/<arm>__<workload>__<runid>/  all per-cell artifacts
+#      kernels/<model>/<quant>/<target>/     kernels.c + kernels.h + graph.json
+#                                            + passes_applied.json
+#                                            + optimize_summary.json (Arm B)
+#                                            + beam_search_trajectory.jsonl
+
+# 3. Render a teammate's bundle as text (read-only)
+uv run mb-cost import PATH
+
+# 4. Diff two bundles -- cost delta + per-model delta + KERNEL SOURCE diff
+#    when both are full bundles (emits a ready-to-paste `diff -u`)
+uv run mb-cost diff A B
+```
+
+The recommended team workflow:
+
+```bash
+# Run experiments under a named session for clean attribution.
+uv run mb-cost session start alice-fusion-try-1
+# (run benchmarks via Claude Code or directly)
+uv run mb-cost session end
+
+# Export a full bundle, edit the methodology, commit to git.
+uv run mb-cost export --full alice-fusion-try-1
+$EDITOR benchmarks/reports/alice-fusion-try-1/methodology.md
+git add benchmarks/reports/alice-fusion-try-1/
+git commit -m "report: alice fusion try-1 -- see methodology.md"
+git push
+
+# Teammate compares against their own approach.
+git pull
+uv run mb-cost diff benchmarks/reports/alice-fusion-try-1 \
+                    benchmarks/reports/bob-fusion-try-1
+```
+
+`benchmarks/reports/` is **tracked by git** (opposite of
+`benchmarks/results/` which is per-machine ephemeral). Bundles are
+small (10 KB -- 5 MB depending on `--full` and how many cells the
+filter covers) and exactly the kind of artifact that benefits from
+versioning + code review.
+
+#### What's in a `--full` bundle?
+
+For each cell covered, you get every artifact the dashboard reads
+from -- `run.json`, `accuracy.json`, `cycles_per_op.json` (with p50/
+p90/p95 per op kind), `kernel_picks.json`, `stage_timings.json`,
+`binary_size.json`, `passes_applied.json`, `graph_summary.json`,
+`profile_<runner>.csv`, `wall_cycles.txt`, `xpurt_trace.csv`,
+`cross_tile_estimate.json` (hetero), `llm_calls.jsonl` +
+`llm_tokens.json` + `optimize_summary.json` +
+`beam_search_trajectory.jsonl` (Arm B only).
+
+For each `(model, quant, target)` tuple a cell touched, you get
+the **actual generated kernel source** at
+`kernels/<model>/<quant>/<target>/kernels.c` byte-for-byte. The
+recipient can read the C the LLM produced and re-compile it
+themselves.
+
+The `methodology.md` template asks the author to fill in:
+**Approach / Hypothesis / Knobs changed / Result interpretation /
+Reproducing this report / Next steps**. Without prose, numbers
+alone don't tell readers WHY you tried something or how to compare.
+
+Two reference bundles are committed at `benchmarks/reports/demo-arm-a-mlp/`
+and `benchmarks/reports/demo-arm-b-mlp/` -- a tiny 2-layer MLP run
+through both arms, with the LLM-generated kernel achieving +42.9%
+cycle improvement over the scalar reference at $0.077 of real
+Bedrock spend. `mb-cost diff demo-arm-a-mlp demo-arm-b-mlp` shows
+the workflow.
+
 ## Port-back gate for CompGen integrations
 
 When evaluating whether a CompGen piece (dossier schema, oracle, plan,
