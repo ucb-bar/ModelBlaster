@@ -149,7 +149,7 @@ GEN_KERNELS_ARGS=(
     --io "${IR_DIR}/io.npz"
     --repo-root "${REPO_ROOT}"
     --build-dir "${VERIFY_BUILD_DIR}"
-    --harness-dir "modelblaster/harness"
+    --harness-dir "harness"
     --cache-dir "${CACHE_DIR}"
     --algorithms "${ALGORITHMS:-all}"
 )
@@ -255,7 +255,7 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     )
 fi
 _mb_stage_begin build
-west build -p -b "${BOARD_TARGET}" modelblaster/harness \
+west build -p -b "${BOARD_TARGET}" harness \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 _mb_stage_end build
