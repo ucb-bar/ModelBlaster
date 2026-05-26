@@ -47,6 +47,16 @@ smolvla = [
     "num2words>=0.5",
 ]
 
+[project.scripts]
+# `uv run mb-cost` launches the live cost monitor with sensible
+# defaults (watches every llm_calls.jsonl under benchmarks/results,
+# refreshes 4 Hz). The wrapper is here so the command is one short
+# token rather than a module path.
+mb-cost = "modelblaster.benchmarks.tools.cost_monitor:main"
+# `uv run mb-cost-demo` runs the fake-call producer for offline TUI
+# verification (see cost_monitor_demo.py).
+mb-cost-demo = "modelblaster.benchmarks.tools.cost_monitor_demo:main"
+
 [tool.hatch.metadata]
 # The `smolvla` optional-dependency entry uses a `file://` direct
 # reference to a sibling checkout of lerobot; hatch requires this opt-in
