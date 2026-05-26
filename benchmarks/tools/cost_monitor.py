@@ -14,7 +14,7 @@ flagged ``placeholder: true`` are skipped (their $ contribution is
 shown as ``--``) so the running total never silently includes
 guessed rates.
 
-Layout (refreshes at ``--refresh-hz``, default 2 Hz):
+Layout (refreshes at ``--refresh-hz``, default 4 Hz):
 
     +---- Summary -----+----- Recent calls ------+
     |   total $        |  hh:mm:ss  cell  phase  |
@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
+from rich.align import Align
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -68,16 +69,20 @@ def price_call(
     rates = models_table.get(model_id)
     if rates is None or rates.get("placeholder"):
         return None
-    in_uncached = int(rec.get("input_tokens", 0) or 0)
+    # Bedrock Converse usage block semantics (per AWS prompt-caching
+    # docs): `inputTokens` is the non-cached portion only.
+    #   total input billable = inputTokens         @ uncached rate
+    #                        + cacheReadInputTokens @ cache_read rate
+    #                        + cacheWriteInputTokens @ cache_write_5m rate
+    # Anthropic first-party API uses the same convention. So we DO NOT
+    # subtract cached/write from input_tokens to derive uncached -- the
+    # API already split them. An earlier version did subtract; that
+    # underbilled cached calls by ~28% and would silently drift on the
+    # beam-search loop where prompt caching is common.
+    uncached = int(rec.get("input_tokens", 0) or 0)
     cached_read = int(rec.get("cache_read_input_tokens", 0) or 0)
     cached_write = int(rec.get("cache_write_input_tokens", 0) or 0)
     out_t = int(rec.get("output_tokens", 0) or 0)
-
-    # The bedrock client logs `input_tokens` as the full input count
-    # (including cached portions on some providers). Subtract cached
-    # reads/writes to derive the "uncached" portion. Negative result
-    # means the provider didn't split cleanly -- treat as pure uncached.
-    uncached = max(0, in_uncached - cached_read - cached_write)
 
     r_in = rates.get("input_uncached")
     r_cache_read = rates.get("cache_read")
@@ -205,11 +210,13 @@ def poll_files(
 def _ingest(rec: dict, path: Path, state: WatcherState, pricing: dict,
             max_recent: int) -> None:
     model_id = str(rec.get("model_id", "unknown"))
-    in_uncached = int(rec.get("input_tokens", 0) or 0)
+    # See price_call() docstring: Bedrock's `inputTokens` is the
+    # non-cached portion only; cached_read / cached_write are reported
+    # separately and are NOT included in inputTokens.
+    uncached = int(rec.get("input_tokens", 0) or 0)
     cached_read = int(rec.get("cache_read_input_tokens", 0) or 0)
     cached_write = int(rec.get("cache_write_input_tokens", 0) or 0)
     out_t = int(rec.get("output_tokens", 0) or 0)
-    uncached = max(0, in_uncached - cached_read - cached_write)
 
     tally = state.by_model.setdefault(model_id, ModelTally())
     tally.n_calls += 1
@@ -271,6 +278,10 @@ def _fmt_short_ts(ts: str) -> str:
 
 
 def _summary_panel(state: WatcherState, watching: int) -> Panel:
+    """Big-total summary. The default view's job is to make the running
+    $ spend the focal point at any terminal size, so the dollar amount
+    gets a dedicated centered line in bold green and the supporting
+    counters live as a single subtitle line beneath it."""
     total_cost = 0.0
     cost_known = True
     total_in_uncached = 0
@@ -286,22 +297,45 @@ def _summary_panel(state: WatcherState, watching: int) -> Panel:
     elapsed = max(time.time() - state.started_at, 0.001)
     rate = state.total_calls / elapsed * 60.0  # calls/min
 
-    body = Text()
-    body.append("Running spend: ", style="bold")
-    body.append(_fmt_usd(total_cost) if cost_known
-                else f"{_fmt_usd(total_cost)}+ (some models lack rates)",
-                style="green" if cost_known else "yellow")
-    body.append("\n")
-    body.append(f"Calls so far: {state.total_calls}  ({rate:.1f}/min)\n")
-    body.append(f"Input (uncached / cached): "
-                f"{_fmt_tok(total_in_uncached)} / {_fmt_tok(total_in_cached)}\n")
-    body.append(f"Output: {_fmt_tok(total_out)}\n")
-    body.append(f"Watching {watching} llm_calls.jsonl file(s)\n",
-                style="dim")
+    # Hero line: the running spend, centered, oversized via bold + padding.
+    spend_text = _fmt_usd(total_cost)
+    if not cost_known:
+        spend_text += "+"   # the "+" hints that some models lack rates
+    hero_style = "bold green" if cost_known else "bold yellow"
+    hero = Text(f"  {spend_text}  ", style=hero_style)
+
+    # Subtitle line(s): everything else, dim but readable.
+    sub = Text(justify="center")
+    sub.append(f"{state.total_calls} call{'s' if state.total_calls != 1 else ''}",
+               style="bold white")
+    sub.append("  •  ", style="dim")
+    sub.append(f"{rate:.1f}/min", style="dim")
+    sub.append("  •  ", style="dim")
+    sub.append(f"in {_fmt_tok(total_in_uncached)}", style="dim")
+    if total_in_cached:
+        sub.append(f" (+{_fmt_tok(total_in_cached)} cached)", style="dim")
+    sub.append(f"  •  out {_fmt_tok(total_out)}", style="dim")
+    sub.append(f"  •  watching {watching} file{'s' if watching != 1 else ''}",
+               style="dim")
+
+    body = Group(
+        Text(""),
+        Align.center(hero),
+        Text(""),
+        Align.center(sub),
+        Text(""),
+    )
     if state.unknown_cost_models:
-        body.append("Models without pricing: ", style="yellow")
-        body.append(", ".join(sorted(state.unknown_cost_models)), style="yellow")
-    return Panel(body, title="Summary", border_style="cyan")
+        warn = Text(
+            f"Pricing missing for: {', '.join(sorted(state.unknown_cost_models))}",
+            style="yellow",
+        )
+        body = Group(body, Align.center(warn), Text(""))
+
+    title = "[bold]LLM SPEND[/bold]" if cost_known \
+        else "[bold yellow]LLM SPEND  (rates incomplete)[/bold yellow]"
+    return Panel(body, title=title, border_style="green" if cost_known
+                 else "yellow", padding=(0, 1))
 
 
 def _per_model_table(state: WatcherState) -> Table:
@@ -381,8 +415,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="specific llm_calls.jsonl files to watch (overrides --root)")
     ap.add_argument("--pricing", type=Path, default=DEFAULT_PRICING,
                     help="pricing.yaml path")
-    ap.add_argument("--refresh-hz", type=float, default=2.0,
-                    help="redraw rate in Hz (default: 2)")
+    ap.add_argument("--refresh-hz", type=float, default=4.0,
+                    help="redraw + file-poll rate in Hz (default: 4)")
     ap.add_argument("--max-recent", type=int, default=12,
                     help="max recent calls to keep on screen (default: 12)")
     args = ap.parse_args(argv)

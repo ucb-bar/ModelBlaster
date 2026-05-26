@@ -612,18 +612,28 @@ def synthesize_llm_tokens(
                 continue
             mid = rec.get("model_id") or "unknown"
             slot = per_model[mid]
-            cached = int(rec.get("cache_read_input_tokens") or 0)
+            cached_read = int(rec.get("cache_read_input_tokens") or 0)
+            cached_write = int(rec.get("cache_write_input_tokens") or 0)
             input_t = int(rec.get("input_tokens") or 0)
             output_t = int(rec.get("output_tokens") or 0)
-            # Bedrock/Gemini both report `input_tokens` as the total
-            # input (cache-read inclusive); subtract to land in the
-            # uncached/cached buckets the cost extractor expects.
-            uncached = max(0, input_t - cached)
-            slot["input_cached"] += cached
+            # Bedrock's Converse usage block reports `inputTokens` as the
+            # *non-cached* input portion only -- read/write counts are
+            # surfaced separately. Per AWS docs (Bedrock prompt-caching
+            # page): "When prompt caching is enabled, the inputTokens
+            # field represents only the non-cached input tokens (tokens
+            # that were not read from or written to the cache). To
+            # calculate the total input tokens sent in a request, use:
+            # total input tokens = inputTokens + cacheReadInputTokens +
+            # cacheWriteInputTokens". So `input_t` lands directly in the
+            # uncached bucket; subtracting would underbill the uncached
+            # portion. Anthropic's first-party API uses identical
+            # semantics; verified vs the Claude pricing page math.
+            uncached = input_t
+            slot["input_cached"] += cached_read
             slot["input_uncached"] += uncached
             slot["output"] += output_t
             slot["calls"] += 1
-            total_in_cached += cached
+            total_in_cached += cached_read
             total_in_uncached += uncached
             total_out += output_t
             total_calls += 1
