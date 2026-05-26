@@ -11,6 +11,15 @@
 workloads:
 
   # ───── Smoke (cheap, fast — used to validate the harness itself) ─────
+  # Tiniest viable end-to-end: 3 Linear + 2 ReLU. ~5 ops, runs in
+  # seconds, exercises every metric without burning real money.
+  - id: mlp_generic_scalar_smoke
+    model: mlp_generic
+    target: scalar
+    quant: int8
+    runner: spike
+    tags: [smoke]
+
   - id: dronet_rvv_smoke
     model: dronet
     target: rvv
