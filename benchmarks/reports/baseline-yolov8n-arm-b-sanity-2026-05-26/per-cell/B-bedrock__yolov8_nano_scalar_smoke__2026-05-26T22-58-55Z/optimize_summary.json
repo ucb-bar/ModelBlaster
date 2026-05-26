@@ -1,0 +1,259 @@
+{
+  "add_s8": {
+    "baseline": 2837882,
+    "best": 2837882,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 2837882,
+        "result": "verify_fail",
+        "tokens_in": 3818,
+        "tokens_out": 868,
+        "diag": "numerical mismatch on shape={'n': 25600}: max_abs_err=1 max_rel_err=0.167 (atol=0.0001 rtol=0.001)"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 2837882,
+        "result": "verify_fail",
+        "tokens_in": 3818,
+        "tokens_out": 846,
+        "diag": "numerical mismatch on shape={'n': 25600}: max_abs_err=1 max_rel_err=0.167 (atol=0.0001 rtol=0.001)"
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "batchnorm2d_s8": {
+    "baseline": 49702950,
+    "best": 49702950,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 49702950,
+        "result": "verify_fail",
+        "tokens_in": 4350,
+        "tokens_out": 921,
+        "diag": "golden mismatch (78)"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 49702950,
+        "result": "verify_fail",
+        "tokens_in": 4350,
+        "tokens_out": 868,
+        "diag": "golden mismatch (4)"
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat2_c1_s8": {
+    "baseline": 7749698,
+    "best": 7718389,
+    "improvement_pct": 0.40400283985259816,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 7749698,
+        "result": "ok",
+        "cycles": 7718389,
+        "tokens_in": 6210,
+        "tokens_out": 3945
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 7749698,
+        "result": "duplicate",
+        "tokens_in": 6210,
+        "tokens_out": 3945
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat3_c1_s8": {
+    "baseline": 6044486,
+    "best": 6044486,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 6044486,
+        "result": "ok",
+        "cycles": 6158822,
+        "tokens_in": 6985,
+        "tokens_out": 5355
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 6044486,
+        "result": "duplicate",
+        "tokens_in": 6985,
+        "tokens_out": 5475
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat4_c1_s8": {
+    "baseline": 3263682,
+    "best": 3263682,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 3263682,
+        "result": "ok",
+        "cycles": 3274006,
+        "tokens_in": 5388,
+        "tokens_out": 2586
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 3263682,
+        "result": "duplicate",
+        "tokens_in": 5388,
+        "tokens_out": 2586
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "conv2d_s8": {
+    "baseline": 4046755323,
+    "best": 3080072138,
+    "improvement_pct": 23.887858490128934,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 4046755323,
+        "result": "ok",
+        "cycles": 3623566647,
+        "tokens_in": 10500,
+        "tokens_out": 2236
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 4046755323,
+        "result": "ok",
+        "cycles": 3080072138,
+        "tokens_in": 10500,
+        "tokens_out": 2536
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "maxpool2d_s8": {
+    "baseline": 2296148,
+    "best": 2181371,
+    "improvement_pct": 4.9986760435302955,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 2296148,
+        "result": "ok",
+        "cycles": 2181371,
+        "tokens_in": 5787,
+        "tokens_out": 3098
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 2296148,
+        "result": "ok",
+        "cycles": 2181371,
+        "tokens_in": 5787,
+        "tokens_out": 3007
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "silu_s8": {
+    "baseline": 99546216,
+    "best": 99546216,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 99546216,
+        "result": "ok",
+        "cycles": 100417865,
+        "tokens_in": 4546,
+        "tokens_out": 1549
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 99546216,
+        "result": "duplicate",
+        "tokens_in": 4546,
+        "tokens_out": 1549
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "upsample_nearest_s8": {
+    "baseline": 750718,
+    "best": 534742,
+    "improvement_pct": 28.769258230121032,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 750718,
+        "result": "ok",
+        "cycles": 637110,
+        "tokens_in": 4137,
+        "tokens_out": 1273
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 750718,
+        "result": "ok",
+        "cycles": 534742,
+        "tokens_in": 4137,
+        "tokens_out": 1094
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  }
+}
