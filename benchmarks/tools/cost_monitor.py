@@ -1791,6 +1791,340 @@ def cmd_run(args) -> int:
     return rc
 
 
+# ───────────────────── shareable report bundle ─────────────────────
+#
+# A self-contained snapshot of cost / call / kernel data that teammates
+# can swap via git commit, Slack attachment, S3 sync, or email. Contains
+# only AGGREGATES (no raw prompts/responses), so it's safe to share
+# publicly.
+
+_REPORT_SCHEMA_VERSION = 1
+
+REPORTS_DIR = BENCHMARKS_ROOT / "reports"
+
+
+def _git_identity() -> dict[str, Optional[str]]:
+    """Capture git sha + branch for reproducibility. Silent fallback to
+    Nones when git isn't available (so the export still works)."""
+    import subprocess
+    out: dict[str, Optional[str]] = {"sha": None, "branch": None}
+    try:
+        out["sha"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(BENCHMARKS_ROOT.parent), text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        out["branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(BENCHMARKS_ROOT.parent), text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return out
+
+
+def _build_report(state: WatcherState, ledger: SessionLedger,
+                  pricing: dict, *, report_id: str,
+                  session_filter: Optional[str] = None,
+                  since: Optional[str] = None,
+                  ) -> dict:
+    """Aggregate the ingested state into a shareable JSON bundle.
+    Filters by session id (only that session's calls) or by ts >= since
+    (ISO 8601). When both are omitted, the bundle covers everything
+    cumulative.
+    """
+    import socket
+    git = _git_identity()
+    records = list(state.records)
+
+    if session_filter is not None:
+        sess = ledger.get(session_filter)
+        if sess is None:
+            raise ValueError(
+                f"session {session_filter!r} not found in ledger"
+            )
+        records = [r for r in records if sess.contains(r.ts)]
+
+    if since is not None:
+        records = [r for r in records if r.ts >= since]
+
+    # Aggregate.
+    win = _aggregate(records, "EXPORT")
+    monthly = _aggregate(
+        [r for r in records if is_within_current_month(r.ts)],
+        "MONTHLY",
+    )
+
+    # Per-cell rollup.
+    by_cell: dict[str, dict] = {}
+    for r in records:
+        slot = by_cell.setdefault(r.cell, {
+            "n_calls": 0, "cost_usd": 0.0, "cost_known": True,
+            "input_uncached": 0, "input_cached_read": 0,
+            "input_cached_write": 0, "output": 0,
+        })
+        slot["n_calls"] += 1
+        if r.cost_usd is None:
+            slot["cost_known"] = False
+        else:
+            slot["cost_usd"] += r.cost_usd
+        slot["input_uncached"] += r.input_uncached
+        slot["input_cached_read"] += r.input_cached_read
+        slot["input_cached_write"] += r.input_cached_write
+        slot["output"] += r.output
+
+    sessions_payload = []
+    for s in ledger.list_all():
+        s_recs = [r for r in records if s.contains(r.ts)]
+        if not s_recs and session_filter is None:
+            continue
+        s_cost = sum((r.cost_usd or 0.0) for r in s_recs)
+        sessions_payload.append({
+            "id": s.id, "label": s.label,
+            "started_at": s.started_at, "ended_at": s.ended_at,
+            "is_active": s.is_active,
+            "n_calls": len(s_recs), "cost_usd": round(s_cost, 4),
+        })
+
+    def _tally_to_dict(t: ModelTally) -> dict:
+        return {
+            "n_calls": t.n_calls,
+            "input_uncached": t.input_uncached,
+            "input_cached_read": t.input_cached_read,
+            "input_cached_write": t.input_cached_write,
+            "output": t.output,
+            "cost_usd": round(t.cost_usd, 6),
+            "cost_known": t.cost_known,
+        }
+
+    def _window_to_dict(w: WindowTotals) -> dict:
+        return {
+            "label": w.label, "n_calls": w.n_calls,
+            "total_cost_usd": round(w.total_cost, 6),
+            "cost_known": w.cost_known,
+            "input_uncached": w.input_uncached,
+            "input_cached": w.input_cached,
+            "output": w.output,
+        }
+
+    return {
+        "schema_version": _REPORT_SCHEMA_VERSION,
+        "report_id": report_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_by": {
+            "user": os.environ.get("USER", "?"),
+            "hostname": socket.gethostname(),
+            "git_sha": git["sha"], "git_branch": git["branch"],
+        },
+        "filter": {
+            "session": session_filter, "since": since,
+        },
+        "windows": {
+            "cumulative": _window_to_dict(win),
+            "monthly": _window_to_dict(monthly),
+        },
+        "by_model": {k: _tally_to_dict(v) for k, v in win.by_model.items()},
+        "by_kernel": {k: _tally_to_dict(v) for k, v in win.by_kernel.items()},
+        "by_cell": by_cell,
+        "sessions": sessions_payload,
+        "config": {
+            "pricing_last_updated": pricing.get("last_updated"),
+        },
+    }
+
+
+def _render_report_markdown(bundle: dict) -> str:
+    """Human-readable markdown rendering of an exported bundle."""
+    lines = []
+    rid = bundle["report_id"]
+    g = bundle["generated_by"]
+    lines.append(f"# Cost report — `{rid}`")
+    lines.append("")
+    lines.append(f"_Generated at {bundle['generated_at']} by_  "
+                 f"`{g['user']}@{g['hostname']}`  "
+                 f"_on git_  `{g.get('git_sha') or 'n/a'}`  "
+                 f"_branch_  `{g.get('git_branch') or 'n/a'}`.")
+    flt = bundle.get("filter", {})
+    if flt.get("session"):
+        lines.append(f"\n_Filter:_ session = `{flt['session']}`")
+    if flt.get("since"):
+        lines.append(f"\n_Filter:_ since = `{flt['since']}`")
+    lines.append("")
+    win = bundle["windows"]["cumulative"]
+    monthly = bundle["windows"]["monthly"]
+    plus = "" if win["cost_known"] else "+"
+    lines.append(f"## Totals")
+    lines.append(f"- **Spend:** ${win['total_cost_usd']:.4f}{plus} "
+                 f"across {win['n_calls']} calls")
+    lines.append(f"- This month: ${monthly['total_cost_usd']:.4f} "
+                 f"({monthly['n_calls']} calls)")
+    lines.append(f"- Input (uncached / cached): {win['input_uncached']:,} / "
+                 f"{win['input_cached']:,}")
+    lines.append(f"- Output: {win['output']:,}")
+    lines.append("")
+
+    if bundle.get("by_model"):
+        lines.append("## Per-model")
+        lines.append("| Model | Calls | In (uncached) | In (cached) | Out | USD |")
+        lines.append("|---|---|---|---|---|---|")
+        for mid, t in sorted(bundle["by_model"].items(),
+                              key=lambda kv: -kv[1]["cost_usd"]):
+            cached = t["input_cached_read"] + t["input_cached_write"]
+            lines.append(f"| `{mid}` | {t['n_calls']} | "
+                         f"{t['input_uncached']:,} | {cached:,} | "
+                         f"{t['output']:,} | ${t['cost_usd']:.4f} |")
+        lines.append("")
+
+    if bundle.get("by_kernel"):
+        lines.append("## Per-kernel (by op)")
+        lines.append("| Kernel | Calls | In | Out | USD |")
+        lines.append("|---|---|---|---|---|")
+        for k, t in sorted(bundle["by_kernel"].items(),
+                            key=lambda kv: -kv[1]["cost_usd"]):
+            in_tok = (t["input_uncached"]
+                       + t["input_cached_read"]
+                       + t["input_cached_write"])
+            lines.append(f"| `{k}` | {t['n_calls']} | {in_tok:,} | "
+                         f"{t['output']:,} | ${t['cost_usd']:.4f} |")
+        lines.append("")
+
+    if bundle.get("by_cell"):
+        lines.append("## Per-cell")
+        lines.append("| Cell | Calls | USD |")
+        lines.append("|---|---|---|")
+        for cell, slot in sorted(bundle["by_cell"].items(),
+                                  key=lambda kv: -kv[1]["cost_usd"]):
+            lines.append(f"| `{cell}` | {slot['n_calls']} | "
+                         f"${slot['cost_usd']:.4f} |")
+        lines.append("")
+
+    if bundle.get("sessions"):
+        lines.append("## Sessions covered")
+        lines.append("| Session | Label | Started | Ended | Calls | USD |")
+        lines.append("|---|---|---|---|---|---|")
+        for s in bundle["sessions"]:
+            ended = "ongoing" if s["is_active"] else s["ended_at"][:19]
+            lines.append(
+                f"| `{s['id']}` | {s.get('label') or ''} | "
+                f"{s['started_at'][:19]} | {ended} | "
+                f"{s['n_calls']} | ${s['cost_usd']:.4f} |"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ───────────────────── subcommand: export ─────────────────────
+
+
+def cmd_export(args) -> int:
+    """Aggregate current state into a portable JSON + Markdown bundle
+    suitable for sharing with teammates."""
+    if not args.pricing.exists():
+        print(f"pricing file not found: {args.pricing}", file=sys.stderr)
+        return 2
+    pricing = load_pricing(args.pricing)
+    ledger = SessionLedger.load()
+    state = WatcherState()
+    files = list(discover_jsonls(args.root))
+    if getattr(args, "watch_claude_code", False):
+        files.extend(discover_claude_code_sessions())
+    poll_files(files, state, pricing)
+
+    try:
+        bundle = _build_report(
+            state, ledger, pricing,
+            report_id=args.name,
+            session_filter=args.session,
+            since=args.since,
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_json = REPORTS_DIR / f"{args.name}.json"
+    out_md = REPORTS_DIR / f"{args.name}.md"
+    out_json.write_text(json.dumps(bundle, indent=2, default=str))
+    out_md.write_text(_render_report_markdown(bundle))
+    print(f"wrote {out_json}")
+    print(f"wrote {out_md}")
+    print(f"\nShare either file. JSON is machine-readable + diff-able; "
+          f"Markdown is human-friendly for Slack / PRs / email.")
+    return 0
+
+
+# ───────────────────── subcommand: import ─────────────────────
+
+
+def cmd_import(args) -> int:
+    """Read a teammate's exported bundle and print a text summary.
+    Read-only: does NOT merge anything into the local ledger or state."""
+    src = Path(args.path)
+    if not src.exists():
+        print(f"file not found: {src}", file=sys.stderr)
+        return 2
+    try:
+        bundle = json.loads(src.read_text())
+    except json.JSONDecodeError as e:
+        print(f"not valid JSON: {e}", file=sys.stderr)
+        return 2
+    sv = bundle.get("schema_version")
+    if sv != _REPORT_SCHEMA_VERSION:
+        print(f"warning: bundle schema_version={sv} differs from "
+              f"current ({_REPORT_SCHEMA_VERSION}); "
+              f"some fields may be missing.",
+              file=sys.stderr)
+    print(_render_report_markdown(bundle))
+    return 0
+
+
+# ───────────────────── subcommand: diff ─────────────────────
+
+
+def cmd_diff(args) -> int:
+    """Side-by-side comparison of two report bundles."""
+    a_path = Path(args.a)
+    b_path = Path(args.b)
+    if not a_path.exists() or not b_path.exists():
+        print("both --a and --b paths must exist", file=sys.stderr)
+        return 2
+    a = json.loads(a_path.read_text())
+    b = json.loads(b_path.read_text())
+
+    def _g(d, *keys, default=None):
+        for k in keys:
+            d = d.get(k, {}) if isinstance(d, dict) else default
+        return d if d != {} else default
+
+    print(f"DIFF  {a['report_id']}  vs  {b['report_id']}\n")
+    aw = a["windows"]["cumulative"]; bw = b["windows"]["cumulative"]
+    print(f"  spend:   ${aw['total_cost_usd']:.4f}  vs  ${bw['total_cost_usd']:.4f}"
+          f"  (Δ ${bw['total_cost_usd'] - aw['total_cost_usd']:+.4f})")
+    print(f"  calls:   {aw['n_calls']}  vs  {bw['n_calls']}"
+          f"  (Δ {bw['n_calls'] - aw['n_calls']:+d})")
+    print(f"  output:  {aw['output']:,}  vs  {bw['output']:,}"
+          f"  (Δ {bw['output'] - aw['output']:+,})")
+
+    am = set(a.get("by_model", {}).keys())
+    bm = set(b.get("by_model", {}).keys())
+    common = sorted(am & bm)
+    only_a = sorted(am - bm)
+    only_b = sorted(bm - am)
+    if common:
+        print("\n  per-model (common):")
+        for m in common:
+            ac = a["by_model"][m]["cost_usd"]
+            bc = b["by_model"][m]["cost_usd"]
+            print(f"    {m[:60]:60s}  ${ac:.4f}  vs  ${bc:.4f}  "
+                  f"(Δ ${bc-ac:+.4f})")
+    if only_a:
+        print(f"\n  only in {a['report_id']!r}: {only_a}")
+    if only_b:
+        print(f"\n  only in {b['report_id']!r}: {only_b}")
+    return 0
+
+
 # ───────────────────── subcommand: report ─────────────────────
 
 
@@ -1903,6 +2237,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     rep = sub.add_parser("report", help="one-shot text report (no TUI)")
     _add_common_args(rep)
 
+    # export: shareable bundle for teammates
+    exp = sub.add_parser("export",
+                         help="export current state as a portable JSON+MD "
+                              "bundle for sharing with teammates")
+    _add_common_args(exp)
+    exp.add_argument("name", help="report id (used as filename; should "
+                                   "be unique per snapshot)")
+    exp.add_argument("--session", default=None,
+                     help="filter to a specific session id (default: all)")
+    exp.add_argument("--since", default=None,
+                     help="filter records to ts >= YYYY-MM-DD or ISO 8601")
+
+    # import: read someone else's bundle
+    imp = sub.add_parser("import",
+                         help="render a teammate's exported bundle as text "
+                              "(read-only; doesn't merge into local state)")
+    imp.add_argument("path", help="path to a .json bundle from `mb-cost export`")
+
+    # diff: compare two bundles
+    df = sub.add_parser("diff", help="side-by-side diff of two bundles")
+    df.add_argument("a", help="path to first bundle")
+    df.add_argument("b", help="path to second bundle")
+
     # run NAME [--label TEXT] -- <command...>
     #
     # argparse.REMAINDER consumes EVERYTHING after the positional
@@ -1927,6 +2284,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not argv:
         argv = sys.argv[1:]
     if not argv or argv[0] not in ("live", "session", "report", "run",
+                                    "export", "import", "diff",
                                     "-h", "--help"):
         argv = ["live"] + list(argv)
     args = ap.parse_args(argv)
@@ -1947,6 +2305,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command and args.command[0] == "--":
             args.command = args.command[1:]
         return cmd_run(args)
+    if args.cmd == "export":
+        return cmd_export(args)
+    if args.cmd == "import":
+        return cmd_import(args)
+    if args.cmd == "diff":
+        return cmd_diff(args)
     ap.print_help()
     return 0
 
