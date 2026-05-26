@@ -370,6 +370,15 @@ def execute_run_sh(
     (out_dir / "stdout.log").write_text(proc.stdout)
     (out_dir / "stderr.log").write_text(proc.stderr)
 
+    # Per-stage wall-clock breakdown from the MODELBLASTER_STAGE_END
+    # markers _run_lib.sh emits. Captures the extract / skeleton /
+    # kernels / build / run split so the dashboard can show where
+    # compile_wall_clock_s went.
+    from modelblaster.benchmarks.ingest import stage_timings
+    (out_dir / "stage_timings.json").write_text(
+        json.dumps(stage_timings.synthesize(proc.stdout), indent=2)
+    )
+
     parsed = runner.parse_stdout(proc.stdout)
     runner.write_accuracy(out_dir, parsed["verify"])
     runner.write_profile_csv(out_dir, parsed["profile"],
@@ -395,6 +404,10 @@ def execute_run_sh(
     # graph.json stays out of the run dir (large; per-model, not
     # per-cell).
     _emit_graph_summary(workload, out_dir)
+
+    # All cells: stat the build artifacts so the dashboard can track
+    # binary bloat alongside the cycle / cost columns.
+    _emit_binary_size(workload, out_dir)
 
     # Arm B-* only: snapshot the optimize-loop trajectory so the
     # aggregator can read per-candidate progress, yield rate, and
@@ -467,6 +480,37 @@ def _emit_cross_tile_estimate(workload: Workload, out_dir: Path) -> None:
     )
 
 
+def _emit_binary_size(workload: Workload, out_dir: Path) -> None:
+    """After run.sh completes, stat the build artifacts to record how
+    big the kernel set + binary actually got. Single-target layout is
+    examples/<model>/<quant>/{generated,build}/<target>/...; the
+    hetero path's elf lives under examples/xpurt_demo/<quant>/build/
+    so this records what it can find and leaves the rest as null."""
+    base = REPO_ROOT / "examples" / workload.model / workload.quant
+    paths = {
+        "zephyr_elf":   base / "build" / workload.target / "zephyr" / "zephyr.elf",
+        "kernels_c":    base / "generated" / workload.target / "kernels.c",
+        "weights_npz":  base / "generated" / "weights.npz",
+    }
+    payload: dict[str, Any] = {"schema_version": 1}
+    payload["zephyr_elf_bytes"] = (
+        paths["zephyr_elf"].stat().st_size if paths["zephyr_elf"].exists() else None
+    )
+    if paths["kernels_c"].exists():
+        payload["kernels_c_bytes"] = paths["kernels_c"].stat().st_size
+        # Cheap LOC: count newlines (good enough; comments + blank
+        # lines included).
+        with open(paths["kernels_c"]) as f:
+            payload["kernels_c_loc"] = sum(1 for _ in f)
+    else:
+        payload["kernels_c_bytes"] = None
+        payload["kernels_c_loc"] = None
+    payload["weights_npz_bytes"] = (
+        paths["weights_npz"].stat().st_size if paths["weights_npz"].exists() else None
+    )
+    (out_dir / "binary_size.json").write_text(json.dumps(payload, indent=2))
+
+
 def _emit_graph_summary(workload: Workload, out_dir: Path) -> None:
     """Synthesize a compact `graph_summary.json` from the pipeline's
     full `graph.json` (which is large and stays out of the run dir).
@@ -508,10 +552,15 @@ def _copy_optimize_artifacts(workload: Workload, target: str,
     optimize_summary.json + beam_search_trajectory.jsonl from
     examples/<model>/<quant>/generated/<target>/ into the cell run
     dir. Arm A never produces them (no LLM calls); Arm B-* always
-    does when the optimize loop runs."""
+    does when the optimize loop runs.
+
+    Also snapshots kernel_picks.json (emitted by generate_kernels.py
+    for both arms) so the aggregator can derive per-source counts
+    (curated / reference / llm) and algorithm diversity per cell."""
     src_dir = (REPO_ROOT / "examples" / workload.model
                / workload.quant / "generated" / target)
-    for fname in ("optimize_summary.json", "beam_search_trajectory.jsonl"):
+    for fname in ("optimize_summary.json", "beam_search_trajectory.jsonl",
+                  "kernel_picks.json"):
         src = src_dir / fname
         if src.exists():
             (out_dir / fname).write_text(src.read_text())
