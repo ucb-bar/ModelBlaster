@@ -2017,9 +2017,174 @@ def _render_report_markdown(bundle: dict) -> str:
 # ───────────────────── subcommand: export ─────────────────────
 
 
+def _methodology_template(name: str, bundle: dict) -> str:
+    """Opinionated methodology.md template. The author fills it in
+    BEFORE sharing -- without context, numbers alone aren't enough to
+    compare approaches."""
+    g = bundle["generated_by"]
+    cells = ", ".join(sorted(bundle.get("by_cell", {}).keys())[:5])
+    return f"""# Methodology: {name}
+
+_Fill this in before sharing — without prose, numbers alone don't tell
+the reader WHY you tried something or how to reproduce it._
+
+## Approach
+What did you try? (e.g. "Switch Arm B-bedrock from beam=2 exp=3 iter=2
+to beam=1 exp=4 iter=1 to spend more on diversity per parent and less
+on iteration depth.")
+
+## Hypothesis
+What did you expect would work, and why? (e.g. "Wider expansions per
+parent should land a better kernel earlier without paying for extra
+iterations on already-converged ops.")
+
+## Knobs changed
+| Knob | Default | This run |
+|---|---|---|
+| arm | A | (e.g. B-bedrock) |
+| LLM model | — | (e.g. claude-sonnet-4-5) |
+| beam | 2 | |
+| expansions | 3 | |
+| iterations | 2 | |
+| FIRESIM_EVAL | 0 | |
+| max_usd | none | |
+
+## Result interpretation
+What did the numbers show? Which kernels improved, by how much, and
+why? Reference specific cells in this report:
+
+  cells covered (first 5): {cells}
+
+See `report.md` for the cost + cycle table; `kernels/` for the actual
+generated C code; `per-cell/<cell>/cycles_per_op.json` for per-op cycle
+breakdowns.
+
+## Reproducing this report
+```bash
+git checkout {g.get('git_sha') or '<sha>'}
+# ... your commands here ...
+mb-cost export --full {name}
+```
+
+## Next steps
+What would you try next based on these results?
+"""
+
+
+def _collect_experiment_artifacts(bundle: dict, out_dir: Path,
+                                  results_root: Path) -> dict:
+    """Copy the per-cell + per-(model,quant,target) artifacts into
+    ``out_dir/`` so the recipient sees full context: actual kernel C
+    source, IR graphs, beam-search trajectory, etc.
+
+    Discovers run dirs DIRECTLY from the filesystem (any directory
+    under results_root/ containing a run.json), so Arm A runs that
+    made zero LLM calls are still included. Returns a manifest dict.
+    """
+    import shutil
+    manifest: dict = {
+        "per_cell": [], "kernels": [], "missing": [],
+    }
+    per_cell_root = out_dir / "per-cell"
+    kernels_root = out_dir / "kernels"
+    per_cell_root.mkdir(parents=True, exist_ok=True)
+    kernels_root.mkdir(parents=True, exist_ok=True)
+
+    PER_CELL_FILES = [
+        "run.json", "accuracy.json", "cycles_per_op.json",
+        "kernel_picks.json", "stage_timings.json", "binary_size.json",
+        "graph_summary.json", "passes_applied.json",
+        "wall_cycles.txt", "env.txt",
+        "profile_spike.csv", "profile_firesim.csv",
+        "llm_calls.jsonl", "llm_tokens.json",
+        "optimize_summary.json", "beam_search_trajectory.jsonl",
+        "xpurt_trace.csv", "cross_tile_estimate.json",
+    ]
+    seen_models: set[tuple[str, str, str]] = set()
+
+    # Filesystem discovery: every dir with a run.json under
+    # results_root/ is a candidate cell (Arm A has no llm_calls.jsonl
+    # but still has artifacts worth sharing).
+    cells: list[tuple[str, Path]] = []
+    if results_root.exists():
+        for rj_path in results_root.rglob("run.json"):
+            run_dir = rj_path.parent
+            # Skip results/dashboard.csv etc; only proper cell dirs.
+            rel = run_dir.relative_to(results_root)
+            cell_key = "/".join(rel.parts)
+            cells.append((cell_key, run_dir))
+
+    for cell_key, src in cells:
+        dst = per_cell_root / cell_key.replace("/", "__")
+        dst.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for fname in PER_CELL_FILES:
+            sp = src / fname
+            if sp.exists():
+                shutil.copy2(sp, dst / fname)
+                copied.append(fname)
+        manifest["per_cell"].append({"cell": cell_key, "files": copied})
+
+        rj_path = src / "run.json"
+        if rj_path.exists():
+            try:
+                rj = json.loads(rj_path.read_text())
+                key = (rj.get("model"), rj.get("quant"), rj.get("target"))
+                if all(key) and key not in seen_models:
+                    seen_models.add(key)
+            except json.JSONDecodeError:
+                pass
+
+    # Per-(model, quant, target) artifacts: the actual generated C
+    # source + IR. ONE copy regardless of how many cells share the
+    # tuple. The recipient can read kernel.c byte-for-byte.
+    KERNEL_FILES = [
+        "kernels.c", "kernels.h", "graph.json",
+        "passes_applied.json", "kernel_picks.json",
+        "optimize_summary.json", "beam_search_trajectory.jsonl",
+    ]
+    for (model, quant, target) in seen_models:
+        gen_dir = (results_root.parent.parent  # repo root
+                   / "examples" / model / quant / "generated")
+        # Some artifacts (graph.json, passes_applied.json) live at the
+        # generated/ level; kernels.c + target-specific stuff lives at
+        # generated/<target>/.
+        dst = kernels_root / model / quant / target
+        dst.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for fname in ("graph.json", "passes_applied.json"):
+            sp = gen_dir / fname
+            if sp.exists():
+                shutil.copy2(sp, dst / fname)
+                copied.append(fname)
+        target_dir = gen_dir / target
+        for fname in KERNEL_FILES:
+            sp = target_dir / fname
+            if sp.exists():
+                shutil.copy2(sp, dst / fname)
+                copied.append(fname)
+        manifest["kernels"].append({
+            "model": model, "quant": quant, "target": target,
+            "files": copied,
+        })
+    return manifest
+
+
 def cmd_export(args) -> int:
     """Aggregate current state into a portable JSON + Markdown bundle
-    suitable for sharing with teammates."""
+    suitable for sharing with teammates.
+
+    Two modes:
+      * default (lightweight) -- writes <name>.json + <name>.md only.
+        Best for cost-only summaries (Slack / email).
+      * --full                -- writes a DIRECTORY <name>/ containing
+        report.json + report.md + methodology.md template + the actual
+        per-cell artifacts (run.json, accuracy.json, cycles_per_op.json,
+        kernel_picks.json, etc.) + the generated kernel C source +
+        graph.json + optimize_summary.json + beam_search_trajectory.jsonl.
+        Best for methodology comparison: the recipient can read your
+        actual kernels and re-derive the numbers.
+    """
     if not args.pricing.exists():
         print(f"pricing file not found: {args.pricing}", file=sys.stderr)
         return 2
@@ -2043,6 +2208,35 @@ def cmd_export(args) -> int:
         return 2
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.full:
+        bundle["kind"] = "experiment"
+        out_root = REPORTS_DIR / args.name
+        out_root.mkdir(parents=True, exist_ok=True)
+        manifest = _collect_experiment_artifacts(
+            bundle, out_root, args.root,
+        )
+        bundle["bundle_contents"] = manifest
+        report_blob = json.dumps(bundle, indent=2, default=str)
+        (out_root / "report.json").write_text(report_blob)
+        (out_root / "report.md").write_text(
+            _render_report_markdown(bundle))
+        meth = out_root / "methodology.md"
+        if not meth.exists():
+            meth.write_text(_methodology_template(args.name, bundle))
+        print(f"wrote experiment bundle: {out_root}/")
+        print(f"  - report.json ({len(report_blob)/1024:.1f} KB)")
+        print(f"  - report.md")
+        print(f"  - methodology.md  (TEMPLATE -- edit before sharing)")
+        print(f"  - per-cell/  ({len(manifest['per_cell'])} cell(s))")
+        print(f"  - kernels/   ({len(manifest['kernels'])} "
+              f"(model,quant,target) tuple(s))")
+        if manifest["missing"]:
+            print(f"  WARN missing run dirs (skipped): "
+                  f"{manifest['missing']}")
+        return 0
+
+    bundle["kind"] = "report"
     out_json = REPORTS_DIR / f"{args.name}.json"
     out_md = REPORTS_DIR / f"{args.name}.md"
     out_json.write_text(json.dumps(bundle, indent=2, default=str))
@@ -2059,13 +2253,24 @@ def cmd_export(args) -> int:
 
 def cmd_import(args) -> int:
     """Read a teammate's exported bundle and print a text summary.
-    Read-only: does NOT merge anything into the local ledger or state."""
+    Read-only: does NOT merge anything into the local ledger or state.
+
+    Accepts either a single .json file (lightweight bundle) OR a
+    directory produced by `mb-cost export --full`. For directory
+    bundles, prints the methodology.md + report + a listing of the
+    included kernels, per-cell artifacts, and graphs.
+    """
     src = Path(args.path)
     if not src.exists():
-        print(f"file not found: {src}", file=sys.stderr)
+        print(f"path not found: {src}", file=sys.stderr)
+        return 2
+
+    bundle_path = src / "report.json" if src.is_dir() else src
+    if not bundle_path.exists():
+        print(f"no report.json found at {bundle_path}", file=sys.stderr)
         return 2
     try:
-        bundle = json.loads(src.read_text())
+        bundle = json.loads(bundle_path.read_text())
     except json.JSONDecodeError as e:
         print(f"not valid JSON: {e}", file=sys.stderr)
         return 2
@@ -2075,22 +2280,65 @@ def cmd_import(args) -> int:
               f"current ({_REPORT_SCHEMA_VERSION}); "
               f"some fields may be missing.",
               file=sys.stderr)
+
+    # For full-experiment bundles, show methodology first (it's the
+    # author's intent + the only context the numbers belong to).
+    if src.is_dir():
+        meth = src / "methodology.md"
+        if meth.exists():
+            print("═" * 76)
+            print(meth.read_text())
+            print("═" * 76)
+        print()
+
     print(_render_report_markdown(bundle))
+
+    if src.is_dir():
+        contents = bundle.get("bundle_contents") or {}
+        print()
+        print("## Artifacts in this bundle")
+        cells = contents.get("per_cell") or []
+        kerns = contents.get("kernels") or []
+        print(f"- per-cell artifacts: {len(cells)} cell(s)")
+        for c in cells[:5]:
+            print(f"    {c['cell']}  ({len(c['files'])} files)")
+        if len(cells) > 5:
+            print(f"    ... +{len(cells) - 5} more")
+        print(f"- generated kernels: {len(kerns)} (model,quant,target) tuple(s)")
+        for k in kerns:
+            print(f"    {k['model']}/{k['quant']}/{k['target']}  "
+                  f"({len(k['files'])} files)")
+        print()
+        print(f"Read the actual kernels at: "
+              f"{src / 'kernels'}/<model>/<quant>/<target>/kernels.c")
     return 0
 
 
 # ───────────────────── subcommand: diff ─────────────────────
 
 
+def _load_bundle(p: Path) -> tuple[dict, Optional[Path]]:
+    """Load report.json from a file OR a directory bundle. Returns
+    (bundle_dict, kernels_root_or_None) so the caller can find the
+    .c source files if it's a directory bundle."""
+    if p.is_dir():
+        bp = p / "report.json"
+        return json.loads(bp.read_text()), (p / "kernels")
+    return json.loads(p.read_text()), None
+
+
 def cmd_diff(args) -> int:
-    """Side-by-side comparison of two report bundles."""
+    """Side-by-side comparison of two report bundles. When both are
+    directory bundles (from `mb-cost export --full`), also surfaces
+    kernel-source diffs so you can see HOW the approaches differ at
+    the C level, not just the bottom-line numbers."""
     a_path = Path(args.a)
     b_path = Path(args.b)
     if not a_path.exists() or not b_path.exists():
-        print("both --a and --b paths must exist", file=sys.stderr)
+        print("both A and B paths must exist", file=sys.stderr)
         return 2
-    a = json.loads(a_path.read_text())
-    b = json.loads(b_path.read_text())
+    a, a_kernels = _load_bundle(a_path)
+    b, b_kernels = _load_bundle(b_path)
 
     def _g(d, *keys, default=None):
         for k in keys:
@@ -2122,6 +2370,52 @@ def cmd_diff(args) -> int:
         print(f"\n  only in {a['report_id']!r}: {only_a}")
     if only_b:
         print(f"\n  only in {b['report_id']!r}: {only_b}")
+
+    # Kernel-source diff: only available when both sides are full
+    # directory bundles. Lists shared (model,quant,target) tuples
+    # and reports byte-size + LOC diffs of the actual kernels.c.
+    if a_kernels and b_kernels:
+        print("\n  KERNEL SOURCE DIFF (both bundles are --full):")
+        a_keys = set()
+        b_keys = set()
+        for root, keys in ((a_kernels, a_keys), (b_kernels, b_keys)):
+            if root.exists():
+                for mdir in root.iterdir():
+                    if not mdir.is_dir(): continue
+                    for qdir in mdir.iterdir():
+                        if not qdir.is_dir(): continue
+                        for tdir in qdir.iterdir():
+                            if tdir.is_dir():
+                                keys.add(
+                                    f"{mdir.name}/{qdir.name}/{tdir.name}"
+                                )
+        common_k = sorted(a_keys & b_keys)
+        for k in common_k:
+            ap = a_kernels / k / "kernels.c"
+            bp = b_kernels / k / "kernels.c"
+            if not (ap.exists() and bp.exists()):
+                continue
+            a_sz, b_sz = ap.stat().st_size, bp.stat().st_size
+            a_lo = sum(1 for _ in open(ap))
+            b_lo = sum(1 for _ in open(bp))
+            same = ap.read_bytes() == bp.read_bytes()
+            tag = " (identical)" if same else ""
+            print(f"    {k}/kernels.c{tag}")
+            print(f"      size:  {a_sz:>6,}B vs {b_sz:>6,}B  "
+                  f"(Δ {b_sz-a_sz:+,}B)")
+            print(f"      LOC:   {a_lo:>6,}  vs {b_lo:>6,}  "
+                  f"(Δ {b_lo-a_lo:+,})")
+            if not same:
+                print(f"      diff: diff -u {ap} {bp}")
+        only_a_k = sorted(a_keys - b_keys)
+        only_b_k = sorted(b_keys - a_keys)
+        if only_a_k:
+            print(f"    only in A: {only_a_k}")
+        if only_b_k:
+            print(f"    only in B: {only_b_k}")
+    elif (a_kernels and not b_kernels) or (b_kernels and not a_kernels):
+        print("\n  (one bundle is --full and the other isn't; "
+              "kernel-source diff requires both)")
     return 0
 
 
@@ -2248,6 +2542,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                      help="filter to a specific session id (default: all)")
     exp.add_argument("--since", default=None,
                      help="filter records to ts >= YYYY-MM-DD or ISO 8601")
+    exp.add_argument("--full", action="store_true",
+                     help="produce a DIRECTORY bundle <name>/ with "
+                          "per-cell artifacts + generated kernel C source "
+                          "+ IR graphs + optimize_summary.json + a "
+                          "methodology.md template. For methodology "
+                          "comparison: teammates can read your actual "
+                          "kernels and reproduce the numbers.")
 
     # import: read someone else's bundle
     imp = sub.add_parser("import",
