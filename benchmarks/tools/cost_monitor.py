@@ -1791,6 +1791,634 @@ def cmd_run(args) -> int:
     return rc
 
 
+# ───────────────────── shareable report bundle ─────────────────────
+#
+# A self-contained snapshot of cost / call / kernel data that teammates
+# can swap via git commit, Slack attachment, S3 sync, or email. Contains
+# only AGGREGATES (no raw prompts/responses), so it's safe to share
+# publicly.
+
+_REPORT_SCHEMA_VERSION = 1
+
+REPORTS_DIR = BENCHMARKS_ROOT / "reports"
+
+
+def _git_identity() -> dict[str, Optional[str]]:
+    """Capture git sha + branch for reproducibility. Silent fallback to
+    Nones when git isn't available (so the export still works)."""
+    import subprocess
+    out: dict[str, Optional[str]] = {"sha": None, "branch": None}
+    try:
+        out["sha"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(BENCHMARKS_ROOT.parent), text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        out["branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(BENCHMARKS_ROOT.parent), text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return out
+
+
+def _build_report(state: WatcherState, ledger: SessionLedger,
+                  pricing: dict, *, report_id: str,
+                  session_filter: Optional[str] = None,
+                  since: Optional[str] = None,
+                  ) -> dict:
+    """Aggregate the ingested state into a shareable JSON bundle.
+    Filters by session id (only that session's calls) or by ts >= since
+    (ISO 8601). When both are omitted, the bundle covers everything
+    cumulative.
+    """
+    import socket
+    git = _git_identity()
+    records = list(state.records)
+
+    if session_filter is not None:
+        sess = ledger.get(session_filter)
+        if sess is None:
+            raise ValueError(
+                f"session {session_filter!r} not found in ledger"
+            )
+        records = [r for r in records if sess.contains(r.ts)]
+
+    if since is not None:
+        records = [r for r in records if r.ts >= since]
+
+    # Aggregate.
+    win = _aggregate(records, "EXPORT")
+    monthly = _aggregate(
+        [r for r in records if is_within_current_month(r.ts)],
+        "MONTHLY",
+    )
+
+    # Per-cell rollup.
+    by_cell: dict[str, dict] = {}
+    for r in records:
+        slot = by_cell.setdefault(r.cell, {
+            "n_calls": 0, "cost_usd": 0.0, "cost_known": True,
+            "input_uncached": 0, "input_cached_read": 0,
+            "input_cached_write": 0, "output": 0,
+        })
+        slot["n_calls"] += 1
+        if r.cost_usd is None:
+            slot["cost_known"] = False
+        else:
+            slot["cost_usd"] += r.cost_usd
+        slot["input_uncached"] += r.input_uncached
+        slot["input_cached_read"] += r.input_cached_read
+        slot["input_cached_write"] += r.input_cached_write
+        slot["output"] += r.output
+
+    sessions_payload = []
+    for s in ledger.list_all():
+        s_recs = [r for r in records if s.contains(r.ts)]
+        if not s_recs and session_filter is None:
+            continue
+        s_cost = sum((r.cost_usd or 0.0) for r in s_recs)
+        sessions_payload.append({
+            "id": s.id, "label": s.label,
+            "started_at": s.started_at, "ended_at": s.ended_at,
+            "is_active": s.is_active,
+            "n_calls": len(s_recs), "cost_usd": round(s_cost, 4),
+        })
+
+    def _tally_to_dict(t: ModelTally) -> dict:
+        return {
+            "n_calls": t.n_calls,
+            "input_uncached": t.input_uncached,
+            "input_cached_read": t.input_cached_read,
+            "input_cached_write": t.input_cached_write,
+            "output": t.output,
+            "cost_usd": round(t.cost_usd, 6),
+            "cost_known": t.cost_known,
+        }
+
+    def _window_to_dict(w: WindowTotals) -> dict:
+        return {
+            "label": w.label, "n_calls": w.n_calls,
+            "total_cost_usd": round(w.total_cost, 6),
+            "cost_known": w.cost_known,
+            "input_uncached": w.input_uncached,
+            "input_cached": w.input_cached,
+            "output": w.output,
+        }
+
+    return {
+        "schema_version": _REPORT_SCHEMA_VERSION,
+        "report_id": report_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_by": {
+            "user": os.environ.get("USER", "?"),
+            "hostname": socket.gethostname(),
+            "git_sha": git["sha"], "git_branch": git["branch"],
+        },
+        "filter": {
+            "session": session_filter, "since": since,
+        },
+        "windows": {
+            "cumulative": _window_to_dict(win),
+            "monthly": _window_to_dict(monthly),
+        },
+        "by_model": {k: _tally_to_dict(v) for k, v in win.by_model.items()},
+        "by_kernel": {k: _tally_to_dict(v) for k, v in win.by_kernel.items()},
+        "by_cell": by_cell,
+        "sessions": sessions_payload,
+        "config": {
+            "pricing_last_updated": pricing.get("last_updated"),
+        },
+    }
+
+
+def _render_report_markdown(bundle: dict) -> str:
+    """Human-readable markdown rendering of an exported bundle."""
+    lines = []
+    rid = bundle["report_id"]
+    g = bundle["generated_by"]
+    lines.append(f"# Cost report — `{rid}`")
+    lines.append("")
+    lines.append(f"_Generated at {bundle['generated_at']} by_  "
+                 f"`{g['user']}@{g['hostname']}`  "
+                 f"_on git_  `{g.get('git_sha') or 'n/a'}`  "
+                 f"_branch_  `{g.get('git_branch') or 'n/a'}`.")
+    flt = bundle.get("filter", {})
+    if flt.get("session"):
+        lines.append(f"\n_Filter:_ session = `{flt['session']}`")
+    if flt.get("since"):
+        lines.append(f"\n_Filter:_ since = `{flt['since']}`")
+    lines.append("")
+    win = bundle["windows"]["cumulative"]
+    monthly = bundle["windows"]["monthly"]
+    plus = "" if win["cost_known"] else "+"
+    lines.append(f"## Totals")
+    lines.append(f"- **Spend:** ${win['total_cost_usd']:.4f}{plus} "
+                 f"across {win['n_calls']} calls")
+    lines.append(f"- This month: ${monthly['total_cost_usd']:.4f} "
+                 f"({monthly['n_calls']} calls)")
+    lines.append(f"- Input (uncached / cached): {win['input_uncached']:,} / "
+                 f"{win['input_cached']:,}")
+    lines.append(f"- Output: {win['output']:,}")
+    lines.append("")
+
+    if bundle.get("by_model"):
+        lines.append("## Per-model")
+        lines.append("| Model | Calls | In (uncached) | In (cached) | Out | USD |")
+        lines.append("|---|---|---|---|---|---|")
+        for mid, t in sorted(bundle["by_model"].items(),
+                              key=lambda kv: -kv[1]["cost_usd"]):
+            cached = t["input_cached_read"] + t["input_cached_write"]
+            lines.append(f"| `{mid}` | {t['n_calls']} | "
+                         f"{t['input_uncached']:,} | {cached:,} | "
+                         f"{t['output']:,} | ${t['cost_usd']:.4f} |")
+        lines.append("")
+
+    if bundle.get("by_kernel"):
+        lines.append("## Per-kernel (by op)")
+        lines.append("| Kernel | Calls | In | Out | USD |")
+        lines.append("|---|---|---|---|---|")
+        for k, t in sorted(bundle["by_kernel"].items(),
+                            key=lambda kv: -kv[1]["cost_usd"]):
+            in_tok = (t["input_uncached"]
+                       + t["input_cached_read"]
+                       + t["input_cached_write"])
+            lines.append(f"| `{k}` | {t['n_calls']} | {in_tok:,} | "
+                         f"{t['output']:,} | ${t['cost_usd']:.4f} |")
+        lines.append("")
+
+    if bundle.get("by_cell"):
+        lines.append("## Per-cell")
+        lines.append("| Cell | Calls | USD |")
+        lines.append("|---|---|---|")
+        for cell, slot in sorted(bundle["by_cell"].items(),
+                                  key=lambda kv: -kv[1]["cost_usd"]):
+            lines.append(f"| `{cell}` | {slot['n_calls']} | "
+                         f"${slot['cost_usd']:.4f} |")
+        lines.append("")
+
+    if bundle.get("sessions"):
+        lines.append("## Sessions covered")
+        lines.append("| Session | Label | Started | Ended | Calls | USD |")
+        lines.append("|---|---|---|---|---|---|")
+        for s in bundle["sessions"]:
+            ended = "ongoing" if s["is_active"] else s["ended_at"][:19]
+            lines.append(
+                f"| `{s['id']}` | {s.get('label') or ''} | "
+                f"{s['started_at'][:19]} | {ended} | "
+                f"{s['n_calls']} | ${s['cost_usd']:.4f} |"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ───────────────────── subcommand: export ─────────────────────
+
+
+def _methodology_template(name: str, bundle: dict) -> str:
+    """Opinionated methodology.md template. The author fills it in
+    BEFORE sharing -- without context, numbers alone aren't enough to
+    compare approaches."""
+    g = bundle["generated_by"]
+    cells = ", ".join(sorted(bundle.get("by_cell", {}).keys())[:5])
+    return f"""# Methodology: {name}
+
+_Fill this in before sharing — without prose, numbers alone don't tell
+the reader WHY you tried something or how to reproduce it._
+
+## Approach
+What did you try? (e.g. "Switch Arm B-bedrock from beam=2 exp=3 iter=2
+to beam=1 exp=4 iter=1 to spend more on diversity per parent and less
+on iteration depth.")
+
+## Hypothesis
+What did you expect would work, and why? (e.g. "Wider expansions per
+parent should land a better kernel earlier without paying for extra
+iterations on already-converged ops.")
+
+## Knobs changed
+| Knob | Default | This run |
+|---|---|---|
+| arm | A | (e.g. B-bedrock) |
+| LLM model | — | (e.g. claude-sonnet-4-5) |
+| beam | 2 | |
+| expansions | 3 | |
+| iterations | 2 | |
+| FIRESIM_EVAL | 0 | |
+| max_usd | none | |
+
+## Result interpretation
+What did the numbers show? Which kernels improved, by how much, and
+why? Reference specific cells in this report:
+
+  cells covered (first 5): {cells}
+
+See `report.md` for the cost + cycle table; `kernels/` for the actual
+generated C code; `per-cell/<cell>/cycles_per_op.json` for per-op cycle
+breakdowns.
+
+## Reproducing this report
+```bash
+git checkout {g.get('git_sha') or '<sha>'}
+# ... your commands here ...
+mb-cost export --full {name}
+```
+
+## Next steps
+What would you try next based on these results?
+"""
+
+
+def _collect_experiment_artifacts(bundle: dict, out_dir: Path,
+                                  results_root: Path) -> dict:
+    """Copy the per-cell + per-(model,quant,target) artifacts into
+    ``out_dir/`` so the recipient sees full context: actual kernel C
+    source, IR graphs, beam-search trajectory, etc.
+
+    Discovers run dirs DIRECTLY from the filesystem (any directory
+    under results_root/ containing a run.json), so Arm A runs that
+    made zero LLM calls are still included. Returns a manifest dict.
+    """
+    import shutil
+    manifest: dict = {
+        "per_cell": [], "kernels": [], "missing": [],
+    }
+    per_cell_root = out_dir / "per-cell"
+    kernels_root = out_dir / "kernels"
+    per_cell_root.mkdir(parents=True, exist_ok=True)
+    kernels_root.mkdir(parents=True, exist_ok=True)
+
+    PER_CELL_FILES = [
+        "run.json", "accuracy.json", "cycles_per_op.json",
+        "kernel_picks.json", "stage_timings.json", "binary_size.json",
+        "graph_summary.json", "passes_applied.json",
+        "wall_cycles.txt", "env.txt",
+        "profile_spike.csv", "profile_firesim.csv",
+        "llm_calls.jsonl", "llm_tokens.json",
+        "optimize_summary.json", "beam_search_trajectory.jsonl",
+        "xpurt_trace.csv", "cross_tile_estimate.json",
+    ]
+    seen_models: set[tuple[str, str, str]] = set()
+
+    # Filesystem discovery: every dir with a run.json under
+    # results_root/ is a candidate cell (Arm A has no llm_calls.jsonl
+    # but still has artifacts worth sharing).
+    cells: list[tuple[str, Path]] = []
+    if results_root.exists():
+        for rj_path in results_root.rglob("run.json"):
+            run_dir = rj_path.parent
+            # Skip results/dashboard.csv etc; only proper cell dirs.
+            rel = run_dir.relative_to(results_root)
+            cell_key = "/".join(rel.parts)
+            cells.append((cell_key, run_dir))
+
+    for cell_key, src in cells:
+        dst = per_cell_root / cell_key.replace("/", "__")
+        dst.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for fname in PER_CELL_FILES:
+            sp = src / fname
+            if sp.exists():
+                shutil.copy2(sp, dst / fname)
+                copied.append(fname)
+        manifest["per_cell"].append({"cell": cell_key, "files": copied})
+
+        rj_path = src / "run.json"
+        if rj_path.exists():
+            try:
+                rj = json.loads(rj_path.read_text())
+                key = (rj.get("model"), rj.get("quant"), rj.get("target"))
+                if all(key) and key not in seen_models:
+                    seen_models.add(key)
+            except json.JSONDecodeError:
+                pass
+
+    # Per-(model, quant, target) artifacts: the actual generated C
+    # source + IR. ONE copy regardless of how many cells share the
+    # tuple. The recipient can read kernel.c byte-for-byte.
+    KERNEL_FILES = [
+        "kernels.c", "kernels.h", "graph.json",
+        "passes_applied.json", "kernel_picks.json",
+        "optimize_summary.json", "beam_search_trajectory.jsonl",
+    ]
+    for (model, quant, target) in seen_models:
+        gen_dir = (results_root.parent.parent  # repo root
+                   / "examples" / model / quant / "generated")
+        # Some artifacts (graph.json, passes_applied.json) live at the
+        # generated/ level; kernels.c + target-specific stuff lives at
+        # generated/<target>/.
+        dst = kernels_root / model / quant / target
+        dst.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for fname in ("graph.json", "passes_applied.json"):
+            sp = gen_dir / fname
+            if sp.exists():
+                shutil.copy2(sp, dst / fname)
+                copied.append(fname)
+        target_dir = gen_dir / target
+        for fname in KERNEL_FILES:
+            sp = target_dir / fname
+            if sp.exists():
+                shutil.copy2(sp, dst / fname)
+                copied.append(fname)
+        manifest["kernels"].append({
+            "model": model, "quant": quant, "target": target,
+            "files": copied,
+        })
+    return manifest
+
+
+def cmd_export(args) -> int:
+    """Aggregate current state into a portable JSON + Markdown bundle
+    suitable for sharing with teammates.
+
+    Two modes:
+      * default (lightweight) -- writes <name>.json + <name>.md only.
+        Best for cost-only summaries (Slack / email).
+      * --full                -- writes a DIRECTORY <name>/ containing
+        report.json + report.md + methodology.md template + the actual
+        per-cell artifacts (run.json, accuracy.json, cycles_per_op.json,
+        kernel_picks.json, etc.) + the generated kernel C source +
+        graph.json + optimize_summary.json + beam_search_trajectory.jsonl.
+        Best for methodology comparison: the recipient can read your
+        actual kernels and re-derive the numbers.
+    """
+    if not args.pricing.exists():
+        print(f"pricing file not found: {args.pricing}", file=sys.stderr)
+        return 2
+    pricing = load_pricing(args.pricing)
+    ledger = SessionLedger.load()
+    state = WatcherState()
+    files = list(discover_jsonls(args.root))
+    if getattr(args, "watch_claude_code", False):
+        files.extend(discover_claude_code_sessions())
+    poll_files(files, state, pricing)
+
+    try:
+        bundle = _build_report(
+            state, ledger, pricing,
+            report_id=args.name,
+            session_filter=args.session,
+            since=args.since,
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.full:
+        bundle["kind"] = "experiment"
+        out_root = REPORTS_DIR / args.name
+        out_root.mkdir(parents=True, exist_ok=True)
+        manifest = _collect_experiment_artifacts(
+            bundle, out_root, args.root,
+        )
+        bundle["bundle_contents"] = manifest
+        report_blob = json.dumps(bundle, indent=2, default=str)
+        (out_root / "report.json").write_text(report_blob)
+        (out_root / "report.md").write_text(
+            _render_report_markdown(bundle))
+        meth = out_root / "methodology.md"
+        if not meth.exists():
+            meth.write_text(_methodology_template(args.name, bundle))
+        print(f"wrote experiment bundle: {out_root}/")
+        print(f"  - report.json ({len(report_blob)/1024:.1f} KB)")
+        print(f"  - report.md")
+        print(f"  - methodology.md  (TEMPLATE -- edit before sharing)")
+        print(f"  - per-cell/  ({len(manifest['per_cell'])} cell(s))")
+        print(f"  - kernels/   ({len(manifest['kernels'])} "
+              f"(model,quant,target) tuple(s))")
+        if manifest["missing"]:
+            print(f"  WARN missing run dirs (skipped): "
+                  f"{manifest['missing']}")
+        return 0
+
+    bundle["kind"] = "report"
+    out_json = REPORTS_DIR / f"{args.name}.json"
+    out_md = REPORTS_DIR / f"{args.name}.md"
+    out_json.write_text(json.dumps(bundle, indent=2, default=str))
+    out_md.write_text(_render_report_markdown(bundle))
+    print(f"wrote {out_json}")
+    print(f"wrote {out_md}")
+    print(f"\nShare either file. JSON is machine-readable + diff-able; "
+          f"Markdown is human-friendly for Slack / PRs / email.")
+    return 0
+
+
+# ───────────────────── subcommand: import ─────────────────────
+
+
+def cmd_import(args) -> int:
+    """Read a teammate's exported bundle and print a text summary.
+    Read-only: does NOT merge anything into the local ledger or state.
+
+    Accepts either a single .json file (lightweight bundle) OR a
+    directory produced by `mb-cost export --full`. For directory
+    bundles, prints the methodology.md + report + a listing of the
+    included kernels, per-cell artifacts, and graphs.
+    """
+    src = Path(args.path)
+    if not src.exists():
+        print(f"path not found: {src}", file=sys.stderr)
+        return 2
+
+    bundle_path = src / "report.json" if src.is_dir() else src
+    if not bundle_path.exists():
+        print(f"no report.json found at {bundle_path}", file=sys.stderr)
+        return 2
+    try:
+        bundle = json.loads(bundle_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"not valid JSON: {e}", file=sys.stderr)
+        return 2
+    sv = bundle.get("schema_version")
+    if sv != _REPORT_SCHEMA_VERSION:
+        print(f"warning: bundle schema_version={sv} differs from "
+              f"current ({_REPORT_SCHEMA_VERSION}); "
+              f"some fields may be missing.",
+              file=sys.stderr)
+
+    # For full-experiment bundles, show methodology first (it's the
+    # author's intent + the only context the numbers belong to).
+    if src.is_dir():
+        meth = src / "methodology.md"
+        if meth.exists():
+            print("═" * 76)
+            print(meth.read_text())
+            print("═" * 76)
+        print()
+
+    print(_render_report_markdown(bundle))
+
+    if src.is_dir():
+        contents = bundle.get("bundle_contents") or {}
+        print()
+        print("## Artifacts in this bundle")
+        cells = contents.get("per_cell") or []
+        kerns = contents.get("kernels") or []
+        print(f"- per-cell artifacts: {len(cells)} cell(s)")
+        for c in cells[:5]:
+            print(f"    {c['cell']}  ({len(c['files'])} files)")
+        if len(cells) > 5:
+            print(f"    ... +{len(cells) - 5} more")
+        print(f"- generated kernels: {len(kerns)} (model,quant,target) tuple(s)")
+        for k in kerns:
+            print(f"    {k['model']}/{k['quant']}/{k['target']}  "
+                  f"({len(k['files'])} files)")
+        print()
+        print(f"Read the actual kernels at: "
+              f"{src / 'kernels'}/<model>/<quant>/<target>/kernels.c")
+    return 0
+
+
+# ───────────────────── subcommand: diff ─────────────────────
+
+
+def _load_bundle(p: Path) -> tuple[dict, Optional[Path]]:
+    """Load report.json from a file OR a directory bundle. Returns
+    (bundle_dict, kernels_root_or_None) so the caller can find the
+    .c source files if it's a directory bundle."""
+    if p.is_dir():
+        bp = p / "report.json"
+        return json.loads(bp.read_text()), (p / "kernels")
+    return json.loads(p.read_text()), None
+
+
+def cmd_diff(args) -> int:
+    """Side-by-side comparison of two report bundles. When both are
+    directory bundles (from `mb-cost export --full`), also surfaces
+    kernel-source diffs so you can see HOW the approaches differ at
+    the C level, not just the bottom-line numbers."""
+    a_path = Path(args.a)
+    b_path = Path(args.b)
+    if not a_path.exists() or not b_path.exists():
+        print("both A and B paths must exist", file=sys.stderr)
+        return 2
+    a, a_kernels = _load_bundle(a_path)
+    b, b_kernels = _load_bundle(b_path)
+
+    def _g(d, *keys, default=None):
+        for k in keys:
+            d = d.get(k, {}) if isinstance(d, dict) else default
+        return d if d != {} else default
+
+    print(f"DIFF  {a['report_id']}  vs  {b['report_id']}\n")
+    aw = a["windows"]["cumulative"]; bw = b["windows"]["cumulative"]
+    print(f"  spend:   ${aw['total_cost_usd']:.4f}  vs  ${bw['total_cost_usd']:.4f}"
+          f"  (Δ ${bw['total_cost_usd'] - aw['total_cost_usd']:+.4f})")
+    print(f"  calls:   {aw['n_calls']}  vs  {bw['n_calls']}"
+          f"  (Δ {bw['n_calls'] - aw['n_calls']:+d})")
+    print(f"  output:  {aw['output']:,}  vs  {bw['output']:,}"
+          f"  (Δ {bw['output'] - aw['output']:+,})")
+
+    am = set(a.get("by_model", {}).keys())
+    bm = set(b.get("by_model", {}).keys())
+    common = sorted(am & bm)
+    only_a = sorted(am - bm)
+    only_b = sorted(bm - am)
+    if common:
+        print("\n  per-model (common):")
+        for m in common:
+            ac = a["by_model"][m]["cost_usd"]
+            bc = b["by_model"][m]["cost_usd"]
+            print(f"    {m[:60]:60s}  ${ac:.4f}  vs  ${bc:.4f}  "
+                  f"(Δ ${bc-ac:+.4f})")
+    if only_a:
+        print(f"\n  only in {a['report_id']!r}: {only_a}")
+    if only_b:
+        print(f"\n  only in {b['report_id']!r}: {only_b}")
+
+    # Kernel-source diff: only available when both sides are full
+    # directory bundles. Lists shared (model,quant,target) tuples
+    # and reports byte-size + LOC diffs of the actual kernels.c.
+    if a_kernels and b_kernels:
+        print("\n  KERNEL SOURCE DIFF (both bundles are --full):")
+        a_keys = set()
+        b_keys = set()
+        for root, keys in ((a_kernels, a_keys), (b_kernels, b_keys)):
+            if root.exists():
+                for mdir in root.iterdir():
+                    if not mdir.is_dir(): continue
+                    for qdir in mdir.iterdir():
+                        if not qdir.is_dir(): continue
+                        for tdir in qdir.iterdir():
+                            if tdir.is_dir():
+                                keys.add(
+                                    f"{mdir.name}/{qdir.name}/{tdir.name}"
+                                )
+        common_k = sorted(a_keys & b_keys)
+        for k in common_k:
+            ap = a_kernels / k / "kernels.c"
+            bp = b_kernels / k / "kernels.c"
+            if not (ap.exists() and bp.exists()):
+                continue
+            a_sz, b_sz = ap.stat().st_size, bp.stat().st_size
+            a_lo = sum(1 for _ in open(ap))
+            b_lo = sum(1 for _ in open(bp))
+            same = ap.read_bytes() == bp.read_bytes()
+            tag = " (identical)" if same else ""
+            print(f"    {k}/kernels.c{tag}")
+            print(f"      size:  {a_sz:>6,}B vs {b_sz:>6,}B  "
+                  f"(Δ {b_sz-a_sz:+,}B)")
+            print(f"      LOC:   {a_lo:>6,}  vs {b_lo:>6,}  "
+                  f"(Δ {b_lo-a_lo:+,})")
+            if not same:
+                print(f"      diff: diff -u {ap} {bp}")
+        only_a_k = sorted(a_keys - b_keys)
+        only_b_k = sorted(b_keys - a_keys)
+        if only_a_k:
+            print(f"    only in A: {only_a_k}")
+        if only_b_k:
+            print(f"    only in B: {only_b_k}")
+    elif (a_kernels and not b_kernels) or (b_kernels and not a_kernels):
+        print("\n  (one bundle is --full and the other isn't; "
+              "kernel-source diff requires both)")
+    return 0
+
+
 # ───────────────────── subcommand: report ─────────────────────
 
 
@@ -1903,6 +2531,36 @@ def main(argv: Optional[list[str]] = None) -> int:
     rep = sub.add_parser("report", help="one-shot text report (no TUI)")
     _add_common_args(rep)
 
+    # export: shareable bundle for teammates
+    exp = sub.add_parser("export",
+                         help="export current state as a portable JSON+MD "
+                              "bundle for sharing with teammates")
+    _add_common_args(exp)
+    exp.add_argument("name", help="report id (used as filename; should "
+                                   "be unique per snapshot)")
+    exp.add_argument("--session", default=None,
+                     help="filter to a specific session id (default: all)")
+    exp.add_argument("--since", default=None,
+                     help="filter records to ts >= YYYY-MM-DD or ISO 8601")
+    exp.add_argument("--full", action="store_true",
+                     help="produce a DIRECTORY bundle <name>/ with "
+                          "per-cell artifacts + generated kernel C source "
+                          "+ IR graphs + optimize_summary.json + a "
+                          "methodology.md template. For methodology "
+                          "comparison: teammates can read your actual "
+                          "kernels and reproduce the numbers.")
+
+    # import: read someone else's bundle
+    imp = sub.add_parser("import",
+                         help="render a teammate's exported bundle as text "
+                              "(read-only; doesn't merge into local state)")
+    imp.add_argument("path", help="path to a .json bundle from `mb-cost export`")
+
+    # diff: compare two bundles
+    df = sub.add_parser("diff", help="side-by-side diff of two bundles")
+    df.add_argument("a", help="path to first bundle")
+    df.add_argument("b", help="path to second bundle")
+
     # run NAME [--label TEXT] -- <command...>
     #
     # argparse.REMAINDER consumes EVERYTHING after the positional
@@ -1927,6 +2585,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not argv:
         argv = sys.argv[1:]
     if not argv or argv[0] not in ("live", "session", "report", "run",
+                                    "export", "import", "diff",
                                     "-h", "--help"):
         argv = ["live"] + list(argv)
     args = ap.parse_args(argv)
@@ -1947,6 +2606,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command and args.command[0] == "--":
             args.command = args.command[1:]
         return cmd_run(args)
+    if args.cmd == "export":
+        return cmd_export(args)
+    if args.cmd == "import":
+        return cmd_import(args)
+    if args.cmd == "diff":
+        return cmd_diff(args)
     ap.print_help()
     return 0
 

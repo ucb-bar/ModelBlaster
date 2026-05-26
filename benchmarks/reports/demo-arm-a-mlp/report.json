@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "report_id": "demo-arm-a-mlp",
+  "generated_at": "2026-05-26T06:59:32.071767+00:00",
+  "generated_by": {
+    "user": "agustin",
+    "hostname": "garden",
+    "git_sha": "7ea176a",
+    "git_branch": "feat/benchmark-harness"
+  },
+  "filter": {
+    "session": null,
+    "since": null
+  },
+  "windows": {
+    "cumulative": {
+      "label": "EXPORT",
+      "n_calls": 0,
+      "total_cost_usd": 0.0,
+      "cost_known": true,
+      "input_uncached": 0,
+      "input_cached": 0,
+      "output": 0
+    },
+    "monthly": {
+      "label": "MONTHLY",
+      "n_calls": 0,
+      "total_cost_usd": 0.0,
+      "cost_known": true,
+      "input_uncached": 0,
+      "input_cached": 0,
+      "output": 0
+    }
+  },
+  "by_model": {},
+  "by_kernel": {},
+  "by_cell": {},
+  "sessions": [],
+  "config": {
+    "pricing_last_updated": "2026-05-25"
+  },
+  "kind": "experiment",
+  "bundle_contents": {
+    "per_cell": [
+      {
+        "cell": "A/mlp_generic_scalar_smoke/2026-05-26T06-59-24Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      }
+    ],
+    "kernels": [
+      {
+        "model": "mlp_generic",
+        "quant": "int8",
+        "target": "scalar",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json"
+        ]
+      }
+    ],
+    "missing": []
+  }
+}
