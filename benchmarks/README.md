@@ -144,6 +144,115 @@ rather than mid-`west build` with `command not found`.
   `{ workload_tag: smoke, arm: [B, C] }` or
   `{ workload_id_pattern: "smolvla_*", arm: B }`.
 
+## Live cost monitor (`mb-cost`)
+
+A terminal UI that tails every `llm_calls.jsonl` under
+`benchmarks/results/` and shows running spend live. Math matches
+AWS Bedrock prompt-caching semantics exactly
+(`inputTokens` = uncached portion only; `cache_read` and
+`cache_write` are reported separately and billed at their own rates).
+
+### Quickstart
+
+```bash
+cd <repo root>
+uv sync --extra benchmarks    # one-time; pulls rich + pyyaml
+
+# Live TUI (default). Always-on-top alternate-screen mode.
+uv run mb-cost
+
+# With a visual budget alarm (no kill -- just colors + bell).
+uv run mb-cost --budget-usd 100
+
+# Watch one specific cell only.
+uv run mb-cost --paths benchmarks/results/B-bedrock/<workload>/latest/llm_calls.jsonl
+
+# One-shot text report (CI / Slack / cron-friendly; no TUI).
+uv run mb-cost report
+```
+
+Keyboard inside the TUI:
+
+| Key | Action |
+|-----|--------|
+| `q` / Ctrl-C | quit (terminal restored) |
+| `p` | pause / resume polling |
+| `s` | cycle per-model sort: cost → calls → name |
+| `j` / `k` | scroll recent calls down / up |
+| `r` | reset state + re-scan all files |
+| `?` | toggle key-hints overlay |
+
+### What gets tracked
+
+Each call lands in four aggregation windows simultaneously:
+
+- **CUMULATIVE** — lifetime spend across every record on disk
+- **THIS MONTH** — calls with `ts` in the current UTC month
+- **SESSION** — calls during the currently-active named session
+  (see below; only when one is active)
+- **PER-MODEL** — cross-cutting table grouped by `model_id`
+- **PER-KERNEL** — cross-cutting table grouped by op (conv2d_s8,
+  linear_s8, …) parsed from each call's `phase` field
+  (`synth:<op>` or `optimize:<op>`, set by `generate_kernels.py`)
+
+### Sessions (named time windows)
+
+A session is a labeled window of wall-clock time. Cost incurred while
+a session is active is attributed to it. Single-active model:
+starting a new session auto-ends the previous one. State persists at
+`benchmarks/results/.sessions.json` (gitignored).
+
+Two ways to scope a session:
+
+**Manual** — for interactive work where you bound the run yourself:
+
+```bash
+uv run mb-cost session start baseline-v1 --label "first dronet baseline"
+# ... run any number of arm_b_bedrock / arm_b_gemini cells ...
+uv run mb-cost session end
+uv run mb-cost session list
+```
+
+**Command-wrapped** — the right hook for automation (CI, Claude Code,
+or any wrapper). The session opens just before exec and closes on the
+command's exit (any exit code):
+
+```bash
+uv run mb-cost run baseline-v1 --label "first run" -- \
+    uv run python -m modelblaster.benchmarks.arms.arm_b_bedrock \
+        --workload dronet_scalar_smoke --beam 1 --expansions 2 --iterations 1
+```
+
+The label is optional; `mb-cost session list` shows historical
+sessions with their windowed totals.
+
+### Hard budget cap (driver-side)
+
+The visual `--budget-usd` only alarms; it doesn't stop spending. For
+unattended runs, the Arm B-bedrock driver accepts a hard kill:
+
+```bash
+uv run python -m modelblaster.benchmarks.arms.arm_b_bedrock \
+    --workload <id> --max-usd 5.00
+```
+
+`pipeline/bedrock_client.BedrockClient` tracks cumulative cost using
+the same math as the monitor and raises `BudgetExceeded` once the cap
+is crossed. The arm driver writes `exit_status=budget_exceeded` to
+`run.json` and returns exit code 2.
+
+### Reconciling against AWS Cost Explorer
+
+| Source | Lag | What you'll see |
+|---|---|---|
+| `llm_calls.jsonl` `request_id` field | instant | CloudTrail event id for each call |
+| CloudTrail → Event history (filter `bedrock-runtime` / `Converse`) | ~5-15 min | Per-call audit log |
+| CloudWatch → Metrics → Bedrock (`InputTokenCount`, `OutputTokenCount`) | ~1-5 min | Time-series totals |
+| Billing → Cost Explorer (service = Amazon Bedrock) | ~24-48 h | Dollar amounts; verifies `dollars_equivalent` math |
+
+Set an AWS Budget alert at the Billing console for the absolute backstop
+("don't spend more than $X/month").
+
 ## Port-back gate for CompGen integrations
 
 When evaluating whether a CompGen piece (dossier schema, oracle, plan,

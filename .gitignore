@@ -20,6 +20,13 @@ runtime/modelblaster_pool/test_app/build/
 
 tmp/
 
+# Claude Code session state (CronCreate, etc.) -- ephemeral, never commit.
+.claude/
+
+# Live cost monitor session ledger -- per-machine, gitignored.
+benchmarks/results/.sessions.json
+benchmarks/results/.sessions.json.tmp
+
 # Secrets. The repo's bedrock/gemini/HF clients read tokens from
 # environment variables; the .env file is sourced by `set -a; . .env;
 # set +a` (or equivalent) at the start of any run. Never commit.
