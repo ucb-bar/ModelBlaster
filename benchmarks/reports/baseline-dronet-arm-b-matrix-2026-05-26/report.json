@@ -1,0 +1,1103 @@
+{
+  "schema_version": 1,
+  "report_id": "baseline-dronet-arm-b-matrix-2026-05-26",
+  "generated_at": "2026-05-26T22:32:21.135539+00:00",
+  "generated_by": {
+    "user": "agustin",
+    "hostname": "garden",
+    "git_sha": "c0750c0",
+    "git_branch": "feat/benchmark-harness"
+  },
+  "filter": {
+    "session": "baseline-dronet-arm-b-matrix-2026-05-26",
+    "since": null
+  },
+  "windows": {
+    "cumulative": {
+      "label": "EXPORT",
+      "n_calls": 171,
+      "total_cost_usd": 11.080749,
+      "cost_known": true,
+      "input_uncached": 2671958,
+      "input_cached": 0,
+      "output": 204325
+    },
+    "monthly": {
+      "label": "MONTHLY",
+      "n_calls": 171,
+      "total_cost_usd": 11.080749,
+      "cost_known": true,
+      "input_uncached": 2671958,
+      "input_cached": 0,
+      "output": 204325
+    }
+  },
+  "by_model": {
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+      "n_calls": 171,
+      "input_uncached": 2671958,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 204325,
+      "cost_usd": 11.080749,
+      "cost_known": true
+    }
+  },
+  "by_kernel": {
+    "add_s8": {
+      "n_calls": 20,
+      "input_uncached": 316398,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 16143,
+      "cost_usd": 1.191339,
+      "cost_known": true
+    },
+    "batchnorm2d_s8": {
+      "n_calls": 13,
+      "input_uncached": 189989,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 15737,
+      "cost_usd": 0.806022,
+      "cost_known": true
+    },
+    "linear_s8": {
+      "n_calls": 20,
+      "input_uncached": 356054,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 37588,
+      "cost_usd": 1.631982,
+      "cost_known": true
+    },
+    "maxpool2d_s8": {
+      "n_calls": 28,
+      "input_uncached": 338136,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 29123,
+      "cost_usd": 1.451253,
+      "cost_known": true
+    },
+    "relu_s8": {
+      "n_calls": 17,
+      "input_uncached": 216987,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 4203,
+      "cost_usd": 0.714006,
+      "cost_known": true
+    },
+    "sigmoid_s8": {
+      "n_calls": 14,
+      "input_uncached": 207671,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 3590,
+      "cost_usd": 0.676863,
+      "cost_known": true
+    },
+    "conv2d_s8": {
+      "n_calls": 59,
+      "input_uncached": 1046723,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 97941,
+      "cost_usd": 4.609284,
+      "cost_known": true
+    }
+  },
+  "by_cell": {
+    "B-bedrock/dronet_gemmini_int8/2026-05-26T22-23-36Z": {
+      "n_calls": 7,
+      "cost_usd": 0.15942,
+      "cost_known": true,
+      "input_uncached": 27735,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 5081
+    },
+    "B-bedrock/dronet_gemmini_int8/2026-05-26T22-25-11Z": {
+      "n_calls": 4,
+      "cost_usd": 0.113943,
+      "cost_known": true,
+      "input_uncached": 16786,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 4239
+    },
+    "B-bedrock/dronet_gemmini_int8/2026-05-26T22-26-34Z": {
+      "n_calls": 7,
+      "cost_usd": 0.124881,
+      "cost_known": true,
+      "input_uncached": 23822,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 3561
+    },
+    "B-bedrock/dronet_gemmini_q31_int8/2026-05-26T22-28-14Z": {
+      "n_calls": 2,
+      "cost_usd": 0.027111,
+      "cost_known": true,
+      "input_uncached": 6477,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 512
+    },
+    "B-bedrock/dronet_rvv_opu_int8/2026-05-26T21-15-51Z": {
+      "n_calls": 43,
+      "cost_usd": 3.045759,
+      "cost_known": true,
+      "input_uncached": 743143,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 54422
+    },
+    "B-bedrock/dronet_rvv_opu_int8/2026-05-26T21-43-14Z": {
+      "n_calls": 33,
+      "cost_usd": 2.3145810000000004,
+      "cost_known": true,
+      "input_uncached": 575982,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 39109
+    },
+    "B-bedrock/dronet_rvv_opu_int8/2026-05-26T22-02-45Z": {
+      "n_calls": 39,
+      "cost_usd": 2.734305000000001,
+      "cost_known": true,
+      "input_uncached": 682290,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 45829
+    },
+    "B-bedrock/dronet_rvv_smoke/2026-05-26T21-02-09Z": {
+      "n_calls": 12,
+      "cost_usd": 0.833622,
+      "cost_known": true,
+      "input_uncached": 198079,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 15959
+    },
+    "B-bedrock/dronet_rvv_smoke/2026-05-26T21-06-37Z": {
+      "n_calls": 12,
+      "cost_usd": 0.86283,
+      "cost_known": true,
+      "input_uncached": 198565,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 17809
+    },
+    "B-bedrock/dronet_rvv_smoke/2026-05-26T21-11-12Z": {
+      "n_calls": 12,
+      "cost_usd": 0.864297,
+      "cost_known": true,
+      "input_uncached": 199079,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 17804
+    }
+  },
+  "sessions": [
+    {
+      "id": "baseline-dronet-arm-b-matrix-2026-05-26",
+      "label": "Arm B-bedrock matrix: dronet \u00d7 {rvv, rvv_opu, gemmini, gemmini_q31}, 3 reps each, beam=2 exp=3 iter=2",
+      "started_at": "2026-05-26T21:01:56.212549+00:00",
+      "ended_at": "2026-05-26T22:32:21.012884+00:00",
+      "is_active": false,
+      "n_calls": 171,
+      "cost_usd": 11.0807
+    },
+    {
+      "id": "baseline-dronet-arm-a-matrix-2026-05-26",
+      "label": "Arm A matrix: dronet \u00d7 {rvv, rvv_opu, gemmini, gemmini_q31}, 3 reps each",
+      "started_at": "2026-05-26T20:24:12.674008+00:00",
+      "ended_at": "2026-05-26T21:01:02.382428+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_hetero_int8-2026-05-26T20-1",
+      "label": "auto-opened by arm driver A for workload 'dronet_hetero_int8' (hetero_gemmini_opu/spike)",
+      "started_at": "2026-05-26T20:11:21.669053+00:00",
+      "ended_at": "2026-05-26T20:22:01.019532+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_gemmini_q31_int8-2026-05-26T20-1",
+      "label": "auto-opened by arm driver A for workload 'dronet_gemmini_q31_int8' (gemmini_q31/spike)",
+      "started_at": "2026-05-26T20:10:35.621001+00:00",
+      "ended_at": "2026-05-26T20:11:14.660395+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_gemmini_int8-2026-05-26T20-1",
+      "label": "auto-opened by arm driver A for workload 'dronet_gemmini_int8' (gemmini/spike)",
+      "started_at": "2026-05-26T20:10:09.199229+00:00",
+      "ended_at": "2026-05-26T20:10:28.982634+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_hetero_int8-2026-05-26T20-0",
+      "label": "auto-opened by arm driver A for workload 'dronet_hetero_int8' (hetero_gemmini_opu/spike)",
+      "started_at": "2026-05-26T20:07:02.458799+00:00",
+      "ended_at": "2026-05-26T20:07:18.616879+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_gemmini_q31_int8-2026-05-26T20-0",
+      "label": "auto-opened by arm driver A for workload 'dronet_gemmini_q31_int8' (gemmini_q31/spike)",
+      "started_at": "2026-05-26T20:06:25.282871+00:00",
+      "ended_at": "2026-05-26T20:07:02.287998+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_gemmini_int8-2026-05-26T20-0",
+      "label": "auto-opened by arm driver A for workload 'dronet_gemmini_int8' (gemmini/spike)",
+      "started_at": "2026-05-26T20:06:07.728560+00:00",
+      "ended_at": "2026-05-26T20:06:25.091520+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_hetero_int8-2026-05-26T19-5",
+      "label": "auto-opened by arm driver A for workload 'dronet_hetero_int8' (hetero_gemmini_opu/spike)",
+      "started_at": "2026-05-26T19:54:35.325002+00:00",
+      "ended_at": "2026-05-26T19:54:52.284572+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_gemmini_q31_int8-2026-05-26T19-5",
+      "label": "auto-opened by arm driver A for workload 'dronet_gemmini_q31_int8' (gemmini_q31/spike)",
+      "started_at": "2026-05-26T19:53:58.676310+00:00",
+      "ended_at": "2026-05-26T19:54:35.189891+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_gemmini_int8-2026-05-26T19-5",
+      "label": "auto-opened by arm driver A for workload 'dronet_gemmini_int8' (gemmini/spike)",
+      "started_at": "2026-05-26T19:53:41.107061+00:00",
+      "ended_at": "2026-05-26T19:53:58.501475+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_rvv_opu_int8-2026-05-26T19-5",
+      "label": "auto-opened by arm driver A for workload 'dronet_rvv_opu_int8' (rvv_opu/spike)",
+      "started_at": "2026-05-26T19:53:22.843357+00:00",
+      "ended_at": "2026-05-26T19:53:40.918876+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_rvv_smoke-2026-05-26T19-5",
+      "label": "auto-opened by arm driver A for workload 'dronet_rvv_smoke' (rvv/spike)",
+      "started_at": "2026-05-26T19:51:57.502845+00:00",
+      "ended_at": "2026-05-26T19:52:46.639119+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-dronet_scalar_smoke-2026-05-26T19-2",
+      "label": "auto-opened by arm driver A for workload 'dronet_scalar_smoke' (scalar/spike)",
+      "started_at": "2026-05-26T19:29:55.827464+00:00",
+      "ended_at": "2026-05-26T19:30:11.634436+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "baseline-dronet-arm-b-2026-05-26",
+      "label": "Arm B-bedrock baseline: dronet_scalar_smoke beam=2 exp=3 iter=2, 3 reps, --max-usd 5",
+      "started_at": "2026-05-26T18:12:41.224947+00:00",
+      "ended_at": "2026-05-26T19:02:18.435251+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "baseline-dronet-arm-a-2026-05-26",
+      "label": "Arm A curated baseline: dronet_scalar_smoke + dronet_rvv_smoke, 3 reps each",
+      "started_at": "2026-05-26T18:05:37.085675+00:00",
+      "ended_at": "2026-05-26T18:11:40.310873+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    },
+    {
+      "id": "auto-A-mlp_generic_scalar_smoke-2026-05-26T18-0",
+      "label": "auto-opened by arm driver A for workload 'mlp_generic_scalar_smoke' (scalar/spike)",
+      "started_at": "2026-05-26T18:05:02.973757+00:00",
+      "ended_at": "2026-05-26T18:05:02.974046+00:00",
+      "is_active": false,
+      "n_calls": 0,
+      "cost_usd": 0
+    }
+  ],
+  "config": {
+    "pricing_last_updated": "2026-05-25"
+  },
+  "kind": "experiment",
+  "bundle_contents": {
+    "per_cell": [
+      {
+        "cell": "A/dronet_gemmini_int8/2026-05-26T20-10-09Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_int8/2026-05-26T20-57-43Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_int8/2026-05-26T20-58-01Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_int8/2026-05-26T20-58-20Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_int8/2026-05-26T19-53-41Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt"
+        ]
+      },
+      {
+        "cell": "A/yolov8_nano_scalar_smoke/2026-05-26T20-20-20Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_opu_int8/2026-05-26T19-53-22Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_opu_int8/2026-05-26T20-47-23Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_opu_int8/2026-05-26T20-26-44Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_opu_int8/2026-05-26T20-37-03Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_opu_int8/2026-05-26T19-55-46Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_scalar_smoke/2026-05-26T18-05-50Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "A/dronet_scalar_smoke/2026-05-26T18-05-59Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "A/dronet_scalar_smoke/2026-05-26T18-05-41Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "A/dronet_scalar_smoke/2026-05-26T19-29-55Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_hetero_int8/2026-05-26T19-54-35Z",
+        "files": [
+          "run.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "cross_tile_estimate.json"
+        ]
+      },
+      {
+        "cell": "A/dronet_hetero_int8/2026-05-26T20-11-21Z",
+        "files": [
+          "run.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "cross_tile_estimate.json"
+        ]
+      },
+      {
+        "cell": "A/dronet_hetero_int8/2026-05-26T20-07-02Z",
+        "files": [
+          "run.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "cross_tile_estimate.json"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_q31_int8/2026-05-26T19-53-58Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_q31_int8/2026-05-26T20-59-54Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_q31_int8/2026-05-26T20-59-17Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_q31_int8/2026-05-26T20-10-35Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_gemmini_q31_int8/2026-05-26T20-58-39Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_smoke/2026-05-26T20-24-18Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_smoke/2026-05-26T19-51-57Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_smoke/2026-05-26T20-25-55Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "A/dronet_rvv_smoke/2026-05-26T20-25-06Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_gemmini_int8/2026-05-26T22-25-11Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_calls.jsonl",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_gemmini_int8/2026-05-26T22-23-36Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_calls.jsonl",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_gemmini_int8/2026-05-26T22-26-34Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_calls.jsonl",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_rvv_opu_int8/2026-05-26T21-43-14Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "llm_calls.jsonl",
+          "llm_tokens.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_rvv_opu_int8/2026-05-26T21-15-51Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "llm_calls.jsonl",
+          "llm_tokens.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_rvv_opu_int8/2026-05-26T22-02-45Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "llm_calls.jsonl",
+          "llm_tokens.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_scalar_smoke/2026-05-26T18-13-37Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "llm_calls.jsonl",
+          "llm_tokens.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_scalar_smoke/2026-05-26T18-40-39Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "llm_calls.jsonl",
+          "llm_tokens.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_scalar_smoke/2026-05-26T18-25-32Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "llm_calls.jsonl",
+          "llm_tokens.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_gemmini_q31_int8/2026-05-26T22-30-15Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_gemmini_q31_int8/2026-05-26T22-29-18Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_gemmini_q31_int8/2026-05-26T22-28-14Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_calls.jsonl",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_rvv_smoke/2026-05-26T21-06-37Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_calls.jsonl",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_rvv_smoke/2026-05-26T21-02-09Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_calls.jsonl",
+          "llm_tokens.json"
+        ]
+      },
+      {
+        "cell": "B-bedrock/dronet_rvv_smoke/2026-05-26T21-11-12Z",
+        "files": [
+          "run.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "env.txt",
+          "llm_calls.jsonl",
+          "llm_tokens.json"
+        ]
+      }
+    ],
+    "kernels": [
+      {
+        "model": "dronet",
+        "quant": "int8",
+        "target": "gemmini",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json"
+        ]
+      },
+      {
+        "model": "dronet",
+        "quant": "int8",
+        "target": "hetero_gemmini_opu",
+        "files": [
+          "graph.json",
+          "passes_applied.json"
+        ]
+      },
+      {
+        "model": "yolov8_nano",
+        "quant": "int8",
+        "target": "scalar",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json"
+        ]
+      },
+      {
+        "model": "dronet",
+        "quant": "int8",
+        "target": "gemmini_q31",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json"
+        ]
+      },
+      {
+        "model": "dronet",
+        "quant": "int8",
+        "target": "rvv",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json"
+        ]
+      },
+      {
+        "model": "dronet",
+        "quant": "int8",
+        "target": "rvv_opu",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      },
+      {
+        "model": "dronet",
+        "quant": "int8",
+        "target": "scalar",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json"
+        ]
+      }
+    ],
+    "missing": []
+  }
+}
