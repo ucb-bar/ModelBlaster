@@ -33,3 +33,8 @@ benchmarks/results/.sessions.json.tmp
 .env
 .env.*
 !.env.example
+
+# Pretrained weight artifacts downloaded at first run -- ignored so a
+# clean clone re-downloads from the canonical URL. Tracked in the
+# model loader's _load_*_weights() helper.
+yolov8n.pt
