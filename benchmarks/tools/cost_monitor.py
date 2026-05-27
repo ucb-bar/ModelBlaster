@@ -1116,6 +1116,7 @@ def _summary_panel(state: WatcherState, ledger: SessionLedger,
 def _per_model_table(by_model: dict[str, ModelTally],
                      sort_mode: str,
                      *, max_rows: Optional[int] = None,
+                     scroll: int = 0,
                      highlighted: bool = False) -> Table:
     title_label = (
         "[bold cyan]🤖 Per-model breakdown[/bold cyan]"
@@ -1146,11 +1147,20 @@ def _per_model_table(by_model: dict[str, ModelTally],
     else:  # cost (default)
         items.sort(key=lambda kv: -kv[1].cost_usd)
 
+    # Same scroll semantics as _per_kernel_table.
+    total = len(items)
+    if scroll > 0:
+        scroll = min(scroll, max(0, total - 1))
+        items = items[scroll:]
     if max_rows is not None and len(items) > max_rows:
-        truncated = len(items) - max_rows
+        truncated_below = len(items) - max_rows
         items = items[:max_rows]
     else:
-        truncated = 0
+        truncated_below = 0
+    truncated_above = scroll if scroll > 0 else 0
+    if truncated_above > 0:
+        table.add_row(f"[dim]↑ {truncated_above} more above…[/dim]",
+                      "", "", "", "", "", "")
     for model_id, tally in items:
         cost_repr = _fmt_usd(tally.cost_usd)
         if not tally.cost_known:
@@ -1164,10 +1174,10 @@ def _per_model_table(by_model: dict[str, ModelTally],
             _fmt_tok(tally.output),
             cost_repr,
         )
-    if not items and truncated == 0:
+    if not items and total == 0:
         table.add_row("(none yet)", "0", "0", "0", "0", "0", "—")
-    if truncated > 0:
-        table.add_row(f"[dim]+{truncated} more…[/dim]",
+    if truncated_below > 0:
+        table.add_row(f"[dim]↓ {truncated_below} more below…[/dim]",
                       "", "", "", "", "", "")
     return table
 
@@ -1175,6 +1185,7 @@ def _per_model_table(by_model: dict[str, ModelTally],
 def _per_kernel_table(by_kernel: dict[str, ModelTally],
                       sort_mode: str,
                       *, max_rows: Optional[int] = None,
+                      scroll: int = 0,
                       highlighted: bool = False) -> Optional[Table]:
     """Per-op cost breakdown. Returns None when no records carry a
     kernel-scoped phase so the panel doesn't render empty on smoke
@@ -1207,11 +1218,21 @@ def _per_kernel_table(by_kernel: dict[str, ModelTally],
     else:
         items.sort(key=lambda kv: -kv[1].cost_usd)
 
+    # Apply scroll offset (clamped) then slice to max_rows. scroll > 0
+    # means the user has scrolled DOWN past the top of the sorted list.
+    total = len(items)
+    if scroll > 0:
+        scroll = min(scroll, max(0, total - 1))
+        items = items[scroll:]
     if max_rows is not None and len(items) > max_rows:
-        truncated = len(items) - max_rows
+        truncated_below = len(items) - max_rows
         items = items[:max_rows]
     else:
-        truncated = 0
+        truncated_below = 0
+    truncated_above = scroll if scroll > 0 else 0
+    if truncated_above > 0:
+        table.add_row(f"[dim]↑ {truncated_above} more above…[/dim]",
+                      "", "", "", "")
     for kernel, tally in items:
         cost_repr = _fmt_usd(tally.cost_usd) + (
             "+" if not tally.cost_known else "")
@@ -1221,8 +1242,9 @@ def _per_kernel_table(by_kernel: dict[str, ModelTally],
             kernel, str(tally.n_calls),
             _fmt_tok(in_tok), _fmt_tok(tally.output), cost_repr,
         )
-    if truncated > 0:
-        table.add_row(f"[dim]+{truncated} more…[/dim]", "", "", "", "")
+    if truncated_below > 0:
+        table.add_row(f"[dim]↓ {truncated_below} more below…[/dim]",
+                      "", "", "", "")
     return table
 
 
@@ -1447,21 +1469,31 @@ def render(state: WatcherState, ledger: SessionLedger,
         recent_h = max(5, middle_h - per_model_h - per_kernel_h)
         recent_rows = max(1, recent_h - 4)
 
+        # Route the scroll offset to whichever pane is currently active.
+        # Inactive panes always show from row 0 so the user's mental
+        # "current position per pane" is preserved across switches: only
+        # one scroll var so leaving and returning resets, but the active
+        # pane is always the one being navigated.
+        model_scroll = scroll if active_pane == "model" else 0
+        kernel_scroll = scroll if active_pane == "kernel" else 0
+        recent_scroll = scroll if active_pane == "recent" else 0
         middle_parts: list = [
             _per_model_table(cumul.by_model, sort_mode,
                               max_rows=per_model_rows,
+                              scroll=model_scroll,
                               highlighted=(explore_mode
                                             and active_pane == "model")),
         ]
         if has_kernels:
             kt = _per_kernel_table(cumul.by_kernel, sort_mode,
                                     max_rows=per_kernel_rows,
+                                    scroll=kernel_scroll,
                                     highlighted=(explore_mode
                                                   and active_pane == "kernel"))
             if kt is not None:
                 middle_parts.append(kt)
         middle_parts.append(
-            _recent_table(state.records, scroll, recent_rows,
+            _recent_table(state.records, recent_scroll, recent_rows,
                           frozen=explore_mode,
                           highlighted=(explore_mode
                                         and active_pane == "recent"))
@@ -1691,16 +1723,27 @@ def cmd_live(args) -> int:
                         scroll = max(0, scroll - 1)
                         nav_consumed = True
                     elif ch in ("DOWN", "j"):
-                        scroll = min(scroll + 1,
-                                     max(0, len(state.records) - 1))
+                        # Bound by the active pane's row count so we
+                        # can't scroll past the end of whichever pane
+                        # we're in.
+                        _cumul = compute_windows(state, ledger)["cumulative"]
+                        if active_pane == "model":
+                            _len = len(_cumul.by_model)
+                        elif active_pane == "kernel":
+                            _len = len(_cumul.by_kernel)
+                        else:
+                            _len = len(state.records)
+                        scroll = min(scroll + 1, max(0, _len - 1))
                         nav_consumed = True
                     elif ch == "LEFT" and explore_mode:
                         idx = PANE_CYCLE.index(active_pane)
                         active_pane = PANE_CYCLE[(idx - 1) % len(PANE_CYCLE)]
+                        scroll = 0   # reset to top of newly-active pane
                         nav_consumed = True
                     elif ch == "RIGHT" and explore_mode:
                         idx = PANE_CYCLE.index(active_pane)
                         active_pane = PANE_CYCLE[(idx + 1) % len(PANE_CYCLE)]
+                        scroll = 0   # reset to top of newly-active pane
                         nav_consumed = True
                     else:
                         continue   # unknown key: don't trigger render
