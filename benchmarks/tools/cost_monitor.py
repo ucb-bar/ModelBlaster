@@ -359,12 +359,14 @@ def _ingest(rec: dict, path: Path, state: WatcherState,
         cell=derive_cell_label(path),
         phase=phase,
     ))
-    # Fire the blaster mascot when we encounter a new kernel.
-    # _BLASTER_ANIM_FRAMES is the number of redraw frames the shot
-    # animation persists before settling back to idle.
+    # Fire the blaster mascot on every new LLM call (but don't restart
+    # an already-running shot animation so overlapping calls look like
+    # rapid fire instead of a single jittery frame). seen_kernels stays
+    # populated for the "first-time-seen" highlight elsewhere if needed.
     kernel = _kernel_from_phase(phase)
-    if kernel is not None and kernel not in state.seen_kernels:
+    if kernel is not None:
         state.seen_kernels.add(kernel)
+    if state.blaster_anim_frame == 0:
         state.blaster_anim_frame = _BLASTER_ANIM_FRAMES
 
 
@@ -648,7 +650,7 @@ def render_splash(console: Console) -> None:
 # "shot" without needing complex sprite work. The projectile chars
 # add the pew-pew across the rest of the line.
 
-_BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
+_BLASTER_ANIM_FRAMES = 30  # at 20 Hz: 1.5s per shot
 
 
 # Sci-fi blaster ASCII -- riff on the classic "hjw" revolver silhouette
@@ -1615,17 +1617,41 @@ def cmd_live(args) -> int:
                       budget_usd=args.budget_usd,
                       terminal_height=console.size.height)
 
+    # Three independent rates, decoupled so each one's slow path doesn't
+    # block the others. Keystrokes get 60 Hz polling (≤16 ms latency)
+    # regardless of how heavy a render or a filesystem walk takes.
+    KEY_INTERVAL  = 1.0 / 60.0                    # ~16 ms
+    render_interval = 1.0 / max(args.refresh_hz, 0.1)
+    POLL_INTERVAL = max(render_interval * 4, 0.25)  # disk poll: ~4 Hz
+    last_render = 0.0
+    last_poll = 0.0
+    needs_render = True   # render once on entry
+
     try:
         with _StdinReader() as keyreader, \
              Live(_initial_layout(), console=console,
                   refresh_per_second=args.refresh_hz,
                   screen=True) as live:
             while True:
-                # Drain any pending keystrokes.
+                now = time.monotonic()
+
+                # ---- 60 Hz: drain pending keystrokes ----
+                # Navigation keys (arrows + j/k) are rate-limited to one
+                # action per drain so that terminal key auto-repeat (which
+                # streams many escape sequences while the key is held)
+                # doesn't whip through panes / scroll positions faster
+                # than the eye can follow. We coalesce trailing repeats
+                # of the same nav key into a single effect for this
+                # drain pass. Toggle keys (p, ?, e) and one-shots (s, r,
+                # q) still process every event.
+                nav_consumed = False
                 while True:
                     ch = keyreader.read_key()
                     if ch is None:
                         break
+                    is_nav = ch in ("UP", "DOWN", "LEFT", "RIGHT", "j", "k")
+                    if is_nav and nav_consumed:
+                        continue   # already navigated this drain; drop repeat
                     if ch in ("q", "Q", "\x03"):  # q / Q / Ctrl-C
                         raise KeyboardInterrupt
                     if ch == "p":
@@ -1649,20 +1675,33 @@ def cmd_live(args) -> int:
                     # functions if you don't know about explore.
                     elif ch in ("UP", "k"):
                         scroll = max(0, scroll - 1)
+                        nav_consumed = True
                     elif ch in ("DOWN", "j"):
                         scroll = min(scroll + 1,
                                      max(0, len(state.records) - 1))
+                        nav_consumed = True
                     elif ch == "LEFT" and explore_mode:
                         idx = PANE_CYCLE.index(active_pane)
                         active_pane = PANE_CYCLE[(idx - 1) % len(PANE_CYCLE)]
+                        nav_consumed = True
                     elif ch == "RIGHT" and explore_mode:
                         idx = PANE_CYCLE.index(active_pane)
                         active_pane = PANE_CYCLE[(idx + 1) % len(PANE_CYCLE)]
+                        nav_consumed = True
+                    else:
+                        continue   # unknown key: don't trigger render
+                    # Any handled keypress should re-render immediately
+                    # so the UI feels live.
+                    needs_render = True
 
-                if not paused:
+                # ---- ~4 Hz: filesystem walk + JSONL polls ----
+                if not paused and (now - last_poll) >= POLL_INTERVAL:
                     files = _files()
-                    poll_files(files, state, pricing)
+                    n_new = poll_files(files, state, pricing)
                     ledger = SessionLedger.load()
+                    last_poll = now
+                    if n_new:
+                        needs_render = True
                 # In explore mode we DON'T auto-scroll; the user is
                 # navigating frozen history. In live mode the scroll
                 # offset stays 0 so new records appear at the top.
@@ -1677,16 +1716,24 @@ def cmd_live(args) -> int:
                         console.bell()
                         bell_rung = True
 
-                live.update(render(state, ledger, sort_mode=sort_mode,
-                                    scroll=scroll,
-                                    max_recent=args.max_recent,
-                                    watching=len(files), paused=paused,
-                                    show_help=show_help,
-                                    explore_mode=explore_mode,
-                                    active_pane=active_pane,
-                                    budget_usd=args.budget_usd,
-                                    terminal_height=console.size.height))
-                time.sleep(poll_interval)
+                # ---- ~refresh_hz Hz: render. Also ticks the mascot
+                # animation, so we want a heartbeat even when idle. ----
+                if (needs_render or state.blaster_anim_frame > 0
+                        or (now - last_render) >= render_interval):
+                    live.update(render(
+                        state, ledger, sort_mode=sort_mode,
+                        scroll=scroll,
+                        max_recent=args.max_recent,
+                        watching=len(files), paused=paused,
+                        show_help=show_help,
+                        explore_mode=explore_mode,
+                        active_pane=active_pane,
+                        budget_usd=args.budget_usd,
+                        terminal_height=console.size.height))
+                    last_render = now
+                    needs_render = False
+
+                time.sleep(KEY_INTERVAL)
     except KeyboardInterrupt:
         pass
 
@@ -2540,8 +2587,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # live (default)
     live = sub.add_parser("live", help="live TUI (default)")
     _add_common_args(live)
-    live.add_argument("--refresh-hz", type=float, default=4.0,
-                      help="redraw rate (default: 4)")
+    live.add_argument("--refresh-hz", type=float, default=20.0,
+                      help="redraw rate Hz (default: 20). At 20 Hz the "
+                           "main loop sleeps 50ms per cycle, which is "
+                           "also the keystroke-to-effect latency. Drop "
+                           "to 4 for low-bandwidth ssh sessions or when "
+                           "another live TUI is sharing the terminal.")
     live.add_argument("--max-recent", type=int, default=15,
                       help="recent calls visible (default: 15)")
     live.add_argument("--budget-usd", type=float, default=None,
