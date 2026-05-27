@@ -425,7 +425,7 @@ def main() -> int:
         kill_first=not args.no_kill_first,
     )
     repo_root = args.repo_root or os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..")
+        os.path.join(os.path.dirname(__file__), "..")
     )
     iree_args = IREEProfileArgs(
         profile_out_root=args.profile_out_root,
