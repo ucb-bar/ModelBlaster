@@ -328,7 +328,7 @@ def check_one(actual: np.ndarray, golden_npz_path: str,
 
 def model_io_path(repo_root: str, name: str, quant: str) -> str:
     return os.path.join(
-        repo_root, "modelblaster", "examples", name, quant, "generated", "io.npz"
+        repo_root, "examples", name, quant, "generated", "io.npz"
     )
 
 
