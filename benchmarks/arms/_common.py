@@ -117,6 +117,23 @@ def apply_runner_override(
             f"baseline capture.",
             file=sys.stderr,
         )
+    if (workload.target == "gemmini_q31" and override == "spike"):
+        # libgemmini.so in spike's lib dir is built with acc_scale_t=float;
+        # the Q31 kernels emit Q0.31 int multipliers that get reinterpreted
+        # as float bits → numerics drift, verify fails (linf=9..72 observed
+        # on dronet / yolov8n). The Q31 path needs a libgemmini.so.q31
+        # build per the Q31GemminiRocketConfig (see backends.py:266-280).
+        # Surface this loudly so the cell's stderr.log documents WHY the
+        # verify fails rather than the user having to dig.
+        print(
+            "NOTE: --runner-override spike on target gemmini_q31: "
+            "spike's libgemmini.so is float-acc_scale; the Q31 kernels' "
+            "Q0.31 int multipliers get reinterpreted as float bits and "
+            "trip verify. Cycle counts are recorded but numerics drift. "
+            "Use firesim with a Q31GemminiRocketConfig bitstream for the "
+            "authoritative baseline.",
+            file=sys.stderr,
+        )
     return replace(workload, runner=override)
 
 
