@@ -337,6 +337,35 @@ def emit_kernels_c(
 
 
 # ---------------------------------------------------------------------------
+# Per-backend op skip lists for the LLM optimize loop AND the initial
+# BACKEND=llm kernel-gen pass.
+#
+# Ops listed here are KEPT at their reference/curated impl when running with
+# BACKEND=llm + OPTIMIZE=1; we don't ask Sonnet to (re)write them. The motive
+# for each entry is empirical: a measured Arm B-bedrock matrix capture where
+# the LLM tripped verify on every attempt for that (target, op) pair while
+# the curated/reference impl was already correct. See
+# benchmarks/reports/baseline-dronet-arm-b-matrix-2026-05-26/methodology.md
+# for the gemmini maxpool / relu / etc. failure traces.
+#
+# Keyed by target name (the str), not the Backend object. Lookup with
+# .get(backend.name, set()).
+LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
+    # Gemmini doesn't accelerate elementwise / pooling / activation ops
+    # natively. The curated path routes maxpool through tiled_conv_dw_auto
+    # + mvout pool, but LLM attempts to rewrite as a "Gemmini matmul"
+    # consistently trip verify (max_abs_err=12..56 across attempts). For
+    # the other ops gemmini RoCC has no special instruction so the LLM
+    # has nothing to win against the scalar reference; let it fall
+    # through to reference_impl rather than burning budget on retries.
+    "gemmini":     {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
+                    "add_s8", "sigmoid_s8"},
+    "gemmini_q31": {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
+                    "add_s8", "sigmoid_s8"},
+}
+
+
+# ---------------------------------------------------------------------------
 # Verify routing — backend dictates host_ctypes vs spike_harness
 # ---------------------------------------------------------------------------
 
@@ -1282,7 +1311,19 @@ def generate(
         # First pass: write reference + emit so the harness can build at all.
         emit_kernels_h(specs, out_dir, model_name=ir["name"])
         emit_kernels_c(impls, "seed", out_dir, backend=target, model_name=ir["name"])
+        _llm_skip = LLM_SKIP_OPS_PER_TARGET.get(target.name, set())
         for spec in specs:
+            if spec.op in _llm_skip:
+                log(f"  [{spec.op}] target={target.name} -> "
+                    f"LLM-gen skip (curated/reference is best known); "
+                    f"keeping reference_impl from seed step")
+                kernel_picks[spec.op] = {
+                    "source": "reference",
+                    "algorithm": None,
+                    "path": None,
+                }
+                chosen_algo[spec.op] = "direct"
+                continue
             shapes = collect_shapes(ir, spec.op, spec)
             log(f"  [{spec.op}] verify shapes={shapes}")
             result = generate_one_llm(
@@ -1414,8 +1455,15 @@ def generate(
         log(f"optimize: firesim re-rank ENABLED "
             f"(top_k={firesim_top_k}, build_dir={firesim_build_dir})")
 
+    # See module-level LLM_SKIP_OPS_PER_TARGET for the rationale.
+    _skip = LLM_SKIP_OPS_PER_TARGET.get(target.name, set())
+
     optimize_summary: dict[str, dict] = {}
     for spec in specs:
+        if spec.op in _skip:
+            log(f"  [{spec.op}] target={target} -> "
+                f"optimize-skip (curated/reference is best known)")
+            continue
         baseline_op = baseline_cycles_by_op.get(spec.op, 0)
         if baseline_op <= 0:
             log(f"  [{spec.op}] no baseline cycles, skipping")
