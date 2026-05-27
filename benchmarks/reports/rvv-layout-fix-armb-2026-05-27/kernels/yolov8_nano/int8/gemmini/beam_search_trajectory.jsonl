@@ -1,0 +1,48 @@
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 7362063, "result": "ok", "cycles": 7749698, "tokens_in": 4527, "tokens_out": 2441}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 7362063, "result": "duplicate", "tokens_in": 4527, "tokens_out": 2439}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 7362063, "result": "ok", "cycles": 8175758, "tokens_in": 4527, "tokens_out": 2203}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 2, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 7749698, "result": "ok", "cycles": 7718389, "tokens_in": 7496, "tokens_out": 4063}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 2, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 7749698, "result": "duplicate", "tokens_in": 7496, "tokens_out": 3992}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 2, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 7749698, "result": "ok", "cycles": 4072900, "tokens_in": 7496, "tokens_out": 4738}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 2, "parent_idx": 1, "exp_idx": 1, "parent_cycles": 8175758, "result": "duplicate", "tokens_in": 7496, "tokens_out": 4017}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 2, "parent_idx": 1, "exp_idx": 2, "parent_cycles": 8175758, "result": "duplicate", "tokens_in": 7496, "tokens_out": 4003}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7362063, "iter": 2, "parent_idx": 1, "exp_idx": 3, "parent_cycles": 8175758, "result": "duplicate", "tokens_in": 7496, "tokens_out": 4002}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 2839683, "result": "ok", "cycles": 3082265, "tokens_in": 8086, "tokens_out": 3094}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 2839683, "result": "ok", "cycles": 3160805, "tokens_in": 8086, "tokens_out": 1505}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 2839683, "result": "ok", "cycles": 3160805, "tokens_in": 8086, "tokens_out": 1528}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 2, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 3082265, "result": "ok", "cycles": 2839683, "tokens_in": 7226, "tokens_out": 5176}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 2, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 3082265, "result": "duplicate", "tokens_in": 7226, "tokens_out": 5243}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 2, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 3082265, "result": "ok", "cycles": 3157583, "tokens_in": 7226, "tokens_out": 7015}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 2, "parent_idx": 1, "exp_idx": 1, "parent_cycles": 3160805, "result": "duplicate", "tokens_in": 7226, "tokens_out": 5040}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 2, "parent_idx": 1, "exp_idx": 2, "parent_cycles": 3160805, "result": "duplicate", "tokens_in": 7226, "tokens_out": 5040}
+{"spec": "cat3_c1_s8", "baseline_cycles": 2839683, "iter": 2, "parent_idx": 1, "exp_idx": 3, "parent_cycles": 3160805, "result": "duplicate", "tokens_in": 7226, "tokens_out": 5040}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 3013654, "result": "ok", "cycles": 3261446, "tokens_in": 3941, "tokens_out": 1473}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 3013654, "result": "ok", "cycles": 3261446, "tokens_in": 3941, "tokens_out": 1588}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 3013654, "result": "duplicate", "tokens_in": 3941, "tokens_out": 1588}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 2, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 3261446, "result": "ok", "cycles": 1276637, "tokens_in": 5966, "tokens_out": 2758}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 2, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 3261446, "result": "ok", "cycles": 3267715, "tokens_in": 5966, "tokens_out": 2560}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 2, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 3261446, "result": "duplicate", "tokens_in": 5966, "tokens_out": 2473}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 2, "parent_idx": 1, "exp_idx": 1, "parent_cycles": 3261446, "result": "duplicate", "tokens_in": 5966, "tokens_out": 2500}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 2, "parent_idx": 1, "exp_idx": 2, "parent_cycles": 3261446, "result": "duplicate", "tokens_in": 5966, "tokens_out": 2500}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3013654, "iter": 2, "parent_idx": 1, "exp_idx": 3, "parent_cycles": 3261446, "result": "ok", "cycles": 3060523, "tokens_in": 5966, "tokens_out": 1761}
+{"spec": "conv2d_s8", "baseline_cycles": 99497142, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 99497142, "result": "ok", "cycles": 99949314, "tokens_in": 11304, "tokens_out": 2807}
+{"spec": "conv2d_s8", "baseline_cycles": 99497142, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 99497142, "result": "ok", "cycles": 71343888, "tokens_in": 11304, "tokens_out": 2598}
+{"spec": "conv2d_s8", "baseline_cycles": 99497142, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 99497142, "result": "ok", "cycles": 51856932, "tokens_in": 11304, "tokens_out": 3599}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 97375583, "result": "ok", "cycles": 100741837, "tokens_in": 3571, "tokens_out": 1495}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 97375583, "result": "ok", "cycles": 100741837, "tokens_in": 3571, "tokens_out": 1493}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 97375583, "result": "duplicate", "tokens_in": 3571, "tokens_out": 1493}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 2, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 100741837, "result": "ok", "cycles": 97377818, "tokens_in": 5772, "tokens_out": 990}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 2, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 100741837, "result": "ok", "cycles": 99546923, "tokens_in": 5772, "tokens_out": 1052}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 2, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 100741837, "result": "ok", "cycles": 100741837, "tokens_in": 5772, "tokens_out": 1536}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 2, "parent_idx": 1, "exp_idx": 1, "parent_cycles": 100741837, "result": "ok", "cycles": 99329216, "tokens_in": 5772, "tokens_out": 1073}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 2, "parent_idx": 1, "exp_idx": 2, "parent_cycles": 100741837, "result": "ok", "cycles": 102477951, "tokens_in": 5772, "tokens_out": 2835}
+{"spec": "silu_s8", "baseline_cycles": 97375583, "iter": 2, "parent_idx": 1, "exp_idx": 3, "parent_cycles": 100741837, "result": "ok", "cycles": 100197937, "tokens_in": 5772, "tokens_out": 1064}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 894058, "result": "ok", "cycles": 1932182, "tokens_in": 2998, "tokens_out": 405}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 894058, "result": "ok", "cycles": 1932182, "tokens_in": 2998, "tokens_out": 385}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 894058, "result": "ok", "cycles": 1932182, "tokens_in": 2998, "tokens_out": 381}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 2, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 1932182, "result": "ok", "cycles": 1802902, "tokens_in": 3576, "tokens_out": 392}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 2, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 1932182, "result": "duplicate", "tokens_in": 3576, "tokens_out": 392}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 2, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 1932182, "result": "duplicate", "tokens_in": 3576, "tokens_out": 392}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 2, "parent_idx": 1, "exp_idx": 1, "parent_cycles": 1932182, "result": "duplicate", "tokens_in": 3576, "tokens_out": 392}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 2, "parent_idx": 1, "exp_idx": 2, "parent_cycles": 1932182, "result": "ok", "cycles": 192950, "tokens_in": 3576, "tokens_out": 1246}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 894058, "iter": 2, "parent_idx": 1, "exp_idx": 3, "parent_cycles": 1932182, "result": "ok", "cycles": 261776, "tokens_in": 3576, "tokens_out": 967}
