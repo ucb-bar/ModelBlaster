@@ -1,0 +1,18 @@
+{"spec": "add_s8", "baseline_cycles": 2837882, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 2837882, "result": "verify_fail", "tokens_in": 3818, "tokens_out": 868, "diag": "numerical mismatch on shape={'n': 25600}: max_abs_err=1 max_rel_err=0.167 (atol=0.0001 rtol=0.001)"}
+{"spec": "add_s8", "baseline_cycles": 2837882, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 2837882, "result": "verify_fail", "tokens_in": 3818, "tokens_out": 846, "diag": "numerical mismatch on shape={'n': 25600}: max_abs_err=1 max_rel_err=0.167 (atol=0.0001 rtol=0.001)"}
+{"spec": "batchnorm2d_s8", "baseline_cycles": 49702950, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 49702950, "result": "verify_fail", "tokens_in": 4350, "tokens_out": 921, "diag": "golden mismatch (78)"}
+{"spec": "batchnorm2d_s8", "baseline_cycles": 49702950, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 49702950, "result": "verify_fail", "tokens_in": 4350, "tokens_out": 868, "diag": "golden mismatch (4)"}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7749698, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 7749698, "result": "ok", "cycles": 7718389, "tokens_in": 6210, "tokens_out": 3945}
+{"spec": "cat2_c1_s8", "baseline_cycles": 7749698, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 7749698, "result": "duplicate", "tokens_in": 6210, "tokens_out": 3945}
+{"spec": "cat3_c1_s8", "baseline_cycles": 6044486, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 6044486, "result": "ok", "cycles": 6158822, "tokens_in": 6985, "tokens_out": 5355}
+{"spec": "cat3_c1_s8", "baseline_cycles": 6044486, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 6044486, "result": "duplicate", "tokens_in": 6985, "tokens_out": 5475}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3263682, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 3263682, "result": "ok", "cycles": 3274006, "tokens_in": 5388, "tokens_out": 2586}
+{"spec": "cat4_c1_s8", "baseline_cycles": 3263682, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 3263682, "result": "duplicate", "tokens_in": 5388, "tokens_out": 2586}
+{"spec": "conv2d_s8", "baseline_cycles": 4046755323, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 4046755323, "result": "ok", "cycles": 3623566647, "tokens_in": 10500, "tokens_out": 2236}
+{"spec": "conv2d_s8", "baseline_cycles": 4046755323, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 4046755323, "result": "ok", "cycles": 3080072138, "tokens_in": 10500, "tokens_out": 2536}
+{"spec": "maxpool2d_s8", "baseline_cycles": 2296148, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 2296148, "result": "ok", "cycles": 2181371, "tokens_in": 5787, "tokens_out": 3098}
+{"spec": "maxpool2d_s8", "baseline_cycles": 2296148, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 2296148, "result": "ok", "cycles": 2181371, "tokens_in": 5787, "tokens_out": 3007}
+{"spec": "silu_s8", "baseline_cycles": 99546216, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 99546216, "result": "ok", "cycles": 100417865, "tokens_in": 4546, "tokens_out": 1549}
+{"spec": "silu_s8", "baseline_cycles": 99546216, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 99546216, "result": "duplicate", "tokens_in": 4546, "tokens_out": 1549}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 750718, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 750718, "result": "ok", "cycles": 637110, "tokens_in": 4137, "tokens_out": 1273}
+{"spec": "upsample_nearest_s8", "baseline_cycles": 750718, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 750718, "result": "ok", "cycles": 534742, "tokens_in": 4137, "tokens_out": 1094}
