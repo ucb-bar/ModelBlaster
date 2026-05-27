@@ -1,0 +1,17 @@
+/*
+ * DT overlay for FireSimGemminiAndOPUShuttleConfig.
+ * Our SoC has only 2 Shuttle tiles, but chipyard-riscv64.dtsi declares 8 CPUs.
+ * Disable the non-existent CPUs so Zephyr's SMP boot only tries to wake harts 0-1.
+ * Lesson 1 in docs/dev_blog/2026-05-13-zephyr-on-hetero-shuttle-firesim.md.
+ */
+
+/ {
+	cpus {
+		cpu@2 { status = "disabled"; };
+		cpu@3 { status = "disabled"; };
+		cpu@4 { status = "disabled"; };
+		cpu@5 { status = "disabled"; };
+		cpu@6 { status = "disabled"; };
+		cpu@7 { status = "disabled"; };
+	};
+};
