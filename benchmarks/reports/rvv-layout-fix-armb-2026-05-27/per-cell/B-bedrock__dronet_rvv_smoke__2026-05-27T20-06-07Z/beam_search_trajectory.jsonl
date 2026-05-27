@@ -1,0 +1,12 @@
+{"spec": "conv2d_s8", "baseline_cycles": 24306893, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 24306893, "result": "ok", "cycles": 23654775, "tokens_in": 19554, "tokens_out": 1797}
+{"spec": "conv2d_s8", "baseline_cycles": 24306893, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 24306893, "result": "duplicate", "tokens_in": 19554, "tokens_out": 1812}
+{"spec": "conv2d_s8", "baseline_cycles": 24306893, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 24306893, "result": "duplicate", "tokens_in": 19554, "tokens_out": 1810}
+{"spec": "linear_s8", "baseline_cycles": 3071, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 3071, "result": "ok", "cycles": 2947, "tokens_in": 17205, "tokens_out": 1875}
+{"spec": "linear_s8", "baseline_cycles": 3071, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 3071, "result": "ok", "cycles": 2947, "tokens_in": 17205, "tokens_out": 1871}
+{"spec": "linear_s8", "baseline_cycles": 3071, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 3071, "result": "ok", "cycles": 2941, "tokens_in": 17205, "tokens_out": 1870}
+{"spec": "maxpool2d_s8", "baseline_cycles": 218279, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 218279, "result": "ok", "cycles": 4659604, "tokens_in": 18151, "tokens_out": 521}
+{"spec": "maxpool2d_s8", "baseline_cycles": 218279, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 218279, "result": "ok", "cycles": 233002, "tokens_in": 18151, "tokens_out": 1263}
+{"spec": "maxpool2d_s8", "baseline_cycles": 218279, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 218279, "result": "ok", "cycles": 207138, "tokens_in": 18151, "tokens_out": 1462}
+{"spec": "relu_s8", "baseline_cycles": 3714, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 3714, "result": "ok", "cycles": 3373, "tokens_in": 15725, "tokens_out": 361}
+{"spec": "relu_s8", "baseline_cycles": 3714, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 3714, "result": "duplicate", "tokens_in": 15725, "tokens_out": 361}
+{"spec": "relu_s8", "baseline_cycles": 3714, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 3714, "result": "ok", "cycles": 3366, "tokens_in": 15725, "tokens_out": 341}

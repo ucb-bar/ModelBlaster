@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "arm": "A",
+  "workload_id": "yolov8n_rvv_opu_int8",
+  "run_id": "2026-05-27T02-04-10Z",
+  "git_sha": "fb4f293",
+  "started_at": "2026-05-27T02:04:10.921177+00:00",
+  "ended_at": "2026-05-27T02:09:58.670574+00:00",
+  "wall_clock_s": 347.749,
+  "peak_rss_mb": 136.4,
+  "exit_status": "ok",
+  "model": "yolov8_nano",
+  "target": "rvv_opu",
+  "quant": "int8",
+  "runner": "spike"
+}

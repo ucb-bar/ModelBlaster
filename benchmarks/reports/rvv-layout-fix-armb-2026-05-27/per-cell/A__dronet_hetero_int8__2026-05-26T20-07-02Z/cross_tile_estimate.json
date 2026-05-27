@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "graph_source": "/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/graph.json",
+  "schedule_source": "/scratch2/agustin/ModelBlaster/schedule_fixtures/dronet_hetero_gemmini_opu.json",
+  "total_bytes": 171553,
+  "n_cross_tile_edges": 16,
+  "edges": [
+    {
+      "producer_id": 0,
+      "consumer_id": 1,
+      "tensor": "conv_modules_0",
+      "shape": [
+        1,
+        32,
+        56,
+        56
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 100352
+    },
+    {
+      "producer_id": 3,
+      "consumer_id": 4,
+      "tensor": "relu_modules_0",
+      "shape": [
+        1,
+        32,
+        27,
+        27
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 23328
+    },
+    {
+      "producer_id": 4,
+      "consumer_id": 5,
+      "tensor": "conv_modules_1",
+      "shape": [
+        1,
+        32,
+        14,
+        14
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 6272
+    },
+    {
+      "producer_id": 6,
+      "consumer_id": 7,
+      "tensor": "relu_modules_1",
+      "shape": [
+        1,
+        32,
+        14,
+        14
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 6272
+    },
+    {
+      "producer_id": 7,
+      "consumer_id": 9,
+      "tensor": "conv_modules_2",
+      "shape": [
+        1,
+        32,
+        14,
+        14
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 6272
+    },
+    {
+      "producer_id": 11,
+      "consumer_id": 12,
+      "tensor": "relu_modules_2",
+      "shape": [
+        1,
+        32,
+        14,
+        14
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 6272
+    },
+    {
+      "producer_id": 12,
+      "consumer_id": 13,
+      "tensor": "conv_modules_4",
+      "shape": [
+        1,
+        64,
+        7,
+        7
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 3136
+    },
+    {
+      "producer_id": 14,
+      "consumer_id": 15,
+      "tensor": "relu_modules_3",
+      "shape": [
+        1,
+        64,
+        7,
+        7
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 3136
+    },
+    {
+      "producer_id": 15,
+      "consumer_id": 17,
+      "tensor": "conv_modules_5",
+      "shape": [
+        1,
+        64,
+        7,
+        7
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 3136
+    },
+    {
+      "producer_id": 19,
+      "consumer_id": 20,
+      "tensor": "relu_modules_4",
+      "shape": [
+        1,
+        64,
+        7,
+        7
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 3136
+    },
+    {
+      "producer_id": 20,
+      "consumer_id": 21,
+      "tensor": "conv_modules_7",
+      "shape": [
+        1,
+        128,
+        4,
+        4
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 2048
+    },
+    {
+      "producer_id": 22,
+      "consumer_id": 23,
+      "tensor": "relu_modules_5",
+      "shape": [
+        1,
+        128,
+        4,
+        4
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 2048
+    },
+    {
+      "producer_id": 23,
+      "consumer_id": 25,
+      "tensor": "conv_modules_8",
+      "shape": [
+        1,
+        128,
+        4,
+        4
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 2048
+    },
+    {
+      "producer_id": 26,
+      "consumer_id": 27,
+      "tensor": "relu_modules_6",
+      "shape": [
+        1,
+        2048
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 2048
+    },
+    {
+      "producer_id": 26,
+      "consumer_id": 28,
+      "tensor": "relu_modules_6",
+      "shape": [
+        1,
+        2048
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_E#0",
+      "consumer_tile": "CPU_P#0",
+      "bytes": 2048
+    },
+    {
+      "producer_id": 28,
+      "consumer_id": 29,
+      "tensor": "linear2",
+      "shape": [
+        1,
+        1
+      ],
+      "dtype": "i8",
+      "producer_tile": "CPU_P#0",
+      "consumer_tile": "CPU_E#0",
+      "bytes": 1
+    }
+  ],
+  "unknown_dtypes": []
+}
