@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "target": "rvv_opu",
+  "picks": {
+    "add_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "batchnorm2d_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "cat2_c1_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "cat3_c1_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "cat4_c1_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "conv2d_s8": {
+      "source": "llm",
+      "algorithm": "indir_gemm",
+      "path": null
+    },
+    "maxpool2d_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "silu_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "upsample_nearest_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    }
+  }
+}

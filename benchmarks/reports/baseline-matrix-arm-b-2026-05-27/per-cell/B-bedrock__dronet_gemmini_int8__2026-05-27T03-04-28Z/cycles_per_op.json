@@ -1,0 +1,312 @@
+{
+  "schema_version": 2,
+  "total_cycles": 14669038,
+  "n_ops": 30,
+  "mean_cycles_per_dispatch": 488967.93333333335,
+  "stddev_cycles_per_dispatch": 1135042.6109497913,
+  "by_op_kind": {
+    "conv2d_s8": {
+      "count": 10,
+      "total": 5915621,
+      "min": 48948,
+      "max": 3878259,
+      "mean": 591562.1,
+      "share": 0.40327259360838796,
+      "median": 185562.0,
+      "p50": 185562.0,
+      "p90": 844609.1999999988,
+      "p95": 2361434.0999999964,
+      "stddev": 1166330.8705335006
+    },
+    "maxpool2d_s8": {
+      "count": 1,
+      "total": 5146005,
+      "min": 5146005,
+      "max": 5146005,
+      "mean": 5146005.0,
+      "share": 0.3508072581174035,
+      "median": 5146005.0,
+      "p50": 5146005.0,
+      "p90": 5146005.0,
+      "p95": 5146005.0,
+      "stddev": 0.0
+    },
+    "batchnorm2d_s8": {
+      "count": 6,
+      "total": 2540435,
+      "min": 121877,
+      "max": 1332368,
+      "mean": 423405.8333333333,
+      "share": 0.1731834766533429,
+      "median": 271378.0,
+      "p50": 271378.0,
+      "p90": 846638.5,
+      "p95": 1089503.25,
+      "stddev": 456301.19337666285
+    },
+    "relu_s8": {
+      "count": 7,
+      "total": 571054,
+      "min": 25925,
+      "max": 280289,
+      "mean": 81579.14285714286,
+      "share": 0.038929205855216954,
+      "median": 39844.0,
+      "p50": 39844.0,
+      "p90": 159987.80000000008,
+      "p95": 220138.39999999988,
+      "stddev": 90465.54635039902
+    },
+    "add_s8": {
+      "count": 3,
+      "total": 490603,
+      "min": 87872,
+      "max": 268579,
+      "mean": 163534.33333333334,
+      "share": 0.03344479712984587,
+      "median": 134152.0,
+      "p50": 134152.0,
+      "p90": 241693.6,
+      "p95": 255136.3,
+      "stddev": 93868.2379526394
+    },
+    "linear_s8": {
+      "count": 2,
+      "total": 5169,
+      "min": 2584,
+      "max": 2585,
+      "mean": 2584.5,
+      "share": 0.0003523748455761039,
+      "median": 2584.5,
+      "p50": 2584.5,
+      "p90": 2584.9,
+      "p95": 2584.9500000000003,
+      "stddev": 0.7071067811865476
+    },
+    "sigmoid_s8": {
+      "count": 1,
+      "total": 151,
+      "min": 151,
+      "max": 151,
+      "mean": 151.0,
+      "share": 1.0293790226734705e-05,
+      "median": 151.0,
+      "p50": 151.0,
+      "p90": 151.0,
+      "p95": 151.0,
+      "stddev": 0.0
+    }
+  },
+  "by_dispatch": [
+    {
+      "dispatch_id": 0,
+      "op": "conv2d_s8",
+      "name": "conv_modules.0",
+      "shape": "N=1;IC=3;IH=112;IW=112;OC=32;OH=56;OW=56;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 3878259
+    },
+    {
+      "dispatch_id": 1,
+      "op": "maxpool2d_s8",
+      "name": "maxpool1",
+      "shape": "N=1;C=32;IH=56;IW=56;OH=27;OW=27;KH=3;KW=3;SH=2;SW=2;PH=0;PW=0;DH=1;DW=1",
+      "cycles": 5146005
+    },
+    {
+      "dispatch_id": 2,
+      "op": "batchnorm2d_s8",
+      "name": "bn_modules.0",
+      "shape": "N=1;C=32;H=27;W=27",
+      "cycles": 1332368
+    },
+    {
+      "dispatch_id": 3,
+      "op": "relu_s8",
+      "name": "relu_modules.0",
+      "shape": "n=23328",
+      "cycles": 280289
+    },
+    {
+      "dispatch_id": 4,
+      "op": "conv2d_s8",
+      "name": "conv_modules.1",
+      "shape": "N=1;IC=32;IH=27;IW=27;OC=32;OH=14;OW=14;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 507537
+    },
+    {
+      "dispatch_id": 5,
+      "op": "batchnorm2d_s8",
+      "name": "bn_modules.1",
+      "shape": "N=1;C=32;H=14;W=14",
+      "cycles": 360909
+    },
+    {
+      "dispatch_id": 6,
+      "op": "relu_s8",
+      "name": "relu_modules.1",
+      "shape": "n=6272",
+      "cycles": 79787
+    },
+    {
+      "dispatch_id": 7,
+      "op": "conv2d_s8",
+      "name": "conv_modules.2",
+      "shape": "N=1;IC=32;IH=14;IW=14;OC=32;OH=14;OW=14;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1",
+      "cycles": 507536
+    },
+    {
+      "dispatch_id": 8,
+      "op": "conv2d_s8",
+      "name": "conv_modules.3",
+      "shape": "N=1;IC=32;IH=27;IW=27;OC=32;OH=14;OW=14;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0",
+      "cycles": 191568
+    },
+    {
+      "dispatch_id": 9,
+      "op": "add_s8",
+      "name": "add",
+      "shape": "n=6272",
+      "cycles": 268579
+    },
+    {
+      "dispatch_id": 10,
+      "op": "batchnorm2d_s8",
+      "name": "bn_modules.2",
+      "shape": "N=1;C=32;H=14;W=14",
+      "cycles": 360169
+    },
+    {
+      "dispatch_id": 11,
+      "op": "relu_s8",
+      "name": "relu_modules.2",
+      "shape": "n=6272",
+      "cycles": 78806
+    },
+    {
+      "dispatch_id": 12,
+      "op": "conv2d_s8",
+      "name": "conv_modules.4",
+      "shape": "N=1;IC=32;IH=14;IW=14;OC=64;OH=7;OW=7;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 179556
+    },
+    {
+      "dispatch_id": 13,
+      "op": "batchnorm2d_s8",
+      "name": "bn_modules.3",
+      "shape": "N=1;C=64;H=7;W=7",
+      "cycles": 182587
+    },
+    {
+      "dispatch_id": 14,
+      "op": "relu_s8",
+      "name": "relu_modules.3",
+      "shape": "n=3136",
+      "cycles": 39844
+    },
+    {
+      "dispatch_id": 15,
+      "op": "conv2d_s8",
+      "name": "conv_modules.5",
+      "shape": "N=1;IC=64;IH=7;IW=7;OC=64;OH=7;OW=7;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1",
+      "cycles": 279450
+    },
+    {
+      "dispatch_id": 16,
+      "op": "conv2d_s8",
+      "name": "conv_modules.6",
+      "shape": "N=1;IC=32;IH=14;IW=14;OC=64;OH=7;OW=7;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0",
+      "cycles": 82148
+    },
+    {
+      "dispatch_id": 17,
+      "op": "add_s8",
+      "name": "add_1",
+      "shape": "n=3136",
+      "cycles": 134152
+    },
+    {
+      "dispatch_id": 18,
+      "op": "batchnorm2d_s8",
+      "name": "bn_modules.4",
+      "shape": "N=1;C=64;H=7;W=7",
+      "cycles": 182525
+    },
+    {
+      "dispatch_id": 19,
+      "op": "relu_s8",
+      "name": "relu_modules.4",
+      "shape": "n=3136",
+      "cycles": 39819
+    },
+    {
+      "dispatch_id": 20,
+      "op": "conv2d_s8",
+      "name": "conv_modules.7",
+      "shape": "N=1;IC=64;IH=7;IW=7;OC=128;OH=4;OW=4;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 95783
+    },
+    {
+      "dispatch_id": 21,
+      "op": "batchnorm2d_s8",
+      "name": "bn_modules.5",
+      "shape": "N=1;C=128;H=4;W=4",
+      "cycles": 121877
+    },
+    {
+      "dispatch_id": 22,
+      "op": "relu_s8",
+      "name": "relu_modules.5",
+      "shape": "n=2048",
+      "cycles": 25925
+    },
+    {
+      "dispatch_id": 23,
+      "op": "conv2d_s8",
+      "name": "conv_modules.8",
+      "shape": "N=1;IC=128;IH=4;IW=4;OC=128;OH=4;OW=4;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1",
+      "cycles": 144836
+    },
+    {
+      "dispatch_id": 24,
+      "op": "conv2d_s8",
+      "name": "conv_modules.9",
+      "shape": "N=1;IC=64;IH=7;IW=7;OC=128;OH=4;OW=4;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0",
+      "cycles": 48948
+    },
+    {
+      "dispatch_id": 25,
+      "op": "add_s8",
+      "name": "add_2",
+      "shape": "n=2048",
+      "cycles": 87872
+    },
+    {
+      "dispatch_id": 26,
+      "op": "relu_s8",
+      "name": "relu_modules.6",
+      "shape": "n=2048",
+      "cycles": 26584
+    },
+    {
+      "dispatch_id": 27,
+      "op": "linear_s8",
+      "name": "linear1",
+      "shape": "M=1;K=2048;N=1",
+      "cycles": 2584
+    },
+    {
+      "dispatch_id": 28,
+      "op": "linear_s8",
+      "name": "linear2",
+      "shape": "M=1;K=2048;N=1",
+      "cycles": 2585
+    },
+    {
+      "dispatch_id": 29,
+      "op": "sigmoid_s8",
+      "name": "sigmoid1",
+      "shape": "n=1",
+      "cycles": 151
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "arm": "B-bedrock",
+  "workload_id": "dronet_gemmini_q31_int8",
+  "run_id": "2026-05-26T22-28-14Z",
+  "git_sha": "c0750c0",
+  "started_at": "2026-05-26T22:28:14.529788+00:00",
+  "ended_at": "2026-05-26T22:29:17.914384+00:00",
+  "wall_clock_s": 63.385,
+  "peak_rss_mb": 99.8,
+  "exit_status": "exit_1",
+  "model": "dronet",
+  "target": "gemmini_q31",
+  "quant": "int8",
+  "runner": "spike",
+  "beam": 2,
+  "expansions": 3,
+  "iterations": 2,
+  "firesim_eval": false,
+  "llm_provider": "bedrock",
+  "max_usd": 5.0
+}
