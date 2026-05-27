@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "extractor": "extract_graph",
+  "n_fx_nodes": 230,
+  "n_ir_ops": 212,
+  "passes": {
+    "linear_relu_fuse": {
+      "fired": 0,
+      "sites": []
+    },
+    "conv2d_relu_fuse": {
+      "fired": 0,
+      "sites": []
+    },
+    "add_relu_fuse": {
+      "fired": 0,
+      "sites": []
+    }
+  }
+}
