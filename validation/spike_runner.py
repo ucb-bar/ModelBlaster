@@ -186,7 +186,7 @@ def main() -> int:
 
     backend_tag = args.profile_backend or _detect_backend(args.spike_arg)
     repo_root = args.repo_root or os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..")
+        os.path.join(os.path.dirname(__file__), "..")
     )
     iree_args = IREEProfileArgs(
         profile_out_root=args.profile_out_root,
