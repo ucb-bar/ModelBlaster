@@ -1414,8 +1414,32 @@ def generate(
         log(f"optimize: firesim re-rank ENABLED "
             f"(top_k={firesim_top_k}, build_dir={firesim_build_dir})")
 
+    # Ops where the curated/baseline kernel on a given backend is already
+    # at the algorithmic floor (or close to it) AND the LLM has empirically
+    # struggled to write a correct alternative. Skipping them in the
+    # optimize loop keeps the curated kernel as-is and avoids burning
+    # LLM budget + tripping verify on something we can't beat anyway.
+    # Format: target -> set of op names. Maintained next to the cell
+    # capture data that motivated each entry; see baseline-dronet-arm-b-
+    # matrix-2026-05-26 / methodology.md for the gemmini maxpool case.
+    OPTIMIZE_SKIP_PER_TARGET: dict[str, set[str]] = {
+        # Gemmini doesn't accelerate maxpool natively (the curated path
+        # routes through tiled_conv_dw_auto with weights=+1 and the
+        # mvout pool unit); LLM attempts to rewrite trip verify with
+        # rounding / OOB-handling drift. Reference + curated suffice.
+        "gemmini":     {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
+                        "add_s8", "sigmoid_s8"},
+        "gemmini_q31": {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
+                        "add_s8", "sigmoid_s8"},
+    }
+    _skip = OPTIMIZE_SKIP_PER_TARGET.get(target, set())
+
     optimize_summary: dict[str, dict] = {}
     for spec in specs:
+        if spec.op in _skip:
+            log(f"  [{spec.op}] target={target} -> "
+                f"optimize-skip (curated/reference is best known)")
+            continue
         baseline_op = baseline_cycles_by_op.get(spec.op, 0)
         if baseline_op <= 0:
             log(f"  [{spec.op}] no baseline cycles, skipping")
