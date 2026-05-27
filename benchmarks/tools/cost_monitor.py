@@ -359,12 +359,14 @@ def _ingest(rec: dict, path: Path, state: WatcherState,
         cell=derive_cell_label(path),
         phase=phase,
     ))
-    # Fire the blaster mascot when we encounter a new kernel.
-    # _BLASTER_ANIM_FRAMES is the number of redraw frames the shot
-    # animation persists before settling back to idle.
+    # Fire the blaster mascot on every new LLM call (but don't restart
+    # an already-running shot animation so overlapping calls look like
+    # rapid fire instead of a single jittery frame). seen_kernels stays
+    # populated for the "first-time-seen" highlight elsewhere if needed.
     kernel = _kernel_from_phase(phase)
-    if kernel is not None and kernel not in state.seen_kernels:
+    if kernel is not None:
         state.seen_kernels.add(kernel)
+    if state.blaster_anim_frame == 0:
         state.blaster_anim_frame = _BLASTER_ANIM_FRAMES
 
 
@@ -648,7 +650,7 @@ def render_splash(console: Console) -> None:
 # "shot" without needing complex sprite work. The projectile chars
 # add the pew-pew across the rest of the line.
 
-_BLASTER_ANIM_FRAMES = 8  # at 4 Hz: 2 seconds total
+_BLASTER_ANIM_FRAMES = 12  # at 20 Hz: ~0.6s per shot (snappy, visible)
 
 
 # Sci-fi blaster ASCII -- riff on the classic "hjw" revolver silhouette
@@ -2540,8 +2542,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # live (default)
     live = sub.add_parser("live", help="live TUI (default)")
     _add_common_args(live)
-    live.add_argument("--refresh-hz", type=float, default=4.0,
-                      help="redraw rate (default: 4)")
+    live.add_argument("--refresh-hz", type=float, default=20.0,
+                      help="redraw rate Hz (default: 20). At 20 Hz the "
+                           "main loop sleeps 50ms per cycle, which is "
+                           "also the keystroke-to-effect latency. Drop "
+                           "to 4 for low-bandwidth ssh sessions or when "
+                           "another live TUI is sharing the terminal.")
     live.add_argument("--max-recent", type=int, default=15,
                       help="recent calls visible (default: 15)")
     live.add_argument("--budget-usd", type=float, default=None,
