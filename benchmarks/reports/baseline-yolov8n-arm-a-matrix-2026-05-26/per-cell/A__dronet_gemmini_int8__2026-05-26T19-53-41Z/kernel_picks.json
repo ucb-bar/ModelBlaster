@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "target": "gemmini",
+  "picks": {
+    "add_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "batchnorm2d_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "conv2d_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "linear_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "maxpool2d_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "relu_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "sigmoid_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    }
+  }
+}

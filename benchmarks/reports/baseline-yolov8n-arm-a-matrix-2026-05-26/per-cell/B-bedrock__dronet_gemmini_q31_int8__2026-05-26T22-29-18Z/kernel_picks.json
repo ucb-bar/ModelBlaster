@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "target": "gemmini_q31",
+  "picks": {
+    "add_s8": {
+      "source": "llm",
+      "algorithm": "gemmini_resadd",
+      "path": null
+    },
+    "batchnorm2d_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "conv2d_s8": {
+      "source": "llm",
+      "algorithm": "gemmini_tiled_conv",
+      "path": null
+    },
+    "linear_s8": {
+      "source": "llm",
+      "algorithm": "gemmini_tiled_matmul",
+      "path": null
+    },
+    "maxpool2d_s8": {
+      "source": "llm",
+      "algorithm": "gemmini_tiled_conv_pool",
+      "path": null
+    },
+    "relu_s8": {
+      "source": "llm",
+      "algorithm": "gemmini_resadd_relu",
+      "path": null
+    },
+    "sigmoid_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    }
+  }
+}
