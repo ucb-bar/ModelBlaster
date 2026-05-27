@@ -1,0 +1,12 @@
+{"spec": "conv2d_s8", "baseline_cycles": 9875013, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 9875013, "result": "verify_fail", "tokens_in": 8244, "tokens_out": 2393, "diag": "golden mismatch (8)"}
+{"spec": "conv2d_s8", "baseline_cycles": 9875013, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 9875013, "result": "ok", "cycles": 7229552, "tokens_in": 8244, "tokens_out": 3484}
+{"spec": "conv2d_s8", "baseline_cycles": 9875013, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 9875013, "result": "ok", "cycles": 5915621, "tokens_in": 8244, "tokens_out": 3424}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 1, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 5169, "result": "ok", "cycles": 5207, "tokens_in": 4334, "tokens_out": 2104}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 1, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 5169, "result": "ok", "cycles": 5207, "tokens_in": 4334, "tokens_out": 2098}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 1, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 5169, "result": "ok", "cycles": 5207, "tokens_in": 4334, "tokens_out": 2164}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 2, "parent_idx": 0, "exp_idx": 1, "parent_cycles": 5207, "result": "ok", "cycles": 5223, "tokens_in": 7416, "tokens_out": 2773}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 2, "parent_idx": 0, "exp_idx": 2, "parent_cycles": 5207, "result": "duplicate", "tokens_in": 7416, "tokens_out": 2773}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 2, "parent_idx": 0, "exp_idx": 3, "parent_cycles": 5207, "result": "ok", "cycles": 5213, "tokens_in": 7416, "tokens_out": 2964}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 2, "parent_idx": 1, "exp_idx": 1, "parent_cycles": 5207, "result": "ok", "cycles": 5213, "tokens_in": 7416, "tokens_out": 3081}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 2, "parent_idx": 1, "exp_idx": 2, "parent_cycles": 5207, "result": "ok", "cycles": 5223, "tokens_in": 7416, "tokens_out": 2803}
+{"spec": "linear_s8", "baseline_cycles": 5169, "iter": 2, "parent_idx": 1, "exp_idx": 3, "parent_cycles": 5207, "result": "ok", "cycles": 5195, "tokens_in": 7416, "tokens_out": 2153}

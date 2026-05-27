@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "provider": "bedrock",
+  "tokens_input_cached": 0,
+  "tokens_input_uncached": 90810,
+  "tokens_output": 35031,
+  "n_calls": 12,
+  "by_model": {
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+      "input_cached": 0,
+      "input_uncached": 90810,
+      "output": 35031,
+      "calls": 12
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "target": "rvv",
+  "picks": {
+    "add_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "batchnorm2d_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "conv2d_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "linear_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "maxpool2d_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "relu_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    },
+    "sigmoid_s8": {
+      "source": "llm",
+      "algorithm": "direct",
+      "path": null
+    }
+  }
+}

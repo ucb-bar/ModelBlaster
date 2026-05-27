@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "arm": "B-bedrock",
+  "workload_id": "dronet_scalar_smoke",
+  "run_id": "2026-05-26T18-25-32Z",
+  "git_sha": "265851b",
+  "started_at": "2026-05-26T18:25:32.889574+00:00",
+  "ended_at": "2026-05-26T18:40:38.938245+00:00",
+  "wall_clock_s": 906.049,
+  "peak_rss_mb": 99.5,
+  "exit_status": "ok",
+  "model": "dronet",
+  "target": "scalar",
+  "quant": "int8",
+  "runner": "spike",
+  "beam": 2,
+  "expansions": 3,
+  "iterations": 2,
+  "firesim_eval": false,
+  "llm_provider": "bedrock",
+  "max_usd": 5.0
+}
