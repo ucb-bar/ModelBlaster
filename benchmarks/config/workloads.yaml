@@ -55,8 +55,9 @@ workloads:
   # firesim for authoritative cycles on accelerator targets.
   - { id: yolov8_nano_scalar_smoke, model: yolov8_nano, target: scalar, quant: int8, runner: spike, tags: [smoke] }
   - { id: yolov8_nano_rvv_smoke,    model: yolov8_nano, target: rvv,    quant: int8, runner: spike, tags: [smoke] }
-  - { id: yolov8n_rvv_opu_fp16,   model: yolov8_nano, target: rvv_opu,            quant: fp16, runner: firesim }
-  - { id: yolov8n_gemmini_q31_int8, model: yolov8_nano, target: gemmini_q31,      quant: int8, runner: firesim }
+  - { id: yolov8n_rvv_opu_int8,     model: yolov8_nano, target: rvv_opu,            quant: int8, runner: firesim }
+  - { id: yolov8n_gemmini_int8,     model: yolov8_nano, target: gemmini,            quant: int8, runner: firesim }
+  - { id: yolov8n_gemmini_q31_int8, model: yolov8_nano, target: gemmini_q31,        quant: int8, runner: firesim }
   - id: yolov8n_hetero_int8
     model: yolov8_nano
     target: hetero_gemmini_opu
