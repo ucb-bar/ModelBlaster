@@ -257,36 +257,62 @@ def _firesim_run_async(firesim_env: str, firesim_root: str,
                        log_path: str) -> subprocess.Popen:
     """Spawn `firesim runworkload` and return the Popen handle. We do
     NOT wait on it from this side; the run is treated as done when the
-    expected OUTPUT_END markers appear in the uartlog. firesim's own
-    stdout/stderr go to `log_path` so we can diagnose silent failures
-    (e.g. screen session not starting). The actual UART output lives
-    in firesim_rundir/sim_slot_0/uartlog regardless.
+    expected OUTPUT_END markers appear in the uartlog.
 
-    When FIRESIM_QUEUE=1 (and the queue binary at FIRESIM_QUEUE_BIN
-    exists) the runworkload command is wrapped by `firesim-queue
-    submit --background`. The queue daemon serializes FPGA access
-    across users (currently us + merlin), so concurrent runs don't
-    clobber each other's bitstream / xdma state. The daemon spawns
-    the wrapped `firesim runworkload` inside its own process tree;
-    our uartlog watcher + firesim kill still work identically because
-    firesim kill pgrep's its target by process name, and the uartlog
-    path is unchanged.
+    When FIRESIM_QUEUE=1 the WHOLE FPGA-touching block
+    (infrasetup + runworkload + kill) is submitted as ONE queue job.
+    This matches merlin's pattern and gives each ModelBlaster cell
+    full visibility in `firesim-queue status` for the entire duration
+    of FPGA usage, not just the short runworkload window. The caller
+    must skip its own _firesim_infrasetup() / _firesim_kill() when
+    the queue is being used (see run_firesim()).
+
+    Default (no queue): just runworkload, infrasetup + kill happen as
+    separate direct subprocess.run calls in the caller.
     """
     log_f = open(log_path, "w")
-    runworkload_cmd = _firesim_cmd(firesim_env, firesim_root, "runworkload")
     if _use_firesim_queue():
         priority = os.environ.get("FIRESIM_QUEUE_PRIORITY", "5")
+        # Single bash block does the whole FPGA dance. Mirrors merlin's
+        # firesim_shuttle/run_hetero.sh structure.
+        inner = (
+            f"set -e; "
+            # Drop any inherited active conda env so chipyard's activate
+            # starts from a clean conda state.
+            f"unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER "
+            f"      CONDA_PYTHON_EXE CONDA_SHLVL CONDA_EXE _CE_M _CE_CONDA; "
+            f"export PATH=/scratch2/agustin/miniforge3/condabin:$PATH; "
+            f"source {firesim_env}; "
+            f"cd {firesim_root}; "
+            f"source ./sourceme-manager.sh --skip-ssh-setup; "
+            f"cd {firesim_root}/deploy; "
+            # Proper FPGA cycle: leading kill (cleans any prior sim's
+            # half-configured xdma / screen sessions) -> infrasetup
+            # (reflash / re-rsync staged binary) -> runworkload (boots
+            # the bitstream + the staged elf) -> trailing kill (release).
+            # Both kills are best-effort (exit 0 even when nothing to
+            # kill). rc is preserved from runworkload across the
+            # trailing kill so the queue records the right exit code.
+            f"firesim kill >/dev/null 2>&1 || true; "
+            f"firesim infrasetup; "
+            f"rc=0; firesim runworkload || rc=$?; "
+            f"firesim kill >/dev/null 2>&1 || true; "
+            f"exit $rc"
+        )
         argv = [
             FIRESIM_QUEUE_BIN, "submit",
             "--priority", str(priority),
-            "--cwd", firesim_root,
+            "--cwd", os.path.join(firesim_root, "deploy"),
             "--project", "modelblaster",
             "--background",
             "--",
-        ] + runworkload_cmd
+            "bash", "-c", inner,
+        ]
         return subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT)
+    # No-queue path: just runworkload (caller does infrasetup + kill).
     return subprocess.Popen(
-        runworkload_cmd, stdout=log_f, stderr=subprocess.STDOUT,
+        _firesim_cmd(firesim_env, firesim_root, "runworkload"),
+        stdout=log_f, stderr=subprocess.STDOUT,
     )
 
 
@@ -329,24 +355,33 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             f"FIRESIM_ROOT not found at {firesim_root}; "
             f"set FIRESIM_ROOT or pass --firesim-root"
         )
-    if kill_first:
-        if verbose:
-            print(f"firesim: kill any prior sim", flush=True)
-        _firesim_kill(firesim_env, firesim_root)
-    # firesim kill causes the xdma kernel module to re-probe, which resets
-    # /dev/xdma* permissions back to root:root 0600. Fix up before runworkload.
-    subprocess.run(["sudo", "chmod", "666"] + [
-        f"/dev/{n}" for n in os.listdir("/dev") if n.startswith("xdma")
-    ], check=False)
-    # Re-run infrasetup so XDMA / FPGA state is freshly configured.  Without
-    # this, runworkload can pick up half-configured XDMA from a previous
-    # aborted sim and crash mid-run with a bus error that's not a Zephyr bug.
-    if os.environ.get("FIRESIM_SKIP_INFRASETUP", "0") != "1":
-        _firesim_infrasetup(firesim_env, firesim_root, verbose=verbose)
+    # Stage the elf BEFORE any firesim invocation. infrasetup reads
+    # from deploy/workloads/<workload>/<bootbinary> when it runs (whether
+    # via direct call or via the queue submission).
     if stage_elf:
         if verbose:
             print(f"firesim: stage {elf} -> {paths['elf_target']}", flush=True)
         _stage_elf(elf, paths)
+    # When FIRESIM_QUEUE=1, the queue submission below does the WHOLE
+    # FPGA block (infrasetup + runworkload + kill) as one job. Skip the
+    # direct kill/infrasetup calls -- they'd race against the queued
+    # block, and the kill would knock over whoever's currently running.
+    # When not using the queue, do them inline as before.
+    if not _use_firesim_queue():
+        if kill_first:
+            if verbose:
+                print(f"firesim: kill any prior sim", flush=True)
+            _firesim_kill(firesim_env, firesim_root)
+        # firesim kill causes the xdma kernel module to re-probe, which resets
+        # /dev/xdma* permissions back to root:root 0600. Fix up before runworkload.
+        subprocess.run(["sudo", "chmod", "666"] + [
+            f"/dev/{n}" for n in os.listdir("/dev") if n.startswith("xdma")
+        ], check=False)
+        # Re-run infrasetup so XDMA / FPGA state is freshly configured.  Without
+        # this, runworkload can pick up half-configured XDMA from a previous
+        # aborted sim and crash mid-run with a bus error that's not a Zephyr bug.
+        if os.environ.get("FIRESIM_SKIP_INFRASETUP", "0") != "1":
+            _firesim_infrasetup(firesim_env, firesim_root, verbose=verbose)
     _truncate_uartlog(paths)
     expected_ends = _expected_end_count(models, pool_sizes)
     if verbose:
@@ -466,7 +501,12 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                       flush=True)
             time.sleep(poll_interval)
     finally:
-        _firesim_kill(firesim_env, firesim_root)
+        # When using the queue, the queued bash block already does the
+        # trailing kill itself -- calling it again from here would race
+        # with whoever's NEXT in the queue (we'd kill THEIR runworkload).
+        # The proc.wait below still cleans up our local Popen handle.
+        if not _use_firesim_queue():
+            _firesim_kill(firesim_env, firesim_root)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
