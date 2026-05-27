@@ -66,6 +66,16 @@ fi
 _MB_FIRESIM_DIR="/scratch2/agustin/chipyard/sims/firesim"
 _MB_FIRESIM_SSH_KEY="${HOME}/.ssh/firesim"
 
+# Point validation/firesim_runner.py at OUR install (agustin's) -- the
+# bitstream there is alveo_u250_firesim_shuttle_gemmini_opu (the
+# GemminiAndOPUShuttleConfig hetero, tile 0 Gemmini RoCC + tile 1 Saturn
+# OPU). dima's install has dual-rocket-saturn-gemmini-q31 but the logs
+# dir under that tree is not writable by us, so firesim CLI invocations
+# from this user can't complete there. Override via FIRESIM_ROOT /
+# FIRESIM_ENV if pointing at a different chipyard install.
+export FIRESIM_ROOT="${FIRESIM_ROOT:-${_MB_FIRESIM_DIR}}"
+export FIRESIM_ENV="${FIRESIM_ENV:-/scratch2/agustin/chipyard/env.sh}"
+
 if [ -f "${_MB_FIRESIM_DIR}/sourceme-manager.sh" ]; then
     # sourceme-manager appends ${dir}/deploy to PATH so the `firesim`
     # CLI becomes available. It also expects to be sourced FROM the

@@ -51,16 +51,50 @@ DEFAULT_FIRESIM_ENV = os.environ.get(
     "FIRESIM_ENV", "/scratch2/dima/chipyard-fsim/env.sh")
 DEFAULT_FIRESIM_SLOT = os.environ.get(
     "FIRESIM_SLOT", "firesim_rundir/sim_slot_0")
-DEFAULT_FIRESIM_BINARY_BASENAME = "zephyr0-zephyr.elf"
+# FireSim's runworkload stages the workload's `common_bootbinary` into
+# the sim_slot prefixed with `<workload_name><N>-`, where N is the
+# node index (0 for single-node sims). The TSI bridge in the
+# simulator binary then looks for the prefixed name in its cwd
+# (sim_slot dir). Our staged workload is `modelblaster-firesim.json`
+# with `common_bootbinary: zephyr0-zephyr.elf`; the runtime expects
+# `modelblaster-firesim0-zephyr0-zephyr.elf` to land in sim_slot_0.
+DEFAULT_FIRESIM_WORKLOAD_NAME = os.environ.get(
+    "FIRESIM_WORKLOAD_NAME", "modelblaster-firesim")
+DEFAULT_FIRESIM_BOOTBINARY = "zephyr0-zephyr.elf"
+DEFAULT_FIRESIM_BINARY_BASENAME = (
+    f"{DEFAULT_FIRESIM_WORKLOAD_NAME}0-{DEFAULT_FIRESIM_BOOTBINARY}")
 
 
 def _firesim_paths(root: str, slot: str) -> dict:
+    """Return all paths the runner cares about.
+
+    `root` is the firesim install root (e.g.
+    `/scratch2/agustin/chipyard/sims/firesim`). `slot` is the legacy
+    `firesim_rundir/sim_slot_0` path -- still tracked because
+    `_truncate_uartlog` / `_agents_runworkload.log` land there, but
+    the simulator's actual runtime cwd is configured via
+    `config_runtime.yaml::run_farm::run_farm_hosts::run_dir`
+    (typically `/scratch2/<user>/FIRESIM_RUNS_DIR/sim_slot_0/rsyncdir`)
+    so the workload's bootbinary must live in the canonical
+    deploy/workloads/<workload>/<bootbinary> location -- infrasetup
+    rsyncs from there to the runtime cwd at simulation start.
+    """
     sim_slot = os.path.join(root, slot)
     return {
         "root": root,
         "sim_slot": sim_slot,
         "uartlog": os.path.join(sim_slot, "uartlog"),
+        # Where the simulator's TSI loader looks at runtime (rsync'd by
+        # infrasetup; we don't write directly here -- preserved for
+        # backwards-compat / log location).
         "elf_target": os.path.join(sim_slot, DEFAULT_FIRESIM_BINARY_BASENAME),
+        # The canonical source path infrasetup reads. WRITE OUR ELF
+        # HERE. `root` already ends in `sims/firesim`, so deploy is
+        # just `root/deploy/workloads/<workload>/<bootbinary>`.
+        "workload_bootbinary": os.path.join(
+            root, "deploy", "workloads",
+            DEFAULT_FIRESIM_WORKLOAD_NAME,
+            DEFAULT_FIRESIM_BOOTBINARY),
     }
 
 
@@ -95,16 +129,30 @@ def _firesim_cmd(firesim_env: str, firesim_root: str, sub_cmd: str) -> list[str]
 
 
 def _stage_elf(elf: str, paths: dict) -> None:
-    """Copy the built elf over the staged binary in the sim slot.
-    `firesim infrasetup` does this from deploy/workloads/zephyr/
-    zephyr.elf, but a cp lets us skip the slow re-flash when only the
-    binary changed."""
+    """Copy the built elf over BOTH staging locations FireSim uses:
+
+    - ``deploy/workloads/<workload>/<bootbinary>`` is what
+      ``firesim infrasetup`` reads when populating the run-farm node's
+      filesystem (the "canonical" source path).
+    - ``firesim_rundir/<slot>/<workload><N>-<bootbinary>`` is what the
+      TSI loader inside the simulator binary opens at boot. Without
+      this, infrasetup re-creates the prefixed file from the canonical
+      source -- a no-op when the source hasn't changed -- so a direct
+      cp lets us skip slow re-flashes on iteration.
+    """
     if not os.path.isfile(elf):
         raise FileNotFoundError(f"--elf {elf} not found")
+    # Sim-slot path (TSI loader's view).
     target = paths["elf_target"]
     os.makedirs(paths["sim_slot"], exist_ok=True)
     shutil.copyfile(elf, target)
     os.chmod(target, 0o755)
+    # Workload-bundle path (infrasetup's source-of-truth).
+    workload_dest = paths.get("workload_bootbinary")
+    if workload_dest:
+        os.makedirs(os.path.dirname(workload_dest), exist_ok=True)
+        shutil.copyfile(elf, workload_dest)
+        os.chmod(workload_dest, 0o755)
 
 
 def _truncate_uartlog(paths: dict) -> None:

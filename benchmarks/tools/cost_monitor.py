@@ -1520,10 +1520,24 @@ class _StdinReader:
                               self._old_attrs)
 
     def _read_with_timeout(self, timeout: float) -> Optional[str]:
+        # os.read bypasses Python's TextIOWrapper line-buffering. sys.stdin.read(1)
+        # was waiting on Python's io layer to fill its internal buffer even AFTER
+        # the TTY had bytes ready -- so held arrows / fast typing produced bursts
+        # that visibly dropped between renders. os.read(fd, 1) returns immediately
+        # when a single byte is in the kernel TTY buffer (which cbreak guarantees).
         r, _, _ = select.select([sys.stdin], [], [], timeout)
         if not r:
             return None
-        return sys.stdin.read(1)
+        try:
+            data = os.read(sys.stdin.fileno(), 1)
+        except (BlockingIOError, OSError):
+            return None
+        if not data:
+            return None
+        try:
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            return None
 
     def read_key(self) -> Optional[str]:
         if not self._enabled:
