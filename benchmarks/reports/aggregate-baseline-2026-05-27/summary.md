@@ -37,33 +37,34 @@ model `dronet`, target `rvv`, quant `int8`, runner `spike`
 
 | metric | A | unit |
 | --- | --- | --- |
-| cycles_spike | 316,598,005 ± 250,311,304 (N=3) | cycles |
+| cycles_spike | 27,563,408 (N=3) | cycles |
+| wall_cycles_spike | 275,700 (N=3) | cycles |
 | accuracy_linf | 0 (N=3) | dimensionless |
 | verify_pass | yes (N=3) | bool |
 | bit_exact | yes (N=3) | bool |
-| latency_ms_spike | 316.6 ± 250.3 (N=3) | ms |
-| zephyr_elf_bytes | 894,933 ± 812.9 (N=3) | bytes |
-| kernels_c_bytes | 18,637 ± 531.7 (N=3) | bytes |
-| kernels_c_loc | 378 ± 15.59 (N=3) | count |
+| latency_ms_spike | 27.56 (N=3) | ms |
+| zephyr_elf_bytes | 895,872 (N=3) | bytes |
+| kernels_c_bytes | 19,251 (N=3) | bytes |
+| kernels_c_loc | 396 (N=3) | count |
 | weights_npz_bytes | 326,642 (N=3) | bytes |
-| extract_s | 0.0013 ± 5.774e-04 (N=3) | s |
-| generate_skeleton_s | 0.2083 ± 0.0304 (N=3) | s |
-| generate_kernels_s | 36.69 ± 6.049 (N=3) | s |
-| build_s | 6.156 ± 0.3831 (N=3) | s |
-| run_s | 1.391 ± 0.4353 (N=3) | s |
-| total_stage_s | 44.45 ± 6.883 (N=3) | s |
+| extract_s | 0.0010 (N=3) | s |
+| generate_skeleton_s | 0.1853 ± 0.0040 (N=3) | s |
+| generate_kernels_s | 29.41 ± 0.3747 (N=3) | s |
+| build_s | 5.775 ± 0.0527 (N=3) | s |
+| run_s | 0.9013 ± 0.0146 (N=3) | s |
+| total_stage_s | 36.27 ± 0.3505 (N=3) | s |
 | n_kernels_curated | 4 (N=3) | count |
 | n_kernels_reference | 3 (N=3) | count |
 | n_kernels_total | 7 (N=3) | count |
-| algorithms_distinct_count | 1.333 ± 0.5774 (N=3) | count |
-| compile_wall_clock_s | 44.53 ± 6.894 (N=3) | s |
-| compile_peak_rss_mb | 137.3 ± 0.1732 (N=3) | MB |
+| algorithms_distinct_count | 2 (N=3) | count |
+| compile_wall_clock_s | 36.34 ± 0.3502 (N=3) | s |
+| compile_peak_rss_mb | 137.5 (N=3) | MB |
 | n_ops_profiled | 30 (N=3) | count |
-| dominant_op_share | 0.9595 ± 0.0673 (N=3) | fraction |
-| mean_cycles_per_dispatch | 10,553,267 ± 8,343,710 (N=3) | cycles |
-| stddev_cycles_per_dispatch | 19,423,733 ± 15,528,585 (N=3) | cycles |
-| op_kind_p95_max_cycles | 61,602,165 ± 48,987,977 (N=3) | cycles |
-| op_kind_median_max_cycles | 34,219,754 ± 27,446,865 (N=3) | cycles |
+| dominant_op_share | 0.8819 (N=3) | fraction |
+| mean_cycles_per_dispatch | 918,780 (N=3) | cycles |
+| stddev_cycles_per_dispatch | 1,492,867 (N=3) | cycles |
+| op_kind_p95_max_cycles | 5,035,721 (N=3) | cycles |
+| op_kind_median_max_cycles | 2,526,845 (N=3) | cycles |
 
 **Top op kinds by cycle share:**
 
@@ -97,6 +98,7 @@ model `dronet`, target `scalar`, quant `int8`, runner `spike`
 | metric | A | unit |
 | --- | --- | --- |
 | cycles_spike | 454,542,207 (N=3) | cycles |
+| wall_cycles_spike | 4,546,550 (N=3) | cycles |
 | accuracy_linf | 0 (N=3) | dimensionless |
 | verify_pass | yes (N=3) | bool |
 | bit_exact | yes (N=3) | bool |
@@ -155,6 +157,7 @@ model `dronet`, target `rvv_opu`, quant `int8`, runner `firesim`
 | metric | A | B-bedrock | B-gemini | B-claude | unit |
 | --- | --- | --- | --- | --- | --- |
 | cycles_spike *(not authoritative on rvv_opu)* | 454,543,545 (N=3) | 15,334,283 ± 10,827 (N=3) | — | — | cycles |
+| wall_cycles_spike | 4,546,550 (N=3) | 153,367 ± 125.8 (N=3) | — | — | cycles |
 | accuracy_linf | 0 (N=3) | 0 (N=3) | — | — | dimensionless |
 | verify_pass | yes (N=3) | yes (N=3) | — | — | bool |
 | bit_exact | yes (N=3) | yes (N=3) | — | — | bool |
@@ -232,6 +235,7 @@ model `dronet`, target `gemmini`, quant `int8`, runner `firesim`
 | metric | A | B-bedrock | B-gemini | B-claude | unit |
 | --- | --- | --- | --- | --- | --- |
 | cycles_spike *(not authoritative on gemmini)* | 18,808,376 (N=3) | 15,531,641 ± 801,686 (N=3) | — | — | cycles |
+| wall_cycles_spike | 188,150 (N=3) | 155,333 ± 8,019 (N=3) | — | — | cycles |
 | accuracy_linf | 0 (N=3) | 0 (N=3) | — | — | dimensionless |
 | verify_pass | yes (N=3) | yes (N=3) | — | — | bool |
 | bit_exact | yes (N=3) | yes (N=3) | — | — | bool |
@@ -309,6 +313,7 @@ model `dronet`, target `gemmini_q31`, quant `int8`, runner `firesim`
 | metric | A | B-bedrock | B-gemini | B-claude | unit |
 | --- | --- | --- | --- | --- | --- |
 | cycles_spike *(not authoritative on gemmini_q31)* | 6,899,785 (N=3) | — | — | — | cycles |
+| wall_cycles_spike | 69,050 (N=3) | — | — | — | cycles |
 | accuracy_linf | 72 (N=3) | — | — | — | dimensionless |
 | verify_pass | yes (N=3) | — | — | — | bool |
 | bit_exact | no (N=3) | — | — | — | bool |
@@ -406,6 +411,7 @@ model `yolov8_nano`, target `scalar`, quant `int8`, runner `spike`
 | metric | A | unit |
 | --- | --- | --- |
 | cycles_spike | 10,437,905,042 (N=3) | cycles |
+| wall_cycles_spike | 104,405,200 (N=3) | cycles |
 | accuracy_linf | 0 (N=3) | dimensionless |
 | verify_pass | yes (N=3) | bool |
 | bit_exact | yes (N=3) | bool |
@@ -460,33 +466,34 @@ model `yolov8_nano`, target `rvv`, quant `int8`, runner `spike`
 
 | metric | A | unit |
 | --- | --- | --- |
-| cycles_spike | 7,336,874,564 ± 5,807,167,627 (N=3) | cycles |
+| cycles_spike | 631,334,979 (N=3) | cycles |
+| wall_cycles_spike | 6,315,000 (N=3) | cycles |
 | accuracy_linf | 0 (N=3) | dimensionless |
 | verify_pass | yes (N=3) | bool |
 | bit_exact | yes (N=3) | bool |
-| latency_ms_spike | 7,337 ± 5,807 (N=3) | ms |
-| zephyr_elf_bytes | 4,178,659 ± 434.2 (N=3) | bytes |
-| kernels_c_bytes | 26,402 ± 2,539 (N=3) | bytes |
-| kernels_c_loc | 551.7 ± 50.81 (N=3) | count |
+| latency_ms_spike | 631.3 (N=3) | ms |
+| zephyr_elf_bytes | 4,179,160 (N=3) | bytes |
+| kernels_c_bytes | 23,471 (N=3) | bytes |
+| kernels_c_loc | 493 (N=3) | count |
 | weights_npz_bytes | 3,277,160 (N=3) | bytes |
 | extract_s | 0.0010 (N=3) | s |
-| generate_skeleton_s | 0.7003 ± 0.0505 (N=3) | s |
-| generate_kernels_s | 291 ± 50.94 (N=3) | s |
-| build_s | 8.857 ± 0.5187 (N=3) | s |
-| run_s | 26.21 ± 10.9 (N=3) | s |
-| total_stage_s | 326.8 ± 62.4 (N=3) | s |
-| n_kernels_curated | 6 ± 1.732 (N=3) | count |
-| n_kernels_reference | 3 ± 1.732 (N=3) | count |
+| generate_skeleton_s | 0.7027 ± 0.0605 (N=3) | s |
+| generate_kernels_s | 231.7 ± 2.51 (N=3) | s |
+| build_s | 8.131 ± 0.1145 (N=3) | s |
+| run_s | 13.59 ± 0.0357 (N=3) | s |
+| total_stage_s | 254.2 ± 2.514 (N=3) | s |
+| n_kernels_curated | 4 (N=3) | count |
+| n_kernels_reference | 5 (N=3) | count |
 | n_kernels_total | 9 (N=3) | count |
-| algorithms_distinct_count | 1.333 ± 0.5774 (N=3) | count |
-| compile_wall_clock_s | 326.8 ± 62.4 (N=3) | s |
-| compile_peak_rss_mb | 138 ± 0.4619 (N=3) | MB |
+| algorithms_distinct_count | 2 (N=3) | count |
+| compile_wall_clock_s | 254.2 ± 2.512 (N=3) | s |
+| compile_peak_rss_mb | 137.3 ± 0.1732 (N=3) | MB |
 | n_ops_profiled | 204 (N=3) | count |
-| dominant_op_share | 0.9551 ± 0.0764 (N=3) | fraction |
-| mean_cycles_per_dispatch | 35,965,071 ± 28,466,508 (N=3) | cycles |
-| stddev_cycles_per_dispatch | 74,909,690 ± 60,204,544 (N=3) | cycles |
-| op_kind_p95_max_cycles | 340,088,298 ± 273,054,978 (N=3) | cycles |
-| op_kind_median_max_cycles | 88,630,785 ± 71,104,500 (N=3) | cycles |
+| dominant_op_share | 0.8668 (N=3) | fraction |
+| mean_cycles_per_dispatch | 3,094,779 (N=3) | cycles |
+| stddev_cycles_per_dispatch | 5,391,471 (N=3) | cycles |
+| op_kind_p95_max_cycles | 24,791,567 (N=3) | cycles |
+| op_kind_median_max_cycles | 6,526,380 (N=3) | cycles |
 
 **Top op kinds by cycle share:**
 
@@ -517,6 +524,7 @@ model `yolov8_nano`, target `rvv_opu`, quant `int8`, runner `firesim`
 | metric | A | B-bedrock | B-gemini | B-claude | unit |
 | --- | --- | --- | --- | --- | --- |
 | cycles_spike *(not authoritative on rvv_opu)* | 10,437,933,880 (N=3) | 626,016,151 ± 789,046 (N=3) | — | — | cycles |
+| wall_cycles_spike | 104,405,500 (N=3) | 6,261,783 ± 7,895 (N=3) | — | — | cycles |
 | accuracy_linf | 0 (N=3) | 0 (N=3) | — | — | dimensionless |
 | verify_pass | yes (N=3) | yes (N=3) | — | — | bool |
 | bit_exact | yes (N=3) | yes (N=3) | — | — | bool |
@@ -591,6 +599,7 @@ model `yolov8_nano`, target `gemmini`, quant `int8`, runner `firesim`
 | metric | A | B-bedrock | B-gemini | B-claude | unit |
 | --- | --- | --- | --- | --- | --- |
 | cycles_spike *(not authoritative on gemmini)* | 283,076,496 (N=3) | 249,702,937 ± 31,214,072 (N=3) | — | — | cycles |
+| wall_cycles_spike | 2,831,550 (N=3) | 2,497,733 ± 312,228 (N=3) | — | — | cycles |
 | accuracy_linf | 0 (N=3) | 0 (N=3) | — | — | dimensionless |
 | verify_pass | yes (N=3) | yes (N=3) | — | — | bool |
 | bit_exact | yes (N=3) | yes (N=3) | — | — | bool |
@@ -665,6 +674,7 @@ model `yolov8_nano`, target `gemmini_q31`, quant `int8`, runner `firesim`
 | metric | A | B-bedrock | B-gemini | B-claude | unit |
 | --- | --- | --- | --- | --- | --- |
 | cycles_spike *(not authoritative on gemmini_q31)* | 280,933,590 (N=3) | — | — | — | cycles |
+| wall_cycles_spike | 2,810,150 (N=3) | — | — | — | cycles |
 | accuracy_linf | 9 (N=3) | — | — | — | dimensionless |
 | verify_pass | yes (N=3) | — | — | — | bool |
 | bit_exact | no (N=3) | — | — | — | bool |
