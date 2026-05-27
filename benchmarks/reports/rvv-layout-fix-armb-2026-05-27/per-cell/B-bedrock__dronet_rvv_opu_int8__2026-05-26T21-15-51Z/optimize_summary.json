@@ -1,0 +1,356 @@
+{
+  "add_s8": {
+    "baseline": 9383,
+    "best": 9383,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 9383,
+        "result": "ok",
+        "cycles": 20839,
+        "tokens_in": 16553,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 9383,
+        "result": "duplicate",
+        "tokens_in": 16553,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 9383,
+        "result": "duplicate",
+        "tokens_in": 16553,
+        "tokens_out": 840
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 20839,
+        "result": "ok",
+        "cycles": 9383,
+        "tokens_in": 16475,
+        "tokens_out": 764
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 20839,
+        "result": "duplicate",
+        "tokens_in": 16475,
+        "tokens_out": 764
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 20839,
+        "result": "duplicate",
+        "tokens_in": 16475,
+        "tokens_out": 764
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "batchnorm2d_s8": {
+    "baseline": 45190,
+    "best": 45190,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 45190,
+        "result": "build_fail",
+        "tokens_in": 16756,
+        "tokens_out": 1791,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1 |   stdout (tail): | dwarf-4 -fdiagnostics-color=always -mabi=lp64d -march=rv64imafdcv_zicsr_zifencei -mcmodel=medany -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize --sysroot=/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include -DMODELBLASTER_SATURN_OPU=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c | /scratch2/agustin"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 45190,
+        "result": "build_fail",
+        "tokens_in": 16756,
+        "tokens_out": 814,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1 |   stdout (tail): | 0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include -DMODELBLASTER_SATURN_OPU=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c | /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c: In function 'kernel_batchnorm2d_s8_dronet': | /scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c:82:63: error: incompatible type for argument 1 of '__r"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 45190,
+        "result": "verify_fail",
+        "tokens_in": 16756,
+        "tokens_out": 1736,
+        "diag": "golden mismatch (72)"
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "conv2d_s8": {
+    "baseline": 23370421,
+    "best": 15089334,
+    "improvement_pct": 35.43405144477286,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 23370421,
+        "result": "ok",
+        "cycles": 26996737,
+        "tokens_in": 19028,
+        "tokens_out": 1960
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 23370421,
+        "result": "ok",
+        "cycles": 26996717,
+        "tokens_in": 19028,
+        "tokens_out": 1961
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 23370421,
+        "result": "duplicate",
+        "tokens_in": 19028,
+        "tokens_out": 1961
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 26996717,
+        "result": "ok",
+        "cycles": 15089334,
+        "tokens_in": 21274,
+        "tokens_out": 2038
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 26996717,
+        "result": "build_fail",
+        "tokens_in": 21274,
+        "tokens_out": 1964,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1 |   stdout (tail): | zephyr-chipyard-sw/zephyr_ws/zephyr/soc/rocketchip/virt_riscv/common/. -isystem /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/libc/common/include -fno-strict-aliasing -Os -imacros /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu/zephyr/include/generated/zephyr/autoconf.h -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mabi=lp64d -march=rv64imafdcv_zicsr_zifencei -mcmodel=medany -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize --sysroot=/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include -DMODELBLASTER_SATURN_OPU=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu/kernels.c.o"
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 26996717,
+        "result": "build_fail",
+        "tokens_in": 21274,
+        "tokens_out": 1925,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1 |   stdout (tail): | hyr/lib/libc/picolibc/include -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/posix/c_lib_ext/getopt -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/midi2/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/common/riscv-privileged/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/rocketchip/virt_riscv/common/. -isystem /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/libc/common/include -fno-strict-aliasing -Os -imacros /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu/zephyr/include/generated/zephyr/autoconf.h -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mabi=lp64d -march=rv64imafdcv_zicsr_zifencei -mcmodel=medany -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize --sysroot=/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffuncti"
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 1,
+        "parent_cycles": 26996737,
+        "result": "build_fail",
+        "tokens_in": 21274,
+        "tokens_out": 1930,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1 |   stdout (tail): | picolibc/include -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/posix/c_lib_ext/getopt -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/midi2/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/common/riscv-privileged/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/rocketchip/virt_riscv/common/. -isystem /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/libc/common/include -fno-strict-aliasing -Os -imacros /scratch2/agustin/ModelBlaster/examples/dronet/int8/build/rvv_opu/zephyr/include/generated/zephyr/autoconf.h -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mabi=lp64d -march=rv64imafdcv_zicsr_zifencei -mcmodel=medany -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize --sysroot=/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -"
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 2,
+        "parent_cycles": 26996737,
+        "result": "duplicate",
+        "tokens_in": 21274,
+        "tokens_out": 1925
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 3,
+        "parent_cycles": 26996737,
+        "result": "duplicate",
+        "tokens_in": 21274,
+        "tokens_out": 1925
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "linear_s8": {
+    "baseline": 4327,
+    "best": 3061,
+    "improvement_pct": 29.258146521839613,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 4327,
+        "result": "ok",
+        "cycles": 3061,
+        "tokens_in": 17436,
+        "tokens_out": 1805
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 4327,
+        "result": "ok",
+        "cycles": 3193,
+        "tokens_in": 17436,
+        "tokens_out": 1738
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 4327,
+        "result": "ok",
+        "cycles": 4055,
+        "tokens_in": 17436,
+        "tokens_out": 2107
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "maxpool2d_s8": {
+    "baseline": 5146005,
+    "best": 194978,
+    "improvement_pct": 96.21108024574403,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 5146005,
+        "result": "verify_fail",
+        "tokens_in": 16640,
+        "tokens_out": 1165,
+        "diag": "golden mismatch (34)"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 5146005,
+        "result": "ok",
+        "cycles": 202986,
+        "tokens_in": 16640,
+        "tokens_out": 1628
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 5146005,
+        "result": "ok",
+        "cycles": 194978,
+        "tokens_in": 16640,
+        "tokens_out": 1297
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "relu_s8": {
+    "baseline": 7314,
+    "best": 3714,
+    "improvement_pct": 49.22067268252666,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 7314,
+        "result": "ok",
+        "cycles": 3714,
+        "tokens_in": 15751,
+        "tokens_out": 189
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 7314,
+        "result": "duplicate",
+        "tokens_in": 15751,
+        "tokens_out": 189
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 7314,
+        "result": "duplicate",
+        "tokens_in": 15751,
+        "tokens_out": 189
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "sigmoid_s8": {
+    "baseline": 151,
+    "best": 145,
+    "improvement_pct": 3.9735099337748347,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 151,
+        "result": "ok",
+        "cycles": 145,
+        "tokens_in": 15740,
+        "tokens_out": 282
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 151,
+        "result": "ok",
+        "cycles": 145,
+        "tokens_in": 15740,
+        "tokens_out": 283
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 151,
+        "result": "ok",
+        "cycles": 153,
+        "tokens_in": 15740,
+        "tokens_out": 255
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  }
+}
