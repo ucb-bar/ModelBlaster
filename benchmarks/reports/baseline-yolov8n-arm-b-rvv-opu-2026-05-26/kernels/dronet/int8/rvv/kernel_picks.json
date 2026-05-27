@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "target": "rvv",
+  "picks": {
+    "add_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "batchnorm2d_s8": {
+      "source": "curated",
+      "algorithm": "direct",
+      "path": "/scratch2/agustin/ModelBlaster/kernels/rvv/rvv_batchnorm2d_s8_direct.c"
+    },
+    "conv2d_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "linear_s8": {
+      "source": "curated",
+      "algorithm": "direct",
+      "path": "/scratch2/agustin/ModelBlaster/kernels/rvv/rvv_linear_s8_direct.c"
+    },
+    "maxpool2d_s8": {
+      "source": "curated",
+      "algorithm": "direct",
+      "path": "/scratch2/agustin/ModelBlaster/kernels/rvv/rvv_maxpool2d_s8_direct.c"
+    },
+    "relu_s8": {
+      "source": "curated",
+      "algorithm": "direct",
+      "path": "/scratch2/agustin/ModelBlaster/kernels/rvv/rvv_relu_s8_direct.c"
+    },
+    "sigmoid_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    }
+  }
+}

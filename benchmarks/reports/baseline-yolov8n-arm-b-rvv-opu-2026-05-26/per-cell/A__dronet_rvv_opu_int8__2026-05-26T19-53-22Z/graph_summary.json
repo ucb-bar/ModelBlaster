@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "n_dispatches": 32,
+  "n_distinct_op_kinds": 8,
+  "n_distinct_shapes": 25,
+  "by_op_kind": {
+    "conv2d_s8": {
+      "count": 10,
+      "distinct_shapes": 10
+    },
+    "maxpool2d_s8": {
+      "count": 1,
+      "distinct_shapes": 1
+    },
+    "batchnorm2d_s8": {
+      "count": 6,
+      "distinct_shapes": 4
+    },
+    "relu_s8": {
+      "count": 7,
+      "distinct_shapes": 4
+    },
+    "add_s8": {
+      "count": 3,
+      "distinct_shapes": 3
+    },
+    "view": {
+      "count": 2,
+      "distinct_shapes": 1
+    },
+    "linear_s8": {
+      "count": 2,
+      "distinct_shapes": 1
+    },
+    "sigmoid_s8": {
+      "count": 1,
+      "distinct_shapes": 1
+    }
+  }
+}
