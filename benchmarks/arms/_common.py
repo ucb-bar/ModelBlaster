@@ -153,9 +153,19 @@ def xpurt_demo_run_sh() -> Path:
 # Default cores registry + backend set for the `hetero_gemmini_opu`
 # target. Per-workload overrides come from the workload row's
 # `xpurt_cores_registry` / `xpurt_backends` fields.
+#
+# cpu_p_kind / cpu_e_kind tell ingest_xpurt_schedule.py how to resolve
+# the CPU_P / CPU_E slot labels in the schedule fixture against the
+# cores registry. For chipyard_gemmini_opu_hetero.json the registry
+# has cores of kind 'gemmini' and 'rvv_opu', so CPU_P -> gemmini and
+# CPU_E -> rvv_opu. xpurt_demo/run.sh defaults to rvv/scalar (the
+# 2x2 SoC mapping); without the override the hetero workload would
+# trip "registry has no cores of kind 'rvv' (needed by CPU_P#0)".
 _HETERO_GEMMINI_OPU_DEFAULTS = {
     "registry": "cores/chipyard_gemmini_opu_hetero.json",
     "backends": "gemmini,rvv_opu",
+    "cpu_p_kind": "gemmini",
+    "cpu_e_kind": "rvv_opu",
 }
 
 
@@ -187,6 +197,16 @@ def hetero_env_overlay(workload: Workload, env: dict[str, str]) -> None:
         env["SCHEDULE_JSON"] = str(
             (REPO_ROOT / workload.xpurt_schedule_path).resolve()
         )
+
+    # CPU_P_KIND / CPU_E_KIND resolve the schedule fixture's slot labels
+    # against the cores registry (see _HETERO_*_DEFAULTS above). The user
+    # can still override by setting these in the calling env.
+    cpu_p = defaults.get("cpu_p_kind")
+    cpu_e = defaults.get("cpu_e_kind")
+    if cpu_p:
+        env.setdefault("CPU_P_KIND", cpu_p)
+    if cpu_e:
+        env.setdefault("CPU_E_KIND", cpu_e)
 
     # spike-hetero is the merlin-side wrapper that loads both Gemmini
     # and Saturn-OPU extensions into one spike process. Point at it so
