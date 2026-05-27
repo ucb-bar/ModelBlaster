@@ -362,17 +362,12 @@ LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
                     "add_s8", "sigmoid_s8"},
     "gemmini_q31": {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
                     "add_s8", "sigmoid_s8"},
-    # Plain rvv (without OPU extension) has curated conv2d_s8 kernels
-    # (rvv_vsmul_vnclip / rvv_oc_blocked / rvv_widening_oc) that drift
-    # by max_abs_err=12 on dronet's int8 shapes -- they were authored
-    # against a different per-channel scale convention. Arm A
-    # transparently falls back to reference, but Arm B's "direct"
-    # universal algorithm gets dropped from the queue by the
-    # target-affinity preference, leaving only the broken curated set;
-    # the LLM optimize attempts then trip verify too. Skip conv2d_s8
-    # on rvv so the seed step's reference_impl holds. (rvv_opu is a
-    # superset and DOES win on conv2d_s8 via the indir_gemm path.)
-    "rvv":         {"conv2d_s8"},
+    # (Plain rvv conv2d_s8 was previously here as a workaround for a
+    # broken curated kernel; the actual bug was the _LAYOUT_PERMUTATION
+    # for "ihwoc" returning HWIO order instead of IHWO. Fixed in
+    # generate_skeleton.py:_LAYOUT_PERMUTATION. The curated rvv conv2d
+    # kernels now pass verify bit-exact and give ~16-17× speedup over
+    # the scalar reference on dronet + yolov8n smoke shapes.)
 }
 
 
