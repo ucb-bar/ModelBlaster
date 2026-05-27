@@ -194,11 +194,33 @@ metrics:
     arms: [A, B, C]
     phase: kernel_synthesis
     note: |
+      Sum of per-dispatch cycles from the spike-side profile. This is
+      the COMPUTE WORK across all dispatches, NOT the end-to-end
+      wall-clock cycle count -- when dispatches run concurrently
+      (multi-tile hetero), or when verify probes added extra_shapes
+      not in the original IR, the sum exceeds wall_cycles_spike. Use
+      wall_cycles_spike when you want "what the user feels".
+
       Recorded for {scalar, scalar_f16, rvv, rvv_f16} as primary.
       For {rvv_opu, gemmini, gemmini_q31, hetero_gemmini_opu} this is
       correctness instrumentation only. Spike runs the Gemmini and
       Saturn-OPU extensions atomically (no microarchitectural model),
       so cycle counts on those targets are not authoritative.
+
+  wall_cycles_spike:
+    source: "wall_cycles.txt"
+    extractor: "modelblaster.benchmarks.ingest.wall_cycles:wall_cycles"
+    unit: cycles
+    arms: [A, B, C]
+    phase: kernel_synthesis
+    note: |
+      End-to-end inference cycle count measured between the harness's
+      MODELBLASTER_WALL_CYCLES_BEGIN / _END markers. This is the
+      "inference latency" metric end users feel, distinct from
+      cycles_spike (sum of per-dispatch work). For single-tile
+      single-pass workloads the two should agree closely; for hetero
+      or multi-instance workloads wall_cycles_spike is the smaller
+      authoritative number.
 
   accuracy_linf:
     source: "accuracy.json"
