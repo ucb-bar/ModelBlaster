@@ -533,12 +533,22 @@ def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
     return None
 
 
-# Physical permutation (2,3,1,0) on OIHW gives both HWIO and IHWOC
-# (same transpose, different semantic interpretation depending on how
-# the kernel indexes it).
+# Physical permutation on OIHW. The two layouts differ in axis order
+# despite both being "weight reshuffled away from OIHW":
+#
+#   hwio   = (H, W, I, O)  - perm (2, 3, 1, 0); gemmini's tiled_conv_auto
+#                            wants this for the strided DMA.
+#   ihwoc  = (I, H, W, O)  - perm (1, 2, 3, 0); the rvv conv2d kernels
+#                            index as weight[((ic*KH+kh)*KW+kw)*OC+oc],
+#                            which IS (i, h, w, o) ordering.
+#
+# Earlier comment claimed both layouts share permutation (2,3,1,0); that's
+# false. The HWIO buffer indexed as IHWOC gives wrong elements (verify
+# tripped with max_abs_err=12 on dronet+yolov8n smoke shapes). Each
+# kernel's indexing pattern must match its packing permutation.
 _LAYOUT_PERMUTATION = {
-    "hwio": (2, 3, 1, 0),
-    "ihwoc": (2, 3, 1, 0),
+    "hwio":  (2, 3, 1, 0),
+    "ihwoc": (1, 2, 3, 0),
 }
 
 _LAYOUT_TAG = {
