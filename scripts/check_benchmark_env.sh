@@ -50,4 +50,16 @@ echo "    ZEPHYR_SDK_INSTALL_DIR  = ${ZEPHYR_SDK_INSTALL_DIR}"
 if [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
     echo "    AWS_BEARER_TOKEN_BEDROCK = (set, ${#AWS_BEARER_TOKEN_BEDROCK} chars)"
 fi
+# FireSim is opt-in (only needed for the accelerator-cycle baseline);
+# report status but don't fail when it's not set up.
+if command -v firesim >/dev/null 2>&1; then
+    if ssh-add -l 2>/dev/null | grep -q firesim; then
+        echo "    firesim = $(command -v firesim)  (ssh-agent has firesim key)"
+    else
+        echo "    firesim = $(command -v firesim)  (warning: firesim ssh key not in agent;"
+        echo "              run \`ssh-add ~/.ssh/firesim\` before infrasetup/kill/runworkload)"
+    fi
+else
+    echo "    firesim = not on PATH (spike-only session; ok for non-accelerator captures)"
+fi
 exit 0

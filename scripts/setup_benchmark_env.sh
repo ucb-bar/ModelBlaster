@@ -57,7 +57,43 @@ if [ -f "${_MB_REPO_ROOT}/.env" ]; then
     set +a
 fi
 
-# ---- 4) verify (defers to check_benchmark_env.sh for the assertions) ------
+# ---- 4) FireSim env -------------------------------------------------------
+# FireSim needs (a) the firesim CLI on PATH and (b) ssh-agent holding the
+# key that authenticates to localhost (the FPGA host on this machine).
+# Both are skipped silently when their prerequisites aren't present so
+# spike-only sessions don't hit avoidable warnings.
+
+_MB_FIRESIM_DIR="/scratch2/agustin/chipyard/sims/firesim"
+_MB_FIRESIM_SSH_KEY="${HOME}/.ssh/firesim"
+
+if [ -f "${_MB_FIRESIM_DIR}/sourceme-manager.sh" ]; then
+    # sourceme-manager appends ${dir}/deploy to PATH so the `firesim`
+    # CLI becomes available. It also expects to be sourced FROM the
+    # firesim dir, so cd-then-back.
+    _mb_orig_cwd="$(pwd)"
+    cd "${_MB_FIRESIM_DIR}"
+    set +u
+    # shellcheck disable=SC1091
+    source ./sourceme-manager.sh --skip-ssh-setup >/dev/null
+    set -u 2>/dev/null || true
+    cd "${_mb_orig_cwd}"
+    unset _mb_orig_cwd
+fi
+
+# ssh-agent: load the firesim key if (a) the key file exists and
+# (b) it's not already loaded. ssh-add -l returns 1 when no keys.
+if [ -r "${_MB_FIRESIM_SSH_KEY}" ]; then
+    if [ -z "${SSH_AUTH_SOCK:-}" ] || ! ssh-add -l >/dev/null 2>&1; then
+        eval "$(ssh-agent -s)" >/dev/null 2>&1 || true
+    fi
+    if ssh-add -l 2>/dev/null | grep -q "${_MB_FIRESIM_SSH_KEY}"; then
+        :   # already loaded
+    else
+        ssh-add "${_MB_FIRESIM_SSH_KEY}" >/dev/null 2>&1 || true
+    fi
+fi
+
+# ---- 5) verify (defers to check_benchmark_env.sh for the assertions) ------
 
 if [ -x "${_MB_REPO_ROOT}/scripts/check_benchmark_env.sh" ]; then
     "${_MB_REPO_ROOT}/scripts/check_benchmark_env.sh"
