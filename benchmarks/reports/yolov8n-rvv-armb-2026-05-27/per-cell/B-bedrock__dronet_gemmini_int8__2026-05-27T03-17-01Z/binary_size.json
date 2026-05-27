@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "zephyr_elf_bytes": 931544,
+  "kernels_c_bytes": 15649,
+  "kernels_c_loc": 363,
+  "weights_npz_bytes": 326642
+}

@@ -1,0 +1,458 @@
+{
+  "add_s8": {
+    "baseline": 54750,
+    "best": 54750,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 54750,
+        "result": "ok",
+        "cycles": 121950,
+        "tokens_in": 16518,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 54750,
+        "result": "duplicate",
+        "tokens_in": 16518,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 54750,
+        "result": "duplicate",
+        "tokens_in": 16518,
+        "tokens_out": 840
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 121950,
+        "result": "ok",
+        "cycles": 54750,
+        "tokens_in": 16440,
+        "tokens_out": 890
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 121950,
+        "result": "duplicate",
+        "tokens_in": 16440,
+        "tokens_out": 764
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 121950,
+        "result": "duplicate",
+        "tokens_in": 16440,
+        "tokens_out": 764
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "batchnorm2d_s8": {
+    "baseline": 699533,
+    "best": 574291,
+    "improvement_pct": 17.903658583655098,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 699533,
+        "result": "ok",
+        "cycles": 574291,
+        "tokens_in": 16926,
+        "tokens_out": 1640
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 699533,
+        "result": "build_fail",
+        "tokens_in": 16926,
+        "tokens_out": 1666,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | phyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_batchnorm2d_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:83:63: error: too many arguments to function '__riscv_vlmul_trunc_v_i16m8_i16m4' |    83 |                 vfloat32m8_t vf0 = __riscv_vfwcvt_f_x_v_f32m8(__riscv_vlmul_trunc_v_i16m8_i16m4(__riscv_vslidedown_vx_i16m8(vi16, 0, vl), vl/2), vl/2); |       |                                                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: declared here |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:84:63: error: too many arguments to fu"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 699533,
+        "result": "build_fail",
+        "tokens_in": 16926,
+        "tokens_out": 1164,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): |    84 |                 vf16 = __riscv_vfmacc_vf_f16m8( |       |                        ^~~~~~~~~~~~~~~~~~~~~~~~ |    85 |                     __riscv_vfmv_v_f_f16m8((_Float16)cb, vl), |       |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |    86 |                     (_Float16)cs, vf16, vl); |       |                     ~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:87:39: error: built-in function '__riscv_vfcvt_x_f_v_i16m8(vf16,  vlmax)' requires the zvfhmin or zvfh ISA extension |    87 |                 vint16m8_t vi_out16 = __riscv_vfcvt_x_f_v_i16m8(vf16, vl); |       |                                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:98:37: error: built-in function '__riscv_vfcvt_f_x_v_f16m8(vi16,  vl)' requires the zvfhmin or zvfh ISA extension |    98 |                 vfloat16m8_t vf16 = __riscv_vfcvt_f_x_v_f16m8(vi16, vl); |       |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:99:24: error: built-in function '__riscv_vfmv_v_f_f16m8(<unknown>,  vl)' requires the zvfhmin or zvfh ISA extension |    99 |                 vf16 = __riscv_vfmacc_vf_f16m8( |       |                        ^~~~~~~~~~~~~~~~~~~~~~~~ |   100 |                     __riscv_vfmv_v_f_f16m8((_Float16)cb, vl), |       |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |   101 |                     (_Float16)cs, vf16, vl); |       |    "
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat2_c1_s8": {
+    "baseline": 192188,
+    "best": 187391,
+    "improvement_pct": 2.4959935063583574,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 192188,
+        "result": "ok",
+        "cycles": 187391,
+        "tokens_in": 16964,
+        "tokens_out": 2231
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 192188,
+        "result": "verify_fail",
+        "tokens_in": 16964,
+        "tokens_out": 1494,
+        "diag": "golden mismatch (122)"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 192188,
+        "result": "build_fail",
+        "tokens_in": 16964,
+        "tokens_out": 3115,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | amples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_cat2_c1_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:156:93: error: incompatible type for argument 1 of '__riscv_vlmul_ext_v_i16m4_i16m8' |   156 |                 vint32m8_t v32_hi = __riscv_vsext_vf2_i32m8(__riscv_vlmul_ext_v_i16m4_i16m8(__riscv_vslidedown_vx_i16m8(v16, vlmax, vlmax * 2)), vlmax); |       |                                                                                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                                                             | |       |                                                                                             vint16m8_t | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:201:93: error: incompatible type for argument 1 of '__riscv_vlmul_ext_v_i16m4_i16m8' |   201 |                 vint32m8_t v32_hi = __riscv_vsext_vf2_i32m8(__riscv_vlmul_ext_v_i16m4_i16m8(__riscv_vslidedown_vx_i16m8(v16, vlmax, vlmax * 2)), vlmax); |       |                                                                                      "
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat3_c1_s8": {
+    "baseline": 135936,
+    "best": 135936,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 135936,
+        "result": "build_fail",
+        "tokens_in": 17658,
+        "tokens_out": 1795,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): |                                               ^~~ |       |                                                                    | |       |                                                                    vint16m8_t | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint8m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:258:68: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f16m8' |   258 |                     vfloat16m8_t vf16 = __riscv_vfwcvt_f_x_v_f16m8(v16, vl); |       |                                                                    ^~~ |       |                                                                    | |       |                                                                    vint16m8_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint8m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:281:68: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f16m8' |   281 |                     vfloat16m8_t vf16 ="
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 135936,
+        "result": "duplicate",
+        "tokens_in": 17658,
+        "tokens_out": 1795
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 135936,
+        "result": "build_fail",
+        "tokens_in": 17658,
+        "tokens_out": 5491,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): |                                                          vint16m4_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m8_t' but argument is of type 'vint16m4_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:358:67: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f32m8' |   358 |                     vfloat32m8_t vf1 = __riscv_vfwcvt_f_x_v_f32m8(__riscv_vslidedown_vx_i16m8(v16, vl / 2, vl), vl / 2); |       |                                                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                                   | |       |                                                                   vint16m8_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:369:106: error: incompatible type for argument 2 of '__riscv_vslideup_vx_i16m8' |   369 |                     vint16m8_t vi16 = __riscv_vslideup_vx_i16m8(__riscv_vlmul_ext_v_i16m4_i16m8(vi16_0), vi16_1, vl / 2, vl); |       |                                                                             "
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat4_c1_s8": {
+    "baseline": 59265,
+    "best": 55062,
+    "improvement_pct": 7.091875474563401,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 59265,
+        "result": "build_fail",
+        "tokens_in": 16739,
+        "tokens_out": 1174,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | ls.c: In function 'kernel_maxpool2d_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:487:52: warning: unused variable 'v' [-Wunused-variable] |   487 |                                             int8_t v = in_row[iw]; |       |                                                    ^ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_cat4_c1_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:330:35: error: built-in function '__riscv_vfcvt_f_x_v_f16m8(v16,  vlmax)' requires the zvfhmin or zvfh ISA extension |   330 |                 vfloat16m8_t vf = __riscv_vfcvt_f_x_v_f16m8(v16, vl); |       |                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:331:22: error: built-in function '__riscv_vfmul_vf_f16m8(vf,  <unknown>,  vlmax)' requires the zvfhmin or zvfh ISA extension |   331 |                 vf = __riscv_vfmul_vf_f16m8(vf, (_Float16)ratio, vl); |       |                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:332:33: error: built-in function '__riscv_vfcvt_x_f_v_i16m8(vf,  vlmax)' requires the zvfhmin or zvfh ISA extension |   332 |                 vint16m8_t vr = __riscv_vfcvt_x_f_v_i16m8(vf, vl); |       |                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:34"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 59265,
+        "result": "ok",
+        "cycles": 55062,
+        "tokens_in": 16739,
+        "tokens_out": 1402
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 59265,
+        "result": "verify_fail",
+        "tokens_in": 16739,
+        "tokens_out": 1821,
+        "diag": "golden mismatch (71)"
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "maxpool2d_s8": {
+    "baseline": 2472090,
+    "best": 2472090,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 2472090,
+        "result": "ok",
+        "cycles": 3594368,
+        "tokens_in": 18152,
+        "tokens_out": 512
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 2472090,
+        "result": "ok",
+        "cycles": 3205376,
+        "tokens_in": 18152,
+        "tokens_out": 532
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 2472090,
+        "result": "duplicate",
+        "tokens_in": 18152,
+        "tokens_out": 532
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 3205376,
+        "result": "ok",
+        "cycles": 3097508,
+        "tokens_in": 17186,
+        "tokens_out": 1037
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 3205376,
+        "result": "ok",
+        "cycles": 3097508,
+        "tokens_in": 17186,
+        "tokens_out": 1037
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 3205376,
+        "result": "ok",
+        "cycles": 3238157,
+        "tokens_in": 17186,
+        "tokens_out": 1095
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 1,
+        "parent_cycles": 3594368,
+        "result": "verify_fail",
+        "tokens_in": 17186,
+        "tokens_out": 1342,
+        "diag": "golden mismatch (5)"
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 2,
+        "parent_cycles": 3594368,
+        "result": "ok",
+        "cycles": 2966576,
+        "tokens_in": 17186,
+        "tokens_out": 1406
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 3,
+        "parent_cycles": 3594368,
+        "result": "ok",
+        "cycles": 2642706,
+        "tokens_in": 17186,
+        "tokens_out": 991
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "silu_s8": {
+    "baseline": 1770703,
+    "best": 1770703,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 1770703,
+        "result": "ok",
+        "cycles": 1838503,
+        "tokens_in": 16219,
+        "tokens_out": 536
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 1770703,
+        "result": "ok",
+        "cycles": 1838503,
+        "tokens_in": 16219,
+        "tokens_out": 546
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 1770703,
+        "result": "ok",
+        "cycles": 1838503,
+        "tokens_in": 16219,
+        "tokens_out": 546
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16759,
+        "tokens_out": 569
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16759,
+        "tokens_out": 545
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16759,
+        "tokens_out": 575
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 1,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16759,
+        "tokens_out": 559
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 2,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16759,
+        "tokens_out": 553
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 3,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16759,
+        "tokens_out": 597
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "upsample_nearest_s8": {
+    "baseline": 428544,
+    "best": 80018,
+    "improvement_pct": 81.3279383213859,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 428544,
+        "result": "ok",
+        "cycles": 80018,
+        "tokens_in": 16447,
+        "tokens_out": 1151
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 428544,
+        "result": "ok",
+        "cycles": 91010,
+        "tokens_in": 16447,
+        "tokens_out": 1243
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 428544,
+        "result": "ok",
+        "cycles": 761356,
+        "tokens_in": 16447,
+        "tokens_out": 569
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  }
+}

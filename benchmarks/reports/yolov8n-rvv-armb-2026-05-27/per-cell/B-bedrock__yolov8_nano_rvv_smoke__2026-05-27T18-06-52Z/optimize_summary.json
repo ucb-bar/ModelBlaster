@@ -1,0 +1,488 @@
+{
+  "add_s8": {
+    "baseline": 54750,
+    "best": 54750,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 54750,
+        "result": "ok",
+        "cycles": 121950,
+        "tokens_in": 16518,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 54750,
+        "result": "duplicate",
+        "tokens_in": 16518,
+        "tokens_out": 840
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 54750,
+        "result": "duplicate",
+        "tokens_in": 16518,
+        "tokens_out": 840
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 121950,
+        "result": "ok",
+        "cycles": 54750,
+        "tokens_in": 16440,
+        "tokens_out": 764
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 121950,
+        "result": "duplicate",
+        "tokens_in": 16440,
+        "tokens_out": 764
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 121950,
+        "result": "duplicate",
+        "tokens_in": 16440,
+        "tokens_out": 764
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "batchnorm2d_s8": {
+    "baseline": 699533,
+    "best": 574291,
+    "improvement_pct": 17.903658583655098,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 699533,
+        "result": "build_fail",
+        "tokens_in": 16926,
+        "tokens_out": 1648,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | iscv_vfwcvt_f_x_v_f32m8(__riscv_vlmul_trunc_v_i16m8_i16m4(__riscv_vget_v_i16m8_i16m4(vi16, 1), vl/2), vl/2); |       |                                                                                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                                                                 | |       |                                                                                                 vint16m4_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m8_t' but argument is of type 'vint16m4_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:84:63: error: too many arguments to function '__riscv_vlmul_trunc_v_i16m8_i16m4' |    84 |                 vfloat32m8_t vf1 = __riscv_vfwcvt_f_x_v_f32m8(__riscv_vlmul_trunc_v_i16m8_i16m4(__riscv_vget_v_i16m8_i16m4(vi16, 1), vl/2), vl/2); |       |                                                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: declared here |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:109:59: error: incompatible type for argument 1 of '__riscv_vsext_vf4_i32m8' |   109 |      "
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 699533,
+        "result": "verify_fail",
+        "tokens_in": 16926,
+        "tokens_out": 2134,
+        "diag": "golden mismatch (120)"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 699533,
+        "result": "ok",
+        "cycles": 574291,
+        "tokens_in": 16926,
+        "tokens_out": 1626
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat2_c1_s8": {
+    "baseline": 192188,
+    "best": 192188,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 192188,
+        "result": "build_fail",
+        "tokens_in": 16964,
+        "tokens_out": 2153,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | ustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_cat2_c1_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:150:61: error: incompatible type for argument 1 of '__riscv_vsext_vf2_i32m8' |   150 |                 vint32m8_t v32_hi = __riscv_vsext_vf2_i32m8(__riscv_vslidedown_vx_i16m8(v16, vl/2, vl), vl - vl/2); |       |                                                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                             | |       |                                                             vint16m8_t | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:181:61: error: incompatible type for argument 1 of '__riscv_vsext_vf2_i32m8' |   181 |                 vint32m8_t v32_hi = __riscv_vsext_vf2_i32m8(__riscv_vslidedown_vx_i16m8(v16, vl/2, vl), v"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 192188,
+        "result": "verify_fail",
+        "tokens_in": 16964,
+        "tokens_out": 1463,
+        "diag": "golden mismatch (122)"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 192188,
+        "result": "ok",
+        "cycles": 195427,
+        "tokens_in": 16964,
+        "tokens_out": 1347
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 195427,
+        "result": "build_fail",
+        "tokens_in": 17239,
+        "tokens_out": 1515,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | akeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_cat2_c1_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:150:63: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f32m8' |   150 |                 vfloat32m8_t vf0 = __riscv_vfwcvt_f_x_v_f32m8(v16, vl); |       |                                                               ^~~ |       |                                                               | |       |                                                               vint16m8_t | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:169:63: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f32m8' |   169 |                 vfloat32m8_t vf1 = __riscv_vfwcvt_f_x_v_f32m8(v16, vl); |       |                                                               ^~~ |       |                                                               | |       |                         "
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 195427,
+        "result": "ok",
+        "cycles": 324643,
+        "tokens_in": 17239,
+        "tokens_out": 1443
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 195427,
+        "result": "build_fail",
+        "tokens_in": 17239,
+        "tokens_out": 2244,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): |                                                     vint16m4_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m8_t' but argument is of type 'vint16m4_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:194:65: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f32m8' |   194 |                 vfloat32m8_t vf_hi = __riscv_vfwcvt_f_x_v_f32m8(__riscv_vslidedown_vx_i16m8(v16, vl1/2 + vl1%2, vl1), vl1/2); |       |                                                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                                 | |       |                                                                 vint16m8_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:204:103: error: incompatible type for argument 2 of '__riscv_vslideup_vx_i16m8' |   204 |                 vint16m8_t vi16 = __riscv_vslideup_vx_i16m8(__riscv_vlmul_ext_v_i16m4_i16m8(vi16_lo), vi16_hi, vl1/2 + vl1%2, vl1); |       |                                                                     "
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat3_c1_s8": {
+    "baseline": 135936,
+    "best": 135936,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 135936,
+        "result": "build_fail",
+        "tokens_in": 17658,
+        "tokens_out": 5491,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): |                                                          vint16m4_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m8_t' but argument is of type 'vint16m4_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:331:67: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f32m8' |   331 |                     vfloat32m8_t vf1 = __riscv_vfwcvt_f_x_v_f32m8(__riscv_vslidedown_vx_i16m8(v16, vl / 2, vl), vl / 2); |       |                                                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                                   | |       |                                                                   vint16m8_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint16m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:342:106: error: incompatible type for argument 2 of '__riscv_vslideup_vx_i16m8' |   342 |                     vint16m8_t vi16 = __riscv_vslideup_vx_i16m8(__riscv_vlmul_ext_v_i16m4_i16m8(vi16_0), vi16_1, vl / 2, vl); |       |                                                                             "
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 135936,
+        "result": "build_fail",
+        "tokens_in": 17658,
+        "tokens_out": 1795,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): |                                               ^~~ |       |                                                                    | |       |                                                                    vint16m8_t | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint8m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:231:68: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f16m8' |   231 |                     vfloat16m8_t vf16 = __riscv_vfwcvt_f_x_v_f16m8(v16, vl); |       |                                                                    ^~~ |       |                                                                    | |       |                                                                    vint16m8_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint8m4_t' but argument is of type 'vint16m8_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:254:68: error: incompatible type for argument 1 of '__riscv_vfwcvt_f_x_v_f16m8' |   254 |                     vfloat16m8_t vf16 ="
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 135936,
+        "result": "duplicate",
+        "tokens_in": 17658,
+        "tokens_out": 1795
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "cat4_c1_s8": {
+    "baseline": 59265,
+    "best": 59265,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 59265,
+        "result": "build_fail",
+        "tokens_in": 16739,
+        "tokens_out": 1192,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): |  function 'kernel_maxpool2d_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:460:52: warning: unused variable 'v' [-Wunused-variable] |   460 |                                             int8_t v = in_row[iw]; |       |                                                    ^ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_cat4_c1_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:303:35: error: built-in function '__riscv_vfcvt_f_x_v_f16m8(v16,  vlmax)' requires the zvfhmin or zvfh ISA extension |   303 |                 vfloat16m8_t vf = __riscv_vfcvt_f_x_v_f16m8(v16, vl); |       |                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:304:22: error: built-in function '__riscv_vfmul_vf_f16m8(vf,  <unknown>,  vlmax)' requires the zvfhmin or zvfh ISA extension |   304 |                 vf = __riscv_vfmul_vf_f16m8(vf, (_Float16)ratio, vl); |       |                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:305:35: error: built-in function '__riscv_vfcvt_x_f_v_i16m8(vf,  vlmax)' requires the zvfhmin or zvfh ISA extension |   305 |                 vint16m8_t vr16 = __riscv_vfcvt_x_f_v_i16m8(vf, vl); |       |                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:316:35"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 59265,
+        "result": "build_fail",
+        "tokens_in": 16739,
+        "tokens_out": 2575,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | _vf4_i32mf2' |   305 |                 vint32mf2_t v32_3 = __riscv_vsext_vf4_i32mf2(__riscv_vget_v_i8m4_i8m1(v8, 3), 8); |       |                                                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                              | |       |                                                              vint8m1_t | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint8mf8_t' but argument is of type 'vint8m1_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:343:26: error: implicit declaration of function '__riscv_vset_v_i8mf8_i8m4'; did you mean '__riscv_vget_v_i8m8_i8m4'? [-Wimplicit-function-declaration] |   343 |                 result = __riscv_vset_v_i8mf8_i8m4(result, 0, vr8_0); |       |                          ^~~~~~~~~~~~~~~~~~~~~~~~~ |       |                          __riscv_vget_v_i8m8_i8m4 | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:343:26: error: incompatible types when assigning to type 'vint8m4_t' from type 'int' | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:344:26: error: incompatible types when assigning to type 'vint8m4_t' from type 'int' |   344 |                 result = __riscv_vset_v_i8mf8_i8m4(result, 1, vr8_1); |       |                          ^~~~~~~~~~~~~~~~~~~~~~~~~ | /scratch2/agustin/ModelBlaster/exampl"
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 59265,
+        "result": "build_fail",
+        "tokens_in": 16739,
+        "tokens_out": 1756,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | gcv -mabi=lp64d -DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_cat4_c1_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:334:58: error: incompatible type for argument 1 of '__riscv_vsext_vf4_i32m8' |   334 |                 vint32m8_t v32 = __riscv_vsext_vf4_i32m8(v8, vl); |       |                                                          ^~ |       |                                                          | |       |                                                          vint8m4_t | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint8m2_t' but argument is of type 'vint8m4_t' |    40 | #pragma riscv intrinsic \"vector\" |       |         ^~~~~ | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:341:58: error: incompatible type for argument 1 of '__riscv_vncvt_x_x_w_i8m4' |   341 |           "
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "maxpool2d_s8": {
+    "baseline": 2472090,
+    "best": 2472090,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 2472090,
+        "result": "ok",
+        "cycles": 3205376,
+        "tokens_in": 18152,
+        "tokens_out": 536
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 2472090,
+        "result": "ok",
+        "cycles": 3205376,
+        "tokens_in": 18152,
+        "tokens_out": 532
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 2472090,
+        "result": "duplicate",
+        "tokens_in": 18152,
+        "tokens_out": 536
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 3205376,
+        "result": "ok",
+        "cycles": 2494851,
+        "tokens_in": 17210,
+        "tokens_out": 1337
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 3205376,
+        "result": "ok",
+        "cycles": 3268529,
+        "tokens_in": 17210,
+        "tokens_out": 1446
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 3205376,
+        "result": "ok",
+        "cycles": 2971955,
+        "tokens_in": 17210,
+        "tokens_out": 1530
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 1,
+        "parent_cycles": 3205376,
+        "result": "verify_fail",
+        "tokens_in": 17210,
+        "tokens_out": 1134,
+        "diag": "golden mismatch (36)"
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 2,
+        "parent_cycles": 3205376,
+        "result": "build_fail",
+        "tokens_in": 17210,
+        "tokens_out": 1295,
+        "diag": "west build failed (rc=1): |   cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/build/rvv -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 |   stdout (tail): | =WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -DMODELBLASTER_RVV_IHWOC_WEIGHTS=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c: In function 'kernel_maxpool2d_s8_yolov8_nano': | /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:440:82: error: incompatible type for argument 1 of '__riscv_vmv_x_s_i8m1_i8' |   440 |                                             int8_t cur = __riscv_vmv_x_s_i8m1_i8(__riscv_vslidedown_vx_i8m4(vmax, i, vl)); |       |                                                                                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |       |                                                                                  | |       |                                                                                  vint8m4_t | In file included from /scratch2/agustin/ModelBlaster/examples/yolov8_nano/int8/generated/rvv/kernels.c:8: | /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/lib/gcc/riscv64-zephyr-elf/14.3.0/include/riscv_vector.h:40:9: note: expected 'vint8m1_t' but argument is of type"
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 3,
+        "parent_cycles": 3205376,
+        "result": "ok",
+        "cycles": 3234605,
+        "tokens_in": 17210,
+        "tokens_out": 1354
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "silu_s8": {
+    "baseline": 1770703,
+    "best": 1770703,
+    "improvement_pct": 0.0,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 1770703,
+        "result": "ok",
+        "cycles": 1838503,
+        "tokens_in": 16219,
+        "tokens_out": 536
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 1770703,
+        "result": "ok",
+        "cycles": 1838503,
+        "tokens_in": 16219,
+        "tokens_out": 549
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 1770703,
+        "result": "ok",
+        "cycles": 1838503,
+        "tokens_in": 16219,
+        "tokens_out": 545
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16762,
+        "tokens_out": 573
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16762,
+        "tokens_out": 569
+      },
+      {
+        "iter": 2,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16762,
+        "tokens_out": 558
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 1,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16762,
+        "tokens_out": 551
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 2,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16762,
+        "tokens_out": 585
+      },
+      {
+        "iter": 2,
+        "parent_idx": 1,
+        "exp_idx": 3,
+        "parent_cycles": 1838503,
+        "result": "ok",
+        "cycles": 1770703,
+        "tokens_in": 16762,
+        "tokens_out": 592
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  },
+  "upsample_nearest_s8": {
+    "baseline": 428544,
+    "best": 88452,
+    "improvement_pct": 79.35987903225806,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 428544,
+        "result": "ok",
+        "cycles": 428544,
+        "tokens_in": 16447,
+        "tokens_out": 699
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 428544,
+        "result": "ok",
+        "cycles": 88452,
+        "tokens_in": 16447,
+        "tokens_out": 1010
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 3,
+        "parent_cycles": 428544,
+        "result": "ok",
+        "cycles": 626564,
+        "tokens_in": 16447,
+        "tokens_out": 652
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  }
+}

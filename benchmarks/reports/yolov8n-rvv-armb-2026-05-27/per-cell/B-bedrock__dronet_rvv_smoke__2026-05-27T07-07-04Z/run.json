@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "arm": "B-bedrock",
+  "workload_id": "dronet_rvv_smoke",
+  "run_id": "2026-05-27T07-07-04Z",
+  "git_sha": "2ac7c4e",
+  "started_at": "2026-05-27T07:07:04.272815+00:00",
+  "ended_at": "2026-05-27T07:12:59.207002+00:00",
+  "wall_clock_s": 354.934,
+  "peak_rss_mb": 139.1,
+  "exit_status": "ok",
+  "model": "dronet",
+  "target": "rvv",
+  "quant": "int8",
+  "runner": "spike",
+  "beam": 2,
+  "expansions": 3,
+  "iterations": 2,
+  "firesim_eval": false,
+  "llm_provider": "bedrock",
+  "max_usd": 8.0
+}
