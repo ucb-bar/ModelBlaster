@@ -48,6 +48,14 @@ smolvla = [
     # raises at __init__ if it is missing.
     "num2words>=0.5",
 ]
+scheduler = [
+    # XPU-RT scheduler as a real library. Brings in cvxpy + solvers.
+    # After `uv sync --extra scheduler`, callers can `from xpurt import schedule, Workload`.
+    "xpurt",
+]
+
+[tool.uv.sources]
+xpurt = { path = "/scratch2/agustin/XPU-RT", editable = true }
 
 [project.scripts]
 # `uv run mb-cost` launches the live cost monitor with sensible
