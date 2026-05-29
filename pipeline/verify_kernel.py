@@ -350,6 +350,13 @@ def _gen_inputs_silu_s8(shape: dict, rng: np.random.Generator):
     return inp, out
 
 
+def _gen_inputs_elu_s8(shape: dict, rng: np.random.Generator):
+    n = shape["n"]
+    inp = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    out = np.zeros((n,), dtype=np.int8)
+    return inp, out
+
+
 def _gen_inputs_upsample_nearest_s8(shape: dict, rng: np.random.Generator):
     N, C = shape["N"], shape["C"]
     IH, IW, scale = shape["IH"], shape["IW"], shape["scale"]
@@ -610,6 +617,12 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         fn(_i8p(inp), _i8p(out), shape["n"],
            ctypes.c_float(0.05), ctypes.c_float(0.05), -128, 127)
         return out
+    if op == "elu_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out), shape["n"],
+           ctypes.c_float(0.05), ctypes.c_float(0.05),
+           -128, 127, ctypes.c_float(1.0))
+        return out
     if op == "upsample_nearest_s8":
         inp, out = inputs
         fn(_i8p(inp), _i8p(out),
@@ -709,7 +722,7 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
 # (no atol/rtol tolerance) since integer math is deterministic.
 _INTEGER_OPS = {"linear_s8", "relu_s8", "conv2d_s8", "maxpool2d_s8",
                 "add_s8", "batchnorm2d_s8", "sigmoid_s8",
-                "silu_s8", "upsample_nearest_s8",
+                "silu_s8", "elu_s8", "upsample_nearest_s8",
                 "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8",
                 # ViNT s8 ops (Phase A.2)
                 "mul_s8", "gelu_s8", "pad_s8",
