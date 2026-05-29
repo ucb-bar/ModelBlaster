@@ -146,6 +146,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         "iterations": args.iterations,
         "firesim_eval": firesim_eval,
         "llm_provider": PROVIDER,
+        # Log the temperature schedule applied per attempt in
+        # generate_kernels.py (first attempt deterministic, retries
+        # nudged off zero to escape repeating broken kernels). Bedrock's
+        # Converse API does NOT expose a seed parameter, so we log null
+        # rather than fabricating one -- this is the truth a future
+        # reviewer would need to know to assess reproducibility.
+        "llm_temperature_schedule": [0.0, 0.3],
+        "llm_seed": None,
     }
     if args.max_usd is not None:
         extra["max_usd"] = args.max_usd

@@ -10,4 +10,3 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
         output[i] = (int8_t)v;
     }
 }
-
