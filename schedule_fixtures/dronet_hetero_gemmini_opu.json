@@ -6,7 +6,8 @@
     "source_ir": "/tmp/dronet-graph/graph.json",
     "notes": [
       "Hand-authored placeholder schedule. Timing values are synthetic; only the DAG, hardware_target labels, and topological start_time ordering are load-bearing.",
-      "Replace with a FreshScheduler-emitted schedule against profiled per-op cycles once the harness produces results.csv on the target backends."
+      "Replace with a FreshScheduler-emitted schedule against profiled per-op cycles once the harness produces results.csv on the target backends.",
+      "Updated 2026-05-28: ALL convs + linears routed to gemmini (CPU_P#0). Originally 3 skip-convs (dispatch_8, _16, _24, all 1x1 stride-2) were on rvv_opu; that broke bit-exact verify because gemmini's requantize-after-conv produces slightly different int8 output than rvv_opu's (different rounding policies in the multiply-and-shift path). Each backend's full chain is bit-exact to PyTorch golden, but mixing convs across backends accumulates per-op drift to linf=52. Keeping all requantization-producing ops on ONE backend preserves bit-exact end-to-end. Structural ops (maxpool, bn, relu, add, sigmoid) don't requantize and can mix freely. See notes/known_issues.md for the full debug history."
     ]
   },
   "dispatches": {
@@ -54,11 +55,11 @@
       "dependencies": [
         "dronet_dispatch_1"
       ],
-      "hardware_target": "CPU_E#0",
+      "hardware_target": "CPU_P#0",
       "start_time": 0.027,
       "duration": 0.035,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_8_RVV_OPU_conv2d_s8"
+      "module_name": "dronet$dispatch_8_GEMMINI_conv2d_s8"
     },
     "dronet_dispatch_3": {
       "id": 3,
@@ -159,11 +160,11 @@
       "dependencies": [
         "dronet_dispatch_9"
       ],
-      "hardware_target": "CPU_E#0",
+      "hardware_target": "CPU_P#0",
       "start_time": 0.1165,
       "duration": 0.035,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_16_RVV_OPU_conv2d_s8"
+      "module_name": "dronet$dispatch_16_GEMMINI_conv2d_s8"
     },
     "dronet_dispatch_11": {
       "id": 11,
@@ -264,11 +265,11 @@
       "dependencies": [
         "dronet_dispatch_17"
       ],
-      "hardware_target": "CPU_E#0",
+      "hardware_target": "CPU_P#0",
       "start_time": 0.206,
       "duration": 0.035,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_24_RVV_OPU_conv2d_s8"
+      "module_name": "dronet$dispatch_24_GEMMINI_conv2d_s8"
     },
     "dronet_dispatch_19": {
       "id": 19,
