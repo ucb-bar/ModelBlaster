@@ -5649,6 +5649,56 @@ def _silu_s8_argtypes():
             ctypes.c_int, ctypes.c_int]
 
 
+def _elu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, scale_in, scale_out, activation_min, activation_max, alpha
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float]
+
+
+ELU_S8 = KernelSpec(
+    op="elu_s8",
+    signature=(
+        "void kernel_elu_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max, float alpha)"
+    ),
+    semantics=(
+        "Quantized elementwise ELU (Exponential Linear Unit) on a contiguous\n"
+        "int8 buffer with symmetric per-tensor quantization (zero_point = 0).\n"
+        "ELU(x) = x          if x > 0\n"
+        "         alpha*(e^x - 1) if x <= 0\n"
+        "Reference uses the exact form; an LUT-based variant can be added as\n"
+        "a curated kernel — the int8 input only has 256 possible values, so\n"
+        "the entire output table fits in 256 bytes for a given (scale_in,\n"
+        "scale_out, alpha) tuple:\n"
+        "  f = input[i] * scale_in\n"
+        "  y = (f > 0) ? f : alpha * (expf(f) - 1)\n"
+        "  output[i] = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "alpha is typically 1.0 (PyTorch default)."
+    ),
+    reference_impl="""\
+void kernel_elu_s8(const int8_t *input, int8_t *output, int n,
+                   float scale_in, float scale_out,
+                   int activation_min, int activation_max, float alpha) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = (f > 0.0f) ? f : alpha * (expf(f) - 1.0f);
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 256}],
+    argtypes_factory=_elu_s8_argtypes,
+)
+
+
 SILU_S8 = KernelSpec(
     op="silu_s8",
     signature=(
@@ -6952,6 +7002,8 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "cat4_c1": CAT4_C1,
     # YOLOv8-nano int8 support.
     "silu_s8": SILU_S8,
+    # mlp_control int8 support (PPO actor uses nn.ELU).
+    "elu_s8": ELU_S8,
     "upsample_nearest_s8": UPSAMPLE_NEAREST_S8,
     "cat2_c1_s8": CAT2_C1_S8,
     "cat3_c1_s8": CAT3_C1_S8,

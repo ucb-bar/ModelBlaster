@@ -50,6 +50,21 @@ workloads:
     # output against profiled per-op cycles when the harness produces them.
     xpurt_schedule_path: schedule_fixtures/dronet_hetero_gemmini_opu.json
 
+  # XPU-RT MOSEK MIP-emitted schedule (the "gold standard" reference)
+  # from per-op profiled cycles. Same model, same backends, same
+  # cores registry — differs only in the schedule fixture. Compare
+  # this cell's cycles against dronet_hetero_int8 to measure the
+  # MIP's improvement (or not) over the hand-authored placement.
+  # See scripts/run_xpurt_scheduler.py + notes/xpurt_mosek_baseline.md.
+  - id: dronet_hetero_xpurt_mosek_int8
+    model: dronet
+    target: hetero_gemmini_opu
+    quant: int8
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    xpurt_schedule_path: schedule_fixtures/dronet_xpurt_mosek.json
+
   # ───── yolov8n — recent focus, exercises silu/depthwise/upsample ─────
   # Smoke cells for spike-side validation. The matrix cells below run on
   # firesim for authoritative cycles on accelerator targets.
@@ -58,6 +73,13 @@ workloads:
   - { id: yolov8n_rvv_opu_int8,     model: yolov8_nano, target: rvv_opu,            quant: int8, runner: firesim }
   - { id: yolov8n_gemmini_int8,     model: yolov8_nano, target: gemmini,            quant: int8, runner: firesim }
   - { id: yolov8n_gemmini_q31_int8, model: yolov8_nano, target: gemmini_q31,        quant: int8, runner: firesim }
+
+  # ───── mlp_control — PPO actor (16->256->128->64->4, ELU). int8 path
+  # newly unblocked by `elu_s8` reference kernel. ─────
+  - { id: mlp_control_rvv_opu_int8,     model: mlp_control, target: rvv_opu,     quant: int8, runner: firesim }
+  - { id: mlp_control_gemmini_int8,     model: mlp_control, target: gemmini,     quant: int8, runner: firesim }
+  - { id: mlp_control_gemmini_q31_int8, model: mlp_control, target: gemmini_q31, quant: int8, runner: firesim }
+
   - id: yolov8n_hetero_int8
     model: yolov8_nano
     target: hetero_gemmini_opu

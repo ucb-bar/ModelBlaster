@@ -1155,6 +1155,17 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "elu_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            alpha = q.get("alpha", 1.0)
+            call = (
+                f"kernel_elu_s8({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']}, "
+                f"{_f32(alpha)})"
+            )
         elif op["op"] == "upsample_nearest_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]

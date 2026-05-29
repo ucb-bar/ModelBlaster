@@ -617,15 +617,22 @@ def extract_int8(
     # Default: single-output. The output handler may overwrite this.
     output_names_multi: Optional[list[str]] = None
 
-    # Two-pass walk: first collect linear→relu, conv2d→relu, and add→relu
-    # fusions so the relu node is absorbed into the producer's op kind.
-    # Split by producer type so the passes_applied.json artifact can credit
-    # each fusion pattern separately -- that distinction matters when
-    # evaluating which pattern is paying off on which workload.
+    # Two-pass walk: first collect linear→relu, conv2d→relu, add→relu, and
+    # batchnorm2d→relu fusions so the relu node is absorbed into the
+    # producer's op kind. Split by producer type so the passes_applied.json
+    # artifact can credit each fusion pattern separately -- that distinction
+    # matters when evaluating which pattern is paying off on which workload.
     nodes = list(gm.graph.nodes)
     fused_linear_relu: set[str] = set()
     fused_conv2d_relu: set[str] = set()
     fused_add_relu: set[str] = set()
+    # bn→relu fuse: dronet's pre-activation residual blocks
+    # (BN → ReLU → Conv) leave the BN's output feeding a standalone ReLU
+    # kernel call. Folding the ReLU into the BN's emit (activation_min=0
+    # on the existing batchnorm2d_s8 op) removes one full N×C×H×W pass
+    # over the activation tensor per BN — a noticeable win on dronet
+    # where 6 such pairs exist.
+    fused_bn_relu: set[str] = set()
     for i, node in enumerate(nodes):
         if i + 1 >= len(nodes):
             continue
@@ -644,6 +651,8 @@ def extract_int8(
                 fused_linear_relu.add(nxt.name)
             elif isinstance(producer_mod, torch.nn.Conv2d):
                 fused_conv2d_relu.add(nxt.name)
+            elif isinstance(producer_mod, torch.nn.BatchNorm2d):
+                fused_bn_relu.add(nxt.name)
         elif node.op == "call_function":
             t = node.target
             tname = getattr(t, "__name__", "")
@@ -651,7 +660,7 @@ def extract_int8(
                     or t is __import__("operator").add):
                 fused_add_relu.add(nxt.name)
     fused_relu_after: set[str] = (
-        fused_linear_relu | fused_conv2d_relu | fused_add_relu
+        fused_linear_relu | fused_conv2d_relu | fused_add_relu | fused_bn_relu
     )
 
     # Nodes to skip during the main walk (e.g. getitem consumers of chunk).
@@ -879,21 +888,37 @@ def extract_int8(
                 weights_blob[b_key] = bn_bias
                 in_shape = tensors_meta[in_name]["shape"]
                 N_, C, H, W = (int(s) for s in in_shape)
+                # Same fuse-with-following-relu pattern as conv2d_s8: if the
+                # next FX node is a ReLU and was captured in the fusion
+                # scan, clamp at 0 on the batchnorm op and route the output
+                # tensor name to the ReLU's name. The separate ReLU kernel
+                # call then becomes a no-op (its emit branch sees the alias
+                # already exists and skips).
+                next_node = (nodes[nodes.index(node) + 1]
+                             if nodes.index(node) + 1 < len(nodes) else None)
+                fuse_relu = (next_node is not None
+                             and next_node.name in fused_relu_after
+                             and next_node.name in fused_bn_relu)
+                act_min = 0 if fuse_relu else -128
                 ops.append({
                     "name": str(node.target),
                     "op": "batchnorm2d_s8",
                     "inputs": [in_name],
-                    "outputs": [node.name],
+                    "outputs": [
+                        next_node.name if fuse_relu else node.name
+                    ],
                     "weight": s_key,
                     "bias": b_key,
                     "shape": {"N": N_, "C": C, "H": H, "W": W},
                     "quant": {
                         "scale_in":   scales[in_name],
                         "scale_out":  scales[node.name],
-                        "activation_min": -128,
+                        "activation_min": act_min,
                         "activation_max": 127,
                     },
                 })
+                if fuse_relu and next_node.name not in tensors_meta:
+                    tensors_meta[next_node.name] = dict(tensors_meta[node.name])
 
             elif isinstance(mod, torch.nn.Sigmoid):
                 _record(node.name, dtype="i8")
@@ -926,6 +951,24 @@ def extract_int8(
                         "scale_out": scales[node.name],
                         "activation_min": -128,
                         "activation_max": 127,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.ELU):
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "elu_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in":  scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128,
+                        "activation_max": 127,
+                        "alpha": float(mod.alpha),
                     },
                 })
 
@@ -1317,6 +1360,14 @@ def extract_int8(
             v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "elu_s8":
+            q = op["quant"]
+            fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            alpha = np.float32(q.get("alpha", 1.0))
+            elu_out = np.where(fv > 0, fv, alpha * (np.exp(fv) - np.float32(1.0))).astype(np.float32)
+            v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
+            v = np.clip(v, q["activation_min"], q["activation_max"])
+            activations[out_name] = v.astype(np.int8)
         elif op["op"] == "upsample_nearest_s8":
             sh = op["shape"]
             scale = sh["scale"]
@@ -1387,6 +1438,10 @@ def extract_int8(
                 "fired": len(fused_add_relu),
                 "sites": sorted(fused_add_relu),
             },
+            "bn_relu_fuse": {
+                "fired": len(fused_bn_relu),
+                "sites": sorted(fused_bn_relu),
+            },
         },
     }
     with open(passes_path, "w") as f:
@@ -1397,7 +1452,8 @@ def extract_int8(
     print(f"wrote {passes_path}  ("
           f"linear_relu_fuse={len(fused_linear_relu)}, "
           f"conv2d_relu_fuse={len(fused_conv2d_relu)}, "
-          f"add_relu_fuse={len(fused_add_relu)})")
+          f"add_relu_fuse={len(fused_add_relu)}, "
+          f"bn_relu_fuse={len(fused_bn_relu)})")
     return ir
 
 
