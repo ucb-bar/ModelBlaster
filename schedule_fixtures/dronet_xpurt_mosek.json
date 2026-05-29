@@ -1,13 +1,11 @@
 {
-  "dot_file": "dronet_hetero_gemmini_opu_handauthored.json",
+  "dot_file": "dronet_xpurt_mosek.json",
   "_provenance": {
-    "generated_by": "scripts/gen_hetero_schedule.py",
-    "policy": "gemmini_main_opu_skip",
-    "source_ir": "/tmp/dronet-graph/graph.json",
+    "generated_by": "scripts/run_xpurt_scheduler.py",
+    "solver": "MOSEK",
+    "cycles_per_ms_scale": 1000000,
     "notes": [
-      "Hand-authored placeholder schedule. Timing values are synthetic; only the DAG, hardware_target labels, and topological start_time ordering are load-bearing.",
-      "Replace with a FreshScheduler-emitted schedule against profiled per-op cycles once the harness produces results.csv on the target backends.",
-      "Updated 2026-05-28: ALL convs + linears routed to gemmini (CPU_P#0). Originally 3 skip-convs (dispatch_8, _16, _24, all 1x1 stride-2) were on rvv_opu; that broke bit-exact verify because gemmini's requantize-after-conv produces slightly different int8 output than rvv_opu's (different rounding policies in the multiply-and-shift path). Each backend's full chain is bit-exact to PyTorch golden, but mixing convs across backends accumulates per-op drift to linf=52. Keeping all requantization-producing ops on ONE backend preserves bit-exact end-to-end. Structural ops (maxpool, bn, relu, add, sigmoid) don't requantize and can mix freely. See notes/known_issues.md for the full debug history."
+      "Schedule produced by XPU-RT's MOSEK solver from measured per-op cycle profiles. Each dispatch's machine assignment minimizes the workload's makespan subject to the dependency graph in dronet_dispatch_deps.json and the per-(dispatch, machine) processing times derived from standalone-backend FireSim runs."
     ]
   },
   "dispatches": {
@@ -18,9 +16,9 @@
       "dependencies": [],
       "hardware_target": "CPU_P#0",
       "start_time": 0.0,
-      "duration": 0.02,
+      "duration": 7104263.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_0_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_0_GEMMINI_op"
     },
     "dronet_dispatch_1": {
       "id": 1,
@@ -30,10 +28,10 @@
         "dronet_dispatch_0"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.02,
-      "duration": 0.003,
+      "start_time": 7114263.0,
+      "duration": 4334165.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_1_RVV_OPU_maxpool2d_s8"
+      "module_name": "dronet$dispatch_1_RVV_OPU_op"
     },
     "dronet_dispatch_2": {
       "id": 2,
@@ -43,23 +41,10 @@
         "dronet_dispatch_1"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.023,
-      "duration": 0.004,
+      "start_time": 11458428.0,
+      "duration": 1861717.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_2_RVV_OPU_batchnorm2d_s8"
-    },
-    "dronet_dispatch_8": {
-      "id": 8,
-      "ordinal": 1,
-      "total": 1,
-      "dependencies": [
-        "dronet_dispatch_1"
-      ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 0.027,
-      "duration": 0.035,
-      "job_name": "dronet",
-      "module_name": "dronet$dispatch_8_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_2_RVV_OPU_op"
     },
     "dronet_dispatch_3": {
       "id": 3,
@@ -69,10 +54,10 @@
         "dronet_dispatch_2"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.062,
-      "duration": 0.002,
+      "start_time": 13330145.0,
+      "duration": 205330.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_3_RVV_OPU_relu_s8"
+      "module_name": "dronet$dispatch_3_RVV_OPU_op"
     },
     "dronet_dispatch_4": {
       "id": 4,
@@ -82,10 +67,10 @@
         "dronet_dispatch_3"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.064,
-      "duration": 0.02,
+      "start_time": 13545475.0,
+      "duration": 524975.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_4_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_4_GEMMINI_op"
     },
     "dronet_dispatch_5": {
       "id": 5,
@@ -94,11 +79,11 @@
       "dependencies": [
         "dronet_dispatch_4"
       ],
-      "hardware_target": "CPU_E#0",
-      "start_time": 0.084,
-      "duration": 0.004,
+      "hardware_target": "CPU_P#0",
+      "start_time": 14080449.999999998,
+      "duration": 511595.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_5_RVV_OPU_batchnorm2d_s8"
+      "module_name": "dronet$dispatch_5_GEMMINI_op"
     },
     "dronet_dispatch_6": {
       "id": 6,
@@ -108,10 +93,10 @@
         "dronet_dispatch_5"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.088,
-      "duration": 0.002,
+      "start_time": 14602044.999999998,
+      "duration": 53195.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_6_RVV_OPU_relu_s8"
+      "module_name": "dronet$dispatch_6_RVV_OPU_op"
     },
     "dronet_dispatch_7": {
       "id": 7,
@@ -121,10 +106,23 @@
         "dronet_dispatch_6"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.09,
-      "duration": 0.02,
+      "start_time": 14665239.999999998,
+      "duration": 423955.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_7_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_7_GEMMINI_op"
+    },
+    "dronet_dispatch_8": {
+      "id": 8,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet_dispatch_1"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 13148569.105877917,
+      "duration": 396932.0,
+      "job_name": "dronet",
+      "module_name": "dronet$dispatch_8_GEMMINI_op"
     },
     "dronet_dispatch_9": {
       "id": 9,
@@ -135,10 +133,10 @@
         "dronet_dispatch_8"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.11,
-      "duration": 0.0025,
+      "start_time": 15099194.999999996,
+      "duration": 502569.99999999994,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_9_RVV_OPU_add_s8"
+      "module_name": "dronet$dispatch_9_RVV_OPU_op"
     },
     "dronet_dispatch_10": {
       "id": 10,
@@ -148,23 +146,10 @@
         "dronet_dispatch_9"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.1125,
-      "duration": 0.004,
+      "start_time": 15611764.999999998,
+      "duration": 509526.00000000006,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_10_RVV_OPU_batchnorm2d_s8"
-    },
-    "dronet_dispatch_16": {
-      "id": 16,
-      "ordinal": 1,
-      "total": 1,
-      "dependencies": [
-        "dronet_dispatch_9"
-      ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 0.1165,
-      "duration": 0.035,
-      "job_name": "dronet",
-      "module_name": "dronet$dispatch_16_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_10_RVV_OPU_op"
     },
     "dronet_dispatch_11": {
       "id": 11,
@@ -173,11 +158,11 @@
       "dependencies": [
         "dronet_dispatch_10"
       ],
-      "hardware_target": "CPU_E#0",
-      "start_time": 0.1515,
-      "duration": 0.002,
+      "hardware_target": "CPU_P#0",
+      "start_time": 16131290.999999998,
+      "duration": 53376.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_11_RVV_OPU_relu_s8"
+      "module_name": "dronet$dispatch_11_GEMMINI_op"
     },
     "dronet_dispatch_12": {
       "id": 12,
@@ -187,10 +172,10 @@
         "dronet_dispatch_11"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.1535,
-      "duration": 0.02,
+      "start_time": 16194666.999999998,
+      "duration": 189230.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_12_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_12_GEMMINI_op"
     },
     "dronet_dispatch_13": {
       "id": 13,
@@ -200,10 +185,10 @@
         "dronet_dispatch_12"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.1735,
-      "duration": 0.004,
+      "start_time": 16393896.999999996,
+      "duration": 261896.00000000003,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_13_RVV_OPU_batchnorm2d_s8"
+      "module_name": "dronet$dispatch_13_RVV_OPU_op"
     },
     "dronet_dispatch_14": {
       "id": 14,
@@ -213,10 +198,10 @@
         "dronet_dispatch_13"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.1775,
-      "duration": 0.002,
+      "start_time": 16665792.999999996,
+      "duration": 26581.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_14_RVV_OPU_relu_s8"
+      "module_name": "dronet$dispatch_14_RVV_OPU_op"
     },
     "dronet_dispatch_15": {
       "id": 15,
@@ -226,10 +211,23 @@
         "dronet_dispatch_14"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.1795,
-      "duration": 0.02,
+      "start_time": 16702373.999999998,
+      "duration": 190991.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_15_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_15_GEMMINI_op"
+    },
+    "dronet_dispatch_16": {
+      "id": 16,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet_dispatch_9"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 16383897.000000766,
+      "duration": 152312.0,
+      "job_name": "dronet",
+      "module_name": "dronet$dispatch_16_GEMMINI_op"
     },
     "dronet_dispatch_17": {
       "id": 17,
@@ -240,10 +238,10 @@
         "dronet_dispatch_16"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.1995,
-      "duration": 0.0025,
+      "start_time": 16903364.999999996,
+      "duration": 251448.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_17_RVV_OPU_add_s8"
+      "module_name": "dronet$dispatch_17_RVV_OPU_op"
     },
     "dronet_dispatch_18": {
       "id": 18,
@@ -253,23 +251,10 @@
         "dronet_dispatch_17"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.202,
-      "duration": 0.004,
+      "start_time": 17164813.0,
+      "duration": 260191.99999999997,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_18_RVV_OPU_batchnorm2d_s8"
-    },
-    "dronet_dispatch_24": {
-      "id": 24,
-      "ordinal": 1,
-      "total": 1,
-      "dependencies": [
-        "dronet_dispatch_17"
-      ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 0.206,
-      "duration": 0.035,
-      "job_name": "dronet",
-      "module_name": "dronet$dispatch_24_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_18_RVV_OPU_op"
     },
     "dronet_dispatch_19": {
       "id": 19,
@@ -279,10 +264,10 @@
         "dronet_dispatch_18"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.241,
-      "duration": 0.002,
+      "start_time": 17435005.0,
+      "duration": 26472.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_19_RVV_OPU_relu_s8"
+      "module_name": "dronet$dispatch_19_RVV_OPU_op"
     },
     "dronet_dispatch_20": {
       "id": 20,
@@ -292,10 +277,10 @@
         "dronet_dispatch_19"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.243,
-      "duration": 0.02,
+      "start_time": 17471477.0,
+      "duration": 114054.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_20_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_20_GEMMINI_op"
     },
     "dronet_dispatch_21": {
       "id": 21,
@@ -305,10 +290,10 @@
         "dronet_dispatch_20"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.263,
-      "duration": 0.004,
+      "start_time": 17595531.0,
+      "duration": 180249.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_21_RVV_OPU_batchnorm2d_s8"
+      "module_name": "dronet$dispatch_21_RVV_OPU_op"
     },
     "dronet_dispatch_22": {
       "id": 22,
@@ -318,10 +303,10 @@
         "dronet_dispatch_21"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 0.267,
-      "duration": 0.002,
+      "start_time": 17785780.000000004,
+      "duration": 17117.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_22_RVV_OPU_relu_s8"
+      "module_name": "dronet$dispatch_22_RVV_OPU_op"
     },
     "dronet_dispatch_23": {
       "id": 23,
@@ -331,10 +316,23 @@
         "dronet_dispatch_22"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.269,
-      "duration": 0.02,
+      "start_time": 17812897.000000004,
+      "duration": 125969.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_23_GEMMINI_conv2d_s8"
+      "module_name": "dronet$dispatch_23_GEMMINI_op"
+    },
+    "dronet_dispatch_24": {
+      "id": 24,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet_dispatch_17"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 17164813.0,
+      "duration": 92394.0,
+      "job_name": "dronet",
+      "module_name": "dronet$dispatch_24_GEMMINI_op"
     },
     "dronet_dispatch_25": {
       "id": 25,
@@ -344,11 +342,11 @@
         "dronet_dispatch_23",
         "dronet_dispatch_24"
       ],
-      "hardware_target": "CPU_E#0",
-      "start_time": 0.289,
-      "duration": 0.0025,
+      "hardware_target": "CPU_P#0",
+      "start_time": 17948866.000000004,
+      "duration": 164297.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_25_RVV_OPU_add_s8"
+      "module_name": "dronet$dispatch_25_GEMMINI_op"
     },
     "dronet_dispatch_26": {
       "id": 26,
@@ -357,11 +355,11 @@
       "dependencies": [
         "dronet_dispatch_25"
       ],
-      "hardware_target": "CPU_E#0",
-      "start_time": 0.2915,
-      "duration": 0.002,
+      "hardware_target": "CPU_P#0",
+      "start_time": 18123163.0,
+      "duration": 17181.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_26_RVV_OPU_relu_s8"
+      "module_name": "dronet$dispatch_26_GEMMINI_op"
     },
     "dronet_dispatch_27": {
       "id": 27,
@@ -371,10 +369,10 @@
         "dronet_dispatch_26"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.2935,
-      "duration": 0.008,
+      "start_time": 18150344.091573887,
+      "duration": 21618.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_27_GEMMINI_linear_s8"
+      "module_name": "dronet$dispatch_27_GEMMINI_op"
     },
     "dronet_dispatch_28": {
       "id": 28,
@@ -384,10 +382,10 @@
         "dronet_dispatch_26"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 0.3015,
-      "duration": 0.008,
+      "start_time": 18150344.0466993,
+      "duration": 21180.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_28_GEMMINI_linear_s8"
+      "module_name": "dronet$dispatch_28_GEMMINI_op"
     },
     "dronet_dispatch_29": {
       "id": 29,
@@ -396,11 +394,11 @@
       "dependencies": [
         "dronet_dispatch_28"
       ],
-      "hardware_target": "CPU_E#0",
-      "start_time": 0.3095,
-      "duration": 0.005,
+      "hardware_target": "CPU_P#0",
+      "start_time": 18181524.046699297,
+      "duration": 817.0,
       "job_name": "dronet",
-      "module_name": "dronet$dispatch_29_RVV_OPU_sigmoid_s8"
+      "module_name": "dronet$dispatch_29_GEMMINI_op"
     }
   }
 }
