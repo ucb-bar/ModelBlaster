@@ -21,4 +21,3 @@ void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
         }
     }
 }
-
