@@ -353,11 +353,23 @@ else
     if [[ -n "${FIRESIM_TIMEOUT:-}" ]]; then
         FIRESIM_FLAGS+=("--timeout=${FIRESIM_TIMEOUT}")
     fi
+    # Pass per-model quants when QUANTS was set (mixed-quant builds).
+    _quant_flag=()
+    if [[ -n "${QUANTS:-}" ]]; then
+        _quant_flag+=("--quants" "${QUANTS}")
+    fi
+    # Use the FIRST model's quant for the io.npz fallback path (single
+    # --io arg). per-model golden lookup uses --quants when present.
+    _first_quant="${QUANT}"
+    if [[ -n "${QUANTS:-}" ]]; then
+        _first_quant="${QUANTS%%,*}"
+    fi
     python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${_first_quant}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
+        "${_quant_flag[@]}" \
         "${FIRESIM_FLAGS[@]}"
 fi
 _mb_stage_end run
