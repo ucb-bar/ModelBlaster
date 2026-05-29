@@ -362,12 +362,19 @@ LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
                     "add_s8", "sigmoid_s8"},
     "gemmini_q31": {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
                     "add_s8", "sigmoid_s8"},
-    # (Plain rvv conv2d_s8 was previously here as a workaround for a
-    # broken curated kernel; the actual bug was the _LAYOUT_PERMUTATION
-    # for "ihwoc" returning HWIO order instead of IHWO. Fixed in
-    # generate_skeleton.py:_LAYOUT_PERMUTATION. The curated rvv conv2d
-    # kernels now pass verify bit-exact and give ~16-17× speedup over
-    # the scalar reference on dronet + yolov8n smoke shapes.)
+    # Plain rvv: the elementwise / normalization ops have no working
+    # curated kernel (add_s8 has none at all; batchnorm2d_s8 / cat*_c1_s8
+    # exist but trip verify with linf=82 / rel_err=5.1e+13 on yolov8n
+    # smoke shapes, suggesting an OOB / scale-mismatch bug in those
+    # files). Arm A transparently falls back to reference for them;
+    # Arm B's LLM attempts trip verify on every retry. Skip these ops
+    # so the seed reference_impl holds, same as the gemmini pattern.
+    # conv2d_s8 was previously here too -- that workaround was for the
+    # IHWOC layout permutation bug (fixed in
+    # generate_skeleton.py:_LAYOUT_PERMUTATION); conv2d now works
+    # bit-exact via rvv_vsmul_vnclip and gives ~16-17× speedup.
+    "rvv":         {"add_s8", "batchnorm2d_s8", "sigmoid_s8",
+                    "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"},
 }
 
 

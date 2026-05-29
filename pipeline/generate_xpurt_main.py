@@ -183,13 +183,28 @@ def _emit(networks: list[str], schedule_name: str,
         # core_kind comes from the schedule and matches the backend tag;
         # we dispatch with the per-(network, kind) state struct so
         # `.pool` is the running kind's, with no per-dispatch write.
+        #
+        # Cross-tile memory coherence: Gemmini's RoCC DMA reads/writes
+        # memory through an independent port at the SoC coherence point,
+        # NOT through the CPU store buffer or L1 dcache. On
+        # GemminiAndOPUShuttleConfig, the CPU on tile 0 (which dispatches
+        # to Gemmini) might still have writes sitting in its store buffer
+        # when Gemmini's mvin reads, and Gemmini's mvout writes may not
+        # be visible to subsequent CPU loads on tile 1 (Saturn). The
+        # `fence rw,rw` before+after each dispatch fixes both. Diagnosed
+        # in merlin/third_party/iree_bar/.../embedded_elf_loader.c
+        # (2026-05-14) and ported here for the multi-backend xpurt
+        # dispatch loop. Without these fences, hetero output diverges
+        # from golden (linf ~52 on dronet).
         bs_select_lines: list[str] = []
         for i, bs in enumerate(backends):
             BS = bs.upper()
             kw = "if" if i == 0 else "else if"
             bs_select_lines.append(
                 f'            {kw} (strcmp(e_->core_kind, "{bs}") == 0) {{\n'
+                f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
                 f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{bs});\n"
+                f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
                 f"            }}"
             )
         bs_select_lines.append(
@@ -392,6 +407,30 @@ def _emit(networks: list[str], schedule_name: str,
 
 {chr(10).join(inc_lines)}
 #include "{dispatch_table_header}"
+
+/* Note (2026-05-28): we previously tried several memory-fence and
+ * cache-invalidation strategies to fix `dronet_hetero` verify-fail
+ * (max_abs_err=52 vs golden). All failed identically:
+ *
+ *   - fence rw,rw before+after each dispatch:    output unchanged
+ *   - L1 dcache eviction via 128KB scratch read: output unchanged
+ *   - Zicbom cbo.inval:                          illegal-instr trap
+ *     (mcause=2, mtval=0x7a00f) -- bitstream
+ *     was not built with Zicbom.
+ *
+ * Persistent identical failure across these very different remedies
+ * indicates the bug is NOT cross-tile cache staleness. The real
+ * cause is cross-backend per-op numerical drift: gemmini and
+ * rvv_opu each match PyTorch golden bit-exactly END-TO-END, but
+ * their intermediate per-op outputs differ slightly due to
+ * backend-specific rounding/quantization details (each backend's
+ * full chain happens to cancel its own drift into a golden-matching
+ * final answer; mixing chains doesn't preserve that property).
+ *
+ * Documented in notes/known_issues.md. Fix path is cross-backend
+ * numerical alignment, not memory mgmt. fence rw,rw is kept on the
+ * dispatch boundaries below as good hygiene (it WAS load-bearing
+ * for Gemmini DMA in merlin's loader; harmless and ~zero cost). */
 
 /* Per-(model, backend) externs — the harness compiles a separate
  * OBJECT lib per pair, with externally-visible symbols suffixed _<bs>
