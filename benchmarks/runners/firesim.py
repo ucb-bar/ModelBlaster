@@ -104,3 +104,32 @@ def write_xpurt_trace(out_dir: Path, trace_csv: Optional[str]) -> None:
     if not trace_csv:
         return
     (out_dir / "xpurt_trace.csv").write_text(trace_csv + "\n")
+    _maybe_emit_scheduler_postmortem(out_dir)
+
+
+def _maybe_emit_scheduler_postmortem(out_dir: Path) -> None:
+    """If xpurt's postmortem comparator is importable AND a scheduler_report.json
+    sibling exists, write scheduler_postmortem.json. Silent no-op otherwise —
+    postmortem is best-effort observability, not a required artifact."""
+    trace_path = out_dir / "xpurt_trace.csv"
+    if not trace_path.exists():
+        return
+    report_path = out_dir / "scheduler_report.json"
+    try:
+        from postmortem import compare_trace  # xpurt installable
+    except ImportError:
+        try:
+            import sys
+            sys.path.insert(0, "/scratch2/agustin/XPU-RT/xpu-rt")
+            from postmortem import compare_trace
+        except ImportError:
+            return
+    try:
+        compare_trace(
+            str(trace_path),
+            str(report_path) if report_path.exists() else None,
+            write_to=str(out_dir / "scheduler_postmortem.json"),
+        )
+    except Exception:
+        # Best-effort: do not let postmortem errors break a successful run.
+        return
