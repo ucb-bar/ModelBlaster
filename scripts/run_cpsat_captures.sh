@@ -15,6 +15,13 @@ export RUNNER="firesim"
 export FIRESIM_QUEUE_TIMEOUT="3600"
 export XPURT_TRACE=1
 export BACKENDS="gemmini,rvv_opu"
+# CRITICAL: enable curated kernels in the multi-net build. Without this
+# GLOBAL_CURATED_DIR export, examples/_run_lib.sh:156 skips the
+# --global-curated-dir flag and generate_kernels falls back to scalar
+# reference for conv2d_s8 — making convs 9× slower than the gemmini RoCC
+# kernel SOLO mode uses. arm_a_curated.py sets this; xpurt_demo/run.sh
+# did NOT, which is the runtime contention root cause.
+export GLOBAL_CURATED_DIR="$PWD/kernels"
 export REGISTRY="$PWD/cores/chipyard_gemmini_opu_hetero.json"
 export CPU_P_KIND="gemmini"
 export CPU_E_KIND="rvv_opu"
@@ -23,7 +30,7 @@ LOG=/tmp/mb-matrix/cpsat_captures.log
 mkdir -p "$(dirname "$LOG")"
 : > "$LOG"
 
-CONFIGS=(heft_qrb heft_dronet2_mlp4)
+CONFIGS=(mosek_dronet2_mlp4 mosek_qrb)
 if [[ $# -gt 0 ]]; then CONFIGS=("$@"); fi
 
 for cfg in "${CONFIGS[@]}"; do
