@@ -9,6 +9,10 @@ export RUNNER="firesim"
 export FIRESIM_QUEUE_TIMEOUT="3600"
 export XPURT_TRACE=1
 export BACKENDS="gemmini,rvv_opu"
+# CRITICAL: enable curated gemmini RoCC kernels. Without this the
+# multi-net staging picks scalar reference for conv2d_s8 (9× slower
+# than the curated gemmini_im2col_full_C kernel).
+export GLOBAL_CURATED_DIR="$PWD/kernels"
 export REGISTRY="$PWD/cores/chipyard_gemmini_opu_hetero.json"
 export CPU_P_KIND="gemmini"
 export CPU_E_KIND="rvv_opu"
