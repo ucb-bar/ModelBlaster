@@ -58,24 +58,37 @@ def _read_fixture(fx_name):
 def _run_actual_ms(run_dir):
     trace = run_dir / "xpurt_trace.csv"
     if not trace.exists():
-        return None, "?"
+        return None, "?", 0
     rows = [r for r in csv.DictReader(trace.open())
             if r and r.get("actual_end_cycles","").strip()]
     if not rows:
-        return None, "?"
+        return None, "?", 0
     actual_ms = max(int(r["actual_end_cycles"]) for r in rows) / 1000.0
-    uart = run_dir / "uartlog"
+    n = len(rows)
+    # Verify status: prefer run_stdout.log (spike_runner verify output
+    # against PyTorch goldens). Uartlog only has the Zephyr framework's
+    # *** PASSED ***, which fires on a clean kernel exit even when the
+    # bit-exact verification later fails. run_stdout.log carries the
+    # authoritative OVERALL: PASS|FAIL line from spike_runner.
     overall = "?"
-    if uart.exists():
-        text = uart.read_text(errors="replace")
-        if "*** PASSED ***" in text or "OVERALL: PASS" in text:
-            overall = "PASS"
-        elif "OVERALL: FAIL" in text or "*** FAILED ***" in text:
-            overall = "FAIL"
-    return actual_ms, overall
+    for log_name in ("run_stdout.log", "uartlog"):
+        log_file = run_dir / log_name
+        if log_file.exists():
+            text = log_file.read_text(errors="replace")
+            if "OVERALL: FAIL" in text:
+                overall = "FAIL"
+                break
+            if "OVERALL: PASS" in text:
+                overall = "PASS"
+                break
+            # Zephyr's *** PASSED *** is a weaker signal — keep looking
+            # in run_stdout.log first; only fall back to it.
+            if log_name == "uartlog" and "*** PASSED ***" in text:
+                overall = "PASS"
+    return actual_ms, overall, n
 
 
-def _read_actuals(result_dir_name, run_filter=None):
+def _read_actuals(result_dir_name, run_filter=None, expected_n=None):
     cell = RESULTS / result_dir_name
     if not cell.exists():
         return []
@@ -84,10 +97,15 @@ def _read_actuals(result_dir_name, run_filter=None):
         runs = [r for r in runs if r.name >= "20260530T0046"]
     out = []
     for d in runs:
-        ms, verify = _run_actual_ms(d)
+        ms, verify, n = _run_actual_ms(d)
         if ms is None:
             continue
-        out.append({"run": d.name, "actual_ms": ms, "verify": verify})
+        # Skip runs whose dispatch count doesn't match the fixture —
+        # those are stale binaries that the queue ran from a previous
+        # config's build artifacts.
+        if expected_n is not None and n != expected_n:
+            continue
+        out.append({"run": d.name, "actual_ms": ms, "verify": verify, "n": n})
     return out
 
 
@@ -101,7 +119,8 @@ def main():
 
     for label, fx_name, dir_name, run_filter in CONFIGS:
         fx = _read_fixture(fx_name)
-        actuals = _read_actuals(dir_name, run_filter)
+        expected_n = fx["n_dispatches"] if fx else None
+        actuals = _read_actuals(dir_name, run_filter, expected_n=expected_n)
         pred = fx["predicted_ms"] if fx else None
         solver = fx["solver"] if fx else "—"
         n = str(fx["n_dispatches"]) if fx else "—"
