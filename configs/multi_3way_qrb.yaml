@@ -1,0 +1,38 @@
+# QRB5165 head-to-head: 1 yolov8n + 2 dronet + 4 mlp_control on the
+# Gemmini+RVV/OPU hetero bitstream. Bitstream and core kinds are fixed —
+# all of our scheduling work runs on this single 2-tile config (CPU_P=
+# Gemmini+scalar, CPU_E=RVV+OPU). No q31 / scalar-only / rvv-only variants.
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+
+# Two-tile hetero: kind names match the schedule fixture's
+# `hardware_target` strings consumed by pipeline/ingest_xpurt_schedule.py.
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }   # Gemmini RoCC + scalar fallback (Shuttle)
+  - { id: opu0,     kind: CPU_E, hart: 1 }   # Saturn OPU + RVV (Shuttle)
+
+# Cross-backend numerical drift constraint: ops that produce requantized
+# outputs MUST stay on one backend per inference chain. Encoded as
+# infeasible_combinations on CPU_E for these op kinds.
+requantize_ops: [conv2d_s8, linear_s8]
+
+# Networks with their instance counts. Independent instances (no
+# cross-instance time ordering) — the MIP packs them within the horizon.
+networks:
+  - { name: yolov8_nano, quant: int8, instances: 1 }
+  - { name: dronet,      quant: int8, instances: 2 }
+  - { name: mlp_control, quant: int8, instances: 4 }
+
+# Target horizon (ms). MOSEK minimizes makespan; if solved makespan <
+# this value, we've beaten qrb5165's 75.71 ms head-to-head. Acts as a
+# soft target — the solver minimizes regardless, and the value also
+# informs the periodic time window if a network is marked periodic.
+horizon_ms: 75.0
+
+# Solver knobs
+solver: HEFT
+time_limit_s: 120
+cycles_source: db        # db = median across reps from profile_db
+cycles_agg: median       # alt: mean/min/max
+cycles_per_ms: 1000000   # 1 GHz target clock
