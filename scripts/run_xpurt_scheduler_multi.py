@@ -138,16 +138,39 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
     next_job_id = 0
     instance_meta: List[dict] = []  # for fixture emission
 
+    # Horizon for periodic instance bounds. Each instance i of a network
+    # with N total instances gets a time slice [i * horizon/N, (i+1) * horizon/N]
+    # so that the scheduler enforces "fire at this Hz" semantics, not just
+    # "do N copies anywhere in the makespan." If enforce_periodic is False
+    # (legacy mode) we skip per-instance min/max bounds and let the scheduler
+    # pack freely — that's what produced the headline 25.30 ms result, which
+    # is correct for "do all 6 inferences as fast as possible" but doesn't
+    # match the qrb image's periodic robotics frequencies.
+    enforce_periodic = bool(cfg.get("enforce_periodic", False))
+    horizon_ms = float(cfg.get("horizon_ms", 0.0))
+
     for net_cfg in cfg["networks"]:
         network = net_cfg["name"]
         quant = net_cfg["quant"]
         n_inst = int(net_cfg.get("instances", 1))
         data = _load_network(network, quant)
 
+        # Per-network period override (rare). Defaults to horizon_ms / n_inst
+        # so a network with N instances fires every horizon/N. A network
+        # with explicit period_ms uses that instead — useful when two
+        # networks have different target Hz but share the same horizon.
+        net_period_ms = float(net_cfg.get("period_ms") or 0.0) or (
+            horizon_ms / max(n_inst, 1) if horizon_ms > 0 else 0.0
+        )
+
         for inst in range(n_inst):
             inst_prefix = f"{network}#{inst}"
             inst_job_id = next_job_id
             next_job_id += 1
+
+            # Periodic time-slice bounds for this instance.
+            inst_min_start = inst * net_period_ms if enforce_periodic and net_period_ms > 0 else None
+            inst_max_end = (inst + 1) * net_period_ms if enforce_periodic and net_period_ms > 0 else None
 
             # First pass: create Operations (no predecessors yet — we
             # need all op objects before we can wire deps).
@@ -166,6 +189,8 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
                 op = Operation(
                     processing_times=[g_ms, o_ms],
                     operation_name=f"{inst_prefix}_dispatch_{did}",
+                    min_start_t=inst_min_start,
+                    max_end_t=inst_max_end,
                 )
                 # Annotate metadata for fixture emission.
                 op._mb_network = network        # noqa: SLF001
