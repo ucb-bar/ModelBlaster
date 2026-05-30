@@ -69,7 +69,7 @@ cannot fit any 1+2+4 bundle under 75 ms regardless of scheduler — see
 
 MOSEK is the baseline; HEFT/PEFT are fast fallbacks when MOSEK times out.
 
-## Sub-result: yolov8_nano_64 1+2+4
+## Sub-result: yolov8_nano_64 1+2+4 (full qrb shape)
 
 For the head-to-head match including yolov8 (so the workload structure
 matches qrb exactly), we extracted **yolov8_nano @ 64×64 input**
@@ -80,15 +80,21 @@ matches qrb exactly), we extracted **yolov8_nano @ 64×64 input**
 
 Heuristic schedulers on 1×yolov8_nano_64 + 2×dronet + 4×mlp_control (300 ops):
 
-| Solver | Predicted |
-|--------|----------:|
-| HEFT     | 84.151 ms |
-| PEFT     | 84.008 ms (best) |
-| MOSEK    | did not converge (300 ops × 90k binary β-vars exceeds practical MILP) |
+| Solver | Predicted | Actual FireSim | Δ% | vs qrb 75.71 | verify |
+|--------|----------:|----------------:|-----:|-------------:|--------|
+| HEFT     | 84.151 ms | **84.093 ms**   | 0.07% | 1.11× (lose by 11%) | yolov8 + dronet PASS, mlp FAIL (cross-backend drift) |
+| PEFT     | 84.008 ms | not captured    | — | 1.11× | — |
+| MOSEK    | did not converge (300 ops × 90k binary β-vars exceeds practical MILP) | | | | |
 
 LP relaxation lower bound = ~71 ms (max single-tile work). Heuristic
-gives 84 ms (13% above LP floor, 12% above qrb 75.71 ms target). Tight
-but not yet under qrb on the 1+2+4 mix.
+gives 84 ms actual (vs 71 ms LP floor, 11% above qrb 75.71 ms target).
+mlp_control verify-FAIL is the **cross-backend numerical drift issue**
+documented in `notes/baseline_2026-05-28.md`: HEFT placed `elu_s8` ops
+on different tiles than MOSEK does on the no-yolo workload, and the
+scalar reference and rvv_opu LUT-based elu kernels diverge by a few LSBs.
+The runtime is correct; the schedule needs `elu_s8` added to the
+cross-backend drift constraint list. Fix is a 1-line YAML change to
+`configs/multi_3way_qrb_y64_heft.yaml`'s `requantize_ops` list.
 
 ## Fixture catalogue
 
