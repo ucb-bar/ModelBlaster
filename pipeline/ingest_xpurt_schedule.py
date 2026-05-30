@@ -74,9 +74,22 @@ class XpurtEntry:
 _INSTANCE_RE = re.compile(r"^(?P<base>.+?)(?P<idx>\d+)$")
 
 
-def _split_job_name(job: str) -> tuple[str, int]:
+def _split_job_name(job: str, known: set[str] | None = None) -> tuple[str, int]:
     """Split a job_name like "mlp_control3" into ("mlp_control", 3); a name
-    without a trailing instance index returns (job, 0)."""
+    without a trailing instance index returns (job, 0).
+
+    When `known` is provided, longest-prefix match against the known
+    network names wins — this disambiguates models whose name ends in
+    a digit (e.g. "yolov8_nano_640" → ("yolov8_nano_64", 0), not
+    ("yolov8_nano_", 640))."""
+    if known:
+        for base in sorted(known, key=len, reverse=True):
+            if job == base:
+                return base, 0
+            if job.startswith(base):
+                rest = job[len(base):]
+                if rest.isdigit():
+                    return base, int(rest)
     m = _INSTANCE_RE.match(job)
     if not m:
         return job, 0
@@ -234,7 +247,7 @@ def load(schedule_path: str,
     for entry_id, key in enumerate(sorted_keys):
         d = raw[key]
         job = d["job_name"]
-        network, instance = _split_job_name(job)
+        network, instance = _split_job_name(job, set(irs_by_network))
         if network not in irs_by_network:
             raise ValueError(
                 f"schedule entry {key!r} references unknown network {network!r}; "
