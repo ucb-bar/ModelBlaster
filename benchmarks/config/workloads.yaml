@@ -74,6 +74,12 @@ workloads:
   - { id: yolov8n_gemmini_int8,     model: yolov8_nano, target: gemmini,            quant: int8, runner: firesim }
   - { id: yolov8n_gemmini_q31_int8, model: yolov8_nano, target: gemmini_q31,        quant: int8, runner: firesim }
 
+  # ───── yolov8_nano at 64x64 input — smaller variant to fit 1+2+4
+  # bundle into the qrb5165 reference's 75.71 ms period budget. Same
+  # architecture as yolov8_nano, 6.25× less spatial compute. ─────
+  - { id: yolov8_nano_64_rvv_opu_int8,  model: yolov8_nano_64, target: rvv_opu, quant: int8, runner: firesim }
+  - { id: yolov8_nano_64_gemmini_int8,  model: yolov8_nano_64, target: gemmini, quant: int8, runner: firesim }
+
   # ───── mlp_control — PPO actor (16->256->128->64->4, ELU). int8 path
   # newly unblocked by `elu_s8` reference kernel. ─────
   - { id: mlp_control_rvv_opu_int8,     model: mlp_control, target: rvv_opu,     quant: int8, runner: firesim }

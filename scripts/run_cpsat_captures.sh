@@ -42,7 +42,11 @@ for cfg in "${CONFIGS[@]}"; do
       ;;
     *)
       export MODELS="yolov8_nano,dronet,mlp_control"
-      export QUANTS="int8,int8,fp32"
+      # All-int8: HEFT/MOSEK fixtures reference linear_s8 / elu_s8 etc
+      # (the int8 graph.json), so mlp_control MUST be built int8 to
+      # match. fp32 mlp would link the wrong kernels and produce garbage
+      # outputs (the earlier heft_qrb FAILED for exactly this reason).
+      export QUANTS="int8,int8,int8"
       ;;
   esac
 
@@ -52,7 +56,10 @@ for cfg in "${CONFIGS[@]}"; do
   export SCHED_NAME="$safe_name"
 
   echo "=== cpsat sweep [$cfg / $safe_name] start $(date +%T) -> $RESULTS_DIR ===" | tee -a "$LOG"
-  rm -rf "$PWD/examples/xpurt_demo/fp32/build/gemmini_rvv_opu_firesim/zephyr" 2>/dev/null
+  # FULL build-dir wipe between configs. A previous version only nuked
+  # build/.../zephyr, which left the cmake cache + ninja graph in place
+  # and let stale main.c targets leak from one config to the next.
+  rm -rf "$PWD/examples/xpurt_demo/fp32/build/gemmini_rvv_opu_firesim" 2>/dev/null
   uv run bash examples/xpurt_demo/run.sh 2>&1 | tee "$RESULTS_DIR/run_stdout.log" >> "$LOG"
   rc=${PIPESTATUS[0]}
   echo "  rc=$rc at $(date +%T)" | tee -a "$LOG"
