@@ -91,10 +91,18 @@ gives 84 ms actual (vs 71 ms LP floor, 11% above qrb 75.71 ms target).
 mlp_control verify-FAIL is the **cross-backend numerical drift issue**
 documented in `notes/baseline_2026-05-28.md`: HEFT placed `elu_s8` ops
 on different tiles than MOSEK does on the no-yolo workload, and the
-scalar reference and rvv_opu LUT-based elu kernels diverge by a few LSBs.
-The runtime is correct; the schedule needs `elu_s8` added to the
-cross-backend drift constraint list. Fix is a 1-line YAML change to
-`configs/multi_3way_qrb_y64_heft.yaml`'s `requantize_ops` list.
+gemmini scalar-reference and rvv_opu kernel paths for elu round
+differently in their fixed-point int8 forms.
+
+We tried adding `elu_s8` to `requantize_ops` (pinning it to CPU_P) —
+the predicted makespan rose by only +0.14 ms (84.15 → 84.29 ms), but
+the actual FireSim sim timed out at the 1-hour FIRESIM_QUEUE_TIMEOUT.
+The pinned schedule loads the gemmini tile heavily enough that the
+real wall-clock time on the FPGA blows past the predicted cycle
+estimate — the cycle estimates didn't model the RoCC issue-port
+contention between back-to-back `conv2d_s8` and `elu_s8` calls. Marked
+as a known limitation; the headline win (no-yolo, MOSEK, 25.24 ms,
+3.0× faster) does not depend on this case.
 
 ## Fixture catalogue
 

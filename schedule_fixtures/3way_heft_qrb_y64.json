@@ -2,17 +2,17 @@
   "dot_file": "3way_heft_qrb_y64.json",
   "_provenance": {
     "generated_by": "scripts/run_xpurt_scheduler_multi.py",
-    "config": "configs/multi_3way_qrb_y64_heft.yaml",
+    "config": "/tmp/multi_3way_qrb_y64_heft.yaml",
     "solver": "HEFT",
-    "solve_wall_s": 0.015303850173950195,
-    "makespan_ms": 84.28979700000018,
+    "solve_wall_s": 0.01750040054321289,
+    "makespan_ms": 84.15098500000015,
     "horizon_target_ms": 75.0,
     "cycles_source": "db",
     "cycles_agg": "median",
     "contention_applied": false,
     "contention_path": null,
-    "git_sha": "2f66c4c",
-    "generated_at": "2026-05-30T10:15:59+00:00",
+    "git_sha": "ed374f0",
+    "generated_at": "2026-05-30T07:58:23+00:00",
     "instances": [
       {
         "network": "yolov8_nano_64",
@@ -3257,7 +3257,7 @@
         "yolov8_nano_64#0_dispatch_210"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 83.72876500000012,
+      "start_time": 83.73709800000013,
       "duration": 0.044731,
       "job_name": "yolov8_nano_640",
       "module_name": "yolov8_nano_64$dispatch_211_RVV_OPU_op",
@@ -3663,7 +3663,7 @@
         "dronet#0_dispatch_25"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 83.77349600000012,
+      "start_time": 83.78182900000013,
       "duration": 0.017182,
       "job_name": "dronet0",
       "module_name": "dronet$dispatch_26_RVV_OPU_op",
@@ -3678,7 +3678,7 @@
         "dronet#0_dispatch_26"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.19204100000015,
+      "start_time": 84.09654100000013,
       "duration": 0.021618,
       "job_name": "dronet0",
       "module_name": "dronet$dispatch_27_GEMMINI_op",
@@ -3693,7 +3693,7 @@
         "dronet#0_dispatch_26"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.14968100000014,
+      "start_time": 84.05418100000013,
       "duration": 0.02118,
       "job_name": "dronet0",
       "module_name": "dronet$dispatch_28_GEMMINI_op",
@@ -3708,7 +3708,7 @@
         "dronet#0_dispatch_28"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 84.18086100000015,
+      "start_time": 84.08536100000013,
       "duration": 0.001,
       "job_name": "dronet0",
       "module_name": "dronet$dispatch_29_RVV_OPU_op",
@@ -4114,7 +4114,7 @@
         "dronet#1_dispatch_25"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 83.79067800000013,
+      "start_time": 83.79901100000014,
       "duration": 0.017182,
       "job_name": "dronet1",
       "module_name": "dronet$dispatch_26_RVV_OPU_op",
@@ -4129,7 +4129,7 @@
         "dronet#1_dispatch_26"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.21365900000015,
+      "start_time": 84.11815900000013,
       "duration": 0.021618,
       "job_name": "dronet1",
       "module_name": "dronet$dispatch_27_GEMMINI_op",
@@ -4144,7 +4144,7 @@
         "dronet#1_dispatch_26"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.17086100000014,
+      "start_time": 84.07536100000013,
       "duration": 0.02118,
       "job_name": "dronet1",
       "module_name": "dronet$dispatch_28_GEMMINI_op",
@@ -4159,7 +4159,7 @@
         "dronet#1_dispatch_28"
       ],
       "hardware_target": "CPU_E#0",
-      "start_time": 84.20204100000015,
+      "start_time": 84.10654100000013,
       "duration": 0.001,
       "job_name": "dronet1",
       "module_name": "dronet$dispatch_29_RVV_OPU_op",
@@ -4216,11 +4216,11 @@
       "dependencies": [
         "mlp_control#0_dispatch_2"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 83.71876500000012,
+      "hardware_target": "CPU_E#0",
+      "start_time": 83.07825600000008,
       "duration": 0.023875,
       "job_name": "mlp_control0",
-      "module_name": "mlp_control$dispatch_3_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_3_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 0
     },
@@ -4232,7 +4232,7 @@
         "mlp_control#0_dispatch_3"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 83.81426500000013,
+      "start_time": 83.71876500000012,
       "duration": 0.083854,
       "job_name": "mlp_control0",
       "module_name": "mlp_control$dispatch_4_GEMMINI_op",
@@ -4246,11 +4246,11 @@
       "dependencies": [
         "mlp_control#0_dispatch_4"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 84.23527700000015,
+      "hardware_target": "CPU_E#0",
+      "start_time": 83.81619300000014,
       "duration": 0.010828,
       "job_name": "mlp_control0",
-      "module_name": "mlp_control$dispatch_5_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_5_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 0
     },
@@ -4262,7 +4262,7 @@
         "mlp_control#0_dispatch_5"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.27858900000017,
+      "start_time": 84.13977700000014,
       "duration": 0.002802,
       "job_name": "mlp_control0",
       "module_name": "mlp_control$dispatch_6_GEMMINI_op",
@@ -4319,11 +4319,11 @@
       "dependencies": [
         "mlp_control#1_dispatch_2"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 83.74264000000012,
+      "hardware_target": "CPU_E#0",
+      "start_time": 83.10213100000009,
       "duration": 0.023875,
       "job_name": "mlp_control1",
-      "module_name": "mlp_control$dispatch_3_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_3_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 1
     },
@@ -4335,7 +4335,7 @@
         "mlp_control#1_dispatch_3"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 83.89811900000014,
+      "start_time": 83.80261900000012,
       "duration": 0.083854,
       "job_name": "mlp_control1",
       "module_name": "mlp_control$dispatch_4_GEMMINI_op",
@@ -4349,11 +4349,11 @@
       "dependencies": [
         "mlp_control#1_dispatch_4"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 84.24610500000016,
+      "hardware_target": "CPU_E#0",
+      "start_time": 83.89647300000013,
       "duration": 0.010828,
       "job_name": "mlp_control1",
-      "module_name": "mlp_control$dispatch_5_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_5_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 1
     },
@@ -4365,7 +4365,7 @@
         "mlp_control#1_dispatch_5"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.28139100000017,
+      "start_time": 84.14257900000014,
       "duration": 0.002802,
       "job_name": "mlp_control1",
       "module_name": "mlp_control$dispatch_6_GEMMINI_op",
@@ -4422,11 +4422,11 @@
       "dependencies": [
         "mlp_control#2_dispatch_2"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 83.76651500000013,
+      "hardware_target": "CPU_E#0",
+      "start_time": 83.38180600000013,
       "duration": 0.023875,
       "job_name": "mlp_control2",
-      "module_name": "mlp_control$dispatch_3_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_3_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 2
     },
@@ -4438,7 +4438,7 @@
         "mlp_control#2_dispatch_3"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 83.98197300000014,
+      "start_time": 83.88647300000012,
       "duration": 0.083854,
       "job_name": "mlp_control2",
       "module_name": "mlp_control$dispatch_4_GEMMINI_op",
@@ -4452,11 +4452,11 @@
       "dependencies": [
         "mlp_control#2_dispatch_4"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 84.25693300000016,
+      "hardware_target": "CPU_E#0",
+      "start_time": 83.98032700000013,
       "duration": 0.010828,
       "job_name": "mlp_control2",
-      "module_name": "mlp_control$dispatch_5_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_5_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 2
     },
@@ -4468,7 +4468,7 @@
         "mlp_control#2_dispatch_5"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.28419300000017,
+      "start_time": 84.14538100000014,
       "duration": 0.002802,
       "job_name": "mlp_control2",
       "module_name": "mlp_control$dispatch_6_GEMMINI_op",
@@ -4525,11 +4525,11 @@
       "dependencies": [
         "mlp_control#3_dispatch_2"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 83.79039000000013,
+      "hardware_target": "CPU_E#0",
+      "start_time": 83.71322300000013,
       "duration": 0.023875,
       "job_name": "mlp_control3",
-      "module_name": "mlp_control$dispatch_3_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_3_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 3
     },
@@ -4541,7 +4541,7 @@
         "mlp_control#3_dispatch_3"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.06582700000014,
+      "start_time": 83.97032700000013,
       "duration": 0.083854,
       "job_name": "mlp_control3",
       "module_name": "mlp_control$dispatch_4_GEMMINI_op",
@@ -4555,11 +4555,11 @@
       "dependencies": [
         "mlp_control#3_dispatch_4"
       ],
-      "hardware_target": "CPU_P#0",
-      "start_time": 84.26776100000016,
+      "hardware_target": "CPU_E#0",
+      "start_time": 84.06418100000013,
       "duration": 0.010828,
       "job_name": "mlp_control3",
-      "module_name": "mlp_control$dispatch_5_GEMMINI_op",
+      "module_name": "mlp_control$dispatch_5_RVV_OPU_op",
       "op_kind": "elu_s8",
       "instance": 3
     },
@@ -4571,7 +4571,7 @@
         "mlp_control#3_dispatch_5"
       ],
       "hardware_target": "CPU_P#0",
-      "start_time": 84.28699500000018,
+      "start_time": 84.14818300000015,
       "duration": 0.002802,
       "job_name": "mlp_control3",
       "module_name": "mlp_control$dispatch_6_GEMMINI_op",
