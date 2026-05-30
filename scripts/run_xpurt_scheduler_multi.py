@@ -98,6 +98,14 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
     transfer_times = np.array([[0.0, 0.01], [0.01, 0.0]], dtype=float)
 
     requantize_ops = set(cfg.get("requantize_ops", []))
+    # Per-network whole-chain affinity: force all ops of a given network
+    # to one tile. Heavier than requantize_ops (which is per-op-type) —
+    # pin_to_cpu_p kills any rvv_opu placement for those networks, so the
+    # whole inference chain is bit-exact-preserving on one backend. Use
+    # when a network's int8 LUT kernels diverge across backends and the
+    # schedule cost of forcing it onto one side is acceptable.
+    pin_to_cpu_p = set(cfg.get("pin_to_cpu_p", []))
+    pin_to_cpu_e = set(cfg.get("pin_to_cpu_e", []))
     cycles_per_ms = float(cfg.get("cycles_per_ms", 1_000_000))
     mults: Dict[str, float] = (contention or {}).get("multipliers", {})
 
@@ -172,6 +180,13 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
                 if op_type in requantize_ops:
                     cpu_e_index = machines.index("CPU_E#0")
                     op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_e_index}
+                # Per-network whole-chain affinity.
+                if network in pin_to_cpu_p:
+                    cpu_e_index = machines.index("CPU_E#0")
+                    op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_e_index}
+                if network in pin_to_cpu_e:
+                    cpu_p_index = machines.index("CPU_P#0")
+                    op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_p_index}
 
                 op_by_did[did] = op
                 all_ops.append(op)
