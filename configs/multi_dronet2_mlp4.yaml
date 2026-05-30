@@ -8,7 +8,7 @@ networks:
   - { name: dronet,      quant: int8, instances: 2 }
   - { name: mlp_control, quant: int8, instances: 4 }
 horizon_ms: 75.0
-solver: HEFT
+solver: MOSEK
 time_limit_s: 60
 cycles_source: db
 cycles_agg: median
