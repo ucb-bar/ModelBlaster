@@ -34,6 +34,12 @@ CONFIGS=(mosek_dronet2_mlp4 mosek_qrb)
 if [[ $# -gt 0 ]]; then CONFIGS=("$@"); fi
 
 for cfg in "${CONFIGS[@]}"; do
+  case "$cfg" in
+    *qrb_y64*) export MODELS="yolov8_nano_64,dronet,mlp_control"; export QUANTS="int8,int8,int8" ;;
+    *qrb*)     export MODELS="yolov8_nano,dronet,mlp_control";    export QUANTS="int8,int8,int8" ;;
+    *dronet*)  export MODELS="dronet,mlp_control";                 export QUANTS="int8,int8" ;;
+    *)         export MODELS="yolov8_nano,dronet,mlp_control";    export QUANTS="int8,int8,int8" ;;
+  esac
   FX="$PWD/schedule_fixtures/3way_${cfg}.json"
   if [[ ! -f "$FX" ]]; then
     echo "MISSING fixture: $FX — skip $cfg" | tee -a "$LOG"
@@ -42,20 +48,7 @@ for cfg in "${CONFIGS[@]}"; do
   RESULTS_DIR="$PWD/benchmarks/results/A/3way_${cfg}/$(date +%Y%m%dT%H%M%SZ)"
   mkdir -p "$RESULTS_DIR"
 
-  case "$cfg" in
-    *dronet2_mlp4)
-      export MODELS="dronet,mlp_control"
-      export QUANTS="int8,int8"
-      ;;
-    *)
-      export MODELS="yolov8_nano,dronet,mlp_control"
-      # All-int8: HEFT/MOSEK fixtures reference linear_s8 / elu_s8 etc
-      # (the int8 graph.json), so mlp_control MUST be built int8 to
-      # match. fp32 mlp would link the wrong kernels and produce garbage
-      # outputs (the earlier heft_qrb FAILED for exactly this reason).
-      export QUANTS="int8,int8,int8"
-      ;;
-  esac
+  # MODELS/QUANTS are set above by the case statement.
 
   export SCHEDULE_JSON="$FX"
   safe_name="cpsat_${cfg//-/_}"
