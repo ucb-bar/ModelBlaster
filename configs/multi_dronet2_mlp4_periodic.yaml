@@ -25,8 +25,8 @@ networks:
   - { name: mlp_control, quant: int8, instances: 4 }
 horizon_ms: 75.0
 enforce_periodic: true
-solver: HEFT
-time_limit_s: 0
+solver: MOSEK
+time_limit_s: 120
 cycles_source: db
 cycles_agg: median
 cycles_per_ms: 1000000

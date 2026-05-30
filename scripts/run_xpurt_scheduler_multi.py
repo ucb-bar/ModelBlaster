@@ -354,10 +354,20 @@ def main() -> int:
     # are the fast fallbacks for 100+-op workloads where MOSEK times out.
     solver = cfg.get("solver", "MOSEK")
     # Map the human-friendly "MOSEK" / "HIGHS" / ... names to registry keys.
+    # When enforce_periodic is on, EVERY op carries min_start_t/max_end_t.
+    # xpurt's default `restrict_makespan_to_nonperiodic=True` then skips
+    # the C_max lower-bound entirely (C_max only tracks non-periodic ops),
+    # leaving the objective unbounded — MOSEK fails with SolverError and
+    # HIGHS reports infeasible_or_unbounded. Override the flag here so
+    # C_max is bound by all ops, including periodic ones.
+    periodic_mode = bool(cfg.get("enforce_periodic", False))
     SOLVER_TO_REGISTRY = {
-        "MOSEK": ("mosek", {"cvxpy_solver": "MOSEK", "time_limit": time_limit}),
-        "HIGHS": ("milp_highs", {"cvxpy_solver": "HIGHS", "time_limit": time_limit}),
-        "GUROBI": ("milp_gurobi", {"cvxpy_solver": "GUROBI", "time_limit": time_limit}),
+        "MOSEK": ("mosek", {"cvxpy_solver": "MOSEK", "time_limit": time_limit,
+                            "restrict_makespan_to_nonperiodic": not periodic_mode}),
+        "HIGHS": ("milp_highs", {"cvxpy_solver": "HIGHS", "time_limit": time_limit,
+                                 "restrict_makespan_to_nonperiodic": not periodic_mode}),
+        "GUROBI": ("milp_gurobi", {"cvxpy_solver": "GUROBI", "time_limit": time_limit,
+                                   "restrict_makespan_to_nonperiodic": not periodic_mode}),
         "HEFT":  ("heft",  {}),
         "CPSAT": ("cpsat", {"time_limit_s": time_limit}),
     }
