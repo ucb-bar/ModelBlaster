@@ -1,5 +1,10 @@
 """Definitive MOSEK-on-qrb_y64 experiment with HEFT warm-start.
 
+Run with the xpu-rt-integration venv which has both cvxpy and mosek:
+  /scratch2/agustin/xpu-rt-integration/.venv/bin/python \\
+      scripts/mosek_qrb_y64_warmstart.py
+
+
 We've documented MOSEK doesn't converge on 300-op qrb_y64 under "default
 time_limit_s=0 (unlimited)" — but xpurt's "unlimited" mode caps at MOSEK
 default ~5 min internally. This script:
@@ -34,7 +39,8 @@ def main() -> int:
     # Reuse the bridge to build the Workload.
     import yaml
     from scripts.run_xpurt_scheduler_multi import _build_workload  # type: ignore
-    import xpurt.scheduler as scheduler  # type: ignore
+    import scheduler  # type: ignore   # xpu-rt flat layout
+    from schedulers import get_scheduler  # type: ignore
 
     cfg_path = REPO / "configs" / "multi_3way_qrb_y64.yaml"  # uses solver: MOSEK
     out_dir = REPO / "benchmarks" / "results" / "A" / "mosek_qrb_y64_definitive"
@@ -51,11 +57,12 @@ def main() -> int:
     # 1. HEFT warm-start.
     print(f"\n== HEFT warm-start ==", flush=True)
     t0 = time.perf_counter()
-    heft_state = scheduler.schedule(workload, solver="heft", emit_report_to=None)
+    heft_fn = get_scheduler("heft")
+    heft_fn(workload)
     heft_wall = time.perf_counter() - t0
-    heft_report = workload.solver_state.get("report")
+    heft_report = workload.solver_state.get("report") if hasattr(workload, "solver_state") else None
     heft_ms = heft_report.makespan_cycles if heft_report else None
-    print(f"   HEFT makespan: {heft_ms:.3f} ms  (wall={heft_wall:.2f}s)", flush=True)
+    print(f"   HEFT makespan: {heft_ms} ms  (wall={heft_wall:.2f}s)", flush=True)
 
     # 2. MOSEK with explicit 1-hour wall budget.
     print(f"\n== MOSEK MILP — 3600s wall budget ==", flush=True)
@@ -65,13 +72,9 @@ def main() -> int:
     mosek_report = None
     err = None
     try:
-        scheduler.schedule(
-            workload,
-            cvxpy_solver="MOSEK",
-            time_limit=3600,
-            emit_report_to=str(out_run / "scheduler_report.json"),
-        )
-        mosek_report = workload.solver_state.get("report")
+        mosek_fn = get_scheduler("mosek")
+        mosek_fn(workload, cvxpy_solver="MOSEK", time_limit=3600)
+        mosek_report = workload.solver_state.get("report") if hasattr(workload, "solver_state") else None
         if mosek_report:
             mosek_makespan = mosek_report.makespan_cycles
             mosek_status = mosek_report.solver_status
