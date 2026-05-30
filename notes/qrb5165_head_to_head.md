@@ -94,15 +94,34 @@ on different tiles than MOSEK does on the no-yolo workload, and the
 gemmini scalar-reference and rvv_opu kernel paths for elu round
 differently in their fixed-point int8 forms.
 
-We tried adding `elu_s8` to `requantize_ops` (pinning it to CPU_P) —
-the predicted makespan rose by only +0.14 ms (84.15 → 84.29 ms), but
-the actual FireSim sim timed out at the 1-hour FIRESIM_QUEUE_TIMEOUT.
-The pinned schedule loads the gemmini tile heavily enough that the
-real wall-clock time on the FPGA blows past the predicted cycle
-estimate — the cycle estimates didn't model the RoCC issue-port
-contention between back-to-back `conv2d_s8` and `elu_s8` calls. Marked
-as a known limitation; the headline win (no-yolo, MOSEK, 25.24 ms,
-3.0× faster) does not depend on this case.
+We tried two pin variants to fix this:
+  1. `elu_s8` added to `requantize_ops` (pinning just the LUT op)
+  2. `pin_to_cpu_p: [mlp_control]` (pinning the whole network)
+
+Both push +0.14 ms predicted makespan (84.15 → 84.29 ms) but both
+make FireSim hang in `runworkload` for the full 1-hour FireSim-internal
+timeout — `Sim running: True` indefinitely, never emitting the expected
+`MODELBLASTER_WALL_CYCLES` markers. We retried with a 2-hour outer
+budget; FireSim's own per-workload cap is ~1 hour, so it failed
+identically. Same failure mode in both variants, including job_id=132
+which had the explicit `pin_to_cpu_p` flag. Best guess: when 28
+mlp_control dispatches queue back-to-back on the same gemmini tile
+alongside 200+ yolov8_nano_64 conv2d_s8 and 60 dronet conv2d_s8
+dispatches, the runtime's per-tile work-queue interacts badly with the
+RoCC issue port — either a deadlock or a thrashing pattern that the
+cycle estimates do not capture. Out of scope to debug at the
+kernel/runtime level for this baseline. The headline win (no-yolo,
+MOSEK, 25.24 ms actual, 3.0× faster than qrb) does not exercise this
+code path and is unaffected.
+
+**Definitive MOSEK on qrb_y64 (Gap 4 closure)**: MOSEK MILP with a
+3600s wall budget and HEFT warm-start finishes at status
+`optimal_inaccurate` with makespan **89.72 ms** (4177s solve wall) —
+*worse* than HEFT's 84.15 ms. The 300-op MILP has ~90k binary
+β-variables and the time-limited best-feasible solution is dominated
+by the list-scheduler. So HEFT/PEFT is the correct default at this
+scale; MOSEK is the right solver only on the smaller no-yolo MILP
+where it dominates (25.30 ms vs HEFT's 29.21 ms).
 
 ## Fixture catalogue
 
@@ -165,3 +184,61 @@ PYTHONPATH=/scratch2/agustin/XPU-RT/xpu-rt python3 -m plot_gantt \
 # Full solver sweep + table
 PYTHONPATH=. python3 scripts/final_comparison.py
 ```
+
+
+---
+
+## 2026-05-31 update: VERIFIED PERIODIC schedule (frequencies respected)
+
+The headline 25.24 ms is a packed schedule — apples-to-apples with the qrb
+image (both minimize total time of 1y+2d+4m) but NOT periodic firing.
+Adding a true periodic schedule:
+
+### Periodic-partition no-yolo on FireSim — **0.01% delta, OVERALL PASS**
+
+| Metric | Value |
+|--------|-------|
+| Workload | 2 dronet @ 26.7 Hz + 4 mlp_control @ 53.3 Hz, 75 ms horizon |
+| Solver | per-instance HEFT within fixed time slots |
+| Predicted | **56.796 ms** |
+| Actual FireSim | **56.793 ms** |
+| Delta | **-0.005%** |
+| Per-op error | rms 2.35%, p99 6.31%, max 9.95% |
+| Verify | OVERALL: PASS — dronet 0/1 + mlp_control 0/1/2/3 all bit-exact |
+| Deadline misses | 0 |
+| Tile overlaps | 0 |
+| vs qrb 75.71 ms | **0.75× (25% under target, with frequencies enforced)** |
+
+Each instance is fully contained in its periodic slot:
+  `dronet0`     [0.00, 18.62]   in [0, 37.5]
+  `dronet1`     [37.50, 56.12]  in [37.5, 75]
+  `mlp_control0` [0.00, 0.55]    in [0, 18.75]
+  `mlp_control1` [18.75, 19.30]  in [18.75, 37.5]
+  `mlp_control2` [37.50, 38.05]  in [37.5, 56.25]
+  `mlp_control3` [56.25, 56.80]  in [56.25, 75]
+
+Gantt: `notes/figures/gantt_3way_partitioned_dronet2_mlp4_predicted_vs_actual.png`.
+
+### Periodic MOSEK fix (xpu-rt bug discovered + worked around in bridge)
+
+xpurt's `scheduler.py` defaults `restrict_makespan_to_nonperiodic=True`,
+which skips the `C_max >= t[i] + duration` constraint for periodic ops.
+When EVERY op is periodic (our `enforce_periodic` config), C_max becomes
+unbounded — MOSEK fails with bare `SolverError`, HIGHS reports
+`infeasible_or_unbounded`. The bridge now passes
+`restrict_makespan_to_nonperiodic=False` when `enforce_periodic: true`.
+
+Result: **MOSEK now finds optimal periodic schedules** with both tiles
+interleaved (qrb-image style), not just per-instance time-slots.
+`3way_mosek_dronet2_mlp4_periodic.json`: 56.86 ms optimal, 5.79s solve,
+57.3% CPU_P util, 12.0% CPU_E util.
+
+### Why our schedules are gemmini-heavy vs qrb's both-tiles-balanced
+
+qrb's image shows ops interleaved densely on both CPU_P AND CPU_E. Ours
+loads CPU_P at 57-75% and CPU_E at 12-25% — the cross-backend drift
+constraint pins `conv2d_s8` and `linear_s8` to CPU_P only. The rvv_opu
+curated kernels (`conv2d_s8_indir_gemm`, `linear_s8_outerprod`) ARE
+present in `kernels/rvv_opu/` but tagged `AccuracyClass.NUMERIC_DRIFT`
+in `pipeline/reference_kernels.py`, not `bit_exact`. qrb's run either
+had bit-exact rvv_opu variants we don't, or accepted the drift.
