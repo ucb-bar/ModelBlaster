@@ -11,10 +11,11 @@ hetero pair.
 | Metric | qrb image | ours (MOSEK no-yolo + curated gemmini RoCC) |
 |--------|-----------|---------------------------------------------|
 | Workload | 1y + 2d + 4m | **2 dronet + 4 mlp_control** |
-| Predicted | 75.71 ms | **25.30 ms**  (3.0× faster) |
-| Actual FireSim | n/a | **25.24 ms**  (3.0× faster) |
-| Predicted vs actual | — | **0.22%** delta |
-| Bit-exact | — | PASS across all 6 instances |
+| Predicted | 75.71 ms | **25.297 ms**  (3.0× faster) |
+| Actual FireSim (3 reps) | n/a | **25.243 ms** (bit-identical across 3 reps) |
+| Predicted vs actual | — | **0.21%** delta |
+| Bit-exact | — | `*** PASSED ***` on all 3 reps |
+| Per-dispatch ratio | — | med=1.006, p10/p90=0.944/1.046 across 82 ops |
 
 Same heterogeneous hardware kind. Workload missing yolov8 because our
 default yolov8_nano (160×160 input) has ~420 ms of compute alone, which
@@ -104,15 +105,18 @@ but not yet under qrb on the 1+2+4 mix.
 ## Triple-check audit
 
 1. **MOSEK fixture is valid**: 0 dep-precedence violations + 0 tile-overlap
-   violations (verified in fixture-emit and post-extracted).
+   violations (verified in fixture-emit and post-extracted). All other
+   solver-produced fixtures (HEFT, PEFT) also validate clean.
 2. **MOSEK fixture matches measured FireSim runtime**: 25.297 ms predicted
-   vs 25.243 ms actual = 0.22% delta. Per-dispatch ratios all 0.95-1.05
-   across every op kind on both tiles.
+   vs 25.243 ms actual = 0.21% delta. Per-dispatch duration ratio
+   (actual/predicted) median 1.006, p10-p90 0.944-1.046 across 82 ops.
 3. **All 29 xpu-rt + 7 ModelBlaster tests pass** after every change.
-4. **bit_exact verification**: PASS on all 6 instances (2 dronet + 4
-   mlp_control) against PyTorch fp32-then-quantize references.
+4. **bit_exact verification**: `*** PASSED ***` on all 3 reps. Per-instance
+   verify_kernel passes on every dispatch against PyTorch
+   fp32-then-quantize references.
 5. **Multi-rep determinism**: 3-rep FireSim run produces bit-identical
-   cycle counts (FPGA emulation is fully deterministic).
+   actual makespan (25.243 ms × 3) and identical PASS counts (FPGA
+   emulation is fully deterministic).
 
 ## What's NOT in scope (and why)
 
