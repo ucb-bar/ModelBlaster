@@ -30,9 +30,10 @@ networks:
 # informs the periodic time window if a network is marked periodic.
 horizon_ms: 75.0
 
-# Solver knobs
+# Solver knobs — MOSEK is THE baseline. No time limit; we accept whatever
+# wall it needs to converge to the MIP optimum.
 solver: MOSEK
-time_limit_s: 120
+time_limit_s: 0          # 0 == unlimited per cvxpy's MOSEK config
 cycles_source: db        # db = median across reps from profile_db
 cycles_agg: median       # alt: mean/min/max
 cycles_per_ms: 1000000   # 1 GHz target clock
