@@ -31,7 +31,7 @@ networks:
 horizon_ms: 75.0
 
 # Solver knobs
-solver: HEFT
+solver: MOSEK
 time_limit_s: 120
 cycles_source: db        # db = median across reps from profile_db
 cycles_agg: median       # alt: mean/min/max
