@@ -2550,7 +2550,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano"])
+                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2585,6 +2585,8 @@ def main() -> None:
         from modelblaster.models import mobilenet_v2 as model_mod
     elif args.model == "yolov8_nano":
         from modelblaster.models import yolov8_nano as model_mod
+    elif args.model == "yolov8_nano_64":
+        from modelblaster.models import yolov8_nano_64 as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()
