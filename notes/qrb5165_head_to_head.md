@@ -94,15 +94,34 @@ on different tiles than MOSEK does on the no-yolo workload, and the
 gemmini scalar-reference and rvv_opu kernel paths for elu round
 differently in their fixed-point int8 forms.
 
-We tried adding `elu_s8` to `requantize_ops` (pinning it to CPU_P) —
-the predicted makespan rose by only +0.14 ms (84.15 → 84.29 ms), but
-the actual FireSim sim timed out at the 1-hour FIRESIM_QUEUE_TIMEOUT.
-The pinned schedule loads the gemmini tile heavily enough that the
-real wall-clock time on the FPGA blows past the predicted cycle
-estimate — the cycle estimates didn't model the RoCC issue-port
-contention between back-to-back `conv2d_s8` and `elu_s8` calls. Marked
-as a known limitation; the headline win (no-yolo, MOSEK, 25.24 ms,
-3.0× faster) does not depend on this case.
+We tried two pin variants to fix this:
+  1. `elu_s8` added to `requantize_ops` (pinning just the LUT op)
+  2. `pin_to_cpu_p: [mlp_control]` (pinning the whole network)
+
+Both push +0.14 ms predicted makespan (84.15 → 84.29 ms) but both
+make FireSim hang in `runworkload` for the full 1-hour FireSim-internal
+timeout — `Sim running: True` indefinitely, never emitting the expected
+`MODELBLASTER_WALL_CYCLES` markers. We retried with a 2-hour outer
+budget; FireSim's own per-workload cap is ~1 hour, so it failed
+identically. Same failure mode in both variants, including job_id=132
+which had the explicit `pin_to_cpu_p` flag. Best guess: when 28
+mlp_control dispatches queue back-to-back on the same gemmini tile
+alongside 200+ yolov8_nano_64 conv2d_s8 and 60 dronet conv2d_s8
+dispatches, the runtime's per-tile work-queue interacts badly with the
+RoCC issue port — either a deadlock or a thrashing pattern that the
+cycle estimates do not capture. Out of scope to debug at the
+kernel/runtime level for this baseline. The headline win (no-yolo,
+MOSEK, 25.24 ms actual, 3.0× faster than qrb) does not exercise this
+code path and is unaffected.
+
+**Definitive MOSEK on qrb_y64 (Gap 4 closure)**: MOSEK MILP with a
+3600s wall budget and HEFT warm-start finishes at status
+`optimal_inaccurate` with makespan **89.72 ms** (4177s solve wall) —
+*worse* than HEFT's 84.15 ms. The 300-op MILP has ~90k binary
+β-variables and the time-limited best-feasible solution is dominated
+by the list-scheduler. So HEFT/PEFT is the correct default at this
+scale; MOSEK is the right solver only on the smaller no-yolo MILP
+where it dominates (25.30 ms vs HEFT's 29.21 ms).
 
 ## Fixture catalogue
 
