@@ -42,14 +42,22 @@ import os
 import re
 
 # Match the ingest module's heuristic for splitting "<network><instance>".
-# Same caveat: a network name ending in digits will be misparsed (e.g.
-# "mobilenet_v2" splits into base="mobilenet_v", idx=2). Acceptable today
-# because no scheduled network uses that pattern; long-term fix is to
-# adopt an explicit "<net>#<inst>" delimiter in job_name.
+# Falls back to the trailing-digits regex when no known set is provided.
+# When known networks are available, longest-prefix match wins — this
+# disambiguates model names ending in digits (e.g. "yolov8_nano_640"
+# → ("yolov8_nano_64", 0), not ("yolov8_nano_", 640)).
 _INSTANCE_RE = re.compile(r"^(?P<base>.+?)(?P<idx>\d+)$")
 
 
-def _split_job_name(job: str) -> tuple[str, int]:
+def _split_job_name(job: str, known: set[str] | None = None) -> tuple[str, int]:
+    if known:
+        for base in sorted(known, key=len, reverse=True):
+            if job == base:
+                return base, 0
+            if job.startswith(base):
+                rest = job[len(base):]
+                if rest.isdigit():
+                    return base, int(rest)
     m = _INSTANCE_RE.match(job)
     if not m:
         return job, 0
@@ -717,12 +725,28 @@ def main() -> None:
     networks: list[str] = []
     seen: set[str] = set()
     n_instances: dict[str, int] = {}
-    for d in sched["dispatches"].values():
-        net, inst = _split_job_name(d["job_name"])
-        if net not in seen:
-            seen.add(net)
-            networks.append(net)
-        n_instances[net] = max(n_instances.get(net, 0), inst + 1)
+    # Multi-network bridge stamps an explicit instances list in
+    # provenance — use it when present (it's the only way to be
+    # unambiguous about model names ending in digits, e.g. "yolov8_nano_64"
+    # which the trailing-digits regex parses as "yolov8_nano_" + idx=64).
+    prov_instances = sched.get("_provenance", {}).get("instances")
+    if prov_instances:
+        known = {ins["network"] for ins in prov_instances}
+        for ins in prov_instances:
+            net = ins["network"]
+            inst = ins["instance"]
+            if net not in seen:
+                seen.add(net)
+                networks.append(net)
+            n_instances[net] = max(n_instances.get(net, 0), inst + 1)
+    else:
+        known = None
+        for d in sched["dispatches"].values():
+            net, inst = _split_job_name(d["job_name"], known)
+            if net not in seen:
+                seen.add(net)
+                networks.append(net)
+            n_instances[net] = max(n_instances.get(net, 0), inst + 1)
 
     core_kinds = [k.strip() for k in args.core_kinds.split(",") if k.strip()]
     if not core_kinds:
