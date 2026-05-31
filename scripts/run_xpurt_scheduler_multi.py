@@ -92,10 +92,15 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
     from benchmarks.profile_db import query as profile_db_query  # type: ignore
 
     # Bitstream is locked: two singleton-combo machines (one op at a time
-    # per tile). transfer_times is small but nonzero so the MIP prefers
-    # keeping a chain on one tile when feasible.
+    # per tile). transfer_times is a deliberate disincentive against
+    # cross-tile dispatch chains: the actual cost is a sync-wait that
+    # the scheduler currently doesn't model directly, but penalizing
+    # cross-tile transfers approximates it. Tunable via YAML
+    # `cross_tile_transfer_ms` (default 0.5 ms — calibrated from the
+    # observed 20-46 ms aggregate sync wait on the qrb_y64 chain).
     machines = ["CPU_P#0", "CPU_E#0"]
-    transfer_times = np.array([[0.0, 0.01], [0.01, 0.0]], dtype=float)
+    xfer_ms = float(cfg.get("cross_tile_transfer_ms", 0.5))
+    transfer_times = np.array([[0.0, xfer_ms], [xfer_ms, 0.0]], dtype=float)
 
     requantize_ops = set(cfg.get("requantize_ops", []))
     # Per-network whole-chain affinity: force all ops of a given network
@@ -106,6 +111,11 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
     # schedule cost of forcing it onto one side is acceptable.
     pin_to_cpu_p = set(cfg.get("pin_to_cpu_p", []))
     pin_to_cpu_e = set(cfg.get("pin_to_cpu_e", []))
+    # Op-type level forbids: e.g. force all silu_s8 onto CPU_E (rvv_opu),
+    # useful when an op has equal cost on both backends but heuristic
+    # placement keeps it on a bottleneck tile because of dep chains.
+    forbid_op_on_cpu_p = set(cfg.get("forbid_op_on_cpu_p", []))
+    forbid_op_on_cpu_e = set(cfg.get("forbid_op_on_cpu_e", []))
     cycles_per_ms = float(cfg.get("cycles_per_ms", 1_000_000))
     mults: Dict[str, float] = (contention or {}).get("multipliers", {})
 
@@ -212,6 +222,13 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
                 if network in pin_to_cpu_e:
                     cpu_p_index = machines.index("CPU_P#0")
                     op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_p_index}
+                # Per-op-type forbids.
+                if op_type in forbid_op_on_cpu_p:
+                    cpu_p_index = machines.index("CPU_P#0")
+                    op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_p_index}
+                if op_type in forbid_op_on_cpu_e:
+                    cpu_e_index = machines.index("CPU_E#0")
+                    op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_e_index}
 
                 op_by_did[did] = op
                 all_ops.append(op)
