@@ -106,6 +106,11 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
     # schedule cost of forcing it onto one side is acceptable.
     pin_to_cpu_p = set(cfg.get("pin_to_cpu_p", []))
     pin_to_cpu_e = set(cfg.get("pin_to_cpu_e", []))
+    # Op-type level forbids: e.g. force all silu_s8 onto CPU_E (rvv_opu),
+    # useful when an op has equal cost on both backends but heuristic
+    # placement keeps it on a bottleneck tile because of dep chains.
+    forbid_op_on_cpu_p = set(cfg.get("forbid_op_on_cpu_p", []))
+    forbid_op_on_cpu_e = set(cfg.get("forbid_op_on_cpu_e", []))
     cycles_per_ms = float(cfg.get("cycles_per_ms", 1_000_000))
     mults: Dict[str, float] = (contention or {}).get("multipliers", {})
 
@@ -212,6 +217,13 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
                 if network in pin_to_cpu_e:
                     cpu_p_index = machines.index("CPU_P#0")
                     op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_p_index}
+                # Per-op-type forbids.
+                if op_type in forbid_op_on_cpu_p:
+                    cpu_p_index = machines.index("CPU_P#0")
+                    op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_p_index}
+                if op_type in forbid_op_on_cpu_e:
+                    cpu_e_index = machines.index("CPU_E#0")
+                    op.infeasible_combinations = set(op.infeasible_combinations) | {cpu_e_index}
 
                 op_by_did[did] = op
                 all_ops.append(op)
