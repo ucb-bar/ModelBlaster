@@ -92,10 +92,15 @@ def _build_workload(cfg: dict, contention: Optional[dict]):
     from benchmarks.profile_db import query as profile_db_query  # type: ignore
 
     # Bitstream is locked: two singleton-combo machines (one op at a time
-    # per tile). transfer_times is small but nonzero so the MIP prefers
-    # keeping a chain on one tile when feasible.
+    # per tile). transfer_times is a deliberate disincentive against
+    # cross-tile dispatch chains: the actual cost is a sync-wait that
+    # the scheduler currently doesn't model directly, but penalizing
+    # cross-tile transfers approximates it. Tunable via YAML
+    # `cross_tile_transfer_ms` (default 0.5 ms — calibrated from the
+    # observed 20-46 ms aggregate sync wait on the qrb_y64 chain).
     machines = ["CPU_P#0", "CPU_E#0"]
-    transfer_times = np.array([[0.0, 0.01], [0.01, 0.0]], dtype=float)
+    xfer_ms = float(cfg.get("cross_tile_transfer_ms", 0.5))
+    transfer_times = np.array([[0.0, xfer_ms], [xfer_ms, 0.0]], dtype=float)
 
     requantize_ops = set(cfg.get("requantize_ops", []))
     # Per-network whole-chain affinity: force all ops of a given network
