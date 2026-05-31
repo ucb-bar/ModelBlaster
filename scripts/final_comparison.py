@@ -29,12 +29,14 @@ QRB_PREDICTED_MS = 75.71
 # run_filter: None means "all dirs"; "post-fix" means runs from 20260530 onwards
 # (after the GLOBAL_CURATED_DIR fix landed).
 CONFIGS = [
-    ("MOSEK no-yolo (2d+4m)",         "3way_mosek_dronet2_mlp4.json",  "3way_mosek_dronet2_mlp4",  "post-fix"),
-    ("MOSEK no-yolo regrouped",       "3way_mosek_dronet2_mlp4_regrouped.json", "3way_mosek_dronet2_mlp4_regrouped", "post-fix"),
-    ("HEFT  no-yolo (2d+4m)",         "3way_heft_dronet2_mlp4.json",   "3way_heft_dronet2_mlp4",   "post-fix"),
-    ("HEFT  qrb (1y160+2d+4m)",       "3way_heft_qrb.json",            "3way_heft_qrb",            "post-fix"),
-    ("HEFT  qrb_y64 (1y64+2d+4m)",    "3way_heft_qrb_y64.json",        "3way_heft_qrb_y64",        "post-fix"),
-    ("PEFT  qrb_y64 (1y64+2d+4m)",    "3way_peft_qrb_y64.json",        "3way_peft_qrb_y64",        "post-fix"),
+    # PACKED (min-makespan; comparable to qrb image which also packs)
+    ("MOSEK PACKED no-yolo (2d+4m)",   "3way_mosek_dronet2_mlp4.json",            "3way_mosek_dronet2_mlp4",  "post-fix"),
+    ("HEFT  PACKED no-yolo (2d+4m)",   "3way_heft_dronet2_mlp4.json",             "3way_heft_dronet2_mlp4",   "post-fix"),
+    ("HEFT  PACKED qrb_y64 (1y+2d+4m)","3way_heft_qrb_y64.json",                  "3way_heft_qrb_y64",        "post-fix"),
+    # PERIODIC (frequencies enforced; per-instance time-window constraints)
+    ("MOSEK PERIODIC no-yolo (27Hz+53Hz)", "3way_mosek_dronet2_mlp4_periodic.json", "3way_mosek_dronet2_mlp4_periodic", "post-fix"),
+    ("Partition PERIODIC no-yolo (27Hz+53Hz)", "3way_partitioned_dronet2_mlp4.json", "3way_partitioned_dronet2_mlp4", "post-fix"),
+    ("Partition PERIODIC qrb_y64 (13+27+53Hz)", "3way_partitioned_qrb_y64.json",   "3way_partitioned_qrb_y64", "post-fix"),
 ]
 
 
