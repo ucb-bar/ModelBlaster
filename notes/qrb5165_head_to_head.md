@@ -188,6 +188,46 @@ PYTHONPATH=. python3 scripts/final_comparison.py
 
 ---
 
+## 2026-05-31 analysis: WHY we're at 84 ms and qrb is at 75.71 ms
+
+Per-op breakdown of yolov8_nano_64 (the bottleneck instance in the qrb mix):
+
+| op_type | gemmini total | rvv_opu total | notes |
+|---------|--------------:|--------------:|-------|
+| conv2d_s8 (63 calls) | **10.07 ms** | 1011.99 ms | gemmini RoCC fast; rvv_opu falls back to scalar |
+| silu_s8 (~30 calls)  | 38.31 ms | 38.16 ms | **heaviest op — equal cost both backends** |
+| batchnorm2d_s8       | 11.64 ms | 11.66 ms | equal cost |
+| add_s8, maxpool, upsample, cat | ~7 ms | ~7 ms | equal cost |
+| **TOTAL yolov8**     | 67.20 ms | 1069 ms (mostly scalar fallback for conv) | |
+
+**Critical-path / makespan decomposition:**
+
+| Bound | Value |
+|-------|------:|
+| yolov8_nano_64 sequential critical path (212 ops chained) | **55.77 ms** |
+| Theoretical parallel floor (sum-of-min / 2 tiles) for 1y+2d+4m | 53.20 ms |
+| **qrb image makespan** | **75.71 ms** (36% over yolov8 CP) |
+| Our HEFT current | 84.15 ms (51% over yolov8 CP) |
+
+**Verdict on "better yolo kernels":**
+- Conv kernel on gemmini is **already fast** (10 ms for all 63 convs). Not the bottleneck.
+- **silu_s8 is the heaviest op (38 ms total)**, equal cost on both backends → our vectorized
+  rvv silu (`kernels/rvv/rvv_silu_s8_direct.c`, LUT + `vluxei8` gather) isn't dramatically
+  faster than scalar fallback.
+- **28 ms of our 84 ms is cross-tile sync wait**, not compute. Each of the ~30 conv→silu
+  transitions in the yolov8 chain crosses tile boundaries when conv is gemmini-pinned and
+  silu floats.
+
+**Path to beat qrb 75.71 ms:**
+1. **Conv+SiLU fusion** (graph + kernel work): eliminates ~28 ms of sync wait.
+   Expected makespan ~56 ms — beats qrb by 26%.
+2. **Faster vectorized silu**: 2× speedup saves ~19 ms.
+   Either path alone is enough.
+3. Scheduler tuning explored — `cross_tile_transfer_ms` sweep hits a local min at 84 ms,
+   so placement alone cannot close the gap.
+
+Status: documented; kernel-level fusion work is a follow-up beyond this baseline.
+
 ## 2026-05-31 update: VERIFIED PERIODIC schedule (frequencies respected)
 
 The headline 25.24 ms is a packed schedule — apples-to-apples with the qrb
