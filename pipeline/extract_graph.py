@@ -633,6 +633,11 @@ def extract_int8(
     # over the activation tensor per BN — a noticeable win on dronet
     # where 6 such pairs exist.
     fused_bn_relu: set[str] = set()
+    # conv→silu fuse for the int8 path (mirror of the fp32 detector).
+    # Absorbs the standalone silu_s8 dispatch into the producer conv,
+    # emitted as a new op_kind 'conv2d_silu_s8' so the kernel picker
+    # can offer a specialized fused variant.
+    fused_conv2d_silu: set[str] = set()
     for i, node in enumerate(nodes):
         if i + 1 >= len(nodes):
             continue
@@ -643,11 +648,24 @@ def extract_int8(
             or (nxt.op == "call_function" and nxt.target in (
                 torch.relu, torch.nn.functional.relu))
         )
-        if not (is_next_relu and len(nxt.args) == 1 and nxt.args[0] is node):
+        is_next_silu = (
+            (nxt.op == "call_module"
+             and isinstance(gm.get_submodule(nxt.target), torch.nn.SiLU))
+            or (nxt.op == "call_function" and nxt.target in (
+                torch.nn.functional.silu,))
+        )
+        if not ((is_next_relu or is_next_silu)
+                and len(nxt.args) == 1 and nxt.args[0] is node):
             continue
         if node.op == "call_module":
             producer_mod = gm.get_submodule(node.target)
-            if isinstance(producer_mod, torch.nn.Linear):
+            if is_next_silu:
+                # Only Conv2d→SiLU is currently considered for absorption
+                # (yolov8 backbone pattern). Other (BN→SiLU, etc.) fall
+                # through without modifying the relu-fold sets.
+                if isinstance(producer_mod, torch.nn.Conv2d):
+                    fused_conv2d_silu.add(nxt.name)
+            elif isinstance(producer_mod, torch.nn.Linear):
                 fused_linear_relu.add(nxt.name)
             elif isinstance(producer_mod, torch.nn.Conv2d):
                 fused_conv2d_relu.add(nxt.name)
@@ -784,6 +802,15 @@ def extract_int8(
                 next_node = nodes[nodes.index(node) + 1] if nodes.index(node) + 1 < len(nodes) else None
                 fuse_relu = (next_node is not None
                              and next_node.name in fused_relu_after)
+                # NOTE: Conv→SiLU fusion is DETECTED above (fused_conv2d_silu)
+                # and the KernelSpec CONV2D_SILU_S8 is registered, but the IR
+                # emit below keeps the conv as standalone conv2d_s8 because
+                # threading the fused output name through the activation
+                # calibration cache (line ~1272: activations[in_name]) needs
+                # more invasive surgery (we'd have to re-key intermediate
+                # tensors that named the BN/SiLU output, which dronet and
+                # other models still consume). Left as a follow-up — until
+                # then conv2d_silu_s8 is wire-ready but unused in production.
                 act_min = 0 if fuse_relu else -128
                 act_max = 127
                 in_shape = tensors_meta[in_name]["shape"]
@@ -938,6 +965,10 @@ def extract_int8(
                 })
 
             elif isinstance(mod, torch.nn.SiLU):
+                # Fusion detection runs above (fused_conv2d_silu) and the
+                # CONV2D_SILU_S8 spec is registered for future use; for now
+                # we still emit the standalone silu_s8 dispatch (see comment
+                # at the conv2d emit site).
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[in_name]["shape"]))
                 ops.append({
