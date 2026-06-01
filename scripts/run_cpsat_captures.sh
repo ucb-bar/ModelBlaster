@@ -22,15 +22,17 @@ export BACKENDS="gemmini,rvv_opu"
 # kernel SOLO mode uses. arm_a_curated.py sets this; xpurt_demo/run.sh
 # did NOT, which is the runtime contention root cause.
 export GLOBAL_CURATED_DIR="$PWD/kernels"
-# Skip per-kernel curated verify — it requires `west` on PATH (the Zephyr
-# build tool used to compile + run candidate kernels on spike). The
-# spike_harness verify path isn't wired in this environment, so verify
-# raises FileNotFoundError and the picker falls back to the scalar
-# reference impl for EVERY curated kernel (including rvv_opu/silu_s8,
-# rvv_opu/conv2d_s8, etc.). Skipping verify means we accept the curated
-# kernels on faith — fine because they're hand-written + bit_exact
-# tagged in spec.algorithms.
-export MODELBLASTER_CURATED_VERIFY=0
+# Note: MODELBLASTER_CURATED_VERIFY=0 was tried but breaks the build
+# silently (cmake/west fails at ~10s with no diagnostic when set).
+# Leaving verify=1 (default) — the verify step still fails with
+# "FileNotFoundError: west" so the picker falls back to scalar reference
+# for the curated rvv_opu kernels, but that's the EXISTING behavior
+# every previous capture had. Fixing the curated-kernel pickup needs
+# either:
+#   1. Wire `west` into PATH so verify can actually run
+#   2. Patch generate_kernels.py to accept curated kernels without
+#      verify when the per-kernel verify-skip flag is set (the current
+#      flag is wired but evidently triggers a separate codepath bug)
 export REGISTRY="$PWD/cores/chipyard_gemmini_opu_hetero.json"
 export CPU_P_KIND="gemmini"
 export CPU_E_KIND="rvv_opu"
