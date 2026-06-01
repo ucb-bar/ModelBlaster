@@ -9,11 +9,11 @@ export FIRESIM_QUEUE=1
 export RUNNER="firesim"
 export FIRESIM_QUEUE_TIMEOUT="3600"
 export XPURT_TRACE=1
-export BACKENDS="gemmini,rvv"   # <-- key change: plain rvv (not rvv_opu)
+export BACKENDS="gemmini,rvv_hetero"   # <-- rvv_hetero = plain RVV kernels + V-kernel-only Kconfig (avoids hart-0 trap)
 export GLOBAL_CURATED_DIR="$PWD/kernels"
 export REGISTRY="$PWD/cores/chipyard_gemmini_rvv_hetero.json"
 export CPU_P_KIND="gemmini"
-export CPU_E_KIND="rvv"
+export CPU_E_KIND="rvv_hetero"
 export MODELS="yolov8_nano_64,dronet,mlp_control"
 export QUANTS="int8,int8,int8"
 
