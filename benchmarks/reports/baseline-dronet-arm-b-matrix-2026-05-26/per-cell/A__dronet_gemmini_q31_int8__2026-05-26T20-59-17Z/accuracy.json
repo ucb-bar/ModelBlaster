@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "linf": 72.0,
-  "rmse": null,
-  "cosine": null,
-  "n_samples": 2,
-  "bit_exact": false,
-  "verify_pass": true
-}
