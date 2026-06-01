@@ -32,7 +32,7 @@ NETWORKS = [
 
 # Bounds: lower from theoretical critical-path (55.77 ms for yolov8),
 # upper from "definitely fits" (200 ms).
-M_LO = 55.0
+M_LO = 40.0
 M_HI = 200.0
 TOL = 0.5  # ms — stop when interval is smaller than this
 
@@ -45,7 +45,9 @@ def _try_makespan(M: float) -> tuple[bool, int, float]:
         "cores:\n"
         "  - { id: gemmini0, kind: CPU_P, hart: 0 }\n"
         "  - { id: opu0,     kind: CPU_E, hart: 1 }\n"
-        "requantize_ops: [conv2d_s8, linear_s8]\n"
+        # NO requantize_ops: drift constraint dropped so conv2d_s8 +
+        # linear_s8 can split across both tiles, matching qrb's
+        # both-tiles-balanced approach.
         "networks:\n"
     )
     for net, q, n in NETWORKS:
