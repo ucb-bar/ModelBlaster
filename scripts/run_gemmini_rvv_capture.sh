@@ -11,6 +11,13 @@ export FIRESIM_QUEUE_TIMEOUT="3600"
 export XPURT_TRACE=1
 export BACKENDS="gemmini,rvv"
 export GLOBAL_CURATED_DIR="$PWD/kernels"
+# Note: MODELBLASTER_CURATED_VERIFY=0 was tried but it breaks the
+# build at 11s (separate bug from the V trap-loop). Leaving verify=1
+# (default) — the per-kernel verify takes ~46 min total and currently
+# fails for all curated rvv kernels (spike-harness build env not wired
+# in this checkout), so the picker falls back to scalar reference.
+# The fixed rvv.conf still removes the hart-0 trap-loop, so at least
+# FireSim sim should complete now even with scalar fallback.
 export REGISTRY="$PWD/cores/chipyard_gemmini_rvv_hetero.json"
 export CPU_P_KIND="gemmini"
 export CPU_E_KIND="rvv"
