@@ -318,6 +318,16 @@ def _conv2d_s8_argtypes():
     return [i8p, i8p, i32p, i8p] + [ctypes.c_int] * 18
 
 
+def _conv2d_silu_s8_argtypes():
+    """Same as conv2d_s8 plus silu_scale_in / silu_scale_out (float) at
+    the end. The fused kernel applies a SiLU LUT to its int8 output
+    before the final activation clamp."""
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i32p, i8p] + [ctypes.c_int] * 18 + [ctypes.c_float, ctypes.c_float]
+
+
 def _maxpool2d_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -2858,6 +2868,119 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
 """,
         ),
     ],
+)
+
+
+# Fused Conv2D + SiLU. Same dataflow as CONV2D_S8 plus an int8 SiLU LUT
+# applied during the requantize epilogue (saves 1 dispatch + 1 cross-tile
+# sync per occurrence; the int8 output tensor materializes once instead
+# of twice). Detected in extract_graph.py when a Conv2d is immediately
+# followed by an nn.SiLU. Curated kernels per backend can implement the
+# fused requantize→LUT epilogue directly; the reference impl below
+# composes the two ops in C as a fallback.
+CONV2D_SILU_S8 = KernelSpec(
+    op="conv2d_silu_s8",
+    signature=(
+        "void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int activation_min, int activation_max, "
+        "float silu_scale_in, float silu_scale_out)"
+    ),
+    semantics=(
+        "Fused quantized 2D convolution + SiLU activation. Computes\n"
+        "conv2d_s8(input, weight, bias) → int8 intermediate, then\n"
+        "elementwise SiLU(intermediate * silu_scale_in) / silu_scale_out\n"
+        "→ int8 output. activation_min / activation_max bound the final\n"
+        "output. silu_scale_in is the conv's output scale (= dequant for\n"
+        "the SiLU's float compute); silu_scale_out is the quantization\n"
+        "scale for the SiLU result.\n"
+        "Reference impl materializes the intermediate; curated kernels\n"
+        "can apply the SiLU LUT inline in the conv's requantize loop."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight,
+                            const int32_t *bias, int8_t *output,
+                            int N, int IC, int IH, int IW, int OC,
+                            int KH, int KW, int SH, int SW, int PH, int PW,
+                            int input_offset, int filter_offset, int output_offset,
+                            int output_multiplier, int output_shift,
+                            int activation_min, int activation_max,
+                            float silu_scale_in, float silu_scale_out) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    /* Precompute SiLU LUT: 256 entries indexed by (uint8_t)int8 value.
+     * The conv intermediate is int8 (after requantize); SiLU maps each
+     * to another int8 via the float-precision SiLU formula. */
+    int8_t silu_lut[256];
+    for (int v = 0; v < 256; v++) {
+        int8_t iv = (int8_t)(uint8_t)v;
+        float f = (float)iv * silu_scale_in;
+        float y = f / (1.0f + expf(-f));
+        int32_t q = (int32_t)roundf(y / silu_scale_out);
+        if (q < activation_min) q = activation_min;
+        if (q > activation_max) q = activation_max;
+        silu_lut[v] = (int8_t)q;
+    }
+    /* Per-output-element conv with inline SiLU LUT. */
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        const size_t in_row_base = ((size_t)n * IC + ic) * IH;
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[(in_row_base + ih) * IW + iw] + input_offset;
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    /* Conv requantize → int8 intermediate (no clamp at the
+                     * activation min/max yet — those belong to the SiLU
+                     * output. Clamp to int8 range so the LUT index is valid). */
+                    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                    } else if (output_shift < 0) {
+                        scaled = scaled << (-output_shift);
+                    }
+                    scaled += output_offset;
+                    if (scaled < -128) scaled = -128;
+                    if (scaled > 127) scaled = 127;
+                    /* SiLU LUT applied to the int8 intermediate. */
+                    output[((n*OC + oc)*OH + oh)*OW + ow] =
+                        silu_lut[(uint8_t)(int8_t)scaled];
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # Small shape for verify; SiLU scales chosen so the LUT is non-trivial.
+        {"N": 1, "IC": 3, "IH": 8, "IW": 8, "OC": 16,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_silu_s8_argtypes,
 )
 
 
@@ -6958,6 +7081,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear_s8": LINEAR_S8,
     "relu_s8": RELU_S8,
     "conv2d_s8": CONV2D_S8,
+    "conv2d_silu_s8": CONV2D_SILU_S8,
     "maxpool2d_s8": MAXPOOL2D_S8,
     "add_s8": ADD_S8,
     "batchnorm2d_s8": BATCHNORM2D_S8,
