@@ -1,0 +1,8 @@
+label,mix,schedule_kind,solver,n_dispatches,solver_status,solve_wall_s,deadline_misses,predicted_ms,predicted_vs_qrb,n_reps,actual_ms_min,actual_ms_med,actual_ms_max,delta_pct_med,verify
+MOSEK PACKED no-yolo,2d+4m,packed,MOSEK,88,optimal,72.795,0,25.297,0.334,3,25.243,25.243,25.243,-0.215,PASS
+HEFT  PACKED no-yolo,2d+4m,packed,HEFT,88,?,0.007,0,29.206,0.386,0,,,,,
+HEFT  PACKED qrb_y64,1y64+2d+4m,packed,HEFT,300,?,0.018,0,84.151,1.111,2,84.093,84.093,84.093,-0.069,FAIL
+PEFT  PACKED qrb_y64,1y64+2d+4m,packed,peft,300,?,0.017,0,84.008,1.110,0,,,,,
+MOSEK PERIODIC no-yolo,2d+4m@27+53Hz,periodic,MOSEK,88,optimal,5.789,0,56.856,0.751,0,,,,,
+Partition PERIODIC no-yolo,2d+4m@27+53Hz,periodic,periodic_partition_heft,88,?,,0,56.796,0.750,1,56.793,56.793,56.793,-0.005,PASS
+Partition PERIODIC qrb_y64,1y+2d+4m@13+27+53Hz,periodic,periodic_partition_heft,300,?,,5,99.385,1.313,0,,,,,
