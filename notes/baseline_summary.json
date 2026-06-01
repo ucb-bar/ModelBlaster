@@ -139,7 +139,7 @@
       "predicted_ms": 56.796074,
       "predicted_vs_qrb": 0.7501792893937393,
       "actual": {
-        "n_reps": 1,
+        "n_reps": 3,
         "actual_ms_min": 56.793,
         "actual_ms_med": 56.793,
         "actual_ms_max": 56.793,
@@ -148,6 +148,18 @@
         "per_rep": [
           {
             "run": "20260531T103809Z",
+            "actual_ms": 56.793,
+            "verify": "PASS",
+            "n_dispatches": 88
+          },
+          {
+            "run": "20260531T210849Z_rep2",
+            "actual_ms": 56.793,
+            "verify": "PASS",
+            "n_dispatches": 88
+          },
+          {
+            "run": "20260531T211621Z_rep3",
             "actual_ms": 56.793,
             "verify": "PASS",
             "n_dispatches": 88
