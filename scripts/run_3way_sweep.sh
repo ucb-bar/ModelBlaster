@@ -28,6 +28,10 @@ export CPU_P_KIND="gemmini"
 export CPU_E_KIND="rvv_opu"
 export RUNNER="firesim"
 export FIRESIM_QUEUE_TIMEOUT="3600"
+# Record per-dispatch start/end cycles into the in-binary xpurt_trace[]
+# array during execution; the trace is dumped as ONE block at the end of
+# the run via printk. No per-dispatch printk overhead during measurement.
+export XPURT_TRACE=1
 
 if [[ $# -gt 0 ]]; then
   CONFIGS=("$@")
@@ -79,6 +83,24 @@ for cfg in "${CONFIGS[@]}"; do
   if [[ -n "$Q_UART" ]]; then
     cp "$Q_UART" "$RESULTS_DIR/uartlog"
     echo "  uartlog (job_id=${JOB_ID:-?}) -> $RESULTS_DIR/uartlog" | tee -a "$LOG"
+
+    # Extract the per-dispatch trace block (emitted ONCE at end of run, after
+    # all dispatches complete — no measurement overhead). Drop into the same
+    # CSV format arm_a_curated produces so plot_gantt + postmortem just work.
+    python3 - "$RESULTS_DIR/uartlog" "$RESULTS_DIR/xpurt_trace.csv" <<'PY'
+import sys
+src, dst = sys.argv[1:3]
+text = open(src).read()
+B = "=== MODELBLASTER_XPURT_TRACE_BEGIN ==="
+E = "=== MODELBLASTER_XPURT_TRACE_END ==="
+if B in text and E in text:
+    body = text[text.index(B)+len(B):text.index(E, text.index(B))].strip()
+    with open(dst, "w") as f:
+        f.write(body + "\n")
+    print(f"  trace -> {dst} ({body.count(chr(10))+1} rows)")
+else:
+    print("  WARN: trace block missing (XPURT_TRACE=0 in build?)")
+PY
   else
     echo "  WARN: no uartlog found for job_id=${JOB_ID:-?}" | tee -a "$LOG"
   fi
