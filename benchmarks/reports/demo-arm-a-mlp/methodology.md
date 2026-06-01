@@ -1,45 +1,53 @@
 # Methodology: demo-arm-a-mlp
 
-_Fill this in before sharing — without prose, numbers alone don't tell
-the reader WHY you tried something or how to reproduce it._
+Reference Arm A bundle on the smallest viable workload
+(`mlp_generic_scalar_smoke`: 3 Linear + 2 ReLU, scalar int8, spike runner).
+Tutorial example for `mb-cost diff` and a regression oracle for the
+harness itself — every metric should populate, every cell should report
+`verify_pass=true` + `bit_exact=true`.
 
 ## Approach
-What did you try? (e.g. "Switch Arm B-bedrock from beam=2 exp=3 iter=2
-to beam=1 exp=4 iter=1 to spend more on diversity per parent and less
-on iteration depth.")
+Arm A picks curated kernels from `kernels/<target>/` when one matches the
+op signature and falls back to the scalar reference oracle in
+`pipeline/reference_kernels.py` otherwise. No LLM in the loop.
+Deterministic across reps modulo wall-clock drift.
 
-## Hypothesis
-What did you expect would work, and why? (e.g. "Wider expansions per
-parent should land a better kernel earlier without paying for extra
-iterations on already-converged ops.")
+## Configuration
+| Knob          | Value                          |
+|---------------|--------------------------------|
+| arm           | A (curated → scalar fallback)  |
+| LLM           | none                           |
+| workload      | `mlp_generic_scalar_smoke`     |
+| target        | `scalar`                       |
+| quant         | `int8`                         |
+| runner        | `spike`                        |
+| reps          | 1 (demo); set `--runs 3` for stats |
+| FIRESIM_EVAL  | 0                              |
+| max_usd       | n/a                            |
 
-## Knobs changed
-| Knob | Default | This run |
-|---|---|---|
-| arm | A | (e.g. B-bedrock) |
-| LLM model | — | (e.g. claude-sonnet-4-5) |
-| beam | 2 | |
-| expansions | 3 | |
-| iterations | 2 | |
-| FIRESIM_EVAL | 0 | |
-| max_usd | none | |
-
-## Result interpretation
-What did the numbers show? Which kernels improved, by how much, and
-why? Reference specific cells in this report:
-
-  cells covered (first 5): 
-
-See `report.md` for the cost + cycle table; `kernels/` for the actual
-generated C code; `per-cell/<cell>/cycles_per_op.json` for per-op cycle
-breakdowns.
-
-## Reproducing this report
+## Reproducing this bundle
 ```bash
-git checkout 7ea176a
-# ... your commands here ...
-mb-cost export --full demo-arm-a-mlp
+git checkout feat/benchmark-harness
+source scripts/setup_benchmark_env.sh
+uv run mb-cost session start demo-arm-a-mlp \
+    --label "Arm A demo bundle, mlp_generic_scalar_smoke"
+uv run python -m benchmarks.arms.arm_a_curated \
+    --workload mlp_generic_scalar_smoke --runs 1
+uv run mb-cost session end
+uv run mb-cost export --full demo-arm-a-mlp
 ```
 
-## Next steps
-What would you try next based on these results?
+## What this bundle contains
+- `report.json` / `report.md` — top-level summary + per-cell breakdown
+- `per-cell/A__mlp_generic_scalar_smoke__<ts>/` — per-rep raw artifacts
+  (`run.json`, `accuracy.json`, `wall_cycles.txt`, `profile_spike.csv`,
+  `cycles_per_op.json`, `stage_timings.json`, `binary_size.json`,
+  `passes_applied.json`, `kernel_picks.json`, `graph_summary.json`, `env.txt`)
+- `kernels/mlp_generic/int8/scalar/` — kernel C source from this exact run
+  (`kernels.c`, `kernels.h`, `graph.json`, `kernel_picks.json`,
+  `optimize_summary.json`, `beam_search_trajectory.jsonl`)
+
+## Diffing a future change against this bundle
+```bash
+uv run mb-cost diff benchmarks/reports/demo-arm-a-mlp <your-new-bundle>
+```

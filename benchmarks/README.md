@@ -137,6 +137,58 @@ runner is `spike`) on PATH before invoking the shell pipeline; a
 missing tool fails fast with the activation instructions above
 rather than mid-`west build` with `command not found`.
 
+## Reproducing a baseline
+
+`benchmarks/reports/` ships only a curated subset — the aggregate
+rollup (`aggregate-baseline-2026-05-27/`) plus two tutorial bundles
+(`demo-arm-{a,b}-mlp/`). The aggregate's `dashboard.csv` carries every
+metric inline (mean ± stddev across reps), so it works directly as a
+numbers-only baseline. The per-cell raw artifacts for the
+dronet/yolov8n × backend matrix that originally produced it are no
+longer tracked — regenerate them locally when needed:
+
+```bash
+git checkout feat/benchmark-harness
+source scripts/setup_benchmark_env.sh
+
+# Arm A — curated kernels → scalar oracle fallback. Deterministic.
+for w in mlp_generic_scalar_smoke \
+         dronet_scalar_smoke dronet_rvv_smoke \
+         dronet_rvv_opu_int8 dronet_gemmini_int8 \
+         yolov8_nano_scalar_smoke yolov8_nano_rvv_smoke \
+         yolov8n_rvv_opu_int8 yolov8n_gemmini_int8; do
+    uv run python -m benchmarks.arms.arm_a_curated --workload "$w" --runs 3
+done
+
+# Arm B-bedrock — LLM-driven beam search. Nondeterministic; budget required.
+source ../set_api_keys.sh   # Bedrock credentials
+uv run mb-cost session start replay-baseline-2026-05-27 \
+    --budget-usd 100 --label "Reproducing the 2026-05-27 baseline"
+for w in dronet_scalar_smoke dronet_rvv_smoke \
+         dronet_rvv_opu_int8 dronet_gemmini_int8 \
+         yolov8n_rvv_opu_int8 yolov8n_gemmini_int8; do
+    uv run python -m benchmarks.arms.arm_b_bedrock --workload "$w"
+done
+uv run mb-cost session end
+
+# Roll up + diff vs the published baseline.
+uv run python -m benchmarks.aggregate --runs 3
+diff -u benchmarks/reports/aggregate-baseline-2026-05-27/dashboard.csv \
+        benchmarks/results/dashboard.csv | less
+uv run mb-cost diff benchmarks/reports/aggregate-baseline-2026-05-27 \
+                    benchmarks/results
+```
+
+The full matrix landed on `feat/benchmark-harness` — checkout that
+branch (or main once merged) to get every code-side dependency the
+baseline depended on (V trap-loop fix, `GLOBAL_CURATED_DIR`, scheduler
+patches). Reproducing against a pinned earlier SHA is not supported:
+the run-from-scratch flow assumes the current branch's fixes.
+
+For a single-cell diff (no full matrix), see the demo bundle methodologies:
+- `benchmarks/reports/demo-arm-a-mlp/methodology.md`
+- `benchmarks/reports/demo-arm-b-mlp/methodology.md`
+
 ## Adding a workload, metric, arm, or matrix rule
 
 - **New workload:** append one row in `config/workloads.yaml`. If it's
