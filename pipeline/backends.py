@@ -310,9 +310,32 @@ GEMMINI_Q31 = Backend(
 )
 
 
+# RVV_HETERO: same kernel codegen as plain RVV (kernels/rvv/*, no
+# Saturn OP-V custom instructions) but with a kernel-only-V Kconfig
+# overlay so the binary BOOTS on a heterogeneous bitstream where hart 0
+# doesn't have V (the GemminiAndOPUShuttleConfig case). Used to test
+# Dima's qrb-image kernel set on the existing OPU FireSim bitstream
+# without rebuilding the bitstream.
+RVV_HETERO = Backend(
+    name="rvv_hetero",
+    description=(
+        "Plain RVV (rv64gcv) kernels with rvv_opu-style kernel-only V "
+        "Kconfig overlay. For HETEROGENEOUS bitstreams where hart 0 lacks "
+        "V and would otherwise trap on Zephyr's V context init."
+    ),
+    kernel_cflags=RVV.kernel_cflags,
+    kernel_includes=RVV.kernel_includes,
+    prj_conf_overlay="rvv_hetero.conf",
+    spike_args=RVV.spike_args,
+    optimization_guide=RVV.optimization_guide,
+    verify_method=RVV.verify_method,
+)
+
+
 BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
+    RVV_HETERO.name: RVV_HETERO,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,
     RVV_OPU.name: RVV_OPU,
