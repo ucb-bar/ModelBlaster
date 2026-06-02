@@ -25,7 +25,7 @@
 #   source scripts/set_envvars_sdk.sh
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 export PATH="/usr/bin:${PATH}"
 
@@ -35,7 +35,7 @@ FIRESIM_TIMEOUT="${FIRESIM_TIMEOUT:-2400}"
 SPIKE_OK="${SPIKE_OK:-0}"   # if 1, also run on spike (for smoke)
 RUNNER="${RUNNER:-firesim}"
 
-BASELINES_DIR="${REPO_ROOT}/modelblaster/examples/microros_demo/baselines"
+BASELINES_DIR="${REPO_ROOT}/examples/microros_demo/baselines"
 mkdir -p "${BASELINES_DIR}"
 
 # Each entry: tag : pin_backends_csv : pin_harts_csv
