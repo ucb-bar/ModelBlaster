@@ -1,15 +1,15 @@
 {
-  "max_usd": 150.00,
+  "max_usd": 150.0,
   "as_of": "2026-06-02",
   "recorded_to_date_usd": 63.62,
-  "actual_to_date_usd": 81.00,
-  "actual_offset_usd": 17.38,
-  "remaining_usd": 69.00,
-  "rationale": "User authorized maximum LLM spend of $150 total. The mb-cost report shows $63.62 cumulative across 1027 calls, but actual billed spend is $81 — $17.38 of under-counting (likely due to cached prompt tokens not appearing in llm_calls.jsonl, or pricing-table drift). The actual_offset is added to every recorded total before checking against the cap.",
+  "actual_to_date_usd": 83.5,
+  "actual_offset_usd": 19.88,
+  "remaining_usd": 66.5,
+  "rationale": "User authorized maximum LLM spend of $150 total. The mb-cost report shows $63.62 cumulative across 1027 calls, but actual billed spend is $81 \u2014 $17.38 of under-counting (likely due to cached prompt tokens not appearing in llm_calls.jsonl, or pricing-table drift). The actual_offset is added to every recorded total before checking against the cap. Bumped by $2.50 on 2026-06-02 for 4 unrecorded Bedrock attempts (LLM_PROVIDER=bedrock BACKEND=llm via examples/mlp_control/run.sh, which doesn't open a tracked session) that all failed verify and produced no usable kernel.",
   "policy": {
-    "hard_cap": 150.00,
-    "warn_at_usd": 130.00,
-    "stop_new_jobs_at_usd": 145.00,
-    "per_run_cap_default_usd": 10.00
+    "hard_cap": 150.0,
+    "warn_at_usd": 130.0,
+    "stop_new_jobs_at_usd": 145.0,
+    "per_run_cap_default_usd": 10.0
   }
 }
