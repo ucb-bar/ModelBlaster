@@ -20,8 +20,10 @@ runtime/modelblaster_pool/test_app/build/
 
 tmp/
 
-# Claude Code session state (CronCreate, etc.) -- ephemeral, never commit.
-.claude/
+# Claude Code session state -- ephemeral logs / per-user policy never
+# commit; shared skills + hooks DO commit so teammates pick them up.
+.claude/logs/
+.claude/edit_policy.json
 
 # Live cost monitor session ledger -- per-machine, gitignored.
 benchmarks/results/.sessions.json
