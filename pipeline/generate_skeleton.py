@@ -1249,6 +1249,32 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "linear_s8_elu_s8":
+            # Phase 1d pair-fused linear+elu (Phase 1b emitted a synthetic
+            # __fused__... op + chained sub-kernels; this is the registered
+            # KernelSpec path so the LLM-codegen seeds actually fire). The
+            # fused op carries the linear and the elu under sub_ops; pull
+            # their weight / quant params directly.
+            sub = op["sub_ops"]
+            sub_lin = sub[0]; sub_elu = sub[1]
+            in_ptr = ptr_for(sub_lin["inputs"][0], "in")
+            w  = _weight_name(model_name, sub_lin["weight"])
+            b  = _weight_name(model_name, sub_lin["bias"]) if sub_lin.get("bias") else "NULL"
+            sh = sub_lin["shape"]
+            ql = sub_lin["quant"]
+            qe = sub_elu["quant"]
+            alpha = qe.get("alpha", 1.0)
+            call = (
+                f"kernel_linear_s8_elu_s8({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{ql['input_offset']}, {ql['filter_offset']}, "
+                f"{ql['output_offset']}, "
+                f"{ql['output_multiplier']}, {ql['output_shift']}, "
+                f"{ql['activation_min']}, {ql['activation_max']}, "
+                f"{_f32(qe['scale_in'])}, {_f32(qe['scale_out'])}, "
+                f"{qe['activation_min']}, {qe['activation_max']}, "
+                f"{_f32(alpha)})"
+            )
         elif op["op"] == "elu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
