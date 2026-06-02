@@ -1,5 +1,36 @@
 # Plan: Close the XPU-RT ⇄ ModelBlaster agentic granularity loop
 
+## Status (current)
+
+- **Phase 0** (branch hygiene) — done. `baseline` branch off
+  `main@405d1e6`; `feat/agentic-fusion-loop` is the active branch.
+- **Phase 1a** (IR-level fusion realization) — done.
+  `pipeline/apply_fusion_hint.py` + tests (11/11 pass).
+  Smoke-tested on the real XPU-RT hint: `mlp_control` 7 dispatches
+  → 2 (one `__fused__linear_s8__elu_s8__...` + the trailing linear).
+- **Phase 1b** (fused-op codegen integration) — deferred.
+  `generate_skeleton.py:emit_model` is a 50-branch if/elif chain
+  spanning ~740 lines; teaching it to recurse into `sub_ops` is a
+  sizable refactor that risks the working axis-A/B build paths.
+  Axis-C runs through `/realize-hint` + `/realize-and-run` will
+  report `skipped` with a clear reason until this lands.
+- **Phase 2** (bundle driver + measured-report adapter + shell
+  wrapper) — done.
+  `scripts/run_xpurt_bundle.py`, `scripts/run_bundle_firesim.sh`,
+  `scripts/emit_measured_report.py`, `scripts/close_xpurt_loop.py`.
+- **Phase 3** (skills) — done.
+  ModelBlaster `.claude/skills/{realize-hint,realize-and-run}/SKILL.md`;
+  XPU-RT `.claude/skills/close-loop/SKILL.md`.
+- **Phase 4** (end-to-end demo) — running.
+  Baseline (`decomposed`, 388 dispatches, predicted 75.57 ms) and
+  HEFT candidate A2 (300 dispatches, predicted 54.43 ms) queued on
+  FireSim under `FIRESIM_QUEUE=1`. Predicted Gantts already rendered
+  under `artifacts/bundle/{baseline,A2}/predicted_gantt.png`; the
+  greedy-periodic partition variant is in
+  `artifacts/bundle/partition_gantt.png` for reference. Measured
+  Gantts + advisor verdicts will land via `close_xpurt_loop.py` once
+  the FireSim traces come back.
+
 ## Context
 
 `feat/benchmark-harness` is merged (PR #1, `405d1e6` on `main`). The
