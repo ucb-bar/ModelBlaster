@@ -5782,6 +5782,141 @@ def _elu_s8_argtypes():
             ctypes.c_float]
 
 
+def _linear_s8_elu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, weight, bias, output,
+    # M, K, N,
+    # input_offset, filter_offset, linear_output_offset,
+    # output_multiplier, output_shift,
+    # linear_activation_min, linear_activation_max,
+    # scale_linear_out, scale_final_out,
+    # activation_min, activation_max, alpha
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+# Axis-C Phase 1d: pair-fused linear+elu. Computes the linear MAC +
+# requantize tail and applies ELU IN-REGISTER on the resulting int8,
+# skipping the intermediate-tensor write/read that separate
+# kernel_linear_s8 + kernel_elu_s8 would do. For the demo's
+# mlp_control chain (linear→elu repeated three times), pairwise
+# fusion replaces N round-trips through buf_<mid>_mlp_K with N MAC+ELU
+# chains in tight inner loops. Reference impl reproduces both ops'
+# math bit-exact; LLM-codegen seeds (target_affinity) describe
+# vector-register variants for rvv_opu and tiled-matmul fusion for
+# gemmini.
+LINEAR_S8_ELU_S8 = KernelSpec(
+    op="linear_s8_elu_s8",
+    signature=(
+        "void kernel_linear_s8_elu_s8("
+        "const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int M, int K, int N, "
+        "int input_offset, int filter_offset, int linear_output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int linear_activation_min, int linear_activation_max, "
+        "float scale_linear_out, float scale_final_out, "
+        "int activation_min, int activation_max, float alpha)"
+    ),
+    semantics=(
+        "Pair-fused quantized fully-connected + ELU activation. Computes "
+        "linear_s8's MAC + Q0.31 requantize tail, clamps to the linear's "
+        "activation range, then applies ELU on the resulting int8 IN "
+        "REGISTER before storing. Avoids the intermediate-tensor "
+        "write/read that two separate kernel_linear_s8 + kernel_elu_s8 "
+        "calls would do.\n\n"
+        "Math (per output element):\n"
+        "  acc = bias[n] if bias else 0\n"
+        "  for k in K: acc += (in[m,k]+input_offset) * (w[n,k]+filter_offset)\n"
+        "  scaled = requantize_q031(acc, output_multiplier, output_shift)\n"
+        "  scaled += linear_output_offset\n"
+        "  scaled = clamp(scaled, linear_activation_min, linear_activation_max)\n"
+        "  linear_int8 = (int8_t) scaled\n"
+        "  /* ELU in-register */\n"
+        "  f = (float) linear_int8 * scale_linear_out\n"
+        "  y = (f > 0) ? f : alpha * (expf(f) - 1)\n"
+        "  v = round(y / scale_final_out)\n"
+        "  v = clamp(v, activation_min, activation_max)\n"
+        "  output[m,n] = (int8_t) v\n\n"
+        "Optimization targets (LLM seeds):\n"
+        "  rvv_opu  — accumulate the MAC into a vector register via "
+        "VOPMACC, requantize via VOPACC tail, apply ELU LUT via VRGATHER "
+        "in the same vector register before the strided store. The 256-byte "
+        "ELU LUT (one per (scale_linear_out, scale_final_out, alpha) tuple) "
+        "fits entirely in L1 and can be precomputed.\n"
+        "  gemmini  — issue tiled_matmul_auto for the MAC + requant + "
+        "linear-clamp tail (already its native pipeline). Apply ELU on "
+        "the int8 output before write-back via a scalar inner loop on "
+        "the same hart, or fold into the tiled_matmul_auto's epilogue "
+        "if Gemmini's activation-fn slot supports a LUT.\n"
+        "  reference — straightforward C: linear math, requantize, clamp, "
+        "ELU on the int8 result, store final."
+    ),
+    reference_impl="""\
+void kernel_linear_s8_elu_s8(
+    const int8_t *input, const int8_t *weight,
+    const int32_t *bias, int8_t *output,
+    int M, int K, int N,
+    int input_offset, int filter_offset, int linear_output_offset,
+    int output_multiplier, int output_shift,
+    int linear_activation_min, int linear_activation_max,
+    float scale_linear_out, float scale_final_out,
+    int activation_min, int activation_max, float alpha) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            /* --- linear_s8 math --- */
+            int32_t acc = bias ? bias[n] : 0;
+            for (int k = 0; k < K; k++) {
+                int32_t in_v = (int32_t)input[m * K + k] + input_offset;
+                int32_t w_v  = (int32_t)weight[n * K + k] + filter_offset;
+                acc += in_v * w_v;
+            }
+            /* Q0.31 rounding multiply (matches kernel_linear_s8). */
+            int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+            prod = (prod + (1LL << 30)) >> 31;
+            int32_t scaled = (int32_t)prod;
+            if (output_shift > 0) {
+                scaled = (int32_t)(((int64_t)scaled
+                                    + ((int64_t)1 << (output_shift - 1)))
+                                   >> output_shift);
+            } else if (output_shift < 0) {
+                scaled = scaled << (-output_shift);
+            }
+            scaled += linear_output_offset;
+            if (scaled < linear_activation_min) scaled = linear_activation_min;
+            if (scaled > linear_activation_max) scaled = linear_activation_max;
+            int8_t linear_int8 = (int8_t)scaled;
+            /* --- elu_s8 math, in-register (no intermediate tensor) --- */
+            float f = (float)linear_int8 * scale_linear_out;
+            float y = (f > 0.0f) ? f : alpha * (expf(f) - 1.0f);
+            int32_t v = (int32_t)roundf(y / scale_final_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[m * N + n] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # mlp_control's three layer dims (the demo target).
+        {"M": 1, "K": 16,  "N": 256},
+        {"M": 1, "K": 256, "N": 128},
+        {"M": 1, "K": 128, "N": 64},
+        # Generalization
+        {"M": 1, "K": 17,  "N": 23},
+        {"M": 2, "K": 7,   "N": 5},
+    ],
+    argtypes_factory=_linear_s8_elu_s8_argtypes,
+)
+
+
 ELU_S8 = KernelSpec(
     op="elu_s8",
     signature=(
@@ -7128,6 +7263,12 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "silu_s8": SILU_S8,
     # mlp_control int8 support (PPO actor uses nn.ELU).
     "elu_s8": ELU_S8,
+    # Phase 1d pair-fused linear+elu. Eliminates the intermediate-tensor
+    # write/read between consecutive linear_s8 + elu_s8 ops (the mlp_control
+    # chain has three such pairs). LLM-codegen seeds describe rvv_opu
+    # vector-register-resident and gemmini tiled_matmul_auto variants;
+    # reference impl matches kernel_linear_s8 + kernel_elu_s8 bit-exact.
+    "linear_s8_elu_s8": LINEAR_S8_ELU_S8,
     "upsample_nearest_s8": UPSAMPLE_NEAREST_S8,
     "cat2_c1_s8": CAT2_C1_S8,
     "cat3_c1_s8": CAT3_C1_S8,

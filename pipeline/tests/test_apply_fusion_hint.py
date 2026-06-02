@@ -64,9 +64,13 @@ class FuseTwoOpChainTest(unittest.TestCase):
         self.assertEqual(len(out["ops"]), 2)
 
         fused, tail = out["ops"]
-        # fused op
+        # fused op — when sub_ops are exactly [linear_s8, elu_s8] the
+        # rewrite now emits the registered KernelSpec key
+        # `linear_s8_elu_s8` (Phase 1d) instead of the synthetic chain
+        # name; that routes codegen through the registered kernel
+        # (with LLM-codegen seeds) rather than the chained-call fallback.
         self.assertEqual(fused["fused_from"], [0, 1])
-        self.assertEqual(fused["op"], "__fused__linear_s8__elu_s8")
+        self.assertEqual(fused["op"], "linear_s8_elu_s8")
         self.assertEqual(fused["dispatch_id"], 0)
         self.assertEqual(fused["depends_on"], [])
         self.assertEqual(fused["inputs"], ["x"])
