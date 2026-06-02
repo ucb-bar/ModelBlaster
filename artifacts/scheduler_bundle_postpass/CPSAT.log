@@ -1,0 +1,6 @@
+built Workload: 300 ops, 2 machines, 7 network instances
+invoking scheduler.cpsat({'time_limit_s': 600.0})
+solved: makespan=73.979 ms  solve_wall=30.39s  status=solved
+target_horizon=75.0 ms -> WITHIN target
+automerge: collapsed 65 pair(s) -> 235 dispatches, saved 0.0µs
+wrote /scratch2/agustin/ModelBlaster/artifacts/scheduler_bundle_postpass/CPSAT.json

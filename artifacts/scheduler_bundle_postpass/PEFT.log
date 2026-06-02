@@ -1,0 +1,6 @@
+built Workload: 300 ops, 2 machines, 7 network instances
+invoking scheduler.peft({'time_limit': 60.0})
+solved: makespan=87.172 ms  solve_wall=0.02s  status=solved
+target_horizon=75.0 ms -> OVER target
+automerge: collapsed 153 pair(s) -> 147 dispatches, saved 0.0µs
+wrote /scratch2/agustin/ModelBlaster/artifacts/scheduler_bundle_postpass/PEFT.json
