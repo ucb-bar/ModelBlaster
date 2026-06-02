@@ -80,24 +80,23 @@ def _emit_measured(candidate: dict, deadline_us: float | None,
 
 def _render_gantt(trace_csv: Path, out_png: Path,
                   clock_mhz: float = 1000.0) -> bool:
-    """Use the existing scripts/plot_xpurt_trace.py to render a
-    predicted-vs-actual Gantt for a candidate."""
+    """Render predicted-vs-actual Gantt using XPU-RT's plot_gantt.py.
+
+    XPU-RT's plotter accepts the extracted CSV directly via `--trace`,
+    while ModelBlaster's plot_xpurt_trace.py expects the full
+    spike/firesim stdout (with the BEGIN/END markers). The CSVs we
+    have are already extracted, so the XPU-RT plotter is the right
+    consumer.
+    """
     cmd = [
-        sys.executable, "-m", "scripts.plot_xpurt_trace",
-        str(trace_csv),
+        sys.executable, str(XPURT_ROOT / "xpu-rt/plot_gantt.py"),
+        "--trace", str(trace_csv),
         "--out", str(out_png),
-        "--clock-mhz", str(clock_mhz),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        # Fall back to invoking the script directly (some workflows
-        # don't have `scripts` as a python package).
-        cmd = [sys.executable, str(REPO_ROOT / "scripts/plot_xpurt_trace.py"),
-               str(trace_csv), "--out", str(out_png),
-               "--clock-mhz", str(clock_mhz)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"  plot_xpurt_trace failed: {r.stderr.strip()}", file=sys.stderr)
+        print(f"  plot_gantt --trace failed: {r.stderr.strip()}",
+              file=sys.stderr)
         return False
     return out_png.is_file()
 
