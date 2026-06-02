@@ -1,0 +1,28 @@
+{
+  "network": "decomposed",
+  "solver_name": "decomposed",
+  "deadline_us": 65.0,
+  "makespan_us": 75.570546,
+  "meets_deadline": false,
+  "margin_us": -10.570545999999993,
+  "margin_pct": -16.3,
+  "deadline_miss_count": 0,
+  "bottleneck_backend": "CPU_E#0",
+  "idle_backends": [],
+  "granularity_verdict": "too_fine",
+  "recommendations": [
+    {
+      "kind": "coarsen",
+      "target": "fusion_threshold = 1000 cycles",
+      "expected_savings_us": 0.0,
+      "confidence": "medium",
+      "rationale": "388/388 dispatches (100.0%) fall below 1000 cycles. Fusing them collapses the dispatch-overhead tail.",
+      "detail": {
+        "fusion_kind": "threshold",
+        "dispatches_collapsed_pct": 100.0
+      }
+    }
+  ],
+  "projected_makespan_us": 75.571,
+  "projected_meets_deadline": false
+}

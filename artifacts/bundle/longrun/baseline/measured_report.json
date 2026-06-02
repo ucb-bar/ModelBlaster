@@ -1,0 +1,7440 @@
+{
+  "schema_version": 2,
+  "solver_name": "decomposed",
+  "solver_status": "feasible",
+  "solve_wall_s": 0.7054933129693381,
+  "n_operations": 388,
+  "n_combinations": 2,
+  "n_resources_by_kind": {
+    "CPU_P": 1,
+    "CPU_E": 1
+  },
+  "makespan_cycles": 75.570546,
+  "utilization": {
+    "CPU_P#0": {
+      "busy_cycles": 44.62280499999999,
+      "idle_cycles": 30.947741,
+      "frac_busy": 0.5904787957996227
+    },
+    "CPU_E#0": {
+      "busy_cycles": 45.81852,
+      "idle_cycles": 29.752025999999994,
+      "frac_busy": 0.6063012962748742
+    }
+  },
+  "granularity": {
+    "p50": 0.086406,
+    "p90": 0.6425839000000002,
+    "p95": 1.0372974499999998,
+    "p99": 1.923387,
+    "mean": 0.23309619845360827,
+    "max": 2.109587,
+    "buckets": {
+      "lt_1k": 388,
+      "lt_10k": 0,
+      "lt_100k": 0,
+      "lt_1M": 0,
+      "ge_1M": 0
+    }
+  },
+  "dispatch_durations": [
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    0.050087,
+    0.024935,
+    0.341016,
+    0.015115,
+    0.086406,
+    0.006331,
+    0.002755,
+    1.910402,
+    0.759079,
+    0.047627,
+    0.004594,
+    0.241491,
+    0.014256,
+    0.001079,
+    0.111154,
+    0.2296,
+    0.504297,
+    0.014342,
+    0.001356,
+    0.083951,
+    0.00702,
+    0.000653,
+    0.068734,
+    0.07722,
+    0.252079,
+    0.00694,
+    0.000602,
+    0.998446,
+    0.006788,
+    0.00038,
+    1.923387,
+    0.262582,
+    0.164952,
+    0.000414,
+    0.002508,
+    0.002125,
+    0.000763,
+    1.910402,
+    0.759079,
+    0.047627,
+    0.004594,
+    0.241491,
+    0.014256,
+    0.001079,
+    0.111154,
+    0.2296,
+    0.504297,
+    0.014342,
+    0.001356,
+    0.083951,
+    0.00702,
+    0.000653,
+    0.068734,
+    0.07722,
+    0.252079,
+    0.00694,
+    0.000602,
+    0.998446,
+    0.006788,
+    0.00038,
+    1.923387,
+    0.262582,
+    0.164952,
+    0.000414,
+    0.002508,
+    0.002125,
+    0.000763,
+    1.910402,
+    0.759079,
+    0.047627,
+    0.004594,
+    0.241491,
+    0.014256,
+    0.001079,
+    0.111154,
+    0.2296,
+    0.504297,
+    0.014342,
+    0.001356,
+    0.083951,
+    0.00702,
+    0.000653,
+    0.068734,
+    0.07722,
+    0.252079,
+    0.00694,
+    0.000602,
+    0.998446,
+    0.006788,
+    0.00038,
+    1.923387,
+    0.262582,
+    0.164952,
+    0.000414,
+    0.002508,
+    0.002125,
+    0.000763,
+    1.910402,
+    0.759079,
+    0.047627,
+    0.004594,
+    0.241491,
+    0.014256,
+    0.001079,
+    0.111154,
+    0.2296,
+    0.504297,
+    0.014342,
+    0.001356,
+    0.083951,
+    0.00702,
+    0.000653,
+    0.068734,
+    0.07722,
+    0.252079,
+    0.00694,
+    0.000602,
+    0.998446,
+    0.006788,
+    0.00038,
+    1.923387,
+    0.262582,
+    0.164952,
+    0.000414,
+    0.002508,
+    0.002125,
+    0.000763,
+    2.109587,
+    0.201982,
+    1.364861,
+    1.479597,
+    0.100451,
+    0.711225,
+    1.035404,
+    0.100394,
+    0.707264,
+    0.0,
+    0.43586,
+    0.050275,
+    0.382094,
+    0.432304,
+    0.050221,
+    0.382256,
+    2.076229,
+    0.124299,
+    1.247761,
+    0.100336,
+    0.70877,
+    0.63742,
+    0.052077,
+    0.382275,
+    0.435197,
+    0.051979,
+    0.382297,
+    0.0,
+    0.21781,
+    0.026254,
+    0.221175,
+    0.217677,
+    0.026209,
+    0.221328,
+    1.038726,
+    0.218177,
+    0.026244,
+    0.221397,
+    0.21793,
+    0.026121,
+    0.221191,
+    1.038317,
+    0.090718,
+    0.669759,
+    0.05193,
+    0.382301,
+    0.346096,
+    0.026526,
+    0.221392,
+    0.235687,
+    0.026458,
+    0.221283,
+    0.0,
+    0.127851,
+    0.013315,
+    0.140531,
+    0.126447,
+    0.013306,
+    0.140331,
+    0.520342,
+    0.127101,
+    0.013378,
+    0.140508,
+    0.126579,
+    0.013254,
+    0.14323,
+    0.521409,
+    0.045525,
+    0.42189,
+    0.026279,
+    0.221173,
+    0.283634,
+    0.017625,
+    0.140487,
+    0.141342,
+    0.017422,
+    0.139778,
+    0.0,
+    0.128986,
+    0.253139,
+    0.097215,
+    0.127661,
+    0.255391,
+    0.084435,
+    0.262882,
+    0.724828,
+    0.179043,
+    0.508841,
+    1.267585,
+    0.093319,
+    0.250261,
+    0.090652,
+    1.250023,
+    1.225438,
+    1.159111,
+    0.022828,
+    0.216341,
+    0.017366,
+    0.120141,
+    0.16074,
+    0.06086,
+    0.698628,
+    0.02633,
+    0.220928,
+    0.0,
+    0.127269,
+    0.013301,
+    0.139205,
+    0.125544,
+    0.013301,
+    0.134984,
+    0.032481,
+    0.325004,
+    0.026427,
+    0.219715,
+    0.27606,
+    0.118003,
+    0.920273,
+    0.052014,
+    0.382284,
+    0.0,
+    0.218735,
+    0.026278,
+    0.22116,
+    0.217464,
+    0.026196,
+    0.221078,
+    0.063281,
+    0.550149,
+    0.051986,
+    0.382141,
+    0.265141,
+    0.01324,
+    0.140463,
+    0.03145,
+    0.323384,
+    0.02638,
+    0.220542,
+    0.0,
+    0.127039,
+    0.01341,
+    0.137119,
+    0.126672,
+    0.013269,
+    0.130015,
+    0.032448,
+    0.326772,
+    0.026513,
+    0.217426,
+    0.187398,
+    0.008746,
+    0.082169,
+    0.020758,
+    0.178658,
+    0.504406,
+    0.939684,
+    0.0,
+    0.129221,
+    0.008768,
+    0.080799,
+    0.128014,
+    0.008792,
+    0.081024,
+    0.020283,
+    0.179952,
+    0.017236,
+    0.121341,
+    0.516295,
+    0.052206,
+    0.382172,
+    0.490999,
+    0.054381,
+    0.381517,
+    0.43248,
+    0.582277,
+    0.065157,
+    0.462816,
+    0.654633,
+    0.065056,
+    0.462442,
+    0.558858,
+    0.088946,
+    0.205556,
+    0.013397,
+    0.123032,
+    0.127209,
+    0.013258,
+    0.118616,
+    0.816622,
+    0.229618,
+    0.615929,
+    0.145182,
+    0.168045,
+    0.016572,
+    0.138974,
+    1.395438,
+    0.022381,
+    0.122686,
+    0.004483,
+    0.060747,
+    0.044118,
+    0.004409,
+    0.060551,
+    0.203759,
+    0.141798,
+    0.005574,
+    0.065736,
+    0.061008,
+    0.005509,
+    0.065745,
+    0.347839,
+    0.00716
+  ],
+  "critical_path": 45.53206399999999,
+  "cross_device_transitions": 180,
+  "deadline_miss_count": 0,
+  "fusion_applied": false,
+  "fusion_map": null,
+  "git_sha": "561321a",
+  "captured_at": "2026-06-02T00:54:34+00:00",
+  "deadline_us": null,
+  "dispatches": [
+    {
+      "id": 0,
+      "name": "mlp_control0_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.0,
+      "duration_us": 0.050087,
+      "finish_us": 0.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 1,
+      "name": "mlp_control0_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.050087,
+      "duration_us": 0.024935,
+      "finish_us": 0.075022,
+      "deps": [
+        0
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 2,
+      "name": "mlp_control0_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.075022,
+      "duration_us": 0.341016,
+      "finish_us": 0.416038,
+      "deps": [
+        1
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 3,
+      "name": "mlp_control0_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.416038,
+      "duration_us": 0.015115,
+      "finish_us": 0.431153,
+      "deps": [
+        2
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 4,
+      "name": "mlp_control0_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.431153,
+      "duration_us": 0.086406,
+      "finish_us": 0.517559,
+      "deps": [
+        3
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 5,
+      "name": "mlp_control0_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.517559,
+      "duration_us": 0.006331,
+      "finish_us": 0.52389,
+      "deps": [
+        4
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 6,
+      "name": "mlp_control0_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.52389,
+      "duration_us": 0.002755,
+      "finish_us": 0.5266449999999999,
+      "deps": [
+        5
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 7,
+      "name": "mlp_control1_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.0,
+      "duration_us": 0.050087,
+      "finish_us": 10.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 8,
+      "name": "mlp_control1_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.050087,
+      "duration_us": 0.024935,
+      "finish_us": 10.075021999999999,
+      "deps": [
+        7
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 9,
+      "name": "mlp_control1_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.075021999999999,
+      "duration_us": 0.341016,
+      "finish_us": 10.416037999999999,
+      "deps": [
+        8
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 10,
+      "name": "mlp_control1_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.416037999999999,
+      "duration_us": 0.015115,
+      "finish_us": 10.431152999999998,
+      "deps": [
+        9
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 11,
+      "name": "mlp_control1_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.431152999999998,
+      "duration_us": 0.086406,
+      "finish_us": 10.517558999999999,
+      "deps": [
+        10
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 12,
+      "name": "mlp_control1_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.517558999999999,
+      "duration_us": 0.006331,
+      "finish_us": 10.523889999999998,
+      "deps": [
+        11
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 13,
+      "name": "mlp_control1_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.523889999999998,
+      "duration_us": 0.002755,
+      "finish_us": 10.526644999999998,
+      "deps": [
+        12
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 14,
+      "name": "mlp_control2_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.0,
+      "duration_us": 0.050087,
+      "finish_us": 20.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 15,
+      "name": "mlp_control2_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.050087,
+      "duration_us": 0.024935,
+      "finish_us": 20.075022,
+      "deps": [
+        14
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 16,
+      "name": "mlp_control2_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.075022,
+      "duration_us": 0.341016,
+      "finish_us": 20.416038,
+      "deps": [
+        15
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 17,
+      "name": "mlp_control2_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.416038,
+      "duration_us": 0.015115,
+      "finish_us": 20.431153000000002,
+      "deps": [
+        16
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 18,
+      "name": "mlp_control2_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.431153000000002,
+      "duration_us": 0.086406,
+      "finish_us": 20.517559000000002,
+      "deps": [
+        17
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 19,
+      "name": "mlp_control2_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.517559000000002,
+      "duration_us": 0.006331,
+      "finish_us": 20.52389,
+      "deps": [
+        18
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 20,
+      "name": "mlp_control2_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.52389,
+      "duration_us": 0.002755,
+      "finish_us": 20.526645000000002,
+      "deps": [
+        19
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 21,
+      "name": "mlp_control3_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.0,
+      "duration_us": 0.050087,
+      "finish_us": 30.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 22,
+      "name": "mlp_control3_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.050087,
+      "duration_us": 0.024935,
+      "finish_us": 30.075022,
+      "deps": [
+        21
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 23,
+      "name": "mlp_control3_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.075022,
+      "duration_us": 0.341016,
+      "finish_us": 30.416038,
+      "deps": [
+        22
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 24,
+      "name": "mlp_control3_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.416038,
+      "duration_us": 0.015115,
+      "finish_us": 30.431153000000002,
+      "deps": [
+        23
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 25,
+      "name": "mlp_control3_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.431153000000002,
+      "duration_us": 0.086406,
+      "finish_us": 30.517559000000002,
+      "deps": [
+        24
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 26,
+      "name": "mlp_control3_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.517559000000002,
+      "duration_us": 0.006331,
+      "finish_us": 30.52389,
+      "deps": [
+        25
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 27,
+      "name": "mlp_control3_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.52389,
+      "duration_us": 0.002755,
+      "finish_us": 30.526645000000002,
+      "deps": [
+        26
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 28,
+      "name": "mlp_control4_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.0,
+      "duration_us": 0.050087,
+      "finish_us": 40.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 29,
+      "name": "mlp_control4_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.050087,
+      "duration_us": 0.024935,
+      "finish_us": 40.075022,
+      "deps": [
+        28
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 30,
+      "name": "mlp_control4_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.075022,
+      "duration_us": 0.341016,
+      "finish_us": 40.416038,
+      "deps": [
+        29
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 31,
+      "name": "mlp_control4_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.416038,
+      "duration_us": 0.015115,
+      "finish_us": 40.431153,
+      "deps": [
+        30
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 32,
+      "name": "mlp_control4_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.431153,
+      "duration_us": 0.086406,
+      "finish_us": 40.517559,
+      "deps": [
+        31
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 33,
+      "name": "mlp_control4_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.517559,
+      "duration_us": 0.006331,
+      "finish_us": 40.52389,
+      "deps": [
+        32
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 34,
+      "name": "mlp_control4_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.52389,
+      "duration_us": 0.002755,
+      "finish_us": 40.526645,
+      "deps": [
+        33
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 35,
+      "name": "mlp_control5_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.0,
+      "duration_us": 0.050087,
+      "finish_us": 50.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 36,
+      "name": "mlp_control5_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.050087,
+      "duration_us": 0.024935,
+      "finish_us": 50.075022,
+      "deps": [
+        35
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 37,
+      "name": "mlp_control5_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.075022,
+      "duration_us": 0.341016,
+      "finish_us": 50.416038,
+      "deps": [
+        36
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 38,
+      "name": "mlp_control5_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.416038,
+      "duration_us": 0.015115,
+      "finish_us": 50.431153,
+      "deps": [
+        37
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 39,
+      "name": "mlp_control5_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.431153,
+      "duration_us": 0.086406,
+      "finish_us": 50.517559,
+      "deps": [
+        38
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 40,
+      "name": "mlp_control5_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.517559,
+      "duration_us": 0.006331,
+      "finish_us": 50.52389,
+      "deps": [
+        39
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 41,
+      "name": "mlp_control5_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.52389,
+      "duration_us": 0.002755,
+      "finish_us": 50.526645,
+      "deps": [
+        40
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 42,
+      "name": "mlp_control6_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.0,
+      "duration_us": 0.050087,
+      "finish_us": 60.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 43,
+      "name": "mlp_control6_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.050087,
+      "duration_us": 0.024935,
+      "finish_us": 60.075022,
+      "deps": [
+        42
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 44,
+      "name": "mlp_control6_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.075022,
+      "duration_us": 0.341016,
+      "finish_us": 60.416038,
+      "deps": [
+        43
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 45,
+      "name": "mlp_control6_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.416038,
+      "duration_us": 0.015115,
+      "finish_us": 60.431153,
+      "deps": [
+        44
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 46,
+      "name": "mlp_control6_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.431153,
+      "duration_us": 0.086406,
+      "finish_us": 60.517559,
+      "deps": [
+        45
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 47,
+      "name": "mlp_control6_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.517559,
+      "duration_us": 0.006331,
+      "finish_us": 60.52389,
+      "deps": [
+        46
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 48,
+      "name": "mlp_control6_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.52389,
+      "duration_us": 0.002755,
+      "finish_us": 60.526645,
+      "deps": [
+        47
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 49,
+      "name": "mlp_control7_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 70.0,
+      "duration_us": 0.050087,
+      "finish_us": 70.050087,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 50,
+      "name": "mlp_control7_dispatch_1",
+      "op": 1,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 70.050087,
+      "duration_us": 0.024935,
+      "finish_us": 70.075022,
+      "deps": [
+        49
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 51,
+      "name": "mlp_control7_dispatch_2",
+      "op": 2,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 70.075022,
+      "duration_us": 0.341016,
+      "finish_us": 70.416038,
+      "deps": [
+        50
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 52,
+      "name": "mlp_control7_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 70.416038,
+      "duration_us": 0.015115,
+      "finish_us": 70.431153,
+      "deps": [
+        51
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 53,
+      "name": "mlp_control7_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 70.431153,
+      "duration_us": 0.086406,
+      "finish_us": 70.51755899999999,
+      "deps": [
+        52
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 54,
+      "name": "mlp_control7_dispatch_5",
+      "op": 5,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 70.51755899999999,
+      "duration_us": 0.006331,
+      "finish_us": 70.52389,
+      "deps": [
+        53
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 55,
+      "name": "mlp_control7_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 70.52389,
+      "duration_us": 0.002755,
+      "finish_us": 70.52664499999999,
+      "deps": [
+        54
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 56,
+      "name": "dronet0_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 0.5266449999999999,
+      "duration_us": 1.910402,
+      "finish_us": 2.4370469999999997,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 57,
+      "name": "dronet0_dispatch_1",
+      "op": 1,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 2.4370469999999997,
+      "duration_us": 0.759079,
+      "finish_us": 3.1961259999999996,
+      "deps": [
+        56
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 58,
+      "name": "dronet0_dispatch_2",
+      "op": 2,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 3.1961259999999996,
+      "duration_us": 0.047627,
+      "finish_us": 3.2437529999999994,
+      "deps": [
+        57
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 59,
+      "name": "dronet0_dispatch_3",
+      "op": 3,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 3.2437529999999994,
+      "duration_us": 0.004594,
+      "finish_us": 3.2483469999999994,
+      "deps": [
+        58
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 60,
+      "name": "dronet0_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 3.2483469999999994,
+      "duration_us": 0.241491,
+      "finish_us": 3.4898379999999993,
+      "deps": [
+        59
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 61,
+      "name": "dronet0_dispatch_5",
+      "op": 5,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 3.4898379999999993,
+      "duration_us": 0.014256,
+      "finish_us": 3.5040939999999994,
+      "deps": [
+        60
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 62,
+      "name": "dronet0_dispatch_6",
+      "op": 6,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 3.5040939999999994,
+      "duration_us": 0.001079,
+      "finish_us": 3.505172999999999,
+      "deps": [
+        61
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 63,
+      "name": "dronet0_dispatch_7",
+      "op": 7,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 3.505172999999999,
+      "duration_us": 0.111154,
+      "finish_us": 3.616326999999999,
+      "deps": [
+        62
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 64,
+      "name": "dronet0_dispatch_8",
+      "op": 8,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 3.616326999999999,
+      "duration_us": 0.2296,
+      "finish_us": 3.845926999999999,
+      "deps": [
+        57
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 65,
+      "name": "dronet0_dispatch_9",
+      "op": 9,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 3.845926999999999,
+      "duration_us": 0.504297,
+      "finish_us": 4.350223999999999,
+      "deps": [
+        63,
+        64
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 66,
+      "name": "dronet0_dispatch_10",
+      "op": 10,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.350223999999999,
+      "duration_us": 0.014342,
+      "finish_us": 4.364565999999999,
+      "deps": [
+        65
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 67,
+      "name": "dronet0_dispatch_11",
+      "op": 11,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.364565999999999,
+      "duration_us": 0.001356,
+      "finish_us": 4.365921999999999,
+      "deps": [
+        66
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 68,
+      "name": "dronet0_dispatch_12",
+      "op": 12,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 4.365921999999999,
+      "duration_us": 0.083951,
+      "finish_us": 4.449872999999999,
+      "deps": [
+        67
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 69,
+      "name": "dronet0_dispatch_13",
+      "op": 13,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.449872999999999,
+      "duration_us": 0.00702,
+      "finish_us": 4.456892999999999,
+      "deps": [
+        68
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 70,
+      "name": "dronet0_dispatch_14",
+      "op": 14,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.456892999999999,
+      "duration_us": 0.000653,
+      "finish_us": 4.457545999999999,
+      "deps": [
+        69
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 71,
+      "name": "dronet0_dispatch_15",
+      "op": 15,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 4.457545999999999,
+      "duration_us": 0.068734,
+      "finish_us": 4.526279999999999,
+      "deps": [
+        70
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 72,
+      "name": "dronet0_dispatch_16",
+      "op": 16,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 4.526279999999999,
+      "duration_us": 0.07722,
+      "finish_us": 4.603499999999999,
+      "deps": [
+        65
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 73,
+      "name": "dronet0_dispatch_17",
+      "op": 17,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.603499999999999,
+      "duration_us": 0.252079,
+      "finish_us": 4.855578999999999,
+      "deps": [
+        71,
+        72
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 74,
+      "name": "dronet0_dispatch_18",
+      "op": 18,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.855578999999999,
+      "duration_us": 0.00694,
+      "finish_us": 4.862518999999999,
+      "deps": [
+        73
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 75,
+      "name": "dronet0_dispatch_19",
+      "op": 19,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.862518999999999,
+      "duration_us": 0.000602,
+      "finish_us": 4.863120999999999,
+      "deps": [
+        74
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 76,
+      "name": "dronet0_dispatch_20",
+      "op": 20,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 4.863120999999999,
+      "duration_us": 0.998446,
+      "finish_us": 5.861566999999999,
+      "deps": [
+        75
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 77,
+      "name": "dronet0_dispatch_21",
+      "op": 21,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 5.861566999999999,
+      "duration_us": 0.006788,
+      "finish_us": 5.868354999999999,
+      "deps": [
+        76
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 78,
+      "name": "dronet0_dispatch_22",
+      "op": 22,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 5.868354999999999,
+      "duration_us": 0.00038,
+      "finish_us": 5.868734999999999,
+      "deps": [
+        77
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 79,
+      "name": "dronet0_dispatch_23",
+      "op": 23,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 6.131316999999999,
+      "duration_us": 1.923387,
+      "finish_us": 8.054704,
+      "deps": [
+        78
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 80,
+      "name": "dronet0_dispatch_24",
+      "op": 24,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 5.868734999999999,
+      "duration_us": 0.262582,
+      "finish_us": 6.131316999999999,
+      "deps": [
+        73
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 81,
+      "name": "dronet0_dispatch_25",
+      "op": 25,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 8.054704,
+      "duration_us": 0.164952,
+      "finish_us": 8.219655999999999,
+      "deps": [
+        79,
+        80
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 82,
+      "name": "dronet0_dispatch_26",
+      "op": 26,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 8.219655999999999,
+      "duration_us": 0.000414,
+      "finish_us": 8.220069999999998,
+      "deps": [
+        81
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 83,
+      "name": "dronet0_dispatch_27",
+      "op": 27,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 8.222957999999997,
+      "duration_us": 0.002508,
+      "finish_us": 8.225465999999997,
+      "deps": [
+        82
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 84,
+      "name": "dronet0_dispatch_28",
+      "op": 28,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 8.220069999999998,
+      "duration_us": 0.002125,
+      "finish_us": 8.222194999999997,
+      "deps": [
+        82
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 85,
+      "name": "dronet0_dispatch_29",
+      "op": 29,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 8.222194999999997,
+      "duration_us": 0.000763,
+      "finish_us": 8.222957999999997,
+      "deps": [
+        84
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 86,
+      "name": "dronet1_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 20.526645000000002,
+      "duration_us": 1.910402,
+      "finish_us": 22.437047000000003,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 87,
+      "name": "dronet1_dispatch_1",
+      "op": 1,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 22.437047000000003,
+      "duration_us": 0.759079,
+      "finish_us": 23.196126000000003,
+      "deps": [
+        86
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 88,
+      "name": "dronet1_dispatch_2",
+      "op": 2,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 23.196126000000003,
+      "duration_us": 0.047627,
+      "finish_us": 23.243753,
+      "deps": [
+        87
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 89,
+      "name": "dronet1_dispatch_3",
+      "op": 3,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 23.243753,
+      "duration_us": 0.004594,
+      "finish_us": 23.248347000000003,
+      "deps": [
+        88
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 90,
+      "name": "dronet1_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 23.248347000000003,
+      "duration_us": 0.241491,
+      "finish_us": 23.489838000000002,
+      "deps": [
+        89
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 91,
+      "name": "dronet1_dispatch_5",
+      "op": 5,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 23.489838000000002,
+      "duration_us": 0.014256,
+      "finish_us": 23.504094000000002,
+      "deps": [
+        90
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 92,
+      "name": "dronet1_dispatch_6",
+      "op": 6,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 23.504094000000002,
+      "duration_us": 0.001079,
+      "finish_us": 23.505173000000003,
+      "deps": [
+        91
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 93,
+      "name": "dronet1_dispatch_7",
+      "op": 7,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 23.505173000000003,
+      "duration_us": 0.111154,
+      "finish_us": 23.616327000000002,
+      "deps": [
+        92
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 94,
+      "name": "dronet1_dispatch_8",
+      "op": 8,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 23.616327000000002,
+      "duration_us": 0.2296,
+      "finish_us": 23.845927000000003,
+      "deps": [
+        87
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 95,
+      "name": "dronet1_dispatch_9",
+      "op": 9,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 23.845927000000003,
+      "duration_us": 0.504297,
+      "finish_us": 24.350224000000004,
+      "deps": [
+        93,
+        94
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 96,
+      "name": "dronet1_dispatch_10",
+      "op": 10,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.350224000000004,
+      "duration_us": 0.014342,
+      "finish_us": 24.364566000000003,
+      "deps": [
+        95
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 97,
+      "name": "dronet1_dispatch_11",
+      "op": 11,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.364566000000003,
+      "duration_us": 0.001356,
+      "finish_us": 24.365922000000005,
+      "deps": [
+        96
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 98,
+      "name": "dronet1_dispatch_12",
+      "op": 12,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 24.365922000000005,
+      "duration_us": 0.083951,
+      "finish_us": 24.449873000000004,
+      "deps": [
+        97
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 99,
+      "name": "dronet1_dispatch_13",
+      "op": 13,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.449873000000004,
+      "duration_us": 0.00702,
+      "finish_us": 24.456893000000004,
+      "deps": [
+        98
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 100,
+      "name": "dronet1_dispatch_14",
+      "op": 14,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.456893000000004,
+      "duration_us": 0.000653,
+      "finish_us": 24.457546000000004,
+      "deps": [
+        99
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 101,
+      "name": "dronet1_dispatch_15",
+      "op": 15,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 24.457546000000004,
+      "duration_us": 0.068734,
+      "finish_us": 24.526280000000003,
+      "deps": [
+        100
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 102,
+      "name": "dronet1_dispatch_16",
+      "op": 16,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 24.526280000000003,
+      "duration_us": 0.07722,
+      "finish_us": 24.603500000000004,
+      "deps": [
+        95
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 103,
+      "name": "dronet1_dispatch_17",
+      "op": 17,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.603500000000004,
+      "duration_us": 0.252079,
+      "finish_us": 24.855579000000002,
+      "deps": [
+        101,
+        102
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 104,
+      "name": "dronet1_dispatch_18",
+      "op": 18,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.855579000000002,
+      "duration_us": 0.00694,
+      "finish_us": 24.862519000000002,
+      "deps": [
+        103
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 105,
+      "name": "dronet1_dispatch_19",
+      "op": 19,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.862519000000002,
+      "duration_us": 0.000602,
+      "finish_us": 24.863121000000003,
+      "deps": [
+        104
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 106,
+      "name": "dronet1_dispatch_20",
+      "op": 20,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 24.863121000000003,
+      "duration_us": 0.998446,
+      "finish_us": 25.861567000000004,
+      "deps": [
+        105
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 107,
+      "name": "dronet1_dispatch_21",
+      "op": 21,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 25.861567000000004,
+      "duration_us": 0.006788,
+      "finish_us": 25.868355000000005,
+      "deps": [
+        106
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 108,
+      "name": "dronet1_dispatch_22",
+      "op": 22,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 25.868355000000005,
+      "duration_us": 0.00038,
+      "finish_us": 25.868735000000004,
+      "deps": [
+        107
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 109,
+      "name": "dronet1_dispatch_23",
+      "op": 23,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 26.131317000000003,
+      "duration_us": 1.923387,
+      "finish_us": 28.054704,
+      "deps": [
+        108
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 110,
+      "name": "dronet1_dispatch_24",
+      "op": 24,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 25.868735000000004,
+      "duration_us": 0.262582,
+      "finish_us": 26.131317000000003,
+      "deps": [
+        103
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 111,
+      "name": "dronet1_dispatch_25",
+      "op": 25,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 28.054704,
+      "duration_us": 0.164952,
+      "finish_us": 28.219656,
+      "deps": [
+        109,
+        110
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 112,
+      "name": "dronet1_dispatch_26",
+      "op": 26,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 28.219656,
+      "duration_us": 0.000414,
+      "finish_us": 28.22007,
+      "deps": [
+        111
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 113,
+      "name": "dronet1_dispatch_27",
+      "op": 27,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 28.222958,
+      "duration_us": 0.002508,
+      "finish_us": 28.225465999999997,
+      "deps": [
+        112
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 114,
+      "name": "dronet1_dispatch_28",
+      "op": 28,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 28.22007,
+      "duration_us": 0.002125,
+      "finish_us": 28.222195,
+      "deps": [
+        112
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 115,
+      "name": "dronet1_dispatch_29",
+      "op": 29,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 28.222195,
+      "duration_us": 0.000763,
+      "finish_us": 28.222958,
+      "deps": [
+        114
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 116,
+      "name": "dronet2_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 40.526645,
+      "duration_us": 1.910402,
+      "finish_us": 42.437047,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 117,
+      "name": "dronet2_dispatch_1",
+      "op": 1,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 42.437047,
+      "duration_us": 0.759079,
+      "finish_us": 43.196126,
+      "deps": [
+        116
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 118,
+      "name": "dronet2_dispatch_2",
+      "op": 2,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 43.196126,
+      "duration_us": 0.047627,
+      "finish_us": 43.243753,
+      "deps": [
+        117
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 119,
+      "name": "dronet2_dispatch_3",
+      "op": 3,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 43.243753,
+      "duration_us": 0.004594,
+      "finish_us": 43.248346999999995,
+      "deps": [
+        118
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 120,
+      "name": "dronet2_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 43.248346999999995,
+      "duration_us": 0.241491,
+      "finish_us": 43.489838,
+      "deps": [
+        119
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 121,
+      "name": "dronet2_dispatch_5",
+      "op": 5,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 43.489838,
+      "duration_us": 0.014256,
+      "finish_us": 43.504094,
+      "deps": [
+        120
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 122,
+      "name": "dronet2_dispatch_6",
+      "op": 6,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 43.504094,
+      "duration_us": 0.001079,
+      "finish_us": 43.505173,
+      "deps": [
+        121
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 123,
+      "name": "dronet2_dispatch_7",
+      "op": 7,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 43.505173,
+      "duration_us": 0.111154,
+      "finish_us": 43.616327,
+      "deps": [
+        122
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 124,
+      "name": "dronet2_dispatch_8",
+      "op": 8,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 43.616327,
+      "duration_us": 0.2296,
+      "finish_us": 43.845926999999996,
+      "deps": [
+        117
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 125,
+      "name": "dronet2_dispatch_9",
+      "op": 9,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 43.845926999999996,
+      "duration_us": 0.504297,
+      "finish_us": 44.350224,
+      "deps": [
+        123,
+        124
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 126,
+      "name": "dronet2_dispatch_10",
+      "op": 10,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.350224,
+      "duration_us": 0.014342,
+      "finish_us": 44.364565999999996,
+      "deps": [
+        125
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 127,
+      "name": "dronet2_dispatch_11",
+      "op": 11,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.364565999999996,
+      "duration_us": 0.001356,
+      "finish_us": 44.365922,
+      "deps": [
+        126
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 128,
+      "name": "dronet2_dispatch_12",
+      "op": 12,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 44.365922,
+      "duration_us": 0.083951,
+      "finish_us": 44.449873,
+      "deps": [
+        127
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 129,
+      "name": "dronet2_dispatch_13",
+      "op": 13,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.449873,
+      "duration_us": 0.00702,
+      "finish_us": 44.456892999999994,
+      "deps": [
+        128
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 130,
+      "name": "dronet2_dispatch_14",
+      "op": 14,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.456892999999994,
+      "duration_us": 0.000653,
+      "finish_us": 44.457545999999994,
+      "deps": [
+        129
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 131,
+      "name": "dronet2_dispatch_15",
+      "op": 15,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 44.457545999999994,
+      "duration_us": 0.068734,
+      "finish_us": 44.52627999999999,
+      "deps": [
+        130
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 132,
+      "name": "dronet2_dispatch_16",
+      "op": 16,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 44.52627999999999,
+      "duration_us": 0.07722,
+      "finish_us": 44.60349999999999,
+      "deps": [
+        125
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 133,
+      "name": "dronet2_dispatch_17",
+      "op": 17,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.60349999999999,
+      "duration_us": 0.252079,
+      "finish_us": 44.85557899999999,
+      "deps": [
+        131,
+        132
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 134,
+      "name": "dronet2_dispatch_18",
+      "op": 18,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.85557899999999,
+      "duration_us": 0.00694,
+      "finish_us": 44.86251899999999,
+      "deps": [
+        133
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 135,
+      "name": "dronet2_dispatch_19",
+      "op": 19,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.86251899999999,
+      "duration_us": 0.000602,
+      "finish_us": 44.86312099999999,
+      "deps": [
+        134
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 136,
+      "name": "dronet2_dispatch_20",
+      "op": 20,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.86312099999999,
+      "duration_us": 0.998446,
+      "finish_us": 45.861566999999994,
+      "deps": [
+        135
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 137,
+      "name": "dronet2_dispatch_21",
+      "op": 21,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 45.861566999999994,
+      "duration_us": 0.006788,
+      "finish_us": 45.868354999999994,
+      "deps": [
+        136
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 138,
+      "name": "dronet2_dispatch_22",
+      "op": 22,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 45.868354999999994,
+      "duration_us": 0.00038,
+      "finish_us": 45.868734999999994,
+      "deps": [
+        137
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 139,
+      "name": "dronet2_dispatch_23",
+      "op": 23,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 46.131316999999996,
+      "duration_us": 1.923387,
+      "finish_us": 48.054703999999994,
+      "deps": [
+        138
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 140,
+      "name": "dronet2_dispatch_24",
+      "op": 24,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 45.868734999999994,
+      "duration_us": 0.262582,
+      "finish_us": 46.131316999999996,
+      "deps": [
+        133
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 141,
+      "name": "dronet2_dispatch_25",
+      "op": 25,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 48.054703999999994,
+      "duration_us": 0.164952,
+      "finish_us": 48.21965599999999,
+      "deps": [
+        139,
+        140
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 142,
+      "name": "dronet2_dispatch_26",
+      "op": 26,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 48.21965599999999,
+      "duration_us": 0.000414,
+      "finish_us": 48.22006999999999,
+      "deps": [
+        141
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 143,
+      "name": "dronet2_dispatch_27",
+      "op": 27,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 48.22295799999999,
+      "duration_us": 0.002508,
+      "finish_us": 48.22546599999999,
+      "deps": [
+        142
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 144,
+      "name": "dronet2_dispatch_28",
+      "op": 28,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 48.22006999999999,
+      "duration_us": 0.002125,
+      "finish_us": 48.22219499999999,
+      "deps": [
+        142
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 145,
+      "name": "dronet2_dispatch_29",
+      "op": 29,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 48.22219499999999,
+      "duration_us": 0.000763,
+      "finish_us": 48.22295799999999,
+      "deps": [
+        144
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 146,
+      "name": "dronet3_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 60.526645,
+      "duration_us": 1.910402,
+      "finish_us": 62.437047,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 147,
+      "name": "dronet3_dispatch_1",
+      "op": 1,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 62.437047,
+      "duration_us": 0.759079,
+      "finish_us": 63.196126,
+      "deps": [
+        146
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 148,
+      "name": "dronet3_dispatch_2",
+      "op": 2,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 63.196126,
+      "duration_us": 0.047627,
+      "finish_us": 63.243753,
+      "deps": [
+        147
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 149,
+      "name": "dronet3_dispatch_3",
+      "op": 3,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 63.243753,
+      "duration_us": 0.004594,
+      "finish_us": 63.248346999999995,
+      "deps": [
+        148
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 150,
+      "name": "dronet3_dispatch_4",
+      "op": 4,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 63.248346999999995,
+      "duration_us": 0.241491,
+      "finish_us": 63.489838,
+      "deps": [
+        149
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 151,
+      "name": "dronet3_dispatch_5",
+      "op": 5,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 63.489838,
+      "duration_us": 0.014256,
+      "finish_us": 63.504094,
+      "deps": [
+        150
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 152,
+      "name": "dronet3_dispatch_6",
+      "op": 6,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 63.504094,
+      "duration_us": 0.001079,
+      "finish_us": 63.505173,
+      "deps": [
+        151
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 153,
+      "name": "dronet3_dispatch_7",
+      "op": 7,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 63.505173,
+      "duration_us": 0.111154,
+      "finish_us": 63.616327,
+      "deps": [
+        152
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 154,
+      "name": "dronet3_dispatch_8",
+      "op": 8,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 63.616327,
+      "duration_us": 0.2296,
+      "finish_us": 63.845926999999996,
+      "deps": [
+        147
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 155,
+      "name": "dronet3_dispatch_9",
+      "op": 9,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 63.845926999999996,
+      "duration_us": 0.504297,
+      "finish_us": 64.350224,
+      "deps": [
+        153,
+        154
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 156,
+      "name": "dronet3_dispatch_10",
+      "op": 10,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.350224,
+      "duration_us": 0.014342,
+      "finish_us": 64.364566,
+      "deps": [
+        155
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 157,
+      "name": "dronet3_dispatch_11",
+      "op": 11,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.364566,
+      "duration_us": 0.001356,
+      "finish_us": 64.365922,
+      "deps": [
+        156
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 158,
+      "name": "dronet3_dispatch_12",
+      "op": 12,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 64.365922,
+      "duration_us": 0.083951,
+      "finish_us": 64.449873,
+      "deps": [
+        157
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 159,
+      "name": "dronet3_dispatch_13",
+      "op": 13,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.449873,
+      "duration_us": 0.00702,
+      "finish_us": 64.456893,
+      "deps": [
+        158
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 160,
+      "name": "dronet3_dispatch_14",
+      "op": 14,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.456893,
+      "duration_us": 0.000653,
+      "finish_us": 64.457546,
+      "deps": [
+        159
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 161,
+      "name": "dronet3_dispatch_15",
+      "op": 15,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 64.457546,
+      "duration_us": 0.068734,
+      "finish_us": 64.52628,
+      "deps": [
+        160
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 162,
+      "name": "dronet3_dispatch_16",
+      "op": 16,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 64.52628,
+      "duration_us": 0.07722,
+      "finish_us": 64.6035,
+      "deps": [
+        155
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 163,
+      "name": "dronet3_dispatch_17",
+      "op": 17,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.6035,
+      "duration_us": 0.252079,
+      "finish_us": 64.85557899999999,
+      "deps": [
+        161,
+        162
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 164,
+      "name": "dronet3_dispatch_18",
+      "op": 18,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.85557899999999,
+      "duration_us": 0.00694,
+      "finish_us": 64.86251899999999,
+      "deps": [
+        163
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 165,
+      "name": "dronet3_dispatch_19",
+      "op": 19,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.86251899999999,
+      "duration_us": 0.000602,
+      "finish_us": 64.86312099999999,
+      "deps": [
+        164
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 166,
+      "name": "dronet3_dispatch_20",
+      "op": 20,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.86312099999999,
+      "duration_us": 0.998446,
+      "finish_us": 65.861567,
+      "deps": [
+        165
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 167,
+      "name": "dronet3_dispatch_21",
+      "op": 21,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 65.861567,
+      "duration_us": 0.006788,
+      "finish_us": 65.868355,
+      "deps": [
+        166
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 168,
+      "name": "dronet3_dispatch_22",
+      "op": 22,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 65.868355,
+      "duration_us": 0.00038,
+      "finish_us": 65.868735,
+      "deps": [
+        167
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 169,
+      "name": "dronet3_dispatch_23",
+      "op": 23,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 66.131317,
+      "duration_us": 1.923387,
+      "finish_us": 68.054704,
+      "deps": [
+        168
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 170,
+      "name": "dronet3_dispatch_24",
+      "op": 24,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 65.868735,
+      "duration_us": 0.262582,
+      "finish_us": 66.131317,
+      "deps": [
+        163
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 171,
+      "name": "dronet3_dispatch_25",
+      "op": 25,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.054704,
+      "duration_us": 0.164952,
+      "finish_us": 68.219656,
+      "deps": [
+        169,
+        170
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 172,
+      "name": "dronet3_dispatch_26",
+      "op": 26,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.219656,
+      "duration_us": 0.000414,
+      "finish_us": 68.22007,
+      "deps": [
+        171
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 173,
+      "name": "dronet3_dispatch_27",
+      "op": 27,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.22295800000002,
+      "duration_us": 0.002508,
+      "finish_us": 68.22546600000003,
+      "deps": [
+        172
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 174,
+      "name": "dronet3_dispatch_28",
+      "op": 28,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.22007,
+      "duration_us": 0.002125,
+      "finish_us": 68.22219500000001,
+      "deps": [
+        172
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 175,
+      "name": "dronet3_dispatch_29",
+      "op": 29,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.22219500000001,
+      "duration_us": 0.000763,
+      "finish_us": 68.22295800000002,
+      "deps": [
+        174
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 176,
+      "name": "yolov8_nano_dispatch_0",
+      "op": 0,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 4.603499999999999,
+      "duration_us": 2.109587,
+      "finish_us": 6.713086999999998,
+      "deps": [],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 177,
+      "name": "yolov8_nano_dispatch_1",
+      "op": 1,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 8.225465999999997,
+      "duration_us": 0.201982,
+      "finish_us": 8.427447999999996,
+      "deps": [
+        176
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 178,
+      "name": "yolov8_nano_dispatch_2",
+      "op": 2,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 8.427447999999996,
+      "duration_us": 1.364861,
+      "finish_us": 9.792308999999996,
+      "deps": [
+        177
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 179,
+      "name": "yolov8_nano_dispatch_3",
+      "op": 3,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 10.526644999999998,
+      "duration_us": 1.479597,
+      "finish_us": 12.006241999999999,
+      "deps": [
+        178
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 180,
+      "name": "yolov8_nano_dispatch_4",
+      "op": 4,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 12.006241999999999,
+      "duration_us": 0.100451,
+      "finish_us": 12.106692999999998,
+      "deps": [
+        179
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 181,
+      "name": "yolov8_nano_dispatch_5",
+      "op": 5,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 12.106692999999998,
+      "duration_us": 0.711225,
+      "finish_us": 12.817917999999999,
+      "deps": [
+        180
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 182,
+      "name": "yolov8_nano_dispatch_6",
+      "op": 6,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 12.817917999999999,
+      "duration_us": 1.035404,
+      "finish_us": 13.853321999999999,
+      "deps": [
+        181
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 183,
+      "name": "yolov8_nano_dispatch_7",
+      "op": 7,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 13.853321999999999,
+      "duration_us": 0.100394,
+      "finish_us": 13.953715999999998,
+      "deps": [
+        182
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 184,
+      "name": "yolov8_nano_dispatch_8",
+      "op": 8,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 13.953715999999998,
+      "duration_us": 0.707264,
+      "finish_us": 14.660979999999999,
+      "deps": [
+        183
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 185,
+      "name": "yolov8_nano_dispatch_9",
+      "op": 9,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 14.660979999999999,
+      "duration_us": 0.0,
+      "finish_us": 14.660979999999999,
+      "deps": [
+        184
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 186,
+      "name": "yolov8_nano_dispatch_10",
+      "op": 10,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 14.660979999999999,
+      "duration_us": 0.43586,
+      "finish_us": 15.096839999999998,
+      "deps": [
+        185
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 187,
+      "name": "yolov8_nano_dispatch_11",
+      "op": 11,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 15.096839999999998,
+      "duration_us": 0.050275,
+      "finish_us": 15.147114999999998,
+      "deps": [
+        186
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 188,
+      "name": "yolov8_nano_dispatch_12",
+      "op": 12,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 15.147114999999998,
+      "duration_us": 0.382094,
+      "finish_us": 15.529208999999998,
+      "deps": [
+        187
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 189,
+      "name": "yolov8_nano_dispatch_13",
+      "op": 13,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 15.529208999999998,
+      "duration_us": 0.432304,
+      "finish_us": 15.961512999999998,
+      "deps": [
+        188
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 190,
+      "name": "yolov8_nano_dispatch_14",
+      "op": 14,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 15.961512999999998,
+      "duration_us": 0.050221,
+      "finish_us": 16.011733999999997,
+      "deps": [
+        189
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 191,
+      "name": "yolov8_nano_dispatch_15",
+      "op": 15,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 16.011733999999997,
+      "duration_us": 0.382256,
+      "finish_us": 16.39399,
+      "deps": [
+        190
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 192,
+      "name": "yolov8_nano_dispatch_16",
+      "op": 16,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 16.39399,
+      "duration_us": 2.076229,
+      "finish_us": 18.470219,
+      "deps": [
+        185,
+        191
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 193,
+      "name": "yolov8_nano_dispatch_17",
+      "op": 17,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 18.470219,
+      "duration_us": 0.124299,
+      "finish_us": 18.594518,
+      "deps": [
+        185,
+        192
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 194,
+      "name": "yolov8_nano_dispatch_18",
+      "op": 18,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 18.594518,
+      "duration_us": 1.247761,
+      "finish_us": 19.842279,
+      "deps": [
+        193
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 195,
+      "name": "yolov8_nano_dispatch_19",
+      "op": 19,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 19.842279,
+      "duration_us": 0.100336,
+      "finish_us": 19.942615,
+      "deps": [
+        194
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 196,
+      "name": "yolov8_nano_dispatch_20",
+      "op": 20,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 19.942615,
+      "duration_us": 0.70877,
+      "finish_us": 20.651385,
+      "deps": [
+        195
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 197,
+      "name": "yolov8_nano_dispatch_21",
+      "op": 21,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 22.437047000000003,
+      "duration_us": 0.63742,
+      "finish_us": 23.074467000000002,
+      "deps": [
+        196
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 198,
+      "name": "yolov8_nano_dispatch_22",
+      "op": 22,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 23.248347000000003,
+      "duration_us": 0.052077,
+      "finish_us": 23.300424000000003,
+      "deps": [
+        197
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 199,
+      "name": "yolov8_nano_dispatch_23",
+      "op": 23,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 28.225465999999997,
+      "duration_us": 0.382275,
+      "finish_us": 28.607740999999997,
+      "deps": [
+        198
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 200,
+      "name": "yolov8_nano_dispatch_24",
+      "op": 24,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 28.607740999999997,
+      "duration_us": 0.435197,
+      "finish_us": 29.042937999999996,
+      "deps": [
+        199
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 201,
+      "name": "yolov8_nano_dispatch_25",
+      "op": 25,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 29.042937999999996,
+      "duration_us": 0.051979,
+      "finish_us": 29.094916999999995,
+      "deps": [
+        200
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 202,
+      "name": "yolov8_nano_dispatch_26",
+      "op": 26,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 29.094916999999995,
+      "duration_us": 0.382297,
+      "finish_us": 29.477213999999996,
+      "deps": [
+        201
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 203,
+      "name": "yolov8_nano_dispatch_27",
+      "op": 27,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 29.477213999999996,
+      "duration_us": 0.0,
+      "finish_us": 29.477213999999996,
+      "deps": [
+        202
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 204,
+      "name": "yolov8_nano_dispatch_28",
+      "op": 28,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 29.477213999999996,
+      "duration_us": 0.21781,
+      "finish_us": 29.695023999999997,
+      "deps": [
+        203
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 205,
+      "name": "yolov8_nano_dispatch_29",
+      "op": 29,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 29.695023999999997,
+      "duration_us": 0.026254,
+      "finish_us": 29.721277999999998,
+      "deps": [
+        204
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 206,
+      "name": "yolov8_nano_dispatch_30",
+      "op": 30,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 29.721277999999998,
+      "duration_us": 0.221175,
+      "finish_us": 29.942452999999997,
+      "deps": [
+        205
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 207,
+      "name": "yolov8_nano_dispatch_31",
+      "op": 31,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 30.526645000000002,
+      "duration_us": 0.217677,
+      "finish_us": 30.744322,
+      "deps": [
+        206
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 208,
+      "name": "yolov8_nano_dispatch_32",
+      "op": 32,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 30.744322,
+      "duration_us": 0.026209,
+      "finish_us": 30.770531000000002,
+      "deps": [
+        207
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 209,
+      "name": "yolov8_nano_dispatch_33",
+      "op": 33,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 30.770531000000002,
+      "duration_us": 0.221328,
+      "finish_us": 30.991859,
+      "deps": [
+        208
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 210,
+      "name": "yolov8_nano_dispatch_34",
+      "op": 34,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 30.991859,
+      "duration_us": 1.038726,
+      "finish_us": 32.030585,
+      "deps": [
+        203,
+        209
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 211,
+      "name": "yolov8_nano_dispatch_35",
+      "op": 35,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 32.030585,
+      "duration_us": 0.218177,
+      "finish_us": 32.248762,
+      "deps": [
+        210
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 212,
+      "name": "yolov8_nano_dispatch_36",
+      "op": 36,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 32.248762,
+      "duration_us": 0.026244,
+      "finish_us": 32.275006,
+      "deps": [
+        211
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 213,
+      "name": "yolov8_nano_dispatch_37",
+      "op": 37,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 32.275006,
+      "duration_us": 0.221397,
+      "finish_us": 32.496403,
+      "deps": [
+        212
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 214,
+      "name": "yolov8_nano_dispatch_38",
+      "op": 38,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 32.496403,
+      "duration_us": 0.21793,
+      "finish_us": 32.714333,
+      "deps": [
+        213
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 215,
+      "name": "yolov8_nano_dispatch_39",
+      "op": 39,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 32.714333,
+      "duration_us": 0.026121,
+      "finish_us": 32.74045400000001,
+      "deps": [
+        214
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 216,
+      "name": "yolov8_nano_dispatch_40",
+      "op": 40,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 32.74045400000001,
+      "duration_us": 0.221191,
+      "finish_us": 32.961645000000004,
+      "deps": [
+        215
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 217,
+      "name": "yolov8_nano_dispatch_41",
+      "op": 41,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 32.961645000000004,
+      "duration_us": 1.038317,
+      "finish_us": 33.999962000000004,
+      "deps": [
+        210,
+        216
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 218,
+      "name": "yolov8_nano_dispatch_42",
+      "op": 42,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 33.999962000000004,
+      "duration_us": 0.090718,
+      "finish_us": 34.090680000000006,
+      "deps": [
+        203,
+        210,
+        217
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 219,
+      "name": "yolov8_nano_dispatch_43",
+      "op": 43,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 34.090680000000006,
+      "duration_us": 0.669759,
+      "finish_us": 34.760439000000005,
+      "deps": [
+        218
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 220,
+      "name": "yolov8_nano_dispatch_44",
+      "op": 44,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 34.760439000000005,
+      "duration_us": 0.05193,
+      "finish_us": 34.812369000000004,
+      "deps": [
+        219
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 221,
+      "name": "yolov8_nano_dispatch_45",
+      "op": 45,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 34.812369000000004,
+      "duration_us": 0.382301,
+      "finish_us": 35.19467,
+      "deps": [
+        220
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 222,
+      "name": "yolov8_nano_dispatch_46",
+      "op": 46,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 35.19467,
+      "duration_us": 0.346096,
+      "finish_us": 35.540766000000005,
+      "deps": [
+        221
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 223,
+      "name": "yolov8_nano_dispatch_47",
+      "op": 47,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 35.540766000000005,
+      "duration_us": 0.026526,
+      "finish_us": 35.567292,
+      "deps": [
+        222
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 224,
+      "name": "yolov8_nano_dispatch_48",
+      "op": 48,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 35.567292,
+      "duration_us": 0.221392,
+      "finish_us": 35.788684,
+      "deps": [
+        223
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 225,
+      "name": "yolov8_nano_dispatch_49",
+      "op": 49,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 35.788684,
+      "duration_us": 0.235687,
+      "finish_us": 36.024371,
+      "deps": [
+        224
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 226,
+      "name": "yolov8_nano_dispatch_50",
+      "op": 50,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 36.024371,
+      "duration_us": 0.026458,
+      "finish_us": 36.050829,
+      "deps": [
+        225
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 227,
+      "name": "yolov8_nano_dispatch_51",
+      "op": 51,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 36.050829,
+      "duration_us": 0.221283,
+      "finish_us": 36.272112,
+      "deps": [
+        226
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 228,
+      "name": "yolov8_nano_dispatch_52",
+      "op": 52,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 36.272112,
+      "duration_us": 0.0,
+      "finish_us": 36.272112,
+      "deps": [
+        227
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 229,
+      "name": "yolov8_nano_dispatch_53",
+      "op": 53,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 36.272112,
+      "duration_us": 0.127851,
+      "finish_us": 36.399963,
+      "deps": [
+        228
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 230,
+      "name": "yolov8_nano_dispatch_54",
+      "op": 54,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 36.399963,
+      "duration_us": 0.013315,
+      "finish_us": 36.413278,
+      "deps": [
+        229
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 231,
+      "name": "yolov8_nano_dispatch_55",
+      "op": 55,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 36.413278,
+      "duration_us": 0.140531,
+      "finish_us": 36.553809,
+      "deps": [
+        230
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 232,
+      "name": "yolov8_nano_dispatch_56",
+      "op": 56,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 36.553809,
+      "duration_us": 0.126447,
+      "finish_us": 36.680256,
+      "deps": [
+        231
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 233,
+      "name": "yolov8_nano_dispatch_57",
+      "op": 57,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 36.680256,
+      "duration_us": 0.013306,
+      "finish_us": 36.693562,
+      "deps": [
+        232
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 234,
+      "name": "yolov8_nano_dispatch_58",
+      "op": 58,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 36.693562,
+      "duration_us": 0.140331,
+      "finish_us": 36.833893,
+      "deps": [
+        233
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 235,
+      "name": "yolov8_nano_dispatch_59",
+      "op": 59,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 36.833893,
+      "duration_us": 0.520342,
+      "finish_us": 37.354235,
+      "deps": [
+        228,
+        234
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 236,
+      "name": "yolov8_nano_dispatch_60",
+      "op": 60,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 37.354235,
+      "duration_us": 0.127101,
+      "finish_us": 37.481336000000006,
+      "deps": [
+        235
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 237,
+      "name": "yolov8_nano_dispatch_61",
+      "op": 61,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 37.481336000000006,
+      "duration_us": 0.013378,
+      "finish_us": 37.49471400000001,
+      "deps": [
+        236
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 238,
+      "name": "yolov8_nano_dispatch_62",
+      "op": 62,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 37.49471400000001,
+      "duration_us": 0.140508,
+      "finish_us": 37.635222000000006,
+      "deps": [
+        237
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 239,
+      "name": "yolov8_nano_dispatch_63",
+      "op": 63,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 37.635222000000006,
+      "duration_us": 0.126579,
+      "finish_us": 37.761801000000006,
+      "deps": [
+        238
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 240,
+      "name": "yolov8_nano_dispatch_64",
+      "op": 64,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 37.761801000000006,
+      "duration_us": 0.013254,
+      "finish_us": 37.77505500000001,
+      "deps": [
+        239
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 241,
+      "name": "yolov8_nano_dispatch_65",
+      "op": 65,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 37.77505500000001,
+      "duration_us": 0.14323,
+      "finish_us": 37.91828500000001,
+      "deps": [
+        240
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 242,
+      "name": "yolov8_nano_dispatch_66",
+      "op": 66,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 37.91828500000001,
+      "duration_us": 0.521409,
+      "finish_us": 38.43969400000001,
+      "deps": [
+        235,
+        241
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 243,
+      "name": "yolov8_nano_dispatch_67",
+      "op": 67,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 38.43969400000001,
+      "duration_us": 0.045525,
+      "finish_us": 38.48521900000001,
+      "deps": [
+        228,
+        235,
+        242
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 244,
+      "name": "yolov8_nano_dispatch_68",
+      "op": 68,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 38.48521900000001,
+      "duration_us": 0.42189,
+      "finish_us": 38.907109000000005,
+      "deps": [
+        243
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 245,
+      "name": "yolov8_nano_dispatch_69",
+      "op": 69,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 38.907109000000005,
+      "duration_us": 0.026279,
+      "finish_us": 38.93338800000001,
+      "deps": [
+        244
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 246,
+      "name": "yolov8_nano_dispatch_70",
+      "op": 70,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 38.93338800000001,
+      "duration_us": 0.221173,
+      "finish_us": 39.15456100000001,
+      "deps": [
+        245
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 247,
+      "name": "yolov8_nano_dispatch_71",
+      "op": 71,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 39.15456100000001,
+      "duration_us": 0.283634,
+      "finish_us": 39.43819500000001,
+      "deps": [
+        246
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 248,
+      "name": "yolov8_nano_dispatch_72",
+      "op": 72,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 39.43819500000001,
+      "duration_us": 0.017625,
+      "finish_us": 39.45582000000001,
+      "deps": [
+        247
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 249,
+      "name": "yolov8_nano_dispatch_73",
+      "op": 73,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 39.45582000000001,
+      "duration_us": 0.140487,
+      "finish_us": 39.59630700000001,
+      "deps": [
+        248
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 250,
+      "name": "yolov8_nano_dispatch_74",
+      "op": 74,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 39.59630700000001,
+      "duration_us": 0.141342,
+      "finish_us": 39.73764900000001,
+      "deps": [
+        249
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 251,
+      "name": "yolov8_nano_dispatch_75",
+      "op": 75,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 39.73764900000001,
+      "duration_us": 0.017422,
+      "finish_us": 39.755071000000015,
+      "deps": [
+        250
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 252,
+      "name": "yolov8_nano_dispatch_76",
+      "op": 76,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 39.755071000000015,
+      "duration_us": 0.139778,
+      "finish_us": 39.894849000000015,
+      "deps": [
+        251
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 253,
+      "name": "yolov8_nano_dispatch_77",
+      "op": 77,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 39.894849000000015,
+      "duration_us": 0.0,
+      "finish_us": 39.894849000000015,
+      "deps": [
+        252
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 254,
+      "name": "yolov8_nano_dispatch_78",
+      "op": 78,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 42.437047,
+      "duration_us": 0.128986,
+      "finish_us": 42.566033,
+      "deps": [
+        253
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 255,
+      "name": "yolov8_nano_dispatch_79",
+      "op": 79,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 42.566033,
+      "duration_us": 0.253139,
+      "finish_us": 42.819171999999995,
+      "deps": [
+        254
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 256,
+      "name": "yolov8_nano_dispatch_80",
+      "op": 80,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 43.248346999999995,
+      "duration_us": 0.097215,
+      "finish_us": 43.345561999999994,
+      "deps": [
+        255
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 257,
+      "name": "yolov8_nano_dispatch_81",
+      "op": 81,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 43.845926999999996,
+      "duration_us": 0.127661,
+      "finish_us": 43.973588,
+      "deps": [
+        256
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 258,
+      "name": "yolov8_nano_dispatch_82",
+      "op": 82,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 43.973588,
+      "duration_us": 0.255391,
+      "finish_us": 44.228979,
+      "deps": [
+        257
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 259,
+      "name": "yolov8_nano_dispatch_83",
+      "op": 83,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 44.457545999999994,
+      "duration_us": 0.084435,
+      "finish_us": 44.54198099999999,
+      "deps": [
+        258
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 260,
+      "name": "yolov8_nano_dispatch_84",
+      "op": 84,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 44.60349999999999,
+      "duration_us": 0.262882,
+      "finish_us": 44.86638199999999,
+      "deps": [
+        253,
+        259
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 261,
+      "name": "yolov8_nano_dispatch_85",
+      "op": 85,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 44.86638199999999,
+      "duration_us": 0.724828,
+      "finish_us": 45.59120999999999,
+      "deps": [
+        253,
+        260
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 262,
+      "name": "yolov8_nano_dispatch_86",
+      "op": 86,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 45.59120999999999,
+      "duration_us": 0.179043,
+      "finish_us": 45.77025299999999,
+      "deps": [
+        261
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 263,
+      "name": "yolov8_nano_dispatch_87",
+      "op": 87,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 45.77025299999999,
+      "duration_us": 0.508841,
+      "finish_us": 46.279093999999986,
+      "deps": [
+        262
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 264,
+      "name": "yolov8_nano_dispatch_88",
+      "op": 88,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 46.279093999999986,
+      "duration_us": 1.267585,
+      "finish_us": 47.54667899999998,
+      "deps": [
+        263
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 265,
+      "name": "yolov8_nano_dispatch_89",
+      "op": 89,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 47.54667899999998,
+      "duration_us": 0.093319,
+      "finish_us": 47.639997999999984,
+      "deps": [
+        264
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 266,
+      "name": "yolov8_nano_dispatch_90",
+      "op": 90,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 47.639997999999984,
+      "duration_us": 0.250261,
+      "finish_us": 47.890258999999986,
+      "deps": [
+        265
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 267,
+      "name": "yolov8_nano_dispatch_91",
+      "op": 91,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 48.22546599999999,
+      "duration_us": 0.090652,
+      "finish_us": 48.31611799999999,
+      "deps": [
+        266
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 268,
+      "name": "yolov8_nano_dispatch_92",
+      "op": 92,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 48.31611799999999,
+      "duration_us": 1.250023,
+      "finish_us": 49.56614099999999,
+      "deps": [
+        267
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 269,
+      "name": "yolov8_nano_dispatch_93",
+      "op": 93,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 49.56614099999999,
+      "duration_us": 1.225438,
+      "finish_us": 50.791578999999984,
+      "deps": [
+        268
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 270,
+      "name": "yolov8_nano_dispatch_94",
+      "op": 94,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 50.791578999999984,
+      "duration_us": 1.159111,
+      "finish_us": 51.95068999999999,
+      "deps": [
+        269
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 271,
+      "name": "yolov8_nano_dispatch_95",
+      "op": 95,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 51.95068999999999,
+      "duration_us": 0.022828,
+      "finish_us": 51.973517999999984,
+      "deps": [
+        267,
+        268,
+        269,
+        270
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 272,
+      "name": "yolov8_nano_dispatch_96",
+      "op": 96,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 51.973517999999984,
+      "duration_us": 0.216341,
+      "finish_us": 52.189858999999984,
+      "deps": [
+        271
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 273,
+      "name": "yolov8_nano_dispatch_97",
+      "op": 97,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 52.189858999999984,
+      "duration_us": 0.017366,
+      "finish_us": 52.20722499999999,
+      "deps": [
+        272
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 274,
+      "name": "yolov8_nano_dispatch_98",
+      "op": 98,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 52.20722499999999,
+      "duration_us": 0.120141,
+      "finish_us": 52.327365999999984,
+      "deps": [
+        273
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 275,
+      "name": "yolov8_nano_dispatch_99",
+      "op": 99,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 52.327365999999984,
+      "duration_us": 0.16074,
+      "finish_us": 52.48810599999998,
+      "deps": [
+        274
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 276,
+      "name": "yolov8_nano_dispatch_100",
+      "op": 100,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 52.48810599999998,
+      "duration_us": 0.06086,
+      "finish_us": 52.54896599999998,
+      "deps": [
+        246,
+        275
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 277,
+      "name": "yolov8_nano_dispatch_101",
+      "op": 101,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 52.54896599999998,
+      "duration_us": 0.698628,
+      "finish_us": 53.24759399999998,
+      "deps": [
+        276
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 278,
+      "name": "yolov8_nano_dispatch_102",
+      "op": 102,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 53.24759399999998,
+      "duration_us": 0.02633,
+      "finish_us": 53.27392399999998,
+      "deps": [
+        277
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 279,
+      "name": "yolov8_nano_dispatch_103",
+      "op": 103,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 53.27392399999998,
+      "duration_us": 0.220928,
+      "finish_us": 53.49485199999998,
+      "deps": [
+        278
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 280,
+      "name": "yolov8_nano_dispatch_104",
+      "op": 104,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 53.49485199999998,
+      "duration_us": 0.0,
+      "finish_us": 53.49485199999998,
+      "deps": [
+        279
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 281,
+      "name": "yolov8_nano_dispatch_105",
+      "op": 105,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 53.49485199999998,
+      "duration_us": 0.127269,
+      "finish_us": 53.62212099999998,
+      "deps": [
+        280
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 282,
+      "name": "yolov8_nano_dispatch_106",
+      "op": 106,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 53.62212099999998,
+      "duration_us": 0.013301,
+      "finish_us": 53.63542199999998,
+      "deps": [
+        281
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 283,
+      "name": "yolov8_nano_dispatch_107",
+      "op": 107,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 53.63542199999998,
+      "duration_us": 0.139205,
+      "finish_us": 53.774626999999974,
+      "deps": [
+        282
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 284,
+      "name": "yolov8_nano_dispatch_108",
+      "op": 108,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 53.774626999999974,
+      "duration_us": 0.125544,
+      "finish_us": 53.90017099999997,
+      "deps": [
+        283
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 285,
+      "name": "yolov8_nano_dispatch_109",
+      "op": 109,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 53.90017099999997,
+      "duration_us": 0.013301,
+      "finish_us": 53.91347199999997,
+      "deps": [
+        284
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 286,
+      "name": "yolov8_nano_dispatch_110",
+      "op": 110,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 53.91347199999997,
+      "duration_us": 0.134984,
+      "finish_us": 54.04845599999997,
+      "deps": [
+        285
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 287,
+      "name": "yolov8_nano_dispatch_111",
+      "op": 111,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 54.04845599999997,
+      "duration_us": 0.032481,
+      "finish_us": 54.08093699999997,
+      "deps": [
+        280,
+        286
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 288,
+      "name": "yolov8_nano_dispatch_112",
+      "op": 112,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 54.08093699999997,
+      "duration_us": 0.325004,
+      "finish_us": 54.40594099999997,
+      "deps": [
+        287
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 289,
+      "name": "yolov8_nano_dispatch_113",
+      "op": 113,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 54.40594099999997,
+      "duration_us": 0.026427,
+      "finish_us": 54.43236799999997,
+      "deps": [
+        288
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 290,
+      "name": "yolov8_nano_dispatch_114",
+      "op": 114,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 54.43236799999997,
+      "duration_us": 0.219715,
+      "finish_us": 54.65208299999997,
+      "deps": [
+        289
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 291,
+      "name": "yolov8_nano_dispatch_115",
+      "op": 115,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 54.65208299999997,
+      "duration_us": 0.27606,
+      "finish_us": 54.92814299999997,
+      "deps": [
+        290
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 292,
+      "name": "yolov8_nano_dispatch_116",
+      "op": 116,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 54.92814299999997,
+      "duration_us": 0.118003,
+      "finish_us": 55.04614599999997,
+      "deps": [
+        221,
+        291
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 293,
+      "name": "yolov8_nano_dispatch_117",
+      "op": 117,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 55.04614599999997,
+      "duration_us": 0.920273,
+      "finish_us": 55.96641899999997,
+      "deps": [
+        292
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 294,
+      "name": "yolov8_nano_dispatch_118",
+      "op": 118,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 55.96641899999997,
+      "duration_us": 0.052014,
+      "finish_us": 56.01843299999997,
+      "deps": [
+        293
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 295,
+      "name": "yolov8_nano_dispatch_119",
+      "op": 119,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 56.01843299999997,
+      "duration_us": 0.382284,
+      "finish_us": 56.40071699999997,
+      "deps": [
+        294
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 296,
+      "name": "yolov8_nano_dispatch_120",
+      "op": 120,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 56.40071699999997,
+      "duration_us": 0.0,
+      "finish_us": 56.40071699999997,
+      "deps": [
+        295
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 297,
+      "name": "yolov8_nano_dispatch_121",
+      "op": 121,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 56.40071699999997,
+      "duration_us": 0.218735,
+      "finish_us": 56.619451999999974,
+      "deps": [
+        296
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 298,
+      "name": "yolov8_nano_dispatch_122",
+      "op": 122,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 56.619451999999974,
+      "duration_us": 0.026278,
+      "finish_us": 56.64572999999997,
+      "deps": [
+        297
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 299,
+      "name": "yolov8_nano_dispatch_123",
+      "op": 123,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 56.64572999999997,
+      "duration_us": 0.22116,
+      "finish_us": 56.86688999999997,
+      "deps": [
+        298
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 300,
+      "name": "yolov8_nano_dispatch_124",
+      "op": 124,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 56.86688999999997,
+      "duration_us": 0.217464,
+      "finish_us": 57.08435399999997,
+      "deps": [
+        299
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 301,
+      "name": "yolov8_nano_dispatch_125",
+      "op": 125,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 57.08435399999997,
+      "duration_us": 0.026196,
+      "finish_us": 57.11054999999997,
+      "deps": [
+        300
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 302,
+      "name": "yolov8_nano_dispatch_126",
+      "op": 126,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 57.11054999999997,
+      "duration_us": 0.221078,
+      "finish_us": 57.33162799999997,
+      "deps": [
+        301
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 303,
+      "name": "yolov8_nano_dispatch_127",
+      "op": 127,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 57.33162799999997,
+      "duration_us": 0.063281,
+      "finish_us": 57.39490899999997,
+      "deps": [
+        296,
+        302
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 304,
+      "name": "yolov8_nano_dispatch_128",
+      "op": 128,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 57.39490899999997,
+      "duration_us": 0.550149,
+      "finish_us": 57.94505799999997,
+      "deps": [
+        303
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 305,
+      "name": "yolov8_nano_dispatch_129",
+      "op": 129,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 57.94505799999997,
+      "duration_us": 0.051986,
+      "finish_us": 57.99704399999997,
+      "deps": [
+        304
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 306,
+      "name": "yolov8_nano_dispatch_130",
+      "op": 130,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 57.99704399999997,
+      "duration_us": 0.382141,
+      "finish_us": 58.379184999999964,
+      "deps": [
+        305
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 307,
+      "name": "yolov8_nano_dispatch_131",
+      "op": 131,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 58.379184999999964,
+      "duration_us": 0.265141,
+      "finish_us": 58.644325999999964,
+      "deps": [
+        306
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 308,
+      "name": "yolov8_nano_dispatch_132",
+      "op": 132,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 58.644325999999964,
+      "duration_us": 0.01324,
+      "finish_us": 58.65756599999997,
+      "deps": [
+        307
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 309,
+      "name": "yolov8_nano_dispatch_133",
+      "op": 133,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 58.65756599999997,
+      "duration_us": 0.140463,
+      "finish_us": 58.798028999999964,
+      "deps": [
+        308
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 310,
+      "name": "yolov8_nano_dispatch_134",
+      "op": 134,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 58.798028999999964,
+      "duration_us": 0.03145,
+      "finish_us": 58.829478999999964,
+      "deps": [
+        290,
+        309
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 311,
+      "name": "yolov8_nano_dispatch_135",
+      "op": 135,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 58.829478999999964,
+      "duration_us": 0.323384,
+      "finish_us": 59.15286299999996,
+      "deps": [
+        310
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 312,
+      "name": "yolov8_nano_dispatch_136",
+      "op": 136,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 59.15286299999996,
+      "duration_us": 0.02638,
+      "finish_us": 59.179242999999964,
+      "deps": [
+        311
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 313,
+      "name": "yolov8_nano_dispatch_137",
+      "op": 137,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 59.179242999999964,
+      "duration_us": 0.220542,
+      "finish_us": 59.399784999999966,
+      "deps": [
+        312
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 314,
+      "name": "yolov8_nano_dispatch_138",
+      "op": 138,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 59.399784999999966,
+      "duration_us": 0.0,
+      "finish_us": 59.399784999999966,
+      "deps": [
+        313
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 315,
+      "name": "yolov8_nano_dispatch_139",
+      "op": 139,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 59.399784999999966,
+      "duration_us": 0.127039,
+      "finish_us": 59.52682399999997,
+      "deps": [
+        314
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 316,
+      "name": "yolov8_nano_dispatch_140",
+      "op": 140,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 59.52682399999997,
+      "duration_us": 0.01341,
+      "finish_us": 59.54023399999997,
+      "deps": [
+        315
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 317,
+      "name": "yolov8_nano_dispatch_141",
+      "op": 141,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 59.54023399999997,
+      "duration_us": 0.137119,
+      "finish_us": 59.67735299999997,
+      "deps": [
+        316
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 318,
+      "name": "yolov8_nano_dispatch_142",
+      "op": 142,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 59.67735299999997,
+      "duration_us": 0.126672,
+      "finish_us": 59.80402499999997,
+      "deps": [
+        317
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 319,
+      "name": "yolov8_nano_dispatch_143",
+      "op": 143,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 59.80402499999997,
+      "duration_us": 0.013269,
+      "finish_us": 59.81729399999997,
+      "deps": [
+        318
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 320,
+      "name": "yolov8_nano_dispatch_144",
+      "op": 144,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 59.81729399999997,
+      "duration_us": 0.130015,
+      "finish_us": 59.94730899999997,
+      "deps": [
+        319
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 321,
+      "name": "yolov8_nano_dispatch_145",
+      "op": 145,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 59.94730899999997,
+      "duration_us": 0.032448,
+      "finish_us": 59.97975699999997,
+      "deps": [
+        314,
+        320
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 322,
+      "name": "yolov8_nano_dispatch_146",
+      "op": 146,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 62.437047,
+      "duration_us": 0.326772,
+      "finish_us": 62.763819,
+      "deps": [
+        321
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 323,
+      "name": "yolov8_nano_dispatch_147",
+      "op": 147,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 63.248346999999995,
+      "duration_us": 0.026513,
+      "finish_us": 63.27486,
+      "deps": [
+        322
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 324,
+      "name": "yolov8_nano_dispatch_148",
+      "op": 148,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 63.505173,
+      "duration_us": 0.217426,
+      "finish_us": 63.722599,
+      "deps": [
+        323
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 325,
+      "name": "yolov8_nano_dispatch_149",
+      "op": 149,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 63.845926999999996,
+      "duration_us": 0.187398,
+      "finish_us": 64.03332499999999,
+      "deps": [
+        324
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 326,
+      "name": "yolov8_nano_dispatch_150",
+      "op": 150,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.365922,
+      "duration_us": 0.008746,
+      "finish_us": 64.374668,
+      "deps": [
+        325
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 327,
+      "name": "yolov8_nano_dispatch_151",
+      "op": 151,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.457546,
+      "duration_us": 0.082169,
+      "finish_us": 64.53971499999999,
+      "deps": [
+        326
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 328,
+      "name": "yolov8_nano_dispatch_152",
+      "op": 152,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.53971499999999,
+      "duration_us": 0.020758,
+      "finish_us": 64.56047299999999,
+      "deps": [
+        274,
+        327
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 329,
+      "name": "yolov8_nano_dispatch_153",
+      "op": 153,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 64.6035,
+      "duration_us": 0.178658,
+      "finish_us": 64.782158,
+      "deps": [
+        328
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 330,
+      "name": "yolov8_nano_dispatch_154",
+      "op": 154,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 65.011776,
+      "duration_us": 0.504406,
+      "finish_us": 65.516182,
+      "deps": [
+        329
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 331,
+      "name": "yolov8_nano_dispatch_155",
+      "op": 155,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 67.230683,
+      "duration_us": 0.939684,
+      "finish_us": 68.170367,
+      "deps": [
+        330
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 332,
+      "name": "yolov8_nano_dispatch_156",
+      "op": 156,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 68.170367,
+      "duration_us": 0.0,
+      "finish_us": 68.170367,
+      "deps": [
+        331
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 333,
+      "name": "yolov8_nano_dispatch_157",
+      "op": 157,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 68.170367,
+      "duration_us": 0.129221,
+      "finish_us": 68.299588,
+      "deps": [
+        332
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 334,
+      "name": "yolov8_nano_dispatch_158",
+      "op": 158,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.299588,
+      "duration_us": 0.008768,
+      "finish_us": 68.308356,
+      "deps": [
+        333
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 335,
+      "name": "yolov8_nano_dispatch_159",
+      "op": 159,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.373513,
+      "duration_us": 0.080799,
+      "finish_us": 68.454312,
+      "deps": [
+        334
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 336,
+      "name": "yolov8_nano_dispatch_160",
+      "op": 160,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 68.454312,
+      "duration_us": 0.128014,
+      "finish_us": 68.582326,
+      "deps": [
+        335
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 337,
+      "name": "yolov8_nano_dispatch_161",
+      "op": 161,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.582326,
+      "duration_us": 0.008792,
+      "finish_us": 68.591118,
+      "deps": [
+        336
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 338,
+      "name": "yolov8_nano_dispatch_162",
+      "op": 162,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.591118,
+      "duration_us": 0.081024,
+      "finish_us": 68.672142,
+      "deps": [
+        337
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 339,
+      "name": "yolov8_nano_dispatch_163",
+      "op": 163,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.672142,
+      "duration_us": 0.020283,
+      "finish_us": 68.692425,
+      "deps": [
+        332,
+        338
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 340,
+      "name": "yolov8_nano_dispatch_164",
+      "op": 164,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 68.70953499999999,
+      "duration_us": 0.179952,
+      "finish_us": 68.88948699999999,
+      "deps": [
+        339
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 341,
+      "name": "yolov8_nano_dispatch_165",
+      "op": 165,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.88948699999999,
+      "duration_us": 0.017236,
+      "finish_us": 68.90672299999999,
+      "deps": [
+        340
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 342,
+      "name": "yolov8_nano_dispatch_166",
+      "op": 166,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.90672299999999,
+      "duration_us": 0.121341,
+      "finish_us": 69.02806399999999,
+      "deps": [
+        341
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 343,
+      "name": "yolov8_nano_dispatch_167",
+      "op": 167,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 65.516182,
+      "duration_us": 0.516295,
+      "finish_us": 66.032477,
+      "deps": [
+        306
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 344,
+      "name": "yolov8_nano_dispatch_168",
+      "op": 168,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.22546600000003,
+      "duration_us": 0.052206,
+      "finish_us": 68.27767200000002,
+      "deps": [
+        343
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 345,
+      "name": "yolov8_nano_dispatch_169",
+      "op": 169,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 70.632999,
+      "duration_us": 0.382172,
+      "finish_us": 71.015171,
+      "deps": [
+        344
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 346,
+      "name": "yolov8_nano_dispatch_170",
+      "op": 170,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 71.015171,
+      "duration_us": 0.490999,
+      "finish_us": 71.50617,
+      "deps": [
+        345
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 347,
+      "name": "yolov8_nano_dispatch_171",
+      "op": 171,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 71.50617,
+      "duration_us": 0.054381,
+      "finish_us": 71.560551,
+      "deps": [
+        346
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 348,
+      "name": "yolov8_nano_dispatch_172",
+      "op": 172,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 71.560551,
+      "duration_us": 0.381517,
+      "finish_us": 71.942068,
+      "deps": [
+        347
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 349,
+      "name": "yolov8_nano_dispatch_173",
+      "op": 173,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 72.160803,
+      "duration_us": 0.43248,
+      "finish_us": 72.593283,
+      "deps": [
+        348
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 350,
+      "name": "yolov8_nano_dispatch_174",
+      "op": 174,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 66.032477,
+      "duration_us": 0.582277,
+      "finish_us": 66.614754,
+      "deps": [
+        306
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 351,
+      "name": "yolov8_nano_dispatch_175",
+      "op": 175,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.308356,
+      "duration_us": 0.065157,
+      "finish_us": 68.373513,
+      "deps": [
+        350
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 352,
+      "name": "yolov8_nano_dispatch_176",
+      "op": 176,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 71.015171,
+      "duration_us": 0.462816,
+      "finish_us": 71.477987,
+      "deps": [
+        351
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 353,
+      "name": "yolov8_nano_dispatch_177",
+      "op": 177,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 71.50617,
+      "duration_us": 0.654633,
+      "finish_us": 72.160803,
+      "deps": [
+        352
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 354,
+      "name": "yolov8_nano_dispatch_178",
+      "op": 178,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 72.160803,
+      "duration_us": 0.065056,
+      "finish_us": 72.225859,
+      "deps": [
+        353
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 355,
+      "name": "yolov8_nano_dispatch_179",
+      "op": 179,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 72.225859,
+      "duration_us": 0.462442,
+      "finish_us": 72.688301,
+      "deps": [
+        354
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 356,
+      "name": "yolov8_nano_dispatch_180",
+      "op": 180,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 72.688301,
+      "duration_us": 0.558858,
+      "finish_us": 73.247159,
+      "deps": [
+        355
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 357,
+      "name": "yolov8_nano_dispatch_181",
+      "op": 181,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 73.247159,
+      "duration_us": 0.088946,
+      "finish_us": 73.336105,
+      "deps": [
+        349,
+        356
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 358,
+      "name": "yolov8_nano_dispatch_182",
+      "op": 182,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 64.03332499999999,
+      "duration_us": 0.205556,
+      "finish_us": 64.23888099999999,
+      "deps": [
+        324
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 359,
+      "name": "yolov8_nano_dispatch_183",
+      "op": 183,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 64.374668,
+      "duration_us": 0.013397,
+      "finish_us": 64.388065,
+      "deps": [
+        358
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 360,
+      "name": "yolov8_nano_dispatch_184",
+      "op": 184,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.454312,
+      "duration_us": 0.123032,
+      "finish_us": 68.577344,
+      "deps": [
+        359
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 361,
+      "name": "yolov8_nano_dispatch_185",
+      "op": 185,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 68.582326,
+      "duration_us": 0.127209,
+      "finish_us": 68.70953499999999,
+      "deps": [
+        360
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 362,
+      "name": "yolov8_nano_dispatch_186",
+      "op": 186,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.70953499999999,
+      "duration_us": 0.013258,
+      "finish_us": 68.72279299999998,
+      "deps": [
+        361
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 363,
+      "name": "yolov8_nano_dispatch_187",
+      "op": 187,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 68.72279299999998,
+      "duration_us": 0.118616,
+      "finish_us": 68.84140899999998,
+      "deps": [
+        362
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 364,
+      "name": "yolov8_nano_dispatch_188",
+      "op": 188,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 73.336105,
+      "duration_us": 0.816622,
+      "finish_us": 74.152727,
+      "deps": [
+        363
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 365,
+      "name": "yolov8_nano_dispatch_189",
+      "op": 189,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 64.782158,
+      "duration_us": 0.229618,
+      "finish_us": 65.011776,
+      "deps": [
+        324
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 366,
+      "name": "yolov8_nano_dispatch_190",
+      "op": 190,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 66.614754,
+      "duration_us": 0.615929,
+      "finish_us": 67.230683,
+      "deps": [
+        365
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 367,
+      "name": "yolov8_nano_dispatch_191",
+      "op": 191,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.60546799999999,
+      "duration_us": 0.145182,
+      "finish_us": 69.75065,
+      "deps": [
+        366
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 368,
+      "name": "yolov8_nano_dispatch_192",
+      "op": 192,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 69.75065,
+      "duration_us": 0.168045,
+      "finish_us": 69.918695,
+      "deps": [
+        367
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 369,
+      "name": "yolov8_nano_dispatch_193",
+      "op": 193,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.918695,
+      "duration_us": 0.016572,
+      "finish_us": 69.935267,
+      "deps": [
+        368
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 370,
+      "name": "yolov8_nano_dispatch_194",
+      "op": 194,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.935267,
+      "duration_us": 0.138974,
+      "finish_us": 70.074241,
+      "deps": [
+        369
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 371,
+      "name": "yolov8_nano_dispatch_195",
+      "op": 195,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 74.152727,
+      "duration_us": 1.395438,
+      "finish_us": 75.548165,
+      "deps": [
+        370
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 372,
+      "name": "yolov8_nano_dispatch_196",
+      "op": 196,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 75.548165,
+      "duration_us": 0.022381,
+      "finish_us": 75.570546,
+      "deps": [
+        364,
+        371
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 373,
+      "name": "yolov8_nano_dispatch_197",
+      "op": 197,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 69.02806399999999,
+      "duration_us": 0.122686,
+      "finish_us": 69.15074999999999,
+      "deps": [
+        342
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 374,
+      "name": "yolov8_nano_dispatch_198",
+      "op": 198,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.15074999999999,
+      "duration_us": 0.004483,
+      "finish_us": 69.15523299999998,
+      "deps": [
+        373
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 375,
+      "name": "yolov8_nano_dispatch_199",
+      "op": 199,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.15523299999998,
+      "duration_us": 0.060747,
+      "finish_us": 69.21597999999999,
+      "deps": [
+        374
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 376,
+      "name": "yolov8_nano_dispatch_200",
+      "op": 200,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 69.21597999999999,
+      "duration_us": 0.044118,
+      "finish_us": 69.26009799999999,
+      "deps": [
+        375
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 377,
+      "name": "yolov8_nano_dispatch_201",
+      "op": 201,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.26009799999999,
+      "duration_us": 0.004409,
+      "finish_us": 69.26450699999998,
+      "deps": [
+        376
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 378,
+      "name": "yolov8_nano_dispatch_202",
+      "op": 202,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.26450699999998,
+      "duration_us": 0.060551,
+      "finish_us": 69.32505799999998,
+      "deps": [
+        377
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 379,
+      "name": "yolov8_nano_dispatch_203",
+      "op": 203,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 70.074241,
+      "duration_us": 0.203759,
+      "finish_us": 70.278,
+      "deps": [
+        378
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 380,
+      "name": "yolov8_nano_dispatch_204",
+      "op": 204,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 69.26009799999999,
+      "duration_us": 0.141798,
+      "finish_us": 69.40189599999998,
+      "deps": [
+        342
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 381,
+      "name": "yolov8_nano_dispatch_205",
+      "op": 205,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.40189599999998,
+      "duration_us": 0.005574,
+      "finish_us": 69.40746999999998,
+      "deps": [
+        380
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 382,
+      "name": "yolov8_nano_dispatch_206",
+      "op": 206,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.40746999999998,
+      "duration_us": 0.065736,
+      "finish_us": 69.47320599999998,
+      "deps": [
+        381
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 383,
+      "name": "yolov8_nano_dispatch_207",
+      "op": 207,
+      "target": "CPU_P#0",
+      "combo_idx": 0,
+      "start_us": 69.47320599999998,
+      "duration_us": 0.061008,
+      "finish_us": 69.53421399999998,
+      "deps": [
+        382
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 384,
+      "name": "yolov8_nano_dispatch_208",
+      "op": 208,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.53421399999998,
+      "duration_us": 0.005509,
+      "finish_us": 69.53972299999998,
+      "deps": [
+        383
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 385,
+      "name": "yolov8_nano_dispatch_209",
+      "op": 209,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 69.53972299999998,
+      "duration_us": 0.065745,
+      "finish_us": 69.60546799999999,
+      "deps": [
+        384
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 386,
+      "name": "yolov8_nano_dispatch_210",
+      "op": 210,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 70.278,
+      "duration_us": 0.347839,
+      "finish_us": 70.625839,
+      "deps": [
+        385
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    },
+    {
+      "id": 387,
+      "name": "yolov8_nano_dispatch_211",
+      "op": 211,
+      "target": "CPU_E#0",
+      "combo_idx": 1,
+      "start_us": 70.625839,
+      "duration_us": 0.00716,
+      "finish_us": 70.632999,
+      "deps": [
+        379,
+        386
+      ],
+      "feasible_targets": [
+        "CPU_E#0",
+        "CPU_P#0"
+      ],
+      "deadline_us": null
+    }
+  ],
+  "measured_makespan_us": 0.0,
+  "clock_mhz": 1000.0,
+  "measured_trace_matched": 0,
+  "measured_trace_total": 388
+}
