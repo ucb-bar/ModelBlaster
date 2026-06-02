@@ -1187,7 +1187,18 @@ def generate(
     #   * `chunk2_c1` — channel-wise split (YOLOv8 C2f), maps to two
     #                   offset aliases into the input buffer.
     _zero_cost = {"view", "chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"}
-    op_kinds = sorted({op["op"] for op in ir["ops"] if op["op"] not in _zero_cost})
+    # __fused__<sub0>__<sub1>__... ops carry their constituent kernels
+    # under `sub_ops` (see pipeline/apply_fusion_hint.py). The fused
+    # dispatcher in generate_skeleton.py emits back-to-back calls to
+    # the same kernel_<sub_op>_<mid> symbols a non-fused dispatch would
+    # use, so the kernel picker still needs to emit each sub-op kind.
+    def _expand_op_kinds(op):
+        if op["op"].startswith("__fused__"):
+            return [s["op"] for s in op.get("sub_ops", []) if s["op"] not in _zero_cost]
+        if op["op"] in _zero_cost:
+            return []
+        return [op["op"]]
+    op_kinds = sorted({k for op in ir["ops"] for k in _expand_op_kinds(op)})
     for k in op_kinds:
         if k not in KERNEL_SPECS:
             raise SystemExit(f"unknown op kind in IR: {k}")
