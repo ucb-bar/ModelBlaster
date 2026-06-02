@@ -30,6 +30,10 @@ NETWORK_PERIOD_MS = {
 
 
 def load_trace(path: Path, clock_mhz: float = 1000.0) -> list[dict]:
+    """Load either a CSV trace (FireSim measured) or a JSON schedule
+    fixture (XPU-RT predicted). Auto-detects by suffix."""
+    if str(path).endswith(".json"):
+        return _load_fixture(path)
     rows = []
     with open(path) as f:
         # Skip blank-leading lines.
@@ -51,6 +55,40 @@ def load_trace(path: Path, clock_mhz: float = 1000.0) -> list[dict]:
             "start_ms": a_s / cycles_per_ms,
             "duration_ms": max(0.0, (a_e - a_s) / cycles_per_ms),
             "is_fused": "__fused__" in r.get("op", ""),
+        })
+    return rows
+
+
+def _load_fixture(path: Path) -> list[dict]:
+    """Load XPU-RT schedule fixture (JSON) → uniform row shape."""
+    import json as _json
+    j = _json.loads(path.read_text())
+    rows = []
+    for k, entry in j.get("dispatches", {}).items():
+        job = entry.get("job_name", "")
+        if not job:
+            continue
+        # Strip trailing instance digits for the network color.
+        network = job; instance = 0
+        for n in ("yolov8_nano", "yolov8_nano_64", "mlp_control", "dronet"):
+            if job.startswith(n):
+                network = n
+                rest = job[len(n):]
+                if rest.isdigit():
+                    instance = int(rest)
+                break
+        ht = entry.get("hardware_target", "")
+        # Map "CPU_P#0" / "CPU_E#0" → lane keys our renderer recognizes.
+        lane = ht
+        if "CPU_P" in ht: lane = "gemmini"
+        elif "CPU_E" in ht: lane = "rvv_opu"
+        rows.append({
+            "network": network,
+            "instance": instance,
+            "lane": lane,
+            "start_ms": float(entry["start_time"]),
+            "duration_ms": float(entry["duration"]),
+            "is_fused": False,
         })
     return rows
 
