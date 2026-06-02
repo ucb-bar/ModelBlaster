@@ -874,10 +874,104 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
     dispatch_fns: list[str] = []
     invoke_table_rows: list[str] = []
+
+    def _emit_sub_op_call(sub_op: dict) -> str:
+        """Build the per-dispatch C call string for one sub-op of a
+        `__fused__<...>` op (see pipeline/apply_fusion_hint.py).
+
+        Mirrors the kernel-mangling + pointer-rewrite logic the main
+        if/elif chain below does for non-fused ops, but only for the
+        sub-op kinds that appear in the demo's fusion hints. New
+        kinds raise NotImplementedError so codegen failures are loud
+        rather than silent.
+
+        Sub-ops keep their original `inputs`/`outputs` tensor names,
+        so `ptr_for(...)` resolves internal tensors to the same
+        `buf_<mid>_<name>` aliases the model.c emits for unfused ops.
+        That means a fused dispatcher is N back-to-back kernel calls
+        with no inter-op handshake — exactly the dispatch-overhead
+        win XPU-RT's coarsen hint is after.
+        """
+        sub_out_ptr = ptr_for(sub_op["outputs"][0], "out")
+        kind = sub_op["op"]
+        if kind == "linear_s8":
+            in_ptr = ptr_for(sub_op["inputs"][0], "in")
+            w = _weight_name(model_name, sub_op["weight"])
+            b = _weight_name(model_name, sub_op["bias"]) if sub_op.get("bias") else "NULL"
+            sh = sub_op["shape"]; q = sub_op["quant"]
+            call = (
+                f"parallel_linear_s8(pool, {in_ptr}, {w}, {b}, {sub_out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, {q['output_offset']}, "
+                f"{q['output_multiplier']}, {q['output_shift']}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif kind == "elu_s8":
+            in_ptr = ptr_for(sub_op["inputs"][0], "in")
+            n = sub_op["shape"]["n"]; q = sub_op["quant"]
+            alpha = q.get("alpha", 1.0)
+            call = (
+                f"kernel_elu_s8({in_ptr}, {sub_out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']}, {_f32(alpha)})"
+            )
+        elif kind == "relu_s8":
+            in_ptr = ptr_for(sub_op["inputs"][0], "in")
+            n = sub_op["shape"]["n"]
+            call = f"kernel_relu_s8({in_ptr}, {sub_out_ptr}, {n})"
+        else:
+            raise NotImplementedError(
+                f"fused-op sub-op kind {kind!r} not yet supported in "
+                f"generate_skeleton._emit_sub_op_call — add the matching "
+                f"branch from the main if/elif chain. Sub-op was: "
+                f"{sub_op.get('name', '?')}/{kind}.")
+        # Kernel-name mangle (mirror the main loop's logic at line ~1574).
+        if kind not in _PARALLELIZED_OPS:
+            call = call.replace(
+                f"kernel_{kind}(", f"kernel_{kind}_{mid}(", 1)
+        # Pointer rewrites so the fused dispatcher reads the same `s`
+        # state struct as a non-fused dispatch_fn (mirror line ~1586).
+        return (call
+                .replace("(input + ", "(s->input + ")
+                .replace("input,", "s->input,")
+                .replace("input)", "s->input)")
+                .replace("output,", "s->output,")
+                .replace("output)", "s->output)")
+                .replace("(output + ", "(s->output + ")
+                .replace("(pool, ", "(s->pool, "))
+
     for op in ir["ops"]:
         if op["op"] in _zero_cost_ops:
             # view / chunk2_c1: no kernel call. Aliases were set up above
             # (plain aliases for view, offset aliases for chunk2_c1).
+            continue
+        if op["op"].startswith("__fused__"):
+            # axis-C realization (see pipeline/apply_fusion_hint.py).
+            # Collapse `sub_ops` into one dispatcher that calls each
+            # sub-op's kernel back-to-back, sharing the same buffer
+            # aliases a non-fused IR would have used. Removes
+            # `len(sub_ops) - 1` inter-dispatch worker-thread
+            # handshakes — that's the launch-overhead saving XPU-RT's
+            # coarsen recommendation is after.
+            sub_ops = [s for s in op.get("sub_ops", [])
+                       if s["op"] not in _zero_cost_ops]
+            per_disp_call = "; ".join(_emit_sub_op_call(s) for s in sub_ops)
+            dispatch_id = op["dispatch_id"]
+            shape_lit = f"fused({len(sub_ops)})"
+            dispatch_fns.append(
+                f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
+                f"    unsigned long _s = rdcycle();\n"
+                f"    {per_disp_call};\n"
+                f"    unsigned long _e = rdcycle();\n"
+                f"    int slot = n_++;\n"
+                f'    records_[slot].dispatch_id = {dispatch_id};\n'
+                f'    records_[slot].name   = "{op["name"]}";\n'
+                f'    records_[slot].op     = "{op["op"]}";\n'
+                f'    records_[slot].shape  = "{shape_lit}";\n'
+                f"    records_[slot].cycles = _e - _s;\n"
+                f"}}"
+            )
+            invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
             continue
         out_ptr = ptr_for(op["outputs"][0], "out")
         shape_lit = _shape_str(op)
