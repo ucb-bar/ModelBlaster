@@ -49,3 +49,9 @@ benchmarks/reports/*
 # clean clone re-downloads from the canonical URL. Tracked in the
 # model loader's _load_*_weights() helper.
 yolov8n.pt
+
+# Bundle run logs / uartlogs — large per-machine artifacts, not useful
+# cross-machine. Keep the rendered Gantts, the extracted trace.csv, and
+# the JSON reports.
+artifacts/bundle/**/run_stdout.log
+artifacts/bundle/**/uartlog
