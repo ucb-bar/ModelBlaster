@@ -27,6 +27,67 @@
   `__fused__linear_s8__elu_s8__linear_s8__elu_s8__linear_s8__elu_s8`,
   shape `fused(6)`) accounting for 99.4% of cycles + the trailing
   standalone `linear_s8` (`mlp.6`) for 0.6%.
+
+  **Honest scope.** Phase 1b/1c's "fused" dispatcher chains N
+  back-to-back kernel calls inside one harness dispatch. This
+  eliminates the N-1 inter-dispatch worker-thread handshakes
+  (XPU-RT's `coarsen` recommendation is exactly that), but it
+  does **not** change total compute — the same N kernels run, the
+  same intermediates get written/read between them. So measured
+  makespan barely moves on the work-conserving harness today; the
+  only saving is the per-dispatch launch cost.
+
+  True compute-fusion (one tight loop with intermediates kept in
+  registers, no intermediate tensor stores/loads) is **Phase 1d**
+  below — that's where makespan actually drops.
+
+  Splitting (axis-C's *finer* direction, `split_hints/v1`) is
+  **Phase 1e** — the dual transform for *too_coarse* workloads
+  where one heavy serialized op leaves a core idle.
+
+## Roadmap — Phase 1d / 1e / 1f / 1g
+
+- **Phase 1d** — *true* fused kernels. Today
+  `_emit_sub_op_call` glues N kernel calls together. For
+  `linear_s8 + elu_s8` chains the fused-kernel body would: load
+  weights → accumulate MAC into a register-resident vector →
+  apply ELU lookup *in register* → use as input to the next
+  linear's MAC, never spilling to an intermediate tensor. Two
+  paths to consider:
+  1. Hand-write `kernel_mlp_chain_s8(...)` for the
+     `linear_s8 elu_s8 ...` pattern under
+     `pipeline/reference_kernels.py`.
+  2. Generate it from a kernel-fusion template
+     (`pipeline/fuser/emit_chain.py`) keyed by the sub-op
+     sequence, so any chain pattern XPU-RT proposes gets a
+     bespoke fused kernel automatically.
+
+  Goal: measured-makespan delta after Phase 1d should be > 0
+  (not the ~0 we see today on Phase 1b).
+
+- **Phase 1e** — realize `modelblaster.split_hints/v1`. XPU-RT's
+  `granularity_loop.py` emits split hints when granularity is
+  *too_coarse* (a single dispatch dominates and a core sits idle
+  waiting). Implement the dual transform of
+  `pipeline/apply_fusion_hint.py`: given
+  `{network, split_ops: [{op: 4, n_splits: 2}]}` decompose op 4
+  into N smaller ops along a tilable dimension (OC for conv2d,
+  N or K for linear). The scheduler then places the tiles on
+  separate cores in parallel.
+
+- **Phase 1f** — pick a *too_coarse* demo workload so axis-C's
+  split direction has a counter-example. The current 1y+4m+2d
+  workload is too_fine (fusion wins, split shows 0 predicted
+  gain). Candidates: a single-big-conv yolov8 variant, or
+  `mlp_wide` (large hidden-layer MLP where one matmul is the
+  whole cost). Re-run `granularity_loop.py` to confirm split-wins.
+
+- **Phase 1g** — side-by-side splitting demo. Render Gantts for
+  the too_coarse workload showing (a) baseline with one heavy
+  serialized op + one idle core; (b) after split: tiles placed
+  in parallel, makespan drops. Same shading/annotation
+  conventions as the fused walkthrough so both directions of
+  axis-C are visually consistent.
 - **Phase 2** (bundle driver + measured-report adapter + shell
   wrapper) — done.
   `scripts/run_xpurt_bundle.py`, `scripts/run_bundle_firesim.sh`,
