@@ -122,6 +122,68 @@ Step 4 collapses them.
 
 ---
 
+## FAQ — three real questions about Steps 3-4
+
+**Q. Why does the measured run finish in 13.5 ms when the predicted
+schedule says 75.6 ms?**
+
+The 62 ms gap is the **periodic-phasing idle time** the predicted
+schedule reserves but the harness doesn't enforce. The schedule places
+`mlp_control[1]` at t=10 ms (one period after [0]); the harness fires it
+at 85 µs because the dispatch walker is work-conserving:
+
+|  | predicted start | actual start (FireSim) | gap |
+|---|---:|---:|---:|
+| `mlp_control[1]` | 10.000 ms | 85 µs | **117× early** |
+| `mlp_control[2]` | 20.000 ms | 662 µs | 30× early |
+| `mlp_control[3]` | 30.000 ms | 1.22 ms | 24× early |
+| `dronet[1]` | 20.527 ms | 663 µs | 31× early |
+
+Subtract the ~62 ms of intended idle gaps from 75.6 ms and you get
+≈ 13.5 ms — the actual work time.
+
+**Q. Are the desired frequencies respected?**
+
+- **In the schedule (predicted):** yes. The XPU-RT `decomposed` / HEFT
+  solvers honor each network's `period` / `window_duration`; that's why
+  the predicted Gantts (Steps 1-2) show one block per period boundary.
+- **At runtime (measured):** no. The ModelBlaster `harness_xpurt`
+  walker pulls the next ready entry the moment a worker thread is free
+  — there's no `wait_until(entry.start_time)` gate yet. So at runtime
+  `mlp_control[1]`'s convolutions chase `mlp_control[0]`'s tail
+  instead of waiting 10 ms for the next frame.
+
+For *makespan* (will the work fit?) this is fine and conservative.
+For a real periodic system you'd add a `k_sleep`-style gate to
+`generate_xpurt_main.py`'s dispatch loop so worker threads honor
+`entry.start_time`. Roadmap item, separate from this loop.
+
+**Q. Why HEFT and not MOSEK with infinite budget?**
+
+Because `bundle.propose_bundle`'s `DEFAULT_SCHEDULERS` only ships the
+polynomial-time heuristics (`greedy`, `decomposed`, `heft`, `peft`,
+`edf`) — the exact ILP solvers (`mosek`, `cpsat`) are opt-in because
+they're expensive on the unconstrained 1+4+2 problem.
+
+```python
+# /scratch2/agustin/XPU-RT/xpu-rt/bundle.py:25
+DEFAULT_SCHEDULERS = [
+    {"solver": "greedy",     "scheduler": None},
+    {"solver": "decomposed", "scheduler": None},
+    {"solver": "milp", "scheduler": "heft"},
+    {"solver": "milp", "scheduler": "peft"},
+    {"solver": "milp", "scheduler": "edf"},
+]
+```
+
+With infinite budget you'd opt MOSEK + CPSAT in. XPU-RT supports both
+(task #148 ran MOSEK with a 3600 s time-limit; `partition_gantt.png`
+in this dir is `greedy_periodic` for comparison). The
+`firesim_batch_inf_budget.json` next to this README is the same
+proposer call with the exact-ILP solvers opted in — 9 candidates
+including `A5: milp/mosek` (provably optimal ILP) and
+`A6: milp/cpsat` (OR-Tools CP-SAT).
+
 ## Round 2 — the loop closes
 
 `artifacts/bundle/round2/` holds the **next** iteration's input,
