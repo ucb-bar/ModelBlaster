@@ -1,0 +1,127 @@
+{
+  "deadline_us": 50.0,
+  "deadline_src": "explicit",
+  "winner": "A3",
+  "runs": [
+    {
+      "id": "baseline",
+      "label": "decomposed",
+      "axis": "baseline",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "makespan_us": 75.570546,
+      "meets_deadline": false,
+      "granularity": "too_fine",
+      "bottleneck": "CPU_E#0"
+    },
+    {
+      "id": "A3",
+      "label": "milp/heft",
+      "axis": "scheduler",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "makespan_us": 54.429872,
+      "meets_deadline": false,
+      "granularity": "too_fine",
+      "bottleneck": "CPU_P#0"
+    },
+    {
+      "id": "A4",
+      "label": "milp/peft",
+      "axis": "scheduler",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "makespan_us": 56.241877,
+      "meets_deadline": false,
+      "granularity": "too_fine",
+      "bottleneck": "CPU_P#0"
+    },
+    {
+      "id": "A5",
+      "label": "milp/edf",
+      "axis": "scheduler",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "makespan_us": 116.78462599999997,
+      "meets_deadline": false,
+      "granularity": "too_fine",
+      "bottleneck": "CPU_E#0"
+    },
+    {
+      "id": "A6",
+      "label": "greedy",
+      "axis": "scheduler",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "makespan_us": 60.47555,
+      "meets_deadline": false,
+      "granularity": "too_fine",
+      "bottleneck": "CPU_P#0"
+    },
+    {
+      "id": "B3",
+      "label": "decomposed",
+      "axis": "backend",
+      "profile_hw": {
+        "cpu_p": "V256D128_rvv",
+        "cpu_e": "gemmini_q31"
+      },
+      "makespan_us": 75.570546,
+      "meets_deadline": false,
+      "granularity": "too_fine",
+      "bottleneck": "CPU_P#0"
+    }
+  ],
+  "skipped": [
+    {
+      "id": "A1",
+      "label": "milp/mosek",
+      "axis": "scheduler",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "status": "error: n(              ^^^^^^^^^^^^^   File \"/scratch2/agustin/XPU-RT/xpu-rt/schedulers.py\", line 29, in _mosek     from scheduler import schedule as milp_schedule   File \"/scratch2/agustin/XPU-RT/xpu-rt/scheduler.py\", line 5, in <module>     import cvxpy as cp ModuleNotFoundError: No module named 'cvxpy' "
+    },
+    {
+      "id": "A2",
+      "label": "milp/cpsat",
+      "axis": "scheduler",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "status": "error: _schedule     cp_model = _lazy_cp_model()                ^^^^^^^^^^^^^^^^   File \"/scratch2/agustin/XPU-RT/xpu-rt/scheduler_cpsat.py\", line 50, in _lazy_cp_model     raise RuntimeError( RuntimeError: ortools is required for the CP-SAT scheduler. Install with `pip install ortools` or add to env.yml. "
+    },
+    {
+      "id": "B1",
+      "label": "decomposed",
+      "axis": "backend",
+      "profile_hw": {
+        "cpu_p": "V256D128_rvv",
+        "cpu_e": "V256D128_rvv"
+      },
+      "status": "timeout (rvv emits many more dispatches \u2014 a fusion/coarsen candidate)"
+    },
+    {
+      "id": "B2",
+      "label": "decomposed",
+      "axis": "backend",
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "gemmini_q31"
+      },
+      "status": "timeout"
+    }
+  ]
+}
