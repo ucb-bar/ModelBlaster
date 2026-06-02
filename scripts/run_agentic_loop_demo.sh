@@ -46,6 +46,10 @@ bash scripts/run_bundle_firesim.sh \
     --include "${INCLUDE}"
 
 echo
+echo "=== [2.5/3] Per-step Gantt PNGs (predicted + measured side by side) ==="
+python3 scripts/render_per_step.py --manifest "${OUT_DIR}/manifest.json" || true
+
+echo
 echo "=== [3/3] Close the loop (measured reports + predicted-vs-actual Gantts + re-advise) ==="
 set +u
 source scripts/setup_benchmark_env.sh >/dev/null 2>&1 || true
