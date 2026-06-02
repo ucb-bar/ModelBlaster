@@ -1,0 +1,26 @@
+# HEFT-solved variant of multi_3way_qrb_y64.yaml. We use HEFT (heuristic
+# list-scheduler) when MOSEK MILP cannot converge on the 300-op problem
+# in any practical time budget — the 1+2+4 bundle with yolov8_nano_64
+# has ~90k binary β-variables which MOSEK kills/hangs on indefinitely.
+#
+# elu_s8 added to requantize_ops because the gemmini scalar reference
+# kernel and the rvv_opu LUT kernel for elu_s8 differ by a few LSBs;
+# leaving it free to swap tiles caused mlp_control's verify-FAIL on the
+# initial qrb_y64 capture (84.09 ms / 0.07% delta but mlp drift).
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: opu0,     kind: CPU_E, hart: 1 }
+requantize_ops: [conv2d_s8, linear_s8, elu_s8]
+networks:
+  - { name: yolov8_nano_64, quant: int8, instances: 1 }
+  - { name: dronet,         quant: int8, instances: 2 }
+  - { name: mlp_control,    quant: int8, instances: 4 }
+horizon_ms: 75.0
+solver: HEFT
+time_limit_s: 0
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000

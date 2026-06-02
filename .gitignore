@@ -17,3 +17,33 @@ examples/*/cache/
 
 # modelblaster_pool unit-test build trees.
 runtime/modelblaster_pool/test_app/build/
+
+tmp/
+
+# Claude Code session state (CronCreate, etc.) -- ephemeral, never commit.
+.claude/
+
+# Live cost monitor session ledger -- per-machine, gitignored.
+benchmarks/results/.sessions.json
+benchmarks/results/.sessions.json.tmp
+
+# mb-cost export bundles: by default, exports stay local. The curated
+# set below is the team-shareable subset that lives in git. Use
+# `mb-cost export --full NAME` locally; share via S3/Slack/email or
+# move into the curated allowlist below if it earns its keep.
+benchmarks/reports/*
+!benchmarks/reports/aggregate-baseline-2026-05-27/
+!benchmarks/reports/demo-arm-a-mlp/
+!benchmarks/reports/demo-arm-b-mlp/
+
+# Secrets. The repo's bedrock/gemini/HF clients read tokens from
+# environment variables; the .env file is sourced by `set -a; . .env;
+# set +a` (or equivalent) at the start of any run. Never commit.
+.env
+.env.*
+!.env.example
+
+# Pretrained weight artifacts downloaded at first run -- ignored so a
+# clean clone re-downloads from the canonical URL. Tracked in the
+# model loader's _load_*_weights() helper.
+yolov8n.pt

@@ -29,7 +29,8 @@ from modelblaster.pipeline import backends as backends_mod
 from modelblaster.pipeline.backends import (
     Backend, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
 )
-from modelblaster.pipeline.bedrock_client import BedrockClient, extract_code_block
+from modelblaster.pipeline.bedrock_client import extract_code_block
+from modelblaster.pipeline.llm_client import LLMClient, make_llm_client
 from modelblaster.pipeline.reference_kernels import (
     AccuracyClass, ACCURACY_CLASS_ATOL,
     KERNEL_SPECS, KernelSpec, shapes_from_ir,
@@ -336,6 +337,48 @@ def emit_kernels_c(
 
 
 # ---------------------------------------------------------------------------
+# Per-backend op skip lists for the LLM optimize loop AND the initial
+# BACKEND=llm kernel-gen pass.
+#
+# Ops listed here are KEPT at their reference/curated impl when running with
+# BACKEND=llm + OPTIMIZE=1; we don't ask Sonnet to (re)write them. The motive
+# for each entry is empirical: a measured Arm B-bedrock matrix capture where
+# the LLM tripped verify on every attempt for that (target, op) pair while
+# the curated/reference impl was already correct. See
+# benchmarks/reports/baseline-dronet-arm-b-matrix-2026-05-26/methodology.md
+# for the gemmini maxpool / relu / etc. failure traces.
+#
+# Keyed by target name (the str), not the Backend object. Lookup with
+# .get(backend.name, set()).
+LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
+    # Gemmini doesn't accelerate elementwise / pooling / activation ops
+    # natively. The curated path routes maxpool through tiled_conv_dw_auto
+    # + mvout pool, but LLM attempts to rewrite as a "Gemmini matmul"
+    # consistently trip verify (max_abs_err=12..56 across attempts). For
+    # the other ops gemmini RoCC has no special instruction so the LLM
+    # has nothing to win against the scalar reference; let it fall
+    # through to reference_impl rather than burning budget on retries.
+    "gemmini":     {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
+                    "add_s8", "sigmoid_s8"},
+    "gemmini_q31": {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
+                    "add_s8", "sigmoid_s8"},
+    # Plain rvv: the elementwise / normalization ops have no working
+    # curated kernel (add_s8 has none at all; batchnorm2d_s8 / cat*_c1_s8
+    # exist but trip verify with linf=82 / rel_err=5.1e+13 on yolov8n
+    # smoke shapes, suggesting an OOB / scale-mismatch bug in those
+    # files). Arm A transparently falls back to reference for them;
+    # Arm B's LLM attempts trip verify on every retry. Skip these ops
+    # so the seed reference_impl holds, same as the gemmini pattern.
+    # conv2d_s8 was previously here too -- that workaround was for the
+    # IHWOC layout permutation bug (fixed in
+    # generate_skeleton.py:_LAYOUT_PERMUTATION); conv2d now works
+    # bit-exact via rvv_vsmul_vnclip and gives ~16-17× speedup.
+    "rvv":         {"add_s8", "batchnorm2d_s8", "sigmoid_s8",
+                    "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"},
+}
+
+
+# ---------------------------------------------------------------------------
 # Verify routing — backend dictates host_ctypes vs spike_harness
 # ---------------------------------------------------------------------------
 
@@ -562,7 +605,7 @@ def _generate_one_llm_for_algorithm(
     spec: KernelSpec,
     algorithm,  # AlgorithmCandidate
     shapes: list[dict],
-    client: BedrockClient,
+    client: LLMClient,
     backend: Backend,
     correctness_system: str,
     max_retries: int,
@@ -619,7 +662,8 @@ def _generate_one_llm_for_algorithm(
         # 2048 cap got hit on sigmoid_f16 / conv2d_f16 mid-expression and
         # produced unparseable truncations.
         res = client.converse(user=user, system=correctness_system,
-                              max_tokens=32768, temperature=temp)
+                              max_tokens=32768, temperature=temp,
+                              phase=f"synth:{spec.op}")
         log(f"  [{spec.op}/{algorithm.name}] tokens "
             f"in={res.input_tokens} out={res.output_tokens} "
             f"stop={res.stop_reason}")
@@ -658,7 +702,7 @@ def _generate_one_llm_for_algorithm(
 def generate_one_llm(
     spec: KernelSpec,
     shapes: list[dict],
-    client: BedrockClient,
+    client: LLMClient,
     backend: Backend,
     correctness_system: str,
     max_retries: int,
@@ -913,7 +957,7 @@ def beam_search_optimize(
     impls: dict[str, str],
     specs: list[KernelSpec],
     backend: Backend,
-    client: BedrockClient,
+    client: LLMClient,
     optimize_system: str,
     repo_root: str,
     model_dir: str,
@@ -958,12 +1002,26 @@ def beam_search_optimize(
                 res = client.converse(
                     user=user, system=optimize_system,
                     max_tokens=32768, temperature=0.5,
+                    phase=f"optimize:{spec.op}",
                 )
                 log(f"      tokens in={res.input_tokens} out={res.output_tokens}")
+                # Token usage attaches to every history record produced
+                # for this call, regardless of how the candidate exits
+                # (duplicate / build_fail / verify_fail / ok). Lets the
+                # trajectory log answer "how much did we pay per
+                # successful candidate?" without re-joining JSONL logs.
+                tokens_in = int(res.input_tokens or 0)
+                tokens_out = int(res.output_tokens or 0)
                 candidate = extract_code_block(res.text, lang="c")
                 key = _normalize(candidate)
                 if key in seen:
                     log(f"      duplicate, skip")
+                    history.append({
+                        "iter": it, "parent_idx": parent_idx,
+                        "exp_idx": exp, "parent_cycles": parent_cycles,
+                        "result": "duplicate",
+                        "tokens_in": tokens_in, "tokens_out": tokens_out,
+                    })
                     continue
                 seen.add(key)
 
@@ -990,8 +1048,10 @@ def beam_search_optimize(
                     for ln in head:
                         log(f"        {ln[:300]}")
                     history.append({
-                        "iter": it, "parent_cycles": parent_cycles,
+                        "iter": it, "parent_idx": parent_idx,
+                        "exp_idx": exp, "parent_cycles": parent_cycles,
                         "result": "build_fail",
+                        "tokens_in": tokens_in, "tokens_out": tokens_out,
                         "diag": " | ".join(head)[:2000],
                     })
                     continue
@@ -1000,8 +1060,10 @@ def beam_search_optimize(
                     log(f"      verify FAIL: golden mismatch "
                         f"(max_abs_err={hres.golden_max_abs_err:.3g})")
                     history.append({
-                        "iter": it, "parent_cycles": parent_cycles,
+                        "iter": it, "parent_idx": parent_idx,
+                        "exp_idx": exp, "parent_cycles": parent_cycles,
                         "result": "verify_fail",
+                        "tokens_in": tokens_in, "tokens_out": tokens_out,
                         "diag": f"golden mismatch ({hres.golden_max_abs_err:.3g})",
                     })
                     continue
@@ -1014,8 +1076,10 @@ def beam_search_optimize(
                     if not vres.ok:
                         log(f"      host verify FAIL: {vres.message.splitlines()[0]}")
                         history.append({
-                            "iter": it, "parent_cycles": parent_cycles,
+                            "iter": it, "parent_idx": parent_idx,
+                            "exp_idx": exp, "parent_cycles": parent_cycles,
                             "result": "verify_fail",
+                            "tokens_in": tokens_in, "tokens_out": tokens_out,
                             "diag": vres.message.splitlines()[0],
                         })
                         continue
@@ -1024,8 +1088,10 @@ def beam_search_optimize(
                 log(f"      {parent_cycles} -> {new_cycles} cyc"
                     f" ({(parent_cycles-new_cycles)/parent_cycles*100:+.1f}%)")
                 history.append({
-                    "iter": it, "parent_cycles": parent_cycles,
+                    "iter": it, "parent_idx": parent_idx,
+                    "exp_idx": exp, "parent_cycles": parent_cycles,
                     "result": "ok", "cycles": new_cycles,
+                    "tokens_in": tokens_in, "tokens_out": tokens_out,
                 })
                 proposals.append((candidate, new_cycles))
                 all_viable.append((candidate, new_cycles))
@@ -1133,6 +1199,15 @@ def generate(
     # Used by the optimize loop to write the optimized kernel back to the
     # right cache file (same key the baseline read from).
     chosen_algo: dict[str, str] = {}
+    # Per-op record of where each kernel ended up coming from. Written
+    # to kernel_picks.json next to kernels.c so the benchmark harness
+    # can answer "Arm A: how many curated kernels matched vs scalar
+    # fallback?" and "Arm B: which algorithm did the LLM pick per op?"
+    # The schema is provider-agnostic and arm-agnostic:
+    #   {op: {source: reference|curated|cached|llm,
+    #         algorithm: str|null,
+    #         path: str|null}}
+    kernel_picks: dict[str, dict[str, Optional[str]]] = {}
 
     needs_harness_paths = (
         target.verify_method == VERIFY_SPIKE_HARNESS
@@ -1150,15 +1225,28 @@ def generate(
         log(f"backend=reference  target={target.name}  ops={op_kinds}")
         for spec in specs:
             impls[spec.op] = spec.reference_impl
+            kernel_picks[spec.op] = {
+                "source": "reference", "algorithm": None, "path": None,
+            }
         # Also probe the global curated dir under the reference path so
         # hand-written curated kernels can be exercised without needing
         # LLM credentials. For each spec, look up any algorithm whose file
         # exists at <global_curated_dir>/<target>/<backend>_<op>_<algo>.c
         # and swap in the curated source instead of the scalar reference.
         # First-found-wins (algorithms are queue-ordered by target_affinity
-        # in spec.algorithms). No verify pass here — that's a deliberate
-        # tradeoff for the no-LLM path; the spike/firesim run downstream
-        # will catch correctness regressions just like a normal verify.
+        # in spec.algorithms).
+        #
+        # Per-kernel verification: when MODELBLASTER_CURATED_VERIFY=1 (the
+        # default) and the surrounding harness is wired (build_dir / repo_root
+        # / harness_dir / io_path present), we call _verify on each curated
+        # source against the spec's extra_shapes BEFORE accepting the swap.
+        # If verify fails, fall back to spec.reference_impl with a warning
+        # so the e2e build proceeds. Set MODELBLASTER_CURATED_VERIFY=0 to
+        # skip (one extra spike build per curated kernel takes ~10-30s).
+        curated_verify = (
+            os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
+            and needs_harness_paths
+        )
         if global_curated_dir is not None:
             for spec in specs:
                 for algorithm in spec.algorithms:
@@ -1168,13 +1256,52 @@ def generate(
                     curated_path = os.path.join(
                         global_curated_dir, target.name, filename
                     )
-                    if os.path.exists(curated_path):
-                        log(f"  [{spec.op}/{algorithm.name}] reference + "
-                            f"curated swap from {curated_path}")
-                        impls[spec.op] = open(curated_path).read()
-                        break
+                    if not os.path.exists(curated_path):
+                        continue
+                    curated_src = open(curated_path).read()
+                    log(f"  [{spec.op}/{algorithm.name}] reference + "
+                        f"curated swap from {curated_path}")
+                    accepted = True
+                    if curated_verify:
+                        shapes = collect_shapes(ir, spec.op, spec)
+                        log(f"  [{spec.op}/{algorithm.name}] verify curated "
+                            f"at {len(shapes)} shape(s) vs reference_impl")
+                        try:
+                            vres = _verify(
+                                spec, curated_src, shapes,
+                                backend=target, impls=impls, specs=specs,
+                                repo_root=repo_root, model_dir=out_dir,
+                                build_dir=build_dir,
+                                harness_dir=harness_dir, io_path=io_path,
+                                algorithm_name=algorithm.name,
+                            )
+                        except Exception as e:
+                            log(f"  [{spec.op}/{algorithm.name}] curated "
+                                f"verify raised {type(e).__name__}: {e}; "
+                                f"falling back to reference_impl")
+                            accepted = False
+                            vres = None
+                        if vres is not None and not vres.ok:
+                            log(f"  [{spec.op}/{algorithm.name}] curated "
+                                f"verify FAIL — {vres.message}; "
+                                f"falling back to reference_impl")
+                            accepted = False
+                        elif vres is not None:
+                            log(f"  [{spec.op}/{algorithm.name}] curated "
+                                f"verify PASS — {vres.message}")
+                    if accepted:
+                        impls[spec.op] = curated_src
+                        kernel_picks[spec.op] = {
+                            "source": "curated",
+                            "algorithm": algorithm.name,
+                            "path": curated_path,
+                        }
+                        break  # first-accepted-wins; try next spec
+                    # If verify failed, continue to next algorithm; if
+                    # all algorithms fail, kernel_picks keeps the original
+                    # "reference" entry and impls keeps reference_impl.
     elif backend_name == "llm":
-        # Lazy proxy: BedrockClient() is only instantiated when actually needed
+        # Lazy proxy: the LLM client is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
         # runs that hit all curated kernels don't require AWS credentials.
         class _LazyClient:
@@ -1183,7 +1310,7 @@ def generate(
             def __getattr__(self_, name):
                 real = object.__getattribute__(self_, '_real')
                 if real is None:
-                    real = BedrockClient()
+                    real = make_llm_client()
                     object.__setattr__(self_, '_real', real)
                 return getattr(real, name)
         client = _LazyClient()
@@ -1197,7 +1324,19 @@ def generate(
         # First pass: write reference + emit so the harness can build at all.
         emit_kernels_h(specs, out_dir, model_name=ir["name"])
         emit_kernels_c(impls, "seed", out_dir, backend=target, model_name=ir["name"])
+        _llm_skip = LLM_SKIP_OPS_PER_TARGET.get(target.name, set())
         for spec in specs:
+            if spec.op in _llm_skip:
+                log(f"  [{spec.op}] target={target.name} -> "
+                    f"LLM-gen skip (curated/reference is best known); "
+                    f"keeping reference_impl from seed step")
+                kernel_picks[spec.op] = {
+                    "source": "reference",
+                    "algorithm": None,
+                    "path": None,
+                }
+                chosen_algo[spec.op] = "direct"
+                continue
             shapes = collect_shapes(ir, spec.op, spec)
             log(f"  [{spec.op}] verify shapes={shapes}")
             result = generate_one_llm(
@@ -1226,14 +1365,35 @@ def generate(
             code, chosen = result
             impls[spec.op] = code
             chosen_algo[spec.op] = chosen
+            # generate_one_llm may have hit a cache / curated probe
+            # internally; today we can't distinguish those cleanly
+            # from a fresh LLM synthesis without further plumbing.
+            # Record as "llm" (the path that reached this point through
+            # the LLM backend) with the chosen algorithm name. A
+            # follow-up that propagates the actual code source out of
+            # generate_one_llm can refine cached/curated/llm.
+            kernel_picks[spec.op] = {
+                "source": "llm",
+                "algorithm": chosen,
+                "path": None,
+            }
     else:
         raise SystemExit(f"unknown --backend: {backend_name}")
 
     emit_kernels_h(specs, out_dir, model_name=ir["name"])
     emit_kernels_c(impls, backend_name, out_dir, backend=target, model_name=ir["name"])
+    # Emit the per-op kernel_picks alongside kernels.c. The benchmark
+    # harness's arm driver copies this into the cell's run dir; the
+    # aggregator's kernel_picks extractors derive per-source counts +
+    # algorithm diversity.
+    picks_path = os.path.join(out_dir, "kernel_picks.json")
+    with open(picks_path, "w") as _f:
+        json.dump({"schema_version": 1, "target": target.name,
+                   "picks": kernel_picks}, _f, indent=2)
     print(f"wrote {os.path.join(out_dir, 'kernels.h')}")
     print(f"wrote {os.path.join(out_dir, 'kernels.c')}  "
           f"(source={backend_name} target={target.name})")
+    print(f"wrote {picks_path}")
 
     if not optimize:
         return
@@ -1286,7 +1446,7 @@ def generate(
         optimize_system = optimize_system + "\n\n" + stanza
         log(f"optimize: prompt enriched with target memory-hierarchy stanza "
             f"(target={target.name})")
-    client = BedrockClient()
+    client = make_llm_client()
 
     # Pre-instantiate the firesim evaluator (one per generate() call). It
     # reuses a separate chipyard build dir from the spike build_dir so
@@ -1308,8 +1468,15 @@ def generate(
         log(f"optimize: firesim re-rank ENABLED "
             f"(top_k={firesim_top_k}, build_dir={firesim_build_dir})")
 
+    # See module-level LLM_SKIP_OPS_PER_TARGET for the rationale.
+    _skip = LLM_SKIP_OPS_PER_TARGET.get(target.name, set())
+
     optimize_summary: dict[str, dict] = {}
     for spec in specs:
+        if spec.op in _skip:
+            log(f"  [{spec.op}] target={target} -> "
+                f"optimize-skip (curated/reference is best known)")
+            continue
         baseline_op = baseline_cycles_by_op.get(spec.op, 0)
         if baseline_op <= 0:
             log(f"  [{spec.op}] no baseline cycles, skipping")
@@ -1436,6 +1603,21 @@ def generate(
     with open(summary_path, "w") as f:
         json.dump(optimize_summary, f, indent=2)
     log(f"wrote {summary_path}")
+
+    # beam_search_trajectory.jsonl: one line per candidate (across
+    # every op + iter + parent + expansion in this optimize call) so
+    # the harness can answer "did we plateau early?" / "how much did
+    # we pay per surviving candidate?" / "what was the best-of-K
+    # curve?" without re-parsing the nested summary.
+    trajectory_path = os.path.join(out_dir, "beam_search_trajectory.jsonl")
+    with open(trajectory_path, "w") as f:
+        for op, entry in optimize_summary.items():
+            baseline = entry.get("baseline")
+            for rec in entry.get("history") or []:
+                line = {"spec": op, "baseline_cycles": baseline}
+                line.update(rec)
+                f.write(json.dumps(line) + "\n")
+    log(f"wrote {trajectory_path}")
     log("")
     log("optimize summary:")
     for op, s in sorted(optimize_summary.items()):

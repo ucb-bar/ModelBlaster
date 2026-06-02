@@ -1,0 +1,23 @@
+# QRB5165 head-to-head with yolov8_nano @ 64x64 input — the smaller
+# yolov8 variant that fits the 1+2+4 bundle into a workable period
+# budget on the Gemmini+RVV/OPU hetero bitstream. yolov8_nano@160 has
+# ~420 ms of compute alone (can't fit in 75 ms); @64 has ~67 ms so the
+# bundle's total = 67 + 37 + 2 = 106 ms which CAN fit in ≤75 ms with
+# 2-way parallelism.
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: opu0,     kind: CPU_E, hart: 1 }
+requantize_ops: [conv2d_s8, linear_s8]
+networks:
+  - { name: yolov8_nano_64, quant: int8, instances: 1 }
+  - { name: dronet,         quant: int8, instances: 2 }
+  - { name: mlp_control,    quant: int8, instances: 4 }
+horizon_ms: 75.0
+solver: MOSEK
+time_limit_s: 0
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000
