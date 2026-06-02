@@ -1,0 +1,6 @@
+built Workload: 300 ops, 2 machines, 7 network instances
+invoking scheduler.heft({})
+solved: makespan=83.083 ms  solve_wall=0.02s  status=solved
+target_horizon=75.0 ms -> OVER target
+automerge: collapsed 130 pair(s) -> 170 dispatches, saved 0.0µs
+wrote /scratch2/agustin/ModelBlaster/artifacts/scheduler_bundle_postpass/HEFT.json

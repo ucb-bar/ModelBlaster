@@ -441,6 +441,19 @@ def main() -> int:
         from dataclasses import asdict
         report_dict = asdict(report_obj)
 
+    # Compute the oracle floor from the workload alone (no solver). HEFT /
+    # PEFT / EDF / greedy don't build a SchedulerReport so this is the only
+    # path that surfaces oracle_gap_pct on those solvers.
+    try:
+        from oracle import compute_floor, oracle_gap_pct as _gap_pct
+        floor = compute_floor(workload)
+        if report_dict is None:
+            report_dict = {}
+        for k, v in floor.items():
+            report_dict.setdefault(k, v)
+    except Exception as _exc:
+        print(f"warning: oracle floor computation skipped ({_exc})")
+
     makespan = float(max(t + np.array([op.processing_times[int(np.argmax(alpha[i]))]
                                         for i, op in enumerate(workload.operations)])))
     status = getattr(workload, "solver_state", {}).get("problem_status", "solved")

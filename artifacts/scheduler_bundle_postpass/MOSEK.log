@@ -1,0 +1,37 @@
+(CVXPY) Jun 02 03:45:39 PM: Encountered unexpected exception importing solver GLOP:
+RuntimeError('Unrecognized new version of ortools (9.15.6755). Expected < 9.15.0. Please open a feature request on cvxpy to enable support for this version.')
+(CVXPY) Jun 02 03:45:39 PM: Encountered unexpected exception importing solver PDLP:
+RuntimeError('Unrecognized new version of ortools (9.15.6755). Expected < 9.15.0. Please open a feature request on cvxpy to enable support for this version.')
+/scratch2/agustin/miniforge3/envs/merlin-dev/lib/python3.11/site-packages/mosek/__init__.py:11539: UserWarning: Argument subi in putaijlist64: Incorrect array format causing data to be copied
+  warnings.warn("Argument subi in putaijlist64: Incorrect array format causing data to be copied");
+/scratch2/agustin/miniforge3/envs/merlin-dev/lib/python3.11/site-packages/mosek/__init__.py:11568: UserWarning: Argument subj in putaijlist64: Incorrect array format causing data to be copied
+  warnings.warn("Argument subj in putaijlist64: Incorrect array format causing data to be copied");
+/scratch2/agustin/XPU-RT/xpu-rt/scheduler.py:771: UserWarning: Optimization terminated by time limit; solution may be imprecise or absent.
+  problem.solve(solver=solver_attr, verbose=solver_verbose, **solver_kwargs)
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/scratch2/agustin/ModelBlaster/scripts/run_xpurt_scheduler_multi.py", line 469, in <module>
+    print(f"  buckets: {g['buckets']}")
+                 ^^^^^^
+  File "/scratch2/agustin/ModelBlaster/scripts/run_xpurt_scheduler_multi.py", line 430, in main
+    t, alpha, _fused, _fmap = scheduler_fn(workload, **solver_kwargs)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch2/agustin/XPU-RT/xpu-rt/schedulers.py", line 175, in _compacted
+    result = fn(workload, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch2/agustin/XPU-RT/xpu-rt/schedulers.py", line 30, in _mosek
+    return milp_schedule(workload, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch2/agustin/XPU-RT/xpu-rt/scheduler.py", line 771, in schedule
+    problem.solve(solver=solver_attr, verbose=solver_verbose, **solver_kwargs)
+  File "/scratch2/agustin/miniforge3/envs/merlin-dev/lib/python3.11/site-packages/cvxpy/problems/problem.py", line 650, in solve
+    return solve_func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch2/agustin/miniforge3/envs/merlin-dev/lib/python3.11/site-packages/cvxpy/problems/problem.py", line 1247, in _solve
+    self.unpack_results(solution, solving_chain, inverse_data)
+  File "/scratch2/agustin/miniforge3/envs/merlin-dev/lib/python3.11/site-packages/cvxpy/problems/problem.py", line 1552, in unpack_results
+    raise error.SolverError(
+cvxpy.error.SolverError: Solver 'MOSEK' failed. Try another solver, or solve with verbose=True for more information.
+built Workload: 300 ops, 2 machines, 7 network instances
+invoking scheduler.mosek({'cvxpy_solver': 'MOSEK', 'time_limit': 300.0, 'restrict_makespan_to_nonperiodic': True})

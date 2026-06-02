@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/scratch2/agustin/ModelBlaster/scripts/run_xpurt_scheduler_multi.py", line 469, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/scratch2/agustin/ModelBlaster/scripts/run_xpurt_scheduler_multi.py", line 418, in main
+    scheduler_fn = get_scheduler(registry_name)
+  File "/scratch2/agustin/XPU-RT/xpu-rt/schedulers.py", line 207, in get_scheduler
+    raise ValueError(f"Unknown scheduler '{name}'. Available: {available}")
+ValueError: Unknown scheduler 'greedy'. Available: cost_model, cpsat, cpsat_memory, critical_path, edf, fastest_device, fifo, gnn_placement, heft, llm_ranker, max_min, milp_cbc, milp_gurobi, milp_highs, milp_scip, min_min, mosek, peft, random_list, rl_policy, round_robin, simulated_annealing
+built Workload: 300 ops, 2 machines, 7 network instances
