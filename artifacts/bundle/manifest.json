@@ -1,0 +1,27 @@
+{
+  "bundle": "/scratch2/agustin/XPU-RT/artifacts/iterate/firesim_batch.json",
+  "workload_spec": "/scratch2/agustin/XPU-RT/data/toplevel/networks_1yolo_4mlp_2dronet_firesim.json",
+  "runner": "firesim",
+  "deadline_us": 65.0,
+  "candidates": [
+    {
+      "id": "baseline",
+      "axis": "baseline",
+      "solver": "decomposed",
+      "scheduler": null,
+      "profile_hw": {
+        "cpu_p": "gemmini_q31",
+        "cpu_e": "V256D128_rvv"
+      },
+      "fixture": "/scratch2/agustin/XPU-RT/schedules/scheduled__iter_baseline_decomposed_profiled.json",
+      "stdout_log": "artifacts/bundle/baseline/run_stdout.log",
+      "predicted_makespan_us": 75570.546,
+      "status": "partial-trace",
+      "reason": "FireSim 1hr wall-clock timeout hit; trace covers first ~6.55ms of simulated time",
+      "trace_csv": "artifacts/bundle/baseline/xpurt_trace.csv",
+      "measured_makespan_us": 6552.238,
+      "wall_s": null,
+      "uartlog": "/scratch2/agustin/chipyard/sims/firesim/deploy/results-workload/2026-06-02--07-09-09-modelblaster-firesim-q154/modelblaster-firesim0/uartlog"
+    }
+  ]
+}
