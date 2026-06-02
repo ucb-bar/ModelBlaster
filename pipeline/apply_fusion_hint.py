@@ -191,9 +191,17 @@ def _build_fused_op(
     ]
 
     sub_op_names = [op["op"] for op in group_ops]
+    # Phase 1d: if this fuse_group is exactly a registered fused-pair
+    # pattern (linear_s8 + elu_s8), use the matching KernelSpec key
+    # instead of the synthetic `__fused__...` name. That routes codegen
+    # through the registered kernel (with LLM seeds) rather than
+    # generate_skeleton.py's chained-call fallback.
+    fused_op_kind = "__fused__" + "__".join(sub_op_names)
+    if len(group_ops) == 2 and sub_op_names == ["linear_s8", "elu_s8"]:
+        fused_op_kind = "linear_s8_elu_s8"
     return {
         "name": f"{network}.fused_{group[0]}_{group[-1]}",
-        "op": "__fused__" + "__".join(sub_op_names),
+        "op": fused_op_kind,
         "inputs": fused_inputs,
         "outputs": fused_outputs,
         "sub_ops": [copy.deepcopy(op) for op in group_ops],
@@ -204,9 +212,36 @@ def _build_fused_op(
     }
 
 
+def _pairwise_split(group: list[int], ops_by_id: dict[int, dict[str, Any]]
+                    ) -> list[list[int]] | None:
+    """If `group` is a flat chain of alternating `linear_s8` / `elu_s8`
+    sub-ops, split it into pair fuse_groups so each pair maps to the
+    `linear_s8_elu_s8` registered KernelSpec (Phase 1d). Returns
+    `None` if the pattern doesn't match — caller falls back to the
+    synthetic `__fused__...` chain.
+
+    For mlp_control's hint [0,1,2,3,4,5] (six ops: linear, elu, linear,
+    elu, linear, elu), this returns [[0,1], [2,3], [4,5]].
+    """
+    if len(group) % 2 != 0:
+        return None
+    pairs: list[list[int]] = []
+    for i in range(0, len(group), 2):
+        a, b = group[i], group[i + 1]
+        op_a = ops_by_id[a]["op"]
+        op_b = ops_by_id[b]["op"]
+        if op_a == "linear_s8" and op_b == "elu_s8":
+            pairs.append([a, b])
+        else:
+            return None
+    return pairs
+
+
 def apply_hint(
     graph: dict[str, Any],
     fuse_groups: list[list[int]],
+    *,
+    pairwise: bool = False,
 ) -> dict[str, Any]:
     """Apply a list of fuse_groups (Contract-2) to one network's IR.
 
@@ -233,9 +268,25 @@ def apply_hint(
         for t in out_node.get("tensors", []) or []:
             model_outputs.add(t)
 
-    # Validate, then check disjointness across groups.
+    # Validate.
     for group in fuse_groups:
         _validate_fuse_group(group, ops_by_id, network)
+    # Phase 1d: if pairwise=True, try to split each linear+elu-alternating
+    # chain into a sequence of pair fuse_groups whose sub-ops match the
+    # registered `linear_s8_elu_s8` KernelSpec. Fall back to the original
+    # group when the pattern doesn't fit (caller still gets a synthetic
+    # `__fused__...` op).
+    if pairwise:
+        expanded: list[list[int]] = []
+        for group in fuse_groups:
+            pairs = _pairwise_split(group, ops_by_id)
+            if pairs is not None:
+                expanded.extend(pairs)
+            else:
+                expanded.append(group)
+        fuse_groups = expanded
+
+    # Check disjointness across the (possibly expanded) group set.
     all_grouped: set[int] = set()
     for group in fuse_groups:
         overlap = all_grouped.intersection(group)
@@ -346,6 +397,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="Input graph.json.")
     p.add_argument("--out", required=True, type=Path,
                    help="Output graph.fused.json (overwritten).")
+    p.add_argument("--pairwise", action="store_true",
+                   help="Phase 1d: split each linear_s8/elu_s8-alternating "
+                        "fuse_group into a sequence of pair fuse_groups so "
+                        "each pair maps to the registered `linear_s8_elu_s8` "
+                        "KernelSpec (which has LLM-codegen seeds for "
+                        "rvv_opu and gemmini).")
     args = p.parse_args(argv)
 
     hint = _load_hint(args.hint)
@@ -363,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         graph["name"] = args.model
 
-    rewritten = apply_hint(graph, fuse_groups)
+    rewritten = apply_hint(graph, fuse_groups, pairwise=args.pairwise)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:

@@ -1,0 +1,5 @@
+dispatch_id,name,op,shape,cycles
+0,mlp_control.fused_0_1,linear_s8_elu_s8,,102454
+1,mlp_control.fused_2_3,linear_s8_elu_s8,,605299
+2,mlp_control.fused_4_5,linear_s8_elu_s8,,154714
+3,mlp.6,linear_s8,M=1;K=64;N=4,4036
