@@ -8,10 +8,29 @@
   `pipeline/apply_fusion_hint.py` + tests (11/11 pass).
   Smoke-tested on the real XPU-RT hint: `mlp_control` 7 dispatches
   → 2 (one `__fused__linear_s8__elu_s8__...` + the trailing linear).
-- **Phase 1b** (fused-op codegen integration) — deferred.
-  `generate_skeleton.py:emit_model` is a 50-branch if/elif chain
-  spanning ~740 lines; teaching it to recurse into `sub_ops` is a
-  sizable refactor that risks the working axis-A/B build paths.
+- **Phase 1b** (fused-op codegen integration) — partial.
+  The small additive piece is in: `generate_kernels.py`'s `op_kinds`
+  loop now expands `__fused__` ops into their `sub_ops` kinds so the
+  kernel picker emits `kernel_<sub_op>_<mid>` for every constituent.
+  The bigger piece — teaching `generate_skeleton.py:emit_model` to
+  recognize `__fused__` ops and emit a fused `dispatch_<mid>_<id>`
+  function that calls each sub-kernel back-to-back — is **deferred**.
+  The function is a 50-branch if/elif chain over ~740 lines; the
+  clean refactor wraps the body in an inner loop over "effective ops"
+  (sub_ops for fused, [op] for non-fused) and joins the per-sub-op
+  call strings. Plan for the follow-up:
+  1. Extract the if/elif into a closure `_compute_call(op)` returning
+     the call string (mechanical reindent).
+  2. Replace the inline use with the closure.
+  3. Add a top-of-loop branch that calls `_compute_call(sub)` for
+     each sub-op of a `__fused__` op and joins with `; `.
+  4. Update the `dispatch_fns.append(...)` template so the
+     `shape` field for a fused dispatch reads `"fused(N)"` instead
+     of trying to derive a shape literal from the outer op.
+  5. Verify on spike with the actual hint
+     (`/scratch2/agustin/XPU-RT/artifacts/iterate/granularity_hint.json`)
+     applied to `mlp_control` first (smallest fuse_group),
+     then `dronet`, then `yolov8_nano`.
   Axis-C runs through `/realize-hint` + `/realize-and-run` will
   report `skipped` with a clear reason until this lands.
 - **Phase 2** (bundle driver + measured-report adapter + shell
