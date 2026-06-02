@@ -47,23 +47,40 @@
 
 ## Roadmap — Phase 1d / 1e / 1f / 1g
 
-- **Phase 1d** — *true* fused kernels. Today
-  `_emit_sub_op_call` glues N kernel calls together. For
-  `linear_s8 + elu_s8` chains the fused-kernel body would: load
-  weights → accumulate MAC into a register-resident vector →
-  apply ELU lookup *in register* → use as input to the next
-  linear's MAC, never spilling to an intermediate tensor. Two
-  paths to consider:
-  1. Hand-write `kernel_mlp_chain_s8(...)` for the
-     `linear_s8 elu_s8 ...` pattern under
-     `pipeline/reference_kernels.py`.
-  2. Generate it from a kernel-fusion template
-     (`pipeline/fuser/emit_chain.py`) keyed by the sub-op
-     sequence, so any chain pattern XPU-RT proposes gets a
-     bespoke fused kernel automatically.
+- **Phase 1d** — *true* fused kernels via **Bedrock LLM
+  codegen**. Today `_emit_sub_op_call` glues N kernel calls
+  together. A true fused kernel would load weights → accumulate
+  MAC into register-resident vectors → apply ELU lookup *in
+  register* → use as input to the next linear's MAC, never
+  spilling to an intermediate tensor. User authorized using
+  ModelBlaster's existing `BACKEND=llm` codegen path
+  (`pipeline/bedrock_client.py` + `pipeline/generate_kernels.py`)
+  for this:
+
+  1. Register a `KernelSpec` per fused chain pattern XPU-RT
+     proposes. The synthetic op name from
+     `apply_fusion_hint.py` (`__fused__<sub0>__<sub1>__...`)
+     is the registry key. `reference_impl` = the chained-call
+     fallback (what Phase 1b emits today) — that's the oracle
+     the LLM-generated kernel must match bit-exact.
+  2. `AlgorithmCandidate` list seeds Bedrock with
+     target-specific variants:
+     - `rvv_opu`: "use one VOPMACC across all linear stages,
+       keep the activation vector resident in vector registers
+       between layers, apply ELU via VRGATHER LUT"
+     - `gemmini`: "issue back-to-back tiled_matmul_auto calls
+       sharing the same DRAM weight cursor, fold elu into the
+       activation_min/max args of the next stage"
+     - portable: "stack-allocate intermediates, replace
+       buf_<mid>_<tensor> globals with `int8_t scratch[N]`"
+  3. `BACKEND=llm TARGET=<bs>` regenerates the kernel; the
+     verify harness gates it against `reference_impl`. The
+     picker keeps whichever is faster (curated > LLM > LLM
+     fallback to reference).
 
   Goal: measured-makespan delta after Phase 1d should be > 0
-  (not the ~0 we see today on Phase 1b).
+  (not the ~0 we see today on Phase 1b). Bedrock cost +
+  generation time is acceptable per user authorization.
 
 - **Phase 1e** — realize `modelblaster.split_hints/v1`. XPU-RT's
   `granularity_loop.py` emits split hints when granularity is
@@ -72,8 +89,16 @@
   `pipeline/apply_fusion_hint.py`: given
   `{network, split_ops: [{op: 4, n_splits: 2}]}` decompose op 4
   into N smaller ops along a tilable dimension (OC for conv2d,
-  N or K for linear). The scheduler then places the tiles on
-  separate cores in parallel.
+  N or K for linear). Per-tile kernels use **Bedrock LLM
+  codegen** with prompt context describing the split:
+  - "this is tile `t` of `n_splits`; OC range
+    `[t*OC/n, (t+1)*OC/n)`; reuse the input but emit only
+    the matching output rows"
+  - LLM picks the cheapest accumulation strategy for the target
+    backend; oracle is the un-split reference impl run on the
+    same shape.
+  The scheduler then places the tiles on separate cores in
+  parallel.
 
 - **Phase 1f** — pick a *too_coarse* demo workload so axis-C's
   split direction has a counter-example. The current 1y+4m+2d
