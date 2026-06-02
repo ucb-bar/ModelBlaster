@@ -179,7 +179,7 @@ def render_stack(panels: list[dict], out_png: Path, title: str,
                         fontsize=10)
 
     # Legend at top.
-    handles = [mpatches.Patch(color=NETWORK_COLORS[n], label=n)
+    handles = [mpatches.Patch(color=NETWORK_COLORS.get(n, "#888"), label=n)
                for n in sorted(networks_present)]
     handles.append(mpatches.Patch(facecolor=NETWORK_COLORS["mlp_control"],
                                    alpha=0.3,
