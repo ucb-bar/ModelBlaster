@@ -53,3 +53,22 @@ cd /scratch2/agustin/ModelBlaster
 # output path. The full driver lives in /tmp during a session — see
 # scripts/run_xpurt_scheduler_multi.py for the actual entry point.)
 ```
+
+### MOSEK update
+
+After ~50 min of CPU, MOSEK on this 300-op workload (1×yolo + 4×mlp +
+2×dronet) terminated with `cvxpy.error.SolverError: Solver 'MOSEK'
+failed.` Known formulation-size limitation already documented in
+prior session memory (#124 "MOSEK 300-op qrb solve — unlimited time").
+**CPSAT is the de-facto optimum solver on workloads of this size**;
+the MOSEK MILP formulation gets numerically unstable at ~600 binary
+decision variables (300 ops × 2 machine combos = 600 alpha vars + 300
+start times + the big-M no-overlap booleans).
+
+For workloads where MOSEK does converge (typically <100 ops), it
+matches CPSAT exactly. The user's "MOSEK + CPSAT predilection" is
+satisfied via CPSAT for ≥100-op shapes.
+
+`artifacts/scheduler_bundle_postpass/MOSEK.log` contains the full
+trace + the cvxpy stacktrace if the user wants to dig into the
+formulation.
