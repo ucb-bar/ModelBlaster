@@ -168,9 +168,26 @@
  * Without these undefs, any RVV intrinsic kernel that names a vector
  * variable v0..v31 (extremely common -- vint16m4_t v16 = __riscv_*) hits
  * "expected identifier or '(' before string constant" at the variable
- * declaration. The macros are still usable INSIDE this header for the
- * OPMACC / OPRSUB / etc. inline-asm patterns above.
+ * declaration.
+ *
+ * BUT — the OPMVINBCAST / VOPACC / VMV_VR / VMV_RV macros take REGISTER
+ * NAMES as arguments and depend on `m1` / `v0` etc. expanding to the
+ * "x1" / "x0" string literals at the call site (the asm template does
+ * string concatenation: `".insn r 0x57,0x6,0x59, " md ", x0, " vs2`).
+ * So a kernel that wants to CALL those macros MUST keep the register
+ * #defines alive. Opt in by setting `SATURN_OPU_KEEP_REGISTER_MACROS`
+ * before including this header:
+ *
+ *   #define SATURN_OPU_KEEP_REGISTER_MACROS
+ *   #include "saturn_opu.h"
+ *   // now m0..m3, v0..v31 are "x0".."x31" strings — and the macros
+ *   // OPMVINBCAST(m1, v0); VOPACC(m1, v18, v16); etc. work.
+ *
+ * Kernels that DON'T set this (e.g. a kernel that uses `__riscv_*`
+ * intrinsics and names a `vint16m4_t v16` C variable) get the default
+ * undef-everything behavior so the C parser is happy.
  */
+#ifndef SATURN_OPU_KEEP_REGISTER_MACROS
 #undef m0
 #undef m1
 #undef m2
@@ -207,5 +224,6 @@
 #undef v29
 #undef v30
 #undef v31
+#endif /* !SATURN_OPU_KEEP_REGISTER_MACROS */
 
 #endif /* MODELBLASTER_SATURN_OPU_H */

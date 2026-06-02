@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -328,6 +329,28 @@ def _emit_fixture(workload, t, alpha, instance_meta, machines, cfg, out_path: pa
     }
     if report_dict is not None:
         fixture["_provenance"]["scheduler_report"] = report_dict
+
+    # Same-network adjacent auto-merge (schedule-time fusion of back-to-back
+    # dispatches on the same core with no external readers/writers). Plumbs
+    # through the XPU-RT helper so the same post-pass applies on both the
+    # XPU-RT-internal writer (postprocessing.output_scheduled_json) and this
+    # multi-network ModelBlaster writer. Disable with XPURT_NO_AUTOMERGE=1.
+    if os.environ.get("XPURT_NO_AUTOMERGE", "0") not in ("1", "true", "True"):
+        try:
+            import sys as _sys
+            _sys.path.insert(0, "/scratch2/agustin/XPU-RT/xpu-rt")
+            from automerge import automerge_adjacent, automerge_savings
+            before = fixture
+            fixture = automerge_adjacent(fixture, max_gap_us=50.0,
+                                         saved_handshake_us=5.0)
+            sav = automerge_savings(before, fixture)
+            if sav["pairs_merged"] > 0:
+                print(f"automerge: collapsed {sav['pairs_merged']} pair(s) -> "
+                      f"{sav['dispatches_after']} dispatches, "
+                      f"saved {sav['saved_us']:.1f}µs")
+                fixture.setdefault("_provenance", {})["automerge"] = sav
+        except Exception as _exc:
+            print(f"warning: automerge skipped ({_exc})")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(fixture, indent=2) + "\n")
