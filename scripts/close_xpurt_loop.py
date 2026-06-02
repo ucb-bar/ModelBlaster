@@ -182,7 +182,11 @@ def main(argv: list[str] | None = None) -> int:
         cand_dir = out_dir / cid
         cand_dir.mkdir(parents=True, exist_ok=True)
         advice = None
-        if cand.get("status") == "ok" and cand.get("trace_csv"):
+        # Process anything with a trace CSV — covers status=ok (full
+        # run) and status=partial-trace (FireSim wall-clock cutoff). A
+        # truncated trace is still useful for predicted-vs-measured
+        # comparison on the prefix that ran.
+        if cand.get("status") in ("ok", "partial-trace") and cand.get("trace_csv"):
             measured = _emit_measured(cand, deadline_us, cand_dir)
             if measured:
                 gantt = cand_dir / "predicted_vs_actual.png"
