@@ -35,6 +35,18 @@ _GCC="${ZEPHYR_SDK_INSTALL_DIR}/gnu/riscv64-zephyr-elf/bin/riscv64-zephyr-elf-gc
     || _fail "RISC-V Zephyr GCC not found at ${_GCC}" \
              "verify ZEPHYR_SDK_INSTALL_DIR points at a complete SDK tree"
 
+# 3a) zephyr-chipyard-sw must carry Dima's arch/riscv/core/v.c refactor
+# (HAS_V() per-hart misa probe). Without it, eager V context-switch
+# still traps on hart-0-without-V at boot. Pin the minimum SHA:
+# zephyr-chipyard-sw @ ae5d736 → zephyr_ws/zephyr @ 852bb170c.
+_V_C="${ZEPHYR_BASE}/arch/riscv/core/v.c"
+[ -f "${_V_C}" ] \
+    || _fail "missing ${_V_C} (Dima's V-decouple refactor)" \
+             "cd \$(dirname \$(dirname \$(dirname ${ZEPHYR_BASE}))) && git pull origin dev && git submodule update --init --recursive"
+grep -q 'HAS_V' "${_V_C}" 2>/dev/null \
+    || _fail "${_V_C} lacks HAS_V() runtime misa probe (upstream Zephyr, not Saturn fork)" \
+             "bump zephyr-chipyard-sw to ae5d736+ and re-init zephyr_ws/zephyr"
+
 # 4) Bedrock creds for Arm B (warning only -- Arm A doesn't need them).
 if [ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
     echo "warning: AWS_BEARER_TOKEN_BEDROCK not set -- Arm B-bedrock runs will fail." >&2
