@@ -164,9 +164,13 @@ def _fixture_path(candidate: dict[str, Any]) -> Path:
 
 
 def _models_quants_for_networks_json(spec_path: Path) -> tuple[str, str]:
-    """Resolve MODELS / QUANTS from the XPU-RT workload spec, expanding
-    periodic instances so the dispatch-table walker has the matching
-    per-instance kernels available.
+    """Resolve MODELS / QUANTS from the XPU-RT workload spec.
+
+    Returns UNIQUE network names (one per `name`), not per-instance —
+    the harness builds one model library per name, and the schedule
+    references them by instance suffix (e.g. `mlp_control0`,
+    `mlp_control1` both link the single `mlp_control` model lib).
+    Emitting duplicates triggers CMake "target already exists" errors.
 
     On the hetero (Gemmini+OPU) bitstream the demo standardizes on int8
     builds for all three networks (matches past 1+4+2 captures in
@@ -178,24 +182,19 @@ def _models_quants_for_networks_json(spec_path: Path) -> tuple[str, str]:
     with open(spec_path) as f:
         spec = json.load(f)
     nets = spec.get("networks", {})
-    # The XPU-RT spec emits networks as a dict keyed by name (not a list).
     if isinstance(nets, list):
         nets_iter = [(n["name"], n) for n in nets]
     else:
         nets_iter = list(nets.items())
-    models: list[str] = []
-    quants: list[str] = []
     # Order: yolov8_nano first (one-shot), then dronet, then mlp_control —
     # matches periodicity (least-periodic first) for the harness walker.
     def _key(item):
         name, entry = item
         period = entry.get("period", 0) or 0
         return (period, name)
-    for name, entry in sorted(nets_iter, key=_key):
-        ninst = int(entry.get("num_instances", 1))
-        for _ in range(ninst):
-            models.append(name)
-            quants.append("int8")
+    sorted_nets = sorted(nets_iter, key=_key)
+    models = [name for name, _ in sorted_nets]
+    quants = ["int8" for _ in sorted_nets]
     return ",".join(models), ",".join(quants)
 
 
@@ -234,22 +233,32 @@ def _extract_trace(uartlog: Path, dst: Path) -> bool:
 def _find_uartlog(stdout_log: Path, job_started_at: float) -> Path | None:
     """Locate the uartlog FireSim wrote for our run.
 
-    Two strategies in priority order:
-      1. parse `job_id=<N>` out of run.sh stdout (firesim-queue prints
-         this when it submits) and look for the matching results dir,
-      2. fall back to the newest uartlog in the FireSim results tree
-         that landed after we started.
+    Strategies in priority order:
+      1. parse the explicit `firesim: reading per-run uartlog at <path>`
+         line firesim_runner.py prints (most reliable, exact match).
+      2. parse `job_id=<N>` (queue submit log) and look for the
+         matching `*-q<N>/*/uartlog` results dir.
+      3. fall back to the newest uartlog under the results tree with
+         mtime > job_started_at (FIRESIM_QUEUE=1 serializes runs, so
+         the newest one after our subprocess started IS ours).
     """
+    import re
     text = stdout_log.read_text(errors="replace") if stdout_log.is_file() else ""
     results_root = Path("/scratch2/agustin/chipyard/sims/firesim/deploy/results-workload")
-    import re
+
+    m = re.search(r"firesim: reading per-run uartlog at (\S+)", text)
+    if m:
+        p = Path(m.group(1))
+        if p.is_file():
+            return p
+
     m = re.search(r"job_id=(\d+)", text)
     if m:
         job_id = m.group(1)
         for candidate in results_root.glob(f"*-q{job_id}/*/uartlog"):
             if candidate.is_file():
                 return candidate
-    # Fallback: newest uartlog created after our start.
+
     newest = None
     newest_mtime = job_started_at
     for u in results_root.glob("**/uartlog"):
@@ -378,21 +387,29 @@ def run_one(
         entry["status"] = "dry-run"
         return entry
 
-    cmd = ["bash", str(REPO_ROOT / "examples/xpurt_demo/run.sh")]
+    # `uv run` activates the venv inside the subprocess so the
+    # bare `python -m modelblaster.pipeline.*` invocations in
+    # run.sh resolve. Without it, run.sh hits conda's python which
+    # doesn't have the modelblaster package installed.
+    cmd = ["uv", "run", "bash", str(REPO_ROOT / "examples/xpurt_demo/run.sh")]
     with open(stdout_log, "w") as f:
         proc = subprocess.run(
             cmd, env=env, cwd=REPO_ROOT, stdout=f, stderr=subprocess.STDOUT)
     wall_s = time.time() - started_at
     entry["wall_s"] = round(wall_s, 1)
 
-    elf_src = REPO_ROOT / f"examples/xpurt_demo/{env['QUANT']}/build/gemmini_rvv_opu_firesim/zephyr/zephyr.elf"
-    if elf_src.is_file():
-        elf_dst = cand_dir / "zephyr.elf"
-        try:
-            shutil.copy2(elf_src, elf_dst)
-            entry["elf"] = str(elf_dst)
-        except OSError as e:
-            entry["elf_copy_error"] = str(e)
+    # ELF copy only after a successful build — checking just for file
+    # existence picks up stale artifacts from prior runs and lies in
+    # the manifest.
+    if proc.returncode == 0:
+        elf_src = REPO_ROOT / f"examples/xpurt_demo/{env['QUANT']}/build/gemmini_rvv_opu_firesim/zephyr/zephyr.elf"
+        if elf_src.is_file():
+            elf_dst = cand_dir / "zephyr.elf"
+            try:
+                shutil.copy2(elf_src, elf_dst)
+                entry["elf"] = str(elf_dst)
+            except OSError as e:
+                entry["elf_copy_error"] = str(e)
 
     uartlog = _find_uartlog(stdout_log, started_at)
     if uartlog and uartlog.is_file():
