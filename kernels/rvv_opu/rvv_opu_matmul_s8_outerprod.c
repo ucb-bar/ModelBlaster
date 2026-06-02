@@ -38,6 +38,10 @@
 #include <stdint.h>
 #include <math.h>
 #include <riscv_vector.h>
+/* Keep the m0..m3 / v0..v31 register-name #defines alive past the header
+ * so the OPU macros below can use `m1` / `v0` etc. as their
+ * architectural-register-name arguments. */
+#define SATURN_OPU_KEEP_REGISTER_MACROS
 #include "saturn_opu.h"
 
 /* Tile bounds. mlmax = VLEN/8 at runtime; we cap at OPU_MAX_TILE=64

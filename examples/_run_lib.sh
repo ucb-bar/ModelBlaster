@@ -140,6 +140,19 @@ python -m modelblaster.pipeline.generate_skeleton \
 _mb_stage_end generate_skeleton
 
 echo "[3/5] generate_kernels (backend=${BACKEND} target=${GEN_TARGET} quant=${QUANT} optimize=${OPTIMIZE}) -> ${GEN_DIR}"
+# Make BACKEND=llm runs visible to benchmarks/tools/cost_monitor.py (mb-cost).
+# Without these env exports, the Bedrock/Gemini clients run with log_path=None
+# and the calls bypass benchmarks/results/*/llm_calls.jsonl entirely — mb-cost
+# can't see them and budget tracking drifts. Pin the per-example log under
+# benchmarks/results/<MODEL>_<TARGET>_<QUANT>/<UTC>/ so cost_monitor's glob
+# picks it up on the next refresh.
+if [[ "${BACKEND}" == "llm" && -z "${BEDROCK_CALLS_LOG:-}${GEMINI_CALLS_LOG:-}" ]]; then
+    _MB_LLM_RUN_DIR="${REPO_ROOT}/benchmarks/results/${MODEL_NAME}_${TARGET}_${QUANT}/$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+    mkdir -p "${_MB_LLM_RUN_DIR}"
+    export BEDROCK_CALLS_LOG="${_MB_LLM_RUN_DIR}/llm_calls.jsonl"
+    export GEMINI_CALLS_LOG="${_MB_LLM_RUN_DIR}/llm_calls.jsonl"
+    echo "  BEDROCK_CALLS_LOG=${BEDROCK_CALLS_LOG}"
+fi
 GEN_KERNELS_ARGS=(
     --ir "${IR_DIR}/graph.json"
     --out-dir "${GEN_DIR}"
