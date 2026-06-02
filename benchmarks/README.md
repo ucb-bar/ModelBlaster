@@ -139,6 +139,20 @@ rather than mid-`west build` with `command not found`.
 
 ## Reproducing a baseline
 
+**Prereq.** Any backend that uses V (rvv, rvv_opu) requires
+`zephyr-chipyard-sw` at `ae5d736+` so that
+`arch/riscv/core/v.c` has Dima's `HAS_V()` runtime misa probe (per-hart
+gate that lets the boot hart skip V save/restore when V isn't present).
+Without it, eager-V context-switch traps on hart 0. Update with:
+
+```bash
+cd /scratch2/agustin/zephyr-chipyard-sw   # or wherever ZEPHYR_BASE/../.. lives
+git pull origin dev && git submodule update --init --recursive
+```
+
+`scripts/check_benchmark_env.sh` asserts both the file presence and the
+`HAS_V` macro; an old checkout fails fast there.
+
 `benchmarks/reports/` ships only a curated subset — the aggregate
 rollup (`aggregate-baseline-2026-05-27/`) plus two tutorial bundles
 (`demo-arm-{a,b}-mlp/`). The aggregate's `dashboard.csv` carries every
