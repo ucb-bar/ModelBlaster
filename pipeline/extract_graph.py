@@ -617,27 +617,69 @@ def extract_int8(
     # Default: single-output. The output handler may overwrite this.
     output_names_multi: Optional[list[str]] = None
 
-    # Two-pass walk: first collect linear→relu and conv2d→relu fusions so the
-    # relu node is absorbed into the producer's op kind.
+    # Two-pass walk: first collect linear→relu, conv2d→relu, add→relu, and
+    # batchnorm2d→relu fusions so the relu node is absorbed into the
+    # producer's op kind. Split by producer type so the passes_applied.json
+    # artifact can credit each fusion pattern separately -- that distinction
+    # matters when evaluating which pattern is paying off on which workload.
     nodes = list(gm.graph.nodes)
-    fused_relu_after: set[str] = set()  # names of relu nodes that get fused
+    fused_linear_relu: set[str] = set()
+    fused_conv2d_relu: set[str] = set()
+    fused_add_relu: set[str] = set()
+    # bn→relu fuse: dronet's pre-activation residual blocks
+    # (BN → ReLU → Conv) leave the BN's output feeding a standalone ReLU
+    # kernel call. Folding the ReLU into the BN's emit (activation_min=0
+    # on the existing batchnorm2d_s8 op) removes one full N×C×H×W pass
+    # over the activation tensor per BN — a noticeable win on dronet
+    # where 6 such pairs exist.
+    fused_bn_relu: set[str] = set()
+    # conv→silu fuse for the int8 path (mirror of the fp32 detector).
+    # Absorbs the standalone silu_s8 dispatch into the producer conv,
+    # emitted as a new op_kind 'conv2d_silu_s8' so the kernel picker
+    # can offer a specialized fused variant.
+    fused_conv2d_silu: set[str] = set()
     for i, node in enumerate(nodes):
         if i + 1 >= len(nodes):
             continue
         nxt = nodes[i + 1]
-        is_fusable_producer = node.op == "call_module" and isinstance(
-            gm.get_submodule(node.target),
-            (torch.nn.Linear, torch.nn.Conv2d),
-        )
         is_next_relu = (
             (nxt.op == "call_module"
              and isinstance(gm.get_submodule(nxt.target), torch.nn.ReLU))
             or (nxt.op == "call_function" and nxt.target in (
                 torch.relu, torch.nn.functional.relu))
         )
-        if is_fusable_producer and is_next_relu and len(nxt.args) == 1 \
-                and nxt.args[0] is node:
-            fused_relu_after.add(nxt.name)
+        is_next_silu = (
+            (nxt.op == "call_module"
+             and isinstance(gm.get_submodule(nxt.target), torch.nn.SiLU))
+            or (nxt.op == "call_function" and nxt.target in (
+                torch.nn.functional.silu,))
+        )
+        if not ((is_next_relu or is_next_silu)
+                and len(nxt.args) == 1 and nxt.args[0] is node):
+            continue
+        if node.op == "call_module":
+            producer_mod = gm.get_submodule(node.target)
+            if is_next_silu:
+                # Only Conv2d→SiLU is currently considered for absorption
+                # (yolov8 backbone pattern). Other (BN→SiLU, etc.) fall
+                # through without modifying the relu-fold sets.
+                if isinstance(producer_mod, torch.nn.Conv2d):
+                    fused_conv2d_silu.add(nxt.name)
+            elif isinstance(producer_mod, torch.nn.Linear):
+                fused_linear_relu.add(nxt.name)
+            elif isinstance(producer_mod, torch.nn.Conv2d):
+                fused_conv2d_relu.add(nxt.name)
+            elif isinstance(producer_mod, torch.nn.BatchNorm2d):
+                fused_bn_relu.add(nxt.name)
+        elif node.op == "call_function":
+            t = node.target
+            tname = getattr(t, "__name__", "")
+            if (tname == "add" or t is torch.add
+                    or t is __import__("operator").add):
+                fused_add_relu.add(nxt.name)
+    fused_relu_after: set[str] = (
+        fused_linear_relu | fused_conv2d_relu | fused_add_relu | fused_bn_relu
+    )
 
     # Nodes to skip during the main walk (e.g. getitem consumers of chunk).
     _skip_nodes: set = set()
@@ -760,6 +802,15 @@ def extract_int8(
                 next_node = nodes[nodes.index(node) + 1] if nodes.index(node) + 1 < len(nodes) else None
                 fuse_relu = (next_node is not None
                              and next_node.name in fused_relu_after)
+                # NOTE: Conv→SiLU fusion is DETECTED above (fused_conv2d_silu)
+                # and the KernelSpec CONV2D_SILU_S8 is registered, but the IR
+                # emit below keeps the conv as standalone conv2d_s8 because
+                # threading the fused output name through the activation
+                # calibration cache (line ~1272: activations[in_name]) needs
+                # more invasive surgery (we'd have to re-key intermediate
+                # tensors that named the BN/SiLU output, which dronet and
+                # other models still consume). Left as a follow-up — until
+                # then conv2d_silu_s8 is wire-ready but unused in production.
                 act_min = 0 if fuse_relu else -128
                 act_max = 127
                 in_shape = tensors_meta[in_name]["shape"]
@@ -864,21 +915,37 @@ def extract_int8(
                 weights_blob[b_key] = bn_bias
                 in_shape = tensors_meta[in_name]["shape"]
                 N_, C, H, W = (int(s) for s in in_shape)
+                # Same fuse-with-following-relu pattern as conv2d_s8: if the
+                # next FX node is a ReLU and was captured in the fusion
+                # scan, clamp at 0 on the batchnorm op and route the output
+                # tensor name to the ReLU's name. The separate ReLU kernel
+                # call then becomes a no-op (its emit branch sees the alias
+                # already exists and skips).
+                next_node = (nodes[nodes.index(node) + 1]
+                             if nodes.index(node) + 1 < len(nodes) else None)
+                fuse_relu = (next_node is not None
+                             and next_node.name in fused_relu_after
+                             and next_node.name in fused_bn_relu)
+                act_min = 0 if fuse_relu else -128
                 ops.append({
                     "name": str(node.target),
                     "op": "batchnorm2d_s8",
                     "inputs": [in_name],
-                    "outputs": [node.name],
+                    "outputs": [
+                        next_node.name if fuse_relu else node.name
+                    ],
                     "weight": s_key,
                     "bias": b_key,
                     "shape": {"N": N_, "C": C, "H": H, "W": W},
                     "quant": {
                         "scale_in":   scales[in_name],
                         "scale_out":  scales[node.name],
-                        "activation_min": -128,
+                        "activation_min": act_min,
                         "activation_max": 127,
                     },
                 })
+                if fuse_relu and next_node.name not in tensors_meta:
+                    tensors_meta[next_node.name] = dict(tensors_meta[node.name])
 
             elif isinstance(mod, torch.nn.Sigmoid):
                 _record(node.name, dtype="i8")
@@ -898,6 +965,10 @@ def extract_int8(
                 })
 
             elif isinstance(mod, torch.nn.SiLU):
+                # Fusion detection runs above (fused_conv2d_silu) and the
+                # CONV2D_SILU_S8 spec is registered for future use; for now
+                # we still emit the standalone silu_s8 dispatch (see comment
+                # at the conv2d emit site).
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[in_name]["shape"]))
                 ops.append({
@@ -911,6 +982,24 @@ def extract_int8(
                         "scale_out": scales[node.name],
                         "activation_min": -128,
                         "activation_max": 127,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.ELU):
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "elu_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in":  scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128,
+                        "activation_max": 127,
+                        "alpha": float(mod.alpha),
                     },
                 })
 
@@ -983,20 +1072,35 @@ def extract_int8(
                 b_name = node.args[1].name
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[a_name]["shape"]))
+                # add→relu fusion: clamp at 0 instead of -128 and alias the
+                # relu's output name to this add's buffer (mirrors the
+                # linear/conv2d fusion logic above).
+                next_node = (nodes[nodes.index(node) + 1]
+                             if nodes.index(node) + 1 < len(nodes) else None)
+                fuse_relu = (next_node is not None
+                             and next_node.name in fused_add_relu)
+                act_min = 0 if fuse_relu else -128
+                if fuse_relu:
+                    _skip_nodes.add(next_node)
                 ops.append({
                     "name": node.name,
                     "op": "add_s8",
                     "inputs": [a_name, b_name],
-                    "outputs": [node.name],
+                    "outputs": [
+                        next_node.name if fuse_relu else node.name
+                    ],
                     "shape": {"n": n},
                     "quant": {
                         "scale_a":   scales[a_name],
                         "scale_b":   scales[b_name],
                         "scale_out": scales[node.name],
-                        "activation_min": -128,
+                        "activation_min": act_min,
                         "activation_max": 127,
                     },
                 })
+                if fuse_relu and next_node.name not in tensors_meta:
+                    tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                    scales[next_node.name] = scales[node.name]
             elif target is torch.cat or tname == "cat":
                 tensors_arg = node.args[0]
                 if not isinstance(tensors_arg, (list, tuple)):
@@ -1287,6 +1391,14 @@ def extract_int8(
             v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "elu_s8":
+            q = op["quant"]
+            fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            alpha = np.float32(q.get("alpha", 1.0))
+            elu_out = np.where(fv > 0, fv, alpha * (np.exp(fv) - np.float32(1.0))).astype(np.float32)
+            v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
+            v = np.clip(v, q["activation_min"], q["activation_max"])
+            activations[out_name] = v.astype(np.int8)
         elif op["op"] == "upsample_nearest_s8":
             sh = op["shape"]
             scale = sh["scale"]
@@ -1330,13 +1442,49 @@ def extract_int8(
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
     io_path = os.path.join(out_dir, "io.npz")
+    passes_path = os.path.join(out_dir, "passes_applied.json")
     with open(ir_path, "w") as f:
         json.dump(ir, f, indent=2)
     np.savez(weights_path, **weights_blob)
     np.savez(io_path, input=inp_q, output=out_q)
+    # passes_applied.json records each fusion / fold pass that fired
+    # during this IR extraction plus the IR-side op counts that
+    # downstream tooling uses to answer "did my new fusion pattern
+    # actually run?" without grepping stdout.
+    passes_log = {
+        "schema_version": 1,
+        "extractor": "extract_graph",
+        "n_fx_nodes": len(nodes),
+        "n_ir_ops": len(ir["ops"]),
+        "passes": {
+            "linear_relu_fuse": {
+                "fired": len(fused_linear_relu),
+                "sites": sorted(fused_linear_relu),
+            },
+            "conv2d_relu_fuse": {
+                "fired": len(fused_conv2d_relu),
+                "sites": sorted(fused_conv2d_relu),
+            },
+            "add_relu_fuse": {
+                "fired": len(fused_add_relu),
+                "sites": sorted(fused_add_relu),
+            },
+            "bn_relu_fuse": {
+                "fired": len(fused_bn_relu),
+                "sites": sorted(fused_bn_relu),
+            },
+        },
+    }
+    with open(passes_path, "w") as f:
+        json.dump(passes_log, f, indent=2)
     print(f"wrote {ir_path}")
     print(f"wrote {weights_path}  ({len(weights_blob)} tensors)")
     print(f"wrote {io_path}  (input dtype={inp_q.dtype}, output dtype={out_q.dtype})")
+    print(f"wrote {passes_path}  ("
+          f"linear_relu_fuse={len(fused_linear_relu)}, "
+          f"conv2d_relu_fuse={len(fused_conv2d_relu)}, "
+          f"add_relu_fuse={len(fused_add_relu)}, "
+          f"bn_relu_fuse={len(fused_bn_relu)})")
     return ir
 
 
@@ -2433,7 +2581,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano"])
+                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2468,6 +2616,8 @@ def main() -> None:
         from modelblaster.models import mobilenet_v2 as model_mod
     elif args.model == "yolov8_nano":
         from modelblaster.models import yolov8_nano as model_mod
+    elif args.model == "yolov8_nano_64":
+        from modelblaster.models import yolov8_nano_64 as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()
@@ -2476,7 +2626,7 @@ def main() -> None:
     calibration_samples = None
     if args.quant == "int8" and args.num_calibration > 1:
         if hasattr(model_mod, "get_calibration_spec"):
-            from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
+            from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             spec = model_mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_graph] resolving calibration spec "
                   f"({args.num_calibration} samples) ...", flush=True)

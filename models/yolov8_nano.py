@@ -492,7 +492,7 @@ def get_calibration_samples(n: int = 16) -> list[tuple[torch.Tensor, ...]]:
     """Back-compat wrapper around ``get_calibration_spec``: walks the
     spec and returns a list of single-input tuples. Used by some old
     callers; the walker prefers ``get_calibration_spec`` directly."""
-    from modelblaster.datasets.base import materialize_calibration_samples
+    from modelblaster.mb_datasets.base import materialize_calibration_samples
     spec = get_calibration_spec(n)
     raw = materialize_calibration_samples(spec)
     return [(item["x"],) for item in raw]

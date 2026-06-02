@@ -1,0 +1,25 @@
+# qrb-pair config: gemmini + rvv (plain RVV) on the same OPU bitstream.
+# Matches the kernel pair Dima used for the qrb5165 image (rvv +
+# gemmini_q31 effective behavior — gemmini's im2col_full_C does software
+# Q0.31 requantize, so it's effectively gemmini_q31 at the kernel level).
+#
+# Drift constraint DROPPED: with both backends doing bit-exact-equivalent
+# Q0.31 requantize, the scheduler can split conv2d_s8/linear_s8 across
+# tiles freely. This is the regime that gives qrb its tight schedule.
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_rvv_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: rvv0,     kind: CPU_E, hart: 1 }
+# No requantize_ops: conv2d_s8 / linear_s8 can run on either tile.
+networks:
+  - { name: yolov8_nano_64, quant: int8, instances: 1 }
+  - { name: dronet,         quant: int8, instances: 2 }
+  - { name: mlp_control,    quant: int8, instances: 4 }
+horizon_ms: 75.0
+solver: HEFT
+time_limit_s: 0
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000

@@ -1,0 +1,30 @@
+{
+  "linear_s8": {
+    "baseline": 30180,
+    "best": 17237,
+    "improvement_pct": 42.88601722995361,
+    "history": [
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 1,
+        "parent_cycles": 30180,
+        "result": "ok",
+        "cycles": 17237,
+        "tokens_in": 4600,
+        "tokens_out": 1641
+      },
+      {
+        "iter": 1,
+        "parent_idx": 0,
+        "exp_idx": 2,
+        "parent_cycles": 30180,
+        "result": "duplicate",
+        "tokens_in": 4600,
+        "tokens_out": 1647
+      }
+    ],
+    "firesim_history": [],
+    "firesim_best_cycles": null
+  }
+}

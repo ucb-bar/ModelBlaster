@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-31",
+  "bitstream": "GemminiAndOPUShuttleConfig",
+  "qrb_image_predicted_ms": 75.71,
+  "rows": [
+    {
+      "label": "MOSEK PACKED no-yolo",
+      "mix": "2d+4m",
+      "schedule_kind": "packed",
+      "solver": "MOSEK",
+      "n_dispatches": 88,
+      "solver_status": "optimal",
+      "solve_wall_s": 72.79524755477905,
+      "deadline_misses": 0,
+      "predicted_ms": 25.29741799999801,
+      "predicted_vs_qrb": 0.3341357548540221,
+      "actual": {
+        "n_reps": 3,
+        "actual_ms_min": 25.243,
+        "actual_ms_med": 25.243,
+        "actual_ms_max": 25.243,
+        "delta_pct_med": -0.21511286249852302,
+        "verify": "PASS",
+        "per_rep": [
+          {
+            "run": "20260530T004852Z",
+            "actual_ms": 25.243,
+            "verify": "PASS",
+            "n_dispatches": 88
+          },
+          {
+            "run": "20260530T015242Z_rep2",
+            "actual_ms": 25.243,
+            "verify": "PASS",
+            "n_dispatches": 88
+          },
+          {
+            "run": "20260530T020103Z_rep3",
+            "actual_ms": 25.243,
+            "verify": "PASS",
+            "n_dispatches": 88
+          }
+        ]
+      },
+      "fixture_path": "/scratch2/agustin/ModelBlaster/schedule_fixtures/3way_mosek_dronet2_mlp4.json",
+      "results_dir": "3way_mosek_dronet2_mlp4"
+    },
+    {
+      "label": "HEFT  PACKED no-yolo",
+      "mix": "2d+4m",
+      "schedule_kind": "packed",
+      "solver": "HEFT",
+      "n_dispatches": 88,
+      "solver_status": "?",
+      "solve_wall_s": 0.007179975509643555,
+      "deadline_misses": 0,
+      "predicted_ms": 29.20625599999997,
+      "predicted_vs_qrb": 0.3857648395192177,
+      "actual": null,
+      "fixture_path": "/scratch2/agustin/ModelBlaster/schedule_fixtures/3way_heft_dronet2_mlp4.json",
+      "results_dir": "3way_heft_dronet2_mlp4"
+    },
+    {
+      "label": "HEFT  PACKED qrb_y64",
+      "mix": "1y64+2d+4m",
+      "schedule_kind": "packed",
+      "solver": "HEFT",
+      "n_dispatches": 300,
+      "solver_status": "?",
+      "solve_wall_s": 0.01750040054321289,
+      "deadline_misses": 0,
+      "predicted_ms": 84.15098500000015,
+      "predicted_vs_qrb": 1.111491018359532,
+      "actual": {
+        "n_reps": 2,
+        "actual_ms_min": 84.093,
+        "actual_ms_med": 84.093,
+        "actual_ms_max": 84.093,
+        "delta_pct_med": -0.06890590763749727,
+        "verify": "FAIL",
+        "per_rep": [
+          {
+            "run": "20260530T023348Z",
+            "actual_ms": 84.093,
+            "verify": "FAIL",
+            "n_dispatches": 300
+          },
+          {
+            "run": "20260531T182603Z",
+            "actual_ms": 84.093,
+            "verify": "FAIL",
+            "n_dispatches": 300
+          }
+        ]
+      },
+      "fixture_path": "/scratch2/agustin/ModelBlaster/schedule_fixtures/3way_heft_qrb_y64.json",
+      "results_dir": "3way_heft_qrb_y64"
+    },
+    {
+      "label": "PEFT  PACKED qrb_y64",
+      "mix": "1y64+2d+4m",
+      "schedule_kind": "packed",
+      "solver": "peft",
+      "n_dispatches": 300,
+      "solver_status": "?",
+      "solve_wall_s": 0.017088651657104492,
+      "deadline_misses": 0,
+      "predicted_ms": 84.00773500000007,
+      "predicted_vs_qrb": 1.1095989301281215,
+      "actual": null,
+      "fixture_path": "/scratch2/agustin/ModelBlaster/schedule_fixtures/3way_peft_qrb_y64.json",
+      "results_dir": "3way_peft_qrb_y64"
+    },
+    {
+      "label": "MOSEK PERIODIC no-yolo",
+      "mix": "2d+4m@27+53Hz",
+      "schedule_kind": "periodic",
+      "solver": "MOSEK",
+      "n_dispatches": 88,
+      "solver_status": "optimal",
+      "solve_wall_s": 5.7891082763671875,
+      "deadline_misses": 0,
+      "predicted_ms": 56.856074,
+      "predicted_vs_qrb": 0.7509717870822877,
+      "actual": null,
+      "fixture_path": "/scratch2/agustin/ModelBlaster/schedule_fixtures/3way_mosek_dronet2_mlp4_periodic.json",
+      "results_dir": "3way_mosek_dronet2_mlp4_periodic"
+    },
+    {
+      "label": "Partition PERIODIC no-yolo",
+      "mix": "2d+4m@27+53Hz",
+      "schedule_kind": "periodic",
+      "solver": "periodic_partition_heft",
+      "n_dispatches": 88,
+      "solver_status": "?",
+      "solve_wall_s": null,
+      "deadline_misses": 0,
+      "predicted_ms": 56.796074,
+      "predicted_vs_qrb": 0.7501792893937393,
+      "actual": {
+        "n_reps": 3,
+        "actual_ms_min": 56.793,
+        "actual_ms_med": 56.793,
+        "actual_ms_max": 56.793,
+        "delta_pct_med": -0.005412345930808568,
+        "verify": "PASS",
+        "per_rep": [
+          {
+            "run": "20260531T103809Z",
+            "actual_ms": 56.793,
+            "verify": "PASS",
+            "n_dispatches": 88
+          },
+          {
+            "run": "20260531T210849Z_rep2",
+            "actual_ms": 56.793,
+            "verify": "PASS",
+            "n_dispatches": 88
+          },
+          {
+            "run": "20260531T211621Z_rep3",
+            "actual_ms": 56.793,
+            "verify": "PASS",
+            "n_dispatches": 88
+          }
+        ]
+      },
+      "fixture_path": "/scratch2/agustin/ModelBlaster/schedule_fixtures/3way_partitioned_dronet2_mlp4.json",
+      "results_dir": "3way_partitioned_dronet2_mlp4"
+    },
+    {
+      "label": "Partition PERIODIC qrb_y64",
+      "mix": "1y+2d+4m@13+27+53Hz",
+      "schedule_kind": "periodic",
+      "solver": "periodic_partition_heft",
+      "n_dispatches": 300,
+      "solver_status": "?",
+      "solve_wall_s": null,
+      "deadline_misses": 5,
+      "predicted_ms": 99.38486400000009,
+      "predicted_vs_qrb": 1.3127045832783002,
+      "actual": null,
+      "fixture_path": "/scratch2/agustin/ModelBlaster/schedule_fixtures/3way_partitioned_qrb_y64.json",
+      "results_dir": "3way_partitioned_qrb_y64"
+    }
+  ],
+  "notes": {
+    "yolov8_critical_path_ms": 55.77,
+    "yolov8_critical_path_note": "yolov8_nano_64 sequential critical path \u2014 absolute floor for any schedule containing 1 yolov8",
+    "ideal_parallel_floor_ms_1y_2d_4m": 53.2,
+    "curated_kernel_verify_gate_status": "blocked: west subprocess loses PATH; curated rvv_opu kernels fall back to scalar reference at runtime",
+    "operator_fusion_status": "Conv+SiLU detection wired in extract_int8 + CONV2D_SILU_S8 KernelSpec registered, but doesn't fire on yolov8 which has Conv\u2192BN\u2192SiLU (3 separate ops). Needs Conv+BN+SiLU 3-fold."
+  }
+}

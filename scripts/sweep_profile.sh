@@ -74,7 +74,7 @@ for backend in "${BACKEND_LIST[@]}"; do
         PROFILE_CPU="${PROFILE_CPU:-${PROFILE_SOURCE:-spike}}" \
         PROFILE_CORES="${cores}" \
         PROFILE_CLOCK_MHZ="${PROFILE_CLOCK_MHZ:-1000.0}" \
-            bash "${REPO_ROOT}/modelblaster/examples/multi_demo/run.sh"
+            bash "${REPO_ROOT}/examples/multi_demo/run.sh"
     done
 done
 

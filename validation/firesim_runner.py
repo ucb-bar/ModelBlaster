@@ -51,16 +51,90 @@ DEFAULT_FIRESIM_ENV = os.environ.get(
     "FIRESIM_ENV", "/scratch2/dima/chipyard-fsim/env.sh")
 DEFAULT_FIRESIM_SLOT = os.environ.get(
     "FIRESIM_SLOT", "firesim_rundir/sim_slot_0")
-DEFAULT_FIRESIM_BINARY_BASENAME = "zephyr0-zephyr.elf"
+# config_runtime.yaml's recipe_arg_overrides::default_simulation_dir
+# decides where the simulator actually runs (it copies the staged binary
+# into <default_simulation_dir>/sim_slot_<N>/, writes uartlog there, etc.).
+# When unset / commented out, it defaults to firesim_rundir/sim_slot_<N>
+# under the firesim install. On this host it's overridden to
+# /scratch2/agustin/FIRESIM_RUNS_DIR. We read it dynamically rather than
+# hard-coding so the integration follows whatever the user has wired up.
+DEFAULT_FIRESIM_SIM_DIR_ENV = "FIRESIM_SIM_DIR"
+
+
+def _resolve_sim_dir(firesim_root: str) -> str:
+    """Read `default_simulation_dir` from config_runtime.yaml; fall
+    back to the legacy `<firesim_root>/firesim_rundir/` when unset."""
+    env_override = os.environ.get(DEFAULT_FIRESIM_SIM_DIR_ENV)
+    if env_override:
+        return env_override
+    config_path = os.path.join(firesim_root, "deploy", "config_runtime.yaml")
+    if os.path.exists(config_path):
+        try:
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f)
+            sim_dir = (cfg.get("run_farm", {})
+                          .get("recipe_arg_overrides", {})
+                          .get("default_simulation_dir"))
+            if sim_dir:
+                return sim_dir
+        except Exception:
+            pass
+    return os.path.join(firesim_root, "firesim_rundir")
+# FireSim's runworkload stages the workload's `common_bootbinary` into
+# the sim_slot prefixed with `<workload_name><N>-`, where N is the
+# node index (0 for single-node sims). The TSI bridge in the
+# simulator binary then looks for the prefixed name in its cwd
+# (sim_slot dir). Our staged workload is `modelblaster-firesim.json`
+# with `common_bootbinary: zephyr0-zephyr.elf`; the runtime expects
+# `modelblaster-firesim0-zephyr0-zephyr.elf` to land in sim_slot_0.
+DEFAULT_FIRESIM_WORKLOAD_NAME = os.environ.get(
+    "FIRESIM_WORKLOAD_NAME", "modelblaster-firesim")
+DEFAULT_FIRESIM_BOOTBINARY = "zephyr0-zephyr.elf"
+DEFAULT_FIRESIM_BINARY_BASENAME = (
+    f"{DEFAULT_FIRESIM_WORKLOAD_NAME}0-{DEFAULT_FIRESIM_BOOTBINARY}")
 
 
 def _firesim_paths(root: str, slot: str) -> dict:
-    sim_slot = os.path.join(root, slot)
+    """Return all paths the runner cares about.
+
+    `root` is the firesim install root (e.g.
+    `/scratch2/agustin/chipyard/sims/firesim`). `slot` is the trailing
+    sim_slot path relative to the actual simulation dir
+    (which comes from config_runtime.yaml::default_simulation_dir).
+
+    Three distinct file locations the runner touches:
+      - `workload_bootbinary`: deploy/workloads/<workload>/<bootbinary>.
+        `firesim infrasetup` rsyncs from here. WE WRITE OUR ELF HERE.
+      - `sim_slot`: <default_simulation_dir>/sim_slot_<N>/. The simulator
+        runs here, writes uartlog here, and infrasetup stages a copy of
+        the bootbinary here (prefixed with <workload><N>-).
+      - `legacy_sim_slot`: firesim_rundir/sim_slot_<N>/. Old default,
+        kept for compatibility with workflows that don't override
+        default_simulation_dir.
+    """
+    # Strip the leading firesim_rundir/ if the slot was set against the
+    # legacy default; the real simulation dir provides the prefix.
+    sub_slot = slot
+    if sub_slot.startswith("firesim_rundir/"):
+        sub_slot = sub_slot[len("firesim_rundir/"):]
+    real_sim_dir = _resolve_sim_dir(root)
+    sim_slot = os.path.join(real_sim_dir, sub_slot)
+    # Also expose the legacy path so logs / older overrides still resolve.
+    legacy_sim_slot = os.path.join(root, "firesim_rundir", sub_slot)
     return {
         "root": root,
         "sim_slot": sim_slot,
+        "legacy_sim_slot": legacy_sim_slot,
+        # The live uartlog the simulator writes to during runworkload.
         "uartlog": os.path.join(sim_slot, "uartlog"),
+        # Where the simulator's TSI loader looks at runtime.
         "elf_target": os.path.join(sim_slot, DEFAULT_FIRESIM_BINARY_BASENAME),
+        # The canonical source path infrasetup reads.
+        "workload_bootbinary": os.path.join(
+            root, "deploy", "workloads",
+            DEFAULT_FIRESIM_WORKLOAD_NAME,
+            DEFAULT_FIRESIM_BOOTBINARY),
     }
 
 
@@ -95,16 +169,30 @@ def _firesim_cmd(firesim_env: str, firesim_root: str, sub_cmd: str) -> list[str]
 
 
 def _stage_elf(elf: str, paths: dict) -> None:
-    """Copy the built elf over the staged binary in the sim slot.
-    `firesim infrasetup` does this from deploy/workloads/zephyr/
-    zephyr.elf, but a cp lets us skip the slow re-flash when only the
-    binary changed."""
+    """Copy the built elf over BOTH staging locations FireSim uses:
+
+    - ``deploy/workloads/<workload>/<bootbinary>`` is what
+      ``firesim infrasetup`` reads when populating the run-farm node's
+      filesystem (the "canonical" source path).
+    - ``firesim_rundir/<slot>/<workload><N>-<bootbinary>`` is what the
+      TSI loader inside the simulator binary opens at boot. Without
+      this, infrasetup re-creates the prefixed file from the canonical
+      source -- a no-op when the source hasn't changed -- so a direct
+      cp lets us skip slow re-flashes on iteration.
+    """
     if not os.path.isfile(elf):
         raise FileNotFoundError(f"--elf {elf} not found")
+    # Sim-slot path (TSI loader's view).
     target = paths["elf_target"]
     os.makedirs(paths["sim_slot"], exist_ok=True)
     shutil.copyfile(elf, target)
     os.chmod(target, 0o755)
+    # Workload-bundle path (infrasetup's source-of-truth).
+    workload_dest = paths.get("workload_bootbinary")
+    if workload_dest:
+        os.makedirs(os.path.dirname(workload_dest), exist_ok=True)
+        shutil.copyfile(elf, workload_dest)
+        os.chmod(workload_dest, 0o755)
 
 
 def _truncate_uartlog(paths: dict) -> None:
@@ -147,19 +235,140 @@ def _firesim_infrasetup(firesim_env: str, firesim_root: str,
               flush=True)
 
 
+FIRESIM_QUEUE_BIN = os.environ.get(
+    "FIRESIM_QUEUE_BIN",
+    "/scratch2/agustin/firesim_queue/bin/firesim-queue")
+
+
+def _use_firesim_queue() -> bool:
+    """Whether to route runworkload through the shared FPGA queue.
+
+    Checked at every call (not memoized) so a test can flip
+    FIRESIM_QUEUE on/off without restarting the runner. The
+    queue is only enabled when BOTH the env var is set AND the
+    queue binary exists -- if the queue install moves, ModelBlaster
+    falls back to direct invocation rather than hanging.
+    """
+    return (os.environ.get("FIRESIM_QUEUE", "0") == "1"
+            and os.path.exists(FIRESIM_QUEUE_BIN))
+
+
 def _firesim_run_async(firesim_env: str, firesim_root: str,
-                       log_path: str) -> subprocess.Popen:
-    """Spawn `firesim runworkload` and return the Popen handle. We do
-    NOT wait on it from this side; the run is treated as done when the
-    expected OUTPUT_END markers appear in the uartlog. firesim's own
-    stdout/stderr go to `log_path` so we can diagnose silent failures
-    (e.g. screen session not starting). The actual UART output lives
-    in firesim_rundir/sim_slot_0/uartlog regardless."""
+                       log_path: str,
+                       elf: Optional[str] = None) -> subprocess.Popen:
+    """Spawn `firesim runworkload` and return the Popen handle.
+
+    Two paths:
+
+    QUEUE (FIRESIM_QUEUE=1, queue binary present):
+        Submit one `firesim-queue runworkload-full` job and block. The
+        daemon owns kill → infrasetup → runworkload → kill atomically
+        under the FPGA flock, writes a per-job config_runtime.yaml
+        (so concurrent users don't race on the shared YAML), and uses
+        `suffix_tag=q<job_id>` so the results-workload directory is
+        deterministically named after our job. We pass `--stage-from`
+        so the daemon copies the ELF into place under the same lock
+        as infrasetup (no caller-side staging race either).
+
+        By the time Popen returns we know:
+          - The full lifecycle ran exactly once.
+          - The per-run uartlog is at:
+            deploy/results-workload/<launch_time>-<workload>-q<job_id>/
+                <workload>0/uartlog
+            and we locate it via _latest_results_uartlog (which we now
+            filter by the unique q<job_id> suffix, not just mtime).
+
+    NO-QUEUE (default):
+        Plain `firesim runworkload`. Caller is responsible for kill +
+        infrasetup. Subject to all the races the queue path fixes;
+        intended for single-user dev environments only.
+    """
     log_f = open(log_path, "w")
+    if _use_firesim_queue():
+        priority = os.environ.get("FIRESIM_QUEUE_PRIORITY", "5")
+        # Timeout is opt-in: by default we let the workload run to
+        # natural completion. Pass FIRESIM_QUEUE_TIMEOUT=<seconds> to
+        # bound it (e.g. for smoke tests where you'd rather lose the
+        # run than hold the FPGA past N seconds).
+        timeout = os.environ.get("FIRESIM_QUEUE_TIMEOUT")
+        # chipyard root = parent-of-parent of firesim_root.
+        # (firesim_root = <chipyard>/sims/firesim)
+        chipyard = os.path.dirname(os.path.dirname(firesim_root))
+        argv = [
+            FIRESIM_QUEUE_BIN, "runworkload-full",
+            "--chipyard", chipyard,
+            "--workload", DEFAULT_FIRESIM_WORKLOAD_NAME,
+            "--bootbinary", DEFAULT_FIRESIM_BOOTBINARY,
+            "--priority", str(priority),
+            "--project", "modelblaster",
+        ]
+        if timeout:
+            argv += ["--timeout", str(timeout)]
+        if elf:
+            argv += ["--stage-from", elf]
+        return subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT)
+    # No-queue path: just runworkload (caller does infrasetup + kill).
     return subprocess.Popen(
         _firesim_cmd(firesim_env, firesim_root, "runworkload"),
         stdout=log_f, stderr=subprocess.STDOUT,
     )
+
+
+def _latest_results_uartlog(firesim_root: str, workload_name: str,
+                            since_mtime: float,
+                            suffix_tag: Optional[str] = None) -> Optional[str]:
+    """Find the per-run uartlog from the most recent
+    `deploy/results-workload/<timestamp>-<workload>[-<suffix>]/`.
+
+    Two filter modes:
+      - suffix_tag given: require the directory name to end with
+        `-<suffix_tag>`. This is the load-bearing path under
+        FIRESIM_QUEUE=1, where the daemon sets a unique suffix_tag
+        per job (q<job_id>) — exact match, no race.
+      - suffix_tag None: fall back to mtime-based selection (newest
+        directory containing workload_name whose mtime is at or after
+        since_mtime). Used in the no-queue path where we have nothing
+        better to disambiguate by.
+    """
+    results_root = os.path.join(firesim_root, "deploy", "results-workload")
+    if not os.path.isdir(results_root):
+        return None
+    candidates = []
+    for name in os.listdir(results_root):
+        if workload_name not in name:
+            continue
+        if suffix_tag is not None and not name.endswith(f"-{suffix_tag}"):
+            continue
+        full = os.path.join(results_root, name)
+        try:
+            mt = os.path.getmtime(full)
+        except OSError:
+            continue
+        if mt < since_mtime:
+            continue
+        candidates.append((mt, full))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    newest = candidates[0][1]
+    uart = os.path.join(newest, f"{workload_name}0", "uartlog")
+    return uart if os.path.exists(uart) else None
+
+
+_JOB_ID_RE = re.compile(r"job_id=(\d+)\s+kind=runworkload-full")
+
+
+def _parse_queue_job_id(log_path: str) -> Optional[int]:
+    """Scan the queue-submit log for the job_id line emitted by
+    cmd_runworkload_full at submit time. Returns None if not found
+    (e.g. queue was unreachable, log truncated)."""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = _JOB_ID_RE.search(text)
+    return int(m.group(1)) if m else None
 
 
 def _expected_end_count(models: Optional[list[str]],
@@ -201,24 +410,36 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             f"FIRESIM_ROOT not found at {firesim_root}; "
             f"set FIRESIM_ROOT or pass --firesim-root"
         )
-    if kill_first:
-        if verbose:
-            print(f"firesim: kill any prior sim", flush=True)
-        _firesim_kill(firesim_env, firesim_root)
-    # firesim kill causes the xdma kernel module to re-probe, which resets
-    # /dev/xdma* permissions back to root:root 0600. Fix up before runworkload.
-    subprocess.run(["sudo", "chmod", "666"] + [
-        f"/dev/{n}" for n in os.listdir("/dev") if n.startswith("xdma")
-    ], check=False)
-    # Re-run infrasetup so XDMA / FPGA state is freshly configured.  Without
-    # this, runworkload can pick up half-configured XDMA from a previous
-    # aborted sim and crash mid-run with a bus error that's not a Zephyr bug.
-    if os.environ.get("FIRESIM_SKIP_INFRASETUP", "0") != "1":
-        _firesim_infrasetup(firesim_env, firesim_root, verbose=verbose)
-    if stage_elf:
+    # Stage the elf BEFORE any firesim invocation. infrasetup reads
+    # from deploy/workloads/<workload>/<bootbinary> when it runs.
+    # Under FIRESIM_QUEUE=1 the daemon stages atomically (via
+    # --stage-from passed to runworkload-full) so we skip the
+    # caller-side cp -- doing both is harmless but redundant, and
+    # confusing if the user is debugging which copy "won".
+    if stage_elf and not _use_firesim_queue():
         if verbose:
             print(f"firesim: stage {elf} -> {paths['elf_target']}", flush=True)
         _stage_elf(elf, paths)
+    # When FIRESIM_QUEUE=1, the queue submission below does the WHOLE
+    # FPGA block (infrasetup + runworkload + kill) as one job. Skip the
+    # direct kill/infrasetup calls -- they'd race against the queued
+    # block, and the kill would knock over whoever's currently running.
+    # When not using the queue, do them inline as before.
+    if not _use_firesim_queue():
+        if kill_first:
+            if verbose:
+                print(f"firesim: kill any prior sim", flush=True)
+            _firesim_kill(firesim_env, firesim_root)
+        # firesim kill causes the xdma kernel module to re-probe, which resets
+        # /dev/xdma* permissions back to root:root 0600. Fix up before runworkload.
+        subprocess.run(["sudo", "chmod", "666"] + [
+            f"/dev/{n}" for n in os.listdir("/dev") if n.startswith("xdma")
+        ], check=False)
+        # Re-run infrasetup so XDMA / FPGA state is freshly configured.  Without
+        # this, runworkload can pick up half-configured XDMA from a previous
+        # aborted sim and crash mid-run with a bus error that's not a Zephyr bug.
+        if os.environ.get("FIRESIM_SKIP_INFRASETUP", "0") != "1":
+            _firesim_infrasetup(firesim_env, firesim_root, verbose=verbose)
     _truncate_uartlog(paths)
     expected_ends = _expected_end_count(models, pool_sizes)
     if verbose:
@@ -226,9 +447,80 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
               f"MODELBLASTER_WALL_CYCLES marker{'s' if expected_ends>1 else ''})",
               flush=True)
 
-    runworkload_log = os.path.join(paths["sim_slot"],
-                                   "_agents_runworkload.log")
-    proc = _firesim_run_async(firesim_env, firesim_root, runworkload_log)
+    # UNIQUE per-invocation log path. The shared
+    # paths["sim_slot"]/_agents_runworkload.log was racey when multiple
+    # firesim_runner.py processes ran concurrently (arm_a matrix +
+    # arm_b optimize loop, etc.) -- each `open("w")` truncated the
+    # other's still-being-read job_id line, and `_parse_queue_job_id`
+    # returned the wrong suffix tag, causing the uartlog lookup to
+    # miss. A pid+timestamp suffix gives each invocation its own log
+    # file. Tempdir is /tmp to keep this off NFS-shared paths.
+    runworkload_log = os.path.join(
+        "/tmp",
+        f"firesim_runner_qlog_{os.getpid()}_{int(time.time()*1000)}.log")
+    # Record the moment we're about to submit so we can disambiguate
+    # OUR results-workload/<timestamp>-... directory from any older
+    # ones left behind by previous runs (ours or anyone else's).
+    submit_started_at = time.time()
+    proc = _firesim_run_async(firesim_env, firesim_root, runworkload_log,
+                              elf=elf if _use_firesim_queue() else None)
+    # Queue path: submit blocks until our job is done; the live uartlog
+    # is shared with concurrent users, so we MUST read the per-run
+    # copy from deploy/results-workload/ instead. Skip the watcher loop
+    # entirely — by the time proc exits there's nothing to watch for.
+    if _use_firesim_queue():
+        rc = proc.wait()
+        if rc != 0:
+            try:
+                with open(runworkload_log) as f:
+                    rwl_tail = f.read()[-2000:]
+            except FileNotFoundError:
+                rwl_tail = "(no log captured)"
+            raise RuntimeError(
+                f"firesim-queue submit returned rc={rc}.\n"
+                f"--- last 2KB of `firesim-queue submit` log ---\n"
+                f"{rwl_tail}"
+            )
+        # Find our results dir via the deterministic q<job_id> suffix
+        # the queue daemon sets, falling back to mtime if for some
+        # reason we couldn't recover the job_id.
+        job_id = _parse_queue_job_id(runworkload_log)
+        suffix_tag = f"q{job_id}" if job_id is not None else None
+        per_run_uart = _latest_results_uartlog(
+            firesim_root, DEFAULT_FIRESIM_WORKLOAD_NAME,
+            since_mtime=submit_started_at,
+            suffix_tag=suffix_tag,
+        )
+        if per_run_uart is None:
+            raise RuntimeError(
+                f"firesim-queue submit returned rc=0 but no per-run "
+                f"uartlog was found under "
+                f"{os.path.join(firesim_root, 'deploy', 'results-workload')}"
+                + (f" matching suffix '-{suffix_tag}'" if suffix_tag else "")
+                + f" (newer than mtime {submit_started_at}). "
+                f"Has runworkload's results-workload output changed shape?"
+            )
+        if verbose:
+            print(f"firesim: reading per-run uartlog at {per_run_uart}",
+                  flush=True)
+        with open(per_run_uart, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        # Sanity-check that we actually have enough WALL_CYCLES markers.
+        # If not, something raced or the job died mid-block.
+        if wall_cycles_count(text) < expected_ends:
+            raise RuntimeError(
+                f"firesim-queue job exited rc=0 but per-run uartlog "
+                f"only has {wall_cycles_count(text)} WALL_CYCLES markers "
+                f"(expected {expected_ends}). Path: {per_run_uart}"
+            )
+        # Mirror the per-run uartlog into paths["uartlog"] so downstream
+        # consumers that hardcode the slot path still work.
+        try:
+            with open(paths["uartlog"], "w") as fw:
+                fw.write(text)
+        except OSError:
+            pass
+        return text
     deadline = time.monotonic() + timeout
     last_size = 0
     last_progress = time.monotonic()
@@ -338,7 +630,12 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                       flush=True)
             time.sleep(poll_interval)
     finally:
-        _firesim_kill(firesim_env, firesim_root)
+        # When using the queue, the queued bash block already does the
+        # trailing kill itself -- calling it again from here would race
+        # with whoever's NEXT in the queue (we'd kill THEIR runworkload).
+        # The proc.wait below still cleans up our local Popen handle.
+        if not _use_firesim_queue():
+            _firesim_kill(firesim_env, firesim_root)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -356,6 +653,14 @@ def main() -> int:
     ap.add_argument("--models", default=None,
                     help="comma-separated model names for multi-model mode")
     ap.add_argument("--quant", default="fp32")
+    # Per-model quant overrides for mixed-quant multi-network binaries
+    # (e.g. dronet=int8 + mlp_control=fp32 in one xpurt_demo build).
+    # Comma list parallel to --models. When set, golden lookup uses the
+    # per-model quant instead of the single --quant.
+    ap.add_argument("--quants", default=None,
+                    help="comma-list of per-model quants, parallel to "
+                         "--models. Overrides --quant for golden-path "
+                         "resolution when running mixed-quant binaries.")
     ap.add_argument("--repo-root", default=None)
     ap.add_argument("--atol", type=float, default=None)
     ap.add_argument("--rtol", type=float, default=None)
@@ -424,8 +729,17 @@ def main() -> int:
         stage_elf=not args.no_stage_elf,
         kill_first=not args.no_kill_first,
     )
+    # Re-emit the uartlog (with MODELBLASTER_VERIFY / PROFILE_BEGIN /
+    # PROFILE_END / WALL_CYCLES markers intact) so downstream parsers
+    # in benchmarks/runners/firesim.py:parse_stdout can find them in the
+    # captured run.sh stdout. Bracket with our own markers so the
+    # extractor can grep for just this block. Mirrors the spike runner's
+    # MODELBLASTER_RAW_SPIKE_BEGIN/END dance.
+    print("=== MODELBLASTER_RAW_FIRESIM_BEGIN ===")
+    print(out, end="" if out.endswith("\n") else "\n")
+    print("=== MODELBLASTER_RAW_FIRESIM_END ===")
     repo_root = args.repo_root or os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..")
+        os.path.join(os.path.dirname(__file__), "..")
     )
     iree_args = IREEProfileArgs(
         profile_out_root=args.profile_out_root,
@@ -448,11 +762,19 @@ def main() -> int:
             repo_root=repo_root,
         )
     else:
+        # Per-model quants: pass through to report_run if specified.
+        quants_list = (args.quants.split(",")
+                       if args.quants else None)
+        if quants_list and models_list and len(quants_list) != len(models_list):
+            ap.error(
+                f"--quants count ({len(quants_list)}) must match "
+                f"--models count ({len(models_list)})")
         ok = report_run(
             out,
             models=models_list,
             io_path=args.io,
             quant=args.quant,
+            quants=quants_list,
             atol=args.atol, rtol=args.rtol,
             profile_csv=args.profile_csv,
             iree_args=iree_args,
