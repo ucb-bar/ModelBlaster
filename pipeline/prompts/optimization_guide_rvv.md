@@ -828,6 +828,12 @@ operand constraints.
 **API (single-tile, M, N <= mlmax = VLEN/8):**
 
 ```c
+/* MANDATORY: opt in to keep m0..m3 / v0..v31 #defines alive past the
+ * header so the OPU macros below can use them as architectural-
+ * register-name arguments. WITHOUT this define, the assembler will
+ * reject every macro call with `bad value for funct2 field` and
+ * `illegal operands` errors. */
+#define SATURN_OPU_KEEP_REGISTER_MACROS
 #include "saturn_opu.h"
 
 OPMVINBCAST(m1, v0);          /* broadcast vector v0 to all M rows of m1 */

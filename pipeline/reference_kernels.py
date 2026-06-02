@@ -1643,6 +1643,13 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
                 "different K tiling) if you can justify why it's still bit-exact."
             ),
             reference_impl=(
+                "/* OPU macros take REGISTER-NAME arguments that expand via\n"
+                " * the m0..m3 / v0..v31 #defines in saturn_opu.h. Opt in to\n"
+                " * keep those #defines alive so OPMVINBCAST(m1, v0) etc. work\n"
+                " * — without this the assembler rejects with `bad value for\n"
+                " * funct2 field` / `illegal operands`. */\n"
+                "#define SATURN_OPU_KEEP_REGISTER_MACROS\n"
+                "#include \"saturn_opu.h\"\n\n"
                 "/* Q0.31 requantize — bit-exact match to LINEAR_S8 reference. */\n"
                 "static inline int32_t q31_requantize(int32_t x, int32_t mult, int32_t shift) {\n"
                 "    int64_t prod = (int64_t)x * (int64_t)mult;\n"
@@ -6705,6 +6712,11 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
                 "MUST be bit-exact to the matmul_s8 reference."
             ),
             reference_impl=(
+                "/* OPU macros take REGISTER-NAME arguments that expand via\n"
+                " * the m0..m3 / v0..v31 #defines in saturn_opu.h. Opt in to\n"
+                " * keep those #defines alive so OPMVINBCAST(m1, v0) etc. work. */\n"
+                "#define SATURN_OPU_KEEP_REGISTER_MACROS\n"
+                "#include \"saturn_opu.h\"\n\n"
                 "/* Saturn OPU outer-product matmul skeleton (i8, single-tile). */\n"
                 "void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *c,\n"
                 "                      int M, int K, int N, int transpose_b,\n"
