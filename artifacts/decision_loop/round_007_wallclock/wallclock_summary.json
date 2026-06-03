@@ -1,0 +1,19 @@
+{
+  "hint": "artifacts/decision_loop/round_003/_manual_split_hint.json",
+  "solver": "decomposed",
+  "before": {
+    "makespan_us": 75.57,
+    "deadline_miss": 0,
+    "cross_dev": 180,
+    "solver_s": 2.158
+  },
+  "after": {
+    "makespan_us": 64.92,
+    "deadline_miss": 0,
+    "cross_dev": 209,
+    "solver_s": 2.048
+  },
+  "delta_makespan_us": 10.649999999999991,
+  "delta_pct": 14.092894005557751,
+  "decision": "ACCEPT"
+}
