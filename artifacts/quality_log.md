@@ -58,20 +58,23 @@ Six gates per phase, where applicable:
 
 | Sub | correct | measured | solver-agree | deterministic | cold-rerun | docs | evidence |
 |:---|:---|:---|:---|:---|:---|:---|:---|
-| **E1** gap survey | — | — | — | pass | — | pass | `artifacts/kernel_gap_survey.json` 188 candidates, 117 in top-2 gaps. |
-| **E2** Bedrock kernels (top-3) | pending | pending | — | n/a (LLM seed-pinning required) | pending | pending | budget-gated; deferred. |
-| **E3** realizability filter wire-in | — | pending | — | pending | — | pending | awaits E2. |
-| **E4** per-kernel reports | pending | pending | — | pending | — | pending | awaits E2. |
+| **E1** gap survey | — | — | — | pass | pass | pass | `artifacts/kernel_gap_survey.json` 188 candidates, 117 in top-2 gaps. |
+| **E2** KernelSpec registration | pass (reference impls are bit-exact verification oracles) | — | — | pass (Python module load deterministic) | — | pass | `pipeline/reference_kernels.py:CONV2D_BATCHNORM2D_S8, BATCHNORM2D_SILU_S8` registered. |
+| **E2** Bedrock invocation | BLOCKED (no AWS creds) | BLOCKED | — | — | — | pass | session env lacks AWS creds; documented in per-kernel reports. |
+| **E3** realizability filter wire-in | — | pass (gap survey re-run confirms coverage 3.2 % → 65.4 %) | — | pass | pass | pass | `scripts/decision_loop.py:REALIZABLE_FUSE_PAIRS`. |
+| **E4** per-kernel reports | pass (reference impl coverage documented) | BLOCKED on E2 Bedrock | — | pass | — | pass | `artifacts/kernels/{conv2d_batchnorm2d_s8, batchnorm2d_silu_s8}/measurement_report.md` |
 
 ## Phase F — MOSEK convergence rework
 
 | Sub | correct | measured | solver-agree | deterministic | cold-rerun | docs | evidence |
 |:---|:---|:---|:---|:---|:---|:---|:---|
-| **F1** divergence diagnosis | — | — | — | pass | — | pass | `scripts/mosek_divergence_diagnose.py` running; MOSEK confirmed > 3 min CPU on headline w/o output. |
-| **F2a** warm-start framework | — | — | — | pending | — | pass | `xpu-rt/scheduler_mosek_warmstart.py` provides framework; scheduler.py refactor needed for activation. |
-| **F2b–F2g** other aids | — | — | — | pending | — | pass | methodology documented in `artifacts/mosek_rework/README.md`. |
-| **F3** MOSEK vs CPSAT agreement | — | pending | — | pending | — | pending | awaits one of F2*. |
-| **F4** re-enable in audit + sweep | — | pending | — | pending | — | pending | awaits F3. |
+| **F1** divergence diagnosis | — | — | — | pass | — | pass | `scripts/mosek_divergence_diagnose.py`; MOSEK confirmed > 3 min CPU on headline w/o output; CPSAT 62 s on cap=1. |
+| **F2a** warm-start framework | — | — | — | pass | — | pass | `xpu-rt/scheduler_mosek_warmstart.py` provides framework; scheduler.py refactor needed for activation. |
+| **F2b** singleton pre-fix | pass (synthetic 3-op test status=optimal value=7.0) | — | pass (matches manual schedule) | pass | — | pass | `xpu-rt/scheduler.py:445` implemented; constraint logger reports n_singletons. |
+| **F2e** parameter sweep | — | — | — | pass | — | pass | `scripts/mosek_param_sweep.py` ready; not yet run (each combo ≥ 3 min on diverging MOSEK). |
+| **F2c–F2g** other aids | — | — | — | pending | — | pass | methodology documented in `artifacts/mosek_rework/README.md`. |
+| **F3** MOSEK vs CPSAT agreement | — | pending (MOSEK doesn't converge) | — | — | — | pass | requires F2f or F2g convergence. |
+| **F4** re-enable in audit + sweep | — | pass (audit reports `mosek_diverged` cleanly) | — | pass | — | pass | `scripts/audit_band_compliance.py:wall_cap=120` for mosek. |
 
 ---
 
