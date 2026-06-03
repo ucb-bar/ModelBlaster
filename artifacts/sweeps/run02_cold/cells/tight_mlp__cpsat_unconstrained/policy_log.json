@@ -1,0 +1,20 @@
+{
+  "policy": "cpsat_unconstrained",
+  "status": "ok",
+  "solve_wall_s": 62.062,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_sweep_4m2d1y_tight_mlp_cpsat_profiled.json",
+  "makespan": 163.67369299999996,
+  "n_deadline_miss": 57,
+  "n_release_viol": 0,
+  "n_dispatches": 217,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "use_underlying",
+      "scheduler": "cpsat",
+      "reason": "exact solver, no pre-applied structure",
+      "delta": null
+    }
+  ]
+}

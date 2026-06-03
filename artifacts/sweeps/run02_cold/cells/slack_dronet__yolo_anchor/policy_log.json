@@ -1,0 +1,18 @@
+{
+  "policy": "yolo_anchor",
+  "status": "ok",
+  "solve_wall_s": 3.58,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_sweep_4m2d1y_slack_dronet_greedy_periodic_profiled.json",
+  "makespan": 56.54074600000001,
+  "n_deadline_miss": 28,
+  "n_release_viol": 0,
+  "n_dispatches": 213,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "anchor on heaviest aperiodic (yolov8) via greedy_periodic"
+    }
+  ]
+}
