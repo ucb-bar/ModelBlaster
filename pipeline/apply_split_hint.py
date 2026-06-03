@@ -90,9 +90,50 @@ def _split_linear_s8(op: dict[str, Any], n_splits: int,
     return tiles
 
 
+def _split_conv2d_s8(op: dict[str, Any], n_splits: int,
+                     network: str) -> list[dict[str, Any]]:
+    """Split a conv2d_s8 op along the OC (output channel) dim.
+
+    Weight layout per kernel signature: [OC, IC, KH, KW]. Splitting
+    along OC produces n tiles that each compute a disjoint slice of
+    output channels; the weight pointer for tile t is `weight +
+    t*(OC/n)*IC*KH*KW`, the bias pointer is `bias + t*(OC/n)`. No
+    new weight tensors needed — the existing buffer is shared via
+    offset (same shape transformation the linear_s8 splitter uses
+    for its weight along N).
+
+    The output tensor `[N, OC, OH, OW]` splits along OC: tile_t
+    writes channels `[t*OC/n, (t+1)*OC/n)`. Output is named
+    `<orig>.tile_<t>`. Downstream consumers see the original tensor
+    as the concat of tiles along OC (or read each tile slice
+    explicitly by name).
+    """
+    shape = op["shape"]
+    OC = int(shape["OC"])
+    if OC % n_splits != 0:
+        raise SplitHintError(
+            f"{network}: conv2d_s8 OC={OC} doesn't divide cleanly into "
+            f"{n_splits} tiles (need OC % n_splits == 0)")
+    tile_oc = OC // n_splits
+    out_tensor = op["outputs"][0]
+    tiles: list[dict[str, Any]] = []
+    for t in range(n_splits):
+        tile = copy.deepcopy(op)
+        tile["shape"] = dict(shape)
+        tile["shape"]["OC"] = tile_oc
+        tile["outputs"] = [f"{out_tensor}.tile_{t}"]
+        tile["name"] = op["name"] + f".tile_{t}"
+        tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
+                              "n_splits": n_splits, "tile_oc": tile_oc,
+                              "tile_offset_OC": t * tile_oc,
+                              "axis": "OC"}
+        tiles.append(tile)
+    return tiles
+
+
 _SPLITTABLE: dict[str, Any] = {
     "linear_s8": _split_linear_s8,
-    # conv2d_s8 follow-up (needs weight slicing).
+    "conv2d_s8": _split_conv2d_s8,
 }
 
 
@@ -117,7 +158,13 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
     if not parent_shape:
         return
     tile_shape = list(parent_shape)
-    tile_shape[-1] = tile_n  # split along last (N) dimension
+    # Split axis depends on the op kind: linear_s8 splits N (last dim),
+    # conv2d_s8 splits OC. Both encode the per-tile size into tile_n
+    # by the caller — for conv we splice the OC dim of [N,OC,OH,OW].
+    if op.get("op") == "conv2d_s8" and len(tile_shape) >= 4:
+        tile_shape[1] = tile_n   # NCHW: OC is dim 1
+    else:
+        tile_shape[-1] = tile_n  # linear_s8: N is last dim
     for t in range(n_splits):
         tile_name = f"{out_name}.tile_{t}"
         if tile_name not in tensors:
@@ -177,8 +224,10 @@ def apply_split_hint(graph: dict[str, Any],
             # dict so generate_skeleton can allocate per-tile buffers
             # (fixes "buf_<network>_<out>_tile_0 undeclared" build error).
             if tile_ops and "shape" in tile_ops[0]:
-                _register_tile_tensors(out, op, n,
-                                       tile_ops[0]["shape"].get("N", 0))
+                # tile_n: for linear_s8 the per-tile N; for conv2d_s8 the per-tile OC
+                shape = tile_ops[0]["shape"]
+                tile_n = shape.get("N") if op.get("op") == "linear_s8" else shape.get("OC", 0)
+                _register_tile_tensors(out, op, n, tile_n)
             new_tile_ids: list[int] = []
             for tile in tile_ops:
                 tile["dispatch_id"] = next_new_id
