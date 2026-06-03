@@ -1,0 +1,6 @@
+built Workload: 58 ops, 2 machines, 5 network instances
+invoking scheduler.cpsat({'time_limit_s': 300.0})
+solved: makespan=18.098 ms  solve_wall=17.59s  status=solved
+target_horizon=20.0 ms -> WITHIN target
+automerge: collapsed 9 pair(s) -> 49 dispatches, saved 0.0µs
+wrote /scratch2/agustin/ModelBlaster/artifacts/agentic_fuse_split/fuse_split_CPSAT.json

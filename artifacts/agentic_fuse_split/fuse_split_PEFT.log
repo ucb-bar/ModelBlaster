@@ -1,0 +1,6 @@
+built Workload: 58 ops, 2 machines, 5 network instances
+invoking scheduler.peft({'time_limit': 300.0})
+solved: makespan=20.751 ms  solve_wall=0.01s  status=solved
+target_horizon=20.0 ms -> OVER target
+automerge: collapsed 24 pair(s) -> 34 dispatches, saved 0.0µs
+wrote /scratch2/agustin/ModelBlaster/artifacts/agentic_fuse_split/fuse_split_PEFT.json
