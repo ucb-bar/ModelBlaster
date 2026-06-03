@@ -179,3 +179,96 @@ already at a local optimum. The next interesting question isn't
 "more splits/fuses" — it's **"what other candidate types should the
 agent generate?"** (per-op placement reassignment, periodic-instance
 parallelization, pipeline sharding).
+
+---
+
+## Asymmetric splits — the real cross-accelerator parallelism win
+
+After the FINDINGS conclusion above, we tested the *asymmetric* split
+case: split an op into unequal tile fractions proportional to the
+accelerator speed ratio, so the big tile on the fast accel and the
+small tile on the slow accel both finish at the same wall-clock.
+
+### Predicted win formula
+
+For an op with cost `c_g` on Gemmini and `c_r` on RVV, the balanced
+asymmetric split has:
+- `work_g / work_r = c_r / c_g` (more work to the faster accel)
+- Balanced time `T_balanced = (c_g * c_r) / (c_g + c_r)`
+- Saving vs best single accel: `min(c_g, c_r) - T_balanced`
+
+Top candidates by absolute saving on yolov8:
+
+| did | Op shape | Gemm ms | RVV ms | Balanced | Saving % |
+|---:|:---|---:|---:|---:|---:|
+| 0 | first 3×3 conv IC=3 OC=16 | 2.110 | 8.566 | 1.693 | **19.8%** |
+| 18 | 1×1 IC=48 OC=32 | 1.248 | 5.326 | 1.011 | 19.0% |
+| 6 | 1×1 IC=32 OC=32 | 1.035 | 4.119 | 0.827 | **20.1%** |
+
+### Measured
+
+`xpu-rt/profile_loader.py` extended to honor `tile_oc_fraction` in
+`split_from` metadata (defaults to `1/n_splits` for symmetric).
+
+Test on dispatch_0 with fractions 0.812 / 0.188 (≈ OC=13 + OC=3
+from the 16-OC original):
+
+| | Hardware | Duration | Tile cost |
+|:---|:---|---:|:---:|
+| BEFORE — dispatch_0 alone | CPU_P#0 | 2.110 ms | Gemmini full op |
+| AFTER — dispatch_0.tile_0 | CPU_P#0 | 1.714 ms | Gemmini OC=13 |
+| AFTER — dispatch_0.tile_1 | **CPU_E#0** | 1.606 ms | RVV OC=3 |
+
+**The scheduler placed tile_0 on Gemmini and tile_1 on RVV.** Per-op
+wall-clock dropped from 2.110 ms to max(1.714, 1.606) = 1.714 ms,
+**a real 18.8% saving on this op.**
+
+Network makespan barely moved (75.57 → 75.5705 ms) because
+dispatch_0 isn't on the makespan-critical path. The asymmetric split
+mechanism works — it just doesn't move the headline number on this
+workload because the critical path is elsewhere.
+
+### Test on critical-path op (did=195, 1×1 conv on RVV)
+
+Tried asymmetric split of did=195 (OC=80 → 77/3 = RVV-favored
+asymmetric). The scheduler kept both tiles on RVV, putting tile_1
+(small, 0.0523 ms) early at t=70 in RVV slack, then tile_0 (big,
+1.343 ms) at t=74. **No makespan change.**
+
+Why: tile_1 (OC=3) on its "other" accel (Gemmini) costs 1.357 ms —
+massively MORE than 0.0523 ms on RVV. Even though the *original*
+op-level math says asymmetric split saves 3% (max 1.357 vs 1.40),
+the scheduler correctly notices that the *tile-level* placement
+decision is "tile_1 on RVV (0.052 ms) beats tile_1 on Gemmini
+(1.357 ms)" — and that local choice dominates.
+
+### What this tells us about when asymmetric splits help
+
+**Asymmetric splits move the makespan when:**
+
+1. The op is on the makespan-critical path (necessary).
+2. The fast accelerator is heavily loaded at the moment the op
+   becomes ready (so backfilling part of the op onto the slow
+   accelerator avoids waiting for fast-accel slack).
+3. The fraction on the slow accelerator is small enough to finish
+   before the fast-accel slot would free up anyway, OR the slow
+   accelerator has nothing else to do during that interval.
+
+On this workload, the critical-path ops (mostly small 1×1 convs on
+RVV near the end of the detect head) don't satisfy (2) — Gemmini is
+free during those slots, but it's free *because* it's structurally
+the wrong tool for those ops. Migrating work to it doesn't help.
+
+### Where this WILL win
+
+Workloads where:
+- Multiple ops with comparable Gemmini/RVV costs (ratio ~1.5–3×)
+  cluster on the same accel.
+- Critical path passes through a contention point where the fast
+  accel is overloaded.
+- The slow accel has a slot of idle time long enough to absorb
+  10–20% of the contended op's work.
+
+That's a different workload shape than yolov8_nano + dronet + mlp_control
+on this hetero bitstream. **The framework now supports it for free
+when such a workload comes along.**
