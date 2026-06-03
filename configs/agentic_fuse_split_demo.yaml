@@ -1,25 +1,28 @@
 # Curated workload for the agentic fuse/split demo (closes #168).
 #
-# Designed so the agent's fuse/split picks are NON-OBVIOUS — both
-# axes have a use case at different operating points:
+# This is the ACTUAL robotics scenario: drone control with
+# vision + depth + actor policy running concurrently. All three
+# networks are present and have non-obvious fuse/split decisions:
 #
-#   * mlp_control has 7 dispatches with median duration ~0.04 ms. At
-#     a 5 ms period and 4 instances in flight, ~28 sub-50µs dispatches
-#     compete for cores AND for inter-dispatch handshake overhead.
-#     The granularity advisor sees this as "too_fine" and emits fuse
-#     hints for the mlp linear+elu chains.
+#   * yolov8_nano @ 64x64 — perception. 30+ heavy conv2d_s8 ops
+#     dominated by the 5x5 and 3x3 ops on Saturn OPU. These are
+#     the "too_coarse" candidates — the granularity advisor proposes
+#     splitting the heaviest conv along OC to fill the gemmini core
+#     while the OPU works through the original tile.
 #
-#   * dronet's heavy 2D convs (5×5, 3×3) on the same hetero bitstream
-#     run on one core for ~5-10 ms at a stretch, leaving the other
-#     core idle when nothing else is ready. The advisor sees this
-#     as "too_coarse" on conv2d_s8[0] and emits split hints.
+#   * mlp_control — PPO actor. 7 sub-50µs dispatches × 4 instances at
+#     5 ms period. These are the "too_fine" candidates — the granularity
+#     advisor proposes fusing the linear+elu chains via Phase 1d's
+#     `linear_s8_elu_s8` registered kernel.
 #
-# By dropping yolov8 entirely we (a) shrink the MILP enough that
-# MOSEK actually converges (300 ops with yolo -> ~80 ops without),
-# (b) eliminate the bitstream-stability issue that prevents
-# FireSim-measured runs from completing on the 1+4+2 shape, and
-# (c) make the period-driven release timing the dominant factor
-# rather than yolo's one-shot makespan.
+#   * dronet — depth. 2D convs on the OPU at ~20 ms period. Acts as
+#     a periodic backlog producer: when dronet is in flight, mlp_control
+#     instances accumulate; when dronet drops, the agent has to absorb
+#     the burst.
+#
+# Solver choice: CPSAT. MOSEK formulation diverges at ~300 ops on the
+# hetero combinatorics (see oracle_table.md). CPSAT handles it fine
+# and reaches the same optimum on smaller workloads.
 
 bitstream: GemminiAndOPUShuttleConfig
 registry:  cores/chipyard_gemmini_opu_hetero.json
@@ -28,22 +31,16 @@ cores:
   - { id: opu0,     kind: CPU_E, hart: 1 }
 requantize_ops: [conv2d_s8, linear_s8]
 networks:
-  # 4 mlp_control instances at a TIGHT 5 ms period (vs 10 ms baseline).
-  # Tightening forces the agent to fuse the back-to-back ops in each
-  # instance's linear+elu chain to stay under the period budget.
-  - { name: mlp_control, quant: int8, instances: 4, period_ms: 5.0 }
-  # 1 dronet at 20 ms period. With only one dronet running and 4
-  # tight-period mlp_controls competing for cores, dronet's heavy
-  # conv2d ops sometimes block all mlp release windows. The agent's
-  # split advisor sees that and proposes splitting the heaviest conv.
-  - { name: dronet, quant: int8, instances: 1, period_ms: 20.0 }
-horizon_ms: 20.0   # one dronet period — tight enough that fuse/split
-                   # decisions actually move the makespan visibly.
-# CPSAT is the optimal solver of choice (MOSEK formulation diverges
-# at this size class on the 1+4+2 baseline — see oracle_table.md).
-# For this smaller workload (~80 ops) both should converge.
+  - { name: yolov8_nano_64, quant: int8, instances: 1 }     # one-shot, 64×64
+  - { name: dronet,         quant: int8, instances: 2, period_ms: 20.0 }
+  - { name: mlp_control,    quant: int8, instances: 4, period_ms: 5.0 }
+# Horizon: tight enough that fuse/split decisions actually move
+# the makespan, loose enough that the optimum solver can find feasible.
+# The CPSAT y64 result on the larger 75 ms horizon (Section 9) gives
+# us a sanity bound — this workload's optimum should be ≤ that.
+horizon_ms: 75.0
 solver: CPSAT
-time_limit_s: 300
+time_limit_s: 600
 cycles_source: db
 cycles_agg: median
 cycles_per_ms: 1000000

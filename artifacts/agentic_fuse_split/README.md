@@ -1,54 +1,77 @@
-# Agentic fuse/split demo — curated workload (closes #168)
+# Agentic fuse/split demo — yolov8_nano_64 + mlp_control + dronet
 
-Workload: `configs/agentic_fuse_split_demo.yaml` — 4×mlp_control @
-5 ms period + 1×dronet @ 20 ms period, 20 ms horizon. Designed so
-both fuse and split picks have a non-obvious justification:
+## What this directory contains
 
-- **mlp_control is "too_fine":** 7 sub-50µs dispatches × 4 instances
-  competing for handshake slots at 5 ms periods → granularity
-  advisor proposes fusing linear+elu chains.
-- **dronet is "too_coarse":** 5×5 and 3×3 conv2d_s8 ops on the OPU
-  core that block the gemmini core ready-queue for ms at a stretch →
-  granularity advisor proposes splitting the heaviest conv along OC.
+1. **`AGENTIC_LOOP.md`** — the full end-to-end run: schedule → analyze
+   → act → re-schedule, with the agent's actual decision trace. Read this
+   first.
+2. **`agentic_loop_before_after.png`** — 2-panel Gantt showing the BEFORE
+   (170 disp, 83.08 ms) and AFTER (157 disp, 82.67 ms) schedules from the
+   loop, with the fused mlp_control1 chain visible as hatched blocks.
+3. **`stack_yolo.png`** — 4-scheduler comparison (CPSAT/HEFT/EDF/PEFT) on
+   the same 1+4+2 workload, baseline (no fuse/split applied).
+4. **`granularity_hint.json`** + **`granularity/granularity_result.json`** —
+   the agent's raw output: 330 candidates considered, scored top picks
+   with predicted Δmakespan for each.
+5. **`fuse_hint.json`** — the Contract-2 hint that was actually applied
+   (top fuse candidate; the top split was conv2d_s8 which Phase 1e doesn't
+   realize yet — see honest-scope in AGENTIC_LOOP.md).
+6. **`mlp_control_fused.graph.json`** — the rewritten IR after
+   `apply_fusion_hint.py --pairwise` collapsed mlp_control's 7
+   dispatches into 4 fused linear+elu chains.
+7. **`before_HEFT.json` / `after_HEFT.json`** — the two scheduler fixtures
+   that feed the before/after PNG.
 
-Yolov8 was deliberately removed: (a) MOSEK formulation diverges at
-300 ops on the 1+4+2 shape (see oracle_table.md), (b) FireSim bitstream
-runtime stability is poor for the full 3-way workload, (c) yolo's
-one-shot makespan dominates and crowds out the period-driven release
-behavior the advisor was designed to reason about.
+## Reproduction
 
-## 4-scheduler result (predicted, compaction + automerge applied)
+```bash
+cd /scratch2/agustin/ModelBlaster
 
-| Solver | Solve wall | Makespan | Meets 20 ms? | Dispatches | Pairs merged |
-|:-------|-----------:|---------:|:------------:|-----------:|-------------:|
-| CPSAT  | <60 s | **18.10 ms** | ✅ | 49 | 9  |
-| HEFT   | <1 s  | 20.56 ms | ❌ (+2.8%) | 42 | 16 |
-| EDF    | <1 s  | 20.56 ms | ❌ (+2.8%) | 42 | 16 |
-| PEFT   | <1 s  | 20.75 ms | ❌ (+3.8%) | 34 | 24 |
+# Step 1: baseline 4-scheduler scan
+for s in CPSAT HEFT PEFT EDF ; do
+    /tmp/run_one_solver_v2.sh "$s" 600 configs/agentic_fuse_split_demo.yaml fuse_split_yolo
+done
 
-Same qualitative pattern as the 1+4+2 baseline (CPSAT wins by ~10%,
-heuristics miss the horizon) but the formulation is small enough
-that MOSEK converges too (not run here — CPSAT is sufficient).
+# Step 2-3: agentic candidate generation + scoring
+PYTHONPATH=/scratch2/agustin/XPU-RT/xpu-rt \
+    /scratch2/agustin/miniforge3/envs/merlin-dev/bin/python \
+    /scratch2/agustin/XPU-RT/scripts/granularity_loop.py \
+    --networks-json /scratch2/agustin/XPU-RT/data/toplevel/networks_1yolo_4mlp_2dronet_firesim.json \
+    --baseline-solver greedy --max-per-type 3 \
+    --out-dir artifacts/agentic_fuse_split/granularity \
+    --emit-hint artifacts/agentic_fuse_split/granularity_hint.json
 
-Visual: `stack.png`.
+# Step 4: realize the hint
+uv run python -m modelblaster.pipeline.apply_fusion_hint \
+    --hint artifacts/agentic_fuse_split/fuse_hint.json \
+    --model mlp_control \
+    --ir examples/mlp_control/int8/generated/graph.json \
+    --out artifacts/agentic_fuse_split/mlp_control_fused.graph.json \
+    --pairwise
 
-## Why this closes #168
+# Step 5: re-schedule (swap IR, run, restore)
+cp examples/mlp_control/int8/generated/graph.json /tmp/orig_mlp.json
+cp artifacts/agentic_fuse_split/mlp_control_fused.graph.json \
+   examples/mlp_control/int8/generated/graph.json
+/tmp/run_one_solver_v2.sh HEFT 60 configs/agentic_fuse_split_demo.yaml after
+cp /tmp/orig_mlp.json examples/mlp_control/int8/generated/graph.json
 
-The original task asked for "agent-picked fuse/split decisions on
-sensible timing." With this workload:
+# Step 6: render before/after
+uv run python scripts/render_compare_gantt.py \
+    --out artifacts/agentic_fuse_split/agentic_loop_before_after.png \
+    --title "Agentic loop: schedule → analyze → fuse → re-schedule" \
+    --deadline-ms 75 --x-max-ms 95 \
+    --panel "BEFORE (83.08 ms, 170 disp)" \
+            artifacts/agentic_fuse_split/before_HEFT.json "baseline" \
+    --panel "AFTER (82.67 ms, 157 disp)" \
+            artifacts/agentic_fuse_split/after_HEFT.json "fused mlp_control1"
+```
 
-- The advisor's fuse picks are the mlp_control linear+elu chains.
-  `pipeline/apply_fusion_hint.py` Phase 1d turns those into
-  `linear_s8_elu_s8` fused dispatches (spike-bit-exact).
-- The advisor's split picks are the dronet conv2d ops along OC.
-  `pipeline/apply_split_hint.py` Phase 1e produces tile-level
-  ops with rewired `depends_on`.
-- The 4-scheduler comparison at the curated workload size is
-  fast enough that the agentic loop (XPU-RT iterate → bundle →
-  realize-hint → re-schedule → re-render) completes in ~5 min
-  end-to-end vs ~hours for the 1+4+2 baseline.
+## Headline numbers
 
-This is the workload the demo should use going forward. The 1+4+2
-baseline is kept for the headline "all 4 schedulers compared with
-yolov8 in the mix" PNG, but operational agent-loop work happens
-on this smaller config.
+| | Makespan | Dispatches | Notes |
+|:--|---------:|-----------:|:------|
+| CPSAT baseline | **77.72 ms** | 233 | best axis-A; still misses 75 ms target by 3.6% |
+| HEFT baseline  | 83.08 ms | 170 | baseline before agentic acting |
+| HEFT after fuse | **82.67 ms** | 157 | **after** agent applied `mlp_control1[0..5]` fuse |
+| Δ from loop    | **−0.41 ms** | **−13 disp** | measurable improvement from a real agentic decision |
