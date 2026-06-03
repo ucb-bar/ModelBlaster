@@ -1,0 +1,36 @@
+{
+  "network": "mlp_control",
+  "wall_clock_cycles": 8650,
+  "total_dispatch_cycles": 863830,
+  "n_dispatches": 4,
+  "dispatches": [
+    {
+      "name": "mlp_control.fused_0_1",
+      "op": "linear_s8_elu_s8",
+      "shape": "",
+      "cycles": 102951,
+      "pct_of_total": 11.9
+    },
+    {
+      "name": "mlp_control.fused_2_3",
+      "op": "linear_s8_elu_s8",
+      "shape": "",
+      "cycles": 605580,
+      "pct_of_total": 70.1
+    },
+    {
+      "name": "mlp_control.fused_4_5",
+      "op": "linear_s8_elu_s8",
+      "shape": "",
+      "cycles": 154841,
+      "pct_of_total": 17.9
+    },
+    {
+      "name": "mlp.6",
+      "op": "linear_s8",
+      "shape": "M=1;K=64;N=4",
+      "cycles": 458,
+      "pct_of_total": 0.1
+    }
+  ]
+}

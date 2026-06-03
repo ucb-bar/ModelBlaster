@@ -301,3 +301,74 @@ correct given the metric used.
 - **`conv2d_s8` split realization** — the most common split candidate
   the granularity advisor proposes; Phase 1e covers `linear_s8` only.
 
+
+---
+
+## Round 6 (OPU-targeted fused AlgorithmCandidate added)
+
+Added `outerprod_with_in_register_elu` AlgorithmCandidate to
+`LINEAR_S8_ELU_S8.algorithms` in `pipeline/reference_kernels.py` —
+target_affinity=("rvv_opu",), seeded with the OPU outerprod pattern +
+in-register ELU drain tail. Bedrock picked it on first try, passed
+verify on attempt 2 (`max_abs_err=0 max_rel_err=0`).
+
+Round 6 result:
+
+| | Strategy | Cycles |
+|:---|:---|---:|
+| BASELINE (per-op) | Bedrock RVV `linear_s8` (`vwmul`/`vredsum`) + scalar `elu_s8` | **96,597** |
+| FUSE candidate | Bedrock OPU `linear_s8_elu_s8` (outerprod + in-register ELU) | 863,830 |
+| Δ | | **−794 % worse** |
+
+### The real root cause (and it's structural, not prompt-tuning)
+
+The fused kernel is **correct** OPU code — it uses OPMVINBCAST,
+VOPACC, VMV_VR exactly as seeded. But it has the M/N≤mlmax
+eligibility gate (same as the curated linear_s8_outerprod kernel),
+and falls back to scalar when the shape exceeds it.
+
+For mlp_control on this spike config:
+- mlmax = VLEN/8. On the default V256 build, that's 32. Even on
+  V512 (D128) it's 64.
+- mlp.0 (N=256), mlp.2 (N=128), mlp.4 (N=64) all exceed or equal mlmax.
+
+So the OPU path is **dead code** for this workload — the eligibility
+gate triggers, the kernel falls back to the scalar implementation
+in its else branch, and the scalar path is what we're measuring.
+
+Meanwhile **Bedrock's standalone `kernel_linear_s8`** for the same
+workload took a completely different approach: `vwmul_vv_i16m2 +
+vwadd_wv_i32m4 + vredsum_vs_i32m4_i32m1` — per-element RVV inner
+product with no shape restriction at all. That's the 96k-cycle path.
+
+**The mismatch:** the AlgorithmCandidate for `linear_s8/outerprod`
+seeded the OPU pattern, and Bedrock used it AND added an RVV
+fallback that works on any shape. For `linear_s8_elu_s8`, my new
+AlgorithmCandidate seeded the OPU pattern but with a SCALAR
+fallback (because that's what the reference_impl shows). Bedrock
+faithfully reproduced both halves.
+
+The fix would be: rewrite `LINEAR_S8_ELU_S8.algorithms[
+outerprod_with_in_register_elu].reference_impl` so the fallback
+branch uses RVV intrinsics (`vwmul`/`vredsum`) instead of pure
+scalar. Then Bedrock would copy *that* pattern and the fused kernel
+would work on any N.
+
+That's a prompt-engineering fix, and is the natural follow-up.
+
+### Decision-loop summary across 6 rounds
+
+| Round | Backend | Hint | Measured | Verdict | What we learned |
+|:---:|:---:|:---|---:|:---|:---|
+| 003 | reference | fuse mlp_control[0..5] | −18.7 % | REJECT | curated scalar fused < per-op |
+| 003 | reference | split linear_s8 mlp.2 | BUILD FAIL | (fixed in round 5) | skeleton emitter missing tile buffers |
+| 004 | llm | fuse mlp_control[0..5] | −793 % | REJECT | LLM auto-chose scalar fusion strategy |
+| 005 | reference | split linear_s8 mlp.2 | −0.4 % cyc | "within epsilon" | per-op cycle metric wrong for splits |
+| 006 | llm | fuse mlp_control[0..5] (with OPU seed) | −794 % | REJECT | OPU code path was dead — eligibility gate fell back to scalar; fallback strategy matters more than the OPU seed |
+
+**The loop's verdict is honest in every round.** The fact that fusion
+keeps losing isn't a bug in the loop — it's the actual answer to the
+research question on this workload+hardware+kernel combination. The
+agent correctly refuses to commit an IR change that the measurement
+says doesn't help.
+
