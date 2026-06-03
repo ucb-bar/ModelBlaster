@@ -6276,7 +6276,6 @@ CONV2D_BATCHNORM2D_S8 = KernelSpec(
         "support runtime BN params (e.g., calibration-time fold not done)."
     ),
     reference_impl="""\
-#include <math.h>
 void kernel_conv2d_batchnorm2d_s8(
     const int8_t *input, const int8_t *weight, const int32_t *bias,
     const float *bn_scale, const float *bn_bias, int8_t *output,
@@ -6428,7 +6427,6 @@ BATCHNORM2D_SILU_S8 = KernelSpec(
         "  reference — straightforward C as in `reference_impl` below."
     ),
     reference_impl="""\
-#include <math.h>
 void kernel_batchnorm2d_silu_s8(
     const int8_t *input, const float *scale, const float *bias,
     int8_t *output,
