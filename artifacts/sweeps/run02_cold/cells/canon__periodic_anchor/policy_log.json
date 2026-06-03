@@ -1,0 +1,18 @@
+{
+  "policy": "periodic_anchor",
+  "status": "ok",
+  "solve_wall_s": 3.035,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_sweep_4m2d1y_canon_decomposed_profiled.json",
+  "makespan": 75.570546,
+  "n_deadline_miss": 0,
+  "n_release_viol": 0,
+  "n_dispatches": 248,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "reserve periodic slots first via decomposed solver"
+    }
+  ]
+}
