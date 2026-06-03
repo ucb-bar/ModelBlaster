@@ -1,0 +1,49 @@
+# Curated workload for the agentic fuse/split demo (closes #168).
+#
+# Designed so the agent's fuse/split picks are NON-OBVIOUS — both
+# axes have a use case at different operating points:
+#
+#   * mlp_control has 7 dispatches with median duration ~0.04 ms. At
+#     a 5 ms period and 4 instances in flight, ~28 sub-50µs dispatches
+#     compete for cores AND for inter-dispatch handshake overhead.
+#     The granularity advisor sees this as "too_fine" and emits fuse
+#     hints for the mlp linear+elu chains.
+#
+#   * dronet's heavy 2D convs (5×5, 3×3) on the same hetero bitstream
+#     run on one core for ~5-10 ms at a stretch, leaving the other
+#     core idle when nothing else is ready. The advisor sees this
+#     as "too_coarse" on conv2d_s8[0] and emits split hints.
+#
+# By dropping yolov8 entirely we (a) shrink the MILP enough that
+# MOSEK actually converges (300 ops with yolo -> ~80 ops without),
+# (b) eliminate the bitstream-stability issue that prevents
+# FireSim-measured runs from completing on the 1+4+2 shape, and
+# (c) make the period-driven release timing the dominant factor
+# rather than yolo's one-shot makespan.
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: opu0,     kind: CPU_E, hart: 1 }
+requantize_ops: [conv2d_s8, linear_s8]
+networks:
+  # 4 mlp_control instances at a TIGHT 5 ms period (vs 10 ms baseline).
+  # Tightening forces the agent to fuse the back-to-back ops in each
+  # instance's linear+elu chain to stay under the period budget.
+  - { name: mlp_control, quant: int8, instances: 4, period_ms: 5.0 }
+  # 1 dronet at 20 ms period. With only one dronet running and 4
+  # tight-period mlp_controls competing for cores, dronet's heavy
+  # conv2d ops sometimes block all mlp release windows. The agent's
+  # split advisor sees that and proposes splitting the heaviest conv.
+  - { name: dronet, quant: int8, instances: 1, period_ms: 20.0 }
+horizon_ms: 20.0   # one dronet period — tight enough that fuse/split
+                   # decisions actually move the makespan visibly.
+# CPSAT is the optimal solver of choice (MOSEK formulation diverges
+# at this size class on the 1+4+2 baseline — see oracle_table.md).
+# For this smaller workload (~80 ops) both should converge.
+solver: CPSAT
+time_limit_s: 300
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000

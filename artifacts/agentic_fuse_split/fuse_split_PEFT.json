@@ -1,0 +1,682 @@
+{
+  "dot_file": "fuse_split_PEFT.json",
+  "_provenance": {
+    "generated_by": "scripts/run_xpurt_scheduler_multi.py",
+    "config": "/tmp/cfg_fuse_split_PEFT.yaml",
+    "solver": "PEFT",
+    "solve_wall_s": 0.008348226547241211,
+    "makespan_ms": 20.751121999999974,
+    "horizon_target_ms": 20.0,
+    "cycles_source": "db",
+    "cycles_agg": "median",
+    "contention_applied": false,
+    "contention_path": null,
+    "git_sha": "ef0cd3d",
+    "generated_at": "2026-06-03T00:06:02+00:00",
+    "instances": [
+      {
+        "network": "mlp_control",
+        "instance": 0,
+        "job_id": 0,
+        "n_dispatches": 7
+      },
+      {
+        "network": "mlp_control",
+        "instance": 1,
+        "job_id": 1,
+        "n_dispatches": 7
+      },
+      {
+        "network": "mlp_control",
+        "instance": 2,
+        "job_id": 2,
+        "n_dispatches": 7
+      },
+      {
+        "network": "mlp_control",
+        "instance": 3,
+        "job_id": 3,
+        "n_dispatches": 7
+      },
+      {
+        "network": "dronet",
+        "instance": 0,
+        "job_id": 4,
+        "n_dispatches": 30
+      }
+    ],
+    "n_dispatches": 58,
+    "scheduler_report": {
+      "critical_path_us": 17.932375,
+      "load_us": 12.289617999999999,
+      "release_us": 0.0,
+      "oracle_floor_us": 17.932375
+    },
+    "automerge": {
+      "dispatches_before": 58,
+      "dispatches_after": 34,
+      "pairs_merged": 24,
+      "makespan_before": 20.751121999999974,
+      "makespan_after": 20.751121999999974,
+      "saved_us": 0.0
+    }
+  },
+  "dispatches": {
+    "mlp_control#0_dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [],
+      "hardware_target": "CPU_P#0",
+      "start_time": 18.170936999999995,
+      "duration": 0.0,
+      "job_name": "mlp_control0",
+      "module_name": "mlp_control$dispatch_0_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 0,
+      "merged_with": [
+        "mlp_control#0_dispatch_1"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_1_GEMMINI_op"
+      ]
+    },
+    "mlp_control#0_dispatch_2": {
+      "id": 2,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#0_dispatch_0"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 18.544128999999984,
+      "duration": 0.331417,
+      "job_name": "mlp_control0",
+      "module_name": "mlp_control$dispatch_2_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 0
+    },
+    "mlp_control#0_dispatch_3": {
+      "id": 3,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#0_dispatch_2"
+      ],
+      "hardware_target": "CPU_E#0",
+      "start_time": 18.875545999999982,
+      "duration": 0.023875,
+      "job_name": "mlp_control0",
+      "module_name": "mlp_control$dispatch_3_RVV_OPU_op",
+      "op_kind": "elu_s8",
+      "instance": 0
+    },
+    "mlp_control#0_dispatch_4": {
+      "id": 4,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#0_dispatch_3"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.31738799999998,
+      "duration": 0.0,
+      "job_name": "mlp_control0",
+      "module_name": "mlp_control$dispatch_4_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 0,
+      "merged_with": [
+        "mlp_control#0_dispatch_5"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_5_GEMMINI_op"
+      ]
+    },
+    "mlp_control#0_dispatch_6": {
+      "id": 6,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#0_dispatch_4"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.738913999999976,
+      "duration": 0.002802,
+      "job_name": "mlp_control0",
+      "module_name": "mlp_control$dispatch_6_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 0
+    },
+    "mlp_control#1_dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [],
+      "hardware_target": "CPU_P#0",
+      "start_time": 18.264234999999992,
+      "duration": 0.0,
+      "job_name": "mlp_control1",
+      "module_name": "mlp_control$dispatch_0_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 1,
+      "merged_with": [
+        "mlp_control#1_dispatch_1"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_1_GEMMINI_op"
+      ]
+    },
+    "mlp_control#1_dispatch_2": {
+      "id": 2,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#1_dispatch_0"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 18.875545999999982,
+      "duration": 0.331417,
+      "job_name": "mlp_control1",
+      "module_name": "mlp_control$dispatch_2_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 1
+    },
+    "mlp_control#1_dispatch_3": {
+      "id": 3,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#1_dispatch_2"
+      ],
+      "hardware_target": "CPU_E#0",
+      "start_time": 19.20696299999998,
+      "duration": 0.023875,
+      "job_name": "mlp_control1",
+      "module_name": "mlp_control$dispatch_3_RVV_OPU_op",
+      "op_kind": "elu_s8",
+      "instance": 1
+    },
+    "mlp_control#1_dispatch_4": {
+      "id": 4,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#1_dispatch_3"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.41206999999998,
+      "duration": 0.0,
+      "job_name": "mlp_control1",
+      "module_name": "mlp_control$dispatch_4_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 1,
+      "merged_with": [
+        "mlp_control#1_dispatch_5"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_5_GEMMINI_op"
+      ]
+    },
+    "mlp_control#1_dispatch_6": {
+      "id": 6,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#1_dispatch_4"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.741715999999975,
+      "duration": 0.002802,
+      "job_name": "mlp_control1",
+      "module_name": "mlp_control$dispatch_6_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 1
+    },
+    "mlp_control#2_dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [],
+      "hardware_target": "CPU_P#0",
+      "start_time": 18.35753299999999,
+      "duration": 0.0,
+      "job_name": "mlp_control2",
+      "module_name": "mlp_control$dispatch_0_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 2,
+      "merged_with": [
+        "mlp_control#2_dispatch_1"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_1_GEMMINI_op"
+      ]
+    },
+    "mlp_control#2_dispatch_2": {
+      "id": 2,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#2_dispatch_0"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 19.20696299999998,
+      "duration": 0.331417,
+      "job_name": "mlp_control2",
+      "module_name": "mlp_control$dispatch_2_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 2
+    },
+    "mlp_control#2_dispatch_3": {
+      "id": 3,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#2_dispatch_2"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 19.869796999999977,
+      "duration": 0.023875,
+      "job_name": "mlp_control2",
+      "module_name": "mlp_control$dispatch_3_GEMMINI_op",
+      "op_kind": "elu_s8",
+      "instance": 2
+    },
+    "mlp_control#2_dispatch_4": {
+      "id": 4,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#2_dispatch_3"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.506751999999977,
+      "duration": 0.0,
+      "job_name": "mlp_control2",
+      "module_name": "mlp_control$dispatch_4_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 2,
+      "merged_with": [
+        "mlp_control#2_dispatch_5"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_5_GEMMINI_op"
+      ]
+    },
+    "mlp_control#2_dispatch_6": {
+      "id": 6,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#2_dispatch_4"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.744517999999974,
+      "duration": 0.002802,
+      "job_name": "mlp_control2",
+      "module_name": "mlp_control$dispatch_6_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 2
+    },
+    "mlp_control#3_dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [],
+      "hardware_target": "CPU_P#0",
+      "start_time": 18.450830999999987,
+      "duration": 0.0,
+      "job_name": "mlp_control3",
+      "module_name": "mlp_control$dispatch_0_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 3,
+      "merged_with": [
+        "mlp_control#3_dispatch_1"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_1_GEMMINI_op"
+      ]
+    },
+    "mlp_control#3_dispatch_2": {
+      "id": 2,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#3_dispatch_0"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 19.53837999999998,
+      "duration": 0.331417,
+      "job_name": "mlp_control3",
+      "module_name": "mlp_control$dispatch_2_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 3
+    },
+    "mlp_control#3_dispatch_3": {
+      "id": 3,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#3_dispatch_2"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 19.893671999999977,
+      "duration": 0.023875,
+      "job_name": "mlp_control3",
+      "module_name": "mlp_control$dispatch_3_GEMMINI_op",
+      "op_kind": "elu_s8",
+      "instance": 3
+    },
+    "mlp_control#3_dispatch_4": {
+      "id": 4,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#3_dispatch_3"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.601433999999976,
+      "duration": 0.0,
+      "job_name": "mlp_control3",
+      "module_name": "mlp_control$dispatch_4_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 3,
+      "merged_with": [
+        "mlp_control#3_dispatch_5"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "mlp_control$dispatch_5_GEMMINI_op"
+      ]
+    },
+    "mlp_control#3_dispatch_6": {
+      "id": 6,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_control#3_dispatch_4"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.747319999999974,
+      "duration": 0.002802,
+      "job_name": "mlp_control3",
+      "module_name": "mlp_control$dispatch_6_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 3
+    },
+    "dronet#0_dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [],
+      "hardware_target": "CPU_P#0",
+      "start_time": 0.0,
+      "duration": 6.450516,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_0_GEMMINI_op",
+      "op_kind": "conv2d_s8",
+      "instance": 0,
+      "merged_with": [
+        "dronet#0_dispatch_1"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "dronet$dispatch_1_GEMMINI_op"
+      ]
+    },
+    "dronet#0_dispatch_2": {
+      "id": 2,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_0"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 11.450516,
+      "duration": 0.0,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_2_GEMMINI_op",
+      "op_kind": "batchnorm2d_s8",
+      "instance": 0,
+      "merged_with": [
+        "dronet#0_dispatch_3",
+        "dronet#0_dispatch_4",
+        "dronet#0_dispatch_5",
+        "dronet#0_dispatch_6",
+        "dronet#0_dispatch_7"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "dronet$dispatch_3_GEMMINI_op",
+        "dronet$dispatch_4_GEMMINI_op",
+        "dronet$dispatch_5_GEMMINI_op",
+        "dronet$dispatch_6_GEMMINI_op",
+        "dronet$dispatch_7_GEMMINI_op"
+      ]
+    },
+    "dronet#0_dispatch_8": {
+      "id": 8,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_0"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 15.034028999999999,
+      "duration": 0.396932,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_8_GEMMINI_op",
+      "op_kind": "conv2d_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_9": {
+      "id": 9,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_2",
+        "dronet#0_dispatch_8"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 15.430960999999998,
+      "duration": 0.50291,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_9_GEMMINI_op",
+      "op_kind": "add_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_10": {
+      "id": 10,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_9"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 15.933870999999998,
+      "duration": 0.0,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_10_GEMMINI_op",
+      "op_kind": "batchnorm2d_s8",
+      "instance": 0,
+      "merged_with": [
+        "dronet#0_dispatch_11",
+        "dronet#0_dispatch_12",
+        "dronet#0_dispatch_13",
+        "dronet#0_dispatch_14",
+        "dronet#0_dispatch_15"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "dronet$dispatch_11_GEMMINI_op",
+        "dronet$dispatch_12_GEMMINI_op",
+        "dronet$dispatch_13_GEMMINI_op",
+        "dronet$dispatch_14_GEMMINI_op",
+        "dronet$dispatch_15_GEMMINI_op"
+      ]
+    },
+    "dronet#0_dispatch_16": {
+      "id": 16,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_9"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 17.167106999999998,
+      "duration": 0.152312,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_16_GEMMINI_op",
+      "op_kind": "conv2d_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_17": {
+      "id": 17,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_10",
+        "dronet#0_dispatch_16"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 17.319418999999996,
+      "duration": 0.251551,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_17_GEMMINI_op",
+      "op_kind": "add_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_18": {
+      "id": 18,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_17"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 17.570969999999996,
+      "duration": 0.0,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_18_GEMMINI_op",
+      "op_kind": "batchnorm2d_s8",
+      "instance": 0,
+      "merged_with": [
+        "dronet#0_dispatch_19",
+        "dronet#0_dispatch_20",
+        "dronet#0_dispatch_21",
+        "dronet#0_dispatch_22"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "dronet$dispatch_19_GEMMINI_op",
+        "dronet$dispatch_20_GEMMINI_op",
+        "dronet$dispatch_21_GEMMINI_op",
+        "dronet$dispatch_22_GEMMINI_op"
+      ]
+    },
+    "dronet#0_dispatch_23": {
+      "id": 23,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_18"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 19.917546999999978,
+      "duration": 0.125969,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_23_GEMMINI_op",
+      "op_kind": "conv2d_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_24": {
+      "id": 24,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_17"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.04351599999998,
+      "duration": 0.092394,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_24_GEMMINI_op",
+      "op_kind": "conv2d_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_25": {
+      "id": 25,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_23",
+        "dronet#0_dispatch_24"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.135909999999978,
+      "duration": 0.0,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_25_GEMMINI_op",
+      "op_kind": "add_s8",
+      "instance": 0,
+      "merged_with": [
+        "dronet#0_dispatch_26"
+      ],
+      "is_fused": true,
+      "merged_module_names": [
+        "dronet$dispatch_26_GEMMINI_op"
+      ]
+    },
+    "dronet#0_dispatch_27": {
+      "id": 27,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_25"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.717295999999976,
+      "duration": 0.021618,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_27_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_28": {
+      "id": 28,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_25"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.696115999999975,
+      "duration": 0.02118,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_28_GEMMINI_op",
+      "op_kind": "linear_s8",
+      "instance": 0
+    },
+    "dronet#0_dispatch_29": {
+      "id": 29,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dronet#0_dispatch_28"
+      ],
+      "hardware_target": "CPU_P#0",
+      "start_time": 20.750121999999973,
+      "duration": 0.001,
+      "job_name": "dronet0",
+      "module_name": "dronet$dispatch_29_GEMMINI_op",
+      "op_kind": "sigmoid_s8",
+      "instance": 0
+    }
+  }
+}
