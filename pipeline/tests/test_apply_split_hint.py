@@ -100,5 +100,59 @@ class LinearSplitRejectTest(unittest.TestCase):
             apply_split_hint(g, [{"op": 0, "n_splits": 1}])
 
 
+def _conv2d_op(did, name, N=1, IC=3, IH=8, IW=8, OC=16, KH=3, KW=3,
+               inputs=("x",), outputs=("y",), depends_on=()):
+    return {
+        "name": name, "op": "conv2d_s8",
+        "inputs": list(inputs), "outputs": list(outputs),
+        "weight": f"{name}.weight_q", "bias": f"{name}.bias_q",
+        "shape": {"N": N, "IC": IC, "IH": IH, "IW": IW, "OC": OC,
+                  "KH": KH, "KW": KW, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        "quant": {
+            "input_offset": 0, "filter_offset": 0, "output_offset": 0,
+            "output_multiplier": 1845733646, "output_shift": 7,
+            "activation_min": -128, "activation_max": 127,
+        },
+        "dispatch_id": did, "hardware_target": "any",
+        "depends_on": list(depends_on),
+    }
+
+
+class Conv2dSplitBasicTest(unittest.TestCase):
+
+    def test_splits_one_conv2d_into_two_tiles_along_oc(self):
+        g = _g(_conv2d_op(0, "c0", OC=16))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 2)
+        t0, t1 = ops
+        self.assertEqual(t0["shape"]["OC"], 8)
+        self.assertEqual(t1["shape"]["OC"], 8)
+        self.assertEqual(t0["outputs"], ["y.tile_0"])
+        self.assertEqual(t1["outputs"], ["y.tile_1"])
+        self.assertEqual(t0["split_from"]["axis"], "OC")
+        self.assertEqual(t0["split_from"]["tile_offset_OC"], 0)
+        self.assertEqual(t1["split_from"]["tile_offset_OC"], 8)
+        # IC/IH/IW unchanged
+        self.assertEqual(t0["shape"]["IC"], 3)
+
+    def test_reject_oc_not_dividing(self):
+        g = _g(_conv2d_op(0, "c0", OC=15))
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+
+    def test_downstream_depends_on_all_conv_tiles(self):
+        g = _g(
+            _conv2d_op(0, "c0", OC=16),
+            _conv2d_op(1, "c1", IC=16, OC=8,
+                       inputs=["y"], outputs=["z"], depends_on=[0]),
+        )
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 3)
+        tail = ops[-1]
+        self.assertEqual(set(tail["depends_on"]), {0, 1})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,82 @@
+{
+  "dot_file": "",
+  "dispatches": {
+    "dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": []
+    },
+    "dispatch_1": {
+      "id": 1,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dispatch_0"
+      ]
+    },
+    "dispatch_2.tile_0": {
+      "id": 7,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dispatch_1"
+      ],
+      "split_from": {
+        "orig": "dispatch_2",
+        "tile": 0,
+        "n_splits": 2
+      }
+    },
+    "dispatch_2.tile_1": {
+      "id": 8,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dispatch_1"
+      ],
+      "split_from": {
+        "orig": "dispatch_2",
+        "tile": 1,
+        "n_splits": 2
+      }
+    },
+    "dispatch_3": {
+      "id": 3,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dispatch_2.tile_0",
+        "dispatch_2.tile_1"
+      ]
+    },
+    "dispatch_4": {
+      "id": 4,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dispatch_3"
+      ]
+    },
+    "dispatch_5": {
+      "id": 5,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dispatch_4"
+      ]
+    },
+    "dispatch_6": {
+      "id": 6,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "dispatch_5"
+      ]
+    }
+  },
+  "_split_applied": {
+    "orig_n": 7,
+    "new_n": 8
+  }
+}

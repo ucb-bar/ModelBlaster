@@ -51,7 +51,11 @@ XPURT_ROOT = Path("/scratch2/agustin/XPU-RT")
 # ─────────────── candidate scoping ────────────────────────────────────────
 
 REALIZABLE_FUSE_TYPES = {"fuse_linear_chain", "fuse_producer_consumer"}
-REALIZABLE_SPLIT_KINDS = {"linear_s8"}  # apply_split_hint covers this
+# apply_split_hint covers both linear_s8 (along N) and conv2d_s8 (along OC)
+# as of the conv2d_s8 splitter addition. The candidate's `affected`
+# dispatches encode the op kind only indirectly via the name; we accept
+# both `linear` and `conv` patterns.
+REALIZABLE_SPLIT_KINDS = {"linear_s8", "conv2d_s8"}
 
 
 @dataclass
@@ -122,16 +126,14 @@ def classify_realizability(cand: dict) -> tuple[bool, str]:
     if ctype in REALIZABLE_FUSE_TYPES:
         return True, "fuse via apply_fusion_hint --pairwise (linear_s8_elu_s8 KernelSpec exists)"
     if ctype == "split_heavy_dispatch":
-        # split_ops are op-kind-specific in apply_split_hint; only
-        # linear_s8 is supported today.
-        # The candidate's `affected` is a dispatch name like
-        # "dronet1_dispatch_0" which doesn't carry op kind. Inspect via
-        # dispatch_id heuristic: if affected[0] contains 'linear', call it
-        # realizable; else flag as not-yet (conv2d_s8 is the common case).
-        if affected and any("linear" in a for a in affected):
-            return True, "split via apply_split_hint (linear_s8 along N)"
-        return False, ("conv2d_s8 split (or other non-linear) not realizable yet "
-                       "— apply_split_hint Phase 1e covers linear_s8 only")
+        # apply_split_hint covers linear_s8 (N) and conv2d_s8 (OC). The
+        # candidate's `affected` is a dispatch name like "dronet1_dispatch_0"
+        # — we don't know the op kind from the name alone, but both are
+        # supported, so realizable for either. The downstream
+        # apply_split_hint call will surface SplitHintError if the op kind
+        # is something we don't support yet (e.g. matmul_s8 along N).
+        return True, ("split via apply_split_hint (linear_s8 along N OR "
+                      "conv2d_s8 along OC; both supported)")
     return False, f"unknown candidate type {ctype}"
 
 
