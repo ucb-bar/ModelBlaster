@@ -1,0 +1,76 @@
+{
+  "yolo_anchor": {
+    "policy": "yolo_anchor",
+    "status": "ok",
+    "solve_wall_s": 5.465,
+    "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_greedy_periodic_profiled.json",
+    "makespan": 61.19647900000001,
+    "n_deadline_miss": 67,
+    "n_release_viol": 0,
+    "n_dispatches": 236,
+    "n_shards_applied": 0,
+    "n_fuses_applied": 0,
+    "policy_log": [
+      {
+        "action": "policy_anchor",
+        "intent": "anchor on heaviest aperiodic (yolov8) via greedy_periodic"
+      }
+    ]
+  },
+  "periodic_anchor": {
+    "policy": "periodic_anchor",
+    "status": "ok",
+    "solve_wall_s": 2.979,
+    "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_decomposed_profiled.json",
+    "makespan": 75.570546,
+    "n_deadline_miss": 0,
+    "n_release_viol": 0,
+    "n_dispatches": 248,
+    "n_shards_applied": 0,
+    "n_fuses_applied": 0,
+    "policy_log": [
+      {
+        "action": "policy_anchor",
+        "intent": "reserve periodic slots first via decomposed solver"
+      }
+    ]
+  },
+  "critical_path_first": {
+    "policy": "critical_path_first",
+    "status": "ok",
+    "solve_wall_s": 1.784,
+    "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_heft_profiled.json",
+    "makespan": 54.429872,
+    "n_deadline_miss": 88,
+    "n_release_viol": 0,
+    "n_dispatches": 245,
+    "n_shards_applied": 0,
+    "n_fuses_applied": 0,
+    "policy_log": [
+      {
+        "action": "policy_anchor",
+        "intent": "CP-first global ordering via heft upward_rank"
+      }
+    ]
+  },
+  "cpsat_unconstrained": {
+    "policy": "cpsat_unconstrained",
+    "status": "ok",
+    "solve_wall_s": 32.058,
+    "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_cpsat_profiled.json",
+    "makespan": 186.735133,
+    "n_deadline_miss": 65,
+    "n_release_viol": 0,
+    "n_dispatches": 207,
+    "n_shards_applied": 0,
+    "n_fuses_applied": 0,
+    "policy_log": [
+      {
+        "action": "use_underlying",
+        "scheduler": "cpsat",
+        "reason": "exact solver, no pre-applied structure",
+        "delta": null
+      }
+    ]
+  }
+}
