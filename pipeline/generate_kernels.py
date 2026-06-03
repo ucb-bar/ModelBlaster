@@ -326,6 +326,15 @@ def emit_kernels_c(
     if backend is not None:
         parts.append(f"/* target: {backend.name} */")
         for inc in backend.kernel_includes:
+            # If the backend pulls in saturn_opu.h, inject the
+            # SATURN_OPU_KEEP_REGISTER_MACROS opt-in BEFORE the include
+            # so the m0..m3 / v0..v31 #defines stay alive for OPU macro
+            # calls. Without this the assembler rejects every macro call
+            # with `bad value for funct2 field`. Doing this here means
+            # neither curated nor LLM-generated kernels need to remember
+            # the guard themselves — it's mechanical, not stochastic.
+            if "saturn_opu.h" in inc:
+                parts.append("#define SATURN_OPU_KEEP_REGISTER_MACROS")
             parts.append(f"#include {inc}")
     parts += ['#include "kernels.h"', ""]
     for op in sorted(impls):
