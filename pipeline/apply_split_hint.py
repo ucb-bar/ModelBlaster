@@ -96,6 +96,40 @@ _SPLITTABLE: dict[str, Any] = {
 }
 
 
+def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
+                           n_splits: int, tile_n: int) -> None:
+    """When we split a linear_s8 op along N, the per-tile output names
+    (`<orig>.tile_<i>`) need entries in the IR's tensors dict so the
+    downstream skeleton emitter can allocate buffers for them. The
+    tile shape is the parent op's output shape with the last dim
+    (N) replaced by tile_n.
+
+    Without this, generate_skeleton.py walks `graph["tensors"]` to
+    emit `buf_<network>_<tensor>[size]` definitions, the tile tensors
+    aren't found, and `model.c` references undeclared `buf_..._tile_0`
+    at link time."""
+    tensors = graph.setdefault("tensors", {})
+    out_name = op["outputs"][0]
+    parent = tensors.get(out_name)
+    if not parent or "shape" not in parent:
+        return  # nothing to do — IR has no shape info for this tensor
+    parent_shape = list(parent["shape"])
+    if not parent_shape:
+        return
+    tile_shape = list(parent_shape)
+    tile_shape[-1] = tile_n  # split along last (N) dimension
+    for t in range(n_splits):
+        tile_name = f"{out_name}.tile_{t}"
+        if tile_name not in tensors:
+            tensors[tile_name] = {
+                "shape": tile_shape,
+                "dtype": parent.get("dtype", "i8"),
+                "split_from": out_name,
+                "tile": t,
+                "n_splits": n_splits,
+            }
+
+
 def apply_split_hint(graph: dict[str, Any],
                      split_ops: list[dict[str, Any]]) -> dict[str, Any]:
     """Rewrite `graph` so each op listed in `split_ops` is decomposed
@@ -139,6 +173,12 @@ def apply_split_hint(graph: dict[str, Any],
             n = target_ids[did]
             splitter = _SPLITTABLE[op["op"]]
             tile_ops = splitter(op, n, network)
+            # Register the per-tile output tensors in the IR's tensors
+            # dict so generate_skeleton can allocate per-tile buffers
+            # (fixes "buf_<network>_<out>_tile_0 undeclared" build error).
+            if tile_ops and "shape" in tile_ops[0]:
+                _register_tile_tensors(out, op, n,
+                                       tile_ops[0]["shape"].get("N", 0))
             new_tile_ids: list[int] = []
             for tile in tile_ops:
                 tile["dispatch_id"] = next_new_id
