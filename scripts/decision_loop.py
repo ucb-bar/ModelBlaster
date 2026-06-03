@@ -217,6 +217,15 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--networks-json", required=True)
     ap.add_argument("--baseline-solver", default="decomposed")
+    ap.add_argument("--policy", default=None,
+                    choices=[None, "yolo_anchor", "periodic_anchor",
+                             "critical_path_first", "cpsat_unconstrained"],
+                    help="Phase C policy. When set, overrides "
+                         "--baseline-solver per the policy's mapping: "
+                         "yolo_anchor→greedy_periodic, "
+                         "periodic_anchor→decomposed, "
+                         "critical_path_first→heft, "
+                         "cpsat_unconstrained→cpsat.")
     ap.add_argument("--network", required=True,
                     help="Which network's IR to rewrite (e.g. mlp_control). "
                          "Candidates affecting other networks are logged but skipped.")
@@ -233,6 +242,18 @@ def main(argv=None) -> int:
                     help="Acceptance threshold on measured Δcycles_total.")
     ap.add_argument("--out-dir", required=True, type=Path)
     args = ap.parse_args(argv)
+
+    # Phase C5: --policy overrides --baseline-solver via documented map.
+    _POLICY_TO_SOLVER = {
+        "yolo_anchor": "greedy_periodic",
+        "periodic_anchor": "decomposed",
+        "critical_path_first": "heft",
+        "cpsat_unconstrained": "cpsat",
+    }
+    if args.policy:
+        args.baseline_solver = _POLICY_TO_SOLVER[args.policy]
+        print(f"[decision_loop] --policy={args.policy} → "
+              f"baseline_solver={args.baseline_solver}")
 
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
