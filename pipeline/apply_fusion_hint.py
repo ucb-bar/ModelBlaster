@@ -199,6 +199,18 @@ def _build_fused_op(
     fused_op_kind = "__fused__" + "__".join(sub_op_names)
     if len(group_ops) == 2 and sub_op_names == ["linear_s8", "elu_s8"]:
         fused_op_kind = "linear_s8_elu_s8"
+    # Phase E2: BatchNorm→SiLU fusion (yolov8 hot path, 57 candidate
+    # pairs identified by Phase E1 gap survey). Maps to the registered
+    # BATCHNORM2D_SILU_S8 KernelSpec — LUT-based, intermediate stays in
+    # registers.
+    if len(group_ops) == 2 and sub_op_names == ["batchnorm2d_s8", "silu_s8"]:
+        fused_op_kind = "batchnorm2d_silu_s8"
+    # Phase E2: Conv2D→BatchNorm fusion (yolov8 + dronet, 60 candidate
+    # pairs — the top-1 fusion gap on the headline workload). Maps to
+    # the registered CONV2D_BATCHNORM2D_S8 KernelSpec — BN affine folds
+    # into conv's requantize epilogue.
+    if len(group_ops) == 2 and sub_op_names == ["conv2d_s8", "batchnorm2d_s8"]:
+        fused_op_kind = "conv2d_batchnorm2d_s8"
     return {
         "name": f"{network}.fused_{group[0]}_{group[-1]}",
         "op": fused_op_kind,

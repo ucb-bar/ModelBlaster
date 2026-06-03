@@ -15,6 +15,22 @@
         "elu"
       ],
       "dtype": "s8"
+    },
+    {
+      "op": "conv2d_batchnorm2d_s8",
+      "components": [
+        "conv2d",
+        "batchnorm2d"
+      ],
+      "dtype": "s8"
+    },
+    {
+      "op": "batchnorm2d_silu_s8",
+      "components": [
+        "batchnorm2d",
+        "silu"
+      ],
+      "dtype": "s8"
     }
   ],
   "candidate_pairs_seen": {
@@ -34,24 +50,6 @@
     "cat2_c1_s8__conv2d_s8": 4
   },
   "gaps_unregistered": [
-    {
-      "pair": "conv2d_s8__batchnorm2d_s8",
-      "candidate_count": 60,
-      "components": [
-        "conv2d_s8",
-        "batchnorm2d_s8"
-      ],
-      "already_registered": false
-    },
-    {
-      "pair": "batchnorm2d_s8__silu_s8",
-      "candidate_count": 57,
-      "components": [
-        "batchnorm2d_s8",
-        "silu_s8"
-      ],
-      "already_registered": false
-    },
     {
       "pair": "silu_s8__chunk2_c1",
       "candidate_count": 8,
@@ -135,6 +133,24 @@
     }
   ],
   "gaps_registered": [
+    {
+      "pair": "conv2d_s8__batchnorm2d_s8",
+      "candidate_count": 60,
+      "components": [
+        "conv2d_s8",
+        "batchnorm2d_s8"
+      ],
+      "already_registered": true
+    },
+    {
+      "pair": "batchnorm2d_s8__silu_s8",
+      "candidate_count": 57,
+      "components": [
+        "batchnorm2d_s8",
+        "silu_s8"
+      ],
+      "already_registered": true
+    },
     {
       "pair": "silu_s8__conv2d_s8",
       "candidate_count": 29,
