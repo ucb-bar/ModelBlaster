@@ -1,0 +1,378 @@
+{
+  "name": "mlp_control",
+  "version": 1,
+  "quant": "int8",
+  "input": {
+    "tensor": "x"
+  },
+  "output": {
+    "tensors": [
+      "mlp_6"
+    ],
+    "tensor": "mlp_6"
+  },
+  "tensors": {
+    "x": {
+      "shape": [
+        1,
+        16
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.013284357513968401,
+        "zero_point": 0
+      }
+    },
+    "mlp_0": {
+      "shape": [
+        1,
+        256
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0492792955533726,
+        "zero_point": 0
+      }
+    },
+    "mlp_1": {
+      "shape": [
+        1,
+        256
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.0483740859144316,
+        "zero_point": 0
+      }
+    },
+    "mlp_2": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.17312730203463336,
+        "zero_point": 0
+      }
+    },
+    "mlp_3": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.15518244044987237,
+        "zero_point": 0
+      }
+    },
+    "mlp_4": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.11439899384506105,
+        "zero_point": 0
+      }
+    },
+    "mlp_5": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.06678451327827033,
+        "zero_point": 0
+      }
+    },
+    "mlp_6": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.1147797501931979,
+        "zero_point": 0
+      }
+    },
+    "mlp_2.tile_0": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "i8",
+      "split_from": "mlp_2",
+      "tile": 0,
+      "n_splits": 2
+    },
+    "mlp_2.tile_1": {
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "i8",
+      "split_from": "mlp_2",
+      "tile": 1,
+      "n_splits": 2
+    }
+  },
+  "ops": [
+    {
+      "name": "mlp.0",
+      "op": "linear_s8",
+      "inputs": [
+        "x"
+      ],
+      "outputs": [
+        "mlp_0"
+      ],
+      "weight": "mlp.0.weight_q",
+      "bias": "mlp.0.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 16,
+        "N": 256
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1845733646,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 0,
+      "hardware_target": "any",
+      "depends_on": []
+    },
+    {
+      "name": "mlp.1",
+      "op": "elu_s8",
+      "inputs": [
+        "mlp_0"
+      ],
+      "outputs": [
+        "mlp_1"
+      ],
+      "shape": {
+        "n": 256
+      },
+      "quant": {
+        "scale_in": 0.0492792955533726,
+        "scale_out": 0.0483740859144316,
+        "activation_min": -128,
+        "activation_max": 127,
+        "alpha": 1.0
+      },
+      "dispatch_id": 1,
+      "hardware_target": "any",
+      "depends_on": [
+        0
+      ]
+    },
+    {
+      "name": "mlp.2.tile_0",
+      "op": "linear_s8",
+      "inputs": [
+        "mlp_1"
+      ],
+      "outputs": [
+        "mlp_2.tile_0"
+      ],
+      "weight": "mlp.2.weight_q",
+      "bias": "mlp.2.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 256,
+        "N": 64
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1110483990,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 2,
+      "hardware_target": "any",
+      "depends_on": [
+        1
+      ],
+      "split_from": {
+        "op_id": 2,
+        "tile": 0,
+        "n_splits": 2,
+        "tile_n": 64,
+        "tile_offset_N": 0
+      }
+    },
+    {
+      "name": "mlp.2.tile_1",
+      "op": "linear_s8",
+      "inputs": [
+        "mlp_1"
+      ],
+      "outputs": [
+        "mlp_2.tile_1"
+      ],
+      "weight": "mlp.2.weight_q",
+      "bias": "mlp.2.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 256,
+        "N": 64
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1110483990,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 3,
+      "hardware_target": "any",
+      "depends_on": [
+        1
+      ],
+      "split_from": {
+        "op_id": 2,
+        "tile": 1,
+        "n_splits": 2,
+        "tile_n": 64,
+        "tile_offset_N": 64
+      }
+    },
+    {
+      "name": "mlp.3",
+      "op": "elu_s8",
+      "inputs": [
+        "mlp_2"
+      ],
+      "outputs": [
+        "mlp_3"
+      ],
+      "shape": {
+        "n": 128
+      },
+      "quant": {
+        "scale_in": 0.17312730203463336,
+        "scale_out": 0.15518244044987237,
+        "activation_min": -128,
+        "activation_max": 127,
+        "alpha": 1.0
+      },
+      "dispatch_id": 4,
+      "hardware_target": "any",
+      "depends_on": [
+        2,
+        3
+      ]
+    },
+    {
+      "name": "mlp.4",
+      "op": "linear_s8",
+      "inputs": [
+        "mlp_3"
+      ],
+      "outputs": [
+        "mlp_4"
+      ],
+      "weight": "mlp.4.weight_q",
+      "bias": "mlp.4.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 128,
+        "N": 64
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1146682164,
+        "output_shift": 7,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 5,
+      "hardware_target": "any",
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "name": "mlp.5",
+      "op": "elu_s8",
+      "inputs": [
+        "mlp_4"
+      ],
+      "outputs": [
+        "mlp_5"
+      ],
+      "shape": {
+        "n": 64
+      },
+      "quant": {
+        "scale_in": 0.11439899384506105,
+        "scale_out": 0.06678451327827033,
+        "activation_min": -128,
+        "activation_max": 127,
+        "alpha": 1.0
+      },
+      "dispatch_id": 6,
+      "hardware_target": "any",
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "name": "mlp.6",
+      "op": "linear_s8",
+      "inputs": [
+        "mlp_5"
+      ],
+      "outputs": [
+        "mlp_6"
+      ],
+      "weight": "mlp.6.weight_q",
+      "bias": "mlp.6.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 64,
+        "N": 4
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 2091447846,
+        "output_shift": 9,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 7,
+      "hardware_target": "any",
+      "depends_on": [
+        6
+      ]
+    }
+  ],
+  "dispatches": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ]
+}
