@@ -26,6 +26,11 @@
 #   <out-dir>/PASS or FAIL           verify gate
 
 set -uo pipefail
+# yolov8 build+run is ~30s and produces ~200 dispatch rows of profile
+# table. `tee | grep ...` upstream produced SIGPIPE that propagated to
+# the build/run, killing it with rc=141 mid-run. Disable pipefail on
+# the tee leg by writing the log file directly and tailing afterward.
+:
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -111,7 +116,7 @@ RUN_STATUS=0
 LLM_PROVIDER="${LLM_PROVIDER:-bedrock}" \
 BACKEND="${BACKEND}" RUNNER="${RUNNER}" TARGET="${TARGET}" QUANT="${QUANT}" \
     uv run bash "${REPO_ROOT}/examples/${MODEL}/run.sh" \
-    2>&1 | tee "${OUT_DIR}/spike.log" || RUN_STATUS=$?
+    > "${OUT_DIR}/spike.log" 2>&1 || RUN_STATUS=$?
 
 # Restore original IR FIRST, regardless of build outcome
 cp "${BACKUP}" "${IR_ORIG}"
