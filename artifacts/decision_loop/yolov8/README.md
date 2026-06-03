@@ -105,3 +105,81 @@ splits (wall-clock multi-core, not per-op cycles).
 - `round_001/` — the auto-loop run that found 0 yolov8 candidates
   via granularity (granularity_result.json shows the top-K it did
   consider).
+
+---
+
+## Wall-clock test (honest answer after loader fix)
+
+Ran `scripts/wallclock_split_eval.py` on the dispatch_177 split with
+two iterations of the profile_loader fix:
+
+**First attempt (round 7-style bug):** AFTER=75.32 ms (Δ -0.25 ms,
+looked like accept). Inspection showed both tiles had dur=0.0 in the
+fixture — same bookkeeping fiction as the prior session. The 0.25 ms
+"improvement" was scheduling-rearrangement noise around zero-cost
+tiles, not real parallelism.
+
+**Loader patch v1 (committed earlier):** parent cycles / n_splits
+fallback. Still didn't fire because the split rewrite REPLACED the
+parent dispatch in the graph, so `dispatches[parent_name]` returned
+None.
+
+**Loader patch v2 (this round):** parse `dispatch_<int>` directly
+from the parent name string. Now tile cycles correctly resolve to
+parent_cycles / n_splits.
+
+**After v2:**
+
+| | Makespan | Tile placement |
+|:---|---:|:---|
+| BEFORE | 75.57 ms | dispatch_177 on CPU_P#0, dur=0.6546 ms |
+| AFTER  | 75.57 ms | tile_0 on CPU_P#0 dur=0.3273, tile_1 on CPU_P#0 dur=0.3273 (sequential, NOT parallel) |
+| Δ      | 0.00 ms  | — |
+
+**The real result:** with proper cycle accounting, the decomposed
+scheduler placed BOTH tiles on CPU_P#0 sequentially. tile_0 starts
+at 71.5062, tile_1 starts at 71.8335 (= 71.5062 + 0.3273). Total
+contribution = 0.6546 ms = same as the unsplit dispatch.
+
+### Why both tiles stayed on the same core
+
+yolov8's network entry in the workload JSON has `preferred_hw =
+gemmini` (the bigger of the two accelerator classes for this
+network). `profile_loader.py` applies a 1000× penalty multiplier
+to non-preferred-hw machine combos. So even though tile_1 *could*
+run on CPU_E#0 (OPU+RVV), the scheduler sees CPU_E#0 as 1000× more
+expensive than CPU_P#0 and never picks it.
+
+The scheduler is doing what its configuration says. The
+configuration is locking out the parallelism win that splitting
+should provide.
+
+### The actual question this exposes
+
+> *When you split a heavy op into 2 tiles, do you want both tiles
+> to stay on the preferred hardware class (cache locality, no
+> cross-cluster cost), or do you want one tile to migrate to a
+> different class (parallelism win, but possibly slower per-tile
+> compute)?*
+
+Today the workload's `preferred_hw` answer is "stay on gemmini" —
+and the scheduler obeys. For the agent's split decisions to ever
+ACCEPT, we'd need one of:
+
+1. **Relax preferred_hw for split tiles.** Mark tile_1 as
+   "preferred_hw = OPU" or "no preference" so the scheduler
+   considers both core classes. Requires a small extension in
+   apply_split_hint.py to tag tiles with alternate preferred_hw.
+2. **Per-tile profile data on the non-preferred hw.** The
+   profile DB only has yolov8 cycles for gemmini_q31. If we had
+   measured yolov8 ops on OPU/RVV too, the scheduler could compare
+   honestly. Otherwise the 1000× penalty stays inviolate.
+3. **Use a workload without preferred_hw pinning.** Trade-off:
+   without pinning, the scheduler considers all cross-class
+   placements, but cross-cluster overhead (e.g. CPU_P→CPU_E
+   cache cold) might dominate the parallelism win.
+
+This is the actual next layer of work. The IR rewrite, the
+skeleton emitter, the measurement primitive, and the profile-DB
+ingestion are all working correctly. The bottleneck has moved up
+the stack to the scheduler's HW-pinning configuration.
