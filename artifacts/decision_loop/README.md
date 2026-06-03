@@ -239,3 +239,65 @@ table lookup before drain). That's an LLM-prompt change in
 `pipeline/reference_kernels.py`, not a kernel that needs to be
 hand-written — Bedrock can produce it, given the right seed. Follow-up.
 
+
+---
+
+## Round 5: linear_s8 split end-to-end (post-buffer-emitter-fix)
+
+The skeleton emitter gap from round 3 — `buf_<network>_<tensor>_tile_N`
+undeclared at link time — is fixed. `pipeline/apply_split_hint.py`
+now registers per-tile output tensors in the graph's `tensors` dict
+(`_register_tile_tensors` helper) so `generate_skeleton.py` allocates
+the buffers correctly. The 6 existing split unit tests still pass.
+
+Smoke result with the manual hint
+(`mlp_control dispatch_2: linear_s8 K=256 N=128 → 2× N=64 tiles`),
+`BACKEND=reference RUNNER=spike`:
+
+| | mlp.2 → | tile_0 (linear_s8 K=256 N=64) | tile_1 (linear_s8 K=256 N=64) | total |
+|:---|:---:|---:|---:|---:|
+| BEFORE | mlp.2 (K=256 N=128) = 495,313 | — | — | 730,069 |
+| AFTER  | (split into 2 tiles)          | 247,697 | 247,697 | 727,200 |
+
+Δ = −2,869 cycles (−0.4 %). The compiler-side gain is small and within
+noise; the **real** split value is at the scheduler level: the two
+247k-cycle tiles can run on **different cores** in parallel, which
+on the Gemmini+OPU hetero bitstream would roughly halve the wall-clock
+contribution of that dispatch. On spike (single core, sequential)
+that parallelism gain is invisible.
+
+This is itself a research finding: split's value is **measured at the
+scheduler / wall-clock level, not at the per-op cycle level**. To
+properly accept/reject splits the decision loop would need to:
+1. Apply the split,
+2. Re-emit the dispatch graph (now with 2 tile dispatches),
+3. Re-run the scheduler (which CAN place tiles on different cores),
+4. Compare measured wall-clock makespan, not summed per-op cycles.
+
+That's a different acceptance criterion than fuse (where per-op
+cycles ARE the right metric because fusion eliminates dispatch
+boundaries, not parallelism). The driver's `--epsilon-cycles` check
+correctly says "no significant Δ" here for the spike run — which is
+correct given the metric used.
+
+### Decision-loop summary across rounds
+
+| Round | Backend | Hint | Measured | Verdict | Honest finding |
+|:---:|:---:|:---|---:|:---|:---|
+| 003 | reference | fuse mlp_control[0..5] (×3) | −18.7 % each | REJECT × 3 | curated `linear_s8_elu_s8` is scalar, slower than per-op chain |
+| 003 | reference | split linear_s8 mlp.2 (manual) | BUILD FAIL | (gap) | skeleton emitter didn't allocate tile buffers — FIXED |
+| 004 | llm | fuse mlp_control[0..5] | −793 % | REJECT | Bedrock auto-chose scalar fusion strategy; lost OPU acceleration of per-op linear_s8 |
+| 005 | reference | split linear_s8 mlp.2 (post-fix) | −0.4 % cycles | "below epsilon" | per-op cycle metric is wrong for splits — needs wall-clock makespan from a multi-core scheduler |
+
+### What this leaves on the table for follow-up
+
+- **Wall-clock-makespan acceptance criterion for splits** — add a
+  scheduler re-run to the decision loop and compare predicted
+  parallel makespan with the split tiles on different cores.
+- **OPU-targeted `linear_s8_elu_s8` AlgorithmCandidate** — would let
+  the LLM-fused experiment compete on equal hardware terms. The
+  honest expectation is that fusion would then win (both halves get
+  OPU acceleration + the fused-op handshake savings).
+- **`conv2d_s8` split realization** — the most common split candidate
+  the granularity advisor proposes; Phase 1e covers `linear_s8` only.
+
