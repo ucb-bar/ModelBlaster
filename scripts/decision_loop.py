@@ -57,6 +57,18 @@ REALIZABLE_FUSE_TYPES = {"fuse_linear_chain", "fuse_producer_consumer"}
 # both `linear` and `conv` patterns.
 REALIZABLE_SPLIT_KINDS = {"linear_s8", "conv2d_s8"}
 
+# Phase E3: explicit (producer_op, consumer_op) pairs for which a fused
+# KernelSpec is REGISTERED in pipeline/reference_kernels.py. The
+# fuse-realizability filter looks up the pair here when the candidate
+# carries op-kind metadata; otherwise it falls back to the generic
+# REALIZABLE_FUSE_TYPES check above. Add new pairs here as new
+# KernelSpecs land.
+REALIZABLE_FUSE_PAIRS = {
+    ("linear_s8", "elu_s8"),         # mlp_control hot path
+    ("conv2d_s8", "batchnorm2d_s8"), # yolov8+dronet (E1 top-1 gap, 60 cands)
+    ("batchnorm2d_s8", "silu_s8"),   # yolov8 (E1 top-2 gap, 57 cands)
+}
+
 
 @dataclass
 class CandidateOutcome:
