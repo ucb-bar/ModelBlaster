@@ -1,0 +1,134 @@
+[measure_candidate] hint=artifacts/decision_loop/round_002/_empty_hint.json (modelblaster.fusion_hints/v1)  model=mlp_control
+apply_fusion_hint: no fuse_groups for network 'mlp_control' in artifacts/decision_loop/round_002/_empty_hint.json — copying IR through unchanged
+apply_fusion_hint: wrote artifacts/decision_loop/round_002/baseline/mlp_control.afterhint.graph.json (0 fused ops, 7 total dispatches; input had 7)
+[1/5] extract_graph (quant=int8) -> /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated
+MODELBLASTER_STAGE_BEGIN:extract
+  (skipped — IR present at /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated; set FORCE_EXTRACT=1 to re-run)
+MODELBLASTER_STAGE_END:extract:0.001
+[2/5] generate_skeleton (backend=rvv_opu) -> /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu
+MODELBLASTER_STAGE_BEGIN:generate_skeleton
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/weights.h
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/weights.c
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/model.h
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/model.c
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/buffers.c
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/test_io.h
+MODELBLASTER_STAGE_END:generate_skeleton:0.100
+[3/5] generate_kernels (backend=llm target=rvv_opu quant=int8 optimize=0) -> /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu
+  BEDROCK_CALLS_LOG=/scratch2/agustin/ModelBlaster/benchmarks/results/mlp_control_rvv_opu_int8/2026-06-03T03-08-14Z/llm_calls.jsonl
+MODELBLASTER_STAGE_BEGIN:generate_kernels
+backend=llm  target=rvv_opu  ops=['elu_s8', 'linear_s8']
+  [elu_s8] verify shapes=[{'n': 256}, {'n': 128}, {'n': 64}, {'n': 1}, {'n': 17}, {'n': 256}]
+  [elu_s8] algorithm queue: ['direct']
+  [elu_s8/direct] attempt 1/4: calling us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  [elu_s8/direct] tokens in=16565 out=206 stop=end_turn
+  [elu_s8/direct] verify PASS — spike-harness ok (max_abs_err=0 max_rel_err=0, cycles={'linear_s8': 693111, 'elu_s8': 36958})
+  [elu_s8/direct] cached -> /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/cache/rvv_opu/rvv_opu_elu_s8_direct.c
+  [elu_s8] using algorithm 'direct'
+  [linear_s8] verify shapes=[{'M': 1, 'K': 16, 'N': 256}, {'M': 1, 'K': 256, 'N': 128}, {'M': 1, 'K': 128, 'N': 64}, {'M': 1, 'K': 64, 'N': 4}, {'M': 1, 'K': 16, 'N': 32}, {'M': 1, 'K': 32, 'N': 32}, {'M': 1, 'K': 32, 'N': 10}, {'M': 1, 'K': 7, 'N': 13}, {'M': 4, 'K': 17, 'N': 23}]
+  [linear_s8] target-affinity preference: dropped universal-affinity ['direct'] in favor of ['outerprod']
+  [linear_s8] algorithm queue: ['outerprod']
+  [linear_s8/outerprod] attempt 1/4: calling us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  [linear_s8/outerprod] tokens in=18949 out=1177 stop=end_turn
+  [linear_s8/outerprod] verify FAIL — spike-harness build/run failed:
+      west build failed (rc=1):
+        cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1
+        stdout (tail):
+      ratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/posix/c_lib_ext/getopt -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/midi2/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/common/riscv-privileged/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/rocketchip/virt_riscv/common/. -isystem /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/libc/common/include -fno-strict-aliasing -Os -imacros /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu/zephyr/include/generated/zephyr/autoconf.h -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mabi=lp64d -march=rv64imafdc_zicsr_zifencei -mcmodel=medany -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize --sysroot=/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include -DMODELBLASTER_SATURN_OPU=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c
+      In file included from /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:9:
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c: In function 'kernel_linear_s8_mlp_control':
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:72:17: error: expected ':' or ')' before 'm1'
+         72 |     OPMVINBCAST(m1, v0);
+            |                 ^~
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83:16: error: expected ':' or ')' before 'm1'
+         83 |         VOPACC(m1, v18, v16);
+            |                ^~
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:89:16: error: expected ':' or ')' before 'v0'
+         89 |         VMV_VR(v0, m, m1);
+            |                ^~
+      ninja: build stopped: subcommand failed.
+      
+        stderr (tail):
+      Loading Zephyr default modules (Zephyr base (cached)).
+      node '/uart' compatible 'ucb,htif' has unknown vendor prefix 'ucb'
+      FATAL ERROR: command exited with status 1: /usr/bin/cmake --build /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu
+  [linear_s8/outerprod] attempt 2/4: calling us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  [linear_s8/outerprod] tokens in=18482 out=1532 stop=end_turn
+  [linear_s8/outerprod] verify FAIL — spike-harness build/run failed:
+      west build failed (rc=1):
+        cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1
+        stdout (tail):
+      /int8/build/rvv_opu/zephyr/include/generated/zephyr -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include -I/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu/zephyr/include/generated -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/libc/picolibc/include -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/posix/c_lib_ext/getopt -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/midi2/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/common/riscv-privileged/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/rocketchip/virt_riscv/common/. -isystem /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/libc/common/include -fno-strict-aliasing -Os -imacros /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu/zephyr/include/generated/zephyr/autoconf.h -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mabi=lp64d -march=rv64imafdc_zicsr_zifencei -mcmodel=medany -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize --sysroot=/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include -DMODELBLASTER_SATURN_OPU=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c: In function 'kernel_linear_s8_mlp_control':
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83:9: warning: 'asm' operand 0 probably does not match constraints
+         83 |         __asm__ volatile(".insn r 0x57, 0x6, 0x5d, 0, %0, 8" : : "i"(m));
+            |         ^~~~~~~
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83:9: error: impossible constraint in 'asm'
+      ninja: build stopped: subcommand failed.
+      
+        stderr (tail):
+      Loading Zephyr default modules (Zephyr base (cached)).
+      node '/uart' compatible 'ucb,htif' has unknown vendor prefix 'ucb'
+      FATAL ERROR: command exited with status 1: /usr/bin/cmake --build /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu
+  [linear_s8/outerprod] attempt 3/4: calling us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  [linear_s8/outerprod] tokens in=18596 out=1510 stop=end_turn
+  [linear_s8/outerprod] verify FAIL — spike-harness build/run failed:
+      west build failed (rc=1):
+        cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1
+        stdout (tail):
+      t8/generated/rvv_opu/kernels.c:77: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:77: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:77: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:77: Error: illegal operands `r 0x57,0x2,0x51,8,18,16'
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: bad value for funct2 field, value must be 0...3
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83: Error: illegal operands `r 0x57,0x6,0x5d,0,a2,8'
+      ninja: build stopped: subcommand failed.
+      
+        stderr (tail):
+      Loading Zephyr default modules (Zephyr base (cached)).
+      node '/uart' compatible 'ucb,htif' has unknown vendor prefix 'ucb'
+      FATAL ERROR: command exited with status 1: /usr/bin/cmake --build /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu
+  [linear_s8/outerprod] attempt 4/4: calling us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  [linear_s8/outerprod] tokens in=18475 out=1432 stop=end_turn
+  [linear_s8/outerprod] verify FAIL — spike-harness build/run failed:
+      west build failed (rc=1):
+        cmd: west build -b spike_riscv64 harness --build-dir /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu -- -DMODEL_DIR=/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu -DMODELBLASTER_BACKEND=rvv_opu -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include;-DMODELBLASTER_SATURN_OPU=1
+        stdout (tail):
+      ratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/posix/c_lib_ext/getopt -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/midi2/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/common/riscv-privileged/. -I/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/soc/rocketchip/virt_riscv/common/. -isystem /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/lib/libc/common/include -fno-strict-aliasing -Os -imacros /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu/zephyr/include/generated/zephyr/autoconf.h -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mabi=lp64d -march=rv64imafdc_zicsr_zifencei -mcmodel=medany -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize --sysroot=/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/riscv64-zephyr-elf -imacros /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wdouble-promotion -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -ftls-model=local-exec -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/scratch2/agustin/ModelBlaster/harness=CMAKE_SOURCE_DIR -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws=WEST_TOPDIR -ffunction-sections -fdata-sections -specs=picolibc.specs -std=gnu17 -march=rv64gcv -mabi=lp64d -isystem/scratch2/agustin/ModelBlaster/cores/saturn_opu/include -DMODELBLASTER_SATURN_OPU=1 -MD -MT CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj -MF CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj.d -o CMakeFiles/app.dir/scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c.obj -c /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c
+      In file included from /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:9:
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c: In function 'kernel_linear_s8_mlp_control':
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:66:17: error: expected ':' or ')' before 'm1'
+         66 |     OPMVINBCAST(m1, v0);
+            |                 ^~
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:77:16: error: expected ':' or ')' before 'm1'
+         77 |         VOPACC(m1, v18, v16);
+            |                ^~
+      /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/kernels.c:83:16: error: expected ':' or ')' before 'v0'
+         83 |         VMV_VR(v0, m, m1);
+            |                ^~
+      ninja: build stopped: subcommand failed.
+      
+        stderr (tail):
+      Loading Zephyr default modules (Zephyr base (cached)).
+      node '/uart' compatible 'ucb,htif' has unknown vendor prefix 'ucb'
+      FATAL ERROR: command exited with status 1: /usr/bin/cmake --build /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/build/rvv_opu
+  [linear_s8/outerprod] gave up after 4 attempts
+  [linear_s8] all 1 algorithms exhausted
+failed to generate kernel for op 'linear_s8' after 4 attempts
+
+--- stderr ---

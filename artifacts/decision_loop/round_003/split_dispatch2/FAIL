@@ -1,0 +1,12 @@
+FAIL: build error after IR split — generate_skeleton's buffer allocator
+does not yet emit `buf_<network>_<orig>_tile_<i>` for split tile outputs.
+The split IR rewrite (pipeline/apply_split_hint.py Phase 1e) is correct
+per its unit tests but the downstream skeleton emitter (model.c lines
+158, 169) still references the un-split buffer names.
+
+Errors:
+  model.c:158:110: 'buf_mlp_control_mlp_2_tile_0' undeclared
+  model.c:169:110: 'buf_mlp_control_mlp_2_tile_1' undeclared
+
+Fix would be in pipeline/generate_skeleton.py — recognize tile-output
+naming convention and allocate per-tile buffer entries.

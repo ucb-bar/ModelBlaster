@@ -1,0 +1,2 @@
+[measure_candidate] hint=artifacts/decision_loop/round_003/_manual_split_hint.json (modelblaster.split_hints/v1)  model=mlp_control
+apply_split_hint: wrote artifacts/decision_loop/round_003/split_dispatch2/mlp_control.afterhint.graph.json (2 tile ops from splits, 8 total dispatches)

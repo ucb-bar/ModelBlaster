@@ -1,0 +1,7 @@
+{
+  "contract": "modelblaster.fusion_hints/v1",
+  "reason": "Phase 2 smoke test: pairwise fuse linear+elu in mlp_control",
+  "networks": [
+    {"network": "mlp_control", "fuse_groups": [[0,1,2,3,4,5]], "n_tiny": 7}
+  ]
+}

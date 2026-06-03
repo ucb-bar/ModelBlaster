@@ -1,0 +1,2 @@
+[measure_candidate] hint=artifacts/decision_loop/round_001/cand_01_fuse_chain_mlp_control1_dispatch_0_mlp_c/hint.json (modelblaster.fusion_hints/v1)  model=mlp_control
+apply_fusion_hint: wrote artifacts/decision_loop/round_001/cand_01_fuse_chain_mlp_control1_dispatch_0_mlp_c/mlp_control.afterhint.graph.json (3 fused ops, 4 total dispatches; input had 7)
