@@ -1,0 +1,155 @@
+{
+  "baseline_solver": "greedy",
+  "baseline_dispatches": 344,
+  "granularity_verdict": "too_fine",
+  "n_candidates": 330,
+  "candidate_types": {
+    "fuse_producer_consumer": 254,
+    "fuse_linear_chain": 51,
+    "split_heavy_dispatch": 25
+  },
+  "overhead_us_proxy": 1.0,
+  "decision": "split",
+  "rationale": "splitting ['dronet1_dispatch_0'] lowers predicted makespan by 0.58 us (exposes parallelism).",
+  "best_merge": {
+    "id": "fuse_chain_mlp_control1_dispatch_0_mlp_control1_dispatch_5",
+    "type": "fuse_linear_chain",
+    "affected": [
+      "mlp_control1_dispatch_0",
+      "mlp_control1_dispatch_1",
+      "mlp_control1_dispatch_2",
+      "mlp_control1_dispatch_3",
+      "mlp_control1_dispatch_4",
+      "mlp_control1_dispatch_5"
+    ],
+    "makespan_delta_us": -0.797,
+    "dispatch_delta": -5,
+    "obj_delta_us": -5.797
+  },
+  "best_split": {
+    "id": "split_dronet1_dispatch_0",
+    "type": "split_heavy_dispatch",
+    "affected": [
+      "dronet1_dispatch_0"
+    ],
+    "makespan_delta_us": -0.58,
+    "dispatch_delta": 1,
+    "obj_delta_us": 0.42
+  },
+  "top_merges": [
+    {
+      "id": "fuse_chain_mlp_control1_dispatch_0_mlp_control1_dispatch_5",
+      "type": "fuse_linear_chain",
+      "affected": [
+        "mlp_control1_dispatch_0",
+        "mlp_control1_dispatch_1",
+        "mlp_control1_dispatch_2",
+        "mlp_control1_dispatch_3",
+        "mlp_control1_dispatch_4",
+        "mlp_control1_dispatch_5"
+      ],
+      "makespan_delta_us": -0.797,
+      "dispatch_delta": -5,
+      "obj_delta_us": -5.797
+    },
+    {
+      "id": "fuse_chain_mlp_control0_dispatch_0_mlp_control0_dispatch_5",
+      "type": "fuse_linear_chain",
+      "affected": [
+        "mlp_control0_dispatch_0",
+        "mlp_control0_dispatch_1",
+        "mlp_control0_dispatch_2",
+        "mlp_control0_dispatch_3",
+        "mlp_control0_dispatch_4",
+        "mlp_control0_dispatch_5"
+      ],
+      "makespan_delta_us": 0.0,
+      "dispatch_delta": -5,
+      "obj_delta_us": -5.0
+    },
+    {
+      "id": "fuse_chain_mlp_control2_dispatch_0_mlp_control2_dispatch_5",
+      "type": "fuse_linear_chain",
+      "affected": [
+        "mlp_control2_dispatch_0",
+        "mlp_control2_dispatch_1",
+        "mlp_control2_dispatch_2",
+        "mlp_control2_dispatch_3",
+        "mlp_control2_dispatch_4",
+        "mlp_control2_dispatch_5"
+      ],
+      "makespan_delta_us": 0.0,
+      "dispatch_delta": -5,
+      "obj_delta_us": -5.0
+    },
+    {
+      "id": "fuse_mlp_control0_dispatch_0__mlp_control0_dispatch_1",
+      "type": "fuse_producer_consumer",
+      "affected": [
+        "mlp_control0_dispatch_0",
+        "mlp_control0_dispatch_1"
+      ],
+      "makespan_delta_us": 0.0,
+      "dispatch_delta": -1,
+      "obj_delta_us": -1.0
+    },
+    {
+      "id": "fuse_mlp_control0_dispatch_1__mlp_control0_dispatch_2",
+      "type": "fuse_producer_consumer",
+      "affected": [
+        "mlp_control0_dispatch_1",
+        "mlp_control0_dispatch_2"
+      ],
+      "makespan_delta_us": 0.0,
+      "dispatch_delta": -1,
+      "obj_delta_us": -1.0
+    }
+  ],
+  "top_splits": [
+    {
+      "id": "split_dronet1_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet1_dispatch_0"
+      ],
+      "makespan_delta_us": -0.58,
+      "dispatch_delta": 1,
+      "obj_delta_us": 0.42
+    },
+    {
+      "id": "split_dronet2_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet2_dispatch_0"
+      ],
+      "makespan_delta_us": -0.126,
+      "dispatch_delta": 1,
+      "obj_delta_us": 0.874
+    },
+    {
+      "id": "split_dronet0_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet0_dispatch_0"
+      ],
+      "makespan_delta_us": 0.0,
+      "dispatch_delta": 1,
+      "obj_delta_us": 1.0
+    }
+  ],
+  "hint": {
+    "contract": "modelblaster.split_hints/v1",
+    "reason": "splitting ['dronet1_dispatch_0'] lowers predicted makespan by 0.58 us (exposes parallelism).",
+    "networks": [
+      {
+        "network": "dronet",
+        "split_ops": [
+          {
+            "op": 0,
+            "n_splits": 2
+          }
+        ]
+      }
+    ]
+  }
+}

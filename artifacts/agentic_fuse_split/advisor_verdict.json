@@ -1,0 +1,16 @@
+{
+  "network": null,
+  "solver_name": null,
+  "deadline_us": 75000.0,
+  "makespan_us": 77715.04300000005,
+  "meets_deadline": false,
+  "margin_us": -2715.043000000049,
+  "margin_pct": -3.6,
+  "deadline_miss_count": 0,
+  "bottleneck_backend": null,
+  "idle_backends": [],
+  "granularity_verdict": "balanced",
+  "recommendations": [],
+  "projected_makespan_us": 77715.043,
+  "projected_meets_deadline": false
+}
