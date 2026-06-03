@@ -1,0 +1,57 @@
+{
+  "network": "mlp_control",
+  "wall_clock_cycles": 950,
+  "total_dispatch_cycles": 96597,
+  "n_dispatches": 7,
+  "dispatches": [
+    {
+      "name": "mlp.0",
+      "op": "linear_s8",
+      "shape": "M=1;K=16;N=256",
+      "cycles": 12110,
+      "pct_of_total": 12.5
+    },
+    {
+      "name": "mlp.1",
+      "op": "elu_s8",
+      "shape": "n=256",
+      "cycles": 20498,
+      "pct_of_total": 21.2
+    },
+    {
+      "name": "mlp.2",
+      "op": "linear_s8",
+      "shape": "M=1;K=256;N=128",
+      "cycles": 36815,
+      "pct_of_total": 38.1
+    },
+    {
+      "name": "mlp.3",
+      "op": "elu_s8",
+      "shape": "n=128",
+      "cycles": 11302,
+      "pct_of_total": 11.7
+    },
+    {
+      "name": "mlp.4",
+      "op": "linear_s8",
+      "shape": "M=1;K=128;N=64",
+      "cycles": 10256,
+      "pct_of_total": 10.6
+    },
+    {
+      "name": "mlp.5",
+      "op": "elu_s8",
+      "shape": "n=64",
+      "cycles": 5158,
+      "pct_of_total": 5.3
+    },
+    {
+      "name": "mlp.6",
+      "op": "linear_s8",
+      "shape": "M=1;K=64;N=4",
+      "cycles": 458,
+      "pct_of_total": 0.5
+    }
+  ]
+}
