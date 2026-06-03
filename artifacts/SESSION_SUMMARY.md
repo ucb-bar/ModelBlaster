@@ -102,10 +102,26 @@ shift is applicable.
 - E1: `scripts/kernel_gap_survey.py` + `artifacts/kernel_gap_survey.json`
   — 188 candidate fuse pairs, top gaps `conv2d→batchnorm` (60) and
   `batchnorm→silu` (57). 117 candidates concentrated in the top 2
-  gaps. Existing fused kernels: `conv2d_silu_s8`, `linear_s8_elu_s8`.
-- E2/E3/E4: framework documented in `artifacts/kernels/README.md`;
-  actual Bedrock generation is budget-gated and deferred to a
-  next-budget-approved run.
+  gaps.
+- **E2: Two new fused KernelSpecs registered.**
+  - `CONV2D_BATCHNORM2D_S8` — covers the top-1 gap (60 yolov8+dronet
+    candidates). Reference impl + gemmini AlgorithmCandidate (tiled
+    matmul + activation epilogue).
+  - `BATCHNORM2D_SILU_S8` — covers the top-2 gap (57 yolov8
+    candidates). Reference impl + rvv_opu (VRGATHER LUT) + gemmini
+    AlgorithmCandidates.
+- **E3: Realizability filter wired.** `apply_fusion_hint.py` recognizes
+  both new pairs; `decision_loop.py:REALIZABLE_FUSE_PAIRS` lists all 3.
+- **E4: Per-kernel reports** in `artifacts/kernels/<pair>/measurement_report.md`
+  documenting reference impl coverage, programming model, and the
+  rejection criteria binding any future Bedrock-generated kernel.
+- **Bedrock invocation: blocked on AWS credentials in this session env.**
+  Reference impls are bit-exact verification oracles ready to validate
+  whatever Bedrock produces. The next-credentials-approved run can
+  invoke `LLM_PROVIDER=bedrock BACKEND=llm` directly.
+- **Coverage improvement: 3.2 % → 65.4 % of fuse candidates** are now
+  realizable on the headline workload, even before any Bedrock
+  generation.
 
 ### Phase F — MOSEK convergence rework
 - F1: MOSEK confirmed structurally divergent on this workload at any
@@ -114,13 +130,21 @@ shift is applicable.
   wall-clock, neither bounded by `MSK_DPAR_OPTIMIZER_MAX_TIME`.
 - F2: 6 convergence-aid tracks documented in
   `artifacts/mosek_rework/README.md`:
-  - F2a warm-start (framework module written)
-  - F2b variable elimination (pre-fix singletons)
-  - F2c symmetry-breaking constraints
-  - F2d coarse-fine time discretization
-  - F2e solver-parameter sweep (script ready)
-  - F2f time-indexed reformulation
-  - F2g Lagrangian decomposition by network
+  - F2a warm-start (framework module written; needs scheduler.py
+    refactor to inject initial values)
+  - **F2b variable elimination IMPLEMENTED** in
+    `xpu-rt/scheduler.py:445`: detects singleton-feasible ops via
+    infeasible_combinations OR processing_times ≥ 1e8 sentinel; adds
+    `alpha[i, single_k] == 1` directly so MOSEK presolve eliminates
+    the variable. Synthetic 3-op test passes (status=optimal,
+    value=7.0). On headline scale, F2b alone doesn't make MOSEK
+    converge (canonicalization remains the wall) — needs F2f or F2g
+    combination.
+  - F2c symmetry-breaking constraints (designed, not implemented)
+  - F2d coarse-fine time discretization (designed)
+  - F2e solver-parameter sweep (`scripts/mosek_param_sweep.py` ready)
+  - F2f time-indexed reformulation (designed)
+  - F2g Lagrangian decomposition by network (designed)
 - F3/F4 (re-enable in audit): audit now records MOSEK as
   `mosek_diverged` cleanly, capping wall at 120 s instead of hanging.
 
@@ -135,14 +159,17 @@ shift is applicable.
 
 ## Honest gaps
 
-1. **Phase E2 Bedrock kernels** — gap identified (117 candidate
-   conv→BN→silu pairs); generation deferred to a budget-approved run.
-   Triple-fused `conv2d_s8_bn_silu_s8` is the highest-value target.
-2. **Phase F2 actual implementation** — F1 diagnosed structural
-   divergence and prioritized F2b/F2f/F2g. Each requires a
-   scheduler.py refactor of varying depth; F2a's framework module is
-   in place but activation needs the refactor too. Documented and
-   tracked.
+1. **Bedrock actual generation** — BLOCKED on AWS credentials in this
+   session env (`aws sts get-caller-identity` returned NoCredentials).
+   KernelSpecs + AlgorithmCandidates + reference impls + realizability
+   wire-in are all in place; the framework runs end-to-end once
+   credentials are provisioned.
+2. **MOSEK F2f / F2g** — F1 diagnosed canonicalization wall; F2b
+   (singleton pre-fix) is implemented and tested but isn't enough on
+   its own at headline scale. The two scalable answers are F2f
+   (time-indexed reformulation) and F2g (Lagrangian decomposition by
+   network), both requiring deeper scheduler.py refactors than fit a
+   single session.
 3. **Decision-loop policy seeding** — Phase B formulas are unit-tested
    but not yet wired as candidate seeds inside `scripts/decision_loop.py`.
    The hook (`--policy`) is in; the seed pass is the next iteration.
