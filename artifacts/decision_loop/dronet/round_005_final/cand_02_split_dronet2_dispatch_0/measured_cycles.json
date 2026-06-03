@@ -1,0 +1,225 @@
+{
+  "network": "dronet",
+  "wall_clock_cycles": 4546550,
+  "total_dispatch_cycles": 454544764,
+  "n_dispatches": 31,
+  "dispatches": [
+    {
+      "name": "conv_modules.0.tile_0",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=3;IH=112;IW=112;OC=16;OH=56;OW=56;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 48910724,
+      "pct_of_total": 10.8
+    },
+    {
+      "name": "conv_modules.0.tile_1",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=3;IH=112;IW=112;OC=16;OH=56;OW=56;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 48910725,
+      "pct_of_total": 10.8
+    },
+    {
+      "name": "maxpool1",
+      "op": "maxpool2d_s8",
+      "shape": "N=1;C=32;IH=56;IW=56;OH=27;OW=27;KH=3;KW=3;SH=2;SW=2;PH=0;PW=0;DH=1;DW=1",
+      "cycles": 5146815,
+      "pct_of_total": 1.1
+    },
+    {
+      "name": "bn_modules.0",
+      "op": "batchnorm2d_s8",
+      "shape": "N=1;C=32;H=27;W=27",
+      "cycles": 1332628,
+      "pct_of_total": 0.3
+    },
+    {
+      "name": "relu_modules.0",
+      "op": "relu_s8",
+      "shape": "n=23328",
+      "cycles": 280289,
+      "pct_of_total": 0.1
+    },
+    {
+      "name": "conv_modules.1",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=32;IH=27;IW=27;OC=32;OH=14;OW=14;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 61307456,
+      "pct_of_total": 13.5
+    },
+    {
+      "name": "bn_modules.1",
+      "op": "batchnorm2d_s8",
+      "shape": "N=1;C=32;H=14;W=14",
+      "cycles": 360909,
+      "pct_of_total": 0.1
+    },
+    {
+      "name": "relu_modules.1",
+      "op": "relu_s8",
+      "shape": "n=6272",
+      "cycles": 79787,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "conv_modules.2",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=32;IH=14;IW=14;OC=32;OH=14;OW=14;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1",
+      "cycles": 61307455,
+      "pct_of_total": 13.5
+    },
+    {
+      "name": "conv_modules.3",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=32;IH=27;IW=27;OC=32;OH=14;OW=14;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0",
+      "cycles": 10890217,
+      "pct_of_total": 2.4
+    },
+    {
+      "name": "add",
+      "op": "add_s8",
+      "shape": "n=6272",
+      "cycles": 268579,
+      "pct_of_total": 0.1
+    },
+    {
+      "name": "bn_modules.2",
+      "op": "batchnorm2d_s8",
+      "shape": "N=1;C=32;H=14;W=14",
+      "cycles": 360169,
+      "pct_of_total": 0.1
+    },
+    {
+      "name": "relu_modules.2",
+      "op": "relu_s8",
+      "shape": "n=6272",
+      "cycles": 78806,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "conv_modules.4",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=32;IH=14;IW=14;OC=64;OH=7;OW=7;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 30615691,
+      "pct_of_total": 6.7
+    },
+    {
+      "name": "bn_modules.3",
+      "op": "batchnorm2d_s8",
+      "shape": "N=1;C=64;H=7;W=7",
+      "cycles": 182587,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "relu_modules.3",
+      "op": "relu_s8",
+      "shape": "n=3136",
+      "cycles": 39844,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "conv_modules.5",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=64;IH=7;IW=7;OC=64;OH=7;OW=7;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1",
+      "cycles": 59496159,
+      "pct_of_total": 13.1
+    },
+    {
+      "name": "conv_modules.6",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=32;IH=14;IW=14;OC=64;OH=7;OW=7;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0",
+      "cycles": 5449055,
+      "pct_of_total": 1.2
+    },
+    {
+      "name": "add_1",
+      "op": "add_s8",
+      "shape": "n=3136",
+      "cycles": 134152,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "bn_modules.4",
+      "op": "batchnorm2d_s8",
+      "shape": "N=1;C=64;H=7;W=7",
+      "cycles": 182525,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "relu_modules.4",
+      "op": "relu_s8",
+      "shape": "n=3136",
+      "cycles": 39819,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "conv_modules.7",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=64;IH=7;IW=7;OC=128;OH=4;OW=4;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1",
+      "cycles": 37299830,
+      "pct_of_total": 8.2
+    },
+    {
+      "name": "bn_modules.5",
+      "op": "batchnorm2d_s8",
+      "shape": "N=1;C=128;H=4;W=4",
+      "cycles": 121877,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "relu_modules.5",
+      "op": "relu_s8",
+      "shape": "n=2048",
+      "cycles": 25925,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "conv_modules.8",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=128;IH=4;IW=4;OC=128;OH=4;OW=4;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1",
+      "cycles": 74509514,
+      "pct_of_total": 16.4
+    },
+    {
+      "name": "conv_modules.9",
+      "op": "conv2d_s8",
+      "shape": "N=1;IC=64;IH=7;IW=7;OC=128;OH=4;OW=4;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0",
+      "cycles": 7036959,
+      "pct_of_total": 1.5
+    },
+    {
+      "name": "add_2",
+      "op": "add_s8",
+      "shape": "n=2048",
+      "cycles": 87872,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "relu_modules.6",
+      "op": "relu_s8",
+      "shape": "n=2048",
+      "cycles": 26584,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "linear1",
+      "op": "linear_s8",
+      "shape": "M=1;K=2048;N=1",
+      "cycles": 30830,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "linear2",
+      "op": "linear_s8",
+      "shape": "M=1;K=2048;N=1",
+      "cycles": 30831,
+      "pct_of_total": 0.0
+    },
+    {
+      "name": "sigmoid1",
+      "op": "sigmoid_s8",
+      "shape": "n=1",
+      "cycles": 151,
+      "pct_of_total": 0.0
+    }
+  ]
+}

@@ -259,10 +259,36 @@ def main(argv=None) -> int:
             realizable=realizable, realizability_reason=reason,
         ))
 
-    # Take top-K realizable by predicted delta (most negative first)
-    realizable_sorted = sorted([o for o in outcomes if o.realizable],
-                               key=lambda o: o.predicted_delta_us)
+    # Filter to candidates targeting --network. Otherwise top-K picks
+    # whichever network has the most-favorable predicted score, which
+    # may not be the network we set up to measure. The "candidate
+    # targets other network" rejection used to happen at measure time —
+    # too late, we'd already spent budget on the wrong build path.
+    def _affects_network(o):
+        return any(a.startswith(args.network) for a in o.affected)
+    on_target = [o for o in outcomes if o.realizable and _affects_network(o)]
+    print(f"[decision_loop] candidates on --network={args.network}: {len(on_target)}")
+
+    # Sort by predicted delta (most negative first = predicted improvement).
+    # Splits often score positive (predicted WORSE) under the granularity
+    # advisor — that's because the advisor's model doesn't include the
+    # cross-core parallelism benefit of placing tiles on different
+    # accelerators. We still measure them: the agentic loop is supposed
+    # to disagree with the predicted model when measurement says
+    # otherwise.
+    realizable_sorted = sorted(on_target, key=lambda o: o.predicted_delta_us)
     to_measure = realizable_sorted[:args.K]
+    if not to_measure:
+        print(f"[decision_loop] no realizable candidates targeting "
+              f"--network={args.network}; nothing to measure")
+        # Still write summary with the unfiltered outcomes for trace.
+        (out_dir / "summary.json").write_text(json.dumps({
+            "baseline_solver": args.baseline_solver,
+            "network": args.network,
+            "outcomes": [asdict(o) for o in outcomes],
+            "note": "no on-target candidates after realizability filter",
+        }, indent=2))
+        return 0
     print(f"[decision_loop] realizable: {len(realizable_sorted)} / {len(outcomes)} "
           f"→ measuring top-K={len(to_measure)}")
 

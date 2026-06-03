@@ -1,0 +1,207 @@
+{
+  "baseline_solver": "decomposed",
+  "network": "dronet",
+  "target": "rvv_opu",
+  "quant": "int8",
+  "backend": "reference",
+  "K": 3,
+  "epsilon_cycles": 1000,
+  "baseline_total_cycles": 454544606,
+  "outcomes": [
+    {
+      "id": "fuse_chain_mlp_control0_dispatch_0_mlp_control0_dispatch_5",
+      "type": "fuse_linear_chain",
+      "affected": [
+        "mlp_control0_dispatch_0",
+        "mlp_control0_dispatch_1",
+        "mlp_control0_dispatch_2",
+        "mlp_control0_dispatch_3",
+        "mlp_control0_dispatch_4",
+        "mlp_control0_dispatch_5"
+      ],
+      "predicted_delta_us": 0.0,
+      "realizable": true,
+      "realizability_reason": "fuse via apply_fusion_hint --pairwise (linear_s8_elu_s8 KernelSpec exists)",
+      "measured_cycles_before": null,
+      "measured_cycles_after": null,
+      "measured_delta": null,
+      "measured_delta_pct": null,
+      "accepted": false,
+      "accept_reason": ""
+    },
+    {
+      "id": "fuse_chain_mlp_control1_dispatch_0_mlp_control1_dispatch_5",
+      "type": "fuse_linear_chain",
+      "affected": [
+        "mlp_control1_dispatch_0",
+        "mlp_control1_dispatch_1",
+        "mlp_control1_dispatch_2",
+        "mlp_control1_dispatch_3",
+        "mlp_control1_dispatch_4",
+        "mlp_control1_dispatch_5"
+      ],
+      "predicted_delta_us": 0.0,
+      "realizable": true,
+      "realizability_reason": "fuse via apply_fusion_hint --pairwise (linear_s8_elu_s8 KernelSpec exists)",
+      "measured_cycles_before": null,
+      "measured_cycles_after": null,
+      "measured_delta": null,
+      "measured_delta_pct": null,
+      "accepted": false,
+      "accept_reason": ""
+    },
+    {
+      "id": "fuse_chain_mlp_control2_dispatch_0_mlp_control2_dispatch_5",
+      "type": "fuse_linear_chain",
+      "affected": [
+        "mlp_control2_dispatch_0",
+        "mlp_control2_dispatch_1",
+        "mlp_control2_dispatch_2",
+        "mlp_control2_dispatch_3",
+        "mlp_control2_dispatch_4",
+        "mlp_control2_dispatch_5"
+      ],
+      "predicted_delta_us": 0.0,
+      "realizable": true,
+      "realizability_reason": "fuse via apply_fusion_hint --pairwise (linear_s8_elu_s8 KernelSpec exists)",
+      "measured_cycles_before": null,
+      "measured_cycles_after": null,
+      "measured_delta": null,
+      "measured_delta_pct": null,
+      "accepted": false,
+      "accept_reason": ""
+    },
+    {
+      "id": "fuse_mlp_control0_dispatch_0__mlp_control0_dispatch_1",
+      "type": "fuse_producer_consumer",
+      "affected": [
+        "mlp_control0_dispatch_0",
+        "mlp_control0_dispatch_1"
+      ],
+      "predicted_delta_us": 0.0,
+      "realizable": true,
+      "realizability_reason": "fuse via apply_fusion_hint --pairwise (linear_s8_elu_s8 KernelSpec exists)",
+      "measured_cycles_before": null,
+      "measured_cycles_after": null,
+      "measured_delta": null,
+      "measured_delta_pct": null,
+      "accepted": false,
+      "accept_reason": ""
+    },
+    {
+      "id": "fuse_mlp_control0_dispatch_1__mlp_control0_dispatch_2",
+      "type": "fuse_producer_consumer",
+      "affected": [
+        "mlp_control0_dispatch_1",
+        "mlp_control0_dispatch_2"
+      ],
+      "predicted_delta_us": 0.0,
+      "realizable": true,
+      "realizability_reason": "fuse via apply_fusion_hint --pairwise (linear_s8_elu_s8 KernelSpec exists)",
+      "measured_cycles_before": null,
+      "measured_cycles_after": null,
+      "measured_delta": null,
+      "measured_delta_pct": null,
+      "accepted": false,
+      "accept_reason": ""
+    },
+    {
+      "id": "split_dronet0_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet0_dispatch_0"
+      ],
+      "predicted_delta_us": 3.062,
+      "realizable": true,
+      "realizability_reason": "split via apply_split_hint (linear_s8 along N OR conv2d_s8 along OC; both supported)",
+      "measured_cycles_before": 454544606,
+      "measured_cycles_after": 454544764,
+      "measured_delta": -158,
+      "measured_delta_pct": -3.476006489008914e-05,
+      "accepted": false,
+      "accept_reason": "measured \u0394=-158 cyc (-0.0%) \u2014 WORSE"
+    },
+    {
+      "id": "split_dronet1_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet1_dispatch_0"
+      ],
+      "predicted_delta_us": 3.062,
+      "realizable": true,
+      "realizability_reason": "split via apply_split_hint (linear_s8 along N OR conv2d_s8 along OC; both supported)",
+      "measured_cycles_before": 454544606,
+      "measured_cycles_after": 454544764,
+      "measured_delta": -158,
+      "measured_delta_pct": -3.476006489008914e-05,
+      "accepted": false,
+      "accept_reason": "measured \u0394=-158 cyc (-0.0%) \u2014 WORSE"
+    },
+    {
+      "id": "split_dronet2_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet2_dispatch_0"
+      ],
+      "predicted_delta_us": 3.062,
+      "realizable": true,
+      "realizability_reason": "split via apply_split_hint (linear_s8 along N OR conv2d_s8 along OC; both supported)",
+      "measured_cycles_before": 454544606,
+      "measured_cycles_after": 454544764,
+      "measured_delta": -158,
+      "measured_delta_pct": -3.476006489008914e-05,
+      "accepted": false,
+      "accept_reason": "measured \u0394=-158 cyc (-0.0%) \u2014 WORSE"
+    }
+  ],
+  "measured_outcomes": [
+    {
+      "id": "split_dronet0_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet0_dispatch_0"
+      ],
+      "predicted_delta_us": 3.062,
+      "realizable": true,
+      "realizability_reason": "split via apply_split_hint (linear_s8 along N OR conv2d_s8 along OC; both supported)",
+      "measured_cycles_before": 454544606,
+      "measured_cycles_after": 454544764,
+      "measured_delta": -158,
+      "measured_delta_pct": -3.476006489008914e-05,
+      "accepted": false,
+      "accept_reason": "measured \u0394=-158 cyc (-0.0%) \u2014 WORSE"
+    },
+    {
+      "id": "split_dronet1_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet1_dispatch_0"
+      ],
+      "predicted_delta_us": 3.062,
+      "realizable": true,
+      "realizability_reason": "split via apply_split_hint (linear_s8 along N OR conv2d_s8 along OC; both supported)",
+      "measured_cycles_before": 454544606,
+      "measured_cycles_after": 454544764,
+      "measured_delta": -158,
+      "measured_delta_pct": -3.476006489008914e-05,
+      "accepted": false,
+      "accept_reason": "measured \u0394=-158 cyc (-0.0%) \u2014 WORSE"
+    },
+    {
+      "id": "split_dronet2_dispatch_0",
+      "type": "split_heavy_dispatch",
+      "affected": [
+        "dronet2_dispatch_0"
+      ],
+      "predicted_delta_us": 3.062,
+      "realizable": true,
+      "realizability_reason": "split via apply_split_hint (linear_s8 along N OR conv2d_s8 along OC; both supported)",
+      "measured_cycles_before": 454544606,
+      "measured_cycles_after": 454544764,
+      "measured_delta": -158,
+      "measured_delta_pct": -3.476006489008914e-05,
+      "accepted": false,
+      "accept_reason": "measured \u0394=-158 cyc (-0.0%) \u2014 WORSE"
+    }
+  ]
+}

@@ -713,6 +713,43 @@ def emit_model(ir: dict[str, Any], out_dir: str) -> None:
             elem_offset = sh["c_each"] * sh["H"] * sh["W"]
             offset_aliases[op["outputs"][0]] = (base, 0)
             offset_aliases[op["outputs"][1]] = (base, elem_offset)
+        # ── Split-tile output alias ─────────────────────────────────────
+        # When apply_split_hint rewrites a single op into N tile ops
+        # (named "<orig>.tile_<i>"), each tile writes its slice of the
+        # output buffer. Wire that as an offset alias so each tile's
+        # output pointer is base + tile*(slice_size_in_elements), the
+        # same mechanism chunk2_c1 uses. Without this, every tile's
+        # kernel writes to offset 0 and they trample each other —
+        # verify FAILs with `max_abs_err > 0`.
+        elif "split_from" in op:
+            sf = op["split_from"]
+            tile_idx = int(sf.get("tile", 0))
+            n_splits = int(sf.get("n_splits", 1))
+            axis = sf.get("axis", "N")  # linear_s8 -> N (last), conv2d_s8 -> OC
+            # The base tensor is the ORIGINAL output (before split). Its name
+            # is recoverable from the tile output: strip ".tile_<i>" suffix.
+            tile_out = op["outputs"][0]
+            base = tile_out.rsplit(f".tile_{tile_idx}", 1)[0]
+            sh = op.get("shape", {})
+            elem_offset = 0
+            if axis == "OC" and op["op"] == "conv2d_s8":
+                # Output buffer shape [N, OC, OH, OW]; tile slice is
+                # tile_oc rows of (OH*OW) elements at offset
+                # tile_idx * tile_oc * OH * OW.
+                tile_oc = int(sh.get("OC", 0))
+                OH = int(sh.get("OH", 0))
+                OW = int(sh.get("OW", 0))
+                elem_offset = tile_idx * tile_oc * OH * OW
+            elif axis == "N" and op["op"] == "linear_s8":
+                # Output buffer shape [M, N]; tile slice is tile_n cols
+                # at offset tile_idx * tile_n (M=1 typical).
+                tile_n = int(sh.get("N", 0))
+                elem_offset = tile_idx * tile_n
+            else:
+                # Unknown split axis / op kind — leave offset 0; tile
+                # measurement will surface the verify FAIL clearly.
+                elem_offset = 0
+            offset_aliases[tile_out] = (base, elem_offset)
 
     # Number of ops that actually emit a kernel call (used to size the profile
     # record array). chunk2_c1 is a no-op at runtime (just sets up offset
@@ -1187,6 +1224,26 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
+            # ── Split-tile pointer offset ────────────────────────────
+            # When apply_split_hint produces a tile op (split_from
+            # metadata, axis="OC"), the weight/bias pointers passed to
+            # the kernel call must point at this tile's OC-slice:
+            #   weight + t*tile_oc*IC*KH*KW
+            #   bias   + t*tile_oc
+            # Without this, every tile reads OC=[0..tile_oc) of the
+            # weight tensor, producing 1/n_splits correct outputs and
+            # wrong ones elsewhere (matches the round-002 max_abs_err
+            # signature on the first dronet split attempt).
+            sf = op.get("split_from") or {}
+            if sf and sf.get("axis") == "OC":
+                tile_idx = int(sf.get("tile", 0))
+                tile_oc = int(sh.get("OC", 0))
+                per_filter = int(sh.get("IC", 0)) * int(sh.get("KH", 0)) * int(sh.get("KW", 0))
+                w_off = tile_idx * tile_oc * per_filter
+                b_off = tile_idx * tile_oc
+                w = f"({w} + {w_off})"
+                if b != "NULL":
+                    b = f"({b} + {b_off})"
             call = (
                 f"parallel_conv2d_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
