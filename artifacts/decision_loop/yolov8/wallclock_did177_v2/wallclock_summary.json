@@ -1,0 +1,19 @@
+{
+  "hint": "artifacts/decision_loop/yolov8/manual_splits/hint_did177.json",
+  "solver": "decomposed",
+  "before": {
+    "makespan_us": 75.57,
+    "deadline_miss": 0,
+    "cross_dev": 180,
+    "solver_s": 1.807
+  },
+  "after": {
+    "makespan_us": 75.57,
+    "deadline_miss": 0,
+    "cross_dev": 182,
+    "solver_s": 1.763
+  },
+  "delta_makespan_us": 0.0,
+  "delta_pct": 0.0,
+  "decision": "REJECT"
+}
