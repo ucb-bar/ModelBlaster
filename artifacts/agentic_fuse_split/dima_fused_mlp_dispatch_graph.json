@@ -1,0 +1,26 @@
+{
+  "dot_file": "",
+  "dispatches": {
+    "dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [],
+      "fused_from": [
+        "dispatch_0",
+        "dispatch_1",
+        "dispatch_2",
+        "dispatch_3",
+        "dispatch_4",
+        "dispatch_5"
+      ]
+    },
+    "dispatch_6": {
+      "id": 6,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": []
+    }
+  },
+  "_fused_by": "agentic_loop dima_hint.json"
+}

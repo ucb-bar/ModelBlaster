@@ -39,6 +39,15 @@ networks:
 # The CPSAT y64 result on the larger 75 ms horizon (Section 9) gives
 # us a sanity bound — this workload's optimum should be ≤ that.
 horizon_ms: 75.0
+# Honor the period_ms entries above. Without this, period_ms is ignored
+# and the workload becomes "place N instances anywhere in the horizon" —
+# which made the prior Gantt degenerate (yolo monopolized 0-82 ms, all 4
+# mlp_control instances stacked at t≈81 ms, dronet first start at 40 ms).
+enforce_periodic: true
+# Periodic ops still count toward makespan (otherwise the C_max lower-bound
+# would ignore mlp_control + dronet entirely and the schedule would
+# under-report its actual span).
+restrict_makespan_to_nonperiodic: false
 solver: CPSAT
 time_limit_s: 600
 cycles_source: db
