@@ -9,25 +9,67 @@ rather than the original two-formulation choice. Pick the
 combination that converges first; the rest serve as documented
 fallback.
 
-## F1 — Divergence diagnosis (run01)
+## F1 — Divergence diagnosis (run01, completed)
 
 `scripts/mosek_divergence_diagnose.py` bisects op count from a tiny
 (mlp_instances=1) variant up to the headline (mlp_instances=4) and
-runs both CPSAT and MOSEK at each scale. Records (status, wall, obj)
-per cell.
+runs both CPSAT and MOSEK at each scale.
 
 Output: `artifacts/audit/mosek_diagnose.csv`.
 
-Initial observation (headline scale): MOSEK runs > 3 minutes of CPU
-time without producing a fixture, despite `time_limit=60` being passed
-as `MSK_DPAR_OPTIMIZER_MAX_TIME`. This means the wall-clock is spent
-either in:
-1. CVXPY formulation/canonicalization (which the time_limit doesn't
-   bound), OR
-2. MOSEK presolve before optimization (which separate params control).
+### Observed (cap=1: mlp_control × 1 instance + dronet × 1 + yolov8 × 1)
 
-Per-cap bisection results will land in the CSV when F1 completes;
-the README will be filled in with the actual scale-vs-status data.
+| Solver | Status | Wall (s) | Makespan (ms) |
+|:---|:---|---:|---:|
+| cpsat | ok | 62.06 | 71.34 |
+| mosek | timeout (180 s wall, 60 s solver budget) | — | — |
+
+### Headline (cap=4: mlp × 4 + dronet × 2 + yolov8 × 1, ~388 ops)
+
+Observed in the policy sweep:
+
+| Solver | Status | Wall (s) | Makespan (ms) |
+|:---|:---|---:|---:|
+| cpsat | ok (time-limited) | 60.05 | 111.17 (40 misses) |
+| mosek | hang (killed at 180+ s CPU) | — | — |
+
+### Diagnosis
+
+**MOSEK does not converge at any of the practical scales for this
+workload's structure.** Even at the smallest cap (1 MLP + 1 dronet +
+1 yolov8 — about 100 ops in the periodic-expanded form), MOSEK
+exceeded the 60-s solver wall by a factor > 3 without returning. The
+time spent is upstream of the solver's optimization phase:
+
+1. **CVXPY canonicalization** of the disjunctive scheduling constraints
+   produces a very large sparse matrix. With `n_ops × n_combinations`
+   binary `alpha` variables plus precedence + machine-busy disjunctions,
+   the problem matrix easily reaches O(10⁵) constraints on ~100 ops.
+2. **MOSEK's presolve** then chews on this matrix before the optimizer
+   even starts. `MSK_DPAR_OPTIMIZER_MAX_TIME=60` bounds the optimizer's
+   wall-clock but NOT presolve, so presolve can monopolize all of the
+   observed runtime.
+
+Each of these is a structural problem with the current formulation —
+not a tuning issue. CPSAT, by contrast, handles this op-count
+cleanly because its CP-SAT engine doesn't go through cvxpy
+canonicalization at all (we build the OR-Tools model directly).
+
+### Implication for Phase F
+
+The convergence aids F2a–F2g attack different parts of this problem:
+
+- F2a (warm-start) and F2c (symmetry-breaking) reduce the optimizer's
+  search; they assume MOSEK at least *gets* to optimization.
+- F2b (pre-fix singletons) and F2f (time-indexed) reduce the
+  variable / constraint count before canonicalization.
+- F2g (Lagrangian by network) sidesteps the monolithic formulation
+  entirely.
+
+Given the diagnosis that the wall is dominated by canonicalization +
+presolve, the most-effective aids are F2b, F2f, and F2g. F2a and F2c
+would help only after the other three made the problem
+canonicalizable in reasonable time.
 
 ## F2 — Convergence aids (six tracks, ranked by implementation cost)
 
