@@ -1,0 +1,100 @@
+You will write a C implementation of the fused kernel below for the
+RVV 1.0 target (rv64gcv with vector). Output must be:
+  * A SINGLE C function with EXACTLY the signature below.
+  * Self-contained: include any helpers as `static inline` above the function.
+  * Bit-exact match vs the reference impl on spike (max_abs_err == 0).
+  * No `#include` statements — they are added by the harness (which already
+    pulls in <stdint.h>, <stddef.h>, <math.h>, <riscv_vector.h>).
+  * RVV 1.0 intrinsic names: `__riscv_v*` prefix. Important conversions:
+    - int8→int16 widen: `__riscv_vsext_vf2_i16m2(v_int8, vl)`
+    - int16→float32 widen-convert: `__riscv_vfwcvt_f_x_v_f32m4(v_int16, vl)`
+      (NOT `vfcvt` — that's same-width; for widening to f32 from i16 use `vfwcvt`)
+    - float32→int32 same-width: `__riscv_vfcvt_x_f_v_i32m4(v_f32, vl)`
+    - int32→int16 narrow: `__riscv_vnsra_wx_i16m2(v_int32, 0, vl)`
+    - int16→int8 narrow: `__riscv_vnsra_wx_i8m1(v_int16, 0, vl)`
+    - Set VL: `__riscv_vsetvl_e8m1(n)` for e8m1, etc.
+
+SIGNATURE (must match exactly):
+void kernel_batchnorm2d_silu_s8(const int8_t *input, const float *scale, const float *bias, int8_t *output, int N, int C, int H, int W, float bn_scale_in, float bn_scale_out, int bn_activation_min, int bn_activation_max, float silu_scale_in, float silu_scale_out, int silu_activation_min, int silu_activation_max)
+
+REFERENCE IMPLEMENTATION (must produce bit-identical results on spike):
+void kernel_batchnorm2d_silu_s8(
+    const int8_t *input, const float *scale, const float *bias,
+    int8_t *output,
+    int N, int C, int H, int W,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max,
+    float silu_scale_in, float silu_scale_out,
+    int silu_activation_min, int silu_activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float s = scale[c];
+            float b = bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    /* --- batchnorm2d_s8 math --- */
+                    float fv = (float)input[idx] * bn_scale_in;
+                    float y = s * fv + b;
+                    int32_t bv = (int32_t)roundf(y / bn_scale_out);
+                    if (bv < bn_activation_min) bv = bn_activation_min;
+                    if (bv > bn_activation_max) bv = bn_activation_max;
+                    int8_t bn_int8 = (int8_t)bv;
+                    /* --- silu_s8 math, in-register (no intermediate tensor) --- */
+                    float fbv = (float)bn_int8 * silu_scale_in;
+                    float sy = fbv / (1.0f + expf(-fbv));
+                    int32_t v = (int32_t)roundf(sy / silu_scale_out);
+                    if (v < silu_activation_min) v = silu_activation_min;
+                    if (v > silu_activation_max) v = silu_activation_max;
+                    output[idx] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+
+
+ALGORITHM (target_affinity=('rvv_opu',)):
+RVV vector implementation: load BN's per-channel (scale[c], bias[c]) as vector-broadcast operands; apply the BN affine over the (H*W) tile in float vector registers; requantize+clamp to int8 vector register; use VRGATHER to look up SiLU LUT for each int8 in the BN output; clamp+store final int8. The intermediate BN int8 buffer is NEVER materialized — the SiLU LUT lookup happens on the vector register that holds the BN quantized output.
+
+WHY this wins vs the per-op chain:
+  * One worker handshake (vs 2 for BN+SiLU chained).
+  * The BN_int8 intermediate (N*C*H*W bytes) never spills to L1 — it stays in vector registers.
+  * The SiLU LUT (256 bytes per scale tuple) is precomputed once per dispatch.
+
+PROGRAMMING MODEL:
+  /* Precompute SiLU LUT keyed by BN int8 output. */
+  for (int v = 0; v < 256; v++) {
+      int8_t iv = (int8_t)(uint8_t)v;
+      float f = (float)iv * silu_scale_in;
+      float y = f / (1.0f + expf(-f));
+      int32_t q = roundf(y / silu_scale_out);
+      if (q < silu_activation_min) q = silu_activation_min;
+      if (q > silu_activation_max) q = silu_activation_max;
+      silu_lut[v] = (int8_t)q;
+  }
+  /* For each (n, c) panel of (H*W) int8 elements: */
+  for (n, c) in [N, C):
+      bs = vfmv_v_f(scale[c]); bb = vfmv_v_f(bias[c]);
+      for tile of size VLEN/8:
+          v_in = vle8_v(input + idx)
+          v_f  = vfcvt_f_x(v_in) * bn_scale_in
+          v_y  = bs * v_f + bb
+          v_q  = round(v_y / bn_scale_out)
+          v_q  = clamp(v_q, bn_act_min, bn_act_max)
+          v_bn8 = vncvt_x_x(v_q)
+          v_out = vrgather_vv(silu_lut, v_bn8)
+          vse8_v(output + idx, v_out)
+
+STRICT REQUIREMENTS:
+  * Bit-exact match vs the reference scalar impl above
+    (same rounding/clamp order). Verify gate:
+    spike max_abs_err=0 max_rel_err=0.
+  * Per-channel (scale, bias) MUST be loaded fresh per
+    channel — do not assume a single (scale, bias) for
+    the whole tensor.
+  * The BN_int8 intermediate MUST be in registers — DO
+    NOT allocate an HxW (or any) BN-output buffer.
+
+OUTPUT FORMAT:
+Wrap your final code in ```c ... ``` fences. Output ONLY the code.
