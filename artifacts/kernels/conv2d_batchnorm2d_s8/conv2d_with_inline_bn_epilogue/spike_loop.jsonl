@@ -1,0 +1,1 @@
+{"ts": "2026-06-03T19:09:28.000565+00:00", "provider": "bedrock", "model_id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "request_id": "e3bf88a5-c296-4eac-a6f5-7fe3f9691085", "parent_call_id": null, "phase": null, "input_tokens": 1900, "output_tokens": 1227, "cache_read_input_tokens": 0, "cache_write_input_tokens": 0, "stop_reason": "end_turn"}

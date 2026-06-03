@@ -1,0 +1,109 @@
+{
+  "status": "PASS",
+  "winning_attempt": 6,
+  "total_cost_usd": 0.0,
+  "history": [
+    {
+      "attempt": 1,
+      "bedrock_cost_usd": 0.0,
+      "shapes": [
+        {
+          "status": "ok",
+          "shape": {
+            "N": 2,
+            "C": 4,
+            "H": 3,
+            "W": 3
+          },
+          "max_abs_err": 99,
+          "n_diff": 68,
+          "n_el": 72,
+          "verify_wall_s": 0.27
+        }
+      ]
+    },
+    {
+      "attempt": 2,
+      "bedrock_cost_usd": 0.0,
+      "shapes": [
+        {
+          "status": "candidate_spike fail rc=255:\n",
+          "shape": {
+            "N": 2,
+            "C": 4,
+            "H": 3,
+            "W": 3
+          },
+          "verify_wall_s": 0.13
+        }
+      ]
+    },
+    {
+      "attempt": 3,
+      "bedrock_cost_usd": 0.0,
+      "shapes": [
+        {
+          "status": "candidate_spike fail rc=255:\n",
+          "shape": {
+            "N": 2,
+            "C": 4,
+            "H": 3,
+            "W": 3
+          },
+          "verify_wall_s": 0.12
+        }
+      ]
+    },
+    {
+      "attempt": 4,
+      "bedrock_cost_usd": 0.0,
+      "shapes": [
+        {
+          "status": "candidate_spike fail rc=255:\n",
+          "shape": {
+            "N": 2,
+            "C": 4,
+            "H": 3,
+            "W": 3
+          },
+          "verify_wall_s": 0.13
+        }
+      ]
+    },
+    {
+      "attempt": 5,
+      "bedrock_cost_usd": 0.0,
+      "shapes": [
+        {
+          "status": "candidate_spike fail rc=255:\n",
+          "shape": {
+            "N": 2,
+            "C": 4,
+            "H": 3,
+            "W": 3
+          },
+          "verify_wall_s": 0.21
+        }
+      ]
+    },
+    {
+      "attempt": 6,
+      "bedrock_cost_usd": 0.0,
+      "shapes": [
+        {
+          "status": "ok",
+          "shape": {
+            "N": 2,
+            "C": 4,
+            "H": 3,
+            "W": 3
+          },
+          "max_abs_err": 0,
+          "n_diff": 0,
+          "n_el": 72,
+          "verify_wall_s": 0.4
+        }
+      ]
+    }
+  ]
+}
