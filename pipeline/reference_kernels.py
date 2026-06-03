@@ -6224,6 +6224,331 @@ void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
 )
 
 
+def _conv2d_batchnorm2d_s8_argtypes():
+    """Argtypes for the fused conv2d+batchnorm kernel registered in
+    Phase E2 (yolov8 + dronet hot path, 60 candidate pairs identified
+    in E1 — the largest single fusion gap)."""
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, conv_bias, bn_scale, bn_bias, output,
+    # N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW,
+    # input_offset, filter_offset, conv_output_offset,
+    # conv_output_multiplier, conv_output_shift,
+    # conv_act_min, conv_act_max,
+    # bn_scale_in, bn_scale_out, bn_act_min, bn_act_max
+    return [i8p, i8p, i32p, fp, fp, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+CONV2D_BATCHNORM2D_S8 = KernelSpec(
+    op="conv2d_batchnorm2d_s8",
+    signature=(
+        "void kernel_conv2d_batchnorm2d_s8("
+        "const int8_t *input, const int8_t *weight, const int32_t *bias, "
+        "const float *bn_scale, const float *bn_bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int conv_output_offset, "
+        "int conv_output_multiplier, int conv_output_shift, "
+        "int conv_activation_min, int conv_activation_max, "
+        "float bn_scale_in, float bn_scale_out, "
+        "int bn_activation_min, int bn_activation_max)"
+    ),
+    semantics=(
+        "Pair-fused quantized 2D conv + BatchNorm. Computes Conv2D's MAC + "
+        "Q0.31 requantize tail (matching kernel_conv2d_s8), then applies "
+        "BN's per-channel affine on the resulting int8 IN REGISTER before "
+        "storing. Eliminates the intermediate-tensor write/read between "
+        "kernel_conv2d_s8 + kernel_batchnorm2d_s8 — the top-1 fusion gap "
+        "on the headline workload (60 candidate pairs identified by E1).\n\n"
+        "Note: this is distinct from the standard 'BN folding' inference "
+        "optimization where BN is absorbed into conv's weight/bias offline. "
+        "Folding works when BN's params are static post-training. Here we "
+        "support runtime BN params (e.g., calibration-time fold not done)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_conv2d_batchnorm2d_s8(
+    const int8_t *input, const int8_t *weight, const int32_t *bias,
+    const float *bn_scale, const float *bn_bias, int8_t *output,
+    int N, int IC, int IH, int IW, int OC,
+    int KH, int KW, int SH, int SW, int PH, int PW,
+    int input_offset, int filter_offset, int conv_output_offset,
+    int conv_output_multiplier, int conv_output_shift,
+    int conv_activation_min, int conv_activation_max,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            /* BN's per-channel scale and bias loaded once per output channel. */
+            float bn_s = bn_scale[oc];
+            float bn_b = bn_bias[oc];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw] + filter_offset;
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    /* Conv requantize via Q0.31 rounding multiply. */
+                    int64_t prod = (int64_t)acc * (int64_t)conv_output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (conv_output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (conv_output_shift - 1)))
+                                            >> conv_output_shift);
+                    } else if (conv_output_shift < 0) {
+                        scaled = scaled << (-conv_output_shift);
+                    }
+                    scaled += conv_output_offset;
+                    if (scaled < conv_activation_min) scaled = conv_activation_min;
+                    if (scaled > conv_activation_max) scaled = conv_activation_max;
+                    int8_t conv_int8 = (int8_t)scaled;
+                    /* BN affine in-register, no intermediate tensor. */
+                    float fv = (float)conv_int8 * bn_scale_in;
+                    float y = bn_s * fv + bn_b;
+                    int32_t v = (int32_t)roundf(y / bn_scale_out);
+                    if (v < bn_activation_min) v = bn_activation_min;
+                    if (v > bn_activation_max) v = bn_activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # YOLOv8-nano hot conv shapes (from E1 candidate distribution).
+        {"N": 1, "IC": 3,  "IH": 320, "IW": 320, "OC": 16, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 16, "IH": 160, "IW": 160, "OC": 32, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 32, "IH": 80,  "IW": 80,  "OC": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        # Smaller shapes for fast validation
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 4, "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_batchnorm2d_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="conv2d_with_inline_bn_epilogue",
+            target_affinity=("gemmini",),
+            description=(
+                "Gemmini's tiled_matmul_auto + activation epilogue. The conv "
+                "MAC runs in the systolic array as usual; the BN affine "
+                "lives in the activation stage by precomputing the per-channel "
+                "(bn_scale[c] / bn_scale_out, bn_bias[c] / bn_scale_out) "
+                "constants and feeding them through gemmini's int8 multiply-"
+                "by-constant activation slot. Result: NO intermediate "
+                "conv_int8 buffer between conv and BN. 60 candidate pairs "
+                "from yolov8 + dronet collapse to single dispatches."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+        ),
+    ],
+)
+
+
+def _batchnorm2d_silu_s8_argtypes():
+    """Argtypes for the fused batchnorm2d+silu kernel registered in
+    Phase E2 (yolov8 hot path, 57 candidate pairs identified in E1)."""
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, scale, bias, output,
+    # N, C, H, W,
+    # bn_scale_in, bn_scale_out, bn_act_min, bn_act_max,
+    # silu_scale_in, silu_scale_out, silu_act_min, silu_act_max
+    return [i8p, fp, fp, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+BATCHNORM2D_SILU_S8 = KernelSpec(
+    op="batchnorm2d_silu_s8",
+    signature=(
+        "void kernel_batchnorm2d_silu_s8("
+        "const int8_t *input, const float *scale, const float *bias, "
+        "int8_t *output, "
+        "int N, int C, int H, int W, "
+        "float bn_scale_in, float bn_scale_out, "
+        "int bn_activation_min, int bn_activation_max, "
+        "float silu_scale_in, float silu_scale_out, "
+        "int silu_activation_min, int silu_activation_max)"
+    ),
+    semantics=(
+        "Pair-fused quantized BatchNorm + SiLU activation. Computes BN's "
+        "per-channel float affine on int8 activations, requantizes through "
+        "the BN's clamp, then applies SiLU on the resulting int8 IN "
+        "REGISTER before storing. Eliminates the intermediate-tensor "
+        "write/read between consecutive kernel_batchnorm2d_s8 + "
+        "kernel_silu_s8 calls — the top-2 fusion gap on yolov8_nano "
+        "(57 candidate pairs identified by Phase E1 gap survey).\n\n"
+        "Math (per element):\n"
+        "  fv  = input * bn_scale_in\n"
+        "  y   = scale[c] * fv + bias[c]                # BN affine (f32)\n"
+        "  bv  = clamp(round(y / bn_scale_out),\n"
+        "             bn_activation_min, bn_activation_max)  # BN's int8\n"
+        "  /* SiLU in-register, no intermediate tensor */\n"
+        "  fbv = bv * silu_scale_in\n"
+        "  sy  = fbv / (1.0f + expf(-fbv))               # SiLU = x*sigmoid(x)\n"
+        "  v   = clamp(round(sy / silu_scale_out),\n"
+        "             silu_activation_min, silu_activation_max)\n"
+        "  output = (int8_t) v\n\n"
+        "Optimization targets:\n"
+        "  rvv_opu — broadcast BN's per-channel (scale[c], bias[c]) into\n"
+        "  a vector register; the BN affine, requantize+clamp, SiLU LUT\n"
+        "  lookup, and final quant all happen in vector registers before\n"
+        "  the strided store. The 256-byte SiLU LUT (keyed by the BN\n"
+        "  int8 output) is precomputed per (silu_scale_in, silu_scale_out)\n"
+        "  tuple and fits in L1.\n"
+        "  gemmini — gemmini's activation slot can carry a custom LUT\n"
+        "  output stage; load (scale[c], bias[c]) per-channel and apply\n"
+        "  the fused BN+SiLU lookup in the epilogue.\n"
+        "  reference — straightforward C as in `reference_impl` below."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_batchnorm2d_silu_s8(
+    const int8_t *input, const float *scale, const float *bias,
+    int8_t *output,
+    int N, int C, int H, int W,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max,
+    float silu_scale_in, float silu_scale_out,
+    int silu_activation_min, int silu_activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float s = scale[c];
+            float b = bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    /* --- batchnorm2d_s8 math --- */
+                    float fv = (float)input[idx] * bn_scale_in;
+                    float y = s * fv + b;
+                    int32_t bv = (int32_t)roundf(y / bn_scale_out);
+                    if (bv < bn_activation_min) bv = bn_activation_min;
+                    if (bv > bn_activation_max) bv = bn_activation_max;
+                    int8_t bn_int8 = (int8_t)bv;
+                    /* --- silu_s8 math, in-register (no intermediate tensor) --- */
+                    float fbv = (float)bn_int8 * silu_scale_in;
+                    float sy = fbv / (1.0f + expf(-fbv));
+                    int32_t v = (int32_t)roundf(sy / silu_scale_out);
+                    if (v < silu_activation_min) v = silu_activation_min;
+                    if (v > silu_activation_max) v = silu_activation_max;
+                    output[idx] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # YOLOv8-nano hot shapes (BN dimensions from dronet/yolov8 IRs).
+        {"N": 1, "C": 16, "H": 40, "W": 40},
+        {"N": 1, "C": 32, "H": 20, "W": 20},
+        {"N": 1, "C": 64, "H": 10, "W": 10},
+        {"N": 1, "C": 128, "H": 5, "W": 5},
+        # Generalization
+        {"N": 1, "C": 8, "H": 7, "W": 7},
+        {"N": 2, "C": 4, "H": 3, "W": 3},
+    ],
+    argtypes_factory=_batchnorm2d_silu_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="bn_silu_per_channel_register_fused",
+            target_affinity=("rvv_opu",),
+            description=(
+                "RVV vector implementation: load BN's per-channel "
+                "(scale[c], bias[c]) as vector-broadcast operands; apply "
+                "the BN affine over the (H*W) tile in float vector "
+                "registers; requantize+clamp to int8 vector register; "
+                "use VRGATHER to look up SiLU LUT for each int8 in the "
+                "BN output; clamp+store final int8. The intermediate "
+                "BN int8 buffer is NEVER materialized — the SiLU LUT "
+                "lookup happens on the vector register that holds the "
+                "BN quantized output.\n\n"
+                "WHY this wins vs the per-op chain:\n"
+                "  * One worker handshake (vs 2 for BN+SiLU chained).\n"
+                "  * The BN_int8 intermediate (N*C*H*W bytes) never "
+                "spills to L1 — it stays in vector registers.\n"
+                "  * The SiLU LUT (256 bytes per scale tuple) is "
+                "precomputed once per dispatch.\n\n"
+                "PROGRAMMING MODEL:\n"
+                "  /* Precompute SiLU LUT keyed by BN int8 output. */\n"
+                "  for (int v = 0; v < 256; v++) {\n"
+                "      int8_t iv = (int8_t)(uint8_t)v;\n"
+                "      float f = (float)iv * silu_scale_in;\n"
+                "      float y = f / (1.0f + expf(-f));\n"
+                "      int32_t q = roundf(y / silu_scale_out);\n"
+                "      if (q < silu_activation_min) q = silu_activation_min;\n"
+                "      if (q > silu_activation_max) q = silu_activation_max;\n"
+                "      silu_lut[v] = (int8_t)q;\n"
+                "  }\n"
+                "  /* For each (n, c) panel of (H*W) int8 elements: */\n"
+                "  for (n, c) in [N, C):\n"
+                "      bs = vfmv_v_f(scale[c]); bb = vfmv_v_f(bias[c]);\n"
+                "      for tile of size VLEN/8:\n"
+                "          v_in = vle8_v(input + idx)\n"
+                "          v_f  = vfcvt_f_x(v_in) * bn_scale_in\n"
+                "          v_y  = bs * v_f + bb\n"
+                "          v_q  = round(v_y / bn_scale_out)\n"
+                "          v_q  = clamp(v_q, bn_act_min, bn_act_max)\n"
+                "          v_bn8 = vncvt_x_x(v_q)\n"
+                "          v_out = vrgather_vv(silu_lut, v_bn8)\n"
+                "          vse8_v(output + idx, v_out)\n\n"
+                "STRICT REQUIREMENTS:\n"
+                "  * Bit-exact match vs the reference scalar impl above\n"
+                "    (same rounding/clamp order). Verify gate:\n"
+                "    spike max_abs_err=0 max_rel_err=0.\n"
+                "  * Per-channel (scale, bias) MUST be loaded fresh per\n"
+                "    channel — do not assume a single (scale, bias) for\n"
+                "    the whole tensor.\n"
+                "  * The BN_int8 intermediate MUST be in registers — DO\n"
+                "    NOT allocate an HxW (or any) BN-output buffer."
+            ),
+            reference_impl="(see KernelSpec.reference_impl — same math)",
+        ),
+        AlgorithmCandidate(
+            name="bn_silu_inline_scalar_per_channel",
+            target_affinity=("gemmini",),
+            description=(
+                "Gemmini doesn't run BN natively (it's a matmul/conv "
+                "accelerator) — the fused BN+SiLU runs on the scalar "
+                "host or via gemmini's activation-stage LUT slot if "
+                "available. The fused kernel reduces the per-channel "
+                "(scale, bias) memory traffic by a factor of 2 vs "
+                "running BN and SiLU as separate dispatches (each of "
+                "which would load the per-channel params anew).\n\n"
+                "Verify gate: bit-exact match vs reference scalar impl."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+        ),
+    ],
+)
+
+
 def _upsample_nearest_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -7574,6 +7899,14 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     # vector-register-resident and gemmini tiled_matmul_auto variants;
     # reference impl matches kernel_linear_s8 + kernel_elu_s8 bit-exact.
     "linear_s8_elu_s8": LINEAR_S8_ELU_S8,
+    # Phase E2: yolov8 + dronet hot path — top-1 fusion gap from E1
+    # survey (60 candidate pairs). Eliminates conv→BN intermediate
+    # write/read; BN affine folds into conv's requantize epilogue.
+    "conv2d_batchnorm2d_s8": CONV2D_BATCHNORM2D_S8,
+    # Phase E2: yolov8 hot path — top-2 fusion gap from E1 survey
+    # (57 candidate pairs). Eliminates the BN→SiLU intermediate
+    # tensor write/read; LUT applied in-register.
+    "batchnorm2d_silu_s8": BATCHNORM2D_SILU_S8,
     "upsample_nearest_s8": UPSAMPLE_NEAREST_S8,
     "cat2_c1_s8": CAT2_C1_S8,
     "cat3_c1_s8": CAT3_C1_S8,
