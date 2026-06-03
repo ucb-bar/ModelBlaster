@@ -1,0 +1,7 @@
+{
+  "contract": "modelblaster.split_hints/v1",
+  "reason": "manual split test: dispatch_2 (linear_s8 K=256 N=128) into 2 tiles N=64",
+  "networks": [
+    {"network": "mlp_control", "split_ops": [{"op": 2, "n_splits": 2}]}
+  ]
+}

@@ -1,0 +1,5 @@
+[measure_candidate] hint=/tmp/empty_hint.json (modelblaster.fusion_hints/v1)  model=mlp_control
+apply_fusion_hint: no fuse_groups for network 'mlp_control' in /tmp/empty_hint.json — copying IR through unchanged
+apply_fusion_hint: wrote artifacts/decision_loop/smoke/baseline/mlp_control.afterhint.graph.json (0 fused ops, 7 total dispatches; input had 7)
+ingest_measured_cycles: wrote artifacts/decision_loop/smoke/baseline/measured_cycles.json (n=7, total=102725 cyc, wall=1050)
+[measure_candidate] OK -> artifacts/decision_loop/smoke/baseline/measured_cycles.json
