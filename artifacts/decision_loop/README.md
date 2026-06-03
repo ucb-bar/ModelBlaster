@@ -195,3 +195,47 @@ Inspect:
 5. **FireSim escalation** — `--runner firesim` is wired in. Currently
    blocked on the same bitstream stability issue as #163. When that
    clears, the same decision loop runs with FireSim measurements.
+
+---
+
+## Round 4 (post-prompt-tightening): measured BACKEND=llm
+
+After the `SATURN_OPU_KEEP_REGISTER_MACROS` guard was made mechanical
+(injected at `emit_kernels_c` time in `generate_kernels.py`, no longer
+LLM-stochastic), we re-ran the loop with **both** baseline and fuse
+candidate using `BACKEND=llm` (Bedrock-generated kernels):
+
+| | Strategy | Cycles |
+|:---|:---|---:|
+| BASELINE (per-op) | Bedrock OPU `linear_s8` (outerprod) + scalar `elu_s8` | **96,597** |
+| FUSE candidate | Bedrock scalar `linear_s8_elu_s8` (auto-chose scalar fusion) | 862,925 |
+| Δ | | **−793 % worse** |
+
+**Decision: REJECT.** The agent correctly refused the fuse hint
+because the measured cost is dramatically higher.
+
+### Why Bedrock chose scalar fusion (real finding)
+
+The `linear_s8_elu_s8` AlgorithmCandidate didn't have an OPU-targeted
+seed in the prompt — its reference_impl is the curated scalar chain.
+When Bedrock got the `linear_s8` AlgorithmCandidate it had the
+`outerprod` seed (OPMVINBCAST / VOPACC / VMV_VR pattern) and
+reproduced it bit-exact. With no equivalent seed for the fused op, it
+defaulted to "just chain the scalar implementations."
+
+This is the actual research answer:
+
+> **Fusion helps when the fused kernel reaches for the same hardware
+> features the per-op kernels do.** On Saturn OPU + `linear_s8_elu_s8`,
+> the fused kernel that the LLM auto-generates does NOT reach for OPU
+> macros — so fusion collapses to scalar and loses 9× to the per-op
+> variants. The agent correctly rejects this in 1 round.
+
+### What would change the verdict
+
+Adding an OPU-targeted `linear_s8_elu_s8` AlgorithmCandidate with the
+right seed (outerprod accumulator + in-register ELU via `vfmacc` or
+table lookup before drain). That's an LLM-prompt change in
+`pipeline/reference_kernels.py`, not a kernel that needs to be
+hand-written — Bedrock can produce it, given the right seed. Follow-up.
+
