@@ -1,0 +1,2 @@
+[measure_candidate] hint=artifacts/decision_loop/dronet/round_002/cand_00_split_dronet0_dispatch_0/hint.json (modelblaster.split_hints/v1)  model=dronet
+apply_split_hint: wrote artifacts/decision_loop/dronet/round_003_aliasfix/dronet.afterhint.graph.json (2 tile ops from splits, 31 total dispatches)
