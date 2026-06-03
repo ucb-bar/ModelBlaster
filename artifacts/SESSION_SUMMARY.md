@@ -128,6 +128,10 @@ shift is applicable.
 - 28 unit tests pass (`pytest`).
 - All Gantts use measured profile data (no bookkeeping fictions).
 - Per-phase evidence trail in `artifacts/quality_log.md`.
+- **Cold-rerun gate:** 9/12 cells reproduce bit-exact. The 3 cpsat
+  cells drifted due to non-deterministic parallel search; root cause
+  fixed in `xpu-rt/scheduler_cpsat.py` (num_search_workers=1 +
+  random_seed=42). See `artifacts/sweeps/COLD_RERUN_REPORT.md`.
 
 ## Honest gaps
 
