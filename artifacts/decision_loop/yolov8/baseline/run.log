@@ -1,0 +1,5 @@
+[measure_candidate] hint=/tmp/empty_yolo_hint.json (modelblaster.fusion_hints/v1)  model=yolov8_nano
+apply_fusion_hint: no fuse_groups for network 'yolov8_nano' in /tmp/empty_yolo_hint.json — copying IR through unchanged
+apply_fusion_hint: wrote artifacts/decision_loop/yolov8/baseline/yolov8_nano.afterhint.graph.json (0 fused ops, 212 total dispatches; input had 212)
+ingest_measured_cycles: wrote artifacts/decision_loop/yolov8/baseline/measured_cycles.json (n=204, total=10437959441 cyc, wall=104405750)
+[measure_candidate] OK -> artifacts/decision_loop/yolov8/baseline/measured_cycles.json
