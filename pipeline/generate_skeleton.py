@@ -1000,7 +1000,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"    unsigned long _s = rdcycle();\n"
                 f"    {per_disp_call};\n"
                 f"    unsigned long _e = rdcycle();\n"
-                f"    int slot = n_++;\n"
+                f"    int slot = (n_ < MODEL_{umid}_OP_COUNT) ? n_++ : MODEL_{umid}_OP_COUNT - 1;\n"
                 f'    records_[slot].dispatch_id = {dispatch_id};\n'
                 f'    records_[slot].name   = "{op["name"]}";\n'
                 f'    records_[slot].op     = "{op["op"]}";\n'
@@ -1866,7 +1866,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             f"    {per_disp_call};\n"
             f"    unsigned long _e = rdcycle();\n"
             f"{inspect_block}"
-            f"    int slot = n_++;\n"
+            f"    int slot = (n_ < MODEL_{umid}_OP_COUNT) ? n_++ : MODEL_{umid}_OP_COUNT - 1;\n"
             f'    records_[slot].dispatch_id = {dispatch_id};\n'
             f'    records_[slot].name   = "{op["name"]}";\n'
             f'    records_[slot].op     = "{op["op"]}";\n'
