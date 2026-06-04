@@ -1,0 +1,36 @@
+Spike mlp_control hetero IR-complete validation, 2026-06-04
+===
+spike --isa=rv64gcv_zicntr --extension=gemmini --extension=saturn_opu -p4 zephyr.elf
+
+Workload: mlp_control alone (4 linear + 3 elu) with full IR-completion
+Schedule: scheduled_networks_1yolo_4mlp_2dronet_firesim_only_mlp_control_profiled.json
+
+Result:
+  === MODELBLASTER_OUTPUT_BEGIN [mlp_control] ===
+  125
+  -20
+  23
+  0
+  === MODELBLASTER_OUTPUT_END [mlp_control] ===
+
+  [mlp_control] actual: [125.0, -20.0, 23.0, 0.0]
+  [mlp_control] golden: [125.0, -20.0, 23.0, 0.0]
+  [mlp_control] max_abs_err=0 max_rel_err=0 (atol=0 rtol=0)
+  [mlp_control] PASS
+  OVERALL: PASS (1 models)
+
+Per-op profile:
+  gemmini_q31, mlp.0 linear_s8,  68978 cycles (9.4%)
+  rvv_opu,     mlp.1 elu_s8,     20453 cycles (2.8%)
+  rvv_opu,     mlp.2 linear_s8, 495347 cycles (67.8%)
+  rvv_opu,     mlp.3 elu_s8,     11302 cycles (1.5%)
+  rvv_opu,     mlp.4 linear_s8, 124852 cycles (17.1%)
+  rvv_opu,     mlp.5 elu_s8,      5158 cycles (0.7%)
+  rvv_opu,     mlp.6 linear_s8,   4070 cycles (0.6%)
+  TOTAL                          730160 cycles
+  Wall mtime                       7350 cycles -> 7.35 ms
+
+7 IR ops dispatched (vs 1-2 in the old schedule before IR-completion).
+Includes the 5 synthesized elu/linear ops that the scheduler had
+dropped. Scalar-FP activations (elu_s8) on rvv_opu hart per the
+activation-pin rule.
