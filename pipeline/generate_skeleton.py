@@ -1949,7 +1949,14 @@ void run_model_{mid}(const model_{mid}_input_t *input,
 }}
 
 const model_{mid}_op_record_t *model_{mid}_profile_records(int *count) {{
-    *count = n_;
+    /* Clamp to OP_COUNT — the per-dispatch n_++ is non-atomic across
+     * harts, so under heavy multi-instance contention n_ can overshoot
+     * even with the cap in the dispatch fn. Without this clamp the dump
+     * iterator reads past records_[] and follows a garbage string
+     * pointer, faulting with mcause=5. */
+    int n = n_;
+    if (n > MODEL_{umid}_OP_COUNT) n = MODEL_{umid}_OP_COUNT;
+    *count = n;
     return records_;
 }}
 
