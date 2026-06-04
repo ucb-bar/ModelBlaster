@@ -71,14 +71,40 @@ PASS: skip mode 236 entries < full 337 (synthesized 101)
 All four checks confirm the synthesis produces a structurally
 correct table.
 
-### Spike-hetero functional execution
+### Spike-hetero end-to-end functional execution (dronet)
 
-Built the v6 binary (337-entry dispatch table) and ran on
-spike-hetero (`spike -p2 --extension=gemmini --extension=saturn_opu
---isa=rv64gcv_zicntr`). Spike boots Zephyr immediately, prints the
-worker spawn diagnostics, and emits the `MODELBLASTER_XPURT_TRACE`
-block showing every dispatch firing on the correct kind worker in
-topological order:
+Built v6 binary for dronet-only IR-complete schedule and ran on
+spike-hetero (`spike -p4 --isa=rv64gcv_zicntr --extension=gemmini
+--extension=saturn_opu`). All 30 IR ops fired in topological order
+on the correct kind worker, including the 7 synthesized entries
+(6 relus + 1 sigmoid). Final verify output:
+
+```
+=== MODELBLASTER_OUTPUT_BEGIN [dronet] ===
+-56
+127
+=== MODELBLASTER_OUTPUT_END [dronet] ===
+=== MODELBLASTER_WALL_CYCLES [dronet] === 4671350
+```
+
+**Bit-exact match against the PyTorch golden `[-56, 127]`**. This
+proves the IR-completion fix produces functionally correct output
+end-to-end on the hetero dispatch path.
+
+Full trace preserved at
+`artifacts/audit/spike_dronet_hetero_validation.log`.
+
+Note: the earlier multi-net spike attempts hung in Zephyr's SMP
+boot because the binary was built with `MP_MAX_NUM_CPUS=4` (from
+`spike_quad.conf`) but the test invocation used `SPIKE_HARTS=2`.
+Zephyr's SMP boot spinwaits for every configured hart, so the
+mismatched hart count appears as a silent hang. With the right
+`-p4` count, boot proceeds and the workload completes.
+
+### Spike-hetero multi-network trace (earlier, v5 binary)
+
+The same harness ran end-to-end on the v5 binary (337-entry
+multi-network schedule). Trace excerpt:
 
 ```
 *** Booting Zephyr OS build 852bb170cc56 ***
