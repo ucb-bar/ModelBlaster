@@ -1267,28 +1267,42 @@ def generate(
             os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
             and needs_harness_paths
         )
-        if global_curated_dir is not None:
+
+        def _probe_swap(source_label: str, dir_path: Optional[str],
+                        path_layout) -> None:
+            """Probe `dir_path` for per-(op, algorithm) kernels and swap
+            in the first verified hit per spec. `path_layout(spec, algo)`
+            returns the candidate file path. Both `cache_dir` (per-model
+            cache populated by prior LLM runs) and `global_curated_dir`
+            (hand-written generic library) get probed with the same
+            verify+accept logic — without this, BACKEND=reference builds
+            would silently pick the scalar reference for every op even
+            when validated Gemmini-RoCC / RVV kernels were already in
+            the per-model cache (see notes below)."""
+            if dir_path is None:
+                return
             for spec in specs:
+                if kernel_picks.get(spec.op, {}).get("source") not in (
+                        None, "reference"):
+                    # Already swapped by an earlier source (cache beats
+                    # global_curated, since cache was vetted for THIS model).
+                    continue
                 for algorithm in spec.algorithms:
-                    filename = (
-                        f"{target.name}_{spec.op}_{algorithm.name}.c"
-                    )
-                    curated_path = os.path.join(
-                        global_curated_dir, target.name, filename
-                    )
-                    if not os.path.exists(curated_path):
+                    candidate_path = path_layout(spec, algorithm)
+                    if not candidate_path or not os.path.exists(candidate_path):
                         continue
-                    curated_src = open(curated_path).read()
+                    candidate_src = open(candidate_path).read()
                     log(f"  [{spec.op}/{algorithm.name}] reference + "
-                        f"curated swap from {curated_path}")
+                        f"{source_label} swap from {candidate_path}")
                     accepted = True
                     if curated_verify:
                         shapes = collect_shapes(ir, spec.op, spec)
-                        log(f"  [{spec.op}/{algorithm.name}] verify curated "
-                            f"at {len(shapes)} shape(s) vs reference_impl")
+                        log(f"  [{spec.op}/{algorithm.name}] verify "
+                            f"{source_label} at {len(shapes)} shape(s) "
+                            f"vs reference_impl")
                         try:
                             vres = _verify(
-                                spec, curated_src, shapes,
+                                spec, candidate_src, shapes,
                                 backend=target, impls=impls, specs=specs,
                                 repo_root=repo_root, model_dir=out_dir,
                                 build_dir=build_dir,
@@ -1296,30 +1310,55 @@ def generate(
                                 algorithm_name=algorithm.name,
                             )
                         except Exception as e:
-                            log(f"  [{spec.op}/{algorithm.name}] curated "
-                                f"verify raised {type(e).__name__}: {e}; "
+                            log(f"  [{spec.op}/{algorithm.name}] "
+                                f"{source_label} verify raised "
+                                f"{type(e).__name__}: {e}; "
                                 f"falling back to reference_impl")
                             accepted = False
                             vres = None
                         if vres is not None and not vres.ok:
-                            log(f"  [{spec.op}/{algorithm.name}] curated "
-                                f"verify FAIL — {vres.message}; "
-                                f"falling back to reference_impl")
+                            log(f"  [{spec.op}/{algorithm.name}] "
+                                f"{source_label} verify FAIL — "
+                                f"{vres.message}; falling back to "
+                                f"reference_impl")
                             accepted = False
                         elif vres is not None:
-                            log(f"  [{spec.op}/{algorithm.name}] curated "
-                                f"verify PASS — {vres.message}")
+                            log(f"  [{spec.op}/{algorithm.name}] "
+                                f"{source_label} verify PASS — {vres.message}")
                     if accepted:
-                        impls[spec.op] = curated_src
+                        impls[spec.op] = candidate_src
                         kernel_picks[spec.op] = {
-                            "source": "curated",
+                            "source": source_label,
                             "algorithm": algorithm.name,
-                            "path": curated_path,
+                            "path": candidate_path,
                         }
                         break  # first-accepted-wins; try next spec
                     # If verify failed, continue to next algorithm; if
                     # all algorithms fail, kernel_picks keeps the original
                     # "reference" entry and impls keeps reference_impl.
+
+        # Per-model LLM cache first (vetted for THIS model by a prior
+        # BACKEND=llm run). Files at <cache_dir>/<target>_<op>_<algo>.c
+        # — note the flat layout (no <target>/ subdir) since cache_dir
+        # is already per-target.
+        _probe_swap(
+            "cache",
+            cache_dir,
+            lambda spec, algorithm: os.path.join(
+                cache_dir, f"{target.name}_{spec.op}_{algorithm.name}.c",
+            ) if cache_dir else None,
+        )
+        # Global curated library second (hand-written generic, layout
+        # <global_curated_dir>/<target>/<target>_<op>_<algo>.c). Only
+        # probed for specs that the per-model cache didn't already cover.
+        _probe_swap(
+            "curated",
+            global_curated_dir,
+            lambda spec, algorithm: os.path.join(
+                global_curated_dir, target.name,
+                f"{target.name}_{spec.op}_{algorithm.name}.c",
+            ) if global_curated_dir else None,
+        )
     elif backend_name == "llm":
         # Lazy proxy: the LLM client is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
