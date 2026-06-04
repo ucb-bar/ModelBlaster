@@ -204,20 +204,41 @@ def _emit(networks: list[str], schedule_name: str,
         # (2026-05-14) and ported here for the multi-backend xpurt
         # dispatch loop. Without these fences, hetero output diverges
         # from golden (linf ~52 on dronet).
+        # Dispatch branch: strcmp against the SCHEDULER'S core_kind (the
+        # value the ingest stored in the table — registry kind), but
+        # invoke through the BACKEND-suffixed dispatch fn symbol (which
+        # is how each backend's per-model OBJECT lib is named). The two
+        # can legitimately differ (e.g. kind="gemmini" → backend tag
+        # "gemmini_q31") as long as they're paired by index in the
+        # callsite's --core-kinds / --backends args. Before 2026-06-03
+        # this loop strcmped against `bs` (the backend tag), so any
+        # mismatch silently dropped every dispatch into the else clause
+        # — verify then showed all-zero outputs (static init) and the
+        # bug looked like FPGA corruption. The state struct stays
+        # suffixed by `kind` so its .pool binding (in state_pool_assigns
+        # above) keeps the kind's pool, regardless of the backend tag.
+        if len(core_kinds) != len(backends):
+            raise SystemExit(
+                f"_emit: core_kinds and backends must have equal length "
+                f"(got {core_kinds} vs {backends})"
+            )
         bs_select_lines: list[str] = []
-        for i, bs in enumerate(backends):
+        for i, (kind, bs) in enumerate(zip(core_kinds, backends)):
             BS = bs.upper()
             kw = "if" if i == 0 else "else if"
             bs_select_lines.append(
-                f'            {kw} (strcmp(e_->core_kind, "{bs}") == 0) {{\n'
+                f'            {kw} (strcmp(e_->core_kind, "{kind}") == 0) {{\n'
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
-                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{bs});\n"
+                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{kind});\n"
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
                 f"            }}"
             )
         bs_select_lines.append(
             "            else {\n"
-            f'                printf("xpurt: WARN unknown core_kind \'%s\' for {net}\\n", e_->core_kind);\n'
+            f'                printf("xpurt: FATAL unknown core_kind \'%s\' for {net} (entry %d) — '
+            f'kind→backend mapping mismatch at codegen, see pipeline/generate_xpurt_main.py\\n", '
+            f'e_->core_kind, e_->entry_id);\n'
+            f"                sys_reboot(SYS_REBOOT_COLD);\n"
             "            }"
         )
         bs_select = "\n".join(bs_select_lines)
@@ -757,6 +778,20 @@ def main() -> None:
         backends = [b.strip() for b in args.backends.split(",") if b.strip()]
         if not backends:
             raise SystemExit("--backends must be a non-empty comma list")
+
+    # Guard against the silent-dispatch-drop bug (2026-06-03):
+    # the schedule's dispatch table carries .core_kind = registry-kind
+    # (e.g. "gemmini"). The generated dispatch branch must strcmp the
+    # entry's .core_kind against the SAME string — so kind→backend
+    # mapping is now done by zip(core_kinds, backends) inside _emit
+    # (strcmp uses kind, dispatch fn symbol uses backend). Asserting
+    # length parity here so the index-aligned mapping is well-defined.
+    if len(core_kinds) != len(backends):
+        raise SystemExit(
+            f"--core-kinds and --backends must have the same length "
+            f"(got core_kinds={core_kinds}, backends={backends}). The "
+            f"dispatch branch pairs kind[i] -> backend[i] by index."
+        )
 
     # Pool size resolution:
     #   1. explicit --pool-sizes wins
