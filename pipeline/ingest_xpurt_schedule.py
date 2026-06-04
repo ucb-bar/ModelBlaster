@@ -191,135 +191,130 @@ def load(schedule_path: str,
         network_remap[net] = remap
 
     # ---------- IR-completion: synthesize missing IR ops ----------
-    #
-    # XPU-RT's scheduler drops IR ops whose profile-DB cost is zero
-    # (relu_s8 fused into the prior BN at profile time, sigmoid_s8 not
-    # measured separately, etc.). Those ops still need to dispatch on
-    # the harness — the generated model_<m>.c chains buffers through
-    # them, so the consumer of a dropped op reads stale / zero memory.
-    # Symptom before this fix: dronet output stuck at zero or partial;
-    # mlp_control had only 1-2 of 7 IR ops in the schedule, so the
-    # final-writeback op never fired and `state.output` stayed at
-    # static zero-init.
-    #
-    # Fix: walk each (job_name, IR) pair. For every IR dispatch_id
-    # missing from the schedule for that job, synthesize a raw entry
-    # mirroring the XPU-RT schema, then thread its dependencies into
-    # the topological sort. Placement is inherited from the IR
-    # producer's schedule entry (so a relu dropped between two
-    # gemmini-placed ops lands on gemmini). Duration=0 — the schedule
-    # never said this op had cost, so we don't invent one; the wall
-    # we'll see at runtime is the kernel's actual cost.
-    #
-    # The mutation makes the schedule's dispatch graph match the IR's
-    # data-flow graph, which is what the harness needs.
-    known_networks = set(irs_by_network)
-    sched_jobs: dict[str, set[int]] = {}  # job_name -> set of IR did's already scheduled
-    job_net_inst: dict[str, tuple[str, int]] = {}  # job_name -> (network, instance)
-    for k, d in raw.items():
-        job = d["job_name"]
-        sched_jobs.setdefault(job, set()).add(int(d["id"]))
-        if job not in job_net_inst:
-            net, inst = _split_job_name(job, known_networks)
-            if net in known_networks:
-                job_net_inst[job] = (net, inst)
+    # Toggle: set MB_INGEST_SKIP_IR_COMPLETION=1 to disable the
+    # synthesis pass (useful for control tests / bisecting failures).
+    _skip_ir_completion = (
+        os.environ.get("MB_INGEST_SKIP_IR_COMPLETION", "0") == "1")
+    if _skip_ir_completion:
+        print("ingest: IR-completion DISABLED via MB_INGEST_SKIP_IR_COMPLETION=1")
+    if not _skip_ir_completion:
+        # XPU-RT's scheduler drops IR ops whose profile-DB cost is zero
+        # (relu_s8 fused into the prior BN at profile time, sigmoid_s8
+        # not measured separately, etc.). Those ops still need to
+        # dispatch on the harness — the generated model_<m>.c chains
+        # buffers through them, so the consumer of a dropped op reads
+        # stale / zero memory. Symptom before this fix: dronet output
+        # stuck at zero or partial; mlp_control had only 1-2 of 7 IR
+        # ops in the schedule, so the final-writeback op never fired
+        # and `state.output` stayed at static zero-init.
+        #
+        # Fix: walk each (job_name, IR) pair. For every IR dispatch_id
+        # missing from the schedule for that job, synthesize a raw
+        # entry mirroring the XPU-RT schema, then thread its
+        # dependencies into the topological sort. Activation ops
+        # (silu/relu/elu/sigmoid/...) are pinned to the rvv_opu hart
+        # since they're pure scalar FP — placing them on the gemmini
+        # hart triggers a bitstream-side issue not exercised by v2.
+        known_networks = set(irs_by_network)
+        sched_jobs: dict[str, set[int]] = {}
+        job_net_inst: dict[str, tuple[str, int]] = {}
+        for k, d in raw.items():
+            job = d["job_name"]
+            sched_jobs.setdefault(job, set()).add(int(d["id"]))
+            if job not in job_net_inst:
+                net, inst = _split_job_name(job, known_networks)
+                if net in known_networks:
+                    job_net_inst[job] = (net, inst)
 
-    synthesized: list[tuple[str, int, str]] = []  # (job_name, did, key) for diagnostics
-    for job_name, scheduled_dids in list(sched_jobs.items()):
-        if job_name not in job_net_inst:
-            continue
-        network, _instance = job_net_inst[job_name]
-        ir_dids = network_dispatches.get(network, set())
-        missing_dids = sorted(ir_dids - scheduled_dids)
-        if not missing_dids:
-            continue
-        for did in missing_dids:
-            op = network_op_by_did[network][did]
-            depends_on = op.get("depends_on", []) or []
-            # Resolve producer schedule keys. A producer might itself
-            # be a synthesized entry that we already added in this
-            # loop (since we walk missing_dids in dispatch_id order,
-            # producers come first).
-            dep_keys: list[str] = []
-            producer_max_end = 0.0
-            producer_target = None
-            for prod_did in depends_on:
-                prod_key = f"{job_name}_dispatch_{prod_did}"
-                if prod_key in raw:
-                    dep_keys.append(prod_key)
-                    pr = raw[prod_key]
-                    pr_end = float(pr.get("start_time", 0.0) or 0.0) + \
-                             float(pr.get("duration", 0.0) or 0.0)
-                    if pr_end > producer_max_end:
-                        producer_max_end = pr_end
-                    if producer_target is None:
-                        producer_target = pr.get("hardware_target")
-                # If a producer is itself MISSING and we somehow
-                # haven't synthesized it yet (shouldn't happen with
-                # ascending-did order), skip — the entry still gets
-                # added but with weaker ordering.
-            # Fallback placement: first scheduled entry of this job.
-            if producer_target is None:
-                for k2, d2 in raw.items():
-                    if d2.get("job_name") == job_name:
-                        producer_target = d2.get("hardware_target")
-                        producer_max_end = float(d2.get("start_time", 0.0) or 0.0)
-                        break
-            if producer_target is None:
-                # Job has no scheduled entries at all (degenerate);
-                # default to CPU_P#0.
-                producer_target = "CPU_P#0"
-            new_key = f"{job_name}_dispatch_{did}"
-            raw[new_key] = {
-                "id": did,
-                "ordinal": 1,
-                "total": 1,
-                "dependencies": dep_keys,
-                "hardware_target": producer_target,
-                "start_time": producer_max_end,  # tiny tail of producer
-                "duration": 0.0,
-                "job_name": job_name,
-                "module_name": op.get("name", f"dispatch_{did}"),
-                "_synthesized": True,
-            }
-            scheduled_dids.add(did)
-            synthesized.append((job_name, did, new_key))
+        _SCALAR_FP_OPS = {
+            "silu_s8", "elu_s8", "relu_s8", "sigmoid_s8", "tanh_s8",
+            "gelu_s8", "hardswish_s8", "softmax_s8",
+        }
+        _CPU_E_LABEL = "CPU_E#0"
 
-        # Now thread the synthesized entry into its consumers'
-        # dependencies. Any IR op that consumes a synthesized op MUST
-        # wait for it; otherwise the consumer races the zero buffer.
-        # Walk IR ops for this network; for every op whose IR
-        # depends_on includes a now-synthesized did AND whose own
-        # scheduled key exists in `raw` for this job, append the
-        # synthesized key to that scheduled entry's dependencies.
-        synth_dids_this_job = {did for (jn, did, _k) in synthesized
-                               if jn == job_name}
-        for op in irs_by_network[network].get("ops", []):
-            cdid = op.get("dispatch_id")
-            if cdid is None:
+        synthesized: list[tuple[str, int, str]] = []
+        for job_name, scheduled_dids in list(sched_jobs.items()):
+            if job_name not in job_net_inst:
                 continue
-            consumer_key = f"{job_name}_dispatch_{cdid}"
-            if consumer_key not in raw:
+            network, _instance = job_net_inst[job_name]
+            ir_dids = network_dispatches.get(network, set())
+            missing_dids = sorted(ir_dids - scheduled_dids)
+            if not missing_dids:
                 continue
-            consumer = raw[consumer_key]
-            existing_deps = list(consumer.get("dependencies", []) or [])
-            changed = False
-            for pd in op.get("depends_on", []) or []:
-                if pd in synth_dids_this_job:
-                    pk = f"{job_name}_dispatch_{pd}"
-                    if pk not in existing_deps:
-                        existing_deps.append(pk)
-                        changed = True
-            if changed:
-                consumer["dependencies"] = existing_deps
+            for did in missing_dids:
+                op = network_op_by_did[network][did]
+                op_kind = op.get("op", "")
+                depends_on = op.get("depends_on", []) or []
+                dep_keys: list[str] = []
+                producer_max_end = 0.0
+                producer_target = None
+                for prod_did in depends_on:
+                    prod_key = f"{job_name}_dispatch_{prod_did}"
+                    if prod_key in raw:
+                        dep_keys.append(prod_key)
+                        pr = raw[prod_key]
+                        pr_end = float(pr.get("start_time", 0.0) or 0.0) + \
+                                 float(pr.get("duration", 0.0) or 0.0)
+                        if pr_end > producer_max_end:
+                            producer_max_end = pr_end
+                        if producer_target is None:
+                            producer_target = pr.get("hardware_target")
+                if producer_target is None:
+                    for k2, d2 in raw.items():
+                        if d2.get("job_name") == job_name:
+                            producer_target = d2.get("hardware_target")
+                            producer_max_end = float(
+                                d2.get("start_time", 0.0) or 0.0)
+                            break
+                if producer_target is None:
+                    producer_target = "CPU_P#0"
+                if op_kind in _SCALAR_FP_OPS:
+                    producer_target = _CPU_E_LABEL
+                new_key = f"{job_name}_dispatch_{did}"
+                raw[new_key] = {
+                    "id": did,
+                    "ordinal": 1,
+                    "total": 1,
+                    "dependencies": dep_keys,
+                    "hardware_target": producer_target,
+                    "start_time": producer_max_end,
+                    "duration": 0.0,
+                    "job_name": job_name,
+                    "module_name": op.get("name", f"dispatch_{did}"),
+                    "_synthesized": True,
+                }
+                scheduled_dids.add(did)
+                synthesized.append((job_name, did, new_key))
 
-    if synthesized:
-        # Concise summary so callers can see what got filled in.
-        by_job: dict[str, list[int]] = {}
-        for jn, did, _k in synthesized:
-            by_job.setdefault(jn, []).append(did)
-        parts = ", ".join(f"{j}: {sorted(ds)}" for j, ds in sorted(by_job.items()))
-        print(f"ingest: synthesized {len(synthesized)} missing IR ops -> {parts}")
+            # Thread synthesized entries into consumers' dependencies.
+            synth_dids_this_job = {did for (jn, did, _k) in synthesized
+                                   if jn == job_name}
+            for op in irs_by_network[network].get("ops", []):
+                cdid = op.get("dispatch_id")
+                if cdid is None:
+                    continue
+                consumer_key = f"{job_name}_dispatch_{cdid}"
+                if consumer_key not in raw:
+                    continue
+                consumer = raw[consumer_key]
+                existing_deps = list(consumer.get("dependencies", []) or [])
+                changed = False
+                for pd in op.get("depends_on", []) or []:
+                    if pd in synth_dids_this_job:
+                        pk = f"{job_name}_dispatch_{pd}"
+                        if pk not in existing_deps:
+                            existing_deps.append(pk)
+                            changed = True
+                if changed:
+                    consumer["dependencies"] = existing_deps
+
+        if synthesized:
+            by_job: dict[str, list[int]] = {}
+            for jn, did, _k in synthesized:
+                by_job.setdefault(jn, []).append(did)
+            parts = ", ".join(f"{j}: {sorted(ds)}"
+                              for j, ds in sorted(by_job.items()))
+            print(f"ingest: synthesized {len(synthesized)} missing IR ops -> {parts}")
     # ---------- end IR-completion ----------
 
     # In-table order: priority topological sort, where the priority
