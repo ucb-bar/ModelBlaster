@@ -1278,7 +1278,15 @@ def generate(
             verify+accept logic — without this, BACKEND=reference builds
             would silently pick the scalar reference for every op even
             when validated Gemmini-RoCC / RVV kernels were already in
-            the per-model cache (see notes below)."""
+            the per-model cache (see notes below).
+
+            Honors max_accuracy_class: the cached file's
+            `/* accuracy_class: ... */` header takes precedence if
+            present, else the spec algorithm's declared class is used.
+            Cached kernels with a stricter requirement than the user
+            asked for are skipped — e.g. `--max-accuracy-class bit_exact`
+            skips the cached gemmini_tiled_conv (numeric_drift) and
+            lands on gemmini_im2col_full_C (bit_exact) instead."""
             if dir_path is None:
                 return
             for spec in specs:
@@ -1292,6 +1300,20 @@ def generate(
                     if not candidate_path or not os.path.exists(candidate_path):
                         continue
                     candidate_src = open(candidate_path).read()
+                    # Honor max_accuracy_class: parse the file's own
+                    # declared class (falls back to the algorithm's
+                    # default), and skip if it exceeds the user cap.
+                    candidate_class = (
+                        _parse_curated_accuracy_class(candidate_src)
+                        or algorithm.accuracy_class
+                    )
+                    if (max_accuracy_class is not None
+                            and candidate_class > max_accuracy_class):
+                        log(f"  [{spec.op}/{algorithm.name}] {source_label} "
+                            f"kernel declares accuracy_class="
+                            f"{candidate_class.name.lower()} > "
+                            f"{max_accuracy_class.name.lower()}; skipping")
+                        continue
                     log(f"  [{spec.op}/{algorithm.name}] reference + "
                         f"{source_label} swap from {candidate_path}")
                     accepted = True
