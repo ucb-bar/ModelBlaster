@@ -515,7 +515,17 @@ def load(schedule_path: str,
             hart=hart,
             start_time_ms=float(d.get("start_time", 0.0) or 0.0),
             duration_ms=float(d.get("duration", 0.0) or 0.0),
-            deps_entry_ids=tuple(deps_ids),
+            # Dedup deps_entry_ids. Two consequences of the Phase G2d
+            # producer-side fanout: (a) the consumer's take loop calls
+            # k_sem_take once per dep entry, so duplicates would mean
+            # multiple takes from the same producer's sem; (b) the
+            # producer side dedups fanout per unique consumer. If a
+            # producer ended up as both fanout[c] = c-once but the
+            # consumer's deps had it twice, take/give wouldn't
+            # balance and the worker deadlocks. Dedup at both ends
+            # keeps the invariant 1-give = 1-take for every unique
+            # (producer, consumer) edge.
+            deps_entry_ids=tuple(sorted(set(deps_ids))),
             time_dep_entry_id=time_dep_id,
         ))
 
