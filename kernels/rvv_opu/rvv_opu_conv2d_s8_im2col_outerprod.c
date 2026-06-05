@@ -136,17 +136,18 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     int OW = (IW + 2*PW - KW) / SW + 1;
     int K = IC * KH * KW;
 
-    /* mlmax (= VLEN/SEW = 128/8 = 16 for the
-     * FireSimGemminiAndOPUShuttleConfig bitstream — VLEN fixed at
-     * synthesis time, per the build's varch=vlen:128). Hardcoded so
-     * the compiler can never lower a __riscv_vsetvlmax_* probe to a
-     * rs1=zero vsetvli encoding, which (a) Zephyr-on-RV-V leaves
-     * mstatus.VS=Off if the primary hart lacks V (we patch that in
-     * the walker, commit 1a12db9), (b) the Saturn-OPU implementation
-     * may handle differently from the SET form which we have direct
-     * FPGA evidence works (OPU_PROBE_01..04 from job 221). Same
-     * approach as im2col_rvv_reduce. */
-    const size_t mlmax = 16;
+    /* mlmax = VLMAX for e8/m1 = VLEN/SEW = 128/8 = 16. Must NOT be
+     * a `const = 16` — gcc would constant-propagate it and lower
+     * subsequent intrinsics to vsetivli (immediate-AVL form), which
+     * the Saturn bitstream rejects even though the register-AVL form
+     * works (see commit log on the im2col_rvv_reduce sibling for the
+     * full mtval decode). Read via inline-asm vsetvli SET form so the
+     * compiler must keep mlmax in a register, then a `volatile` write
+     * back to defeat any later constant propagation. */
+    size_t mlmax;
+    asm volatile("vsetvli %0, %1, e8, m1, ta, ma"
+                 : "=r"(mlmax) : "r"((size_t)16));
+    asm volatile("" : "+r"(mlmax));
     int OW_BLK = (int)mlmax;
 
     if (input_offset != 0 || filter_offset != 0 ||
