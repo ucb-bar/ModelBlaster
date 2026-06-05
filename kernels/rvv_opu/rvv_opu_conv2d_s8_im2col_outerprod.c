@@ -136,18 +136,17 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     int OW = (IW + 2*PW - KW) / SW + 1;
     int K = IC * KH * KW;
 
-    /* Query mlmax (= VLEN/8) and gate eligibility. Symmetric quant
-     * only — matching the linear_s8 kernel's eligibility — and the
-     * im2col strip [OW_BLK, K] must fit in the per-hart scratch.
-     *
-     * Use the SET form with rs1 = SIZE_MAX (hardware clamps vl to
-     * VLMAX) rather than the VLMAX-probe form (rs1=zero). The
-     * Saturn-OPU FireSim bitstream traps the rs1=zero form as illegal
-     * even though it accepts rs1=avl in the same vtype config — same
-     * fix as the im2col_rvv_reduce sibling. */
-    size_t mlmax;
-    asm volatile("vsetvli %0, %1, e8, m1, ta, ma"
-                 : "=r"(mlmax) : "r"((size_t)-1));
+    /* mlmax (= VLEN/SEW = 128/8 = 16 for the
+     * FireSimGemminiAndOPUShuttleConfig bitstream — VLEN fixed at
+     * synthesis time, per the build's varch=vlen:128). Hardcoded so
+     * the compiler can never lower a __riscv_vsetvlmax_* probe to a
+     * rs1=zero vsetvli encoding, which (a) Zephyr-on-RV-V leaves
+     * mstatus.VS=Off if the primary hart lacks V (we patch that in
+     * the walker, commit 1a12db9), (b) the Saturn-OPU implementation
+     * may handle differently from the SET form which we have direct
+     * FPGA evidence works (OPU_PROBE_01..04 from job 221). Same
+     * approach as im2col_rvv_reduce. */
+    const size_t mlmax = 16;
     int OW_BLK = (int)mlmax;
 
     if (input_offset != 0 || filter_offset != 0 ||
