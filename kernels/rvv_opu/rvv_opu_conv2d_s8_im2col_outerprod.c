@@ -138,9 +138,16 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
 
     /* Query mlmax (= VLEN/8) and gate eligibility. Symmetric quant
      * only — matching the linear_s8 kernel's eligibility — and the
-     * im2col strip [OW_BLK, K] must fit in the per-hart scratch. */
+     * im2col strip [OW_BLK, K] must fit in the per-hart scratch.
+     *
+     * Use the SET form with rs1 = SIZE_MAX (hardware clamps vl to
+     * VLMAX) rather than the VLMAX-probe form (rs1=zero). The
+     * Saturn-OPU FireSim bitstream traps the rs1=zero form as illegal
+     * even though it accepts rs1=avl in the same vtype config — same
+     * fix as the im2col_rvv_reduce sibling. */
     size_t mlmax;
-    asm volatile("vsetvli %0, zero, e8, m1, ta, ma" : "=r"(mlmax));
+    asm volatile("vsetvli %0, %1, e8, m1, ta, ma"
+                 : "=r"(mlmax) : "r"((size_t)-1));
     int OW_BLK = (int)mlmax;
 
     if (input_offset != 0 || filter_offset != 0 ||

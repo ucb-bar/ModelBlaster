@@ -67,6 +67,15 @@ class XpurtEntry:
     duration_ms: float
     deps_entry_ids: tuple[int, ...]   # in-table entry_ids of intra-job deps
     time_dep_entry_id: int            # cross-job edge, -1 if none
+    # Producer-side fanout (Phase G2d): list of entry_ids that consume
+    # *this* entry's output, via either a data-dep edge (their
+    # deps_entry_ids includes self.entry_id) or a time-dep edge
+    # (their time_dep_entry_id == self.entry_id). Computed by load()
+    # after deps are resolved. The walker uses this to k_sem_give() a
+    # consumer's completion sem once per fanout edge, instead of the
+    # old multi-consumer take/re-give dance — saves one sem op per
+    # edge and eliminates the 64-deep limit-over-provisioning.
+    fanout_entry_ids: tuple[int, ...] = ()
 
 
 # ---------- parsing helpers --------------------------------------------------
@@ -509,6 +518,29 @@ def load(schedule_path: str,
             deps_entry_ids=tuple(deps_ids),
             time_dep_entry_id=time_dep_id,
         ))
+
+    # ---------- Phase G2d: producer-side fanout -----------
+    # For each entry, build the set of consumers that wait on its
+    # completion sem. A consumer C waits on producer P's sem when
+    # either (a) P ∈ C.deps_entry_ids (data dep) or (b)
+    # C.time_dep_entry_id == P (cross-job ordering). The walker uses
+    # this to give the consumer's sem exactly once per fanout edge,
+    # instead of having every consumer take-then-re-give. Net effect:
+    # one fewer sem op per dep edge.
+    fanout: list[list[int]] = [[] for _ in entries]
+    for c in entries:
+        for d in c.deps_entry_ids:
+            if 0 <= d < len(fanout):
+                fanout[d].append(c.entry_id)
+        if 0 <= c.time_dep_entry_id < len(fanout):
+            fanout[c.time_dep_entry_id].append(c.entry_id)
+    for e in entries:
+        # Sort + dedup so codegen is deterministic and a single
+        # consumer connected by both a data-dep and a time-dep edge
+        # only appears once in the fanout list (otherwise the walker
+        # would over-signal it).
+        e.fanout_entry_ids = tuple(sorted(set(fanout[e.entry_id])))
+
     return entries
 
 
@@ -523,7 +555,7 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
 
     upper = schedule_name.replace(".", "_").replace("-", "_").upper()
 
-    # Build per-entry deps arrays + interned strings.
+    # Build per-entry deps + fanout arrays + interned strings.
     deps_arrays: list[str] = []
     for e in entries:
         if e.deps_entry_ids:
@@ -531,11 +563,18 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
             deps_arrays.append(
                 f"static const int sched_{e.entry_id}_deps[] = {{ {arr} }};"
             )
+        if e.fanout_entry_ids:
+            arr = ", ".join(str(d) for d in e.fanout_entry_ids)
+            deps_arrays.append(
+                f"static const int sched_{e.entry_id}_fanout[] = {{ {arr} }};"
+            )
 
     rows: list[str] = []
     for e in entries:
         n_deps = len(e.deps_entry_ids)
         deps_ref = (f"sched_{e.entry_id}_deps" if n_deps else "NULL")
+        n_fanout = len(e.fanout_entry_ids)
+        fanout_ref = (f"sched_{e.entry_id}_fanout" if n_fanout else "NULL")
         rows.append(
             f'    {{ .entry_id = {e.entry_id}, '
             f'.network = "{e.network}", .instance = {e.instance}, '
@@ -547,7 +586,8 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
             f'.start_time_ms = {e.start_time_ms!r}f, '
             f'.duration_ms = {e.duration_ms!r}f, '
             f'.n_deps = {n_deps}, .deps = {deps_ref}, '
-            f'.time_dep_entry_id = {e.time_dep_entry_id} }},'
+            f'.time_dep_entry_id = {e.time_dep_entry_id}, '
+            f'.n_fanout = {n_fanout}, .fanout = {fanout_ref} }},'
         )
 
     h = f"""{HEADER}
@@ -578,6 +618,13 @@ typedef struct {{
     int            n_deps;
     const int     *deps;           /* in-table entry_ids of intra-job data deps */
     int            time_dep_entry_id; /* cross-job ordering edge, -1 if none */
+    /* Producer-side fanout: entry_ids of consumers that wait on this
+     * entry's completion sem (data-dep or time-dep). The walker uses
+     * .n_fanout to k_sem_give() the consumer's sem exactly once per
+     * consumer at producer-side, instead of the old multi-consumer
+     * take/re-give pattern. */
+    int            n_fanout;
+    const int     *fanout;
 }} xpurt_sched_entry_t;
 
 #define {upper}_N_ENTRIES   {len(entries)}
