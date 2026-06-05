@@ -582,6 +582,29 @@ static void *xpurt_worker(void *arg)
      * target_gate_spin + hart_idle. prev_iter_end is updated INSIDE
      * each per-net branch just before `continue` so hart_idle on the
      * next iter is correctly (this_iter_start - last_iter_end). */
+
+    /* Per-hart V-extension enable. Zephyr's HAS_V() macro reads
+     * misa from the PRIMARY hart only — on our 2-tile
+     * FireSimGemminiAndOPUShuttleConfig that's hart 0 (Rocket +
+     * Gemmini, misa.V=0) so Zephyr leaves mstatus.VS = Off
+     * EVERYWHERE, including on hart 1 (Shuttle + Saturn-OPU) which
+     * does have V (misa.V=1, verified by examples/opu_probe). If we
+     * don't flip VS to Initial here, the first vsetvli in any RVV
+     * kernel dispatched to this hart traps with illegal-instruction.
+     *
+     * Behavior: read THIS hart's misa, and if the V bit is set,
+     * raise mstatus.VS to Initial (writes to mstatus.VS are silently
+     * ignored on harts whose misa.V=0, so this is a no-op on
+     * non-V harts and safe to run unconditionally per worker). */
+    {{
+        unsigned long _misa;
+        asm volatile("csrr %0, misa" : "=r"(_misa));
+        if (_misa & (1UL << 21)) {{  /* 'V' - 'A' = 21 */
+            unsigned long _vs_init = (1UL << 9);  /* MSTATUS_VS = Initial */
+            asm volatile("csrs mstatus, %0" : : "r"(_vs_init));
+        }}
+    }}
+
     uint64_t worker_t0 = (uint64_t)k_cycle_get_64();
     uint64_t prev_iter_end = worker_t0;
     /* Take entries that match `my_kind`, in start_time order. */
