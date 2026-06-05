@@ -162,7 +162,7 @@ GEN_KERNELS_ARGS=(
     --io "${IR_DIR}/io.npz"
     --repo-root "${REPO_ROOT}"
     --build-dir "${VERIFY_BUILD_DIR}"
-    --harness-dir "harness"
+    --harness-dir "${REPO_ROOT}/harness"
     --cache-dir "${CACHE_DIR}"
     --algorithms "${ALGORITHMS:-all}"
 )

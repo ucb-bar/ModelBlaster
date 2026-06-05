@@ -1721,7 +1721,14 @@ def main() -> None:
     ap.add_argument("--iterations", type=int, default=2)
     ap.add_argument("--repo-root", default=None)
     ap.add_argument("--build-dir", default=None)
-    ap.add_argument("--harness-dir", default="modelblaster/harness")
+    # Resolve default relative to this script's parent (the repo root)
+    # so the default works regardless of cwd when invoked via Bedrock
+    # or any other path outside examples/<model>/run.sh.
+    _default_harness_dir = str(
+        (__import__("pathlib").Path(__file__).resolve().parent.parent
+         / "harness").resolve()
+    )
+    ap.add_argument("--harness-dir", default=_default_harness_dir)
     ap.add_argument("--io", default=None,
                     help="io.npz with the PyTorch golden output (required for "
                          "spike-harness verify and --optimize)")
