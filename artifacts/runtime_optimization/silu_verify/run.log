@@ -1,0 +1,68 @@
+OK: benchmark env ready
+    west   = /scratch2/agustin/chipyard/.conda-env/bin/west
+    spike  = /scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/spike
+    ZEPHYR_BASE             = /scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr
+    ZEPHYR_SDK_INSTALL_DIR  = /scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1
+    AWS_BEARER_TOKEN_BEDROCK = (set, 132 chars)
+    firesim = /scratch2/agustin/chipyard/sims/firesim/deploy/firesim  (warning: firesim ssh key not in agent;
+              run `ssh-add ~/.ssh/firesim` before infrasetup/kill/runworkload)
+l21.cv1.act          silu_s8              n=6400                                                                        35060    0.0
+l21.m0.cv1.conv      conv2d_s8            N=1;IC=128;IH=5;IW=5;OC=128;OH=5;OW=5;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1       118647328    1.1
+l21.m0.cv1.bn        batchnorm2d_s8       N=1;C=128;H=5;W=5                                                            188736    0.0
+l21.m0.cv1.act       silu_s8              n=3200                                                                        32932    0.0
+l21.m0.cv2.conv      conv2d_s8            N=1;IC=128;IH=5;IW=5;OC=128;OH=5;OW=5;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1       118647328    1.1
+l21.m0.cv2.bn        batchnorm2d_s8       N=1;C=128;H=5;W=5                                                            188735    0.0
+l21.m0.cv2.act       silu_s8              n=3200                                                                        32897    0.0
+cat_12               cat3_c1_s8           N=1;H=5;W=5;C_inputs=128|128|128;C_total=384                                 545198    0.0
+l21.cv2.conv         conv2d_s8            N=1;IC=384;IH=5;IW=5;OC=256;OH=5;OW=5;KH=1;KW=1;SH=1;SW=1;PH=0;PW=0       130531488    1.3
+l21.cv2.bn           batchnorm2d_s8       N=1;C=256;H=5;W=5                                                            376160    0.0
+l21.cv2.act          silu_s8              n=6400                                                                        35050    0.0
+detect.cv2_0_0.conv  conv2d_s8            N=1;IC=64;IH=20;IW=20;OC=64;OH=20;OW=20;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1     503692988    4.9
+detect.cv2_0_0.bn    batchnorm2d_s8       N=1;C=64;H=20;W=20                                                          1464631    0.0
+detect.cv2_0_0.act   silu_s8              n=25600                                                                       48285    0.0
+detect.cv2_0_1.conv  conv2d_s8            N=1;IC=64;IH=20;IW=20;OC=64;OH=20;OW=20;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1     503692177    4.9
+detect.cv2_0_1.bn    batchnorm2d_s8       N=1;C=64;H=20;W=20                                                          1461924    0.0
+detect.cv2_0_1.act   silu_s8              n=25600                                                                       47906    0.0
+detect.cv2_0_2       conv2d_s8            N=1;IC=64;IH=20;IW=20;OC=64;OH=20;OW=20;KH=1;KW=1;SH=1;SW=1;PH=0;PW=0      87857417    0.8
+detect.cv3_0_0.conv  conv2d_s8            N=1;IC=64;IH=20;IW=20;OC=80;OH=20;OW=20;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1     629615791    6.1
+detect.cv3_0_0.bn    batchnorm2d_s8       N=1;C=80;H=20;W=20                                                          1831787    0.0
+detect.cv3_0_0.act   silu_s8              n=32000                                                                       52635    0.0
+detect.cv3_0_1.conv  conv2d_s8            N=1;IC=80;IH=20;IW=20;OC=80;OH=20;OW=20;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1     786700507    7.6
+detect.cv3_0_1.bn    batchnorm2d_s8       N=1;C=80;H=20;W=20                                                          1829153    0.0
+detect.cv3_0_1.act   silu_s8              n=32000                                                                       52440    0.0
+detect.cv3_0_2       conv2d_s8            N=1;IC=80;IH=20;IW=20;OC=80;OH=20;OW=20;KH=1;KW=1;SH=1;SW=1;PH=0;PW=0     136959354    1.3
+cat_13               cat2_c1_s8           N=1;H=20;W=20;C_inputs=64|80;C_total=144                                    3192336    0.0
+detect.cv2_1_0.conv  conv2d_s8            N=1;IC=128;IH=10;IW=10;OC=64;OH=10;OW=10;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1    246670094    2.4
+detect.cv2_1_0.bn    batchnorm2d_s8       N=1;C=64;H=10;W=10                                                           369347    0.0
+detect.cv2_1_0.act   silu_s8              n=6400                                                                        35027    0.0
+detect.cv2_1_1.conv  conv2d_s8            N=1;IC=64;IH=10;IW=10;OC=64;OH=10;OW=10;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1     123464928    1.2
+detect.cv2_1_1.bn    batchnorm2d_s8       N=1;C=64;H=10;W=10                                                           369787    0.0
+detect.cv2_1_1.act   silu_s8              n=6400                                                                        34828    0.0
+detect.cv2_1_2       conv2d_s8            N=1;IC=64;IH=10;IW=10;OC=64;OH=10;OW=10;KH=1;KW=1;SH=1;SW=1;PH=0;PW=0      21970184    0.2
+detect.cv3_1_0.conv  conv2d_s8            N=1;IC=128;IH=10;IW=10;OC=80;OH=10;OW=10;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1    308337375    3.0
+detect.cv3_1_0.bn    batchnorm2d_s8       N=1;C=80;H=10;W=10                                                           460593    0.0
+detect.cv3_1_0.act   silu_s8              n=8000                                                                        36196    0.0
+detect.cv3_1_1.conv  conv2d_s8            N=1;IC=80;IH=10;IW=10;OC=80;OH=10;OW=10;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1     192832177    1.9
+detect.cv3_1_1.bn    batchnorm2d_s8       N=1;C=80;H=10;W=10                                                           458054    0.0
+detect.cv3_1_1.act   silu_s8              n=8000                                                                        35474    0.0
+detect.cv3_1_2       conv2d_s8            N=1;IC=80;IH=10;IW=10;OC=80;OH=10;OW=10;KH=1;KW=1;SH=1;SW=1;PH=0;PW=0      34247299    0.3
+cat_14               cat2_c1_s8           N=1;H=10;W=10;C_inputs=64|80;C_total=144                                     793849    0.0
+detect.cv2_2_0.conv  conv2d_s8            N=1;IC=256;IH=5;IW=5;OC=64;OH=5;OW=5;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1        118578913    1.1
+detect.cv2_2_0.bn    batchnorm2d_s8       N=1;C=64;H=5;W=5                                                              94444    0.0
+detect.cv2_2_0.act   silu_s8              n=1600                                                                        31699    0.0
+detect.cv2_2_1.conv  conv2d_s8            N=1;IC=64;IH=5;IW=5;OC=64;OH=5;OW=5;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1          29695756    0.3
+detect.cv2_2_1.bn    batchnorm2d_s8       N=1;C=64;H=5;W=5                                                              94346    0.0
+detect.cv2_2_1.act   silu_s8              n=1600                                                                        31548    0.0
+detect.cv2_2_2       conv2d_s8            N=1;IC=64;IH=5;IW=5;OC=64;OH=5;OW=5;KH=1;KW=1;SH=1;SW=1;PH=0;PW=0           5496587    0.1
+detect.cv3_2_0.conv  conv2d_s8            N=1;IC=256;IH=5;IW=5;OC=80;OH=5;OW=5;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1        148223197    1.4
+detect.cv3_2_0.bn    batchnorm2d_s8       N=1;C=80;H=5;W=5                                                             117380    0.0
+detect.cv3_2_0.act   silu_s8              n=2000                                                                        31981    0.0
+detect.cv3_2_1.conv  conv2d_s8            N=1;IC=80;IH=5;IW=5;OC=80;OH=5;OW=5;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1          46378500    0.4
+detect.cv3_2_1.bn    batchnorm2d_s8       N=1;C=80;H=5;W=5                                                             116843    0.0
+detect.cv3_2_1.act   silu_s8              n=2000                                                                        31245    0.0
+detect.cv3_2_2       conv2d_s8            N=1;IC=80;IH=5;IW=5;OC=80;OH=5;OW=5;KH=1;KW=1;SH=1;SW=1;PH=0;PW=0           8566488    0.1
+cat_15               cat2_c1_s8           N=1;H=5;W=5;C_inputs=64|80;C_total=144                                       199200    0.0
+-----------------------------------------------------------------------------------------------------------------------------------
+TOTAL                                                                                                            10340570894
+wall_clock_cycles=103431650 (mtime)
+MODELBLASTER_STAGE_END:run:29.132
