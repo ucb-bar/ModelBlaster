@@ -1953,6 +1953,23 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             reference_impl="",  # the curated file supplies the impl
         ),
         AlgorithmCandidate(
+            name="im2col_vlA_scalarMAC",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Worst-case-safe Saturn-OPU conv2d_s8: scalar im2col + "
+                "vle8.v-streamed input/weight lanes + SCALAR MAC inner "
+                "loop. Uses ONLY e8/m1 vsetvli SET form with rs1 = small "
+                "positive (no probes, no e32/m4, no e16/m2, no widening "
+                "ops, no Saturn OPU custom). Ships an estimated 3-5x "
+                "cycle reduction vs. pure reference scalar — much less "
+                "than im2col_rvv_reduce's 20x, but with zero FPGA risk: "
+                "every opcode it emits is in the subset directly proven "
+                "by v10 v1's silu kernel running on the actual bitstream."
+            ),
+            reference_impl="",
+        ),
+        AlgorithmCandidate(
             name="im2col_rvv_reduce",
             target_affinity=("rvv_opu",),
             accuracy_class=AccuracyClass.BIT_EXACT,
