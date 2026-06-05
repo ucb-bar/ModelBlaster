@@ -216,7 +216,16 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                             vint16m2_t prod = __riscv_vwmul_vv_i16m2(va, vb, vl);
                             vacc = __riscv_vwadd_wv_i32m4(vacc, prod, vl);
                         }
-                        vint32m1_t vinit = __riscv_vmv_s_x_i32m1(0, 1);
+                        /* Defensive: hide the AVL=1 from gcc so it can't
+                         * lower vmv_s_x to vsetivli e32/m1 uimm=1 (we don't
+                         * yet have FPGA evidence that ANY vsetivli works
+                         * — probe job 221 tested vsetvli SET register
+                         * form only). Use a runtime register holding 1. */
+                        size_t _one;
+                        asm volatile("vsetvli %0, %1, e32, m1, ta, ma"
+                                     : "=r"(_one) : "r"((size_t)1));
+                        asm volatile("" : "+r"(_one));
+                        vint32m1_t vinit = __riscv_vmv_s_x_i32m1(0, _one);
                         vint32m1_t vsum =
                             __riscv_vredsum_vs_i32m4_i32m1(vacc, vinit, vlmax_i32);
                         int32_t acc = __riscv_vmv_x_s_i32m1_i32(vsum);
