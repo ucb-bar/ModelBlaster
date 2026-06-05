@@ -21,6 +21,19 @@
 | slack_dronet | periodic_anchor | 92.59 | **0** | 213 | 3.03 |
 | slack_dronet | critical_path_first | 54.43 | 58 | 245 | 1.76 |
 | slack_dronet | cpsat_unconstrained | 117.63 | 32 | 224 | 62.05 |
+| canon | **hybrid_periodic_mosek_yolo** | **70.00** | **0** | 240 | 228.92 |
+
+## Headline answer
+
+The `hybrid_periodic_mosek_yolo` policy is Pareto-best on the canonical
+workload: **70 ms makespan with 0 deadline misses across all 240
+dispatches**. Phase 1 reserves periodic instances via the `decomposed`
+solver (3.0 s), phase 2 schedules yolov8 against the remainder via
+MOSEK (225.9 s), phase 3 shifts yolov8 to avoid periodic-busy intervals
+(no shift needed on this cell). Source: `artifacts/policies/
+headline_hybrid_result.json`; Gantt:
+`gantts/canon__hybrid_periodic_mosek_yolo.png`. End-to-end FireSim
+validation pending — see `task #245`.
 
 ## Findings (answer to the user's research questions)
 
