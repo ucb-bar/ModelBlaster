@@ -1953,6 +1953,49 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             reference_impl="",  # the curated file supplies the impl
         ),
         AlgorithmCandidate(
+            name="im2col_outerprod",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Saturn-OPU i8 conv2d via scalar im2col + tiled outer-"
+                "product GEMM. Reuses the proven VOPACC / OPMVINBCAST / "
+                "VMV_VR opcode sequence from rvv_opu_linear_s8_outerprod "
+                "(validated bit-exact on the FireSimGemminiAndOPUShuttle "
+                "bitstream for mlp_control across v8/v9/v10). Avoids the "
+                "vluxei8-based gather of indir_gemm, which traps as "
+                "illegal instruction on this bitstream.\n\n"
+                "ALGORITHM:\n"
+                "  outer (n, oh, ow_tile in OW step mlmax):\n"
+                "    scalar im2col into per-hart strip [mlmax, K]\n"
+                "    for oc_tile in OC step mlmax:\n"
+                "      OPMVINBCAST m1 <- bias[oc_tile..+mlmax]\n"
+                "      for k in [0, K):\n"
+                "        vlse8.v v16 <- strip column k (M_tile lanes)\n"
+                "        vlse8.v v18 <- weight column k for oc_tile (N_tile)\n"
+                "        VOPACC m1, v18, v16\n"
+                "      drain m1 rows, Q0.31 requantize, store i8 to output\n\n"
+                "Symmetric quant only (input_offset = filter_offset = 0); "
+                "falls back to the scalar reference for asymmetric quant or "
+                "K exceeding per-hart scratch."
+            ),
+            reference_impl="",  # the curated file supplies the impl
+        ),
+        AlgorithmCandidate(
+            name="im2col_rvv_reduce",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Saturn-OPU i8 conv2d via scalar im2col + per-output RVV "
+                "vector reduce (vwmul + vwadd-into-i32 + vredsum). Uses "
+                "ONLY the RVV opcodes already validated bit-exact on "
+                "FireSimGemminiAndOPUShuttleConfig by the mlp_control "
+                "cached linear kernel — NO OPU custom OP-V instructions "
+                "and NO vluxei. Safer fallback if the outer-product "
+                "variant turns out to trap on this bitstream."
+            ),
+            reference_impl="",
+        ),
+        AlgorithmCandidate(
             name="direct",
             # Same nested-loop math as the spec's reference_impl (verify
             # oracle); reads weights from whichever layout the codegen
