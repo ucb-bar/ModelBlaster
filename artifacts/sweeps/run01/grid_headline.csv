@@ -11,3 +11,4 @@ slack_dronet__yolo_anchor,yolo_anchor,10,33,4,2,1,ok,56.54074600000001,28,0,213,
 slack_dronet__periodic_anchor,periodic_anchor,10,33,4,2,1,ok,92.59226799999999,0,0,213,3.028,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
 slack_dronet__critical_path_first,critical_path_first,10,33,4,2,1,ok,54.429872,58,0,245,1.757,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
 slack_dronet__cpsat_unconstrained,cpsat_unconstrained,10,33,4,2,1,ok,117.62504900000003,32,0,224,62.054,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+canon__hybrid_periodic_mosek_yolo,hybrid_periodic_mosek_yolo,10,20,4,2,1,ok,70.0,0,0,240,228.918,False,canonical config — phase1 decomposed periodic + phase2 MOSEK yolov8 + phase3 shift
