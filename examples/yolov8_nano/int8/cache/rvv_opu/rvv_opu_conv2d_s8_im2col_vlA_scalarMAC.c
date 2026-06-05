@@ -1,45 +1,32 @@
 /* source: curated */
-/* algorithm: im2col_rvv_reduce */
+/* algorithm: im2col_vlA_scalarMAC */
 /* accuracy_class: bit_exact */
-/* origin: Saturn-OPU i8 conv2d via scalar im2col + per-output vector
- *   reduce. Sister kernel to rvv_opu_conv2d_s8_im2col_outerprod.c.
- *   Uses ONLY the RVV opcodes already validated bit-exact on the
- *   FireSimGemminiAndOPUShuttleConfig FPGA by the mlp_control cached
- *   linear kernel (vsetvl_e8m1, vle8_v_i8m1, vwmul_vv_i16m2,
- *   vwadd_wv_i32m4, vredsum_vs_i32m4_i32m1, vmv_v_x_i32m4,
- *   vmv_s_x_i32m1, vmv_x_s_i32m1_i32) — NO OPU custom OP-V ops
- *   (VOPACC / OPMVINBCAST / VMV_VR / VMV_RV) and NO vluxei. Serves
- *   as the FPGA-safe fallback if the outer-product OPU variant
- *   turns out to be unsupported by this specific bitstream (same
- *   risk class as the vluxei8 trap that took down a prior silu
- *   kernel attempt).
+/* origin: Worst-case-safe conv2d_s8 for the Saturn-OPU FireSim
+ *   bitstream. Uses ONLY the RVV opcodes with direct prior evidence
+ *   of working on the FPGA: vsetvli SET form for e8/m1 with rs1 = a
+ *   small positive constant, and vle8.v + vse8.v at that vtype.
+ *   No e16/m2, no e32/m4, no widening multiplies, no reductions, no
+ *   OPU custom ops, no probes. Multiply-accumulate is scalar — we
+ *   vectorize the LOAD path only and let the inner MAC be a plain C
+ *   loop over the K vector lanes we just streamed.
  *
- *   Algorithm: build the im2col strip [M_tile, K] once per (n, oh,
- *   ow_tile) tile; then for each (m, oc) reduce over K via
- *   vwmul + vwadd-into-i32 + vredsum tail. Same Q0.31 requantize
- *   as the spec's reference impl.
+ *   Used as the fall-back if im2col_rvv_reduce trips on e32/m4 or
+ *   e16/m2 vsetvli (which it did in v11 attempts 2 and 3 on
+ *   FireSimGemminiAndOPUShuttleConfig). The savings vs. the pure
+ *   reference scalar conv come from amortizing per-element load
+ *   latency across 16-lane vle8 streams; estimated 3-5x cycle drop,
+ *   substantially less than im2col_rvv_reduce's 20x but with zero
+ *   FPGA risk.
  *
- *   Bit-exactness rationale: vwmul_vv_i16m2(va, vb) computes
- *   (int16)va * (int16)vb per lane, identical to the reference's
- *   (int32)input * (int32)weight when inputs fit in int8 (they do
- *   by construction). The i32 widen-accumulate via vwadd_wv keeps
- *   the running sum in int32 with no precision loss. vredsum sums
- *   the lanes in any associative order, but integer addition IS
- *   associative for integers within int32 range — and the lane
- *   contributions per (kh, kw, ic) tuple are at most |i8| * |i8|
- *   < 2^15, so up to 2^17 such products fit before overflow. The
- *   largest K in yolov8 (= IC*KH*KW = 128*3*3 = 1152) is well
- *   inside that envelope. Padded pixels use strip = 0 so their
- *   product contributes 0, matching the reference's symmetric-quant
- *   padded path. */
+ *   Bit-exact rationale: each MAC is `acc += (int32_t)strip[m,k] *
+ *   (int32_t)weight[oc,k]` — same form as the spec's reference impl.
+ *   vle8 reads bytes verbatim; vse8 writes them back unchanged.
+ *   Q0.31 requantize tail unchanged. Symmetric quant only (matching
+ *   the other OPU conv variants). */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include <riscv_vector.h>
 
-/* Per-hart strip scratch. Same sizing rationale as the outerprod
- * sibling: covers IC*KH*KW up to 1152 * M_tile = 16 with 24 KB
- * headroom; oversize shapes fall back to scalar reference. */
 #define MODELBLASTER_OPU_CONV_SCRATCH_BYTES (24 * 1024)
 static int8_t g_conv_scratch[2][MODELBLASTER_OPU_CONV_SCRATCH_BYTES]
     __attribute__((aligned(16)));
@@ -112,9 +99,11 @@ static void conv2d_s8_scalar_fallback(
     }
 }
 
-/* Strip tile height: 8 rows of output per im2col build. Trades a
- * little extra scalar im2col for tighter scratch usage. With K up to
- * 1152, M_TILE=8 needs 8*1152 = 9216 bytes, well under scratch. */
+/* Strip tile + per-K scratch arrays. We only need to hold one chunk
+ * of `vl` lanes at a time for the MAC loop. 64-byte buffers cover the
+ * largest possible vlmax_e8 on VLEN=512 chipyard builds; for the
+ * FireSim Saturn at vlen=128 only 16 are used. */
+#define MODELBLASTER_OPU_CONV_VLANE_MAX 64
 #define MODELBLASTER_OPU_CONV_M_TILE 8
 
 void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
@@ -140,15 +129,12 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     }
 
     int8_t *strip = g_conv_scratch[read_mhartid() & 1];
-    /* VLMAX for e32/m4 — hardcoded to VLEN/SEW*LMUL = 128/32*4 = 16
-     * lanes for the FireSimGemminiAndOPUShuttleConfig bitstream
-     * (vlen=128, fixed at synthesis). Avoids ALL vsetvlmax_*
-     * intrinsics: gcc lowers them to vsetvli rs1=zero (VLMAX probe)
-     * which the Saturn-OPU bitstream traps. Passing a small in-range
-     * constant (~SIZE_MAX) also gets rejected — the Saturn vsetvli
-     * implementation evidently bounds rs1 below something we don't
-     * see in the spec. Hardcoding the result skips the issue. */
-    const size_t vlmax_i32 = 16;
+    /* Per-call scratch for the vle8-streamed lanes. Stack-resident so
+     * concurrent dispatches on the same hart can each have their own. */
+    int8_t a_buf[MODELBLASTER_OPU_CONV_VLANE_MAX]
+        __attribute__((aligned(16)));
+    int8_t b_buf[MODELBLASTER_OPU_CONV_VLANE_MAX]
+        __attribute__((aligned(16)));
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
@@ -158,9 +144,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 if (M_tile > MODELBLASTER_OPU_CONV_M_TILE)
                     M_tile = MODELBLASTER_OPU_CONV_M_TILE;
 
-                /* Scalar im2col strip — identical math to the outerprod
-                 * sibling. strip[m, k] is the input pixel that maps to
-                 * output (oh, ow_tile+m). Default zero handles padding. */
+                /* Scalar im2col strip [M_tile, K]. Padding zeroed. */
                 memset(strip, 0, (size_t)K * (size_t)M_tile);
                 for (int m = 0; m < M_tile; m++) {
                     int ow = ow_tile + m;
@@ -179,33 +163,34 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                     }
                 }
 
-                /* Per-output vector reduce: acc = sum_k strip[m,k] * w[oc,k] */
                 for (int m = 0; m < M_tile; m++) {
                     int ow = ow_tile + m;
                     const int8_t *strip_row = &strip[(size_t)m * K];
                     for (int oc = 0; oc < OC; oc++) {
                         const int8_t *w_row = &weight[(size_t)oc * K];
-                        vint32m4_t vacc = __riscv_vmv_v_x_i32m4(0, vlmax_i32);
-                        size_t vl;
-                        for (int k = 0; k < K; k += (int)vl) {
-                            /* Inline asm vsetvli with explicit rs1=K-k
-                             * — equivalent to __riscv_vsetvl_e8m1 but
-                             * opaque to gcc, so it can't lift a probe
-                             * (vsetvli rs1=zero, e8/m1) which the Saturn
-                             * bitstream traps as illegal. */
+                        int32_t acc = bias ? bias[oc] : 0;
+                        int k = 0;
+                        while (k < K) {
+                            /* Stream up to mlmax_e8 lanes into scratch
+                             * via vle8.v. Inline asm so gcc doesn't
+                             * hoist a VLMAX probe. */
+                            size_t vl;
                             asm volatile(
                                 "vsetvli %0, %1, e8, m1, ta, ma"
                                 : "=r"(vl) : "r"((size_t)(K - k)));
-                            vint8m1_t va = __riscv_vle8_v_i8m1(strip_row + k, vl);
-                            vint8m1_t vb = __riscv_vle8_v_i8m1(w_row + k, vl);
-                            vint16m2_t prod = __riscv_vwmul_vv_i16m2(va, vb, vl);
-                            vacc = __riscv_vwadd_wv_i32m4(vacc, prod, vl);
+                            asm volatile("vle8.v v16, (%0)"
+                                         : : "r"(strip_row + k));
+                            asm volatile("vse8.v v16, (%0)"
+                                         : : "r"(a_buf));
+                            asm volatile("vle8.v v16, (%0)"
+                                         : : "r"(w_row + k));
+                            asm volatile("vse8.v v16, (%0)"
+                                         : : "r"(b_buf));
+                            for (size_t i = 0; i < vl; i++) {
+                                acc += (int32_t)a_buf[i] * (int32_t)b_buf[i];
+                            }
+                            k += (int)vl;
                         }
-                        vint32m1_t vinit = __riscv_vmv_s_x_i32m1(0, 1);
-                        vint32m1_t vsum =
-                            __riscv_vredsum_vs_i32m4_i32m1(vacc, vinit, vlmax_i32);
-                        int32_t acc = __riscv_vmv_x_s_i32m1_i32(vsum);
-                        if (bias) acc += bias[oc];
 
                         int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
                         prod = (prod + (1LL << 30)) >> 31;

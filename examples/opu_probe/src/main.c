@@ -26,6 +26,11 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Zephyr's global build pins -march=rv64imafdc_zicsr_zifencei (no
+ * vector). Enable V locally via assembler arch option so vsetvli /
+ * vle8 / vse8 / etc. encode. */
+asm(".option arch, +v");
+
 /* Saturn OPU custom opcodes via inline asm — same encodings as
  * cores/saturn_opu/include/saturn_opu.h. We don't include the header
  * to keep this binary self-contained. */
