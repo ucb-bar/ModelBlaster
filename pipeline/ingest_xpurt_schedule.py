@@ -146,6 +146,70 @@ def load(schedule_path: str,
     if not isinstance(raw, dict) or not raw:
         raise ValueError(f"{schedule_path}: 'dispatches' missing or empty")
 
+    # PDB-content-hash guard. The fixture (when produced by a recent
+    # solver) carries `metadata.pdb_hash` and `metadata.pdb_files` —
+    # the SHA256 over the profile CSVs the solver actually read. We
+    # recompute the hash for the SAME paths now, before any dispatch
+    # parsing, and warn (or refuse) on mismatch.
+    #
+    # Knob: MB_INGEST_STRICT_PDB_CHECK=1 turns the warning into a
+    # hard error. Off by default to avoid breaking fixtures emitted by
+    # solver versions that pre-date this metadata field — but on a
+    # hash MISmatch we always emit a loud, named warning so the trap
+    # is at least visible in the run log.
+    meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+    fixture_hash = meta.get("pdb_hash")
+    fixture_files = meta.get("pdb_files") or []
+    if fixture_hash and fixture_files:
+        try:
+            import hashlib as _hashlib
+            _h = _hashlib.sha256()
+            _used: list[str] = []
+            for _p in sorted(set(fixture_files)):
+                if not _p:
+                    continue
+                try:
+                    with open(_p, "rb") as _f:
+                        _data = _f.read()
+                except OSError:
+                    continue
+                _h.update(_p.encode("utf-8"))
+                _h.update(b"\0")
+                _h.update(len(_data).to_bytes(8, "little"))
+                _h.update(_data)
+                _used.append(_p)
+            current_hash = _h.hexdigest()
+            if current_hash != fixture_hash:
+                import os as _os
+                _msg = (
+                    f"!! STALE-FIXTURE WARNING [{schedule_path}]\n"
+                    f"   fixture pdb_hash = sha256:{fixture_hash[:16]}... "
+                    f"(over {len(fixture_files)} CSV(s))\n"
+                    f"   current pdb_hash = sha256:{current_hash[:16]}... "
+                    f"(over {len(_used)} CSV(s) hashed)\n"
+                    f"   The profile CSVs the solver used have changed on "
+                    f"disk since this fixture was emitted. Predicted "
+                    f"durations may not reflect what the runtime will "
+                    f"actually execute.\n"
+                    f"   Re-solve the workload (scripts/run_xpurt_schedule.py)\n"
+                    f"   or set MB_INGEST_STRICT_PDB_CHECK=0 to acknowledge."
+                )
+                print(_msg)
+                if _os.environ.get("MB_INGEST_STRICT_PDB_CHECK", "0") in (
+                    "1", "true", "True",
+                ):
+                    raise RuntimeError(
+                        f"{schedule_path}: PDB content hash mismatch "
+                        f"(MB_INGEST_STRICT_PDB_CHECK=1)."
+                    )
+        except RuntimeError:
+            raise
+        except Exception as _e:
+            # Never let the hash check itself break a load; if hashing
+            # fails (e.g., permissions), print a one-line note and
+            # continue with the unverified fixture.
+            print(f"  (info) pdb_hash recompute skipped: {_e}")
+
     # Build dispatch_id index per network IR + remap from IR-space
     # dispatch_id to codegen-space dispatch table index.
     #
