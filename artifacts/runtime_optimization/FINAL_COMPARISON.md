@@ -61,6 +61,53 @@ Remaining slow rvv_opu kernels:
 
 These are tracked under #255 as future work.
 
+## v11 attempt — blocked by bitstream limitation
+
+A v11 sequence tried to vectorize the rvv_opu-routed conv2d_s8
+kernel using RVV. Every variant crashed at the first vsetvli with
+illegal-instruction. Root cause was confirmed by a dedicated ISA
+probe binary (`examples/opu_probe/`, FireSim job 220):
+
+```
+CSR_INIT misa=0x800000000094112d (V_bit=0)
+         mstatus=0x8000000a00018088 (VS=0)
+CSR_AFTER mstatus=0x8000000a00018088 (VS=0)   # manual csrs mstatus, 0x200 IGNORED
+OPU_PROBE_01: vsetvli e8/m1 SET rs1=16 START
+  mcause: 2, Illegal instruction
+  mtval: c0975d7                              # vsetvli s11, s2, e8, m1, ta, ma
+```
+
+`misa.V = 0` on this FireSim `FireSimGemminiAndOPUShuttleConfig`
+bitstream. mstatus.VS is hardwired to Off when misa.V is 0, so any
+attempt to enable VS is silently dropped, and every standard RVV
+opcode (vsetvli, vle8, vse8, vwmul, vredsum, …) traps. The Saturn
+OPU custom OP-V instructions (VOPACC / OPMVINBCAST / VMV_VR /
+VMV_RV) use the same OP-V opcode space and almost certainly also
+require RVV's vsetvli setup to be usable — so they're effectively
+unreachable too on this specific bitstream.
+
+**Conclusion: the rvv_opu-side scalar-reference conv2d_s8 path that
+v10 already ships IS the production result for this FPGA image.**
+Until a bitstream is synthesized with real V extension support, all
+rvv_opu kernels must be scalar (no inline RVV asm, no `__riscv_v*`
+intrinsics, no Saturn OPU custom). The four kernels added in the
+v11 attempt (`im2col_rvv_reduce`, `im2col_outerprod`,
+`im2col_vlA_scalarMAC`, the OPU probe) are kept in the codebase
+under `kernels/rvv_opu/` for the future bitstream but are removed
+from the yolov8 per-model cache so the picker falls through to the
+scalar reference.
+
+Path forward to actually beat v10's 571 ms on this same bitstream:
+1. **Build a new bitstream** with `FireSimSaturnGENV256D128ShuttleConfig`
+   (already in `config_hwdb.yaml`) or a hetero variant whose Saturn
+   stage advertises misa.V=1. Then v11's `im2col_rvv_reduce` and
+   eventually `im2col_outerprod` become unblocked and the predicted
+   20x cycle reduction on conv2d_s8 lands.
+2. **Runtime-side wins on the existing bitstream** (orthogonal to
+   the kernel ISA question): producer-side fanout signaling (G2d),
+   async dispatch overlap, walker hot-loop scrubbing — each saves
+   sub-50 ms but they're additive.
+
 ## Correctness gates
 
 - mlp_control: bit-exact through v8/v9/v10. **PASS** ✓
