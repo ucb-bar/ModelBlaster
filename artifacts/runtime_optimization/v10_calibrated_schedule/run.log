@@ -1,0 +1,72 @@
+============================================================
+Loading network hierarchy from JSON...
+============================================================
+
+Loading networks from: /scratch2/agustin/XPU-RT/data/toplevel/networks_1yolo_4mlp_2dronet_firesim.json
+
+Found 3 networks:
+  - mlp_control (id: 0, identifier: mlp_control)
+  - dronet (id: 1, identifier: dronet)
+  - yolov8_nano (id: 2, identifier: yolov8_nano)
+
+Found 0 network-level dependencies:
+
+Resolved runtime configuration:
+  Machine core counts: {'CPU_P': 1, 'CPU_E': 1}
+  Profile HW mapping: CPU_P->gemmini_q31, CPU_E->V256D128_rvv
+  Profile target/topology: target=firesim_rocket_saturn, topo_tag=topo_0
+  p_core_speedup: 1.0
+  random_seed: 42
+  solver_verbosity: 0
+  time_limit: 60.0
+  use_profiled: True
+  prune_periodic: False
+  restrict_makespan_to_nonperiodic: False
+  machine_combination_mode: singletons
+  enforce_same_processor_combinations: True
+
+Using profiled runtimes where available...
+
+--- decomposed iteration 1 ---
+  Total operations: 300
+  Job names: ['mlp_control0', 'dronet0', 'yolov8_nano', 'mlp_control1', 'mlp_control2', 'mlp_control3', 'dronet1']
+decomposed_schedule: 7 jobs total (6 periodic, 1 non-periodic)
+  Makespan: 402.69 ms
+  Periodic 'mlp_control': period=10ms current=4 needed=41
+  Periodic 'dronet': period=20ms current=2 needed=21
+  Bumping num_instances: mlp_control: 4->41, dronet: 2->21
+
+Final greedy makespan: 402.69 ms (after 1 iteration)
+
+Scheduling completed!
+Makespan (non-periodic): 402.69 ms
+
+Combination assignments:
+  1xCPU_P: 237 operations
+  1xCPU_E: 63 operations
+
+Per-network combination assignments:
+  Mlp_control0: 1xCPU_P=7
+  Dronet0: 1xCPU_P=19, 1xCPU_E=11
+  Yolov8_nano: 1xCPU_P=181, 1xCPU_E=31
+  Mlp_control1: 1xCPU_P=2, 1xCPU_E=5
+  Mlp_control2: 1xCPU_P=7
+  Mlp_control3: 1xCPU_P=2, 1xCPU_E=5
+  Dronet1: 1xCPU_P=19, 1xCPU_E=11
+Job 'mlp_control0' (job_id=0, color_index=0) -> color RGB=[0.59607843 0.8345098  0.57882353]
+DEBUG TRANSFER: alpha_shape=(300, 2), num_actual_machines=2, len(machines)=2, alpha_cols=2, is_using_combos=False, prev_machine=0, machine=0, transfer_times_shape=(2, 2), machine_combinations=True
+Job 'mlp_control1' (job_id=3, color_index=3) -> color RGB=[0.32       0.70249904 0.39661669]
+Job 'mlp_control2' (job_id=4, color_index=4) -> color RGB=[0.11680123 0.52756632 0.25597847]
+Job 'mlp_control3' (job_id=5, color_index=5) -> color RGB=[0.         0.32719723 0.13098039]
+Job 'dronet0' (job_id=1, color_index=1) -> color RGB=[0.57960784 0.77019608 0.87372549]
+Saving plot to plots/networks_1yolo_4mlp_2dronet_firesim_decomposed_profiled.png...
+
+Plot saved to plots/networks_1yolo_4mlp_2dronet_firesim_decomposed_profiled.png
+
+Outputting scheduled JSON...
+automerge: collapsed 149 adjacent same-network pair(s) → 151 dispatches, makespan 402.7µs → 402.7µs
+
+Scheduled JSON saved to: schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_decomposed_profiled.json
+Metrics written to: schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_decomposed_profiled_metrics.json
+  makespan_us=402.69  deadline_miss=0  cross_dev=115  solver_s=0.084
+Scheduler report written to: schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_decomposed_profiled_report.json
