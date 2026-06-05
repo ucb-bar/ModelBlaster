@@ -23,7 +23,24 @@
 | slack_dronet | cpsat_unconstrained | 117.63 | 32 | 224 | 62.05 |
 | canon | **hybrid_periodic_mosek_yolo** | **70.00** | **0** | 240 | 228.92 |
 
-## Headline answer
+## Correction (2026-06-05) — the 70 ms number is stale
+
+The fixture below was generated against an older snapshot of the
+FireSim PDB (the `.prebitexact_backup` set, predating Phase E's
+bit-exact kernel re-ingestion). End-to-end FireSim validation
+(`artifacts/firesim_runs/hybrid_v8/` and
+`artifacts/runtime_optimization/v9_baseline_instrumented/`) measured
+786 ms worst-hart wall on this same fixture. Re-running the policy's
+Phase-1 decomposed solver against the CURRENT PDB predicts 782 ms —
+agreement with measurement within 0.5%. The "9× gap" between
+predicted 70 ms and measured 786 ms was a stale-PDB artifact, not a
+solver-vs-runtime model gap. See
+`artifacts/runtime_optimization/v10_calibrated_schedule/` for the
+re-cost and re-solve evidence. The 70 ms row below is preserved for
+provenance; the honest predicted-vs-measured headline is in the v10
+artifacts.
+
+## Headline answer (provenance — see correction above)
 
 The `hybrid_periodic_mosek_yolo` policy is Pareto-best on the canonical
 workload: **70 ms makespan with 0 deadline misses across all 240
