@@ -6477,6 +6477,9 @@ void kernel_batchnorm2d_silu_s8(
         AlgorithmCandidate(
             name="bn_silu_per_channel_register_fused",
             target_affinity=("rvv_opu",),
+            # BN affine in F32 + LUT-based SiLU; precise vs PyTorch
+            # golden across all yolov8 single-net runs (max_abs_err=0).
+            accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "RVV vector implementation: load BN's per-channel "
                 "(scale[c], bias[c]) as vector-broadcast operands; apply "

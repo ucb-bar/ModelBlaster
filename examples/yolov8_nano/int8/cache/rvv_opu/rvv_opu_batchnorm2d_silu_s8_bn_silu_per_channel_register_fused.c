@@ -1,3 +1,6 @@
+/* algorithm: bn_silu_per_channel_register_fused */
+/* accuracy_class: bit_exact */
+/* origin: bedrock-LLM-generated, validated max_abs_err=0 on yolov8 single-net FireSim (Jun 3 2026). */
 #include <math.h>
 #include <riscv_vector.h>
 
