@@ -140,15 +140,15 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     }
 
     int8_t *strip = g_conv_scratch[read_mhartid() & 1];
-    /* We want VLMAX for e32/m4 (the accumulator width) without using
-     * __riscv_vsetvlmax_*: gcc lowers that intrinsic to a vsetvli with
-     * rs1=zero (VLMAX probe), and the Saturn-OPU FireSim bitstream
-     * traps the rs1=zero form as illegal even though it accepts
-     * vsetvli rs1=avl in the same shape. Workaround: do a SET with a
-     * very large AVL — hardware clamps vl to VLMAX and returns it. */
-    size_t vlmax_i32;
-    asm volatile("vsetvli %0, %1, e32, m4, ta, ma"
-                 : "=r"(vlmax_i32) : "r"((size_t)-1));
+    /* VLMAX for e32/m4 — hardcoded to VLEN/SEW*LMUL = 128/32*4 = 16
+     * lanes for the FireSimGemminiAndOPUShuttleConfig bitstream
+     * (vlen=128, fixed at synthesis). Avoids ALL vsetvlmax_*
+     * intrinsics: gcc lowers them to vsetvli rs1=zero (VLMAX probe)
+     * which the Saturn-OPU bitstream traps. Passing a small in-range
+     * constant (~SIZE_MAX) also gets rejected — the Saturn vsetvli
+     * implementation evidently bounds rs1 below something we don't
+     * see in the spec. Hardcoding the result skips the issue. */
+    const size_t vlmax_i32 = 16;
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
