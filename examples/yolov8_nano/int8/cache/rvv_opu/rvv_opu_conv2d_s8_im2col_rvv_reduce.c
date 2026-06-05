@@ -140,7 +140,15 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     }
 
     int8_t *strip = g_conv_scratch[read_mhartid() & 1];
-    const size_t vlmax_i32 = __riscv_vsetvlmax_e32m4();
+    /* We want VLMAX for e32/m4 (the accumulator width) without using
+     * __riscv_vsetvlmax_*: gcc lowers that intrinsic to a vsetvli with
+     * rs1=zero (VLMAX probe), and the Saturn-OPU FireSim bitstream
+     * traps the rs1=zero form as illegal even though it accepts
+     * vsetvli rs1=avl in the same shape. Workaround: do a SET with a
+     * very large AVL — hardware clamps vl to VLMAX and returns it. */
+    size_t vlmax_i32;
+    asm volatile("vsetvli %0, %1, e32, m4, ta, ma"
+                 : "=r"(vlmax_i32) : "r"((size_t)-1));
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
@@ -180,7 +188,14 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                         vint32m4_t vacc = __riscv_vmv_v_x_i32m4(0, vlmax_i32);
                         size_t vl;
                         for (int k = 0; k < K; k += (int)vl) {
-                            vl = __riscv_vsetvl_e8m1((size_t)(K - k));
+                            /* Inline asm vsetvli with explicit rs1=K-k
+                             * — equivalent to __riscv_vsetvl_e8m1 but
+                             * opaque to gcc, so it can't lift a probe
+                             * (vsetvli rs1=zero, e8/m1) which the Saturn
+                             * bitstream traps as illegal. */
+                            asm volatile(
+                                "vsetvli %0, %1, e8, m1, ta, ma"
+                                : "=r"(vl) : "r"((size_t)(K - k)));
                             vint8m1_t va = __riscv_vle8_v_i8m1(strip_row + k, vl);
                             vint8m1_t vb = __riscv_vle8_v_i8m1(w_row + k, vl);
                             vint16m2_t prod = __riscv_vwmul_vv_i16m2(va, vb, vl);
