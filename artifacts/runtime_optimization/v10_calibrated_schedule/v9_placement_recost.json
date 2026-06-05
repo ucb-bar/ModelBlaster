@@ -1,0 +1,15 @@
+{
+  "n_dispatches": 240,
+  "n_matched": 238,
+  "n_missing": 2,
+  "per_hw_old_ms": {
+    "CPU_P": 36.692446,
+    "CPU_E": 25.226891999999996
+  },
+  "per_hw_new_ms": {
+    "CPU_P": 107.33421399999999,
+    "CPU_E": 211.8198229999999
+  },
+  "old_max_lane_ms": 36.692446,
+  "new_max_lane_ms": 211.8198229999999
+}
