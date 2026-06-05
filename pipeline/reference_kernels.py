@@ -1953,6 +1953,22 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             reference_impl="",  # the curated file supplies the impl
         ),
         AlgorithmCandidate(
+            name="im2col_rvv_reduce",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Saturn-OPU i8 conv2d via scalar im2col + per-output RVV "
+                "vector reduce (vwmul + vwadd-into-i32 + vredsum). Uses "
+                "ONLY the RVV opcodes already validated bit-exact on "
+                "FireSimGemminiAndOPUShuttleConfig by the mlp_control "
+                "cached linear kernel — NO OPU custom OP-V instructions "
+                "and NO vluxei. Spike verify currently confirmed bit-"
+                "exact with 19.6x cycle reduction over the reference "
+                "scalar conv on yolov8."
+            ),
+            reference_impl="",
+        ),
+        AlgorithmCandidate(
             name="im2col_vlA_scalarMAC",
             target_affinity=("rvv_opu",),
             accuracy_class=AccuracyClass.BIT_EXACT,
@@ -1966,22 +1982,6 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "than im2col_rvv_reduce's 20x, but with zero FPGA risk: "
                 "every opcode it emits is in the subset directly proven "
                 "by v10 v1's silu kernel running on the actual bitstream."
-            ),
-            reference_impl="",
-        ),
-        AlgorithmCandidate(
-            name="im2col_rvv_reduce",
-            target_affinity=("rvv_opu",),
-            accuracy_class=AccuracyClass.BIT_EXACT,
-            description=(
-                "Saturn-OPU i8 conv2d via scalar im2col + per-output RVV "
-                "vector reduce (vwmul + vwadd-into-i32 + vredsum). Uses "
-                "ONLY the RVV opcodes already validated bit-exact on "
-                "FireSimGemminiAndOPUShuttleConfig by the mlp_control "
-                "cached linear kernel — NO OPU custom OP-V instructions "
-                "and NO vluxei. Spike verify currently confirmed bit-"
-                "exact with 19.6x cycle reduction over the reference "
-                "scalar conv on yolov8."
             ),
             reference_impl="",
         ),
