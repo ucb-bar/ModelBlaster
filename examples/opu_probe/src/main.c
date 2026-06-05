@@ -57,6 +57,37 @@ int main(void)
 {
     printf("=== Saturn-OPU FireSim ISA probe START ===\n");
 
+    /* Read misa and mstatus to ground-truth what the hardware claims
+     * vs. what the OS thinks is enabled. Probe v9 trapped at the
+     * FIRST vsetvli, which most likely means mstatus.VS == Off
+     * (Zephyr's HAS_V() reads misa, finds no V bit, and leaves VS
+     * disabled — any subsequent V instruction traps with illegal-
+     * instruction). */
+    {
+        unsigned long misa, mstatus;
+        asm volatile("csrr %0, misa"    : "=r"(misa));
+        asm volatile("csrr %0, mstatus" : "=r"(mstatus));
+        /* V bit in misa is bit 21 ('V' - 'A' = 21). VS field in
+         * mstatus is bits 10:9 (00=Off, 01=Initial, 10=Clean,
+         * 11=Dirty). */
+        printf("CSR_INIT misa=0x%lx (V_bit=%lu) mstatus=0x%lx (VS=%lu)\n",
+               misa, (misa >> 21) & 1UL,
+               mstatus, (mstatus >> 9) & 0x3UL);
+    }
+
+    /* Force mstatus.VS = Initial (01) regardless of misa. If the
+     * Saturn-OPU bitstream actually supports V execution but doesn't
+     * advertise V in misa (so Zephyr left VS=Off), this manual write
+     * unblocks every subsequent V instruction. */
+    {
+        unsigned long bit = (1UL << 9);   /* MSTATUS_VS_INITIAL */
+        asm volatile("csrs mstatus, %0" : : "r"(bit));
+        unsigned long mstatus_after;
+        asm volatile("csrr %0, mstatus" : "=r"(mstatus_after));
+        printf("CSR_AFTER mstatus=0x%lx (VS=%lu)\n",
+               mstatus_after, (mstatus_after >> 9) & 0x3UL);
+    }
+
     for (int i = 0; i < 64; i++) {
         in_a[i] = (int8_t)i;
         in_b[i] = (int8_t)(i + 1);
