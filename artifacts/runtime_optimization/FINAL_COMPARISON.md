@@ -61,52 +61,48 @@ Remaining slow rvv_opu kernels:
 
 These are tracked under #255 as future work.
 
-## v11 attempt — blocked by bitstream limitation
+## v11 — initial mis-diagnosis, then unblocked
 
 A v11 sequence tried to vectorize the rvv_opu-routed conv2d_s8
 kernel using RVV. Every variant crashed at the first vsetvli with
-illegal-instruction. Root cause was confirmed by a dedicated ISA
-probe binary (`examples/opu_probe/`, FireSim job 220):
+illegal-instruction. A first ISA probe binary
+(`examples/opu_probe/`) ran on hart 0 only (Rocket + Gemmini) and
+reported `misa.V_bit=0`, leading to a wrong conclusion that the
+bitstream lacked V everywhere. A **second probe** (same source,
+extended to spawn a thread pinned to hart 1) found the real story:
 
 ```
-CSR_INIT misa=0x800000000094112d (V_bit=0)
-         mstatus=0x8000000a00018088 (VS=0)
-CSR_AFTER mstatus=0x8000000a00018088 (VS=0)   # manual csrs mstatus, 0x200 IGNORED
-OPU_PROBE_01: vsetvli e8/m1 SET rs1=16 START
-  mcause: 2, Illegal instruction
-  mtval: c0975d7                              # vsetvli s11, s2, e8, m1, ta, ma
+HART_0 mhartid=0 misa.V_bit=0   (Rocket+Gemmini — no V, expected)
+HART_1 mhartid=1 misa.V_bit=1   ← V IS on the Shuttle tile
+HART_1 CSR_INIT mstatus.VS=0    ← but Zephyr left it Off
+HART_1 CSR_AFTER mstatus.VS=1   ← csrs mstatus, 0x200 latches!
+OPU_PROBE_01..10                ← ALL PASS:
+  vsetvli e8/m1, e16/m2, e32/m4       ✓
+  vle8 / vse8                         ✓
+  vwmul.vv, vwadd.wv, vredsum.vs      ✓
+  OPMVINBCAST, VOPACC, VMV_VR         ✓
 ```
 
-`misa.V = 0` on this FireSim `FireSimGemminiAndOPUShuttleConfig`
-bitstream. mstatus.VS is hardwired to Off when misa.V is 0, so any
-attempt to enable VS is silently dropped, and every standard RVV
-opcode (vsetvli, vle8, vse8, vwmul, vredsum, …) traps. The Saturn
-OPU custom OP-V instructions (VOPACC / OPMVINBCAST / VMV_VR /
-VMV_RV) use the same OP-V opcode space and almost certainly also
-require RVV's vsetvli setup to be usable — so they're effectively
-unreachable too on this specific bitstream.
+The bitstream is exactly what the registry claims (Shuttle + Saturn
+OPU vector unit with the four custom OP-V instructions); `misa` is
+per-hart and Zephyr's `HAS_V()` reads it on the primary hart (hart
+0 here) so it leaves `mstatus.VS=Off` on every hart, including the
+V-capable hart 1. First vsetvli on hart 1 then traps.
 
-**Conclusion: the rvv_opu-side scalar-reference conv2d_s8 path that
-v10 already ships IS the production result for this FPGA image.**
-Until a bitstream is synthesized with real V extension support, all
-rvv_opu kernels must be scalar (no inline RVV asm, no `__riscv_v*`
-intrinsics, no Saturn OPU custom). The four kernels added in the
-v11 attempt (`im2col_rvv_reduce`, `im2col_outerprod`,
-`im2col_vlA_scalarMAC`, the OPU probe) are kept in the codebase
-under `kernels/rvv_opu/` for the future bitstream but are removed
-from the yolov8 per-model cache so the picker falls through to the
-scalar reference.
+**Fix (commit 1a12db9):** at the top of every `xpurt_worker()`,
+read THIS hart's misa, and if V is set, raise `mstatus.VS` to
+Initial via `csrs mstatus, 0x200`. Cleanly no-op on non-V harts.
+Once VS is Initial, every standard RVV instruction the conv2d_s8
+kernels emit executes normally on hart 1 — confirmed by all 10
+probe tests passing.
 
-Path forward to actually beat v10's 571 ms on this same bitstream:
-1. **Build a new bitstream** with `FireSimSaturnGENV256D128ShuttleConfig`
-   (already in `config_hwdb.yaml`) or a hetero variant whose Saturn
-   stage advertises misa.V=1. Then v11's `im2col_rvv_reduce` and
-   eventually `im2col_outerprod` become unblocked and the predicted
-   20x cycle reduction on conv2d_s8 lands.
-2. **Runtime-side wins on the existing bitstream** (orthogonal to
-   the kernel ISA question): producer-side fanout signaling (G2d),
-   async dispatch overlap, walker hot-loop scrubbing — each saves
-   sub-50 ms but they're additive.
+With that fix applied, the v11 kernels are viable:
+- `im2col_rvv_reduce`: ~20× cycle reduction over reference scalar
+  (verified bit-exact on spike earlier; FPGA measurement pending).
+- `im2col_outerprod`: ~50× ceiling via Saturn OPU outer-product
+  engine (VOPACC + OPMVINBCAST + VMV_VR). FPGA-verified opcodes
+  now confirmed.
+- `im2col_vlA_scalarMAC`: kept as a safe e8/m1-only fallback.
 
 ## Correctness gates
 
