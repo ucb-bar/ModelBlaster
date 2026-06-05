@@ -254,6 +254,8 @@ def _emit(networks: list[str], schedule_name: str,
             f"             * dependents downstream unblock. */\n"
             f"            if (e_->dispatch_id < 0) {{\n"
             f"                k_sem_give(&completion_sems[i_]);\n"
+            f"                prev_iter_end = (uint64_t)k_cycle_get_64();\n"
+            f"                g_hart_acc[my_kind_idx].entries_done++;\n"
             f"                continue;\n"
             f"            }}\n"
             f"            if (e_->dispatch_id == 0) {{\n"
@@ -267,23 +269,27 @@ def _emit(networks: list[str], schedule_name: str,
             f"                uint64_t target_start = run_t0 +\n"
             f"                    (uint64_t)((double)e_->start_time_ms *\n"
             f"                               (double)XPURT_CYCLES_PER_MS);\n"
+            f"                uint64_t t_gate0 = (uint64_t)k_cycle_get_64();\n"
             f"                while ((uint64_t)k_cycle_get_64() < target_start) {{\n"
             f"                    k_yield();\n"
             f"                }}\n"
+            f"                g_hart_acc[my_kind_idx].target_gate_spin +=\n"
+            f"                    ((uint64_t)k_cycle_get_64() - t_gate0);\n"
             + "\n".join(
                 f"                model_{mid}_reset_profile_{bs}();"
                 for bs in backends
             ) + "\n"
             f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n"
             f"            }}\n"
+            f"            uint64_t t_disp0 = (uint64_t)k_cycle_get_64();\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
-            f"            xpurt_trace[i_].start_cycles =\n"
-            f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
+            f"            xpurt_trace[i_].start_cycles = t_disp0 - run_t0;\n"
             f"#endif\n"
             f"{bs_select}\n"
+            f"            uint64_t t_disp1 = (uint64_t)k_cycle_get_64();\n"
+            f"            g_hart_acc[my_kind_idx].kernel += (t_disp1 - t_disp0);\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
-            f"            xpurt_trace[i_].end_cycles =\n"
-            f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
+            f"            xpurt_trace[i_].end_cycles = t_disp1 - run_t0;\n"
             f"            xpurt_trace[i_].worker_kind_idx = my_kind_idx;\n"
             f"#endif\n"
             f"            if (e_->dispatch_id == MODEL_{umid}_OP_COUNT - 1) {{\n"
@@ -291,6 +297,10 @@ def _emit(networks: list[str], schedule_name: str,
             f"                    (uint64_t)k_cycle_get_64() - wall_start_{mid}[e_->instance];\n"
             f"            }}\n"
             f"            k_sem_give(&completion_sems[i_]);\n"
+            f"            uint64_t t_iter_end = (uint64_t)k_cycle_get_64();\n"
+            f"            g_hart_acc[my_kind_idx].sync_overhead += (t_iter_end - t_disp1);\n"
+            f"            prev_iter_end = t_iter_end;\n"
+            f"            g_hart_acc[my_kind_idx].entries_done++;\n"
             f"            continue;\n"
             f"        }}"
         )
@@ -474,6 +484,25 @@ def _emit(networks: list[str], schedule_name: str,
  * "completed" reading without blocking each other). */
 static struct k_sem completion_sems[{upper}_N_ENTRIES];
 
+/* Phase G1 — per-hart runtime attribution counters, accumulated in
+ * mtime ticks (1 us each on chipyard FireSim). Read at end-of-run and
+ * dumped under MODELBLASTER_HART_ACC for host-side decomposition of
+ * the predicted-vs-measured wall gap. Indexed by my_kind_idx. */
+#ifndef XPURT_MAX_KINDS
+#define XPURT_MAX_KINDS 8
+#endif
+struct xpurt_hart_acc {{
+    uint64_t kernel;            /* mtime delta around bs_select dispatch */
+    uint64_t dep_wait;          /* mtime inside k_sem_take loop */
+    uint64_t sync_overhead;     /* mtime between kernel-end and end of iter */
+    uint64_t target_gate_spin;  /* mtime inside dispatch_id==0 spin */
+    uint64_t hart_idle;         /* mtime between iters (gap to next match) */
+    uint64_t gemmini_cfg_emit;  /* reserved for G2b caching wrappers */
+    uint64_t entries_done;      /* count of dispatched entries */
+    uint64_t wall_total;        /* worker_t0 → worker_exit delta */
+}};
+static struct xpurt_hart_acc g_hart_acc[XPURT_MAX_KINDS];
+
 /* One state struct per (network, kind). `.pool` is bound to the kind's
  * modelblaster_pool in main() before workers spawn and never written again
  * by the worker — that eliminates the data race that existed when a
@@ -534,10 +563,23 @@ static void *xpurt_worker(void *arg)
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
     const char *my_kind = wa->kind;
     int my_kind_idx = wa->kind_idx;
+    /* Phase G1 attribution: track per-iter timing so we can decompose
+     * wall_total into kernel + dep_wait + sync_overhead +
+     * target_gate_spin + hart_idle. prev_iter_end is updated INSIDE
+     * each per-net branch just before `continue` so hart_idle on the
+     * next iter is correctly (this_iter_start - last_iter_end). */
+    uint64_t worker_t0 = (uint64_t)k_cycle_get_64();
+    uint64_t prev_iter_end = worker_t0;
     /* Take entries that match `my_kind`, in start_time order. */
     for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
         const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
         if (strcmp(e_->core_kind, my_kind) != 0) continue;
+
+        uint64_t t_iter_start = (uint64_t)k_cycle_get_64();
+        if (g_hart_acc[my_kind_idx].entries_done > 0) {{
+            g_hart_acc[my_kind_idx].hart_idle +=
+                (t_iter_start - prev_iter_end);
+        }}
 
         /* Wait for all data deps + the time_dep edge to complete. */
         for (int d = 0; d < e_->n_deps; d++) {{
@@ -548,13 +590,19 @@ static void *xpurt_worker(void *arg)
             k_sem_take(&completion_sems[e_->time_dep_entry_id], K_FOREVER);
             k_sem_give(&completion_sems[e_->time_dep_entry_id]);
         }}
+        uint64_t t_deps_done = (uint64_t)k_cycle_get_64();
+        g_hart_acc[my_kind_idx].dep_wait += (t_deps_done - t_iter_start);
 
 {dispatch_branch}
         printf("xpurt: WARN unknown network %s in entry %d\\n",
                e_->network, e_->entry_id);
         /* Unknown network — give the sem anyway so we don't deadlock. */
         k_sem_give(&completion_sems[i_]);
+        prev_iter_end = (uint64_t)k_cycle_get_64();
+        g_hart_acc[my_kind_idx].entries_done++;
     }}
+    g_hart_acc[my_kind_idx].wall_total =
+        (uint64_t)k_cycle_get_64() - worker_t0;
     return NULL;
 }}
 
@@ -670,6 +718,28 @@ int main(void)
         printf("xpurt: worker[%d] kind=%s pinned_hart=%d\\n",
                k, wargs[k].kind, wargs[k].hart);
     }}
+
+    /* Phase G1 — per-hart runtime attribution. All values are mtime
+     * ticks (1 us each on chipyard FireSim). Sum of categories should
+     * equal wall_total within ~2%; residual is unattributed overhead
+     * (k_cycle_get_64 itself, branch mispredict, etc.). */
+    printf("=== MODELBLASTER_HART_ACC_BEGIN ===\\n");
+    printf("kind_idx,kind,kernel_us,dep_wait_us,sync_overhead_us,"
+           "target_gate_spin_us,hart_idle_us,gemmini_cfg_emit_us,"
+           "entries_done,wall_total_us\\n");
+    for (int k = 0; k < {n_kinds}; k++) {{
+        printf("%d,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\\n",
+               k, kinds[k],
+               (unsigned long long)g_hart_acc[k].kernel,
+               (unsigned long long)g_hart_acc[k].dep_wait,
+               (unsigned long long)g_hart_acc[k].sync_overhead,
+               (unsigned long long)g_hart_acc[k].target_gate_spin,
+               (unsigned long long)g_hart_acc[k].hart_idle,
+               (unsigned long long)g_hart_acc[k].gemmini_cfg_emit,
+               (unsigned long long)g_hart_acc[k].entries_done,
+               (unsigned long long)g_hart_acc[k].wall_total);
+    }}
+    printf("=== MODELBLASTER_HART_ACC_END ===\\n");
 
 #ifdef MODELBLASTER_XPURT_TRACE
     /* Trace dump — one CSV row per scheduled entry, with the actual
