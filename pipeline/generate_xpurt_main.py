@@ -253,7 +253,14 @@ def _emit(networks: list[str], schedule_name: str,
             f"             * but still post the completion sem so any\n"
             f"             * dependents downstream unblock. */\n"
             f"            if (e_->dispatch_id < 0) {{\n"
-            f"                k_sem_give(&completion_sems[i_]);\n"
+            f"                /* Phase G2d producer-side fanout: give this\n"
+            f"                 * entry's sem once per downstream consumer\n"
+            f"                 * (data dep + time dep, dedup'd at ingest).\n"
+            f"                 * Consumers take once with no re-give. Leaf\n"
+            f"                 * entries (n_fanout=0) skip the give entirely. */\n"
+            f"                for (int _f = 0; _f < e_->n_fanout; _f++) {{\n"
+            f"                    k_sem_give(&completion_sems[i_]);\n"
+            f"                }}\n"
             f"                prev_iter_end = (uint64_t)k_cycle_get_64();\n"
             f"                g_hart_acc[my_kind_idx].entries_done++;\n"
             f"                continue;\n"
@@ -296,7 +303,14 @@ def _emit(networks: list[str], schedule_name: str,
             f"                wall_cycles_{mid}[e_->instance] =\n"
             f"                    (uint64_t)k_cycle_get_64() - wall_start_{mid}[e_->instance];\n"
             f"            }}\n"
-            f"            k_sem_give(&completion_sems[i_]);\n"
+            f"            /* Phase G2d: producer-side fanout. Give this\n"
+            f"             * entry's sem once per downstream consumer; the\n"
+            f"             * consumer-side take loop does NOT re-give (saves\n"
+            f"             * one sem op per dep edge). Leaf entries skip the\n"
+            f"             * give entirely. */\n"
+            f"            for (int _f = 0; _f < e_->n_fanout; _f++) {{\n"
+            f"                k_sem_give(&completion_sems[i_]);\n"
+            f"            }}\n"
             f"            uint64_t t_iter_end = (uint64_t)k_cycle_get_64();\n"
             f"            g_hart_acc[my_kind_idx].sync_overhead += (t_iter_end - t_disp1);\n"
             f"            prev_iter_end = t_iter_end;\n"
@@ -581,14 +595,28 @@ static void *xpurt_worker(void *arg)
                 (t_iter_start - prev_iter_end);
         }}
 
-        /* Wait for all data deps + the time_dep edge to complete. */
+        /* Wait for all data deps + the time_dep edge to complete.
+         * Phase G2d: producer gives its sem once per UNIQUE consumer
+         * (dedup'd at ingest), consumer takes once per UNIQUE dep
+         * here. No re-give — the counts balance. The time_dep edge
+         * dedup against deps[] preserves the invariant when one
+         * producer is both a data and a time dep of the same
+         * consumer (without dedup, consumer takes twice from one
+         * producer give → deadlock). */
         for (int d = 0; d < e_->n_deps; d++) {{
             k_sem_take(&completion_sems[e_->deps[d]], K_FOREVER);
-            k_sem_give(&completion_sems[e_->deps[d]]); /* re-post for other waiters */
         }}
         if (e_->time_dep_entry_id >= 0) {{
-            k_sem_take(&completion_sems[e_->time_dep_entry_id], K_FOREVER);
-            k_sem_give(&completion_sems[e_->time_dep_entry_id]);
+            int _td_is_dup = 0;
+            for (int _d = 0; _d < e_->n_deps; _d++) {{
+                if (e_->deps[_d] == e_->time_dep_entry_id) {{
+                    _td_is_dup = 1;
+                    break;
+                }}
+            }}
+            if (!_td_is_dup) {{
+                k_sem_take(&completion_sems[e_->time_dep_entry_id], K_FOREVER);
+            }}
         }}
         uint64_t t_deps_done = (uint64_t)k_cycle_get_64();
         g_hart_acc[my_kind_idx].dep_wait += (t_deps_done - t_iter_start);
@@ -596,8 +624,12 @@ static void *xpurt_worker(void *arg)
 {dispatch_branch}
         printf("xpurt: WARN unknown network %s in entry %d\\n",
                e_->network, e_->entry_id);
-        /* Unknown network — give the sem anyway so we don't deadlock. */
-        k_sem_give(&completion_sems[i_]);
+        /* Unknown network — give the sem anyway so we don't deadlock.
+         * Fan out per the producer-side invariant so any downstream
+         * consumers actually unblock. */
+        for (int _f = 0; _f < e_->n_fanout; _f++) {{
+            k_sem_give(&completion_sems[i_]);
+        }}
         prev_iter_end = (uint64_t)k_cycle_get_64();
         g_hart_acc[my_kind_idx].entries_done++;
     }}
@@ -642,10 +674,13 @@ int main(void)
 
 {chr(10).join(reset_calls)}
 
-    /* Init completion sems — limit > 1 so multi-consumer give/take
-     * doesn't bottleneck. */
+    /* Init completion sems. Limit needs to be >= max fanout across
+     * all entries (producer gives n_fanout times before any consumer
+     * has taken). For our schedules max fanout is observed at <16; a
+     * 32 cap gives headroom while keeping the sem accounting tight
+     * (Phase G2d). The old limit=64 + take/re-give pattern is gone. */
     for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
-        k_sem_init(&completion_sems[i], 0, 64);
+        k_sem_init(&completion_sems[i], 0, 32);
     }}
 
     /* One worker per distinct core_kind. Each pins itself to the first
