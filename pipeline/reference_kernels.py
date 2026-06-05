@@ -6221,6 +6221,58 @@ void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
         {"n": 1}, {"n": 17}, {"n": 1024},
     ],
     argtypes_factory=_silu_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_lut_gather",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Vectorized SiLU via a 256-entry int8 LUT. Since the "
+                "input is int8 (256 possible values) and scale_in / "
+                "scale_out are loop-invariant, the entire output "
+                "domain has at most 256 distinct values. Precompute "
+                "lut[v] = scalar_silu(v - 128) at function entry "
+                "using the SAME math as the reference impl (so bit-"
+                "exact by construction). Then loop with vsetvl + "
+                "vle8 + add-128 + vluxei8 gather + vse8 to vectorize "
+                "the per-element lookup. Replaces a scalar expf + "
+                "roundf + clip per element with one gather per VLEN "
+                "elements — typically 8-16x speedup on Saturn-OPU "
+                "for large n with no accuracy compromise."
+            ),
+            reference_impl=(
+                "#include <math.h>\n"
+                "#include <riscv_vector.h>\n"
+                "void kernel_silu_s8(const int8_t *input, int8_t *output, "
+                "int n, float scale_in, float scale_out, "
+                "int activation_min, int activation_max) {\n"
+                "    int8_t lut[256];\n"
+                "    for (int v = 0; v < 256; v++) {\n"
+                "        int8_t iv = (int8_t)(v - 128);\n"
+                "        float f = (float)iv * scale_in;\n"
+                "        float y = f / (1.0f + expf(-f));\n"
+                "        int32_t q = (int32_t)roundf(y / scale_out);\n"
+                "        if (q < activation_min) q = activation_min;\n"
+                "        if (q > activation_max) q = activation_max;\n"
+                "        lut[v] = (int8_t)q;\n"
+                "    }\n"
+                "    int i = 0;\n"
+                "    while (i < n) {\n"
+                "        size_t vl = __riscv_vsetvl_e8m1((size_t)(n - i));\n"
+                "        vint8m1_t vx = __riscv_vle8_v_i8m1(&input[i], vl);\n"
+                "        vint8m1_t vshift = __riscv_vadd_vx_i8m1(vx, "
+                "(int8_t)-128, vl);\n"
+                "        vuint8m1_t vidx = "
+                "__riscv_vreinterpret_v_i8m1_u8m1(vshift);\n"
+                "        vint8m1_t vy = __riscv_vluxei8_v_i8m1("
+                "(const int8_t *)lut, vidx, vl);\n"
+                "        __riscv_vse8_v_i8m1(&output[i], vy, vl);\n"
+                "        i += (int)vl;\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+    ],
 )
 
 
