@@ -1,4 +1,4 @@
-# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14 → v17)
+# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14 → v17 → v18)
 
 Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 4 MLP@10ms + 2 Dronet@20ms + 1 Yolo@100ms, hetero bitstream
@@ -16,6 +16,7 @@ Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 | v14 | + per-channel LUT batchnorm2d_s8 (spatial ≥ 256 guard) | 435 ms | **515 ms** | **515 ms** | 0 | 72 | 22 |
 | v15 | + im2col_outerprod conv2d_s8 (Saturn VOPACC) — REJECTED | n/a | n/a | n/a | n/a | n/a | n/a |
 | v17 | + im2col_rvv_reduce conv2d_s8 cached for **dronet** | 216 ms | **223 ms** | **223 ms** | 0 | 72 | 22 |
+| v18 | + per-input-LUT cat2_c1_s8 (cat3/4 LUT verify failed) | 205 ms | **211 ms** | **211 ms** | 0 | 72 | 22 |
 
 Improvement v9 → v10: **−215 ms on makespan (−27%)**, **−223 ms
 on rvv_opu kernel time (−30%)**, exactly the silu_s8 contribution
@@ -41,7 +42,21 @@ v14  rvv_opu  514,622   kernel=452,560  dep_wait= 61,667  sync=289  gate=  0  id
 
 v17  gemmini  216,112   kernel=109,355  dep_wait=106,074  sync=157  gate=455  idle=49
 v17  rvv_opu  222,738   kernel=157,862  dep_wait= 64,478  sync=281  gate=  0  idle=64
+
+v18  gemmini  204,704   kernel=109,448  dep_wait= 94,579  sync=144  gate=456  idle=58
+v18  rvv_opu  211,348   kernel=143,962  dep_wait= 66,990  sync=285  gate=  0  idle=58
 ```
+
+v17 → v18: cat2_c1_s8 picker landed `per_input_lut`. Per-call
+cat_13 (yolov8 H=W=20 C_inputs=64|80) dropped 4.22 M → 638 k
+rdcycle (-85%). Across the 7 cat2 calls in yolov8, total cat2
+contribution dropped roughly 16 M → 6 M rdcycle. Cascade saved
+~14 ms on rvv_opu kernel and ~12 ms on gemmini dep_wait. cat3
+and cat4 LUT verify FAILED in spike-harness even though host
+bit-exact tests across 14 seeds × 4 shapes passed; #276 tracks
+diagnosis.
+
+Cumulative v10 → v18: **571 → 211 ms (-61%)**.
 
 **v17 is the biggest single step on the optimization curve.** Root
 cause of the v8-v14 plateau: `examples/dronet/int8/cache/rvv_opu/`
@@ -149,11 +164,11 @@ confirming once more that the runtime itself is not the bottleneck.
 
 ## Per-network worst-instance wall (µs)
 
-| | v8 | v9 | v10 | v11g | v14 | v17 |
-|:---|---:|---:|---:|---:|---:|---:|
-| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | 79,677 | **10,511** |
-| dronet | 178,237 | 178,280 | 153,483 | 145,168 | 148,849 | **38,505** |
-| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | 363,344 | **195,025** |
+| | v8 | v9 | v10 | v11g | v14 | v17 | v18 |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | 79,677 | 10,511 | **6,693** |
+| dronet | 178,237 | 178,280 | 153,483 | 145,168 | 148,849 | 38,505 | **37,246** |
+| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | 363,344 | 195,025 | **182,174** |
 
 yolov8 saw the biggest drop (−215 ms = −34%) because all 57 silu
 ops live in yolov8.
