@@ -1,4 +1,4 @@
-# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14 → v17 → v18)
+# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14 → v17 → v18 → v19)
 
 Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 4 MLP@10ms + 2 Dronet@20ms + 1 Yolo@100ms, hetero bitstream
@@ -17,6 +17,7 @@ Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 | v15 | + im2col_outerprod conv2d_s8 (Saturn VOPACC) — REJECTED | n/a | n/a | n/a | n/a | n/a | n/a |
 | v17 | + im2col_rvv_reduce conv2d_s8 cached for **dronet** | 216 ms | **223 ms** | **223 ms** | 0 | 72 | 22 |
 | v18 | + per-input-LUT cat2_c1_s8 (cat3/4 LUT verify failed) | 205 ms | **211 ms** | **211 ms** | 0 | 72 | 22 |
+| v19 | + per-input-LUT cat3_c1_s8 + cat4_c1_s8 (name collision fix) | 191 ms | **198 ms** | **198 ms** | 0 | 72 | 22 |
 
 Improvement v9 → v10: **−215 ms on makespan (−27%)**, **−223 ms
 on rvv_opu kernel time (−30%)**, exactly the silu_s8 contribution
@@ -45,7 +46,30 @@ v17  rvv_opu  222,738   kernel=157,862  dep_wait= 64,478  sync=281  gate=  0  id
 
 v18  gemmini  204,704   kernel=109,448  dep_wait= 94,579  sync=144  gate=456  idle=58
 v18  rvv_opu  211,348   kernel=143,962  dep_wait= 66,990  sync=285  gate=  0  idle=58
+
+v19  gemmini  191,352   kernel=110,006  dep_wait= 80,663  sync=155  gate=457  idle=51
+v19  rvv_opu  197,984   kernel=129,416  dep_wait= 68,177  sync=285  gate=  0  idle=58
 ```
+
+v18 → v19: per-input-LUT cat3 + cat4 landed after fixing a static-
+helper name collision (`_build_cat_lut` defined in all three LUT
+kernel files would multiply-define when picker took all three —
+spike-harness build failed, picker fell back to scalar reference
+for cat3/cat4). Renamed each to `_build_cat{2,3,4}_lut`.
+
+Cat totals on rvv_opu hart:
+```
+v17 (no cat LUTs):   34.3 M rdcycle
+v18 (cat2 LUT):      20.8 M rdcycle  (-39%)
+v19 (cat2+3+4 LUT):   5.7 M rdcycle  (-85% total, -73% v18→v19)
+```
+
+Per-shape v18→v19 cat3 ratios (5x5..40x40): **0.16x..0.22x**
+(5-6x speedup). cat4 same range. The biggest absolute saving:
+H=40 W=40 C_inputs=16|16|16 went 4.6 M → 833 k rdcycle.
+
+makespan 211 → 198 ms (-13 ms, -6%). Cumulative v10 → v19 =
+**571 → 198 ms (-65%)**.
 
 v17 → v18: cat2_c1_s8 picker landed `per_input_lut`. Per-call
 cat_13 (yolov8 H=W=20 C_inputs=64|80) dropped 4.22 M → 638 k
@@ -164,11 +188,11 @@ confirming once more that the runtime itself is not the bottleneck.
 
 ## Per-network worst-instance wall (µs)
 
-| | v8 | v9 | v10 | v11g | v14 | v17 | v18 |
-|:---|---:|---:|---:|---:|---:|---:|---:|
-| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | 79,677 | 10,511 | **6,693** |
-| dronet | 178,237 | 178,280 | 153,483 | 145,168 | 148,849 | 38,505 | **37,246** |
-| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | 363,344 | 195,025 | **182,174** |
+| | v8 | v9 | v10 | v11g | v14 | v17 | v18 | v19 |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | 79,677 | 10,511 | 6,693 | **6,681** |
+| dronet | 178,237 | 178,280 | 153,483 | 145,168 | 148,849 | 38,505 | 37,246 | **36,216** |
+| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | 363,344 | 195,025 | 182,174 | **168,576** |
 
 yolov8 saw the biggest drop (−215 ms = −34%) because all 57 silu
 ops live in yolov8.
