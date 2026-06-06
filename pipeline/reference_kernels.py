@@ -3473,6 +3473,59 @@ void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
         {"N": 1, "C": 128, "H": 4, "W": 4},
     ],
     argtypes_factory=_batchnorm2d_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="per_channel_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Quantized BN via a per-channel 256-entry int8 LUT. "
+                "For fixed (scale[c], bias[c], scale_in, scale_out, "
+                "clamp range) the output is a deterministic function "
+                "of the int8 input pixel with at most 256 distinct "
+                "values. Build lut[v] = scalar_bn(v - 128, c) at the "
+                "start of each channel using the SAME math as the "
+                "reference impl, then the inner H*W loop is a scalar "
+                "indexed load. Bit-exact by construction.\n"
+                "Same constraint as silu_s8's rvv_lut_gather: the "
+                "Saturn-OPU FireSim bitstream does NOT implement "
+                "vluxei8, so the lookup stays scalar — the win comes "
+                "from replacing ~8 fp ops per pixel (cast/mul/FMA/div/"
+                "round/2 clamps) with a single byte indexed load."
+            ),
+            reference_impl=(
+                "#include <math.h>\n"
+                "#include <stdint.h>\n"
+                "void kernel_batchnorm2d_s8(const int8_t *input, "
+                "const float *scale, const float *bias, int8_t *output, "
+                "int N, int C, int H, int W, float scale_in, "
+                "float scale_out, int activation_min, int activation_max) {\n"
+                "    int spatial = H * W;\n"
+                "    for (int n = 0; n < N; n++) {\n"
+                "        for (int c = 0; c < C; c++) {\n"
+                "            float s = scale[c];\n"
+                "            float b = bias[c];\n"
+                "            int8_t lut[256];\n"
+                "            for (int v = 0; v < 256; v++) {\n"
+                "                int8_t iv = (int8_t)(v - 128);\n"
+                "                float fv = (float)iv * scale_in;\n"
+                "                float y = s * fv + b;\n"
+                "                int32_t q = (int32_t)roundf(y / scale_out);\n"
+                "                if (q < activation_min) q = activation_min;\n"
+                "                if (q > activation_max) q = activation_max;\n"
+                "                lut[v] = (int8_t)q;\n"
+                "            }\n"
+                "            const int8_t *ip = input + (n * C + c) * spatial;\n"
+                "            int8_t *op = output + (n * C + c) * spatial;\n"
+                "            for (int i = 0; i < spatial; i++) {\n"
+                "                op[i] = lut[(int)ip[i] + 128];\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+    ],
 )
 
 
