@@ -6844,20 +6844,31 @@ CAT2_C1_S8 = KernelSpec(
     argtypes_factory=_cat2_c1_s8_argtypes,
     algorithms=[
         AlgorithmCandidate(
+            name="per_input_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Same LUT pattern that shipped silu_s8/rvv_lut_gather "
+                "and batchnorm2d_s8/per_channel_lut. For each input "
+                "tensor i build lut[v] = clamp(roundf((v-128) * scale_i "
+                "/ scale_out)) once, then the H*W*c_i loop is a scalar "
+                "indexed lookup. Bit-exact by construction; on Saturn "
+                "vluxei8 is unimplemented so the lookup stays scalar."
+            ),
+            reference_impl="",  # curated file supplies the impl
+        ),
+        AlgorithmCandidate(
             name="direct",
             target_affinity=("rvv_opu",),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
-                "RVV vectorized cat2 concat-rescale: per-input ratio = "
-                "scale_i / scale_out applied to each int8 pixel via "
-                "vle8 → vsext_vf2_i16 → vfwcvt_f_x → vfmul.vf (ratio) "
-                "→ vfcvt.x.f (RNE) → vmax/vmin clamp → vncvt narrow → "
-                "vse8 store at the channel offset. Same LMUL m2/m4/m8 "
-                "widening chain as the proven gemmini-side cat path. "
-                "Without this candidate the picker falls back to a "
-                "per-pixel scalar fp rescale (~10x slower on Saturn)."
+                "RVV vectorized cat2 concat-rescale (vle8/vsext/vfcvt/"
+                "vfmul/vnclip). Kept as a fallback if per_input_lut "
+                "verify fails — historically tripped strict bit-exact "
+                "on yolov8 smoke shapes due to vfcvt RNE vs roundf "
+                "half-away-from-zero divergence."
             ),
-            reference_impl="",  # curated file supplies the impl
+            reference_impl="",
         ),
     ],
 )
@@ -6884,6 +6895,16 @@ CAT3_C1_S8 = KernelSpec(
     ],
     argtypes_factory=_cat3_c1_s8_argtypes,
     algorithms=[
+        AlgorithmCandidate(
+            name="per_input_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Per-input 256-entry LUT (3 inputs). Same LUT pattern "
+                "as cat2_c1_s8/per_input_lut. Bit-exact by construction."
+            ),
+            reference_impl="",
+        ),
         AlgorithmCandidate(
             name="direct",
             target_affinity=("rvv_opu",),
@@ -6920,6 +6941,16 @@ CAT4_C1_S8 = KernelSpec(
     ],
     argtypes_factory=_cat4_c1_s8_argtypes,
     algorithms=[
+        AlgorithmCandidate(
+            name="per_input_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Per-input 256-entry LUT (4 inputs). Same LUT pattern "
+                "as cat2_c1_s8/per_input_lut. Bit-exact by construction."
+            ),
+            reference_impl="",
+        ),
         AlgorithmCandidate(
             name="direct",
             target_affinity=("rvv_opu",),
