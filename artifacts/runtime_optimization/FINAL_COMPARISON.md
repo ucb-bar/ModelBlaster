@@ -1,4 +1,4 @@
-# Phase G — Final Comparison (v8 → v9 → v10 → v11g)
+# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14)
 
 Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 4 MLP@10ms + 2 Dronet@20ms + 1 Yolo@100ms, hetero bitstream
@@ -12,6 +12,8 @@ Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 | v9 | G1 instrumentation, same code as v8 | 709 ms | **786 ms** | 786 ms | 0 | 72 | 22 |
 | v10 | + RVV silu_s8 LUT kernel (G5) | 494 ms | **571 ms** | **571 ms** | 0 | 72 | 22 |
 | v11g | + im2col_rvv_reduce conv2d_s8 + per-dispatch VS re-arm + producer-fanout | 454 ms | **531 ms** | **531 ms** | 0 | 72 | 22 |
+| v13 | + per-channel LUT batchnorm2d_s8 (no guard) — REJECTED | 518 ms | 601 ms | 601 ms | 0 | 72 | 22 |
+| v14 | + per-channel LUT batchnorm2d_s8 (spatial ≥ 256 guard) | 435 ms | **515 ms** | **515 ms** | 0 | 72 | 22 |
 
 Improvement v9 → v10: **−215 ms on makespan (−27%)**, **−223 ms
 on rvv_opu kernel time (−30%)**, exactly the silu_s8 contribution
@@ -28,7 +30,36 @@ v10  rvv_opu  571,117   kernel=509,152  dep_wait= 61,646  sync=203  gate=  0  id
 
 v11g gemmini  453,983   kernel=109,080  dep_wait=344,213  sync=159  gate=456  idle=47
 v11g rvv_opu  531,250   kernel=470,095  dep_wait= 60,762  sync=285  gate=  0  idle=54
+
+v13  gemmini  517,519   kernel=108,728  dep_wait=408,120  sync=141  gate=456  idle=54
+v13  rvv_opu  601,276   kernel=541,511  dep_wait= 59,368  sync=303  gate=  0  idle=45
+
+v14  gemmini  434,994   kernel=108,852  dep_wait=325,460  sync=148  gate=456  idle=52
+v14  rvv_opu  514,622   kernel=452,560  dep_wait= 61,667  sync=289  gate=  0  idle=55
 ```
+
+v11g → v13 (LUT no guard): batchnorm2d_s8 sum 73 M → **121 M** rdcycle
+(+48 M regression). The 256-entry LUT build (256× cast/mul/FMA/div/
+roundf/clamps) only amortizes when H*W ≥ ~256 per channel — yolov8's
+deeper layers (5×5=25 px, 10×10=100 px) lose 3-12× per call.
+Documented in `v13_bn_lut_cached/REJECTED.md`.
+
+v11g → v14 (LUT with `spatial >= 256` guard): batchnorm2d_s8 sum
+73 M → **46 M** rdcycle (−27 M, −37%). Per-shape ratios (v14/v11g):
+
+```
+spatial   v14/v11g    notes
+   25     0.93x       reference branch (guard skips LUT)
+  100     0.95x       reference branch
+  400     0.30-0.76x  LUT wins consistently
+  729     0.46x       LUT
+ 1600     0.14-0.57x  LUT — biggest wins on dronet bn_modules
+ 6400     0.17x       LUT — single 80×80 BN, 6× speedup
+```
+
+makespan 531 ms → 515 ms (−16 ms, −3%). yolov8 instance wall
+383,653 → 363,344 µs (−20 ms). Correctness unchanged (mlp bit-exact,
+dronet 72, yolov8 22).
 
 v10 → v11g delta: rvv_opu kernel down 39 ms (509 → 470), gemmini
 dep_wait down 40 ms (384 → 344), makespan down 40 ms (571 → 531).
@@ -75,11 +106,11 @@ confirming once more that the runtime itself is not the bottleneck.
 
 ## Per-network worst-instance wall (µs)
 
-| | v8 | v9 | v10 | v11g |
-|:---|---:|---:|---:|---:|
-| mlp_control | 77,583 | 77,783 | 77,397 | **77,316** |
-| dronet | 178,237 | 178,280 | 153,483 | **145,168** |
-| yolov8_nano | 638,448 | 638,187 | 422,892 | **383,653** |
+| | v8 | v9 | v10 | v11g | v14 |
+|:---|---:|---:|---:|---:|---:|
+| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | **79,677** |
+| dronet | 178,237 | 178,280 | 153,483 | 145,168 | **148,849** |
+| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | **363,344** |
 
 yolov8 saw the biggest drop (−215 ms = −34%) because all 57 silu
 ops live in yolov8.
