@@ -1,4 +1,4 @@
-# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14 → v17 → v18 → v19)
+# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14 → v17 → v18 → v19 → v20b)
 
 Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 4 MLP@10ms + 2 Dronet@20ms + 1 Yolo@100ms, hetero bitstream
@@ -18,6 +18,7 @@ Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 | v17 | + im2col_rvv_reduce conv2d_s8 cached for **dronet** | 216 ms | **223 ms** | **223 ms** | 0 | 72 | 22 |
 | v18 | + per-input-LUT cat2_c1_s8 (cat3/4 LUT verify failed) | 205 ms | **211 ms** | **211 ms** | 0 | 72 | 22 |
 | v19 | + per-input-LUT cat3_c1_s8 + cat4_c1_s8 (name collision fix) | 191 ms | **198 ms** | **198 ms** | 0 | 72 | 22 |
+| v20b | + gemmini im2col_full_C transpose elimination (NCHW direct) | 177 ms | **183 ms** | **183 ms** | 0 | 72 | 22 |
 
 Improvement v9 → v10: **−215 ms on makespan (−27%)**, **−223 ms
 on rvv_opu kernel time (−30%)**, exactly the silu_s8 contribution
@@ -49,7 +50,37 @@ v18  rvv_opu  211,348   kernel=143,962  dep_wait= 66,990  sync=285  gate=  0  id
 
 v19  gemmini  191,352   kernel=110,006  dep_wait= 80,663  sync=155  gate=457  idle=51
 v19  rvv_opu  197,984   kernel=129,416  dep_wait= 68,177  sync=285  gate=  0  idle=58
+
+v20b gemmini  176,760   kernel= 88,706  dep_wait= 87,371  sync=151  gate=457  idle=56
+v20b rvv_opu  183,446   kernel=133,002  dep_wait= 50,053  sync=287  gate=  0  idle=57
 ```
+
+v19 → v20b: gemmini conv2d_s8 kernel `gemmini_im2col_full_C` had a
+post-tile NHWC→NCHW transpose loop that touched every output pixel
+twice (once during requantize → ws_output NHWC, then again during
+transpose → output NCHW). Folded the transpose into the requantize
+inner: write `output[(n*OC+oc)*OH+oh_idx]*OW + ow_idx] = scaled`
+directly, deleted the trailing transpose loop.
+
+Per-call gemmini conv2d deltas (v20b/v19 ratios, dronet+yolov8):
+```
+conv_modules.0 (OH=56 OW=56 OC=32)   7.2M → 5.3M   (0.74x, big)
+conv_modules.1 (OH=14 OW=14 OC=32)   536k → 500k   (0.93x)
+conv_modules.2 (OH=14 OW=14 OC=32)   432k → 394k   (0.91x)
+conv_modules.4 (OH=14 OW=14 OC=16)   195k → 173k   (0.89x)
+```
+
+Biggest savings on the largest conv (top-of-network), where the
+transpose was a larger fraction of total kernel time. Total gemmini
+conv2d sum: 76.3 M → 61.4 M rdcycle (-20%).
+
+gemmini kernel wall dropped 110 → 89 ms (-21 ms). gemmini dep_wait
+went UP slightly (81 → 87 ms) because gemmini now finishes its
+work faster and ends up blocked longer waiting for rvv_opu —
+but the wall-total still drops because the gemmini kernel
+reduction is larger than the dep_wait increase.
+
+Cumulative v10 → v20b: **571 → 183 ms (-68%)**.
 
 v18 → v19: per-input-LUT cat3 + cat4 landed after fixing a static-
 helper name collision (`_build_cat_lut` defined in all three LUT
@@ -188,11 +219,11 @@ confirming once more that the runtime itself is not the bottleneck.
 
 ## Per-network worst-instance wall (µs)
 
-| | v8 | v9 | v10 | v11g | v14 | v17 | v18 | v19 |
-|:---|---:|---:|---:|---:|---:|---:|---:|---:|
-| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | 79,677 | 10,511 | 6,693 | **6,681** |
-| dronet | 178,237 | 178,280 | 153,483 | 145,168 | 148,849 | 38,505 | 37,246 | **36,216** |
-| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | 363,344 | 195,025 | 182,174 | **168,576** |
+| | v8 | v9 | v10 | v11g | v14 | v17 | v18 | v19 | v20b |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | 79,677 | 10,511 | 6,693 | 6,681 | **6,734** |
+| dronet | 178,237 | 178,280 | 153,483 | 145,168 | 148,849 | 38,505 | 37,246 | 36,216 | **34,055** |
+| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | 363,344 | 195,025 | 182,174 | 168,576 | **156,924** |
 
 yolov8 saw the biggest drop (−215 ms = −34%) because all 57 silu
 ops live in yolov8.
