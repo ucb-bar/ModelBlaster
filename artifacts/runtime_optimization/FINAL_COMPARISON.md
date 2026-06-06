@@ -1,4 +1,4 @@
-# Phase G — Final Comparison (v8 → v9 → v10)
+# Phase G — Final Comparison (v8 → v9 → v10 → v11g)
 
 Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 4 MLP@10ms + 2 Dronet@20ms + 1 Yolo@100ms, hetero bitstream
@@ -11,6 +11,7 @@ Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 | v8 | baseline (no instrumentation) | n/a | n/a | **638 ms** | 0 | 72 | 22 |
 | v9 | G1 instrumentation, same code as v8 | 709 ms | **786 ms** | 786 ms | 0 | 72 | 22 |
 | v10 | + RVV silu_s8 LUT kernel (G5) | 494 ms | **571 ms** | **571 ms** | 0 | 72 | 22 |
+| v11g | + im2col_rvv_reduce conv2d_s8 + per-dispatch VS re-arm + producer-fanout | 454 ms | **531 ms** | **531 ms** | 0 | 72 | 22 |
 
 Improvement v9 → v10: **−215 ms on makespan (−27%)**, **−223 ms
 on rvv_opu kernel time (−30%)**, exactly the silu_s8 contribution
@@ -24,7 +25,46 @@ v9   rvv_opu  786,534   kernel=732,620  dep_wait= 53,586  sync=234  gate=  0  id
 
 v10  gemmini  493,768   kernel=109,403  dep_wait=383,728  sync=119  gate=449  idle=56
 v10  rvv_opu  571,117   kernel=509,152  dep_wait= 61,646  sync=203  gate=  0  idle=72
+
+v11g gemmini  453,983   kernel=109,080  dep_wait=344,213  sync=159  gate=456  idle=47
+v11g rvv_opu  531,250   kernel=470,095  dep_wait= 60,762  sync=285  gate=  0  idle=54
 ```
+
+v10 → v11g delta: rvv_opu kernel down 39 ms (509 → 470), gemmini
+dep_wait down 40 ms (384 → 344), makespan down 40 ms (571 → 531).
+The conv2d_s8 reduce kernel landed cleanly with the per-dispatch
+VS re-arm fix (commit f98a5dd) — yolov8 instance wall dropped
+422,892 → 383,653 µs (-39 ms), aligning with the kernel-time delta.
+
+The 39 ms saving is smaller than the spike microbench's 20× ratio
+predicted because the reduce kernel only beats reference scalar on
+the *inner k-reduction*, not on im2col packing or accumulator
+write-out. conv2d_s8 remains the single largest rvv_opu kernel
+category on the joint run:
+
+```
+v11g per-op rvv_opu kernel rdcycle attribution (sum across 283 ops):
+
+  conv2d_s8        131.3 M (9 ops, avg 14.6 M)   ← largest single op
+  batchnorm2d_s8    73.3 M (60 ops, avg 1.22 M)
+  cat2_c1_s8        16.0 M (7 ops, avg 2.29 M)
+  silu_s8           12.4 M (54 ops, avg 0.23 M)  ← LUT kernel from v10
+  cat3_c1_s8        12.0 M (6 ops, avg 2.00 M)
+  cat4_c1_s8         6.6 M (3 ops, avg 2.19 M)
+  add_s8             6.4 M (10 ops)
+  ── remainder (maxpool/upsample/linear/relu/elu/sigmoid) < 7 M ──
+```
+
+Next candidates by impact:
+- `batchnorm2d_s8` (73 M rdcycle, 60 calls) — a vectorized
+  `vmadd` pass over `(c · scale + bias)` would likely cut 50-60%.
+- Outer-product `conv2d_s8_im2col_outerprod` kernel — the
+  AlgorithmCandidate is registered (#264) and FPGA-verified
+  opcodes confirmed (#266) but not yet on the realized path for
+  v11g. Picking it up should approach the spike 50× ceiling on
+  the larger yolov8 conv shapes.
+- `cat*_c1_s8` (34 M total) — currently scalar memcpy-style; an
+  RVV vle/vse loop would cut 40-50%.
 
 `kernel` time on rvv_opu dropped by 223 ms (732→509). gemmini's
 kernel time stayed flat (silu is rvv_opu only). gemmini's
@@ -35,11 +75,11 @@ confirming once more that the runtime itself is not the bottleneck.
 
 ## Per-network worst-instance wall (µs)
 
-| | v8 | v9 | v10 |
-|:---|---:|---:|---:|
-| mlp_control | 77,583 | 77,783 | **77,397** |
-| dronet | 178,237 | 178,280 | **153,483** |
-| yolov8_nano | 638,448 | 638,187 | **422,892** |
+| | v8 | v9 | v10 | v11g |
+|:---|---:|---:|---:|---:|
+| mlp_control | 77,583 | 77,783 | 77,397 | **77,316** |
+| dronet | 178,237 | 178,280 | 153,483 | **145,168** |
+| yolov8_nano | 638,448 | 638,187 | 422,892 | **383,653** |
 
 yolov8 saw the biggest drop (−215 ms = −34%) because all 57 silu
 ops live in yolov8.
