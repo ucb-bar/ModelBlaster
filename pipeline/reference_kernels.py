@@ -1997,19 +1997,14 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "bitstream for mlp_control across v8/v9/v10). Avoids the "
                 "vluxei8-based gather of indir_gemm, which traps as "
                 "illegal instruction on this bitstream.\n\n"
-                "ALGORITHM:\n"
-                "  outer (n, oh, ow_tile in OW step mlmax):\n"
-                "    scalar im2col into per-hart strip [mlmax, K]\n"
-                "    for oc_tile in OC step mlmax:\n"
-                "      OPMVINBCAST m1 <- bias[oc_tile..+mlmax]\n"
-                "      for k in [0, K):\n"
-                "        vlse8.v v16 <- strip column k (M_tile lanes)\n"
-                "        vlse8.v v18 <- weight column k for oc_tile (N_tile)\n"
-                "        VOPACC m1, v18, v16\n"
-                "      drain m1 rows, Q0.31 requantize, store i8 to output\n\n"
-                "Symmetric quant only (input_offset = filter_offset = 0); "
-                "falls back to the scalar reference for asymmetric quant or "
-                "K exceeding per-hart scratch."
+                "V15 ATTEMPT: copied into per-net cache and reordered "
+                "ahead of im2col_rvv_reduce. spike-harness verify FAILED "
+                "for dronet (which has 5 of the 9 rvv_opu conv2d_s8 calls "
+                "totaling 131M rdcycle in v14). Picker fell ALL THE WAY "
+                "BACK to scalar reference for dronet — the rvv_reduce "
+                "fallback didn't fire either, suggesting outerprod's "
+                "verify crashed spike rather than returning a divergence. "
+                "Reverted to last position pending root-cause analysis."
             ),
             reference_impl="",  # the curated file supplies the impl
         ),
@@ -6847,6 +6842,24 @@ CAT2_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32],  "C_total": 48},
     ],
     argtypes_factory=_cat2_c1_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV vectorized cat2 concat-rescale: per-input ratio = "
+                "scale_i / scale_out applied to each int8 pixel via "
+                "vle8 → vsext_vf2_i16 → vfwcvt_f_x → vfmul.vf (ratio) "
+                "→ vfcvt.x.f (RNE) → vmax/vmin clamp → vncvt narrow → "
+                "vse8 store at the channel offset. Same LMUL m2/m4/m8 "
+                "widening chain as the proven gemmini-side cat path. "
+                "Without this candidate the picker falls back to a "
+                "per-pixel scalar fp rescale (~10x slower on Saturn)."
+            ),
+            reference_impl="",  # curated file supplies the impl
+        ),
+    ],
 )
 
 CAT3_C1_S8 = KernelSpec(
@@ -6870,6 +6883,18 @@ CAT3_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32, 16], "C_total": 64},
     ],
     argtypes_factory=_cat3_c1_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV vectorized cat3 concat-rescale (3 inputs). Same "
+                "widening pipeline as cat2_c1_s8/direct."
+            ),
+            reference_impl="",
+        ),
+    ],
 )
 
 CAT4_C1_S8 = KernelSpec(
@@ -6894,6 +6919,18 @@ CAT4_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [8, 16, 16, 8],   "C_total": 48},
     ],
     argtypes_factory=_cat4_c1_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV vectorized cat4 concat-rescale (4 inputs). Same "
+                "widening pipeline as cat2_c1_s8/direct."
+            ),
+            reference_impl="",
+        ),
+    ],
 )
 
 

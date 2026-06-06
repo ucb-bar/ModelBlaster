@@ -1,4 +1,4 @@
-# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14)
+# Phase G — Final Comparison (v8 → v9 → v10 → v11g → v14 → v17)
 
 Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 4 MLP@10ms + 2 Dronet@20ms + 1 Yolo@100ms, hetero bitstream
@@ -14,6 +14,8 @@ Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 | v11g | + im2col_rvv_reduce conv2d_s8 + per-dispatch VS re-arm + producer-fanout | 454 ms | **531 ms** | **531 ms** | 0 | 72 | 22 |
 | v13 | + per-channel LUT batchnorm2d_s8 (no guard) — REJECTED | 518 ms | 601 ms | 601 ms | 0 | 72 | 22 |
 | v14 | + per-channel LUT batchnorm2d_s8 (spatial ≥ 256 guard) | 435 ms | **515 ms** | **515 ms** | 0 | 72 | 22 |
+| v15 | + im2col_outerprod conv2d_s8 (Saturn VOPACC) — REJECTED | n/a | n/a | n/a | n/a | n/a | n/a |
+| v17 | + im2col_rvv_reduce conv2d_s8 cached for **dronet** | 216 ms | **223 ms** | **223 ms** | 0 | 72 | 22 |
 
 Improvement v9 → v10: **−215 ms on makespan (−27%)**, **−223 ms
 on rvv_opu kernel time (−30%)**, exactly the silu_s8 contribution
@@ -36,7 +38,48 @@ v13  rvv_opu  601,276   kernel=541,511  dep_wait= 59,368  sync=303  gate=  0  id
 
 v14  gemmini  434,994   kernel=108,852  dep_wait=325,460  sync=148  gate=456  idle=52
 v14  rvv_opu  514,622   kernel=452,560  dep_wait= 61,667  sync=289  gate=  0  idle=55
+
+v17  gemmini  216,112   kernel=109,355  dep_wait=106,074  sync=157  gate=455  idle=49
+v17  rvv_opu  222,738   kernel=157,862  dep_wait= 64,478  sync=281  gate=  0  idle=64
 ```
+
+**v17 is the biggest single step on the optimization curve.** Root
+cause of the v8-v14 plateau: `examples/dronet/int8/cache/rvv_opu/`
+had **no** `rvv_opu_conv2d_s8_im2col_rvv_reduce.c` since cache
+inception, so dronet's 5 rvv_opu conv2d_s8 calls (one of them
+49 M rdcycle each — `conv_modules.8` IC=128 KH=3) were running the
+scalar reference. The v11g work cached rvv_reduce for yolov8 only
+(its 4 small detect-head convs) and never landed it for dronet.
+v15 attempted to add im2col_outerprod ahead of rvv_reduce; outerprod
+spike-harness verify failed for dronet (uncached root cause —
+crashed spike before the rvv_reduce candidate could run, so the
+picker fell straight back to scalar reference for the conv2d_s8 op).
+**v15 was reverted before measurement** — the v15 row in the table
+is documentational.
+
+v17 just copied rvv_reduce + silu_lut_gather into dronet's per-net
+cache. Picker accepted both. Measured deltas vs v14:
+
+```
+dronet conv_modules sum   131 M → 8.8 M  rdcycle  (14.9× speedup)
+all rvv_opu conv2d_s8     135 M →  12 M  rdcycle  (11.0×)
+gemmini wall              435 → 216 ms   (−219 ms, −50%)
+gemmini dep_wait          325 → 106 ms   (−219 ms — cascade)
+rvv_opu wall              515 → 223 ms   (−292 ms, −57%)
+rvv_opu kernel            453 → 158 ms   (−295 ms)
+makespan                  515 → 223 ms   (−292 ms, −57%)
+yolov8 instance           363 → 195 ms   (−168 ms, −46%)
+dronet instance           149 →  39 ms   (−110 ms, −74%)
+mlp_control instance       80 →  11 ms   (−69 ms, −87%)
+```
+
+The dronet/mlp instance walls drop disproportionately because the
+walker's periodic gate stops being slack-eaten by upstream rvv_opu
+conv work — when dronet conv finishes 14× faster, every downstream
+periodic instance launches on schedule and finishes promptly.
+
+Correctness unchanged from baseline: mlp bit-exact, dronet 72,
+yolov8 22 (pre-existing #247 / im2col tail drift).
 
 v11g → v13 (LUT no guard): batchnorm2d_s8 sum 73 M → **121 M** rdcycle
 (+48 M regression). The 256-entry LUT build (256× cast/mul/FMA/div/
@@ -106,11 +149,11 @@ confirming once more that the runtime itself is not the bottleneck.
 
 ## Per-network worst-instance wall (µs)
 
-| | v8 | v9 | v10 | v11g | v14 |
-|:---|---:|---:|---:|---:|---:|
-| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | **79,677** |
-| dronet | 178,237 | 178,280 | 153,483 | 145,168 | **148,849** |
-| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | **363,344** |
+| | v8 | v9 | v10 | v11g | v14 | v17 |
+|:---|---:|---:|---:|---:|---:|---:|
+| mlp_control | 77,583 | 77,783 | 77,397 | 77,316 | 79,677 | **10,511** |
+| dronet | 178,237 | 178,280 | 153,483 | 145,168 | 148,849 | **38,505** |
+| yolov8_nano | 638,448 | 638,187 | 422,892 | 383,653 | 363,344 | **195,025** |
 
 yolov8 saw the biggest drop (−215 ms = −34%) because all 57 silu
 ops live in yolov8.
