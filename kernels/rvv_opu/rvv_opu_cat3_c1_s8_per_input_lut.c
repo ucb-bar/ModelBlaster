@@ -9,7 +9,7 @@
 #include <math.h>
 #include <stdint.h>
 
-static inline void _build_cat_lut(int8_t lut[256], float scale_in, float scale_out,
+static inline void _build_cat3_lut(int8_t lut[256], float scale_in, float scale_out,
                                   int activation_min, int activation_max) {
     for (int v = 0; v < 256; v++) {
         int8_t iv = (int8_t)(v - 128);
@@ -31,9 +31,9 @@ void kernel_cat3_c1_s8(const int8_t *in0, int c0, float scale0,
     int stride = H * W;
     int c_total = c0 + c1 + c2;
     int8_t lut0[256], lut1[256], lut2[256];
-    _build_cat_lut(lut0, scale0, scale_out, activation_min, activation_max);
-    _build_cat_lut(lut1, scale1, scale_out, activation_min, activation_max);
-    _build_cat_lut(lut2, scale2, scale_out, activation_min, activation_max);
+    _build_cat3_lut(lut0, scale0, scale_out, activation_min, activation_max);
+    _build_cat3_lut(lut1, scale1, scale_out, activation_min, activation_max);
+    _build_cat3_lut(lut2, scale2, scale_out, activation_min, activation_max);
     for (int n = 0; n < N; n++) {
         int out_c = 0;
         { /* input 0 */
