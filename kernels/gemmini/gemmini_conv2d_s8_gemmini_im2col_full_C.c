@@ -217,16 +217,14 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 scaled += output_offset;
                 if (scaled < activation_min) scaled = activation_min;
                 if (scaled > activation_max) scaled = activation_max;
-                ws_output[((n_idx*OH + oh_idx)*OW + ow_idx)*OC + oc] = (elem_t)scaled;
+                /* v20: write directly to NCHW output, skip NHWC ws_output.
+                 * Eliminates the post-tile transpose pass (was ~10ms wall
+                 * across 66 conv calls in v18). Mathematically identical to
+                 * the old (NHWC ws_output + transpose) path — each output
+                 * pixel still receives the same `scaled` value, just at its
+                 * NCHW destination address directly. */
+                output[((n_idx*OC + oc)*OH + oh_idx)*OW + ow_idx] = (elem_t)scaled;
             }
         }
     }
-
-    /* Transpose output NHWC → NCHW. */
-    for (int n = 0; n < N; n++)
-        for (int c = 0; c < OC; c++)
-            for (int h = 0; h < OH; h++)
-                for (int w = 0; w < OW; w++)
-                    output[((n*OC + c)*OH + h)*OW + w] =
-                        ws_output[((n*OH + h)*OW + w)*OC + c];
 }
