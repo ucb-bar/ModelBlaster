@@ -1,0 +1,20 @@
+{
+  "policy": "critical_path_first",
+  "status": "ok",
+  "solve_wall_s": 1.76,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_workload_heft_profiled.json",
+  "makespan": 128.68831199999997,
+  "n_deadline_miss": 103,
+  "n_release_viol": 0,
+  "n_dispatches": 208,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "CP-first global ordering via heft upward_rank"
+    }
+  ],
+  "local_fixture": "/scratch2/agustin/ModelBlaster/artifacts/sweeps/2026-06-08/cells/m4_d2_y1__p5_20_100__critical_path_first/fixture.json",
+  "gantt": "/scratch2/agustin/ModelBlaster/artifacts/sweeps/2026-06-08/cells/m4_d2_y1__p5_20_100__critical_path_first/gantt.png"
+}
