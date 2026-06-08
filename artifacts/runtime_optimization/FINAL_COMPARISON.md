@@ -19,6 +19,13 @@ Hybrid policy `hybrid_periodic_mosek_yolo`, canonical workload
 | v18 | + per-input-LUT cat2_c1_s8 (cat3/4 LUT verify failed) | 205 ms | **211 ms** | **211 ms** | 0 | 72 | 22 |
 | v19 | + per-input-LUT cat3_c1_s8 + cat4_c1_s8 (name collision fix) | 191 ms | **198 ms** | **198 ms** | 0 | 72 | 22 |
 | v20b | + gemmini im2col_full_C transpose elimination (NCHW direct) | 177 ms | **183 ms** | **183 ms** | 0 | 72 | 22 |
+| v21 | per-instance output buffer (dronet correctness) — REJECTED | n/a | n/a | n/a | n/a | n/a | n/a |
+| v22 | + silu_s8 LUT cache across calls — REJECTED (cache never hits) | 176 ms | 182 ms | 182 ms | 0 | 72 | 22 |
+
+v22 silu LUT cache invalidates on essentially every call because
+yolov8 per-layer dequant/requant scales rarely repeat. Measured delta
+v20b→v22 (-1.2 ms on both harts) is within FireSim mtime noise.
+Reverted; kernel optimization journey ends at v20b 183 ms.
 
 Improvement v9 → v10: **−215 ms on makespan (−27%)**, **−223 ms
 on rvv_opu kernel time (−30%)**, exactly the silu_s8 contribution
