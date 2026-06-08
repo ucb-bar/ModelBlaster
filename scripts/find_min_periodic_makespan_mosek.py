@@ -21,11 +21,31 @@ needs 5+ min per solve on this scale. The binary search may use
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
+# XPU-RT + merlin are sibling checkouts next to this repo (../XPU-RT, ../merlin);
+# override with the XPURT_ROOT / MERLIN_DIR env vars if they live elsewhere.
+_XPURT_PKG = os.environ.get("XPURT_ROOT", str(REPO.parent / "XPU-RT")) + "/xpu-rt"
+_MERLIN_DIR = os.environ.get("MERLIN_DIR", str(REPO.parent / "merlin"))
+
+
+def _xpurt_python() -> str:
+    """Interpreter for the cvxpy/MOSEK scheduler env. Honors XPURT_PYTHON;
+    otherwise locates the `xpu-rt-schedule` conda env relative to the active
+    conda install, falling back to whatever `python3` is on PATH."""
+    explicit = os.environ.get("XPURT_PYTHON")
+    if explicit:
+        return explicit
+    conda_exe = os.environ.get("CONDA_EXE")
+    if conda_exe:
+        cand = pathlib.Path(conda_exe).parent.parent / "envs" / "xpu-rt-schedule" / "bin" / "python"
+        if cand.exists():
+            return str(cand)
+    return "python3"
 
 NETWORKS = [
     ("yolov8_nano_64", "int8", 1),
@@ -69,9 +89,9 @@ def _try_makespan(M: float, label: str = "") -> tuple[bool, str, float]:
 
     import os
     env = {**os.environ,
-           "PYTHONPATH": f"{REPO}:/scratch2/agustin/XPU-RT/xpu-rt:/scratch2/agustin/merlin"}
+           "PYTHONPATH": f"{REPO}:{_XPURT_PKG}:{_MERLIN_DIR}"}
     r = subprocess.run(
-        ["/scratch2/agustin/xpu-rt-integration/.venv/bin/python",
+        [_xpurt_python(),
          "scripts/run_xpurt_scheduler_multi.py",
          "--config", cfg, "--output", out],
         cwd=str(REPO), env=env, capture_output=True, text=True,
@@ -162,9 +182,9 @@ def main() -> int:
         cfg = f.name
     import os
     env = {**os.environ,
-           "PYTHONPATH": f"{REPO}:/scratch2/agustin/XPU-RT/xpu-rt:/scratch2/agustin/merlin"}
+           "PYTHONPATH": f"{REPO}:{_XPURT_PKG}:{_MERLIN_DIR}"}
     subprocess.run(
-        ["/scratch2/agustin/xpu-rt-integration/.venv/bin/python",
+        [_xpurt_python(),
          "scripts/run_xpurt_scheduler_multi.py",
          "--config", cfg, "--output", str(out_path)],
         cwd=str(REPO), env=env,
