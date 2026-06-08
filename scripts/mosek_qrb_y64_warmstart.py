@@ -1,8 +1,7 @@
 """Definitive MOSEK-on-qrb_y64 experiment with HEFT warm-start.
 
-Run with the xpu-rt-integration venv which has both cvxpy and mosek:
-  /scratch2/agustin/xpu-rt-integration/.venv/bin/python \\
-      scripts/mosek_qrb_y64_warmstart.py
+Run with the xpu-rt-schedule conda env, which has both cvxpy and mosek:
+  conda run -n xpu-rt-schedule python scripts/mosek_qrb_y64_warmstart.py
 
 
 We've documented MOSEK doesn't converge on 300-op qrb_y64 under "default
@@ -29,10 +28,14 @@ import pathlib
 import sys
 import time
 
+import os
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
+# XPU-RT + merlin are sibling checkouts next to this repo (../XPU-RT, ../merlin);
+# override with the XPURT_ROOT / MERLIN_DIR env vars if they live elsewhere.
 sys.path.insert(0, str(REPO))
-sys.path.insert(0, "/scratch2/agustin/XPU-RT/xpu-rt")
-sys.path.insert(0, "/scratch2/agustin/merlin")
+sys.path.insert(0, os.environ.get("XPURT_ROOT", str(REPO.parent / "XPU-RT")) + "/xpu-rt")
+sys.path.insert(0, os.environ.get("MERLIN_DIR", str(REPO.parent / "merlin")))
 
 
 def main() -> int:

@@ -11,6 +11,28 @@ one binary with explicit core pinning and inter-network synchronization.
 > **Parent-repo cross-link** to the XPURT side of the same flow:
 > `../../docs/end_to_end_xpurt_firesim.md`.
 
+## Origin: built on KernelBlaster
+
+ModelBlaster is an applied derivative of **KernelBlaster**, the original
+research project that defines the underlying methodology. KernelBlaster
+introduces continual, cross-task CUDA kernel optimization via
+memory-augmented in-context reinforcement learning — an LLM that learns
+from prior optimization attempts to improve generated kernels across
+hardware targets. ModelBlaster carries that core idea — LLM-driven,
+verify-then-optimize kernel generation with a persistent cache of winning
+implementations — over to the PyTorch → quantized → Zephyr/RISC-V
+embedded flow, and adds the multi-model XPU-RT scheduling layer.
+
+To understand *why* the pipeline is shaped the way it is (the
+generate → verify → beam-search-optimize loop, the per-op algorithm
+candidates, the cached-kernel reuse model), read the KernelBlaster paper:
+
+- **Paper:** *KernelBlaster: Continual Cross-Task CUDA Optimization via
+  Memory-Augmented In-Context Reinforcement Learning* —
+  https://arxiv.org/abs/2602.14293
+- **Source:** vendored here as a git submodule under `third_party/KernelBlaster/`
+  (NVlabs/KernelBlaster).
+
 ## Quick orientation
 
 ```

@@ -43,7 +43,9 @@ import numpy as np
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 RESULTS_ROOT = REPO_ROOT / "benchmarks" / "results"
-XPURT_ROOT = pathlib.Path("/scratch2/agustin/XPU-RT")
+# XPU-RT is a sibling checkout next to this repo (../XPU-RT); override with
+# the XPURT_ROOT env var if it lives elsewhere.
+XPURT_ROOT = pathlib.Path(os.environ.get("XPURT_ROOT", str(REPO_ROOT.parent / "XPU-RT")))
 XPURT_PKG = XPURT_ROOT / "xpu-rt"
 DRONET_DEPS_JSON = XPURT_PKG / "pytorch_workload" / "samples" / "dronet_dispatch_deps.json"
 
