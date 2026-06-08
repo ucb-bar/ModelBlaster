@@ -243,6 +243,30 @@ the per-op cycle estimates in the PDB are stale again — the
 predicted makespan should drop to roughly v10 measured (571 ms)
 once the v10 cycles are re-ingested. Tracked as a follow-up.
 
+### G3 v20b PDB recalibration (2026-06-08)
+
+Updated 235 PDB rows from v20b measured cycles. Replay of
+`hybrid_periodic_mosek_yolo`:
+
+| Side | predicted Σdur | measured kernel | ratio |
+|:---|---:|---:|---:|
+| CPU_P (gemmini) | 94.98 ms |  88.71 ms | 1.07× |
+| CPU_E (rvv_opu) | 221.42 ms | 133.00 ms | 1.66× |
+| total makespan  | 393.08 ms | 183.45 ms | 2.15× |
+
+Gemmini side now well-calibrated. The remaining 1.66× rvv overhead
+comes from (1) missing mlp_control V256D128_rvv PDB row — the
+solver's fallback estimate is ~30M cyc/instance vs measured
+~0.5M cyc/instance, and (2) the phased hybrid policy serialising
+work that the runtime actually parallelises across harts. Both are
+solver shortcomings, not runtime overhead.
+
+Documented in `v23_pdb_recalibrated/README.md`. Phase A1 band audit
+also ran (`v23_pdb_recalibrated/band_compliance.csv`) — `decomposed`
+is the only solver with 0 deadline misses on the canonical workload
+(832 ops, 516 ms makespan); HEFT/critical_path/cpsat/greedy_periodic
+all overshoot deadlines because they don't enforce `max_end_t`.
+
 Remaining slow rvv_opu kernels:
 - conv2d_s8 (3 shapes, ~140 ms total) — proper OPU outer-product
   kernel needed; the spike→FPGA divergence on RVV intrinsics
