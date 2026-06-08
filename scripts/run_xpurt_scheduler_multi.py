@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -38,7 +39,8 @@ import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 RESULTS_ROOT = REPO_ROOT / "benchmarks" / "results"
-XPURT_PKG = pathlib.Path("/scratch2/agustin/XPU-RT/xpu-rt")
+# XPU-RT is a sibling checkout next to this repo (../XPU-RT); override via XPURT_ROOT.
+XPURT_PKG = pathlib.Path(os.environ.get("XPURT_ROOT", str(REPO_ROOT.parent / "XPU-RT"))) / "xpu-rt"
 
 
 def _build_dep_graph(ir: dict) -> Tuple[Dict[int, list[int]], Dict[int, str], Dict[int, str]]:

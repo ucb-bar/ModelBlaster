@@ -119,8 +119,9 @@ def _maybe_emit_scheduler_postmortem(out_dir: Path) -> None:
         from postmortem import compare_trace  # xpurt installable
     except ImportError:
         try:
-            import sys
-            sys.path.insert(0, "/scratch2/agustin/XPU-RT/xpu-rt")
+            import os, sys
+            _xpurt = os.environ.get("XPURT_ROOT", str(Path(__file__).resolve().parents[3] / "XPU-RT"))
+            sys.path.insert(0, _xpurt + "/xpu-rt")
             from postmortem import compare_trace
         except ImportError:
             return

@@ -233,7 +233,8 @@ def hetero_env_overlay(workload: Workload, env: dict[str, str]) -> None:
     if (workload.target == "hetero_gemmini_opu"
             and workload.runner == "spike"
             and "MODELBLASTER_HETERO_SPIKE" not in env):
-        candidate = Path("/scratch2/agustin/merlin/tools/spike-hetero/spike-hetero")
+        _merlin = os.environ.get("MERLIN_DIR", str(Path(__file__).resolve().parents[3] / "merlin"))
+        candidate = Path(_merlin) / "tools/spike-hetero/spike-hetero"
         if candidate.exists():
             env["MODELBLASTER_HETERO_SPIKE"] = str(candidate)
 
