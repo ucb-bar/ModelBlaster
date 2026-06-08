@@ -1,6 +1,15 @@
 solver,workload,n_ops,n_release_violations,n_deadline_violations,worst_release_overrun_us,worst_deadline_overrun_us,n_networks_with_misses,makespan_us,solve_wall_s,status
-cpsat,networks_1yolo_4mlp_2dronet_firesim,207,0,65,0.0,141.137,2,186.735133,0.0,reused
 decomposed,networks_1yolo_4mlp_2dronet_firesim,832,0,0,0.0,0.0,0,516.4651650000004,0.0,reused
-greedy_periodic,networks_1yolo_4mlp_2dronet_firesim,236,0,67,0.0,31.885,2,61.19647900000001,0.0,reused
+cpsat,networks_1yolo_4mlp_2dronet_firesim,207,0,65,0.0,141.137,2,186.735133,0.0,reused
+cpsat_memory,networks_1yolo_4mlp_2dronet_firesim,203,0,68,0.0,126.997,2,244.7792339999999,0.0,reused
 heft,networks_1yolo_4mlp_2dronet_firesim,245,0,88,0.0,44.424,2,54.429872,0.0,reused
 critical_path,networks_1yolo_4mlp_2dronet_firesim,234,0,88,0.0,106.691,2,116.78462599999997,0.0,reused
+edf,networks_1yolo_4mlp_2dronet_firesim,234,0,88,0.0,106.691,2,116.78462599999997,0.0,reused
+fastest_device,networks_1yolo_4mlp_2dronet_firesim,265,0,75,0.0,31.895,2,85.64249600000007,0.0,reused
+fifo,networks_1yolo_4mlp_2dronet_firesim,241,0,70,0.0,44.854,2,166.51891000000006,0.0,reused
+random_list,networks_1yolo_4mlp_2dronet_firesim,203,0,55,0.0,58.986,2,148.54572200000004,0.0,reused
+peft,networks_1yolo_4mlp_2dronet_firesim,234,0,84,0.0,46.237,2,56.241877,0.0,reused
+min_min,networks_1yolo_4mlp_2dronet_firesim,209,0,42,0.0,20.075,2,90.71356800000004,0.0,reused
+max_min,networks_1yolo_4mlp_2dronet_firesim,227,0,40,0.0,22.45,2,76.89628899999998,0.0,reused
+round_robin,networks_1yolo_4mlp_2dronet_firesim,287,0,78,0.0,117.007,2,408.8124190000001,0.0,reused
+greedy_periodic,networks_1yolo_4mlp_2dronet_firesim,236,0,67,0.0,31.885,2,61.19647900000001,0.0,reused
