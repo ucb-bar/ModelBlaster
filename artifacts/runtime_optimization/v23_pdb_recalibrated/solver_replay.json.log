@@ -1,0 +1,34 @@
+---RESULT---
+{
+  "policy": "hybrid_periodic_mosek_yolo",
+  "status": "ok",
+  "solve_wall_s": 193.057,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_hybrid.json",
+  "makespan": 393.08059499999996,
+  "n_deadline_miss": 0,
+  "n_release_viol": 0,
+  "n_dispatches": 826,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "phase1 periodic reservation via decomposed; phase2 yolov8 via MOSEK; phase3 shift yolov8 to avoid periodic-busy intervals"
+    },
+    {
+      "phase": 1,
+      "wall_s": 45.4,
+      "periodic_fixture": "/scratch2/agustin/XPU-RT/data/toplevel/networks_1yolo_4mlp_2dronet_firesim_hybrid_periodic_extracted.json"
+    },
+    {
+      "phase": 2,
+      "wall_s": 147.62,
+      "yolo_fixture": "/scratch2/agustin/XPU-RT/schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_hybrid_yolo_only_profiled.json"
+    },
+    {
+      "phase": 3,
+      "yolo_makespan_before_shift": 123.24024499999994,
+      "yolo_makespan_after_shift": 127.004417
+    }
+  ]
+}
