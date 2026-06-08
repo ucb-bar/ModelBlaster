@@ -18,12 +18,17 @@ Output: notes/figures/frequency_sweep_v2.png — two subplots side by side.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
+# XPU-RT + merlin are sibling checkouts next to this repo (../XPU-RT, ../merlin);
+# override with the XPURT_ROOT / MERLIN_DIR env vars if they live elsewhere.
+_XPURT_PKG = os.environ.get("XPURT_ROOT", str(REPO.parent / "XPU-RT")) + "/xpu-rt"
+_MERLIN_DIR = os.environ.get("MERLIN_DIR", str(REPO.parent / "merlin"))
 
 
 CONFIG_TEMPLATE = """bitstream: GemminiAndOPUShuttleConfig
@@ -86,8 +91,8 @@ def _solve(n_yolo: int, n_dronet: int, n_mlp: int) -> dict | None:
         cwd=str(REPO),
         capture_output=True,
         text=True,
-        env={**__import__("os").environ,
-             "PYTHONPATH": f"{REPO}:/scratch2/agustin/XPU-RT/xpu-rt:/scratch2/agustin/merlin"},
+        env={**os.environ,
+             "PYTHONPATH": f"{REPO}:{_XPURT_PKG}:{_MERLIN_DIR}"},
     )
     if proc.returncode != 0:
         print(f"  solver failed for ({n_yolo},{n_dronet},{n_mlp}): {proc.stderr[-300:]}")

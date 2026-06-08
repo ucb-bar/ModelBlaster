@@ -38,11 +38,11 @@ benchmarks = [
 smolvla = [
     # SmolVLA admission pulls the canonical lerobot checkout in editable
     # mode so its policies.smolvla.modeling_smolvla module is importable
-    # without re-implementing it. The path matches the dev-box clone at
-    # /scratch2/agustin/merlin/third_party/lerobot; override via
-    # `uv pip install -e <other-path>` if your checkout lives elsewhere.
-    "lerobot @ file:///scratch2/agustin/merlin/third_party/lerobot",
-    "lerobot[transformers-dep] @ file:///scratch2/agustin/merlin/third_party/lerobot",
+    # without re-implementing it. Resolved (via [tool.uv.sources] below) to
+    # the merlin sibling checkout at ../merlin/third_party/lerobot; override
+    # that source entry if your checkout lives elsewhere.
+    "lerobot",
+    "lerobot[transformers-dep]",
     # SmolVLM's text processor turns digits into words via num2words at
     # tokenization time. Not in lerobot's base deps, but the processor
     # raises at __init__ if it is missing.
@@ -55,7 +55,10 @@ scheduler = [
 ]
 
 [tool.uv.sources]
-xpurt = { path = "/scratch2/agustin/XPU-RT", editable = true }
+# XPU-RT and merlin are sibling checkouts next to this repo. Paths are
+# relative to this pyproject.toml, so they work from any clone location.
+xpurt = { path = "../XPU-RT", editable = true }
+lerobot = { path = "../merlin/third_party/lerobot", editable = true }
 
 [project.scripts]
 # `uv run mb-cost` launches the live cost monitor with sensible
