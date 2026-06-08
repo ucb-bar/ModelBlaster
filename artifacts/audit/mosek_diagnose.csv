@@ -1,9 +1,9 @@
 scheduler,cap_label,mlp_instances,status,wall_s,objective_us,stderr_tail
-cpsat,mlp1_dr1,1,ok,62.06,71.34,
-mosek,mlp1_dr1,1,timeout,180.0,,SIGTERM after 60s + 120s grace
-cpsat,mlp2_dr1,2,not_run,,,deferred — mosek already diverges at cap=1
-mosek,mlp2_dr1,2,not_run,,,deferred — mosek already diverges at cap=1
-cpsat,mlp4_dr2,4,not_run,,,deferred — see headline policy sweep (cpsat returns 111.2 ms / 60 s)
-mosek,mlp4_dr2,4,timeout,180.0,,deferred — already observed to hang 3+ min on headline
-cpsat,mlp8_dr4,8,not_run,,,deferred — would just amplify findings above
-mosek,mlp8_dr4,8,not_run,,,deferred — would just amplify findings above
+cpsat,mlp1_dr1,1,ok,61.97,269.81,
+mosek,mlp1_dr1,1,timeout,180.0,,
+cpsat,mlp2_dr1,2,ok,62.06,288.63,
+mosek,mlp2_dr1,2,timeout,180.0,,
+cpsat,mlp4_dr2,4,ok,62.11,244.78,
+mosek,mlp4_dr2,4,timeout,180.0,,
+cpsat,mlp8_dr4,8,ok,62.79,251.3,
+mosek,mlp8_dr4,8,timeout,180.0,,
