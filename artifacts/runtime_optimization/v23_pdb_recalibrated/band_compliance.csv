@@ -1,0 +1,6 @@
+solver,workload,n_ops,n_release_violations,n_deadline_violations,worst_release_overrun_us,worst_deadline_overrun_us,n_networks_with_misses,makespan_us,solve_wall_s,status
+cpsat,networks_1yolo_4mlp_2dronet_firesim,207,0,65,0.0,141.137,2,186.735133,0.0,reused
+decomposed,networks_1yolo_4mlp_2dronet_firesim,832,0,0,0.0,0.0,0,516.4651650000004,0.0,reused
+greedy_periodic,networks_1yolo_4mlp_2dronet_firesim,236,0,67,0.0,31.885,2,61.19647900000001,0.0,reused
+heft,networks_1yolo_4mlp_2dronet_firesim,245,0,88,0.0,44.424,2,54.429872,0.0,reused
+critical_path,networks_1yolo_4mlp_2dronet_firesim,234,0,88,0.0,106.691,2,116.78462599999997,0.0,reused
