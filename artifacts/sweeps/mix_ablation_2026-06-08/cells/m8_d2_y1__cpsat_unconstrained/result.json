@@ -1,0 +1,20 @@
+{
+  "policy": "cpsat_unconstrained",
+  "status": "ok",
+  "solve_wall_s": 62.399,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_workload_cpsat_profiled.json",
+  "makespan": 220.41995899999992,
+  "n_deadline_miss": 83,
+  "n_release_viol": 0,
+  "n_dispatches": 217,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "use_underlying",
+      "scheduler": "cpsat",
+      "reason": "exact solver, no pre-applied structure",
+      "delta": null
+    }
+  ]
+}

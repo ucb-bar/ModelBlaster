@@ -1,0 +1,18 @@
+{
+  "policy": "critical_path_first",
+  "status": "ok",
+  "solve_wall_s": 1.847,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_workload_heft_profiled.json",
+  "makespan": 133.854643,
+  "n_deadline_miss": 74,
+  "n_release_viol": 0,
+  "n_dispatches": 233,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "CP-first global ordering via heft upward_rank"
+    }
+  ]
+}

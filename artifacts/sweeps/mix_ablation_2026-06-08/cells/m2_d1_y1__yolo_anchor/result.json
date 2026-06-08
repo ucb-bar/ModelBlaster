@@ -1,0 +1,18 @@
+{
+  "policy": "yolo_anchor",
+  "status": "ok",
+  "solve_wall_s": 24.856,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_workload_greedy_periodic_profiled.json",
+  "makespan": 202.721186,
+  "n_deadline_miss": 189,
+  "n_release_viol": 0,
+  "n_dispatches": 353,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "anchor on heaviest aperiodic (yolov8) via greedy_periodic"
+    }
+  ]
+}

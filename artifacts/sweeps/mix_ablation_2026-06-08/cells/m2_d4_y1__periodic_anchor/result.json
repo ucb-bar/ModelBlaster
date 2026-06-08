@@ -1,0 +1,18 @@
+{
+  "policy": "periodic_anchor",
+  "status": "ok",
+  "solve_wall_s": 52.836,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_workload_decomposed_profiled.json",
+  "makespan": 536.4651649999998,
+  "n_deadline_miss": 0,
+  "n_release_viol": 0,
+  "n_dispatches": 866,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "reserve periodic slots first via decomposed solver"
+    }
+  ]
+}
