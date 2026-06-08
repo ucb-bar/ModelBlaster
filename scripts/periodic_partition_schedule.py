@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import pathlib
 import sys
 import time
@@ -40,7 +41,8 @@ from collections import defaultdict
 from typing import Any
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-XPURT = pathlib.Path("/scratch2/agustin/XPU-RT/xpu-rt")
+# XPU-RT is a sibling checkout next to this repo (../XPU-RT); override via XPURT_ROOT.
+XPURT = pathlib.Path(os.environ.get("XPURT_ROOT", str(REPO.parent / "XPU-RT"))) / "xpu-rt"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(XPURT))
 
