@@ -84,3 +84,11 @@ if(DEFINED MODELBLASTER_KERNEL_CFLAGS AND NOT "${MODELBLASTER_KERNEL_CFLAGS}" ST
     )
     message(STATUS "modelblaster harness kernel cflags=${MODELBLASTER_KERNEL_CFLAGS}")
 endif()
+
+# Opt-in: TACIT / L-Trace of just the model inference (brackets run_model with
+# the encoder start/stop). Pass -DMB_TACIT_TRACE_MODEL=1 and run on the
+# TACIT-enabled spike with `--trace=l`. See samples/tacit/TACIT_TRACING.md.
+if(MB_TACIT_TRACE_MODEL)
+    target_compile_definitions(app PRIVATE MB_TACIT_TRACE_MODEL=1)
+    message(STATUS "modelblaster harness: TACIT model tracing enabled")
+endif()
