@@ -329,11 +329,24 @@ fi
 if [[ "${CMODEL_LARGE:-0}" == "1" ]]; then
     WEST_BUILD_EXTRA+=(-DCONFIG_RISCV_CMODEL_LARGE=y)
 fi
+# MB_NO_BIGIO_REORDER=1 keeps the baked io in .rodata even under CMODEL_LARGE
+# (harness places it above .bss by default). Mainly to A/B the reorder.
+if [[ "${MB_NO_BIGIO_REORDER:-0}" == "1" ]]; then
+    WEST_BUILD_EXTRA+=(-DMB_NO_BIGIO_REORDER=1)
+fi
 _mb_stage_begin build
 west build -p -b "${BOARD_TARGET}" harness \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 _mb_stage_end build
+
+# BUILD_ONLY=1 stops after the west build (link) and skips the run+compare.
+# Used to A/B link-time behaviour (e.g. medany R_RISCV_PCREL_HI20 truncation
+# vs CMODEL_LARGE) without needing a target that can actually hold/run the io.
+if [[ "${BUILD_ONLY:-0}" == "1" ]]; then
+    echo "[build-only] link done -> ${BUILD_DIR}/zephyr/zephyr.elf"
+    exit 0
+fi
 
 echo "[5/5] ${RUNNER} + compare"
 _mb_stage_begin run
