@@ -222,6 +222,13 @@ class _ExportWalker:
         # modelblaster/notes/mixed_precision_plan.md.
         if quant not in ("int8", "fp16"):
             raise ValueError(f"quant must be 'int8' or 'fp16' (got {quant!r})")
+        # Pass-fire counters. Incremented from inside the walker each
+        # time a fold pattern actually matches; the final main() writes
+        # these out as passes_applied.json next to graph.json.
+        self.fold_counts: dict[str, list[str]] = {
+            "bn_fold_into_conv2d": [],
+            "pad_fold_into_conv2d": [],
+        }
         self.default_quant = quant
         # node_name → "int8" | "fp16" override for this op.
         self.op_precision: dict[str, str] = dict(op_precision or {})
@@ -1021,6 +1028,7 @@ class _ExportWalker:
         bn_user = self._find_bn_user(n)
         if bn_user is not None:
             w, b, post_name = self._fold_batchnorm(w, b, bn_user)
+            self.fold_counts["bn_fold_into_conv2d"].append(bn_user.name)
         else:
             post_name = n.name
 
@@ -1040,12 +1048,15 @@ class _ExportWalker:
             all_zero = all(int(x) == 0 for x in pads) if pads else True
             if all_zero:
                 in_name = self._resolve_input(pad_node.args[0])
+                self.fold_counts["pad_fold_into_conv2d"].append(pad_node.name)
             elif symmetric:
                 padding = (padding[0] + int(pads[2]), padding[1] + int(pads[0]))
                 in_name = self._resolve_input(pad_node.args[0])
+                self.fold_counts["pad_fold_into_conv2d"].append(pad_node.name)
             else:
                 # Asymmetric pad: emit it as its own op (pad_s8) and
                 # consume that record's output as this conv's input.
+                # Not a fold; nothing to log.
                 self._emit_pad(pad_node)
                 in_name = self._resolve_input(pad_node)
 
@@ -1842,6 +1853,8 @@ def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
 def _import_model_module(name: str):
     if name == "vint":
         from modelblaster.models import vint as model_mod
+    elif name == "smolvla":
+        from modelblaster.models import smolvla as model_mod
     else:
         raise SystemExit(
             f"--model {name} doesn't need extract_graph_export; "
@@ -1860,7 +1873,7 @@ def _load_model(name: str):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True, choices=["vint"])
+    p.add_argument("--model", required=True, choices=["vint", "smolvla"])
     p.add_argument("--quant", default="int8", choices=["fp32", "int8", "fp16"])
     p.add_argument("--out-dir", required=True)
     p.add_argument("--inventory-only", action="store_true",
@@ -1928,7 +1941,7 @@ def main():
     # Multi-sample calibration. The model module declares a
     # *calibration spec* (the canonical, reproducible source-of-truth
     # for where activation scales come from). The spec gets resolved
-    # via modelblaster.datasets.materialize_calibration_samples and
+    # via modelblaster.mb_datasets.materialize_calibration_samples and
     # serialized into the generated/ dir for later reference. If the
     # model doesn't ship a spec yet, fall back to its
     # get_calibration_samples helper, then finally the single trace
@@ -1941,7 +1954,7 @@ def main():
     mod = _import_model_module(args.model)
     if args.num_calibration > 1:
         if hasattr(mod, "get_calibration_spec"):
-            from modelblaster.datasets import materialize_calibration_samples  # noqa: PLC0415
+            from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             calib_spec = mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_export] resolving calibration spec "
                   f"({args.num_calibration} samples) ...", flush=True)
@@ -2138,6 +2151,26 @@ def main():
           f"({len(walker.ops)} op records, "
           f"{sum(1 for o in walker.ops if o.get('_pending_kernel'))} pending kernels)",
           flush=True)
+
+    # passes_applied.json -- per-pass counters captured by the walker
+    # during the IR build. Mirror shape of extract_graph.py's output so
+    # the harness's passes_applied extractor reads either source the
+    # same way.
+    passes_path = out_dir / "passes_applied.json"
+    passes_log = {
+        "schema_version": 1,
+        "extractor": "extract_graph_export",
+        "n_aten_nodes": len(list(walker.gm.graph.nodes)),
+        "n_ir_ops": len(walker.ops),
+        "passes": {
+            name: {"fired": len(sites), "sites": sorted(sites)}
+            for name, sites in walker.fold_counts.items()
+        },
+    }
+    with open(passes_path, "w") as f:
+        json.dump(passes_log, f, indent=2)
+    summary = ", ".join(f"{k}={v['fired']}" for k, v in passes_log["passes"].items())
+    print(f"[extract_export] wrote {passes_path}  ({summary})", flush=True)
 
     weights_path = out_dir / "weights.npz"
     np.savez(weights_path, **walker.weights_blob)

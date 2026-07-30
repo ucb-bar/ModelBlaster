@@ -1,0 +1,28 @@
+{
+  "system": "chipyard-GemminiAndOPUShuttleConfig",
+  "description": "Two-tile heterogeneous Chipyard SoC with one Shuttle+Gemmini-RoCC tile and one Shuttle+Saturn-OPU vector tile. Matches chipyard.HeteroConfigs.GemminiAndOPUShuttleConfig (tile 0 = Shuttle + Gemmini RoCC; tile 1 = Shuttle + Saturn OPU vector unit, vLen=128). XPU-RT pins each dispatch to a specific tile via the schedule's hardware_target string; the runtime maps each (kind, hart) pair to its own worker queue.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "gemmini0",
+      "kind": "gemmini",
+      "isa": "rv64imafdc",
+      "harts": [0],
+      "description": "Shuttle scalar + Gemmini int8 RoCC (DIM=16, f32 acc_scale). Int8 matmul + conv-as-im2col-tiled-matmul; everything else falls back to scalar on the same hart.",
+      "capabilities": ["linear_s8", "conv2d_s8", "scalar_fallback"]
+    },
+    {
+      "name": "opu0",
+      "kind": "rvv_opu",
+      "isa": "rv64gcv",
+      "varch": "vlen:128,elen:64",
+      "harts": [1],
+      "description": "Shuttle + Saturn OPU vector unit. RVV plus the four Saturn custom OP-V instructions (VOPACC, OPMVINBCAST, VMV_RV, VMV_VR). Int8 outer-product matmul + conv-as-indirect-GEMM are first-class; standard RVV ops also run here.",
+      "capabilities": ["linear_s8", "conv2d_s8", "matmul_s8", "rvv_baseline"]
+    }
+  ],
+  "notes": [
+    "FireSim bitstream for this exact 2-tile topology is not yet built; spike via the merlin/tools/spike-hetero wrapper is the functional simulator today. spike-hetero loads both Gemmini and Saturn OPU extensions into one binary so a 2-hart ELF can decode RoCC custom-3 and OP-V instructions side-by-side.",
+    "spike-hetero is functional-only — both extensions execute atomically with no microarchitectural pipeline model. Cycle counts from spike on this target are NOT authoritative; use FireSim once the matching bitstream lands."
+  ]
+}

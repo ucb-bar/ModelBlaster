@@ -1,0 +1,4 @@
+dispatch_id,name,op,shape,cycles
+0,fc1,linear_s8,M=1;K=16;N=32,4952
+1,fc2,linear_s8,M=1;K=32;N=32,9050
+2,fc3,linear_s8,M=1;K=32;N=10,3235

@@ -44,12 +44,29 @@ if [[ "${QUANT}" == "fp16" ]]; then
     GEN_TARGET="${TARGET}_f16"
 fi
 
-EXAMPLE_DIR_REL="modelblaster/examples/${MODEL_NAME}"
+EXAMPLE_DIR_REL="examples/${MODEL_NAME}"
 EXAMPLE_DIR="${REPO_ROOT}/${EXAMPLE_DIR_REL}"
 
 cd "${REPO_ROOT}"
 # Avoid the stale Vitis cmake on PATH (it's 3.3.2 and breaks west).
 export PATH="/usr/bin:${PATH}"
+
+# Per-stage timing markers. The benchmark harness's arm driver parses
+# MODELBLASTER_STAGE_END:<name>:<seconds> lines out of stdout into
+# stage_timings.json so the dashboard can show where wall-clock
+# actually went (extract / skeleton / kernels / build / run).
+_MB_STAGE_T=0
+_mb_stage_begin() {
+    _MB_STAGE_T="$(date +%s.%N)"
+    echo "MODELBLASTER_STAGE_BEGIN:$1"
+}
+_mb_stage_end() {
+    local end="$(date +%s.%N)"
+    local delta
+    delta=$(awk -v a="${_MB_STAGE_T}" -v b="${end}" \
+            'BEGIN{printf "%.3f", b-a}')
+    echo "MODELBLASTER_STAGE_END:$1:${delta}"
+}
 
 IR_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 GEN_DIR="${IR_DIR}/${TARGET}"
@@ -71,6 +88,7 @@ CACHE_DIR="${EXAMPLE_DIR}/${QUANT}/cache/${TARGET}"
 mkdir -p "${GEN_DIR}" "${BUILD_DIR%/*}" "${CACHE_DIR}"
 
 echo "[1/5] extract_graph (quant=${QUANT}) -> ${IR_DIR}"
+_mb_stage_begin extract
 # Skip the PyTorch extract pass when the IR is already on disk. Useful
 # when (a) the active env lacks the model's PyTorch deps (set up the IR
 # in a different env first), or (b) iterating on later stages without
@@ -84,6 +102,7 @@ else
         --quant "${QUANT}" \
         --num-calibration "${NUM_CALIBRATION:-1}"
 fi
+_mb_stage_end extract
 
 # Post-extract auto-promote: if the IR contains any fp16 ops (mixed
 # precision via get_precision_spec) and we haven't already promoted via
@@ -111,12 +130,14 @@ print('1' if any('f16' in n['op'] for n in g.get('ops', [])) else '0')
 fi
 
 echo "[2/5] generate_skeleton (backend=${GEN_TARGET}) -> ${GEN_DIR}"
+_mb_stage_begin generate_skeleton
 python -m modelblaster.pipeline.generate_skeleton \
     --ir "${IR_DIR}/graph.json" \
     --weights "${IR_DIR}/weights.npz" \
     --io "${IR_DIR}/io.npz" \
     --out-dir "${GEN_DIR}" \
     --backend "${GEN_TARGET}"
+_mb_stage_end generate_skeleton
 
 echo "[3/5] generate_kernels (backend=${BACKEND} target=${GEN_TARGET} quant=${QUANT} optimize=${OPTIMIZE}) -> ${GEN_DIR}"
 GEN_KERNELS_ARGS=(
@@ -128,7 +149,7 @@ GEN_KERNELS_ARGS=(
     --io "${IR_DIR}/io.npz"
     --repo-root "${REPO_ROOT}"
     --build-dir "${VERIFY_BUILD_DIR}"
-    --harness-dir "modelblaster/harness"
+    --harness-dir "harness"
     --cache-dir "${CACHE_DIR}"
     --algorithms "${ALGORITHMS:-all}"
 )
@@ -169,7 +190,9 @@ if [[ "${OPTIMIZE}" == "1" ]]; then
         GEN_KERNELS_ARGS+=(--cache-aware-prompt)
     fi
 fi
+_mb_stage_begin generate_kernels
 python -m modelblaster.pipeline.generate_kernels "${GEN_KERNELS_ARGS[@]}"
+_mb_stage_end generate_kernels
 
 # RUNNER selects the simulator behind stages 4-5: spike (default; in-process
 # spike subprocess) or firesim (build for chipyard_riscv64, copy elf into
@@ -217,25 +240,28 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # hart counts so MP_MAX_NUM_CPUS must match. Override via
     # FIRESIM_CONF env if running a different config.
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/${FIRESIM_CONF}"
+        FS_CONF="${REPO_ROOT}/harness/backends/${FIRESIM_CONF}"
     elif [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" ]]; then
         # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants ride
         # the same dual-rocket-saturn-gemmini SoC topology, so the same
         # Zephyr SMP overlay applies. The runtime bitstream is selected
         # via config_runtime.yaml::default_hw_config.
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard_dual_gemmini.conf"
+        FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
-        FS_CONF="${REPO_ROOT}/modelblaster/harness/backends/firesim_chipyard.conf"
+        FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard.conf"
     fi
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
     )
 fi
-west build -p -b "${BOARD_TARGET}" modelblaster/harness \
+_mb_stage_begin build
+west build -p -b "${BOARD_TARGET}" harness \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
+_mb_stage_end build
 
 echo "[5/5] ${RUNNER} + compare"
+_mb_stage_begin run
 
 # Optional IREE-shape per-dispatch profile (PROFILE_OUT_ROOT env).
 PROFILE_FLAGS=()
@@ -340,3 +366,4 @@ else
         "${FIRESIM_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
 fi
+_mb_stage_end run

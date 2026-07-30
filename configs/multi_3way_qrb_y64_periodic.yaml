@@ -1,0 +1,27 @@
+# Periodic variant of multi_3way_qrb_y64.yaml — each instance bound to
+# its periodic time slice in the 75 ms horizon:
+#   - yolov8_nano_64 (1 instance) → 75 ms → 13.3 Hz
+#   - dronet (2 instances) → 37.5 ms each → 26.7 Hz
+#   - mlp_control (4 instances) → 18.75 ms each → 53.3 Hz
+#
+# HEFT respects start windows; instances may finish past their slot.
+# MOSEK fails on the qrb_y64 periodic formulation (300 ops × per-instance
+# bounds → solver-side numerical issue, not infeasibility).
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: opu0,     kind: CPU_E, hart: 1 }
+requantize_ops: [conv2d_s8, linear_s8]
+networks:
+  - { name: yolov8_nano_64, quant: int8, instances: 1 }
+  - { name: dronet,         quant: int8, instances: 2 }
+  - { name: mlp_control,    quant: int8, instances: 4 }
+horizon_ms: 75.0
+enforce_periodic: true
+solver: HEFT
+time_limit_s: 0
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000

@@ -1,0 +1,252 @@
+{
+  "version": 1,
+  "source_runs": [
+    "3way_baseline/20260529T140609Z",
+    "3way_camera-30hz/20260529T185719Z",
+    "3way_conservative/20260529T143037Z",
+    "3way_heft_dronet2_mlp4/20260529T210526Z",
+    "3way_heft_dronet2_mlp4/20260529T221535Z",
+    "3way_heft_qrb/20260529T214947Z",
+    "3way_imu-only-hi/20260529T204136Z"
+  ],
+  "multipliers": {
+    "dronet|add_s8|gemmini": {
+      "n_samples": 6,
+      "median": 1.025,
+      "mean": 1.019,
+      "p90": 1.029,
+      "max": 1.03
+    },
+    "dronet|add_s8|rvv_opu": {
+      "n_samples": 63,
+      "median": 1.004,
+      "mean": 1.004,
+      "p90": 1.01,
+      "max": 1.01
+    },
+    "dronet|batchnorm2d_s8|gemmini": {
+      "n_samples": 14,
+      "median": 1.0,
+      "mean": 1.001,
+      "p90": 1.01,
+      "max": 1.018
+    },
+    "dronet|batchnorm2d_s8|rvv_opu": {
+      "n_samples": 124,
+      "median": 1.006,
+      "mean": 1.006,
+      "p90": 1.019,
+      "max": 1.022
+    },
+    "dronet|conv2d_s8|gemmini": {
+      "n_samples": 230,
+      "median": 89.529,
+      "mean": 232.235,
+      "p90": 507.926,
+      "max": 901.857
+    },
+    "dronet|linear_s8|gemmini": {
+      "n_samples": 46,
+      "median": 1.018,
+      "mean": 1.01,
+      "p90": 1.064,
+      "max": 1.086
+    },
+    "dronet|maxpool2d_s8|rvv_opu": {
+      "n_samples": 23,
+      "median": 0.857,
+      "mean": 0.87,
+      "p90": 0.877,
+      "max": 1.012
+    },
+    "dronet|relu_s8|gemmini": {
+      "n_samples": 14,
+      "median": 1.011,
+      "mean": 1.002,
+      "p90": 1.018,
+      "max": 1.045
+    },
+    "dronet|relu_s8|rvv_opu": {
+      "n_samples": 147,
+      "median": 1.014,
+      "mean": 1.024,
+      "p90": 1.049,
+      "max": 1.164
+    },
+    "dronet|sigmoid_s8|rvv_opu": {
+      "n_samples": 23,
+      "median": 1.224,
+      "mean": 0.866,
+      "p90": 1.224,
+      "max": 1.224
+    },
+    "mlp_control|elu|rvv_opu": {
+      "n_samples": 714,
+      "median": 1.0,
+      "mean": 1.002,
+      "p90": 1.04,
+      "max": 1.08
+    },
+    "mlp_control|elu_s8|gemmini": {
+      "n_samples": 6,
+      "median": 0.967,
+      "mean": 0.973,
+      "p90": 0.989,
+      "max": 1.005
+    },
+    "mlp_control|elu_s8|rvv_opu": {
+      "n_samples": 18,
+      "median": 1.016,
+      "mean": 1.019,
+      "p90": 1.047,
+      "max": 1.108
+    },
+    "mlp_control|linear|gemmini": {
+      "n_samples": 952,
+      "median": 1.083,
+      "mean": 1.173,
+      "p90": 1.5,
+      "max": 2.0
+    },
+    "mlp_control|linear_s8|gemmini": {
+      "n_samples": 32,
+      "median": 0.93,
+      "mean": 0.945,
+      "p90": 1.065,
+      "max": 1.428
+    },
+    "yolov8_nano|add_s8|gemmini": {
+      "n_samples": 1,
+      "median": 0.977,
+      "mean": 0.977,
+      "p90": 0.977,
+      "max": 0.977
+    },
+    "yolov8_nano|add_s8|rvv_opu": {
+      "n_samples": 35,
+      "median": 0.978,
+      "mean": 0.981,
+      "p90": 0.999,
+      "max": 1.003
+    },
+    "yolov8_nano|batchnorm2d_s8|gemmini": {
+      "n_samples": 44,
+      "median": 1.006,
+      "mean": 1.006,
+      "p90": 1.012,
+      "max": 1.023
+    },
+    "yolov8_nano|batchnorm2d_s8|rvv_opu": {
+      "n_samples": 298,
+      "median": 1.013,
+      "mean": 1.011,
+      "p90": 1.02,
+      "max": 1.028
+    },
+    "yolov8_nano|cat2_c1_s8|gemmini": {
+      "n_samples": 5,
+      "median": 1.001,
+      "mean": 1.001,
+      "p90": 1.002,
+      "max": 1.002
+    },
+    "yolov8_nano|cat2_c1_s8|rvv_opu": {
+      "n_samples": 37,
+      "median": 1.028,
+      "mean": 1.028,
+      "p90": 1.032,
+      "max": 1.042
+    },
+    "yolov8_nano|cat3_c1_s8|gemmini": {
+      "n_samples": 4,
+      "median": 1.056,
+      "mean": 1.053,
+      "p90": 1.063,
+      "max": 1.069
+    },
+    "yolov8_nano|cat3_c1_s8|rvv_opu": {
+      "n_samples": 32,
+      "median": 1.001,
+      "mean": 1.004,
+      "p90": 1.013,
+      "max": 1.037
+    },
+    "yolov8_nano|cat4_c1_s8|gemmini": {
+      "n_samples": 3,
+      "median": 0.999,
+      "mean": 0.999,
+      "p90": 0.999,
+      "max": 1.0
+    },
+    "yolov8_nano|cat4_c1_s8|rvv_opu": {
+      "n_samples": 15,
+      "median": 1.026,
+      "mean": 1.027,
+      "p90": 1.027,
+      "max": 1.03
+    },
+    "yolov8_nano|chunk2_c1|gemmini": {
+      "n_samples": 7,
+      "median": 0.0,
+      "mean": 0.0,
+      "p90": 0.0,
+      "max": 0.0
+    },
+    "yolov8_nano|chunk2_c1|rvv_opu": {
+      "n_samples": 41,
+      "median": 0.0,
+      "mean": 0.0,
+      "p90": 0.0,
+      "max": 0.0
+    },
+    "yolov8_nano|conv2d_s8|gemmini": {
+      "n_samples": 378,
+      "median": 372.311,
+      "mean": 359.798,
+      "p90": 851.579,
+      "max": 994.811
+    },
+    "yolov8_nano|maxpool2d_s8|gemmini": {
+      "n_samples": 3,
+      "median": 0.998,
+      "mean": 0.997,
+      "p90": 0.998,
+      "max": 0.999
+    },
+    "yolov8_nano|maxpool2d_s8|rvv_opu": {
+      "n_samples": 15,
+      "median": 1.04,
+      "mean": 1.025,
+      "p90": 1.043,
+      "max": 1.043
+    },
+    "yolov8_nano|silu_s8|gemmini": {
+      "n_samples": 39,
+      "median": 1.003,
+      "mean": 1.003,
+      "p90": 1.004,
+      "max": 1.006
+    },
+    "yolov8_nano|silu_s8|rvv_opu": {
+      "n_samples": 303,
+      "median": 1.002,
+      "mean": 1.002,
+      "p90": 1.005,
+      "max": 1.016
+    },
+    "yolov8_nano|upsample_nearest_s8|gemmini": {
+      "n_samples": 2,
+      "median": 1.003,
+      "mean": 1.003,
+      "p90": 1.002,
+      "max": 1.003
+    },
+    "yolov8_nano|upsample_nearest_s8|rvv_opu": {
+      "n_samples": 10,
+      "median": 1.0,
+      "mean": 1.001,
+      "p90": 1.003,
+      "max": 1.004
+    }
+  }
+}
