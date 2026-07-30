@@ -218,6 +218,14 @@ _mb_stage_begin generate_kernels
 python -m modelblaster.pipeline.generate_kernels "${GEN_KERNELS_ARGS[@]}"
 _mb_stage_end generate_kernels
 
+# STAGE_ONLY=1 stops after codegen (extract/skeleton/kernels), skipping the
+# build+run — used by the multi-model wrapper to stage each bench's
+# generated/<target>/ dir before fusing them into one ELF.
+if [[ "${STAGE_ONLY:-0}" == "1" ]]; then
+    echo "[stage-only] generated -> ${GEN_DIR}"
+    return 0 2>/dev/null || exit 0
+fi
+
 # RUNNER selects the simulator behind stages 4-5: spike (default; in-process
 # spike subprocess) or firesim (build for chipyard_riscv64, copy elf into
 # the FireSim sim slot, runworkload, tail uartlog). The build (4/5) and

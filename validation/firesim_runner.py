@@ -662,6 +662,10 @@ def main() -> int:
                          "--models. Overrides --quant for golden-path "
                          "resolution when running mixed-quant binaries.")
     ap.add_argument("--repo-root", default=None)
+    ap.add_argument("--io-paths", default=None,
+                    help="multi-model golden override: comma list of "
+                         "NAME=/abs/io.npz (e.g. flat kernelbench tags whose "
+                         "data lives under examples/kernelbench/<NAME>/).")
     ap.add_argument("--atol", type=float, default=None)
     ap.add_argument("--rtol", type=float, default=None)
     ap.add_argument("--timeout", type=float, default=600.0,
@@ -705,6 +709,16 @@ def main() -> int:
                          "runner to walk [<model>@p<N>] tags and emit "
                          "per-(model, pool) profiles under topo_<cores>.")
     args = ap.parse_args()
+
+    io_paths = None
+    if getattr(args, "io_paths", None):
+        io_paths = {}
+        for spec in args.io_paths.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            k, _, v = spec.partition("=")
+            io_paths[k.strip()] = v.strip()
 
     if not args.models and not args.io:
         ap.error("must pass either --io (single-model) or --models (multi)")
@@ -780,6 +794,7 @@ def main() -> int:
             iree_args=iree_args,
             backend_tag=args.profile_backend,
             repo_root=repo_root,
+            io_paths=io_paths,
         )
     return 0 if ok else 1
 
