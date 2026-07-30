@@ -16,6 +16,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
 
@@ -130,6 +131,12 @@ int main(void)
      * per-op rdcycle deltas above are used for relative comparisons. */
     printf("=== MODELBLASTER_WALL_CYCLES === %lu\n", model_wall_cycles());
 
+#ifdef CONFIG_ARCH_POSIX
+    /* native_sim: no HTIF/reboot — terminate the host process cleanly so the
+     * native runner gets a clean exit (stdout already flushed above). */
+    exit(0);
+#else
     sys_reboot(SYS_REBOOT_COLD);
+#endif
     return 0;
 }
