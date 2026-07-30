@@ -1827,7 +1827,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                          + input_offset;
                                 }
 #if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
-                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -1948,7 +1948,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                 }
 
 #if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
-                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -2982,7 +2982,7 @@ void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight,
                                     ? input_offset
                                     : (int32_t)input[(in_row_base + ih) * IW + iw] + input_offset;
 #if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
-                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
