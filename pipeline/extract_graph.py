@@ -2623,17 +2623,20 @@ def _load_kernelbench(bench_path: str,
     `__init__(*init_args)` + `forward(x)`, module-level shape constants, and
     `get_inputs()` / `get_init_inputs()`.
 
-    Returns (model, sample_input, name); name is a C-friendly `kb_<basename>`.
+    Returns (model, sample_input, name); `sample_input` is a bare tensor for
+    single-input forwards or a list of tensors for multi-input ones (matmul
+    A,B; bmm). name is a C-friendly `kb_<basename>`.
 
-    `max_elements` caps the input tensor size — KernelBench level1 defaults are
-    sized for GPU memory (batch=16, 256x256 spatial) and overflow Zephyr's
-    256 MB RAM region when baked into rodata. When set, we shrink integer
-    module-level shape attrs by halving the largest until the input fits, then
-    re-instantiate, so the PyTorch golden corresponds to the shrunken shape.
+    `max_elements` caps the *total* input element count across all forward
+    inputs — KernelBench level1 defaults are sized for GPU memory (batch=16,
+    256x256 spatial) and overflow Zephyr's 256 MB RAM region when baked into
+    rodata. When set, we shrink integer module-level shape attrs by halving the
+    largest until the inputs fit, then re-instantiate, so the PyTorch golden
+    corresponds to the shrunken shape.
 
-    Multi-input forwards (matmul A,B; loss preds+targets) raise
-    NotImplementedError — a structural extension for a later phase. See
-    modelblaster/notes/kernelbench_rvv_port_plan.md.
+    Multi-input forwards are threaded through extract()'s packed_inputs path.
+    Loss-style benches (preds+targets → scalar) load but fail later at the
+    unsupported loss op. See modelblaster/notes/kernelbench_rvv_port_plan.md.
     """
     import importlib.util
     if not os.path.isfile(bench_path):
@@ -2655,9 +2658,11 @@ def _load_kernelbench(bench_path: str,
                 and not k.startswith("_")
                 and k not in SHAPE_ATTRS_BLOCKLIST}
         for _ in range(64):
-            sample = mod.get_inputs()[0]
-            n = int(np.prod(sample.shape))
-            if n <= max_elements:
+            # Cap the TOTAL element count across all forward inputs (matmul
+            # A+B, bmm, etc.), not just the first — the second operand can
+            # dwarf the first.
+            total = sum(int(np.prod(t.shape)) for t in mod.get_inputs())
+            if total <= max_elements:
                 break
             if not ints:
                 break
@@ -2674,18 +2679,17 @@ def _load_kernelbench(bench_path: str,
     inputs = mod.get_inputs()
     if not isinstance(inputs, list) or not inputs:
         raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
-    if len(inputs) != 1:
-        raise NotImplementedError(
-            f"{bench_path} forward() takes {len(inputs)} tensors; the pipeline "
-            f"currently supports single-input forward only. Multi-input support "
-            f"(matmul, losses) is a separate extension -- see "
-            f"modelblaster/notes/kernelbench_rvv_port_plan.md.")
     base = os.path.splitext(os.path.basename(bench_path))[0]
     name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
                            for ch in base).strip("_")
     while "__" in name:
         name = name.replace("__", "_")
-    return model, inputs[0], name
+    # Single-input → return the bare tensor (legacy path). Multi-input
+    # (matmul A+B, bmm) → return the list; extract() threads it through as
+    # packed_inputs / a flat io.npz buffer. Loss-style multi-input benches
+    # (preds+targets → scalar) still load here but fail later at the
+    # unsupported loss op, with a clear per-op error.
+    return model, (inputs[0] if len(inputs) == 1 else inputs), name
 
 
 def main() -> None:
