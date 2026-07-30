@@ -19,16 +19,23 @@ following the existing `_s8`/`_f16` variants. All verified on spike.
 - **layer_norm** — `nn.LayerNorm`; K = prod(normalized_shape), M = leading;
   gamma/beta flattened to K (ones/zeros when affine off).
 
-## Corpus status
-Extractable level1 benches: **34 → 51 / 100** (this batch +4, matmul family
-+13 net counting 10_3D which extracts but fails verification). Full-suite run:
-**50 / 51 PASS** on RVV/spike fp32 (`results/rvv_fp32.md`).
+This was the first of several op batches. Later batches added: group_norm +
+rms_norm (34/35/36), conv_transpose2d (7 benches), and 1D conv/pool (6 benches)
+— see notes/kernelbench_rvv_port_plan.md Phase 3.5.
 
-`10_3D_tensor_matrix_multiplication` extracts but fails verification
-(max_abs_err=22): it's a 3D×2D broadcast matmul that the plain `matmul` op
-computes incorrectly — needs a batched-broadcast matmul handler (deferred).
+## Corpus status (final, 2026-07-30)
+Extractable level1 benches: **34 → 67 / 100**. Full-suite spike run:
+**66 / 67 PASS** on RVV/spike fp32 (`results/rvv_fp32.md`).
 
-## Remaining not-extractable (49) — next targets
-Conv1d/Conv3d, ConvTranspose{1,2,3}d (large family, ~20 benches), InstanceNorm2d,
-GroupNorm, RMSNorm, AvgPool1d/3d, MaxPool1d/3d, cumsum/cumprod, diag/triu/tril/
-einsum, abs (L1Norm compound), pow, and the loss family (94–100, out of scope).
+Only `10_3D_tensor_matrix_multiplication` fails (max_abs_err=22): a 3D×2D
+broadcast matmul the plain `matmul` op computes wrong — needs a
+batched-broadcast handler (deferred).
+
+## Remaining not-extractable (33) — next targets
+- **3D conv/pool (13)** — Conv3d ×4, ConvTranspose3d ×7, MaxPool3d, AvgPool3d
+  (need 5D-tensor kernels; the largest coherent next batch).
+- **Losses (7)** — CrossEntropy/MSE/Huber/KLDiv/Hinge/TripletMargin (scalar
+  output, out of scope).
+- **Cumulative (5)** — cumsum/cumprod/flip/select.
+- **Matmul variants (4)** — diag/triu/tril/einsum.
+- **Misc** — abs (L1Norm 38), dilated conv2d (76/80), SDPA (97, hardcodes cuda).

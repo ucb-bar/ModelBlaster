@@ -81,17 +81,32 @@ KernelBench models are **fp32**; the curated RVV kernels here are all **int8
    on firesim). Env pinned to this working copy via scratch `mbenv.sh`;
    `_run_lib.sh` exports `PYTHONPATH=<parent>` for the submodule layout.
 
-### Phase 3.5 — extend op coverage (2026-07-29, in progress)
-Beyond the first 34 single-input benches, extending the loader + op set:
+### Phase 3.5 — extend op coverage (2026-07-30) — 67/100 extractable, 66 PASS
+Beyond the first 34 single-input benches, extended the loader + op set.
+Final full-suite spike run: **66 / 67 PASS** (only 10_3D fails — a 3D×2D
+broadcast matmul the plain matmul op computes wrong).
+
+Commits (in order):
 - **Matmul family** (`babc532`): relaxed `_load_kernelbench` to return
   multi-input `forward(A,B)`; extract()'s `packed_inputs` path already handled
-  it. 12/18 matmul benches PASS (matmul, matmul_ta/tb/tatb, bmm). Remaining 6
-  need `diag`/`triu`/`tril`/`einsum` handlers or scalar-broadcast.
-- **fp32 softmax / log_softmax / avgpool2d / layer_norm** (new KernelSpecs +
-  extract handlers + skeleton emission): unlocks benches 23, 24, 45, 40.
-- Extractable corpus: **34 → 51 / 100**.
-- Still out: Conv1d/3d, ConvTranspose{1,2,3}d (large family), Instance/Group/
-  RMSNorm, AvgPool1d/3d, MaxPool1d/3d, cumsum/cumprod, losses.
+  it. 12/18 matmul benches PASS (matmul, matmul_ta/tb/tatb, bmm).
+- **softmax / log_softmax / avgpool2d / layer_norm** (`926a9d2`): unlocks 23,
+  24, 45, 40.
+- **group_norm + rms_norm** (`8325630`): one group_norm kernel covers
+  nn.GroupNorm and nn.InstanceNorm2d (G==C); rms_norm via compound-fusion
+  matcher. Unlocks 34, 35, 36.
+- **conv_transpose2d** (`243bd35`): general gather form (stride/pad/
+  output_pad/groups/dilation), IHWO-aware weight. 7/7 ConvTranspose2d benches.
+- **1D conv/pool** (`4308eab`): Conv1d/ConvTranspose1d/MaxPool1d/AvgPool1d map
+  to 2D kernels with a unit height dim. 6 benches (dilated Conv1d 76 deferred).
+
+Extractable corpus: **34 → 67 / 100**.
+
+Still out (33): **3D conv/pool family (13)** — Conv3d ×4, ConvTranspose3d ×7,
+MaxPool3d, AvgPool3d (need 5D-tensor kernels — the obvious next batch); losses
+(7, scalar output, out of scope); cumsum/cumprod/flip/select (5); matmul
+variants diag/triu/tril/einsum (4); abs(L1Norm 38); dilated conv2d (76, 80);
+SDPA (97, hardcodes cuda).
 
 ### Phase 4 — optimized RVV + real RTL (~1 week)
 10. `BACKEND=llm` on the covered ops → LLM RVV kernels, verified + measured
