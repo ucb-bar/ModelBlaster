@@ -1172,6 +1172,25 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_diag_matmul({a_ptr}, {b_ptr}, {out_ptr}, "
                 f"{sh['N']}, {sh['M']})"
             )
+        elif op["op"] in ("cumsum", "cumprod", "flip"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['axis']}, {sh['inner']})"
+            )
+        elif op["op"] == "mul":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_mul({a_ptr}, {b_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "mean_abs_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_mean_abs_norm({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['reduce']}, {sh['inner']})"
+            )
         elif op["op"] == "adaptive_avg_pool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]

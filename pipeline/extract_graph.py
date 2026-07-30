@@ -363,6 +363,30 @@ def _match_rms_norm(out, x):
     return float(eps)
 
 
+def _match_mean_abs_norm(out, x):
+    """Pattern: out = x / mean(abs(x), dim=1, keepdim=True) (KernelBench 38,
+    L1 normalization). Returns True on match."""
+    if out.op != "call_function" or out.target not in (_operator.truediv, torch.div):
+        return False
+    if len(out.args) != 2 or out.args[0] is not x:
+        return False
+    mean_node = out.args[1]
+    if not (hasattr(mean_node, "op") and mean_node.op == "call_function"
+            and getattr(mean_node.target, "__name__", "") == "mean"):
+        return False
+    mkw = mean_node.kwargs or {}
+    dim = mkw.get("dim", None)
+    if dim is None and len(mean_node.args) > 1:
+        dim = mean_node.args[1]
+    if dim != 1:
+        return False
+    abs_node = mean_node.args[0]
+    if not (hasattr(abs_node, "op") and abs_node.op == "call_function"
+            and abs_node.target in (torch.abs, _operator.abs)):
+        return False
+    return len(abs_node.args) >= 1 and abs_node.args[0] is x
+
+
 def _maybe_fuse_compound_activation(gm) -> None:
     """If the entire forward graph matches a known compound activation,
     rewrite the FX graph in place: remove the multi-op subgraph and
@@ -397,6 +421,8 @@ def _maybe_fuse_compound_activation(gm) -> None:
         sentinel = _agents_compound_frobenius_norm
     elif (_rms_eps := _match_rms_norm(out_arg, x)) is not None:
         sentinel = _agents_compound_rms_norm
+    elif _match_mean_abs_norm(out_arg, x):
+        sentinel = _agents_compound_mean_abs_norm
     else:
         return
 
@@ -447,6 +473,10 @@ def _agents_compound_frobenius_norm(x):
 
 
 def _agents_compound_rms_norm(x):
+    return x
+
+
+def _agents_compound_mean_abs_norm(x):
     return x
 
 
@@ -2632,6 +2662,45 @@ def extract(
             # KernelBench Phase 2 reductions over a single dim. The
             # 3D logical shape (outer, reduce, inner) is computed from
             # the input shape and the `dim` argument.
+            elif tname in ("cumsum", "cumprod") or target in (torch.cumsum,
+                                                              torch.cumprod):
+                # Cumulative scan along a dim → {outer, axis, inner}.
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                d = node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)
+                d = int(d)
+                if d < 0:
+                    d += len(in_shape)
+                outer = int(np.prod(in_shape[:d])) if d > 0 else 1
+                axis = int(in_shape[d])
+                inner = int(np.prod(in_shape[d+1:])) if d + 1 < len(in_shape) else 1
+                op_name = "cumsum" if (tname == "cumsum" or target is torch.cumsum) \
+                    else "cumprod"
+                ops.append({
+                    "name": node.name, "op": op_name,
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"outer": outer, "axis": axis, "inner": inner},
+                })
+            elif ((tname == "mul" or target in (torch.mul, _operator.mul))
+                  and isinstance(node.args[0], torch.fx.Node)
+                  and isinstance(node.args[1], torch.fx.Node)):
+                # Elementwise multiply of two tensors (KernelBench 93 x*mask,
+                # 100 pred*targets). Scalar mul (one non-Node arg) is handled
+                # elsewhere. Requires equal shapes (no broadcast).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = tensors[a_name]["shape"]
+                b_shape = tensors[b_name]["shape"]
+                if list(a_shape) != list(b_shape):
+                    raise NotImplementedError(
+                        f"mul at {node.name}: broadcasting not supported "
+                        f"(a={a_shape} b={b_shape})")
+                n = int(np.prod(a_shape))
+                ops.append({
+                    "name": node.name, "op": "mul",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"n": n},
+                })
             elif tname == "sum" or target is torch.sum:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
@@ -2826,6 +2895,18 @@ def extract(
                     "name": node.name, "op": "rms_norm",
                     "inputs": [in_name], "outputs": [out_name],
                     "eps": float(node.meta.get("rms_eps", 1e-5)),
+                    "shape": {"outer": outer, "reduce": reduce, "inner": inner},
+                })
+            elif target is _agents_compound_mean_abs_norm:
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                dim = 1  # L1 norm divides by mean(|x|) over dim=1, keepdim=True
+                outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
+                reduce = int(in_shape[dim])
+                inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
+                ops.append({
+                    "name": node.name, "op": "mean_abs_norm",
+                    "inputs": [in_name], "outputs": [out_name],
                     "shape": {"outer": outer, "reduce": reduce, "inner": inner},
                 })
             elif tname == "hardtanh" \
@@ -3069,6 +3150,31 @@ def extract(
                     "shape": {"N": N_, "C": C, "H": H_, "W": W_,
                               "c_each": c_each},
                 })
+            elif target == "flip":
+                # Tensor.flip(dim) — reverse along one axis. dims may be an int
+                # or a 1-elem tuple/list (KernelBench 91 uses a single dim).
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                dims = node.args[1] if len(node.args) > 1 \
+                    else node.kwargs.get("dims")
+                if isinstance(dims, (tuple, list)):
+                    if len(dims) != 1:
+                        raise NotImplementedError(
+                            f"flip at {node.name}: only single-axis supported")
+                    d = int(dims[0])
+                else:
+                    d = int(dims)
+                if d < 0:
+                    d += len(in_shape)
+                outer = int(np.prod(in_shape[:d])) if d > 0 else 1
+                axis = int(in_shape[d])
+                inner = int(np.prod(in_shape[d+1:])) if d + 1 < len(in_shape) else 1
+                tensors[node.name] = _tensor_meta(node)
+                ops.append({
+                    "name": node.name, "op": "flip",
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"outer": outer, "axis": axis, "inner": inner},
+                })
             else:
                 raise NotImplementedError(
                     f"unhandled call_method '{target}' at {node.name}"
@@ -3249,6 +3355,11 @@ def _load_kernelbench(bench_path: str,
     inputs = mod.get_inputs()
     if not isinstance(inputs, list) or not inputs:
         raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
+    # Bool masks (e.g. masked_cumsum) become float in the model anyway
+    # (x * bool == x * float); cast them so the fp32 pipeline can carry them.
+    # Integer class-index targets (cross_entropy) are left alone.
+    inputs = [t.float() if (torch.is_tensor(t) and t.dtype == torch.bool) else t
+              for t in inputs]
     base = os.path.splitext(os.path.basename(bench_path))[0]
     name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
                            for ch in base).strip("_")
