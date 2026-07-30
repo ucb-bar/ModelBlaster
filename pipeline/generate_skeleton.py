@@ -1183,6 +1183,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
                 f"{sh['outer']}, {sh['axis']}, {sh['inner']})"
             )
+        elif op["op"] == "exclusive_cumsum":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_exclusive_cumsum({in_ptr}, {out_ptr}, {sh['Bout']}, {sh['N']})"
         elif op["op"] == "mul":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")
