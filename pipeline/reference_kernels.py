@@ -8585,6 +8585,55 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
 }
 
 
+def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec.
+
+    The transformation is purely mechanical: rename kernel_<op> -> kernel_<op>_f16
+    and change every float POINTER (`const float *` / `float *`, in both the
+    signature and the body's pointer locals) to `_Float16 *`. Scalar `float`
+    params (eps, scale, beta, margin) and `float` locals / `(float)` casts stay
+    — loads widen `_Float16`->float and stores narrow float->`_Float16`
+    implicitly, so the math still runs in fp32. Mirrors the hand-written _f16
+    kernels (relu_f16, softmax_f16, ...)."""
+    import ctypes
+
+    def _c(s: str) -> str:
+        s = s.replace("const float *", "const _Float16 *")
+        s = s.replace("float *", "_Float16 *")
+        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}_f16(")
+        return s
+
+    _fp = ctypes.POINTER(ctypes.c_float)
+    _hp = ctypes.POINTER(ctypes.c_uint16)  # _Float16 has no ctypes type; use u16
+
+    def _argtypes(_orig=spec.argtypes_factory):
+        if _orig is None:
+            return None
+        return [_hp if a is _fp else a for a in _orig()]
+
+    return KernelSpec(
+        op=spec.op + "_f16",
+        signature=_c(spec.signature),
+        semantics="(fp16) " + spec.semantics,
+        reference_impl=_c(spec.reference_impl),
+        extra_shapes=list(spec.extra_shapes),
+        argtypes_factory=(None if spec.argtypes_factory is None else _argtypes),
+    )
+
+
+# Auto-generate an fp16 (`_f16`) variant for every fp32 op that doesn't already
+# have a hand-written one, so `--quant fp16` has full op coverage. Skips ops that
+# already carry a dtype suffix (`_f16`, `_s8`) and the i8<->f16 cast helpers.
+for _op_name in list(KERNEL_SPECS):
+    if _op_name.endswith("_f16") or _op_name.endswith("_s8"):
+        continue
+    if _op_name.startswith("cast_"):
+        continue
+    _f16_name = _op_name + "_f16"
+    if _f16_name not in KERNEL_SPECS:
+        KERNEL_SPECS[_f16_name] = _make_f16_variant(KERNEL_SPECS[_op_name])
+
+
 def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
     """Pull every distinct shape combo for `op` out of an IR graph.
 
