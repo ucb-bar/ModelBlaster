@@ -7959,6 +7959,31 @@ def _pointwise2_argtypes():
     return [fp, fp, fp, ctypes.c_int]
 
 
+def _mul_scalar_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+MUL_SCALAR = KernelSpec(
+    op="mul_scalar",
+    signature="void kernel_mul_scalar(const float *input, float *output, int n, float s)",
+    semantics=(
+        "Multiply a tensor by a compile-time scalar constant (KernelBench 5,\n"
+        "A * s with s a Python float bound at extract time):\n"
+        "  output[i] = input[i] * s   for i in [0, n)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_mul_scalar(const float *input, float *output, int n, float s) {
+    for (int i = 0; i < n; i++) output[i] = input[i] * s;
+}
+""",
+    extra_shapes=[{"n": 64, "s": 1.0}],
+    argtypes_factory=_mul_scalar_argtypes,
+)
+
+
 MUL = KernelSpec(
     op="mul",
     signature=(
@@ -8364,6 +8389,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "cumprod": CUMPROD,
     "flip": FLIP,
     "mul": MUL,
+    "mul_scalar": MUL_SCALAR,
     "mean_abs_norm": MEAN_ABS_NORM,
     "mse_loss": MSE_LOSS,
     "huber_loss": HUBER_LOSS,
