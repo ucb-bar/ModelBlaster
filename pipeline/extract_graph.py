@@ -2819,7 +2819,7 @@ def extract(
                   and isinstance(node.args[1], torch.fx.Node)):
                 # Elementwise multiply of two tensors (KernelBench 93 x*mask,
                 # 100 pred*targets). Scalar mul (one non-Node arg) is handled
-                # elsewhere. Requires equal shapes (no broadcast).
+                # below. Requires equal shapes (no broadcast).
                 a_name = node.args[0].name
                 b_name = node.args[1].name
                 a_shape = tensors[a_name]["shape"]
@@ -2833,6 +2833,23 @@ def extract(
                     "name": node.name, "op": "mul",
                     "inputs": [a_name, b_name], "outputs": [out_name],
                     "shape": {"n": n},
+                })
+            elif (tname == "mul" or target in (torch.mul, _operator.mul)):
+                # Tensor * scalar constant (KernelBench 5, A * s). Exactly one
+                # arg is a Node (the tensor), the other a bound Python scalar.
+                a, b = node.args[0], node.args[1]
+                if isinstance(a, torch.fx.Node) and not isinstance(b, torch.fx.Node):
+                    t_node, s = a, b
+                elif isinstance(b, torch.fx.Node) and not isinstance(a, torch.fx.Node):
+                    t_node, s = b, a
+                else:
+                    raise NotImplementedError(
+                        f"mul at {node.name}: unexpected args {node.args}")
+                n = int(np.prod(tensors[t_node.name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "mul_scalar",
+                    "inputs": [t_node.name], "outputs": [out_name],
+                    "scalar": float(s), "shape": {"n": n},
                 })
             elif tname == "sum" or target is torch.sum:
                 in_name = node.args[0].name
@@ -3490,7 +3507,8 @@ def _load_kernelbench(bench_path: str,
             # Cap the TOTAL element count across all forward inputs (matmul
             # A+B, bmm, etc.), not just the first — the second operand can
             # dwarf the first.
-            total = sum(int(np.prod(t.shape)) for t in mod.get_inputs())
+            total = sum(int(np.prod(t.shape)) for t in mod.get_inputs()
+                        if torch.is_tensor(t))
             if total <= max_elements:
                 break
             if not ints:
@@ -3532,6 +3550,35 @@ def _load_kernelbench(bench_path: str,
     # Integer class-index targets (cross_entropy) are left alone.
     inputs = [t.float() if (torch.is_tensor(t) and t.dtype == torch.bool) else t
               for t in inputs]
+
+    # Bind non-tensor (scalar) forward args as constants so only tensors are
+    # graph inputs (KernelBench 5: `A * s` with s a Python float). The trace
+    # then sees `A * <const>`, extracted as a mul_scalar op. Only a single
+    # tensor input is supported here (fx can't trace a *args wrapper).
+    if any(not torch.is_tensor(t) for t in inputs):
+        _tensor_pos = [i for i, t in enumerate(inputs) if torch.is_tensor(t)]
+        if len(_tensor_pos) != 1:
+            raise NotImplementedError(
+                f"{bench_path}: scalar forward args are only supported with a "
+                f"single tensor input (got {len(_tensor_pos)})")
+        _pos0 = _tensor_pos[0]
+        _full = list(inputs)  # concrete scalars + placeholder slot for the tensor
+        _orig = model
+
+        class _ScalarBind(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.m = _orig
+
+            def forward(self, x):
+                args = list(_full)
+                args[_pos0] = x
+                return self.m(*args)
+
+        model = _ScalarBind()
+        model.eval()
+        inputs = [inputs[_pos0]]
+
     base = os.path.splitext(os.path.basename(bench_path))[0]
     name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
                            for ch in base).strip("_")
