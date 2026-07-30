@@ -2,8 +2,12 @@
 
 | bench | status | err | note |
 |---|---|---|---|
-| 10_3D_tensor_matrix_multiplication | FAIL-run | - |  |
+| 10_3D_tensor_matrix_multiplication | PASS | max_abs_err=0 | ok |
+| 11_4D_tensor_matrix_multiplication | PASS | max_abs_err=1.43e-06 | ok |
+| 12_Matmul_with_diagonal_matrices_ | PASS | max_abs_err=0 | ok |
 | 13_Matmul_for_symmetric_matrices | PASS | max_abs_err=0 | ok |
+| 14_Matmul_for_upper_triangular_matrices | PASS | max_abs_err=0 | ok |
+| 15_Matmul_for_lower_triangular_matrices | PASS | max_abs_err=0 | ok |
 | 16_Matmul_with_transposed_A | PASS | max_abs_err=0 | ok |
 | 17_Matmul_with_transposed_B | PASS | max_abs_err=0 | ok |
 | 18_Matmul_with_transposed_both | PASS | max_abs_err=0 | ok |
@@ -13,7 +17,7 @@
 | 21_Sigmoid | PASS | max_abs_err=1.19e-07 | ok |
 | 22_Tanh | PASS | max_abs_err=1.19e-07 | ok |
 | 23_Softmax | PASS | max_abs_err=4.66e-09 | ok |
-| 24_LogSoftmax | PASS | max_abs_err=9.54e-07 | ok |
+| 24_LogSoftmax | PASS | max_abs_err=1.43e-06 | ok |
 | 25_Swish | PASS | max_abs_err=1.19e-07 | ok |
 | 26_GELU_ | PASS | max_abs_err=1.79e-07 | ok |
 | 27_SELU_ | PASS | max_abs_err=0 | ok |
@@ -24,13 +28,13 @@
 | 31_ELU | PASS | max_abs_err=0 | ok |
 | 32_HardTanh | PASS | max_abs_err=0 | ok |
 | 33_BatchNorm | PASS | max_abs_err=0 | ok |
-| 34_InstanceNorm | PASS | max_abs_err=5.84e-06 | ok |
-| 35_GroupNorm_ | PASS | max_abs_err=6.79e-06 | ok |
-| 36_RMSNorm_ | PASS | max_abs_err=3.58e-07 | ok |
-| 37_FrobeniusNorm_ | PASS | max_abs_err=1.58e-08 | ok |
+| 34_InstanceNorm | PASS | max_abs_err=4.53e-06 | ok |
+| 35_GroupNorm_ | PASS | max_abs_err=5.72e-06 | ok |
+| 36_RMSNorm_ | PASS | max_abs_err=4.77e-07 | ok |
+| 37_FrobeniusNorm_ | PASS | max_abs_err=2.84e-08 | ok |
 | 39_L2Norm_ | PASS | max_abs_err=4.47e-08 | ok |
 | 3_Batched_matrix_multiplication | PASS | max_abs_err=0 | ok |
-| 40_LayerNorm | PASS | max_abs_err=1.57e-05 | ok |
+| 40_LayerNorm | PASS | max_abs_err=1.79e-05 | ok |
 | 41_Max_Pooling_1D | PASS | max_abs_err=0 | ok |
 | 42_Max_Pooling_2D | PASS | max_abs_err=0 | ok |
 | 43_Max_Pooling_3D | PASS | max_abs_err=0 | ok |
@@ -40,37 +44,37 @@
 | 47_Sum_reduction_over_a_dimension | PASS | max_abs_err=5.72e-06 | ok |
 | 48_Mean_reduction_over_a_dimension | PASS | max_abs_err=1.79e-07 | ok |
 | 49_Max_reduction_over_a_dimension | PASS | max_abs_err=0 | ok |
-| 4_Matrix_vector_multiplication_ | PASS | max_abs_err=5.34e-05 | ok |
-| 50_conv_standard_2D__square_input__square_kernel | PASS | max_abs_err=9.54e-07 | ok |
+| 4_Matrix_vector_multiplication_ | PASS | max_abs_err=3.43e-05 | ok |
+| 50_conv_standard_2D__square_input__square_kernel | PASS | max_abs_err=1.07e-06 | ok |
 | 51_Argmax_over_a_dimension | PASS | max_abs_err=0 | ok |
 | 52_Argmin_over_a_dimension | PASS | max_abs_err=0 | ok |
 | 53_Min_reduction_over_a_dimension | PASS | max_abs_err=0 | ok |
 | 54_conv_standard_3D__square_input__square_kernel | PASS | max_abs_err=0 | ok |
-| 55_conv_standard_2D__asymmetric_input__square_kernel | PASS | max_abs_err=1.07e-06 | ok |
-| 56_conv_standard_2D__asymmetric_input__asymmetric_kernel | PASS | max_abs_err=1.13e-06 | ok |
-| 57_conv_transposed_2D__square_input__square_kernel | PASS | max_abs_err=7.15e-07 | ok |
+| 55_conv_standard_2D__asymmetric_input__square_kernel | PASS | max_abs_err=7.15e-07 | ok |
+| 56_conv_standard_2D__asymmetric_input__asymmetric_kernel | PASS | max_abs_err=1.25e-06 | ok |
+| 57_conv_transposed_2D__square_input__square_kernel | PASS | max_abs_err=5.36e-07 | ok |
 | 58_conv_transposed_3D__asymmetric_input__asymmetric_kernel | PASS | max_abs_err=0 | ok |
 | 59_conv_standard_3D__asymmetric_input__square_kernel | PASS | max_abs_err=0 | ok |
 | 60_conv_standard_3D__square_input__asymmetric_kernel | PASS | max_abs_err=0 | ok |
-| 61_conv_transposed_3D__square_input__square_kernel | PASS | max_abs_err=8.94e-07 | ok |
+| 61_conv_transposed_3D__square_input__square_kernel | PASS | max_abs_err=9.54e-07 | ok |
 | 62_conv_standard_2D__square_input__asymmetric_kernel | PASS | max_abs_err=1.31e-06 | ok |
-| 63_conv_standard_2D__square_input__square_kernel | PASS | max_abs_err=5.96e-07 | ok |
-| 64_conv_transposed_1D | PASS | max_abs_err=4.47e-07 | ok |
-| 65_conv_transposed_2D__square_input__asymmetric_kernel | PASS | max_abs_err=1.01e-06 | ok |
+| 63_conv_standard_2D__square_input__square_kernel | PASS | max_abs_err=4.77e-07 | ok |
+| 64_conv_transposed_1D | PASS | max_abs_err=3.58e-07 | ok |
+| 65_conv_transposed_2D__square_input__asymmetric_kernel | PASS | max_abs_err=1.04e-06 | ok |
 | 66_conv_standard_3D__asymmetric_input__asymmetric_kernel | PASS | max_abs_err=0 | ok |
 | 67_conv_standard_1D | PASS | max_abs_err=4.77e-07 | ok |
 | 68_conv_transposed_3D__square_input__asymmetric_kernel | PASS | max_abs_err=0 | ok |
 | 69_conv_transposed_2D__asymmetric_input__asymmetric_kernel | PASS | max_abs_err=7.15e-07 | ok |
-| 6_Matmul_with_large_K_dimension_ | PASS | max_abs_err=5.72e-05 | ok |
+| 6_Matmul_with_large_K_dimension_ | PASS | max_abs_err=6.1e-05 | ok |
 | 70_conv_transposed_3D__asymmetric_input__square_kernel | PASS | max_abs_err=0 | ok |
-| 71_conv_transposed_2D__asymmetric_input__square_kernel | PASS | max_abs_err=9.54e-07 | ok |
-| 72_conv_transposed_3D_asymmetric_input_asymmetric_kernel___strided_padded_grouped_ | PASS | max_abs_err=1.49e-07 | ok |
+| 71_conv_transposed_2D__asymmetric_input__square_kernel | PASS | max_abs_err=4.77e-07 | ok |
+| 72_conv_transposed_3D_asymmetric_input_asymmetric_kernel___strided_padded_grouped_ | PASS | max_abs_err=1.79e-07 | ok |
 | 73_conv_transposed_3D_asymmetric_input_square_kernel__strided_padded__grouped | PASS | max_abs_err=0 | ok |
-| 74_conv_transposed_1D_dilated | PASS | max_abs_err=5.96e-07 | ok |
-| 75_conv_transposed_2D_asymmetric_input_asymmetric_kernel_strided__grouped____padded____dilated__ | PASS | max_abs_err=1.79e-07 | ok |
-| 77_conv_transposed_3D_square_input_square_kernel___padded____dilated____strided__ | PASS | max_abs_err=6.56e-07 | ok |
-| 78_conv_transposed_2D_asymmetric_input_asymmetric_kernel___padded__ | PASS | max_abs_err=8.94e-07 | ok |
-| 79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__ | PASS | max_abs_err=5.96e-07 | ok |
+| 74_conv_transposed_1D_dilated | PASS | max_abs_err=5.36e-07 | ok |
+| 75_conv_transposed_2D_asymmetric_input_asymmetric_kernel_strided__grouped____padded____dilated__ | PASS | max_abs_err=2.38e-07 | ok |
+| 77_conv_transposed_3D_square_input_square_kernel___padded____dilated____strided__ | PASS | max_abs_err=7.75e-07 | ok |
+| 78_conv_transposed_2D_asymmetric_input_asymmetric_kernel___padded__ | PASS | max_abs_err=1.31e-06 | ok |
+| 79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__ | PASS | max_abs_err=4.17e-07 | ok |
 | 7_Matmul_with_small_K_dimension_ | PASS | max_abs_err=0 | ok |
 | 81_conv_transposed_2D_asymmetric_input_square_kernel___dilated____padded____strided__ | PASS | max_abs_err=0 | ok |
 | 82_conv_depthwise_2D_square_input_square_kernel | PASS | max_abs_err=0 | ok |
@@ -83,4 +87,4 @@
 | 8_Matmul_with_irregular_shapes_ | PASS | max_abs_err=0 | ok |
 | 9_Tall_skinny_matrix_multiplication_ | PASS | max_abs_err=0 | ok |
 
-_79 PASS / 1 FAIL_
+_84 PASS / 0 FAIL_
