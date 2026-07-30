@@ -102,11 +102,14 @@ Commits (in order):
 - **3D conv/pool** (`1a8f4da`): conv3d, conv_transpose3d, maxpool3d, avgpool3d
   (new 5D NCDHW kernels; 5D weights stay OIDHW — no repack). 13/13 benches.
 
-Extractable corpus: **34 → 80 / 100** (79/80 PASS; only 10_3D fails).
+- **Matmul variants** (`8b0f599`): triu/tril mask ops, diag_matmul fusion
+  (diag(A)@B row-scale), and N-D@2D matmul + einsum '...l,lk->...k'. Unlocked
+  11/12/14/15 and fixed 10_3D.
 
-Still out (20): losses (7); cumsum/cumprod/flip/select (5); matmul variants
-diag/triu/tril/einsum (4); abs(L1Norm 38); dilated conv2d (76, 80); SDPA (97,
-hardcodes cuda); 10_3D broadcast matmul.
+Extractable corpus: **34 → 84 / 100** (84/84 PASS after the matmul-variant batch).
+
+Still out (16): losses (7); cumsum/cumprod/flip/select (5); abs(L1Norm 38);
+dilated conv2d (76, 80); SDPA (97, hardcodes cuda).
 
 Note on losses: a scalar output is NOT a blocker — the harness flattens outputs
 and compares element-wise, so a size-1 result works. Losses are deferred purely
