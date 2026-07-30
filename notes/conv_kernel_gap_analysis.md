@@ -22,6 +22,28 @@ purely **how many useful MAC-instructions issue per cycle** = data reuse +
 instruction mix. XNNPACK is **not** using a wider/different ALU, a better
 requantize, or a special ISA feature.
 
+### Update: weight-buffer layout (HWIO ↔ IHWO) is perf-neutral
+
+After merging upstream (which repacks conv weights `ihwoc`=IHWO, commit
+`15a3b17`), the curated kernels were re-aligned to read IHWO
+(`((ic*KH+kh)*KW+kw)*OC+oc`) instead of HWIO. Re-measured on FireSim (bit-exact):
+
+| MB conv (DroNet) | total cycles | MAC/cycle | gap vs ET |
+|---|---:|---:|---:|
+| HWIO (old) | 14,079,285 | 0.92 | 3.49× |
+| **IHWO (new)** | **14,472,123** | **0.90** | **3.58×** |
+
+The weight-buffer layout barely moves the needle (IHWO is ~3% *slower* here, per
+conv) — **it is not a major factor.** In both layouts OC is the contiguous
+vector axis (identical `vle8` loads) and the kernel still streams the *entire*
+weight buffer once per output pixel with no reuse; only the block order differs,
+which the Saturn memory system handles about the same. The ~3.5× gap is
+unchanged, confirming it comes from the structural causes below (register
+tiling/reuse, NHWC-vs-NCHW *activation* layout, pre-packing) — **not** the weight
+layout. (Note: the "layout" that does matter is the NHWC **activation** layout —
+cause #2 — which forces MB's scalar strided output store; that is orthogonal to
+the weight-buffer packing changed here.)
+
 ## The three structural causes (ranked)
 
 ### 1. Register tiling / weight reuse (dominant)
