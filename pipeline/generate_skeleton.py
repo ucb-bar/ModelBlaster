@@ -1240,6 +1240,15 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
             call = f"kernel_log({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "sdpa":
+            q_ptr = ptr_for(op["inputs"][0], "in")
+            k_ptr = ptr_for(op["inputs"][1], "in")
+            v_ptr = ptr_for(op["inputs"][2], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_sdpa({q_ptr}, {k_ptr}, {v_ptr}, {out_ptr}, "
+                f"{sh['BH']}, {sh['S']}, {sh['D']})"
+            )
         elif op["op"] == "adaptive_avg_pool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]

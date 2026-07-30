@@ -2678,6 +2678,23 @@ def extract(
                     "inputs": [a_name, b_name], "outputs": [out_name],
                     "shape": {"N": a_shape[0], "C": a_shape[1]},
                 })
+            elif tname == "scaled_dot_product_attention" \
+                    or target is torch.nn.functional.scaled_dot_product_attention:
+                # SDPA (KernelBench 97). Q/K/V are [B, H, S, D]; flatten B*H.
+                q_name = node.args[0].name
+                k_name = node.args[1].name
+                v_name = node.args[2].name
+                q_shape = [int(s) for s in tensors[q_name]["shape"]]
+                if len(q_shape) != 4:
+                    raise NotImplementedError(
+                        f"sdpa at {node.name}: only [B,H,S,D] supported "
+                        f"(got {q_shape})")
+                B, H, S, D = q_shape
+                ops.append({
+                    "name": node.name, "op": "sdpa",
+                    "inputs": [q_name, k_name, v_name], "outputs": [out_name],
+                    "shape": {"BH": B * H, "S": S, "D": D},
+                })
             elif tname == "kl_div" or target is torch.nn.functional.kl_div:
                 # KL divergence, reduction='batchmean' (KernelBench 98). First
                 # arg is already log(pred).
@@ -3459,6 +3476,36 @@ def extract(
     return ir
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _cpu_fp32_tensor_creation():
+    """Patch torch tensor-creation ops so benches that hard-code
+    device='cuda' and/or dtype=float16 in get_inputs (e.g. 97 SDPA) still
+    materialize on CPU in fp32. Restores the originals on exit."""
+    names = ["rand", "randn", "zeros", "ones", "empty", "full", "randint",
+             "arange", "tensor", "eye", "linspace"]
+    saved = {n: getattr(torch, n) for n in names if hasattr(torch, n)}
+
+    def _wrap(fn):
+        def inner(*args, **kwargs):
+            if kwargs.get("device") is not None:
+                kwargs["device"] = "cpu"
+            if kwargs.get("dtype") == torch.float16:
+                kwargs["dtype"] = torch.float32
+            return fn(*args, **kwargs)
+        return inner
+
+    try:
+        for n, fn in saved.items():
+            setattr(torch, n, _wrap(fn))
+        yield
+    finally:
+        for n, fn in saved.items():
+            setattr(torch, n, fn)
+
+
 def _load_kernelbench(bench_path: str,
                       max_elements: "int | None" = None
                       ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
@@ -3496,55 +3543,56 @@ def _load_kernelbench(bench_path: str,
     if not hasattr(mod, "get_inputs"):
         raise RuntimeError(f"{bench_path} missing get_inputs()")
 
-    if max_elements is not None and max_elements > 0:
-        SHAPE_ATTRS_BLOCKLIST = {"num_classes"}  # not a spatial dim
-        ints = {k: v for k, v in vars(mod).items()
-                if isinstance(v, int) and v > 1
-                and not k.startswith("_")
-                and k not in SHAPE_ATTRS_BLOCKLIST}
-        history: "list[tuple[str, int]]" = []
-        for _ in range(64):
-            # Cap the TOTAL element count across all forward inputs (matmul
-            # A+B, bmm, etc.), not just the first — the second operand can
-            # dwarf the first.
-            total = sum(int(np.prod(t.shape)) for t in mod.get_inputs()
-                        if torch.is_tensor(t))
-            if total <= max_elements:
-                break
-            if not ints:
-                break
-            biggest = max(ints, key=ints.get)
-            new = max(1, ints[biggest] // 2)
-            if new == ints[biggest]:
-                break
-            history.append((biggest, ints[biggest]))
-            ints[biggest] = new
-            setattr(mod, biggest, new)
-
-        # Some ops (dilated conv) become invalid if a spatial dim is shrunk
-        # below the (dilated) kernel extent — the model's own forward then
-        # raises. Back off the most recent shrink steps until a forward pass
-        # succeeds, so the shape stays valid even if it exceeds max_elements.
-        _ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
-        for _ in range(len(history) + 1):
-            try:
-                _m = mod.Model(*_ia)
-                _m.eval()
-                with torch.no_grad():
-                    _m(*mod.get_inputs())
-                break
-            except Exception:
-                if not history:
+    with _cpu_fp32_tensor_creation():
+        if max_elements is not None and max_elements > 0:
+            SHAPE_ATTRS_BLOCKLIST = {"num_classes"}  # not a spatial dim
+            ints = {k: v for k, v in vars(mod).items()
+                    if isinstance(v, int) and v > 1
+                    and not k.startswith("_")
+                    and k not in SHAPE_ATTRS_BLOCKLIST}
+            history: "list[tuple[str, int]]" = []
+            for _ in range(64):
+                # Cap the TOTAL element count across all forward inputs (matmul
+                # A+B, bmm, etc.), not just the first — the second operand can
+                # dwarf the first.
+                total = sum(int(np.prod(t.shape)) for t in mod.get_inputs()
+                            if torch.is_tensor(t))
+                if total <= max_elements:
                     break
-                attr, oldv = history.pop()
-                setattr(mod, attr, oldv)
+                if not ints:
+                    break
+                biggest = max(ints, key=ints.get)
+                new = max(1, ints[biggest] // 2)
+                if new == ints[biggest]:
+                    break
+                history.append((biggest, ints[biggest]))
+                ints[biggest] = new
+                setattr(mod, biggest, new)
 
-    init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
-    model = mod.Model(*init_args)
-    model.eval()
-    inputs = mod.get_inputs()
-    if not isinstance(inputs, list) or not inputs:
-        raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
+            # Some ops (dilated conv) become invalid if a spatial dim is shrunk
+            # below the (dilated) kernel extent — the model's own forward then
+            # raises. Back off the most recent shrink steps until a forward pass
+            # succeeds, so the shape stays valid even if it exceeds max_elements.
+            _ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+            for _ in range(len(history) + 1):
+                try:
+                    _m = mod.Model(*_ia)
+                    _m.eval()
+                    with torch.no_grad():
+                        _m(*mod.get_inputs())
+                    break
+                except Exception:
+                    if not history:
+                        break
+                    attr, oldv = history.pop()
+                    setattr(mod, attr, oldv)
+
+        init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+        model = mod.Model(*init_args)
+        model.eval()
+        inputs = mod.get_inputs()
+        if not isinstance(inputs, list) or not inputs:
+            raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
     # Bool masks (e.g. masked_cumsum) become float in the model anyway
     # (x * bool == x * float); cast them so the fp32 pipeline can carry them.
     # Integer class-index targets (cross_entropy) are left alone.
