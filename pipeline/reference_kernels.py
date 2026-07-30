@@ -7848,6 +7848,174 @@ void kernel_diag_matmul(const float *a, const float *b, float *output,
 )
 
 
+def _scan_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+CUMSUM = KernelSpec(
+    op="cumsum",
+    signature=(
+        "void kernel_cumsum(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Cumulative sum along the scan axis (torch.cumsum). The tensor is\n"
+        "viewed as [outer, axis, inner] (outer = product of dims before the\n"
+        "scan dim, inner = product of dims after):\n"
+        "  output[o, a, i] = sum over a' in [0, a] of input[o, a', i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_cumsum(const float *input, float *output,
+                   int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 0.0f;
+            for (int a = 0; a < axis; a++) {
+                long idx = ((long)(o*axis + a))*inner + i;
+                acc += input[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+CUMPROD = KernelSpec(
+    op="cumprod",
+    signature=(
+        "void kernel_cumprod(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Cumulative product along the scan axis (torch.cumprod), viewed as\n"
+        "[outer, axis, inner]:\n"
+        "  output[o, a, i] = product over a' in [0, a] of input[o, a', i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_cumprod(const float *input, float *output,
+                    int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 1.0f;
+            for (int a = 0; a < axis; a++) {
+                long idx = ((long)(o*axis + a))*inner + i;
+                acc *= input[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+FLIP = KernelSpec(
+    op="flip",
+    signature=(
+        "void kernel_flip(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Reverse along one axis (torch.flip / Tensor.flip), viewed as\n"
+        "[outer, axis, inner]:\n"
+        "  output[o, a, i] = input[o, axis-1-a, i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_flip(const float *input, float *output,
+                 int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int a = 0; a < axis; a++) {
+            for (int i = 0; i < inner; i++) {
+                output[((long)(o*axis + a))*inner + i] =
+                    input[((long)(o*axis + (axis-1-a)))*inner + i];
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+def _pointwise2_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int]
+
+
+MUL = KernelSpec(
+    op="mul",
+    signature=(
+        "void kernel_mul(const float *a, const float *b, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise multiply of two equal-shaped tensors:\n"
+        "  output[i] = a[i] * b[i]   for i in [0, n)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_mul(const float *a, const float *b, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = a[i] * b[i];
+    }
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_pointwise2_argtypes,
+)
+
+
+MEAN_ABS_NORM = KernelSpec(
+    op="mean_abs_norm",
+    signature=(
+        "void kernel_mean_abs_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "L1 normalization (KernelBench 38): divide by the mean absolute value\n"
+        "over the reduce axis (dim=1, keepdim=True), viewed as\n"
+        "[outer, reduce, inner]:\n"
+        "  denom[o, i]      = (1/reduce) * sum_r |input[o, r, i]|\n"
+        "  output[o, r, i]  = input[o, r, i] / denom[o, i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_mean_abs_norm(const float *input, float *output,
+                          int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float s = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                s += fabsf(input[((long)(o*reduce + r))*inner + i]);
+            }
+            float denom = s / (float)reduce;
+            for (int r = 0; r < reduce; r++) {
+                long idx = ((long)(o*reduce + r))*inner + i;
+                output[idx] = input[idx] / denom;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "reduce": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
 LAYER_NORM = KernelSpec(
     op="layer_norm",
     signature=(
@@ -7944,6 +8112,11 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "triu": TRIU,
     "tril": TRIL,
     "diag_matmul": DIAG_MATMUL,
+    "cumsum": CUMSUM,
+    "cumprod": CUMPROD,
+    "flip": FLIP,
+    "mul": MUL,
+    "mean_abs_norm": MEAN_ABS_NORM,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
