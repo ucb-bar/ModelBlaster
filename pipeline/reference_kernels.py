@@ -7953,6 +7953,42 @@ void kernel_flip(const float *input, float *output,
 )
 
 
+def _excl_cumsum_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+EXCLUSIVE_CUMSUM = KernelSpec(
+    op="exclusive_cumsum",
+    signature=(
+        "void kernel_exclusive_cumsum(const float *x, float *output, "
+        "int Bout, int N)"
+    ),
+    semantics=(
+        "Exclusive cumulative sum with a leading zero, as computed by\n"
+        "KernelBench 92: cat([zeros, x], dim=1)[:-1] then cumsum(dim=1).\n"
+        "x is [B, N]; the [:-1] drops the last row (dim 0), so the output is\n"
+        "[Bout, N+1] with Bout = B-1. For each kept row b:\n"
+        "  output[b, 0] = 0;  output[b, k] = sum_{j<k} x[b, j]  (k=1..N)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_exclusive_cumsum(const float *x, float *output, int Bout, int N) {
+    for (int b = 0; b < Bout; b++) {
+        float acc = 0.0f;
+        for (int k = 0; k <= N; k++) {
+            output[(long)b*(N+1) + k] = acc;
+            if (k < N) acc += x[(long)b*N + k];
+        }
+    }
+}
+""",
+    extra_shapes=[{"Bout": 4, "N": 16}],
+    argtypes_factory=_excl_cumsum_argtypes,
+)
+
+
 def _pointwise2_argtypes():
     import ctypes
     fp = ctypes.POINTER(ctypes.c_float)
@@ -8453,6 +8489,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "cumsum": CUMSUM,
     "cumprod": CUMPROD,
     "flip": FLIP,
+    "exclusive_cumsum": EXCLUSIVE_CUMSUM,
     "mul": MUL,
     "mul_scalar": MUL_SCALAR,
     "mean_abs_norm": MEAN_ABS_NORM,

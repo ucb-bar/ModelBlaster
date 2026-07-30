@@ -455,6 +455,28 @@ def _maybe_fuse_loss(gm) -> None:
     gm.recompile()
 
 
+def _match_exclusive_cumsum(out, x):
+    """Pattern (KernelBench 92): cumsum(cat([zeros_like(...), x])[:-1], dim=1).
+    x is 2D [B, N]; output is [B-1, N+1]. Returns True on match."""
+    if not (out.op == "call_function"
+            and getattr(out.target, "__name__", "") == "cumsum"):
+        return False
+    gi = out.args[0]
+    if not (hasattr(gi, "op") and gi.op == "call_function"
+            and getattr(gi.target, "__name__", "") == "getitem"):
+        return False
+    cat = gi.args[0]
+    if not (hasattr(cat, "op") and cat.op == "call_function"
+            and getattr(cat.target, "__name__", "") == "cat"):
+        return False
+    seq = cat.args[0]
+    if not (isinstance(seq, (tuple, list)) and len(seq) == 2 and seq[1] is x):
+        return False
+    zl = seq[0]
+    return (hasattr(zl, "op") and zl.op == "call_function"
+            and getattr(zl.target, "__name__", "") == "zeros_like")
+
+
 def _maybe_fuse_compound_activation(gm) -> None:
     """If the entire forward graph matches a known compound activation,
     rewrite the FX graph in place: remove the multi-op subgraph and
@@ -491,6 +513,8 @@ def _maybe_fuse_compound_activation(gm) -> None:
         sentinel = _agents_compound_rms_norm
     elif _match_mean_abs_norm(out_arg, x):
         sentinel = _agents_compound_mean_abs_norm
+    elif _match_exclusive_cumsum(out_arg, x):
+        sentinel = _agents_compound_excl_cumsum
     else:
         return
 
@@ -498,10 +522,13 @@ def _maybe_fuse_compound_activation(gm) -> None:
     # everything else via dead-code elimination.
     with gm.graph.inserting_before(out_node):
         new_node = gm.graph.call_function(sentinel, args=(x,))
-    # Copy the placeholder's tensor_meta onto the new node — pointwise
-    # activations preserve shape/dtype, and downstream ShapeProp won't
-    # re-run on this graph.
-    if "tensor_meta" in x.meta:
+    # Copy tensor_meta onto the new node. Most compounds are shape-preserving
+    # (copy the input's meta); exclusive_cumsum reshapes, so copy the original
+    # output node's meta instead.
+    if sentinel is _agents_compound_excl_cumsum:
+        if "tensor_meta" in out_arg.meta:
+            new_node.meta["tensor_meta"] = out_arg.meta["tensor_meta"]
+    elif "tensor_meta" in x.meta:
         new_node.meta["tensor_meta"] = x.meta["tensor_meta"]
     if sentinel is _agents_compound_rms_norm:
         new_node.meta["rms_eps"] = _rms_eps
@@ -545,6 +572,10 @@ def _agents_compound_rms_norm(x):
 
 
 def _agents_compound_mean_abs_norm(x):
+    return x
+
+
+def _agents_compound_excl_cumsum(x):
     return x
 
 
@@ -3094,6 +3125,19 @@ def extract(
                     "name": node.name, "op": "mean_abs_norm",
                     "inputs": [in_name], "outputs": [out_name],
                     "shape": {"outer": outer, "reduce": reduce, "inner": inner},
+                })
+            elif target is _agents_compound_excl_cumsum:
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                if len(in_shape) != 2:
+                    raise NotImplementedError(
+                        f"exclusive_cumsum at {node.name}: only 2D supported "
+                        f"(got {in_shape})")
+                B, N = in_shape
+                ops.append({
+                    "name": node.name, "op": "exclusive_cumsum",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"Bout": B - 1, "N": N},
                 })
             elif tname == "hardtanh" \
                     or target is torch.nn.functional.hardtanh:
