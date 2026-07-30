@@ -402,7 +402,7 @@ def _sigmoid_f16_argtypes():
 def _conv2d_f16_argtypes():
     import ctypes
     h = ctypes.POINTER(ctypes.c_uint16)
-    return [h, h, h, h] + [ctypes.c_int] * 11
+    return [h, h, h, h] + [ctypes.c_int] * 13
 
 
 def _maxpool2d_f16_argtypes():
@@ -4432,7 +4432,7 @@ CONV2D_F16 = KernelSpec(
         "void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight, "
         "const _Float16 *bias, _Float16 *output, "
         "int N, int IC, int IH, int IW, int OC, "
-        "int KH, int KW, int SH, int SW, int PH, int PW)"
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
     ),
     semantics=(
         "Half-precision 2D convolution. groups=1, dilation=1.\n"
@@ -4446,9 +4446,10 @@ CONV2D_F16 = KernelSpec(
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -4456,10 +4457,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                     float acc = bias ? (float)bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = (float)input[((n*IC + ic)*IH + ih)*IW + iw];
                                 float w = (float)weight[((oc*IC + ic)*KH + kh)*KW + kw];
@@ -4517,10 +4518,11 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW)
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW)
 {
-    const int OH = (IH + 2*PH - KH) / SH + 1;
-    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    const int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     const size_t vlmax_e32m4 = __riscv_vsetvlmax_e32m4();
     const ptrdiff_t in_ic_stride_bytes = (ptrdiff_t)IH * IW * sizeof(_Float16);
     const ptrdiff_t w_ic_stride_bytes  = (ptrdiff_t)KH * KW * sizeof(_Float16);

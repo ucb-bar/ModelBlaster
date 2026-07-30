@@ -3476,14 +3476,28 @@ def extract(
     # numerics — not an fp32 trace down-cast at the boundary.
     with torch.no_grad():
         if quant == "fp16":
-            ref_inputs_exec = [t.half() for t in sample_inputs]
-            ref_model = model.half()
+            # The reference kernels use fp16 STORAGE but fp32 MATH (load
+            # _Float16 -> float, accumulate in float, store _Float16). Compute
+            # the golden the same way: round inputs to fp16, run the model in
+            # fp32 on those rounded values, then store the output as fp16. This
+            # matches the kernels' numerics (a genuine `model.half()` would
+            # instead accumulate in fp16 — e.g. cross_entropy's 4096-class
+            # logsumexp drifts ~0.1 — and also lacks CPU Half kernels for some
+            # ops like avg_pool3d). ALL tensor inputs (including int class-index
+            # targets and bool masks) are round-tripped through fp16 so the
+            # golden sees exactly what the kernel reads from the fp16 io buffer
+            # — e.g. cross_entropy indices > 2048 aren't representable in fp16,
+            # so both golden and kernel must use the same fp16-rounded index.
+            ref_inputs_exec = [t.to(torch.float16).to(t.dtype)
+                               if torch.is_tensor(t) else t
+                               for t in sample_inputs]
             torch_dtype = torch.float16
+            out = model.float()(*ref_inputs_exec)
         else:
             ref_inputs_exec = list(sample_inputs)
             ref_model = model
             torch_dtype = torch.float32
-        out = ref_model(*ref_inputs_exec)
+            out = ref_model(*ref_inputs_exec)
 
     # Multi-output models return a tuple; flatten in IR-output order so the
     # downstream comparator just needs to do an elementwise compare.
