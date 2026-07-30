@@ -1,0 +1,180 @@
+{
+  "name": "mlp_generic",
+  "version": 1,
+  "quant": "int8",
+  "input": {
+    "tensor": "x"
+  },
+  "output": {
+    "tensors": [
+      "fc3"
+    ],
+    "tensor": "fc3"
+  },
+  "tensors": {
+    "x": {
+      "shape": [
+        1,
+        16
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.013284357513968401,
+        "zero_point": 0
+      }
+    },
+    "fc1": {
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.009652079559686616,
+        "zero_point": 0
+      }
+    },
+    "relu": {
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.009652079559686616,
+        "zero_point": 0
+      }
+    },
+    "fc2": {
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.005080041453594298,
+        "zero_point": 0
+      }
+    },
+    "relu_1": {
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.005080041453594298,
+        "zero_point": 0
+      }
+    },
+    "fc3": {
+      "shape": [
+        1,
+        10
+      ],
+      "dtype": "i8",
+      "quant": {
+        "scale": 0.002271341057274285,
+        "zero_point": 0
+      }
+    }
+  },
+  "ops": [
+    {
+      "name": "fc1",
+      "op": "linear_s8",
+      "inputs": [
+        "x"
+      ],
+      "outputs": [
+        "relu"
+      ],
+      "weight": "fc1.weight_q",
+      "bias": "fc1.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 16,
+        "N": 32
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1488967427,
+        "output_shift": 8,
+        "activation_min": 0,
+        "activation_max": 127
+      },
+      "dispatch_id": 0,
+      "hardware_target": "any",
+      "depends_on": []
+    },
+    {
+      "name": "fc2",
+      "op": "linear_s8",
+      "inputs": [
+        "relu"
+      ],
+      "outputs": [
+        "relu_1"
+      ],
+      "weight": "fc2.weight_q",
+      "bias": "fc2.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 32,
+        "N": 32
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1428750699,
+        "output_shift": 8,
+        "activation_min": 0,
+        "activation_max": 127
+      },
+      "dispatch_id": 1,
+      "hardware_target": "any",
+      "depends_on": [
+        0
+      ]
+    },
+    {
+      "name": "fc3",
+      "op": "linear_s8",
+      "inputs": [
+        "relu_1"
+      ],
+      "outputs": [
+        "fc3"
+      ],
+      "weight": "fc3.weight_q",
+      "bias": "fc3.bias_q",
+      "shape": {
+        "M": 1,
+        "K": 32,
+        "N": 10
+      },
+      "quant": {
+        "input_offset": 0,
+        "filter_offset": 0,
+        "output_offset": 0,
+        "output_multiplier": 1699799953,
+        "output_shift": 8,
+        "activation_min": -128,
+        "activation_max": 127
+      },
+      "dispatch_id": 2,
+      "hardware_target": "any",
+      "depends_on": [
+        1
+      ]
+    }
+  ],
+  "dispatches": [
+    0,
+    1,
+    2
+  ]
+}

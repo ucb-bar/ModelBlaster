@@ -111,14 +111,52 @@ def _output_block(text: str, tag: Optional[str] = None) -> str:
 
 
 def parse_output(text: str, tag: Optional[str] = None) -> np.ndarray:
+    """Parse the OUTPUT block. Supports two formats:
+
+    Format 1 (small tensors — < ~64 elements):
+        =1
+        =2
+        ...
+      One value per line; returned as a 1D float32 array.
+
+    Format 2 (large tensors — sampled to head+tail to stay UART-friendly):
+        OUTPUT_SAMPLED size=<N> head=<H> tail=<T>
+          [0] <v>
+          [1] <v>
+          ...
+          [N-T] <v>
+          ...
+          [N-1] <v>
+        OUTPUT_SUMMARY sum=... abs_sum=... min=... max=...
+      Returns a SPARSE representation: ndarray of shape (n_samples, 2)
+      with columns (index, value). check_one() handles this by comparing
+      against golden[index] at each sampled position.
+    """
     body = _output_block(text, tag)
-    nums = []
+    # Detect format.
+    if "OUTPUT_SAMPLED" in body:
+        # Sampled large-tensor format.
+        nums: list[tuple[int, float]] = []
+        for line in body.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("OUTPUT_SAMPLED") or line.startswith("OUTPUT_SUMMARY"):
+                continue
+            # Expected: "[<idx>] <val>"
+            m = re.match(r"\[(\d+)\]\s+(.+)$", line)
+            if m:
+                nums.append((int(m.group(1)), float(m.group(2))))
+        # Sparse array of (index, value) pairs.
+        return np.array(nums, dtype=np.float32)
+    # Dense small-tensor format.
+    nums_dense = []
     for line in body.splitlines():
         line = line.strip()
         if not line:
             continue
-        nums.append(float(line))
-    return np.array(nums, dtype=np.float32)
+        nums_dense.append(float(line))
+    return np.array(nums_dense, dtype=np.float32)
 
 
 def parse_wall_cycles(text: str, tag: Optional[str] = None) -> Optional[int]:
@@ -311,6 +349,46 @@ def check_one(actual: np.ndarray, golden_npz_path: str,
         return ok, stats
 
     golden = raw_golden.astype(np.float32).reshape(-1)
+
+    # Sparse "sampled" actual: shape (n, 2) with columns (index, value).
+    # Emitted by parse_output() when the harness used OUTPUT_SAMPLED.
+    # Compare each sampled value against golden at its index.
+    if actual.ndim == 2 and actual.shape[1] == 2:
+        idxs = actual[:, 0].astype(np.int64)
+        vals = actual[:, 1].astype(np.float32)
+        max_idx = int(idxs.max()) if len(idxs) else -1
+        if max_idx >= len(golden):
+            err = (f"sampled index {max_idx} out of golden size "
+                   f"{len(golden)}")
+            print(f"{label}FAIL: {err}")
+            return False, {"error": err, "atol": a, "rtol": r}
+        gold_at = golden[idxs]
+        abs_err = np.abs(vals - gold_at)
+        rel_err = np.where(
+            np.abs(gold_at) > 0,
+            abs_err / np.abs(gold_at),
+            np.zeros_like(abs_err))
+        ok = bool(np.all((abs_err <= a) | (rel_err <= r)))
+        max_ae = float(abs_err.max()) if len(abs_err) else 0.0
+        max_re = float(rel_err.max()) if len(rel_err) else 0.0
+        stats = {
+            "max_abs_err": max_ae, "max_rel_err": max_re,
+            "atol": a, "rtol": r, "source": "sampled",
+            "n_sampled": int(len(idxs)),
+            "n_full": int(len(golden)),
+        }
+        print(f"{label}sampled {len(idxs)} of {len(golden)} elements "
+              f"at idx {idxs.tolist()}")
+        print(f"{label}actual: {vals.tolist()}")
+        print(f"{label}golden: {gold_at.tolist()}")
+        print(
+            f"{label}max_abs_err={max_ae:.3g} max_rel_err={max_re:.3g} "
+            f"(atol={a:g} rtol={r:g}, sampled)"
+        )
+        print(f"{label}{'PASS' if ok else 'FAIL'}")
+        return ok, stats
+
+    # Dense actual: legacy small-tensor compare path.
     ok, stats = compare(actual, golden, atol=a, rtol=r)
     if "error" in stats:
         print(f"{label}FAIL: {stats['error']}")
@@ -328,7 +406,7 @@ def check_one(actual: np.ndarray, golden_npz_path: str,
 
 def model_io_path(repo_root: str, name: str, quant: str) -> str:
     return os.path.join(
-        repo_root, "modelblaster", "examples", name, quant, "generated", "io.npz"
+        repo_root, "examples", name, quant, "generated", "io.npz"
     )
 
 
@@ -436,23 +514,32 @@ def report_run(text: str, *, models: Optional[list[str]],
                atol: Optional[float], rtol: Optional[float],
                profile_csv: Optional[str],
                iree_args: IREEProfileArgs, backend_tag: str,
-               repo_root: str) -> bool:
+               repo_root: str,
+               quants: Optional[list[str]] = None) -> bool:
     """Single entry point used by both runners after they've captured
     the harness stdout. Walks the OUTPUT/PROFILE/WALL blocks, compares
     each against its golden, prints summaries, writes per-model CSV,
     and emits IREE-shape profile data when configured. Returns overall
-    PASS/FAIL boolean."""
+    PASS/FAIL boolean.
+
+    Multi-quant: when `quants` is given, it's a parallel list to
+    `models` providing each model's quant for golden-path resolution.
+    Falls back to the single `quant` arg when not given. Useful for
+    mixed-quant binaries (int8 dronet + fp32 mlp_control in one
+    xpurt_demo build)."""
     if models:
         names = [n.strip() for n in models if n.strip()]
         all_ok = True
-        for name in names:
+        for i, name in enumerate(names):
             print(f"\n--- model: {name} ---")
             # Prefer the in-binary verify summary when present (modern
             # harness — saves shipping the full output tensor over UART);
             # fall back to per-element parse_output for legacy binaries.
             verify = parse_verify(text, tag=name)
             actual = None if verify is not None else parse_output(text, tag=name)
-            golden_path = model_io_path(repo_root, name, quant)
+            per_model_quant = (quants[i] if quants and i < len(quants)
+                               else quant)
+            golden_path = model_io_path(repo_root, name, per_model_quant)
             if not os.path.exists(golden_path):
                 print(f"FAIL: golden not found at {golden_path}")
                 all_ok = False

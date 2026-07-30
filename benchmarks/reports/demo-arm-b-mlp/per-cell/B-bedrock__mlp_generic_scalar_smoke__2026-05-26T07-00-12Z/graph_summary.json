@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "n_dispatches": 3,
+  "n_distinct_op_kinds": 1,
+  "n_distinct_shapes": 3,
+  "by_op_kind": {
+    "linear_s8": {
+      "count": 3,
+      "distinct_shapes": 3
+    }
+  }
+}

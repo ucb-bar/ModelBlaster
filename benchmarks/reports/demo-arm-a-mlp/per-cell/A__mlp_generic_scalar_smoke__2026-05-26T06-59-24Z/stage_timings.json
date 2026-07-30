@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "extract_s": 0.001,
+  "generate_skeleton_s": 0.122,
+  "generate_kernels_s": 0.175,
+  "build_s": 6.527,
+  "run_s": 0.235,
+  "total_stage_s": 7.0600000000000005
+}

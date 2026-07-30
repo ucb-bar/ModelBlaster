@@ -10,6 +10,6 @@
 #   MODELBLASTER_MOBILENETV2_NUM_CLASSES  default 1000
 set -euo pipefail
 MODEL_NAME=mobilenet_v2
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MODEL_NAME REPO_ROOT
-source "${REPO_ROOT}/modelblaster/examples/_run_lib.sh"
+source "${REPO_ROOT}/examples/_run_lib.sh"
