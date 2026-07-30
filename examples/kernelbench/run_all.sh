@@ -34,7 +34,7 @@ run_bench() {
   if [[ -z "$f" || ! -f "$f" ]]; then printf 'SKIP\t%s\t-\t(not found)\n' "$b"; return; fi
   local log="/tmp/kb_${b}.log"
   if BENCH_FILE="$f" bash "${REPO_ROOT}/modelblaster/examples/kernelbench/run_one.sh" > "$log" 2>&1; then
-    local err; err=$(grep -aoE "max_abs_err=[0-9.eE+-]+" "$log" | tail -1)
+    local err; err=$(grep -aoE 'max_abs_err=[^ ]+' "$log" | tail -1)
     if grep -qaE "^PASS$" "$log"; then printf 'PASS\t%s\t%s\tok\n' "$b" "$err"
     else printf 'FAIL-verify\t%s\t%s\t-\n' "$b" "$err"; fi
   else
@@ -53,7 +53,9 @@ printf '%s\n' "${LIST[@]}" | xargs -d '\n' -P "${JOBS}" -I{} bash -c 'run_bench 
 pass=0; fail=0; declare -a rows
 # Re-emit in the original bench order for a stable report.
 for b in "${LIST[@]}"; do
-  line=$(grep -P "\t${b}\t" "$res_tmp" | head -1)
+  # Match the bench in field 2 exactly (awk fixed-string; avoids treating the
+  # bench name as a regex, which broke on some names).
+  line=$(awk -F'\t' -v b="$b" '$2==b{print; exit}' "$res_tmp")
   [[ -z "$line" ]] && continue
   IFS=$'\t' read -r s bb e n <<< "$line"
   case "$s" in
