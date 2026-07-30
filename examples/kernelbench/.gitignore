@@ -1,0 +1,3 @@
+# Per-bench generated IR, Zephyr build trees, and spike run outputs are
+# reproducible from run_all.sh — do not vendor them.
+kb_*/
