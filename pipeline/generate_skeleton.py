@@ -1191,6 +1191,47 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_mean_abs_norm({in_ptr}, {out_ptr}, "
                 f"{sh['outer']}, {sh['reduce']}, {sh['inner']})"
             )
+        elif op["op"] == "mse_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            call = f"kernel_mse_loss({a_ptr}, {b_ptr}, {out_ptr}, {op['shape']['n']})"
+        elif op["op"] == "hinge_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_hinge_loss({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['n']}, {sh.get('targ_len', sh['n'])})"
+            )
+        elif op["op"] == "huber_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            beta = op.get("beta", 1.0)
+            call = (
+                f"kernel_huber_loss({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{op['shape']['n']}, {_f32(beta)})"
+            )
+        elif op["op"] in ("cross_entropy_loss", "kldiv_loss"):
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']})"
+            )
+        elif op["op"] == "triplet_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            p_ptr = ptr_for(op["inputs"][1], "in")
+            n_ptr = ptr_for(op["inputs"][2], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_triplet_loss({a_ptr}, {p_ptr}, {n_ptr}, {out_ptr}, "
+                f"{sh['B']}, {sh['F']}, {_f32(op.get('margin', 1.0))})"
+            )
+        elif op["op"] == "log":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_log({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "adaptive_avg_pool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]

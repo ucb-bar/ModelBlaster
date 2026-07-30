@@ -387,6 +387,74 @@ def _match_mean_abs_norm(out, x):
     return len(abs_node.args) >= 1 and abs_node.args[0] is x
 
 
+def _agents_loss_mse(a, b):
+    return a
+
+
+def _agents_loss_hinge(a, b):
+    return a
+
+
+def _is_mean_all(node) -> bool:
+    """torch.mean with no dim → scalar (mean over all elements)."""
+    if not (hasattr(node, "op") and node.op == "call_function"
+            and getattr(node.target, "__name__", "") == "mean"):
+        return False
+    kw = node.kwargs or {}
+    return kw.get("dim") is None and len(node.args) < 2
+
+
+def _maybe_fuse_loss(gm) -> None:
+    """Fuse whole-graph loss patterns that produce a scalar from 2 inputs into
+    a single op: MSE = mean((a-b)^2), Hinge = mean(clamp(1 - a*b, min=0)).
+    Single-node losses (cross_entropy, smooth_l1, kl_div, TripletMarginLoss)
+    are handled directly in the per-node loop, not here."""
+    outputs = [n for n in gm.graph.nodes if n.op == "output"]
+    if len(outputs) != 1:
+        return
+    out_arg = outputs[0].args[0]
+    if not (hasattr(out_arg, "op") and _is_mean_all(out_arg)):
+        return
+    inner = out_arg.args[0]  # the tensor being mean-reduced
+
+    sentinel = None
+    # MSE: mean(pow(sub(a, b), 2))
+    if (hasattr(inner, "op") and inner.op == "call_function"
+            and inner.target in (_operator.pow, torch.pow)
+            and len(inner.args) >= 2 and inner.args[1] == 2):
+        sub = inner.args[0]
+        if (hasattr(sub, "op") and sub.op == "call_function"
+                and sub.target in (_operator.sub, torch.sub)
+                and all(isinstance(x, torch.fx.Node) for x in sub.args[:2])):
+            a, b = sub.args[0], sub.args[1]
+            sentinel = _agents_loss_mse
+    # Hinge: mean(clamp(sub(1, mul(a, b)), min=0))
+    if sentinel is None and (hasattr(inner, "op") and inner.op == "call_function"
+            and getattr(inner.target, "__name__", "") == "clamp"):
+        rsub = inner.args[0]
+        if (hasattr(rsub, "op") and rsub.op == "call_function"
+                and rsub.target in (_operator.sub, torch.sub, torch.rsub)):
+            mul = rsub.args[1] if rsub.args[0] == 1 else (
+                rsub.args[0] if rsub.target is torch.rsub else None)
+            if (hasattr(mul, "op") and mul.op == "call_function"
+                    and mul.target in (_operator.mul, torch.mul)
+                    and all(isinstance(x, torch.fx.Node) for x in mul.args[:2])):
+                a, b = mul.args[0], mul.args[1]
+                sentinel = _agents_loss_hinge
+    if sentinel is None:
+        return
+
+    n = int(np.prod(list(inner.meta["tensor_meta"].shape)))
+    with gm.graph.inserting_before(outputs[0]):
+        new_node = gm.graph.call_function(sentinel, args=(a, b))
+    new_node.meta["loss_n"] = n
+    if "tensor_meta" in out_arg.meta:
+        new_node.meta["tensor_meta"] = out_arg.meta["tensor_meta"]
+    outputs[0].args = (new_node,)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+
+
 def _maybe_fuse_compound_activation(gm) -> None:
     """If the entire forward graph matches a known compound activation,
     rewrite the FX graph in place: remove the multi-op subgraph and
@@ -512,6 +580,7 @@ SUPPORTED_MODULES = (
     torch.nn.LayerNorm,  # normalize over trailing normalized_shape dims
     torch.nn.GroupNorm,  # per-(sample,group) normalize; InstanceNorm is G==C
     torch.nn.InstanceNorm2d,  # per-(sample,channel) spatial normalize
+    torch.nn.TripletMarginLoss,  # 3-input margin loss → scalar
     torch.nn.Sigmoid,
     # YOLOv8 backbone uses SiLU activation throughout; neck uses Upsample.
     torch.nn.SiLU,
@@ -1687,6 +1756,7 @@ def extract(
     # marker function. The per-node iteration below then sees that
     # marker and emits a clean single-op IR.
     _maybe_fuse_compound_activation(gm)
+    _maybe_fuse_loss(gm)
 
     tensors: dict[str, dict] = {}
     ops: list[dict] = []
@@ -2223,6 +2293,22 @@ def extract(
                     "shape": {"N": N_, "C": C, "G": G, "HW": HW},
                 })
 
+            elif isinstance(mod, torch.nn.TripletMarginLoss):
+                # 3 inputs (anchor, positive, negative), p=2, reduction=mean.
+                a_name = node.args[0].name
+                p_name = node.args[1].name
+                n_name = node.args[2].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                B = a_shape[0]
+                Feat = int(np.prod(a_shape[1:])) if len(a_shape) > 1 else 1
+                ops.append({
+                    "name": str(node.target), "op": "triplet_loss",
+                    "inputs": [a_name, p_name, n_name],
+                    "outputs": [out_name],
+                    "margin": float(mod.margin),
+                    "shape": {"B": B, "F": Feat},
+                })
+
             elif isinstance(mod, torch.nn.Dropout):
                 # Eval-mode dropout is identity. Record as a view: the output
                 # tensor aliases the input.
@@ -2563,6 +2649,61 @@ def extract(
                     "outputs": [out_name],
                     "shape": {"M": M, "K": K},
                 })
+            elif tname == "log" or target is torch.log:
+                # Elementwise natural log (used before F.kl_div, KernelBench 98).
+                in_name = node.args[0].name
+                n = int(np.prod(tensors[in_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "log",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+            elif tname == "smooth_l1_loss" \
+                    or target is torch.nn.functional.smooth_l1_loss:
+                # Huber / smooth-L1 loss (KernelBench 96). beta defaults to 1.0.
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                n = int(np.prod(tensors[a_name]["shape"]))
+                beta = float((node.kwargs or {}).get("beta", 1.0))
+                ops.append({
+                    "name": node.name, "op": "huber_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "beta": beta, "shape": {"n": n},
+                })
+            elif tname == "cross_entropy" \
+                    or target is torch.nn.functional.cross_entropy:
+                # Mean cross-entropy (KernelBench 95). logits [N, C], targets [N]
+                # class indices (carried as floats in the flat io buffer).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                if len(a_shape) != 2:
+                    raise NotImplementedError(
+                        f"cross_entropy at {node.name}: only [N, C] logits "
+                        f"supported (got {a_shape})")
+                ops.append({
+                    "name": node.name, "op": "cross_entropy_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"N": a_shape[0], "C": a_shape[1]},
+                })
+            elif tname == "kl_div" or target is torch.nn.functional.kl_div:
+                # KL divergence, reduction='batchmean' (KernelBench 98). First
+                # arg is already log(pred).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                red = (node.kwargs or {}).get("reduction", "mean")
+                if red != "batchmean":
+                    raise NotImplementedError(
+                        f"kl_div at {node.name}: only reduction='batchmean' "
+                        f"supported (got {red!r})")
+                N = a_shape[0]
+                C = int(np.prod(a_shape[1:])) if len(a_shape) > 1 else 1
+                ops.append({
+                    "name": node.name, "op": "kldiv_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"N": N, "C": C},
+                })
             elif tname == "elu" or target is torch.nn.functional.elu:
                 # KernelBench 31_ELU may use functional too. nn.ELU's
                 # alpha defaults to 1.0; functional takes alpha kwarg.
@@ -2897,6 +3038,25 @@ def extract(
                     "eps": float(node.meta.get("rms_eps", 1e-5)),
                     "shape": {"outer": outer, "reduce": reduce, "inner": inner},
                 })
+            elif target is _agents_loss_mse or target is _agents_loss_hinge:
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                n = int(node.meta.get("loss_n",
+                                      int(np.prod(tensors[a_name]["shape"]))))
+                if target is _agents_loss_mse:
+                    ops.append({
+                        "name": node.name, "op": "mse_loss",
+                        "inputs": [a_name, b_name], "outputs": [out_name],
+                        "shape": {"n": n},
+                    })
+                else:
+                    # Hinge: targ may broadcast over pred (targ_len divides n).
+                    targ_len = int(np.prod(tensors[b_name]["shape"]))
+                    ops.append({
+                        "name": node.name, "op": "hinge_loss",
+                        "inputs": [a_name, b_name], "outputs": [out_name],
+                        "shape": {"n": n, "targ_len": max(1, targ_len)},
+                    })
             elif target is _agents_compound_mean_abs_norm:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
