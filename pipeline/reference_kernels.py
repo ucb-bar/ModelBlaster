@@ -8061,6 +8061,250 @@ void kernel_layer_norm(const float *input, const float *gamma,
 )
 
 
+# --- KernelBench loss ops (multi-input, scalar output) --------------------
+
+def _loss2_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int]
+
+
+MSE_LOSS = KernelSpec(
+    op="mse_loss",
+    signature="void kernel_mse_loss(const float *a, const float *b, float *output, int n)",
+    semantics=(
+        "Mean squared error (KernelBench 94, mean((a-b)^2)):\n"
+        "  output[0] = (1/n) * sum_i (a[i] - b[i])^2\n"
+        "float32; output is a single scalar."
+    ),
+    reference_impl="""\
+void kernel_mse_loss(const float *a, const float *b, float *output, int n) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float d = a[i] - b[i];
+        acc += (double)d * d;
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_loss2_argtypes,
+)
+
+
+def _huber_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+HUBER_LOSS = KernelSpec(
+    op="huber_loss",
+    signature=(
+        "void kernel_huber_loss(const float *a, const float *b, float *output, "
+        "int n, float beta)"
+    ),
+    semantics=(
+        "Smooth-L1 / Huber loss (F.smooth_l1_loss, reduction=mean; KernelBench\n"
+        "96). Per element with d = a-b: 0.5*d^2/beta if |d| < beta, else\n"
+        "|d| - 0.5*beta. output[0] = mean over n. beta defaults to 1.0. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_huber_loss(const float *a, const float *b, float *output,
+                       int n, float beta) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        acc += (d < beta) ? (0.5 * d * d / beta) : (d - 0.5 * beta);
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64, "beta": 1.0}],
+    argtypes_factory=_huber_argtypes,
+)
+
+
+def _hinge_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+HINGE_LOSS = KernelSpec(
+    op="hinge_loss",
+    signature=(
+        "void kernel_hinge_loss(const float *pred, const float *targ, "
+        "float *output, int n, int targ_len)"
+    ),
+    semantics=(
+        "Hinge loss (KernelBench 100, mean(clamp(1 - pred*targ, min=0))):\n"
+        "  output[0] = (1/n) * sum_i max(0, 1 - pred[i]*targ[i % targ_len])\n"
+        "targ broadcasts over pred (targ_len == n for no broadcast, or a\n"
+        "divisor of n — e.g. 1 for a per-batch scalar). targ is expected in\n"
+        "{-1, +1}. float32; scalar output."
+    ),
+    reference_impl="""\
+void kernel_hinge_loss(const float *pred, const float *targ, float *output,
+                       int n, int targ_len) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float h = 1.0f - pred[i] * targ[i % targ_len];
+        if (h > 0.0f) acc += h;
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64, "targ_len": 64}],
+    argtypes_factory=_hinge_argtypes,
+)
+
+
+def _ce_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+CROSS_ENTROPY_LOSS = KernelSpec(
+    op="cross_entropy_loss",
+    signature=(
+        "void kernel_cross_entropy_loss(const float *logits, "
+        "const float *targets, float *output, int N, int C)"
+    ),
+    semantics=(
+        "Cross-entropy loss (F.cross_entropy, reduction=mean; KernelBench 95).\n"
+        "logits is [N, C]; targets are N class indices passed as floats (cast\n"
+        "to int). loss_i = logsumexp(logits[i,:]) - logits[i, t_i].\n"
+        "output[0] = mean_i loss_i. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_cross_entropy_loss(const float *logits, const float *targets,
+                               float *output, int N, int C) {
+    double total = 0.0;
+    for (int i = 0; i < N; i++) {
+        const float *row = logits + (long)i * C;
+        float maxv = row[0];
+        for (int c = 1; c < C; c++) if (row[c] > maxv) maxv = row[c];
+        float sum = 0.0f;
+        for (int c = 0; c < C; c++) sum += expf(row[c] - maxv);
+        float lse = maxv + logf(sum);
+        int t = (int)(targets[i] + 0.5f);
+        total += (double)(lse - row[t]);
+    }
+    output[0] = (float)(total / (double)N);
+}
+""",
+    extra_shapes=[{"N": 4, "C": 8}],
+    argtypes_factory=_ce_argtypes,
+)
+
+
+KLDIV_LOSS = KernelSpec(
+    op="kldiv_loss",
+    signature=(
+        "void kernel_kldiv_loss(const float *log_input, const float *target, "
+        "float *output, int N, int C)"
+    ),
+    semantics=(
+        "KL divergence, reduction='batchmean' (F.kl_div; KernelBench 98). The\n"
+        "first arg is already log(pred). Over an [N, C] tensor:\n"
+        "  output[0] = (1/N) * sum_{i,c} target*(log(target) - log_input)\n"
+        "target*log(target) is taken as 0 where target == 0. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_kldiv_loss(const float *log_input, const float *target,
+                       float *output, int N, int C) {
+    double acc = 0.0;
+    long total = (long)N * C;
+    for (long i = 0; i < total; i++) {
+        float t = target[i];
+        if (t > 0.0f) acc += (double)t * (logf(t) - log_input[i]);
+    }
+    output[0] = (float)(acc / (double)N);
+}
+""",
+    extra_shapes=[{"N": 4, "C": 8}],
+    argtypes_factory=_ce_argtypes,
+)
+
+
+def _triplet_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+TRIPLET_LOSS = KernelSpec(
+    op="triplet_loss",
+    signature=(
+        "void kernel_triplet_loss(const float *anchor, const float *pos, "
+        "const float *neg, float *output, int B, int F, float margin)"
+    ),
+    semantics=(
+        "Triplet margin loss (nn.TripletMarginLoss, p=2, reduction=mean;\n"
+        "KernelBench 99). Per sample b over F features:\n"
+        "  dp = ||anchor_b - pos_b||_2,  dn = ||anchor_b - neg_b||_2\n"
+        "  loss_b = max(0, dp - dn + margin)\n"
+        "output[0] = mean_b loss_b. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_triplet_loss(const float *anchor, const float *pos,
+                         const float *neg, float *output,
+                         int B, int F, float margin) {
+    double total = 0.0;
+    for (int b = 0; b < B; b++) {
+        const float *a = anchor + (long)b * F;
+        const float *p = pos + (long)b * F;
+        const float *n = neg + (long)b * F;
+        float sp = 0.0f, sn = 0.0f;
+        for (int f = 0; f < F; f++) {
+            float dp = a[f] - p[f];
+            float dn = a[f] - n[f];
+            sp += dp * dp;
+            sn += dn * dn;
+        }
+        float loss = sqrtf(sp) - sqrtf(sn) + margin;
+        if (loss > 0.0f) total += (double)loss;
+    }
+    output[0] = (float)(total / (double)B);
+}
+""",
+    extra_shapes=[{"B": 4, "F": 16, "margin": 1.0}],
+    argtypes_factory=_triplet_argtypes,
+)
+
+
+def _log_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+LOG = KernelSpec(
+    op="log",
+    signature="void kernel_log(const float *input, float *output, int n)",
+    semantics="Elementwise natural log: output[i] = logf(input[i]). float32.",
+    reference_impl="""\
+#include <math.h>
+
+void kernel_log(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) output[i] = logf(input[i]);
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_log_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -8117,6 +8361,13 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "flip": FLIP,
     "mul": MUL,
     "mean_abs_norm": MEAN_ABS_NORM,
+    "mse_loss": MSE_LOSS,
+    "huber_loss": HUBER_LOSS,
+    "hinge_loss": HINGE_LOSS,
+    "cross_entropy_loss": CROSS_ENTROPY_LOSS,
+    "kldiv_loss": KLDIV_LOSS,
+    "triplet_loss": TRIPLET_LOSS,
+    "log": LOG,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
