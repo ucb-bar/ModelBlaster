@@ -1894,9 +1894,15 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
  * dispatch (which pthreadpool_parallelize_1d does). */
 static inline unsigned long rdcycle(void)
 {{
+#if defined(__riscv)
     unsigned long cc;
     __asm__ volatile("rdcycle %0" : "=r"(cc));
     return cc;
+#else
+    /* native_sim / non-RISC-V hosts: no rdcycle. Cycle counts are meaningless
+     * off-target anyway (native runs are for correctness only). */
+    return 0UL;
+#endif
 }}
 {_emit_parallel_wrappers(mid, used_ops)}
 
