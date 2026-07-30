@@ -1188,6 +1188,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             b_ptr = ptr_for(op["inputs"][1], "in")
             n = op["shape"]["n"]
             call = f"kernel_mul({a_ptr}, {b_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "mul_scalar":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_mul_scalar({in_ptr}, {out_ptr}, {sh['n']}, {_f32(op['scalar'])})"
         elif op["op"] == "mean_abs_norm":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
