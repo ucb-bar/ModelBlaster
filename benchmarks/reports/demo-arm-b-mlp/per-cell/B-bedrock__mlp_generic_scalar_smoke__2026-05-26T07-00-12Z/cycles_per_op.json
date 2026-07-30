@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "total_cycles": 17237,
+  "n_ops": 3,
+  "mean_cycles_per_dispatch": 5745.666666666667,
+  "stddev_cycles_per_dispatch": 2987.638922850841,
+  "by_op_kind": {
+    "linear_s8": {
+      "count": 3,
+      "total": 17237,
+      "min": 3235,
+      "max": 9050,
+      "mean": 5745.666666666667,
+      "share": 1.0,
+      "median": 4952.0,
+      "p50": 4952.0,
+      "p90": 8230.4,
+      "p95": 8640.199999999999,
+      "stddev": 2987.638922850841
+    }
+  },
+  "by_dispatch": [
+    {
+      "dispatch_id": 0,
+      "op": "linear_s8",
+      "name": "fc1",
+      "shape": "M=1;K=16;N=32",
+      "cycles": 4952
+    },
+    {
+      "dispatch_id": 1,
+      "op": "linear_s8",
+      "name": "fc2",
+      "shape": "M=1;K=32;N=32",
+      "cycles": 9050
+    },
+    {
+      "dispatch_id": 2,
+      "op": "linear_s8",
+      "name": "fc3",
+      "shape": "M=1;K=32;N=10",
+      "cycles": 3235
+    }
+  ]
+}

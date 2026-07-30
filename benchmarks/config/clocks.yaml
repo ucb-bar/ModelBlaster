@@ -1,0 +1,51 @@
+# Per-target operating frequencies used to convert raw cycles into
+# wall-clock latency. Aggregate.py reads this for the
+# `latency_ms_firesim` / `latency_ms_spike` derived metrics.
+#
+# Notes:
+#   * FireSim defaults match the chipyard bitstream's typical sim
+#     frequency for the dronet / yolov8 / vint flow. The actual
+#     bitstream clock is bitstream-specific; override per-target if
+#     you observe a different frequency in your invoice / log.
+#   * `null` means "do not derive latency for this (target, runner)
+#     pair". cycles_spike on accelerator targets is non-authoritative
+#     anyway (see the cycle-source-honesty policy in metrics.yaml).
+#   * Add an entry per target name in pipeline.backends.BACKENDS.
+
+last_updated: 2026-05-25
+sources:
+  chipyard_bitstream:
+    url: https://github.com/ucb-bar/chipyard/blob/main/docs/Simulation/Software-RTL-Simulation.rst
+    note: |
+      FireSim default sim frequency on chipyard rocket-class targets is
+      typically 100 MHz. Override below if your bitstream differs.
+
+firesim:
+  # Hz; cycles_firesim / clock_hz * 1000 = latency_ms_firesim.
+  default_clock_hz: 100_000_000  # 100 MHz
+  per_target:
+    rvv:                 100_000_000
+    rvv_f16:             100_000_000
+    rvv_opu:             100_000_000
+    gemmini:             100_000_000
+    gemmini_q31:         100_000_000
+    hetero_gemmini_opu:  100_000_000
+
+spike:
+  # Spike has no microarchitectural model on accelerator targets
+  # (atomic exec). Cycles on the scalar / rvv paths are
+  # cycle-suggestive, not cycle-accurate. Assigned 1 GHz as a
+  # convention so latency_ms_spike on those targets converts cleanly
+  # for delta-vs-baseline purposes -- not for absolute claims.
+  default_clock_hz: 1_000_000_000  # 1 GHz nominal
+  per_target:
+    scalar:              1_000_000_000
+    scalar_f16:          1_000_000_000
+    rvv:                 1_000_000_000
+    rvv_f16:             1_000_000_000
+    # The accelerator targets are explicitly null -- their spike
+    # cycles aren't a valid latency input.
+    rvv_opu:             null
+    gemmini:             null
+    gemmini_q31:         null
+    hetero_gemmini_opu:  null

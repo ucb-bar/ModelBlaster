@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "report_id": "demo-arm-b-mlp",
+  "generated_at": "2026-05-26T07:01:18.055426+00:00",
+  "generated_by": {
+    "user": "agustin",
+    "hostname": "garden",
+    "git_sha": "7ea176a",
+    "git_branch": "feat/benchmark-harness"
+  },
+  "filter": {
+    "session": null,
+    "since": null
+  },
+  "windows": {
+    "cumulative": {
+      "label": "EXPORT",
+      "n_calls": 2,
+      "total_cost_usd": 0.07692,
+      "cost_known": true,
+      "input_uncached": 9200,
+      "input_cached": 0,
+      "output": 3288
+    },
+    "monthly": {
+      "label": "MONTHLY",
+      "n_calls": 2,
+      "total_cost_usd": 0.07692,
+      "cost_known": true,
+      "input_uncached": 9200,
+      "input_cached": 0,
+      "output": 3288
+    }
+  },
+  "by_model": {
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+      "n_calls": 2,
+      "input_uncached": 9200,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 3288,
+      "cost_usd": 0.07692,
+      "cost_known": true
+    }
+  },
+  "by_kernel": {
+    "linear_s8": {
+      "n_calls": 2,
+      "input_uncached": 9200,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 3288,
+      "cost_usd": 0.07692,
+      "cost_known": true
+    }
+  },
+  "by_cell": {
+    "B-bedrock/mlp_generic_scalar_smoke/2026-05-26T07-00-12Z": {
+      "n_calls": 2,
+      "cost_usd": 0.07692,
+      "cost_known": true,
+      "input_uncached": 9200,
+      "input_cached_read": 0,
+      "input_cached_write": 0,
+      "output": 3288
+    }
+  },
+  "sessions": [
+    {
+      "id": "mlp-arm-b-demo-v2",
+      "label": "Option B: Arm B-bedrock MLP w/ beam=1 exp=2 iter=1",
+      "started_at": "2026-05-26T07:00:12.407004+00:00",
+      "ended_at": "2026-05-26T07:01:00.651716+00:00",
+      "is_active": false,
+      "n_calls": 2,
+      "cost_usd": 0.0769
+    }
+  ],
+  "config": {
+    "pricing_last_updated": "2026-05-25"
+  },
+  "kind": "experiment",
+  "bundle_contents": {
+    "per_cell": [
+      {
+        "cell": "A/mlp_generic_scalar_smoke/2026-05-26T06-59-24Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv"
+        ]
+      },
+      {
+        "cell": "B-bedrock/mlp_generic_scalar_smoke/2026-05-26T07-00-12Z",
+        "files": [
+          "run.json",
+          "accuracy.json",
+          "cycles_per_op.json",
+          "kernel_picks.json",
+          "stage_timings.json",
+          "binary_size.json",
+          "graph_summary.json",
+          "passes_applied.json",
+          "wall_cycles.txt",
+          "env.txt",
+          "profile_spike.csv",
+          "llm_calls.jsonl",
+          "llm_tokens.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      }
+    ],
+    "kernels": [
+      {
+        "model": "mlp_generic",
+        "quant": "int8",
+        "target": "scalar",
+        "files": [
+          "graph.json",
+          "passes_applied.json",
+          "kernels.c",
+          "kernels.h",
+          "kernel_picks.json",
+          "optimize_summary.json",
+          "beam_search_trajectory.jsonl"
+        ]
+      }
+    ],
+    "missing": []
+  }
+}

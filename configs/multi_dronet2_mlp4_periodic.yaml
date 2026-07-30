@@ -1,0 +1,32 @@
+# Periodic variant of multi_dronet2_mlp4.yaml — each instance is bound
+# to its periodic time slice ([i*period/N, (i+1)*period/N]) so the
+# scheduler enforces "fire at frequency F", not just "do N copies
+# anywhere in the makespan."
+#
+# Periods (75 ms horizon):
+#   - dronet (2 instances) → 37.5 ms each → 26.7 Hz
+#   - mlp_control (4 instances) → 18.75 ms each → 53.3 Hz
+#
+# HEFT respects min_start_t (instances start in their slot) but doesn't
+# enforce max_end_t — instances may finish past their deadline. MOSEK
+# enforces both but currently fails on this formulation (numerical, not
+# infeasibility). The headline 3way_mosek_dronet2_mlp4.json result
+# (25.30 ms makespan, no periodic bounds) is the "minimize total time"
+# answer; this fixture is the "respect periodic frequencies" answer.
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: opu0,     kind: CPU_E, hart: 1 }
+requantize_ops: [conv2d_s8, linear_s8]
+networks:
+  - { name: dronet,      quant: int8, instances: 2 }
+  - { name: mlp_control, quant: int8, instances: 4 }
+horizon_ms: 75.0
+enforce_periodic: true
+solver: MOSEK
+time_limit_s: 120
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000
