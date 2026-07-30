@@ -8334,6 +8334,71 @@ void kernel_log(const float *input, float *output, int n) {
 )
 
 
+def _sdpa_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+SDPA = KernelSpec(
+    op="sdpa",
+    signature=(
+        "void kernel_sdpa(const float *Q, const float *K, const float *V, "
+        "float *output, int BH, int S, int D)"
+    ),
+    semantics=(
+        "Scaled dot-product attention (F.scaled_dot_product_attention, no mask,\n"
+        "no dropout; KernelBench 97). Q/K/V are [B, H, S, D] viewed as BH=B*H\n"
+        "independent [S, D] attentions:\n"
+        "  scores = (Q @ K^T) / sqrt(D)      [S, S]\n"
+        "  P      = softmax(scores, axis=-1)\n"
+        "  output = P @ V                    [S, D]\n"
+        "Math in fp32. A per-row scores[S] scratch buffer is used."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_sdpa(const float *Q, const float *K, const float *V,
+                 float *output, int BH, int S, int D) {
+    float scale = 1.0f / sqrtf((float)D);
+    for (int bh = 0; bh < BH; bh++) {
+        const float *Qb = Q + (long)bh * S * D;
+        const float *Kb = K + (long)bh * S * D;
+        const float *Vb = V + (long)bh * S * D;
+        float *Ob = output + (long)bh * S * D;
+        float scores[S];
+        for (int i = 0; i < S; i++) {
+            const float *qi = Qb + (long)i * D;
+            float smax = -3.402823e38f;
+            for (int j = 0; j < S; j++) {
+                const float *kj = Kb + (long)j * D;
+                float s = 0.0f;
+                for (int d = 0; d < D; d++) s += qi[d] * kj[d];
+                s *= scale;
+                scores[j] = s;
+                if (s > smax) smax = s;
+            }
+            float sum = 0.0f;
+            for (int j = 0; j < S; j++) {
+                scores[j] = expf(scores[j] - smax);
+                sum += scores[j];
+            }
+            float inv = 1.0f / sum;
+            float *oi = Ob + (long)i * D;
+            for (int d = 0; d < D; d++) {
+                float acc = 0.0f;
+                for (int j = 0; j < S; j++) acc += scores[j] * Vb[(long)j * D + d];
+                oi[d] = acc * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"BH": 2, "S": 8, "D": 16}],
+    argtypes_factory=_sdpa_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -8398,6 +8463,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "kldiv_loss": KLDIV_LOSS,
     "triplet_loss": TRIPLET_LOSS,
     "log": LOG,
+    "sdpa": SDPA,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
