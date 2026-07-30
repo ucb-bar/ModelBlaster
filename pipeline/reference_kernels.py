@@ -306,6 +306,13 @@ def _relu_s8_argtypes():
     return [i8p, i8p, ctypes.c_int]
 
 
+def _relu6_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, qmax (int8 value of the 6.0 clamp ceiling)
+    return [i8p, i8p, ctypes.c_int, ctypes.c_int]
+
+
 def _conv2d_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -1689,6 +1696,39 @@ void kernel_relu_s8(const int8_t *input, int8_t *output, int n)
 """,
         ),
     ],
+)
+
+
+RELU6_S8 = KernelSpec(
+    op="relu6_s8",
+    signature=("void kernel_relu6_s8(const int8_t *input, int8_t *output, "
+               "int n, int qmax)"),
+    semantics=(
+        "Elementwise ReLU6 on a contiguous int8 buffer with symmetric "
+        "quantization (zero_point = 0, and input/output share the same "
+        "scale s):\n"
+        "  output[i] = clamp(input[i], 0, qmax)  for i in [0, n)\n"
+        "where `qmax` is the int8 encoding of the 6.0 clamp ceiling, i.e. "
+        "qmax = round(6.0 / s) saturated into [1, 127]. Standalone version; "
+        "the ReLU6 activation clamped at 6 that follows conv/bn in "
+        "MobileNet-style blocks."
+    ),
+    reference_impl="""\
+void kernel_relu6_s8(const int8_t *input, int8_t *output, int n, int qmax) {
+    for (int i = 0; i < n; i++) {
+        int v = input[i];
+        if (v < 0) v = 0;
+        if (v > qmax) v = qmax;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 256},
+    ],
+    argtypes_factory=_relu6_s8_argtypes,
 )
 
 
@@ -6907,6 +6947,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "sigmoid": SIGMOID,
     "linear_s8": LINEAR_S8,
     "relu_s8": RELU_S8,
+    "relu6_s8": RELU6_S8,
     "conv2d_s8": CONV2D_S8,
     "maxpool2d_s8": MAXPOOL2D_S8,
     "add_s8": ADD_S8,
