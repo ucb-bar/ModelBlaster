@@ -1120,6 +1120,43 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
                 f"{sh['PH']}, {sh['PW']}, {sh['DH']}, {sh['DW']}, {sh['G']})"
             )
+        elif op["op"] in ("conv3d", "conv_transpose3d"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['ID']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['OD']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KD']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SD']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PD']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh['DD']}, {sh['DH']}, {sh['DW']}, {sh['G']})"
+            )
+        elif op["op"] == "maxpool3d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_maxpool3d({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['ID']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OD']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KD']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SD']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PD']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh['DD']}, {sh['DH']}, {sh['DW']})"
+            )
+        elif op["op"] == "avgpool3d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_avgpool3d({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['ID']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OD']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KD']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SD']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PD']}, {sh['PH']}, {sh['PW']})"
+            )
         elif op["op"] == "adaptive_avg_pool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
