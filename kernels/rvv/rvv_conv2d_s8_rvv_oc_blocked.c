@@ -107,17 +107,17 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                         in_byte = input[row_off + iw];
                                     int32_t in_v = (int32_t)in_byte + input_offset;
 
-                                    /* Packed layout is physical [KH][KW][IC][OC]
-                                     * (OIHW transposed by (2,3,1,0) in
+                                    /* Packed layout is physical [IC][KH][KW][OC] (IHWO)
+                                     * (OIHW transposed by (1,2,3,0) in
                                      * generate_skeleton::_backend_pack_weight); OC
                                      * innermost/contiguous. Index must match the
                                      * reference oracle's IHWOC branch:
-                                     * weight[((kh*KW+kw)*IC + ic)*OC + oc].
+                                     * weight[((ic*KH+kh)*KW + kw)*OC + oc].
                                      * With OC blocking, the [oc_outer..oc_end)
                                      * slab stays hot in L1D across the entire
                                      * (n, oh, ow) sweep. */
                                     const int8_t *wp = weight
-                                        + ((size_t)(kh * KW + kw) * IC + ic) * OC
+                                        + ((size_t)(ic * KH + kh) * KW + kw) * OC
                                         + oc_base;
                                     vint8m1_t vw8 = __riscv_vle8_v_i8m1(wp, vl);
 
