@@ -468,10 +468,14 @@ SUPPORTED_MODULES = (
     torch.nn.ConvTranspose2d,  # transposed / fractionally-strided 2D conv
     torch.nn.Conv1d,  # mapped to conv2d with a unit height dim
     torch.nn.ConvTranspose1d,  # mapped to conv_transpose2d with unit height
+    torch.nn.Conv3d,  # 3D conv (NCDHW)
+    torch.nn.ConvTranspose3d,  # 3D transposed conv
     torch.nn.MaxPool2d,
     torch.nn.MaxPool1d,  # mapped to maxpool2d with a unit height dim
+    torch.nn.MaxPool3d,  # 3D max pool
     torch.nn.AvgPool2d,  # fixed-window 2D average pool (KernelBench 45)
     torch.nn.AvgPool1d,  # mapped to avgpool2d with a unit height dim
+    torch.nn.AvgPool3d,  # 3D average pool
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
@@ -497,6 +501,13 @@ def _as_tuple1(v) -> tuple[int]:
     if isinstance(v, (tuple, list)):
         return (int(v[0]),)
     return (int(v),)
+
+
+def _triple(v) -> tuple[int, int, int]:
+    """Coerce int or 3-tuple to a (d, h, w) triple (nn.Conv3d/Pool3d params)."""
+    if isinstance(v, (tuple, list)):
+        return int(v[0]), int(v[1]), int(v[2])
+    return int(v), int(v), int(v)
 
 
 def _tensor_meta(node: torch.fx.Node) -> dict[str, Any]:
@@ -1912,6 +1923,98 @@ def extract(
                         "DH": DH, "DW": DW,
                         "G": G,
                     },
+                })
+
+            elif isinstance(mod, torch.nn.Conv3d):
+                # 3D conv (NCDHW). Weight [OC, IC/G, KD, KH, KW] is 5D so the
+                # backend leaves it in OIDHW (no IHWO repack for 5D).
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                N_, IC, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, OC, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "conv3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "ID": ID, "IH": IH, "IW": IW,
+                              "OC": OC, "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW, "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.ConvTranspose3d):
+                # 3D transposed conv. Weight [IC, OC/G, KD, KH, KW] (5D). OD/OH/
+                # OW come from the traced output shape (output_padding folded in).
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                N_, IC, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, OC, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "conv_transpose3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "ID": ID, "IH": IH, "IW": IW,
+                              "OC": OC, "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW, "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.MaxPool3d):
+                N_, C, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, _, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride if mod.stride is not None
+                                     else mod.kernel_size)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "maxpool3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "ID": ID, "IH": IH, "IW": IW,
+                              "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW},
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool3d):
+                N_, C, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, _, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride if mod.stride is not None
+                                     else mod.kernel_size)
+                PD, PH, PW = _triple(mod.padding)
+                if not mod.count_include_pad and (PD or PH or PW):
+                    raise NotImplementedError(
+                        f"AvgPool3d count_include_pad=False with padding at "
+                        f"{node.name}")
+                ops.append({
+                    "name": str(node.target), "op": "avgpool3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "ID": ID, "IH": IH, "IW": IW,
+                              "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW},
                 })
 
             elif isinstance(mod, torch.nn.MaxPool2d):
