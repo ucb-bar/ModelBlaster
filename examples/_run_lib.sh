@@ -112,10 +112,13 @@ elif [[ -n "${BENCH_FILE:-}" ]]; then
     # through extract_graph's --bench-file loader instead of --model (the
     # kernelbench MODEL_NAME is a path like kernelbench/kb_<name>, not a
     # registered model).
+    # BENCH_MAX_ELEMENTS=0 disables input shrinking → stock KernelBench dims
+    # (feasible on RUNNER=native; overflows spike's 256 MB RAM region).
     python -m modelblaster.pipeline.extract_graph \
         --bench-file "${BENCH_FILE}" \
         --out-dir "${IR_DIR}" \
-        --quant "${QUANT}"
+        --quant "${QUANT}" \
+        --bench-max-elements "${BENCH_MAX_ELEMENTS:-65536}"
 else
     python -m modelblaster.pipeline.extract_graph \
         --model "${MODEL_NAME}" \
@@ -225,6 +228,21 @@ case "${RUNNER}" in
     spike)
         BOARD_TARGET="spike_riscv64"
         ;;
+    native)
+        # Zephyr native_sim: build the harness as a plain x86-64 host binary.
+        # Runs at native speed with host-backed memory, so it validates the
+        # reference kernels at FULL stock dimensions (spike's 256 MB Zephyr RAM
+        # region can't hold them). Requires the host toolchain (not the RISC-V
+        # SDK) and a scalar target (native x86 can't use RVV) — the reference
+        # kernel math is identical across targets, so this checks the same code.
+        BOARD_TARGET="native_sim/native/64"
+        export ZEPHYR_TOOLCHAIN_VARIANT=host
+        if [[ "${GEN_TARGET}" == rvv* ]]; then
+            echo "ERROR: RUNNER=native needs a scalar TARGET (got ${GEN_TARGET}); " \
+                 "set TARGET=scalar" >&2
+            exit 1
+        fi
+        ;;
     firesim)
         # Chipyard's quad-rocket-saturn board target. Pulls in the
         # firesim_chipyard.conf overlay (shrunk stack + SMP knobs that
@@ -244,6 +262,12 @@ from modelblaster.pipeline.backends import get
 b = get('${GEN_TARGET}')
 print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}')))
 ")
+if [[ "${RUNNER}" == "native" ]]; then
+    # The scalar backend ships no kernel cflags, so the reference kernels would
+    # compile unoptimized — far too slow at stock KernelBench dims (e.g. a
+    # 2048^3 matmul). Add -O2 (no -ffast-math, so fp semantics are unchanged).
+    KERNEL_CFLAGS="${KERNEL_CFLAGS:+${KERNEL_CFLAGS};}-O2"
+fi
 WEST_CMAKE_ARGS=(
     -DMODEL_DIR="${GEN_DIR}"
     -DMODELBLASTER_BACKEND="${GEN_TARGET}"
@@ -330,12 +354,16 @@ print(' '.join(b.spike_args))
     for a in ${SPIKE_ARGS}; do
         SPIKE_FLAGS+=("--spike-arg=${a}")
     done
-    # Gemmini backend needs the chipyard spike (has --extension=gemmini support
-    # + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE env if set, else chipyard path.
+    # Gemmini backend (incl. Q31 variant) needs the chipyard spike (has
+    # --extension=gemmini support + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE
+    # env if set, else chipyard path. The Q31 acc_scale variant uses the same
+    # spike binary; MODELBLASTER_GEMMINI_LIB_DIR is normally per-config under
+    # cores/gemmini/include/per_config/<sub>/libgemmini.so — see
+    # modelblaster/scripts/validate_q31_matrix.sh.
     SPIKE_BIN_FLAGS=()
-    if [[ "${GEN_TARGET}" == "gemmini" ]]; then
-        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+    if [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" ]]; then
+        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/bin/spike}"
+        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/lib}"
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
             export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
@@ -362,6 +390,15 @@ print(' '.join(b.spike_args))
         "${SPIKE_BIN_FLAGS[@]}" \
         "${SPIKE_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
+elif [[ "${RUNNER}" == "native" ]]; then
+    # native_sim: the built artifact is a host executable (zephyr.exe). Run it
+    # directly and reuse the shared verify/compare path.
+    python -m modelblaster.validation.native_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.exe" \
+        --io "${IR_DIR}/io.npz" \
+        --quant "${QUANT}" \
+        --timeout "${NATIVE_TIMEOUT:-600}" \
+        ${TOL_FLAGS}
 else
     # firesim: the runner copies the elf into the sim slot, runs
     # firesim runworkload, tails the uartlog until OUTPUT_END, then
