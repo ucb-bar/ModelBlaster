@@ -25,6 +25,7 @@ Then per run:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -382,6 +383,69 @@ def _expected_end_count(models: Optional[list[str]],
     return max(1, len(models)) if models else 1
 
 
+def _ensure_workload_configured(
+        firesim_root: str,
+        workload_name: str = DEFAULT_FIRESIM_WORKLOAD_NAME,
+        bootbinary: str = DEFAULT_FIRESIM_BOOTBINARY,
+        verbose: bool = True) -> None:
+    """Self-provision the FireSim workload so a fresh install runs OUR ELF.
+
+    Two pieces must line up or `runworkload` silently runs whatever the
+    install's `config_runtime.yaml` last pointed at. (We once staged a
+    fused KernelBench ELF but the FPGA ran a stale `dronet` workload,
+    because `config_runtime.yaml` still said `workload_name: zephyr.json`
+    and no `modelblaster-firesim.json` existed — so our ELF was never
+    referenced.)  Ensure both:
+
+      1. `deploy/workloads/<workload>.json` exists and names our
+         `common_bootbinary` (created here if missing).
+      2. `deploy/config_runtime.yaml::workload_name` == `<workload>.json`
+         (rewritten here if it differs).
+
+    Both edits are idempotent — a no-op on an already-configured install.
+    Kept in the runner (not a one-off manual step) so any FireSim host
+    self-heals on first run.
+    """
+    deploy = os.path.join(firesim_root, "deploy")
+    json_name = (workload_name if workload_name.endswith(".json")
+                 else f"{workload_name}.json")
+    bench_name = json_name[:-len(".json")]
+    json_path = os.path.join(deploy, "workloads", json_name)
+    if not os.path.isfile(json_path):
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        spec = {
+            "benchmark_name": bench_name,
+            "common_simulation_outputs": ["uartlog"],
+            "common_bootbinary": bootbinary,
+            "common_rootfs": ("../../../../../software/firemarshal/boards/"
+                              "default/installers/firesim/dummy.rootfs"),
+        }
+        with open(json_path, "w") as f:
+            json.dump(spec, f, indent=2)
+            f.write("\n")
+        if verbose:
+            print(f"firesim: created workload {json_path}", flush=True)
+    # Point config_runtime.yaml's active (non-commented) workload_name at
+    # our workload. `^(\s*workload_name:...)` never matches a `# ...`
+    # commented alternative, so only the live line is rewritten.
+    cfg_path = os.path.join(deploy, "config_runtime.yaml")
+    try:
+        with open(cfg_path) as f:
+            cfg = f.read()
+    except FileNotFoundError:
+        return
+    new_cfg, n = re.subn(
+        r"(?m)^(\s*workload_name:\s*)\S+",
+        lambda m: m.group(1) + json_name,
+        cfg, count=1)
+    if n and new_cfg != cfg:
+        with open(cfg_path, "w") as f:
+            f.write(new_cfg)
+        if verbose:
+            print("firesim: set config_runtime.yaml workload_name -> "
+                  f"{json_name}", flush=True)
+
+
 def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                 pool_sizes: Optional[list[int]] = None,
                 firesim_root: str = DEFAULT_FIRESIM_ROOT,
@@ -410,6 +474,10 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             f"FIRESIM_ROOT not found at {firesim_root}; "
             f"set FIRESIM_ROOT or pass --firesim-root"
         )
+    # Make sure config_runtime.yaml + the workload JSON actually point at
+    # OUR bootbinary before infrasetup reads them (else the FPGA runs a
+    # stale workload). Idempotent; see _ensure_workload_configured.
+    _ensure_workload_configured(firesim_root, verbose=verbose)
     # Stage the elf BEFORE any firesim invocation. infrasetup reads
     # from deploy/workloads/<workload>/<bootbinary> when it runs.
     # Under FIRESIM_QUEUE=1 the daemon stages atomically (via
