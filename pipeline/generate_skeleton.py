@@ -1632,7 +1632,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
-                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh.get('DH', 1)}, {sh.get('DW', 1)})"
             )
         # ---- Mixed-precision cast kernels ----
         elif op["op"] == "cast_i8_to_f16":
