@@ -143,6 +143,29 @@ level1 benches on RVV/spike (rvv_f16 backend, Zvfh/Zfh).
   incl. int class-index targets (indices > 2048 aren't fp16-representable).
   Commits `e12403c`, `8379297`.
 
+### Phase 3.7 — stock-dimension validation (2026-07-30)
+The shrink (`--bench-max-elements`) was only needed for spike's default Zephyr
+RAM region (256 MB). That's a config, not a hardware limit — spike is bounded by
+host RAM (125 GB here) and FireSim by FPGA DRAM (~16 GB). Two paths added:
+- **native (`RUNNER=native`)** — Zephyr native_sim host binary; validates the
+  reference kernels at FULL stock dims (host memory + speed). Verified: stock
+  matmul 2048^3, matmul_ta/tb/tatb, diag_matmul(4096^2), CrossEntropy(32768x4096),
+  LayerNorm — all PASS (`2f934b2`). `MB_KB_DATA_ROOT` (default /scratch)
+  symlinks the multi-GB per-bench data onto a roomy disk so parallel runs don't
+  fill the repo partition (`730e0a4`).
+- **spike stock (`SPIKE_RAM_SIZE` + `SPIKE_MEM_MB`)** — bump ram0 via a DTS
+  overlay + spike -m. Verified: 95_CrossEntropyLoss at stock (32768x4096) on
+  spike RVV — PASS, 114.7M cycles (`aae11cf`). First KernelBench problem
+  benchmarked at full size on RISC-V.
+
+Constraints at stock: (1) io > 4 GB hits GNU `ar`'s archive-member limit at
+build (both native + spike, since io is `.incbin`'d into the ELF) — fix =
+runtime io-load on native (nsi_host_open/read); (2) COMPUTE TIME on functional
+spike is the binding limit — O(N) ops (activations/norms/reductions/losses,
+matrix-vector) run in seconds-minutes at stock; matmul 2048^3 ~hours; convs/
+convtranspose/SDPA (100s of GFLOP–TFLOP) are impractical on spike. FireSim runs
+the optimized RVV kernels at hardware speed → the stock-dim perf metric (Phase 4).
+
 ### Phase 4 — optimized RVV + real RTL (~1 week)
 10. `BACKEND=llm` on the covered ops → LLM RVV kernels, verified + measured
     (reference-vs-llm speedup per op) — the actual KernelBench metric.
