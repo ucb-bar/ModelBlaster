@@ -132,6 +132,21 @@ def _buf_name(mid: str, tensor: str) -> str:
 # modelblaster_pool.h out of model.c so the harness has no POSIX dep.
 _PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 
+# fp16 ops that have a bespoke `_f16` skeleton branch (some with different args,
+# e.g. softmax_f16's input_scale). These route to their own branch unchanged.
+# Every OTHER `_f16` op reuses its fp32 branch (identical args) via the
+# normalization at the top of the op-emission loop, with `_f16` folded into the
+# mangled kernel name.
+_EXPLICIT_F16_OPS = {
+    "relu_f16", "elu_f16", "sigmoid_f16", "batchnorm2d_f16", "maxpool2d_f16",
+    "conv2d_f16", "linear_f16", "depthwise_conv2d_f16", "layer_norm_f16",
+    "gelu_f16", "softmax_f16", "add_f16", "mul_f16", "mul_c1_f16",
+    "adaptive_avg_pool2d_f16", "slice_c_f16", "cat2_c1_f16", "cat3_c1_f16",
+    "cat4_c1_f16", "silu_f16", "upsample_nearest_f16", "pad_f16", "bmm_f16",
+    "matmul_f16", "matmul_ta_f16", "matmul_tb_f16", "matmul_tatb_f16",
+    "chunk2_c1_f16", "cast_i8_to_f16", "cast_f16_to_i8",
+}
+
 
 _LINEAR_WRAPPER = """
 /* ---- linear: split outer N (output features), M==1 only ----------------- */
@@ -878,6 +893,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     dispatch_fns: list[str] = []
     invoke_table_rows: list[str] = []
     for op in ir["ops"]:
+        # fp16 dispatch: an `_f16` op without a bespoke branch reuses its fp32
+        # branch (identical args) — normalize to the base op for matching and
+        # fold `_f16` into the mangled kernel name below.
+        _ksfx = ""
+        if op["op"].endswith("_f16") and op["op"] not in _EXPLICIT_F16_OPS:
+            _ksfx = "_f16"
+            op = dict(op)
+            op["op"] = op["op"][:-4]
         if op["op"] in _zero_cost_ops:
             # view / chunk2_c1: no kernel call. Aliases were set up above
             # (plain aliases for view, offset aliases for chunk2_c1).
@@ -1769,7 +1792,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # so we don't accidentally mangle the wrapper name itself.
         if op["op"] not in _PARALLELIZED_OPS:
             call = call.replace(
-                f"kernel_{op['op']}(", f"kernel_{op['op']}_{mid}(", 1
+                f"kernel_{op['op']}(", f"kernel_{op['op']}{_ksfx}_{mid}(", 1
             )
         # dispatch_id comes from the IR (assigned by extract_graph's
         # _annotate_dispatches). Propagating it here means the C-level
