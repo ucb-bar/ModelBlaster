@@ -465,6 +465,7 @@ SUPPORTED_MODULES = (
     torch.nn.Hardtanh,
     torch.nn.ELU,
     torch.nn.Conv2d,
+    torch.nn.ConvTranspose2d,  # transposed / fractionally-strided 2D conv
     torch.nn.MaxPool2d,
     torch.nn.AvgPool2d,  # fixed-window 2D average pool (KernelBench 45)
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
@@ -1789,6 +1790,43 @@ def extract(
                         f"groups=IC=OC (depthwise) are wired up at "
                         f"{node.name}"
                     )
+
+            elif isinstance(mod, torch.nn.ConvTranspose2d):
+                # Transposed conv. Weight is [IC, OC/G, KH, KW]. OH/OW come from
+                # the traced output shape, so output_padding is already folded
+                # in. The rvv backend repacks this 4D weight to IHWO like any
+                # conv weight; the kernel honors that via its IHWOC branch.
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                in_shape = tensors[in_name]["shape"]
+                out_shape = tensors[out_name]["shape"]
+                N_, IC, IH, IW = (int(s) for s in in_shape)
+                _, OC, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                SH, SW = _pair(mod.stride)
+                PH, PW = _pair(mod.padding)
+                DH, DW = _pair(mod.dilation)
+                G = int(mod.groups)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "conv_transpose2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "weight": w_key,
+                    "bias": b_key,
+                    "shape": {
+                        "N": N_, "IC": IC, "IH": IH, "IW": IW,
+                        "OC": OC, "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                        "DH": DH, "DW": DW,
+                        "G": G,
+                    },
+                })
 
             elif isinstance(mod, torch.nn.MaxPool2d):
                 in_shape = tensors[in_name]["shape"]
