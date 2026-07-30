@@ -420,9 +420,11 @@ SUPPORTED_MODULES = (
     torch.nn.ELU,
     torch.nn.Conv2d,
     torch.nn.MaxPool2d,
+    torch.nn.AvgPool2d,  # fixed-window 2D average pool (KernelBench 45)
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
+    torch.nn.LayerNorm,  # normalize over trailing normalized_shape dims
     torch.nn.Sigmoid,
     # YOLOv8 backbone uses SiLU activation throughout; neck uses Upsample.
     torch.nn.SiLU,
@@ -1765,6 +1767,69 @@ def extract(
                     },
                 })
 
+            elif isinstance(mod, torch.nn.AvgPool2d):
+                in_shape = tensors[in_name]["shape"]
+                out_shape = tensors[out_name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                _, _, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                # nn.AvgPool2d.stride defaults to None → same as kernel_size.
+                SH, SW = _pair(mod.stride if mod.stride is not None
+                               else mod.kernel_size)
+                PH, PW = _pair(mod.padding)
+                if not mod.count_include_pad and (PH or PW):
+                    raise NotImplementedError(
+                        f"AvgPool2d count_include_pad=False with padding is not "
+                        f"supported at {node.name}")
+                ops.append({
+                    "name": str(node.target),
+                    "op": "avgpool2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {
+                        "N": N_, "C": C,
+                        "IH": IH, "IW": IW,
+                        "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.LayerNorm):
+                # LayerNorm over the trailing normalized_shape dims. K = product
+                # of normalized_shape, M = product of the leading dims. gamma /
+                # beta are flattened to length K (ones/zeros if affine is off).
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ns = tuple(int(s) for s in mod.normalized_shape)
+                K = int(np.prod(ns)) if ns else 1
+                total = int(np.prod(in_shape))
+                if K == 0 or total % K != 0:
+                    raise NotImplementedError(
+                        f"LayerNorm at {node.name}: normalized_shape {ns} does "
+                        f"not divide input {in_shape}")
+                M = total // K
+                g_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias"
+                if mod.elementwise_affine and mod.weight is not None:
+                    weights[g_key] = mod.weight.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                    weights[b_key] = mod.bias.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                else:
+                    weights[g_key] = np.ones(K, dtype=weight_dtype)
+                    weights[b_key] = np.zeros(K, dtype=weight_dtype)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "layer_norm",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "gamma_key": g_key,
+                    "beta_key": b_key,
+                    "eps": float(mod.eps),
+                    "shape": {"M": M, "K": K},
+                })
+
             elif isinstance(mod, torch.nn.Dropout):
                 # Eval-mode dropout is identity. Record as a view: the output
                 # tensor aliases the input.
@@ -2046,6 +2111,64 @@ def extract(
                     "inputs": [in_name],
                     "outputs": [out_name],
                     "shape": {"n": n},
+                })
+            elif tname == "softmax" or target is torch.softmax \
+                    or target is torch.nn.functional.softmax:
+                # KernelBench 23_Softmax: torch.softmax(x, dim=...). The
+                # reference kernel normalizes over contiguous rows, so only a
+                # last-axis softmax is supported (M = leading dims, K = last).
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ndim = len(in_shape)
+                dim = node.kwargs.get("dim") if node.kwargs else None
+                if dim is None and len(node.args) > 1:
+                    dim = node.args[1]
+                if dim is None:
+                    raise NotImplementedError(
+                        f"softmax at {node.name}: implicit dim not supported")
+                dim = int(dim)
+                if dim < 0:
+                    dim += ndim
+                if dim != ndim - 1:
+                    raise NotImplementedError(
+                        f"softmax at {node.name}: only last-axis softmax "
+                        f"supported (got dim={dim} of {ndim}D)")
+                K = in_shape[-1]
+                M = int(np.prod(in_shape[:-1])) if ndim > 1 else 1
+                ops.append({
+                    "name": node.name,
+                    "op": "softmax",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"M": M, "K": K},
+                })
+            elif tname == "log_softmax" or target is torch.log_softmax \
+                    or target is torch.nn.functional.log_softmax:
+                # KernelBench 24_LogSoftmax. Last-axis only, as with softmax.
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ndim = len(in_shape)
+                dim = node.kwargs.get("dim") if node.kwargs else None
+                if dim is None and len(node.args) > 1:
+                    dim = node.args[1]
+                if dim is None:
+                    raise NotImplementedError(
+                        f"log_softmax at {node.name}: implicit dim not supported")
+                dim = int(dim)
+                if dim < 0:
+                    dim += ndim
+                if dim != ndim - 1:
+                    raise NotImplementedError(
+                        f"log_softmax at {node.name}: only last-axis supported "
+                        f"(got dim={dim} of {ndim}D)")
+                K = in_shape[-1]
+                M = int(np.prod(in_shape[:-1])) if ndim > 1 else 1
+                ops.append({
+                    "name": node.name,
+                    "op": "log_softmax",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"M": M, "K": K},
                 })
             elif tname == "elu" or target is torch.nn.functional.elu:
                 # KernelBench 31_ELU may use functional too. nn.ELU's

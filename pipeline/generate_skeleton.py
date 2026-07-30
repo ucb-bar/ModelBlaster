@@ -928,6 +928,34 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
                 f"{PH}, {PW}, {DH}, {DW})"
             )
+        elif op["op"] == "avgpool2d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            PH, PW = sh.get("PH", 0), sh.get("PW", 0)
+            call = (
+                f"kernel_avgpool2d({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{PH}, {PW})"
+            )
+        elif op["op"] == "softmax":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_softmax({in_ptr}, {out_ptr}, {sh['M']}, {sh['K']})"
+        elif op["op"] == "log_softmax":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_log_softmax({in_ptr}, {out_ptr}, {sh['M']}, {sh['K']})"
+        elif op["op"] == "layer_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            gamma = _weight_name(model_name, op["gamma_key"])
+            beta = _weight_name(model_name, op["beta_key"])
+            sh = op["shape"]
+            eps = op.get("eps", 1e-5)
+            call = (
+                f"kernel_layer_norm({in_ptr}, {gamma}, {beta}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {_f32(eps)})"
+            )
         elif op["op"] == "add":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")
