@@ -320,6 +320,15 @@ if [[ "${RUNNER}" == "firesim" ]]; then
         -DEXTRA_CONF_FILE="${FS_CONF}"
     )
 fi
+# CMODEL_LARGE=1 selects the RISC-V large code model (auipc+constant-pool /
+# R_RISCV_64 indirection) so the program + all static symbols are no longer
+# confined to a single 2 GiB window — lifts the R_RISCV_PCREL_HI20 truncation
+# that stock-dimension baked io hits under the default medany model. Needs an
+# SDK gcc that supports -mcmodel=large for rv64 (Zephyr SDK >= 1.0.0-beta1 /
+# gcc 14). Orthogonal to -march; applies on any RISC-V board (spike/firesim).
+if [[ "${CMODEL_LARGE:-0}" == "1" ]]; then
+    WEST_BUILD_EXTRA+=(-DCONFIG_RISCV_CMODEL_LARGE=y)
+fi
 _mb_stage_begin build
 west build -p -b "${BOARD_TARGET}" harness \
     --build-dir "${BUILD_DIR}" \
