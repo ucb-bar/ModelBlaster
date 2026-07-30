@@ -208,6 +208,8 @@ typedef struct {{
     int SW;
     int PH;
     int PW;
+    int DH;
+    int DW;
     int OH;
     int OW;
     int chunks;
@@ -228,7 +230,7 @@ static void parallel_conv2d_fn(void *ctx_, size_t i) {{
                         c->out + (size_t)oc0 * per_oc_out,
                         c->N, c->IC, c->IH, c->IW,
                         oc1 - oc0, c->KH, c->KW,
-                        c->SH, c->SW, c->PH, c->PW);
+                        c->SH, c->SW, c->PH, c->PW, c->DH, c->DW);
 }}
 
 static inline void parallel_conv2d(void *pool_,
@@ -236,34 +238,35 @@ static inline void parallel_conv2d(void *pool_,
                                    const float *b, float *out,
                                    int N, int IC, int IH, int IW,
                                    int OC, int KH, int KW,
-                                   int SH, int SW, int PH, int PW) {{
+                                   int SH, int SW, int PH, int PW,
+                                   int DH, int DW) {{
 #ifdef MODELBLASTER_USE_POOL
     modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
     if (pool == NULL || N != 1) {{
         kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                            OC, KH, KW, SH, SW, PH, PW);
+                            OC, KH, KW, SH, SW, PH, PW, DH, DW);
         return;
     }}
     size_t T = modelblaster_pool_get_threads_count(pool);
     if (T <= 1 || (size_t)OC < T) {{
         kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                            OC, KH, KW, SH, SW, PH, PW);
+                            OC, KH, KW, SH, SW, PH, PW, DH, DW);
         return;
     }}
-    int OH = (IH + 2 * PH - KH) / SH + 1;
-    int OW = (IW + 2 * PW - KW) / SW + 1;
+    int OH = (IH + 2 * PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2 * PW - DW*(KW-1) - 1) / SW + 1;
     parallel_conv2d_ctx_t ctx = {{
         .in = in, .w = w, .b = b, .out = out,
         .N = N, .IC = IC, .IH = IH, .IW = IW,
         .OC_total = OC, .KH = KH, .KW = KW,
-        .SH = SH, .SW = SW, .PH = PH, .PW = PW,
+        .SH = SH, .SW = SW, .PH = PH, .PW = PW, .DH = DH, .DW = DW,
         .OH = OH, .OW = OW, .chunks = (int)T,
     }};
     modelblaster_pool_parallelize_1d(pool, parallel_conv2d_fn, &ctx, T, 0);
 #else
     (void)pool_;
     kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                        OC, KH, KW, SH, SW, PH, PW);
+                        OC, KH, KW, SH, SW, PH, PW, DH, DW);
 #endif
 }}
 """
@@ -915,7 +918,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"parallel_conv2d(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
-                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh.get('DH', 1)}, {sh.get('DW', 1)})"
             )
         elif op["op"] == "maxpool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")

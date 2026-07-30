@@ -1859,11 +1859,6 @@ def extract(
                 })
 
             elif isinstance(mod, torch.nn.Conv2d):
-                if mod.dilation != (1, 1):
-                    raise NotImplementedError(
-                        f"Conv2d with dilation={mod.dilation} not supported "
-                        f"yet at {node.name}"
-                    )
                 w_key = f"{node.target}.weight"
                 b_key = f"{node.target}.bias" if mod.bias is not None else None
                 weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
@@ -1877,6 +1872,7 @@ def extract(
                 KH, KW = _pair(mod.kernel_size)
                 SH, SW = _pair(mod.stride)
                 PH, PW = _pair(mod.padding)
+                DH, DW = _pair(mod.dilation)
                 # Depthwise conv: each output channel reads from one input
                 # channel via its own [1, KH, KW] filter. Detected when
                 # groups == in_channels == out_channels. Different memory
@@ -1895,9 +1891,10 @@ def extract(
                             "KH": KH, "KW": KW,
                             "SH": SH, "SW": SW,
                             "PH": PH, "PW": PW,
+                            "DH": DH, "DW": DW,
                         },
                     })
-                elif mod.groups == IC and IC == OC:
+                elif mod.groups == IC and IC == OC and DH == 1 and DW == 1:
                     ops.append({
                         "name": str(node.target),
                         "op": "conv2d_dw",
@@ -1925,10 +1922,8 @@ def extract(
             elif isinstance(mod, torch.nn.Conv1d):
                 # 1D conv → conv2d with a unit height dim: input [N,C,L] is
                 # [N,C,1,L]; weight [OC,IC,K] → [OC,IC,1,K]; KH=1, KW=K.
-                if _as_tuple1(mod.dilation)[0] != 1:
-                    raise NotImplementedError(
-                        f"Conv1d dilation={mod.dilation} not supported at "
-                        f"{node.name}")
+                # Dilation maps to DW (the height dim is degenerate, DH=1).
+                (Dl,) = _as_tuple1(mod.dilation)
                 in_shape = [int(s) for s in tensors[in_name]["shape"]]
                 out_shape = [int(s) for s in tensors[out_name]["shape"]]
                 N_, IC, IW = in_shape
@@ -1943,14 +1938,6 @@ def extract(
                 if b_key is not None:
                     weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
                 if mod.groups == 1:
-                    op_name, ch = "conv2d", None
-                elif mod.groups == IC and IC == OC:
-                    op_name, ch = "conv2d_dw", IC
-                else:
-                    raise NotImplementedError(
-                        f"Conv1d groups={mod.groups} (IC={IC},OC={OC}) at "
-                        f"{node.name}: only standard/depthwise wired")
-                if op_name == "conv2d":
                     ops.append({
                         "name": str(node.target), "op": "conv2d",
                         "inputs": [in_name], "outputs": [out_name],
@@ -1958,17 +1945,22 @@ def extract(
                         "shape": {"N": N_, "IC": IC, "IH": 1, "IW": IW,
                                   "OC": OC, "OH": 1, "OW": OW,
                                   "KH": 1, "KW": K, "SH": 1, "SW": S,
-                                  "PH": 0, "PW": P},
+                                  "PH": 0, "PW": P, "DH": 1, "DW": Dl},
                     })
-                else:
+                elif mod.groups == IC and IC == OC and Dl == 1:
                     ops.append({
                         "name": str(node.target), "op": "conv2d_dw",
                         "inputs": [in_name], "outputs": [out_name],
                         "weight": w_key, "bias": b_key,
-                        "shape": {"N": N_, "C": ch, "IH": 1, "IW": IW,
+                        "shape": {"N": N_, "C": IC, "IH": 1, "IW": IW,
                                   "OH": 1, "OW": OW, "KH": 1, "KW": K,
                                   "SH": 1, "SW": S, "PH": 0, "PW": P},
                     })
+                else:
+                    raise NotImplementedError(
+                        f"Conv1d groups={mod.groups} (IC={IC},OC={OC}) "
+                        f"dilation={Dl} at {node.name}: only standard and "
+                        f"non-dilated depthwise wired")
 
             elif isinstance(mod, torch.nn.ConvTranspose1d):
                 # 1D transposed conv → conv_transpose2d, unit height dim.
@@ -3493,6 +3485,7 @@ def _load_kernelbench(bench_path: str,
                 if isinstance(v, int) and v > 1
                 and not k.startswith("_")
                 and k not in SHAPE_ATTRS_BLOCKLIST}
+        history: "list[tuple[str, int]]" = []
         for _ in range(64):
             # Cap the TOTAL element count across all forward inputs (matmul
             # A+B, bmm, etc.), not just the first — the second operand can
@@ -3506,8 +3499,27 @@ def _load_kernelbench(bench_path: str,
             new = max(1, ints[biggest] // 2)
             if new == ints[biggest]:
                 break
+            history.append((biggest, ints[biggest]))
             ints[biggest] = new
             setattr(mod, biggest, new)
+
+        # Some ops (dilated conv) become invalid if a spatial dim is shrunk
+        # below the (dilated) kernel extent — the model's own forward then
+        # raises. Back off the most recent shrink steps until a forward pass
+        # succeeds, so the shape stays valid even if it exceeds max_elements.
+        _ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+        for _ in range(len(history) + 1):
+            try:
+                _m = mod.Model(*_ia)
+                _m.eval()
+                with torch.no_grad():
+                    _m(*mod.get_inputs())
+                break
+            except Exception:
+                if not history:
+                    break
+                attr, oldv = history.pop()
+                setattr(mod, attr, oldv)
 
     init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
     model = mod.Model(*init_args)
