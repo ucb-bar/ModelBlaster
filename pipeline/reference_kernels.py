@@ -7091,6 +7091,216 @@ void kernel_vint_action_post(const int8_t *dist_int8, float scale_dist,
 )
 
 
+# ---------------------------------------------------------------------------
+# KernelBench fp32 coverage ops (softmax / avg-pool / layer-norm). fp32
+# counterparts of the existing _s8 / _f16 variants, wired for the
+# reference-on-RVV KernelBench harness (examples/kernelbench).
+# ---------------------------------------------------------------------------
+
+def _softmax_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+SOFTMAX = KernelSpec(
+    op="softmax",
+    signature=(
+        "void kernel_softmax(const float *input, float *output, int M, int K)"
+    ),
+    semantics=(
+        "Row-wise softmax over the last axis of an [M, K] tensor (numerically\n"
+        "stable max-subtract form):\n"
+        "  m_i          = max_k input[i, k]\n"
+        "  e_k          = expf(input[i, k] - m_i)\n"
+        "  output[i, k] = e_k / sum_k e_k\n"
+        "All tensors float32. A tensor whose softmax dim is the last axis maps\n"
+        "here directly (M = product of leading dims, K = last dim)."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_softmax(const float *input, float *output, int M, int K) {
+    for (int m = 0; m < M; m++) {
+        float maxv = input[m*K];
+        for (int k = 1; k < K; k++) {
+            float v = input[m*K + k];
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float e = expf(input[m*K + k] - maxv);
+            output[m*K + k] = e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] *= inv_sum;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 7, "K": 128}],
+    argtypes_factory=_softmax_argtypes,
+)
+
+
+LOG_SOFTMAX = KernelSpec(
+    op="log_softmax",
+    signature=(
+        "void kernel_log_softmax(const float *input, float *output, "
+        "int M, int K)"
+    ),
+    semantics=(
+        "Row-wise log-softmax over the last axis of an [M, K] tensor:\n"
+        "  m_i          = max_k input[i, k]\n"
+        "  lse          = m_i + logf(sum_k expf(input[i, k] - m_i))\n"
+        "  output[i, k] = input[i, k] - lse\n"
+        "Numerically stable log-sum-exp form. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_log_softmax(const float *input, float *output, int M, int K) {
+    for (int m = 0; m < M; m++) {
+        float maxv = input[m*K];
+        for (int k = 1; k < K; k++) {
+            float v = input[m*K + k];
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += expf(input[m*K + k] - maxv);
+        }
+        float lse = maxv + logf(sum);
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] = input[m*K + k] - lse;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 7, "K": 128}],
+    argtypes_factory=_softmax_argtypes,
+)
+
+
+def _avgpool2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW
+    return [fp, fp] + [ctypes.c_int] * 10
+
+
+AVGPOOL2D = KernelSpec(
+    op="avgpool2d",
+    signature=(
+        "void kernel_avgpool2d(const float *input, float *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "2D average pooling matching torch.nn.AvgPool2d with the default\n"
+        "count_include_pad=True (the divisor is always KH*KW; padded cells\n"
+        "contribute 0). nn.AvgPool2d has no dilation.\n"
+        "Layout (NCHW, row-major):\n"
+        "  input:  [N, C, IH, IW]\n"
+        "  output: [N, C, OH, OW]  with\n"
+        "    OH = (IH + 2*PH - KH) / SH + 1\n"
+        "    OW = (IW + 2*PW - KW) / SW + 1\n"
+        "  output[n, c, oh, ow] = (1/(KH*KW)) * sum over kh, kw of\n"
+        "    val(n, c, oh*SH - PH + kh, ow*SW - PW + kw)\n"
+        "  where val(...) is input at that location or 0 out of bounds.\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_avgpool2d(const float *input, float *output,
+                      int N, int C, int IH, int IW,
+                      int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    float inv = 1.0f / (float)(KH * KW);
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            acc += input[((n*C + c)*IH + ih)*IW + iw];
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = acc * inv;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4, "IH": 32, "IW": 32, "KH": 3, "KW": 3, "SH": 3, "SW": 3,
+         "PH": 0, "PW": 0},
+        {"N": 1, "C": 8, "IH": 16, "IW": 16, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_avgpool2d_argtypes,
+)
+
+
+def _layer_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+LAYER_NORM = KernelSpec(
+    op="layer_norm",
+    signature=(
+        "void kernel_layer_norm(const float *input, const float *gamma, "
+        "const float *beta, float *output, int M, int K, float eps)"
+    ),
+    semantics=(
+        "LayerNorm over the last axis of an [M, K] tensor (K = product of the\n"
+        "normalized_shape dims, M = product of the leading dims):\n"
+        "  mu     = mean(input[m, :])\n"
+        "  sigma  = sqrt(var(input[m, :]) + eps)\n"
+        "  output[m, k] = gamma[k] * (input[m, k] - mu) / sigma + beta[k]\n"
+        "gamma and beta are float32 buffers of length K. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_layer_norm(const float *input, const float *gamma,
+                       const float *beta, float *output,
+                       int M, int K, float eps) {
+    for (int m = 0; m < M; m++) {
+        float sum = 0.0f, sqsum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float v = input[m*K + k];
+            sum += v;
+            sqsum += v * v;
+        }
+        float mean = sum / (float)K;
+        float var  = sqsum / (float)K - mean * mean;
+        float inv_sigma = 1.0f / sqrtf(var + eps);
+        for (int k = 0; k < K; k++) {
+            float v = input[m*K + k];
+            output[m*K + k] = gamma[k] * (v - mean) * inv_sigma + beta[k];
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 16, "eps": 1e-5},
+        {"M": 7, "K": 512, "eps": 1e-5},
+    ],
+    argtypes_factory=_layer_norm_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -7128,6 +7338,10 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "conv2d": CONV2D,
     "conv2d_dw": CONV2D_DW,
     "maxpool2d": MAXPOOL2D,
+    "avgpool2d": AVGPOOL2D,
+    "softmax": SOFTMAX,
+    "log_softmax": LOG_SOFTMAX,
+    "layer_norm": LAYER_NORM,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
