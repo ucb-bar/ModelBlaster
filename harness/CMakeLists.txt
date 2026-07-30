@@ -69,6 +69,24 @@ set_source_files_properties(${MODEL_DIR}/test_io.S PROPERTIES LANGUAGE ASM)
 # linker relaxation here — medany still gives ±2GB addressing, we just
 # lose the gp-relative shortcut. No measurable code-size impact.
 zephyr_link_libraries(-Wl,--no-relax)
+
+# >2GB baked io only links under the RISC-V large code model
+# (CONFIG_RISCV_CMODEL_LARGE), which fixes the C-side references. But the
+# hand-written startup assembly (vector.S/reset.S/isr.S) uses fixed
+# PC-relative addressing that -mcmodel=large does NOT rewrite, so if the
+# giant io sits in .rodata (before .bss) it pushes gp/_kernel/z_interrupt_stacks
+# past the startup asm's +/-2GiB reach and the link still truncates. When the
+# large model is active, emit the io into .mb_bigio (test_io.S #ifdef
+# MB_BIGIO_HIGH) and place that section ABOVE .bss (harness/bigio.ld). Default
+# (medany) builds are untouched -> byte-identical.
+# MB_NO_BIGIO_REORDER=1 opts out (io stays in .rodata) — e.g. io that fits
+# under 2GiB, or XIP boards where io belongs in flash not RAM.
+if(CONFIG_RISCV_CMODEL_LARGE AND NOT MB_NO_BIGIO_REORDER)
+    target_compile_definitions(app PRIVATE MB_BIGIO_HIGH=1)
+    zephyr_linker_sources(SECTIONS ${CMAKE_CURRENT_LIST_DIR}/bigio.ld)
+    message(STATUS "modelblaster harness: CMODEL_LARGE active -> io in .mb_bigio placed above .bss")
+endif()
+
 target_include_directories(app PRIVATE
     src
     ${MODEL_DIR}
