@@ -125,6 +125,24 @@ compound (cross_entropy = log_softmax + NLL), and they're multi-input (preds +
 targets) — which the packed_inputs path already supports. Implementable, not
 architecturally out of scope.
 
+### Phase 3.6 — fp16 (`--quant fp16`) for all ops (2026-07-30)
+Every fp32 op now has an fp16 counterpart, so `--quant fp16` covers all 100
+level1 benches on RVV/spike (rvv_f16 backend, Zvfh/Zfh).
+- `reference_kernels._make_f16_variant()` mechanically derives `<op>_f16` from
+  each fp32 spec (`float*`→`_Float16*` on pointers; scalar `float`/casts/locals
+  unchanged, so math stays fp32 with implicit widen on load / narrow on store).
+  A post-`KERNEL_SPECS` loop auto-adds the variant for every fp32 op lacking a
+  hand-written `_f16` (skips `_s8`/`_f16`/`cast_*`).
+- `generate_skeleton`: `_f16` ops without a bespoke branch (set
+  `_EXPLICIT_F16_OPS`) normalize to the base op for matching; `_f16` is folded
+  into the mangled kernel name. Bespoke branches (softmax input_scale, matmul
+  family, conv2d, …) untouched. `conv2d_f16` gained DH/DW dilation.
+- fp16 golden = **fp32 math on fp16-round-tripped inputs** (matches the kernels'
+  fp16-storage/fp32-math), not `model.half()` (which accumulates in fp16 and
+  lacks some CPU Half kernels). ALL tensor inputs round-trip through fp16,
+  incl. int class-index targets (indices > 2048 aren't fp16-representable).
+  Commits `e12403c`, `8379297`.
+
 ### Phase 4 — optimized RVV + real RTL (~1 week)
 10. `BACKEND=llm` on the covered ops → LLM RVV kernels, verified + measured
     (reference-vs-llm speedup per op) — the actual KernelBench metric.
