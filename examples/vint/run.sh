@@ -26,9 +26,9 @@ N_CALIB="${VINT_NUM_CALIBRATION:-16}"
 # trained nets; needed for ViNT to verify against the fp32 golden).
 PC_FLAG="${VINT_PER_CHANNEL:-1}"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
-EXAMPLE_DIR="${REPO_ROOT}/modelblaster/examples/${MODEL_NAME}"
+EXAMPLE_DIR="${REPO_ROOT}/examples/${MODEL_NAME}"
 IR_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
 
 # Stage 1 — extract IR via torch.export. Runs in the xpurt env where
@@ -61,4 +61,4 @@ source "${REPO_ROOT}/scripts/set_envvars_sdk.sh"
 # disk from the xpurt-side extract_graph_export above.
 unset FORCE_EXTRACT
 export MODEL_NAME REPO_ROOT QUANT TARGET BACKEND RUNNER
-source "${REPO_ROOT}/modelblaster/examples/_run_lib.sh"
+source "${REPO_ROOT}/examples/_run_lib.sh"

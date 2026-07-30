@@ -16,6 +16,7 @@
  */
 
 #include <stdio.h>
+#include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
 
 #include "model.h"
@@ -35,6 +36,19 @@ static model_output_t model_output[MODEL_OUTPUT_SIZE];
 
 int main(void)
 {
+#if defined(CONFIG_SMP) && defined(CONFIG_RISCV_ISA_EXT_V) && (CONFIG_MP_MAX_NUM_CPUS > 1)
+    /* Pin main to hart 1 on hetero bitstreams (GemminiAndOPUShuttleConfig,
+     * chipyard_hetero_q31, firesim_rocket_saturn) — hart 0 boots without
+     * V hardware on these, so running a V-using generated kernel from
+     * the boot hart would trap on the first vsetvli. Hart 1 has V (+
+     * Saturn OPU matrix). Pinning is a no-op on single-hart builds
+     * (e.g. spike) because the guard requires MP_MAX_NUM_CPUS > 1.
+     *
+     * Requires CONFIG_SCHED_CPU_MASK_PIN_ONLY=y in the FireSim overlay
+     * (harness/backends/firesim_chipyard.conf) — already set. */
+    k_thread_cpu_pin(k_current_get(), 1);
+#endif
+
     printf("modelblaster harness: model=%s in=%d out=%d\n",
            MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE);
 

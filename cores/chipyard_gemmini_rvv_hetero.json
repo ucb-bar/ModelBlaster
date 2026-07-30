@@ -1,0 +1,28 @@
+{
+  "system": "chipyard-GemminiAndOPUShuttleConfig-as-gemmini+rvv",
+  "description": "Same physical FireSim bitstream as chipyard_gemmini_opu_hetero.json (alveo_u250_firesim_shuttle_gemmini_opu) but the runtime treats hart 1 as PLAIN RVV (no Saturn OPU custom instructions). Saturn OPU IS RVV base + OP-V extensions, so plain RVV kernels execute on the OPU unit correctly. Picks kernels from kernels/gemmini/ + kernels/rvv/ instead of kernels/gemmini/ + kernels/rvv_opu/. Both sets are bit_exact-equivalent vs the Q0.31 PyTorch golden (gemmini does software Q0.31 requantize in im2col_full_C; rvv kernels use the same Q0.31 fixed-point requantize tail), so the cross-backend drift constraint (requantize_ops: [conv2d_s8, linear_s8]) is unnecessary — conv/linear can run on either tile freely. This matches the kernel pair (rvv + gemmini_q31) that Dima used for the qrb5165 image.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "gemmini0",
+      "kind": "gemmini",
+      "isa": "rv64imafdc",
+      "harts": [0],
+      "description": "Shuttle scalar + Gemmini int8 RoCC. Curated im2col_full_C kernel does software Q0.31 requantize — bit-exact vs PyTorch Q0.31 golden (max_abs_err=0 validated on Saturn FireSim May 2026).",
+      "capabilities": ["linear_s8", "conv2d_s8", "scalar_fallback"]
+    },
+    {
+      "name": "rvv0",
+      "kind": "rvv",
+      "isa": "rv64gcv",
+      "varch": "vlen:128,elen:64",
+      "harts": [1],
+      "description": "Shuttle + Saturn OPU vector unit, but kernels here use ONLY base RVV instructions (no OP-V customs). Curated rvv_conv2d_s8 / rvv_linear_s8 / rvv_silu_s8 do the Q0.31 fixed-point requantize tail bit-exact-equivalent to the gemmini im2col_full_C path.",
+      "capabilities": ["linear_s8", "conv2d_s8", "matmul_s8", "rvv_baseline"]
+    }
+  ],
+  "notes": [
+    "Runs on the existing GemminiAndOPUShuttleConfig FireSim bitstream — no rebuild needed. The OPU custom instructions are unused (kernels never emit VOPACC/OPMVINBCAST/etc.) but the Shuttle hart still decodes plain RVV via the OPU unit's base RVV implementation.",
+    "Replaces the requantize_ops drift constraint we needed with rvv_opu kernels (which were tagged NUMERIC_DRIFT). With both backends doing software Q0.31 requantize, the scheduler can split conv2d_s8 / linear_s8 across tiles freely — the regime that gives qrb its tight 75.71 ms schedule."
+  ]
+}

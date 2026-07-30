@@ -162,4 +162,50 @@
 #define OPFMACC(md, vs2, vs1) \
     asm volatile(".insn r 0x57, 0x1, 0x4b, " md ", " vs1 ", " vs2);
 
+/* Undef the register-name macros so subsequent translation-unit code can
+ * freely use identifiers like v16, m0, etc. as C variable names without
+ * the preprocessor substituting them with "x16" / "x0" string literals.
+ * Without these undefs, any RVV intrinsic kernel that names a vector
+ * variable v0..v31 (extremely common -- vint16m4_t v16 = __riscv_*) hits
+ * "expected identifier or '(' before string constant" at the variable
+ * declaration. The macros are still usable INSIDE this header for the
+ * OPMACC / OPRSUB / etc. inline-asm patterns above.
+ */
+#undef m0
+#undef m1
+#undef m2
+#undef m3
+#undef v0
+#undef v1
+#undef v2
+#undef v3
+#undef v4
+#undef v5
+#undef v6
+#undef v7
+#undef v8
+#undef v9
+#undef v10
+#undef v11
+#undef v12
+#undef v13
+#undef v14
+#undef v15
+#undef v16
+#undef v17
+#undef v18
+#undef v19
+#undef v20
+#undef v21
+#undef v22
+#undef v23
+#undef v24
+#undef v25
+#undef v26
+#undef v27
+#undef v28
+#undef v29
+#undef v30
+#undef v31
+
 #endif /* MODELBLASTER_SATURN_OPU_H */
