@@ -158,10 +158,26 @@ def main() -> int:
                          "(built with -DMODELBLASTER_XPURT_TRACE=ON) for the "
                          "trace plotter — spike output is otherwise "
                          "hidden behind subprocess.run(capture_output).")
+    ap.add_argument("--io-paths", default=None,
+                    help="multi-model golden override: comma list of "
+                         "NAME=/abs/io.npz. Lets a model tag point at an io.npz "
+                         "that isn't under examples/<NAME>/ (e.g. flat "
+                         "kernelbench tags whose data lives under "
+                         "examples/kernelbench/<NAME>/).")
     args = ap.parse_args()
 
     if not args.models and not args.io:
         ap.error("must pass either --io (single-model) or --models (multi)")
+
+    io_paths = None
+    if args.io_paths:
+        io_paths = {}
+        for spec in args.io_paths.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            k, _, v = spec.partition("=")
+            io_paths[k.strip()] = v.strip()
     if args.pool_sizes and not args.models:
         ap.error("--pool-sizes requires --models")
 
@@ -220,6 +236,7 @@ def main() -> int:
             iree_args=iree_args,
             backend_tag=backend_tag,
             repo_root=repo_root,
+            io_paths=io_paths,
         )
     return 0 if ok else 1
 
