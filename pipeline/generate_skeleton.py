@@ -1108,6 +1108,18 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
                 f"{sh['PH']}, {sh['PW']})"
             )
+        elif op["op"] == "conv_transpose2d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_conv_transpose2d({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PH']}, {sh['PW']}, {sh['DH']}, {sh['DW']}, {sh['G']})"
+            )
         elif op["op"] == "adaptive_avg_pool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]

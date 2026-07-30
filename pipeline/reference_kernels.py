@@ -7374,6 +7374,99 @@ void kernel_rms_norm(const float *input, float *output,
 )
 
 
+def _conv_transpose2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, then 17 ints (N,IC,IH,IW,OC,OH,OW,
+    # KH,KW,SH,SW,PH,PW,DH,DW,G)
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 16
+
+
+CONV_TRANSPOSE2D = KernelSpec(
+    op="conv_transpose2d",
+    signature=(
+        "void kernel_conv_transpose2d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int IH, int IW, int OC, int OH, int OW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "2D transposed convolution (torch.nn.ConvTranspose2d), gather form.\n"
+        "Layout (NCHW):\n"
+        "  input:  [N, IC, IH, IW]\n"
+        "  weight: [IC, OC/G, KH, KW]   (ConvTranspose weight order)\n"
+        "  bias:   [OC] (may be NULL)\n"
+        "  output: [N, OC, OH, OW]\n"
+        "  output_padding is already folded into the caller-supplied OH/OW.\n"
+        "Each output pixel gathers the input pixels that scatter onto it:\n"
+        "  for oc (group g = oc/(OC/G)), oh, ow:\n"
+        "    acc = bias[oc]\n"
+        "    for kh, kw with ih=(oh+PH-kh*DH)/SH, iw=(ow+PW-kw*DW)/SW integral\n"
+        "        and in range, for ic in group g:\n"
+        "      acc += input[n,ic,ih,iw] * weight[ic, oc%(OC/G), kh, kw]\n"
+        "All tensors float32. G is the group count."
+    ),
+    reference_impl="""\
+void kernel_conv_transpose2d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int IH, int IW,
+                             int OC, int OH, int OW,
+                             int KH, int KW, int SH, int SW,
+                             int PH, int PW, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ihs = oh + PH - kh*DH;
+                        if (ihs < 0 || (ihs % SH) != 0) continue;
+                        int ih = ihs / SH;
+                        if (ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iws = ow + PW - kw*DW;
+                            if (iws < 0 || (iws % SW) != 0) continue;
+                            int iw = iws / SW;
+                            if (iw >= IW) continue;
+                            for (int icg = 0; icg < ICpG; icg++) {
+                                int ic = g*ICpG + icg;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* weight [IC,OCpG,KH,KW] packed (1,2,3,0) ->
+                                   [OCpG,KH,KW,IC]. */
+                                float w = weight[((ocg*KH + kh)*KW + kw)*IC + ic];
+#else
+                                float w = weight[((ic*OCpG + ocg)*KH + kh)*KW + kw];
+#endif
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # basic stride-1
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 6, "OH": 10, "OW": 10,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 0, "PW": 0, "DH": 1, "DW": 1,
+         "G": 1},
+        # strided
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 4, "OH": 17, "OW": 17,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 0, "PW": 0, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv_transpose2d_argtypes,
+)
+
+
 LAYER_NORM = KernelSpec(
     op="layer_norm",
     signature=(
@@ -7462,6 +7555,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "layer_norm": LAYER_NORM,
     "group_norm": GROUP_NORM,
     "rms_norm": RMS_NORM,
+    "conv_transpose2d": CONV_TRANSPOSE2D,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
