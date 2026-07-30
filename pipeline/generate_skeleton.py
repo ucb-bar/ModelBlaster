@@ -1077,6 +1077,11 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
             call = f"kernel_relu_s8({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "relu6_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            qmax = op["clamp_max"]
+            call = f"kernel_relu6_s8({in_ptr}, {out_ptr}, {n}, {qmax})"
         elif op["op"] == "conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             w = _weight_name(model_name, op["weight"])

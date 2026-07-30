@@ -569,6 +569,13 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         inp, out = inputs
         fn(_i8p(inp), _i8p(out), shape["n"])
         return out
+    if op == "relu6_s8":
+        inp, out = inputs
+        # Representative int8 ceiling for the 6.0 clamp; a real model-level
+        # invocation supplies the calibrated qmax. 100 exercises both the
+        # lower (0) and upper clamp on the [-128, 127] random input.
+        fn(_i8p(inp), _i8p(out), shape["n"], 100)
+        return out
     if op == "conv2d_s8":
         inp, w, b, out = inputs
         fn(_i8p(inp), _i8p(w), _i32p(b), _i8p(out),
@@ -707,7 +714,7 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
 
 # Op kinds that produce integer outputs — verify must compare bit-exactly
 # (no atol/rtol tolerance) since integer math is deterministic.
-_INTEGER_OPS = {"linear_s8", "relu_s8", "conv2d_s8", "maxpool2d_s8",
+_INTEGER_OPS = {"linear_s8", "relu_s8", "relu6_s8", "conv2d_s8", "maxpool2d_s8",
                 "add_s8", "batchnorm2d_s8", "sigmoid_s8",
                 "silu_s8", "upsample_nearest_s8",
                 "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8",
@@ -819,6 +826,8 @@ def verify(
                 elif op == "linear_s8":
                     inputs_ref = _gen_inputs_linear_s8(shape, rng)
                 elif op == "relu_s8":
+                    inputs_ref = _gen_inputs_relu_s8(shape, rng)
+                elif op == "relu6_s8":
                     inputs_ref = _gen_inputs_relu_s8(shape, rng)
                 elif op == "conv2d_s8":
                     inputs_ref = _gen_inputs_conv2d_s8(shape, rng)

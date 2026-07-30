@@ -728,6 +728,25 @@ def extract_int8(
                     "shape": {"n": n},
                 })
 
+            elif isinstance(mod, torch.nn.ReLU6):
+                # Standalone ReLU6: clamp real values to [0, 6]. Keep the
+                # output at the input's scale (like relu_s8 keeps scale for
+                # plain relu) and express the 6.0 ceiling in int8 units:
+                # qmax = round(6 / s), saturated to [1, 127]. zp = 0.
+                in_scale = scales[in_name]
+                scales[node.name] = in_scale       # relu6 preserves scale
+                _record(node.name, dtype="i8")
+                qmax = max(1, min(127, int(round(6.0 / in_scale))))
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "relu6_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "clamp_max": qmax,
+                })
+
             elif isinstance(mod, torch.nn.Conv2d):
                 if mod.groups != 1:
                     raise NotImplementedError(
@@ -965,6 +984,21 @@ def extract_int8(
                     "outputs": [node.name],
                     "shape": {"n": n},
                 })
+            elif tname == "relu6" or target is torch.nn.functional.relu6:
+                in_name = node.args[0].name
+                in_scale = scales[in_name]
+                scales[node.name] = in_scale       # relu6 preserves scale
+                _record(node.name, dtype="i8")
+                qmax = max(1, min(127, int(round(6.0 / in_scale))))
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": node.name,
+                    "op": "relu6_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "clamp_max": qmax,
+                })
             elif tname == "flatten" or target is torch.flatten:
                 in_name = node.args[0].name
                 _record(node.name, dtype="i8")
@@ -1179,6 +1213,9 @@ def extract_int8(
             activations[out_name] = scaled.astype(np.int8)
         elif op["op"] == "relu_s8":
             activations[out_name] = np.maximum(in_arr, 0).astype(np.int8)
+        elif op["op"] == "relu6_s8":
+            activations[out_name] = np.clip(
+                in_arr, 0, op["clamp_max"]).astype(np.int8)
         elif op["op"] == "conv2d_s8":
             sh = op["shape"]
             q = op["quant"]
@@ -2433,7 +2470,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano"])
+                             "mobilenet_v2", "yolov8_nano", "relu6net"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2462,6 +2499,8 @@ def main() -> None:
         from modelblaster.models import mlp_control as model_mod
     elif args.model == "lenet":
         from modelblaster.models import lenet as model_mod
+    elif args.model == "relu6net":
+        from modelblaster.models import relu6net as model_mod
     elif args.model == "dronet":
         from modelblaster.models import dronet as model_mod
     elif args.model == "mobilenet_v2":
