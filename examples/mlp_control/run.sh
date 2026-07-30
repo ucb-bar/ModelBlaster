@@ -7,6 +7,6 @@
 # See mlp_generic/run.sh for the full env-var docs.
 set -euo pipefail
 MODEL_NAME=mlp_control
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MODEL_NAME REPO_ROOT
-source "${REPO_ROOT}/modelblaster/examples/_run_lib.sh"
+source "${REPO_ROOT}/examples/_run_lib.sh"

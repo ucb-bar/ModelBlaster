@@ -1,0 +1,34 @@
+# QRB5165 head-to-head with mlp_control pinned to CPU_P (gemmini) — the
+# whole 4-instance × 7-dispatch mlp chain stays on one backend so the
+# rvv_opu/gemmini elu_s8 kernel divergence (a few LSBs) doesn't poison
+# subsequent linear_s8 dispatches in the same chain.
+#
+# Cost vs the unpinned HEFT fixture:
+#   - predicted +0.14 ms (84.15 → 84.29 ms expected, similar to the
+#     elu_s8-only pin we tried before)
+# Benefit:
+#   - mlp_control verify-PASS expected on the FireSim capture, instead
+#     of the cross-backend drift FAIL we recorded earlier
+# Key difference vs the previous elu_s8-only pin which timed out at
+# 1 hr FireSim wall: this version uses HEFT (not MOSEK on 300-op), so
+# the gemmini tile gets *natural* clustering — HEFT picks the
+# lowest-cost tile per op which keeps mlp_control's chain tight on
+# gemmini without forcing the heavy yolov8 conv2d_s8 ops to compete on
+# the same back-to-back issue port.
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: opu0,     kind: CPU_E, hart: 1 }
+requantize_ops: [conv2d_s8, linear_s8]
+pin_to_cpu_p: [mlp_control]
+networks:
+  - { name: yolov8_nano_64, quant: int8, instances: 1 }
+  - { name: dronet,         quant: int8, instances: 2 }
+  - { name: mlp_control,    quant: int8, instances: 4 }
+horizon_ms: 75.0
+solver: HEFT
+time_limit_s: 0
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000

@@ -1,0 +1,57 @@
+# The treatments — the compile flows being compared. One row per arm.
+#
+# Adding a new arm = one row here + one driver file in ../arms/<id>.py
+# that emits run.json conforming to the shared schema. No aggregator
+# code change required.
+
+arms:
+  - id: A
+    name: deterministic_curated
+    description: |
+      Current ModelBlaster pipeline, BACKEND=curated (or scalar fallback).
+      No LLM in the loop. Baseline reference for compiler quality.
+    driver: modelblaster.benchmarks.arms.arm_a_curated
+    requires_llm: null
+
+  - id: B-bedrock
+    name: optimize_beam_search_bedrock
+    description: |
+      Current ModelBlaster pipeline + BACKEND=llm + --optimize beam search
+      with FIRESIM_EVAL re-rank where time permits, using AWS Bedrock for
+      kernel synthesis and beam reranking. Per-call token usage is logged
+      to llm_calls.jsonl via pipeline.bedrock_client; the driver rolls it
+      up into llm_tokens.json at end-of-run.
+    driver: modelblaster.benchmarks.arms.arm_b_bedrock
+    requires_llm: bedrock
+
+  - id: B-gemini
+    name: optimize_beam_search_gemini
+    description: |
+      Same pipeline as Arm B-bedrock with the LLM provider swapped to
+      Google's Gemini API (default model: gemini-2.5-flash). Matched on
+      every other axis so the comparison isolates the LLM-provider
+      effect on kernel quality and token economics.
+    driver: modelblaster.benchmarks.arms.arm_b_gemini
+    requires_llm: gemini
+
+  - id: B-claude
+    name: optimize_beam_search_claude_code
+    description: |
+      Same pipeline as Arm B-bedrock / B-gemini with Claude Code driving
+      kernel synthesis through a `claude --print --output-format json
+      --bare` subprocess per call. Token usage and Claude Code's
+      self-reported `total_cost_usd` are captured in the JSONL per
+      call; the same provider-agnostic rollup feeds dollars_equivalent.
+    driver: modelblaster.benchmarks.arms.arm_b_claude
+    requires_llm: claude_code
+
+  - id: C
+    name: agentic_claude_code
+    description: |
+      Agentic flow (Phase 4 — gated): dossier + analytical cost models +
+      pass cards + plan/replan driven by Claude Code via MCP tools and
+      subagents. Per-decision token cost from Claude Code session JSONL
+      is authoritative; tool-call traces are reconciliation only.
+    driver: modelblaster.benchmarks.arms.arm_c_agentic
+    requires_llm: claude_code
+    gated_by: phase_3_dashboard_review

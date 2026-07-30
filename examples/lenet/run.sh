@@ -3,6 +3,6 @@
 # shared body lives in modelblaster/examples/_run_lib.sh.
 set -euo pipefail
 MODEL_NAME=lenet
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MODEL_NAME REPO_ROOT
-source "${REPO_ROOT}/modelblaster/examples/_run_lib.sh"
+source "${REPO_ROOT}/examples/_run_lib.sh"
