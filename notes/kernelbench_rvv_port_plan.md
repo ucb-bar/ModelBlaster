@@ -105,14 +105,21 @@ Commits (in order):
 - **Matmul variants** (`8b0f599`): triu/tril mask ops, diag_matmul fusion
   (diag(A)@B row-scale), and N-D@2D matmul + einsum '...l,lk->...k'. Unlocked
   11/12/14/15 and fixed 10_3D.
+- **Cumulative + L1Norm** (`17711a4`): cumsum, cumprod, flip, elementwise mul,
+  mean_abs_norm (38). Unlocked 89/90/91/93/38.
+- **Loss family** (`66f1be1`): mse/hinge (fused via _maybe_fuse_loss), huber/
+  cross_entropy/kldiv+log/triplet (direct handlers). Unlocked 94/95/96/98/99/100.
+- **Dilated conv2d** (`65842ad`): DH/DW across conv2d variants + wrapper; shrink
+  back-off validation. Unlocked 76, 80.
+- **mul_scalar** (`cda8a9d`): tensor * python-float const (5) via scalar-bind.
+- **sdpa** (`ba20394`): attention (97) + cuda/fp16 creation shim.
+- **exclusive_cumsum** (`7e4de73`): 92 via compound fusion.
 
-Extractable corpus: **34 → 84 / 100** (84/84 PASS after the matmul-variant batch).
-
-Still out (16): losses (7); cumsum/cumprod/flip/select (5); abs(L1Norm 38);
-dilated conv2d (76, 80); SDPA (97, hardcodes cuda).
+Extractable corpus: **34 → 100 / 100 — every level1 bench PASSes on RVV/spike
+fp32** (`d287ca4`…`7e4de73`).
 
 Note on losses: a scalar output is NOT a blocker — the harness flattens outputs
-and compares element-wise, so a size-1 result works. Losses are deferred purely
+and compares element-wise, so a size-1 result works. Losses were deferred purely
 by effort: each needs a new reduction-to-scalar op (mse_loss, huber, kldiv) or a
 compound (cross_entropy = log_softmax + NLL), and they're multi-input (preds +
 targets) — which the packed_inputs path already supports. Implementable, not
