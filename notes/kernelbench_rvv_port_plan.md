@@ -81,6 +81,18 @@ KernelBench models are **fp32**; the curated RVV kernels here are all **int8
    on firesim). Env pinned to this working copy via scratch `mbenv.sh`;
    `_run_lib.sh` exports `PYTHONPATH=<parent>` for the submodule layout.
 
+### Phase 3.5 — extend op coverage (2026-07-29, in progress)
+Beyond the first 34 single-input benches, extending the loader + op set:
+- **Matmul family** (`babc532`): relaxed `_load_kernelbench` to return
+  multi-input `forward(A,B)`; extract()'s `packed_inputs` path already handled
+  it. 12/18 matmul benches PASS (matmul, matmul_ta/tb/tatb, bmm). Remaining 6
+  need `diag`/`triu`/`tril`/`einsum` handlers or scalar-broadcast.
+- **fp32 softmax / log_softmax / avgpool2d / layer_norm** (new KernelSpecs +
+  extract handlers + skeleton emission): unlocks benches 23, 24, 45, 40.
+- Extractable corpus: **34 → 51 / 100**.
+- Still out: Conv1d/3d, ConvTranspose{1,2,3}d (large family), Instance/Group/
+  RMSNorm, AvgPool1d/3d, MaxPool1d/3d, cumsum/cumprod, losses.
+
 ### Phase 4 — optimized RVV + real RTL (~1 week)
 10. `BACKEND=llm` on the covered ops → LLM RVV kernels, verified + measured
     (reference-vs-llm speedup per op) — the actual KernelBench metric.
