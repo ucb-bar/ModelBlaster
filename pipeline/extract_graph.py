@@ -325,6 +325,44 @@ def _match_frobenius_norm(out, x):
     return True
 
 
+def _match_rms_norm(out, x):
+    """Pattern: out = x / sqrt(mean(x**2, dim=1, keepdim=True) + eps).
+    Returns eps (float) on match, else None (KernelBench 36_RMSNorm)."""
+    if out.op != "call_function" or out.target not in (_operator.truediv, torch.div):
+        return None
+    if len(out.args) != 2 or out.args[0] is not x:
+        return None
+    sqrt_node = out.args[1]
+    if not (hasattr(sqrt_node, "op") and sqrt_node.op == "call_function"
+            and getattr(sqrt_node.target, "__name__", "") == "sqrt"):
+        return None
+    add_node = sqrt_node.args[0]
+    if not (hasattr(add_node, "op") and add_node.op == "call_function"
+            and add_node.target in (_operator.add, torch.add)):
+        return None
+    mean_node, eps = add_node.args[0], add_node.args[1]
+    if not isinstance(eps, (int, float)):
+        mean_node, eps = add_node.args[1], add_node.args[0]
+    if not isinstance(eps, (int, float)):
+        return None
+    if not (hasattr(mean_node, "op") and mean_node.op == "call_function"
+            and getattr(mean_node.target, "__name__", "") == "mean"):
+        return None
+    mkw = mean_node.kwargs or {}
+    dim = mkw.get("dim", None)
+    if dim is None and len(mean_node.args) > 1:
+        dim = mean_node.args[1]
+    if dim != 1:
+        return None
+    pow_node = mean_node.args[0]
+    if not (hasattr(pow_node, "op") and pow_node.op == "call_function"
+            and pow_node.target in (_operator.pow, torch.pow)):
+        return None
+    if len(pow_node.args) < 2 or pow_node.args[0] is not x or pow_node.args[1] != 2:
+        return None
+    return float(eps)
+
+
 def _maybe_fuse_compound_activation(gm) -> None:
     """If the entire forward graph matches a known compound activation,
     rewrite the FX graph in place: remove the multi-op subgraph and
@@ -357,6 +395,8 @@ def _maybe_fuse_compound_activation(gm) -> None:
         sentinel = _agents_compound_l2_norm
     elif _match_frobenius_norm(out_arg, x):
         sentinel = _agents_compound_frobenius_norm
+    elif (_rms_eps := _match_rms_norm(out_arg, x)) is not None:
+        sentinel = _agents_compound_rms_norm
     else:
         return
 
@@ -369,6 +409,8 @@ def _maybe_fuse_compound_activation(gm) -> None:
     # re-run on this graph.
     if "tensor_meta" in x.meta:
         new_node.meta["tensor_meta"] = x.meta["tensor_meta"]
+    if sentinel is _agents_compound_rms_norm:
+        new_node.meta["rms_eps"] = _rms_eps
     out_node.args = (new_node,)
     gm.graph.eliminate_dead_code()
     gm.recompile()
@@ -404,6 +446,10 @@ def _agents_compound_frobenius_norm(x):
     return x
 
 
+def _agents_compound_rms_norm(x):
+    return x
+
+
 SUPPORTED_MODULES = (
     torch.nn.Linear,
     torch.nn.ReLU,
@@ -425,6 +471,8 @@ SUPPORTED_MODULES = (
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
     torch.nn.LayerNorm,  # normalize over trailing normalized_shape dims
+    torch.nn.GroupNorm,  # per-(sample,group) normalize; InstanceNorm is G==C
+    torch.nn.InstanceNorm2d,  # per-(sample,channel) spatial normalize
     torch.nn.Sigmoid,
     # YOLOv8 backbone uses SiLU activation throughout; neck uses Upsample.
     torch.nn.SiLU,
@@ -1830,6 +1878,47 @@ def extract(
                     "shape": {"M": M, "K": K},
                 })
 
+            elif isinstance(mod, (torch.nn.GroupNorm, torch.nn.InstanceNorm2d)):
+                # Both normalize over (channels-in-group × spatial) per sample;
+                # InstanceNorm2d is the num_groups == num_channels case. gamma /
+                # beta are per-channel (ones/zeros when affine is off).
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                N_ = in_shape[0]
+                C = in_shape[1]
+                HW = int(np.prod(in_shape[2:])) if len(in_shape) > 2 else 1
+                if isinstance(mod, torch.nn.GroupNorm):
+                    G = int(mod.num_groups)
+                    affine = bool(mod.affine)
+                    eps = float(mod.eps)
+                else:  # InstanceNorm2d: one group per channel
+                    G = C
+                    affine = bool(mod.affine)
+                    eps = float(mod.eps)
+                if C % G != 0:
+                    raise NotImplementedError(
+                        f"group_norm at {node.name}: C={C} not divisible by "
+                        f"G={G}")
+                g_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias"
+                if affine and getattr(mod, "weight", None) is not None:
+                    weights[g_key] = mod.weight.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                    weights[b_key] = mod.bias.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                else:
+                    weights[g_key] = np.ones(C, dtype=weight_dtype)
+                    weights[b_key] = np.zeros(C, dtype=weight_dtype)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "group_norm",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "gamma_key": g_key,
+                    "beta_key": b_key,
+                    "eps": eps,
+                    "shape": {"N": N_, "C": C, "G": G, "HW": HW},
+                })
+
             elif isinstance(mod, torch.nn.Dropout):
                 # Eval-mode dropout is identity. Record as a view: the output
                 # tensor aliases the input.
@@ -2451,6 +2540,19 @@ def extract(
                     "name": node.name, "op": "frobenius_norm",
                     "inputs": [in_name], "outputs": [out_name],
                     "shape": {"n": n},
+                })
+            elif target is _agents_compound_rms_norm:
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                dim = 1  # RMSNorm reduces over the channel axis, keepdim=True
+                outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
+                reduce = int(in_shape[dim])
+                inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
+                ops.append({
+                    "name": node.name, "op": "rms_norm",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "eps": float(node.meta.get("rms_eps", 1e-5)),
+                    "shape": {"outer": outer, "reduce": reduce, "inner": inner},
                 })
             elif tname == "hardtanh" \
                     or target is torch.nn.functional.hardtanh:

@@ -7256,6 +7256,124 @@ def _layer_norm_argtypes():
     return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_float]
 
 
+def _group_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, beta, output, N, C, G, HW, eps
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_float]
+
+
+GROUP_NORM = KernelSpec(
+    op="group_norm",
+    signature=(
+        "void kernel_group_norm(const float *input, const float *gamma, "
+        "const float *beta, float *output, int N, int C, int G, int HW, "
+        "float eps)"
+    ),
+    semantics=(
+        "GroupNorm over an NCHW tensor: the C channels are split into G groups\n"
+        "of C/G channels; mean/variance are computed jointly over the\n"
+        "(C/G) * HW elements of each (sample, group), then applied per element:\n"
+        "  output[n, c, i] = gamma[c] * (input[n, c, i] - mu_{n,g}) / \n"
+        "                    sqrt(var_{n,g} + eps) + beta[c]\n"
+        "with g = c / (C/G). gamma/beta are per-channel float32 buffers of\n"
+        "length C (ones/zeros when the module has no affine). InstanceNorm2d is\n"
+        "the G == C special case. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_group_norm(const float *input, const float *gamma,
+                       const float *beta, float *output,
+                       int N, int C, int G, int HW, float eps) {
+    int cpg = C / G;              /* channels per group */
+    long cnt = (long)cpg * HW;
+    for (int n = 0; n < N; n++) {
+        for (int g = 0; g < G; g++) {
+            float sum = 0.0f, sqsum = 0.0f;
+            for (int cc = 0; cc < cpg; cc++) {
+                int c = g*cpg + cc;
+                const float *p = input + ((long)(n*C + c))*HW;
+                for (int i = 0; i < HW; i++) {
+                    float v = p[i];
+                    sum += v;
+                    sqsum += v * v;
+                }
+            }
+            float mean = sum / (float)cnt;
+            float var  = sqsum / (float)cnt - mean * mean;
+            float inv_sigma = 1.0f / sqrtf(var + eps);
+            for (int cc = 0; cc < cpg; cc++) {
+                int c = g*cpg + cc;
+                float gm = gamma[c], bt = beta[c];
+                const float *p = input + ((long)(n*C + c))*HW;
+                float *o = output + ((long)(n*C + c))*HW;
+                for (int i = 0; i < HW; i++) {
+                    o[i] = gm * (p[i] - mean) * inv_sigma + bt;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 8, "G": 2, "HW": 64, "eps": 1e-5},
+        {"N": 2, "C": 16, "G": 16, "HW": 32, "eps": 1e-5},  # instance-norm case
+    ],
+    argtypes_factory=_group_norm_argtypes,
+)
+
+
+def _rms_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+RMS_NORM = KernelSpec(
+    op="rms_norm",
+    signature=(
+        "void kernel_rms_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner, float eps)"
+    ),
+    semantics=(
+        "RMS normalization over the reduce axis (KernelBench 36 uses dim=1,\n"
+        "keepdim=True, so outer = leading dims, reduce = normalized axis,\n"
+        "inner = trailing dims):\n"
+        "  rms[o, i]           = sqrt(mean_r input[o, r, i]^2 + eps)\n"
+        "  output[o, r, i]     = input[o, r, i] / rms[o, i]\n"
+        "No affine weight (the bench divides by RMS directly). All float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_rms_norm(const float *input, float *output,
+                     int outer, int reduce, int inner, float eps) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float ss = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[((long)(o*reduce + r))*inner + i];
+                ss += v * v;
+            }
+            float inv = 1.0f / sqrtf(ss / (float)reduce + eps);
+            for (int r = 0; r < reduce; r++) {
+                long idx = ((long)(o*reduce + r))*inner + i;
+                output[idx] = input[idx] * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "reduce": 8, "inner": 64, "eps": 1e-5},
+        {"outer": 2, "reduce": 16, "inner": 128, "eps": 1e-5},
+    ],
+    argtypes_factory=_rms_norm_argtypes,
+)
+
+
 LAYER_NORM = KernelSpec(
     op="layer_norm",
     signature=(
@@ -7342,6 +7460,8 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "softmax": SOFTMAX,
     "log_softmax": LOG_SOFTMAX,
     "layer_norm": LAYER_NORM,
+    "group_norm": GROUP_NORM,
+    "rms_norm": RMS_NORM,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
