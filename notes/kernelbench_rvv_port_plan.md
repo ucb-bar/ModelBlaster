@@ -99,14 +99,14 @@ Commits (in order):
   output_pad/groups/dilation), IHWO-aware weight. 7/7 ConvTranspose2d benches.
 - **1D conv/pool** (`4308eab`): Conv1d/ConvTranspose1d/MaxPool1d/AvgPool1d map
   to 2D kernels with a unit height dim. 6 benches (dilated Conv1d 76 deferred).
+- **3D conv/pool** (`1a8f4da`): conv3d, conv_transpose3d, maxpool3d, avgpool3d
+  (new 5D NCDHW kernels; 5D weights stay OIDHW — no repack). 13/13 benches.
 
-Extractable corpus: **34 → 67 / 100**.
+Extractable corpus: **34 → 80 / 100** (79/80 PASS; only 10_3D fails).
 
-Still out (33): **3D conv/pool family (13)** — Conv3d ×4, ConvTranspose3d ×7,
-MaxPool3d, AvgPool3d (need 5D-tensor kernels — the obvious next batch); losses
-(7, scalar output, out of scope); cumsum/cumprod/flip/select (5); matmul
-variants diag/triu/tril/einsum (4); abs(L1Norm 38); dilated conv2d (76, 80);
-SDPA (97, hardcodes cuda).
+Still out (20): losses (7, scalar output, out of scope); cumsum/cumprod/flip/
+select (5); matmul variants diag/triu/tril/einsum (4); abs(L1Norm 38); dilated
+conv2d (76, 80); SDPA (97, hardcodes cuda); 10_3D broadcast matmul.
 
 ### Phase 4 — optimized RVV + real RTL (~1 week)
 10. `BACKEND=llm` on the covered ops → LLM RVV kernels, verified + measured
