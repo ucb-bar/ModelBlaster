@@ -124,6 +124,7 @@ each against its `io.npz` golden (passed via `--io-paths`, since the flat
 | `RUNNER` | `spike` | `spike`, `firesim`, or `native`. |
 | `BACKEND` | `reference` | `reference` (curated kernels) or `llm` (generated). |
 | `BENCH_MAX_ELEMENTS` | `65536` | Shrink largest module dim so io fits spike RAM. `0` = **stock dims**. |
+| `CMODEL_LARGE` | `0` | `1` = build with the RISC-V **large** code model (`CONFIG_RISCV_CMODEL_LARGE=y`). Lifts the ±2 GiB medany PC-relative (`R_RISCV_PCREL_HI20`) span limit so stock-dim baked io >2 GB can link. Needs SDK gcc ≥14. Verified PASS on spike + FireSim. |
 | `JOBS` | `1` | (run_all) concurrent benches. Forced to 1 on firesim (shared FPGA). |
 | `FORCE_EXTRACT` | `1` (multi/all) | Re-run extract even if `generated/` exists. |
 | `MB_KB_DATA_ROOT` | `/scratch/dima/mb_kb` | Symlink target for the heavy per-bench dir (keeps it off the repo partition; parallel-safe). Set empty to disable. |
