@@ -1684,10 +1684,19 @@ def extract(
 
     _skip_nodes: set = set()
     for _n in gm.graph.nodes:
+        # `@` traces to operator.matmul (name "matmul"), not torch.matmul —
+        # match by name too so the diag/transpose fusions fire for both.
         if (_n.op == "call_function" and
-                _n.target in (torch.matmul, torch.mm)):
+                (_n.target in (torch.matmul, torch.mm, _operator.matmul)
+                 or getattr(_n.target, "__name__", "") in ("matmul", "mm"))):
             for _arg in _n.args[:2]:
                 if _is_transpose_node(_arg):
+                    _skip_nodes.add(_arg)
+                # diag(A) @ B is fused into diag_matmul; the diag node itself
+                # emits no op.
+                elif (isinstance(_arg, torch.fx.Node)
+                      and _arg.op == "call_function"
+                      and getattr(_arg.target, "__name__", "") == "diag"):
                     _skip_nodes.add(_arg)
 
     for node in gm.graph.nodes:
@@ -2842,32 +2851,51 @@ def extract(
             elif (target is torch.matmul or target is torch.mm or
                   tname in ("matmul", "mm")):
                 arg_a_node, arg_b_node = node.args[0], node.args[1]
-                trans_a = _is_transpose_node(arg_a_node)
-                trans_b = _is_transpose_node(arg_b_node)
-                a_node = arg_a_node.args[0] if trans_a else arg_a_node
-                b_node = arg_b_node.args[0] if trans_b else arg_b_node
-                # Shape before transpose: a_shape is (K,M) if trans_a else (M,K)
-                a_shape = list(tensors[a_node.name]["shape"])
-                b_shape = list(tensors[b_node.name]["shape"])
-                if trans_a:
-                    K, M = int(a_shape[0]), int(a_shape[1])
+                # diag(A) @ B — A is 1D, diag makes it NxN, then row-scales B.
+                # Emit a fused diag_matmul (out[i,j]=A[i]*B[i,j]) rather than
+                # materializing the NxN diagonal matrix (KernelBench 12).
+                if (isinstance(arg_a_node, torch.fx.Node)
+                        and arg_a_node.op == "call_function"
+                        and getattr(arg_a_node.target, "__name__", "") == "diag"):
+                    a1_node = arg_a_node.args[0]
+                    b_shape = list(tensors[arg_b_node.name]["shape"])
+                    ops.append({
+                        "name": node.name, "op": "diag_matmul",
+                        "inputs": [a1_node.name, arg_b_node.name],
+                        "outputs": [out_name],
+                        "shape": {"N": int(b_shape[0]), "M": int(b_shape[1])},
+                    })
                 else:
-                    M, K = int(a_shape[0]), int(a_shape[1])
-                N = int(b_shape[0]) if trans_b else int(b_shape[1])
-                if trans_a and trans_b:
-                    op_kind = "matmul_tatb"
-                elif trans_a:
-                    op_kind = "matmul_ta"
-                elif trans_b:
-                    op_kind = "matmul_tb"
-                else:
-                    op_kind = "matmul"
-                ops.append({
-                    "name": node.name, "op": op_kind,
-                    "inputs": [a_node.name, b_node.name],
-                    "outputs": [out_name],
-                    "shape": {"M": M, "K": K, "N": N},
-                })
+                    trans_a = _is_transpose_node(arg_a_node)
+                    trans_b = _is_transpose_node(arg_b_node)
+                    a_node = arg_a_node.args[0] if trans_a else arg_a_node
+                    b_node = arg_b_node.args[0] if trans_b else arg_b_node
+                    a_shape = list(tensors[a_node.name]["shape"])
+                    b_shape = list(tensors[b_node.name]["shape"])
+                    # N-D @ 2D: flatten A's leading dims into M (contiguous
+                    # row-major, so the matmul kernel sees a plain [M,K]). This
+                    # covers torch.matmul(A_3d/4d, B_2d) (KernelBench 10) and the
+                    # einsum "...l,lk->...k" reduction. Transposed forms stay 2D.
+                    if trans_a:
+                        K, M = int(a_shape[0]), int(a_shape[1])
+                    else:
+                        M = int(np.prod(a_shape[:-1]))
+                        K = int(a_shape[-1])
+                    N = int(b_shape[0]) if trans_b else int(b_shape[-1])
+                    if trans_a and trans_b:
+                        op_kind = "matmul_tatb"
+                    elif trans_a:
+                        op_kind = "matmul_ta"
+                    elif trans_b:
+                        op_kind = "matmul_tb"
+                    else:
+                        op_kind = "matmul"
+                    ops.append({
+                        "name": node.name, "op": op_kind,
+                        "inputs": [a_node.name, b_node.name],
+                        "outputs": [out_name],
+                        "shape": {"M": M, "K": K, "N": N},
+                    })
             elif target is torch.bmm or tname == "bmm":
                 a_name = node.args[0].name
                 b_name = node.args[1].name
@@ -2883,6 +2911,58 @@ def extract(
                         "K": int(a_shape[2]),
                         "N": int(b_shape[2]),
                     },
+                })
+            elif tname in ("triu", "tril") or target in (torch.triu, torch.tril):
+                # Upper/lower triangular mask of a 2D matrix (KernelBench 14/15,
+                # typically triu(matmul(A,B))). diagonal from kwargs/args[1].
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                if len(in_shape) != 2:
+                    raise NotImplementedError(
+                        f"{tname} at {node.name}: only 2D supported "
+                        f"(got {in_shape})")
+                diagonal = 0
+                if node.kwargs and "diagonal" in node.kwargs:
+                    diagonal = int(node.kwargs["diagonal"])
+                elif len(node.args) > 1:
+                    diagonal = int(node.args[1])
+                op_name = "triu" if (tname == "triu" or target is torch.triu) \
+                    else "tril"
+                ops.append({
+                    "name": node.name, "op": op_name,
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"M": in_shape[0], "N": in_shape[1],
+                              "diagonal": diagonal},
+                })
+            elif tname == "einsum" or target is torch.einsum:
+                # Only the "<lead>l,lk-><lead>k" reduction (A's last dim
+                # contracts with B's first; B is 2D) is wired — it's a plain
+                # matmul with A's leading dims flattened into M (KernelBench 11).
+                eq = node.args[0]
+                operands = node.args[1:]
+                if len(operands) == 1 and isinstance(operands[0], (tuple, list)):
+                    operands = tuple(operands[0])
+                eq_norm = eq.replace(" ", "")
+                a_name = operands[0].name
+                b_name = operands[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                b_shape = [int(s) for s in tensors[b_name]["shape"]]
+                lhs, rhs = eq_norm.split("->")
+                a_sub, b_sub = lhs.split(",")
+                ok = (len(b_sub) == 2 and len(b_shape) == 2
+                      and a_sub[-1] == b_sub[0]           # contract A_last · B_0
+                      and rhs == a_sub[:-1] + b_sub[1])   # output = lead + B_1
+                if not ok:
+                    raise NotImplementedError(
+                        f"einsum {eq!r} at {node.name}: only "
+                        f"'...l,lk->...k' (matmul) is supported")
+                M = int(np.prod(a_shape[:-1]))
+                K = int(a_shape[-1])
+                N = int(b_shape[1])
+                ops.append({
+                    "name": node.name, "op": "matmul",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"M": M, "K": K, "N": N},
                 })
             elif target is torch.cat or tname == "cat":
                 # torch.cat(tensors_list, dim). YOLOv8 uses dim=1 (channel
