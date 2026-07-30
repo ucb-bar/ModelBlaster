@@ -24,6 +24,18 @@ set -euo pipefail
 : "${MODEL_NAME:?MODEL_NAME must be set by the caller}"
 : "${REPO_ROOT:?REPO_ROOT must be set by the caller}"
 
+# Submodule-layout adaptation (LOCAL, uncommitted): ModelBlaster is upstreamed as
+# a standalone repo, so this script resolves examples/harness/kernels relative to
+# the ModelBlaster root. When embedded as a submodule of zephyr-chipyard-sw, the
+# example run.sh scripts set REPO_ROOT to the *parent* (zephyr) repo, so retarget
+# it to the nested modelblaster/ dir. No-op in a standalone checkout.
+if [[ -d "${REPO_ROOT}/modelblaster/pipeline" ]]; then
+    # The parent (zephyr) repo becomes the package root so `python -m
+    # modelblaster.pipeline.*` resolves once we cd into the nested dir.
+    export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+    REPO_ROOT="${REPO_ROOT}/modelblaster"
+fi
+
 BACKEND="${BACKEND:-reference}"
 TARGET="${TARGET:-scalar}"
 QUANT="${QUANT:-fp32}"
@@ -95,6 +107,15 @@ _mb_stage_begin extract
 # re-running tracing. Set FORCE_EXTRACT=1 to override.
 if [[ -f "${IR_DIR}/graph.json" && -f "${IR_DIR}/weights.npz" && -f "${IR_DIR}/io.npz" && "${FORCE_EXTRACT:-0}" != "1" ]]; then
     echo "  (skipped — IR present at ${IR_DIR}; set FORCE_EXTRACT=1 to re-run)"
+elif [[ -n "${BENCH_FILE:-}" ]]; then
+    # KernelBench mode: caller passes BENCH_FILE (a level1 .py path); route
+    # through extract_graph's --bench-file loader instead of --model (the
+    # kernelbench MODEL_NAME is a path like kernelbench/kb_<name>, not a
+    # registered model).
+    python -m modelblaster.pipeline.extract_graph \
+        --bench-file "${BENCH_FILE}" \
+        --out-dir "${IR_DIR}" \
+        --quant "${QUANT}"
 else
     python -m modelblaster.pipeline.extract_graph \
         --model "${MODEL_NAME}" \

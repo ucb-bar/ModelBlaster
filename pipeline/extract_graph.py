@@ -2614,12 +2614,94 @@ def extract(
     return ir
 
 
+def _load_kernelbench(bench_path: str,
+                      max_elements: "int | None" = None
+                      ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
+    """Load a KernelBench level1 file (single-input variant only).
+
+    Schema (every level1 file conforms): a `class Model(nn.Module)` with
+    `__init__(*init_args)` + `forward(x)`, module-level shape constants, and
+    `get_inputs()` / `get_init_inputs()`.
+
+    Returns (model, sample_input, name); name is a C-friendly `kb_<basename>`.
+
+    `max_elements` caps the input tensor size — KernelBench level1 defaults are
+    sized for GPU memory (batch=16, 256x256 spatial) and overflow Zephyr's
+    256 MB RAM region when baked into rodata. When set, we shrink integer
+    module-level shape attrs by halving the largest until the input fits, then
+    re-instantiate, so the PyTorch golden corresponds to the shrunken shape.
+
+    Multi-input forwards (matmul A,B; loss preds+targets) raise
+    NotImplementedError — a structural extension for a later phase. See
+    modelblaster/notes/kernelbench_rvv_port_plan.md.
+    """
+    import importlib.util
+    if not os.path.isfile(bench_path):
+        raise FileNotFoundError(f"--bench-file {bench_path} not found")
+    spec = importlib.util.spec_from_file_location("_kernelbench_mod", bench_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to import {bench_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "Model"):
+        raise RuntimeError(f"{bench_path} missing class Model")
+    if not hasattr(mod, "get_inputs"):
+        raise RuntimeError(f"{bench_path} missing get_inputs()")
+
+    if max_elements is not None and max_elements > 0:
+        SHAPE_ATTRS_BLOCKLIST = {"num_classes"}  # not a spatial dim
+        ints = {k: v for k, v in vars(mod).items()
+                if isinstance(v, int) and v > 1
+                and not k.startswith("_")
+                and k not in SHAPE_ATTRS_BLOCKLIST}
+        for _ in range(64):
+            sample = mod.get_inputs()[0]
+            n = int(np.prod(sample.shape))
+            if n <= max_elements:
+                break
+            if not ints:
+                break
+            biggest = max(ints, key=ints.get)
+            new = max(1, ints[biggest] // 2)
+            if new == ints[biggest]:
+                break
+            ints[biggest] = new
+            setattr(mod, biggest, new)
+
+    init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    model = mod.Model(*init_args)
+    model.eval()
+    inputs = mod.get_inputs()
+    if not isinstance(inputs, list) or not inputs:
+        raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
+    if len(inputs) != 1:
+        raise NotImplementedError(
+            f"{bench_path} forward() takes {len(inputs)} tensors; the pipeline "
+            f"currently supports single-input forward only. Multi-input support "
+            f"(matmul, losses) is a separate extension -- see "
+            f"modelblaster/notes/kernelbench_rvv_port_plan.md.")
+    base = os.path.splitext(os.path.basename(bench_path))[0]
+    name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
+                           for ch in base).strip("_")
+    while "__" in name:
+        name = name.replace("__", "_")
+    return model, inputs[0], name
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="mlp_generic",
+    ap.add_argument("--model", default=None,
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
                              "mobilenet_v2", "yolov8_nano", "yolov8_nano_64",
                              "relu6net"])
+    ap.add_argument("--bench-file", default=None,
+                    help="path to a KernelBench level1 .py file. "
+                         "Mutually exclusive with --model.")
+    ap.add_argument("--bench-max-elements", type=int, default=65536,
+                    help="cap input tensor size for kernelbench files "
+                         "(default 65536); stock level1 shapes are halved "
+                         "on the largest int module-level attr until the "
+                         "input fits spike's 256 MB RAM region.")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2642,29 +2724,38 @@ def main() -> None:
                          "No-op for fp32 / fp16.")
     args = ap.parse_args()
 
-    if args.model == "mlp_generic":
-        from modelblaster.models import mlp_generic as model_mod
-    elif args.model == "mlp_control":
-        from modelblaster.models import mlp_control as model_mod
-    elif args.model == "lenet":
-        from modelblaster.models import lenet as model_mod
-    elif args.model == "relu6net":
-        from modelblaster.models import relu6net as model_mod
-    elif args.model == "dronet":
-        from modelblaster.models import dronet as model_mod
-    elif args.model == "mobilenet_v2":
-        from modelblaster.models import mobilenet_v2 as model_mod
-    elif args.model == "yolov8_nano":
-        from modelblaster.models import yolov8_nano as model_mod
-    elif args.model == "yolov8_nano_64":
-        from modelblaster.models import yolov8_nano_64 as model_mod
+    if (args.model is None) == (args.bench_file is None):
+        ap.error("pass exactly one of --model or --bench-file")
+
+    model_mod = None
+    if args.bench_file is not None:
+        model, sample, name = _load_kernelbench(
+            args.bench_file, max_elements=args.bench_max_elements)
     else:
-        raise SystemExit(f"unknown model {args.model}")
-    model = model_mod.get_model()
-    sample = model_mod.get_sample_input()
+        if args.model == "mlp_generic":
+            from modelblaster.models import mlp_generic as model_mod
+        elif args.model == "mlp_control":
+            from modelblaster.models import mlp_control as model_mod
+        elif args.model == "lenet":
+            from modelblaster.models import lenet as model_mod
+        elif args.model == "relu6net":
+            from modelblaster.models import relu6net as model_mod
+        elif args.model == "dronet":
+            from modelblaster.models import dronet as model_mod
+        elif args.model == "mobilenet_v2":
+            from modelblaster.models import mobilenet_v2 as model_mod
+        elif args.model == "yolov8_nano":
+            from modelblaster.models import yolov8_nano as model_mod
+        elif args.model == "yolov8_nano_64":
+            from modelblaster.models import yolov8_nano_64 as model_mod
+        else:
+            raise SystemExit(f"unknown model {args.model}")
+        model = model_mod.get_model()
+        sample = model_mod.get_sample_input()
+        name = args.model
 
     calibration_samples = None
-    if args.quant == "int8" and args.num_calibration > 1:
+    if model_mod is not None and args.quant == "int8" and args.num_calibration > 1:
         if hasattr(model_mod, "get_calibration_spec"):
             from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             spec = model_mod.get_calibration_spec(args.num_calibration)
@@ -2694,7 +2785,7 @@ def main() -> None:
                   f"get_calibration_samples; falling back to single "
                   f"get_sample_input()", flush=True)
 
-    extract(model, sample, name=args.model, out_dir=args.out_dir,
+    extract(model, sample, name=name, out_dir=args.out_dir,
             quant=args.quant,
             calibration_samples=calibration_samples)
 

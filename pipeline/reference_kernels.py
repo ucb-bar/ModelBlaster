@@ -920,7 +920,11 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                                 int iw = ow * SW - PW + kw;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                float w = weight[((ic*KH + kh)*KW + kw)*OC + oc];
+#else
                                 float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+#endif
                                 acc += v * w;
                             }
                         }
@@ -986,7 +990,11 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                                 int iw = ow * SW - PW + kw;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                float w = weight[((ic*KH + kh)*KW + kw)*OC + oc];
+#else
                                 float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+#endif
                                 acc += v * w;
                             }
                         }
@@ -3440,7 +3448,13 @@ void kernel_conv2d_dw(const float *input, const float *weight, const float *bias
                             int iw = ow * SW - PW + kw;
                             if (iw < 0 || iw >= IW) continue;
                             float v = input[((n*C + c)*IH + ih)*IW + iw];
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                            /* depthwise weight [C,1,KH,KW] packed IHWO (perm
+                               1,2,3,0): IC=1, OC=C, so index = (kh*KW+kw)*C+c. */
+                            float w = weight[(kh*KW + kw)*C + c];
+#else
                             float w = weight[(c*KH + kh)*KW + kw];
+#endif
                             acc += v * w;
                         }
                     }
