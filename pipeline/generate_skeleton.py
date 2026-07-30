@@ -956,6 +956,16 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_layer_norm({in_ptr}, {gamma}, {beta}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {_f32(eps)})"
             )
+        elif op["op"] == "group_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            gamma = _weight_name(model_name, op["gamma_key"])
+            beta = _weight_name(model_name, op["beta_key"])
+            sh = op["shape"]
+            eps = op.get("eps", 1e-5)
+            call = (
+                f"kernel_group_norm({in_ptr}, {gamma}, {beta}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['G']}, {sh['HW']}, {_f32(eps)})"
+            )
         elif op["op"] == "add":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")
@@ -1074,6 +1084,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
                 f"{sh['outer']}, {sh['reduce']}, {sh['inner']})"
+            )
+        elif op["op"] == "rms_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            eps = op.get("eps", 1e-5)
+            call = (
+                f"kernel_rms_norm({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['reduce']}, {sh['inner']}, {_f32(eps)})"
             )
         elif op["op"] == "frobenius_norm":
             in_ptr = ptr_for(op["inputs"][0], "in")
