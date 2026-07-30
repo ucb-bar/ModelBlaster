@@ -7467,6 +7467,295 @@ void kernel_conv_transpose2d(const float *input, const float *weight,
 )
 
 
+def _conv3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, then 22 ints
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 22
+
+
+CONV3D = KernelSpec(
+    op="conv3d",
+    signature=(
+        "void kernel_conv3d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int ID, int IH, int IW, "
+        "int OC, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "3D convolution (torch.nn.Conv3d). NCDHW layout:\n"
+        "  input:  [N, IC, ID, IH, IW]\n"
+        "  weight: [OC, IC/G, KD, KH, KW]  (5D — not backend-repacked)\n"
+        "  bias:   [OC] (may be NULL)\n"
+        "  output: [N, OC, OD, OH, OW]\n"
+        "  output[n,oc,od,oh,ow] = bias[oc] + sum over kd,kh,kw and ic in\n"
+        "  group(oc) of input[n,ic, od*SD-PD+kd*DD, oh*SH-PH+kh*DH,\n"
+        "  ow*SW-PW+kw*DW] * weight[oc, ic%(IC/G), kd, kh, kw], zero-padded.\n"
+        "All tensors float32; G is the group count, D* are dilations."
+    ),
+    reference_impl="""\
+void kernel_conv3d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int ID, int IH, int IW,
+                   int OC, int OD, int OH, int OW,
+                   int KD, int KH, int KW, int SD, int SH, int SW,
+                   int PD, int PH, int PW, int DD, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd*DD;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh*DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw*DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    for (int icg = 0; icg < ICpG; icg++) {
+                                        int ic = g*ICpG + icg;
+                                        float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                        float w = weight[(((long)(oc*ICpG + icg)*KD + kd)*KH + kh)*KW + kw];
+                                        acc += v * w;
+                                    }
+                                }
+                            }
+                        }
+                        output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 2, "ID": 6, "IH": 6, "IW": 6, "OC": 4, "OD": 4,
+         "OH": 4, "OW": 4, "KD": 3, "KH": 3, "KW": 3, "SD": 1, "SH": 1,
+         "SW": 1, "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv3d_argtypes,
+)
+
+
+CONV_TRANSPOSE3D = KernelSpec(
+    op="conv_transpose3d",
+    signature=(
+        "void kernel_conv_transpose3d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int ID, int IH, int IW, "
+        "int OC, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "3D transposed convolution (torch.nn.ConvTranspose3d), gather form.\n"
+        "NCDHW; weight [IC, OC/G, KD, KH, KW] (5D, not repacked). OD/OH/OW\n"
+        "already include output_padding. Each output voxel gathers the inputs\n"
+        "that scatter onto it: for kd,kh,kw with id=(od+PD-kd*DD)/SD etc.\n"
+        "integral and in range, acc += input[n,ic,id,ih,iw] *\n"
+        "weight[ic, oc%(OC/G), kd, kh, kw]. bias may be NULL. float32."
+    ),
+    reference_impl="""\
+void kernel_conv_transpose3d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int ID, int IH, int IW,
+                             int OC, int OD, int OH, int OW,
+                             int KD, int KH, int KW, int SD, int SH, int SW,
+                             int PD, int PH, int PW, int DD, int DH, int DW,
+                             int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int ids = od + PD - kd*DD;
+                            if (ids < 0 || (ids % SD) != 0) continue;
+                            int id = ids / SD;
+                            if (id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ihs = oh + PH - kh*DH;
+                                if (ihs < 0 || (ihs % SH) != 0) continue;
+                                int ih = ihs / SH;
+                                if (ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iws = ow + PW - kw*DW;
+                                    if (iws < 0 || (iws % SW) != 0) continue;
+                                    int iw = iws / SW;
+                                    if (iw >= IW) continue;
+                                    for (int icg = 0; icg < ICpG; icg++) {
+                                        int ic = g*ICpG + icg;
+                                        float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                        float w = weight[(((long)(ic*OCpG + ocg)*KD + kd)*KH + kh)*KW + kw];
+                                        acc += v * w;
+                                    }
+                                }
+                            }
+                        }
+                        output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 2, "ID": 4, "IH": 4, "IW": 4, "OC": 4, "OD": 6,
+         "OH": 6, "OW": 6, "KD": 3, "KH": 3, "KW": 3, "SD": 1, "SH": 1,
+         "SW": 1, "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv3d_argtypes,
+)
+
+
+def _maxpool3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, then 20 ints
+    return [fp, fp] + [ctypes.c_int] * 20
+
+
+MAXPOOL3D = KernelSpec(
+    op="maxpool3d",
+    signature=(
+        "void kernel_maxpool3d(const float *input, float *output, "
+        "int N, int C, int ID, int IH, int IW, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW)"
+    ),
+    semantics=(
+        "3D max pooling (torch.nn.MaxPool3d) over NCDHW, with padding and\n"
+        "dilation. Out-of-bounds taps never win the max (treated as -inf).\n"
+        "  output[n,c,od,oh,ow] = max over kd,kh,kw of\n"
+        "    input[n,c, od*SD-PD+kd*DD, oh*SH-PH+kh*DH, ow*SW-PW+kw*DW].\n"
+        "float32."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_maxpool3d(const float *input, float *output,
+                      int N, int C, int ID, int IH, int IW,
+                      int OD, int OH, int OW,
+                      int KD, int KH, int KW, int SD, int SH, int SW,
+                      int PD, int PH, int PW, int DD, int DH, int DW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float m = -FLT_MAX;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd*DD;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh*DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw*DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    float v = input[(((long)(n*C + c)*ID + id)*IH + ih)*IW + iw];
+                                    if (v > m) m = v;
+                                }
+                            }
+                        }
+                        output[(((long)(n*C + c)*OD + od)*OH + oh)*OW + ow] = m;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 2, "ID": 8, "IH": 8, "IW": 8, "OD": 4, "OH": 4,
+         "OW": 4, "KD": 2, "KH": 2, "KW": 2, "SD": 2, "SH": 2, "SW": 2,
+         "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1},
+    ],
+    argtypes_factory=_maxpool3d_argtypes,
+)
+
+
+def _avgpool3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, then 17 ints
+    return [fp, fp] + [ctypes.c_int] * 17
+
+
+AVGPOOL3D = KernelSpec(
+    op="avgpool3d",
+    signature=(
+        "void kernel_avgpool3d(const float *input, float *output, "
+        "int N, int C, int ID, int IH, int IW, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW)"
+    ),
+    semantics=(
+        "3D average pooling (torch.nn.AvgPool3d), count_include_pad=True\n"
+        "(divisor KD*KH*KW; padded cells contribute 0), no dilation. NCDHW.\n"
+        "  output[n,c,od,oh,ow] = (1/(KD*KH*KW)) * sum over kd,kh,kw of\n"
+        "    input[n,c, od*SD-PD+kd, oh*SH-PH+kh, ow*SW-PW+kw]. float32."
+    ),
+    reference_impl="""\
+void kernel_avgpool3d(const float *input, float *output,
+                      int N, int C, int ID, int IH, int IW,
+                      int OD, int OH, int OW,
+                      int KD, int KH, int KW, int SD, int SH, int SW,
+                      int PD, int PH, int PW) {
+    float inv = 1.0f / (float)(KD * KH * KW);
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    acc += input[(((long)(n*C + c)*ID + id)*IH + ih)*IW + iw];
+                                }
+                            }
+                        }
+                        output[(((long)(n*C + c)*OD + od)*OH + oh)*OW + ow] = acc * inv;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 2, "ID": 8, "IH": 8, "IW": 8, "OD": 4, "OH": 4,
+         "OW": 4, "KD": 2, "KH": 2, "KW": 2, "SD": 2, "SH": 2, "SW": 2,
+         "PD": 0, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_avgpool3d_argtypes,
+)
+
+
 LAYER_NORM = KernelSpec(
     op="layer_norm",
     signature=(
@@ -7556,6 +7845,10 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "group_norm": GROUP_NORM,
     "rms_norm": RMS_NORM,
     "conv_transpose2d": CONV_TRANSPOSE2D,
+    "conv3d": CONV3D,
+    "conv_transpose3d": CONV_TRANSPOSE3D,
+    "maxpool3d": MAXPOOL3D,
+    "avgpool3d": AVGPOOL3D,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
