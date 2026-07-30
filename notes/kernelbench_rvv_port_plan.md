@@ -104,9 +104,16 @@ Commits (in order):
 
 Extractable corpus: **34 → 80 / 100** (79/80 PASS; only 10_3D fails).
 
-Still out (20): losses (7, scalar output, out of scope); cumsum/cumprod/flip/
-select (5); matmul variants diag/triu/tril/einsum (4); abs(L1Norm 38); dilated
-conv2d (76, 80); SDPA (97, hardcodes cuda); 10_3D broadcast matmul.
+Still out (20): losses (7); cumsum/cumprod/flip/select (5); matmul variants
+diag/triu/tril/einsum (4); abs(L1Norm 38); dilated conv2d (76, 80); SDPA (97,
+hardcodes cuda); 10_3D broadcast matmul.
+
+Note on losses: a scalar output is NOT a blocker — the harness flattens outputs
+and compares element-wise, so a size-1 result works. Losses are deferred purely
+by effort: each needs a new reduction-to-scalar op (mse_loss, huber, kldiv) or a
+compound (cross_entropy = log_softmax + NLL), and they're multi-input (preds +
+targets) — which the packed_inputs path already supports. Implementable, not
+architecturally out of scope.
 
 ### Phase 4 — optimized RVV + real RTL (~1 week)
 10. `BACKEND=llm` on the covered ops → LLM RVV kernels, verified + measured
