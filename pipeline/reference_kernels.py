@@ -7756,6 +7756,98 @@ void kernel_avgpool3d(const float *input, float *output,
 )
 
 
+def _tri_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+TRIU = KernelSpec(
+    op="triu",
+    signature=(
+        "void kernel_triu(const float *input, float *output, "
+        "int M, int N, int diagonal)"
+    ),
+    semantics=(
+        "Upper-triangular mask (torch.triu) of an [M, N] matrix: keep elements\n"
+        "on and above the k-th diagonal, zero the rest.\n"
+        "  output[i, j] = input[i, j] if j >= i + diagonal else 0\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_triu(const float *input, float *output, int M, int N, int diagonal) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            output[i*N + j] = (j >= i + diagonal) ? input[i*N + j] : 0.0f;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 8, "N": 8, "diagonal": 0}],
+    argtypes_factory=_tri_argtypes,
+)
+
+
+TRIL = KernelSpec(
+    op="tril",
+    signature=(
+        "void kernel_tril(const float *input, float *output, "
+        "int M, int N, int diagonal)"
+    ),
+    semantics=(
+        "Lower-triangular mask (torch.tril) of an [M, N] matrix: keep elements\n"
+        "on and below the k-th diagonal, zero the rest.\n"
+        "  output[i, j] = input[i, j] if j <= i + diagonal else 0\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_tril(const float *input, float *output, int M, int N, int diagonal) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            output[i*N + j] = (j <= i + diagonal) ? input[i*N + j] : 0.0f;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 8, "N": 8, "diagonal": 0}],
+    argtypes_factory=_tri_argtypes,
+)
+
+
+def _diag_matmul_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+DIAG_MATMUL = KernelSpec(
+    op="diag_matmul",
+    signature=(
+        "void kernel_diag_matmul(const float *a, const float *b, "
+        "float *output, int N, int M)"
+    ),
+    semantics=(
+        "diag(a) @ b, where a is a 1D vector of length N and b is [N, M]:\n"
+        "  output[i, j] = a[i] * b[i, j]\n"
+        "i.e. row-wise scaling of b by a (torch.diag(A) @ B, KernelBench 12).\n"
+        "The N×N diagonal matrix is never materialized. float32."
+    ),
+    reference_impl="""\
+void kernel_diag_matmul(const float *a, const float *b, float *output,
+                        int N, int M) {
+    for (int i = 0; i < N; i++) {
+        float ai = a[i];
+        for (int j = 0; j < M; j++) {
+            output[i*M + j] = ai * b[i*M + j];
+        }
+    }
+}
+""",
+    extra_shapes=[{"N": 8, "M": 16}],
+    argtypes_factory=_diag_matmul_argtypes,
+)
+
+
 LAYER_NORM = KernelSpec(
     op="layer_norm",
     signature=(
@@ -7849,6 +7941,9 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "conv_transpose3d": CONV_TRANSPOSE3D,
     "maxpool3d": MAXPOOL3D,
     "avgpool3d": AVGPOOL3D,
+    "triu": TRIU,
+    "tril": TRIL,
+    "diag_matmul": DIAG_MATMUL,
     "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
