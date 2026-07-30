@@ -466,8 +466,12 @@ SUPPORTED_MODULES = (
     torch.nn.ELU,
     torch.nn.Conv2d,
     torch.nn.ConvTranspose2d,  # transposed / fractionally-strided 2D conv
+    torch.nn.Conv1d,  # mapped to conv2d with a unit height dim
+    torch.nn.ConvTranspose1d,  # mapped to conv_transpose2d with unit height
     torch.nn.MaxPool2d,
+    torch.nn.MaxPool1d,  # mapped to maxpool2d with a unit height dim
     torch.nn.AvgPool2d,  # fixed-window 2D average pool (KernelBench 45)
+    torch.nn.AvgPool1d,  # mapped to avgpool2d with a unit height dim
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
@@ -486,6 +490,13 @@ def _pair(v) -> tuple[int, int]:
     if isinstance(v, (tuple, list)):
         return int(v[0]), int(v[1])
     return int(v), int(v)
+
+
+def _as_tuple1(v) -> tuple[int]:
+    """Coerce int or 1-tuple (the 1D nn.Conv1d/Pool1d param form) to (x,)."""
+    if isinstance(v, (tuple, list)):
+        return (int(v[0]),)
+    return (int(v),)
 
 
 def _tensor_meta(node: torch.fx.Node) -> dict[str, Any]:
@@ -1791,6 +1802,81 @@ def extract(
                         f"{node.name}"
                     )
 
+            elif isinstance(mod, torch.nn.Conv1d):
+                # 1D conv → conv2d with a unit height dim: input [N,C,L] is
+                # [N,C,1,L]; weight [OC,IC,K] → [OC,IC,1,K]; KH=1, KW=K.
+                if _as_tuple1(mod.dilation)[0] != 1:
+                    raise NotImplementedError(
+                        f"Conv1d dilation={mod.dilation} not supported at "
+                        f"{node.name}")
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, IC, IW = in_shape
+                OC, OW = out_shape[1], out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride)
+                (P,) = _as_tuple1(mod.padding)
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                w = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                weights[w_key] = w.reshape(w.shape[0], w.shape[1], 1, w.shape[2])
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                if mod.groups == 1:
+                    op_name, ch = "conv2d", None
+                elif mod.groups == IC and IC == OC:
+                    op_name, ch = "conv2d_dw", IC
+                else:
+                    raise NotImplementedError(
+                        f"Conv1d groups={mod.groups} (IC={IC},OC={OC}) at "
+                        f"{node.name}: only standard/depthwise wired")
+                if op_name == "conv2d":
+                    ops.append({
+                        "name": str(node.target), "op": "conv2d",
+                        "inputs": [in_name], "outputs": [out_name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "IC": IC, "IH": 1, "IW": IW,
+                                  "OC": OC, "OH": 1, "OW": OW,
+                                  "KH": 1, "KW": K, "SH": 1, "SW": S,
+                                  "PH": 0, "PW": P},
+                    })
+                else:
+                    ops.append({
+                        "name": str(node.target), "op": "conv2d_dw",
+                        "inputs": [in_name], "outputs": [out_name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "C": ch, "IH": 1, "IW": IW,
+                                  "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                                  "SH": 1, "SW": S, "PH": 0, "PW": P},
+                    })
+
+            elif isinstance(mod, torch.nn.ConvTranspose1d):
+                # 1D transposed conv → conv_transpose2d, unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, IC, IW = in_shape
+                OC, OW = out_shape[1], out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride)
+                (P,) = _as_tuple1(mod.padding)
+                (Dl,) = _as_tuple1(mod.dilation)
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                w = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                weights[w_key] = w.reshape(w.shape[0], w.shape[1], 1, w.shape[2])
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                ops.append({
+                    "name": str(node.target), "op": "conv_transpose2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "IH": 1, "IW": IW,
+                              "OC": OC, "OH": 1, "OW": OW,
+                              "KH": 1, "KW": K, "SH": 1, "SW": S,
+                              "PH": 0, "PW": P, "DH": 1, "DW": Dl,
+                              "G": int(mod.groups)},
+                })
+
             elif isinstance(mod, torch.nn.ConvTranspose2d):
                 # Transposed conv. Weight is [IC, OC/G, KH, KW]. OH/OW come from
                 # the traced output shape, so output_padding is already folded
@@ -1880,6 +1966,44 @@ def extract(
                         "SH": SH, "SW": SW,
                         "PH": PH, "PW": PW,
                     },
+                })
+
+            elif isinstance(mod, torch.nn.MaxPool1d):
+                # 1D max pool → maxpool2d with a unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, C, IW = in_shape
+                OW = out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride if mod.stride is not None
+                                  else mod.kernel_size)
+                (P,) = _as_tuple1(mod.padding)
+                (Dl,) = _as_tuple1(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "maxpool2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": 1, "IW": IW,
+                              "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                              "SH": 1, "SW": S, "PH": 0, "PW": P,
+                              "DH": 1, "DW": Dl},
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool1d):
+                # 1D average pool → avgpool2d with a unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, C, IW = in_shape
+                OW = out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride if mod.stride is not None
+                                  else mod.kernel_size)
+                (P,) = _as_tuple1(mod.padding)
+                ops.append({
+                    "name": str(node.target), "op": "avgpool2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": 1, "IW": IW,
+                              "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                              "SH": 1, "SW": S, "PH": 0, "PW": P},
                 })
 
             elif isinstance(mod, torch.nn.LayerNorm):
