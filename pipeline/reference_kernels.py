@@ -210,8 +210,8 @@ def _elu_argtypes():
 def _conv2d_argtypes():
     import ctypes
     fp = ctypes.POINTER(ctypes.c_float)
-    # input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW
-    return [fp, fp, fp, fp] + [ctypes.c_int] * 11
+    # input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW, DH, DW
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 13
 
 
 def _maxpool2d_argtypes():
@@ -881,7 +881,7 @@ CONV2D = KernelSpec(
         "void kernel_conv2d(const float *input, const float *weight, "
         "const float *bias, float *output, "
         "int N, int IC, int IH, int IW, int OC, "
-        "int KH, int KW, int SH, int SW, int PH, int PW)"
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
     ),
     semantics=(
         "2D convolution matching torch.nn.Conv2d semantics with groups=1, "
@@ -904,9 +904,10 @@ CONV2D = KernelSpec(
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -914,10 +915,10 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                     float acc = bias ? bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
 #if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
@@ -974,9 +975,10 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -984,10 +986,10 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                     float acc = bias ? bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
 #if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
@@ -1084,9 +1086,10 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     int M = OH * OW;
     int K = IC * KH * KW;
 
@@ -1100,9 +1103,9 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 int row = oh * OW + ow;
                 for (int ic = 0; ic < IC; ic++) {
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh * SH - PH + kh;
+                        int ih = oh * SH - PH + kh * DH;
                         for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PW + kw;
+                            int iw = ow * SW - PW + kw * DW;
                             int col = (ic * KH + kh) * KW + kw;
                             float v = 0.0f;
                             if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
@@ -1192,9 +1195,10 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     /* Tile so one OC-slab of weights fits in ~24 KB of L1D.
      * For OC=128 IC=128 K=3: 4 * 128 * 9 * 4 = 18 KB. */
     const int TILE_OC = 4;
@@ -1210,10 +1214,10 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                         float acc = bias ? bias[oc] : 0.0f;
                         for (int ic = 0; ic < IC; ic++) {
                             for (int kh = 0; kh < KH; kh++) {
-                                int ih = oh * SH - PH + kh;
+                                int ih = oh * SH - PH + kh * DH;
                                 if (ih < 0 || ih >= IH) continue;
                                 for (int kw = 0; kw < KW; kw++) {
-                                    int iw = ow * SW - PW + kw;
+                                    int iw = ow * SW - PW + kw * DW;
                                     if (iw < 0 || iw >= IW) continue;
                                     float v = input[((n*IC + ic)*IH + ih)*IW + iw];
                                     float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
