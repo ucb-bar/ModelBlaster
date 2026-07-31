@@ -56,10 +56,28 @@ case "${RUNNER}" in
 esac
 
 WEST_EXTRA=()
-if [[ "${RUNNER}" == "spike" && -n "${SPIKE_RAM_SIZE:-}" ]]; then
-    OVL="${BUILD_DIR%/build/*}/spike_ram.overlay"; mkdir -p "$(dirname "$OVL")"
-    echo "&ram0 { reg = < 0x80000000 ${SPIKE_RAM_SIZE} >; };" > "$OVL"
-    WEST_EXTRA+=(-DEXTRA_DTC_OVERLAY_FILE="${OVL}")
+# Auto-size ram0 from the fused footprint: all N models' io lives in rodata at
+# once; only one model's working buffers are live at a time. Applies to BOTH
+# spike and firesim. SPIKE_RAM_SIZE (hex bytes) overrides; AUTO_RAM0=0 disables.
+_RAM0_SZ=0
+if [[ "${AUTO_RAM0:-1}" == "1" ]]; then
+    _sum_io=0; _max_io=0
+    IFS=',' read -ra _IOS <<< "${IOPATHS}"
+    for _kv in "${_IOS[@]}"; do
+        _n=$(python -c "import numpy as np,sys; d=np.load(sys.argv[1]); print(int(d['input'].nbytes)+int(d['output'].nbytes))" "${_kv#*=}" 2>/dev/null || echo 0)
+        _sum_io=$(( _sum_io + _n )); (( _n > _max_io )) && _max_io=$_n
+    done
+    _bytes=$(( _sum_io + _max_io + 128*1024*1024 ))
+    [[ -n "${SPIKE_RAM_SIZE:-}" ]] && _bytes=$(( SPIKE_RAM_SIZE ))
+    _RAM0_SZ=$(( ((_bytes + 0x3FFFFFF) / 0x4000000) * 0x4000000 ))
+    if (( _RAM0_SZ > 0x10000000 )); then
+        if [[ "${RUNNER}" == "firesim" ]]; then _cap=$(( ${FIRESIM_DRAM_MB:-1024}*1024*1024 )); else _cap=$(( 0xF0000000 )); fi
+        (( _RAM0_SZ > _cap )) && { echo "WARN: multi ram0 $((_RAM0_SZ/1048576))MB > ${RUNNER} cap $((_cap/1048576))MB; clamping" >&2; _RAM0_SZ=$_cap; }
+        OVL="${BUILD_DIR%/build/*}/ram0.overlay"; mkdir -p "$(dirname "$OVL")"
+        printf '&ram0 { reg = < 0x80000000 0x%x >; };\n' "${_RAM0_SZ}" > "$OVL"
+        WEST_EXTRA+=(-DEXTRA_DTC_OVERLAY_FILE="${OVL}")
+        echo "[ram0] auto-sized to $((_RAM0_SZ/1048576)) MiB (${#LIST[@]} models, sum io ~$((_sum_io/1048576))MB) for ${RUNNER}" >&2
+    fi
 fi
 if [[ "${RUNNER}" == "firesim" ]]; then
     WEST_EXTRA+=(-DEXTRA_CONF_FILE="${MB}/harness/backends/${FIRESIM_CONF:-firesim_chipyard.conf}")
@@ -85,7 +103,10 @@ if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "from modelblaster.pipeline.backends import get; print(' '.join(get('${GEN_TARGET}').spike_args))")
     SF=(); for a in ${SPIKE_ARGS}; do SF+=("--spike-arg=${a}"); done
     SF+=("--spike-arg=-p${SPIKE_HARTS:-4}")
-    [[ -n "${SPIKE_MEM_MB:-}" ]] && SF+=("--spike-arg=-m${SPIKE_MEM_MB}")
+    # Cover the auto-sized ram0 (only when it exceeds spike's 2 GiB default).
+    _mem="${SPIKE_MEM_MB:-}"
+    if [[ -z "${_mem}" && $(( _RAM0_SZ / 1048576 )) -gt 1984 ]]; then _mem=$(( _RAM0_SZ/1048576 + 64 )); fi
+    [[ -n "${_mem}" ]] && SF+=("--spike-arg=-m${_mem}")
     python -m modelblaster.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --models "${MODELS}" --io-paths "${IOPATHS}" --quant "${QUANT}" \
