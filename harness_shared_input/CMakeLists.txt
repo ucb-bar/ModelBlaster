@@ -160,14 +160,19 @@ foreach(_i RANGE ${_last_variant})
             "VARIANT_SOURCES[${_i}]='${_kern_c}' does not exist.")
     endif()
 
+    # Per-variant OBJECT lib carries ONLY code that gets a per-variant
+    # symbol namespace: model.c (renamed dispatch table + run_model +
+    # introspection helpers) and the variant's kernels.c. weights.c,
+    # buffers.c, and test_io.S are SHARED — same content in every
+    # variant, so we compile them exactly once (into the app itself,
+    # below) to avoid multiply-defined rodata / extern-linkage symbols
+    # at the final link. model.c's references to weights_*/buf_*/
+    # test_input etc. stay unrenamed and resolve to the single shared
+    # copy — gen_variant_renames.py explicitly excludes those symbols.
     add_library(modelblaster_${_tag}_objs OBJECT
         "${MODEL_DIR}/model.c"
         "${_kern_c}"
-        "${MODEL_DIR}/weights.c"
-        "${MODEL_DIR}/buffers.c"
-        "${MODEL_DIR}/test_io.S"
     )
-    set_source_files_properties("${MODEL_DIR}/test_io.S" PROPERTIES LANGUAGE ASM)
 
     # Rename header -include'd first so every subsequent header sees the
     # macro-mangled symbol names. This is what actually makes N copies
@@ -227,8 +232,24 @@ add_custom_command(
     VERBATIM
 )
 
-target_sources(app PRIVATE "${_MAIN_C}")
+# App carries the shared-data TUs: weights.c + buffers.c + test_io.S.
+# Compiled ONCE into libapp.a; the per-variant OBJECT libs' extern refs
+# to these symbols resolve here at final link. Same convention as the
+# single-model harness (single copy of weights + baked I/O), just with
+# an explicit target instead of implicit via the model dir.
+target_sources(app PRIVATE
+    "${_MAIN_C}"
+    "${MODEL_DIR}/weights.c"
+    "${MODEL_DIR}/buffers.c"
+    "${MODEL_DIR}/test_io.S"
+)
+set_source_files_properties("${MODEL_DIR}/test_io.S" PROPERTIES LANGUAGE ASM)
 target_include_directories(app PRIVATE "${MODEL_DIR}" "${_STAGE_DIR}")
+# App defines MODELBLASTER_DISABLE_UNMANGLED so its own inclusion of
+# model.h (via shared_input_main.c) does not emit the single-model
+# alias block — which is defined in every variant OBJECT lib and
+# would collide with the app's copy.
+target_compile_definitions(app PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
 target_link_libraries(app PRIVATE modelblaster_pool)
 foreach(_lib IN LISTS _ALL_VARIANT_LIBS)
     target_link_libraries(app PRIVATE ${_lib})
