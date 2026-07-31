@@ -270,6 +270,19 @@ foreach(_lib IN LISTS _ALL_VARIANT_LIBS)
     target_link_libraries(app PRIVATE ${_lib})
 endforeach()
 
+# Disable linker relaxation. With N variant OBJECT libs each carrying a
+# full copy of model.c (dispatch tables, per-op cycles arrays, wall_cycles
+# accessors) plus the shared 100+ MB baked I/O, .sdata / small-data
+# references push past the R_RISCV_GPREL_I ±2KB window and the linker
+# emits truncated relocations against Zephyr's own scalar globals
+# (z_malloc_heap, _kernel, etc). Mirrors the single-model harness's
+# ``zephyr_link_libraries(-Wl,--no-relax)`` — without it the ELF links
+# but boots into corrupted gp-relative loads that read uninitialised DDR,
+# hanging pre-UART. medany code model still gives ±2GB, we only lose
+# the gp shortcut (no measurable code-size impact per single-model
+# harness comment).
+zephyr_link_libraries(-Wl,--no-relax)
+
 # CMODEL_LARGE bigio reordering — critical for FireSim. Without this the
 # baked I/O (13-256 MB of const rodata from test_io.S) lands between
 # .text and .data, pushing __global_pointer$ 10+ MB from the small-data
