@@ -1,1 +1,1 @@
-per_config/Q31Ws32x32AccGemminiRocketAlinxAxku040DraftConfig/gemmini_params.h
+per_config/Q31Ws32x32AccGemminiSaturnV128D128Fp16FullKU040Config/gemmini_params.h
