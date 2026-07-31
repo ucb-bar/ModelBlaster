@@ -82,12 +82,11 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(modelblaster_harness_shared_input)
 
-# Pull in the modelblaster_pool runtime (raw-pthread parallel-for) —
-# same integration as harness_multi. All variants share the same pool
-# instance; each variant runs to completion before the next starts, so
-# there is no cross-variant contention on worker threads.
-add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../runtime/modelblaster_pool"
-                 modelblaster_pool_build)
+# NOTE: We do NOT add_subdirectory(modelblaster_pool) here. The shared-
+# input harness runs each variant sequentially with pool=NULL, matching
+# the single-model harness's convention. If a caller later wants the
+# parallel path, restoring this + defining MODELBLASTER_USE_POOL on
+# each variant OBJECT lib is the wire-up.
 
 # Validate MODEL_DIR has the expected shape (matches harness_multi's check).
 foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h test_io.S test_input.bin test_golden.bin)
@@ -192,10 +191,16 @@ foreach(_i RANGE ${_last_variant})
     # For shared-input, those aliases would collide across N variants
     # (they resolve to per-variant mangled names, and the alias itself
     # is single-model). Same reason harness_multi defines it.
+    # NOTE: MODELBLASTER_USE_POOL is NOT defined here. The single-model
+    # harness runs with pool=NULL and the model.c parallel_for wrappers
+    # only compile in when MODELBLASTER_USE_POOL is set — matching that
+    # keeps the shared-input harness on the sequential path, avoiding
+    # spike's no-SMP hang on modelblaster_pool_init() and giving the
+    # per-op cycle counts a clean apples-to-apples comparison against
+    # the single-model harness. Callers that WANT the parallel path can
+    # opt in later via a per-variant flag; not needed for the smoke.
     target_compile_definitions(modelblaster_${_tag}_objs PRIVATE
-        MODELBLASTER_USE_POOL=1
         MODELBLASTER_DISABLE_UNMANGLED=1)
-    target_link_libraries(modelblaster_${_tag}_objs PRIVATE modelblaster_pool)
 
     # Backend cflags apply ONLY to the LLM-emitted kernels.c — same
     # convention as harness_multi.
@@ -250,7 +255,6 @@ target_include_directories(app PRIVATE "${MODEL_DIR}" "${_STAGE_DIR}")
 # alias block — which is defined in every variant OBJECT lib and
 # would collide with the app's copy.
 target_compile_definitions(app PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
-target_link_libraries(app PRIVATE modelblaster_pool)
 foreach(_lib IN LISTS _ALL_VARIANT_LIBS)
     target_link_libraries(app PRIVATE ${_lib})
 endforeach()
