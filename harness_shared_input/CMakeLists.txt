@@ -71,7 +71,18 @@ endif()
 # Reuse harness_multi's backend configs — the compilation-unit shape is
 # identical (one OBJECT lib per model+variant, same shared Zephyr link).
 set(CONF_FILE "prj.conf")
-set(_BACKEND_CONF "${CMAKE_CURRENT_LIST_DIR}/../harness_multi/backends/${MODELBLASTER_BACKEND}.conf")
+# Backend .conf sources the RVV Zephyr Kconfig — CONFIG_RISCV_ISA_EXT_V=y,
+# LAZY=n, and CRITICALLY ``CONFIG_RISCV_V_KERNEL_ONLY=y`` (which
+# restricts V codegen to kernel functions only; without it GCC
+# auto-vectorises Zephyr's own scalar code with V insns and traps
+# somewhere pre-boot, hangs before UART).
+#
+# We point at ``harness/backends/`` (the single-model harness) rather
+# than ``harness_multi/backends/`` because harness_multi's rvv.conf is
+# missing V_KERNEL_ONLY. Diagnosed by comparing .config output of a
+# working baseline (has V_KERNEL_ONLY=y) vs the hung fused ELF (had
+# ``# is not set``).
+set(_BACKEND_CONF "${CMAKE_CURRENT_LIST_DIR}/../harness/backends/${MODELBLASTER_BACKEND}.conf")
 if(EXISTS "${_BACKEND_CONF}")
     list(APPEND CONF_FILE "${_BACKEND_CONF}")
 else()
