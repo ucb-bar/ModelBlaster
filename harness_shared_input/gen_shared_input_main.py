@@ -76,9 +76,6 @@ def emit_main(model_dir: Path, tags: list[str], out: Path) -> None:
     lines.append("#include <zephyr/kernel.h>")
     lines.append('#include "model.h"')
     lines.append('#include "test_io.h"')
-    lines.append("#ifdef MODELBLASTER_USE_POOL")
-    lines.append('#include "modelblaster_pool.h"')
-    lines.append("#endif")
     lines.append("")
 
     # Per-variant extern prototypes.
@@ -137,14 +134,17 @@ def emit_main(model_dir: Path, tags: list[str], out: Path) -> None:
     lines.append("}")
     lines.append("")
 
-    # Main.
+    # Main. Matches the single-model harness's convention: pool = NULL.
+    # The generated kernels' parallel_for wrappers ignore a NULL pool
+    # and fall through to the sequential path. Initializing a real pool
+    # via modelblaster_pool_init(4) hangs on spike (no true SMP), and
+    # for FireSim's SMP config the RL loop measures wall cycles that
+    # already reflect the target's dispatch cost — the harness's own
+    # pool choice would only add noise. Callers that need parallel
+    # dispatch pass a pool explicitly to run_model().
     lines.append("int main(void)")
     lines.append("{")
-    lines.append("#ifdef MODELBLASTER_USE_POOL")
-    lines.append("    void *pool = modelblaster_pool_init(4);")
-    lines.append("#else")
     lines.append("    void *pool = NULL;")
-    lines.append("#endif")
     lines.append("")
     lines.append(f'    printf("modelblaster harness: model={mid} '
                  f'shared_input_variants={n} '
@@ -199,9 +199,7 @@ def emit_main(model_dir: Path, tags: list[str], out: Path) -> None:
         lines.append("")
 
     lines.append('    printf("modelblaster harness: shared_input all variants done\\n");')
-    lines.append("#ifdef MODELBLASTER_USE_POOL")
-    lines.append("    modelblaster_pool_shutdown(pool);")
-    lines.append("#endif")
+    lines.append("    (void)pool;")
     lines.append("    return 0;")
     lines.append("}")
 
