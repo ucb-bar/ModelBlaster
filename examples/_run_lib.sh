@@ -112,13 +112,16 @@ elif [[ -n "${BENCH_FILE:-}" ]]; then
     # through extract_graph's --bench-file loader instead of --model (the
     # kernelbench MODEL_NAME is a path like kernelbench/kb_<name>, not a
     # registered model).
-    # BENCH_MAX_ELEMENTS=0 disables input shrinking → stock KernelBench dims
-    # (feasible on RUNNER=native; overflows spike's 256 MB RAM region).
+    # Default sizing: cap baked io to BENCH_TARGET_MB MiB (256), shrinking
+    # batch->spatial and protecting channels for good HW utilization. Set
+    # BENCH_TARGET_MB=0 for stock dims. BENCH_MAX_ELEMENTS>0 is the LEGACY
+    # tiny-element-cap override (kept for reproducing old results).
     python -m modelblaster.pipeline.extract_graph \
         --bench-file "${BENCH_FILE}" \
         --out-dir "${IR_DIR}" \
         --quant "${QUANT}" \
-        --bench-max-elements "${BENCH_MAX_ELEMENTS:-65536}"
+        --bench-target-mb "${BENCH_TARGET_MB:-256}" \
+        --bench-max-elements "${BENCH_MAX_ELEMENTS:-0}"
 else
     python -m modelblaster.pipeline.extract_graph \
         --model "${MODEL_NAME}" \
