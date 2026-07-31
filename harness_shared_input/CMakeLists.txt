@@ -259,4 +259,26 @@ foreach(_lib IN LISTS _ALL_VARIANT_LIBS)
     target_link_libraries(app PRIVATE ${_lib})
 endforeach()
 
+# CMODEL_LARGE bigio reordering — critical for FireSim. Without this the
+# baked I/O (13-256 MB of const rodata from test_io.S) lands between
+# .text and .data, pushing __global_pointer$ 10+ MB from the small-data
+# region. gp-relative loads then read uninitialised DDR → boot hangs
+# before UART init. Spike's functional sim tolerates this (any mapped
+# address responds); FireSim's real memory system does not.
+#
+# Fix: emit the baked I/O in .mb_bigio (via test_io.S's ``#ifdef
+# MB_BIGIO_HIGH`` guard) and pull in ``bigio.ld`` (reused from
+# modelblaster/harness/) which places .mb_bigio AFTER .bss so the
+# small-data region stays adjacent to .text and gp fits naturally.
+#
+# Mirrors modelblaster/harness/CMakeLists.txt's identical block.
+# Diagnosed by comparing readelf -l on baseline (has .mb_bigio at
+# 0x80a0fed0) vs fused ELF (no .mb_bigio, __global_pointer$ at
+# 0x80c0d898 instead of the baseline's 0x8000dc48).
+if(CONFIG_RISCV_CMODEL_LARGE AND NOT MB_NO_BIGIO_REORDER)
+    target_compile_definitions(app PRIVATE MB_BIGIO_HIGH=1)
+    zephyr_linker_sources(SECTIONS ${CMAKE_CURRENT_LIST_DIR}/../harness/bigio.ld)
+    message(STATUS "harness_shared_input: CMODEL_LARGE active — io reordered to .mb_bigio above .bss")
+endif()
+
 message(STATUS "harness_shared_input: ${_n_variants} variants of ${MODEL_DIR}, tags=${VARIANT_TAGS}")
