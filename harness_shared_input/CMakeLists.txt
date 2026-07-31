@@ -45,10 +45,17 @@ if(_n_variants LESS 1)
     message(FATAL_ERROR "VARIANT_SOURCES is empty.")
 endif()
 
+# ``_last_variant`` is used by every foreach(_i RANGE ...) loop below.
+# Compute it ONCE up-front, unconditionally — a prior version only set
+# it inside the "TAGS not defined" branch, so caller-provided TAGS
+# left it undefined and the RANGE fell through to 0..0. Symptoms
+# looked like "only the first variant links; second one is missing"
+# — spent an hour chasing an imagined dependency race.
+math(EXPR _last_variant "${_n_variants} - 1")
+
 # Default tags = v0, v1, ..., vN-1.
 if(NOT DEFINED VARIANT_TAGS OR "${VARIANT_TAGS}" STREQUAL "")
     set(VARIANT_TAGS "")
-    math(EXPR _last_variant "${_n_variants} - 1")
     foreach(_i RANGE ${_last_variant})
         list(APPEND VARIANT_TAGS "v${_i}")
     endforeach()
