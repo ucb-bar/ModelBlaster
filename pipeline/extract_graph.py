@@ -3564,8 +3564,90 @@ def _cpu_fp32_tensor_creation():
             setattr(torch, n, fn)
 
 
+# --- utilization-aware sizing -------------------------------------------------
+# The legacy `max_elements` policy halves whatever module attr is largest until
+# a tiny total element count is met — which collapses conv/matmul channel counts
+# to ~16 and leaves XNNPACK/RVV overhead-bound (41 inst/MAC measured). Instead we
+# cap the *baked io footprint* (input+golden bytes) and shrink dims by category:
+# structural attrs define the op (never touched); batch just replicates work
+# (shrunk first); spatial next; channel/feature dims drive vector/GEMM
+# utilization so they're protected (shrunk last, with a floor). Categorization is
+# by the attr-name vocabulary the level1 benches actually use.
+_KB_STRUCT = {"kernel_size", "stride", "padding", "dilation", "groups",
+              "num_classes", "num_heads", "num_groups", "stride_w", "stride_h",
+              "padding_w", "padding_h", "reduce_dim"}
+_KB_BATCH = {"batch_size", "sequence_length"}
+_KB_SPATIAL = {"width", "height", "length", "depth", "width_in", "height_in",
+               "spatial"}
+_KB_CHANNEL = {"in_channels", "out_channels", "channels", "features", "dim",
+               "hidden_size", "embed_dim", "k", "m", "l", "n"}
+_KB_FLOOR = {"batch": 1, "spatial": 16, "channel": 32}
+
+
+def _kb_attr_group(name: str) -> "str | None":
+    if name in _KB_STRUCT:
+        return None            # structural — never shrink
+    if name in _KB_BATCH:
+        return "batch"
+    if name in _KB_SPATIAL:
+        return "spatial"
+    if name in _KB_CHANNEL:
+        return "channel"
+    return "spatial"           # unknown dim → treat like spatial (before channels)
+
+
+def _kb_footprint_bytes(mod) -> int:
+    """Baked io footprint (input + golden output) in fp32 bytes at the module's
+    current dims. Runs a forward to size the output."""
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    m.eval()
+    ins = mod.get_inputs()
+    with torch.no_grad():
+        o = m(*ins)
+    outs = o if isinstance(o, (list, tuple)) else [o]
+    inb = sum(int(np.prod(t.shape)) for t in ins if torch.is_tensor(t))
+    outb = sum(int(np.prod(x.shape)) for x in outs if torch.is_tensor(x))
+    return (inb + outb) * 4
+
+
+def _shrink_for_utilization(mod, target_bytes: int) -> None:
+    """Shrink module dims to fit `target_bytes` of baked io, preferring
+    batch → spatial and protecting channel/feature dims (so the shrunk problem
+    still exercises the vector/GEMM units). Reverts any shrink that makes the
+    forward invalid."""
+    order = ["batch", "spatial", "channel"]
+    for _ in range(200):
+        try:
+            fp = _kb_footprint_bytes(mod)
+        except Exception:
+            return             # can't instantiate at current dims; leave as-is
+        if fp <= target_bytes:
+            return
+        ints = {k: v for k, v in vars(mod).items()
+                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+        cand = None
+        for grp in order:
+            pool = {k: v for k, v in ints.items()
+                    if _kb_attr_group(k) == grp and v > _KB_FLOOR[grp]}
+            if pool:
+                cand = max(pool, key=pool.get)
+                break
+        if cand is None:
+            return             # nothing shrinkable without violating a floor
+        grp = _kb_attr_group(cand)
+        oldv = vars(mod)[cand]
+        setattr(mod, cand, max(_KB_FLOOR[grp], oldv // 2))
+        try:
+            _kb_footprint_bytes(mod)   # validate the new dims forward-pass
+        except Exception:
+            setattr(mod, cand, oldv)
+            return
+
+
 def _load_kernelbench(bench_path: str,
-                      max_elements: "int | None" = None
+                      max_elements: "int | None" = None,
+                      target_bytes: "int | None" = None
                       ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
     """Load a KernelBench level1 file (single-input variant only).
 
@@ -3644,6 +3726,10 @@ def _load_kernelbench(bench_path: str,
                         break
                     attr, oldv = history.pop()
                     setattr(mod, attr, oldv)
+        elif target_bytes is not None and target_bytes > 0:
+            # Default policy: cap the baked-io footprint while protecting the
+            # channel/feature dims that drive vector/GEMM utilization.
+            _shrink_for_utilization(mod, target_bytes)
 
         init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
         model = mod.Model(*init_args)
@@ -3707,11 +3793,15 @@ def main() -> None:
     ap.add_argument("--bench-file", default=None,
                     help="path to a KernelBench level1 .py file. "
                          "Mutually exclusive with --model.")
-    ap.add_argument("--bench-max-elements", type=int, default=65536,
-                    help="cap input tensor size for kernelbench files "
-                         "(default 65536); stock level1 shapes are halved "
-                         "on the largest int module-level attr until the "
-                         "input fits spike's 256 MB RAM region.")
+    ap.add_argument("--bench-target-mb", type=int, default=256,
+                    help="DEFAULT kernelbench sizing: cap baked io (input+golden) "
+                         "to this many MiB, shrinking batch->spatial and "
+                         "protecting channel/feature dims for good HW "
+                         "utilization (default 256). 0 = stock dims.")
+    ap.add_argument("--bench-max-elements", type=int, default=0,
+                    help="LEGACY override: if >0, cap total input ELEMENTS by "
+                         "halving the largest int attr (the old tiny-toy policy). "
+                         "Overrides --bench-target-mb. 0 = use --bench-target-mb.")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -3739,8 +3829,13 @@ def main() -> None:
 
     model_mod = None
     if args.bench_file is not None:
+        # Legacy element-cap wins if explicitly set (>0); otherwise the default
+        # byte-budget / utilization-aware policy applies.
+        _tgt = None if args.bench_max_elements else args.bench_target_mb * 2**20
         model, sample, name = _load_kernelbench(
-            args.bench_file, max_elements=args.bench_max_elements)
+            args.bench_file,
+            max_elements=(args.bench_max_elements or None),
+            target_bytes=_tgt)
     else:
         if args.model == "mlp_generic":
             from modelblaster.models import mlp_generic as model_mod
