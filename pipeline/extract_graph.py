@@ -3611,6 +3611,65 @@ def _kb_footprint_bytes(mod) -> int:
     return (inb + outb) * 4
 
 
+def _kb_flops(mod) -> int:
+    """Total forward FLOPs at the module's current dims, via torch's
+    FlopCounterMode (counts matmul/conv/bmm/etc.). Model-agnostic — measures the
+    real op cost, so it captures the K-contraction of a matmul or the spatial**3
+    of a 3D conv that `_kb_footprint_bytes` (io only) misses. Raises if
+    uncountable."""
+    from torch.utils.flop_counter import FlopCounterMode
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    m.eval()
+    ins = mod.get_inputs()
+    fc = FlopCounterMode(display=False)
+    with fc, torch.no_grad():
+        m(*ins)
+    return int(fc.get_total_flops())
+
+
+def _shrink_for_flops(mod, target_flops: int,
+                      target_bytes: "int | None" = None) -> None:
+    """Shrink module dims until measured forward FLOPs <= `target_flops` (and io
+    bytes <= `target_bytes` if given), preferring batch -> spatial -> channel and
+    honoring per-group floors so the shrunk problem still exercises the GEMM/vector
+    units (channel/K floor keeps a full vector register busy). Unlike
+    `_shrink_for_utilization` (io-byte cap only), this bounds the *compute*, so a
+    large-K matmul or a 3D conv shrinks to a size that actually runs on-target
+    instead of pinning a tiny-io / huge-FLOP shape. Falls back to a byte cap if
+    FLOPs can't be counted; reverts any shrink that makes the forward invalid."""
+    order = ["batch", "spatial", "channel"]
+    for _ in range(400):
+        try:
+            fl = _kb_flops(mod)
+            fp = _kb_footprint_bytes(mod)
+        except Exception:
+            if target_bytes:
+                _shrink_for_utilization(mod, target_bytes)
+            return
+        if fl <= target_flops and (target_bytes is None or fp <= target_bytes):
+            return
+        ints = {k: v for k, v in vars(mod).items()
+                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+        cand = None
+        for grp in order:
+            pool = {k: v for k, v in ints.items()
+                    if _kb_attr_group(k) == grp and v > _KB_FLOOR[grp]}
+            if pool:
+                cand = max(pool, key=pool.get)
+                break
+        if cand is None:
+            return             # everything at its floor; can't reduce further
+        grp = _kb_attr_group(cand)
+        oldv = vars(mod)[cand]
+        setattr(mod, cand, max(_KB_FLOOR[grp], oldv // 2))
+        try:
+            _kb_footprint_bytes(mod)   # validate the new dims forward-pass
+        except Exception:
+            setattr(mod, cand, oldv)
+            return
+
+
 def _shrink_for_utilization(mod, target_bytes: int) -> None:
     """Shrink module dims to fit `target_bytes` of baked io, preferring
     batch → spatial and protecting channel/feature dims (so the shrunk problem
@@ -3647,7 +3706,8 @@ def _shrink_for_utilization(mod, target_bytes: int) -> None:
 
 def _load_kernelbench(bench_path: str,
                       max_elements: "int | None" = None,
-                      target_bytes: "int | None" = None
+                      target_bytes: "int | None" = None,
+                      target_flops: "int | None" = None
                       ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
     """Load a KernelBench level1 file (single-input variant only).
 
@@ -3726,6 +3786,11 @@ def _load_kernelbench(bench_path: str,
                         break
                     attr, oldv = history.pop()
                     setattr(mod, attr, oldv)
+        elif target_flops is not None and target_flops > 0:
+            # FLOP-budget policy: bound the actual compute (so large-K matmuls /
+            # 3D convs shrink to something that runs on-target), while still
+            # capping io bytes if a target_bytes ceiling is also supplied.
+            _shrink_for_flops(mod, target_flops, target_bytes)
         elif target_bytes is not None and target_bytes > 0:
             # Default policy: cap the baked-io footprint while protecting the
             # channel/feature dims that drive vector/GEMM utilization.
@@ -3802,6 +3867,14 @@ def main() -> None:
                     help="LEGACY override: if >0, cap total input ELEMENTS by "
                          "halving the largest int attr (the old tiny-toy policy). "
                          "Overrides --bench-target-mb. 0 = use --bench-target-mb.")
+    ap.add_argument("--bench-target-gflops", type=float,
+                    default=float(os.environ.get("BENCH_TARGET_GFLOPS", "0")),
+                    help="COMPUTE-budget sizing: if >0, size the bench to this "
+                         "forward-FLOP budget (measured via FlopCounterMode), "
+                         "bounding compute rather than just io — fixes large-K "
+                         "matmuls / 3D convs that have tiny io but huge FLOPs. "
+                         "--bench-target-mb stays an io ceiling. Overridden by "
+                         "--bench-max-elements. Env: BENCH_TARGET_GFLOPS.")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -3829,13 +3902,18 @@ def main() -> None:
 
     model_mod = None
     if args.bench_file is not None:
-        # Legacy element-cap wins if explicitly set (>0); otherwise the default
-        # byte-budget / utilization-aware policy applies.
+        # Legacy element-cap wins if explicitly set (>0); else if a FLOP budget is
+        # given, bound compute (io stays capped by --bench-target-mb as a ceiling);
+        # otherwise the default byte-budget / utilization-aware policy applies.
         _tgt = None if args.bench_max_elements else args.bench_target_mb * 2**20
+        _tflops = (int(args.bench_target_gflops * 1e9)
+                   if args.bench_target_gflops and args.bench_target_gflops > 0
+                   else None)
         model, sample, name = _load_kernelbench(
             args.bench_file,
             max_elements=(args.bench_max_elements or None),
-            target_bytes=_tgt)
+            target_bytes=_tgt,
+            target_flops=_tflops)
     else:
         if args.model == "mlp_generic":
             from modelblaster.models import mlp_generic as model_mod
