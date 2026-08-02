@@ -116,11 +116,16 @@ elif [[ -n "${BENCH_FILE:-}" ]]; then
     # batch->spatial and protecting channels for good HW utilization. Set
     # BENCH_TARGET_MB=0 for stock dims. BENCH_MAX_ELEMENTS>0 is the LEGACY
     # tiny-element-cap override (kept for reproducing old results).
+    # BENCH_TARGET_GFLOPS>0 bounds COMPUTE (forward FLOPs) instead of just io —
+    # needed for large-K matmuls / 3D convs that have tiny io but huge FLOPs;
+    # BENCH_TARGET_MB stays an io ceiling. Same knob as the ExecuTorch exporter
+    # (gen_pte_kb_sized.py --target-gflops), so both flows size identically.
     python -m modelblaster.pipeline.extract_graph \
         --bench-file "${BENCH_FILE}" \
         --out-dir "${IR_DIR}" \
         --quant "${QUANT}" \
         --bench-target-mb "${BENCH_TARGET_MB:-256}" \
+        --bench-target-gflops "${BENCH_TARGET_GFLOPS:-0}" \
         --bench-max-elements "${BENCH_MAX_ELEMENTS:-0}"
 else
     python -m modelblaster.pipeline.extract_graph \
@@ -334,6 +339,14 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     fi
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
+    )
+elif [[ "${RUNNER}" == "spike" && "${ET_SMP:-0}" != "1" ]]; then
+    # Default spike to a 1-core, 1-thread INLINE pthreadpool (+ unbuffered HTIF for
+    # live markers). The harness prj.conf is MP_MAX_NUM_CPUS=4, which on spike is
+    # >10x slower (4-hart emulation + pthreadpool oversubscription) and looks like
+    # a hang. Opt into multicore with ET_SMP=1, or override SPIKE_CONF=.
+    WEST_BUILD_EXTRA+=(
+        -DEXTRA_CONF_FILE="${REPO_ROOT}/harness/backends/${SPIKE_CONF:-spike_single_core.conf}"
     )
 fi
 # CMODEL_LARGE=1 selects the RISC-V large code model (auipc+constant-pool /
