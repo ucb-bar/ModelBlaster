@@ -66,6 +66,14 @@ int main(void)
     l_trace_encoder_stop(_tacit_enc);
     for (int _i = 0; _i < 16; _i++) { __asm__ volatile("nop"); } /* flush */
 #endif
+    /* RVV->scalar visibility barrier. The kernels write model_output via RVV
+     * vector stores (vse/vsse); the verify loop below reads it with scalar
+     * loads. On FireSim/Saturn's weak memory model the vector store buffer may
+     * not have drained before the scalar reads -> stale/partial output ->
+     * spurious miscompute (correct on spike, wrong on FireSim; worse in
+     * complex kernels with more in-flight stores). Same root cause + fix as the
+     * ExecuTorch riscv_executor_runner fence. */
+    __asm__ volatile("fence rw, rw" ::: "memory");
 
     /* In-binary golden compare.
      *

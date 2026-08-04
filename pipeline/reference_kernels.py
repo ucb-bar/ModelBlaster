@@ -1238,6 +1238,63 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
             # tiny channel counts where direct already wins easily.
             applicable=lambda s: s.get("OC", 0) >= 32 and s.get("IC", 0) >= 16,
         ),
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 conv2d over the OUTPUT-CHANNEL dimension. "
+                "Weights are packed IHWOC ([IC][KH][KW][OC], OC "
+                "innermost/contiguous) so the OC slab for a fixed "
+                "(ic, kh, kw) is a unit-stride vector load. For each "
+                "(n, oh, ow) output position hold a vl-wide vfloat32 "
+                "accumulator (one lane per OC), seed it from bias, then "
+                "for every (ic, kh, kw) broadcast the input pixel as a "
+                "scalar and fold it in with a single vfmacc.vf. Tail-handle "
+                "OC with vsetvl (VLEN not assumed). Output is NCHW so the "
+                "per-OC store is strided by OH*OW (vsse32).\n\n"
+                "The OC dimension is additionally tiled (oc_outer loop) so "
+                "one TILE_OC weight slab stays resident in L1D across the "
+                "whole OH*OW spatial sweep, cutting weight traffic ~OH*OW-"
+                "fold on cache-limited targets (FireSim); spike's flat "
+                "memory is unaffected but still correct."
+            ),
+            reference_impl="""\
+void kernel_conv2d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int IH, int IW, int OC,
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                for (int oc = 0; oc < OC; oc++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh * DH;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw * DW;
+                                if (iw < 0 || iw >= IW) continue;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                /* IHWOC weight: [IC][KH][KW][OC]. */
+                                float w = weight[((ic*KH + kh)*KW + kw)*OC + oc];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
     ],
 )
 
@@ -3481,6 +3538,59 @@ void kernel_conv2d_dw(const float *input, const float *weight, const float *bias
          "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
     ],
     argtypes_factory=_conv2d_dw_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 depthwise conv2d over the CHANNEL "
+                "dimension. Depthwise has no IC reduction (each output "
+                "channel reads its own single input channel), so the "
+                "channel dim vectorizes with full lanes and no cross-lane "
+                "reduction: lane c owns channel c's (kh, kw) accumulation. "
+                "Weights are packed IHWOC ([KH][KW][C], C contiguous since "
+                "IC=1/OC=C), so the per-(kh,kw) weight load over channels "
+                "is a unit-stride vle32. Input is NCHW so channels are a "
+                "strided vlse32 (stride IH*IW); output is NCHW so the store "
+                "is a strided vsse32 (stride OH*OW). For each (n, oh, ow) "
+                "seed a vl-wide accumulator from bias, then vfmacc.vv over "
+                "(kh, kw). Tail-handle channels with vsetvl."
+            ),
+            reference_impl="""\
+void kernel_conv2d_dw(const float *input, const float *weight, const float *bias,
+                      float *output,
+                      int N, int C, int IH, int IW,
+                      int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[c] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = input[((n*C + c)*IH + ih)*IW + iw];
+                            /* IHWOC depthwise weight [KH][KW][C]. */
+                            float w = weight[(kh*KW + kw)*C + c];
+                            acc += v * w;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
 )
 
 
@@ -7459,6 +7569,75 @@ void kernel_conv_transpose2d(const float *input, const float *weight,
     }
 }
 """,
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 transposed conv2d over the OUTPUT-CHANNEL "
+                "dimension (gather form). Each output pixel (oc, oh, ow) "
+                "collects the input pixels that scatter onto it: for taps "
+                "(kh, kw), ih=(oh+PH-kh*DH)/SH and iw=(ow+PW-kw*DW)/SW "
+                "contribute only when those divisions are exact and in "
+                "range. Weights are packed IHWOC — torch ConvTranspose "
+                "weight [IC][OCpG][KH][KW] permuted (1,2,3,0) to "
+                "[OCpG][KH][KW][IC], i.e. weight[((ocg*KH+kh)*KW+kw)*IC+ic]. "
+                "For each (n, g, oh, ow) hold a vl-wide vfloat32 accumulator "
+                "(one lane per OC in the group), seed from bias, then for "
+                "every valid (icg, kh, kw) broadcast the input pixel as a "
+                "scalar and fold it in with a single vfmacc.vf. Consecutive "
+                "OC lanes are KH*KW*IC apart in the weight buffer, so the "
+                "per-lane OC weight slab is a strided vlse32; output is NCHW "
+                "so the per-OC store is strided by OH*OW (vsse32). Tail-"
+                "handle OC with vsetvl (VLEN not assumed); groups via an "
+                "outer g loop."
+            ),
+            reference_impl="""\
+void kernel_conv_transpose2d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int IH, int IW,
+                             int OC, int OH, int OW,
+                             int KH, int KW, int SH, int SW,
+                             int PH, int PW, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ihs = oh + PH - kh*DH;
+                        if (ihs < 0 || (ihs % SH) != 0) continue;
+                        int ih = ihs / SH;
+                        if (ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iws = ow + PW - kw*DW;
+                            if (iws < 0 || (iws % SW) != 0) continue;
+                            int iw = iws / SW;
+                            if (iw >= IW) continue;
+                            for (int icg = 0; icg < ICpG; icg++) {
+                                int ic = g*ICpG + icg;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                /* IHWOC: [OCpG][KH][KW][IC]. */
+                                float w = weight[((ocg*KH + kh)*KW + kw)*IC + ic];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
     extra_shapes=[
         # basic stride-1
         {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 6, "OH": 10, "OW": 10,
@@ -7550,6 +7729,78 @@ void kernel_conv3d(const float *input, const float *weight, const float *bias,
          "G": 1},
     ],
     argtypes_factory=_conv3d_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            # conv3d weights are 5D [OC][IC/G][KD][KH][KW] and are NOT
+            # backend-repacked (_backend_pack_weight only permutes 4D
+            # tensors), so we stay in native OIDHW and reach the OC slab with
+            # a strided load instead of the conv2d IHWOC unit-stride trick.
+            weight_layout="oihw",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 conv3d over the OUTPUT-CHANNEL dimension. "
+                "Weights stay in native OIDHW ([OC][IC/G][KD][KH][KW], OC "
+                "OUTERMOST) because 5D conv weights are not backend-repacked, "
+                "so the OC slab for a fixed (icg, kd, kh, kw) is a STRIDED "
+                "vector load (vlse32) with element stride IC/G*KD*KH*KW. For "
+                "each (n, od, oh, ow) output voxel hold a vl-wide vfloat32 "
+                "accumulator (one lane per OC), seed it from bias (unit-stride "
+                "vle32, OC contiguous), then for every (kd, kh, kw, icg) "
+                "broadcast the input voxel as a scalar and fold it in with a "
+                "single vfmacc.vf. Tail-handle OC with vsetvl (VLEN not "
+                "assumed). Output is NCDHW so the per-OC store is strided by "
+                "OD*OH*OW (vsse32). Groups: slab OC WITHIN a single group so "
+                "the input-channel base never straddles a group boundary."
+            ),
+            reference_impl="""\
+void kernel_conv3d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int ID, int IH, int IW,
+                   int OC, int OD, int OH, int OW,
+                   int KD, int KH, int KW, int SD, int SH, int SW,
+                   int PD, int PH, int PW, int DD, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int g = 0; g < G; g++) {
+            int ic_base = g * ICpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        for (int oc = g*OCpG; oc < (g+1)*OCpG; oc++) {
+                            float acc = bias ? bias[oc] : 0.0f;
+                            for (int kd = 0; kd < KD; kd++) {
+                                int id = od*SD - PD + kd*DD;
+                                if (id < 0 || id >= ID) continue;
+                                for (int kh = 0; kh < KH; kh++) {
+                                    int ih = oh*SH - PH + kh*DH;
+                                    if (ih < 0 || ih >= IH) continue;
+                                    for (int kw = 0; kw < KW; kw++) {
+                                        int iw = ow*SW - PW + kw*DW;
+                                        if (iw < 0 || iw >= IW) continue;
+                                        for (int icg = 0; icg < ICpG; icg++) {
+                                            int ic = ic_base + icg;
+                                            float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                            /* OIDHW weight, OC outermost. */
+                                            float w = weight[(((long)(oc*ICpG + icg)*KD + kd)*KH + kh)*KW + kw];
+                                            acc += v * w;
+                                        }
+                                    }
+                                }
+                            }
+                            output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
 )
 
 
