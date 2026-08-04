@@ -1879,8 +1879,16 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                     in_v = (int32_t)input[(in_row_base + ih) * IW + iw]
                                          + input_offset;
                                 }
-#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must NOT reuse the
+                                 * HWIO index above -- indexing an IHWOC buffer as HWIO reads
+                                 * the wrong elements (see _LAYOUT_PERMUTATION in
+                                 * generate_skeleton.py). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -2056,8 +2064,16 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                          + input_offset;
                                 }
 
-#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must NOT reuse the
+                                 * HWIO index above -- indexing an IHWOC buffer as HWIO reads
+                                 * the wrong elements (see _LAYOUT_PERMUTATION in
+                                 * generate_skeleton.py). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -3090,8 +3106,16 @@ void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight,
                                 int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
                                     ? input_offset
                                     : (int32_t)input[(in_row_base + ih) * IW + iw] + input_offset;
-#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must NOT reuse the
+                                 * HWIO index above -- indexing an IHWOC buffer as HWIO reads
+                                 * the wrong elements (see _LAYOUT_PERMUTATION in
+                                 * generate_skeleton.py). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -6427,6 +6451,7 @@ CONV2D_BATCHNORM2D_S8 = KernelSpec(
         "support runtime BN params (e.g., calibration-time fold not done)."
     ),
     reference_impl="""\
+#include <math.h>
 void kernel_conv2d_batchnorm2d_s8(
     const int8_t *input, const int8_t *weight, const int32_t *bias,
     const float *bn_scale, const float *bn_bias, int8_t *output,
@@ -6455,7 +6480,19 @@ void kernel_conv2d_batchnorm2d_s8(
                                 int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
                                     ? input_offset
                                     : (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
-                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw] + filter_offset;
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must match the
+                                 * skeleton's _backend_pack_weight permutation for rvv. */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
                                 acc += in_v * w_v;
                             }
                         }
@@ -6497,6 +6534,40 @@ void kernel_conv2d_batchnorm2d_s8(
     ],
     argtypes_factory=_conv2d_batchnorm2d_s8_argtypes,
     algorithms=[
+        # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
+        # Q0.31 requantize -> int8) then BN affine as scalar epilogue.
+        # Single-stage Q0.31 -> numeric_drift; picked first when it stays
+        # within atol=128, else the bit-exact im2col_full_C variant below.
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_bn_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "tiled_conv_auto (HW im2col + HW Q0.31 requantize) for the "
+                "conv, BN per-channel affine + activation clamp as a scalar "
+                "epilogue. Fast (single-digit-M cycles); ~1 LSB/layer drift."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            weight_layout="hwio",
+        ),
+        # Bit-exact fallback (kernels/gemmini/gemmini_conv2d_batchnorm2d_s8
+        # _gemmini_im2col_full_C_bn_epilogue.c): CPU im2col ->
+        # tiled_matmul_auto(full_C) on the systolic array -> scalar Q0.31
+        # requantize -> BN affine. Bit-exact but CPU im2col is ~4.6x slower.
+        AlgorithmCandidate(
+            name="gemmini_im2col_full_C_bn_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "Systolic-array matmul (tiled_matmul_auto, full_C int32 "
+                "accumulator) + scalar Q0.31 requantize + BN per-channel "
+                "affine + activation clamp, all in one on-core kernel. No "
+                "intermediate conv_int8 tensor; no conv→bn cross-core "
+                "ping-pong."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="hwio",
+        ),
         AlgorithmCandidate(
             name="conv2d_with_inline_bn_epilogue",
             target_affinity=("gemmini",),
@@ -6511,6 +6582,188 @@ void kernel_conv2d_batchnorm2d_s8(
                 "from yolov8 + dronet collapse to single dispatches."
             ),
             reference_impl="(use the scalar reference_impl)",
+            weight_layout="hwio",
+        ),
+    ],
+)
+
+
+def _conv2d_batchnorm2d_silu_s8_argtypes():
+    """Argtypes for the triple-fused conv2d+batchnorm+silu kernel.
+
+    Same as conv2d_batchnorm2d_s8 plus the SiLU stage's
+    (silu_scale_in, silu_scale_out, silu_act_min, silu_act_max) tail.
+    Used for the yolov8_nano backbone's Conv→BN→SiLU blocks — folds all
+    three ops onto one hart so the whole block is one dispatch."""
+    import ctypes
+    return _conv2d_batchnorm2d_s8_argtypes() + [
+        ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int]
+
+
+CONV2D_BATCHNORM2D_SILU_S8 = KernelSpec(
+    op="conv2d_batchnorm2d_silu_s8",
+    signature=(
+        "void kernel_conv2d_batchnorm2d_silu_s8("
+        "const int8_t *input, const int8_t *weight, const int32_t *bias, "
+        "const float *bn_scale, const float *bn_bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int conv_output_offset, "
+        "int conv_output_multiplier, int conv_output_shift, "
+        "int conv_activation_min, int conv_activation_max, "
+        "float bn_scale_in, float bn_scale_out, "
+        "int bn_activation_min, int bn_activation_max, "
+        "float silu_scale_in, float silu_scale_out, "
+        "int silu_activation_min, int silu_activation_max)"
+    ),
+    semantics=(
+        "Triple-fused quantized Conv2D + BatchNorm + SiLU — the yolov8_nano "
+        "backbone's canonical Conv block, collapsed to a single dispatch on "
+        "one hart. Computes Conv2D's MAC + Q0.31 requantize tail (bit-exact "
+        "with kernel_conv2d_s8), clamps to the conv int8 range, applies BN's "
+        "per-channel affine + requantize+clamp (bit-exact with "
+        "kernel_batchnorm2d_s8), then applies SiLU + requantize+clamp "
+        "(bit-exact with kernel_silu_s8) — all IN REGISTER with no "
+        "intermediate tensor materialized. Removes the conv→bn and bn→silu "
+        "cross-core ping-pong that stalls the Gemmini hart waiting on rvv "
+        "glue ops.\n\n"
+        "Weight layout follows the same MODELBLASTER_GEMMINI_HWIO_WEIGHTS / "
+        "MODELBLASTER_RVV_IHWOC_WEIGHTS #ifdef convention as kernel_conv2d_s8 "
+        "(weights are pre-packed per-backend by generate_skeleton.py)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_conv2d_batchnorm2d_silu_s8(
+    const int8_t *input, const int8_t *weight, const int32_t *bias,
+    const float *bn_scale, const float *bn_bias, int8_t *output,
+    int N, int IC, int IH, int IW, int OC,
+    int KH, int KW, int SH, int SW, int PH, int PW,
+    int input_offset, int filter_offset, int conv_output_offset,
+    int conv_output_multiplier, int conv_output_shift,
+    int conv_activation_min, int conv_activation_max,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max,
+    float silu_scale_in, float silu_scale_out,
+    int silu_activation_min, int silu_activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            float bn_s = bn_scale[oc];
+            float bn_b = bn_bias[oc];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    /* --- conv2d_s8 requantize (Q0.31 rounding multiply) --- */
+                    int64_t prod = (int64_t)acc * (int64_t)conv_output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (conv_output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (conv_output_shift - 1)))
+                                            >> conv_output_shift);
+                    } else if (conv_output_shift < 0) {
+                        scaled = scaled << (-conv_output_shift);
+                    }
+                    scaled += conv_output_offset;
+                    if (scaled < conv_activation_min) scaled = conv_activation_min;
+                    if (scaled > conv_activation_max) scaled = conv_activation_max;
+                    int8_t conv_int8 = (int8_t)scaled;
+                    /* --- batchnorm2d_s8 affine, in-register --- */
+                    float fv = (float)conv_int8 * bn_scale_in;
+                    float y = bn_s * fv + bn_b;
+                    int32_t bv = (int32_t)roundf(y / bn_scale_out);
+                    if (bv < bn_activation_min) bv = bn_activation_min;
+                    if (bv > bn_activation_max) bv = bn_activation_max;
+                    int8_t bn_int8 = (int8_t)bv;
+                    /* --- silu_s8, in-register (no intermediate tensor) --- */
+                    float fbv = (float)bn_int8 * silu_scale_in;
+                    float sy = fbv / (1.0f + expf(-fbv));
+                    int32_t v = (int32_t)roundf(sy / silu_scale_out);
+                    if (v < silu_activation_min) v = silu_activation_min;
+                    if (v > silu_activation_max) v = silu_activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # YOLOv8-nano hot conv shapes (Conv→BN→SiLU backbone blocks).
+        {"N": 1, "IC": 3,  "IH": 320, "IW": 320, "OC": 16, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 16, "IH": 160, "IW": 160, "OC": 32, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        # Smaller shape for fast validation.
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 4, "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_batchnorm2d_silu_s8_argtypes,
+    algorithms=[
+        # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
+        # Q0.31 requantize -> int8) then BN affine + SiLU as scalar epilogue.
+        # Single-stage Q0.31 -> numeric_drift; picked first when within
+        # atol=128, else the bit-exact im2col_full_C variant below.
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_bn_silu_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "tiled_conv_auto (HW im2col + HW Q0.31 requantize) for the "
+                "conv, then BN per-channel affine + SiLU as a scalar "
+                "epilogue. Fast (single-digit-M cycles); ~1 LSB/layer drift."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            weight_layout="hwio",
+        ),
+        # Bit-exact fallback: CPU im2col -> tiled_matmul_auto(full_C) ->
+        # scalar Q0.31 requantize -> BN affine -> SiLU. Slower (CPU im2col).
+        AlgorithmCandidate(
+            name="gemmini_im2col_full_C_bn_silu_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "Systolic-array matmul (tiled_matmul_auto, full_C int32 "
+                "accumulator) + scalar Q0.31 requantize + BN per-channel "
+                "affine + SiLU, all in one on-core kernel. No intermediate "
+                "conv_int8/bn_int8 tensors; no conv→bn or bn→silu ping-pong."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="hwio",
+        ),
+        AlgorithmCandidate(
+            name="conv2d_with_inline_bn_silu_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "Gemmini's tiled_matmul_auto + custom activation epilogue: "
+                "the conv MAC runs in the systolic array; the BN per-channel "
+                "affine and the SiLU LUT are applied in the requantize "
+                "epilogue so the whole Conv→BN→SiLU block is one dispatch "
+                "with no intermediate tensor and no cross-core ping-pong."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="hwio",
         ),
     ],
 )
@@ -8125,6 +8378,12 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     # survey (60 candidate pairs). Eliminates conv→BN intermediate
     # write/read; BN affine folds into conv's requantize epilogue.
     "conv2d_batchnorm2d_s8": CONV2D_BATCHNORM2D_S8,
+    # Conv→BN→SiLU triple fusion (yolov8_nano backbone). Folds the whole
+    # Conv block onto one hart in a single dispatch — removes both the
+    # conv→bn and bn→silu standalone dispatches and their cross-core
+    # ping-pong. Emitted directly by extract_graph's int8 activation
+    # absorb pass.
+    "conv2d_batchnorm2d_silu_s8": CONV2D_BATCHNORM2D_SILU_S8,
     # Phase E2: yolov8 hot path — top-2 fusion gap from E1 survey
     # (57 candidate pairs). Eliminates the BN→SiLU intermediate
     # tensor write/read; LUT applied in-register.

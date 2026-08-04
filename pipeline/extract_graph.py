@@ -510,6 +510,76 @@ def _requantize_multiplier_shift(real_mult: float) -> tuple[int, int]:
     return int(multiplier), int(shift)
 
 
+# ---------------------------------------------------------------------------
+# int8 golden-simulator primitives. These are the single source of truth for
+# the per-op integer math used both by the standalone op branches and by the
+# fused conv2d_batchnorm2d(_silu)_s8 branches — keeping them identical is what
+# guarantees a fused op's golden is bit-exact with the unfused conv+bn(+silu)
+# it replaces (and hence with the composed C reference kernel).
+# ---------------------------------------------------------------------------
+
+def _sim_conv2d_s8(in_arr, sh, q, w_q, b_q):
+    """int8 conv2d + Q0.31 requantize (direct sliding window). Weights are
+    OIHW ([OC, IC, KH, KW]) — the raw pre-pack layout stored in the blob."""
+    w_q = w_q.astype(np.int32)
+    b_q = b_q.astype(np.int32)
+    in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
+    OH, OW = sh["OH"], sh["OW"]
+    KH, KW = sh["KH"], sh["KW"]
+    SH, SW = sh["SH"], sh["SW"]
+    PH, PW = sh["PH"], sh["PW"]
+    out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
+    for n in range(sh["N"]):
+        for oc in range(sh["OC"]):
+            out[n, oc] = b_q[oc]
+            for ic in range(sh["IC"]):
+                for kh in range(KH):
+                    for kw in range(KW):
+                        ih_start = -PH + kh
+                        iw_start = -PW + kw
+                        for oh in range(OH):
+                            ih = oh * SH + ih_start
+                            if ih < 0 or ih >= sh["IH"]:
+                                in_row = np.full(OW, q["input_offset"], dtype=np.int32)
+                            else:
+                                in_row = np.zeros(OW, dtype=np.int32)
+                                for ow in range(OW):
+                                    iw = ow * SW + iw_start
+                                    if iw < 0 or iw >= sh["IW"]:
+                                        in_row[ow] = q["input_offset"]
+                                    else:
+                                        in_row[ow] = in_4d[n, ic, ih, iw] + q["input_offset"]
+                            w_v = w_q[oc, ic, kh, kw] + q["filter_offset"]
+                            out[n, oc, oh] += in_row * w_v
+    scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
+    scaled += q["output_offset"]
+    scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
+    return scaled.astype(np.int8)
+
+
+def _sim_batchnorm2d_s8(in_arr, sh, q, scale_pc, bias_pc):
+    """Per-channel BN affine on int8: dequant → gamma*x+beta → requant+clamp."""
+    scale_pc = scale_pc.astype(np.float32)
+    bias_pc = bias_pc.astype(np.float32)
+    in_4d = in_arr.reshape(sh["N"], sh["C"], sh["H"], sh["W"]).astype(np.float32)
+    scale_in = np.float32(q["scale_in"])
+    scale_out = np.float32(q["scale_out"])
+    fv = in_4d * scale_in
+    y = scale_pc[None, :, None, None] * fv + bias_pc[None, :, None, None]
+    v = np.round(y / scale_out).astype(np.int32)
+    v = np.clip(v, q["activation_min"], q["activation_max"])
+    return v.astype(np.int8)
+
+
+def _sim_silu_s8(in_arr, q):
+    """int8 SiLU: dequant → x*sigmoid(x) → requant+clamp."""
+    fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+    silu_out = fv / (np.float32(1.0) + np.exp(-fv).astype(np.float32))
+    v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
+    v = np.clip(v, q["activation_min"], q["activation_max"])
+    return v.astype(np.int8)
+
+
 class _CaptureTensors(torch.fx.Interpreter):
     """FX Interpreter that records every tensor produced by every node."""
     def __init__(self, gm):
@@ -681,8 +751,68 @@ def extract_int8(
         fused_linear_relu | fused_conv2d_relu | fused_add_relu | fused_bn_relu
     )
 
-    # Nodes to skip during the main walk (e.g. getitem consumers of chunk).
-    _skip_nodes: set = set()
+    # ------------------------------------------------------------------
+    # Conv2d → BatchNorm2d (→ ReLU | SiLU) fusion detection.
+    #
+    # The XPU-RT schedule puts every heavy conv on the gemmini hart and
+    # every elementwise glue op (batchnorm2d_s8 / silu_s8 / relu_s8) on
+    # rvv; that cross-core ping-pong leaves gemmini stalled. Absorbing the
+    # BN (and the trailing activation) into the producing conv collapses
+    # the whole block into ONE op that runs on a single hart:
+    #   * conv2d_batchnorm2d_s8       (conv→bn, and conv→bn→relu — the relu
+    #                                  is folded into the bn sub-op's clamp)
+    #   * conv2d_batchnorm2d_silu_s8  (conv→bn→silu)
+    # Each fused op carries its constituents under `sub_ops` (the same
+    # shape apply_fusion_hint.py produces), so the existing skeleton /
+    # kernel-picker plumbing for those registered op-kinds handles it.
+    #
+    # Detection is by FX adjacency + single-consumer checks: the conv must
+    # feed ONLY the immediately-following BN, and (for the activation) the
+    # BN must feed ONLY the immediately-following relu/silu. This mirrors
+    # the relu/silu absorb above and correctly leaves alone the dronet
+    # blocks where a maxpool or residual-add sits between conv and bn.
+    conv_bn_fusion: dict[str, dict] = {}
+    conv_bn_consumed: set = set()
+    for i, node in enumerate(nodes):
+        if node.op != "call_module":
+            continue
+        if not isinstance(gm.get_submodule(node.target), torch.nn.Conv2d):
+            continue
+        if i + 1 >= len(nodes) or len(list(node.users)) != 1:
+            continue
+        bn_node = nodes[i + 1]
+        if not (bn_node.op == "call_module"
+                and isinstance(gm.get_submodule(bn_node.target),
+                               torch.nn.BatchNorm2d)
+                and len(bn_node.args) >= 1 and bn_node.args[0] is node):
+            continue
+        act_node = None
+        act_kind = None
+        if len(list(bn_node.users)) == 1 and i + 2 < len(nodes):
+            cand = nodes[i + 2]
+            cand_is_relu = (
+                (cand.op == "call_module"
+                 and isinstance(gm.get_submodule(cand.target), torch.nn.ReLU))
+                or (cand.op == "call_function" and cand.target in (
+                    torch.relu, torch.nn.functional.relu)))
+            cand_is_silu = (
+                (cand.op == "call_module"
+                 and isinstance(gm.get_submodule(cand.target), torch.nn.SiLU))
+                or (cand.op == "call_function" and cand.target in (
+                    torch.nn.functional.silu,)))
+            if ((cand_is_relu or cand_is_silu)
+                    and len(cand.args) == 1 and cand.args[0] is bn_node):
+                act_node = cand
+                act_kind = "relu" if cand_is_relu else "silu"
+        conv_bn_fusion[node.name] = {
+            "bn": bn_node, "act": act_node, "act_kind": act_kind}
+        conv_bn_consumed.add(bn_node)
+        if act_node is not None:
+            conv_bn_consumed.add(act_node)
+
+    # Nodes to skip during the main walk (e.g. getitem consumers of chunk,
+    # and the BN / activation nodes absorbed by conv_bn_fusion above).
+    _skip_nodes: set = set(conv_bn_consumed)
 
     for node in nodes:
         if node in _skip_nodes:
@@ -781,6 +911,151 @@ def extract_int8(
                         f"int8 extract: Conv2d dilation={mod.dilation} not "
                         f"supported at {node.name}"
                     )
+
+                # ---- Conv2d → BatchNorm2d (→ ReLU|SiLU) fusion --------------
+                fuse = conv_bn_fusion.get(node.name)
+                if fuse is not None:
+                    bn_node = fuse["bn"]
+                    act_node = fuse["act"]
+                    act_kind = fuse["act_kind"]
+                    bn_mod = gm.get_submodule(bn_node.target)
+
+                    # -- conv sub-op (int8 conv + Q0.31 requantize, full range;
+                    #    BN reads the full-range int8 conv output) --
+                    w_fp32 = mod.weight.detach()
+                    b_fp32 = mod.bias.detach() if mod.bias is not None else None
+                    w_scale = _scale_from_max_abs(w_fp32)
+                    w_q = _quantize_per_tensor_sym(w_fp32, w_scale)
+                    in_scale = scales[in_name]
+                    conv_out_scale = scales[node.name]
+                    if b_fp32 is not None:
+                        b_q = torch.round(
+                            b_fp32 / (in_scale * w_scale)).to(
+                            torch.int32).cpu().numpy()
+                    else:
+                        b_q = np.zeros((mod.out_channels,), dtype=np.int32)
+                    w_key = f"{node.target}.weight_q"
+                    b_key = f"{node.target}.bias_q"
+                    weights_blob[w_key] = w_q
+                    weights_blob[b_key] = b_q
+                    real_mult = (in_scale * w_scale) / conv_out_scale
+                    multiplier, shift = _requantize_multiplier_shift(real_mult)
+                    in_shape = tensors_meta[in_name]["shape"]
+                    conv_out_shape = list(cap.tensors[node.name].shape)
+                    N_, IC, IH, IW = (int(s) for s in in_shape)
+                    _, OC, OH, OW = (int(s) for s in conv_out_shape)
+                    KH, KW = _pair(mod.kernel_size)
+                    SH, SW = _pair(mod.stride)
+                    PH, PW = _pair(mod.padding)
+                    conv_sub = {
+                        "name": str(node.target), "op": "conv2d_s8",
+                        "inputs": [in_name], "outputs": [node.name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "IC": IC, "IH": IH, "IW": IW,
+                                  "OC": OC, "OH": OH, "OW": OW,
+                                  "KH": KH, "KW": KW, "SH": SH, "SW": SW,
+                                  "PH": PH, "PW": PW},
+                        "quant": {
+                            "input_offset": 0, "filter_offset": 0,
+                            "output_offset": 0,
+                            "output_multiplier": multiplier,
+                            "output_shift": shift,
+                            "activation_min": -128, "activation_max": 127,
+                        },
+                    }
+
+                    # -- bn sub-op (per-channel affine folded to scale + bias) --
+                    gamma = (bn_mod.weight.detach().cpu().numpy().astype(np.float32)
+                             if bn_mod.weight is not None else
+                             np.ones((bn_mod.num_features,), dtype=np.float32))
+                    beta = (bn_mod.bias.detach().cpu().numpy().astype(np.float32)
+                            if bn_mod.bias is not None else
+                            np.zeros((bn_mod.num_features,), dtype=np.float32))
+                    bn_mean = bn_mod.running_mean.detach().cpu().numpy().astype(np.float32)
+                    bn_var = bn_mod.running_var.detach().cpu().numpy().astype(np.float32)
+                    bn_eps = float(bn_mod.eps)
+                    bn_scale_pc = (gamma / np.sqrt(bn_var + bn_eps)).astype(np.float32)
+                    bn_bias_pc = (beta - bn_mean * bn_scale_pc).astype(np.float32)
+                    bn_s_key = f"{bn_node.target}.scale"
+                    bn_b_key = f"{bn_node.target}.bias_fused"
+                    weights_blob[bn_s_key] = bn_scale_pc
+                    weights_blob[bn_b_key] = bn_bias_pc
+                    bn_out_scale = scales[bn_node.name]
+                    # relu → clamp at 0 on the bn requantize (the relu is the
+                    # bn output stage); silu/none → full int8 range.
+                    bn_act_min = 0 if act_kind == "relu" else -128
+                    # Where the bn writes: for relu the fused output IS the
+                    # relu tensor (bn's clamp does the relu); for silu the bn
+                    # feeds the silu sub-op; for none the bn IS the output.
+                    if act_kind == "relu":
+                        bn_out_name = act_node.name
+                    else:
+                        bn_out_name = bn_node.name
+                    bn_sub = {
+                        "name": str(bn_node.target), "op": "batchnorm2d_s8",
+                        "inputs": [node.name], "outputs": [bn_out_name],
+                        "weight": bn_s_key, "bias": bn_b_key,
+                        "shape": {"N": N_, "C": OC, "H": OH, "W": OW},
+                        "quant": {
+                            "scale_in": conv_out_scale,
+                            "scale_out": bn_out_scale,
+                            "activation_min": bn_act_min,
+                            "activation_max": 127,
+                        },
+                    }
+
+                    sub_ops = [conv_sub, bn_sub]
+                    if act_kind == "silu":
+                        silu_out_scale = scales[act_node.name]
+                        n_elem = int(N_ * OC * OH * OW)
+                        sub_ops.append({
+                            "name": str(getattr(act_node, "target", act_node.name)),
+                            "op": "silu_s8",
+                            "inputs": [bn_node.name],
+                            "outputs": [act_node.name],
+                            "shape": {"n": n_elem},
+                            "quant": {
+                                "scale_in": bn_out_scale,
+                                "scale_out": silu_out_scale,
+                                "activation_min": -128,
+                                "activation_max": 127,
+                            },
+                        })
+                        fused_op_kind = "conv2d_batchnorm2d_silu_s8"
+                        final_out = act_node.name
+                        final_scale = silu_out_scale
+                    elif act_kind == "relu":
+                        fused_op_kind = "conv2d_batchnorm2d_s8"
+                        final_out = act_node.name
+                        # relu (bn-clamp) keeps the bn output scale, matching
+                        # the standalone bn→relu fusion's aliasing.
+                        final_scale = bn_out_scale
+                    else:
+                        fused_op_kind = "conv2d_batchnorm2d_s8"
+                        final_out = bn_node.name
+                        final_scale = bn_out_scale
+
+                    # Register only the fused OUTPUT tensor; the conv/bn
+                    # intermediates live inside the single kernel and need no
+                    # global buffer.
+                    tensors_meta[final_out] = {
+                        "shape": (list(cap.tensors[final_out].shape)
+                                  if final_out in cap.tensors
+                                  else [N_, OC, OH, OW]),
+                        "dtype": "i8",
+                        "quant": {"scale": final_scale, "zero_point": 0},
+                    }
+                    scales[final_out] = final_scale
+                    ops.append({
+                        "name": str(node.target),
+                        "op": fused_op_kind,
+                        "inputs": [in_name],
+                        "outputs": [final_out],
+                        "sub_ops": sub_ops,
+                    })
+                    continue
+                # ---- end Conv2d → BatchNorm2d fusion -----------------------
+
                 _record(node.name, dtype="i8")
                 w_fp32 = mod.weight.detach()
                 b_fp32 = mod.bias.detach() if mod.bias is not None else None
@@ -1284,46 +1559,31 @@ def extract_int8(
         elif op["op"] == "relu_s8":
             activations[out_name] = np.maximum(in_arr, 0).astype(np.int8)
         elif op["op"] == "conv2d_s8":
-            sh = op["shape"]
-            q = op["quant"]
-            w_q = weights_blob[op["weight"]].astype(np.int32)  # [OC, IC, KH, KW]
-            b_q = weights_blob[op["bias"]].astype(np.int32)    # [OC]
-            in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
-            # Compute via direct sliding window (slow but correct simulator).
-            OH, OW = sh["OH"], sh["OW"]
-            KH, KW = sh["KH"], sh["KW"]
-            SH, SW = sh["SH"], sh["SW"]
-            PH, PW = sh["PH"], sh["PW"]
-            out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
-            for n in range(sh["N"]):
-                for oc in range(sh["OC"]):
-                    out[n, oc] = b_q[oc]
-                    for ic in range(sh["IC"]):
-                        for kh in range(KH):
-                            for kw in range(KW):
-                                # Build the input slice for this (kh, kw).
-                                ih_start = -PH + kh
-                                iw_start = -PW + kw
-                                # Compute valid output ranges.
-                                for oh in range(OH):
-                                    ih = oh * SH + ih_start
-                                    if ih < 0 or ih >= sh["IH"]:
-                                        # padded: in_v = input_offset
-                                        in_row = np.full(OW, q["input_offset"], dtype=np.int32)
-                                    else:
-                                        in_row = np.zeros(OW, dtype=np.int32)
-                                        for ow in range(OW):
-                                            iw = ow * SW + iw_start
-                                            if iw < 0 or iw >= sh["IW"]:
-                                                in_row[ow] = q["input_offset"]
-                                            else:
-                                                in_row[ow] = in_4d[n, ic, ih, iw] + q["input_offset"]
-                                    w_v = w_q[oc, ic, kh, kw] + q["filter_offset"]
-                                    out[n, oc, oh] += in_row * w_v
-            scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
-            scaled += q["output_offset"]
-            scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
-            activations[out_name] = scaled.astype(np.int8)
+            activations[out_name] = _sim_conv2d_s8(
+                in_arr, op["shape"], op["quant"],
+                weights_blob[op["weight"]], weights_blob[op["bias"]])
+        elif op["op"] in ("conv2d_batchnorm2d_s8",
+                          "conv2d_batchnorm2d_silu_s8"):
+            # Fused conv→bn(→silu): run the sub-ops in sequence through the
+            # same primitives as the standalone path so the golden is
+            # bit-exact with the composed C reference kernel.
+            cur = in_arr
+            for sub in op["sub_ops"]:
+                sk = sub["op"]
+                if sk == "conv2d_s8":
+                    cur = _sim_conv2d_s8(
+                        cur, sub["shape"], sub["quant"],
+                        weights_blob[sub["weight"]], weights_blob[sub["bias"]])
+                elif sk == "batchnorm2d_s8":
+                    cur = _sim_batchnorm2d_s8(
+                        cur, sub["shape"], sub["quant"],
+                        weights_blob[sub["weight"]], weights_blob[sub["bias"]])
+                elif sk == "silu_s8":
+                    cur = _sim_silu_s8(cur, sub["quant"])
+                else:
+                    raise NotImplementedError(
+                        f"int8 simulator: fused sub-op {sk!r} unsupported")
+            activations[out_name] = cur
         elif op["op"] == "maxpool2d_s8":
             sh = op["shape"]
             in_4d = in_arr.reshape(sh["N"], sh["C"], sh["IH"], sh["IW"])
@@ -1365,18 +1625,9 @@ def extract_int8(
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
         elif op["op"] == "batchnorm2d_s8":
-            sh = op["shape"]
-            q = op["quant"]
-            scale_per_ch = weights_blob[op["weight"]].astype(np.float32)
-            bias_per_ch = weights_blob[op["bias"]].astype(np.float32)
-            in_4d = in_arr.reshape(sh["N"], sh["C"], sh["H"], sh["W"]).astype(np.float32)
-            scale_in = np.float32(q["scale_in"])
-            scale_out = np.float32(q["scale_out"])
-            fv = in_4d * scale_in
-            y = scale_per_ch[None, :, None, None] * fv + bias_per_ch[None, :, None, None]
-            v = np.round(y / scale_out).astype(np.int32)
-            v = np.clip(v, q["activation_min"], q["activation_max"])
-            activations[out_name] = v.astype(np.int8)
+            activations[out_name] = _sim_batchnorm2d_s8(
+                in_arr, op["shape"], op["quant"],
+                weights_blob[op["weight"]], weights_blob[op["bias"]])
         elif op["op"] == "sigmoid_s8":
             q = op["quant"]
             fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
@@ -1385,12 +1636,7 @@ def extract_int8(
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
         elif op["op"] == "silu_s8":
-            q = op["quant"]
-            fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
-            silu_out = fv / (np.float32(1.0) + np.exp(-fv).astype(np.float32))
-            v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
-            v = np.clip(v, q["activation_min"], q["activation_max"])
-            activations[out_name] = v.astype(np.int8)
+            activations[out_name] = _sim_silu_s8(in_arr, op["quant"])
         elif op["op"] == "elu_s8":
             q = op["quant"]
             fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])

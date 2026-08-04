@@ -375,6 +375,7 @@ else
     python -m modelblaster.validation.firesim_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
+        --quant "${QUANT}" \
         ${TOL_FLAGS} \
         "${FIRESIM_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"

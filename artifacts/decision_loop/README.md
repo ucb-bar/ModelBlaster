@@ -443,3 +443,46 @@ What's still purely realizable-as-IR-only (no measurement loop yet):
   to account for the OC-offset slice. That's likely a generate_skeleton.py
   fix similar in spirit to the tile-tensor registration we already
   shipped. Follow-up.
+
+---
+
+## Round 8 — profile-loader tile fallback (committed, partial fix)
+
+`xpu-rt/profile_loader.py` patched: when a dispatch named
+`<base>.tile_<i>` has no direct profile entry, fall back to the
+parent op's `time_ms / n_splits`. This closes the bookkeeping gap
+where tile dispatches defaulted to 0 cycles.
+
+Wall-clock split test re-run with the fallback in place: **same
+result as round 7** (75.57 → 64.92 ms, +14.09 %, looks like ACCEPT).
+At first glance the fix worked; on inspection, both the BEFORE and
+AFTER fixtures show mlp_control's per-dispatch duration as
+**exactly `0.0` ms** — not the expected ~50 µs for mlp_control's
+linear_s8 dispatch_0.
+
+That's a separate issue from the tile fallback. Even with no split
+applied, Dima's scheduler is producing fixture entries where
+mlp_control's durations are zero, meaning the "wall-clock savings"
+we see come from rearranged scheduling of yolov8 around already-
+zero-cost mlp work, not from real tile parallelism.
+
+The tile-fallback patch itself is correct and useful — it covers the
+documented gap. But the wall-clock split gate cannot give an honest
+verdict until mlp_control's per-dispatch durations come through the
+scheduler accurately. That's deeper in the scheduler's profile
+ingest path (likely a `processing_times[k]` indexing issue or a
+`max_end_t` periodic-pruning artifact) and out of scope for this
+round.
+
+### Honest current state of the decision driver
+
+| Capability | Status |
+|:---|:---|
+| Predicted candidate scoring | ✅ via `granularity_loop.py` |
+| Realizability filter | ✅ covers fuse + linear/conv2d splits |
+| IR rewriting (fuse + linear split + conv2d split) | ✅ unit-tested |
+| Per-tile profile fallback in scheduler | ✅ this round |
+| Per-op cycle gate (for fuse acceptance) | ✅ honest, measured |
+| Wall-clock makespan gate (for split acceptance) | ⚠️ scaffolded but underlying mlp_control duration ingestion is broken |
+| End-to-end multi-round iteration | ◯ infrastructure exists, not yet exercised |
+

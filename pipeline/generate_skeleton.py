@@ -1350,6 +1350,34 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(qb['scale_in'])}, {_f32(qb['scale_out'])}, "
                 f"{qb['activation_min']}, {qb['activation_max']})"
             )
+        elif op["op"] == "conv2d_batchnorm2d_silu_s8":
+            # Triple-fused conv→BN→SiLU (yolov8 backbone). sub_ops = [conv, bn, silu].
+            sub = op["sub_ops"]
+            sub_conv = sub[0]; sub_bn = sub[1]; sub_silu = sub[2]
+            in_ptr = ptr_for(sub_conv["inputs"][0], "in")
+            w = _weight_name(model_name, sub_conv["weight"])
+            b = _weight_name(model_name, sub_conv["bias"]) if sub_conv.get("bias") else "NULL"
+            bn_s = _weight_name(model_name, sub_bn["weight"])
+            bn_b = _weight_name(model_name, sub_bn["bias"])
+            sh = sub_conv["shape"]
+            qc = sub_conv["quant"]
+            qb = sub_bn["quant"]
+            qs = sub_silu["quant"]
+            call = (
+                f"kernel_conv2d_batchnorm2d_silu_s8({in_ptr}, {w}, {b}, "
+                f"{bn_s}, {bn_b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{qc['input_offset']}, {qc['filter_offset']}, "
+                f"{qc['output_offset']}, "
+                f"{qc['output_multiplier']}, {qc['output_shift']}, "
+                f"{qc['activation_min']}, {qc['activation_max']}, "
+                f"{_f32(qb['scale_in'])}, {_f32(qb['scale_out'])}, "
+                f"{qb['activation_min']}, {qb['activation_max']}, "
+                f"{_f32(qs['scale_in'])}, {_f32(qs['scale_out'])}, "
+                f"{qs['activation_min']}, {qs['activation_max']})"
+            )
         elif op["op"] == "linear_s8_elu_s8":
             # Phase 1d pair-fused linear+elu (Phase 1b emitted a synthetic
             # __fused__... op + chained sub-kernels; this is the registered
