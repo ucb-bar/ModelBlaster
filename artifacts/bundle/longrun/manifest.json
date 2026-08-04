@@ -1,29 +1,25 @@
 {
-  "bundle": "/scratch2/agustin/XPU-RT/artifacts/iterate/firesim_batch.json",
+  "bundle": "/tmp/single_cand_heft.json",
   "workload_spec": "/scratch2/agustin/XPU-RT/data/toplevel/networks_1yolo_4mlp_2dronet_firesim.json",
   "runner": "firesim",
   "deadline_us": 65.0,
   "candidates": [
     {
-      "id": "baseline",
-      "axis": "baseline",
-      "solver": "decomposed",
-      "scheduler": null,
+      "id": "A_heft",
+      "axis": "scheduler",
+      "solver": "milp",
+      "scheduler": "heft",
       "profile_hw": {
         "cpu_p": "gemmini_q31",
         "cpu_e": "V256D128_rvv"
       },
-      "fixture": "/scratch2/agustin/XPU-RT/schedules/scheduled__iter_baseline_decomposed_profiled.json",
-      "stdout_log": "artifacts/bundle/longrun/baseline/run_stdout.log",
-      "predicted_makespan_us": 75570.54599999999,
-      "wall_s": 1479.1,
-      "uartlog": "artifacts/bundle/longrun/baseline/uartlog",
-      "trace_csv": "artifacts/bundle/longrun/baseline/xpurt_trace.csv",
-      "measured_makespan_us": 13507.048,
-      "status": "ok",
-      "returncode": 1,
-      "verify_failed": true,
-      "verify_note": "cross-backend numerical drift (known issue task #103); cycle measurements are valid"
+      "fixture": "/scratch2/agustin/XPU-RT/schedules/scheduled__iter_heft_V256D128_rvv-gemmini_q31_heft_profiled.json",
+      "stdout_log": "artifacts/bundle/longrun/A_heft/run_stdout.log",
+      "predicted_makespan_us": 54429.872,
+      "wall_s": 6984.4,
+      "uartlog": "artifacts/bundle/longrun/A_heft/uartlog",
+      "status": "error",
+      "returncode": 1
     }
   ]
 }

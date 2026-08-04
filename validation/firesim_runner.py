@@ -300,7 +300,7 @@ def _firesim_run_async(firesim_env: str, firesim_root: str,
             "--workload", DEFAULT_FIRESIM_WORKLOAD_NAME,
             "--bootbinary", DEFAULT_FIRESIM_BOOTBINARY,
             "--priority", str(priority),
-            "--project", "modelblaster",
+            "--project", os.environ.get("FIRESIM_PROJECT", "modelblaster"),
         ]
         if timeout:
             argv += ["--timeout", str(timeout)]
