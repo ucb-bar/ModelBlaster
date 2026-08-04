@@ -1,0 +1,62 @@
+{
+  "action_in_projector": {
+    "CPU": 4.6,
+    "GPU": 18.26,
+    "DSP": 32.06
+  },
+  "action_out_projector": {
+    "CPU": 1.98,
+    "GPU": 11.4,
+    "DSP": 29.76
+  },
+  "dronet": {
+    "CPU": 3.2,
+    "GPU": 18.42,
+    "DSP": 30.46
+  },
+  "mobilenet_v2": {
+    "CPU": 40.5,
+    "GPU": 26.72,
+    "DSP": 40.3
+  },
+  "smolvlm_text": {
+    "CPU": 6.52,
+    "GPU": 5.4,
+    "DSP": 34.5
+  },
+  "smolvlm_vision": {
+    "CPU": 3652.94,
+    "GPU": 15844.3,
+    "DSP": null
+  },
+  "yolov8s": {
+    "CPU": 700.4,
+    "GPU": 371.56,
+    "DSP": 212.46
+  },
+  "state_projector": {
+    "CPU": 1.24,
+    "GPU": 6.76,
+    "DSP": 28.72
+  },
+  "time_in_projector": {
+    "CPU": 7.6,
+    "GPU": 39.16,
+    "DSP": 35.92
+  },
+  "time_out_projector": {
+    "CPU": 5.88,
+    "GPU": 27.8,
+    "DSP": 35.36
+  },
+  "smolvlm_expert_decode": {
+    "CPU": 630.96,
+    "GPU": null,
+    "DSP": null
+  },
+  "smolvlm_expert_prefill": {
+    "CPU": 1601.0,
+    "GPU": 4511.84,
+    "DSP": null
+  }
+}

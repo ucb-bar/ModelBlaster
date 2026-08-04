@@ -1,0 +1,127 @@
+{
+  "dsp_seg_00": {
+    "p0": {"status":"no_ctx"},
+    "p1": {"dlc":"ctx_dsp_seg_00_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_00_tramp_p1","iters":20,"init_us":2546.5,"mean_us":17542.56,"median_us":17884.17,"min_us":13008.20,"max_us":20693.06,"std_us":1745.61,"p99_us":20693.06},
+    "p2": {"dlc":"ctx_dsp_seg_00_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_00_tramp_p2","iters":20,"init_us":1839.8,"mean_us":78823.83,"median_us":78877.76,"min_us":77388.11,"max_us":79664.48,"std_us":521.21,"p99_us":79664.48}
+  },
+  "dsp_seg_01": {
+    "p0": {"dlc":"ctx_dsp_seg_01_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_01_tramp_p0","iters":20,"init_us":1531.0,"mean_us":3113.30,"median_us":3109.09,"min_us":3055.91,"max_us":3266.50,"std_us":46.10,"p99_us":3266.50},
+    "p1": {"dlc":"ctx_dsp_seg_01_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_01_tramp_p1","iters":20,"init_us":1794.8,"mean_us":18885.30,"median_us":18645.08,"min_us":17838.98,"max_us":20318.12,"std_us":678.32,"p99_us":20318.12},
+    "p2": {"dlc":"ctx_dsp_seg_01_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_01_tramp_p2","iters":20,"init_us":2275.1,"mean_us":48883.18,"median_us":48828.84,"min_us":48364.43,"max_us":50298.27,"std_us":425.07,"p99_us":50298.27}
+  },
+  "dsp_seg_02": {
+    "p0": {"dlc":"ctx_dsp_seg_02_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_02_tramp_p0","iters":20,"init_us":2179.3,"mean_us":29145.93,"median_us":29201.65,"min_us":28505.45,"max_us":30128.64,"std_us":348.45,"p99_us":30128.64},
+    "p1": {"dlc":"ctx_dsp_seg_02_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_02_tramp_p1","iters":20,"init_us":1924.0,"mean_us":17852.23,"median_us":17346.75,"min_us":15791.27,"max_us":20811.43,"std_us":1289.53,"p99_us":20811.43},
+    "p2": {"dlc":"ctx_dsp_seg_02_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_02_tramp_p2","iters":20,"init_us":2932.3,"mean_us":78300.76,"median_us":78318.10,"min_us":77873.08,"max_us":78969.44,"std_us":255.24,"p99_us":78969.44}
+  },
+  "dsp_seg_03": {
+    "p0": {"dlc":"ctx_dsp_seg_03_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_03_tramp_p0","iters":20,"init_us":1792.6,"mean_us":3132.91,"median_us":3132.44,"min_us":3072.07,"max_us":3237.65,"std_us":38.36,"p99_us":3237.65},
+    "p1": {"dlc":"ctx_dsp_seg_03_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_03_tramp_p1","iters":20,"init_us":2507.9,"mean_us":18499.28,"median_us":18601.06,"min_us":14801.71,"max_us":20689.00,"std_us":1241.79,"p99_us":20689.00},
+    "p2": {"dlc":"ctx_dsp_seg_03_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_03_tramp_p2","iters":20,"init_us":2189.5,"mean_us":48798.20,"median_us":48724.13,"min_us":48245.60,"max_us":49727.61,"std_us":355.08,"p99_us":49727.61}
+  },
+  "dsp_seg_04": {
+    "p0": {"dlc":"ctx_dsp_seg_04_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_04_tramp_p0","iters":20,"init_us":2092.1,"mean_us":29465.30,"median_us":29445.21,"min_us":29066.26,"max_us":30212.96,"std_us":297.32,"p99_us":30212.96},
+    "p1": {"dlc":"ctx_dsp_seg_04_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_04_tramp_p1","iters":20,"init_us":1895.0,"mean_us":17805.38,"median_us":17199.16,"min_us":16018.96,"max_us":20434.11,"std_us":1078.23,"p99_us":20434.11},
+    "p2": {"dlc":"ctx_dsp_seg_04_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_04_tramp_p2","iters":20,"init_us":4199.7,"mean_us":78411.22,"median_us":78364.65,"min_us":77922.95,"max_us":79440.96,"std_us":325.53,"p99_us":79440.96}
+  },
+  "dsp_seg_05": {
+    "p0": {"dlc":"ctx_dsp_seg_05_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_05_tramp_p0","iters":20,"init_us":1882.7,"mean_us":3126.73,"median_us":3126.42,"min_us":3078.71,"max_us":3184.76,"std_us":28.61,"p99_us":3184.76},
+    "p1": {"dlc":"ctx_dsp_seg_05_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_05_tramp_p1","iters":20,"init_us":2408.1,"mean_us":18548.85,"median_us":18623.96,"min_us":16555.68,"max_us":23377.03,"std_us":1503.71,"p99_us":23377.03},
+    "p2": {"dlc":"ctx_dsp_seg_05_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_05_tramp_p2","iters":20,"init_us":1870.0,"mean_us":48774.34,"median_us":48797.55,"min_us":48271.12,"max_us":49491.75,"std_us":267.96,"p99_us":49491.75}
+  },
+  "dsp_seg_06": {
+    "p0": {"dlc":"ctx_dsp_seg_06_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_06_tramp_p0","iters":20,"init_us":1752.9,"mean_us":29040.83,"median_us":29111.77,"min_us":28484.79,"max_us":29760.30,"std_us":302.07,"p99_us":29760.30},
+    "p1": {"dlc":"ctx_dsp_seg_06_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_06_tramp_p1","iters":20,"init_us":1828.9,"mean_us":17361.91,"median_us":17625.94,"min_us":15142.27,"max_us":19988.53,"std_us":1161.89,"p99_us":19988.53},
+    "p2": {"dlc":"ctx_dsp_seg_06_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_06_tramp_p2","iters":20,"init_us":1833.5,"mean_us":78615.50,"median_us":78584.15,"min_us":77967.86,"max_us":79913.74,"std_us":400.55,"p99_us":79913.74}
+  },
+  "dsp_seg_07": {
+    "p0": {"dlc":"ctx_dsp_seg_07_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_07_tramp_p0","iters":20,"init_us":1750.5,"mean_us":3122.92,"median_us":3117.28,"min_us":3079.26,"max_us":3267.60,"std_us":40.02,"p99_us":3267.60},
+    "p1": {"dlc":"ctx_dsp_seg_07_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_07_tramp_p1","iters":20,"init_us":2318.2,"mean_us":18661.67,"median_us":18584.19,"min_us":16856.09,"max_us":21288.85,"std_us":1054.28,"p99_us":21288.85},
+    "p2": {"dlc":"ctx_dsp_seg_07_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_07_tramp_p2","iters":20,"init_us":4000.3,"mean_us":47817.03,"median_us":47844.52,"min_us":47049.58,"max_us":48378.75,"std_us":329.75,"p99_us":48378.75}
+  },
+  "dsp_seg_08": {
+    "p0": {"dlc":"ctx_dsp_seg_08_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_08_tramp_p0","iters":20,"init_us":2218.8,"mean_us":29636.91,"median_us":29603.60,"min_us":29199.00,"max_us":30479.92,"std_us":314.15,"p99_us":30479.92},
+    "p1": {"dlc":"ctx_dsp_seg_08_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_08_tramp_p1","iters":20,"init_us":730.8,"mean_us":17358.80,"median_us":17117.71,"min_us":12864.31,"max_us":19403.50,"std_us":1352.53,"p99_us":19403.50},
+    "p2": {"dlc":"ctx_dsp_seg_08_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_08_tramp_p2","iters":20,"init_us":1986.0,"mean_us":78672.39,"median_us":78774.44,"min_us":77779.55,"max_us":79312.64,"std_us":403.94,"p99_us":79312.64}
+  },
+  "dsp_seg_09": {
+    "p0": {"dlc":"ctx_dsp_seg_09_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_09_tramp_p0","iters":20,"init_us":1491.7,"mean_us":3130.58,"median_us":3123.25,"min_us":3070.39,"max_us":3232.68,"std_us":42.70,"p99_us":3232.68},
+    "p1": {"dlc":"ctx_dsp_seg_09_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_09_tramp_p1","iters":20,"init_us":2222.6,"mean_us":16889.15,"median_us":17039.49,"min_us":11579.01,"max_us":18894.88,"std_us":1705.21,"p99_us":18894.88},
+    "p2": {"dlc":"ctx_dsp_seg_09_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_09_tramp_p2","iters":20,"init_us":2380.0,"mean_us":48181.56,"median_us":48299.32,"min_us":47505.79,"max_us":48586.09,"std_us":299.33,"p99_us":48586.09}
+  },
+  "dsp_seg_10": {
+    "p0": {"dlc":"ctx_dsp_seg_10_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_10_tramp_p0","iters":20,"init_us":2125.2,"mean_us":28758.53,"median_us":28767.09,"min_us":28251.51,"max_us":29341.38,"std_us":277.40,"p99_us":29341.38},
+    "p1": {"dlc":"ctx_dsp_seg_10_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_10_tramp_p1","iters":20,"init_us":2426.5,"mean_us":18725.52,"median_us":18522.43,"min_us":16741.36,"max_us":20684.23,"std_us":935.15,"p99_us":20684.23},
+    "p2": {"dlc":"ctx_dsp_seg_10_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_10_tramp_p2","iters":20,"init_us":2906.8,"mean_us":78521.07,"median_us":78684.15,"min_us":77759.27,"max_us":79186.51,"std_us":393.47,"p99_us":79186.51}
+  },
+  "dsp_seg_11": {
+    "p0": {"dlc":"ctx_dsp_seg_11_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_11_tramp_p0","iters":20,"init_us":1741.5,"mean_us":3161.51,"median_us":3162.51,"min_us":3091.62,"max_us":3276.00,"std_us":44.29,"p99_us":3276.00},
+    "p1": {"dlc":"ctx_dsp_seg_11_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_11_tramp_p1","iters":20,"init_us":2213.3,"mean_us":18965.71,"median_us":18786.35,"min_us":12895.46,"max_us":22868.68,"std_us":1878.60,"p99_us":22868.68},
+    "p2": {"dlc":"ctx_dsp_seg_11_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_11_tramp_p2","iters":20,"init_us":1732.9,"mean_us":48438.64,"median_us":48511.90,"min_us":47791.44,"max_us":49287.58,"std_us":445.56,"p99_us":49287.58}
+  },
+  "dsp_seg_12": {
+    "p0": {"dlc":"ctx_dsp_seg_12_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_12_tramp_p0","iters":20,"init_us":1664.6,"mean_us":29352.88,"median_us":29296.98,"min_us":29033.43,"max_us":30105.29,"std_us":241.03,"p99_us":30105.29},
+    "p1": {"dlc":"ctx_dsp_seg_12_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_12_tramp_p1","iters":20,"init_us":1696.8,"mean_us":18507.66,"median_us":18627.50,"min_us":12826.26,"max_us":21508.06,"std_us":1797.42,"p99_us":21508.06},
+    "p2": {"dlc":"ctx_dsp_seg_12_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_12_tramp_p2","iters":20,"init_us":1859.6,"mean_us":78261.29,"median_us":78227.72,"min_us":77646.78,"max_us":79331.10,"std_us":363.89,"p99_us":79331.10}
+  },
+  "dsp_seg_13": {
+    "p0": {"dlc":"ctx_dsp_seg_13_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_13_tramp_p0","iters":20,"init_us":2129.1,"mean_us":3147.40,"median_us":3111.61,"min_us":3055.83,"max_us":3427.35,"std_us":104.28,"p99_us":3427.35},
+    "p1": {"dlc":"ctx_dsp_seg_13_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_13_tramp_p1","iters":20,"init_us":2394.0,"mean_us":18770.93,"median_us":18543.04,"min_us":16487.50,"max_us":20725.40,"std_us":1082.16,"p99_us":20725.40},
+    "p2": {"dlc":"ctx_dsp_seg_13_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_13_tramp_p2","iters":20,"init_us":1723.0,"mean_us":48344.17,"median_us":48395.99,"min_us":47722.80,"max_us":48817.29,"std_us":279.55,"p99_us":48817.29}
+  },
+  "dsp_seg_14": {
+    "p0": {"dlc":"ctx_dsp_seg_14_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_14_tramp_p0","iters":20,"init_us":1652.0,"mean_us":29624.91,"median_us":29548.04,"min_us":29090.36,"max_us":30402.28,"std_us":317.76,"p99_us":30402.28},
+    "p1": {"dlc":"ctx_dsp_seg_14_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_14_tramp_p1","iters":20,"init_us":1734.4,"mean_us":18996.75,"median_us":18703.69,"min_us":17095.67,"max_us":20655.62,"std_us":881.92,"p99_us":20655.62},
+    "p2": {"dlc":"ctx_dsp_seg_14_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_14_tramp_p2","iters":20,"init_us":2892.2,"mean_us":78238.76,"median_us":78246.10,"min_us":77719.85,"max_us":79454.38,"std_us":390.47,"p99_us":79454.38}
+  },
+  "dsp_seg_15": {
+    "p0": {"dlc":"ctx_dsp_seg_15_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_15_tramp_p0","iters":20,"init_us":1796.6,"mean_us":3121.83,"median_us":3125.04,"min_us":3067.85,"max_us":3171.29,"std_us":26.25,"p99_us":3171.29},
+    "p1": {"dlc":"ctx_dsp_seg_15_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_15_tramp_p1","iters":20,"init_us":767.5,"mean_us":16922.86,"median_us":17057.21,"min_us":14218.85,"max_us":18633.56,"std_us":995.91,"p99_us":18633.56},
+    "p2": {"dlc":"ctx_dsp_seg_15_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_15_tramp_p2","iters":20,"init_us":2260.0,"mean_us":48486.05,"median_us":48516.62,"min_us":47807.90,"max_us":49267.02,"std_us":283.76,"p99_us":49267.02}
+  },
+  "dsp_seg_16": {
+    "p0": {"dlc":"ctx_dsp_seg_16_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_16_tramp_p0","iters":20,"init_us":1799.7,"mean_us":29196.03,"median_us":29156.38,"min_us":28901.16,"max_us":29672.02,"std_us":241.09,"p99_us":29672.02},
+    "p1": {"dlc":"ctx_dsp_seg_16_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_16_tramp_p1","iters":20,"init_us":2009.6,"mean_us":18465.24,"median_us":18650.98,"min_us":16810.88,"max_us":19450.95,"std_us":615.61,"p99_us":19450.95},
+    "p2": {"dlc":"ctx_dsp_seg_16_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_16_tramp_p2","iters":20,"init_us":1909.8,"mean_us":78216.45,"median_us":78234.93,"min_us":76696.73,"max_us":79206.72,"std_us":466.84,"p99_us":79206.72}
+  },
+  "dsp_seg_17": {
+    "p0": {"dlc":"ctx_dsp_seg_17_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_17_tramp_p0","iters":20,"init_us":1770.7,"mean_us":3129.20,"median_us":3107.27,"min_us":3063.47,"max_us":3305.04,"std_us":69.10,"p99_us":3305.04},
+    "p1": {"dlc":"ctx_dsp_seg_17_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_17_tramp_p1","iters":20,"init_us":2426.2,"mean_us":17178.93,"median_us":17052.64,"min_us":14867.89,"max_us":19369.26,"std_us":849.53,"p99_us":19369.26},
+    "p2": {"dlc":"ctx_dsp_seg_17_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_17_tramp_p2","iters":20,"init_us":1763.0,"mean_us":48386.72,"median_us":48367.30,"min_us":47809.79,"max_us":48793.30,"std_us":251.50,"p99_us":48793.30}
+  },
+  "dsp_seg_18": {
+    "p0": {"dlc":"ctx_dsp_seg_18_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_18_tramp_p0","iters":20,"init_us":2171.9,"mean_us":29685.28,"median_us":29602.90,"min_us":29269.76,"max_us":30623.91,"std_us":324.69,"p99_us":30623.91},
+    "p1": {"dlc":"ctx_dsp_seg_18_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_18_tramp_p1","iters":20,"init_us":2194.2,"mean_us":16969.30,"median_us":16985.23,"min_us":14670.22,"max_us":18611.26,"std_us":839.34,"p99_us":18611.26},
+    "p2": {"dlc":"ctx_dsp_seg_18_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_18_tramp_p2","iters":20,"init_us":1853.2,"mean_us":78089.34,"median_us":78079.27,"min_us":77628.58,"max_us":78735.02,"std_us":315.99,"p99_us":78735.02}
+  },
+  "dsp_seg_19": {
+    "p0": {"dlc":"ctx_dsp_seg_19_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_19_tramp_p0","iters":20,"init_us":1812.8,"mean_us":3130.11,"median_us":3126.02,"min_us":3091.59,"max_us":3204.51,"std_us":28.17,"p99_us":3204.51},
+    "p1": {"dlc":"ctx_dsp_seg_19_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_19_tramp_p1","iters":20,"init_us":2273.5,"mean_us":16794.00,"median_us":16953.17,"min_us":11157.51,"max_us":18673.74,"std_us":1431.68,"p99_us":18673.74},
+    "p2": {"dlc":"ctx_dsp_seg_19_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_19_tramp_p2","iters":20,"init_us":2279.7,"mean_us":48297.44,"median_us":48396.85,"min_us":47423.39,"max_us":49103.12,"std_us":410.64,"p99_us":49103.12}
+  },
+  "dsp_seg_20": {
+    "p0": {"dlc":"ctx_dsp_seg_20_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_20_tramp_p0","iters":20,"init_us":2098.0,"mean_us":29680.86,"median_us":29668.52,"min_us":29390.08,"max_us":30378.12,"std_us":221.66,"p99_us":30378.12},
+    "p1": {"dlc":"ctx_dsp_seg_20_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_20_tramp_p1","iters":20,"init_us":1980.6,"mean_us":17736.55,"median_us":17851.41,"min_us":15685.42,"max_us":19115.66,"std_us":997.72,"p99_us":19115.66},
+    "p2": {"dlc":"ctx_dsp_seg_20_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_20_tramp_p2","iters":20,"init_us":3806.5,"mean_us":78336.27,"median_us":78283.13,"min_us":77793.41,"max_us":79525.07,"std_us":373.37,"p99_us":79525.07}
+  },
+  "dsp_seg_21": {
+    "p0": {"dlc":"ctx_dsp_seg_21_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_21_tramp_p0","iters":20,"init_us":1787.9,"mean_us":3134.35,"median_us":3136.32,"min_us":3090.64,"max_us":3243.72,"std_us":34.72,"p99_us":3243.72},
+    "p1": {"dlc":"ctx_dsp_seg_21_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_21_tramp_p1","iters":20,"init_us":2167.7,"mean_us":19073.69,"median_us":18662.82,"min_us":17569.10,"max_us":21931.13,"std_us":1076.81,"p99_us":21931.13},
+    "p2": {"dlc":"ctx_dsp_seg_21_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_21_tramp_p2","iters":20,"init_us":1711.9,"mean_us":48383.30,"median_us":48473.75,"min_us":47745.98,"max_us":49708.68,"std_us":471.82,"p99_us":49708.68}
+  },
+  "dsp_seg_22": {
+    "p0": {"dlc":"ctx_dsp_seg_22_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_22_tramp_p0","iters":20,"init_us":2092.5,"mean_us":29210.53,"median_us":29208.36,"min_us":28634.71,"max_us":30313.18,"std_us":366.63,"p99_us":30313.18},
+    "p1": {"dlc":"ctx_dsp_seg_22_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_22_tramp_p1","iters":20,"init_us":1858.2,"mean_us":18725.49,"median_us":18588.85,"min_us":16869.33,"max_us":20086.02,"std_us":879.26,"p99_us":20086.02},
+    "p2": {"dlc":"ctx_dsp_seg_22_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_22_tramp_p2","iters":20,"init_us":1908.3,"mean_us":78382.77,"median_us":78390.63,"min_us":77881.14,"max_us":79354.19,"std_us":350.62,"p99_us":79354.19}
+  },
+  "dsp_seg_23": {
+    "p0": {"dlc":"ctx_dsp_seg_23_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_23_tramp_p0","iters":20,"init_us":577.4,"mean_us":3153.39,"median_us":3139.18,"min_us":3080.38,"max_us":3367.68,"std_us":62.87,"p99_us":3367.68},
+    "p1": {"dlc":"ctx_dsp_seg_23_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_23_tramp_p1","iters":20,"init_us":2258.6,"mean_us":17209.33,"median_us":17087.66,"min_us":14785.58,"max_us":18593.06,"std_us":731.02,"p99_us":18593.06},
+    "p2": {"dlc":"ctx_dsp_seg_23_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_23_tramp_p2","iters":20,"init_us":1689.7,"mean_us":48373.15,"median_us":48307.08,"min_us":47738.32,"max_us":49365.02,"std_us":398.45,"p99_us":49365.02}
+  },
+  "dsp_seg_24": {
+    "p0": {"dlc":"ctx_dsp_seg_24_tramp_p0__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_24_tramp_p0","iters":20,"init_us":1652.4,"mean_us":29057.14,"median_us":29055.04,"min_us":28733.06,"max_us":29427.09,"std_us":185.97,"p99_us":29427.09},
+    "p1": {"dlc":"ctx_dsp_seg_24_tramp_p1__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_24_tramp_p1","iters":20,"init_us":1774.8,"mean_us":31291.18,"median_us":31142.27,"min_us":28999.26,"max_us":33466.38,"std_us":961.50,"p99_us":33466.38},
+    "p2": {"dlc":"ctx_dsp_seg_24_tramp_p2__Cpu.bin","backend":"/root/qairt/lib/target/libQnnCpu.so","status":"ok","graph":"dsp_seg_24_tramp_p2","iters":20,"init_us":1923.5,"mean_us":358.55,"median_us":357.92,"min_us":347.92,"max_us":377.25,"std_us":5.70,"p99_us":377.25}
+  }
+}

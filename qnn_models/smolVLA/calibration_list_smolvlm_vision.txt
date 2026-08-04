@@ -1,0 +1,10 @@
+/workspace/calibration_data_smolvlm_vision/image_0.raw
+/workspace/calibration_data_smolvlm_vision/image_1.raw
+/workspace/calibration_data_smolvlm_vision/image_2.raw
+/workspace/calibration_data_smolvlm_vision/image_3.raw
+/workspace/calibration_data_smolvlm_vision/image_4.raw
+/workspace/calibration_data_smolvlm_vision/image_5.raw
+/workspace/calibration_data_smolvlm_vision/image_6.raw
+/workspace/calibration_data_smolvlm_vision/image_7.raw
+/workspace/calibration_data_smolvlm_vision/image_8.raw
+/workspace/calibration_data_smolvlm_vision/image_9.raw

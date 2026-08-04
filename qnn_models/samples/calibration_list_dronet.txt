@@ -1,0 +1,10 @@
+/workspace/calibration_data_dronet/input_0.raw
+/workspace/calibration_data_dronet/input_1.raw
+/workspace/calibration_data_dronet/input_2.raw
+/workspace/calibration_data_dronet/input_3.raw
+/workspace/calibration_data_dronet/input_4.raw
+/workspace/calibration_data_dronet/input_5.raw
+/workspace/calibration_data_dronet/input_6.raw
+/workspace/calibration_data_dronet/input_7.raw
+/workspace/calibration_data_dronet/input_8.raw
+/workspace/calibration_data_dronet/input_9.raw

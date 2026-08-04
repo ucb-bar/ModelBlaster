@@ -1,0 +1,1511 @@
+{
+  "dsp_seg_00": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_00__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_00",
+      "iters": 50,
+      "init_us": 75497.3,
+      "mean_us": 159942.55,
+      "median_us": 160123.79,
+      "min_us": 148341.38,
+      "max_us": 166561.53,
+      "std_us": 3547.48,
+      "p99_us": 166561.53
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_00__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_00",
+      "iters": 50,
+      "init_us": 20332.0,
+      "mean_us": 68492.1,
+      "median_us": 65163.43,
+      "min_us": 63736.31,
+      "max_us": 83483.36,
+      "std_us": 6018.92,
+      "p99_us": 83483.36
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 295459.02,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_00_node_Conv_2118",
+          "mean_us": 289327.41
+        },
+        {
+          "name": "dsp_seg_00_sng_MatMul_0_conv1x1",
+          "mean_us": 6131.61
+        }
+      ]
+    }
+  },
+  "dsp_seg_01": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_01__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_01",
+      "iters": 50,
+      "init_us": 83894.5,
+      "mean_us": 88194.95,
+      "median_us": 88783.35,
+      "min_us": 82060.31,
+      "max_us": 91317.9,
+      "std_us": 2326.37,
+      "p99_us": 91317.9
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_01__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_01",
+      "iters": 50,
+      "init_us": 28366.2,
+      "mean_us": 97275.63,
+      "median_us": 96364.66,
+      "min_us": 94479.48,
+      "max_us": 102802.29,
+      "std_us": 1894.78,
+      "p99_us": 102802.29
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12398.95,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_01_node_MatMul_549_conv1x1",
+          "mean_us": 3100.52
+        },
+        {
+          "name": "dsp_seg_01_node_MatMul_554_conv1x1",
+          "mean_us": 9298.43
+        }
+      ]
+    }
+  },
+  "dsp_seg_02": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_02__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_02",
+      "iters": 50,
+      "init_us": 108149.7,
+      "mean_us": 156081.2,
+      "median_us": 157172.83,
+      "min_us": 148316.17,
+      "max_us": 160181.33,
+      "std_us": 3093.0,
+      "p99_us": 160181.33
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_02__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_02",
+      "iters": 50,
+      "init_us": 40452.8,
+      "mean_us": 115520.05,
+      "median_us": 115193.34,
+      "min_us": 103744.88,
+      "max_us": 130991.89,
+      "std_us": 6900.75,
+      "p99_us": 130991.89
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22154.56,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_02_node_MatMul_570_conv1x1",
+          "mean_us": 15922.31
+        },
+        {
+          "name": "dsp_seg_02_sng_MatMul_2_conv1x1",
+          "mean_us": 6232.25
+        }
+      ]
+    }
+  },
+  "dsp_seg_03": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_03__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_03",
+      "iters": 50,
+      "init_us": 84883.5,
+      "mean_us": 87990.53,
+      "median_us": 88834.7,
+      "min_us": 80376.73,
+      "max_us": 91320.87,
+      "std_us": 2574.54,
+      "p99_us": 91320.87
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_03__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_03",
+      "iters": 50,
+      "init_us": 30040.0,
+      "mean_us": 104281.87,
+      "median_us": 103876.25,
+      "min_us": 101187.29,
+      "max_us": 110833.78,
+      "std_us": 1799.37,
+      "p99_us": 110833.78
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12727.44,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_03_node_MatMul_669_conv1x1",
+          "mean_us": 3270.29
+        },
+        {
+          "name": "dsp_seg_03_node_MatMul_674_conv1x1",
+          "mean_us": 9457.15
+        }
+      ]
+    }
+  },
+  "dsp_seg_04": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_04__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_04",
+      "iters": 50,
+      "init_us": 104153.8,
+      "mean_us": 155654.31,
+      "median_us": 156937.89,
+      "min_us": 145846.6,
+      "max_us": 160717.28,
+      "std_us": 3763.34,
+      "p99_us": 160717.28
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_04__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_04",
+      "iters": 50,
+      "init_us": 47668.9,
+      "mean_us": 111473.83,
+      "median_us": 108364.9,
+      "min_us": 102221.78,
+      "max_us": 128517.94,
+      "std_us": 8291.73,
+      "p99_us": 128517.94
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22397.72,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_04_node_MatMul_690_conv1x1",
+          "mean_us": 16190.84
+        },
+        {
+          "name": "dsp_seg_04_sng_MatMul_4_conv1x1",
+          "mean_us": 6206.88
+        }
+      ]
+    }
+  },
+  "dsp_seg_05": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_05__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_05",
+      "iters": 50,
+      "init_us": 85409.0,
+      "mean_us": 88325.93,
+      "median_us": 89123.11,
+      "min_us": 80054.92,
+      "max_us": 91413.07,
+      "std_us": 2676.68,
+      "p99_us": 91413.07
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_05__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_05",
+      "iters": 50,
+      "init_us": 38699.3,
+      "mean_us": 103600.64,
+      "median_us": 103509.46,
+      "min_us": 100038.7,
+      "max_us": 109681.91,
+      "std_us": 1638.04,
+      "p99_us": 109681.91
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12639.22,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_05_node_MatMul_789_conv1x1",
+          "mean_us": 3298.69
+        },
+        {
+          "name": "dsp_seg_05_node_MatMul_794_conv1x1",
+          "mean_us": 9340.53
+        }
+      ]
+    }
+  },
+  "dsp_seg_06": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_06__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_06",
+      "iters": 50,
+      "init_us": 90936.7,
+      "mean_us": 155809.3,
+      "median_us": 157331.9,
+      "min_us": 142376.44,
+      "max_us": 160386.48,
+      "std_us": 4110.85,
+      "p99_us": 160386.48
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_06__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_06",
+      "iters": 50,
+      "init_us": 37826.3,
+      "mean_us": 115144.52,
+      "median_us": 114407.32,
+      "min_us": 103465.19,
+      "max_us": 131529.61,
+      "std_us": 9053.02,
+      "p99_us": 131529.61
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 21522.44,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_06_node_MatMul_810_conv1x1",
+          "mean_us": 15339.57
+        },
+        {
+          "name": "dsp_seg_06_sng_MatMul_6_conv1x1",
+          "mean_us": 6182.87
+        }
+      ]
+    }
+  },
+  "dsp_seg_07": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_07__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_07",
+      "iters": 50,
+      "init_us": 81063.0,
+      "mean_us": 87588.82,
+      "median_us": 88241.06,
+      "min_us": 77030.35,
+      "max_us": 91063.9,
+      "std_us": 3210.23,
+      "p99_us": 91063.9
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_07__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_07",
+      "iters": 50,
+      "init_us": 28593.5,
+      "mean_us": 100564.35,
+      "median_us": 102795.6,
+      "min_us": 93269.51,
+      "max_us": 105434.44,
+      "std_us": 3927.56,
+      "p99_us": 105434.44
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12382.6,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_07_node_MatMul_909_conv1x1",
+          "mean_us": 3072.4
+        },
+        {
+          "name": "dsp_seg_07_node_MatMul_914_conv1x1",
+          "mean_us": 9310.2
+        }
+      ]
+    }
+  },
+  "dsp_seg_08": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_08__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_08",
+      "iters": 50,
+      "init_us": 91781.6,
+      "mean_us": 155796.36,
+      "median_us": 156762.4,
+      "min_us": 145560.7,
+      "max_us": 160140.25,
+      "std_us": 3805.29,
+      "p99_us": 160140.25
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_08__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_08",
+      "iters": 50,
+      "init_us": 36460.8,
+      "mean_us": 115731.44,
+      "median_us": 115374.79,
+      "min_us": 103757.74,
+      "max_us": 132002.82,
+      "std_us": 8935.37,
+      "p99_us": 132002.82
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 21735.24,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_08_node_MatMul_930_conv1x1",
+          "mean_us": 15533.07
+        },
+        {
+          "name": "dsp_seg_08_sng_MatMul_8_conv1x1",
+          "mean_us": 6202.17
+        }
+      ]
+    }
+  },
+  "dsp_seg_09": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_09__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_09",
+      "iters": 50,
+      "init_us": 84658.7,
+      "mean_us": 87780.68,
+      "median_us": 88936.89,
+      "min_us": 79053.7,
+      "max_us": 91678.59,
+      "std_us": 3101.36,
+      "p99_us": 91678.59
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_09__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_09",
+      "iters": 50,
+      "init_us": 29456.4,
+      "mean_us": 103182.26,
+      "median_us": 103336.65,
+      "min_us": 98023.6,
+      "max_us": 108199.02,
+      "std_us": 1779.47,
+      "p99_us": 108199.02
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12561.31,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_09_node_MatMul_1029_conv1x1",
+          "mean_us": 3174.89
+        },
+        {
+          "name": "dsp_seg_09_node_MatMul_1034_conv1x1",
+          "mean_us": 9386.42
+        }
+      ]
+    }
+  },
+  "dsp_seg_10": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_10__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_10",
+      "iters": 50,
+      "init_us": 105192.3,
+      "mean_us": 156031.0,
+      "median_us": 157290.72,
+      "min_us": 141915.76,
+      "max_us": 160204.52,
+      "std_us": 3849.25,
+      "p99_us": 160204.52
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_10__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_10",
+      "iters": 50,
+      "init_us": 38308.7,
+      "mean_us": 113218.3,
+      "median_us": 114611.7,
+      "min_us": 103675.52,
+      "max_us": 128167.41,
+      "std_us": 7955.25,
+      "p99_us": 128167.41
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22015.04,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_10_node_MatMul_1050_conv1x1",
+          "mean_us": 15768.07
+        },
+        {
+          "name": "dsp_seg_10_sng_MatMul_10_conv1x1",
+          "mean_us": 6246.97
+        }
+      ]
+    }
+  },
+  "dsp_seg_11": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_11__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_11",
+      "iters": 50,
+      "init_us": 88793.5,
+      "mean_us": 87708.65,
+      "median_us": 88508.39,
+      "min_us": 76558.27,
+      "max_us": 91439.65,
+      "std_us": 3189.05,
+      "p99_us": 91439.65
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_11__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_11",
+      "iters": 50,
+      "init_us": 35578.7,
+      "mean_us": 103836.83,
+      "median_us": 103604.89,
+      "min_us": 101415.34,
+      "max_us": 111646.28,
+      "std_us": 1650.99,
+      "p99_us": 111646.28
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12415.83,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_11_node_MatMul_1149_conv1x1",
+          "mean_us": 3161.23
+        },
+        {
+          "name": "dsp_seg_11_node_MatMul_1154_conv1x1",
+          "mean_us": 9254.6
+        }
+      ]
+    }
+  },
+  "dsp_seg_12": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_12__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_12",
+      "iters": 50,
+      "init_us": 90278.3,
+      "mean_us": 156405.96,
+      "median_us": 157608.79,
+      "min_us": 140691.66,
+      "max_us": 160797.54,
+      "std_us": 3832.33,
+      "p99_us": 160797.54
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_12__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_12",
+      "iters": 50,
+      "init_us": 38888.9,
+      "mean_us": 112283.76,
+      "median_us": 109331.12,
+      "min_us": 103469.25,
+      "max_us": 128728.37,
+      "std_us": 8735.34,
+      "p99_us": 128728.37
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22278.69,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_12_node_MatMul_1170_conv1x1",
+          "mean_us": 16027.06
+        },
+        {
+          "name": "dsp_seg_12_sng_MatMul_12_conv1x1",
+          "mean_us": 6251.63
+        }
+      ]
+    }
+  },
+  "dsp_seg_13": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_13__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_13",
+      "iters": 50,
+      "init_us": 81447.5,
+      "mean_us": 88390.04,
+      "median_us": 89166.6,
+      "min_us": 75557.9,
+      "max_us": 91377.06,
+      "std_us": 3088.93,
+      "p99_us": 91377.06
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_13__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_13",
+      "iters": 50,
+      "init_us": 30296.8,
+      "mean_us": 103395.31,
+      "median_us": 103488.42,
+      "min_us": 100632.32,
+      "max_us": 107850.12,
+      "std_us": 1339.13,
+      "p99_us": 107850.12
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12457.25,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_13_node_MatMul_1269_conv1x1",
+          "mean_us": 3145.23
+        },
+        {
+          "name": "dsp_seg_13_node_MatMul_1274_conv1x1",
+          "mean_us": 9312.02
+        }
+      ]
+    }
+  },
+  "dsp_seg_14": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_14__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_14",
+      "iters": 50,
+      "init_us": 97210.4,
+      "mean_us": 155742.79,
+      "median_us": 156609.86,
+      "min_us": 144825.81,
+      "max_us": 160597.99,
+      "std_us": 3556.62,
+      "p99_us": 160597.99
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_14__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_14",
+      "iters": 50,
+      "init_us": 39294.9,
+      "mean_us": 111635.33,
+      "median_us": 109411.64,
+      "min_us": 103327.65,
+      "max_us": 132156.01,
+      "std_us": 9139.34,
+      "p99_us": 132156.01
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22172.25,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_14_node_MatMul_1290_conv1x1",
+          "mean_us": 15941.87
+        },
+        {
+          "name": "dsp_seg_14_sng_MatMul_14_conv1x1",
+          "mean_us": 6230.38
+        }
+      ]
+    }
+  },
+  "dsp_seg_15": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_15__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_15",
+      "iters": 50,
+      "init_us": 73800.8,
+      "mean_us": 87864.14,
+      "median_us": 88391.08,
+      "min_us": 78677.31,
+      "max_us": 90981.92,
+      "std_us": 2829.31,
+      "p99_us": 90981.92
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_15__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_15",
+      "iters": 50,
+      "init_us": 31624.8,
+      "mean_us": 102641.79,
+      "median_us": 103209.1,
+      "min_us": 97632.4,
+      "max_us": 105926.64,
+      "std_us": 2144.82,
+      "p99_us": 105926.64
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12442.51,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_15_node_MatMul_1389_conv1x1",
+          "mean_us": 3121.52
+        },
+        {
+          "name": "dsp_seg_15_node_MatMul_1394_conv1x1",
+          "mean_us": 9320.99
+        }
+      ]
+    }
+  },
+  "dsp_seg_16": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_16__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_16",
+      "iters": 50,
+      "init_us": 105671.8,
+      "mean_us": 155474.91,
+      "median_us": 156723.3,
+      "min_us": 144866.38,
+      "max_us": 160170.5,
+      "std_us": 3663.03,
+      "p99_us": 160170.5
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_16__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_16",
+      "iters": 50,
+      "init_us": 43143.5,
+      "mean_us": 116359.91,
+      "median_us": 118869.38,
+      "min_us": 103604.12,
+      "max_us": 131057.77,
+      "std_us": 8871.58,
+      "p99_us": 131057.77
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22007.07,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_16_node_MatMul_1410_conv1x1",
+          "mean_us": 15815.56
+        },
+        {
+          "name": "dsp_seg_16_sng_MatMul_16_conv1x1",
+          "mean_us": 6191.51
+        }
+      ]
+    }
+  },
+  "dsp_seg_17": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_17__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_17",
+      "iters": 50,
+      "init_us": 73428.5,
+      "mean_us": 87886.38,
+      "median_us": 88951.94,
+      "min_us": 74548.72,
+      "max_us": 91503.97,
+      "std_us": 3711.75,
+      "p99_us": 91503.97
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_17__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_17",
+      "iters": 50,
+      "init_us": 30244.8,
+      "mean_us": 102739.59,
+      "median_us": 102949.86,
+      "min_us": 99924.14,
+      "max_us": 105654.12,
+      "std_us": 1106.0,
+      "p99_us": 105654.12
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12494.32,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_17_node_MatMul_1509_conv1x1",
+          "mean_us": 3217.11
+        },
+        {
+          "name": "dsp_seg_17_node_MatMul_1514_conv1x1",
+          "mean_us": 9277.21
+        }
+      ]
+    }
+  },
+  "dsp_seg_18": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_18__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_18",
+      "iters": 50,
+      "init_us": 105672.5,
+      "mean_us": 155583.82,
+      "median_us": 157106.9,
+      "min_us": 143249.76,
+      "max_us": 159806.49,
+      "std_us": 4098.93,
+      "p99_us": 159806.49
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_18__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_18",
+      "iters": 50,
+      "init_us": 36119.0,
+      "mean_us": 111114.95,
+      "median_us": 104516.79,
+      "min_us": 102962.21,
+      "max_us": 127825.6,
+      "std_us": 9129.18,
+      "p99_us": 127825.6
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 21754.03,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_18_node_MatMul_1530_conv1x1",
+          "mean_us": 15534.55
+        },
+        {
+          "name": "dsp_seg_18_sng_MatMul_18_conv1x1",
+          "mean_us": 6219.48
+        }
+      ]
+    }
+  },
+  "dsp_seg_19": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_19__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_19",
+      "iters": 50,
+      "init_us": 68116.5,
+      "mean_us": 88117.15,
+      "median_us": 88892.96,
+      "min_us": 79713.42,
+      "max_us": 91264.21,
+      "std_us": 2888.38,
+      "p99_us": 91264.21
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_19__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_19",
+      "iters": 50,
+      "init_us": 30431.5,
+      "mean_us": 100667.59,
+      "median_us": 100500.78,
+      "min_us": 95483.2,
+      "max_us": 107007.17,
+      "std_us": 2812.6,
+      "p99_us": 107007.17
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12583.38,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_19_node_MatMul_1629_conv1x1",
+          "mean_us": 3200.22
+        },
+        {
+          "name": "dsp_seg_19_node_MatMul_1634_conv1x1",
+          "mean_us": 9383.16
+        }
+      ]
+    }
+  },
+  "dsp_seg_20": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_20__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_20",
+      "iters": 50,
+      "init_us": 98673.9,
+      "mean_us": 155334.14,
+      "median_us": 156258.91,
+      "min_us": 146522.32,
+      "max_us": 160217.67,
+      "std_us": 3431.81,
+      "p99_us": 160217.67
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_20__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_20",
+      "iters": 50,
+      "init_us": 39950.3,
+      "mean_us": 115919.34,
+      "median_us": 112851.1,
+      "min_us": 104331.55,
+      "max_us": 128703.54,
+      "std_us": 7875.16,
+      "p99_us": 128703.54
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22083.22,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_20_node_MatMul_1650_conv1x1",
+          "mean_us": 15897.77
+        },
+        {
+          "name": "dsp_seg_20_sng_MatMul_20_conv1x1",
+          "mean_us": 6185.45
+        }
+      ]
+    }
+  },
+  "dsp_seg_21": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_21__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_21",
+      "iters": 50,
+      "init_us": 90384.5,
+      "mean_us": 87783.44,
+      "median_us": 88720.1,
+      "min_us": 78373.39,
+      "max_us": 91127.54,
+      "std_us": 2960.74,
+      "p99_us": 91127.54
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_21__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_21",
+      "iters": 50,
+      "init_us": 33338.2,
+      "mean_us": 103613.35,
+      "median_us": 103339.34,
+      "min_us": 99951.4,
+      "max_us": 108785.71,
+      "std_us": 1699.92,
+      "p99_us": 108785.71
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12516.9,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_21_node_MatMul_1749_conv1x1",
+          "mean_us": 3195.52
+        },
+        {
+          "name": "dsp_seg_21_node_MatMul_1754_conv1x1",
+          "mean_us": 9321.38
+        }
+      ]
+    }
+  },
+  "dsp_seg_22": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_22__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_22",
+      "iters": 50,
+      "init_us": 100411.7,
+      "mean_us": 155399.79,
+      "median_us": 156739.88,
+      "min_us": 142357.98,
+      "max_us": 159768.24,
+      "std_us": 4114.87,
+      "p99_us": 159768.24
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_22__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_22",
+      "iters": 50,
+      "init_us": 36563.0,
+      "mean_us": 112958.16,
+      "median_us": 111754.14,
+      "min_us": 103783.84,
+      "max_us": 130698.95,
+      "std_us": 7643.34,
+      "p99_us": 130698.95
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 22271.92,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_22_node_MatMul_1770_conv1x1",
+          "mean_us": 16053.99
+        },
+        {
+          "name": "dsp_seg_22_sng_MatMul_22_conv1x1",
+          "mean_us": 6217.93
+        }
+      ]
+    }
+  },
+  "dsp_seg_23": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_23__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_23",
+      "iters": 50,
+      "init_us": 84706.5,
+      "mean_us": 87495.88,
+      "median_us": 88040.3,
+      "min_us": 77088.58,
+      "max_us": 90716.36,
+      "std_us": 2900.67,
+      "p99_us": 90716.36
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_23__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_23",
+      "iters": 50,
+      "init_us": 31623.8,
+      "mean_us": 103985.64,
+      "median_us": 103928.34,
+      "min_us": 100914.1,
+      "max_us": 108318.82,
+      "std_us": 1320.21,
+      "p99_us": 108318.82
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 12558.03,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_23_node_MatMul_1869_conv1x1",
+          "mean_us": 3289.74
+        },
+        {
+          "name": "dsp_seg_23_node_MatMul_1874_conv1x1",
+          "mean_us": 9268.29
+        }
+      ]
+    }
+  },
+  "dsp_seg_24": {
+    "Dsp": {
+      "dlc": "ctx_dsp_seg_24__Dsp.bin",
+      "backend": "/root/qairt/lib/target/libQnnDsp.so",
+      "status": "ok",
+      "graph": "dsp_seg_24",
+      "iters": 50,
+      "init_us": 145649.7,
+      "mean_us": 136482.19,
+      "median_us": 137615.62,
+      "min_us": 123687.93,
+      "max_us": 140747.96,
+      "std_us": 4002.32,
+      "p99_us": 140747.96
+    },
+    "Cpu": {
+      "dlc": "ctx_dsp_seg_24__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "dsp_seg_24",
+      "iters": 50,
+      "init_us": 109860.7,
+      "mean_us": 77804.31,
+      "median_us": 79751.75,
+      "min_us": 69263.81,
+      "max_us": 88042.51,
+      "std_us": 4645.28,
+      "p99_us": 88042.51
+    },
+    "Hta": {
+      "status": "ok",
+      "mean_us": 134847.75,
+      "note": "sum of 2 conv ops",
+      "convs": [
+        {
+          "name": "dsp_seg_24_node_MatMul_1890_conv1x1",
+          "mean_us": 15940.41
+        },
+        {
+          "name": "dsp_seg_24_node_MatMul_1926_conv1x1",
+          "mean_us": 118907.34
+        }
+      ]
+    }
+  },
+  "cpu_seg_00": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_00__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_00",
+      "iters": 50,
+      "init_us": 1788.1,
+      "mean_us": 36071.3,
+      "median_us": 35948.66,
+      "min_us": 34614.67,
+      "max_us": 41941.05,
+      "std_us": 1137.07,
+      "p99_us": 41941.05
+    }
+  },
+  "cpu_seg_01": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_01__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_01",
+      "iters": 50,
+      "init_us": 1627.6,
+      "mean_us": 9168.93,
+      "median_us": 9152.46,
+      "min_us": 9084.76,
+      "max_us": 9361.04,
+      "std_us": 51.65,
+      "p99_us": 9361.04
+    }
+  },
+  "cpu_seg_02": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_02__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_02",
+      "iters": 50,
+      "init_us": 1854.4,
+      "mean_us": 36099.18,
+      "median_us": 35892.75,
+      "min_us": 35473.12,
+      "max_us": 39321.42,
+      "std_us": 722.04,
+      "p99_us": 39321.42
+    }
+  },
+  "cpu_seg_03": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_03__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_03",
+      "iters": 50,
+      "init_us": 1564.8,
+      "mean_us": 9165.52,
+      "median_us": 9156.12,
+      "min_us": 9087.32,
+      "max_us": 9321.06,
+      "std_us": 45.12,
+      "p99_us": 9321.06
+    }
+  },
+  "cpu_seg_04": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_04__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_04",
+      "iters": 50,
+      "init_us": 1985.4,
+      "mean_us": 36043.57,
+      "median_us": 35860.91,
+      "min_us": 34332.25,
+      "max_us": 45775.54,
+      "std_us": 1904.23,
+      "p99_us": 45775.54
+    }
+  },
+  "cpu_seg_05": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_05__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_05",
+      "iters": 50,
+      "init_us": 550.7,
+      "mean_us": 9144.22,
+      "median_us": 9135.88,
+      "min_us": 9084.68,
+      "max_us": 9285.98,
+      "std_us": 39.24,
+      "p99_us": 9285.98
+    }
+  },
+  "cpu_seg_06": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_06__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_06",
+      "iters": 50,
+      "init_us": 2020.0,
+      "mean_us": 36445.42,
+      "median_us": 35968.07,
+      "min_us": 35610.93,
+      "max_us": 42279.09,
+      "std_us": 1283.69,
+      "p99_us": 42279.09
+    }
+  },
+  "cpu_seg_07": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_07__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_07",
+      "iters": 50,
+      "init_us": 1674.0,
+      "mean_us": 9164.65,
+      "median_us": 9159.71,
+      "min_us": 9093.88,
+      "max_us": 9269.39,
+      "std_us": 37.59,
+      "p99_us": 9269.39
+    }
+  },
+  "cpu_seg_08": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_08__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_08",
+      "iters": 50,
+      "init_us": 2136.2,
+      "mean_us": 36044.95,
+      "median_us": 35949.69,
+      "min_us": 33846.82,
+      "max_us": 42574.39,
+      "std_us": 1385.57,
+      "p99_us": 42574.39
+    }
+  },
+  "cpu_seg_09": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_09__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_09",
+      "iters": 50,
+      "init_us": 556.9,
+      "mean_us": 9186.87,
+      "median_us": 9173.22,
+      "min_us": 9095.2,
+      "max_us": 9383.42,
+      "std_us": 62.66,
+      "p99_us": 9383.42
+    }
+  },
+  "cpu_seg_10": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_10__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_10",
+      "iters": 50,
+      "init_us": 1616.1,
+      "mean_us": 36167.32,
+      "median_us": 35994.19,
+      "min_us": 34425.47,
+      "max_us": 38413.58,
+      "std_us": 661.7,
+      "p99_us": 38413.58
+    }
+  },
+  "cpu_seg_11": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_11__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_11",
+      "iters": 50,
+      "init_us": 1787.2,
+      "mean_us": 9161.89,
+      "median_us": 9147.73,
+      "min_us": 9081.9,
+      "max_us": 9359.18,
+      "std_us": 48.82,
+      "p99_us": 9359.18
+    }
+  },
+  "cpu_seg_12": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_12__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_12",
+      "iters": 50,
+      "init_us": 1562.2,
+      "mean_us": 36085.75,
+      "median_us": 35981.71,
+      "min_us": 35517.49,
+      "max_us": 38819.34,
+      "std_us": 516.92,
+      "p99_us": 38819.34
+    }
+  },
+  "cpu_seg_13": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_13__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_13",
+      "iters": 50,
+      "init_us": 1752.3,
+      "mean_us": 9160.78,
+      "median_us": 9142.86,
+      "min_us": 9098.7,
+      "max_us": 9348.01,
+      "std_us": 49.97,
+      "p99_us": 9348.01
+    }
+  },
+  "cpu_seg_14": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_14__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_14",
+      "iters": 50,
+      "init_us": 686.2,
+      "mean_us": 36838.11,
+      "median_us": 36184.39,
+      "min_us": 34904.31,
+      "max_us": 43532.45,
+      "std_us": 1918.46,
+      "p99_us": 43532.45
+    }
+  },
+  "cpu_seg_15": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_15__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_15",
+      "iters": 50,
+      "init_us": 1454.0,
+      "mean_us": 9165.56,
+      "median_us": 9163.88,
+      "min_us": 9092.27,
+      "max_us": 9316.95,
+      "std_us": 42.53,
+      "p99_us": 9316.95
+    }
+  },
+  "cpu_seg_16": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_16__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_16",
+      "iters": 50,
+      "init_us": 1726.1,
+      "mean_us": 36225.83,
+      "median_us": 35939.81,
+      "min_us": 34054.71,
+      "max_us": 42397.73,
+      "std_us": 1540.11,
+      "p99_us": 42397.73
+    }
+  },
+  "cpu_seg_17": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_17__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_17",
+      "iters": 50,
+      "init_us": 1668.2,
+      "mean_us": 9169.41,
+      "median_us": 9154.86,
+      "min_us": 9104.34,
+      "max_us": 9285.21,
+      "std_us": 44.43,
+      "p99_us": 9285.21
+    }
+  },
+  "cpu_seg_18": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_18__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_18",
+      "iters": 50,
+      "init_us": 2011.5,
+      "mean_us": 36328.44,
+      "median_us": 35994.26,
+      "min_us": 35711.51,
+      "max_us": 40727.81,
+      "std_us": 1026.48,
+      "p99_us": 40727.81
+    }
+  },
+  "cpu_seg_19": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_19__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_19",
+      "iters": 50,
+      "init_us": 1719.4,
+      "mean_us": 9172.72,
+      "median_us": 9154.37,
+      "min_us": 9104.06,
+      "max_us": 9313.06,
+      "std_us": 46.72,
+      "p99_us": 9313.06
+    }
+  },
+  "cpu_seg_20": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_20__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_20",
+      "iters": 50,
+      "init_us": 1668.7,
+      "mean_us": 36510.08,
+      "median_us": 36046.25,
+      "min_us": 34554.79,
+      "max_us": 42765.61,
+      "std_us": 1769.47,
+      "p99_us": 42765.61
+    }
+  },
+  "cpu_seg_21": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_21__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_21",
+      "iters": 50,
+      "init_us": 1768.4,
+      "mean_us": 9164.55,
+      "median_us": 9157.84,
+      "min_us": 9106.55,
+      "max_us": 9267.37,
+      "std_us": 37.86,
+      "p99_us": 9267.37
+    }
+  },
+  "cpu_seg_22": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_22__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_22",
+      "iters": 50,
+      "init_us": 689.8,
+      "mean_us": 35888.02,
+      "median_us": 35892.08,
+      "min_us": 34445.84,
+      "max_us": 39676.58,
+      "std_us": 690.19,
+      "p99_us": 39676.58
+    }
+  },
+  "cpu_seg_23": {
+    "Cpu": {
+      "dlc": "ctx_cpu_seg_23__Cpu.bin",
+      "backend": "/root/qairt/lib/target/libQnnCpu.so",
+      "status": "ok",
+      "graph": "cpu_seg_23",
+      "iters": 50,
+      "init_us": 556.5,
+      "mean_us": 9163.09,
+      "median_us": 9157.57,
+      "min_us": 9098.46,
+      "max_us": 9245.75,
+      "std_us": 36.89,
+      "p99_us": 9245.75
+    }
+  }
+}
