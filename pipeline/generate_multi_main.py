@@ -72,6 +72,14 @@ def _emit(models: list[tuple[str, str]],
     printf("running model: {tag}\\n");
     model_{mid}_reset_profile();
     run_model_{mid}(model_{mid}_test_input, out_{mid}, (void *)pool);
+    /* RVV->scalar visibility barrier (mirrors harness/src/main.c). The kernels
+     * write out_{mid} via RVV vector stores (vse/vsse); the verify loop below
+     * reads it with scalar loads. On Saturn's weak memory model the vector store
+     * buffer may not have drained before the scalar reads -> stale/partial
+     * output -> spurious miscompare (correct on spike, wrong on FireSim; worse
+     * for heavy-vector-store kernels). Without this the fused runs showed ~25%
+     * of transcendentals failing verify while being bit-exact in isolation. */
+    __asm__ volatile("fence rw, rw" ::: "memory");
     /* In-binary golden compare. Both arrays widen to float so the
      * same loop handles f32, f16, and integer outputs. Replaces the
      * per-element printf dump that used to dominate FireSim runtime
