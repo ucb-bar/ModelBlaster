@@ -1,0 +1,10 @@
+/workspace/calibration_data_action_in_projector/action_0.raw
+/workspace/calibration_data_action_in_projector/action_1.raw
+/workspace/calibration_data_action_in_projector/action_2.raw
+/workspace/calibration_data_action_in_projector/action_3.raw
+/workspace/calibration_data_action_in_projector/action_4.raw
+/workspace/calibration_data_action_in_projector/action_5.raw
+/workspace/calibration_data_action_in_projector/action_6.raw
+/workspace/calibration_data_action_in_projector/action_7.raw
+/workspace/calibration_data_action_in_projector/action_8.raw
+/workspace/calibration_data_action_in_projector/action_9.raw

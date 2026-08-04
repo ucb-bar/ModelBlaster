@@ -1,0 +1,10 @@
+/workspace/calibration_data_smolvlm_text/tokens_0.raw
+/workspace/calibration_data_smolvlm_text/tokens_1.raw
+/workspace/calibration_data_smolvlm_text/tokens_2.raw
+/workspace/calibration_data_smolvlm_text/tokens_3.raw
+/workspace/calibration_data_smolvlm_text/tokens_4.raw
+/workspace/calibration_data_smolvlm_text/tokens_5.raw
+/workspace/calibration_data_smolvlm_text/tokens_6.raw
+/workspace/calibration_data_smolvlm_text/tokens_7.raw
+/workspace/calibration_data_smolvlm_text/tokens_8.raw
+/workspace/calibration_data_smolvlm_text/tokens_9.raw

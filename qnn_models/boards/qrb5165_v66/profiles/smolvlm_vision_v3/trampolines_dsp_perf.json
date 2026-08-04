@@ -1,0 +1,127 @@
+{
+  "dsp_seg_00": {
+    "p0": {"status":"no_ctx"},
+    "p1": {"dlc":"ctx_dsp_seg_00_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_00_tramp_p1","iters":20,"init_us":20303.4,"mean_us":6213.18,"median_us":5948.14,"min_us":5018.67,"max_us":7504.44,"std_us":1071.56,"p99_us":7504.44},
+    "p2": {"dlc":"ctx_dsp_seg_00_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_00_tramp_p2","iters":20,"init_us":46759.5,"mean_us":49713.22,"median_us":50267.64,"min_us":46886.59,"max_us":52539.50,"std_us":1653.08,"p99_us":52539.50}
+  },
+  "dsp_seg_01": {
+    "p0": {"dlc":"ctx_dsp_seg_01_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_01_tramp_p0","iters":20,"init_us":18574.2,"mean_us":1679.00,"median_us":1683.44,"min_us":1636.98,"max_us":1754.21,"std_us":30.52,"p99_us":1754.21},
+    "p1": {"dlc":"ctx_dsp_seg_01_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_01_tramp_p1","iters":20,"init_us":18278.8,"mean_us":6484.59,"median_us":6273.17,"min_us":5314.89,"max_us":7888.59,"std_us":1034.70,"p99_us":7888.59},
+    "p2": {"dlc":"ctx_dsp_seg_01_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_01_tramp_p2","iters":20,"init_us":52938.7,"mean_us":20403.40,"median_us":19700.34,"min_us":19494.99,"max_us":23878.02,"std_us":1385.02,"p99_us":23878.02}
+  },
+  "dsp_seg_02": {
+    "p0": {"dlc":"ctx_dsp_seg_02_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_02_tramp_p0","iters":20,"init_us":52553.8,"mean_us":18658.67,"median_us":19001.89,"min_us":16651.44,"max_us":20720.65,"std_us":1417.78,"p99_us":20720.65},
+    "p1": {"dlc":"ctx_dsp_seg_02_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_02_tramp_p1","iters":20,"init_us":18228.0,"mean_us":7027.90,"median_us":7591.43,"min_us":5428.42,"max_us":7940.37,"std_us":929.78,"p99_us":7940.37},
+    "p2": {"dlc":"ctx_dsp_seg_02_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_02_tramp_p2","iters":20,"init_us":45958.9,"mean_us":49714.97,"median_us":49996.18,"min_us":46901.44,"max_us":52928.54,"std_us":1467.52,"p99_us":52928.54}
+  },
+  "dsp_seg_03": {
+    "p0": {"dlc":"ctx_dsp_seg_03_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_03_tramp_p0","iters":20,"init_us":18069.2,"mean_us":1677.77,"median_us":1671.64,"min_us":1633.62,"max_us":1765.23,"std_us":33.03,"p99_us":1765.23},
+    "p1": {"dlc":"ctx_dsp_seg_03_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_03_tramp_p1","iters":20,"init_us":19055.9,"mean_us":7063.53,"median_us":7697.16,"min_us":5448.92,"max_us":8116.72,"std_us":976.54,"p99_us":8116.72},
+    "p2": {"dlc":"ctx_dsp_seg_03_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_03_tramp_p2","iters":20,"init_us":46773.6,"mean_us":21154.21,"median_us":20609.18,"min_us":19679.53,"max_us":24187.98,"std_us":1477.08,"p99_us":24187.98}
+  },
+  "dsp_seg_04": {
+    "p0": {"dlc":"ctx_dsp_seg_04_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_04_tramp_p0","iters":20,"init_us":52290.2,"mean_us":19360.78,"median_us":19519.61,"min_us":16780.45,"max_us":20871.74,"std_us":1095.03,"p99_us":20871.74},
+    "p1": {"dlc":"ctx_dsp_seg_04_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_04_tramp_p1","iters":20,"init_us":18963.1,"mean_us":7276.81,"median_us":7763.91,"min_us":5470.20,"max_us":7897.14,"std_us":806.60,"p99_us":7897.14},
+    "p2": {"dlc":"ctx_dsp_seg_04_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_04_tramp_p2","iters":20,"init_us":46764.6,"mean_us":49919.51,"median_us":50172.92,"min_us":46957.26,"max_us":52805.90,"std_us":1744.10,"p99_us":52805.90}
+  },
+  "dsp_seg_05": {
+    "p0": {"dlc":"ctx_dsp_seg_05_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_05_tramp_p0","iters":20,"init_us":18027.3,"mean_us":1661.52,"median_us":1661.87,"min_us":1620.78,"max_us":1691.66,"std_us":17.52,"p99_us":1691.66},
+    "p1": {"dlc":"ctx_dsp_seg_05_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_05_tramp_p1","iters":20,"init_us":18652.9,"mean_us":6927.10,"median_us":7362.62,"min_us":5484.30,"max_us":7971.51,"std_us":969.43,"p99_us":7971.51},
+    "p2": {"dlc":"ctx_dsp_seg_05_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_05_tramp_p2","iters":20,"init_us":51000.8,"mean_us":20796.87,"median_us":20866.31,"min_us":19468.64,"max_us":23407.07,"std_us":1306.39,"p99_us":23407.07}
+  },
+  "dsp_seg_06": {
+    "p0": {"dlc":"ctx_dsp_seg_06_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_06_tramp_p0","iters":20,"init_us":52135.1,"mean_us":19211.73,"median_us":19696.27,"min_us":16696.43,"max_us":20850.79,"std_us":1351.53,"p99_us":20850.79},
+    "p1": {"dlc":"ctx_dsp_seg_06_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_06_tramp_p1","iters":20,"init_us":18487.4,"mean_us":6871.38,"median_us":7392.23,"min_us":5388.07,"max_us":7893.89,"std_us":978.56,"p99_us":7893.89},
+    "p2": {"dlc":"ctx_dsp_seg_06_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_06_tramp_p2","iters":20,"init_us":46561.3,"mean_us":49410.29,"median_us":49398.02,"min_us":46615.60,"max_us":51715.57,"std_us":1670.96,"p99_us":51715.57}
+  },
+  "dsp_seg_07": {
+    "p0": {"dlc":"ctx_dsp_seg_07_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_07_tramp_p0","iters":20,"init_us":17877.3,"mean_us":1680.39,"median_us":1680.90,"min_us":1627.82,"max_us":1721.62,"std_us":20.24,"p99_us":1721.62},
+    "p1": {"dlc":"ctx_dsp_seg_07_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_07_tramp_p1","iters":20,"init_us":18613.3,"mean_us":6620.42,"median_us":7320.61,"min_us":5333.57,"max_us":7816.43,"std_us":1040.44,"p99_us":7816.43},
+    "p2": {"dlc":"ctx_dsp_seg_07_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_07_tramp_p2","iters":20,"init_us":51393.6,"mean_us":21950.57,"median_us":22634.13,"min_us":19605.83,"max_us":24815.64,"std_us":1980.17,"p99_us":24815.64}
+  },
+  "dsp_seg_08": {
+    "p0": {"dlc":"ctx_dsp_seg_08_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_08_tramp_p0","iters":20,"init_us":50929.2,"mean_us":18546.35,"median_us":18398.05,"min_us":16685.39,"max_us":21104.61,"std_us":1534.76,"p99_us":21104.61},
+    "p1": {"dlc":"ctx_dsp_seg_08_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_08_tramp_p1","iters":20,"init_us":18308.4,"mean_us":6936.31,"median_us":7594.07,"min_us":5388.39,"max_us":7877.71,"std_us":989.22,"p99_us":7877.71},
+    "p2": {"dlc":"ctx_dsp_seg_08_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_08_tramp_p2","iters":20,"init_us":46559.0,"mean_us":50058.50,"median_us":50391.53,"min_us":47237.14,"max_us":52685.13,"std_us":1567.42,"p99_us":52685.13}
+  },
+  "dsp_seg_09": {
+    "p0": {"dlc":"ctx_dsp_seg_09_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_09_tramp_p0","iters":20,"init_us":18126.5,"mean_us":1659.62,"median_us":1656.90,"min_us":1629.97,"max_us":1759.04,"std_us":28.25,"p99_us":1759.04},
+    "p1": {"dlc":"ctx_dsp_seg_09_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_09_tramp_p1","iters":20,"init_us":18276.9,"mean_us":6642.82,"median_us":7198.95,"min_us":5323.25,"max_us":7870.19,"std_us":1068.57,"p99_us":7870.19},
+    "p2": {"dlc":"ctx_dsp_seg_09_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_09_tramp_p2","iters":20,"init_us":44868.2,"mean_us":21035.88,"median_us":20126.33,"min_us":19657.69,"max_us":23719.36,"std_us":1406.33,"p99_us":23719.36}
+  },
+  "dsp_seg_10": {
+    "p0": {"dlc":"ctx_dsp_seg_10_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_10_tramp_p0","iters":20,"init_us":52253.0,"mean_us":18824.87,"median_us":19245.74,"min_us":16673.28,"max_us":21184.21,"std_us":1503.95,"p99_us":21184.21},
+    "p1": {"dlc":"ctx_dsp_seg_10_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_10_tramp_p1","iters":20,"init_us":20032.6,"mean_us":6508.59,"median_us":6869.97,"min_us":5295.67,"max_us":7766.73,"std_us":1033.43,"p99_us":7766.73},
+    "p2": {"dlc":"ctx_dsp_seg_10_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_10_tramp_p2","iters":20,"init_us":46328.7,"mean_us":50171.58,"median_us":50606.79,"min_us":47193.42,"max_us":52970.50,"std_us":1630.86,"p99_us":52970.50}
+  },
+  "dsp_seg_11": {
+    "p0": {"dlc":"ctx_dsp_seg_11_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_11_tramp_p0","iters":20,"init_us":17906.2,"mean_us":1672.15,"median_us":1679.62,"min_us":1635.35,"max_us":1696.03,"std_us":16.17,"p99_us":1696.03},
+    "p1": {"dlc":"ctx_dsp_seg_11_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_11_tramp_p1","iters":20,"init_us":18299.7,"mean_us":7158.16,"median_us":7671.08,"min_us":5401.47,"max_us":8028.01,"std_us":905.16,"p99_us":8028.01},
+    "p2": {"dlc":"ctx_dsp_seg_11_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_11_tramp_p2","iters":20,"init_us":51017.7,"mean_us":21585.37,"median_us":22307.08,"min_us":19639.96,"max_us":24012.85,"std_us":1672.83,"p99_us":24012.85}
+  },
+  "dsp_seg_12": {
+    "p0": {"dlc":"ctx_dsp_seg_12_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_12_tramp_p0","iters":20,"init_us":49676.7,"mean_us":18649.51,"median_us":18902.02,"min_us":16628.40,"max_us":20850.34,"std_us":1496.78,"p99_us":20850.34},
+    "p1": {"dlc":"ctx_dsp_seg_12_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_12_tramp_p1","iters":20,"init_us":18148.7,"mean_us":6791.36,"median_us":7402.57,"min_us":5400.70,"max_us":8186.73,"std_us":1010.40,"p99_us":8186.73},
+    "p2": {"dlc":"ctx_dsp_seg_12_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_12_tramp_p2","iters":20,"init_us":45834.0,"mean_us":50134.39,"median_us":50415.39,"min_us":46759.93,"max_us":52706.55,"std_us":1799.25,"p99_us":52706.55}
+  },
+  "dsp_seg_13": {
+    "p0": {"dlc":"ctx_dsp_seg_13_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_13_tramp_p0","iters":20,"init_us":17755.0,"mean_us":1664.47,"median_us":1662.34,"min_us":1630.41,"max_us":1734.79,"std_us":24.94,"p99_us":1734.79},
+    "p1": {"dlc":"ctx_dsp_seg_13_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_13_tramp_p1","iters":20,"init_us":18108.0,"mean_us":6847.92,"median_us":7468.16,"min_us":5351.97,"max_us":7797.95,"std_us":976.92,"p99_us":7797.95},
+    "p2": {"dlc":"ctx_dsp_seg_13_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_13_tramp_p2","iters":20,"init_us":59271.7,"mean_us":21142.91,"median_us":21046.43,"min_us":19421.38,"max_us":24186.74,"std_us":1543.65,"p99_us":24186.74}
+  },
+  "dsp_seg_14": {
+    "p0": {"dlc":"ctx_dsp_seg_14_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_14_tramp_p0","iters":20,"init_us":52227.7,"mean_us":18956.00,"median_us":19407.70,"min_us":16820.62,"max_us":20762.80,"std_us":1499.83,"p99_us":20762.80},
+    "p1": {"dlc":"ctx_dsp_seg_14_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_14_tramp_p1","iters":20,"init_us":18040.3,"mean_us":6859.97,"median_us":7600.37,"min_us":5425.68,"max_us":7838.70,"std_us":1021.43,"p99_us":7838.70},
+    "p2": {"dlc":"ctx_dsp_seg_14_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_14_tramp_p2","iters":20,"init_us":40020.8,"mean_us":50178.53,"median_us":50286.46,"min_us":47242.55,"max_us":53181.58,"std_us":1749.91,"p99_us":53181.58}
+  },
+  "dsp_seg_15": {
+    "p0": {"dlc":"ctx_dsp_seg_15_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_15_tramp_p0","iters":20,"init_us":17690.8,"mean_us":2739.09,"median_us":3334.17,"min_us":1658.60,"max_us":3967.20,"std_us":874.67,"p99_us":3967.20},
+    "p1": {"dlc":"ctx_dsp_seg_15_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_15_tramp_p1","iters":20,"init_us":17888.4,"mean_us":6620.52,"median_us":7186.01,"min_us":5382.20,"max_us":7810.80,"std_us":1045.94,"p99_us":7810.80},
+    "p2": {"dlc":"ctx_dsp_seg_15_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_15_tramp_p2","iters":20,"init_us":88071.0,"mean_us":21234.08,"median_us":20340.60,"min_us":19592.83,"max_us":23901.75,"std_us":1712.41,"p99_us":23901.75}
+  },
+  "dsp_seg_16": {
+    "p0": {"dlc":"ctx_dsp_seg_16_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_16_tramp_p0","iters":20,"init_us":52193.4,"mean_us":18879.27,"median_us":18774.98,"min_us":16786.90,"max_us":21479.77,"std_us":1508.44,"p99_us":21479.77},
+    "p1": {"dlc":"ctx_dsp_seg_16_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_16_tramp_p1","iters":20,"init_us":18350.5,"mean_us":6767.77,"median_us":7549.72,"min_us":5293.83,"max_us":7926.13,"std_us":1089.39,"p99_us":7926.13},
+    "p2": {"dlc":"ctx_dsp_seg_16_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_16_tramp_p2","iters":20,"init_us":44914.3,"mean_us":49723.17,"median_us":49592.63,"min_us":46652.08,"max_us":51798.74,"std_us":1469.53,"p99_us":51798.74}
+  },
+  "dsp_seg_17": {
+    "p0": {"dlc":"ctx_dsp_seg_17_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_17_tramp_p0","iters":20,"init_us":17737.1,"mean_us":2609.69,"median_us":3270.75,"min_us":1647.77,"max_us":3535.49,"std_us":830.33,"p99_us":3535.49},
+    "p1": {"dlc":"ctx_dsp_seg_17_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_17_tramp_p1","iters":20,"init_us":20087.7,"mean_us":6390.63,"median_us":5920.62,"min_us":5268.06,"max_us":7942.61,"std_us":996.95,"p99_us":7942.61},
+    "p2": {"dlc":"ctx_dsp_seg_17_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_17_tramp_p2","iters":20,"init_us":69669.3,"mean_us":21064.87,"median_us":19913.95,"min_us":19488.12,"max_us":24588.57,"std_us":1680.46,"p99_us":24588.57}
+  },
+  "dsp_seg_18": {
+    "p0": {"dlc":"ctx_dsp_seg_18_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_18_tramp_p0","iters":20,"init_us":69501.6,"mean_us":18523.44,"median_us":18338.12,"min_us":16697.01,"max_us":21674.60,"std_us":1609.85,"p99_us":21674.60},
+    "p1": {"dlc":"ctx_dsp_seg_18_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_18_tramp_p1","iters":20,"init_us":18560.4,"mean_us":6278.16,"median_us":5529.48,"min_us":5356.24,"max_us":7948.19,"std_us":1029.55,"p99_us":7948.19},
+    "p2": {"dlc":"ctx_dsp_seg_18_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_18_tramp_p2","iters":20,"init_us":47198.5,"mean_us":49822.90,"median_us":50248.28,"min_us":46909.81,"max_us":52364.91,"std_us":1724.26,"p99_us":52364.91}
+  },
+  "dsp_seg_19": {
+    "p0": {"dlc":"ctx_dsp_seg_19_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_19_tramp_p0","iters":20,"init_us":19959.2,"mean_us":1688.88,"median_us":1686.73,"min_us":1660.69,"max_us":1744.44,"std_us":20.78,"p99_us":1744.44},
+    "p1": {"dlc":"ctx_dsp_seg_19_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_19_tramp_p1","iters":20,"init_us":18629.8,"mean_us":6691.97,"median_us":7224.66,"min_us":5348.28,"max_us":7968.31,"std_us":1085.71,"p99_us":7968.31},
+    "p2": {"dlc":"ctx_dsp_seg_19_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_19_tramp_p2","iters":20,"init_us":81737.3,"mean_us":21578.16,"median_us":21330.13,"min_us":19739.59,"max_us":24605.94,"std_us":1561.83,"p99_us":24605.94}
+  },
+  "dsp_seg_20": {
+    "p0": {"dlc":"ctx_dsp_seg_20_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_20_tramp_p0","iters":20,"init_us":50894.2,"mean_us":18523.80,"median_us":19023.81,"min_us":16693.05,"max_us":20629.03,"std_us":1350.88,"p99_us":20629.03},
+    "p1": {"dlc":"ctx_dsp_seg_20_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_20_tramp_p1","iters":20,"init_us":17973.3,"mean_us":6450.19,"median_us":6210.59,"min_us":5416.37,"max_us":7786.86,"std_us":981.37,"p99_us":7786.86},
+    "p2": {"dlc":"ctx_dsp_seg_20_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_20_tramp_p2","iters":20,"init_us":46481.3,"mean_us":49856.45,"median_us":50290.36,"min_us":46898.70,"max_us":53368.88,"std_us":1638.48,"p99_us":53368.88}
+  },
+  "dsp_seg_21": {
+    "p0": {"dlc":"ctx_dsp_seg_21_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_21_tramp_p0","iters":20,"init_us":18040.2,"mean_us":1664.77,"median_us":1663.15,"min_us":1633.82,"max_us":1705.49,"std_us":20.01,"p99_us":1705.49},
+    "p1": {"dlc":"ctx_dsp_seg_21_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_21_tramp_p1","iters":20,"init_us":20154.0,"mean_us":6357.46,"median_us":5762.32,"min_us":5315.59,"max_us":8171.62,"std_us":1061.00,"p99_us":8171.62},
+    "p2": {"dlc":"ctx_dsp_seg_21_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_21_tramp_p2","iters":20,"init_us":67837.5,"mean_us":21230.79,"median_us":20350.90,"min_us":19641.57,"max_us":24361.89,"std_us":1633.46,"p99_us":24361.89}
+  },
+  "dsp_seg_22": {
+    "p0": {"dlc":"ctx_dsp_seg_22_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_22_tramp_p0","iters":20,"init_us":90000.6,"mean_us":18883.08,"median_us":19191.36,"min_us":16746.95,"max_us":21348.63,"std_us":1518.26,"p99_us":21348.63},
+    "p1": {"dlc":"ctx_dsp_seg_22_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_22_tramp_p1","iters":20,"init_us":18257.3,"mean_us":6848.53,"median_us":7399.85,"min_us":5357.47,"max_us":7798.39,"std_us":979.33,"p99_us":7798.39},
+    "p2": {"dlc":"ctx_dsp_seg_22_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_22_tramp_p2","iters":20,"init_us":47286.3,"mean_us":50254.73,"median_us":50001.51,"min_us":47147.67,"max_us":53115.93,"std_us":1842.28,"p99_us":53115.93}
+  },
+  "dsp_seg_23": {
+    "p0": {"dlc":"ctx_dsp_seg_23_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_23_tramp_p0","iters":20,"init_us":18109.2,"mean_us":1674.51,"median_us":1678.05,"min_us":1632.11,"max_us":1723.78,"std_us":21.41,"p99_us":1723.78},
+    "p1": {"dlc":"ctx_dsp_seg_23_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_23_tramp_p1","iters":20,"init_us":18515.0,"mean_us":6994.33,"median_us":7757.51,"min_us":5358.36,"max_us":7870.80,"std_us":1013.66,"p99_us":7870.80},
+    "p2": {"dlc":"ctx_dsp_seg_23_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_23_tramp_p2","iters":20,"init_us":79542.8,"mean_us":21760.38,"median_us":21883.21,"min_us":19952.14,"max_us":24269.34,"std_us":1530.38,"p99_us":24269.34}
+  },
+  "dsp_seg_24": {
+    "p0": {"dlc":"ctx_dsp_seg_24_tramp_p0__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_24_tramp_p0","iters":20,"init_us":45276.9,"mean_us":18245.19,"median_us":18360.40,"min_us":16672.61,"max_us":20948.72,"std_us":1348.85,"p99_us":20948.72},
+    "p1": {"dlc":"ctx_dsp_seg_24_tramp_p1__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_24_tramp_p1","iters":20,"init_us":18485.2,"mean_us":7004.21,"median_us":7326.52,"min_us":5672.64,"max_us":8119.04,"std_us":1010.80,"p99_us":8119.04},
+    "p2": {"dlc":"ctx_dsp_seg_24_tramp_p2__Dsp.bin","backend":"/root/qairt/lib/target/libQnnDsp.so","status":"ok","graph":"dsp_seg_24_tramp_p2","iters":20,"init_us":17541.3,"mean_us":444.02,"median_us":443.18,"min_us":437.61,"max_us":457.66,"std_us":4.51,"p99_us":457.66}
+  }
+}

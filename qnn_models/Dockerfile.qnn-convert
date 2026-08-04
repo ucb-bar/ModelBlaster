@@ -1,0 +1,46 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system Python 3.10, LLVM runtime (QNN SDK build env), and download tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    libc++-dev \
+    libc++abi-dev \
+    libatomic1 \
+    libllvm14 \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages needed by the converters
+RUN python3.10 -m pip install --no-cache-dir \
+    'numpy<2' \
+    onnx \
+    onnxruntime \
+    onnx-simplifier \
+    pyyaml \
+    pandas \
+    packaging \
+    decorator \
+    attrs \
+    scipy \
+    psutil \
+    pytest \
+    tflite
+
+# Download and install QNN SDK
+ARG QNN_SDK_URL="https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.45.0.260326/v2.45.0.260326.zip"
+RUN curl -L -o /tmp/qnn_sdk.zip "$QNN_SDK_URL" \
+    && unzip -q /tmp/qnn_sdk.zip -d /opt \
+    && rm /tmp/qnn_sdk.zip \
+    && ln -s /opt/qairt/2.45.0.260326 /qnn
+
+ENV QNN_SDK_ROOT=/qnn
+ENV PYTHONPATH=/qnn/lib/python:${PYTHONPATH}
+ENV PATH=/qnn/bin/x86_64-linux-clang:${PATH}
+ENV LD_LIBRARY_PATH=/qnn/lib/x86_64-linux-clang:${LD_LIBRARY_PATH}
+
+WORKDIR /workspace
