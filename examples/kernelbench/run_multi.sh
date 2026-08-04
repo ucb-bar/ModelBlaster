@@ -11,7 +11,9 @@
 #
 # Env: BENCHES=comma-list of level1 basenames (required);
 #      TARGET={scalar,rvv} (default rvv); QUANT={fp32,fp16} (default fp32);
-#      RUNNER={spike,firesim} (default spike); SPIKE_HARTS (default 4);
+#      RUNNER={spike,firesim} (default spike); SPIKE_HARTS (default 1, or 4 if
+#      ET_SMP=1); spike defaults to spike_single_core.conf (1-thread inline pool,
+#      unbuffered HTIF) — set ET_SMP=1 or SPIKE_CONF=<name> to change;
 #      SPIKE_RAM_SIZE / SPIKE_MEM_MB (stock dims); BENCH_MAX_ELEMENTS (default 65536).
 set -euo pipefail
 : "${BENCHES:?set BENCHES=comma-list of level1 basenames}"
@@ -81,6 +83,12 @@ if [[ "${AUTO_RAM0:-1}" == "1" ]]; then
 fi
 if [[ "${RUNNER}" == "firesim" ]]; then
     WEST_EXTRA+=(-DEXTRA_CONF_FILE="${MB}/harness/backends/${FIRESIM_CONF:-firesim_chipyard.conf}")
+elif [[ "${RUNNER}" == "spike" && "${ET_SMP:-0}" != "1" ]]; then
+    # Default spike to a 1-core, 1-thread INLINE pthreadpool (+ unbuffered HTIF for
+    # live per-model markers). The harness prj.conf is MP_MAX_NUM_CPUS=4, which on
+    # spike is >10x slower (4-hart emulation + thread oversubscription) and looks
+    # like a hang. Opt into multicore with ET_SMP=1, or override SPIKE_CONF=.
+    WEST_EXTRA+=(-DEXTRA_CONF_FILE="${MB}/harness/backends/${SPIKE_CONF:-spike_single_core.conf}")
 fi
 
 echo "[multi] west build (${#LIST[@]} benches, board=${BOARD}) -> ${BUILD_DIR}"
@@ -98,11 +106,22 @@ if b.atol_override is not None: p.append(f'--atol={b.atol_override}')
 if b.rtol_override is not None: p.append(f'--rtol={b.rtol_override}')
 print(' '.join(p))")
 
+# MULTI_BUILD_ONLY=1: build the fused ELF but skip the (host-local) run. Used when
+# the caller runs the ELF elsewhere (e.g. a remote F2), so run_multi.sh must not
+# block on a local firesim runworkload that hangs when there is no local FPGA.
+if [[ "${MULTI_BUILD_ONLY:-0}" == "1" ]]; then
+    echo "[multi] MULTI_BUILD_ONLY -> ELF built, skipping ${RUNNER} run"
+    exit 0
+fi
 echo "[multi] ${RUNNER} run (${MODELS})"
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "from modelblaster.pipeline.backends import get; print(' '.join(get('${GEN_TARGET}').spike_args))")
     SF=(); for a in ${SPIKE_ARGS}; do SF+=("--spike-arg=${a}"); done
-    SF+=("--spike-arg=-p${SPIKE_HARTS:-4}")
+    # Match harts to the pthreadpool thread count: 1 by default (spike_single_core.conf
+    # = MP_MAX_NUM_CPUS=1), 4 under ET_SMP=1. Running more harts than threads just
+    # idles the extra harts; running fewer oversubscribes and spin-wastes.
+    _hdef=1; [[ "${ET_SMP:-0}" == "1" ]] && _hdef=4
+    SF+=("--spike-arg=-p${SPIKE_HARTS:-$_hdef}")
     # Cover the auto-sized ram0 (only when it exceeds spike's 2 GiB default).
     _mem="${SPIKE_MEM_MB:-}"
     if [[ -z "${_mem}" && $(( _RAM0_SZ / 1048576 )) -gt 1984 ]]; then _mem=$(( _RAM0_SZ/1048576 + 64 )); fi

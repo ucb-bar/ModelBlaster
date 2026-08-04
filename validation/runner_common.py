@@ -537,7 +537,21 @@ def report_run(text: str, *, models: Optional[list[str]],
             # harness — saves shipping the full output tensor over UART);
             # fall back to per-element parse_output for legacy binaries.
             verify = parse_verify(text, tag=name)
-            actual = None if verify is not None else parse_output(text, tag=name)
+            # Batched harness: in-binary VERIFY may be missing for a
+            # variant whose kernel crashed / infinite-looped / lost its
+            # marker to HTIF-buffer drop. Try parse_output(); if that
+            # also fails, mark this model failed and continue instead
+            # of aborting the whole report_run — otherwise one bad
+            # variant wipes the batch even though the others ran fine.
+            actual = None
+            if verify is None:
+                try:
+                    actual = parse_output(text, tag=name)
+                except RuntimeError as _e:
+                    print(f"  [{name}] MISSING OUTPUT/VERIFY (variant "
+                          f"hung, crashed, or lost markers) — FAIL")
+                    all_ok = False
+                    continue
             per_model_quant = (quants[i] if quants and i < len(quants)
                                else quant)
             # io_paths lets the caller point a model name (e.g. a flat
