@@ -268,6 +268,34 @@ west build -p -b "${BOARD_TARGET}" harness_xpurt \
 _mb_stage_end build
 _mb_stage_begin run
 echo "[xpurt] ${RUNNER} + verify"
+
+# Per-backend verify tolerance. A model's dispatches may be routed to ANY of
+# the linked BACKENDS by the schedule, so the binary's numeric envelope is the
+# loosest of them (e.g. gemmini_q31 declares atol_override=128 for its Q0.31
+# requantize drift, while rvv is bit-exact). Without this, the combined verify
+# runs at atol=rtol=0 and a gemmini-routed model fails on legitimate drift.
+# Mirrors the TOL_FLAGS logic in examples/_run_lib.sh.
+TOL_FLAGS=$(python -c "
+from modelblaster.pipeline.backends import get
+atol = None
+rtol = None
+for bs in '${BACKENDS}'.split(','):
+    b = get(bs.strip())
+    if b.atol_override is not None:
+        atol = b.atol_override if atol is None else max(atol, b.atol_override)
+    if b.rtol_override is not None:
+        rtol = b.rtol_override if rtol is None else max(rtol, b.rtol_override)
+parts = []
+if atol is not None:
+    parts.append(f'--atol={atol}')
+if rtol is not None:
+    parts.append(f'--rtol={rtol}')
+print(' '.join(parts))
+")
+if [[ -n "${TOL_FLAGS}" ]]; then
+    echo "[xpurt] verify tolerance (max over BACKENDS=${BACKENDS}): ${TOL_FLAGS}"
+fi
+
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_ARGS=$(python -c "
 from modelblaster.pipeline.backends import get
@@ -338,6 +366,7 @@ print(' '.join(out))
         --models "${MODELS}" \
         --quant "${QUANT}" \
         --timeout "${SPIKE_TIMEOUT:-900}" \
+        ${TOL_FLAGS} \
         "${SPIKE_FLAGS[@]}"
 else
     FIRESIM_FLAGS=()
@@ -369,6 +398,7 @@ else
         --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${_first_quant}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
+        ${TOL_FLAGS} \
         "${_quant_flag[@]}" \
         "${FIRESIM_FLAGS[@]}"
 fi
