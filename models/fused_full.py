@@ -73,10 +73,35 @@ def get_sample_input(seed: int = 1):
 
 def get_input_dtypes():
     # front_grey, tof_cross, lowdim — all int8-quantized (each its own scale).
+    # MB_FUSED_LOWDIM_FLOAT=1 keeps lowdim as an fp32 passthrough (no int8 clip):
+    # the real lowdim vector mixes O(1) components (quat/flow-normalized/flags)
+    # with a large optical_flow (~330), which a single per-tensor int8 scale
+    # cannot represent — so lowdim stays float and feeds the (fp16/fp32) tail.
+    import os
+    v = os.environ.get("MB_FUSED_LOWDIM_FLOAT", "0")
+    if v not in ("0", ""):
+        # "f16" (default when set) matches an fp16 tail so cat needs no cast;
+        # "f32" for an fp32 tail / plain-scalar ISA.
+        dt = "f16" if v in ("1", "f16") else v
+        return ["i8", "i8", dt]
     return ["i8", "i8", "i8"]
 
 
 def get_calibration_samples(n: int):
+    # MB_FUSED_CALIB_PKL: a pickle holding a list of real (front_grey[1,1,60,90],
+    # tof_cross[1,4,8,8], lowdim[1,21]) tuples captured from gate-course flight.
+    # Calibrating activation scales on the DEPLOYMENT distribution (not synthetic
+    # randoms) is required — real magnitudes differ a lot (fwd~1.5, flow~330).
+    import os
+    pkl = os.environ.get("MB_FUSED_CALIB_PKL")
+    if pkl:
+        import pickle, torch as _t
+        with open(pkl, "rb") as f:
+            samples = pickle.load(f)
+        out = []
+        for s in samples[:n]:
+            out.append(tuple(x if _t.is_tensor(x) else _t.as_tensor(x) for x in s))
+        return out
     # Widen activation-scale calibration across a few representative inputs.
     return [_sample(100 + i) for i in range(n)]
 
