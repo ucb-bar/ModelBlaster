@@ -4812,6 +4812,52 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
     argtypes_factory=_linear_f16_argtypes,
     algorithms=[
         AlgorithmCandidate(
+            name="narrow",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh fp16 linear with PURE-fp16 accumulation (no fp32). "
+                "Identical to 'widening' but the K-reduction uses vfmacc_vv_f16 "
+                "(fp16 multiply-accumulate) + vfredusum_vs_f16, keeping the whole "
+                "vector datapath at SEW=16 — NO vfwmacc / fp32 accumulator. This is "
+                "the DEFAULT for rvv_f16 because it runs on BOTH full-zvfh AND a "
+                "reduced fp16-only vector unit (the FPGA drone target has no LUT "
+                "area for an fp32 vector ALU); 'widening' below needs the fp32 "
+                "datapath. Divergence from the reference is reduction ORDER only "
+                "(fp16 non-associative) -> numeric_drift; the fp16 accumulate also "
+                "matches the deployment hardware exactly.\n"
+            ),
+            reference_impl="""\
+#include <stddef.h>
+#include <riscv_vector.h>
+
+void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int M, int K, int N) {
+    const size_t vlmax = __riscv_vsetvlmax_e16m4();
+    for (int m = 0; m < M; m++) {
+        const _Float16 *in_row = input + (size_t)m * (size_t)K;
+        for (int n = 0; n < N; n++) {
+            const _Float16 *w_row = weight + (size_t)n * (size_t)K;
+            vfloat16m4_t vacc = __riscv_vfmv_v_f_f16m4((_Float16)0.0f, vlmax);
+            int k = 0;
+            size_t vl;
+            for (; k < K; k += (int)vl) {
+                vl = __riscv_vsetvl_e16m4(K - k);
+                vfloat16m4_t va = __riscv_vle16_v_f16m4(in_row + k, vl);
+                vfloat16m4_t vb = __riscv_vle16_v_f16m4(w_row + k, vl);
+                vacc = __riscv_vfmacc_vv_f16m4(vacc, va, vb, vl);
+            }
+            vfloat16m1_t vs = __riscv_vfmv_s_f_f16m1((_Float16)0.0f, 1);
+            vs = __riscv_vfredusum_vs_f16m4_f16m1(vacc, vs, vlmax);
+            _Float16 acc = __riscv_vfmv_f_s_f16m1_f16(vs);
+            if (bias) acc = (_Float16)(acc + bias[n]);
+            output[(size_t)m * N + n] = acc;
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
             name="widening",
             target_affinity=("rvv_f16",),
             description=(
