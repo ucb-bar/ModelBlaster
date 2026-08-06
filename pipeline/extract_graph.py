@@ -524,6 +524,77 @@ class _CaptureTensors(torch.fx.Interpreter):
         return result
 
 
+def _promote_ops_to_fp16(ops, fp16_names, tensors_meta, weights_blob, fp32_stash):
+    """Mixed precision: convert ops whose IR `name` is in `fp16_names` from their
+    int8 (_s8) kind to the fp16 (_f16) kind, re-store their weights as float16,
+    and mark their output + LSTM state tensors dtype f16. Everything else stays
+    int8. Mirrors the export path's per-op precision promotion, on the FX IR."""
+    for op in ops:
+        if op["name"] not in fp16_names:
+            op.setdefault("precision", "int8")
+            continue
+        op["precision"] = "fp16"
+        if op["op"].endswith("_s8"):
+            op["op"] = op["op"][:-3] + "_f16"
+        for wk in ("weight", "bias", "weight_ih", "weight_hh"):
+            key = op.get(wk)
+            if key and key in fp32_stash:
+                weights_blob[key] = fp32_stash[key].astype(np.float16)
+        outs = list(op.get("outputs", []))
+        for st in ("h", "c"):
+            s = op.get("state", {})
+            if s.get(st):
+                outs.append(s[st])
+        for t in outs:
+            if t in tensors_meta:
+                tensors_meta[t] = {**tensors_meta[t], "dtype": "f16", "quant": None}
+
+
+def _insert_casts_i8_f16(ops, tensors_meta, scales):
+    """Insert cast_i8_to_f16 / cast_f16_to_i8 ops at int8<->fp16 tensor
+    boundaries (ported from extract_graph_export._ExportWalker.insert_casts)."""
+    def consumer_dtype(op):
+        p = op.get("precision")
+        if p is None:
+            p = "fp16" if op["op"].endswith("_f16") else "int8"
+        return "f16" if p == "fp16" else "i8"
+
+    new_ops: list[dict] = []
+    cast_intermediates: dict[tuple[str, str], str] = {}
+    for op in ops:
+        dst = consumer_dtype(op)
+        for i, in_name in enumerate(op.get("inputs", [])):
+            meta = tensors_meta.get(in_name)
+            if meta is None:
+                continue
+            src = meta.get("dtype", "i8")
+            if src == dst or (src, dst) not in (("i8", "f16"), ("f16", "i8")):
+                continue
+            key = (in_name, dst)
+            cast_out = cast_intermediates.get(key)
+            if cast_out is None:
+                cast_out = f"{in_name}__cast_{dst}"
+                tensors_meta[cast_out] = {"shape": list(meta["shape"]),
+                                          "dtype": dst, "quant": None}
+                scale = scales.get(in_name, 1e-8)
+                kind = ("cast_i8_to_f16" if (src == "i8" and dst == "f16")
+                        else "cast_f16_to_i8")
+                n = 1
+                for d in meta["shape"]:
+                    n *= int(d)
+                new_ops.append({
+                    "name": cast_out, "op": kind,
+                    "precision": "fp16" if dst == "f16" else "int8",
+                    "inputs": [in_name], "outputs": [cast_out],
+                    "shape": {"n": n},
+                    "quant": {"scale": float(scale), "zero_point": 0},
+                })
+                cast_intermediates[key] = cast_out
+            op["inputs"][i] = cast_out
+        new_ops.append(op)
+    return new_ops
+
+
 def extract_int8(
     model: torch.nn.Module,
     sample_input: "torch.Tensor | list[torch.Tensor] | tuple",
@@ -531,6 +602,7 @@ def extract_int8(
     out_dir: str,
     calibration_samples: "list | None" = None,
     input_dtypes: "list[str] | None" = None,
+    fp16_op_names: "set[str] | None" = None,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -622,6 +694,9 @@ def extract_int8(
 
     tensors_meta: dict[str, dict] = {}
     weights_blob: dict[str, np.ndarray] = {}
+    # fp32 copies of weights, kept so ops promoted to fp16 (mixed precision via
+    # fp16_op_names) can re-store their weights as float16 instead of int8.
+    fp32_stash: dict[str, np.ndarray] = {}
     ops: list[dict] = []
     input_names: list[str] = []          # collected in placeholder order
     output_name: str | None = None
@@ -739,6 +814,11 @@ def extract_int8(
                 b_key = f"{node.target}.bias_q"
                 weights_blob[w_key] = w_q
                 weights_blob[b_key] = b_q
+                # fp32 copies for a possible fp16 promotion of this linear.
+                fp32_stash[w_key] = w_fp32.cpu().numpy().astype(np.float32)
+                fp32_stash[b_key] = (b_fp32.cpu().numpy().astype(np.float32)
+                                     if b_fp32 is not None
+                                     else np.zeros((mod.out_features,), np.float32))
                 # Requantize: real_mult = s_in * s_w / s_out
                 real_mult = (in_scale * w_scale) / out_scale
                 multiplier, shift = _requantize_multiplier_shift(real_mult)
@@ -1113,6 +1193,12 @@ def extract_int8(
                     weights_blob[whh_name] = _quantize_per_tensor_sym(
                         whh, s_whh).reshape(4 * H, H).astype(np.int8)
                     weights_blob[bias_name] = bias.numpy().astype(np.float32)
+                    # fp32 copies for a possible fp16 promotion of this layer.
+                    fp32_stash[wih_name] = wih.cpu().numpy().reshape(
+                        4 * H, in_l).astype(np.float32)
+                    fp32_stash[whh_name] = whh.cpu().numpy().reshape(
+                        4 * H, H).astype(np.float32)
+                    fp32_stash[bias_name] = bias.numpy().astype(np.float32)
                     h_name = f"{prefix}_h_l{lyr}"
                     c_name = f"{prefix}_c_l{lyr}"
                     out_name = final_name if lyr == L - 1 else f"{prefix}_out_l{lyr}"
@@ -1348,6 +1434,13 @@ def extract_int8(
 
     if not input_names or output_name is None:
         raise RuntimeError("int8 extract: graph missing input/output")
+
+    # Mixed precision: promote the requested ops to fp16 and materialize the
+    # int8<->fp16 boundary casts as explicit ops (backwards compatible — with no
+    # spec, ops/tensors are untouched and the IR is the plain all-int8 one).
+    if fp16_op_names:
+        _promote_ops_to_fp16(ops, fp16_op_names, tensors_meta, weights_blob, fp32_stash)
+        ops = _insert_casts_i8_f16(ops, tensors_meta, scales)
 
     output_tensors = (output_names_multi
                       if output_names_multi is not None
@@ -1587,14 +1680,68 @@ def extract_int8(
             h_new = (og * np.tanh(c_new).astype(np.float32)).astype(np.float32)
             hq = np.clip(np.round(h_new / s_h).astype(np.int32), -128, 127)
             activations[out_name] = hq.reshape(1, H).astype(np.int8)
+        elif op["op"] == "cast_i8_to_f16":
+            # int8 -> fp16: dequantize by the source scale.
+            activations[out_name] = (in_arr.astype(np.float32)
+                                     * np.float32(op["quant"]["scale"])).astype(np.float16)
+        elif op["op"] == "cast_f16_to_i8":
+            activations[out_name] = np.clip(np.round(
+                in_arr.astype(np.float32) / np.float32(op["quant"]["scale"])
+            ), -128, 127).astype(np.int8)
+        elif op["op"] in ("cat2_c1_f16", "cat3_c1_f16", "cat4_c1_f16"):
+            # fp16 channel concat (no requant): inputs already f16.
+            sh = op["shape"]; N_, H_, W_ = sh["N"], sh["H"], sh["W"]
+            parts = [activations[n].reshape(N_, c, H_, W_).astype(np.float16)
+                     for n, c in zip(op["inputs"], sh["C_inputs"])]
+            activations[out_name] = np.concatenate(parts, axis=1)
+        elif op["op"] == "linear_f16":
+            # fp16 storage, fp32 accumulate (matches kernel_linear_f16).
+            w = weights_blob[op["weight"]].astype(np.float32)
+            b = weights_blob[op["bias"]].astype(np.float32) if op.get("bias") else None
+            sh = op["shape"]
+            x = in_arr.reshape(sh["M"], sh["K"]).astype(np.float32)
+            y = x @ w.reshape(sh["N"], sh["K"]).T
+            if b is not None:
+                y = y + b
+            activations[out_name] = y.astype(np.float16)
+        elif op["op"] == "lstm_f16":
+            # fp16 storage + fp16 gate-GEMM accumulate (mirrors kernel_lstm_f16).
+            wih = weights_blob[op["weight_ih"]].astype(np.float16)
+            whh = weights_blob[op["weight_hh"]].astype(np.float16)
+            bias = weights_blob[op["bias"]].astype(np.float32)
+            sh = op["shape"]; in_size = int(sh["in_size"]); H = int(sh["H"])
+            x = in_arr.reshape(-1)[:in_size].astype(np.float16)
+            h = np.zeros(H, np.float16); c = np.zeros(H, np.float32)
+            out = np.zeros(H, np.float16)
+            for j in range(H):
+                pre = np.zeros(4, np.float32)
+                for g in range(4):
+                    row = g * H + j
+                    ax = np.float16(0); ah = np.float16(0)
+                    for k in range(in_size):
+                        ax = np.float16(ax + np.float16(x[k] * wih[row, k]))
+                    for k in range(H):
+                        ah = np.float16(ah + np.float16(h[k] * whh[row, k]))
+                    pre[g] = np.float32(ax) + np.float32(ah) + bias[row]
+                ig = 1.0 / (1.0 + np.exp(-pre[0])); fg = 1.0 / (1.0 + np.exp(-pre[1]))
+                cg = np.tanh(pre[2]); og = 1.0 / (1.0 + np.exp(-pre[3]))
+                c_new = np.float32(fg) * c[j] + np.float32(ig) * np.float32(cg)
+                c[j] = c_new
+                out[j] = np.float16(np.float32(og) * np.float32(np.tanh(c_new)))
+            activations[out_name] = out.reshape(1, H).astype(np.float16)
         else:
             raise NotImplementedError(
                 f"int8 simulator: unsupported op {op['op']}"
             )
 
     # Concatenate outputs in IR order (matching multi-output goldens elsewhere).
+    # Respect the surface dtype: fp16 for an fp16-promoted output (mixed
+    # precision), else int8. (Assumes surface outputs share one dtype.)
+    _out_np_dtype = (np.float16
+                     if tensors_meta.get(output_tensors[0], {}).get("dtype") == "f16"
+                     else np.int8)
     out_q = np.concatenate([
-        activations[t].reshape(-1).astype(np.int8) for t in output_tensors
+        activations[t].reshape(-1).astype(_out_np_dtype) for t in output_tensors
     ])
     # Per-input flat arrays at native dtype: input0..N (multi-input harness).
     # `input=` (== input0) kept for the single-input harness back-compat.
@@ -1662,6 +1809,7 @@ def extract(
     quant: str = "fp32",
     calibration_samples: "list[torch.Tensor] | None" = None,
     input_dtypes: "list[str] | None" = None,
+    fp16_op_names: "set[str] | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -1681,6 +1829,7 @@ def extract(
             model, sample_input, name, out_dir,
             calibration_samples=calibration_samples,
             input_dtypes=input_dtypes,
+            fp16_op_names=fp16_op_names,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -2834,6 +2983,10 @@ def main() -> None:
                          "instead of a single frame. Detection / segmentation "
                          "models need ~16 to avoid cls-logit saturation. "
                          "No-op for fp32 / fp16.")
+    ap.add_argument("--fp16-ops", default=None,
+                    help="comma-separated op names to promote to fp16 in an int8 "
+                         "extract (mixed precision). Additive to the model's "
+                         "get_precision_spec(). No-op for fp32 / fp16.")
     args = ap.parse_args()
 
     if args.model == "mlp_generic":
@@ -2905,10 +3058,24 @@ def main() -> None:
     if hasattr(model_mod, "get_input_dtypes"):
         input_dtypes = list(model_mod.get_input_dtypes())
 
+    # Mixed precision (int8 base + fp16 islands): resolve the model's
+    # get_precision_spec() to the set of op names to run fp16. Only 'fp16_ops'
+    # (explicit op names) is honored on the FX path; '--fp16-ops a,b' is additive.
+    fp16_op_names: "set[str] | None" = None
+    if args.quant == "int8":
+        _names: set[str] = set()
+        if hasattr(model_mod, "get_precision_spec"):
+            spec = model_mod.get_precision_spec() or {}
+            _names |= set(spec.get("fp16_ops", []))
+        if getattr(args, "fp16_ops", None):
+            _names |= {s.strip() for s in args.fp16_ops.split(",") if s.strip()}
+        fp16_op_names = _names or None
+
     extract(model, sample, name=args.model, out_dir=args.out_dir,
             quant=args.quant,
             calibration_samples=calibration_samples,
-            input_dtypes=input_dtypes)
+            input_dtypes=input_dtypes,
+            fp16_op_names=fp16_op_names)
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry
