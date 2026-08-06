@@ -2,8 +2,19 @@
 
 How to add a hand-written ("curated") RVV kernel for an op, verify it **bit-exact
 on the V-spike simulator**, and get it auto-selected by `generate_kernels`. Written
-up after landing curated `conv2d_s8_pc` + `linear_s8_pc` for the fused drone-nav
-model (commit c1dc2f2, branch rose-2-dev).
+up after landing curated `conv2d_s8_pc` + `linear_s8_pc` + `lstm_s8` for the pure
+per-channel-int8 fused drone-nav model (commits c1dc2f2/d179d3e/b007574, branch
+rose-2-dev). End-to-end result, all bit-exact (max_abs_err=0) on rvv_f16 V-spike:
+
+| op | reference | curated | speedup |
+|----|----------:|--------:|:-------:|
+| conv2d_s8_pc | 12.31M | 5.98M | 2.06× (OC-vectorized GEMM + pixel tiling) |
+| linear_s8_pc | 12.81M | 0.61M | 21× (unit-stride vle8/vwmul + vredsum) |
+| lstm_s8 | 6.37M | 0.83M | 7.7× (same dot on the two gate GEMVs) |
+| **whole model** | **31.52M** | **7.46M** | **4.22×** |
+
+Deploy target is **pure per-channel int8** — per-channel weight quant already gives
+~0.36% L2 vs fp32, so the int8 LSTM is deployment-grade and no fp16 tail is needed.
 
 See also: `notes/mixed_precision_plan.md`, and the project memory
 `rose-modelblaster-spike-build` / `rose-modelblaster-multiinput-lstm`.
