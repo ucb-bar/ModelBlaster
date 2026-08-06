@@ -1546,10 +1546,15 @@ def extract_int8(
                 list(si.shape)).astype(np.int8)
         elif dt == "f32":
             q = si.detach().cpu().numpy().astype(np.float32)
+        elif dt == "f16":
+            # fp16 passthrough input — feeds an fp16 island (e.g. the fused
+            # net's lowdim vector into the fp16 tail's cat) with NO cast, since
+            # a single int8 scale can't span its mixed component magnitudes.
+            q = si.detach().cpu().numpy().astype(np.float16)
         else:
             raise NotImplementedError(
                 f"int8 extract: input dtype {dt!r} for {nm} not supported "
-                "(supported: i8, f32)")
+                "(supported: i8, f32, f16)")
         inputs_q.append(q)
         activations[nm] = q
     for op in ops:
