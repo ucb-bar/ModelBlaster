@@ -3438,9 +3438,11 @@ void kernel_lstm_s8(const int8_t *x, const int8_t *w_ih, const int8_t *w_hh,
         float c_new  = fg * c_prev + ig * cg;
         float h_new  = og * tanhf(c_new);
         int32_t cq = (int32_t)roundf(c_new / s_c);
-        if (cq < -128) cq = -128; if (cq > 127) cq = 127;
+        if (cq < -128) cq = -128;
+        if (cq > 127) cq = 127;
         int32_t hq = (int32_t)roundf(h_new / s_h);
-        if (hq < -128) hq = -128; if (hq > 127) hq = 127;
+        if (hq < -128) hq = -128;
+        if (hq > 127) hq = 127;
         c[j]   = (int8_t)cq;
         out[j] = (int8_t)hq;   /* into out[] so h[] stays the previous state */
     }

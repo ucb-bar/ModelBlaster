@@ -91,6 +91,8 @@ def get_precision_spec() -> dict:
     cast_i8_to_f16 at the encoder->fuse boundary automatically.
     """
     import os
+    if os.environ.get("MB_FUSED_HYBRID", "1") == "0":
+        return {"default": "int8"}     # pure int8 (no fp16 tail) — for the all-int8 build
     tail = ["cat", "lstm_l0", "lstm_l1", "lstm_l2", "head"]
     # The int8 encoder-FC OUTPUTS (vision_fc 512, depth_fc 64) carry the ~9%
     # feature error that the LSTM amplifies; promoting these two cheap linears to
