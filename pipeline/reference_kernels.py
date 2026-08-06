@@ -377,6 +377,13 @@ def _lstm_s8_argtypes():
             ctypes.c_float, ctypes.c_float]
 
 
+def _lstm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [fp, fp, fp, fp, fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
 # ---------------------------------------------------------------------------
 # fp16 (half-precision) argtypes. ctypes has no native _Float16, so the host
 # verify path uses c_uint16 as a 16-bit opaque blob — bit-identical layout
@@ -3442,6 +3449,57 @@ void kernel_lstm_s8(const int8_t *x, const int8_t *w_ih, const int8_t *w_hh,
 """,
     extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
     argtypes_factory=_lstm_s8_argtypes,
+)
+
+
+LSTM = KernelSpec(
+    op="lstm",
+    signature=(
+        "void kernel_lstm(const float *x, const float *w_ih, "
+        "const float *w_hh, const float *bias, "
+        "float *h, float *c, float *out, int in_size, int H)"
+    ),
+    semantics=(
+        "Single-layer, single-timestep fp32 LSTM cell (PyTorch nn.LSTM gate\n"
+        "order: input, forget, cell, output). Recurrence is expressed by\n"
+        "persisting h and c in caller buffers between calls (seq-len-1 unroll).\n"
+        "  x:[in_size] w_ih:[4H,in_size] w_hh:[4H,H] bias:[4H] h:[H] c:[H] out:[H]\n"
+        "per unit j (gate row g = g*H+j):\n"
+        "  pre[g] = x.w_ih[g] + h.w_hh[g] + bias[g*H+j]\n"
+        "  i=sig(pre_i) f=sig(pre_f) g=tanh(pre_g) o=sig(pre_o)\n"
+        "  c' = f*c[j] + i*g;  out[j] = o*tanh(c')\n"
+        "then h[:] = out[:] (deferred so the w_hh GEMM sees the previous h;\n"
+        "out MUST NOT alias h)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm(const float *x, const float *w_ih, const float *w_hh,
+                 const float *bias, float *h, float *c, float *out,
+                 int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const float *wih_row = w_ih + (long)row * in_size;
+            const float *whh_row = w_hh + (long)row * H;
+            float ax = 0.0f, ah = 0.0f;
+            for (int k = 0; k < in_size; k++) ax += x[k] * wih_row[k];
+            for (int k = 0; k < H; k++)       ah += h[k] * whh_row[k];
+            pre[g] = ax + ah + bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * c[j] + ig * cg;
+        c[j]   = c_new;
+        out[j] = og * tanhf(c_new);
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_argtypes,
 )
 
 
@@ -7168,6 +7226,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
     "sigmoid": SIGMOID,
+    "lstm": LSTM,
     "linear_s8": LINEAR_S8,
     "relu_s8": RELU_S8,
     "conv2d_s8": CONV2D_S8,

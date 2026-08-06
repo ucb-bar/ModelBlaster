@@ -427,6 +427,7 @@ SUPPORTED_MODULES = (
     # YOLOv8 backbone uses SiLU activation throughout; neck uses Upsample.
     torch.nn.SiLU,
     torch.nn.Upsample,
+    torch.nn.LSTM,   # decomposed into per-layer lstm ops (fp32 + int8 paths)
 )
 
 
@@ -1758,7 +1759,11 @@ def extract(
                 )
             in_name = node.args[0].name
             out_name = node.name
-            tensors[out_name] = _tensor_meta(node)
+            # nn.LSTM returns a tuple (output, (h,c)); _tensor_meta can't read a
+            # tuple node's shape. The LSTM branch registers its own per-layer
+            # output tensors below, so skip the scalar-meta assignment here.
+            if not isinstance(mod, torch.nn.LSTM):
+                tensors[out_name] = _tensor_meta(node)
 
             if isinstance(mod, torch.nn.Linear):
                 w_key = f"{node.target}.weight"
@@ -2071,6 +2076,63 @@ def extract(
                     "shape": {"N": N_, "C": C, "IH": IH, "IW": IW,
                               "scale": sf},
                 })
+
+            elif isinstance(mod, torch.nn.LSTM):
+                # fp32 mirror of the int8 lstm_s8 decomposition: one `lstm` op
+                # per layer, chained via its output tensor, with persistent
+                # float h/c state (seq-len-1 unroll; state persists between
+                # run_model calls, BSS-zeroed => correct step-0 init).
+                if mod.bidirectional:
+                    raise NotImplementedError("fp32 LSTM: bidirectional unsupported")
+                L = int(mod.num_layers)
+                H = int(mod.hidden_size)
+                in_size0 = int(tensors[in_name]["shape"][-1])
+                gi0 = _find_getitem_consumer(node, 0)
+                gi1 = _find_getitem_consumer(node, 1)
+                final_name = gi0.name if gi0 is not None else node.name
+                if gi0 is not None:
+                    _skip_nodes.add(gi0)
+                if gi1 is not None:
+                    _skip_nodes.add(gi1)
+                prefix = node.name
+                x_name = in_name
+                for lyr in range(L):
+                    wih = getattr(mod, f"weight_ih_l{lyr}").detach()
+                    whh = getattr(mod, f"weight_hh_l{lyr}").detach()
+                    bias = torch.zeros(4 * H)
+                    bih = getattr(mod, f"bias_ih_l{lyr}", None)
+                    bhh = getattr(mod, f"bias_hh_l{lyr}", None)
+                    if bih is not None:
+                        bias = bias + bih.detach()
+                    if bhh is not None:
+                        bias = bias + bhh.detach()
+                    in_l = in_size0 if lyr == 0 else H
+                    wih_key = f"{prefix}_wih_l{lyr}"
+                    whh_key = f"{prefix}_whh_l{lyr}"
+                    bias_key = f"{prefix}_bias_l{lyr}"
+                    weights[wih_key] = wih.cpu().numpy().reshape(
+                        4 * H, in_l).astype(weight_dtype)
+                    weights[whh_key] = whh.cpu().numpy().reshape(
+                        4 * H, H).astype(weight_dtype)
+                    weights[bias_key] = bias.cpu().numpy().astype(weight_dtype)
+                    h_name = f"{prefix}_h_l{lyr}"
+                    c_name = f"{prefix}_c_l{lyr}"
+                    out_nm = final_name if lyr == L - 1 else f"{prefix}_out_l{lyr}"
+                    dt = "f16" if weight_dtype == np.float16 else "f32"
+                    for nm in (h_name, c_name, out_nm):
+                        tensors[nm] = {"shape": [1, H], "dtype": dt, "quant": None}
+                    ops.append({
+                        "name": f"{node.target}_l{lyr}",
+                        "op": "lstm" + op_suffix,
+                        "inputs": [x_name],
+                        "outputs": [out_nm],
+                        "state": {"h": h_name, "c": c_name},
+                        "weight_ih": wih_key,
+                        "weight_hh": whh_key,
+                        "bias": bias_key,
+                        "shape": {"in_size": in_l, "H": H},
+                    })
+                    x_name = out_nm
 
         elif node.op == "call_function":
             out_name = node.name
@@ -2540,11 +2602,17 @@ def extract(
                     )
                 in_names = [t.name for t in tensors_arg]
                 first_shape = list(tensors[in_names[0]]["shape"])
-                if len(first_shape) != 4:
+                # 4D NCHW channel-concat, or 2D [N,C] feature-concat (as
+                # [N,C,1,1] for the cat_c1 kernel) — the vision|depth|state fuse.
+                if len(first_shape) == 4:
+                    N_, _, H_, W_ = (int(s) for s in first_shape)
+                elif len(first_shape) == 2:
+                    N_ = int(first_shape[0]); H_ = W_ = 1
+                else:
                     raise NotImplementedError(
-                        f"cat at {node.name}: only 4D NCHW inputs supported."
+                        f"cat at {node.name}: only 2D [N,C] or 4D NCHW inputs "
+                        f"supported (got {first_shape})."
                     )
-                N_, _, H_, W_ = (int(s) for s in first_shape)
                 c_inputs = [int(tensors[n]["shape"][1]) for n in in_names]
                 op_kind = f"cat{len(in_names)}_c1"
                 if len(in_names) not in (2, 3, 4):
