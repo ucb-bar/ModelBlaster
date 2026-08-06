@@ -79,3 +79,23 @@ def get_input_dtypes():
 def get_calibration_samples(n: int):
     # Widen activation-scale calibration across a few representative inputs.
     return [_sample(100 + i) for i in range(n)]
+
+
+def get_precision_spec() -> dict:
+    """Recommended HYBRID precision map (see docs / the modelblaster memo): keep
+    the int8 encoders (vision CNN + depth conv + their FCs) on the int8/Gemmini
+    path (95% of compute, ~9% feature error), and promote the recurrent head —
+    the fuse, the 3-layer LSTM, and the output head — to fp16, since the int8
+    3-layer LSTM was the entire accuracy loss (full-int8 0.45 L2 vs 0.0029 for
+    this split) and it is only ~5% of compute. The extractor inserts
+    cast_i8_to_f16 at the encoder->fuse boundary automatically.
+    """
+    import os
+    tail = ["cat", "lstm_l0", "lstm_l1", "lstm_l2", "head"]
+    # The int8 encoder-FC OUTPUTS (vision_fc 512, depth_fc 64) carry the ~9%
+    # feature error that the LSTM amplifies; promoting these two cheap linears to
+    # fp16 (conv bulk stays int8) recovers most of it. Toggle with MB_FUSED_FP16_FC=0
+    # to A/B the conv-only-int8 split.
+    if os.environ.get("MB_FUSED_FP16_FC", "1") != "0":
+        tail = ["vision_fc", "depth_fc"] + tail
+    return {"default": "int8", "fp16_ops": tail}
