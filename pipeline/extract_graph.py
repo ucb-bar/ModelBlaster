@@ -2123,7 +2123,7 @@ def extract(
                         tensors[nm] = {"shape": [1, H], "dtype": dt, "quant": None}
                     ops.append({
                         "name": f"{node.target}_l{lyr}",
-                        "op": "lstm" + op_suffix,
+                        "op": "lstm",   # _f16 suffix added by the rename pass below
                         "inputs": [x_name],
                         "outputs": [out_nm],
                         "state": {"h": h_name, "c": c_name},
