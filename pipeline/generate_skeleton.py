@@ -1215,6 +1215,18 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['s_x'])}, {_f32(q['s_wih'])}, {_f32(q['s_whh'])}, "
                 f"{_f32(q['s_h'])}, {_f32(q['s_c'])})"
             )
+        elif op["op"] == "lstm":
+            x_ptr = ptr_for(op["inputs"][0], "in")
+            wih = _weight_name(model_name, op["weight_ih"])
+            whh = _weight_name(model_name, op["weight_hh"])
+            b = _weight_name(model_name, op["bias"])
+            h_ptr = ptr_for(op["state"]["h"], "in")
+            c_ptr = ptr_for(op["state"]["c"], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_lstm({x_ptr}, {wih}, {whh}, {b}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, {sh['in_size']}, {sh['H']})"
+            )
         elif op["op"] == "silu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
