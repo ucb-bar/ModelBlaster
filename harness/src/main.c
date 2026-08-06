@@ -44,8 +44,10 @@ int main(void)
 
     /* Single-model harness has no thread pool — pass NULL. The
      * generated kernel bodies ignore it; only the parallel-for wrapper
-     * (when emitted) would dispatch onto a real modelblaster_pool_t. */
-    run_model(model_test_input, model_output, NULL);
+     * (when emitted) would dispatch onto a real modelblaster_pool_t.
+     * model_run_test() feeds the baked test input(s) — it is arity-agnostic
+     * (1 input or N typed inputs), so this call is unchanged across models. */
+    model_run_test(model_output, NULL);
 
     /* In-binary golden compare.
      *
