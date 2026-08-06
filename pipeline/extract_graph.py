@@ -1225,12 +1225,18 @@ def extract_int8(
                     )
                 in_names = [t.name for t in tensors_arg]
                 first_shape = list(tensors_meta[in_names[0]]["shape"])
-                if len(first_shape) != 4:
+                # 4D NCHW channel-concat, or 2D [N, C] feature-concat (treated
+                # as [N, C, 1, 1] — the cat_c1 kernel is layout-agnostic once
+                # H=W=1). The 2D case is the vision/depth/state fuse -> LSTM.
+                if len(first_shape) == 4:
+                    N_, _, H_, W_ = (int(s) for s in first_shape)
+                elif len(first_shape) == 2:
+                    N_ = int(first_shape[0]); H_ = W_ = 1
+                else:
                     raise NotImplementedError(
-                        f"int8 extract: cat at {node.name}: only 4D NCHW "
-                        f"inputs supported."
+                        f"int8 extract: cat at {node.name}: only 2D [N,C] or "
+                        f"4D NCHW inputs supported (got {first_shape})."
                     )
-                N_, _, H_, W_ = (int(s) for s in first_shape)
                 c_inputs = [int(tensors_meta[n]["shape"][1]) for n in in_names]
                 n_inputs = len(in_names)
                 if n_inputs not in (2, 3, 4):
