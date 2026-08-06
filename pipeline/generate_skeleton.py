@@ -1524,6 +1524,18 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_linear_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']})"
             )
+        elif op["op"] == "lstm_f16":
+            x_ptr = ptr_for(op["inputs"][0], "in")
+            wih = _weight_name(model_name, op["weight_ih"])
+            whh = _weight_name(model_name, op["weight_hh"])
+            b = _weight_name(model_name, op["bias"])
+            h_ptr = ptr_for(op["state"]["h"], "in")
+            c_ptr = ptr_for(op["state"]["c"], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_lstm_f16({x_ptr}, {wih}, {whh}, {b}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, {sh['in_size']}, {sh['H']})"
+            )
         elif op["op"] == "depthwise_conv2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
             w = _weight_name(model_name, op["weight"])

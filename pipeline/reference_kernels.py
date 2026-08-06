@@ -7185,6 +7185,62 @@ void kernel_vint_action_post(const int8_t *dist_int8, float scale_dist,
 )
 
 
+def _lstm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)   # _Float16 opaque
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [h, h, h, h, h, h, h, ctypes.c_int, ctypes.c_int]
+
+
+LSTM_F16 = KernelSpec(
+    op="lstm_f16",
+    signature=(
+        "void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih, "
+        "const _Float16 *w_hh, const _Float16 *bias, "
+        "_Float16 *h, _Float16 *c, _Float16 *out, int in_size, int H)"
+    ),
+    semantics=(
+        "Half-precision single-layer, single-timestep LSTM cell (PyTorch gate\n"
+        "order i,f,g,o). Mirrors kernel_lstm but all tensors are _Float16 and\n"
+        "the gate-GEMM reduction ACCUMULATES IN _Float16 (storage + accumulate\n"
+        "fp16); the sigmoid/tanh/cell update are evaluated in float then stored\n"
+        "back to _Float16. h/c persist across calls (seq-len-1 unroll); out must\n"
+        "not alias h (the w_hh GEMM reads the previous h)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih, const _Float16 *w_hh,
+                     const _Float16 *bias, _Float16 *h, _Float16 *c, _Float16 *out,
+                     int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const _Float16 *wih_row = w_ih + (long)row * in_size;
+            const _Float16 *whh_row = w_hh + (long)row * H;
+            _Float16 ax = (_Float16)0.0f, ah = (_Float16)0.0f;
+            for (int k = 0; k < in_size; k++)      /* fp16 product + fp16 accumulate */
+                ax = (_Float16)(ax + (_Float16)(x[k] * wih_row[k]));
+            for (int k = 0; k < H; k++)
+                ah = (_Float16)(ah + (_Float16)(h[k] * whh_row[k]));
+            pre[g] = (float)ax + (float)ah + (float)bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * (float)c[j] + ig * cg;
+        c[j]   = (_Float16)c_new;
+        out[j] = (_Float16)(og * tanhf(c_new));
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_f16_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -7252,6 +7308,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "cast_f16_to_i8": CAST_F16_TO_I8,
     # ViNT fp16 op set.
     "linear_f16": LINEAR_F16,
+    "lstm_f16": LSTM_F16,
     "depthwise_conv2d_f16": DEPTHWISE_CONV2D_F16,
     "layer_norm_f16": LAYER_NORM_F16,
     "gelu_f16": GELU_F16,
