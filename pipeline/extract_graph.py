@@ -525,10 +525,11 @@ class _CaptureTensors(torch.fx.Interpreter):
 
 def extract_int8(
     model: torch.nn.Module,
-    sample_input: torch.Tensor,
+    sample_input: "torch.Tensor | list[torch.Tensor] | tuple",
     name: str,
     out_dir: str,
-    calibration_samples: "list[torch.Tensor] | None" = None,
+    calibration_samples: "list | None" = None,
+    input_dtypes: "list[str] | None" = None,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -552,12 +553,19 @@ def extract_int8(
     os.makedirs(out_dir, exist_ok=True)
     model = model.eval()
 
+    # Normalize to a list of input tensors (multi-input support). A model with
+    # several inputs passes a tuple/list of tensors, in placeholder order.
+    if isinstance(sample_input, (list, tuple)):
+        sample_inputs = list(sample_input)
+    else:
+        sample_inputs = [sample_input]
+
     gm = torch.fx.symbolic_trace(model)
-    ShapeProp(gm).propagate(sample_input)
+    ShapeProp(gm).propagate(*sample_inputs)
 
     # Capture every node's tensor for activation calibration.
     cap = _CaptureTensors(gm)
-    final = cap.run(sample_input)
+    final = cap.run(*sample_inputs)
     # Multi-output is fine — `final` may be a tuple. The IR builder picks up
     # the actual output names from the FX `output` node below; we don't need
     # to special-case here.
@@ -568,21 +576,38 @@ def extract_int8(
     # per-tensor max-abs to its true distribution-wide bound, which is
     # what fixes the cls-logit saturation seen with single-sample
     # calibration on detection models.
-    input_node_name = next(iter(gm.graph.nodes)).name
+    # All graph inputs, in placeholder order, paired 1:1 with the sample tensors.
+    placeholder_nodes = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    input_node_names = [n.name for n in placeholder_nodes]
+    if len(input_node_names) != len(sample_inputs):
+        raise RuntimeError(
+            f"int8 extract: model has {len(input_node_names)} inputs "
+            f"({input_node_names}) but {len(sample_inputs)} sample tensors given")
+    input_shapes = {nm: list(si.shape)
+                    for nm, si in zip(input_node_names, sample_inputs)}
+    # Per-input dtype (multi-dtype support). Default: everything int8.
+    in_dtype_list = (input_dtypes if input_dtypes is not None
+                     else ["i8"] * len(input_node_names))
+    if len(in_dtype_list) != len(input_node_names):
+        raise RuntimeError("int8 extract: input_dtypes length mismatch")
+    input_dtype_map = {nm: dt for nm, dt in zip(input_node_names, in_dtype_list)}
+
     max_abs: dict[str, float] = {}
-    max_abs[input_node_name] = float(sample_input.detach().abs().max().item())
+    for nm, si in zip(input_node_names, sample_inputs):
+        max_abs[nm] = float(si.detach().abs().max().item())
     for nname, t in cap.tensors.items():
         max_abs[nname] = float(t.detach().abs().max().item())
 
     if calibration_samples:
-        extra = [s for s in calibration_samples
-                 if s is not sample_input]
-        for i, s in enumerate(extra):
+        extra = [s for s in calibration_samples if s is not sample_input]
+        for s in extra:
+            s_list = list(s) if isinstance(s, (list, tuple)) else [s]
             cap_i = _CaptureTensors(gm)
-            cap_i.run(s)
-            cur = float(s.detach().abs().max().item())
-            if cur > max_abs[input_node_name]:
-                max_abs[input_node_name] = cur
+            cap_i.run(*s_list)
+            for nm, si in zip(input_node_names, s_list):
+                cur = float(si.detach().abs().max().item())
+                if cur > max_abs.get(nm, 0.0):
+                    max_abs[nm] = cur
             for nname, t in cap_i.tensors.items():
                 cur = float(t.detach().abs().max().item())
                 if cur > max_abs.get(nname, 0.0):
@@ -597,15 +622,15 @@ def extract_int8(
     tensors_meta: dict[str, dict] = {}
     weights_blob: dict[str, np.ndarray] = {}
     ops: list[dict] = []
-    input_name: str | None = None
+    input_names: list[str] = []          # collected in placeholder order
     output_name: str | None = None
 
     # Helper: register a tensor in the IR with its int8 scale + zero_point.
     def _record(nname: str, dtype: str = "i8") -> None:
         t = cap.tensors.get(nname)
         if t is None:
-            # Placeholder (input)
-            shape = list(sample_input.shape)
+            # Placeholder (input) — shape from the paired sample tensor.
+            shape = input_shapes.get(nname, [])
         else:
             shape = list(t.shape)
         tensors_meta[nname] = {
@@ -688,8 +713,8 @@ def extract_int8(
         if node in _skip_nodes:
             continue
         if node.op == "placeholder":
-            input_name = node.name
-            _record(node.name, dtype="i8")
+            input_names.append(node.name)
+            _record(node.name, dtype=input_dtype_map.get(node.name, "i8"))
 
         elif node.op == "call_module":
             mod = gm.get_submodule(node.target)
@@ -1031,6 +1056,89 @@ def extract_int8(
                               "scale": sf},
                 })
 
+            elif isinstance(mod, torch.nn.LSTM):
+                # Decompose an nn.LSTM(num_layers=L) into L per-layer lstm_s8
+                # ops. Seq-len-1: one timestep per run_model call; the hidden
+                # (h) and cell (c) state persist in file-static buffers between
+                # calls (BSS-zeroed => correct zero init on the first step).
+                if mod.bidirectional:
+                    raise NotImplementedError(
+                        "int8 extract: bidirectional LSTM not supported")
+                if not mod.batch_first:
+                    # input is (seq, batch, feat); we require seq=batch=1.
+                    pass
+                L = int(mod.num_layers)
+                H = int(mod.hidden_size)
+                in_shape = tensors_meta[in_name]["shape"]
+                in_size0 = int(in_shape[-1])
+                # The nn.LSTM node returns (output, (h_n, c_n)); the graph
+                # consumes them via operator.getitem. output (index 0) is the
+                # last layer's hidden sequence — its consumer's name is the
+                # surface tensor we write. Skip the getitem nodes in the walk.
+                gi0 = _find_getitem_consumer(node, 0)
+                gi1 = _find_getitem_consumer(node, 1)
+                final_name = gi0.name if gi0 is not None else node.name
+                if gi0 is not None:
+                    _skip_nodes.add(gi0)
+                if gi1 is not None:
+                    _skip_nodes.add(gi1)
+                # Uniform hidden scale: h = o*tanh(c) is bounded to (-1, 1) for
+                # every layer, so one symmetric scale fits all. Calibrate from
+                # the captured surface output when available, else 1/127. Cell
+                # can exceed (-1,1); give it 4x the range.
+                s_h = float(scales.get(final_name) or (1.0 / _INT8_RANGE))
+                s_c = 4.0 * s_h
+                prefix = node.name
+                x_name = in_name
+                s_x = float(scales[in_name])
+                for lyr in range(L):
+                    wih = getattr(mod, f"weight_ih_l{lyr}").detach()  # [4H, in]
+                    whh = getattr(mod, f"weight_hh_l{lyr}").detach()  # [4H, H]
+                    bias = torch.zeros(4 * H)
+                    bih = getattr(mod, f"bias_ih_l{lyr}", None)
+                    bhh = getattr(mod, f"bias_hh_l{lyr}", None)
+                    if bih is not None:
+                        bias = bias + bih.detach()
+                    if bhh is not None:
+                        bias = bias + bhh.detach()
+                    in_l = in_size0 if lyr == 0 else H
+                    s_wih = _scale_from_max_abs(wih)
+                    s_whh = _scale_from_max_abs(whh)
+                    wih_name = f"{prefix}_wih_l{lyr}"
+                    whh_name = f"{prefix}_whh_l{lyr}"
+                    bias_name = f"{prefix}_bias_l{lyr}"
+                    weights_blob[wih_name] = _quantize_per_tensor_sym(
+                        wih, s_wih).reshape(4 * H, in_l).astype(np.int8)
+                    weights_blob[whh_name] = _quantize_per_tensor_sym(
+                        whh, s_whh).reshape(4 * H, H).astype(np.int8)
+                    weights_blob[bias_name] = bias.numpy().astype(np.float32)
+                    h_name = f"{prefix}_h_l{lyr}"
+                    c_name = f"{prefix}_c_l{lyr}"
+                    out_name = final_name if lyr == L - 1 else f"{prefix}_out_l{lyr}"
+                    for nm, sc in ((h_name, s_h), (c_name, s_c), (out_name, s_h)):
+                        tensors_meta[nm] = {
+                            "shape": [1, H], "dtype": "i8",
+                            "quant": {"scale": sc, "zero_point": 0},
+                        }
+                        scales[nm] = sc
+                    ops.append({
+                        "name": f"{node.target}_l{lyr}",
+                        "op": "lstm_s8",
+                        "inputs": [x_name],
+                        "outputs": [out_name],
+                        "state": {"h": h_name, "c": c_name},
+                        "weight_ih": wih_name,
+                        "weight_hh": whh_name,
+                        "bias": bias_name,
+                        "shape": {"in_size": in_l, "H": H},
+                        "quant": {
+                            "s_x": s_x, "s_wih": s_wih, "s_whh": s_whh,
+                            "s_h": s_h, "s_c": s_c,
+                        },
+                    })
+                    x_name = out_name
+                    s_x = s_h
+
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported module {type(mod).__name__} "
@@ -1231,7 +1339,7 @@ def extract_int8(
         elif node.op == "get_attr":
             raise NotImplementedError(f"int8 extract: get_attr {node.name} not supported")
 
-    if input_name is None or output_name is None:
+    if not input_names or output_name is None:
         raise RuntimeError("int8 extract: graph missing input/output")
 
     output_tensors = (output_names_multi
@@ -1243,7 +1351,13 @@ def extract_int8(
         "name": name,
         "version": 1,
         "quant": "int8",
-        "input": {"tensor": input_name},
+        # Multi-input: `tensors` lists every input in placeholder order (each
+        # with its own shape/dtype/quant in the top-level `tensors` dict);
+        # `tensor` stays for single-input back-compat (None when >1).
+        "input": {
+            "tensors": input_names,
+            "tensor": input_names[0] if len(input_names) == 1 else None,
+        },
         "output": {
             "tensors": output_tensors,
             "tensor": output_tensors[0] if len(output_tensors) == 1 else None,
@@ -1253,15 +1367,25 @@ def extract_int8(
         "dispatches": dispatches,
     }
 
-    # Quantize the input once with the IR's input scale.
-    in_scale = scales[input_name]
-    inp_q = _quantize_per_tensor_sym(sample_input, in_scale).reshape(
-        list(sample_input.shape)
-    )
-
-    # Simulate the integer pipeline in Python so the golden output matches
-    # bit-exactly what the C kernel will produce. Walking the IR ops:
-    activations: dict[str, np.ndarray] = {input_name: inp_q.astype(np.int8)}
+    # Quantize each input with its own scale/dtype and seed the simulator.
+    # int8 inputs are symmetric-quantized by their scale; f32 inputs pass
+    # through (typed float in codegen). The flat, native-dtype arrays are
+    # saved to io.npz (input0..N) for the harness's baked golden input.
+    inputs_q: list[np.ndarray] = []
+    activations: dict[str, np.ndarray] = {}
+    for nm, si in zip(input_node_names, sample_inputs):
+        dt = input_dtype_map.get(nm, "i8")
+        if dt == "i8":
+            q = _quantize_per_tensor_sym(si, scales[nm]).reshape(
+                list(si.shape)).astype(np.int8)
+        elif dt == "f32":
+            q = si.detach().cpu().numpy().astype(np.float32)
+        else:
+            raise NotImplementedError(
+                f"int8 extract: input dtype {dt!r} for {nm} not supported "
+                "(supported: i8, f32)")
+        inputs_q.append(q)
+        activations[nm] = q
     for op in ops:
         in_name = op["inputs"][0]
         out_name = op["outputs"][0]
@@ -1428,6 +1552,34 @@ def extract_int8(
             c_each = sh["c_each"]
             activations[op["outputs"][0]] = in_4d[:, :c_each, :, :].astype(np.int8)
             activations[op["outputs"][1]] = in_4d[:, c_each:, :, :].astype(np.int8)
+        elif op["op"] == "lstm_s8":
+            # Mirrors kernel_lstm_s8 in float32. Seq-len-1, single timestep:
+            # h and c start at 0 (the device's BSS-zeroed state on the first
+            # run_model call), so this one-forward golden matches step 0.
+            wih = weights_blob[op["weight_ih"]].astype(np.int64)   # [4H, in]
+            whh = weights_blob[op["weight_hh"]].astype(np.int64)   # [4H, H]
+            bias = weights_blob[op["bias"]].astype(np.float32)     # [4H]
+            sh = op["shape"]; q = op["quant"]
+            in_size = int(sh["in_size"]); H = int(sh["H"])
+            x = in_arr.reshape(-1).astype(np.int64)[:in_size]
+            h = np.zeros(H, np.int64)
+            c = np.zeros(H, np.float32)
+            sx = np.float32(q["s_x"]) * np.float32(q["s_wih"])
+            sr = np.float32(q["s_h"]) * np.float32(q["s_whh"])
+            s_h = np.float32(q["s_h"]); s_c = np.float32(q["s_c"])
+            acc_x = (wih @ x)                                       # [4H] int64
+            acc_h = (whh @ h)                                       # [4H] (all zero)
+            pre = (acc_x.astype(np.float32) * sx
+                   + acc_h.astype(np.float32) * sr + bias).astype(np.float32)
+            ig = (np.float32(1.0) / (np.float32(1.0) + np.exp(-pre[0:H]))).astype(np.float32)
+            fg = (np.float32(1.0) / (np.float32(1.0) + np.exp(-pre[H:2 * H]))).astype(np.float32)
+            cg = np.tanh(pre[2 * H:3 * H]).astype(np.float32)
+            og = (np.float32(1.0) / (np.float32(1.0) + np.exp(-pre[3 * H:4 * H]))).astype(np.float32)
+            c_prev = c * s_c                                        # zero on step 0
+            c_new = (fg * c_prev + ig * cg).astype(np.float32)
+            h_new = (og * np.tanh(c_new).astype(np.float32)).astype(np.float32)
+            hq = np.clip(np.round(h_new / s_h).astype(np.int32), -128, 127)
+            activations[out_name] = hq.reshape(1, H).astype(np.int8)
         else:
             raise NotImplementedError(
                 f"int8 simulator: unsupported op {op['op']}"
@@ -1437,7 +1589,9 @@ def extract_int8(
     out_q = np.concatenate([
         activations[t].reshape(-1).astype(np.int8) for t in output_tensors
     ])
-    inp_q = inp_q.reshape(-1)
+    # Per-input flat arrays at native dtype: input0..N (multi-input harness).
+    # `input=` (== input0) kept for the single-input harness back-compat.
+    inputs_flat = {f"input{i}": q.reshape(-1) for i, q in enumerate(inputs_q)}
 
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
@@ -1446,7 +1600,7 @@ def extract_int8(
     with open(ir_path, "w") as f:
         json.dump(ir, f, indent=2)
     np.savez(weights_path, **weights_blob)
-    np.savez(io_path, input=inp_q, output=out_q)
+    np.savez(io_path, input=inputs_q[0].reshape(-1), output=out_q, **inputs_flat)
     # passes_applied.json records each fusion / fold pass that fired
     # during this IR extraction plus the IR-side op counts that
     # downstream tooling uses to answer "did my new fusion pattern
@@ -1479,7 +1633,8 @@ def extract_int8(
         json.dump(passes_log, f, indent=2)
     print(f"wrote {ir_path}")
     print(f"wrote {weights_path}  ({len(weights_blob)} tensors)")
-    print(f"wrote {io_path}  (input dtype={inp_q.dtype}, output dtype={out_q.dtype})")
+    print(f"wrote {io_path}  ({len(inputs_q)} input(s): "
+          f"{[str(q.dtype) for q in inputs_q]}, output dtype={out_q.dtype})")
     print(f"wrote {passes_path}  ("
           f"linear_relu_fuse={len(fused_linear_relu)}, "
           f"conv2d_relu_fuse={len(fused_conv2d_relu)}, "
@@ -1499,6 +1654,7 @@ def extract(
     out_dir: str,
     quant: str = "fp32",
     calibration_samples: "list[torch.Tensor] | None" = None,
+    input_dtypes: "list[str] | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -1517,6 +1673,7 @@ def extract(
         return extract_int8(
             model, sample_input, name, out_dir,
             calibration_samples=calibration_samples,
+            input_dtypes=input_dtypes,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -2580,9 +2737,9 @@ def extract(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
-                    choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64",
-                             "fused_vision", "fused_depth", "fused_full"])
+                    help="model id -> models/<id>.py (the well-known ids have "
+                         "explicit imports; any other resolves by dynamic "
+                         "import of modelblaster.models.<id>)")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2626,7 +2783,14 @@ def main() -> None:
     elif args.model == "fused_full":
         from modelblaster.models import fused_full as model_mod
     else:
-        raise SystemExit(f"unknown model {args.model}")
+        # Fall back to a dynamic import so a new models/<name>.py works without
+        # editing this dispatch chain.
+        import importlib
+        try:
+            model_mod = importlib.import_module(
+                f"modelblaster.models.{args.model}")
+        except ModuleNotFoundError:
+            raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()
     sample = model_mod.get_sample_input()
 
@@ -2661,9 +2825,16 @@ def main() -> None:
                   f"get_calibration_samples; falling back to single "
                   f"get_sample_input()", flush=True)
 
+    # Optional per-input dtype declaration for multi-input / multi-dtype models
+    # (list of "i8"/"f32" in placeholder order). Defaults to all-int8.
+    input_dtypes = None
+    if hasattr(model_mod, "get_input_dtypes"):
+        input_dtypes = list(model_mod.get_input_dtypes())
+
     extract(model, sample, name=args.model, out_dir=args.out_dir,
             quant=args.quant,
-            calibration_samples=calibration_samples)
+            calibration_samples=calibration_samples,
+            input_dtypes=input_dtypes)
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry

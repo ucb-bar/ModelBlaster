@@ -365,6 +365,18 @@ def _sigmoid_s8_argtypes():
             ctypes.c_int, ctypes.c_int]
 
 
+def _lstm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    f32p = ctypes.POINTER(ctypes.c_float)
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H,
+    # s_x, s_wih, s_whh, s_h, s_c
+    return [i8p, i8p, i8p, f32p, i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_float, ctypes.c_float]
+
+
 # ---------------------------------------------------------------------------
 # fp16 (half-precision) argtypes. ctypes has no native _Float16, so the host
 # verify path uses c_uint16 as a 16-bit opaque blob — bit-identical layout
@@ -3352,6 +3364,84 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 16}],
     argtypes_factory=_sigmoid_s8_argtypes,
+)
+
+
+LSTM_S8 = KernelSpec(
+    op="lstm_s8",
+    signature=(
+        "void kernel_lstm_s8(const int8_t *x, const int8_t *w_ih, "
+        "const int8_t *w_hh, const float *bias, "
+        "int8_t *h, int8_t *c, int8_t *out, "
+        "int in_size, int H, "
+        "float s_x, float s_wih, float s_whh, float s_h, float s_c)"
+    ),
+    semantics=(
+        "Single-layer, single-timestep quantized LSTM cell (PyTorch nn.LSTM\n"
+        "gate order: input, forget, cell, output). Recurrence across timesteps\n"
+        "is expressed by persisting h and c in caller-owned buffers between\n"
+        "calls (seq-len-1 unroll: one call per timestep).\n"
+        "Layout (row-major):\n"
+        "  x:     int8  [in_size]           layer input (scale s_x)\n"
+        "  w_ih:  int8  [4H, in_size]       input->gates (scale s_wih)\n"
+        "  w_hh:  int8  [4H, H]             hidden->gates (scale s_whh)\n"
+        "  bias:  f32   [4H]                b_ih + b_hh (already summed)\n"
+        "  h:     int8  [H]  IN/OUT         hidden state (scale s_h)\n"
+        "  c:     int8  [H]  IN/OUT         cell state   (scale s_c)\n"
+        "  out:   int8  [H]                 new hidden (= h after update); MUST\n"
+        "                                    NOT alias h (h[k] of the PREVIOUS\n"
+        "                                    step is read for every unit).\n"
+        "Compute per unit j (gate row g uses w_[.][g*H + j]):\n"
+        "  pre[g] = (float)(x . w_ih[g]) * (s_x*s_wih)\n"
+        "         + (float)(h . w_hh[g]) * (s_h*s_whh) + bias[g*H+j]\n"
+        "  i=sigmoid(pre_i); f=sigmoid(pre_f); g=tanh(pre_g); o=sigmoid(pre_o)\n"
+        "  c' = f*(c[j]*s_c) + i*g;  h' = o*tanh(c')\n"
+        "  c[j] = sat8(round(c'/s_c));  out[j] = sat8(round(h'/s_h))\n"
+        "then h[:] = out[:] (deferred so the w_hh GEMM sees the previous h).\n"
+        "Gate GEMMs are int8xint8->int32; gate nonlinearities + cell update\n"
+        "are done in float (H is small — 128 — so this is cheap), matching the\n"
+        "'encoder GEMMs int8, LSTM gates in float' split."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm_s8(const int8_t *x, const int8_t *w_ih, const int8_t *w_hh,
+                    const float *bias, int8_t *h, int8_t *c, int8_t *out,
+                    int in_size, int H,
+                    float s_x, float s_wih, float s_whh, float s_h, float s_c) {
+    const float sx = s_x * s_wih;   /* dequant for the x . w_ih accumulator */
+    const float sr = s_h * s_whh;   /* dequant for the h . w_hh accumulator */
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const int8_t *wih_row = w_ih + (long)row * in_size;
+            const int8_t *whh_row = w_hh + (long)row * H;
+            int32_t acc_x = 0, acc_h = 0;
+            for (int k = 0; k < in_size; k++)
+                acc_x += (int32_t)x[k] * (int32_t)wih_row[k];
+            for (int k = 0; k < H; k++)
+                acc_h += (int32_t)h[k] * (int32_t)whh_row[k];
+            pre[g] = (float)acc_x * sx + (float)acc_h * sr + bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));   /* input gate  */
+        float fg = 1.0f / (1.0f + expf(-pre[1]));   /* forget gate */
+        float cg = tanhf(pre[2]);                   /* cell gate   */
+        float og = 1.0f / (1.0f + expf(-pre[3]));   /* output gate */
+        float c_prev = (float)c[j] * s_c;
+        float c_new  = fg * c_prev + ig * cg;
+        float h_new  = og * tanhf(c_new);
+        int32_t cq = (int32_t)roundf(c_new / s_c);
+        if (cq < -128) cq = -128; if (cq > 127) cq = 127;
+        int32_t hq = (int32_t)roundf(h_new / s_h);
+        if (hq < -128) hq = -128; if (hq > 127) hq = 127;
+        c[j]   = (int8_t)cq;
+        out[j] = (int8_t)hq;   /* into out[] so h[] stays the previous state */
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];   /* commit new hidden state */
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_s8_argtypes,
 )
 
 
@@ -7086,6 +7176,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "add_s8": ADD_S8,
     "batchnorm2d_s8": BATCHNORM2D_S8,
     "sigmoid_s8": SIGMOID_S8,
+    "lstm_s8": LSTM_S8,
     "relu_f16": RELU_F16,
     "sigmoid_f16": SIGMOID_F16,
     "elu_f16": ELU_F16,
