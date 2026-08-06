@@ -595,6 +595,60 @@ def _insert_casts_i8_f16(ops, tensors_meta, scales):
     return new_ops
 
 
+def _requantize_int_per_oc(acc, mult_arr, shift_arr, oc_axis):
+    """Per-output-channel requantize: apply the scalar _requantize_int with each
+    channel's own (multiplier, shift) along `oc_axis`."""
+    acc = acc.astype(np.int64)
+    out = np.empty(acc.shape, dtype=np.int32)
+    for oc in range(acc.shape[oc_axis]):
+        sl = [slice(None)] * acc.ndim
+        sl[oc_axis] = oc
+        sl = tuple(sl)
+        out[sl] = _requantize_int(acc[sl], int(mult_arr[oc]), int(shift_arr[oc]))
+    return out
+
+
+def _apply_per_channel(ops, tensors_meta, weights_blob, fp32_stash, scales,
+                       skip_names):
+    """Re-quantize conv2d_s8 / linear_s8 weights per-OUTPUT-CHANNEL (tighter than
+    one per-tensor scale) and switch the op to its _pc kind with per-oc
+    multiplier/shift arrays. Ops in `skip_names` (e.g. fp16-promoted) are left
+    alone. Mirrors extract_graph_export's per-channel path on the FX IR."""
+    for op in ops:
+        if op["name"] in skip_names or op["op"] not in ("conv2d_s8", "linear_s8"):
+            continue
+        wk = op.get("weight")
+        w_fp32 = fp32_stash.get(wk)
+        if w_fp32 is None:
+            continue
+        OF = int(w_fp32.shape[0])
+        per_oc_max = np.abs(w_fp32).reshape(OF, -1).max(axis=1)
+        w_scales = np.maximum(per_oc_max, 1e-8) / 127.0
+        w_flat = w_fp32.reshape(OF, -1)
+        w_q = np.round(w_flat / w_scales[:, None]).clip(-127, 127).astype(np.int8)
+        weights_blob[wk] = w_q.reshape(w_fp32.shape)
+        in_scale = float(scales[op["inputs"][0]])
+        out_scale = float(scales[op["outputs"][0]])
+        bk = op.get("bias")
+        if bk and bk in fp32_stash:
+            b_fp32 = fp32_stash[bk]
+            weights_blob[bk] = np.round(
+                b_fp32 / (in_scale * w_scales)).astype(np.int32)
+        mult = np.zeros(OF, np.int32); shift = np.zeros(OF, np.int32)
+        for oc in range(OF):
+            m, s = _requantize_multiplier_shift(
+                (in_scale * float(w_scales[oc])) / max(out_scale, 1e-30))
+            mult[oc] = m; shift[oc] = s
+        mk = f"{op['name']}.output_multiplier_per_oc"
+        sk = f"{op['name']}.output_shift_per_oc"
+        weights_blob[mk] = mult; weights_blob[sk] = shift
+        op["op"] = op["op"] + "_pc"
+        q = op["quant"]
+        q.pop("output_multiplier", None); q.pop("output_shift", None)
+        q["output_multiplier_per_oc_key"] = mk
+        q["output_shift_per_oc_key"] = sk
+
+
 def extract_int8(
     model: torch.nn.Module,
     sample_input: "torch.Tensor | list[torch.Tensor] | tuple",
@@ -603,6 +657,7 @@ def extract_int8(
     calibration_samples: "list | None" = None,
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
+    per_channel: bool = False,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -903,6 +958,11 @@ def extract_int8(
                 b_key = f"{node.target}.bias_q"
                 weights_blob[w_key] = w_q
                 weights_blob[b_key] = b_q
+                # fp32 copies for a possible per-channel re-quant or fp16 promotion.
+                fp32_stash[w_key] = w_fp32.cpu().numpy().astype(np.float32)
+                fp32_stash[b_key] = (b_fp32.cpu().numpy().astype(np.float32)
+                                     if b_fp32 is not None
+                                     else np.zeros((mod.out_channels,), np.float32))
                 real_mult = (in_scale * w_scale) / out_scale
                 multiplier, shift = _requantize_multiplier_shift(real_mult)
                 next_node = nodes[nodes.index(node) + 1] if nodes.index(node) + 1 < len(nodes) else None
@@ -1435,6 +1495,12 @@ def extract_int8(
     if not input_names or output_name is None:
         raise RuntimeError("int8 extract: graph missing input/output")
 
+    # Per-channel int8: tighten conv/linear weights to per-output-channel scales
+    # (skip ops about to be promoted to fp16). Backwards compatible — off by default.
+    if per_channel:
+        _apply_per_channel(ops, tensors_meta, weights_blob, fp32_stash, scales,
+                           skip_names=(fp16_op_names or set()))
+
     # Mixed precision: promote the requested ops to fp16 and materialize the
     # int8<->fp16 boundary casts as explicit ops (backwards compatible — with no
     # spec, ops/tensors are untouched and the IR is the plain all-int8 one).
@@ -1505,9 +1571,21 @@ def extract_int8(
             scaled += q["output_offset"]
             scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
             activations[out_name] = scaled.astype(np.int8)
+        elif op["op"] == "linear_s8_pc":
+            w_q = weights_blob[op["weight"]]
+            b_q = weights_blob[op["bias"]]
+            sh = op["shape"]; q = op["quant"]
+            mult = weights_blob[q["output_multiplier_per_oc_key"]]
+            shift = weights_blob[q["output_shift_per_oc_key"]]
+            in_2d = in_arr.reshape(sh["M"], sh["K"]).astype(np.int32)
+            w_2d = w_q.reshape(sh["N"], sh["K"]).astype(np.int32)
+            acc = in_2d @ w_2d.T + b_q.astype(np.int32)         # [M, N]
+            scaled = _requantize_int_per_oc(acc, mult, shift, oc_axis=1)
+            scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
+            activations[out_name] = scaled.astype(np.int8)
         elif op["op"] == "relu_s8":
             activations[out_name] = np.maximum(in_arr, 0).astype(np.int8)
-        elif op["op"] == "conv2d_s8":
+        elif op["op"] in ("conv2d_s8", "conv2d_s8_pc"):
             sh = op["shape"]
             q = op["quant"]
             w_q = weights_blob[op["weight"]].astype(np.int32)  # [OC, IC, KH, KW]
@@ -1544,8 +1622,13 @@ def extract_int8(
                                                 in_row[ow] = in_4d[n, ic, ih, iw] + q["input_offset"]
                                     w_v = w_q[oc, ic, kh, kw] + q["filter_offset"]
                                     out[n, oc, oh] += in_row * w_v
-            scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
-            scaled += q["output_offset"]
+            if op["op"] == "conv2d_s8_pc":
+                mult = weights_blob[q["output_multiplier_per_oc_key"]]
+                shift = weights_blob[q["output_shift_per_oc_key"]]
+                scaled = _requantize_int_per_oc(out, mult, shift, oc_axis=1)
+            else:
+                scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
+                scaled += q["output_offset"]
             scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
             activations[out_name] = scaled.astype(np.int8)
         elif op["op"] == "maxpool2d_s8":
@@ -1810,6 +1893,7 @@ def extract(
     calibration_samples: "list[torch.Tensor] | None" = None,
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
+    per_channel: bool = False,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -1830,6 +1914,7 @@ def extract(
             calibration_samples=calibration_samples,
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names,
+            per_channel=per_channel,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -2987,6 +3072,9 @@ def main() -> None:
                     help="comma-separated op names to promote to fp16 in an int8 "
                          "extract (mixed precision). Additive to the model's "
                          "get_precision_spec(). No-op for fp32 / fp16.")
+    ap.add_argument("--per-channel", action="store_true",
+                    help="per-output-channel int8 weight quant for conv/linear "
+                         "(tighter than per-tensor). No-op for fp32 / fp16.")
     args = ap.parse_args()
 
     if args.model == "mlp_generic":
@@ -3075,7 +3163,8 @@ def main() -> None:
             quant=args.quant,
             calibration_samples=calibration_samples,
             input_dtypes=input_dtypes,
-            fp16_op_names=fp16_op_names)
+            fp16_op_names=fp16_op_names,
+            per_channel=getattr(args, "per_channel", False))
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry
