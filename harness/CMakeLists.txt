@@ -43,13 +43,21 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(modelblaster_harness)
 
-foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h test_io.S test_input.bin test_golden.bin)
+foreach(_required model.c model.h kernels.c kernels.h weights.c weights.h buffers.c test_io.h test_io.S test_golden.bin)
     if(NOT EXISTS "${MODEL_DIR}/${_required}")
         message(FATAL_ERROR
             "MODEL_DIR='${MODEL_DIR}' is missing required file: ${_required}. "
             "Run modelblaster/pipeline/generate_skeleton.py and generate_kernels.py first.")
     endif()
 endforeach()
+# Test input blob(s): single-input models emit test_input.bin; multi-input
+# models emit test_input0.bin, test_input1.bin, ... (each .incbin'd by
+# test_io.S). Require at least one of the two forms to exist.
+if(NOT EXISTS "${MODEL_DIR}/test_input.bin" AND NOT EXISTS "${MODEL_DIR}/test_input0.bin")
+    message(FATAL_ERROR
+        "MODEL_DIR='${MODEL_DIR}' has no test_input.bin or test_input0.bin. "
+        "Run modelblaster/pipeline/generate_skeleton.py first.")
+endif()
 message(STATUS "modelblaster harness MODEL_DIR=${MODEL_DIR}  backend=${MODELBLASTER_BACKEND}")
 
 target_sources(app PRIVATE
