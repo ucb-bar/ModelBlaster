@@ -43,6 +43,17 @@ class Backend:
     spike_args: tuple[str, ...] = ()
     # Optimization guide markdown file under modelblaster/pipeline/prompts/.
     optimization_guide: str = "optimization_guide_scalar.md"
+    # Curated-kernel lineage. A backend that is a VARIANT of another (a
+    # different -march of the same ISA family) shares its hand-written kernels,
+    # which live at <global_curated_dir>/<name>/<name>_<op>_<algo>.c.
+    #
+    # Without this a new variant silently gets NOTHING: the probe finds no
+    # kernels/<variant>/ directory, every op falls back to the scalar reference
+    # implementation, and the build still succeeds. Measured when rvv_x60 was
+    # added -- DroNet came out at 195 ms against RVV's 113 ms, and the picks
+    # file said `source=reference` for all 8 ops. A number produced that way is
+    # not an RVV measurement at all, and nothing about the build says so.
+    curated_aliases: tuple[str, ...] = ()
     # How verify is performed.
     verify_method: str = VERIFY_HOST_CTYPES
     # Per-backend verify-tolerance overrides for the spike-harness end-to-
@@ -130,6 +141,9 @@ RVV_X60 = Backend(
     prj_conf_overlay="rvv.conf",
     spike_args=("--isa=rv64gcv_zicntr",),
     optimization_guide="optimization_guide_rvv.md",
+    # Same ISA family as rvv, just with VLEN pinned -- so it inherits every
+    # curated kernel in kernels/rvv/.
+    curated_aliases=("rvv",),
     verify_method=VERIFY_HOST_CTYPES,
 )
 
