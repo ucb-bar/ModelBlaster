@@ -29,15 +29,18 @@ ATEN_TO_KERNEL = {
     "addmm": "linear_s8", "mm": "matmul_s8", "bmm": "matmul_s8",
     "linear": "linear_s8", "matmul": "matmul_s8",
     "convolution": "conv2d_s8", "conv2d": "conv2d_s8",
-    "relu": "relu_s8", "gelu": "gelu", "silu": "silu_s8",
-    "sigmoid": "sigmoid_s8", "tanh": "tanh", "elu": "elu_s8",
+    "relu": "relu_s8", "gelu": "gelu_s8", "silu": "silu_s8",
+    "sigmoid": "sigmoid_s8", "tanh": "tanh",  # fp32 only; no tanh_s8 yet "elu": "elu_s8",
     "leaky_relu": "leaky_relu_s8",
     "add": "add_s8", "mul": "mul_s8", "sub": "add_s8", "div": "mul_s8",
     "cat": "cat2_c1_s8", "max_pool2d": "maxpool2d_s8",
     "avg_pool2d": "avgpool2d_s8", "mean": "avgpool2d_s8",
-    "softmax": "softmax", "_softmax": "softmax",
-    "layer_norm": "layernorm", "native_layer_norm": "layernorm",
-    "rms_norm": "rmsnorm",
+    "softmax": "softmax_s8", "_softmax": "softmax_s8",
+    "layer_norm": "layernorm_s8", "native_layer_norm": "layernorm_s8",
+    "rms_norm": "rmsnorm_s8",
+    # SmolVLA writes RMSNorm out as pow + mean + rsqrt + mul rather than
+    # calling an RMSNorm module, so the decomposed ops map to the same kernel.
+    "pow": "rmsnorm_s8", "rsqrt": "rmsnorm_s8",
     "batch_norm": "batchnorm2d_s8", "native_batch_norm": "batchnorm2d_s8",
     "embedding": "embedding",
     "lstm": "lstm_s8",
@@ -122,6 +125,10 @@ def main() -> int:
     gap = sum(c for c, _ in gaps.values())
     print(f"\ncompute nodes covered: {cov}   gaps: {gap}   "
           f"coverage of COMPUTE nodes: {100*cov/max(1, cov+gap):.1f}%")
+    print("NOTE: 'covered' means a KernelSpec exists. It does not by itself "
+          "mean the extractor can emit it -- gelu_s8 had a kernel and no "
+          "extractor branch for a while, and counted as covered while nothing "
+          "could produce it. Treat this as an upper bound.")
     print("(free/bookkeeping nodes are excluded from both sides -- counting "
           "them as gaps understates coverage badly)")
 

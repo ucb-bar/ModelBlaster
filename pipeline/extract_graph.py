@@ -436,6 +436,9 @@ SUPPORTED_MODULES = (
     torch.nn.MaxPool2d,
     torch.nn.AvgPool2d,
     torch.nn.LSTM,
+    torch.nn.LayerNorm,
+    # RMSNorm only exists in newer torch; tolerate its absence.
+    *((torch.nn.RMSNorm,) if hasattr(torch.nn, "RMSNorm") else ()),
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
@@ -1294,6 +1297,67 @@ def extract_int8(
                     },
                 })
 
+            elif isinstance(mod, torch.nn.GELU):
+                # gelu_s8 existed as a kernel with no extractor branch, so the
+                # op inventory counted it as "covered" while nothing could emit
+                # it. Kernel presence is not coverage.
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "gelu_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in":  scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128, "activation_max": 127,
+                    },
+                })
+
+            elif isinstance(mod, (torch.nn.LayerNorm,
+                                  getattr(torch.nn, "RMSNorm", torch.nn.LayerNorm))) \
+                    and type(mod).__name__ in ("LayerNorm", "RMSNorm"):
+                is_rms = type(mod).__name__ == "RMSNorm"
+                _record(node.name, dtype="i8")
+                in_shape = tensors_meta[in_name]["shape"]
+                K = int(in_shape[-1])
+                M = int(np.prod(in_shape[:-1])) if len(in_shape) > 1 else 1
+                ns = mod.normalized_shape
+                ns = (ns,) if isinstance(ns, int) else tuple(ns)
+                if len(ns) != 1 or int(ns[0]) != K:
+                    raise NotImplementedError(
+                        f"int8 extract: {type(mod).__name__} at {node.name} "
+                        f"normalizes over {ns}; only the last dimension is "
+                        f"supported")
+                base = f"{node.target}"
+                g = (mod.weight.detach().cpu().numpy().astype(np.float32)
+                     if getattr(mod, "weight", None) is not None
+                     else np.ones((K,), np.float32))
+                weights_blob[f"{base}.gamma"] = g
+                op_rec = {
+                    "name": base,
+                    "op": "rmsnorm_s8" if is_rms else "layernorm_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "weight": f"{base}.gamma",
+                    "shape": {"M": M, "K": K},
+                    "quant": {
+                        "scale_in": scales[in_name],
+                        "scale_out": scales[node.name],
+                        "eps": float(getattr(mod, "eps", 1e-5) or 1e-5),
+                        "activation_min": -128, "activation_max": 127,
+                    },
+                }
+                if not is_rms:
+                    b = (mod.bias.detach().cpu().numpy().astype(np.float32)
+                         if getattr(mod, "bias", None) is not None
+                         else np.zeros((K,), np.float32))
+                    weights_blob[f"{base}.beta"] = b
+                    op_rec["bias"] = f"{base}.beta"
+                ops.append(op_rec)
+
             elif isinstance(mod, torch.nn.LSTM):
                 # One `lstm_s8` op per layer. The recurrent state is carried in
                 # dedicated tensors that are NOT scratch: they must survive
@@ -1864,6 +1928,40 @@ def extract_int8(
             v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "gelu_s8":
+            q = op["quant"]
+            import math as _math
+            # float32 with the kernel's own constant, not float64 with a more
+            # accurate 1/sqrt(2): the golden must reproduce what the device
+            # computes, including its constant.
+            kInvSqrt2 = np.float32(0.70710678118)
+            x = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            erf = np.vectorize(_math.erf, otypes=[np.float32])
+            y = np.float32(0.5) * x * (np.float32(1.0) + erf(x * kInvSqrt2))
+            v = _round_half_away(y.astype(np.float64)
+                                 / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] in ("layernorm_s8", "rmsnorm_s8"):
+            sh = op["shape"]; q = op["quant"]
+            M, K = sh["M"], sh["K"]
+            x = in_arr.reshape(M, K).astype(np.float64) * float(q["scale_in"])
+            g = weights_blob[op["weight"]].astype(np.float64)
+            eps = float(q["eps"])
+            if op["op"] == "rmsnorm_s8":
+                # RMSNorm does NOT subtract the mean; conflating it with a
+                # bias-free LayerNorm is silent and wrong for rows with DC.
+                inv = 1.0 / np.sqrt((x * x).mean(axis=1, keepdims=True) + eps)
+                y = x * inv * g
+            else:
+                mu = x.mean(axis=1, keepdims=True)
+                var = ((x - mu) ** 2).mean(axis=1, keepdims=True)  # biased, as torch
+                y = (x - mu) / np.sqrt(var + eps) * g
+                if op.get("bias"):
+                    y = y + weights_blob[op["bias"]].astype(np.float64)
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
         elif op["op"] == "lstm_s8":
             sh = op["shape"]; q = op["quant"]
             H = sh["hidden_size"]; IS = sh["input_size"]
@@ -3122,7 +3220,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend", "lstm_tiny", "vitfly_lstm"])
+                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend", "lstm_tiny", "vitfly_lstm", "norm_block"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -3165,6 +3263,8 @@ def main() -> None:
         from modelblaster.models import lstm_tiny as model_mod
     elif args.model == "vitfly_lstm":
         from modelblaster.models import vitfly_lstm as model_mod
+    elif args.model == "norm_block":
+        from modelblaster.models import norm_block as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()

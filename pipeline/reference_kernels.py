@@ -6009,6 +6009,22 @@ def _leaky_relu_s8_argtypes():
             ctypes.c_float]
 
 
+def _layernorm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8); f32p = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, beta, output, M, K, scale_in, scale_out, eps, amin, amax
+    return ([i8p, f32p, f32p, i8p] + [ctypes.c_int]*2
+            + [ctypes.c_float]*3 + [ctypes.c_int]*2)
+
+
+def _rmsnorm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8); f32p = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, output, M, K, scale_in, scale_out, eps, amin, amax
+    return ([i8p, f32p, i8p] + [ctypes.c_int]*2
+            + [ctypes.c_float]*3 + [ctypes.c_int]*2)
+
+
 def _lstm_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -8550,6 +8566,123 @@ void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
 
 
 
+LAYERNORM_S8 = KernelSpec(
+    op="layernorm_s8",
+    signature=(
+        "void kernel_layernorm_s8(const int8_t *input, const float *gamma, "
+        "const float *beta, int8_t *output, int M, int K, "
+        "float scale_in, float scale_out, float eps, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized LayerNorm over the last dimension of an [M, K] int8 tensor,\n"
+        "symmetric per-tensor quantization (zero_point = 0).\n"
+        "  mu    = mean(x_row)\n"
+        "  var   = mean((x_row - mu)^2)          (biased, 1/K, as PyTorch)\n"
+        "  y     = (x - mu) / sqrt(var + eps) * gamma + beta\n"
+        "  out   = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "\n"
+        "gamma and beta stay float32 rather than being quantized: they are K\n"
+        "values against K*M activations, so the memory is irrelevant, and\n"
+        "quantizing an affine applied AFTER normalisation costs accuracy for\n"
+        "nothing. batchnorm2d_s8 takes its scale/bias the same way.\n"
+        "\n"
+        "The variance is biased (divide by K, not K-1) because that is what\n"
+        "torch.nn.LayerNorm does. Using the unbiased form is a silent accuracy\n"
+        "bug that grows as K shrinks."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_layernorm_s8(const int8_t *input, const float *gamma,
+                         const float *beta, int8_t *output,
+                         int M, int K, float scale_in, float scale_out,
+                         float eps, int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row = input + (size_t)m * (size_t)K;
+        double mu = 0.0;
+        for (int k = 0; k < K; k++) mu += (double)row[k] * (double)scale_in;
+        mu /= (double)K;
+        double var = 0.0;
+        for (int k = 0; k < K; k++) {
+            const double d = (double)row[k] * (double)scale_in - mu;
+            var += d * d;
+        }
+        var /= (double)K;
+        const double inv = 1.0 / sqrt(var + (double)eps);
+        for (int k = 0; k < K; k++) {
+            const double xn = ((double)row[k] * (double)scale_in - mu) * inv;
+            double y = xn * (double)(gamma ? gamma[k] : 1.0f);
+            if (beta) y += (double)beta[k];
+            int32_t v = (int32_t)round(y / (double)scale_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[(size_t)m * (size_t)K + k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 1, "K": 64}, {"M": 4, "K": 128}],
+    argtypes_factory=_layernorm_s8_argtypes,
+)
+
+
+RMSNORM_S8 = KernelSpec(
+    op="rmsnorm_s8",
+    signature=(
+        "void kernel_rmsnorm_s8(const int8_t *input, const float *gamma, "
+        "int8_t *output, int M, int K, "
+        "float scale_in, float scale_out, float eps, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized RMSNorm over the last dimension of an [M, K] int8 tensor.\n"
+        "  rms = sqrt(mean(x_row^2) + eps)\n"
+        "  y   = x / rms * gamma\n"
+        "  out = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "\n"
+        "NOT LayerNorm without beta: RMSNorm does not subtract the mean at all,\n"
+        "so a row with a large DC component normalises differently. The two are\n"
+        "easy to conflate and the difference is silent.\n"
+        "\n"
+        "This is what SmolVLA's `pow` + `rsqrt` pairs decompose to -- 173 of its\n"
+        "477 uncovered compute nodes are this one operation written out."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_rmsnorm_s8(const int8_t *input, const float *gamma,
+                       int8_t *output, int M, int K,
+                       float scale_in, float scale_out, float eps,
+                       int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row = input + (size_t)m * (size_t)K;
+        double ms = 0.0;
+        for (int k = 0; k < K; k++) {
+            const double x = (double)row[k] * (double)scale_in;
+            ms += x * x;
+        }
+        ms /= (double)K;
+        const double inv = 1.0 / sqrt(ms + (double)eps);
+        for (int k = 0; k < K; k++) {
+            const double x = (double)row[k] * (double)scale_in;
+            double y = x * inv * (double)(gamma ? gamma[k] : 1.0f);
+            int32_t v = (int32_t)round(y / (double)scale_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[(size_t)m * (size_t)K + k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 1, "K": 64}, {"M": 4, "K": 128}],
+    argtypes_factory=_rmsnorm_s8_argtypes,
+)
+
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -8644,6 +8777,8 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "leaky_relu_s8": LEAKY_RELU_S8,
     "avgpool2d_s8": AVGPOOL2D_S8,
     "lstm_s8": LSTM_S8,
+    "layernorm_s8": LAYERNORM_S8,
+    "rmsnorm_s8": RMSNORM_S8,
     # Phase 1d pair-fused linear+elu. Eliminates the intermediate-tensor
     # write/read between consecutive linear_s8 + elu_s8 ops (the mlp_control
     # chain has three such pairs). LLM-codegen seeds describe rvv_opu
