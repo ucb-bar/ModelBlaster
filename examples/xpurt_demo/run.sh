@@ -145,7 +145,19 @@ for idx in "${!MODEL_LIST[@]}"; do
             # run are wasted work here. Force RUNNER=spike so we don't
             # accidentally fire up FireSim N times (one per model x
             # backend) while xpurt_demo itself is targeting firesim.
+            # GLOBAL_CURATED_DIR must be forwarded here -- without it,
+            # generate_kernels.py's reference-backend curated-swap block
+            # (gated on `if global_curated_dir is not None`) never fires,
+            # so every op silently falls back to spec.reference_impl
+            # (generic scalar C) instead of the fast, verified-correct
+            # curated kernel (e.g. conv2d_s8's rvv_vsmul_vnclip on RVV).
+            # Confirmed root cause of a ~14-16x cycle-count blowup AND a
+            # wrong-output regression (max_abs_err=51) on dronet in the
+            # combined binary -- reference_impl is both far slower
+            # (no RVV vectorization) and not bit-exact for this op,
+            # while the curated kernel is verified bit-exact standalone.
             TARGET="${bs}" QUANT="${m_quant}" RUNNER=spike \
+                GLOBAL_CURATED_DIR="${GLOBAL_CURATED_DIR:-${REPO_ROOT}/kernels}" \
                 bash "${REPO_ROOT}/examples/${m}/run.sh" >/dev/null
         fi
     done
@@ -335,11 +347,31 @@ print(' '.join(out))
     if [[ -n "${XPURT_SAVE_OUTPUT:-}" ]]; then
         SPIKE_FLAGS+=("--save-output" "${XPURT_SAVE_OUTPUT}")
     fi
+    # Per-model golden lookup for mixed-quant builds (QUANTS=fp32,int8,int8
+    # etc.) -- without this, every model's golden was looked up under the
+    # single blanket ${QUANT} (defaulting to fp32), so any model actually
+    # built at a different quant than the first one in MODELS failed
+    # verification with "golden not found" even though it ran correctly.
+    # spike_runner.py already supports --io-paths (net=path,...); the
+    # firesim branch below builds the equivalent --quants flag, this
+    # branch just never did. Falls back to the single --io/--quant path
+    # when QUANTS isn't set (single-quant builds), matching prior behavior.
+    _spike_io_flags=()
+    if [[ -n "${QUANTS:-}" ]]; then
+        _io_paths=""
+        for idx in "${!MODEL_LIST[@]}"; do
+            m="${MODEL_LIST[$idx]}"
+            m_quant="${QUANT_LIST[$idx]}"
+            _io_paths+="${_io_paths:+,}${m}=${REPO_ROOT}/examples/${m}/${m_quant}/generated/io.npz"
+        done
+        _spike_io_flags+=("--io-paths" "${_io_paths}")
+    fi
     python -m modelblaster.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
-        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT}/generated/io.npz" \
+        --io  "${REPO_ROOT}/examples/${MODEL_LIST[0]}/${QUANT_LIST[0]}/generated/io.npz" \
         --models "${MODELS}" \
         --quant "${QUANT}" \
+        "${_spike_io_flags[@]}" \
         --timeout "${SPIKE_TIMEOUT:-900}" \
         "${SPIKE_FLAGS[@]}"
 else
