@@ -685,27 +685,79 @@ def _shape_str(op: dict) -> str:
 
 def emit_model(ir: dict[str, Any], out_dir: str,
                backend: Optional[str] = None) -> None:
-    in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
         list(out_field["tensors"]) if out_field.get("tensors") else [out_field["tensor"]]
     )
     tensors = ir["tensors"]
-    in_c_type = _dtype_to_c(tensors[in_tensor]["dtype"])
-    # Build input offset map: {tensor_name: flat_offset_in_packed_input_buffer}.
-    # Single-input models have no "packed_inputs" key — offset is always 0.
-    if "packed_inputs" in ir["input"]:
-        input_offsets: dict[str, int] = {
-            p["name"]: p["offset"] for p in ir["input"]["packed_inputs"]
-        }
-        in_size = sum(p["size"] for p in ir["input"]["packed_inputs"])
+
+    # --- Input surface(s) ---------------------------------------------------
+    # Three input schemas are supported:
+    #   * single input                             -> one arg `input`
+    #   * fp32/export multi-input ("packed_inputs") -> one arg `input` + offsets
+    #     (all inputs share one buffer at one dtype)
+    #   * int8 multi-input ("input.tensors", N>1)   -> N SEPARATE typed args
+    #     input0..N-1, each with its own C dtype (multi-dtype supported)
+    # Single-input and packed paths are byte-for-byte unchanged.
+    _in_list = ir["input"].get("tensors") or (
+        [ir["input"]["tensor"]] if ir["input"].get("tensor") else [])
+    _packed = "packed_inputs" in ir["input"]
+    multi_typed = (len(_in_list) > 1) and not _packed
+    in_tensor = ir["input"].get("tensor") or _in_list[0]  # never None below
+
+    input_offsets: dict[str, int] = {}
+    input_arg_of: dict[str, str] = {}   # tensor -> run_model arg name (multi path)
+    in_infos: list[dict] = []           # per-input {name,i,c_type,arg,typedef,size}
+    if multi_typed:
+        for i, nm in enumerate(_in_list):
+            ct = _dtype_to_c(tensors[nm]["dtype"])
+            in_infos.append({
+                "name": nm, "i": i, "c_type": ct,
+                "arg": f"input{i}",
+                "typedef": f"model_{_mid(ir['name'])}_input{i}_t",
+                "size": _prod(tensors[nm]["shape"]),
+            })
+            input_arg_of[nm] = f"input{i}"
+        input_names_set = set(input_arg_of.keys())
+        in_c_type = in_infos[0]["c_type"]        # nominal (unused in signature)
+        in_size = sum(x["size"] for x in in_infos)
     else:
-        input_offsets = {in_tensor: 0}
-        in_size = _prod(tensors[in_tensor]["shape"])
-    input_names_set = set(input_offsets.keys())
+        in_c_type = _dtype_to_c(tensors[in_tensor]["dtype"])
+        if _packed:
+            input_offsets = {p["name"]: p["offset"]
+                             for p in ir["input"]["packed_inputs"]}
+            in_size = sum(p["size"] for p in ir["input"]["packed_inputs"])
+        else:
+            input_offsets = {in_tensor: 0}
+            in_size = _prod(tensors[in_tensor]["shape"])
+        input_names_set = set(input_offsets.keys())
     model_name = ir["name"]
     mid = _mid(model_name)
     umid = _umid(model_name)
+
+    # Codegen fragments for the input surface (single vs N-typed). Longest arg
+    # names first so token-rewrites don't clip a prefix (input1 vs input10).
+    if multi_typed:
+        _in_sorted = sorted(in_infos, key=lambda x: -len(x["arg"]))
+        input_typedef_block = "\n".join(
+            f"typedef {x['c_type']} {x['typedef']};" for x in in_infos)
+        input_sig_params = "".join(
+            f"const {x['typedef']} *{x['arg']},\n                     "
+            for x in in_infos)
+        input_state_fields = "\n".join(
+            f"    const {x['typedef']} *{x['arg']};" for x in in_infos)
+        input_state_init = ", ".join(f".{x['arg']} = {x['arg']}" for x in in_infos)
+        input_unmangled_typedefs = "\n".join(
+            f"typedef model_{mid}_input{x['i']}_t model_input{x['i']}_t;"
+            for x in in_infos)
+    else:
+        _in_sorted = []
+        input_typedef_block = f"typedef {in_c_type}  model_{mid}_input_t;"
+        input_sig_params = f"const model_{mid}_input_t *input,\n                     "
+        input_state_fields = f"    const model_{mid}_input_t *input;"
+        input_state_init = ".input = input"
+        input_unmangled_typedefs = f"typedef model_{mid}_input_t   model_input_t;"
+
     # All outputs must share a dtype (we concatenate into one output buffer).
     # If the IR has mixed-dtype surface outputs, the extract pass should
     # have inserted casts so every surface tensor lands at one dtype —
@@ -784,7 +836,7 @@ def emit_model(ir: dict[str, Any], out_dir: str,
 #define MODEL_{umid}_QUANT        "{ir.get("quant", "fp32")}"
 
 /* Mangled I/O scalar types. */
-typedef {in_c_type}  model_{mid}_input_t;
+{input_typedef_block}
 typedef {out_c_type} model_{mid}_output_t;
 
 #ifdef __cplusplus
@@ -807,8 +859,7 @@ typedef struct {{
  * header doesn't pull in modelblaster_pool.h — single-model harness uses
  * NULL). Sequential kernel bodies ignore it; the parallel-for wrapper
  * (emitted by a later pipeline stage) casts and dispatches onto it. */
-void run_model_{mid}(const model_{mid}_input_t *input,
-                     model_{mid}_output_t *output,
+void run_model_{mid}({input_sig_params}model_{mid}_output_t *output,
                      void *pool);
 
 /* Per-dispatch state passed to dispatch_<mid>_<id>() invocations.
@@ -817,7 +868,7 @@ void run_model_{mid}(const model_{mid}_input_t *input,
  * dispatch table. Intermediate buffers are file-static (see model.c)
  * and outlive any individual dispatch call. */
 typedef struct {{
-    const model_{mid}_input_t *input;
+{input_state_fields}
     model_{mid}_output_t      *output;
     void                       *pool;
 }} model_{mid}_state_t;
@@ -866,7 +917,7 @@ unsigned long model_{mid}_wall_cycles(void);
 #define MODEL_OUTPUT_SIZE     MODEL_{umid}_OUTPUT_SIZE
 #define MODEL_OP_COUNT        MODEL_{umid}_OP_COUNT
 #define MODEL_QUANT           MODEL_{umid}_QUANT
-typedef model_{mid}_input_t   model_input_t;
+{input_unmangled_typedefs}
 typedef model_{mid}_output_t  model_output_t;
 typedef model_{mid}_op_record_t model_op_record_t;
 #define run_model             run_model_{mid}
@@ -906,6 +957,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             base, off = offset_aliases[tensor]
             base_ptr = ptr_for(base, role)
             return base_ptr if off == 0 else f"({base_ptr} + {off})"
+        if tensor in input_arg_of:            # N-typed multi-input path
+            return input_arg_of[tensor]
         if tensor in input_offsets:
             off = input_offsets[tensor]
             return "input" if off == 0 else f"(input + {off})"
@@ -1390,6 +1443,34 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "lstm_s8":
+            x_ptr = ptr_for(op["inputs"][0], "in")
+            wih = _weight_name(model_name, op["weight_ih"])
+            whh = _weight_name(model_name, op["weight_hh"])
+            b = _weight_name(model_name, op["bias"])
+            h_ptr = ptr_for(op["state"]["h"], "in")
+            c_ptr = ptr_for(op["state"]["c"], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_lstm_s8({x_ptr}, {wih}, {whh}, {b}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, "
+                f"{sh['in_size']}, {sh['H']}, "
+                f"{_f32(q['s_x'])}, {_f32(q['s_wih'])}, {_f32(q['s_whh'])}, "
+                f"{_f32(q['s_h'])}, {_f32(q['s_c'])})"
+            )
+        elif op["op"] == "lstm":
+            x_ptr = ptr_for(op["inputs"][0], "in")
+            wih = _weight_name(model_name, op["weight_ih"])
+            whh = _weight_name(model_name, op["weight_hh"])
+            b = _weight_name(model_name, op["bias"])
+            h_ptr = ptr_for(op["state"]["h"], "in")
+            c_ptr = ptr_for(op["state"]["c"], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_lstm({x_ptr}, {wih}, {whh}, {b}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, {sh['in_size']}, {sh['H']})"
+            )
         elif op["op"] == "silu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
@@ -1688,6 +1769,18 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_linear_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']})"
             )
+        elif op["op"] == "lstm_f16":
+            x_ptr = ptr_for(op["inputs"][0], "in")
+            wih = _weight_name(model_name, op["weight_ih"])
+            whh = _weight_name(model_name, op["weight_hh"])
+            b = _weight_name(model_name, op["bias"])
+            h_ptr = ptr_for(op["state"]["h"], "in")
+            c_ptr = ptr_for(op["state"]["c"], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_lstm_f16({x_ptr}, {wih}, {whh}, {b}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, {sh['in_size']}, {sh['H']})"
+            )
         elif op["op"] == "depthwise_conv2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
             w = _weight_name(model_name, op["weight"], backend)
@@ -1828,10 +1921,22 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # Rewrite "input"/"output" pointer references so they read from
         # the model_<mid>_state_t the dispatch fn is invoked with. Buffer
         # references (buf_<...>) stay as-is — those are file-static.
-        per_disp_call = (call
-                         .replace("(input + ", "(s->input + ")
-                         .replace("input,", "s->input,")
-                         .replace("input)", "s->input)")
+        per_disp_call = call
+        if multi_typed:
+            # Per-input args input0..N-1 (longest-first so input1 doesn't clip
+            # input10). Each is a distinct token, so no cross-input collision.
+            for x in _in_sorted:
+                a = x["arg"]
+                per_disp_call = (per_disp_call
+                                 .replace(f"({a} + ", f"(s->{a} + ")
+                                 .replace(f"{a},", f"s->{a},")
+                                 .replace(f"{a})", f"s->{a})"))
+        else:
+            per_disp_call = (per_disp_call
+                             .replace("(input + ", "(s->input + ")
+                             .replace("input,", "s->input,")
+                             .replace("input)", "s->input)"))
+        per_disp_call = (per_disp_call
                          .replace("output,", "s->output,")
                          .replace("output)", "s->output)")
                          .replace("(output + ", "(s->output + ")
@@ -1976,10 +2081,9 @@ void model_{mid}_set_wall_cycles(unsigned long c) {{
     wall_cycles_ = c;
 }}
 
-void run_model_{mid}(const model_{mid}_input_t *input,
-                     model_{mid}_output_t *output,
+void run_model_{mid}({input_sig_params}model_{mid}_output_t *output,
                      void *pool) {{
-    model_{mid}_state_t s = {{ .input = input, .output = output, .pool = pool }};
+    model_{mid}_state_t s = {{ {input_state_init}, .output = output, .pool = pool }};
     n_ = 0;
     unsigned long _wall_s = (unsigned long)k_cycle_get_64();
     for (int i = 0; i < MODEL_{umid}_OP_COUNT; i++) {{
@@ -2026,103 +2130,125 @@ unsigned long model_{mid}_wall_cycles(void) {{
         f.write(buf_c)
 
 
-def emit_test_io(model_name: str, io_npz: str, out_dir: str) -> None:
+def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
     """Emit per-model test inputs + goldens.
 
     Layout:
-      test_io.h       — extern declarations + size constants. No data.
-      test_io.S       — uses .incbin to pull the raw .bin files into
-                        rodata at link time (the assembler streams them
-                        verbatim — no parsing cost).
-      test_input.bin  — raw little-endian fp32/int8 bytes from io.npz.
-      test_golden.bin — same.
+      test_io.h        — extern decls + size constants + a `model_run_test()`
+                         inline that calls run_model with the baked input(s),
+                         so the harness is agnostic to input arity.
+      test_io.S        — .incbin pulls the raw .bin files into rodata at link
+                         time (the assembler streams them verbatim).
+      test_input.bin   — single-input; OR test_input0.bin, test_input1.bin, ...
+                         for the N-typed multi-input path (each native dtype).
+      test_golden.bin  — the golden output.
 
     Why .incbin instead of `static const T arr[N] = { 0.123f, ... };`:
     the latter forces the C compiler to parse one decimal literal per
-    element. KernelBench's stock shapes are big — 33_BatchNorm at
-    16x64x256x256 = 67M floats = ~2 GB of decimal text — and cc1
-    chokes (we measured 22 GB RAM, no sign of finishing). The
-    .incbin path makes test_io effectively zero-cost at compile time
-    regardless of size.
+    element, which chokes cc1 on big tensors. .incbin is zero parse cost.
     """
+    model_name = ir["name"]
     mid = _mid(model_name)
     umid = _umid(model_name)
     data = np.load(io_npz)
-    inp = np.ascontiguousarray(data["input"].reshape(-1))
     out = np.ascontiguousarray(data["output"].reshape(-1))
-    in_c, _ = _np_to_c_dtype(inp.dtype)
     out_c, _ = _np_to_c_dtype(out.dtype)
 
-    # 1) raw binary blobs.
-    in_bin = os.path.join(out_dir, "test_input.bin")
-    out_bin = os.path.join(out_dir, "test_golden.bin")
-    inp.tofile(in_bin)
-    out.tofile(out_bin)
-
-    # 2) test_io.S — assembler with .incbin pointing at the .bin files.
-    # Use absolute paths so the assembler resolves them regardless of
-    # the build's working directory or -I search path. Symbols are
-    # .globl so the extern decls in test_io.h resolve.
-    in_sym  = f"model_{mid}_test_input"
+    # Mirror emit_model's input-surface logic so symbols/wrapper agree.
+    in_list = ir["input"].get("tensors") or (
+        [ir["input"]["tensor"]] if ir["input"].get("tensor") else [])
+    packed = "packed_inputs" in ir["input"]
+    multi_typed = (len(in_list) > 1) and not packed
     out_sym = f"model_{mid}_test_golden"
-    in_bin_abs  = os.path.abspath(in_bin)
-    out_bin_abs = os.path.abspath(out_bin)
+    out_bin_abs = os.path.abspath(os.path.join(out_dir, "test_golden.bin"))
+    out.tofile(os.path.join(out_dir, "test_golden.bin"))
+
+    # Under CONFIG_RISCV_CMODEL_LARGE the harness defines MB_BIGIO_HIGH and
+    # places .mb_bigio ABOVE .bss/.sdata (harness/bigio.ld), so the startup
+    # assembly keeps gp + kernel bss within its fixed +/-2GiB reach while the
+    # C code reaches this far io via the large model's R_RISCV_64 indirection.
+    # Default (medany) builds keep the io in .rodata -> byte-identical. Set
+    # once here since it applies to every blob emitted below (single- or
+    # multi-input).
     s_lines = [
-        f"/* @generated by modelblaster/pipeline/generate_skeleton.py */",
-        f"/* Under CONFIG_RISCV_CMODEL_LARGE the harness defines MB_BIGIO_HIGH and",
-        f"   places .mb_bigio ABOVE .bss/.sdata (harness/bigio.ld), so the startup",
-        f"   assembly keeps gp + kernel bss within its fixed +/-2GiB reach while the",
-        f"   C code reaches this far io via the large model's R_RISCV_64 indirection.",
-        f"   Default (medany) builds keep the io in .rodata -> byte-identical. */",
-        f"#ifdef MB_BIGIO_HIGH",
-        f'    .section .mb_bigio, "a", @progbits',
-        f"#else",
-        f"    .section .rodata",
-        f"#endif",
-        f"    .align 4",
-        f"    .globl  {in_sym}",
-        f"    .type   {in_sym}, @object",
-        f"{in_sym}:",
-        f'    .incbin "{in_bin_abs}"',
-        f"    .size   {in_sym}, . - {in_sym}",
-        f"",
-        f"    .align 4",
-        f"    .globl  {out_sym}",
-        f"    .type   {out_sym}, @object",
-        f"{out_sym}:",
-        f'    .incbin "{out_bin_abs}"',
-        f"    .size   {out_sym}, . - {out_sym}",
-        f"",
+        "/* @generated by modelblaster/pipeline/generate_skeleton.py */",
+        "#ifdef MB_BIGIO_HIGH",
+        '    .section .mb_bigio, "a", @progbits',
+        "#else",
+        "    .section .rodata",
+        "#endif",
+        "    .align 4",
     ]
+
+    def _s_blob(sym, bin_abs):
+        return [f"    .globl  {sym}", f"    .type   {sym}, @object",
+                f"{sym}:", f'    .incbin "{bin_abs}"',
+                f"    .size   {sym}, . - {sym}", "    .align 4", ""]
+
+    h_input_decls: list[str] = []       # extern + LEN macros (mangled)
+    h_input_aliases: list[str] = []     # unmangled aliases
+    run_test_args: list[str] = []       # args to run_model_{mid} in the wrapper
+
+    if multi_typed:
+        for i, nm in enumerate(in_list):
+            arr = np.ascontiguousarray(data[f"input{i}"].reshape(-1))
+            in_c, _ = _np_to_c_dtype(arr.dtype)
+            bin_path = os.path.join(out_dir, f"test_input{i}.bin")
+            arr.tofile(bin_path)
+            sym = f"model_{mid}_test_input{i}"
+            s_lines += _s_blob(sym, os.path.abspath(bin_path))
+            h_input_decls.append(f"#define MODEL_{umid}_TEST_INPUT{i}_LEN  {arr.size}")
+            h_input_decls.append(
+                f"extern const {in_c} {sym}[MODEL_{umid}_TEST_INPUT{i}_LEN];")
+            h_input_aliases.append(
+                f"#define MODEL_TEST_INPUT{i}_LEN MODEL_{umid}_TEST_INPUT{i}_LEN")
+            h_input_aliases.append(f"#define model_test_input{i} {sym}")
+            run_test_args.append(sym)
+    else:
+        inp = np.ascontiguousarray(data["input"].reshape(-1))
+        in_c, _ = _np_to_c_dtype(inp.dtype)
+        bin_path = os.path.join(out_dir, "test_input.bin")
+        inp.tofile(bin_path)
+        sym = f"model_{mid}_test_input"
+        s_lines += _s_blob(sym, os.path.abspath(bin_path))
+        h_input_decls.append(f"#define MODEL_{umid}_TEST_INPUT_LEN  {inp.size}")
+        h_input_decls.append(
+            f"extern const {in_c} {sym}[MODEL_{umid}_TEST_INPUT_LEN];")
+        h_input_aliases.append(f"#define MODEL_TEST_INPUT_LEN MODEL_{umid}_TEST_INPUT_LEN")
+        h_input_aliases.append(f"#define model_test_input {sym}")
+        run_test_args.append(sym)
+
+    s_lines += _s_blob(out_sym, out_bin_abs)
     with open(os.path.join(out_dir, "test_io.S"), "w") as f:
         f.write("\n".join(s_lines))
 
-    # 3) test_io.h — declarations only. Size macros stay #define so
-    # they're constant-foldable; arrays are extern.
+    # test_io.h — decls + an arity-agnostic run_model_{mid}_test() wrapper so
+    # the harness calls the model the same way whether it has 1 or N inputs.
+    run_args_c = ", ".join(run_test_args + ["out", "pool"])
     h_lines = [
-        HEADER,
-        "#pragma once",
-        "",
+        HEADER, "#pragma once", "",
         "#include <stdint.h>",
+        '#include "model.h"',
         "",
-        f"/* Mangled (always defined). */",
-        f"#define MODEL_{umid}_TEST_INPUT_LEN  {inp.size}",
+        "/* Mangled (always defined). */",
         f"#define MODEL_{umid}_TEST_OUTPUT_LEN {out.size}",
+        *h_input_decls,
         "",
-        f"/* Definitions in test_io.S (.incbin from test_input.bin /",
-        f" * test_golden.bin). Const so the linker can keep them in",
-        f" * rodata; the assembler emits them in .rodata directly. */",
-        f"extern const {in_c}  {in_sym}[MODEL_{umid}_TEST_INPUT_LEN];",
         f"extern const {out_c} {out_sym}[MODEL_{umid}_TEST_OUTPUT_LEN];",
         "",
+        "/* Arity-agnostic driver: run the model on its baked test input(s). */",
+        f"static inline void model_{mid}_run_test("
+        f"model_{mid}_output_t *out, void *pool) {{",
+        f"    run_model_{mid}({run_args_c});",
+        "}",
+        "",
         "/* Unmangled aliases for single-model use. The multi-model harness",
-        " * defines MODELBLASTER_DISABLE_UNMANGLED before including any test_io.h",
-        " * to keep names from colliding. */",
+        " * defines MODELBLASTER_DISABLE_UNMANGLED before including test_io.h. */",
         "#ifndef MODELBLASTER_DISABLE_UNMANGLED",
-        f"#define MODEL_TEST_INPUT_LEN  MODEL_{umid}_TEST_INPUT_LEN",
         f"#define MODEL_TEST_OUTPUT_LEN MODEL_{umid}_TEST_OUTPUT_LEN",
-        f"#define model_test_input      {in_sym}",
+        *h_input_aliases,
         f"#define model_test_golden     {out_sym}",
+        f"#define model_run_test        model_{mid}_run_test",
         "#endif",
         "",
     ]
@@ -2145,7 +2271,7 @@ def generate(
 
     emit_weights(model_name, weights, out_dir, backend=backend)
     emit_model(ir, out_dir, backend=backend)
-    emit_test_io(model_name, io_path, out_dir)
+    emit_test_io(ir, io_path, out_dir)
 
     files = ["weights.h", "weights.c", "model.h", "model.c",
              "buffers.c", "test_io.h"]

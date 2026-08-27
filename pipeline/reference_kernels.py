@@ -372,6 +372,25 @@ def _sigmoid_s8_argtypes():
             ctypes.c_int, ctypes.c_int]
 
 
+def _lstm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    f32p = ctypes.POINTER(ctypes.c_float)
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H,
+    # s_x, s_wih, s_whh, s_h, s_c
+    return [i8p, i8p, i8p, f32p, i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_float, ctypes.c_float]
+
+
+def _lstm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [fp, fp, fp, fp, fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
 # ---------------------------------------------------------------------------
 # fp16 (half-precision) argtypes. ctypes has no native _Float16, so the host
 # verify path uses c_uint16 as a 16-bit opaque blob — bit-identical layout
@@ -3464,6 +3483,137 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
 )
 
 
+LSTM_S8 = KernelSpec(
+    op="lstm_s8",
+    signature=(
+        "void kernel_lstm_s8(const int8_t *x, const int8_t *w_ih, "
+        "const int8_t *w_hh, const float *bias, "
+        "int8_t *h, int8_t *c, int8_t *out, "
+        "int in_size, int H, "
+        "float s_x, float s_wih, float s_whh, float s_h, float s_c)"
+    ),
+    semantics=(
+        "Single-layer, single-timestep quantized LSTM cell (PyTorch nn.LSTM\n"
+        "gate order: input, forget, cell, output). Recurrence across timesteps\n"
+        "is expressed by persisting h and c in caller-owned buffers between\n"
+        "calls (seq-len-1 unroll: one call per timestep).\n"
+        "Layout (row-major):\n"
+        "  x:     int8  [in_size]           layer input (scale s_x)\n"
+        "  w_ih:  int8  [4H, in_size]       input->gates (scale s_wih)\n"
+        "  w_hh:  int8  [4H, H]             hidden->gates (scale s_whh)\n"
+        "  bias:  f32   [4H]                b_ih + b_hh (already summed)\n"
+        "  h:     int8  [H]  IN/OUT         hidden state (scale s_h)\n"
+        "  c:     int8  [H]  IN/OUT         cell state   (scale s_c)\n"
+        "  out:   int8  [H]                 new hidden (= h after update); MUST\n"
+        "                                    NOT alias h (h[k] of the PREVIOUS\n"
+        "                                    step is read for every unit).\n"
+        "Compute per unit j (gate row g uses w_[.][g*H + j]):\n"
+        "  pre[g] = (float)(x . w_ih[g]) * (s_x*s_wih)\n"
+        "         + (float)(h . w_hh[g]) * (s_h*s_whh) + bias[g*H+j]\n"
+        "  i=sigmoid(pre_i); f=sigmoid(pre_f); g=tanh(pre_g); o=sigmoid(pre_o)\n"
+        "  c' = f*(c[j]*s_c) + i*g;  h' = o*tanh(c')\n"
+        "  c[j] = sat8(round(c'/s_c));  out[j] = sat8(round(h'/s_h))\n"
+        "then h[:] = out[:] (deferred so the w_hh GEMM sees the previous h).\n"
+        "Gate GEMMs are int8xint8->int32; gate nonlinearities + cell update\n"
+        "are done in float (H is small — 128 — so this is cheap), matching the\n"
+        "'encoder GEMMs int8, LSTM gates in float' split."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm_s8(const int8_t *x, const int8_t *w_ih, const int8_t *w_hh,
+                    const float *bias, int8_t *h, int8_t *c, int8_t *out,
+                    int in_size, int H,
+                    float s_x, float s_wih, float s_whh, float s_h, float s_c) {
+    const float sx = s_x * s_wih;   /* dequant for the x . w_ih accumulator */
+    const float sr = s_h * s_whh;   /* dequant for the h . w_hh accumulator */
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const int8_t *wih_row = w_ih + (long)row * in_size;
+            const int8_t *whh_row = w_hh + (long)row * H;
+            int32_t acc_x = 0, acc_h = 0;
+            for (int k = 0; k < in_size; k++)
+                acc_x += (int32_t)x[k] * (int32_t)wih_row[k];
+            for (int k = 0; k < H; k++)
+                acc_h += (int32_t)h[k] * (int32_t)whh_row[k];
+            pre[g] = (float)acc_x * sx + (float)acc_h * sr + bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));   /* input gate  */
+        float fg = 1.0f / (1.0f + expf(-pre[1]));   /* forget gate */
+        float cg = tanhf(pre[2]);                   /* cell gate   */
+        float og = 1.0f / (1.0f + expf(-pre[3]));   /* output gate */
+        float c_prev = (float)c[j] * s_c;
+        float c_new  = fg * c_prev + ig * cg;
+        float h_new  = og * tanhf(c_new);
+        int32_t cq = (int32_t)roundf(c_new / s_c);
+        if (cq < -128) cq = -128;
+        if (cq > 127) cq = 127;
+        int32_t hq = (int32_t)roundf(h_new / s_h);
+        if (hq < -128) hq = -128;
+        if (hq > 127) hq = 127;
+        c[j]   = (int8_t)cq;
+        out[j] = (int8_t)hq;   /* into out[] so h[] stays the previous state */
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];   /* commit new hidden state */
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_s8_argtypes,
+)
+
+
+LSTM = KernelSpec(
+    op="lstm",
+    signature=(
+        "void kernel_lstm(const float *x, const float *w_ih, "
+        "const float *w_hh, const float *bias, "
+        "float *h, float *c, float *out, int in_size, int H)"
+    ),
+    semantics=(
+        "Single-layer, single-timestep fp32 LSTM cell (PyTorch nn.LSTM gate\n"
+        "order: input, forget, cell, output). Recurrence is expressed by\n"
+        "persisting h and c in caller buffers between calls (seq-len-1 unroll).\n"
+        "  x:[in_size] w_ih:[4H,in_size] w_hh:[4H,H] bias:[4H] h:[H] c:[H] out:[H]\n"
+        "per unit j (gate row g = g*H+j):\n"
+        "  pre[g] = x.w_ih[g] + h.w_hh[g] + bias[g*H+j]\n"
+        "  i=sig(pre_i) f=sig(pre_f) g=tanh(pre_g) o=sig(pre_o)\n"
+        "  c' = f*c[j] + i*g;  out[j] = o*tanh(c')\n"
+        "then h[:] = out[:] (deferred so the w_hh GEMM sees the previous h;\n"
+        "out MUST NOT alias h)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm(const float *x, const float *w_ih, const float *w_hh,
+                 const float *bias, float *h, float *c, float *out,
+                 int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const float *wih_row = w_ih + (long)row * in_size;
+            const float *whh_row = w_hh + (long)row * H;
+            float ax = 0.0f, ah = 0.0f;
+            for (int k = 0; k < in_size; k++) ax += x[k] * wih_row[k];
+            for (int k = 0; k < H; k++)       ah += h[k] * whh_row[k];
+            pre[g] = ax + ah + bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * c[j] + ig * cg;
+        c[j]   = c_new;
+        out[j] = og * tanhf(c_new);
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_argtypes,
+)
+
+
 CONV2D_DW = KernelSpec(
     op="conv2d_dw",
     signature=(
@@ -4831,6 +4981,52 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
     ],
     argtypes_factory=_linear_f16_argtypes,
     algorithms=[
+        AlgorithmCandidate(
+            name="narrow",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh fp16 linear with PURE-fp16 accumulation (no fp32). "
+                "Identical to 'widening' but the K-reduction uses vfmacc_vv_f16 "
+                "(fp16 multiply-accumulate) + vfredusum_vs_f16, keeping the whole "
+                "vector datapath at SEW=16 — NO vfwmacc / fp32 accumulator. This is "
+                "the DEFAULT for rvv_f16 because it runs on BOTH full-zvfh AND a "
+                "reduced fp16-only vector unit (the FPGA drone target has no LUT "
+                "area for an fp32 vector ALU); 'widening' below needs the fp32 "
+                "datapath. Divergence from the reference is reduction ORDER only "
+                "(fp16 non-associative) -> numeric_drift; the fp16 accumulate also "
+                "matches the deployment hardware exactly.\n"
+            ),
+            reference_impl="""\
+#include <stddef.h>
+#include <riscv_vector.h>
+
+void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int M, int K, int N) {
+    const size_t vlmax = __riscv_vsetvlmax_e16m4();
+    for (int m = 0; m < M; m++) {
+        const _Float16 *in_row = input + (size_t)m * (size_t)K;
+        for (int n = 0; n < N; n++) {
+            const _Float16 *w_row = weight + (size_t)n * (size_t)K;
+            vfloat16m4_t vacc = __riscv_vfmv_v_f_f16m4((_Float16)0.0f, vlmax);
+            int k = 0;
+            size_t vl;
+            for (; k < K; k += (int)vl) {
+                vl = __riscv_vsetvl_e16m4(K - k);
+                vfloat16m4_t va = __riscv_vle16_v_f16m4(in_row + k, vl);
+                vfloat16m4_t vb = __riscv_vle16_v_f16m4(w_row + k, vl);
+                vacc = __riscv_vfmacc_vv_f16m4(vacc, va, vb, vl);
+            }
+            vfloat16m1_t vs = __riscv_vfmv_s_f_f16m1((_Float16)0.0f, 1);
+            vs = __riscv_vfredusum_vs_f16m4_f16m1(vacc, vs, vlmax);
+            _Float16 acc = __riscv_vfmv_f_s_f16m1_f16(vs);
+            if (bias) acc = (_Float16)(acc + bias[n]);
+            output[(size_t)m * N + n] = acc;
+        }
+    }
+}
+""",
+        ),
         AlgorithmCandidate(
             name="widening",
             target_affinity=("rvv_f16",),
@@ -8688,6 +8884,62 @@ void kernel_sdpa(const float *Q, const float *K, const float *V,
 )
 
 
+def _lstm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)   # _Float16 opaque
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [h, h, h, h, h, h, h, ctypes.c_int, ctypes.c_int]
+
+
+LSTM_F16 = KernelSpec(
+    op="lstm_f16",
+    signature=(
+        "void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih, "
+        "const _Float16 *w_hh, const _Float16 *bias, "
+        "_Float16 *h, _Float16 *c, _Float16 *out, int in_size, int H)"
+    ),
+    semantics=(
+        "Half-precision single-layer, single-timestep LSTM cell (PyTorch gate\n"
+        "order i,f,g,o). Mirrors kernel_lstm but all tensors are _Float16 and\n"
+        "the gate-GEMM reduction ACCUMULATES IN _Float16 (storage + accumulate\n"
+        "fp16); the sigmoid/tanh/cell update are evaluated in float then stored\n"
+        "back to _Float16. h/c persist across calls (seq-len-1 unroll); out must\n"
+        "not alias h (the w_hh GEMM reads the previous h)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih, const _Float16 *w_hh,
+                     const _Float16 *bias, _Float16 *h, _Float16 *c, _Float16 *out,
+                     int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const _Float16 *wih_row = w_ih + (long)row * in_size;
+            const _Float16 *whh_row = w_hh + (long)row * H;
+            _Float16 ax = (_Float16)0.0f, ah = (_Float16)0.0f;
+            for (int k = 0; k < in_size; k++)      /* fp16 product + fp16 accumulate */
+                ax = (_Float16)(ax + (_Float16)(x[k] * wih_row[k]));
+            for (int k = 0; k < H; k++)
+                ah = (_Float16)(ah + (_Float16)(h[k] * whh_row[k]));
+            pre[g] = (float)ax + (float)ah + (float)bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * (float)c[j] + ig * cg;
+        c[j]   = (_Float16)c_new;
+        out[j] = (_Float16)(og * tanhf(c_new));
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_f16_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -8758,6 +9010,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "add": ADD,
     "batchnorm2d": BATCHNORM2D,
     "sigmoid": SIGMOID,
+    "lstm": LSTM,
     "linear_s8": LINEAR_S8,
     "relu_s8": RELU_S8,
     "relu6_s8": RELU6_S8,
@@ -8767,6 +9020,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "add_s8": ADD_S8,
     "batchnorm2d_s8": BATCHNORM2D_S8,
     "sigmoid_s8": SIGMOID_S8,
+    "lstm_s8": LSTM_S8,
     "relu_f16": RELU_F16,
     "sigmoid_f16": SIGMOID_F16,
     "elu_f16": ELU_F16,
@@ -8783,6 +9037,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "cast_f16_to_i8": CAST_F16_TO_I8,
     # ViNT fp16 op set.
     "linear_f16": LINEAR_F16,
+    "lstm_f16": LSTM_F16,
     "depthwise_conv2d_f16": DEPTHWISE_CONV2D_F16,
     "layer_norm_f16": LAYER_NORM_F16,
     "gelu_f16": GELU_F16,
