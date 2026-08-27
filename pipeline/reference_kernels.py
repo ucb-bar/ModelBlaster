@@ -6009,6 +6009,19 @@ def _leaky_relu_s8_argtypes():
             ctypes.c_float]
 
 
+def _lstm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, w_ih, w_hh, b_ih, b_hh, h_state, c_state, output,
+    # input_size, hidden_size,
+    # scale_in, scale_w_ih, scale_w_hh, scale_b, scale_h, scale_c, has_bias
+    return ([i8p, i8p, i8p, i32p, i32p, i8p, i8p, i8p]
+            + [ctypes.c_int] * 2
+            + [ctypes.c_float] * 6
+            + [ctypes.c_int])
+
+
 def _avgpool2d_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -8411,6 +8424,132 @@ void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
 
 
 
+LSTM_S8 = KernelSpec(
+    op="lstm_s8",
+    signature=(
+        "void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih, "
+        "const int8_t *w_hh, const int32_t *b_ih, const int32_t *b_hh, "
+        "int8_t *h_state, int8_t *c_state, int8_t *output, "
+        "int input_size, int hidden_size, "
+        "float scale_in, float scale_w_ih, float scale_w_hh, "
+        "float scale_b, float scale_h, float scale_c, int has_bias)"
+    ),
+    semantics=(
+        "One timestep of a single-layer LSTM cell, batch size 1, int8 in/out.\n"
+        "Gate order is PyTorch's: [input, forget, cell, output].\n"
+        "\n"
+        "  gates = W_ih @ x + b_ih + W_hh @ h_prev + b_hh      (4H values)\n"
+        "  i = sigmoid(gates[0:H])      f = sigmoid(gates[H:2H])\n"
+        "  g = tanh(gates[2H:3H])       o = sigmoid(gates[3H:4H])\n"
+        "  c = f * c_prev + i * g\n"
+        "  h = o * tanh(c)\n"
+        "\n"
+        "h_state and c_state are BOTH INPUTS AND OUTPUTS: they carry the\n"
+        "recurrent state and are updated in place. `output` receives a copy of\n"
+        "the new h. This is what makes the op stateful -- a second call with the\n"
+        "same input does not produce the same answer, and the caller must keep\n"
+        "these buffers alive across invocations. Zero-initialised buffers are\n"
+        "the standard 'no history' start.\n"
+        "\n"
+        "Accumulation and the nonlinearities are done in float after\n"
+        "dequantizing, matching how elu_s8/sigmoid_s8 handle transcendentals:\n"
+        "the int8 grid is far too coarse to evaluate sigmoid/tanh on directly,\n"
+        "and the cell state c is unbounded so it carries its own scale rather\n"
+        "than sharing the activation's.\n"
+        "\n"
+        "Weight layout is PyTorch's: w_ih is [4H, input_size] row-major and\n"
+        "w_hh is [4H, H] row-major, so each gate row is contiguous along its\n"
+        "reduction. Biases are int32 pre-scaled by scale_b; has_bias=0 skips\n"
+        "them entirely (VitFly's LSTM is constructed with bias=False)."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+/* Upper bound on hidden_size, so the h_prev snapshot is a fixed stack buffer
+   rather than a VLA. VitFly's LSTM is 395; 1024 leaves headroom without being
+   a meaningful stack cost (1 KB). */
+#ifndef MERLIN_LSTM_MAX_HIDDEN
+#define MERLIN_LSTM_MAX_HIDDEN 1024
+#endif
+
+void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
+                    const int8_t *w_hh, const int32_t *b_ih,
+                    const int32_t *b_hh,
+                    int8_t *h_state, int8_t *c_state, int8_t *output,
+                    int input_size, int hidden_size,
+                    float scale_in, float scale_w_ih, float scale_w_hh,
+                    float scale_b, float scale_h, float scale_c,
+                    int has_bias) {
+    const int H = hidden_size;
+    /* Snapshot h_prev before touching h_state.
+     *
+     * Every gate reduction reads the WHOLE previous hidden vector, but the
+     * loop below writes h_state[t] as it goes. Without this copy, unit t+1
+     * would read the newly-written h[t] instead of the previous timestep's --
+     * the recurrence would consume its own output mid-step. That is not a
+     * rounding difference; it produced answers off by up to 12 LSB. */
+    int8_t h_prev[MERLIN_LSTM_MAX_HIDDEN];
+    if (H > MERLIN_LSTM_MAX_HIDDEN) {
+        /* Refuse rather than silently truncate the state. */
+        return;
+    }
+    for (int k = 0; k < H; k++) h_prev[k] = h_state[k];
+
+    /* One pass per hidden unit, computing its four gates. */
+    for (int t = 0; t < H; t++) {
+        double g_pre[4];
+        for (int gi = 0; gi < 4; gi++) {
+            const int j = gi * H + t;
+            double acc = 0.0;
+            for (int k = 0; k < input_size; k++) {
+                acc += ((double)input[k] * (double)scale_in)
+                     * ((double)w_ih[j * input_size + k] * (double)scale_w_ih);
+            }
+            for (int k = 0; k < H; k++) {
+                acc += ((double)h_prev[k] * (double)scale_h)
+                     * ((double)w_hh[j * H + k] * (double)scale_w_hh);
+            }
+            if (has_bias) {
+                acc += (double)b_ih[j] * (double)scale_b;
+                acc += (double)b_hh[j] * (double)scale_b;
+            }
+            g_pre[gi] = acc;
+        }
+        /* double, not float: this op is evaluated in floating point, so the
+           only way the device and the golden simulator agree bit-for-bit is if
+           both compute the same real value to well within half an int8 LSB.
+           float32 was not enough -- it disagreed by up to 2 LSB. */
+        const double i_g = 1.0 / (1.0 + exp(-g_pre[0]));
+        const double f_g = 1.0 / (1.0 + exp(-g_pre[1]));
+        const double g_g = tanh(g_pre[2]);
+        const double o_g = 1.0 / (1.0 + exp(-g_pre[3]));
+
+        const double c_prev = (double)c_state[t] * (double)scale_c;
+        const double c_new = f_g * c_prev + i_g * g_g;
+        const double h_new = o_g * tanh(c_new);
+
+        int32_t cq = (int32_t)round(c_new / (double)scale_c);
+        if (cq < -128) cq = -128;
+        if (cq > 127) cq = 127;
+        int32_t hq = (int32_t)round(h_new / (double)scale_h);
+        if (hq < -128) hq = -128;
+        if (hq > 127) hq = 127;
+        c_state[t] = (int8_t)cq;
+        h_state[t] = (int8_t)hq;
+        output[t] = (int8_t)hq;
+    }
+}
+""",
+    extra_shapes=[
+        {"input_size": 8, "hidden_size": 4},
+        {"input_size": 665, "hidden_size": 395},
+    ],
+    argtypes_factory=_lstm_s8_argtypes,
+)
+
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -8504,6 +8643,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "elu_s8": ELU_S8,
     "leaky_relu_s8": LEAKY_RELU_S8,
     "avgpool2d_s8": AVGPOOL2D_S8,
+    "lstm_s8": LSTM_S8,
     # Phase 1d pair-fused linear+elu. Eliminates the intermediate-tensor
     # write/read between consecutive linear_s8 + elu_s8 ops (the mlp_control
     # chain has three such pairs). LLM-codegen seeds describe rvv_opu
