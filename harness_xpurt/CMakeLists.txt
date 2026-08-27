@@ -110,7 +110,15 @@ foreach(_i RANGE ${_last})
         endif()
     endforeach()
     configure_file("${_primary_dir}/model.h"   "${_STAGE_DIR}/${_name}_model.h"   COPYONLY)
-    configure_file("${_primary_dir}/test_io.h" "${_STAGE_DIR}/${_name}_test_io.h" COPYONLY)
+    # test_io.h's own `#include "model.h"` (needed by its arity-agnostic
+    # model_{mid}_run_test() wrapper, which references model_{mid}_output_t)
+    # must be rewritten to the staged, per-model-prefixed header name --
+    # COPYONLY doesn't rewrite file contents, and multiple models'
+    # unqualified model.h would otherwise collide in this shared staging dir.
+    file(READ "${_primary_dir}/test_io.h" _test_io_contents)
+    string(REPLACE "#include \"model.h\"" "#include \"${_name}_model.h\""
+           _test_io_contents "${_test_io_contents}")
+    file(WRITE "${_STAGE_DIR}/${_name}_test_io.h" "${_test_io_contents}")
 
     # Per-(model, backend) OBJECT lib over model.c + kernels.c, with -D
     # renames so the externally-visible symbols don't collide across
