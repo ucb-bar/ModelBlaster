@@ -1592,6 +1592,127 @@ def extract_int8(
                     "outputs": [node.name],
                     "shape": {"n": n},
                 })
+            elif tname == "mul" or target is torch.mul \
+                    or target is __import__("operator").mul:
+                # mul_s8 existed with no call_function branch, the same shape of
+                # gap as gelu_s8: a kernel nothing could emit.
+                if not all(hasattr(a, "name") for a in node.args[:2]):
+                    raise NotImplementedError(
+                        f"int8 extract: mul at {node.name} with a scalar "
+                        f"operand is not supported; both sides must be tensors")
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                if tensors_meta[a_name]["shape"] != tensors_meta[b_name]["shape"]:
+                    raise NotImplementedError(
+                        f"int8 extract: mul at {node.name} broadcasts "
+                        f"{tensors_meta[a_name]['shape']} against "
+                        f"{tensors_meta[b_name]['shape']}; only equal shapes "
+                        f"are supported")
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[a_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "mul_s8",
+                    "inputs": [a_name, b_name], "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {"scale_a": scales[a_name],
+                              "scale_b": scales[b_name],
+                              "scale_out": scales[node.name],
+                              "activation_min": -128, "activation_max": 127},
+                })
+            elif tname in ("sin", "cos") or target in (torch.sin, torch.cos):
+                kind = "sin_s8" if (tname == "sin" or target is torch.sin) else "cos_s8"
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": kind,
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {"scale_in": scales[in_name],
+                              "scale_out": scales[node.name],
+                              "activation_min": -128, "activation_max": 127},
+                })
+            elif tname == "softmax" or target is torch.softmax \
+                    or getattr(target, "__name__", "") == "softmax":
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                shp = tensors_meta[in_name]["shape"]
+                K = int(shp[-1]); M = int(np.prod(shp[:-1])) if len(shp) > 1 else 1
+                dim = node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else -1)
+                if dim not in (-1, len(shp) - 1):
+                    raise NotImplementedError(
+                        f"int8 extract: softmax at {node.name} over dim={dim}; "
+                        f"only the last dimension is supported")
+                ops.append({
+                    "name": node.name, "op": "softmax_s8",
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"M": M, "K": K},
+                    "quant": {"scale_in": scales[in_name],
+                              "scale_out": scales[node.name]},
+                })
+            elif getattr(target, "__name__", "") == "scaled_dot_product_attention":
+                # Decompose rather than adding a fused kernel: matmul_s8
+                # already carries transpose_b and scale_div, which is exactly
+                # QK^T/sqrt(d), and softmax_s8 exists. Three existing kernels
+                # beat one new one that would duplicate all three.
+                q_n, k_n, v_n = (a.name for a in node.args[:3])
+                if len(node.args) > 3 or node.kwargs.get("attn_mask") is not None:
+                    raise NotImplementedError(
+                        f"int8 extract: sdpa at {node.name} with an attention "
+                        f"mask is not supported; only the unmasked form")
+                if node.kwargs.get("is_causal"):
+                    raise NotImplementedError(
+                        f"int8 extract: causal sdpa at {node.name} needs a mask "
+                        f"kernel; only the unmasked form is supported")
+                _record(node.name, dtype="i8")
+                qs = tensors_meta[q_n]["shape"]; ks = tensors_meta[k_n]["shape"]
+                M = int(np.prod(qs[:-1])); D = int(qs[-1]); S = int(np.prod(ks[:-1]))
+                scores = f"{node.name}__scores"
+                probs = f"{node.name}__probs"
+                # Scale for the attention scores.
+                #
+                # score = (q . k) / sqrt(D). In int8 units each operand has
+                # sigma ~ 127/3, so the dot over D terms has sigma
+                # ~ sqrt(D)*(127/3)^2 and the 1/sqrt(D) cancels it: the score
+                # magnitude is ~independent of D and lands near
+                # 3*(127/3)^2 ~ 1800 * scale_q * scale_k at 3 sigma. 32*sq*sk
+                # puts 127 levels over ~4060*sq*sk, i.e. roughly 2x headroom on
+                # that.
+                #
+                # The obvious-looking sq*sk*sqrt(D) is what was here first and
+                # it CLIPS: measured on attn_block it covered 0.022 against an
+                # actual score range of 0.095, and cosine at that step was
+                # 0.914 instead of ~0.999.
+                sc_scale = scales[q_n] * scales[k_n] * 32.0
+                for nm, sc in ((scores, float(sc_scale)), (probs, 1.0 / 127.0)):
+                    tensors_meta[nm] = {"shape": [M, S], "dtype": "i8",
+                                        "quant": {"scale": sc, "zero_point": 0}}
+                    scales[nm] = sc
+                ops.append({
+                    "name": f"{node.name}.qk", "op": "matmul_s8",
+                    "inputs": [q_n, k_n], "outputs": [scores],
+                    "shape": {"M": M, "K": D, "N": S, "transpose_b": 1},
+                    "quant": {"scale_a": scales[q_n], "scale_b": scales[k_n],
+                              "scale_out": float(sc_scale),
+                              "scale_div": float(np.sqrt(D)),
+                              "activation_min": -128, "activation_max": 127},
+                })
+                ops.append({
+                    "name": f"{node.name}.softmax", "op": "softmax_s8",
+                    "inputs": [scores], "outputs": [probs],
+                    "shape": {"M": M, "K": S},
+                    "quant": {"scale_in": float(sc_scale),
+                              "scale_out": 1.0 / 127.0},
+                })
+                ops.append({
+                    "name": f"{node.name}.av", "op": "matmul_s8",
+                    "inputs": [probs, v_n], "outputs": [node.name],
+                    "shape": {"M": M, "K": S, "N": int(tensors_meta[v_n]["shape"][-1]),
+                              "transpose_b": 0},
+                    "quant": {"scale_a": 1.0 / 127.0, "scale_b": scales[v_n],
+                              "scale_out": scales[node.name], "scale_div": 1.0,
+                              "activation_min": -128, "activation_max": 127},
+                })
             elif tname == "flatten" or target is torch.flatten:
                 in_name = node.args[0].name
                 _record(node.name, dtype="i8")
@@ -1928,6 +2049,46 @@ def extract_int8(
             v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "mul_s8":
+            q = op["quant"]
+            # Flatten both: activations are stored with whatever rank their
+            # producer used, and this op is elementwise over equal shapes.
+            a = activations[op["inputs"][0]].reshape(-1).astype(np.float64) \
+                * float(q["scale_a"])
+            b = activations[op["inputs"][1]].reshape(-1).astype(np.float64) \
+                * float(q["scale_b"])
+            v = _round_half_away((a * b) / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] in ("sin_s8", "cos_s8"):
+            q = op["quant"]
+            x = in_arr.astype(np.float64) * float(q["scale_in"])
+            y = np.sin(x) if op["op"] == "sin_s8" else np.cos(x)
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "softmax_s8":
+            sh = op["shape"]; q = op["quant"]
+            x = in_arr.reshape(sh["M"], sh["K"]).astype(np.float64) \
+                * float(q["scale_in"])
+            x = x - x.max(axis=1, keepdims=True)      # stable, as the kernel does
+            e = np.exp(x)
+            y = e / e.sum(axis=1, keepdims=True)
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(v, -128, 127).astype(np.int8)
+        elif op["op"] == "matmul_s8":
+            sh = op["shape"]; q = op["quant"]
+            a = activations[op["inputs"][0]].reshape(sh["M"], sh["K"]) \
+                .astype(np.float64) * float(q["scale_a"])
+            bm = activations[op["inputs"][1]]
+            if sh.get("transpose_b"):
+                bm = bm.reshape(sh["N"], sh["K"]).astype(np.float64).T
+            else:
+                bm = bm.reshape(sh["K"], sh["N"]).astype(np.float64)
+            y = (a @ (bm * float(q["scale_b"]))) / float(q.get("scale_div", 1.0))
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
         elif op["op"] == "gelu_s8":
             q = op["quant"]
             import math as _math
@@ -3220,7 +3381,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend", "lstm_tiny", "vitfly_lstm", "norm_block"])
+                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend", "lstm_tiny", "vitfly_lstm", "norm_block", "attn_block"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -3265,6 +3426,8 @@ def main() -> None:
         from modelblaster.models import vitfly_lstm as model_mod
     elif args.model == "norm_block":
         from modelblaster.models import norm_block as model_mod
+    elif args.model == "attn_block":
+        from modelblaster.models import attn_block as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()

@@ -1416,6 +1416,29 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q['activation_min']}, {q['activation_max']}, "
                 f"{_f32(alpha)})"
             )
+        elif op["op"] in ("sin_s8", "cos_s8"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            q = op["quant"]
+            call = (f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
+                    f"{op['shape']['n']}, "
+                    f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                    f"{q['activation_min']}, {q['activation_max']})")
+        elif op["op"] == "softmax_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            call = (f"kernel_softmax_s8({in_ptr}, {out_ptr}, "
+                    f"{sh['M']}, {sh['K']}, "
+                    f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])})")
+        elif op["op"] == "matmul_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]; q = op["quant"]
+            call = (f"kernel_matmul_s8({a_ptr}, {b_ptr}, {out_ptr}, "
+                    f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                    f"{_f32(q['scale_a'])}, {_f32(q['scale_b'])}, "
+                    f"{_f32(q['scale_out'])}, {sh.get('transpose_b', 0)}, "
+                    f"{_f32(q.get('scale_div', 1.0))}, "
+                    f"{q['activation_min']}, {q['activation_max']})")
         elif op["op"] in ("layernorm_s8", "rmsnorm_s8"):
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]; q = op["quant"]
