@@ -55,13 +55,15 @@ int main(void)
 
     /* Single-model harness has no thread pool — pass NULL. The
      * generated kernel bodies ignore it; only the parallel-for wrapper
-     * (when emitted) would dispatch onto a real modelblaster_pool_t. */
+     * (when emitted) would dispatch onto a real modelblaster_pool_t.
+     * model_run_test() feeds the baked test input(s) — it is arity-agnostic
+     * (1 input or N typed inputs), so this call is unchanged across models. */
 #if defined(MB_TACIT_TRACE_MODEL)
     LTraceEncoderType *_tacit_enc = l_trace_encoder_get(arch_curr_cpu()->id);
     l_trace_encoder_configure_target(_tacit_enc, TARGET_PRINT);
     l_trace_encoder_start(_tacit_enc);
 #endif
-    run_model(model_test_input, model_output, NULL);
+    model_run_test(model_output, NULL);
 #if defined(MB_TACIT_TRACE_MODEL)
     l_trace_encoder_stop(_tacit_enc);
     for (int _i = 0; _i < 16; _i++) { __asm__ volatile("nop"); } /* flush */
