@@ -25,11 +25,12 @@ _OBS_DIM = 16
 _ACTION_DIM = 4
 _HIDDEN_DIMS = [256, 128, 64]
 
-# Latest trained MLP checkpoint at the time of writing. Updates pick up via
-# MODELBLASTER_MLP_CONTROL_CKPT env var.
-_DEFAULT_CKPT = (
-    "/scratch2/dima/misc_sw/FreshScheduler/logs/rsl_rl/"
-    "crazyflie_steering_tracking/2026-04-13_12-23-08/model_6998.pt"
+# Committed alongside this module so a fresh clone works with no external
+# state (previously an absolute path into one user's home directory, which
+# doesn't exist on any other checkout). Override via MODELBLASTER_MLP_CONTROL_CKPT.
+_DEFAULT_CKPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "checkpoints", "mlp_control", "model_6998.pt",
 )
 
 
