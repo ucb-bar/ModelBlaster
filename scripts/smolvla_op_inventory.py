@@ -41,6 +41,13 @@ ATEN_TO_KERNEL = {
     # SmolVLA writes RMSNorm out as pow + mean + rsqrt + mul rather than
     # calling an RMSNorm module, so the decomposed ops map to the same kernel.
     "pow": "rmsnorm_s8", "rsqrt": "rmsnorm_s8",
+    "sin": "sin_s8", "cos": "cos_s8",
+    # sdpa is decomposed into matmul_s8 -> softmax_s8 -> matmul_s8 rather than
+    # given a fused kernel: matmul_s8 already carries transpose_b and scale_div,
+    # which is exactly QK^T/sqrt(d).
+    "scaled_dot_product_attention": "matmul_s8",
+    "where": "mul_s8", "clamp": "relu_s8", "min": "relu_s8",
+    "reciprocal": "mul_s8", "sum": "avgpool2d_s8",
     "batch_norm": "batchnorm2d_s8", "native_batch_norm": "batchnorm2d_s8",
     "embedding": "embedding",
     "lstm": "lstm_s8",
