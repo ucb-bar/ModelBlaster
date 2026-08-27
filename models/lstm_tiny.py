@@ -27,6 +27,12 @@ class LSTMTiny(nn.Module):
 
 
 def get_model():
+    # Fixed seed so get_model() is reproducible. Without it every call builds
+    # different random weights, and anything comparing an extracted model
+    # against a freshly constructed one is comparing two different networks --
+    # which is exactly how int8 quality got measured at cosine 0.03 when the
+    # real figure is 0.999.
+    torch.manual_seed(0)
     m = LSTMTiny()
     m.eval()
     return m
