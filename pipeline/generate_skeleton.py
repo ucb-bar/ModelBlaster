@@ -641,7 +641,8 @@ def _shape_str(op: dict) -> str:
     return ";".join(parts)
 
 
-def emit_model(ir: dict[str, Any], out_dir: str) -> None:
+def emit_model(ir: dict[str, Any], out_dir: str,
+               platform: str = "zephyr") -> None:
     in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
@@ -1904,29 +1905,63 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         )
         invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
 
-    c = f"""{HEADER}
-#include <stddef.h>
+    if platform == "linux":
+        # rdcycle is NOT usable here. Measured on a SpaceMiT K1 (Bianbu,
+        # Linux 6.6.63): reading the cycle CSR from userspace raises SIGILL,
+        # while rdtime works. So a Linux build must not emit rdcycle at all --
+        # it would not run slowly, it would die on the first timed dispatch.
+        #
+        # rdtime is a fixed 24.000 MHz on this board (measured; 41.7 ns tick),
+        # which is finer than any dispatch we profile (60 us .. 23 ms) and is
+        # better behaved than rdcycle would have been anyway: constant
+        # frequency under DVFS, and consistent across harts. Report the clock
+        # as 24 MHz when converting these counts to time.
+        timer_preamble = """#include <stddef.h>
 #include <stdint.h>
-#include <zephyr/kernel.h>   /* for k_cycle_get_64() — static inline in this header */
+#include <time.h>
 #include "model.h"
 #include "kernels.h"
 #include "weights.h"
 
-/* Per-op timer: per-hart mcycle CSR. High resolution (one count per
- * retired instruction) and accurate enough for relative comparisons
- * between ops on spike. Caveat: on real Chipyard silicon mcycle pauses
- * during WFI, so when the master thread sleeps waiting on threadpool
- * workers this UNDERCOUNTS wall time. We additionally measure
- * end-to-end wall cycles via k_cycle_get_64() (mtime) — that's the
- * cross-hart-correct number; per-op rdcycle is only sound when run
- * sequentially or while the master itself participates in parallel
- * dispatch (which pthreadpool_parallelize_1d does). */
+/* Per-op timer, Linux/riscv64: the rdtime CSR (fixed 24 MHz on SpaceMiT K1).
+ * rdcycle traps with SIGILL from userspace on this kernel, so it is not an
+ * option; rdtime is unprivileged, constant-rate under DVFS, and consistent
+ * across harts, which rdcycle is not. */
 static inline unsigned long rdcycle(void)
-{{
+{
+    unsigned long t;
+    __asm__ volatile("rdtime %0" : "=r"(t));
+    return t;
+}
+static inline unsigned long long mb_wall_ticks(void)
+{
+    unsigned long t;
+    __asm__ volatile("rdtime %0" : "=r"(t));
+    return (unsigned long long)t;
+}"""
+    else:
+        timer_preamble = """#include <stddef.h>
+#include <stdint.h>
+#include <zephyr/kernel.h>   /* for k_cycle_get_64() \u2014 static inline in this header */
+#include "model.h"
+#include "kernels.h"
+#include "weights.h"
+
+/* Per-op timer: per-hart mcycle CSR. */
+static inline unsigned long rdcycle(void)
+{
     unsigned long cc;
     __asm__ volatile("rdcycle %0" : "=r"(cc));
     return cc;
-}}
+}
+static inline unsigned long long mb_wall_ticks(void)
+{
+    return k_cycle_get_64();
+}"""
+
+    c = f"""{HEADER}
+{timer_preamble}
+
 {_emit_parallel_wrappers(mid, used_ops)}
 
 /* Per-model intermediate buffers. Defined in a sibling buffers.c (one
@@ -1969,11 +2004,11 @@ void run_model_{mid}(const model_{mid}_input_t *input,
                      void *pool) {{
     model_{mid}_state_t s = {{ .input = input, .output = output, .pool = pool }};
     n_ = 0;
-    unsigned long _wall_s = (unsigned long)k_cycle_get_64();
+    unsigned long _wall_s = (unsigned long)mb_wall_ticks();
     for (int i = 0; i < MODEL_{umid}_OP_COUNT; i++) {{
         MODEL_{umid}_DISPATCH_FNS[i](&s);
     }}
-    wall_cycles_ = (unsigned long)k_cycle_get_64() - _wall_s;
+    wall_cycles_ = (unsigned long)mb_wall_ticks() - _wall_s;
 }}
 
 const model_{mid}_op_record_t *model_{mid}_profile_records(int *count) {{
@@ -2119,6 +2154,7 @@ def generate(
     io_path: str,
     out_dir: str,
     backend: Optional[str] = None,
+    platform: str = "zephyr",
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
@@ -2127,7 +2163,7 @@ def generate(
     model_name = ir["name"]
 
     emit_weights(model_name, weights, out_dir, backend=backend)
-    emit_model(ir, out_dir)
+    emit_model(ir, out_dir, platform=platform)
     emit_test_io(model_name, io_path, out_dir)
 
     files = ["weights.h", "weights.c", "model.h", "model.c",
@@ -2150,8 +2186,17 @@ def main() -> None:
                          "tiled_conv_auto consumes directly, eliminating "
                          "the per-inference weight-transpose loop in the "
                          "kernel. Other backends are pass-through.")
+    ap.add_argument("--platform", default="zephyr",
+                    choices=["zephyr", "linux"],
+                    help="Host OS for the generated model.c. 'zephyr' emits "
+                         "k_cycle_get_64 + rdcycle; 'linux' emits rdtime for "
+                         "both, because reading the cycle CSR from userspace "
+                         "raises SIGILL on a SpaceMiT K1 running Linux 6.6 -- "
+                         "an rdcycle build does not run slowly there, it dies "
+                         "on the first timed dispatch.")
     args = ap.parse_args()
-    generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend)
+    generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend,
+             platform=args.platform)
 
 
 if __name__ == "__main__":
