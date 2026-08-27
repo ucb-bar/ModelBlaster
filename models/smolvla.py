@@ -6,16 +6,17 @@ cache). Two upstream packages are consumed off-tree:
 
 * ``Understanding-PI0`` at ``PI0_ROOT`` / ``UNDERSTANDING_PI0_ROOT``,
   shipping the SmolVLA loader + the no-cache wrapper.
-* ``lerobot`` at ``LEROBOT_ROOT`` (the canonical clone is at
-  ``/scratch2/agustin/merlin/third_party/lerobot``), shipping the
-  ``SmolVLAPolicy`` class and constant names.
+* ``lerobot`` at ``LEROBOT_ROOT`` (the canonical clone is the merlin
+  sibling checkout at ``$MERLIN_DIR/third_party/lerobot``, default
+  ``../merlin/third_party/lerobot``), shipping the ``SmolVLAPolicy``
+  class and constant names.
 
 Both are pulled in via ``sys.path`` injection rather than as pip
 dependencies; the upstream pyproject deps would force diffusers /
 accelerate / transformers into every modelblaster venv whether the
 caller needs SmolVLA or not. ``HF_HOME`` should point at the same
 cache that holds the ``models--lerobot--smolvla_base`` snapshot
-(``/scratch2/agustin/hf_cache`` here); the wrapper does not download
+(defaults to ``~/.cache/huggingface``); the wrapper does not download
 weights itself.
 
 Tracing: SmolVLA can NOT be FX-symbolically-traced — the policy uses
@@ -64,9 +65,10 @@ _DEFAULT_DEVICE = "cpu"
 # Canonical sibling clones on this dev box. Used as fallbacks when the
 # corresponding *_ROOT env vars are not set. Both are real upstream
 # checkouts, not vendored copies.
-_FALLBACK_PI0_ROOT = Path("/scratch2/agustin/merlin/third_party/Understanding-PI0")
-_FALLBACK_LEROBOT_ROOT = Path("/scratch2/agustin/merlin/third_party/lerobot")
-_FALLBACK_HF_HOME = Path("/scratch2/agustin/hf_cache")
+_MERLIN_ROOT = Path(os.environ.get("MERLIN_DIR", str(Path(__file__).resolve().parents[2] / "merlin")))
+_FALLBACK_PI0_ROOT = _MERLIN_ROOT / "third_party" / "Understanding-PI0"
+_FALLBACK_LEROBOT_ROOT = _MERLIN_ROOT / "third_party" / "lerobot"
+_FALLBACK_HF_HOME = Path.home() / ".cache" / "huggingface"
 
 
 def _resolve_root(env_vars: tuple[str, ...], fallback: Path,

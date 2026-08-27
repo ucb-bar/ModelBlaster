@@ -55,7 +55,10 @@ _mb_stage_end() {
     echo "MODELBLASTER_STAGE_END:$1:${delta}"
 }
 
-SCHEDULE_JSON="${SCHEDULE_JSON:-/scratch2/dima/misc_sw/FreshScheduler/schedules/scheduled_networks_mlp_dronet_profile_zephyr_profiled.json}"
+# Default points at an XPU-RT-produced schedule in the sibling checkout
+# (see XPU-RT README "Run XPU-RT Scheduler"). Override SCHEDULE_JSON to use
+# a different one. XPURT_ROOT overrides the XPU-RT checkout location.
+SCHEDULE_JSON="${SCHEDULE_JSON:-${XPURT_ROOT:-$(dirname "${REPO_ROOT}")/XPU-RT}/schedules/scheduled_networks_periodic_profiled.json}"
 MODELS="${MODELS:-dronet,mlp_control}"
 REGISTRY="${REGISTRY:-${REPO_ROOT}/cores/chipyard_hetero_example.json}"
 BACKENDS="${BACKENDS:-scalar,rvv}"
