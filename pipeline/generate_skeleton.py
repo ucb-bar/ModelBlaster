@@ -1416,6 +1416,22 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q['activation_min']}, {q['activation_max']}, "
                 f"{_f32(alpha)})"
             )
+        elif op["op"] in ("layernorm_s8", "rmsnorm_s8"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            gamma = _weight_name(model_name, op["weight"])
+            common = (f"{sh['M']}, {sh['K']}, "
+                      f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                      f"{_f32(q['eps'])}, "
+                      f"{q['activation_min']}, {q['activation_max']})")
+            if op["op"] == "rmsnorm_s8":
+                call = (f"kernel_rmsnorm_s8({in_ptr}, {gamma}, {out_ptr}, "
+                        + common)
+            else:
+                beta = (_weight_name(model_name, op["bias"])
+                        if op.get("bias") else "NULL")
+                call = (f"kernel_layernorm_s8({in_ptr}, {gamma}, {beta}, "
+                        f"{out_ptr}, " + common)
         elif op["op"] == "lstm_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]; q = op["quant"]
