@@ -98,6 +98,11 @@ def main() -> int:
                     help="rdtime frequency, NOT the core clock (default 24 MHz)")
     ap.add_argument("--pool-sizes", default=None)
     ap.add_argument("--save-output", default=None)
+    ap.add_argument("--model-name", default=None,
+                    help="model name for the profile tree. Without it the "
+                         "name is guessed by walking up from io.npz, which "
+                         "mislabels any layout other than "
+                         "examples/<model>/<quant>/generated/.")
     args = ap.parse_args()
 
     if not args.models and not args.io:
@@ -143,7 +148,7 @@ def main() -> int:
             out, models=models_list, io_path=args.io, quant=args.quant,
             atol=args.atol, rtol=args.rtol, profile_csv=args.profile_csv,
             iree_args=iree_args, backend_tag=args.profile_backend,
-            repo_root=repo_root)
+            repo_root=repo_root, model_name=args.model_name)
     return 0 if ok else 1
 
 
