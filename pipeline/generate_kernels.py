@@ -1381,6 +1381,20 @@ def generate(
                 f"{target.name}_{spec.op}_{algorithm.name}.c",
             ) if global_curated_dir else None,
         )
+        # Then the backend's curated ancestors. A variant backend (a different
+        # -march of the same ISA family, e.g. rvv_x60 pinning VLEN=256) has no
+        # kernels directory of its own, and without this every op quietly falls
+        # back to the SCALAR reference while the build reports success -- so a
+        # run labelled "rvv_x60" would be measuring scalar code.
+        for _alias in getattr(target, "curated_aliases", ()):
+            _probe_swap(
+                f"curated[{_alias}]",
+                global_curated_dir,
+                lambda spec, algorithm, _a=_alias: os.path.join(
+                    global_curated_dir, _a,
+                    f"{_a}_{spec.op}_{algorithm.name}.c",
+                ) if global_curated_dir else None,
+            )
     elif backend_name == "llm":
         # Lazy proxy: the LLM client is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
