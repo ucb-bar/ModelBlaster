@@ -97,6 +97,43 @@ RVV = Backend(
 )
 
 
+# SpaceMiT K1 / X60. Kept separate from RVV rather than changing it, because
+# every FireSim/Spike measurement in this repo was taken against RVV's
+# -march=rv64gcv and must stay reproducible.
+#
+# Two differences, both load-bearing:
+#
+#   1. `zvl256b`. The X60 has VLEN=256. Plain -march=rv64gcv leaves VLEN
+#      unspecified, so the compiler must assume the 128-bit minimum and cannot
+#      fold a 256-bit vsetvli -- it emits strip-mined loops for a length it
+#      already knows. The Codex kernel prompts in this project were written
+#      against rv64gcv_zvl256b, so a kernel generated for that target was being
+#      compiled for a narrower one.
+#
+#   2. verify_method. RVV verifies through a Spike harness, which cannot run
+#      zvl256b usefully and is not where these kernels execute anyway. On the
+#      K1 the composed model is verified ON THE BOARD, bit-exact against the
+#      PyTorch golden, by the MODELBLASTER_VERIFY marker the generated main
+#      emits -- a stronger check than per-kernel verification because it tests
+#      the composition, not just each kernel in isolation. So per-kernel verify
+#      is declared unavailable here rather than pointed at the wrong simulator.
+RVV_X60 = Backend(
+    name="rvv_x60",
+    description="SpaceMiT X60: rv64gcv with VLEN=256 (zvl256b). Verified on "
+                "the board, not in Spike.",
+    kernel_cflags=(
+        "-march=rv64gcv_zvl256b",
+        "-mabi=lp64d",
+        "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
+    ),
+    kernel_includes=("<riscv_vector.h>",),
+    prj_conf_overlay="rvv.conf",
+    spike_args=("--isa=rv64gcv_zicntr",),
+    optimization_guide="optimization_guide_rvv.md",
+    verify_method=VERIFY_HOST_CTYPES,
+)
+
+
 # fp16 variants: same shape as scalar/rvv but with Zfh (and Zvfh on rvv)
 # enabled. The Kconfig overlay (scalar_f16.conf / rvv_f16.conf) tells
 # Zephyr to context-switch the half-precision register state and tells
@@ -335,6 +372,7 @@ RVV_HETERO = Backend(
 BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
+    RVV_X60.name: RVV_X60,
     RVV_HETERO.name: RVV_HETERO,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,

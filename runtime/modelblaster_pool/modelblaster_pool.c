@@ -29,7 +29,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(MODELBLASTER_PLATFORM_LINUX)
+/* Hosted riscv64 (SpaceMiT K1). The pool is already pthreads-based; this
+ * supplies only k_sem and the tick counter. See runtime/mb_posix_compat.h. */
+#include "mb_posix_compat.h"
+#else
 #include <zephyr/kernel.h>
+#endif
 
 /* Hard cap so we can size the embedded sem arrays without dynamic
  * malloc per worker. The bench under modelblaster/microbench/threadpool/
