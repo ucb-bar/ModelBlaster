@@ -49,6 +49,27 @@ import re
 _INSTANCE_RE = re.compile(r"^(?P<base>.+?)(?P<idx>\d+)$")
 
 
+# Platform prologue. The walker body is identical on both platforms -- it was
+# already written against pthreads with pthread_attr_setaffinity_np -- so the
+# only Zephyr coupling is the timer, the semaphores, the abort path, and two
+# CONFIG_ constants. Defining the Zephyr names in terms of POSIX ones keeps a
+# single body rather than forking ~900 lines of generator.
+_PROLOGUE_ZEPHYR = """#include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem */
+#include <zephyr/sys/reboot.h>
+
+#define XPURT_TICKS_PER_SEC  CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC
+#define XPURT_BOARD_TARGET   CONFIG_BOARD_TARGET"""
+
+_PROLOGUE_LINUX = """#define MODELBLASTER_PLATFORM_LINUX 1
+#include "mb_posix_compat.h"   /* k_cycle_get_64, k_sem, sys_reboot on POSIX */
+
+#define XPURT_TICKS_PER_SEC  MB_POSIX_TICKS_PER_SEC
+#define XPURT_BOARD_TARGET   "linux/riscv64"
+"""
+
+_PROLOGUES = {"zephyr": _PROLOGUE_ZEPHYR, "linux": _PROLOGUE_LINUX}
+
+
 def _split_job_name(job: str, known: set[str] | None = None) -> tuple[str, int]:
     if known:
         for base in sorted(known, key=len, reverse=True):
@@ -76,7 +97,8 @@ def _emit(networks: list[str], schedule_name: str,
           core_kinds: list[str],
           backends: list[str],
           pool_sizes: list[int],
-          n_instances: dict[str, int]) -> str:
+          n_instances: dict[str, int],
+          platform: str = "zephyr") -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -292,6 +314,7 @@ def _emit(networks: list[str], schedule_name: str,
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].start_cycles = t_disp0 - run_t0;\n"
             f"#endif\n"
+            f"#ifndef MODELBLASTER_PLATFORM_LINUX\n"
             f"            /* Re-arm mstatus.VS right before the kernel\n"
             f"             * dispatch. The worker's once-at-entry VS=Initial\n"
             f"             * write gets clobbered by Zephyr's V state\n"
@@ -300,8 +323,14 @@ def _emit(networks: list[str], schedule_name: str,
             f"             * reach the kernel, VS may be Off again. csrs\n"
             f"             * to MSTATUS.VS is a no-op on harts whose VS is\n"
             f"             * hardwired-zero (no misa.V), so this is safe to\n"
-            f"             * issue unconditionally. */\n"
+            f"             * issue unconditionally.\n"
+            f"             *\n"
+            f"             * MACHINE MODE ONLY -- csrs mstatus traps in U-mode.\n"
+            f"             * A hosted OS saves and restores vector state across\n"
+            f"             * context switches itself, so there is nothing to\n"
+            f"             * re-arm; this whole hazard is Zephyr-specific. */\n"
             f"            asm volatile(\"csrs mstatus, %0\" : : \"r\"((unsigned long)(1UL << 9)));\n"
+            f"#endif\n"
             f"{bs_select}\n"
             f"            uint64_t t_disp1 = (uint64_t)k_cycle_get_64();\n"
             f"            g_hart_acc[my_kind_idx].kernel += (t_disp1 - t_disp0);\n"
@@ -432,6 +461,11 @@ def _emit(networks: list[str], schedule_name: str,
     # Forward decls go right after the model headers — they reference
     # types from those headers (model_<mid>_dispatch_fn etc.).
     forward_decl_block = "\n".join(forward_decls)
+    try:
+        platform_prologue = _PROLOGUES[platform]
+    except KeyError:
+        raise SystemExit(f"--platform must be one of {sorted(_PROLOGUES)}, "
+                         f"got {platform!r}")
 
     return f"""{HEADER}
 /*
@@ -459,14 +493,15 @@ def _emit(networks: list[str], schedule_name: str,
 
 #define MODELBLASTER_DISABLE_UNMANGLED
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #include "modelblaster_pool.h"
-#include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem */
-#include <zephyr/sys/reboot.h>
+{platform_prologue}
 
 {chr(10).join(inc_lines)}
 #include "{dispatch_table_header}"
@@ -559,7 +594,7 @@ static void *pools[{n_kinds}] = {{ NULL }};
  * start_time_ms), and (b) tag actual_start/end_cycles in the trace. */
 static uint64_t run_t0;
 #define XPURT_CYCLES_PER_MS \\
-    ((uint64_t)(CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC / 1000))
+    ((uint64_t)(XPURT_TICKS_PER_SEC / 1000))
 
 #ifdef MODELBLASTER_XPURT_TRACE
 /* Per-entry execution trace. Each slot is touched by exactly one
@@ -606,6 +641,15 @@ static void *xpurt_worker(void *arg)
      * raise mstatus.VS to Initial (writes to mstatus.VS are silently
      * ignored on harts whose misa.V=0, so this is a no-op on
      * non-V harts and safe to run unconditionally per worker). */
+#ifndef MODELBLASTER_PLATFORM_LINUX
+    /* MACHINE MODE ONLY. Both `csrr misa` and `csrs mstatus` are privileged;
+     * under a hosted OS the process runs in U-mode and the first of them traps
+     * with SIGILL before a single dispatch executes. On Linux there is also
+     * nothing to do: the kernel owns per-thread vector state and enables it
+     * lazily on first use, which is exactly what this block hand-rolls for
+     * Zephyr. Measured on the SpaceMiT K1: without this guard the harness dies
+     * immediately, `dmesg` showing cause=2 badaddr=0x301027f3, which decodes to
+     * `csrr a5, misa`. */
     {{
         unsigned long _misa;
         asm volatile("csrr %0, misa" : "=r"(_misa));
@@ -614,6 +658,7 @@ static void *xpurt_worker(void *arg)
             asm volatile("csrs mstatus, %0" : : "r"(_vs_init));
         }}
     }}
+#endif
 
     uint64_t worker_t0 = (uint64_t)k_cycle_get_64();
     uint64_t prev_iter_end = worker_t0;
@@ -674,7 +719,7 @@ static void *xpurt_worker(void *arg)
 int main(void)
 {{
     printf("xpurt-runner: schedule={schedule_name} entries=%d kinds=%d on %s\\n",
-           {upper}_N_ENTRIES, {n_kinds}, CONFIG_BOARD_TARGET);
+           {upper}_N_ENTRIES, {n_kinds}, XPURT_BOARD_TARGET);
 
     /* Per-kind modelblaster_pool sizes. Element k's helper thread count is
      * (harts_of_kind_k - 1) — one less than the kind's hart count, since
@@ -838,7 +883,18 @@ int main(void)
             modelblaster_pool_destroy((modelblaster_pool_t)pools[k]);
         }}
     }}
+#ifndef MODELBLASTER_PLATFORM_LINUX
+    /* Zephyr: a bare-metal run ends by rebooting the board, so the harness
+     * driver sees a clean restart rather than a hung shell. This is the
+     * SUCCESS path -- the error paths above reach sys_reboot too.
+     *
+     * On a hosted OS it must not be a reboot and, more importantly, must not
+     * share an exit status with the failure paths: the POSIX shim maps
+     * sys_reboot to _exit(1), which is right for an error and wrong here.
+     * Falling through to `return 0` is what lets a caller distinguish "the
+     * schedule ran" from "the schedule died". */
     sys_reboot(SYS_REBOOT_COLD);
+#endif
     return 0;
 }}
 """
@@ -856,6 +912,11 @@ def main() -> None:
     ap.add_argument("--dispatch-table-header", required=True,
                     help="basename of the .h emitted by ingest_xpurt_schedule "
                          "(included from xpurt_main.c)")
+    ap.add_argument("--platform", choices=("zephyr", "linux"),
+                    default="zephyr",
+                    help="zephyr: k_cycle_get_64/k_sem/sys_reboot as-is. "
+                         "linux: rdtime + POSIX semaphores, for a hosted "
+                         "riscv64 board such as the SpaceMiT K1.")
     ap.add_argument("--core-kinds", default="rvv,scalar",
                     help="comma list of distinct core_kind values the schedule "
                          "uses. One worker thread is spawned per kind. "
@@ -962,11 +1023,13 @@ def main() -> None:
     pool_sizes = [pool_sizes_map.get(k, 0) for k in core_kinds]
 
     src = _emit(networks, args.name, args.dispatch_table_header,
-                core_kinds, backends, pool_sizes, n_instances)
+                core_kinds, backends, pool_sizes, n_instances,
+                platform=args.platform)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
-    print(f"wrote {args.out}  (networks: {networks} "
+    print(f"wrote {args.out}  (platform: {args.platform} "
+          f"networks: {networks} "
           f"instances: {n_instances} kinds: {core_kinds} "
           f"backends: {backends} pool_sizes: {pool_sizes})")
 
