@@ -89,3 +89,20 @@ packages = ["src/modelblaster"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pytest.ini_options]
+# importlib import mode, and why it is not optional here.
+#
+# `tests/` has no __init__.py while `pipeline/tests/` does, so under pytest's
+# default "prepend" mode the two directories can claim the same module name for
+# same-named files. That alone is survivable, but a stale __pycache__ written by
+# a *different* checkout of this repo (there is a sibling clone at
+# /scratch2/agustin/ModelBlaster) then makes collection abort outright with
+# "import file mismatch" -- which is how the documented test command in
+# docs/k1_modelblaster_xpurt_closed_loop.md came to fail for anyone but the
+# person whose cache happened to be warm.
+#
+# importlib mode gives each test file its own module identity derived from its
+# path, so neither the missing __init__.py nor a foreign cache can collide.
+addopts = "--import-mode=importlib"
+testpaths = ["tests", "pipeline/tests"]
