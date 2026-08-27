@@ -1416,6 +1416,26 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q['activation_min']}, {q['activation_max']}, "
                 f"{_f32(alpha)})"
             )
+        elif op["op"] == "leaky_relu_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_leaky_relu_s8({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']}, "
+                f"{_f32(q.get('negative_slope', 0.01))})"
+            )
+        elif op["op"] == "avgpool2d_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_avgpool2d_s8({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh.get('PH', 0)}, {sh.get('PW', 0)}, "
+                f"{sh.get('count_include_pad', 1)})"
+            )
         elif op["op"] == "upsample_nearest_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
