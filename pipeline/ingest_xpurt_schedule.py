@@ -403,22 +403,71 @@ def load(schedule_path: str,
     # whenever the priority queue has multiple runnable entries.
     import heapq
     from collections import defaultdict
+
+    # Data dependencies first, on their own.
+    #
+    # Data deps come from the IR and are ground truth. `time_dependency` is a
+    # different kind of edge: a hardware-serialisation hint that XPU-RT derived
+    # from the *start times* of the dispatches it actually scheduled. Those two
+    # can disagree, and the IR-completion pass above is exactly what makes them
+    # disagree -- it inserts zero-cost ops the scheduler never saw, so the
+    # scheduler's ordering could not have accounted for their edges.
+    #
+    # Observed on the 4-MLP + 2-DroNet + 1-YOLO fixture: dispatch_16 is placed
+    # at 60.306 ms and data-depends on the synthesized dispatch_14, which lands
+    # at 60.467 ms behind 13 &lt;- 12; meanwhile 12 carries time_dependency on 16
+    # because 16 finished on CPU_P#0 the instant 12 started. That closes a
+    # 12 -&gt; 16 -&gt; 14 -&gt; 13 -&gt; 12 loop and made the whole ingest fail.
+    #
+    # So: build the DAG from data deps, which are acyclic by construction, then
+    # admit each time_dep edge only if it does not close a cycle. Dropping an
+    # ordering hint costs nothing correctness-wise -- the data deps still force
+    # every real ordering -- whereas honouring it makes the graph unsortable.
     adj: dict[str, list[str]] = defaultdict(list)
     indeg: dict[str, int] = {k: 0 for k in raw}
     for k, d in raw.items():
-        # Both data deps and time_dep are ordering edges and must
-        # appear before this entry in the table walk.
-        edges = list(d.get("dependencies", []) or [])
-        time_dep_key = d.get("time_dependency")
-        if time_dep_key:
-            edges.append(time_dep_key)
-        for dep in edges:
+        for dep in (d.get("dependencies", []) or []):
             if dep not in raw:
                 # Will be flagged later when we resolve to entry_ids;
                 # don't bookkeep an edge to a non-existent node here.
                 continue
             adj[dep].append(k)
             indeg[k] += 1
+
+    def _reaches(src: str, dst: str) -> bool:
+        """Is dst reachable from src along edges admitted so far?"""
+        if src == dst:
+            return True
+        seen = {src}
+        stack = [src]
+        while stack:
+            for nxt in adj[stack.pop()]:
+                if nxt == dst:
+                    return True
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return False
+
+    dropped_time_deps: list[tuple[str, str]] = []
+    for k, d in sorted(raw.items()):
+        time_dep_key = d.get("time_dependency")
+        if not time_dep_key or time_dep_key not in raw:
+            continue
+        # Edge time_dep_key -> k. It closes a cycle iff k already reaches
+        # time_dep_key.
+        if _reaches(k, time_dep_key):
+            dropped_time_deps.append((k, time_dep_key))
+            continue
+        adj[time_dep_key].append(k)
+        indeg[k] += 1
+
+    if dropped_time_deps:
+        shown = ", ".join(f"{k} <- {t}" for k, t in dropped_time_deps[:4])
+        print(f"ingest: dropped {len(dropped_time_deps)} time_dependency "
+              f"edge(s) that contradicted the IR data-dependency DAG "
+              f"(data deps win): {shown}"
+              + (", ..." if len(dropped_time_deps) > 4 else ""))
 
     heap: list[tuple[float, str]] = []
     for k, n in indeg.items():
