@@ -336,6 +336,13 @@ class _ExportWalker:
             for nname, t in cap.tensors.items():
                 if not isinstance(t, torch.Tensor):
                     continue
+                # Only floating tensors carry an activation scale. Attention
+                # masks are bool and integer index tensors are exact; abs() is
+                # not even defined for Bool ("abs_cpu not implemented for
+                # 'Bool'"), and giving them a scale would be meaningless
+                # anyway -- they are not quantized, they are used as-is.
+                if not t.is_floating_point():
+                    continue
                 abs_t = t.detach().abs()
                 m = float(abs_t.max().item())
                 if nname not in max_abs or m > max_abs[nname]:
@@ -371,6 +378,11 @@ class _ExportWalker:
         first = self.calib[0]
         for k in self.input_order:
             t = first[k]
+            # Same rule as the activation pass: only floating inputs have a
+            # scale. SmolVLA takes a bool attention mask as a model input, and
+            # abs() is not defined for Bool.
+            if not (isinstance(t, torch.Tensor) and t.is_floating_point()):
+                continue
             self.scales[k] = _scale_from_max_abs(t)
 
     def _build_flat_args(self, user_args):
@@ -380,18 +392,52 @@ class _ExportWalker:
         """
         sig = self.ep.graph_signature
         sd = dict(self.ep.state_dict)
+        # Non-persistent buffers are absent from state_dict by definition, but
+        # the graph signature still lists them as inputs. Newer transformers
+        # made rotary-embedding inv_freq non-persistent, so SmolVLA export died
+        # with KeyError on
+        # policy.model.vlm_with_expert.vlm.model.text_model.rotary_emb.inv_freq.
+        # ExportedProgram keeps them in `constants`, and they are also
+        # reachable on the module, so look there before giving up.
+        extra = {}
+        for attr in ("constants", "tensor_constants", "_constants"):
+            c = getattr(self.ep, attr, None)
+            if isinstance(c, dict):
+                extra.update(c)
+        nonpersist = dict(getattr(self.ep, "_non_persistent_buffers", {}) or {})
+        extra.update(nonpersist)
+
+        def _lookup(target):
+            if target in sd:
+                return sd[target]
+            if target in extra:
+                return extra[target]
+            # Last resort: walk the exported module's own buffers.
+            mod = getattr(self.ep, "module", None)
+            mod = mod() if callable(mod) else mod
+            if mod is not None:
+                for name, buf in mod.named_buffers():
+                    if name == target or name.endswith("." + target) \
+                       or target.endswith("." + name):
+                        return buf
+            raise KeyError(
+                f"{target!r} is in the graph signature but in neither the "
+                f"state dict nor the constants; if it is a non-persistent "
+                f"buffer, the exporting torch/transformers pair does not "
+                f"expose it")
+
         flat: list = []
         for spec in sig.input_specs:
             kind = spec.kind.name if hasattr(spec.kind, "name") else str(spec.kind)
             if kind == "PARAMETER":
-                flat.append(sd[spec.target])
+                flat.append(_lookup(spec.target))
             elif kind == "BUFFER":
-                flat.append(sd[spec.target])
+                flat.append(_lookup(spec.target))
             elif kind == "USER_INPUT":
                 # USER_INPUT order matches user_args order.
                 flat.append(user_args[len([f for f in flat if isinstance(f, torch.Tensor) and id(f) in {id(u) for u in user_args}])])
             elif kind == "CONSTANT_TENSOR":
-                flat.append(sd.get(spec.target))
+                flat.append(sd.get(spec.target, extra.get(spec.target)))
             else:
                 raise NotImplementedError(f"input kind {kind} not handled")
         return flat
@@ -2198,8 +2244,16 @@ def main():
     for k in input_names:
         t = calib_sample[k]
         if args.quant == "int8":
-            in_parts.append(
-                _quantize_per_tensor_sym(t, walker.scales[k]).ravel())
+            if k not in walker.scales:
+                # No scale means the input is not floating point -- SmolVLA's
+                # attention mask is bool. Such inputs are not quantized; they
+                # are cast into the int8 buffer as their own values, which for
+                # a mask is exactly 0/1 and is what the kernels compare against.
+                in_parts.append(
+                    t.detach().cpu().numpy().ravel().astype(np.int8))
+            else:
+                in_parts.append(
+                    _quantize_per_tensor_sym(t, walker.scales[k]).ravel())
         elif args.quant == "fp16":
             in_parts.append(t.detach().cpu().numpy().ravel().astype(np.float16))
         else:
