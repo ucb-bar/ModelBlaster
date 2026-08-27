@@ -515,7 +515,8 @@ def report_run(text: str, *, models: Optional[list[str]],
                profile_csv: Optional[str],
                iree_args: IREEProfileArgs, backend_tag: str,
                repo_root: str,
-               quants: Optional[list[str]] = None) -> bool:
+               quants: Optional[list[str]] = None,
+               model_name: Optional[str] = None) -> bool:
     """Single entry point used by both runners after they've captured
     the harness stdout. Walks the OUTPUT/PROFILE/WALL blocks, compares
     each against its golden, prints summaries, writes per-model CSV,
@@ -585,10 +586,17 @@ def report_run(text: str, *, models: Optional[list[str]],
     if wall is not None:
         print(f"wall_clock_cycles={wall} (mtime)")
     if profile is not None and iree_args.profile_out_root:
-        io_abs = os.path.abspath(io_path)
-        model_name = os.path.basename(
-            os.path.dirname(os.path.dirname(os.path.dirname(io_abs)))
-        )
+        # The model name decides where the profile lands in the tree. It used to
+        # be derived purely by walking three directories up from io.npz, which
+        # silently mislabels any layout other than
+        # examples/<model>/<quant>/generated/io.npz -- a K1 build rooted at
+        # build/k1/<model>/<quant>/ filed every profile under "k1". An explicit
+        # name wins; the walk remains the default for existing callers.
+        if model_name is None:
+            io_abs = os.path.abspath(io_path)
+            model_name = os.path.basename(
+                os.path.dirname(os.path.dirname(os.path.dirname(io_abs)))
+            )
         iree_path = emit_iree_profile(profile, model_name, iree_args, backend_tag)
         if iree_path:
             print(f"iree_profile -> {iree_path}")
