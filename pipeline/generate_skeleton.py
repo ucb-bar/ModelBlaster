@@ -1207,6 +1207,44 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
+            # ── Split-tile pointer offset ────────────────────────────
+            # Mirror of the conv2d_s8 arm below. apply_split_hint's own
+            # docstring promises "the kernel call passes weight + t*N/n*K and
+            # bias + t*N/n as offsets" -- but this branch never implemented it,
+            # so every tile read weight rows [0, tile_N) and tile t>0 wrote
+            # those same values into y[t*tile_N ...]. Silent: no crash, no
+            # build error, just wrong numbers above the first tile.
+            #
+            # It survived because the only workload ever split was DroNet,
+            # whose linears are N=1 -- apply_split_hint rejects those on
+            # divisibility before reaching here, so only the conv path was
+            # exercised. The conv comment below describes exactly this bug
+            # being found and fixed for conv alone.
+            #
+            # Weight layout is [N, K] and the kernel indexes weight[n*K + k]
+            # (reference_kernels.py), so tile t starts at row t*tile_N.
+            # Detection note: the linear splitter does NOT set an `axis` key
+            # (unlike the conv one, which sets axis="OC"). It sets `tile_n` and
+            # `tile_offset_N`, and the latter is precisely the first output row
+            # this tile owns -- so use it rather than recomputing tile*tile_n
+            # and risking a second source of truth.
+            sf = op.get("split_from") or {}
+            if sf and "tile_offset_N" in sf:
+                if int(sh.get("M", 1)) != 1:
+                    raise SystemExit(
+                        f"{op.get('name')}: split_from axis=N with M="
+                        f"{sh.get('M')} > 1 is unsupported. Output [M,N] is "
+                        f"row-major, so an N-tile is a STRIDED column slice, "
+                        f"not the contiguous block the offset assumes -- tiles "
+                        f"would overlap and write past the parent buffer. "
+                        f"Split along M, or add strided tile emission first."
+                    )
+                off_n = int(sf["tile_offset_N"])
+                w_off = off_n * int(sh.get("K", 0))
+                b_off = off_n
+                w = f"({w} + {w_off})"
+                if b != "NULL":
+                    b = f"({b} + {b_off})"
             call = (
                 f"parallel_linear_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']}, "
@@ -1237,6 +1275,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # signature on the first dronet split attempt).
             sf = op.get("split_from") or {}
             if sf and sf.get("axis") == "OC":
+                if int(sh.get("N", 1)) != 1:
+                    raise SystemExit(
+                        f"{op.get('name')}: split_from axis=OC with batch N="
+                        f"{sh.get('N')} > 1 is unsupported. Output "
+                        f"[N,OC,OH,OW] makes an OC-slice strided per batch, so "
+                        f"the contiguous offset below would be wrong for every "
+                        f"n > 0."
+                    )
                 tile_idx = int(sf.get("tile", 0))
                 tile_oc = int(sh.get("OC", 0))
                 per_filter = int(sh.get("IC", 0)) * int(sh.get("KH", 0)) * int(sh.get("KW", 0))
