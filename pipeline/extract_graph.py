@@ -95,6 +95,20 @@ def _annotate_dispatches(ops: list[dict]) -> list[int]:
 import operator as _operator
 
 
+def _round_half_away(x):
+    """Round half away from zero, like C's round()/roundf().
+
+    numpy's np.round is half-to-EVEN (banker's rounding), so a value landing
+    exactly on .5 goes the other way from the generated C. On an int8 grid that
+    is a whole LSB of disagreement between the golden simulator and the device,
+    and it shows up as a verify FAIL with max_abs_err=1 that no amount of extra
+    float precision fixes -- the two are computing the same real number and
+    disagreeing about how to round it.
+    """
+    import numpy as _np
+    return _np.sign(x) * _np.floor(_np.abs(x) + 0.5)
+
+
 def _find_getitem_consumer(node, index: int):
     """Return the unique operator.getitem consumer of `node` selecting
     `index`, or None. Used by the torch.max/min handlers to find the
@@ -421,6 +435,7 @@ SUPPORTED_MODULES = (
     torch.nn.Conv2d,
     torch.nn.MaxPool2d,
     torch.nn.AvgPool2d,
+    torch.nn.LSTM,
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
@@ -1279,6 +1294,138 @@ def extract_int8(
                     },
                 })
 
+            elif isinstance(mod, torch.nn.LSTM):
+                # One `lstm_s8` op per layer. The recurrent state is carried in
+                # dedicated tensors that are NOT scratch: they must survive
+                # across run_model() calls, because a recurrent model's
+                # invocation k depends on k-1. generate_skeleton gives any
+                # tensor named `<...>.h_state` / `.c_state` a persistent,
+                # zero-initialised buffer.
+                if mod.batch_first:
+                    raise NotImplementedError(
+                        "int8 extract: LSTM batch_first=True is not supported; "
+                        "the cell expects [seq, batch, feature]")
+                if mod.bidirectional:
+                    raise NotImplementedError(
+                        "int8 extract: bidirectional LSTM is not supported")
+                # nn.LSTM returns (output, (h_n, c_n)), so the FX node for the
+                # module produces a TUPLE and calibration never assigned it a
+                # scale. The tensor everything downstream actually uses arrives
+                # via operator.getitem(node, 0); that is the name our op must
+                # write, and node.name itself never becomes a buffer.
+                out_node = _find_getitem_consumer(node, 0)
+                out_node_name = out_node.name if out_node is not None else None
+                if out_node_name is None:
+                    raise NotImplementedError(
+                        f"int8 extract: LSTM at {node.name} has no "
+                        f"getitem(0) consumer; the hidden-state tuple output "
+                        f"is not supported, only the sequence output")
+                H = int(mod.hidden_size)
+                in_scale = scales[in_name]
+                # The hidden state is a tanh output, so it lives in [-1, 1] and
+                # 1/127 covers it exactly. The cell state is NOT bounded --
+                # f*c + i*g can grow -- so it gets a wider, separate scale.
+                # Sharing one scale between them is the obvious mistake and it
+                # saturates c silently.
+                h_scale = 1.0 / 127.0
+                c_scale = 8.0 / 127.0
+                cur_in = in_name
+                cur_scale = in_scale
+                cur_size = int(tensors_meta[in_name]["shape"][-1])
+                for layer in range(int(mod.num_layers)):
+                    w_ih = getattr(mod, f"weight_ih_l{layer}").detach()
+                    w_hh = getattr(mod, f"weight_hh_l{layer}").detach()
+                    s_ih = _scale_from_max_abs(w_ih)
+                    s_hh = _scale_from_max_abs(w_hh)
+                    q_ih = _quantize_per_tensor_sym(w_ih, s_ih)
+                    q_hh = _quantize_per_tensor_sym(w_hh, s_hh)
+                    has_bias = 1 if mod.bias else 0
+                    # Both bias vectors share the input-side accumulator scale.
+                    b_scale = cur_scale * s_ih
+                    if has_bias:
+                        b_ih = torch.round(
+                            getattr(mod, f"bias_ih_l{layer}").detach()
+                            / b_scale).to(torch.int32).cpu().numpy()
+                        b_hh = torch.round(
+                            getattr(mod, f"bias_hh_l{layer}").detach()
+                            / b_scale).to(torch.int32).cpu().numpy()
+                    else:
+                        b_ih = np.zeros((4 * H,), dtype=np.int32)
+                        b_hh = np.zeros((4 * H,), dtype=np.int32)
+                    base = f"{node.target}.l{layer}"
+                    weights_blob[f"{base}.w_ih_q"] = q_ih
+                    weights_blob[f"{base}.w_hh_q"] = q_hh
+                    weights_blob[f"{base}.b_ih_q"] = b_ih
+                    weights_blob[f"{base}.b_hh_q"] = b_hh
+                    h_name = f"{base}.h_state"
+                    c_name = f"{base}.c_state"
+                    for nm, sc in ((h_name, h_scale), (c_name, c_scale)):
+                        tensors_meta[nm] = {
+                            "shape": [1, H], "dtype": "i8",
+                            "quant": {"scale": sc, "zero_point": 0},
+                            "persistent": True,
+                        }
+                        scales[nm] = sc
+                    out_nm = (out_node_name
+                              if layer == int(mod.num_layers) - 1
+                              else f"{base}.out")
+                    if out_nm != out_node_name:
+                        tensors_meta[out_nm] = {
+                            "shape": [1, H], "dtype": "i8",
+                            "quant": {"scale": h_scale, "zero_point": 0},
+                        }
+                        scales[out_nm] = h_scale
+                    ops.append({
+                        "name": base,
+                        "op": "lstm_s8",
+                        "inputs": [cur_in],
+                        "outputs": [out_nm],
+                        "state": [h_name, c_name],
+                        "weight": f"{base}.w_ih_q",
+                        "weight_hh": f"{base}.w_hh_q",
+                        "bias": f"{base}.b_ih_q",
+                        "bias_hh": f"{base}.b_hh_q",
+                        "shape": {"input_size": cur_size, "hidden_size": H},
+                        "quant": {
+                            "scale_in": cur_scale,
+                            "scale_w_ih": float(s_ih),
+                            "scale_w_hh": float(s_hh),
+                            "scale_b": float(b_scale),
+                            "scale_h": h_scale,
+                            "scale_c": c_scale,
+                            "has_bias": has_bias,
+                        },
+                    })
+                    cur_in = out_nm
+                    cur_scale = h_scale
+                    cur_size = H
+                # The final layer's h IS the module output. Register it under
+                # the getitem name with the scale the kernel actually writes.
+                tensors_meta[out_node_name] = {
+                    "shape": [1, H], "dtype": "i8",
+                    "quant": {"scale": h_scale, "zero_point": 0},
+                }
+                scales[out_node_name] = h_scale
+                # The getitem that unpacks (output, (h, c)) is now redundant:
+                # our op already wrote its tensor. Skip it in the main walk, the
+                # same way chunk's getitem consumers are skipped.
+                _skip_nodes.add(out_node)
+                # `y, _ = self.lstm(x)` also produces a getitem(1) for the
+                # (h_n, c_n) tuple. When it is discarded -- which is how both
+                # VitFly and this test model use it -- skip it. If something
+                # actually consumes it, say so rather than silently dropping
+                # the state the caller asked for: the state lives in the
+                # persistent buffers and is not exposed as a tensor.
+                state_node = _find_getitem_consumer(node, 1)
+                if state_node is not None:
+                    if len(state_node.users) > 0:
+                        raise NotImplementedError(
+                            "int8 extract: LSTM (h_n, c_n) output is consumed "
+                            "at {}; the recurrent state is held in persistent "
+                            "buffers and is not exposed as a tensor".format(
+                                state_node.name))
+                    _skip_nodes.add(state_node)
+
             elif isinstance(mod, torch.nn.LeakyReLU):
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[in_name]["shape"]))
@@ -1536,6 +1683,26 @@ def extract_int8(
                     "shape": {"N": N_, "C": C, "H": H_, "W": W_,
                               "c_each": c_each},
                 })
+            elif target_name in ("unsqueeze", "squeeze"):
+                # Pure rank changes: the element order and count are unchanged,
+                # so this is a view like flatten. LSTM inputs need one of these
+                # to reach [seq, batch, feature].
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
+                scales[node.name] = scales[in_name]
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                if n != int(np.prod(tensors_meta[node.name]["shape"])):
+                    raise NotImplementedError(
+                        f"int8 extract: {target_name} at {node.name} changed "
+                        f"the element count; only rank changes are views")
+                ops.append({
+                    "name": node.name,
+                    "op": "view",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                })
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported call_method "
@@ -1697,6 +1864,42 @@ def extract_int8(
             v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "lstm_s8":
+            sh = op["shape"]; q = op["quant"]
+            H = sh["hidden_size"]; IS = sh["input_size"]
+            # float64 throughout, matching the kernel's double: the op is
+            # evaluated in floating point, so golden and device agree only if
+            # both land well inside half an int8 LSB. float32 on both sides
+            # still disagreed by up to 2 LSB.
+            w_ih = weights_blob[op["weight"]].astype(np.float64) * float(q["scale_w_ih"])
+            w_hh = weights_blob[op["weight_hh"]].astype(np.float64) * float(q["scale_w_hh"])
+            b = np.zeros((4 * H,), dtype=np.float64)
+            if q["has_bias"]:
+                b = ((weights_blob[op["bias"]] + weights_blob[op["bias_hh"]])
+                     .astype(np.float64) * float(q["scale_b"]))
+            h_name, c_name = op["state"]
+            # Persistent state: zero on the first step, then whatever the
+            # previous invocation left. The simulator has to model that or the
+            # golden diverges from the device on step 2 onwards.
+            h_q = activations.get(h_name)
+            c_q = activations.get(c_name)
+            h = (np.zeros(H, np.float64) if h_q is None
+                 else h_q.reshape(-1).astype(np.float64) * float(q["scale_h"]))
+            c = (np.zeros(H, np.float64) if c_q is None
+                 else c_q.reshape(-1).astype(np.float64) * float(q["scale_c"]))
+            x = in_arr.reshape(-1).astype(np.float64) * float(q["scale_in"])
+            g = w_ih @ x[:IS] + w_hh @ h + b
+            i_g = 1.0 / (1.0 + np.exp(-g[0:H]))
+            f_g = 1.0 / (1.0 + np.exp(-g[H:2*H]))
+            g_g = np.tanh(g[2*H:3*H])
+            o_g = 1.0 / (1.0 + np.exp(-g[3*H:4*H]))
+            c_new = f_g * c + i_g * g_g
+            h_new = o_g * np.tanh(c_new)
+            cq = np.clip(_round_half_away(c_new / float(q["scale_c"])), -128, 127).astype(np.int8)
+            hq = np.clip(_round_half_away(h_new / float(q["scale_h"])), -128, 127).astype(np.int8)
+            activations[c_name] = cq.reshape(1, H)
+            activations[h_name] = hq.reshape(1, H)
+            activations[out_name] = hq.reshape(1, H)
         elif op["op"] == "leaky_relu_s8":
             q = op["quant"]
             fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
@@ -2919,7 +3122,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend"])
+                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend", "lstm_tiny", "vitfly_lstm"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2958,6 +3161,10 @@ def main() -> None:
         from modelblaster.models import yolov8_nano_64 as model_mod
     elif args.model == "vitfly_frontend":
         from modelblaster.models import vitfly_frontend as model_mod
+    elif args.model == "lstm_tiny":
+        from modelblaster.models import lstm_tiny as model_mod
+    elif args.model == "vitfly_lstm":
+        from modelblaster.models import vitfly_lstm as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()

@@ -1416,6 +1416,29 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q['activation_min']}, {q['activation_max']}, "
                 f"{_f32(alpha)})"
             )
+        elif op["op"] == "lstm_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            h_ptr = ptr_for(op["state"][0], "inout")
+            c_ptr = ptr_for(op["state"][1], "inout")
+            # h_state / c_state are ordinary intermediates, which means
+            # file-scope arrays in buffers.c -- .bss, so zero-initialised once
+            # and retained across run_model() calls. That is precisely the
+            # recurrence: invocation k reads what invocation k-1 wrote. Nothing
+            # resets them between calls, deliberately.
+            call = (
+                f"kernel_lstm_s8({in_ptr}, "
+                f"{_weight_name(model_name, op['weight'])}, "
+                f"{_weight_name(model_name, op['weight_hh'])}, "
+                f"{_weight_name(model_name, op['bias'])}, "
+                f"{_weight_name(model_name, op['bias_hh'])}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, "
+                f"{sh['input_size']}, {sh['hidden_size']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_w_ih'])}, "
+                f"{_f32(q['scale_w_hh'])}, {_f32(q['scale_b'])}, "
+                f"{_f32(q['scale_h'])}, {_f32(q['scale_c'])}, "
+                f"{q['has_bias']})"
+            )
         elif op["op"] == "leaky_relu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
