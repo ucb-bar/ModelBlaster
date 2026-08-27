@@ -1445,9 +1445,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "lstm_s8":
             x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"])
-            whh = _weight_name(model_name, op["weight_hh"])
-            b = _weight_name(model_name, op["bias"])
+            wih = _weight_name(model_name, op["weight_ih"], backend)
+            whh = _weight_name(model_name, op["weight_hh"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             h_ptr = ptr_for(op["state"]["h"], "in")
             c_ptr = ptr_for(op["state"]["c"], "in")
             sh = op["shape"]
@@ -1461,9 +1461,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "lstm":
             x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"])
-            whh = _weight_name(model_name, op["weight_hh"])
-            b = _weight_name(model_name, op["bias"])
+            wih = _weight_name(model_name, op["weight_ih"], backend)
+            whh = _weight_name(model_name, op["weight_hh"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             h_ptr = ptr_for(op["state"]["h"], "in")
             c_ptr = ptr_for(op["state"]["c"], "in")
             sh = op["shape"]
@@ -1771,9 +1771,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "lstm_f16":
             x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"])
-            whh = _weight_name(model_name, op["weight_hh"])
-            b = _weight_name(model_name, op["bias"])
+            wih = _weight_name(model_name, op["weight_ih"], backend)
+            whh = _weight_name(model_name, op["weight_hh"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             h_ptr = ptr_for(op["state"]["h"], "in")
             c_ptr = ptr_for(op["state"]["c"], "in")
             sh = op["shape"]
