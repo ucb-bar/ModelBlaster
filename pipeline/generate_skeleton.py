@@ -512,9 +512,33 @@ def _umid(model_name: str) -> str:
     return _c_ident(model_name).upper()
 
 
-def _weight_name(model_name: str, weight_key: str) -> str:
-    """Mangled weight-blob symbol name: <model>_<weight_key>."""
-    return f"{_mid(model_name)}_{_c_ident(weight_key)}"
+def _weight_name(model_name: str, weight_key: str,
+                  backend: Optional[str] = None) -> str:
+    """Mangled weight-blob symbol name: <model>_<weight_key>[_<backend>].
+
+    The backend suffix is required whenever a heterogeneous (multi-backend)
+    binary links more than one backend's weights.c together: different
+    backends can pack the SAME logical tensor in different physical
+    layouts (e.g. RVV's IHWOC vs scalar's native OIHW -- see
+    _backend_pack_weight below), so without a distinguishing suffix two
+    backends' weights.c would define the identical, non-static symbol
+    name with DIFFERENT data. The build silently linked only one of them
+    (observed: xpurt_demo always picked the first-listed backend's
+    weights.c), and every other backend's kernels then read that
+    backend's weight data through the wrong layout -- a deterministic
+    wrong-answer bug, not a link error, since only one definition ever
+    got compiled in. Root-caused via dronet (max_abs_err=51, reproduced
+    identically whether the kernel was a curated RVV kernel or the plain
+    scalar reference_impl -- the kernel logic was never the problem, the
+    multi-backend link was). Suffixing unconditionally (not just for
+    layout-sensitive conv weights) keeps this simple and collision-proof;
+    the extra duplication for backend-invariant bias/scale vectors is
+    negligible next to the conv weight tensors themselves.
+    """
+    ident = f"{_mid(model_name)}_{_c_ident(weight_key)}"
+    if backend:
+        ident += f"_{_c_ident(backend)}"
+    return ident
 
 
 def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
@@ -606,7 +630,7 @@ def emit_weights(
                "#include <stdint.h>",
                "", "#ifdef __cplusplus", 'extern "C" {', "#endif", ""]
     for k in keys:
-        ident = _weight_name(model_name, k)
+        ident = _weight_name(model_name, k, backend)
         c_type, _ = _np_to_c_dtype(weights[k].dtype)
         size = weights[k].size
         h_lines.append(f"extern const {c_type} {ident}[{size}];")
@@ -619,7 +643,7 @@ def emit_weights(
         c_lines.append(f"/* backend-packed layout: {backend} */")
     c_lines.append("")
     for k in keys:
-        ident = _weight_name(model_name, k)
+        ident = _weight_name(model_name, k, backend)
         arr_in = weights[k]
         arr_out, layout_tag = _backend_pack_weight(arr_in, backend)
         c_type, _ = _np_to_c_dtype(arr_out.dtype)
@@ -659,7 +683,8 @@ def _shape_str(op: dict) -> str:
     return ";".join(parts)
 
 
-def emit_model(ir: dict[str, Any], out_dir: str) -> None:
+def emit_model(ir: dict[str, Any], out_dir: str,
+               backend: Optional[str] = None) -> None:
     in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
@@ -909,8 +934,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         shape_lit = _shape_str(op)
         if op["op"] == "linear":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             # Parallel-for variant: dispatches the outer N dimension onto
             # `pool` when M==1 and the pool has >1 worker. In single-model
@@ -931,8 +956,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_elu({in_ptr}, {out_ptr}, {n}, {_f32(alpha)})"
         elif op["op"] == "conv2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             # Parallel-for variant: dispatches the outer OC dimension onto
             # `pool` when N==1 and the pool has >1 worker. Falls back to
@@ -975,8 +1000,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_log_softmax({in_ptr}, {out_ptr}, {sh['M']}, {sh['K']})"
         elif op["op"] == "layer_norm":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            gamma = _weight_name(model_name, op["gamma_key"])
-            beta = _weight_name(model_name, op["beta_key"])
+            gamma = _weight_name(model_name, op["gamma_key"], backend)
+            beta = _weight_name(model_name, op["beta_key"], backend)
             sh = op["shape"]
             eps = op.get("eps", 1e-5)
             call = (
@@ -985,8 +1010,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "group_norm":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            gamma = _weight_name(model_name, op["gamma_key"])
-            beta = _weight_name(model_name, op["beta_key"])
+            gamma = _weight_name(model_name, op["gamma_key"], backend)
+            beta = _weight_name(model_name, op["beta_key"], backend)
             sh = op["shape"]
             eps = op.get("eps", 1e-5)
             call = (
@@ -1000,8 +1025,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_add({a_ptr}, {b_ptr}, {out_ptr}, {n})"
         elif op["op"] == "batchnorm2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"])
+            s = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             sh = op["shape"]
             call = (
                 f"kernel_batchnorm2d({in_ptr}, {s}, {b}, {out_ptr}, "
@@ -1126,8 +1151,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_frobenius_norm({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "conv2d_dw":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_conv2d_dw({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -1137,8 +1162,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "conv_transpose2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_conv_transpose2d({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -1149,8 +1174,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] in ("conv3d", "conv_transpose3d"):
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_{op['op']}({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -1285,8 +1310,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "linear_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -1308,8 +1333,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_relu6_s8({in_ptr}, {out_ptr}, {n}, {qmax})"
         elif op["op"] == "conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -1346,8 +1371,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "batchnorm2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"])
+            s = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -1412,12 +1437,12 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # ---- ViNT per-channel weight-scale variants (Phase B.2) ----
         elif op["op"] == "conv2d_s8_pc":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
-            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"])
-            shift = _weight_name(model_name, q["output_shift_per_oc_key"])
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
             call = (
                 f"kernel_conv2d_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
@@ -1430,12 +1455,12 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "linear_s8_pc":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
-            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"])
-            shift = _weight_name(model_name, q["output_shift_per_oc_key"])
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
             call = (
                 f"kernel_linear_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']}, "
@@ -1447,8 +1472,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # ---- ViNT s8 ops ----
         elif op["op"] == "depthwise_conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             # Channel count for depthwise: groups == OC == IC.
@@ -1523,8 +1548,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
             q = op["quant"]
-            gamma = _weight_name(model_name, q["gamma_key"]) if q.get("gamma_key") else "NULL"
-            beta = _weight_name(model_name, q["beta_key"]) if q.get("beta_key") else "NULL"
+            gamma = _weight_name(model_name, q["gamma_key"], backend) if q.get("gamma_key") else "NULL"
+            beta = _weight_name(model_name, q["beta_key"], backend) if q.get("beta_key") else "NULL"
             call = (
                 f"kernel_layer_norm_s8({in_ptr}, {gamma}, {beta}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, "
@@ -1605,8 +1630,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_sigmoid_f16({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "batchnorm2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"])
+            s = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             sh = op["shape"]
             call = (
                 f"kernel_batchnorm2d_f16({in_ptr}, {s}, {b}, {out_ptr}, "
@@ -1625,8 +1650,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "conv2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -1656,8 +1681,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # ---- ViNT fp16 op set ----
         elif op["op"] == "linear_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_linear_f16({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -1665,8 +1690,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "depthwise_conv2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_depthwise_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -1676,8 +1701,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "layer_norm_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            gamma = _weight_name(model_name, op["gamma_key"])
-            beta = _weight_name(model_name, op["beta_key"])
+            gamma = _weight_name(model_name, op["gamma_key"], backend)
+            beta = _weight_name(model_name, op["beta_key"], backend)
             sh = op["shape"]
             eps = op.get("eps", 1e-5)
             call = (
@@ -1865,7 +1890,17 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             f"    {per_disp_call};\n"
             f"    unsigned long _e = rdcycle();\n"
             f"{inspect_block}"
-            f"    int slot = n_++;\n"
+            # Wrap rather than grow unbounded: records_[] is sized for one
+            # pass (MODEL_..._OP_COUNT). The xpurt schedule-driven runtime
+            # invokes dispatches straight through the per-dispatch table
+            # (bypassing run_model_{mid}()'s n_=0 reset and reset_profile()),
+            # so for a periodic network n_ keeps climbing across every
+            # instance in the run. Without the modulo, more than one
+            # instance's worth of cumulative dispatches wrote straight past
+            # the end of this static array and corrupted adjacent memory
+            # (observed: a Load access fault a few dispatches into a
+            # schedule with 58 periodic instances of one network).
+            f"    int slot = (n_++) % MODEL_{umid}_OP_COUNT;\n"
             f'    records_[slot].dispatch_id = {dispatch_id};\n'
             f'    records_[slot].name   = "{op["name"]}";\n'
             f'    records_[slot].op     = "{op["op"]}";\n'
@@ -1954,7 +1989,10 @@ void run_model_{mid}(const model_{mid}_input_t *input,
 }}
 
 const model_{mid}_op_record_t *model_{mid}_profile_records(int *count) {{
-    *count = n_;
+    /* n_ can exceed records_[]'s capacity for a periodic network driven
+     * through the schedule (see the wrap comment on the write side above)
+     * -- cap what we report so callers never index past the array. */
+    *count = (n_ < MODEL_{umid}_OP_COUNT) ? n_ : MODEL_{umid}_OP_COUNT;
     return records_;
 }}
 
@@ -2106,7 +2144,7 @@ def generate(
     model_name = ir["name"]
 
     emit_weights(model_name, weights, out_dir, backend=backend)
-    emit_model(ir, out_dir)
+    emit_model(ir, out_dir, backend=backend)
     emit_test_io(model_name, io_path, out_dir)
 
     files = ["weights.h", "weights.c", "model.h", "model.c",
