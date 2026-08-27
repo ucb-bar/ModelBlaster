@@ -55,3 +55,4 @@ yolov8n.pt
 # the JSON reports.
 artifacts/bundle/**/run_stdout.log
 artifacts/bundle/**/uartlog
+build/k1_xpurt/
