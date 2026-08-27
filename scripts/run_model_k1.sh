@@ -82,5 +82,5 @@ fi
 "${PY}" -m modelblaster.validation.k1_runner \
     --elf "${BIN}" --host "${HOST}" --cpu "${CPU}" \
     --io "${GEN}/io.npz" --quant "${QUANT}" \
-    --profile-csv "${GEN}/profile_k1.csv" \
+    --profile-csv "${GEN}/profile_k1.csv" --model-name "${MODEL}" \
     --repo-root "${REPO_ROOT}" "${PROFILE_ARGS[@]}"
