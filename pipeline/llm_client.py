@@ -63,7 +63,15 @@ def make_llm_client(
         # import in shells that don't have Claude Code installed.
         from modelblaster.pipeline.claude_code_client import ClaudeCodeClient
         return ClaudeCodeClient(log_path=log_path)
+    if name == "codex":
+        # Lazy for the same reason: constructing CodexClient probes for the
+        # `codex` binary. Note there is deliberately no fallback from here to
+        # bedrock -- if Codex is unavailable the kernel step must fail loudly
+        # and the caller falls back to reference/curated kernels, not to a
+        # different model provider.
+        from modelblaster.pipeline.codex_client import CodexClient
+        return CodexClient(log_path=log_path)
     raise RuntimeError(
         f"unknown LLM_PROVIDER={name!r} "
-        "(expected 'gemini', 'bedrock', or 'claude_code')"
+        "(expected 'gemini', 'bedrock', 'claude_code', or 'codex')"
     )
