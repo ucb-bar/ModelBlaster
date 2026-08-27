@@ -5998,6 +5998,24 @@ def _silu_s8_argtypes():
             ctypes.c_int, ctypes.c_int]
 
 
+def _leaky_relu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, scale_in, scale_out, activation_min, activation_max,
+    # negative_slope
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float]
+
+
+def _avgpool2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW, count_include_pad
+    return [i8p, i8p] + [ctypes.c_int] * 11
+
+
 def _elu_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -8277,6 +8295,122 @@ void kernel_vint_action_post(const int8_t *dist_int8, float scale_dist,
 )
 
 
+LEAKY_RELU_S8 = KernelSpec(
+    op="leaky_relu_s8",
+    signature=(
+        "void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max, float negative_slope)"
+    ),
+    semantics=(
+        "Quantized elementwise LeakyReLU on a contiguous int8 buffer with\n"
+        "symmetric per-tensor quantization (zero_point = 0).\n"
+        "  LeakyReLU(x) = x                    if x > 0\n"
+        "                 negative_slope * x   if x <= 0\n"
+        "Dequantize, apply, requantize:\n"
+        "  f = input[i] * scale_in\n"
+        "  y = f > 0 ? f : negative_slope * f\n"
+        "  out = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "\n"
+        "Like elu_s8 this is a 256-entry function of the input byte for a given\n"
+        "(scale_in, scale_out, negative_slope), so an LUT variant is the obvious\n"
+        "curated optimisation. Unlike elu_s8 there is no transcendental, so the\n"
+        "direct form already vectorises: compare, select, scale."
+    ),
+    reference_impl=r"""
+void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n,
+                          float scale_in, float scale_out,
+                          int activation_min, int activation_max,
+                          float negative_slope) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = (f > 0.0f) ? f : negative_slope * f;
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}, {"n": 395}],
+    argtypes_factory=_leaky_relu_s8_argtypes,
+)
+
+
+AVGPOOL2D_S8 = KernelSpec(
+    op="avgpool2d_s8",
+    signature=(
+        "void kernel_avgpool2d_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int IH, int IW, int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int count_include_pad)"
+    ),
+    semantics=(
+        "Quantized 2D average pooling over NCHW int8 with symmetric per-tensor\n"
+        "quantization (zero_point = 0) and IDENTICAL input and output scale, so\n"
+        "no requantization is needed -- the mean of values on a scale is on the\n"
+        "same scale.\n"
+        "  OH = (IH + 2*PH - KH) / SH + 1\n"
+        "  OW = (IW + 2*PW - KW) / SW + 1\n"
+        "Accumulate in int32, divide by the window count, round half away from\n"
+        "zero to match PyTorch's quantized avg_pool2d:\n"
+        "  out = (sum >= 0) ? (sum + cnt/2)/cnt : -((-sum + cnt/2)/cnt)\n"
+        "\n"
+        "count_include_pad selects the divisor: non-zero divides by KH*KW\n"
+        "regardless of how much of the window lies in padding; zero divides by\n"
+        "the in-bounds count only. Padded positions contribute 0 to the sum (the\n"
+        "quantized zero) either way, so the two differ only in the divisor.\n"
+        "Getting it backwards is silent: it shifts border values and nothing\n"
+        "else."
+    ),
+    reference_impl=r"""
+#include <stdint.h>
+
+void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
+                         int N, int C, int IH, int IW,
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int count_include_pad) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t sum = 0;
+                    int cnt = 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                                sum += (int32_t)input[((n*C + c)*IH + ih)*IW + iw];
+                                cnt++;
+                            }
+                        }
+                    }
+                    int div = count_include_pad ? (KH*KW) : (cnt > 0 ? cnt : 1);
+                    int32_t v;
+                    if (sum >= 0) v = (sum + div/2) / div;
+                    else          v = -(((-sum) + div/2) / div);
+                    if (v < -128) v = -128;
+                    if (v > 127) v = 127;
+                    output[((n*C + c)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 10, "IH": 8, "IW": 8, "KH": 3, "KW": 3,
+         "SH": 1, "SW": 1, "PH": 0, "PW": 0, "count_include_pad": 1},
+        {"N": 1, "C": 4, "IH": 5, "IW": 5, "KH": 2, "KW": 2,
+         "SH": 2, "SW": 2, "PH": 0, "PW": 0, "count_include_pad": 1},
+    ],
+    argtypes_factory=_avgpool2d_s8_argtypes,
+)
+
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -8368,6 +8502,8 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "silu_s8": SILU_S8,
     # mlp_control int8 support (PPO actor uses nn.ELU).
     "elu_s8": ELU_S8,
+    "leaky_relu_s8": LEAKY_RELU_S8,
+    "avgpool2d_s8": AVGPOOL2D_S8,
     # Phase 1d pair-fused linear+elu. Eliminates the intermediate-tensor
     # write/read between consecutive linear_s8 + elu_s8 ops (the mlp_control
     # chain has three such pairs). LLM-codegen seeds describe rvv_opu

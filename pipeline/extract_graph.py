@@ -420,6 +420,7 @@ SUPPORTED_MODULES = (
     torch.nn.ELU,
     torch.nn.Conv2d,
     torch.nn.MaxPool2d,
+    torch.nn.AvgPool2d,
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
@@ -1278,6 +1279,57 @@ def extract_int8(
                     },
                 })
 
+            elif isinstance(mod, torch.nn.LeakyReLU):
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "leaky_relu_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in":  scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128,
+                        "activation_max": 127,
+                        "negative_slope": float(mod.negative_slope),
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool2d):
+                _record(node.name, dtype="i8")
+                in_shape = tensors_meta[in_name]["shape"]
+                out_shape = tensors_meta[node.name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                _, _, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                SH, SW = _pair(mod.stride if mod.stride is not None
+                               else mod.kernel_size)
+                PH, PW = _pair(mod.padding)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "avgpool2d_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {
+                        "N": N_, "C": C,
+                        "IH": IH, "IW": IW,
+                        "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                        "count_include_pad": 1 if mod.count_include_pad else 0,
+                    },
+                })
+                # Averaging values on a scale leaves them on that scale, so
+                # like MaxPool this does not requantize. Overwrite the
+                # calibrated scale so downstream consumers read the right one --
+                # leaving the calibrated value here would silently rescale the
+                # tensor.
+                tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
+                scales[node.name] = scales[in_name]
+
             elif isinstance(mod, torch.nn.Upsample):
                 if mod.mode != "nearest":
                     raise NotImplementedError(
@@ -1645,6 +1697,46 @@ def extract_int8(
             v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "leaky_relu_s8":
+            q = op["quant"]
+            fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            slope = np.float32(q.get("negative_slope", 0.01))
+            y = np.where(fv > 0, fv, slope * fv).astype(np.float32)
+            v = np.round(y / np.float32(q["scale_out"])).astype(np.int32)
+            v = np.clip(v, q["activation_min"], q["activation_max"])
+            activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "avgpool2d_s8":
+            sh = op["shape"]
+            in_4d = in_arr.reshape(sh["N"], sh["C"], sh["IH"], sh["IW"])
+            KH, KW = sh["KH"], sh["KW"]
+            SH, SW = sh["SH"], sh["SW"]
+            PH, PW = sh["PH"], sh["PW"]
+            cip = bool(sh.get("count_include_pad", 1))
+            OH, OW = sh["OH"], sh["OW"]
+            # Pad with the quantized zero, which is the real 0 under symmetric
+            # per-tensor quantization -- so padded taps contribute nothing to
+            # the sum and only the divisor distinguishes count_include_pad.
+            padded = np.pad(in_4d.astype(np.int32),
+                            ((0, 0), (0, 0), (PH, PH), (PW, PW)))
+            valid = np.pad(np.ones_like(in_4d, dtype=np.int32),
+                           ((0, 0), (0, 0), (PH, PH), (PW, PW)))
+            out = np.zeros((sh["N"], sh["C"], OH, OW), dtype=np.int8)
+            for oh in range(OH):
+                for ow in range(OW):
+                    win = padded[:, :, oh*SH:oh*SH+KH, ow*SW:ow*SW+KW]
+                    tot = win.sum(axis=(2, 3))
+                    if cip:
+                        div = np.full_like(tot, KH * KW)
+                    else:
+                        div = valid[:, :, oh*SH:oh*SH+KH,
+                                    ow*SW:ow*SW+KW].sum(axis=(2, 3))
+                        div = np.maximum(div, 1)
+                    # round half away from zero, matching the C kernel
+                    v = np.where(tot >= 0,
+                                 (tot + div // 2) // div,
+                                 -((-tot + div // 2) // div))
+                    out[:, :, oh, ow] = np.clip(v, -128, 127).astype(np.int8)
+            activations[out_name] = out
         elif op["op"] == "upsample_nearest_s8":
             sh = op["shape"]
             scale = sh["scale"]
@@ -2827,7 +2919,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
                     choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64"])
+                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -2864,6 +2956,8 @@ def main() -> None:
         from modelblaster.models import yolov8_nano as model_mod
     elif args.model == "yolov8_nano_64":
         from modelblaster.models import yolov8_nano_64 as model_mod
+    elif args.model == "vitfly_frontend":
+        from modelblaster.models import vitfly_frontend as model_mod
     else:
         raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()
