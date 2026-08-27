@@ -6009,6 +6009,17 @@ def _leaky_relu_s8_argtypes():
             ctypes.c_float]
 
 
+def _sin_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, i8p, ctypes.c_int, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+def _cos_s8_argtypes():
+    return _sin_s8_argtypes()
+
+
 def _layernorm_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8); f32p = ctypes.POINTER(ctypes.c_float)
@@ -8683,6 +8694,83 @@ void kernel_rmsnorm_s8(const int8_t *input, const float *gamma,
 
 
 
+SIN_S8 = KernelSpec(
+    op="sin_s8",
+    signature=(
+        "void kernel_sin_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise sin on a contiguous int8 buffer, symmetric\n"
+        "per-tensor quantization (zero_point = 0).\n"
+        "  out = clamp(round(sin(input[i] * scale_in) / scale_out),\n"
+        "              activation_min, activation_max)\n"
+        "\n"
+        "Used by rotary position embedding (RoPE), which is where SmolVLA's\n"
+        "sin/cos nodes come from. Note the accuracy caveat that applies to\n"
+        "RoPE specifically: the ARGUMENT is a position-derived angle whose\n"
+        "range is large, and an int8 grid over a wide angular range is coarse.\n"
+        "In practice RoPE tables are computed once in float and the int8 form\n"
+        "is only appropriate when scale_in keeps the angle inside a few\n"
+        "radians. This kernel is exact against its own definition; whether\n"
+        "quantizing the angle is the right thing to do is a model question,\n"
+        "not a kernel question."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_sin_s8(const int8_t *input, int8_t *output, int n,
+                   float scale_in, float scale_out,
+                   int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        const double y = sin((double)input[i] * (double)scale_in);
+        int32_t v = (int32_t)round(y / (double)scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}],
+    argtypes_factory=_sin_s8_argtypes,
+)
+
+
+COS_S8 = KernelSpec(
+    op="cos_s8",
+    signature=(
+        "void kernel_cos_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise cos. Same contract and the same RoPE caveat as\n"
+        "sin_s8; see that kernel's notes."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_cos_s8(const int8_t *input, int8_t *output, int n,
+                   float scale_in, float scale_out,
+                   int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        const double y = cos((double)input[i] * (double)scale_in);
+        int32_t v = (int32_t)round(y / (double)scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}],
+    argtypes_factory=_cos_s8_argtypes,
+)
+
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -8779,6 +8867,8 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "lstm_s8": LSTM_S8,
     "layernorm_s8": LAYERNORM_S8,
     "rmsnorm_s8": RMSNORM_S8,
+    "sin_s8": SIN_S8,
+    "cos_s8": COS_S8,
     # Phase 1d pair-fused linear+elu. Eliminates the intermediate-tensor
     # write/read between consecutive linear_s8 + elu_s8 ops (the mlp_control
     # chain has three such pairs). LLM-codegen seeds describe rvv_opu
