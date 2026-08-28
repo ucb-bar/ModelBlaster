@@ -27,6 +27,8 @@
 #   -DXPURT_MAIN_C=<path>                 generated xpurt_main.c (--platform linux)
 #   -DXPURT_INCLUDE_DIR=<path>            dir holding the generated .h files
 #   -DMODELBLASTER_KERNEL_CFLAGS_<BACKEND>=...   e.g. "-march=rv64gcv_zvl256b"
+#   -DMODELBLASTER_KERNEL_CC=<abs path>   compile every kernels.c with THIS
+#                                         compiler instead of CMAKE_C_COMPILER
 #   -DMODELBLASTER_XPURT_TRACE=ON         emit the trace CSV block
 #   -DMODELBLASTER_POOL_THREADS=N         parallel-for pool size
 
@@ -172,11 +174,76 @@ foreach(_i RANGE ${_last})
         # Kernel cflags are scoped to kernels.c only: model.c uses no
         # intrinsics, and keeping -march off it avoids surprises.
         string(TOUPPER "MODELBLASTER_KERNEL_CFLAGS_${_bs}" _cflags_var)
+        set(_kflags "")
         if(DEFINED ${_cflags_var} AND NOT "${${_cflags_var}}" STREQUAL "")
             separate_arguments(_kflags UNIX_COMMAND "${${_cflags_var}}")
             set_source_files_properties("${_backend_dir}/kernels.c"
                 TARGET_DIRECTORY ${_obj_tgt}
                 PROPERTIES COMPILE_OPTIONS "${_kflags}")
+        endif()
+
+        # MODELBLASTER_KERNEL_CC compiles kernels.c with a DIFFERENT compiler,
+        # mirroring harness_linux/Makefile's KERNEL_CC. The Zvfh intrinsics the
+        # curated fp16 kernels use (vfloat16m4_t, vfmacc.vv f16, vfredusum.vs
+        # f16) do not exist in GCC 13.2, the only riscv64-unknown-linux-gnu
+        # compiler installed here; GCC >= 14 has them. kernels.c is a leaf TU
+        # whose only external references are libm, so an object built by a
+        # bare-metal riscv64-unknown-elf gcc of the same lp64d ABI links into
+        # this glibc binary and runs -- verified on the board via harness_linux.
+        #
+        # Without this the fp16 build can only run standalone, never in a
+        # schedule. That is not an academic gap: the pure-int8 fused_full the
+        # scheduler could otherwise build is the configuration whose fuse layer
+        # requantizes the camera and ToF branches to all-zero (scale ratios
+        # 0.0011 and 0.0026 against the output scale), so the only fused_full
+        # that can be SCHEDULED is the one that cannot see.
+        #
+        # Done with an explicit custom command, not C_COMPILER_LAUNCHER: a
+        # launcher PREFIXES the compiler rather than replacing it, so it would
+        # have quietly kept using 13.2 -- the silent-fallback shape this
+        # pipeline has been bitten by twice. CMake takes a .o as a source, so
+        # the object joins the link the ordinary way.
+        #
+        # Explicit opt-in, never a search: a build must not silently change
+        # compilers. The fp16 kernels carry an #error naming this variable, so a
+        # 13.2 build fails by name rather than falling back to scalar.
+        if(DEFINED MODELBLASTER_KERNEL_CC AND NOT "${MODELBLASTER_KERNEL_CC}" STREQUAL "")
+            if(NOT EXISTS "${MODELBLASTER_KERNEL_CC}")
+                message(FATAL_ERROR
+                    "MODELBLASTER_KERNEL_CC='${MODELBLASTER_KERNEL_CC}' does not "
+                    "exist. Pass an absolute path to a riscv64 GCC >= 14, or "
+                    "leave it unset to use ${CMAKE_C_COMPILER}.")
+            endif()
+            # Drop kernels.c from the CMake-compiled object library; the custom
+            # command below owns it. model.c stays on the default compiler --
+            # it is the TU that references the runtime and the pool.
+            get_target_property(_srcs ${_obj_tgt} SOURCES)
+            list(REMOVE_ITEM _srcs "${_backend_dir}/kernels.c")
+            set_property(TARGET ${_obj_tgt} PROPERTY SOURCES ${_srcs})
+
+            set(_kobj "${CMAKE_CURRENT_BINARY_DIR}/mb_${_name}_${_bs}_kernels.o")
+            set(_kdefs -DMODELBLASTER_USE_POOL=1
+                       -DMODELBLASTER_DISABLE_UNMANGLED=1
+                       -DMODELBLASTER_PLATFORM_LINUX=1)
+            foreach(_kv IN LISTS _rename_defs)
+                list(APPEND _kdefs "-D${_kv}")
+            endforeach()
+            add_custom_command(
+                OUTPUT "${_kobj}"
+                COMMAND "${MODELBLASTER_KERNEL_CC}"
+                        -O2 ${_kflags} ${_kdefs}
+                        -I "${_backend_dir}" -I "${_RUNTIME_DIR}"
+                        -I "${_RUNTIME_DIR}/modelblaster_pool"
+                        -c "${_backend_dir}/kernels.c" -o "${_kobj}"
+                DEPENDS "${_backend_dir}/kernels.c"
+                COMMENT "kernels.c [${_name}/${_bs}] with ${MODELBLASTER_KERNEL_CC}"
+                VERBATIM)
+            target_sources(xpurt_harness PRIVATE "${_kobj}")
+            set_source_files_properties("${_kobj}" PROPERTIES
+                EXTERNAL_OBJECT TRUE GENERATED TRUE)
+            message(STATUS
+                "harness_xpurt_linux: ${_name}/${_bs} kernels.c -> "
+                "${MODELBLASTER_KERNEL_CC}")
         endif()
 
         target_link_libraries(xpurt_harness PRIVATE ${_obj_tgt})
