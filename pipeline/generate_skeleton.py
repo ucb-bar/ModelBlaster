@@ -640,6 +640,36 @@ def _shape_str(op: dict) -> str:
     op with C_inputs=[16, 16, 16] becomes ``C_inputs=16|16|16``.
     """
     sh = op.get("shape", {})
+
+    # A FUSED op carries no `shape` of its own -- the real dimensions live on
+    # its sub_ops -- so this returned "" and profile_writer rendered the
+    # module_name as `..._<op>_noshape`. Every fused conv in a model then shared
+    # ONE signature: 57 of yolov8_nano's 90 dispatches keyed to
+    # `conv2d_batchnorm2d_silu_s8_noshape`, spanning 0.605 to 17.465 ms -- a 29x
+    # range under a single join key.
+    #
+    # That breaks the one rule that makes cross-rung comparison possible. Joins
+    # must key on module_name and never on dispatch_id, because a split or a
+    # realize-hint renumbers everything downstream; but a key 57 dispatches
+    # share is not a key, and the first rewrite touching that family would make
+    # yolov8_nano unjoinable.
+    #
+    # The producing sub_op's shape is the honest source: for conv+BN+SiLU the
+    # convolution's dimensions determine the work, and the later stages are
+    # elementwise over its output. Codegen is unaffected -- every fused branch
+    # reads sub[i]["shape"] directly and never op["shape"].
+    if not sh:
+        for sub in (op.get("sub_ops") or ()):
+            if sub.get("shape"):
+                sh = sub["shape"]
+                break
+
+    # `op["shape"]` is often present-but-None rather than absent, so the
+    # `.get(..., {})` default never fires and a genuinely shapeless op reaches
+    # the loop below as None. Normalise here instead of at each caller.
+    if not sh:
+        sh = {}
+
     parts: list[str] = []
     for k in sh:
         v = sh[k]
