@@ -52,7 +52,9 @@ counterparts are discovered from the rewritten IR (`<tensor>.tile_<i>` for a
 split, the same name for a fusion) and concatenated in tile order, which is the
 parent buffer's own layout.
 
-Exit 0 identical, 1 differing, 2 could not be established.
+Exit 0 identical, 1 differing, 2 could not be established,
+3 the rewrite is faithful but the BASELINE build already disagrees with
+its golden (a property of the build, not of the rewrite).
 """
 
 from __future__ import annotations
@@ -206,8 +208,21 @@ def main(argv=None) -> int:
         "n_differing": int((diff != 0).sum()),
         "tiles_all_identical": bool(tiles_identical),
     }
-    ok = (res["max_abs_diff"] == 0 and base_err == 0 and new_err == 0
-          and not tiles_identical)
+    # TWO QUESTIONS, TWO ANSWERS. "Did the rewrite change anything?" is a
+    # property of the REWRITE. "Does this model match its golden?" is a
+    # property of the BASELINE BUILD, true or false before any rewrite exists.
+    # Collapsing both into one exit code makes a clean rewrite on a model with
+    # a pre-existing golden discrepancy indistinguishable from a rewrite that
+    # broke the model -- and the first is the one you keep, so the difference
+    # matters. Measured: yolov8_nano's 320x320 build reports max_abs_err=4.0
+    # on the host scalar-reference path for the UNMODIFIED graph, while the
+    # deployed 64x96 build reports 0.0; a split of the 320x320 graph is
+    # element-for-element identical and was still reported as a failure.
+    faithful = (res["max_abs_diff"] == 0 and not tiles_identical
+                and base_err == new_err)
+    ok = faithful and base_err == 0 and new_err == 0
+    res["rewrite_faithful"] = bool(faithful)
+    res["baseline_matches_golden"] = bool(base_err == 0)
     res["bit_exact"] = bool(ok)
     res["expectation"] = (
         "bit-exact. An OC/N tile partitions outputs without reordering any "
@@ -219,7 +234,18 @@ def main(argv=None) -> int:
     if tiles_identical:
         print("FAIL every tile produced identical values -- the tile weight "
               "pointers are not distinct (the tile_offset defect)")
-    return 0 if ok else 1
+    if ok:
+        return 0
+    if faithful:
+        print(f"REWRITE FAITHFUL, BASELINE NOT CLEAN: the rewritten op's "
+              f"output is element-for-element identical and the golden error "
+              f"is unchanged at {base_err}, but the BASELINE build already "
+              f"disagrees with its golden by {base_err}. That is a property "
+              f"of the model/build, not of this rewrite -- fix or explain it "
+              f"before quoting timings, but do not read this as the rewrite "
+              f"breaking anything.")
+        return 3
+    return 1
 
 
 if __name__ == "__main__":
