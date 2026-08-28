@@ -469,6 +469,20 @@ def apply_hint(
     # Gantt labels) silently re-attaches to the wrong op after a rewrite.
     # Every id-bearing input op appears exactly once; absorbed group
     # members map to their fused op's id (many old -> one new).
+    # `dispatches` is documented by extract_graph as "the ordered list of
+    # dispatch_ids" (:57), and it was being carried through the rewrite
+    # unchanged -- so every rewritten graph on disk describes the PRE-rewrite
+    # dispatch set. Measured: a fused mlp_control graph with 4 ops still
+    # claimed 7 dispatches; a split DroNet graph with 22 ops claimed 21.
+    #
+    # It is currently harmless on the main path because emit_dispatch_graph
+    # walks `ops`, not this field. It is not harmless everywhere:
+    # ModelBlaster/scripts/plot_frequency_sweep_v2.py:105 reads
+    # `len(fx["dispatches"])` as the op count, which is wrong by exactly the
+    # rewrite delta -- silently, and in a plot.
+    if isinstance(out.get("dispatches"), list):
+        out["dispatches"] = [o["dispatch_id"] for o in new_ops
+                             if o.get("dispatch_id") is not None]
     out["id_remap"] = {str(old): new for old, new in sorted(id_remap.items())}
     return out
 

@@ -237,3 +237,39 @@ class IdRemapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheDispatchListTracksTheRewrite(unittest.TestCase):
+    """`dispatches` must describe the graph it ships with.
+
+    extract_graph documents this field as "the ordered list of dispatch_ids"
+    (:57), and both rewriters used to carry it through untouched -- so every
+    rewritten graph on disk described the PRE-rewrite dispatch set. Measured
+    before the fix: a fused mlp_control graph with 4 ops still claimed 7
+    dispatches; a split DroNet graph with 22 ops claimed 21; a 213-op split
+    claimed 212.
+
+    Harmless on the main path, because emit_dispatch_graph walks `ops`. Not
+    harmless in general: scripts/plot_frequency_sweep_v2.py:105 reads
+    `len(fx["dispatches"])` as the op count, so it was wrong by exactly the
+    rewrite delta, silently, inside a plot.
+    """
+
+    def test_split_grows_the_list_by_the_tiles_it_added(self):
+        g = _g(_linear_op(0, "lin", 1, 32, 64))
+        g["dispatches"] = [o["dispatch_id"] for o in g["ops"]]
+        before = len(g["dispatches"])
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        ids = [o["dispatch_id"] for o in out["ops"]
+               if o.get("dispatch_id") is not None]
+        self.assertEqual(out["dispatches"], ids)
+        self.assertEqual(len(out["dispatches"]), before + 1,
+                         "one op became two")
+
+    def test_a_graph_without_the_field_does_not_gain_one(self):
+        """Only maintained where it already existed -- the rewriters must not
+        invent structure the input did not have."""
+        g = _g(_linear_op(0, "lin", 1, 32, 64))
+        g.pop("dispatches", None)
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        self.assertNotIn("dispatches", out)
