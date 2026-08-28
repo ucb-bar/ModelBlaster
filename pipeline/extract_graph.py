@@ -890,17 +890,34 @@ def extract_int8(
     # Graph-level BN folding, BEFORE ShapeProp/calibration/quantization —
     # a folded model has no batchnorm2d nodes at all, so everything
     # downstream (activation calibration, op emission) just never sees them.
-    # `fold_conv_bn` (default True) is a knob because folding is NOT free on a
-    # heterogeneous SoC. It removes a real N*C*H*W pass and lets Gemmini skip an
-    # op it cannot make bit-exact -- but it also destroys a SCHEDULING degree of
-    # freedom: an unfused batchnorm2d is its own dispatch and can be placed on
-    # whichever core is good at it, whereas conv+bn is indivisible and must run
-    # wholly on one. Measured on yolov8_nano: folding takes the graph from 204
-    # to 155 dispatches and the best-per-dispatch heterogeneous work from 50.43
-    # to 66.77 (32% WORSE), collapsing the value of having two different cores
-    # from 6.71x to 2.48x -- even though every individual kernel got faster.
-    # Keep it on for single-core targets; turn it off to hand the scheduler back
-    # the per-op placement choice.
+    # `fold_conv_bn` (default True) is a knob because folding removes a
+    # SCHEDULING degree of freedom on a heterogeneous SoC: an unfused
+    # batchnorm2d is its own dispatch and can be placed on whichever core is
+    # good at it, whereas conv+bn is indivisible and must run wholly on one.
+    #
+    # That DOF turns out to be worthless in practice. Controlled A/B on
+    # yolov8_nano, both arms on ONE AWS F2 bitstream
+    # (f2_dual_small_norose_tacit_q31_60mhz) with one curated kernel set
+    # (2026-08-28, kernel_opt_log id bnfold-ab-VERDICT):
+    #
+    #     folding ON   155 dispatches  best-per-dispatch 67.61 ms  floor 65.97 ms
+    #     folding OFF  212 dispatches  best-per-dispatch 68.94 ms  floor 67.25 ms
+    #     two-core specialisation gain 2.44x -> 2.41x (unchanged)
+    #
+    # i.e. unfolding is ~2% WORSE, not better. Folding is essentially free
+    # (it is absorbed into the conv's weights and requant scale — conv2d_s8
+    # best-per-dispatch only moves 57.76 -> 57.89 ms), so unfolding just adds
+    # 1.21 ms of batchnorm2d_s8 and buys no placement freedom: the scheduler
+    # puts all 57 BN dispatches on the Saturn core, the same core that already
+    # takes all 57 silu_s8 and every other elementwise op. The RVV arm also
+    # loses bit-exactness (max_abs_err 0 -> 1 LSB) to the curated BN kernel.
+    #
+    # An earlier note here claimed 204->155 dispatches and 50.43->66.77 ms
+    # (32% worse) with specialisation collapsing 6.71x->2.48x. That comparison
+    # was confounded — the two profiles came from different bitstreams
+    # (firesim_rocket_saturn vs F2 SatGemDualSmall) AND different graphs — and
+    # it does not survive the controlled A/B above. Keep folding ON; this flag
+    # is for investigation, not a win.
     folded_bn_names = _fold_conv_bn(gm) if fold_conv_bn else []
     ShapeProp(gm).propagate(*sample_inputs)
 
@@ -3480,16 +3497,17 @@ def main() -> None:
                     action="store_false",
                     default=os.environ.get("MB_NO_BN_FOLDING", "0") != "1",
                     help="disable graph-level batchnorm->conv folding (on by "
-                         "default). Folding removes an N*C*H*W pass and an op "
-                         "Gemmini cannot make bit-exact, but on a HETEROGENEOUS "
-                         "SoC it also removes a scheduling choice: an unfused "
-                         "batchnorm2d is its own dispatch and can be placed on "
-                         "whichever core suits it, while conv+bn must run whole "
-                         "on one core. Measured on yolov8_nano, folding takes "
-                         "204 dispatches down to 155 and makes the best "
-                         "per-dispatch heterogeneous work 32%% WORSE (50.43 -> "
-                         "66.77), collapsing two-core specialisation from 6.71x "
-                         "to 2.48x. Also settable via MB_NO_BN_FOLDING=1.")
+                         "default). Unfolding hands the scheduler a placement "
+                         "choice back (a standalone batchnorm2d is its own "
+                         "dispatch; conv+bn must run whole on one core), but a "
+                         "controlled same-bitstream A/B on yolov8_nano showed "
+                         "that choice is worth nothing: 155 -> 212 dispatches, "
+                         "best-per-dispatch 67.61 -> 68.94 ms and greedy floor "
+                         "makespan 65.97 -> 67.25 ms (both ~2%% WORSE), "
+                         "two-core specialisation gain flat at 2.44x -> 2.41x, "
+                         "and the RVV arm drops from bit-exact to 1 LSB. Use "
+                         "for investigation, not as an optimization. Also "
+                         "settable via MB_NO_BN_FOLDING=1.")
     ap.add_argument("--enable-fusion", action="store_true",
                     default=os.environ.get("MB_ENABLE_FUSION", "0") == "1",
                     help="opt-in extended operator fusion (beyond the "
