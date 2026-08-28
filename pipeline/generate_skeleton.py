@@ -917,7 +917,7 @@ def split_conv_tile_weights(
     # graph in the repo today) must not pay for -- or depend on -- that.
     tiles = [op for op in ir.get("ops", [])
              if (op.get("split_from") or {}).get("axis") == "OC"
-             and op.get("op") == "conv2d_s8"]
+             and op.get("op") in _OC_SLICEABLE_CONV_OPS]
     if not tiles:
         return {}
     layout = _conv_weight_layout_for_backend(backend)
@@ -927,12 +927,18 @@ def split_conv_tile_weights(
     for op in tiles:
         sf = op["split_from"]
         did = op.get("dispatch_id")
-        if did is None or not op.get("weight"):
+        # A FUSED conv keeps its weight, bias and shape on `sub_ops[0]`, not on
+        # itself. Reading them off the op directly finds nothing, so the tile
+        # is dropped from the plan and silently falls back to the pointer
+        # arithmetic this whole function exists to replace -- correct on
+        # scalar, corrupt on rvv, and invisible in the emitted C.
+        weight = _conv_weight_of(op)
+        if did is None or not weight:
             continue
-        sh = op.get("shape") or {}
+        sh = _conv_shape_of(op)
         plan[did] = {
-            "weight": op["weight"],
-            "bias": op.get("bias"),
+            "weight": weight,
+            "bias": _conv_bias_of(op),
             "tile": int(sf.get("tile", 0)),
             "n_splits": int(sf.get("n_splits", 1)),
             "tile_oc": int(sh.get("OC", 0)),
@@ -946,16 +952,29 @@ def split_conv_tile_weights(
 _SHARD_W_SUFFIX = ".shard_"
 
 
-#: Conv ops an OC shard can be built for. Deliberately NOT `_PARALLELIZED_OPS`:
-#: that set drives the offset-based wrappers, which have no template for the
-#: fused ops and are compiled out on a repacking backend anyway. These three
-#: are where the time is -- `conv2d_batchnorm2d_silu_s8` alone is 97% of
-#: yolov8n and `conv2d_batchnorm2d_s8` is 29% of DroNet.
-_SHARDABLE_CONV_OPS = {
+#: Conv ops whose OC axis can be sliced at codegen. One set, because it is one
+#: property, exercised by two mechanisms: a split TILE (`apply_split_hint`, one
+#: dispatch per slice, sliced here) and an intra-op SHARD (`shard_conv_weights`,
+#: one pool task per slice). Either way OC is an output axis, so slicing it
+#: partitions output elements and reorders no accumulation, and the epilogue
+#: parameters (`bias`, `bn_scale`, `bn_bias`) are 1-D per-output-channel so
+#: their slice is a plain `+ oc0`.
+#:
+#: Deliberately NOT `_PARALLELIZED_OPS`: that set drives the offset-based
+#: wrappers, which have no template for the fused ops and are compiled out on a
+#: repacking backend anyway. These three are where the time is --
+#: `conv2d_batchnorm2d_silu_s8` alone is 97% of yolov8n and
+#: `conv2d_batchnorm2d_s8` is 29% of DroNet, so a slicing path that refuses
+#: them can only reach ops too cheap for the slicing to matter.
+_OC_SLICEABLE_CONV_OPS = {
     "conv2d_s8",
     "conv2d_batchnorm2d_s8",
     "conv2d_batchnorm2d_silu_s8",
 }
+
+#: The shard path's name for the same set, kept because `shard_conv_weights`
+#: documents itself in those terms.
+_SHARDABLE_CONV_OPS = _OC_SLICEABLE_CONV_OPS
 
 
 def _conv_shape_of(op: dict[str, Any]) -> dict[str, Any]:
@@ -979,6 +998,21 @@ def _conv_weight_of(op: dict[str, Any]) -> Optional[str]:
     for sub in (op.get("sub_ops") or ()):
         if sub.get("op", "").startswith("conv2d") and sub.get("weight"):
             return sub["weight"]
+    return None
+
+
+def _conv_bias_of(op: dict[str, Any]) -> Optional[str]:
+    """The conv's bias, whether the op is plain or fused.
+
+    The epilogue's OWN bias (`bn_bias`) is deliberately not returned: it is a
+    different tensor with a different dtype, and the OC slicing here applies to
+    both only by coincidence of them sharing a length.
+    """
+    if op.get("weight") and op.get("bias"):
+        return op["bias"]
+    for sub in (op.get("sub_ops") or ()):
+        if sub.get("op", "").startswith("conv2d") and sub.get("bias"):
+            return sub["bias"]
     return None
 
 
@@ -1135,6 +1169,59 @@ def _apply_tile_weight_plan(
     return extra, drop
 
 
+def _oc_tile_operands(
+    op: dict[str, Any], sh: dict[str, Any],
+    tile_w_plan: dict[int, dict[str, Any]], model_name: str,
+    w: str, b: str, per_oc: tuple[str, ...] = (),
+) -> tuple[str, str, list[str]]:
+    """Retarget one OC split tile's operands at its own slice of the weights.
+
+    Returns `(weight, bias, per_oc_sliced)`; a no-op for anything that is not
+    an `axis="OC"` tile, so callers can apply it unconditionally.
+
+    `per_oc` names 1-D per-output-channel arrays -- a fused op's `bn_scale` and
+    `bn_bias`. Those are contiguous under EVERY backend layout, because
+    `_backend_pack_weight` only permutes 4-D tensors, so `+ oc0` reaches this
+    tile's slice for them in every case. The 4-D WEIGHT is the one an offset
+    cannot express on a repacking backend, and that is what `tile_w_plan` is
+    for: there the tile reads its own re-packed array from element 0 instead.
+
+    This is the codegen-time twin of what `parallel_cbs_shard_fn` does at
+    runtime, and deliberately the same arithmetic -- `b + oc0`,
+    `bn_* + oc0`, `out + oc0*OH*OW`, `OC = oc_per` -- because that path's OC
+    slicing was measured bit-exact on the board.
+    """
+    sf = op.get("split_from") or {}
+    if sf.get("axis") != "OC":
+        return w, b, list(per_oc)
+    if int(sh.get("N", 1)) != 1:
+        raise SystemExit(
+            f"{op.get('name')}: split_from axis=OC with batch N="
+            f"{sh.get('N')} > 1 is unsupported. Output [N,OC,OH,OW] makes an "
+            f"OC-slice strided per batch, so the contiguous offsets below "
+            f"would be wrong for every n > 0.")
+    tile_idx = int(sf.get("tile", 0))
+    tile_oc = int(sh.get("OC", 0))
+    oc0 = tile_idx * tile_oc
+    spec = tile_w_plan.get(op.get("dispatch_id"))
+    if spec is not None:
+        # Backend packs conv weights away from OIHW (IHWOC for rvv), so an OC
+        # slice is STRIDED and no pointer offset can express it -- the tile
+        # gets its own array, re-packed with OC = tile_oc, and reads it from
+        # element 0. See `split_conv_tile_weights` for the two-way failure
+        # this replaces.
+        w = _weight_name(model_name, _tile_key(spec["weight"], tile_idx))
+        if spec.get("bias"):
+            b = _weight_name(model_name, _tile_key(spec["bias"], tile_idx))
+    else:
+        per_filter = (int(sh.get("IC", 0)) * int(sh.get("KH", 0))
+                      * int(sh.get("KW", 0)))
+        w = f"({w} + {oc0 * per_filter})"
+        if b != "NULL":
+            b = f"({b} + {oc0})"
+    return w, b, [f"({nm} + {oc0})" for nm in per_oc]
+
+
 def emit_weights(
     model_name: str,
     weights: dict[str, np.ndarray],
@@ -1175,8 +1262,13 @@ def emit_weights(
                 if (op.get("split_from") or {}).get("axis") == "OC":
                     return False
                 return op.get("dispatch_id") not in sharded_ids
+            # Conv-aware on both sides: a fused op's weight is on `sub_ops[0]`,
+            # so `op.get("weight")` reports None for it and a parent read only
+            # by fused ops would look unreferenced and be dropped.
             still_used = {
-                op.get("weight") for op in ir.get("ops", []) if _reads_parent(op)
+                _conv_weight_of(op) for op in ir.get("ops", []) if _reads_parent(op)
+            } | {
+                _conv_bias_of(op) for op in ir.get("ops", []) if _reads_parent(op)
             } | {
                 op.get("bias") for op in ir.get("ops", []) if _reads_parent(op)
             }
@@ -1388,9 +1480,13 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             # is recoverable from the tile output: strip ".tile_<i>" suffix.
             tile_out = op["outputs"][0]
             base = tile_out.rsplit(f".tile_{tile_idx}", 1)[0]
-            sh = op.get("shape", {})
+            # `_conv_shape_of`, not `op["shape"]`: a fused conv has no shape
+            # of its own and would fall through to the `else` below with
+            # elem_offset 0, i.e. every tile writing over tile 0's output.
+            sh = _conv_shape_of(op) if op["op"] in _OC_SLICEABLE_CONV_OPS \
+                else op.get("shape", {})
             elem_offset = 0
-            if axis == "OC" and op["op"] == "conv2d_s8":
+            if axis == "OC" and op["op"] in _OC_SLICEABLE_CONV_OPS:
                 # Output buffer shape [N, OC, OH, OW]; tile slice is
                 # tile_oc rows of (OH*OW) elements at offset
                 # tile_idx * tile_oc * OH * OW.
@@ -1938,44 +2034,12 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # ── Split-tile pointer offset ────────────────────────────
             # When apply_split_hint produces a tile op (split_from
             # metadata, axis="OC"), the weight/bias pointers passed to
-            # the kernel call must point at this tile's OC-slice:
-            #   weight + t*tile_oc*IC*KH*KW
-            #   bias   + t*tile_oc
+            # the kernel call must point at this tile's OC-slice.
             # Without this, every tile reads OC=[0..tile_oc) of the
             # weight tensor, producing 1/n_splits correct outputs and
             # wrong ones elsewhere (matches the round-002 max_abs_err
             # signature on the first dronet split attempt).
-            sf = op.get("split_from") or {}
-            if sf and sf.get("axis") == "OC":
-                if int(sh.get("N", 1)) != 1:
-                    raise SystemExit(
-                        f"{op.get('name')}: split_from axis=OC with batch N="
-                        f"{sh.get('N')} > 1 is unsupported. Output "
-                        f"[N,OC,OH,OW] makes an OC-slice strided per batch, so "
-                        f"the contiguous offset below would be wrong for every "
-                        f"n > 0."
-                    )
-                tile_idx = int(sf.get("tile", 0))
-                tile_oc = int(sh.get("OC", 0))
-                spec = tile_w_plan.get(op.get("dispatch_id"))
-                if spec is not None:
-                    # Backend packs conv weights away from OIHW (IHWOC for
-                    # rvv), so an OC slice is STRIDED and no pointer offset can
-                    # express it -- the tile gets its own array, re-packed with
-                    # OC = tile_oc, and reads it from element 0. See
-                    # `split_conv_tile_weights` for the two-way failure this
-                    # replaces.
-                    w = _weight_name(model_name, _tile_key(op["weight"], tile_idx))
-                    if op.get("bias"):
-                        b = _weight_name(model_name,
-                                         _tile_key(op["bias"], tile_idx))
-                else:
-                    per_filter = int(sh.get("IC", 0)) * int(sh.get("KH", 0)) * int(sh.get("KW", 0))
-                    w_off = tile_idx * tile_oc * per_filter
-                    b_off = tile_idx * tile_oc
-                    w = f"({w} + {w_off})"
-                    if b != "NULL":
-                        b = f"({b} + {b_off})"
+            w, b, _ = _oc_tile_operands(op, sh, tile_w_plan, model_name, w, b)
             sspec = shard_w_plan.get(op.get("dispatch_id"))
             if sspec is not None:
                 # Sharded: a static table of the per-shard arrays, and the
@@ -2094,6 +2158,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             sh = sub_conv["shape"]
             qc = sub_conv["quant"]
             qb = sub_bn["quant"]
+            # An OC split tile narrows sh["OC"] and retargets every operand at
+            # its own slice; a no-op for an unsplit op.
+            w, b, (bn_s, bn_b) = _oc_tile_operands(
+                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b))
             call = (
                 f"kernel_conv2d_batchnorm2d_s8({in_ptr}, {w}, {b}, "
                 f"{bn_s}, {bn_b}, {out_ptr}, "
@@ -2120,6 +2188,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             qc = sub_conv["quant"]
             qb = sub_bn["quant"]
             qs = sub_silu["quant"]
+            w, b, (bn_s, bn_b) = _oc_tile_operands(
+                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b))
             sspec = shard_w_plan.get(op.get("dispatch_id"))
             if sspec is not None:
                 n_sh = int(sspec["n_shards"])
