@@ -34,6 +34,23 @@ cd "${REPO_ROOT}"
 
 SCHEDULE=""
 MODELS="mlp_control,dronet"
+# <network>:<dir>,... -- networks whose IR is ALREADY BUILT and is supplied
+# rather than extracted. Two cases need this and neither is exotic:
+#
+#   * a network whose name is not a `models/` module. `networks_dense2` calls
+#     its detector `yolov8_nano_64x96`; that is the `yolov8_nano` module built
+#     at a different input size, registered under its own name so specs built
+#     against the 160x160 profile still reproduce. `extract_graph --model
+#     yolov8_nano_64x96` has nothing to extract.
+#   * A REWRITTEN IR. `apply_split_hint` / `apply_fusion_hint` /
+#     `apply_unfuse_hint` produce a graph.json that no `--model` can regenerate
+#     -- which is the entire point of the granularity loop. Without this the
+#     runner cannot execute the thing the loop produces.
+#
+# The staged IR is COPIED, its sha256 recorded, and its provenance written to
+# `.staged_from` -- deliberately NOT `.extract_config`, so a staged graph can
+# never be mistaken for an extracted one by the reuse check.
+STAGED_IRS=""
 BACKENDS="rvv_x60,rvv_x60"
 QUANT="int8"
 # reference = curated/hand-written kernels, no LLM. Codex is only for NEW kernel
@@ -91,6 +108,7 @@ while [[ $# -gt 0 ]]; do
         --schedule)  SCHEDULE="$2"; shift 2 ;;
         --registry)  REGISTRY="$2"; shift 2 ;;
         --models)    MODELS="$2"; shift 2 ;;
+        --staged-ir) STAGED_IRS="${STAGED_IRS:+${STAGED_IRS},}$2"; shift 2 ;;
         --backends)  BACKENDS="$2"; shift 2 ;;
         --quant)     QUANT="$2"; shift 2 ;;
         --out-root)  OUT_ROOT="$2"; shift 2 ;;
@@ -137,6 +155,56 @@ mkdir -p "${GEN_DIR}" "${BUILD_DIR}"
 echo "=== 1/5 generate per-(model, backend) sources ==="
 MODEL_NAMES=""
 MODEL_DIRS_BASE=""
+
+# Stage supplied IRs first, so the loop below finds them in place and treats
+# them exactly like an extracted model from that point on.
+STAGED_SET=""
+if [[ -n "${STAGED_IRS}" ]]; then
+    IFS=',' read -r -a _staged <<< "${STAGED_IRS}"
+    for spec in "${_staged[@]}"; do
+        net="${spec%%:*}"; src="${spec#*:}"
+        [[ "${net}" != "${spec}" ]] || { echo "--staged-ir needs <network>:<dir>, got ${spec}" >&2; exit 2; }
+        [[ -d "${src}" ]] || { echo "--staged-ir ${net}: no such directory ${src}" >&2; exit 2; }
+        for f in graph.json weights.npz io.npz; do
+            [[ -f "${src}/${f}" ]] || { echo "--staged-ir ${net}: ${src}/${f} missing" >&2; exit 2; }
+        done
+        dst="${REPO_ROOT}/${OUT_ROOT}/${net}/${QUANT}"
+        _sha="$(sha256sum "${src}/graph.json" | cut -d" " -f1)"
+        if [[ -f "${dst}/.staged_from" ]] && grep -q "sha256=${_sha}\b" "${dst}/.staged_from"; then
+            echo "  [${net}] staged IR unchanged (sha256 ${_sha:0:12})"
+        else
+            echo "  [${net}] staging IR from ${src} (sha256 ${_sha:0:12})"
+            mkdir -p "${dst}"
+            cp "${src}/graph.json" "${src}/weights.npz" "${src}/io.npz" "${dst}/"
+            # The IR's own `name` becomes the NETWORK name. Every generated C
+            # symbol is mangled by it -- `model_<name>_op_record_t`,
+            # `MODEL_<NAME>_OUTPUT_SIZE`, `dispatch_<name>_<id>` -- while
+            # xpurt_main.c mangles from the SCHEDULE's network name. Leave them
+            # different and the harness fails to compile against a type it just
+            # generated under another name. This is a rename, not a rewrite:
+            # the graph is otherwise byte-identical, which is why the recorded
+            # sha256 is of the SOURCE file.
+            ${PY} - "${dst}/graph.json" "${net}" <<'PY_RENAME'
+import json, sys
+path, net = sys.argv[1], sys.argv[2]
+g = json.load(open(path))
+was = g.get("name")
+if was != net:
+    g["name"] = net
+    g["_staged_rename"] = {"from": was, "to": net}
+    json.dump(g, open(path, "w"), indent=1)
+    print(f"      renamed IR {was!r} -> {net!r} (C symbols mangle by this)")
+PY_RENAME
+            # The generated sources descend from this IR, so they are stale.
+            rm -f "${dst}"/*/kernels.c "${dst}"/*/model.c
+            printf 'source=%s\nsha256=%s\nstaged_at=%s\n' \
+                "$(cd "${src}" && pwd)" "${_sha}" "$(date -Is)" > "${dst}/.staged_from"
+        fi
+        # A staged graph must never satisfy the extraction reuse check.
+        rm -f "${dst}/.extract_config"
+        STAGED_SET="${STAGED_SET} ${net} "
+    done
+fi
 for model in "${MODEL_LIST[@]}"; do
     base="${REPO_ROOT}/${OUT_ROOT}/${model}/${QUANT}"
     mkdir -p "${base}"
@@ -157,12 +225,20 @@ for model in "${MODEL_LIST[@]}"; do
     # Dying was the good case: the two graphs differ in PRECISION, so a
     # dispatch-count coincidence would have run the blind int8 model under the
     # hybrid's name and reported its timings.
+    if [[ "${STAGED_SET}" == *" ${model} "* ]]; then
+        echo "  [${model}] using staged IR ($(sed -n 's/^source=//p' "${base}/.staged_from"))"
+        _skip_extract=1
+    else
+        _skip_extract=0
+    fi
     _cfg_file="${base}/.extract_config"
     _cfg="model=${model} quant=${QUANT}"
     for _v in $(compgen -v | grep -E '^(MB_|MODELBLASTER_|NUM_CALIBRATION)' | sort); do
         _cfg="${_cfg} ${_v}=${!_v}"
     done
-    if [[ -f "${base}/graph.json" && -f "${_cfg_file}" ]] \
+    if [[ "${_skip_extract}" == "1" ]]; then
+        :
+    elif [[ -f "${base}/graph.json" && -f "${_cfg_file}" ]] \
        && [[ "$(cat "${_cfg_file}")" == "${_cfg}" ]]; then
         echo "  [${model}] reusing ${base}/graph.json"
     else
@@ -272,7 +348,8 @@ MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
 ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --schedule "${SCHEDULE}" --out "${MAIN_C}" --name "${SCHED_NAME}" \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
-    --platform linux --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}"
+    --platform linux --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
+    --networks "${MODELS}"
 
 echo "=== 4/5 cross-build ==="
 CMAKE_ARGS=(
