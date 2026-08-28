@@ -40,40 +40,67 @@
 #define __RISCV_VXRM_RDN 2 /* round-down / truncate */
 #define __RISCV_VXRM_ROD 3 /* round-to-odd */
 
-/* Set vxrm explicitly rather than trusting the reset value: the CSR is
- * per-hart architectural state and another thread's kernel could have left it
- * elsewhere. Cheap -- one csrwi, hoisted out of any loop. */
-static inline void mb_rvv_vxrm_init(void)
+/* Set the rounding mode the caller asked for.
+ *
+ * The first version of this header asserted the mode was RNU and dropped the
+ * argument, on the reasoning that every curated kernel used RNU. That was
+ * wrong, and the assertion caught it: yolov8's cat kernel uses RDN
+ * (round-down). Dropping a mode argument silently would have rounded the wrong
+ * way -- a quiet numerical difference, not a build error, in exactly the class
+ * of code where nobody would look.
+ *
+ * So the shim WRITES the CSR instead. That is what the pre-1.0 API expects the
+ * caller to do, so the semantics match the v1.0 intrinsic exactly for every
+ * mode rather than for one of them.
+ *
+ * Cost is one csrw per call. The alternative -- hoisting it out of the loop --
+ * would need to know that nothing in the loop body changes vxrm, which is not
+ * something a header can know about a kernel it does not see. */
+static inline void mb_rvv_set_vxrm(int mode)
 {
-	__asm__ volatile("csrwi vxrm, 0" ::: "memory");
+	__asm__ volatile("csrw vxrm, %0" :: "r"(mode) : "memory");
 }
 
-/* Compile-time guard: these rewrites are only valid for RNU. */
-#define MB_VXRM_ASSERT_RNU(m) \
-	((void)sizeof(char[1 - 2 * !((m) == __RISCV_VXRM_RNU)]))
+static inline void mb_rvv_vxrm_init(void)
+{
+	mb_rvv_set_vxrm(__RISCV_VXRM_RNU);
+}
 
 #define __riscv_vsmul_vx_i32m4(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vsmul_vx_i32m4(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vsmul_vx_i32m4(vs2, rs1, vl))
 #define __riscv_vsmul_vv_i32m4(vs2, vs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vsmul_vv_i32m4(vs2, vs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vsmul_vv_i32m4(vs2, vs1, vl))
 #define __riscv_vsmul_vx_i32m2(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vsmul_vx_i32m2(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vsmul_vx_i32m2(vs2, rs1, vl))
 #define __riscv_vsmul_vx_i32m1(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vsmul_vx_i32m1(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vsmul_vx_i32m1(vs2, rs1, vl))
+#define __riscv_vsmul_vx_i32m8(vs2, rs1, vxrm, vl) \
+	(mb_rvv_set_vxrm(vxrm), __riscv_vsmul_vx_i32m8(vs2, rs1, vl))
 
+/* Cover every LMUL the curated kernels use. These were added one at a time as
+ * each model reached the compiler -- conv2d in dronet needs i16m2, yolov8's
+ * fused conv+BN+SiLU needs i16m4 and i8m2 -- which is a poor way to find them.
+ * The set below is the full i8/i16 narrowing family, so the next model does not
+ * discover a gap the same way. */
+#define __riscv_vnclip_wx_i16m4(vs2, rs1, vxrm, vl) \
+	(mb_rvv_set_vxrm(vxrm), __riscv_vnclip_wx_i16m4(vs2, rs1, vl))
 #define __riscv_vnclip_wx_i16m2(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vnclip_wx_i16m2(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vnclip_wx_i16m2(vs2, rs1, vl))
+#define __riscv_vnclip_wx_i8m4(vs2, rs1, vxrm, vl) \
+	(mb_rvv_set_vxrm(vxrm), __riscv_vnclip_wx_i8m4(vs2, rs1, vl))
+#define __riscv_vnclip_wx_i8m2(vs2, rs1, vxrm, vl) \
+	(mb_rvv_set_vxrm(vxrm), __riscv_vnclip_wx_i8m2(vs2, rs1, vl))
 #define __riscv_vnclip_wx_i16m1(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vnclip_wx_i16m1(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vnclip_wx_i16m1(vs2, rs1, vl))
 #define __riscv_vnclip_wx_i8m1(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vnclip_wx_i8m1(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vnclip_wx_i8m1(vs2, rs1, vl))
 #define __riscv_vnclip_wx_i8mf2(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vnclip_wx_i8mf2(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vnclip_wx_i8mf2(vs2, rs1, vl))
 
 #define __riscv_vssra_vx_i32m4(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vssra_vx_i32m4(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vssra_vx_i32m4(vs2, rs1, vl))
 #define __riscv_vssra_vx_i32m2(vs2, rs1, vxrm, vl) \
-	(MB_VXRM_ASSERT_RNU(vxrm), __riscv_vssra_vx_i32m2(vs2, rs1, vl))
+	(mb_rvv_set_vxrm(vxrm), __riscv_vssra_vx_i32m2(vs2, rs1, vl))
 
 #define MB_RVV_VXRM_COMPAT_ACTIVE 1
 

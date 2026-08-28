@@ -406,6 +406,29 @@ BACKENDS: dict[str, Backend] = {
 }
 
 
+def backend_lineage(name: str) -> tuple[str, ...]:
+    """`name` followed by the backends it inherits behaviour from.
+
+    A backend VARIANT (a different -march of the same ISA family) must inherit
+    every per-backend decision its parent makes, not just curated kernels. Two
+    such decisions have already been found the hard way by adding rvv_x60:
+
+      * curated kernel lookup -- without inheritance every op silently fell
+        back to the scalar reference while the build reported success;
+      * conv weight layout -- `_conv_weight_layout_for_backend` matches
+        `target_affinity` exactly, so the variant emitted OIHW weights while
+        its own -DMODELBLASTER_RVV_IHWOC_WEIGHTS told the kernel they were
+        IHWOC. That is not a crash, it is max_abs_err=57.
+
+    Both failures are silent and produce a plausible number, so the lineage
+    belongs in one place that every per-backend lookup consults.
+    """
+    b = BACKENDS.get(name)
+    if b is None:
+        return (name,)
+    return (name,) + tuple(b.curated_aliases)
+
+
 def get(name: str) -> Backend:
     if name not in BACKENDS:
         raise SystemExit(

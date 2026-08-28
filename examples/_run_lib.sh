@@ -146,11 +146,15 @@ echo "[3/5] generate_kernels (backend=${BACKEND} target=${GEN_TARGET} quant=${QU
 # can't see them and budget tracking drifts. Pin the per-example log under
 # benchmarks/results/<MODEL>_<TARGET>_<QUANT>/<UTC>/ so cost_monitor's glob
 # picks it up on the next refresh.
-if [[ "${BACKEND}" == "llm" && -z "${BEDROCK_CALLS_LOG:-}${GEMINI_CALLS_LOG:-}" ]]; then
+# CODEX_CALLS_LOG is included deliberately. Gating on the bedrock/gemini vars
+# alone meant a Codex run got log_path=None and logged NOTHING -- silently, so
+# a K1 kernel-synthesis run would leave no audit trail of what was generated.
+if [[ "${BACKEND}" == "llm" && -z "${BEDROCK_CALLS_LOG:-}${GEMINI_CALLS_LOG:-}${CODEX_CALLS_LOG:-}" ]]; then
     _MB_LLM_RUN_DIR="${REPO_ROOT}/benchmarks/results/${MODEL_NAME}_${TARGET}_${QUANT}/$(date -u +%Y-%m-%dT%H-%M-%SZ)"
     mkdir -p "${_MB_LLM_RUN_DIR}"
     export BEDROCK_CALLS_LOG="${_MB_LLM_RUN_DIR}/llm_calls.jsonl"
     export GEMINI_CALLS_LOG="${_MB_LLM_RUN_DIR}/llm_calls.jsonl"
+    export CODEX_CALLS_LOG="${_MB_LLM_RUN_DIR}/llm_calls.jsonl"
     echo "  BEDROCK_CALLS_LOG=${BEDROCK_CALLS_LOG}"
 fi
 GEN_KERNELS_ARGS=(

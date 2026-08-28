@@ -34,19 +34,27 @@ cd "${REPO_ROOT}"
 
 SCHEDULE=""
 MODELS="mlp_control,dronet"
-BACKENDS="scalar"
+BACKENDS="rvv_x60,rvv_x60"
 QUANT="int8"
 # reference = curated/hand-written kernels, no LLM. Codex is only for NEW kernel
 # bodies and must be requested explicitly; there is no Bedrock path here.
 KERNEL_BACKEND="${BACKEND:-reference}"
+# Codex only, no fallback. Consulted only when BACKEND=llm.
+export LLM_PROVIDER="${LLM_PROVIDER:-codex}"
 # The K1 registry is measured, not assumed -- cluster 0 carries IME, cluster 1
 # traps on it. See cores/spacemit_k1.json.
 REGISTRY="${REGISTRY:-cores/spacemit_k1.json}"
 # Both K1 clusters are RVV-capable and measured equivalent (0.996 ratio), so a
 # single backend kind covers both; the cluster distinction is a placement
 # constraint, not a codegen one.
+# Two DISTINCT kinds, one per cluster. `kind` is how ingest resolves an
+# abstract CPU_P#n / CPU_E#n slot to a hart -- it takes the n-th core of that
+# kind -- so a single kind for all eight cores makes CPU_E#n alias CPU_P#n, and
+# a 4+4 config silently double-books cluster 0 while never touching cluster 1.
+# The two clusters run the same ISA and measure equivalent (0.996), so this is
+# a placement-pool distinction, not a codegen one: both compile rvv_x60.
 CPU_P_KIND="${CPU_P_KIND:-rvv}"
-CPU_E_KIND="${CPU_E_KIND:-rvv}"
+CPU_E_KIND="${CPU_E_KIND:-rvv_c1}"
 # core_kind (what the SCHEDULE says, and what the walker matches on) is distinct
 # from the backend tag (what the BINARY was built as). rvv_x60 is a K1-specific
 # build of the same rvv kind; conflating them makes every worker refuse every
@@ -64,6 +72,19 @@ CROSS="${CROSS:-/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-un
 PY="${PY:-python3}"
 # Same import root the single-model runner uses.
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# Assert we are running THIS checkout's pipeline. There is a second, older
+# ModelBlaster clone on this machine, and the venv most people use here carries
+# an editable install (_editable_impl_modelblaster.pth) pointing at it. Import
+# `modelblaster` without the PYTHONPATH above and you silently get the sibling's
+# code -- same module names, different behaviour, no warning.
+_mb_file="$(${PY} -c 'from modelblaster.pipeline import backends; print(backends.__file__)' 2>/dev/null || echo '')"
+case "${_mb_file}" in
+    "${REPO_ROOT}"/*) : ;;
+    *) echo "refusing to run: 'modelblaster' resolves to ${_mb_file:-<import failed>}," >&2
+       echo "not this checkout (${REPO_ROOT}). Check PYTHONPATH and any editable install." >&2
+       exit 2 ;;
+esac
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -94,6 +115,11 @@ if [[ -z "${CORE_KINDS}" ]]; then
     fi
 fi
 IFS=',' read -r -a CORE_KIND_LIST <<< "${CORE_KINDS}"
+# Several core kinds can share one backend -- the K1's two clusters are the
+# same ISA, so both pools compile rvv_x60. The GENERATOR needs the per-kind
+# list (kind k is executed by backend k); CMake needs the deduped set, or it
+# would try to declare the same OBJECT-library target twice.
+UNIQUE_BACKENDS="$(printf '%s\n' "${BACKEND_LIST[@]}" | awk '!seen[$0]++' | paste -sd, -)"
 if [[ ${#CORE_KIND_LIST[@]} -ne ${#BACKEND_LIST[@]} ]]; then
     echo "core-kinds (${CORE_KINDS}) and backends (${BACKENDS}) must be" >&2
     echo "parallel lists: kind k is executed by backend k." >&2
@@ -178,7 +204,7 @@ CMAKE_ARGS=(
     "-DCMAKE_SYSTEM_NAME=Linux"
     "-DCMAKE_SYSTEM_PROCESSOR=riscv64"
     "-DPYTHON_EXECUTABLE=${PY}"
-    "-DMODEL_BACKENDS=${BACKENDS}"
+    "-DMODEL_BACKENDS=${UNIQUE_BACKENDS}"
     "-DMODEL_NAMES=${MODEL_NAMES}"
     "-DMODEL_DIRS_BASE=${MODEL_DIRS_BASE}"
     "-DXPURT_SCHEDULE_C=${SCHED_C}"
