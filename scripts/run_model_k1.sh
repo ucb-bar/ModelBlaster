@@ -19,6 +19,8 @@
 #   CROSS                        cross toolchain prefix
 #   PROFILE_OUT_ROOT             emit IREE-shaped results.csv under here
 #   OUT_ROOT                     local build/staging dir
+#   MB_IR                        profile this graph.json instead of re-extracting
+#                                (a fuse/split rewrite); see the note at step 1/5
 #
 # No credentials are read or written; ssh does whatever it is already
 # configured to do.
@@ -47,6 +49,53 @@ mkdir -p "${GEN}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
+# MB_IR: profile a PRE-STAGED IR instead of re-extracting the model.
+#
+# This exists because step 1/5 below is unconditional, and that made a
+# granularity rung impossible to run correctly. The obvious recipe for
+# profiling an apply_split_hint / apply_fusion_hint rewrite is
+#
+#     cp round/graph.split.json build/k1/<model>/int8/graph.json
+#     bash scripts/run_model_k1.sh <model> int8 rvv_x60 0
+#
+# and it silently profiles the BASELINE: extract_graph overwrites graph.json
+# with a freshly extracted one before anything reads it, the build succeeds, the
+# board verifies, and a results.csv describing the unrewritten graph is filed
+# under the rewrite's name. That is precisely the gen/vmfb/mlp/.../RVV_fused
+# failure -- a negative result recorded as a success -- and it would have been
+# reintroduced by a runbook step, not by a mistake at the keyboard.
+#
+# With MB_IR set, the extraction is skipped and that file becomes the graph.
+# weights.npz and io.npz are NOT regenerated and must already be in ${GEN}: a
+# fuse/split rewrite changes only the dispatch graph, so the baseline's weights
+# and goldens are exactly the ones the rewrite must reproduce -- reusing them is
+# what makes max_abs_err a meaningful correctness statement about the rewrite
+# rather than about a fresh calibration. If they are missing, run once without
+# MB_IR first.
+if [[ -n "${MB_IR:-}" ]]; then
+    [[ -f "${MB_IR}" ]] || { echo "MB_IR=${MB_IR}: no such file" >&2; exit 2; }
+    for _req in weights.npz io.npz; do
+        [[ -f "${GEN}/${_req}" ]] || {
+            echo "MB_IR set but ${GEN}/${_req} is missing. Run this model once" >&2
+            echo "without MB_IR so the weights and goldens exist, then retry." >&2
+            exit 2; }
+    done
+    echo "=== 1/5 SKIPPED -- staging pre-extracted IR ${MB_IR} ==="
+    # Only copy when it is not already the same file, so that pointing MB_IR at
+    # ${GEN}/graph.json itself is a harmless no-op rather than a truncation.
+    if [[ "$(readlink -f "${MB_IR}")" != "$(readlink -f "${GEN}/graph.json")" ]]; then
+        cp "${MB_IR}" "${GEN}/graph.json"
+    fi
+    "${PY}" - "${GEN}/graph.json" <<'PYEOF'
+import json, sys
+ops = json.load(open(sys.argv[1])).get("ops", [])
+n = sum(1 for o in ops if o.get("dispatch_id") is not None)
+tiles = sum(1 for o in ops if "split_from" in o)
+fused = sum(1 for o in ops if o.get("sub_ops"))
+print("  %d dispatches (%d split tiles, %d fused ops)" % (n, tiles, fused))
+PYEOF
+else
+
 echo "=== 1/5 extract ${MODEL} (${QUANT}) ==="
 # NUM_CALIBRATION: how many samples the int8 activation scales are calibrated
 # over. It has to be reachable from here, not just from extract_graph's CLI: a
@@ -59,6 +108,7 @@ echo "=== 1/5 extract ${MODEL} (${QUANT}) ==="
 "${PY}" -m modelblaster.pipeline.extract_graph \
     --model "${MODEL}" --quant "${QUANT}" --out-dir "${GEN}" \
     --num-calibration "${NUM_CALIBRATION:-1}"
+fi
 
 echo "=== 2/5 generate skeleton (platform=linux) ==="
 # platform=linux matters: the Zephyr flavour emits rdcycle, which raises SIGILL
