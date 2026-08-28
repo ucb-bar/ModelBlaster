@@ -585,12 +585,159 @@ def _backend_pack_weight(arr: np.ndarray, backend: Optional[str]) -> tuple[np.nd
     return np.ascontiguousarray(np.transpose(arr, perm)), _LAYOUT_TAG[layout]
 
 
+#: Per-tile weight symbols for a split conv on a backend that does NOT pack
+#: conv weights OIHW. See `split_conv_tile_weights` for why they have to exist.
+_TILE_W_SUFFIX = ".tile_"
+
+
+def split_conv_tile_weights(
+    ir: dict[str, Any], backend: Optional[str],
+) -> dict[int, dict[str, Any]]:
+    """`{dispatch_id: {...}}` for every conv2d_s8 OC tile that needs its own
+    re-packed weight array instead of a pointer offset into the parent's.
+
+    THE BUG THIS EXISTS TO CLOSE
+    ----------------------------
+    `apply_split_hint` splits a conv2d_s8 along OC and the codegen gives tile
+    `t` the pointers `weight + t*tile_oc*IC*KH*KW` and `bias + t*tile_oc`. That
+    is correct for an OIHW `[OC, IC, KH, KW]` weight, where an OC slice is a
+    contiguous block -- and it is what the scalar backend gets.
+
+    The rvv backends do not get OIHW. `_backend_pack_weight` permutes conv
+    weights to IHWOC `(IC, KH, KW, OC)` at codegen time, because the curated
+    kernels vectorise over OC and index
+    `weight[((ic*KH + kh)*KW + kw)*OC + oc]` (kernels/rvv/
+    rvv_conv2d_s8_rvv_vsmul_vnclip.c). Under that layout OC is the INNERMOST
+    axis, so an OC slice is strided, not contiguous: its elements start at
+    `t*tile_oc` and repeat every full OC. Two independent things then go wrong
+    at once --
+
+      * the base offset is wrong by a factor of IC*KH*KW (432 vs 16 for
+        dronet's dispatch 0, OC 32 -> 2x16), and
+      * the kernel is handed `OC = tile_oc`, so it strides the weight by 16
+        where the packed array strides by 32.
+
+    -- and neither is detectable from the IR, the build, or the emitted C read
+    on its own. The result is `max_abs_err > 0` from a rewrite that the
+    granularity gate correctly passed, i.e. exactly the failure mode that makes
+    a granularity rung untrustworthy. Note also that the parent conv's OWN
+    profile is unaffected, so the mistake shows up only in the split variant
+    and looks like "splitting broke the model".
+
+    THE FIX. Give each tile its own weight array: slice OIHW first
+    (`w[t*tile_oc:(t+1)*tile_oc]`), then pack THAT with the backend's
+    permutation. The result strides by `tile_oc`, which is precisely the `OC`
+    the kernel is called with, and the tile's offset becomes 0. Because a conv
+    weight is consumed by exactly one op, the parent array is then dead and is
+    not emitted -- so this costs no extra bytes, it just moves them.
+
+    Returns `{}` when the backend packs OIHW (the pointer arithmetic is right
+    there and duplicating the arrays would only waste space), and `{}` for
+    `linear_s8` tiles in every case: linear weights are 2D, `_backend_pack_weight`
+    only touches 4D tensors, so `[N, K]` stays row-major and an N slice stays
+    contiguous.
+    """
+    # Scan for tiles BEFORE asking the backend about layout: the layout query
+    # imports reference_kernels, and a graph with no split conv (i.e. every
+    # graph in the repo today) must not pay for -- or depend on -- that.
+    tiles = [op for op in ir.get("ops", [])
+             if (op.get("split_from") or {}).get("axis") == "OC"
+             and op.get("op") == "conv2d_s8"]
+    if not tiles:
+        return {}
+    layout = _conv_weight_layout_for_backend(backend)
+    if layout in (None, "oihw"):
+        return {}
+    plan: dict[int, dict[str, Any]] = {}
+    for op in tiles:
+        sf = op["split_from"]
+        did = op.get("dispatch_id")
+        if did is None or not op.get("weight"):
+            continue
+        sh = op.get("shape") or {}
+        plan[did] = {
+            "weight": op["weight"],
+            "bias": op.get("bias"),
+            "tile": int(sf.get("tile", 0)),
+            "n_splits": int(sf.get("n_splits", 1)),
+            "tile_oc": int(sh.get("OC", 0)),
+            "layout": layout,
+        }
+    return plan
+
+
+def _tile_key(base_key: str, tile: int) -> str:
+    return f"{base_key}{_TILE_W_SUFFIX}{tile}"
+
+
+def _apply_tile_weight_plan(
+    weights: dict[str, np.ndarray],
+    plan: dict[int, dict[str, Any]],
+) -> tuple[dict[str, np.ndarray], set[str]]:
+    """`(extra_arrays, parent_keys_to_drop)` for `plan`.
+
+    The tile arrays are sliced in OIHW and returned in OIHW: `emit_weights`
+    runs `_backend_pack_weight` over everything it emits, so packing here as
+    well would permute twice. Slicing before that pass is the whole point --
+    `pack(w[a:b])` is the tile's own array, `pack(w)[a:b]` is not even the
+    right elements.
+    """
+    extra: dict[str, np.ndarray] = {}
+    drop: set[str] = set()
+    for spec in plan.values():
+        wk = spec["weight"]
+        arr = weights.get(wk)
+        if arr is None or arr.ndim != 4:
+            continue
+        t, tile_oc = spec["tile"], spec["tile_oc"]
+        if tile_oc <= 0 or (t + 1) * tile_oc > arr.shape[0]:
+            raise SystemExit(
+                f"split tile weight slice out of range: {wk} has OC="
+                f"{arr.shape[0]}, tile {t} of {spec['n_splits']} wants "
+                f"[{t * tile_oc}, {(t + 1) * tile_oc})")
+        extra[_tile_key(wk, t)] = np.ascontiguousarray(
+            arr[t * tile_oc:(t + 1) * tile_oc])
+        drop.add(wk)
+        bk = spec.get("bias")
+        if bk and bk in weights:
+            b = weights[bk]
+            extra[_tile_key(bk, t)] = np.ascontiguousarray(
+                b[t * tile_oc:(t + 1) * tile_oc])
+            drop.add(bk)
+    return extra, drop
+
+
 def emit_weights(
     model_name: str,
     weights: dict[str, np.ndarray],
     out_dir: str,
     backend: Optional[str] = None,
+    ir: Optional[dict[str, Any]] = None,
 ) -> None:
+    # Split tiles on a non-OIHW backend need their own re-packed arrays; the
+    # parent then has no consumer left and is dropped. `ir` is optional so the
+    # existing two-argument callers (and the tests) keep working -- with no IR
+    # there are no tiles to plan for.
+    tile_extra: dict[str, np.ndarray] = {}
+    tile_drop: set[str] = set()
+    if ir is not None:
+        plan = split_conv_tile_weights(ir, backend)
+        if plan:
+            tile_extra, tile_drop = _apply_tile_weight_plan(weights, plan)
+            # Drop a parent only if NOTHING but tiles reads it. A conv weight
+            # has exactly one consumer in every model here, so this normally
+            # holds; refusing loudly beats emitting a dangling reference.
+            still_used = {
+                op.get("weight") for op in ir.get("ops", [])
+                if not (op.get("split_from") or {}).get("axis") == "OC"
+            } | {
+                op.get("bias") for op in ir.get("ops", [])
+                if not (op.get("split_from") or {}).get("axis") == "OC"
+            }
+            tile_drop -= {k for k in tile_drop if k in still_used}
+    if tile_extra:
+        weights = {**{k: v for k, v in weights.items() if k not in tile_drop},
+                   **tile_extra}
     keys = sorted(weights.keys())
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
@@ -680,7 +827,15 @@ def _shape_str(op: dict) -> str:
 
 
 def emit_model(ir: dict[str, Any], out_dir: str,
-               platform: str = "zephyr") -> None:
+               platform: str = "zephyr",
+               backend: Optional[str] = None) -> None:
+    # `backend` reaches the codegen for exactly one reason: the conv weight
+    # LAYOUT is a per-backend codegen decision (_backend_pack_weight), and a
+    # split conv's tile pointers depend on it. Without it here, the conv2d_s8
+    # split arm below silently assumed OIHW for every backend -- see
+    # `split_conv_tile_weights`. Everything else in this function is
+    # backend-independent and must stay that way.
+    tile_w_plan = split_conv_tile_weights(ir, backend)
     in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
@@ -1348,12 +1503,25 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                     )
                 tile_idx = int(sf.get("tile", 0))
                 tile_oc = int(sh.get("OC", 0))
-                per_filter = int(sh.get("IC", 0)) * int(sh.get("KH", 0)) * int(sh.get("KW", 0))
-                w_off = tile_idx * tile_oc * per_filter
-                b_off = tile_idx * tile_oc
-                w = f"({w} + {w_off})"
-                if b != "NULL":
-                    b = f"({b} + {b_off})"
+                spec = tile_w_plan.get(op.get("dispatch_id"))
+                if spec is not None:
+                    # Backend packs conv weights away from OIHW (IHWOC for
+                    # rvv), so an OC slice is STRIDED and no pointer offset can
+                    # express it -- the tile gets its own array, re-packed with
+                    # OC = tile_oc, and reads it from element 0. See
+                    # `split_conv_tile_weights` for the two-way failure this
+                    # replaces.
+                    w = _weight_name(model_name, _tile_key(op["weight"], tile_idx))
+                    if op.get("bias"):
+                        b = _weight_name(model_name,
+                                         _tile_key(op["bias"], tile_idx))
+                else:
+                    per_filter = int(sh.get("IC", 0)) * int(sh.get("KH", 0)) * int(sh.get("KW", 0))
+                    w_off = tile_idx * tile_oc * per_filter
+                    b_off = tile_idx * tile_oc
+                    w = f"({w} + {w_off})"
+                    if b != "NULL":
+                        b = f"({b} + {b_off})"
             call = (
                 f"parallel_conv2d_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
@@ -2113,7 +2281,51 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         )
         invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
 
-    if platform == "linux":
+    if platform == "host":
+        # Not a deployment target -- a CORRECTNESS target. The generated
+        # model.c is the only arch-specific file in a ModelBlaster build (the
+        # kernels, weights, buffers and harness are all plain C), and the only
+        # arch-specific thing in it is the two timer inlines: both `linux` and
+        # `zephyr` emit RISC-V `rdcycle`/`rdtime`, so `cc build/.../model.c` on
+        # an x86 host dies with "no such instruction: rdtime" and nothing else.
+        #
+        # That one line is what stood between "we changed the dispatch graph"
+        # and "we can prove the change still computes the right answer" without
+        # a board. MODELBLASTER_VERIFY compares the generated model against the
+        # goldens in io.npz in-binary and prints max_abs_err; an int8 model is
+        # exact integer arithmetic end to end, so that number is
+        # architecture-independent and a host run answers the correctness
+        # question that the board run would have answered -- before any board
+        # time is spent on a rewrite that might be wrong.
+        #
+        # The counts are therefore NANOSECONDS of host wall clock and are NOT a
+        # performance measurement of anything: different ISA, different cache
+        # hierarchy, no pinning. Never feed a `host` build's cycles into a
+        # profile DB or a cost model. `results.csv` producers take the board
+        # builds; this one takes the verdict line.
+        timer_preamble = """#include <stddef.h>
+#include <stdint.h>
+#include <time.h>
+#include "model.h"
+#include "kernels.h"
+#include "weights.h"
+
+/* Per-op timer, host build: CLOCK_MONOTONIC nanoseconds. Portable stand-in for
+ * the rdcycle/rdtime CSRs, which do not assemble off RISC-V. See the generator
+ * comment: these numbers are for nothing but keeping the record struct filled;
+ * the correctness verdict is what a host build is for. */
+static inline unsigned long long mb_wall_ticks(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull
+         + (unsigned long long)ts.tv_nsec;
+}
+static inline unsigned long rdcycle(void)
+{
+    return (unsigned long)mb_wall_ticks();
+}"""
+    elif platform == "linux":
         # rdcycle is NOT usable here. Measured on a SpaceMiT K1 (Bianbu,
         # Linux 6.6.63): reading the cycle CSR from userspace raises SIGILL,
         # while rdtime works. So a Linux build must not emit rdcycle at all --
@@ -2370,8 +2582,8 @@ def generate(
     weights = dict(np.load(weights_path))
     model_name = ir["name"]
 
-    emit_weights(model_name, weights, out_dir, backend=backend)
-    emit_model(ir, out_dir, platform=platform)
+    emit_weights(model_name, weights, out_dir, backend=backend, ir=ir)
+    emit_model(ir, out_dir, platform=platform, backend=backend)
     emit_test_io(model_name, io_path, out_dir)
 
     files = ["weights.h", "weights.c", "model.h", "model.c",
@@ -2395,13 +2607,18 @@ def main() -> None:
                          "the per-inference weight-transpose loop in the "
                          "kernel. Other backends are pass-through.")
     ap.add_argument("--platform", default="zephyr",
-                    choices=["zephyr", "linux"],
+                    choices=["zephyr", "linux", "host"],
                     help="Host OS for the generated model.c. 'zephyr' emits "
                          "k_cycle_get_64 + rdcycle; 'linux' emits rdtime for "
                          "both, because reading the cycle CSR from userspace "
                          "raises SIGILL on a SpaceMiT K1 running Linux 6.6 -- "
                          "an rdcycle build does not run slowly there, it dies "
-                         "on the first timed dispatch.")
+                         "on the first timed dispatch. 'host' emits "
+                         "clock_gettime so model.c assembles on the build "
+                         "machine: that build is for MODELBLASTER_VERIFY only "
+                         "(int8 arithmetic is exact, so max_abs_err is "
+                         "architecture-independent) and its cycle counts are "
+                         "host nanoseconds -- never a cost input.")
     args = ap.parse_args()
     generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend,
              platform=args.platform)
