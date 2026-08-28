@@ -28,7 +28,7 @@ _spec = importlib.util.spec_from_file_location("check_kernel_coverage", _SCRIPT)
 cov = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cov)
 
-_CSV_HEAD = "dispatch_id,module_name,mean_time_ns,op\n"
+_CSV_HEAD = "dispatch_id,module_name,mean_time_ns,op,implementation\n"
 
 
 class _Case:
@@ -49,8 +49,10 @@ class _Case:
             self.profile = os.path.join(self.dir, "results.csv")
             with open(self.profile, "w") as fh:
                 fh.write(_CSV_HEAD)
-                for i, (mod, ns, op) in enumerate(profile_rows):
-                    fh.write(f"{i},{mod},{ns},{op}\n")
+                for i, row in enumerate(profile_rows):
+                    mod, ns, op = row[0], row[1], row[2]
+                    impl = row[3] if len(row) > 3 else ""
+                    fh.write(f"{i},{mod},{ns},{op},{impl}\n")
 
     def check(self, **kw):
         return cov.check(self.gen, os.path.join(self.dir, "graph.json"),
@@ -134,3 +136,53 @@ class TheMeasurementOutranksTheStalePicksFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheImplementationColumnIsTheGroundTruth(unittest.TestCase):
+    """module_name cannot answer this, and reading it as if it could is a bug.
+
+    profile_writer builds module_name as `<model>$dispatch_<id>_<backend>_<op>_
+    <shape>`, and `_shape_concise()` returned the literal "scalar" for an op
+    with no recorded shape. The fused convs had no shape AND ran the reference,
+    so `..._conv2d_batchnorm2d_silu_s8_scalar` looked like a reliable
+    "ran scalar" marker. It was a coincidence. Once real RVV kernels landed
+    (22.9x measured on the K1) the name still ended in `_scalar`, and a gate
+    trusting it would have failed a build that was correct.
+
+    The `implementation` column is filled from kernel_picks.json at PROFILE
+    time, so it describes the build that was actually measured.
+    """
+
+    def test_a_shapeless_op_with_a_real_kernel_passes(self):
+        """The exact post-fix state: name says _scalar, impl says curated."""
+        c = _Case(
+            picks={"conv2d_batchnorm2d_silu_s8": _CURATED},
+            profile_rows=[
+                ("y$dispatch_0_rvv_x60_conv2d_batchnorm2d_silu_s8_scalar",
+                 217_000_000, "conv2d_batchnorm2d_silu_s8",
+                 "curated[rvv]/rvv_oc_blocked_bn_silu_epilogue")])
+        self.assertTrue(c.check())
+
+    def test_the_column_still_catches_a_genuine_fallback(self):
+        c = _Case(
+            picks={"conv2d_batchnorm2d_silu_s8": _CURATED},
+            profile_rows=[
+                ("y$dispatch_0_rvv_x60_conv2d_batchnorm2d_silu_s8_noshape",
+                 4_962_000_000, "conv2d_batchnorm2d_silu_s8", "reference")])
+        self.assertFalse(c.check())
+
+    def test_the_column_outranks_a_stale_picks_file(self):
+        """picks claims curated; the measured run says reference."""
+        c = _Case(
+            picks={"conv2d_s8": _CURATED},
+            profile_rows=[("m$dispatch_0_rvv_x60_conv2d_s8_N1xIC3",
+                           54_000_000, "conv2d_s8", "reference")])
+        self.assertFalse(c.check())
+
+    def test_an_empty_column_falls_back_to_the_legacy_heuristic(self):
+        """Profiles written before the column existed must still be judged."""
+        c = _Case(
+            picks={"conv2d_batchnorm2d_s8": _REF},
+            profile_rows=[("m$dispatch_0_rvv_x60_conv2d_batchnorm2d_s8_scalar",
+                           54_000_000, "conv2d_batchnorm2d_s8", "")])
+        self.assertFalse(c.check())
