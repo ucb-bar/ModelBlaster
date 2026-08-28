@@ -207,7 +207,36 @@ foreach(_i RANGE ${_last})
         # Explicit opt-in, never a search: a build must not silently change
         # compilers. The fp16 kernels carry an #error naming this variable, so a
         # 13.2 build fails by name rather than falling back to scalar.
+        # Apply it ONLY to the files that need it. This harness compiles many
+        # models into one binary, unlike harness_linux which builds one at a
+        # time -- so a global override silently recompiled EVERY model's
+        # kernels.c with the bare-metal toolchain. yolov8_nano's int8 kernels
+        # built that way produced a binary that ran all 767 dispatches and then
+        # died in printf with a float bit pattern where a char* belonged
+        # (SIGSEGV in __strlen from __printf_buffer, badaddr 0xffffffffc8ffc9f8
+        # -- the same value in two different binaries, which is what gave it
+        # away as a computed value rather than stray memory). fused_full ALONE
+        # was fine, because then nothing else was miscompiled.
+        #
+        # The rule is "use the alternate compiler exactly where the default one
+        # cannot compile the file", and the file itself says so: the Zvfh
+        # kernels are the ones declaring _Float16. Detecting that beats a
+        # per-model flag, which would be one more thing to keep in sync with
+        # which models happen to have an fp16 tail.
+        set(_needs_alt_cc FALSE)
         if(DEFINED MODELBLASTER_KERNEL_CC AND NOT "${MODELBLASTER_KERNEL_CC}" STREQUAL "")
+            file(READ "${_backend_dir}/kernels.c" _kernels_src)
+            if(_kernels_src MATCHES "_Float16")
+                set(_needs_alt_cc TRUE)
+            else()
+                message(STATUS
+                    "harness_xpurt_linux: ${_name}/${_bs} kernels.c has no "
+                    "_Float16; keeping ${CMAKE_C_COMPILER}")
+            endif()
+            unset(_kernels_src)
+        endif()
+
+        if(_needs_alt_cc)
             if(NOT EXISTS "${MODELBLASTER_KERNEL_CC}")
                 message(FATAL_ERROR
                     "MODELBLASTER_KERNEL_CC='${MODELBLASTER_KERNEL_CC}' does not "

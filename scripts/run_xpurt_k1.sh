@@ -142,12 +142,45 @@ for model in "${MODEL_LIST[@]}"; do
     mkdir -p "${base}"
 
     # The int8 IR + weights + goldens are per model, not per backend.
-    if [[ ! -f "${base}/graph.json" ]]; then
+    #
+    # Reuse is keyed on the EXTRACTION CONFIG, not just on the file existing.
+    # Several models read their precision and calibration choices from the
+    # environment -- fused_full alone honours MB_FUSED_HYBRID,
+    # MB_FUSED_LOWDIM_FLOAT, MB_FUSED_FP16_FC, MB_FUSED_CALIB_PKL and
+    # NUM_CALIBRATION -- and none of that is visible in the output path. An
+    # existence check therefore silently serves a graph built under different
+    # settings.
+    #
+    # That is not hypothetical. A schedule solved against the fp16 hybrid
+    # (17 ops, ids 0-14) was ingested against a cached pure-int8 graph (15 ops,
+    # ids 0-12) and died with "dispatch_id=13 not in network 'fused_full'".
+    # Dying was the good case: the two graphs differ in PRECISION, so a
+    # dispatch-count coincidence would have run the blind int8 model under the
+    # hybrid's name and reported its timings.
+    _cfg_file="${base}/.extract_config"
+    _cfg="model=${model} quant=${QUANT}"
+    for _v in $(compgen -v | grep -E '^(MB_|MODELBLASTER_|NUM_CALIBRATION)' | sort); do
+        _cfg="${_cfg} ${_v}=${!_v}"
+    done
+    if [[ -f "${base}/graph.json" && -f "${_cfg_file}" ]] \
+       && [[ "$(cat "${_cfg_file}")" == "${_cfg}" ]]; then
+        echo "  [${model}] reusing ${base}/graph.json"
+    else
+        if [[ -f "${base}/graph.json" ]]; then
+            echo "  [${model}] re-extracting: extraction config changed"
+            if [[ -f "${_cfg_file}" ]]; then
+                diff <(tr ' ' '\n' < "${_cfg_file}") <(tr ' ' '\n' <<< "${_cfg}") \
+                    | grep -E '^[<>]' | sed 's/^/      /' || true
+            else
+                echo "      (no previous config recorded)"
+            fi
+        fi
         echo "  [${model}] extract int8 IR"
         ${PY} -m modelblaster.pipeline.extract_graph \
             --model "${model}" --quant "${QUANT}" --out-dir "${base}"
-    else
-        echo "  [${model}] reusing ${base}/graph.json"
+        printf '%s' "${_cfg}" > "${_cfg_file}"
+        # The generated sources descend from this IR, so they are stale too.
+        rm -f "${base}"/*/kernels.c "${base}"/*/model.c
     fi
 
     for bs in "${BACKEND_LIST[@]}"; do
