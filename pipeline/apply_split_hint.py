@@ -24,6 +24,20 @@ convention (`<orig>.tile_0`, `<orig>.tile_1`, ...).
 For `conv2d_s8`, the tile dimension is OC (output channels) — same
 shape, just on the conv output. Weight tensor surgery (slicing
 `[OC, IC, KH, KW]` into N OC-slices) is required and is a follow-up.
+
+Inserting tiles renumbers every op after the split point, so the output
+graph carries an `id_remap` field mapping every input `dispatch_id` to
+its id(s) in the rewritten graph (JSON object keys are strings)::
+
+    "id_remap": {"0": [0, 1], "1": [2], "2": [3]}
+
+Values are always lists: splitting is one-to-many, so op 0 above became
+tiles 0 and 1, while untouched ops 1 and 2 (renumbered to 2 and 3) get
+single-element lists. Consumers keyed on dispatch_id must translate
+through this before joining a pre-rewrite profile / cost DB against a
+post-rewrite graph — and must sum across the tiles when attributing a
+split op's cost. (`apply_fusion_hint.py` emits the same field, but
+scalar-valued — fusion is many-to-one.)
 """
 
 from __future__ import annotations
@@ -258,6 +272,20 @@ def apply_split_hint(graph: dict[str, Any],
         nop["depends_on"] = [x for x in new_deps if not (x in seen or seen.add(x))]
 
     out["ops"] = new_ops
+    # Publish the renumbering. Inserting tiles shifts every id after the
+    # split point, so ops that were NOT split still change identity —
+    # without this, anything keyed on dispatch_id (profile CSVs, cost
+    # DBs, SchedulerReports, Gantt labels) silently re-attaches to the
+    # wrong op after a rewrite.
+    #
+    # Values are LISTS because splitting is one-to-many: a split op maps
+    # to all of its tile ids, in tile order, and collapsing that to the
+    # first tile would misreport the op's cost as one tile's cost.
+    # Untouched ops get a single-element list so consumers never have to
+    # branch on the value type. (`apply_fusion_hint.py` emits the same
+    # field scalar-valued — fusion is many-to-one.)
+    out["id_remap"] = {str(old): list(new)
+                       for old, new in sorted(id_remap.items())}
     return out
 
 

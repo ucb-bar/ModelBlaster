@@ -66,9 +66,65 @@ int main(void)
     printf("modelblaster harness: model=%s in=%d out=%d\n",
            MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE);
 
-    run_model(model_test_input, model_output, NULL);
+    /* Repeat count. Two independent reasons, and the second is not obvious.
+     *
+     * 1. A single cold measurement is not a profile. The accept/reject
+     *    criterion this feeds requires a median over warm repetitions, and two
+     *    closed-loop candidates in this project were previously rejected on
+     *    n=1 samples. The gaps were large enough that the conclusions stand,
+     *    but the stated criterion was not met.
+     *
+     * 2. It is the only way to OBSERVE recurrent state. A stateful model --
+     *    VitFly's LSTM -- keeps h_state/c_state in file-scope arrays that
+     *    nothing resets, so invocation k consumes what k-1 wrote. With a
+     *    single invocation that claim rests entirely on the C storage class;
+     *    an arena change or a zero-init flag would break it silently and no
+     *    test would notice. Running twice makes it a measurement: for a
+     *    stateful model the outputs MUST differ between iterations, and for a
+     *    stateless one they must be identical.
+     *
+     * Default 1 so every existing caller and golden comparison is unchanged. */
+    long iters = 1;
+    {
+        const char *e = getenv("MODELBLASTER_ITERS");
+        if (e && *e) {
+            long v = strtol(e, NULL, 10);
+            if (v > 0) iters = v;
+        }
+    }
 
-    /* In-binary golden compare, identical arithmetic to the Zephyr harness:
+    for (long it = 0; it < iters; it++) {
+        run_model(model_test_input, model_output, NULL);
+        if (iters > 1) {
+            /* One block per iteration so the host can compare them. A
+             * stateful model's outputs diverge across iterations by design;
+             * printing only the last would hide exactly that. */
+            printf("=== MODELBLASTER_ITER_BEGIN [%ld] ===\n", it);
+            int dump = MODEL_TEST_OUTPUT_LEN <= 64 ? MODEL_TEST_OUTPUT_LEN : 64;
+            for (int i = 0; i < dump; i++)
+                printf("%.9g\n", (double)(float)model_output[i]);
+            printf("=== MODELBLASTER_ITER_END [%ld] ===\n", it);
+
+            int n_rec_it = 0;
+            const model_op_record_t *rec_it = model_profile_records(&n_rec_it);
+            printf("=== MODELBLASTER_ITER_PROFILE_BEGIN [%ld] ===\n", it);
+            printf("dispatch_id,name,op,shape,cycles\n");
+            for (int i = 0; i < n_rec_it; i++)
+                printf("%d,%s,%s,%s,%lu\n",
+                       rec_it[i].dispatch_id, rec_it[i].name, rec_it[i].op,
+                       rec_it[i].shape, rec_it[i].cycles);
+            printf("=== MODELBLASTER_ITER_PROFILE_END [%ld] ===\n", it);
+            printf("=== MODELBLASTER_ITER_WALL [%ld] === %lu\n",
+                   it, model_wall_cycles());
+        }
+    }
+
+    /* In-binary golden compare of the LAST iteration, identical arithmetic to
+     * the Zephyr harness. For a stateless model every iteration produces the
+     * same outputs so this is unambiguous; for a stateful one the golden
+     * describes iteration 0, so MODELBLASTER_ITERS>1 is a state-persistence
+     * probe rather than a correctness run and the per-iteration blocks above
+     * are what to read.
      * widen both sides to float so one loop covers f32/f16/int outputs, and
      * report global max abs / max rel error. The host gates on
      * (max_abs_err <= atol) || (max_rel_err <= rtol). */

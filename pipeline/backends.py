@@ -136,8 +136,18 @@ RVV_X60 = Backend(
         "-march=rv64gcv_zvl256b",
         "-mabi=lp64d",
         "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
+        # Where mb_rvv_vxrm_compat.h lives. Same <repo_root> placeholder
+        # mechanism gemmini and saturn_opu use for their vendored headers, so
+        # the Backend stays repo-relative and serializable.
+        "-I<repo_root>/kernels/rvv",
     ),
-    kernel_includes=("<riscv_vector.h>",),
+    # The compat header must follow <riscv_vector.h>: it rewrites intrinsic
+    # names, so the real declarations have to be in scope first. It bridges the
+    # RVV intrinsics v1.0 API the curated kernels are written against onto the
+    # GCC 13.2 cross-toolchain, which predates the explicit-vxrm argument.
+    # Without it both curated conv kernels fail to compile and every conv
+    # silently falls back to the scalar reference.
+    kernel_includes=("<riscv_vector.h>", '"mb_rvv_vxrm_compat.h"'),
     prj_conf_overlay="rvv.conf",
     spike_args=("--isa=rv64gcv_zicntr",),
     optimization_guide="optimization_guide_rvv.md",

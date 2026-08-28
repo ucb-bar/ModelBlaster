@@ -8,6 +8,7 @@ the rewrite actually inspects).
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -224,6 +225,187 @@ class FuseBranchingOutputTest(unittest.TestCase):
         # tail = original op 3
         self.assertEqual(tail["op"], "linear_s8")
         self.assertEqual(tail["depends_on"], [0])  # rewired
+
+
+class FuseGroupDependencyClosureTest(unittest.TestCase):
+    """A fuse_group must be closed under the dependency paths between
+    its members.
+
+    Regression for the silent-cycle bug: `_validate_fuse_group` only
+    checked INTRA-group ordering, so a group that skipped over an
+    external op was accepted and produced a graph where the fused op
+    and the skipped op each listed the other in `depends_on`. Nothing
+    downstream rejects that — it's a well-formed graph.json that simply
+    deadlocks the scheduler.
+    """
+
+    def test_skipping_an_external_op_is_rejected(self):
+        # a -> b -> c, fuse [0, 2]. Op 1 (`b`) is left outside but sits
+        # on the only path from 0 to 2. Fusing 0 and 2 means the fused
+        # op both produces b's input and consumes b's output.
+        g = {
+            "name": "tiny",
+            "input": {"tensor": "x"},
+            "output": {"tensor": "t3", "tensors": ["t3"]},
+            "tensors": {n: {"shape": [1, 4], "dtype": "i8"}
+                        for n in ["x", "t1", "t2", "t3"]},
+            "ops": [
+                _op(0, "linear_s8", "a", ["x"], ["t1"]),
+                _op(1, "elu_s8", "b", ["t1"], ["t2"], depends_on=[0]),
+                _op(2, "linear_s8", "c", ["t2"], ["t3"], depends_on=[1]),
+            ],
+        }
+        with self.assertRaises(FusionHintError) as ctx:
+            apply_hint(g, [[0, 2]])
+        msg = str(ctx.exception)
+        # The message must name the offending op so the advisor that
+        # emitted the hint can be pointed at the right dispatch.
+        self.assertIn("1", msg)
+        self.assertIn("'b'", msg)
+
+    def test_skipping_an_external_op_over_a_long_path_is_rejected(self):
+        # Same defect, but the trapped ops are two hops away — proves
+        # the check follows transitive paths, not just direct edges.
+        g = {
+            "name": "tiny",
+            "input": {"tensor": "x"},
+            "output": {"tensor": "t4", "tensors": ["t4"]},
+            "tensors": {n: {"shape": [1, 4], "dtype": "i8"}
+                        for n in ["x", "t1", "t2", "t3", "t4"]},
+            "ops": [
+                _op(0, "linear_s8", "a", ["x"], ["t1"]),
+                _op(1, "elu_s8", "b", ["t1"], ["t2"], depends_on=[0]),
+                _op(2, "elu_s8", "c", ["t2"], ["t3"], depends_on=[1]),
+                _op(3, "linear_s8", "d", ["t3"], ["t4"], depends_on=[2]),
+            ],
+        }
+        with self.assertRaises(FusionHintError):
+            apply_hint(g, [[0, 3]])
+
+    def test_non_contiguous_ids_on_parallel_branches_are_accepted(self):
+        # Guards against "fix" the cheap wrong way (rejecting any group
+        # whose dispatch_ids aren't contiguous). Here 0 and 2 have a gap
+        # in id space, but op 1 is a SIBLING branch, not an op between
+        # them: it descends from 0 and never reaches 2. Fusing [0, 2] is
+        # sound and must stay allowed.
+        g = {
+            "name": "tiny",
+            "input": {"tensor": "x"},
+            "output": {"tensor": "t4", "tensors": ["t4"]},
+            "tensors": {n: {"shape": [1, 4], "dtype": "i8"}
+                        for n in ["x", "t1", "t2", "t3", "t4"]},
+            "ops": [
+                _op(0, "linear_s8", "a", ["x"], ["t1"]),
+                _op(1, "elu_s8", "b", ["t1"], ["t2"], depends_on=[0]),
+                _op(2, "elu_s8", "c", ["t1"], ["t3"], depends_on=[0]),
+                _op(3, "linear_s8", "d", ["t2", "t3"], ["t4"],
+                    depends_on=[1, 2]),
+            ],
+        }
+        out = apply_hint(g, [[0, 2]])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 3)
+        fused = ops[0]
+        self.assertEqual(fused["fused_from"], [0, 2])
+        # And the result is genuinely acyclic — no op lists a dependency
+        # that lists it back.
+        deps = {o["dispatch_id"]: set(o["depends_on"]) for o in ops}
+        for did, ds in deps.items():
+            for d in ds:
+                self.assertNotIn(did, deps[d],
+                                 f"cycle between {did} and {d}")
+
+    def test_disconnected_ops_are_accepted(self):
+        # Two independent chains; fusing one op from each is legal (the
+        # scheduler is free to run them as one dispatch) because no op
+        # lies on a path between them — there is no path at all.
+        g = {
+            "name": "tiny",
+            "input": {"tensor": "x"},
+            "output": {"tensor": "t4", "tensors": ["t2", "t4"]},
+            "tensors": {n: {"shape": [1, 4], "dtype": "i8"}
+                        for n in ["x", "y", "t1", "t2", "t3", "t4"]},
+            "ops": [
+                _op(0, "linear_s8", "a", ["x"], ["t1"]),
+                _op(1, "elu_s8", "b", ["t1"], ["t2"], depends_on=[0]),
+                _op(2, "linear_s8", "c", ["y"], ["t3"]),
+                _op(3, "elu_s8", "d", ["t3"], ["t4"], depends_on=[2]),
+            ],
+        }
+        out = apply_hint(g, [[0, 2]])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 3)
+        self.assertEqual(ops[0]["fused_from"], [0, 2])
+
+    def test_adjacent_group_still_accepted(self):
+        # The common case must not regress: a contiguous chain has no
+        # external op between its members.
+        out = apply_hint(_mlp3_graph(), [[0, 1, 2]])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 1)
+
+
+class IdRemapTest(unittest.TestCase):
+    """`id_remap` must let a consumer recover any op's new identity.
+
+    Regression for the dropped-mapping bug: ids are reassigned
+    contiguously, so fusing ops 0+1 shifts ops 2 and 3 down by one even
+    though they were untouched. Any artifact keyed on dispatch_id (the
+    profile CSV, the cost DB, SchedulerReport rows, Gantt labels) then
+    joins against the wrong op.
+    """
+
+    def test_untouched_op_identity_is_recoverable(self):
+        g = {
+            "name": "tiny",
+            "input": {"tensor": "x"},
+            "output": {"tensor": "t4", "tensors": ["t4"]},
+            "tensors": {n: {"shape": [1, 4], "dtype": "i8"}
+                        for n in ["x", "t1", "t2", "t3", "t4"]},
+            "ops": [
+                _op(0, "linear_s8", "a", ["x"], ["t1"]),
+                _op(1, "elu_s8", "b", ["t1"], ["t2"], depends_on=[0]),
+                _op(2, "linear_s8", "c", ["t2"], ["t3"], depends_on=[1]),
+                _op(3, "elu_s8", "d", ["t3"], ["t4"], depends_on=[2]),
+            ],
+        }
+        out = apply_hint(g, [[0, 1]])
+        remap = out["id_remap"]
+        by_new = {o["dispatch_id"]: o for o in out["ops"]
+                  if o.get("dispatch_id") is not None}
+        # Op `c` was id 2 and was NOT fused, yet its id changed.
+        self.assertEqual(by_new[remap["2"]]["name"], "c")
+        self.assertEqual(by_new[remap["3"]]["name"], "d")
+        self.assertNotEqual(remap["2"], 2)
+
+    def test_remap_covers_every_input_id_including_fused_members(self):
+        g = _mlp3_graph()
+        out = apply_hint(g, [[0, 1]])
+        remap = out["id_remap"]
+        original_ids = {str(o["dispatch_id"]) for o in g["ops"]
+                        if o.get("dispatch_id") is not None}
+        self.assertEqual(set(remap), original_ids)
+        # Fusion is many-to-one: both members land on the fused op's id.
+        self.assertEqual(remap["0"], remap["1"])
+        fused = next(o for o in out["ops"] if "fused_from" in o)
+        self.assertEqual(fused["dispatch_id"], remap["0"])
+
+    def test_remap_is_json_round_trippable(self):
+        # The IR is written with json.dump, so the keys must already be
+        # strings — an int-keyed dict would silently stringify on write
+        # and mismatch anything comparing keys before/after the file
+        # round trip.
+        out = apply_hint(_mlp3_graph(), [[0, 1]])
+        self.assertEqual(out["id_remap"],
+                         json.loads(json.dumps(out))["id_remap"])
+        self.assertTrue(all(isinstance(k, str) for k in out["id_remap"]))
+
+    def test_identity_remap_when_no_groups(self):
+        out = apply_hint(_mlp3_graph(), [])
+        # No rewrite happened, so callers must not be handed a stale or
+        # missing mapping; absent is fine, present must be the identity.
+        if "id_remap" in out:
+            self.assertEqual(out["id_remap"], {"0": 0, "1": 1, "2": 2})
 
 
 if __name__ == "__main__":
