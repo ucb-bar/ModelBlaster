@@ -836,6 +836,7 @@ def extract_int8(
     per_channel: bool = False,
     enable_fusion: bool = False,
     fusion_target: "str | None" = None,
+    fold_conv_bn: bool = True,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -889,7 +890,18 @@ def extract_int8(
     # Graph-level BN folding, BEFORE ShapeProp/calibration/quantization —
     # a folded model has no batchnorm2d nodes at all, so everything
     # downstream (activation calibration, op emission) just never sees them.
-    folded_bn_names = _fold_conv_bn(gm)
+    # `fold_conv_bn` (default True) is a knob because folding is NOT free on a
+    # heterogeneous SoC. It removes a real N*C*H*W pass and lets Gemmini skip an
+    # op it cannot make bit-exact -- but it also destroys a SCHEDULING degree of
+    # freedom: an unfused batchnorm2d is its own dispatch and can be placed on
+    # whichever core is good at it, whereas conv+bn is indivisible and must run
+    # wholly on one. Measured on yolov8_nano: folding takes the graph from 204
+    # to 155 dispatches and the best-per-dispatch heterogeneous work from 50.43
+    # to 66.77 (32% WORSE), collapsing the value of having two different cores
+    # from 6.71x to 2.48x -- even though every individual kernel got faster.
+    # Keep it on for single-core targets; turn it off to hand the scheduler back
+    # the per-op placement choice.
+    folded_bn_names = _fold_conv_bn(gm) if fold_conv_bn else []
     ShapeProp(gm).propagate(*sample_inputs)
 
     # Capture every node's tensor for activation calibration.
@@ -2210,6 +2222,7 @@ def extract_int8(
         "extended_fusion_active": _extended_fusion_ok,
         "n_fx_nodes": len(nodes),
         "n_ir_ops": len(ir["ops"]),
+        "bn_folding_enabled": fold_conv_bn,
         "passes": {
             "linear_relu_fuse": {
                 "fired": len(fused_linear_relu),
@@ -2278,6 +2291,7 @@ def extract(
     per_channel: bool = False,
     enable_fusion: bool = False,
     fusion_target: "str | None" = None,
+    fold_conv_bn: bool = True,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -2301,6 +2315,7 @@ def extract(
             per_channel=per_channel,
             enable_fusion=enable_fusion,
             fusion_target=fusion_target,
+            fold_conv_bn=fold_conv_bn,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -3461,6 +3476,20 @@ def main() -> None:
     ap.add_argument("--per-channel", action="store_true",
                     help="per-output-channel int8 weight quant for conv/linear "
                          "(tighter than per-tensor). No-op for fp32 / fp16.")
+    ap.add_argument("--no-bn-folding", dest="fold_conv_bn",
+                    action="store_false",
+                    default=os.environ.get("MB_NO_BN_FOLDING", "0") != "1",
+                    help="disable graph-level batchnorm->conv folding (on by "
+                         "default). Folding removes an N*C*H*W pass and an op "
+                         "Gemmini cannot make bit-exact, but on a HETEROGENEOUS "
+                         "SoC it also removes a scheduling choice: an unfused "
+                         "batchnorm2d is its own dispatch and can be placed on "
+                         "whichever core suits it, while conv+bn must run whole "
+                         "on one core. Measured on yolov8_nano, folding takes "
+                         "204 dispatches down to 155 and makes the best "
+                         "per-dispatch heterogeneous work 32%% WORSE (50.43 -> "
+                         "66.77), collapsing two-core specialisation from 6.71x "
+                         "to 2.48x. Also settable via MB_NO_BN_FOLDING=1.")
     ap.add_argument("--enable-fusion", action="store_true",
                     default=os.environ.get("MB_ENABLE_FUSION", "0") == "1",
                     help="opt-in extended operator fusion (beyond the "
@@ -3584,6 +3613,7 @@ def main() -> None:
             fp16_op_names=fp16_op_names,
             per_channel=getattr(args, "per_channel", False),
             enable_fusion=getattr(args, "enable_fusion", False),
+            fold_conv_bn=getattr(args, "fold_conv_bn", True),
             fusion_target=getattr(args, "fusion_target", None))
 
     if args.core_registry:
