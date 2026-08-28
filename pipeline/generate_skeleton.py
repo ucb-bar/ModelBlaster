@@ -466,18 +466,94 @@ _PARALLEL_WRAPPER_TEMPLATES = {
 }
 
 
-def _emit_parallel_wrappers(mid: str, used_ops: set[str]) -> str:
+#: Parallel wrappers that shard a conv by slicing its WEIGHT tensor along OC.
+#: Correct only when that slice is contiguous, i.e. when the backend packs
+#: conv weights OIHW. See `_emit_parallel_wrappers`.
+_OC_WEIGHT_SLICING_OPS = {"conv2d", "conv2d_s8"}
+
+
+def _emit_parallel_wrappers(mid: str, used_ops: set[str],
+                            backend: Optional[str] = None) -> str:
     """Emit static parallel_for wrappers ONLY for ops the model actually uses.
+
     Emitting for every parallelizable op leaks `kernel_<op>_<mid>` references
     that the kernels.c doesn't define when the model has no such op (e.g.
-    mlp_control has no conv2d → no kernel_conv2d_mlp_control symbol)."""
+    mlp_control has no conv2d → no kernel_conv2d_mlp_control symbol).
+
+    WHY `backend` IS HERE. `parallel_conv2d_s8` shards along OC and hands each
+    shard `w + oc0*IC*KH*KW` -- an OIHW offset. The rvv backends do not get
+    OIHW: `_backend_pack_weight` permutes conv weights to IHWOC `(IC,KH,KW,OC)`
+    at codegen time, OC innermost, so an OC slice is STRIDED. Two things then
+    go wrong at once, and they are the same two `split_conv_tile_weights`
+    documents for the split path:
+
+      * the base offset is wrong by a factor of IC*KH*KW, and
+      * the kernel is handed `OC = oc1-oc0` and strides the packed array by
+        that instead of by the full OC.
+
+    The result is silent corruption on every vector backend, bit-exact on
+    scalar (which really is OIHW) -- so nothing on an x86 host can see it.
+
+    This has never fired: no run has enabled a pool with helpers. Only
+    `scripts/profile_firesim.sh` sets MODELBLASTER_POOL_THREADS, and to 1,
+    which is caller-only. So no measurement in this tree is affected, and the
+    fix is to stop it being reachable rather than to correct a past number.
+
+    Until the shard path re-packs per-shard weights the way
+    `split_conv_tile_weights` does for tiles, a non-OIHW backend gets the
+    wrapper with NO pool path: the call is simply serial. Sharding not
+    engaging is what already happens in practice; sharding engaging and
+    computing the wrong answer is not.
+    """
     parts = ["\n/* ---------- parallel_for wrappers (Path 2 — skeleton-driven) ---------- */"]
     parts.append("#ifdef MODELBLASTER_USE_POOL")
     parts.append('#include "modelblaster_pool.h"')
     parts.append("#endif")
+    layout = _conv_weight_layout_for_backend(backend)
+    oc_slice_is_contiguous = layout in (None, "oihw")
     for op in sorted(_PARALLELIZED_OPS & used_ops):
+        if not oc_slice_is_contiguous and op in _OC_WEIGHT_SLICING_OPS:
+            parts.append(
+                f"\n/* parallel_{op}: NO pool path on this backend.\n"
+                f" * Conv weights are packed {layout.upper()} here, so the OC\n"
+                f" * slice this wrapper would take is strided, not contiguous.\n"
+                f" * Sharding it would read the wrong weights -- bit-exact on\n"
+                f" * scalar, silently wrong on rvv. Serial call only until the\n"
+                f" * shard path re-packs per-shard weights the way\n"
+                f" * split_conv_tile_weights does for split tiles. */")
+            parts.append(_serial_only_wrapper(op, mid))
+            continue
         parts.append(_PARALLEL_WRAPPER_TEMPLATES[op].format(mid=mid))
     return "\n".join(parts)
+
+
+def _serial_only_wrapper(op: str, mid: str) -> str:
+    """The op's wrapper with the shard machinery compiled out entirely.
+
+    Reuses the template's own `#else` arm rather than hand-writing a second
+    copy of the call: that arm already spells the serial call correctly, and
+    a hand-written duplicate is one more thing to keep in sync with a kernel
+    signature.
+
+    Two regions are disabled, not one. Guarding only the `#ifdef
+    MODELBLASTER_USE_POOL` inside `parallel_<op>` leaves the shard worker
+    `parallel_<op>_fn` and its context struct compiled -- dead, since their
+    only caller is inside the disabled block, but still carrying the OIHW
+    offset arithmetic that is wrong here, and still emitting an unused-function
+    warning. The public `parallel_<op>` entry point itself must survive: model.c
+    calls it unconditionally.
+    """
+    body = _PARALLEL_WRAPPER_TEMPLATES[op].format(mid=mid)
+    reason = ("#if 0 /* OC slice is strided under this backend's weight "
+              "packing */")
+    entry = f"static inline void parallel_{op}("
+    head, sep, tail = body.partition(entry)
+    if not sep:                       # template shape changed; guard the call
+        return body.replace("#ifdef MODELBLASTER_USE_POOL", reason, 1)
+    # head = ctx struct + worker fn -> disable wholesale.
+    # tail = the entry point -> keep, but take its serial arm.
+    return (f"{reason}\n{head}#endif\n"
+            + (entry + tail).replace("#ifdef MODELBLASTER_USE_POOL", reason, 1))
 
 
 
@@ -2382,7 +2458,7 @@ static inline unsigned long long mb_wall_ticks(void)
     c = f"""{HEADER}
 {timer_preamble}
 
-{_emit_parallel_wrappers(mid, used_ops)}
+{_emit_parallel_wrappers(mid, used_ops, backend)}
 
 /* Per-model intermediate buffers. Defined in a sibling buffers.c (one
  * TU per model, NOT per backend) so the heterogeneous harness's two
