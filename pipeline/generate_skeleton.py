@@ -550,6 +550,16 @@ def _check_conv_family_layout_agreement(backend: Optional[str], s8_layout: Optio
 
     Mirrors _conv_weight_layout_for_backend's same-op disagreement check,
     but across ops. Fails loudly instead of guessing.
+
+    SCOPE (2026-08-28): packing is now resolved PER OP by
+    _conv_weight_layout_for_op, so the blind spot this guards no longer
+    exists for any weight tensor whose owning op is known from the IR.
+    The guard is still armed on the one path where the old
+    one-layout-per-backend rule survives: a 4D weight tensor that no op in
+    the IR claims (see _backend_pack_weight). Do not widen it back to the
+    general path -- conv2d_s8 wanting "ihwoc" while conv2d_f16 wants
+    "oihw" on rvv_f16 is now a legitimate, correctly-handled combination,
+    not a conflict.
     """
     if backend is None:
         return
@@ -583,6 +593,70 @@ def _check_conv_family_layout_agreement(backend: Optional[str], s8_layout: Optio
             )
 
 
+# Macros by which a UNIVERSAL (non-target-affined) reference impl declares
+# "this backend hands me pre-packed conv weights". An op whose impl tests
+# one of these follows the backend-wide packed layout; every other op is
+# packed according to its OWN target-affined algorithms.
+_BACKEND_PACK_MACROS = (
+    "MODELBLASTER_RVV_IHWOC_WEIGHTS",
+    "MODELBLASTER_GEMMINI_HWIO_WEIGHTS",
+)
+
+
+def _op_follows_backend_conv_layout(spec) -> bool:
+    """True if this op's reference code branches on the backend pack macros."""
+    sources = [spec.reference_impl or ""]
+    sources += [a.reference_impl or "" for a in spec.algorithms]
+    return any(m in s for s in sources for m in _BACKEND_PACK_MACROS)
+
+
+def _conv_weight_layout_for_op(op_name: Optional[str],
+                               backend: Optional[str]) -> Optional[str]:
+    """The layout THIS op's weight tensor must be packed in on `backend`.
+
+    Weight packing is a per-op contract, not a per-backend one. The old
+    rule -- derive one layout from conv2d_s8 and apply it to every 4D
+    tensor on the backend -- is unrepresentable on a mixed-precision
+    target: on rvv_f16 the curated conv2d_s8 kernels index weights IHWOC
+    while the curated conv2d_f16 / depthwise_conv2d_f16 kernels index them
+    OIHW, and a single backend-wide answer is wrong for one of them
+    whichever way it goes. (That is precisely what
+    _check_conv_family_layout_agreement was built to detect; it is a real
+    conflict under the old rule and a non-issue under this one.)
+
+    Resolution order:
+      1. If any algorithm of this op is target-affined to this backend, the
+         layout those algorithms declare wins. They must agree.
+      2. Otherwise, if the op's own reference code branches on the backend
+         pack macros, it follows the backend-wide conv2d_s8 layout.
+      3. Otherwise the tensor stays OIHW.
+    """
+    if backend is None or op_name is None:
+        return None
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    spec = KERNEL_SPECS.get(op_name)
+    if spec is None:
+        return None
+    declared = {
+        algo.weight_layout
+        for algo in spec.algorithms
+        if algo.target_affinity and backend in algo.target_affinity
+    }
+    if len(declared) > 1:
+        raise SystemExit(
+            f"backend '{backend}': {op_name} algorithms disagree on "
+            f"weight_layout: {sorted(declared)}. All target-affined "
+            f"algorithms for an op on a backend must declare the same "
+            f"layout."
+        )
+    if declared:
+        layout = declared.pop()
+        return None if layout == "oihw" else layout
+    if _op_follows_backend_conv_layout(spec):
+        return _conv_weight_layout_for_backend(backend)
+    return None
+
+
 # Physical permutation on OIHW. The two layouts differ in axis order
 # despite both being "weight reshuffled away from OIHW":
 #
@@ -607,19 +681,39 @@ _LAYOUT_TAG = {
 }
 
 
-def _backend_pack_weight(arr: np.ndarray, backend: Optional[str]) -> tuple[np.ndarray, Optional[str]]:
+def _backend_pack_weight(
+    arr: np.ndarray,
+    backend: Optional[str],
+    owner_ops: Optional[set[str]] = None,
+) -> tuple[np.ndarray, Optional[str]]:
     """Apply layout transformation to a 4D conv weight tensor at codegen time.
 
-    The target layout is derived from the algorithm declarations for this
-    backend (see _conv_weight_layout_for_backend). This keeps the weight
-    format as a per-algorithm SW decision rather than a per-backend HW
-    property — if all conv2d algorithms on a backend agree on layout, we
-    apply that layout here; otherwise we leave the tensor in OIHW.
+    `owner_ops` is the set of op kinds in the IR that consume this tensor
+    as their `weight`. The layout is that op's contract
+    (_conv_weight_layout_for_op), which keeps the weight format a
+    per-algorithm SW decision and lets int8 and fp16 convs on the same
+    backend be packed differently.
+
+    Falls back to the historical one-layout-per-backend rule (plus its
+    cross-op trip-wire) only for a 4D tensor no op claims, since there is
+    then nothing better to go on.
     """
     if arr.ndim != 4:
         return arr, None
-    layout = _conv_weight_layout_for_backend(backend)
-    _check_conv_family_layout_agreement(backend, layout)
+    if owner_ops:
+        layouts = {_conv_weight_layout_for_op(op, backend) for op in owner_ops}
+        if len(layouts) > 1:
+            raise SystemExit(
+                f"backend '{backend}': a single 4D weight tensor is shared "
+                f"by ops {sorted(owner_ops)} whose weight layouts disagree "
+                f"({sorted(str(x) for x in layouts)}). One tensor cannot be "
+                f"packed two ways; give the ops separate weight tensors or "
+                f"align their weight_layout on this backend."
+            )
+        layout = layouts.pop()
+    else:
+        layout = _conv_weight_layout_for_backend(backend)
+        _check_conv_family_layout_agreement(backend, layout)
     if layout is None or layout == "oihw":
         return arr, None
     perm = _LAYOUT_PERMUTATION.get(layout)
@@ -628,12 +722,30 @@ def _backend_pack_weight(arr: np.ndarray, backend: Optional[str]) -> tuple[np.nd
     return np.ascontiguousarray(np.transpose(arr, perm)), _LAYOUT_TAG[layout]
 
 
+def _weight_owner_ops(ir: Optional[dict[str, Any]]) -> dict[str, set[str]]:
+    """Map weight-tensor key -> set of op kinds that consume it as `weight`.
+
+    Drives the per-op weight packing in _backend_pack_weight. Every
+    conv-family op in the IR names its filter tensor in `op["weight"]`.
+    """
+    owners: dict[str, set[str]] = {}
+    if not ir:
+        return owners
+    for op in ir.get("ops", []) or []:
+        key = op.get("weight")
+        if key:
+            owners.setdefault(key, set()).add(op.get("op"))
+    return owners
+
+
 def emit_weights(
     model_name: str,
     weights: dict[str, np.ndarray],
     out_dir: str,
     backend: Optional[str] = None,
+    ir: Optional[dict[str, Any]] = None,
 ) -> None:
+    owners = _weight_owner_ops(ir)
     keys = sorted(weights.keys())
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
@@ -654,7 +766,8 @@ def emit_weights(
     for k in keys:
         ident = _weight_name(model_name, k)
         arr_in = weights[k]
-        arr_out, layout_tag = _backend_pack_weight(arr_in, backend)
+        arr_out, layout_tag = _backend_pack_weight(
+            arr_in, backend, owners.get(k))
         c_type, _ = _np_to_c_dtype(arr_out.dtype)
         if layout_tag:
             c_lines.append(
@@ -2092,7 +2205,7 @@ def generate(
     weights = dict(np.load(weights_path))
     model_name = ir["name"]
 
-    emit_weights(model_name, weights, out_dir, backend=backend)
+    emit_weights(model_name, weights, out_dir, backend=backend, ir=ir)
     emit_model(ir, out_dir)
     emit_test_io(ir, io_path, out_dir)
 

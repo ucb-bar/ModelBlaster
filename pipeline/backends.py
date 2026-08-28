@@ -121,7 +121,20 @@ SCALAR_F16 = Backend(
 RVV_F16 = Backend(
     name="rvv_f16",
     description="rv64gcv + Zfh + Zvfh (vector half-precision).",
-    kernel_cflags=("-march=rv64gcv_zfh_zvfh", "-mabi=lp64d"),
+    kernel_cflags=(
+        "-march=rv64gcv_zfh_zvfh",
+        "-mabi=lp64d",
+        # Same contract as the plain rvv backend: conv2d_s8's
+        # target-affined algorithms declare weight_layout="ihwoc", so the
+        # skeleton packs conv2d_s8 weights IHWOC on this backend too and
+        # the universal (non-affined) reference impls must be told. Note
+        # the flag is only read by the ops whose reference_impl tests it
+        # (conv2d_s8 / conv2d_silu_s8 / conv2d_pool_s8) -- the fp16 conv
+        # ops declare weight_layout="oihw" and are packed OIHW, which is
+        # why the packing is resolved per-op in generate_skeleton rather
+        # than once per backend.
+        "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
+    ),
     kernel_includes=("<riscv_vector.h>",),
     prj_conf_overlay="rvv_f16.conf",
     spike_args=("--isa=rv64gcv_zicntr_zfh_zvfh",),
