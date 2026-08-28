@@ -4957,6 +4957,25 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
     ],
     argtypes_factory=_linear_f16_argtypes,
     algorithms=[
+        # Kernel: kernels/rvv/rvv_linear_f16_narrow.c
+        AlgorithmCandidate(
+            name="narrow",
+            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            description=(
+                "RVV+Zvfh fp16 linear with PURE-fp16 accumulation. The "
+                "K-reduction uses vfmacc.vv (fp16 multiply-accumulate) and "
+                "vfredusum.vs, keeping the whole vector datapath at SEW=16 -- "
+                "no vfwmacc, no fp32 accumulator. Preferred over 'widening' "
+                "on the rvv family because it runs on a reduced fp16-only "
+                "vector unit as well as a full one, and because f16m4 "
+                "processes twice the lanes of widening's f16m2 load. The "
+                "divergence from the reference is reduction ORDER only (fp16 "
+                "is non-associative), which is also what the deployment "
+                "hardware does."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        ),
         AlgorithmCandidate(
             name="widening",
             target_affinity=("rvv_f16",),
@@ -9049,6 +9068,114 @@ void kernel_cos_s8(const int8_t *input, int8_t *output, int n,
 
 
 
+def _lstm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)   # _Float16 has no ctypes type
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [h, h, h, h, h, h, h, ctypes.c_int, ctypes.c_int]
+
+
+# The fp16 counterpart of LSTM_S8. It exists because the int8 recurrent tail is
+# where the fused sensor net loses its answer: per-tensor int8 over a 3-layer
+# LSTM took the full-net error to 0.45 relative L2 while the encoders alone were
+# at 0.09. The tail is ~5% of the dispatch time, so buying it back in fp16 is
+# cheap. Promotion is per-op (extract_graph._promote_ops_to_fp16), which is why
+# this spec's op record is the SAME shape as lstm_s8's -- minus the scales, and
+# with b_ih + b_hh folded into one float bias.
+LSTM_F16 = KernelSpec(
+    op="lstm_f16",
+    signature=(
+        "void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih, "
+        "const _Float16 *w_hh, const _Float16 *bias, "
+        "_Float16 *h, _Float16 *c, _Float16 *out, int in_size, int H)"
+    ),
+    semantics=(
+        "One timestep of a single-layer LSTM cell, batch size 1, _Float16\n"
+        "in/out. Gate order is PyTorch's: [input, forget, cell, output].\n"
+        "\n"
+        "  gates = w_ih @ x + w_hh @ h_prev + bias        (4H values)\n"
+        "  i = sigmoid(gates[0:H])     f = sigmoid(gates[H:2H])\n"
+        "  g = tanh(gates[2H:3H])      o = sigmoid(gates[3H:4H])\n"
+        "  c = f * c_prev + i * g      h = o * tanh(c)\n"
+        "\n"
+        "The two gate-GEMM reductions ACCUMULATE IN _Float16 -- storage and\n"
+        "accumulate both half -- so the kernel needs no fp32 vector datapath.\n"
+        "The sigmoid/tanh and the cell update are evaluated in scalar float\n"
+        "(O(H) work against O(4H*(in_size+H)) MACs) and stored back to\n"
+        "_Float16.\n"
+        "\n"
+        "h and c are BOTH INPUTS AND OUTPUTS: they carry the recurrent state\n"
+        "and are updated in place, so a second call with the same input does\n"
+        "not give the same answer and the caller must keep both buffers alive\n"
+        "across invocations. Zero-initialised buffers are the 'no history'\n"
+        "start.\n"
+        "\n"
+        "The new hidden state is written to `out` and only committed to `h`\n"
+        "after every unit is done, because the w_hh reduction for unit t+1 must\n"
+        "still see the PREVIOUS h. `out` must therefore not alias `h`.\n"
+        "\n"
+        "Weight layout is PyTorch's: w_ih is [4H, in_size] row-major, w_hh is\n"
+        "[4H, H] row-major, bias is [4H] and already holds b_ih + b_hh."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih,
+                     const _Float16 *w_hh, const _Float16 *bias,
+                     _Float16 *h, _Float16 *c, _Float16 *out,
+                     int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const _Float16 *wih_row = w_ih + (long)row * in_size;
+            const _Float16 *whh_row = w_hh + (long)row * H;
+            /* fp16 product, fp16 accumulate -- see semantics. */
+            _Float16 ax = (_Float16)0.0f, ah = (_Float16)0.0f;
+            for (int k = 0; k < in_size; k++)
+                ax = (_Float16)(ax + (_Float16)(x[k] * wih_row[k]));
+            for (int k = 0; k < H; k++)
+                ah = (_Float16)(ah + (_Float16)(h[k] * whh_row[k]));
+            pre[g] = (float)ax + (float)ah + (float)bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * (float)c[j] + ig * cg;
+        c[j]   = (_Float16)c_new;
+        out[j] = (_Float16)(og * tanhf(c_new));
+    }
+    /* Commit the new hidden state only now (deferred writeback). */
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 597, "H": 128}],
+    argtypes_factory=_lstm_f16_argtypes,
+    algorithms=[
+        # Kernel: kernels/rvv/rvv_lstm_f16_rvv_gate_f16_dot.c
+        AlgorithmCandidate(
+            name="rvv_gate_f16_dot",
+            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            description=(
+                "Vectorize the two gate GEMVs per unit -- x . w_ih[g] over "
+                "in_size and h . w_hh[g] over H -- with unit-stride fp16 loads, "
+                "vfmacc.vv (fp16 multiply-accumulate) and vfredusum.vs. The "
+                "whole vector hot loop stays SEW=16: nothing widens to fp32, so "
+                "no fp32 vector datapath is required. sigmoid, tanh and the "
+                "cell update stay scalar float exactly as the reference writes "
+                "them (~5 libm calls per hidden unit against ~4200 MACs). The "
+                "deferred hidden writeback is preserved. Divergence from the "
+                "reference is reduction ORDER only -- fp16 is non-associative -- "
+                "so this is numeric_drift by construction, not bit_exact."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        ),
+    ],
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     "linear": LINEAR,
     "matmul": MATMUL,
@@ -9114,6 +9241,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "cast_f16_to_i8": CAST_F16_TO_I8,
     # ViNT fp16 op set.
     "linear_f16": LINEAR_F16,
+    "lstm_f16": LSTM_F16,
     "depthwise_conv2d_f16": DEPTHWISE_CONV2D_F16,
     "layer_norm_f16": LAYER_NORM_F16,
     "gelu_f16": GELU_F16,

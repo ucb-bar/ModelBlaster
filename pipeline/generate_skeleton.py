@@ -660,11 +660,25 @@ def emit_model(ir: dict[str, Any], out_dir: str,
     in_c_type = _dtype_to_c(tensors[in_tensor]["dtype"])
     # Build input offset map: {tensor_name: flat_offset_in_packed_input_buffer}.
     # Single-input models have no "packed_inputs" key — offset is always 0.
+    #
+    # A MIXED-dtype packed buffer (the fused sensor net: two int8 image inputs
+    # plus an fp16 low-dimensional state vector) is addressed by BYTE instead:
+    # the buffer stays int8_t and each slice is cast to its own element type at
+    # the call site. Offsetting such a buffer in elements would be silently
+    # wrong for every slice after the first differently-sized one.
+    input_mixed_dtype = ir["input"].get("packed_dtype") == "mixed"
+    input_entry_dtype: dict[str, str] = {}
     if "packed_inputs" in ir["input"]:
-        input_offsets: dict[str, int] = {
-            p["name"]: p["offset"] for p in ir["input"]["packed_inputs"]
-        }
-        in_size = sum(p["size"] for p in ir["input"]["packed_inputs"])
+        _packed = ir["input"]["packed_inputs"]
+        input_entry_dtype = {p["name"]: p.get("dtype", "i8") for p in _packed}
+        if input_mixed_dtype:
+            input_offsets: dict[str, int] = {
+                p["name"]: int(p["byte_offset"]) for p in _packed
+            }
+            in_size = int(ir["input"]["packed_bytes"])
+        else:
+            input_offsets = {p["name"]: p["offset"] for p in _packed}
+            in_size = sum(p["size"] for p in _packed)
     else:
         input_offsets = {in_tensor: 0}
         in_size = _prod(tensors[in_tensor]["shape"])
@@ -911,6 +925,17 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             return base_ptr if off == 0 else f"({base_ptr} + {off})"
         if tensor in input_offsets:
             off = input_offsets[tensor]
+            if input_mixed_dtype:
+                # Byte-addressed: cast the slice to its own element type. The
+                # parenthesised `(input)` is not cosmetic -- the dispatch-body
+                # emitter rewrites `input` to `s->input` by matching the
+                # literal substrings "input,", "input)" and "(input + ", so a
+                # bare `input +` inside a cast expression would silently miss
+                # the rewrite and fail to compile.
+                ct = _dtype_to_c(input_entry_dtype.get(tensor, "i8"))
+                base = ("(const char *)(input)" if off == 0
+                        else f"((const char *)(input) + {off})")
+                return f"((const {ct} *){base})"
             return "input" if off == 0 else f"(input + {off})"
         if tensor in out_tensor_to_offset:
             off = out_tensor_to_offset[tensor]
@@ -1828,6 +1853,23 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_linear_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']})"
+            )
+        elif op["op"] == "lstm_f16":
+            # Same op record as lstm_s8 (see the int8 branch) after the fp16
+            # promotion pass rewrote its kind and folded b_ih + b_hh into one
+            # float bias -- so the state is still the [h, c] pair of persistent
+            # buffers, now _Float16.
+            x_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            h_ptr = ptr_for(op["state"][0], "inout")
+            c_ptr = ptr_for(op["state"][1], "inout")
+            call = (
+                f"kernel_lstm_f16({x_ptr}, "
+                f"{_weight_name(model_name, op['weight'])}, "
+                f"{_weight_name(model_name, op['weight_hh'])}, "
+                f"{_weight_name(model_name, op['bias'])}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, "
+                f"{sh['input_size']}, {sh['hidden_size']})"
             )
         elif op["op"] == "depthwise_conv2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
