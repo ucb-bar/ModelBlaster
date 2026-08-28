@@ -136,3 +136,42 @@ class ConvShardingOnAPackedBackend(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TheSplitPointIsDeclaredNotInferred(unittest.TestCase):
+    """The marker replaces a match on the entry point's C signature.
+
+    The first version of `_serial_only_wrapper` partitioned the template on
+    `static inline void parallel_<op>(`. That works until someone reformats a
+    signature across lines, at which point the partition silently fails and the
+    function falls back to guarding only the call -- leaving the shard worker,
+    with its wrong-for-this-backend offset arithmetic, compiled in. Silent
+    degradation of a safety mechanism is the worst failure shape available, so
+    a missing marker is now a hard error.
+    """
+
+    def test_every_offset_wrapper_template_declares_the_marker(self):
+        for op, tmpl in generate_skeleton._PARALLEL_WRAPPER_TEMPLATES.items():
+            self.assertIn(generate_skeleton._SHARD_MACHINERY_END, tmpl,
+                          f"{op} template lost its split marker")
+
+    def test_the_marker_precedes_the_entry_point(self):
+        for op, tmpl in generate_skeleton._PARALLEL_WRAPPER_TEMPLATES.items():
+            self.assertLess(
+                tmpl.index(generate_skeleton._SHARD_MACHINERY_END),
+                tmpl.index(f"static inline void parallel_{op}("),
+                f"{op}: the marker must come before the entry point, or the "
+                f"entry point would be disabled with the machinery")
+
+    def test_a_template_without_the_marker_is_refused_loudly(self):
+        saved = dict(generate_skeleton._PARALLEL_WRAPPER_TEMPLATES)
+        try:
+            generate_skeleton._PARALLEL_WRAPPER_TEMPLATES["conv2d_s8"] = (
+                "static inline void parallel_conv2d_s8(void) {{}}")
+            with self.assertRaises(SystemExit) as cm:
+                generate_skeleton._serial_only_wrapper("conv2d_s8", "m")
+            self.assertIn("marker", str(cm.exception))
+        finally:
+            generate_skeleton._PARALLEL_WRAPPER_TEMPLATES.clear()
+            generate_skeleton._PARALLEL_WRAPPER_TEMPLATES.update(saved)
