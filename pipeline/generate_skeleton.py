@@ -458,6 +458,177 @@ static inline void parallel_conv2d_s8(void *pool_,
 }}
 """
 
+_CONV2D_BN_SILU_S8_SHARD_WRAPPER = """
+/* ---- conv2d+BN+SiLU, sharded over OC with PRE-PACKED per-shard weights --- */
+
+typedef struct {{
+    const int8_t *in;
+    const int8_t *const *w_shards;
+    const int32_t *b;
+    const float *bn_scale;
+    const float *bn_bias;
+    int8_t *out;
+    int N, IC, IH, IW, oc_per, KH, KW, SH, SW, PH, PW, OH, OW;
+    int input_offset, filter_offset, output_offset;
+    int output_multiplier, output_shift, activation_min, activation_max;
+    float bn_scale_in, bn_scale_out;
+    int bn_activation_min, bn_activation_max;
+    float silu_scale_in, silu_scale_out;
+    int silu_activation_min, silu_activation_max;
+}} parallel_cbs_shard_ctx_t;
+
+static void parallel_cbs_shard_fn(void *ctx_, size_t i) {{
+    parallel_cbs_shard_ctx_t *c = (parallel_cbs_shard_ctx_t *)ctx_;
+    int oc0 = (int)i * c->oc_per;
+    size_t per_oc_out = (size_t)c->OH * (size_t)c->OW;
+    /* Only the WEIGHT needs its own array. bn_scale and bn_bias are 1-D
+     * per-output-channel floats and `bias` is 1-D int32; _backend_pack_weight
+     * only permutes 4-D tensors, so all three stay contiguous and a plain
+     * `+ oc0` is correct for them. The output is NCHW, so an OC slice is a
+     * contiguous run of planes. */
+    kernel_conv2d_batchnorm2d_silu_s8(
+        c->in, c->w_shards[i], c->b ? c->b + oc0 : NULL,
+        c->bn_scale + oc0, c->bn_bias + oc0,
+        c->out + (size_t)oc0 * per_oc_out,
+        c->N, c->IC, c->IH, c->IW, c->oc_per, c->KH, c->KW,
+        c->SH, c->SW, c->PH, c->PW,
+        c->input_offset, c->filter_offset, c->output_offset,
+        c->output_multiplier, c->output_shift,
+        c->activation_min, c->activation_max,
+        c->bn_scale_in, c->bn_scale_out,
+        c->bn_activation_min, c->bn_activation_max,
+        c->silu_scale_in, c->silu_scale_out,
+        c->silu_activation_min, c->silu_activation_max);
+}}
+
+static inline void parallel_conv2d_bn_silu_s8_sharded(
+        void *pool_, const int8_t *in, const int8_t *const *w_shards,
+        int n_shards, int oc_per, const int32_t *b,
+        const float *bn_scale, const float *bn_bias, int8_t *out,
+        int N, int IC, int IH, int IW, int KH, int KW,
+        int SH, int SW, int PH, int PW,
+        int input_offset, int filter_offset, int output_offset,
+        int output_multiplier, int output_shift,
+        int activation_min, int activation_max,
+        float bn_scale_in, float bn_scale_out,
+        int bn_activation_min, int bn_activation_max,
+        float silu_scale_in, float silu_scale_out,
+        int silu_activation_min, int silu_activation_max) {{
+    int OH = (IH + 2 * PH - KH) / SH + 1;
+    int OW = (IW + 2 * PW - KW) / SW + 1;
+    parallel_cbs_shard_ctx_t ctx = {{
+        .in = in, .w_shards = w_shards, .b = b,
+        .bn_scale = bn_scale, .bn_bias = bn_bias, .out = out,
+        .N = N, .IC = IC, .IH = IH, .IW = IW, .oc_per = oc_per,
+        .KH = KH, .KW = KW, .SH = SH, .SW = SW, .PH = PH, .PW = PW,
+        .OH = OH, .OW = OW,
+        .input_offset = input_offset, .filter_offset = filter_offset,
+        .output_offset = output_offset,
+        .output_multiplier = output_multiplier, .output_shift = output_shift,
+        .activation_min = activation_min, .activation_max = activation_max,
+        .bn_scale_in = bn_scale_in, .bn_scale_out = bn_scale_out,
+        .bn_activation_min = bn_activation_min,
+        .bn_activation_max = bn_activation_max,
+        .silu_scale_in = silu_scale_in, .silu_scale_out = silu_scale_out,
+        .silu_activation_min = silu_activation_min,
+        .silu_activation_max = silu_activation_max,
+    }};
+#ifdef MODELBLASTER_USE_POOL
+    modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
+    if (pool != NULL && N == 1
+        && modelblaster_pool_get_threads_count(pool) > 1) {{
+        modelblaster_pool_parallelize_1d(pool, parallel_cbs_shard_fn,
+                                         &ctx, (size_t)n_shards, 0);
+        return;
+    }}
+#else
+    (void)pool_;
+#endif
+    for (size_t i = 0; i < (size_t)n_shards; i++)
+        parallel_cbs_shard_fn(&ctx, i);
+}}
+"""
+
+
+_CONV2D_S8_SHARD_WRAPPER = """
+/* ---- conv2d_s8, sharded over OC with PRE-PACKED per-shard weights ------- */
+
+typedef struct {{
+    const int8_t *in;
+    const int8_t *const *w_shards;   /* one re-packed array per shard */
+    const int32_t *b;
+    int8_t *out;
+    int N, IC, IH, IW, oc_per, KH, KW, SH, SW, PH, PW, OH, OW;
+    int input_offset, filter_offset, output_offset;
+    int output_multiplier, output_shift, activation_min, activation_max;
+}} parallel_conv2d_s8_shard_ctx_t;
+
+static void parallel_conv2d_s8_shard_fn(void *ctx_, size_t i) {{
+    parallel_conv2d_s8_shard_ctx_t *c = (parallel_conv2d_s8_shard_ctx_t *)ctx_;
+    int oc0 = (int)i * c->oc_per;
+    size_t per_oc_out = (size_t)c->OH * (size_t)c->OW;
+    /* The weight is the shard's OWN array, read from element 0 -- NOT an
+     * offset into the parent. Under this backend's IHWOC packing an OC slice
+     * is strided and no offset can express it; see shard_conv_weights.
+     *
+     * Bias and output ARE offsets, and correctly so: bias is 1-D so
+     * _backend_pack_weight leaves it contiguous, and the output is NCHW so an
+     * OC slice is a contiguous plane run. */
+    kernel_conv2d_s8_{mid}(c->in,
+                           c->w_shards[i],
+                           c->b ? c->b + oc0 : NULL,
+                           c->out + (size_t)oc0 * per_oc_out,
+                           c->N, c->IC, c->IH, c->IW,
+                           c->oc_per, c->KH, c->KW,
+                           c->SH, c->SW, c->PH, c->PW,
+                           c->input_offset, c->filter_offset,
+                           c->output_offset,
+                           c->output_multiplier, c->output_shift,
+                           c->activation_min, c->activation_max);
+}}
+
+static inline void parallel_conv2d_s8_sharded(
+        void *pool_, const int8_t *in, const int8_t *const *w_shards,
+        int n_shards, int oc_per, const int32_t *b, int8_t *out,
+        int N, int IC, int IH, int IW, int KH, int KW,
+        int SH, int SW, int PH, int PW,
+        int input_offset, int filter_offset, int output_offset,
+        int output_multiplier, int output_shift,
+        int activation_min, int activation_max) {{
+    int OH = (IH + 2 * PH - KH) / SH + 1;
+    int OW = (IW + 2 * PW - KW) / SW + 1;
+    parallel_conv2d_s8_shard_ctx_t ctx = {{
+        .in = in, .w_shards = w_shards, .b = b, .out = out,
+        .N = N, .IC = IC, .IH = IH, .IW = IW,
+        .oc_per = oc_per, .KH = KH, .KW = KW,
+        .SH = SH, .SW = SW, .PH = PH, .PW = PW, .OH = OH, .OW = OW,
+        .input_offset = input_offset, .filter_offset = filter_offset,
+        .output_offset = output_offset,
+        .output_multiplier = output_multiplier, .output_shift = output_shift,
+        .activation_min = activation_min, .activation_max = activation_max,
+    }};
+#ifdef MODELBLASTER_USE_POOL
+    modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
+    if (pool != NULL && N == 1
+        && modelblaster_pool_get_threads_count(pool) > 1) {{
+        modelblaster_pool_parallelize_1d(pool, parallel_conv2d_s8_shard_fn,
+                                         &ctx, (size_t)n_shards, 0);
+        return;
+    }}
+#else
+    (void)pool_;
+#endif
+    /* No pool: loop the SAME shards rather than making one full-OC call.
+     * Identical arithmetic, not an approximation -- OC is an output axis, so
+     * slicing it partitions output elements and changes no accumulation
+     * order. It also means the full-OC parent array has no consumer and is
+     * not emitted, so sharding costs no extra weight bytes. */
+    for (size_t i = 0; i < (size_t)n_shards; i++)
+        parallel_conv2d_s8_shard_fn(&ctx, i);
+}}
+"""
+
+
 _PARALLEL_WRAPPER_TEMPLATES = {
     "linear":    _LINEAR_WRAPPER,
     "conv2d":    _CONV2D_WRAPPER,
@@ -473,7 +644,8 @@ _OC_WEIGHT_SLICING_OPS = {"conv2d", "conv2d_s8"}
 
 
 def _emit_parallel_wrappers(mid: str, used_ops: set[str],
-                            backend: Optional[str] = None) -> str:
+                            backend: Optional[str] = None,
+                            sharded: bool = False) -> str:
     """Emit static parallel_for wrappers ONLY for ops the model actually uses.
 
     Emitting for every parallelizable op leaks `kernel_<op>_<mid>` references
@@ -511,6 +683,14 @@ def _emit_parallel_wrappers(mid: str, used_ops: set[str],
     parts.append("#endif")
     layout = _conv_weight_layout_for_backend(backend)
     oc_slice_is_contiguous = layout in (None, "oihw")
+    if sharded and "conv2d_batchnorm2d_silu_s8" in used_ops:
+        parts.append(_CONV2D_BN_SILU_S8_SHARD_WRAPPER.format(mid=mid))
+    if sharded and "conv2d_s8" in used_ops:
+        # The SHARDED entry point is correct on a repacking backend precisely
+        # because it does not slice the parent -- each shard has its own
+        # pre-packed array. So it is emitted even where the offset-based
+        # wrapper below is compiled out.
+        parts.append(_CONV2D_S8_SHARD_WRAPPER.format(mid=mid))
     for op in sorted(_PARALLELIZED_OPS & used_ops):
         if not oc_slice_is_contiguous and op in _OC_WEIGHT_SLICING_OPS:
             parts.append(
@@ -742,6 +922,159 @@ def split_conv_tile_weights(
     return plan
 
 
+#: Per-shard weight symbols for an intra-op sharded conv. Same hazard as
+#: `_TILE_W_SUFFIX`, different mechanism -- see `shard_conv_weights`.
+_SHARD_W_SUFFIX = ".shard_"
+
+
+#: Conv ops an OC shard can be built for. Deliberately NOT `_PARALLELIZED_OPS`:
+#: that set drives the offset-based wrappers, which have no template for the
+#: fused ops and are compiled out on a repacking backend anyway. These three
+#: are where the time is -- `conv2d_batchnorm2d_silu_s8` alone is 97% of
+#: yolov8n and `conv2d_batchnorm2d_s8` is 29% of DroNet.
+_SHARDABLE_CONV_OPS = {
+    "conv2d_s8",
+    "conv2d_batchnorm2d_s8",
+    "conv2d_batchnorm2d_silu_s8",
+}
+
+
+def _conv_shape_of(op: dict[str, Any]) -> dict[str, Any]:
+    """A conv's shape, whether it is plain or fused.
+
+    A fused op carries no shape of its own; the conv is `sub_ops[0]`. Reading
+    `op["shape"]` for a fused conv is how the profile ended up writing
+    `noshape` for 57 of yolov8n's dispatches.
+    """
+    if op.get("shape"):
+        return op["shape"]
+    for sub in (op.get("sub_ops") or ()):
+        if sub.get("op", "").startswith("conv2d") and sub.get("shape"):
+            return sub["shape"]
+    return {}
+
+
+def _conv_weight_of(op: dict[str, Any]) -> Optional[str]:
+    if op.get("weight"):
+        return op["weight"]
+    for sub in (op.get("sub_ops") or ()):
+        if sub.get("op", "").startswith("conv2d") and sub.get("weight"):
+            return sub["weight"]
+    return None
+
+
+def shard_factor() -> int:
+    """How many OC shards a parallelizable conv is compiled for. 1 = off.
+
+    A codegen-time constant rather than a runtime one, because the whole point
+    is that the weights are RE-PACKED per shard. `modelblaster_pool` can be
+    sized at runtime, but the arrays it reads cannot.
+    """
+    try:
+        return max(1, int(os.environ.get("MB_SHARD_FACTOR", "1")))
+    except ValueError:
+        raise SystemExit("MB_SHARD_FACTOR must be a positive integer")
+
+
+def shard_conv_weights(
+    ir: dict[str, Any], backend: Optional[str], factor: int,
+) -> dict[int, dict[str, Any]]:
+    """`{dispatch_id: {...}}` for every conv whose weights must be re-packed
+    per OC shard before `modelblaster_pool` can shard it.
+
+    WHY THIS IS NOT A POINTER OFFSET
+    --------------------------------
+    Identical to the hazard `split_conv_tile_weights` documents, reached by a
+    different route. `parallel_conv2d_s8` hands shard `t` the pointer
+    `w + t*oc_per*IC*KH*KW`, an OIHW offset. The rvv backends pack conv weights
+    IHWOC, OC innermost, so an OC slice is STRIDED and no offset expresses it.
+
+    That path is currently compiled out entirely on a repacking backend (see
+    `_emit_parallel_wrappers`), which is why sharding has never run on rvv.
+    This is what makes it runnable: shard `t` gets its OWN array, sliced in
+    OIHW and then packed, so it strides by `oc_per` -- exactly the `OC` the
+    kernel is called with -- and reads from element 0.
+
+    WHY THE PARENT ARRAY CAN BE DROPPED
+    -----------------------------------
+    A shard is not a tile: it must still work when the pool is absent. The
+    obvious reading is that both layouts are needed, doubling weight memory,
+    because `pack(w[0:16]) ++ pack(w[16:32])` is NOT `pack(w[0:32])` under
+    IHWOC -- the concatenation interleaves differently.
+
+    It is avoidable. The serial path loops over the SAME shards instead of
+    making one full-OC call. That is numerically identical, not an
+    approximation: OC is an OUTPUT axis, so slicing it partitions the output
+    elements and changes no accumulation order. (Slicing a REDUCTION axis
+    would not be safe this way.) So the parent is dead either way and weight
+    memory is unchanged.
+
+    Returns `{}` when the backend packs OIHW -- the pointer arithmetic is
+    already right there and duplicating arrays would only waste space -- and
+    skips any conv whose OC is not divisible by `factor`, which falls back to
+    a single shard rather than growing an uneven-tail special case.
+    """
+    if factor <= 1:
+        return {}
+    ops = [op for op in ir.get("ops", [])
+           if op.get("op") in _SHARDABLE_CONV_OPS
+           and _conv_weight_of(op)
+           and not (op.get("split_from") or {})]
+    if not ops:
+        return {}
+    layout = _conv_weight_layout_for_backend(backend)
+    if layout in (None, "oihw"):
+        return {}
+    plan: dict[int, dict[str, Any]] = {}
+    for op in ops:
+        did = op.get("dispatch_id")
+        oc = int(_conv_shape_of(op).get("OC", 0))
+        if did is None or oc <= 0 or oc % factor != 0:
+            continue
+        plan[did] = {"weight": _conv_weight_of(op), "op": op.get("op"),
+                     "oc_per": oc // factor, "n_shards": factor,
+                     "layout": layout}
+    return plan
+
+
+def _shard_key(base_key: str, shard: int) -> str:
+    return f"{base_key}{_SHARD_W_SUFFIX}{shard}"
+
+
+def _apply_shard_weight_plan(
+    weights: dict[str, np.ndarray],
+    plan: dict[int, dict[str, Any]],
+) -> tuple[dict[str, np.ndarray], set[str]]:
+    """`(extra_arrays, parent_keys_to_drop)`, mirroring the tile version.
+
+    Sliced in OIHW and returned in OIHW: `emit_weights` runs
+    `_backend_pack_weight` over everything it emits, so packing here would
+    permute twice. `pack(w[a:b])` is the shard's array; `pack(w)[a:b]` is not
+    even the right elements.
+
+    The BIAS is deliberately not sharded. `_backend_pack_weight` only touches
+    4D tensors, so a 1D bias stays contiguous and `bias + oc0` is correct --
+    the same reason the linear wrappers were left alone.
+    """
+    extra: dict[str, np.ndarray] = {}
+    drop: set[str] = set()
+    for spec in plan.values():
+        wk = spec["weight"]
+        arr = weights.get(wk)
+        if arr is None or arr.ndim != 4:
+            continue
+        oc_per, n = spec["oc_per"], spec["n_shards"]
+        if oc_per <= 0 or oc_per * n != arr.shape[0]:
+            raise SystemExit(
+                f"shard weight slice does not tile {wk}: OC={arr.shape[0]}, "
+                f"{n} shards of {oc_per}")
+        for t in range(n):
+            extra[_shard_key(wk, t)] = np.ascontiguousarray(
+                arr[t * oc_per:(t + 1) * oc_per])
+        drop.add(wk)
+    return extra, drop
+
+
 def _tile_key(base_key: str, tile: int) -> str:
     return f"{base_key}{_TILE_W_SUFFIX}{tile}"
 
@@ -798,17 +1131,35 @@ def emit_weights(
     tile_drop: set[str] = set()
     if ir is not None:
         plan = split_conv_tile_weights(ir, backend)
+        shard_plan = shard_conv_weights(ir, backend, shard_factor())
         if plan:
             tile_extra, tile_drop = _apply_tile_weight_plan(weights, plan)
-            # Drop a parent only if NOTHING but tiles reads it. A conv weight
-            # has exactly one consumer in every model here, so this normally
-            # holds; refusing loudly beats emitting a dangling reference.
+        if shard_plan:
+            # Intra-op shards need the same re-packing for the same reason;
+            # see `shard_conv_weights`. A conv is never both -- the shard plan
+            # skips anything already carrying `split_from`.
+            s_extra, s_drop = _apply_shard_weight_plan(weights, shard_plan)
+            tile_extra.update(s_extra)
+            tile_drop |= s_drop
+        if plan or shard_plan:
+            # Drop a parent only if NOTHING but tiles/shards reads it. A conv
+            # weight has exactly one consumer in every model here, so this
+            # normally holds; refusing loudly beats emitting a dangling
+            # reference.
+            #
+            # A SHARDED conv's own op still names the parent weight, so it
+            # would appear "still used" and the parent would be kept -- 2x the
+            # weight bytes for nothing, since the emitted call reads the shard
+            # table instead. Those dispatch_ids are excluded explicitly.
+            sharded_ids = set(shard_plan)
+            def _reads_parent(op):
+                if (op.get("split_from") or {}).get("axis") == "OC":
+                    return False
+                return op.get("dispatch_id") not in sharded_ids
             still_used = {
-                op.get("weight") for op in ir.get("ops", [])
-                if not (op.get("split_from") or {}).get("axis") == "OC"
+                op.get("weight") for op in ir.get("ops", []) if _reads_parent(op)
             } | {
-                op.get("bias") for op in ir.get("ops", [])
-                if not (op.get("split_from") or {}).get("axis") == "OC"
+                op.get("bias") for op in ir.get("ops", []) if _reads_parent(op)
             }
             tile_drop -= {k for k in tile_drop if k in still_used}
     if tile_extra:
@@ -912,6 +1263,10 @@ def emit_model(ir: dict[str, Any], out_dir: str,
     # `split_conv_tile_weights`. Everything else in this function is
     # backend-independent and must stay that way.
     tile_w_plan = split_conv_tile_weights(ir, backend)
+    # Intra-op OC shards with pre-packed per-shard weights. Empty unless
+    # MB_SHARD_FACTOR > 1 AND the backend repacks conv weights; see
+    # `shard_conv_weights`.
+    shard_w_plan = shard_conv_weights(ir, backend, shard_factor())
     in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
@@ -1205,6 +1560,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
     dispatch_fns: list[str] = []
+    # File-scope `static const` tables of per-shard weight pointers, one per
+    # sharded conv. File scope rather than inside the dispatch function so the
+    # single-expression call site stays a single expression.
+    shard_tables: list[str] = []
     invoke_table_rows: list[str] = []
 
     def _emit_sub_op_call(sub_op: dict) -> str:
@@ -1598,16 +1957,41 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                     w = f"({w} + {w_off})"
                     if b != "NULL":
                         b = f"({b} + {b_off})"
-            call = (
-                f"parallel_conv2d_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
-                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
-                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
-                f"{q['input_offset']}, {q['filter_offset']}, "
-                f"{q['output_offset']}, "
-                f"{q['output_multiplier']}, {q['output_shift']}, "
-                f"{q['activation_min']}, {q['activation_max']})"
-            )
+            sspec = shard_w_plan.get(op.get("dispatch_id"))
+            if sspec is not None:
+                # Sharded: a static table of the per-shard arrays, and the
+                # entry point that reads shard i from element 0. The parent
+                # weight symbol is not emitted for this conv at all.
+                n_sh = int(sspec["n_shards"])
+                tbl = f"w_shards_d{op['dispatch_id']}"
+                shard_syms = ", ".join(
+                    _weight_name(model_name, _shard_key(op["weight"], t))
+                    for t in range(n_sh))
+                shard_tables.append(
+                    f"static const int8_t *const {tbl}[{n_sh}] = "
+                    f"{{ {shard_syms} }};")
+                call = (
+                    f"parallel_conv2d_s8_sharded(pool, {in_ptr}, {tbl}, "
+                    f"{n_sh}, {int(sspec['oc_per'])}, {b}, {out_ptr}, "
+                    f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                    f"{sh['KH']}, {sh['KW']}, "
+                    f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                    f"{q['input_offset']}, {q['filter_offset']}, "
+                    f"{q['output_offset']}, "
+                    f"{q['output_multiplier']}, {q['output_shift']}, "
+                    f"{q['activation_min']}, {q['activation_max']})"
+                )
+            else:
+                call = (
+                    f"parallel_conv2d_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
+                    f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                    f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                    f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                    f"{q['input_offset']}, {q['filter_offset']}, "
+                    f"{q['output_offset']}, "
+                    f"{q['output_multiplier']}, {q['output_shift']}, "
+                    f"{q['activation_min']}, {q['activation_max']})"
+                )
         elif op["op"] == "maxpool2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
@@ -1717,11 +2101,29 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             qc = sub_conv["quant"]
             qb = sub_bn["quant"]
             qs = sub_silu["quant"]
+            sspec = shard_w_plan.get(op.get("dispatch_id"))
+            if sspec is not None:
+                n_sh = int(sspec["n_shards"])
+                tbl = f"w_shards_d{op['dispatch_id']}"
+                shard_tables.append(
+                    f"static const int8_t *const {tbl}[{n_sh}] = {{ "
+                    + ", ".join(
+                        _weight_name(model_name,
+                                     _shard_key(sspec["weight"], t))
+                        for t in range(n_sh))
+                    + " };")
+                head = (f"parallel_conv2d_bn_silu_s8_sharded(pool, {in_ptr}, "
+                        f"{tbl}, {n_sh}, {int(sspec['oc_per'])}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['KH']}, {sh['KW']}, ")
+            else:
+                head = (f"kernel_conv2d_batchnorm2d_silu_s8({in_ptr}, {w}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['OC']}, {sh['KH']}, {sh['KW']}, ")
             call = (
-                f"kernel_conv2d_batchnorm2d_silu_s8({in_ptr}, {w}, {b}, "
-                f"{bn_s}, {bn_b}, {out_ptr}, "
-                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                head +
                 f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
                 f"{qc['input_offset']}, {qc['filter_offset']}, "
                 f"{qc['output_offset']}, "
@@ -2458,7 +2860,7 @@ static inline unsigned long long mb_wall_ticks(void)
     c = f"""{HEADER}
 {timer_preamble}
 
-{_emit_parallel_wrappers(mid, used_ops, backend)}
+{_emit_parallel_wrappers(mid, used_ops, backend, bool(shard_w_plan))}
 
 /* Per-model intermediate buffers. Defined in a sibling buffers.c (one
  * TU per model, NOT per backend) so the heterogeneous harness's two
@@ -2477,6 +2879,8 @@ static int n_;
 static unsigned long wall_cycles_;
 
 /* ---------- per-dispatch invoke fns (one per non-view IR op) ----------- */
+{chr(10).join(shard_tables)}
+
 {chr(10).join(dispatch_fns)}
 
 /* Invoke table indexed by IR dispatch_id. The schedule-driven runtime
