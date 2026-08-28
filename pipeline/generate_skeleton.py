@@ -516,9 +516,17 @@ def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
     # Only consider algorithms explicitly targeting this backend.
     # Universal algorithms (empty target_affinity) are fallbacks that
     # handle any layout via #ifdef and don't dictate the choice.
+    # Match the backend OR anything it inherits from. A variant such as
+    # rvv_x60 has no algorithms declaring affinity to it by name, so an exact
+    # match returned None -- weights were emitted OIHW while the variant's own
+    # -DMODELBLASTER_RVV_IHWOC_WEIGHTS told the kernel to read them as IHWOC.
+    # Measured cost of that mismatch on DroNet: max_abs_err=57, with no error
+    # anywhere in the build.
+    from modelblaster.pipeline.backends import backend_lineage
+    lineage = set(backend_lineage(backend))
     layouts = set()
     for algo in CONV2D_S8.algorithms:
-        if not algo.target_affinity or backend not in algo.target_affinity:
+        if not algo.target_affinity or not (lineage & set(algo.target_affinity)):
             continue
         if algo.weight_layout != "oihw":
             layouts.add(algo.weight_layout)
