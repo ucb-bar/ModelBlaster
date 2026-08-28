@@ -614,10 +614,12 @@ class _CaptureTensors(torch.fx.Interpreter):
 
 def extract_int8(
     model: torch.nn.Module,
-    sample_input: torch.Tensor,
+    sample_input: "torch.Tensor | list[torch.Tensor] | tuple",
     name: str,
     out_dir: str,
-    calibration_samples: "list[torch.Tensor] | None" = None,
+    calibration_samples: "list | None" = None,
+    input_dtypes: "list[str] | None" = None,
+    fp16_op_names: "set[str] | None" = None,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -641,12 +643,20 @@ def extract_int8(
     os.makedirs(out_dir, exist_ok=True)
     model = model.eval()
 
+    # Normalise to a list of input tensors. A multi-input model (the fused
+    # sensor net: front_grey, tof_cross, lowdim) passes a tuple/list in
+    # placeholder order; a single-input model still passes a bare tensor.
+    if isinstance(sample_input, (list, tuple)):
+        sample_inputs = list(sample_input)
+    else:
+        sample_inputs = [sample_input]
+
     gm = torch.fx.symbolic_trace(model)
-    ShapeProp(gm).propagate(sample_input)
+    ShapeProp(gm).propagate(*sample_inputs)
 
     # Capture every node's tensor for activation calibration.
     cap = _CaptureTensors(gm)
-    final = cap.run(sample_input)
+    final = cap.run(*sample_inputs)
     # Multi-output is fine — `final` may be a tuple. The IR builder picks up
     # the actual output names from the FX `output` node below; we don't need
     # to special-case here.
@@ -657,9 +667,31 @@ def extract_int8(
     # per-tensor max-abs to its true distribution-wide bound, which is
     # what fixes the cls-logit saturation seen with single-sample
     # calibration on detection models.
-    input_node_name = next(iter(gm.graph.nodes)).name
+    # Every graph input, in placeholder order, paired 1:1 with the samples.
+    placeholder_nodes = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    input_node_names = [n.name for n in placeholder_nodes]
+    if len(input_node_names) != len(sample_inputs):
+        raise RuntimeError(
+            f"int8 extract: model has {len(input_node_names)} inputs "
+            f"({input_node_names}) but {len(sample_inputs)} sample tensors "
+            f"were given")
+    input_shapes = {nm: list(si.shape)
+                    for nm, si in zip(input_node_names, sample_inputs)}
+    # Per-input surface dtype. Default: every input int8. A model declaring
+    # get_input_dtypes() may keep one input in float ("f16"/"f32") -- the
+    # fused net's lowdim vector, whose optical_flow component is ~1e5x the
+    # magnitude of its quaternion components and cannot share one int8 scale.
+    in_dtype_list = (list(input_dtypes) if input_dtypes is not None
+                     else ["i8"] * len(input_node_names))
+    if len(in_dtype_list) != len(input_node_names):
+        raise RuntimeError(
+            f"int8 extract: input_dtypes has {len(in_dtype_list)} entries for "
+            f"{len(input_node_names)} inputs")
+    input_dtype_map = dict(zip(input_node_names, in_dtype_list))
+
     max_abs: dict[str, float] = {}
-    max_abs[input_node_name] = float(sample_input.detach().abs().max().item())
+    for nm, si in zip(input_node_names, sample_inputs):
+        max_abs[nm] = float(si.detach().abs().max().item())
     for nname, t in cap.tensors.items():
         max_abs[nname] = float(t.detach().abs().max().item())
 
@@ -667,11 +699,13 @@ def extract_int8(
         extra = [s for s in calibration_samples
                  if s is not sample_input]
         for i, s in enumerate(extra):
+            s_list = list(s) if isinstance(s, (list, tuple)) else [s]
             cap_i = _CaptureTensors(gm)
-            cap_i.run(s)
-            cur = float(s.detach().abs().max().item())
-            if cur > max_abs[input_node_name]:
-                max_abs[input_node_name] = cur
+            cap_i.run(*s_list)
+            for nm, si in zip(input_node_names, s_list):
+                cur = float(si.detach().abs().max().item())
+                if cur > max_abs.get(nm, 0.0):
+                    max_abs[nm] = cur
             for nname, t in cap_i.tensors.items():
                 cur = float(t.detach().abs().max().item())
                 if cur > max_abs.get(nname, 0.0):
@@ -685,16 +719,20 @@ def extract_int8(
 
     tensors_meta: dict[str, dict] = {}
     weights_blob: dict[str, np.ndarray] = {}
+    # fp32 copies of every quantized weight, kept so that an op promoted to
+    # fp16 (mixed precision, `fp16_op_names`) can re-store its weights as
+    # float16 rather than re-deriving them from the int8 blob.
+    fp32_stash: dict[str, np.ndarray] = {}
     ops: list[dict] = []
-    input_name: str | None = None
+    input_names: list[str] = []          # placeholder order
     output_name: str | None = None
 
     # Helper: register a tensor in the IR with its int8 scale + zero_point.
     def _record(nname: str, dtype: str = "i8") -> None:
         t = cap.tensors.get(nname)
         if t is None:
-            # Placeholder (input)
-            shape = list(sample_input.shape)
+            # Placeholder (input) -- shape from the paired sample tensor.
+            shape = input_shapes.get(nname, [])
         else:
             shape = list(t.shape)
         tensors_meta[nname] = {
@@ -837,8 +875,8 @@ def extract_int8(
         if node in _skip_nodes:
             continue
         if node.op == "placeholder":
-            input_name = node.name
-            _record(node.name, dtype="i8")
+            input_names.append(node.name)
+            _record(node.name, dtype=input_dtype_map.get(node.name, "i8"))
 
         elif node.op == "call_module":
             mod = gm.get_submodule(node.target)
@@ -1776,12 +1814,20 @@ def extract_int8(
                     )
                 in_names = [t.name for t in tensors_arg]
                 first_shape = list(tensors_meta[in_names[0]]["shape"])
-                if len(first_shape) != 4:
+                # 4D NCHW channel-concat, or 2D [N, C] feature-concat handled
+                # as [N, C, 1, 1]. The cat_c1 kernels are layout-agnostic once
+                # H=W=1, and the 2D case is the fused net's
+                # [vision | depth | lowdim] fuse feeding the LSTM.
+                if len(first_shape) == 4:
+                    N_, _, H_, W_ = (int(s) for s in first_shape)
+                elif len(first_shape) == 2:
+                    N_ = int(first_shape[0])
+                    H_ = W_ = 1
+                else:
                     raise NotImplementedError(
-                        f"int8 extract: cat at {node.name}: only 4D NCHW "
-                        f"inputs supported."
+                        f"int8 extract: cat at {node.name}: only 2D [N,C] or "
+                        f"4D NCHW inputs supported (got {first_shape})."
                     )
-                N_, _, H_, W_ = (int(s) for s in first_shape)
                 c_inputs = [int(tensors_meta[n]["shape"][1]) for n in in_names]
                 n_inputs = len(in_names)
                 if n_inputs not in (2, 3, 4):
@@ -1910,7 +1956,7 @@ def extract_int8(
         elif node.op == "get_attr":
             raise NotImplementedError(f"int8 extract: get_attr {node.name} not supported")
 
-    if input_name is None or output_name is None:
+    if not input_names or output_name is None:
         raise RuntimeError("int8 extract: graph missing input/output")
 
     output_tensors = (output_names_multi
@@ -1918,11 +1964,64 @@ def extract_int8(
                       else [output_name])
 
     dispatches = _annotate_dispatches(ops)
+
+    # Quantize each input with its own scale and surface dtype. int8 inputs are
+    # symmetric-quantized; f16/f32 inputs pass through as floats (they feed an
+    # fp16 island directly, so no cast op is needed at the surface).
+    inputs_q: list[np.ndarray] = []
+    for nm, si in zip(input_node_names, sample_inputs):
+        dt = input_dtype_map.get(nm, "i8")
+        if dt == "i8":
+            q = _quantize_per_tensor_sym(si, scales[nm]).reshape(
+                list(si.shape)).astype(np.int8)
+        elif dt == "f16":
+            q = si.detach().cpu().numpy().astype(np.float16)
+        elif dt == "f32":
+            q = si.detach().cpu().numpy().astype(np.float32)
+        else:
+            raise NotImplementedError(
+                f"int8 extract: input dtype {dt!r} for {nm} is not supported "
+                f"(supported: i8, f16, f32)")
+        inputs_q.append(q)
+
+    # Build the `input` IR field. Single-input keeps the legacy `tensor` key
+    # alone. Multi-input adds `packed_inputs`: the harness hands run_model ONE
+    # flat buffer holding every input back to back, and each entry says where
+    # its tensor starts. `offset` is in elements of the buffer's own element
+    # type (valid when every input shares a dtype); `byte_offset` and `dtype`
+    # are always present so a MIXED-dtype buffer (i8 images + f16 lowdim) can
+    # be addressed by byte and cast at the call site.
+    _NP_OF = {"i8": np.int8, "f16": np.float16, "f32": np.float32}
+    if len(input_names) == 1:
+        ir_input: dict = {"tensor": input_names[0],
+                          "tensors": input_names}
+    else:
+        packed: list[dict] = []
+        byte_off = 0
+        elem_off = 0
+        for nm, q in zip(input_names, inputs_q):
+            dt = input_dtype_map.get(nm, "i8")
+            itemsize = np.dtype(_NP_OF[dt]).itemsize
+            # Keep every slice naturally aligned for its own element type.
+            if byte_off % itemsize:
+                byte_off += itemsize - (byte_off % itemsize)
+            sz = int(np.prod(q.shape))
+            packed.append({"name": nm, "offset": elem_off, "size": sz,
+                           "dtype": dt, "byte_offset": byte_off})
+            byte_off += sz * itemsize
+            elem_off += sz
+        uniform = len({input_dtype_map.get(nm, "i8") for nm in input_names})
+        ir_input = {"tensor": input_names[0],
+                    "tensors": input_names,
+                    "packed_inputs": packed,
+                    "packed_dtype": (input_dtype_map.get(input_names[0], "i8")
+                                     if uniform == 1 else "mixed"),
+                    "packed_bytes": byte_off}
     ir = {
         "name": name,
         "version": 1,
         "quant": "int8",
-        "input": {"tensor": input_name},
+        "input": ir_input,
         "output": {
             "tensors": output_tensors,
             "tensor": output_tensors[0] if len(output_tensors) == 1 else None,
@@ -1932,15 +2031,11 @@ def extract_int8(
         "dispatches": dispatches,
     }
 
-    # Quantize the input once with the IR's input scale.
-    in_scale = scales[input_name]
-    inp_q = _quantize_per_tensor_sym(sample_input, in_scale).reshape(
-        list(sample_input.shape)
-    )
-
     # Simulate the integer pipeline in Python so the golden output matches
     # bit-exactly what the C kernel will produce. Walking the IR ops:
-    activations: dict[str, np.ndarray] = {input_name: inp_q.astype(np.int8)}
+    activations: dict[str, np.ndarray] = {
+        nm: q for nm, q in zip(input_node_names, inputs_q)
+    }
     for op in ops:
         in_name = op["inputs"][0]
         out_name = op["outputs"][0]
@@ -2233,11 +2328,32 @@ def extract_int8(
                 f"int8 simulator: unsupported op {op['op']}"
             )
 
-    # Concatenate outputs in IR order (matching multi-output goldens elsewhere).
+    # Concatenate outputs in IR order (matching multi-output goldens
+    # elsewhere). The surface dtype follows the IR: an fp16-promoted tail
+    # writes f16 outputs, everything else int8.
+    _out_np_dtype = (np.float16
+                     if tensors_meta.get(output_tensors[0], {}).get("dtype") == "f16"
+                     else np.int8)
     out_q = np.concatenate([
-        activations[t].reshape(-1).astype(np.int8) for t in output_tensors
+        activations[t].reshape(-1).astype(_out_np_dtype) for t in output_tensors
     ])
-    inp_q = inp_q.reshape(-1)
+    # One flat, native-dtype array per input (input0..N), plus the single
+    # packed `input` buffer the harness actually bakes in. When every input
+    # shares a dtype the packed buffer is that dtype; when they do not (i8
+    # images + f16 lowdim) it is a byte buffer whose slices the generated C
+    # re-casts, so the golden must be packed byte-wise the same way.
+    inputs_flat = {f"input{i}": q.reshape(-1) for i, q in enumerate(inputs_q)}
+    if len(inputs_q) == 1:
+        inp_q = inputs_q[0].reshape(-1)
+    elif ir_input.get("packed_dtype") != "mixed":
+        inp_q = np.concatenate([q.reshape(-1) for q in inputs_q])
+    else:
+        blob = np.zeros(int(ir_input["packed_bytes"]), dtype=np.int8)
+        for entry, q in zip(ir_input["packed_inputs"], inputs_q):
+            raw = np.ascontiguousarray(q.reshape(-1)).view(np.int8)
+            off = int(entry["byte_offset"])
+            blob[off:off + raw.size] = raw
+        inp_q = blob
 
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
@@ -2246,7 +2362,7 @@ def extract_int8(
     with open(ir_path, "w") as f:
         json.dump(ir, f, indent=2)
     np.savez(weights_path, **weights_blob)
-    np.savez(io_path, input=inp_q, output=out_q)
+    np.savez(io_path, input=inp_q, output=out_q, **inputs_flat)
     # passes_applied.json records each fusion / fold pass that fired
     # during this IR extraction plus the IR-side op counts that
     # downstream tooling uses to answer "did my new fusion pattern
@@ -2279,7 +2395,9 @@ def extract_int8(
         json.dump(passes_log, f, indent=2)
     print(f"wrote {ir_path}")
     print(f"wrote {weights_path}  ({len(weights_blob)} tensors)")
-    print(f"wrote {io_path}  (input dtype={inp_q.dtype}, output dtype={out_q.dtype})")
+    print(f"wrote {io_path}  ({len(inputs_q)} input(s) "
+          f"{[str(q.dtype) for q in inputs_q]}, packed dtype={inp_q.dtype}, "
+          f"output dtype={out_q.dtype})")
     print(f"wrote {passes_path}  ("
           f"linear_relu_fuse={len(fused_linear_relu)}, "
           f"conv2d_relu_fuse={len(fused_conv2d_relu)}, "
@@ -2299,6 +2417,8 @@ def extract(
     out_dir: str,
     quant: str = "fp32",
     calibration_samples: "list[torch.Tensor] | None" = None,
+    input_dtypes: "list[str] | None" = None,
+    fp16_op_names: "set[str] | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -2317,6 +2437,8 @@ def extract(
         return extract_int8(
             model, sample_input, name, out_dir,
             calibration_samples=calibration_samples,
+            input_dtypes=input_dtypes,
+            fp16_op_names=fp16_op_names,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -3380,14 +3502,20 @@ def extract(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlp_generic",
-                    choices=["mlp_generic", "mlp_control", "lenet", "dronet",
-                             "mobilenet_v2", "yolov8_nano", "yolov8_nano_64", "vitfly_frontend", "lstm_tiny", "vitfly_lstm", "norm_block", "attn_block"])
+                    help="model id -> models/<id>.py. The ids listed in the "
+                         "dispatch below have explicit imports; any other id "
+                         "resolves by dynamic import of "
+                         "modelblaster.models.<id>.")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
                          "half precision (uses torch.float16 model + "
                          "_Float16 C kernels, validated against half-cast "
                          "torch golden), int8 = symmetric per-tensor PTQ.")
+    ap.add_argument("--fp16-ops", default=None,
+                    help="comma-separated IR op names to promote to fp16 in an "
+                         "int8 extract (mixed precision). Additive to the "
+                         "model's get_precision_spec(). No-op for fp32/fp16.")
     ap.add_argument("--core-registry", default=None,
                     help="optional path to an modelblaster/cores/*.json registry. "
                          "When provided, the post-extraction pass validates "
@@ -3428,8 +3556,20 @@ def main() -> None:
         from modelblaster.models import norm_block as model_mod
     elif args.model == "attn_block":
         from modelblaster.models import attn_block as model_mod
+    elif args.model == "fused_vision":
+        from modelblaster.models import fused_vision as model_mod
+    elif args.model == "fused_depth":
+        from modelblaster.models import fused_depth as model_mod
+    elif args.model == "fused_full":
+        from modelblaster.models import fused_full as model_mod
     else:
-        raise SystemExit(f"unknown model {args.model}")
+        # Dynamic import so a new models/<name>.py needs no edit here.
+        import importlib
+        try:
+            model_mod = importlib.import_module(
+                f"modelblaster.models.{args.model}")
+        except ModuleNotFoundError:
+            raise SystemExit(f"unknown model {args.model}")
     model = model_mod.get_model()
     sample = model_mod.get_sample_input()
 
@@ -3464,9 +3604,35 @@ def main() -> None:
                   f"get_calibration_samples; falling back to single "
                   f"get_sample_input()", flush=True)
 
+    # Optional per-input surface dtype for multi-input / multi-dtype models
+    # ("i8" / "f16" / "f32" in placeholder order). Defaults to all-int8.
+    input_dtypes = None
+    if hasattr(model_mod, "get_input_dtypes"):
+        input_dtypes = list(model_mod.get_input_dtypes())
+        print(f"[extract_graph] input dtypes: {input_dtypes}", flush=True)
+
+    # Mixed precision (int8 base + fp16 islands): resolve the model's
+    # get_precision_spec() to the set of IR op names to run in fp16. Only
+    # 'fp16_ops' (explicit names) is honoured on the FX path; --fp16-ops adds
+    # to it. With no spec the IR is byte-identical to the all-int8 one.
+    fp16_op_names: "set[str] | None" = None
+    if args.quant == "int8":
+        _names: set[str] = set()
+        if hasattr(model_mod, "get_precision_spec"):
+            spec = model_mod.get_precision_spec() or {}
+            _names |= set(spec.get("fp16_ops", []))
+        if args.fp16_ops:
+            _names |= {t.strip() for t in args.fp16_ops.split(",") if t.strip()}
+        fp16_op_names = _names or None
+        if fp16_op_names:
+            print(f"[extract_graph] fp16 ops: {sorted(fp16_op_names)}",
+                  flush=True)
+
     extract(model, sample, name=args.model, out_dir=args.out_dir,
             quant=args.quant,
-            calibration_samples=calibration_samples)
+            calibration_samples=calibration_samples,
+            input_dtypes=input_dtypes,
+            fp16_op_names=fp16_op_names)
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry
