@@ -191,6 +191,95 @@ def parse_profile(text: str, tag: Optional[str] = None) -> Optional[list[dict]]:
     return out
 
 
+#: Per-iteration profile blocks emitted when MODELBLASTER_ITERS > 1.
+_ITER_PROF = re.compile(
+    r"=== MODELBLASTER_ITER_PROFILE_BEGIN \[(?P<it>\d+)\] ===\n"
+    r"(?P<body>.*?)\n=== MODELBLASTER_ITER_PROFILE_END \[\1\] ===",
+    re.S)
+
+
+def parse_profile_reps(text: str) -> Optional[list[dict]]:
+    """Median per-dispatch cycles across MODELBLASTER_ITERS repetitions.
+
+    Every cost in the authoritative profile DB was a SINGLE sample: the harness
+    prints one PROFILE block, `parse_profile` reads it, and that number becomes
+    the service time the scheduler plans against and the advisor compares
+    against a free slot. Two closed-loop recommendations have already been
+    rejected on n=1 gaps -- they were large (41%, 36%) so the conclusions hold,
+    but the project's own criterion asks for a median of N and did not have one.
+
+    The binary could already do the work: MODELBLASTER_ITERS>1 runs the model N
+    times and prints a per-iteration profile block. Nothing read them, so the
+    repetitions were paid for and discarded.
+
+    Returns None when no per-iteration blocks are present, so the single-block
+    path stays exactly as it was. Adds `cycles_n`, `cycles_min`, `cycles_max`
+    and `cycles_cv_pct` -- the spread is the point, not decoration: it is what
+    tells you whether a 10% "win" is distinguishable from run-to-run noise, and
+    an advisor that reports confidence needs it.
+
+    Iteration 0 is DISCARDED when at least three remain. First-touch faulting of
+    a const weight array lands entirely in it -- measured on vitfly_lstm, whose
+    1.7 MB of weights cost 21.9 ms cold against 2.88 ms warm, a 7.6x difference
+    attributable to nothing but page faults.
+    """
+    blocks = []
+    for m in _ITER_PROF.finditer(text):
+        lines = [ln for ln in m.group("body").splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        header = [c.strip() for c in lines[0].split(",")]
+        recs = []
+        for ln in lines[1:]:
+            rec = dict(zip(header, [c.strip() for c in ln.split(",")]))
+            if "cycles" in rec:
+                rec["cycles"] = int(rec["cycles"])
+            if "dispatch_id" in rec:
+                rec["dispatch_id"] = int(rec["dispatch_id"])
+            recs.append(rec)
+        blocks.append((int(m.group("it")), recs))
+    if not blocks:
+        return None
+
+    blocks.sort()
+    warm = [recs for it, recs in blocks if it > 0] if len(blocks) >= 4 else \
+           [recs for _, recs in blocks]
+    dropped = len(blocks) - len(warm)
+
+    # Key on (dispatch_id, name) rather than position: a model whose op count
+    # varied between iterations would otherwise average unrelated ops together.
+    by_key: dict = {}
+    order: list = []
+    for recs in warm:
+        for r in recs:
+            k = (r.get("dispatch_id"), r.get("name"))
+            if k not in by_key:
+                by_key[k] = (dict(r), [])
+                order.append(k)
+            by_key[k][1].append(int(r["cycles"]))
+
+    import statistics
+    out = []
+    for k in order:
+        base, samples = by_key[k]
+        n = len(samples)
+        med = int(statistics.median(samples))
+        base["cycles"] = med
+        base["cycles_n"] = n
+        base["cycles_min"] = min(samples)
+        base["cycles_max"] = max(samples)
+        base["cycles_cv_pct"] = (
+            round(100.0 * statistics.stdev(samples) / med, 2)
+            if n > 1 and med else 0.0)
+        out.append(base)
+    if out:
+        print(f"  profile: median of {len(warm)} rep(s)"
+              f"{f' (dropped {dropped} warmup)' if dropped else ''}, "
+              f"worst per-dispatch CV "
+              f"{max(r['cycles_cv_pct'] for r in out):.1f}%")
+    return out
+
+
 def write_profile_csv(records: list[dict], path: str) -> None:
     if not records:
         return
@@ -579,7 +668,9 @@ def report_run(text: str, *, models: Optional[list[str]],
     verify = parse_verify(text)
     actual = None if verify is not None else parse_output(text)
     ok, _ = check_one(actual, io_path, atol, rtol, verify=verify)
-    profile = parse_profile(text)
+    # Prefer the median across MODELBLASTER_ITERS repetitions when the run
+    # produced them; fall back to the single block otherwise.
+    profile = parse_profile_reps(text) or parse_profile(text)
     if profile is not None:
         out_csv = profile_csv or os.path.join(
             os.path.dirname(os.path.abspath(io_path)), "profile.csv"
