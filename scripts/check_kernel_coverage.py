@@ -65,18 +65,21 @@ def _profile_weights(profile_csv):
 
     Returns (weights, measured_fallback_ops).
 
-    The second value is ground truth in a way kernel_picks.json is not. A
-    profiled module name ends in its ALGORITHM tag --
-    `mlp_control$dispatch_0_rvv_x60_linear_s8_M1xK16xN256` for a curated
-    shape-specialised kernel, `..._conv2d_batchnorm2d_s8_scalar` for the
-    reference -- so the run itself says what executed.
+    The second value comes from the profile's `implementation` column, which
+    profile_writer fills from the build's kernel_picks.json at PROFILE time.
+    That is what makes it ground truth rather than a claim: it is recorded
+    alongside the timing, by the run that produced it, so it cannot describe a
+    different build than the one measured.
 
-    That matters because kernel_picks.json is written at generate time and can
-    outlive the sources: mlp_control's picks file claimed `linear_s8:
-    reference` while the profile taken afterwards showed a curated kernel, and
-    reporting the stale claim would have invented a regression that did not
-    exist. When both are available the measurement wins and the disagreement is
-    reported as staleness.
+    It matters because a kernel_picks.json read later can outlive its sources:
+    mlp_control's claimed `linear_s8: reference` while the profile taken
+    afterwards showed a curated kernel, and reporting the stale claim would
+    have invented a regression. When both are available the profile wins and
+    the disagreement is reported as staleness.
+
+    Do NOT infer this from module_name. Its trailing segment is the shape tag,
+    and an op with no recorded shape used to render as `..._<op>_scalar`,
+    which reads exactly like "ran the scalar reference".
     """
     ms = collections.Counter()
     ran_reference = set()
@@ -87,7 +90,19 @@ def _profile_weights(profile_csv):
                 ms[op] += float(row.get("mean_time_ns") or 0) / 1e6
             except ValueError:
                 pass
-            if (row.get("module_name") or "").endswith("_scalar"):
+            impl = (row.get("implementation") or "").strip()
+            if impl:
+                if impl.split("/")[0] == "reference":
+                    ran_reference.add(op)
+            elif (row.get("module_name") or "").endswith("_scalar"):
+                # Legacy profiles only. This is a WEAK signal and it is wrong
+                # in both directions: the trailing module_name segment is the
+                # SHAPE tag, and _shape_concise() used to emit the literal
+                # "scalar" for an op with no recorded shape. The fused convs
+                # had no shape AND ran the reference, so the two coincided
+                # and the label looked reliable -- until real RVV kernels
+                # landed (22.9x measured) and the name still said "_scalar".
+                # Trust it only when `implementation` is absent entirely.
                 ran_reference.add(op)
     return ms, ran_reference
 
