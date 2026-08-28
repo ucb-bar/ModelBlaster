@@ -154,8 +154,28 @@ GEN_KERNELS_ARGS=(
     --cache-dir "${CACHE_DIR}"
     --algorithms "${ALGORITHMS:-all}"
 )
-if [[ -n "${GLOBAL_CURATED_DIR:-}" ]]; then
-    GEN_KERNELS_ARGS+=(--global-curated-dir "${GLOBAL_CURATED_DIR}")
+# GLOBAL_CURATED_DIR points at the curated kernel library
+# (<dir>/<backend>/<backend>_<op>_<algo>.c). It used to default to UNSET, which
+# silently built the scalar reference kernels instead -- a 37x regression on
+# dronet/gemmini_q31 (527M vs 14M cycles) that went unnoticed through a whole
+# profile sweep, and the same trap that hid a 29.7x win earlier. Six wrapper
+# scripts under scripts/ each worked around it with an identical
+# `export GLOBAL_CURATED_DIR="$PWD/kernels"`; that default now lives here.
+#
+# Defaulting to curated is safe because selection is verify-gated: a curated
+# kernel that fails its per-op check against the reference falls back to
+# reference_impl automatically (see the rvv_f16 conv2d_s8 case).
+#
+# Opt out with an explicit empty value -- `GLOBAL_CURATED_DIR= ...` -- which is
+# why this uses ${VAR-default} (unset only) and not ${VAR:-default}.
+GLOBAL_CURATED_DIR="${GLOBAL_CURATED_DIR-${REPO_ROOT}/kernels}"
+if [[ -n "${GLOBAL_CURATED_DIR}" ]]; then
+    if [[ -d "${GLOBAL_CURATED_DIR}" ]]; then
+        GEN_KERNELS_ARGS+=(--global-curated-dir "${GLOBAL_CURATED_DIR}")
+    else
+        echo "  WARNING: GLOBAL_CURATED_DIR=${GLOBAL_CURATED_DIR} does not exist;" \
+             "building REFERENCE kernels (expect large slowdowns)" >&2
+    fi
 fi
 # MAX_ACCURACY_CLASS=bit_exact|numeric_drift|approximate restricts kernel
 # selection to algorithms that meet at least the given accuracy class. Use
