@@ -486,7 +486,7 @@ static void parallel_cbs_shard_fn(void *ctx_, size_t i) {{
      * only permutes 4-D tensors, so all three stay contiguous and a plain
      * `+ oc0` is correct for them. The output is NCHW, so an OC slice is a
      * contiguous run of planes. */
-    kernel_conv2d_batchnorm2d_silu_s8(
+    kernel_conv2d_batchnorm2d_silu_s8_{mid}(
         c->in, c->w_shards[i], c->b ? c->b + oc0 : NULL,
         c->bn_scale + oc0, c->bn_bias + oc0,
         c->out + (size_t)oc0 * per_oc_out,
