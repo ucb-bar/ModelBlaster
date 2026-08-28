@@ -24,7 +24,9 @@ Env knobs:
   MODELBLASTER_YOLOV8N_INPUT       default 160. `96` = square, `64x96` = H x W.
                                    Every dimension must be a multiple of 32.
   MODELBLASTER_YOLOV8N_NC          default 80 (COCO classes)
-  MODELBLASTER_YOLOV8N_PRETRAINED  default 1 (load yolov8n.pt; 0 → random init)
+  MODELBLASTER_YOLOV8N_PRETRAINED  default 1 (load weights; 0 → random init)
+  MODELBLASTER_YOLOV8N_WEIGHTS     default yolov8n.pt. A fine-tuned checkpoint
+                                   may use any nc; the stock one is COCO-80.
 """
 
 from __future__ import annotations
@@ -324,8 +326,39 @@ def _ultra_to_local_key(ultra_key: str) -> Optional[str]:
     return None
 
 
-def _load_ultralytics_weights(model: YOLOv8Nano) -> int:
-    """Stream weights from yolov8n.pt into model. Returns count copied."""
+#: The stock COCO checkpoint. Anything else is a fine-tune, and the two are
+#: treated differently: see `get_model`.
+STOCK_WEIGHTS = "yolov8n.pt"
+
+
+def weights_path() -> str:
+    return os.environ.get("MODELBLASTER_YOLOV8N_WEIGHTS", STOCK_WEIGHTS)
+
+
+def _load_ultralytics_weights(model: YOLOv8Nano, path: str | None = None) -> int:
+    """Stream weights from an ultralytics checkpoint into model.
+
+    `path` defaults to the stock COCO yolov8n.pt. A custom fine-tune is passed
+    through MODELBLASTER_YOLOV8N_WEIGHTS -- without which a retrained model
+    could not be built here at all, because this used to hardcode the stock
+    filename and there was no way to name another.
+
+    Resolution does not appear here, and that is worth stating: conv and BN
+    weight shapes depend on channel counts, not on input size. So a checkpoint
+    trained at 64x96 loads into a model configured for any resolution. What
+    must match is `nc` and the width multiple; what must NOT be assumed to
+    match is the input geometry, which is set separately by
+    MODELBLASTER_YOLOV8N_INPUT and has to agree with how the model was trained
+    and with the board preprocess.
+    """
+    # Path check BEFORE the import, so a mistyped checkpoint is reported as a
+    # mistyped checkpoint even in an environment without ultralytics. The
+    # reverse order hides the specific error behind the generic one.
+    path = path or weights_path()
+    if not os.path.exists(path) and path != STOCK_WEIGHTS:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_WEIGHTS={path!r} does not exist. "
+            f"Point it at the trained .pt, or unset it to use {STOCK_WEIGHTS}.")
     try:
         from ultralytics import YOLO
     except ImportError as e:
@@ -333,7 +366,7 @@ def _load_ultralytics_weights(model: YOLOv8Nano) -> int:
             "ultralytics not installed. `pip install ultralytics` and retry, "
             "or set MODELBLASTER_YOLOV8N_PRETRAINED=0 to use random init."
         ) from e
-    yolo = YOLO("yolov8n.pt")
+    yolo = YOLO(path)
     src_state = yolo.model.state_dict()
     dst_state = model.state_dict()
     n_copied = 0
@@ -418,17 +451,23 @@ def get_model(seed: int = 0):
     torch.manual_seed(seed)
     m = YOLOv8Nano(nc=nc)
     if pretrained:
-        if nc != 80:
-            # Backbone+neck weights still load; the cv3 head's last conv has
-            # nc-dependent shape and would shape-mismatch. Refuse to silently
-            # skip — force the user to acknowledge.
+        wp = weights_path()
+        if nc != 80 and wp == STOCK_WEIGHTS:
+            # The STOCK checkpoint is COCO-80. Its cv3 head's last conv is
+            # nc-dependent and would shape-mismatch, so refuse rather than
+            # silently skip those tensors and ship a randomly-initialised head.
             raise SystemExit(
-                f"MODELBLASTER_YOLOV8N_NC={nc} ≠ 80 with pretrained weights: cv3 "
-                f"head shapes don't match. Set MODELBLASTER_YOLOV8N_PRETRAINED=0 "
-                f"or fine-tune from a custom checkpoint (out of scope here)."
+                f"MODELBLASTER_YOLOV8N_NC={nc} != 80 against the stock "
+                f"{STOCK_WEIGHTS}: the cv3 head shapes do not match. Either set "
+                f"MODELBLASTER_YOLOV8N_WEIGHTS=<your fine-tuned .pt>, or set "
+                f"MODELBLASTER_YOLOV8N_PRETRAINED=0 for random init."
             )
-        n = _load_ultralytics_weights(m)
-        print(f"yolov8_nano: loaded {n} pretrained tensors from yolov8n.pt")
+        # A custom checkpoint is allowed any nc. It is not trusted, though:
+        # _load_ultralytics_weights raises on any per-tensor shape mismatch, so
+        # a checkpoint whose head disagrees with MODELBLASTER_YOLOV8N_NC fails
+        # loudly and names the tensor, rather than loading a partial head.
+        n = _load_ultralytics_weights(m, wp)
+        print(f"yolov8_nano: loaded {n} pretrained tensors from {wp} (nc={nc})")
     m.eval()
     return m
 
