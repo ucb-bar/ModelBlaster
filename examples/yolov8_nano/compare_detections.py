@@ -281,8 +281,11 @@ def main():
                    default="modelblaster/examples/yolov8_nano/int8/generated")
     p.add_argument("--spike",
                    default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
-    p.add_argument("--img", type=int,
-                   default=int(os.environ.get("MODELBLASTER_YOLOV8N_INPUT", "160")))
+    # A string, not an int: MODELBLASTER_YOLOV8N_INPUT accepts `96` or the
+    # rectangular `64x96` (H x W), and int() would reject the latter with a
+    # ValueError from argparse's default rather than a useful message.
+    p.add_argument("--img", type=str,
+                   default=os.environ.get("MODELBLASTER_YOLOV8N_INPUT", "160"))
     p.add_argument("--score-thresh", type=float, default=0.10)
     p.add_argument("--iou-thresh", type=float, default=0.45)
     p.add_argument("--top-k", type=int, default=50)
