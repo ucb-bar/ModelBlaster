@@ -47,6 +47,50 @@ _ACCURACY_CLASS_RE = re.compile(
 )
 
 
+def _assert_curated_layout_contract(spec, algorithm, backend, curated_path):
+    """Refuse a curated kernel whose weight layout the skeleton doesn't pack.
+
+    A curated file is discovered by PATH
+    (<curated_dir>/<target>/<target>_<op>_<algo>.c) and probed for any
+    algorithm of the op, with no reference to that algorithm's
+    target_affinity. But target_affinity is exactly what
+    generate_skeleton._conv_weight_layout_for_op reads to decide how to
+    pack the weights. So dropping a copy of an rvv kernel into
+    kernels/<other_backend>/ silently hands an IHWOC-indexing kernel
+    OIHW-packed weights: the model output is merely *wrong*, the curated
+    verify fails, and the pipeline falls back to the scalar reference —
+    which is numerically correct, so an end-to-end correctness check still
+    passes while the op runs ~57x slower. That is a performance cliff with
+    no error signal, and it is what happened to conv2d_s8 on rvv_f16
+    (max_abs_err=0.19, 163M cycles vs 2.8M).
+
+    Verify cannot distinguish "this kernel is buggy" from "this kernel was
+    given weights in a layout it never agreed to", so check the contract
+    up front and fail loudly with the actual fix.
+    """
+    from modelblaster.pipeline.generate_skeleton import (
+        _conv_weight_layout_for_op,
+    )
+    declared = (getattr(algorithm, "weight_layout", None) or "oihw")
+    packed = _conv_weight_layout_for_op(spec.op, backend.name) or "oihw"
+    if declared != packed:
+        raise SystemExit(
+            f"curated kernel layout contract violated:\n"
+            f"  file      {curated_path}\n"
+            f"  op/algo   {spec.op}/{algorithm.name}\n"
+            f"  declares  weight_layout={declared!r}\n"
+            f"  but generate_skeleton packs {spec.op} weights as "
+            f"{packed!r} on backend {backend.name!r}.\n"
+            f"The kernel would read correctly-emitted weights with the "
+            f"wrong strides. Fix by adding {backend.name!r} to the "
+            f"target_affinity of {spec.op}'s {algorithm.name!r} algorithm "
+            f"(so the skeleton packs {declared!r}), or by porting the "
+            f"curated file to index weights as {packed!r}. Do NOT loosen "
+            f"the curated verify tolerance: the fallback it triggers is "
+            f"numerically correct and therefore invisible end-to-end."
+        )
+
+
 def _parse_curated_accuracy_class(src: str) -> Optional[AccuracyClass]:
     m = _ACCURACY_CLASS_RE.search(src)
     if not m:
@@ -831,6 +875,8 @@ def generate_one_llm(
                 if global_curated_dir else None
             )
             if curated_path and os.path.exists(curated_path):
+                _assert_curated_layout_contract(
+                    spec, algorithm, backend, curated_path)
                 curated = open(curated_path).read()
                 # If the curated header declares a stricter class than the
                 # spec's algorithm metadata, that wins (the file is an
@@ -1272,6 +1318,8 @@ def generate(
                     _fn = f"{target.name}_{spec.op}_{algorithm.name}.c"
                     _cp = os.path.join(global_curated_dir, target.name, _fn)
                     if os.path.exists(_cp):
+                        _assert_curated_layout_contract(
+                            spec, algorithm, target, _cp)
                         curated_seed[spec.op] = (
                             algorithm.name, _cp, open(_cp).read())
                         break
@@ -1293,6 +1341,8 @@ def generate(
                     )
                     if not os.path.exists(curated_path):
                         continue
+                    _assert_curated_layout_contract(
+                        spec, algorithm, target, curated_path)
                     curated_src = open(curated_path).read()
                     log(f"  [{spec.op}/{algorithm.name}] reference + "
                         f"curated swap from {curated_path}")

@@ -1822,8 +1822,17 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                     in_v = (int32_t)input[(in_row_base + ih) * IW + iw]
                                          + input_offset;
                                 }
-#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+/* HWIO and IHWOC are NOT the same permutation of OIHW -- hwio is
+ * (H,W,I,O) and ihwoc is (I,H,W,O) (see generate_skeleton
+ * _LAYOUT_PERMUTATION). Sharing one indexing expression between the two
+ * macros read 64/72 elements from the wrong place on an IHWOC buffer.
+ * Latent because rvv models always select a curated conv kernel; it
+ * would only surface as a *silently wrong* fallback. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -1949,8 +1958,17 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                          + input_offset;
                                 }
 
-#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+/* HWIO and IHWOC are NOT the same permutation of OIHW -- hwio is
+ * (H,W,I,O) and ihwoc is (I,H,W,O) (see generate_skeleton
+ * _LAYOUT_PERMUTATION). Sharing one indexing expression between the two
+ * macros read 64/72 elements from the wrong place on an IHWOC buffer.
+ * Latent because rvv models always select a curated conv kernel; it
+ * would only surface as a *silently wrong* fallback. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -1979,9 +1997,20 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
 }
 """,
         ),
+        # rvv_f16 is listed alongside rvv on every one of these four
+        # algorithms because rvv_f16 is a strict ISA superset of rvv and
+        # kernels/rvv_f16/ ships byte-identical copies of the rvv int8
+        # conv kernels. That is not cosmetic: target_affinity is what
+        # generate_skeleton._conv_weight_layout_for_backend reads to decide
+        # how to PACK the weights. With rvv_f16 missing, the curated
+        # rvv_f16 conv2d_s8 kernels (which index weights IHWOC,
+        # unconditionally) were handed OIHW-packed weights and failed their
+        # curated verify at max_abs_err=0.19, silently falling back to the
+        # scalar reference at ~57x the cycles. Any new backend that reuses
+        # these kernel files must be added here too.
         AlgorithmCandidate(
             name="rvv_widening_oc",
-            target_affinity=("rvv",),
+            target_affinity=("rvv", "rvv_f16"),
             weight_layout="ihwoc",
             description=(
                 "Vectorize over OUTPUT CHANNELS using RVV's widening "
@@ -2165,7 +2194,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         ),
         AlgorithmCandidate(
             name="rvv_vsmul_vnclip",
-            target_affinity=("rvv",),
+            target_affinity=("rvv", "rvv_f16"),
             weight_layout="ihwoc",
             description=(
                 "Pure-integer RVV conv2d_s8 using vsmul (Q0.31 multiply) "
@@ -2310,7 +2339,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         ),
         AlgorithmCandidate(
             name="rvv_oc_blocked",
-            target_affinity=("rvv",),
+            target_affinity=("rvv", "rvv_f16"),
             weight_layout="ihwoc",
             description=(
                 "Cache-aware variant of rvv_vsmul_vnclip. Same inner "
@@ -2443,7 +2472,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         ),
         AlgorithmCandidate(
             name="rvv_igemm",
-            target_affinity=("rvv",),
+            target_affinity=("rvv", "rvv_f16"),
             weight_layout="ihwoc",
             description=(
                 "Implicit-GEMM conv2d_s8 (XNNPACK igemm style, adapted to "
@@ -3020,8 +3049,17 @@ void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight,
                                 int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
                                     ? input_offset
                                     : (int32_t)input[(in_row_base + ih) * IW + iw] + input_offset;
-#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+/* HWIO and IHWOC are NOT the same permutation of OIHW -- hwio is
+ * (H,W,I,O) and ihwoc is (I,H,W,O) (see generate_skeleton
+ * _LAYOUT_PERMUTATION). Sharing one indexing expression between the two
+ * macros read 64/72 elements from the wrong place on an IHWOC buffer.
+ * Latent because rvv models always select a curated conv kernel; it
+ * would only surface as a *silently wrong* fallback. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
@@ -3158,8 +3196,17 @@ void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
                                 int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
                                     ? input_offset
                                     : (int32_t)input[(in_row_base + ih) * IW + iw] + input_offset;
-#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+/* HWIO and IHWOC are NOT the same permutation of OIHW -- hwio is
+ * (H,W,I,O) and ihwoc is (I,H,W,O) (see generate_skeleton
+ * _LAYOUT_PERMUTATION). Sharing one indexing expression between the two
+ * macros read 64/72 elements from the wrong place on an IHWOC buffer.
+ * Latent because rvv models always select a curated conv kernel; it
+ * would only surface as a *silently wrong* fallback. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
                                 int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
                                             + filter_offset;
 #else
                                 int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
