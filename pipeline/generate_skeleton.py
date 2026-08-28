@@ -160,6 +160,7 @@ static void parallel_linear_fn(void *ctx_, size_t i) {{
                         c->M, c->K, n1 - n0);
 }}
 
+/* MB_SHARD_MACHINERY_END */
 static inline void parallel_linear(void *pool_,
                                    const float *in, const float *w,
                                    const float *b, float *out,
@@ -231,6 +232,7 @@ static void parallel_conv2d_fn(void *ctx_, size_t i) {{
                         c->SH, c->SW, c->PH, c->PW);
 }}
 
+/* MB_SHARD_MACHINERY_END */
 static inline void parallel_conv2d(void *pool_,
                                    const float *in, const float *w,
                                    const float *b, float *out,
@@ -306,6 +308,7 @@ static void parallel_linear_s8_fn(void *ctx_, size_t i) {{
                            c->activation_min, c->activation_max);
 }}
 
+/* MB_SHARD_MACHINERY_END */
 static inline void parallel_linear_s8(void *pool_,
                                       const int8_t *in, const int8_t *w,
                                       const int32_t *b, int8_t *out,
@@ -403,6 +406,7 @@ static void parallel_conv2d_s8_fn(void *ctx_, size_t i) {{
                            c->activation_min, c->activation_max);
 }}
 
+/* MB_SHARD_MACHINERY_END */
 static inline void parallel_conv2d_s8(void *pool_,
                                       const int8_t *in, const int8_t *w,
                                       const int32_t *b, int8_t *out,
@@ -637,6 +641,11 @@ _PARALLEL_WRAPPER_TEMPLATES = {
 }
 
 
+#: Separates a wrapper template's shard machinery (context struct + worker fn)
+#: from its public entry point, which must survive even where the machinery is
+#: compiled out. Declared by the templates rather than inferred from the C.
+_SHARD_MACHINERY_END = "/* MB_SHARD_MACHINERY_END */"
+
 #: Parallel wrappers that shard a conv by slicing its WEIGHT tensor along OC.
 #: Correct only when that slice is contiguous, i.e. when the backend packs
 #: conv weights OIHW. See `_emit_parallel_wrappers`.
@@ -715,6 +724,13 @@ def _serial_only_wrapper(op: str, mid: str) -> str:
     a hand-written duplicate is one more thing to keep in sync with a kernel
     signature.
 
+    The split point is a MARKER the templates declare, not a match on the
+    entry point's C signature. The first version matched
+    `static inline void parallel_<op>(` and would have silently stopped
+    splitting -- falling back to guarding only the call -- if anyone reformatted
+    a signature across lines. A missing marker is now a hard error naming the
+    template, because the failure mode it replaces is silent.
+
     Two regions are disabled, not one. Guarding only the `#ifdef
     MODELBLASTER_USE_POOL` inside `parallel_<op>` leaves the shard worker
     `parallel_<op>_fn` and its context struct compiled -- dead, since their
@@ -726,14 +742,17 @@ def _serial_only_wrapper(op: str, mid: str) -> str:
     body = _PARALLEL_WRAPPER_TEMPLATES[op].format(mid=mid)
     reason = ("#if 0 /* OC slice is strided under this backend's weight "
               "packing */")
-    entry = f"static inline void parallel_{op}("
-    head, sep, tail = body.partition(entry)
-    if not sep:                       # template shape changed; guard the call
-        return body.replace("#ifdef MODELBLASTER_USE_POOL", reason, 1)
-    # head = ctx struct + worker fn -> disable wholesale.
-    # tail = the entry point -> keep, but take its serial arm.
+    head, sep, tail = body.partition(_SHARD_MACHINERY_END)
+    if not sep:
+        raise SystemExit(
+            f"the {op} wrapper template has no {_SHARD_MACHINERY_END} marker, "
+            f"so the shard machinery and the entry point cannot be told "
+            f"apart. Add the marker immediately before "
+            f"`static inline void parallel_{op}(`.")
+    # head = ctx struct + worker fn -> disabled wholesale.
+    # tail = the entry point -> kept, but takes its serial arm.
     return (f"{reason}\n{head}#endif\n"
-            + (entry + tail).replace("#ifdef MODELBLASTER_USE_POOL", reason, 1))
+            + tail.replace("#ifdef MODELBLASTER_USE_POOL", reason, 1))
 
 
 
