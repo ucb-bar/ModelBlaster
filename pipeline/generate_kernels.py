@@ -1155,6 +1155,10 @@ def generate(
     global_curated_dir: Optional[str] = None,
     max_accuracy_class: Optional[AccuracyClass] = None,
     quant: str = "fp32",
+    # Op kinds that must KEEP the portable reference implementation even when
+    # a curated kernel exists for them. The consumer of XPU-RT's
+    # `choose_implementation` advice -- see `keep_reference_ops` below.
+    keep_reference_ops: Optional[set[str]] = None,
     # Opt-in: after the spike beam search picks a best, re-rank the
     # top-K spike survivors on FireSim RTL. The cache slot is replaced
     # with the firesim-best only if the firesim cycles drop by >=
@@ -1263,6 +1267,14 @@ def generate(
         # If verify fails, fall back to spec.reference_impl with a warning
         # so the e2e build proceeds. Set MODELBLASTER_CURATED_VERIFY=0 to
         # skip (one extra spike build per curated kernel takes ~10-30s).
+        # Normalised once: a None default and a caller passing a list both
+        # have to behave the same at the probe site.
+        pinned_to_reference = set(keep_reference_ops or ())
+        unknown_pins = pinned_to_reference - {sp.op for sp in specs}
+        if unknown_pins:
+            log(f"  keep_reference_ops names op kind(s) this model does not "
+                f"contain: {sorted(unknown_pins)} -- check the advice was "
+                f"generated from this graph")
         curated_verify = (
             os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
             and needs_harness_paths
@@ -1290,6 +1302,27 @@ def generate(
             if dir_path is None:
                 return
             for spec in specs:
+                if spec.op in pinned_to_reference:
+                    # THE CONSUMER OF `choose_implementation`. XPU-RT measures
+                    # per dispatch that some other implementation is faster;
+                    # for a curated-vs-reference comparison the actionable form
+                    # is "stop swapping the curated kernel in for this op".
+                    # Measured on the board, yolov8_nano rvv_x60:
+                    #   maxpool2d_s8 N1xC128xIH5xIW5xKH5xKW5
+                    #   curated[rvv]/direct 502us vs scalar build 394us (-21.5%)
+                    #
+                    # WHAT THIS DOES NOT PROMISE. The 394us was measured in a
+                    # `scalar` BUILD -- the same reference C compiled with
+                    # `-march=rv64gc`. Kept here it is compiled with the rvv
+                    # build's flags, so the compiler may auto-vectorise it
+                    # differently and the time is not the advised one. The
+                    # mechanism transfers; the number does not, and has to be
+                    # re-measured like any other rung.
+                    kernel_picks.setdefault(spec.op, {})
+                    kernel_picks[spec.op]["pinned_to_reference"] = True
+                    log(f"  [{spec.op}] pinned to reference by "
+                        f"keep_reference_ops; not probing {source_label}")
+                    continue
                 if kernel_picks.get(spec.op, {}).get("source") not in (
                         None, "reference"):
                     # Already swapped by an earlier source (cache beats
@@ -1755,6 +1788,14 @@ def main() -> None:
                     help="reuse PASSing kernels from this dir across runs "
                          "(saves <target>_<op>_<algo>.c on success, "
                          "reverifies on hit)")
+    ap.add_argument("--keep-reference-ops", default=None,
+                    help="comma-separated op kinds that must keep the portable "
+                         "reference kernel even where a curated one exists. "
+                         "This is how XPU-RT's `choose_implementation` advice "
+                         "is applied: `scripts/advice_to_kernel_choice.py` "
+                         "turns the advice into this list. The advised timing "
+                         "was measured in a different BUILD, so the change has "
+                         "to be re-profiled, not assumed.")
     ap.add_argument("--algorithms", default="all",
                     help=("comma-separated algorithm names to try (in order) "
                           "for each op, or 'all' (default) to try every "
@@ -1827,6 +1868,10 @@ def main() -> None:
             if args.max_accuracy_class else None
         ),
         quant=args.quant,
+        keep_reference_ops=(
+            {o.strip() for o in args.keep_reference_ops.split(",") if o.strip()}
+            if args.keep_reference_ops else None
+        ),
         firesim_eval=args.firesim_eval,
         firesim_top_k=args.firesim_top_k,
         cache_aware_prompt=args.cache_aware_prompt,
