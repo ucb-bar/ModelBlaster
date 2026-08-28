@@ -280,9 +280,24 @@ RUN="cd ${REMOTE_ROOT}/xpurt && ulimit -n 8192 &&"
 [[ -n "${CPU_IDS}" ]] && RUN="${RUN} taskset -c ${CPU_IDS}"
 RUN="${RUN} ./${SCHED_NAME}"
 OUT="${GEN_DIR}/${SCHED_NAME}_stdout.txt"
+# Redirect ON THE BOARD and scp the file back, rather than streaming stdout
+# through ssh. A three-model schedule emits ~1600 trace rows, and streaming that
+# volume reproducibly killed the board's ssh daemon:
+#
+#   sshd-session[...]: unhandled signal 7 code 0x1 in libcrypto.so.3
+#   status: ... badaddr: 0000002ab877e7ea cause: 0000000000000006
+#
+# cause 6 is a misaligned store, signal 7 is SIGBUS, and Comm is sshd-session --
+# so the harness was fine and the transport died under it. The visible symptom
+# was a truncated trace (575 of 1617 rows) plus a nonzero exit, which reads
+# exactly like a crash in the run being measured. Writing to a file first makes
+# the run's completion independent of the link, and the exit status is the
+# program's own.
+REMOTE_LOG="${REMOTE_ROOT}/xpurt/${SCHED_NAME}_stdout.txt"
 set +e
-ssh "${HOST}" "${RUN}" >"${OUT}" 2>&1
-rc=$?
+ssh "${HOST}" "${RUN} >${REMOTE_LOG} 2>&1; echo \$? >${REMOTE_LOG}.rc"
+scp -q "${HOST}:${REMOTE_LOG}" "${OUT}"
+rc=$(ssh "${HOST}" "cat ${REMOTE_LOG}.rc" 2>/dev/null || echo 255)
 set -e
 echo "  exit=${rc}  stdout -> ${OUT}"
 grep -E 'MODELBLASTER_VERIFY|max_abs_err|FAIL|PASS' "${OUT}" | head -20 || true
