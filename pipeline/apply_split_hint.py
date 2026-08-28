@@ -22,8 +22,13 @@ treat the original output tensor as the concat of the tiles by name
 convention (`<orig>.tile_0`, `<orig>.tile_1`, ...).
 
 For `conv2d_s8`, the tile dimension is OC (output channels) — same
-shape, just on the conv output. Weight tensor surgery (slicing
-`[OC, IC, KH, KW]` into N OC-slices) is required and is a follow-up.
+shape, just on the conv output. Whether the weights need slicing is a
+BACKEND question, and `generate_skeleton` answers it, not this module:
+on a backend that keeps conv weights OIHW `[OC, IC, KH, KW]` an OC slice
+is contiguous and a pointer offset suffices, while the rvv backends pack
+them IHWOC `(IC, KH, KW, OC)` — OC innermost — where an OC slice is
+strided and each tile is given its own re-packed array. See
+`generate_skeleton.split_conv_tile_weights`.
 
 Inserting tiles renumbers every op after the split point, so the output
 graph carries an `id_remap` field mapping every input `dispatch_id` to
@@ -108,13 +113,15 @@ def _split_conv2d_s8(op: dict[str, Any], n_splits: int,
                      network: str) -> list[dict[str, Any]]:
     """Split a conv2d_s8 op along the OC (output channel) dim.
 
-    Weight layout per kernel signature: [OC, IC, KH, KW]. Splitting
-    along OC produces n tiles that each compute a disjoint slice of
-    output channels; the weight pointer for tile t is `weight +
-    t*(OC/n)*IC*KH*KW`, the bias pointer is `bias + t*(OC/n)`. No
-    new weight tensors needed — the existing buffer is shared via
-    offset (same shape transformation the linear_s8 splitter uses
-    for its weight along N).
+    Splitting along OC produces n tiles that each compute a disjoint
+    slice of output channels. How the tile reaches its own weights is
+    left to the codegen, because it depends on the layout the backend
+    packs conv weights in: OIHW `[OC, IC, KH, KW]` makes an OC slice
+    contiguous, so `weight + t*(OC/n)*IC*KH*KW` and `bias + t*(OC/n)`
+    are enough; the rvv backends' IHWOC packing makes it strided, so the
+    tile gets its own re-packed array instead. This function records
+    only `tile_offset_OC` and `axis`, and
+    `generate_skeleton.split_conv_tile_weights` decides.
 
     The output tensor `[N, OC, OH, OW]` splits along OC: tile_t
     writes channels `[t*OC/n, (t+1)*OC/n)`. Output is named
@@ -182,13 +189,22 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
     for t in range(n_splits):
         tile_name = f"{out_name}.tile_{t}"
         if tile_name not in tensors:
-            tensors[tile_name] = {
+            entry = {
                 "shape": tile_shape,
                 "dtype": parent.get("dtype", "i8"),
                 "split_from": out_name,
                 "tile": t,
                 "n_splits": n_splits,
             }
+            # Carry the parent's quantization across. A tile is a slice of the
+            # parent tensor -- same scale, same zero point, by construction --
+            # and anything reading the tile's own metadata (the codegen's
+            # inspect blocks, an accuracy comparison against a golden, a
+            # downstream requantize) otherwise falls back to scale=1.0 and
+            # silently reports raw int8 counts as physical values.
+            if parent.get("quant") is not None:
+                entry["quant"] = copy.deepcopy(parent["quant"])
+            tensors[tile_name] = entry
 
 
 def apply_split_hint(graph: dict[str, Any],

@@ -39,7 +39,11 @@ from pathlib import Path
 
 import numpy as np
 
+# Repo root, for `pipeline.*`. And src/, because generate_skeleton's conv
+# weight-layout query imports `modelblaster.pipeline.reference_kernels` by its
+# installed name -- reachable only through the src/modelblaster namespace shim.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from pipeline.apply_split_hint import apply_split_hint  # noqa: E402
 from pipeline import generate_skeleton  # noqa: E402
@@ -184,6 +188,168 @@ class SplitLinearRejectsUnsupportedShapes(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             _emit(g, M, K, N)
         self.assertIn("strided", str(cm.exception).lower())
+
+
+def _conv_graph(N, IC, IH, IW, OC, KH, KW):
+    """One conv2d_s8, so a split produces exactly two comparable calls."""
+    OH, OW = IH, IW      # stride 1, pad 1, 3x3 -> same spatial size
+    return {
+        "name": "probe",
+        "input": {"tensor": "x"},
+        "output": {"tensors": ["y"]},
+        "tensors": {
+            "x": {"shape": [N, IC, IH, IW], "dtype": "i8",
+                  "quant": {"scale": 0.02, "zero_point": 0}},
+            "y": {"shape": [N, OC, OH, OW], "dtype": "i8",
+                  "quant": {"scale": 0.05, "zero_point": 0}},
+        },
+        "ops": [{
+            "name": "c0", "op": "conv2d_s8",
+            "inputs": ["x"], "outputs": ["y"],
+            "weight": "c0.weight_q", "bias": "c0.bias_q",
+            "shape": {"N": N, "IC": IC, "IH": IH, "IW": IW, "OC": OC,
+                      "OH": OH, "OW": OW, "KH": KH, "KW": KW,
+                      "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+            "quant": {
+                "input_offset": 0, "filter_offset": 0, "output_offset": 0,
+                "output_multiplier": 1845733646, "output_shift": 7,
+                "activation_min": -128, "activation_max": 127,
+            },
+            "dispatch_id": 0, "hardware_target": "any", "depends_on": [],
+        }],
+    }
+
+
+def _emit_conv(graph, N, IC, IH, IW, OC, KH, KW, backend):
+    """Run the skeleton generator; return (model.c, weights.c, weights.npz dict)."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        ir = td / "graph.json"
+        ir.write_text(json.dumps(graph))
+        rng = np.random.default_rng(0)
+        w = rng.integers(-127, 127, size=(OC, IC, KH, KW), dtype=np.int8)
+        b = rng.integers(-1000, 1000, size=(OC,)).astype(np.int32)
+        np.savez(td / "weights.npz", **{"c0.weight_q": w, "c0.bias_q": b})
+        np.savez(td / "io.npz",
+                 input=np.zeros((N, IC, IH, IW), dtype=np.int8),
+                 output=np.zeros((N, OC, IH, IW), dtype=np.int8))
+        out = td / "generated"
+        argv = sys.argv
+        sys.argv = ["generate_skeleton",
+                    "--ir", str(ir), "--weights", str(td / "weights.npz"),
+                    "--io", str(td / "io.npz"), "--out-dir", str(out),
+                    "--backend", backend, "--platform", "linux"]
+        try:
+            generate_skeleton.main()
+        finally:
+            sys.argv = argv
+        return ((out / "model.c").read_text(),
+                (out / "weights.c").read_text(),
+                {"c0.weight_q": w, "c0.bias_q": b})
+
+
+def _c_array(src, name):
+    m = re.search(rf"\b{name}\[\d+\] = \{{(.*?)\n\}};", src, re.S)
+    if not m:
+        return None
+    return np.array([int(x) for x in re.findall(r"-?\d+", m.group(1))],
+                    dtype=np.int64)
+
+
+class SplitConvUnderPackedWeightLayout(unittest.TestCase):
+    """An OC split must respect the backend's conv weight LAYOUT.
+
+    `_backend_pack_weight` permutes conv weights to IHWOC `(IC, KH, KW, OC)`
+    for the rvv backends, because their kernels vectorise over OC and index
+    `weight[((ic*KH + kh)*KW + kw)*OC + oc]`. Under that layout OC is the
+    innermost axis, so an OC slice is STRIDED -- `weight + t*tile_oc*IC*KH*KW`
+    names a different element set entirely, and the kernel additionally strides
+    by `tile_oc` where the packed parent strides by the full OC. Both errors are
+    invisible in the IR, in the build, and in the emitted C read on its own.
+    """
+
+    N, IC, IH, IW, OC, KH, KW = 1, 3, 8, 8, 16, 3, 3
+
+    def _split(self, backend, n_splits=2):
+        g = apply_split_hint(
+            _conv_graph(self.N, self.IC, self.IH, self.IW,
+                        self.OC, self.KH, self.KW),
+            [{"op": 0, "n_splits": n_splits}])
+        return _emit_conv(g, self.N, self.IC, self.IH, self.IW,
+                          self.OC, self.KH, self.KW, backend)
+
+    def test_rvv_tile_weights_are_the_packed_slice_not_a_slice_of_the_packed(self):
+        """The regression. Each tile array must equal pack(w[tile slice])."""
+        n = 2
+        _, weights_c, npz = self._split("rvv_x60", n)
+        tile_oc = self.OC // n
+        w = npz["c0.weight_q"]
+        packed_parent = np.ascontiguousarray(
+            np.transpose(w, (1, 2, 3, 0))).ravel().astype(np.int64)
+        for t in range(n):
+            got = _c_array(weights_c, f"probe_c0_weight_q_tile_{t}")
+            self.assertIsNotNone(
+                got, f"no per-tile weight array emitted for tile {t}; the "
+                     f"rvv backends pack conv weights IHWOC, where a pointer "
+                     f"offset cannot express an OC slice")
+            want = np.ascontiguousarray(np.transpose(
+                w[t * tile_oc:(t + 1) * tile_oc], (1, 2, 3, 0))
+            ).ravel().astype(np.int64)
+            np.testing.assert_array_equal(
+                got, want,
+                f"tile {t} weight array is not pack(oihw_slice)")
+            # And pin what the pre-fix codegen would have produced: a window
+            # into the packed PARENT at t*tile_oc*IC*KH*KW. Asserting it is
+            # different is what makes the test above mean something.
+            off = t * tile_oc * self.IC * self.KH * self.KW
+            old = packed_parent[off:off + want.size]
+            self.assertFalse(
+                np.array_equal(old, want),
+                f"tile {t}: the old pointer-offset view coincides with the "
+                f"correct slice at this shape, so this test cannot detect the "
+                f"bug -- pick a shape where it does")
+
+    def test_rvv_tile_call_reads_its_own_array_from_element_zero(self):
+        model_c, _, _ = self._split("rvv_x60", 2)
+        calls = re.findall(r"parallel_conv2d_s8\([^;]*\);", model_c, re.S)
+        self.assertEqual(len(calls), 2)
+        for t, call in enumerate(calls):
+            self.assertIn(f"probe_c0_weight_q_tile_{t}", call)
+            self.assertIn(f"probe_c0_bias_q_tile_{t}", call)
+            self.assertNotIn("weight_q + ", call,
+                             "a per-tile array must be read from element 0, "
+                             "not offset again")
+
+    def test_rvv_parent_array_is_not_also_emitted(self):
+        """A conv weight has one consumer, so once tiles own it the parent is
+        dead. Emitting both would double that conv's weight storage."""
+        _, weights_c, _ = self._split("rvv_x60", 2)
+        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q"),
+                          "parent weight array emitted alongside the tiles")
+
+    def test_scalar_backend_keeps_the_pointer_offset_and_no_tile_arrays(self):
+        """OIHW makes an OC slice contiguous, so offsetting is correct AND
+        free. The fix must not start duplicating arrays on that path."""
+        model_c, weights_c, _ = self._split("scalar", 2)
+        tile_oc = self.OC // 2
+        per_filter = self.IC * self.KH * self.KW
+        calls = re.findall(r"parallel_conv2d_s8\([^;]*\);", model_c, re.S)
+        self.assertEqual(len(calls), 2)
+        self.assertIn(f"+ {tile_oc * per_filter}", calls[1])
+        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q_tile_0"),
+                          "scalar backend should not need per-tile arrays")
+        self.assertIsNotNone(_c_array(weights_c, "probe_c0_weight_q"),
+                            "scalar backend must still emit the parent array")
+
+    def test_linear_split_is_unaffected_by_conv_packing(self):
+        """Linear weights are 2D; _backend_pack_weight only touches 4D
+        tensors, so `[N, K]` stays row-major and the N-tile offset stays
+        valid even on rvv."""
+        K, N, n = 32, 64, 2
+        g = apply_split_hint(_linear_graph(1, K, N), [{"op": 0, "n_splits": n}])
+        calls = _linear_calls(_emit(g, 1, K, N))
+        self.assertEqual(len(calls), n)
+        self.assertIn(f"+ {(N // n) * K}", calls[1])
 
 
 if __name__ == "__main__":
