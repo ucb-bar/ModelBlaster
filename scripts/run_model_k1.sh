@@ -35,6 +35,11 @@ OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/build/k1}"
 CROSS="${CROSS:-riscv64-unknown-linux-gnu-}"
 HOST="${MODELBLASTER_K1_HOST:-k1}"
 PY="${PY:-python3}"
+# Kernel synthesis on the K1 path goes to Codex, never Bedrock, and there is no
+# fallback: if Codex is unavailable the kernel step must fail loudly rather than
+# quietly produce kernels from another provider. Only consulted when
+# BACKEND=llm; the default (reference) uses curated kernels and calls no model.
+export LLM_PROVIDER="${LLM_PROVIDER:-codex}"
 
 GEN="${OUT_ROOT}/${MODEL}/${QUANT}"
 BIN="${OUT_ROOT}/${MODEL}_${QUANT}_${TARGET}_harness"
@@ -61,12 +66,20 @@ echo "=== 3/5 generate kernels (${TARGET}) ==="
     --global-curated-dir "${REPO_ROOT}/kernels"
 
 echo "=== 4/5 build linux harness ==="
-KERNEL_CFLAGS="$("${PY}" - "$TARGET" <<'PYEOF'
+# repo_root must be the ABSOLUTE repo path, not ".". The flags can contain
+# include paths (-I<repo_root>/kernels/rvv for the RVV intrinsics compat
+# header, -isystem<repo_root>/cores/... for gemmini), and `make -C harness_linux`
+# below runs from a different directory -- so a relative path resolves against
+# the wrong place and the header is not found.
+KERNEL_CFLAGS="$("${PY}" - "$TARGET" "${REPO_ROOT}" <<'PYEOF'
 import sys
-sys.path.insert(0, ".")
+# src first: `modelblaster` is also installed editable from a sibling checkout
+# in the venv commonly used here, and would otherwise shadow this one silently.
+sys.path.insert(0, sys.argv[2] + "/src")
+sys.path.insert(0, sys.argv[2])
 from modelblaster.pipeline import backends
 b = backends.get(sys.argv[1])
-print(" ".join(b.resolved_kernel_cflags(".")))
+print(" ".join(b.resolved_kernel_cflags(sys.argv[2])))
 PYEOF
 )" || KERNEL_CFLAGS=""
 make -s -C "${REPO_ROOT}/harness_linux" \
