@@ -129,8 +129,19 @@ foreach(_i RANGE ${_last})
 
         # Symbol suffixes, so two backends of one model link without
         # colliding. Same invocation the Zephyr harness uses.
+        # PYTHONPATH mirrors scripts/run_xpurt_k1.sh: `src` first (the shim
+        # package whose __path__ points back at this checkout's repo root),
+        # then the repo root itself. It used to be `${_REPO_ROOT_ABS}/..`,
+        # which only works when the checkout's own directory is *named*
+        # `modelblaster` -- so a checkout named ModelBlaster/ (or vendored
+        # under another repo) failed configure with "No module named
+        # 'modelblaster'", and a machine with a sibling clone next door
+        # silently ran THAT checkout's backend_rename instead. The symbol
+        # suffixes it prints decide which kernel each dispatch links against,
+        # so resolving to the wrong checkout is not a cosmetic error.
         execute_process(
-            COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${_REPO_ROOT_ABS}/.."
+            COMMAND ${CMAKE_COMMAND} -E env
+                "PYTHONPATH=${_REPO_ROOT_ABS}/src:${_REPO_ROOT_ABS}"
                 ${PYTHON_EXECUTABLE} -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}" --backend "${_bs}" --separator ";"
             OUTPUT_VARIABLE _rename_flags
