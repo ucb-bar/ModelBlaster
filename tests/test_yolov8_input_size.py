@@ -30,9 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 try:
+    from modelblaster.models import yolov8_nano as ymod
     from modelblaster.models.yolov8_nano import parse_input_size
     _IMPORT_ERR = None
 except Exception as exc:                     # torch absent in some envs
+    ymod = None
     parse_input_size = None
     _IMPORT_ERR = exc
 
@@ -116,3 +118,55 @@ class TheModelActuallyBuilds(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(parse_input_size is None, "yolov8_nano unimportable")
+class LoadingAFineTunedCheckpoint(unittest.TestCase):
+    """A retrained nc=2 model has to be loadable at all.
+
+    The checkpoint path was hardcoded to `yolov8n.pt` and `nc != 80` was
+    refused outright with a message saying a custom checkpoint was "out of
+    scope". So a model retrained on {gate, person} could not be built here:
+    PRETRAINED=1 refused, and PRETRAINED=0 silently discarded the training and
+    shipped random weights. That is the worse of the two, and it is the one a
+    hurried operator would reach for.
+    """
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("MODELBLASTER_YOLOV8N_NC",
+                        "MODELBLASTER_YOLOV8N_WEIGHTS",
+                        "MODELBLASTER_YOLOV8N_PRETRAINED")}
+        os.environ["MODELBLASTER_YOLOV8N_PRETRAINED"] = "1"
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_nc2_against_the_stock_coco_checkpoint_is_refused(self):
+        """Loading a COCO-80 head into an nc=2 model must not half-succeed."""
+        os.environ["MODELBLASTER_YOLOV8N_NC"] = "2"
+        os.environ.pop("MODELBLASTER_YOLOV8N_WEIGHTS", None)
+        with self.assertRaises(SystemExit) as cm:
+            ymod.get_model(seed=0)
+        msg = str(cm.exception)
+        self.assertIn("MODELBLASTER_YOLOV8N_WEIGHTS", msg,
+                      "the refusal must name the way forward, not just say no")
+
+    def test_a_missing_checkpoint_is_named(self):
+        """And is reported as a missing checkpoint even where ultralytics is
+        absent -- the path check runs before the import for that reason."""
+        os.environ["MODELBLASTER_YOLOV8N_NC"] = "2"
+        os.environ["MODELBLASTER_YOLOV8N_WEIGHTS"] = "/tmp/does_not_exist_xyz.pt"
+        with self.assertRaises(SystemExit) as cm:
+            ymod.get_model(seed=0)
+        self.assertIn("does_not_exist_xyz.pt", str(cm.exception))
+
+    def test_the_stock_path_is_unchanged(self):
+        """Backward compatibility: nc=80 + no override behaves as before."""
+        os.environ["MODELBLASTER_YOLOV8N_NC"] = "80"
+        os.environ.pop("MODELBLASTER_YOLOV8N_WEIGHTS", None)
+        self.assertEqual(ymod.weights_path(), ymod.STOCK_WEIGHTS)
