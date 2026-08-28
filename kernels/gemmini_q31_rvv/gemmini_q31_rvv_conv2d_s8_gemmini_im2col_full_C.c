@@ -7,55 +7,81 @@
  * The skeleton emitter (generate_skeleton.py::_backend_pack_weight)
  * permutes OIHW→HWIO at codegen time when --backend gemmini, so
  * we pass weight straight through without a workspace copy. */
-/* origin: im2col → tiled_matmul_auto(full_C=true) → scalar Q0.31 requantize.
- *         Bypasses Saturn-Gemmini float-scale mvout; bit-exact with the
- *         Q0.31 PyTorch golden (max_abs_err=0 validated on Saturn FireSim
- *         May 2026).  Handles non-square kernels, any stride/padding, and
- *         large output_shift values (int64 requantize, no UB). */
-/* perf: requantize writes straight into `output` (NCHW) instead of an
- * intermediate ws_output (NHWC) workspace that a separate full-tensor
- * NHWC->NCHW transpose pass then had to undo. That transpose pass had no
- * reuse to amortize (every output element is produced exactly once,
- * unlike the input transpose which is read KH*KW times per pixel), so it
- * was a pure extra traversal of N*OH*OW*OC elements. Removing it trades a
- * contiguous (NHWC) store + a later strided-read/contiguous-write pass
- * for a single strided (NCHW, stride OH*OW per oc) store done inline in
- * the existing requantize loop -- net one fewer full-tensor pass. ws_output
- * is gone entirely.
+/*
+ * origin: im2col -> tiled_matmul_auto(full_C=true) -> RVV Q0.31 requantize.
  *
- * HARDWARE-MEASURED (kernel_opt_log.jsonl id 1200, dronet, FPGA
- * f2_dual_small_norose_tacit_q31_60mhz, provenance-verified, max_abs_err=0
- * before and after): conv2d_s8 aggregate 11,598,513 -> 9,889,329 cycles
- * (-14.73%), model end-to-end 20,933,650 -> 19,213,428 cycles (-8.22%).
- * Every one of the 10 conv2d_s8 layers moved -8.8% to -16.1%; control ops
- * (maxpool/batchnorm/add/relu/sigmoid, untouched source) moved -0.05% to
- * +0.28%, confirming isolation. Two follow-on ideas were tried and
- * HARDWARE-REFUTED, not adopted: (a) batching multiple DIM=16-row CPU
- * tiles into one larger tiled_matmul_auto() call (up to ROWS_PER_TILE=320
- * rows) to amortize gemmini_flush(0)/CONFIG_EX/CONFIG_ST/CONFIG_LD reissue
- * across fewer calls -- net +0.33% end-to-end (conv2d_s8 +0.58%): the
- * saved reissue overhead was more than offset by wasted zero-padded mesh
- * rows on layers much smaller than the batch size. (b) replacing the
- * per-row div/mod decomposition of (n,oh,ow) from out_idx with an
- * incremental wrap-counter (one div/mod per tile instead of per row) --
- * a consistent small REGRESSION on spike (conv_modules.0 +2.0%), not
- * pursued to FPGA. Both indicate the per-tile RoCC ceremony and the
- * scalar index arithmetic are NOT where this kernel's cycles go; the
- * im2col gather/copy and the GEMM/DMA transfer dominate instead. */
+ * NOTE: this file used to be a symlink shared with
+ * kernels/gemmini/gemmini_conv2d_s8_gemmini_im2col_full_C.c (the plain,
+ * non-Q31 "gemmini" target, which has no `v` in kernel_cflags). It is now
+ * a standalone gemmini_q31-only file so it can use RVV intrinsics
+ * (kernel_cflags gained rv64imafdc*v* + <riscv_vector.h> for this target
+ * specifically, kernel_opt_log.jsonl id 800) without breaking the plain
+ * "gemmini" target's build. If you need to change the shared logic (the
+ * im2col / tiled_matmul_auto(full_C=true) structure), check both files.
+ *
+ * WHY THIS KERNEL EXISTS (root-cause of the gemmini_q31 accuracy bug):
+ * The sibling gemmini_tiled_conv algorithm asks gemmini's HW mvout unit
+ * to fold (output_multiplier, output_shift) into ONE Q0.31 scale
+ * (scale_q31 = round(mult / 2^shift)) and does a SINGLE hardware
+ * round-shift-by-31. The reference/golden (the scalar fallback below,
+ * kernels/rvv/rvv_conv2d_s8_rvv_vsmul_vnclip.c, and the PyTorch
+ * quantized op it was generated from) all compute a TWO-STAGE rounding:
+ *   stage1 = round_half_up(acc * mult,   2^31)
+ *   stage2 = round_half_up(stage1,       2^shift)   (shift > 0)
+ * Pre-folding mult/shift into one scale BEFORE multiplying by acc changes
+ * which values land exactly on a rounding boundary (the pre-rounding of
+ * the scale is amplified by acc, instead of a fixed +-0.5 in output
+ * units), so a single hardware round cannot reproduce the two-stage
+ * golden bit-for-bit -- this is a genuine, unavoidable structural
+ * mismatch for that algorithm (see gemmini_q31_conv2d_s8_gemmini_tiled_conv.c
+ * for the analysis and its own header comment). It is not a bug in that
+ * kernel's code, just a HW datapath that cannot represent double
+ * rounding.
+ *
+ * The fix is this algorithm: bypass gemmini's mvout requantize entirely
+ * (tiled_matmul_auto(..., full_C=true) drains the RAW int32 accumulator,
+ * no scale/round/saturate in hardware) and do the exact two-stage Q0.31
+ * requantize on the CPU with vsmul_vx (stage1) + vnclip_wx (stage2), both
+ * __RISCV_VXRM_RNU -- bit-identical to the scalar int64 formula and to
+ * kernels/rvv/rvv_conv2d_s8_rvv_vsmul_vnclip.c's mb_requant_i32m4, which
+ * is independently verified bit-exact end-to-end elsewhere in this repo.
+ * Verified in ISOLATION on dronet (this kernel alone, every other op
+ * forced to scalar reference_impl): max_abs_err=0
+ * (experiments/kernel_opt_log.jsonl id 1101). The unvectorized ancestor
+ * of this file (identical arithmetic, scalar requantize loop) was
+ * likewise measured bit-exact on Saturn RTL FireSim, May 2026 -- see
+ * kernels/gemmini/gemmini_conv2d_s8_gemmini_im2col_full_C.c.
+ *
+ * COST: draining a raw int32 accumulator moves 4 bytes/output instead of
+ * gemmini_tiled_conv's 1, and needs a CPU-side requantize pass gemmini's
+ * float/Q31-scale mvout does inside the accelerator for free
+ * (kernel_opt_log id 302/303/304: the unvectorized version of this
+ * kernel was ~4-5x slower than gemmini_tiled_conv on dronet, almost
+ * entirely the scalar per-element requantize loop). The RVV
+ * vectorization here (vsmul/vnclip over the OC dimension, same rounding
+ * mode) plus writing straight into `output`'s NCHW layout via a strided
+ * vector store (no NHWC ws_output staging buffer, no separate
+ * NHWC->NCHW transpose pass -- same fix as id 304) claws back most of
+ * that gap; see experiments/kernel_opt_log.jsonl id 1105+ for the
+ * measured trade.
+ *
+ * Handles non-square kernels, any stride/padding, and large
+ * output_shift values (int64/RVV requantize, no UB).
+ */
 
 #include <stdint.h>
 #include <stddef.h>
 #include <gemmini.h>
 #include <gemmini_params.h>
+#include <riscv_vector.h>
 
 /*
  * Static workspace limits.  512 KB covers all square conv layers in
  * dronet and yolov8_nano:
  *   WS_BYTES:     max input  = IC=3,IH=160,IW=160 →  75 KB (yolov8 l0)
- *                 (ws_output is gone — requantize now stores straight into
- *                  the caller's NCHW `output` buffer; ws_weight is gone
- *                  too — weight is pre-packed HWIO at codegen time and
- *                  passed straight to tiled_matmul_auto)
+ *                 max output = IC=16,OH=80,OW=80  → 100 KB (yolov8 l0)
+ *                 (ws_weight is gone — weight is pre-packed HWIO at
+ *                  codegen time and passed straight to tiled_matmul_auto)
  *   IM2COL_ELEMS: max K_inner = IC=256,K=3×3     → 2304 (yolov8 detect head)
  *   ACC_ELEMS:    max OC      = 256               (yolov8 l7/l8/l9)
  */
@@ -64,6 +90,43 @@ enum {
     IM2COL_ELEMS   = DIM * 256 * 9,   /* DIM rows × max K_inner (IC=256, 3×3) */
     ACC_ELEMS      = DIM * 256,        /* DIM rows × max OC (256 in yolov8)    */
 };
+
+/* Two-stage Q0.31 requantize, vectorized over a run of OC channels.
+ * Bit-identical to the scalar int64 reference (see file header):
+ *   stage1 = round_half_up(acc * output_multiplier, 2^31)
+ *   stage2 = round_half_up(stage1, 2^output_shift)          (shift > 0)
+ *          = stage1 << (-output_shift)                      (shift < 0, exact)
+ * vsmul_vx(..., RNU) performs stage1 (Q0.31 multiply-round, matches the
+ * scalar '+ (1<<30) >> 31'); vnclip_wx(..., RNU) performs stage2 (matches
+ * the scalar '+ (1<<(shift-1)) >> shift'). Structurally the same
+ * construction as kernels/rvv/rvv_conv2d_s8_rvv_vsmul_vnclip.c's
+ * mb_requant_i32m4. */
+static inline vint8m1_t gq31_requant_i32m4(vint32m4_t vacc,
+                                           int output_multiplier, int output_shift,
+                                           int output_offset,
+                                           int activation_min, int activation_max,
+                                           size_t vl)
+{
+    vint32m4_t vscaled = __riscv_vsmul_vx_i32m4(
+        vacc, output_multiplier, __RISCV_VXRM_RNU, vl);
+    vint16m2_t vout16;
+    if (output_shift < 0) {
+        vint32m4_t vsh = __riscv_vsll_vx_i32m4(vscaled, (size_t)(-output_shift), vl);
+        vout16 = __riscv_vnclip_wx_i16m2(vsh, 0, __RISCV_VXRM_RNU, vl);
+    } else if (output_shift < 32) {
+        vout16 = __riscv_vnclip_wx_i16m2(vscaled, (size_t)output_shift,
+                                         __RISCV_VXRM_RNU, vl);
+    } else {
+        int sa2 = output_shift - 31;
+        if (sa2 > 31) sa2 = 31;
+        vint32m4_t v2 = __riscv_vsra_vx_i32m4(vscaled, 31, vl);
+        vout16 = __riscv_vnclip_wx_i16m2(v2, (size_t)sa2, __RISCV_VXRM_RNU, vl);
+    }
+    vout16 = __riscv_vadd_vx_i16m2(vout16, (int16_t)output_offset, vl);
+    vout16 = __riscv_vmax_vx_i16m2(vout16, (int16_t)activation_min, vl);
+    vout16 = __riscv_vmin_vx_i16m2(vout16, (int16_t)activation_max, vl);
+    return __riscv_vnsra_wx_i8m1(vout16, 0, vl);
+}
 
 void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                       const int32_t *bias, int8_t *output,
@@ -226,35 +289,28 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         gemmini_fence();
         gemmini_flush(0);
 
-        /* Scalar Q0.31 requantize: int32 accumulator → int8 NHWC.
-         * Uses int64 arithmetic throughout to avoid UB on large output_shift. */
+        /* RVV Q0.31 requantize: int32 accumulator -> int8, written
+         * straight into `output`'s NCHW layout (stride OH*OW elements
+         * between consecutive oc) via a strided vector store. No NHWC
+         * staging buffer, no separate transpose pass (kernel_opt_log
+         * id 304's fix, applied here too). */
         for (int i = 0; i < tile_rows; i++) {
             int out_idx = tile_i + i;
             int ow_idx  = out_idx % OW;
             int oh_idx  = (out_idx / OW) % OH;
             int n_idx   = out_idx / (OH * OW);
-            /* NCHW base for (n_idx, ., oh_idx, ow_idx); stride between
-             * consecutive oc is (size_t)OH*OW elements. size_t throughout --
-             * BSS workspaces above 0x80000000 wrap 32-bit index arithmetic
-             * (see sibling_audit.py / the yolov8n int-wrap postmortem). */
-            const size_t out_base =
-                (((size_t)n_idx*OC)*OH + (size_t)oh_idx)*OW + (size_t)ow_idx;
-            const size_t out_oc_stride = (size_t)OH * (size_t)OW;
-            for (int oc = 0; oc < OC; oc++) {
-                int32_t acc = ws_acc_out[i * OC + oc];
-                int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
-                prod = (prod + ((int64_t)1 << 30)) >> 31;
-                int32_t scaled = (int32_t)prod;
-                if (output_shift > 0) {
-                    scaled = (int32_t)(((int64_t)scaled
-                        + ((int64_t)1 << (output_shift - 1))) >> output_shift);
-                } else if (output_shift < 0) {
-                    scaled <<= (-output_shift);
-                }
-                scaled += output_offset;
-                if (scaled < activation_min) scaled = activation_min;
-                if (scaled > activation_max) scaled = activation_max;
-                output[out_base + (size_t)oc * out_oc_stride] = (int8_t)scaled;
+            int8_t *dst0 = output + (((size_t)n_idx * OC) * OH + oh_idx) * OW + ow_idx;
+            ptrdiff_t oc_stride_bytes = (ptrdiff_t)OH * OW;  /* elem_t is 1 byte */
+            int oc = 0;
+            while (oc < OC) {
+                size_t vl = __riscv_vsetvl_e32m4((size_t)(OC - oc));
+                vint32m4_t vacc = __riscv_vle32_v_i32m4(&ws_acc_out[i * OC + oc], vl);
+                vint8m1_t vout = gq31_requant_i32m4(
+                    vacc, output_multiplier, output_shift, output_offset,
+                    activation_min, activation_max, vl);
+                __riscv_vsse8_v_i8m1(dst0 + (size_t)oc * OH * OW,
+                                     oc_stride_bytes, vout, vl);
+                oc += (int)vl;
             }
         }
     }

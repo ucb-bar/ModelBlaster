@@ -22,8 +22,8 @@ void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
         for (int n = 0; n < N; n++) {
             size_t vl;
             vint32m4_t vacc = __riscv_vmv_v_x_i32m4(0, __riscv_vsetvlmax_e32m4());
-            const int8_t *in_row = input + m * K;
-            const int8_t *w_row  = weight + n * K;
+            const int8_t *in_row = input + (size_t)m * K;
+            const int8_t *w_row  = weight + (size_t)n * K;
             int k = 0;
             for (; k + 2 * (int)(__riscv_vsetvlmax_e8m1()) <= K;
                    k += 2 * (int)(__riscv_vsetvlmax_e8m1())) {
@@ -64,7 +64,7 @@ void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
             scaled += output_offset;
             if (scaled < activation_min) scaled = activation_min;
             if (scaled > activation_max) scaled = activation_max;
-            output[m * N + n] = (int8_t)scaled;
+            output[(size_t)m * N + n] = (int8_t)scaled;
         }
     }
 }

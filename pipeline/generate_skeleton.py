@@ -533,6 +533,56 @@ def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
     return None
 
 
+def _check_conv_family_layout_agreement(backend: Optional[str], s8_layout: Optional[str]) -> None:
+    """Guard the cross-op blind spot in _backend_pack_weight.
+
+    _backend_pack_weight derives ONE weight layout per *backend* from
+    CONV2D_S8's algorithm declarations (_conv_weight_layout_for_backend)
+    and then applies it to every 4D weight tensor on that backend —
+    regardless of which op actually owns the tensor. If some OTHER
+    conv-family op (conv2d_f16, depthwise_conv2d_*, conv2d_s8_pc, ...) has
+    its own algorithm target-affined to this backend that assumes a
+    DIFFERENT layout, silently applying the conv2d_s8-derived layout to
+    that op's weights transposes them with the wrong permutation. This is
+    exactly how a target_affinity edit on one algorithm silently corrupted
+    an unrelated op's weights (uniform max_abs_err across every kernel in
+    the target, not just the one whose affinity changed).
+
+    Mirrors _conv_weight_layout_for_backend's same-op disagreement check,
+    but across ops. Fails loudly instead of guessing.
+    """
+    if backend is None:
+        return
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+
+    s8_effective = s8_layout or "oihw"
+    for op_name, spec in KERNEL_SPECS.items():
+        if op_name == "conv2d_s8":
+            continue
+        if not op_name.startswith(("conv2d", "depthwise_conv2d")):
+            continue
+        other_layouts = {
+            algo.weight_layout
+            for algo in spec.algorithms
+            if algo.target_affinity and backend in algo.target_affinity
+        }
+        if not other_layouts:
+            continue
+        if other_layouts != {s8_effective}:
+            raise SystemExit(
+                f"backend '{backend}': weight_layout mismatch between "
+                f"conv-family ops. conv2d_s8's target-affined algorithms "
+                f"want {s8_effective!r} for this backend, but {op_name}'s "
+                f"target-affined algorithm(s) want {sorted(other_layouts)}. "
+                f"_backend_pack_weight applies ONE layout to every 4D conv "
+                f"weight tensor on a backend, so this would silently pack "
+                f"{op_name}'s weights with the wrong permutation. Align "
+                f"weight_layout across conv2d_s8 and {op_name} for backend "
+                f"{backend!r} (or restrict target_affinity so they don't "
+                f"both target it)."
+            )
+
+
 # Physical permutation on OIHW. The two layouts differ in axis order
 # despite both being "weight reshuffled away from OIHW":
 #
@@ -569,6 +619,7 @@ def _backend_pack_weight(arr: np.ndarray, backend: Optional[str]) -> tuple[np.nd
     if arr.ndim != 4:
         return arr, None
     layout = _conv_weight_layout_for_backend(backend)
+    _check_conv_family_layout_agreement(backend, layout)
     if layout is None or layout == "oihw":
         return arr, None
     perm = _LAYOUT_PERMUTATION.get(layout)
@@ -1155,6 +1206,32 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q['output_offset']}, "
                 f"{q['output_multiplier']}, {q['output_shift']}, "
                 f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "conv2d_pool_s8":
+            # Fused conv2d + maxpool (extended fusion, --enable-fusion /
+            # MB_ENABLE_FUSION=1). Direct (non-parallelized) call, unlike
+            # conv2d_s8's OC-split parallel_conv2d_s8 wrapper -- the
+            # dronet/yolov8n sites this fires on today are small enough
+            # (and few enough) that OC-parallelizing this call too is a
+            # follow-up, not required for correctness or the measured win.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_conv2d_pool_s8({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{q['output_multiplier']}, {q['output_shift']}, "
+                f"{q['activation_min']}, {q['activation_max']}, "
+                f"{sh['pool_KH']}, {sh['pool_KW']}, "
+                f"{sh['pool_SH']}, {sh['pool_SW']}, "
+                f"{sh['pool_PH']}, {sh['pool_PW']}, "
+                f"{sh['pool_DH']}, {sh['pool_DW']})"
             )
         elif op["op"] == "maxpool2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")

@@ -2,20 +2,24 @@
 /* algorithm: gemmini_resadd */
 /* accuracy_class: bit_exact */
 /* BUG FOUND + FIXED 2026-08-28 (experiments/kernel_opt_log.jsonl id
- * BUG-add-s8-gemmini / 1500+): this kernel used to route well-conditioned
- * adds (both |scale/scale_out| ratios in [0.5, 2.0], n>=256) through
- * gemmini's tiled_resadd_auto with C_scale=ACC_SCALE_IDENTITY, on the
- * theory that "identity" made the mvout requantize a no-op. It isn't --
- * ACC_SCALE_IDENTITY still traverses the same round-and-saturate unit
- * conv2d_s8's HW path uses (see kernels/gemmini_q31/archive/'s two
- * kernels, retired for the identical defect), so mvout picks up its own
- * rounding on top of whatever the mvin scale already lost. Validated
- * ONLY against dronet, where every add fails the [0.5,2.0] gate and
- * fell back to scalar 100% of the time -- so this HW branch was NEVER
- * actually exercised until isolation-tested on yolov8n (whose adds land
- * inside the gate): max_abs_err=43 on the real F2 Q0.31 Gemmini
- * bitstream, isolation-tested (this kernel alone curated, every other
- * op forced to scalar reference_impl).
+ * BUG-add-s8-gemmini / 1500+, fix applied here after being missed on the
+ * first pass -- the pure gemmini_q31 sibling
+ * kernels/gemmini_q31/gemmini_q31_add_s8_gemmini_resadd.c was fixed
+ * first; this fused-target copy still had the identical bug until now):
+ * this kernel used to route well-conditioned adds (both |scale/scale_out|
+ * ratios in [0.5, 2.0], n>=256) through gemmini's tiled_resadd_auto with
+ * C_scale=ACC_SCALE_IDENTITY, on the theory that "identity" made the
+ * mvout requantize a no-op. It isn't -- ACC_SCALE_IDENTITY still
+ * traverses the same round-and-saturate unit conv2d_s8's HW path uses
+ * (see kernels/gemmini_q31/archive/'s two kernels, retired for the
+ * identical defect), so mvout picks up its own rounding on top of
+ * whatever the mvin scale already lost. Validated ONLY against dronet,
+ * where every add fails the [0.5,2.0] gate and fell back to scalar 100%
+ * of the time -- so this HW branch was NEVER actually exercised until
+ * isolation-tested on yolov8n (whose in-gate adds land inside the gate):
+ * max_abs_err=43 on the real F2 Q0.31 Gemmini bitstream, isolation-tested
+ * (this kernel alone curated, every other op forced to scalar
+ * reference_impl).
  *
  * WHY THIS CANNOT BE MADE EXACT ON THIS HW: the concatenation kernels
  * (kernels/gemmini_q31/*_cat*_gemmini_mvin_scale.c) work around the same
@@ -46,11 +50,10 @@
  * scale_a/scale_out and scale_b/scale_out into integer multipliers and
  * rounds half-away-from-zero, matching the reference roundf() bit for
  * bit) and was already the 100%-of-traffic path on dronet
- * (max_abs_err=0). Slower than the HW path would have been, but
- * correct beats fast: dronet stays at its existing err=0 baseline, and
- * yolov8n -- the model that actually exercises the previously-untested
- * gate -- now also verifies at err=0 (isolation-tested, this kernel
- * alone curated).
+ * (max_abs_err=0). Slower than the HW path would have been, but correct
+ * beats fast: dronet stays at its existing err=0 baseline, and yolov8n --
+ * the model that actually exercises the previously-untested gate -- now
+ * also verifies at err=0 (isolation-tested, this kernel alone curated).
  *
  * WHY THE SCALAR PATH IS STILL FAST: measured on the F2 Q0.31 Gemmini
  * bitstream, the old naive float fallback (int->float converts, fdiv by

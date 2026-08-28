@@ -1247,6 +1247,41 @@ def generate(
             os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
             and needs_harness_paths
         )
+        # PRE-SEED PASS.
+        # `_verify` only ever compares the FINAL model output against the
+        # PyTorch golden -- it has no view of intermediates. So the impls
+        # dict that surrounds the kernel under test *is* the experiment's
+        # control, and seeding it all-reference makes that control wrong:
+        # any op whose reference_impl is broken poisons the verdict for
+        # every op verified before the good curated kernel for it lands.
+        #
+        # specs iterate in sorted(op_kinds) order, so on dronet
+        # `batchnorm2d_s8` is judged while conv2d_s8 is still the broken
+        # scalar reference, and inherits that conv's max_abs_err=92.
+        # The batchnorm kernel was never the problem.
+        #
+        # Fix: seed every op that HAS a curated file with it up front, so
+        # each op is judged against the best-known stack rather than the
+        # worst-known one. A curated kernel that then fails verify is
+        # reverted to reference immediately (below) so it cannot poison
+        # the ops after it.
+        curated_seed: dict[str, tuple[str, str, str]] = {}
+        if global_curated_dir is not None:
+            for spec in specs:
+                for algorithm in spec.algorithms:
+                    _fn = f"{target.name}_{spec.op}_{algorithm.name}.c"
+                    _cp = os.path.join(global_curated_dir, target.name, _fn)
+                    if os.path.exists(_cp):
+                        curated_seed[spec.op] = (
+                            algorithm.name, _cp, open(_cp).read())
+                        break
+            if curated_seed:
+                for _op, (_algo, _cp, _src) in curated_seed.items():
+                    impls[_op] = _src
+                log(f"  [curated] pre-seeded verify baseline with "
+                    f"{len(curated_seed)} curated kernel(s): "
+                    f"{sorted(curated_seed)}")
+
         if global_curated_dir is not None:
             for spec in specs:
                 for algorithm in spec.algorithms:
@@ -1276,16 +1311,74 @@ def generate(
                                 algorithm_name=algorithm.name,
                             )
                         except Exception as e:
-                            log(f"  [{spec.op}/{algorithm.name}] curated "
-                                f"verify raised {type(e).__name__}: {e}; "
-                                f"falling back to reference_impl")
-                            accepted = False
+                            # A BUILD failure is NOT evidence against this op.
+                            # The harness is compiled with every pre-seeded
+                            # curated kernel in it, so one non-compiling
+                            # pre-seed fails the build for every op that is
+                            # verified before the culprit is reached and
+                            # reverted -- silently downgrading all of them to
+                            # reference. That cost yolov8n 21% of runtime
+                            # (batchnorm2d + cat2/3/4) before it was noticed.
+                            # Numeric failures are handled below and are real;
+                            # only compile failures get this treatment.
+                            _build_fail = "west build failed" in str(e)
+                            if _build_fail and curated_seed:
+                                log(f"  [{spec.op}/{algorithm.name}] curated "
+                                    f"verify hit a BUILD failure, not a "
+                                    f"numeric mismatch. The harness carries "
+                                    f"{len(curated_seed)} pre-seeded curated "
+                                    f"kernel(s), so the culprit may be any of "
+                                    f"{sorted(curated_seed)} -- not "
+                                    f"necessarily {spec.op}. Every op sorting "
+                                    f"before the real culprit is being "
+                                    f"downgraded to reference by this. Set "
+                                    f"MB_PRESEED_RECOVER=1 to re-verify "
+                                    f"against a reference-only baseline.")
+                            else:
+                                log(f"  [{spec.op}/{algorithm.name}] curated "
+                                    f"verify raised {type(e).__name__}: {e}; "
+                                    f"falling back to reference_impl")
                             vres = None
+                            if (_build_fail and curated_seed
+                                    and os.environ.get("MB_PRESEED_RECOVER")
+                                    == "1"):
+                                # Retry this op alone against an unpoisoned
+                                # baseline. If it builds and verifies here,
+                                # the fault was another op's kernel.
+                                log(f"  [{spec.op}/{algorithm.name}] "
+                                    f"MB_PRESEED_RECOVER: re-verifying "
+                                    f"against a reference-only baseline")
+                                _clean = {sp.op: sp.reference_impl
+                                          for sp in specs}
+                                try:
+                                    vres = _verify(
+                                        spec, curated_src, shapes,
+                                        backend=target, impls=_clean,
+                                        specs=specs, repo_root=repo_root,
+                                        model_dir=out_dir,
+                                        build_dir=build_dir,
+                                        harness_dir=harness_dir,
+                                        io_path=io_path,
+                                        algorithm_name=algorithm.name,
+                                    )
+                                except Exception as e2:
+                                    log(f"  [{spec.op}/{algorithm.name}] "
+                                        f"recovery verify also failed "
+                                        f"({type(e2).__name__}: {e2}); "
+                                        f"falling back to reference_impl")
+                                    vres = None
+                            if vres is None:
+                                accepted = False
+                                impls[spec.op] = spec.reference_impl
                         if vres is not None and not vres.ok:
                             log(f"  [{spec.op}/{algorithm.name}] curated "
                                 f"verify FAIL — {vres.message}; "
                                 f"falling back to reference_impl")
                             accepted = False
+                            # Undo the pre-seed for this op right away:
+                            # leaving a known-bad kernel in the baseline
+                            # would mis-judge every op verified after it.
+                            impls[spec.op] = spec.reference_impl
                         elif vres is not None:
                             log(f"  [{spec.op}/{algorithm.name}] curated "
                                 f"verify PASS — {vres.message}")
@@ -1536,9 +1629,11 @@ def generate(
                     repo_root=firesim_evaluator.repo_root,
                     runner="firesim",
                     firesim_config=firesim_evaluator.config,
+                    harness_dir=firesim_evaluator.harness_dir,
+                    impls=firesim_evaluator.impls,
                     log=log,
                 )
-                _batch_results = _batch.evaluate(_run_list)
+                _batch_results = _batch.evaluate(_run_list, spec=spec)
 
                 fbest_code = None
                 fbest_cycles = None

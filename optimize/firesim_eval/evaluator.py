@@ -85,6 +85,14 @@ class FiresimEvalConfig:
     replacement_threshold_pct: float = 1.0
     # FireSim board target — chipyard's quad-rocket-saturn slot.
     board_target: str = "chipyard_riscv64/rocketchip_virt_riscv64"
+    # How the ELF actually reaches an FPGA:
+    #   "local" — drive the FIRESIM_ROOT install directly (one local U250,
+    #             serialised; this is garden's board).
+    #   "fq"    — submit to the shared AWS F2 pool through the `fq` queue
+    #             (8 lanes, runs candidates concurrently).
+    # Default is "fq": kernel re-ranking should not squat garden's U250,
+    # and the pool is what makes batch re-rank cheap.
+    transport: str = os.environ.get("FIRESIM_TRANSPORT", "fq")
 
 
 @dataclass
@@ -100,6 +108,66 @@ class FiresimEvalResult:
     # candidates that compile + run but produce wrong numbers).
     golden_ok: Optional[bool] = None
     golden_max_abs_err: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# uartlog -> result  (shared by the single-candidate and batch paths)
+# ---------------------------------------------------------------------------
+
+def parse_uart_result(uart: str, io_path: str) -> tuple[bool, str, dict]:
+    """Turn a FireSim/fq uartlog into (ok, diagnostic, parsed).
+
+    `parsed` carries cycles_by_op / wall_cycles / golden_ok /
+    golden_max_abs_err. Transport-agnostic on purpose: the local runner
+    and the fq pool emit byte-identical harness output.
+    """
+    from modelblaster.validation.runner_common import (
+        parse_output, parse_profile, parse_verify, parse_wall_cycles,
+        compare,
+    )
+    import numpy as np
+
+    verify = parse_verify(uart)
+    profile = parse_profile(uart) or []
+    cycles_by_op: dict[str, int] = {}
+    for row in profile:
+        cycles_by_op[row["op"]] = (
+            cycles_by_op.get(row["op"], 0) + int(row["cycles"])
+        )
+    wall = parse_wall_cycles(uart)
+
+    raw_golden = np.load(io_path)["output"]
+    is_int = raw_golden.dtype.kind in ("i", "u")
+    is_fp16 = raw_golden.dtype == np.float16
+    if is_int:
+        atol = rtol = 0.0
+    elif is_fp16:
+        atol, rtol = 1e-2, 1e-2
+    else:
+        atol, rtol = 1e-5, 1e-4
+
+    if verify is not None:
+        n_golden = int(np.asarray(raw_golden).reshape(-1).size)
+        if verify["n"] != n_golden:
+            ok, max_ae = False, float("inf")
+        else:
+            max_ae = verify["max_abs_err"]
+            ok = (max_ae <= atol) or (verify["max_rel_err"] <= rtol)
+    else:
+        try:
+            actual = parse_output(uart)
+        except Exception as e:  # noqa: BLE001
+            return False, f"output parse failed: {e}", {}
+        golden = raw_golden.astype(np.float32).reshape(-1)
+        ok, stats = compare(actual, golden, atol=atol, rtol=rtol)
+        max_ae = stats.get("max_abs_err")
+
+    return True, "ok", {
+        "cycles_by_op": cycles_by_op,
+        "wall_cycles": wall,
+        "golden_ok": ok,
+        "golden_max_abs_err": max_ae,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -371,77 +439,35 @@ class FiresimEvaluator:
         """Stage the elf to the firesim sim slot, run it, parse output.
         Returns (ok, diagnostic, parsed_dict). parsed_dict holds
         cycles_by_op, wall_cycles, golden_ok, golden_max_abs_err."""
-        # Local imports — same lazy pattern; firesim_runner is heavy.
-        from modelblaster.validation.firesim_runner import run_firesim
-        from modelblaster.validation.runner_common import (
-            parse_output, parse_profile, parse_verify, parse_wall_cycles,
-            compare,
-        )
-        import numpy as np
-
-        try:
-            uart = run_firesim(
-                elf_path,
-                models=None,  # single-model harness
-                firesim_root=self.config.firesim_root,
-                firesim_env=self.config.firesim_env,
-                firesim_slot=self.config.firesim_slot,
-                timeout=self.config.firesim_timeout_sec,
-                stage_elf=True,
-                kill_first=True,
-                verbose=False,
+        if self.config.transport == "fq":
+            from modelblaster.optimize.firesim_eval.fq_transport import (
+                run_fq,
             )
-        except Exception as e:
-            return False, f"firesim run threw: {type(e).__name__}: {e}", {}
-
-        # Modern harness emits a single MODELBLASTER_VERIFY summary; legacy
-        # binaries ship the per-element OUTPUT block. Prefer the
-        # summary on FireSim — the OUTPUT path's per-element printf
-        # over HTIF UART used to dominate the wall budget.
-        verify = parse_verify(uart)
-
-        profile = parse_profile(uart) or []
-        cycles_by_op: dict[str, int] = {}
-        for row in profile:
-            cycles_by_op[row["op"]] = (
-                cycles_by_op.get(row["op"], 0) + int(row["cycles"])
-            )
-        wall = parse_wall_cycles(uart)
-
-        raw_golden = np.load(self.io_path)["output"]
-        is_int = raw_golden.dtype.kind in ("i", "u")
-        is_fp16 = raw_golden.dtype == np.float16
-        if is_int:
-            atol = rtol = 0.0
-        elif is_fp16:
-            atol, rtol = 1e-2, 1e-2
-        else:
-            atol, rtol = 1e-5, 1e-4
-
-        if verify is not None:
-            n_golden = int(np.asarray(raw_golden).reshape(-1).size)
-            if verify["n"] != n_golden:
-                ok = False
-                max_ae = float("inf")
-            else:
-                max_ae = verify["max_abs_err"]
-                max_re = verify["max_rel_err"]
-                ok = (max_ae <= atol) or (max_re <= rtol)
-        else:
             try:
-                actual = parse_output(uart)
-            except Exception as e:
-                return False, f"firesim output parse failed: {e}", {}
-            golden = raw_golden.astype(np.float32).reshape(-1)
-            ok, stats = compare(actual, golden, atol=atol, rtol=rtol)
-            max_ae = stats.get("max_abs_err")
+                uart = run_fq(
+                    elf_path,
+                    timeout_sec=int(self.config.firesim_timeout_sec),
+                )
+            except Exception as e:  # noqa: BLE001
+                return False, f"fq run threw: {type(e).__name__}: {e}", {}
+        else:
+            from modelblaster.validation.firesim_runner import run_firesim
+            try:
+                uart = run_firesim(
+                    elf_path,
+                    models=None,  # single-model harness
+                    firesim_root=self.config.firesim_root,
+                    firesim_env=self.config.firesim_env,
+                    firesim_slot=self.config.firesim_slot,
+                    timeout=self.config.firesim_timeout_sec,
+                    stage_elf=True,
+                    kill_first=True,
+                    verbose=False,
+                )
+            except Exception as e:  # noqa: BLE001
+                return False, f"firesim run threw: {type(e).__name__}: {e}", {}
 
-        return True, "ok", {
-            "cycles_by_op": cycles_by_op,
-            "wall_cycles": wall,
-            "golden_ok": ok,
-            "golden_max_abs_err": max_ae,
-        }
+        return parse_uart_result(uart, self.io_path)
 
 
 # ---------------------------------------------------------------------------

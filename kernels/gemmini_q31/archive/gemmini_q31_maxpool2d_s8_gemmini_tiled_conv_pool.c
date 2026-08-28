@@ -1,65 +1,36 @@
 /* source: curated */
 /* algorithm: gemmini_tiled_conv_pool */
-/* accuracy_class: bit_exact */
-/* FIXED 2026-08-28 (un-archived): the previous version of this kernel used
- * a per-channel identity conv with weight=+1 to move data through
- * gemmini's mvout-pool datapath at scale=ACC_SCALE_IDENTITY, and measured
- * max_abs_err=17 in isolation (kernel_opt_log.jsonl id 1100/gemmini-
- * correct-cost) despite declaring accuracy_class=bit_exact — archived to
- * archive/ pending a fix.
- *
- * ROOT CAUSE (this fix): cores/gemmini/include/gemmini_params.h defines
- *   ACC_SCALE_IDENTITY  ((acc_scale_t)1 << 30)
- *   ACC_SCALE(x, scale) = round_half_up((x * scale) + 2^30, >> 31)
- * i.e. ACC_SCALE_IDENTITY represents the fixed-point value 0.5, not 1.0 —
- * a genuine Q31-format limitation, not a typo: acc_scale_t is a SIGNED
- * int32, and the value that would represent an exact 1.0 in this >>31
- * convention is 2^31, which overflows int32 (max representable is
- * 2^31 - 1). Whoever chose this bitstream's ACC_SCALE_IDENTITY picked
- * 2^30 (0.5) rather than 2^31-1 (~0.9999999995); either would have
- * worked at mvout time (see kernels/gemmini/gemmini_conv2d_s8_gemmini_
- * tiled_conv.c's header for the SEPARATE, unrelated single-vs-double-
- * rounding drift that affects a REAL non-identity conv scale — 2^31-1's
- * ~5e-10 relative error is negligible by comparison), but 2^30 also
- * works AS LONG AS THE ACCUMULATOR INPUT IS PRE-DOUBLED: verified
- * exhaustively (all int8 v in [-128,127]) that
- *   ACC_SCALE(2*v, ACC_SCALE_IDENTITY) == v   exactly, for every v
- * while ACC_SCALE(v, ACC_SCALE_IDENTITY) == round(v/2) (max diff 64).
- * The previous version's identity conv used weight=+1, giving
- * accumulator x = v*1 = v (NOT pre-doubled) — hence the ~2x-attenuated,
- * badly wrong per-element values that propagated to max_abs_err=17
- * after the downstream linear layer. FIX: weight=+2 per channel, giving
- * accumulator x = v*2 = 2v, which ACC_SCALE_IDENTITY recovers EXACTLY
- * (provably, not just measured-zero-in-practice — this is why the
- * accuracy_class above is BIT_EXACT, unlike the cat2/3/4_c1_s8 MVIN_SCALE
- * trick which is NUMERIC_DRIFT due to a real ties-to-even-vs-away-from-
- * zero rounding mismatch. Here there is no rounding at all: 2v is exactly
- * representable and exactly recovered for every int8 v). No overflow risk
- * (2*v in [-256,254], acc_t is int32).
- *
- * ISOLATION-VERIFIED (this kernel alone curated via a private
- * GLOBAL_CURATED_DIR, every other op forced to spec.reference_impl, per
- * the campaign's isolation-testing rule): dronet/gemmini_q31 on spike,
- * whole-model max_abs_err=0 max_rel_err=0 (was 17 with weight=+1).
- * kernel_picks.json confirmed this file's algorithm was actually
- * selected (source=curated, algorithm=gemmini_tiled_conv_pool), not a
- * silent fallback. See experiments/kernel_opt_log.jsonl id ~1900s.
+/* accuracy_class: numeric_drift */
+/* ARCHIVED 2026-08-28: this kernel declared accuracy_class=bit_exact but
+ * is NOT bit-exact — isolation-tested on dronet (this kernel alone as the
+ * only curated swap, every other op forced to scalar reference_impl, so
+ * no other source of drift is present): max_abs_err=17
+ * (experiments/kernel_opt_log.jsonl id 1100). Root cause: the "identity"
+ * passthrough conv this kernel uses to move data through gemmini's
+ * mvout-pool datapath scales by ACC_SCALE_IDENTITY through the SAME
+ * fixed-point ACC_SCALE round-and-saturate unit conv2d_s8's HW path uses
+ * (cores/gemmini/include/gemmini_params.h::ACC_SCALE /
+ * ACC_SCALE_IDENTITY) — that unit is not a true identity for this
+ * Q31Ws32x32Acc config (see gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * header for the general "single hardware round vs two-stage golden"
+ * mismatch), so even a nominally-lossless pass-through picks up ~1 LSB
+ * of noise per element BEFORE the max is taken, and that per-element
+ * noise then propagates through dronet's downstream linear layer. Not
+ * removed from the repo (kept for reference / possible future HW fix),
+ * but relocated to this archive/ subdirectory so ModelBlaster's flat
+ * curated-kernel lookup (target_dir/<target>_<op>_<algorithm>.c) never
+ * selects it — kernels/gemmini_q31/ and kernels/gemmini_q31_rvv/ both
+ * use the RVV/scalar `direct` sliding-window max instead, which is
+ * exact (a plain max() has no rounding to get wrong) and also faster.
  *
  * origin: tiled_conv_dw_auto — gemmini's depthwise-conv path with the
  *         pool tail enabled. We turn the conv into a per-channel
  *         passthrough (kernel_dim=1, stride=1, padding=0,
- *         weights = +2 per channel [see FIX above], bias = NULL, act = 0,
+ *         weights = +1 per channel, bias = NULL, act = 0,
  *         scale = ACC_SCALE_IDENTITY) so the conv produces output[c,h,w]
- *         = input[c,h,w] in the accumulator (exactly, after ACC_SCALE's
- *         halving), and then the mvout pool unit takes a max over each
- *         KH×KW window with stride SH==SW while writing to DRAM. Per
- *         kernel_opt_log id 1303's finding (confirmed by reading
- *         cores/gemmini/include/gemmini.h's tiled_conv pool loop): pool
- *         quantizes each position individually THEN takes the max over
- *         already-quantized int8 values — since our per-position
- *         quantize is now exact (not just "close"), the max over them is
- *         exact too (max of exact values is exact; no rounding is done a
- *         second time after the max).
+ *         = input[c,h,w] in the accumulator, and then the mvout pool
+ *         unit takes a max over each KH×KW window with stride SH==SW
+ *         while writing to DRAM.
  *
  *         Why depthwise rather than the full tiled_conv_auto: a full
  *         passthrough conv would need a C×C identity weight tensor,
@@ -79,12 +50,9 @@
  *              boundary, which we guard against by falling back.)
  *           - tensor fits the static workspace.
  *
- *         All shapes we care about (LeNet, dronet, yolov8 SPPF-adjacent)
- *         use square windows with PH==0, so they take the gemmini path.
- *         Asymmetric/padded maxpools fall back to scalar (exact either
- *         way — the fallback below is the same direct sliding-window max
- *         the RVV/scalar `direct` algorithm uses, just inlined here so
- *         this file is a complete drop-in replacement).
+ *         All shapes we care about (LeNet, dronet, yolov8 SPPF) use
+ *         square windows with PH==0, so they take the gemmini path.
+ *         Asymmetric/padded maxpools fall back to scalar.
  */
 
 #include <stdint.h>
@@ -108,9 +76,7 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
     enum { MAXPOOL_MAX_CHANNELS = 1024 };
     static elem_t ws_input  [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
     static elem_t ws_output [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
-    /* Per-channel passthrough weights: +2 for every channel (see the FIX
-     * note above -- +1 would silently halve every value through
-     * ACC_SCALE_IDENTITY), init once. */
+    /* Per-channel passthrough weights: +1 for every channel, init once. */
     static elem_t ws_weights[MAXPOOL_MAX_CHANNELS] __attribute__((aligned(64)));
     static int    ws_weights_inited = 0;
 
@@ -154,7 +120,7 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
 
     if (!ws_weights_inited) {
         for (int i = 0; i < MAXPOOL_MAX_CHANNELS; i++) {
-            ws_weights[i] = 2;
+            ws_weights[i] = 1;
         }
         ws_weights_inited = 1;
     }

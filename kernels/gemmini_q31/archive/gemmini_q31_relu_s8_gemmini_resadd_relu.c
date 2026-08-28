@@ -1,7 +1,28 @@
 /* source: curated */
 /* algorithm: gemmini_resadd_relu */
-/* accuracy_class: bit_exact */
-/* origin: relu(int8) via gemmini's tiled_resadd_auto with B=zeros and
+/* accuracy_class: numeric_drift */
+/* ARCHIVED 2026-08-28: this kernel declared accuracy_class=bit_exact but
+ * is NOT bit-exact — isolation-tested on dronet (this kernel alone as the
+ * only curated swap, every other op forced to scalar reference_impl):
+ * max_abs_err=17 (experiments/kernel_opt_log.jsonl id 1100). Same root
+ * cause as the maxpool2d_s8/gemmini_tiled_conv_pool kernel archived
+ * alongside this file: the C_scale=ACC_SCALE_IDENTITY "no rescale"
+ * passthrough this kernel relies on (tiled_resadd_auto's A*1 + 0*0, then
+ * mvout-relu) goes through the SAME fixed-point ACC_SCALE round unit
+ * conv2d_s8's HW path uses, which is not a true identity for this
+ * Q31Ws32x32Acc config — so relu(A[i]) picks up ~1 LSB of noise per
+ * element even though a max()-with-0 threshold has nothing to round.
+ * dronet's one relu_s8 call feeds 2048 elements straight into linear1/
+ * linear2 (M=1,K=2048,N=1 dot products), so per-element noise on many of
+ * those inputs is exactly the kind of thing that shows up amplified at
+ * the output. Relocated to archive/ (not deleted) so ModelBlaster's flat
+ * curated-kernel lookup never selects it; kernels/gemmini_q31/ and
+ * kernels/gemmini_q31_rvv/ both use the RVV/scalar `direct` threshold
+ * kernel instead, which is exact (max(0,x) has no rounding to get
+ * wrong) and also faster (kernel_opt_log id 801: 543 cycles vs this
+ * kernel's 10,414).
+ *
+ * origin: relu(int8) via gemmini's tiled_resadd_auto with B=zeros and
  *         relu=true. Computes:
  *           C[i] = sat_int8(max(0, A[i]*1 + 0*0) * 1)
  *                = sat_int8(max(0, A[i]))
