@@ -278,17 +278,49 @@ GEMMINI = Backend(
 #      (or set MODELBLASTER_GEMMINI_LIB_DIR to a dir that has libgemmini.so.q31
 #      renamed to libgemmini.so).
 #   3. TARGET=gemmini_q31 modelblaster/examples/<m>/run.sh ...
+#
+# SPLIT (2026-08-28, correctness campaign): this used to be ONE Backend
+# that quietly turned into a fused Gemmini+Saturn(RVV) target the moment
+# `v` was added to kernel_cflags — every "gemmini_q31" number on record
+# up to that point (5.222x, 3,411,130 cycles, 155x-off-baseline) was
+# really "Gemmini+RVV vs RVV", not a statement about Gemmini alone. It is
+# now two backends:
+#   - GEMMINI_Q31      — PURE Gemmini. rv64imafdc, no `v`. Gemmini kernels
+#                        only for the ops Gemmini actually covers
+#                        correctly (conv2d_s8, add_s8, linear_s8); every
+#                        other op is scalar reference. This is the honest
+#                        "what does Gemmini alone do" measurement,
+#                        coverage gap included.
+#   - GEMMINI_Q31_RVV  — the fused target. Same Gemmini kernels for
+#                        conv2d_s8/add_s8/linear_s8 PLUS `v` + the RVV
+#                        kernels for the ops Gemmini doesn't (efficiently)
+#                        cover. All the previously-reported wins live
+#                        here now, correctly labeled.
+# Both targets pick ONLY bit-exact algorithms for conv2d_s8/maxpool2d_s8/
+# relu_s8 — see kernels/gemmini_q31/archive/ for the two kernels
+# (gemmini_tiled_conv_pool, gemmini_resadd_relu) that turned out to
+# declare accuracy_class=bit_exact and are not (experiments/
+# kernel_opt_log.jsonl ids 1100-1108).
 GEMMINI_Q31 = Backend(
     name="gemmini_q31",
     description=(
-        "Same as gemmini but for the Q0.31 acc_scale bitstream variant: "
-        "tiled_conv_auto's mvout requantize is bit-exact integer instead "
-        "of f32. Used after chipyard rebuilds with Q31GemminiRocketConfig."
+        "PURE Gemmini on the Q0.31 acc_scale bitstream variant: no `v`, "
+        "no RVV fallback kernels. Gemmini kernels for conv2d_s8 "
+        "(gemmini_im2col_full_C — bit-exact; gemmini_tiled_conv is NOT "
+        "offered here, see its header), add_s8 and linear_s8; every "
+        "other op (batchnorm2d_s8, maxpool2d_s8, relu_s8, sigmoid_s8) is "
+        "scalar reference_impl. Used after chipyard rebuilds with "
+        "Q31GemminiRocketConfig. For the fused Gemmini+RVV target, see "
+        "GEMMINI_Q31_RVV below."
     ),
     kernel_cflags=GEMMINI.kernel_cflags + (
         # Tells gemmini_conv2d_s8_gemmini_tiled_conv.c to fold (mult, shift)
         # into a single Q0.31 scale instead of computing a float scale via
         # ldexpf. Required when acc_scale_t is int32 (Q31 gemmini config).
+        # (gemmini_tiled_conv isn't actually selected by this target's
+        # curated dir any more — see its header for why — but the define
+        # is harmless to carry and keeps the TU consistent if it's ever
+        # re-offered.)
         "-DMODELBLASTER_GEMMINI_Q31_ACC_SCALE=1",
     ),
     kernel_includes=GEMMINI.kernel_includes,
@@ -296,16 +328,77 @@ GEMMINI_Q31 = Backend(
     spike_args=GEMMINI.spike_args,
     optimization_guide=GEMMINI.optimization_guide,
     verify_method=GEMMINI.verify_method,
-    # Q0.31 fold introduces ≤1 LSB drift per layer (one rounded multiply
-    # vs the two-stage TFLite formula). dronet (~30 layers) stays well
-    # inside atol; yolov8 (~200 layers) accumulates to ~80 LSB. Bumping
-    # to atol=128 lets gemmini_tiled_conv (HW im2col + GEMM in one call)
-    # win verify on yolov8 too instead of falling back to the slower
-    # gemmini_im2col_full_C (CPU im2col + scalar Q0.31). The drift is a
-    # known-bounded mode (single-stage vs two-stage Q0.31 fold), not a
-    # kernel bug; downstream model accuracy on int8 detection is robust
-    # to it.
-    atol_override=128.0,
+    # Both conv2d_s8 (gemmini_im2col_full_C) and add_s8/linear_s8
+    # (gemmini_resadd / gemmini_tiled_matmul, both verified bit-exact in
+    # isolation, kernel_opt_log id 1102/1103) are now exact, and every
+    # other op is scalar reference (exact by construction). Tight atol —
+    # this target should verify at max_abs_err=0.
+    atol_override=1.0,
+    rtol_override=0.0,
+)
+
+
+# Fused Gemmini+Saturn(RVV) target: same acc_scale_t=int32 Q0.31 bitstream
+# as GEMMINI_Q31, but with `v` added so ops Gemmini doesn't (efficiently)
+# cover fall back to the proven RVV kernels instead of scalar. This is
+# where every previously-reported "gemmini_q31" speed number now lives —
+# see the SPLIT note above GEMMINI_Q31 for why it moved.
+#
+# kernel_cflags: unlike GEMMINI, this is NOT rv64imafdc — see exp
+# 310/312 (kernel_opt_log.jsonl). Every op with no Gemmini kernel
+# (batchnorm2d_s8, and — by triage — maxpool2d_s8/relu_s8/linear_s8,
+# which measure SLOWER on Gemmini than on RVV) was silently falling
+# back to SCALAR, not RVV, because GEMMINI.kernel_cflags carries no
+# `v`. exp 310 proved hart 1 (where main.c pins execution once
+# CONFIG_RISCV_ISA_EXT_V is defined — see harness/src/main.c) still
+# has a working Gemmini RoCC port on the SatGemDualSmall bitstream,
+# so adding `v` does not strand the accelerator. `<repo_root>` is
+# substituted the same way as GEMMINI's isystem paths.
+GEMMINI_Q31_RVV = Backend(
+    name="gemmini_q31_rvv",
+    description=(
+        "Fused Gemmini+Saturn(RVV) on the Q0.31 acc_scale bitstream: "
+        "Gemmini kernels for conv2d_s8/add_s8, RVV kernels (kernels/rvv/"
+        "*_direct.c, unmodified) for batchnorm2d_s8/maxpool2d_s8/"
+        "relu_s8/linear_s8. All of it verified bit-exact (kernel_opt_log "
+        "id 1105+); this is the fast headline configuration."
+    ),
+    kernel_cflags=tuple(
+        "-march=rv64imafdcv" if f == "-march=rv64imafdc" else f
+        for f in GEMMINI.kernel_cflags
+    ) + (
+        "-DMODELBLASTER_GEMMINI_Q31_ACC_SCALE=1",
+    ),
+    # + riscv_vector.h so the RVV fallback kernels (batchnorm2d_s8,
+    # maxpool2d_s8, relu_s8, linear_s8 — kernels/gemmini_q31_rvv/)
+    # compile alongside gemmini.h's RoCC macros in the same kernels.c TU.
+    kernel_includes=GEMMINI.kernel_includes + ("<riscv_vector.h>",),
+    # gemmini_q31.conf carries the rvv.conf V stanza (EAGER context
+    # switch + CONFIG_RISCV_V_KERNEL_ONLY) on top of GEMMINI's overlay.
+    # NOTE (same caveat as GEMMINI.prj_conf_overlay elsewhere in this
+    # file): this field is not read by examples/_run_lib.sh's firesim
+    # path today — that path selects harness/backends/
+    # firesim_chipyard_dual_gemmini_q31.conf directly by GEN_TARGET name
+    # (dual_gemmini.conf's SMP/UART stanza + this same V stanza). Kept
+    # here for documentation / future wiring.
+    prj_conf_overlay="gemmini_q31.conf",
+    # `v` added to the isa string so RUNNER=spike / curated_verify's
+    # nested spike-harness builds can decode the RVV fallback kernels'
+    # intrinsics alongside --extension=gemmini's RoCC decode. Spike
+    # itself is single-hart-with-everything (unlike the FPGA's hart-0
+    # lacks V / hart-1 has V split), so this combination is expected to
+    # "just work", but as of this change it had not been separately
+    # regression-tested against a V-containing curated kernel — only
+    # against the FPGA hardware run (see kernel_opt_log.jsonl id 800+).
+    spike_args=("--extension=gemmini", "--isa=rv64gcv_zicntr"),
+    optimization_guide=GEMMINI.optimization_guide,
+    verify_method=GEMMINI.verify_method,
+    # conv2d_s8 now uses gemmini_im2col_full_C (RVV-vectorized, exact)
+    # instead of the drifting gemmini_tiled_conv — see kernels/
+    # gemmini_q31_rvv/gemmini_q31_rvv_conv2d_s8_gemmini_im2col_full_C.c.
+    # Every op in this target's curated set (kernels/gemmini_q31_rvv/)
+    # is bit-exact; tight atol.
+    atol_override=1.0,
     rtol_override=0.0,
 )
 
@@ -341,6 +434,7 @@ BACKENDS: dict[str, Backend] = {
     RVV_OPU.name: RVV_OPU,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,
+    GEMMINI_Q31_RVV.name: GEMMINI_Q31_RVV,
 }
 
 

@@ -12,6 +12,36 @@
  *         Q0.31 PyTorch golden (max_abs_err=0 validated on Saturn FireSim
  *         May 2026).  Handles non-square kernels, any stride/padding, and
  *         large output_shift values (int64 requantize, no UB). */
+/* perf: requantize writes straight into `output` (NCHW) instead of an
+ * intermediate ws_output (NHWC) workspace that a separate full-tensor
+ * NHWC->NCHW transpose pass then had to undo. That transpose pass had no
+ * reuse to amortize (every output element is produced exactly once,
+ * unlike the input transpose which is read KH*KW times per pixel), so it
+ * was a pure extra traversal of N*OH*OW*OC elements. Removing it trades a
+ * contiguous (NHWC) store + a later strided-read/contiguous-write pass
+ * for a single strided (NCHW, stride OH*OW per oc) store done inline in
+ * the existing requantize loop -- net one fewer full-tensor pass. ws_output
+ * is gone entirely.
+ *
+ * HARDWARE-MEASURED (kernel_opt_log.jsonl id 1200, dronet, FPGA
+ * f2_dual_small_norose_tacit_q31_60mhz, provenance-verified, max_abs_err=0
+ * before and after): conv2d_s8 aggregate 11,598,513 -> 9,889,329 cycles
+ * (-14.73%), model end-to-end 20,933,650 -> 19,213,428 cycles (-8.22%).
+ * Every one of the 10 conv2d_s8 layers moved -8.8% to -16.1%; control ops
+ * (maxpool/batchnorm/add/relu/sigmoid, untouched source) moved -0.05% to
+ * +0.28%, confirming isolation. Two follow-on ideas were tried and
+ * HARDWARE-REFUTED, not adopted: (a) batching multiple DIM=16-row CPU
+ * tiles into one larger tiled_matmul_auto() call (up to ROWS_PER_TILE=320
+ * rows) to amortize gemmini_flush(0)/CONFIG_EX/CONFIG_ST/CONFIG_LD reissue
+ * across fewer calls -- net +0.33% end-to-end (conv2d_s8 +0.58%): the
+ * saved reissue overhead was more than offset by wasted zero-padded mesh
+ * rows on layers much smaller than the batch size. (b) replacing the
+ * per-row div/mod decomposition of (n,oh,ow) from out_idx with an
+ * incremental wrap-counter (one div/mod per tile instead of per row) --
+ * a consistent small REGRESSION on spike (conv_modules.0 +2.0%), not
+ * pursued to FPGA. Both indicate the per-tile RoCC ceremony and the
+ * scalar index arithmetic are NOT where this kernel's cycles go; the
+ * im2col gather/copy and the GEMM/DMA transfer dominate instead. */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -22,9 +52,10 @@
  * Static workspace limits.  512 KB covers all square conv layers in
  * dronet and yolov8_nano:
  *   WS_BYTES:     max input  = IC=3,IH=160,IW=160 →  75 KB (yolov8 l0)
- *                 max output = IC=16,OH=80,OW=80  → 100 KB (yolov8 l0)
- *                 (ws_weight is gone — weight is pre-packed HWIO at
- *                  codegen time and passed straight to tiled_matmul_auto)
+ *                 (ws_output is gone — requantize now stores straight into
+ *                  the caller's NCHW `output` buffer; ws_weight is gone
+ *                  too — weight is pre-packed HWIO at codegen time and
+ *                  passed straight to tiled_matmul_auto)
  *   IM2COL_ELEMS: max K_inner = IC=256,K=3×3     → 2304 (yolov8 detect head)
  *   ACC_ELEMS:    max OC      = 256               (yolov8 l7/l8/l9)
  */
@@ -46,7 +77,6 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
      * pre-packs weights to flat HWIO at codegen time, so we pass
      * `weight` straight into tiled_matmul_auto below. */
     static elem_t ws_input  [WS_BYTES]     __attribute__((aligned(64)));
-    static elem_t ws_output [WS_BYTES]     __attribute__((aligned(64)));
     static elem_t ws_im2col [IM2COL_ELEMS] __attribute__((aligned(64)));
     static acc_t  ws_acc_out[ACC_ELEMS]    __attribute__((aligned(64)));
 
@@ -203,6 +233,13 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             int ow_idx  = out_idx % OW;
             int oh_idx  = (out_idx / OW) % OH;
             int n_idx   = out_idx / (OH * OW);
+            /* NCHW base for (n_idx, ., oh_idx, ow_idx); stride between
+             * consecutive oc is (size_t)OH*OW elements. size_t throughout --
+             * BSS workspaces above 0x80000000 wrap 32-bit index arithmetic
+             * (see sibling_audit.py / the yolov8n int-wrap postmortem). */
+            const size_t out_base =
+                (((size_t)n_idx*OC)*OH + (size_t)oh_idx)*OW + (size_t)ow_idx;
+            const size_t out_oc_stride = (size_t)OH * (size_t)OW;
             for (int oc = 0; oc < OC; oc++) {
                 int32_t acc = ws_acc_out[i * OC + oc];
                 int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
@@ -217,16 +254,8 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 scaled += output_offset;
                 if (scaled < activation_min) scaled = activation_min;
                 if (scaled > activation_max) scaled = activation_max;
-                ws_output[((n_idx*OH + oh_idx)*OW + ow_idx)*OC + oc] = (elem_t)scaled;
+                output[out_base + (size_t)oc * out_oc_stride] = (int8_t)scaled;
             }
         }
     }
-
-    /* Transpose output NHWC → NCHW. */
-    for (int n = 0; n < N; n++)
-        for (int c = 0; c < OC; c++)
-            for (int h = 0; h < OH; h++)
-                for (int w = 0; w < OW; w++)
-                    output[((n*OC + c)*OH + h)*OW + w] =
-                        ws_output[((n*OH + h)*OW + w)*OC + c];
 }

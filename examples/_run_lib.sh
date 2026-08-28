@@ -241,11 +241,25 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     # FIRESIM_CONF env if running a different config.
     if [[ -n "${FIRESIM_CONF:-}" ]]; then
         FS_CONF="${REPO_ROOT}/harness/backends/${FIRESIM_CONF}"
+    elif [[ "${GEN_TARGET}" == "gemmini_q31_rvv" ]]; then
+        # gemmini_q31_rvv (the fused Gemmini+RVV target, split off from
+        # gemmini_q31 2026-08-28 — see pipeline/backends.py's SPLIT note)
+        # carries `v` in kernel_cflags (kernel_opt_log.jsonl exp
+        # 310/312/800+) so ops with no Gemmini kernel fall back to the
+        # proven RVV kernels instead of scalar. That needs Zephyr's V
+        # Kconfig stanza too — this overlay is
+        # firesim_chipyard_dual_gemmini.conf's SMP/UART stanza plus the
+        # same V stanza rvv.conf/gemmini_q31.conf carry, which pins
+        # main() (harness/src/main.c) onto hart 1. Do NOT reuse this for
+        # plain `gemmini` or pure `gemmini_q31` (no `v`, stay on hart 0
+        # below).
+        FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard_dual_gemmini_q31.conf"
     elif [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" ]]; then
-        # Both float-scale (gemmini) and Q0.31 (gemmini_q31) variants ride
-        # the same dual-rocket-saturn-gemmini SoC topology, so the same
-        # Zephyr SMP overlay applies. The runtime bitstream is selected
-        # via config_runtime.yaml::default_hw_config.
+        # Float-scale (gemmini) and PURE Q0.31 (gemmini_q31, no `v`)
+        # variants both ride the same dual-rocket-saturn-gemmini SoC
+        # topology with no vector Kconfig needed, so the same Zephyr SMP
+        # overlay applies. The runtime bitstream is selected via
+        # config_runtime.yaml::default_hw_config.
         FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard_dual_gemmini.conf"
     else
         FS_CONF="${REPO_ROOT}/harness/backends/firesim_chipyard.conf"
@@ -260,6 +274,16 @@ west build -p -b "${BOARD_TARGET}" harness \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 _mb_stage_end build
 
+# STOP_AFTER=build: emit the guest ELF and stop. Lets an external scheduler
+# (deploy/fpga_queue) own the FPGA run instead of MB driving its own FireSim
+# flow -- which otherwise targets whatever run farm the tree's config_runtime
+# points at (for chipyard-fsim that is a LOCAL U250, not AWS F2).
+if [[ "${STOP_AFTER:-}" == "build" ]]; then
+    echo "[4/5] STOP_AFTER=build -> stopping before the run stage"
+    echo "ELF: ${BUILD_DIR}/zephyr/zephyr.elf"
+    ls -l "${BUILD_DIR}/zephyr/zephyr.elf" 2>/dev/null || echo "WARNING: elf not found"
+    exit 0
+fi
 echo "[5/5] ${RUNNER} + compare"
 _mb_stage_begin run
 
@@ -312,7 +336,7 @@ print(' '.join(b.spike_args))
     # Gemmini backend needs the chipyard spike (has --extension=gemmini support
     # + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE env if set, else chipyard path.
     SPIKE_BIN_FLAGS=()
-    if [[ "${GEN_TARGET}" == "gemmini" ]]; then
+    if [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" || "${GEN_TARGET}" == "gemmini_q31_rvv" ]]; then
         _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
         _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then

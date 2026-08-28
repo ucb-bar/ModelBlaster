@@ -488,6 +488,46 @@ def _requantize_int(acc: np.ndarray, multiplier: int, shift: int) -> np.ndarray:
         return prod.astype(np.int32) << (-shift)
 
 
+def _sim_conv2d_int32_acc(in_4d: np.ndarray, w_q: np.ndarray, b_q: np.ndarray,
+                          sh: dict, input_offset: int, filter_offset: int
+                          ) -> np.ndarray:
+    """Direct sliding-window int32 conv accumulate — the pre-requantize
+    stage shared by the conv2d_s8/conv2d_s8_pc and conv2d_silu_s8 IR
+    simulator branches (extract_int8's numpy golden). Slow but bit-exact
+    against kernel_conv2d_s8 / kernel_conv2d_silu_s8's own accumulate loop
+    (both reference C impls, and every algorithm candidate, use the same
+    acc = bias + sum((in + input_offset) * (w + filter_offset)) order).
+    """
+    OH, OW = sh["OH"], sh["OW"]
+    KH, KW = sh["KH"], sh["KW"]
+    SH, SW = sh["SH"], sh["SW"]
+    PH, PW = sh["PH"], sh["PW"]
+    out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
+    for n in range(sh["N"]):
+        for oc in range(sh["OC"]):
+            out[n, oc] = b_q[oc]
+            for ic in range(sh["IC"]):
+                for kh in range(KH):
+                    for kw in range(KW):
+                        ih_start = -PH + kh
+                        iw_start = -PW + kw
+                        for oh in range(OH):
+                            ih = oh * SH + ih_start
+                            if ih < 0 or ih >= sh["IH"]:
+                                in_row = np.full(OW, input_offset, dtype=np.int32)
+                            else:
+                                in_row = np.zeros(OW, dtype=np.int32)
+                                for ow in range(OW):
+                                    iw = ow * SW + iw_start
+                                    if iw < 0 or iw >= sh["IW"]:
+                                        in_row[ow] = input_offset
+                                    else:
+                                        in_row[ow] = in_4d[n, ic, ih, iw] + input_offset
+                            w_v = w_q[oc, ic, kh, kw] + filter_offset
+                            out[n, oc, oh] += in_row * w_v
+    return out
+
+
 def _requantize_multiplier_shift(real_mult: float) -> tuple[int, int]:
     """Decompose `real_mult` (typically < 1) into (Q0.31 multiplier, shift).
 
@@ -649,6 +689,85 @@ def _apply_per_channel(ops, tensors_meta, weights_blob, fp32_stash, scales,
         q["output_shift_per_oc_key"] = sk
 
 
+def _get_submodule(root: torch.nn.Module, qualname: str) -> torch.nn.Module:
+    obj = root
+    for p in qualname.split("."):
+        obj = getattr(obj, p)
+    return obj
+
+
+def _set_submodule(root: torch.nn.Module, qualname: str, module: torch.nn.Module) -> None:
+    *path, last = qualname.split(".")
+    obj = root
+    for p in path:
+        obj = getattr(obj, p)
+    setattr(obj, last, module)
+
+
+def _fold_conv_bn(gm: "torch.fx.GraphModule") -> list[str]:
+    """Graph-level BatchNorm folding: absorb a BatchNorm2d directly
+    consuming a Conv2d's output into that conv's weight and bias, in
+    float, BEFORE any quantization happens. Mirrors the canonical
+    ``torch.nn.utils.fusion.fuse_conv_bn_eval`` (same math the batchnorm2d_s8
+    emitter already used to compute its fp32 scale/bias — this just moves
+    it upstream of quantization instead of leaving BN as its own op).
+
+    Removing the op is worth doing for every backend: it's a real N×C×H×W
+    pass eliminated, and on Gemmini batchnorm2d_s8 can't even be made
+    exact (its bias has to land after the multiply; Gemmini's accumulator
+    only supports bias before the single mvout scale, so reconciling needs
+    a second independent rounding on the bias term — the double-rounding
+    failure already proven fatal for conv2d_s8, just relocated).
+
+    Only folds the exact pattern where it is provably lossless:
+      * the BN node's sole input is a call_module Conv2d node, AND
+      * that conv's output has no OTHER consumer (folding would silently
+        change the un-normalized value seen by any other reader), AND
+      * the BN is in inference mode with real running stats.
+    This deliberately does NOT chase BN-before-conv (pre-activation)
+    patterns, or fold across an intervening activation — folding across a
+    nonlinearity changes the numerics, not just relocates them. DroNet's
+    residual blocks are ``BN -> ReLU -> Conv``, so only the *second* BN in
+    each block (which sits directly after a conv, no activation between)
+    matches; the first (whose producer is a maxpool/add, and whose output
+    feeds a ReLU before the next conv) is correctly left as a standalone
+    batchnorm2d_s8 op.
+    """
+    import torch.nn.utils.fusion as _fusion
+
+    folded: list[str] = []
+    for node in list(gm.graph.nodes):
+        if node.op != "call_module":
+            continue
+        bn_mod = _get_submodule(gm, node.target)
+        if not isinstance(bn_mod, torch.nn.BatchNorm2d):
+            continue
+        if bn_mod.running_mean is None or bn_mod.running_var is None:
+            continue  # track_running_stats=False: no fixed affine to fold
+        if len(node.args) != 1 or not isinstance(node.args[0], torch.fx.Node):
+            continue
+        prod = node.args[0]
+        if prod.op != "call_module":
+            continue
+        conv_mod = _get_submodule(gm, prod.target)
+        if not isinstance(conv_mod, torch.nn.Conv2d):
+            continue
+        if len(prod.users) != 1:
+            # conv output feeds something besides this BN (e.g. a residual
+            # branch) — folding would change what that other reader sees.
+            continue
+        fused_conv = _fusion.fuse_conv_bn_eval(conv_mod, bn_mod)
+        _set_submodule(gm, prod.target, fused_conv)
+        node.replace_all_uses_with(prod)
+        gm.graph.erase_node(node)
+        folded.append(node.name)
+
+    if folded:
+        gm.graph.lint()
+        gm.recompile()
+    return folded
+
+
 def extract_int8(
     model: torch.nn.Module,
     sample_input: "torch.Tensor | list[torch.Tensor] | tuple",
@@ -658,6 +777,7 @@ def extract_int8(
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
     per_channel: bool = False,
+    enable_fusion: bool = False,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -674,6 +794,16 @@ def extract_int8(
         `activation_min = 0` (the relu becomes a clamp inside the requantize
         tail). Standalone relu nodes get an explicit `relu_s8` op.
 
+    `enable_fusion` (default False) is the opt-in switch for *extended*
+    fusion beyond that always-on relu absorption + graph-level bn->conv
+    folding. Today it gates one pattern: conv2d -> silu absorption into a
+    single `conv2d_silu_s8` op (mirrors the always-on conv2d -> relu
+    absorption, but SiLU needs its own op+kernel since it isn't a plain
+    clamp). With the flag off, a conv2d immediately followed by nn.SiLU
+    still emits as two ops (conv2d_s8 + silu_s8, byte-identical to the
+    pre-flag behavior) — both configurations stay reachable so the two can
+    be measured against each other.
+
     Supported ops in this first cut: nn.Linear, nn.ReLU, torch.relu.
     Any other op kind raises — extend this function as more ops gain int8
     kernels.
@@ -689,6 +819,10 @@ def extract_int8(
         sample_inputs = [sample_input]
 
     gm = torch.fx.symbolic_trace(model)
+    # Graph-level BN folding, BEFORE ShapeProp/calibration/quantization —
+    # a folded model has no batchnorm2d nodes at all, so everything
+    # downstream (activation calibration, op emission) just never sees them.
+    folded_bn_names = _fold_conv_bn(gm)
     ShapeProp(gm).propagate(*sample_inputs)
 
     # Capture every node's tensor for activation calibration.
@@ -794,6 +928,20 @@ def extract_int8(
     # emitted as a new op_kind 'conv2d_silu_s8' so the kernel picker
     # can offer a specialized fused variant.
     fused_conv2d_silu: set[str] = set()
+    # conv→maxpool fuse (extended fusion, gated by enable_fusion like
+    # conv2d_silu). Absorbs a MaxPool2d that is a Conv2d's SOLE consumer
+    # (and the Conv2d's ONLY node in between is nothing — i.e. the conv
+    # feeds the pool directly with no intervening op) into one
+    # `conv2d_pool_s8` op. Unlike SiLU, max-pool never rescales (scale_in
+    # == scale_out) and commutes with the conv's own round+clamp (both
+    # monotonic non-decreasing), so this is exact given the underlying
+    # conv computation is exact — see CONV2D_POOL_S8's docstring in
+    # reference_kernels.py. Deliberately does NOT reach through an
+    # intervening (already-folded) ReLU — dronet's actual conv->maxpool
+    # site has zero intervening ops, so the simple adjacent-node check
+    # below covers it; extending to "conv -(folded relu)-> maxpool"
+    # chains is a documented follow-up, not attempted here.
+    fused_conv2d_pool: set[str] = set()
     for i, node in enumerate(nodes):
         if i + 1 >= len(nodes):
             continue
@@ -810,6 +958,23 @@ def extract_int8(
             or (nxt.op == "call_function" and nxt.target in (
                 torch.nn.functional.silu,))
         )
+        # conv2d -> maxpool2d: separate check (independent gate, only
+        # Conv2d producers considered) so it doesn't disturb the
+        # relu/silu detection below at all. Handled and `continue`d here
+        # rather than folded into the combined is_next_relu/is_next_silu
+        # branch, since a MaxPool2d producer-type restriction (Conv2d
+        # only) doesn't fit that branch's Linear/Conv2d/BatchNorm2d
+        # dispatch cleanly.
+        is_next_maxpool = (
+            nxt.op == "call_module"
+            and isinstance(gm.get_submodule(nxt.target), torch.nn.MaxPool2d)
+        )
+        if (enable_fusion and is_next_maxpool
+                and len(nxt.args) == 1 and nxt.args[0] is node
+                and node.op == "call_module"
+                and isinstance(gm.get_submodule(node.target), torch.nn.Conv2d)):
+            fused_conv2d_pool.add(nxt.name)
+            continue
         if not ((is_next_relu or is_next_silu)
                 and len(nxt.args) == 1 and nxt.args[0] is node):
             continue
@@ -819,7 +984,14 @@ def extract_int8(
                 # Only Conv2d→SiLU is currently considered for absorption
                 # (yolov8 backbone pattern). Other (BN→SiLU, etc.) fall
                 # through without modifying the relu-fold sets.
-                if isinstance(producer_mod, torch.nn.Conv2d):
+                # Gated on enable_fusion (unlike the relu absorptions
+                # below, which are always on): SiLU is not a plain clamp,
+                # so absorbing it needs its own op+kernel
+                # (conv2d_silu_s8) rather than reusing conv2d_s8's
+                # activation_min/max fields, and it's new/unproven end to
+                # end. Off by default keeps the pre-existing two-op
+                # (conv2d_s8 + silu_s8) behavior reachable for comparison.
+                if enable_fusion and isinstance(producer_mod, torch.nn.Conv2d):
                     fused_conv2d_silu.add(nxt.name)
             elif isinstance(producer_mod, torch.nn.Linear):
                 fused_linear_relu.add(nxt.name)
@@ -968,15 +1140,25 @@ def extract_int8(
                 next_node = nodes[nodes.index(node) + 1] if nodes.index(node) + 1 < len(nodes) else None
                 fuse_relu = (next_node is not None
                              and next_node.name in fused_relu_after)
-                # NOTE: Conv→SiLU fusion is DETECTED above (fused_conv2d_silu)
-                # and the KernelSpec CONV2D_SILU_S8 is registered, but the IR
-                # emit below keeps the conv as standalone conv2d_s8 because
-                # threading the fused output name through the activation
-                # calibration cache (line ~1272: activations[in_name]) needs
-                # more invasive surgery (we'd have to re-key intermediate
-                # tensors that named the BN/SiLU output, which dronet and
-                # other models still consume). Left as a follow-up — until
-                # then conv2d_silu_s8 is wire-ready but unused in production.
+                # Conv→SiLU: only considered when fused_conv2d_silu is
+                # non-empty for this site, which itself only happens when
+                # enable_fusion was passed (see the two-pass scan above).
+                # Emits the KernelSpec CONV2D_SILU_S8 op instead of a
+                # standalone conv2d_s8, and the SiLU branch below skips its
+                # own emission (output aliased to the SiLU node's name,
+                # same pattern as the always-on relu absorption).
+                fuse_silu = (next_node is not None
+                             and next_node.name in fused_conv2d_silu)
+                # Conv→MaxPool: same alias pattern as the relu absorption
+                # (fused_conv2d_pool is only populated when enable_fusion
+                # was passed — see the two-pass scan above). Unlike SiLU,
+                # pool never rescales, so no new quant scale is needed —
+                # activation_min/max still bound the PRE-pool intermediate
+                # exactly as they would for a standalone conv2d_s8 (pool
+                # then selects the max of already-clamped values, which
+                # commutes with the clamp).
+                fuse_pool = (next_node is not None
+                             and next_node.name in fused_conv2d_pool)
                 act_min = 0 if fuse_relu else -128
                 act_max = 127
                 in_shape = tensors_meta[in_name]["shape"]
@@ -986,36 +1168,101 @@ def extract_int8(
                 KH, KW = _pair(mod.kernel_size)
                 SH, SW = _pair(mod.stride)
                 PH, PW = _pair(mod.padding)
+                quant = {
+                    "input_offset": 0,
+                    "filter_offset": 0,
+                    "output_offset": 0,
+                    "output_multiplier": multiplier,
+                    "output_shift": shift,
+                    "activation_min": act_min,
+                    "activation_max": act_max,
+                }
+                if fuse_silu:
+                    # silu_scale_in is this conv's OWN (intermediate,
+                    # pre-SiLU) scale — the calibrated scale the conv would
+                    # have used as a standalone op (out_scale, above).
+                    # silu_scale_out is the SiLU node's own calibrated
+                    # scale (a real requantize happens in the LUT, unlike
+                    # the relu case where clamping doesn't rescale).
+                    quant["silu_scale_in"] = out_scale
+                    quant["silu_scale_out"] = scales[next_node.name]
+                shape = {
+                    "N": N_, "IC": IC, "IH": IH, "IW": IW,
+                    "OC": OC, "OH": OH, "OW": OW,
+                    "KH": KH, "KW": KW,
+                    "SH": SH, "SW": SW,
+                    "PH": PH, "PW": PW,
+                }
+                op_kind = "conv2d_s8"
+                if fuse_silu:
+                    op_kind = "conv2d_silu_s8"
+                elif fuse_pool:
+                    op_kind = "conv2d_pool_s8"
+                    pool_mod = gm.get_submodule(next_node.target)
+                    pKH, pKW = _pair(pool_mod.kernel_size)
+                    pSH, pSW = _pair(pool_mod.stride)
+                    pPH, pPW = _pair(pool_mod.padding)
+                    pDH, pDW = _pair(pool_mod.dilation)
+                    shape.update({
+                        "pool_KH": pKH, "pool_KW": pKW,
+                        "pool_SH": pSH, "pool_SW": pSW,
+                        "pool_PH": pPH, "pool_PW": pPW,
+                        "pool_DH": pDH, "pool_DW": pDW,
+                    })
                 ops.append({
                     "name": str(node.target),
-                    "op": "conv2d_s8",
+                    "op": op_kind,
                     "inputs": [in_name],
                     "outputs": [
-                        next_node.name if fuse_relu else node.name
+                        next_node.name if (fuse_relu or fuse_silu or fuse_pool)
+                        else node.name
                     ],
                     "weight": w_key,
                     "bias": b_key,
-                    "shape": {
-                        "N": N_, "IC": IC, "IH": IH, "IW": IW,
-                        "OC": OC, "OH": OH, "OW": OW,
-                        "KH": KH, "KW": KW,
-                        "SH": SH, "SW": SW,
-                        "PH": PH, "PW": PW,
-                    },
-                    "quant": {
-                        "input_offset": 0,
-                        "filter_offset": 0,
-                        "output_offset": 0,
-                        "output_multiplier": multiplier,
-                        "output_shift": shift,
-                        "activation_min": act_min,
-                        "activation_max": act_max,
-                    },
+                    "shape": shape,
+                    "quant": quant,
                 })
                 if fuse_relu and next_node.name not in tensors_meta:
+                    # Relu alias: shape is UNCHANGED by relu, so copying the
+                    # conv's whole tensors_meta entry (shape + scale) is
+                    # exact.
                     tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                elif fuse_pool and next_node.name not in tensors_meta:
+                    # Pool alias: UNLIKE relu, pool changes shape (that's
+                    # the whole point) — must NOT blindly copy the conv's
+                    # tensors_meta (its shape is the PRE-pool [OH,OW], not
+                    # the pool's own [OHp,OWp]). _record() pulls the
+                    # correct shape from cap.tensors (ShapeProp already
+                    # ran maxpool2d's real forward() on the float graph,
+                    # so the pool node's true output shape is there);
+                    # the scale is fixed up to the conv's out_scale right
+                    # below (no rescale happens in a pool, same as the
+                    # standalone maxpool2d_s8 emitter's own
+                    # `scales[node.name] = scales[in_name]` line).
+                    _record(next_node.name, dtype="i8")
+                elif fuse_silu and next_node.name not in tensors_meta:
+                    # Unlike the relu alias above, SiLU's output genuinely
+                    # requantizes to its own (already-calibrated) scale —
+                    # record it properly rather than copying the conv's.
+                    _record(next_node.name, dtype="i8")
+                if fuse_pool:
+                    # No rescale happens in a pool -- force the pooled
+                    # tensor's scale to match the conv's out_scale exactly
+                    # (mirrors the standalone maxpool2d_s8 emitter's own
+                    # `scales[node.name] = scales[in_name]` +
+                    # `tensors_meta[node.name]["quant"]["scale"] =
+                    # scales[in_name]` pair). _record() above seeded
+                    # tensors_meta[next_node.name]["quant"]["scale"] from
+                    # the pool's OWN independently-calibrated scale, which
+                    # should be numerically close but isn't guaranteed
+                    # identical -- both must agree with what the C kernel
+                    # (which does zero rescaling) actually produces.
+                    scales[next_node.name] = out_scale
+                    tensors_meta[next_node.name]["quant"]["scale"] = out_scale
 
             elif isinstance(mod, torch.nn.MaxPool2d):
+                if node.name in fused_conv2d_pool:
+                    continue  # absorbed into the producer's conv2d_pool_s8
                 _record(node.name, dtype="i8")
                 in_shape = tensors_meta[in_name]["shape"]
                 out_shape = tensors_meta[node.name]["shape"]
@@ -1131,10 +1378,8 @@ def extract_int8(
                 })
 
             elif isinstance(mod, torch.nn.SiLU):
-                # Fusion detection runs above (fused_conv2d_silu) and the
-                # CONV2D_SILU_S8 spec is registered for future use; for now
-                # we still emit the standalone silu_s8 dispatch (see comment
-                # at the conv2d emit site).
+                if node.name in fused_conv2d_silu:
+                    continue  # absorbed into the producing conv2d_silu_s8
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[in_name]["shape"]))
                 ops.append({
@@ -1597,36 +1842,8 @@ def extract_int8(
             b_q = weights_blob[op["bias"]].astype(np.int32)    # [OC]
             in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
             # Compute via direct sliding window (slow but correct simulator).
-            OH, OW = sh["OH"], sh["OW"]
-            KH, KW = sh["KH"], sh["KW"]
-            SH, SW = sh["SH"], sh["SW"]
-            PH, PW = sh["PH"], sh["PW"]
-            out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
-            for n in range(sh["N"]):
-                for oc in range(sh["OC"]):
-                    out[n, oc] = b_q[oc]
-                    for ic in range(sh["IC"]):
-                        for kh in range(KH):
-                            for kw in range(KW):
-                                # Build the input slice for this (kh, kw).
-                                ih_start = -PH + kh
-                                iw_start = -PW + kw
-                                # Compute valid output ranges.
-                                for oh in range(OH):
-                                    ih = oh * SH + ih_start
-                                    if ih < 0 or ih >= sh["IH"]:
-                                        # padded: in_v = input_offset
-                                        in_row = np.full(OW, q["input_offset"], dtype=np.int32)
-                                    else:
-                                        in_row = np.zeros(OW, dtype=np.int32)
-                                        for ow in range(OW):
-                                            iw = ow * SW + iw_start
-                                            if iw < 0 or iw >= sh["IW"]:
-                                                in_row[ow] = q["input_offset"]
-                                            else:
-                                                in_row[ow] = in_4d[n, ic, ih, iw] + q["input_offset"]
-                                    w_v = w_q[oc, ic, kh, kw] + q["filter_offset"]
-                                    out[n, oc, oh] += in_row * w_v
+            out = _sim_conv2d_int32_acc(in_4d, w_q, b_q, sh,
+                                        q["input_offset"], q["filter_offset"])
             if op["op"] == "conv2d_s8_pc":
                 mult = weights_blob[q["output_multiplier_per_oc_key"]]
                 shift = weights_blob[q["output_shift_per_oc_key"]]
@@ -1636,6 +1853,73 @@ def extract_int8(
                 scaled += q["output_offset"]
             scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
             activations[out_name] = scaled.astype(np.int8)
+        elif op["op"] == "conv2d_silu_s8":
+            # Fused conv2d + SiLU (extended fusion, gated by --enable-fusion
+            # in extract_int8). Same accumulate + requantize as conv2d_s8,
+            # but the intermediate is clamped to the PLAIN int8 range
+            # (bias/activation_min/max only bound the final SiLU output,
+            # per CONV2D_SILU_S8's semantics in reference_kernels.py) —
+            # mirrors kernel_conv2d_silu_s8's reference impl exactly,
+            # including reusing the intermediate as the SiLU LUT index.
+            sh = op["shape"]
+            q = op["quant"]
+            w_q = weights_blob[op["weight"]].astype(np.int32)
+            b_q = weights_blob[op["bias"]].astype(np.int32)
+            in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
+            out = _sim_conv2d_int32_acc(in_4d, w_q, b_q, sh,
+                                        q["input_offset"], q["filter_offset"])
+            scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
+            scaled += q["output_offset"]
+            intermediate = np.clip(scaled, -128, 127).astype(np.int8)
+            fv = intermediate.astype(np.float32) * np.float32(q["silu_scale_in"])
+            silu_out = fv / (np.float32(1.0) + np.exp(-fv).astype(np.float32))
+            v = np.round(silu_out.astype(np.float32)
+                         / np.float32(q["silu_scale_out"])).astype(np.int32)
+            v = np.clip(v, q["activation_min"], q["activation_max"])
+            activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "conv2d_pool_s8":
+            # Fused conv2d + maxpool2d (extended fusion, gated by
+            # --enable-fusion). Same accumulate + requantize + clamp as
+            # conv2d_s8 (activation_min/max bound the PRE-pool
+            # intermediate exactly as a standalone conv2d_s8 would), then
+            # the SAME sliding-window max as the standalone maxpool2d_s8
+            # branch below, parameterized by this op's pool_* shape keys.
+            # No second requantize — pool is scale-preserving.
+            sh = op["shape"]
+            q = op["quant"]
+            w_q = weights_blob[op["weight"]].astype(np.int32)
+            b_q = weights_blob[op["bias"]].astype(np.int32)
+            in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
+            out = _sim_conv2d_int32_acc(in_4d, w_q, b_q, sh,
+                                        q["input_offset"], q["filter_offset"])
+            scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
+            scaled += q["output_offset"]
+            scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
+            conv_out = scaled.astype(np.int8)  # [N, OC, OH, OW]
+            pKH, pKW = sh["pool_KH"], sh["pool_KW"]
+            pSH, pSW = sh["pool_SH"], sh["pool_SW"]
+            pPH, pPW = sh.get("pool_PH", 0), sh.get("pool_PW", 0)
+            pDH, pDW = sh.get("pool_DH", 1), sh.get("pool_DW", 1)
+            OHp = (sh["OH"] + 2*pPH - pDH*(pKH-1) - 1) // pSH + 1
+            OWp = (sh["OW"] + 2*pPW - pDW*(pKW-1) - 1) // pSW + 1
+            if pPH or pPW:
+                pool_in = np.pad(conv_out,
+                                 ((0, 0), (0, 0), (pPH, pPH), (pPW, pPW)),
+                                 mode="constant",
+                                 constant_values=np.iinfo(np.int8).min)
+            else:
+                pool_in = conv_out
+            pooled = np.zeros((sh["N"], sh["OC"], OHp, OWp), dtype=np.int8)
+            for ohp in range(OHp):
+                for owp in range(OWp):
+                    ih0 = ohp * pSH
+                    iw0 = owp * pSW
+                    cells = []
+                    for kh in range(pKH):
+                        for kw in range(pKW):
+                            cells.append(pool_in[:, :, ih0 + kh*pDH, iw0 + kw*pDW])
+                    pooled[:, :, ohp, owp] = np.stack(cells, axis=-1).max(axis=-1)
+            activations[out_name] = pooled
         elif op["op"] == "maxpool2d_s8":
             sh = op["shape"]
             in_4d = in_arr.reshape(sh["N"], sh["C"], sh["IH"], sh["IW"])
@@ -1850,6 +2134,7 @@ def extract_int8(
     passes_log = {
         "schema_version": 1,
         "extractor": "extract_graph",
+        "enable_fusion": enable_fusion,
         "n_fx_nodes": len(nodes),
         "n_ir_ops": len(ir["ops"]),
         "passes": {
@@ -1869,6 +2154,21 @@ def extract_int8(
                 "fired": len(fused_bn_relu),
                 "sites": sorted(fused_bn_relu),
             },
+            "bn_conv_fuse": {
+                "fired": len(folded_bn_names),
+                "sites": sorted(folded_bn_names),
+            },
+            # Gated on --enable-fusion / enable_fusion=True; empty set (and
+            # zero-op-count effect) whenever the flag is off, so this key
+            # is the flag-on/flag-off diff to grep for on this pass.
+            "conv2d_silu_fuse": {
+                "fired": len(fused_conv2d_silu),
+                "sites": sorted(fused_conv2d_silu),
+            },
+            "conv2d_pool_fuse": {
+                "fired": len(fused_conv2d_pool),
+                "sites": sorted(fused_conv2d_pool),
+            },
         },
     }
     with open(passes_path, "w") as f:
@@ -1878,10 +2178,14 @@ def extract_int8(
     print(f"wrote {io_path}  ({len(inputs_q)} input(s): "
           f"{[str(q.dtype) for q in inputs_q]}, output dtype={out_q.dtype})")
     print(f"wrote {passes_path}  ("
+          f"enable_fusion={enable_fusion}, "
           f"linear_relu_fuse={len(fused_linear_relu)}, "
           f"conv2d_relu_fuse={len(fused_conv2d_relu)}, "
           f"add_relu_fuse={len(fused_add_relu)}, "
-          f"bn_relu_fuse={len(fused_bn_relu)})")
+          f"bn_relu_fuse={len(fused_bn_relu)}, "
+          f"bn_conv_fuse={len(folded_bn_names)}, "
+          f"conv2d_silu_fuse={len(fused_conv2d_silu)}, "
+          f"conv2d_pool_fuse={len(fused_conv2d_pool)})")
     return ir
 
 
@@ -1899,6 +2203,7 @@ def extract(
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
     per_channel: bool = False,
+    enable_fusion: bool = False,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -1920,6 +2225,7 @@ def extract(
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names,
             per_channel=per_channel,
+            enable_fusion=enable_fusion,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -3080,6 +3386,25 @@ def main() -> None:
     ap.add_argument("--per-channel", action="store_true",
                     help="per-output-channel int8 weight quant for conv/linear "
                          "(tighter than per-tensor). No-op for fp32 / fp16.")
+    ap.add_argument("--enable-fusion", action="store_true",
+                    default=os.environ.get("MB_ENABLE_FUSION", "0") == "1",
+                    help="opt-in extended operator fusion (beyond the "
+                         "always-on linear/conv2d/add/bn -> relu absorption "
+                         "and graph-level bn->conv folding). Currently "
+                         "gates two patterns: (1) conv2d -> silu absorption "
+                         "into a single conv2d_silu_s8 op (bit-exact vs the "
+                         "unfused conv2d_s8 + silu_s8 pair); (2) conv2d -> "
+                         "maxpool2d absorption into a single conv2d_pool_s8 "
+                         "op when the pool is the conv's SOLE, DIRECT "
+                         "consumer (numeric_drift on gemmini targets, "
+                         "bit-exact elsewhere — see CONV2D_POOL_S8 in "
+                         "reference_kernels.py for the accuracy bound; the "
+                         "fast alternative to gemmini's exact-but-6x-slower "
+                         "separate conv2d_s8 + maxpool2d_s8 pair). Off by "
+                         "default so the unfused path stays available for "
+                         "comparison. Can also be set via "
+                         "MB_ENABLE_FUSION=1. No-op for fp32 / fp16 "
+                         "(int8-only today).")
     args = ap.parse_args()
 
     if args.model == "mlp_generic":
@@ -3169,7 +3494,8 @@ def main() -> None:
             calibration_samples=calibration_samples,
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names,
-            per_channel=getattr(args, "per_channel", False))
+            per_channel=getattr(args, "per_channel", False),
+            enable_fusion=getattr(args, "enable_fusion", False))
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry

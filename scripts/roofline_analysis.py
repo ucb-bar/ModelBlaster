@@ -54,7 +54,7 @@ import argparse
 import csv
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 
@@ -70,8 +70,53 @@ class BackendSOL:
     name: str
     target: str
     clock_mhz: float
-    peak_ops_per_cycle: float       # per-hart sustained int8 OPS at peak
+    peak_ops_per_cycle: float       # nominal/legacy peak, dtype-blind
     peak_bytes_per_cycle: float     # effective DRAM bandwidth at peak
+    # Per-dtype compute peaks, derived from the RTL rather than assumed. Left
+    # at 0 they fall back to the nominal figure, so existing entries keep
+    # working unchanged.
+    peak_ops_per_cycle_s8: float = 0.0
+    peak_ops_per_cycle_f16: float = 0.0
+    # Per-OP overrides, checked before the dtype-suffix rule. Needed when an
+    # op's *kernel* can't reach the dtype-generic ceiling for a structural
+    # reason (not a performance bug) -- e.g. conv2d_f16 widens fp16->fp32
+    # via vfwcvt and then issues a same-width vfmacc rather than a true
+    # narrow-accumulate vfwmacc, so its ceiling is the WIDENED rate, not
+    # the narrow rate every other `_f16` op is scored against. Scoring it
+    # against an unreachable narrow roof would silently overstate its
+    # remaining headroom by 2x -- the same class of error (in the other
+    # direction) that motivated peak_ops_per_cycle_for in the first place.
+    peak_ops_per_cycle_override: dict[str, float] = field(default_factory=dict)
+
+    def peak_ops_per_cycle_for(self, op: str) -> float:
+        """Compute peak for THIS operator's dtype.
+
+        The single nominal 64 ops/cyc was dtype-blind and wrong for both
+        dtypes on this Saturn config:
+
+          * int8 -- the backend builds ``-march=rv64gcv`` with NO Zvqdotq, so
+            ``vwmacc`` is the only int8 MAC path and it writes 32 bits per
+            MAC. At DLEN=128 that caps throughput at 4 MAC/cyc = 8 ops/cyc,
+            an 8x overstatement.
+          * fp16 -- ``nTandemFMA = dLenB/8 = 2`` segments per cycle, each
+            holding 4 fp16 lanes, so 8 MAC/cyc = 16 ops/cyc on the narrow
+            (pure-fp16-accumulate) path. Widening through ``vfwmacc`` to an
+            fp32 accumulator halves that again.
+
+        Scoring against an unreachable figure made every kernel look 4-8x
+        further from its roof than it was, which distorted triage for the
+        whole campaign.
+        """
+        if op in self.peak_ops_per_cycle_override:
+            return self.peak_ops_per_cycle_override[op]
+        if op.endswith("_f16") and self.peak_ops_per_cycle_f16:
+            return self.peak_ops_per_cycle_f16
+        if op.endswith("_s8") and self.peak_ops_per_cycle_s8:
+            return self.peak_ops_per_cycle_s8
+        return self.peak_ops_per_cycle
+
+    def peak_compute_gops_for(self, op: str) -> float:
+        return self.peak_ops_per_cycle_for(op) * self.clock_mhz / 1000.0
 
     @property
     def peak_compute_gops(self) -> float:
@@ -102,12 +147,30 @@ SOL_CONFIGS: dict[tuple[str, str], BackendSOL] = {
     ("V256D128_rvv", "firesim_rocket_saturn"): BackendSOL(
         name="V256D128_rvv", target="firesim_rocket_saturn",
         clock_mhz=1000.0, peak_ops_per_cycle=64.0, peak_bytes_per_cycle=16.0,
+        # RTL-derived: vwmacc-only int8 => 4 MAC/cyc = 8 ops/cyc;
+        # fp16 narrow => nTandemFMA(2) x 4 lanes = 8 MAC/cyc = 16 ops/cyc.
+        peak_ops_per_cycle_s8=8.0, peak_ops_per_cycle_f16=16.0,
+        # conv2d_f16's curated kernel (kernels/rvv_f16/
+        # rvv_f16_conv2d_f16_oc_blocked.c) widens fp16->fp32 via vfwcvt and
+        # accumulates with a same-width vfmacc, not a narrow-accumulate
+        # vfwmacc.vf -- so it can only ever reach the WIDENED 8 ops/cyc,
+        # half the narrow 16 ops/cyc every other _f16 op is scored against.
+        peak_ops_per_cycle_override={"conv2d_f16": 8.0},
     ),
     # Legacy alias — kept so older CSVs / scripts that still emit
     # backend="RVV" keep finding a SOL entry.
     ("RVV", "firesim_rocket_saturn"): BackendSOL(
         name="V256D128_rvv", target="firesim_rocket_saturn",
         clock_mhz=1000.0, peak_ops_per_cycle=64.0, peak_bytes_per_cycle=16.0,
+        # RTL-derived: vwmacc-only int8 => 4 MAC/cyc = 8 ops/cyc;
+        # fp16 narrow => nTandemFMA(2) x 4 lanes = 8 MAC/cyc = 16 ops/cyc.
+        peak_ops_per_cycle_s8=8.0, peak_ops_per_cycle_f16=16.0,
+        # conv2d_f16's curated kernel (kernels/rvv_f16/
+        # rvv_f16_conv2d_f16_oc_blocked.c) widens fp16->fp32 via vfwcvt and
+        # accumulates with a same-width vfmacc, not a narrow-accumulate
+        # vfwmacc.vf -- so it can only ever reach the WIDENED 8 ops/cyc,
+        # half the narrow 16 ops/cyc every other _f16 op is scored against.
+        peak_ops_per_cycle_override={"conv2d_f16": 8.0},
     ),
     # scalar Rocket: 1 MAC/cyc, modest L1 throughput.
     ("scalar", "firesim_rocket_saturn"): BackendSOL(
@@ -246,6 +309,85 @@ OP_FORMULAS: dict[str, Callable[[dict[str, int]], tuple[int, int]]] = {
 
 
 # ---------------------------------------------------------------------- #
+# fp16 formulas.
+#
+# NOTE ON PLACEMENT: these MUST be defined and registered into
+# OP_FORMULAS above (i.e. before) `if __name__ == "__main__": main()`
+# below. A previous revision of this file appended the fp16 formulas
+# and their OP_FORMULAS[...] = ... registrations AFTER that guard --
+# harmless when the module is `import`ed (Python still runs the whole
+# file top-to-bottom before any caller can invoke load_rows()), but
+# fatal for the documented `python -m ...` CLI usage: when run as
+# __main__, execution hits `main()` and returns BEFORE the interpreter
+# ever reaches the lines below it, so linear_f16/lstm_f16 (and every
+# fp16 formula added the same way) were silently never registered for
+# any real CLI invocation of this tool. This is why conv2d_f16 (and
+# even the pre-existing linear_f16/lstm_f16 "fixes") never actually
+# showed up in a `python -m modelblaster.scripts.roofline_analysis`
+# run's aggregate -- confirmed by reproducing it: `python -m ...`
+# scored every fp16 op ops=0/bytes=0/roof="n/a", while calling
+# load_rows()/OP_FORMULAS directly after `import roofline_analysis`
+# (which executes the whole module, registrations included, before
+# your own code runs) scored them correctly. Keeping every OP_FORMULAS
+# registration above the __main__ guard, in one place, removes this
+# footgun for the next op family too.
+# ---------------------------------------------------------------------- #
+
+def _conv2d_f16(s: dict[str, int]) -> tuple[int, int]:
+    """fp16 conv2d. Mirrors _conv2d_s8's structure exactly (MAC counting
+    and footprint shape) so the two dtypes stay comparable; only the
+    element size (2 B instead of 1 B) and bias dtype (fp16, not int32)
+    differ."""
+    N, IC, IH, IW = s.get("N", 1), s.get("IC", 0), s.get("IH", 0), s.get("IW", 0)
+    OC, OH, OW = s.get("OC", 0), s.get("OH", 0), s.get("OW", 0)
+    KH, KW = s.get("KH", 1), s.get("KW", 1)
+    ops = 2 * N * OC * OH * OW * IC * KH * KW    # MACs counted as 2 ops
+    in_bytes = 2 * N * IC * IH * IW               # fp16
+    w_bytes = 2 * OC * IC * KH * KW               # fp16
+    out_bytes = 2 * N * OC * OH * OW              # fp16
+    bias_bytes = 2 * OC                           # fp16
+    return ops, in_bytes + w_bytes + out_bytes + bias_bytes
+
+
+def _elementwise_f16(s: dict[str, int]) -> tuple[int, int]:
+    n = s.get("n", 0)
+    # Single-input elementwise (relu_f16). fp16 elements, in + out.
+    return n, 2 * (2 * n)
+
+
+def _cat_f16(s: dict[str, int]) -> tuple[int, int]:
+    N = s.get("N", 1)
+    H, W = s.get("H", 0), s.get("W", 0)
+    C_total = s.get("C_total", 0)
+    n = N * C_total * H * W
+    return 0, 2 * (2 * n)                         # pure memcpy, fp16 elements
+
+
+def _linear_f16(s: dict) -> tuple[int, int]:
+    """fp16 GEMV/GEMM: 2 ops per MAC. bytes = weights (2B) + in + out."""
+    M = s.get("M", 1); K = s.get("K", 0); N = s.get("N", 0)
+    return 2 * M * K * N, 2 * (K * N + M * K + M * N)
+
+
+def _lstm_f16(s: dict) -> tuple[int, int]:
+    """One LSTM timestep, 4 gates. Each gate does an input matmul
+    (in_size x H) and a recurrent matmul (H x H); 2 ops per MAC.
+    Elementwise gate math is ~O(H) and negligible beside the matmuls."""
+    ins = s.get("in_size", 0); H = s.get("H", 0)
+    macs = 4 * (ins * H + H * H)
+    return 2 * macs, 2 * (macs + ins + H)
+
+
+OP_FORMULAS["conv2d_f16"] = _conv2d_f16
+OP_FORMULAS["relu_f16"] = _elementwise_f16
+OP_FORMULAS["cat2_c1_f16"] = _cat_f16
+OP_FORMULAS["cat3_c1_f16"] = _cat_f16
+OP_FORMULAS["cat4_c1_f16"] = _cat_f16
+OP_FORMULAS["linear_f16"] = _linear_f16
+OP_FORMULAS["lstm_f16"] = _lstm_f16
+
+
+# ---------------------------------------------------------------------- #
 # CSV reader                                                             #
 # ---------------------------------------------------------------------- #
 
@@ -337,7 +479,7 @@ def _row_metrics(backend: str, target: str, network: str, raw: dict) -> Optional
     seconds = cycles / (sol.clock_mhz * 1e6)
     ai = ops / bytes_
     measured_gops = ops / seconds / 1e9
-    sol_compute = sol.peak_compute_gops
+    sol_compute = sol.peak_compute_gops_for(op)
     sol_bandwidth = sol.peak_bandwidth_gbps * ai
     sol_gops = min(sol_compute, sol_bandwidth)
     util = (measured_gops / sol_gops) if sol_gops > 0 else 0.0

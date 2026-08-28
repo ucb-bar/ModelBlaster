@@ -7,6 +7,34 @@
  *         must be zero (symmetric per-tensor int8 from extract_int8).
  *         Float-scale introduces ≤1 LSB drift vs Q0.31 golden.
  *
+ *         ROOT CAUSE of the drift, characterised 2026-08-28 (experiments/
+ *         kernel_opt_log.jsonl id 1100-1103): the golden reference (scalar
+ *         fallback below, kernels/rvv/rvv_conv2d_s8_rvv_vsmul_vnclip.c,
+ *         gemmini_im2col_full_C's CPU requantize) all compute a TWO-STAGE
+ *         rounding: stage1 = round_half_up(acc*mult, 2^31), THEN
+ *         stage2 = round_half_up(stage1, 2^output_shift). gemmini's HW
+ *         mvout unit only implements ONE hardware round-shift-by-31
+ *         (cores/gemmini/include/gemmini_params.h::ACC_SCALE); to use it
+ *         at all for a nonzero output_shift, this kernel (in its
+ *         MODELBLASTER_GEMMINI_Q31_ACC_SCALE branch below) pre-folds
+ *         (mult, shift) into a single Q0.31 scale = round(mult/2^shift)
+ *         BEFORE the hardware multiply, i.e. computes
+ *         round_half_up(acc * round(mult, shift), 2^31) instead. That is
+ *         structurally NOT the same operation as double rounding:
+ *         pre-rounding the SCALE turns a fixed +-0.5-output-unit rounding
+ *         error into an error that scales with acc, so a single hardware
+ *         round cannot reproduce the two-stage golden bit-for-bit for
+ *         every acc value. This is unavoidable with this HW datapath (no
+ *         Q0.31 fold choice fixes it) — the real fix is
+ *         gemmini_im2col_full_C, which bypasses this mvout unit entirely
+ *         (tiled_matmul_auto full_C=true drains the RAW accumulator, then
+ *         the exact two-stage formula runs on the CPU/RVV) and is
+ *         verified bit-exact in isolation. Kept here (not removed) as the
+ *         faster, drift-tolerant option for backends/models whose
+ *         atol_override covers ~1 LSB/layer; gemmini_q31 and
+ *         gemmini_q31_rvv (pipeline/backends.py) no longer select it —
+ *         see gemmini_q31_rvv_conv2d_s8_gemmini_im2col_full_C.c.
+ *
  *         WEIGHT LAYOUT CONTRACT: this kernel expects `weight` to already
  *         be in flat HWIO layout (= `[KH*KW*IC, OC]`, the form
  *         `tiled_conv_auto` consumes directly).  The skeleton emitter at
@@ -115,13 +143,31 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     /* Reset gemmini controller and drain any prior DMA. */
     gemmini_flush(0);
 
-    /* Transpose input NCHW → NHWC into ws_input. */
-    for (int n = 0; n < N; n++)
-        for (int h = 0; h < IH; h++)
-            for (int w = 0; w < IW; w++)
-                for (int c = 0; c < IC; c++)
-                    ws_input[((n*IH + h)*IW + w)*IC + c] =
-                        input[((n*IC + c)*IH + h)*IW + w];
+    /* Transpose input NCHW → NHWC into ws_input.
+     * Blocked (TB x TB) so the contiguous-read side and the IC-strided
+     * write side both stay resident in L1. The old 4-deep loop nest
+     * recomputed ((n*IH+h)*IW+w)*IC+c and ((n*IC+c)*IH+h)*IW+w per
+     * element; on dronet conv0 the two transposes move 137,984 bytes and
+     * were the single largest term in the layer's 1.75M cycles. */
+    {
+        const int TB = 32;
+        int HW = IH * IW;
+        for (int n = 0; n < N; n++) {
+            const int8_t *inb = input   + (size_t)n * IC * HW;
+            elem_t       *ob  = ws_input + (size_t)n * HW * IC;
+            for (int p0 = 0; p0 < HW; p0 += TB) {
+                int pn = HW - p0 < TB ? HW - p0 : TB;
+                for (int c0 = 0; c0 < IC; c0 += TB) {
+                    int cn = IC - c0 < TB ? IC - c0 : TB;
+                    for (int c = 0; c < cn; c++) {
+                        const int8_t *s = inb + (size_t)(c0 + c) * HW + p0;
+                        elem_t       *d = ob  + (size_t)p0 * IC + (c0 + c);
+                        for (int p = 0; p < pn; p++) d[(size_t)p * IC] = s[p];
+                    }
+                }
+            }
+        }
+    }
 
     /* Weight is already in flat HWIO layout ([KH*KW*IC, OC]) — see the
      * file-header WEIGHT LAYOUT CONTRACT.  The OIHW→HWIO permutation
@@ -178,13 +224,26 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     gemmini_fence();
     gemmini_flush(0);
 
-    /* Transpose output NHWC → NCHW. */
-    for (int n = 0; n < N; n++)
-        for (int c = 0; c < OC; c++)
-            for (int h = 0; h < OH; h++)
-                for (int w = 0; w < OW; w++)
-                    output[((n*OC + c)*OH + h)*OW + w] =
-                        ws_output[((n*OH + h)*OW + w)*OC + c];
+    /* Transpose output NHWC → NCHW (same blocking as the input side). */
+    {
+        const int TB = 32;
+        int OHW = OH * OW;
+        for (int n = 0; n < N; n++) {
+            int8_t       *outb = output    + (size_t)n * OC * OHW;
+            const elem_t *ob   = ws_output + (size_t)n * OHW * OC;
+            for (int p0 = 0; p0 < OHW; p0 += TB) {
+                int pn = OHW - p0 < TB ? OHW - p0 : TB;
+                for (int c0 = 0; c0 < OC; c0 += TB) {
+                    int cn = OC - c0 < TB ? OC - c0 : TB;
+                    for (int c = 0; c < cn; c++) {
+                        int8_t       *d = outb + (size_t)(c0 + c) * OHW + p0;
+                        const elem_t *s = ob   + (size_t)p0 * OC + (c0 + c);
+                        for (int p = 0; p < pn; p++) d[p] = s[(size_t)p * OC];
+                    }
+                }
+            }
+        }
+    }
 
     /* Post-clamp for activation_max < 127 (gemmini RELU only handles min==0). */
     if (activation_max < 127) {

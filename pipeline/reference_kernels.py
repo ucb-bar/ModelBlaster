@@ -335,6 +335,15 @@ def _maxpool2d_s8_argtypes():
     return [i8p, i8p] + [ctypes.c_int] * 12
 
 
+def _conv2d_pool_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # conv2d_s8's 18 ints, then 8 more for the pool tail
+    # (pool_KH, pool_KW, pool_SH, pool_SW, pool_PH, pool_PW, pool_DH, pool_DW).
+    return [i8p, i8p, i32p, i8p] + [ctypes.c_int] * (18 + 8)
+
+
 def _add_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -1500,6 +1509,14 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
         # Generalization
         {"M": 1, "K": 7,  "N": 13},
         {"M": 4, "K": 17, "N": 23},
+        # dronet linear2: a SINGLE output. A kernel vectorized over N runs
+        # at vl=1 here; nothing else covered that tail.
+        {"M": 1, "K": 64, "N": 1},
+        # dronet's ACTUAL linear1/linear2 heads (kernel_opt_log 1000+): both
+        # run at M=1,K=2048,N=1 -- the N=1 tail above only tested K=64. K=2048
+        # is 32x larger (more K-chunk iterations before the vl=1 tail), which
+        # the K=64 shape cannot exercise.
+        {"M": 1, "K": 2048, "N": 1},
     ],
     argtypes_factory=_linear_s8_argtypes,
     algorithms=[
@@ -1845,6 +1862,12 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
          "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
         {"N": 1, "IC": 32, "IH": 16, "IW": 16, "OC": 64,
          "KH": 1, "KW": 1, "SH": 2, "SW": 2, "PH": 0, "PW": 0},
+        # fused_full vision_cnn.0 shape class: PADDING 2. Every shape above
+        # is PH/PW <= 1, so the 2-column border path -- where an out-of-bounds
+        # tap must still contribute input_offset rather than be skipped -- was
+        # exercised by no build except fused_full's own, on a SHARED kernel.
+        {"N": 1, "IC": 1, "IH": 20, "IW": 30, "OC": 16,
+         "KH": 5, "KW": 5, "SH": 2, "SW": 2, "PH": 2, "PW": 2},
     ],
     argtypes_factory=_conv2d_s8_argtypes,
     algorithms=[
@@ -2419,8 +2442,45 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
 """,
         ),
         AlgorithmCandidate(
+            name="rvv_igemm",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            description=(
+                "Implicit-GEMM conv2d_s8 (XNNPACK igemm style, adapted to "
+                "NCHW/planar input and this SoC's vwmacc-only int8 MAC "
+                "path). Same OC-vectorized register-tiled MAC as "
+                "rvv_vsmul_vnclip/rvv_oc_blocked (mr=4/2/1 output pixels "
+                "x nr=vlmax_e32m4 output channels), but the K=IC*KH*KW "
+                "reduction is restructured around a small per-output-tile "
+                "indirection buffer instead of recomputing padding/bounds "
+                "bookkeeping inside the IC loop.\n\n"
+                "For each (n, oh, ow_tile) -- built ONCE, reused across "
+                "the entire oc_base (OC cache-blocking) sweep AND the "
+                "entire IC reduction, not just one tap -- build mr*KH*KW "
+                "(pointer, ic-step) pairs: a pointer to input[n,0,ih,iw] "
+                "(ic=0 base) with step=IH*IW for an in-bounds tap, or a "
+                "pointer to a single static zero byte with step=0 for an "
+                "out-of-bounds tap (so the ic-loop keeps re-reading that "
+                "same zero byte -- branch-free, and it still contributes "
+                "input_offset*(w+filter_offset) per ic, matching the "
+                "conv2d_s8 spec's OOB semantics exactly). The reduction "
+                "loop then walks taps outer / ic inner with NO bounds "
+                "check and NO address recompute at all: per K-step it is "
+                "one OC-contiguous vle8+vwadd (weight) + mr scalar loads "
+                "+ mr vwmacc + mr+1 pointer increments.\n\n"
+                "Never turns the input access into a vector strided load "
+                "(Saturn serializes those); every K-step input read stays "
+                "one scalar load per accumulator row, same as "
+                "rvv_vsmul_vnclip today. OC cache-blocking (TILE_OC slab) "
+                "kept unchanged from rvv_oc_blocked.\n\n"
+                "See kernels/rvv/rvv_conv2d_s8_rvv_igemm.c for the full "
+                "design rationale and worked instruction-count comparison."
+            ),
+            reference_impl="",  # the curated file supplies the impl
+        ),
+        AlgorithmCandidate(
             name="gemmini_tiled_conv",
-            target_affinity=("gemmini", "gemmini_q31"),
+            target_affinity=("gemmini", "gemmini_q31", "gemmini_q31_rvv"),
             weight_layout="hwio",
             # HW im2col + GEMM + mvout-requantize. Float-scale on Saturn /
             # Q0.31-fold on Q31 bitstream — both single-stage requantize, drift
@@ -2646,7 +2706,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         ),
         AlgorithmCandidate(
             name="gemmini_im2col_full_C",
-            target_affinity=("gemmini", "gemmini_q31"),
+            target_affinity=("gemmini", "gemmini_q31", "gemmini_q31_rvv"),
             weight_layout="hwio",
             # CPU im2col + tiled_matmul_auto(full_C=true) raw int32 mvout +
             # scalar two-stage Q0.31 requantize on the host. Matches the
@@ -3003,6 +3063,186 @@ void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight,
 )
 
 
+# Fused Conv2D + MaxPool2D. Same dataflow as CONV2D_S8 (conv → requantize →
+# activation clamp, producing an int8 [N,OC,OH,OW] intermediate) followed
+# by MAXPOOL2D_S8's sliding-window max over that intermediate, producing
+# [N,OC,OH_pool,OW_pool]. No rescale happens in the pool stage (max is
+# scale-preserving), so this is exactly "conv2d_s8 then maxpool2d_s8" with
+# the intermediate never materialized to DRAM.
+#
+# Detected in extract_graph.py (gated behind the --fuse-conv-pool opt-in
+# flag, OFF by default) when a Conv2d feeds a MaxPool2d as its ONLY
+# consumer, with no activation in between (or an activation already
+# absorbed by the existing relu-fold pass — see fused_relu_after). Only
+# monotonic-nondecreasing activations commute with max (round(max(a,b)) ==
+# max(round(a),round(b)); same for a clamp with shared bounds), which is
+# why the detector requires "conv directly feeds pool" on the (possibly
+# already relu-folded) graph rather than pattern-matching raw activation
+# module types — a SiLU (not monotonic) sitting between conv and pool
+# means the producer is silu_s8, not conv2d_s8, so the pattern silently
+# does not match and the two ops stay separate (see e.g. yolov8n's SPPF:
+# conv -> silu_s8 -> maxpool2d_s8, correctly excluded).
+#
+# accuracy_class is NUMERIC_DRIFT on gemmini: the fused HW path must use
+# gemmini_tiled_conv's single-hardware-round Q0.31 fold (tiled_conv_auto's
+# native pool_size/pool_stride tail is wired only through tiled_conv_auto,
+# not gemmini_im2col_full_C's tiled_matmul_auto full_C=true bypass), whose
+# per-layer error is analytically bounded (see the header comment in
+# kernels/gemmini/gemmini_conv2d_s8_gemmini_tiled_conv.c) — the pool
+# reduction itself adds zero additional error since round commutes with
+# max. This is the FAST, opt-in alternative to the exact-but-slower
+# separate conv2d_s8(gemmini_im2col_full_C) + maxpool2d_s8(gemmini_tiled_
+# conv_pool, weight=2 identity-conv trick) pair.
+CONV2D_POOL_S8 = KernelSpec(
+    op="conv2d_pool_s8",
+    signature=(
+        "void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int activation_min, int activation_max, "
+        "int pool_KH, int pool_KW, int pool_SH, int pool_SW, "
+        "int pool_PH, int pool_PW, int pool_DH, int pool_DW)"
+    ),
+    semantics=(
+        "Fused quantized 2D convolution + 2D max-pool. Computes\n"
+        "conv2d_s8(input, weight, bias, ...) -> int8 intermediate\n"
+        "[N,OC,OH,OW] (requantized + clamped to [activation_min,\n"
+        "activation_max], identical formula to kernel_conv2d_s8), then\n"
+        "maxpool2d_s8(intermediate, pool_KH, pool_KW, pool_SH, pool_SW,\n"
+        "pool_PH, pool_PW, pool_DH, pool_DW) -> int8 output\n"
+        "[N,OC,OH_pool,OW_pool]. Out-of-bounds pool taps read INT8_MIN\n"
+        "(matches kernel_maxpool2d_s8's convention, not gemmini's native\n"
+        "zero-fill — callers with pool_PH/pool_PW > 0 should confirm the\n"
+        "curated algorithm they select honors this, falling back to the\n"
+        "separate conv2d_s8+maxpool2d_s8 pair otherwise).\n"
+        "No rescale occurs between the two stages (max is scale-\n"
+        "preserving); the pool stage introduces no requantization error\n"
+        "beyond what the conv stage's own single quantize already has."
+    ),
+    reference_impl="""\
+#include <limits.h>
+void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
+                           const int32_t *bias, int8_t *output,
+                           int N, int IC, int IH, int IW, int OC,
+                           int KH, int KW, int SH, int SW, int PH, int PW,
+                           int input_offset, int filter_offset, int output_offset,
+                           int output_multiplier, int output_shift,
+                           int activation_min, int activation_max,
+                           int pool_KH, int pool_KW, int pool_SH, int pool_SW,
+                           int pool_PH, int pool_PW, int pool_DH, int pool_DW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    int OHp = (OH + 2*pool_PH - pool_DH*(pool_KH-1) - 1) / pool_SH + 1;
+    int OWp = (OW + 2*pool_PW - pool_DW*(pool_KW-1) - 1) / pool_SW + 1;
+    /* Portable reference oracle: materialize the pre-pool conv output in
+     * a generously-sized static workspace (512 KB, same cap every gemmini
+     * kernel in this tree uses -- covers every conv2d_s8 shape in dronet
+     * and yolov8_nano), then pool it. Not the fast path; curated kernels
+     * fuse the two stages without ever writing `tmp` to DRAM. */
+    enum { CONV2D_POOL_WS_BYTES = 512 * 1024 };
+    static int8_t tmp[CONV2D_POOL_WS_BYTES];
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        const size_t in_row_base = ((size_t)n * IC + ic) * IH;
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[(in_row_base + ih) * IW + iw] + input_offset;
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                    } else if (output_shift < 0) {
+                        scaled = scaled << (-output_shift);
+                    }
+                    scaled += output_offset;
+                    if (scaled < activation_min) scaled = activation_min;
+                    if (scaled > activation_max) scaled = activation_max;
+                    size_t tmp_idx = (((size_t)n*OC + oc)*OH + oh)*OW + ow;
+                    tmp[tmp_idx] = (int8_t)scaled;
+                }
+            }
+        }
+    }
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int ohp = 0; ohp < OHp; ohp++) {
+                for (int owp = 0; owp < OWp; owp++) {
+                    int8_t m = INT8_MIN;
+                    for (int kh = 0; kh < pool_KH; kh++) {
+                        int oh = ohp*pool_SH - pool_PH + kh*pool_DH;
+                        if (oh < 0 || oh >= OH) continue;
+                        for (int kw = 0; kw < pool_KW; kw++) {
+                            int ow = owp*pool_SW - pool_PW + kw*pool_DW;
+                            if (ow < 0 || ow >= OW) continue;
+                            size_t tmp_idx = (((size_t)n*OC + oc)*OH + oh)*OW + ow;
+                            int8_t v = tmp[tmp_idx];
+                            if (v > m) m = v;
+                        }
+                    }
+                    size_t out_idx = (((size_t)n*OC + oc)*OHp + ohp)*OWp + owp;
+                    output[out_idx] = m;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # DroNet-style conv0->maxpool1 shape class: 3x3 s2 p1 conv feeding
+        # a 3x3 s2 maxpool, the exact chain the fusion detector matches on
+        # dronet today.
+        {"N": 1, "IC": 3, "IH": 32, "IW": 32, "OC": 8,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1,
+         "pool_KH": 3, "pool_KW": 3, "pool_SH": 2, "pool_SW": 2,
+         "pool_PH": 0, "pool_PW": 0, "pool_DH": 1, "pool_DW": 1},
+    ],
+    argtypes_factory=_conv2d_pool_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_pool",
+            target_affinity=("gemmini", "gemmini_q31"),
+            weight_layout="hwio",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "gemmini tiled_conv_auto with its native pool_size/pool_"
+                "stride tail enabled, folding (output_multiplier, "
+                "output_shift) into a single Q0.31 HW scale the same way "
+                "gemmini_conv2d_s8_gemmini_tiled_conv.c does. Only square, "
+                "unpadded pooling (pool_KH==pool_KW, pool_SH==pool_SW, "
+                "pool_PH==pool_PW==0, pool_DH==pool_DW==1) maps onto "
+                "gemmini's scalar pool params; anything else falls back "
+                "to the scalar reference (conv then a separate pool "
+                "pass)."
+            ),
+            reference_impl="",  # the curated .c file supplies the impl
+        ),
+    ],
+)
+
+
 MAXPOOL2D_S8 = KernelSpec(
     op="maxpool2d_s8",
     signature=(
@@ -3067,6 +3307,12 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
         # DroNet
         {"N": 1, "C": 32, "IH": 64, "IW": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2,
          "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # YOLOv8 SPPF. Every shape above is SW=2/PW=0, so a kernel's
+        # stride-1 and padded-boundary paths were exercised by NO model's
+        # verify -- and maxpool2d_s8 is a single kernel shared by every
+        # model that has the op. This shape covers both.
+        {"N": 1, "C": 128, "IH": 5, "IW": 5, "KH": 5, "KW": 5, "SH": 1, "SW": 1,
+         "PH": 2, "PW": 2, "DH": 1, "DW": 1},
     ],
     argtypes_factory=_maxpool2d_s8_argtypes,
     algorithms=[
@@ -4574,6 +4820,30 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
     argtypes_factory=_conv2d_f16_argtypes,
     algorithms=[
         AlgorithmCandidate(
+            name="oc_blocked",
+            target_affinity=("rvv_f16",),
+            description=(
+                "OC-parallel conv2d_f16. Vectorize over OC (each lane "
+                "carries one output channel of the current output pixel); "
+                "scalar-loop the (ic, kh, kw) reduction. Trades the "
+                "widening kernel's strided fp16 input load (slow on V256 "
+                "Saturn when IH*IW is small) for unit-stride scalar input "
+                "+ strided weight. Useful for layers with tiny spatial "
+                "dim (1×1 convs in EfficientNet MBConv expand/project) "
+                "where the strided-by-IH*IW input load gathers from "
+                "scattered addresses. Numerics equivalent to the widening "
+                "kernel modulo summation order (fp32 accumulator both "
+                "paths). Promoted to the FIRST candidate (2026-08-28): "
+                "hardware-validated ~5.9x faster than widening on this "
+                "model's full conv2d_f16 op set (not just the IC=1 "
+                "first layer) once the anti-cheat naming + a genuine "
+                "numeric bug (repeated same-block e16m2/e32m4 vsetvl "
+                "re-derivation miscompiling the final vfncvt+vsse16) "
+                "were both fixed. widening now the fallback candidate."
+            ),
+            reference_impl="",  # curated file supplies the impl
+        ),
+        AlgorithmCandidate(
             name="widening",
             target_affinity=("rvv_f16",),
             description=(
@@ -4653,26 +4923,6 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
     }
 }
 """,
-        ),
-        AlgorithmCandidate(
-            name="oc_blocked",
-            target_affinity=("rvv_f16",),
-            description=(
-                "OC-parallel conv2d_f16. Vectorize over OC (each lane "
-                "carries one output channel of the current output pixel); "
-                "scalar-loop the (ic, kh, kw) reduction. Trades the "
-                "widening kernel's strided fp16 input load (slow on V256 "
-                "Saturn when IH*IW is small) for unit-stride scalar input "
-                "+ strided weight. Useful for layers with tiny spatial "
-                "dim (1×1 convs in EfficientNet MBConv expand/project) "
-                "where the strided-by-IH*IW input load gathers from "
-                "scattered addresses. Numerics equivalent to the widening "
-                "kernel modulo summation order (fp32 accumulator both "
-                "paths). Registered as the second candidate so 'widening' "
-                "stays the default; pick this via --algorithms=oc_blocked "
-                "or via the LLM optimize loop's FireSim re-rank."
-            ),
-            reference_impl="",  # curated file supplies the impl
         ),
     ],
 )
@@ -4808,6 +5058,15 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
         {"M": 1, "K": 7, "N": 13},
         {"M": 4, "K": 17, "N": 23},
         {"M": 1, "K": 64, "N": 64},
+        # Production shapes (fused_full's fp16 tail, kernel_opt_log 1000+):
+        # every prior shape had K,N <= 64, far under a single LMUL4 register
+        # group (vlmax_e16m4 = 64 @ VLEN=256) and under the N-blocking width
+        # (4) any curated kernel would tile by -- none of them exercised
+        # multi-chunk K reduction or an N%4 tail at production scale. These
+        # three are fused_full's actual vision_fc / depth_fc / head calls.
+        {"M": 1, "K": 1536, "N": 512},   # vision_fc: 1536->512 (multi-chunk K, N%4==0)
+        {"M": 1, "K": 1024, "N": 64},    # depth_fc: 1024->64 (multi-chunk K, N%4==0)
+        {"M": 1, "K": 128, "N": 2},      # head: 128->2 (N<4, exercises the tail-only path)
     ],
     argtypes_factory=_linear_f16_argtypes,
     algorithms=[
@@ -6098,6 +6357,11 @@ void kernel_upsample_nearest_s8(const int8_t *input, int8_t *output,
     extra_shapes=[
         {"N": 1, "C": 4,  "IH": 5,  "IW": 5,  "scale": 2},
         {"N": 1, "C": 16, "IH": 10, "IW": 10, "scale": 2},
+        # yolov8n's two real upsample calls. The shapes above are C=4/C=16;
+        # yolov8n runs C=256 (5x5) and C=128 (10x10), so the op that faults
+        # at kernels.c:857 had NO verify coverage at the shapes it faults on.
+        {"N": 1, "C": 256, "IH": 5,  "IW": 5,  "scale": 2},
+        {"N": 1, "C": 128, "IH": 10, "IW": 10, "scale": 2},
     ],
     argtypes_factory=_upsample_nearest_s8_argtypes,
 )
@@ -6177,6 +6441,40 @@ void kernel_cat{n_inputs}_c1_s8({sig_parts},
 """
 
 
+def _cat_gemmini_mvin_scale_algorithm(n_inputs: int) -> AlgorithmCandidate:
+    """Registers the curated `gemmini_mvin_scale` algorithm for catN_c1_s8
+    on the gemmini_q31 target, so generate_kernels' curated-probe loop
+    (which iterates KernelSpec.algorithms, not directory listings) will
+    look for kernels/gemmini_q31/gemmini_q31_cat{n}_c1_s8_gemmini_mvin_scale.c.
+
+    Per-input requantize via gemmini's MVIN_SCALE mvin path (a genuine
+    float32 multiply + round-to-nearest-even + int8 clamp, run in
+    hardware) into a degenerate [count x 1] x [1 x 1] matmul, drained
+    raw via tiled_matmul_auto(full_C=true) to bypass gemmini's mvout
+    ACC_SCALE unit entirely -- that unit is empirically NOT a true
+    identity on this Q31Ws32x32Acc config (kernel_opt_log.jsonl id 1100,
+    archived kernels/gemmini_q31/archive/*), and full_C is only exposed
+    by the base tiled_matmul_auto, not by tiled_resadd_auto/
+    tiled_conv_auto. NUMERIC_DRIFT (not BIT_EXACT): MVIN_SCALE ties to
+    even, the reference's roundf ties away from zero -- these differ
+    only at exact float32 .5 ties, empirically ~2.3e-6 per (ratio,
+    int8-code) pair (see the curated file's header for the sweep)."""
+    return AlgorithmCandidate(
+        name="gemmini_mvin_scale",
+        target_affinity=("gemmini_q31",),
+        accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        description=(
+            "Per-input channel-range copy via gemmini's MVIN_SCALE "
+            "(mvin-time float32 multiply + round-to-nearest-even + int8 "
+            "clamp) into a degenerate K=1,J=1 tiled_matmul_auto call "
+            "with full_C=true, bypassing the mvout ACC_SCALE unit "
+            "entirely. See kernels/gemmini_q31/"
+            f"gemmini_q31_cat{n_inputs}_c1_s8_gemmini_mvin_scale.c."
+        ),
+        reference_impl="",  # the curated file supplies the impl
+    )
+
+
 CAT2_C1_S8 = KernelSpec(
     op="cat2_c1_s8",
     signature=(
@@ -6198,6 +6496,7 @@ CAT2_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32],  "C_total": 48},
     ],
     argtypes_factory=_cat2_c1_s8_argtypes,
+    algorithms=[_cat_gemmini_mvin_scale_algorithm(2)],
 )
 
 CAT3_C1_S8 = KernelSpec(
@@ -6221,6 +6520,7 @@ CAT3_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32, 16], "C_total": 64},
     ],
     argtypes_factory=_cat3_c1_s8_argtypes,
+    algorithms=[_cat_gemmini_mvin_scale_algorithm(3)],
 )
 
 CAT4_C1_S8 = KernelSpec(
@@ -6245,6 +6545,7 @@ CAT4_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [8, 16, 16, 8],   "C_total": 48},
     ],
     argtypes_factory=_cat4_c1_s8_argtypes,
+    algorithms=[_cat_gemmini_mvin_scale_algorithm(4)],
 )
 
 
@@ -7284,7 +7585,17 @@ void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih, const _Float16 *w_
     for (int j = 0; j < H; j++) h[j] = out[j];
 }
 """,
-    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    extra_shapes=[
+        {"in_size": 8, "H": 4},
+        {"in_size": 16, "H": 8},
+        # Production shapes (fused_full's 3-layer LSTM, kernel_opt_log 1000+):
+        # both prior shapes have in_size,H <= 16, well under a single LMUL4
+        # register group (vlmax_e16m4 = 64 @ VLEN=256) -- neither exercised
+        # multi-chunk K reduction, which is what the gate-blocked kernel's
+        # hoisted-load loop actually runs at production scale.
+        {"in_size": 597, "H": 128},   # layer 0: fused (1,597) -> hidden 128
+        {"in_size": 128, "H": 128},   # layers 1,2: hidden 128 -> hidden 128
+    ],
     argtypes_factory=_lstm_f16_argtypes,
 )
 
@@ -7335,6 +7646,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     "relu_s8": RELU_S8,
     "conv2d_s8": CONV2D_S8,
     "conv2d_silu_s8": CONV2D_SILU_S8,
+    "conv2d_pool_s8": CONV2D_POOL_S8,
     "maxpool2d_s8": MAXPOOL2D_S8,
     "add_s8": ADD_S8,
     "batchnorm2d_s8": BATCHNORM2D_S8,
