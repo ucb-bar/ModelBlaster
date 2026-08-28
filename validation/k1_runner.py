@@ -96,6 +96,12 @@ def main() -> int:
                     help="topology label for the profile tree; defaults to --cpu")
     ap.add_argument("--profile-clock-mhz", type=float, default=DEFAULT_CLOCK_MHZ,
                     help="rdtime frequency, NOT the core clock (default 24 MHz)")
+    ap.add_argument("--gen-dir", default=None,
+                    help="build dir holding kernel_picks.json. Records WHAT "
+                         "ran per op in the profile's `implementation` "
+                         "column; without it that column is empty and the "
+                         "profile cannot say whether a dispatch was actually "
+                         "vectorised.")
     ap.add_argument("--pool-sizes", default=None)
     ap.add_argument("--save-output", default=None)
     ap.add_argument("--model-name", default=None,
@@ -134,6 +140,7 @@ def main() -> int:
                        else (args.cpu or "0")),
         profile_clock_mhz=args.profile_clock_mhz,
         quant=args.quant,
+        gen_dir=args.gen_dir,
     )
     models_list = args.models.split(",") if args.models else None
     if args.pool_sizes:

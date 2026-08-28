@@ -110,4 +110,5 @@ fi
     --elf "${BIN}" --host "${HOST}" --cpu "${CPU}" \
     --io "${GEN}/io.npz" --quant "${QUANT}" \
     --profile-csv "${GEN}/profile_k1.csv" --model-name "${MODEL}" \
+    --gen-dir "${GEN}/generated" \
     --repo-root "${REPO_ROOT}" "${PROFILE_ARGS[@]}"
