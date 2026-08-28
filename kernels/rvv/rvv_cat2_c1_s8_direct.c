@@ -29,28 +29,45 @@ void kernel_cat2_c1_s8(const int8_t *in0, int c0, float scale0, const int8_t *in
                 int hw = 0;
                 size_t vl;
                 for (; hw < stride; hw += (int)vl) {
+                    /* Each width domain is entered EXPLICITLY.
+                     *
+                     * GCC 13.2 does not carry vtype across the mixed widths in
+                     * this loop: it left `vsetvli e8,m2` standing and emitted
+                     * `vsext.vf2 v8, v24` under it, which is illegal at SEW=8.
+                     * The kernel SIGILLs on its first dispatch. Same defect,
+                     * same fix, as rvv_batchnorm2d_s8_direct.c -- the
+                     * intrinsics are used correctly and the compiler owes the
+                     * vtype change, so name each transition instead.
+                     *
+                     * Element COUNT is identical throughout (EMUL scales with
+                     * SEW: e8m2, e16m4 and e32m8 all hold the same number of
+                     * elements), so this changes no arithmetic. */
                     vl = __riscv_vsetvl_e8m2(stride - hw);
                     /* Load int8 */
                     vint8m2_t v8 = __riscv_vle8_v_i8m2(src + hw, vl);
                     /* Sign-extend i8 -> i16 */
-                    vint16m4_t v16 = __riscv_vsext_vf2_i16m4(v8, vl);
+                    size_t vl16 = __riscv_vsetvl_e16m4(vl);
+                    vint16m4_t v16 = __riscv_vsext_vf2_i16m4(v8, vl16);
                     /* Sign-extend i16 -> i32 */
-                    vint32m8_t v32 = __riscv_vsext_vf2_i32m8(v16, vl);
+                    size_t vl32 = __riscv_vsetvl_e32m8(vl);
+                    vint32m8_t v32 = __riscv_vsext_vf2_i32m8(v16, vl32);
                     /* Convert int32 -> float32 */
-                    vfloat32m8_t vf = __riscv_vfcvt_f_x_v_f32m8(v32, vl);
+                    vfloat32m8_t vf = __riscv_vfcvt_f_x_v_f32m8(v32, vl32);
                     /* Multiply by ratio */
-                    vf = __riscv_vfmul_vf_f32m8(vf, ratio, vl);
+                    vf = __riscv_vfmul_vf_f32m8(vf, ratio, vl32);
                     /* Round to nearest int32 (round-to-nearest-even via vfcvt) */
-                    vint32m8_t vi = __riscv_vfcvt_x_f_v_i32m8(vf, vl);
+                    vint32m8_t vi = __riscv_vfcvt_x_f_v_i32m8(vf, vl32);
                     /* Narrow i32 -> i16 with saturation */
-                    vint16m4_t vi16 = __riscv_vnclip_wx_i16m4(vi, 0, __RISCV_VXRM_RDN, vl);
+                    vl16 = __riscv_vsetvl_e16m4(vl);
+                    vint16m4_t vi16 = __riscv_vnclip_wx_i16m4(vi, 0, __RISCV_VXRM_RDN, vl16);
                     /* Narrow i16 -> i8 with saturation */
-                    vint8m2_t vi8 = __riscv_vnclip_wx_i8m2(vi16, 0, __RISCV_VXRM_RDN, vl);
+                    size_t vl8 = __riscv_vsetvl_e8m2(vl);
+                    vint8m2_t vi8 = __riscv_vnclip_wx_i8m2(vi16, 0, __RISCV_VXRM_RDN, vl8);
                     /* Clamp to activation range */
-                    vi8 = __riscv_vmax_vx_i8m2(vi8, amin, vl);
-                    vi8 = __riscv_vmin_vx_i8m2(vi8, amax, vl);
+                    vi8 = __riscv_vmax_vx_i8m2(vi8, amin, vl8);
+                    vi8 = __riscv_vmin_vx_i8m2(vi8, amax, vl8);
                     /* Store */
-                    __riscv_vse8_v_i8m2(dst + hw, vi8, vl);
+                    __riscv_vse8_v_i8m2(dst + hw, vi8, vl8);
                 }
             }
             out_c += ci;
