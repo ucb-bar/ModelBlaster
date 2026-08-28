@@ -191,6 +191,11 @@ def parse_profile(text: str, tag: Optional[str] = None) -> Optional[list[dict]]:
     return out
 
 
+#: Below this many rdtime ticks a dispatch's run-to-run spread is mostly timer
+#: quantisation. 240 ticks = 10 us at 24 MHz, so the tick is 0.4% of the sample
+#: and a reported CV is about the kernel rather than about the clock.
+_CV_MIN_TICKS = 240
+
 #: Per-iteration profile blocks emitted when MODELBLASTER_ITERS > 1.
 _ITER_PROF = re.compile(
     r"=== MODELBLASTER_ITER_PROFILE_BEGIN \[(?P<it>\d+)\] ===\n"
@@ -273,10 +278,34 @@ def parse_profile_reps(text: str) -> Optional[list[dict]]:
             if n > 1 and med else 0.0)
         out.append(base)
     if out:
-        print(f"  profile: median of {len(warm)} rep(s)"
-              f"{f' (dropped {dropped} warmup)' if dropped else ''}, "
-              f"worst per-dispatch CV "
-              f"{max(r['cycles_cv_pct'] for r in out):.1f}%")
+        # Report CV only for dispatches long enough for it to MEAN anything.
+        # rdtime ticks at 24 MHz (41.7 ns), so a 1.5 us dispatch is ~36 ticks
+        # and a 0.1 us one is 2-3. At that scale the spread is dominated by
+        # quantisation of the timer, not by the kernel: the hybrid fused_full
+        # profile showed 244.8% CV on a cast_i8_to_f16 costing 36 ticks, which
+        # reads as wild instability and is nothing of the kind. Quoting it as
+        # the run's "worst CV" would make every profile look untrustworthy and
+        # would bury the figures that do matter -- the 0.5-0.7 ms convolutions
+        # in the same run sit at 15-22%, which is a real and interesting number.
+        floor = _CV_MIN_TICKS
+        big = [r for r in out if r["cycles"] >= floor]
+        if big:
+            worst = max(big, key=lambda r: r["cycles_cv_pct"])
+            print(f"  profile: median of {len(warm)} rep(s)"
+                  f"{f' (dropped {dropped} warmup)' if dropped else ''}, "
+                  f"worst CV {worst['cycles_cv_pct']:.1f}% "
+                  f"({worst.get('op') or worst.get('name')}, "
+                  f"{worst['cycles']} ticks)")
+        else:
+            print(f"  profile: median of {len(warm)} rep(s)"
+                  f"{f' (dropped {dropped} warmup)' if dropped else ''}; "
+                  f"every dispatch is under {floor} rdtime ticks, so per-dispatch "
+                  f"CV is timer quantisation and is not reported")
+        small = len(out) - len(big)
+        if small:
+            print(f"           {small} of {len(out)} dispatch(es) under {floor} "
+                  f"ticks; their cycles_cv_pct is in the CSV but is dominated "
+                  f"by the 41.7 ns timer tick")
     return out
 
 
