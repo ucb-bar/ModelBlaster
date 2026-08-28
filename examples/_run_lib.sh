@@ -100,7 +100,8 @@ else
         --model "${MODEL_NAME}" \
         --out-dir "${IR_DIR}" \
         --quant "${QUANT}" \
-        --num-calibration "${NUM_CALIBRATION:-1}"
+        --num-calibration "${NUM_CALIBRATION:-1}" \
+        --fusion-target "${TARGET}"
 fi
 _mb_stage_end extract
 

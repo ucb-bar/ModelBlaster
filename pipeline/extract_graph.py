@@ -488,6 +488,63 @@ def _requantize_int(acc: np.ndarray, multiplier: int, shift: int) -> np.ndarray:
         return prod.astype(np.int32) << (-shift)
 
 
+# Targets where the NEW extended-fusion ops (conv2d_silu_s8, conv2d_pool_s8)
+# are safe to fire today. Neither op has ANY curated/vectorized kernel yet
+# on ANY backend (both are new, first-cut -- see their KernelSpecs in
+# reference_kernels.py) -- so firing them always costs the acceleration the
+# UNFUSED ops already have there (conv2d_s8's curated RVV/gemmini kernel,
+# silu_s8's / maxpool2d_s8's own curated kernels), in exchange for one
+# fewer dispatch + no intermediate DRAM round trip. On RVV that trade is a
+# clear net loss today: dronet's best-validated RVV config (7,496,398
+# cycles) uses a tuned conv2d_s8 AND a 3.44x-optimised maxpool2d_s8: fusing
+# them into a reference-only conv2d_pool_s8 would silently regress it.
+#
+# This list USED to hold {gemmini, gemmini_q31, gemmini_q31_rvv}, on the
+# stated assumption that "on Gemmini the trade is directionally the
+# intended one" because Gemmini's accumulator drains straight into
+# activation+pool hardware. That assumption has now been FALSIFIED by
+# FPGA measurement on every entry it contained:
+#
+#   conv2d_pool_s8  dronet   gemmini_q31       14,147,329 ->    110,818,876   7.84x SLOWER
+#   conv2d_silu_s8  yolov8n  gemmini_q31      315,521,575 -> 12,819,955,173  40.6x SLOWER
+#   conv2d_pool_s8  dronet   gemmini_q31_rvv    2,478,782 ->    105,675,367  42.6x SLOWER
+#
+# All three are numerically exact (max_abs_err=0) -- they are pure
+# performance losses. Two distinct causes, both structural:
+#
+#   1. conv2d_silu_s8 has NO curated kernel on ANY backend (its only
+#      algorithm is `direct`, the scalar reference), so fusing always
+#      discards a curated conv2d_s8 and lands on scalar.
+#   2. conv2d_pool_s8's gemmini_tiled_conv_pool is affinity-tagged
+#      ('gemmini','gemmini_q31') only -- NOT gemmini_q31_rvv -- so on that
+#      target it also falls all the way back to the scalar reference,
+#      costing 97% of the model in a single op.
+#
+# Fusion here is a PREREQUISITE for a win, not a win: it only pays once a
+# curated fused kernel exists AND is affinity-tagged for the target. So the
+# list is now EMPTY and extended fusion fires nowhere. The --enable-fusion
+# flag and all the machinery stay in place; re-add a target here only
+# alongside an FPGA measurement showing it beats the unfused path.
+#
+# extract_graph's IR is otherwise target-independent by design (generated/
+# holds target-indep IR; generated/<target>/ holds the target-specific
+# code) -- this allowlist is a deliberate, narrow exception scoped to ONLY
+# the extended-fusion opt-in path, not a general target-coupling of the IR.
+_FUSION_SAFE_TARGETS: frozenset = frozenset()  # see above: every prior
+# entry was measured as a 7.8x-42.6x regression. Re-add only with an FPGA
+# measurement showing the fused path beats the unfused one.
+
+
+def _fusion_target_is_safe(fusion_target: "str | None") -> bool:
+    """True if extended fusion (conv2d_silu_s8 / conv2d_pool_s8) is allowed
+    to fire for the given eventual build target. Fails CLOSED: an unknown
+    or unspecified target (fusion_target=None, e.g. a caller that hasn't
+    been updated to pass --fusion-target) is treated as unsafe, since the
+    risk is a SILENT regression on exactly the targets (rvv, scalar) that
+    already have good curated kernels for the unfused ops."""
+    return fusion_target in _FUSION_SAFE_TARGETS
+
+
 def _sim_conv2d_int32_acc(in_4d: np.ndarray, w_q: np.ndarray, b_q: np.ndarray,
                           sh: dict, input_offset: int, filter_offset: int
                           ) -> np.ndarray:
@@ -778,6 +835,7 @@ def extract_int8(
     fp16_op_names: "set[str] | None" = None,
     per_channel: bool = False,
     enable_fusion: bool = False,
+    fusion_target: "str | None" = None,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -803,6 +861,15 @@ def extract_int8(
     still emits as two ops (conv2d_s8 + silu_s8, byte-identical to the
     pre-flag behavior) — both configurations stay reachable so the two can
     be measured against each other.
+
+    `fusion_target` (default None) names the eventual build target this IR
+    is headed for (e.g. "rvv", "gemmini_q31") -- extract_graph's IR is
+    otherwise target-independent, but the extended-fusion ops have no
+    curated kernel on ANY backend yet, so firing them on a target that
+    already has a fast curated kernel for the UNFUSED ops (rvv, scalar)
+    would be a silent regression. See _FUSION_SAFE_TARGETS. Passing None
+    with enable_fusion=True fails closed (no extended fusion fires) rather
+    than assuming safety.
 
     Supported ops in this first cut: nn.Linear, nn.ReLU, torch.relu.
     Any other op kind raises — extend this function as more ops gain int8
@@ -942,6 +1009,10 @@ def extract_int8(
     # below covers it; extending to "conv -(folded relu)-> maxpool"
     # chains is a documented follow-up, not attempted here.
     fused_conv2d_pool: set[str] = set()
+    # Extended fusion only actually fires when BOTH the opt-in flag is set
+    # AND the eventual target is in the safe set (see _fusion_target_is_safe)
+    # -- computed once here, used at both gate points below.
+    _extended_fusion_ok = enable_fusion and _fusion_target_is_safe(fusion_target)
     for i, node in enumerate(nodes):
         if i + 1 >= len(nodes):
             continue
@@ -969,7 +1040,7 @@ def extract_int8(
             nxt.op == "call_module"
             and isinstance(gm.get_submodule(nxt.target), torch.nn.MaxPool2d)
         )
-        if (enable_fusion and is_next_maxpool
+        if (_extended_fusion_ok and is_next_maxpool
                 and len(nxt.args) == 1 and nxt.args[0] is node
                 and node.op == "call_module"
                 and isinstance(gm.get_submodule(node.target), torch.nn.Conv2d)):
@@ -991,7 +1062,7 @@ def extract_int8(
                 # activation_min/max fields, and it's new/unproven end to
                 # end. Off by default keeps the pre-existing two-op
                 # (conv2d_s8 + silu_s8) behavior reachable for comparison.
-                if enable_fusion and isinstance(producer_mod, torch.nn.Conv2d):
+                if _extended_fusion_ok and isinstance(producer_mod, torch.nn.Conv2d):
                     fused_conv2d_silu.add(nxt.name)
             elif isinstance(producer_mod, torch.nn.Linear):
                 fused_linear_relu.add(nxt.name)
@@ -2135,6 +2206,8 @@ def extract_int8(
         "schema_version": 1,
         "extractor": "extract_graph",
         "enable_fusion": enable_fusion,
+        "fusion_target": fusion_target,
+        "extended_fusion_active": _extended_fusion_ok,
         "n_fx_nodes": len(nodes),
         "n_ir_ops": len(ir["ops"]),
         "passes": {
@@ -2204,6 +2277,7 @@ def extract(
     fp16_op_names: "set[str] | None" = None,
     per_channel: bool = False,
     enable_fusion: bool = False,
+    fusion_target: "str | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -2226,6 +2300,7 @@ def extract(
             fp16_op_names=fp16_op_names,
             per_channel=per_channel,
             enable_fusion=enable_fusion,
+            fusion_target=fusion_target,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -3405,6 +3480,19 @@ def main() -> None:
                          "comparison. Can also be set via "
                          "MB_ENABLE_FUSION=1. No-op for fp32 / fp16 "
                          "(int8-only today).")
+    ap.add_argument("--fusion-target", default=os.environ.get("MB_FUSION_TARGET"),
+                    help="eventual build target this IR is headed for (e.g. "
+                         "'rvv', 'gemmini_q31') -- required (with "
+                         "--enable-fusion) for the extended-fusion ops "
+                         "(conv2d_silu_s8, conv2d_pool_s8) to actually "
+                         "fire. Neither has a curated kernel on ANY "
+                         "backend yet, so firing on a target that already "
+                         "has good curated kernels for the UNFUSED ops "
+                         "(rvv, scalar) would silently regress it -- so "
+                         "this is restricted to gemmini/gemmini_q31/"
+                         "gemmini_q31_rvv (see _FUSION_SAFE_TARGETS in "
+                         "this file) and fails CLOSED (no extended fusion) "
+                         "if omitted. Also settable via MB_FUSION_TARGET.")
     args = ap.parse_args()
 
     if args.model == "mlp_generic":
@@ -3495,7 +3583,8 @@ def main() -> None:
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names,
             per_channel=getattr(args, "per_channel", False),
-            enable_fusion=getattr(args, "enable_fusion", False))
+            enable_fusion=getattr(args, "enable_fusion", False),
+            fusion_target=getattr(args, "fusion_target", None))
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry

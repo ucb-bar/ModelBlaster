@@ -1233,6 +1233,30 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['pool_PH']}, {sh['pool_PW']}, "
                 f"{sh['pool_DH']}, {sh['pool_DW']})"
             )
+
+        elif op["op"] == "conv2d_silu_s8":
+            # Fused conv2d + SiLU (extended fusion, --enable-fusion /
+            # MB_ENABLE_FUSION=1). Direct (non-parallelized) call, like
+            # conv2d_pool_s8 above -- no curated kernel exists for this op
+            # yet (new/unproven end to end), so it always runs the plain
+            # reference_kernels.py C reference impl regardless of target
+            # until someone curates a vectorized version.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"])
+            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_conv2d_silu_s8({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{q['output_multiplier']}, {q['output_shift']}, "
+                f"{q['activation_min']}, {q['activation_max']}, "
+                f"{_f32(q['silu_scale_in'])}, {_f32(q['silu_scale_out'])})"
+            )
         elif op["op"] == "maxpool2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
