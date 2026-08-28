@@ -264,6 +264,14 @@ print(' '.join(get('${bs}').resolved_kernel_cflags('${REPO_ROOT}')))
     [[ -n "${KF}" ]] && CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CFLAGS_${BS_UPPER}=${KF}")
 done
 [[ "${TRACE}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_TRACE=ON")
+# Compile kernels.c with a different compiler than the rest. Needed for the
+# Zvfh fp16 kernels, whose intrinsics do not exist in GCC 13.2 -- the only
+# riscv64-unknown-linux-gnu compiler here. Same variable and same meaning as
+# scripts/run_model_k1.sh, so the standalone and scheduled paths agree.
+# Unset by default; see harness_xpurt_linux/CMakeLists.txt for why it is an
+# explicit opt-in rather than a search.
+[[ -n "${MODELBLASTER_KERNEL_CC:-}" ]] && \
+    CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CC=${MODELBLASTER_KERNEL_CC}")
 
 cmake -S harness_xpurt_linux -B "${BUILD_DIR}" "${CMAKE_ARGS[@]}" >"${BUILD_DIR}/cmake.log" 2>&1 \
     || { echo "cmake configure failed; tail of ${BUILD_DIR}/cmake.log:" >&2; tail -30 "${BUILD_DIR}/cmake.log" >&2; exit 1; }
