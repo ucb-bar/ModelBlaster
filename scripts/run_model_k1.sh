@@ -86,6 +86,20 @@ make -s -C "${REPO_ROOT}/harness_linux" \
     MODEL_DIR="${GEN}/generated" CROSS="${CROSS}" \
     KERNEL_CFLAGS="${KERNEL_CFLAGS}" OUT="${BIN}"
 
+# Gate: refuse to deploy a binary carrying an instruction the board will
+# refuse. GCC 13.2 does not reliably carry vtype across a kernel's width
+# changes, and the result is not a build error -- it is a SIGILL on the first
+# dispatch that reaches the bad instruction. Three curated kernels shipped one.
+# Each was found by decoding badaddr out of dmesg, one model at a time; this
+# finds them at build time instead.
+if command -v "${CROSS}objdump" >/dev/null 2>&1; then
+    if ! "${PY}" "${REPO_ROOT}/scripts/check_rvv_vtype.py" \
+            --objdump "${CROSS}objdump" "${BIN}"; then
+        echo "refusing to deploy ${BIN}" >&2
+        exit 1
+    fi
+fi
+
 echo "=== 5/5 deploy + run on ${HOST} (pinned to cpu ${CPU}) ==="
 PROFILE_ARGS=()
 if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
