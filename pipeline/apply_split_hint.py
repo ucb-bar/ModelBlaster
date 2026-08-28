@@ -300,6 +300,20 @@ def apply_split_hint(graph: dict[str, Any],
     # Untouched ops get a single-element list so consumers never have to
     # branch on the value type. (`apply_fusion_hint.py` emits the same
     # field scalar-valued — fusion is many-to-one.)
+    # `dispatches` is documented by extract_graph as "the ordered list of
+    # dispatch_ids" (:57), and it was being carried through the rewrite
+    # unchanged -- so every rewritten graph on disk describes the PRE-rewrite
+    # dispatch set. Measured: a fused mlp_control graph with 4 ops still
+    # claimed 7 dispatches; a split DroNet graph with 22 ops claimed 21.
+    #
+    # It is currently harmless on the main path because emit_dispatch_graph
+    # walks `ops`, not this field. It is not harmless everywhere:
+    # ModelBlaster/scripts/plot_frequency_sweep_v2.py:105 reads
+    # `len(fx["dispatches"])` as the op count, which is wrong by exactly the
+    # rewrite delta -- silently, and in a plot.
+    if isinstance(out.get("dispatches"), list):
+        out["dispatches"] = [o["dispatch_id"] for o in new_ops
+                             if o.get("dispatch_id") is not None]
     out["id_remap"] = {str(old): list(new)
                        for old, new in sorted(id_remap.items())}
     return out
