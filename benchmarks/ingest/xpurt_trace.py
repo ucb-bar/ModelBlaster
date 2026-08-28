@@ -6,7 +6,10 @@ and ``MODELBLASTER_XPURT_TRACE_END`` when the binary is built with
 ``-DMODELBLASTER_XPURT_TRACE=ON``. Each row carries
 (entry_id, network, instance, dispatch_id, op, name, core_kind,
 hart, predicted_start_ms, predicted_duration_ms, worker_kind_idx,
-actual_start_cycles, actual_end_cycles).
+worker_hart, actual_start_cycles, actual_end_cycles). ``hart`` is where
+the schedule placed the dispatch; ``worker_hart`` is where it actually
+ran -- equal for every executed row since the walker spawns one worker
+per (core_kind, hart), and -1 for a row no worker executed.
 
 Metrics that fire only on heterogeneous targets. The aggregator's
 nullable_if rules in ``config/metrics.yaml`` suppress them on
