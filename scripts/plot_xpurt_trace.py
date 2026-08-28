@@ -6,15 +6,16 @@ when built with ``-DMODELBLASTER_XPURT_TRACE=ON``. Each row carries:
 
   entry_id, network, instance, dispatch_id, op, name, core_kind, hart,
   predicted_start_ms, predicted_duration_ms, worker_kind_idx,
-  actual_start_cycles, actual_end_cycles
+  worker_hart, actual_start_cycles, actual_end_cycles
 
 We render two stacked Gantt charts:
   * top: XPU-RT's predicted schedule (predicted_start_ms / duration_ms)
   * bottom: actual measured execution (actual_start/end_cycles divided
     by the assumed clock_mhz)
 
-with bars colored by network and grouped on lanes by worker_kind_idx
-(predicted side: by core_kind+hart). Red lines flag entries whose
+with bars colored by network and grouped on lanes by
+(core_kind, worker_hart) -- one lane per scheduler worker, matching the
+predicted side's (core_kind, hart) lanes so the two axes line up. Red lines flag entries whose
 actual end exceeded the predicted finish, the most actionable signal
 for tuning the schedule against measured cost.
 
@@ -57,10 +58,27 @@ class TraceEntry:
     worker_kind_idx: int
     actual_start_ms: float
     actual_end_ms: float
+    # Hart of the worker that actually executed the row. Emitted since the
+    # walker started spawning one worker per (core_kind, hart); -1 both for
+    # traces produced before that column existed and for rows no worker ran.
+    worker_hart: int = -1
 
     @property
     def actual_duration_ms(self) -> float:
         return max(self.actual_end_ms - self.actual_start_ms, 0.0)
+
+    @property
+    def worker_lane(self) -> tuple[str, int]:
+        """Lane key for the actual-execution axis.
+
+        Must be per (kind, hart), not per kind: with one worker per hart a
+        kind-keyed lane stacks four independent workers into one row, which
+        renders genuine inter-dispatch parallelism as if it were still
+        serialized. Falls back to the kind index for pre-worker_hart
+        traces, where a kind really did mean one thread."""
+        if self.worker_hart >= 0:
+            return (self.core_kind, self.worker_hart)
+        return (self.core_kind, -1)
 
 
 def _read_text(path: str) -> str:
@@ -104,6 +122,7 @@ def parse_trace(text: str, clock_mhz: float) -> list[TraceEntry]:
             worker_kind_idx=int(r["worker_kind_idx"]),
             actual_start_ms=actual_start_cyc / cycles_per_ms,
             actual_end_ms=actual_end_cyc / cycles_per_ms,
+            worker_hart=int(r.get("worker_hart", -1) or -1),
         ))
     return rows
 
@@ -114,7 +133,7 @@ def write_csv(rows: list[TraceEntry], path: str) -> None:
     converted-to-ms variants."""
     cols = [
         "entry_id", "network", "instance", "dispatch_id", "op", "name",
-        "core_kind", "hart", "worker_kind_idx",
+        "core_kind", "hart", "worker_kind_idx", "worker_hart",
         "predicted_start_ms", "predicted_duration_ms",
         "actual_start_ms", "actual_end_ms", "actual_duration_ms",
     ]
@@ -124,7 +143,7 @@ def write_csv(rows: list[TraceEntry], path: str) -> None:
         for r in rows:
             w.writerow([
                 r.entry_id, r.network, r.instance, r.dispatch_id, r.op, r.name,
-                r.core_kind, r.hart, r.worker_kind_idx,
+                r.core_kind, r.hart, r.worker_kind_idx, r.worker_hart,
                 f"{r.predicted_start_ms:.6f}", f"{r.predicted_duration_ms:.6f}",
                 f"{r.actual_start_ms:.6f}", f"{r.actual_end_ms:.6f}",
                 f"{r.actual_duration_ms:.6f}",
@@ -184,8 +203,14 @@ def render_plot(rows: list[TraceEntry], out_path: str,
     )
     pred_lane_idx = {k: i for i, k in enumerate(pred_lane_keys)}
 
-    # Actual-side lanes: one per worker_kind_idx that ran something.
-    actual_lane_keys = sorted({r.worker_kind_idx for r in rows})
+    # Actual-side lanes: one per (core_kind, hart) worker that ran something.
+    # Built from EXECUTED rows only. Zero-cost IR ops (view, chunk2_c1) get
+    # dispatch_id=-1 from ingest, are skipped before the trace write, and so
+    # carry worker_hart=-1 -- letting them in adds a permanently empty
+    # "#worker" lane that reads like a worker that did nothing.
+    _executed = [r for r in rows if r.actual_end_ms > 0.0]
+    actual_lane_keys = sorted({r.worker_lane for r in (_executed or rows)},
+                              key=lambda x: (x[0], x[1]))
     actual_lane_idx = {k: i for i, k in enumerate(actual_lane_keys)}
 
     pred_makespan = max(r.predicted_start_ms + r.predicted_duration_ms for r in rows)
@@ -209,10 +234,11 @@ def render_plot(rows: list[TraceEntry], out_path: str,
         overrun = r.actual_end_ms > pred_end + 0.001
         edge = "red" if overrun else "black"
         ew = 1.0 if overrun else 0.3
-        ax_actual.barh(actual_lane_idx[r.worker_kind_idx],
-                       r.actual_duration_ms,
-                       left=r.actual_start_ms, height=bar_h,
-                       color=c, edgecolor=edge, linewidth=ew)
+        if r.worker_lane in actual_lane_idx:
+            ax_actual.barh(actual_lane_idx[r.worker_lane],
+                           r.actual_duration_ms,
+                           left=r.actual_start_ms, height=bar_h,
+                           color=c, edgecolor=edge, linewidth=ew)
 
     ax_pred.set_yticks(list(pred_lane_idx.values()))
     ax_pred.set_yticklabels([f"{kind}#hart{hart}"
@@ -224,7 +250,9 @@ def render_plot(rows: list[TraceEntry], out_path: str,
     ax_pred.grid(axis="x", alpha=0.3)
 
     ax_actual.set_yticks(list(actual_lane_idx.values()))
-    ax_actual.set_yticklabels([f"worker[{i}]" for i in actual_lane_keys])
+    ax_actual.set_yticklabels([
+        f"{kind}#hart{hart}" if hart >= 0 else f"{kind}#worker"
+        for kind, hart in actual_lane_keys])
     ax_actual.set_title(
         f"Actual execution on {source} "
         f"(red border = ran past predicted finish)")
@@ -290,7 +318,7 @@ def main() -> None:
                   f"{r.predicted_duration_ms:6.3f}ms]  "
                   f"actual=[{r.actual_start_ms:7.3f}+"
                   f"{r.actual_duration_ms:6.3f}ms]  "
-                  f"worker[{r.worker_kind_idx}]")
+                  f"worker[{r.worker_lane[0]}#hart{r.worker_lane[1]}]")
 
 
 if __name__ == "__main__":
