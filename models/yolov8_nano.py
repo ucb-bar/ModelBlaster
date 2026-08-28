@@ -21,7 +21,8 @@ backbone/neck channel counts are identical; head re-init to a smaller
 `nc` would be a fine-tune-time concern, out of scope here.
 
 Env knobs:
-  MODELBLASTER_YOLOV8N_INPUT       default 160 (must be a multiple of 32)
+  MODELBLASTER_YOLOV8N_INPUT       default 160. `96` = square, `64x96` = H x W.
+                                   Every dimension must be a multiple of 32.
   MODELBLASTER_YOLOV8N_NC          default 80 (COCO classes)
   MODELBLASTER_YOLOV8N_PRETRAINED  default 1 (load yolov8n.pt; 0 → random init)
 """
@@ -358,13 +359,55 @@ def _load_ultralytics_weights(model: YOLOv8Nano) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _cfg() -> tuple[int, int, bool]:
-    img = int(os.environ.get("MODELBLASTER_YOLOV8N_INPUT", 160))
-    if img % 32 != 0:
+def parse_input_size(raw: str) -> tuple[int, int]:
+    """`"96"` -> (96, 96); `"64x96"` or `"64,96"` -> (64, 96), as (H, W).
+
+    WHY RECTANGULAR INPUT EXISTS. A square input forces a non-square camera
+    frame to be letterboxed, and the padding is then convolved at full cost
+    through the entire backbone. For a 90x60 (WxH) FPV frame letterboxed into
+    96x96, a third of every tensor is constant grey -- measured against the
+    fitted per-shape cost model, 88.5 ms of which ~26 ms buys nothing.
+
+    Matching the aspect instead (64x96 for a 3:2 frame) keeps every real pixel
+    and drops the padding to zero. It is not a speed/accuracy trade; it is
+    declining to convolve over grey bars.
+
+    Both dimensions must be multiples of 32 -- YOLOv8's deepest level
+    downsamples by 32, so a non-multiple has no valid stride-32 feature map.
+    """
+    txt = str(raw).strip().lower().replace(",", "x")
+    parts = [p for p in txt.split("x") if p]
+    try:
+        vals = [int(p) for p in parts]
+    except ValueError:
         raise SystemExit(
-            f"MODELBLASTER_YOLOV8N_INPUT={img} must be a multiple of 32 "
-            f"(YOLOv8 stride-32 head requires it)."
-        )
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r} is not a size. Use `96` for "
+            f"square or `64x96` for rectangular (H x W).")
+    if len(vals) == 1:
+        h = w = vals[0]
+    elif len(vals) == 2:
+        h, w = vals
+    else:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r} has {len(vals)} dimensions; "
+            f"want 1 (square) or 2 (H x W).")
+    bad = [n for n in (h, w) if n <= 0 or n % 32 != 0]
+    if bad:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r}: {bad} not a positive "
+            f"multiple of 32 (YOLOv8 stride-32 head requires it).")
+    return h, w
+
+
+def _cfg() -> tuple[tuple[int, int], int, bool]:
+    """`((H, W), nc, pretrained)`.
+
+    The first element became a PAIR rather than an int when rectangular input
+    landed. Every caller unpacks it as `img`, so an accidental `(img, img)`
+    downstream would now build a 4-D shape and fail loudly rather than
+    silently squaring one dimension.
+    """
+    img = parse_input_size(os.environ.get("MODELBLASTER_YOLOV8N_INPUT", "160"))
     nc = int(os.environ.get("MODELBLASTER_YOLOV8N_NC", 80))
     pretrained = os.environ.get("MODELBLASTER_YOLOV8N_PRETRAINED", "1") == "1"
     return img, nc, pretrained
@@ -429,11 +472,11 @@ def get_sample_input(seed: int = 1) -> torch.Tensor:
             from PIL import Image  # noqa: PLC0415
             from torchvision import transforms  # noqa: PLC0415
             tfm = transforms.Compose([
-                transforms.Resize((img, img)),
+                transforms.Resize(img),   # (H, W)
                 transforms.ToTensor(),  # HWC [0,255] -> CHW [0,1]
             ])
             pil = Image.open(p).convert("RGB")
-            return tfm(pil).unsqueeze(0)  # (1, 3, img, img)
+            return tfm(pil).unsqueeze(0)  # (1, 3, H, W)
         except Exception as e:
             print(f"[yolov8_nano.get_sample_input] WARN: couldn't load "
                   f"{p} ({e}); falling back to torch.randn.")
@@ -443,7 +486,7 @@ def get_sample_input(seed: int = 1) -> torch.Tensor:
           f"calibration). Set MODELBLASTER_YOLOV8N_CALIB_IMAGE to a "
           f"real RGB image to fix.")
     g = torch.Generator().manual_seed(seed)
-    return torch.randn(1, 3, img, img, generator=g)
+    return torch.randn(1, 3, img[0], img[1], generator=g)
 
 
 def get_calibration_spec(num_samples: int = 16) -> dict:
@@ -480,7 +523,7 @@ def get_calibration_spec(num_samples: int = 16) -> dict:
             "x": {
                 "loader": "image_dir",
                 "path": src,
-                "image_size": [img, img],
+                "image_size": [img[0], img[1]],
                 "normalize": "none",
                 "compose": {"kind": "one_per_sample"},
             },
