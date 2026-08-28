@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -152,6 +153,86 @@ class Conv2dSplitBasicTest(unittest.TestCase):
         self.assertEqual(len(ops), 3)
         tail = ops[-1]
         self.assertEqual(set(tail["depends_on"]), {0, 1})
+
+
+class IdRemapTest(unittest.TestCase):
+    """`id_remap` must let a consumer recover any op's new identity.
+
+    Regression for the dropped-mapping bug: inserting N tiles in place
+    of one op shifts every id after the split point, so ops that were
+    never split still change identity. Any artifact keyed on
+    dispatch_id (the profile CSV, the cost DB, SchedulerReport rows,
+    Gantt labels) then joins against the wrong op.
+    """
+
+    def _chain(self):
+        # lin0 (splittable) followed by two ops that are NOT touched.
+        return _g(
+            _linear_op(0, "lin0", M=1, K=32, N=64),
+            _linear_op(1, "lin1", M=1, K=64, N=16,
+                       inputs=["y"], outputs=["z"], depends_on=[0]),
+            _linear_op(2, "lin2", M=1, K=16, N=8,
+                       inputs=["z"], outputs=["w"], depends_on=[1]),
+        )
+
+    def test_untouched_op_identity_is_recoverable(self):
+        out = apply_split_hint(self._chain(), [{"op": 0, "n_splits": 2}])
+        remap = out["id_remap"]
+        by_new = {o["dispatch_id"]: o for o in out["ops"]
+                  if o.get("dispatch_id") is not None}
+        # lin2 was id 2 and was NOT split, yet the two inserted tiles
+        # pushed it to id 3.
+        self.assertEqual(remap["2"], [3])
+        self.assertEqual(by_new[remap["2"][0]]["name"], "lin2")
+        self.assertEqual(by_new[remap["1"][0]]["name"], "lin1")
+
+    def test_split_op_maps_to_all_its_tiles(self):
+        out = apply_split_hint(self._chain(), [{"op": 0, "n_splits": 4}])
+        remap = out["id_remap"]
+        # One-to-many must be expressed honestly: keeping only the first
+        # tile would make a consumer attribute the whole op's cost to a
+        # quarter of the work.
+        self.assertEqual(remap["0"], [0, 1, 2, 3])
+        by_new = {o["dispatch_id"]: o for o in out["ops"]
+                  if o.get("dispatch_id") is not None}
+        for tile_idx, new_id in enumerate(remap["0"]):
+            self.assertEqual(by_new[new_id]["split_from"]["tile"], tile_idx)
+
+    def test_remap_values_are_always_lists(self):
+        # Untouched ops get single-element lists so consumers never have
+        # to branch on the value type.
+        out = apply_split_hint(self._chain(), [{"op": 0, "n_splits": 2}])
+        for old, new in out["id_remap"].items():
+            self.assertIsInstance(new, list, f"id_remap[{old!r}]")
+            self.assertTrue(new)
+
+    def test_remap_covers_every_input_id(self):
+        g = self._chain()
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        original_ids = {str(o["dispatch_id"]) for o in g["ops"]
+                        if o.get("dispatch_id") is not None}
+        self.assertEqual(set(out["id_remap"]), original_ids)
+
+    def test_remap_is_json_round_trippable(self):
+        # The IR is written with json.dump, so keys must already be
+        # strings — int keys would silently stringify on write and
+        # mismatch anything comparing keys across the file round trip.
+        out = apply_split_hint(self._chain(), [{"op": 0, "n_splits": 2}])
+        self.assertEqual(out["id_remap"],
+                         json.loads(json.dumps(out))["id_remap"])
+        self.assertTrue(all(isinstance(k, str) for k in out["id_remap"]))
+
+    def test_remap_agrees_with_rewired_depends_on(self):
+        # The mapping isn't a separate bookkeeping channel: it must be
+        # the same renumbering the rewrite applied to depends_on, or a
+        # consumer translating through it lands on a different graph
+        # than the scheduler sees.
+        out = apply_split_hint(self._chain(), [{"op": 0, "n_splits": 2}])
+        remap = out["id_remap"]
+        by_new = {o["dispatch_id"]: o for o in out["ops"]
+                  if o.get("dispatch_id") is not None}
+        lin1_new = remap["1"][0]
+        self.assertEqual(by_new[lin1_new]["depends_on"], remap["0"])
 
 
 if __name__ == "__main__":

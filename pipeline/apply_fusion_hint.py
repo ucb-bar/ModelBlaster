@@ -21,6 +21,18 @@ the codegen path knows which ones to keep stack-local inside the fused
 function body. Downstream ops have their `depends_on` rewired to the
 fused op's new id; ids are reassigned contiguously.
 
+Because the renumbering shifts ops that were never fused, the output
+graph carries an `id_remap` field mapping every input `dispatch_id` to
+its id in the rewritten graph (JSON object keys are strings)::
+
+    "id_remap": {"0": 0, "1": 0, "2": 1, "3": 2}
+
+Fusion is many-to-one: the members of a fuse_group all map to the single
+fused op's id (above, ops 0 and 1 fused into new id 0). Consumers keyed
+on dispatch_id must translate through this before joining a pre-rewrite
+profile / cost DB against a post-rewrite graph. (`apply_split_hint.py`
+emits the same field, but list-valued — splitting is one-to-many.)
+
 CLI:
 
     python -m modelblaster.pipeline.apply_fusion_hint \\
@@ -78,6 +90,46 @@ def _producers(ops: list[dict[str, Any]]) -> dict[str, int]:
     return out
 
 
+def _dep_edges(ops_by_id: dict[int, dict[str, Any]],
+               ) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Build (successors, predecessors) over dispatch_id space.
+
+    `depends_on` gives predecessors; the successor map is its reverse.
+    Deps pointing at ids that aren't in the graph (view ops, dangling
+    references) are dropped — the rewrite ignores them too, so the
+    reachability check must agree with what actually gets emitted.
+    """
+    succ: dict[int, list[int]] = {did: [] for did in ops_by_id}
+    pred: dict[int, list[int]] = {did: [] for did in ops_by_id}
+    for did, op in ops_by_id.items():
+        for dep in op.get("depends_on", []):
+            if dep not in ops_by_id:
+                continue
+            pred[did].append(dep)
+            succ[dep].append(did)
+    return succ, pred
+
+
+def _closure(seeds: set[int], edges: dict[int, list[int]],
+             ) -> dict[int, int]:
+    """Nodes reachable from `seeds` along `edges` -> witness seed.
+
+    The witness is the seed the BFS entered from, so a failure can name
+    *which* group members the offending op sits between instead of just
+    reporting that some path exists.
+    """
+    reached: dict[int, int] = {}
+    frontier = [(s, s) for s in seeds]
+    while frontier:
+        node, seed = frontier.pop()
+        for nxt in edges.get(node, ()):
+            if nxt in reached:
+                continue
+            reached[nxt] = seed
+            frontier.append((nxt, seed))
+    return reached
+
+
 def _validate_fuse_group(
     group: list[int],
     ops_by_id: dict[int, dict[str, Any]],
@@ -115,6 +167,36 @@ def _validate_fuse_group(
                     f"order — op {did} depends on group member {dep} which "
                     f"appears later")
         seen.add(did)
+
+    # Dependency closure. The group collapses to ONE node, so every op
+    # on a path between two members gets an edge in both directions:
+    # it still depends on the fused op (via the earlier member) and the
+    # fused op still depends on it (via the later member). That is a
+    # 2-cycle, and nothing downstream catches it — the rewrite emits a
+    # structurally valid graph.json that simply cannot be scheduled.
+    #
+    # An op is "between" two members iff it is BOTH a descendant of some
+    # member and an ancestor of some member. Note this is a graph
+    # property, not an id-range one: non-contiguous dispatch_ids are
+    # perfectly legal to fuse (parallel branches, ids assigned in a
+    # different order than the dataflow) as long as no external op lands
+    # inside the span. Checking id contiguity instead would reject those.
+    succ, pred = _dep_edges(ops_by_id)
+    descendants = _closure(group_set, succ)
+    ancestors = _closure(group_set, pred)
+    trapped = sorted(
+        (set(descendants) & set(ancestors)) - group_set)
+    if trapped:
+        did = trapped[0]
+        name = ops_by_id[did].get("name", "<unnamed>")
+        raise FusionHintError(
+            f"{network}: fuse_group {group} is not closed under its "
+            f"dependency paths — op {did} ({name!r}, "
+            f"{ops_by_id[did].get('op', '?')}) is not in the group but lies "
+            f"on a path from group member {descendants[did]} to group member "
+            f"{ancestors[did]}; fusing would make the fused op depend on "
+            f"itself through it"
+            + (f" (also trapped: {trapped[1:]})" if len(trapped) > 1 else ""))
 
 
 def _merge_hardware_target(group_ops: list[dict[str, Any]]) -> str:
@@ -288,6 +370,12 @@ def apply_hint(
     # registered `linear_s8_elu_s8` KernelSpec. Fall back to the original
     # group when the pattern doesn't fit (caller still gets a synthetic
     # `__fused__...` op).
+    #
+    # The pairs need no second closure check: a pair [a, b] carved out
+    # of an already-validated group can only trap an op that is itself a
+    # member of that group, and such an op would have made the group
+    # non-topological (b depending on a member listed after it), which
+    # the validation above already rejected.
     if pairwise:
         expanded: list[list[int]] = []
         for group in fuse_groups:
@@ -375,6 +463,13 @@ def apply_hint(
             ))
 
     out["ops"] = new_ops
+    # Publish the renumbering. Ids are reassigned contiguously, so ops
+    # that were NOT fused still change identity — without this, anything
+    # keyed on dispatch_id (profile CSVs, cost DBs, SchedulerReports,
+    # Gantt labels) silently re-attaches to the wrong op after a rewrite.
+    # Every id-bearing input op appears exactly once; absorbed group
+    # members map to their fused op's id (many old -> one new).
+    out["id_remap"] = {str(old): new for old, new in sorted(id_remap.items())}
     return out
 
 
