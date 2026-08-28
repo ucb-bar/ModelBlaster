@@ -14,6 +14,19 @@
 #include <stddef.h>
 #include <riscv_vector.h>
 
+/* These intrinsics need RVV intrinsics API >= v0.12 (the fp16 vector types
+ * vfloat16m*_t and vfmacc.vv / vfredusum.vs / vfncvt at SEW=16). GCC 13.2
+ * reports __riscv_v_intrinsic == 11000 and has none of them: it accepts the
+ * calls as implicit declarations, emits warnings rather than errors, and the
+ * build then fails at LINK with undefined __riscv_vle16_v_f16m4 -- or worse,
+ * would pass the wrong types if a declaration existed. Say so here instead.
+ * Fix: build kernels.c with a GCC >= 14 of the same lp64d ABI via
+ * MODELBLASTER_KERNEL_CC (see KERNEL_CC in harness_linux/Makefile). */
+#if !defined(__riscv_v_intrinsic) || __riscv_v_intrinsic < 12000
+#error "curated RVV fp16 kernel needs RVV intrinsics >= v0.12 (GCC >= 14); set MODELBLASTER_KERNEL_CC"
+#endif
+
+
 void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int M, int K, int N) {
