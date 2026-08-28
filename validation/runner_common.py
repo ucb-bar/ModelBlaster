@@ -420,6 +420,10 @@ class IREEProfileArgs:
     profile_cores: str
     profile_clock_mhz: float
     quant: str
+    #: Build dir holding kernel_picks.json, so the profile can record WHAT
+    #: ran per op rather than only how long it took. Optional: without it the
+    #: `implementation` column is empty, which reads as unknown.
+    gen_dir: Optional[str] = None
 
 
 def emit_iree_profile(records: list[dict], model: str,
@@ -439,6 +443,8 @@ def emit_iree_profile(records: list[dict], model: str,
         source=args.profile_source,
         cpu=cpu,
         clock_mhz=args.profile_clock_mhz,
+        picks=(profile_writer.picks_from_build(args.gen_dir)
+               if args.gen_dir else {}),
     )
     return profile_writer.write_profile(records, meta, args.profile_out_root)
 
