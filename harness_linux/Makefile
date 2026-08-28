@@ -14,6 +14,18 @@ MODEL_DIR ?= $(error set MODEL_DIR to a generate_skeleton output directory)
 CROSS     ?=
 OUT       ?= build/harness
 CC        := $(CROSS)gcc
+# Compiler for kernels.c ONLY. Defaults to the same cross gcc as everything
+# else; override when a curated kernel needs a newer compiler than the Linux
+# cross-toolchain provides. The concrete case: the RVV fp16 intrinsics
+# (vfloat16m4_t, vfmacc.vv f16, vfredusum.vs f16) that the Zvfh curated kernels
+# are written against do not exist in GCC 13.2, which is the only
+# riscv64-unknown-linux-gnu compiler installed here; GCC >= 14 has them. Since
+# kernels.c is a leaf translation unit whose only external references are libm
+# (expf/tanhf), an object built by a bare-metal riscv64-unknown-elf gcc of the
+# same lp64d ABI links into this glibc static binary and runs -- verified on the
+# board. Kept as an explicit opt-in rather than a search: a build must not
+# silently change compilers.
+KERNEL_CC ?= $(CC)
 CFLAGS    ?= -O2 -static
 KERNEL_CFLAGS ?=
 INCLUDES  := -I src -I $(MODEL_DIR)
@@ -39,9 +51,11 @@ $(OBJDIR)/weights.o: $(MODEL_DIR)/weights.c | $(OBJDIR)
 $(OBJDIR)/buffers.o: $(MODEL_DIR)/buffers.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-# Only kernels.c gets the backend ISA flags.
+# Only kernels.c gets the backend ISA flags -- and, optionally, its own
+# compiler (see KERNEL_CC above). -static is dropped here because it is a link
+# flag and a bare-metal KERNEL_CC would try to resolve it against newlib.
 $(OBJ_KERNELS): $(MODEL_DIR)/kernels.c | $(OBJDIR)
-	$(CC) $(CFLAGS) $(KERNEL_CFLAGS) $(INCLUDES) -c $< -o $@
+	$(KERNEL_CC) $(filter-out -static,$(CFLAGS)) $(KERNEL_CFLAGS) $(INCLUDES) -c $< -o $@
 
 # test_io.S .incbin's the golden/input blobs; it must assemble from MODEL_DIR
 # so the relative .incbin paths resolve.

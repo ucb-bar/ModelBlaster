@@ -612,6 +612,124 @@ class _CaptureTensors(torch.fx.Interpreter):
         return result
 
 
+def _promote_ops_to_fp16(ops, fp16_names, tensors_meta, weights_blob,
+                         fp32_stash) -> list[str]:
+    """Mixed precision: turn every op whose IR name is in `fp16_names` from its
+    int8 (`*_s8`) kind into the fp16 (`*_f16`) kind, re-store its weights as
+    float16 from the fp32 stash, and mark its output (and, for an LSTM, its
+    recurrent state) as dtype f16. Everything else stays int8; the int8<->fp16
+    boundaries are materialized afterwards by `_insert_casts_i8_f16`.
+
+    Why this exists: the fused sensor net's compute bulk is its int8 encoders,
+    but its accuracy is dominated by the recurrent tail. A per-tensor int8
+    3-layer LSTM loses the answer; the same tail in fp16 costs ~5% of the
+    dispatch time. So precision is chosen per op, not per model.
+
+    Returns the names of the ops that were actually promoted (so a spec naming
+    an op that is not in the graph is reported rather than silently ignored).
+    """
+    promoted: list[str] = []
+    for op in ops:
+        if op["name"] not in fp16_names:
+            op.setdefault("precision", "int8")
+            continue
+        op["precision"] = "fp16"
+        if op["op"].endswith("_s8"):
+            op["op"] = op["op"][:-3] + "_f16"
+        promoted.append(op["name"])
+
+        if op["op"] == "lstm_f16":
+            # The int8 cell carries separate int32-quantized b_ih / b_hh in the
+            # accumulator domain; the fp16 cell takes ONE float bias, so fold
+            # them here (PyTorch adds both anyway).
+            b_key, bh_key = op.get("bias"), op.get("bias_hh")
+            if b_key and b_key in fp32_stash:
+                folded = fp32_stash[b_key].astype(np.float32)
+                if bh_key and bh_key in fp32_stash:
+                    folded = folded + fp32_stash[bh_key].astype(np.float32)
+                weights_blob[b_key] = folded.astype(np.float16)
+            op.pop("bias_hh", None)
+            for wk in ("weight", "weight_hh"):
+                key = op.get(wk)
+                if key and key in fp32_stash:
+                    weights_blob[key] = fp32_stash[key].astype(np.float16)
+        else:
+            for wk in ("weight", "bias", "weight_hh", "bias_hh"):
+                key = op.get(wk)
+                if key and key in fp32_stash:
+                    weights_blob[key] = fp32_stash[key].astype(np.float16)
+
+        # Outputs and recurrent state become f16 surfaces.
+        touched = list(op.get("outputs", []))
+        st = op.get("state")
+        if isinstance(st, dict):
+            touched += [v for v in st.values() if v]
+        elif isinstance(st, (list, tuple)):
+            touched += [v for v in st if v]
+        for t in touched:
+            if t in tensors_meta:
+                meta = dict(tensors_meta[t])
+                meta["dtype"] = "f16"
+                meta["quant"] = None
+                tensors_meta[t] = meta
+    return promoted
+
+
+def _insert_casts_i8_f16(ops, tensors_meta, scales) -> list[dict]:
+    """Materialize `cast_i8_to_f16` / `cast_f16_to_i8` ops at int8<->fp16 tensor
+    boundaries. Same pass as `_ExportWalker.insert_casts` in
+    extract_graph_export.py, applied to the FX int8 IR -- mixed precision is a
+    property of the assembled graph, so each op's emit code stays
+    single-precision.
+    """
+    def consumer_dtype(op) -> str:
+        p = op.get("precision")
+        if p is None:
+            p = "fp16" if op["op"].endswith("_f16") else "int8"
+        return "f16" if p == "fp16" else "i8"
+
+    new_ops: list[dict] = []
+    cast_intermediates: dict[tuple[str, str], str] = {}
+    for op in ops:
+        dst = consumer_dtype(op)
+        for i, in_name in enumerate(op.get("inputs", [])):
+            meta = tensors_meta.get(in_name)
+            if meta is None:
+                continue
+            src = meta.get("dtype", "i8")
+            if src == dst or (src, dst) not in (("i8", "f16"), ("f16", "i8")):
+                continue
+            key = (in_name, dst)
+            cast_out = cast_intermediates.get(key)
+            if cast_out is None:
+                cast_out = f"{in_name}__cast_{dst}"
+                tensors_meta[cast_out] = {
+                    "shape": list(meta["shape"]),
+                    "dtype": dst,
+                    "quant": (None if dst == "f16" else
+                              {"scale": float(scales.get(in_name, 1e-8)),
+                               "zero_point": 0}),
+                }
+                n = 1
+                for d in meta["shape"]:
+                    n *= int(d)
+                new_ops.append({
+                    "name": cast_out,
+                    "op": ("cast_i8_to_f16" if dst == "f16"
+                           else "cast_f16_to_i8"),
+                    "precision": "fp16" if dst == "f16" else "int8",
+                    "inputs": [in_name],
+                    "outputs": [cast_out],
+                    "shape": {"n": n},
+                    "quant": {"scale": float(scales.get(in_name, 1e-8)),
+                              "zero_point": 0},
+                })
+                cast_intermediates[key] = cast_out
+            op["inputs"][i] = cast_out
+        new_ops.append(op)
+    return new_ops
+
+
 def extract_int8(
     model: torch.nn.Module,
     sample_input: "torch.Tensor | list[torch.Tensor] | tuple",
@@ -900,6 +1018,14 @@ def extract_int8(
                 b_key = f"{node.target}.bias_q"
                 weights_blob[w_key] = w_q
                 weights_blob[b_key] = b_q
+                # Keep fp32 copies so promoting this linear to fp16 (mixed
+                # precision) can re-store float16 weights, instead of trying to
+                # invert the int8 quantization.
+                fp32_stash[w_key] = w_fp32.cpu().numpy().astype(np.float32)
+                fp32_stash[b_key] = (
+                    b_fp32.cpu().numpy().astype(np.float32)
+                    if b_fp32 is not None
+                    else np.zeros((mod.out_features,), np.float32))
                 # Requantize: real_mult = s_in * s_w / s_out
                 real_mult = (in_scale * w_scale) / out_scale
                 multiplier, shift = _requantize_multiplier_shift(real_mult)
@@ -1459,6 +1585,21 @@ def extract_int8(
                     weights_blob[f"{base}.w_hh_q"] = q_hh
                     weights_blob[f"{base}.b_ih_q"] = b_ih
                     weights_blob[f"{base}.b_hh_q"] = b_hh
+                    # fp32 copies for a possible fp16 promotion of this layer.
+                    fp32_stash[f"{base}.w_ih_q"] = (
+                        w_ih.cpu().numpy().astype(np.float32))
+                    fp32_stash[f"{base}.w_hh_q"] = (
+                        w_hh.cpu().numpy().astype(np.float32))
+                    if has_bias:
+                        fp32_stash[f"{base}.b_ih_q"] = (
+                            getattr(mod, f"bias_ih_l{layer}").detach()
+                            .cpu().numpy().astype(np.float32))
+                        fp32_stash[f"{base}.b_hh_q"] = (
+                            getattr(mod, f"bias_hh_l{layer}").detach()
+                            .cpu().numpy().astype(np.float32))
+                    else:
+                        fp32_stash[f"{base}.b_ih_q"] = np.zeros((4 * H,), np.float32)
+                        fp32_stash[f"{base}.b_hh_q"] = np.zeros((4 * H,), np.float32)
                     h_name = f"{base}.h_state"
                     c_name = f"{base}.c_state"
                     for nm, sc in ((h_name, h_scale), (c_name, c_scale)):
@@ -1959,6 +2100,22 @@ def extract_int8(
     if not input_names or output_name is None:
         raise RuntimeError("int8 extract: graph missing input/output")
 
+    # Mixed precision: promote the requested ops to fp16 and materialize the
+    # int8<->fp16 boundary casts. With no spec this is a no-op and the IR is
+    # byte-identical to the all-int8 one.
+    if fp16_op_names:
+        promoted = _promote_ops_to_fp16(ops, set(fp16_op_names), tensors_meta,
+                                        weights_blob, fp32_stash)
+        missing = sorted(set(fp16_op_names) - set(promoted))
+        if missing:
+            raise RuntimeError(
+                f"int8 extract: fp16 promotion asked for op(s) {missing} that "
+                f"are not in the graph; the graph has "
+                f"{sorted(o['name'] for o in ops)}. A precision spec that "
+                f"names a nonexistent op would silently leave that op int8.")
+        ops = _insert_casts_i8_f16(ops, tensors_meta, scales)
+        print(f"[extract_int8] fp16 islands: {promoted}", flush=True)
+
     output_tensors = (output_names_multi
                       if output_names_multi is not None
                       else [output_name])
@@ -2323,6 +2480,75 @@ def extract_int8(
             c_each = sh["c_each"]
             activations[op["outputs"][0]] = in_4d[:, :c_each, :, :].astype(np.int8)
             activations[op["outputs"][1]] = in_4d[:, c_each:, :, :].astype(np.int8)
+        # ---- fp16 islands (mixed precision) --------------------------------
+        elif op["op"] == "cast_i8_to_f16":
+            activations[out_name] = (
+                in_arr.astype(np.float32)
+                * np.float32(op["quant"]["scale"])).astype(np.float16)
+        elif op["op"] == "cast_f16_to_i8":
+            inv = np.float32(1.0 / max(float(op["quant"]["scale"]), 1e-30))
+            v = _round_half_away(in_arr.astype(np.float32) * inv)
+            activations[out_name] = np.clip(v, -128, 127).astype(np.int8)
+        elif op["op"] in ("cat2_c1_f16", "cat3_c1_f16", "cat4_c1_f16"):
+            # fp16 concat is a pure copy -- no requantization, which is the
+            # whole point: the int8 version had to squeeze 512 vision features
+            # (max-abs 0.24) onto the optical-flow-dominated output scale.
+            sh = op["shape"]
+            N_, H_, W_ = sh["N"], sh["H"], sh["W"]
+            parts = [activations[n].reshape(N_, c, H_, W_).astype(np.float16)
+                     for n, c in zip(op["inputs"], sh["C_inputs"])]
+            activations[out_name] = np.concatenate(parts, axis=1)
+        elif op["op"] == "linear_f16":
+            # fp16 storage, fp32 accumulate -- matches kernel_linear_f16.
+            sh = op["shape"]
+            w = weights_blob[op["weight"]].astype(np.float32)
+            x = in_arr.reshape(sh["M"], sh["K"]).astype(np.float32)
+            y = x @ w.reshape(sh["N"], sh["K"]).T
+            if op.get("bias"):
+                y = y + weights_blob[op["bias"]].astype(np.float32)
+            activations[out_name] = y.astype(np.float16)
+        elif op["op"] == "lstm_f16":
+            # Mirrors kernel_lstm_f16: fp16 storage AND fp16 gate-GEMM
+            # accumulate (each product rounded to fp16, then added in fp16),
+            # with the sigmoid/tanh/cell update in float32. The fp16 accumulate
+            # is modelled step by step rather than as one matmul, because the
+            # rounding is what the device does.
+            sh = op["shape"]
+            H = int(sh["hidden_size"]); IS = int(sh["input_size"])
+            w_ih = weights_blob[op["weight"]].reshape(4 * H, IS)
+            w_hh = weights_blob[op["weight_hh"]].reshape(4 * H, H)
+            b = weights_blob[op["bias"]].astype(np.float32)
+            h_name, c_name = (op["state"] if isinstance(op["state"], (list, tuple))
+                              else (op["state"]["h"], op["state"]["c"]))
+            h_prev = activations.get(h_name)
+            c_prev = activations.get(c_name)
+            h = (np.zeros(H, np.float16) if h_prev is None
+                 else h_prev.reshape(-1).astype(np.float16))
+            c = (np.zeros(H, np.float32) if c_prev is None
+                 else c_prev.reshape(-1).astype(np.float32))
+            x = in_arr.reshape(-1)[:IS].astype(np.float16)
+            px = (x.astype(np.float32)
+                  * w_ih.astype(np.float32)).astype(np.float16)   # [4H, IS]
+            ph = (h.astype(np.float32)
+                  * w_hh.astype(np.float32)).astype(np.float16)   # [4H, H]
+            ax = np.zeros(4 * H, np.float16)
+            for k in range(IS):
+                ax = (ax.astype(np.float32)
+                      + px[:, k].astype(np.float32)).astype(np.float16)
+            ah = np.zeros(4 * H, np.float16)
+            for k in range(H):
+                ah = (ah.astype(np.float32)
+                      + ph[:, k].astype(np.float32)).astype(np.float16)
+            pre = (ax.astype(np.float32) + ah.astype(np.float32) + b)
+            ig = (1.0 / (1.0 + np.exp(-pre[0:H]))).astype(np.float32)
+            fg = (1.0 / (1.0 + np.exp(-pre[H:2*H]))).astype(np.float32)
+            cg = np.tanh(pre[2*H:3*H]).astype(np.float32)
+            og = (1.0 / (1.0 + np.exp(-pre[3*H:4*H]))).astype(np.float32)
+            c_new = (fg * c + ig * cg).astype(np.float32)
+            out_f16 = (og * np.tanh(c_new).astype(np.float32)).astype(np.float16)
+            activations[c_name] = c_new.astype(np.float16).reshape(1, H)
+            activations[h_name] = out_f16.reshape(1, H)
+            activations[out_name] = out_f16.reshape(1, H)
         else:
             raise NotImplementedError(
                 f"int8 simulator: unsupported op {op['op']}"

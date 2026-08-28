@@ -82,8 +82,14 @@ b = backends.get(sys.argv[1])
 print(" ".join(b.resolved_kernel_cflags(sys.argv[2])))
 PYEOF
 )" || KERNEL_CFLAGS=""
+# MODELBLASTER_KERNEL_CC: compile kernels.c with a different compiler than the
+# rest of the harness. Needed only for a model with an fp16 island on this box,
+# where the curated Zvfh kernels use RVV fp16 intrinsics that GCC 13.2 -- the
+# only riscv64-unknown-linux-gnu compiler installed -- does not have. See the
+# KERNEL_CC comment in harness_linux/Makefile. Unset by default.
 make -s -C "${REPO_ROOT}/harness_linux" \
     MODEL_DIR="${GEN}/generated" CROSS="${CROSS}" \
+    ${MODELBLASTER_KERNEL_CC:+KERNEL_CC="${MODELBLASTER_KERNEL_CC}"} \
     KERNEL_CFLAGS="${KERNEL_CFLAGS}" OUT="${BIN}"
 
 # Gate: refuse to deploy a binary carrying an instruction the board will

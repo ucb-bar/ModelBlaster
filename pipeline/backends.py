@@ -133,7 +133,17 @@ RVV_X60 = Backend(
     description="SpaceMiT X60: rv64gcv with VLEN=256 (zvl256b). Verified on "
                 "the board, not in Spike.",
     kernel_cflags=(
-        "-march=rv64gcv_zvl256b",
+        # zfh + zvfh are in the board's own /proc/cpuinfo isa string
+        # (rv64imafdcv_..._zfh_zfhmin_..._zvfh_zvfhmin_...), so declaring them
+        # here describes the hardware rather than requesting an emulation. They
+        # matter only for a model with an fp16 island -- fused_full's fp16 tail
+        # is the first one on this backend -- but without them every _Float16
+        # operation in a curated kernel becomes a libgcc softfloat call and the
+        # fp16 vector intrinsics (vfmacc.vv f16, vfredusum.vs f16) will not
+        # compile at all, so the kernel silently falls back to scalar. Adding
+        # extensions cannot change codegen for the int8/fp32 kernels that do not
+        # mention _Float16.
+        "-march=rv64gcv_zvl256b_zfh_zvfh",
         "-mabi=lp64d",
         "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
         # Where mb_rvv_vxrm_compat.h lives. Same <repo_root> placeholder
