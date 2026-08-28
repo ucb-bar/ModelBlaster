@@ -109,6 +109,13 @@ def main() -> int:
                          "name is guessed by walking up from io.npz, which "
                          "mislabels any layout other than "
                          "examples/<model>/<quant>/generated/.")
+    ap.add_argument("--iters", type=int, default=None,
+                    help="run the model this many times on the board and take "
+                         "the MEDIAN per-dispatch cycles, dropping iteration 0 "
+                         "as warmup (first-touch faulting of the const weight "
+                         "arrays lands entirely in it). Default: one run, one "
+                         "sample. See the note at the call site about what this "
+                         "does to the verify marker for a stateful model.")
     args = ap.parse_args()
 
     if not args.models and not args.io:
@@ -117,8 +124,23 @@ def main() -> int:
         ap.error("--pool-sizes requires --models")
 
     print(f"k1: host={args.host} elf={args.elf} cpu={args.cpu or 'unpinned'}")
+    # --iters > 1 makes the harness run the model N times and print one profile
+    # block per iteration; runner_common.parse_profile_reps then takes the
+    # median and drops iteration 0 as warmup. deploy_and_run already accepted an
+    # env dict, but nothing on the single-model path filled it, so the
+    # repetitions could not be asked for from here at all.
+    #
+    # For a STATEFUL model this changes what the verify marker means: the golden
+    # describes iteration 0, and h_state/c_state persist, so the last
+    # iteration's output legitimately differs and max_abs_err will be nonzero.
+    # Verify with --iters 1 and time with --iters N; do not read the two off one
+    # run.
+    board_env = {}
+    if args.iters and args.iters > 1:
+        board_env["MODELBLASTER_ITERS"] = str(args.iters)
     out = deploy_and_run(args.host, args.elf, args.remote_root,
-                         cpu=args.cpu, timeout=args.timeout)
+                         cpu=args.cpu, timeout=args.timeout,
+                         env=board_env or None)
     if args.save_output:
         with open(args.save_output, "w") as f:
             f.write(out)

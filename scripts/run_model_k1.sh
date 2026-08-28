@@ -117,6 +117,14 @@ fi
 
 echo "=== 5/5 deploy + run on ${HOST} (pinned to cpu ${CPU}) ==="
 PROFILE_ARGS=()
+# ITERS: repetitions on the board, median per dispatch, iteration 0 dropped as
+# warmup. Leave unset for the historical one-sample behaviour. For a stateful
+# model the in-binary verify compares the LAST iteration against a golden that
+# describes iteration 0, so a run with ITERS>1 is a timing run, not a
+# correctness run -- do both, separately.
+if [[ -n "${ITERS:-}" ]]; then
+    PROFILE_ARGS+=(--iters "${ITERS}")
+fi
 if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     PROFILE_ARGS+=(--profile-out-root "${PROFILE_OUT_ROOT}"
                    --profile-backend "${TARGET}")
