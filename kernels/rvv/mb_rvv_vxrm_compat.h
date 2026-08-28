@@ -33,7 +33,17 @@
 #ifndef MB_RVV_VXRM_COMPAT_H_
 #define MB_RVV_VXRM_COMPAT_H_
 
-#if defined(__riscv_v_intrinsic) && !defined(__RISCV_VXRM_RNU)
+/* Gate on the intrinsics API VERSION, not on whether __RISCV_VXRM_RNU happens
+ * to be a preprocessor macro. The explicit-rounding-mode form arrived in
+ * intrinsics v0.12: GCC 13.2 reports __riscv_v_intrinsic == 11000 (v0.11, no
+ * vxrm argument) and GCC 14.2 reports 12000 (v0.12, vxrm argument present). In
+ * GCC 14 the __RISCV_VXRM_* names come from the `#pragma riscv intrinsic
+ * "vector"` machinery rather than from #define, so the old `!defined(...)`
+ * guard let the shim fire on a toolchain that did not need it and every
+ * fixed-point call then failed with "too few arguments". A model with an fp16
+ * island has to be compiled by GCC >= 14 on this box (see KERNEL_CC in
+ * harness_linux/Makefile), which is how that was found. */
+#if defined(__riscv_v_intrinsic) && __riscv_v_intrinsic < 12000
 
 #define __RISCV_VXRM_RNU 0 /* round-to-nearest-up   (vxrm reset value) */
 #define __RISCV_VXRM_RNE 1 /* round-to-nearest-even */
