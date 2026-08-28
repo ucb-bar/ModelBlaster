@@ -48,8 +48,17 @@ mkdir -p "${GEN}"
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 echo "=== 1/5 extract ${MODEL} (${QUANT}) ==="
+# NUM_CALIBRATION: how many samples the int8 activation scales are calibrated
+# over. It has to be reachable from here, not just from extract_graph's CLI: a
+# model whose calibration set is its deployment distribution (fused_full loads
+# real gate-course frames from MB_FUSED_CALIB_PKL) silently falls back to ONE
+# synthetic get_sample_input() at the default of 1, and the scales -- hence the
+# quantization, hence every number measured downstream -- are then not the ones
+# the model would ship with. The io.npz golden anchor also becomes the first
+# calibration sample, so the board verifies against a real frame.
 "${PY}" -m modelblaster.pipeline.extract_graph \
-    --model "${MODEL}" --quant "${QUANT}" --out-dir "${GEN}"
+    --model "${MODEL}" --quant "${QUANT}" --out-dir "${GEN}" \
+    --num-calibration "${NUM_CALIBRATION:-1}"
 
 echo "=== 2/5 generate skeleton (platform=linux) ==="
 # platform=linux matters: the Zephyr flavour emits rdcycle, which raises SIGILL
