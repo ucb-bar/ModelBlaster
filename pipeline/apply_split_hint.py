@@ -152,14 +152,124 @@ def _split_conv2d_s8(op: dict[str, Any], n_splits: int,
     return tiles
 
 
+#: Sub-op shape keys that name an output-channel count, in the order they are
+#: tried. A fused conv's constituents each describe the same tensor in their
+#: own vocabulary: the conv says `OC`, the batchnorm says `C`, the elementwise
+#: activation says `n` (a flat element count). Narrowing only `sub_ops[0]` and
+#: leaving the rest at full width would put a graph on disk whose own
+#: constituents disagree about how wide the tile is.
+_CHANNEL_SHAPE_KEYS = ("OC", "C")
+
+
+def _narrow_sub_shape(sub: dict[str, Any], full_oc: int, tile_oc: int) -> None:
+    """Narrow one fused constituent's shape from `full_oc` channels to `tile_oc`.
+
+    Only narrows what it can verify: a channel key must currently read
+    `full_oc`, and a flat element count must divide by it. Anything else is
+    left alone rather than scaled on a guess -- a shape that does not describe
+    this tensor is not made truer by rewriting it.
+    """
+    shape = sub.get("shape")
+    if not isinstance(shape, dict):
+        return
+    shape = dict(shape)
+    for key in _CHANNEL_SHAPE_KEYS:
+        if int(shape.get(key, -1)) == full_oc:
+            shape[key] = tile_oc
+            sub["shape"] = shape
+            return
+    n = shape.get("n")
+    if isinstance(n, int) and n > 0 and n % full_oc == 0:
+        shape["n"] = n // full_oc * tile_oc
+        sub["shape"] = shape
+
+
+def _split_fused_conv_s8(op: dict[str, Any], n_splits: int,
+                         network: str) -> list[dict[str, Any]]:
+    """Split a fused conv->BN[->SiLU] along OC.
+
+    The ARITHMETIC is `_split_conv2d_s8`'s, unchanged: OC is an output axis,
+    so slicing it partitions output elements and reorders no accumulation, and
+    the epilogue parameters are 1-D per-output-channel (`bn_scale`, `bn_bias`,
+    `bias`) so their slice is a plain `+ oc0`. That is not an assumption -- it
+    is the same slicing the intra-op SHARD path already performs at runtime and
+    that was measured bit-exact on the board; see
+    `generate_skeleton._CONV2D_BN_SILU_S8_SHARD_WRAPPER`.
+
+    What differs is BOOKKEEPING, and each difference is a trap that the plain
+    conv path never has to see:
+
+      * **A fused op has no `shape` of its own.** The geometry lives on the
+        conv sub-op. Reading `op["shape"]` here is the same mistake that wrote
+        `noshape` for 57 of yolov8n's dispatches into a profile.
+      * **The constituents' tensors are internal names**, and every tile
+        deep-copies them. Two tiles both claiming to produce `l0_conv` is a
+        graph that says one tensor has two producers. Names that a sibling
+        sub-op produces are suffixed per tile; the op's real INPUT is not,
+        because every tile reads the same input.
+      * **The constituents describe the channel count three different ways**
+        (`OC`, `C`, `n`), so narrowing only the conv leaves the graph
+        internally inconsistent -- see `_narrow_sub_shape`.
+
+    This does NOT unfuse anything: the tile is still one fused op running one
+    curated fused kernel, just over `OC/n` channels. The epilogue fusion that
+    makes `conv2d_batchnorm2d_silu_s8` 97% of yolov8n is preserved.
+    """
+    sub_ops = op.get("sub_ops") or []
+    conv = next((s for s in sub_ops
+                 if str(s.get("op", "")).startswith("conv2d") and s.get("shape")),
+                None)
+    if conv is None:
+        raise SplitHintError(
+            f"{network}: {op['op']} (dispatch_id={op.get('dispatch_id')}) "
+            f"carries no conv sub_op with a shape. A fused op has no shape of "
+            f"its own -- the geometry lives under sub_ops -- so there is no OC "
+            f"to tile along")
+    full_oc = int(conv["shape"]["OC"])
+    if full_oc % n_splits != 0:
+        raise SplitHintError(
+            f"{network}: {op['op']} OC={full_oc} doesn't divide cleanly into "
+            f"{n_splits} tiles (need OC % n_splits == 0)")
+    tile_oc = full_oc // n_splits
+    out_tensor = op["outputs"][0]
+    # Produced by a sibling constituent => internal to this fused op => must
+    # not be shared across tiles. The op's own input is produced elsewhere and
+    # is deliberately absent from this set.
+    internal = {t for s in sub_ops for t in (s.get("outputs") or [])}
+    tiles: list[dict[str, Any]] = []
+    for t in range(n_splits):
+        tile = copy.deepcopy(op)
+        suffix = f".tile_{t}"
+        for sub in tile["sub_ops"]:
+            for field in ("inputs", "outputs"):
+                sub[field] = [nm + suffix if nm in internal else nm
+                              for nm in (sub.get(field) or [])]
+            _narrow_sub_shape(sub, full_oc, tile_oc)
+        tile["outputs"] = [f"{out_tensor}{suffix}"]
+        tile["name"] = op["name"] + suffix
+        tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
+                              "n_splits": n_splits, "tile_oc": tile_oc,
+                              "tile_offset_OC": t * tile_oc,
+                              "axis": "OC"}
+        tiles.append(tile)
+    return tiles
+
+
+#: Op kinds an OC/N split can be built for. The fused convs are here for the
+#: same reason they are in `generate_skeleton._SHARDABLE_CONV_OPS`: that is
+#: where the time is. `conv2d_batchnorm2d_silu_s8` alone is 97% of yolov8n and
+#: `conv2d_batchnorm2d_s8` is 29% of DroNet, so a split path that refuses them
+#: can only ever tile ops too cheap for the tiling to matter.
 _SPLITTABLE: dict[str, Any] = {
     "linear_s8": _split_linear_s8,
     "conv2d_s8": _split_conv2d_s8,
+    "conv2d_batchnorm2d_s8": _split_fused_conv_s8,
+    "conv2d_batchnorm2d_silu_s8": _split_fused_conv_s8,
 }
 
 
 def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
-                           n_splits: int, tile_n: int) -> None:
+                           n_splits: int, tile_n: int, axis: str) -> None:
     """When we split a linear_s8 op along N, the per-tile output names
     (`<orig>.tile_<i>`) need entries in the IR's tensors dict so the
     downstream skeleton emitter can allocate buffers for them. The
@@ -179,10 +289,11 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
     if not parent_shape:
         return
     tile_shape = list(parent_shape)
-    # Split axis depends on the op kind: linear_s8 splits N (last dim),
-    # conv2d_s8 splits OC. Both encode the per-tile size into tile_n
-    # by the caller — for conv we splice the OC dim of [N,OC,OH,OW].
-    if op.get("op") == "conv2d_s8" and len(tile_shape) >= 4:
+    # Which dim `tile_n` narrows is the SPLIT AXIS, not the op kind: an OC
+    # split narrows dim 1 of NCHW, an N split narrows the last dim. Keying it
+    # on the op kind is why this used to name `conv2d_s8` explicitly, which
+    # silently sent every fused conv down the linear branch and narrowed W.
+    if axis == "OC" and len(tile_shape) >= 4:
         tile_shape[1] = tile_n   # NCHW: OC is dim 1
     else:
         tile_shape[-1] = tile_n  # linear_s8: N is last dim
@@ -253,11 +364,18 @@ def apply_split_hint(graph: dict[str, Any],
             # Register the per-tile output tensors in the IR's tensors
             # dict so generate_skeleton can allocate per-tile buffers
             # (fixes "buf_<network>_<out>_tile_0 undeclared" build error).
-            if tile_ops and "shape" in tile_ops[0]:
-                # tile_n: for linear_s8 the per-tile N; for conv2d_s8 the per-tile OC
-                shape = tile_ops[0]["shape"]
-                tile_n = shape.get("N") if op.get("op") == "linear_s8" else shape.get("OC", 0)
-                _register_tile_tensors(out, op, n, tile_n)
+            if tile_ops:
+                # Read the tile width off the metadata the splitter RECORDED,
+                # not off the tile's `shape`. A fused conv has no `shape` key
+                # at all, so the old `"shape" in tile_ops[0]` gate skipped
+                # tensor registration for it entirely -- silently, and the
+                # failure surfaced much later as an undeclared
+                # `buf_<net>_<out>_tile_0` at link time.
+                sf0 = tile_ops[0].get("split_from") or {}
+                axis = sf0.get("axis", "N")
+                tile_n = int(sf0.get("tile_oc" if axis == "OC" else "tile_n", 0))
+                if tile_n > 0:
+                    _register_tile_tensors(out, op, n, tile_n, axis)
             new_tile_ids: list[int] = []
             for tile in tile_ops:
                 tile["dispatch_id"] = next_new_id

@@ -354,3 +354,187 @@ class SplitConvUnderPackedWeightLayout(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _fused_conv_graph(N, IC, IH, IW, OC, KH, KW,
+                      kind="conv2d_batchnorm2d_silu_s8"):
+    """One fused conv->BN[->SiLU], written the way `extract_graph` writes one:
+    no `shape` on the op itself, geometry and weights under `sub_ops`."""
+    OH, OW = IH, IW      # stride 1, pad 1, 3x3 -> same spatial size
+    conv = {
+        "name": "c0.conv", "op": "conv2d_s8",
+        "inputs": ["x"], "outputs": ["c0_conv"],
+        "weight": "c0.weight_q", "bias": "c0.bias_q",
+        "shape": {"N": N, "IC": IC, "IH": IH, "IW": IW, "OC": OC,
+                  "OH": OH, "OW": OW, "KH": KH, "KW": KW,
+                  "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        "quant": {"input_offset": 0, "filter_offset": 0, "output_offset": 0,
+                  "output_multiplier": 1845733646, "output_shift": 7,
+                  "activation_min": -128, "activation_max": 127},
+    }
+    bn = {
+        "name": "c0.bn", "op": "batchnorm2d_s8",
+        "inputs": ["c0_conv"], "outputs": ["c0_bn"],
+        "weight": "c0.bn.scale", "bias": "c0.bn.bias_fused",
+        "shape": {"N": N, "C": OC, "H": OH, "W": OW},
+        "quant": {"scale_in": 0.04, "scale_out": 1.07,
+                  "activation_min": -128, "activation_max": 127},
+    }
+    subs = [conv, bn]
+    if kind == "conv2d_batchnorm2d_silu_s8":
+        subs.append({
+            "name": "c0.act", "op": "silu_s8",
+            "inputs": ["c0_bn"], "outputs": ["y"],
+            "shape": {"n": N * OC * OH * OW},
+            "quant": {"scale_in": 1.07, "scale_out": 1.07,
+                      "activation_min": -128, "activation_max": 127},
+        })
+    else:
+        bn["outputs"] = ["y"]
+    return {
+        "name": "probe",
+        "input": {"tensor": "x"},
+        "output": {"tensors": ["y"]},
+        "tensors": {
+            "x": {"shape": [N, IC, IH, IW], "dtype": "i8",
+                  "quant": {"scale": 0.02, "zero_point": 0}},
+            "y": {"shape": [N, OC, OH, OW], "dtype": "i8",
+                  "quant": {"scale": 0.05, "zero_point": 0}},
+        },
+        "ops": [{
+            "name": "c0", "op": kind,
+            "inputs": ["x"], "outputs": ["y"], "sub_ops": subs,
+            "dispatch_id": 0, "hardware_target": "any", "depends_on": [],
+        }],
+    }
+
+
+def _emit_fused_conv(graph, N, IC, IH, IW, OC, KH, KW, backend):
+    """As `_emit_conv`, plus the 1-D per-output-channel epilogue arrays."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        ir = td / "graph.json"
+        ir.write_text(json.dumps(graph))
+        rng = np.random.default_rng(0)
+        w = rng.integers(-127, 127, size=(OC, IC, KH, KW), dtype=np.int8)
+        b = rng.integers(-1000, 1000, size=(OC,)).astype(np.int32)
+        bn_s = rng.random(OC).astype(np.float32)
+        bn_b = rng.random(OC).astype(np.float32)
+        arrays = {"c0.weight_q": w, "c0.bias_q": b,
+                  "c0.bn.scale": bn_s, "c0.bn.bias_fused": bn_b}
+        np.savez(td / "weights.npz", **arrays)
+        np.savez(td / "io.npz",
+                 input=np.zeros((N, IC, IH, IW), dtype=np.int8),
+                 output=np.zeros((N, OC, IH, IW), dtype=np.int8))
+        out = td / "generated"
+        argv = sys.argv
+        sys.argv = ["generate_skeleton",
+                    "--ir", str(ir), "--weights", str(td / "weights.npz"),
+                    "--io", str(td / "io.npz"), "--out-dir", str(out),
+                    "--backend", backend, "--platform", "linux"]
+        try:
+            generate_skeleton.main()
+        finally:
+            sys.argv = argv
+        return ((out / "model.c").read_text(),
+                (out / "weights.c").read_text(), arrays)
+
+
+class SplitFusedConvOperands(unittest.TestCase):
+    """A fused conv tile must retarget FOUR operands, not two.
+
+    The plain conv path slices a weight and a bias. A fused conv adds
+    `bn_scale` and `bn_bias`, which are 1-D per-output-channel floats.
+    `_backend_pack_weight` only permutes 4-D tensors, so those two stay
+    contiguous under every backend layout and `+ oc0` is correct for them on
+    rvv as well as scalar -- while the 4-D weight still needs its own
+    re-packed array on rvv. Getting one of the four right and the others
+    wrong is bit-exact on tile 0 and silently wrong on every other tile.
+
+    This is the same arithmetic `parallel_cbs_shard_fn` performs at runtime,
+    which is what makes it trustworthy: that path's OC slicing was measured
+    bit-exact on the board.
+    """
+
+    N, IC, IH, IW, OC, KH, KW = 1, 3, 8, 8, 16, 3, 3
+
+    def _split(self, backend, n_splits=2, kind="conv2d_batchnorm2d_silu_s8"):
+        g = apply_split_hint(
+            _fused_conv_graph(self.N, self.IC, self.IH, self.IW,
+                              self.OC, self.KH, self.KW, kind),
+            [{"op": 0, "n_splits": n_splits}])
+        return _emit_fused_conv(g, self.N, self.IC, self.IH, self.IW,
+                                self.OC, self.KH, self.KW, backend)
+
+    def _calls(self, model_c):
+        return re.findall(r"kernel_conv2d_batchnorm2d_\w*s8_probe\([^;]*\);",
+                          model_c, re.S)
+
+    def test_scalar_offsets_every_operand_including_the_epilogue(self):
+        model_c, weights_c, _ = self._split("scalar", 2)
+        calls = self._calls(model_c)
+        self.assertEqual(len(calls), 2)
+        tile_oc = self.OC // 2
+        per_filter = self.IC * self.KH * self.KW
+        self.assertIn(f"weight_q + {tile_oc * per_filter}", calls[1])
+        self.assertIn(f"bias_q + {tile_oc}", calls[1])
+        self.assertIn(f"bn_scale + {tile_oc}", calls[1])
+        self.assertIn(f"bn_bias_fused + {tile_oc}", calls[1])
+        # Tile 0 is the trap: every offset is 0, so a codegen that forgot the
+        # epilogue entirely still produces a correct tile 0.
+        self.assertIn("bn_scale + 0", calls[0])
+        self.assertIn("bn_bias_fused + 0", calls[0])
+
+    def test_each_tile_is_called_with_the_narrowed_oc(self):
+        model_c, _, _ = self._split("scalar", 4)
+        calls = self._calls(model_c)
+        self.assertEqual(len(calls), 4)
+        for call in calls:
+            args = call.split("(", 1)[1].split(",")
+            # in, w, b, bn_scale, bn_bias, out, N, IC, IH, IW, OC, ...
+            self.assertEqual(args[10].strip(), str(self.OC // 4))
+
+    def test_each_tile_writes_its_own_slice_of_the_output_buffer(self):
+        """Without the offset alias every tile writes at element 0 and they
+        trample each other -- the failure reads as `max_abs_err > 0` from a
+        rewrite the granularity gate correctly passed."""
+        model_c, _, _ = self._split("scalar", 2)
+        calls = self._calls(model_c)
+        plane = self.IH * self.IW
+        # `y` is the model's output, so its buffer is `s->output`; a tile of
+        # an interior tensor would read `buf_probe_<name> + ...` instead.
+        self.assertIn(f"s->output + {self.OC // 2 * plane}", calls[1])
+        self.assertNotIn("+ ", calls[0].split(",")[5],
+                         "tile 0 must address the output at element 0")
+
+    def test_rvv_weight_gets_its_own_packed_array_but_the_epilogue_does_not(self):
+        """The whole point of the split: the 4-D weight cannot be offset under
+        IHWOC, the 1-D epilogue can and must be."""
+        n = 2
+        model_c, weights_c, arrays = self._split("rvv_x60", n)
+        tile_oc = self.OC // n
+        w = arrays["c0.weight_q"]
+        for t in range(n):
+            got = _c_array(weights_c, f"probe_c0_weight_q_tile_{t}")
+            self.assertIsNotNone(got, f"no per-tile weight array for tile {t}")
+            want = np.ascontiguousarray(np.transpose(
+                w[t * tile_oc:(t + 1) * tile_oc], (1, 2, 3, 0))
+            ).ravel().astype(np.int64)
+            np.testing.assert_array_equal(got, want)
+        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q"),
+                          "parent weight emitted alongside the tiles")
+        calls = self._calls(model_c)
+        for t, call in enumerate(calls):
+            self.assertIn(f"probe_c0_weight_q_tile_{t}", call)
+            self.assertIn(f"bn_scale + {t * tile_oc}", call,
+                          "the 1-D epilogue arrays stay whole and are offset")
+        # bn arrays are NOT split into per-tile copies.
+        self.assertIsNone(_c_array(weights_c, "probe_c0_bn_scale_tile_0"))
+
+    def test_pair_fused_conv_takes_the_same_path(self):
+        model_c, _, _ = self._split("scalar", 2, kind="conv2d_batchnorm2d_s8")
+        calls = self._calls(model_c)
+        self.assertEqual(len(calls), 2)
+        tile_oc = self.OC // 2
+        self.assertIn(f"bn_scale + {tile_oc}", calls[1])
+        self.assertIn(f"bn_bias_fused + {tile_oc}", calls[1])

@@ -273,3 +273,154 @@ class TheDispatchListTracksTheRewrite(unittest.TestCase):
         g.pop("dispatches", None)
         out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
         self.assertNotIn("dispatches", out)
+
+
+def _fused_conv_op(did, name, kind="conv2d_batchnorm2d_silu_s8",
+                   N=1, IC=3, IH=8, IW=8, OC=16, OH=8, OW=8, KH=3, KW=3,
+                   inputs=("x",), outputs=("y",), depends_on=()):
+    """A fused conv exactly as `extract_graph` writes one.
+
+    The two properties that matter here and that a hand-written fixture is
+    easy to get wrong: the op itself carries NO `shape` key at all, and the
+    constituents name their channel count three different ways -- `OC` on the
+    conv, `C` on the batchnorm, a flat `n` on the activation.
+    """
+    conv = {
+        "name": f"{name}.conv", "op": "conv2d_s8",
+        "inputs": list(inputs), "outputs": [f"{name}_conv"],
+        "weight": f"{name}.conv.weight_q", "bias": f"{name}.conv.bias_q",
+        "shape": {"N": N, "IC": IC, "IH": IH, "IW": IW, "OC": OC,
+                  "OH": OH, "OW": OW, "KH": KH, "KW": KW,
+                  "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        "quant": {"input_offset": 0, "filter_offset": 0, "output_offset": 0,
+                  "output_multiplier": 1845733646, "output_shift": 7,
+                  "activation_min": -128, "activation_max": 127},
+    }
+    bn = {
+        "name": f"{name}.bn", "op": "batchnorm2d_s8",
+        "inputs": [f"{name}_conv"], "outputs": [f"{name}_bn"],
+        "weight": f"{name}.bn.scale", "bias": f"{name}.bn.bias_fused",
+        "shape": {"N": N, "C": OC, "H": OH, "W": OW},
+        "quant": {"scale_in": 0.04, "scale_out": 1.07,
+                  "activation_min": -128, "activation_max": 127},
+    }
+    subs = [conv, bn]
+    if kind == "conv2d_batchnorm2d_silu_s8":
+        subs.append({
+            "name": f"{name}.act", "op": "silu_s8",
+            "inputs": [f"{name}_bn"], "outputs": list(outputs),
+            "shape": {"n": N * OC * OH * OW},
+            "quant": {"scale_in": 1.07, "scale_out": 1.07,
+                      "activation_min": -128, "activation_max": 127},
+        })
+    else:
+        bn["outputs"] = list(outputs)
+    return {
+        "name": name, "op": kind,
+        "inputs": list(inputs), "outputs": list(outputs),
+        "sub_ops": subs,
+        "dispatch_id": did, "hardware_target": "any",
+        "depends_on": list(depends_on),
+    }
+
+
+class FusedConvSplitTest(unittest.TestCase):
+    """Splitting the ops that carry the runtime.
+
+    `conv2d_batchnorm2d_silu_s8` is 97% of yolov8n and `conv2d_batchnorm2d_s8`
+    is 29% of DroNet. A split path that refuses them can only tile ops too
+    cheap for the tiling to matter.
+    """
+
+    def test_splits_a_triple_fused_conv_along_oc(self):
+        g = _g(_fused_conv_op(0, "l0", OC=16))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 2)
+        t0, t1 = ops
+        self.assertEqual(t0["sub_ops"][0]["shape"]["OC"], 8)
+        self.assertEqual(t1["sub_ops"][0]["shape"]["OC"], 8)
+        self.assertEqual(t0["outputs"], ["y.tile_0"])
+        self.assertEqual(t1["outputs"], ["y.tile_1"])
+        self.assertEqual(t0["split_from"]["axis"], "OC")
+        self.assertEqual(t0["split_from"]["tile_offset_OC"], 0)
+        self.assertEqual(t1["split_from"]["tile_offset_OC"], 8)
+        self.assertEqual(t1["split_from"]["tile_oc"], 8)
+
+    def test_splits_a_pair_fused_conv_too(self):
+        g = _g(_fused_conv_op(0, "c1", kind="conv2d_batchnorm2d_s8", OC=32))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 4}])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 4)
+        self.assertEqual([o["sub_ops"][0]["shape"]["OC"] for o in ops],
+                         [8, 8, 8, 8])
+        self.assertEqual([o["split_from"]["tile_offset_OC"] for o in ops],
+                         [0, 8, 16, 24])
+
+    def test_every_constituent_agrees_about_the_tile_width(self):
+        """The conv's OC, the batchnorm's C and the activation's flat n all
+        describe the SAME tensor. Narrowing only `sub_ops[0]` would ship a
+        graph whose batchnorm claims to process 16 channels from an
+        8-channel conv -- and `diff_dispatch_graph` prints exactly that
+        signature, so it would be visible in the gate output and wrong."""
+        g = _g(_fused_conv_op(0, "l0", OC=16, OH=8, OW=8))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        conv, bn, act = out["ops"][0]["sub_ops"]
+        self.assertEqual(conv["shape"]["OC"], 8)
+        self.assertEqual(bn["shape"]["C"], 8)
+        self.assertEqual(act["shape"]["n"], 8 * 8 * 8)
+
+    def test_internal_tensors_are_per_tile_but_the_input_is_not(self):
+        """Every tile deep-copies the constituents, so without renaming, both
+        tiles claim to produce `l0_conv` -- one tensor, two producers. The
+        op's real INPUT is produced elsewhere and must stay shared: all tiles
+        read the same input."""
+        g = _g(_fused_conv_op(0, "l0", OC=16))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        t0, t1 = out["ops"][0], out["ops"][1]
+        self.assertEqual(t0["sub_ops"][0]["inputs"], ["x"])
+        self.assertEqual(t1["sub_ops"][0]["inputs"], ["x"])
+        self.assertEqual(t0["sub_ops"][0]["outputs"], ["l0_conv.tile_0"])
+        self.assertEqual(t1["sub_ops"][0]["outputs"], ["l0_conv.tile_1"])
+        self.assertEqual(t0["sub_ops"][1]["inputs"], ["l0_conv.tile_0"])
+        self.assertEqual(t1["sub_ops"][2]["outputs"], ["y.tile_1"])
+        produced = [nm for t in (t0, t1) for s in t["sub_ops"]
+                    for nm in s["outputs"]]
+        self.assertEqual(len(produced), len(set(produced)))
+
+    def test_tile_output_tensors_are_registered_with_a_narrowed_channel_dim(self):
+        """The registration used to be gated on `"shape" in tile_ops[0]`. A
+        fused op has no `shape` key, so the gate was False and no tile tensor
+        was declared -- surfacing much later as an undeclared
+        `buf_<net>_y_tile_0` at link time."""
+        g = _g(_fused_conv_op(0, "l0", OC=16, OH=8, OW=8))
+        g["tensors"] = {"y": {"shape": [1, 16, 8, 8], "dtype": "i8",
+                              "quant": {"scale": 0.05, "zero_point": 0}}}
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        for t in (0, 1):
+            entry = out["tensors"][f"y.tile_{t}"]
+            self.assertEqual(entry["shape"], [1, 8, 8, 8])
+            self.assertEqual(entry["quant"]["scale"], 0.05)
+        self.assertEqual(out["tensors"]["y"]["shape"], [1, 16, 8, 8])
+
+    def test_downstream_depends_on_every_tile(self):
+        g = _g(_fused_conv_op(0, "l0", OC=16),
+               _fused_conv_op(1, "l1", IC=16, OC=16,
+                              inputs=("y",), outputs=("z",), depends_on=(0,)))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 4}])
+        tail = out["ops"][-1]
+        self.assertEqual(tail["depends_on"], [0, 1, 2, 3])
+        self.assertEqual(out["id_remap"]["0"], [0, 1, 2, 3])
+        self.assertEqual(out["id_remap"]["1"], [4])
+
+    def test_reject_oc_not_dividing(self):
+        g = _g(_fused_conv_op(0, "l0", OC=18))
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(g, [{"op": 0, "n_splits": 4}])
+
+    def test_reject_a_fused_op_with_no_conv_geometry(self):
+        """Refusing loudly beats tiling along an OC read as 0."""
+        op = _fused_conv_op(0, "l0", OC=16)
+        del op["sub_ops"][0]["shape"]
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(_g(op), [{"op": 0, "n_splits": 2}])
