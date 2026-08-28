@@ -562,7 +562,13 @@ def get_calibration_spec(num_samples: int = 16) -> dict:
             "x": {
                 "loader": "image_dir",
                 "path": src,
-                "image_size": [img[0], img[1]],
+                # [W, H] -- the image_dir loader's order, NOT (H, W).
+                # `img` is (H, W) to match NCHW and transforms.Resize, so it
+                # has to be reversed here. This was invisible while the input
+                # was square, and the first rectangular build extracted a
+                # 96x64 graph from a 64x96 request: silently transposed, and
+                # the shapes still looked plausible all the way to the board.
+                "image_size": [img[1], img[0]],
                 "normalize": "none",
                 "compose": {"kind": "one_per_sample"},
             },

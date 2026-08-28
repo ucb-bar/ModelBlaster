@@ -170,3 +170,51 @@ class LoadingAFineTunedCheckpoint(unittest.TestCase):
         os.environ["MODELBLASTER_YOLOV8N_NC"] = "80"
         os.environ.pop("MODELBLASTER_YOLOV8N_WEIGHTS", None)
         self.assertEqual(ymod.weights_path(), ymod.STOCK_WEIGHTS)
+
+
+@unittest.skipIf(parse_input_size is None, "yolov8_nano unimportable")
+class TheCalibrationSpecAgreesWithTheModel(unittest.TestCase):
+    """The calibration loader takes [W, H]; `img` is (H, W). Reverse it.
+
+    This is the bug the first rectangular build actually hit. `get_model` and
+    `get_sample_input` were correct at 64x96, but `get_calibration_spec`
+    handed the image_dir loader `[img[0], img[1]]` -- (H, W) into a slot
+    documented as [W, H] (mb_datasets/image_dir.py: `W, H = image_size`).
+
+    Extraction traces the graph from a CALIBRATION sample, so the emitted
+    graph was 96x64 for a 64x96 request. Silently transposed, plausible
+    shapes the whole way, and it reached the board before anything objected.
+
+    Invisible while the input was square, which is exactly why the square
+    tests above cannot cover it and this one has to exist separately.
+    """
+
+    def _spec(self, size):
+        os.environ["MODELBLASTER_YOLOV8N_INPUT"] = size
+        from modelblaster.models.yolov8_nano import get_calibration_spec
+        return get_calibration_spec(4)["inputs"]["x"]["image_size"]
+
+    def test_the_spec_is_width_then_height(self):
+        self.assertEqual(self._spec("64x96"), [96, 64],
+                         "image_dir wants [W, H]; a 64x96 (H x W) request is "
+                         "96 wide by 64 tall")
+
+    def test_it_matches_what_the_model_is_actually_fed(self):
+        """The property that matters: the calibration tensor and the model
+        input must be the same shape. Comparing the two directly is what a
+        transposition cannot survive."""
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch not installed in this env")
+        os.environ["MODELBLASTER_YOLOV8N_INPUT"] = "64x96"
+        from modelblaster.models import yolov8_nano as y
+        x = y.get_sample_input(seed=1)          # (N, C, H, W)
+        w, h = self._spec("64x96")              # loader order
+        self.assertEqual((h, w), tuple(x.shape)[2:],
+                         "calibration geometry must equal the model's input "
+                         "geometry, or extraction traces a transposed graph")
+
+    def test_square_is_unaffected_either_way(self):
+        """Why this went unnoticed: [160,160] reversed is [160,160]."""
+        self.assertEqual(self._spec("160"), [160, 160])
