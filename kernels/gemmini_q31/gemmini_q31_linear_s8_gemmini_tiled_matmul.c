@@ -1,12 +1,28 @@
 /* source: curated */
 /* algorithm: gemmini_tiled_matmul */
-/* accuracy_class: numeric_drift */
-/* origin: tiled_matmul_auto(full_C=true) → raw int32 accumulator + scalar
+/* accuracy_class: bit_exact */
+/* RELABELED 2026-08-28 (experiments/kernel_opt_log.jsonl): was previously
+ * marked numeric_drift with a "≤1 LSB / layer" bound below -- stale, and
+ * from a different ACC_SCALE-style construction than the code that's
+ * actually here. This kernel drives tiled_matmul_auto with full_C=true,
+ * which drains the RAW int32 accumulator (no HW mvout requantize at
+ * all -- ACC_SCALE_IDENTITY is inert on this path, see the resadd
+ * kernels' headers for why that combination is NOT a no-op when
+ * full_C=false) and lets the CPU do the entire Q0.31 requantize in
+ * int64, below. That is structurally identical to
+ * conv2d_s8_gemmini_im2col_full_C.c (also full_C=true, also
+ * accuracy_class: bit_exact, already isolation-measured at err=0), and
+ * this kernel has now likewise been isolation-tested (this kernel alone
+ * curated, every other op forced to scalar reference_impl) at err=0.
+ * There is no float-scale HW shortcut anywhere in this path for drift to
+ * come from.
+ *
+ * origin: tiled_matmul_auto(full_C=true) → raw int32 accumulator + scalar
  *         Q0.31 requantize on CPU.  The same precision contract as the
  *         conv2d_s8_gemmini_im2col_full_C path: bit-exact accumulator
  *         (gemmini's 32-bit acc with no float-scale shortcut) folded into
- *         the Q0.31 multiplier on CPU.  Drift vs the Q0.31 PyTorch golden
- *         is ≤1 LSB / layer.
+ *         the Q0.31 multiplier on CPU, exactly matching the reference
+ *         formula's int64 rounding.
  *
  *         Computes C[M,N] = A[M,K] @ B[K,N] + bias[N] where:
  *           A = input  (row-major [M,K], stride_A = K)

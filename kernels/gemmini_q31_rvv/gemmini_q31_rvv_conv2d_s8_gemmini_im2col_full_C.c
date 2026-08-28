@@ -67,6 +67,75 @@
  *
  * Handles non-square kernels, any stride/padding, and large
  * output_shift values (int64/RVV requantize, no UB).
+ *
+ * -------------------------------------------------------------------------
+ * RVV im2col + transpose (kernel_opt_log.jsonl id 2400 = baseline split,
+ * id 2401 = this change, id 2403 = the FPGA A/B)
+ * -------------------------------------------------------------------------
+ * MEASURE ON HARDWARE, NOT ON SPIKE.  An rdcycle-bracketed, numerically-
+ * inert copy of this kernel (dronet, all 10 conv2d_s8 layers, curated set,
+ * max_abs_err=0) was run BOTH ways.  The two profiles disagree so badly
+ * they invert the priority order, so the FPGA column is the real one:
+ *
+ *                        FPGA f2_dual_small_...q31_60mhz    spike
+ *   phase                  BEFORE    %     AFTER    %       BEFORE  %
+ *   im2col gather        2,039,505 43.5% 1,090,432 34.3%   3,724,056 71.6%
+ *   NCHW->NHWC transpose   997,760 21.3%   419,838 13.2%   1,052,263 20.2%
+ *   RVV requantize       1,325,917 28.2% 1,345,898 42.3%     359,322  6.9%
+ *   Gemmini GEMM + drain   330,538  7.0%   327,435 10.3%      67,575  1.3%
+ *   -------------------------------------------------------------------
+ *   sum                  4,693,720       3,183,603  1.47x            4.82x
+ *
+ * Spike bills a vector instruction at roughly one cycle, so it
+ * systematically under-weights phases that are ALREADY vectorized and
+ * over-weights scalar ones.  Measured end-to-end on hardware (jobs 184 /
+ * 185, un-instrumented, both max_abs_err=0): conv2d_s8 aggregate over all
+ * 10 layers 4,703,561 -> 3,150,508 = 1.493x, model 5,391,657 -> 3,853,664
+ * = 1.399x, every layer moving 1.29x-1.68x.  The same A/B on spike says
+ * 4.80x.  Quote the 1.493x.  (kernel_opt_log id 2403 / 2405.)
+ *
+ * NOTE for anyone carrying over the pure-gemmini_q31 profile: that profile
+ * says "requantize 43.6%", but it was taken on the PURE (non-RVV) sibling
+ * where the requantize is a scalar int64 two-stage loop.  Here it was
+ * ALREADY vsmul/vnclip-vectorized before this change.  Vectorizing "the
+ * requantize" on THIS target recovers nothing -- it is untouched below.
+ *
+ * Two restructurings, both pure data movement (max_abs_err stays 0 by
+ * construction -- the same bytes land in the same places):
+ *
+ *  (1) im2col: the kw loop steps iw by exactly 1 whatever SW is, and both
+ *      ws_input (NHWC) and the im2col row are channel-minor, so for a fixed
+ *      kh the KW cells the scalar loop copied one CHANNEL at a time are
+ *      contiguous on BOTH sides.  The whole in-bounds kw run becomes ONE
+ *      vectorized copy of (kw_hi-kw_lo)*IC bytes with the out-of-bounds
+ *      prefix/suffix as two zero-fills -- vector length KW*IC instead of
+ *      IC (96B not 32B on dronet's 3x3/IC=32 layers), and KW-1 fewer loop
+ *      set-ups per kh.  1.87x on hardware.
+ *
+ *  (2) transpose: for fixed (n,h) this is an IC x IW -> IW x IC transpose,
+ *      so exactly one side must be strided.  Pick the orientation with the
+ *      LONGER vector (walk w when IW >= IC, else walk c) to amortize the
+ *      per-iteration set-up.  2.38x on hardware.
+ *
+ * WHAT IS NOT RECOVERED, and why (honest scoreboard):
+ *  - The requantize is untouched: it was already RVV.  On hardware it is
+ *    now the LARGEST phase (42.3%), and it was already the second largest
+ *    (28.2%) BEFORE this change -- spike hid that, reporting it at 6.9%.
+ *    Its cost is per-output-row overhead, not arithmetic: three integer
+ *    div/mods per row to decompose out_idx into (n,oh,ow), plus
+ *    ceil(OC/vlmax) short STRIDED vector stores (stride OH*OW).  That is
+ *    the next thing to attack in this kernel.
+ *  - conv_modules.0 (IC=3, 112x112) gains least (1.48x on hardware) and is
+ *    the single biggest conv.  With IC=3 the fused kw run is only KW*IC=9
+ *    bytes, so its im2col is loop-overhead-bound, not bandwidth-bound.
+ *    Fixing that needs a different im2col shape for tiny-IC layers (gather
+ *    a whole tile column-block at a time), not a wider vector.
+ *  - Hoisting the per-row div/mod into an incremental wrap-counter was
+ *    NOT attempted here: a previous agent measured it as a consistent
+ *    small REGRESSION on spike.  Given the spike-vs-hardware inversion
+ *    documented above, that measurement cannot distinguish "no win" from
+ *    "win only on real hardware" -- spike bills a hardware divide at
+ *    roughly one instruction too.  It needs an FPGA A/B.
  */
 
 #include <stdint.h>
@@ -90,6 +159,35 @@ enum {
     IM2COL_ELEMS   = DIM * 256 * 9,   /* DIM rows × max K_inner (IC=256, 3×3) */
     ACC_ELEMS      = DIM * 256,        /* DIM rows × max OC (256 in yolov8)    */
 };
+
+/* ---------------------------------------------------------------------------
+ * RVV byte-move helpers (kernel_opt_log id 2401).
+ *
+ * These replace the two CPU-scalar byte loops this kernel used to spend
+ * 92% of its cycles in (im2col gather 71.8% + NCHW->NHWC transpose 20.3%;
+ * see the phase table in the file header).  Both are pure data movement --
+ * byte-for-byte identical results, so max_abs_err stays 0 by construction.
+ * ------------------------------------------------------------------------- */
+
+/* Contiguous int8 copy, vectorized. Equivalent to memcpy(dst, src, n). */
+static inline void gq31_vcopy_i8(elem_t *dst, const elem_t *src, size_t n)
+{
+    while (n > 0) {
+        size_t vl = __riscv_vsetvl_e8m8(n);
+        __riscv_vse8_v_i8m8(dst, __riscv_vle8_v_i8m8(src, vl), vl);
+        dst += vl; src += vl; n -= vl;
+    }
+}
+
+/* Contiguous int8 zero-fill, vectorized. Equivalent to memset(dst, 0, n). */
+static inline void gq31_vzero_i8(elem_t *dst, size_t n)
+{
+    while (n > 0) {
+        size_t vl = __riscv_vsetvl_e8m8(n);
+        __riscv_vse8_v_i8m8(dst, __riscv_vmv_v_x_i8m8(0, vl), vl);
+        dst += vl; n -= vl;
+    }
+}
 
 /* Two-stage Q0.31 requantize, vectorized over a run of OC channels.
  * Bit-identical to the scalar int64 reference (see file header):
@@ -207,13 +305,51 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     /* Reset gemmini controller and drain any prior DMA. */
     gemmini_flush(0);
 
-    /* Transpose input NCHW → NHWC into ws_input. */
-    for (int n = 0; n < N; n++)
-        for (int h = 0; h < IH; h++)
-            for (int w = 0; w < IW; w++)
-                for (int c = 0; c < IC; c++)
-                    ws_input[((n*IH + h)*IW + w)*IC + c] =
-                        input[((n*IC + c)*IH + h)*IW + w];
+    /* Transpose input NCHW → NHWC into ws_input (RVV).
+     *
+     * For a fixed (n, h) this is a plain IC x IW -> IW x IC transpose:
+     *   src[c][w] = input[((n*IC + c)*IH + h)*IW + w]   (row stride IH*IW)
+     *   dst[w][c] = ws_input[((n*IH + h)*IW + w)*IC + c] (row stride IC)
+     * Exactly one of the two sides has to be strided. Both orientations move
+     * the same number of elements, so pick the one with the LONGER vector so
+     * the per-iteration vsetvl/loop overhead is amortized over more work:
+     *   IW >= IC -> walk w (unit-stride load, strided store, vl up to IW)
+     *   IC >  IW -> walk c (strided load, unit-stride store, vl up to IC)
+     * dronet hits the second branch on every layer (IC=32..128 vs IW=4..27),
+     * yolov8's wide early layers hit the first. Pure data movement -- the
+     * bytes written are identical to the scalar loop this replaces. */
+    for (int n = 0; n < N; n++) {
+        for (int h = 0; h < IH; h++) {
+            const elem_t *in_nh  = &input[((size_t)n*IC*IH + h)*IW];
+            elem_t       *out_nh = &ws_input[(((size_t)n*IH + h)*IW)*IC];
+            if (IW >= IC) {
+                for (int c = 0; c < IC; c++) {
+                    const elem_t *src = in_nh  + (size_t)c*IH*IW;
+                    elem_t       *dp  = out_nh + c;
+                    size_t w = 0, rem = (size_t)IW;
+                    while (rem > 0) {
+                        size_t vl = __riscv_vsetvl_e8m8(rem);
+                        __riscv_vsse8_v_i8m8(dp + w*(size_t)IC, (ptrdiff_t)IC,
+                                             __riscv_vle8_v_i8m8(src + w, vl), vl);
+                        w += vl; rem -= vl;
+                    }
+                }
+            } else {
+                for (int w = 0; w < IW; w++) {
+                    const elem_t *src = in_nh  + w;
+                    elem_t       *dp  = out_nh + (size_t)w*IC;
+                    size_t c = 0, rem = (size_t)IC;
+                    while (rem > 0) {
+                        size_t vl = __riscv_vsetvl_e8m8(rem);
+                        __riscv_vse8_v_i8m8(dp + c,
+                            __riscv_vlse8_v_i8m8(src + c*(size_t)IH*IW,
+                                                 (ptrdiff_t)IH*IW, vl), vl);
+                        c += vl; rem -= vl;
+                    }
+                }
+            }
+        }
+    }
 
     /* Weight is already HWIO-packed by the codegen
      * (generate_skeleton.py::_backend_pack_weight, --backend gemmini).
@@ -234,27 +370,49 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
          * Row i holds the flattened receptive field for output position
          * (tile_i + i).  Rows past tile_rows are zero-padded. */
         for (int i = 0; i < DIM; i++) {
-            elem_t *row = &ws_im2col[i * K_inner];
+            elem_t *row = &ws_im2col[(size_t)i * K_inner];
             if (i >= tile_rows) {
-                for (int k = 0; k < K_inner; k++) row[k] = 0;
+                gq31_vzero_i8(row, (size_t)K_inner);
                 continue;
             }
             int out_idx = tile_i + i;
             int ow_idx  = out_idx % OW;
             int oh_idx  = (out_idx / OW) % OH;
             int n_idx   = out_idx / (OH * OW);
+            /* iw for kw=0. The kw loop steps iw by exactly 1 regardless of SW,
+             * so for a fixed kh the KW cells the scalar loop wrote one channel
+             * at a time are CONTIGUOUS on both sides:
+             *   src advances by IC per kw (ws_input is NHWC, iw+1 -> +IC)
+             *   dst advances by IC per kw (row is [kh][kw][ic])
+             * => the whole in-bounds kw run is a single contiguous copy of
+             * (kw_hi - kw_lo)*IC bytes, and the out-of-bounds prefix/suffix are
+             * two contiguous zero-fills. This both removes KW-1 of every KW
+             * loop set-ups and hands the copy a vector length of KW*IC instead
+             * of IC (e.g. 96B instead of 32B for dronet's 3x3/IC=32 layers).
+             * Byte-for-byte the same im2col matrix as the scalar loop. */
+            const int iw0 = ow_idx * SW - PW;
+            int kw_lo = -iw0 > 0 ? -iw0 : 0;
+            int kw_hi = (IW - iw0) < KW ? (IW - iw0) : KW;
+            if (kw_lo > KW) kw_lo = KW;
+            if (kw_hi < kw_lo) kw_hi = kw_lo;
             for (int kh = 0; kh < KH; kh++) {
                 int ih = oh_idx * SH - PH + kh;
-                for (int kw = 0; kw < KW; kw++) {
-                    int iw = ow_idx * SW - PW + kw;
-                    elem_t *cell = row + (kh * KW + kw) * IC;
-                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
-                        const elem_t *src = &ws_input[((n_idx*IH + ih)*IW + iw)*IC];
-                        for (int c = 0; c < IC; c++) cell[c] = src[c];
-                    } else {
-                        for (int c = 0; c < IC; c++) cell[c] = 0;
-                    }
+                elem_t *base = row + (size_t)kh * KW * IC;
+                if (ih < 0 || ih >= IH) {          /* whole row out of bounds */
+                    gq31_vzero_i8(base, (size_t)KW * IC);
+                    continue;
                 }
+                if (kw_lo > 0)
+                    gq31_vzero_i8(base, (size_t)kw_lo * IC);
+                if (kw_hi > kw_lo) {
+                    const elem_t *src = &ws_input[
+                        ((((size_t)n_idx*IH + ih)*IW) + (size_t)(iw0 + kw_lo))*IC];
+                    gq31_vcopy_i8(base + (size_t)kw_lo * IC, src,
+                                  (size_t)(kw_hi - kw_lo) * IC);
+                }
+                if (kw_hi < KW)
+                    gq31_vzero_i8(base + (size_t)kw_hi * IC,
+                                  (size_t)(KW - kw_hi) * IC);
             }
         }
 
