@@ -6642,6 +6642,35 @@ void kernel_conv2d_batchnorm2d_s8(
             reference_impl="(use the scalar reference_impl)",
             weight_layout="hwio",
         ),
+        # The RVV entry. Without it the curated lookup has no
+        # (op, algorithm) pair to probe for this op and every fused
+        # conv falls back to the scalar reference inside a build
+        # labelled rvv_x60 -- measured at 86.7% of DroNet's 62.6 ms.
+        # Kernel: kernels/rvv/rvv_conv2d_batchnorm2d_s8
+        # _rvv_oc_blocked_bn_epilogue.c
+        AlgorithmCandidate(
+            name="rvv_oc_blocked_bn_epilogue",
+            target_affinity=("rvv", "rvv_x60"),
+            weight_layout="ihwoc",
+            description=(
+                "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
+                "MAC reduction over (ic, kh, kw), vsmul+vnclip Q0.31 "
+                "requantize tail, OC tiled for L1D, IHWOC weights) with "
+                "the BN stage applied to the int8 conv result on its way "
+                "to memory -- no intermediate tensor.\n\n"
+                "The BN stage stays on the scalar unit: after the conv "
+                "requantize the value is an int8, so BN has at most 256 "
+                "distinct outputs per channel and becomes a per-channel "
+                "table wherever OH*OW amortizes the 256-entry build "
+                "(below that break-even the same arithmetic runs per "
+                "element). That keeps float ops out of a vector body "
+                "whose vtype is otherwise pure integer, and makes the "
+                "epilogue bit-exact with the reference by construction "
+                "-- vfcvt cannot round the way roundf() does."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
     ],
 )
 
@@ -6822,6 +6851,38 @@ void kernel_conv2d_batchnorm2d_silu_s8(
             ),
             reference_impl="(use the scalar reference_impl)",
             weight_layout="hwio",
+        ),
+        # The RVV entry. Without it the curated lookup has no
+        # (op, algorithm) pair to probe for this op, and all 57 of
+        # yolov8_nano's backbone convolutions fall back to the scalar
+        # reference inside a build labelled rvv_x60 -- measured at 99.8%
+        # of a 4974.8 ms run, i.e. 0.81x against the pure-scalar build.
+        # Kernel: kernels/rvv/rvv_conv2d_batchnorm2d_silu_s8
+        # _rvv_oc_blocked_bn_silu_epilogue.c
+        AlgorithmCandidate(
+            name="rvv_oc_blocked_bn_silu_epilogue",
+            target_affinity=("rvv", "rvv_x60"),
+            weight_layout="ihwoc",
+            description=(
+                "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
+                "MAC reduction over (ic, kh, kw), vsmul+vnclip Q0.31 "
+                "requantize tail, OC tiled for L1D, IHWOC weights) with "
+                "the BN and SiLU stages applied to the int8 conv result "
+                "on its way to memory -- no intermediate tensors.\n\n"
+                "Both stages are tables, not vector float math. The conv "
+                "requantize leaves an int8, so SiLU depends on at most "
+                "256 distinct inputs in total (one table per dispatch, "
+                "256 expf calls instead of one per output element) and BN "
+                "on at most 256 per channel (tabulated per OC tile where "
+                "OH*OW amortizes the build, per element below that "
+                "break-even). Keeping the float arithmetic scalar and "
+                "textually identical to the reference makes the epilogue "
+                "bit-exact by construction -- vfcvt cannot round the way "
+                "roundf() does -- and keeps float ops out of a vector "
+                "body whose vtype is otherwise pure integer."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
         ),
     ],
 )
