@@ -20,9 +20,12 @@ The generated main:
 
     1. Creates one modelblaster_pool (worker count from MODELBLASTER_POOL_THREADS).
     2. Resets every involved (model, backend) profile counter.
-    3. Spawns one Zephyr worker per distinct core_kind, pinned to the
-       schedule-assigned hart. Each worker walks the table in start-time
-       order taking entries that match its kind.
+    3. Spawns one worker per (core_kind, hart) pair the schedule
+       actually uses, pinned to that hart. Each worker walks the table
+       in start-time order taking only entries that match BOTH its kind
+       and its hart. Entries with hart == -1 (unbound) are claimed by
+       the kind's designated worker -- the one sitting on the kind's
+       lowest-numbered hart -- so nothing is ever dropped.
     4. Inside the dispatch branch, selects the right per-backend table
        by ``core_kind`` and invokes ``MODEL_<UMID>_DISPATCH_FNS_<BS>``.
     5. Tracks per-network wall cycles inline (no model-side setter
@@ -69,6 +72,15 @@ _PROLOGUE_LINUX = """#define MODELBLASTER_PLATFORM_LINUX 1
 
 _PROLOGUES = {"zephyr": _PROLOGUE_ZEPHYR, "linux": _PROLOGUE_LINUX}
 
+# Emitted BEFORE any #include. glibc gates cpu_set_t / CPU_ZERO / CPU_SET and
+# pthread_attr_setaffinity_np behind _GNU_SOURCE, and <sched.h> latches the
+# decision the first time it is included -- so this cannot live in the
+# platform prologue, which lands after the include block. Zephyr gets an
+# empty string: its affinity API is Kconfig-gated, not feature-test-gated,
+# and defining _GNU_SOURCE there would be a no-op at best.
+_TOP_LINUX = "#define _GNU_SOURCE 1  /* cpu_set_t, pthread_attr_setaffinity_np */\n"
+_TOPS = {"zephyr": "", "linux": _TOP_LINUX}
+
 
 def _split_job_name(job: str, known: set[str] | None = None) -> tuple[str, int]:
     if known:
@@ -103,8 +115,12 @@ def _emit(networks: list[str], schedule_name: str,
 
     `networks`     is the ordered list of distinct network names the
                    schedule references.
-    `core_kinds`   is the ordered list of distinct core_kind values; one
-                   scheduler-worker thread is spawned per kind.
+    `core_kinds`   is the ordered list of distinct core_kind values.
+                   NOTE this no longer fixes the thread count: the walker
+                   discovers the (kind, hart) worker set at RUN time by
+                   scanning the dispatch table, so `core_kinds` only fixes
+                   the kind -> backend pairing, the per-kind pool array
+                   layout, and which kinds are executable at all.
     `backends`     is the ordered list of HW backends compiled into the
                    binary (== the per-model OBJECT-lib suffixes). Usually
                    identical to `core_kinds`, but separated to allow
@@ -118,6 +134,17 @@ def _emit(networks: list[str], schedule_name: str,
                    parallel_<op> runs synchronously on the scheduler
                    worker. Intra-op parallelism kicks in only when a kind
                    has >=2 harts.
+
+                   OVERSUBSCRIPTION RULE (2026-08-27): inter-dispatch
+                   parallelism (one scheduler worker per hart) and
+                   intra-op parallelism (pool helper threads) compete for
+                   the same physical harts. Now that the walker spawns one
+                   worker per (kind, hart) the kind's harts are already
+                   fully claimed by scheduler workers, so main() FORCES
+                   pools[k] = NULL for any kind that ended up with more
+                   than one worker, whatever `pool_sizes[k]` says. A kind
+                   with exactly one worker still gets its configured pool,
+                   because the kind's other harts are genuinely idle.
     `n_instances`  per-network instance count (max instance index + 1).
                    Sized arrays for wall-cycle bookkeeping so periodic
                    instances of the same network don't clobber each
@@ -284,7 +311,7 @@ def _emit(networks: list[str], schedule_name: str,
             f"                    k_sem_give(&completion_sems[i_]);\n"
             f"                }}\n"
             f"                prev_iter_end = (uint64_t)k_cycle_get_64();\n"
-            f"                g_hart_acc[my_kind_idx].entries_done++;\n"
+            f"                g_hart_acc[my_acc_idx].entries_done++;\n"
             f"                continue;\n"
             f"            }}\n"
             f"            if (e_->dispatch_id == 0) {{\n"
@@ -302,7 +329,7 @@ def _emit(networks: list[str], schedule_name: str,
             f"                while ((uint64_t)k_cycle_get_64() < target_start) {{\n"
             f"                    k_yield();\n"
             f"                }}\n"
-            f"                g_hart_acc[my_kind_idx].target_gate_spin +=\n"
+            f"                g_hart_acc[my_acc_idx].target_gate_spin +=\n"
             f"                    ((uint64_t)k_cycle_get_64() - t_gate0);\n"
             + "\n".join(
                 f"                model_{mid}_reset_profile_{bs}();"
@@ -333,10 +360,11 @@ def _emit(networks: list[str], schedule_name: str,
             f"#endif\n"
             f"{bs_select}\n"
             f"            uint64_t t_disp1 = (uint64_t)k_cycle_get_64();\n"
-            f"            g_hart_acc[my_kind_idx].kernel += (t_disp1 - t_disp0);\n"
+            f"            g_hart_acc[my_acc_idx].kernel += (t_disp1 - t_disp0);\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].end_cycles = t_disp1 - run_t0;\n"
             f"            xpurt_trace[i_].worker_kind_idx = my_kind_idx;\n"
+            f"            xpurt_trace[i_].worker_hart = my_hart;\n"
             f"#endif\n"
             f"            if (e_->dispatch_id == MODEL_{umid}_OP_COUNT - 1) {{\n"
             f"                wall_cycles_{mid}[e_->instance] =\n"
@@ -351,9 +379,9 @@ def _emit(networks: list[str], schedule_name: str,
             f"                k_sem_give(&completion_sems[i_]);\n"
             f"            }}\n"
             f"            uint64_t t_iter_end = (uint64_t)k_cycle_get_64();\n"
-            f"            g_hart_acc[my_kind_idx].sync_overhead += (t_iter_end - t_disp1);\n"
+            f"            g_hart_acc[my_acc_idx].sync_overhead += (t_iter_end - t_disp1);\n"
             f"            prev_iter_end = t_iter_end;\n"
-            f"            g_hart_acc[my_kind_idx].entries_done++;\n"
+            f"            g_hart_acc[my_acc_idx].entries_done++;\n"
             f"            continue;\n"
             f"        }}"
         )
@@ -463,16 +491,20 @@ def _emit(networks: list[str], schedule_name: str,
     forward_decl_block = "\n".join(forward_decls)
     try:
         platform_prologue = _PROLOGUES[platform]
+        platform_top = _TOPS[platform]
     except KeyError:
         raise SystemExit(f"--platform must be one of {sorted(_PROLOGUES)}, "
                          f"got {platform!r}")
 
     return f"""{HEADER}
-/*
- * Schedule-driven multi-network entry point with per-core-kind worker
- * threads and HETEROGENEOUS per-backend dispatch tables. Each worker:
+{platform_top}/*
+ * Schedule-driven multi-network entry point with per-(core_kind, hart)
+ * worker threads and HETEROGENEOUS per-backend dispatch tables. One
+ * worker is spawned for each (core_kind, hart) pair the dispatch table
+ * uses, pinned to that hart, so the schedule's per-core placement is what
+ * actually executes. Each worker:
  *   1. Walks the XPU-RT-emitted dispatch table in start_time order,
- *      taking entries whose .core_kind matches its own kind.
+ *      taking entries whose .core_kind AND .hart match its own.
  *   2. Before invoking, waits on k_sems posted by the producers of its
  *      .deps[] (intra-job data deps) and .time_dep_entry_id (cross-job
  *      ordering edges).
@@ -481,9 +513,22 @@ def _emit(networks: list[str], schedule_name: str,
  *      time has suffixed every model's externally-visible symbol with
  *      _<bs>, so multiple backends per model link cleanly.
  *   4. After invoking, gives the entry's k_sem so consumers unblock.
- * Workers are pinned to harts via pthread_attr_setaffinity_np (Phase A
- * patch). modelblaster_pool is the parallel-for primitive — parallel_<op>
- * wrappers inside dispatched kernels use it for intra-op parallelism.
+ *
+ * Deadlock freedom is unchanged by the extra threads. ingest asserts that
+ * every dep and time_dep edge points STRICTLY BACKWARD in entry_id order,
+ * and every worker walks 0..N-1 monotonically. Take the blocked worker
+ * with the smallest current index i: it waits on some j < i, whose owner
+ * has current index <= j < i, so that owner is either running or is a
+ * blocked worker with a smaller index -- contradicting minimality. The
+ * argument never mentions how entries are partitioned across threads, so
+ * it holds for one worker per (kind, hart) exactly as it did for one
+ * worker per kind.
+ *
+ * Workers are pinned to harts via pthread_attr_setaffinity_np.
+ * modelblaster_pool is the parallel-for primitive — parallel_<op>
+ * wrappers inside dispatched kernels use it for intra-op parallelism, and
+ * main() disables it for any kind whose harts are already fully claimed
+ * by scheduler workers (see the pool oversubscription rule below).
  *
  * Outputs follow the same multi-line marker protocol as the
  * straight-line multi_main, so spike_runner verifies them against
@@ -550,6 +595,13 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
 #ifndef XPURT_MAX_KINDS
 #define XPURT_MAX_KINDS 8
 #endif
+/* Upper bound on scheduler-worker threads == distinct (core_kind, hart)
+ * pairs the dispatch table uses. 32 covers every board we target (the K1
+ * has 8 harts); main() aborts loudly rather than truncating if a schedule
+ * ever exceeds it. */
+#ifndef XPURT_MAX_WORKERS
+#define XPURT_MAX_WORKERS 32
+#endif
 struct xpurt_hart_acc {{
     uint64_t kernel;            /* mtime delta around bs_select dispatch */
     uint64_t dep_wait;          /* mtime inside k_sem_take loop */
@@ -560,7 +612,11 @@ struct xpurt_hart_acc {{
     uint64_t entries_done;      /* count of dispatched entries */
     uint64_t wall_total;        /* worker_t0 → worker_exit delta */
 }};
-static struct xpurt_hart_acc g_hart_acc[XPURT_MAX_KINDS];
+/* Indexed by WORKER index, not kind index — since 2026-08-27 there is one
+ * worker per (core_kind, hart), so a per-kind array would have several
+ * threads racing on the same counters and would report a kind's busy time
+ * as if one hart had done it all. */
+static struct xpurt_hart_acc g_hart_acc[XPURT_MAX_WORKERS];
 
 /* One state struct per (network, kind). `.pool` is bound to the kind's
  * modelblaster_pool in main() before workers spawn and never written again
@@ -597,31 +653,62 @@ static uint64_t run_t0;
     ((uint64_t)(XPURT_TICKS_PER_SEC / 1000))
 
 #ifdef MODELBLASTER_XPURT_TRACE
-/* Per-entry execution trace. Each slot is touched by exactly one
- * worker (the one whose core_kind matches) so concurrent writes never
- * overlap. Cycles are mtime-based (k_cycle_get_64) and offset against
- * `run_t0`, captured immediately before the first worker starts. The
- * host parser reconstructs (start_ms, end_ms) by dividing by the
- * configured clock_mhz. */
+/* Per-entry execution trace. Each slot is still touched by exactly one
+ * worker, and that is now enforced rather than asserted: the claim
+ * predicate in xpurt_worker() partitions the table by (core_kind, hart),
+ * a partition with no overlap by construction, and main() audits at
+ * startup that every entry is claimed by EXACTLY ONE worker before any
+ * thread is spawned (see the claim-coverage audit). `worker_hart` records
+ * which hart actually executed the slot, so an entry that ran somewhere
+ * other than where the schedule placed it (column `hart`) is visible in
+ * the CSV instead of being invisible behind a shared kind index.
+ * Pre-initialized to -1/-1 so an entry NO worker ran is distinguishable
+ * from one that ran on kind 0 / hart 0 at cycle 0.
+ * Cycles are mtime-based (k_cycle_get_64) and offset against `run_t0`,
+ * captured immediately before the first worker starts. The host parser
+ * reconstructs (start_ms, end_ms) by dividing by the configured
+ * clock_mhz. */
 struct xpurt_trace_slot {{
     uint64_t start_cycles;
     uint64_t end_cycles;
     int      worker_kind_idx;   /* index into kinds[] */
+    int      worker_hart;       /* hart the executing worker was pinned to */
 }};
 static struct xpurt_trace_slot xpurt_trace[{upper}_N_ENTRIES];
 #endif
 
 struct xpurt_worker_arg {{
     const char *kind;
-    int hart;
-    int kind_idx;
+    int hart;             /* hart this worker is pinned to; -1 = unpinned */
+    int kind_idx;         /* index into kinds[] / pools[] */
+    int worker_idx;       /* index into g_hart_acc[] / tids[] */
+    int claims_unbound;   /* 1 => also claims this kind's hart<0 entries */
+    int observed_cpu;     /* sched_getcpu() at worker entry; -1 if unknown */
 }};
+
+/* The worker set: one entry per (core_kind, hart) pair the dispatch table
+ * actually uses. Built in main() by scanning the table, BEFORE the pools
+ * are created (the pool sizing depends on how many workers a kind got). */
+static struct xpurt_worker_arg g_workers[XPURT_MAX_WORKERS];
+static int g_n_workers;
 
 static void *xpurt_worker(void *arg)
 {{
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
     const char *my_kind = wa->kind;
     int my_kind_idx = wa->kind_idx;
+    int my_hart = wa->hart;
+    int my_acc_idx = wa->worker_idx;
+    int my_claims_unbound = wa->claims_unbound;
+#ifdef MODELBLASTER_PLATFORM_LINUX
+    /* Record where the scheduler ACTUALLY put us. pthread_attr_setaffinity_np
+     * failing (or being compiled out) is silent otherwise, and an unpinned
+     * worker makes every per-hart number in this trace a fiction. main()
+     * prints observed_cpu next to the requested hart after the join. */
+    wa->observed_cpu = sched_getcpu();
+#else
+    wa->observed_cpu = -1;
+#endif
     /* Phase G1 attribution: track per-iter timing so we can decompose
      * wall_total into kernel + dep_wait + sync_overhead +
      * target_gate_spin + hart_idle. prev_iter_end is updated INSIDE
@@ -662,14 +749,39 @@ static void *xpurt_worker(void *arg)
 
     uint64_t worker_t0 = (uint64_t)k_cycle_get_64();
     uint64_t prev_iter_end = worker_t0;
-    /* Take entries that match `my_kind`, in start_time order. */
+    /* Take entries that match `my_kind` AND `my_hart`, in start_time
+     * order.
+     *
+     * Until 2026-08-27 the predicate was kind-only, so ONE thread ran
+     * every entry of a kind serially no matter how many distinct cores
+     * the scheduler had placed them on. Measured on the K1 with a
+     * 3-model schedule: zero overlapping dispatch pairs in 1617 entries,
+     * the single `rvv` worker 97.9% busy across a 1017.8 ms run, and 119
+     * of 123 instances missing their deadline even though per-dispatch
+     * durations matched the cost model (median actual/predicted 0.93).
+     * The schedule's core assignment was simply not honored at run time.
+     *
+     * UNBOUND ENTRIES: `hart == -1` means ingest could not resolve the
+     * schedule's machine slot to a physical hart (a registry core with an
+     * empty `harts` list). Those entries are NOT dropped -- exactly one
+     * worker per kind carries `claims_unbound`, the one on the kind's
+     * lowest-numbered hart, and it runs them interleaved with its own.
+     * If a kind has ONLY unbound entries it gets a single unpinned worker
+     * that carries the flag. Either way the (kind, hart) predicate stays
+     * a partition of the table: every entry is claimed by exactly one
+     * worker, which main() audits before spawning anything. */
     for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
         const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
         if (strcmp(e_->core_kind, my_kind) != 0) continue;
+        if (e_->hart >= 0) {{
+            if (e_->hart != my_hart) continue;
+        }} else if (!my_claims_unbound) {{
+            continue;
+        }}
 
         uint64_t t_iter_start = (uint64_t)k_cycle_get_64();
-        if (g_hart_acc[my_kind_idx].entries_done > 0) {{
-            g_hart_acc[my_kind_idx].hart_idle +=
+        if (g_hart_acc[my_acc_idx].entries_done > 0) {{
+            g_hart_acc[my_acc_idx].hart_idle +=
                 (t_iter_start - prev_iter_end);
         }}
 
@@ -697,7 +809,7 @@ static void *xpurt_worker(void *arg)
             }}
         }}
         uint64_t t_deps_done = (uint64_t)k_cycle_get_64();
-        g_hart_acc[my_kind_idx].dep_wait += (t_deps_done - t_iter_start);
+        g_hart_acc[my_acc_idx].dep_wait += (t_deps_done - t_iter_start);
 
 {dispatch_branch}
         printf("xpurt: WARN unknown network %s in entry %d\\n",
@@ -709,9 +821,9 @@ static void *xpurt_worker(void *arg)
             k_sem_give(&completion_sems[i_]);
         }}
         prev_iter_end = (uint64_t)k_cycle_get_64();
-        g_hart_acc[my_kind_idx].entries_done++;
+        g_hart_acc[my_acc_idx].entries_done++;
     }}
-    g_hart_acc[my_kind_idx].wall_total =
+    g_hart_acc[my_acc_idx].wall_total =
         (uint64_t)k_cycle_get_64() - worker_t0;
     return NULL;
 }}
@@ -721,26 +833,144 @@ int main(void)
     printf("xpurt-runner: schedule={schedule_name} entries=%d kinds=%d on %s\\n",
            {upper}_N_ENTRIES, {n_kinds}, XPURT_BOARD_TARGET);
 
-    /* Per-kind modelblaster_pool sizes. Element k's helper thread count is
-     * (harts_of_kind_k - 1) — one less than the kind's hart count, since
-     * the scheduler-worker thread for that kind is itself one of those
-     * harts. 0 ⇒ NULL pool, parallel_<op> wrappers run synchronously on
-     * the calling scheduler worker. We never oversubscribe a backend's
-     * harts; on real silicon this maps each pool's helper threads onto
-     * the kind's idle harts. */
+    static const char *kinds[] = {{ {kind_strs} }};
+
+    /* ---- Worker-set discovery -----------------------------------------
+     * One worker per (core_kind, hart) pair the DISPATCH TABLE actually
+     * uses -- discovered here rather than passed in at codegen, because
+     * the hart column is resolved by ingest against the core registry and
+     * the generator never sees the registry. A kind the schedule does not
+     * use gets zero workers (e.g. rvv_c1 in the 2-model B1 schedule).
+     *
+     * Unbound entries (hart == -1): the kind's lowest-hart worker is
+     * marked `claims_unbound` and runs them interleaved with its own. If
+     * a kind has ONLY unbound entries it gets one unpinned worker
+     * carrying the flag. Never dropped -- a dropped entry surfaces as a
+     * zeroed trace row and reads exactly like a crash. */
+    g_n_workers = 0;
+    for (int k = 0; k < {n_kinds}; k++) {{
+        int kind_first = g_n_workers;
+        int has_unbound = 0;
+        for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+            const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
+            if (strcmp(e->core_kind, kinds[k]) != 0) continue;
+            if (e->hart < 0) {{ has_unbound = 1; continue; }}
+            int seen = 0;
+            for (int w = kind_first; w < g_n_workers; w++) {{
+                if (g_workers[w].hart == e->hart) {{ seen = 1; break; }}
+            }}
+            if (seen) continue;
+            if (g_n_workers >= XPURT_MAX_WORKERS) {{
+                printf("FATAL: schedule uses more than %d (core_kind,hart) "
+                       "pairs; raise XPURT_MAX_WORKERS\\n", XPURT_MAX_WORKERS);
+                sys_reboot(SYS_REBOOT_COLD);
+                return -1;
+            }}
+            g_workers[g_n_workers].kind = kinds[k];
+            g_workers[g_n_workers].hart = e->hart;
+            g_workers[g_n_workers].kind_idx = k;
+            g_workers[g_n_workers].worker_idx = g_n_workers;
+            g_workers[g_n_workers].claims_unbound = 0;
+            g_workers[g_n_workers].observed_cpu = -1;
+            g_n_workers++;
+        }}
+        if (has_unbound) {{
+            if (g_n_workers > kind_first) {{
+                int lo = kind_first;
+                for (int w = kind_first + 1; w < g_n_workers; w++) {{
+                    if (g_workers[w].hart < g_workers[lo].hart) lo = w;
+                }}
+                g_workers[lo].claims_unbound = 1;
+            }} else {{
+                if (g_n_workers >= XPURT_MAX_WORKERS) {{
+                    printf("FATAL: XPURT_MAX_WORKERS exhausted on unbound "
+                           "kind %s\\n", kinds[k]);
+                    sys_reboot(SYS_REBOOT_COLD);
+                    return -1;
+                }}
+                g_workers[g_n_workers].kind = kinds[k];
+                g_workers[g_n_workers].hart = -1;   /* unpinned */
+                g_workers[g_n_workers].kind_idx = k;
+                g_workers[g_n_workers].worker_idx = g_n_workers;
+                g_workers[g_n_workers].claims_unbound = 1;
+                g_workers[g_n_workers].observed_cpu = -1;
+                g_n_workers++;
+            }}
+        }}
+    }}
+
+    /* ---- Claim-coverage audit -----------------------------------------
+     * Every table entry must be claimed by EXACTLY ONE worker. Zero
+     * claimants means the entry silently never runs -- that is how the
+     * kind-vs-backend strcmp mismatch of 2026-06-03 presented, as all-zero
+     * outputs that read like FPGA corruption. More than one means two
+     * threads write the same trace slot and run the same kernel twice.
+     * Both are fatal and both are cheap to rule out right here, before a
+     * single thread exists. This is also what keeps the trace-slot
+     * "exactly one writer" invariant a fact rather than a hope. */
+    for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+        const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
+        int claimants = 0;
+        for (int w = 0; w < g_n_workers; w++) {{
+            if (strcmp(e->core_kind, g_workers[w].kind) != 0) continue;
+            if (e->hart >= 0) {{
+                if (e->hart != g_workers[w].hart) continue;
+            }} else if (!g_workers[w].claims_unbound) {{
+                continue;
+            }}
+            claimants++;
+        }}
+        if (claimants != 1) {{
+            printf("FATAL: entry %d (%s dispatch %d, core_kind=%s hart=%d) "
+                   "has %d claimant workers, expected 1\\n",
+                   e->entry_id, e->network, e->dispatch_id,
+                   e->core_kind, e->hart, claimants);
+            sys_reboot(SYS_REBOOT_COLD);
+            return -1;
+        }}
+    }}
+
+    /* ---- Per-kind modelblaster_pool sizes ------------------------------
+     * `pool_sizes[k]` is the intra-op (parallel_<op>) fan-out for kind k;
+     * modelblaster_pool counts the CALLER in its thread count, so kind k
+     * wants pool_size == the kind's hart count. 0 => NULL pool and
+     * parallel_<op> runs synchronously on the calling scheduler worker.
+     *
+     * OVERSUBSCRIPTION GUARD: inter-dispatch parallelism (one scheduler
+     * worker per hart, above) and intra-op parallelism (pool helpers)
+     * draw on the same physical harts. If a kind got more than one
+     * worker, its harts are already fully claimed and a pool on top would
+     * put 2+ runnable threads on each of them, turning a measurement of
+     * the schedule into a measurement of the Linux scheduler. So a
+     * multi-worker kind is forced to a NULL pool regardless of what
+     * `pool_sizes` says. A single-worker kind keeps its configured pool:
+     * the kind's remaining harts really are idle in that case. */
     static const int pool_sizes[{n_kinds}] = {{ {pool_size_strs} }};
     for (int k = 0; k < {n_kinds}; k++) {{
-        if (pool_sizes[k] > 0) {{
-            pools[k] = (void *)modelblaster_pool_create(pool_sizes[k]);
+        int n_workers_k = 0;
+        for (int w = 0; w < g_n_workers; w++) {{
+            if (g_workers[w].kind_idx == k) n_workers_k++;
+        }}
+        int want = pool_sizes[k];
+        if (want > 0 && n_workers_k > 1) {{
+            printf("modelblaster_pool[kind=%d]: disabled -- %d scheduler "
+                   "workers already own this kind's harts, pool_size=%d "
+                   "would oversubscribe\\n", k, n_workers_k, want);
+            want = 0;
+        }}
+        if (want > 0) {{
+            pools[k] = (void *)modelblaster_pool_create(want);
             if (pools[k] == NULL) {{
                 printf("FATAL: modelblaster_pool_create kind=%d size=%d failed\\n",
-                       k, pool_sizes[k]);
+                       k, want);
                 sys_reboot(SYS_REBOOT_COLD);
                 return -1;
             }}
         }}
-        printf("modelblaster_pool[kind=%d]: %u helpers (intra-op)\\n",
-               k, (unsigned)(pools[k] ? modelblaster_pool_get_threads_count((modelblaster_pool_t)pools[k]) : 0));
+        printf("modelblaster_pool[kind=%d]: %u helpers (intra-op), "
+               "%d scheduler worker(s)\\n",
+               k, (unsigned)(pools[k] ? modelblaster_pool_get_threads_count((modelblaster_pool_t)pools[k]) : 0),
+               n_workers_k);
     }}
 
 {chr(10).join(state_inits)}
@@ -761,115 +991,142 @@ int main(void)
         k_sem_init(&completion_sems[i], 0, 32);
     }}
 
-    /* One worker per distinct core_kind. Each pins itself to the first
-     * matching entry's hart (good enough — assumes all entries of the
-     * same kind share a hart, which is true for our singleton-machine
-     * schedules; multi-hart-per-kind would need a per-hart subdivision).
+    /* One worker per (core_kind, hart) pair, discovered above. Each pins
+     * itself to its own hart, so the schedule's placement decision is the
+     * one that executes. The previous version spawned one worker per KIND
+     * and pinned it to the first matching entry's hart, which quietly
+     * serialized every dispatch of a kind onto a single core.
      *
      * Zephyr quirk: pthread_attr_init() casts the public pthread_attr_t*
      * to the internal `struct posix_thread_attr*` and zeroes it; with
      * CONFIG_POSIX_THREADS_AFFINITY the internal struct extends past the
      * public 16 bytes (cpu_affinity sits at offset 16). Without padding,
      * pthread_attr_setaffinity_np(&attrs[k+1]) silently corrupts the
-     * adjacent wargs[k]. Pad each slot to 64 bytes so the cast stays in
-     * its lane. */
-    static const char *kinds[] = {{ {kind_strs} }};
-    static struct xpurt_worker_arg wargs[{n_kinds}];
-    static pthread_t tids[{n_kinds}];
+     * adjacent attrs[k+1] neighbour. Pad each slot to 64 bytes so the
+     * cast stays in its lane. */
+    static pthread_t tids[XPURT_MAX_WORKERS];
     union xpurt_attr_slot {{ pthread_attr_t a; char _pad[64]; }};
-    static union xpurt_attr_slot attrs[{n_kinds}];
+    static union xpurt_attr_slot attrs[XPURT_MAX_WORKERS];
+
+#ifdef MODELBLASTER_XPURT_TRACE
+    /* -1/-1 rather than the static 0/0, so a row NO worker executed is
+     * distinguishable from one executed by kind 0 on hart 0. */
+    for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+        xpurt_trace[i].worker_kind_idx = -1;
+        xpurt_trace[i].worker_hart = -1;
+    }}
+#endif
 
     /* Run baseline for both the trace and the periodic-start-time gate.
      * Captured just before workers spawn so it's the moment "t=0" of the
      * schedule maps to. */
     run_t0 = (uint64_t)k_cycle_get_64();
 
-    for (int k = 0; k < {n_kinds}; k++) {{
-        int pinned_hart = -1;
-        for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
-            if (strcmp({upper}_TABLE[i_].core_kind, kinds[k]) == 0) {{
-                pinned_hart = {upper}_TABLE[i_].hart;
-                break;
-            }}
-        }}
-        wargs[k].kind = kinds[k];
-        wargs[k].hart = pinned_hart;
-        wargs[k].kind_idx = k;
-
-        pthread_attr_init(&attrs[k].a);
-#ifdef CONFIG_POSIX_THREADS_AFFINITY
-        if (pinned_hart >= 0) {{
+    for (int w = 0; w < g_n_workers; w++) {{
+        pthread_attr_init(&attrs[w].a);
+        /* Affinity. The Linux arm used to be missing: the whole block sat
+         * under `#ifdef CONFIG_POSIX_THREADS_AFFINITY`, a Zephyr Kconfig
+         * symbol that the harness_xpurt_linux CMake never defines -- so on
+         * the K1 every worker floated across all 8 harts and the
+         * "pinned_hart=N" line printed at exit was a claim about an
+         * attribute nobody had set. glibc needs _GNU_SOURCE (emitted at
+         * the top of this file) plus the same call. */
+#if defined(CONFIG_POSIX_THREADS_AFFINITY) || defined(MODELBLASTER_PLATFORM_LINUX)
+        if (g_workers[w].hart >= 0) {{
             cpu_set_t cs;
             CPU_ZERO(&cs);
-            CPU_SET(pinned_hart, &cs);
-            pthread_attr_setaffinity_np(&attrs[k].a, sizeof(cs), &cs);
+            CPU_SET(g_workers[w].hart, &cs);
+            int arc = pthread_attr_setaffinity_np(&attrs[w].a, sizeof(cs), &cs);
+            if (arc != 0) {{
+                printf("FATAL: pthread_attr_setaffinity_np worker=%d kind=%s "
+                       "hart=%d rc=%d -- refusing to run unpinned, every "
+                       "per-hart number in the trace would be fiction\\n",
+                       w, g_workers[w].kind, g_workers[w].hart, arc);
+                sys_reboot(SYS_REBOOT_COLD);
+                return -1;
+            }}
         }}
 #endif
-        int rc = pthread_create(&tids[k], &attrs[k].a, xpurt_worker, &wargs[k]);
+        int rc = pthread_create(&tids[w], &attrs[w].a, xpurt_worker,
+                                &g_workers[w]);
         if (rc != 0) {{
-            printf("FATAL: pthread_create kind=%s rc=%d\\n", kinds[k], rc);
+            printf("FATAL: pthread_create worker=%d kind=%s hart=%d rc=%d\\n",
+                   w, g_workers[w].kind, g_workers[w].hart, rc);
             sys_reboot(SYS_REBOOT_COLD);
             return -1;
         }}
         /* Per-worker spawn diagnostic deferred to after pthread_join.
          * Inline printf here costs ~tens-of-ms over FireSim HTIF UART
-         * and starves any worker pinned to the same hart as main
-         * (the scalar worker pinned to hart 0). The (kind, pinned_hart)
-         * info is already aggregated in wargs[k]; print at the end so
-         * it doesn't perturb the schedule's actual_start cycle counts. */
+         * and starves any worker pinned to the same hart as main.
+         * The (kind, hart) info is already in g_workers[w]; print at the
+         * end so it doesn't perturb the schedule's actual_start cycles. */
     }}
 
     /* Wait for every worker to drain. */
-    for (int k = 0; k < {n_kinds}; k++) {{
-        pthread_join(tids[k], NULL);
-        pthread_attr_destroy(&attrs[k].a);
+    for (int w = 0; w < g_n_workers; w++) {{
+        pthread_join(tids[w], NULL);
+        pthread_attr_destroy(&attrs[w].a);
     }}
 
     /* Now safe to flush the spawn diagnostics — workers are done, so
-     * nothing pinned to hart 0 is competing with main for UART time. */
-    for (int k = 0; k < {n_kinds}; k++) {{
-        printf("xpurt: worker[%d] kind=%s pinned_hart=%d\\n",
-               k, wargs[k].kind, wargs[k].hart);
+     * nothing pinned to hart 0 is competing with main for UART time.
+     * `observed_cpu` is sched_getcpu() sampled inside the worker: it must
+     * equal `hart` for a pinned worker, and a mismatch means the pinning
+     * did not take even though the call returned 0. */
+    for (int w = 0; w < g_n_workers; w++) {{
+        printf("xpurt: worker[%d] kind=%s pinned_hart=%d observed_cpu=%d "
+               "claims_unbound=%d entries_done=%llu\\n",
+               w, g_workers[w].kind, g_workers[w].hart,
+               g_workers[w].observed_cpu, g_workers[w].claims_unbound,
+               (unsigned long long)g_hart_acc[w].entries_done);
     }}
 
-    /* Phase G1 — per-hart runtime attribution. All values are mtime
-     * ticks (1 us each on chipyard FireSim). Sum of categories should
-     * equal wall_total within ~2%; residual is unattributed overhead
-     * (k_cycle_get_64 itself, branch mispredict, etc.). */
+    /* Phase G1 — per-WORKER runtime attribution. All values are mtime
+     * ticks (1 us each on chipyard FireSim, 1/24 us on the K1 whose
+     * rdtime runs at 24 MHz). Sum of categories should equal wall_total
+     * within ~2%; residual is unattributed overhead (k_cycle_get_64
+     * itself, branch mispredict, etc.).
+     *
+     * The `kind_idx` and `kind` columns are kept for
+     * scripts/parse_runtime_breakdown.py, which keys on them; `worker_idx`
+     * and `hart` are new and are what actually identify a row now that a
+     * kind can have several workers. */
     printf("=== MODELBLASTER_HART_ACC_BEGIN ===\\n");
-    printf("kind_idx,kind,kernel_us,dep_wait_us,sync_overhead_us,"
-           "target_gate_spin_us,hart_idle_us,gemmini_cfg_emit_us,"
-           "entries_done,wall_total_us\\n");
-    for (int k = 0; k < {n_kinds}; k++) {{
-        printf("%d,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\\n",
-               k, kinds[k],
-               (unsigned long long)g_hart_acc[k].kernel,
-               (unsigned long long)g_hart_acc[k].dep_wait,
-               (unsigned long long)g_hart_acc[k].sync_overhead,
-               (unsigned long long)g_hart_acc[k].target_gate_spin,
-               (unsigned long long)g_hart_acc[k].hart_idle,
-               (unsigned long long)g_hart_acc[k].gemmini_cfg_emit,
-               (unsigned long long)g_hart_acc[k].entries_done,
-               (unsigned long long)g_hart_acc[k].wall_total);
+    printf("worker_idx,kind_idx,kind,hart,kernel_us,dep_wait_us,"
+           "sync_overhead_us,target_gate_spin_us,hart_idle_us,"
+           "gemmini_cfg_emit_us,entries_done,wall_total_us\\n");
+    for (int w = 0; w < g_n_workers; w++) {{
+        printf("%d,%d,%s,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\\n",
+               w, g_workers[w].kind_idx, g_workers[w].kind, g_workers[w].hart,
+               (unsigned long long)g_hart_acc[w].kernel,
+               (unsigned long long)g_hart_acc[w].dep_wait,
+               (unsigned long long)g_hart_acc[w].sync_overhead,
+               (unsigned long long)g_hart_acc[w].target_gate_spin,
+               (unsigned long long)g_hart_acc[w].hart_idle,
+               (unsigned long long)g_hart_acc[w].gemmini_cfg_emit,
+               (unsigned long long)g_hart_acc[w].entries_done,
+               (unsigned long long)g_hart_acc[w].wall_total);
     }}
     printf("=== MODELBLASTER_HART_ACC_END ===\\n");
 
 #ifdef MODELBLASTER_XPURT_TRACE
     /* Trace dump — one CSV row per scheduled entry, with the actual
-     * mtime-cycle window the worker ran and the kind-index of the
-     * worker that owned it. The host parser cross-references this
+     * mtime-cycle window the worker ran, plus the kind-index AND the
+     * hart of the worker that owned it (`worker_hart` vs the schedule's
+     * `hart` column: they should be equal for every executed row). The host parser cross-references this
      * with the dispatch table for op/network/predicted-time fields. */
     printf("=== MODELBLASTER_XPURT_TRACE_BEGIN ===\\n");
     printf("entry_id,network,instance,dispatch_id,op,name,core_kind,hart,"
            "predicted_start_ms,predicted_duration_ms,worker_kind_idx,"
-           "actual_start_cycles,actual_end_cycles\\n");
+           "worker_hart,actual_start_cycles,actual_end_cycles\\n");
     for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
         const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
-        printf("%d,%s,%d,%d,%s,%s,%s,%d,%.6f,%.6f,%d,%llu,%llu\\n",
+        printf("%d,%s,%d,%d,%s,%s,%s,%d,%.6f,%.6f,%d,%d,%llu,%llu\\n",
                e->entry_id, e->network, e->instance, e->dispatch_id,
                e->op, e->name, e->core_kind, e->hart,
                (double)e->start_time_ms, (double)e->duration_ms,
                xpurt_trace[i].worker_kind_idx,
+               xpurt_trace[i].worker_hart,
                (unsigned long long)xpurt_trace[i].start_cycles,
                (unsigned long long)xpurt_trace[i].end_cycles);
     }}
