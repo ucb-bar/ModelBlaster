@@ -1184,6 +1184,15 @@ def main() -> None:
                          "forward-declares MODEL_<UMID>_DISPATCH_FNS_<BS> for "
                          "each backend and dispatches by core_kind. "
                          "Defaults to --core-kinds.")
+    ap.add_argument("--networks", default=None,
+                    help="comma-separated network names in the schedule. "
+                         "Supplies the known set that makes the "
+                         "<network><instance> split unambiguous when a network "
+                         "name ENDS IN A DIGIT (yolov8_nano_64x96), which the "
+                         "trailing-digit regex otherwise reads as "
+                         "'yolov8_nano_64x' + instance 96. The caller almost "
+                         "always knows these -- run_xpurt_k1.sh has them as "
+                         "--models -- and passing them removes the guess.")
     ap.add_argument("--registry", default=None,
                     help="path to the cores/*.json registry that drove the "
                          "schedule. Used to derive each kind's pool size as "
@@ -1206,8 +1215,25 @@ def main() -> None:
     # provenance — use it when present (it's the only way to be
     # unambiguous about model names ending in digits, e.g. "yolov8_nano_64"
     # which the trailing-digits regex parses as "yolov8_nano_" + idx=64).
+    # An explicitly supplied network list is the most reliable source and
+    # takes precedence over both the provenance block and the regex: the
+    # caller knows what it built.
+    cli_known = {n.strip() for n in (args.networks or "").split(",") if n.strip()}
     prov_instances = sched.get("_provenance", {}).get("instances")
-    if prov_instances:
+    if cli_known:
+        for d in sched["dispatches"].values():
+            net, inst = _split_job_name(d["job_name"], cli_known)
+            if net not in cli_known:
+                raise SystemExit(
+                    f"job_name {d['job_name']!r} does not start with any of "
+                    f"--networks {sorted(cli_known)}. Refusing to guess: a "
+                    f"wrong split emits an #include for a model that does not "
+                    f"exist, or worse, one that does.")
+            if net not in seen:
+                seen.add(net)
+                networks.append(net)
+            n_instances[net] = max(n_instances.get(net, 0), inst + 1)
+    elif prov_instances:
         known = {ins["network"] for ins in prov_instances}
         for ins in prov_instances:
             net = ins["network"]
