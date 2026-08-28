@@ -3440,6 +3440,40 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
 }
 """,
         ),
+        # The RVV entry. The only algorithm registered for this op was
+        # gemmini-affined, so on an RVV target the curated probe had no
+        # (op, algorithm) pair to look for and every residual add ran
+        # the scalar reference inside a build labelled rvv_x60.
+        # Kernel: kernels/rvv/rvv_add_s8_rvv_frm_rmm.c
+        AlgorithmCandidate(
+            name="rvv_frm_rmm",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The reference expression issued on the vector unit, "
+                "including its rounding mode.\n\n"
+                "The reference ends in `(int32_t)roundf(fout)`, and "
+                "roundf is round-to-nearest TIES AWAY FROM ZERO -- "
+                "which is why the earlier curated RVV work declined to "
+                "vectorise anything shaped like this. That is a "
+                "property of vfcvt's default behaviour, not of the "
+                "instruction: vfcvt.x.f rounds by `frm`, and frm=RMM "
+                "(round to nearest, ties to Max Magnitude) IS "
+                "ties-away-from-zero. So the conversion is not an "
+                "approximation of roundf, it is roundf, and the kernel "
+                "is bit-exact by construction.\n\n"
+                "frm is toggled around the conversion rather than held: "
+                "it also governs vfmul/vfadd/vfdiv, and leaving it at "
+                "RMM would round the dequantize, the sum and the divide "
+                "to ties-away where C rounds to nearest-even. Two csrw "
+                "per 32 outputs, against a vfdiv that costs far more.\n\n"
+                "The three float operations stay separate (no vfmacc) "
+                "and the divide stays a divide (no reciprocal "
+                "multiply): both would remove an intermediate rounding "
+                "the reference performs."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
     ],
 )
 
@@ -3578,6 +3612,42 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 16}],
     argtypes_factory=_sigmoid_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all.
+        # Kernel: kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The expensive part of this op is the expf, not the "
+                "datapath width: ~140 cycles per element on this core, "
+                "which is essentially the whole runtime. There is no "
+                "vector expf, and a polynomial one would trade "
+                "bit-exactness for an op measured in tens of "
+                "microseconds.\n\n"
+                "What does help: the input is int8, so the op has at "
+                "most 256 distinct outputs for a given quant tuple, and "
+                "a quantized activation tensor repeats values heavily. "
+                "One cheap pass marks which of the 256 bytes actually "
+                "occur, expf runs only for those, and the output is a "
+                "vector indexed-load gather (vluxei8, the biased byte "
+                "used directly as its own offset into the table). Cost "
+                "goes from n*expf to distinct*expf.\n\n"
+                "The MEMOIZED table beats the eager one: building all "
+                "256 entries costs 256 expf regardless of n, which "
+                "loses for every shape these models have. Building only "
+                "what is asked for never loses by more than the marking "
+                "pass, and below a small-n guard the reference "
+                "expression runs per element instead.\n\n"
+                "Bit-exact by construction -- each table entry is the "
+                "reference's own expression, scalar, float32, same "
+                "casts, same roundf, and the vector path contains no "
+                "arithmetic at all. Its one appearance in these models is DroNet\'s output head at n=1, below the guard, where it runs the same scalar path the reference does; it closes a coverage hole and will pay for itself on a model that applies sigmoid to a real tensor."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -6376,6 +6446,42 @@ void kernel_elu_s8(const int8_t *input, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 17}, {"n": 256}],
     argtypes_factory=_elu_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all.
+        # Kernel: kernels/rvv/rvv_elu_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The expensive part of this op is the expf, not the "
+                "datapath width: ~140 cycles per element on this core, "
+                "which is essentially the whole runtime. There is no "
+                "vector expf, and a polynomial one would trade "
+                "bit-exactness for an op measured in tens of "
+                "microseconds.\n\n"
+                "What does help: the input is int8, so the op has at "
+                "most 256 distinct outputs for a given quant tuple, and "
+                "a quantized activation tensor repeats values heavily. "
+                "One cheap pass marks which of the 256 bytes actually "
+                "occur, expf runs only for those, and the output is a "
+                "vector indexed-load gather (vluxei8, the biased byte "
+                "used directly as its own offset into the table). Cost "
+                "goes from n*expf to distinct*expf.\n\n"
+                "The MEMOIZED table beats the eager one: building all "
+                "256 entries costs 256 expf regardless of n, which "
+                "loses for every shape these models have. Building only "
+                "what is asked for never loses by more than the marking "
+                "pass, and below a small-n guard the reference "
+                "expression runs per element instead.\n\n"
+                "Bit-exact by construction -- each table entry is the "
+                "reference's own expression, scalar, float32, same "
+                "casts, same roundf, and the vector path contains no "
+                "arithmetic at all. This is the memoized form of the LUT this op\'s own semantics text proposes."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -8435,6 +8541,34 @@ void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}, {"n": 395}],
     argtypes_factory=_leaky_relu_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all, so
+        # no target had a named (op, algorithm) pair to probe for.
+        # Kernel: kernels/rvv/rvv_leaky_relu_s8_rvv_frm_rmm.c
+        AlgorithmCandidate(
+            name="rvv_frm_rmm",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "Same shape as add_s8's rvv_frm_rmm: the reference "
+                "expression on the vector unit, with roundf() spelled "
+                "as frm=RMM (round to nearest, ties to Max Magnitude) "
+                "so the integer conversion is bit-exact by construction "
+                "rather than by tolerance. frm is toggled around the "
+                "conversion only, since it also governs the float "
+                "arithmetic.\n\n"
+                "The select is taken where the reference takes it -- "
+                "vmfgt against +0.0f on the DEQUANTIZED float, not on "
+                "the int8. For scale_in > 0 the two agree; taking it in "
+                "the same place removes the question.\n\n"
+                "Worth stating plainly: the shapes this op has in the "
+                "models here are n = 16 and n = 64, where call overhead "
+                "dominates either way. The kernel is for coverage and "
+                "for models that apply the op at width."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -8508,6 +8642,41 @@ void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
          "SH": 2, "SW": 2, "PH": 0, "PW": 0, "count_include_pad": 1},
     ],
     argtypes_factory=_avgpool2d_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all.
+        # Measured on the scalar reference inside an rvv_x60 build:
+        # 12.8% of vitfly_frontend.
+        # Kernel: kernels/rvv/rvv_avgpool2d_s8_rvv_ow_lanes.c
+        AlgorithmCandidate(
+            name="rvv_ow_lanes",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "One vector = a run of output columns of one (n, c, "
+                "oh). Output is contiguous along ow and input is "
+                "contiguous along iw with stride SW, so the window "
+                "accumulation is KH*KW unit- or strided loads into an "
+                "i32 accumulator in a single pass, with no gather.\n\n"
+                "The epilogue is the reference's own integer "
+                "expression: round the magnitude half away from zero as "
+                "(|sum| + div/2)/div and reapply the sign. Exact "
+                "integer arithmetic, no float, so there is no rounding "
+                "mode to match -- bit-exact by construction. vdiv is "
+                "used rather than a reciprocal multiply; it is slower "
+                "and correct.\n\n"
+                "The padded case falls back to the reference loop "
+                "verbatim, deliberately. With PH=PW=0 every window is "
+                "fully in bounds, so cnt is KH*KW everywhere and the "
+                "divisor is the same constant whichever way "
+                "count_include_pad is set; with padding it is neither, "
+                "and the vector path would need a per-lane divisor and "
+                "in-bounds mask to reproduce a case these models do not "
+                "have. Getting count_include_pad backwards is silent, "
+                "which is a good reason not to implement it twice."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -8634,6 +8803,54 @@ void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
         {"input_size": 665, "hidden_size": 395},
     ],
     argtypes_factory=_lstm_s8_argtypes,
+    algorithms=[
+        # The RVV entry. Without it the curated lookup has no
+        # (op, algorithm) pair to probe for this op beyond the
+        # synthesized universal "direct", and a descriptive name is
+        # what the profile's `implementation` column records -- the
+        # difference between "curated[rvv]/rvv_gate_int_dot" and
+        # "reference" is the whole finding here. Measured before the
+        # kernel existed: 27.6 ms of vitfly_lstm's 28.2 ms rvv_x60 run,
+        # 97.9%, on the scalar reference.
+        # Kernel: kernels/rvv/rvv_lstm_s8_rvv_gate_int_dot.c
+        AlgorithmCandidate(
+            name="rvv_gate_int_dot",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "Move the gate reductions onto the INTEGER vector unit "
+                "and leave the cell update alone.\n\n"
+                "Per timestep the op reduces 4H*(input_size + H) "
+                "products -- 1.67 M for VitFly's 660->395 layer -- and "
+                "the reference computes each as two int->double "
+                "converts and two double multiplies on a serial fadd "
+                "chain. But the products are integers: x[k] and w[k] "
+                "are int8, sum(x[k]*w[k]) is exact in int32, and the "
+                "per-tensor scales factor straight out of the sum, so\n"
+                "    sum_k (x_k*s_in)*(w_k*s_w) == (sum_k x_k*w_k) * "
+                "(s_in*s_w)\n"
+                "as reals. The reduction becomes a widening int8 dot "
+                "product (vwmul.vv into i16, vwadd.wv into an i32 "
+                "accumulator, vredsum at the end) and the float math "
+                "shrinks to one multiply per gate.\n\n"
+                "sigmoid, tanh, the cell update and the requantize stay "
+                "scalar and in double, exactly as the reference writes "
+                "them: ~5 libm calls per hidden unit against ~4200 "
+                "MACs, so there is nothing to win, and vectorising them "
+                "would mean matching a rounding mode vfcvt does not "
+                "have.\n\n"
+                "NOT bit-exact by construction, and the only kernel "
+                "here of which that is true: the reference rounds every "
+                "product and every partial sum, this computes the same "
+                "real quantity with one rounding, and the integer sum "
+                "is the more accurate of the two. Agreement at the int8 "
+                "output is measured (max_abs_err=0 on both VitFly "
+                "layers and both lstm_tiny layers, two data regimes, on "
+                "the board) rather than proven."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
