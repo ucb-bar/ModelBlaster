@@ -67,6 +67,12 @@ _EXTRA_COLUMNS = [
     "op",       # raw IR op kind, e.g. linear, conv2d_s8
     "shape",    # the IR-side shape descriptor, e.g. M=1;K=256;N=128
     "cycles",   # raw cycle count from the harness (pre-ns conversion)
+    # Sample count and spread when the run used MODELBLASTER_ITERS>1. Without
+    # these a cost is indistinguishable from a single sample, and an advisor
+    # cannot tell a 10% "win" from run-to-run noise -- which is the difference
+    # between a recommendation and a guess.
+    "cycles_n",
+    "cycles_cv_pct",
     # What actually executed: "curated[rvv]/rvv_oc_blocked", "reference", ...
     # Read from the build's kernel_picks.json at profile time. module_name
     # cannot carry this -- its trailing segment is the SHAPE tag -- and
@@ -160,6 +166,8 @@ def build_records(op_records: Iterable[dict], meta: ProfileMeta) -> list[dict]:
             "log_path": "",
             "source": meta.source,
             "implementation": meta.picks.get(r["op"], ""),
+            "cycles_n": r.get("cycles_n", 1),
+            "cycles_cv_pct": r.get("cycles_cv_pct", ""),
             "op": r["op"],
             "shape": r["shape"],
             "cycles": cycles,
