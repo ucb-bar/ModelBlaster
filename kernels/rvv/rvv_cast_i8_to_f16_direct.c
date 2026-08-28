@@ -38,10 +38,18 @@ void kernel_cast_i8_to_f16(const int8_t *in, _Float16 *out,
     int i = 0;
     size_t vl;
     for (; i < n; i += (int)vl) {
-        vl = __riscv_vsetvl_e8m1(n - i);
+        /* Element count in its own variable, handed to every width.
+         * Chaining `vsetvl_e16m2(vl)` on a previous vsetvl's result is
+         * miscompiled by GCC 14.3.0: it passes an ADDRESS register as the AVL
+         * operand, vl saturates to VLMAX, and the vl-preserving forms carry
+         * that to the store, which then writes VLMAX elements on a partial
+         * tail. See rvv_cat2_c1_s8_direct.c for the disassembly and the
+         * guard-page proof, and scripts/check_rvv_avl.py for the detector. */
+        const size_t n_elem = (size_t)(n - i);
+        vl = __riscv_vsetvl_e8m1(n_elem);
         size_t vl8 = vl;
-        size_t vl16 = __riscv_vsetvl_e16m2(vl);
-        size_t vl32 = __riscv_vsetvl_e32m4(vl);
+        size_t vl16 = __riscv_vsetvl_e16m2(n_elem);
+        size_t vl32 = __riscv_vsetvl_e32m4(n_elem);
         vint8m1_t v8 = __riscv_vle8_v_i8m1(in + i, vl8);
         vint16m2_t v16 = __riscv_vsext_vf2_i16m2(v8, vl16);
         vfloat32m4_t vf = __riscv_vfwcvt_f_x_v_f32m4(v16, vl32);
