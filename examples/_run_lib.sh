@@ -101,7 +101,8 @@ else
         --out-dir "${IR_DIR}" \
         --quant "${QUANT}" \
         --num-calibration "${NUM_CALIBRATION:-1}" \
-        --fusion-target "${TARGET}"
+        --fusion-target "${TARGET}" \
+        ${MB_NO_BN_FOLDING:+--no-bn-folding}
 fi
 _mb_stage_end extract
 
