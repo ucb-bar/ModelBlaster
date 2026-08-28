@@ -1,0 +1,39 @@
+/* source: curated */
+/* algorithm: direct */
+/* accuracy_class: bit_exact */
+/* origin: vectorized RVV int8 -> _Float16 dequantize. The reference computes
+ *   out[i] = (_Float16)((float)in[i] * scale) -- one fp32 multiply, then ONE
+ *   rounding at the store. This reproduces exactly that chain, so it is
+ *   bit-exact rather than numeric_drift: widen int8 -> int16 -> fp32
+ *   (vsext.vf2 + vfwcvt.f.x.v), scale in fp32 (vfmul.vf), narrow to fp16
+ *   (vfncvt.f.f.w). Multiplying in fp16 instead would round twice and drift.
+ *
+ *   The per-width vsetvl calls are deliberate and load-bearing: GCC 13.2 does
+ *   not carry vtype across a kernel's width changes and will issue a widening
+ *   convert under the previous SEW, which is illegal and SIGILLs on the first
+ *   dispatch (see kernels/rvv/rvv_cat3_c1_s8_direct.c and
+ *   scripts/check_rvv_vtype.py, which gates on it at build time). Element
+ *   COUNT is identical across e8m1 / e16m2 / e32m4 because EMUL scales with
+ *   SEW, so naming the widths changes no arithmetic. */
+
+#include <stddef.h>
+#include <stdint.h>
+#include <riscv_vector.h>
+
+void kernel_cast_i8_to_f16(const int8_t *in, _Float16 *out,
+                           int n, float scale) {
+    int i = 0;
+    size_t vl;
+    for (; i < n; i += (int)vl) {
+        vl = __riscv_vsetvl_e8m1(n - i);
+        size_t vl8 = vl;
+        size_t vl16 = __riscv_vsetvl_e16m2(vl);
+        size_t vl32 = __riscv_vsetvl_e32m4(vl);
+        vint8m1_t v8 = __riscv_vle8_v_i8m1(in + i, vl8);
+        vint16m2_t v16 = __riscv_vsext_vf2_i16m2(v8, vl16);
+        vfloat32m4_t vf = __riscv_vfwcvt_f_x_v_f32m4(v16, vl32);
+        vf = __riscv_vfmul_vf_f32m4(vf, scale, vl32);
+        vfloat16m2_t vh = __riscv_vfncvt_f_f_w_f16m2(vf, vl16);
+        __riscv_vse16_v_f16m2(out + i, vh, vl16);
+    }
+}
