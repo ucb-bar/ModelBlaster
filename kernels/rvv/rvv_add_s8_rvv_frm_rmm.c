@@ -84,7 +84,16 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
     int i = 0;
 
     while (i < n) {
-        size_t vl8 = __riscv_vsetvl_e8m1((size_t)(n - i));
+        const size_t n_elem = (size_t)(n - i);
+        /* Element count in its own variable, handed to every
+         * width. Chaining `vsetvl_e16m4(vl)` on a previous
+         * vsetvl's result is miscompiled by this GCC: it passes an
+         * ADDRESS register as the AVL operand, vl saturates to
+         * VLMAX, and the vl-preserving forms carry that to the
+         * store. See rvv_cat2_c1_s8_direct.c for the disassembly
+         * and the guard-page proof. Only bites when the count is
+         * not a whole multiple of VLMAX, i.e. on a partial tail. */
+        size_t vl8 = __riscv_vsetvl_e8m1(n_elem);
         vint8m1_t va8 = __riscv_vle8_v_i8m1(a + i, vl8);
         vint8m1_t vb8 = __riscv_vle8_v_i8m1(b + i, vl8);
 
@@ -93,7 +102,7 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
          * instruction, which is a SIGILL on the board and not a build
          * error. The element COUNT is unchanged -- e8m1 and e32m4 hold the
          * same number of elements. */
-        size_t vl = __riscv_vsetvl_e32m4(vl8);
+        size_t vl = __riscv_vsetvl_e32m4(n_elem);
         vint32m4_t va32 = __riscv_vsext_vf4_i32m4(va8, vl);
         vint32m4_t vb32 = __riscv_vsext_vf4_i32m4(vb8, vl);
 
@@ -116,9 +125,9 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
 
         /* Step back down through the widths explicitly, same reason as the
          * widen above; each narrowing names its DESTINATION width. */
-        size_t vl16 = __riscv_vsetvl_e16m2(vl8);
+        size_t vl16 = __riscv_vsetvl_e16m2(n_elem);
         vint16m2_t vi16 = __riscv_vncvt_x_x_w_i16m2(vi, vl16);
-        size_t vlo8 = __riscv_vsetvl_e8m1(vl8);
+        size_t vlo8 = __riscv_vsetvl_e8m1(n_elem);
         vint8m1_t vi8 = __riscv_vncvt_x_x_w_i8m1(vi16, vlo8);
         __riscv_vse8_v_i8m1(output + i, vi8, vlo8);
 
