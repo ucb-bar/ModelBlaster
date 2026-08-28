@@ -153,8 +153,35 @@ for model in "${MODEL_LIST[@]}"; do
     for bs in "${BACKEND_LIST[@]}"; do
         bdir="${base}/${bs}"
         if [[ -f "${bdir}/kernels.c" && -f "${bdir}/model.c" ]]; then
-            echo "  [${model}/${bs}] reusing generated sources"
-            continue
+            # Existence is NOT enough. generate_kernels.py inlines the curated
+            # kernel bodies into kernels.c, so once that file exists a later fix
+            # to a curated kernel never reaches the board -- the driver prints
+            # "reusing" and links the stale copy. That is not hypothetical: the
+            # vtype fix in rvv_batchnorm2d_s8_direct.c (explicit vsetvl_e32m8
+            # around the float epilogue) was written at 19:01 and the B1 harness
+            # built at 17:44 kept SIGILLing on vfmv.v.f under SEW=8, because the
+            # generated copy predated the fix. The kernel looked fixed in the
+            # source tree and was still broken on the hardware.
+            #
+            # So reuse only if nothing that FEEDS the generated sources is newer:
+            # the curated kernel library and the generators themselves.
+            _stale=""
+            for _dep in "${REPO_ROOT}/kernels" \
+                        "${REPO_ROOT}/pipeline/generate_kernels.py" \
+                        "${REPO_ROOT}/pipeline/generate_skeleton.py" \
+                        "${REPO_ROOT}/pipeline/backends.py"; do
+                [[ -e "${_dep}" ]] || continue
+                if [[ -n "$(find "${_dep}" -newer "${bdir}/kernels.c" -print -quit 2>/dev/null)" ]]; then
+                    _stale="${_dep}"
+                    break
+                fi
+            done
+            if [[ -z "${_stale}" ]]; then
+                echo "  [${model}/${bs}] reusing generated sources"
+                continue
+            fi
+            echo "  [${model}/${bs}] regenerating -- ${_stale#${REPO_ROOT}/} is newer than the generated kernels.c"
+            rm -f "${bdir}/kernels.c" "${bdir}/model.c"
         fi
         echo "  [${model}/${bs}] skeleton + kernels"
         mkdir -p "${bdir}"
@@ -167,6 +194,23 @@ for model in "${MODEL_LIST[@]}"; do
             --ir "${base}/graph.json" --out-dir "${bdir}" \
             --target "${bs}" --backend "${KERNEL_BACKEND}" --quant "${QUANT}" \
             --global-curated-dir "${REPO_ROOT}/kernels"
+    done
+
+    # A vector backend that silently resolved ops to the scalar reference is
+    # the single most expensive failure this pipeline has: yolov8_nano measured
+    # 0.81x against the scalar build (i.e. SLOWER) purely because the fused
+    # conv2d_batchnorm2d_silu_s8 had no curated RVV kernel and nothing said so.
+    # Catch it here, before the board time is spent.
+    for bs in "${BACKEND_LIST[@]}"; do
+        [[ "${bs}" == "scalar" ]] && continue
+        if ! ${PY} "${REPO_ROOT}/scripts/check_kernel_coverage.py" "${base}/${bs}"; then
+            if [[ "${MB_KERNEL_COVERAGE:-strict}" == "warn" ]]; then
+                echo "  [${model}/${bs}] coverage gate FAILED -- continuing because MB_KERNEL_COVERAGE=warn"
+            else
+                echo "  [${model}/${bs}] coverage gate failed; set MB_KERNEL_COVERAGE=warn to profile anyway" >&2
+                exit 1
+            fi
+        fi
     done
 
     MODEL_NAMES="${MODEL_NAMES:+${MODEL_NAMES};}${model}"
