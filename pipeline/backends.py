@@ -25,6 +25,17 @@ from typing import Optional
 #                  build or run.
 VERIFY_HOST_CTYPES = "host_ctypes"
 VERIFY_SPIKE_HARNESS = "spike_harness"
+#: Cross-compile the candidate for the target ISA and check that it BUILDS;
+#: do not execute it. For a backend whose intrinsics the host cannot compile
+#: and whose ISA no available simulator runs usefully, this is the strongest
+#: check available before the board -- and declaring it is much safer than
+#: declaring host_ctypes, which cannot compile the candidate either but
+#: reports that as a verify FAILURE. Four such failures exhaust the retry
+#: budget and the generator falls back to the seed, emitting the SCALAR
+#: reference under `source: seed` in a build labelled for a vector target.
+#: That is the silent-scalar regression this backend's own comments warn
+#: about, arrived at from the other direction.
+VERIFY_CROSS_COMPILE = "cross_compile"
 
 
 @dataclass(frozen=True)
@@ -164,7 +175,18 @@ RVV_X60 = Backend(
     # Same ISA family as rvv, just with VLEN pinned -- so it inherits every
     # curated kernel in kernels/rvv/.
     curated_aliases=("rvv",),
-    verify_method=VERIFY_HOST_CTYPES,
+    # NOT host_ctypes. The host is x86 and cannot compile `vint32m4_t` or
+    # `__riscv_vle8_v_i8m1`, so host_ctypes verify fails on every candidate
+    # with "unknown type name" -- which the generator reads as the LLM being
+    # wrong, retries four times, and then falls back to the seed. The result
+    # is the scalar reference emitted as an rvv_x60 kernel: precisely the
+    # 195ms-vs-113ms DroNet regression described at the top of this file,
+    # reached through the verify path instead of the curated-lookup path.
+    # Cross-compiling catches what is actually catchable here (bad
+    # intrinsics, wrong vector types, wrong vtype width) and leaves numeric
+    # correctness to the on-board golden compare, which is where this
+    # backend's docstring already says correctness is established.
+    verify_method=VERIFY_CROSS_COMPILE,
 )
 
 
