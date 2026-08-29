@@ -119,10 +119,22 @@ echo "=== 2/5 generate skeleton (platform=linux) ==="
     --out-dir "${GEN}/generated" --backend "${TARGET}" --platform linux
 
 echo "=== 3/5 generate kernels (${TARGET}) ==="
+# KEEP_REFERENCE_OPS pins the named op kinds to their portable reference
+# kernel instead of swapping in the curated one. It is how XPU-RT's
+# `choose_implementation` advice is applied, and it is also how the `unfuse`
+# precondition is reconstructed -- a fused op forced onto the reference is
+# exactly the measured fallback `unfuse_advice` fires on.
+#
+# Step 3/5 regenerates unconditionally, so there is no way to pre-stage kernels
+# into the build dir and have them survive; the flag has to be threaded here.
+KEEPREF_ARGS=()
+[[ -n "${KEEP_REFERENCE_OPS:-}" ]] && \
+    KEEPREF_ARGS+=(--keep-reference-ops "${KEEP_REFERENCE_OPS}")
+
 "${PY}" -m modelblaster.pipeline.generate_kernels \
     --ir "${GEN}/graph.json" --out-dir "${GEN}/generated" \
     --target "${TARGET}" --backend "${BACKEND:-reference}" --quant "${QUANT}" \
-    --global-curated-dir "${REPO_ROOT}/kernels"
+    --global-curated-dir "${REPO_ROOT}/kernels" "${KEEPREF_ARGS[@]}"
 
 echo "=== 4/5 build linux harness ==="
 # repo_root must be the ABSOLUTE repo path, not ".". The flags can contain
