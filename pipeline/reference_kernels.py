@@ -7583,7 +7583,11 @@ MUL_S8 = KernelSpec(
         "  output[i] = clamp(\n"
         "      roundf((a[i]*scale_a) * (b[i]*scale_b) / scale_out),\n"
         "      activation_min, activation_max)\n"
-        "Use roundf to match numpy.round (banker's rounding compatible).\n"
+        "Use roundf, which is round-to-nearest TIES AWAY FROM ZERO. It is\n"
+        "NOT numpy.round, which is ties-to-even; they disagree on every\n"
+        "exact .5, so a kernel that picks the RNE rounding mode to match\n"
+        "the wrong description is wrong only on ties and passes most\n"
+        "random test data.\n"
         "Common shapes in ViNT: SE gating (per-channel multiply onto an\n"
         "NCHW activation, with `b` broadcast or pre-expanded) and the\n"
         "Swish-as-x*sigmoid pattern. Both forms compile to a single\n"
@@ -7606,6 +7610,42 @@ void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}, {"n": 8192}],
     argtypes_factory=_mul_s8_argtypes,
+    algorithms=[
+        # This op had no AlgorithmCandidate at all, so the curated probe had
+        # no (op, algorithm) pair to look for on any target and every mul ran
+        # the scalar reference inside builds labelled rvv_x60 -- 19.3% of
+        # attn_block, the largest remaining reference share in it, and it is
+        # the RoPE rotation sitting between two curated LUT kernels.
+        # Kernel: kernels/rvv/rvv_mul_s8_rvv_frm_rmm.c, derived mechanically
+        # from the add_s8 kernel; scripts/check_derived_kernel.py re-derives
+        # it and diffs.
+        AlgorithmCandidate(
+            name="rvv_frm_rmm",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The reference expression issued on the vector unit, "
+                "including its rounding mode. Structurally identical to "
+                "add_s8's kernel of the same name -- the two references "
+                "differ in one operator, `fa + fb` against `fa * fb` -- so "
+                "read that one's description for the frm argument in "
+                "full.\n\n"
+                "The short form: the reference ends in "
+                "`(int32_t)roundf(fout)`, roundf is round-to-nearest TIES "
+                "AWAY FROM ZERO, and vfcvt.x.f rounds by `frm`, where "
+                "frm=RMM is exactly that mode. The conversion is not an "
+                "approximation of roundf, it IS roundf. frm is toggled "
+                "around the conversion only, never held across the "
+                "arithmetic, because it also governs vfmul and vfdiv and C "
+                "rounds those to nearest-even.\n\n"
+                "The four float operations stay separate (no vfmacc) and "
+                "the divide stays a divide (no reciprocal multiply): both "
+                "would remove an intermediate rounding the reference "
+                "performs."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -7651,6 +7691,42 @@ void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 32}, {"n": 2048}],
     argtypes_factory=_gelu_s8_argtypes,
+    algorithms=[
+        # This op had no AlgorithmCandidate, so gelu ran the scalar reference
+        # inside builds labelled rvv_x60 and ime_x60 -- 29.7% of ffn_block on
+        # the vector unit and 42.2% of it on the MAC unit, the largest single
+        # reference share anywhere in the tree.
+        # Kernel: kernels/rvv/rvv_gelu_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The expensive part of this op is the erff, not the "
+                "datapath width. One call per element, no vector erff "
+                "exists, and a polynomial one would trade bit-exactness "
+                "for the whole reason the op is quantized.\n\n"
+                "What does help: the input is int8, so for a fixed "
+                "(scale_in, scale_out, clamp) the op has at most 256 "
+                "distinct outputs, and a quantized activation tensor "
+                "repeats values heavily. One cheap pass marks which of the "
+                "256 bytes actually occur, erff runs only for those, and "
+                "the output is a vector indexed-load gather (vluxei8, the "
+                "biased byte used directly as its own offset into the "
+                "table). Cost goes from n*erff to distinct*erff.\n\n"
+                "Bit-exact by construction: each table entry is the "
+                "reference's own expression, on the scalar unit, in "
+                "float32, with the same kInvSqrt2 constant, the same casts "
+                "and the same roundf. The vector path contains no "
+                "arithmetic at all, so there is no rounding mode to "
+                "match.\n\n"
+                "Below a small-n guard the reference expression runs per "
+                "element instead -- the marking array costs more than it "
+                "saves there."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 

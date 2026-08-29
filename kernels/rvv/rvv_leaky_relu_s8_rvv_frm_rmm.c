@@ -23,6 +23,23 @@
  *   vmfgt against +0.0f. For scale_in > 0 the two agree, but taking the
  *   comparison where the reference takes it removes the question.
  *
+ *   THE AVL IS THE ELEMENT COUNT, NEVER A PREVIOUS vsetvl'S RESULT, AND
+ *   THAT IS NOT STYLE. Written as `__riscv_vsetvl_e32m4(vl8)` -- chaining
+ *   one vsetvl on another's return value -- GCC 14.3 substitutes an
+ *   unrelated register for the AVL. Measured in the avgpool kernel, which
+ *   had the same shape: its second vsetvl was issued with the OUTER LOOP
+ *   BOUND as its AVL, vl came out 5 where the row is 11
+ *   wide, the `vsetvli zero,zero` forms carried that 5 down to the store,
+ *   and six of every eleven outputs were never written at all. Not a
+ *   rounding difference: max_abs_err=68 against the reference, and silent.
+ *
+ *   It was correct under GCC 13.2 -- the compiler these kernels were
+ *   verified on, and still what the default `CROSS` points at. 13.2 has its
+ *   own bug (it reorders a vsetvl across a widening op and the binary
+ *   SIGILLs), which is why 14.3 is mandatory. So these kernels moved from a
+ *   compiler that crashes loudly to one that answers wrongly, and the only
+ *   form that is correct under both is the element count, every time.
+ *
  *   VTYPE. e8m1 loads, an explicit e32m4 window for the extend and the
  *   float body, e16m2/e8m1 stepping back down for the store. Checked with
  *   scripts/check_rvv_vtype.py.
@@ -62,10 +79,11 @@ void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n,
     int i = 0;
 
     while (i < n) {
-        size_t vl8 = __riscv_vsetvl_e8m1((size_t)(n - i));
+        const size_t n_elem = (size_t)(n - i);
+        size_t vl8 = __riscv_vsetvl_e8m1(n_elem);
         vint8m1_t vx8 = __riscv_vle8_v_i8m1(input + i, vl8);
 
-        size_t vl = __riscv_vsetvl_e32m4(vl8);
+        size_t vl = __riscv_vsetvl_e32m4(n_elem);
         vint32m4_t vx32 = __riscv_vsext_vf4_i32m4(vx8, vl);
         vfloat32m4_t vf = __riscv_vfcvt_f_x_v_f32m4(vx32, vl);
         vf = __riscv_vfmul_vf_f32m4(vf, scale_in, vl);
@@ -84,9 +102,9 @@ void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n,
         vi = __riscv_vmax_vx_i32m4(vi, activation_min, vl);
         vi = __riscv_vmin_vx_i32m4(vi, activation_max, vl);
 
-        size_t vl16 = __riscv_vsetvl_e16m2(vl8);
+        size_t vl16 = __riscv_vsetvl_e16m2(n_elem);
         vint16m2_t vi16 = __riscv_vncvt_x_x_w_i16m2(vi, vl16);
-        size_t vlo8 = __riscv_vsetvl_e8m1(vl8);
+        size_t vlo8 = __riscv_vsetvl_e8m1(n_elem);
         vint8m1_t vi8 = __riscv_vncvt_x_x_w_i8m1(vi16, vlo8);
         __riscv_vse8_v_i8m1(output + i, vi8, vlo8);
 
