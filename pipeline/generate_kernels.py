@@ -23,11 +23,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 from typing import Optional
 
 from modelblaster.pipeline import backends as backends_mod
 from modelblaster.pipeline.backends import (
-    Backend, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
+    Backend, VERIFY_CROSS_COMPILE, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
 )
 from modelblaster.pipeline.bedrock_client import extract_code_block
 from modelblaster.pipeline.llm_client import LLMClient, make_llm_client
@@ -391,6 +393,58 @@ LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
 # Verify routing — backend dictates host_ctypes vs spike_harness
 # ---------------------------------------------------------------------------
 
+def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
+                         repo_root: Optional[str]) -> VerifyResult:
+    """Compile the candidate for the target ISA. Do not run it.
+
+    For a backend whose intrinsics the host cannot compile and whose ISA no
+    available simulator runs usefully, this is the strongest check that can be
+    made off the board. It catches every error the compiler can see -- unknown
+    vector types, misspelled intrinsics, an LMUL that does not match the
+    element width, a widening op under the wrong vtype -- which is the bulk of
+    what an LLM gets wrong about RVV.
+
+    IT DOES NOT CHECK NUMERICS, and the caller must not report that it does.
+    The kernel is correct when the on-board golden compare says so.
+
+    The alternative in place until now was to declare `host_ctypes`, whose
+    x86 `cc` cannot parse `vint8m1_t` at all: every candidate "failed", the
+    retry budget was spent, and the generator emitted the scalar seed under a
+    vector target's name.
+    """
+    cross = os.environ.get("CROSS", "")
+    cc = f"{cross}gcc" if cross else None
+    if not cc or shutil.which(cc) is None:
+        return VerifyResult(
+            False,
+            "cross-compile verify needs a target toolchain: set CROSS to a "
+            "riscv64 prefix (`eval \"$(scripts/setup_spacemit_toolchain.sh)\"`). "
+            "Refusing to accept an unbuilt kernel.")
+
+    flags = list(backend.resolved_kernel_cflags(repo_root or "."))
+    includes = "\n".join(f"#include {inc}" for inc in backend.kernel_includes)
+    src = (f"#include <stddef.h>\n#include <stdint.h>\n#include <math.h>\n"
+           f"{includes}\n\n{candidate}\n")
+
+    with tempfile.TemporaryDirectory(prefix="xverify_") as d:
+        cpath = os.path.join(d, f"cand_{spec.op}.c")
+        with open(cpath, "w") as f:
+            f.write(src)
+        cmd = [cc, "-O2", "-c", cpath, "-o", os.path.join(d, "cand.o")] + flags
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return VerifyResult(
+                False,
+                "candidate failed to cross-compile for "
+                f"{backend.name}:\n  cmd: {' '.join(cmd)}\n"
+                f"  stderr:\n{proc.stderr}")
+
+    return VerifyResult(
+        True,
+        f"cross-compiled for {backend.name}; NOT executed -- numeric "
+        f"correctness is established by the on-board golden compare")
+
+
 def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
     """Cheap lexical check that the candidate contains the expected function
     signature (whitespace-insensitive, parameter names included). Searches
@@ -504,6 +558,9 @@ def _verify(
 
     if backend.verify_method == VERIFY_HOST_CTYPES:
         return host_verify(spec, candidate, shapes)
+
+    if backend.verify_method == VERIFY_CROSS_COMPILE:
+        return cross_compile_verify(spec, candidate, backend, repo_root)
 
     if backend.verify_method == VERIFY_SPIKE_HARNESS:
         # Build the full harness with this candidate substituted, run on
