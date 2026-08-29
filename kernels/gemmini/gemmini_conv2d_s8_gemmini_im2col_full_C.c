@@ -1,68 +1,46 @@
 /* source: curated */
 /* algorithm: gemmini_im2col_full_C */
 /* accuracy_class: bit_exact */
-/* WEIGHT LAYOUT CONTRACT: like the sibling tiled_conv variant, this
- * kernel expects `weight` already in flat HWIO layout
- * ([KH*KW*IC, OC]) — the form tiled_matmul_auto consumes directly.
- * The skeleton emitter (generate_skeleton.py::_backend_pack_weight)
- * permutes OIHW→HWIO at codegen time when --backend gemmini, so
- * we pass weight straight through without a workspace copy. */
-/* origin: im2col → tiled_matmul_auto(full_C=true) → scalar Q0.31 requantize.
- *         Bypasses Saturn-Gemmini float-scale mvout; bit-exact with the
- *         Q0.31 PyTorch golden (max_abs_err=0 validated on Saturn FireSim
- *         May 2026).  Handles non-square kernels, any stride/padding, and
- *         large output_shift values (int64 requantize, no UB). */
-/* perf: requantize writes straight into `output` (NCHW) instead of an
- * intermediate ws_output (NHWC) workspace that a separate full-tensor
- * NHWC->NCHW transpose pass then had to undo. That transpose pass had no
- * reuse to amortize (every output element is produced exactly once,
- * unlike the input transpose which is read KH*KW times per pixel), so it
- * was a pure extra traversal of N*OH*OW*OC elements. Removing it trades a
- * contiguous (NHWC) store + a later strided-read/contiguous-write pass
- * for a single strided (NCHW, stride OH*OW per oc) store done inline in
- * the existing requantize loop -- net one fewer full-tensor pass. ws_output
- * is gone entirely.
+/* EXPERIMENT (hw-gather): same bit-exact contract as the shipped
+ * gemmini_im2col_full_C -- int32 accumulator drained via full_C and the
+ * exact two-stage Q0.31 requantize on the CPU -- but the im2col GATHER is
+ * done by Gemmini's mvin DMA instead of by the CPU.
  *
- * HARDWARE-MEASURED (kernel_opt_log.jsonl id 1200, dronet, FPGA
- * f2_dual_small_norose_tacit_q31_60mhz, provenance-verified, max_abs_err=0
- * before and after): conv2d_s8 aggregate 11,598,513 -> 9,889,329 cycles
- * (-14.73%), model end-to-end 20,933,650 -> 19,213,428 cycles (-8.22%).
- * Every one of the 10 conv2d_s8 layers moved -8.8% to -16.1%; control ops
- * (maxpool/batchnorm/add/relu/sigmoid, untouched source) moved -0.05% to
- * +0.28%, confirming isolation. Two follow-on ideas were tried and
- * HARDWARE-REFUTED, not adopted: (a) batching multiple DIM=16-row CPU
- * tiles into one larger tiled_matmul_auto() call (up to ROWS_PER_TILE=320
- * rows) to amortize gemmini_flush(0)/CONFIG_EX/CONFIG_ST/CONFIG_LD reissue
- * across fewer calls -- net +0.33% end-to-end (conv2d_s8 +0.58%): the
- * saved reissue overhead was more than offset by wasted zero-padded mesh
- * rows on layers much smaller than the batch size. (b) replacing the
- * per-row div/mod decomposition of (n,oh,ow) from out_idx with an
- * incremental wrap-counter (one div/mod per tile instead of per row) --
- * a consistent small REGRESSION on spike (conv_modules.0 +2.0%), not
- * pursued to FPGA. Both indicate the per-tile RoCC ceremony and the
- * scalar index arithmetic are NOT where this kernel's cycles go; the
- * im2col gather/copy and the GEMM/DMA transfer dominate instead. */
+ * How: for a fixed kernel row kh, the A-matrix block
+ *     A[p][kw*IC + ic] = padded_nhwc[n, oh*SH + kh, ow*SW + kw, ic]
+ * (p = the output column index ow) is an AFFINE 2-D access pattern in
+ * DRAM: row stride = SW*IC elements, and the (kw, ic) column index runs
+ * over KW*IC CONTIGUOUS bytes because the padded activation is NHWC.
+ * That is exactly what `config_ld` + `mvin` express, so tiled_matmul_auto
+ * can read the im2col patch matrix straight out of the padded activation
+ * -- overlapping rows and all -- with stride_A = SW*IC and dim_K = KW*IC.
+ * No ws_im2col, no per-row scalar copy.
+ *
+ * The KH kernel rows are then chained through the int32 partial-sum
+ * buffers: call kh=0 with D=bias, C=P0; kh=1 with D=P0, C=P1; ... The
+ * chain is pure int32 (full_C on the way out, low_D=false on the way in,
+ * and MVIN_SCALE_ACC is a hardwired no-op on this config), so no rounding
+ * happens anywhere in the accelerator -- bit-exactness is preserved by
+ * construction, exactly as in the shipped kernel.
+ *
+ * Zero padding is materialised once, fused into the NCHW->NHWC transpose
+ * that this kernel had to do anyway, so the DMA never reads out of bounds
+ * and the halo reads see real zeros.
+ *
+ * WEIGHT LAYOUT CONTRACT: unchanged -- `weight` is flat HWIO
+ * [KH*KW*IC, OC], pre-packed at codegen time by
+ * generate_skeleton.py::_backend_pack_weight. Rows [kh*KW*IC,
+ * (kh+1)*KW*IC) of that matrix are exactly the B block for kernel row kh,
+ * contiguous, stride OC. */
 
 #include <stdint.h>
 #include <stddef.h>
 #include <gemmini.h>
 #include <gemmini_params.h>
 
-/*
- * Static workspace limits.  512 KB covers all square conv layers in
- * dronet and yolov8_nano:
- *   WS_BYTES:     max input  = IC=3,IH=160,IW=160 →  75 KB (yolov8 l0)
- *                 (ws_output is gone — requantize now stores straight into
- *                  the caller's NCHW `output` buffer; ws_weight is gone
- *                  too — weight is pre-packed HWIO at codegen time and
- *                  passed straight to tiled_matmul_auto)
- *   IM2COL_ELEMS: max K_inner = IC=256,K=3×3     → 2304 (yolov8 detect head)
- *   ACC_ELEMS:    max OC      = 256               (yolov8 l7/l8/l9)
- */
 enum {
-    WS_BYTES       = 512 * 1024,
-    IM2COL_ELEMS   = DIM * 256 * 9,   /* DIM rows × max K_inner (IC=256, 3×3) */
-    ACC_ELEMS      = DIM * 256,        /* DIM rows × max OC (256 in yolov8)    */
+    PAD_BYTES  = 256 * 1024,  /* zero-padded NHWC activation (yolov8 max 105 KB) */
+    PART_ELEMS = 16 * 1024,   /* int32 partial-sum tile: rows*OC (yolov8 max 6 KB) */
 };
 
 void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
@@ -73,28 +51,22 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                       int output_multiplier, int output_shift,
                       int activation_min, int activation_max)
 {
-    /* ws_weight is gone — generate_skeleton.py::_backend_pack_weight
-     * pre-packs weights to flat HWIO at codegen time, so we pass
-     * `weight` straight into tiled_matmul_auto below. */
-    static elem_t ws_input  [WS_BYTES]     __attribute__((aligned(64)));
-    static elem_t ws_im2col [IM2COL_ELEMS] __attribute__((aligned(64)));
-    static acc_t  ws_acc_out[ACC_ELEMS]    __attribute__((aligned(64)));
+    static elem_t ws_pad[PAD_BYTES]  __attribute__((aligned(64)));
+    static acc_t  ws_p0 [PART_ELEMS] __attribute__((aligned(64)));
+    static acc_t  ws_p1 [PART_ELEMS] __attribute__((aligned(64)));
 
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
-    int K_inner   = IC * KH * KW;
-    int total_out = N * OH * OW;
+    const int OH  = (IH + 2*PH - KH) / SH + 1;
+    const int OW  = (IW + 2*PW - KW) / SW + 1;
+    const int IHp = IH + 2*PH;
+    const int IWp = IW + 2*PW;
 
-    /* Fall back to scalar for configs exceeding workspace or using offsets.
-     * offsets != 0 would require zero-point subtraction inside the GEMM, which
-     * tiled_matmul_auto does not support; gemmini_im2col_full_C assumes
-     * symmetric per-tensor int8 (offsets == 0 from extract_int8). */
+    /* Slack rows so the last mvin of a kh block (which reads KW*IC bytes
+     * past the last row start) can never run off the end of ws_pad. */
+    const size_t pad_elems = (size_t)N * (size_t)(IHp + KH) * (size_t)IWp * (size_t)IC;
+
     if (input_offset != 0 || filter_offset != 0
-            || (size_t)(N * IH * IW * IC) > WS_BYTES
-            || (size_t)(K_inner * OC)      > WS_BYTES
-            || (size_t)(N * OH * OW * OC)  > WS_BYTES
-            || K_inner * DIM               > IM2COL_ELEMS
-            || OC * DIM                    > ACC_ELEMS) {
+            || pad_elems > (size_t)PAD_BYTES
+            || (size_t)OW * (size_t)OC > (size_t)PART_ELEMS) {
         for (int n = 0; n < N; n++) {
             for (int oc = 0; oc < OC; oc++) {
                 for (int oh = 0; oh < OH; oh++) {
@@ -111,8 +83,6 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                     else
                                         in_v = (int32_t)input[((n*IC+ic)*IH+ih)*IW+iw]
                                              + input_offset;
-                                    /* weight is HWIO-packed:
-                                     * idx = ((kh*KW + kw)*IC + ic)*OC + oc */
                                     acc += in_v * ((int32_t)weight[((kh*KW+kw)*IC+ic)*OC+oc]
                                                    + filter_offset);
                                 }
@@ -138,123 +108,96 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         return;
     }
 
-    /* Enable mstatus.XS=Dirty so RoCC custom-3 instructions don't trap. */
     asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
-
-    /* Reset gemmini controller and drain any prior DMA. */
     gemmini_flush(0);
 
-    /* Transpose input NCHW → NHWC into ws_input. */
+    /* NCHW -> zero-padded NHWC, single pass. */
+    for (size_t i = 0; i < pad_elems; i++) ws_pad[i] = 0;
     for (int n = 0; n < N; n++)
-        for (int h = 0; h < IH; h++)
-            for (int w = 0; w < IW; w++)
-                for (int c = 0; c < IC; c++)
-                    ws_input[((n*IH + h)*IW + w)*IC + c] =
-                        input[((n*IC + c)*IH + h)*IW + w];
-
-    /* Weight is already HWIO-packed by the codegen
-     * (generate_skeleton.py::_backend_pack_weight, --backend gemmini).
-     * Layout = `[KH*KW*IC, OC]` flat — exactly the B-matrix layout
-     * tiled_matmul_auto wants — so no ws_weight copy needed; we'll
-     * pass `weight` directly to tiled_matmul_auto below. */
-
-    /* Drain CPU store buffer (covers ws_input writes — the weight
-     * was a const blob so already coherent, but keep the fence here
-     * as gemmini mvin sets up A and B together). */
-    asm volatile("fence" ::: "memory");
-
-    /* Process output positions in tiles of DIM rows. */
-    for (int tile_i = 0; tile_i < total_out; tile_i += DIM) {
-        int tile_rows = total_out - tile_i < DIM ? total_out - tile_i : DIM;
-
-        /* Build im2col A-matrix: DIM rows × K_inner cols.
-         * Row i holds the flattened receptive field for output position
-         * (tile_i + i).  Rows past tile_rows are zero-padded. */
-        for (int i = 0; i < DIM; i++) {
-            elem_t *row = &ws_im2col[i * K_inner];
-            if (i >= tile_rows) {
-                for (int k = 0; k < K_inner; k++) row[k] = 0;
-                continue;
-            }
-            int out_idx = tile_i + i;
-            int ow_idx  = out_idx % OW;
-            int oh_idx  = (out_idx / OW) % OH;
-            int n_idx   = out_idx / (OH * OW);
-            for (int kh = 0; kh < KH; kh++) {
-                int ih = oh_idx * SH - PH + kh;
-                for (int kw = 0; kw < KW; kw++) {
-                    int iw = ow_idx * SW - PW + kw;
-                    elem_t *cell = row + (kh * KW + kw) * IC;
-                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
-                        const elem_t *src = &ws_input[((n_idx*IH + ih)*IW + iw)*IC];
-                        for (int c = 0; c < IC; c++) cell[c] = src[c];
-                    } else {
-                        for (int c = 0; c < IC; c++) cell[c] = 0;
-                    }
-                }
+        for (int c = 0; c < IC; c++) {
+            const int8_t *src = input + ((size_t)n*IC + c)*IH*IW;
+            for (int h = 0; h < IH; h++) {
+                elem_t *dst = ws_pad
+                    + ((((size_t)n*(IHp + KH) + (h + PH))*IWp) + PW)*IC + c;
+                for (int w = 0; w < IW; w++) dst[(size_t)w*IC] = src[(size_t)h*IW + w];
             }
         }
 
-        /* Drain CPU stores to ws_im2col before gemmini mvin. */
-        asm volatile("fence" ::: "memory");
+    asm volatile("fence" ::: "memory");
 
-        /* GEMM: ws_im2col [DIM × K_inner] × weight [K_inner × OC] + bias[OC].
-         * weight is pre-packed HWIO from codegen — flat [KH*KW*IC, OC] is
-         * exactly the B-matrix layout tiled_matmul_auto wants.
-         * full_C=true → raw int32 accumulator output (no float-scale mvout). */
-        tiled_matmul_auto(
-            DIM, OC, K_inner,
-            ws_im2col, weight,
-            (const void *)bias, (void *)ws_acc_out,
-            K_inner, OC, OC, OC,
-            MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, (scale_acc_t)1,
-            NO_ACTIVATION, ACC_SCALE_IDENTITY, (acc_scale_t)0,
-            bias != NULL,
-            false, false,
-            true, false,
-            0, WS
-        );
+    const int    K_row     = KW * IC;              /* dim_K per kernel row   */
+    const size_t stride_A  = (size_t)SW * (size_t)IC;
+    const int    rows_max  = PART_ELEMS / OC;
+    /* When SH*IWp == OW*SW the (oh,ow) -> DRAM map is affine across whole
+     * output rows too, so one call can cover several output rows. */
+    const int    merged    = (SH * IWp == OW * SW);
+    const int    row_span  = merged ? (OH * OW) : OW;
 
-        /* Wait for gemmini DMA writes to ws_acc_out to reach L2.
-         * gemmini_fence drains the in-flight mvout DMAs; gemmini_flush
-         * resets the controller. Both are needed — without the fence,
-         * yolov8-scale tiles (DIM * OC * K_inner large) can race with
-         * the CPU's subsequent ws_acc_out reads in the requantize loop,
-         * which corrupts the stack and surfaces as mcause=1 mepc=0
-         * (return-address-zeroed) several frames later. See
-         * modelblaster/notes/gemmini_tiled_conv_fence_required.md. */
-        gemmini_fence();
-        gemmini_flush(0);
+    for (int n = 0; n < N; n++) {
+        for (int seg = 0; seg < (merged ? 1 : OH); seg++) {
+            const int   base_out = merged ? (n*OH*OW) : (n*OH*OW + seg*OW);
+            const size_t base_a  = (((size_t)n*(IHp + KH) + (size_t)seg*SH)*IWp)*IC;
 
-        /* Scalar Q0.31 requantize: int32 accumulator → int8 NHWC.
-         * Uses int64 arithmetic throughout to avoid UB on large output_shift. */
-        for (int i = 0; i < tile_rows; i++) {
-            int out_idx = tile_i + i;
-            int ow_idx  = out_idx % OW;
-            int oh_idx  = (out_idx / OW) % OH;
-            int n_idx   = out_idx / (OH * OW);
-            /* NCHW base for (n_idx, ., oh_idx, ow_idx); stride between
-             * consecutive oc is (size_t)OH*OW elements. size_t throughout --
-             * BSS workspaces above 0x80000000 wrap 32-bit index arithmetic
-             * (see sibling_audit.py / the yolov8n int-wrap postmortem). */
-            const size_t out_base =
-                (((size_t)n_idx*OC)*OH + (size_t)oh_idx)*OW + (size_t)ow_idx;
-            const size_t out_oc_stride = (size_t)OH * (size_t)OW;
-            for (int oc = 0; oc < OC; oc++) {
-                int32_t acc = ws_acc_out[i * OC + oc];
-                int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
-                prod = (prod + ((int64_t)1 << 30)) >> 31;
-                int32_t scaled = (int32_t)prod;
-                if (output_shift > 0) {
-                    scaled = (int32_t)(((int64_t)scaled
-                        + ((int64_t)1 << (output_shift - 1))) >> output_shift);
-                } else if (output_shift < 0) {
-                    scaled <<= (-output_shift);
+            for (int r0 = 0; r0 < row_span; r0 += rows_max) {
+                const int rows = (row_span - r0) < rows_max ? (row_span - r0) : rows_max;
+                acc_t *cur = ws_p0, *prev = ws_p1;
+
+                for (int kh = 0; kh < KH; kh++) {
+                    const elem_t *A = ws_pad + base_a
+                                    + (size_t)kh * (size_t)IWp * (size_t)IC
+                                    + (size_t)r0 * stride_A;
+                    const elem_t *B = weight + (size_t)kh * (size_t)K_row * (size_t)OC;
+                    const void   *D;
+                    int repeating;
+                    if (kh == 0) { D = (const void *)bias; repeating = bias != NULL; }
+                    else         { D = (const void *)prev; repeating = 0; }
+
+                    tiled_matmul_auto(
+                        (size_t)rows, (size_t)OC, (size_t)K_row,
+                        A, B, D, (void *)cur,
+                        stride_A, (size_t)OC, (size_t)OC, (size_t)OC,
+                        MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, (scale_acc_t)1,
+                        NO_ACTIVATION, ACC_SCALE_IDENTITY, (acc_scale_t)0,
+                        repeating,
+                        false, false,
+                        true, false,
+                        0, WS
+                    );
+
+                    acc_t *t = cur; cur = prev; prev = t;   /* result now in `prev` */
                 }
-                scaled += output_offset;
-                if (scaled < activation_min) scaled = activation_min;
-                if (scaled > activation_max) scaled = activation_max;
-                output[out_base + (size_t)oc * out_oc_stride] = (int8_t)scaled;
+
+                gemmini_fence();
+                gemmini_flush(0);
+
+                /* Exact two-stage Q0.31 requantize, int32 -> int8 NCHW.
+                 * Byte-for-byte the same arithmetic as the shipped kernel. */
+                const acc_t *acc_buf = prev;
+                for (int r = 0; r < rows; r++) {
+                    const int out_idx = base_out + r0 + r;
+                    const int ow_idx  = out_idx % OW;
+                    const int oh_idx  = (out_idx / OW) % OH;
+                    const int n_idx   = out_idx / (OH * OW);
+                    const size_t out_base =
+                        (((size_t)n_idx*OC)*OH + (size_t)oh_idx)*OW + (size_t)ow_idx;
+                    const size_t out_oc_stride = (size_t)OH * (size_t)OW;
+                    for (int oc = 0; oc < OC; oc++) {
+                        int32_t acc = acc_buf[(size_t)r * OC + oc];
+                        int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                        prod = (prod + ((int64_t)1 << 30)) >> 31;
+                        int32_t scaled = (int32_t)prod;
+                        if (output_shift > 0) {
+                            scaled = (int32_t)(((int64_t)scaled
+                                + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                        } else if (output_shift < 0) {
+                            scaled <<= (-output_shift);
+                        }
+                        scaled += output_offset;
+                        if (scaled < activation_min) scaled = activation_min;
+                        if (scaled > activation_max) scaled = activation_max;
+                        output[out_base + (size_t)oc * out_oc_stride] = (int8_t)scaled;
+                    }
+                }
             }
         }
     }
