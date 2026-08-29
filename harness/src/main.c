@@ -47,7 +47,49 @@ int main(void)
      * (when emitted) would dispatch onto a real modelblaster_pool_t.
      * model_run_test() feeds the baked test input(s) — it is arity-agnostic
      * (1 input or N typed inputs), so this call is unchanged across models. */
+    /* ------------------------------------------------------------------
+     * MODELBLASTER_MASK_IRQ_DURING_RUN: run the whole inference with
+     * machine interrupts masked.
+     *
+     * WHY. On the Saturn RVV configs in this tree (measured on
+     * f2_dual_small_norose_tacit_q31_60mhz, VLEN=256/dLen=128) a trap
+     * taken while a vector kernel is executing can come back with
+     * EXACTLY ONE scalar register corrupted. It is deterministic and
+     * bit-reproducible, and it is invisible on spike. Two shipped fp16
+     * conv kernels were blamed for it before the trap path was:
+     *
+     *   ViNT depthwise_conv2d_f16 : mcause 5, mtval 0x7aa61300c on a
+     *     `vlse16.v v2,(a0),t6` whose a0 the kernel's own arithmetic
+     *     provably cannot compute -- every other register in the frame
+     *     is exactly right for that iteration (fq jobs 248/249/271).
+     *   ViNT conv2d_f16           : mcause 4, mtval 3 on the same kind
+     *     of strided weight gather (fq jobs 248/290/292).
+     *
+     * Masking MIE for the duration of the run removes both, with the
+     * model otherwise byte-identical (fq jobs 283/285). The kernels
+     * themselves are clean: all 81 ViNT conv shapes run fault-free in
+     * isolation on the same bitstream (fq jobs 270/296).
+     *
+     * COST. No preemption and no tick servicing for the duration of one
+     * model_run_test(). This harness is single-threaded and main() is
+     * pinned to one hart, so nothing else is runnable; k_cycle_get_64()
+     * reads free-running mtime and stays correct, and the per-op rdcycle
+     * profile gets cleaner (no ISR time folded in). A harness that runs
+     * a thread pool or several models concurrently must NOT do this --
+     * hence the switch rather than an unconditional lock.
+     * ------------------------------------------------------------------ */
+#if !defined(MODELBLASTER_MASK_IRQ_DURING_RUN)
+#define MODELBLASTER_MASK_IRQ_DURING_RUN 1
+#endif
+#if MODELBLASTER_MASK_IRQ_DURING_RUN
+    unsigned int mb_irq_key = irq_lock();
+#endif
+
     model_run_test(model_output, NULL);
+
+#if MODELBLASTER_MASK_IRQ_DURING_RUN
+    irq_unlock(mb_irq_key);
+#endif
 
     /* In-binary golden compare.
      *
