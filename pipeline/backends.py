@@ -277,7 +277,7 @@ RVV_F16 = Backend(
 # assembles under plain rv64gcv_zvl256b on both installed toolchains. There is
 # no `xsmtvdot` march string for either compiler.
 IME = Backend(
-    name="ime",
+    name="ime_x60",
     description=(
         "SpaceMiT K1 IME int8 matrix engine (smt.vmadot, 4x4x8 micro-tile) "
         "layered on rv64gcv with VLEN=256. Cluster 0 only."
@@ -292,10 +292,17 @@ IME = Backend(
     prj_conf_overlay="rvv.conf",
     spike_args=("--isa=rv64gcv_zicntr",),
     optimization_guide="optimization_guide_rvv.md",
-    # Load-bearing. IME can only serve matmul; every other op in the model
-    # falls through to these. Without it a green "ime" build measures the
-    # SCALAR reference for all of them and reports it as an IME number.
-    curated_aliases=("rvv",),
+    # Load-bearing, and the ORDER matters. "ime" first so the vmadot kernels
+    # in kernels/ime/ are found; "rvv" second because IME can only serve
+    # matmul and every other op in the model falls through to the RVV curated
+    # set. Without the rvv fallback a green ime build measures the SCALAR
+    # reference for all of them and reports it as an IME number.
+    #
+    # The backend is `ime_x60` (matching the profile tree's rvv_x60 / scalar
+    # convention, which is what the scheduler's combo_hw swap keys on) while
+    # the kernels live in kernels/ime/ -- the alias is what bridges the two,
+    # exactly as rvv_x60 reaches kernels/rvv/.
+    curated_aliases=("ime", "rvv"),
     # Same reasoning as rvv_x60: the host is x86 and no simulator models
     # smt.vmadot, so generation cross-compiles and the board settles numerics.
     verify_method=VERIFY_CROSS_COMPILE,
