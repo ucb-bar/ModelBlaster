@@ -1238,8 +1238,26 @@ class _ExportWalker:
         out_name = n.name
         self._record_tensor(out_name)
         in_shape = self.tensors[in_name].shape
-        M = 1
-        for d in in_shape[:-1]: M *= int(d)
+        # M = number of rows the GEMM sees = numel(in) / in_features.
+        #
+        # NOT ``prod(in_shape[:-1])``: aliases (flatten / view / reshape)
+        # are zero-cost, so ``in_name`` frequently resolves to the
+        # PRE-reshape producer whose trailing dim is not in_features.
+        # ViNT hits this three ways -- goal-encoder `linear` reads the
+        # 4D pooled (1,1280,1,1) -> prod=1280 (true M=1); the attention
+        # out_projs read (1,4,7,128) -> prod=28 (true M=7); `linear_18`
+        # reads (1,7,512) -> prod=7 (true M=1). Each inflated M both
+        # multiplies the kernel's work and overruns the output buffer,
+        # which is sized from the real output shape.
+        in_numel = 1
+        for d in in_shape: in_numel *= int(d)
+        if int(IF) > 0 and in_numel % int(IF) == 0:
+            M = in_numel // int(IF)
+        else:
+            # Shouldn't happen for a well-formed aten.linear; fall back
+            # to the old rule rather than emitting M=0.
+            M = 1
+            for d in in_shape[:-1]: M *= int(d)
 
         w_key = f"{n.name}.weights"
         b_key = f"{n.name}.bias" if b is not None else None
