@@ -10,6 +10,19 @@ For each round:
      gate + per-dispatch measured cycles.
   4. ACCEPT iff measured improves total cycles by > epsilon AND
      verify passed; otherwise REJECT with logged reason.
+
+     THIS IS A PROXY GATE, NOT THE PROJECT'S ACCEPTANCE RULE. Total cycles is
+     `candidate_objective`'s NINTH and last term, and that module's docstring
+     says it is "never the deciding term" -- its own worked example is a split
+     that costs 5% more cycles and is a WIN because it stops a model missing
+     deadlines. Measured on the DroNet split rung: rejected at term 5
+     (heavy-model max latency) while IMPROVING critical-task p99, a verdict
+     a cycles gate cannot reach in either direction.
+
+     Use this loop to SEARCH -- it is cheap and it does not need a schedule
+     per candidate. Decide with `XPU-RT/scripts/compare_candidates.py`, which
+     scores two solved schedules through all nine terms and names the one that
+     turned the verdict.
   5. Persist round artifacts and render a Gantt-style summary
      (predicted-vs-measured per candidate).
 
@@ -130,6 +143,46 @@ def run_granularity(args, out_dir: Path) -> dict:
     raise SystemExit(f"could not locate granularity_result.json (tried {candidates}); see {log}")
 
 
+def _known_networks(args) -> set[str] | None:
+    """The real network names, from the workload spec the loop is driving.
+
+    Cached on `args` because it is read once per candidate otherwise.
+    """
+    cached = getattr(args, "_known_cache", None)
+    if cached is not None:
+        return cached or None
+    names: set[str] = set()
+    try:
+        with open(args.networks_json) as fh:
+            names = set((json.load(fh).get("networks") or {}))
+    except (OSError, ValueError):
+        pass
+    args._known_cache = names
+    return names or None
+
+
+def _network_of(net_inst: str, known: set[str] | None = None) -> str:
+    """`'mlp_control3'` -> `'mlp_control'`, given the real network names.
+
+    The previous implementation stripped EVERY digit rather than a trailing
+    run, so `yolov8_nano_64x960` became `yolov8_nano_x` -- a name matching no
+    network, which silently dropped the candidate from `network_filter`. The
+    trailing-run rule is still ambiguous on its own for a network whose name
+    ends in a digit, so pass `known` when it is available; XPU-RT's
+    `job_names` module owns the same rule on that side.
+    """
+    if known:
+        for base in sorted(known, key=len, reverse=True):
+            if net_inst == base:
+                return base
+            if net_inst.startswith(base) and net_inst[len(base):].isdigit():
+                return base
+    i = len(net_inst)
+    while i > 0 and net_inst[i - 1].isdigit():
+        i -= 1
+    return net_inst[:i].rstrip("_") or net_inst
+
+
 def classify_realizability(cand: dict) -> tuple[bool, str]:
     """Decide whether a candidate from granularity_result.json can be
     turned into IR by one of our existing rewriters."""
@@ -149,7 +202,8 @@ def classify_realizability(cand: dict) -> tuple[bool, str]:
     return False, f"unknown candidate type {ctype}"
 
 
-def build_fuse_hint(cand: dict, network_filter: str | None = None) -> dict:
+def build_fuse_hint(cand: dict, network_filter: str | None = None,
+                    known: set[str] | None = None) -> dict:
     """Turn a granularity_loop candidate into a Contract-2 fusion hint."""
     affected: list[str] = cand["affected"]
     # affected entries look like 'mlp_control3_dispatch_0' — group by network.
@@ -161,8 +215,7 @@ def build_fuse_hint(cand: dict, network_filter: str | None = None) -> dict:
             continue
         net_inst = a[:i]
         disp_id = int(a[i + len("_dispatch_"):])
-        # collapse instance suffix to network name: mlp_control3 -> mlp_control
-        net = "".join(c for c in net_inst if not c.isdigit() or c == "_").rstrip("_")
+        net = _network_of(net_inst, known)
         if network_filter and net != network_filter:
             continue
         groups.setdefault(net, []).append(disp_id)
@@ -177,7 +230,8 @@ def build_fuse_hint(cand: dict, network_filter: str | None = None) -> dict:
 
 
 def build_split_hint(cand: dict, network_filter: str | None = None,
-                     n_splits: int = 2) -> dict:
+                     n_splits: int = 2,
+                     known: set[str] | None = None) -> dict:
     affected: list[str] = cand["affected"]
     by_net: dict[str, list[int]] = {}
     for a in affected:
@@ -185,7 +239,7 @@ def build_split_hint(cand: dict, network_filter: str | None = None,
         if i < 0:
             continue
         net_inst = a[:i]; did = int(a[i + len("_dispatch_"):])
-        net = "".join(c for c in net_inst if not c.isdigit() or c == "_").rstrip("_")
+        net = _network_of(net_inst, known)
         if network_filter and net != network_filter:
             continue
         by_net.setdefault(net, []).append(did)
@@ -346,9 +400,11 @@ def main(argv=None) -> int:
         # Find the original candidate dict
         orig = next(c for c in all_cands if c["id"] == o.id)
         if "fuse" in o.type:
-            hint = build_fuse_hint(orig, network_filter=args.network)
+            hint = build_fuse_hint(orig, network_filter=args.network,
+                                   known=_known_networks(args))
         else:
-            hint = build_split_hint(orig, network_filter=args.network)
+            hint = build_split_hint(orig, network_filter=args.network,
+                                    known=_known_networks(args))
         if not hint["networks"]:
             o.accept_reason = f"candidate targets a network other than --network={args.network}"
             continue
