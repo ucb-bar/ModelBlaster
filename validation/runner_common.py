@@ -668,7 +668,8 @@ def report_run(text: str, *, models: Optional[list[str]],
                iree_args: IREEProfileArgs, backend_tag: str,
                repo_root: str,
                quants: Optional[list[str]] = None,
-               model_name: Optional[str] = None) -> bool:
+               model_name: Optional[str] = None,
+               io_paths: Optional[dict] = None) -> bool:
     """Single entry point used by both runners after they've captured
     the harness stdout. Walks the OUTPUT/PROFILE/WALL blocks, compares
     each against its golden, prints summaries, writes per-model CSV,
@@ -689,10 +690,27 @@ def report_run(text: str, *, models: Optional[list[str]],
             # harness — saves shipping the full output tensor over UART);
             # fall back to per-element parse_output for legacy binaries.
             verify = parse_verify(text, tag=name)
-            actual = None if verify is not None else parse_output(text, tag=name)
+            # Batched harness: in-binary VERIFY may be missing for a
+            # variant whose kernel crashed / infinite-looped / lost its
+            # marker to HTIF-buffer drop. Try parse_output(); if that
+            # also fails, mark this model failed and continue instead
+            # of aborting the whole report_run — otherwise one bad
+            # variant wipes the batch even though the others ran fine.
+            actual = None
+            if verify is None:
+                try:
+                    actual = parse_output(text, tag=name)
+                except RuntimeError as _e:
+                    print(f"  [{name}] MISSING OUTPUT/VERIFY (variant "
+                          f"hung, crashed, or lost markers) — FAIL")
+                    all_ok = False
+                    continue
             per_model_quant = (quants[i] if quants and i < len(quants)
                                else quant)
-            golden_path = model_io_path(repo_root, name, per_model_quant)
+            # io_paths lets the caller point a model name (e.g. a flat
+            # kernelbench tag) at an io.npz that isn't under examples/<name>/.
+            golden_path = ((io_paths or {}).get(name)
+                           or model_io_path(repo_root, name, per_model_quant))
             if not os.path.exists(golden_path):
                 print(f"FAIL: golden not found at {golden_path}")
                 all_ok = False
