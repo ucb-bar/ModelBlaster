@@ -393,6 +393,42 @@ LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
 # Verify routing — backend dictates host_ctypes vs spike_harness
 # ---------------------------------------------------------------------------
 
+#: Backends whose whole point is a vector unit. A curated kernel for one of
+#: these that contains no vector instruction is a mistake, not a style.
+_VECTOR_BACKENDS = {"rvv", "rvv_x60", "rvv_f16", "rvv_opu", "ime"}
+
+
+def _count_vector_insns(obj_path: str, cross: str) -> int:
+    """How many RVV instructions an object file actually contains.
+
+    Reads the OBJECT, not the source: an intrinsic can appear in the C and be
+    optimised away, and `.insn`-encoded instructions (IME's vmadot) never look
+    like intrinsics in the first place. Returns -1 when objdump is unavailable,
+    which callers must treat as "unknown", never as zero.
+    """
+    objdump = f"{cross}objdump"
+    if shutil.which(objdump) is None:
+        return -1
+    proc = subprocess.run([objdump, "-d", obj_path], capture_output=True,
+                          text=True)
+    if proc.returncode != 0:
+        return -1
+    n = 0
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        mnemonic = parts[2].split()[0] if parts[2].split() else ""
+        # vsetvli alone does not make a kernel vector code; it is the data
+        # instructions that count. `.insn`-encoded customs disassemble as
+        # `.insn` or an unknown mnemonic, so count those too.
+        if mnemonic.startswith("v") and not mnemonic.startswith("vsetvl"):
+            n += 1
+        elif mnemonic.startswith(".insn"):
+            n += 1
+    return n
+
+
 def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
                          repo_root: Optional[str]) -> VerifyResult:
     """Compile the candidate for the target ISA. Do not run it.
@@ -438,6 +474,26 @@ def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
                 "candidate failed to cross-compile for "
                 f"{backend.name}:\n  cmd: {' '.join(cmd)}\n"
                 f"  stderr:\n{proc.stderr}")
+
+        # A "vector" kernel that compiled to no vector instructions is the
+        # same class of silent failure as the seed fallback, one level up:
+        # it builds, it verifies, it is bit-exact, and it is scalar. It
+        # happened -- asking for the generic `direct` algorithm on this
+        # backend produced four transformer kernels with zero intrinsics
+        # between them, each of which would have been committed as a curated
+        # RVV kernel. The object file settles it; the source does not, since
+        # an intrinsic can be present and optimised away.
+        if _VECTOR_BACKENDS.intersection(backends_mod.backend_lineage(
+                backend.name)):
+            vec = _count_vector_insns(os.path.join(d, "cand.o"), cross)
+            if vec == 0:
+                return VerifyResult(
+                    False,
+                    f"candidate compiled for {backend.name} but emitted NO "
+                    f"vector instructions -- it is scalar code wearing a "
+                    f"vector target's name. Use the RVV intrinsics "
+                    f"(__riscv_vsetvl_*, vle8/vwmul/vredsum ...); a kernel "
+                    f"that only happens to build is not a port.")
 
     return VerifyResult(
         True,
