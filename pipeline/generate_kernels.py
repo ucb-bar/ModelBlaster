@@ -1341,10 +1341,28 @@ def generate(
         # worst-known one. A curated kernel that then fails verify is
         # reverted to reference immediately (below) so it cannot poison
         # the ops after it.
+        #
+        # ORDER MATTERS, and spec.algorithms order is NOT the right order here.
+        # The seed is the baseline every other op is judged against, so it must
+        # be the most ACCURATE kernel available, not the first one listed.
+        # conv2d_s8 lists gemmini_tiled_conv (accuracy_class=1, ~2-6 LSB of
+        # Q0.31 drift) before gemmini_im2col_full_C (accuracy_class=0, exact).
+        # Seeding the drifting one makes the whole-model baseline drift, and
+        # every op probed before conv2d_s8 alphabetically inherits that drift
+        # and is reverted to reference -- measured as add_s8 on dronet and
+        # add_s8 + cat2/cat3/cat4_c1_s8 on yolov8_nano, all of which verify
+        # clean on their own. This bit the moment commit f10d0b6 gave
+        # gemmini_tiled_conv a curated file on gemmini_q31; before that it had
+        # none, so the scan fell through to the exact kernel by accident.
+        # Sorting by accuracy_class makes that accident a guarantee.
         curated_seed: dict[str, tuple[str, str, str]] = {}
         if global_curated_dir is not None:
             for spec in specs:
-                for algorithm in spec.algorithms:
+                _cands = sorted(
+                    spec.algorithms,
+                    key=lambda a: (getattr(a, "accuracy_class", 0) or 0),
+                )
+                for algorithm in _cands:
                     _fn = f"{target.name}_{spec.op}_{algorithm.name}.c"
                     _cp = os.path.join(global_curated_dir, target.name, _fn)
                     if os.path.exists(_cp):
