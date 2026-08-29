@@ -7870,6 +7870,34 @@ void kernel_adaptive_avg_pool2d_s8(const int8_t *input, int8_t *output,
         {"N": 1, "C": 1280, "IH": 2, "IW": 3, "OH": 1, "OW": 1},
     ],
     argtypes_factory=_adaptive_avg_pool2d_s8_argtypes,
+    algorithms=[
+        # ViNT needs this op and no model in this tree emits it, so it had
+        # only the synthesized `direct` candidate and no curated kernel.
+        # Kernel: kernels/rvv/rvv_adaptive_avg_pool2d_s8_rvv_window_sum.c
+        AlgorithmCandidate(
+            name="rvv_window_sum",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The window accumulator is `int32_t acc` over int8 inputs, "
+                "and integer addition is associative -- so any reduction "
+                "shape gives the identical sum and the vector form is the "
+                "same arithmetic, not an approximation of it. That is what "
+                "makes this op easy where layernorm and softmax were not: "
+                "their reductions are floating-point and sequential, so "
+                "order is part of the answer.\n\n"
+                "Accumulate at 32 bits, not 16. A widening reduction into "
+                "int16 overflows on a 104-element window of large values, "
+                "and the failure is silent and data-dependent.\n\n"
+                "The extractor only supports output_size=(1,1), so the "
+                "window is the whole plane and the inner loop is a long "
+                "contiguous run -- which is the shape this is written for. "
+                "The float tail stays scalar: there is one roundf per "
+                "OUTPUT, and at (1,1) that is one element per channel."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -8704,6 +8732,39 @@ void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
          "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 0, "PW": 0},
     ],
     argtypes_factory=_depthwise_conv2d_s8_argtypes,
+    algorithms=[
+        # ViNT needs this op and no model in this tree emits it.
+        # Kernel: kernels/rvv/rvv_depthwise_conv2d_s8_rvv_ow_lanes_taps.c
+        AlgorithmCandidate(
+            name="rvv_ow_lanes_taps",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "One vector is a run of OUTPUT COLUMNS of one (n, c, oh). "
+                "Everything up to the store is integer -- `acc += iv*wv` in "
+                "int32, then a fixed-point requantize through int64 -- so "
+                "reordering the taps cannot change the sum and there is no "
+                "rounding mode to match.\n\n"
+                "THE PADDING IS HANDLED WITHOUT A MASK. For a fixed (kh, "
+                "kw) the input ROW index is constant, so its bounds check is "
+                "scalar. The column index iw = ow*SW - PW + kw is monotonic "
+                "in ow, so the outputs for which a tap is in bounds form a "
+                "CONTIGUOUS range with a closed form: ow >= ceil((PW-kw)/SW) "
+                "and ow <= (IW-1-kw+PW)/SW. A sub-range is addressed by "
+                "moving the pointer and shortening the vector -- no "
+                "per-lane compare, and identical to the reference's "
+                "`if (iw < 0 || iw >= IW) continue;`.\n\n"
+                "The accumulator therefore lives in a small int32 scratch "
+                "rather than a register: different taps cover different "
+                "sub-ranges of the same tile, and a register accumulator "
+                "would need exactly the mask this design avoids. 128 bytes, "
+                "L1-resident, and a stack array rather than a static one "
+                "because the pool runs one worker per hart in one address "
+                "space."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 

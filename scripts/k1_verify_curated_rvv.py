@@ -81,6 +81,10 @@ CURATED = {
     "gelu_s8": "kernels/rvv/rvv_gelu_s8_rvv_memo_lut_gather.c",
     "softmax_s8": "kernels/rvv/rvv_softmax_s8_rvv_cached_exp.c",
     "layernorm_s8": "kernels/rvv/rvv_layernorm_s8_rvv_f64_tail.c",
+    "adaptive_avg_pool2d_s8":
+        "kernels/rvv/rvv_adaptive_avg_pool2d_s8_rvv_window_sum.c",
+    "depthwise_conv2d_s8":
+        "kernels/rvv/rvv_depthwise_conv2d_s8_rvv_ow_lanes_taps.c",
 }
 
 #: Shapes to check beyond the ones the model graphs happen to contain.
@@ -90,6 +94,59 @@ CURATED = {
 #: vector. A kernel that is wrong in exactly those places passes on the model
 #: shapes alone. These come from matmul_s8's own KernelSpec.extra_shapes plus
 #: two deliberate off-by-one strip boundaries.
+#: Complete cases for ops NO MODEL IN THIS TREE EMITS. `EXTRA_CASES` above
+#: extends a donor case borrowed from a real graph, so it cannot help here --
+#: there is no donor. These carry their own quant values.
+#:
+#: Both entries are ViNT ops. ViNT cannot be built in this checkout (its int8
+#: calibration needs the IDSIA stills and the IsaacLab forest renders, neither
+#: of which is present), so these kernels are verified against the reference
+#: and NOT yet exercised by a real model. The shapes are chosen to hit the
+#: cases the kernels actually branch on rather than to look like ViNT:
+#: padded and unpadded, stride 1 and 2, an odd width that leaves a vector
+#: tail, and a channel count above one vector.
+SYNTHETIC_CASES = {
+    "depthwise_conv2d_s8": [
+        # 3x3 stride 1 same-padding: the common mobile block, and the case
+        # where every tap has a different valid output range.
+        dict(N=1, C=16, IH=14, IW=14, KH=3, KW=3, SH=1, SW=1, PH=1, PW=1),
+        # stride 2, so the strided load path runs and the tap ranges are not
+        # simply shifted by one.
+        dict(N=1, C=16, IH=14, IW=14, KH=3, KW=3, SH=2, SW=2, PH=1, PW=1),
+        # unpadded: every tap in bounds for every column, the easy path.
+        dict(N=1, C=8,  IH=14, IW=14, KH=3, KW=3, SH=1, SW=1, PH=0, PW=0),
+        # odd width, so the last tile is a partial vector.
+        dict(N=1, C=8,  IH=9,  IW=13, KH=3, KW=3, SH=1, SW=1, PH=1, PW=1),
+        # 5x5, more taps than a tile is wide at small IW.
+        dict(N=1, C=4,  IH=11, IW=11, KH=5, KW=5, SH=1, SW=1, PH=2, PW=2),
+        # 1x1: degenerate, no padding logic at all.
+        dict(N=1, C=32, IH=7,  IW=7,  KH=1, KW=1, SH=1, SW=1, PH=0, PW=0),
+    ],
+    "adaptive_avg_pool2d_s8": [
+        # output_size=(1,1) -- the only form the extractor emits, and a
+        # whole-plane reduction.
+        dict(N=1, C=32, IH=8,  IW=13, OH=1, OW=1),
+        dict(N=1, C=10, IH=14, IW=14, OH=1, OW=1),
+        # a run shorter than MB_AAP_VEC_MIN, so the scalar arm runs
+        dict(N=1, C=8,  IH=3,  IW=5,  OH=1, OW=1),
+        # non-degenerate output: uneven windows, which is where the
+        # ih0/ih1/iw0/iw1 arithmetic actually differs per output
+        dict(N=1, C=8,  IH=13, IW=13, OH=3, OW=3),
+        dict(N=1, C=4,  IH=16, IW=16, OH=4, OW=4),
+    ],
+}
+
+#: Quant tuples for the synthetic cases, by op. Realistic rather than 1.0, so
+#: the requantize tail is exercised instead of short-circuited.
+SYNTHETIC_QUANT = {
+    "depthwise_conv2d_s8": dict(input_offset=0, filter_offset=0,
+                                output_offset=0, output_multiplier=1207959552,
+                                output_shift=7, activation_min=-128,
+                                activation_max=127),
+    "adaptive_avg_pool2d_s8": dict(scale_in=0.0235, scale_out=0.0180,
+                                   activation_min=-128, activation_max=127),
+}
+
 EXTRA_CASES = {
     "matmul_s8": [
         {"M": 7, "K": 64,  "N": 7,   "transpose_b": 1, "scale_div": 8.0},
@@ -144,6 +201,18 @@ def collect_cases(op_name, models):
     # Shapes the graphs do not happen to contain but the kernel must survive:
     # strip boundaries and a large K. Quant values are borrowed from the first
     # real case so the requantize tail sees realistic scales rather than 1.0.
+    # Ops no model emits get their cases outright -- there is no donor to
+    # extend, so EXTRA_CASES below cannot reach them.
+    for i, extra in enumerate(SYNTHETIC_CASES.get(op_name, [])):
+        case = dict(extra)
+        case.update(SYNTHETIC_QUANT.get(op_name, {}))
+        key = tuple(sorted(case.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        case["tag"] = f"synthetic:{op_name}#{i}"
+        cases.append(case)
+
     donor = dict(cases[0]) if cases else {}
     for extra in EXTRA_CASES.get(op_name, []):
         case = {k: v for k, v in donor.items() if k not in ("tag",)}
@@ -760,6 +829,142 @@ int main(void) {{
 """
 
 
+def emit_adaptive_avg_pool(cases):
+    max_in = max(c["N"]*c["C"]*c["IH"]*c["IW"] for c in cases)
+    max_out = max(c["N"]*c["C"]*c["OH"]*c["OW"] for c in cases)
+    rows = ['    { "%(tag)s", %(N)d,%(C)d,%(IH)d,%(IW)d,%(OH)d,%(OW)d,'
+            '%(scale_in).9ef,%(scale_out).9ef,%(activation_min)d,'
+            '%(activation_max)d },' % c for c in cases]
+    return PRELUDE + f"""
+#define MAX_IN  {max_in}
+#define MAX_OUT {max_out}
+typedef struct {{
+    const char *tag;
+    int N, C, IH, IW, OH, OW;
+    float scale_in, scale_out;
+    int amin, amax;
+}} case_t;
+static const case_t CASES[] = {{
+{chr(10).join(rows)}
+}};
+#define N_CASES ((int)(sizeof(CASES)/sizeof(CASES[0])))
+
+extern void kernel_cand(const int8_t *, int8_t *, int, int, int, int, int, int,
+                        float, float, int, int);
+extern void kernel_ref (const int8_t *, int8_t *, int, int, int, int, int, int,
+                        float, float, int, int);
+
+static int8_t IN[MAX_IN], OUTC[MAX_OUT], OUTR[MAX_OUT];
+
+int main(void) {{
+    for (int i = 0; i < N_CASES; i++) {{
+        const case_t *c = &CASES[i];
+        long n_in  = (long)c->N*c->C*c->IH*c->IW;
+        long n_out = (long)c->N*c->C*c->OH*c->OW;
+        char dims[96];
+        snprintf(dims, sizeof dims, "C%d %dx%d -> %dx%d",
+                 c->C, c->IH, c->IW, c->OH, c->OW);
+        for (int regime = 0; regime < 2; regime++) {{
+            int lim = regime ? 20 : 128;
+            rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)i << 8) ^ regime;
+            for (long k = 0; k < n_in; k++) IN[k] = rnd8(lim);
+            memset(OUTC, 0, n_out); memset(OUTR, 0, n_out);
+            double t0 = now_ms();
+            kernel_cand(IN, OUTC, c->N, c->C, c->IH, c->IW, c->OH, c->OW,
+                        c->scale_in, c->scale_out, c->amin, c->amax);
+            double t1 = now_ms();
+            kernel_ref (IN, OUTR, c->N, c->C, c->IH, c->IW, c->OH, c->OW,
+                        c->scale_in, c->scale_out, c->amin, c->amax);
+            double t2 = now_ms();
+            report(c->tag, regime ? "small" : "full", dims, OUTC, OUTR,
+                   n_out, t1 - t0, t2 - t1);
+        }}
+    }}
+    printf("WORST max_abs_err=%d over %d cases\\n", worst, N_CASES);
+    return worst == 0 ? 0 : 1;
+}}
+"""
+
+
+def emit_depthwise(cases):
+    max_in = max(c["N"]*c["C"]*c["IH"]*c["IW"] for c in cases)
+    def _o(c, d):
+        return ((c[d] + 2*c["P"+("H" if d=="IH" else "W")]
+                 - c["K"+("H" if d=="IH" else "W")])
+                // c["S"+("H" if d=="IH" else "W")]) + 1
+    max_out = max(c["N"]*c["C"]*_o(c,"IH")*_o(c,"IW") for c in cases)
+    max_w = max(c["C"]*c["KH"]*c["KW"] for c in cases)
+    rows = ['    { "%(tag)s", %(N)d,%(C)d,%(IH)d,%(IW)d,%(KH)d,%(KW)d,'
+            '%(SH)d,%(SW)d,%(PH)d,%(PW)d,%(input_offset)d,%(filter_offset)d,'
+            '%(output_offset)d,%(output_multiplier)d,%(output_shift)d,'
+            '%(activation_min)d,%(activation_max)d },' % c for c in cases]
+    return PRELUDE + f"""
+#define MAX_IN  {max_in}
+#define MAX_OUT {max_out}
+#define MAX_W   {max_w}
+typedef struct {{
+    const char *tag;
+    int N, C, IH, IW, KH, KW, SH, SW, PH, PW;
+    int input_offset, filter_offset, output_offset;
+    int output_multiplier, output_shift, amin, amax;
+}} case_t;
+static const case_t CASES[] = {{
+{chr(10).join(rows)}
+}};
+#define N_CASES ((int)(sizeof(CASES)/sizeof(CASES[0])))
+
+extern void kernel_cand(const int8_t *, const int8_t *, const int32_t *,
+                        int8_t *, int, int, int, int, int, int, int, int,
+                        int, int, int, int, int, int, int, int, int);
+extern void kernel_ref (const int8_t *, const int8_t *, const int32_t *,
+                        int8_t *, int, int, int, int, int, int, int, int,
+                        int, int, int, int, int, int, int, int, int);
+
+static int8_t IN[MAX_IN], W[MAX_W], OUTC[MAX_OUT], OUTR[MAX_OUT];
+static int32_t B[MAX_W];
+
+int main(void) {{
+    for (int i = 0; i < N_CASES; i++) {{
+        const case_t *c = &CASES[i];
+        int OH = (c->IH + 2*c->PH - c->KH) / c->SH + 1;
+        int OW = (c->IW + 2*c->PW - c->KW) / c->SW + 1;
+        long n_in  = (long)c->N*c->C*c->IH*c->IW;
+        long n_out = (long)c->N*c->C*OH*OW;
+        long n_w   = (long)c->C*c->KH*c->KW;
+        char dims[110];
+        snprintf(dims, sizeof dims, "C%d %dx%d K%dx%d S%d P%d -> %dx%d",
+                 c->C, c->IH, c->IW, c->KH, c->KW, c->SH, c->PH, OH, OW);
+        for (int regime = 0; regime < 2; regime++) {{
+            int lim = regime ? 20 : 128;
+            rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)i << 8) ^ regime;
+            for (long k = 0; k < n_in; k++) IN[k] = rnd8(lim);
+            for (long k = 0; k < n_w;  k++) W[k]  = rnd8(lim);
+            /* Bias in the range a real per-channel int32 bias occupies. */
+            for (long k = 0; k < c->C; k++) B[k] = (int32_t)rnd8(64) * 137;
+            memset(OUTC, 0, n_out); memset(OUTR, 0, n_out);
+            double t0 = now_ms();
+            kernel_cand(IN, W, B, OUTC, c->N, c->C, c->IH, c->IW,
+                        c->KH, c->KW, c->SH, c->SW, c->PH, c->PW,
+                        c->input_offset, c->filter_offset, c->output_offset,
+                        c->output_multiplier, c->output_shift,
+                        c->amin, c->amax);
+            double t1 = now_ms();
+            kernel_ref (IN, W, B, OUTR, c->N, c->C, c->IH, c->IW,
+                        c->KH, c->KW, c->SH, c->SW, c->PH, c->PW,
+                        c->input_offset, c->filter_offset, c->output_offset,
+                        c->output_multiplier, c->output_shift,
+                        c->amin, c->amax);
+            double t2 = now_ms();
+            report(c->tag, regime ? "small" : "full", dims, OUTC, OUTR,
+                   n_out, t1 - t0, t2 - t1);
+        }}
+    }}
+    printf("WORST max_abs_err=%d over %d cases\\n", worst, N_CASES);
+    return worst == 0 ? 0 : 1;
+}}
+"""
+
+
 EMITTERS = {
     "lstm_s8": emit_lstm,
     "add_s8": emit_add,
@@ -779,6 +984,10 @@ EMITTERS = {
     "softmax_s8": emit_softmax,
     "layernorm_s8": emit_layernorm,
     "linear_s8": emit_linear,
+    # ViNT ops that no model in this tree emits; their cases come from
+    # SYNTHETIC_CASES rather than from a graph.
+    "adaptive_avg_pool2d_s8": emit_adaptive_avg_pool,
+    "depthwise_conv2d_s8": emit_depthwise,
 }
 
 
