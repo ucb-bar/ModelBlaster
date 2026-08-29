@@ -252,6 +252,56 @@ RVV_F16 = Backend(
 # verify_method=VERIFY_SPIKE_HARNESS as "spike unsupported, skip verify"
 # (TODO once that flag exists; until then, set BACKEND=reference + a
 # curated kernel and run on FireSim directly via run.sh RUNNER=firesim).
+# SpaceMiT K1 IME (Integrated Matrix Extension), reached through the
+# `smt.vmadot` custom instruction. Layered ON TOP of rvv_x60 rather than
+# replacing it: only matmul can use the MAC unit, so every other op in a model
+# still needs the RVV kernels, which is what `curated_aliases` is for.
+#
+# Four facts, all MEASURED on the board rather than read off a datasheet,
+# because the datasheet was wrong about two of them (see docs section 9):
+#
+#   1. The micro-tile is 4x4x8 and HARDWARE-FORCED. The MAC table is indexed
+#      by vl*SEW, not VLEN: at VLEN=256, SEW=8, vl=32 gives M x N x K = 4x4x8.
+#      K is pinned at 8; a deeper reduction is a LOOP of vmadots.
+#   2. It ACCUMULATES: vd += A . B^T, verified by issuing the same operands
+#      twice and watching the results double. That is what makes the K-loop
+#      possible.
+#   3. The 16 int32 results land row-major across the pair (vd, vd+1):
+#      element e is C[e/4][e%4]. Measured by
+#      scripts/k1_ime_accumulator_probe.c.
+#   4. CLUSTER 0 ONLY. Harts 4-7 do not implement the instruction and exit
+#      132 (SIGILL). Any machine config that places ime work on CPU_E, or that
+#      asks for {"cpu_p": 8}, produces a schedule that cannot run.
+#
+# No new -march is needed: the instruction is emitted as a `.insn` and
+# assembles under plain rv64gcv_zvl256b on both installed toolchains. There is
+# no `xsmtvdot` march string for either compiler.
+IME = Backend(
+    name="ime",
+    description=(
+        "SpaceMiT K1 IME int8 matrix engine (smt.vmadot, 4x4x8 micro-tile) "
+        "layered on rv64gcv with VLEN=256. Cluster 0 only."
+    ),
+    kernel_cflags=(
+        "-march=rv64gcv_zvl256b_zfh_zvfh",
+        "-mabi=lp64d",
+        "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
+        "-I<repo_root>/kernels/rvv",
+    ),
+    kernel_includes=("<riscv_vector.h>", '"mb_rvv_vxrm_compat.h"'),
+    prj_conf_overlay="rvv.conf",
+    spike_args=("--isa=rv64gcv_zicntr",),
+    optimization_guide="optimization_guide_rvv.md",
+    # Load-bearing. IME can only serve matmul; every other op in the model
+    # falls through to these. Without it a green "ime" build measures the
+    # SCALAR reference for all of them and reports it as an IME number.
+    curated_aliases=("rvv",),
+    # Same reasoning as rvv_x60: the host is x86 and no simulator models
+    # smt.vmadot, so generation cross-compiles and the board settles numerics.
+    verify_method=VERIFY_CROSS_COMPILE,
+)
+
+
 RVV_OPU = Backend(
     name="rvv_opu",
     description=(
@@ -433,6 +483,7 @@ BACKENDS: dict[str, Backend] = {
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,
     RVV_OPU.name: RVV_OPU,
+    IME.name: IME,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,
 }
