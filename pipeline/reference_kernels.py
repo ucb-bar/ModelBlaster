@@ -8831,6 +8831,44 @@ void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
         {"M": 16,  "K": 64},    # broader test
     ],
     argtypes_factory=_softmax_s8_argtypes,
+    algorithms=[
+        # This op carried only the synthesized `direct` candidate, so the
+        # curated probe had no named (op, algorithm) pair to look for and
+        # softmax ran the scalar reference inside builds labelled rvv_x60 --
+        # 6.4% of attn_block, and one of the four ops ViNT still needs.
+        # Kernel: kernels/rvv/rvv_softmax_s8_rvv_cached_exp.c
+        AlgorithmCandidate(
+            name="rvv_cached_exp",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The reference calls expf TWICE per element with the SAME "
+                "argument -- once to build the denominator, once to "
+                "quantize. Cache the first pass in a scratch buffer and the "
+                "second reads it back. That is not an approximation: expf is "
+                "a pure function of its argument, so the cached value IS the "
+                "value the second call would have produced, and nothing "
+                "about the arithmetic changes.\n\n"
+                "expf is ~140 cycles on this core and the rest of the row is "
+                "loads and two divides, so halving the transcendental count "
+                "is most of the available win. The cache also makes the "
+                "requantize tail vectorisable, which the two-pass form is "
+                "not.\n\n"
+                "The DENOMINATOR STAYS SCALAR. `sum += expf(...)` is a "
+                "sequential float accumulation and a vector tree reduction "
+                "would add the same terms in a different order -- a few ULP "
+                "different, on a value every output is divided by. The row "
+                "MAXIMUM is vectorised, because max is associative and "
+                "commutative over a total order and reduction shape cannot "
+                "change it.\n\n"
+                "The two divides stay two divides (no reciprocal multiply, "
+                "no folding into one), and roundf is spelled as frm=RMM. The "
+                "scratch is a stack array, not a static one: the thread pool "
+                "runs one worker per hart in a single address space."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -9330,6 +9368,44 @@ void kernel_layernorm_s8(const int8_t *input, const float *gamma,
 """,
     extra_shapes=[{"M": 1, "K": 16}, {"M": 1, "K": 64}, {"M": 4, "K": 128}],
     argtypes_factory=_layernorm_s8_argtypes,
+    algorithms=[
+        # Only the synthesized `direct` candidate existed, so the curated
+        # probe had no named (op, algorithm) pair and layernorm ran the scalar
+        # reference inside builds labelled rvv_x60 -- 13.9% of attn_block, and
+        # one of the four ops ViNT still needs.
+        # Kernel: kernels/rvv/rvv_layernorm_s8_rvv_f64_tail.c
+        AlgorithmCandidate(
+            name="rvv_f64_tail",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "Three passes per row. The first two accumulate mu and var "
+                "as SEQUENTIAL DOUBLE SUMS and must stay scalar: a vector "
+                "tree reduction adds the same terms in a different order, "
+                "and mu and inv then feed every output in the row, so a few "
+                "ULP there moves every element rather than one. RVV's "
+                "ordered reduction (vfredosum) would preserve the order but "
+                "serialises the add chain by construction, so it buys the "
+                "loads and not the adds.\n\n"
+                "The THIRD pass is where the time is and is embarrassingly "
+                "parallel once mu and inv are known -- it also carries the "
+                "kernel's only division, one per element. That is what gets "
+                "vectorised.\n\n"
+                "It is done in DOUBLE, because the reference does. int8 is "
+                "sign-extended 8x to i64 then converted to f64; gamma and "
+                "beta are float32 in memory and are widened to f64 exactly "
+                "as `(double)gamma[k]` does. Doing this pass in float32 "
+                "would be much faster and would be a different answer, which "
+                "defeats the point of a curated kernel: the scheduler's cost "
+                "has to be for code that computes what the model computes.\n\n"
+                "round() is ties-away-from-zero, spelled as frm=RMM around "
+                "the f64->i64 conversion. The divide stays a divide. gamma "
+                "and beta are each optional and the NULL cases skip the "
+                "widening load rather than materialising constants."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
