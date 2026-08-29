@@ -79,16 +79,23 @@ class Backend:
     rtol_override: float | None = None
 
     def resolved_kernel_cflags(self, repo_root: str) -> tuple[str, ...]:
-        """kernel_cflags with `<repo_root>` placeholders substituted.
+        """kernel_cflags with `<repo_root>` and `<gemmini_config>`
+        placeholders substituted.
 
-        Used for backends that need an -isystem / -I path into the
-        vendored driver headers under modelblaster/cores/<backend>/include/
-        — gemmini's the first one. The placeholder is intentional
-        (over hardcoding `${REPO_ROOT}`-prefixed paths) so the
-        Backend definition stays repo-relative and serializable.
+        `<repo_root>` -> absolute repo root.
+        `<gemmini_config>` -> env MODELBLASTER_GEMMINI_CONFIG, default
+        "default16x16". Used by the gemmini backends so a single source
+        tree can build against any snapshotted gemmini_params.h variant
+        in modelblaster/cores/gemmini/include/per_config/<name>/.
         """
-        return tuple(f.replace("<repo_root>", repo_root)
-                     for f in self.kernel_cflags)
+        import os
+        gem_cfg = os.environ.get("MODELBLASTER_GEMMINI_CONFIG", "default16x16")
+        out = []
+        for f in self.kernel_cflags:
+            f = f.replace("<repo_root>", repo_root)
+            f = f.replace("<gemmini_config>", gem_cfg)
+            out.append(f)
+        return tuple(out)
 
 
 SCALAR = Backend(
@@ -373,10 +380,17 @@ GEMMINI = Backend(
     kernel_cflags=(
         "-march=rv64imafdc",
         "-mabi=lp64d",
-        # Two include paths needed:
+        # Per-config gemmini_params.h must come FIRST so its
+        # `include/gemmini_params.h` shadows any default in
+        # cores/gemmini/include/. <gemmini_config> resolves from env
+        # MODELBLASTER_GEMMINI_CONFIG (default: "default16x16").
+        # See modelblaster/validation/config_matrix.json for the
+        # canonical list.
+        "-isystem<repo_root>/modelblaster/cores/gemmini/include/per_config/<gemmini_config>",
+        # Two more include paths:
         #   .../include — so kernels.c's `#include "gemmini.h"` resolves
         #   .../        — so gemmini.h's `#include "include/gemmini_params.h"`
-        #                 and `#include "rocc-software/src/xcustom.h"` resolve
+        #                 and `#include "rocc-software/src/xcustom.h"` resolve.
         # The asymmetric layout is gemmini-rocc-tests' upstream convention.
         "-isystem<repo_root>/cores/gemmini/include",
         "-isystem<repo_root>/cores/gemmini",

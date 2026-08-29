@@ -248,8 +248,19 @@ def _emit_conv(graph, N, IC, IH, IW, OC, KH, KW, backend):
                 {"c0.weight_q": w, "c0.bias_q": b})
 
 
-def _c_array(src, name):
-    m = re.search(rf"\b{name}\[\d+\] = \{{(.*?)\n\}};", src, re.S)
+def _c_array(src, name, backend=None):
+    """Find the emitted array for a LOGICAL weight key.
+
+    `_weight_name` suffixes every symbol with its backend, unconditionally, so
+    that two backends' weights.c cannot define the same non-static symbol with
+    differently-packed data -- a silent wrong answer (max_abs_err=51 on dronet),
+    not a link error, because only one definition ever got compiled in. These
+    tests care which TENSOR was emitted, not how the symbol is spelled, so the
+    suffix is matched here rather than written into every assertion.
+    """
+    pat = rf"\b{name}(?:_{re.escape(backend)})?\[\d+\] = \{{(.*?)\n\}};" \
+        if backend else rf"\b{name}\[\d+\] = \{{(.*?)\n\}};"
+    m = re.search(pat, src, re.S)
     if not m:
         return None
     return np.array([int(x) for x in re.findall(r"-?\d+", m.group(1))],
@@ -287,7 +298,7 @@ class SplitConvUnderPackedWeightLayout(unittest.TestCase):
         packed_parent = np.ascontiguousarray(
             np.transpose(w, (1, 2, 3, 0))).ravel().astype(np.int64)
         for t in range(n):
-            got = _c_array(weights_c, f"probe_c0_weight_q_tile_{t}")
+            got = _c_array(weights_c, f"probe_c0_weight_q_tile_{t}", "rvv_x60")
             self.assertIsNotNone(
                 got, f"no per-tile weight array emitted for tile {t}; the "
                      f"rvv backends pack conv weights IHWOC, where a pointer "
@@ -324,7 +335,7 @@ class SplitConvUnderPackedWeightLayout(unittest.TestCase):
         """A conv weight has one consumer, so once tiles own it the parent is
         dead. Emitting both would double that conv's weight storage."""
         _, weights_c, _ = self._split("rvv_x60", 2)
-        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q"),
+        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q", "rvv_x60"),
                           "parent weight array emitted alongside the tiles")
 
     def test_scalar_backend_keeps_the_pointer_offset_and_no_tile_arrays(self):
@@ -336,9 +347,9 @@ class SplitConvUnderPackedWeightLayout(unittest.TestCase):
         calls = re.findall(r"parallel_conv2d_s8\([^;]*\);", model_c, re.S)
         self.assertEqual(len(calls), 2)
         self.assertIn(f"+ {tile_oc * per_filter}", calls[1])
-        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q_tile_0"),
+        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q_tile_0", "scalar"),
                           "scalar backend should not need per-tile arrays")
-        self.assertIsNotNone(_c_array(weights_c, "probe_c0_weight_q"),
+        self.assertIsNotNone(_c_array(weights_c, "probe_c0_weight_q", "scalar"),
                             "scalar backend must still emit the parent array")
 
     def test_linear_split_is_unaffected_by_conv_packing(self):
@@ -515,13 +526,13 @@ class SplitFusedConvOperands(unittest.TestCase):
         tile_oc = self.OC // n
         w = arrays["c0.weight_q"]
         for t in range(n):
-            got = _c_array(weights_c, f"probe_c0_weight_q_tile_{t}")
+            got = _c_array(weights_c, f"probe_c0_weight_q_tile_{t}", "rvv_x60")
             self.assertIsNotNone(got, f"no per-tile weight array for tile {t}")
             want = np.ascontiguousarray(np.transpose(
                 w[t * tile_oc:(t + 1) * tile_oc], (1, 2, 3, 0))
             ).ravel().astype(np.int64)
             np.testing.assert_array_equal(got, want)
-        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q"),
+        self.assertIsNone(_c_array(weights_c, "probe_c0_weight_q", "rvv_x60"),
                           "parent weight emitted alongside the tiles")
         calls = self._calls(model_c)
         for t, call in enumerate(calls):
@@ -529,7 +540,7 @@ class SplitFusedConvOperands(unittest.TestCase):
             self.assertIn(f"bn_scale + {t * tile_oc}", call,
                           "the 1-D epilogue arrays stay whole and are offset")
         # bn arrays are NOT split into per-tile copies.
-        self.assertIsNone(_c_array(weights_c, "probe_c0_bn_scale_tile_0"))
+        self.assertIsNone(_c_array(weights_c, "probe_c0_bn_scale_tile_0", "rvv_x60"))
 
     def test_pair_fused_conv_takes_the_same_path(self):
         model_c, _, _ = self._split("scalar", 2, kind="conv2d_batchnorm2d_s8")

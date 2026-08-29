@@ -9806,152 +9806,1766 @@ void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih,
 )
 
 
-KERNEL_SPECS: dict[str, KernelSpec] = {
-    "linear": LINEAR,
-    "matmul": MATMUL,
-    "matmul_ta": MATMUL_TA,
-    "matmul_tb": MATMUL_TB,
-    "matmul_tatb": MATMUL_TATB,
-    "bmm": BMM,
-    "relu": RELU,
-    "relu6": RELU6,
-    "elu": ELU,
-    # KernelBench Phase 2 activations.
-    "leaky_relu": LEAKY_RELU,
-    "tanh": TANH,
-    "swish": SWISH,
-    "gelu": GELU,
-    "gelu_exact": GELU_EXACT,
-    "selu": SELU,
-    "hardsigmoid": HARDSIGMOID,
-    "softplus": SOFTPLUS,
-    "softsign": SOFTSIGN,
-    "hardtanh": HARDTANH,
-    # KernelBench Phase 2 reductions over a dim.
-    "sum_dim": SUM_DIM,
-    "mean_dim": MEAN_DIM,
-    "max_dim": MAX_DIM,
-    "min_dim": MIN_DIM,
-    "prod_dim": PROD_DIM,
-    "argmax_dim": ARGMAX_DIM,
-    "argmin_dim": ARGMIN_DIM,
-    # KernelBench Phase 2 norms (subset — see Tier 3 follow-on for the
-    # affine-bearing nn.Module ones).
-    "l1_norm": L1_NORM,
-    "l2_norm": L2_NORM,
-    "frobenius_norm": FROBENIUS_NORM,
-    "conv2d": CONV2D,
-    "conv2d_dw": CONV2D_DW,
-    "maxpool2d": MAXPOOL2D,
-    "adaptive_avg_pool2d": ADAPTIVE_AVG_POOL2D,
-    "add": ADD,
-    "batchnorm2d": BATCHNORM2D,
-    "sigmoid": SIGMOID,
-    "linear_s8": LINEAR_S8,
-    "relu_s8": RELU_S8,
-    "conv2d_s8": CONV2D_S8,
-    "conv2d_silu_s8": CONV2D_SILU_S8,
-    "maxpool2d_s8": MAXPOOL2D_S8,
-    "add_s8": ADD_S8,
-    "batchnorm2d_s8": BATCHNORM2D_S8,
-    "sigmoid_s8": SIGMOID_S8,
-    "relu_f16": RELU_F16,
-    "sigmoid_f16": SIGMOID_F16,
-    "elu_f16": ELU_F16,
-    "batchnorm2d_f16": BATCHNORM2D_F16,
-    "maxpool2d_f16": MAXPOOL2D_F16,
-    "conv2d_f16": CONV2D_F16,
-    "matmul_f16": MATMUL_F16,
-    "matmul_ta_f16": MATMUL_TA_F16,
-    "matmul_tb_f16": MATMUL_TB_F16,
-    "matmul_tatb_f16": MATMUL_TATB_F16,
-    "bmm_f16": BMM_F16,
-    # Mixed-precision i8↔f16 cast kernels (auto-cast pass output).
-    "cast_i8_to_f16": CAST_I8_TO_F16,
-    "cast_f16_to_i8": CAST_F16_TO_I8,
-    # ViNT fp16 op set.
-    "linear_f16": LINEAR_F16,
-    "lstm_f16": LSTM_F16,
-    "depthwise_conv2d_f16": DEPTHWISE_CONV2D_F16,
-    "layer_norm_f16": LAYER_NORM_F16,
-    "gelu_f16": GELU_F16,
-    "softmax_f16": SOFTMAX_F16,
-    "add_f16": ADD_F16,
-    "mul_f16": MUL_F16,
-    "mul_c1_f16": MUL_C1_F16,
-    "mul_c1_s8": MUL_C1_S8,
-    "adaptive_avg_pool2d_f16": ADAPTIVE_AVG_POOL2D_F16,
-    "slice_c_f16": SLICE_C_F16,
-    "cat2_c1_f16": CAT2_C1_F16,
-    "cat3_c1_f16": CAT3_C1_F16,
-    "cat4_c1_f16": CAT4_C1_F16,
-    "pad_f16": PAD_F16,
-    "silu_f16": SILU_F16,
-    "upsample_nearest_f16": UPSAMPLE_NEAREST_F16,
-    # YOLOv8-nano fp32 support.
-    "silu": SILU,
-    "upsample_nearest": UPSAMPLE_NEAREST,
-    "cat2_c1": CAT2_C1,
-    "cat3_c1": CAT3_C1,
-    "cat4_c1": CAT4_C1,
-    # YOLOv8-nano int8 support.
-    "silu_s8": SILU_S8,
-    # mlp_control int8 support (PPO actor uses nn.ELU).
-    "elu_s8": ELU_S8,
-    "leaky_relu_s8": LEAKY_RELU_S8,
-    "avgpool2d_s8": AVGPOOL2D_S8,
-    "lstm_s8": LSTM_S8,
-    "layernorm_s8": LAYERNORM_S8,
-    "rmsnorm_s8": RMSNORM_S8,
-    "sin_s8": SIN_S8,
-    "cos_s8": COS_S8,
-    # Phase 1d pair-fused linear+elu. Eliminates the intermediate-tensor
-    # write/read between consecutive linear_s8 + elu_s8 ops (the mlp_control
-    # chain has three such pairs). LLM-codegen seeds describe rvv_opu
-    # vector-register-resident and gemmini tiled_matmul_auto variants;
-    # reference impl matches kernel_linear_s8 + kernel_elu_s8 bit-exact.
-    "linear_s8_elu_s8": LINEAR_S8_ELU_S8,
-    # Phase E2: yolov8 + dronet hot path — top-1 fusion gap from E1
-    # survey (60 candidate pairs). Eliminates conv→BN intermediate
-    # write/read; BN affine folds into conv's requantize epilogue.
-    "conv2d_batchnorm2d_s8": CONV2D_BATCHNORM2D_S8,
-    # Conv→BN→SiLU triple fusion (yolov8_nano backbone). Folds the whole
-    # Conv block onto one hart in a single dispatch — removes both the
-    # conv→bn and bn→silu standalone dispatches and their cross-core
-    # ping-pong. Emitted directly by extract_graph's int8 activation
-    # absorb pass.
-    "conv2d_batchnorm2d_silu_s8": CONV2D_BATCHNORM2D_SILU_S8,
-    # Phase E2: yolov8 hot path — top-2 fusion gap from E1 survey
-    # (57 candidate pairs). Eliminates the BN→SiLU intermediate
-    # tensor write/read; LUT applied in-register.
-    "batchnorm2d_silu_s8": BATCHNORM2D_SILU_S8,
-    "upsample_nearest_s8": UPSAMPLE_NEAREST_S8,
-    "cat2_c1_s8": CAT2_C1_S8,
-    "cat3_c1_s8": CAT3_C1_S8,
-    "cat4_c1_s8": CAT4_C1_S8,
-    # ViNT int8 support.
-    "mul_s8": MUL_S8,
-    "gelu_s8": GELU_S8,
-    "pad_s8": PAD_S8,
-    "adaptive_avg_pool2d_s8": ADAPTIVE_AVG_POOL2D_S8,
-    "layer_norm_s8": LAYER_NORM_S8,
-    "matmul_s8": MATMUL_S8,
-    "softmax_s8": SOFTMAX_S8,
-    "depthwise_conv2d_s8": DEPTHWISE_CONV2D_S8,
-    "slice_c_s8": SLICE_C_S8,
-    # Per-channel-weight-scale variants (Phase B.2).
-    "conv2d_s8_pc": CONV2D_S8_PC,
-    "linear_s8_pc": LINEAR_S8_PC,
-    "matmul_s8_pc": MATMUL_S8_PC,
-    # Application-specific composite ops. The op-kind family
-    # "app_op_<name>" is reserved for these — codegen looks up the
-    # implementation either in modelblaster/kernels/<backend>/<op>.c (curated)
-    # or generates it via the LLM path using the semantics block in
-    # the IR record. Stock impls below cover the common patterns; a
-    # model-specific spec can override by registering with the same
-    # name.
-    "vint_action_post": VINT_ACTION_POST,
+def _relu6_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, qmax (int8 value of the 6.0 clamp ceiling)
+    return [i8p, i8p, ctypes.c_int, ctypes.c_int]
+
+
+def _lstm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [fp, fp, fp, fp, fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+RELU6_S8 = KernelSpec(
+    op="relu6_s8",
+    signature=("void kernel_relu6_s8(const int8_t *input, int8_t *output, "
+               "int n, int qmax)"),
+    semantics=(
+        "Elementwise ReLU6 on a contiguous int8 buffer with symmetric "
+        "quantization (zero_point = 0, and input/output share the same "
+        "scale s):\n"
+        "  output[i] = clamp(input[i], 0, qmax)  for i in [0, n)\n"
+        "where `qmax` is the int8 encoding of the 6.0 clamp ceiling, i.e. "
+        "qmax = round(6.0 / s) saturated into [1, 127]. Standalone version; "
+        "the ReLU6 activation clamped at 6 that follows conv/bn in "
+        "MobileNet-style blocks."
+    ),
+    reference_impl="""\
+void kernel_relu6_s8(const int8_t *input, int8_t *output, int n, int qmax) {
+    for (int i = 0; i < n; i++) {
+        int v = input[i];
+        if (v < 0) v = 0;
+        if (v > qmax) v = qmax;
+        output[i] = (int8_t)v;
+    }
 }
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 256},
+    ],
+    argtypes_factory=_relu6_s8_argtypes,
+)
+
+
+LSTM = KernelSpec(
+    op="lstm",
+    signature=(
+        "void kernel_lstm(const float *x, const float *w_ih, "
+        "const float *w_hh, const float *bias, "
+        "float *h, float *c, float *out, int in_size, int H)"
+    ),
+    semantics=(
+        "Single-layer, single-timestep fp32 LSTM cell (PyTorch nn.LSTM gate\n"
+        "order: input, forget, cell, output). Recurrence is expressed by\n"
+        "persisting h and c in caller buffers between calls (seq-len-1 unroll).\n"
+        "  x:[in_size] w_ih:[4H,in_size] w_hh:[4H,H] bias:[4H] h:[H] c:[H] out:[H]\n"
+        "per unit j (gate row g = g*H+j):\n"
+        "  pre[g] = x.w_ih[g] + h.w_hh[g] + bias[g*H+j]\n"
+        "  i=sig(pre_i) f=sig(pre_f) g=tanh(pre_g) o=sig(pre_o)\n"
+        "  c' = f*c[j] + i*g;  out[j] = o*tanh(c')\n"
+        "then h[:] = out[:] (deferred so the w_hh GEMM sees the previous h;\n"
+        "out MUST NOT alias h)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm(const float *x, const float *w_ih, const float *w_hh,
+                 const float *bias, float *h, float *c, float *out,
+                 int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const float *wih_row = w_ih + (long)row * in_size;
+            const float *whh_row = w_hh + (long)row * H;
+            float ax = 0.0f, ah = 0.0f;
+            for (int k = 0; k < in_size; k++) ax += x[k] * wih_row[k];
+            for (int k = 0; k < H; k++)       ah += h[k] * whh_row[k];
+            pre[g] = ax + ah + bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * c[j] + ig * cg;
+        c[j]   = c_new;
+        out[j] = og * tanhf(c_new);
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_argtypes,
+)
+
+
+def _softmax_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+SOFTMAX = KernelSpec(
+    op="softmax",
+    signature=(
+        "void kernel_softmax(const float *input, float *output, int M, int K)"
+    ),
+    semantics=(
+        "Row-wise softmax over the last axis of an [M, K] tensor (numerically\n"
+        "stable max-subtract form):\n"
+        "  m_i          = max_k input[i, k]\n"
+        "  e_k          = expf(input[i, k] - m_i)\n"
+        "  output[i, k] = e_k / sum_k e_k\n"
+        "All tensors float32. A tensor whose softmax dim is the last axis maps\n"
+        "here directly (M = product of leading dims, K = last dim)."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_softmax(const float *input, float *output, int M, int K) {
+    for (int m = 0; m < M; m++) {
+        float maxv = input[m*K];
+        for (int k = 1; k < K; k++) {
+            float v = input[m*K + k];
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float e = expf(input[m*K + k] - maxv);
+            output[m*K + k] = e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] *= inv_sum;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 7, "K": 128}],
+    argtypes_factory=_softmax_argtypes,
+)
+
+
+LOG_SOFTMAX = KernelSpec(
+    op="log_softmax",
+    signature=(
+        "void kernel_log_softmax(const float *input, float *output, "
+        "int M, int K)"
+    ),
+    semantics=(
+        "Row-wise log-softmax over the last axis of an [M, K] tensor:\n"
+        "  m_i          = max_k input[i, k]\n"
+        "  lse          = m_i + logf(sum_k expf(input[i, k] - m_i))\n"
+        "  output[i, k] = input[i, k] - lse\n"
+        "Numerically stable log-sum-exp form. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_log_softmax(const float *input, float *output, int M, int K) {
+    for (int m = 0; m < M; m++) {
+        float maxv = input[m*K];
+        for (int k = 1; k < K; k++) {
+            float v = input[m*K + k];
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += expf(input[m*K + k] - maxv);
+        }
+        float lse = maxv + logf(sum);
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] = input[m*K + k] - lse;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 7, "K": 128}],
+    argtypes_factory=_softmax_argtypes,
+)
+
+
+def _avgpool2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW
+    return [fp, fp] + [ctypes.c_int] * 10
+
+
+AVGPOOL2D = KernelSpec(
+    op="avgpool2d",
+    signature=(
+        "void kernel_avgpool2d(const float *input, float *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "2D average pooling matching torch.nn.AvgPool2d with the default\n"
+        "count_include_pad=True (the divisor is always KH*KW; padded cells\n"
+        "contribute 0). nn.AvgPool2d has no dilation.\n"
+        "Layout (NCHW, row-major):\n"
+        "  input:  [N, C, IH, IW]\n"
+        "  output: [N, C, OH, OW]  with\n"
+        "    OH = (IH + 2*PH - KH) / SH + 1\n"
+        "    OW = (IW + 2*PW - KW) / SW + 1\n"
+        "  output[n, c, oh, ow] = (1/(KH*KW)) * sum over kh, kw of\n"
+        "    val(n, c, oh*SH - PH + kh, ow*SW - PW + kw)\n"
+        "  where val(...) is input at that location or 0 out of bounds.\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_avgpool2d(const float *input, float *output,
+                      int N, int C, int IH, int IW,
+                      int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    float inv = 1.0f / (float)(KH * KW);
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            acc += input[((n*C + c)*IH + ih)*IW + iw];
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = acc * inv;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4, "IH": 32, "IW": 32, "KH": 3, "KW": 3, "SH": 3, "SW": 3,
+         "PH": 0, "PW": 0},
+        {"N": 1, "C": 8, "IH": 16, "IW": 16, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_avgpool2d_argtypes,
+)
+
+
+def _layer_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+def _group_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, beta, output, N, C, G, HW, eps
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_float]
+
+
+GROUP_NORM = KernelSpec(
+    op="group_norm",
+    signature=(
+        "void kernel_group_norm(const float *input, const float *gamma, "
+        "const float *beta, float *output, int N, int C, int G, int HW, "
+        "float eps)"
+    ),
+    semantics=(
+        "GroupNorm over an NCHW tensor: the C channels are split into G groups\n"
+        "of C/G channels; mean/variance are computed jointly over the\n"
+        "(C/G) * HW elements of each (sample, group), then applied per element:\n"
+        "  output[n, c, i] = gamma[c] * (input[n, c, i] - mu_{n,g}) / \n"
+        "                    sqrt(var_{n,g} + eps) + beta[c]\n"
+        "with g = c / (C/G). gamma/beta are per-channel float32 buffers of\n"
+        "length C (ones/zeros when the module has no affine). InstanceNorm2d is\n"
+        "the G == C special case. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_group_norm(const float *input, const float *gamma,
+                       const float *beta, float *output,
+                       int N, int C, int G, int HW, float eps) {
+    int cpg = C / G;              /* channels per group */
+    long cnt = (long)cpg * HW;
+    for (int n = 0; n < N; n++) {
+        for (int g = 0; g < G; g++) {
+            float sum = 0.0f, sqsum = 0.0f;
+            for (int cc = 0; cc < cpg; cc++) {
+                int c = g*cpg + cc;
+                const float *p = input + ((long)(n*C + c))*HW;
+                for (int i = 0; i < HW; i++) {
+                    float v = p[i];
+                    sum += v;
+                    sqsum += v * v;
+                }
+            }
+            float mean = sum / (float)cnt;
+            float var  = sqsum / (float)cnt - mean * mean;
+            float inv_sigma = 1.0f / sqrtf(var + eps);
+            for (int cc = 0; cc < cpg; cc++) {
+                int c = g*cpg + cc;
+                float gm = gamma[c], bt = beta[c];
+                const float *p = input + ((long)(n*C + c))*HW;
+                float *o = output + ((long)(n*C + c))*HW;
+                for (int i = 0; i < HW; i++) {
+                    o[i] = gm * (p[i] - mean) * inv_sigma + bt;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 8, "G": 2, "HW": 64, "eps": 1e-5},
+        {"N": 2, "C": 16, "G": 16, "HW": 32, "eps": 1e-5},  # instance-norm case
+    ],
+    argtypes_factory=_group_norm_argtypes,
+)
+
+
+def _rms_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+RMS_NORM = KernelSpec(
+    op="rms_norm",
+    signature=(
+        "void kernel_rms_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner, float eps)"
+    ),
+    semantics=(
+        "RMS normalization over the reduce axis (KernelBench 36 uses dim=1,\n"
+        "keepdim=True, so outer = leading dims, reduce = normalized axis,\n"
+        "inner = trailing dims):\n"
+        "  rms[o, i]           = sqrt(mean_r input[o, r, i]^2 + eps)\n"
+        "  output[o, r, i]     = input[o, r, i] / rms[o, i]\n"
+        "No affine weight (the bench divides by RMS directly). All float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_rms_norm(const float *input, float *output,
+                     int outer, int reduce, int inner, float eps) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float ss = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[((long)(o*reduce + r))*inner + i];
+                ss += v * v;
+            }
+            float inv = 1.0f / sqrtf(ss / (float)reduce + eps);
+            for (int r = 0; r < reduce; r++) {
+                long idx = ((long)(o*reduce + r))*inner + i;
+                output[idx] = input[idx] * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "reduce": 8, "inner": 64, "eps": 1e-5},
+        {"outer": 2, "reduce": 16, "inner": 128, "eps": 1e-5},
+    ],
+    argtypes_factory=_rms_norm_argtypes,
+)
+
+
+def _conv_transpose2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, then 17 ints (N,IC,IH,IW,OC,OH,OW,
+    # KH,KW,SH,SW,PH,PW,DH,DW,G)
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 16
+
+
+CONV_TRANSPOSE2D = KernelSpec(
+    op="conv_transpose2d",
+    signature=(
+        "void kernel_conv_transpose2d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int IH, int IW, int OC, int OH, int OW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "2D transposed convolution (torch.nn.ConvTranspose2d), gather form.\n"
+        "Layout (NCHW):\n"
+        "  input:  [N, IC, IH, IW]\n"
+        "  weight: [IC, OC/G, KH, KW]   (ConvTranspose weight order)\n"
+        "  bias:   [OC] (may be NULL)\n"
+        "  output: [N, OC, OH, OW]\n"
+        "  output_padding is already folded into the caller-supplied OH/OW.\n"
+        "Each output pixel gathers the input pixels that scatter onto it:\n"
+        "  for oc (group g = oc/(OC/G)), oh, ow:\n"
+        "    acc = bias[oc]\n"
+        "    for kh, kw with ih=(oh+PH-kh*DH)/SH, iw=(ow+PW-kw*DW)/SW integral\n"
+        "        and in range, for ic in group g:\n"
+        "      acc += input[n,ic,ih,iw] * weight[ic, oc%(OC/G), kh, kw]\n"
+        "All tensors float32. G is the group count."
+    ),
+    reference_impl="""\
+void kernel_conv_transpose2d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int IH, int IW,
+                             int OC, int OH, int OW,
+                             int KH, int KW, int SH, int SW,
+                             int PH, int PW, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ihs = oh + PH - kh*DH;
+                        if (ihs < 0 || (ihs % SH) != 0) continue;
+                        int ih = ihs / SH;
+                        if (ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iws = ow + PW - kw*DW;
+                            if (iws < 0 || (iws % SW) != 0) continue;
+                            int iw = iws / SW;
+                            if (iw >= IW) continue;
+                            for (int icg = 0; icg < ICpG; icg++) {
+                                int ic = g*ICpG + icg;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* weight [IC,OCpG,KH,KW] packed (1,2,3,0) ->
+                                   [OCpG,KH,KW,IC]. */
+                                float w = weight[((ocg*KH + kh)*KW + kw)*IC + ic];
+#else
+                                float w = weight[((ic*OCpG + ocg)*KH + kh)*KW + kw];
+#endif
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 transposed conv2d over the OUTPUT-CHANNEL "
+                "dimension (gather form). Each output pixel (oc, oh, ow) "
+                "collects the input pixels that scatter onto it: for taps "
+                "(kh, kw), ih=(oh+PH-kh*DH)/SH and iw=(ow+PW-kw*DW)/SW "
+                "contribute only when those divisions are exact and in "
+                "range. Weights are packed IHWOC — torch ConvTranspose "
+                "weight [IC][OCpG][KH][KW] permuted (1,2,3,0) to "
+                "[OCpG][KH][KW][IC], i.e. weight[((ocg*KH+kh)*KW+kw)*IC+ic]. "
+                "For each (n, g, oh, ow) hold a vl-wide vfloat32 accumulator "
+                "(one lane per OC in the group), seed from bias, then for "
+                "every valid (icg, kh, kw) broadcast the input pixel as a "
+                "scalar and fold it in with a single vfmacc.vf. Consecutive "
+                "OC lanes are KH*KW*IC apart in the weight buffer, so the "
+                "per-lane OC weight slab is a strided vlse32; output is NCHW "
+                "so the per-OC store is strided by OH*OW (vsse32). Tail-"
+                "handle OC with vsetvl (VLEN not assumed); groups via an "
+                "outer g loop."
+            ),
+            reference_impl="""\
+void kernel_conv_transpose2d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int IH, int IW,
+                             int OC, int OH, int OW,
+                             int KH, int KW, int SH, int SW,
+                             int PH, int PW, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ihs = oh + PH - kh*DH;
+                        if (ihs < 0 || (ihs % SH) != 0) continue;
+                        int ih = ihs / SH;
+                        if (ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iws = ow + PW - kw*DW;
+                            if (iws < 0 || (iws % SW) != 0) continue;
+                            int iw = iws / SW;
+                            if (iw >= IW) continue;
+                            for (int icg = 0; icg < ICpG; icg++) {
+                                int ic = g*ICpG + icg;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                /* IHWOC: [OCpG][KH][KW][IC]. */
+                                float w = weight[((ocg*KH + kh)*KW + kw)*IC + ic];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
+    extra_shapes=[
+        # basic stride-1
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 6, "OH": 10, "OW": 10,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 0, "PW": 0, "DH": 1, "DW": 1,
+         "G": 1},
+        # strided
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 4, "OH": 17, "OW": 17,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 0, "PW": 0, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv_transpose2d_argtypes,
+)
+
+
+def _conv3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, then 22 ints
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 22
+
+
+CONV3D = KernelSpec(
+    op="conv3d",
+    signature=(
+        "void kernel_conv3d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int ID, int IH, int IW, "
+        "int OC, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "3D convolution (torch.nn.Conv3d). NCDHW layout:\n"
+        "  input:  [N, IC, ID, IH, IW]\n"
+        "  weight: [OC, IC/G, KD, KH, KW]  (5D — not backend-repacked)\n"
+        "  bias:   [OC] (may be NULL)\n"
+        "  output: [N, OC, OD, OH, OW]\n"
+        "  output[n,oc,od,oh,ow] = bias[oc] + sum over kd,kh,kw and ic in\n"
+        "  group(oc) of input[n,ic, od*SD-PD+kd*DD, oh*SH-PH+kh*DH,\n"
+        "  ow*SW-PW+kw*DW] * weight[oc, ic%(IC/G), kd, kh, kw], zero-padded.\n"
+        "All tensors float32; G is the group count, D* are dilations."
+    ),
+    reference_impl="""\
+void kernel_conv3d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int ID, int IH, int IW,
+                   int OC, int OD, int OH, int OW,
+                   int KD, int KH, int KW, int SD, int SH, int SW,
+                   int PD, int PH, int PW, int DD, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd*DD;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh*DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw*DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    for (int icg = 0; icg < ICpG; icg++) {
+                                        int ic = g*ICpG + icg;
+                                        float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                        float w = weight[(((long)(oc*ICpG + icg)*KD + kd)*KH + kh)*KW + kw];
+                                        acc += v * w;
+                                    }
+                                }
+                            }
+                        }
+                        output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 2, "ID": 6, "IH": 6, "IW": 6, "OC": 4, "OD": 4,
+         "OH": 4, "OW": 4, "KD": 3, "KH": 3, "KW": 3, "SD": 1, "SH": 1,
+         "SW": 1, "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv3d_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            # conv3d weights are 5D [OC][IC/G][KD][KH][KW] and are NOT
+            # backend-repacked (_backend_pack_weight only permutes 4D
+            # tensors), so we stay in native OIDHW and reach the OC slab with
+            # a strided load instead of the conv2d IHWOC unit-stride trick.
+            weight_layout="oihw",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 conv3d over the OUTPUT-CHANNEL dimension. "
+                "Weights stay in native OIDHW ([OC][IC/G][KD][KH][KW], OC "
+                "OUTERMOST) because 5D conv weights are not backend-repacked, "
+                "so the OC slab for a fixed (icg, kd, kh, kw) is a STRIDED "
+                "vector load (vlse32) with element stride IC/G*KD*KH*KW. For "
+                "each (n, od, oh, ow) output voxel hold a vl-wide vfloat32 "
+                "accumulator (one lane per OC), seed it from bias (unit-stride "
+                "vle32, OC contiguous), then for every (kd, kh, kw, icg) "
+                "broadcast the input voxel as a scalar and fold it in with a "
+                "single vfmacc.vf. Tail-handle OC with vsetvl (VLEN not "
+                "assumed). Output is NCDHW so the per-OC store is strided by "
+                "OD*OH*OW (vsse32). Groups: slab OC WITHIN a single group so "
+                "the input-channel base never straddles a group boundary."
+            ),
+            reference_impl="""\
+void kernel_conv3d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int ID, int IH, int IW,
+                   int OC, int OD, int OH, int OW,
+                   int KD, int KH, int KW, int SD, int SH, int SW,
+                   int PD, int PH, int PW, int DD, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int g = 0; g < G; g++) {
+            int ic_base = g * ICpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        for (int oc = g*OCpG; oc < (g+1)*OCpG; oc++) {
+                            float acc = bias ? bias[oc] : 0.0f;
+                            for (int kd = 0; kd < KD; kd++) {
+                                int id = od*SD - PD + kd*DD;
+                                if (id < 0 || id >= ID) continue;
+                                for (int kh = 0; kh < KH; kh++) {
+                                    int ih = oh*SH - PH + kh*DH;
+                                    if (ih < 0 || ih >= IH) continue;
+                                    for (int kw = 0; kw < KW; kw++) {
+                                        int iw = ow*SW - PW + kw*DW;
+                                        if (iw < 0 || iw >= IW) continue;
+                                        for (int icg = 0; icg < ICpG; icg++) {
+                                            int ic = ic_base + icg;
+                                            float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                            /* OIDHW weight, OC outermost. */
+                                            float w = weight[(((long)(oc*ICpG + icg)*KD + kd)*KH + kh)*KW + kw];
+                                            acc += v * w;
+                                        }
+                                    }
+                                }
+                            }
+                            output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
+)
+
+
+CONV_TRANSPOSE3D = KernelSpec(
+    op="conv_transpose3d",
+    signature=(
+        "void kernel_conv_transpose3d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int ID, int IH, int IW, "
+        "int OC, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "3D transposed convolution (torch.nn.ConvTranspose3d), gather form.\n"
+        "NCDHW; weight [IC, OC/G, KD, KH, KW] (5D, not repacked). OD/OH/OW\n"
+        "already include output_padding. Each output voxel gathers the inputs\n"
+        "that scatter onto it: for kd,kh,kw with id=(od+PD-kd*DD)/SD etc.\n"
+        "integral and in range, acc += input[n,ic,id,ih,iw] *\n"
+        "weight[ic, oc%(OC/G), kd, kh, kw]. bias may be NULL. float32."
+    ),
+    reference_impl="""\
+void kernel_conv_transpose3d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int ID, int IH, int IW,
+                             int OC, int OD, int OH, int OW,
+                             int KD, int KH, int KW, int SD, int SH, int SW,
+                             int PD, int PH, int PW, int DD, int DH, int DW,
+                             int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int ids = od + PD - kd*DD;
+                            if (ids < 0 || (ids % SD) != 0) continue;
+                            int id = ids / SD;
+                            if (id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ihs = oh + PH - kh*DH;
+                                if (ihs < 0 || (ihs % SH) != 0) continue;
+                                int ih = ihs / SH;
+                                if (ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iws = ow + PW - kw*DW;
+                                    if (iws < 0 || (iws % SW) != 0) continue;
+                                    int iw = iws / SW;
+                                    if (iw >= IW) continue;
+                                    for (int icg = 0; icg < ICpG; icg++) {
+                                        int ic = g*ICpG + icg;
+                                        float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                        float w = weight[(((long)(ic*OCpG + ocg)*KD + kd)*KH + kh)*KW + kw];
+                                        acc += v * w;
+                                    }
+                                }
+                            }
+                        }
+                        output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 2, "ID": 4, "IH": 4, "IW": 4, "OC": 4, "OD": 6,
+         "OH": 6, "OW": 6, "KD": 3, "KH": 3, "KW": 3, "SD": 1, "SH": 1,
+         "SW": 1, "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv3d_argtypes,
+)
+
+
+def _maxpool3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, then 20 ints
+    return [fp, fp] + [ctypes.c_int] * 20
+
+
+MAXPOOL3D = KernelSpec(
+    op="maxpool3d",
+    signature=(
+        "void kernel_maxpool3d(const float *input, float *output, "
+        "int N, int C, int ID, int IH, int IW, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW)"
+    ),
+    semantics=(
+        "3D max pooling (torch.nn.MaxPool3d) over NCDHW, with padding and\n"
+        "dilation. Out-of-bounds taps never win the max (treated as -inf).\n"
+        "  output[n,c,od,oh,ow] = max over kd,kh,kw of\n"
+        "    input[n,c, od*SD-PD+kd*DD, oh*SH-PH+kh*DH, ow*SW-PW+kw*DW].\n"
+        "float32."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_maxpool3d(const float *input, float *output,
+                      int N, int C, int ID, int IH, int IW,
+                      int OD, int OH, int OW,
+                      int KD, int KH, int KW, int SD, int SH, int SW,
+                      int PD, int PH, int PW, int DD, int DH, int DW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float m = -FLT_MAX;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd*DD;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh*DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw*DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    float v = input[(((long)(n*C + c)*ID + id)*IH + ih)*IW + iw];
+                                    if (v > m) m = v;
+                                }
+                            }
+                        }
+                        output[(((long)(n*C + c)*OD + od)*OH + oh)*OW + ow] = m;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 2, "ID": 8, "IH": 8, "IW": 8, "OD": 4, "OH": 4,
+         "OW": 4, "KD": 2, "KH": 2, "KW": 2, "SD": 2, "SH": 2, "SW": 2,
+         "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1},
+    ],
+    argtypes_factory=_maxpool3d_argtypes,
+)
+
+
+def _avgpool3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, then 17 ints
+    return [fp, fp] + [ctypes.c_int] * 17
+
+
+AVGPOOL3D = KernelSpec(
+    op="avgpool3d",
+    signature=(
+        "void kernel_avgpool3d(const float *input, float *output, "
+        "int N, int C, int ID, int IH, int IW, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW)"
+    ),
+    semantics=(
+        "3D average pooling (torch.nn.AvgPool3d), count_include_pad=True\n"
+        "(divisor KD*KH*KW; padded cells contribute 0), no dilation. NCDHW.\n"
+        "  output[n,c,od,oh,ow] = (1/(KD*KH*KW)) * sum over kd,kh,kw of\n"
+        "    input[n,c, od*SD-PD+kd, oh*SH-PH+kh, ow*SW-PW+kw]. float32."
+    ),
+    reference_impl="""\
+void kernel_avgpool3d(const float *input, float *output,
+                      int N, int C, int ID, int IH, int IW,
+                      int OD, int OH, int OW,
+                      int KD, int KH, int KW, int SD, int SH, int SW,
+                      int PD, int PH, int PW) {
+    float inv = 1.0f / (float)(KD * KH * KW);
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    acc += input[(((long)(n*C + c)*ID + id)*IH + ih)*IW + iw];
+                                }
+                            }
+                        }
+                        output[(((long)(n*C + c)*OD + od)*OH + oh)*OW + ow] = acc * inv;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 2, "ID": 8, "IH": 8, "IW": 8, "OD": 4, "OH": 4,
+         "OW": 4, "KD": 2, "KH": 2, "KW": 2, "SD": 2, "SH": 2, "SW": 2,
+         "PD": 0, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_avgpool3d_argtypes,
+)
+
+
+def _tri_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+TRIU = KernelSpec(
+    op="triu",
+    signature=(
+        "void kernel_triu(const float *input, float *output, "
+        "int M, int N, int diagonal)"
+    ),
+    semantics=(
+        "Upper-triangular mask (torch.triu) of an [M, N] matrix: keep elements\n"
+        "on and above the k-th diagonal, zero the rest.\n"
+        "  output[i, j] = input[i, j] if j >= i + diagonal else 0\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_triu(const float *input, float *output, int M, int N, int diagonal) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            output[i*N + j] = (j >= i + diagonal) ? input[i*N + j] : 0.0f;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 8, "N": 8, "diagonal": 0}],
+    argtypes_factory=_tri_argtypes,
+)
+
+
+TRIL = KernelSpec(
+    op="tril",
+    signature=(
+        "void kernel_tril(const float *input, float *output, "
+        "int M, int N, int diagonal)"
+    ),
+    semantics=(
+        "Lower-triangular mask (torch.tril) of an [M, N] matrix: keep elements\n"
+        "on and below the k-th diagonal, zero the rest.\n"
+        "  output[i, j] = input[i, j] if j <= i + diagonal else 0\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_tril(const float *input, float *output, int M, int N, int diagonal) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            output[i*N + j] = (j <= i + diagonal) ? input[i*N + j] : 0.0f;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 8, "N": 8, "diagonal": 0}],
+    argtypes_factory=_tri_argtypes,
+)
+
+
+def _diag_matmul_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+DIAG_MATMUL = KernelSpec(
+    op="diag_matmul",
+    signature=(
+        "void kernel_diag_matmul(const float *a, const float *b, "
+        "float *output, int N, int M)"
+    ),
+    semantics=(
+        "diag(a) @ b, where a is a 1D vector of length N and b is [N, M]:\n"
+        "  output[i, j] = a[i] * b[i, j]\n"
+        "i.e. row-wise scaling of b by a (torch.diag(A) @ B, KernelBench 12).\n"
+        "The N×N diagonal matrix is never materialized. float32."
+    ),
+    reference_impl="""\
+void kernel_diag_matmul(const float *a, const float *b, float *output,
+                        int N, int M) {
+    for (int i = 0; i < N; i++) {
+        float ai = a[i];
+        for (int j = 0; j < M; j++) {
+            output[i*M + j] = ai * b[i*M + j];
+        }
+    }
+}
+""",
+    extra_shapes=[{"N": 8, "M": 16}],
+    argtypes_factory=_diag_matmul_argtypes,
+)
+
+
+def _scan_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+CUMSUM = KernelSpec(
+    op="cumsum",
+    signature=(
+        "void kernel_cumsum(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Cumulative sum along the scan axis (torch.cumsum). The tensor is\n"
+        "viewed as [outer, axis, inner] (outer = product of dims before the\n"
+        "scan dim, inner = product of dims after):\n"
+        "  output[o, a, i] = sum over a' in [0, a] of input[o, a', i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_cumsum(const float *input, float *output,
+                   int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 0.0f;
+            for (int a = 0; a < axis; a++) {
+                long idx = ((long)(o*axis + a))*inner + i;
+                acc += input[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+CUMPROD = KernelSpec(
+    op="cumprod",
+    signature=(
+        "void kernel_cumprod(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Cumulative product along the scan axis (torch.cumprod), viewed as\n"
+        "[outer, axis, inner]:\n"
+        "  output[o, a, i] = product over a' in [0, a] of input[o, a', i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_cumprod(const float *input, float *output,
+                    int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 1.0f;
+            for (int a = 0; a < axis; a++) {
+                long idx = ((long)(o*axis + a))*inner + i;
+                acc *= input[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+FLIP = KernelSpec(
+    op="flip",
+    signature=(
+        "void kernel_flip(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Reverse along one axis (torch.flip / Tensor.flip), viewed as\n"
+        "[outer, axis, inner]:\n"
+        "  output[o, a, i] = input[o, axis-1-a, i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_flip(const float *input, float *output,
+                 int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int a = 0; a < axis; a++) {
+            for (int i = 0; i < inner; i++) {
+                output[((long)(o*axis + a))*inner + i] =
+                    input[((long)(o*axis + (axis-1-a)))*inner + i];
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+def _excl_cumsum_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+EXCLUSIVE_CUMSUM = KernelSpec(
+    op="exclusive_cumsum",
+    signature=(
+        "void kernel_exclusive_cumsum(const float *x, float *output, "
+        "int Bout, int N)"
+    ),
+    semantics=(
+        "Exclusive cumulative sum with a leading zero, as computed by\n"
+        "KernelBench 92: cat([zeros, x], dim=1)[:-1] then cumsum(dim=1).\n"
+        "x is [B, N]; the [:-1] drops the last row (dim 0), so the output is\n"
+        "[Bout, N+1] with Bout = B-1. For each kept row b:\n"
+        "  output[b, 0] = 0;  output[b, k] = sum_{j<k} x[b, j]  (k=1..N)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_exclusive_cumsum(const float *x, float *output, int Bout, int N) {
+    for (int b = 0; b < Bout; b++) {
+        float acc = 0.0f;
+        for (int k = 0; k <= N; k++) {
+            output[(long)b*(N+1) + k] = acc;
+            if (k < N) acc += x[(long)b*N + k];
+        }
+    }
+}
+""",
+    extra_shapes=[{"Bout": 4, "N": 16}],
+    argtypes_factory=_excl_cumsum_argtypes,
+)
+
+
+def _pointwise2_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int]
+
+
+def _mul_scalar_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+MUL_SCALAR = KernelSpec(
+    op="mul_scalar",
+    signature="void kernel_mul_scalar(const float *input, float *output, int n, float s)",
+    semantics=(
+        "Multiply a tensor by a compile-time scalar constant (KernelBench 5,\n"
+        "A * s with s a Python float bound at extract time):\n"
+        "  output[i] = input[i] * s   for i in [0, n)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_mul_scalar(const float *input, float *output, int n, float s) {
+    for (int i = 0; i < n; i++) output[i] = input[i] * s;
+}
+""",
+    extra_shapes=[{"n": 64, "s": 1.0}],
+    argtypes_factory=_mul_scalar_argtypes,
+)
+
+
+MUL = KernelSpec(
+    op="mul",
+    signature=(
+        "void kernel_mul(const float *a, const float *b, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise multiply of two equal-shaped tensors:\n"
+        "  output[i] = a[i] * b[i]   for i in [0, n)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_mul(const float *a, const float *b, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = a[i] * b[i];
+    }
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_pointwise2_argtypes,
+)
+
+
+MEAN_ABS_NORM = KernelSpec(
+    op="mean_abs_norm",
+    signature=(
+        "void kernel_mean_abs_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "L1 normalization (KernelBench 38): divide by the mean absolute value\n"
+        "over the reduce axis (dim=1, keepdim=True), viewed as\n"
+        "[outer, reduce, inner]:\n"
+        "  denom[o, i]      = (1/reduce) * sum_r |input[o, r, i]|\n"
+        "  output[o, r, i]  = input[o, r, i] / denom[o, i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_mean_abs_norm(const float *input, float *output,
+                          int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float s = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                s += fabsf(input[((long)(o*reduce + r))*inner + i]);
+            }
+            float denom = s / (float)reduce;
+            for (int r = 0; r < reduce; r++) {
+                long idx = ((long)(o*reduce + r))*inner + i;
+                output[idx] = input[idx] / denom;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "reduce": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+LAYER_NORM = KernelSpec(
+    op="layer_norm",
+    signature=(
+        "void kernel_layer_norm(const float *input, const float *gamma, "
+        "const float *beta, float *output, int M, int K, float eps)"
+    ),
+    semantics=(
+        "LayerNorm over the last axis of an [M, K] tensor (K = product of the\n"
+        "normalized_shape dims, M = product of the leading dims):\n"
+        "  mu     = mean(input[m, :])\n"
+        "  sigma  = sqrt(var(input[m, :]) + eps)\n"
+        "  output[m, k] = gamma[k] * (input[m, k] - mu) / sigma + beta[k]\n"
+        "gamma and beta are float32 buffers of length K. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_layer_norm(const float *input, const float *gamma,
+                       const float *beta, float *output,
+                       int M, int K, float eps) {
+    for (int m = 0; m < M; m++) {
+        float sum = 0.0f, sqsum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float v = input[m*K + k];
+            sum += v;
+            sqsum += v * v;
+        }
+        float mean = sum / (float)K;
+        float var  = sqsum / (float)K - mean * mean;
+        float inv_sigma = 1.0f / sqrtf(var + eps);
+        for (int k = 0; k < K; k++) {
+            float v = input[m*K + k];
+            output[m*K + k] = gamma[k] * (v - mean) * inv_sigma + beta[k];
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 16, "eps": 1e-5},
+        {"M": 7, "K": 512, "eps": 1e-5},
+    ],
+    argtypes_factory=_layer_norm_argtypes,
+)
+
+
+def _loss2_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int]
+
+
+MSE_LOSS = KernelSpec(
+    op="mse_loss",
+    signature="void kernel_mse_loss(const float *a, const float *b, float *output, int n)",
+    semantics=(
+        "Mean squared error (KernelBench 94, mean((a-b)^2)):\n"
+        "  output[0] = (1/n) * sum_i (a[i] - b[i])^2\n"
+        "float32; output is a single scalar."
+    ),
+    reference_impl="""\
+void kernel_mse_loss(const float *a, const float *b, float *output, int n) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float d = a[i] - b[i];
+        acc += (double)d * d;
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_loss2_argtypes,
+)
+
+
+def _huber_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+HUBER_LOSS = KernelSpec(
+    op="huber_loss",
+    signature=(
+        "void kernel_huber_loss(const float *a, const float *b, float *output, "
+        "int n, float beta)"
+    ),
+    semantics=(
+        "Smooth-L1 / Huber loss (F.smooth_l1_loss, reduction=mean; KernelBench\n"
+        "96). Per element with d = a-b: 0.5*d^2/beta if |d| < beta, else\n"
+        "|d| - 0.5*beta. output[0] = mean over n. beta defaults to 1.0. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_huber_loss(const float *a, const float *b, float *output,
+                       int n, float beta) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        acc += (d < beta) ? (0.5 * d * d / beta) : (d - 0.5 * beta);
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64, "beta": 1.0}],
+    argtypes_factory=_huber_argtypes,
+)
+
+
+def _hinge_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+HINGE_LOSS = KernelSpec(
+    op="hinge_loss",
+    signature=(
+        "void kernel_hinge_loss(const float *pred, const float *targ, "
+        "float *output, int n, int targ_len)"
+    ),
+    semantics=(
+        "Hinge loss (KernelBench 100, mean(clamp(1 - pred*targ, min=0))):\n"
+        "  output[0] = (1/n) * sum_i max(0, 1 - pred[i]*targ[i % targ_len])\n"
+        "targ broadcasts over pred (targ_len == n for no broadcast, or a\n"
+        "divisor of n — e.g. 1 for a per-batch scalar). targ is expected in\n"
+        "{-1, +1}. float32; scalar output."
+    ),
+    reference_impl="""\
+void kernel_hinge_loss(const float *pred, const float *targ, float *output,
+                       int n, int targ_len) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float h = 1.0f - pred[i] * targ[i % targ_len];
+        if (h > 0.0f) acc += h;
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64, "targ_len": 64}],
+    argtypes_factory=_hinge_argtypes,
+)
+
+
+def _ce_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+CROSS_ENTROPY_LOSS = KernelSpec(
+    op="cross_entropy_loss",
+    signature=(
+        "void kernel_cross_entropy_loss(const float *logits, "
+        "const float *targets, float *output, int N, int C)"
+    ),
+    semantics=(
+        "Cross-entropy loss (F.cross_entropy, reduction=mean; KernelBench 95).\n"
+        "logits is [N, C]; targets are N class indices passed as floats (cast\n"
+        "to int). loss_i = logsumexp(logits[i,:]) - logits[i, t_i].\n"
+        "output[0] = mean_i loss_i. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_cross_entropy_loss(const float *logits, const float *targets,
+                               float *output, int N, int C) {
+    double total = 0.0;
+    for (int i = 0; i < N; i++) {
+        const float *row = logits + (long)i * C;
+        float maxv = row[0];
+        for (int c = 1; c < C; c++) if (row[c] > maxv) maxv = row[c];
+        float sum = 0.0f;
+        for (int c = 0; c < C; c++) sum += expf(row[c] - maxv);
+        float lse = maxv + logf(sum);
+        int t = (int)(targets[i] + 0.5f);
+        total += (double)(lse - row[t]);
+    }
+    output[0] = (float)(total / (double)N);
+}
+""",
+    extra_shapes=[{"N": 4, "C": 8}],
+    argtypes_factory=_ce_argtypes,
+)
+
+
+KLDIV_LOSS = KernelSpec(
+    op="kldiv_loss",
+    signature=(
+        "void kernel_kldiv_loss(const float *log_input, const float *target, "
+        "float *output, int N, int C)"
+    ),
+    semantics=(
+        "KL divergence, reduction='batchmean' (F.kl_div; KernelBench 98). The\n"
+        "first arg is already log(pred). Over an [N, C] tensor:\n"
+        "  output[0] = (1/N) * sum_{i,c} target*(log(target) - log_input)\n"
+        "target*log(target) is taken as 0 where target == 0. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_kldiv_loss(const float *log_input, const float *target,
+                       float *output, int N, int C) {
+    double acc = 0.0;
+    long total = (long)N * C;
+    for (long i = 0; i < total; i++) {
+        float t = target[i];
+        if (t > 0.0f) acc += (double)t * (logf(t) - log_input[i]);
+    }
+    output[0] = (float)(acc / (double)N);
+}
+""",
+    extra_shapes=[{"N": 4, "C": 8}],
+    argtypes_factory=_ce_argtypes,
+)
+
+
+def _triplet_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+TRIPLET_LOSS = KernelSpec(
+    op="triplet_loss",
+    signature=(
+        "void kernel_triplet_loss(const float *anchor, const float *pos, "
+        "const float *neg, float *output, int B, int F, float margin)"
+    ),
+    semantics=(
+        "Triplet margin loss (nn.TripletMarginLoss, p=2, reduction=mean;\n"
+        "KernelBench 99). Per sample b over F features:\n"
+        "  dp = ||anchor_b - pos_b||_2,  dn = ||anchor_b - neg_b||_2\n"
+        "  loss_b = max(0, dp - dn + margin)\n"
+        "output[0] = mean_b loss_b. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_triplet_loss(const float *anchor, const float *pos,
+                         const float *neg, float *output,
+                         int B, int F, float margin) {
+    double total = 0.0;
+    for (int b = 0; b < B; b++) {
+        const float *a = anchor + (long)b * F;
+        const float *p = pos + (long)b * F;
+        const float *n = neg + (long)b * F;
+        float sp = 0.0f, sn = 0.0f;
+        for (int f = 0; f < F; f++) {
+            float dp = a[f] - p[f];
+            float dn = a[f] - n[f];
+            sp += dp * dp;
+            sn += dn * dn;
+        }
+        float loss = sqrtf(sp) - sqrtf(sn) + margin;
+        if (loss > 0.0f) total += (double)loss;
+    }
+    output[0] = (float)(total / (double)B);
+}
+""",
+    extra_shapes=[{"B": 4, "F": 16, "margin": 1.0}],
+    argtypes_factory=_triplet_argtypes,
+)
+
+
+def _log_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+LOG = KernelSpec(
+    op="log",
+    signature="void kernel_log(const float *input, float *output, int n)",
+    semantics="Elementwise natural log: output[i] = logf(input[i]). float32.",
+    reference_impl="""\
+#include <math.h>
+
+void kernel_log(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) output[i] = logf(input[i]);
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_log_argtypes,
+)
+
+
+def _sdpa_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+SDPA = KernelSpec(
+    op="sdpa",
+    signature=(
+        "void kernel_sdpa(const float *Q, const float *K, const float *V, "
+        "float *output, int BH, int S, int D)"
+    ),
+    semantics=(
+        "Scaled dot-product attention (F.scaled_dot_product_attention, no mask,\n"
+        "no dropout; KernelBench 97). Q/K/V are [B, H, S, D] viewed as BH=B*H\n"
+        "independent [S, D] attentions:\n"
+        "  scores = (Q @ K^T) / sqrt(D)      [S, S]\n"
+        "  P      = softmax(scores, axis=-1)\n"
+        "  output = P @ V                    [S, D]\n"
+        "Math in fp32. A per-row scores[S] scratch buffer is used."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_sdpa(const float *Q, const float *K, const float *V,
+                 float *output, int BH, int S, int D) {
+    float scale = 1.0f / sqrtf((float)D);
+    for (int bh = 0; bh < BH; bh++) {
+        const float *Qb = Q + (long)bh * S * D;
+        const float *Kb = K + (long)bh * S * D;
+        const float *Vb = V + (long)bh * S * D;
+        float *Ob = output + (long)bh * S * D;
+        float scores[S];
+        for (int i = 0; i < S; i++) {
+            const float *qi = Qb + (long)i * D;
+            float smax = -3.402823e38f;
+            for (int j = 0; j < S; j++) {
+                const float *kj = Kb + (long)j * D;
+                float s = 0.0f;
+                for (int d = 0; d < D; d++) s += qi[d] * kj[d];
+                s *= scale;
+                scores[j] = s;
+                if (s > smax) smax = s;
+            }
+            float sum = 0.0f;
+            for (int j = 0; j < S; j++) {
+                scores[j] = expf(scores[j] - smax);
+                sum += scores[j];
+            }
+            float inv = 1.0f / sum;
+            float *oi = Ob + (long)i * D;
+            for (int d = 0; d < D; d++) {
+                float acc = 0.0f;
+                for (int j = 0; j < S; j++) acc += scores[j] * Vb[(long)j * D + d];
+                oi[d] = acc * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"BH": 2, "S": 8, "D": 16}],
+    argtypes_factory=_sdpa_argtypes,
+)
+
+
+KERNEL_SPECS: dict[str, KernelSpec] = {
+    'linear': LINEAR,
+    'matmul': MATMUL,
+    'matmul_ta': MATMUL_TA,
+    'matmul_tb': MATMUL_TB,
+    'matmul_tatb': MATMUL_TATB,
+    'bmm': BMM,
+    'relu': RELU,
+    'relu6': RELU6,
+    'elu': ELU,
+    'leaky_relu': LEAKY_RELU,
+    'tanh': TANH,
+    'swish': SWISH,
+    'gelu': GELU,
+    'gelu_exact': GELU_EXACT,
+    'selu': SELU,
+    'hardsigmoid': HARDSIGMOID,
+    'softplus': SOFTPLUS,
+    'softsign': SOFTSIGN,
+    'hardtanh': HARDTANH,
+    'sum_dim': SUM_DIM,
+    'mean_dim': MEAN_DIM,
+    'max_dim': MAX_DIM,
+    'min_dim': MIN_DIM,
+    'prod_dim': PROD_DIM,
+    'argmax_dim': ARGMAX_DIM,
+    'argmin_dim': ARGMIN_DIM,
+    'l1_norm': L1_NORM,
+    'l2_norm': L2_NORM,
+    'frobenius_norm': FROBENIUS_NORM,
+    'conv2d': CONV2D,
+    'conv2d_dw': CONV2D_DW,
+    'maxpool2d': MAXPOOL2D,
+    'adaptive_avg_pool2d': ADAPTIVE_AVG_POOL2D,
+    'add': ADD,
+    'batchnorm2d': BATCHNORM2D,
+    'sigmoid': SIGMOID,
+    'linear_s8': LINEAR_S8,
+    'relu_s8': RELU_S8,
+    'conv2d_s8': CONV2D_S8,
+    'conv2d_silu_s8': CONV2D_SILU_S8,
+    'maxpool2d_s8': MAXPOOL2D_S8,
+    'add_s8': ADD_S8,
+    'batchnorm2d_s8': BATCHNORM2D_S8,
+    'sigmoid_s8': SIGMOID_S8,
+    'relu_f16': RELU_F16,
+    'sigmoid_f16': SIGMOID_F16,
+    'elu_f16': ELU_F16,
+    'batchnorm2d_f16': BATCHNORM2D_F16,
+    'maxpool2d_f16': MAXPOOL2D_F16,
+    'conv2d_f16': CONV2D_F16,
+    'matmul_f16': MATMUL_F16,
+    'matmul_ta_f16': MATMUL_TA_F16,
+    'matmul_tb_f16': MATMUL_TB_F16,
+    'matmul_tatb_f16': MATMUL_TATB_F16,
+    'bmm_f16': BMM_F16,
+    'cast_i8_to_f16': CAST_I8_TO_F16,
+    'cast_f16_to_i8': CAST_F16_TO_I8,
+    'linear_f16': LINEAR_F16,
+    'lstm_f16': LSTM_F16,
+    'depthwise_conv2d_f16': DEPTHWISE_CONV2D_F16,
+    'layer_norm_f16': LAYER_NORM_F16,
+    'gelu_f16': GELU_F16,
+    'softmax_f16': SOFTMAX_F16,
+    'add_f16': ADD_F16,
+    'mul_f16': MUL_F16,
+    'mul_c1_f16': MUL_C1_F16,
+    'mul_c1_s8': MUL_C1_S8,
+    'adaptive_avg_pool2d_f16': ADAPTIVE_AVG_POOL2D_F16,
+    'slice_c_f16': SLICE_C_F16,
+    'cat2_c1_f16': CAT2_C1_F16,
+    'cat3_c1_f16': CAT3_C1_F16,
+    'cat4_c1_f16': CAT4_C1_F16,
+    'pad_f16': PAD_F16,
+    'silu_f16': SILU_F16,
+    'upsample_nearest_f16': UPSAMPLE_NEAREST_F16,
+    'silu': SILU,
+    'upsample_nearest': UPSAMPLE_NEAREST,
+    'cat2_c1': CAT2_C1,
+    'cat3_c1': CAT3_C1,
+    'cat4_c1': CAT4_C1,
+    'silu_s8': SILU_S8,
+    'elu_s8': ELU_S8,
+    'leaky_relu_s8': LEAKY_RELU_S8,
+    'avgpool2d_s8': AVGPOOL2D_S8,
+    'lstm_s8': LSTM_S8,
+    'layernorm_s8': LAYERNORM_S8,
+    'rmsnorm_s8': RMSNORM_S8,
+    'sin_s8': SIN_S8,
+    'cos_s8': COS_S8,
+    'linear_s8_elu_s8': LINEAR_S8_ELU_S8,
+    'conv2d_batchnorm2d_s8': CONV2D_BATCHNORM2D_S8,
+    'conv2d_batchnorm2d_silu_s8': CONV2D_BATCHNORM2D_SILU_S8,
+    'batchnorm2d_silu_s8': BATCHNORM2D_SILU_S8,
+    'upsample_nearest_s8': UPSAMPLE_NEAREST_S8,
+    'cat2_c1_s8': CAT2_C1_S8,
+    'cat3_c1_s8': CAT3_C1_S8,
+    'cat4_c1_s8': CAT4_C1_S8,
+    'mul_s8': MUL_S8,
+    'gelu_s8': GELU_S8,
+    'pad_s8': PAD_S8,
+    'adaptive_avg_pool2d_s8': ADAPTIVE_AVG_POOL2D_S8,
+    'layer_norm_s8': LAYER_NORM_S8,
+    'matmul_s8': MATMUL_S8,
+    'softmax_s8': SOFTMAX_S8,
+    'depthwise_conv2d_s8': DEPTHWISE_CONV2D_S8,
+    'slice_c_s8': SLICE_C_S8,
+    'conv2d_s8_pc': CONV2D_S8_PC,
+    'linear_s8_pc': LINEAR_S8_PC,
+    'matmul_s8_pc': MATMUL_S8_PC,
+    'vint_action_post': VINT_ACTION_POST,
+    'avgpool2d': AVGPOOL2D,
+    'softmax': SOFTMAX,
+    'log_softmax': LOG_SOFTMAX,
+    'layer_norm': LAYER_NORM,
+    'group_norm': GROUP_NORM,
+    'rms_norm': RMS_NORM,
+    'conv_transpose2d': CONV_TRANSPOSE2D,
+    'conv3d': CONV3D,
+    'conv_transpose3d': CONV_TRANSPOSE3D,
+    'maxpool3d': MAXPOOL3D,
+    'avgpool3d': AVGPOOL3D,
+    'triu': TRIU,
+    'tril': TRIL,
+    'diag_matmul': DIAG_MATMUL,
+    'cumsum': CUMSUM,
+    'cumprod': CUMPROD,
+    'flip': FLIP,
+    'exclusive_cumsum': EXCLUSIVE_CUMSUM,
+    'mul': MUL,
+    'mul_scalar': MUL_SCALAR,
+    'mean_abs_norm': MEAN_ABS_NORM,
+    'mse_loss': MSE_LOSS,
+    'huber_loss': HUBER_LOSS,
+    'hinge_loss': HINGE_LOSS,
+    'cross_entropy_loss': CROSS_ENTROPY_LOSS,
+    'kldiv_loss': KLDIV_LOSS,
+    'triplet_loss': TRIPLET_LOSS,
+    'log': LOG,
+    'sdpa': SDPA,
+    'lstm': LSTM,
+    'relu6_s8': RELU6_S8,
+}
+
+
+def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec.
+
+    The transformation is purely mechanical: rename kernel_<op> -> kernel_<op>_f16
+    and change every float POINTER (`const float *` / `float *`, in both the
+    signature and the body's pointer locals) to `_Float16 *`. Scalar `float`
+    params (eps, scale, beta, margin) and `float` locals / `(float)` casts stay
+    — loads widen `_Float16`->float and stores narrow float->`_Float16`
+    implicitly, so the math still runs in fp32. Mirrors the hand-written _f16
+    kernels (relu_f16, softmax_f16, ...)."""
+    import ctypes
+
+    def _c(s: str) -> str:
+        s = s.replace("const float *", "const _Float16 *")
+        s = s.replace("float *", "_Float16 *")
+        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}_f16(")
+        return s
+
+    _fp = ctypes.POINTER(ctypes.c_float)
+    _hp = ctypes.POINTER(ctypes.c_uint16)  # _Float16 has no ctypes type; use u16
+
+    def _argtypes(_orig=spec.argtypes_factory):
+        if _orig is None:
+            return None
+        return [_hp if a is _fp else a for a in _orig()]
+
+    return KernelSpec(
+        op=spec.op + "_f16",
+        signature=_c(spec.signature),
+        semantics="(fp16) " + spec.semantics,
+        reference_impl=_c(spec.reference_impl),
+        extra_shapes=list(spec.extra_shapes),
+        argtypes_factory=(None if spec.argtypes_factory is None else _argtypes),
+    )
+
+
+for _op_name in list(KERNEL_SPECS):
+    if _op_name.endswith("_f16") or _op_name.endswith("_s8"):
+        continue
+    if _op_name.startswith("cast_"):
+        continue
+    _f16_name = _op_name + "_f16"
+    if _f16_name not in KERNEL_SPECS:
+        KERNEL_SPECS[_f16_name] = _make_f16_variant(KERNEL_SPECS[_op_name])
 
 
 def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:

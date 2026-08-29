@@ -9,6 +9,8 @@ here" is exactly what the advice measures.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -40,6 +42,17 @@ class ThePinKeepsTheReferenceKernel(unittest.TestCase):
     def _generate(self, keep):
         if not self.IR_PATH.exists():
             self.skipTest(f"no graph at {self.IR_PATH}")
+        # A curated kernel is only ACCEPTED once it has been cross-compiled and
+        # verified against the reference; with no target toolchain the picker
+        # correctly refuses it and falls back, so every "curated[rvv]"
+        # assertion below would fail for a reason that is about the
+        # environment rather than about the pin. Skip, loudly.
+        cross = os.environ.get("CROSS", "")
+        if not (cross and shutil.which(cross + "gcc")):
+            self.skipTest(
+                'no cross toolchain: set CROSS to a riscv64 prefix '
+                '(eval "$(scripts/setup_spacemit_toolchain.sh)") -- without it '
+                'the curated kernels cannot be verified, so none is picked')
         with tempfile.TemporaryDirectory() as td:
             generate_kernels.generate(
                 str(self.IR_PATH), td, "reference", "rvv_x60",
