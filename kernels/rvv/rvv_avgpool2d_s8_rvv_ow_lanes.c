@@ -32,6 +32,22 @@
  *   backwards is silent (it shifts border values and nothing else), which
  *   is a good reason not to reimplement it twice.
  *
+ *   THE AVL IS THE ELEMENT COUNT, NEVER A PREVIOUS vsetvl'S RESULT, AND
+ *   THAT IS NOT STYLE. Written as `__riscv_vsetvl_e32m4(vl8)` -- chaining
+ *   one vsetvl on another's return value -- GCC 14.3 substitutes an
+ *   unrelated register for the AVL. Measured here: the second vsetvl
+ *   was issued with the OUTER LOOP BOUND as its AVL, vl came out 5 where
+ *   the row is 11 wide, the `vsetvli zero,zero` forms carried that 5 down
+ *   to the store, and six of every eleven outputs were never written at all. Not a
+ *   rounding difference: max_abs_err=68 against the reference, and silent.
+ *
+ *   It was correct under GCC 13.2 -- the compiler these kernels were
+ *   verified on, and still what the default `CROSS` points at. 13.2 has its
+ *   own bug (it reorders a vsetvl across a widening op and the binary
+ *   SIGILLs), which is why 14.3 is mandatory. So these kernels moved from a
+ *   compiler that crashes loudly to one that answers wrongly, and the only
+ *   form that is correct under both is the element count, every time.
+ *
  *   VTYPE. Integer only: e8m1 loads, an explicit e32m4 window for the
  *   extend, accumulate and divide, e16m2/e8m1 stepping back down for the
  *   store. Checked with scripts/check_rvv_vtype.py.
@@ -92,11 +108,12 @@ void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
             for (int oh = 0; oh < OH; oh++) {
                 int ow = 0;
                 while (ow < OW) {
-                    size_t vl8 = __riscv_vsetvl_e8m1((size_t)(OW - ow));
+                    const size_t n_col = (size_t)(OW - ow);
+                    size_t vl8 = __riscv_vsetvl_e8m1(n_col);
                     /* The accumulator lives in the 32-bit domain; name that
                      * transition explicitly rather than letting GCC carry
                      * e8m1 into a vsext.vf4 it cannot legally run under. */
-                    size_t vl = __riscv_vsetvl_e32m4(vl8);
+                    size_t vl = __riscv_vsetvl_e32m4(n_col);
                     vint32m4_t acc = __riscv_vmv_v_x_i32m4(0, vl);
                     for (int kh = 0; kh < KH; kh++) {
                         const int8_t *row = plane + (size_t)(oh*SH + kh) * IW;
@@ -108,11 +125,11 @@ void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
                              * dropped result is a dropped vtype change --
                              * which is a SIGILL on the board, not a build
                              * error. */
-                            size_t l8 = __riscv_vsetvl_e8m1(vl8);
+                            size_t l8 = __riscv_vsetvl_e8m1(n_col);
                             vint8m1_t v8 = (SW == 1)
                                 ? __riscv_vle8_v_i8m1(src, l8)
                                 : __riscv_vlse8_v_i8m1(src, stride, l8);
-                            size_t l32 = __riscv_vsetvl_e32m4(vl8);
+                            size_t l32 = __riscv_vsetvl_e32m4(n_col);
                             acc = __riscv_vadd_vv_i32m4(
                                 acc, __riscv_vsext_vf4_i32m4(v8, l32), l32);
                         }
@@ -129,9 +146,9 @@ void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
                     q = __riscv_vmax_vx_i32m4(q, -128, vl);
                     q = __riscv_vmin_vx_i32m4(q, 127, vl);
 
-                    size_t vl16 = __riscv_vsetvl_e16m2(vl8);
+                    size_t vl16 = __riscv_vsetvl_e16m2(n_col);
                     vint16m2_t q16 = __riscv_vncvt_x_x_w_i16m2(q, vl16);
-                    size_t vlo8 = __riscv_vsetvl_e8m1(vl8);
+                    size_t vlo8 = __riscv_vsetvl_e8m1(n_col);
                     vint8m1_t q8 = __riscv_vncvt_x_x_w_i8m1(q16, vlo8);
                     __riscv_vse8_v_i8m1(oplane + (size_t)oh * OW + ow, q8, vlo8);
 
