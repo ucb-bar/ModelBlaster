@@ -190,6 +190,28 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         ? output_multiplier
         : (int32_t)(((int64_t)output_multiplier + ((int64_t)1 << (output_shift - 1))) >> output_shift);
     acc_scale_t scale = (acc_scale_t)scale_q31;
+
+    /* EXPERIMENT (beta=1 rounding-bias compensation).
+     * The golden's two-stage round is exactly a ONE-stage round with a
+     * larger numerator bias:
+     *   round_s(round_31(acc*M)) == (acc*M + 2^30 + 2^(30+s)) >> (31+s)
+     * The HW mvout gives  ((acc)*m + 2^30) >> 31  with m = M/2^s, i.e. it
+     * is short by 2^(30-s) in the numerator.  The only lever that adds an
+     * acc-INDEPENDENT constant to the numerator is the accumulator bias:
+     * bias += beta contributes beta*m.  The exact beta would be
+     * 2^(30-s)/m = 2^30/M in (0.5, 1]; beta=1 is the nearest integer and
+     * is provably the error-minimising choice (2^30/M > 0.5 always).
+     * This does NOT make the path exact -- see the kernel_opt_log entry --
+     * it just moves it to the floor of what this datapath can do. */
+    static acc_t ws_bias[4096];
+    const acc_t *bias_used;
+    if (OC <= (int)(sizeof(ws_bias)/sizeof(ws_bias[0]))) {
+        for (int oc = 0; oc < OC; oc++)
+            ws_bias[oc] = (bias ? bias[oc] : 0) + 1;
+        bias_used = ws_bias;
+    } else {
+        bias_used = bias;
+    }
 #else
     /* Default (Saturn FireSim) gemmini config: acc_scale_t = float.
      * effective_scale = output_multiplier * 2^(-(31 + output_shift)). f32
@@ -210,7 +232,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         OC, OH, OW,
         SH, 1, 1, PH, KH,
         false, false, false, false, false,
-        ws_input, weight, bias, ws_output,   /* weight is pre-packed HWIO from codegen */
+        ws_input, weight, bias_used, ws_output,   /* weight is pre-packed HWIO from codegen */
         act_kind, scale,
         0, 0, 0,
         WS

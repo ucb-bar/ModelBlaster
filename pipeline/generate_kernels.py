@@ -586,6 +586,36 @@ def _verify(
             class_atol = ACCURACY_CLASS_ATOL.get(accuracy_class)
             if class_atol is not None and class_atol < _atol:
                 _atol = class_atol
+        # MB_DRIFT_ATOL is the ONE mechanism that LOOSENS the gate, and it is
+        # deliberately an explicit opt-in rather than a side effect of
+        # --max-accuracy-class (which only ever tightens, above).
+        #
+        # It exists because on Gemmini exactness and speed are a real, measured
+        # trade rather than a capability limit. conv2d_s8 has two curated
+        # algorithms that differ ONLY in where the accumulator is requantized:
+        #
+        #   gemmini_im2col_full_C  int32 drain, exact CPU Q0.31 requantize
+        #                          max_abs_err 0   dronet conv 6,415,770
+        #   gemmini_tiled_conv     int8 drain, HW mvout requantize
+        #                          max_abs_err 2   dronet conv ~1,860,000  (3.45x)
+        #
+        # The drifting path is provably unable to reach 0 (the HW mvout does one
+        # round-shift-by-31 while the golden does two; the required bias
+        # 2^30/M is never an integer), so no amount of kernel work selects it --
+        # only an explicit statement that N LSB is acceptable for this build.
+        # Unset by default, so the exact kernel stays the default everywhere.
+        _drift_atol = os.environ.get("MB_DRIFT_ATOL")
+        if _drift_atol:
+            try:
+                _da = float(_drift_atol)
+            except ValueError:
+                raise SystemExit(
+                    f"MB_DRIFT_ATOL={_drift_atol!r} is not a number")
+            if _da > _atol:
+                print(f"  [{spec.op}/{getattr(candidate,'name','?')}] "
+                      f"MB_DRIFT_ATOL loosens verify atol {_atol} -> {_da} "
+                      f"(accepting up to {_da} LSB of drift by request)")
+                _atol = _da
         trial = dict(impls)  # type: ignore[arg-type]
         trial[spec.op] = candidate
         try:
