@@ -1249,13 +1249,24 @@ def shard_conv_weights(
     skips any conv whose OC is not divisible by `factor`, which falls back to
     a single shard rather than growing an uneven-tail special case.
     """
-    if factor <= 1:
-        return {}
     ops = [op for op in ir.get("ops", [])
            if op.get("op") in _SHARDABLE_CONV_OPS
            and _conv_weight_of(op)
            and not (op.get("split_from") or {})]
-    if not ops:
+    # PER-OP WIDTH, model-wide default. `factor` is MB_SHARD_FACTOR, which
+    # applies one width to every shardable conv; an op annotated by
+    # `apply_shard_hint` overrides it for itself. The measured per-dispatch
+    # scaling varies 4.8x WITHIN one model (4.02x on a wide-OC conv, 0.83x on
+    # a 1x1), so one width per model is wrong for nearly every dispatch in it.
+    def _factor_for(op) -> int:
+        try:
+            return max(1, int(op.get("shard_factor") or factor))
+        except (TypeError, ValueError):
+            raise SystemExit(
+                f"dispatch {op.get('dispatch_id')} has a non-integer "
+                f"shard_factor {op.get('shard_factor')!r}")
+
+    if not ops or all(_factor_for(op) <= 1 for op in ops):
         return {}
     layout = _conv_weight_layout_for_backend(backend)
     if layout in (None, "oihw"):
@@ -1263,11 +1274,12 @@ def shard_conv_weights(
     plan: dict[int, dict[str, Any]] = {}
     for op in ops:
         did = op.get("dispatch_id")
+        f = _factor_for(op)
         oc = int(_conv_shape_of(op).get("OC", 0))
-        if did is None or oc <= 0 or oc % factor != 0:
+        if did is None or f <= 1 or oc <= 0 or oc % f != 0:
             continue
         plan[did] = {"weight": _conv_weight_of(op), "op": op.get("op"),
-                     "oc_per": oc // factor, "n_shards": factor,
+                     "oc_per": oc // f, "n_shards": f,
                      "layout": layout}
     return plan
 
