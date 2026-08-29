@@ -60,7 +60,7 @@ REMOTE_ROOT = os.environ.get("MODELBLASTER_K1_REMOTE_ROOT", "/root/mb_k1")
 MARCH = ["-march=rv64gcv_zvl256b", "-mabi=lp64d"]
 
 MODELS = ["vitfly_lstm", "lstm_tiny", "dronet", "yolov8_nano",
-          "vitfly_frontend", "mlp_control", "attn_block"]
+          "vitfly_frontend", "mlp_control", "attn_block", "norm_block"]
 
 CURATED = {
     "lstm_s8": "kernels/rvv/rvv_lstm_s8_rvv_gate_int_dot.c",
@@ -550,6 +550,130 @@ int main(void) {{
 """
 
 
+def emit_softmax(cases):
+    """out[m,:] = softmax(in[m,:] * scale_in) quantized to int8.
+
+    BIT-EXACTNESS IS GENUINELY HARD HERE and the number this reports is the
+    interesting part. The reference calls `expf` per element and accumulates
+    the denominator in float, sequentially. Float addition is not associative,
+    so ANY vector reduction gives a different sum, and a vectorized exp differs
+    from libm's `expf` in the last ulp. A kernel that keeps the row sum scalar
+    and LUTs the exponential can be exact; one that reduces in vector form
+    cannot. Report what it actually is rather than assuming either.
+    """
+    max_n = max(c["M"] * c["K"] for c in cases)
+    rows = ['    { "%(tag)s", %(M)d, %(K)d, %(scale_in).9ef, %(scale_out).9ef },' % c
+            for c in cases]
+    return PRELUDE + f"""
+#define MAX_N {max_n}
+typedef struct {{ const char *tag; int M, K; float scale_in, scale_out; }} case_t;
+static const case_t CASES[] = {{
+{chr(10).join(rows)}
+}};
+#define N_CASES ((int)(sizeof(CASES)/sizeof(CASES[0])))
+
+extern void kernel_cand(const int8_t *, int8_t *, int, int, float, float);
+extern void kernel_ref(const int8_t *, int8_t *, int, int, float, float);
+
+static int8_t A[MAX_N], OUTC[MAX_N], OUTR[MAX_N];
+
+int main(void) {{
+    for (int i = 0; i < N_CASES; i++) {{
+        const case_t *c = &CASES[i];
+        char dims[64];
+        snprintf(dims, sizeof dims, "M=%d K=%d", c->M, c->K);
+        int n = c->M * c->K;
+        for (int regime = 0; regime < 2; regime++) {{
+            /* "small" keeps the row range narrow so no single element
+             * dominates the softmax -- that is where the denominator's
+             * rounding decides the output rather than one saturating term. */
+            int lim = regime ? 8 : 128;
+            rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)i << 8) ^ regime;
+            for (int k = 0; k < n; k++) A[k] = rnd8(lim);
+            memset(OUTC, 0, n); memset(OUTR, 0, n);
+            double t0 = now_ms();
+            kernel_cand(A, OUTC, c->M, c->K, c->scale_in, c->scale_out);
+            double t1 = now_ms();
+            kernel_ref(A, OUTR, c->M, c->K, c->scale_in, c->scale_out);
+            double t2 = now_ms();
+            report(c->tag, regime ? "small" : "full", dims, OUTC, OUTR,
+                   n, t1 - t0, t2 - t1);
+        }}
+    }}
+    printf("WORST max_abs_err=%d over %d cases\\n", worst, N_CASES);
+    return worst == 0 ? 0 : 1;
+}}
+"""
+
+
+def emit_layernorm(cases):
+    """Row-wise layernorm with float gamma/beta.
+
+    The reference accumulates mean and variance in DOUBLE and takes a double
+    `sqrt`. Reproducing that bit-exactly in vector form means reproducing the
+    summation ORDER, so the same caveat as softmax applies -- and more sharply,
+    because two reductions have to match, not one.
+    """
+    max_n = max(c["M"] * c["K"] for c in cases)
+    max_k = max(c["K"] for c in cases)
+    rows = ['    { "%(tag)s", %(M)d, %(K)d, %(scale_in).9ef, %(scale_out).9ef,'
+            ' %(eps).9ef, %(activation_min)d, %(activation_max)d },' % c
+            for c in cases]
+    return PRELUDE + f"""
+#define MAX_N {max_n}
+#define MAX_K {max_k}
+typedef struct {{
+    const char *tag; int M, K; float scale_in, scale_out, eps; int amin, amax;
+}} case_t;
+static const case_t CASES[] = {{
+{chr(10).join(rows)}
+}};
+#define N_CASES ((int)(sizeof(CASES)/sizeof(CASES[0])))
+
+extern void kernel_cand(const int8_t *, const float *, const float *, int8_t *,
+                        int, int, float, float, float, int, int);
+extern void kernel_ref(const int8_t *, const float *, const float *, int8_t *,
+                       int, int, float, float, float, int, int);
+
+static int8_t A[MAX_N], OUTC[MAX_N], OUTR[MAX_N];
+static float GAMMA[MAX_K], BETA[MAX_K];
+
+int main(void) {{
+    for (int i = 0; i < N_CASES; i++) {{
+        const case_t *c = &CASES[i];
+        char dims[80];
+        snprintf(dims, sizeof dims, "M=%d K=%d act[%d,%d]",
+                 c->M, c->K, c->amin, c->amax);
+        int n = c->M * c->K;
+        for (int regime = 0; regime < 2; regime++) {{
+            int lim = regime ? 8 : 128;
+            rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)i << 8) ^ regime;
+            for (int k = 0; k < n; k++) A[k] = rnd8(lim);
+            /* gamma near 1 and beta near 0, as a trained net has them: an
+             * arbitrary gamma would swamp the normalization and hide a
+             * variance bug behind a large multiply. */
+            for (int k = 0; k < c->K; k++) {{
+                GAMMA[k] = 1.0f + (float)(rnd8(32)) / 256.0f;
+                BETA[k]  = (float)(rnd8(32)) / 512.0f;
+            }}
+            memset(OUTC, 0, n); memset(OUTR, 0, n);
+            double t0 = now_ms();
+            kernel_cand(A, GAMMA, BETA, OUTC, c->M, c->K, c->scale_in,
+                        c->scale_out, c->eps, c->amin, c->amax);
+            double t1 = now_ms();
+            kernel_ref(A, GAMMA, BETA, OUTR, c->M, c->K, c->scale_in,
+                       c->scale_out, c->eps, c->amin, c->amax);
+            double t2 = now_ms();
+            report(c->tag, regime ? "small" : "full", dims, OUTC, OUTR,
+                   n, t1 - t0, t2 - t1);
+        }}
+    }}
+    printf("WORST max_abs_err=%d over %d cases\\n", worst, N_CASES);
+    return worst == 0 ? 0 : 1;
+}}
+"""
+
+
 EMITTERS = {
     "lstm_s8": emit_lstm,
     "add_s8": emit_add,
@@ -559,6 +683,12 @@ EMITTERS = {
                                             ", c->negative_slope"),
     "sigmoid_s8": lambda cs: _emit_unary(cs, None, None, ""),
     "matmul_s8": emit_matmul,
+    # mul_s8 is signature-identical to add_s8, and gelu_s8 to
+    # sigmoid_s8, so both reuse the existing harnesses.
+    "mul_s8": emit_add,
+    "gelu_s8": lambda cs: _emit_unary(cs, None, None, ""),
+    "softmax_s8": emit_softmax,
+    "layernorm_s8": emit_layernorm,
 }
 
 
