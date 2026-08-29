@@ -86,6 +86,12 @@ EXTRA_CASES = {
         {"M": 7, "K": 512, "N": 512, "transpose_b": 0, "scale_div": 1.0},
         {"M": 3, "K": 33,  "N": 5,   "transpose_b": 1, "scale_div": 1.0},
         {"M": 3, "K": 31,  "N": 33,  "transpose_b": 0, "scale_div": 1.0},
+        # M in the hundreds. The IME micro-tile is 4x4x8 and hardware-forced,
+        # so at M=7 the second row-tile is half padding and the comparison is
+        # unfair to it. These are the shapes where the tile is fully used --
+        # a real transformer's MLP block, not attention's tiny M.
+        {"M": 64,  "K": 512, "N": 512, "transpose_b": 0, "scale_div": 1.0},
+        {"M": 128, "K": 256, "N": 256, "transpose_b": 1, "scale_div": 1.0},
     ],
 }
 
@@ -546,7 +552,7 @@ EMITTERS = {
 }
 
 
-def run_op(op_name, models, keep_dir=None):
+def run_op(op_name, models, keep_dir=None, kernel_path=None):
     cases = collect_cases(op_name, models)
     if not cases:
         print(f"[{op_name}] no cases found in {models}")
@@ -562,7 +568,8 @@ def run_op(op_name, models, keep_dir=None):
     cand_c = os.path.join(workdir, "cand.c")
     with open(cand_c, "w") as f:
         f.write(prologue)
-        f.write(open(os.path.join(REPO, CURATED[op_name])).read())
+        f.write(open(kernel_path or os.path.join(
+            REPO, CURATED[op_name])).read())
     ref_c = os.path.join(workdir, "ref.c")
     with open(ref_c, "w") as f:
         f.write("#include <stddef.h>\n#include <stdint.h>\n"
@@ -614,14 +621,24 @@ def main():
     ap.add_argument("--model", action="append", default=[])
     ap.add_argument("--op", action="append", default=[])
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--kernel", default=None,
+                    help="verify THIS file against the op's reference instead "
+                         "of the one wired into CURATED. Needed for a second "
+                         "implementation of an op that already has one -- the "
+                         "IME matmul against the RVV matmul, say, where both "
+                         "are matmul_s8 and only one can be the curated pick. "
+                         "Requires exactly one --op.")
     args = ap.parse_args()
+    if args.kernel and len(args.op) != 1:
+        ap.error("--kernel names one file, so it needs exactly one --op")
     models = args.model or MODELS
     ops = args.op or list(CURATED)
     ok = True
     for op in ops:
         res = run_op(op, models,
                      keep_dir=(os.path.join(args.workdir, op)
-                               if args.workdir else None))
+                               if args.workdir else None),
+                     kernel_path=args.kernel)
         if res is False:
             ok = False
     print("VERIFY", "PASS" if ok else "FAIL")
