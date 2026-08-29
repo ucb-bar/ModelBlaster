@@ -1,131 +1,127 @@
 #!/usr/bin/env python3
-"""Catch a vsetvli handed a POINTER as its AVL operand.
+"""Refuse a `vsetvl` whose AVL is another `vsetvl`'s result.
 
-Why this exists
----------------
-GCC 14.3.0 miscompiles a vsetvl chained on a previous vsetvl's result. Four
-curated kernels contained this, verbatim from kernel_cat2_c1_s8:
+WHAT THIS CATCHES, AND WHY THE DISASSEMBLY CHECKER CANNOT
+---------------------------------------------------------
+`check_rvv_vtype.py` finds instructions the hardware refuses -- a vf4 extend
+under SEW=8, say -- by decoding the disassembly. Those SIGILL, loudly, on the
+first dispatch. This is the other failure: every instruction is legal, the
+binary runs to completion, and `vl` is simply wrong.
 
-    subw    a3,a1,a4          ; a3 = stride - hw = 6
-    add     a5,a6,a4          ; a5 = src + hw    <- a POINTER
-    vsetvli a3,a3,e8,m2       ; vl = 6, correct
-    vle8.v  v2,(a5)
-    vsetvli zero,a5,e16,m4    ; AVL = a5 -- THE ADDRESS REGISTER
+Written as
 
-An address is astronomically larger than VLMAX, so `vl` saturates to VLMAX and
-the vl-preserving `vsetvli zero,zero` forms that follow carry it to the store.
-The tail then writes VLMAX elements where it owes the remainder.
+    size_t vl8 = __riscv_vsetvl_e8m1(n_col);
+    size_t vl  = __riscv_vsetvl_e32m4(vl8);      <- AVL is a previous vl
 
-The reason it is worth a checker rather than a code review: saturating to VLMAX
-is CORRECT on every full iteration, so the bug is invisible unless a shape
-produces a partial tail. yolov8n's cat_15 (stride 2*3=6 over 66 channels) is a
-tail on its first iteration and wrote 58 bytes past the output buffer. The same
-kernels had been shipping for as long as they existed on shapes that happened
-not to expose it.
+GCC 14.3 substitutes an unrelated register for the second AVL. Measured in
+kernels/rvv/rvv_avgpool2d_s8_rvv_ow_lanes.c: the e32m4 vsetvl was issued with
+the enclosing loop's BOUND as its AVL, `vl` came out 5 where the output row is
+11 wide, the `vsetvli zero,zero` forms carried that 5 down to the store, and
+six of every eleven outputs were never written. max_abs_err=68 against the
+op's own reference, with no crash and no warning.
 
-It is also worth checking the DISASSEMBLY and not the C: nine curated kernels
-use the chained source pattern, and only four are actually miscompiled. Grepping
-the source over-reports by more than half.
+WHY THE FORM IS TEMPTING AND STILL WRONG. It reads as correct RVV: e8m1 and
+e32m4 hold the same number of elements, so `vsetvl_e32m4(vl8)` and
+`vsetvl_e32m4(n)` return the same value, and the first says "the same count,
+in the other domain" more clearly. It is the compiler that does not honour it.
 
-The heuristic: a register used as the base address of a vector load/store, then
-used as the AVL operand of a vsetvli before being redefined. That is never
-something a kernel means to do.
+WHY IT SURVIVED REVIEW FOR SO LONG. The kernels that use it were verified
+bit-exact on the board under GCC 13.2, which compiles it correctly. 13.2 has
+the OTHER bug -- it reorders a vsetvl across a widening op and the binary
+SIGILLs -- which is why 14.3 is now mandatory. So the mandate that fixed a
+loud failure introduced a silent one, and the only form correct under both
+compilers is: pass the ELEMENT COUNT to every width, every time.
 
-Usage:
-    check_rvv_avl.py <elf-or-object> [...]      # exit 1 if any found
+    const size_t n_elem = (size_t)(n - i);
+    size_t vl8 = __riscv_vsetvl_e8m1(n_elem);
+    size_t vl  = __riscv_vsetvl_e32m4(n_elem);
+
+Source-level and deliberately simple: it does not model scope or control flow.
+It records every identifier assigned from a `__riscv_vsetvl_*` call in a file
+and flags any later `__riscv_vsetvl_*` whose argument is exactly one of them.
+That is the whole shape of the defect, and a broader analysis would find
+nothing more while being able to be wrong.
+
+Exit 0 clean, 1 if any kernel chains.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
-import subprocess
 import sys
 
-_FUNC = re.compile(r"^[0-9a-f]+ <(?P<name>.+)>:")
-_INSN = re.compile(r"^\s*(?P<addr>[0-9a-f]+):\s+[0-9a-f ]+\t(?P<mn>[a-z0-9._]+)\s*(?P<ops>.*)$")
-#: `vle8.v v2,(a5)` / `vse8.v v8,(a2)` -- the base register is what matters.
-_MEM = re.compile(r"^v(?:le|se)[0-9]+\.v\s+v\d+,\((?P<base>\w+)\)")
-_VSET = re.compile(r"^vsetvli\s+(?P<rd>\w+),(?P<avl>\w+),")
-#: Anything writing rd kills the association; keep this deliberately small and
-#: assume a write when unsure -- a missed report beats a false one here.
-_WRITES_RD = re.compile(r"^(?P<mn>add|addi|addw|addiw|sub|subw|mv|li|lui|ld|lw|lh|lb|"
-                        r"lbu|lhu|lwu|sll|slli|srl|srli|sra|srai|and|andi|or|ori|"
-                        r"xor|xori|mul|mulw|div|divw|rem|remw|c\.\w+)$")
+#: `size_t vl8 = __riscv_vsetvl_e8m1(...)` / `vl = __riscv_vsetvl_e8m2(...)`
+_ASSIGN = re.compile(
+    r"^\s*(?:const\s+)?(?:size_t\s+)?([A-Za-z_]\w*)\s*=\s*"
+    r"__riscv_vsetvl_[a-z0-9]+\s*\(")
+#: any call, with its argument captured when the argument is a bare identifier
+_CALL = re.compile(r"__riscv_vsetvl_([a-z0-9]+)\s*\(\s*([A-Za-z_]\w*)\s*\)")
 
 
-def scan(text: str):
-    out = []
-    func = "<unknown>"
-    base_of = {}          # register -> addr of the load/store that used it
-    for line in text.splitlines():
-        m = _FUNC.match(line)
-        if m:
-            func, base_of = m.group("name"), {}
-            continue
-        m = _INSN.match(line)
-        if not m:
-            continue
-        addr, mn, ops = m.group("addr"), m.group("mn"), m.group("ops")
-        full = f"{mn} {ops}"
+def strip_comments(text: str) -> str:
+    """Blank out comments, preserving line numbering.
 
-        mm = _MEM.match(full)
-        if mm:
-            base_of[mm.group("base")] = addr
-            continue
+    Necessary, not tidy: every one of these kernels now carries a header
+    paragraph that QUOTES the bad form in order to explain it, and a checker
+    that flags its own explanation is a checker people turn off.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(c if c == "\n" else " " for c in text[i:j]))
+            i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
-        vs = _VSET.match(full)
-        if vs:
-            avl = vs.group("avl")
-            if avl != "zero" and avl in base_of:
-                out.append((func, addr, avl, base_of[avl]))
-            continue
 
-        # A branch or call ends the straight-line reasoning.
-        if mn.startswith(("b", "j", "call", "tail", "ret")):
-            base_of = {}
-            continue
-        # An instruction that redefines the register breaks the association.
-        if _WRITES_RD.match(mn):
-            rd = ops.split(",")[0].strip()
-            base_of.pop(rd, None)
-    return out
+def check_file(path: str) -> list[str]:
+    src = strip_comments(open(path, encoding="utf-8").read())
+    vl_names = {m.group(1) for line in src.splitlines()
+                for m in [_ASSIGN.match(line)] if m}
+    bad = []
+    for lineno, line in enumerate(src.splitlines(), 1):
+        for m in _CALL.finditer(line):
+            if m.group(2) in vl_names:
+                bad.append(f"{path}:{lineno}: __riscv_vsetvl_{m.group(1)}"
+                           f"({m.group(2)}) -- {m.group(2)} is itself a vsetvl "
+                           f"result; pass the element count instead")
+    return bad
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("files", nargs="+")
-    ap.add_argument("--objdump", default="riscv64-unknown-linux-gnu-objdump")
+    ap.add_argument("files", nargs="*",
+                    help="C sources to check (default: every curated kernel)")
     a = ap.parse_args()
 
-    bad = 0
-    for f in a.files:
-        try:
-            text = subprocess.run([a.objdump, "-d", f], capture_output=True,
-                                  text=True, check=True, timeout=600).stdout
-        except (OSError, subprocess.CalledProcessError) as e:
-            print(f"{f}: could not disassemble ({e})", file=sys.stderr)
-            return 2
-        hits = scan(text)
-        if hits:
-            bad += len(hits)
-            print(f"FAIL {f}: {len(hits)} vsetvli given an address as AVL")
-            for func, addr, reg, src in hits:
-                print(f"  {func} @ {addr}: AVL={reg}, which is the base of the "
-                      f"vector load/store at {src}")
-        else:
-            print(f"OK   {f}")
+    files = a.files
+    if not files:
+        root = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "kernels")
+        files = sorted(os.path.join(d, f)
+                       for d, _, fs in os.walk(root) for f in fs
+                       if f.endswith(".c"))
+    if not files:
+        print("no files to check", file=sys.stderr)
+        return 1
 
-    if bad:
-        print(f"\n{bad} site(s). vl saturates to VLMAX at each, so the code is "
-              f"correct on full iterations and writes VLMAX elements on a "
-              f"PARTIAL TAIL -- past the end of the destination.\n"
-              f"The fix is in the KERNEL: hand every width the same plain "
-              f"element count instead of chaining one vsetvl on another's "
-              f"result. See kernels/rvv/rvv_cat2_c1_s8_direct.c.",
-              file=sys.stderr)
+    bad = [v for f in files for v in check_file(f)]
+    for v in bad:
+        print("CHAINED AVL: " + v)
+    print(f"{len(files)} file(s) checked, {len(bad)} chained AVL(s)")
     return 1 if bad else 0
 
 

@@ -71,6 +71,14 @@ CURATED = {
     "sigmoid_s8": "kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c",
     "matmul_s8": "kernels/rvv/rvv_matmul_s8_rvv_k_reduce_n_lanes.c",
     "linear_s8": "kernels/rvv/rvv_linear_s8_direct.c",
+    # RoPE and the transformer blocks. sin/cos were verified with --kernel
+    # when they landed and were never added here, so the default full sweep
+    # -- the thing that would catch a later edit to one of them -- did not
+    # cover them. It does now.
+    "sin_s8": "kernels/rvv/rvv_sin_s8_rvv_memo_lut_gather.c",
+    "cos_s8": "kernels/rvv/rvv_cos_s8_rvv_memo_lut_gather.c",
+    "mul_s8": "kernels/rvv/rvv_mul_s8_rvv_frm_rmm.c",
+    "gelu_s8": "kernels/rvv/rvv_gelu_s8_rvv_memo_lut_gather.c",
 }
 
 #: Shapes to check beyond the ones the model graphs happen to contain.

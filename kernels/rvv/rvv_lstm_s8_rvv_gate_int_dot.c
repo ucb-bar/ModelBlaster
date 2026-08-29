@@ -54,6 +54,23 @@
  *   against ~4200 MACs, so there is nothing to win there, and vectorising
  *   them would mean matching a rounding mode vfcvt does not have.
  *
+ *   THE AVL IS THE ELEMENT COUNT, NEVER A PREVIOUS vsetvl'S RESULT, AND
+ *   THAT IS NOT STYLE. Written as `__riscv_vsetvl_e32m4(vl8)` -- chaining
+ *   one vsetvl on another's return value -- GCC 14.3 substitutes an
+ *   unrelated register for the AVL. Measured in the avgpool kernel, which
+ *   had the same shape: its second vsetvl was issued with the OUTER LOOP
+ *   BOUND as its AVL, vl came out 5 where the row is 11
+ *   wide, the `vsetvli zero,zero` forms carried that 5 down to the store,
+ *   and six of every eleven outputs were never written at all. Not a
+ *   rounding difference: max_abs_err=68 against the reference, and silent.
+ *
+ *   It was correct under GCC 13.2 -- the compiler these kernels were
+ *   verified on, and still what the default `CROSS` points at. 13.2 has its
+ *   own bug (it reorders a vsetvl across a widening op and the binary
+ *   SIGILLs), which is why 14.3 is mandatory. So these kernels moved from a
+ *   compiler that crashes loudly to one that answers wrongly, and the only
+ *   form that is correct under both is the element count, every time.
+ *
  *   VTYPE. The vector body is integer-only (i8m1 loads, i16m2 products,
  *   i32m4 accumulator) and every width transition is named by its own
  *   intrinsic. The reduction runs at VLMAX and the ragged tail is handled
@@ -126,13 +143,14 @@ static inline int32_t mb_lstm_dot_s8(const int8_t *a, const int8_t *b, int n)
     red = __riscv_vredsum_vs_i32m4_i32m1(acc0, red, vlmax32);
 
     if (k < n) {
-        size_t vl = __riscv_vsetvl_e8m1((size_t)(n - k));
+        const size_t n_tail = (size_t)(n - k);
+        size_t vl = __riscv_vsetvl_e8m1(n_tail);
         vint8m1_t va0 = __riscv_vle8_v_i8m1(a + k, vl);
         vint8m1_t vb0 = __riscv_vle8_v_i8m1(b + k, vl);
         vint16m2_t p0 = __riscv_vwmul_vv_i16m2(va0, vb0, vl);
         /* Name the 32-bit domain before the widen, and reduce at the tail's
          * own vl -- vredsum reads exactly vl elements. */
-        size_t vl32 = __riscv_vsetvl_e32m4(vl);
+        size_t vl32 = __riscv_vsetvl_e32m4(n_tail);
         red = __riscv_vredsum_vs_i32m4_i32m1(
             __riscv_vwcvt_x_x_v_i32m4(p0, vl32), red, vl32);
     }
