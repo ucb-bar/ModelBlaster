@@ -339,6 +339,158 @@ def _match_frobenius_norm(out, x):
     return True
 
 
+def _match_rms_norm(out, x):
+    """Pattern: out = x / sqrt(mean(x**2, dim=1, keepdim=True) + eps).
+    Returns eps (float) on match, else None (KernelBench 36_RMSNorm)."""
+    if out.op != "call_function" or out.target not in (_operator.truediv, torch.div):
+        return None
+    if len(out.args) != 2 or out.args[0] is not x:
+        return None
+    sqrt_node = out.args[1]
+    if not (hasattr(sqrt_node, "op") and sqrt_node.op == "call_function"
+            and getattr(sqrt_node.target, "__name__", "") == "sqrt"):
+        return None
+    add_node = sqrt_node.args[0]
+    if not (hasattr(add_node, "op") and add_node.op == "call_function"
+            and add_node.target in (_operator.add, torch.add)):
+        return None
+    mean_node, eps = add_node.args[0], add_node.args[1]
+    if not isinstance(eps, (int, float)):
+        mean_node, eps = add_node.args[1], add_node.args[0]
+    if not isinstance(eps, (int, float)):
+        return None
+    if not (hasattr(mean_node, "op") and mean_node.op == "call_function"
+            and getattr(mean_node.target, "__name__", "") == "mean"):
+        return None
+    mkw = mean_node.kwargs or {}
+    dim = mkw.get("dim", None)
+    if dim is None and len(mean_node.args) > 1:
+        dim = mean_node.args[1]
+    if dim != 1:
+        return None
+    pow_node = mean_node.args[0]
+    if not (hasattr(pow_node, "op") and pow_node.op == "call_function"
+            and pow_node.target in (_operator.pow, torch.pow)):
+        return None
+    if len(pow_node.args) < 2 or pow_node.args[0] is not x or pow_node.args[1] != 2:
+        return None
+    return float(eps)
+
+
+def _match_mean_abs_norm(out, x):
+    """Pattern: out = x / mean(abs(x), dim=1, keepdim=True) (KernelBench 38,
+    L1 normalization). Returns True on match."""
+    if out.op != "call_function" or out.target not in (_operator.truediv, torch.div):
+        return False
+    if len(out.args) != 2 or out.args[0] is not x:
+        return False
+    mean_node = out.args[1]
+    if not (hasattr(mean_node, "op") and mean_node.op == "call_function"
+            and getattr(mean_node.target, "__name__", "") == "mean"):
+        return False
+    mkw = mean_node.kwargs or {}
+    dim = mkw.get("dim", None)
+    if dim is None and len(mean_node.args) > 1:
+        dim = mean_node.args[1]
+    if dim != 1:
+        return False
+    abs_node = mean_node.args[0]
+    if not (hasattr(abs_node, "op") and abs_node.op == "call_function"
+            and abs_node.target in (torch.abs, _operator.abs)):
+        return False
+    return len(abs_node.args) >= 1 and abs_node.args[0] is x
+
+
+def _agents_loss_mse(a, b):
+    return a
+
+
+def _agents_loss_hinge(a, b):
+    return a
+
+
+def _is_mean_all(node) -> bool:
+    """torch.mean with no dim → scalar (mean over all elements)."""
+    if not (hasattr(node, "op") and node.op == "call_function"
+            and getattr(node.target, "__name__", "") == "mean"):
+        return False
+    kw = node.kwargs or {}
+    return kw.get("dim") is None and len(node.args) < 2
+
+
+def _maybe_fuse_loss(gm) -> None:
+    """Fuse whole-graph loss patterns that produce a scalar from 2 inputs into
+    a single op: MSE = mean((a-b)^2), Hinge = mean(clamp(1 - a*b, min=0)).
+    Single-node losses (cross_entropy, smooth_l1, kl_div, TripletMarginLoss)
+    are handled directly in the per-node loop, not here."""
+    outputs = [n for n in gm.graph.nodes if n.op == "output"]
+    if len(outputs) != 1:
+        return
+    out_arg = outputs[0].args[0]
+    if not (hasattr(out_arg, "op") and _is_mean_all(out_arg)):
+        return
+    inner = out_arg.args[0]  # the tensor being mean-reduced
+
+    sentinel = None
+    # MSE: mean(pow(sub(a, b), 2))
+    if (hasattr(inner, "op") and inner.op == "call_function"
+            and inner.target in (_operator.pow, torch.pow)
+            and len(inner.args) >= 2 and inner.args[1] == 2):
+        sub = inner.args[0]
+        if (hasattr(sub, "op") and sub.op == "call_function"
+                and sub.target in (_operator.sub, torch.sub)
+                and all(isinstance(x, torch.fx.Node) for x in sub.args[:2])):
+            a, b = sub.args[0], sub.args[1]
+            sentinel = _agents_loss_mse
+    # Hinge: mean(clamp(sub(1, mul(a, b)), min=0))
+    if sentinel is None and (hasattr(inner, "op") and inner.op == "call_function"
+            and getattr(inner.target, "__name__", "") == "clamp"):
+        rsub = inner.args[0]
+        if (hasattr(rsub, "op") and rsub.op == "call_function"
+                and rsub.target in (_operator.sub, torch.sub, torch.rsub)):
+            mul = rsub.args[1] if rsub.args[0] == 1 else (
+                rsub.args[0] if rsub.target is torch.rsub else None)
+            if (hasattr(mul, "op") and mul.op == "call_function"
+                    and mul.target in (_operator.mul, torch.mul)
+                    and all(isinstance(x, torch.fx.Node) for x in mul.args[:2])):
+                a, b = mul.args[0], mul.args[1]
+                sentinel = _agents_loss_hinge
+    if sentinel is None:
+        return
+
+    n = int(np.prod(list(inner.meta["tensor_meta"].shape)))
+    with gm.graph.inserting_before(outputs[0]):
+        new_node = gm.graph.call_function(sentinel, args=(a, b))
+    new_node.meta["loss_n"] = n
+    if "tensor_meta" in out_arg.meta:
+        new_node.meta["tensor_meta"] = out_arg.meta["tensor_meta"]
+    outputs[0].args = (new_node,)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+
+
+def _match_exclusive_cumsum(out, x):
+    """Pattern (KernelBench 92): cumsum(cat([zeros_like(...), x])[:-1], dim=1).
+    x is 2D [B, N]; output is [B-1, N+1]. Returns True on match."""
+    if not (out.op == "call_function"
+            and getattr(out.target, "__name__", "") == "cumsum"):
+        return False
+    gi = out.args[0]
+    if not (hasattr(gi, "op") and gi.op == "call_function"
+            and getattr(gi.target, "__name__", "") == "getitem"):
+        return False
+    cat = gi.args[0]
+    if not (hasattr(cat, "op") and cat.op == "call_function"
+            and getattr(cat.target, "__name__", "") == "cat"):
+        return False
+    seq = cat.args[0]
+    if not (isinstance(seq, (tuple, list)) and len(seq) == 2 and seq[1] is x):
+        return False
+    zl = seq[0]
+    return (hasattr(zl, "op") and zl.op == "call_function"
+            and getattr(zl.target, "__name__", "") == "zeros_like")
+
+
 def _maybe_fuse_compound_activation(gm) -> None:
     """If the entire forward graph matches a known compound activation,
     rewrite the FX graph in place: remove the multi-op subgraph and
@@ -371,6 +523,12 @@ def _maybe_fuse_compound_activation(gm) -> None:
         sentinel = _agents_compound_l2_norm
     elif _match_frobenius_norm(out_arg, x):
         sentinel = _agents_compound_frobenius_norm
+    elif (_rms_eps := _match_rms_norm(out_arg, x)) is not None:
+        sentinel = _agents_compound_rms_norm
+    elif _match_mean_abs_norm(out_arg, x):
+        sentinel = _agents_compound_mean_abs_norm
+    elif _match_exclusive_cumsum(out_arg, x):
+        sentinel = _agents_compound_excl_cumsum
     else:
         return
 
@@ -378,11 +536,16 @@ def _maybe_fuse_compound_activation(gm) -> None:
     # everything else via dead-code elimination.
     with gm.graph.inserting_before(out_node):
         new_node = gm.graph.call_function(sentinel, args=(x,))
-    # Copy the placeholder's tensor_meta onto the new node — pointwise
-    # activations preserve shape/dtype, and downstream ShapeProp won't
-    # re-run on this graph.
-    if "tensor_meta" in x.meta:
+    # Copy tensor_meta onto the new node. Most compounds are shape-preserving
+    # (copy the input's meta); exclusive_cumsum reshapes, so copy the original
+    # output node's meta instead.
+    if sentinel is _agents_compound_excl_cumsum:
+        if "tensor_meta" in out_arg.meta:
+            new_node.meta["tensor_meta"] = out_arg.meta["tensor_meta"]
+    elif "tensor_meta" in x.meta:
         new_node.meta["tensor_meta"] = x.meta["tensor_meta"]
+    if sentinel is _agents_compound_rms_norm:
+        new_node.meta["rms_eps"] = _rms_eps
     out_node.args = (new_node,)
     gm.graph.eliminate_dead_code()
     gm.recompile()
@@ -418,6 +581,18 @@ def _agents_compound_frobenius_norm(x):
     return x
 
 
+def _agents_compound_rms_norm(x):
+    return x
+
+
+def _agents_compound_mean_abs_norm(x):
+    return x
+
+
+def _agents_compound_excl_cumsum(x):
+    return x
+
+
 SUPPORTED_MODULES = (
     torch.nn.Linear,
     torch.nn.ReLU,
@@ -433,19 +608,31 @@ SUPPORTED_MODULES = (
     torch.nn.Hardtanh,
     torch.nn.ELU,
     torch.nn.Conv2d,
+    torch.nn.ConvTranspose2d,  # transposed / fractionally-strided 2D conv
+    torch.nn.Conv1d,  # mapped to conv2d with a unit height dim
+    torch.nn.ConvTranspose1d,  # mapped to conv_transpose2d with unit height
+    torch.nn.Conv3d,  # 3D conv (NCDHW)
+    torch.nn.ConvTranspose3d,  # 3D transposed conv
     torch.nn.MaxPool2d,
-    torch.nn.AvgPool2d,
-    torch.nn.LSTM,
-    torch.nn.LayerNorm,
+    torch.nn.MaxPool1d,  # mapped to maxpool2d with a unit height dim
+    torch.nn.MaxPool3d,  # 3D max pool
+    torch.nn.AvgPool2d,  # fixed-window 2D average pool (KernelBench 45)
+    torch.nn.AvgPool1d,  # mapped to avgpool2d with a unit height dim
+    torch.nn.AvgPool3d,  # 3D average pool
     # RMSNorm only exists in newer torch; tolerate its absence.
     *((torch.nn.RMSNorm,) if hasattr(torch.nn, "RMSNorm") else ()),
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
+    torch.nn.LayerNorm,  # normalize over trailing normalized_shape dims
+    torch.nn.GroupNorm,  # per-(sample,group) normalize; InstanceNorm is G==C
+    torch.nn.InstanceNorm2d,  # per-(sample,channel) spatial normalize
+    torch.nn.TripletMarginLoss,  # 3-input margin loss → scalar
     torch.nn.Sigmoid,
     # YOLOv8 backbone uses SiLU activation throughout; neck uses Upsample.
     torch.nn.SiLU,
     torch.nn.Upsample,
+    torch.nn.LSTM,   # decomposed into per-layer lstm ops (fp32 + int8 paths)
 )
 
 
@@ -454,6 +641,20 @@ def _pair(v) -> tuple[int, int]:
     if isinstance(v, (tuple, list)):
         return int(v[0]), int(v[1])
     return int(v), int(v)
+
+
+def _as_tuple1(v) -> tuple[int]:
+    """Coerce int or 1-tuple (the 1D nn.Conv1d/Pool1d param form) to (x,)."""
+    if isinstance(v, (tuple, list)):
+        return (int(v[0]),)
+    return (int(v),)
+
+
+def _triple(v) -> tuple[int, int, int]:
+    """Coerce int or 3-tuple to a (d, h, w) triple (nn.Conv3d/Pool3d params)."""
+    if isinstance(v, (tuple, list)):
+        return int(v[0]), int(v[1]), int(v[2])
+    return int(v), int(v), int(v)
 
 
 def _tensor_meta(node: torch.fx.Node) -> dict[str, Any]:
@@ -703,31 +904,85 @@ def _insert_casts_i8_f16(ops, tensors_meta, scales) -> list[dict]:
             cast_out = cast_intermediates.get(key)
             if cast_out is None:
                 cast_out = f"{in_name}__cast_{dst}"
+                scale = scales.get(in_name, 1e-8)
+                kind = ("cast_i8_to_f16" if (src == "i8" and dst == "f16")
+                        else "cast_f16_to_i8")
                 tensors_meta[cast_out] = {
                     "shape": list(meta["shape"]),
                     "dtype": dst,
                     "quant": (None if dst == "f16" else
-                              {"scale": float(scales.get(in_name, 1e-8)),
-                               "zero_point": 0}),
+                              {"scale": float(scale), "zero_point": 0}),
                 }
                 n = 1
                 for d in meta["shape"]:
                     n *= int(d)
                 new_ops.append({
                     "name": cast_out,
-                    "op": ("cast_i8_to_f16" if dst == "f16"
-                           else "cast_f16_to_i8"),
+                    "op": kind,
                     "precision": "fp16" if dst == "f16" else "int8",
                     "inputs": [in_name],
                     "outputs": [cast_out],
                     "shape": {"n": n},
-                    "quant": {"scale": float(scales.get(in_name, 1e-8)),
-                              "zero_point": 0},
+                    "quant": {"scale": float(scale), "zero_point": 0},
                 })
                 cast_intermediates[key] = cast_out
             op["inputs"][i] = cast_out
         new_ops.append(op)
     return new_ops
+
+
+def _requantize_int_per_oc(acc, mult_arr, shift_arr, oc_axis):
+    """Per-output-channel requantize: apply the scalar _requantize_int with each
+    channel's own (multiplier, shift) along `oc_axis`."""
+    acc = acc.astype(np.int64)
+    out = np.empty(acc.shape, dtype=np.int32)
+    for oc in range(acc.shape[oc_axis]):
+        sl = [slice(None)] * acc.ndim
+        sl[oc_axis] = oc
+        sl = tuple(sl)
+        out[sl] = _requantize_int(acc[sl], int(mult_arr[oc]), int(shift_arr[oc]))
+    return out
+
+
+def _apply_per_channel(ops, tensors_meta, weights_blob, fp32_stash, scales,
+                       skip_names):
+    """Re-quantize conv2d_s8 / linear_s8 weights per-OUTPUT-CHANNEL (tighter than
+    one per-tensor scale) and switch the op to its _pc kind with per-oc
+    multiplier/shift arrays. Ops in `skip_names` (e.g. fp16-promoted) are left
+    alone. Mirrors extract_graph_export's per-channel path on the FX IR."""
+    for op in ops:
+        if op["name"] in skip_names or op["op"] not in ("conv2d_s8", "linear_s8"):
+            continue
+        wk = op.get("weight")
+        w_fp32 = fp32_stash.get(wk)
+        if w_fp32 is None:
+            continue
+        OF = int(w_fp32.shape[0])
+        per_oc_max = np.abs(w_fp32).reshape(OF, -1).max(axis=1)
+        w_scales = np.maximum(per_oc_max, 1e-8) / 127.0
+        w_flat = w_fp32.reshape(OF, -1)
+        w_q = np.round(w_flat / w_scales[:, None]).clip(-127, 127).astype(np.int8)
+        weights_blob[wk] = w_q.reshape(w_fp32.shape)
+        in_scale = float(scales[op["inputs"][0]])
+        out_scale = float(scales[op["outputs"][0]])
+        bk = op.get("bias")
+        if bk and bk in fp32_stash:
+            b_fp32 = fp32_stash[bk]
+            weights_blob[bk] = np.round(
+                b_fp32 / (in_scale * w_scales)).astype(np.int32)
+        mult = np.zeros(OF, np.int32); shift = np.zeros(OF, np.int32)
+        for oc in range(OF):
+            m, s = _requantize_multiplier_shift(
+                (in_scale * float(w_scales[oc])) / max(out_scale, 1e-30))
+            mult[oc] = m; shift[oc] = s
+        mk = f"{op['name']}.output_multiplier_per_oc"
+        sk = f"{op['name']}.output_shift_per_oc"
+        weights_blob[mk] = mult; weights_blob[sk] = shift
+        op["op"] = op["op"] + "_pc"
+        q = op["quant"]
+        q.pop("output_multiplier", None); q.pop("output_shift", None)
+        q["output_multiplier_per_oc_key"] = mk
+        q["output_shift_per_oc_key"] = sk
 
 
 def extract_int8(
@@ -738,6 +993,7 @@ def extract_int8(
     calibration_samples: "list | None" = None,
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
+    per_channel: bool = False,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -1083,6 +1339,25 @@ def extract_int8(
                     "shape": {"n": n},
                 })
 
+            elif isinstance(mod, torch.nn.ReLU6):
+                # Standalone ReLU6: clamp real values to [0, 6]. Keep the
+                # output at the input's scale (like relu_s8 keeps scale for
+                # plain relu) and express the 6.0 ceiling in int8 units:
+                # qmax = round(6 / s), saturated to [1, 127]. zp = 0.
+                in_scale = scales[in_name]
+                scales[node.name] = in_scale       # relu6 preserves scale
+                _record(node.name, dtype="i8")
+                qmax = max(1, min(127, int(round(6.0 / in_scale))))
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "relu6_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "clamp_max": qmax,
+                })
+
             elif isinstance(mod, torch.nn.Conv2d):
                 if mod.groups != 1:
                     raise NotImplementedError(
@@ -1255,6 +1530,11 @@ def extract_int8(
                 b_key = f"{node.target}.bias_q"
                 weights_blob[w_key] = w_q
                 weights_blob[b_key] = b_q
+                # fp32 copies for a possible per-channel re-quant or fp16 promotion.
+                fp32_stash[w_key] = w_fp32.cpu().numpy().astype(np.float32)
+                fp32_stash[b_key] = (b_fp32.cpu().numpy().astype(np.float32)
+                                     if b_fp32 is not None
+                                     else np.zeros((mod.out_channels,), np.float32))
                 real_mult = (in_scale * w_scale) / out_scale
                 multiplier, shift = _requantize_multiplier_shift(real_mult)
                 next_node = nodes[nodes.index(node) + 1] if nodes.index(node) + 1 < len(nodes) else None
@@ -1747,7 +2027,6 @@ def extract_int8(
                     "shape": {"N": N_, "C": C, "IH": IH, "IW": IW,
                               "scale": sf},
                 })
-
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported module {type(mod).__name__} "
@@ -1891,6 +2170,21 @@ def extract_int8(
                     "quant": {"scale_a": 1.0 / 127.0, "scale_b": scales[v_n],
                               "scale_out": scales[node.name], "scale_div": 1.0,
                               "activation_min": -128, "activation_max": 127},
+                })
+            elif tname == "relu6" or target is torch.nn.functional.relu6:
+                in_name = node.args[0].name
+                in_scale = scales[in_name]
+                scales[node.name] = in_scale       # relu6 preserves scale
+                _record(node.name, dtype="i8")
+                qmax = max(1, min(127, int(round(6.0 / in_scale))))
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": node.name,
+                    "op": "relu6_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "clamp_max": qmax,
                 })
             elif tname == "flatten" or target is torch.flatten:
                 in_name = node.args[0].name
@@ -2100,6 +2394,12 @@ def extract_int8(
     if not input_names or output_name is None:
         raise RuntimeError("int8 extract: graph missing input/output")
 
+    # Per-channel int8: tighten conv/linear weights to per-output-channel scales
+    # (skip ops about to be promoted to fp16). Backwards compatible — off by default.
+    if per_channel:
+        _apply_per_channel(ops, tensors_meta, weights_blob, fp32_stash, scales,
+                           skip_names=(fp16_op_names or set()))
+
     # Mixed precision: promote the requested ops to fp16 and materialize the
     # int8<->fp16 boundary casts. With no spec this is a no-op and the IR is
     # byte-identical to the all-int8 one.
@@ -2212,8 +2512,23 @@ def extract_int8(
             scaled += q["output_offset"]
             scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
             activations[out_name] = scaled.astype(np.int8)
+        elif op["op"] == "linear_s8_pc":
+            w_q = weights_blob[op["weight"]]
+            b_q = weights_blob[op["bias"]]
+            sh = op["shape"]; q = op["quant"]
+            mult = weights_blob[q["output_multiplier_per_oc_key"]]
+            shift = weights_blob[q["output_shift_per_oc_key"]]
+            in_2d = in_arr.reshape(sh["M"], sh["K"]).astype(np.int32)
+            w_2d = w_q.reshape(sh["N"], sh["K"]).astype(np.int32)
+            acc = in_2d @ w_2d.T + b_q.astype(np.int32)         # [M, N]
+            scaled = _requantize_int_per_oc(acc, mult, shift, oc_axis=1)
+            scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
+            activations[out_name] = scaled.astype(np.int8)
         elif op["op"] == "relu_s8":
             activations[out_name] = np.maximum(in_arr, 0).astype(np.int8)
+        elif op["op"] == "relu6_s8":
+            activations[out_name] = np.clip(
+                in_arr, 0, op["clamp_max"]).astype(np.int8)
         elif op["op"] == "conv2d_s8":
             activations[out_name] = _sim_conv2d_s8(
                 in_arr, op["shape"], op["quant"],
@@ -2240,6 +2555,46 @@ def extract_int8(
                     raise NotImplementedError(
                         f"int8 simulator: fused sub-op {sk!r} unsupported")
             activations[out_name] = cur
+        elif op["op"] == "conv2d_s8_pc":
+            sh = op["shape"]
+            q = op["quant"]
+            w_q = weights_blob[op["weight"]].astype(np.int32)  # [OC, IC, KH, KW]
+            b_q = weights_blob[op["bias"]].astype(np.int32)    # [OC]
+            in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
+            # Compute via direct sliding window (slow but correct simulator).
+            OH, OW = sh["OH"], sh["OW"]
+            KH, KW = sh["KH"], sh["KW"]
+            SH, SW = sh["SH"], sh["SW"]
+            PH, PW = sh["PH"], sh["PW"]
+            out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
+            for n in range(sh["N"]):
+                for oc in range(sh["OC"]):
+                    out[n, oc] = b_q[oc]
+                    for ic in range(sh["IC"]):
+                        for kh in range(KH):
+                            for kw in range(KW):
+                                # Build the input slice for this (kh, kw).
+                                ih_start = -PH + kh
+                                iw_start = -PW + kw
+                                # Compute valid output ranges.
+                                for oh in range(OH):
+                                    ih = oh * SH + ih_start
+                                    if ih < 0 or ih >= sh["IH"]:
+                                        # padded: in_v = input_offset
+                                        in_row = np.full(OW, q["input_offset"], dtype=np.int32)
+                                        in_row = np.zeros(OW, dtype=np.int32)
+                                        for ow in range(OW):
+                                            iw = ow * SW + iw_start
+                                            if iw < 0 or iw >= sh["IW"]:
+                                                in_row[ow] = q["input_offset"]
+                                                in_row[ow] = in_4d[n, ic, ih, iw] + q["input_offset"]
+                                    w_v = w_q[oc, ic, kh, kw] + q["filter_offset"]
+                                    out[n, oc, oh] += in_row * w_v
+                mult = weights_blob[q["output_multiplier_per_oc_key"]]
+                shift = weights_blob[q["output_shift_per_oc_key"]]
+                scaled = _requantize_int_per_oc(out, mult, shift, oc_axis=1)
+            scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
+            activations[out_name] = scaled.astype(np.int8)
         elif op["op"] == "maxpool2d_s8":
             sh = op["shape"]
             in_4d = in_arr.reshape(sh["N"], sh["C"], sh["IH"], sh["IW"])
@@ -2645,6 +3000,7 @@ def extract(
     calibration_samples: "list[torch.Tensor] | None" = None,
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
+    per_channel: bool = False,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -2665,6 +3021,7 @@ def extract(
             calibration_samples=calibration_samples,
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names,
+            per_channel=per_channel,
         )
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
@@ -2695,6 +3052,7 @@ def extract(
     # marker function. The per-node iteration below then sees that
     # marker and emits a clean single-op IR.
     _maybe_fuse_compound_activation(gm)
+    _maybe_fuse_loss(gm)
 
     tensors: dict[str, dict] = {}
     ops: list[dict] = []
@@ -2722,10 +3080,19 @@ def extract(
 
     _skip_nodes: set = set()
     for _n in gm.graph.nodes:
+        # `@` traces to operator.matmul (name "matmul"), not torch.matmul —
+        # match by name too so the diag/transpose fusions fire for both.
         if (_n.op == "call_function" and
-                _n.target in (torch.matmul, torch.mm)):
+                (_n.target in (torch.matmul, torch.mm, _operator.matmul)
+                 or getattr(_n.target, "__name__", "") in ("matmul", "mm"))):
             for _arg in _n.args[:2]:
                 if _is_transpose_node(_arg):
+                    _skip_nodes.add(_arg)
+                # diag(A) @ B is fused into diag_matmul; the diag node itself
+                # emits no op.
+                elif (isinstance(_arg, torch.fx.Node)
+                      and _arg.op == "call_function"
+                      and getattr(_arg.target, "__name__", "") == "diag"):
                     _skip_nodes.add(_arg)
 
     for node in gm.graph.nodes:
@@ -2743,7 +3110,11 @@ def extract(
                 )
             in_name = node.args[0].name
             out_name = node.name
-            tensors[out_name] = _tensor_meta(node)
+            # nn.LSTM returns a tuple (output, (h,c)); _tensor_meta can't read a
+            # tuple node's shape. The LSTM branch registers its own per-layer
+            # output tensors below, so skip the scalar-meta assignment here.
+            if not isinstance(mod, torch.nn.LSTM):
+                tensors[out_name] = _tensor_meta(node)
 
             if isinstance(mod, torch.nn.Linear):
                 w_key = f"{node.target}.weight"
@@ -2788,11 +3159,6 @@ def extract(
                 })
 
             elif isinstance(mod, torch.nn.Conv2d):
-                if mod.dilation != (1, 1):
-                    raise NotImplementedError(
-                        f"Conv2d with dilation={mod.dilation} not supported "
-                        f"yet at {node.name}"
-                    )
                 w_key = f"{node.target}.weight"
                 b_key = f"{node.target}.bias" if mod.bias is not None else None
                 weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
@@ -2806,6 +3172,7 @@ def extract(
                 KH, KW = _pair(mod.kernel_size)
                 SH, SW = _pair(mod.stride)
                 PH, PW = _pair(mod.padding)
+                DH, DW = _pair(mod.dilation)
                 # Depthwise conv: each output channel reads from one input
                 # channel via its own [1, KH, KW] filter. Detected when
                 # groups == in_channels == out_channels. Different memory
@@ -2824,9 +3191,10 @@ def extract(
                             "KH": KH, "KW": KW,
                             "SH": SH, "SW": SW,
                             "PH": PH, "PW": PW,
+                            "DH": DH, "DW": DW,
                         },
                     })
-                elif mod.groups == IC and IC == OC:
+                elif mod.groups == IC and IC == OC and DH == 1 and DW == 1:
                     ops.append({
                         "name": str(node.target),
                         "op": "conv2d_dw",
@@ -2851,6 +3219,205 @@ def extract(
                         f"{node.name}"
                     )
 
+            elif isinstance(mod, torch.nn.Conv1d):
+                # 1D conv → conv2d with a unit height dim: input [N,C,L] is
+                # [N,C,1,L]; weight [OC,IC,K] → [OC,IC,1,K]; KH=1, KW=K.
+                # Dilation maps to DW (the height dim is degenerate, DH=1).
+                (Dl,) = _as_tuple1(mod.dilation)
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, IC, IW = in_shape
+                OC, OW = out_shape[1], out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride)
+                (P,) = _as_tuple1(mod.padding)
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                w = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                weights[w_key] = w.reshape(w.shape[0], w.shape[1], 1, w.shape[2])
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                if mod.groups == 1:
+                    ops.append({
+                        "name": str(node.target), "op": "conv2d",
+                        "inputs": [in_name], "outputs": [out_name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "IC": IC, "IH": 1, "IW": IW,
+                                  "OC": OC, "OH": 1, "OW": OW,
+                                  "KH": 1, "KW": K, "SH": 1, "SW": S,
+                                  "PH": 0, "PW": P, "DH": 1, "DW": Dl},
+                    })
+                elif mod.groups == IC and IC == OC and Dl == 1:
+                    ops.append({
+                        "name": str(node.target), "op": "conv2d_dw",
+                        "inputs": [in_name], "outputs": [out_name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "C": IC, "IH": 1, "IW": IW,
+                                  "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                                  "SH": 1, "SW": S, "PH": 0, "PW": P},
+                    })
+                else:
+                    raise NotImplementedError(
+                        f"Conv1d groups={mod.groups} (IC={IC},OC={OC}) "
+                        f"dilation={Dl} at {node.name}: only standard and "
+                        f"non-dilated depthwise wired")
+
+            elif isinstance(mod, torch.nn.ConvTranspose1d):
+                # 1D transposed conv → conv_transpose2d, unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, IC, IW = in_shape
+                OC, OW = out_shape[1], out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride)
+                (P,) = _as_tuple1(mod.padding)
+                (Dl,) = _as_tuple1(mod.dilation)
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                w = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                weights[w_key] = w.reshape(w.shape[0], w.shape[1], 1, w.shape[2])
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                ops.append({
+                    "name": str(node.target), "op": "conv_transpose2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "IH": 1, "IW": IW,
+                              "OC": OC, "OH": 1, "OW": OW,
+                              "KH": 1, "KW": K, "SH": 1, "SW": S,
+                              "PH": 0, "PW": P, "DH": 1, "DW": Dl,
+                              "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.ConvTranspose2d):
+                # Transposed conv. Weight is [IC, OC/G, KH, KW]. OH/OW come from
+                # the traced output shape, so output_padding is already folded
+                # in. The rvv backend repacks this 4D weight to IHWO like any
+                # conv weight; the kernel honors that via its IHWOC branch.
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                in_shape = tensors[in_name]["shape"]
+                out_shape = tensors[out_name]["shape"]
+                N_, IC, IH, IW = (int(s) for s in in_shape)
+                _, OC, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                SH, SW = _pair(mod.stride)
+                PH, PW = _pair(mod.padding)
+                DH, DW = _pair(mod.dilation)
+                G = int(mod.groups)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "conv_transpose2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "weight": w_key,
+                    "bias": b_key,
+                    "shape": {
+                        "N": N_, "IC": IC, "IH": IH, "IW": IW,
+                        "OC": OC, "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                        "DH": DH, "DW": DW,
+                        "G": G,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.Conv3d):
+                # 3D conv (NCDHW). Weight [OC, IC/G, KD, KH, KW] is 5D so the
+                # backend leaves it in OIDHW (no IHWO repack for 5D).
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                N_, IC, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, OC, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "conv3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "ID": ID, "IH": IH, "IW": IW,
+                              "OC": OC, "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW, "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.ConvTranspose3d):
+                # 3D transposed conv. Weight [IC, OC/G, KD, KH, KW] (5D). OD/OH/
+                # OW come from the traced output shape (output_padding folded in).
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                N_, IC, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, OC, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "conv_transpose3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "ID": ID, "IH": IH, "IW": IW,
+                              "OC": OC, "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW, "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.MaxPool3d):
+                N_, C, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, _, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride if mod.stride is not None
+                                     else mod.kernel_size)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "maxpool3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "ID": ID, "IH": IH, "IW": IW,
+                              "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW},
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool3d):
+                N_, C, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, _, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride if mod.stride is not None
+                                     else mod.kernel_size)
+                PD, PH, PW = _triple(mod.padding)
+                if not mod.count_include_pad and (PD or PH or PW):
+                    raise NotImplementedError(
+                        f"AvgPool3d count_include_pad=False with padding at "
+                        f"{node.name}")
+                ops.append({
+                    "name": str(node.target), "op": "avgpool3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "ID": ID, "IH": IH, "IW": IW,
+                              "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW},
+                })
+
             elif isinstance(mod, torch.nn.MaxPool2d):
                 in_shape = tensors[in_name]["shape"]
                 out_shape = tensors[out_name]["shape"]
@@ -2874,6 +3441,164 @@ def extract(
                         "PH": PH, "PW": PW,
                         "DH": DH, "DW": DW,
                     },
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool2d):
+                in_shape = tensors[in_name]["shape"]
+                out_shape = tensors[out_name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                _, _, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                # nn.AvgPool2d.stride defaults to None → same as kernel_size.
+                SH, SW = _pair(mod.stride if mod.stride is not None
+                               else mod.kernel_size)
+                PH, PW = _pair(mod.padding)
+                if not mod.count_include_pad and (PH or PW):
+                    raise NotImplementedError(
+                        f"AvgPool2d count_include_pad=False with padding is not "
+                        f"supported at {node.name}")
+                ops.append({
+                    "name": str(node.target),
+                    "op": "avgpool2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {
+                        "N": N_, "C": C,
+                        "IH": IH, "IW": IW,
+                        "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.MaxPool1d):
+                # 1D max pool → maxpool2d with a unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, C, IW = in_shape
+                OW = out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride if mod.stride is not None
+                                  else mod.kernel_size)
+                (P,) = _as_tuple1(mod.padding)
+                (Dl,) = _as_tuple1(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "maxpool2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": 1, "IW": IW,
+                              "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                              "SH": 1, "SW": S, "PH": 0, "PW": P,
+                              "DH": 1, "DW": Dl},
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool1d):
+                # 1D average pool → avgpool2d with a unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, C, IW = in_shape
+                OW = out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride if mod.stride is not None
+                                  else mod.kernel_size)
+                (P,) = _as_tuple1(mod.padding)
+                ops.append({
+                    "name": str(node.target), "op": "avgpool2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": 1, "IW": IW,
+                              "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                              "SH": 1, "SW": S, "PH": 0, "PW": P},
+                })
+
+            elif isinstance(mod, torch.nn.LayerNorm):
+                # LayerNorm over the trailing normalized_shape dims. K = product
+                # of normalized_shape, M = product of the leading dims. gamma /
+                # beta are flattened to length K (ones/zeros if affine is off).
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ns = tuple(int(s) for s in mod.normalized_shape)
+                K = int(np.prod(ns)) if ns else 1
+                total = int(np.prod(in_shape))
+                if K == 0 or total % K != 0:
+                    raise NotImplementedError(
+                        f"LayerNorm at {node.name}: normalized_shape {ns} does "
+                        f"not divide input {in_shape}")
+                M = total // K
+                g_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias"
+                if mod.elementwise_affine and mod.weight is not None:
+                    weights[g_key] = mod.weight.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                    weights[b_key] = mod.bias.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                else:
+                    weights[g_key] = np.ones(K, dtype=weight_dtype)
+                    weights[b_key] = np.zeros(K, dtype=weight_dtype)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "layer_norm",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "gamma_key": g_key,
+                    "beta_key": b_key,
+                    "eps": float(mod.eps),
+                    "shape": {"M": M, "K": K},
+                })
+
+            elif isinstance(mod, (torch.nn.GroupNorm, torch.nn.InstanceNorm2d)):
+                # Both normalize over (channels-in-group × spatial) per sample;
+                # InstanceNorm2d is the num_groups == num_channels case. gamma /
+                # beta are per-channel (ones/zeros when affine is off).
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                N_ = in_shape[0]
+                C = in_shape[1]
+                HW = int(np.prod(in_shape[2:])) if len(in_shape) > 2 else 1
+                if isinstance(mod, torch.nn.GroupNorm):
+                    G = int(mod.num_groups)
+                    affine = bool(mod.affine)
+                    eps = float(mod.eps)
+                else:  # InstanceNorm2d: one group per channel
+                    G = C
+                    affine = bool(mod.affine)
+                    eps = float(mod.eps)
+                if C % G != 0:
+                    raise NotImplementedError(
+                        f"group_norm at {node.name}: C={C} not divisible by "
+                        f"G={G}")
+                g_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias"
+                if affine and getattr(mod, "weight", None) is not None:
+                    weights[g_key] = mod.weight.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                    weights[b_key] = mod.bias.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                else:
+                    weights[g_key] = np.ones(C, dtype=weight_dtype)
+                    weights[b_key] = np.zeros(C, dtype=weight_dtype)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "group_norm",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "gamma_key": g_key,
+                    "beta_key": b_key,
+                    "eps": eps,
+                    "shape": {"N": N_, "C": C, "G": G, "HW": HW},
+                })
+
+            elif isinstance(mod, torch.nn.TripletMarginLoss):
+                # 3 inputs (anchor, positive, negative), p=2, reduction=mean.
+                a_name = node.args[0].name
+                p_name = node.args[1].name
+                n_name = node.args[2].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                B = a_shape[0]
+                Feat = int(np.prod(a_shape[1:])) if len(a_shape) > 1 else 1
+                ops.append({
+                    "name": str(node.target), "op": "triplet_loss",
+                    "inputs": [a_name, p_name, n_name],
+                    "outputs": [out_name],
+                    "margin": float(mod.margin),
+                    "shape": {"B": B, "F": Feat},
                 })
 
             elif isinstance(mod, torch.nn.Dropout):
@@ -3057,6 +3782,63 @@ def extract(
                               "scale": sf},
                 })
 
+            elif isinstance(mod, torch.nn.LSTM):
+                # fp32 mirror of the int8 lstm_s8 decomposition: one `lstm` op
+                # per layer, chained via its output tensor, with persistent
+                # float h/c state (seq-len-1 unroll; state persists between
+                # run_model calls, BSS-zeroed => correct step-0 init).
+                if mod.bidirectional:
+                    raise NotImplementedError("fp32 LSTM: bidirectional unsupported")
+                L = int(mod.num_layers)
+                H = int(mod.hidden_size)
+                in_size0 = int(tensors[in_name]["shape"][-1])
+                gi0 = _find_getitem_consumer(node, 0)
+                gi1 = _find_getitem_consumer(node, 1)
+                final_name = gi0.name if gi0 is not None else node.name
+                if gi0 is not None:
+                    _skip_nodes.add(gi0)
+                if gi1 is not None:
+                    _skip_nodes.add(gi1)
+                prefix = node.name
+                x_name = in_name
+                for lyr in range(L):
+                    wih = getattr(mod, f"weight_ih_l{lyr}").detach()
+                    whh = getattr(mod, f"weight_hh_l{lyr}").detach()
+                    bias = torch.zeros(4 * H)
+                    bih = getattr(mod, f"bias_ih_l{lyr}", None)
+                    bhh = getattr(mod, f"bias_hh_l{lyr}", None)
+                    if bih is not None:
+                        bias = bias + bih.detach()
+                    if bhh is not None:
+                        bias = bias + bhh.detach()
+                    in_l = in_size0 if lyr == 0 else H
+                    wih_key = f"{prefix}_wih_l{lyr}"
+                    whh_key = f"{prefix}_whh_l{lyr}"
+                    bias_key = f"{prefix}_bias_l{lyr}"
+                    weights[wih_key] = wih.cpu().numpy().reshape(
+                        4 * H, in_l).astype(weight_dtype)
+                    weights[whh_key] = whh.cpu().numpy().reshape(
+                        4 * H, H).astype(weight_dtype)
+                    weights[bias_key] = bias.cpu().numpy().astype(weight_dtype)
+                    h_name = f"{prefix}_h_l{lyr}"
+                    c_name = f"{prefix}_c_l{lyr}"
+                    out_nm = final_name if lyr == L - 1 else f"{prefix}_out_l{lyr}"
+                    dt = "f16" if weight_dtype == np.float16 else "f32"
+                    for nm in (h_name, c_name, out_nm):
+                        tensors[nm] = {"shape": [1, H], "dtype": dt, "quant": None}
+                    ops.append({
+                        "name": f"{node.target}_l{lyr}",
+                        "op": "lstm",   # _f16 suffix added by the rename pass below
+                        "inputs": [x_name],
+                        "outputs": [out_nm],
+                        "state": {"h": h_name, "c": c_name},
+                        "weight_ih": wih_key,
+                        "weight_hh": whh_key,
+                        "bias": bias_key,
+                        "shape": {"in_size": in_l, "H": H},
+                    })
+                    x_name = out_nm
+
         elif node.op == "call_function":
             out_name = node.name
             target = node.target
@@ -3158,6 +3940,136 @@ def extract(
                     "outputs": [out_name],
                     "shape": {"n": n},
                 })
+            elif tname == "softmax" or target is torch.softmax \
+                    or target is torch.nn.functional.softmax:
+                # KernelBench 23_Softmax: torch.softmax(x, dim=...). The
+                # reference kernel normalizes over contiguous rows, so only a
+                # last-axis softmax is supported (M = leading dims, K = last).
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ndim = len(in_shape)
+                dim = node.kwargs.get("dim") if node.kwargs else None
+                if dim is None and len(node.args) > 1:
+                    dim = node.args[1]
+                if dim is None:
+                    raise NotImplementedError(
+                        f"softmax at {node.name}: implicit dim not supported")
+                dim = int(dim)
+                if dim < 0:
+                    dim += ndim
+                if dim != ndim - 1:
+                    raise NotImplementedError(
+                        f"softmax at {node.name}: only last-axis softmax "
+                        f"supported (got dim={dim} of {ndim}D)")
+                K = in_shape[-1]
+                M = int(np.prod(in_shape[:-1])) if ndim > 1 else 1
+                ops.append({
+                    "name": node.name,
+                    "op": "softmax",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"M": M, "K": K},
+                })
+            elif tname == "log_softmax" or target is torch.log_softmax \
+                    or target is torch.nn.functional.log_softmax:
+                # KernelBench 24_LogSoftmax. Last-axis only, as with softmax.
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ndim = len(in_shape)
+                dim = node.kwargs.get("dim") if node.kwargs else None
+                if dim is None and len(node.args) > 1:
+                    dim = node.args[1]
+                if dim is None:
+                    raise NotImplementedError(
+                        f"log_softmax at {node.name}: implicit dim not supported")
+                dim = int(dim)
+                if dim < 0:
+                    dim += ndim
+                if dim != ndim - 1:
+                    raise NotImplementedError(
+                        f"log_softmax at {node.name}: only last-axis supported "
+                        f"(got dim={dim} of {ndim}D)")
+                K = in_shape[-1]
+                M = int(np.prod(in_shape[:-1])) if ndim > 1 else 1
+                ops.append({
+                    "name": node.name,
+                    "op": "log_softmax",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"M": M, "K": K},
+                })
+            elif tname == "log" or target is torch.log:
+                # Elementwise natural log (used before F.kl_div, KernelBench 98).
+                in_name = node.args[0].name
+                n = int(np.prod(tensors[in_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "log",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+            elif tname == "smooth_l1_loss" \
+                    or target is torch.nn.functional.smooth_l1_loss:
+                # Huber / smooth-L1 loss (KernelBench 96). beta defaults to 1.0.
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                n = int(np.prod(tensors[a_name]["shape"]))
+                beta = float((node.kwargs or {}).get("beta", 1.0))
+                ops.append({
+                    "name": node.name, "op": "huber_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "beta": beta, "shape": {"n": n},
+                })
+            elif tname == "cross_entropy" \
+                    or target is torch.nn.functional.cross_entropy:
+                # Mean cross-entropy (KernelBench 95). logits [N, C], targets [N]
+                # class indices (carried as floats in the flat io buffer).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                if len(a_shape) != 2:
+                    raise NotImplementedError(
+                        f"cross_entropy at {node.name}: only [N, C] logits "
+                        f"supported (got {a_shape})")
+                ops.append({
+                    "name": node.name, "op": "cross_entropy_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"N": a_shape[0], "C": a_shape[1]},
+                })
+            elif tname == "scaled_dot_product_attention" \
+                    or target is torch.nn.functional.scaled_dot_product_attention:
+                # SDPA (KernelBench 97). Q/K/V are [B, H, S, D]; flatten B*H.
+                q_name = node.args[0].name
+                k_name = node.args[1].name
+                v_name = node.args[2].name
+                q_shape = [int(s) for s in tensors[q_name]["shape"]]
+                if len(q_shape) != 4:
+                    raise NotImplementedError(
+                        f"sdpa at {node.name}: only [B,H,S,D] supported "
+                        f"(got {q_shape})")
+                B, H, S, D = q_shape
+                ops.append({
+                    "name": node.name, "op": "sdpa",
+                    "inputs": [q_name, k_name, v_name], "outputs": [out_name],
+                    "shape": {"BH": B * H, "S": S, "D": D},
+                })
+            elif tname == "kl_div" or target is torch.nn.functional.kl_div:
+                # KL divergence, reduction='batchmean' (KernelBench 98). First
+                # arg is already log(pred).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                red = (node.kwargs or {}).get("reduction", "mean")
+                if red != "batchmean":
+                    raise NotImplementedError(
+                        f"kl_div at {node.name}: only reduction='batchmean' "
+                        f"supported (got {red!r})")
+                N = a_shape[0]
+                C = int(np.prod(a_shape[1:])) if len(a_shape) > 1 else 1
+                ops.append({
+                    "name": node.name, "op": "kldiv_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"N": N, "C": C},
+                })
             elif tname == "elu" or target is torch.nn.functional.elu:
                 # KernelBench 31_ELU may use functional too. nn.ELU's
                 # alpha defaults to 1.0; functional takes alpha kwarg.
@@ -3257,6 +4169,62 @@ def extract(
             # KernelBench Phase 2 reductions over a single dim. The
             # 3D logical shape (outer, reduce, inner) is computed from
             # the input shape and the `dim` argument.
+            elif tname in ("cumsum", "cumprod") or target in (torch.cumsum,
+                                                              torch.cumprod):
+                # Cumulative scan along a dim → {outer, axis, inner}.
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                d = node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)
+                d = int(d)
+                if d < 0:
+                    d += len(in_shape)
+                outer = int(np.prod(in_shape[:d])) if d > 0 else 1
+                axis = int(in_shape[d])
+                inner = int(np.prod(in_shape[d+1:])) if d + 1 < len(in_shape) else 1
+                op_name = "cumsum" if (tname == "cumsum" or target is torch.cumsum) \
+                    else "cumprod"
+                ops.append({
+                    "name": node.name, "op": op_name,
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"outer": outer, "axis": axis, "inner": inner},
+                })
+            elif ((tname == "mul" or target in (torch.mul, _operator.mul))
+                  and isinstance(node.args[0], torch.fx.Node)
+                  and isinstance(node.args[1], torch.fx.Node)):
+                # Elementwise multiply of two tensors (KernelBench 93 x*mask,
+                # 100 pred*targets). Scalar mul (one non-Node arg) is handled
+                # below. Requires equal shapes (no broadcast).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = tensors[a_name]["shape"]
+                b_shape = tensors[b_name]["shape"]
+                if list(a_shape) != list(b_shape):
+                    raise NotImplementedError(
+                        f"mul at {node.name}: broadcasting not supported "
+                        f"(a={a_shape} b={b_shape})")
+                n = int(np.prod(a_shape))
+                ops.append({
+                    "name": node.name, "op": "mul",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+            elif (tname == "mul" or target in (torch.mul, _operator.mul)):
+                # Tensor * scalar constant (KernelBench 5, A * s). Exactly one
+                # arg is a Node (the tensor), the other a bound Python scalar.
+                a, b = node.args[0], node.args[1]
+                if isinstance(a, torch.fx.Node) and not isinstance(b, torch.fx.Node):
+                    t_node, s = a, b
+                elif isinstance(b, torch.fx.Node) and not isinstance(a, torch.fx.Node):
+                    t_node, s = b, a
+                else:
+                    raise NotImplementedError(
+                        f"mul at {node.name}: unexpected args {node.args}")
+                n = int(np.prod(tensors[t_node.name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "mul_scalar",
+                    "inputs": [t_node.name], "outputs": [out_name],
+                    "scalar": float(s), "shape": {"n": n},
+                })
             elif tname == "sum" or target is torch.sum:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
@@ -3440,6 +4408,63 @@ def extract(
                     "inputs": [in_name], "outputs": [out_name],
                     "shape": {"n": n},
                 })
+            elif target is _agents_compound_rms_norm:
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                dim = 1  # RMSNorm reduces over the channel axis, keepdim=True
+                outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
+                reduce = int(in_shape[dim])
+                inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
+                ops.append({
+                    "name": node.name, "op": "rms_norm",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "eps": float(node.meta.get("rms_eps", 1e-5)),
+                    "shape": {"outer": outer, "reduce": reduce, "inner": inner},
+                })
+            elif target is _agents_loss_mse or target is _agents_loss_hinge:
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                n = int(node.meta.get("loss_n",
+                                      int(np.prod(tensors[a_name]["shape"]))))
+                if target is _agents_loss_mse:
+                    ops.append({
+                        "name": node.name, "op": "mse_loss",
+                        "inputs": [a_name, b_name], "outputs": [out_name],
+                        "shape": {"n": n},
+                    })
+                else:
+                    # Hinge: targ may broadcast over pred (targ_len divides n).
+                    targ_len = int(np.prod(tensors[b_name]["shape"]))
+                    ops.append({
+                        "name": node.name, "op": "hinge_loss",
+                        "inputs": [a_name, b_name], "outputs": [out_name],
+                        "shape": {"n": n, "targ_len": max(1, targ_len)},
+                    })
+            elif target is _agents_compound_mean_abs_norm:
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                dim = 1  # L1 norm divides by mean(|x|) over dim=1, keepdim=True
+                outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
+                reduce = int(in_shape[dim])
+                inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
+                ops.append({
+                    "name": node.name, "op": "mean_abs_norm",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"outer": outer, "reduce": reduce, "inner": inner},
+                })
+            elif target is _agents_compound_excl_cumsum:
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                if len(in_shape) != 2:
+                    raise NotImplementedError(
+                        f"exclusive_cumsum at {node.name}: only 2D supported "
+                        f"(got {in_shape})")
+                B, N = in_shape
+                ops.append({
+                    "name": node.name, "op": "exclusive_cumsum",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"Bout": B - 1, "N": N},
+                })
             elif tname == "hardtanh" \
                     or target is torch.nn.functional.hardtanh:
                 in_name = node.args[0].name
@@ -3463,32 +4488,51 @@ def extract(
             elif (target is torch.matmul or target is torch.mm or
                   tname in ("matmul", "mm")):
                 arg_a_node, arg_b_node = node.args[0], node.args[1]
-                trans_a = _is_transpose_node(arg_a_node)
-                trans_b = _is_transpose_node(arg_b_node)
-                a_node = arg_a_node.args[0] if trans_a else arg_a_node
-                b_node = arg_b_node.args[0] if trans_b else arg_b_node
-                # Shape before transpose: a_shape is (K,M) if trans_a else (M,K)
-                a_shape = list(tensors[a_node.name]["shape"])
-                b_shape = list(tensors[b_node.name]["shape"])
-                if trans_a:
-                    K, M = int(a_shape[0]), int(a_shape[1])
+                # diag(A) @ B — A is 1D, diag makes it NxN, then row-scales B.
+                # Emit a fused diag_matmul (out[i,j]=A[i]*B[i,j]) rather than
+                # materializing the NxN diagonal matrix (KernelBench 12).
+                if (isinstance(arg_a_node, torch.fx.Node)
+                        and arg_a_node.op == "call_function"
+                        and getattr(arg_a_node.target, "__name__", "") == "diag"):
+                    a1_node = arg_a_node.args[0]
+                    b_shape = list(tensors[arg_b_node.name]["shape"])
+                    ops.append({
+                        "name": node.name, "op": "diag_matmul",
+                        "inputs": [a1_node.name, arg_b_node.name],
+                        "outputs": [out_name],
+                        "shape": {"N": int(b_shape[0]), "M": int(b_shape[1])},
+                    })
                 else:
-                    M, K = int(a_shape[0]), int(a_shape[1])
-                N = int(b_shape[0]) if trans_b else int(b_shape[1])
-                if trans_a and trans_b:
-                    op_kind = "matmul_tatb"
-                elif trans_a:
-                    op_kind = "matmul_ta"
-                elif trans_b:
-                    op_kind = "matmul_tb"
-                else:
-                    op_kind = "matmul"
-                ops.append({
-                    "name": node.name, "op": op_kind,
-                    "inputs": [a_node.name, b_node.name],
-                    "outputs": [out_name],
-                    "shape": {"M": M, "K": K, "N": N},
-                })
+                    trans_a = _is_transpose_node(arg_a_node)
+                    trans_b = _is_transpose_node(arg_b_node)
+                    a_node = arg_a_node.args[0] if trans_a else arg_a_node
+                    b_node = arg_b_node.args[0] if trans_b else arg_b_node
+                    a_shape = list(tensors[a_node.name]["shape"])
+                    b_shape = list(tensors[b_node.name]["shape"])
+                    # N-D @ 2D: flatten A's leading dims into M (contiguous
+                    # row-major, so the matmul kernel sees a plain [M,K]). This
+                    # covers torch.matmul(A_3d/4d, B_2d) (KernelBench 10) and the
+                    # einsum "...l,lk->...k" reduction. Transposed forms stay 2D.
+                    if trans_a:
+                        K, M = int(a_shape[0]), int(a_shape[1])
+                    else:
+                        M = int(np.prod(a_shape[:-1]))
+                        K = int(a_shape[-1])
+                    N = int(b_shape[0]) if trans_b else int(b_shape[-1])
+                    if trans_a and trans_b:
+                        op_kind = "matmul_tatb"
+                    elif trans_a:
+                        op_kind = "matmul_ta"
+                    elif trans_b:
+                        op_kind = "matmul_tb"
+                    else:
+                        op_kind = "matmul"
+                    ops.append({
+                        "name": node.name, "op": op_kind,
+                        "inputs": [a_node.name, b_node.name],
+                        "outputs": [out_name],
+                        "shape": {"M": M, "K": K, "N": N},
+                    })
             elif target is torch.bmm or tname == "bmm":
                 a_name = node.args[0].name
                 b_name = node.args[1].name
@@ -3504,6 +4548,58 @@ def extract(
                         "K": int(a_shape[2]),
                         "N": int(b_shape[2]),
                     },
+                })
+            elif tname in ("triu", "tril") or target in (torch.triu, torch.tril):
+                # Upper/lower triangular mask of a 2D matrix (KernelBench 14/15,
+                # typically triu(matmul(A,B))). diagonal from kwargs/args[1].
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                if len(in_shape) != 2:
+                    raise NotImplementedError(
+                        f"{tname} at {node.name}: only 2D supported "
+                        f"(got {in_shape})")
+                diagonal = 0
+                if node.kwargs and "diagonal" in node.kwargs:
+                    diagonal = int(node.kwargs["diagonal"])
+                elif len(node.args) > 1:
+                    diagonal = int(node.args[1])
+                op_name = "triu" if (tname == "triu" or target is torch.triu) \
+                    else "tril"
+                ops.append({
+                    "name": node.name, "op": op_name,
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"M": in_shape[0], "N": in_shape[1],
+                              "diagonal": diagonal},
+                })
+            elif tname == "einsum" or target is torch.einsum:
+                # Only the "<lead>l,lk-><lead>k" reduction (A's last dim
+                # contracts with B's first; B is 2D) is wired — it's a plain
+                # matmul with A's leading dims flattened into M (KernelBench 11).
+                eq = node.args[0]
+                operands = node.args[1:]
+                if len(operands) == 1 and isinstance(operands[0], (tuple, list)):
+                    operands = tuple(operands[0])
+                eq_norm = eq.replace(" ", "")
+                a_name = operands[0].name
+                b_name = operands[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                b_shape = [int(s) for s in tensors[b_name]["shape"]]
+                lhs, rhs = eq_norm.split("->")
+                a_sub, b_sub = lhs.split(",")
+                ok = (len(b_sub) == 2 and len(b_shape) == 2
+                      and a_sub[-1] == b_sub[0]           # contract A_last · B_0
+                      and rhs == a_sub[:-1] + b_sub[1])   # output = lead + B_1
+                if not ok:
+                    raise NotImplementedError(
+                        f"einsum {eq!r} at {node.name}: only "
+                        f"'...l,lk->...k' (matmul) is supported")
+                M = int(np.prod(a_shape[:-1]))
+                K = int(a_shape[-1])
+                N = int(b_shape[1])
+                ops.append({
+                    "name": node.name, "op": "matmul",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"M": M, "K": K, "N": N},
                 })
             elif target is torch.cat or tname == "cat":
                 # torch.cat(tensors_list, dim). YOLOv8 uses dim=1 (channel
@@ -3525,11 +4621,17 @@ def extract(
                     )
                 in_names = [t.name for t in tensors_arg]
                 first_shape = list(tensors[in_names[0]]["shape"])
-                if len(first_shape) != 4:
+                # 4D NCHW channel-concat, or 2D [N,C] feature-concat (as
+                # [N,C,1,1] for the cat_c1 kernel) — the vision|depth|state fuse.
+                if len(first_shape) == 4:
+                    N_, _, H_, W_ = (int(s) for s in first_shape)
+                elif len(first_shape) == 2:
+                    N_ = int(first_shape[0]); H_ = W_ = 1
+                else:
                     raise NotImplementedError(
-                        f"cat at {node.name}: only 4D NCHW inputs supported."
+                        f"cat at {node.name}: only 2D [N,C] or 4D NCHW inputs "
+                        f"supported (got {first_shape})."
                     )
-                N_, _, H_, W_ = (int(s) for s in first_shape)
                 c_inputs = [int(tensors[n]["shape"][1]) for n in in_names]
                 op_kind = f"cat{len(in_names)}_c1"
                 if len(in_names) not in (2, 3, 4):
@@ -3610,6 +4712,31 @@ def extract(
                     "shape": {"N": N_, "C": C, "H": H_, "W": W_,
                               "c_each": c_each},
                 })
+            elif target == "flip":
+                # Tensor.flip(dim) — reverse along one axis. dims may be an int
+                # or a 1-elem tuple/list (KernelBench 91 uses a single dim).
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                dims = node.args[1] if len(node.args) > 1 \
+                    else node.kwargs.get("dims")
+                if isinstance(dims, (tuple, list)):
+                    if len(dims) != 1:
+                        raise NotImplementedError(
+                            f"flip at {node.name}: only single-axis supported")
+                    d = int(dims[0])
+                else:
+                    d = int(dims)
+                if d < 0:
+                    d += len(in_shape)
+                outer = int(np.prod(in_shape[:d])) if d > 0 else 1
+                axis = int(in_shape[d])
+                inner = int(np.prod(in_shape[d+1:])) if d + 1 < len(in_shape) else 1
+                tensors[node.name] = _tensor_meta(node)
+                ops.append({
+                    "name": node.name, "op": "flip",
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"outer": outer, "axis": axis, "inner": inner},
+                })
             else:
                 raise NotImplementedError(
                     f"unhandled call_method '{target}' at {node.name}"
@@ -3681,14 +4808,28 @@ def extract(
     # numerics — not an fp32 trace down-cast at the boundary.
     with torch.no_grad():
         if quant == "fp16":
-            ref_inputs_exec = [t.half() for t in sample_inputs]
-            ref_model = model.half()
+            # The reference kernels use fp16 STORAGE but fp32 MATH (load
+            # _Float16 -> float, accumulate in float, store _Float16). Compute
+            # the golden the same way: round inputs to fp16, run the model in
+            # fp32 on those rounded values, then store the output as fp16. This
+            # matches the kernels' numerics (a genuine `model.half()` would
+            # instead accumulate in fp16 — e.g. cross_entropy's 4096-class
+            # logsumexp drifts ~0.1 — and also lacks CPU Half kernels for some
+            # ops like avg_pool3d). ALL tensor inputs (including int class-index
+            # targets and bool masks) are round-tripped through fp16 so the
+            # golden sees exactly what the kernel reads from the fp16 io buffer
+            # — e.g. cross_entropy indices > 2048 aren't representable in fp16,
+            # so both golden and kernel must use the same fp16-rounded index.
+            ref_inputs_exec = [t.to(torch.float16).to(t.dtype)
+                               if torch.is_tensor(t) else t
+                               for t in sample_inputs]
             torch_dtype = torch.float16
+            out = model.float()(*ref_inputs_exec)
         else:
             ref_inputs_exec = list(sample_inputs)
             ref_model = model
             torch_dtype = torch.float32
-        out = ref_model(*ref_inputs_exec)
+            out = ref_model(*ref_inputs_exec)
 
     # Multi-output models return a tuple; flatten in IR-output order so the
     # downstream comparator just needs to do an elementwise compare.
@@ -3725,13 +4866,348 @@ def extract(
     return ir
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _cpu_fp32_tensor_creation():
+    """Patch torch tensor-creation ops so benches that hard-code
+    device='cuda' and/or dtype=float16 in get_inputs (e.g. 97 SDPA) still
+    materialize on CPU in fp32. Restores the originals on exit."""
+    names = ["rand", "randn", "zeros", "ones", "empty", "full", "randint",
+             "arange", "tensor", "eye", "linspace"]
+    saved = {n: getattr(torch, n) for n in names if hasattr(torch, n)}
+
+    def _wrap(fn):
+        def inner(*args, **kwargs):
+            if kwargs.get("device") is not None:
+                kwargs["device"] = "cpu"
+            if kwargs.get("dtype") == torch.float16:
+                kwargs["dtype"] = torch.float32
+            return fn(*args, **kwargs)
+        return inner
+
+    try:
+        for n, fn in saved.items():
+            setattr(torch, n, _wrap(fn))
+        yield
+    finally:
+        for n, fn in saved.items():
+            setattr(torch, n, fn)
+
+
+# --- utilization-aware sizing -------------------------------------------------
+# The legacy `max_elements` policy halves whatever module attr is largest until
+# a tiny total element count is met — which collapses conv/matmul channel counts
+# to ~16 and leaves XNNPACK/RVV overhead-bound (41 inst/MAC measured). Instead we
+# cap the *baked io footprint* (input+golden bytes) and shrink dims by category:
+# structural attrs define the op (never touched); batch just replicates work
+# (shrunk first); spatial next; channel/feature dims drive vector/GEMM
+# utilization so they're protected (shrunk last, with a floor). Categorization is
+# by the attr-name vocabulary the level1 benches actually use.
+_KB_STRUCT = {"kernel_size", "stride", "padding", "dilation", "groups",
+              "num_classes", "num_heads", "num_groups", "stride_w", "stride_h",
+              "padding_w", "padding_h", "reduce_dim"}
+_KB_BATCH = {"batch_size", "sequence_length"}
+_KB_SPATIAL = {"width", "height", "length", "depth", "width_in", "height_in",
+               "spatial"}
+_KB_CHANNEL = {"in_channels", "out_channels", "channels", "features", "dim",
+               "hidden_size", "embed_dim", "k", "m", "l", "n"}
+_KB_FLOOR = {"batch": 1, "spatial": 16, "channel": 32}
+
+
+def _kb_attr_group(name: str) -> "str | None":
+    if name in _KB_STRUCT:
+        return None            # structural — never shrink
+    if name in _KB_BATCH:
+        return "batch"
+    if name in _KB_SPATIAL:
+        return "spatial"
+    if name in _KB_CHANNEL:
+        return "channel"
+    return "spatial"           # unknown dim → treat like spatial (before channels)
+
+
+def _kb_footprint_bytes(mod) -> int:
+    """Baked io footprint (input + golden output) in fp32 bytes at the module's
+    current dims. Runs a forward to size the output."""
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    m.eval()
+    ins = mod.get_inputs()
+    with torch.no_grad():
+        o = m(*ins)
+    outs = o if isinstance(o, (list, tuple)) else [o]
+    inb = sum(int(np.prod(t.shape)) for t in ins if torch.is_tensor(t))
+    outb = sum(int(np.prod(x.shape)) for x in outs if torch.is_tensor(x))
+    return (inb + outb) * 4
+
+
+def _kb_flops(mod) -> int:
+    """Total forward FLOPs at the module's current dims, via torch's
+    FlopCounterMode (counts matmul/conv/bmm/etc.). Model-agnostic — measures the
+    real op cost, so it captures the K-contraction of a matmul or the spatial**3
+    of a 3D conv that `_kb_footprint_bytes` (io only) misses. Raises if
+    uncountable."""
+    from torch.utils.flop_counter import FlopCounterMode
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    m.eval()
+    ins = mod.get_inputs()
+    fc = FlopCounterMode(display=False)
+    with fc, torch.no_grad():
+        m(*ins)
+    return int(fc.get_total_flops())
+
+
+def _shrink_for_flops(mod, target_flops: int,
+                      target_bytes: "int | None" = None) -> None:
+    """Shrink module dims until measured forward FLOPs <= `target_flops` (and io
+    bytes <= `target_bytes` if given), preferring batch -> spatial -> channel and
+    honoring per-group floors so the shrunk problem still exercises the GEMM/vector
+    units (channel/K floor keeps a full vector register busy). Unlike
+    `_shrink_for_utilization` (io-byte cap only), this bounds the *compute*, so a
+    large-K matmul or a 3D conv shrinks to a size that actually runs on-target
+    instead of pinning a tiny-io / huge-FLOP shape. Falls back to a byte cap if
+    FLOPs can't be counted; reverts any shrink that makes the forward invalid."""
+    order = ["batch", "spatial", "channel"]
+    for _ in range(400):
+        try:
+            fl = _kb_flops(mod)
+            fp = _kb_footprint_bytes(mod)
+        except Exception:
+            if target_bytes:
+                _shrink_for_utilization(mod, target_bytes)
+            return
+        if fl <= target_flops and (target_bytes is None or fp <= target_bytes):
+            return
+        ints = {k: v for k, v in vars(mod).items()
+                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+        cand = None
+        for grp in order:
+            pool = {k: v for k, v in ints.items()
+                    if _kb_attr_group(k) == grp and v > _KB_FLOOR[grp]}
+            if pool:
+                cand = max(pool, key=pool.get)
+                break
+        if cand is None:
+            return             # everything at its floor; can't reduce further
+        grp = _kb_attr_group(cand)
+        oldv = vars(mod)[cand]
+        setattr(mod, cand, max(_KB_FLOOR[grp], oldv // 2))
+        try:
+            _kb_footprint_bytes(mod)   # validate the new dims forward-pass
+        except Exception:
+            setattr(mod, cand, oldv)
+            return
+
+
+def _shrink_for_utilization(mod, target_bytes: int) -> None:
+    """Shrink module dims to fit `target_bytes` of baked io, preferring
+    batch → spatial and protecting channel/feature dims (so the shrunk problem
+    still exercises the vector/GEMM units). Reverts any shrink that makes the
+    forward invalid."""
+    order = ["batch", "spatial", "channel"]
+    for _ in range(200):
+        try:
+            fp = _kb_footprint_bytes(mod)
+        except Exception:
+            return             # can't instantiate at current dims; leave as-is
+        if fp <= target_bytes:
+            return
+        ints = {k: v for k, v in vars(mod).items()
+                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+        cand = None
+        for grp in order:
+            pool = {k: v for k, v in ints.items()
+                    if _kb_attr_group(k) == grp and v > _KB_FLOOR[grp]}
+            if pool:
+                cand = max(pool, key=pool.get)
+                break
+        if cand is None:
+            return             # nothing shrinkable without violating a floor
+        grp = _kb_attr_group(cand)
+        oldv = vars(mod)[cand]
+        setattr(mod, cand, max(_KB_FLOOR[grp], oldv // 2))
+        try:
+            _kb_footprint_bytes(mod)   # validate the new dims forward-pass
+        except Exception:
+            setattr(mod, cand, oldv)
+            return
+
+
+def _load_kernelbench(bench_path: str,
+                      max_elements: "int | None" = None,
+                      target_bytes: "int | None" = None,
+                      target_flops: "int | None" = None
+                      ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
+    """Load a KernelBench level1 file (single-input variant only).
+
+    Schema (every level1 file conforms): a `class Model(nn.Module)` with
+    `__init__(*init_args)` + `forward(x)`, module-level shape constants, and
+    `get_inputs()` / `get_init_inputs()`.
+
+    Returns (model, sample_input, name); `sample_input` is a bare tensor for
+    single-input forwards or a list of tensors for multi-input ones (matmul
+    A,B; bmm). name is a C-friendly `kb_<basename>`.
+
+    `max_elements` caps the *total* input element count across all forward
+    inputs — KernelBench level1 defaults are sized for GPU memory (batch=16,
+    256x256 spatial) and overflow Zephyr's 256 MB RAM region when baked into
+    rodata. When set, we shrink integer module-level shape attrs by halving the
+    largest until the inputs fit, then re-instantiate, so the PyTorch golden
+    corresponds to the shrunken shape.
+
+    Multi-input forwards are threaded through extract()'s packed_inputs path.
+    Loss-style benches (preds+targets → scalar) load but fail later at the
+    unsupported loss op. See modelblaster/notes/kernelbench_rvv_port_plan.md.
+    """
+    import importlib.util
+    if not os.path.isfile(bench_path):
+        raise FileNotFoundError(f"--bench-file {bench_path} not found")
+    spec = importlib.util.spec_from_file_location("_kernelbench_mod", bench_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to import {bench_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "Model"):
+        raise RuntimeError(f"{bench_path} missing class Model")
+    if not hasattr(mod, "get_inputs"):
+        raise RuntimeError(f"{bench_path} missing get_inputs()")
+
+    with _cpu_fp32_tensor_creation():
+        if max_elements is not None and max_elements > 0:
+            SHAPE_ATTRS_BLOCKLIST = {"num_classes"}  # not a spatial dim
+            ints = {k: v for k, v in vars(mod).items()
+                    if isinstance(v, int) and v > 1
+                    and not k.startswith("_")
+                    and k not in SHAPE_ATTRS_BLOCKLIST}
+            history: "list[tuple[str, int]]" = []
+            for _ in range(64):
+                # Cap the TOTAL element count across all forward inputs (matmul
+                # A+B, bmm, etc.), not just the first — the second operand can
+                # dwarf the first.
+                total = sum(int(np.prod(t.shape)) for t in mod.get_inputs()
+                            if torch.is_tensor(t))
+                if total <= max_elements:
+                    break
+                if not ints:
+                    break
+                biggest = max(ints, key=ints.get)
+                new = max(1, ints[biggest] // 2)
+                if new == ints[biggest]:
+                    break
+                history.append((biggest, ints[biggest]))
+                ints[biggest] = new
+                setattr(mod, biggest, new)
+
+            # Some ops (dilated conv) become invalid if a spatial dim is shrunk
+            # below the (dilated) kernel extent — the model's own forward then
+            # raises. Back off the most recent shrink steps until a forward pass
+            # succeeds, so the shape stays valid even if it exceeds max_elements.
+            _ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+            for _ in range(len(history) + 1):
+                try:
+                    _m = mod.Model(*_ia)
+                    _m.eval()
+                    with torch.no_grad():
+                        _m(*mod.get_inputs())
+                    break
+                except Exception:
+                    if not history:
+                        break
+                    attr, oldv = history.pop()
+                    setattr(mod, attr, oldv)
+        elif target_flops is not None and target_flops > 0:
+            # FLOP-budget policy: bound the actual compute (so large-K matmuls /
+            # 3D convs shrink to something that runs on-target), while still
+            # capping io bytes if a target_bytes ceiling is also supplied.
+            _shrink_for_flops(mod, target_flops, target_bytes)
+        elif target_bytes is not None and target_bytes > 0:
+            # Default policy: cap the baked-io footprint while protecting the
+            # channel/feature dims that drive vector/GEMM utilization.
+            _shrink_for_utilization(mod, target_bytes)
+
+        init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+        model = mod.Model(*init_args)
+        model.eval()
+        inputs = mod.get_inputs()
+        if not isinstance(inputs, list) or not inputs:
+            raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
+    # Bool masks (e.g. masked_cumsum) become float in the model anyway
+    # (x * bool == x * float); cast them so the fp32 pipeline can carry them.
+    # Integer class-index targets (cross_entropy) are left alone.
+    inputs = [t.float() if (torch.is_tensor(t) and t.dtype == torch.bool) else t
+              for t in inputs]
+
+    # Bind non-tensor (scalar) forward args as constants so only tensors are
+    # graph inputs (KernelBench 5: `A * s` with s a Python float). The trace
+    # then sees `A * <const>`, extracted as a mul_scalar op. Only a single
+    # tensor input is supported here (fx can't trace a *args wrapper).
+    if any(not torch.is_tensor(t) for t in inputs):
+        _tensor_pos = [i for i, t in enumerate(inputs) if torch.is_tensor(t)]
+        if len(_tensor_pos) != 1:
+            raise NotImplementedError(
+                f"{bench_path}: scalar forward args are only supported with a "
+                f"single tensor input (got {len(_tensor_pos)})")
+        _pos0 = _tensor_pos[0]
+        _full = list(inputs)  # concrete scalars + placeholder slot for the tensor
+        _orig = model
+
+        class _ScalarBind(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.m = _orig
+
+            def forward(self, x):
+                args = list(_full)
+                args[_pos0] = x
+                return self.m(*args)
+
+        model = _ScalarBind()
+        model.eval()
+        inputs = [inputs[_pos0]]
+
+    base = os.path.splitext(os.path.basename(bench_path))[0]
+    name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
+                           for ch in base).strip("_")
+    while "__" in name:
+        name = name.replace("__", "_")
+    # Single-input → return the bare tensor (legacy path). Multi-input
+    # (matmul A+B, bmm) → return the list; extract() threads it through as
+    # packed_inputs / a flat io.npz buffer. Loss-style multi-input benches
+    # (preds+targets → scalar) still load here but fail later at the
+    # unsupported loss op, with a clear per-op error.
+    return model, (inputs[0] if len(inputs) == 1 else inputs), name
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="mlp_generic",
-                    help="model id -> models/<id>.py. The ids listed in the "
-                         "dispatch below have explicit imports; any other id "
-                         "resolves by dynamic import of "
-                         "modelblaster.models.<id>.")
+    ap.add_argument("--model", default=None,
+                    help="model id -> models/<id>.py (the well-known ids have "
+                         "explicit imports; any other resolves by dynamic "
+                         "import of modelblaster.models.<id>). Mutually "
+                         "exclusive with --bench-file.")
+    ap.add_argument("--bench-file", default=None,
+                    help="path to a KernelBench level1 .py file. "
+                         "Mutually exclusive with --model.")
+    ap.add_argument("--bench-target-mb", type=int, default=256,
+                    help="DEFAULT kernelbench sizing: cap baked io (input+golden) "
+                         "to this many MiB, shrinking batch->spatial and "
+                         "protecting channel/feature dims for good HW "
+                         "utilization (default 256). 0 = stock dims.")
+    ap.add_argument("--bench-max-elements", type=int, default=0,
+                    help="LEGACY override: if >0, cap total input ELEMENTS by "
+                         "halving the largest int attr (the old tiny-toy policy). "
+                         "Overrides --bench-target-mb. 0 = use --bench-target-mb.")
+    ap.add_argument("--bench-target-gflops", type=float,
+                    default=float(os.environ.get("BENCH_TARGET_GFLOPS", "0")),
+                    help="COMPUTE-budget sizing: if >0, size the bench to this "
+                         "forward-FLOP budget (measured via FlopCounterMode), "
+                         "bounding compute rather than just io — fixes large-K "
+                         "matmuls / 3D convs that have tiny io but huge FLOPs. "
+                         "--bench-target-mb stays an io ceiling. Overridden by "
+                         "--bench-max-elements. Env: BENCH_TARGET_GFLOPS.")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
@@ -3756,51 +5232,79 @@ def main() -> None:
                          "instead of a single frame. Detection / segmentation "
                          "models need ~16 to avoid cls-logit saturation. "
                          "No-op for fp32 / fp16.")
+    ap.add_argument("--fp16-ops", default=None,
+                    help="comma-separated op names to promote to fp16 in an int8 "
+                         "extract (mixed precision). Additive to the model's "
+                         "get_precision_spec(). No-op for fp32 / fp16.")
+    ap.add_argument("--per-channel", action="store_true",
+                    help="per-output-channel int8 weight quant for conv/linear "
+                         "(tighter than per-tensor). No-op for fp32 / fp16.")
     args = ap.parse_args()
 
-    if args.model == "mlp_generic":
-        from modelblaster.models import mlp_generic as model_mod
-    elif args.model == "mlp_control":
-        from modelblaster.models import mlp_control as model_mod
-    elif args.model == "lenet":
-        from modelblaster.models import lenet as model_mod
-    elif args.model == "dronet":
-        from modelblaster.models import dronet as model_mod
-    elif args.model == "mobilenet_v2":
-        from modelblaster.models import mobilenet_v2 as model_mod
-    elif args.model == "yolov8_nano":
-        from modelblaster.models import yolov8_nano as model_mod
-    elif args.model == "yolov8_nano_64":
-        from modelblaster.models import yolov8_nano_64 as model_mod
-    elif args.model == "vitfly_frontend":
-        from modelblaster.models import vitfly_frontend as model_mod
-    elif args.model == "lstm_tiny":
-        from modelblaster.models import lstm_tiny as model_mod
-    elif args.model == "vitfly_lstm":
-        from modelblaster.models import vitfly_lstm as model_mod
-    elif args.model == "norm_block":
-        from modelblaster.models import norm_block as model_mod
-    elif args.model == "attn_block":
-        from modelblaster.models import attn_block as model_mod
-    elif args.model == "fused_vision":
-        from modelblaster.models import fused_vision as model_mod
-    elif args.model == "fused_depth":
-        from modelblaster.models import fused_depth as model_mod
-    elif args.model == "fused_full":
-        from modelblaster.models import fused_full as model_mod
+    if (args.model is None) == (args.bench_file is None):
+        ap.error("pass exactly one of --model or --bench-file")
+
+    model_mod = None
+    if args.bench_file is not None:
+        # Legacy element-cap wins if explicitly set (>0); else if a FLOP budget is
+        # given, bound compute (io stays capped by --bench-target-mb as a ceiling);
+        # otherwise the default byte-budget / utilization-aware policy applies.
+        _tgt = None if args.bench_max_elements else args.bench_target_mb * 2**20
+        _tflops = (int(args.bench_target_gflops * 1e9)
+                   if args.bench_target_gflops and args.bench_target_gflops > 0
+                   else None)
+        model, sample, name = _load_kernelbench(
+            args.bench_file,
+            max_elements=(args.bench_max_elements or None),
+            target_bytes=_tgt,
+            target_flops=_tflops)
     else:
-        # Dynamic import so a new models/<name>.py needs no edit here.
-        import importlib
-        try:
-            model_mod = importlib.import_module(
-                f"modelblaster.models.{args.model}")
-        except ModuleNotFoundError:
-            raise SystemExit(f"unknown model {args.model}")
-    model = model_mod.get_model()
-    sample = model_mod.get_sample_input()
+        if args.model == "mlp_generic":
+            from modelblaster.models import mlp_generic as model_mod
+        elif args.model == "mlp_control":
+            from modelblaster.models import mlp_control as model_mod
+        elif args.model == "lenet":
+            from modelblaster.models import lenet as model_mod
+        elif args.model == "relu6net":
+            from modelblaster.models import relu6net as model_mod
+        elif args.model == "dronet":
+            from modelblaster.models import dronet as model_mod
+        elif args.model == "mobilenet_v2":
+            from modelblaster.models import mobilenet_v2 as model_mod
+        elif args.model == "yolov8_nano":
+            from modelblaster.models import yolov8_nano as model_mod
+        elif args.model == "yolov8_nano_64":
+            from modelblaster.models import yolov8_nano_64 as model_mod
+        elif args.model == "vitfly_frontend":
+            from modelblaster.models import vitfly_frontend as model_mod
+        elif args.model == "lstm_tiny":
+            from modelblaster.models import lstm_tiny as model_mod
+        elif args.model == "vitfly_lstm":
+            from modelblaster.models import vitfly_lstm as model_mod
+        elif args.model == "norm_block":
+            from modelblaster.models import norm_block as model_mod
+        elif args.model == "attn_block":
+            from modelblaster.models import attn_block as model_mod
+        elif args.model == "fused_vision":
+            from modelblaster.models import fused_vision as model_mod
+        elif args.model == "fused_depth":
+            from modelblaster.models import fused_depth as model_mod
+        elif args.model == "fused_full":
+            from modelblaster.models import fused_full as model_mod
+        else:
+            # Dynamic import so a new models/<name>.py needs no edit here.
+            import importlib
+            try:
+                model_mod = importlib.import_module(
+                    f"modelblaster.models.{args.model}")
+            except ModuleNotFoundError:
+                raise SystemExit(f"unknown model {args.model}")
+        model = model_mod.get_model()
+        sample = model_mod.get_sample_input()
+        name = args.model
 
     calibration_samples = None
-    if args.quant == "int8" and args.num_calibration > 1:
+    if model_mod is not None and args.quant == "int8" and args.num_calibration > 1:
         if hasattr(model_mod, "get_calibration_spec"):
             from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             spec = model_mod.get_calibration_spec(args.num_calibration)
@@ -3853,8 +5357,7 @@ def main() -> None:
         if fp16_op_names:
             print(f"[extract_graph] fp16 ops: {sorted(fp16_op_names)}",
                   flush=True)
-
-    extract(model, sample, name=args.model, out_dir=args.out_dir,
+    extract(model, sample, name=name, out_dir=args.out_dir,
             quant=args.quant,
             calibration_samples=calibration_samples,
             input_dtypes=input_dtypes,
