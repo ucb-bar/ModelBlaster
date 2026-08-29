@@ -487,14 +487,19 @@ class SplitFusedConvOperands(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         tile_oc = self.OC // 2
         per_filter = self.IC * self.KH * self.KW
-        self.assertIn(f"weight_q + {tile_oc * per_filter}", calls[1])
-        self.assertIn(f"bias_q + {tile_oc}", calls[1])
-        self.assertIn(f"bn_scale + {tile_oc}", calls[1])
-        self.assertIn(f"bn_bias_fused + {tile_oc}", calls[1])
+        # `_scalar` is the backend suffix `_weight_name` puts on every
+        # emitted symbol, so two backends' weights.c cannot define the same
+        # name with differently-packed data. Asserted here rather than
+        # stripped, because the offset is only correct on the array the
+        # suffix names.
+        self.assertIn(f"weight_q_scalar + {tile_oc * per_filter}", calls[1])
+        self.assertIn(f"bias_q_scalar + {tile_oc}", calls[1])
+        self.assertIn(f"bn_scale_scalar + {tile_oc}", calls[1])
+        self.assertIn(f"bn_bias_fused_scalar + {tile_oc}", calls[1])
         # Tile 0 is the trap: every offset is 0, so a codegen that forgot the
         # epilogue entirely still produces a correct tile 0.
-        self.assertIn("bn_scale + 0", calls[0])
-        self.assertIn("bn_bias_fused + 0", calls[0])
+        self.assertIn("bn_scale_scalar + 0", calls[0])
+        self.assertIn("bn_bias_fused_scalar + 0", calls[0])
 
     def test_each_tile_is_called_with_the_narrowed_oc(self):
         model_c, _, _ = self._split("scalar", 4)
@@ -537,7 +542,7 @@ class SplitFusedConvOperands(unittest.TestCase):
         calls = self._calls(model_c)
         for t, call in enumerate(calls):
             self.assertIn(f"probe_c0_weight_q_tile_{t}", call)
-            self.assertIn(f"bn_scale + {t * tile_oc}", call,
+            self.assertIn(f"bn_scale_rvv_x60 + {t * tile_oc}", call,
                           "the 1-D epilogue arrays stay whole and are offset")
         # bn arrays are NOT split into per-tile copies.
         self.assertIsNone(_c_array(weights_c, "probe_c0_bn_scale_tile_0", "rvv_x60"))
@@ -547,5 +552,5 @@ class SplitFusedConvOperands(unittest.TestCase):
         calls = self._calls(model_c)
         self.assertEqual(len(calls), 2)
         tile_oc = self.OC // 2
-        self.assertIn(f"bn_scale + {tile_oc}", calls[1])
-        self.assertIn(f"bn_bias_fused + {tile_oc}", calls[1])
+        self.assertIn(f"bn_scale_scalar + {tile_oc}", calls[1])
+        self.assertIn(f"bn_bias_fused_scalar + {tile_oc}", calls[1])
