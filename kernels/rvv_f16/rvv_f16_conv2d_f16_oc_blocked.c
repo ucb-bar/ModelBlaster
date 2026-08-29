@@ -81,7 +81,15 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
             for (int ow = 0; ow < OW; ow++) {
                 int oc_base = 0;
                 while (oc_base < OC) {
-                    size_t vl = __riscv_vsetvl_e32m4((size_t)(OC - oc_base));
+                    /* The AVL is the element count at EVERY width, never
+                     * a previous vsetvl's result -- GCC 14.3 substitutes
+                     * an unrelated register for a chained AVL and the vl
+                     * that reaches the store is simply wrong, with no
+                     * crash. See scripts/check_rvv_avl.py, which now
+                     * refuses the form, and the avgpool kernel's header
+                     * for the disassembly that established it. */
+                    const size_t n_oc = (size_t)(OC - oc_base);
+                    size_t vl = __riscv_vsetvl_e32m4(n_oc);
 
                     /* Seed accumulator with bias (widened to fp32). */
                     vfloat32m4_t vacc;
@@ -89,10 +97,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                         /* Strided fp16 load of bias[oc_base..+vl] is
                          * actually unit-stride. Use the e16 load
                          * then widen. */
-                        size_t vl16 = __riscv_vsetvl_e16m2(vl);
+                        size_t vl16 = __riscv_vsetvl_e16m2(n_oc);
                         vfloat16m2_t vb16 = __riscv_vle16_v_f16m2(
                             bias + oc_base, vl16);
-                        __riscv_vsetvl_e32m4(vl);
+                        __riscv_vsetvl_e32m4(n_oc);
                         vacc = __riscv_vfwcvt_f_f_v_f32m4(vb16, vl);
                     } else {
                         vacc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
@@ -117,7 +125,7 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                                  * (ic, kh, kw), one per oc in the
                                  * current block. Stride between oc's
                                  * weight is IC*KH*KW elements. */
-                                size_t vl16 = __riscv_vsetvl_e16m2(vl);
+                                size_t vl16 = __riscv_vsetvl_e16m2(n_oc);
                                 const _Float16 *w_ptr = weight
                                     + (size_t)oc_base * IC * KH * KW
                                     + ((size_t)ic * KH + kh) * KW + kw;
@@ -138,7 +146,7 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                     _Float16 *out_p = output
                         + ((size_t)n * OC + oc_base) * OH * OW
                         + (size_t)oh * OW + ow;
-                    size_t vl16 = __riscv_vsetvl_e16m2(vl);
+                    size_t vl16 = __riscv_vsetvl_e16m2(n_oc);
                     __riscv_vsse16_v_f16m2(out_p, out_oc_stride_bytes,
                                            vout, vl16);
 
