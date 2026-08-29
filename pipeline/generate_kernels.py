@@ -543,6 +543,18 @@ def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
 # slow verify path which still works; the goal is just to fail FAST when
 # Llama is obviously not following the algorithm.
 _ALGORITHM_REQUIRED_SUBSTRINGS: dict[str, tuple[str, ...]] = {
+    # rvv_memo_lut_gather: must actually build a table and GATHER from it.
+    #
+    # Without this gate the model writes a plausible-looking hybrid instead --
+    # vector loads, then a scalar loop calling the transcendental per element,
+    # then vector stores. It passed cross-compile, emitted plenty of vector
+    # instructions, and even measured max_abs_err=0 on the board. It was still
+    # wrong: it called `cosf`/`roundf` where the reference uses `cos`/`round`
+    # in DOUBLE, so its bit-exactness was a property of the test data rather
+    # than of the kernel. The whole point of the LUT is that the reference
+    # expression is evaluated verbatim, at most 256 times, and never
+    # approximated -- so require the table and the gather that reads it.
+    "rvv_memo_lut_gather": ("table", "vluxei8"),
     # im2col_gemm: must allocate and populate the im2col buffer.
     "im2col_gemm": ("im2col_buf",),
     # oc_blocked: must have an outer OC tile loop. Looking for the
