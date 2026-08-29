@@ -79,6 +79,8 @@ CURATED = {
     "cos_s8": "kernels/rvv/rvv_cos_s8_rvv_memo_lut_gather.c",
     "mul_s8": "kernels/rvv/rvv_mul_s8_rvv_frm_rmm.c",
     "gelu_s8": "kernels/rvv/rvv_gelu_s8_rvv_memo_lut_gather.c",
+    "softmax_s8": "kernels/rvv/rvv_softmax_s8_rvv_cached_exp.c",
+    "layernorm_s8": "kernels/rvv/rvv_layernorm_s8_rvv_f64_tail.c",
 }
 
 #: Shapes to check beyond the ones the model graphs happen to contain.
