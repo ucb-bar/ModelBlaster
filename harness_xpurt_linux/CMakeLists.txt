@@ -29,7 +29,9 @@
 #   -DMODELBLASTER_KERNEL_CFLAGS_<BACKEND>=...   e.g. "-march=rv64gcv_zvl256b"
 #   -DMODELBLASTER_KERNEL_CC=<abs path>   compile every kernels.c with THIS
 #                                         compiler instead of CMAKE_C_COMPILER
-#   -DMODELBLASTER_XPURT_TRACE=ON         emit the trace CSV block
+#   -DMODELBLASTER_XPURT_TRACE=ON         emit the trace CSV block at exit
+#   -DMODELBLASTER_XPURT_STREAM=ON        emit one JSON line per dispatch END,
+#                                         live, for streaming_feedback.py
 #   -DMODELBLASTER_POOL_THREADS=N         parallel-for pool size
 
 cmake_minimum_required(VERSION 3.16)
@@ -92,6 +94,12 @@ if(DEFINED MODELBLASTER_POOL_THREADS)
     target_compile_definitions(xpurt_harness PRIVATE
         MODELBLASTER_POOL_THREADS=${MODELBLASTER_POOL_THREADS})
 endif()
+if(MODELBLASTER_XPURT_STREAM)
+    # One JSON line per dispatch END on stdout, for the host-side feedback
+    # tailer. Independent of the TRACE block, which only prints at exit.
+    target_compile_definitions(xpurt_harness PRIVATE MODELBLASTER_XPURT_STREAM=1)
+endif()
+
 if(MODELBLASTER_XPURT_TRACE)
     target_compile_definitions(xpurt_harness PRIVATE MODELBLASTER_XPURT_TRACE=1)
 endif()
