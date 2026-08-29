@@ -5232,10 +5232,6 @@ def main() -> None:
                          "instead of a single frame. Detection / segmentation "
                          "models need ~16 to avoid cls-logit saturation. "
                          "No-op for fp32 / fp16.")
-    ap.add_argument("--fp16-ops", default=None,
-                    help="comma-separated op names to promote to fp16 in an int8 "
-                         "extract (mixed precision). Additive to the model's "
-                         "get_precision_spec(). No-op for fp32 / fp16.")
     ap.add_argument("--per-channel", action="store_true",
                     help="per-output-channel int8 weight quant for conv/linear "
                          "(tighter than per-tensor). No-op for fp32 / fp16.")
