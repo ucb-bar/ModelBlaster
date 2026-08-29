@@ -508,8 +508,22 @@ def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
     pass. Catches LLM mistakes like reordering ints before we burn a Zephyr
     build / spike run on it.
     """
-    cand_norm = " ".join(candidate.split())
-    sig_norm = " ".join(spec.signature.split())
+    # Collapse whitespace, then drop the purely cosmetic spaces that C
+    # formatting puts next to the parameter-list parens. WITHOUT THE SECOND
+    # STEP this check rejects any kernel written in Allman style: a newline
+    # straight after `kernel_foo(` normalises to `( const ...`, while the
+    # spec's signature is `(const ...`, and the two never match. Two curated
+    # RVV convolutions are written that way -- they compile, link, and pass
+    # the on-board golden compare -- so rejecting them would have silently
+    # dropped DroNet and YOLOv8 onto the scalar reference. Brace and paren
+    # placement is not an error class worth failing on; parameter names and
+    # order, which this still checks exactly, are.
+    def _norm(text: str) -> str:
+        t = " ".join(text.split())
+        return t.replace("( ", "(").replace(" )", ")")
+
+    cand_norm = _norm(candidate)
+    sig_norm = _norm(spec.signature)
     if (
         (sig_norm + " {") in cand_norm
         or (sig_norm + "{") in cand_norm
@@ -1388,9 +1402,25 @@ def generate(
             log(f"  keep_reference_ops names op kind(s) this model does not "
                 f"contain: {sorted(unknown_pins)} -- check the advice was "
                 f"generated from this graph")
+        # Curated kernels get verified too, when a verifier is available that
+        # does not need a simulator harness.
+        #
+        # THIS USED TO REQUIRE `needs_harness_paths`, which is true only for
+        # spike-harness backends or --optimize. So on rvv_x60 and ime_x60 --
+        # the two backends every K1 profile is taken on -- a curated kernel was
+        # swapped in and measured with NO verification of any kind. The build
+        # log said "reference + curated[rvv] swap from ..." and nothing else.
+        # A curated file that had drifted, or that compiled to scalar code,
+        # would have been profiled and reported as a vector measurement.
+        #
+        # Cross-compile verify needs no harness, so there is no reason to skip
+        # it: it re-checks the signature, the algorithm structure, that the
+        # kernel builds for the target ISA, and that it emitted vector
+        # instructions at all.
         curated_verify = (
             os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
-            and needs_harness_paths
+            and (needs_harness_paths
+                 or target.verify_method == VERIFY_CROSS_COMPILE)
         )
 
         def _probe_swap(source_label: str, dir_path: Optional[str],
