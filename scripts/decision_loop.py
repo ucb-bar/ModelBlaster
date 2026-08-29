@@ -263,7 +263,7 @@ def measure_one(hint_path: Path, args, out_dir: Path) -> dict | None:
         "--target", args.target,
         "--quant", args.quant,
         "--backend", args.backend,
-        "--runner", "spike",
+        "--runner", args.runner,
         "--out-dir", str(out_dir),
     ]
     print(f"[decision_loop] measure: {hint_path.name} → {out_dir.name}")
@@ -295,6 +295,11 @@ def main(argv=None) -> int:
     ap.add_argument("--network", required=True,
                     help="Which network's IR to rewrite (e.g. mlp_control). "
                          "Candidates affecting other networks are logged but skipped.")
+    ap.add_argument("--runner", default="k1", choices=["k1", "spike", "firesim"],
+                    help="where a candidate is measured. `k1` is the physical "
+                         "board via MB_IR + run_model_k1.sh and is the default "
+                         "because it is the hardware this project has; `spike` "
+                         "is the retired simulator path.")
     ap.add_argument("--quant", default="int8")
     ap.add_argument("--target", default="rvv_opu")
     ap.add_argument("--backend", default="llm")
