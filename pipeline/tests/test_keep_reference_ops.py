@@ -53,12 +53,22 @@ class ThePinKeepsTheReferenceKernel(unittest.TestCase):
                 'no cross toolchain: set CROSS to a riscv64 prefix '
                 '(eval "$(scripts/setup_spacemit_toolchain.sh)") -- without it '
                 'the curated kernels cannot be verified, so none is picked')
-        with tempfile.TemporaryDirectory() as td:
-            generate_kernels.generate(
-                str(self.IR_PATH), td, "reference", "rvv_x60",
-                quant="int8", global_curated_dir=str(self.KERNELS),
-                keep_reference_ops=keep)
-            return _picks(td)
+        # The curated verify cross-compiles with repo-relative include paths,
+        # so it silently fails to build -- and the picker correctly falls back
+        # to the reference -- when pytest is invoked from a different
+        # directory. That made this test pass from ModelBlaster/ and fail from
+        # the XPU-RT root, which is a worse failure than either outcome.
+        cwd = os.getcwd()
+        os.chdir(Path(__file__).resolve().parents[2])
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                generate_kernels.generate(
+                    str(self.IR_PATH), td, "reference", "rvv_x60",
+                    quant="int8", global_curated_dir=str(self.KERNELS),
+                    keep_reference_ops=keep)
+                return _picks(td)
+        finally:
+            os.chdir(cwd)
 
     def test_without_the_pin_the_curated_kernel_is_swapped_in(self):
         """The control. Without it, the test below cannot distinguish 'pinned'
