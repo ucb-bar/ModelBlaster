@@ -11,7 +11,7 @@ table). Together they close the round trip:
 
 The harness can link multiple HW backends per model (e.g. scalar + rvv);
 the walker dispatches each entry to whichever backend's per-model table
-matches the entry's ``core_kind``. Symbol disambiguation is handled at
+matches the entry's ``impl``. Symbol disambiguation is handled at
 compile time by ``backend_rename.py`` — each model's externally-visible
 symbols (kernels, dispatch table, profile API) get suffixed with
 ``_<bs>`` per backend.
@@ -27,7 +27,19 @@ The generated main:
        the kind's designated worker -- the one sitting on the kind's
        lowest-numbered hart -- so nothing is ever dropped.
     4. Inside the dispatch branch, selects the right per-backend table
-       by ``core_kind`` and invokes ``MODEL_<UMID>_DISPATCH_FNS_<BS>``.
+       by ``impl`` and invokes ``MODEL_<UMID>_DISPATCH_FNS_<BS>``.
+
+       ``impl`` is the entry's KERNEL IMPLEMENTATION, which the ingest
+       defaults to ``core_kind``. They differ only when the schedule was
+       solved with ``scheduler.enable_impls`` and chose per-dispatch
+       implementations -- "this GEMM on the MAC unit, the next on the
+       vector unit", on the same core. ``hardware_target`` cannot say
+       that: it names WHERE, and ``impl`` names WITH WHAT. Selecting on
+       ``impl`` rather than ``core_kind`` is what makes a heterogeneous
+       schedule mean something at run time instead of being a claim the
+       binary quietly ignores. The state struct stays suffixed by
+       ``core_kind`` so its pool binding follows the core, not the
+       implementation.
     5. Tracks per-network wall cycles inline (no model-side setter
        call — keeps wall-cycle bookkeeping backend-agnostic).
     6. Prints each network's final output between the standard
@@ -237,9 +249,12 @@ def _emit(networks: list[str], schedule_name: str,
             reset_calls.append(f"    model_{mid}_reset_profile_{bs}();")
 
         # Build the per-backend selection inside the dispatch branch.
-        # core_kind comes from the schedule and matches the backend tag;
-        # we dispatch with the per-(network, kind) state struct so
-        # `.pool` is the running kind's, with no per-dispatch write.
+        # The selection axis is the entry's `impl` -- the kernel
+        # implementation for THIS dispatch -- which the ingest defaults to
+        # core_kind, so a schedule that never chose per-dispatch impls
+        # selects exactly as it always did. We dispatch with the
+        # per-(network, kind) state struct so `.pool` follows the CORE the
+        # work runs on, not the implementation it runs with.
         #
         # Cross-tile memory coherence: Gemmini's RoCC DMA reads/writes
         # memory through an independent port at the SoC coherence point,
@@ -253,9 +268,9 @@ def _emit(networks: list[str], schedule_name: str,
         # (2026-05-14) and ported here for the multi-backend xpurt
         # dispatch loop. Without these fences, hetero output diverges
         # from golden (linf ~52 on dronet).
-        # Dispatch branch: strcmp against the SCHEDULER'S core_kind (the
-        # value the ingest stored in the table — registry kind), but
-        # invoke through the BACKEND-suffixed dispatch fn symbol (which
+        # Dispatch branch: strcmp against the entry's `impl` (which the
+        # ingest set from the schedule, defaulting to the registry kind),
+        # but invoke through the BACKEND-suffixed dispatch fn symbol (which
         # is how each backend's per-model OBJECT lib is named). The two
         # can legitimately differ (e.g. kind="gemmini" → backend tag
         # "gemmini_q31") as long as they're paired by index in the
@@ -276,7 +291,7 @@ def _emit(networks: list[str], schedule_name: str,
             BS = bs.upper()
             kw = "if" if i == 0 else "else if"
             bs_select_lines.append(
-                f'            {kw} (strcmp(e_->core_kind, "{kind}") == 0) {{\n'
+                f'            {kw} (strcmp(e_->impl, "{kind}") == 0) {{\n'
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
                 f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{kind});\n"
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
@@ -284,9 +299,11 @@ def _emit(networks: list[str], schedule_name: str,
             )
         bs_select_lines.append(
             "            else {\n"
-            f'                printf("xpurt: FATAL unknown core_kind \'%s\' for {net} (entry %d) — '
-            f'kind→backend mapping mismatch at codegen, see pipeline/generate_xpurt_main.py\\n", '
-            f'e_->core_kind, e_->entry_id);\n'
+            f'                printf("xpurt: FATAL entry %d of {net} asks for impl \'%s\', '
+            f'which this binary was not built with (has: {"/".join(core_kinds)}). '
+            f'Either the schedule chose a per-dispatch implementation the build '
+            f'lacks, or the kind→backend pairing is wrong at codegen; see '
+            f'pipeline/generate_xpurt_main.py\\n", e_->entry_id, e_->impl);\n'
             f"                sys_reboot(SYS_REBOOT_COLD);\n"
             "            }"
         )
@@ -508,8 +525,11 @@ def _emit(networks: list[str], schedule_name: str,
  *   2. Before invoking, waits on k_sems posted by the producers of its
  *      .deps[] (intra-job data deps) and .time_dep_entry_id (cross-job
  *      ordering edges).
- *   3. Selects the per-(model, backend) dispatch table by .core_kind
- *      and invokes the matching kernel. backend_rename.py at compile
+ *   3. Selects the per-(model, backend) dispatch table by .impl -- the
+ *      IMPLEMENTATION the schedule chose for this dispatch, which
+ *      defaults to .core_kind -- and invokes the matching kernel.
+ *      Selecting on .impl rather than .core_kind is what lets one core
+ *      run a MAC-unit GEMM and then a vector one. backend_rename.py at compile
  *      time has suffixed every model's externally-visible symbol with
  *      _<bs>, so multiple backends per model link cleanly.
  *   4. After invoking, gives the entry's k_sem so consumers unblock.

@@ -62,6 +62,11 @@ class XpurtEntry:
     name: str                   # echo from IR (e.g. "mlp.0")
     core_name: str              # registry core name (e.g. "rvv0" or "rocket0")
     core_kind: str              # registry kind (e.g. "rvv", "scalar")
+    impl: str                   # kernel implementation to invoke for THIS
+                                # dispatch ("rvv" / "ime" / ...). Defaults to
+                                # core_kind, which is what every schedule
+                                # written before `scheduler.enable_impls`
+                                # existed means. See `load()`.
     hart: int                   # preferred hart (from registry); -1 if unbound
     start_time_ms: float
     duration_ms: float
@@ -511,6 +516,18 @@ def load(schedule_path: str,
         core_name, core_kind, hart = _resolve_target(
             d["hardware_target"], cpu_p_kind, cpu_e_kind, reg)
 
+        # PER-DISPATCH IMPLEMENTATION. With `scheduler.enable_impls` on,
+        # XPU-RT emits every core-group combination once per legal
+        # implementation and records the winner per dispatch, so a schedule
+        # can say "this GEMM on the MAC unit, the next one on the vector
+        # unit" -- on the same core. `hardware_target` cannot express that:
+        # it names WHERE, and impl names WITH WHAT.
+        #
+        # Absent the field the answer is core_kind, which is exactly what a
+        # pre-`enable_impls` schedule means, so those keep producing the
+        # byte-identical table they always did.
+        impl = str(d.get("impl") or core_kind)
+
         # Resolve deps (intra-job data deps) + time_dep (cross-job edge)
         # to in-table entry_ids. The walker's deadlock-freedom argument
         # (see modelblaster/notes/xpurt_walker_semantics.md §4.6) requires every
@@ -561,6 +578,7 @@ def load(schedule_path: str,
             name=op_record.get("name", f"dispatch_{did}"),
             core_name=core_name,
             core_kind=core_kind,
+            impl=impl,
             hart=hart,
             start_time_ms=float(d.get("start_time", 0.0) or 0.0),
             duration_ms=float(d.get("duration", 0.0) or 0.0),
@@ -641,6 +659,7 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
             f'.job_name = "{e.job_name}", '
             f'.op = "{e.op}", .name = "{e.name}", '
             f'.core_name = "{e.core_name}", .core_kind = "{e.core_kind}", '
+            f'.impl = "{e.impl}", '
             f'.hart = {e.hart}, '
             f'.start_time_ms = {e.start_time_ms!r}f, '
             f'.duration_ms = {e.duration_ms!r}f, '
@@ -671,6 +690,9 @@ typedef struct {{
     const char    *name;           /* IR node name (e.g. "mlp.0") */
     const char    *core_name;      /* registry core name (rocket0/rvv0/...) */
     const char    *core_kind;      /* registry kind (scalar/rvv/gemmini/...) */
+    const char    *impl;           /* kernel impl for THIS dispatch (rvv/ime/...);
+                                    * equals core_kind unless the schedule
+                                    * chose per-dispatch implementations */
     int            hart;           /* preferred hart, -1 if unbound */
     float          start_time_ms;  /* XPU-RT-issued start time (ms) */
     float          duration_ms;    /* XPU-RT-modeled duration (ms) */
