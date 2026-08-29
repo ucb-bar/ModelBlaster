@@ -1485,6 +1485,96 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
     argtypes_factory=_linear_s8_argtypes,
     algorithms=[
         AlgorithmCandidate(
+            name="ime_vmadot_4x4x8",
+            target_affinity=("ime", "ime_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K1 IME int8 LINEAR via the `smt.vmadot` MAC unit. "
+                "Same engine as matmul_s8's ime_vmadot_4x4x8; read that "
+                "algorithm's description for the instruction, the tiling and "
+                "the packing, all of which apply unchanged. What differs is "
+                "the operand layout (in IME's favour) and the requantize "
+                "tail.\n\n"
+                "THE LAYOUT IS ALREADY WHAT THE UNIT WANTS. `weight` is "
+                "[N,K] -- indexed weight[n*K + k] -- so its row index is the "
+                "OUTPUT column n. That is exactly vmadot's vs2 convention "
+                "(C[i][j] = sum_k A[i][k] * B[j][k]), so a 4x8 weight tile is "
+                "32 contiguous bytes and needs NO transpose, unlike "
+                "matmul_s8's transpose_b=0 case. `input` is [M,K], "
+                "K-contiguous, which is vs1's convention. Both operands pack "
+                "with a straight copy.\n\n"
+                "THE TAIL IS INTEGER, NOT FLOAT, and that makes bit-exactness "
+                "easier here than in matmul_s8. Per output element:\n"
+                "    acc  = bias[n] (or 0) + sum_k in[m,k]*w[n,k]\n"
+                "    prod = ((int64)acc * output_multiplier + (1<<30)) >> 31\n"
+                "    if output_shift > 0:  round-half-up by that shift\n"
+                "    if output_shift < 0:  left shift\n"
+                "    add output_offset, clamp to [activation_min, "
+                "activation_max]\n"
+                "Reproduce that arithmetic EXACTLY, in int64 where the "
+                "reference uses int64. It is integer, so a scalar tail is "
+                "trivially bit-exact; keep it scalar and spend the effort on "
+                "the packing.\n\n"
+                "OFFSETS. `input_offset` and `filter_offset` are added to "
+                "every operand before the product. vmadot multiplies RAW "
+                "int8, so when either is nonzero the accumulator needs the "
+                "standard decomposition:\n"
+                "    sum (a+ia)(w+iw) = sum(a*w) + ia*sum_k(w) + "
+                "iw*sum_k(a) + K*ia*iw\n"
+                "vmadot supplies the first term; the row and column sums are "
+                "computed once per panel and reused. MEASURED IN THIS TREE: "
+                "all 20 linear_s8 dispatches across every model have "
+                "input_offset = filter_offset = 0 (the quantization is "
+                "symmetric), so the fast path is the common one -- but "
+                "implement the correction rather than asserting zero, and do "
+                "not fall back to a different algorithm when it is nonzero.\n\n"
+                "BIAS is per output column n and is added to the accumulator "
+                "BEFORE the Q0.31 multiply. It is int32; seed the drained "
+                "accumulator with it rather than trying to fold it into the "
+                "MAC.\n\n"
+                "PACK ONCE, NOT PER TILE -- the same requirement, and it is "
+                "worth more here than in matmul_s8 because a linear's N is "
+                "large. Pack all of `input` once, loop the output columns "
+                "outermost packing each weight panel once, and reuse both "
+                "across the inner m loop. Packing inside the tile loop "
+                "measured 6.5x SLOWER than RVV on the matmul; packing once "
+                "measured 2.30x FASTER.\n\n"
+                "CLUSTER 0 ONLY. Harts 4-7 exit 132 (SIGILL).\n"
+                "MUST be bit-exact to the linear_s8 reference: "
+                "max_abs_err = 0. Build with GCC 14.3, not 13.2."
+            ),
+            reference_impl=(
+                "/* The vmadot tile helper is identical to matmul_s8's -- see\n"
+                " * ime_vmadot_4x4x8 there for the complete asm block, which\n"
+                " * is the part that is hard to rediscover. Sketch of the\n"
+                " * per-tile drain and the Q0.31 tail: */\n"
+                "#include <string.h>\n"
+                "#include <riscv_vector.h>\n"
+                "\n"
+                "/* out16[i*4 + j] = C[i][j], row-major across the (vd, vd+1)\n"
+                " * pair, already accumulated over every k-slab. */\n"
+                "static inline int8_t requant(int32_t acc, int32_t bias,\n"
+                "                             int output_multiplier,\n"
+                "                             int output_shift,\n"
+                "                             int output_offset,\n"
+                "                             int amin, int amax) {\n"
+                "    acc += bias;\n"
+                "    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;\n"
+                "    prod = (prod + (1LL << 30)) >> 31;\n"
+                "    int32_t s = (int32_t)prod;\n"
+                "    if (output_shift > 0)\n"
+                "        s = (int32_t)(((int64_t)s +\n"
+                "             ((int64_t)1 << (output_shift - 1))) >> output_shift);\n"
+                "    else if (output_shift < 0)\n"
+                "        s = s << (-output_shift);\n"
+                "    s += output_offset;\n"
+                "    if (s < amin) s = amin;\n"
+                "    if (s > amax) s = amax;\n"
+                "    return (int8_t)s;\n"
+                "}\n"
+            ),
+        ),
+        AlgorithmCandidate(
             name="gemmini_tiled_matmul",
             target_affinity=("gemmini", "gemmini_q31"),
             # Bit-exact accumulator (gemmini's 32-bit acc with full_C
@@ -7855,7 +7945,7 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
     algorithms=[
         AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
-            target_affinity=("ime",),
+            target_affinity=("ime", "ime_x60"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "SpaceMiT K1 IME int8 matmul via the `smt.vmadot` MAC unit.\n\n"

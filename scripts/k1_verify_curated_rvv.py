@@ -60,7 +60,7 @@ REMOTE_ROOT = os.environ.get("MODELBLASTER_K1_REMOTE_ROOT", "/root/mb_k1")
 MARCH = ["-march=rv64gcv_zvl256b", "-mabi=lp64d"]
 
 MODELS = ["vitfly_lstm", "lstm_tiny", "dronet", "yolov8_nano",
-          "vitfly_frontend", "mlp_control", "attn_block", "norm_block"]
+          "vitfly_frontend", "mlp_control", "attn_block", "norm_block", "ffn_block"]
 
 CURATED = {
     "lstm_s8": "kernels/rvv/rvv_lstm_s8_rvv_gate_int_dot.c",
@@ -70,6 +70,7 @@ CURATED = {
     "leaky_relu_s8": "kernels/rvv/rvv_leaky_relu_s8_rvv_frm_rmm.c",
     "sigmoid_s8": "kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c",
     "matmul_s8": "kernels/rvv/rvv_matmul_s8_rvv_k_reduce_n_lanes.c",
+    "linear_s8": "kernels/rvv/rvv_linear_s8_direct.c",
 }
 
 #: Shapes to check beyond the ones the model graphs happen to contain.
@@ -674,6 +675,81 @@ int main(void) {{
 """
 
 
+def emit_linear(cases):
+    """out[M,N] = requant(bias[n] + sum_k in[m,k]*w[n,k]), int8.
+
+    The requantize here is a Q0.31 multiply plus a rounding shift -- INTEGER,
+    unlike matmul_s8's float scale. So bit-exactness is a question of getting
+    the int64 arithmetic right rather than of matching a float rounding mode,
+    and both regimes test the same thing: "full" drives the int32 accumulator
+    toward saturation, "small" keeps it where the rounding shift decides the
+    last bit.
+    """
+    max_i = max(c["M"] * c["K"] for c in cases)
+    max_w = max(c["K"] * c["N"] for c in cases)
+    max_o = max(c["M"] * c["N"] for c in cases)
+    max_n = max(c["N"] for c in cases)
+    rows = ['    { "%(tag)s", %(M)d, %(K)d, %(N)d, %(input_offset)d,'
+            ' %(filter_offset)d, %(output_offset)d, %(output_multiplier)d,'
+            ' %(output_shift)d, %(activation_min)d, %(activation_max)d },' % c
+            for c in cases]
+    return PRELUDE + f"""
+#define MAX_I {max_i}
+#define MAX_W {max_w}
+#define MAX_O {max_o}
+#define MAX_N {max_n}
+typedef struct {{
+    const char *tag; int M, K, N;
+    int in_off, filt_off, out_off, out_mult, out_shift, amin, amax;
+}} case_t;
+static const case_t CASES[] = {{
+{chr(10).join(rows)}
+}};
+#define N_CASES ((int)(sizeof(CASES)/sizeof(CASES[0])))
+
+extern void kernel_cand(const int8_t *, const int8_t *, const int32_t *,
+                        int8_t *, int, int, int, int, int, int, int, int,
+                        int, int);
+extern void kernel_ref(const int8_t *, const int8_t *, const int32_t *,
+                       int8_t *, int, int, int, int, int, int, int, int,
+                       int, int);
+
+static int8_t A[MAX_I], W[MAX_W], OUTC[MAX_O], OUTR[MAX_O];
+static int32_t BIAS[MAX_N];
+
+int main(void) {{
+    for (int i = 0; i < N_CASES; i++) {{
+        const case_t *c = &CASES[i];
+        char dims[96];
+        snprintf(dims, sizeof dims, "M=%d K=%d N=%d act[%d,%d]",
+                 c->M, c->K, c->N, c->amin, c->amax);
+        int ni = c->M * c->K, nw = c->K * c->N, no = c->M * c->N;
+        for (int regime = 0; regime < 2; regime++) {{
+            int lim = regime ? 8 : 128;
+            rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)i << 8) ^ regime;
+            for (int k = 0; k < ni; k++) A[k] = rnd8(lim);
+            for (int k = 0; k < nw; k++) W[k] = rnd8(lim);
+            for (int k = 0; k < c->N; k++) BIAS[k] = (int32_t)rnd8(64) * 37;
+            memset(OUTC, 0, no); memset(OUTR, 0, no);
+            double t0 = now_ms();
+            kernel_cand(A, W, BIAS, OUTC, c->M, c->K, c->N, c->in_off,
+                        c->filt_off, c->out_off, c->out_mult, c->out_shift,
+                        c->amin, c->amax);
+            double t1 = now_ms();
+            kernel_ref(A, W, BIAS, OUTR, c->M, c->K, c->N, c->in_off,
+                       c->filt_off, c->out_off, c->out_mult, c->out_shift,
+                       c->amin, c->amax);
+            double t2 = now_ms();
+            report(c->tag, regime ? "small" : "full", dims, OUTC, OUTR,
+                   no, t1 - t0, t2 - t1);
+        }}
+    }}
+    printf("WORST max_abs_err=%d over %d cases\\n", worst, N_CASES);
+    return worst == 0 ? 0 : 1;
+}}
+"""
+
+
 EMITTERS = {
     "lstm_s8": emit_lstm,
     "add_s8": emit_add,
@@ -689,6 +765,7 @@ EMITTERS = {
     "gelu_s8": lambda cs: _emit_unary(cs, None, None, ""),
     "softmax_s8": emit_softmax,
     "layernorm_s8": emit_layernorm,
+    "linear_s8": emit_linear,
 }
 
 
