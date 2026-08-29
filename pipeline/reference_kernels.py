@@ -9353,6 +9353,54 @@ void kernel_sin_s8(const int8_t *input, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}],
     argtypes_factory=_sin_s8_argtypes,
+    algorithms=[
+        # Kernel: kernels/rvv/rvv_sin_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Memoized 256-entry LUT plus an RVV byte gather -- the same "
+                "structure as kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c, "
+                "with sin_s8's expression substituted.\n\n"
+                "WHY A LUT IS BIT-EXACT HERE RATHER THAN A COMPROMISE. The "
+                "input is int8, so there are only 256 possible inputs. Build "
+                "the table by calling the reference expression VERBATIM on "
+                "each byte -- same `sin`, same double precision, same "
+                "`round`, same clamp -- and every output is the reference's "
+                "own answer by construction. This is the one case where "
+                "vectorizing a transcendental costs no accuracy at all, "
+                "because the transcendental is never vectorized: it is "
+                "evaluated at most 256 times in scalar double and then looked "
+                "up.\n\n"
+                "THE GATHER. Bias the input byte into unsigned order with "
+                "`vxor` by -128, then `vluxei8_v_i8m1` gathers 32 results per "
+                "pass at VLEN=256. No arithmetic in the vector path at all.\n\n"
+                "MEMOIZE, DO NOT BUILD EAGERLY. Mark which of the 256 bytes "
+                "actually occur in this input and evaluate only those. A RoPE "
+                "tensor occupies a narrow slice of the range, so an eager "
+                "table pays 256 `sin` calls to serve a handful.\n\n"
+                "AND FALL BACK TO SCALAR ON SHORT INPUTS. Below ~32 elements "
+                "the marking pass plus the table build costs more than the "
+                "transcendentals it saves, and at n=1 the LUT is pure "
+                "overhead. Keep a threshold and take the reference path under "
+                "it.\n\n"
+                "Reuse the shared `mb_rvv_lut_gather_s8` helper and its "
+                "include guard -- several of these bodies can land in the "
+                "same kernels.c.\n\n"
+                "MUST be bit-exact to the sin_s8 reference: max_abs_err = 0."
+            ),
+            reference_impl=(
+                "/* See kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c for\n"
+                " * the complete worked version. Substitute, keeping the\n"
+                " * double precision and `round` exactly as the reference\n"
+                " * has them:\n"
+                " *   const double y = sin((double)x * (double)scale_in);\n"
+                " *   int32_t v = (int32_t)round(y / (double)scale_out);\n"
+                " */\n"
+            ),
+        ),
+    ],
 )
 
 
@@ -9385,6 +9433,54 @@ void kernel_cos_s8(const int8_t *input, int8_t *output, int n,
 """,
     extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}],
     argtypes_factory=_cos_s8_argtypes,
+    algorithms=[
+        # Kernel: kernels/rvv/rvv_cos_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Memoized 256-entry LUT plus an RVV byte gather -- the same "
+                "structure as kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c, "
+                "with cos_s8's expression substituted.\n\n"
+                "WHY A LUT IS BIT-EXACT HERE RATHER THAN A COMPROMISE. The "
+                "input is int8, so there are only 256 possible inputs. Build "
+                "the table by calling the reference expression VERBATIM on "
+                "each byte -- same `cos`, same double precision, same "
+                "`round`, same clamp -- and every output is the reference's "
+                "own answer by construction. This is the one case where "
+                "vectorizing a transcendental costs no accuracy at all, "
+                "because the transcendental is never vectorized: it is "
+                "evaluated at most 256 times in scalar double and then looked "
+                "up.\n\n"
+                "THE GATHER. Bias the input byte into unsigned order with "
+                "`vxor` by -128, then `vluxei8_v_i8m1` gathers 32 results per "
+                "pass at VLEN=256. No arithmetic in the vector path at all.\n\n"
+                "MEMOIZE, DO NOT BUILD EAGERLY. Mark which of the 256 bytes "
+                "actually occur in this input and evaluate only those. A RoPE "
+                "tensor occupies a narrow slice of the range, so an eager "
+                "table pays 256 `cos` calls to serve a handful.\n\n"
+                "AND FALL BACK TO SCALAR ON SHORT INPUTS. Below ~32 elements "
+                "the marking pass plus the table build costs more than the "
+                "transcendentals it saves, and at n=1 the LUT is pure "
+                "overhead. Keep a threshold and take the reference path under "
+                "it.\n\n"
+                "Reuse the shared `mb_rvv_lut_gather_s8` helper and its "
+                "include guard -- several of these bodies can land in the "
+                "same kernels.c.\n\n"
+                "MUST be bit-exact to the cos_s8 reference: max_abs_err = 0."
+            ),
+            reference_impl=(
+                "/* See kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c for\n"
+                " * the complete worked version. Substitute, keeping the\n"
+                " * double precision and `round` exactly as the reference\n"
+                " * has them:\n"
+                " *   const double y = cos((double)x * (double)scale_in);\n"
+                " *   int32_t v = (int32_t)round(y / (double)scale_out);\n"
+                " */\n"
+            ),
+        ),
+    ],
 )
 
 
