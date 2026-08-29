@@ -8,10 +8,12 @@ add_s8, avgpool2d_s8, elu_s8, leaky_relu_s8, sigmoid_s8.
 
 Why on the board and not on the host
 ------------------------------------
-rvv_x60's declared verify_method is VERIFY_HOST_CTYPES: it compiles the
-candidate with the HOST compiler and dlopen()s it. That works for a scalar
-kernel and cannot work for one written in RVV intrinsics, because the host is
-x86. Spike bakes VLEN at build time and does not model this toolchain's
+rvv_x60's verify_method is VERIFY_CROSS_COMPILE: generation builds the
+candidate for the target ISA but does not run it, because the host is x86 and
+cannot execute rv64gcv. (It used to declare VERIFY_HOST_CTYPES, which could not
+even COMPILE an RVV candidate and so rejected every one of them -- see
+tests/test_cross_compile_verify.py.) A kernel that cross-compiles is still
+numerically unverified, and this script is where that gets settled. Spike bakes VLEN at build time and does not model this toolchain's
 codegen, and the properties at issue are exactly VLEN- and codegen-dependent
 (vl-tail handling, whether frm actually reaches vfcvt, whether GCC contracts a
 multiply and an add into an fma).
@@ -58,7 +60,7 @@ REMOTE_ROOT = os.environ.get("MODELBLASTER_K1_REMOTE_ROOT", "/root/mb_k1")
 MARCH = ["-march=rv64gcv_zvl256b", "-mabi=lp64d"]
 
 MODELS = ["vitfly_lstm", "lstm_tiny", "dronet", "yolov8_nano",
-          "vitfly_frontend", "mlp_control"]
+          "vitfly_frontend", "mlp_control", "attn_block"]
 
 CURATED = {
     "lstm_s8": "kernels/rvv/rvv_lstm_s8_rvv_gate_int_dot.c",
@@ -67,6 +69,24 @@ CURATED = {
     "elu_s8": "kernels/rvv/rvv_elu_s8_rvv_memo_lut_gather.c",
     "leaky_relu_s8": "kernels/rvv/rvv_leaky_relu_s8_rvv_frm_rmm.c",
     "sigmoid_s8": "kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c",
+    "matmul_s8": "kernels/rvv/rvv_matmul_s8_rvv_k_reduce_n_lanes.c",
+}
+
+#: Shapes to check beyond the ones the model graphs happen to contain.
+#: attn_block's own matmuls are M=8,K=32,N=8 and M=8,K=8,N=32 -- correctness
+#: shapes, but K=32 is exactly one e8m1 strip at VLEN=256, so they never
+#: exercise a k-tail, a multi-strip accumulation, or an N-strip wider than one
+#: vector. A kernel that is wrong in exactly those places passes on the model
+#: shapes alone. These come from matmul_s8's own KernelSpec.extra_shapes plus
+#: two deliberate off-by-one strip boundaries.
+EXTRA_CASES = {
+    "matmul_s8": [
+        {"M": 7, "K": 64,  "N": 7,   "transpose_b": 1, "scale_div": 8.0},
+        {"M": 7, "K": 7,   "N": 64,  "transpose_b": 0, "scale_div": 1.0},
+        {"M": 7, "K": 512, "N": 512, "transpose_b": 0, "scale_div": 1.0},
+        {"M": 3, "K": 33,  "N": 5,   "transpose_b": 1, "scale_div": 1.0},
+        {"M": 3, "K": 31,  "N": 33,  "transpose_b": 0, "scale_div": 1.0},
+    ],
 }
 
 
@@ -93,6 +113,20 @@ def collect_cases(op_name, models):
             seen.add(key)
             case["tag"] = f"{model}:{node['name']}"
             cases.append(case)
+
+    # Shapes the graphs do not happen to contain but the kernel must survive:
+    # strip boundaries and a large K. Quant values are borrowed from the first
+    # real case so the requantize tail sees realistic scales rather than 1.0.
+    donor = dict(cases[0]) if cases else {}
+    for extra in EXTRA_CASES.get(op_name, []):
+        case = {k: v for k, v in donor.items() if k not in ("tag",)}
+        case.update(extra)
+        key = tuple(sorted(case.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        case["tag"] = ("synthetic:M%(M)dK%(K)dN%(N)dtb%(transpose_b)d" % case)
+        cases.append(case)
     return cases
 
 
@@ -428,6 +462,78 @@ int main(void) {{
 """
 
 
+def emit_matmul(cases):
+    """out[M,N] = a[M,K] @ (transpose_b ? b[N,K]^T : b[K,N]), int8.
+
+    Both regimes matter here for a specific reason. "full" drives the int32
+    accumulator hard, so a widening mistake (accumulating in i16, or an LMUL
+    that cannot hold the sum) shows as saturation. "small" keeps the products
+    low so the FLOAT REQUANTIZE decides the answer -- which is where a
+    vectorized tail would diverge from the reference's roundf, since RVV float
+    conversion rounds to nearest-even and roundf rounds half away from zero.
+    A kernel that vectorized the tail passes "full" and fails "small".
+    """
+    max_a = max(c["M"] * c["K"] for c in cases)
+    max_b = max(c["K"] * c["N"] for c in cases)
+    max_o = max(c["M"] * c["N"] for c in cases)
+    rows = ['    { "%(tag)s", %(M)d, %(K)d, %(N)d, %(transpose_b)d,'
+            ' %(scale_a).9ef, %(scale_b).9ef, %(scale_out).9ef,'
+            ' %(scale_div).9ef, %(activation_min)d, %(activation_max)d },' % c
+            for c in cases]
+    return PRELUDE + f"""
+#define MAX_A {max_a}
+#define MAX_B {max_b}
+#define MAX_O {max_o}
+typedef struct {{
+    const char *tag; int M, K, N, transpose_b;
+    float scale_a, scale_b, scale_out, scale_div; int amin, amax;
+}} case_t;
+static const case_t CASES[] = {{
+{chr(10).join(rows)}
+}};
+#define N_CASES ((int)(sizeof(CASES)/sizeof(CASES[0])))
+
+extern void kernel_cand(const int8_t *, const int8_t *, int8_t *,
+                        int, int, int, float, float, float, int, float,
+                        int, int);
+extern void kernel_ref(const int8_t *, const int8_t *, int8_t *,
+                       int, int, int, float, float, float, int, float,
+                       int, int);
+
+static int8_t A[MAX_A], B[MAX_B], OUTC[MAX_O], OUTR[MAX_O];
+
+int main(void) {{
+    for (int i = 0; i < N_CASES; i++) {{
+        const case_t *c = &CASES[i];
+        char dims[96];
+        snprintf(dims, sizeof dims, "M=%d K=%d N=%d tb=%d act[%d,%d]",
+                 c->M, c->K, c->N, c->transpose_b, c->amin, c->amax);
+        int na = c->M * c->K, nb = c->K * c->N, no = c->M * c->N;
+        for (int regime = 0; regime < 2; regime++) {{
+            int lim = regime ? 8 : 128;
+            rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)i << 8) ^ regime;
+            for (int k = 0; k < na; k++) A[k] = rnd8(lim);
+            for (int k = 0; k < nb; k++) B[k] = rnd8(lim);
+            memset(OUTC, 0, no); memset(OUTR, 0, no);
+            double t0 = now_ms();
+            kernel_cand(A, B, OUTC, c->M, c->K, c->N, c->scale_a, c->scale_b,
+                        c->scale_out, c->transpose_b, c->scale_div,
+                        c->amin, c->amax);
+            double t1 = now_ms();
+            kernel_ref(A, B, OUTR, c->M, c->K, c->N, c->scale_a, c->scale_b,
+                       c->scale_out, c->transpose_b, c->scale_div,
+                       c->amin, c->amax);
+            double t2 = now_ms();
+            report(c->tag, regime ? "small" : "full", dims, OUTC, OUTR,
+                   no, t1 - t0, t2 - t1);
+        }}
+    }}
+    printf("WORST max_abs_err=%d over %d cases\\n", worst, N_CASES);
+    return worst == 0 ? 0 : 1;
+}}
+"""
+
+
 EMITTERS = {
     "lstm_s8": emit_lstm,
     "add_s8": emit_add,
@@ -436,6 +542,7 @@ EMITTERS = {
     "leaky_relu_s8": lambda cs: _emit_unary(cs, "negative_slope", "float",
                                             ", c->negative_slope"),
     "sigmoid_s8": lambda cs: _emit_unary(cs, None, None, ""),
+    "matmul_s8": emit_matmul,
 }
 
 
