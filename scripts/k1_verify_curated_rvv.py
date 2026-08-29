@@ -763,6 +763,9 @@ EMITTERS = {
     # sigmoid_s8, so both reuse the existing harnesses.
     "mul_s8": emit_add,
     "gelu_s8": lambda cs: _emit_unary(cs, None, None, ""),
+    # RoPE pair: same signature as sigmoid_s8, so same harness.
+    "sin_s8": lambda cs: _emit_unary(cs, None, None, ""),
+    "cos_s8": lambda cs: _emit_unary(cs, None, None, ""),
     "softmax_s8": emit_softmax,
     "layernorm_s8": emit_layernorm,
     "linear_s8": emit_linear,
