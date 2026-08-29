@@ -19,6 +19,13 @@
  *                        the cycle CSR from userspace raises SIGILL on this
  *                        kernel, so generate_skeleton --platform linux emits
  *                        rdtime instead.
+ *
+ * MULTI-CORE. Built with -DMODELBLASTER_USE_POOL this creates a
+ * modelblaster_pool and hands it to run_model, which is what makes the
+ * generated `parallel_<op>` wrappers take their pool arm instead of falling
+ * through to the serial call. Without the define the third argument stays
+ * NULL and the binary is byte-for-byte what it was -- so enabling multi-core
+ * cannot silently re-measure the single-core profile with a different build.
  */
 
 #define _GNU_SOURCE
@@ -31,40 +38,118 @@
 #include "model.h"
 #include "test_io.h"
 
+#ifdef MODELBLASTER_USE_POOL
+#include "modelblaster_pool.h"
+#endif
+
 static model_output_t model_output[MODEL_OUTPUT_SIZE];
 
-/* MODELBLASTER_CPU=<id> pins the whole process to one core. Left unset, the
- * scheduler is free to migrate us, which turns a per-core profile into an
- * average over whatever cores were idle. */
-static void pin_from_env(void)
+/* MODELBLASTER_CPU pins the process. Accepts one id ("3"), a list ("0,1,2,3")
+ * or an inclusive range ("0-3").
+ *
+ * WHY A SET AND NOT AN ID. It was one id, which is right for a single-core
+ * profile and makes a multi-core one impossible: the pool's helper threads
+ * inherit the creating process's affinity mask, so a mask of {0} would have
+ * pinned every worker onto hart 0 and the "4-core" run would have been four
+ * threads time-slicing one core. That does not fail -- it produces a number,
+ * and the number looks like poor scaling.
+ *
+ * Returns how many cpus are in the mask, so the pool can be sized from the
+ * same source of truth rather than from a second environment variable that
+ * can disagree with it.
+ */
+static int pin_from_env(void)
 {
     const char *s = getenv("MODELBLASTER_CPU");
     if (!s || !*s)
-        return;
-    char *end = NULL;
-    long cpu = strtol(s, &end, 10);
-    if (end == s || cpu < 0) {
-        fprintf(stderr, "MODELBLASTER_CPU=%s is not a cpu id; not pinning\n", s);
-        return;
-    }
+        return 0;
+
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET((int)cpu, &set);
+    int n = 0;
+    const char *p = s;
+    while (*p) {
+        char *end = NULL;
+        long lo = strtol(p, &end, 10);
+        if (end == p) {
+            fprintf(stderr, "MODELBLASTER_CPU=%s is not a cpu list; "
+                            "not pinning\n", s);
+            return 0;
+        }
+        long hi = lo;
+        p = end;
+        if (*p == '-') {
+            p++;
+            hi = strtol(p, &end, 10);
+            if (end == p) {
+                fprintf(stderr, "MODELBLASTER_CPU=%s: range with no end; "
+                                "not pinning\n", s);
+                return 0;
+            }
+            p = end;
+        }
+        if (lo < 0 || hi < lo) {
+            fprintf(stderr, "MODELBLASTER_CPU=%s: bad range; not pinning\n", s);
+            return 0;
+        }
+        for (long c = lo; c <= hi; c++) {
+            if (c >= CPU_SETSIZE) continue;
+            if (!CPU_ISSET((int)c, &set)) { CPU_SET((int)c, &set); n++; }
+        }
+        while (*p == ',' || *p == ' ') p++;
+    }
+    if (n == 0)
+        return 0;
     if (sched_setaffinity(0, sizeof set, &set) != 0) {
         perror("sched_setaffinity");
-        return;
+        return 0;
     }
     sched_yield();
-    printf("modelblaster harness: pinned to cpu %ld (running on %d)\n",
-           cpu, sched_getcpu());
+    printf("modelblaster harness: pinned to cpu %s (%d core(s), running on %d)\n",
+           s, n, sched_getcpu());
+    return n;
 }
 
 int main(void)
 {
-    pin_from_env();
+    int n_pinned = pin_from_env();
 
     printf("modelblaster harness: model=%s in=%d out=%d\n",
            MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE);
+
+    void *pool = NULL;
+#ifdef MODELBLASTER_USE_POOL
+    /* Thread count comes from the pin mask unless overridden. One source of
+     * truth: a separate MODELBLASTER_POOL_THREADS that disagreed with
+     * MODELBLASTER_CPU would produce a run whose topo tag says one width and
+     * whose pool is another, and the profile tree records the tag. */
+    long threads = n_pinned > 0 ? n_pinned : 1;
+    {
+        const char *e = getenv("MODELBLASTER_POOL_THREADS");
+        if (e && *e) {
+            long v = strtol(e, NULL, 10);
+            if (v > 0) threads = v;
+        }
+    }
+    if (threads > 1) {
+        pool = (void *)modelblaster_pool_create((int)threads);
+        if (pool == NULL) {
+            /* Loud, and fatal. A NULL pool is the wrappers' "run serially"
+             * signal, so a silent fallback would file a serial measurement
+             * under a multi-core topo tag -- the exact shape of bookkeeping
+             * fiction this project exists to keep out of the cost database. */
+            fprintf(stderr, "modelblaster harness: pool_create(%ld) FAILED; "
+                            "refusing to record a serial run as multi-core\n",
+                    threads);
+            return 3;
+        }
+        printf("modelblaster harness: pool of %ld thread(s)\n", threads);
+    } else {
+        printf("modelblaster harness: no pool (1 core)\n");
+    }
+#else
+    (void)n_pinned;
+#endif
 
     /* Repeat count. Two independent reasons, and the second is not obvious.
      *
@@ -94,7 +179,7 @@ int main(void)
     }
 
     for (long it = 0; it < iters; it++) {
-        run_model(model_test_input, model_output, NULL);
+        run_model(model_test_input, model_output, pool);
         if (iters > 1) {
             /* One block per iteration so the host can compare them. A
              * stateful model's outputs diverge across iterations by design;
@@ -168,5 +253,10 @@ int main(void)
      * field name is kept for protocol compatibility; convert with
      * PROFILE_CLOCK_MHZ=24, not with the core clock. */
     printf("=== MODELBLASTER_WALL_CYCLES === %lu\n", model_wall_cycles());
+
+#ifdef MODELBLASTER_USE_POOL
+    if (pool)
+        modelblaster_pool_destroy((modelblaster_pool_t)pool);
+#endif
     return 0;
 }
