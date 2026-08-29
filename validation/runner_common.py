@@ -544,6 +544,34 @@ class IREEProfileArgs:
     gen_dir: Optional[str] = None
 
 
+def _parse_cores(spec: str) -> list[int]:
+    """A core list, accepting the comma and the underscore spelling.
+
+    WHY THIS IS NOT `[int(c) for c in spec.split(",")]`, which is what it was.
+    The profile tree writes the topology as `topo_0_1_2_3`, so the underscore
+    form is the one a caller reads off a path and hands back. Split only on
+    commas, `"0_1_2_3"` reaches `int()` as a single token -- and Python accepts
+    underscores as digit separators, so it returns **123**. No exception, and
+    the run is filed under `topo_123`: a directory that does not correspond to
+    any topology, sorts nowhere near the real ones, and reads as plausible.
+
+    Found by a 4-core ffn_block run landing in `topo_123`. Rejecting the
+    underscore would have been enough to make it loud; accepting it is better,
+    because the underscore is the spelling the tree itself uses.
+    """
+    out: list[int] = []
+    for tok in str(spec).replace("_", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if not tok.isdigit():
+            raise ValueError(
+                f"--profile-cores {spec!r}: {tok!r} is not a hart id. Use "
+                f"'0,1,2,3' or '0_1_2_3'.")
+        out.append(int(tok))
+    return out
+
+
 def emit_iree_profile(records: list[dict], model: str,
                       args: IREEProfileArgs, backend: str) -> Optional[str]:
     """Build a ProfileMeta and write an IREE-shape CSV.
@@ -551,7 +579,7 @@ def emit_iree_profile(records: list[dict], model: str,
     if not args.profile_out_root or not records:
         return None
     from modelblaster.pipeline import profile_writer
-    cores = [int(c) for c in args.profile_cores.split(",") if c.strip()]
+    cores = _parse_cores(args.profile_cores)
     cpu = args.profile_cpu or args.profile_source
     meta = profile_writer.ProfileMeta(
         model=model,

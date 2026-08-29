@@ -271,7 +271,29 @@ static inline void parallel_conv2d(void *pool_,
 """
 
 _LINEAR_S8_WRAPPER = """
-/* ---- linear_s8: split outer N (output features), M==1 only -------------- */
+/* ---- linear_s8: split M when there are rows to split, else N ------------
+ *
+ * WHY TWO AXES AND NOT ONE. The kernel takes no output stride: it writes
+ * `out[m*N + n]` with the N it was CALLED with. So an N-shard is only
+ * expressible when M == 1 -- with more than one row, columns [n0, n1) of an
+ * [M, N] output are strided and `out + n0` addresses the wrong elements from
+ * row 1 onwards. That is why this wrapper carried an `M != 1` bail-out: not
+ * an oversight, a correctness guard.
+ *
+ * It also meant the wrapper did nothing for the shapes that matter. Every
+ * linear in the transformer blocks is M=8 (attention) or M=128 (FFN), and
+ * ffn_block is 80% linear by time once gelu is vectorised -- so the one op
+ * with a live multi-core path was engaging only on GEMVs.
+ *
+ * The M axis has no such problem. Row m0..m1 of a row-major [M, N] output is
+ * CONTIGUOUS: `in + m0*K`, `out + m0*N`, M = m1-m0, with w, b and N passed
+ * through unchanged. And M, like N, is an OUTPUT axis, so slicing it
+ * partitions output elements and reorders no accumulation -- the result is
+ * bit-identical to the serial call, not close to it. (Slicing K, the
+ * reduction, would not be.)
+ *
+ * So: shard M when M >= T, else shard N when M == 1, else run serial.
+ */
 typedef struct {{
     const int8_t  *in;
     const int8_t  *w;
@@ -288,10 +310,30 @@ typedef struct {{
     int activation_min;
     int activation_max;
     int chunks;
+    int split_m;   /* 1 = slice rows (M), 0 = slice columns (N) */
 }} parallel_linear_s8_ctx_t;
 
 static void parallel_linear_s8_fn(void *ctx_, size_t i) {{
     parallel_linear_s8_ctx_t *c = (parallel_linear_s8_ctx_t *)ctx_;
+    if (c->split_m) {{
+        /* Rows are contiguous in a row-major [M, N] output, so the slice is
+         * a pair of base offsets and the kernel's own N is unchanged. */
+        int m_per = (c->M + c->chunks - 1) / c->chunks;
+        int m0 = (int)i * m_per;
+        int m1 = m0 + m_per;
+        if (m1 > c->M) m1 = c->M;
+        if (m0 >= m1) return;
+        kernel_linear_s8_{mid}(c->in + (size_t)m0 * (size_t)c->K,
+                               c->w, c->b,
+                               c->out + (size_t)m0 * (size_t)c->N_total,
+                               m1 - m0, c->K, c->N_total,
+                               c->input_offset, c->filter_offset,
+                               c->output_offset,
+                               c->output_multiplier, c->output_shift,
+                               c->activation_min, c->activation_max);
+        return;
+    }}
+    /* N slice: only reachable at M == 1, where `out + n0` is exact. */
     int n_per = (c->N_total + c->chunks - 1) / c->chunks;
     int n0 = (int)i * n_per;
     int n1 = n0 + n_per;
@@ -319,15 +361,13 @@ static inline void parallel_linear_s8(void *pool_,
                                       int activation_min, int activation_max) {{
 #ifdef MODELBLASTER_USE_POOL
     modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
-    if (pool == NULL || M != 1) {{
-        kernel_linear_s8_{mid}(in, w, b, out, M, K, N,
-                               input_offset, filter_offset, output_offset,
-                               output_multiplier, output_shift,
-                               activation_min, activation_max);
-        return;
-    }}
-    size_t T = modelblaster_pool_get_threads_count(pool);
-    if (T <= 1 || (size_t)N < T) {{
+    size_t T = pool ? modelblaster_pool_get_threads_count(pool) : 1;
+    /* Prefer the row axis: it is correct at every M, and it is the one the
+     * transformer shapes actually have. Fall back to the column axis only at
+     * M == 1, where the kernel's missing output stride does not bite. */
+    int split_m = (M > 1 && (size_t)M >= T);
+    int splittable = split_m || (M == 1 && (size_t)N >= T);
+    if (pool == NULL || T <= 1 || !splittable) {{
         kernel_linear_s8_{mid}(in, w, b, out, M, K, N,
                                input_offset, filter_offset, output_offset,
                                output_multiplier, output_shift,
@@ -341,7 +381,7 @@ static inline void parallel_linear_s8(void *pool_,
         .output_offset = output_offset,
         .output_multiplier = output_multiplier, .output_shift = output_shift,
         .activation_min = activation_min, .activation_max = activation_max,
-        .chunks = (int)T,
+        .chunks = (int)T, .split_m = split_m,
     }};
     modelblaster_pool_parallelize_1d(pool, parallel_linear_s8_fn, &ctx, T, 0);
 #else

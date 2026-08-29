@@ -30,6 +30,29 @@ CFLAGS    ?= -O2 -static
 KERNEL_CFLAGS ?=
 INCLUDES  := -I src -I $(MODEL_DIR)
 
+# POOL=1 builds the multi-core flavour: link modelblaster_pool and define
+# MODELBLASTER_USE_POOL, which is what makes the generated `parallel_<op>`
+# wrappers take their pool arm. Off by default, deliberately -- a single-core
+# profile and a multi-core one must not differ by anything except the pool, and
+# the surest way to guarantee that is for the default build to be unchanged.
+#
+# The pool is pthreads + counting semaphores. On Zephyr those are k_sem; here
+# runtime/mb_posix_compat.h supplies them, selected by
+# MODELBLASTER_PLATFORM_LINUX -- the same define generate_skeleton --platform
+# linux uses to emit rdtime instead of rdcycle, so the pool's tick source and
+# the model's agree by construction.
+POOL ?= 0
+ifeq ($(POOL),1)
+POOL_DIR    := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))/../runtime
+INCLUDES    += -I $(POOL_DIR) -I $(POOL_DIR)/modelblaster_pool
+CFLAGS      += -DMODELBLASTER_USE_POOL -DMODELBLASTER_PLATFORM_LINUX -pthread
+SRCS_POOL   := $(POOL_DIR)/modelblaster_pool/modelblaster_pool.c
+LDLIBS_POOL := -pthread
+else
+SRCS_POOL   :=
+LDLIBS_POOL :=
+endif
+
 # Auto-generated header dependencies. Without them a rule's only prerequisite
 # is its .c file, so a change to the GENERATED headers -- model.h, test_io.h --
 # does not rebuild the objects that #include them.
@@ -47,7 +70,7 @@ INCLUDES  := -I src -I $(MODEL_DIR)
 DEPFLAGS := -MMD -MP
 
 OBJDIR := $(OUT).objs
-SRCS_PLAIN := src/main.c $(MODEL_DIR)/model.c $(MODEL_DIR)/weights.c $(MODEL_DIR)/buffers.c
+SRCS_PLAIN := src/main.c $(MODEL_DIR)/model.c $(MODEL_DIR)/weights.c $(MODEL_DIR)/buffers.c $(SRCS_POOL)
 OBJS_PLAIN := $(addprefix $(OBJDIR)/,$(notdir $(SRCS_PLAIN:.c=.o)))
 OBJ_KERNELS := $(OBJDIR)/kernels.o
 OBJ_TESTIO  := $(OBJDIR)/test_io.o
@@ -66,6 +89,10 @@ $(OBJDIR)/weights.o: $(MODEL_DIR)/weights.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 $(OBJDIR)/buffers.o: $(MODEL_DIR)/buffers.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+ifeq ($(POOL),1)
+$(OBJDIR)/modelblaster_pool.o: $(POOL_DIR)/modelblaster_pool/modelblaster_pool.c | $(OBJDIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+endif
 
 # Only kernels.c gets the backend ISA flags -- and, optionally, its own
 # compiler (see KERNEL_CC above). -static is dropped here because it is a link
@@ -84,7 +111,7 @@ $(OBJ_TESTIO): $(MODEL_DIR)/test_io.S | $(OBJDIR)
 
 $(OUT): $(OBJS_PLAIN) $(OBJ_KERNELS) $(OBJ_TESTIO)
 	@mkdir -p $(dir $(OUT))
-	$(CC) $(CFLAGS) $^ -o $@ -lm
+	$(CC) $(CFLAGS) $^ -o $@ -lm $(LDLIBS_POOL)
 	@echo "built $(OUT)"
 
 clean:
