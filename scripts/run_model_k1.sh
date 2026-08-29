@@ -21,6 +21,17 @@
 #   OUT_ROOT                     local build/staging dir
 #   MB_IR                        profile this graph.json instead of re-extracting
 #                                (a fuse/split rewrite); see the note at step 1/5
+#   MB_CORES                     core SET for a multi-core run, e.g. "0,1,2,3"
+#                                or "0-3". Builds the harness with POOL=1, pins
+#                                the process to that mask, sizes the pool from
+#                                it, and files the profile under topo_0_1_2_3
+#                                instead of topo_0. Unset = the single-core
+#                                path, byte-identical to before.
+#   MB_SHARD_FACTOR              OC shards per conv, at CODEGEN time (the
+#                                weights are re-packed per shard, so it cannot
+#                                be a runtime knob). Only meaningful with
+#                                MB_CORES; 1 = off. Convs whose OC is not
+#                                divisible by it stay whole.
 #
 # No credentials are read or written; ssh does whatever it is already
 # configured to do.
@@ -31,6 +42,43 @@ MODEL="${1:-mlp_control}"
 QUANT="${2:-int8}"
 TARGET="${3:-scalar}"
 CPU="${4:-0}"
+
+# MB_CORES turns this into a multi-core run. Everything it changes is derived
+# here, once, so the pool width, the affinity mask and the topo tag in the
+# profile tree cannot disagree with each other -- a run tagged topo_0_1_2_3
+# whose pool was actually 1 thread is a serial measurement filed as a parallel
+# one, and nothing downstream could tell.
+POOL_ARGS=()
+PROFILE_CORES_ARGS=()
+RUN_CPU="${CPU}"
+if [[ -n "${MB_CORES:-}" ]]; then
+    RUN_CPU="${MB_CORES}"
+    POOL_ARGS+=(POOL=1)
+    # "0-3" and "0,1,2,3" both become the tag "0_1_2_3": the profile tree keys
+    # on the hart LIST, and two spellings of one core set must not produce two
+    # trees.
+    TOPO_CORES="$("${PY:-python3}" - "${MB_CORES}" <<'PYEOF'
+import sys
+out = []
+for part in sys.argv[1].replace(" ", "").split(","):
+    if not part:
+        continue
+    if "-" in part:
+        lo, hi = part.split("-", 1)
+        out.extend(range(int(lo), int(hi) + 1))
+    else:
+        out.append(int(part))
+seen = []
+for c in out:
+    if c not in seen:
+        seen.append(c)
+print("_".join(str(c) for c in sorted(seen)))
+PYEOF
+)"
+    PROFILE_CORES_ARGS+=(--profile-cores "${TOPO_CORES}")
+    BIN_SUFFIX="_pool${TOPO_CORES}"
+    echo "=== multi-core run: cores ${MB_CORES} -> topo_${TOPO_CORES}, MB_SHARD_FACTOR=${MB_SHARD_FACTOR:-1} ==="
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/build/k1}"
@@ -44,7 +92,12 @@ PY="${PY:-python3}"
 export LLM_PROVIDER="${LLM_PROVIDER:-codex}"
 
 GEN="${OUT_ROOT}/${MODEL}/${QUANT}"
-BIN="${OUT_ROOT}/${MODEL}_${QUANT}_${TARGET}_harness"
+# The pool build and the serial build get DIFFERENT binaries and different
+# object dirs. Sharing one would relink a stale main.o -- built without
+# MODELBLASTER_USE_POOL, so `pool` is NULL and every parallel_ wrapper takes
+# its serial arm -- into a run that reports itself as multi-core. Same class of
+# defect as the stale model.h sizes the Makefile documents, and just as silent.
+BIN="${OUT_ROOT}/${MODEL}_${QUANT}_${TARGET}_harness${BIN_SUFFIX:-}"
 mkdir -p "${GEN}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -159,7 +212,7 @@ PYEOF
 # only riscv64-unknown-linux-gnu compiler installed -- does not have. See the
 # KERNEL_CC comment in harness_linux/Makefile. Unset by default.
 make -s -C "${REPO_ROOT}/harness_linux" \
-    MODEL_DIR="${GEN}/generated" CROSS="${CROSS}" \
+    MODEL_DIR="${GEN}/generated" CROSS="${CROSS}" "${POOL_ARGS[@]}" \
     ${MODELBLASTER_KERNEL_CC:+KERNEL_CC="${MODELBLASTER_KERNEL_CC}"} \
     KERNEL_CFLAGS="${KERNEL_CFLAGS}" OUT="${BIN}"
 
@@ -177,7 +230,7 @@ if command -v "${CROSS}objdump" >/dev/null 2>&1; then
     fi
 fi
 
-echo "=== 5/5 deploy + run on ${HOST} (pinned to cpu ${CPU}) ==="
+echo "=== 5/5 deploy + run on ${HOST} (pinned to cpu ${RUN_CPU}) ==="
 PROFILE_ARGS=()
 # ITERS: repetitions on the board, median per dispatch, iteration 0 dropped as
 # warmup. Leave unset for the historical one-sample behaviour. For a stateful
@@ -192,7 +245,8 @@ if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
                    --profile-backend "${TARGET}")
 fi
 "${PY}" -m modelblaster.validation.k1_runner \
-    --elf "${BIN}" --host "${HOST}" --cpu "${CPU}" \
+    --elf "${BIN}" --host "${HOST}" --cpu "${RUN_CPU}" \
+    "${PROFILE_CORES_ARGS[@]}" \
     --io "${GEN}/io.npz" --quant "${QUANT}" \
     --profile-csv "${GEN}/profile_k1.csv" --model-name "${MODEL}" \
     --gen-dir "${GEN}/generated" \
