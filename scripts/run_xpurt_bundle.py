@@ -1,7 +1,7 @@
 """Drive a candidate bundle (Contract 1) end-to-end on ModelBlaster.
 
 Reads an XPU-RT `xpurt.candidate_bundle/v1` JSON (typically at
-`/scratch2/agustin/XPU-RT/artifacts/iterate/firesim_batch.json`), and
+`$XPURT_ROOT/artifacts/iterate/firesim_batch.json`), and
 for each selected candidate:
 
   - resolves the matching XPU-RT schedule fixture
@@ -21,7 +21,7 @@ infrasetup cost is amortized across the bundle.
 Usage:
 
     python3 scripts/run_xpurt_bundle.py \\
-        --batch /scratch2/agustin/XPU-RT/artifacts/iterate/firesim_batch.json \\
+        --batch $XPURT_ROOT/artifacts/iterate/firesim_batch.json \\
         --out-dir artifacts/bundle \\
         --include baseline,A2          # optional id allow-list
         --runner firesim               # spike|firesim (default firesim)
@@ -55,7 +55,24 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-XPURT_ROOT = Path("/scratch2/agustin/XPU-RT")
+
+
+def _resolve_xpurt_root() -> Path:
+    """Locate the XPU-RT checkout; see the same helper in
+    `scripts/decision_loop.py` and `scripts/close_xpurt_loop.py`. Identified
+    by `schedules/`, which is the directory this script resolves fixtures
+    against. Replaces a hardcoded /scratch2/<user>/XPU-RT.
+    """
+    env = os.environ.get("XPURT_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    for cand in (REPO_ROOT.parent, REPO_ROOT.parent / "XPU-RT"):
+        if (cand / "schedules").is_dir() and (cand / "xpu-rt").is_dir():
+            return cand.resolve()
+    return REPO_ROOT.parent.resolve()
+
+
+XPURT_ROOT = _resolve_xpurt_root()
 GREEDY_FAMILY = {"greedy", "greedy_periodic", "decomposed"}
 
 
