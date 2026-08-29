@@ -37,9 +37,9 @@ candidates, the cached-kernel reuse model), read the KernelBlaster paper:
 
 ModelBlaster compiles and runs; XPU-RT schedules. They form a closed loop, and
 recent work landed in **both repos together** — read
-[`XPU-RT/docs/CHANGES.md`](../docs/CHANGES.md) if you are picking either up
-after a break, and [`XPU-RT/docs/the_loop.md`](../docs/the_loop.md) for which
-script owns which arrow.
+[`XPU-RT/docs/the_loop.md`](../docs/the_loop.md) for which script owns which
+arrow, and [`XPU-RT/docs/k1_board.md`](../docs/k1_board.md) to run any of it on
+hardware.
 
 What XPU-RT expects from this side, and where it lives here:
 
