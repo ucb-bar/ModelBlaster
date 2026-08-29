@@ -118,7 +118,21 @@ foreach(_i RANGE ${_last})
         endif()
     endforeach()
     configure_file("${_primary_dir}/model.h"   "${_STAGE_DIR}/${_name}_model.h"   COPYONLY)
-    configure_file("${_primary_dir}/test_io.h" "${_STAGE_DIR}/${_name}_test_io.h" COPYONLY)
+    # test_io.h's own `#include "model.h"` -- needed by its arity-agnostic
+    # model_{mid}_run_test() wrapper, which references model_{mid}_output_t --
+    # must be rewritten to the staged, per-model-prefixed name. COPYONLY does
+    # not rewrite contents, so the staged header kept including a bare
+    # "model.h" that does not exist in the staging dir, and several models'
+    # unqualified model.h would collide there anyway.
+    #
+    # The Zephyr harness has done this since 84a98cc; this is the same fix,
+    # ported. Without it the xpurt build fails at
+    #   fatal error: model.h: No such file or directory
+    # which reads like a missing generated file rather than a staging bug.
+    file(READ "${_primary_dir}/test_io.h" _test_io_contents)
+    string(REPLACE "#include \"model.h\"" "#include \"${_name}_model.h\""
+           _test_io_contents "${_test_io_contents}")
+    file(WRITE "${_STAGE_DIR}/${_name}_test_io.h" "${_test_io_contents}")
 
     set(_graph_json "${_base}/graph.json")
     if(NOT EXISTS "${_graph_json}")
