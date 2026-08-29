@@ -6,7 +6,7 @@ list). The harness then emits a per-dispatch actual-cycles trace
 between `=== MODELBLASTER_XPURT_TRACE_BEGIN ===` /
 `=== MODELBLASTER_XPURT_TRACE_END ===` markers. This script overlays
 the actuals onto the predicted report so
-`/scratch2/agustin/XPU-RT/xpu-rt/advisor.py --report <measured.json>`
+`$XPURT_ROOT/xpu-rt/advisor.py --report <measured.json>`
 can re-diagnose with real numbers.
 
 The output preserves every field XPU-RT's advisor reads (makespan,
@@ -18,7 +18,7 @@ adds:
 Usage:
 
     python3 scripts/emit_measured_report.py \\
-        --predicted-report /scratch2/agustin/XPU-RT/schedules/scheduled__iter_heft_..._profiled_report.json \\
+        --predicted-report $XPURT_ROOT/schedules/scheduled__iter_heft_..._profiled_report.json \\
         --trace            artifacts/bundle/A2/xpurt_trace.csv \\
         --out              artifacts/bundle/A2/measured_report.json \\
         --clock-mhz 1000
@@ -30,6 +30,8 @@ import argparse
 import copy
 import csv
 import json
+import re
+import sys
 from pathlib import Path
 
 
@@ -50,15 +52,84 @@ def _index_predicted_dispatches(report: dict) -> list[dict]:
         f"'dispatches' / 'per_dispatch' / 'schedule'); keys: {list(report)}")
 
 
-def _key_for(entry: dict) -> tuple[str, int, int]:
+_INSTANCE_RE = re.compile(r"^(?P<base>.*?)(?P<idx>\d+)$")
+
+# XPU-RT writes `<job>_dispatch_<n>`; ModelBlaster writes `<job>$dispatch_<n>`.
+_DISPATCH_SEPS = ("_dispatch_", "$dispatch_")
+
+
+def _split_job_name(job: str, known: set[str] | None = None) -> tuple[str, int]:
+    """Split "mlp_control3" into ("mlp_control", 3); no trailing index -> (job, 0).
+
+    Mirrors `pipeline/ingest_xpurt_schedule._split_job_name`, including the
+    longest-prefix match against `known`: a model whose own name ends in a
+    digit ("yolov8_nano_640") would otherwise donate part of its name to the
+    instance index. Keep the two in sync.
+    """
+    if known:
+        for base in sorted(known, key=len, reverse=True):
+            if job == base:
+                return base, 0
+            if job.startswith(base):
+                rest = job[len(base):]
+                if rest.isdigit():
+                    return base, int(rest)
+    m = _INSTANCE_RE.match(job)
+    if not m:
+        return job, 0
+    return m.group("base"), int(m.group("idx"))
+
+
+def _parse_entry_name(name: str,
+                      known: set[str] | None = None) -> tuple[str, int, int] | None:
+    """'mlp_control0_dispatch_7' -> ('mlp_control', 0, 7); None if unparseable.
+
+    WHY THIS EXISTS. XPU-RT's SchedulerReport entries carry ONLY `name` --
+    `profiling.py` writes `operation_name` and no `network` / `instance`
+    fields at all -- while the trace CSV has all three as explicit columns.
+    Keying the predicted side on the absent fields degraded every entry to
+    ("", 0, id), which matches no trace row: the `matched 0/N` join that
+    made the whole measured side of the loop report nothing.
+
+    Accepts a trailing shard suffix (`..._dispatch_22_4`) by taking the
+    FIRST integer after the separator as the dispatch id.
+    """
+    for sep in _DISPATCH_SEPS:
+        if sep in name:
+            job, _, post = name.partition(sep)
+            head = post.split("_", 1)[0]
+            if not head.isdigit():
+                return None
+            base, inst = _split_job_name(job, known)
+            return base, inst, int(head)
+    return None
+
+
+def _key_for(entry: dict,
+             known: set[str] | None = None) -> tuple[str, int, int]:
     """Match key for a dispatch: (network, instance, dispatch_id).
 
-    Both the predicted report and the trace expose all three so the
-    match is exact even with multi-instance periodic workloads."""
+    Explicit fields win when present; otherwise each component falls back to
+    what `name` encodes (see `_parse_entry_name`).
+    """
+    net = entry.get("network")
+    inst = entry.get("instance")
+    did = entry.get("dispatch_id", entry.get("id"))
+    if net is not None and inst is not None and did is not None:
+        return (str(net), int(inst), int(did))
+
+    parsed = _parse_entry_name(str(entry.get("name", "")), known)
+    if parsed is not None:
+        p_net, p_inst, p_did = parsed
+        return (
+            str(net) if net is not None else p_net,
+            int(inst) if inst is not None else p_inst,
+            int(did) if did is not None else p_did,
+        )
     return (
-        str(entry.get("network", entry.get("job_name", ""))),
-        int(entry.get("instance", 0)),
-        int(entry.get("dispatch_id", entry.get("id", -1))),
+        str(net if net is not None else entry.get("job_name", "")),
+        int(inst if inst is not None else 0),
+        int(did if did is not None else -1),
     )
 
 
@@ -75,13 +146,19 @@ def overlay(predicted: dict, trace: list[dict[str, str]],
     out = copy.deepcopy(predicted)
     trace_by_key = {_trace_key(r): r for r in trace}
 
+    # The trace's `network` column is the authoritative list of network names
+    # in this run, so it is what disambiguates a name whose own tail is a
+    # digit when splitting `<job><instance>` off a predicted entry's `name`.
+    known = {r.get("network", "").strip() for r in trace}
+    known.discard("")
+
     cycles_per_us = clock_mhz  # 1 cycle / (1/clock_mhz µs) = clock_mhz cycles/µs
     measured_last_end_us = 0.0
 
     dispatches = _index_predicted_dispatches(out)
     matched = 0
     for entry in dispatches:
-        k = _key_for(entry)
+        k = _key_for(entry, known)
         r = trace_by_key.get(k)
         if r is None:
             continue
@@ -124,7 +201,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="Output measured report JSON.")
     p.add_argument("--clock-mhz", type=float, default=1000.0,
                    help="Clock for cycles->microseconds conversion. "
-                        "Default 1000 MHz (FireSim chipyard default).")
+                        "Default 1000 MHz (FireSim chipyard default). "
+                        "On the SpaceMiT K1 the trace's actual_*_cycles are "
+                        "rdtime ticks and this MUST be 24, or every measured "
+                        "time is under-reported by 41.7x.")
+    p.add_argument("--allow-unmatched", action="store_true",
+                   help="Exit 0 even when no trace row joins a predicted "
+                        "dispatch. Off by default: a zero-row join means the "
+                        "measured numbers describe nothing, and it used to "
+                        "be reported as a clean success.")
     args = p.parse_args(argv)
 
     predicted = json.loads(args.predicted_report.read_text())
@@ -138,6 +223,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"emit_measured_report: wrote {args.out} "
           f"(matched {matched}/{total} trace rows, "
           f"measured_makespan_us={merged['measured_makespan_us']:.2f})")
+    if total and not matched and not args.allow_unmatched:
+        print(
+            "emit_measured_report: ERROR -- 0 of "
+            f"{total} trace rows joined a predicted dispatch, so every "
+            "measured field in the output describes nothing. Check that the "
+            "predicted report and the trace came from the SAME schedule: the "
+            "join key is (network, instance, dispatch_id), taken from the "
+            "trace's columns and from each report entry's `name`. Pass "
+            "--allow-unmatched to accept this deliberately.",
+            file=sys.stderr)
+        return 1
     return 0
 
 
