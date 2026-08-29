@@ -36,7 +36,7 @@ emits the same field, but list-valued — splitting is one-to-many.)
 CLI:
 
     python -m modelblaster.pipeline.apply_fusion_hint \\
-        --hint /scratch2/agustin/XPU-RT/artifacts/iterate/granularity_hint.json \\
+        --hint $XPURT_ROOT/artifacts/iterate/granularity_hint.json \\
         --model mlp_control \\
         --ir   examples/mlp_control/int8/generated/graph.json \\
         --out  examples/mlp_control/int8/generated/graph.fused.json

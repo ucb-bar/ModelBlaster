@@ -58,7 +58,41 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-XPURT_ROOT = Path("/scratch2/agustin/XPU-RT")
+
+
+def _is_xpurt_checkout(p: Path) -> bool:
+    """An XPU-RT checkout is identified by the two things we call into."""
+    return (p / "scripts" / "granularity_loop.py").is_file() and (p / "xpu-rt").is_dir()
+
+
+def _resolve_xpurt_root() -> Path:
+    """Locate the XPU-RT checkout without baking anyone's home directory in.
+
+    In order: an explicit `XPURT_ROOT`; the parent directory, which is where
+    it is when ModelBlaster is the `XPU-RT/ModelBlaster` submodule (the normal
+    case); then a sibling checkout. This used to be a hardcoded
+    /scratch2/<user>/XPU-RT, so the loop only ran for one person on one box.
+
+    Returns the best candidate even when nothing validates, so the caller
+    fails on a path it actually tried rather than on an empty string.
+    """
+    env = os.environ.get("XPURT_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    for cand in (REPO_ROOT.parent, REPO_ROOT.parent / "XPU-RT"):
+        if _is_xpurt_checkout(cand):
+            return cand.resolve()
+    return REPO_ROOT.parent.resolve()
+
+
+XPURT_ROOT = _resolve_xpurt_root()
+
+# The interpreter that runs granularity_loop.py. XPU-RT's scheduler side needs
+# numpy/matplotlib but NOT torch, so this is often a different env than the one
+# doing model extraction -- hence a knob rather than a hardcoded path to one
+# person's conda env. `sys.executable` is the right default: whatever is
+# running this script can import the same things.
+XPURT_PY = os.environ.get("PY") or os.environ.get("XPURT_PY") or sys.executable
 
 
 # ─────────────── candidate scoping ────────────────────────────────────────
@@ -108,9 +142,14 @@ def run_granularity(args, out_dir: Path) -> dict:
     # and resolve where the file actually ends up.
     abs_out = out_dir.resolve()
     abs_hint = (abs_out / "_granularity_hint.json").resolve()
+    loop_script = XPURT_ROOT / "scripts" / "granularity_loop.py"
+    if not loop_script.is_file():
+        raise SystemExit(
+            f"granularity_loop.py not found at {loop_script}. Set XPURT_ROOT "
+            f"to your XPU-RT checkout (tried: {XPURT_ROOT}).")
     cmd = [
-        "/scratch2/agustin/miniforge3/envs/merlin-dev/bin/python",
-        str(XPURT_ROOT / "scripts" / "granularity_loop.py"),
+        XPURT_PY,
+        str(loop_script),
         "--networks-json", str(Path(args.networks_json).resolve()),
         "--baseline-solver", args.baseline_solver,
         "--max-per-type", str(args.K),
