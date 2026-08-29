@@ -363,8 +363,12 @@ def _load_ultralytics_weights(model: YOLOv8Nano, path: str | None = None) -> int
         from ultralytics import YOLO
     except ImportError as e:
         raise RuntimeError(
-            "ultralytics not installed. `pip install ultralytics` and retry, "
-            "or set MODELBLASTER_YOLOV8N_PRETRAINED=0 to use random init."
+            f"failed to import ultralytics ({e}). If ultralytics itself is "
+            "already installed, this is likely a missing system dependency "
+            "of one of ITS dependencies (e.g. opencv-python needs libgl1) -- "
+            "see the chained traceback above for the actual failing import. "
+            "`pip install ultralytics` if it's genuinely missing, or set "
+            "MODELBLASTER_YOLOV8N_PRETRAINED=0 to use random init instead."
         ) from e
     yolo = YOLO(path)
     src_state = yolo.model.state_dict()
