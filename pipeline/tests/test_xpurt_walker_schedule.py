@@ -99,9 +99,9 @@ class StartGate(unittest.TestCase):
 class UnknownCoreKindIsFatal(unittest.TestCase):
     def test_a_kind_without_a_backend_stops_the_run(self):
         src = _emit()
-        self.assertIn("FATAL: xpurt: no backend built for core_kind", src)
+        self.assertIn("asks for impl", src)
         self.assertNotIn("WARN unknown core_kind", src)
-        tail = src[src.index("no backend built for core_kind"):]
+        tail = src[src.index("asks for impl"):]
         self.assertIn("XPURT_FATAL_EXIT();", tail[:300])
 
     def test_fatal_exits_non_zero_on_linux_and_reboots_on_zephyr(self):
@@ -118,8 +118,8 @@ class KindBackendPairing(unittest.TestCase):
     def test_kinds_that_are_not_backend_names_pair_by_position(self):
         src = _emit(core_kinds=["rvv", "rvv_c1"], backends=["rvv_x60", "rvv_x60"],
                     pool_sizes=[0, 0])
-        self.assertIn('strcmp(e_->core_kind, "rvv") == 0', src)
-        self.assertIn('strcmp(e_->core_kind, "rvv_c1") == 0', src)
+        self.assertIn('strcmp(e_->impl, "rvv") == 0', src)
+        self.assertIn('strcmp(e_->impl, "rvv_c1") == 0', src)
         self.assertIn("model_m_state_t st_ = s_m_rvv_c1;", src)
         self.assertIn("MODEL_M_DISPATCH_FNS_RVV_X60[e_->dispatch_id](&st_)", src)
         self.assertEqual(src.count("extern const model_m_dispatch_fn MODEL_M_DISPATCH_FNS_RVV_X60"), 1)

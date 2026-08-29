@@ -303,7 +303,7 @@ def test_a_core_kind_without_a_backend_stops_the_run(tmp_path):
     assert r.returncode == 0, r.stderr[-3000:]
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
     assert r.returncode == 2, r.stdout[-2000:]
-    assert "FATAL: xpurt: no backend built for core_kind 'rvv'" in r.stdout
+    assert "asks for impl 'rvv'" in r.stdout
 
 
 def test_hart_mode_worker_on_an_ai_cpu_registers_its_own_tid(tmp_path):
