@@ -64,9 +64,13 @@ done
 mkdir -p "${OUT_DIR}"
 
 # `uv run` was resolving a distribution at file://$REPO/XPU-RT -- a path that
-# does not exist -- and failing before any measurement. Use the interpreter
-# that already has this checkout importable.
-MB_PY="${MB_PY:-/scratch2/agustin/miniforge3/envs/merlin-dev/bin/python}"
+# does not exist -- and failing before any measurement.
+#
+# The replacement follows decision_loop.py's convention rather than inventing
+# a second one: honour $PY / $MB_PY, else whatever python is on PATH. A
+# hardcoded conda interpreter is what her portability pass removed from the
+# rest of this loop, and it should not come back in through here.
+MB_PY="${MB_PY:-${PY:-python3}}"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ---- step 1: apply hint to IR ----------------------------------------------
@@ -88,7 +92,7 @@ fi
 IR_AFTER="${OUT_DIR}/${MODEL}.afterhint.graph.json"
 
 # Detect hint contract to choose the right rewriter.
-HINT_CONTRACT="$(/scratch2/agustin/miniforge3/envs/merlin-dev/bin/python -c "
+HINT_CONTRACT="$("${MB_PY}" -c "
 import json,sys
 print(json.load(open('${HINT}'))['contract'])
 ")"
@@ -134,7 +138,13 @@ if [[ "${RUNNER}" == "k1" ]]; then
     # the baseline results.csv for this model is backed up and restored around
     # the run -- otherwise measuring a candidate destroys the baseline every
     # other number was solved from.
+    # Same order decision_loop.py uses: explicit $XPURT_ROOT, else the parent
+    # directory (this layout, ModelBlaster as XPU-RT's submodule).
     XPURT_ROOT="${XPURT_ROOT:-$(cd "${REPO_ROOT}/.." && pwd)}"
+    if [[ ! -d "${XPURT_ROOT}/xpu-rt" ]]; then
+        echo "FAIL: no XPU-RT checkout at ${XPURT_ROOT}; set XPURT_ROOT" > "${OUT_DIR}/FAIL"
+        exit 3
+    fi
     PROF_DIR="${XPURT_ROOT}/gen_mb/profile/${TARGET}/spacemit_x60/${MODEL}/${MODEL}.${QUANT}/${MODEL}_spacemit_x60_${TARGET}_${MODEL}.${QUANT}/topo_0"
     PROF_BAK="${OUT_DIR}/baseline_results.csv"
     [[ -f "${PROF_DIR}/results.csv" ]] && cp "${PROF_DIR}/results.csv" "${PROF_BAK}"
@@ -212,7 +222,7 @@ fi
 
 # ---- step 3: extract per-dispatch cycles -----------------------------------
 
-/scratch2/agustin/miniforge3/envs/merlin-dev/bin/python "${REPO_ROOT}/scripts/ingest_measured_cycles.py" \
+"${MB_PY}" "${REPO_ROOT}/scripts/ingest_measured_cycles.py" \
     --spike-log "${OUT_DIR}/spike.log" \
     --out-cycles "${OUT_DIR}/measured_cycles.json" \
     --network "${MODEL}" \

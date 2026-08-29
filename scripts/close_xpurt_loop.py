@@ -9,7 +9,7 @@ script closes the agentic loop:
      the predicted report XPU-RT already produced.
   2. Render predicted-vs-actual Gantts using
      `scripts/plot_xpurt_trace.py` (already in the repo).
-  3. Run `/scratch2/agustin/XPU-RT/xpu-rt/advisor.py` on each measured
+  3. Run `$XPURT_ROOT/xpu-rt/advisor.py` on each measured
      report so the verdict reflects real numbers.
   4. Write `artifacts/bundle/round1_report.md` summarizing the
      predicted vs measured comparison + the re-advise verdict per
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -34,7 +35,27 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-XPURT_ROOT = Path("/scratch2/agustin/XPU-RT")
+
+
+def _resolve_xpurt_root() -> Path:
+    """Locate the XPU-RT checkout. Same contract as the copy in
+    `scripts/decision_loop.py` -- keep the two in sync. Identified by the
+    two entry points this script calls: xpu-rt/advisor.py and
+    xpu-rt/plot_gantt.py.
+
+    Replaces a hardcoded /scratch2/<user>/XPU-RT, which made this script
+    runnable by exactly one person.
+    """
+    env = os.environ.get("XPURT_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    for cand in (REPO_ROOT.parent, REPO_ROOT.parent / "XPU-RT"):
+        if (cand / "xpu-rt" / "advisor.py").is_file():
+            return cand.resolve()
+    return REPO_ROOT.parent.resolve()
+
+
+XPURT_ROOT = _resolve_xpurt_root()
 
 
 def _predicted_report_path(fixture: Path) -> Path:
@@ -49,7 +70,7 @@ def _predicted_report_path(fixture: Path) -> Path:
 
 
 def _emit_measured(candidate: dict, deadline_us: float | None,
-                   out_dir: Path) -> Path | None:
+                   out_dir: Path, clock_mhz: float = 1000.0) -> Path | None:
     fixture = Path(candidate["fixture"])
     trace = candidate.get("trace_csv")
     if not trace:
@@ -69,6 +90,11 @@ def _emit_measured(candidate: dict, deadline_us: float | None,
         "--predicted-report", str(pred),
         "--trace", str(trace),
         "--out", str(out),
+        # Was omitted, so the measured report was always built at the
+        # script's 1000 MHz default while the Gantt beside it honoured
+        # --clock-mhz. On the K1 (24 MHz rdtime) that silently
+        # under-reported every measured time by 41.7x.
+        "--clock-mhz", str(clock_mhz),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -187,7 +213,8 @@ def main(argv: list[str] | None = None) -> int:
         # truncated trace is still useful for predicted-vs-measured
         # comparison on the prefix that ran.
         if cand.get("status") in ("ok", "partial-trace") and cand.get("trace_csv"):
-            measured = _emit_measured(cand, deadline_us, cand_dir)
+            measured = _emit_measured(cand, deadline_us, cand_dir,
+                                      clock_mhz=args.clock_mhz)
             if measured:
                 gantt = cand_dir / "predicted_vs_actual.png"
                 _render_gantt(Path(cand["trace_csv"]), gantt,
