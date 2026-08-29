@@ -1367,6 +1367,7 @@ def _oc_tile_operands(
     op: dict[str, Any], sh: dict[str, Any],
     tile_w_plan: dict[int, dict[str, Any]], model_name: str,
     w: str, b: str, per_oc: tuple[str, ...] = (),
+    backend: Optional[str] = None,
 ) -> tuple[str, str, list[str]]:
     """Retarget one OC split tile's operands at its own slice of the weights.
 
@@ -1404,9 +1405,9 @@ def _oc_tile_operands(
         # gets its own array, re-packed with OC = tile_oc, and reads it from
         # element 0. See `split_conv_tile_weights` for the two-way failure
         # this replaces.
-        w = _weight_name(model_name, _tile_key(spec["weight"], tile_idx))
+        w = _weight_name(model_name, _tile_key(spec["weight"], tile_idx), backend)
         if spec.get("bias"):
-            b = _weight_name(model_name, _tile_key(spec["bias"], tile_idx))
+            b = _weight_name(model_name, _tile_key(spec["bias"], tile_idx), backend)
     else:
         per_filter = (int(sh.get("IC", 0)) * int(sh.get("KH", 0))
                       * int(sh.get("KW", 0)))
@@ -1950,8 +1951,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         kind = sub_op["op"]
         if kind == "linear_s8":
             in_ptr = ptr_for(sub_op["inputs"][0], "in")
-            w = _weight_name(model_name, sub_op["weight"])
-            b = _weight_name(model_name, sub_op["bias"]) if sub_op.get("bias") else "NULL"
+            w = _weight_name(model_name, sub_op["weight"], backend)
+            b = _weight_name(model_name, sub_op["bias"], backend) if sub_op.get("bias") else "NULL"
             sh = sub_op["shape"]; q = sub_op["quant"]
             call = (
                 f"parallel_linear_s8(pool, {in_ptr}, {w}, {b}, {sub_out_ptr}, "
@@ -2488,7 +2489,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # weight tensor, producing 1/n_splits correct outputs and
             # wrong ones elsewhere (matches the round-002 max_abs_err
             # signature on the first dronet split attempt).
-            w, b, _ = _oc_tile_operands(op, sh, tile_w_plan, model_name, w, b)
+            w, b, _ = _oc_tile_operands(op, sh, tile_w_plan, model_name, w, b,
+                                        backend=backend)
             sspec = shard_w_plan.get(op.get("dispatch_id"))
             if sspec is not None:
                 # Sharded: a static table of the per-shard arrays, and the
@@ -2497,7 +2499,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 n_sh = int(sspec["n_shards"])
                 tbl = f"w_shards_d{op['dispatch_id']}"
                 shard_syms = ", ".join(
-                    _weight_name(model_name, _shard_key(op["weight"], t))
+                    _weight_name(model_name, _shard_key(op["weight"], t), backend)
                     for t in range(n_sh))
                 shard_tables.append(
                     f"static const int8_t *const {tbl}[{n_sh}] = "
@@ -2609,8 +2611,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             sub = op["sub_ops"]
             sub_bn = sub[0]; sub_silu = sub[1]
             in_ptr = ptr_for(sub_bn["inputs"][0], "in")
-            s_name = _weight_name(model_name, sub_bn["weight"])
-            b_name = _weight_name(model_name, sub_bn["bias"])
+            s_name = _weight_name(model_name, sub_bn["weight"], backend)
+            b_name = _weight_name(model_name, sub_bn["bias"], backend)
             sh = sub_bn["shape"]
             qb = sub_bn["quant"]
             qs = sub_silu["quant"]
@@ -2628,17 +2630,18 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             sub = op["sub_ops"]
             sub_conv = sub[0]; sub_bn = sub[1]
             in_ptr = ptr_for(sub_conv["inputs"][0], "in")
-            w = _weight_name(model_name, sub_conv["weight"])
-            b = _weight_name(model_name, sub_conv["bias"]) if sub_conv.get("bias") else "NULL"
-            bn_s = _weight_name(model_name, sub_bn["weight"])
-            bn_b = _weight_name(model_name, sub_bn["bias"])
+            w = _weight_name(model_name, sub_conv["weight"], backend)
+            b = _weight_name(model_name, sub_conv["bias"], backend) if sub_conv.get("bias") else "NULL"
+            bn_s = _weight_name(model_name, sub_bn["weight"], backend)
+            bn_b = _weight_name(model_name, sub_bn["bias"], backend)
             sh = sub_conv["shape"]
             qc = sub_conv["quant"]
             qb = sub_bn["quant"]
             # An OC split tile narrows sh["OC"] and retargets every operand at
             # its own slice; a no-op for an unsplit op.
             w, b, (bn_s, bn_b) = _oc_tile_operands(
-                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b))
+                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b),
+                backend=backend)
             sspec = shard_w_plan.get(op.get("dispatch_id"))
             if sspec is not None:
                 n_sh = int(sspec["n_shards"])
@@ -2647,7 +2650,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                     f"static const int8_t *const {tbl}[{n_sh}] = {{ "
                     + ", ".join(
                         _weight_name(model_name,
-                                     _shard_key(sspec["weight"], t))
+                                     _shard_key(sspec["weight"], t), backend)
                         for t in range(n_sh))
                     + " };")
                 head = (f"parallel_conv2d_bn_s8_sharded(pool, {in_ptr}, "
@@ -2675,16 +2678,17 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             sub = op["sub_ops"]
             sub_conv = sub[0]; sub_bn = sub[1]; sub_silu = sub[2]
             in_ptr = ptr_for(sub_conv["inputs"][0], "in")
-            w = _weight_name(model_name, sub_conv["weight"])
-            b = _weight_name(model_name, sub_conv["bias"]) if sub_conv.get("bias") else "NULL"
-            bn_s = _weight_name(model_name, sub_bn["weight"])
-            bn_b = _weight_name(model_name, sub_bn["bias"])
+            w = _weight_name(model_name, sub_conv["weight"], backend)
+            b = _weight_name(model_name, sub_conv["bias"], backend) if sub_conv.get("bias") else "NULL"
+            bn_s = _weight_name(model_name, sub_bn["weight"], backend)
+            bn_b = _weight_name(model_name, sub_bn["bias"], backend)
             sh = sub_conv["shape"]
             qc = sub_conv["quant"]
             qb = sub_bn["quant"]
             qs = sub_silu["quant"]
             w, b, (bn_s, bn_b) = _oc_tile_operands(
-                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b))
+                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b),
+                backend=backend)
             sspec = shard_w_plan.get(op.get("dispatch_id"))
             if sspec is not None:
                 n_sh = int(sspec["n_shards"])
@@ -2693,7 +2697,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                     f"static const int8_t *const {tbl}[{n_sh}] = {{ "
                     + ", ".join(
                         _weight_name(model_name,
-                                     _shard_key(sspec["weight"], t))
+                                     _shard_key(sspec["weight"], t), backend)
                         for t in range(n_sh))
                     + " };")
                 head = (f"parallel_conv2d_bn_silu_s8_sharded(pool, {in_ptr}, "
@@ -2727,8 +2731,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             sub = op["sub_ops"]
             sub_lin = sub[0]; sub_elu = sub[1]
             in_ptr = ptr_for(sub_lin["inputs"][0], "in")
-            w  = _weight_name(model_name, sub_lin["weight"])
-            b  = _weight_name(model_name, sub_lin["bias"]) if sub_lin.get("bias") else "NULL"
+            w  = _weight_name(model_name, sub_lin["weight"], backend)
+            b  = _weight_name(model_name, sub_lin["bias"], backend) if sub_lin.get("bias") else "NULL"
             sh = sub_lin["shape"]
             ql = sub_lin["quant"]
             qe = sub_elu["quant"]
@@ -2781,7 +2785,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         elif op["op"] in ("layernorm_s8", "rmsnorm_s8"):
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]; q = op["quant"]
-            gamma = _weight_name(model_name, op["weight"])
+            gamma = _weight_name(model_name, op["weight"], backend)
             common = (f"{sh['M']}, {sh['K']}, "
                       f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                       f"{_f32(q['eps'])}, "
@@ -2790,7 +2794,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 call = (f"kernel_rmsnorm_s8({in_ptr}, {gamma}, {out_ptr}, "
                         + common)
             else:
-                beta = (_weight_name(model_name, op["bias"])
+                beta = (_weight_name(model_name, op["bias"], backend)
                         if op.get("bias") else "NULL")
                 call = (f"kernel_layernorm_s8({in_ptr}, {gamma}, {beta}, "
                         f"{out_ptr}, " + common)
@@ -2806,10 +2810,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # resets them between calls, deliberately.
             call = (
                 f"kernel_lstm_s8({in_ptr}, "
-                f"{_weight_name(model_name, op['weight'])}, "
-                f"{_weight_name(model_name, op['weight_hh'])}, "
-                f"{_weight_name(model_name, op['bias'])}, "
-                f"{_weight_name(model_name, op['bias_hh'])}, "
+                f"{_weight_name(model_name, op['weight'], backend)}, "
+                f"{_weight_name(model_name, op['weight_hh'], backend)}, "
+                f"{_weight_name(model_name, op['bias'], backend)}, "
+                f"{_weight_name(model_name, op['bias_hh'], backend)}, "
                 f"{h_ptr}, {c_ptr}, {out_ptr}, "
                 f"{sh['input_size']}, {sh['hidden_size']}, "
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_w_ih'])}, "
@@ -3126,9 +3130,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             c_ptr = ptr_for(op["state"][1], "inout")
             call = (
                 f"kernel_lstm_f16({x_ptr}, "
-                f"{_weight_name(model_name, op['weight'])}, "
-                f"{_weight_name(model_name, op['weight_hh'])}, "
-                f"{_weight_name(model_name, op['bias'])}, "
+                f"{_weight_name(model_name, op['weight'], backend)}, "
+                f"{_weight_name(model_name, op['weight_hh'], backend)}, "
+                f"{_weight_name(model_name, op['bias'], backend)}, "
                 f"{h_ptr}, {c_ptr}, {out_ptr}, "
                 f"{sh['input_size']}, {sh['hidden_size']})"
             )
