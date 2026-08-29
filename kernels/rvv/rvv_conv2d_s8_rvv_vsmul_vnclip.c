@@ -53,9 +53,14 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                     in_byte = input[((n*IC + ic)*IH + ih)*IW + iw];
                                 int32_t in_v = (int32_t)in_byte + input_offset;
 
-                                /* IHWOC: weight[ic][kh][kw][oc] — OC contiguous */
+                                /* Packed layout is physical [IC][KH][KW][OC] (IHWO)
+                                 * (OIHW transposed by (1,2,3,0) in
+                                 * generate_skeleton::_backend_pack_weight); OC is
+                                 * innermost/contiguous. Index must match the
+                                 * reference oracle's IHWOC branch:
+                                 * weight[((ic*KH+kh)*KW + kw)*OC + oc]. */
                                 const int8_t *wp = weight
-                                    + ((size_t)ic * KH * KW + (size_t)kh * KW + kw) * OC
+                                    + ((size_t)(ic * KH + kh) * KW + kw) * OC
                                     + oc_base;
                                 vint8m1_t vw8 = __riscv_vle8_v_i8m1(wp, vl);
 
