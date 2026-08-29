@@ -29,9 +29,18 @@
 
 /* This model's convs: max R=IC*KH*KW=576, max R*OC=36864, max OC=64. Static
  * (kernel runs single-threaded on the harness) to keep it off the thread stack. */
-#define MB_CONV_WT_MAX    65536   /* >= max R*OC */
-#define MB_CONV_PATCH_MAX  1024   /* >= max R */
-#define MB_CONV_OC_MAX      256   /* >= max OC */
+/* CAPACITY, 2026-08-28: these were sized from fused_full's convs ("max
+ * R=IC*KH*KW=576, max R*OC=36864, max OC=64") and there was no check that a
+ * model stayed inside them. ViNT's EfficientNet-B0 does not: its widest 1x1
+ * convs reach R=1152 and R*OC=409600, so the weight transpose below wrote
+ * 1.4 MB into a 64 KB array -- silent .bss corruption whose symptoms moved
+ * whenever an unrelated static was added or realigned. Raised to cover the
+ * models in this tree with headroom, AND backed by a hard guard at kernel
+ * entry (see mb_conv_pc_scalar) so exceeding them can never corrupt memory
+ * again -- it degrades to a bit-exact scalar path instead. */
+#define MB_CONV_WT_MAX  1048576   /* >= max R*OC   (ViNT: 409600) */
+#define MB_CONV_PATCH_MAX  8192   /* >= max R      (ViNT: 1152)   */
+#define MB_CONV_OC_MAX     1024   /* >= max vl at e32m4           */
 #define MB_CONV_TILE          4   /* output-width register block. 4 i32m4 accs =
                                    * 16 vregs; + w8/w16 fits the 32-register file. */
 
@@ -82,6 +91,39 @@ void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
     int OH = (IH + 2 * PH - KH) / SH + 1;
     int OW = (IW + 2 * PW - KW) / SW + 1;
     const int R = IC * KH * KW;                 /* reduction / weight-row length */
+
+    /* Capacity guard. Anything that would not fit the static staging buffers
+     * runs the reference computation instead of scribbling past them. Bounds
+     * are generous enough that no model in this tree takes this path today;
+     * it exists so that the next one that would does not corrupt .bss. */
+    if (R > MB_CONV_PATCH_MAX || (size_t)R * (size_t)OC > MB_CONV_WT_MAX) {
+        for (int n = 0; n < N; n++)
+        for (int oc = 0; oc < OC; oc++)
+        for (int oh = 0; oh < OH; oh++)
+        for (int ow = 0; ow < OW; ow++) {
+            int32_t acc = bias ? bias[oc] : 0;
+            for (int ic = 0; ic < IC; ic++)
+            for (int kh = 0; kh < KH; kh++) {
+                int ih = oh * SH - PH + kh;
+                if (ih < 0 || ih >= IH) continue;
+                for (int kw = 0; kw < KW; kw++) {
+                    int iw = ow * SW - PW + kw;
+                    if (iw < 0 || iw >= IW) continue;
+                    acc += (int32_t)input[(((size_t)n * IC + ic) * IH + ih)
+                                          * (size_t)IW + iw]
+                         * (int32_t)weight[((size_t)oc * IC + ic) * KH * KW
+                                           + kh * KW + kw];
+                }
+            }
+            int32_t v = mb_q31_requant_pc(acc, output_multiplier[oc],
+                                          output_shift[oc]) + output_offset;
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[(((size_t)n * OC + oc) * OH + oh) * (size_t)OW + ow] =
+                (int8_t)v;
+        }
+        return;
+    }
 
     /* Transpose weight [OC, R] (OCIHW, contiguous per oc) -> mb_wt[R, OC]. */
     for (int oc = 0; oc < OC; oc++) {
