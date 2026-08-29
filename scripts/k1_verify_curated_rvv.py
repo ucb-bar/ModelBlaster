@@ -92,6 +92,16 @@ EXTRA_CASES = {
         # a real transformer's MLP block, not attention's tiny M.
         {"M": 64,  "K": 512, "N": 512, "transpose_b": 0, "scale_div": 1.0},
         {"M": 128, "K": 256, "N": 256, "transpose_b": 1, "scale_div": 1.0},
+        # The IME crossover sweep. K and N held fixed, M swept across the
+        # hardware-forced 4-row micro-tile, because M is what decides whether
+        # the MAC unit is fed or padded. The scheduler needs to know WHERE the
+        # IME cost cell stops being the cheaper one, and interpolating between
+        # M=7 and M=64 would invent the answer.
+        {"M": 4,  "K": 256, "N": 256, "transpose_b": 1, "scale_div": 1.0},
+        {"M": 8,  "K": 256, "N": 256, "transpose_b": 1, "scale_div": 1.0},
+        {"M": 16, "K": 256, "N": 256, "transpose_b": 1, "scale_div": 1.0},
+        {"M": 32, "K": 256, "N": 256, "transpose_b": 1, "scale_div": 1.0},
+        {"M": 64, "K": 256, "N": 256, "transpose_b": 1, "scale_div": 1.0},
     ],
 }
 
