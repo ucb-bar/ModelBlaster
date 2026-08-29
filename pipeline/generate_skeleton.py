@@ -594,6 +594,104 @@ static inline void parallel_conv2d_bn_silu_s8_sharded(
 """
 
 
+_CONV2D_BN_S8_SHARD_WRAPPER = """
+/* ---- conv2d+BN, sharded over OC with PRE-PACKED per-shard weights ------- */
+/* The SiLU-fused wrapper above, without the SiLU epilogue's four parameters.
+ *
+ * WHY IT EXISTS SEPARATELY, and why its absence was not merely a missing
+ * optimisation. `conv2d_batchnorm2d_s8` is in `_SHARDABLE_CONV_OPS`, so
+ * `shard_conv_weights` planned it, `_apply_shard_weight_plan` emitted its
+ * per-shard arrays -- and DROPPED THE PARENT, which is correct and
+ * deliberate (see shard_conv_weights). With no wrapper to call, the emitter
+ * fell through to the plain kernel call naming the parent that no longer
+ * exists, and the build failed with `<conv>_weight_q undeclared`. A compile
+ * error rather than a wrong answer, which is the good outcome, but it made
+ * every DroNet-shaped model unbuildable at MB_SHARD_FACTOR > 1: DroNet's
+ * convs are all this op, 29% of its runtime, and it is the op the IHWOC
+ * repacking was written for. */
+
+typedef struct {{
+    const int8_t *in;
+    const int8_t *const *w_shards;
+    const int32_t *b;
+    const float *bn_scale;
+    const float *bn_bias;
+    int8_t *out;
+    int N, IC, IH, IW, oc_per, KH, KW, SH, SW, PH, PW, OH, OW;
+    int input_offset, filter_offset, output_offset;
+    int output_multiplier, output_shift, activation_min, activation_max;
+    float bn_scale_in, bn_scale_out;
+    int bn_activation_min, bn_activation_max;
+}} parallel_cb_shard_ctx_t;
+
+static void parallel_cb_shard_fn(void *ctx_, size_t i) {{
+    parallel_cb_shard_ctx_t *c = (parallel_cb_shard_ctx_t *)ctx_;
+    int oc0 = (int)i * c->oc_per;
+    size_t per_oc_out = (size_t)c->OH * (size_t)c->OW;
+    /* Only the WEIGHT is the shard's own array. bn_scale, bn_bias and bias
+     * are 1-D per-output-channel and `_backend_pack_weight` only permutes 4-D
+     * tensors, so they stay contiguous and `+ oc0` is exact. The output is
+     * NCHW, so an OC slice is a contiguous run of planes. */
+    kernel_conv2d_batchnorm2d_s8_{mid}(
+        c->in, c->w_shards[i], c->b ? c->b + oc0 : NULL,
+        c->bn_scale + oc0, c->bn_bias + oc0,
+        c->out + (size_t)oc0 * per_oc_out,
+        c->N, c->IC, c->IH, c->IW, c->oc_per, c->KH, c->KW,
+        c->SH, c->SW, c->PH, c->PW,
+        c->input_offset, c->filter_offset, c->output_offset,
+        c->output_multiplier, c->output_shift,
+        c->activation_min, c->activation_max,
+        c->bn_scale_in, c->bn_scale_out,
+        c->bn_activation_min, c->bn_activation_max);
+}}
+
+static inline void parallel_conv2d_bn_s8_sharded(
+        void *pool_, const int8_t *in, const int8_t *const *w_shards,
+        int n_shards, int oc_per, const int32_t *b,
+        const float *bn_scale, const float *bn_bias, int8_t *out,
+        int N, int IC, int IH, int IW, int KH, int KW,
+        int SH, int SW, int PH, int PW,
+        int input_offset, int filter_offset, int output_offset,
+        int output_multiplier, int output_shift,
+        int activation_min, int activation_max,
+        float bn_scale_in, float bn_scale_out,
+        int bn_activation_min, int bn_activation_max) {{
+    int OH = (IH + 2 * PH - KH) / SH + 1;
+    int OW = (IW + 2 * PW - KW) / SW + 1;
+    parallel_cb_shard_ctx_t ctx = {{
+        .in = in, .w_shards = w_shards, .b = b,
+        .bn_scale = bn_scale, .bn_bias = bn_bias, .out = out,
+        .N = N, .IC = IC, .IH = IH, .IW = IW, .oc_per = oc_per,
+        .KH = KH, .KW = KW, .SH = SH, .SW = SW, .PH = PH, .PW = PW,
+        .OH = OH, .OW = OW,
+        .input_offset = input_offset, .filter_offset = filter_offset,
+        .output_offset = output_offset,
+        .output_multiplier = output_multiplier, .output_shift = output_shift,
+        .activation_min = activation_min, .activation_max = activation_max,
+        .bn_scale_in = bn_scale_in, .bn_scale_out = bn_scale_out,
+        .bn_activation_min = bn_activation_min,
+        .bn_activation_max = bn_activation_max,
+    }};
+#ifdef MODELBLASTER_USE_POOL
+    modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
+    if (pool != NULL && N == 1
+        && modelblaster_pool_get_threads_count(pool) > 1) {{
+        modelblaster_pool_parallelize_1d(pool, parallel_cb_shard_fn,
+                                         &ctx, (size_t)n_shards, 0);
+        return;
+    }}
+#else
+    (void)pool_;
+#endif
+    /* Serial arm walks the SAME shards rather than making one full-OC call:
+     * the parent array is gone, and looping the shards is numerically
+     * identical because OC is an output axis. */
+    for (size_t i = 0; i < (size_t)n_shards; i++)
+        parallel_cb_shard_fn(&ctx, i);
+}}
+"""
+
+
 _CONV2D_S8_SHARD_WRAPPER = """
 /* ---- conv2d_s8, sharded over OC with PRE-PACKED per-shard weights ------- */
 
@@ -734,6 +832,8 @@ def _emit_parallel_wrappers(mid: str, used_ops: set[str],
     oc_slice_is_contiguous = layout in (None, "oihw")
     if sharded and "conv2d_batchnorm2d_silu_s8" in used_ops:
         parts.append(_CONV2D_BN_SILU_S8_SHARD_WRAPPER.format(mid=mid))
+    if sharded and "conv2d_batchnorm2d_s8" in used_ops:
+        parts.append(_CONV2D_BN_S8_SHARD_WRAPPER.format(mid=mid))
     if sharded and "conv2d_s8" in used_ops:
         # The SHARDED entry point is correct on a repacking backend precisely
         # because it does not slice the parent -- each shard has its own
@@ -2202,11 +2302,29 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # its own slice; a no-op for an unsplit op.
             w, b, (bn_s, bn_b) = _oc_tile_operands(
                 op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b))
+            sspec = shard_w_plan.get(op.get("dispatch_id"))
+            if sspec is not None:
+                n_sh = int(sspec["n_shards"])
+                tbl = f"w_shards_d{op['dispatch_id']}"
+                shard_tables.append(
+                    f"static const int8_t *const {tbl}[{n_sh}] = {{ "
+                    + ", ".join(
+                        _weight_name(model_name,
+                                     _shard_key(sspec["weight"], t))
+                        for t in range(n_sh))
+                    + " };")
+                head = (f"parallel_conv2d_bn_s8_sharded(pool, {in_ptr}, "
+                        f"{tbl}, {n_sh}, {int(sspec['oc_per'])}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['KH']}, {sh['KW']}, ")
+            else:
+                head = (f"kernel_conv2d_batchnorm2d_s8({in_ptr}, {w}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['OC']}, {sh['KH']}, {sh['KW']}, ")
             call = (
-                f"kernel_conv2d_batchnorm2d_s8({in_ptr}, {w}, {b}, "
-                f"{bn_s}, {bn_b}, {out_ptr}, "
-                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                head +
                 f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
                 f"{qc['input_offset']}, {qc['filter_offset']}, "
                 f"{qc['output_offset']}, "
