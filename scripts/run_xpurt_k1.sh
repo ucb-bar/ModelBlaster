@@ -80,6 +80,12 @@ CPU_E_KIND="${CPU_E_KIND:-rvv_c1}"
 CORE_KINDS="${CORE_KINDS:-}"
 OUT_ROOT="build/k1_xpurt"
 TRACE=1
+# Per-dispatch-END JSON lines on stdout, for xpu-rt/streaming_feedback.py.
+# Off by default: the trace block at exit is enough to EXPLAIN a run, and
+# streaming only earns its keep when something is watching live. Pipe the
+# run through `tee` when you turn this on -- the lines are interleaved with
+# the harness's normal output by design, so one stream carries both.
+STREAM="${MB_XPURT_STREAM:-0}"
 CPU_IDS=""
 JOBS="$(nproc)"
 
@@ -374,6 +380,7 @@ print(' '.join(get('${bs}').resolved_kernel_cflags('${REPO_ROOT}')))
     [[ -n "${KF}" ]] && CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CFLAGS_${BS_UPPER}=${KF}")
 done
 [[ "${TRACE}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_TRACE=ON")
+[[ "${STREAM}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_STREAM=ON")
 # Compile kernels.c with a different compiler than the rest. Needed for the
 # Zvfh fp16 kernels, whose intrinsics do not exist in GCC 13.2 -- the only
 # riscv64-unknown-linux-gnu compiler here. Same variable and same meaning as
