@@ -182,6 +182,13 @@ fi
 # selection to algorithms that meet at least the given accuracy class. Use
 # bit_exact for golden-regression runs; default (unset) keeps the
 # atol=8 envelope behavior.
+# MB_DRIFT_ATOL=<lsb> explicitly accepts up to <lsb> of numeric drift in the
+# curated-verify gate, letting a NUMERIC_DRIFT kernel be selected where the
+# default (exact) gate would reject it. On Gemmini this is the conv2d_s8
+# int8-drain path: max_abs_err 2 for ~3.45x on conv. Unset = exact, as before.
+if [[ -n "${MB_DRIFT_ATOL:-}" ]]; then
+    export MB_DRIFT_ATOL
+fi
 if [[ -n "${MAX_ACCURACY_CLASS:-}" ]]; then
     GEN_KERNELS_ARGS+=(--max-accuracy-class "${MAX_ACCURACY_CLASS}")
 fi
