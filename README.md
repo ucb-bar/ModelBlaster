@@ -33,6 +33,49 @@ candidates, the cached-kernel reuse model), read the KernelBlaster paper:
 - **Source:** vendored here as a git submodule under `third_party/KernelBlaster/`
   (NVlabs/KernelBlaster).
 
+## Working with XPU-RT (the scheduler)
+
+ModelBlaster compiles and runs; XPU-RT schedules. They form a closed loop, and
+recent work landed in **both repos together** — read
+[`XPU-RT/docs/CHANGES.md`](../docs/CHANGES.md) if you are picking either up
+after a break, and [`XPU-RT/docs/the_loop.md`](../docs/the_loop.md) for which
+script owns which arrow.
+
+What XPU-RT expects from this side, and where it lives here:
+
+| XPU-RT asks for | ModelBlaster provides |
+|---|---|
+| a measured per-dispatch profile | `pipeline/profile_writer.py` → IREE-shape `results.csv` |
+| a dispatch graph | `pipeline/emit_dispatch_graph.py` |
+| a graph rewritten to a hint | `pipeline/apply_{fusion,split,unfuse,shard}_hint.py` |
+| a binary honouring a schedule | `pipeline/ingest_xpurt_schedule.py` + `generate_xpurt_main.py` |
+| live telemetry | `MB_XPURT_STREAM=1` → one JSON line per dispatch end |
+
+Three things worth knowing before changing any of them:
+
+* **`apply_shard_hint.py` does not rewrite the graph.** It annotates one
+  dispatch with a core width; the dispatch count, ids and edges are unchanged.
+  Its contract spells the count `n_shards`, not `n_splits`, so a hint fed to
+  the wrong applier fails rather than quietly doing the other verb.
+* **The walker selects its kernel by the schedule's `impl`**, not by
+  `core_kind`. That is what makes a heterogeneous schedule mean something at
+  run time; before it, such a schedule produced a binary that ran one backend
+  everywhere and reported the runtime it got.
+* **`_weight_name` suffixes every symbol with its backend, unconditionally.**
+  Without it two backends' `weights.c` define the same non-static symbol with
+  differently-packed data, only one gets linked, and every other backend reads
+  through the wrong layout — dronet at `max_abs_err=51`, no link error. Any new
+  emitter must pass `backend`.
+
+Environment: [`XPU-RT/docs/environment.md`](../docs/environment.md). Run this
+repo's tests **from this directory** (the curated-kernel verify cross-compiles
+with repo-relative includes), with `CROSS` exported:
+
+```bash
+eval "$(../scripts/setup_spacemit_toolchain.sh)"
+../.venv/bin/python -m pytest tests pipeline/tests -q
+```
+
 ## Quick orientation
 
 ```
