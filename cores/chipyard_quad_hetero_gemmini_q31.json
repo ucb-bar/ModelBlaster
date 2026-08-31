@@ -1,0 +1,39 @@
+{
+  "system": "chipyard-quad-hetero-2gemmini-2saturn-q31",
+  "description": "TRUE heterogeneous quad SoC (chipyard.config.SatGemQuadHeteroTacitConfig / SatGemQuadHeteroTacitMMIOOnlyConfig, recipe f2_quad_hetero_norose_tacit_q31_60mhz, MP_MAX_NUM_CPUS=4). Unlike chipyard_dual_rocket_gemmini_q31.json — where BOTH tiles carry a Saturn AND a Gemmini and the split into CPU_P/CPU_E is purely a software convention — here the tiles physically differ. Harts 0-1 are Rocket + Q0.31 Gemmini (16x16 WS) with NO vector unit; harts 2-3 are Rocket + Saturn VLEN256/DLEN128 with NO Gemmini. This gives the XPU-RT scheduler CPU_P=2, CPU_E=2 instead of CPU_P=1, CPU_E=1. ISA IS NOT UNIFORM ACROSS HARTS: harts 0-1 elaborate as rv64imafdc (no V, no Zfh); harts 2-3 as rv64imafdcv + Zvl256b + Zve64d + Zvfh + Zfh + Zvbb. Any RVV or scalar-fp16 kernel MUST be pinned (k_thread_cpu_pin / pthread_attr_setaffinity_np) to hart 2 or 3 or it takes an illegal-instruction trap; any Gemmini RoCC dispatch MUST be pinned to hart 0 or 1 for the same reason.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "gemmini_q31_0",
+      "kind": "gemmini_q31",
+      "isa": "rv64imafdc",
+      "harts": [0],
+      "description": "Rocket + Gemmini Q0.31 (16x16 WS, HW im2col, bit-exact int Q0.31 mvout). NO vector unit and NO Zfh on this tile, so the RVV/fp16 fallbacks available on the dual SoC's gemmini hart do NOT exist here — non-int8 ops must be scheduled onto rvv0/rvv1 or run as plain scalar fp32.",
+      "capabilities": ["linear_s8", "conv2d_s8"]
+    },
+    {
+      "name": "gemmini_q31_1",
+      "kind": "gemmini_q31",
+      "isa": "rv64imafdc",
+      "harts": [1],
+      "description": "Second, identical Gemmini tile. Same constraints as gemmini_q31_0.",
+      "capabilities_ref": "gemmini_q31_0"
+    },
+    {
+      "name": "rvv0",
+      "kind": "rvv",
+      "isa": "rv64gcv_zicntr_zihpm_zfh_zvfh",
+      "harts": [2],
+      "description": "Rocket + Saturn VLEN256/DLEN128 (refParams), Zvfh + Zfh, no Gemmini. Handles RVV-int8 conv2d/linear, the fp16 kernels (linear_f16, lstm_f16), and all the non-int8 / non-conv ops that fall back to scalar/RVV.",
+      "capabilities": ["linear_s8", "conv2d_s8", "linear_f16", "lstm_f16", "relu", "add", "elu", "silu", "sigmoid", "batchnorm2d", "maxpool2d", "cat", "upsample"]
+    },
+    {
+      "name": "rvv1",
+      "kind": "rvv",
+      "isa": "rv64gcv_zicntr_zihpm_zfh_zvfh",
+      "harts": [3],
+      "description": "Second, identical Saturn tile. Same capabilities as rvv0.",
+      "capabilities_ref": "rvv0"
+    }
+  ]
+}
