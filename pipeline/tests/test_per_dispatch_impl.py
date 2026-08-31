@@ -60,13 +60,13 @@ def _ir():
             "ops": [lin(0, 256), lin(1, 256)]}
 
 
-def _schedule(impls=None):
+def _schedule(impls=None, targets=None):
     """`impls` is {dispatch_id: impl}; omit for a pre-enable_impls schedule."""
     out = {"dot_file": "m.dot", "dispatches": {}}
     for did in (0, 1):
         d = {"id": did, "ordinal": 1, "total": 1,
              "dependencies": [] if did == 0 else ["m_dispatch_0"],
-             "hardware_target": "CPU_P#0",
+             "hardware_target": (targets or {}).get(did, "CPU_P#0"),
              "start_time": did * 1.0, "duration": 1.0,
              "job_name": "m", "module_name": f"m$dispatch_{did}"}
         if impls and did in impls:
@@ -81,6 +81,13 @@ class TheScheduleNamesAnImplementationPerDispatch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             sched = Path(d) / "s.json"
             sched.write_text(json.dumps(_schedule(impls)))
+            return ingest.load(str(sched), {"m": _ir()}, _REG,
+                               cpu_p_kind="rvv", cpu_e_kind="rvv_c1")
+
+    def _load_targets(self, targets):
+        with tempfile.TemporaryDirectory() as d:
+            sched = Path(d) / "s.json"
+            sched.write_text(json.dumps(_schedule(targets=targets)))
             return ingest.load(str(sched), {"m": _ir()}, _REG,
                                cpu_p_kind="rvv", cpu_e_kind="rvv_c1")
 
@@ -114,6 +121,27 @@ class TheScheduleNamesAnImplementationPerDispatch(unittest.TestCase):
             c = out.read_text()
         self.assertIn('.impl = "ime"', c)
         self.assertIn('.impl = "rvv"', c)
+
+    def test_a_composite_target_preserves_every_reserved_hart(self):
+        entries = self._load_targets({0: "CPU_P#0+CPU_P#1"})
+        self.assertEqual(entries[0].hart, 0, "first hart owns the dispatch")
+        self.assertEqual(entries[0].harts, (0, 1))
+        self.assertEqual(entries[0].core_kind, "rvv")
+
+    def test_a_composite_target_cannot_cross_runtime_kinds(self):
+        with self.assertRaisesRegex(ValueError, "same runtime kind"):
+            self._load_targets({0: "CPU_P#0+CPU_E#0"})
+
+    def test_the_emitted_table_carries_the_composite_hart_set(self):
+        entries = self._load_targets({0: "CPU_P#0+CPU_P#1"})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "t.c"
+            ingest.emit_table(entries, str(out), schedule_name="s")
+            c = out.read_text()
+            h = out.with_suffix(".h").read_text()
+        self.assertIn("sched_0_harts[] = { 0, 1 }", c)
+        self.assertIn(".n_harts = 2, .harts = sched_0_harts", c)
+        self.assertIn("int            n_harts", h)
 
 
 class AskingForAnImplTheBuildLacksIsFatal(unittest.TestCase):
@@ -154,6 +182,58 @@ class AskingForAnImplTheBuildLacksIsFatal(unittest.TestCase):
         self.assertIn("FATAL", src)
         self.assertIn("sys_reboot", src)
         self.assertIn("e_->impl", src)
+
+    def test_the_walker_locks_every_reserved_hart_and_selects_its_exact_pool(self):
+        from pipeline import generate_xpurt_main as gen
+        src = gen._emit(
+            networks=["m"], schedule_name="s",
+            dispatch_table_header="t.h", core_kinds=["rvv"],
+            backends=["rvv_x60"], pool_sizes=[4], n_instances={"m": 1},
+            platform="linux")
+        self.assertIn("lock_entry_harts(e_)", src)
+        self.assertIn("unlock_entry_harts(e_)", src)
+        self.assertIn("pool_for_entry(e_)", src)
+        self.assertIn("modelblaster_pool_create_on_harts", src)
+
+    def test_every_entry_is_gated_by_its_schedule_issued_start(self):
+        """Independent DAG roots must not run before their periodic release."""
+        from pipeline import generate_xpurt_main as gen
+        src = gen._emit(
+            networks=["m"], schedule_name="s",
+            dispatch_table_header="t.h", core_kinds=["rvv"],
+            backends=["rvv_x60"], pool_sizes=[4], n_instances={"m": 1},
+            platform="linux")
+        gate = src.index("uint64_t target_start = run_t0")
+        network_branch = src.index('strcmp(e_->network, "m") == 0')
+        zero_cost_branch = src.index("if (e_->dispatch_id < 0)")
+        self.assertLess(gate, network_branch)
+        self.assertLess(gate, zero_cost_branch,
+                        "zero-cost roots must not post completion early")
+        self.assertEqual(src.count("uint64_t target_start = run_t0"), 1,
+                         "the gate belongs to the common per-entry path")
+
+    def test_the_walker_emits_a_golden_check_for_each_model(self):
+        from pipeline import generate_xpurt_main as gen
+        src = gen._emit(
+            networks=["m"], schedule_name="s",
+            dispatch_table_header="t.h", core_kinds=["rvv"],
+            backends=["rvv_x60"], pool_sizes=[1], n_instances={"m": 1},
+            platform="linux")
+        self.assertIn("=== MODELBLASTER_VERIFY [m] ===", src)
+        self.assertIn("model_m_test_golden[_v]", src)
+        self.assertIn("MODEL_M_TEST_OUTPUT_LEN", src)
+        self.assertIn("e_->instance == 0", src)
+        self.assertIn("__atomic_add_fetch", src)
+
+    def test_linux_walker_reports_the_observed_process_policy(self):
+        from pipeline import generate_xpurt_main as gen
+        src = gen._emit(
+            networks=["m"], schedule_name="s",
+            dispatch_table_header="t.h", core_kinds=["rvv"],
+            backends=["rvv_x60"], pool_sizes=[1], n_instances={"m": 1},
+            platform="linux")
+        self.assertIn("sched_getscheduler(0)", src)
+        self.assertIn("observed_sched_policy=", src)
 
 
 if __name__ == "__main__":
