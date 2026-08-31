@@ -39,7 +39,8 @@ ModelBlaster compiles and runs; XPU-RT schedules. They form a closed loop, and
 recent work landed in **both repos together** — read
 [`XPU-RT/docs/the_loop.md`](../docs/the_loop.md) for which script owns which
 arrow, and [`XPU-RT/docs/k1_board.md`](../docs/k1_board.md) to run any of it on
-hardware.
+hardware. The complete composite-target contract is in
+[`docs/xpurt_schedule_sharding.md`](docs/xpurt_schedule_sharding.md).
 
 What XPU-RT expects from this side, and where it lives here:
 
@@ -56,7 +57,9 @@ Three things worth knowing before changing any of them:
 * **`apply_shard_hint.py` does not rewrite the graph.** It annotates one
   dispatch with a core width; the dispatch count, ids and edges are unchanged.
   Its contract spells the count `n_shards`, not `n_splits`, so a hint fed to
-  the wrong applier fails rather than quietly doing the other verb.
+  the wrong applier fails rather than quietly doing the other verb. For a
+  schedule-selected width, `schedule_shards.py` derives the same per-dispatch
+  annotation from the composite `hardware_target` before code generation.
 * **The walker selects its kernel by the schedule's `impl`**, not by
   `core_kind`. That is what makes a heterogeneous schedule mean something at
   run time; before it, such a schedule produced a binary that ran one backend
