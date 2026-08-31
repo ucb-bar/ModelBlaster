@@ -3,17 +3,18 @@
 # The Linux counterpart of ../harness_xpurt, which is Zephyr-only (it does
 # find_package(Zephyr) and stacks prj.conf overlays). Everything structural is
 # kept identical -- per-(model, backend) OBJECT libraries with backend_rename.py
-# symbol suffixes, one weights/buffers/test_io TU per model, and the generated
-# walker plus dispatch table as the app -- so a schedule that runs under Zephyr
-# builds here without regenerating anything except xpurt_main.c
-# (--platform linux).
+# symbol suffixes, one weights TU per (model, backend), one buffers/test_io TU
+# per model, and the generated walker plus dispatch table as the app -- so a
+# schedule that runs under Zephyr builds here without regenerating anything
+# except xpurt_main.c (--platform linux).
 #
 # Why the per-model/per-backend split is not simplified: model.c's `buf_*`
 # intermediates must have exactly ONE definition per model, shared across
 # backends. Giving each backend its own copy made a cross-backend dispatch
 # within one network read zeroed scratch -- that is what corrupted DroNet's
 # output on FireSim when rvv ran maxpool1 and scalar's conv_modules.3 then read
-# its own backend's buf_maxpool1. Same reason weights are linked once.
+# its own backend's buf_maxpool1. Weights are different: codegen may pack them
+# differently per backend and gives every backend distinct weight symbols.
 #
 # Pass:
 #   -DMODEL_BACKENDS=scalar,rvv           comma list; must cover every core_kind
@@ -301,22 +302,35 @@ foreach(_i RANGE ${_last})
         message(STATUS "harness_xpurt_linux: ${_name}/${_bs} -> ${_obj_tgt}")
     endforeach()
 
-    # One TU per model, NOT per backend -- see the header comment.
-    foreach(_what weights buffers)
-        if(NOT EXISTS "${_primary_dir}/${_what}.c")
-            message(FATAL_ERROR
-                "${_primary_dir} missing ${_what}.c -- regenerate the skeleton")
-        endif()
-        set(_tgt "mb_${_name}_${_what}_obj")
-        add_library(${_tgt} OBJECT "${_primary_dir}/${_what}.c")
-        target_include_directories(${_tgt} PRIVATE "${_primary_dir}")
-        target_compile_definitions(${_tgt} PRIVATE MODELBLASTER_PLATFORM_LINUX=1)
-        if(_what STREQUAL "weights")
-            target_compile_definitions(${_tgt} PRIVATE
-                MODELBLASTER_DISABLE_UNMANGLED=1)
-        endif()
-        target_link_libraries(xpurt_harness PRIVATE ${_tgt})
+    # One weights TU per (model, backend), matching the Zephyr harness and
+    # generate_skeleton._weight_name(). Backends can pack the same logical
+    # tensor in different physical layouts, and generated model.c references
+    # backend-suffixed symbols such as ..._weight_q_rvv_x60. Linking only the
+    # primary backend's weights therefore either fails (distinct symbols) or,
+    # with older unsuffixed codegen, silently feeds a kernel the wrong layout.
+    foreach(_bs IN LISTS MODEL_BACKENDS)
+        set(_backend_dir "${_base}/${_bs}")
+        set(_weights_tgt "mb_${_name}_${_bs}_weights_obj")
+        add_library(${_weights_tgt} OBJECT "${_backend_dir}/weights.c")
+        target_include_directories(${_weights_tgt} PRIVATE "${_backend_dir}")
+        target_compile_definitions(${_weights_tgt} PRIVATE
+            MODELBLASTER_DISABLE_UNMANGLED=1
+            MODELBLASTER_PLATFORM_LINUX=1)
+        target_link_libraries(xpurt_harness PRIVATE ${_weights_tgt})
     endforeach()
+
+    # Intermediate buffers are deliberately shared across every backend for a
+    # model. Cross-backend dispatches must see the producer's scratch storage.
+    if(NOT EXISTS "${_primary_dir}/buffers.c")
+        message(FATAL_ERROR
+            "${_primary_dir} missing buffers.c -- regenerate the skeleton")
+    endif()
+    set(_buffers_tgt "mb_${_name}_buffers_obj")
+    add_library(${_buffers_tgt} OBJECT "${_primary_dir}/buffers.c")
+    target_include_directories(${_buffers_tgt} PRIVATE "${_primary_dir}")
+    target_compile_definitions(${_buffers_tgt} PRIVATE
+        MODELBLASTER_PLATFORM_LINUX=1)
+    target_link_libraries(xpurt_harness PRIVATE ${_buffers_tgt})
 
     # .incbin pulls test_input.bin / test_golden.bin into rodata, which is what
     # keeps cc1 from OOMing on kernelbench-scale decimal const arrays.

@@ -140,6 +140,7 @@ _PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 _EXPLICIT_F16_OPS = {
     "relu_f16", "elu_f16", "sigmoid_f16", "batchnorm2d_f16", "maxpool2d_f16",
     "conv2d_f16", "linear_f16", "depthwise_conv2d_f16", "layer_norm_f16",
+    "lstm_f16",
     "gelu_f16", "softmax_f16", "add_f16", "mul_f16", "mul_c1_f16",
     "adaptive_avg_pool2d_f16", "slice_c_f16", "cat2_c1_f16", "cat3_c1_f16",
     "cat4_c1_f16", "silu_f16", "upsample_nearest_f16", "pad_f16", "bmm_f16",
