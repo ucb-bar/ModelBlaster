@@ -55,7 +55,18 @@ fi
 # the build-aware west extension, could be base, etc. Forcing
 # set_envvars_sdk here means run.sh works from any starting env as
 # long as the conda zephyr binaries are reachable.
-source "${REPO_ROOT}/scripts/set_envvars_sdk.sh"
+# set_envvars_sdk.sh lives in the zephyr-chipyard-sw tree, one level above
+# REPO_ROOT (which is modelblaster/). Sourcing "${REPO_ROOT}/scripts/..."
+# always failed -- modelblaster/scripts/ has no such file.
+#
+# That script also assigns its OWN REPO_ROOT (= zephyr-chipyard-sw) and it is
+# sourced, so it clobbers ours. Save and restore around the call, otherwise
+# the ${REPO_ROOT}/examples/_run_lib.sh hand-off below resolves to the wrong
+# tree.
+_MB_REPO_ROOT="${REPO_ROOT}"
+source "${REPO_ROOT}/../scripts/set_envvars_sdk.sh"
+REPO_ROOT="${_MB_REPO_ROOT}"
+unset _MB_REPO_ROOT
 # Clear FORCE_EXTRACT so _run_lib.sh doesn't try to re-run its FX-based
 # extract_graph (which doesn't know about vint). The IR is already on
 # disk from the xpurt-side extract_graph_export above.

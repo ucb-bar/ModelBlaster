@@ -269,6 +269,19 @@ west build -p -b "${BOARD_TARGET}" harness_xpurt \
 #    given dispatch to. FireSim: hardware is fixed (RVV-capable rocket),
 #    so just hand the elf to firesim_runner.
 _mb_stage_end build
+
+# STOP_AFTER=build: emit the harness ELF and stop, skipping stage 4's
+# simulator/FireSim run. Mirrors the identically-named knob in
+# examples/_run_lib.sh: lets an external scheduler (deploy/fpga_queue ->
+# AWS F2) own the hardware run instead of firesim_runner.py driving a
+# LOCAL chipyard-fsim tree's `firesim infrasetup` + `runworkload`.
+if [[ "${STOP_AFTER:-}" == "build" ]]; then
+    echo "[xpurt] STOP_AFTER=build -> stopping before the run stage"
+    echo "ELF: ${BUILD_DIR}/zephyr/zephyr.elf"
+    ls -l "${BUILD_DIR}/zephyr/zephyr.elf" 2>/dev/null || echo "WARNING: elf not found"
+    exit 0
+fi
+
 _mb_stage_begin run
 echo "[xpurt] ${RUNNER} + verify"
 if [[ "${RUNNER}" == "spike" ]]; then
