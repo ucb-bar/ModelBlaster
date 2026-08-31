@@ -18,7 +18,8 @@ symbols (kernels, dispatch table, profile API) get suffixed with
 
 The generated main:
 
-    1. Creates one modelblaster_pool (worker count from MODELBLASTER_POOL_THREADS).
+    1. Creates one persistent modelblaster_pool for every distinct composite
+       hart set selected by the schedule. Singleton dispatches need no pool.
     2. Resets every involved (model, backend) profile counter.
     3. Spawns one worker per (core_kind, hart) pair the schedule
        actually uses, pinned to that hart. Each worker walks the table
@@ -37,16 +38,14 @@ The generated main:
        that: it names WHERE, and ``impl`` names WITH WHAT. Selecting on
        ``impl`` rather than ``core_kind`` is what makes a heterogeneous
        schedule mean something at run time instead of being a claim the
-       binary quietly ignores. The state struct stays suffixed by
-       ``core_kind`` so its pool binding follows the core, not the
-       implementation.
+       binary quietly ignores. Dispatch-local state binds the exact composite
+       pool for that entry.
     5. Tracks per-network wall cycles inline (no model-side setter
        call — keeps wall-cycle bookkeeping backend-agnostic).
-    6. Prints each network's final output between the standard
-       ``=== MODELBLASTER_OUTPUT_BEGIN [<network>] ===`` markers so
-       ``spike_runner`` can verify against the golden, plus per-backend
-       profile records so post-run analysis can split per-op cycles by
-       backend.
+    6. Captures instance 0 only after every dispatch in that DAG has finished,
+       compares it with the baked one-invocation golden, and prints the
+       standard output and per-backend profile records. Capturing instance 0
+       matters for recurrent models whose later periodic outputs carry state.
 """
 
 from __future__ import annotations
@@ -131,53 +130,24 @@ def _emit(networks: list[str], schedule_name: str,
                    NOTE this no longer fixes the thread count: the walker
                    discovers the (kind, hart) worker set at RUN time by
                    scanning the dispatch table, so `core_kinds` only fixes
-                   the kind -> backend pairing, the per-kind pool array
-                   layout, and which kinds are executable at all.
+                   the kind -> backend pairing and which kinds are
+                   executable at all.
     `backends`     is the ordered list of HW backends compiled into the
                    binary (== the per-model OBJECT-lib suffixes). Usually
                    identical to `core_kinds`, but separated to allow
                    binaries with backend pools larger than the schedule
                    used (e.g. a future fallback path).
-    `pool_sizes`   is parallel to `core_kinds`; element k is the
-                   modelblaster_pool_create() argument for kind k. modelblaster_pool's
-                   thread count INCLUDES the calling thread, so a kind
-                   with N harts wants pool_size=N (caller + N-1 helpers =
-                   N total threads matching N harts). 0 ⇒ NULL pool;
-                   parallel_<op> runs synchronously on the scheduler
-                   worker. Intra-op parallelism kicks in only when a kind
-                   has >=2 harts.
-
-                   OVERSUBSCRIPTION RULE (2026-08-27): inter-dispatch
-                   parallelism (one scheduler worker per hart) and
-                   intra-op parallelism (pool helper threads) compete for
-                   the same physical harts. Now that the walker spawns one
-                   worker per (kind, hart) the kind's harts are already
-                   fully claimed by scheduler workers, so main() FORCES
-                   pools[k] = NULL for any kind that ended up with more
-                   than one worker, whatever `pool_sizes[k]` says. A kind
-                   with exactly one worker still gets its configured pool,
-                   because the kind's other harts are genuinely idle.
+    `pool_sizes`   is the legacy per-kind default used only when a schedule
+                   does not declare a composite machine. Composite entries
+                   create one persistent pool for their exact ordered hart
+                   set. Per-hart locks prevent scheduler workers and pool
+                   helpers from oversubscribing the same physical hart.
     `n_instances`  per-network instance count (max instance index + 1).
                    Sized arrays for wall-cycle bookkeeping so periodic
                    instances of the same network don't clobber each
                    other's start/elapsed scalars."""
 
-    # State structs are emitted per (network, kind) so each worker's
-    # `s.pool` is fixed at main() time. Without this, two workers that
-    # dispatch concurrently into the same network race the per-dispatch
-    # `s.pool` write, and the kernel ends up fanning out onto the wrong
-    # kind's helpers. core_kinds covers everything the dispatcher
-    # actually selects on; we union with backends for the (rare) case
-    # where a backend has no matching kind in this schedule, so all
-    # `s_<m>_<bs>` references in the bs_select branches resolve.
-    all_kinds: list[str] = []
-    for k in list(core_kinds) + list(backends):
-        if k not in all_kinds:
-            all_kinds.append(k)
     inc_lines: list[str] = []
-    state_decls: list[str] = []
-    state_inits: list[str] = []
-    state_pool_assigns: list[str] = []
     output_buf_decls: list[str] = []
     forward_decls: list[str] = []
     reset_calls: list[str] = []
@@ -196,33 +166,6 @@ def _emit(networks: list[str], schedule_name: str,
             f"static model_{mid}_output_t out_{mid}[MODEL_{umid}_OUTPUT_SIZE];"
         )
 
-        # One state struct per (network, kind). `.pool` is fixed in main()
-        # before workers spawn, so the worker dispatch path never writes
-        # to a struct shared across kinds. `.input` / `.output` are
-        # read-only-from-the-worker after init; multiple kinds reading
-        # them is safe. Intermediate buffers live in a per-model
-        # buffers.c (extern) shared by every (network, kind), so
-        # cross-kind dispatches in one network read each other's writes
-        # exactly as they would in the straight-line path.
-        for kind in all_kinds:
-            state_decls.append(
-                f"    model_{mid}_state_t s_{mid}_{kind};"
-            )
-            state_inits.append(
-                f"    s_{mid}_{kind}.input  = model_{mid}_test_input;\n"
-                f"    s_{mid}_{kind}.output = out_{mid};\n"
-                f"    s_{mid}_{kind}.pool   = NULL;"
-            )
-            if kind in core_kinds:
-                kind_idx = core_kinds.index(kind)
-                state_pool_assigns.append(
-                    f"    s_{mid}_{kind}.pool = pools[{kind_idx}];"
-                )
-            else:
-                state_pool_assigns.append(
-                    f"    s_{mid}_{kind}.pool = NULL;  /* {kind} not in core_kinds */"
-                )
-
         # Per-instance wall-cycle bookkeeping. Periodic networks issue
         # multiple instances (`dronet0`, `dronet1`, ...) — sharing one
         # scalar would mean each instance overwrites the previous.
@@ -230,6 +173,11 @@ def _emit(networks: list[str], schedule_name: str,
             f"static uint64_t wall_start_{mid}[{n_inst}] = {{ 0 }};")
         wall_decls.append(
             f"static uint64_t wall_cycles_{mid}[{n_inst}] = {{ 0 }};")
+        wall_decls.append(
+            f"static int completed_dispatches_{mid}[{n_inst}] = {{ 0 }};")
+        wall_decls.append(
+            f"static float verify_abs_{mid} = 0.0f, verify_rel_{mid} = 0.0f;")
+        wall_decls.append(f"static int verify_ready_{mid} = 0;")
 
         # For each (model, backend) pair: forward-declare the per-backend
         # dispatch table + the renamed profile API. The harness CMakeLists
@@ -253,8 +201,8 @@ def _emit(networks: list[str], schedule_name: str,
         # implementation for THIS dispatch -- which the ingest defaults to
         # core_kind, so a schedule that never chose per-dispatch impls
         # selects exactly as it always did. We dispatch with the
-        # per-(network, kind) state struct so `.pool` follows the CORE the
-        # work runs on, not the implementation it runs with.
+        # dispatch-local state so `.pool` follows the exact composite target
+        # selected for this entry, not merely its kind or implementation.
         #
         # Cross-tile memory coherence: Gemmini's RoCC DMA reads/writes
         # memory through an independent port at the SoC coherence point,
@@ -278,9 +226,8 @@ def _emit(networks: list[str], schedule_name: str,
         # this loop strcmped against `bs` (the backend tag), so any
         # mismatch silently dropped every dispatch into the else clause
         # — verify then showed all-zero outputs (static init) and the
-        # bug looked like FPGA corruption. The state struct stays
-        # suffixed by `kind` so its .pool binding (in state_pool_assigns
-        # above) keeps the kind's pool, regardless of the backend tag.
+        # bug looked like FPGA corruption. Pool selection is independent of
+        # this branch and comes from the entry's complete hart set.
         if len(core_kinds) != len(backends):
             raise SystemExit(
                 f"_emit: core_kinds and backends must have equal length "
@@ -293,7 +240,7 @@ def _emit(networks: list[str], schedule_name: str,
             bs_select_lines.append(
                 f'            {kw} (strcmp(e_->impl, "{kind}") == 0) {{\n'
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
-                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{kind});\n"
+                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&dispatch_state_{mid});\n"
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
                 f"            }}"
             )
@@ -332,28 +279,18 @@ def _emit(networks: list[str], schedule_name: str,
             f"                continue;\n"
             f"            }}\n"
             f"            if (e_->dispatch_id == 0) {{\n"
-            f"                /* Honor the schedule's per-instance start\n"
-            f"                 * time. Only enforced on dispatch_id==0 so\n"
-            f"                 * subsequent ops still chain via data deps;\n"
-            f"                 * this models periodic tasks waking at\n"
-            f"                 * deterministic boundaries (e.g. mlp_control\n"
-            f"                 * every 5 ms) without forcing the rest of\n"
-            f"                 * the instance into lockstep. */\n"
-            f"                uint64_t target_start = run_t0 +\n"
-            f"                    (uint64_t)((double)e_->start_time_ms *\n"
-            f"                               (double)XPURT_CYCLES_PER_MS);\n"
-            f"                uint64_t t_gate0 = (uint64_t)k_cycle_get_64();\n"
-            f"                while ((uint64_t)k_cycle_get_64() < target_start) {{\n"
-            f"                    k_yield();\n"
-            f"                }}\n"
-            f"                g_hart_acc[my_acc_idx].target_gate_spin +=\n"
-            f"                    ((uint64_t)k_cycle_get_64() - t_gate0);\n"
             + "\n".join(
                 f"                model_{mid}_reset_profile_{bs}();"
                 for bs in backends
             ) + "\n"
             f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n"
             f"            }}\n"
+            f"            model_{mid}_state_t dispatch_state_{mid} = {{\n"
+            f"                .input = model_{mid}_test_input,\n"
+            f"                .output = out_{mid},\n"
+            f"                .pool = (void *)pool_for_entry(e_),\n"
+            f"            }};\n"
+            f"            lock_entry_harts(e_);\n"
             f"            uint64_t t_disp0 = (uint64_t)k_cycle_get_64();\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].start_cycles = t_disp0 - run_t0;\n"
@@ -377,6 +314,7 @@ def _emit(networks: list[str], schedule_name: str,
             f"#endif\n"
             f"{bs_select}\n"
             f"            uint64_t t_disp1 = (uint64_t)k_cycle_get_64();\n"
+            f"            unlock_entry_harts(e_);\n"
             f"            g_hart_acc[my_acc_idx].kernel += (t_disp1 - t_disp0);\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].end_cycles = t_disp1 - run_t0;\n"
@@ -413,9 +351,36 @@ def _emit(networks: list[str], schedule_name: str,
             f"                if (sn_ > 0) {{ ssize_t w_ = write(1, sbuf_, (size_t)sn_); (void)w_; }}\n"
             f"            }}\n"
             f"#endif\n"
-            f"            if (e_->dispatch_id == MODEL_{umid}_OP_COUNT - 1) {{\n"
+            f"            /* A DAG may have several output leaves. Numeric\n"
+            f"             * verification and wall completion belong to the\n"
+            f"             * LAST completed dispatch, not the numerically last\n"
+            f"             * dispatch id (DroNet's two heads finish in either\n"
+            f"             * order). */\n"
+            f"            int _model_done = __atomic_add_fetch(\n"
+            f"                &completed_dispatches_{mid}[e_->instance], 1,\n"
+            f"                __ATOMIC_ACQ_REL);\n"
+            f"            if (_model_done == MODEL_{umid}_OP_COUNT) {{\n"
             f"                wall_cycles_{mid}[e_->instance] =\n"
             f"                    (uint64_t)k_cycle_get_64() - wall_start_{mid}[e_->instance];\n"
+            f"                /* Capture instance 0 before a stateful model's\n"
+            f"                 * later invocations advance its state. The baked\n"
+            f"                 * golden is a one-invocation golden. */\n"
+            f"                if (e_->instance == 0) {{\n"
+            f"                    __asm__ volatile(\"fence rw, rw\" ::: \"memory\");\n"
+            f"                    float _mae = 0.0f, _mre = 0.0f;\n"
+            f"                    for (int _v = 0; _v < MODEL_{umid}_TEST_OUTPUT_LEN; _v++) {{\n"
+            f"                        float a = (float)out_{mid}[_v];\n"
+            f"                        float g = (float)model_{mid}_test_golden[_v];\n"
+            f"                        float ae = a > g ? a - g : g - a;\n"
+            f"                        float ag = g > 0.0f ? g : -g;\n"
+            f"                        float re = ae / (ag > 1e-12f ? ag : 1e-12f);\n"
+            f"                        if (ae > _mae) _mae = ae;\n"
+            f"                        if (re > _mre) _mre = re;\n"
+            f"                    }}\n"
+            f"                    verify_abs_{mid} = _mae;\n"
+            f"                    verify_rel_{mid} = _mre;\n"
+            f"                    verify_ready_{mid} = 1;\n"
+            f"                }}\n"
             f"            }}\n"
             f"            /* Phase G2d: producer-side fanout. Give this\n"
             f"             * entry's sem once per downstream consumer; the\n"
@@ -471,6 +436,12 @@ def _emit(networks: list[str], schedule_name: str,
         # bit-exactness. The marker tags stay the same so existing
         # parsers continue to find OUTPUT_BEGIN/END.
         print_blocks.append(f"""\
+    /* Instance 0 is comparable to the baked one-invocation golden even when
+     * this model is stateful and later invocations intentionally evolve it. */
+    printf("=== MODELBLASTER_VERIFY [{net}] === "
+           "max_abs_err=%.9g max_rel_err=%.9g n=%d instance=0 ready=%d\\n",
+           (double)verify_abs_{mid}, (double)verify_rel_{mid},
+           MODEL_{umid}_TEST_OUTPUT_LEN, verify_ready_{mid});
     printf("=== MODELBLASTER_OUTPUT_BEGIN [{net}] ===\\n");
     {{
         const int _osz = MODEL_{umid}_OUTPUT_SIZE;
@@ -574,11 +545,11 @@ def _emit(networks: list[str], schedule_name: str,
  * it holds for one worker per (kind, hart) exactly as it did for one
  * worker per kind.
  *
- * Workers are pinned to harts via pthread_attr_setaffinity_np.
- * modelblaster_pool is the parallel-for primitive — parallel_<op>
- * wrappers inside dispatched kernels use it for intra-op parallelism, and
- * main() disables it for any kind whose harts are already fully claimed
- * by scheduler workers (see the pool oversubscription rule below).
+ * Workers are pinned to harts via pthread_attr_setaffinity_np. Composite
+ * entries reserve every hart in their machine combination under ordered
+ * per-hart locks and select a persistent modelblaster_pool pinned to that
+ * exact set. Scheduler workers on helper harts sleep on the locks while the
+ * shard is active, so inter-op and intra-op parallelism never oversubscribe.
  *
  * Outputs follow the same multi-line marker protocol as the
  * straight-line multi_main, so spike_runner verifies them against
@@ -656,7 +627,7 @@ struct xpurt_hart_acc {{
     uint64_t kernel;            /* mtime delta around bs_select dispatch */
     uint64_t dep_wait;          /* mtime inside k_sem_take loop */
     uint64_t sync_overhead;     /* mtime between kernel-end and end of iter */
-    uint64_t target_gate_spin;  /* mtime inside dispatch_id==0 spin */
+    uint64_t target_gate_spin;  /* mtime inside schedule-start gate */
     uint64_t hart_idle;         /* mtime between iters (gap to next match) */
     uint64_t gemmini_cfg_emit;  /* reserved for G2b caching wrappers */
     uint64_t entries_done;      /* count of dispatched entries */
@@ -668,36 +639,14 @@ struct xpurt_hart_acc {{
  * as if one hart had done it all. */
 static struct xpurt_hart_acc g_hart_acc[XPURT_MAX_WORKERS];
 
-/* One state struct per (network, kind). `.pool` is bound to the kind's
- * modelblaster_pool in main() before workers spawn and never written again
- * by the worker — that eliminates the data race that existed when a
- * single shared `s_<m>` had its `.pool` rewritten per-dispatch by
- * whichever worker happened to take the entry. Two workers dispatching
- * independent ops in the same network now each pass their own
- * (network, kind) state pointer, so `s->pool` always names the running
- * kind's helpers. Intermediate buffers are file-static, shared across
- * all (network, kind) state structs of one network — see the comments
- * over `extern int8_t buf_<mid>_*` in each model.c. */
-{chr(10).join("static " + d.lstrip() for d in state_decls).rstrip()}
-
 /* Per-instance wall-clock state. Each periodic instance writes its own
  * slot indexed by entry->instance, so back-to-back instances of one
  * network don't clobber each other's start/elapsed scalars. */
 {chr(10).join(wall_decls)}
 
-/* Per-kind intra-op pool. Set up in main() before workers spawn, then
- * each (network, kind) state struct's `.pool` is bound to the matching
- * `pools[k]` once. NULL ⇒ kind has only 1 hart, so parallel_<op>
- * wrappers run synchronously on the calling scheduler worker. Type
- * erased to void* here so the same generated source remained
- * backend-agnostic during the migration; modelblaster_pool is the only path
- * now. */
-static void *pools[{n_kinds}] = {{ NULL }};
-
 /* mtime baseline for the run, captured immediately before workers spawn.
- * Used by the worker to (a) honor per-instance schedule start times for
- * periodic networks (gating dispatch_id==0 entries until run_t0 +
- * start_time_ms), and (b) tag actual_start/end_cycles in the trace. */
+ * Used by the worker to (a) honor every entry's absolute schedule-issued
+ * start time and (b) tag actual_start/end_cycles in the trace. */
 static uint64_t run_t0;
 #define XPURT_CYCLES_PER_MS \\
     ((uint64_t)(XPURT_TICKS_PER_SEC / 1000))
@@ -741,6 +690,104 @@ struct xpurt_worker_arg {{
  * are created (the pool sizing depends on how many workers a kind got). */
 static struct xpurt_worker_arg g_workers[XPURT_MAX_WORKERS];
 static int g_n_workers;
+
+/* A schedule may reserve one hart or an aligned 2/4/...-hart block for one
+ * dispatch. Keep one persistent pool per distinct composite block and one
+ * mutex per physical hart. The dispatch-owning worker is harts[0]; helpers
+ * are pinned to the remaining entries by modelblaster_pool_create_on_harts.
+ * Every master acquires hart locks in numeric order, so overlapping blocks
+ * serialize without a lock-order cycle even when actual durations drift. */
+#ifndef XPURT_MAX_HARTS
+#define XPURT_MAX_HARTS 256
+#endif
+#ifndef XPURT_MAX_POOL_WIDTH
+#define XPURT_MAX_POOL_WIDTH 16
+#endif
+#ifndef XPURT_MAX_POOLS
+#define XPURT_MAX_POOLS 32
+#endif
+struct xpurt_pool_desc {{
+    int n_harts;
+    int harts[XPURT_MAX_POOL_WIDTH];
+    modelblaster_pool_t pool;
+}};
+static pthread_mutex_t g_hart_locks[XPURT_MAX_HARTS];
+static struct xpurt_pool_desc g_entry_pools[XPURT_MAX_POOLS];
+static int g_n_entry_pools;
+
+static int same_harts(const struct xpurt_pool_desc *p,
+                      const xpurt_sched_entry_t *e)
+{{
+    if (p->n_harts != e->n_harts) return 0;
+    for (int i = 0; i < e->n_harts; i++) {{
+        if (p->harts[i] != e->harts[i]) return 0;
+    }}
+    return 1;
+}}
+
+static modelblaster_pool_t pool_for_entry(const xpurt_sched_entry_t *e)
+{{
+    if (e->n_harts <= 1) return NULL;
+    for (int i = 0; i < g_n_entry_pools; i++) {{
+        if (same_harts(&g_entry_pools[i], e)) return g_entry_pools[i].pool;
+    }}
+    return NULL;  /* init_entry_runtime audits this before workers spawn */
+}}
+
+static int init_entry_runtime(void)
+{{
+    for (int h = 0; h < XPURT_MAX_HARTS; h++) {{
+        if (pthread_mutex_init(&g_hart_locks[h], NULL) != 0) return -1;
+    }}
+    g_n_entry_pools = 0;
+    for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+        const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
+        if (e->n_harts < 1 || e->n_harts > XPURT_MAX_POOL_WIDTH) return -2;
+        for (int j = 0; j < e->n_harts; j++) {{
+            if (e->harts[j] < 0 || e->harts[j] >= XPURT_MAX_HARTS) return -3;
+        }}
+        if (e->n_harts == 1 || pool_for_entry(e) != NULL) continue;
+        if (g_n_entry_pools >= XPURT_MAX_POOLS) return -4;
+        struct xpurt_pool_desc *p = &g_entry_pools[g_n_entry_pools];
+        p->n_harts = e->n_harts;
+        for (int j = 0; j < e->n_harts; j++) p->harts[j] = e->harts[j];
+        p->pool = modelblaster_pool_create_on_harts(p->n_harts, p->harts);
+        if (p->pool == NULL) return -5;
+        printf("modelblaster_pool[block=%d]: width=%d harts=",\
+               g_n_entry_pools, p->n_harts);
+        for (int j = 0; j < p->n_harts; j++)
+            printf("%s%d", j ? "+" : "", p->harts[j]);
+        printf("\\n");
+        g_n_entry_pools++;
+    }}
+    return 0;
+}}
+
+static void lock_entry_harts(const xpurt_sched_entry_t *e)
+{{
+    int ordered[XPURT_MAX_POOL_WIDTH];
+    for (int i = 0; i < e->n_harts; i++) ordered[i] = e->harts[i];
+    for (int i = 1; i < e->n_harts; i++) {{
+        int v = ordered[i], j = i - 1;
+        while (j >= 0 && ordered[j] > v) {{ ordered[j + 1] = ordered[j]; j--; }}
+        ordered[j + 1] = v;
+    }}
+    for (int i = 0; i < e->n_harts; i++)
+        pthread_mutex_lock(&g_hart_locks[ordered[i]]);
+}}
+
+static void unlock_entry_harts(const xpurt_sched_entry_t *e)
+{{
+    int ordered[XPURT_MAX_POOL_WIDTH];
+    for (int i = 0; i < e->n_harts; i++) ordered[i] = e->harts[i];
+    for (int i = 1; i < e->n_harts; i++) {{
+        int v = ordered[i], j = i - 1;
+        while (j >= 0 && ordered[j] > v) {{ ordered[j + 1] = ordered[j]; j--; }}
+        ordered[j + 1] = v;
+    }}
+    for (int i = e->n_harts - 1; i >= 0; i--)
+        pthread_mutex_unlock(&g_hart_locks[ordered[i]]);
+}}
 
 static void *xpurt_worker(void *arg)
 {{
@@ -861,6 +908,21 @@ static void *xpurt_worker(void *arg)
         uint64_t t_deps_done = (uint64_t)k_cycle_get_64();
         g_hart_acc[my_acc_idx].dep_wait += (t_deps_done - t_iter_start);
 
+        /* Every dispatch has an absolute schedule-issued earliest start.
+         * Gating only dispatch_id==0 is insufficient for a DAG with multiple
+         * roots: another root can otherwise run before its periodic release,
+         * then post dependencies early. Dependencies and this gate are both
+         * lower bounds; actual resource drift may still start an entry later. */
+        uint64_t target_start = run_t0 +
+            (uint64_t)((double)e_->start_time_ms *
+                       (double)XPURT_CYCLES_PER_MS);
+        uint64_t t_gate0 = (uint64_t)k_cycle_get_64();
+        while ((uint64_t)k_cycle_get_64() < target_start) {{
+            k_yield();
+        }}
+        g_hart_acc[my_acc_idx].target_gate_spin +=
+            ((uint64_t)k_cycle_get_64() - t_gate0);
+
 {dispatch_branch}
         printf("xpurt: WARN unknown network %s in entry %d\\n",
                e_->network, e_->entry_id);
@@ -882,6 +944,21 @@ int main(void)
 {{
     printf("xpurt-runner: schedule={schedule_name} entries=%d kinds=%d on %s\\n",
            {upper}_N_ENTRIES, {n_kinds}, XPURT_BOARD_TARGET);
+#ifdef MODELBLASTER_PLATFORM_LINUX
+    struct sched_param observed_sched_param = {{ 0 }};
+    int observed_sched_policy = sched_getscheduler(0);
+    if (observed_sched_policy < 0 ||
+        sched_getparam(0, &observed_sched_param) != 0) {{
+        printf("FATAL: cannot read process scheduler policy errno=%d\\n", errno);
+        return -1;
+    }}
+    const char *observed_sched_name =
+        observed_sched_policy == SCHED_FIFO ? "SCHED_FIFO" :
+        observed_sched_policy == SCHED_RR ? "SCHED_RR" :
+        observed_sched_policy == SCHED_OTHER ? "SCHED_OTHER" : "OTHER";
+    printf("xpurt: observed_sched_policy=%s priority=%d\\n",
+           observed_sched_name, observed_sched_param.sched_priority);
+#endif
 
     static const char *kinds[] = {{ {kind_strs} }};
 
@@ -980,55 +1057,19 @@ int main(void)
         }}
     }}
 
-    /* ---- Per-kind modelblaster_pool sizes ------------------------------
-     * `pool_sizes[k]` is the intra-op (parallel_<op>) fan-out for kind k;
-     * modelblaster_pool counts the CALLER in its thread count, so kind k
-     * wants pool_size == the kind's hart count. 0 => NULL pool and
-     * parallel_<op> runs synchronously on the calling scheduler worker.
-     *
-     * OVERSUBSCRIPTION GUARD: inter-dispatch parallelism (one scheduler
-     * worker per hart, above) and intra-op parallelism (pool helpers)
-     * draw on the same physical harts. If a kind got more than one
-     * worker, its harts are already fully claimed and a pool on top would
-     * put 2+ runnable threads on each of them, turning a measurement of
-     * the schedule into a measurement of the Linux scheduler. So a
-     * multi-worker kind is forced to a NULL pool regardless of what
-     * `pool_sizes` says. A single-worker kind keeps its configured pool:
-     * the kind's remaining harts really are idle in that case. */
-    static const int pool_sizes[{n_kinds}] = {{ {pool_size_strs} }};
-    for (int k = 0; k < {n_kinds}; k++) {{
-        int n_workers_k = 0;
-        for (int w = 0; w < g_n_workers; w++) {{
-            if (g_workers[w].kind_idx == k) n_workers_k++;
-        }}
-        int want = pool_sizes[k];
-        if (want > 0 && n_workers_k > 1) {{
-            printf("modelblaster_pool[kind=%d]: disabled -- %d scheduler "
-                   "workers already own this kind's harts, pool_size=%d "
-                   "would oversubscribe\\n", k, n_workers_k, want);
-            want = 0;
-        }}
-        if (want > 0) {{
-            pools[k] = (void *)modelblaster_pool_create(want);
-            if (pools[k] == NULL) {{
-                printf("FATAL: modelblaster_pool_create kind=%d size=%d failed\\n",
-                       k, want);
-                sys_reboot(SYS_REBOOT_COLD);
-                return -1;
-            }}
-        }}
-        printf("modelblaster_pool[kind=%d]: %u helpers (intra-op), "
-               "%d scheduler worker(s)\\n",
-               k, (unsigned)(pools[k] ? modelblaster_pool_get_threads_count((modelblaster_pool_t)pools[k]) : 0),
-               n_workers_k);
+    /* Build one pool for each distinct composite target. This preserves both
+     * the exact width and exact harts selected by XPU-RT. Singleton entries
+     * deliberately receive NULL and execute on their owning worker. */
+    int entry_runtime_rc = init_entry_runtime();
+    if (entry_runtime_rc != 0) {{
+        printf("FATAL: composite-target runtime init failed rc=%d\\n",
+               entry_runtime_rc);
+        sys_reboot(SYS_REBOOT_COLD);
+        return -1;
     }}
 
-{chr(10).join(state_inits)}
-
-    /* Bind each (network, kind) state struct's `.pool` to the matching
-     * `pools[k]`. Done once here, before workers spawn — the worker
-     * dispatch path no longer writes to `s_<m>_<kind>.pool`. */
-{chr(10).join(state_pool_assigns)}
+    /* Dispatch-local state selects pool_for_entry(e), so the same model may
+     * alternate singleton, two-hart, and four-hart implementations. */
 
 {chr(10).join(reset_calls)}
 
@@ -1185,10 +1226,11 @@ int main(void)
 
 {chr(10).join(print_blocks)}
 
-    for (int k = 0; k < {n_kinds}; k++) {{
-        if (pools[k] != NULL) {{
-            modelblaster_pool_destroy((modelblaster_pool_t)pools[k]);
-        }}
+    for (int p = 0; p < g_n_entry_pools; p++) {{
+        modelblaster_pool_destroy(g_entry_pools[p].pool);
+    }}
+    for (int h = 0; h < XPURT_MAX_HARTS; h++) {{
+        pthread_mutex_destroy(&g_hart_locks[h]);
     }}
 #ifndef MODELBLASTER_PLATFORM_LINUX
     /* Zephyr: a bare-metal run ends by rebooting the board, so the harness

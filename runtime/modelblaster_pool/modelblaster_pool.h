@@ -28,12 +28,10 @@
  *    builds; the bench measured the POSIX layer cost as essentially
  *    zero on top of k_thread.
  *
- *  - We use Zephyr `k_sem` (not POSIX sem_t) for the rendezvous because
- *    the bench harness measured it as the cheapest cross-hart wakeup
- *    primitive available on the platform. The pool object is therefore
- *    Zephyr-only at runtime; any non-Zephyr port would swap k_sem for
- *    a POSIX equivalent and rely on the bench's "POSIX layer is free"
- *    finding.
+ *  - Zephyr uses `k_sem` for the rendezvous because the bench harness measured
+ *    it as the cheapest cross-hart wakeup primitive there. Hosted Linux uses
+ *    mutexes and condition variables behind the same API. Both ports pin
+ *    helpers to the explicit hart set supplied by the schedule runtime.
  *
  *  - Master participates in its own slice (slice index 0). The master
  *    posts start sems for workers 1..N-1, runs slice 0, then takes done
@@ -71,6 +69,14 @@ typedef struct modelblaster_pool_state *modelblaster_pool_t;
  * partial failure during create we tear down anything we already
  * allocated and return NULL — never leak workers. */
 modelblaster_pool_t modelblaster_pool_create(int n_workers);
+
+/* Create the same pool on an explicit ordered hart set. ``harts[0]`` is the
+ * calling/master thread (the caller is responsible for already being pinned
+ * there); helper w is pinned to ``harts[w]``. This is the schedule-runtime
+ * form: a shard on CPU_E#0..#3 must use physical harts 4..7, not the legacy
+ * implicit 0..3 mapping. */
+modelblaster_pool_t modelblaster_pool_create_on_harts(
+    int n_workers, const int *harts);
 
 /* Tear down: post a "die" signal to every worker, join them, free the
  * state. Safe on a NULL pointer (no-op). */
