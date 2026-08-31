@@ -109,8 +109,24 @@ foreach(_i RANGE ${_last})
             message(FATAL_ERROR "MODEL_DIRS_BASE[${_i}]/${_PRIMARY_BS}='${_primary_dir}' missing ${_required}")
         endif()
     endforeach()
-    configure_file("${_primary_dir}/model.h"   "${_STAGE_DIR}/${_name}_model.h"   COPYONLY)
-    configure_file("${_primary_dir}/test_io.h" "${_STAGE_DIR}/${_name}_test_io.h" COPYONLY)
+    # Neither model.h nor test_io.h is COPIED into the stage dir. Two
+    # reasons, and they interact:
+    #   1. generate_skeleton emits `#include "model.h"` inside test_io.h,
+    #      and a quoted include resolves against the INCLUDING file's own
+    #      directory first. After a copy that is _STAGE_DIR, where the
+    #      header is named <name>_model.h and plain model.h does not
+    #      exist -> "fatal error: model.h: No such file or directory".
+    #   2. Copying model.h but not test_io.h then makes the copy and the
+    #      original two distinct files, so `#pragma once` fires twice and
+    #      every type in model.h is redefined ("conflicting types for
+    #      model_<m>_op_record_t").
+    # Staging both as one-line forwarders keeps a single physical
+    # translation of each header, so #pragma once works and every quoted
+    # include inside them resolves from generated/<backend>/.
+    file(WRITE "${_STAGE_DIR}/${_name}_model.h"
+         "#pragma once\n#include \"${_primary_dir}/model.h\"\n")
+    file(WRITE "${_STAGE_DIR}/${_name}_test_io.h"
+         "#pragma once\n#include \"${_primary_dir}/test_io.h\"\n")
 
     # Per-(model, backend) OBJECT lib over model.c + kernels.c, with -D
     # renames so the externally-visible symbols don't collide across

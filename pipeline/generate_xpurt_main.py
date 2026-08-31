@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import glob
 import os
 import re
 
@@ -71,12 +72,71 @@ def _c_ident(name: str) -> str:
     return name.replace(".", "_").replace("-", "_")
 
 
+def _model_input_members(gen_dir: str | None, net: str, mid: str) -> list[str]:
+    """Return the state struct's input member names for `net`.
+
+    Single-input models declare one `input` member; multi-input models
+    (e.g. fused_full, which takes camera + ToF + flow/IMU tensors) declare
+    `input0`, `input1`, ... . This used to be hardcoded to `.input`, which
+    compiled for dronet/yolov8/mlp_control but broke on the first
+    multi-input model in a scheduled build:
+
+        error: 'model_fused_full_state_t' has no member named 'input'
+        error: 'model_fused_full_test_input' undeclared
+                (did you mean 'model_fused_full_test_input2'?)
+
+    The per-model header is located by CONTENT rather than by a passed-in
+    path: at the time this generator runs, the `<net>_model.h` copies do
+    not exist yet (harness_xpurt/CMakeLists.txt stages those into
+    <build>/modelblaster_xpurt/ later), but every model's own
+    examples/<exdir>/<quant>/generated/<backend>/model.h is already on
+    disk. We pick the one declaring `model_<mid>_state_t`.
+
+    Falls back to the single-input form when nothing is found, preserving
+    the previous behaviour for every model that has one input.
+    """
+    cands: list[str] = []
+    if gen_dir:
+        # Explicit per-model generated dir (net=path from --model-gen-dir).
+        # REQUIRED for correctness, not just speed: arity is a property of
+        # the (quant, backend) actually being built. fused_full's fp16
+        # build has ONE input while its int8 build has THREE, so guessing
+        # from a repo-wide glob can silently pick the wrong variant.
+        cands.append(os.path.join(gen_dir, "model.h"))
+        cands.append(os.path.join(gen_dir, f"{net}_model.h"))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cands += sorted(glob.glob(os.path.join(
+        repo, "examples", "*", "*", "generated", "*", "model.h")))
+    needle = f"model_{mid}_state_t"
+    for hdr in cands:
+        try:
+            text = open(hdr).read()
+        except OSError:
+            continue
+        if needle not in text:
+            continue
+        members = re.findall(r"\*\s*(input\d*)\s*;", text)
+        seen: list[str] = []
+        for m in members:
+            if m not in seen:
+                seen.append(m)
+        if not seen:
+            continue
+        if seen == ["input"]:
+            return seen
+        return sorted((m for m in seen if m != "input"),
+                      key=lambda m: int(m[len("input"):] or 0))
+    return ["input"]
+
+
 def _emit(networks: list[str], schedule_name: str,
           dispatch_table_header: str,
           core_kinds: list[str],
           backends: list[str],
           pool_sizes: list[int],
-          n_instances: dict[str, int]) -> str:
+          n_instances: dict[str, int],
+          gen_dir: str | None = None,
+          model_gen_dirs: dict[str, str] | None = None) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -147,8 +207,18 @@ def _emit(networks: list[str], schedule_name: str,
             state_decls.append(
                 f"    model_{mid}_state_t s_{mid}_{kind};"
             )
+            in_members = _model_input_members(
+                (model_gen_dirs or {}).get(net), net, mid)
+            if in_members == ["input"]:
+                in_lines = f"    s_{mid}_{kind}.input  = model_{mid}_test_input;\n"
+            else:
+                # multi-input: .input0 = ..._test_input0, .input1 = ..., ...
+                in_lines = "".join(
+                    f"    s_{mid}_{kind}.{m}  = model_{mid}_test_{m};\n"
+                    for m in in_members
+                )
             state_inits.append(
-                f"    s_{mid}_{kind}.input  = model_{mid}_test_input;\n"
+                in_lines +
                 f"    s_{mid}_{kind}.output = out_{mid};\n"
                 f"    s_{mid}_{kind}.pool   = NULL;"
             )
@@ -211,7 +281,9 @@ def _emit(networks: list[str], schedule_name: str,
             bs_select_lines.append(
                 f'            {kw} (strcmp(e_->core_kind, "{bs}") == 0) {{\n'
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
+                f"                /* guard is opened around the TIMED region below */\n"
                 f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{bs});\n"
+                f"                /* guard closes after the end timestamp */\n"
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
                 f"            }}"
             )
@@ -255,6 +327,7 @@ def _emit(networks: list[str], schedule_name: str,
             ) + "\n"
             f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n"
             f"            }}\n"
+            f"            XPURT_DISPATCH_GUARD_ENTER();\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].start_cycles =\n"
             f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
@@ -265,6 +338,7 @@ def _emit(networks: list[str], schedule_name: str,
             f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
             f"            xpurt_trace[i_].worker_kind_idx = my_kind_idx;\n"
             f"#endif\n"
+            f"            XPURT_DISPATCH_GUARD_EXIT();\n"
             f"            if (e_->dispatch_id == MODEL_{umid}_OP_COUNT - 1) {{\n"
             f"                wall_cycles_{mid}[e_->instance] =\n"
             f"                    (uint64_t)k_cycle_get_64() - wall_start_{mid}[e_->instance];\n"
@@ -285,6 +359,18 @@ def _emit(networks: list[str], schedule_name: str,
             int n_records = 0;
             const model_{mid}_op_record_t *records =
                 model_{mid}_profile_records_{bs}(&n_records);
+            /* Clamp to the model's own op count. Unbounded, this loop walked
+             * off the end of the record array on long ViNT runs and faulted
+             * in printf's strnlen() on a garbage name pointer -- AFTER the
+             * run, its full XPURT_TRACE and every model's OUTPUT block had
+             * been emitted, so it destroyed a completed run's exit status
+             * for a dump that XPURT_TRACE already duplicates. */
+            if (records == NULL || n_records < 0
+                    || n_records > MODEL_{umid}_OP_COUNT) {{
+                printf("{bs},PROFILE_RECORDS_INVALID,n=%d,cap=%d\\n",
+                       n_records, (int)MODEL_{umid}_OP_COUNT);
+                n_records = 0;
+            }}
             for (int i = 0; i < n_records; i++) {{
                 printf("{bs},%d,%s,%s,%s,%lu\\n",
                        records[i].dispatch_id,
@@ -451,6 +537,41 @@ def _emit(networks: list[str], schedule_name: str,
  * dependents take it before invoking. Initialized as 0/1 (binary, but
  * grow the limit so multiple consumers can each take their own
  * "completed" reading without blocking each other). */
+
+/* XPURT_DISPATCH_GUARD: mask this hart's interrupts around ONE kernel call.
+ *
+ * On the Saturn RVV configs here, a trap taken while a vector kernel runs can
+ * return with exactly one scalar register corrupted -- deterministic,
+ * bit-reproducible, invisible on spike (see harness/src/main.c, which masks
+ * for the WHOLE inference via MODELBLASTER_MASK_IRQ_DURING_RUN).
+ *
+ * Symptom here (ViNT, scheduled harness):
+ *     mcause: 5, Load access fault
+ *     mepc -> z_riscv_vstate_restore_thread  (arch/riscv/core/v.c)
+ *     ra   -> kernel_sigmoid_s8_vint_gemmini_q31
+ * a corrupted vector-context pointer on the restore path. Probabilistic in
+ * run length: the 605-dispatch vint-only schedule and the 1546-dispatch
+ * seed2 passed; the ~2000-dispatch / ~5.6 s points faulted.
+ *
+ * harness/src/main.c warns "a thread pool or several models concurrently
+ * must NOT do this" -- that is about holding the lock across BLOCKING work.
+ * Here it is held only across one kernel call: every k_sem wait, scheduler
+ * decision and bookkeeping happens outside it. The two workers are pinned
+ * one-per-hart and the intra-op pool has 0 helpers, so a hart never has a
+ * second runnable worker to starve, and irq_lock() masks only this hart.
+ *
+ * XPURT_DISPATCH_IRQ_GUARD=0 disables it (reproduces the fault). */
+#if !defined(XPURT_DISPATCH_IRQ_GUARD)
+#define XPURT_DISPATCH_IRQ_GUARD 1
+#endif
+#if XPURT_DISPATCH_IRQ_GUARD
+#define XPURT_DISPATCH_GUARD_ENTER() unsigned int _xpurt_irq_key = irq_lock()
+#define XPURT_DISPATCH_GUARD_EXIT()  irq_unlock(_xpurt_irq_key)
+#else
+#define XPURT_DISPATCH_GUARD_ENTER() do {{ }} while (0)
+#define XPURT_DISPATCH_GUARD_EXIT()  do {{ }} while (0)
+#endif
+
 static struct k_sem completion_sems[{upper}_N_ENTRIES];
 
 /* One state struct per (network, kind). `.pool` is bound to the kind's
@@ -707,6 +828,14 @@ def main() -> None:
                          "forward-declares MODEL_<UMID>_DISPATCH_FNS_<BS> for "
                          "each backend and dispatches by core_kind. "
                          "Defaults to --core-kinds.")
+    ap.add_argument("--model-gen-dir", action="append", default=[],
+                    metavar="NET=PATH",
+                    help="per-network generated dir (repeatable). Used to read "
+                         "each model's model.h for input arity -- required "
+                         "because a model's input count can differ between "
+                         "quants/backends (fused_full: 1 input at fp16, 3 at "
+                         "int8). Without it the generator falls back to a "
+                         "repo-wide search and then to the single-input form.")
     ap.add_argument("--registry", default=None,
                     help="path to the cores/*.json registry that drove the "
                          "schedule. Used to derive each kind's pool size as "
@@ -789,7 +918,10 @@ def main() -> None:
     pool_sizes = [pool_sizes_map.get(k, 0) for k in core_kinds]
 
     src = _emit(networks, args.name, args.dispatch_table_header,
-                core_kinds, backends, pool_sizes, n_instances)
+                core_kinds, backends, pool_sizes, n_instances,
+                gen_dir=os.path.dirname(args.out),
+                model_gen_dirs=dict(
+                    kv.split("=", 1) for kv in args.model_gen_dir if "=" in kv))
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
