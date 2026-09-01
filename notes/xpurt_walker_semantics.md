@@ -70,7 +70,9 @@ typedef struct {
     const char    *name;             // IR node name
     const char    *core_name;        // "rocket0" / "rvv0"
     const char    *core_kind;        // "rvv" | "gemmini" | "scalar"
-    int            hart;             // preferred hart, -1 if unbound
+    int            hart;             // master hart, -1 if unbound
+    int            n_harts;          // complete reserved machine combination
+    const int     *harts;             // master followed by helper harts
     float          start_time_ms;    // schedule-issued start
     float          duration_ms;      // schedule-modeled duration
     int            n_deps;
@@ -85,16 +87,25 @@ The table is monotonic in `start_time_ms` — workers walk it in this order.
 
 `generate_xpurt_main.py::_emit` produces a single C source. Layout:
 
-### 3.1 Per-network state, per-entry sync, per-kind pool
+### 3.1 Dispatch-local state, per-entry sync, exact-hart pools
 
 ```c
-static model_<m>_state_t  s_<m>;           // ONE state struct per network m
-static <out_t>            out_<m>[...];    // shared output buffer
+static <out_t>            out_<m>[...];        // shared output buffer
 
 static struct k_sem completion_sems[N_ENTRIES];   // one per entry
-static void *pools[N_KINDS] = { NULL };           // per-kind modelblaster_pool
+static entry_pool_t entry_pools[MAX_POOLS];       // one per distinct hart set
+static pthread_mutex_t hart_locks[MAX_HARTS];     // physical-core exclusion
 static uint64_t run_t0;                            // mtime baseline at worker spawn
 ```
+
+Immediately before invoking a dispatch, the walker creates a local
+`model_<m>_state_t` whose `.pool` is selected from the entry's full `harts[]`
+set. Singleton entries receive `NULL`; two- and four-hart entries receive the
+persistent pool pinned to exactly those harts. This is what permits different
+instances of one model to select different widths without racing on a shared
+`.pool` field. The walker locks every reserved physical hart in sorted order
+and releases in reverse order, so schedule workers and pool helpers cannot
+oversubscribe a core when measured execution drifts from predicted time.
 
 Crucial specs (and where the current code gets them wrong — see §4.5):
 
@@ -149,11 +160,12 @@ if (e_->time_dep_entry_id >= 0) {
     k_sem_give(&completion_sems[e_->time_dep_entry_id]);
 }
 
-// (c) PER-INSTANCE START GATE — only on dispatch_id==0
+// (c) PER-ENTRY START GATE — every root and every zero-cost entry included
+uint64_t target = run_t0 +
+    (uint64_t)(e_->start_time_ms * XPURT_CYCLES_PER_MS);
+while ((uint64_t)k_cycle_get_64() < target) k_yield();
+
 if (e_->dispatch_id == 0) {
-    uint64_t target = run_t0 +
-        (uint64_t)(e_->start_time_ms * XPURT_CYCLES_PER_MS);
-    while ((uint64_t)k_cycle_get_64() < target) k_yield();
     model_<m>_reset_profile_<bs>();    // reset all backends' counters
     wall_start_<m> = k_cycle_get_64();
 }
@@ -224,24 +236,20 @@ worker.
 Concurrent cross-kind dispatch into one network exposed several races
 in the previous emitter. Status as of now:
 
-1. **`s_<m>.pool` write race — FIXED.** Previously the worker did
-   `s_<m>.pool = pools[my_kind_idx];` per-dispatch on a single shared
-   `s_<m>`. The emitter now declares one state struct per
-   (network, kind) — `s_<m>_<kind>` — with `.pool` bound once in
-   `main()` after pool creation. The dispatch path uses
-   `&s_<m>_<core_kind>` and never writes the pool field; concurrent
-   workers across kinds reference disjoint state. Intermediate
-   buffers stay in the per-model `buffers.c` (extern from every
-   `(network, kind)` state's owner), so cross-kind data flow is
-   unchanged.
+1. **`s_<m>.pool` write race — FIXED.** Previously the worker mutated one
+   shared state, and the first fix bound one state per `(network, kind)`.
+   Per-dispatch widths require finer granularity: the current dispatch path
+   creates a local state and binds `.pool = pool_for_entry(e_)`. Concurrent
+   workers therefore never share the pool field. Intermediate buffers remain
+   in the per-model `buffers.c`, so cross-kind data flow is unchanged.
 
-2. **Profile counters race within a backend — STILL LATENT.**
+2. **Profile counters race within a backend — STILL A DIAGNOSTIC LIMITATION.**
    `model.c`'s file-static `int n_;` and `records_[n_++]` are
-   per-`(model, backend)` TU but not per-thread. Today only one
-   worker per kind exists, so no two concurrent ops share a single
-   `(model, backend)` `n_`. **Will break** the moment we add
-   multi-hart-per-kind workers. Track in task #64 — fix shape: atomic
-   `n_` or per-worker record arrays merged at end.
+   per-`(model, backend)` TU but not per-thread. Multiple same-backend
+   scheduler workers can race on this diagnostic array. The independent
+   XPU-RT trace has one slot per schedule entry and is not affected; profile
+   record ordering/count must not be used as execution evidence until `n_` is
+   atomic or records are kept per worker and merged.
 
 3. **`wall_start_<m>` / `wall_cycles_<m>` per-instance race — FIXED.**
    The emitter now allocates `wall_start_<m>[K]` and
@@ -290,10 +298,13 @@ just shifted in `start_time`.
 
 Two mechanisms enforce the period:
 
-1. **Soft start gate** (step **(c)**, only on `dispatch_id==0`): busy-yield
-   until `k_cycle_get_64() >= run_t0 + start_time_ms*cycles_per_ms`. Models
-   "task wakes at deterministic boundary, then runs as fast as it can" —
-   subsequent ops are NOT gated, they chain via data deps and run back-to-back.
+1. **Soft start gate** (step **(c)**, on every entry): after its dependencies,
+   busy-yield until
+   `k_cycle_get_64() >= run_t0 + start_time_ms*cycles_per_ms`. Gating only
+   `dispatch_id==0` was incorrect for multi-root DAGs because another root of
+   a later periodic instance could run before release. Dependencies and the
+   absolute gate are lower bounds; resource drift may still start an entry
+   later.
 2. **Cross-job edges** (`time_dep_entry_id`): scheduler-issued. If a periodic
    instance must complete before some other-network entry runs, the edge
    serializes them via the completion sem.
@@ -320,14 +331,15 @@ Auditing `generate_xpurt_main.py` + `model.c` against that:
 |---|---|---|---|
 | 1 | Independent ops within a network can start concurrently across kinds. | **OK** — workers walk independently, gated only by `deps[]`/`time_dep_entry_id`. No global "one network at a time" lock. | `generate_xpurt_main.py:_emit` outer worker loop |
 | 2 | Data flow correct under concurrent dispatch. | **OK** — intermediate buffers live in a shared per-model `buffers.c` (one TU per model, not per backend), so cross-kind dispatches in the same network read each other's writes. | `modelblaster/examples/dronet/int8/generated/rvv/model.c:218` extern decls |
-| 3 | Intra-op fanout uses the *running kind's* pool. | **OK** (was broken; landed). The walker now declares `s_<m>_<kind>` per (network, kind), `.pool` is bound once in `main()`, and the dispatch path passes `&s_<m>_<core_kind>` so two kinds dispatching the same network never share a state struct. | `generate_xpurt_main.py` state_decls / state_pool_assigns |
-| 4 | Profile records correctly attribute cycles to their backend. | **OK for current shape** — `n_`/`records_[]` are file-static per `(model, backend)` TU, and we run one worker per kind, so no two concurrent ops share a `(model, backend)`'s `n_`. **Will break** if we ever add multi-hart-per-kind workers. | `model.c:254` |
+| 3 | Intra-op fanout uses the dispatch's exact hart-set pool. | **OK** (was broken; landed). The dispatch-local state receives `pool_for_entry(e_)`; persistent pools are keyed by the complete ordered hart set. | `generate_xpurt_main.py` `pool_for_entry`, dispatch-local state |
+| 4 | Profile records correctly attribute cycles to their backend. | **LIMITED** — backend attribution is correct, but same-backend workers can race on the diagnostic `n_`/`records_[]`. The per-entry XPU-RT trace used for schedule validation is separate and race-free. | generated `model.c`; `xpurt_trace[i_]` |
 | 5 | Periodic-instance wall cycles correctly attributed. | **OK** (was broken; landed). `wall_start_<m>[K]` / `wall_cycles_<m>[K]` arrays indexed by `e_->instance`; per-instance lines printed under `MODELBLASTER_WALL_CYCLES_INST [<net>#<inst>]`, summary line under the existing `MODELBLASTER_WALL_CYCLES [<net>]` keeps streamed-runner counters intact. | `generate_xpurt_main.py` `wall_decls`, print_blocks |
 | 6 | Deadlock-free walk. | **OK** — invariant `time_dep_id < entry_id` (and `dep_id < entry_id`) is now asserted at ingest time and fails fast on out-of-spec scheduler output. | `ingest_xpurt_schedule.py::load` |
-| 7 | Per-instance start time honored on `dispatch_id==0`. | **OK** — busy-yield on `k_cycle_get_64()`. The emitter still resets every backend's `model_<m>_reset_profile_<bs>()` at the gate, which is correct (each backend's `records_/n_` arrays get a clean slate per instance, even if the instance crosses kinds). | step (c) in §3.3 |
-| 8 | Single-kind-multi-hart concurrency. | **Not supported.** Single worker per kind. Today's schedules don't need it; if a registry declares `harts=[a,b]` for one kind, the walker only uses one of them. Combined with the row-4 caveat: a future multi-hart-per-kind change requires both more workers AND atomic profile counters. | `_emit` thread spawn loop |
+| 7 | No entry runs before its schedule-issued start. | **OK** — every entry, including independent nonzero roots and zero-cost entries, gates on `run_t0 + start_time_ms`. Restricting this gate to `dispatch_id==0` previously let later roots run before their periodic release. Profile reset/wall-start bookkeeping remains conditional on dispatch 0. | step (c) in §3.3 |
+| 8 | Single-kind multi-hart scheduling and intra-op fanout. | **OK on the Linux K1 path.** One scheduler worker is pinned per `(kind, hart)`; composite entries lock their full hart set and use a pool pinned to those exact harts. Ten complete real-time feedback runs exercised 2- and 4-hart blocks with zero misses. The profile-record caveat in row 4 remains. | `_emit` worker spawn loop; `init_entry_runtime`; exact-cycle board logs |
 | 9 | Per-bitstream hart count comes from one place. | **OK** — `harness_xpurt/prj.conf` no longer sets `CONFIG_MP_MAX_NUM_CPUS`; `run.sh` always applies a per-target overlay (`spike_quad.conf` / `firesim_chipyard.conf` / `firesim_chipyard_dual_gemmini.conf`) and fails fast if none is found. | `modelblaster/harness/backends/*.conf` + `xpurt_demo/run.sh` |
 | 10 | IR-vs-codegen `dispatch_id` are kept consistent. | **OK** — ingest now remaps each schedule entry's IR `dispatch_id` to the codegen-space index (zero-cost ops → -1 sentinel). The walker short-circuits on `dispatch_id < 0` (still posts the completion sem so dependents unblock). Closes the "table indexed past its end → garbage `jalr` to `0x01e2f185f0fe15ec`" crash that was masquerading as a sync bug on FireSim. | `ingest_xpurt_schedule.py::load` remap, `_emit` early-out |
+| 11 | Multi-network output is checked only after a complete DAG instance. | **OK on the Linux K1 path.** An atomic per-instance completion count captures instance 0 after every dispatch, including multiple output leaves, then compares it with the baked one-invocation golden. Twenty exact-cycle runs pass: integer models bit-exact and FP16 `fused_full` within `1e-2`. | `_emit` `completed_dispatches_*`; `board_result.json` golden audits |
 
 ### Validation
 
