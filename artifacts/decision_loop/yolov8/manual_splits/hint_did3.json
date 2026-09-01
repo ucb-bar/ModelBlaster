@@ -1,0 +1,5 @@
+{
+  "contract": "modelblaster.split_hints/v1",
+  "reason": "manual yolov8 split: dispatch_3 along OC into 2 tiles",
+  "networks": [{"network": "yolov8_nano", "split_ops": [{"op": 3, "n_splits": 2}]}]
+}

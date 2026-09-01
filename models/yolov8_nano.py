@@ -21,9 +21,12 @@ backbone/neck channel counts are identical; head re-init to a smaller
 `nc` would be a fine-tune-time concern, out of scope here.
 
 Env knobs:
-  MODELBLASTER_YOLOV8N_INPUT       default 160 (must be a multiple of 32)
+  MODELBLASTER_YOLOV8N_INPUT       default 160. `96` = square, `64x96` = H x W.
+                                   Every dimension must be a multiple of 32.
   MODELBLASTER_YOLOV8N_NC          default 80 (COCO classes)
-  MODELBLASTER_YOLOV8N_PRETRAINED  default 1 (load yolov8n.pt; 0 → random init)
+  MODELBLASTER_YOLOV8N_PRETRAINED  default 1 (load weights; 0 → random init)
+  MODELBLASTER_YOLOV8N_WEIGHTS     default yolov8n.pt. A fine-tuned checkpoint
+                                   may use any nc; the stock one is COCO-80.
 """
 
 from __future__ import annotations
@@ -323,16 +326,51 @@ def _ultra_to_local_key(ultra_key: str) -> Optional[str]:
     return None
 
 
-def _load_ultralytics_weights(model: YOLOv8Nano) -> int:
-    """Stream weights from yolov8n.pt into model. Returns count copied."""
+#: The stock COCO checkpoint. Anything else is a fine-tune, and the two are
+#: treated differently: see `get_model`.
+STOCK_WEIGHTS = "yolov8n.pt"
+
+
+def weights_path() -> str:
+    return os.environ.get("MODELBLASTER_YOLOV8N_WEIGHTS", STOCK_WEIGHTS)
+
+
+def _load_ultralytics_weights(model: YOLOv8Nano, path: str | None = None) -> int:
+    """Stream weights from an ultralytics checkpoint into model.
+
+    `path` defaults to the stock COCO yolov8n.pt. A custom fine-tune is passed
+    through MODELBLASTER_YOLOV8N_WEIGHTS -- without which a retrained model
+    could not be built here at all, because this used to hardcode the stock
+    filename and there was no way to name another.
+
+    Resolution does not appear here, and that is worth stating: conv and BN
+    weight shapes depend on channel counts, not on input size. So a checkpoint
+    trained at 64x96 loads into a model configured for any resolution. What
+    must match is `nc` and the width multiple; what must NOT be assumed to
+    match is the input geometry, which is set separately by
+    MODELBLASTER_YOLOV8N_INPUT and has to agree with how the model was trained
+    and with the board preprocess.
+    """
+    # Path check BEFORE the import, so a mistyped checkpoint is reported as a
+    # mistyped checkpoint even in an environment without ultralytics. The
+    # reverse order hides the specific error behind the generic one.
+    path = path or weights_path()
+    if not os.path.exists(path) and path != STOCK_WEIGHTS:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_WEIGHTS={path!r} does not exist. "
+            f"Point it at the trained .pt, or unset it to use {STOCK_WEIGHTS}.")
     try:
         from ultralytics import YOLO
     except ImportError as e:
         raise RuntimeError(
-            "ultralytics not installed. `pip install ultralytics` and retry, "
-            "or set MODELBLASTER_YOLOV8N_PRETRAINED=0 to use random init."
+            f"failed to import ultralytics ({e}). If ultralytics itself is "
+            "already installed, this is likely a missing system dependency "
+            "of one of ITS dependencies (e.g. opencv-python needs libgl1) -- "
+            "see the chained traceback above for the actual failing import. "
+            "`pip install ultralytics` if it's genuinely missing, or set "
+            "MODELBLASTER_YOLOV8N_PRETRAINED=0 to use random init instead."
         ) from e
-    yolo = YOLO("yolov8n.pt")
+    yolo = YOLO(path)
     src_state = yolo.model.state_dict()
     dst_state = model.state_dict()
     n_copied = 0
@@ -358,13 +396,55 @@ def _load_ultralytics_weights(model: YOLOv8Nano) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _cfg() -> tuple[int, int, bool]:
-    img = int(os.environ.get("MODELBLASTER_YOLOV8N_INPUT", 160))
-    if img % 32 != 0:
+def parse_input_size(raw: str) -> tuple[int, int]:
+    """`"96"` -> (96, 96); `"64x96"` or `"64,96"` -> (64, 96), as (H, W).
+
+    WHY RECTANGULAR INPUT EXISTS. A square input forces a non-square camera
+    frame to be letterboxed, and the padding is then convolved at full cost
+    through the entire backbone. For a 90x60 (WxH) FPV frame letterboxed into
+    96x96, a third of every tensor is constant grey -- measured against the
+    fitted per-shape cost model, 88.5 ms of which ~26 ms buys nothing.
+
+    Matching the aspect instead (64x96 for a 3:2 frame) keeps every real pixel
+    and drops the padding to zero. It is not a speed/accuracy trade; it is
+    declining to convolve over grey bars.
+
+    Both dimensions must be multiples of 32 -- YOLOv8's deepest level
+    downsamples by 32, so a non-multiple has no valid stride-32 feature map.
+    """
+    txt = str(raw).strip().lower().replace(",", "x")
+    parts = [p for p in txt.split("x") if p]
+    try:
+        vals = [int(p) for p in parts]
+    except ValueError:
         raise SystemExit(
-            f"MODELBLASTER_YOLOV8N_INPUT={img} must be a multiple of 32 "
-            f"(YOLOv8 stride-32 head requires it)."
-        )
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r} is not a size. Use `96` for "
+            f"square or `64x96` for rectangular (H x W).")
+    if len(vals) == 1:
+        h = w = vals[0]
+    elif len(vals) == 2:
+        h, w = vals
+    else:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r} has {len(vals)} dimensions; "
+            f"want 1 (square) or 2 (H x W).")
+    bad = [n for n in (h, w) if n <= 0 or n % 32 != 0]
+    if bad:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r}: {bad} not a positive "
+            f"multiple of 32 (YOLOv8 stride-32 head requires it).")
+    return h, w
+
+
+def _cfg() -> tuple[tuple[int, int], int, bool]:
+    """`((H, W), nc, pretrained)`.
+
+    The first element became a PAIR rather than an int when rectangular input
+    landed. Every caller unpacks it as `img`, so an accidental `(img, img)`
+    downstream would now build a 4-D shape and fail loudly rather than
+    silently squaring one dimension.
+    """
+    img = parse_input_size(os.environ.get("MODELBLASTER_YOLOV8N_INPUT", "160"))
     nc = int(os.environ.get("MODELBLASTER_YOLOV8N_NC", 80))
     pretrained = os.environ.get("MODELBLASTER_YOLOV8N_PRETRAINED", "1") == "1"
     return img, nc, pretrained
@@ -375,17 +455,23 @@ def get_model(seed: int = 0):
     torch.manual_seed(seed)
     m = YOLOv8Nano(nc=nc)
     if pretrained:
-        if nc != 80:
-            # Backbone+neck weights still load; the cv3 head's last conv has
-            # nc-dependent shape and would shape-mismatch. Refuse to silently
-            # skip — force the user to acknowledge.
+        wp = weights_path()
+        if nc != 80 and wp == STOCK_WEIGHTS:
+            # The STOCK checkpoint is COCO-80. Its cv3 head's last conv is
+            # nc-dependent and would shape-mismatch, so refuse rather than
+            # silently skip those tensors and ship a randomly-initialised head.
             raise SystemExit(
-                f"MODELBLASTER_YOLOV8N_NC={nc} ≠ 80 with pretrained weights: cv3 "
-                f"head shapes don't match. Set MODELBLASTER_YOLOV8N_PRETRAINED=0 "
-                f"or fine-tune from a custom checkpoint (out of scope here)."
+                f"MODELBLASTER_YOLOV8N_NC={nc} != 80 against the stock "
+                f"{STOCK_WEIGHTS}: the cv3 head shapes do not match. Either set "
+                f"MODELBLASTER_YOLOV8N_WEIGHTS=<your fine-tuned .pt>, or set "
+                f"MODELBLASTER_YOLOV8N_PRETRAINED=0 for random init."
             )
-        n = _load_ultralytics_weights(m)
-        print(f"yolov8_nano: loaded {n} pretrained tensors from yolov8n.pt")
+        # A custom checkpoint is allowed any nc. It is not trusted, though:
+        # _load_ultralytics_weights raises on any per-tensor shape mismatch, so
+        # a checkpoint whose head disagrees with MODELBLASTER_YOLOV8N_NC fails
+        # loudly and names the tensor, rather than loading a partial head.
+        n = _load_ultralytics_weights(m, wp)
+        print(f"yolov8_nano: loaded {n} pretrained tensors from {wp} (nc={nc})")
     m.eval()
     return m
 
@@ -429,11 +515,11 @@ def get_sample_input(seed: int = 1) -> torch.Tensor:
             from PIL import Image  # noqa: PLC0415
             from torchvision import transforms  # noqa: PLC0415
             tfm = transforms.Compose([
-                transforms.Resize((img, img)),
+                transforms.Resize(img),   # (H, W)
                 transforms.ToTensor(),  # HWC [0,255] -> CHW [0,1]
             ])
             pil = Image.open(p).convert("RGB")
-            return tfm(pil).unsqueeze(0)  # (1, 3, img, img)
+            return tfm(pil).unsqueeze(0)  # (1, 3, H, W)
         except Exception as e:
             print(f"[yolov8_nano.get_sample_input] WARN: couldn't load "
                   f"{p} ({e}); falling back to torch.randn.")
@@ -443,7 +529,7 @@ def get_sample_input(seed: int = 1) -> torch.Tensor:
           f"calibration). Set MODELBLASTER_YOLOV8N_CALIB_IMAGE to a "
           f"real RGB image to fix.")
     g = torch.Generator().manual_seed(seed)
-    return torch.randn(1, 3, img, img, generator=g)
+    return torch.randn(1, 3, img[0], img[1], generator=g)
 
 
 def get_calibration_spec(num_samples: int = 16) -> dict:
@@ -480,7 +566,13 @@ def get_calibration_spec(num_samples: int = 16) -> dict:
             "x": {
                 "loader": "image_dir",
                 "path": src,
-                "image_size": [img, img],
+                # [W, H] -- the image_dir loader's order, NOT (H, W).
+                # `img` is (H, W) to match NCHW and transforms.Resize, so it
+                # has to be reversed here. This was invisible while the input
+                # was square, and the first rectangular build extracted a
+                # 96x64 graph from a 64x96 request: silently transposed, and
+                # the shapes still looked plausible all the way to the board.
+                "image_size": [img[1], img[0]],
                 "normalize": "none",
                 "compose": {"kind": "one_per_sample"},
             },

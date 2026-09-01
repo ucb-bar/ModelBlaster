@@ -67,6 +67,19 @@ _EXTRA_COLUMNS = [
     "op",       # raw IR op kind, e.g. linear, conv2d_s8
     "shape",    # the IR-side shape descriptor, e.g. M=1;K=256;N=128
     "cycles",   # raw cycle count from the harness (pre-ns conversion)
+    # Sample count and spread when the run used MODELBLASTER_ITERS>1. Without
+    # these a cost is indistinguishable from a single sample, and an advisor
+    # cannot tell a 10% "win" from run-to-run noise -- which is the difference
+    # between a recommendation and a guess.
+    "cycles_n",
+    "cycles_cv_pct",
+    # What actually executed: "curated[rvv]/rvv_oc_blocked", "reference", ...
+    # Read from the build's kernel_picks.json at profile time. module_name
+    # cannot carry this -- its trailing segment is the SHAPE tag -- and
+    # without it "was this dispatch really vectorised?" has no answer in the
+    # profile, which is how 99.8% of yolov8_nano ran scalar inside a build
+    # labelled rvv_x60 without any artifact saying so.
+    "implementation",
 ]
 
 CSV_COLUMNS = _IREE_COLUMNS + _EXTRA_COLUMNS
@@ -84,6 +97,8 @@ class ProfileMeta:
     cpu: str              # CPU label (path component); often == source
     clock_mhz: float      # cycles → ns conversion factor
     artifacts_dir: str = ""  # optional: where the per-dispatch C lives
+    #: op -> "curated[rvv]/<algo>" | "reference", from kernel_picks.json.
+    picks: dict = field(default_factory=dict)
 
 
 def _shape_concise(shape: str) -> str:
@@ -99,7 +114,15 @@ def _shape_concise(shape: str) -> str:
             parts.append(f"{k}{v}")
         else:
             parts.append(kv)
-    return "x".join(parts) if parts else "scalar"
+    # NOT "scalar". This is a shape tag, and it lands in module_name right
+    # where a reader looks for the implementation -- so an op with no recorded
+    # shape produced `..._conv2d_batchnorm2d_silu_s8_scalar`, which reads as
+    # "this ran the scalar reference". It did, at the time, which is worse than
+    # if it had not: the coincidence made the label look like a working signal.
+    # Once the fused ops got real RVV kernels (22.9x on the board) the name
+    # still said `_scalar`, and a coverage gate reading it would have failed a
+    # build that was fine.
+    return "x".join(parts) if parts else "noshape"
 
 
 def _module_name(model: str, dispatch_id: int, backend: str,
@@ -142,6 +165,9 @@ def build_records(op_records: Iterable[dict], meta: ProfileMeta) -> list[dict]:
             "returncode": 0,
             "log_path": "",
             "source": meta.source,
+            "implementation": meta.picks.get(r["op"], ""),
+            "cycles_n": r.get("cycles_n", 1),
+            "cycles_cv_pct": r.get("cycles_cv_pct", ""),
             "op": r["op"],
             "shape": r["shape"],
             "cycles": cycles,
@@ -164,6 +190,28 @@ def output_path(out_root: str, meta: ProfileMeta) -> str:
         topo,
         "results.csv",
     )
+
+
+def picks_from_build(gen_dir: str) -> dict:
+    """op -> "<source>/<algorithm>" from a build's kernel_picks.json.
+
+    Returns {} when the file is absent, so a harness that never wrote one
+    still profiles -- the column is then empty, which reads as "unknown"
+    rather than as a false claim about what ran.
+    """
+    import json
+    path = os.path.join(gen_dir, "kernel_picks.json")
+    try:
+        with open(path) as fh:
+            picks = json.load(fh).get("picks", {})
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for op, pick in picks.items():
+        src = pick.get("source") or "?"
+        algo = pick.get("algorithm")
+        out[op] = f"{src}/{algo}" if algo else src
+    return out
 
 
 def write_profile(op_records: Iterable[dict], meta: ProfileMeta,

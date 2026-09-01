@@ -118,7 +118,9 @@ def get_precision_spec() -> dict:
     import os
     if os.environ.get("MB_FUSED_HYBRID", "1") == "0":
         return {"default": "int8"}     # pure int8 (no fp16 tail) — for the all-int8 build
-    tail = ["cat", "lstm_l0", "lstm_l1", "lstm_l2", "head"]
+    # Op names are the IR names this branch's FX int8 extractor emits: the
+    # nn.LSTM decomposes to one lstm_s8 per layer named "<module>.l<k>".
+    tail = ["cat", "lstm.l0", "lstm.l1", "lstm.l2", "head"]
     # The int8 encoder-FC OUTPUTS (vision_fc 512, depth_fc 64) carry the ~9%
     # feature error that the LSTM amplifies; promoting these two cheap linears to
     # fp16 (conv bulk stays int8) recovers most of it. Toggle with MB_FUSED_FP16_FC=0

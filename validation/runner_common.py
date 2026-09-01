@@ -191,6 +191,124 @@ def parse_profile(text: str, tag: Optional[str] = None) -> Optional[list[dict]]:
     return out
 
 
+#: Below this many rdtime ticks a dispatch's run-to-run spread is mostly timer
+#: quantisation. 240 ticks = 10 us at 24 MHz, so the tick is 0.4% of the sample
+#: and a reported CV is about the kernel rather than about the clock.
+_CV_MIN_TICKS = 240
+
+#: Per-iteration profile blocks emitted when MODELBLASTER_ITERS > 1.
+_ITER_PROF = re.compile(
+    r"=== MODELBLASTER_ITER_PROFILE_BEGIN \[(?P<it>\d+)\] ===\n"
+    r"(?P<body>.*?)\n=== MODELBLASTER_ITER_PROFILE_END \[\1\] ===",
+    re.S)
+
+
+def parse_profile_reps(text: str) -> Optional[list[dict]]:
+    """Median per-dispatch cycles across MODELBLASTER_ITERS repetitions.
+
+    Every cost in the authoritative profile DB was a SINGLE sample: the harness
+    prints one PROFILE block, `parse_profile` reads it, and that number becomes
+    the service time the scheduler plans against and the advisor compares
+    against a free slot. Two closed-loop recommendations have already been
+    rejected on n=1 gaps -- they were large (41%, 36%) so the conclusions hold,
+    but the project's own criterion asks for a median of N and did not have one.
+
+    The binary could already do the work: MODELBLASTER_ITERS>1 runs the model N
+    times and prints a per-iteration profile block. Nothing read them, so the
+    repetitions were paid for and discarded.
+
+    Returns None when no per-iteration blocks are present, so the single-block
+    path stays exactly as it was. Adds `cycles_n`, `cycles_min`, `cycles_max`
+    and `cycles_cv_pct` -- the spread is the point, not decoration: it is what
+    tells you whether a 10% "win" is distinguishable from run-to-run noise, and
+    an advisor that reports confidence needs it.
+
+    Iteration 0 is DISCARDED when at least three remain. First-touch faulting of
+    a const weight array lands entirely in it -- measured on vitfly_lstm, whose
+    1.7 MB of weights cost 21.9 ms cold against 2.88 ms warm, a 7.6x difference
+    attributable to nothing but page faults.
+    """
+    blocks = []
+    for m in _ITER_PROF.finditer(text):
+        lines = [ln for ln in m.group("body").splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        header = [c.strip() for c in lines[0].split(",")]
+        recs = []
+        for ln in lines[1:]:
+            rec = dict(zip(header, [c.strip() for c in ln.split(",")]))
+            if "cycles" in rec:
+                rec["cycles"] = int(rec["cycles"])
+            if "dispatch_id" in rec:
+                rec["dispatch_id"] = int(rec["dispatch_id"])
+            recs.append(rec)
+        blocks.append((int(m.group("it")), recs))
+    if not blocks:
+        return None
+
+    blocks.sort()
+    warm = [recs for it, recs in blocks if it > 0] if len(blocks) >= 4 else \
+           [recs for _, recs in blocks]
+    dropped = len(blocks) - len(warm)
+
+    # Key on (dispatch_id, name) rather than position: a model whose op count
+    # varied between iterations would otherwise average unrelated ops together.
+    by_key: dict = {}
+    order: list = []
+    for recs in warm:
+        for r in recs:
+            k = (r.get("dispatch_id"), r.get("name"))
+            if k not in by_key:
+                by_key[k] = (dict(r), [])
+                order.append(k)
+            by_key[k][1].append(int(r["cycles"]))
+
+    import statistics
+    out = []
+    for k in order:
+        base, samples = by_key[k]
+        n = len(samples)
+        med = int(statistics.median(samples))
+        base["cycles"] = med
+        base["cycles_n"] = n
+        base["cycles_min"] = min(samples)
+        base["cycles_max"] = max(samples)
+        base["cycles_cv_pct"] = (
+            round(100.0 * statistics.stdev(samples) / med, 2)
+            if n > 1 and med else 0.0)
+        out.append(base)
+    if out:
+        # Report CV only for dispatches long enough for it to MEAN anything.
+        # rdtime ticks at 24 MHz (41.7 ns), so a 1.5 us dispatch is ~36 ticks
+        # and a 0.1 us one is 2-3. At that scale the spread is dominated by
+        # quantisation of the timer, not by the kernel: the hybrid fused_full
+        # profile showed 244.8% CV on a cast_i8_to_f16 costing 36 ticks, which
+        # reads as wild instability and is nothing of the kind. Quoting it as
+        # the run's "worst CV" would make every profile look untrustworthy and
+        # would bury the figures that do matter -- the 0.5-0.7 ms convolutions
+        # in the same run sit at 15-22%, which is a real and interesting number.
+        floor = _CV_MIN_TICKS
+        big = [r for r in out if r["cycles"] >= floor]
+        if big:
+            worst = max(big, key=lambda r: r["cycles_cv_pct"])
+            print(f"  profile: median of {len(warm)} rep(s)"
+                  f"{f' (dropped {dropped} warmup)' if dropped else ''}, "
+                  f"worst CV {worst['cycles_cv_pct']:.1f}% "
+                  f"({worst.get('op') or worst.get('name')}, "
+                  f"{worst['cycles']} ticks)")
+        else:
+            print(f"  profile: median of {len(warm)} rep(s)"
+                  f"{f' (dropped {dropped} warmup)' if dropped else ''}; "
+                  f"every dispatch is under {floor} rdtime ticks, so per-dispatch "
+                  f"CV is timer quantisation and is not reported")
+        small = len(out) - len(big)
+        if small:
+            print(f"           {small} of {len(out)} dispatch(es) under {floor} "
+                  f"ticks; their cycles_cv_pct is in the CSV but is dominated "
+                  f"by the 41.7 ns timer tick")
+    return out
+
+
 def write_profile_csv(records: list[dict], path: str) -> None:
     if not records:
         return
@@ -420,6 +538,38 @@ class IREEProfileArgs:
     profile_cores: str
     profile_clock_mhz: float
     quant: str
+    #: Build dir holding kernel_picks.json, so the profile can record WHAT
+    #: ran per op rather than only how long it took. Optional: without it the
+    #: `implementation` column is empty, which reads as unknown.
+    gen_dir: Optional[str] = None
+
+
+def _parse_cores(spec: str) -> list[int]:
+    """A core list, accepting the comma and the underscore spelling.
+
+    WHY THIS IS NOT `[int(c) for c in spec.split(",")]`, which is what it was.
+    The profile tree writes the topology as `topo_0_1_2_3`, so the underscore
+    form is the one a caller reads off a path and hands back. Split only on
+    commas, `"0_1_2_3"` reaches `int()` as a single token -- and Python accepts
+    underscores as digit separators, so it returns **123**. No exception, and
+    the run is filed under `topo_123`: a directory that does not correspond to
+    any topology, sorts nowhere near the real ones, and reads as plausible.
+
+    Found by a 4-core ffn_block run landing in `topo_123`. Rejecting the
+    underscore would have been enough to make it loud; accepting it is better,
+    because the underscore is the spelling the tree itself uses.
+    """
+    out: list[int] = []
+    for tok in str(spec).replace("_", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if not tok.isdigit():
+            raise ValueError(
+                f"--profile-cores {spec!r}: {tok!r} is not a hart id. Use "
+                f"'0,1,2,3' or '0_1_2_3'.")
+        out.append(int(tok))
+    return out
 
 
 def emit_iree_profile(records: list[dict], model: str,
@@ -429,7 +579,7 @@ def emit_iree_profile(records: list[dict], model: str,
     if not args.profile_out_root or not records:
         return None
     from modelblaster.pipeline import profile_writer
-    cores = [int(c) for c in args.profile_cores.split(",") if c.strip()]
+    cores = _parse_cores(args.profile_cores)
     cpu = args.profile_cpu or args.profile_source
     meta = profile_writer.ProfileMeta(
         model=model,
@@ -439,6 +589,8 @@ def emit_iree_profile(records: list[dict], model: str,
         source=args.profile_source,
         cpu=cpu,
         clock_mhz=args.profile_clock_mhz,
+        picks=(profile_writer.picks_from_build(args.gen_dir)
+               if args.gen_dir else {}),
     )
     return profile_writer.write_profile(records, meta, args.profile_out_root)
 
@@ -515,7 +667,9 @@ def report_run(text: str, *, models: Optional[list[str]],
                profile_csv: Optional[str],
                iree_args: IREEProfileArgs, backend_tag: str,
                repo_root: str,
-               quants: Optional[list[str]] = None) -> bool:
+               quants: Optional[list[str]] = None,
+               model_name: Optional[str] = None,
+               io_paths: Optional[dict] = None) -> bool:
     """Single entry point used by both runners after they've captured
     the harness stdout. Walks the OUTPUT/PROFILE/WALL blocks, compares
     each against its golden, prints summaries, writes per-model CSV,
@@ -536,10 +690,27 @@ def report_run(text: str, *, models: Optional[list[str]],
             # harness — saves shipping the full output tensor over UART);
             # fall back to per-element parse_output for legacy binaries.
             verify = parse_verify(text, tag=name)
-            actual = None if verify is not None else parse_output(text, tag=name)
+            # Batched harness: in-binary VERIFY may be missing for a
+            # variant whose kernel crashed / infinite-looped / lost its
+            # marker to HTIF-buffer drop. Try parse_output(); if that
+            # also fails, mark this model failed and continue instead
+            # of aborting the whole report_run — otherwise one bad
+            # variant wipes the batch even though the others ran fine.
+            actual = None
+            if verify is None:
+                try:
+                    actual = parse_output(text, tag=name)
+                except RuntimeError as _e:
+                    print(f"  [{name}] MISSING OUTPUT/VERIFY (variant "
+                          f"hung, crashed, or lost markers) — FAIL")
+                    all_ok = False
+                    continue
             per_model_quant = (quants[i] if quants and i < len(quants)
                                else quant)
-            golden_path = model_io_path(repo_root, name, per_model_quant)
+            # io_paths lets the caller point a model name (e.g. a flat
+            # kernelbench tag) at an io.npz that isn't under examples/<name>/.
+            golden_path = ((io_paths or {}).get(name)
+                           or model_io_path(repo_root, name, per_model_quant))
             if not os.path.exists(golden_path):
                 print(f"FAIL: golden not found at {golden_path}")
                 all_ok = False
@@ -572,7 +743,9 @@ def report_run(text: str, *, models: Optional[list[str]],
     verify = parse_verify(text)
     actual = None if verify is not None else parse_output(text)
     ok, _ = check_one(actual, io_path, atol, rtol, verify=verify)
-    profile = parse_profile(text)
+    # Prefer the median across MODELBLASTER_ITERS repetitions when the run
+    # produced them; fall back to the single block otherwise.
+    profile = parse_profile_reps(text) or parse_profile(text)
     if profile is not None:
         out_csv = profile_csv or os.path.join(
             os.path.dirname(os.path.abspath(io_path)), "profile.csv"
@@ -585,10 +758,17 @@ def report_run(text: str, *, models: Optional[list[str]],
     if wall is not None:
         print(f"wall_clock_cycles={wall} (mtime)")
     if profile is not None and iree_args.profile_out_root:
-        io_abs = os.path.abspath(io_path)
-        model_name = os.path.basename(
-            os.path.dirname(os.path.dirname(os.path.dirname(io_abs)))
-        )
+        # The model name decides where the profile lands in the tree. It used to
+        # be derived purely by walking three directories up from io.npz, which
+        # silently mislabels any layout other than
+        # examples/<model>/<quant>/generated/io.npz -- a K1 build rooted at
+        # build/k1/<model>/<quant>/ filed every profile under "k1". An explicit
+        # name wins; the walk remains the default for existing callers.
+        if model_name is None:
+            io_abs = os.path.abspath(io_path)
+            model_name = os.path.basename(
+                os.path.dirname(os.path.dirname(os.path.dirname(io_abs)))
+            )
         iree_path = emit_iree_profile(profile, model_name, iree_args, backend_tag)
         if iree_path:
             print(f"iree_profile -> {iree_path}")

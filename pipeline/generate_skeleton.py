@@ -132,6 +132,22 @@ def _buf_name(mid: str, tensor: str) -> str:
 # modelblaster_pool.h out of model.c so the harness has no POSIX dep.
 _PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 
+# fp16 ops that have a bespoke `_f16` skeleton branch (some with different args,
+# e.g. softmax_f16's input_scale). These route to their own branch unchanged.
+# Every OTHER `_f16` op reuses its fp32 branch (identical args) via the
+# normalization at the top of the op-emission loop, with `_f16` folded into the
+# mangled kernel name.
+_EXPLICIT_F16_OPS = {
+    "relu_f16", "elu_f16", "sigmoid_f16", "batchnorm2d_f16", "maxpool2d_f16",
+    "conv2d_f16", "linear_f16", "depthwise_conv2d_f16", "layer_norm_f16",
+    "lstm_f16",
+    "gelu_f16", "softmax_f16", "add_f16", "mul_f16", "mul_c1_f16",
+    "adaptive_avg_pool2d_f16", "slice_c_f16", "cat2_c1_f16", "cat3_c1_f16",
+    "cat4_c1_f16", "silu_f16", "upsample_nearest_f16", "pad_f16", "bmm_f16",
+    "matmul_f16", "matmul_ta_f16", "matmul_tb_f16", "matmul_tatb_f16",
+    "chunk2_c1_f16", "cast_i8_to_f16", "cast_f16_to_i8",
+}
+
 
 _LINEAR_WRAPPER = """
 /* ---- linear: split outer N (output features), M==1 only ----------------- */
@@ -209,6 +225,8 @@ typedef struct {{
     int SW;
     int PH;
     int PW;
+    int DH;
+    int DW;
     int OH;
     int OW;
     int chunks;
@@ -229,7 +247,7 @@ static void parallel_conv2d_fn(void *ctx_, size_t i) {{
                         c->out + (size_t)oc0 * per_oc_out,
                         c->N, c->IC, c->IH, c->IW,
                         oc1 - oc0, c->KH, c->KW,
-                        c->SH, c->SW, c->PH, c->PW);
+                        c->SH, c->SW, c->PH, c->PW, c->DH, c->DW);
 }}
 
 /* MB_SHARD_MACHINERY_END */
@@ -238,40 +256,63 @@ static inline void parallel_conv2d(void *pool_,
                                    const float *b, float *out,
                                    int N, int IC, int IH, int IW,
                                    int OC, int KH, int KW,
-                                   int SH, int SW, int PH, int PW) {{
+                                   int SH, int SW, int PH, int PW,
+                                   int DH, int DW) {{
 #ifdef MODELBLASTER_USE_POOL
     modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
     if (pool == NULL || N != 1) {{
         kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                            OC, KH, KW, SH, SW, PH, PW);
+                            OC, KH, KW, SH, SW, PH, PW, DH, DW);
         return;
     }}
     size_t T = modelblaster_pool_get_threads_count(pool);
     if (T <= 1 || (size_t)OC < T) {{
         kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                            OC, KH, KW, SH, SW, PH, PW);
+                            OC, KH, KW, SH, SW, PH, PW, DH, DW);
         return;
     }}
-    int OH = (IH + 2 * PH - KH) / SH + 1;
-    int OW = (IW + 2 * PW - KW) / SW + 1;
+    int OH = (IH + 2 * PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2 * PW - DW*(KW-1) - 1) / SW + 1;
     parallel_conv2d_ctx_t ctx = {{
         .in = in, .w = w, .b = b, .out = out,
         .N = N, .IC = IC, .IH = IH, .IW = IW,
         .OC_total = OC, .KH = KH, .KW = KW,
-        .SH = SH, .SW = SW, .PH = PH, .PW = PW,
+        .SH = SH, .SW = SW, .PH = PH, .PW = PW, .DH = DH, .DW = DW,
         .OH = OH, .OW = OW, .chunks = (int)T,
     }};
     modelblaster_pool_parallelize_1d(pool, parallel_conv2d_fn, &ctx, T, 0);
 #else
     (void)pool_;
     kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                        OC, KH, KW, SH, SW, PH, PW);
+                        OC, KH, KW, SH, SW, PH, PW, DH, DW);
 #endif
 }}
 """
 
 _LINEAR_S8_WRAPPER = """
-/* ---- linear_s8: split outer N (output features), M==1 only -------------- */
+/* ---- linear_s8: split M when there are rows to split, else N ------------
+ *
+ * WHY TWO AXES AND NOT ONE. The kernel takes no output stride: it writes
+ * `out[m*N + n]` with the N it was CALLED with. So an N-shard is only
+ * expressible when M == 1 -- with more than one row, columns [n0, n1) of an
+ * [M, N] output are strided and `out + n0` addresses the wrong elements from
+ * row 1 onwards. That is why this wrapper carried an `M != 1` bail-out: not
+ * an oversight, a correctness guard.
+ *
+ * It also meant the wrapper did nothing for the shapes that matter. Every
+ * linear in the transformer blocks is M=8 (attention) or M=128 (FFN), and
+ * ffn_block is 80% linear by time once gelu is vectorised -- so the one op
+ * with a live multi-core path was engaging only on GEMVs.
+ *
+ * The M axis has no such problem. Row m0..m1 of a row-major [M, N] output is
+ * CONTIGUOUS: `in + m0*K`, `out + m0*N`, M = m1-m0, with w, b and N passed
+ * through unchanged. And M, like N, is an OUTPUT axis, so slicing it
+ * partitions output elements and reorders no accumulation -- the result is
+ * bit-identical to the serial call, not close to it. (Slicing K, the
+ * reduction, would not be.)
+ *
+ * So: shard M when M >= T, else shard N when M == 1, else run serial.
+ */
 typedef struct {{
     const int8_t  *in;
     const int8_t  *w;
@@ -288,10 +329,30 @@ typedef struct {{
     int activation_min;
     int activation_max;
     int chunks;
+    int split_m;   /* 1 = slice rows (M), 0 = slice columns (N) */
 }} parallel_linear_s8_ctx_t;
 
 static void parallel_linear_s8_fn(void *ctx_, size_t i) {{
     parallel_linear_s8_ctx_t *c = (parallel_linear_s8_ctx_t *)ctx_;
+    if (c->split_m) {{
+        /* Rows are contiguous in a row-major [M, N] output, so the slice is
+         * a pair of base offsets and the kernel's own N is unchanged. */
+        int m_per = (c->M + c->chunks - 1) / c->chunks;
+        int m0 = (int)i * m_per;
+        int m1 = m0 + m_per;
+        if (m1 > c->M) m1 = c->M;
+        if (m0 >= m1) return;
+        kernel_linear_s8_{mid}(c->in + (size_t)m0 * (size_t)c->K,
+                               c->w, c->b,
+                               c->out + (size_t)m0 * (size_t)c->N_total,
+                               m1 - m0, c->K, c->N_total,
+                               c->input_offset, c->filter_offset,
+                               c->output_offset,
+                               c->output_multiplier, c->output_shift,
+                               c->activation_min, c->activation_max);
+        return;
+    }}
+    /* N slice: only reachable at M == 1, where `out + n0` is exact. */
     int n_per = (c->N_total + c->chunks - 1) / c->chunks;
     int n0 = (int)i * n_per;
     int n1 = n0 + n_per;
@@ -319,15 +380,13 @@ static inline void parallel_linear_s8(void *pool_,
                                       int activation_min, int activation_max) {{
 #ifdef MODELBLASTER_USE_POOL
     modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
-    if (pool == NULL || M != 1) {{
-        kernel_linear_s8_{mid}(in, w, b, out, M, K, N,
-                               input_offset, filter_offset, output_offset,
-                               output_multiplier, output_shift,
-                               activation_min, activation_max);
-        return;
-    }}
-    size_t T = modelblaster_pool_get_threads_count(pool);
-    if (T <= 1 || (size_t)N < T) {{
+    size_t T = pool ? modelblaster_pool_get_threads_count(pool) : 1;
+    /* Prefer the row axis: it is correct at every M, and it is the one the
+     * transformer shapes actually have. Fall back to the column axis only at
+     * M == 1, where the kernel's missing output stride does not bite. */
+    int split_m = (M > 1 && (size_t)M >= T);
+    int splittable = split_m || (M == 1 && (size_t)N >= T);
+    if (pool == NULL || T <= 1 || !splittable) {{
         kernel_linear_s8_{mid}(in, w, b, out, M, K, N,
                                input_offset, filter_offset, output_offset,
                                output_multiplier, output_shift,
@@ -341,7 +400,7 @@ static inline void parallel_linear_s8(void *pool_,
         .output_offset = output_offset,
         .output_multiplier = output_multiplier, .output_shift = output_shift,
         .activation_min = activation_min, .activation_max = activation_max,
-        .chunks = (int)T,
+        .chunks = (int)T, .split_m = split_m,
     }};
     modelblaster_pool_parallelize_1d(pool, parallel_linear_s8_fn, &ctx, T, 0);
 #else
@@ -461,7 +520,6 @@ static inline void parallel_conv2d_s8(void *pool_,
 #endif
 }}
 """
-
 
 _CONV2D_BN_SILU_S8_SHARD_WRAPPER = """
 /* ---- conv2d+BN+SiLU, sharded over OC with PRE-PACKED per-shard weights --- */
@@ -731,6 +789,7 @@ static inline void parallel_conv2d_s8_sharded(
 }}
 """
 
+
 _PARALLEL_WRAPPER_TEMPLATES = {
     "linear":    _LINEAR_WRAPPER,
     "conv2d":    _CONV2D_WRAPPER,
@@ -855,6 +914,8 @@ def _serial_only_wrapper(op: str, mid: str) -> str:
             + tail.replace("#ifdef MODELBLASTER_USE_POOL", reason, 1))
 
 
+
+
 def _mid(model_name: str) -> str:
     """Model identifier — c-safe lowercase form used as a prefix on every
     globally-visible symbol the skeleton emits. Drives symbol-mangling so
@@ -867,9 +928,33 @@ def _umid(model_name: str) -> str:
     return _c_ident(model_name).upper()
 
 
-def _weight_name(model_name: str, weight_key: str) -> str:
-    """Mangled weight-blob symbol name: <model>_<weight_key>."""
-    return f"{_mid(model_name)}_{_c_ident(weight_key)}"
+def _weight_name(model_name: str, weight_key: str,
+                  backend: Optional[str] = None) -> str:
+    """Mangled weight-blob symbol name: <model>_<weight_key>[_<backend>].
+
+    The backend suffix is required whenever a heterogeneous (multi-backend)
+    binary links more than one backend's weights.c together: different
+    backends can pack the SAME logical tensor in different physical
+    layouts (e.g. RVV's IHWOC vs scalar's native OIHW -- see
+    _backend_pack_weight below), so without a distinguishing suffix two
+    backends' weights.c would define the identical, non-static symbol
+    name with DIFFERENT data. The build silently linked only one of them
+    (observed: xpurt_demo always picked the first-listed backend's
+    weights.c), and every other backend's kernels then read that
+    backend's weight data through the wrong layout -- a deterministic
+    wrong-answer bug, not a link error, since only one definition ever
+    got compiled in. Root-caused via dronet (max_abs_err=51, reproduced
+    identically whether the kernel was a curated RVV kernel or the plain
+    scalar reference_impl -- the kernel logic was never the problem, the
+    multi-backend link was). Suffixing unconditionally (not just for
+    layout-sensitive conv weights) keeps this simple and collision-proof;
+    the extra duplication for backend-invariant bias/scale vectors is
+    negligible next to the conv weight tensors themselves.
+    """
+    ident = f"{_mid(model_name)}_{_c_ident(weight_key)}"
+    if backend:
+        ident += f"_{_c_ident(backend)}"
+    return ident
 
 
 def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
@@ -889,9 +974,17 @@ def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
     # Only consider algorithms explicitly targeting this backend.
     # Universal algorithms (empty target_affinity) are fallbacks that
     # handle any layout via #ifdef and don't dictate the choice.
+    # Match the backend OR anything it inherits from. A variant such as
+    # rvv_x60 has no algorithms declaring affinity to it by name, so an exact
+    # match returned None -- weights were emitted OIHW while the variant's own
+    # -DMODELBLASTER_RVV_IHWOC_WEIGHTS told the kernel to read them as IHWOC.
+    # Measured cost of that mismatch on DroNet: max_abs_err=57, with no error
+    # anywhere in the build.
+    from modelblaster.pipeline.backends import backend_lineage
+    lineage = set(backend_lineage(backend))
     layouts = set()
     for algo in CONV2D_S8.algorithms:
-        if not algo.target_affinity or backend not in algo.target_affinity:
+        if not algo.target_affinity or not (lineage & set(algo.target_affinity)):
             continue
         if algo.weight_layout != "oihw":
             layouts.add(algo.weight_layout)
@@ -1474,13 +1567,9 @@ def _oc_tile_operands(
         # gets its own array, re-packed with OC = tile_oc, and reads it from
         # element 0. See `split_conv_tile_weights` for the two-way failure
         # this replaces.
-        # NOTE (port): this tree's _weight_name has no backend suffix
-        # (that is a separate origin/main change), so the third argument is
-        # dropped here. `backend` stays in the signature because callers on
-        # origin/main pass it positionally.
-        w = _weight_name(model_name, _tile_key(spec["weight"], tile_idx))
+        w = _weight_name(model_name, _tile_key(spec["weight"], tile_idx), backend)
         if spec.get("bias"):
-            b = _weight_name(model_name, _tile_key(spec["bias"], tile_idx))
+            b = _weight_name(model_name, _tile_key(spec["bias"], tile_idx), backend)
     else:
         per_filter = (int(sh.get("IC", 0)) * int(sh.get("KH", 0))
                       * int(sh.get("KW", 0)))
@@ -1513,6 +1602,9 @@ def emit_weights(
         if plan:
             tile_extra, tile_drop = _apply_tile_weight_plan(weights, plan)
         if shard_plan:
+            # Intra-op shards need the same re-packing for the same reason;
+            # see `shard_conv_weights`. A conv is never both -- the shard plan
+            # skips anything already carrying `split_from`.
             s_extra, s_drop = _apply_shard_weight_plan(weights, shard_plan)
             tile_extra.update(s_extra)
             tile_drop |= s_drop
@@ -1520,15 +1612,20 @@ def emit_weights(
             # Drop a parent only if NOTHING but tiles/shards reads it. A conv
             # weight has exactly one consumer in every model here, so this
             # normally holds; refusing loudly beats emitting a dangling
-            # reference. A SHARDED conv's own op still names the parent, so
-            # those dispatch_ids are excluded explicitly.
+            # reference.
+            #
+            # A SHARDED conv's own op still names the parent weight, so it
+            # would appear "still used" and the parent would be kept -- 2x the
+            # weight bytes for nothing, since the emitted call reads the shard
+            # table instead. Those dispatch_ids are excluded explicitly.
             sharded_ids = set(shard_plan)
-
             def _reads_parent(op):
                 if (op.get("split_from") or {}).get("axis") == "OC":
                     return False
                 return op.get("dispatch_id") not in sharded_ids
-
+            # Conv-aware on both sides: a fused op's weight is on `sub_ops[0]`,
+            # so `op.get("weight")` reports None for it and a parent read only
+            # by fused ops would look unreferenced and be dropped.
             still_used = {
                 _conv_weight_of(op) for op in ir.get("ops", []) if _reads_parent(op)
             } | {
@@ -1557,7 +1654,7 @@ def emit_weights(
                "#include <stdint.h>",
                "", "#ifdef __cplusplus", 'extern "C" {', "#endif", ""]
     for k in keys:
-        ident = _weight_name(model_name, k)
+        ident = _weight_name(model_name, k, backend)
         c_type, _ = _np_to_c_dtype(weights[k].dtype)
         size = weights[k].size
         h_lines.append(f"extern const {c_type} {ident}[{size}];")
@@ -1570,7 +1667,7 @@ def emit_weights(
         c_lines.append(f"/* backend-packed layout: {backend} */")
     c_lines.append("")
     for k in keys:
-        ident = _weight_name(model_name, k)
+        ident = _weight_name(model_name, k, backend)
         arr_in = weights[k]
         arr_out, layout_tag = _backend_pack_weight(
             arr_in, backend, owners.get(k))
@@ -1602,6 +1699,36 @@ def _shape_str(op: dict) -> str:
     op with C_inputs=[16, 16, 16] becomes ``C_inputs=16|16|16``.
     """
     sh = op.get("shape", {})
+
+    # A FUSED op carries no `shape` of its own -- the real dimensions live on
+    # its sub_ops -- so this returned "" and profile_writer rendered the
+    # module_name as `..._<op>_noshape`. Every fused conv in a model then shared
+    # ONE signature: 57 of yolov8_nano's 90 dispatches keyed to
+    # `conv2d_batchnorm2d_silu_s8_noshape`, spanning 0.605 to 17.465 ms -- a 29x
+    # range under a single join key.
+    #
+    # That breaks the one rule that makes cross-rung comparison possible. Joins
+    # must key on module_name and never on dispatch_id, because a split or a
+    # realize-hint renumbers everything downstream; but a key 57 dispatches
+    # share is not a key, and the first rewrite touching that family would make
+    # yolov8_nano unjoinable.
+    #
+    # The producing sub_op's shape is the honest source: for conv+BN+SiLU the
+    # convolution's dimensions determine the work, and the later stages are
+    # elementwise over its output. Codegen is unaffected -- every fused branch
+    # reads sub[i]["shape"] directly and never op["shape"].
+    if not sh:
+        for sub in (op.get("sub_ops") or ()):
+            if sub.get("shape"):
+                sh = sub["shape"]
+                break
+
+    # `op["shape"]` is often present-but-None rather than absent, so the
+    # `.get(..., {})` default never fires and a genuinely shapeless op reaches
+    # the loop below as None. Normalise here instead of at each caller.
+    if not sh:
+        sh = {}
+
     parts: list[str] = []
     for k in sh:
         v = sh[k]
@@ -1612,18 +1739,20 @@ def _shape_str(op: dict) -> str:
 
 
 def emit_model(ir: dict[str, Any], out_dir: str,
+               platform: str = "zephyr",
                backend: Optional[str] = None) -> None:
     # `backend` reaches the codegen for exactly one reason: the conv weight
     # LAYOUT is a per-backend codegen decision (_backend_pack_weight), and a
-    # split conv's tile pointers -- and an intra-op shard's per-shard arrays --
-    # depend on it. Without it the conv2d_s8 arm below silently assumes OIHW
-    # for every backend; see `split_conv_tile_weights`. Everything else in this
-    # function is backend-independent and must stay that way.
-    #
-    # Both plans are `{}` for every graph in this tree today (no `split_from`,
-    # no `shard_factor`, MB_SHARD_FACTOR unset), so the emitted C is unchanged.
+    # split conv's tile pointers depend on it. Without it here, the conv2d_s8
+    # split arm below silently assumed OIHW for every backend -- see
+    # `split_conv_tile_weights`. Everything else in this function is
+    # backend-independent and must stay that way.
     tile_w_plan = split_conv_tile_weights(ir, backend)
+    # Intra-op OC shards with pre-packed per-shard weights. Empty unless
+    # MB_SHARD_FACTOR > 1 AND the backend repacks conv weights; see
+    # `shard_conv_weights`.
     shard_w_plan = shard_conv_weights(ir, backend, shard_factor())
+    in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
         list(out_field["tensors"]) if out_field.get("tensors") else [out_field["tensor"]]
@@ -1641,6 +1770,16 @@ def emit_model(ir: dict[str, Any], out_dir: str,
     _in_list = ir["input"].get("tensors") or (
         [ir["input"]["tensor"]] if ir["input"].get("tensor") else [])
     _packed = "packed_inputs" in ir["input"]
+    # A MIXED-dtype packed buffer (the fused sensor net: two int8 image inputs
+    # plus an fp16 low-dimensional state vector) is addressed by BYTE instead:
+    # the buffer stays int8_t and each slice is cast to its own element type at
+    # the call site. Offsetting such a buffer in ELEMENTS would be silently
+    # wrong for every slice after the first differently-sized one.
+    input_mixed_dtype = ir["input"].get("packed_dtype") == "mixed"
+    input_entry_dtype: dict[str, str] = {
+        p["name"]: p.get("dtype", "i8")
+        for p in ir["input"].get("packed_inputs", [])
+    }
     multi_typed = (len(_in_list) > 1) and not _packed
     in_tensor = ir["input"].get("tensor") or _in_list[0]  # never None below
 
@@ -1662,7 +1801,11 @@ def emit_model(ir: dict[str, Any], out_dir: str,
         in_size = sum(x["size"] for x in in_infos)
     else:
         in_c_type = _dtype_to_c(tensors[in_tensor]["dtype"])
-        if _packed:
+        if _packed and input_mixed_dtype:
+            input_offsets = {p["name"]: int(p["byte_offset"])
+                             for p in ir["input"]["packed_inputs"]}
+            in_size = int(ir["input"]["packed_bytes"])
+        elif _packed:
             input_offsets = {p["name"]: p["offset"]
                              for p in ir["input"]["packed_inputs"]}
             in_size = sum(p["size"] for p in ir["input"]["packed_inputs"])
@@ -1747,6 +1890,47 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             elem_offset = sh["c_each"] * sh["H"] * sh["W"]
             offset_aliases[op["outputs"][0]] = (base, 0)
             offset_aliases[op["outputs"][1]] = (base, elem_offset)
+        # ── Split-tile output alias ─────────────────────────────────────
+        # When apply_split_hint rewrites a single op into N tile ops
+        # (named "<orig>.tile_<i>"), each tile writes its slice of the
+        # output buffer. Wire that as an offset alias so each tile's
+        # output pointer is base + tile*(slice_size_in_elements), the
+        # same mechanism chunk2_c1 uses. Without this, every tile's
+        # kernel writes to offset 0 and they trample each other —
+        # verify FAILs with `max_abs_err > 0`.
+        elif "split_from" in op:
+            sf = op["split_from"]
+            tile_idx = int(sf.get("tile", 0))
+            n_splits = int(sf.get("n_splits", 1))
+            axis = sf.get("axis", "N")  # linear_s8 -> N (last), conv2d_s8 -> OC
+            # The base tensor is the ORIGINAL output (before split). Its name
+            # is recoverable from the tile output: strip ".tile_<i>" suffix.
+            tile_out = op["outputs"][0]
+            base = tile_out.rsplit(f".tile_{tile_idx}", 1)[0]
+            # `_conv_shape_of`, not `op["shape"]`: a fused conv has no shape
+            # of its own and would fall through to the `else` below with
+            # elem_offset 0, i.e. every tile writing over tile 0's output.
+            sh = _conv_shape_of(op) if op["op"] in _OC_SLICEABLE_CONV_OPS \
+                else op.get("shape", {})
+            elem_offset = 0
+            if axis == "OC" and op["op"] in _OC_SLICEABLE_CONV_OPS:
+                # Output buffer shape [N, OC, OH, OW]; tile slice is
+                # tile_oc rows of (OH*OW) elements at offset
+                # tile_idx * tile_oc * OH * OW.
+                tile_oc = int(sh.get("OC", 0))
+                OH = int(sh.get("OH", 0))
+                OW = int(sh.get("OW", 0))
+                elem_offset = tile_idx * tile_oc * OH * OW
+            elif axis == "N" and op["op"] == "linear_s8":
+                # Output buffer shape [M, N]; tile slice is tile_n cols
+                # at offset tile_idx * tile_n (M=1 typical).
+                tile_n = int(sh.get("N", 0))
+                elem_offset = tile_idx * tile_n
+            else:
+                # Unknown split axis / op kind — leave offset 0; tile
+                # measurement will surface the verify FAIL clearly.
+                elem_offset = 0
+            offset_aliases[tile_out] = (base, elem_offset)
 
     # Split tiles: `<parent>.tile_k` produced by pipeline/apply_split_hint.py.
     # apply_split_hint's contract is "no final concat needed -- each tile writes
@@ -1924,6 +2108,17 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             return input_arg_of[tensor]
         if tensor in input_offsets:
             off = input_offsets[tensor]
+            if input_mixed_dtype:
+                # Byte-addressed: cast the slice to its own element type. The
+                # parenthesised `(input)` is not cosmetic -- the dispatch-body
+                # emitter rewrites `input` to `s->input` by matching the
+                # literal substrings "input,", "input)" and "(input + ", so a
+                # bare `input +` inside a cast expression would silently miss
+                # the rewrite and fail to compile.
+                ct = _dtype_to_c(input_entry_dtype.get(tensor, "i8"))
+                base = ("(const char *)(input)" if off == 0
+                        else f"((const char *)(input) + {off})")
+                return f"((const {ct} *){base})"
             return "input" if off == 0 else f"(input + {off})"
         if tensor in out_tensor_to_offset:
             off = out_tensor_to_offset[tensor]
@@ -1932,21 +2127,124 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
     dispatch_fns: list[str] = []
-    # Static per-dispatch tables of the per-shard weight symbols an intra-op
-    # sharded conv reads. Empty unless `shard_w_plan` is non-empty.
+    # File-scope `static const` tables of per-shard weight pointers, one per
+    # sharded conv. File scope rather than inside the dispatch function so the
+    # single-expression call site stays a single expression.
     shard_tables: list[str] = []
     invoke_table_rows: list[str] = []
+
+    def _emit_sub_op_call(sub_op: dict) -> str:
+        """Build the per-dispatch C call string for one sub-op of a
+        `__fused__<...>` op (see pipeline/apply_fusion_hint.py).
+
+        Mirrors the kernel-mangling + pointer-rewrite logic the main
+        if/elif chain below does for non-fused ops, but only for the
+        sub-op kinds that appear in the demo's fusion hints. New
+        kinds raise NotImplementedError so codegen failures are loud
+        rather than silent.
+
+        Sub-ops keep their original `inputs`/`outputs` tensor names,
+        so `ptr_for(...)` resolves internal tensors to the same
+        `buf_<mid>_<name>` aliases the model.c emits for unfused ops.
+        That means a fused dispatcher is N back-to-back kernel calls
+        with no inter-op handshake — exactly the dispatch-overhead
+        win XPU-RT's coarsen hint is after.
+        """
+        sub_out_ptr = ptr_for(sub_op["outputs"][0], "out")
+        kind = sub_op["op"]
+        if kind == "linear_s8":
+            in_ptr = ptr_for(sub_op["inputs"][0], "in")
+            w = _weight_name(model_name, sub_op["weight"], backend)
+            b = _weight_name(model_name, sub_op["bias"], backend) if sub_op.get("bias") else "NULL"
+            sh = sub_op["shape"]; q = sub_op["quant"]
+            call = (
+                f"parallel_linear_s8(pool, {in_ptr}, {w}, {b}, {sub_out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, {q['output_offset']}, "
+                f"{q['output_multiplier']}, {q['output_shift']}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif kind == "elu_s8":
+            in_ptr = ptr_for(sub_op["inputs"][0], "in")
+            n = sub_op["shape"]["n"]; q = sub_op["quant"]
+            alpha = q.get("alpha", 1.0)
+            call = (
+                f"kernel_elu_s8({in_ptr}, {sub_out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']}, {_f32(alpha)})"
+            )
+        elif kind == "relu_s8":
+            in_ptr = ptr_for(sub_op["inputs"][0], "in")
+            n = sub_op["shape"]["n"]
+            call = f"kernel_relu_s8({in_ptr}, {sub_out_ptr}, {n})"
+        else:
+            raise NotImplementedError(
+                f"fused-op sub-op kind {kind!r} not yet supported in "
+                f"generate_skeleton._emit_sub_op_call — add the matching "
+                f"branch from the main if/elif chain. Sub-op was: "
+                f"{sub_op.get('name', '?')}/{kind}.")
+        # Kernel-name mangle (mirror the main loop's logic at line ~1574).
+        if kind not in _PARALLELIZED_OPS:
+            call = call.replace(
+                f"kernel_{kind}(", f"kernel_{kind}_{mid}(", 1)
+        # Pointer rewrites so the fused dispatcher reads the same `s`
+        # state struct as a non-fused dispatch_fn (mirror line ~1586).
+        return (call
+                .replace("(input + ", "(s->input + ")
+                .replace("input,", "s->input,")
+                .replace("input)", "s->input)")
+                .replace("output,", "s->output,")
+                .replace("output)", "s->output)")
+                .replace("(output + ", "(s->output + ")
+                .replace("(pool, ", "(s->pool, "))
+
     for op in ir["ops"]:
+        # fp16 dispatch: an `_f16` op without a bespoke branch reuses its fp32
+        # branch (identical args) — normalize to the base op for matching and
+        # fold `_f16` into the mangled kernel name below.
+        _ksfx = ""
+        if op["op"].endswith("_f16") and op["op"] not in _EXPLICIT_F16_OPS:
+            _ksfx = "_f16"
+            op = dict(op)
+            op["op"] = op["op"][:-4]
         if op["op"] in _zero_cost_ops:
             # view / chunk2_c1: no kernel call. Aliases were set up above
             # (plain aliases for view, offset aliases for chunk2_c1).
+            continue
+        if op["op"].startswith("__fused__"):
+            # axis-C realization (see pipeline/apply_fusion_hint.py).
+            # Collapse `sub_ops` into one dispatcher that calls each
+            # sub-op's kernel back-to-back, sharing the same buffer
+            # aliases a non-fused IR would have used. Removes
+            # `len(sub_ops) - 1` inter-dispatch worker-thread
+            # handshakes — that's the launch-overhead saving XPU-RT's
+            # coarsen recommendation is after.
+            sub_ops = [s for s in op.get("sub_ops", [])
+                       if s["op"] not in _zero_cost_ops]
+            per_disp_call = "; ".join(_emit_sub_op_call(s) for s in sub_ops)
+            dispatch_id = op["dispatch_id"]
+            shape_lit = f"fused({len(sub_ops)})"
+            dispatch_fns.append(
+                f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
+                f"    unsigned long _s = rdcycle();\n"
+                f"    {per_disp_call};\n"
+                f"    unsigned long _e = rdcycle();\n"
+                f"    int slot = (n_ < MODEL_{umid}_OP_COUNT) ? n_++ : MODEL_{umid}_OP_COUNT - 1;\n"
+                f'    records_[slot].dispatch_id = {dispatch_id};\n'
+                f'    records_[slot].name   = "{op["name"]}";\n'
+                f'    records_[slot].op     = "{op["op"]}";\n'
+                f'    records_[slot].shape  = "{shape_lit}";\n'
+                f"    records_[slot].cycles = _e - _s;\n"
+                f"}}"
+            )
+            invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
             continue
         out_ptr = ptr_for(op["outputs"][0], "out")
         shape_lit = _shape_str(op)
         if op["op"] == "linear":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             # Parallel-for variant: dispatches the outer N dimension onto
             # `pool` when M==1 and the pool has >1 worker. In single-model
@@ -1967,8 +2265,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_elu({in_ptr}, {out_ptr}, {n}, {_f32(alpha)})"
         elif op["op"] == "conv2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             # Parallel-for variant: dispatches the outer OC dimension onto
             # `pool` when N==1 and the pool has >1 worker. Falls back to
@@ -1977,7 +2275,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"parallel_conv2d(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
-                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh.get('DH', 1)}, {sh.get('DW', 1)})"
             )
         elif op["op"] == "maxpool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
@@ -1990,6 +2289,44 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
                 f"{PH}, {PW}, {DH}, {DW})"
             )
+        elif op["op"] == "avgpool2d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            PH, PW = sh.get("PH", 0), sh.get("PW", 0)
+            call = (
+                f"kernel_avgpool2d({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{PH}, {PW})"
+            )
+        elif op["op"] == "softmax":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_softmax({in_ptr}, {out_ptr}, {sh['M']}, {sh['K']})"
+        elif op["op"] == "log_softmax":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_log_softmax({in_ptr}, {out_ptr}, {sh['M']}, {sh['K']})"
+        elif op["op"] == "layer_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            gamma = _weight_name(model_name, op["gamma_key"], backend)
+            beta = _weight_name(model_name, op["beta_key"], backend)
+            sh = op["shape"]
+            eps = op.get("eps", 1e-5)
+            call = (
+                f"kernel_layer_norm({in_ptr}, {gamma}, {beta}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {_f32(eps)})"
+            )
+        elif op["op"] == "group_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            gamma = _weight_name(model_name, op["gamma_key"], backend)
+            beta = _weight_name(model_name, op["beta_key"], backend)
+            sh = op["shape"]
+            eps = op.get("eps", 1e-5)
+            call = (
+                f"kernel_group_norm({in_ptr}, {gamma}, {beta}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['G']}, {sh['HW']}, {_f32(eps)})"
+            )
         elif op["op"] == "add":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")
@@ -1997,8 +2334,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_add({a_ptr}, {b_ptr}, {out_ptr}, {n})"
         elif op["op"] == "batchnorm2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"])
+            s = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             sh = op["shape"]
             call = (
                 f"kernel_batchnorm2d({in_ptr}, {s}, {b}, {out_ptr}, "
@@ -2109,20 +2446,169 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
                 f"{sh['outer']}, {sh['reduce']}, {sh['inner']})"
             )
+        elif op["op"] == "rms_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            eps = op.get("eps", 1e-5)
+            call = (
+                f"kernel_rms_norm({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['reduce']}, {sh['inner']}, {_f32(eps)})"
+            )
         elif op["op"] == "frobenius_norm":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
             call = f"kernel_frobenius_norm({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "conv2d_dw":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_conv2d_dw({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
                 f"{sh['PH']}, {sh['PW']})"
+            )
+        elif op["op"] == "conv_transpose2d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_conv_transpose2d({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PH']}, {sh['PW']}, {sh['DH']}, {sh['DW']}, {sh['G']})"
+            )
+        elif op["op"] in ("conv3d", "conv_transpose3d"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {sh['IC']}, {sh['ID']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OC']}, {sh['OD']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KD']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SD']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PD']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh['DD']}, {sh['DH']}, {sh['DW']}, {sh['G']})"
+            )
+        elif op["op"] == "maxpool3d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_maxpool3d({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['ID']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OD']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KD']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SD']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PD']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh['DD']}, {sh['DH']}, {sh['DW']})"
+            )
+        elif op["op"] == "avgpool3d":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_avgpool3d({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['ID']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['OD']}, {sh['OH']}, {sh['OW']}, "
+                f"{sh['KD']}, {sh['KH']}, {sh['KW']}, "
+                f"{sh['SD']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh['PD']}, {sh['PH']}, {sh['PW']})"
+            )
+        elif op["op"] in ("triu", "tril"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
+                f"{sh['M']}, {sh['N']}, {sh.get('diagonal', 0)})"
+            )
+        elif op["op"] == "diag_matmul":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_diag_matmul({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['M']})"
+            )
+        elif op["op"] in ("cumsum", "cumprod", "flip"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['axis']}, {sh['inner']})"
+            )
+        elif op["op"] == "exclusive_cumsum":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_exclusive_cumsum({in_ptr}, {out_ptr}, {sh['Bout']}, {sh['N']})"
+        elif op["op"] == "mul":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_mul({a_ptr}, {b_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "mul_scalar":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = f"kernel_mul_scalar({in_ptr}, {out_ptr}, {sh['n']}, {_f32(op['scalar'])})"
+        elif op["op"] == "mean_abs_norm":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_mean_abs_norm({in_ptr}, {out_ptr}, "
+                f"{sh['outer']}, {sh['reduce']}, {sh['inner']})"
+            )
+        elif op["op"] == "mse_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            call = f"kernel_mse_loss({a_ptr}, {b_ptr}, {out_ptr}, {op['shape']['n']})"
+        elif op["op"] == "hinge_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_hinge_loss({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['n']}, {sh.get('targ_len', sh['n'])})"
+            )
+        elif op["op"] == "huber_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            beta = op.get("beta", 1.0)
+            call = (
+                f"kernel_huber_loss({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{op['shape']['n']}, {_f32(beta)})"
+            )
+        elif op["op"] in ("cross_entropy_loss", "kldiv_loss"):
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']})"
+            )
+        elif op["op"] == "triplet_loss":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            p_ptr = ptr_for(op["inputs"][1], "in")
+            n_ptr = ptr_for(op["inputs"][2], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_triplet_loss({a_ptr}, {p_ptr}, {n_ptr}, {out_ptr}, "
+                f"{sh['B']}, {sh['F']}, {_f32(op.get('margin', 1.0))})"
+            )
+        elif op["op"] == "log":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            call = f"kernel_log({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "sdpa":
+            q_ptr = ptr_for(op["inputs"][0], "in")
+            k_ptr = ptr_for(op["inputs"][1], "in")
+            v_ptr = ptr_for(op["inputs"][2], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_sdpa({q_ptr}, {k_ptr}, {v_ptr}, {out_ptr}, "
+                f"{sh['BH']}, {sh['S']}, {sh['D']})"
             )
         elif op["op"] == "adaptive_avg_pool2d":
             in_ptr = ptr_for(op["inputs"][0], "in")
@@ -2133,26 +2619,31 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "linear_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
-            # Split-tile pointer offset, the mirror of the conv2d_s8 arm.
-            # apply_split_hint promises "the kernel call passes
-            # weight + t*N/n*K and bias + t*N/n as offsets"; without this every
-            # tile reads weight rows [0, tile_N) and tile t>0 writes those same
-            # values into y[t*tile_N ...]. Silent: no crash, no build error,
-            # just wrong numbers above the first tile.
+            # ── Split-tile pointer offset ────────────────────────────
+            # Mirror of the conv2d_s8 arm below. apply_split_hint's own
+            # docstring promises "the kernel call passes weight + t*N/n*K and
+            # bias + t*N/n as offsets" -- but this branch never implemented it,
+            # so every tile read weight rows [0, tile_N) and tile t>0 wrote
+            # those same values into y[t*tile_N ...]. Silent: no crash, no
+            # build error, just wrong numbers above the first tile.
             #
-            # Weight layout is [N, K] and the kernel indexes weight[n*K + k],
-            # so tile t starts at row t*tile_N. Detection note: the LINEAR
-            # splitter does not set an `axis` key (unlike the conv one, which
-            # sets axis="OC"); it sets `tile_n` and `tile_offset_N`, and the
-            # latter is exactly the first output row this tile owns -- use it
-            # rather than recomputing and risking a second source of truth.
-            # A 2-D linear weight is never repacked (_backend_pack_weight only
-            # permutes 4-D tensors), so a row slice stays contiguous and a
-            # pointer offset is correct on every backend -- no tile arrays.
+            # It survived because the only workload ever split was DroNet,
+            # whose linears are N=1 -- apply_split_hint rejects those on
+            # divisibility before reaching here, so only the conv path was
+            # exercised. The conv comment below describes exactly this bug
+            # being found and fixed for conv alone.
+            #
+            # Weight layout is [N, K] and the kernel indexes weight[n*K + k]
+            # (reference_kernels.py), so tile t starts at row t*tile_N.
+            # Detection note: the linear splitter does NOT set an `axis` key
+            # (unlike the conv one, which sets axis="OC"). It sets `tile_n` and
+            # `tile_offset_N`, and the latter is precisely the first output row
+            # this tile owns -- so use it rather than recomputing tile*tile_n
+            # and risking a second source of truth.
             sf = op.get("split_from") or {}
             if sf and "tile_offset_N" in sf:
                 if int(sh.get("M", 1)) != 1:
@@ -2165,9 +2656,11 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                         f"Split along M, or add strided tile emission first."
                     )
                 off_n = int(sf["tile_offset_N"])
-                w = f"({w} + {off_n * int(sh.get('K', 0))})"
+                w_off = off_n * int(sh.get("K", 0))
+                b_off = off_n
+                w = f"({w} + {w_off})"
                 if b != "NULL":
-                    b = f"({b} + {off_n})"
+                    b = f"({b} + {b_off})"
             call = (
                 f"parallel_linear_s8(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']}, "
@@ -2180,27 +2673,36 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
             call = f"kernel_relu_s8({in_ptr}, {out_ptr}, {n})"
+        elif op["op"] == "relu6_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            qmax = op["clamp_max"]
+            call = f"kernel_relu6_s8({in_ptr}, {out_ptr}, {n}, {qmax})"
         elif op["op"] == "conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
-            # Split-tile pointer offset. When apply_split_hint produces a tile
-            # op (split_from, axis="OC"), the weight/bias pointers must address
-            # THIS tile's OC slice -- or on a repacking backend, this tile's own
-            # re-packed array. A no-op for a non-tile op.
+            # ── Split-tile pointer offset ────────────────────────────
+            # When apply_split_hint produces a tile op (split_from
+            # metadata, axis="OC"), the weight/bias pointers passed to
+            # the kernel call must point at this tile's OC-slice.
+            # Without this, every tile reads OC=[0..tile_oc) of the
+            # weight tensor, producing 1/n_splits correct outputs and
+            # wrong ones elsewhere (matches the round-002 max_abs_err
+            # signature on the first dronet split attempt).
             w, b, _ = _oc_tile_operands(op, sh, tile_w_plan, model_name, w, b,
                                         backend=backend)
             sspec = shard_w_plan.get(op.get("dispatch_id"))
             if sspec is not None:
-                # Sharded: a static table of the per-shard arrays, and the entry
-                # point that reads shard i from element 0. The parent weight
-                # symbol is not emitted for this conv at all.
+                # Sharded: a static table of the per-shard arrays, and the
+                # entry point that reads shard i from element 0. The parent
+                # weight symbol is not emitted for this conv at all.
                 n_sh = int(sspec["n_shards"])
                 tbl = f"w_shards_d{op['dispatch_id']}"
                 shard_syms = ", ".join(
-                    _weight_name(model_name, _shard_key(op["weight"], t))
+                    _weight_name(model_name, _shard_key(op["weight"], t), backend)
                     for t in range(n_sh))
                 shard_tables.append(
                     f"static const int8_t *const {tbl}[{n_sh}] = "
@@ -2301,8 +2803,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "batchnorm2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"])
+            s = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -2322,9 +2824,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "lstm_s8":
             x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"])
-            whh = _weight_name(model_name, op["weight_hh"])
-            b = _weight_name(model_name, op["bias"])
+            wih = _weight_name(model_name, op["weight_ih"], backend)
+            whh = _weight_name(model_name, op["weight_hh"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             h_ptr = ptr_for(op["state"]["h"], "in")
             c_ptr = ptr_for(op["state"]["c"], "in")
             sh = op["shape"]
@@ -2338,9 +2840,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "lstm":
             x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"])
-            whh = _weight_name(model_name, op["weight_hh"])
-            b = _weight_name(model_name, op["bias"])
+            wih = _weight_name(model_name, op["weight_ih"], backend)
+            whh = _weight_name(model_name, op["weight_hh"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             h_ptr = ptr_for(op["state"]["h"], "in")
             c_ptr = ptr_for(op["state"]["c"], "in")
             sh = op["shape"]
@@ -2357,6 +2859,148 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "batchnorm2d_silu_s8":
+            # Pair-fused BN→SiLU (yolov8 hot path). sub_ops = [bn, silu].
+            sub = op["sub_ops"]
+            sub_bn = sub[0]; sub_silu = sub[1]
+            in_ptr = ptr_for(sub_bn["inputs"][0], "in")
+            s_name = _weight_name(model_name, sub_bn["weight"], backend)
+            b_name = _weight_name(model_name, sub_bn["bias"], backend)
+            sh = sub_bn["shape"]
+            qb = sub_bn["quant"]
+            qs = sub_silu["quant"]
+            call = (
+                f"kernel_batchnorm2d_silu_s8({in_ptr}, {s_name}, {b_name}, "
+                f"{out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['H']}, {sh['W']}, "
+                f"{_f32(qb['scale_in'])}, {_f32(qb['scale_out'])}, "
+                f"{qb['activation_min']}, {qb['activation_max']}, "
+                f"{_f32(qs['scale_in'])}, {_f32(qs['scale_out'])}, "
+                f"{qs['activation_min']}, {qs['activation_max']})"
+            )
+        elif op["op"] == "conv2d_batchnorm2d_s8":
+            # Pair-fused conv→BN. sub_ops = [conv, bn].
+            sub = op["sub_ops"]
+            sub_conv = sub[0]; sub_bn = sub[1]
+            in_ptr = ptr_for(sub_conv["inputs"][0], "in")
+            w = _weight_name(model_name, sub_conv["weight"], backend)
+            b = _weight_name(model_name, sub_conv["bias"], backend) if sub_conv.get("bias") else "NULL"
+            bn_s = _weight_name(model_name, sub_bn["weight"], backend)
+            bn_b = _weight_name(model_name, sub_bn["bias"], backend)
+            sh = sub_conv["shape"]
+            qc = sub_conv["quant"]
+            qb = sub_bn["quant"]
+            # An OC split tile narrows sh["OC"] and retargets every operand at
+            # its own slice; a no-op for an unsplit op.
+            w, b, (bn_s, bn_b) = _oc_tile_operands(
+                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b),
+                backend=backend)
+            sspec = shard_w_plan.get(op.get("dispatch_id"))
+            if sspec is not None:
+                n_sh = int(sspec["n_shards"])
+                tbl = f"w_shards_d{op['dispatch_id']}"
+                shard_tables.append(
+                    f"static const int8_t *const {tbl}[{n_sh}] = {{ "
+                    + ", ".join(
+                        _weight_name(model_name,
+                                     _shard_key(sspec["weight"], t), backend)
+                        for t in range(n_sh))
+                    + " };")
+                head = (f"parallel_conv2d_bn_s8_sharded(pool, {in_ptr}, "
+                        f"{tbl}, {n_sh}, {int(sspec['oc_per'])}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['KH']}, {sh['KW']}, ")
+            else:
+                head = (f"kernel_conv2d_batchnorm2d_s8({in_ptr}, {w}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['OC']}, {sh['KH']}, {sh['KW']}, ")
+            call = (
+                head +
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{qc['input_offset']}, {qc['filter_offset']}, "
+                f"{qc['output_offset']}, "
+                f"{qc['output_multiplier']}, {qc['output_shift']}, "
+                f"{qc['activation_min']}, {qc['activation_max']}, "
+                f"{_f32(qb['scale_in'])}, {_f32(qb['scale_out'])}, "
+                f"{qb['activation_min']}, {qb['activation_max']})"
+            )
+        elif op["op"] == "conv2d_batchnorm2d_silu_s8":
+            # Triple-fused conv→BN→SiLU (yolov8 backbone). sub_ops = [conv, bn, silu].
+            sub = op["sub_ops"]
+            sub_conv = sub[0]; sub_bn = sub[1]; sub_silu = sub[2]
+            in_ptr = ptr_for(sub_conv["inputs"][0], "in")
+            w = _weight_name(model_name, sub_conv["weight"], backend)
+            b = _weight_name(model_name, sub_conv["bias"], backend) if sub_conv.get("bias") else "NULL"
+            bn_s = _weight_name(model_name, sub_bn["weight"], backend)
+            bn_b = _weight_name(model_name, sub_bn["bias"], backend)
+            sh = sub_conv["shape"]
+            qc = sub_conv["quant"]
+            qb = sub_bn["quant"]
+            qs = sub_silu["quant"]
+            w, b, (bn_s, bn_b) = _oc_tile_operands(
+                op, sh, tile_w_plan, model_name, w, b, (bn_s, bn_b),
+                backend=backend)
+            sspec = shard_w_plan.get(op.get("dispatch_id"))
+            if sspec is not None:
+                n_sh = int(sspec["n_shards"])
+                tbl = f"w_shards_d{op['dispatch_id']}"
+                shard_tables.append(
+                    f"static const int8_t *const {tbl}[{n_sh}] = {{ "
+                    + ", ".join(
+                        _weight_name(model_name,
+                                     _shard_key(sspec["weight"], t), backend)
+                        for t in range(n_sh))
+                    + " };")
+                head = (f"parallel_conv2d_bn_silu_s8_sharded(pool, {in_ptr}, "
+                        f"{tbl}, {n_sh}, {int(sspec['oc_per'])}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['KH']}, {sh['KW']}, ")
+            else:
+                head = (f"kernel_conv2d_batchnorm2d_silu_s8({in_ptr}, {w}, {b}, "
+                        f"{bn_s}, {bn_b}, {out_ptr}, "
+                        f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                        f"{sh['OC']}, {sh['KH']}, {sh['KW']}, ")
+            call = (
+                head +
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{qc['input_offset']}, {qc['filter_offset']}, "
+                f"{qc['output_offset']}, "
+                f"{qc['output_multiplier']}, {qc['output_shift']}, "
+                f"{qc['activation_min']}, {qc['activation_max']}, "
+                f"{_f32(qb['scale_in'])}, {_f32(qb['scale_out'])}, "
+                f"{qb['activation_min']}, {qb['activation_max']}, "
+                f"{_f32(qs['scale_in'])}, {_f32(qs['scale_out'])}, "
+                f"{qs['activation_min']}, {qs['activation_max']})"
+            )
+        elif op["op"] == "linear_s8_elu_s8":
+            # Phase 1d pair-fused linear+elu (Phase 1b emitted a synthetic
+            # __fused__... op + chained sub-kernels; this is the registered
+            # KernelSpec path so the LLM-codegen seeds actually fire). The
+            # fused op carries the linear and the elu under sub_ops; pull
+            # their weight / quant params directly.
+            sub = op["sub_ops"]
+            sub_lin = sub[0]; sub_elu = sub[1]
+            in_ptr = ptr_for(sub_lin["inputs"][0], "in")
+            w  = _weight_name(model_name, sub_lin["weight"], backend)
+            b  = _weight_name(model_name, sub_lin["bias"], backend) if sub_lin.get("bias") else "NULL"
+            sh = sub_lin["shape"]
+            ql = sub_lin["quant"]
+            qe = sub_elu["quant"]
+            alpha = qe.get("alpha", 1.0)
+            call = (
+                f"kernel_linear_s8_elu_s8({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{ql['input_offset']}, {ql['filter_offset']}, "
+                f"{ql['output_offset']}, "
+                f"{ql['output_multiplier']}, {ql['output_shift']}, "
+                f"{ql['activation_min']}, {ql['activation_max']}, "
+                f"{_f32(qe['scale_in'])}, {_f32(qe['scale_out'])}, "
+                f"{qe['activation_min']}, {qe['activation_max']}, "
+                f"{_f32(alpha)})"
+            )
         elif op["op"] == "elu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
@@ -2367,6 +3011,88 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']}, "
                 f"{_f32(alpha)})"
+            )
+        elif op["op"] in ("sin_s8", "cos_s8"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            q = op["quant"]
+            call = (f"kernel_{op['op']}({in_ptr}, {out_ptr}, "
+                    f"{op['shape']['n']}, "
+                    f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                    f"{q['activation_min']}, {q['activation_max']})")
+        elif op["op"] == "softmax_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            call = (f"kernel_softmax_s8({in_ptr}, {out_ptr}, "
+                    f"{sh['M']}, {sh['K']}, "
+                    f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])})")
+        elif op["op"] == "matmul_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]; q = op["quant"]
+            call = (f"kernel_matmul_s8({a_ptr}, {b_ptr}, {out_ptr}, "
+                    f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                    f"{_f32(q['scale_a'])}, {_f32(q['scale_b'])}, "
+                    f"{_f32(q['scale_out'])}, {sh.get('transpose_b', 0)}, "
+                    f"{_f32(q.get('scale_div', 1.0))}, "
+                    f"{q['activation_min']}, {q['activation_max']})")
+        elif op["op"] in ("layernorm_s8", "rmsnorm_s8"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            gamma = _weight_name(model_name, op["weight"], backend)
+            common = (f"{sh['M']}, {sh['K']}, "
+                      f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                      f"{_f32(q['eps'])}, "
+                      f"{q['activation_min']}, {q['activation_max']})")
+            if op["op"] == "rmsnorm_s8":
+                call = (f"kernel_rmsnorm_s8({in_ptr}, {gamma}, {out_ptr}, "
+                        + common)
+            else:
+                beta = (_weight_name(model_name, op["bias"], backend)
+                        if op.get("bias") else "NULL")
+                call = (f"kernel_layernorm_s8({in_ptr}, {gamma}, {beta}, "
+                        f"{out_ptr}, " + common)
+        elif op["op"] == "lstm_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            h_ptr = ptr_for(op["state"][0], "inout")
+            c_ptr = ptr_for(op["state"][1], "inout")
+            # h_state / c_state are ordinary intermediates, which means
+            # file-scope arrays in buffers.c -- .bss, so zero-initialised once
+            # and retained across run_model() calls. That is precisely the
+            # recurrence: invocation k reads what invocation k-1 wrote. Nothing
+            # resets them between calls, deliberately.
+            call = (
+                f"kernel_lstm_s8({in_ptr}, "
+                f"{_weight_name(model_name, op['weight'], backend)}, "
+                f"{_weight_name(model_name, op['weight_hh'], backend)}, "
+                f"{_weight_name(model_name, op['bias'], backend)}, "
+                f"{_weight_name(model_name, op['bias_hh'], backend)}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, "
+                f"{sh['input_size']}, {sh['hidden_size']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_w_ih'])}, "
+                f"{_f32(q['scale_w_hh'])}, {_f32(q['scale_b'])}, "
+                f"{_f32(q['scale_h'])}, {_f32(q['scale_c'])}, "
+                f"{q['has_bias']})"
+            )
+        elif op["op"] == "leaky_relu_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_leaky_relu_s8({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']}, "
+                f"{_f32(q.get('negative_slope', 0.01))})"
+            )
+        elif op["op"] == "avgpool2d_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (
+                f"kernel_avgpool2d_s8({in_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, "
+                f"{sh.get('PH', 0)}, {sh.get('PW', 0)}, "
+                f"{sh.get('count_include_pad', 1)})"
             )
         elif op["op"] == "upsample_nearest_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
@@ -2395,12 +3121,12 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # ---- ViNT per-channel weight-scale variants (Phase B.2) ----
         elif op["op"] == "conv2d_s8_pc":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
-            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"])
-            shift = _weight_name(model_name, q["output_shift_per_oc_key"])
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
             call = (
                 f"kernel_conv2d_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
@@ -2413,12 +3139,12 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "linear_s8_pc":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
-            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"])
-            shift = _weight_name(model_name, q["output_shift_per_oc_key"])
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
             call = (
                 f"kernel_linear_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']}, "
@@ -2430,8 +3156,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # ---- ViNT s8 ops ----
         elif op["op"] == "depthwise_conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             # Channel count for depthwise: groups == OC == IC.
@@ -2506,8 +3232,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
             q = op["quant"]
-            gamma = _weight_name(model_name, q["gamma_key"]) if q.get("gamma_key") else "NULL"
-            beta = _weight_name(model_name, q["beta_key"]) if q.get("beta_key") else "NULL"
+            gamma = _weight_name(model_name, q["gamma_key"], backend) if q.get("gamma_key") else "NULL"
+            beta = _weight_name(model_name, q["beta_key"], backend) if q.get("beta_key") else "NULL"
             call = (
                 f"kernel_layer_norm_s8({in_ptr}, {gamma}, {beta}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, "
@@ -2588,8 +3314,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = f"kernel_sigmoid_f16({in_ptr}, {out_ptr}, {n})"
         elif op["op"] == "batchnorm2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            s = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"])
+            s = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend)
             sh = op["shape"]
             call = (
                 f"kernel_batchnorm2d_f16({in_ptr}, {s}, {b}, {out_ptr}, "
@@ -2608,14 +3334,15 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "conv2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
-                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh.get('DH', 1)}, {sh.get('DW', 1)})"
             )
         # ---- Mixed-precision cast kernels ----
         elif op["op"] == "cast_i8_to_f16":
@@ -2638,29 +3365,34 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # ---- ViNT fp16 op set ----
         elif op["op"] == "linear_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_linear_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']})"
             )
         elif op["op"] == "lstm_f16":
+            # Same op record as lstm_s8 (see the int8 branch) after the fp16
+            # promotion pass rewrote its kind and folded b_ih + b_hh into one
+            # float bias -- so the state is still the [h, c] pair of persistent
+            # buffers, now _Float16.
             x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"])
-            whh = _weight_name(model_name, op["weight_hh"])
-            b = _weight_name(model_name, op["bias"])
-            h_ptr = ptr_for(op["state"]["h"], "in")
-            c_ptr = ptr_for(op["state"]["c"], "in")
             sh = op["shape"]
+            h_ptr = ptr_for(op["state"][0], "inout")
+            c_ptr = ptr_for(op["state"][1], "inout")
             call = (
-                f"kernel_lstm_f16({x_ptr}, {wih}, {whh}, {b}, "
-                f"{h_ptr}, {c_ptr}, {out_ptr}, {sh['in_size']}, {sh['H']})"
+                f"kernel_lstm_f16({x_ptr}, "
+                f"{_weight_name(model_name, op['weight'], backend)}, "
+                f"{_weight_name(model_name, op['weight_hh'], backend)}, "
+                f"{_weight_name(model_name, op['bias'], backend)}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, "
+                f"{sh['input_size']}, {sh['hidden_size']})"
             )
         elif op["op"] == "depthwise_conv2d_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
                 f"kernel_depthwise_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -2670,8 +3402,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
         elif op["op"] == "layer_norm_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
-            gamma = _weight_name(model_name, op["gamma_key"])
-            beta = _weight_name(model_name, op["beta_key"])
+            gamma = _weight_name(model_name, op["gamma_key"], backend)
+            beta = _weight_name(model_name, op["beta_key"], backend)
             sh = op["shape"]
             eps = op.get("eps", 1e-5)
             call = (
@@ -2787,7 +3519,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # so we don't accidentally mangle the wrapper name itself.
         if op["op"] not in _PARALLELIZED_OPS:
             call = call.replace(
-                f"kernel_{op['op']}(", f"kernel_{op['op']}_{mid}(", 1
+                f"kernel_{op['op']}(", f"kernel_{op['op']}{_ksfx}_{mid}(", 1
             )
         # dispatch_id comes from the IR (assigned by extract_graph's
         # _annotate_dispatches). Propagating it here means the C-level
@@ -2871,7 +3603,17 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             f"    {per_disp_call};\n"
             f"    unsigned long _e = rdcycle();\n"
             f"{inspect_block}"
-            f"    int slot = n_++;\n"
+            # Wrap rather than grow unbounded: records_[] is sized for one
+            # pass (MODEL_..._OP_COUNT). The xpurt schedule-driven runtime
+            # invokes dispatches straight through the per-dispatch table
+            # (bypassing run_model_{mid}()'s n_=0 reset and reset_profile()),
+            # so for a periodic network n_ keeps climbing across every
+            # instance in the run. Without the modulo, more than one
+            # instance's worth of cumulative dispatches wrote straight past
+            # the end of this static array and corrupted adjacent memory
+            # (observed: a Load access fault a few dispatches into a
+            # schedule with 58 periodic instances of one network).
+            f"    int slot = (n_++) % MODEL_{umid}_OP_COUNT;\n"
             f'    records_[slot].dispatch_id = {dispatch_id};\n'
             f'    records_[slot].name   = "{op["name"]}";\n'
             f'    records_[slot].op     = "{op["op"]}";\n'
@@ -2881,33 +3623,107 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         )
         invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
 
-    # Emitted only when something is sharded, so a model with no shard plan
-    # produces byte-identical model.c to before this existed.
-    _shard_tables_block = (
-        chr(10).join(shard_tables) + chr(10) + chr(10)) if shard_tables else ""
-    c = f"""{HEADER}
-#include <stddef.h>
+    if platform == "host":
+        # Not a deployment target -- a CORRECTNESS target. The generated
+        # model.c is the only arch-specific file in a ModelBlaster build (the
+        # kernels, weights, buffers and harness are all plain C), and the only
+        # arch-specific thing in it is the two timer inlines: both `linux` and
+        # `zephyr` emit RISC-V `rdcycle`/`rdtime`, so `cc build/.../model.c` on
+        # an x86 host dies with "no such instruction: rdtime" and nothing else.
+        #
+        # That one line is what stood between "we changed the dispatch graph"
+        # and "we can prove the change still computes the right answer" without
+        # a board. MODELBLASTER_VERIFY compares the generated model against the
+        # goldens in io.npz in-binary and prints max_abs_err; an int8 model is
+        # exact integer arithmetic end to end, so that number is
+        # architecture-independent and a host run answers the correctness
+        # question that the board run would have answered -- before any board
+        # time is spent on a rewrite that might be wrong.
+        #
+        # The counts are therefore NANOSECONDS of host wall clock and are NOT a
+        # performance measurement of anything: different ISA, different cache
+        # hierarchy, no pinning. Never feed a `host` build's cycles into a
+        # profile DB or a cost model. `results.csv` producers take the board
+        # builds; this one takes the verdict line.
+        timer_preamble = """#include <stddef.h>
 #include <stdint.h>
-#include <zephyr/kernel.h>   /* for k_cycle_get_64() — static inline in this header */
+#include <time.h>
 #include "model.h"
 #include "kernels.h"
 #include "weights.h"
 
-/* Per-op timer: per-hart mcycle CSR. High resolution (one count per
- * retired instruction) and accurate enough for relative comparisons
- * between ops on spike. Caveat: on real Chipyard silicon mcycle pauses
- * during WFI, so when the master thread sleeps waiting on threadpool
- * workers this UNDERCOUNTS wall time. We additionally measure
- * end-to-end wall cycles via k_cycle_get_64() (mtime) — that's the
- * cross-hart-correct number; per-op rdcycle is only sound when run
- * sequentially or while the master itself participates in parallel
- * dispatch (which pthreadpool_parallelize_1d does). */
+/* Per-op timer, host build: CLOCK_MONOTONIC nanoseconds. Portable stand-in for
+ * the rdcycle/rdtime CSRs, which do not assemble off RISC-V. See the generator
+ * comment: these numbers are for nothing but keeping the record struct filled;
+ * the correctness verdict is what a host build is for. */
+static inline unsigned long long mb_wall_ticks(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull
+         + (unsigned long long)ts.tv_nsec;
+}
 static inline unsigned long rdcycle(void)
-{{
+{
+    return (unsigned long)mb_wall_ticks();
+}"""
+    elif platform == "linux":
+        # rdcycle is NOT usable here. Measured on a SpaceMiT K1 (Bianbu,
+        # Linux 6.6.63): reading the cycle CSR from userspace raises SIGILL,
+        # while rdtime works. So a Linux build must not emit rdcycle at all --
+        # it would not run slowly, it would die on the first timed dispatch.
+        #
+        # rdtime is a fixed 24.000 MHz on this board (measured; 41.7 ns tick),
+        # which is finer than any dispatch we profile (60 us .. 23 ms) and is
+        # better behaved than rdcycle would have been anyway: constant
+        # frequency under DVFS, and consistent across harts. Report the clock
+        # as 24 MHz when converting these counts to time.
+        timer_preamble = """#include <stddef.h>
+#include <stdint.h>
+#include <time.h>
+#include "model.h"
+#include "kernels.h"
+#include "weights.h"
+
+/* Per-op timer, Linux/riscv64: the rdtime CSR (fixed 24 MHz on SpaceMiT K1).
+ * rdcycle traps with SIGILL from userspace on this kernel, so it is not an
+ * option; rdtime is unprivileged, constant-rate under DVFS, and consistent
+ * across harts, which rdcycle is not. */
+static inline unsigned long rdcycle(void)
+{
+    unsigned long t;
+    __asm__ volatile("rdtime %0" : "=r"(t));
+    return t;
+}
+static inline unsigned long long mb_wall_ticks(void)
+{
+    unsigned long t;
+    __asm__ volatile("rdtime %0" : "=r"(t));
+    return (unsigned long long)t;
+}"""
+    else:
+        timer_preamble = """#include <stddef.h>
+#include <stdint.h>
+#include <zephyr/kernel.h>   /* for k_cycle_get_64() \u2014 static inline in this header */
+#include "model.h"
+#include "kernels.h"
+#include "weights.h"
+
+/* Per-op timer: per-hart mcycle CSR. */
+static inline unsigned long rdcycle(void)
+{
     unsigned long cc;
     __asm__ volatile("rdcycle %0" : "=r"(cc));
     return cc;
-}}
+}
+static inline unsigned long long mb_wall_ticks(void)
+{
+    return k_cycle_get_64();
+}"""
+
+    c = f"""{HEADER}
+{timer_preamble}
+
 {_emit_parallel_wrappers(mid, used_ops, backend, bool(shard_w_plan))}
 
 /* Per-model intermediate buffers. Defined in a sibling buffers.c (one
@@ -2927,7 +3743,9 @@ static int n_;
 static unsigned long wall_cycles_;
 
 /* ---------- per-dispatch invoke fns (one per non-view IR op) ----------- */
-{_shard_tables_block}{chr(10).join(dispatch_fns)}
+{chr(10).join(shard_tables)}
+
+{chr(10).join(dispatch_fns)}
 
 /* Invoke table indexed by IR dispatch_id. The schedule-driven runtime
  * uses this to call individual dispatches out-of-order; the
@@ -2949,15 +3767,22 @@ void run_model_{mid}({input_sig_params}model_{mid}_output_t *output,
                      void *pool) {{
     model_{mid}_state_t s = {{ {input_state_init}, .output = output, .pool = pool }};
     n_ = 0;
-    unsigned long _wall_s = (unsigned long)k_cycle_get_64();
+    unsigned long _wall_s = (unsigned long)mb_wall_ticks();
     for (int i = 0; i < MODEL_{umid}_OP_COUNT; i++) {{
         MODEL_{umid}_DISPATCH_FNS[i](&s);
     }}
-    wall_cycles_ = (unsigned long)k_cycle_get_64() - _wall_s;
+    wall_cycles_ = (unsigned long)mb_wall_ticks() - _wall_s;
 }}
 
 const model_{mid}_op_record_t *model_{mid}_profile_records(int *count) {{
-    *count = n_;
+    /* Clamp to OP_COUNT — the per-dispatch n_++ is non-atomic across
+     * harts, so under heavy multi-instance contention n_ can overshoot
+     * even with the cap in the dispatch fn. Without this clamp the dump
+     * iterator reads past records_[] and follows a garbage string
+     * pointer, faulting with mcause=5. */
+    int n = n_;
+    if (n > MODEL_{umid}_OP_COUNT) n = MODEL_{umid}_OP_COUNT;
+    *count = n;
     return records_;
 }}
 
@@ -3024,8 +3849,22 @@ def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
     out_bin_abs = os.path.abspath(os.path.join(out_dir, "test_golden.bin"))
     out.tofile(os.path.join(out_dir, "test_golden.bin"))
 
-    s_lines = ["/* @generated by modelblaster/pipeline/generate_skeleton.py */",
-               "    .section .rodata", "    .align 4"]
+    # Under CONFIG_RISCV_CMODEL_LARGE the harness defines MB_BIGIO_HIGH and
+    # places .mb_bigio ABOVE .bss/.sdata (harness/bigio.ld), so the startup
+    # assembly keeps gp + kernel bss within its fixed +/-2GiB reach while the
+    # C code reaches this far io via the large model's R_RISCV_64 indirection.
+    # Default (medany) builds keep the io in .rodata -> byte-identical. Set
+    # once here since it applies to every blob emitted below (single- or
+    # multi-input).
+    s_lines = [
+        "/* @generated by modelblaster/pipeline/generate_skeleton.py */",
+        "#ifdef MB_BIGIO_HIGH",
+        '    .section .mb_bigio, "a", @progbits',
+        "#else",
+        "    .section .rodata",
+        "#endif",
+        "    .align 4",
+    ]
 
     def _s_blob(sym, bin_abs):
         return [f"    .globl  {sym}", f"    .type   {sym}, @object",
@@ -3109,6 +3948,7 @@ def generate(
     io_path: str,
     out_dir: str,
     backend: Optional[str] = None,
+    platform: str = "zephyr",
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
@@ -3117,7 +3957,7 @@ def generate(
     model_name = ir["name"]
 
     emit_weights(model_name, weights, out_dir, backend=backend, ir=ir)
-    emit_model(ir, out_dir, backend=backend)
+    emit_model(ir, out_dir, platform=platform, backend=backend)
     emit_test_io(ir, io_path, out_dir)
 
     files = ["weights.h", "weights.c", "model.h", "model.c",
@@ -3140,8 +3980,22 @@ def main() -> None:
                          "tiled_conv_auto consumes directly, eliminating "
                          "the per-inference weight-transpose loop in the "
                          "kernel. Other backends are pass-through.")
+    ap.add_argument("--platform", default="zephyr",
+                    choices=["zephyr", "linux", "host"],
+                    help="Host OS for the generated model.c. 'zephyr' emits "
+                         "k_cycle_get_64 + rdcycle; 'linux' emits rdtime for "
+                         "both, because reading the cycle CSR from userspace "
+                         "raises SIGILL on a SpaceMiT K1 running Linux 6.6 -- "
+                         "an rdcycle build does not run slowly there, it dies "
+                         "on the first timed dispatch. 'host' emits "
+                         "clock_gettime so model.c assembles on the build "
+                         "machine: that build is for MODELBLASTER_VERIFY only "
+                         "(int8 arithmetic is exact, so max_abs_err is "
+                         "architecture-independent) and its cycle counts are "
+                         "host nanoseconds -- never a cost input.")
     args = ap.parse_args()
-    generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend)
+    generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend,
+             platform=args.platform)
 
 
 if __name__ == "__main__":

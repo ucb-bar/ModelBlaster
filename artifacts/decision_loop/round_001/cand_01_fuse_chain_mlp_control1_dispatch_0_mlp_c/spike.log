@@ -1,0 +1,73 @@
+[1/5] extract_graph (quant=int8) -> /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated
+MODELBLASTER_STAGE_BEGIN:extract
+  (skipped — IR present at /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated; set FORCE_EXTRACT=1 to re-run)
+MODELBLASTER_STAGE_END:extract:0.001
+[2/5] generate_skeleton (backend=rvv_opu) -> /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu
+MODELBLASTER_STAGE_BEGIN:generate_skeleton
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/weights.h
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/weights.c
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/model.h
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/model.c
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/buffers.c
+wrote /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu/test_io.h
+MODELBLASTER_STAGE_END:generate_skeleton:0.112
+[3/5] generate_kernels (backend=llm target=rvv_opu quant=int8 optimize=0) -> /scratch2/agustin/ModelBlaster/examples/mlp_control/int8/generated/rvv_opu
+  BEDROCK_CALLS_LOG=/scratch2/agustin/ModelBlaster/benchmarks/results/mlp_control_rvv_opu_int8/2026-06-03T03-07-13Z/llm_calls.jsonl
+MODELBLASTER_STAGE_BEGIN:generate_kernels
+backend=llm  target=rvv_opu  ops=['linear_s8', 'linear_s8_elu_s8']
+  [linear_s8] verify shapes=[{'M': 1, 'K': 64, 'N': 4}, {'M': 1, 'K': 16, 'N': 32}, {'M': 1, 'K': 32, 'N': 32}, {'M': 1, 'K': 32, 'N': 10}, {'M': 1, 'K': 7, 'N': 13}, {'M': 4, 'K': 17, 'N': 23}]
+  [linear_s8] target-affinity preference: dropped universal-affinity ['direct'] in favor of ['outerprod']
+  [linear_s8] algorithm queue: ['outerprod']
+  [linear_s8/outerprod] probing cached kernel
+  [linear_s8/outerprod] cache HIT — 497 cycles
+  [linear_s8] using algorithm 'outerprod' (497 cycles, fastest of available options)
+  [linear_s8_elu_s8] verify shapes=[{}, {'M': 1, 'K': 16, 'N': 256}, {'M': 1, 'K': 256, 'N': 128}, {'M': 1, 'K': 128, 'N': 64}, {'M': 1, 'K': 17, 'N': 23}, {'M': 2, 'K': 7, 'N': 5}]
+  [linear_s8_elu_s8] algorithm queue: ['direct']
+  [linear_s8_elu_s8/direct] attempt 1/4: calling gemini-2.5-flash
+Traceback (most recent call last):
+  File "/scratch2/agustin/ModelBlaster/pipeline/gemini_client.py", line 87, in _ensure_client
+    from google import genai  # type: ignore[import]
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'google'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/scratch2/agustin/ModelBlaster/pipeline/generate_kernels.py", line 1747, in <module>
+    main()
+    ~~~~^^
+  File "/scratch2/agustin/ModelBlaster/pipeline/generate_kernels.py", line 1724, in main
+    generate(
+    ~~~~~~~~^
+        args.ir, args.out_dir, args.backend, args.target,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<16 lines>...
+        firesim_op_filter=firesim_op_filter,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/scratch2/agustin/ModelBlaster/pipeline/generate_kernels.py", line 1353, in generate
+    result = generate_one_llm(
+        spec, shapes, client, target, correctness_system,
+    ...<7 lines>...
+        max_accuracy_class=max_accuracy_class,
+    )
+  File "/scratch2/agustin/ModelBlaster/pipeline/generate_kernels.py", line 924, in generate_one_llm
+    code = _generate_one_llm_for_algorithm(
+        spec, algorithm, shapes, client, backend, correctness_system,
+    ...<4 lines>...
+        cache_dir=cache_dir,
+    )
+  File "/scratch2/agustin/ModelBlaster/pipeline/generate_kernels.py", line 664, in _generate_one_llm_for_algorithm
+    res = client.converse(user=user, system=correctness_system,
+                          max_tokens=32768, temperature=temp,
+                          phase=f"synth:{spec.op}")
+  File "/scratch2/agustin/ModelBlaster/pipeline/gemini_client.py", line 111, in converse
+    client = self._ensure_client(timeout_s=timeout)
+  File "/scratch2/agustin/ModelBlaster/pipeline/gemini_client.py", line 90, in _ensure_client
+    raise RuntimeError(
+    ...<2 lines>...
+    ) from e
+RuntimeError: google-genai is not installed. Install the `llm` extra: `uv sync --extra llm`

@@ -815,3 +815,84 @@ output[m * N + n] = (int8_t)scaled;
   (all offsets = 0) the addition is a no-op so it's invisible, but get the
   shape right anyway: skip the offset add entirely if the offset is
   statically known to be 0.
+
+
+### Saturn OPU (rvv_opu) custom instructions
+
+The `rvv_opu` backend targets Saturn's OPU custom-instruction extension
+(an int outer-product MAC unit decoded on V opcode 0x57). Use the
+**macros from `saturn_opu.h`** — never hand-roll the `.insn r 0x57, ...`
+encoding yourself, and never put vector-typed values in inline-asm
+operand constraints.
+
+**API (single-tile, M, N <= mlmax = VLEN/8):**
+
+```c
+/* MANDATORY: opt in to keep m0..m3 / v0..v31 #defines alive past the
+ * header so the OPU macros below can use them as architectural-
+ * register-name arguments. WITHOUT this define, the assembler will
+ * reject every macro call with `bad value for funct2 field` and
+ * `illegal operands` errors. */
+#define SATURN_OPU_KEEP_REGISTER_MACROS
+#include "saturn_opu.h"
+
+OPMVINBCAST(m1, v0);          /* broadcast vector v0 to all M rows of m1 */
+VOPACC(m1, v18, v16);         /* m1[r,c] += v16[r] * v18[c] (int outer-prod) */
+VMV_VR(v0, m, m1);            /* drain row m of m1 into v0 (i32 N lanes) */
+VMV_RV(m1, x_scalar, v2);     /* less common: scalar -> row v2 of m1 */
+```
+
+The macros take **register-name strings only** — no vector or scalar C
+expressions inside them. Set the lane count and SEW via `vsetvli`
+**before** the macro call.
+
+**Failure modes to avoid (these caused 4 prior LLM-codegen attempts to
+fail compile):**
+
+1. `cannot convert a vector of type 'vint32m4_t' to type 'long unsigned
+   int'` — happens when you try to pass a `__riscv_*` intrinsic result
+   into inline asm with `"r"(vec_val)`. The OPU macros do NOT need this;
+   vector data flows through architectural v-registers set up by
+   `vle*.v` / `vse*.v`.
+2. `inconsistent operand constraints in 'asm'` — caused by mixing
+   `"=&r"` outputs with vector input clobbers. The macros have no
+   operands; just call them.
+3. `bad value for funct2 field` and `illegal operands 'r 0x57, ...'` —
+   caused by hand-rolling `.insn r` with wrong funct fields. The macros
+   encode them correctly (funct3 = 0x6 for OPMVINBCAST/VMV_RV/VMV_VR;
+   funct3 = 0x2 for VOPACC; funct7 = 0x59 / 0x55 / 0x5d / 0x51).
+
+**Worked outer-product gemm template (i8, single-tile):**
+
+```c
+/* M, N <= mlmax = VLEN/8, K small enough to loop. */
+size_t mlmax;
+asm volatile("vsetvli %0, zero, e8, m1, ta, ma" : "=r"(mlmax));
+
+/* Seed m1 with zero (or bias via vle32.v into v0 first). */
+asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"((size_t)N));
+asm volatile("vmv.v.i v0, 0");
+OPMVINBCAST(m1, v0);
+
+/* K-loop: outer-product accumulate into m1. */
+for (int k = 0; k < K; k++) {
+    asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"((size_t)M));
+    asm volatile("vle8.v v16, (%0)" : : "r"(&at[k * M]));   /* a column */
+    asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"((size_t)N));
+    asm volatile("vle8.v v18, (%0)" : : "r"(&b [k * N]));   /* b row    */
+    VOPACC(m1, v18, v16);
+}
+
+/* Drain rows of m1, store as i32. */
+int32_t row[64];
+asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"((size_t)N));
+for (int m = 0; m < M; m++) {
+    VMV_VR(v0, m, m1);
+    asm volatile("vse32.v v0, (%0)" : : "r"(row));
+    /* requantize row[0..N-1] per the spec's tail and store to c. */
+}
+```
+
+The header `#undef`s `m0..m3` / `v0..v31` at the bottom so you can also
+use those identifiers as C variables outside macro calls. Include
+`<riscv_vector.h>` **before** `"saturn_opu.h"`.

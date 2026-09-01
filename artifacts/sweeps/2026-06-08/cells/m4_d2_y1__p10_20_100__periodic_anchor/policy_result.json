@@ -1,0 +1,20 @@
+{
+  "policy": "periodic_anchor",
+  "status": "ok",
+  "solve_wall_s": 2.208,
+  "fixture_path": "/scratch2/agustin/XPU-RT/schedules/scheduled_workload_decomposed_profiled.json",
+  "makespan": 130.16126,
+  "n_deadline_miss": 88,
+  "n_release_viol": 0,
+  "n_dispatches": 182,
+  "n_shards_applied": 0,
+  "n_fuses_applied": 0,
+  "policy_log": [
+    {
+      "action": "policy_anchor",
+      "intent": "reserve periodic slots first via decomposed solver"
+    }
+  ],
+  "local_fixture": "/scratch2/agustin/ModelBlaster/artifacts/sweeps/2026-06-08/cells/m4_d2_y1__p10_20_100__periodic_anchor/fixture.json",
+  "gantt": "/scratch2/agustin/ModelBlaster/artifacts/sweeps/2026-06-08/cells/m4_d2_y1__p10_20_100__periodic_anchor/gantt.png"
+}

@@ -1,7 +1,8 @@
 """DroNet model wrapper for the modelblaster flow.
 
-Sources the canonical PyTorch class from qnn_models/dronet.py and loads the
-latest trained checkpoint by default. The trained config is:
+Sources the canonical PyTorch class from the vendored dronet_arch.py (see
+that module's docstring) and loads the latest trained checkpoint by
+default. The trained config is:
 
     img_dims = (112, 112)   img_channels = 3   small = True
     -> linear_in = 2048 (after the conv/pool stack).
@@ -15,17 +16,18 @@ Override the checkpoint path via MODELBLASTER_DRONET_CKPT.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 
 import torch
 
+from . import dronet_arch
 
-_DRONET_SRC = "/scratch2/dima/misc_sw/FreshScheduler/qnn_models/dronet.py"
-
-# Latest trained DroNet checkpoint (best by val_mse from the 30-epoch run).
-_DEFAULT_CKPT = (
-    "/scratch2/dima/misc_sw/FreshScheduler/logs/dronet/2026-04-27_17-10-41/best.pt"
+# Committed alongside this module (see models/mlp_control.py for the same
+# fix applied there) -- previously an absolute path into one user's home
+# directory, which doesn't exist on any other checkout.
+_DEFAULT_CKPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "checkpoints", "dronet", "best.pt",
 )
 
 # Trained config: 3-channel input at 112x112.
@@ -34,19 +36,9 @@ _IMG_H = 112
 _IMG_W = 112
 
 
-def _load_dronet_module():
-    spec = importlib.util.spec_from_file_location("qnn_dronet", _DRONET_SRC)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load dronet from {_DRONET_SRC}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def get_model(seed: int = 0):
     torch.manual_seed(seed)
-    mod = _load_dronet_module()
-    m = mod.DronetTorch(
+    m = dronet_arch.DronetTorch(
         img_dims=(_IMG_H, _IMG_W),
         img_channels=_IMG_CHANNELS,
         output_dim=1,

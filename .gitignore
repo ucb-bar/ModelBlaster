@@ -20,8 +20,10 @@ runtime/modelblaster_pool/test_app/build/
 
 tmp/
 
-# Claude Code session state (CronCreate, etc.) -- ephemeral, never commit.
-.claude/
+# Claude Code session state -- ephemeral logs / per-user policy never
+# commit; shared skills + hooks DO commit so teammates pick them up.
+.claude/logs/
+.claude/edit_policy.json
 
 # Live cost monitor session ledger -- per-machine, gitignored.
 benchmarks/results/.sessions.json
@@ -47,3 +49,28 @@ benchmarks/reports/*
 # clean clone re-downloads from the canonical URL. Tracked in the
 # model loader's _load_*_weights() helper.
 yolov8n.pt
+
+# Bundle run logs / uartlogs — large per-machine artifacts, not useful
+# cross-machine. Keep the rendered Gantts, the extracted trace.csv, and
+# the JSON reports.
+artifacts/bundle/**/run_stdout.log
+artifacts/bundle/**/uartlog
+build/k1_xpurt/
+
+# Cross-compiled build trees. Object files, ELF harnesses, and the generated
+# C/weights they are built from -- all reproducible from the model definition
+# plus a kernel pick, and ~615 files of it. `build/k1_xpurt/` was already
+# ignored; the other roots (`build/k1`, `build/b3_cross`, `build/b3_host`, …)
+# are the same kind of thing and were not, so `git add -A` before a push would
+# have swept in a compiler's entire output.
+#
+# The CURATED KERNELS THEMSELVES ARE TRACKED and are not affected by this:
+# they live in `kernels/<backend>/`, which is source.
+build/
+harness_linux/build/
+
+# Scratch profile tree written by ad-hoc runs. The authoritative measured
+# profiles live in XPU-RT's `gen_mb/profile/`, which is what the scheduler
+# ingests; a copy here is a leftover, and committing one invites a solve
+# against costs nothing else can see.
+gen/profile_mb/

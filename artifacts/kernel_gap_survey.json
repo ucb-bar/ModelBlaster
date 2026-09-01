@@ -1,0 +1,207 @@
+{
+  "registered_fused_kernels": [
+    {
+      "op": "conv2d_silu_s8",
+      "components": [
+        "conv2d",
+        "silu"
+      ],
+      "dtype": "s8"
+    },
+    {
+      "op": "linear_s8_elu_s8",
+      "components": [
+        "linear",
+        "elu"
+      ],
+      "dtype": "s8"
+    },
+    {
+      "op": "conv2d_batchnorm2d_s8",
+      "components": [
+        "conv2d",
+        "batchnorm2d"
+      ],
+      "dtype": "s8"
+    },
+    {
+      "op": "batchnorm2d_silu_s8",
+      "components": [
+        "batchnorm2d",
+        "silu"
+      ],
+      "dtype": "s8"
+    }
+  ],
+  "candidate_pairs_seen": {
+    "linear__elu": 3,
+    "elu__linear": 3,
+    "conv2d_s8__maxpool2d_s8": 1,
+    "batchnorm2d_s8__relu_s8": 6,
+    "relu_s8__conv2d_s8": 6,
+    "conv2d_s8__batchnorm2d_s8": 60,
+    "add_s8__relu_s8": 1,
+    "view__sigmoid_s8": 1,
+    "batchnorm2d_s8__silu_s8": 57,
+    "silu_s8__conv2d_s8": 29,
+    "silu_s8__chunk2_c1": 8,
+    "cat3_c1_s8__conv2d_s8": 6,
+    "cat4_c1_s8__conv2d_s8": 3,
+    "cat2_c1_s8__conv2d_s8": 4
+  },
+  "gaps_unregistered": [
+    {
+      "pair": "silu_s8__chunk2_c1",
+      "candidate_count": 8,
+      "components": [
+        "silu_s8",
+        "chunk2_c1"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "batchnorm2d_s8__relu_s8",
+      "candidate_count": 6,
+      "components": [
+        "batchnorm2d_s8",
+        "relu_s8"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "relu_s8__conv2d_s8",
+      "candidate_count": 6,
+      "components": [
+        "relu_s8",
+        "conv2d_s8"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "cat3_c1_s8__conv2d_s8",
+      "candidate_count": 6,
+      "components": [
+        "cat3_c1_s8",
+        "conv2d_s8"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "cat2_c1_s8__conv2d_s8",
+      "candidate_count": 4,
+      "components": [
+        "cat2_c1_s8",
+        "conv2d_s8"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "cat4_c1_s8__conv2d_s8",
+      "candidate_count": 3,
+      "components": [
+        "cat4_c1_s8",
+        "conv2d_s8"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "conv2d_s8__maxpool2d_s8",
+      "candidate_count": 1,
+      "components": [
+        "conv2d_s8",
+        "maxpool2d_s8"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "add_s8__relu_s8",
+      "candidate_count": 1,
+      "components": [
+        "add_s8",
+        "relu_s8"
+      ],
+      "already_registered": false
+    },
+    {
+      "pair": "view__sigmoid_s8",
+      "candidate_count": 1,
+      "components": [
+        "view",
+        "sigmoid_s8"
+      ],
+      "already_registered": false
+    }
+  ],
+  "gaps_registered": [
+    {
+      "pair": "conv2d_s8__batchnorm2d_s8",
+      "candidate_count": 60,
+      "components": [
+        "conv2d_s8",
+        "batchnorm2d_s8"
+      ],
+      "already_registered": true
+    },
+    {
+      "pair": "batchnorm2d_s8__silu_s8",
+      "candidate_count": 57,
+      "components": [
+        "batchnorm2d_s8",
+        "silu_s8"
+      ],
+      "already_registered": true
+    },
+    {
+      "pair": "silu_s8__conv2d_s8",
+      "candidate_count": 29,
+      "components": [
+        "silu_s8",
+        "conv2d_s8"
+      ],
+      "already_registered": true
+    },
+    {
+      "pair": "linear__elu",
+      "candidate_count": 3,
+      "components": [
+        "linear",
+        "elu"
+      ],
+      "already_registered": true
+    },
+    {
+      "pair": "elu__linear",
+      "candidate_count": 3,
+      "components": [
+        "elu",
+        "linear"
+      ],
+      "already_registered": true
+    }
+  ],
+  "workload": "/scratch2/agustin/XPU-RT/data/toplevel/networks_1yolo_4mlp_2dronet_firesim.json",
+  "per_network": {
+    "mlp_control": {
+      "linear__elu": 3,
+      "elu__linear": 3
+    },
+    "dronet": {
+      "conv2d_s8__maxpool2d_s8": 1,
+      "batchnorm2d_s8__relu_s8": 6,
+      "relu_s8__conv2d_s8": 6,
+      "conv2d_s8__batchnorm2d_s8": 3,
+      "add_s8__relu_s8": 1,
+      "view__sigmoid_s8": 1
+    },
+    "yolov8_nano": {
+      "conv2d_s8__batchnorm2d_s8": 57,
+      "batchnorm2d_s8__silu_s8": 57,
+      "silu_s8__conv2d_s8": 29,
+      "silu_s8__chunk2_c1": 8,
+      "cat3_c1_s8__conv2d_s8": 6,
+      "cat4_c1_s8__conv2d_s8": 3,
+      "cat2_c1_s8__conv2d_s8": 4
+    }
+  },
+  "total_candidate_pairs": 188
+}

@@ -1,0 +1,20 @@
+{
+  "contract": "modelblaster.fusion_hints/v1",
+  "reason": "decision_loop: granularity candidate fuse_chain_mlp_control2_dispatch_0_mlp_control2_dispatch_5; predicted \u0394makespan 0.0 \u00b5s",
+  "networks": [
+    {
+      "network": "mlp_control",
+      "fuse_groups": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      ],
+      "n_tiny": 6
+    }
+  ]
+}

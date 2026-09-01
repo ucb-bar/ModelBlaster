@@ -1,0 +1,48 @@
+{
+  "harts": [
+    {
+      "kind_idx": 0,
+      "kind": "gemmini",
+      "kernel_us": 109403,
+      "dep_wait_us": 383728,
+      "sync_overhead_us": 119,
+      "target_gate_spin_us": 449,
+      "hart_idle_us": 56,
+      "gemmini_cfg_emit_us": 0,
+      "entries_done": 105,
+      "wall_total_us": 493768,
+      "attributed_us": 493755,
+      "unattributed_us": 13,
+      "attribution_pct": 99.99736718458871
+    },
+    {
+      "kind_idx": 1,
+      "kind": "rvv_opu",
+      "kernel_us": 509152,
+      "dep_wait_us": 61646,
+      "sync_overhead_us": 203,
+      "target_gate_spin_us": 0,
+      "hart_idle_us": 72,
+      "gemmini_cfg_emit_us": 0,
+      "entries_done": 283,
+      "wall_total_us": 571117,
+      "attributed_us": 571073,
+      "unattributed_us": 44,
+      "attribution_pct": 99.99229579928456
+    }
+  ],
+  "per_network": {
+    "mlp_control": {
+      "wall_clock_cycles_us": 77397,
+      "max_abs_err": 0.0
+    },
+    "dronet": {
+      "wall_clock_cycles_us": 153483,
+      "max_abs_err": 72.0
+    },
+    "yolov8_nano": {
+      "wall_clock_cycles_us": 422892,
+      "max_abs_err": 22.0
+    }
+  }
+}

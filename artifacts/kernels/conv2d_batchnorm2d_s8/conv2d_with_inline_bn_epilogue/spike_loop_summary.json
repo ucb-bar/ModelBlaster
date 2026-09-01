@@ -1,0 +1,33 @@
+{
+  "status": "PASS",
+  "winning_attempt": 1,
+  "total_cost_usd": 0.0,
+  "history": [
+    {
+      "attempt": 1,
+      "bedrock_cost_usd": 0.0,
+      "shapes": [
+        {
+          "status": "ok",
+          "shape": {
+            "N": 1,
+            "IC": 4,
+            "IH": 8,
+            "IW": 8,
+            "OC": 4,
+            "KH": 3,
+            "KW": 3,
+            "SH": 1,
+            "SW": 1,
+            "PH": 1,
+            "PW": 1
+          },
+          "max_abs_err": 0,
+          "n_diff": 0,
+          "n_el": 256,
+          "verify_wall_s": 0.32
+        }
+      ]
+    }
+  ]
+}

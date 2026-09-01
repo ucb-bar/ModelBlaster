@@ -1,0 +1,11 @@
+{
+  "contract": "modelblaster.fusion_hints/v1",
+  "reason": "agent's top fuse_linear_chain candidate from granularity_loop on the 1+4+2 yolo workload: mlp_control1[0..5]. Predicted Δmakespan -0.80us, eliminates 5 worker handshakes. Picked over the split runner-up because conv2d_s8 split realization is not yet implemented (Phase 1e covers linear_s8 only).",
+  "networks": [
+    {
+      "network": "mlp_control",
+      "fuse_groups": [[0,1,2,3,4,5]],
+      "n_tiny": 7
+    }
+  ]
+}
