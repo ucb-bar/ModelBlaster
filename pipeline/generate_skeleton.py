@@ -3390,11 +3390,21 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             call = (
+                # No dilation args: kernel_conv2d_f16 takes 15 parameters in
+                # BOTH lineages -- reference_kernels' CONV2D_F16 spec and the
+                # curated rvv_f16 kernels, ours and origin/main's alike, all
+                # stop at PW. origin/main's skeleton appends DH/DW anyway,
+                # which no spec or kernel in either tree accepts; it is latent
+                # there and became a hard build error here ("too many arguments
+                # to function 'kernel_conv2d_f16_vint_rvv_f16'") the first time
+                # a f16 model was rebuilt after the merge. Every conv2d_f16 and
+                # depthwise_conv2d_f16 op in this tree is DH=DW=1, so nothing
+                # needs the arguments; add them to the SPEC and the kernels
+                # first if dilated f16 conv is ever wanted.
                 f"kernel_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
-                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
-                f"{sh.get('DH', 1)}, {sh.get('DW', 1)})"
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
             )
         # ---- Mixed-precision cast kernels ----
         elif op["op"] == "cast_i8_to_f16":
