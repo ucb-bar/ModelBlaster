@@ -128,9 +128,11 @@ foreach(_i RANGE ${_last})
     file(WRITE "${_STAGE_DIR}/${_name}_test_io.h"
          "#pragma once\n#include \"${_primary_dir}/test_io.h\"\n")
 
-    # Per-(model, backend) OBJECT lib over model.c + kernels.c, with -D
-    # renames so the externally-visible symbols don't collide across
-    # backends. Weights are NOT renamed (link once per model below).
+    # Per-(model, backend) OBJECT lib over model.c + kernels.c + weights.c,
+    # with -D renames so the externally-visible symbols don't collide across
+    # backends. weights.c is per-backend because the packed layouts differ
+    # (gemmini OIHW vs rvv IHWOC — 93% of dronet's weight elements), so each
+    # backend must link the copy it was packed for.
     foreach(_bs IN LISTS MODEL_BACKENDS)
         set(_backend_dir "${_base}/${_bs}")
         foreach(_required model.c kernels.c weights.c)
@@ -151,6 +153,7 @@ foreach(_i RANGE ${_last})
                 python -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}"
                     --backend "${_bs}"
+                    --weights-header "${_backend_dir}/weights.h"
                     --separator ";"
             OUTPUT_VARIABLE _rename_flags
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -169,7 +172,8 @@ foreach(_i RANGE ${_last})
 
         set(_obj_tgt "modelblaster_${_name}_${_bs}_objs")
         add_library(${_obj_tgt} OBJECT
-            "${_backend_dir}/model.c" "${_backend_dir}/kernels.c")
+            "${_backend_dir}/model.c" "${_backend_dir}/kernels.c"
+            "${_backend_dir}/weights.c")
         target_include_directories(${_obj_tgt} PRIVATE "${_backend_dir}")
         target_link_libraries(${_obj_tgt} PRIVATE zephyr_interface)
         target_link_libraries(${_obj_tgt} PRIVATE modelblaster_pool)
@@ -194,14 +198,6 @@ foreach(_i RANGE ${_last})
 
         message(STATUS "harness_xpurt: ${_name}/${_bs} -> ${_obj_tgt}")
     endforeach()
-
-    # Backend-agnostic weights — single OBJECT lib, picked from the
-    # primary backend's dir (all copies are identical).
-    set(_weights_tgt "modelblaster_${_name}_weights_obj")
-    add_library(${_weights_tgt} OBJECT "${_primary_dir}/weights.c")
-    target_include_directories(${_weights_tgt} PRIVATE "${_primary_dir}")
-    target_link_libraries(${_weights_tgt} PRIVATE zephyr_interface)
-    target_compile_definitions(${_weights_tgt} PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
 
     # Intermediate-buffer storage — also single OBJECT lib per model, NOT
     # per backend. Without this, each per-backend model.c TU would carry
@@ -252,15 +248,14 @@ if(MODELBLASTER_XPURT_TRACE)
     target_compile_definitions(app PRIVATE MODELBLASTER_XPURT_TRACE=1)
 endif()
 
-# Link every (model, backend) OBJECT lib + the per-model weights and
-# buffers OBJECT libs into the final binary. weights and buffers are
-# shared across all backends of one model — see comments where they're
+# Link every (model, backend) OBJECT lib (model.c + kernels.c + weights.c)
+# plus the per-model buffers OBJECT lib. buffers are shared across all
+# backends of one model; weights are NOT — see comments where they're
 # declared.
 foreach(_name ${MODEL_NAMES})
     foreach(_bs IN LISTS MODEL_BACKENDS)
         target_link_libraries(app PRIVATE modelblaster_${_name}_${_bs}_objs)
     endforeach()
-    target_link_libraries(app PRIVATE modelblaster_${_name}_weights_obj)
     target_link_libraries(app PRIVATE modelblaster_${_name}_buffers_obj)
     if(TARGET modelblaster_${_name}_test_io_obj)
         target_link_libraries(app PRIVATE modelblaster_${_name}_test_io_obj)
