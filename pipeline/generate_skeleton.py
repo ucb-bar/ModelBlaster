@@ -1748,6 +1748,30 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             offset_aliases[op["outputs"][0]] = (base, 0)
             offset_aliases[op["outputs"][1]] = (base, elem_offset)
 
+    # Split tiles: `<parent>.tile_k` produced by pipeline/apply_split_hint.py.
+    # apply_split_hint's contract is "no final concat needed -- each tile writes
+    # to its own output SLICE" of the parent tensor. That only holds if the
+    # tiles alias the parent buffer at an offset; giving each tile a standalone
+    # buffer leaves the parent UNWRITTEN and the downstream consumer reads
+    # uninitialised memory. Observed on a 2-way split of dronet conv2d_s8[0]:
+    # every kernel on BOTH backends failed verify with the identical
+    # max_abs_err=18 / max_rel_err=0.321 -- a model-level error, with each
+    # kernel merely reporting it, including relu/sigmoid/maxpool which the
+    # split never touched.
+    #
+    # Tiles split along OC and the layout is NCHW, so tile k occupies a
+    # contiguous run of k * prod(tile_shape) elements from the parent's base --
+    # the same pointer-arithmetic aliasing chunk2_c1 uses above.
+    for tname, tinfo in (tensors or {}).items():
+        sf = tinfo.get("split_from")
+        if not sf:
+            continue
+        base = sf if isinstance(sf, str) else sf.get("tensor")
+        if not base or base not in tensors:
+            continue
+        k = int(tinfo.get("tile", 0))
+        offset_aliases[tname] = (base, k * _prod(tinfo["shape"]))
+
     # Number of ops that actually emit a kernel call (used to size the profile
     # record array). chunk2_c1 is a no-op at runtime (just sets up offset
     # aliases at codegen time), so it doesn't contribute either.
