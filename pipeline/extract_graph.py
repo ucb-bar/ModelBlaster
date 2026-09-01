@@ -95,6 +95,20 @@ def _annotate_dispatches(ops: list[dict]) -> list[int]:
 import operator as _operator
 
 
+def _round_half_away(x):
+    """Round half away from zero, like C's round()/roundf().
+
+    numpy's np.round is half-to-EVEN (banker's rounding), so a value landing
+    exactly on .5 goes the other way from the generated C. On an int8 grid that
+    is a whole LSB of disagreement between the golden simulator and the device,
+    and it shows up as a verify FAIL with max_abs_err=1 that no amount of extra
+    float precision fixes -- the two are computing the same real number and
+    disagreeing about how to round it.
+    """
+    import numpy as _np
+    return _np.sign(x) * _np.floor(_np.abs(x) + 0.5)
+
+
 def _find_getitem_consumer(node, index: int):
     """Return the unique operator.getitem consumer of `node` selecting
     `index`, or None. Used by the torch.max/min handlers to find the
@@ -325,6 +339,158 @@ def _match_frobenius_norm(out, x):
     return True
 
 
+def _match_rms_norm(out, x):
+    """Pattern: out = x / sqrt(mean(x**2, dim=1, keepdim=True) + eps).
+    Returns eps (float) on match, else None (KernelBench 36_RMSNorm)."""
+    if out.op != "call_function" or out.target not in (_operator.truediv, torch.div):
+        return None
+    if len(out.args) != 2 or out.args[0] is not x:
+        return None
+    sqrt_node = out.args[1]
+    if not (hasattr(sqrt_node, "op") and sqrt_node.op == "call_function"
+            and getattr(sqrt_node.target, "__name__", "") == "sqrt"):
+        return None
+    add_node = sqrt_node.args[0]
+    if not (hasattr(add_node, "op") and add_node.op == "call_function"
+            and add_node.target in (_operator.add, torch.add)):
+        return None
+    mean_node, eps = add_node.args[0], add_node.args[1]
+    if not isinstance(eps, (int, float)):
+        mean_node, eps = add_node.args[1], add_node.args[0]
+    if not isinstance(eps, (int, float)):
+        return None
+    if not (hasattr(mean_node, "op") and mean_node.op == "call_function"
+            and getattr(mean_node.target, "__name__", "") == "mean"):
+        return None
+    mkw = mean_node.kwargs or {}
+    dim = mkw.get("dim", None)
+    if dim is None and len(mean_node.args) > 1:
+        dim = mean_node.args[1]
+    if dim != 1:
+        return None
+    pow_node = mean_node.args[0]
+    if not (hasattr(pow_node, "op") and pow_node.op == "call_function"
+            and pow_node.target in (_operator.pow, torch.pow)):
+        return None
+    if len(pow_node.args) < 2 or pow_node.args[0] is not x or pow_node.args[1] != 2:
+        return None
+    return float(eps)
+
+
+def _match_mean_abs_norm(out, x):
+    """Pattern: out = x / mean(abs(x), dim=1, keepdim=True) (KernelBench 38,
+    L1 normalization). Returns True on match."""
+    if out.op != "call_function" or out.target not in (_operator.truediv, torch.div):
+        return False
+    if len(out.args) != 2 or out.args[0] is not x:
+        return False
+    mean_node = out.args[1]
+    if not (hasattr(mean_node, "op") and mean_node.op == "call_function"
+            and getattr(mean_node.target, "__name__", "") == "mean"):
+        return False
+    mkw = mean_node.kwargs or {}
+    dim = mkw.get("dim", None)
+    if dim is None and len(mean_node.args) > 1:
+        dim = mean_node.args[1]
+    if dim != 1:
+        return False
+    abs_node = mean_node.args[0]
+    if not (hasattr(abs_node, "op") and abs_node.op == "call_function"
+            and abs_node.target in (torch.abs, _operator.abs)):
+        return False
+    return len(abs_node.args) >= 1 and abs_node.args[0] is x
+
+
+def _agents_loss_mse(a, b):
+    return a
+
+
+def _agents_loss_hinge(a, b):
+    return a
+
+
+def _is_mean_all(node) -> bool:
+    """torch.mean with no dim → scalar (mean over all elements)."""
+    if not (hasattr(node, "op") and node.op == "call_function"
+            and getattr(node.target, "__name__", "") == "mean"):
+        return False
+    kw = node.kwargs or {}
+    return kw.get("dim") is None and len(node.args) < 2
+
+
+def _maybe_fuse_loss(gm) -> None:
+    """Fuse whole-graph loss patterns that produce a scalar from 2 inputs into
+    a single op: MSE = mean((a-b)^2), Hinge = mean(clamp(1 - a*b, min=0)).
+    Single-node losses (cross_entropy, smooth_l1, kl_div, TripletMarginLoss)
+    are handled directly in the per-node loop, not here."""
+    outputs = [n for n in gm.graph.nodes if n.op == "output"]
+    if len(outputs) != 1:
+        return
+    out_arg = outputs[0].args[0]
+    if not (hasattr(out_arg, "op") and _is_mean_all(out_arg)):
+        return
+    inner = out_arg.args[0]  # the tensor being mean-reduced
+
+    sentinel = None
+    # MSE: mean(pow(sub(a, b), 2))
+    if (hasattr(inner, "op") and inner.op == "call_function"
+            and inner.target in (_operator.pow, torch.pow)
+            and len(inner.args) >= 2 and inner.args[1] == 2):
+        sub = inner.args[0]
+        if (hasattr(sub, "op") and sub.op == "call_function"
+                and sub.target in (_operator.sub, torch.sub)
+                and all(isinstance(x, torch.fx.Node) for x in sub.args[:2])):
+            a, b = sub.args[0], sub.args[1]
+            sentinel = _agents_loss_mse
+    # Hinge: mean(clamp(sub(1, mul(a, b)), min=0))
+    if sentinel is None and (hasattr(inner, "op") and inner.op == "call_function"
+            and getattr(inner.target, "__name__", "") == "clamp"):
+        rsub = inner.args[0]
+        if (hasattr(rsub, "op") and rsub.op == "call_function"
+                and rsub.target in (_operator.sub, torch.sub, torch.rsub)):
+            mul = rsub.args[1] if rsub.args[0] == 1 else (
+                rsub.args[0] if rsub.target is torch.rsub else None)
+            if (hasattr(mul, "op") and mul.op == "call_function"
+                    and mul.target in (_operator.mul, torch.mul)
+                    and all(isinstance(x, torch.fx.Node) for x in mul.args[:2])):
+                a, b = mul.args[0], mul.args[1]
+                sentinel = _agents_loss_hinge
+    if sentinel is None:
+        return
+
+    n = int(np.prod(list(inner.meta["tensor_meta"].shape)))
+    with gm.graph.inserting_before(outputs[0]):
+        new_node = gm.graph.call_function(sentinel, args=(a, b))
+    new_node.meta["loss_n"] = n
+    if "tensor_meta" in out_arg.meta:
+        new_node.meta["tensor_meta"] = out_arg.meta["tensor_meta"]
+    outputs[0].args = (new_node,)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+
+
+def _match_exclusive_cumsum(out, x):
+    """Pattern (KernelBench 92): cumsum(cat([zeros_like(...), x])[:-1], dim=1).
+    x is 2D [B, N]; output is [B-1, N+1]. Returns True on match."""
+    if not (out.op == "call_function"
+            and getattr(out.target, "__name__", "") == "cumsum"):
+        return False
+    gi = out.args[0]
+    if not (hasattr(gi, "op") and gi.op == "call_function"
+            and getattr(gi.target, "__name__", "") == "getitem"):
+        return False
+    cat = gi.args[0]
+    if not (hasattr(cat, "op") and cat.op == "call_function"
+            and getattr(cat.target, "__name__", "") == "cat"):
+        return False
+    seq = cat.args[0]
+    if not (isinstance(seq, (tuple, list)) and len(seq) == 2 and seq[1] is x):
+        return False
+    zl = seq[0]
+    return (hasattr(zl, "op") and zl.op == "call_function"
+            and getattr(zl.target, "__name__", "") == "zeros_like")
+
+
 def _maybe_fuse_compound_activation(gm) -> None:
     """If the entire forward graph matches a known compound activation,
     rewrite the FX graph in place: remove the multi-op subgraph and
@@ -357,6 +523,12 @@ def _maybe_fuse_compound_activation(gm) -> None:
         sentinel = _agents_compound_l2_norm
     elif _match_frobenius_norm(out_arg, x):
         sentinel = _agents_compound_frobenius_norm
+    elif (_rms_eps := _match_rms_norm(out_arg, x)) is not None:
+        sentinel = _agents_compound_rms_norm
+    elif _match_mean_abs_norm(out_arg, x):
+        sentinel = _agents_compound_mean_abs_norm
+    elif _match_exclusive_cumsum(out_arg, x):
+        sentinel = _agents_compound_excl_cumsum
     else:
         return
 
@@ -364,11 +536,16 @@ def _maybe_fuse_compound_activation(gm) -> None:
     # everything else via dead-code elimination.
     with gm.graph.inserting_before(out_node):
         new_node = gm.graph.call_function(sentinel, args=(x,))
-    # Copy the placeholder's tensor_meta onto the new node — pointwise
-    # activations preserve shape/dtype, and downstream ShapeProp won't
-    # re-run on this graph.
-    if "tensor_meta" in x.meta:
+    # Copy tensor_meta onto the new node. Most compounds are shape-preserving
+    # (copy the input's meta); exclusive_cumsum reshapes, so copy the original
+    # output node's meta instead.
+    if sentinel is _agents_compound_excl_cumsum:
+        if "tensor_meta" in out_arg.meta:
+            new_node.meta["tensor_meta"] = out_arg.meta["tensor_meta"]
+    elif "tensor_meta" in x.meta:
         new_node.meta["tensor_meta"] = x.meta["tensor_meta"]
+    if sentinel is _agents_compound_rms_norm:
+        new_node.meta["rms_eps"] = _rms_eps
     out_node.args = (new_node,)
     gm.graph.eliminate_dead_code()
     gm.recompile()
@@ -404,6 +581,18 @@ def _agents_compound_frobenius_norm(x):
     return x
 
 
+def _agents_compound_rms_norm(x):
+    return x
+
+
+def _agents_compound_mean_abs_norm(x):
+    return x
+
+
+def _agents_compound_excl_cumsum(x):
+    return x
+
+
 SUPPORTED_MODULES = (
     torch.nn.Linear,
     torch.nn.ReLU,
@@ -419,10 +608,26 @@ SUPPORTED_MODULES = (
     torch.nn.Hardtanh,
     torch.nn.ELU,
     torch.nn.Conv2d,
+    torch.nn.ConvTranspose2d,  # transposed / fractionally-strided 2D conv
+    torch.nn.Conv1d,  # mapped to conv2d with a unit height dim
+    torch.nn.ConvTranspose1d,  # mapped to conv_transpose2d with unit height
+    torch.nn.Conv3d,  # 3D conv (NCDHW)
+    torch.nn.ConvTranspose3d,  # 3D transposed conv
     torch.nn.MaxPool2d,
+    torch.nn.MaxPool1d,  # mapped to maxpool2d with a unit height dim
+    torch.nn.MaxPool3d,  # 3D max pool
+    torch.nn.AvgPool2d,  # fixed-window 2D average pool (KernelBench 45)
+    torch.nn.AvgPool1d,  # mapped to avgpool2d with a unit height dim
+    torch.nn.AvgPool3d,  # 3D average pool
+    # RMSNorm only exists in newer torch; tolerate its absence.
+    *((torch.nn.RMSNorm,) if hasattr(torch.nn, "RMSNorm") else ()),
     torch.nn.AdaptiveAvgPool2d,  # global avg pool head used by classifiers
     torch.nn.Dropout,  # eval-mode no-op; we still record a passthrough alias
     torch.nn.BatchNorm2d,  # pre-folded into a per-channel scale + bias
+    torch.nn.LayerNorm,  # normalize over trailing normalized_shape dims
+    torch.nn.GroupNorm,  # per-(sample,group) normalize; InstanceNorm is G==C
+    torch.nn.InstanceNorm2d,  # per-(sample,channel) spatial normalize
+    torch.nn.TripletMarginLoss,  # 3-input margin loss → scalar
     torch.nn.Sigmoid,
     # YOLOv8 backbone uses SiLU activation throughout; neck uses Upsample.
     torch.nn.SiLU,
@@ -436,6 +641,20 @@ def _pair(v) -> tuple[int, int]:
     if isinstance(v, (tuple, list)):
         return int(v[0]), int(v[1])
     return int(v), int(v)
+
+
+def _as_tuple1(v) -> tuple[int]:
+    """Coerce int or 1-tuple (the 1D nn.Conv1d/Pool1d param form) to (x,)."""
+    if isinstance(v, (tuple, list)):
+        return (int(v[0]),)
+    return (int(v),)
+
+
+def _triple(v) -> tuple[int, int, int]:
+    """Coerce int or 3-tuple to a (d, h, w) triple (nn.Conv3d/Pool3d params)."""
+    if isinstance(v, (tuple, list)):
+        return int(v[0]), int(v[1]), int(v[2])
+    return int(v), int(v), int(v)
 
 
 def _tensor_meta(node: torch.fx.Node) -> dict[str, Any]:
@@ -608,6 +827,76 @@ def _requantize_multiplier_shift(real_mult: float) -> tuple[int, int]:
     return int(multiplier), int(shift)
 
 
+# ---------------------------------------------------------------------------
+# int8 golden-simulator primitives. These are the single source of truth for
+# the per-op integer math used both by the standalone op branches and by the
+# fused conv2d_batchnorm2d(_silu)_s8 branches — keeping them identical is what
+# guarantees a fused op's golden is bit-exact with the unfused conv+bn(+silu)
+# it replaces (and hence with the composed C reference kernel).
+# ---------------------------------------------------------------------------
+
+def _sim_conv2d_s8(in_arr, sh, q, w_q, b_q):
+    """int8 conv2d + Q0.31 requantize (direct sliding window). Weights are
+    OIHW ([OC, IC, KH, KW]) — the raw pre-pack layout stored in the blob."""
+    w_q = w_q.astype(np.int32)
+    b_q = b_q.astype(np.int32)
+    in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
+    OH, OW = sh["OH"], sh["OW"]
+    KH, KW = sh["KH"], sh["KW"]
+    SH, SW = sh["SH"], sh["SW"]
+    PH, PW = sh["PH"], sh["PW"]
+    out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
+    for n in range(sh["N"]):
+        for oc in range(sh["OC"]):
+            out[n, oc] = b_q[oc]
+            for ic in range(sh["IC"]):
+                for kh in range(KH):
+                    for kw in range(KW):
+                        ih_start = -PH + kh
+                        iw_start = -PW + kw
+                        for oh in range(OH):
+                            ih = oh * SH + ih_start
+                            if ih < 0 or ih >= sh["IH"]:
+                                in_row = np.full(OW, q["input_offset"], dtype=np.int32)
+                            else:
+                                in_row = np.zeros(OW, dtype=np.int32)
+                                for ow in range(OW):
+                                    iw = ow * SW + iw_start
+                                    if iw < 0 or iw >= sh["IW"]:
+                                        in_row[ow] = q["input_offset"]
+                                    else:
+                                        in_row[ow] = in_4d[n, ic, ih, iw] + q["input_offset"]
+                            w_v = w_q[oc, ic, kh, kw] + q["filter_offset"]
+                            out[n, oc, oh] += in_row * w_v
+    scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
+    scaled += q["output_offset"]
+    scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
+    return scaled.astype(np.int8)
+
+
+def _sim_batchnorm2d_s8(in_arr, sh, q, scale_pc, bias_pc):
+    """Per-channel BN affine on int8: dequant → gamma*x+beta → requant+clamp."""
+    scale_pc = scale_pc.astype(np.float32)
+    bias_pc = bias_pc.astype(np.float32)
+    in_4d = in_arr.reshape(sh["N"], sh["C"], sh["H"], sh["W"]).astype(np.float32)
+    scale_in = np.float32(q["scale_in"])
+    scale_out = np.float32(q["scale_out"])
+    fv = in_4d * scale_in
+    y = scale_pc[None, :, None, None] * fv + bias_pc[None, :, None, None]
+    v = np.round(y / scale_out).astype(np.int32)
+    v = np.clip(v, q["activation_min"], q["activation_max"])
+    return v.astype(np.int8)
+
+
+def _sim_silu_s8(in_arr, q):
+    """int8 SiLU: dequant → x*sigmoid(x) → requant+clamp."""
+    fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+    silu_out = fv / (np.float32(1.0) + np.exp(-fv).astype(np.float32))
+    v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
+    v = np.clip(v, q["activation_min"], q["activation_max"])
+    return v.astype(np.int8)
+
+
 class _CaptureTensors(torch.fx.Interpreter):
     """FX Interpreter that records every tensor produced by every node."""
     def __init__(self, gm):
@@ -621,11 +910,23 @@ class _CaptureTensors(torch.fx.Interpreter):
         return result
 
 
-def _promote_ops_to_fp16(ops, fp16_names, tensors_meta, weights_blob, fp32_stash):
-    """Mixed precision: convert ops whose IR `name` is in `fp16_names` from their
-    int8 (_s8) kind to the fp16 (_f16) kind, re-store their weights as float16,
-    and mark their output + LSTM state tensors dtype f16. Everything else stays
-    int8. Mirrors the export path's per-op precision promotion, on the FX IR."""
+def _promote_ops_to_fp16(ops, fp16_names, tensors_meta, weights_blob,
+                         fp32_stash) -> list[str]:
+    """Mixed precision: turn every op whose IR name is in `fp16_names` from its
+    int8 (`*_s8`) kind into the fp16 (`*_f16`) kind, re-store its weights as
+    float16 from the fp32 stash, and mark its output (and, for an LSTM, its
+    recurrent state) as dtype f16. Everything else stays int8; the int8<->fp16
+    boundaries are materialized afterwards by `_insert_casts_i8_f16`.
+
+    Why this exists: the fused sensor net's compute bulk is its int8 encoders,
+    but its accuracy is dominated by the recurrent tail. A per-tensor int8
+    3-layer LSTM loses the answer; the same tail in fp16 costs ~5% of the
+    dispatch time. So precision is chosen per op, not per model.
+
+    Returns the names of the ops that were actually promoted (so a spec naming
+    an op that is not in the graph is reported rather than silently ignored).
+    """
+    promoted: list[str] = []
     for op in ops:
         if op["name"] not in fp16_names:
             op.setdefault("precision", "int8")
@@ -633,24 +934,53 @@ def _promote_ops_to_fp16(ops, fp16_names, tensors_meta, weights_blob, fp32_stash
         op["precision"] = "fp16"
         if op["op"].endswith("_s8"):
             op["op"] = op["op"][:-3] + "_f16"
-        for wk in ("weight", "bias", "weight_ih", "weight_hh"):
-            key = op.get(wk)
-            if key and key in fp32_stash:
-                weights_blob[key] = fp32_stash[key].astype(np.float16)
-        outs = list(op.get("outputs", []))
-        for st in ("h", "c"):
-            s = op.get("state", {})
-            if s.get(st):
-                outs.append(s[st])
-        for t in outs:
+        promoted.append(op["name"])
+
+        if op["op"] == "lstm_f16":
+            # The int8 cell carries separate int32-quantized b_ih / b_hh in the
+            # accumulator domain; the fp16 cell takes ONE float bias, so fold
+            # them here (PyTorch adds both anyway).
+            b_key, bh_key = op.get("bias"), op.get("bias_hh")
+            if b_key and b_key in fp32_stash:
+                folded = fp32_stash[b_key].astype(np.float32)
+                if bh_key and bh_key in fp32_stash:
+                    folded = folded + fp32_stash[bh_key].astype(np.float32)
+                weights_blob[b_key] = folded.astype(np.float16)
+            op.pop("bias_hh", None)
+            for wk in ("weight", "weight_hh"):
+                key = op.get(wk)
+                if key and key in fp32_stash:
+                    weights_blob[key] = fp32_stash[key].astype(np.float16)
+        else:
+            for wk in ("weight", "bias", "weight_hh", "bias_hh"):
+                key = op.get(wk)
+                if key and key in fp32_stash:
+                    weights_blob[key] = fp32_stash[key].astype(np.float16)
+
+        # Outputs and recurrent state become f16 surfaces.
+        touched = list(op.get("outputs", []))
+        st = op.get("state")
+        if isinstance(st, dict):
+            touched += [v for v in st.values() if v]
+        elif isinstance(st, (list, tuple)):
+            touched += [v for v in st if v]
+        for t in touched:
             if t in tensors_meta:
-                tensors_meta[t] = {**tensors_meta[t], "dtype": "f16", "quant": None}
+                meta = dict(tensors_meta[t])
+                meta["dtype"] = "f16"
+                meta["quant"] = None
+                tensors_meta[t] = meta
+    return promoted
 
 
-def _insert_casts_i8_f16(ops, tensors_meta, scales):
-    """Insert cast_i8_to_f16 / cast_f16_to_i8 ops at int8<->fp16 tensor
-    boundaries (ported from extract_graph_export._ExportWalker.insert_casts)."""
-    def consumer_dtype(op):
+def _insert_casts_i8_f16(ops, tensors_meta, scales) -> list[dict]:
+    """Materialize `cast_i8_to_f16` / `cast_f16_to_i8` ops at int8<->fp16 tensor
+    boundaries. Same pass as `_ExportWalker.insert_casts` in
+    extract_graph_export.py, applied to the FX int8 IR -- mixed precision is a
+    property of the assembled graph, so each op's emit code stays
+    single-precision.
+    """
+    def consumer_dtype(op) -> str:
         p = op.get("precision")
         if p is None:
             p = "fp16" if op["op"].endswith("_f16") else "int8"
@@ -671,18 +1001,24 @@ def _insert_casts_i8_f16(ops, tensors_meta, scales):
             cast_out = cast_intermediates.get(key)
             if cast_out is None:
                 cast_out = f"{in_name}__cast_{dst}"
-                tensors_meta[cast_out] = {"shape": list(meta["shape"]),
-                                          "dtype": dst, "quant": None}
                 scale = scales.get(in_name, 1e-8)
                 kind = ("cast_i8_to_f16" if (src == "i8" and dst == "f16")
                         else "cast_f16_to_i8")
+                tensors_meta[cast_out] = {
+                    "shape": list(meta["shape"]),
+                    "dtype": dst,
+                    "quant": (None if dst == "f16" else
+                              {"scale": float(scale), "zero_point": 0}),
+                }
                 n = 1
                 for d in meta["shape"]:
                     n *= int(d)
                 new_ops.append({
-                    "name": cast_out, "op": kind,
+                    "name": cast_out,
+                    "op": kind,
                     "precision": "fp16" if dst == "f16" else "int8",
-                    "inputs": [in_name], "outputs": [cast_out],
+                    "inputs": [in_name],
+                    "outputs": [cast_out],
                     "shape": {"n": n},
                     "quant": {"scale": float(scale), "zero_point": 0},
                 })
@@ -879,8 +1215,9 @@ def extract_int8(
     os.makedirs(out_dir, exist_ok=True)
     model = model.eval()
 
-    # Normalize to a list of input tensors (multi-input support). A model with
-    # several inputs passes a tuple/list of tensors, in placeholder order.
+    # Normalise to a list of input tensors. A multi-input model (the fused
+    # sensor net: front_grey, tof_cross, lowdim) passes a tuple/list in
+    # placeholder order; a single-input model still passes a bare tensor.
     if isinstance(sample_input, (list, tuple)):
         sample_inputs = list(sample_input)
     else:
@@ -934,21 +1271,27 @@ def extract_int8(
     # per-tensor max-abs to its true distribution-wide bound, which is
     # what fixes the cls-logit saturation seen with single-sample
     # calibration on detection models.
-    # All graph inputs, in placeholder order, paired 1:1 with the sample tensors.
+    # Every graph input, in placeholder order, paired 1:1 with the samples.
     placeholder_nodes = [n for n in gm.graph.nodes if n.op == "placeholder"]
     input_node_names = [n.name for n in placeholder_nodes]
     if len(input_node_names) != len(sample_inputs):
         raise RuntimeError(
             f"int8 extract: model has {len(input_node_names)} inputs "
-            f"({input_node_names}) but {len(sample_inputs)} sample tensors given")
+            f"({input_node_names}) but {len(sample_inputs)} sample tensors "
+            f"were given")
     input_shapes = {nm: list(si.shape)
                     for nm, si in zip(input_node_names, sample_inputs)}
-    # Per-input dtype (multi-dtype support). Default: everything int8.
-    in_dtype_list = (input_dtypes if input_dtypes is not None
+    # Per-input surface dtype. Default: every input int8. A model declaring
+    # get_input_dtypes() may keep one input in float ("f16"/"f32") -- the
+    # fused net's lowdim vector, whose optical_flow component is ~1e5x the
+    # magnitude of its quaternion components and cannot share one int8 scale.
+    in_dtype_list = (list(input_dtypes) if input_dtypes is not None
                      else ["i8"] * len(input_node_names))
     if len(in_dtype_list) != len(input_node_names):
-        raise RuntimeError("int8 extract: input_dtypes length mismatch")
-    input_dtype_map = {nm: dt for nm, dt in zip(input_node_names, in_dtype_list)}
+        raise RuntimeError(
+            f"int8 extract: input_dtypes has {len(in_dtype_list)} entries for "
+            f"{len(input_node_names)} inputs")
+    input_dtype_map = dict(zip(input_node_names, in_dtype_list))
 
     max_abs: dict[str, float] = {}
     for nm, si in zip(input_node_names, sample_inputs):
@@ -957,8 +1300,9 @@ def extract_int8(
         max_abs[nname] = float(t.detach().abs().max().item())
 
     if calibration_samples:
-        extra = [s for s in calibration_samples if s is not sample_input]
-        for s in extra:
+        extra = [s for s in calibration_samples
+                 if s is not sample_input]
+        for i, s in enumerate(extra):
             s_list = list(s) if isinstance(s, (list, tuple)) else [s]
             cap_i = _CaptureTensors(gm)
             cap_i.run(*s_list)
@@ -979,18 +1323,19 @@ def extract_int8(
 
     tensors_meta: dict[str, dict] = {}
     weights_blob: dict[str, np.ndarray] = {}
-    # fp32 copies of weights, kept so ops promoted to fp16 (mixed precision via
-    # fp16_op_names) can re-store their weights as float16 instead of int8.
+    # fp32 copies of every quantized weight, kept so that an op promoted to
+    # fp16 (mixed precision, `fp16_op_names`) can re-store its weights as
+    # float16 rather than re-deriving them from the int8 blob.
     fp32_stash: dict[str, np.ndarray] = {}
     ops: list[dict] = []
-    input_names: list[str] = []          # collected in placeholder order
+    input_names: list[str] = []          # placeholder order
     output_name: str | None = None
 
     # Helper: register a tensor in the IR with its int8 scale + zero_point.
     def _record(nname: str, dtype: str = "i8") -> None:
         t = cap.tensors.get(nname)
         if t is None:
-            # Placeholder (input) — shape from the paired sample tensor.
+            # Placeholder (input) -- shape from the paired sample tensor.
             shape = input_shapes.get(nname, [])
         else:
             shape = list(t.shape)
@@ -1109,8 +1454,68 @@ def extract_int8(
         fused_linear_relu | fused_conv2d_relu | fused_add_relu | fused_bn_relu
     )
 
-    # Nodes to skip during the main walk (e.g. getitem consumers of chunk).
-    _skip_nodes: set = set()
+    # ------------------------------------------------------------------
+    # Conv2d → BatchNorm2d (→ ReLU | SiLU) fusion detection.
+    #
+    # The XPU-RT schedule puts every heavy conv on the gemmini hart and
+    # every elementwise glue op (batchnorm2d_s8 / silu_s8 / relu_s8) on
+    # rvv; that cross-core ping-pong leaves gemmini stalled. Absorbing the
+    # BN (and the trailing activation) into the producing conv collapses
+    # the whole block into ONE op that runs on a single hart:
+    #   * conv2d_batchnorm2d_s8       (conv→bn, and conv→bn→relu — the relu
+    #                                  is folded into the bn sub-op's clamp)
+    #   * conv2d_batchnorm2d_silu_s8  (conv→bn→silu)
+    # Each fused op carries its constituents under `sub_ops` (the same
+    # shape apply_fusion_hint.py produces), so the existing skeleton /
+    # kernel-picker plumbing for those registered op-kinds handles it.
+    #
+    # Detection is by FX adjacency + single-consumer checks: the conv must
+    # feed ONLY the immediately-following BN, and (for the activation) the
+    # BN must feed ONLY the immediately-following relu/silu. This mirrors
+    # the relu/silu absorb above and correctly leaves alone the dronet
+    # blocks where a maxpool or residual-add sits between conv and bn.
+    conv_bn_fusion: dict[str, dict] = {}
+    conv_bn_consumed: set = set()
+    for i, node in enumerate(nodes):
+        if node.op != "call_module":
+            continue
+        if not isinstance(gm.get_submodule(node.target), torch.nn.Conv2d):
+            continue
+        if i + 1 >= len(nodes) or len(list(node.users)) != 1:
+            continue
+        bn_node = nodes[i + 1]
+        if not (bn_node.op == "call_module"
+                and isinstance(gm.get_submodule(bn_node.target),
+                               torch.nn.BatchNorm2d)
+                and len(bn_node.args) >= 1 and bn_node.args[0] is node):
+            continue
+        act_node = None
+        act_kind = None
+        if len(list(bn_node.users)) == 1 and i + 2 < len(nodes):
+            cand = nodes[i + 2]
+            cand_is_relu = (
+                (cand.op == "call_module"
+                 and isinstance(gm.get_submodule(cand.target), torch.nn.ReLU))
+                or (cand.op == "call_function" and cand.target in (
+                    torch.relu, torch.nn.functional.relu)))
+            cand_is_silu = (
+                (cand.op == "call_module"
+                 and isinstance(gm.get_submodule(cand.target), torch.nn.SiLU))
+                or (cand.op == "call_function" and cand.target in (
+                    torch.nn.functional.silu,)))
+            if ((cand_is_relu or cand_is_silu)
+                    and len(cand.args) == 1 and cand.args[0] is bn_node):
+                act_node = cand
+                act_kind = "relu" if cand_is_relu else "silu"
+        conv_bn_fusion[node.name] = {
+            "bn": bn_node, "act": act_node, "act_kind": act_kind}
+        conv_bn_consumed.add(bn_node)
+        if act_node is not None:
+            conv_bn_consumed.add(act_node)
+
+    # Nodes to skip during the main walk (e.g. getitem consumers of chunk,
+    # and the BN / activation nodes absorbed by conv_bn_fusion above).
+    _skip_nodes: set = set(conv_bn_consumed)
 
     for node in nodes:
         if node in _skip_nodes:
@@ -1141,11 +1546,14 @@ def extract_int8(
                 b_key = f"{node.target}.bias_q"
                 weights_blob[w_key] = w_q
                 weights_blob[b_key] = b_q
-                # fp32 copies for a possible fp16 promotion of this linear.
+                # Keep fp32 copies so promoting this linear to fp16 (mixed
+                # precision) can re-store float16 weights, instead of trying to
+                # invert the int8 quantization.
                 fp32_stash[w_key] = w_fp32.cpu().numpy().astype(np.float32)
-                fp32_stash[b_key] = (b_fp32.cpu().numpy().astype(np.float32)
-                                     if b_fp32 is not None
-                                     else np.zeros((mod.out_features,), np.float32))
+                fp32_stash[b_key] = (
+                    b_fp32.cpu().numpy().astype(np.float32)
+                    if b_fp32 is not None
+                    else np.zeros((mod.out_features,), np.float32))
                 # Requantize: real_mult = s_in * s_w / s_out
                 real_mult = (in_scale * w_scale) / out_scale
                 multiplier, shift = _requantize_multiplier_shift(real_mult)
@@ -1203,6 +1611,25 @@ def extract_int8(
                     "shape": {"n": n},
                 })
 
+            elif isinstance(mod, torch.nn.ReLU6):
+                # Standalone ReLU6: clamp real values to [0, 6]. Keep the
+                # output at the input's scale (like relu_s8 keeps scale for
+                # plain relu) and express the 6.0 ceiling in int8 units:
+                # qmax = round(6 / s), saturated to [1, 127]. zp = 0.
+                in_scale = scales[in_name]
+                scales[node.name] = in_scale       # relu6 preserves scale
+                _record(node.name, dtype="i8")
+                qmax = max(1, min(127, int(round(6.0 / in_scale))))
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "relu6_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "clamp_max": qmax,
+                })
+
             elif isinstance(mod, torch.nn.Conv2d):
                 if mod.groups != 1:
                     raise NotImplementedError(
@@ -1214,6 +1641,151 @@ def extract_int8(
                         f"int8 extract: Conv2d dilation={mod.dilation} not "
                         f"supported at {node.name}"
                     )
+
+                # ---- Conv2d → BatchNorm2d (→ ReLU|SiLU) fusion --------------
+                fuse = conv_bn_fusion.get(node.name)
+                if fuse is not None:
+                    bn_node = fuse["bn"]
+                    act_node = fuse["act"]
+                    act_kind = fuse["act_kind"]
+                    bn_mod = gm.get_submodule(bn_node.target)
+
+                    # -- conv sub-op (int8 conv + Q0.31 requantize, full range;
+                    #    BN reads the full-range int8 conv output) --
+                    w_fp32 = mod.weight.detach()
+                    b_fp32 = mod.bias.detach() if mod.bias is not None else None
+                    w_scale = _scale_from_max_abs(w_fp32)
+                    w_q = _quantize_per_tensor_sym(w_fp32, w_scale)
+                    in_scale = scales[in_name]
+                    conv_out_scale = scales[node.name]
+                    if b_fp32 is not None:
+                        b_q = torch.round(
+                            b_fp32 / (in_scale * w_scale)).to(
+                            torch.int32).cpu().numpy()
+                    else:
+                        b_q = np.zeros((mod.out_channels,), dtype=np.int32)
+                    w_key = f"{node.target}.weight_q"
+                    b_key = f"{node.target}.bias_q"
+                    weights_blob[w_key] = w_q
+                    weights_blob[b_key] = b_q
+                    real_mult = (in_scale * w_scale) / conv_out_scale
+                    multiplier, shift = _requantize_multiplier_shift(real_mult)
+                    in_shape = tensors_meta[in_name]["shape"]
+                    conv_out_shape = list(cap.tensors[node.name].shape)
+                    N_, IC, IH, IW = (int(s) for s in in_shape)
+                    _, OC, OH, OW = (int(s) for s in conv_out_shape)
+                    KH, KW = _pair(mod.kernel_size)
+                    SH, SW = _pair(mod.stride)
+                    PH, PW = _pair(mod.padding)
+                    conv_sub = {
+                        "name": str(node.target), "op": "conv2d_s8",
+                        "inputs": [in_name], "outputs": [node.name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "IC": IC, "IH": IH, "IW": IW,
+                                  "OC": OC, "OH": OH, "OW": OW,
+                                  "KH": KH, "KW": KW, "SH": SH, "SW": SW,
+                                  "PH": PH, "PW": PW},
+                        "quant": {
+                            "input_offset": 0, "filter_offset": 0,
+                            "output_offset": 0,
+                            "output_multiplier": multiplier,
+                            "output_shift": shift,
+                            "activation_min": -128, "activation_max": 127,
+                        },
+                    }
+
+                    # -- bn sub-op (per-channel affine folded to scale + bias) --
+                    gamma = (bn_mod.weight.detach().cpu().numpy().astype(np.float32)
+                             if bn_mod.weight is not None else
+                             np.ones((bn_mod.num_features,), dtype=np.float32))
+                    beta = (bn_mod.bias.detach().cpu().numpy().astype(np.float32)
+                            if bn_mod.bias is not None else
+                            np.zeros((bn_mod.num_features,), dtype=np.float32))
+                    bn_mean = bn_mod.running_mean.detach().cpu().numpy().astype(np.float32)
+                    bn_var = bn_mod.running_var.detach().cpu().numpy().astype(np.float32)
+                    bn_eps = float(bn_mod.eps)
+                    bn_scale_pc = (gamma / np.sqrt(bn_var + bn_eps)).astype(np.float32)
+                    bn_bias_pc = (beta - bn_mean * bn_scale_pc).astype(np.float32)
+                    bn_s_key = f"{bn_node.target}.scale"
+                    bn_b_key = f"{bn_node.target}.bias_fused"
+                    weights_blob[bn_s_key] = bn_scale_pc
+                    weights_blob[bn_b_key] = bn_bias_pc
+                    bn_out_scale = scales[bn_node.name]
+                    # relu → clamp at 0 on the bn requantize (the relu is the
+                    # bn output stage); silu/none → full int8 range.
+                    bn_act_min = 0 if act_kind == "relu" else -128
+                    # Where the bn writes: for relu the fused output IS the
+                    # relu tensor (bn's clamp does the relu); for silu the bn
+                    # feeds the silu sub-op; for none the bn IS the output.
+                    if act_kind == "relu":
+                        bn_out_name = act_node.name
+                    else:
+                        bn_out_name = bn_node.name
+                    bn_sub = {
+                        "name": str(bn_node.target), "op": "batchnorm2d_s8",
+                        "inputs": [node.name], "outputs": [bn_out_name],
+                        "weight": bn_s_key, "bias": bn_b_key,
+                        "shape": {"N": N_, "C": OC, "H": OH, "W": OW},
+                        "quant": {
+                            "scale_in": conv_out_scale,
+                            "scale_out": bn_out_scale,
+                            "activation_min": bn_act_min,
+                            "activation_max": 127,
+                        },
+                    }
+
+                    sub_ops = [conv_sub, bn_sub]
+                    if act_kind == "silu":
+                        silu_out_scale = scales[act_node.name]
+                        n_elem = int(N_ * OC * OH * OW)
+                        sub_ops.append({
+                            "name": str(getattr(act_node, "target", act_node.name)),
+                            "op": "silu_s8",
+                            "inputs": [bn_node.name],
+                            "outputs": [act_node.name],
+                            "shape": {"n": n_elem},
+                            "quant": {
+                                "scale_in": bn_out_scale,
+                                "scale_out": silu_out_scale,
+                                "activation_min": -128,
+                                "activation_max": 127,
+                            },
+                        })
+                        fused_op_kind = "conv2d_batchnorm2d_silu_s8"
+                        final_out = act_node.name
+                        final_scale = silu_out_scale
+                    elif act_kind == "relu":
+                        fused_op_kind = "conv2d_batchnorm2d_s8"
+                        final_out = act_node.name
+                        # relu (bn-clamp) keeps the bn output scale, matching
+                        # the standalone bn→relu fusion's aliasing.
+                        final_scale = bn_out_scale
+                    else:
+                        fused_op_kind = "conv2d_batchnorm2d_s8"
+                        final_out = bn_node.name
+                        final_scale = bn_out_scale
+
+                    # Register only the fused OUTPUT tensor; the conv/bn
+                    # intermediates live inside the single kernel and need no
+                    # global buffer.
+                    tensors_meta[final_out] = {
+                        "shape": (list(cap.tensors[final_out].shape)
+                                  if final_out in cap.tensors
+                                  else [N_, OC, OH, OW]),
+                        "dtype": "i8",
+                        "quant": {"scale": final_scale, "zero_point": 0},
+                    }
+                    scales[final_out] = final_scale
+                    ops.append({
+                        "name": str(node.target),
+                        "op": fused_op_kind,
+                        "inputs": [in_name],
+                        "outputs": [final_out],
+                        "sub_ops": sub_ops,
+                    })
+                    continue
+                # ---- end Conv2d → BatchNorm2d fusion -----------------------
+
                 _record(node.name, dtype="i8")
                 w_fp32 = mod.weight.detach()
                 b_fp32 = mod.bias.detach() if mod.bias is not None else None
@@ -1514,6 +2086,265 @@ def extract_int8(
                     },
                 })
 
+            elif isinstance(mod, torch.nn.GELU):
+                # gelu_s8 existed as a kernel with no extractor branch, so the
+                # op inventory counted it as "covered" while nothing could emit
+                # it. Kernel presence is not coverage.
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "gelu_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in":  scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128, "activation_max": 127,
+                    },
+                })
+
+            elif isinstance(mod, (torch.nn.LayerNorm,
+                                  getattr(torch.nn, "RMSNorm", torch.nn.LayerNorm))) \
+                    and type(mod).__name__ in ("LayerNorm", "RMSNorm"):
+                is_rms = type(mod).__name__ == "RMSNorm"
+                _record(node.name, dtype="i8")
+                in_shape = tensors_meta[in_name]["shape"]
+                K = int(in_shape[-1])
+                M = int(np.prod(in_shape[:-1])) if len(in_shape) > 1 else 1
+                ns = mod.normalized_shape
+                ns = (ns,) if isinstance(ns, int) else tuple(ns)
+                if len(ns) != 1 or int(ns[0]) != K:
+                    raise NotImplementedError(
+                        f"int8 extract: {type(mod).__name__} at {node.name} "
+                        f"normalizes over {ns}; only the last dimension is "
+                        f"supported")
+                base = f"{node.target}"
+                g = (mod.weight.detach().cpu().numpy().astype(np.float32)
+                     if getattr(mod, "weight", None) is not None
+                     else np.ones((K,), np.float32))
+                weights_blob[f"{base}.gamma"] = g
+                op_rec = {
+                    "name": base,
+                    "op": "rmsnorm_s8" if is_rms else "layernorm_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "weight": f"{base}.gamma",
+                    "shape": {"M": M, "K": K},
+                    "quant": {
+                        "scale_in": scales[in_name],
+                        "scale_out": scales[node.name],
+                        "eps": float(getattr(mod, "eps", 1e-5) or 1e-5),
+                        "activation_min": -128, "activation_max": 127,
+                    },
+                }
+                if not is_rms:
+                    b = (mod.bias.detach().cpu().numpy().astype(np.float32)
+                         if getattr(mod, "bias", None) is not None
+                         else np.zeros((K,), np.float32))
+                    weights_blob[f"{base}.beta"] = b
+                    op_rec["bias"] = f"{base}.beta"
+                ops.append(op_rec)
+
+            elif isinstance(mod, torch.nn.LSTM):
+                # One `lstm_s8` op per layer. The recurrent state is carried in
+                # dedicated tensors that are NOT scratch: they must survive
+                # across run_model() calls, because a recurrent model's
+                # invocation k depends on k-1. generate_skeleton gives any
+                # tensor named `<...>.h_state` / `.c_state` a persistent,
+                # zero-initialised buffer.
+                if mod.batch_first:
+                    raise NotImplementedError(
+                        "int8 extract: LSTM batch_first=True is not supported; "
+                        "the cell expects [seq, batch, feature]")
+                if mod.bidirectional:
+                    raise NotImplementedError(
+                        "int8 extract: bidirectional LSTM is not supported")
+                # nn.LSTM returns (output, (h_n, c_n)), so the FX node for the
+                # module produces a TUPLE and calibration never assigned it a
+                # scale. The tensor everything downstream actually uses arrives
+                # via operator.getitem(node, 0); that is the name our op must
+                # write, and node.name itself never becomes a buffer.
+                out_node = _find_getitem_consumer(node, 0)
+                out_node_name = out_node.name if out_node is not None else None
+                if out_node_name is None:
+                    raise NotImplementedError(
+                        f"int8 extract: LSTM at {node.name} has no "
+                        f"getitem(0) consumer; the hidden-state tuple output "
+                        f"is not supported, only the sequence output")
+                H = int(mod.hidden_size)
+                in_scale = scales[in_name]
+                # The hidden state is a tanh output, so it lives in [-1, 1] and
+                # 1/127 covers it exactly. The cell state is NOT bounded --
+                # f*c + i*g can grow -- so it gets a wider, separate scale.
+                # Sharing one scale between them is the obvious mistake and it
+                # saturates c silently.
+                h_scale = 1.0 / 127.0
+                c_scale = 8.0 / 127.0
+                cur_in = in_name
+                cur_scale = in_scale
+                cur_size = int(tensors_meta[in_name]["shape"][-1])
+                for layer in range(int(mod.num_layers)):
+                    w_ih = getattr(mod, f"weight_ih_l{layer}").detach()
+                    w_hh = getattr(mod, f"weight_hh_l{layer}").detach()
+                    s_ih = _scale_from_max_abs(w_ih)
+                    s_hh = _scale_from_max_abs(w_hh)
+                    q_ih = _quantize_per_tensor_sym(w_ih, s_ih)
+                    q_hh = _quantize_per_tensor_sym(w_hh, s_hh)
+                    has_bias = 1 if mod.bias else 0
+                    # Both bias vectors share the input-side accumulator scale.
+                    b_scale = cur_scale * s_ih
+                    if has_bias:
+                        b_ih = torch.round(
+                            getattr(mod, f"bias_ih_l{layer}").detach()
+                            / b_scale).to(torch.int32).cpu().numpy()
+                        b_hh = torch.round(
+                            getattr(mod, f"bias_hh_l{layer}").detach()
+                            / b_scale).to(torch.int32).cpu().numpy()
+                    else:
+                        b_ih = np.zeros((4 * H,), dtype=np.int32)
+                        b_hh = np.zeros((4 * H,), dtype=np.int32)
+                    base = f"{node.target}.l{layer}"
+                    weights_blob[f"{base}.w_ih_q"] = q_ih
+                    weights_blob[f"{base}.w_hh_q"] = q_hh
+                    weights_blob[f"{base}.b_ih_q"] = b_ih
+                    weights_blob[f"{base}.b_hh_q"] = b_hh
+                    # fp32 copies for a possible fp16 promotion of this layer.
+                    fp32_stash[f"{base}.w_ih_q"] = (
+                        w_ih.cpu().numpy().astype(np.float32))
+                    fp32_stash[f"{base}.w_hh_q"] = (
+                        w_hh.cpu().numpy().astype(np.float32))
+                    if has_bias:
+                        fp32_stash[f"{base}.b_ih_q"] = (
+                            getattr(mod, f"bias_ih_l{layer}").detach()
+                            .cpu().numpy().astype(np.float32))
+                        fp32_stash[f"{base}.b_hh_q"] = (
+                            getattr(mod, f"bias_hh_l{layer}").detach()
+                            .cpu().numpy().astype(np.float32))
+                    else:
+                        fp32_stash[f"{base}.b_ih_q"] = np.zeros((4 * H,), np.float32)
+                        fp32_stash[f"{base}.b_hh_q"] = np.zeros((4 * H,), np.float32)
+                    h_name = f"{base}.h_state"
+                    c_name = f"{base}.c_state"
+                    for nm, sc in ((h_name, h_scale), (c_name, c_scale)):
+                        tensors_meta[nm] = {
+                            "shape": [1, H], "dtype": "i8",
+                            "quant": {"scale": sc, "zero_point": 0},
+                            "persistent": True,
+                        }
+                        scales[nm] = sc
+                    out_nm = (out_node_name
+                              if layer == int(mod.num_layers) - 1
+                              else f"{base}.out")
+                    if out_nm != out_node_name:
+                        tensors_meta[out_nm] = {
+                            "shape": [1, H], "dtype": "i8",
+                            "quant": {"scale": h_scale, "zero_point": 0},
+                        }
+                        scales[out_nm] = h_scale
+                    ops.append({
+                        "name": base,
+                        "op": "lstm_s8",
+                        "inputs": [cur_in],
+                        "outputs": [out_nm],
+                        "state": [h_name, c_name],
+                        "weight": f"{base}.w_ih_q",
+                        "weight_hh": f"{base}.w_hh_q",
+                        "bias": f"{base}.b_ih_q",
+                        "bias_hh": f"{base}.b_hh_q",
+                        "shape": {"input_size": cur_size, "hidden_size": H},
+                        "quant": {
+                            "scale_in": cur_scale,
+                            "scale_w_ih": float(s_ih),
+                            "scale_w_hh": float(s_hh),
+                            "scale_b": float(b_scale),
+                            "scale_h": h_scale,
+                            "scale_c": c_scale,
+                            "has_bias": has_bias,
+                        },
+                    })
+                    cur_in = out_nm
+                    cur_scale = h_scale
+                    cur_size = H
+                # The final layer's h IS the module output. Register it under
+                # the getitem name with the scale the kernel actually writes.
+                tensors_meta[out_node_name] = {
+                    "shape": [1, H], "dtype": "i8",
+                    "quant": {"scale": h_scale, "zero_point": 0},
+                }
+                scales[out_node_name] = h_scale
+                # The getitem that unpacks (output, (h, c)) is now redundant:
+                # our op already wrote its tensor. Skip it in the main walk, the
+                # same way chunk's getitem consumers are skipped.
+                _skip_nodes.add(out_node)
+                # `y, _ = self.lstm(x)` also produces a getitem(1) for the
+                # (h_n, c_n) tuple. When it is discarded -- which is how both
+                # VitFly and this test model use it -- skip it. If something
+                # actually consumes it, say so rather than silently dropping
+                # the state the caller asked for: the state lives in the
+                # persistent buffers and is not exposed as a tensor.
+                state_node = _find_getitem_consumer(node, 1)
+                if state_node is not None:
+                    if len(state_node.users) > 0:
+                        raise NotImplementedError(
+                            "int8 extract: LSTM (h_n, c_n) output is consumed "
+                            "at {}; the recurrent state is held in persistent "
+                            "buffers and is not exposed as a tensor".format(
+                                state_node.name))
+                    _skip_nodes.add(state_node)
+
+            elif isinstance(mod, torch.nn.LeakyReLU):
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "leaky_relu_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in":  scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128,
+                        "activation_max": 127,
+                        "negative_slope": float(mod.negative_slope),
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool2d):
+                _record(node.name, dtype="i8")
+                in_shape = tensors_meta[in_name]["shape"]
+                out_shape = tensors_meta[node.name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                _, _, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                SH, SW = _pair(mod.stride if mod.stride is not None
+                               else mod.kernel_size)
+                PH, PW = _pair(mod.padding)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "avgpool2d_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {
+                        "N": N_, "C": C,
+                        "IH": IH, "IW": IW,
+                        "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                        "count_include_pad": 1 if mod.count_include_pad else 0,
+                    },
+                })
+                # Averaging values on a scale leaves them on that scale, so
+                # like MaxPool this does not requantize. Overwrite the
+                # calibrated scale so downstream consumers read the right one --
+                # leaving the calibrated value here would silently rescale the
+                # tensor.
+                tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
+                scales[node.name] = scales[in_name]
+
             elif isinstance(mod, torch.nn.Upsample):
                 if mod.mode != "nearest":
                     raise NotImplementedError(
@@ -1541,96 +2372,6 @@ def extract_int8(
                     "shape": {"N": N_, "C": C, "IH": IH, "IW": IW,
                               "scale": sf},
                 })
-
-            elif isinstance(mod, torch.nn.LSTM):
-                # Decompose an nn.LSTM(num_layers=L) into L per-layer lstm_s8
-                # ops. Seq-len-1: one timestep per run_model call; the hidden
-                # (h) and cell (c) state persist in file-static buffers between
-                # calls (BSS-zeroed => correct zero init on the first step).
-                if mod.bidirectional:
-                    raise NotImplementedError(
-                        "int8 extract: bidirectional LSTM not supported")
-                if not mod.batch_first:
-                    # input is (seq, batch, feat); we require seq=batch=1.
-                    pass
-                L = int(mod.num_layers)
-                H = int(mod.hidden_size)
-                in_shape = tensors_meta[in_name]["shape"]
-                in_size0 = int(in_shape[-1])
-                # The nn.LSTM node returns (output, (h_n, c_n)); the graph
-                # consumes them via operator.getitem. output (index 0) is the
-                # last layer's hidden sequence — its consumer's name is the
-                # surface tensor we write. Skip the getitem nodes in the walk.
-                gi0 = _find_getitem_consumer(node, 0)
-                gi1 = _find_getitem_consumer(node, 1)
-                final_name = gi0.name if gi0 is not None else node.name
-                if gi0 is not None:
-                    _skip_nodes.add(gi0)
-                if gi1 is not None:
-                    _skip_nodes.add(gi1)
-                # Uniform hidden scale: h = o*tanh(c) is bounded to (-1, 1) for
-                # every layer, so one symmetric scale fits all. Calibrate from
-                # the captured surface output when available, else 1/127. Cell
-                # can exceed (-1,1); give it 4x the range.
-                s_h = float(scales.get(final_name) or (1.0 / _INT8_RANGE))
-                s_c = 4.0 * s_h
-                prefix = node.name
-                x_name = in_name
-                s_x = float(scales[in_name])
-                for lyr in range(L):
-                    wih = getattr(mod, f"weight_ih_l{lyr}").detach()  # [4H, in]
-                    whh = getattr(mod, f"weight_hh_l{lyr}").detach()  # [4H, H]
-                    bias = torch.zeros(4 * H)
-                    bih = getattr(mod, f"bias_ih_l{lyr}", None)
-                    bhh = getattr(mod, f"bias_hh_l{lyr}", None)
-                    if bih is not None:
-                        bias = bias + bih.detach()
-                    if bhh is not None:
-                        bias = bias + bhh.detach()
-                    in_l = in_size0 if lyr == 0 else H
-                    s_wih = _scale_from_max_abs(wih)
-                    s_whh = _scale_from_max_abs(whh)
-                    wih_name = f"{prefix}_wih_l{lyr}"
-                    whh_name = f"{prefix}_whh_l{lyr}"
-                    bias_name = f"{prefix}_bias_l{lyr}"
-                    weights_blob[wih_name] = _quantize_per_tensor_sym(
-                        wih, s_wih).reshape(4 * H, in_l).astype(np.int8)
-                    weights_blob[whh_name] = _quantize_per_tensor_sym(
-                        whh, s_whh).reshape(4 * H, H).astype(np.int8)
-                    weights_blob[bias_name] = bias.numpy().astype(np.float32)
-                    # fp32 copies for a possible fp16 promotion of this layer.
-                    fp32_stash[wih_name] = wih.cpu().numpy().reshape(
-                        4 * H, in_l).astype(np.float32)
-                    fp32_stash[whh_name] = whh.cpu().numpy().reshape(
-                        4 * H, H).astype(np.float32)
-                    fp32_stash[bias_name] = bias.numpy().astype(np.float32)
-                    h_name = f"{prefix}_h_l{lyr}"
-                    c_name = f"{prefix}_c_l{lyr}"
-                    out_name = final_name if lyr == L - 1 else f"{prefix}_out_l{lyr}"
-                    for nm, sc in ((h_name, s_h), (c_name, s_c), (out_name, s_h)):
-                        tensors_meta[nm] = {
-                            "shape": [1, H], "dtype": "i8",
-                            "quant": {"scale": sc, "zero_point": 0},
-                        }
-                        scales[nm] = sc
-                    ops.append({
-                        "name": f"{node.target}_l{lyr}",
-                        "op": "lstm_s8",
-                        "inputs": [x_name],
-                        "outputs": [out_name],
-                        "state": {"h": h_name, "c": c_name},
-                        "weight_ih": wih_name,
-                        "weight_hh": whh_name,
-                        "bias": bias_name,
-                        "shape": {"in_size": in_l, "H": H},
-                        "quant": {
-                            "s_x": s_x, "s_wih": s_wih, "s_whh": s_whh,
-                            "s_h": s_h, "s_c": s_c,
-                        },
-                    })
-                    x_name = out_name
-                    s_x = s_h
-
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported module {type(mod).__name__} "
@@ -1653,6 +2394,142 @@ def extract_int8(
                     "inputs": [in_name],
                     "outputs": [node.name],
                     "shape": {"n": n},
+                })
+            elif tname == "mul" or target is torch.mul \
+                    or target is __import__("operator").mul:
+                # mul_s8 existed with no call_function branch, the same shape of
+                # gap as gelu_s8: a kernel nothing could emit.
+                if not all(hasattr(a, "name") for a in node.args[:2]):
+                    raise NotImplementedError(
+                        f"int8 extract: mul at {node.name} with a scalar "
+                        f"operand is not supported; both sides must be tensors")
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                if tensors_meta[a_name]["shape"] != tensors_meta[b_name]["shape"]:
+                    raise NotImplementedError(
+                        f"int8 extract: mul at {node.name} broadcasts "
+                        f"{tensors_meta[a_name]['shape']} against "
+                        f"{tensors_meta[b_name]['shape']}; only equal shapes "
+                        f"are supported")
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[a_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "mul_s8",
+                    "inputs": [a_name, b_name], "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {"scale_a": scales[a_name],
+                              "scale_b": scales[b_name],
+                              "scale_out": scales[node.name],
+                              "activation_min": -128, "activation_max": 127},
+                })
+            elif tname in ("sin", "cos") or target in (torch.sin, torch.cos):
+                kind = "sin_s8" if (tname == "sin" or target is torch.sin) else "cos_s8"
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": kind,
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {"scale_in": scales[in_name],
+                              "scale_out": scales[node.name],
+                              "activation_min": -128, "activation_max": 127},
+                })
+            elif tname == "softmax" or target is torch.softmax \
+                    or getattr(target, "__name__", "") == "softmax":
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                shp = tensors_meta[in_name]["shape"]
+                K = int(shp[-1]); M = int(np.prod(shp[:-1])) if len(shp) > 1 else 1
+                dim = node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else -1)
+                if dim not in (-1, len(shp) - 1):
+                    raise NotImplementedError(
+                        f"int8 extract: softmax at {node.name} over dim={dim}; "
+                        f"only the last dimension is supported")
+                ops.append({
+                    "name": node.name, "op": "softmax_s8",
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"M": M, "K": K},
+                    "quant": {"scale_in": scales[in_name],
+                              "scale_out": scales[node.name]},
+                })
+            elif getattr(target, "__name__", "") == "scaled_dot_product_attention":
+                # Decompose rather than adding a fused kernel: matmul_s8
+                # already carries transpose_b and scale_div, which is exactly
+                # QK^T/sqrt(d), and softmax_s8 exists. Three existing kernels
+                # beat one new one that would duplicate all three.
+                q_n, k_n, v_n = (a.name for a in node.args[:3])
+                if len(node.args) > 3 or node.kwargs.get("attn_mask") is not None:
+                    raise NotImplementedError(
+                        f"int8 extract: sdpa at {node.name} with an attention "
+                        f"mask is not supported; only the unmasked form")
+                if node.kwargs.get("is_causal"):
+                    raise NotImplementedError(
+                        f"int8 extract: causal sdpa at {node.name} needs a mask "
+                        f"kernel; only the unmasked form is supported")
+                _record(node.name, dtype="i8")
+                qs = tensors_meta[q_n]["shape"]; ks = tensors_meta[k_n]["shape"]
+                M = int(np.prod(qs[:-1])); D = int(qs[-1]); S = int(np.prod(ks[:-1]))
+                scores = f"{node.name}__scores"
+                probs = f"{node.name}__probs"
+                # Scale for the attention scores.
+                #
+                # score = (q . k) / sqrt(D). In int8 units each operand has
+                # sigma ~ 127/3, so the dot over D terms has sigma
+                # ~ sqrt(D)*(127/3)^2 and the 1/sqrt(D) cancels it: the score
+                # magnitude is ~independent of D and lands near
+                # 3*(127/3)^2 ~ 1800 * scale_q * scale_k at 3 sigma. 32*sq*sk
+                # puts 127 levels over ~4060*sq*sk, i.e. roughly 2x headroom on
+                # that.
+                #
+                # The obvious-looking sq*sk*sqrt(D) is what was here first and
+                # it CLIPS: measured on attn_block it covered 0.022 against an
+                # actual score range of 0.095, and cosine at that step was
+                # 0.914 instead of ~0.999.
+                sc_scale = scales[q_n] * scales[k_n] * 32.0
+                for nm, sc in ((scores, float(sc_scale)), (probs, 1.0 / 127.0)):
+                    tensors_meta[nm] = {"shape": [M, S], "dtype": "i8",
+                                        "quant": {"scale": sc, "zero_point": 0}}
+                    scales[nm] = sc
+                ops.append({
+                    "name": f"{node.name}.qk", "op": "matmul_s8",
+                    "inputs": [q_n, k_n], "outputs": [scores],
+                    "shape": {"M": M, "K": D, "N": S, "transpose_b": 1},
+                    "quant": {"scale_a": scales[q_n], "scale_b": scales[k_n],
+                              "scale_out": float(sc_scale),
+                              "scale_div": float(np.sqrt(D)),
+                              "activation_min": -128, "activation_max": 127},
+                })
+                ops.append({
+                    "name": f"{node.name}.softmax", "op": "softmax_s8",
+                    "inputs": [scores], "outputs": [probs],
+                    "shape": {"M": M, "K": S},
+                    "quant": {"scale_in": float(sc_scale),
+                              "scale_out": 1.0 / 127.0},
+                })
+                ops.append({
+                    "name": f"{node.name}.av", "op": "matmul_s8",
+                    "inputs": [probs, v_n], "outputs": [node.name],
+                    "shape": {"M": M, "K": S, "N": int(tensors_meta[v_n]["shape"][-1]),
+                              "transpose_b": 0},
+                    "quant": {"scale_a": 1.0 / 127.0, "scale_b": scales[v_n],
+                              "scale_out": scales[node.name], "scale_div": 1.0,
+                              "activation_min": -128, "activation_max": 127},
+                })
+            elif tname == "relu6" or target is torch.nn.functional.relu6:
+                in_name = node.args[0].name
+                in_scale = scales[in_name]
+                scales[node.name] = in_scale       # relu6 preserves scale
+                _record(node.name, dtype="i8")
+                qmax = max(1, min(127, int(round(6.0 / in_scale))))
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": node.name,
+                    "op": "relu6_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "clamp_max": qmax,
                 })
             elif tname == "flatten" or target is torch.flatten:
                 in_name = node.args[0].name
@@ -1717,13 +2594,15 @@ def extract_int8(
                     )
                 in_names = [t.name for t in tensors_arg]
                 first_shape = list(tensors_meta[in_names[0]]["shape"])
-                # 4D NCHW channel-concat, or 2D [N, C] feature-concat (treated
-                # as [N, C, 1, 1] — the cat_c1 kernel is layout-agnostic once
-                # H=W=1). The 2D case is the vision/depth/state fuse -> LSTM.
+                # 4D NCHW channel-concat, or 2D [N, C] feature-concat handled
+                # as [N, C, 1, 1]. The cat_c1 kernels are layout-agnostic once
+                # H=W=1, and the 2D case is the fused net's
+                # [vision | depth | lowdim] fuse feeding the LSTM.
                 if len(first_shape) == 4:
                     N_, _, H_, W_ = (int(s) for s in first_shape)
                 elif len(first_shape) == 2:
-                    N_ = int(first_shape[0]); H_ = W_ = 1
+                    N_ = int(first_shape[0])
+                    H_ = W_ = 1
                 else:
                     raise NotImplementedError(
                         f"int8 extract: cat at {node.name}: only 2D [N,C] or "
@@ -1815,6 +2694,26 @@ def extract_int8(
                     "shape": {"N": N_, "C": C, "H": H_, "W": W_,
                               "c_each": c_each},
                 })
+            elif target_name in ("unsqueeze", "squeeze"):
+                # Pure rank changes: the element order and count are unchanged,
+                # so this is a view like flatten. LSTM inputs need one of these
+                # to reach [seq, batch, feature].
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
+                scales[node.name] = scales[in_name]
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                if n != int(np.prod(tensors_meta[node.name]["shape"])):
+                    raise NotImplementedError(
+                        f"int8 extract: {target_name} at {node.name} changed "
+                        f"the element count; only rank changes are views")
+                ops.append({
+                    "name": node.name,
+                    "op": "view",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                })
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported call_method "
@@ -1847,28 +2746,84 @@ def extract_int8(
                            skip_names=(fp16_op_names or set()))
 
     # Mixed precision: promote the requested ops to fp16 and materialize the
-    # int8<->fp16 boundary casts as explicit ops (backwards compatible — with no
-    # spec, ops/tensors are untouched and the IR is the plain all-int8 one).
+    # int8<->fp16 boundary casts. With no spec this is a no-op and the IR is
+    # byte-identical to the all-int8 one.
     if fp16_op_names:
-        _promote_ops_to_fp16(ops, fp16_op_names, tensors_meta, weights_blob, fp32_stash)
+        promoted = _promote_ops_to_fp16(ops, set(fp16_op_names), tensors_meta,
+                                        weights_blob, fp32_stash)
+        missing = sorted(set(fp16_op_names) - set(promoted))
+        if missing:
+            raise RuntimeError(
+                f"int8 extract: fp16 promotion asked for op(s) {missing} that "
+                f"are not in the graph; the graph has "
+                f"{sorted(o['name'] for o in ops)}. A precision spec that "
+                f"names a nonexistent op would silently leave that op int8.")
         ops = _insert_casts_i8_f16(ops, tensors_meta, scales)
+        print(f"[extract_int8] fp16 islands: {promoted}", flush=True)
 
     output_tensors = (output_names_multi
                       if output_names_multi is not None
                       else [output_name])
 
     dispatches = _annotate_dispatches(ops)
+
+    # Quantize each input with its own scale and surface dtype. int8 inputs are
+    # symmetric-quantized; f16/f32 inputs pass through as floats (they feed an
+    # fp16 island directly, so no cast op is needed at the surface).
+    inputs_q: list[np.ndarray] = []
+    for nm, si in zip(input_node_names, sample_inputs):
+        dt = input_dtype_map.get(nm, "i8")
+        if dt == "i8":
+            q = _quantize_per_tensor_sym(si, scales[nm]).reshape(
+                list(si.shape)).astype(np.int8)
+        elif dt == "f16":
+            q = si.detach().cpu().numpy().astype(np.float16)
+        elif dt == "f32":
+            q = si.detach().cpu().numpy().astype(np.float32)
+        else:
+            raise NotImplementedError(
+                f"int8 extract: input dtype {dt!r} for {nm} is not supported "
+                f"(supported: i8, f16, f32)")
+        inputs_q.append(q)
+
+    # Build the `input` IR field. Single-input keeps the legacy `tensor` key
+    # alone. Multi-input adds `packed_inputs`: the harness hands run_model ONE
+    # flat buffer holding every input back to back, and each entry says where
+    # its tensor starts. `offset` is in elements of the buffer's own element
+    # type (valid when every input shares a dtype); `byte_offset` and `dtype`
+    # are always present so a MIXED-dtype buffer (i8 images + f16 lowdim) can
+    # be addressed by byte and cast at the call site.
+    _NP_OF = {"i8": np.int8, "f16": np.float16, "f32": np.float32}
+    if len(input_names) == 1:
+        ir_input: dict = {"tensor": input_names[0],
+                          "tensors": input_names}
+    else:
+        packed: list[dict] = []
+        byte_off = 0
+        elem_off = 0
+        for nm, q in zip(input_names, inputs_q):
+            dt = input_dtype_map.get(nm, "i8")
+            itemsize = np.dtype(_NP_OF[dt]).itemsize
+            # Keep every slice naturally aligned for its own element type.
+            if byte_off % itemsize:
+                byte_off += itemsize - (byte_off % itemsize)
+            sz = int(np.prod(q.shape))
+            packed.append({"name": nm, "offset": elem_off, "size": sz,
+                           "dtype": dt, "byte_offset": byte_off})
+            byte_off += sz * itemsize
+            elem_off += sz
+        uniform = len({input_dtype_map.get(nm, "i8") for nm in input_names})
+        ir_input = {"tensor": input_names[0],
+                    "tensors": input_names,
+                    "packed_inputs": packed,
+                    "packed_dtype": (input_dtype_map.get(input_names[0], "i8")
+                                     if uniform == 1 else "mixed"),
+                    "packed_bytes": byte_off}
     ir = {
         "name": name,
         "version": 1,
         "quant": "int8",
-        # Multi-input: `tensors` lists every input in placeholder order (each
-        # with its own shape/dtype/quant in the top-level `tensors` dict);
-        # `tensor` stays for single-input back-compat (None when >1).
-        "input": {
-            "tensors": input_names,
-            "tensor": input_names[0] if len(input_names) == 1 else None,
-        },
+        "input": ir_input,
         "output": {
             "tensors": output_tensors,
             "tensor": output_tensors[0] if len(output_tensors) == 1 else None,
@@ -1878,30 +2833,11 @@ def extract_int8(
         "dispatches": dispatches,
     }
 
-    # Quantize each input with its own scale/dtype and seed the simulator.
-    # int8 inputs are symmetric-quantized by their scale; f32 inputs pass
-    # through (typed float in codegen). The flat, native-dtype arrays are
-    # saved to io.npz (input0..N) for the harness's baked golden input.
-    inputs_q: list[np.ndarray] = []
-    activations: dict[str, np.ndarray] = {}
-    for nm, si in zip(input_node_names, sample_inputs):
-        dt = input_dtype_map.get(nm, "i8")
-        if dt == "i8":
-            q = _quantize_per_tensor_sym(si, scales[nm]).reshape(
-                list(si.shape)).astype(np.int8)
-        elif dt == "f32":
-            q = si.detach().cpu().numpy().astype(np.float32)
-        elif dt == "f16":
-            # fp16 passthrough input — feeds an fp16 island (e.g. the fused
-            # net's lowdim vector into the fp16 tail's cat) with NO cast, since
-            # a single int8 scale can't span its mixed component magnitudes.
-            q = si.detach().cpu().numpy().astype(np.float16)
-        else:
-            raise NotImplementedError(
-                f"int8 extract: input dtype {dt!r} for {nm} not supported "
-                "(supported: i8, f32, f16)")
-        inputs_q.append(q)
-        activations[nm] = q
+    # Simulate the integer pipeline in Python so the golden output matches
+    # bit-exactly what the C kernel will produce. Walking the IR ops:
+    activations: dict[str, np.ndarray] = {
+        nm: q for nm, q in zip(input_node_names, inputs_q)
+    }
     for op in ops:
         in_name = op["inputs"][0]
         out_name = op["outputs"][0]
@@ -1935,7 +2871,36 @@ def extract_int8(
             activations[out_name] = scaled.astype(np.int8)
         elif op["op"] == "relu_s8":
             activations[out_name] = np.maximum(in_arr, 0).astype(np.int8)
-        elif op["op"] in ("conv2d_s8", "conv2d_s8_pc"):
+        elif op["op"] == "relu6_s8":
+            activations[out_name] = np.clip(
+                in_arr, 0, op["clamp_max"]).astype(np.int8)
+        elif op["op"] == "conv2d_s8":
+            activations[out_name] = _sim_conv2d_s8(
+                in_arr, op["shape"], op["quant"],
+                weights_blob[op["weight"]], weights_blob[op["bias"]])
+        elif op["op"] in ("conv2d_batchnorm2d_s8",
+                          "conv2d_batchnorm2d_silu_s8"):
+            # Fused conv→bn(→silu): run the sub-ops in sequence through the
+            # same primitives as the standalone path so the golden is
+            # bit-exact with the composed C reference kernel.
+            cur = in_arr
+            for sub in op["sub_ops"]:
+                sk = sub["op"]
+                if sk == "conv2d_s8":
+                    cur = _sim_conv2d_s8(
+                        cur, sub["shape"], sub["quant"],
+                        weights_blob[sub["weight"]], weights_blob[sub["bias"]])
+                elif sk == "batchnorm2d_s8":
+                    cur = _sim_batchnorm2d_s8(
+                        cur, sub["shape"], sub["quant"],
+                        weights_blob[sub["weight"]], weights_blob[sub["bias"]])
+                elif sk == "silu_s8":
+                    cur = _sim_silu_s8(cur, sub["quant"])
+                else:
+                    raise NotImplementedError(
+                        f"int8 simulator: fused sub-op {sk!r} unsupported")
+            activations[out_name] = cur
+        elif op["op"] == "conv2d_s8_pc":
             sh = op["shape"]
             q = op["quant"]
             w_q = weights_blob[op["weight"]].astype(np.int32)  # [OC, IC, KH, KW]
@@ -1948,9 +2913,6 @@ def extract_int8(
                 mult = weights_blob[q["output_multiplier_per_oc_key"]]
                 shift = weights_blob[q["output_shift_per_oc_key"]]
                 scaled = _requantize_int_per_oc(out, mult, shift, oc_axis=1)
-            else:
-                scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
-                scaled += q["output_offset"]
             scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
             activations[out_name] = scaled.astype(np.int8)
         elif op["op"] == "conv2d_silu_s8":
@@ -2061,18 +3023,9 @@ def extract_int8(
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
         elif op["op"] == "batchnorm2d_s8":
-            sh = op["shape"]
-            q = op["quant"]
-            scale_per_ch = weights_blob[op["weight"]].astype(np.float32)
-            bias_per_ch = weights_blob[op["bias"]].astype(np.float32)
-            in_4d = in_arr.reshape(sh["N"], sh["C"], sh["H"], sh["W"]).astype(np.float32)
-            scale_in = np.float32(q["scale_in"])
-            scale_out = np.float32(q["scale_out"])
-            fv = in_4d * scale_in
-            y = scale_per_ch[None, :, None, None] * fv + bias_per_ch[None, :, None, None]
-            v = np.round(y / scale_out).astype(np.int32)
-            v = np.clip(v, q["activation_min"], q["activation_max"])
-            activations[out_name] = v.astype(np.int8)
+            activations[out_name] = _sim_batchnorm2d_s8(
+                in_arr, op["shape"], op["quant"],
+                weights_blob[op["weight"]], weights_blob[op["bias"]])
         elif op["op"] == "sigmoid_s8":
             q = op["quant"]
             fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
@@ -2081,12 +3034,7 @@ def extract_int8(
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
         elif op["op"] == "silu_s8":
-            q = op["quant"]
-            fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
-            silu_out = fv / (np.float32(1.0) + np.exp(-fv).astype(np.float32))
-            v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
-            v = np.clip(v, q["activation_min"], q["activation_max"])
-            activations[out_name] = v.astype(np.int8)
+            activations[out_name] = _sim_silu_s8(in_arr, op["quant"])
         elif op["op"] == "elu_s8":
             q = op["quant"]
             fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
@@ -2095,6 +3043,156 @@ def extract_int8(
             v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "mul_s8":
+            q = op["quant"]
+            # Flatten both: activations are stored with whatever rank their
+            # producer used, and this op is elementwise over equal shapes.
+            a = activations[op["inputs"][0]].reshape(-1).astype(np.float64) \
+                * float(q["scale_a"])
+            b = activations[op["inputs"][1]].reshape(-1).astype(np.float64) \
+                * float(q["scale_b"])
+            v = _round_half_away((a * b) / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] in ("sin_s8", "cos_s8"):
+            q = op["quant"]
+            x = in_arr.astype(np.float64) * float(q["scale_in"])
+            y = np.sin(x) if op["op"] == "sin_s8" else np.cos(x)
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "softmax_s8":
+            sh = op["shape"]; q = op["quant"]
+            x = in_arr.reshape(sh["M"], sh["K"]).astype(np.float64) \
+                * float(q["scale_in"])
+            x = x - x.max(axis=1, keepdims=True)      # stable, as the kernel does
+            e = np.exp(x)
+            y = e / e.sum(axis=1, keepdims=True)
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(v, -128, 127).astype(np.int8)
+        elif op["op"] == "matmul_s8":
+            sh = op["shape"]; q = op["quant"]
+            a = activations[op["inputs"][0]].reshape(sh["M"], sh["K"]) \
+                .astype(np.float64) * float(q["scale_a"])
+            bm = activations[op["inputs"][1]]
+            if sh.get("transpose_b"):
+                bm = bm.reshape(sh["N"], sh["K"]).astype(np.float64).T
+            else:
+                bm = bm.reshape(sh["K"], sh["N"]).astype(np.float64)
+            y = (a @ (bm * float(q["scale_b"]))) / float(q.get("scale_div", 1.0))
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "gelu_s8":
+            q = op["quant"]
+            import math as _math
+            # float32 with the kernel's own constant, not float64 with a more
+            # accurate 1/sqrt(2): the golden must reproduce what the device
+            # computes, including its constant.
+            kInvSqrt2 = np.float32(0.70710678118)
+            x = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            erf = np.vectorize(_math.erf, otypes=[np.float32])
+            y = np.float32(0.5) * x * (np.float32(1.0) + erf(x * kInvSqrt2))
+            v = _round_half_away(y.astype(np.float64)
+                                 / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] in ("layernorm_s8", "rmsnorm_s8"):
+            sh = op["shape"]; q = op["quant"]
+            M, K = sh["M"], sh["K"]
+            x = in_arr.reshape(M, K).astype(np.float64) * float(q["scale_in"])
+            g = weights_blob[op["weight"]].astype(np.float64)
+            eps = float(q["eps"])
+            if op["op"] == "rmsnorm_s8":
+                # RMSNorm does NOT subtract the mean; conflating it with a
+                # bias-free LayerNorm is silent and wrong for rows with DC.
+                inv = 1.0 / np.sqrt((x * x).mean(axis=1, keepdims=True) + eps)
+                y = x * inv * g
+            else:
+                mu = x.mean(axis=1, keepdims=True)
+                var = ((x - mu) ** 2).mean(axis=1, keepdims=True)  # biased, as torch
+                y = (x - mu) / np.sqrt(var + eps) * g
+                if op.get("bias"):
+                    y = y + weights_blob[op["bias"]].astype(np.float64)
+            v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "lstm_s8":
+            sh = op["shape"]; q = op["quant"]
+            H = sh["hidden_size"]; IS = sh["input_size"]
+            # float64 throughout, matching the kernel's double: the op is
+            # evaluated in floating point, so golden and device agree only if
+            # both land well inside half an int8 LSB. float32 on both sides
+            # still disagreed by up to 2 LSB.
+            w_ih = weights_blob[op["weight"]].astype(np.float64) * float(q["scale_w_ih"])
+            w_hh = weights_blob[op["weight_hh"]].astype(np.float64) * float(q["scale_w_hh"])
+            b = np.zeros((4 * H,), dtype=np.float64)
+            if q["has_bias"]:
+                b = ((weights_blob[op["bias"]] + weights_blob[op["bias_hh"]])
+                     .astype(np.float64) * float(q["scale_b"]))
+            h_name, c_name = op["state"]
+            # Persistent state: zero on the first step, then whatever the
+            # previous invocation left. The simulator has to model that or the
+            # golden diverges from the device on step 2 onwards.
+            h_q = activations.get(h_name)
+            c_q = activations.get(c_name)
+            h = (np.zeros(H, np.float64) if h_q is None
+                 else h_q.reshape(-1).astype(np.float64) * float(q["scale_h"]))
+            c = (np.zeros(H, np.float64) if c_q is None
+                 else c_q.reshape(-1).astype(np.float64) * float(q["scale_c"]))
+            x = in_arr.reshape(-1).astype(np.float64) * float(q["scale_in"])
+            g = w_ih @ x[:IS] + w_hh @ h + b
+            i_g = 1.0 / (1.0 + np.exp(-g[0:H]))
+            f_g = 1.0 / (1.0 + np.exp(-g[H:2*H]))
+            g_g = np.tanh(g[2*H:3*H])
+            o_g = 1.0 / (1.0 + np.exp(-g[3*H:4*H]))
+            c_new = f_g * c + i_g * g_g
+            h_new = o_g * np.tanh(c_new)
+            cq = np.clip(_round_half_away(c_new / float(q["scale_c"])), -128, 127).astype(np.int8)
+            hq = np.clip(_round_half_away(h_new / float(q["scale_h"])), -128, 127).astype(np.int8)
+            activations[c_name] = cq.reshape(1, H)
+            activations[h_name] = hq.reshape(1, H)
+            activations[out_name] = hq.reshape(1, H)
+        elif op["op"] == "leaky_relu_s8":
+            q = op["quant"]
+            fv = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            slope = np.float32(q.get("negative_slope", 0.01))
+            y = np.where(fv > 0, fv, slope * fv).astype(np.float32)
+            v = np.round(y / np.float32(q["scale_out"])).astype(np.int32)
+            v = np.clip(v, q["activation_min"], q["activation_max"])
+            activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "avgpool2d_s8":
+            sh = op["shape"]
+            in_4d = in_arr.reshape(sh["N"], sh["C"], sh["IH"], sh["IW"])
+            KH, KW = sh["KH"], sh["KW"]
+            SH, SW = sh["SH"], sh["SW"]
+            PH, PW = sh["PH"], sh["PW"]
+            cip = bool(sh.get("count_include_pad", 1))
+            OH, OW = sh["OH"], sh["OW"]
+            # Pad with the quantized zero, which is the real 0 under symmetric
+            # per-tensor quantization -- so padded taps contribute nothing to
+            # the sum and only the divisor distinguishes count_include_pad.
+            padded = np.pad(in_4d.astype(np.int32),
+                            ((0, 0), (0, 0), (PH, PH), (PW, PW)))
+            valid = np.pad(np.ones_like(in_4d, dtype=np.int32),
+                           ((0, 0), (0, 0), (PH, PH), (PW, PW)))
+            out = np.zeros((sh["N"], sh["C"], OH, OW), dtype=np.int8)
+            for oh in range(OH):
+                for ow in range(OW):
+                    win = padded[:, :, oh*SH:oh*SH+KH, ow*SW:ow*SW+KW]
+                    tot = win.sum(axis=(2, 3))
+                    if cip:
+                        div = np.full_like(tot, KH * KW)
+                    else:
+                        div = valid[:, :, oh*SH:oh*SH+KH,
+                                    ow*SW:ow*SW+KW].sum(axis=(2, 3))
+                        div = np.maximum(div, 1)
+                    # round half away from zero, matching the C kernel
+                    v = np.where(tot >= 0,
+                                 (tot + div // 2) // div,
+                                 -((-tot + div // 2) // div))
+                    out[:, :, oh, ow] = np.clip(v, -128, 127).astype(np.int8)
+            activations[out_name] = out
         elif op["op"] == "upsample_nearest_s8":
             sh = op["shape"]
             scale = sh["scale"]
@@ -2124,100 +3222,106 @@ def extract_int8(
             c_each = sh["c_each"]
             activations[op["outputs"][0]] = in_4d[:, :c_each, :, :].astype(np.int8)
             activations[op["outputs"][1]] = in_4d[:, c_each:, :, :].astype(np.int8)
-        elif op["op"] == "lstm_s8":
-            # Mirrors kernel_lstm_s8 in float32. Seq-len-1, single timestep:
-            # h and c start at 0 (the device's BSS-zeroed state on the first
-            # run_model call), so this one-forward golden matches step 0.
-            wih = weights_blob[op["weight_ih"]].astype(np.int64)   # [4H, in]
-            whh = weights_blob[op["weight_hh"]].astype(np.int64)   # [4H, H]
-            bias = weights_blob[op["bias"]].astype(np.float32)     # [4H]
-            sh = op["shape"]; q = op["quant"]
-            in_size = int(sh["in_size"]); H = int(sh["H"])
-            x = in_arr.reshape(-1).astype(np.int64)[:in_size]
-            h = np.zeros(H, np.int64)
-            c = np.zeros(H, np.float32)
-            sx = np.float32(q["s_x"]) * np.float32(q["s_wih"])
-            sr = np.float32(q["s_h"]) * np.float32(q["s_whh"])
-            s_h = np.float32(q["s_h"]); s_c = np.float32(q["s_c"])
-            acc_x = (wih @ x)                                       # [4H] int64
-            acc_h = (whh @ h)                                       # [4H] (all zero)
-            pre = (acc_x.astype(np.float32) * sx
-                   + acc_h.astype(np.float32) * sr + bias).astype(np.float32)
-            ig = (np.float32(1.0) / (np.float32(1.0) + np.exp(-pre[0:H]))).astype(np.float32)
-            fg = (np.float32(1.0) / (np.float32(1.0) + np.exp(-pre[H:2 * H]))).astype(np.float32)
-            cg = np.tanh(pre[2 * H:3 * H]).astype(np.float32)
-            og = (np.float32(1.0) / (np.float32(1.0) + np.exp(-pre[3 * H:4 * H]))).astype(np.float32)
-            c_prev = c * s_c                                        # zero on step 0
-            c_new = (fg * c_prev + ig * cg).astype(np.float32)
-            h_new = (og * np.tanh(c_new).astype(np.float32)).astype(np.float32)
-            hq = np.clip(np.round(h_new / s_h).astype(np.int32), -128, 127)
-            activations[out_name] = hq.reshape(1, H).astype(np.int8)
+        # ---- fp16 islands (mixed precision) --------------------------------
         elif op["op"] == "cast_i8_to_f16":
-            # int8 -> fp16: dequantize by the source scale.
-            activations[out_name] = (in_arr.astype(np.float32)
-                                     * np.float32(op["quant"]["scale"])).astype(np.float16)
+            activations[out_name] = (
+                in_arr.astype(np.float32)
+                * np.float32(op["quant"]["scale"])).astype(np.float16)
         elif op["op"] == "cast_f16_to_i8":
-            activations[out_name] = np.clip(np.round(
-                in_arr.astype(np.float32) / np.float32(op["quant"]["scale"])
-            ), -128, 127).astype(np.int8)
+            inv = np.float32(1.0 / max(float(op["quant"]["scale"]), 1e-30))
+            v = _round_half_away(in_arr.astype(np.float32) * inv)
+            activations[out_name] = np.clip(v, -128, 127).astype(np.int8)
         elif op["op"] in ("cat2_c1_f16", "cat3_c1_f16", "cat4_c1_f16"):
-            # fp16 channel concat (no requant): inputs already f16.
-            sh = op["shape"]; N_, H_, W_ = sh["N"], sh["H"], sh["W"]
+            # fp16 concat is a pure copy -- no requantization, which is the
+            # whole point: the int8 version had to squeeze 512 vision features
+            # (max-abs 0.24) onto the optical-flow-dominated output scale.
+            sh = op["shape"]
+            N_, H_, W_ = sh["N"], sh["H"], sh["W"]
             parts = [activations[n].reshape(N_, c, H_, W_).astype(np.float16)
                      for n, c in zip(op["inputs"], sh["C_inputs"])]
             activations[out_name] = np.concatenate(parts, axis=1)
         elif op["op"] == "linear_f16":
-            # fp16 storage, fp32 accumulate (matches kernel_linear_f16).
-            w = weights_blob[op["weight"]].astype(np.float32)
-            b = weights_blob[op["bias"]].astype(np.float32) if op.get("bias") else None
+            # fp16 storage, fp32 accumulate -- matches kernel_linear_f16.
             sh = op["shape"]
+            w = weights_blob[op["weight"]].astype(np.float32)
             x = in_arr.reshape(sh["M"], sh["K"]).astype(np.float32)
             y = x @ w.reshape(sh["N"], sh["K"]).T
-            if b is not None:
-                y = y + b
+            if op.get("bias"):
+                y = y + weights_blob[op["bias"]].astype(np.float32)
             activations[out_name] = y.astype(np.float16)
         elif op["op"] == "lstm_f16":
-            # fp16 storage + fp16 gate-GEMM accumulate (mirrors kernel_lstm_f16).
-            wih = weights_blob[op["weight_ih"]].astype(np.float16)
-            whh = weights_blob[op["weight_hh"]].astype(np.float16)
-            bias = weights_blob[op["bias"]].astype(np.float32)
-            sh = op["shape"]; in_size = int(sh["in_size"]); H = int(sh["H"])
-            x = in_arr.reshape(-1)[:in_size].astype(np.float16)
-            h = np.zeros(H, np.float16); c = np.zeros(H, np.float32)
-            out = np.zeros(H, np.float16)
-            for j in range(H):
-                pre = np.zeros(4, np.float32)
-                for g in range(4):
-                    row = g * H + j
-                    ax = np.float16(0); ah = np.float16(0)
-                    for k in range(in_size):
-                        ax = np.float16(ax + np.float16(x[k] * wih[row, k]))
-                    for k in range(H):
-                        ah = np.float16(ah + np.float16(h[k] * whh[row, k]))
-                    pre[g] = np.float32(ax) + np.float32(ah) + bias[row]
-                ig = 1.0 / (1.0 + np.exp(-pre[0])); fg = 1.0 / (1.0 + np.exp(-pre[1]))
-                cg = np.tanh(pre[2]); og = 1.0 / (1.0 + np.exp(-pre[3]))
-                c_new = np.float32(fg) * c[j] + np.float32(ig) * np.float32(cg)
-                c[j] = c_new
-                out[j] = np.float16(np.float32(og) * np.float32(np.tanh(c_new)))
-            activations[out_name] = out.reshape(1, H).astype(np.float16)
+            # Mirrors kernel_lstm_f16: fp16 storage AND fp16 gate-GEMM
+            # accumulate (each product rounded to fp16, then added in fp16),
+            # with the sigmoid/tanh/cell update in float32. The fp16 accumulate
+            # is modelled step by step rather than as one matmul, because the
+            # rounding is what the device does.
+            sh = op["shape"]
+            H = int(sh["hidden_size"]); IS = int(sh["input_size"])
+            w_ih = weights_blob[op["weight"]].reshape(4 * H, IS)
+            w_hh = weights_blob[op["weight_hh"]].reshape(4 * H, H)
+            b = weights_blob[op["bias"]].astype(np.float32)
+            h_name, c_name = (op["state"] if isinstance(op["state"], (list, tuple))
+                              else (op["state"]["h"], op["state"]["c"]))
+            h_prev = activations.get(h_name)
+            c_prev = activations.get(c_name)
+            h = (np.zeros(H, np.float16) if h_prev is None
+                 else h_prev.reshape(-1).astype(np.float16))
+            c = (np.zeros(H, np.float32) if c_prev is None
+                 else c_prev.reshape(-1).astype(np.float32))
+            x = in_arr.reshape(-1)[:IS].astype(np.float16)
+            px = (x.astype(np.float32)
+                  * w_ih.astype(np.float32)).astype(np.float16)   # [4H, IS]
+            ph = (h.astype(np.float32)
+                  * w_hh.astype(np.float32)).astype(np.float16)   # [4H, H]
+            ax = np.zeros(4 * H, np.float16)
+            for k in range(IS):
+                ax = (ax.astype(np.float32)
+                      + px[:, k].astype(np.float32)).astype(np.float16)
+            ah = np.zeros(4 * H, np.float16)
+            for k in range(H):
+                ah = (ah.astype(np.float32)
+                      + ph[:, k].astype(np.float32)).astype(np.float16)
+            pre = (ax.astype(np.float32) + ah.astype(np.float32) + b)
+            ig = (1.0 / (1.0 + np.exp(-pre[0:H]))).astype(np.float32)
+            fg = (1.0 / (1.0 + np.exp(-pre[H:2*H]))).astype(np.float32)
+            cg = np.tanh(pre[2*H:3*H]).astype(np.float32)
+            og = (1.0 / (1.0 + np.exp(-pre[3*H:4*H]))).astype(np.float32)
+            c_new = (fg * c + ig * cg).astype(np.float32)
+            out_f16 = (og * np.tanh(c_new).astype(np.float32)).astype(np.float16)
+            activations[c_name] = c_new.astype(np.float16).reshape(1, H)
+            activations[h_name] = out_f16.reshape(1, H)
+            activations[out_name] = out_f16.reshape(1, H)
         else:
             raise NotImplementedError(
                 f"int8 simulator: unsupported op {op['op']}"
             )
 
-    # Concatenate outputs in IR order (matching multi-output goldens elsewhere).
-    # Respect the surface dtype: fp16 for an fp16-promoted output (mixed
-    # precision), else int8. (Assumes surface outputs share one dtype.)
+    # Concatenate outputs in IR order (matching multi-output goldens
+    # elsewhere). The surface dtype follows the IR: an fp16-promoted tail
+    # writes f16 outputs, everything else int8.
     _out_np_dtype = (np.float16
                      if tensors_meta.get(output_tensors[0], {}).get("dtype") == "f16"
                      else np.int8)
     out_q = np.concatenate([
         activations[t].reshape(-1).astype(_out_np_dtype) for t in output_tensors
     ])
-    # Per-input flat arrays at native dtype: input0..N (multi-input harness).
-    # `input=` (== input0) kept for the single-input harness back-compat.
+    # One flat, native-dtype array per input (input0..N), plus the single
+    # packed `input` buffer the harness actually bakes in. When every input
+    # shares a dtype the packed buffer is that dtype; when they do not (i8
+    # images + f16 lowdim) it is a byte buffer whose slices the generated C
+    # re-casts, so the golden must be packed byte-wise the same way.
     inputs_flat = {f"input{i}": q.reshape(-1) for i, q in enumerate(inputs_q)}
+    if len(inputs_q) == 1:
+        inp_q = inputs_q[0].reshape(-1)
+    elif ir_input.get("packed_dtype") != "mixed":
+        inp_q = np.concatenate([q.reshape(-1) for q in inputs_q])
+    else:
+        blob = np.zeros(int(ir_input["packed_bytes"]), dtype=np.int8)
+        for entry, q in zip(ir_input["packed_inputs"], inputs_q):
+            raw = np.ascontiguousarray(q.reshape(-1)).view(np.int8)
+            off = int(entry["byte_offset"])
+            blob[off:off + raw.size] = raw
+        inp_q = blob
 
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
@@ -2226,7 +3330,7 @@ def extract_int8(
     with open(ir_path, "w") as f:
         json.dump(ir, f, indent=2)
     np.savez(weights_path, **weights_blob)
-    np.savez(io_path, input=inputs_q[0].reshape(-1), output=out_q, **inputs_flat)
+    np.savez(io_path, input=inp_q, output=out_q, **inputs_flat)
     # passes_applied.json records each fusion / fold pass that fired
     # during this IR extraction plus the IR-side op counts that
     # downstream tooling uses to answer "did my new fusion pattern
@@ -2278,8 +3382,9 @@ def extract_int8(
         json.dump(passes_log, f, indent=2)
     print(f"wrote {ir_path}")
     print(f"wrote {weights_path}  ({len(weights_blob)} tensors)")
-    print(f"wrote {io_path}  ({len(inputs_q)} input(s): "
-          f"{[str(q.dtype) for q in inputs_q]}, output dtype={out_q.dtype})")
+    print(f"wrote {io_path}  ({len(inputs_q)} input(s) "
+          f"{[str(q.dtype) for q in inputs_q]}, packed dtype={inp_q.dtype}, "
+          f"output dtype={out_q.dtype})")
     print(f"wrote {passes_path}  ("
           f"enable_fusion={enable_fusion}, "
           f"linear_relu_fuse={len(fused_linear_relu)}, "
@@ -2363,6 +3468,7 @@ def extract(
     # marker function. The per-node iteration below then sees that
     # marker and emits a clean single-op IR.
     _maybe_fuse_compound_activation(gm)
+    _maybe_fuse_loss(gm)
 
     tensors: dict[str, dict] = {}
     ops: list[dict] = []
@@ -2390,10 +3496,19 @@ def extract(
 
     _skip_nodes: set = set()
     for _n in gm.graph.nodes:
+        # `@` traces to operator.matmul (name "matmul"), not torch.matmul —
+        # match by name too so the diag/transpose fusions fire for both.
         if (_n.op == "call_function" and
-                _n.target in (torch.matmul, torch.mm)):
+                (_n.target in (torch.matmul, torch.mm, _operator.matmul)
+                 or getattr(_n.target, "__name__", "") in ("matmul", "mm"))):
             for _arg in _n.args[:2]:
                 if _is_transpose_node(_arg):
+                    _skip_nodes.add(_arg)
+                # diag(A) @ B is fused into diag_matmul; the diag node itself
+                # emits no op.
+                elif (isinstance(_arg, torch.fx.Node)
+                      and _arg.op == "call_function"
+                      and getattr(_arg.target, "__name__", "") == "diag"):
                     _skip_nodes.add(_arg)
 
     for node in gm.graph.nodes:
@@ -2460,11 +3575,6 @@ def extract(
                 })
 
             elif isinstance(mod, torch.nn.Conv2d):
-                if mod.dilation != (1, 1):
-                    raise NotImplementedError(
-                        f"Conv2d with dilation={mod.dilation} not supported "
-                        f"yet at {node.name}"
-                    )
                 w_key = f"{node.target}.weight"
                 b_key = f"{node.target}.bias" if mod.bias is not None else None
                 weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
@@ -2478,6 +3588,7 @@ def extract(
                 KH, KW = _pair(mod.kernel_size)
                 SH, SW = _pair(mod.stride)
                 PH, PW = _pair(mod.padding)
+                DH, DW = _pair(mod.dilation)
                 # Depthwise conv: each output channel reads from one input
                 # channel via its own [1, KH, KW] filter. Detected when
                 # groups == in_channels == out_channels. Different memory
@@ -2496,9 +3607,10 @@ def extract(
                             "KH": KH, "KW": KW,
                             "SH": SH, "SW": SW,
                             "PH": PH, "PW": PW,
+                            "DH": DH, "DW": DW,
                         },
                     })
-                elif mod.groups == IC and IC == OC:
+                elif mod.groups == IC and IC == OC and DH == 1 and DW == 1:
                     ops.append({
                         "name": str(node.target),
                         "op": "conv2d_dw",
@@ -2523,6 +3635,205 @@ def extract(
                         f"{node.name}"
                     )
 
+            elif isinstance(mod, torch.nn.Conv1d):
+                # 1D conv → conv2d with a unit height dim: input [N,C,L] is
+                # [N,C,1,L]; weight [OC,IC,K] → [OC,IC,1,K]; KH=1, KW=K.
+                # Dilation maps to DW (the height dim is degenerate, DH=1).
+                (Dl,) = _as_tuple1(mod.dilation)
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, IC, IW = in_shape
+                OC, OW = out_shape[1], out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride)
+                (P,) = _as_tuple1(mod.padding)
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                w = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                weights[w_key] = w.reshape(w.shape[0], w.shape[1], 1, w.shape[2])
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                if mod.groups == 1:
+                    ops.append({
+                        "name": str(node.target), "op": "conv2d",
+                        "inputs": [in_name], "outputs": [out_name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "IC": IC, "IH": 1, "IW": IW,
+                                  "OC": OC, "OH": 1, "OW": OW,
+                                  "KH": 1, "KW": K, "SH": 1, "SW": S,
+                                  "PH": 0, "PW": P, "DH": 1, "DW": Dl},
+                    })
+                elif mod.groups == IC and IC == OC and Dl == 1:
+                    ops.append({
+                        "name": str(node.target), "op": "conv2d_dw",
+                        "inputs": [in_name], "outputs": [out_name],
+                        "weight": w_key, "bias": b_key,
+                        "shape": {"N": N_, "C": IC, "IH": 1, "IW": IW,
+                                  "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                                  "SH": 1, "SW": S, "PH": 0, "PW": P},
+                    })
+                else:
+                    raise NotImplementedError(
+                        f"Conv1d groups={mod.groups} (IC={IC},OC={OC}) "
+                        f"dilation={Dl} at {node.name}: only standard and "
+                        f"non-dilated depthwise wired")
+
+            elif isinstance(mod, torch.nn.ConvTranspose1d):
+                # 1D transposed conv → conv_transpose2d, unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, IC, IW = in_shape
+                OC, OW = out_shape[1], out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride)
+                (P,) = _as_tuple1(mod.padding)
+                (Dl,) = _as_tuple1(mod.dilation)
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                w = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                weights[w_key] = w.reshape(w.shape[0], w.shape[1], 1, w.shape[2])
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                ops.append({
+                    "name": str(node.target), "op": "conv_transpose2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "IH": 1, "IW": IW,
+                              "OC": OC, "OH": 1, "OW": OW,
+                              "KH": 1, "KW": K, "SH": 1, "SW": S,
+                              "PH": 0, "PW": P, "DH": 1, "DW": Dl,
+                              "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.ConvTranspose2d):
+                # Transposed conv. Weight is [IC, OC/G, KH, KW]. OH/OW come from
+                # the traced output shape, so output_padding is already folded
+                # in. The rvv backend repacks this 4D weight to IHWO like any
+                # conv weight; the kernel honors that via its IHWOC branch.
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                in_shape = tensors[in_name]["shape"]
+                out_shape = tensors[out_name]["shape"]
+                N_, IC, IH, IW = (int(s) for s in in_shape)
+                _, OC, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                SH, SW = _pair(mod.stride)
+                PH, PW = _pair(mod.padding)
+                DH, DW = _pair(mod.dilation)
+                G = int(mod.groups)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "conv_transpose2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "weight": w_key,
+                    "bias": b_key,
+                    "shape": {
+                        "N": N_, "IC": IC, "IH": IH, "IW": IW,
+                        "OC": OC, "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                        "DH": DH, "DW": DW,
+                        "G": G,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.Conv3d):
+                # 3D conv (NCDHW). Weight [OC, IC/G, KD, KH, KW] is 5D so the
+                # backend leaves it in OIDHW (no IHWO repack for 5D).
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                N_, IC, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, OC, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "conv3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "ID": ID, "IH": IH, "IW": IW,
+                              "OC": OC, "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW, "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.ConvTranspose3d):
+                # 3D transposed conv. Weight [IC, OC/G, KD, KH, KW] (5D). OD/OH/
+                # OW come from the traced output shape (output_padding folded in).
+                w_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias" if mod.bias is not None else None
+                weights[w_key] = mod.weight.detach().cpu().numpy().astype(weight_dtype)
+                if b_key is not None:
+                    weights[b_key] = mod.bias.detach().cpu().numpy().astype(weight_dtype)
+                N_, IC, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, OC, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "conv_transpose3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "weight": w_key, "bias": b_key,
+                    "shape": {"N": N_, "IC": IC, "ID": ID, "IH": IH, "IW": IW,
+                              "OC": OC, "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW, "G": int(mod.groups)},
+                })
+
+            elif isinstance(mod, torch.nn.MaxPool3d):
+                N_, C, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, _, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride if mod.stride is not None
+                                     else mod.kernel_size)
+                PD, PH, PW = _triple(mod.padding)
+                DD, DH, DW = _triple(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "maxpool3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "ID": ID, "IH": IH, "IW": IW,
+                              "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW,
+                              "DD": DD, "DH": DH, "DW": DW},
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool3d):
+                N_, C, ID, IH, IW = (int(s) for s in tensors[in_name]["shape"])
+                _, _, OD, OH, OW = (int(s) for s in tensors[out_name]["shape"])
+                KD, KH, KW = _triple(mod.kernel_size)
+                SD, SH, SW = _triple(mod.stride if mod.stride is not None
+                                     else mod.kernel_size)
+                PD, PH, PW = _triple(mod.padding)
+                if not mod.count_include_pad and (PD or PH or PW):
+                    raise NotImplementedError(
+                        f"AvgPool3d count_include_pad=False with padding at "
+                        f"{node.name}")
+                ops.append({
+                    "name": str(node.target), "op": "avgpool3d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "ID": ID, "IH": IH, "IW": IW,
+                              "OD": OD, "OH": OH, "OW": OW,
+                              "KD": KD, "KH": KH, "KW": KW,
+                              "SD": SD, "SH": SH, "SW": SW,
+                              "PD": PD, "PH": PH, "PW": PW},
+                })
+
             elif isinstance(mod, torch.nn.MaxPool2d):
                 in_shape = tensors[in_name]["shape"]
                 out_shape = tensors[out_name]["shape"]
@@ -2546,6 +3857,164 @@ def extract(
                         "PH": PH, "PW": PW,
                         "DH": DH, "DW": DW,
                     },
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool2d):
+                in_shape = tensors[in_name]["shape"]
+                out_shape = tensors[out_name]["shape"]
+                N_, C, IH, IW = (int(s) for s in in_shape)
+                _, _, OH, OW = (int(s) for s in out_shape)
+                KH, KW = _pair(mod.kernel_size)
+                # nn.AvgPool2d.stride defaults to None → same as kernel_size.
+                SH, SW = _pair(mod.stride if mod.stride is not None
+                               else mod.kernel_size)
+                PH, PW = _pair(mod.padding)
+                if not mod.count_include_pad and (PH or PW):
+                    raise NotImplementedError(
+                        f"AvgPool2d count_include_pad=False with padding is not "
+                        f"supported at {node.name}")
+                ops.append({
+                    "name": str(node.target),
+                    "op": "avgpool2d",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {
+                        "N": N_, "C": C,
+                        "IH": IH, "IW": IW,
+                        "OH": OH, "OW": OW,
+                        "KH": KH, "KW": KW,
+                        "SH": SH, "SW": SW,
+                        "PH": PH, "PW": PW,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.MaxPool1d):
+                # 1D max pool → maxpool2d with a unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, C, IW = in_shape
+                OW = out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride if mod.stride is not None
+                                  else mod.kernel_size)
+                (P,) = _as_tuple1(mod.padding)
+                (Dl,) = _as_tuple1(mod.dilation)
+                ops.append({
+                    "name": str(node.target), "op": "maxpool2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": 1, "IW": IW,
+                              "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                              "SH": 1, "SW": S, "PH": 0, "PW": P,
+                              "DH": 1, "DW": Dl},
+                })
+
+            elif isinstance(mod, torch.nn.AvgPool1d):
+                # 1D average pool → avgpool2d with a unit height dim.
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                out_shape = [int(s) for s in tensors[out_name]["shape"]]
+                N_, C, IW = in_shape
+                OW = out_shape[2]
+                (K,) = _as_tuple1(mod.kernel_size)
+                (S,) = _as_tuple1(mod.stride if mod.stride is not None
+                                  else mod.kernel_size)
+                (P,) = _as_tuple1(mod.padding)
+                ops.append({
+                    "name": str(node.target), "op": "avgpool2d",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"N": N_, "C": C, "IH": 1, "IW": IW,
+                              "OH": 1, "OW": OW, "KH": 1, "KW": K,
+                              "SH": 1, "SW": S, "PH": 0, "PW": P},
+                })
+
+            elif isinstance(mod, torch.nn.LayerNorm):
+                # LayerNorm over the trailing normalized_shape dims. K = product
+                # of normalized_shape, M = product of the leading dims. gamma /
+                # beta are flattened to length K (ones/zeros if affine is off).
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ns = tuple(int(s) for s in mod.normalized_shape)
+                K = int(np.prod(ns)) if ns else 1
+                total = int(np.prod(in_shape))
+                if K == 0 or total % K != 0:
+                    raise NotImplementedError(
+                        f"LayerNorm at {node.name}: normalized_shape {ns} does "
+                        f"not divide input {in_shape}")
+                M = total // K
+                g_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias"
+                if mod.elementwise_affine and mod.weight is not None:
+                    weights[g_key] = mod.weight.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                    weights[b_key] = mod.bias.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                else:
+                    weights[g_key] = np.ones(K, dtype=weight_dtype)
+                    weights[b_key] = np.zeros(K, dtype=weight_dtype)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "layer_norm",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "gamma_key": g_key,
+                    "beta_key": b_key,
+                    "eps": float(mod.eps),
+                    "shape": {"M": M, "K": K},
+                })
+
+            elif isinstance(mod, (torch.nn.GroupNorm, torch.nn.InstanceNorm2d)):
+                # Both normalize over (channels-in-group × spatial) per sample;
+                # InstanceNorm2d is the num_groups == num_channels case. gamma /
+                # beta are per-channel (ones/zeros when affine is off).
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                N_ = in_shape[0]
+                C = in_shape[1]
+                HW = int(np.prod(in_shape[2:])) if len(in_shape) > 2 else 1
+                if isinstance(mod, torch.nn.GroupNorm):
+                    G = int(mod.num_groups)
+                    affine = bool(mod.affine)
+                    eps = float(mod.eps)
+                else:  # InstanceNorm2d: one group per channel
+                    G = C
+                    affine = bool(mod.affine)
+                    eps = float(mod.eps)
+                if C % G != 0:
+                    raise NotImplementedError(
+                        f"group_norm at {node.name}: C={C} not divisible by "
+                        f"G={G}")
+                g_key = f"{node.target}.weight"
+                b_key = f"{node.target}.bias"
+                if affine and getattr(mod, "weight", None) is not None:
+                    weights[g_key] = mod.weight.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                    weights[b_key] = mod.bias.detach().cpu().numpy(
+                        ).astype(weight_dtype).reshape(-1)
+                else:
+                    weights[g_key] = np.ones(C, dtype=weight_dtype)
+                    weights[b_key] = np.zeros(C, dtype=weight_dtype)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "group_norm",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "gamma_key": g_key,
+                    "beta_key": b_key,
+                    "eps": eps,
+                    "shape": {"N": N_, "C": C, "G": G, "HW": HW},
+                })
+
+            elif isinstance(mod, torch.nn.TripletMarginLoss):
+                # 3 inputs (anchor, positive, negative), p=2, reduction=mean.
+                a_name = node.args[0].name
+                p_name = node.args[1].name
+                n_name = node.args[2].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                B = a_shape[0]
+                Feat = int(np.prod(a_shape[1:])) if len(a_shape) > 1 else 1
+                ops.append({
+                    "name": str(node.target), "op": "triplet_loss",
+                    "inputs": [a_name, p_name, n_name],
+                    "outputs": [out_name],
+                    "margin": float(mod.margin),
+                    "shape": {"B": B, "F": Feat},
                 })
 
             elif isinstance(mod, torch.nn.Dropout):
@@ -2887,6 +4356,136 @@ def extract(
                     "outputs": [out_name],
                     "shape": {"n": n},
                 })
+            elif tname == "softmax" or target is torch.softmax \
+                    or target is torch.nn.functional.softmax:
+                # KernelBench 23_Softmax: torch.softmax(x, dim=...). The
+                # reference kernel normalizes over contiguous rows, so only a
+                # last-axis softmax is supported (M = leading dims, K = last).
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ndim = len(in_shape)
+                dim = node.kwargs.get("dim") if node.kwargs else None
+                if dim is None and len(node.args) > 1:
+                    dim = node.args[1]
+                if dim is None:
+                    raise NotImplementedError(
+                        f"softmax at {node.name}: implicit dim not supported")
+                dim = int(dim)
+                if dim < 0:
+                    dim += ndim
+                if dim != ndim - 1:
+                    raise NotImplementedError(
+                        f"softmax at {node.name}: only last-axis softmax "
+                        f"supported (got dim={dim} of {ndim}D)")
+                K = in_shape[-1]
+                M = int(np.prod(in_shape[:-1])) if ndim > 1 else 1
+                ops.append({
+                    "name": node.name,
+                    "op": "softmax",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"M": M, "K": K},
+                })
+            elif tname == "log_softmax" or target is torch.log_softmax \
+                    or target is torch.nn.functional.log_softmax:
+                # KernelBench 24_LogSoftmax. Last-axis only, as with softmax.
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                ndim = len(in_shape)
+                dim = node.kwargs.get("dim") if node.kwargs else None
+                if dim is None and len(node.args) > 1:
+                    dim = node.args[1]
+                if dim is None:
+                    raise NotImplementedError(
+                        f"log_softmax at {node.name}: implicit dim not supported")
+                dim = int(dim)
+                if dim < 0:
+                    dim += ndim
+                if dim != ndim - 1:
+                    raise NotImplementedError(
+                        f"log_softmax at {node.name}: only last-axis supported "
+                        f"(got dim={dim} of {ndim}D)")
+                K = in_shape[-1]
+                M = int(np.prod(in_shape[:-1])) if ndim > 1 else 1
+                ops.append({
+                    "name": node.name,
+                    "op": "log_softmax",
+                    "inputs": [in_name],
+                    "outputs": [out_name],
+                    "shape": {"M": M, "K": K},
+                })
+            elif tname == "log" or target is torch.log:
+                # Elementwise natural log (used before F.kl_div, KernelBench 98).
+                in_name = node.args[0].name
+                n = int(np.prod(tensors[in_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "log",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+            elif tname == "smooth_l1_loss" \
+                    or target is torch.nn.functional.smooth_l1_loss:
+                # Huber / smooth-L1 loss (KernelBench 96). beta defaults to 1.0.
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                n = int(np.prod(tensors[a_name]["shape"]))
+                beta = float((node.kwargs or {}).get("beta", 1.0))
+                ops.append({
+                    "name": node.name, "op": "huber_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "beta": beta, "shape": {"n": n},
+                })
+            elif tname == "cross_entropy" \
+                    or target is torch.nn.functional.cross_entropy:
+                # Mean cross-entropy (KernelBench 95). logits [N, C], targets [N]
+                # class indices (carried as floats in the flat io buffer).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                if len(a_shape) != 2:
+                    raise NotImplementedError(
+                        f"cross_entropy at {node.name}: only [N, C] logits "
+                        f"supported (got {a_shape})")
+                ops.append({
+                    "name": node.name, "op": "cross_entropy_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"N": a_shape[0], "C": a_shape[1]},
+                })
+            elif tname == "scaled_dot_product_attention" \
+                    or target is torch.nn.functional.scaled_dot_product_attention:
+                # SDPA (KernelBench 97). Q/K/V are [B, H, S, D]; flatten B*H.
+                q_name = node.args[0].name
+                k_name = node.args[1].name
+                v_name = node.args[2].name
+                q_shape = [int(s) for s in tensors[q_name]["shape"]]
+                if len(q_shape) != 4:
+                    raise NotImplementedError(
+                        f"sdpa at {node.name}: only [B,H,S,D] supported "
+                        f"(got {q_shape})")
+                B, H, S, D = q_shape
+                ops.append({
+                    "name": node.name, "op": "sdpa",
+                    "inputs": [q_name, k_name, v_name], "outputs": [out_name],
+                    "shape": {"BH": B * H, "S": S, "D": D},
+                })
+            elif tname == "kl_div" or target is torch.nn.functional.kl_div:
+                # KL divergence, reduction='batchmean' (KernelBench 98). First
+                # arg is already log(pred).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                red = (node.kwargs or {}).get("reduction", "mean")
+                if red != "batchmean":
+                    raise NotImplementedError(
+                        f"kl_div at {node.name}: only reduction='batchmean' "
+                        f"supported (got {red!r})")
+                N = a_shape[0]
+                C = int(np.prod(a_shape[1:])) if len(a_shape) > 1 else 1
+                ops.append({
+                    "name": node.name, "op": "kldiv_loss",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"N": N, "C": C},
+                })
             elif tname == "elu" or target is torch.nn.functional.elu:
                 # KernelBench 31_ELU may use functional too. nn.ELU's
                 # alpha defaults to 1.0; functional takes alpha kwarg.
@@ -2986,6 +4585,62 @@ def extract(
             # KernelBench Phase 2 reductions over a single dim. The
             # 3D logical shape (outer, reduce, inner) is computed from
             # the input shape and the `dim` argument.
+            elif tname in ("cumsum", "cumprod") or target in (torch.cumsum,
+                                                              torch.cumprod):
+                # Cumulative scan along a dim → {outer, axis, inner}.
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                d = node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)
+                d = int(d)
+                if d < 0:
+                    d += len(in_shape)
+                outer = int(np.prod(in_shape[:d])) if d > 0 else 1
+                axis = int(in_shape[d])
+                inner = int(np.prod(in_shape[d+1:])) if d + 1 < len(in_shape) else 1
+                op_name = "cumsum" if (tname == "cumsum" or target is torch.cumsum) \
+                    else "cumprod"
+                ops.append({
+                    "name": node.name, "op": op_name,
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"outer": outer, "axis": axis, "inner": inner},
+                })
+            elif ((tname == "mul" or target in (torch.mul, _operator.mul))
+                  and isinstance(node.args[0], torch.fx.Node)
+                  and isinstance(node.args[1], torch.fx.Node)):
+                # Elementwise multiply of two tensors (KernelBench 93 x*mask,
+                # 100 pred*targets). Scalar mul (one non-Node arg) is handled
+                # below. Requires equal shapes (no broadcast).
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                a_shape = tensors[a_name]["shape"]
+                b_shape = tensors[b_name]["shape"]
+                if list(a_shape) != list(b_shape):
+                    raise NotImplementedError(
+                        f"mul at {node.name}: broadcasting not supported "
+                        f"(a={a_shape} b={b_shape})")
+                n = int(np.prod(a_shape))
+                ops.append({
+                    "name": node.name, "op": "mul",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"n": n},
+                })
+            elif (tname == "mul" or target in (torch.mul, _operator.mul)):
+                # Tensor * scalar constant (KernelBench 5, A * s). Exactly one
+                # arg is a Node (the tensor), the other a bound Python scalar.
+                a, b = node.args[0], node.args[1]
+                if isinstance(a, torch.fx.Node) and not isinstance(b, torch.fx.Node):
+                    t_node, s = a, b
+                elif isinstance(b, torch.fx.Node) and not isinstance(a, torch.fx.Node):
+                    t_node, s = b, a
+                else:
+                    raise NotImplementedError(
+                        f"mul at {node.name}: unexpected args {node.args}")
+                n = int(np.prod(tensors[t_node.name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "mul_scalar",
+                    "inputs": [t_node.name], "outputs": [out_name],
+                    "scalar": float(s), "shape": {"n": n},
+                })
             elif tname == "sum" or target is torch.sum:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
@@ -3169,6 +4824,63 @@ def extract(
                     "inputs": [in_name], "outputs": [out_name],
                     "shape": {"n": n},
                 })
+            elif target is _agents_compound_rms_norm:
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                dim = 1  # RMSNorm reduces over the channel axis, keepdim=True
+                outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
+                reduce = int(in_shape[dim])
+                inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
+                ops.append({
+                    "name": node.name, "op": "rms_norm",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "eps": float(node.meta.get("rms_eps", 1e-5)),
+                    "shape": {"outer": outer, "reduce": reduce, "inner": inner},
+                })
+            elif target is _agents_loss_mse or target is _agents_loss_hinge:
+                a_name = node.args[0].name
+                b_name = node.args[1].name
+                n = int(node.meta.get("loss_n",
+                                      int(np.prod(tensors[a_name]["shape"]))))
+                if target is _agents_loss_mse:
+                    ops.append({
+                        "name": node.name, "op": "mse_loss",
+                        "inputs": [a_name, b_name], "outputs": [out_name],
+                        "shape": {"n": n},
+                    })
+                else:
+                    # Hinge: targ may broadcast over pred (targ_len divides n).
+                    targ_len = int(np.prod(tensors[b_name]["shape"]))
+                    ops.append({
+                        "name": node.name, "op": "hinge_loss",
+                        "inputs": [a_name, b_name], "outputs": [out_name],
+                        "shape": {"n": n, "targ_len": max(1, targ_len)},
+                    })
+            elif target is _agents_compound_mean_abs_norm:
+                in_name = node.args[0].name
+                in_shape = list(tensors[in_name]["shape"])
+                dim = 1  # L1 norm divides by mean(|x|) over dim=1, keepdim=True
+                outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
+                reduce = int(in_shape[dim])
+                inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
+                ops.append({
+                    "name": node.name, "op": "mean_abs_norm",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"outer": outer, "reduce": reduce, "inner": inner},
+                })
+            elif target is _agents_compound_excl_cumsum:
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                if len(in_shape) != 2:
+                    raise NotImplementedError(
+                        f"exclusive_cumsum at {node.name}: only 2D supported "
+                        f"(got {in_shape})")
+                B, N = in_shape
+                ops.append({
+                    "name": node.name, "op": "exclusive_cumsum",
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"Bout": B - 1, "N": N},
+                })
             elif tname == "hardtanh" \
                     or target is torch.nn.functional.hardtanh:
                 in_name = node.args[0].name
@@ -3192,32 +4904,51 @@ def extract(
             elif (target is torch.matmul or target is torch.mm or
                   tname in ("matmul", "mm")):
                 arg_a_node, arg_b_node = node.args[0], node.args[1]
-                trans_a = _is_transpose_node(arg_a_node)
-                trans_b = _is_transpose_node(arg_b_node)
-                a_node = arg_a_node.args[0] if trans_a else arg_a_node
-                b_node = arg_b_node.args[0] if trans_b else arg_b_node
-                # Shape before transpose: a_shape is (K,M) if trans_a else (M,K)
-                a_shape = list(tensors[a_node.name]["shape"])
-                b_shape = list(tensors[b_node.name]["shape"])
-                if trans_a:
-                    K, M = int(a_shape[0]), int(a_shape[1])
+                # diag(A) @ B — A is 1D, diag makes it NxN, then row-scales B.
+                # Emit a fused diag_matmul (out[i,j]=A[i]*B[i,j]) rather than
+                # materializing the NxN diagonal matrix (KernelBench 12).
+                if (isinstance(arg_a_node, torch.fx.Node)
+                        and arg_a_node.op == "call_function"
+                        and getattr(arg_a_node.target, "__name__", "") == "diag"):
+                    a1_node = arg_a_node.args[0]
+                    b_shape = list(tensors[arg_b_node.name]["shape"])
+                    ops.append({
+                        "name": node.name, "op": "diag_matmul",
+                        "inputs": [a1_node.name, arg_b_node.name],
+                        "outputs": [out_name],
+                        "shape": {"N": int(b_shape[0]), "M": int(b_shape[1])},
+                    })
                 else:
-                    M, K = int(a_shape[0]), int(a_shape[1])
-                N = int(b_shape[0]) if trans_b else int(b_shape[1])
-                if trans_a and trans_b:
-                    op_kind = "matmul_tatb"
-                elif trans_a:
-                    op_kind = "matmul_ta"
-                elif trans_b:
-                    op_kind = "matmul_tb"
-                else:
-                    op_kind = "matmul"
-                ops.append({
-                    "name": node.name, "op": op_kind,
-                    "inputs": [a_node.name, b_node.name],
-                    "outputs": [out_name],
-                    "shape": {"M": M, "K": K, "N": N},
-                })
+                    trans_a = _is_transpose_node(arg_a_node)
+                    trans_b = _is_transpose_node(arg_b_node)
+                    a_node = arg_a_node.args[0] if trans_a else arg_a_node
+                    b_node = arg_b_node.args[0] if trans_b else arg_b_node
+                    a_shape = list(tensors[a_node.name]["shape"])
+                    b_shape = list(tensors[b_node.name]["shape"])
+                    # N-D @ 2D: flatten A's leading dims into M (contiguous
+                    # row-major, so the matmul kernel sees a plain [M,K]). This
+                    # covers torch.matmul(A_3d/4d, B_2d) (KernelBench 10) and the
+                    # einsum "...l,lk->...k" reduction. Transposed forms stay 2D.
+                    if trans_a:
+                        K, M = int(a_shape[0]), int(a_shape[1])
+                    else:
+                        M = int(np.prod(a_shape[:-1]))
+                        K = int(a_shape[-1])
+                    N = int(b_shape[0]) if trans_b else int(b_shape[-1])
+                    if trans_a and trans_b:
+                        op_kind = "matmul_tatb"
+                    elif trans_a:
+                        op_kind = "matmul_ta"
+                    elif trans_b:
+                        op_kind = "matmul_tb"
+                    else:
+                        op_kind = "matmul"
+                    ops.append({
+                        "name": node.name, "op": op_kind,
+                        "inputs": [a_node.name, b_node.name],
+                        "outputs": [out_name],
+                        "shape": {"M": M, "K": K, "N": N},
+                    })
             elif target is torch.bmm or tname == "bmm":
                 a_name = node.args[0].name
                 b_name = node.args[1].name
@@ -3233,6 +4964,58 @@ def extract(
                         "K": int(a_shape[2]),
                         "N": int(b_shape[2]),
                     },
+                })
+            elif tname in ("triu", "tril") or target in (torch.triu, torch.tril):
+                # Upper/lower triangular mask of a 2D matrix (KernelBench 14/15,
+                # typically triu(matmul(A,B))). diagonal from kwargs/args[1].
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                if len(in_shape) != 2:
+                    raise NotImplementedError(
+                        f"{tname} at {node.name}: only 2D supported "
+                        f"(got {in_shape})")
+                diagonal = 0
+                if node.kwargs and "diagonal" in node.kwargs:
+                    diagonal = int(node.kwargs["diagonal"])
+                elif len(node.args) > 1:
+                    diagonal = int(node.args[1])
+                op_name = "triu" if (tname == "triu" or target is torch.triu) \
+                    else "tril"
+                ops.append({
+                    "name": node.name, "op": op_name,
+                    "inputs": [in_name], "outputs": [out_name],
+                    "shape": {"M": in_shape[0], "N": in_shape[1],
+                              "diagonal": diagonal},
+                })
+            elif tname == "einsum" or target is torch.einsum:
+                # Only the "<lead>l,lk-><lead>k" reduction (A's last dim
+                # contracts with B's first; B is 2D) is wired — it's a plain
+                # matmul with A's leading dims flattened into M (KernelBench 11).
+                eq = node.args[0]
+                operands = node.args[1:]
+                if len(operands) == 1 and isinstance(operands[0], (tuple, list)):
+                    operands = tuple(operands[0])
+                eq_norm = eq.replace(" ", "")
+                a_name = operands[0].name
+                b_name = operands[1].name
+                a_shape = [int(s) for s in tensors[a_name]["shape"]]
+                b_shape = [int(s) for s in tensors[b_name]["shape"]]
+                lhs, rhs = eq_norm.split("->")
+                a_sub, b_sub = lhs.split(",")
+                ok = (len(b_sub) == 2 and len(b_shape) == 2
+                      and a_sub[-1] == b_sub[0]           # contract A_last · B_0
+                      and rhs == a_sub[:-1] + b_sub[1])   # output = lead + B_1
+                if not ok:
+                    raise NotImplementedError(
+                        f"einsum {eq!r} at {node.name}: only "
+                        f"'...l,lk->...k' (matmul) is supported")
+                M = int(np.prod(a_shape[:-1]))
+                K = int(a_shape[-1])
+                N = int(b_shape[1])
+                ops.append({
+                    "name": node.name, "op": "matmul",
+                    "inputs": [a_name, b_name], "outputs": [out_name],
+                    "shape": {"M": M, "K": K, "N": N},
                 })
             elif target is torch.cat or tname == "cat":
                 # torch.cat(tensors_list, dim). YOLOv8 uses dim=1 (channel
@@ -3345,6 +5128,31 @@ def extract(
                     "shape": {"N": N_, "C": C, "H": H_, "W": W_,
                               "c_each": c_each},
                 })
+            elif target == "flip":
+                # Tensor.flip(dim) — reverse along one axis. dims may be an int
+                # or a 1-elem tuple/list (KernelBench 91 uses a single dim).
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors[in_name]["shape"]]
+                dims = node.args[1] if len(node.args) > 1 \
+                    else node.kwargs.get("dims")
+                if isinstance(dims, (tuple, list)):
+                    if len(dims) != 1:
+                        raise NotImplementedError(
+                            f"flip at {node.name}: only single-axis supported")
+                    d = int(dims[0])
+                else:
+                    d = int(dims)
+                if d < 0:
+                    d += len(in_shape)
+                outer = int(np.prod(in_shape[:d])) if d > 0 else 1
+                axis = int(in_shape[d])
+                inner = int(np.prod(in_shape[d+1:])) if d + 1 < len(in_shape) else 1
+                tensors[node.name] = _tensor_meta(node)
+                ops.append({
+                    "name": node.name, "op": "flip",
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"outer": outer, "axis": axis, "inner": inner},
+                })
             else:
                 raise NotImplementedError(
                     f"unhandled call_method '{target}' at {node.name}"
@@ -3416,14 +5224,28 @@ def extract(
     # numerics — not an fp32 trace down-cast at the boundary.
     with torch.no_grad():
         if quant == "fp16":
-            ref_inputs_exec = [t.half() for t in sample_inputs]
-            ref_model = model.half()
+            # The reference kernels use fp16 STORAGE but fp32 MATH (load
+            # _Float16 -> float, accumulate in float, store _Float16). Compute
+            # the golden the same way: round inputs to fp16, run the model in
+            # fp32 on those rounded values, then store the output as fp16. This
+            # matches the kernels' numerics (a genuine `model.half()` would
+            # instead accumulate in fp16 — e.g. cross_entropy's 4096-class
+            # logsumexp drifts ~0.1 — and also lacks CPU Half kernels for some
+            # ops like avg_pool3d). ALL tensor inputs (including int class-index
+            # targets and bool masks) are round-tripped through fp16 so the
+            # golden sees exactly what the kernel reads from the fp16 io buffer
+            # — e.g. cross_entropy indices > 2048 aren't representable in fp16,
+            # so both golden and kernel must use the same fp16-rounded index.
+            ref_inputs_exec = [t.to(torch.float16).to(t.dtype)
+                               if torch.is_tensor(t) else t
+                               for t in sample_inputs]
             torch_dtype = torch.float16
+            out = model.float()(*ref_inputs_exec)
         else:
             ref_inputs_exec = list(sample_inputs)
             ref_model = model
             torch_dtype = torch.float32
-        out = ref_model(*ref_inputs_exec)
+            out = ref_model(*ref_inputs_exec)
 
     # Multi-output models return a tuple; flatten in IR-output order so the
     # downstream comparator just needs to do an elementwise compare.
@@ -3460,18 +5282,358 @@ def extract(
     return ir
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _cpu_fp32_tensor_creation():
+    """Patch torch tensor-creation ops so benches that hard-code
+    device='cuda' and/or dtype=float16 in get_inputs (e.g. 97 SDPA) still
+    materialize on CPU in fp32. Restores the originals on exit."""
+    names = ["rand", "randn", "zeros", "ones", "empty", "full", "randint",
+             "arange", "tensor", "eye", "linspace"]
+    saved = {n: getattr(torch, n) for n in names if hasattr(torch, n)}
+
+    def _wrap(fn):
+        def inner(*args, **kwargs):
+            if kwargs.get("device") is not None:
+                kwargs["device"] = "cpu"
+            if kwargs.get("dtype") == torch.float16:
+                kwargs["dtype"] = torch.float32
+            return fn(*args, **kwargs)
+        return inner
+
+    try:
+        for n, fn in saved.items():
+            setattr(torch, n, _wrap(fn))
+        yield
+    finally:
+        for n, fn in saved.items():
+            setattr(torch, n, fn)
+
+
+# --- utilization-aware sizing -------------------------------------------------
+# The legacy `max_elements` policy halves whatever module attr is largest until
+# a tiny total element count is met — which collapses conv/matmul channel counts
+# to ~16 and leaves XNNPACK/RVV overhead-bound (41 inst/MAC measured). Instead we
+# cap the *baked io footprint* (input+golden bytes) and shrink dims by category:
+# structural attrs define the op (never touched); batch just replicates work
+# (shrunk first); spatial next; channel/feature dims drive vector/GEMM
+# utilization so they're protected (shrunk last, with a floor). Categorization is
+# by the attr-name vocabulary the level1 benches actually use.
+_KB_STRUCT = {"kernel_size", "stride", "padding", "dilation", "groups",
+              "num_classes", "num_heads", "num_groups", "stride_w", "stride_h",
+              "padding_w", "padding_h", "reduce_dim"}
+_KB_BATCH = {"batch_size", "sequence_length"}
+_KB_SPATIAL = {"width", "height", "length", "depth", "width_in", "height_in",
+               "spatial"}
+_KB_CHANNEL = {"in_channels", "out_channels", "channels", "features", "dim",
+               "hidden_size", "embed_dim", "k", "m", "l", "n"}
+_KB_FLOOR = {"batch": 1, "spatial": 16, "channel": 32}
+
+
+def _kb_attr_group(name: str) -> "str | None":
+    if name in _KB_STRUCT:
+        return None            # structural — never shrink
+    if name in _KB_BATCH:
+        return "batch"
+    if name in _KB_SPATIAL:
+        return "spatial"
+    if name in _KB_CHANNEL:
+        return "channel"
+    return "spatial"           # unknown dim → treat like spatial (before channels)
+
+
+def _kb_footprint_bytes(mod) -> int:
+    """Baked io footprint (input + golden output) in fp32 bytes at the module's
+    current dims. Runs a forward to size the output."""
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    m.eval()
+    ins = mod.get_inputs()
+    with torch.no_grad():
+        o = m(*ins)
+    outs = o if isinstance(o, (list, tuple)) else [o]
+    inb = sum(int(np.prod(t.shape)) for t in ins if torch.is_tensor(t))
+    outb = sum(int(np.prod(x.shape)) for x in outs if torch.is_tensor(x))
+    return (inb + outb) * 4
+
+
+def _kb_flops(mod) -> int:
+    """Total forward FLOPs at the module's current dims, via torch's
+    FlopCounterMode (counts matmul/conv/bmm/etc.). Model-agnostic — measures the
+    real op cost, so it captures the K-contraction of a matmul or the spatial**3
+    of a 3D conv that `_kb_footprint_bytes` (io only) misses. Raises if
+    uncountable."""
+    from torch.utils.flop_counter import FlopCounterMode
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    m.eval()
+    ins = mod.get_inputs()
+    fc = FlopCounterMode(display=False)
+    with fc, torch.no_grad():
+        m(*ins)
+    return int(fc.get_total_flops())
+
+
+def _shrink_for_flops(mod, target_flops: int,
+                      target_bytes: "int | None" = None) -> None:
+    """Shrink module dims until measured forward FLOPs <= `target_flops` (and io
+    bytes <= `target_bytes` if given), preferring batch -> spatial -> channel and
+    honoring per-group floors so the shrunk problem still exercises the GEMM/vector
+    units (channel/K floor keeps a full vector register busy). Unlike
+    `_shrink_for_utilization` (io-byte cap only), this bounds the *compute*, so a
+    large-K matmul or a 3D conv shrinks to a size that actually runs on-target
+    instead of pinning a tiny-io / huge-FLOP shape. Falls back to a byte cap if
+    FLOPs can't be counted; reverts any shrink that makes the forward invalid."""
+    order = ["batch", "spatial", "channel"]
+    for _ in range(400):
+        try:
+            fl = _kb_flops(mod)
+            fp = _kb_footprint_bytes(mod)
+        except Exception:
+            if target_bytes:
+                _shrink_for_utilization(mod, target_bytes)
+            return
+        if fl <= target_flops and (target_bytes is None or fp <= target_bytes):
+            return
+        ints = {k: v for k, v in vars(mod).items()
+                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+        cand = None
+        for grp in order:
+            pool = {k: v for k, v in ints.items()
+                    if _kb_attr_group(k) == grp and v > _KB_FLOOR[grp]}
+            if pool:
+                cand = max(pool, key=pool.get)
+                break
+        if cand is None:
+            return             # everything at its floor; can't reduce further
+        grp = _kb_attr_group(cand)
+        oldv = vars(mod)[cand]
+        setattr(mod, cand, max(_KB_FLOOR[grp], oldv // 2))
+        try:
+            _kb_footprint_bytes(mod)   # validate the new dims forward-pass
+        except Exception:
+            setattr(mod, cand, oldv)
+            return
+
+
+def _shrink_for_utilization(mod, target_bytes: int) -> None:
+    """Shrink module dims to fit `target_bytes` of baked io, preferring
+    batch → spatial and protecting channel/feature dims (so the shrunk problem
+    still exercises the vector/GEMM units). Reverts any shrink that makes the
+    forward invalid."""
+    order = ["batch", "spatial", "channel"]
+    for _ in range(200):
+        try:
+            fp = _kb_footprint_bytes(mod)
+        except Exception:
+            return             # can't instantiate at current dims; leave as-is
+        if fp <= target_bytes:
+            return
+        ints = {k: v for k, v in vars(mod).items()
+                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+        cand = None
+        for grp in order:
+            pool = {k: v for k, v in ints.items()
+                    if _kb_attr_group(k) == grp and v > _KB_FLOOR[grp]}
+            if pool:
+                cand = max(pool, key=pool.get)
+                break
+        if cand is None:
+            return             # nothing shrinkable without violating a floor
+        grp = _kb_attr_group(cand)
+        oldv = vars(mod)[cand]
+        setattr(mod, cand, max(_KB_FLOOR[grp], oldv // 2))
+        try:
+            _kb_footprint_bytes(mod)   # validate the new dims forward-pass
+        except Exception:
+            setattr(mod, cand, oldv)
+            return
+
+
+def _load_kernelbench(bench_path: str,
+                      max_elements: "int | None" = None,
+                      target_bytes: "int | None" = None,
+                      target_flops: "int | None" = None
+                      ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
+    """Load a KernelBench level1 file (single-input variant only).
+
+    Schema (every level1 file conforms): a `class Model(nn.Module)` with
+    `__init__(*init_args)` + `forward(x)`, module-level shape constants, and
+    `get_inputs()` / `get_init_inputs()`.
+
+    Returns (model, sample_input, name); `sample_input` is a bare tensor for
+    single-input forwards or a list of tensors for multi-input ones (matmul
+    A,B; bmm). name is a C-friendly `kb_<basename>`.
+
+    `max_elements` caps the *total* input element count across all forward
+    inputs — KernelBench level1 defaults are sized for GPU memory (batch=16,
+    256x256 spatial) and overflow Zephyr's 256 MB RAM region when baked into
+    rodata. When set, we shrink integer module-level shape attrs by halving the
+    largest until the inputs fit, then re-instantiate, so the PyTorch golden
+    corresponds to the shrunken shape.
+
+    Multi-input forwards are threaded through extract()'s packed_inputs path.
+    Loss-style benches (preds+targets → scalar) load but fail later at the
+    unsupported loss op. See modelblaster/notes/kernelbench_rvv_port_plan.md.
+    """
+    import importlib.util
+    if not os.path.isfile(bench_path):
+        raise FileNotFoundError(f"--bench-file {bench_path} not found")
+    spec = importlib.util.spec_from_file_location("_kernelbench_mod", bench_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to import {bench_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "Model"):
+        raise RuntimeError(f"{bench_path} missing class Model")
+    if not hasattr(mod, "get_inputs"):
+        raise RuntimeError(f"{bench_path} missing get_inputs()")
+
+    with _cpu_fp32_tensor_creation():
+        if max_elements is not None and max_elements > 0:
+            SHAPE_ATTRS_BLOCKLIST = {"num_classes"}  # not a spatial dim
+            ints = {k: v for k, v in vars(mod).items()
+                    if isinstance(v, int) and v > 1
+                    and not k.startswith("_")
+                    and k not in SHAPE_ATTRS_BLOCKLIST}
+            history: "list[tuple[str, int]]" = []
+            for _ in range(64):
+                # Cap the TOTAL element count across all forward inputs (matmul
+                # A+B, bmm, etc.), not just the first — the second operand can
+                # dwarf the first.
+                total = sum(int(np.prod(t.shape)) for t in mod.get_inputs()
+                            if torch.is_tensor(t))
+                if total <= max_elements:
+                    break
+                if not ints:
+                    break
+                biggest = max(ints, key=ints.get)
+                new = max(1, ints[biggest] // 2)
+                if new == ints[biggest]:
+                    break
+                history.append((biggest, ints[biggest]))
+                ints[biggest] = new
+                setattr(mod, biggest, new)
+
+            # Some ops (dilated conv) become invalid if a spatial dim is shrunk
+            # below the (dilated) kernel extent — the model's own forward then
+            # raises. Back off the most recent shrink steps until a forward pass
+            # succeeds, so the shape stays valid even if it exceeds max_elements.
+            _ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+            for _ in range(len(history) + 1):
+                try:
+                    _m = mod.Model(*_ia)
+                    _m.eval()
+                    with torch.no_grad():
+                        _m(*mod.get_inputs())
+                    break
+                except Exception:
+                    if not history:
+                        break
+                    attr, oldv = history.pop()
+                    setattr(mod, attr, oldv)
+        elif target_flops is not None and target_flops > 0:
+            # FLOP-budget policy: bound the actual compute (so large-K matmuls /
+            # 3D convs shrink to something that runs on-target), while still
+            # capping io bytes if a target_bytes ceiling is also supplied.
+            _shrink_for_flops(mod, target_flops, target_bytes)
+        elif target_bytes is not None and target_bytes > 0:
+            # Default policy: cap the baked-io footprint while protecting the
+            # channel/feature dims that drive vector/GEMM utilization.
+            _shrink_for_utilization(mod, target_bytes)
+
+        init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+        model = mod.Model(*init_args)
+        model.eval()
+        inputs = mod.get_inputs()
+        if not isinstance(inputs, list) or not inputs:
+            raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
+    # Bool masks (e.g. masked_cumsum) become float in the model anyway
+    # (x * bool == x * float); cast them so the fp32 pipeline can carry them.
+    # Integer class-index targets (cross_entropy) are left alone.
+    inputs = [t.float() if (torch.is_tensor(t) and t.dtype == torch.bool) else t
+              for t in inputs]
+
+    # Bind non-tensor (scalar) forward args as constants so only tensors are
+    # graph inputs (KernelBench 5: `A * s` with s a Python float). The trace
+    # then sees `A * <const>`, extracted as a mul_scalar op. Only a single
+    # tensor input is supported here (fx can't trace a *args wrapper).
+    if any(not torch.is_tensor(t) for t in inputs):
+        _tensor_pos = [i for i, t in enumerate(inputs) if torch.is_tensor(t)]
+        if len(_tensor_pos) != 1:
+            raise NotImplementedError(
+                f"{bench_path}: scalar forward args are only supported with a "
+                f"single tensor input (got {len(_tensor_pos)})")
+        _pos0 = _tensor_pos[0]
+        _full = list(inputs)  # concrete scalars + placeholder slot for the tensor
+        _orig = model
+
+        class _ScalarBind(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.m = _orig
+
+            def forward(self, x):
+                args = list(_full)
+                args[_pos0] = x
+                return self.m(*args)
+
+        model = _ScalarBind()
+        model.eval()
+        inputs = [inputs[_pos0]]
+
+    base = os.path.splitext(os.path.basename(bench_path))[0]
+    name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
+                           for ch in base).strip("_")
+    while "__" in name:
+        name = name.replace("__", "_")
+    # Single-input → return the bare tensor (legacy path). Multi-input
+    # (matmul A+B, bmm) → return the list; extract() threads it through as
+    # packed_inputs / a flat io.npz buffer. Loss-style multi-input benches
+    # (preds+targets → scalar) still load here but fail later at the
+    # unsupported loss op, with a clear per-op error.
+    return model, (inputs[0] if len(inputs) == 1 else inputs), name
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="mlp_generic",
+    ap.add_argument("--model", default=None,
                     help="model id -> models/<id>.py (the well-known ids have "
                          "explicit imports; any other resolves by dynamic "
-                         "import of modelblaster.models.<id>)")
+                         "import of modelblaster.models.<id>). Mutually "
+                         "exclusive with --bench-file.")
+    ap.add_argument("--bench-file", default=None,
+                    help="path to a KernelBench level1 .py file. "
+                         "Mutually exclusive with --model.")
+    ap.add_argument("--bench-target-mb", type=int, default=256,
+                    help="DEFAULT kernelbench sizing: cap baked io (input+golden) "
+                         "to this many MiB, shrinking batch->spatial and "
+                         "protecting channel/feature dims for good HW "
+                         "utilization (default 256). 0 = stock dims.")
+    ap.add_argument("--bench-max-elements", type=int, default=0,
+                    help="LEGACY override: if >0, cap total input ELEMENTS by "
+                         "halving the largest int attr (the old tiny-toy policy). "
+                         "Overrides --bench-target-mb. 0 = use --bench-target-mb.")
+    ap.add_argument("--bench-target-gflops", type=float,
+                    default=float(os.environ.get("BENCH_TARGET_GFLOPS", "0")),
+                    help="COMPUTE-budget sizing: if >0, size the bench to this "
+                         "forward-FLOP budget (measured via FlopCounterMode), "
+                         "bounding compute rather than just io — fixes large-K "
+                         "matmuls / 3D convs that have tiny io but huge FLOPs. "
+                         "--bench-target-mb stays an io ceiling. Overridden by "
+                         "--bench-max-elements. Env: BENCH_TARGET_GFLOPS.")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
                          "half precision (uses torch.float16 model + "
                          "_Float16 C kernels, validated against half-cast "
                          "torch golden), int8 = symmetric per-tensor PTQ.")
+    ap.add_argument("--fp16-ops", default=None,
+                    help="comma-separated IR op names to promote to fp16 in an "
+                         "int8 extract (mixed precision). Additive to the "
+                         "model's get_precision_spec(). No-op for fp32/fp16.")
     ap.add_argument("--core-registry", default=None,
                     help="optional path to an modelblaster/cores/*.json registry. "
                          "When provided, the post-extraction pass validates "
@@ -3486,10 +5648,6 @@ def main() -> None:
                          "instead of a single frame. Detection / segmentation "
                          "models need ~16 to avoid cls-logit saturation. "
                          "No-op for fp32 / fp16.")
-    ap.add_argument("--fp16-ops", default=None,
-                    help="comma-separated op names to promote to fp16 in an int8 "
-                         "extract (mixed precision). Additive to the model's "
-                         "get_precision_spec(). No-op for fp32 / fp16.")
     ap.add_argument("--per-channel", action="store_true",
                     help="per-output-channel int8 weight quant for conv/linear "
                          "(tighter than per-tensor). No-op for fp32 / fp16.")
@@ -3542,40 +5700,70 @@ def main() -> None:
                          "if omitted. Also settable via MB_FUSION_TARGET.")
     args = ap.parse_args()
 
-    if args.model == "mlp_generic":
-        from modelblaster.models import mlp_generic as model_mod
-    elif args.model == "mlp_control":
-        from modelblaster.models import mlp_control as model_mod
-    elif args.model == "lenet":
-        from modelblaster.models import lenet as model_mod
-    elif args.model == "dronet":
-        from modelblaster.models import dronet as model_mod
-    elif args.model == "mobilenet_v2":
-        from modelblaster.models import mobilenet_v2 as model_mod
-    elif args.model == "yolov8_nano":
-        from modelblaster.models import yolov8_nano as model_mod
-    elif args.model == "yolov8_nano_64":
-        from modelblaster.models import yolov8_nano_64 as model_mod
-    elif args.model == "fused_vision":
-        from modelblaster.models import fused_vision as model_mod
-    elif args.model == "fused_depth":
-        from modelblaster.models import fused_depth as model_mod
-    elif args.model == "fused_full":
-        from modelblaster.models import fused_full as model_mod
+    if (args.model is None) == (args.bench_file is None):
+        ap.error("pass exactly one of --model or --bench-file")
+
+    model_mod = None
+    if args.bench_file is not None:
+        # Legacy element-cap wins if explicitly set (>0); else if a FLOP budget is
+        # given, bound compute (io stays capped by --bench-target-mb as a ceiling);
+        # otherwise the default byte-budget / utilization-aware policy applies.
+        _tgt = None if args.bench_max_elements else args.bench_target_mb * 2**20
+        _tflops = (int(args.bench_target_gflops * 1e9)
+                   if args.bench_target_gflops and args.bench_target_gflops > 0
+                   else None)
+        model, sample, name = _load_kernelbench(
+            args.bench_file,
+            max_elements=(args.bench_max_elements or None),
+            target_bytes=_tgt,
+            target_flops=_tflops)
     else:
-        # Fall back to a dynamic import so a new models/<name>.py works without
-        # editing this dispatch chain.
-        import importlib
-        try:
-            model_mod = importlib.import_module(
-                f"modelblaster.models.{args.model}")
-        except ModuleNotFoundError:
-            raise SystemExit(f"unknown model {args.model}")
-    model = model_mod.get_model()
-    sample = model_mod.get_sample_input()
+        if args.model == "mlp_generic":
+            from modelblaster.models import mlp_generic as model_mod
+        elif args.model == "mlp_control":
+            from modelblaster.models import mlp_control as model_mod
+        elif args.model == "lenet":
+            from modelblaster.models import lenet as model_mod
+        elif args.model == "relu6net":
+            from modelblaster.models import relu6net as model_mod
+        elif args.model == "dronet":
+            from modelblaster.models import dronet as model_mod
+        elif args.model == "mobilenet_v2":
+            from modelblaster.models import mobilenet_v2 as model_mod
+        elif args.model == "yolov8_nano":
+            from modelblaster.models import yolov8_nano as model_mod
+        elif args.model == "yolov8_nano_64":
+            from modelblaster.models import yolov8_nano_64 as model_mod
+        elif args.model == "vitfly_frontend":
+            from modelblaster.models import vitfly_frontend as model_mod
+        elif args.model == "lstm_tiny":
+            from modelblaster.models import lstm_tiny as model_mod
+        elif args.model == "vitfly_lstm":
+            from modelblaster.models import vitfly_lstm as model_mod
+        elif args.model == "norm_block":
+            from modelblaster.models import norm_block as model_mod
+        elif args.model == "attn_block":
+            from modelblaster.models import attn_block as model_mod
+        elif args.model == "fused_vision":
+            from modelblaster.models import fused_vision as model_mod
+        elif args.model == "fused_depth":
+            from modelblaster.models import fused_depth as model_mod
+        elif args.model == "fused_full":
+            from modelblaster.models import fused_full as model_mod
+        else:
+            # Dynamic import so a new models/<name>.py needs no edit here.
+            import importlib
+            try:
+                model_mod = importlib.import_module(
+                    f"modelblaster.models.{args.model}")
+            except ModuleNotFoundError:
+                raise SystemExit(f"unknown model {args.model}")
+        model = model_mod.get_model()
+        sample = model_mod.get_sample_input()
+        name = args.model
 
     calibration_samples = None
-    if args.quant == "int8" and args.num_calibration > 1:
+    if model_mod is not None and args.quant == "int8" and args.num_calibration > 1:
         if hasattr(model_mod, "get_calibration_spec"):
             from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             spec = model_mod.get_calibration_spec(args.num_calibration)
@@ -3605,26 +5793,30 @@ def main() -> None:
                   f"get_calibration_samples; falling back to single "
                   f"get_sample_input()", flush=True)
 
-    # Optional per-input dtype declaration for multi-input / multi-dtype models
-    # (list of "i8"/"f32" in placeholder order). Defaults to all-int8.
+    # Optional per-input surface dtype for multi-input / multi-dtype models
+    # ("i8" / "f16" / "f32" in placeholder order). Defaults to all-int8.
     input_dtypes = None
     if hasattr(model_mod, "get_input_dtypes"):
         input_dtypes = list(model_mod.get_input_dtypes())
+        print(f"[extract_graph] input dtypes: {input_dtypes}", flush=True)
 
     # Mixed precision (int8 base + fp16 islands): resolve the model's
-    # get_precision_spec() to the set of op names to run fp16. Only 'fp16_ops'
-    # (explicit op names) is honored on the FX path; '--fp16-ops a,b' is additive.
+    # get_precision_spec() to the set of IR op names to run in fp16. Only
+    # 'fp16_ops' (explicit names) is honoured on the FX path; --fp16-ops adds
+    # to it. With no spec the IR is byte-identical to the all-int8 one.
     fp16_op_names: "set[str] | None" = None
     if args.quant == "int8":
         _names: set[str] = set()
         if hasattr(model_mod, "get_precision_spec"):
             spec = model_mod.get_precision_spec() or {}
             _names |= set(spec.get("fp16_ops", []))
-        if getattr(args, "fp16_ops", None):
-            _names |= {s.strip() for s in args.fp16_ops.split(",") if s.strip()}
+        if args.fp16_ops:
+            _names |= {t.strip() for t in args.fp16_ops.split(",") if t.strip()}
         fp16_op_names = _names or None
-
-    extract(model, sample, name=args.model, out_dir=args.out_dir,
+        if fp16_op_names:
+            print(f"[extract_graph] fp16 ops: {sorted(fp16_op_names)}",
+                  flush=True)
+    extract(model, sample, name=name, out_dir=args.out_dir,
             quant=args.quant,
             calibration_samples=calibration_samples,
             input_dtypes=input_dtypes,

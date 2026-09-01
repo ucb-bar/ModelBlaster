@@ -109,30 +109,21 @@ foreach(_i RANGE ${_last})
             message(FATAL_ERROR "MODEL_DIRS_BASE[${_i}]/${_PRIMARY_BS}='${_primary_dir}' missing ${_required}")
         endif()
     endforeach()
-    # Neither model.h nor test_io.h is COPIED into the stage dir. Two
-    # reasons, and they interact:
-    #   1. generate_skeleton emits `#include "model.h"` inside test_io.h,
-    #      and a quoted include resolves against the INCLUDING file's own
-    #      directory first. After a copy that is _STAGE_DIR, where the
-    #      header is named <name>_model.h and plain model.h does not
-    #      exist -> "fatal error: model.h: No such file or directory".
-    #   2. Copying model.h but not test_io.h then makes the copy and the
-    #      original two distinct files, so `#pragma once` fires twice and
-    #      every type in model.h is redefined ("conflicting types for
-    #      model_<m>_op_record_t").
-    # Staging both as one-line forwarders keeps a single physical
-    # translation of each header, so #pragma once works and every quoted
-    # include inside them resolves from generated/<backend>/.
-    file(WRITE "${_STAGE_DIR}/${_name}_model.h"
-         "#pragma once\n#include \"${_primary_dir}/model.h\"\n")
-    file(WRITE "${_STAGE_DIR}/${_name}_test_io.h"
-         "#pragma once\n#include \"${_primary_dir}/test_io.h\"\n")
+    configure_file("${_primary_dir}/model.h"   "${_STAGE_DIR}/${_name}_model.h"   COPYONLY)
+    # test_io.h's own `#include "model.h"` (needed by its arity-agnostic
+    # model_{mid}_run_test() wrapper, which references model_{mid}_output_t)
+    # must be rewritten to the staged, per-model-prefixed header name --
+    # COPYONLY doesn't rewrite file contents, and multiple models'
+    # unqualified model.h would otherwise collide in this shared staging dir.
+    file(READ "${_primary_dir}/test_io.h" _test_io_contents)
+    string(REPLACE "#include \"model.h\"" "#include \"${_name}_model.h\""
+           _test_io_contents "${_test_io_contents}")
+    file(WRITE "${_STAGE_DIR}/${_name}_test_io.h" "${_test_io_contents}")
 
-    # Per-(model, backend) OBJECT lib over model.c + kernels.c + weights.c,
-    # with -D renames so the externally-visible symbols don't collide across
-    # backends. weights.c is per-backend because the packed layouts differ
-    # (gemmini OIHW vs rvv IHWOC — 93% of dronet's weight elements), so each
-    # backend must link the copy it was packed for.
+    # Per-(model, backend) OBJECT lib over model.c + kernels.c, with -D
+    # renames so the externally-visible symbols don't collide across
+    # backends. Weights are backend-suffixed at codegen by
+    # generate_skeleton.py's _weight_name() and linked per backend below.
     foreach(_bs IN LISTS MODEL_BACKENDS)
         set(_backend_dir "${_base}/${_bs}")
         foreach(_required model.c kernels.c weights.c)
@@ -153,7 +144,6 @@ foreach(_i RANGE ${_last})
                 python -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}"
                     --backend "${_bs}"
-                    --weights-header "${_backend_dir}/weights.h"
                     --separator ";"
             OUTPUT_VARIABLE _rename_flags
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -172,8 +162,7 @@ foreach(_i RANGE ${_last})
 
         set(_obj_tgt "modelblaster_${_name}_${_bs}_objs")
         add_library(${_obj_tgt} OBJECT
-            "${_backend_dir}/model.c" "${_backend_dir}/kernels.c"
-            "${_backend_dir}/weights.c")
+            "${_backend_dir}/model.c" "${_backend_dir}/kernels.c")
         target_include_directories(${_obj_tgt} PRIVATE "${_backend_dir}")
         target_link_libraries(${_obj_tgt} PRIVATE zephyr_interface)
         target_link_libraries(${_obj_tgt} PRIVATE modelblaster_pool)
@@ -197,6 +186,30 @@ foreach(_i RANGE ${_last})
         endif()
 
         message(STATUS "harness_xpurt: ${_name}/${_bs} -> ${_obj_tgt}")
+    endforeach()
+
+    # Per-backend weights — one OBJECT lib per (model, backend), NOT a
+    # single shared copy. The old comment here ("all copies are
+    # identical") is wrong: different backends can pack the SAME logical
+    # tensor in different physical layouts (e.g. RVV's IHWOC vs scalar's
+    # native OIHW — see generate_skeleton.py's _backend_pack_weight).
+    # Picking one "primary" backend's weights.c for every backend to
+    # share made every non-primary backend's kernels silently read weight
+    # data through the wrong layout — a deterministic wrong-answer bug
+    # (root-caused via dronet: max_abs_err=51, reproduced identically
+    # regardless of which kernel algorithm ran, since the kernel was
+    # never the problem). generate_skeleton.py's _weight_name() now bakes
+    # the backend into every weight symbol (e.g. ..._weight_q_rvv vs
+    # ..._weight_q_scalar), so each backend's own model.c/kernels.c
+    # already reference their own backend's symbols — link each backend's
+    # own weights.c accordingly.
+    foreach(_bs IN LISTS MODEL_BACKENDS)
+        set(_backend_dir "${_base}/${_bs}")
+        set(_weights_tgt "modelblaster_${_name}_${_bs}_weights_obj")
+        add_library(${_weights_tgt} OBJECT "${_backend_dir}/weights.c")
+        target_include_directories(${_weights_tgt} PRIVATE "${_backend_dir}")
+        target_link_libraries(${_weights_tgt} PRIVATE zephyr_interface)
+        target_compile_definitions(${_weights_tgt} PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
     endforeach()
 
     # Intermediate-buffer storage — also single OBJECT lib per model, NOT
@@ -248,13 +261,15 @@ if(MODELBLASTER_XPURT_TRACE)
     target_compile_definitions(app PRIVATE MODELBLASTER_XPURT_TRACE=1)
 endif()
 
-# Link every (model, backend) OBJECT lib (model.c + kernels.c + weights.c)
-# plus the per-model buffers OBJECT lib. buffers are shared across all
-# backends of one model; weights are NOT — see comments where they're
-# declared.
+# Link every (model, backend) OBJECT lib + each backend's own weights
+# OBJECT lib + the per-model buffers OBJECT lib into the final binary.
+# Weights are per-backend (see where _weights_tgt is declared above);
+# buffers are shared across all backends of one model — see the comment
+# where that target is declared.
 foreach(_name ${MODEL_NAMES})
     foreach(_bs IN LISTS MODEL_BACKENDS)
         target_link_libraries(app PRIVATE modelblaster_${_name}_${_bs}_objs)
+        target_link_libraries(app PRIVATE modelblaster_${_name}_${_bs}_weights_obj)
     endforeach()
     target_link_libraries(app PRIVATE modelblaster_${_name}_buffers_obj)
     if(TARGET modelblaster_${_name}_test_io_obj)

@@ -16,11 +16,22 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
 
 #include "model.h"
 #include "test_io.h"
+
+/* Opt-in TACIT / L-Trace of just the model inference. Enable by building with
+ * -DMB_TACIT_TRACE_MODEL=1 (see CMakeLists.txt), then run on the TACIT-enabled
+ * spike with `--trace=l`. Brackets only run_model() so the trace is the model's
+ * control flow (not boot) -- preferable to CONFIG_STARTUP_TACIT for substantial
+ * models. See samples/tacit/TACIT_TRACING.md. */
+#if defined(MB_TACIT_TRACE_MODEL)
+#include <tacit/tacit.h>
+#include <zephyr/arch/cpu.h>
+#endif
 
 static model_output_t model_output[MODEL_OUTPUT_SIZE];
 
@@ -47,6 +58,11 @@ int main(void)
      * (when emitted) would dispatch onto a real modelblaster_pool_t.
      * model_run_test() feeds the baked test input(s) — it is arity-agnostic
      * (1 input or N typed inputs), so this call is unchanged across models. */
+#if defined(MB_TACIT_TRACE_MODEL)
+    LTraceEncoderType *_tacit_enc = l_trace_encoder_get(arch_curr_cpu()->id);
+    l_trace_encoder_configure_target(_tacit_enc, TARGET_PRINT);
+    l_trace_encoder_start(_tacit_enc);
+#endif
     /* ------------------------------------------------------------------
      * MODELBLASTER_MASK_IRQ_DURING_RUN: run the whole inference with
      * machine interrupts masked.
@@ -86,6 +102,18 @@ int main(void)
 #endif
 
     model_run_test(model_output, NULL);
+#if defined(MB_TACIT_TRACE_MODEL)
+    l_trace_encoder_stop(_tacit_enc);
+    for (int _i = 0; _i < 16; _i++) { __asm__ volatile("nop"); } /* flush */
+#endif
+    /* RVV->scalar visibility barrier. The kernels write model_output via RVV
+     * vector stores (vse/vsse); the verify loop below reads it with scalar
+     * loads. On FireSim/Saturn's weak memory model the vector store buffer may
+     * not have drained before the scalar reads -> stale/partial output ->
+     * spurious miscompute (correct on spike, wrong on FireSim; worse in
+     * complex kernels with more in-flight stores). Same root cause + fix as the
+     * ExecuTorch riscv_executor_runner fence. */
+    __asm__ volatile("fence rw, rw" ::: "memory");
 
 #if MODELBLASTER_MASK_IRQ_DURING_RUN
     irq_unlock(mb_irq_key);
@@ -155,6 +183,12 @@ int main(void)
      * per-op rdcycle deltas above are used for relative comparisons. */
     printf("=== MODELBLASTER_WALL_CYCLES === %lu\n", model_wall_cycles());
 
+#ifdef CONFIG_ARCH_POSIX
+    /* native_sim: no HTIF/reboot — terminate the host process cleanly so the
+     * native runner gets a clean exit (stdout already flushed above). */
+    exit(0);
+#else
     sys_reboot(SYS_REBOOT_COLD);
+#endif
     return 0;
 }

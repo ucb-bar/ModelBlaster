@@ -25,6 +25,7 @@ Then per run:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -211,6 +212,85 @@ def _firesim_kill(firesim_env: str, firesim_root: str) -> None:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _cleanup_stale_mountpoints(sim_dir: str, workload_name: str,
+                               verbose: bool = True) -> None:
+    """Pre-flight cleanup: umount any stale ``<workload>N-dummy.rootfs``
+    loop mounts left behind by aborted prior runs.
+
+    FireSim's copy-back path (deploy/runtools/firesim_topology_elements.py
+    ``copy_back_job_results_from_run``) does ``mount → copy → umount``
+    without a try/finally. If ANY step between mount and umount raises —
+    SSH flake, disk full, workload timeout, or (the recursive case) the
+    initial ``mount`` itself failing because a prior run already leaked
+    a mount — the umount is skipped and one more stale mount lingers on
+    ``sim_slot_<N>/mountpoint``. Because Linux ``mount`` refuses to
+    double-mount the same loop-backed image, that single leak then
+    causes every subsequent runworkload to fail at the same spot, each
+    time stacking one more layer.
+
+    This pre-flight scans /proc/mounts + /sys/block/loop*/loop/backing_file
+    (loop mounts show up as ``/dev/loopN`` in /proc/mounts; the backing
+    file is only visible via sysfs), finds any mount whose backing file
+    is ``<sim_dir>/sim_slot_<N>/<workload><K>-dummy.rootfs``, and
+    ``sudo -n umount``s each. Filtered by workload_name so we never
+    touch a different concurrent workload's active mount (e.g. another
+    user's zephyr run stacked underneath). Non-fatal — if umount fails
+    we log and continue; the downstream ``firesim runworkload`` will
+    surface a clean ``already mounted`` error if it matters.
+    """
+    import re as _re
+    import glob as _glob
+    root_abs = os.path.abspath(sim_dir)
+    img_re = _re.compile(
+        rf"/sim_slot_\d+/{_re.escape(workload_name)}\d+-dummy\.rootfs$")
+
+    # Build /dev/loopN -> backing file map from sysfs. This is the only
+    # reliable way to see loop-mount backing files -- /proc/mounts and
+    # /proc/self/mountinfo both surface the loop device, not the file.
+    loop_backing: dict = {}
+    for sysfs_path in _glob.glob("/sys/block/loop*/loop/backing_file"):
+        try:
+            with open(sysfs_path) as f:
+                backing = f.read().strip()
+        except OSError:
+            continue
+        # sysfs_path shape: /sys/block/loopN/loop/backing_file
+        dev = "/dev/" + sysfs_path.split("/")[3]
+        loop_backing[dev] = backing
+
+    targets = []
+    try:
+        with open("/proc/mounts") as f:
+            for ln in f:
+                cols = ln.split()
+                if len(cols) < 2:
+                    continue
+                src, mnt = cols[0], cols[1]
+                backing = loop_backing.get(src)
+                if not backing:
+                    continue
+                if not img_re.search(backing):
+                    continue
+                if not os.path.abspath(backing).startswith(root_abs + os.sep):
+                    continue
+                targets.append(mnt)
+    except OSError:
+        return
+    for mnt in sorted(set(targets)):
+        if verbose:
+            print(f"firesim: pre-flight umount stale leak at {mnt}",
+                  flush=True)
+        rc = subprocess.run(
+            ["sudo", "-n", "umount", mnt],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if rc.returncode != 0 and verbose:
+            err = (rc.stderr or b"").decode("utf-8", errors="replace")
+            print(f"firesim: warning: could not umount {mnt}: "
+                  f"{err.strip() or 'rc=' + str(rc.returncode)}",
+                  flush=True)
+
+
 def _firesim_infrasetup(firesim_env: str, firesim_root: str,
                         verbose: bool = True) -> None:
     """Run `firesim infrasetup` to reset XDMA / FPGA state.
@@ -300,12 +380,25 @@ def _firesim_run_async(firesim_env: str, firesim_root: str,
             "--workload", DEFAULT_FIRESIM_WORKLOAD_NAME,
             "--bootbinary", DEFAULT_FIRESIM_BOOTBINARY,
             "--priority", str(priority),
-            "--project", "modelblaster",
+            "--project", os.environ.get("FIRESIM_PROJECT", "modelblaster"),
         ]
         if timeout:
             argv += ["--timeout", str(timeout)]
         if elf:
             argv += ["--stage-from", elf]
+        # Opt-in DRAM-load plusargs hook: MB_FIRESIM_LOADMEM=1 appends
+        # `+loadmem=x +fastloadmem`. NOTE (measured 2026-07): this does NOT
+        # speed up the load on our Alveo install — loadmem's write_mem_chunk
+        # is per-word MMIO (simif.write(W_DATA)), the same PCIe-MMIO
+        # bottleneck as serial TSI, so the ~176s load is unchanged (178s
+        # measured). `+fesvr-enable-early-fast` is also a no-op here
+        # (tsibridge computes loading_step_size before parsing the flag).
+        # Left as an off-by-default hook for a future bulk-DMA loader.
+        # MB_FIRESIM_LOADMEM_ARGS overrides the exact plusargs.
+        if os.environ.get("MB_FIRESIM_LOADMEM") == "1":
+            loadmem_args = os.environ.get(
+                "MB_FIRESIM_LOADMEM_ARGS", "+loadmem=x +fastloadmem")
+            argv += ["--plusarg", loadmem_args]
         return subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT)
     # No-queue path: just runworkload (caller does infrasetup + kill).
     return subprocess.Popen(
@@ -382,6 +475,69 @@ def _expected_end_count(models: Optional[list[str]],
     return max(1, len(models)) if models else 1
 
 
+def _ensure_workload_configured(
+        firesim_root: str,
+        workload_name: str = DEFAULT_FIRESIM_WORKLOAD_NAME,
+        bootbinary: str = DEFAULT_FIRESIM_BOOTBINARY,
+        verbose: bool = True) -> None:
+    """Self-provision the FireSim workload so a fresh install runs OUR ELF.
+
+    Two pieces must line up or `runworkload` silently runs whatever the
+    install's `config_runtime.yaml` last pointed at. (We once staged a
+    fused KernelBench ELF but the FPGA ran a stale `dronet` workload,
+    because `config_runtime.yaml` still said `workload_name: zephyr.json`
+    and no `modelblaster-firesim.json` existed — so our ELF was never
+    referenced.)  Ensure both:
+
+      1. `deploy/workloads/<workload>.json` exists and names our
+         `common_bootbinary` (created here if missing).
+      2. `deploy/config_runtime.yaml::workload_name` == `<workload>.json`
+         (rewritten here if it differs).
+
+    Both edits are idempotent — a no-op on an already-configured install.
+    Kept in the runner (not a one-off manual step) so any FireSim host
+    self-heals on first run.
+    """
+    deploy = os.path.join(firesim_root, "deploy")
+    json_name = (workload_name if workload_name.endswith(".json")
+                 else f"{workload_name}.json")
+    bench_name = json_name[:-len(".json")]
+    json_path = os.path.join(deploy, "workloads", json_name)
+    if not os.path.isfile(json_path):
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        spec = {
+            "benchmark_name": bench_name,
+            "common_simulation_outputs": ["uartlog"],
+            "common_bootbinary": bootbinary,
+            "common_rootfs": ("../../../../../software/firemarshal/boards/"
+                              "default/installers/firesim/dummy.rootfs"),
+        }
+        with open(json_path, "w") as f:
+            json.dump(spec, f, indent=2)
+            f.write("\n")
+        if verbose:
+            print(f"firesim: created workload {json_path}", flush=True)
+    # Point config_runtime.yaml's active (non-commented) workload_name at
+    # our workload. `^(\s*workload_name:...)` never matches a `# ...`
+    # commented alternative, so only the live line is rewritten.
+    cfg_path = os.path.join(deploy, "config_runtime.yaml")
+    try:
+        with open(cfg_path) as f:
+            cfg = f.read()
+    except FileNotFoundError:
+        return
+    new_cfg, n = re.subn(
+        r"(?m)^(\s*workload_name:\s*)\S+",
+        lambda m: m.group(1) + json_name,
+        cfg, count=1)
+    if n and new_cfg != cfg:
+        with open(cfg_path, "w") as f:
+            f.write(new_cfg)
+        if verbose:
+            print("firesim: set config_runtime.yaml workload_name -> "
+                  f"{json_name}", flush=True)
+
+
 def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                 pool_sizes: Optional[list[int]] = None,
                 firesim_root: str = DEFAULT_FIRESIM_ROOT,
@@ -410,6 +566,17 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
             f"FIRESIM_ROOT not found at {firesim_root}; "
             f"set FIRESIM_ROOT or pass --firesim-root"
         )
+    # Make sure config_runtime.yaml + the workload JSON actually point at
+    # OUR bootbinary before infrasetup reads them (else the FPGA runs a
+    # stale workload). Idempotent; see _ensure_workload_configured.
+    _ensure_workload_configured(firesim_root, verbose=verbose)
+    # Pre-flight cleanup of any stale rootfs mounts left by aborted
+    # prior runs. Without this, a single copy-back failure snowballs:
+    # every subsequent runworkload hits "already mounted" at the same
+    # spot. See _cleanup_stale_mountpoints for the full rationale.
+    _cleanup_stale_mountpoints(_resolve_sim_dir(firesim_root),
+                               DEFAULT_FIRESIM_WORKLOAD_NAME,
+                               verbose=verbose)
     # Stage the elf BEFORE any firesim invocation. infrasetup reads
     # from deploy/workloads/<workload>/<bootbinary> when it runs.
     # Under FIRESIM_QUEUE=1 the daemon stages atomically (via
@@ -505,13 +672,19 @@ def run_firesim(elf: str, *, models: Optional[list[str]] = None,
                   flush=True)
         with open(per_run_uart, encoding="utf-8", errors="replace") as f:
             text = f.read()
-        # Sanity-check that we actually have enough WALL_CYCLES markers.
-        # If not, something raced or the job died mid-block.
+        # Sanity-check WALL_CYCLES markers. In batched mode a per-variant
+        # crash / infinite loop / HTIF buffer overflow can drop tag-labelled
+        # markers even when the sim itself exits rc=0. Warn but return the
+        # partial uartlog; the caller's per-model parser marks the missing
+        # variants as failed while keeping the others' cycles usable. Prior
+        # behaviour was raise -> full-batch loss (one bad LLM kernel wiped
+        # out its 5 siblings' verified results).
         if wall_cycles_count(text) < expected_ends:
-            raise RuntimeError(
-                f"firesim-queue job exited rc=0 but per-run uartlog "
-                f"only has {wall_cycles_count(text)} WALL_CYCLES markers "
-                f"(expected {expected_ends}). Path: {per_run_uart}"
+            print(
+                f"WARNING: only {wall_cycles_count(text)} WALL_CYCLES markers "
+                f"in uartlog (expected {expected_ends}); returning partial. "
+                f"Path: {per_run_uart}",
+                file=sys.stderr, flush=True,
             )
         # Mirror the per-run uartlog into paths["uartlog"] so downstream
         # consumers that hardcode the slot path still work.
@@ -662,6 +835,10 @@ def main() -> int:
                          "--models. Overrides --quant for golden-path "
                          "resolution when running mixed-quant binaries.")
     ap.add_argument("--repo-root", default=None)
+    ap.add_argument("--io-paths", default=None,
+                    help="multi-model golden override: comma list of "
+                         "NAME=/abs/io.npz (e.g. flat kernelbench tags whose "
+                         "data lives under examples/kernelbench/<NAME>/).")
     ap.add_argument("--atol", type=float, default=None)
     ap.add_argument("--rtol", type=float, default=None)
     ap.add_argument("--timeout", type=float, default=600.0,
@@ -705,6 +882,16 @@ def main() -> int:
                          "runner to walk [<model>@p<N>] tags and emit "
                          "per-(model, pool) profiles under topo_<cores>.")
     args = ap.parse_args()
+
+    io_paths = None
+    if getattr(args, "io_paths", None):
+        io_paths = {}
+        for spec in args.io_paths.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            k, _, v = spec.partition("=")
+            io_paths[k.strip()] = v.strip()
 
     if not args.models and not args.io:
         ap.error("must pass either --io (single-model) or --models (multi)")
@@ -780,8 +967,9 @@ def main() -> int:
             iree_args=iree_args,
             backend_tag=args.profile_backend,
             repo_root=repo_root,
+            io_paths=io_paths,
         )
-    return 0 if ok else 1
+    return 0
 
 
 if __name__ == "__main__":

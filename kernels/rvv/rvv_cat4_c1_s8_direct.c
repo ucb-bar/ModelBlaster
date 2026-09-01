@@ -28,23 +28,47 @@ void kernel_cat4_c1_s8(const int8_t *in0, int c0, float scale0, const int8_t *in
             int hw = 0;
             size_t vl;
             for (; hw < total_elems; hw += vl) {
-                vl = __riscv_vsetvl_e8m2(total_elems - hw);
-                vint8m2_t v8 = __riscv_vle8_v_i8m2(in_base + hw, vl);
+                    /* Width domains named explicitly.
+                     *
+                     * GCC 13.2 does not carry vtype across the mixed widths
+                     * here: it leaves the e8m2 setting from the load in force
+                     * and issues vsext/vfwcvt/vfcvt under SEW=8, which are
+                     * illegal (a vf2 extend would imply a 4-bit source; there
+                     * is no 8-bit float). The kernel SIGILLs on its first
+                     * dispatch. scripts/check_rvv_vtype.py gates on this.
+                     *
+                     * Element COUNT is identical across e8m2 / e16m4 / e32m8
+                     * (EMUL scales with SEW), so no arithmetic changes. */
+                const size_t n_elem = (size_t)(total_elems - hw);
+                /* Element count in its own variable, handed to every
+                 * width. Chaining `vsetvl_e16m4(vl)` on a previous
+                 * vsetvl's result is miscompiled by this GCC: it passes an
+                 * ADDRESS register as the AVL operand, vl saturates to
+                 * VLMAX, and the vl-preserving forms carry that to the
+                 * store. See rvv_cat2_c1_s8_direct.c for the disassembly
+                 * and the guard-page proof. Only bites when the count is
+                 * not a whole multiple of VLMAX, i.e. on a partial tail. */
+                vl = __riscv_vsetvl_e8m2(n_elem);
+                size_t vl8 = vl;
+                size_t vl16 = __riscv_vsetvl_e16m4(n_elem);
+                size_t vl32 = __riscv_vsetvl_e32m8(n_elem);
+                (void)__riscv_vsetvl_e8m2(n_elem);
+                vint8m2_t v8 = __riscv_vle8_v_i8m2(in_base + hw, vl8);
                 /* sign-extend i8 -> i32 (4x widen) */
-                vint32m8_t v32 = __riscv_vsext_vf4_i32m8(v8, vl);
+                vint32m8_t v32 = __riscv_vsext_vf4_i32m8(v8, vl32);
                 /* convert to float */
-                vfloat32m8_t vf = __riscv_vfcvt_f_x_v_f32m8(v32, vl);
+                vfloat32m8_t vf = __riscv_vfcvt_f_x_v_f32m8(v32, vl32);
                 /* multiply by ratio */
-                vf = __riscv_vfmul_vf_f32m8(vf, ratio, vl);
+                vf = __riscv_vfmul_vf_f32m8(vf, ratio, vl32);
                 /* round to nearest int32 */
-                vint32m8_t vr = __riscv_vfcvt_x_f_v_i32m8(vf, vl);
+                vint32m8_t vr = __riscv_vfcvt_x_f_v_i32m8(vf, vl32);
                 /* clamp */
-                vr = __riscv_vmax_vx_i32m8(vr, activation_min, vl);
-                vr = __riscv_vmin_vx_i32m8(vr, activation_max, vl);
+                vr = __riscv_vmax_vx_i32m8(vr, activation_min, vl32);
+                vr = __riscv_vmin_vx_i32m8(vr, activation_max, vl32);
                 /* narrow i32 -> i16 -> i8 */
-                vint16m4_t vr16 = __riscv_vncvt_x_x_w_i16m4(vr, vl);
-                vint8m2_t vr8 = __riscv_vncvt_x_x_w_i8m2(vr16, vl);
-                __riscv_vse8_v_i8m2(out_base + hw, vr8, vl);
+                vint16m4_t vr16 = __riscv_vncvt_x_x_w_i16m4(vr, vl16);
+                vint8m2_t vr8 = __riscv_vncvt_x_x_w_i8m2(vr16, vl8);
+                __riscv_vse8_v_i8m2(out_base + hw, vr8, vl8);
             }
 
             out_c += ci;

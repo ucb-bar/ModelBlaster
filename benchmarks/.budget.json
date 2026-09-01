@@ -1,0 +1,15 @@
+{
+  "max_usd": 150.0,
+  "as_of": "2026-06-02",
+  "recorded_to_date_usd": 63.62,
+  "actual_to_date_usd": 86.5,
+  "actual_offset_usd": 22.88,
+  "remaining_usd": 63.5,
+  "rationale": "User authorized maximum LLM spend of $150 total. The mb-cost report shows $63.62 cumulative across 1027 calls, but actual billed spend is now ~$86.50 \u2014 $22.88 of under-counting. The actual_offset is added to every recorded total before checking against the cap. Bumped by $2.50 on 2026-06-02 for 4 unrecorded Bedrock attempts that failed verify, then by another $3.00 same day for ~8 more attempts (the LLM_PROVIDER=bedrock BACKEND=llm path via examples/<model>/run.sh constructs BedrockClient via make_llm_client() with NO log_path arg, and the script doesn't export BEDROCK_CALLS_LOG, so those calls bypass benchmarks/results/*/llm_calls.jsonl entirely and mb-cost can't see them). FIX: examples/_run_lib.sh should export BEDROCK_CALLS_LOG=$EXAMPLE_DIR/$QUANT/bedrock_calls.jsonl before invoking BACKEND=llm path; alternatively bedrock_client.BedrockClient.__init__ default for log_path could fall back to ~/.modelblaster/llm_calls.jsonl.",
+  "policy": {
+    "hard_cap": 150.0,
+    "warn_at_usd": 130.0,
+    "stop_new_jobs_at_usd": 145.0,
+    "per_run_cap_default_usd": 10.0
+  }
+}

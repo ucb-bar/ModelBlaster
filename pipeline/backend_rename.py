@@ -29,23 +29,12 @@ or struct-shape):
   * `model_<mid>_input_t`, `model_<mid>_output_t` (typedefs)
   * `MODEL_<UMID>_*` macros (#defines; same value across backends)
 
-Weights (`<mid>_<weight>`) ARE renamed. They are NOT backend-agnostic:
-each backend packs the same tensor in its own layout (gemmini keeps
-OIHW, rvv permutes to IHWOC), so for dronet 290489/312098 weight
-elements differ between the gemmini_q31 and rvv copies. Emitting them
-under one symbol and linking only the primary backend's `weights.c`
-silently fed one backend the other's layout. Each backend now compiles
-its own `weights.c` with `-D<sym>=<sym>_<bs>`, so the layouts coexist.
-
-The symbol list is read from the backend's generated `weights.h` rather
-than re-derived from the IR, so it always matches exactly what
-`generate_skeleton.py` emitted (tile weights from IR-level sharding
-included).
+Weights (`<mid>_<weight>`) are NOT renamed — they're backend-agnostic
+const data and link once per model.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Iterable
 
 
@@ -53,34 +42,11 @@ def _c_ident(name: str) -> str:
     return name.replace(".", "_").replace("-", "_")
 
 
-_EXTERN_RE = re.compile(
-    r"^\s*extern\s+(?:const\s+)?[A-Za-z_][\w\s]*?\b(\w+)\s*(?:\[[^;]*\])?\s*;",
-    re.M)
-
-
-def weight_symbols_from_header(path: str) -> list[str]:
-    """Externally-visible symbols declared in a generated `weights.h`.
-
-    Parsing the header (rather than re-deriving names from the IR) keeps
-    this exactly in step with `generate_skeleton.py`'s `_weight_name`,
-    including split-tile weights whose names have no IR-level analogue.
-    """
-    with open(path) as f:
-        return _EXTERN_RE.findall(f.read())
-
-
-def weight_rename_defs(symbols: Iterable[str], backend: str) -> list[str]:
-    """`-Dsym=sym_<bs>` for every weight symbol, so each backend's
-    `weights.c` defines storage under its own name and its `model.c`
-    reads back the layout that backend was packed for."""
-    return [f"-D{sym}={sym}_{backend}" for sym in symbols]
-
-
-def rename_defs(model_name: str, used_ops: Iterable[str], backend: str,
-                weight_symbols: Iterable[str] = ()) -> list[str]:
+def rename_defs(model_name: str, used_ops: Iterable[str], backend: str
+                ) -> list[str]:
     """Return a list of `-Dold=new` flags for one (model, backend) compile.
-    Pass these as compile_definitions on model.c + kernels.c + weights.c —
-    all three must agree on the renamed weight symbols."""
+    Pass these as compile_definitions on the model.c + kernels.c sources
+    (NOT weights.c)."""
     mid = _c_ident(model_name)
     umid = mid.upper()
     bs = backend
@@ -106,8 +72,6 @@ def rename_defs(model_name: str, used_ops: Iterable[str], backend: str,
     defs.append(
         f"-DMODEL_{umid}_DISPATCH_FNS=MODEL_{umid}_DISPATCH_FNS_{BS}"
     )
-    # Weight storage — see module docstring.
-    defs.extend(weight_rename_defs(weight_symbols, bs))
     return defs
 
 
@@ -128,9 +92,6 @@ def _main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ir", required=True, help="path to graph.json")
     ap.add_argument("--backend", required=True, help="backend tag, e.g. rvv")
-    ap.add_argument("--weights-header", default=None,
-                    help="path to the backend's generated weights.h; its "
-                         "symbols get -D renamed per backend")
     ap.add_argument("--separator", default=";",
                     help="separator between flags (default ';' for CMake lists)")
     args = ap.parse_args()
@@ -138,9 +99,7 @@ def _main() -> None:
     with open(args.ir) as f:
         ir = json.load(f)
     used = {op["op"] for op in ir.get("ops", []) if op.get("op") != "view"}
-    wsyms = (weight_symbols_from_header(args.weights_header)
-             if args.weights_header else [])
-    flags = rename_defs(ir["name"], used, args.backend, wsyms)
+    flags = rename_defs(ir["name"], used, args.backend)
     print(args.separator.join(flags))
 
 

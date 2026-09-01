@@ -36,6 +36,7 @@ import yaml
 
 from modelblaster.benchmarks.runners import spike as spike_runner
 from modelblaster.benchmarks.runners import firesim as firesim_runner
+from modelblaster.benchmarks.runners import k1 as k1_runner
 from modelblaster.benchmarks.runners import _hetero_artifacts
 
 
@@ -103,9 +104,9 @@ def apply_runner_override(
     """
     if override is None or override == workload.runner:
         return workload
-    if override not in ("spike", "firesim"):
+    if override not in ("spike", "firesim", "k1"):
         raise SystemExit(
-            f"--runner-override must be spike|firesim, got {override!r}"
+            f"--runner-override must be spike|firesim|k1, got {override!r}"
         )
     if (workload.target in HETERO_TARGETS and override == "spike"):
         # Surface the cycle-source caveat on stderr so it lands in the
@@ -263,6 +264,10 @@ def required_tools_for(runner: str) -> list[str]:
     needed = ["west"]
     if runner == "spike":
         needed.append("spike")
+    if runner == "k1":
+        # The board is reached over ssh; scp comes with it. Nothing is
+        # simulated locally, so no simulator binary is required.
+        needed.append("ssh")
     # firesim is invoked by the runner script's own logic; the wrapper
     # already exits informatively when its sub-tools are missing, so we
     # do not require firesim on PATH here.
@@ -274,7 +279,10 @@ def select_runner(name: str):
         return spike_runner
     if name == "firesim":
         return firesim_runner
-    raise SystemExit(f"unsupported runner: {name} (expected spike|firesim)")
+    if name == "k1":
+        return k1_runner
+    raise SystemExit(
+        f"unsupported runner: {name} (expected spike|firesim|k1)")
 
 
 def peak_rss_mb_delta(before, after) -> float:

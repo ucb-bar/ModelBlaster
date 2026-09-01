@@ -31,6 +31,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <riscv_vector.h>
+/* Keep the m0..m3 / v0..v31 register-name #defines alive past the header
+ * so the OPMVINBCAST / VOPACC / VMV_VR / VMV_RV macros below can use
+ * `m1` / `v0` etc. as their architectural-register-name arguments. */
+#define SATURN_OPU_KEEP_REGISTER_MACROS
 #include "saturn_opu.h"
 
 /* Q0.31 fixed-point requantize — matches the linear_s8 reference impl in

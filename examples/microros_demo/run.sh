@@ -204,7 +204,7 @@ WEST_BUILD_EXTRA+=(-DEXTRA_CONF_FILE="${EXTRA_CONF}")
 
 # 5) west build.
 echo "[microros_demo] west build (BACKENDS=${BACKENDS}, MODELS=${MODELS})"
-west build -p -b "${BOARD_TARGET}" modelblaster/harness_microros \
+west build -p -b "${BOARD_TARGET}" harness_microros \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
