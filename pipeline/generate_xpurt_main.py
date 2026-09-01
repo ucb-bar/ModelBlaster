@@ -714,17 +714,54 @@ def _emit(networks: list[str], schedule_name: str,
  * harness/src/main.c warns "a thread pool or several models concurrently
  * must NOT do this" -- that is about holding the lock across BLOCKING work.
  * Here it is held only across one kernel call: every k_sem wait, scheduler
- * decision and bookkeeping happens outside it. The two workers are pinned
- * one-per-hart and the intra-op pool has 0 helpers, so a hart never has a
- * second runnable worker to starve, and irq_lock() masks only this hart.
+ * decision and bookkeeping happens outside it.
+ *
+ * DO NOT use irq_lock() here. Under CONFIG_SMP -- which every multi-hart
+ * xpurt build sets -- irq_lock() is NOT a per-hart mask: include/zephyr/irq.h
+ * redefines it to z_smp_global_lock(), Zephyr's system-wide big kernel lock
+ * (one atomic_cas spun on in kernel/smp.c). Holding that across the kernel
+ * call made the two workers mutually exclusive, so a schedule that placed
+ * two independent dispatches on two harts at start_time=0 ran them STRICTLY
+ * SERIALLY. Measured on FPGA job 375 (dronet conv_modules.0 split 2 ways):
+ * every one of the 22 trace intervals was disjoint, the gemmini worker spun
+ * 1274 us waiting out the rvv tile it was supposed to run beside, and the
+ * makespan was exactly the serial sum of the kernels (6567 us of kernel in a
+ * 6651 us run) against a 5099 us 2-hart ASAP ideal. The convoy is also
+ * unfair: which worker wins the CAS is nondeterministic, so the same binary
+ * serialises in a different order run to run.
+ *
+ * harness_microros/src/main.c:287-291 hit this first (a ~400 ms hart-1 stall
+ * during yolov8) and worked around it with a raw `csrrc mie, (1<<3)` MSIE
+ * mask. Do not copy that here: it hardcodes a RISC-V CSR bit into portable
+ * generator output and mutates `mie` behind Zephyr's back, so Zephyr's own
+ * interrupt bookkeeping does not know the bit is clear.
+ *
+ * k_sched_lock() is the abstraction that actually fits. What must not happen
+ * inside a vector kernel is a THREAD SWITCH -- z_riscv_vstate_save_thread /
+ * z_riscv_vstate_restore_thread are called from the context-switch path
+ * (arch/riscv/core/v.c:167,232), and it is the restore that faults.
+ * k_sched_lock() suppresses exactly that, and nothing else: ISRs still run
+ * and the system tick keeps advancing.
+ *
+ * It also cannot reintroduce the serialisation. kernel/sched.c:756 takes
+ * _sched_spinlock only long enough to decrement a PER-THREAD counter, then
+ * drops it -- no lock is held across the kernel call, so the two workers stay
+ * independent.
+ *
+ * And it is strictly stronger than the MSIE mask for this fault: masking MSIE
+ * only blocks the reschedule IPI from another hart, leaving a local timer
+ * tick free to preempt mid-kernel; k_sched_lock() blocks every reschedule of
+ * this thread. arch_irq_lock() would also be correct and genuinely per-hart,
+ * but it masks the tick for the duration of every kernel, which k_sched_lock
+ * does not.
  *
  * XPURT_DISPATCH_IRQ_GUARD=0 disables it (reproduces the fault). */
 #if !defined(XPURT_DISPATCH_IRQ_GUARD)
 #define XPURT_DISPATCH_IRQ_GUARD 1
 #endif
 #if XPURT_DISPATCH_IRQ_GUARD
-#define XPURT_DISPATCH_GUARD_ENTER() unsigned int _xpurt_irq_key = irq_lock()
-#define XPURT_DISPATCH_GUARD_EXIT()  irq_unlock(_xpurt_irq_key)
+#define XPURT_DISPATCH_GUARD_ENTER() k_sched_lock()
+#define XPURT_DISPATCH_GUARD_EXIT()  k_sched_unlock()
 #else
 #define XPURT_DISPATCH_GUARD_ENTER() do {{ }} while (0)
 #define XPURT_DISPATCH_GUARD_EXIT()  do {{ }} while (0)
