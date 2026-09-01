@@ -160,6 +160,7 @@ foreach(_i RANGE ${_last})
                 python -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}"
                     --backend "${_bs}"
+                    --weights-header "${_backend_dir}/weights.h"
                     --separator ";"
             OUTPUT_VARIABLE _rename_flags
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -175,7 +176,8 @@ foreach(_i RANGE ${_last})
 
         set(_obj_tgt "modelblaster_microros_${_name}_${_bs}_objs")
         add_library(${_obj_tgt} OBJECT
-            "${_backend_dir}/model.c" "${_backend_dir}/kernels.c")
+            "${_backend_dir}/model.c" "${_backend_dir}/kernels.c"
+            "${_backend_dir}/weights.c")
         target_include_directories(${_obj_tgt} PRIVATE "${_backend_dir}")
         target_link_libraries(${_obj_tgt} PRIVATE zephyr_interface)
         target_link_libraries(${_obj_tgt} PRIVATE modelblaster_pool)
@@ -197,14 +199,11 @@ foreach(_i RANGE ${_last})
         message(STATUS "harness_microros: ${_name}/${_bs} -> ${_obj_tgt}")
     endforeach()
 
-    # Backend-agnostic weights + buffers + test_io — single TU per model
-    # (matches harness_xpurt's reasoning: cross-backend dispatches in one
-    # network must read each other's writes through one buffer storage).
-    set(_weights_tgt "modelblaster_microros_${_name}_weights_obj")
-    add_library(${_weights_tgt} OBJECT "${_primary_dir}/weights.c")
-    target_include_directories(${_weights_tgt} PRIVATE "${_primary_dir}")
-    target_link_libraries(${_weights_tgt} PRIVATE zephyr_interface)
-    target_compile_definitions(${_weights_tgt} PRIVATE MODELBLASTER_DISABLE_UNMANGLED=1)
+    # buffers + test_io — single TU per model (cross-backend dispatches in
+    # one network must read each other's writes through one buffer storage).
+    # weights are per-backend and live in the ${_obj_tgt} lib above: the
+    # packed layouts differ per backend (gemmini OIHW vs rvv IHWOC), so a
+    # single shared copy silently fed one backend the other's layout.
 
     if(NOT EXISTS "${_primary_dir}/buffers.c")
         message(FATAL_ERROR
@@ -325,7 +324,6 @@ foreach(_name ${MODEL_NAMES})
     foreach(_bs IN LISTS MODEL_BACKENDS)
         target_link_libraries(app PRIVATE modelblaster_microros_${_name}_${_bs}_objs)
     endforeach()
-    target_link_libraries(app PRIVATE modelblaster_microros_${_name}_weights_obj)
     target_link_libraries(app PRIVATE modelblaster_microros_${_name}_buffers_obj)
     if(TARGET modelblaster_microros_${_name}_test_io_obj)
         target_link_libraries(app PRIVATE modelblaster_microros_${_name}_test_io_obj)
