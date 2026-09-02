@@ -295,6 +295,21 @@ def _gen_inputs_relu_s8(shape: dict, rng: np.random.Generator):
     return inp, out
 
 
+def _gen_inputs_relayout_s8(shape: dict, rng: np.random.Generator):
+    """Inputs for nchw_to_nhwc_s8 / nhwc_to_nchw_s8.
+
+    Both directions move the same N*C*H*W bytes, so one generator serves both;
+    only the INTERPRETATION of the buffer differs, and the kernel is told the
+    logical (N, C, H, W) either way. The full [-128, 127] range is used because
+    a permutation must be exact for every byte value -- there is no arithmetic
+    to be tolerant of.
+    """
+    n_elem = shape["N"] * shape["C"] * shape["H"] * shape["W"]
+    inp = rng.integers(-128, 128, size=(n_elem,), dtype=np.int8)
+    out = np.zeros((n_elem,), dtype=np.int8)
+    return inp, out
+
+
 def _gen_inputs_conv2d_s8(shape: dict, rng: np.random.Generator):
     N, IC, IH, IW = shape["N"], shape["IC"], shape["IH"], shape["IW"]
     OC = shape["OC"]
@@ -576,6 +591,11 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         inp, out = inputs
         fn(_i8p(inp), _i8p(out), shape["n"])
         return out
+    if op in ("nchw_to_nhwc_s8", "nhwc_to_nchw_s8"):
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out),
+           shape["N"], shape["C"], shape["H"], shape["W"])
+        return out
     if op == "relu6_s8":
         inp, out = inputs
         # Representative int8 ceiling for the 6.0 clamp; a real model-level
@@ -727,7 +747,8 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
 
 # Op kinds that produce integer outputs — verify must compare bit-exactly
 # (no atol/rtol tolerance) since integer math is deterministic.
-_INTEGER_OPS = {"linear_s8", "relu_s8", "relu6_s8", "conv2d_s8", "maxpool2d_s8",
+_INTEGER_OPS = {"nchw_to_nhwc_s8", "nhwc_to_nchw_s8",
+                "linear_s8", "relu_s8", "relu6_s8", "conv2d_s8", "maxpool2d_s8",
                 "add_s8", "batchnorm2d_s8", "sigmoid_s8",
                 "silu_s8", "elu_s8", "upsample_nearest_s8",
                 "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8",
@@ -840,6 +861,8 @@ def verify(
                     inputs_ref = _gen_inputs_linear_s8(shape, rng)
                 elif op == "relu_s8":
                     inputs_ref = _gen_inputs_relu_s8(shape, rng)
+                elif op in ("nchw_to_nhwc_s8", "nhwc_to_nchw_s8"):
+                    inputs_ref = _gen_inputs_relayout_s8(shape, rng)
                 elif op == "relu6_s8":
                     inputs_ref = _gen_inputs_relu_s8(shape, rng)
                 elif op == "conv2d_s8":

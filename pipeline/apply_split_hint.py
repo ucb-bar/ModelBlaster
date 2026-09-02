@@ -69,8 +69,11 @@ def _ops_by_id(ops: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
 
 
 def _split_linear_s8(op: dict[str, Any], n_splits: int,
-                     network: str) -> list[dict[str, Any]]:
-    """Split a linear_s8 op along the N (output features) dim.
+                     network: str, tile_sizes=None) -> list[dict[str, Any]]:
+    """Split a linear_s8 / linear op along the N (output features) dim.
+
+    Dtype-agnostic: reads only shape["N"]. Registered for both the int8 and
+    the fp32 linear in _SPLITTABLE.
 
     Generates `n_splits` new ops, each computing rows [t*N/n, (t+1)*N/n)
     of the original output. Weight and bias slices share the source
@@ -84,14 +87,11 @@ def _split_linear_s8(op: dict[str, Any], n_splits: int,
     """
     shape = op["shape"]
     N = int(shape["N"])
-    if N % n_splits != 0:
-        raise SplitHintError(
-            f"{network}: linear_s8 N={N} doesn't divide cleanly into "
-            f"{n_splits} tiles (need N % n_splits == 0)")
-    tile_n = N // n_splits
+    widths = _tile_widths(N, n_splits, tile_sizes, network, "linear_s8 N")
     out_tensor = op["outputs"][0]
     tiles: list[dict[str, Any]] = []
-    for t in range(n_splits):
+    n0 = 0
+    for t, tile_n in enumerate(widths):
         tile = copy.deepcopy(op)
         tile["shape"] = dict(shape)
         tile["shape"]["N"] = tile_n
@@ -101,16 +101,58 @@ def _split_linear_s8(op: dict[str, Any], n_splits: int,
         tile["outputs"] = [f"{out_tensor}.tile_{t}"]
         tile["name"] = op["name"] + f".tile_{t}"
         tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
-                              "n_splits": n_splits, "tile_n": tile_n,
-                              "tile_offset_N": t * tile_n}
+                              "n_splits": len(widths), "tile_n": tile_n,
+                              "tile_offset_N": n0}
         # `hardware_target` left as-is; the scheduler may place tiles
         # on different cores at scheduling time.
         tiles.append(tile)
+        n0 += tile_n
     return tiles
 
 
+def _tile_widths(total: int, n_splits: int, tile_sizes,
+                 network: str, what: str) -> list[int]:
+    """Resolve a split into per-tile widths along the tiled axis.
+
+    Two ways to ask for a split, and the second is why this exists:
+
+      * `n_splits=N` -- N EVEN tiles, the original contract. Still requires
+        `total % N == 0`; an uneven remainder was rejected before and stays
+        rejected, because "n_splits" names a count, not a partition.
+      * `tile_sizes=[a, b, ...]` -- an explicit, possibly UNEVEN partition.
+        The widths must be positive and sum to `total`; anything else would
+        leave output channels unwritten or make two tiles claim the same ones.
+
+    An uneven partition is the point: the two backends here do NOT have the
+    same cost curve, so the split that balances them is generally not the
+    even one. Every downstream consumer keys off `tile_offset_OC` (which the
+    splitters record) rather than recomputing `tile * tile_oc`, so uneven
+    widths need no further special-casing.
+    """
+    if tile_sizes is not None:
+        widths = [int(x) for x in tile_sizes]
+        if len(widths) < 2:
+            raise SplitHintError(
+                f"{network}: tile_sizes={tile_sizes} must name at least 2 tiles")
+        if any(w <= 0 for w in widths):
+            raise SplitHintError(
+                f"{network}: tile_sizes={tile_sizes} has a non-positive tile")
+        if sum(widths) != total:
+            raise SplitHintError(
+                f"{network}: tile_sizes={tile_sizes} sums to {sum(widths)}, "
+                f"but {what}={total}. A partition that does not sum to the "
+                f"full axis leaves outputs unwritten or double-written.")
+        return widths
+    if total % n_splits != 0:
+        raise SplitHintError(
+            f"{network}: {what}={total} doesn't divide cleanly into "
+            f"{n_splits} tiles (need {what} % n_splits == 0). Pass "
+            f"tile_sizes=[...] for an uneven partition.")
+    return [total // n_splits] * n_splits
+
+
 def _split_conv2d_s8(op: dict[str, Any], n_splits: int,
-                     network: str) -> list[dict[str, Any]]:
+                     network: str, tile_sizes=None) -> list[dict[str, Any]]:
     """Split a conv2d_s8 op along the OC (output channel) dim.
 
     Splitting along OC produces n tiles that each compute a disjoint
@@ -131,26 +173,144 @@ def _split_conv2d_s8(op: dict[str, Any], n_splits: int,
     """
     shape = op["shape"]
     OC = int(shape["OC"])
-    if OC % n_splits != 0:
-        raise SplitHintError(
-            f"{network}: conv2d_s8 OC={OC} doesn't divide cleanly into "
-            f"{n_splits} tiles (need OC % n_splits == 0)")
-    tile_oc = OC // n_splits
+    widths = _tile_widths(OC, n_splits, tile_sizes, network, "conv2d_s8 OC")
     out_tensor = op["outputs"][0]
     tiles: list[dict[str, Any]] = []
-    for t in range(n_splits):
+    oc0 = 0
+    for t, tile_oc in enumerate(widths):
         tile = copy.deepcopy(op)
         tile["shape"] = dict(shape)
         tile["shape"]["OC"] = tile_oc
         tile["outputs"] = [f"{out_tensor}.tile_{t}"]
         tile["name"] = op["name"] + f".tile_{t}"
         tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
-                              "n_splits": n_splits, "tile_oc": tile_oc,
-                              "tile_offset_OC": t * tile_oc,
+                              "n_splits": len(widths), "tile_oc": tile_oc,
+                              "tile_offset_OC": oc0,
                               "axis": "OC"}
         tiles.append(tile)
+        oc0 += tile_oc
     return tiles
 
+
+def _split_conv2d_s8_oh(op: dict[str, Any], n_splits: int,
+                        network: str, tile_sizes=None) -> list[dict[str, Any]]:
+    """Split a conv2d_s8 op along the OH (output ROW) dim.
+
+    WHY THIS AXIS EXISTS AT ALL. `_split_conv2d_s8` tiles OC, and OC is
+    quantized by the backend's blocking factor -- 32 for rvv (`TILE_OC` is
+    clamped to `vsetvlmax_e32m4()`, kernels/rvv/
+    rvv_conv2d_s8_rvv_vsmul_vnclip.c), 16 for gemmini (systolic DIM). A conv
+    whose OC IS that quantum (dronet has four at OC=32) cannot be OC-split at
+    all without paying for a second full slab: `ceil(32/32) = 1` unsplit, 2 for
+    any 2-way partition. OH carries no such quantum, so an OH split of the same
+    conv keeps every tile a full-width slab.
+
+    WHAT MAKES IT DIFFERENT FROM AN OC SPLIT, and every one of these is a trap:
+
+      * **The tiles' INPUTS overlap.** Output rows [r0, r1) need input rows
+        [r0*SH - PH, (r1-1)*SH + KH - 1 - PH]. Adjacent tiles therefore share
+        `KH - SH` input rows -- the HALO -- so the input is read more than once
+        and the duplication factor is `window_rows / tile_rows`, not 1.0. The
+        OUTPUTS stay disjoint and no accumulation is reordered, which is what
+        keeps this a plain output-space split rather than a reduction split.
+
+      * **Padding is per-tile.** Only the first tile gets the conv's top
+        padding and only the last gets its bottom padding. One `PH` cannot say
+        that -- the kernel signature pads BOTH ends by PH -- so this splitter
+        does not try. It reports the window in PARENT input-row coordinates
+        (`in_row_lo`, which is NEGATIVE for the first tile) and sets the tile's
+        own `PH` to 0; the codegen materialises the out-of-range rows as
+        explicit zeros. A zero row contributes `(0 + input_offset) * (w +
+        filter_offset)`, which is exactly what the kernel's own out-of-bounds
+        branch contributes, so the two are equivalent by construction rather
+        than by luck.
+
+      * **`PW` goes to 0 with it.** Not because the width needs splitting, but
+        because gemmini's curated conv refuses `PH != PW` and falls back to a
+        scalar loop (kernels/gemmini/gemmini_conv2d_s8_gemmini_tiled_conv.c:122
+        -- `KH != KW || SH != SW || PH != PW`). A tile with PH=0 and PW=1 would
+        build, run, verify -- and quietly leave the systolic array idle. So the
+        codegen materialises the column padding too and the tile is a genuine
+        zero-padding conv on a pre-padded window.
+
+    NOT SLICED: the weights. Every tile computes every output channel from the
+    full filter bank, so unlike the OC path there is no per-tile weight array
+    and no layout hazard (`split_conv_tile_weights` deliberately matches only
+    `axis == "OC"`).
+
+    The output tensor `[N, OC, OH, OW]` is NCHW, so a row band is NOT a
+    contiguous slice of it -- it is `OC` separate runs of `tile_oh*OW`
+    elements, one per channel plane. That is the one place an OH tile is
+    strictly more expensive to express than an OC tile, and it is why the tile
+    output aliases the parent at offset 0 and the codegen scatters, instead of
+    aliasing at a per-tile offset the way OC does.
+    """
+    shape = op["shape"]
+    IH, IW = int(shape["IH"]), int(shape["IW"])
+    KH, SH, PH = int(shape["KH"]), int(shape["SH"]), int(shape["PH"])
+    if int(shape.get("DH", 1)) != 1 or int(shape.get("DW", 1)) != 1:
+        raise SplitHintError(
+            f"{network}: {op.get('name')} has dilation "
+            f"DH={shape.get('DH')} DW={shape.get('DW')}; the conv2d_s8 kernel "
+            f"signature carries no dilation, so the halo this splitter derives "
+            f"would understate the input window")
+    OH = int(shape.get("OH") or ((IH + 2 * PH - KH) // SH + 1))
+    widths = _tile_widths(OH, n_splits, tile_sizes, network, "conv2d_s8 OH")
+    out_tensor = op["outputs"][0]
+    tiles: list[dict[str, Any]] = []
+    oh0 = 0
+    for t, tile_oh in enumerate(widths):
+        # Input row window this tile reads, in PARENT coordinates. `lo` is
+        # negative wherever the conv's top padding falls inside the window
+        # (always, for tile 0 of a padded conv), and `lo + window_rows` runs
+        # past IH at the bottom of the last tile. Both are intentional: the
+        # window is the padded extent, and the codegen zero-fills the parts the
+        # parent tensor does not have.
+        lo = oh0 * SH - PH
+        window_rows = (tile_oh - 1) * SH + KH
+        pad_top = max(0, -lo)
+        pad_bot = max(0, lo + window_rows - IH)
+        in_rows = window_rows - pad_top - pad_bot
+        if in_rows <= 0:
+            raise SplitHintError(
+                f"{network}: {op.get('name')} OH tile {t} (rows "
+                f"[{oh0}, {oh0 + tile_oh})) reads no real input row -- its "
+                f"window [{lo}, {lo + window_rows}) misses [0, {IH}). The "
+                f"partition is degenerate for this conv's stride/padding.")
+        tile = copy.deepcopy(op)
+        tile["shape"] = dict(shape)
+        # The tile IS a conv over the pre-padded window: IH becomes the window
+        # height and the padding becomes zero, which reproduces exactly
+        # `tile_oh` output rows -- (window_rows - KH)/SH + 1 == tile_oh by the
+        # definition of window_rows above. Recording the geometry this way (and
+        # not as "parent shape plus a note") means a cost model that multiplies
+        # the shape out gets the tile's real work without knowing about OH
+        # splitting at all.
+        tile["shape"]["IH"] = window_rows
+        tile["shape"]["PH"] = 0
+        tile["shape"]["OH"] = tile_oh
+        # PW follows PH to zero for gemmini's square-padding guard; IW grows to
+        # the padded width so OW is unchanged. See the docstring.
+        PW = int(shape["PW"])
+        tile["shape"]["IW"] = IW + 2 * PW
+        tile["shape"]["PW"] = 0
+        tile["outputs"] = [f"{out_tensor}.tile_{t}"]
+        tile["name"] = op["name"] + f".tile_{t}"
+        tile["split_from"] = {
+            "op_id": op["dispatch_id"], "tile": t, "n_splits": len(widths),
+            "axis": "OH",
+            "tile_oh": tile_oh, "tile_offset_OH": oh0,
+            # Window in parent input rows. `in_row_lo` may be negative.
+            "in_row_lo": lo, "window_rows": window_rows,
+            "pad_top": pad_top, "pad_bot": pad_bot, "in_rows": in_rows,
+            # Parent geometry the codegen needs for the gather/scatter strides;
+            # the tile's own `shape` no longer carries it.
+            "parent_IH": IH, "parent_IW": IW, "parent_OH": OH,
+            "parent_PH": PH, "parent_PW": int(shape["PW"]),
+        }
+        tiles.append(tile)
+        oh0 += tile_oh
+    return tiles
 
 #: Sub-op shape keys that name an output-channel count, in the order they are
 #: tried. A fused conv's constituents each describe the same tensor in their
@@ -185,7 +345,7 @@ def _narrow_sub_shape(sub: dict[str, Any], full_oc: int, tile_oc: int) -> None:
 
 
 def _split_fused_conv_s8(op: dict[str, Any], n_splits: int,
-                         network: str) -> list[dict[str, Any]]:
+                         network: str, tile_sizes=None) -> list[dict[str, Any]]:
     """Split a fused conv->BN[->SiLU] along OC.
 
     The ARITHMETIC is `_split_conv2d_s8`'s, unchanged: OC is an output axis,
@@ -226,18 +386,16 @@ def _split_fused_conv_s8(op: dict[str, Any], n_splits: int,
             f"its own -- the geometry lives under sub_ops -- so there is no OC "
             f"to tile along")
     full_oc = int(conv["shape"]["OC"])
-    if full_oc % n_splits != 0:
-        raise SplitHintError(
-            f"{network}: {op['op']} OC={full_oc} doesn't divide cleanly into "
-            f"{n_splits} tiles (need OC % n_splits == 0)")
-    tile_oc = full_oc // n_splits
+    widths = _tile_widths(full_oc, n_splits, tile_sizes, network,
+                          f"{op['op']} OC")
     out_tensor = op["outputs"][0]
     # Produced by a sibling constituent => internal to this fused op => must
     # not be shared across tiles. The op's own input is produced elsewhere and
     # is deliberately absent from this set.
     internal = {t for s in sub_ops for t in (s.get("outputs") or [])}
     tiles: list[dict[str, Any]] = []
-    for t in range(n_splits):
+    oc0 = 0
+    for t, tile_oc in enumerate(widths):
         tile = copy.deepcopy(op)
         suffix = f".tile_{t}"
         for sub in tile["sub_ops"]:
@@ -248,10 +406,11 @@ def _split_fused_conv_s8(op: dict[str, Any], n_splits: int,
         tile["outputs"] = [f"{out_tensor}{suffix}"]
         tile["name"] = op["name"] + suffix
         tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
-                              "n_splits": n_splits, "tile_oc": tile_oc,
-                              "tile_offset_OC": t * tile_oc,
+                              "n_splits": len(widths), "tile_oc": tile_oc,
+                              "tile_offset_OC": oc0,
                               "axis": "OC"}
         tiles.append(tile)
+        oc0 += tile_oc
     return tiles
 
 
@@ -262,14 +421,70 @@ def _split_fused_conv_s8(op: dict[str, Any], n_splits: int,
 #: can only ever tile ops too cheap for the tiling to matter.
 _SPLITTABLE: dict[str, Any] = {
     "linear_s8": _split_linear_s8,
+    # fp32 `linear` uses the SAME splitter: `_split_linear_s8` only reads
+    # shape["N"], narrows it, renames the output and records tile metadata --
+    # it touches no dtype, no quant params and no weight layout, so it is a
+    # generic N-splitter that happens to be named for its first caller.
+    # NOTE for anyone adding another dtype here: registering the op is NOT
+    # sufficient on its own. generate_skeleton gates BOTH the output offset
+    # alias and the weight/bias pointer offset on the op kind; a kind that is
+    # split but missing from _N_SLICEABLE_LINEAR_OPS there builds cleanly and
+    # computes garbage (every tile writes at offset 0 and reads weight row 0).
+    "linear": _split_linear_s8,
     "conv2d_s8": _split_conv2d_s8,
     "conv2d_batchnorm2d_s8": _split_fused_conv_s8,
     "conv2d_batchnorm2d_silu_s8": _split_fused_conv_s8,
 }
 
 
+#: The axis each kind is split along when a hint does not name one. Kept
+#: separate from `_SPLITTABLE` so the DEFAULT and the SET OF CHOICES are two
+#: facts, not one: a hint that says nothing still gets OC for a conv (every
+#: existing hint on disk relies on that), while one that says `"axis": "OH"`
+#: gets the spatial splitter.
+_DEFAULT_AXIS: dict[str, str] = {
+    "linear_s8": "N",
+    "linear": "N",
+    "conv2d_s8": "OC",
+    "conv2d_batchnorm2d_s8": "OC",
+    "conv2d_batchnorm2d_silu_s8": "OC",
+}
+
+#: axis -> {op kind: splitter}. Only conv2d_s8 has an OH splitter: the fused
+#: convs are excluded deliberately rather than by oversight, because their
+#: epilogue geometry (`bn_scale`/`bn_bias` are per-CHANNEL, and an OH tile
+#: keeps every channel) is fine but their codegen path has no row-window
+#: emitter -- and a kind registered here without one in generate_skeleton is
+#: exactly the "builds cleanly, computes garbage" failure that
+#: `_N_SLICEABLE_LINEAR_OPS` warns about.
+_SPLITTABLE_BY_AXIS: dict[str, dict[str, Any]] = {
+    "N": {"linear_s8": _split_linear_s8, "linear": _split_linear_s8},
+    "OC": {"conv2d_s8": _split_conv2d_s8,
+           "conv2d_batchnorm2d_s8": _split_fused_conv_s8,
+           "conv2d_batchnorm2d_silu_s8": _split_fused_conv_s8},
+    "OH": {"conv2d_s8": _split_conv2d_s8_oh},
+}
+
+
+def _resolve_splitter(op_kind: str, axis, network: str, op_id):
+    """Pick the splitter for (op kind, requested axis), or say why there is none."""
+    if axis is None:
+        axis = _DEFAULT_AXIS.get(op_kind)
+    if axis not in _SPLITTABLE_BY_AXIS:
+        raise SplitHintError(
+            f"{network}: split_ops[dispatch_id={op_id}] asks for axis "
+            f"{axis!r}; known axes are {sorted(_SPLITTABLE_BY_AXIS)}")
+    by_kind = _SPLITTABLE_BY_AXIS[axis]
+    if op_kind not in by_kind:
+        raise SplitHintError(
+            f"{network}: op kind {op_kind!r} (dispatch_id={op_id}) cannot be "
+            f"split along {axis}; that axis supports {sorted(by_kind)}. "
+            f"Split-capable kinds overall: {sorted(_SPLITTABLE)}")
+    return by_kind[op_kind], axis
+
+
 def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
-                           n_splits: int, tile_n: int, axis: str) -> None:
+                           widths: list[int], axis: str) -> None:
     """When we split a linear_s8 op along N, the per-tile output names
     (`<orig>.tile_<i>`) need entries in the IR's tensors dict so the
     downstream skeleton emitter can allocate buffers for them. The
@@ -288,16 +503,28 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
     parent_shape = list(parent["shape"])
     if not parent_shape:
         return
-    tile_shape = list(parent_shape)
-    # Which dim `tile_n` narrows is the SPLIT AXIS, not the op kind: an OC
-    # split narrows dim 1 of NCHW, an N split narrows the last dim. Keying it
-    # on the op kind is why this used to name `conv2d_s8` explicitly, which
+    # Which dim the tile width narrows is the SPLIT AXIS, not the op kind: an
+    # OC split narrows dim 1 of NCHW, an N split narrows the last dim. Keying
+    # it on the op kind is why this used to name `conv2d_s8` explicitly, which
     # silently sent every fused conv down the linear branch and narrowed W.
-    if axis == "OC" and len(tile_shape) >= 4:
-        tile_shape[1] = tile_n   # NCHW: OC is dim 1
+    if axis == "OC" and len(parent_shape) >= 4:
+        axis_dim = 1                       # [N, OC, OH, OW]
+    elif axis == "OH" and len(parent_shape) >= 4:
+        axis_dim = 2                       # [N, OC, OH, OW]
     else:
-        tile_shape[-1] = tile_n  # linear_s8: N is last dim
-    for t in range(n_splits):
+        axis_dim = len(parent_shape) - 1   # linear [M, N]
+    # Element offset of each tile within the parent buffer. With EVEN tiles
+    # this is just `t * prod(tile_shape)`, which is what the consumer used to
+    # recompute; with UNEVEN tiles that is wrong for every tile after the
+    # first, so the offset is recorded here where the partition is known.
+    stride_per_unit = 1
+    for d in parent_shape[axis_dim + 1:]:
+        stride_per_unit *= int(d)
+    off_units = 0
+    n_splits = len(widths)
+    for t, tile_n in enumerate(widths):
+        tile_shape = list(parent_shape)
+        tile_shape[axis_dim] = tile_n
         tile_name = f"{out_name}.tile_{t}"
         if tile_name not in tensors:
             entry = {
@@ -306,7 +533,17 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
                 "split_from": out_name,
                 "tile": t,
                 "n_splits": n_splits,
+                # An OC/N tile is a CONTIGUOUS block of the parent, so it can
+                # be expressed as a pointer offset and the tile simply writes
+                # there. An OH tile is not: in NCHW a band of rows is `OC`
+                # separate runs, one per channel plane. So it aliases the
+                # parent at 0 and the codegen scatters row-band by row-band --
+                # recording any other offset here would put every tile's first
+                # channel plane at the wrong place.
+                "elem_offset": 0 if axis == "OH" else off_units * stride_per_unit,
             }
+            if axis == "OH":
+                entry["alias_kind"] = "row_window"
             # Carry the parent's quantization across. A tile is a slice of the
             # parent tensor -- same scale, same zero point, by construction --
             # and anything reading the tile's own metadata (the codegen's
@@ -316,6 +553,7 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
             if parent.get("quant") is not None:
                 entry["quant"] = copy.deepcopy(parent["quant"])
             tensors[tile_name] = entry
+        off_units += tile_n
 
 
 def apply_split_hint(graph: dict[str, Any],
@@ -332,7 +570,10 @@ def apply_split_hint(graph: dict[str, Any],
 
     # Validate everything first; reject if any op is unsupported.
     for spec in split_ops:
-        op_id = spec["op"]; n = int(spec.get("n_splits", 2))
+        op_id = spec["op"]
+        n = int(spec.get("n_splits", 2))
+        if spec.get("tile_sizes"):
+            n = len(spec["tile_sizes"])
         if op_id not in ops_by_id:
             raise SplitHintError(
                 f"{network}: split_ops references unknown dispatch_id {op_id}")
@@ -342,13 +583,19 @@ def apply_split_hint(graph: dict[str, Any],
                 f"{network}: op kind {op['op']!r} (dispatch_id={op_id}) "
                 f"not yet split-capable; supported kinds: "
                 f"{sorted(_SPLITTABLE)}")
+        # Resolve here as well as at rewrite time so an unsupported (kind,
+        # axis) pair is rejected BEFORE any op is rewritten -- the validate
+        # pass exists so a bad hint leaves the graph untouched.
+        _resolve_splitter(op["op"], spec.get("axis"), network, op_id)
         if n < 2:
             raise SplitHintError(
                 f"{network}: n_splits={n} must be >= 2 to split")
 
     # Single-pass rewrite: walk in original order, replacing split ops
     # with their tile lists. Re-assign dispatch_ids contiguously after.
-    target_ids = {s["op"]: int(s.get("n_splits", 2)) for s in split_ops}
+    target_ids = {s["op"]: (int(s.get("n_splits", 2)), s.get("tile_sizes"),
+                            s.get("axis"))
+                  for s in split_ops}
     new_ops: list[dict[str, Any]] = []
     id_remap: dict[int, list[int]] = {}  # original -> [new tile ids]
     next_new_id = 0
@@ -358,9 +605,9 @@ def apply_split_hint(graph: dict[str, Any],
             new_ops.append(copy.deepcopy(op))
             continue
         if did in target_ids:
-            n = target_ids[did]
-            splitter = _SPLITTABLE[op["op"]]
-            tile_ops = splitter(op, n, network)
+            n, tile_sizes, want_axis = target_ids[did]
+            splitter, _axis = _resolve_splitter(op["op"], want_axis, network, did)
+            tile_ops = splitter(op, n, network, tile_sizes)
             # Register the per-tile output tensors in the IR's tensors
             # dict so generate_skeleton can allocate per-tile buffers
             # (fixes "buf_<network>_<out>_tile_0 undeclared" build error).
@@ -373,9 +620,11 @@ def apply_split_hint(graph: dict[str, Any],
                 # `buf_<net>_<out>_tile_0` at link time.
                 sf0 = tile_ops[0].get("split_from") or {}
                 axis = sf0.get("axis", "N")
-                tile_n = int(sf0.get("tile_oc" if axis == "OC" else "tile_n", 0))
-                if tile_n > 0:
-                    _register_tile_tensors(out, op, n, tile_n, axis)
+                key = {"OC": "tile_oc", "OH": "tile_oh"}.get(axis, "tile_n")
+                widths = [int((t.get("split_from") or {}).get(key, 0))
+                          for t in tile_ops]
+                if all(w > 0 for w in widths):
+                    _register_tile_tensors(out, op, widths, axis)
             new_tile_ids: list[int] = []
             for tile in tile_ops:
                 tile["dispatch_id"] = next_new_id

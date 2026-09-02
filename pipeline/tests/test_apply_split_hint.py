@@ -424,3 +424,244 @@ class FusedConvSplitTest(unittest.TestCase):
         del op["sub_ops"][0]["shape"]
         with self.assertRaises(SplitHintError):
             apply_split_hint(_g(op), [{"op": 0, "n_splits": 2}])
+
+
+class UnevenSplit(unittest.TestCase):
+    """`tile_sizes` partitions an axis into tiles that are NOT all equal.
+
+    The reason this exists: the two backends a tile can land on do not have
+    the same cost curve, so the partition that balances them is generally not
+    the even one. Everything downstream keys off `tile_offset_OC` /
+    `tile_offset_N` rather than `tile * tile_width`, which is only the even
+    special case.
+    """
+
+    def _conv_graph(self, oc=32):
+        return {
+            "name": "net",
+            "tensors": {"out": {"shape": [1, oc, 4, 4], "dtype": "i8"}},
+            "ops": [
+                {"dispatch_id": 0, "op": "conv2d_s8", "name": "c0",
+                 "inputs": ["in"], "outputs": ["out"], "depends_on": [],
+                 "weight": "w", "bias": "b",
+                 "shape": {"N": 1, "IC": 3, "IH": 8, "IW": 8, "OC": oc,
+                           "OH": 4, "OW": 4, "KH": 3, "KW": 3, "SH": 2,
+                           "SW": 2, "PH": 1, "PW": 1}},
+            ],
+            "dispatches": [0],
+        }
+
+    def test_uneven_conv_tiles_get_cumulative_offsets(self):
+        g = apply_split_hint(self._conv_graph(32),
+                             [{"op": 0, "tile_sizes": [20, 7, 5]}])
+        ops = g["ops"]
+        self.assertEqual([o["shape"]["OC"] for o in ops], [20, 7, 5])
+        self.assertEqual([o["split_from"]["tile_offset_OC"] for o in ops],
+                         [0, 20, 27])
+        self.assertEqual([o["split_from"]["tile_oc"] for o in ops], [20, 7, 5])
+        self.assertEqual([o["split_from"]["n_splits"] for o in ops], [3, 3, 3])
+        self.assertEqual(g["id_remap"], {"0": [0, 1, 2]})
+
+    def test_uneven_tile_tensors_carry_per_tile_shape_and_offset(self):
+        g = apply_split_hint(self._conv_graph(32),
+                             [{"op": 0, "tile_sizes": [20, 7, 5]}])
+        t = g["tensors"]
+        # NCHW output [1, OC, 4, 4]; each tile narrows dim 1 and starts at the
+        # cumulative element offset, NOT tile_idx * prod(tile_shape).
+        self.assertEqual(t["out.tile_0"]["shape"], [1, 20, 4, 4])
+        self.assertEqual(t["out.tile_1"]["shape"], [1, 7, 4, 4])
+        self.assertEqual(t["out.tile_2"]["shape"], [1, 5, 4, 4])
+        self.assertEqual([t[f"out.tile_{i}"]["elem_offset"] for i in range(3)],
+                         [0, 20 * 16, 27 * 16])
+
+    def test_even_split_is_unchanged_by_the_uneven_path(self):
+        a = apply_split_hint(self._conv_graph(32), [{"op": 0, "n_splits": 2}])
+        b = apply_split_hint(self._conv_graph(32),
+                             [{"op": 0, "tile_sizes": [16, 16]}])
+        self.assertEqual([o["split_from"] for o in a["ops"]],
+                         [o["split_from"] for o in b["ops"]])
+
+    def test_partition_that_does_not_sum_to_the_axis_is_rejected(self):
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(self._conv_graph(32),
+                             [{"op": 0, "tile_sizes": [20, 7]}])
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(self._conv_graph(32),
+                             [{"op": 0, "tile_sizes": [32, 0]}])
+
+
+def _conv2d_oh_op(did, name, N=1, IC=3, IH=8, IW=8, OC=16, KH=3, KW=3,
+                  SH=1, SW=1, PH=1, PW=1,
+                  inputs=("x",), outputs=("y",), depends_on=()):
+    """`_conv2d_op` with stride/padding as free parameters -- the OH split's
+    geometry is a function of exactly those, and the OC split's is not, which is
+    why the older fixture pins them."""
+    op = _conv2d_op(did, name, N=N, IC=IC, IH=IH, IW=IW, OC=OC, KH=KH, KW=KW,
+                    inputs=inputs, outputs=outputs, depends_on=depends_on)
+    op["shape"].update({"SH": SH, "SW": SW, "PH": PH, "PW": PW})
+    op["shape"]["OH"] = (IH + 2 * PH - KH) // SH + 1
+    op["shape"]["OW"] = (IW + 2 * PW - KW) // SW + 1
+    return op
+
+
+class Conv2dOhSplitTest(unittest.TestCase):
+    """The OH (spatial row) axis. Every assertion here is about geometry, and
+    every one of them is load-bearing: the tiles read OVERLAPPING input and
+    write DISJOINT output, so an off-by-one in the window silently produces a
+    plausible answer rather than a crash."""
+
+    def test_splits_conv_into_two_row_bands(self):
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, OC=16, KH=3, SH=1, PH=1))  # OH=8
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"}])
+        ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
+        self.assertEqual(len(ops), 2)
+        t0, t1 = ops
+        self.assertEqual(t0["split_from"]["axis"], "OH")
+        self.assertEqual([t0["split_from"]["tile_oh"], t1["split_from"]["tile_oh"]],
+                         [4, 4])
+        self.assertEqual(t0["split_from"]["tile_offset_OH"], 0)
+        self.assertEqual(t1["split_from"]["tile_offset_OH"], 4)
+        self.assertEqual(t0["outputs"], ["y.tile_0"])
+        self.assertEqual(t1["outputs"], ["y.tile_1"])
+        # Every tile keeps ALL output channels -- that is the entire point of
+        # this axis, so assert it rather than trusting the deepcopy.
+        self.assertEqual(t0["shape"]["OC"], 16)
+        self.assertEqual(t1["shape"]["OC"], 16)
+
+    def test_tile_shape_is_a_zero_padded_conv_over_its_own_window(self):
+        """IH/PH/OH are rewritten so `(IH + 2*PH - KH)/SH + 1 == OH` holds for
+        the TILE. A cost model that multiplies the shape out then gets the
+        tile's real work without knowing this axis exists."""
+        g = _g(_conv2d_oh_op(0, "c0", IH=112, IW=112, OC=32, KH=3, SH=2, SW=2,
+                             PH=1, PW=1))  # OH=56, OW=56
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"}])
+        for t in out["ops"]:
+            sh = t["shape"]
+            self.assertEqual(sh["PH"], 0)
+            self.assertEqual(sh["PW"], 0)
+            self.assertEqual((sh["IH"] + 2 * sh["PH"] - sh["KH"]) // sh["SH"] + 1,
+                             sh["OH"])
+            self.assertEqual((sh["IW"] + 2 * sh["PW"] - sh["KW"]) // sh["SW"] + 1,
+                             sh["OW"])
+            self.assertEqual(sh["OW"], 56)      # width is NOT split
+            self.assertEqual(sh["IW"], 112 + 2)  # ... it is PRE-PADDED
+
+    def test_halo_and_per_tile_padding(self):
+        """KH=3, SH=2, PH=1 over IH=112: tile 0's window starts one row ABOVE
+        the tensor (that row is the conv's top padding) and tile 1's ends flush
+        with it. Getting this backwards is the classic per-tile padding bug."""
+        g = _g(_conv2d_oh_op(0, "c0", IH=112, IW=112, OC=32, KH=3, SH=2, PH=1))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"}])
+        a, b = [o["split_from"] for o in out["ops"]]
+        self.assertEqual((a["in_row_lo"], a["window_rows"]), (-1, 57))
+        self.assertEqual((a["pad_top"], a["pad_bot"], a["in_rows"]), (1, 0, 56))
+        self.assertEqual((b["in_row_lo"], b["window_rows"]), (55, 57))
+        self.assertEqual((b["pad_top"], b["pad_bot"], b["in_rows"]), (0, 0, 57))
+        # The windows overlap by KH-SH rows; that overlap IS the halo cost.
+        first_end = a["in_row_lo"] + a["window_rows"]
+        self.assertGreater(first_end, b["in_row_lo"])
+        self.assertEqual(first_end - b["in_row_lo"], 1)
+
+    def test_window_covers_every_input_row_each_output_row_needs(self):
+        """Exhaustive over a range of geometries: for every output row the tile
+        owns, every tap the conv would read must be inside the tile's window."""
+        for IH, KH, SH, PH, k in [(8, 3, 1, 1, 2), (112, 3, 2, 1, 2),
+                                  (112, 3, 2, 1, 4), (27, 3, 2, 1, 2),
+                                  (27, 1, 2, 0, 2), (14, 3, 1, 1, 2),
+                                  (7, 3, 1, 1, 7), (9, 5, 2, 2, 3)]:
+            OH = (IH + 2 * PH - KH) // SH + 1
+            if OH % k:
+                continue
+            with self.subTest(IH=IH, KH=KH, SH=SH, PH=PH, k=k):
+                g = _g(_conv2d_oh_op(0, "c0", IH=IH, IW=IH, KH=KH, KW=KH,
+                                     SH=SH, SW=SH, PH=PH, PW=PH))
+                out = apply_split_hint(g, [{"op": 0, "n_splits": k,
+                                            "axis": "OH"}])
+                covered = []
+                for t in out["ops"]:
+                    sf = t["split_from"]
+                    lo, hi = sf["in_row_lo"], sf["in_row_lo"] + sf["window_rows"]
+                    for oh in range(sf["tile_offset_OH"],
+                                    sf["tile_offset_OH"] + sf["tile_oh"]):
+                        for kh in range(KH):
+                            self.assertTrue(lo <= oh * SH - PH + kh < hi)
+                    covered += list(range(sf["tile_offset_OH"],
+                                          sf["tile_offset_OH"] + sf["tile_oh"]))
+                # ... and the tiles partition the output rows exactly once.
+                self.assertEqual(covered, list(range(OH)))
+
+    def test_uneven_row_partition(self):
+        g = _g(_conv2d_oh_op(0, "c0", IH=14, IW=14, OC=32, KH=3, SH=1, PH=1))
+        out = apply_split_hint(g, [{"op": 0, "tile_sizes": [3, 5, 6],
+                                    "axis": "OH"}])
+        sfs = [o["split_from"] for o in out["ops"]]
+        self.assertEqual([s["tile_oh"] for s in sfs], [3, 5, 6])
+        self.assertEqual([s["tile_offset_OH"] for s in sfs], [0, 3, 8])
+        self.assertEqual([o["shape"]["OH"] for o in out["ops"]], [3, 5, 6])
+
+    def test_tile_tensors_alias_the_parent_at_zero(self):
+        """An OH band is NOT contiguous in NCHW, so unlike an OC tile it gets
+        offset 0 and the codegen scatters. A non-zero offset here would put
+        each tile's channel 0 plane on top of the previous tile's data."""
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, IW=8, OC=16, KH=3, SH=1, PH=1))
+        g["tensors"]["y"] = {"shape": [1, 16, 8, 8], "dtype": "i8"}
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"}])
+        for t in (0, 1):
+            e = out["tensors"][f"y.tile_{t}"]
+            self.assertEqual(e["shape"], [1, 16, 4, 8])   # H narrowed, not C
+            self.assertEqual(e["elem_offset"], 0)
+            self.assertEqual(e["alias_kind"], "row_window")
+
+    def test_oc_split_is_still_the_default_for_a_conv(self):
+        """Every split hint already on disk omits `axis`; they must keep
+        getting OC."""
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, OC=16))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        self.assertEqual(out["ops"][0]["split_from"]["axis"], "OC")
+        self.assertEqual(out["ops"][0]["shape"]["OC"], 8)
+
+    def test_rejects_oh_on_a_kind_with_no_row_window_emitter(self):
+        g = _g(_fused_conv_op(0, "f0", OC=16))
+        with self.assertRaises(SplitHintError) as cm:
+            apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"}])
+        self.assertIn("cannot be split along OH", str(cm.exception))
+
+    def test_rejects_an_unknown_axis(self):
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, OC=16))
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OW"}])
+
+    def test_rejects_a_partition_that_is_not_the_output_height(self):
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, OC=16))     # OH=8
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(g, [{"op": 0, "tile_sizes": [3, 3], "axis": "OH"}])
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(g, [{"op": 0, "n_splits": 3, "axis": "OH"}])
+
+    def test_rejects_dilation(self):
+        """The conv2d_s8 kernel signature has no dilation, so a dilated conv
+        would need a wider window than (tile_oh-1)*SH+KH -- refuse rather than
+        silently understate the halo."""
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, OC=16))
+        g["ops"][0]["shape"]["DH"] = 2
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"}])
+
+    def test_a_bad_hint_leaves_the_graph_untouched(self):
+        """Validation runs over EVERY spec before any op is rewritten."""
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, OC=16),
+               _fused_conv_op(1, "f1", OC=16, inputs=("y",), outputs=("z",)))
+        before = json.dumps(g, sort_keys=True)
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"},
+                                 {"op": 1, "n_splits": 2, "axis": "OH"}])
+        self.assertEqual(json.dumps(g, sort_keys=True), before)
+
+    def test_id_remap_and_depends_on_across_an_oh_split(self):
+        g = _g(_conv2d_oh_op(0, "c0", IH=8, OC=16),
+               _conv2d_oh_op(1, "c1", IH=8, OC=16, inputs=("y",),
+                             outputs=("z",), depends_on=(0,)))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2, "axis": "OH"}])
+        self.assertEqual(out["id_remap"], {"0": [0, 1], "1": [2]})
+        consumer = out["ops"][2]
+        self.assertEqual(consumer["depends_on"], [0, 1])
