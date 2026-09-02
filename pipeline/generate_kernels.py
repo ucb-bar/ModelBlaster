@@ -1450,6 +1450,78 @@ def beam_search_optimize(
 # Top-level driver
 # ---------------------------------------------------------------------------
 
+def curated_seed_for(ir, specs, target, global_curated_dir,
+                     log=None) -> dict[str, tuple[str, str, str]]:
+    """The PRE-SEED baseline: {op: (algorithm_name, path, source)}.
+
+    _verify only ever compares the FINAL model output against the PyTorch
+    golden -- it has no view of intermediates. So the impls dict that
+    surrounds the kernel under test *is* the experiment's control, and
+    seeding it all-reference makes that control wrong: any op whose
+    reference_impl is broken poisons the verdict for every op verified
+    before the good curated kernel for it lands.
+
+    Two filters decide the seed, and BOTH are load-bearing:
+
+    1. ACCURACY CLASS. spec.algorithms order is not the right order here:
+       the seed is the baseline every other op is judged against, so it must
+       be the most ACCURATE kernel available, not the first listed.
+       conv2d_s8 lists gemmini_tiled_conv (numeric_drift, ~2-6 LSB of Q0.31
+       drift) before gemmini_im2col_full_C (bit_exact); seeding the drifting
+       one makes the whole-model baseline drift and every op probed before
+       conv2d_s8 alphabetically inherits it.
+
+    2. ACTIVATION LAYOUT. A kernel that reads a layout this graph's tensors
+       do not declare is not a slower choice, it is a wrong one, and it is
+       size-identical so nothing downstream catches it. This filter was
+       MISSING here for as long as the pre-seed existed, while _probe_swap
+       had it. Measured consequence, dronet/gemmini_q31, MB_DRIFT_ATOL=2,
+       spike: batchnorm2d_s8's lowest-accuracy_class curated file is
+       scalar_chan_lut_nhwc (act_layouts=('nhwc',)) and dronet's graph is
+       30/30 nchw, so it got seeded; add_s8 -- alphabetically first, hence
+       verified against the fresh seed -- then read max_abs_err=67 and fell
+       back to reference_impl, while batchnorm2d_s8 (verified next, after
+       the seed had been replaced by the nchw scalar_chan_lut) read 0.
+       Isolation bisect over the curated set:
+           add + bn_nhwc                    add_s8 FAIL err=67
+           add + bn_nchw                    add_s8 PASS err=0
+           all 11 curated files             add_s8 FAIL err=67
+           all 11 minus the 3 nhwc files    add_s8 PASS err=0
+       i.e. gemmini_resadd is a good kernel that this pass was silently
+       demoting on every regeneration.
+
+    Exposed as a module-level function so the validation suite can assert
+    the layout invariant against the REAL selection logic rather than a
+    copy of it:
+        experiments/kernel_validation/validate_kernels.py --checks seed
+    """
+    _log = log or (lambda _m: None)
+    seed: dict[str, tuple[str, str, str]] = {}
+    if global_curated_dir is None:
+        return seed
+    for spec in specs:
+        cands = sorted(
+            spec.algorithms,
+            key=lambda a: (getattr(a, "accuracy_class", 0) or 0),
+        )
+        for algorithm in cands:
+            fn = f"{target.name}_{spec.op}_{algorithm.name}.c"
+            cp = os.path.join(global_curated_dir, target.name, fn)
+            if not os.path.exists(cp):
+                continue
+            if not act_layout_candidate_ok(ir, spec, algorithm, target):
+                _log(f"  [{spec.op}/{algorithm.name}] not seeded: "
+                     f"act_layouts="
+                     f"{getattr(algorithm, 'act_layouts', ('nchw',))} but "
+                     f"this graph needs "
+                     f"{_act_layout_mod.kernel_layout_for_kind(ir, spec.op, target.name)!r}")
+                continue
+            _assert_curated_layout_contract(spec, algorithm, target, cp)
+            seed[spec.op] = (algorithm.name, cp, open(cp).read())
+            break
+    return seed
+
+
 def generate(
     ir_path: str,
     out_dir: str,
@@ -1800,28 +1872,14 @@ def generate(
         # every op probed before conv2d_s8 alphabetically inherits it --
         # measured as add_s8 on dronet and add_s8 + cat2/cat3/cat4_c1_s8 on
         # yolov8_nano, all of which verify clean on their own.
-        curated_seed: dict[str, tuple[str, str, str]] = {}
-        if global_curated_dir is not None:
-            for spec in specs:
-                _cands = sorted(
-                    spec.algorithms,
-                    key=lambda a: (getattr(a, "accuracy_class", 0) or 0),
-                )
-                for algorithm in _cands:
-                    _fn = f"{target.name}_{spec.op}_{algorithm.name}.c"
-                    _cp = os.path.join(global_curated_dir, target.name, _fn)
-                    if os.path.exists(_cp):
-                        _assert_curated_layout_contract(
-                            spec, algorithm, target, _cp)
-                        curated_seed[spec.op] = (
-                            algorithm.name, _cp, open(_cp).read())
-                        break
-            if curated_seed:
-                for _op, (_algo, _cp, _src) in curated_seed.items():
-                    impls[_op] = _src
-                log(f"  [curated] pre-seeded verify baseline with "
-                    f"{len(curated_seed)} curated kernel(s): "
-                    f"{sorted(curated_seed)}")
+        curated_seed = curated_seed_for(
+            ir, specs, target, global_curated_dir, log=log)
+        if curated_seed:
+            for _op, (_algo, _cp, _src) in curated_seed.items():
+                impls[_op] = _src
+            log(f"  [curated] pre-seeded verify baseline with "
+                f"{len(curated_seed)} curated kernel(s): "
+                f"{sorted(curated_seed)}")
 
         # Per-model LLM cache first (vetted for THIS model by a prior
         # BACKEND=llm run). Files at <cache_dir>/<target>_<op>_<algo>.c
