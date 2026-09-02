@@ -148,13 +148,28 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
     elem_t *const ws_output = ws_output_all[MB_GEM_POOL_WS_SLOT];
     /* Per-channel passthrough weights: +2 for every channel (see the FIX
      * note above -- +1 would silently halve every value through
-     * ACC_SCALE_IDENTITY), init once. Kept SHARED deliberately: every hart
-     * writes the identical constant +2, so the init is idempotent and a
-     * concurrent init cannot produce a value neither hart wrote. Per-slot
-     * copies here would cost memory to remove a race that has no wrong
-     * outcome. */
-    static elem_t ws_weights[MAXPOOL_MAX_CHANNELS] __attribute__((aligned(64)));
-    static int    ws_weights_inited = 0;
+     * ACC_SCALE_IDENTITY), init once.
+     *
+     * These WERE kept shared on 2026-09-02 (448f595) on the argument that
+     * every hart writes the identical constant, so a concurrent init is
+     * idempotent and cannot produce a value neither hart wrote. That is true
+     * of the ARRAY and false of the FLAG. `ws_weights_inited` is a plain int
+     * with no release/acquire pairing, so under RVWMO hart B can observe it
+     * as 1 while some of hart A's `ws_weights[i] = 2` stores are still
+     * invisible to it, skip the init, and mvin the BSS zeros for those
+     * channels -- a wrong output, not a redundant write. The compiler is
+     * equally free to sink the flag store above the array stores.
+     *
+     * One slot per hart removes the cross-hart dependence entirely, and
+     * unlike the two 512 KB image buffers it costs 3 KB. UNMEASURED: the
+     * exposed window is the few cycles between one hart's first-ever maxpool
+     * finishing its init and another hart entering, so no run in this
+     * campaign would be expected to hit it. */
+    static elem_t ws_weights_all[MB_GEM_POOL_WS_SLOTS][MAXPOOL_MAX_CHANNELS]
+        __attribute__((aligned(64)));
+    static int    ws_weights_inited_all[MB_GEM_POOL_WS_SLOTS];
+    elem_t *const ws_weights = ws_weights_all[MB_GEM_POOL_WS_SLOT];
+    int    *const ws_weights_inited = &ws_weights_inited_all[MB_GEM_POOL_WS_SLOT];
 
     int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
     int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
@@ -194,11 +209,11 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
     /* Enable mstatus.XS=Dirty so RoCC custom-3 instructions don't trap. */
     asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
 
-    if (!ws_weights_inited) {
+    if (!*ws_weights_inited) {
         for (int i = 0; i < MAXPOOL_MAX_CHANNELS; i++) {
             ws_weights[i] = 2;
         }
-        ws_weights_inited = 1;
+        *ws_weights_inited = 1;
     }
 
     gemmini_flush(0);
