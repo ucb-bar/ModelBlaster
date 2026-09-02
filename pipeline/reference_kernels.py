@@ -106,6 +106,25 @@ class AlgorithmCandidate:
     # The pipeline asserts all selected algorithms for a given op agree on
     # layout, and _backend_pack_weight applies the matching permutation.
     weight_layout: str = "oihw"
+    # ACTIVATION layouts this algorithm's C code can consume and produce, in
+    # priority order. Default ("nchw",) is what every kernel in the tree assumes
+    # today, so an algorithm that does not mention it is unchanged.
+    #
+    # Distinct from weight_layout above in one way that matters: weights are
+    # permuted per BACKEND at codegen time (_backend_pack_weight), and each
+    # backend gets its own weights.c, so two backends may legitimately disagree.
+    # Activations cannot -- buffers.c is compiled ONCE PER MODEL and shared by
+    # every backend (generate_skeleton.py:112-123), so a tensor has exactly one
+    # physical layout no matter which hart the schedule lands its producer on.
+    #
+    # NCHW and NHWC are also SIZE-IDENTICAL, so a disagreement is not a link
+    # error or a crash -- it is a silently wrong answer. That is why the codegen
+    # gate that reads this is deny-by-default: an op whose layout cannot be
+    # resolved is a SystemExit, never an assumption.
+    #
+    # See docs/IR_TENSOR_LAYOUT_DESIGN.md; this is stage 2, which is inert until
+    # a graph actually carries a non-default tensor layout.
+    act_layouts: tuple[str, ...] = ("nchw",)
 
 
 # The Gemmini backend family, spelled as the EXACT strings the affinity filter
