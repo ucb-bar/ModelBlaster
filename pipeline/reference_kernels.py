@@ -306,6 +306,12 @@ def _relu_s8_argtypes():
     return [i8p, i8p, ctypes.c_int]
 
 
+def _relayout_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, i8p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
 def _conv2d_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -12032,6 +12038,100 @@ void kernel_sdpa(const float *Q, const float *K, const float *V,
 )
 
 
+# ---------------------------------------------------------------------------
+# Activation layout conversion.
+#
+# These exist because the IR keeps activations in NCHW while gemmini wants NHWC,
+# so its curated conv kernel transposes on entry and again on exit. Measured on
+# AWS F2 (rdcycle phase brackets, all-gemmini dronet int8): input transpose
+# 34.3%, gemmini itself 12.8%, output transpose 52.9% -- 87% of "gemmini conv
+# time" is layout conversion. See docs/IR_TENSOR_LAYOUT_DESIGN.md.
+#
+# Making the conversion a first-class op is what lets it be profiled, split and
+# placed like anything else instead of being charged to the conv and immovable.
+# These specs deliberately land BEFORE any layout assignment exists: the ops are
+# verified and profiled while no graph emits them, so the cycles-per-byte curve
+# that every later stage depends on is measured rather than inferred.
+#
+# The pair is exactly invertible, which gives verification an oracle needing no
+# reference model at all: nhwc_to_nchw(nchw_to_nhwc(x)) == x, bit-exact.
+# ---------------------------------------------------------------------------
+
+_RELAYOUT_SHAPES = [
+    # dronet's real activation geometries. C=3 is conv0's input -- the largest
+    # tensor in the model, and the one case where C is not a multiple of 4, so
+    # it is what any widened-store path must fall back from.
+    {"N": 1, "C": 3, "H": 112, "W": 112},
+    {"N": 1, "C": 32, "H": 56, "W": 56},
+    {"N": 1, "C": 32, "H": 27, "W": 27},
+    {"N": 1, "C": 32, "H": 14, "W": 14},
+    {"N": 1, "C": 64, "H": 7, "W": 7},
+    {"N": 1, "C": 128, "H": 4, "W": 4},
+    # degenerate and awkward cases
+    {"N": 1, "C": 1, "H": 1, "W": 1},
+    {"N": 1, "C": 7, "H": 5, "W": 3},
+]
+
+NCHW_TO_NHWC_S8 = KernelSpec(
+    op="nchw_to_nhwc_s8",
+    signature=(
+        "void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int H, int W)"
+    ),
+    semantics=(
+        "Activation layout conversion, int8, no arithmetic -- a pure permutation.\n"
+        "  input:  int8 [N, C, H, W]  (channel-planar)\n"
+        "  output: int8 [N, H, W, C]  (channel-interleaved)\n"
+        "  output[((n*H + h)*W + w)*C + c] = input[((n*C + c)*H + h)*W + w]\n"
+        "Every input element appears exactly once in the output, so the result "
+        "is bit-exact by construction. Buffers do not alias."
+    ),
+    reference_impl="""\
+void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W) {
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W; w++)
+                    output[(((size_t)n * H + h) * W + w) * C + c] =
+                        input[(((size_t)n * C + c) * H + h) * W + w];
+}
+""",
+    extra_shapes=list(_RELAYOUT_SHAPES),
+    argtypes_factory=_relayout_s8_argtypes,
+)
+
+NHWC_TO_NCHW_S8 = KernelSpec(
+    op="nhwc_to_nchw_s8",
+    signature=(
+        "void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int H, int W)"
+    ),
+    semantics=(
+        "Activation layout conversion, int8, no arithmetic -- a pure "
+        "permutation, and the exact inverse of nchw_to_nhwc_s8.\n"
+        "  input:  int8 [N, H, W, C]  (channel-interleaved)\n"
+        "  output: int8 [N, C, H, W]  (channel-planar)\n"
+        "  output[((n*C + c)*H + h)*W + w] = input[((n*H + h)*W + w)*C + c]\n"
+        "C, H and W describe the LOGICAL tensor in both directions, so the same "
+        "(N, C, H, W) round-trips through the pair. Buffers do not alias."
+    ),
+    reference_impl="""\
+void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W) {
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W; w++)
+                    output[(((size_t)n * C + c) * H + h) * W + w] =
+                        input[(((size_t)n * H + h) * W + w) * C + c];
+}
+""",
+    extra_shapes=list(_RELAYOUT_SHAPES),
+    argtypes_factory=_relayout_s8_argtypes,
+)
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     'linear': LINEAR,
     'matmul': MATMUL,
@@ -12071,6 +12171,8 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'sigmoid': SIGMOID,
     'linear_s8': LINEAR_S8,
     'relu_s8': RELU_S8,
+    'nchw_to_nhwc_s8': NCHW_TO_NHWC_S8,
+    'nhwc_to_nchw_s8': NHWC_TO_NCHW_S8,
     'conv2d_s8': CONV2D_S8,
     'conv2d_pool_s8': CONV2D_POOL_S8,
     'conv2d_silu_s8': CONV2D_SILU_S8,
