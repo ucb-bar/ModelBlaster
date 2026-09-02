@@ -1306,7 +1306,8 @@ def split_conv_tile_weights(
     # graph in the repo today) must not pay for -- or depend on -- that.
     tiles = [op for op in ir.get("ops", [])
              if (op.get("split_from") or {}).get("axis") == "OC"
-             and op.get("op") in _OC_SLICEABLE_CONV_OPS]
+             and op.get("op") in _OC_SLICEABLE_CONV_OPS
+             and op.get("op") not in _OIHW_ALWAYS_CONV_OPS]
     if not tiles:
         return {}
     layout = _conv_weight_layout_for_backend(backend)
@@ -1577,6 +1578,19 @@ _OC_SLICEABLE_CONV_OPS = {
 #: The shard path's name for the same set, kept because `shard_conv_weights`
 #: documents itself in those terms.
 _SHARDABLE_CONV_OPS = _OC_SLICEABLE_CONV_OPS
+
+#: Conv kinds whose weights stay OIHW on EVERY backend. An OIHW OC slice is
+#: contiguous, so these tiles take the pointer-offset path into the parent array
+#: rather than a repacked per-tile array -- which is what the call emitter
+#: already does for them, via the per-OP layout query.
+#:
+#: split_conv_tile_weights asks the layout per BACKEND. That agreed with the
+#: call emitter only while every splittable kind shared the backend's layout;
+#: conv2d_f16 (OIHW everywhere, including on gemmini which packs conv2d_s8 as
+#: hwio) broke the coincidence, and the two sides then disagreed: per-tile arrays
+#: were emitted as `<w>_tile_<t>_<backend>` while the call still named the
+#: parent, failing the link with "'..._weights_gemmini_q31' undeclared".
+_OIHW_ALWAYS_CONV_OPS = {"conv2d_f16"}
 
 
 def _conv_shape_of(op: dict[str, Any]) -> dict[str, Any]:
