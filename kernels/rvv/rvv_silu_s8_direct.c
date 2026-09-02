@@ -29,24 +29,47 @@
  *   against golden at all 13 of yolov8_nano's real silu shapes (plus
  *   extra_shapes) is max_abs_err=0.
  *
- *   IMPORTANT CAVEAT, not about this kernel: yolov8_nano's shared
+ *   RETRACTED 2026-09-02 (was: "IMPORTANT CAVEAT ... yolov8_nano's shared
  *   conv2d_s8/rvv_vsmul_vnclip is CONFIRMED BROKEN on real hardware for
- *   this model (coordinator bisect: the oc_blocked algorithm gives err=0,
- *   the untiled vsmul_vnclip gives err=3, and the currently-shipped tiled
- *   vsmul_vnclip causes an outright Store/AMO access fault — see
- *   kernel_opt_log.jsonl ids 37/904 and the conv owner's own log). That is
- *   almost certainly why this same FPGA run's whole-model self-check read
- *   max_abs_err=1 instead of 0, and why two attempts to run the STOCK
- *   silu_s8 baseline for comparison (same conv) each hung on real FPGA
- *   hardware without reaching HTIF exit (id 902) rather than completing.
- *   ids 702/704 already showed reverting add_s8 or cat*_c1_s8 alone (not
- *   silu, not conv) also zeroes this class of error against a frozen
- *   buggy base, so per-instruction it is not attributable to this file.
- *   Per the coordinator's explicit instruction, NO yolov8_nano figure is
- *   being banked as a validated result until the conv owner lands a fix
- *   and this gets re-measured on a clean rebuild — that includes the
- *   3.1x/5.53-cyc/elem numbers above, which are the best currently
- *   available evidence but not yet a clean-conv confirmation. */
+ *   this model", citing a 3-way bisect — oc_blocked err=0, untiled
+ *   vsmul_vnclip err=3, tiled vsmul_vnclip Store/AMO access fault,
+ *   kernel_opt_log ids 37/904 — and concluding that the FPGA run's
+ *   whole-model err=1 was "almost certainly" the conv's fault, with no
+ *   yolov8_nano figure to be banked until the conv was fixed).
+ *
+ *   WHY IT IS RETRACTED. That claim was measured on 2026-08-28 against the
+ *   file as it then stood. kernels/rvv/rvv_conv2d_s8_rvv_vsmul_vnclip.c was
+ *   REWRITTEN the same week (d201114, then e2304da "shape-conditional 1x1
+ *   iGEMM dispatch"): the rvv_vsmul_vnclip *algorithm* is retired, and the
+ *   file now carries a shape-conditional tiled-direct / iGEMM production
+ *   conv under that name — see that file's own header, which identifies the
+ *   original hardware fault as 32-bit index arithmetic wrapping for BSS
+ *   buffers above 0x80000000, not anything about this kernel. The claim
+ *   above was left pointing at an algorithm NAME whose implementation had
+ *   changed underneath it, and it caused a wrong attribution.
+ *
+ *   WHAT REPLACES IT (measured, 2026-09-02):
+ *     * spike, per-op curated verify at all of yolov8_nano's real conv
+ *       shapes with MB_DRIFT_ATOL=2: conv2d_s8/rvv_vsmul_vnclip PASS,
+ *       max_abs_err=0, and it is the selected pick. Same result on
+ *       dronet/rvv. Reproduce:
+ *         experiments/kernel_validation/validate_kernels.py --tier1 \
+ *             --nets yolov8_nano --backends rvv
+ *       log: experiments/kernel_validation/results/regen_yolov8_nano_rvv.log
+ *     * FPGA (coordinator's measurement, not re-run here): yolov8_nano rvv
+ *       reads max_abs_err=0 both unsplit-1-hart and unsplit-2-hart.
+ *
+ *   WHAT IS STILL OPEN. yolov8_nano's rvv PAIR arms read max_abs_err=1.
+ *   That defect is UNATTRIBUTED. Three candidates have since been cleared
+ *   for it and should not be re-investigated: this kernel's memo LUT (all
+ *   three rvv-pair arms run 57 silu calls with ZERO concurrent on different
+ *   harts — racy but never exercised concurrently), the OH row-tile helper
+ *   (its scratch is passed per dispatch, nothing shared), and the conv
+ *   itself (zero mutable statics; and the shardec arm has byte-identical
+ *   conv split args yet reads 0, so the effect is order-dependent). The
+ *   3.1x / 5.53-cyc-per-element figures above are still single-run FPGA
+ *   numbers from the pre-fix conv and have NOT been re-measured on a clean
+ *   rebuild. */
 
 /* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
  * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
