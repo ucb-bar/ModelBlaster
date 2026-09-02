@@ -12099,6 +12099,141 @@ void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
 """,
     extra_shapes=list(_RELAYOUT_SHAPES),
     argtypes_factory=_relayout_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name='gemmini_blocked_tb32',
+            target_affinity=('gemmini', 'gemmini_q31', 'gemmini_q31_rvv'),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Blocked scalar transpose, TB=32 on the spatial axis. LIFTED "
+                "verbatim from the input-transpose phase of "
+                "kernels/gemmini/gemmini_conv2d_s8_gemmini_tiled_conv.c, where "
+                "the same nest already runs inside every gemmini conv; this is "
+                "code motion, not new tuning. The read side walks one channel "
+                "plane contiguously and the write side walks with stride C, so "
+                "the blocking exists to bound the live write window to TB*C bytes "
+                "(4 KB at C=128) and keep it in L1 -- that kernel's own comment "
+                "records that removing the blocking cost conv0 46%. Pure scalar "
+                "C: a permutation does no arithmetic, so nothing here touches the "
+                "Gemmini RoCC. It lives on this backend because harts 0/1 are "
+                "where the accelerator is, and they have no vector unit."
+            ),
+            reference_impl="""\
+void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const int TB = 32;
+    const int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        const int8_t *inb = input  + (size_t)n * C * HW;
+        int8_t       *ob  = output + (size_t)n * HW * C;
+        for (int p0 = 0; p0 < HW; p0 += TB) {
+            int pn = HW - p0 < TB ? HW - p0 : TB;
+            for (int c0 = 0; c0 < C; c0 += TB) {
+                int cn = C - c0 < TB ? C - c0 : TB;
+                for (int c = 0; c < cn; c++) {
+                        const int8_t *s = inb + (size_t)(c0 + c) * HW + p0;
+                        int8_t       *d = ob  + (size_t)p0 * C + (c0 + c);
+                        for (int p = 0; p < pn; p++) d[(size_t)p * C] = s[p];
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name='rvv_strided',
+            target_affinity=('rvv',),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "The same blocked nest with the innermost loop replaced by one "
+                "vector memory op: contiguous vle8/vse8 on the planar side, "
+                "vlse8/vsse8 at byte-stride C on the interleaved side. e8m1 "
+                "deliberately, not a wider LMUL -- LMUL sets the spatial block, "
+                "and the spatial block IS the blocking factor the scalar version "
+                "tuned to 32. At Saturn's VLEN=256, e8m1 gives VLMAX=32, so this "
+                "kernel and the scalar one have the same access order and the "
+                "same working set, and the measured difference between them is "
+                "the vector unit and nothing else."
+            ),
+            reference_impl="""\
+void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const size_t HW = (size_t)H * (size_t)W;
+    for (int n = 0; n < N; n++) {
+        const int8_t *ib = input  + (size_t)n * (size_t)C * HW;
+        int8_t       *ob = output + (size_t)n * HW * (size_t)C;
+        for (size_t p0 = 0; p0 < HW; ) {
+            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
+            for (int c = 0; c < C; c++) {
+                vint8m1_t v = __riscv_vle8_v_i8m1(ib + (size_t)c * HW + p0, vl);
+                __riscv_vsse8_v_i8m1(ob + p0 * (size_t)C + (size_t)c,
+                                     (ptrdiff_t)C, v, vl);
+            }
+            p0 += vl;
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name='rvv_seg',
+            target_affinity=('rvv',),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV segment load/store (vlseg/vsseg and their strided forms, "
+                "NF=2..8) -- the ISA's native AoS<->SoA family, which is exactly "
+                "what NCHW<->NHWC is. Nothing in this tree used a segment op "
+                "before this algorithm. The channel axis is chopped into groups: "
+                "C in 2..8 is ONE unit-stride vsseg<C>e8 over the whole tensor, "
+                "C>8 is floor(C/8) passes of vssseg8e8 at byte-stride C plus one "
+                "pass at NF = C mod 8, and C==1 degenerates to a plain strided "
+                "op. Because NF is legal for every value in 2..8 rather than only "
+                "powers of two, C=3 -- conv0's input, the largest activation in "
+                "dronet -- is a single vsseg3e8 on the FAST path rather than a "
+                "2+1 fallback. NF*LMUL<=8 forces LMUL=1 at NF=8, and holding "
+                "LMUL=1 throughout is what keeps this comparable to rvv_strided. "
+                "The seed below is the general vssseg8 arm; the curated kernel "
+                "adds the per-NF unit-stride specialisation and the NF=2..7 tail."
+            ),
+            reference_impl="""\
+void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const size_t HW = (size_t)H * (size_t)W;
+    const ptrdiff_t bs = (ptrdiff_t)C;
+    for (int n = 0; n < N; n++) {
+        const int8_t *ib = input  + (size_t)n * (size_t)C * HW;
+        int8_t       *ob = output + (size_t)n * HW * (size_t)C;
+        for (size_t p0 = 0; p0 < HW; ) {
+            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
+            int8_t *dp = ob + p0 * (size_t)C;
+            int c0 = 0;
+            for (; C - c0 >= 8; c0 += 8) {
+                vint8m1x8_t t = __riscv_vcreate_v_i8m1x8(
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+0) * HW + p0, vl),
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+1) * HW + p0, vl),
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+2) * HW + p0, vl),
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+3) * HW + p0, vl),
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+4) * HW + p0, vl),
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+5) * HW + p0, vl),
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+6) * HW + p0, vl),
+                    __riscv_vle8_v_i8m1(ib + (size_t)(c0+7) * HW + p0, vl));
+                __riscv_vssseg8e8_v_i8m1x8(dp + c0, bs, t, vl);
+            }
+            /* Tail: the curated kernel uses a single vssseg<C-c0>e8 here. */
+            for (; c0 < C; c0++)
+                __riscv_vsse8_v_i8m1(dp + c0, bs,
+                    __riscv_vle8_v_i8m1(ib + (size_t)c0 * HW + p0, vl), vl);
+            p0 += vl;
+        }
+    }
+}
+""",
+        ),
+    ],
 )
 
 NHWC_TO_NCHW_S8 = KernelSpec(
@@ -12129,6 +12264,148 @@ void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
 """,
     extra_shapes=list(_RELAYOUT_SHAPES),
     argtypes_factory=_relayout_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name='gemmini_blocked_tb32',
+            target_affinity=('gemmini', 'gemmini_q31', 'gemmini_q31_rvv'),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Blocked scalar transpose, TB=32 on the spatial axis. LIFTED "
+                "verbatim from the input-transpose phase of "
+                "kernels/gemmini/gemmini_conv2d_s8_gemmini_tiled_conv.c, where "
+                "the same nest already runs inside every gemmini conv; this is "
+                "code motion, not new tuning. The read side walks one channel "
+                "plane contiguously and the write side walks with stride C, so "
+                "the blocking exists to bound the live write window to TB*C bytes "
+                "(4 KB at C=128) and keep it in L1 -- that kernel's own comment "
+                "records that removing the blocking cost conv0 46%. Pure scalar "
+                "C: a permutation does no arithmetic, so nothing here touches the "
+                "Gemmini RoCC. It lives on this backend because harts 0/1 are "
+                "where the accelerator is, and they have no vector unit."
+            ),
+            reference_impl="""\
+void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const int TB = 32;
+    const int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        const int8_t *inb = input  + (size_t)n * HW * C;
+        int8_t       *ob  = output + (size_t)n * C * HW;
+        for (int p0 = 0; p0 < HW; p0 += TB) {
+            int pn = HW - p0 < TB ? HW - p0 : TB;
+            for (int c0 = 0; c0 < C; c0 += TB) {
+                int cn = C - c0 < TB ? C - c0 : TB;
+                for (int c = 0; c < cn; c++) {
+                        int8_t       *d = ob  + (size_t)(c0 + c) * HW + p0;
+                        const int8_t *s = inb + (size_t)p0 * C + (c0 + c);
+                        for (int p = 0; p < pn; p++) d[p] = s[(size_t)p * C];
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name='rvv_strided',
+            target_affinity=('rvv',),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "The same blocked nest with the innermost loop replaced by one "
+                "vector memory op: contiguous vle8/vse8 on the planar side, "
+                "vlse8/vsse8 at byte-stride C on the interleaved side. e8m1 "
+                "deliberately, not a wider LMUL -- LMUL sets the spatial block, "
+                "and the spatial block IS the blocking factor the scalar version "
+                "tuned to 32. At Saturn's VLEN=256, e8m1 gives VLMAX=32, so this "
+                "kernel and the scalar one have the same access order and the "
+                "same working set, and the measured difference between them is "
+                "the vector unit and nothing else."
+            ),
+            reference_impl="""\
+void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const size_t HW = (size_t)H * (size_t)W;
+    for (int n = 0; n < N; n++) {
+        const int8_t *ib = input  + (size_t)n * HW * (size_t)C;
+        int8_t       *ob = output + (size_t)n * (size_t)C * HW;
+        for (size_t p0 = 0; p0 < HW; ) {
+            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
+            for (int c = 0; c < C; c++) {
+                vint8m1_t v = __riscv_vlse8_v_i8m1(
+                        ib + p0 * (size_t)C + (size_t)c, (ptrdiff_t)C, vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)c * HW + p0, v, vl);
+            }
+            p0 += vl;
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name='rvv_seg',
+            target_affinity=('rvv',),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV segment load/store (vlseg/vsseg and their strided forms, "
+                "NF=2..8) -- the ISA's native AoS<->SoA family, which is exactly "
+                "what NCHW<->NHWC is. Nothing in this tree used a segment op "
+                "before this algorithm. The channel axis is chopped into groups: "
+                "C in 2..8 is ONE unit-stride vsseg<C>e8 over the whole tensor, "
+                "C>8 is floor(C/8) passes of vssseg8e8 at byte-stride C plus one "
+                "pass at NF = C mod 8, and C==1 degenerates to a plain strided "
+                "op. Because NF is legal for every value in 2..8 rather than only "
+                "powers of two, C=3 -- conv0's input, the largest activation in "
+                "dronet -- is a single vsseg3e8 on the FAST path rather than a "
+                "2+1 fallback. NF*LMUL<=8 forces LMUL=1 at NF=8, and holding "
+                "LMUL=1 throughout is what keeps this comparable to rvv_strided. "
+                "The seed below is the general vssseg8 arm; the curated kernel "
+                "adds the per-NF unit-stride specialisation and the NF=2..7 tail."
+            ),
+            reference_impl="""\
+void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const size_t HW = (size_t)H * (size_t)W;
+    const ptrdiff_t bs = (ptrdiff_t)C;
+    for (int n = 0; n < N; n++) {
+        const int8_t *ib = input  + (size_t)n * HW * (size_t)C;
+        int8_t       *ob = output + (size_t)n * (size_t)C * HW;
+        for (size_t p0 = 0; p0 < HW; ) {
+            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
+            const int8_t *sp = ib + p0 * (size_t)C;
+            int c0 = 0;
+            for (; C - c0 >= 8; c0 += 8) {
+                vint8m1x8_t t = __riscv_vlsseg8e8_v_i8m1x8(sp + c0, bs, vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+0) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 0), vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+1) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 1), vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+2) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 2), vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+3) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 3), vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+4) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 4), vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+5) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 5), vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+6) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 6), vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)(c0+7) * HW + p0,
+                                    __riscv_vget_v_i8m1x8_i8m1(t, 7), vl);
+            }
+            /* Tail: the curated kernel uses a single vlsseg<C-c0>e8 here. */
+            for (; c0 < C; c0++)
+                __riscv_vse8_v_i8m1(ob + (size_t)c0 * HW + p0,
+                    __riscv_vlse8_v_i8m1(sp + c0, bs, vl), vl);
+            p0 += vl;
+        }
+    }
+}
+""",
+        ),
+    ],
 )
 
 
