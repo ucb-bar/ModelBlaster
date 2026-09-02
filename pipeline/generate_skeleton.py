@@ -139,7 +139,7 @@ _PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 #: kind to apply_split_hint._SPLITTABLE without adding it here yields a build
 #: that succeeds and computes garbage: every tile would write at offset 0 and
 #: read weight row 0.
-_N_SLICEABLE_LINEAR_OPS = {"linear_s8", "linear"}
+_N_SLICEABLE_LINEAR_OPS = {"linear_s8", "linear", "linear_f16"}
 
 #: Conv kinds that can be emitted as an OH (output ROW) split tile. See
 #: `_emit_oh_tile_helper` for what that emission does and
@@ -1565,6 +1565,13 @@ _OC_SLICEABLE_CONV_OPS = {
     "conv2d_s8",
     "conv2d_batchnorm2d_s8",
     "conv2d_batchnorm2d_silu_s8",
+    # conv2d_f16: same operand shape as conv2d_s8 (input, weight, bias, output,
+    # N, IC, ...), no per-channel array, and _conv_weight_layout_for_op returns
+    # None for it on every backend -- i.e. plain OIHW, where an OC slice IS
+    # contiguous, so the `weight + t*tile_oc*IC*KH*KW` pointer offset is exactly
+    # right. conv2d_s8_pc is deliberately absent: it carries per-output-channel
+    # scales and nothing here slices a scale.
+    "conv2d_f16",
 }
 
 #: The shard path's name for the same set, kept because `shard_conv_weights`

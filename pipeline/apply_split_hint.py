@@ -431,7 +431,14 @@ _SPLITTABLE: dict[str, Any] = {
     # split but missing from _N_SLICEABLE_LINEAR_OPS there builds cleanly and
     # computes garbage (every tile writes at offset 0 and reads weight row 0).
     "linear": _split_linear_s8,
+    # fp16 kinds ride the same shape-only splitters. Safe for exactly the
+    # reasons spelled out above _SPLITTABLE_BY_AXIS, and the codegen half of the
+    # registration is done too: conv2d_f16 is in _OC_SLICEABLE_CONV_OPS and
+    # linear_f16 in _N_SLICEABLE_LINEAR_OPS in generate_skeleton, which is what
+    # the NOTE above warns is required and not optional.
+    "linear_f16": _split_linear_s8,
     "conv2d_s8": _split_conv2d_s8,
+    "conv2d_f16": _split_conv2d_s8,
     "conv2d_batchnorm2d_s8": _split_fused_conv_s8,
     "conv2d_batchnorm2d_silu_s8": _split_fused_conv_s8,
 }
@@ -445,7 +452,9 @@ _SPLITTABLE: dict[str, Any] = {
 _DEFAULT_AXIS: dict[str, str] = {
     "linear_s8": "N",
     "linear": "N",
+    "linear_f16": "N",
     "conv2d_s8": "OC",
+    "conv2d_f16": "OC",
     "conv2d_batchnorm2d_s8": "OC",
     "conv2d_batchnorm2d_silu_s8": "OC",
 }
@@ -457,9 +466,30 @@ _DEFAULT_AXIS: dict[str, str] = {
 #: emitter -- and a kind registered here without one in generate_skeleton is
 #: exactly the "builds cleanly, computes garbage" failure that
 #: `_N_SLICEABLE_LINEAR_OPS` warns about.
+# conv2d_f16 / linear_f16 are registered against the SAME splitters as their s8
+# counterparts because the splitters are shape-only -- they set shape["OC"] (or
+# ["N"]) and record split_from; no operand is touched, and
+# generate_skeleton.split_conv_tile_weights selects tiles by
+# `split_from.axis == "OC"` rather than by op kind. Two things make this safe
+# for f16 specifically and NOT for the _pc kinds:
+#
+#   * conv2d_f16's signature is (input, weight, bias, output, N, IC, ...) --
+#     structurally identical to conv2d_s8, with no per-channel array.
+#   * _conv_weight_layout_for_op("conv2d_f16", <any backend>) is None, i.e.
+#     plain OIHW, where an OC slice IS contiguous.
+#
+# conv2d_s8_pc and linear_s8_pc are deliberately NOT registered. They carry
+# per-output-channel scale arrays, and nothing in split_conv_tile_weights slices
+# a scale -- it handles weight and bias only. A _pc tile would therefore index
+# the PARENT's full scale vector from 0 and apply the wrong scale to every
+# channel past the first tile: numerically wrong, size-identical, and silent.
+# Registering them needs per-channel slicing plus a test that catches exactly
+# that, first. See the log entry `sweep3net_vint_not_shardable`.
 _SPLITTABLE_BY_AXIS: dict[str, dict[str, Any]] = {
-    "N": {"linear_s8": _split_linear_s8, "linear": _split_linear_s8},
+    "N": {"linear_s8": _split_linear_s8, "linear": _split_linear_s8,
+          "linear_f16": _split_linear_s8},
     "OC": {"conv2d_s8": _split_conv2d_s8,
+           "conv2d_f16": _split_conv2d_s8,
            "conv2d_batchnorm2d_s8": _split_fused_conv_s8,
            "conv2d_batchnorm2d_silu_s8": _split_fused_conv_s8},
     "OH": {"conv2d_s8": _split_conv2d_s8_oh},
