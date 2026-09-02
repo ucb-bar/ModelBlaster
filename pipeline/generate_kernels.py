@@ -23,11 +23,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 from typing import Optional
 
 from modelblaster.pipeline import backends as backends_mod
 from modelblaster.pipeline.backends import (
-    Backend, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
+    Backend, VERIFY_CROSS_COMPILE, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
 )
 from modelblaster.pipeline.bedrock_client import extract_code_block
 from modelblaster.pipeline.llm_client import LLMClient, make_llm_client
@@ -391,6 +393,114 @@ LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
 # Verify routing — backend dictates host_ctypes vs spike_harness
 # ---------------------------------------------------------------------------
 
+#: Backends whose whole point is a vector unit. A curated kernel for one of
+#: these that contains no vector instruction is a mistake, not a style.
+_VECTOR_BACKENDS = {"rvv", "rvv_x60", "rvv_f16", "rvv_opu", "ime"}
+
+
+def _count_vector_insns(obj_path: str, cross: str) -> int:
+    """How many RVV instructions an object file actually contains.
+
+    Reads the OBJECT, not the source: an intrinsic can appear in the C and be
+    optimised away, and `.insn`-encoded instructions (IME's vmadot) never look
+    like intrinsics in the first place. Returns -1 when objdump is unavailable,
+    which callers must treat as "unknown", never as zero.
+    """
+    objdump = f"{cross}objdump"
+    if shutil.which(objdump) is None:
+        return -1
+    proc = subprocess.run([objdump, "-d", obj_path], capture_output=True,
+                          text=True)
+    if proc.returncode != 0:
+        return -1
+    n = 0
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        mnemonic = parts[2].split()[0] if parts[2].split() else ""
+        # vsetvli alone does not make a kernel vector code; it is the data
+        # instructions that count. `.insn`-encoded customs disassemble as
+        # `.insn` or an unknown mnemonic, so count those too.
+        if mnemonic.startswith("v") and not mnemonic.startswith("vsetvl"):
+            n += 1
+        elif mnemonic.startswith(".insn"):
+            n += 1
+    return n
+
+
+def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
+                         repo_root: Optional[str]) -> VerifyResult:
+    """Compile the candidate for the target ISA. Do not run it.
+
+    For a backend whose intrinsics the host cannot compile and whose ISA no
+    available simulator runs usefully, this is the strongest check that can be
+    made off the board. It catches every error the compiler can see -- unknown
+    vector types, misspelled intrinsics, an LMUL that does not match the
+    element width, a widening op under the wrong vtype -- which is the bulk of
+    what an LLM gets wrong about RVV.
+
+    IT DOES NOT CHECK NUMERICS, and the caller must not report that it does.
+    The kernel is correct when the on-board golden compare says so.
+
+    The alternative in place until now was to declare `host_ctypes`, whose
+    x86 `cc` cannot parse `vint8m1_t` at all: every candidate "failed", the
+    retry budget was spent, and the generator emitted the scalar seed under a
+    vector target's name.
+    """
+    cross = os.environ.get("CROSS", "")
+    cc = f"{cross}gcc" if cross else None
+    if not cc or shutil.which(cc) is None:
+        return VerifyResult(
+            False,
+            "cross-compile verify needs a target toolchain: set CROSS to a "
+            "riscv64 prefix (`eval \"$(scripts/setup_spacemit_toolchain.sh)\"`). "
+            "Refusing to accept an unbuilt kernel.")
+
+    flags = list(backend.resolved_kernel_cflags(repo_root or "."))
+    includes = "\n".join(f"#include {inc}" for inc in backend.kernel_includes)
+    src = (f"#include <stddef.h>\n#include <stdint.h>\n#include <math.h>\n"
+           f"{includes}\n\n{candidate}\n")
+
+    with tempfile.TemporaryDirectory(prefix="xverify_") as d:
+        cpath = os.path.join(d, f"cand_{spec.op}.c")
+        with open(cpath, "w") as f:
+            f.write(src)
+        cmd = [cc, "-O2", "-c", cpath, "-o", os.path.join(d, "cand.o")] + flags
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return VerifyResult(
+                False,
+                "candidate failed to cross-compile for "
+                f"{backend.name}:\n  cmd: {' '.join(cmd)}\n"
+                f"  stderr:\n{proc.stderr}")
+
+        # A "vector" kernel that compiled to no vector instructions is the
+        # same class of silent failure as the seed fallback, one level up:
+        # it builds, it verifies, it is bit-exact, and it is scalar. It
+        # happened -- asking for the generic `direct` algorithm on this
+        # backend produced four transformer kernels with zero intrinsics
+        # between them, each of which would have been committed as a curated
+        # RVV kernel. The object file settles it; the source does not, since
+        # an intrinsic can be present and optimised away.
+        if _VECTOR_BACKENDS.intersection(backends_mod.backend_lineage(
+                backend.name)):
+            vec = _count_vector_insns(os.path.join(d, "cand.o"), cross)
+            if vec == 0:
+                return VerifyResult(
+                    False,
+                    f"candidate compiled for {backend.name} but emitted NO "
+                    f"vector instructions -- it is scalar code wearing a "
+                    f"vector target's name. Use the RVV intrinsics "
+                    f"(__riscv_vsetvl_*, vle8/vwmul/vredsum ...); a kernel "
+                    f"that only happens to build is not a port.")
+
+    return VerifyResult(
+        True,
+        f"cross-compiled for {backend.name}; NOT executed -- numeric "
+        f"correctness is established by the on-board golden compare")
+
+
 def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
     """Cheap lexical check that the candidate contains the expected function
     signature (whitespace-insensitive, parameter names included). Searches
@@ -398,8 +508,22 @@ def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
     pass. Catches LLM mistakes like reordering ints before we burn a Zephyr
     build / spike run on it.
     """
-    cand_norm = " ".join(candidate.split())
-    sig_norm = " ".join(spec.signature.split())
+    # Collapse whitespace, then drop the purely cosmetic spaces that C
+    # formatting puts next to the parameter-list parens. WITHOUT THE SECOND
+    # STEP this check rejects any kernel written in Allman style: a newline
+    # straight after `kernel_foo(` normalises to `( const ...`, while the
+    # spec's signature is `(const ...`, and the two never match. Two curated
+    # RVV convolutions are written that way -- they compile, link, and pass
+    # the on-board golden compare -- so rejecting them would have silently
+    # dropped DroNet and YOLOv8 onto the scalar reference. Brace and paren
+    # placement is not an error class worth failing on; parameter names and
+    # order, which this still checks exactly, are.
+    def _norm(text: str) -> str:
+        t = " ".join(text.split())
+        return t.replace("( ", "(").replace(" )", ")")
+
+    cand_norm = _norm(candidate)
+    sig_norm = _norm(spec.signature)
     if (
         (sig_norm + " {") in cand_norm
         or (sig_norm + "{") in cand_norm
@@ -419,6 +543,18 @@ def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
 # slow verify path which still works; the goal is just to fail FAST when
 # Llama is obviously not following the algorithm.
 _ALGORITHM_REQUIRED_SUBSTRINGS: dict[str, tuple[str, ...]] = {
+    # rvv_memo_lut_gather: must actually build a table and GATHER from it.
+    #
+    # Without this gate the model writes a plausible-looking hybrid instead --
+    # vector loads, then a scalar loop calling the transcendental per element,
+    # then vector stores. It passed cross-compile, emitted plenty of vector
+    # instructions, and even measured max_abs_err=0 on the board. It was still
+    # wrong: it called `cosf`/`roundf` where the reference uses `cos`/`round`
+    # in DOUBLE, so its bit-exactness was a property of the test data rather
+    # than of the kernel. The whole point of the LUT is that the reference
+    # expression is evaluated verbatim, at most 256 times, and never
+    # approximated -- so require the table and the gather that reads it.
+    "rvv_memo_lut_gather": ("table", "vluxei8"),
     # im2col_gemm: must allocate and populate the im2col buffer.
     "im2col_gemm": ("im2col_buf",),
     # oc_blocked: must have an outer OC tile loop. Looking for the
@@ -504,6 +640,9 @@ def _verify(
 
     if backend.verify_method == VERIFY_HOST_CTYPES:
         return host_verify(spec, candidate, shapes)
+
+    if backend.verify_method == VERIFY_CROSS_COMPILE:
+        return cross_compile_verify(spec, candidate, backend, repo_root)
 
     if backend.verify_method == VERIFY_SPIKE_HARNESS:
         # Build the full harness with this candidate substituted, run on
@@ -1155,6 +1294,10 @@ def generate(
     global_curated_dir: Optional[str] = None,
     max_accuracy_class: Optional[AccuracyClass] = None,
     quant: str = "fp32",
+    # Op kinds that must KEEP the portable reference implementation even when
+    # a curated kernel exists for them. The consumer of XPU-RT's
+    # `choose_implementation` advice -- see `keep_reference_ops` below.
+    keep_reference_ops: Optional[set[str]] = None,
     # Opt-in: after the spike beam search picks a best, re-rank the
     # top-K spike survivors on FireSim RTL. The cache slot is replaced
     # with the firesim-best only if the firesim cycles drop by >=
@@ -1263,9 +1406,33 @@ def generate(
         # If verify fails, fall back to spec.reference_impl with a warning
         # so the e2e build proceeds. Set MODELBLASTER_CURATED_VERIFY=0 to
         # skip (one extra spike build per curated kernel takes ~10-30s).
+        # Normalised once: a None default and a caller passing a list both
+        # have to behave the same at the probe site.
+        pinned_to_reference = set(keep_reference_ops or ())
+        unknown_pins = pinned_to_reference - {sp.op for sp in specs}
+        if unknown_pins:
+            log(f"  keep_reference_ops names op kind(s) this model does not "
+                f"contain: {sorted(unknown_pins)} -- check the advice was "
+                f"generated from this graph")
+        # Curated kernels get verified too, when a verifier is available that
+        # does not need a simulator harness.
+        #
+        # THIS USED TO REQUIRE `needs_harness_paths`, which is true only for
+        # spike-harness backends or --optimize. So on rvv_x60 and ime_x60 --
+        # the two backends every K1 profile is taken on -- a curated kernel was
+        # swapped in and measured with NO verification of any kind. The build
+        # log said "reference + curated[rvv] swap from ..." and nothing else.
+        # A curated file that had drifted, or that compiled to scalar code,
+        # would have been profiled and reported as a vector measurement.
+        #
+        # Cross-compile verify needs no harness, so there is no reason to skip
+        # it: it re-checks the signature, the algorithm structure, that the
+        # kernel builds for the target ISA, and that it emitted vector
+        # instructions at all.
         curated_verify = (
             os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
-            and needs_harness_paths
+            and (needs_harness_paths
+                 or target.verify_method == VERIFY_CROSS_COMPILE)
         )
 
         def _probe_swap(source_label: str, dir_path: Optional[str],
@@ -1290,6 +1457,27 @@ def generate(
             if dir_path is None:
                 return
             for spec in specs:
+                if spec.op in pinned_to_reference:
+                    # THE CONSUMER OF `choose_implementation`. XPU-RT measures
+                    # per dispatch that some other implementation is faster;
+                    # for a curated-vs-reference comparison the actionable form
+                    # is "stop swapping the curated kernel in for this op".
+                    # Measured on the board, yolov8_nano rvv_x60:
+                    #   maxpool2d_s8 N1xC128xIH5xIW5xKH5xKW5
+                    #   curated[rvv]/direct 502us vs scalar build 394us (-21.5%)
+                    #
+                    # WHAT THIS DOES NOT PROMISE. The 394us was measured in a
+                    # `scalar` BUILD -- the same reference C compiled with
+                    # `-march=rv64gc`. Kept here it is compiled with the rvv
+                    # build's flags, so the compiler may auto-vectorise it
+                    # differently and the time is not the advised one. The
+                    # mechanism transfers; the number does not, and has to be
+                    # re-measured like any other rung.
+                    kernel_picks.setdefault(spec.op, {})
+                    kernel_picks[spec.op]["pinned_to_reference"] = True
+                    log(f"  [{spec.op}] pinned to reference by "
+                        f"keep_reference_ops; not probing {source_label}")
+                    continue
                 if kernel_picks.get(spec.op, {}).get("source") not in (
                         None, "reference"):
                     # Already swapped by an earlier source (cache beats
@@ -1755,6 +1943,14 @@ def main() -> None:
                     help="reuse PASSing kernels from this dir across runs "
                          "(saves <target>_<op>_<algo>.c on success, "
                          "reverifies on hit)")
+    ap.add_argument("--keep-reference-ops", default=None,
+                    help="comma-separated op kinds that must keep the portable "
+                         "reference kernel even where a curated one exists. "
+                         "This is how XPU-RT's `choose_implementation` advice "
+                         "is applied: `scripts/advice_to_kernel_choice.py` "
+                         "turns the advice into this list. The advised timing "
+                         "was measured in a different BUILD, so the change has "
+                         "to be re-profiled, not assumed.")
     ap.add_argument("--algorithms", default="all",
                     help=("comma-separated algorithm names to try (in order) "
                           "for each op, or 'all' (default) to try every "
@@ -1827,6 +2023,10 @@ def main() -> None:
             if args.max_accuracy_class else None
         ),
         quant=args.quant,
+        keep_reference_ops=(
+            {o.strip() for o in args.keep_reference_ops.split(",") if o.strip()}
+            if args.keep_reference_ops else None
+        ),
         firesim_eval=args.firesim_eval,
         firesim_top_k=args.firesim_top_k,
         cache_aware_prompt=args.cache_aware_prompt,

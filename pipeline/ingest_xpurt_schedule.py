@@ -62,7 +62,14 @@ class XpurtEntry:
     name: str                   # echo from IR (e.g. "mlp.0")
     core_name: str              # registry core name (e.g. "rvv0" or "rocket0")
     core_kind: str              # registry kind (e.g. "rvv", "scalar")
+    impl: str                   # kernel implementation to invoke for THIS
+                                # dispatch ("rvv" / "ime" / ...). Defaults to
+                                # core_kind, which is what every schedule
+                                # written before `scheduler.enable_impls`
+                                # existed means. See `load()`.
     hart: int                   # preferred hart (from registry); -1 if unbound
+    harts: tuple[int, ...]      # every hart reserved by hardware_target;
+                                # first element is the dispatch-owning master
     start_time_ms: float
     duration_ms: float
     deps_entry_ids: tuple[int, ...]   # in-table entry_ids of intra-job deps
@@ -139,6 +146,42 @@ def _resolve_target(core_label: str,
     c = candidates[idx]
     hart = c.harts[0] if c.harts else -1
     return c.name, c.kind, hart
+
+
+def _resolve_targets(core_labels: str,
+                     cpu_p_kind: str, cpu_e_kind: str,
+                     reg: core_registry.CoreRegistry,
+                     ) -> tuple[str, str, int, tuple[int, ...]]:
+    """Resolve a singleton or ``+``-joined XPU-RT machine combination.
+
+    The first target owns the dispatch and participates as shard 0.  Remaining
+    targets are the helper harts reserved for the dispatch's whole execution
+    window.  A ModelBlaster pool is homogeneous, so a combination that crosses
+    runtime kinds is rejected instead of being flattened into a false pool.
+    """
+    labels = [x.strip() for x in str(core_labels).split("+") if x.strip()]
+    if not labels:
+        raise ValueError(f"empty hardware_target {core_labels!r}")
+    resolved = [
+        _resolve_target(label, cpu_p_kind, cpu_e_kind, reg)
+        for label in labels
+    ]
+    kinds = {kind for _name, kind, _hart in resolved}
+    if len(kinds) != 1:
+        raise ValueError(
+            f"composite target {core_labels!r} must use the same runtime kind; "
+            f"resolved kinds are {sorted(kinds)}")
+    harts = tuple(hart for _name, _kind, hart in resolved)
+    if len(set(harts)) != len(harts):
+        raise ValueError(
+            f"composite target {core_labels!r} resolves the same hart twice: "
+            f"{harts}")
+    if len(harts) > 1 and any(hart < 0 for hart in harts):
+        raise ValueError(
+            f"composite target {core_labels!r} contains an unbound hart; "
+            "multi-hart execution requires explicit physical harts")
+    core_name, core_kind, hart = resolved[0]
+    return core_name, core_kind, hart, harts
 
 
 def load(schedule_path: str,
@@ -508,8 +551,20 @@ def load(schedule_path: str,
                 f"network {network!r} (IR has {sorted(network_dispatches[network])[:8]}...)")
         op_record = network_op_by_did[network][did]
 
-        core_name, core_kind, hart = _resolve_target(
+        core_name, core_kind, hart, harts = _resolve_targets(
             d["hardware_target"], cpu_p_kind, cpu_e_kind, reg)
+
+        # PER-DISPATCH IMPLEMENTATION. With `scheduler.enable_impls` on,
+        # XPU-RT emits every core-group combination once per legal
+        # implementation and records the winner per dispatch, so a schedule
+        # can say "this GEMM on the MAC unit, the next one on the vector
+        # unit" -- on the same core. `hardware_target` cannot express that:
+        # it names WHERE, and impl names WITH WHAT.
+        #
+        # Absent the field the answer is core_kind, which is exactly what a
+        # pre-`enable_impls` schedule means, so those keep producing the
+        # byte-identical table they always did.
+        impl = str(d.get("impl") or core_kind)
 
         # Resolve deps (intra-job data deps) + time_dep (cross-job edge)
         # to in-table entry_ids. The walker's deadlock-freedom argument
@@ -561,7 +616,9 @@ def load(schedule_path: str,
             name=op_record.get("name", f"dispatch_{did}"),
             core_name=core_name,
             core_kind=core_kind,
+            impl=impl,
             hart=hart,
+            harts=harts,
             start_time_ms=float(d.get("start_time", 0.0) or 0.0),
             duration_ms=float(d.get("duration", 0.0) or 0.0),
             # Dedup deps_entry_ids. Two consequences of the Phase G2d
@@ -617,6 +674,10 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
     # Build per-entry deps + fanout arrays + interned strings.
     deps_arrays: list[str] = []
     for e in entries:
+        harts = ", ".join(str(h) for h in e.harts)
+        deps_arrays.append(
+            f"static const int sched_{e.entry_id}_harts[] = {{ {harts} }};"
+        )
         if e.deps_entry_ids:
             arr = ", ".join(str(d) for d in e.deps_entry_ids)
             deps_arrays.append(
@@ -641,7 +702,9 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
             f'.job_name = "{e.job_name}", '
             f'.op = "{e.op}", .name = "{e.name}", '
             f'.core_name = "{e.core_name}", .core_kind = "{e.core_kind}", '
+            f'.impl = "{e.impl}", '
             f'.hart = {e.hart}, '
+            f'.n_harts = {len(e.harts)}, .harts = sched_{e.entry_id}_harts, '
             f'.start_time_ms = {e.start_time_ms!r}f, '
             f'.duration_ms = {e.duration_ms!r}f, '
             f'.n_deps = {n_deps}, .deps = {deps_ref}, '
@@ -671,7 +734,12 @@ typedef struct {{
     const char    *name;           /* IR node name (e.g. "mlp.0") */
     const char    *core_name;      /* registry core name (rocket0/rvv0/...) */
     const char    *core_kind;      /* registry kind (scalar/rvv/gemmini/...) */
+    const char    *impl;           /* kernel impl for THIS dispatch (rvv/ime/...);
+                                    * equals core_kind unless the schedule
+                                    * chose per-dispatch implementations */
     int            hart;           /* preferred hart, -1 if unbound */
+    int            n_harts;        /* full reserved machine-combination width */
+    const int     *harts;           /* master first, followed by helper harts */
     float          start_time_ms;  /* XPU-RT-issued start time (ms) */
     float          duration_ms;    /* XPU-RT-modeled duration (ms) */
     int            n_deps;

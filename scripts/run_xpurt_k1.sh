@@ -14,7 +14,7 @@
 # What this does, in order:
 #   1. per (model, backend): extract int8 IR -> generate skeleton -> generate
 #      kernels, staged as <base>/<backend>/ which is the layout the harness
-#      CMake wants (one weights/buffers TU per model, shared across backends).
+#      CMake wants (one weights TU per backend; buffers shared per model).
 #   2. ingest the XPU-RT schedule -> dispatch_table.{c,h}
 #   3. generate xpurt_main.c with --platform linux (rdtime + POSIX semaphores)
 #   4. cross-build harness_xpurt_linux
@@ -34,6 +34,23 @@ cd "${REPO_ROOT}"
 
 SCHEDULE=""
 MODELS="mlp_control,dronet"
+# <network>:<dir>,... -- networks whose IR is ALREADY BUILT and is supplied
+# rather than extracted. Two cases need this and neither is exotic:
+#
+#   * a network whose name is not a `models/` module. `networks_dense2` calls
+#     its detector `yolov8_nano_64x96`; that is the `yolov8_nano` module built
+#     at a different input size, registered under its own name so specs built
+#     against the 160x160 profile still reproduce. `extract_graph --model
+#     yolov8_nano_64x96` has nothing to extract.
+#   * A REWRITTEN IR. `apply_split_hint` / `apply_fusion_hint` /
+#     `apply_unfuse_hint` produce a graph.json that no `--model` can regenerate
+#     -- which is the entire point of the granularity loop. Without this the
+#     runner cannot execute the thing the loop produces.
+#
+# The staged IR is COPIED, its sha256 recorded, and its provenance written to
+# `.staged_from` -- deliberately NOT `.extract_config`, so a staged graph can
+# never be mistaken for an extracted one by the reuse check.
+STAGED_IRS=""
 BACKENDS="rvv_x60,rvv_x60"
 QUANT="int8"
 # reference = curated/hand-written kernels, no LLM. Codex is only for NEW kernel
@@ -63,11 +80,18 @@ CPU_E_KIND="${CPU_E_KIND:-rvv_c1}"
 CORE_KINDS="${CORE_KINDS:-}"
 OUT_ROOT="build/k1_xpurt"
 TRACE=1
+# Per-dispatch-END JSON lines on stdout, for xpu-rt/streaming_feedback.py.
+# Off by default: the trace block at exit is enough to EXPLAIN a run, and
+# streaming only earns its keep when something is watching live. Pipe the
+# run through `tee` when you turn this on -- the lines are interleaved with
+# the harness's normal output by design, so one stream carries both.
+STREAM="${MB_XPURT_STREAM:-0}"
 CPU_IDS=""
 JOBS="$(nproc)"
 
 HOST="${MODELBLASTER_K1_HOST:-k1}"
 REMOTE_ROOT="${MODELBLASTER_K1_REMOTE_ROOT:-/root/mb_k1}"
+RT_PRIORITY="${MODELBLASTER_K1_RT_PRIORITY:-}"
 CROSS="${CROSS:-/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-}"
 PY="${PY:-python3}"
 # Same import root the single-model runner uses.
@@ -91,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         --schedule)  SCHEDULE="$2"; shift 2 ;;
         --registry)  REGISTRY="$2"; shift 2 ;;
         --models)    MODELS="$2"; shift 2 ;;
+        --staged-ir) STAGED_IRS="${STAGED_IRS:+${STAGED_IRS},}$2"; shift 2 ;;
         --backends)  BACKENDS="$2"; shift 2 ;;
         --quant)     QUANT="$2"; shift 2 ;;
         --out-root)  OUT_ROOT="$2"; shift 2 ;;
@@ -137,6 +162,56 @@ mkdir -p "${GEN_DIR}" "${BUILD_DIR}"
 echo "=== 1/5 generate per-(model, backend) sources ==="
 MODEL_NAMES=""
 MODEL_DIRS_BASE=""
+
+# Stage supplied IRs first, so the loop below finds them in place and treats
+# them exactly like an extracted model from that point on.
+STAGED_SET=""
+if [[ -n "${STAGED_IRS}" ]]; then
+    IFS=',' read -r -a _staged <<< "${STAGED_IRS}"
+    for spec in "${_staged[@]}"; do
+        net="${spec%%:*}"; src="${spec#*:}"
+        [[ "${net}" != "${spec}" ]] || { echo "--staged-ir needs <network>:<dir>, got ${spec}" >&2; exit 2; }
+        [[ -d "${src}" ]] || { echo "--staged-ir ${net}: no such directory ${src}" >&2; exit 2; }
+        for f in graph.json weights.npz io.npz; do
+            [[ -f "${src}/${f}" ]] || { echo "--staged-ir ${net}: ${src}/${f} missing" >&2; exit 2; }
+        done
+        dst="${REPO_ROOT}/${OUT_ROOT}/${net}/${QUANT}"
+        _sha="$(sha256sum "${src}/graph.json" | cut -d" " -f1)"
+        if [[ -f "${dst}/.staged_from" ]] && grep -q "sha256=${_sha}\b" "${dst}/.staged_from"; then
+            echo "  [${net}] staged IR unchanged (sha256 ${_sha:0:12})"
+        else
+            echo "  [${net}] staging IR from ${src} (sha256 ${_sha:0:12})"
+            mkdir -p "${dst}"
+            cp "${src}/graph.json" "${src}/weights.npz" "${src}/io.npz" "${dst}/"
+            # The IR's own `name` becomes the NETWORK name. Every generated C
+            # symbol is mangled by it -- `model_<name>_op_record_t`,
+            # `MODEL_<NAME>_OUTPUT_SIZE`, `dispatch_<name>_<id>` -- while
+            # xpurt_main.c mangles from the SCHEDULE's network name. Leave them
+            # different and the harness fails to compile against a type it just
+            # generated under another name. This is a rename, not a rewrite:
+            # the graph is otherwise byte-identical, which is why the recorded
+            # sha256 is of the SOURCE file.
+            ${PY} - "${dst}/graph.json" "${net}" <<'PY_RENAME'
+import json, sys
+path, net = sys.argv[1], sys.argv[2]
+g = json.load(open(path))
+was = g.get("name")
+if was != net:
+    g["name"] = net
+    g["_staged_rename"] = {"from": was, "to": net}
+    json.dump(g, open(path, "w"), indent=1)
+    print(f"      renamed IR {was!r} -> {net!r} (C symbols mangle by this)")
+PY_RENAME
+            # The generated sources descend from this IR, so they are stale.
+            rm -f "${dst}"/*/kernels.c "${dst}"/*/model.c
+            printf 'source=%s\nsha256=%s\nstaged_at=%s\n' \
+                "$(cd "${src}" && pwd)" "${_sha}" "$(date -Is)" > "${dst}/.staged_from"
+        fi
+        # A staged graph must never satisfy the extraction reuse check.
+        rm -f "${dst}/.extract_config"
+        STAGED_SET="${STAGED_SET} ${net} "
+    done
+fi
 for model in "${MODEL_LIST[@]}"; do
     base="${REPO_ROOT}/${OUT_ROOT}/${model}/${QUANT}"
     mkdir -p "${base}"
@@ -157,12 +232,24 @@ for model in "${MODEL_LIST[@]}"; do
     # Dying was the good case: the two graphs differ in PRECISION, so a
     # dispatch-count coincidence would have run the blind int8 model under the
     # hybrid's name and reported its timings.
+    if [[ "${STAGED_SET}" == *" ${model} "* ]]; then
+        echo "  [${model}] using staged IR ($(sed -n 's/^source=//p' "${base}/.staged_from"))"
+        _skip_extract=1
+    else
+        _skip_extract=0
+    fi
     _cfg_file="${base}/.extract_config"
     _cfg="model=${model} quant=${QUANT}"
     for _v in $(compgen -v | grep -E '^(MB_|MODELBLASTER_|NUM_CALIBRATION)' | sort); do
+        # Board process policy cannot change IR, weights, or goldens. Keeping
+        # it in the extraction key needlessly rebuilt every model when an
+        # experiment switched between SCHED_OTHER and SCHED_FIFO.
+        [[ "${_v}" == "MODELBLASTER_K1_RT_PRIORITY" ]] && continue
         _cfg="${_cfg} ${_v}=${!_v}"
     done
-    if [[ -f "${base}/graph.json" && -f "${_cfg_file}" ]] \
+    if [[ "${_skip_extract}" == "1" ]]; then
+        :
+    elif [[ -f "${base}/graph.json" && -f "${_cfg_file}" ]] \
        && [[ "$(cat "${_cfg_file}")" == "${_cfg}" ]]; then
         echo "  [${model}] reusing ${base}/graph.json"
     else
@@ -183,6 +270,18 @@ for model in "${MODEL_LIST[@]}"; do
         rm -f "${base}"/*/kernels.c "${base}"/*/model.c
     fi
 
+    # Materialize the schedule's composite target widths into a codegen-only
+    # IR. XPU-RT keeps a shard as one dispatch and records its width in
+    # hardware_target (CPU_P#0+CPU_P#1+...); packed RVV convolution weights
+    # need that width at skeleton-generation time so each shard receives its
+    # own correctly packed OC slice. Keep the extracted graph pristine: the
+    # next schedule may choose different widths, and profile/hash checks refer
+    # to the unannotated graph.
+    CODEGEN_IR="${base}/graph.xpurt_schedule.json"
+    ${PY} -m modelblaster.pipeline.schedule_shards \
+        --ir "${base}/graph.json" --schedule "${SCHEDULE}" \
+        --network "${model}" --out "${CODEGEN_IR}"
+
     for bs in "${BACKEND_LIST[@]}"; do
         bdir="${base}/${bs}"
         if [[ -f "${bdir}/kernels.c" && -f "${bdir}/model.c" ]]; then
@@ -200,6 +299,7 @@ for model in "${MODEL_LIST[@]}"; do
             # the curated kernel library and the generators themselves.
             _stale=""
             for _dep in "${REPO_ROOT}/kernels" \
+                        "${CODEGEN_IR}" \
                         "${REPO_ROOT}/pipeline/generate_kernels.py" \
                         "${REPO_ROOT}/pipeline/generate_skeleton.py" \
                         "${REPO_ROOT}/pipeline/backends.py"; do
@@ -220,11 +320,11 @@ for model in "${MODEL_LIST[@]}"; do
         mkdir -p "${bdir}"
         # --platform linux swaps rdcycle (SIGILLs here) for rdtime.
         ${PY} -m modelblaster.pipeline.generate_skeleton \
-            --ir "${base}/graph.json" --weights "${base}/weights.npz" \
+            --ir "${CODEGEN_IR}" --weights "${base}/weights.npz" \
             --io "${base}/io.npz" --out-dir "${bdir}" \
             --backend "${bs}" --platform linux
         ${PY} -m modelblaster.pipeline.generate_kernels \
-            --ir "${base}/graph.json" --out-dir "${bdir}" \
+            --ir "${CODEGEN_IR}" --out-dir "${bdir}" \
             --target "${bs}" --backend "${KERNEL_BACKEND}" --quant "${QUANT}" \
             --global-curated-dir "${REPO_ROOT}/kernels"
     done
@@ -258,7 +358,7 @@ SCHED_C="${GEN_DIR}/${SCHED_NAME}.c"
 SCHED_H="${GEN_DIR}/${SCHED_NAME}.h"
 IR_ARGS=()
 for model in "${MODEL_LIST[@]}"; do
-    IR_ARGS+=(--ir "${model}:${REPO_ROOT}/${OUT_ROOT}/${model}/${QUANT}/graph.json")
+    IR_ARGS+=(--ir "${model}:${REPO_ROOT}/${OUT_ROOT}/${model}/${QUANT}/graph.xpurt_schedule.json")
 done
 ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
     --schedule "${SCHEDULE}" --registry "${REGISTRY}" \
@@ -272,7 +372,8 @@ MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
 ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --schedule "${SCHEDULE}" --out "${MAIN_C}" --name "${SCHED_NAME}" \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
-    --platform linux --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}"
+    --platform linux --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
+    --networks "${MODELS}" --registry "${REGISTRY}"
 
 echo "=== 4/5 cross-build ==="
 CMAKE_ARGS=(
@@ -297,6 +398,7 @@ print(' '.join(get('${bs}').resolved_kernel_cflags('${REPO_ROOT}')))
     [[ -n "${KF}" ]] && CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CFLAGS_${BS_UPPER}=${KF}")
 done
 [[ "${TRACE}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_TRACE=ON")
+[[ "${STREAM}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_STREAM=ON")
 # Compile kernels.c with a different compiler than the rest. Needed for the
 # Zvfh fp16 kernels, whose intrinsics do not exist in GCC 13.2 -- the only
 # riscv64-unknown-linux-gnu compiler here. Same variable and same meaning as
@@ -319,6 +421,15 @@ ssh "${HOST}" "mkdir -p ${REMOTE_ROOT}/xpurt"
 scp -q "${BIN}" "${HOST}:${REMOTE_ROOT}/xpurt/${SCHED_NAME}"
 RUN="cd ${REMOTE_ROOT}/xpurt && ulimit -n 8192 &&"
 [[ -n "${CPU_IDS}" ]] && RUN="${RUN} taskset -c ${CPU_IDS}"
+RUNNER_POLICY="SCHED_OTHER"
+RUNNER_PRIORITY=0
+if [[ -n "${RT_PRIORITY}" ]]; then
+    [[ "${RT_PRIORITY}" =~ ^[0-9]+$ ]] && (( RT_PRIORITY >= 1 && RT_PRIORITY <= 99 )) \
+        || { echo "MODELBLASTER_K1_RT_PRIORITY must be an integer in 1..99" >&2; exit 2; }
+    RUN="${RUN} chrt -f ${RT_PRIORITY}"
+    RUNNER_POLICY="SCHED_FIFO"
+    RUNNER_PRIORITY="${RT_PRIORITY}"
+fi
 RUN="${RUN} ./${SCHED_NAME}"
 OUT="${GEN_DIR}/${SCHED_NAME}_stdout.txt"
 # Redirect ON THE BOARD and scp the file back, rather than streaming stdout
@@ -336,7 +447,8 @@ OUT="${GEN_DIR}/${SCHED_NAME}_stdout.txt"
 # program's own.
 REMOTE_LOG="${REMOTE_ROOT}/xpurt/${SCHED_NAME}_stdout.txt"
 set +e
-ssh "${HOST}" "${RUN} >${REMOTE_LOG} 2>&1; echo \$? >${REMOTE_LOG}.rc"
+ssh "${HOST}" \
+    "printf '%s\\n' 'xpurt_runner: sched_policy=${RUNNER_POLICY} priority=${RUNNER_PRIORITY}' >${REMOTE_LOG}; ${RUN} >>${REMOTE_LOG} 2>&1; echo \$? >${REMOTE_LOG}.rc"
 scp -q "${HOST}:${REMOTE_LOG}" "${OUT}"
 rc=$(ssh "${HOST}" "cat ${REMOTE_LOG}.rc" 2>/dev/null || echo 255)
 set -e

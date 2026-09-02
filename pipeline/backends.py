@@ -25,6 +25,17 @@ from typing import Optional
 #                  build or run.
 VERIFY_HOST_CTYPES = "host_ctypes"
 VERIFY_SPIKE_HARNESS = "spike_harness"
+#: Cross-compile the candidate for the target ISA and check that it BUILDS;
+#: do not execute it. For a backend whose intrinsics the host cannot compile
+#: and whose ISA no available simulator runs usefully, this is the strongest
+#: check available before the board -- and declaring it is much safer than
+#: declaring host_ctypes, which cannot compile the candidate either but
+#: reports that as a verify FAILURE. Four such failures exhaust the retry
+#: budget and the generator falls back to the seed, emitting the SCALAR
+#: reference under `source: seed` in a build labelled for a vector target.
+#: That is the silent-scalar regression this backend's own comments warn
+#: about, arrived at from the other direction.
+VERIFY_CROSS_COMPILE = "cross_compile"
 
 
 @dataclass(frozen=True)
@@ -68,16 +79,23 @@ class Backend:
     rtol_override: float | None = None
 
     def resolved_kernel_cflags(self, repo_root: str) -> tuple[str, ...]:
-        """kernel_cflags with `<repo_root>` placeholders substituted.
+        """kernel_cflags with `<repo_root>` and `<gemmini_config>`
+        placeholders substituted.
 
-        Used for backends that need an -isystem / -I path into the
-        vendored driver headers under modelblaster/cores/<backend>/include/
-        — gemmini's the first one. The placeholder is intentional
-        (over hardcoding `${REPO_ROOT}`-prefixed paths) so the
-        Backend definition stays repo-relative and serializable.
+        `<repo_root>` -> absolute repo root.
+        `<gemmini_config>` -> env MODELBLASTER_GEMMINI_CONFIG, default
+        "default16x16". Used by the gemmini backends so a single source
+        tree can build against any snapshotted gemmini_params.h variant
+        in modelblaster/cores/gemmini/include/per_config/<name>/.
         """
-        return tuple(f.replace("<repo_root>", repo_root)
-                     for f in self.kernel_cflags)
+        import os
+        gem_cfg = os.environ.get("MODELBLASTER_GEMMINI_CONFIG", "default16x16")
+        out = []
+        for f in self.kernel_cflags:
+            f = f.replace("<repo_root>", repo_root)
+            f = f.replace("<gemmini_config>", gem_cfg)
+            out.append(f)
+        return tuple(out)
 
 
 SCALAR = Backend(
@@ -164,7 +182,18 @@ RVV_X60 = Backend(
     # Same ISA family as rvv, just with VLEN pinned -- so it inherits every
     # curated kernel in kernels/rvv/.
     curated_aliases=("rvv",),
-    verify_method=VERIFY_HOST_CTYPES,
+    # NOT host_ctypes. The host is x86 and cannot compile `vint32m4_t` or
+    # `__riscv_vle8_v_i8m1`, so host_ctypes verify fails on every candidate
+    # with "unknown type name" -- which the generator reads as the LLM being
+    # wrong, retries four times, and then falls back to the seed. The result
+    # is the scalar reference emitted as an rvv_x60 kernel: precisely the
+    # 195ms-vs-113ms DroNet regression described at the top of this file,
+    # reached through the verify path instead of the curated-lookup path.
+    # Cross-compiling catches what is actually catchable here (bad
+    # intrinsics, wrong vector types, wrong vtype width) and leaves numeric
+    # correctness to the on-board golden compare, which is where this
+    # backend's docstring already says correctness is established.
+    verify_method=VERIFY_CROSS_COMPILE,
 )
 
 
@@ -230,6 +259,63 @@ RVV_F16 = Backend(
 # verify_method=VERIFY_SPIKE_HARNESS as "spike unsupported, skip verify"
 # (TODO once that flag exists; until then, set BACKEND=reference + a
 # curated kernel and run on FireSim directly via run.sh RUNNER=firesim).
+# SpaceMiT K1 IME (Integrated Matrix Extension), reached through the
+# `smt.vmadot` custom instruction. Layered ON TOP of rvv_x60 rather than
+# replacing it: only matmul can use the MAC unit, so every other op in a model
+# still needs the RVV kernels, which is what `curated_aliases` is for.
+#
+# Four facts, all MEASURED on the board rather than read off a datasheet,
+# because the datasheet was wrong about two of them (see docs section 9):
+#
+#   1. The micro-tile is 4x4x8 and HARDWARE-FORCED. The MAC table is indexed
+#      by vl*SEW, not VLEN: at VLEN=256, SEW=8, vl=32 gives M x N x K = 4x4x8.
+#      K is pinned at 8; a deeper reduction is a LOOP of vmadots.
+#   2. It ACCUMULATES: vd += A . B^T, verified by issuing the same operands
+#      twice and watching the results double. That is what makes the K-loop
+#      possible.
+#   3. The 16 int32 results land row-major across the pair (vd, vd+1):
+#      element e is C[e/4][e%4]. Measured by
+#      scripts/k1_ime_accumulator_probe.c.
+#   4. CLUSTER 0 ONLY. Harts 4-7 do not implement the instruction and exit
+#      132 (SIGILL). Any machine config that places ime work on CPU_E, or that
+#      asks for {"cpu_p": 8}, produces a schedule that cannot run.
+#
+# No new -march is needed: the instruction is emitted as a `.insn` and
+# assembles under plain rv64gcv_zvl256b on both installed toolchains. There is
+# no `xsmtvdot` march string for either compiler.
+IME = Backend(
+    name="ime_x60",
+    description=(
+        "SpaceMiT K1 IME int8 matrix engine (smt.vmadot, 4x4x8 micro-tile) "
+        "layered on rv64gcv with VLEN=256. Cluster 0 only."
+    ),
+    kernel_cflags=(
+        "-march=rv64gcv_zvl256b_zfh_zvfh",
+        "-mabi=lp64d",
+        "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
+        "-I<repo_root>/kernels/rvv",
+    ),
+    kernel_includes=("<riscv_vector.h>", '"mb_rvv_vxrm_compat.h"'),
+    prj_conf_overlay="rvv.conf",
+    spike_args=("--isa=rv64gcv_zicntr",),
+    optimization_guide="optimization_guide_rvv.md",
+    # Load-bearing, and the ORDER matters. "ime" first so the vmadot kernels
+    # in kernels/ime/ are found; "rvv" second because IME can only serve
+    # matmul and every other op in the model falls through to the RVV curated
+    # set. Without the rvv fallback a green ime build measures the SCALAR
+    # reference for all of them and reports it as an IME number.
+    #
+    # The backend is `ime_x60` (matching the profile tree's rvv_x60 / scalar
+    # convention, which is what the scheduler's combo_hw swap keys on) while
+    # the kernels live in kernels/ime/ -- the alias is what bridges the two,
+    # exactly as rvv_x60 reaches kernels/rvv/.
+    curated_aliases=("ime", "rvv"),
+    # Same reasoning as rvv_x60: the host is x86 and no simulator models
+    # smt.vmadot, so generation cross-compiles and the board settles numerics.
+    verify_method=VERIFY_CROSS_COMPILE,
+)
+
+
 RVV_OPU = Backend(
     name="rvv_opu",
     description=(
@@ -294,10 +380,17 @@ GEMMINI = Backend(
     kernel_cflags=(
         "-march=rv64imafdc",
         "-mabi=lp64d",
-        # Two include paths needed:
+        # Per-config gemmini_params.h must come FIRST so its
+        # `include/gemmini_params.h` shadows any default in
+        # cores/gemmini/include/. <gemmini_config> resolves from env
+        # MODELBLASTER_GEMMINI_CONFIG (default: "default16x16").
+        # See modelblaster/validation/config_matrix.json for the
+        # canonical list.
+        "-isystem<repo_root>/modelblaster/cores/gemmini/include/per_config/<gemmini_config>",
+        # Two more include paths:
         #   .../include — so kernels.c's `#include "gemmini.h"` resolves
         #   .../        — so gemmini.h's `#include "include/gemmini_params.h"`
-        #                 and `#include "rocc-software/src/xcustom.h"` resolve
+        #                 and `#include "rocc-software/src/xcustom.h"` resolve.
         # The asymmetric layout is gemmini-rocc-tests' upstream convention.
         "-isystem<repo_root>/cores/gemmini/include",
         "-isystem<repo_root>/cores/gemmini",
@@ -411,6 +504,7 @@ BACKENDS: dict[str, Backend] = {
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,
     RVV_OPU.name: RVV_OPU,
+    IME.name: IME,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,
 }
