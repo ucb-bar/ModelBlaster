@@ -3291,6 +3291,78 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
 }
 """,
         ),
+        # ── NHWC entry point (stage 3, docs/IR_TENSOR_LAYOUT_DESIGN.md) ──
+        # Not a faster convolution: the SAME tiled_conv_auto call, handed
+        # activations that are already in the layout it wanted. The two
+        # transposes gemmini_tiled_conv carries are 87% of its measured cycles
+        # (F2, fq 475: in 34.3% / gemmini 12.8% / out 52.9%), and they exist
+        # only to bridge the IR's NCHW convention to the accelerator's NHWC
+        # datapath. Chaining NHWC across a run of convs deletes all but the
+        # island's two boundary conversions.
+        #
+        # This candidate is selected ONLY when the IR declares its activations
+        # nhwc; pipeline/act_layout.plan_for_op and the deny-by-default gate
+        # assert_act_layout_contract are what make that a checked fact rather
+        # than an ordering assumption. Its curated file is
+        # kernels/gemmini/gemmini_conv2d_s8_gemmini_tiled_conv_nhwc.c.
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_nhwc",
+            target_affinity=GEMMINI_TARGETS,
+            weight_layout="hwio",
+            act_layouts=("nhwc",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "gemmini tiled_conv_auto on NHWC activations, with no "
+                "transpose on either side. Identical arithmetic and identical "
+                "drift to gemmini_tiled_conv (the same single hardware "
+                "round-shift-by-31 mvout requantize); the only difference is "
+                "that `input` is read as [N, IH, IW, IC] and `output` is "
+                "written as [N, OH, OW, OC] instead of being staged through a "
+                "transposed workspace. Requires the IR to declare nhwc on both "
+                "activation tensors."
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    /* NHWC seed: activations [N,H,W,C] on both sides, weight flat HWIO. */
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++)
+    for (int oh = 0; oh < OH; oh++)
+    for (int ow = 0; ow < OW; ow++)
+    for (int oc = 0; oc < OC; oc++) {
+        int32_t acc = bias ? bias[oc] : 0;
+        for (int kh = 0; kh < KH; kh++) {
+            int ih = oh*SH - PH + kh;
+            for (int kw = 0; kw < KW; kw++) {
+                int iw = ow*SW - PW + kw;
+                int oob = (ih < 0 || ih >= IH || iw < 0 || iw >= IW);
+                for (int ic = 0; ic < IC; ic++) {
+                    int32_t v = oob ? 0 : input[((n*IH+ih)*IW+iw)*IC+ic];
+                    acc += (v + input_offset)
+                         * ((int32_t)weight[((kh*KW+kw)*IC+ic)*OC+oc]
+                            + filter_offset);
+                }
+            }
+        }
+        int64_t prod = ((int64_t)acc * output_multiplier + ((int64_t)1<<30)) >> 31;
+        int32_t s = (int32_t)prod;
+        if (output_shift > 0)
+            s = (int32_t)(((int64_t)s + ((int64_t)1 << (output_shift-1))) >> output_shift);
+        else if (output_shift < 0) s <<= (-output_shift);
+        s += output_offset;
+        if (s < activation_min) s = activation_min;
+        if (s > activation_max) s = activation_max;
+        output[((n*OH+oh)*OW+ow)*OC+oc] = (int8_t)s;
+    }
+}
+""",
+        ),
     ],
 )
 
@@ -3772,6 +3844,52 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
 }
 """,
         ),
+        # ── NHWC entry point (stage 3) ──────────────────────────────────
+        # Pure deletion: gemmini's pool datapath was already NHWC internally,
+        # so the NCHW kernel's two transposes existed only to meet the IR's
+        # convention. Curated file:
+        # kernels/gemmini/gemmini_maxpool2d_s8_gemmini_tiled_conv_pool_nhwc.c
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_pool_nhwc",
+            target_affinity=("gemmini", "gemmini_q31", "gemmini_q31_rvv"),
+            act_layouts=("nhwc",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "gemmini tiled_conv_dw_auto passthrough (+2 per channel) with "
+                "the mvout pool tail, on NHWC activations and with no "
+                "transpose on either side. Same exactness argument as the NCHW "
+                "kernel -- ACC_SCALE(2*v, ACC_SCALE_IDENTITY) == v for every "
+                "int8 v -- since nothing in the arithmetic changes."
+            ),
+            reference_impl="""\
+void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
+                         int N, int C, int IH, int IW,
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int DH, int DW)
+{
+    /* NHWC seed: [N,H,W,C] on both sides. */
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++)
+    for (int oh = 0; oh < OH; oh++)
+    for (int ow = 0; ow < OW; ow++)
+    for (int c = 0; c < C; c++) {
+        int8_t m = INT8_MIN;
+        for (int kh = 0; kh < KH; kh++) {
+            int ih = oh*SH - PH + kh*DH;
+            if (ih < 0 || ih >= IH) continue;
+            for (int kw = 0; kw < KW; kw++) {
+                int iw = ow*SW - PW + kw*DW;
+                if (iw < 0 || iw >= IW) continue;
+                int8_t v = input[((n*IH+ih)*IW+iw)*C+c];
+                if (v > m) m = v;
+            }
+        }
+        output[((n*OH+oh)*OW+ow)*C+c] = m;
+    }
+}
+""",
+        ),
     ],
 )
 
@@ -4032,6 +4150,51 @@ void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
                 "    }\n"
                 "}\n"
             ),
+        ),
+        # ── NHWC entry point (stage 3) ──────────────────────────────────
+        # The one op in the dronet island that needed genuinely new C rather
+        # than a deletion: batchnorm has no gemmini datapath, so both layouts
+        # are scalar loops. Keeps scalar_chan_lut's two exact tricks (the
+        # per-channel int8 table and fcvt.w.s,rmm in place of a roundf call) so
+        # an NCHW/NHWC A/B prices the layout and not a change of algorithm.
+        # Curated file:
+        # kernels/gemmini/gemmini_batchnorm2d_s8_scalar_chan_lut_nhwc.c
+        AlgorithmCandidate(
+            name="scalar_chan_lut_nhwc",
+            target_affinity=GEMMINI_TARGETS,
+            act_layouts=("nhwc",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Per-channel int8 lookup table for batchnorm on NHWC "
+                "activations. Under NCHW the channel is loop-invariant over a "
+                "whole plane so ONE table is live and can be filled lazily; "
+                "under NHWC the channel changes every element, so every "
+                "channel's table must be live at once ([C][256]) and is filled "
+                "eagerly. That costs a flat C*256 evaluations, so the table "
+                "path is taken only when H*W exceeds it and the direct "
+                "per-element expression runs otherwise."
+            ),
+            reference_impl="""\
+void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
+                           const float *bias, int8_t *output,
+                           int N, int C, int H, int W,
+                           float scale_in, float scale_out,
+                           int activation_min, int activation_max) {
+    /* NHWC seed: [N,H,W,C] on both sides. */
+    for (int n = 0; n < N; n++)
+    for (int h = 0; h < H; h++)
+    for (int w = 0; w < W; w++)
+    for (int c = 0; c < C; c++) {
+        int idx = (((n*H + h)*W + w)*C) + c;
+        float fv = (float)input[idx] * scale_in;
+        float y = scale[c] * fv + bias[c];
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[idx] = (int8_t)v;
+    }
+}
+""",
         ),
     ],
 )
@@ -12258,42 +12421,14 @@ void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
 }
 """,
         ),
-        AlgorithmCandidate(
-            name='rvv_strided',
-            target_affinity=('rvv',),
-            accuracy_class=AccuracyClass.BIT_EXACT,
-            description=(
-                "The same blocked nest with the innermost loop replaced by one "
-                "vector memory op: contiguous vle8/vse8 on the planar side, "
-                "vlse8/vsse8 at byte-stride C on the interleaved side. e8m1 "
-                "deliberately, not a wider LMUL -- LMUL sets the spatial block, "
-                "and the spatial block IS the blocking factor the scalar version "
-                "tuned to 32. At Saturn's VLEN=256, e8m1 gives VLMAX=32, so this "
-                "kernel and the scalar one have the same access order and the "
-                "same working set, and the measured difference between them is "
-                "the vector unit and nothing else."
-            ),
-            reference_impl="""\
-void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
-                            int N, int C, int H, int W)
-{
-    const size_t HW = (size_t)H * (size_t)W;
-    for (int n = 0; n < N; n++) {
-        const int8_t *ib = input  + (size_t)n * (size_t)C * HW;
-        int8_t       *ob = output + (size_t)n * HW * (size_t)C;
-        for (size_t p0 = 0; p0 < HW; ) {
-            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
-            for (int c = 0; c < C; c++) {
-                vint8m1_t v = __riscv_vle8_v_i8m1(ib + (size_t)c * HW + p0, vl);
-                __riscv_vsse8_v_i8m1(ob + p0 * (size_t)C + (size_t)c,
-                                     (ptrdiff_t)C, v, vl);
-            }
-            p0 += vl;
-        }
-    }
-}
-""",
-        ),
+        # ORDER MATTERS, and it is the reason rvv_seg sits ahead of
+        # rvv_strided rather than after it. The reference-path curator takes the
+        # FIRST algorithm with a curated file on disk (generate_kernels
+        # _probe_swap); it does not rank them. Stage 1 measured both on F2 --
+        # rvv_seg 0.85/0.90 c/B against rvv_strided 4.14/2.86 (design doc
+        # section 11.2) -- so leaving rvv_strided first silently shipped the
+        # 3-4x slower kernel to every rvv build. Two candidates, one measured
+        # winner, and the pick was decided by list position.
         AlgorithmCandidate(
             name='rvv_seg',
             target_affinity=('rvv',),
@@ -12343,6 +12478,42 @@ void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
             for (; c0 < C; c0++)
                 __riscv_vsse8_v_i8m1(dp + c0, bs,
                     __riscv_vle8_v_i8m1(ib + (size_t)c0 * HW + p0, vl), vl);
+            p0 += vl;
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name='rvv_strided',
+            target_affinity=('rvv',),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "The same blocked nest with the innermost loop replaced by one "
+                "vector memory op: contiguous vle8/vse8 on the planar side, "
+                "vlse8/vsse8 at byte-stride C on the interleaved side. e8m1 "
+                "deliberately, not a wider LMUL -- LMUL sets the spatial block, "
+                "and the spatial block IS the blocking factor the scalar version "
+                "tuned to 32. At Saturn's VLEN=256, e8m1 gives VLMAX=32, so this "
+                "kernel and the scalar one have the same access order and the "
+                "same working set, and the measured difference between them is "
+                "the vector unit and nothing else."
+            ),
+            reference_impl="""\
+void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const size_t HW = (size_t)H * (size_t)W;
+    for (int n = 0; n < N; n++) {
+        const int8_t *ib = input  + (size_t)n * (size_t)C * HW;
+        int8_t       *ob = output + (size_t)n * HW * (size_t)C;
+        for (size_t p0 = 0; p0 < HW; ) {
+            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
+            for (int c = 0; c < C; c++) {
+                vint8m1_t v = __riscv_vle8_v_i8m1(ib + (size_t)c * HW + p0, vl);
+                __riscv_vsse8_v_i8m1(ob + p0 * (size_t)C + (size_t)c,
+                                     (ptrdiff_t)C, v, vl);
+            }
             p0 += vl;
         }
     }
@@ -12423,42 +12594,14 @@ void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
 }
 """,
         ),
-        AlgorithmCandidate(
-            name='rvv_strided',
-            target_affinity=('rvv',),
-            accuracy_class=AccuracyClass.BIT_EXACT,
-            description=(
-                "The same blocked nest with the innermost loop replaced by one "
-                "vector memory op: contiguous vle8/vse8 on the planar side, "
-                "vlse8/vsse8 at byte-stride C on the interleaved side. e8m1 "
-                "deliberately, not a wider LMUL -- LMUL sets the spatial block, "
-                "and the spatial block IS the blocking factor the scalar version "
-                "tuned to 32. At Saturn's VLEN=256, e8m1 gives VLMAX=32, so this "
-                "kernel and the scalar one have the same access order and the "
-                "same working set, and the measured difference between them is "
-                "the vector unit and nothing else."
-            ),
-            reference_impl="""\
-void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
-                            int N, int C, int H, int W)
-{
-    const size_t HW = (size_t)H * (size_t)W;
-    for (int n = 0; n < N; n++) {
-        const int8_t *ib = input  + (size_t)n * HW * (size_t)C;
-        int8_t       *ob = output + (size_t)n * (size_t)C * HW;
-        for (size_t p0 = 0; p0 < HW; ) {
-            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
-            for (int c = 0; c < C; c++) {
-                vint8m1_t v = __riscv_vlse8_v_i8m1(
-                        ib + p0 * (size_t)C + (size_t)c, (ptrdiff_t)C, vl);
-                __riscv_vse8_v_i8m1(ob + (size_t)c * HW + p0, v, vl);
-            }
-            p0 += vl;
-        }
-    }
-}
-""",
-        ),
+        # ORDER MATTERS, and it is the reason rvv_seg sits ahead of
+        # rvv_strided rather than after it. The reference-path curator takes the
+        # FIRST algorithm with a curated file on disk (generate_kernels
+        # _probe_swap); it does not rank them. Stage 1 measured both on F2 --
+        # rvv_seg 0.85/0.90 c/B against rvv_strided 4.14/2.86 (design doc
+        # section 11.2) -- so leaving rvv_strided first silently shipped the
+        # 3-4x slower kernel to every rvv build. Two candidates, one measured
+        # winner, and the pick was decided by list position.
         AlgorithmCandidate(
             name='rvv_seg',
             target_affinity=('rvv',),
@@ -12515,6 +12658,42 @@ void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
             for (; c0 < C; c0++)
                 __riscv_vse8_v_i8m1(ob + (size_t)c0 * HW + p0,
                     __riscv_vlse8_v_i8m1(sp + c0, bs, vl), vl);
+            p0 += vl;
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name='rvv_strided',
+            target_affinity=('rvv',),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "The same blocked nest with the innermost loop replaced by one "
+                "vector memory op: contiguous vle8/vse8 on the planar side, "
+                "vlse8/vsse8 at byte-stride C on the interleaved side. e8m1 "
+                "deliberately, not a wider LMUL -- LMUL sets the spatial block, "
+                "and the spatial block IS the blocking factor the scalar version "
+                "tuned to 32. At Saturn's VLEN=256, e8m1 gives VLMAX=32, so this "
+                "kernel and the scalar one have the same access order and the "
+                "same working set, and the measured difference between them is "
+                "the vector unit and nothing else."
+            ),
+            reference_impl="""\
+void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
+                            int N, int C, int H, int W)
+{
+    const size_t HW = (size_t)H * (size_t)W;
+    for (int n = 0; n < N; n++) {
+        const int8_t *ib = input  + (size_t)n * HW * (size_t)C;
+        int8_t       *ob = output + (size_t)n * (size_t)C * HW;
+        for (size_t p0 = 0; p0 < HW; ) {
+            size_t vl = __riscv_vsetvl_e8m1(HW - p0);
+            for (int c = 0; c < C; c++) {
+                vint8m1_t v = __riscv_vlse8_v_i8m1(
+                        ib + p0 * (size_t)C + (size_t)c, (ptrdiff_t)C, vl);
+                __riscv_vse8_v_i8m1(ob + (size_t)c * HW + p0, v, vl);
+            }
             p0 += vl;
         }
     }

@@ -38,6 +38,7 @@ from modelblaster.pipeline.reference_kernels import (
     KERNEL_SPECS, KernelSpec, shapes_from_ir,
 )
 from modelblaster.pipeline.verify_kernel import verify as host_verify, VerifyResult
+from modelblaster.pipeline import act_layout as _act_layout_mod
 
 
 # Curated kernel files self-declare their accuracy class via a header
@@ -59,10 +60,10 @@ def _tensor_layout(ir, name):
     return t.get("layout", "nchw")
 
 
-def assert_act_layout_contract(ir, ops, spec, algorithm, backend):
-    """Refuse an (op, backend) whose activation layouts the kernel never agreed to.
+def assert_act_layout_contract(ir, specs, kernel_picks, backend):
+    """Refuse a kernels.c whose kernels never agreed to the layouts in the IR.
 
-    DENY BY DEFAULT, and for a sharper reason than the weight contract above.
+    DENY BY DEFAULT, and for a sharper reason than the weight contract below.
     NCHW and NHWC hold the same bytes in a different order, so handing a kernel
     the wrong one is not a link error, not a crash, and not even a size
     mismatch -- it is a plausible wrong answer. And unlike weights, activations
@@ -70,36 +71,82 @@ def assert_act_layout_contract(ir, ops, spec, algorithm, backend):
     (generate_skeleton.py:112-123), so a tensor has ONE physical layout whatever
     hart the schedule lands its producer on.
 
-    So an op whose tensors carry a layout this algorithm does not declare is a
-    hard stop, never an assumption. Inert while every tensor is nchw and every
-    algorithm declares ("nchw",), which is the state stage 2 lands in.
+    Run once per (model, backend) after selection, because that is the level the
+    decision lives at: kernels.c holds exactly one implementation per op kind,
+    and `act_layout.kernel_layout_for_kind` says which layout it must read. This
+    asserts the algorithm that was actually SELECTED agrees with that answer --
+    in both directions:
+
+      * kernel_layout == nhwc and the pick does not declare nhwc. The pick fell
+        back (a missing curated file, a failed verify) to an NCHW kernel while
+        generate_skeleton, computing the same predicate, will emit a NATIVE
+        call. Silent wrong answer; stop.
+      * kernel_layout == nchw and the pick declares ONLY nhwc. The reverse
+        mistake, e.g. an nhwc curated file dropped into a backend dir where the
+        algorithm ordering happens to find it first.
+
+    The one mismatch that is NOT an error is the shim: an nhwc graph on a
+    backend with no nhwc kernel resolves kernel_layout to nchw, keeps its nchw
+    kernel, and generate_skeleton wraps every call in a relayout pair. That is
+    what makes any layout assignment correct under any placement -- placement
+    can then only make things slower, never wrong (design doc section 8.1).
 
     See docs/IR_TENSOR_LAYOUT_DESIGN.md section 8.
     """
-    declared = tuple(getattr(algorithm, "act_layouts", None) or ("nchw",))
-    for op in ops:
-        if op.get("op") != spec.op:
+    from modelblaster.pipeline import act_layout as _al
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    graph_lays = {(t or {}).get("layout", _al.NCHW)
+                  for t in (ir.get("tensors") or {}).values()}
+    if graph_lays <= {_al.NCHW}:
+        return          # inert: no graph carries a layout key
+    for spec in specs:
+        kind = spec.op
+        if kind in _al.RELAYOUT_OPS or kind in _al.LAYOUT_AGNOSTIC_OPS:
             continue
-        for kind in ("inputs", "outputs"):
-            for tname in (op.get(kind) or []):
-                lay = _tensor_layout(ir, tname)
-                if lay in declared:
-                    continue
-                raise SystemExit(
-                    f"activation layout contract violated:\n"
-                    f"  op/algo   {spec.op}/{algorithm.name} on "
-                    f"backend {backend.name!r}\n"
-                    f"  tensor    {tname} ({kind[:-1]} of {op.get('name')}) "
-                    f"declares layout={lay!r}\n"
-                    f"  algorithm declares act_layouts={declared}\n"
-                    f"The kernel would index this tensor with the wrong strides "
-                    f"and return a plausible WRONG answer -- NCHW and NHWC are "
-                    f"size-identical, so nothing downstream would notice. Fix by "
-                    f"giving {algorithm.name!r} an act_layouts entry for {lay!r} "
-                    f"and a kernel that honours it, by letting assign_layouts "
-                    f"place a relayout op on this edge, or by keeping the tensor "
-                    f"nchw. Do NOT widen act_layouts without changing the C."
-                )
+        want = _al.kernel_layout_for_kind(ir, kind, backend.name)
+        algo_name = (kernel_picks.get(kind) or {}).get("algorithm")
+        declared = (_al.NCHW,)
+        if algo_name:
+            for a in KERNEL_SPECS[kind].algorithms:
+                if a.name == algo_name:
+                    declared = tuple(getattr(a, "act_layouts", None)
+                                     or (_al.NCHW,))
+                    break
+        if want in declared:
+            continue
+        seen = sorted(_al.graph_layouts_for_kind(ir, kind))
+        raise SystemExit(
+            f"activation layout contract violated:\n"
+            f"  op         {kind} on backend {backend.name!r}\n"
+            f"  IR tensors declare layout(s) {seen}\n"
+            f"  codegen will emit a {want!r} call "
+            f"(act_layout.kernel_layout_for_kind)\n"
+            f"  selected   {algo_name or 'reference_impl'} "
+            f"declares act_layouts={declared}\n"
+            f"The kernel would index these tensors with the wrong strides and "
+            f"return a plausible WRONG answer -- NCHW and NHWC are "
+            f"size-identical, so nothing downstream would notice. Fix by "
+            f"supplying a curated kernel for an algorithm that declares "
+            f"{want!r} on this backend, by letting assign_layouts place a "
+            f"relayout op on these edges, or by keeping the tensors nchw. Do "
+            f"NOT widen act_layouts without changing the C.")
+
+
+def act_layout_candidate_ok(ir, spec, algorithm, backend) -> bool:
+    """Is `algorithm` allowed to be the pick for `spec.op` on `backend`?
+
+    The layout half of candidate filtering. Without it, an NHWC graph would
+    still find the NCHW curated file first (it comes first in spec.algorithms,
+    and must, so that an all-NCHW graph keeps picking exactly what it picks
+    today) and the gate above would then fire at the end of a long build.
+    """
+    from modelblaster.pipeline import act_layout as _al
+    kind = spec.op
+    if kind in _al.RELAYOUT_OPS or kind in _al.LAYOUT_AGNOSTIC_OPS:
+        return True
+    want = _al.kernel_layout_for_kind(ir, kind, backend.name)
+    declared = tuple(getattr(algorithm, "act_layouts", None) or (_al.NCHW,))
+    return want in declared
 
 
 def _assert_curated_layout_contract(spec, algorithm, backend, curated_path):
@@ -1480,6 +1527,16 @@ def generate(
             return []
         return [op["op"]]
     op_kinds = sorted({k for op in ir["ops"] for k in _expand_op_kinds(op)})
+    # A graph carrying ANY nhwc tensor gets both relayout kernels emitted into
+    # every backend's kernels.c, whether or not a relayout dispatch appears in
+    # the graph. generate_skeleton's shim calls them for any op this backend has
+    # no native nhwc kernel for, and it cannot add a kernel to kernels.c -- so
+    # without this a shimmed backend links against undefined
+    # kernel_nhwc_to_nchw_s8_<mid>. Cheap: two small functions per backend.
+    if any((t or {}).get("layout", "nchw") != "nchw"
+           for t in (ir.get("tensors") or {}).values()):
+        op_kinds = sorted(set(op_kinds)
+                          | {"nchw_to_nhwc_s8", "nhwc_to_nchw_s8"})
     for k in op_kinds:
         if k not in KERNEL_SPECS:
             raise SystemExit(f"unknown op kind in IR: {k}")
@@ -1615,6 +1672,16 @@ def generate(
                 for algorithm in spec.algorithms:
                     candidate_path = path_layout(spec, algorithm)
                     if not candidate_path or not os.path.exists(candidate_path):
+                        continue
+                    # Activation-layout filter. An algorithm that reads a
+                    # layout this graph's tensors do not declare is not a
+                    # slower choice, it is a wrong one, and it is
+                    # size-identical so nothing downstream would catch it.
+                    if not act_layout_candidate_ok(ir, spec, algorithm, target):
+                        log(f"  [{spec.op}/{algorithm.name}] skipped: "
+                            f"act_layouts={getattr(algorithm, 'act_layouts', ('nchw',))} "
+                            f"but this graph needs "
+                            f"{_act_layout_mod.kernel_layout_for_kind(ir, spec.op, target.name)!r}")
                         continue
                     candidate_src = open(candidate_path).read()
                     # Honor max_accuracy_class: parse the file's own
@@ -1871,6 +1938,11 @@ def generate(
             }
     else:
         raise SystemExit(f"unknown --backend: {backend_name}")
+
+    # Deny-by-default activation-layout gate. Runs after selection and before
+    # anything is written, so a build that would have been silently wrong is a
+    # SystemExit rather than a kernels.c.
+    assert_act_layout_contract(ir, specs, kernel_picks, target)
 
     emit_kernels_h(specs, out_dir, model_name=ir["name"])
     emit_kernels_c(impls, backend_name, out_dir, backend=target, model_name=ir["name"])

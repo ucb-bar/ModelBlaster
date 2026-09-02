@@ -1,0 +1,1 @@
+../gemmini/gemmini_nhwc_to_nchw_s8_gemmini_blocked_tb32.c
