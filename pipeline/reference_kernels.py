@@ -2021,6 +2021,33 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     argtypes_factory=_conv2d_s8_argtypes,
     algorithms=[
         AlgorithmCandidate(
+            name="ime_vmadot_4x4x8",
+            target_affinity=("ime", "ime_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K1 IME conv2d_s8 via im2col -> smt.vmadot GEMM.\n"
+                "Builds the im2col matrix A[M=OH*OW, K=IC*KH*KW] on the fly\n"
+                "directly into the 4x8 A-tiles and reuses the board-proven\n"
+                "vmadot 4x4x8 MAC (see ime_matmul_s8_ime_vmadot_4x4x8). Weights\n"
+                "are consumed in their native IHWOC layout (= the matmul's\n"
+                "transpose_b==0 branch). SYMMETRIC int8 ONLY (input/filter\n"
+                "offset 0 -- true for every dronet/yolov8_nano conv); vmadot's\n"
+                "raw product is then the conv MAC, no offset correction. The\n"
+                "requantize tail is the conv's scalar Q0.31 (bias add, Q0.31\n"
+                "multiply, rounding shift, clamp) -- NOT the matmul float tail.\n"
+                "CLUSTER 0 ONLY (harts 4-7 SIGILL on smt.vmadot).\n\n"
+                "MEASURED ON THE K1: bit-exact vs an independent scalar oracle\n"
+                "AND vs the RVV conv on all 50 unique dronet/yolov8_nano conv\n"
+                "shapes (max_abs_err=0). It is an ALTERNATIVE the picker takes\n"
+                "ONLY where it beats RVV: wins on large-channel convs (1x1 and\n"
+                "big-IC 3x3) up to 2.85x -- yolov8_nano 20/40 layers, 20.6%\n"
+                "conv-cycle reduction taking IME-where-it-wins; loses on small\n"
+                "convs (dronet 1/10). Asymmetric convs stay on RVV.\n"
+                "Verify+bench: scripts/ime_conv_verify_bench.py."
+            ),
+            reference_impl="",  # curated: kernels/ime/ime_conv2d_s8_ime_vmadot_4x4x8.c
+        ),
+        AlgorithmCandidate(
             name="indir_gemm",
             target_affinity=("rvv_opu",),
             description=(

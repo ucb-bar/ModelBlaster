@@ -1,0 +1,5 @@
+network                 disp     Mcyc  heavy%  fused% epi-ceil%  verdict
+------------------------------------------------------------------------
+dronet                    21     0.16    58.2    26.1      15.6  MODEST — some epilogue headroom (15.6%)
+yolov8_nano              204     4.23    95.0     0.0       5.0  COMPUTE-BOUND — fuse for dispatch-collapse only (5.0% cycle ceiling)
+yolov8_nano_64x96         90     0.57     2.3    94.2       3.5  ALREADY FUSED (deployed) — no headroom left

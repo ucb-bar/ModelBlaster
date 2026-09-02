@@ -28,6 +28,7 @@ import tempfile
 from typing import Optional
 
 from modelblaster.pipeline import backends as backends_mod
+from modelblaster.pipeline import ime_cost
 from modelblaster.pipeline.backends import (
     Backend, VERIFY_CROSS_COMPILE, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
 )
@@ -1483,6 +1484,30 @@ def generate(
                     # Already swapped by an earlier source (cache beats
                     # global_curated, since cache was vetted for THIS model).
                     continue
+                # SHAPE-AWARE TABLE-INCLUSION GUARD for the K1 IME matrix engine.
+                # The ime_x60 table is a per-dispatch ALTERNATIVE the scheduler
+                # chooses from (the walker dispatches by `impl`; commits efb1c7d/
+                # 1432da8). So keep the IME kernel in the table iff it is faster
+                # than RVV on AT LEAST ONE shape of this op; the per-dispatch
+                # scheduler then compares measured rvv-vs-ime cost and runs IME
+                # only on the instances where it actually wins. This KEEPS conv
+                # (20/40 yolov8 layers win) and ffn (M=128) available while
+                # EXCLUDING attention (uniformly ~4x slower at M=8) — the mispick
+                # this fixes. (For a hypothetical single-ime build with no
+                # scheduler, per-instance losers are still guarded by the profile
+                # cost comparison downstream.)
+                if source_label.startswith("curated[ime"):
+                    try:
+                        shapes = collect_shapes(ir, spec.op, spec)
+                        win, why = ime_cost.ime_useful(spec.op, shapes)
+                    except Exception as _e:
+                        win, why = True, f"ime_cost guard skipped ({_e})"
+                    if not win:
+                        kernel_picks.setdefault(spec.op, {})
+                        kernel_picks[spec.op]["ime_skipped_reason"] = why
+                        log(f"  [{spec.op}] IME not probed — {why}; stays RVV "
+                            f"(only-if-better rule)")
+                        continue
                 for algorithm in spec.algorithms:
                     candidate_path = path_layout(spec, algorithm)
                     if not candidate_path or not os.path.exists(candidate_path):
