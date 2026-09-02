@@ -24,6 +24,18 @@ set -euo pipefail
 : "${MODEL_NAME:?MODEL_NAME must be set by the caller}"
 : "${REPO_ROOT:?REPO_ROOT must be set by the caller}"
 
+# Submodule-layout adaptation (LOCAL, uncommitted): ModelBlaster is upstreamed as
+# a standalone repo, so this script resolves examples/harness/kernels relative to
+# the ModelBlaster root. When embedded as a submodule of zephyr-chipyard-sw, the
+# example run.sh scripts set REPO_ROOT to the *parent* (zephyr) repo, so retarget
+# it to the nested modelblaster/ dir. No-op in a standalone checkout.
+if [[ -d "${REPO_ROOT}/modelblaster/pipeline" ]]; then
+    # The parent (zephyr) repo becomes the package root so `python -m
+    # modelblaster.pipeline.*` resolves once we cd into the nested dir.
+    export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+    REPO_ROOT="${REPO_ROOT}/modelblaster"
+fi
+
 BACKEND="${BACKEND:-reference}"
 TARGET="${TARGET:-scalar}"
 QUANT="${QUANT:-fp32}"
@@ -95,6 +107,26 @@ _mb_stage_begin extract
 # re-running tracing. Set FORCE_EXTRACT=1 to override.
 if [[ -f "${IR_DIR}/graph.json" && -f "${IR_DIR}/weights.npz" && -f "${IR_DIR}/io.npz" && "${FORCE_EXTRACT:-0}" != "1" ]]; then
     echo "  (skipped — IR present at ${IR_DIR}; set FORCE_EXTRACT=1 to re-run)"
+elif [[ -n "${BENCH_FILE:-}" ]]; then
+    # KernelBench mode: caller passes BENCH_FILE (a level1 .py path); route
+    # through extract_graph's --bench-file loader instead of --model (the
+    # kernelbench MODEL_NAME is a path like kernelbench/kb_<name>, not a
+    # registered model).
+    # Default sizing: cap baked io to BENCH_TARGET_MB MiB (256), shrinking
+    # batch->spatial and protecting channels for good HW utilization. Set
+    # BENCH_TARGET_MB=0 for stock dims. BENCH_MAX_ELEMENTS>0 is the LEGACY
+    # tiny-element-cap override (kept for reproducing old results).
+    # BENCH_TARGET_GFLOPS>0 bounds COMPUTE (forward FLOPs) instead of just io —
+    # needed for large-K matmuls / 3D convs that have tiny io but huge FLOPs;
+    # BENCH_TARGET_MB stays an io ceiling. Same knob as the ExecuTorch exporter
+    # (gen_pte_kb_sized.py --target-gflops), so both flows size identically.
+    python -m modelblaster.pipeline.extract_graph \
+        --bench-file "${BENCH_FILE}" \
+        --out-dir "${IR_DIR}" \
+        --quant "${QUANT}" \
+        --bench-target-mb "${BENCH_TARGET_MB:-256}" \
+        --bench-target-gflops "${BENCH_TARGET_GFLOPS:-0}" \
+        --bench-max-elements "${BENCH_MAX_ELEMENTS:-0}"
 else
     python -m modelblaster.pipeline.extract_graph \
         --model "${MODEL_NAME}" \
@@ -211,6 +243,14 @@ _mb_stage_begin generate_kernels
 python -m modelblaster.pipeline.generate_kernels "${GEN_KERNELS_ARGS[@]}"
 _mb_stage_end generate_kernels
 
+# STAGE_ONLY=1 stops after codegen (extract/skeleton/kernels), skipping the
+# build+run — used by the multi-model wrapper to stage each bench's
+# generated/<target>/ dir before fusing them into one ELF.
+if [[ "${STAGE_ONLY:-0}" == "1" ]]; then
+    echo "[stage-only] generated -> ${GEN_DIR}"
+    return 0 2>/dev/null || exit 0
+fi
+
 # RUNNER selects the simulator behind stages 4-5: spike (default; in-process
 # spike subprocess) or firesim (build for chipyard_riscv64, copy elf into
 # the FireSim sim slot, runworkload, tail uartlog). The build (4/5) and
@@ -220,6 +260,21 @@ RUNNER="${RUNNER:-spike}"
 case "${RUNNER}" in
     spike)
         BOARD_TARGET="spike_riscv64"
+        ;;
+    native)
+        # Zephyr native_sim: build the harness as a plain x86-64 host binary.
+        # Runs at native speed with host-backed memory, so it validates the
+        # reference kernels at FULL stock dimensions (spike's 256 MB Zephyr RAM
+        # region can't hold them). Requires the host toolchain (not the RISC-V
+        # SDK) and a scalar target (native x86 can't use RVV) — the reference
+        # kernel math is identical across targets, so this checks the same code.
+        BOARD_TARGET="native_sim/native/64"
+        export ZEPHYR_TOOLCHAIN_VARIANT=host
+        if [[ "${GEN_TARGET}" == rvv* ]]; then
+            echo "ERROR: RUNNER=native needs a scalar TARGET (got ${GEN_TARGET}); " \
+                 "set TARGET=scalar" >&2
+            exit 1
+        fi
         ;;
     firesim)
         # Chipyard's quad-rocket-saturn board target. Pulls in the
@@ -240,6 +295,12 @@ from modelblaster.pipeline.backends import get
 b = get('${GEN_TARGET}')
 print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}')))
 ")
+if [[ "${RUNNER}" == "native" ]]; then
+    # The scalar backend ships no kernel cflags, so the reference kernels would
+    # compile unoptimized — far too slow at stock KernelBench dims (e.g. a
+    # 2048^3 matmul). Add -O2 (no -ffast-math, so fp semantics are unchanged).
+    KERNEL_CFLAGS="${KERNEL_CFLAGS:+${KERNEL_CFLAGS};}-O2"
+fi
 WEST_CMAKE_ARGS=(
     -DMODEL_DIR="${GEN_DIR}"
     -DMODELBLASTER_BACKEND="${GEN_TARGET}"
@@ -248,6 +309,32 @@ if [[ -n "${KERNEL_CFLAGS}" ]]; then
     WEST_CMAKE_ARGS+=(-DMODELBLASTER_KERNEL_CFLAGS="${KERNEL_CFLAGS}")
 fi
 WEST_BUILD_EXTRA=()
+# Auto-size the Zephyr ram0 region from the actual baked-io footprint so the
+# default (256 MB target) sizing runs on-target without anyone remembering a
+# manual bump — for BOTH spike AND firesim (the stock 256 MB ram0 =
+# dts/.../ram0 0x10000000 is a config, not a hw limit). ram0 ~= rodata(io) +
+# working buffers + code/stack. SPIKE_RAM_SIZE (hex bytes) overrides the derived
+# value; AUTO_RAM0=0 disables. Caps: firesim modeled DRAM (FIRESIM_DRAM_MB,
+# default 1024) or spike single-cell 4 GiB.
+_RAM0_MB=0
+if [[ "${AUTO_RAM0:-1}" == "1" ]]; then
+    _io=0
+    if [[ -f "${IR_DIR}/io.npz" ]]; then
+        _io=$(python -c "import numpy as np,sys; d=np.load(sys.argv[1]); print(int(d['input'].nbytes)+int(d['output'].nbytes))" "${IR_DIR}/io.npz" 2>/dev/null || echo 0)
+    fi
+    _bytes=$(( _io * 3 + 128*1024*1024 ))                 # io + ~working + margin
+    [[ -n "${SPIKE_RAM_SIZE:-}" ]] && _bytes=$(( SPIKE_RAM_SIZE ))
+    _sz=$(( ((_bytes + 0x3FFFFFF) / 0x4000000) * 0x4000000 ))   # round up 64 MiB
+    if (( _sz > 0x10000000 )); then                        # only if > stock 256 MiB
+        if [[ "${RUNNER}" == "firesim" ]]; then _cap=$(( ${FIRESIM_DRAM_MB:-1024} * 1024*1024 )); else _cap=$(( 0xF0000000 )); fi
+        if (( _sz > _cap )); then echo "WARN: derived ram0 $((_sz/1048576))MB > ${RUNNER} cap $((_cap/1048576))MB; clamping" >&2; _sz=$_cap; fi
+        _RAM_OVL="${IR_DIR}/ram0.overlay"
+        printf '/* @generated by _run_lib.sh: auto ram0 for baked io */\n&ram0 { reg = < 0x80000000 0x%x >; };\n' "${_sz}" > "${_RAM_OVL}"
+        WEST_BUILD_EXTRA+=(-DEXTRA_DTC_OVERLAY_FILE="${_RAM_OVL}")
+        _RAM0_MB=$(( _sz / 1048576 ))
+        echo "[ram0] auto-sized to ${_RAM0_MB} MiB (baked io ~$((_io/1048576))MB) for ${RUNNER}" >&2
+    fi
+fi
 if [[ "${RUNNER}" == "firesim" ]]; then
     # Splice the firesim overlay through Zephyr's EXTRA_CONF_FILE knob.
     # `west build -- -DEXTRA_CONF_FILE=...` arrives as a CMake -D, which
@@ -270,12 +357,42 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
     )
+elif [[ "${RUNNER}" == "spike" && "${ET_SMP:-0}" != "1" ]]; then
+    # Default spike to a 1-core, 1-thread INLINE pthreadpool (+ unbuffered HTIF for
+    # live markers). The harness prj.conf is MP_MAX_NUM_CPUS=4, which on spike is
+    # >10x slower (4-hart emulation + pthreadpool oversubscription) and looks like
+    # a hang. Opt into multicore with ET_SMP=1, or override SPIKE_CONF=.
+    WEST_BUILD_EXTRA+=(
+        -DEXTRA_CONF_FILE="${REPO_ROOT}/harness/backends/${SPIKE_CONF:-spike_single_core.conf}"
+    )
+fi
+# CMODEL_LARGE=1 selects the RISC-V large code model (auipc+constant-pool /
+# R_RISCV_64 indirection) so the program + all static symbols are no longer
+# confined to a single 2 GiB window — lifts the R_RISCV_PCREL_HI20 truncation
+# that stock-dimension baked io hits under the default medany model. Needs an
+# SDK gcc that supports -mcmodel=large for rv64 (Zephyr SDK >= 1.0.0-beta1 /
+# gcc 14). Orthogonal to -march; applies on any RISC-V board (spike/firesim).
+if [[ "${CMODEL_LARGE:-0}" == "1" ]]; then
+    WEST_BUILD_EXTRA+=(-DCONFIG_RISCV_CMODEL_LARGE=y)
+fi
+# MB_NO_BIGIO_REORDER=1 keeps the baked io in .rodata even under CMODEL_LARGE
+# (harness places it above .bss by default). Mainly to A/B the reorder.
+if [[ "${MB_NO_BIGIO_REORDER:-0}" == "1" ]]; then
+    WEST_BUILD_EXTRA+=(-DMB_NO_BIGIO_REORDER=1)
 fi
 _mb_stage_begin build
 west build -p -b "${BOARD_TARGET}" harness \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 _mb_stage_end build
+
+# BUILD_ONLY=1 stops after the west build (link) and skips the run+compare.
+# Used to A/B link-time behaviour (e.g. medany R_RISCV_PCREL_HI20 truncation
+# vs CMODEL_LARGE) without needing a target that can actually hold/run the io.
+if [[ "${BUILD_ONLY:-0}" == "1" ]]; then
+    echo "[build-only] link done -> ${BUILD_DIR}/zephyr/zephyr.elf"
+    exit 0
+fi
 
 echo "[5/5] ${RUNNER} + compare"
 _mb_stage_begin run
@@ -326,12 +443,25 @@ print(' '.join(b.spike_args))
     for a in ${SPIKE_ARGS}; do
         SPIKE_FLAGS+=("--spike-arg=${a}")
     done
-    # Gemmini backend needs the chipyard spike (has --extension=gemmini support
-    # + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE env if set, else chipyard path.
+    # Give spike enough modeled DRAM to cover a bumped ram0 (stock-dimension
+    # runs). spike default is 2 GiB at 0x80000000; SPIKE_MEM_MB overrides it.
+    # Auto-cover the derived ram0: only override spike's 2 GiB default when the
+    # auto-sized ram0 exceeds it (SPIKE_MEM_MB overrides either way).
+    _mem="${SPIKE_MEM_MB:-}"
+    if [[ -z "${_mem}" && "${_RAM0_MB:-0}" -gt 1984 ]]; then _mem=$(( _RAM0_MB + 64 )); fi
+    if [[ -n "${_mem}" ]]; then
+        SPIKE_FLAGS+=("--spike-arg=-m${_mem}")
+    fi
+    # Gemmini backend (incl. Q31 variant) needs the chipyard spike (has
+    # --extension=gemmini support + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE
+    # env if set, else chipyard path. The Q31 acc_scale variant uses the same
+    # spike binary; MODELBLASTER_GEMMINI_LIB_DIR is normally per-config under
+    # cores/gemmini/include/per_config/<sub>/libgemmini.so — see
+    # modelblaster/scripts/validate_q31_matrix.sh.
     SPIKE_BIN_FLAGS=()
-    if [[ "${GEN_TARGET}" == "gemmini" ]]; then
-        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+    if [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" ]]; then
+        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/bin/spike}"
+        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/lib}"
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
             export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
@@ -358,6 +488,15 @@ print(' '.join(b.spike_args))
         "${SPIKE_BIN_FLAGS[@]}" \
         "${SPIKE_FLAGS[@]}" \
         "${PROFILE_FLAGS[@]}"
+elif [[ "${RUNNER}" == "native" ]]; then
+    # native_sim: the built artifact is a host executable (zephyr.exe). Run it
+    # directly and reuse the shared verify/compare path.
+    python -m modelblaster.validation.native_runner \
+        --elf "${BUILD_DIR}/zephyr/zephyr.exe" \
+        --io "${IR_DIR}/io.npz" \
+        --quant "${QUANT}" \
+        --timeout "${NATIVE_TIMEOUT:-600}" \
+        ${TOL_FLAGS}
 else
     # firesim: the runner copies the elf into the sim slot, runs
     # firesim runworkload, tails the uartlog until OUTPUT_END, then

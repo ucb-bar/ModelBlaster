@@ -1,0 +1,112 @@
+# KernelBench level1 on rvv/fp16 (reference, spike)
+
+**100 / 100 PASS.** Every level1 problem runs in fp16 on RVV/spike
+(`--target rvv --quant fp16`, rvv_f16 backend with Zvfh/Zfh). fp16 ops
+are auto-generated `_f16` variants of the fp32 kernels (fp16 storage,
+fp32 math). Golden = fp32 math on fp16-round-tripped inputs; tol atol=0.01
+rtol=0.01 (fp16). Regenerate: `QUANT=fp16 JOBS=6 BENCHES=<all> bash run_all.sh`.
+
+| bench | status | max_abs_err |
+|---|---|---|
+| 100_HingeLoss | PASS | 0 |
+| 10_3D_tensor_matrix_multiplication | PASS | 0 |
+| 11_4D_tensor_matrix_multiplication | PASS | 0 |
+| 12_Matmul_with_diagonal_matrices_ | PASS | 0 |
+| 13_Matmul_for_symmetric_matrices | PASS | 0 |
+| 14_Matmul_for_upper_triangular_matrices | PASS | 0 |
+| 15_Matmul_for_lower_triangular_matrices | PASS | 0 |
+| 16_Matmul_with_transposed_A | PASS | 0 |
+| 17_Matmul_with_transposed_B | PASS | 0 |
+| 18_Matmul_with_transposed_both | PASS | 0 |
+| 19_ReLU | PASS | 0 |
+| 1_Square_matrix_multiplication_ | PASS | 0 |
+| 20_LeakyReLU | PASS | 0 |
+| 21_Sigmoid | PASS | 0 |
+| 22_Tanh | PASS | 0 |
+| 23_Softmax | PASS | 7.63e-06 |
+| 24_LogSoftmax | PASS | 0.00391 |
+| 25_Swish | PASS | 0 |
+| 26_GELU_ | PASS | 0.000488 |
+| 27_SELU_ | PASS | 0 |
+| 28_HardSigmoid | PASS | 0 |
+| 29_Softplus | PASS | 0 |
+| 2_Standard_matrix_multiplication_ | PASS | 0 |
+| 30_Softsign | PASS | 0 |
+| 31_ELU | PASS | 0 |
+| 32_HardTanh | PASS | 0 |
+| 33_BatchNorm | PASS | 0 |
+| 34_InstanceNorm | PASS | 0.000977 |
+| 35_GroupNorm_ | PASS | 0.000977 |
+| 36_RMSNorm_ | PASS | 0.000977 |
+| 37_FrobeniusNorm_ | PASS | 3.81e-06 |
+| 38_L1Norm_ | PASS | 0.000977 |
+| 39_L2Norm_ | PASS | 6.1e-05 |
+| 3_Batched_matrix_multiplication | PASS | 0 |
+| 40_LayerNorm | PASS | 0.000977 |
+| 41_Max_Pooling_1D | PASS | 0 |
+| 42_Max_Pooling_2D | PASS | 0 |
+| 43_Max_Pooling_3D | PASS | 0 |
+| 44_Average_Pooling_1D | PASS | 0 |
+| 45_Average_Pooling_2D | PASS | 0 |
+| 46_Average_Pooling_3D | PASS | 0 |
+| 47_Sum_reduction_over_a_dimension | PASS | 0 |
+| 48_Mean_reduction_over_a_dimension | PASS | 0 |
+| 49_Max_reduction_over_a_dimension | PASS | 0 |
+| 4_Matrix_vector_multiplication_ | PASS | 0 |
+| 50_conv_standard_2D__square_input__square_kernel | PASS | 0.000977 |
+| 51_Argmax_over_a_dimension | PASS | 0 |
+| 52_Argmin_over_a_dimension | PASS | 0 |
+| 53_Min_reduction_over_a_dimension | PASS | 0 |
+| 54_conv_standard_3D__square_input__square_kernel | PASS | 0.000977 |
+| 55_conv_standard_2D__asymmetric_input__square_kernel | PASS | 0.000977 |
+| 56_conv_standard_2D__asymmetric_input__asymmetric_kernel | PASS | 0.000488 |
+| 57_conv_transposed_2D__square_input__square_kernel | PASS | 0.000977 |
+| 58_conv_transposed_3D__asymmetric_input__asymmetric_kernel | PASS | 0.000488 |
+| 59_conv_standard_3D__asymmetric_input__square_kernel | PASS | 0.000977 |
+| 5_Matrix_scalar_multiplication | PASS | 0 |
+| 60_conv_standard_3D__square_input__asymmetric_kernel | PASS | 0.000488 |
+| 61_conv_transposed_3D__square_input__square_kernel | PASS | 0.000977 |
+| 62_conv_standard_2D__square_input__asymmetric_kernel | PASS | 0.000977 |
+| 63_conv_standard_2D__square_input__square_kernel | PASS | 0.000977 |
+| 64_conv_transposed_1D | PASS | 0.000488 |
+| 65_conv_transposed_2D__square_input__asymmetric_kernel | PASS | 0.000977 |
+| 66_conv_standard_3D__asymmetric_input__asymmetric_kernel | PASS | 0.000977 |
+| 67_conv_standard_1D | PASS | 0.000977 |
+| 68_conv_transposed_3D__square_input__asymmetric_kernel | PASS | 0.000977 |
+| 69_conv_transposed_2D__asymmetric_input__asymmetric_kernel | PASS | 0.000977 |
+| 6_Matmul_with_large_K_dimension_ | PASS | 0.0625 |
+| 70_conv_transposed_3D__asymmetric_input__square_kernel | PASS | 0.000977 |
+| 71_conv_transposed_2D__asymmetric_input__square_kernel | PASS | 0.000488 |
+| 72_conv_transposed_3D_asymmetric_input_asymmetric_kernel___strided_padded_grouped_ | PASS | 0.000488 |
+| 73_conv_transposed_3D_asymmetric_input_square_kernel__strided_padded__grouped | PASS | 0.000488 |
+| 74_conv_transposed_1D_dilated | PASS | 0.000488 |
+| 75_conv_transposed_2D_asymmetric_input_asymmetric_kernel_strided__grouped____padded____dilated__ | PASS | 0.000488 |
+| 76_conv_standard_1D_dilated_strided__ | PASS | 0.000488 |
+| 77_conv_transposed_3D_square_input_square_kernel___padded____dilated____strided__ | PASS | 0.000488 |
+| 78_conv_transposed_2D_asymmetric_input_asymmetric_kernel___padded__ | PASS | 0.000977 |
+| 79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__ | PASS | 0.000488 |
+| 7_Matmul_with_small_K_dimension_ | PASS | 0 |
+| 80_conv_standard_2D_square_input_asymmetric_kernel___dilated____padded__ | PASS | 0.000977 |
+| 81_conv_transposed_2D_asymmetric_input_square_kernel___dilated____padded____strided__ | PASS | 0.000244 |
+| 82_conv_depthwise_2D_square_input_square_kernel | PASS | 0.000977 |
+| 83_conv_depthwise_2D_square_input_asymmetric_kernel | PASS | 0.000488 |
+| 84_conv_depthwise_2D_asymmetric_input_square_kernel | PASS | 0.000488 |
+| 85_conv_depthwise_2D_asymmetric_input_asymmetric_kernel | PASS | 0.000977 |
+| 86_conv_depthwise_separable_2D | PASS | 0.000488 |
+| 87_conv_pointwise_2D | PASS | 0.000977 |
+| 88_MinGPTNewGelu | PASS | 0 |
+| 89_cumsum | PASS | 8 |
+| 8_Matmul_with_irregular_shapes_ | PASS | 0 |
+| 90_cumprod | PASS | 0 |
+| 91_cumsum_reverse | PASS | 8 |
+| 92_cumsum_exclusive | PASS | 8 |
+| 93_masked_cumsum | PASS | 4 |
+| 94_MSELoss | PASS | 0 |
+| 95_CrossEntropyLoss | PASS | 0 |
+| 96_HuberLoss | PASS | 0 |
+| 97_ScaledDotProductAttention | PASS | 0.000488 |
+| 98_KLDivLoss | PASS | 6.1e-05 |
+| 99_TripletMarginLoss | PASS | 0 |
+| 9_Tall_skinny_matrix_multiplication_ | PASS | 0 |
+
+_100 PASS / 0 FAIL_

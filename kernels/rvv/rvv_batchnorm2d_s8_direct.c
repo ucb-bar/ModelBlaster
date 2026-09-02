@@ -41,10 +41,29 @@ void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
             int i = 0;
             size_t vl;
             for (; i < hw; i += vl) {
-                vl = __riscv_vsetvl_e8m2(hw - i);
+                const size_t n_elem = (size_t)(hw - i);
+                vl = __riscv_vsetvl_e8m2(n_elem);
                 /* Load int8 input */
                 vint8m2_t vi8 = __riscv_vle8_v_i8m2(in_ptr + i, vl);
 
+                /* THE AVL IS THE ELEMENT COUNT, NEVER A PREVIOUS vsetvl'S
+                 * RESULT, AND THAT IS NOT STYLE. Written as
+                 * `__riscv_vsetvl_e32m8(vl)` -- chaining one vsetvl on
+                 * another's return value -- GCC 14.3 substitutes an
+                 * unrelated register for the AVL. Measured in the avgpool
+                 * kernel, which had the same shape: the second vsetvl was
+                 * issued with the OUTER LOOP BOUND as its AVL, vl came out
+                 * 5 where the row is 11 wide, the `vsetvli zero,zero` forms
+                 * carried that 5 down to the store, and six of every eleven
+                 * outputs were never written. max_abs_err=68, and silent.
+                 *
+                 * It was correct under GCC 13.2 -- the compiler these
+                 * kernels were verified on, and still the default `CROSS`.
+                 * 13.2 has its own bug (the paragraph below), which is why
+                 * 14.3 is mandatory: these kernels moved from a compiler
+                 * that crashes loudly to one that answers wrongly. Passing
+                 * the element count to every width is correct under both.
+                 */
                 /* Switch to the 32-bit domain EXPLICITLY before widening.
                  *
                  * GCC 13.2 does not track vtype across this kernel's mixed
@@ -61,7 +80,7 @@ void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
                  * element COUNT is unchanged (EMUL scales with SEW: e8m2 and
                  * e32m8 hold the same number of elements), so this costs one
                  * vsetvli per iteration and changes no arithmetic. */
-                size_t vl32 = __riscv_vsetvl_e32m8(vl);
+                size_t vl32 = __riscv_vsetvl_e32m8(n_elem);
                 /* Sign-extend i8 -> i32 directly (4x widen) */
                 vint32m8_t vi32 = __riscv_vsext_vf4_i32m8(vi8, vl32);
                 /* Convert to float */
@@ -76,9 +95,9 @@ void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
                 /* Narrow i32 -> i16 -> i8. Each narrowing step names the
                  * DESTINATION width, so step back down through the domains
                  * explicitly for the same reason as the widening above. */
-                size_t vl16 = __riscv_vsetvl_e16m4(vl);
+                size_t vl16 = __riscv_vsetvl_e16m4(n_elem);
                 vint16m4_t vi16_out = __riscv_vncvt_x_x_w_i16m4(vi_out, vl16);
-                size_t vl8 = __riscv_vsetvl_e8m2(vl);
+                size_t vl8 = __riscv_vsetvl_e8m2(n_elem);
                 vint8m2_t vi8_out = __riscv_vncvt_x_x_w_i8m2(vi16_out, vl8);
                 /* Store */
                 __riscv_vse8_v_i8m2(out_ptr + i, vi8_out, vl8);
