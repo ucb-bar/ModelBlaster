@@ -154,6 +154,19 @@
  *   IM2COL_ELEMS: max K_inner = IC=256,K=3×3     → 2304 (yolov8 detect head)
  *   ACC_ELEMS:    max OC      = 256               (yolov8 l7/l8/l9)
  */
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_GQRVIM_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_GQRVIM_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_GQRVIM_WS_SLOTS = 1 };
+#define MB_GEM_GQRVIM_WS_SLOT 0
+#endif
+
 enum {
     WS_BYTES       = 512 * 1024,
     IM2COL_ELEMS   = DIM * 256 * 9,   /* DIM rows × max K_inner (IC=256, 3×3) */
@@ -237,9 +250,24 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     /* ws_weight is gone — generate_skeleton.py::_backend_pack_weight
      * pre-packs weights to flat HWIO at codegen time, so we pass
      * `weight` straight into tiled_matmul_auto below. */
-    static elem_t ws_input  [WS_BYTES]     __attribute__((aligned(64)));
-    static elem_t ws_im2col [IM2COL_ELEMS] __attribute__((aligned(64)));
-    static acc_t  ws_acc_out[ACC_ELEMS]    __attribute__((aligned(64)));
+    /* ONE WORKSPACE SLOT PER HART. These buffers hold THIS call's activation
+     * data / partial sums, so two harts inside this function at once
+     * overwrite each other's image. Same defect, same fix, as
+     * gemmini_conv2d_s8_gemmini_im2col_full_C.c, where it was REACHED and
+     * measured: yolov8_nano over a gemmini pair ran 14 concurrent conv pairs
+     * and reported max_abs_err=89 against 0 on a single gemmini hart.
+     *
+     * NOT REACHED HERE, and not measurable from this campaign: no curated
+     * pick in dronet / yolov8_nano / vint / mlp_control selects this kernel,
+     * so it contributes no .bss to any binary measured for that fix and no
+     * FPGA run in this campaign exercises it. It is corrected because the
+     * defect class is proven, not because a run showed it. */
+    static elem_t ws_input_all  [MB_GEM_GQRVIM_WS_SLOTS][WS_BYTES]     __attribute__((aligned(64)));
+    static elem_t ws_im2col_all [MB_GEM_GQRVIM_WS_SLOTS][IM2COL_ELEMS] __attribute__((aligned(64)));
+    static acc_t  ws_acc_out_all[MB_GEM_GQRVIM_WS_SLOTS][ACC_ELEMS]    __attribute__((aligned(64)));
+    elem_t *const ws_input   = ws_input_all  [MB_GEM_GQRVIM_WS_SLOT];
+    elem_t *const ws_im2col  = ws_im2col_all [MB_GEM_GQRVIM_WS_SLOT];
+    acc_t  *const ws_acc_out = ws_acc_out_all[MB_GEM_GQRVIM_WS_SLOT];
 
     int OH = (IH + 2*PH - KH) / SH + 1;
     int OW = (IW + 2*PW - KW) / SW + 1;

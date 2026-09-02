@@ -44,9 +44,34 @@
 #define MB_CONV_TILE          4   /* output-width register block. 4 i32m4 accs =
                                    * 16 vregs; + w8/w16 fits the 32-register file. */
 
-static int8_t  mb_wt[MB_CONV_WT_MAX];                       /* weight [R, OC] */
-static int8_t  mb_patch[MB_CONV_TILE * MB_CONV_PATCH_MAX];  /* TILE gathered patches */
-static int32_t mb_drain[MB_CONV_OC_MAX];
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_RVV_F16CONVPC_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_RVV_F16CONVPC_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_RVV_F16CONVPC_WS_SLOTS = 1 };
+#define MB_RVV_F16CONVPC_WS_SLOT 0
+#endif
+
+/* ONE SLOT PER HART. mb_wt holds THIS call's transposed weight matrix,
+ * mb_patch THIS call's gathered im2col patches and mb_drain THIS call's
+ * accumulator lanes on the way to the requantise loop -- all per-call
+ * scratch that merely happens to live in file scope. Two harts in this
+ * kernel at once transpose over each other's weights.
+ *
+ * NOT REACHED by any run in this campaign: no curated pick in dronet /
+ * yolov8_nano / vint / mlp_control selects this kernel (yolov8_nano's rvv
+ * conv is rvv_vsmul_vnclip, vint's rvv picks are all reference_impl), so
+ * this correction is unmeasured. It is made because the defect class is
+ * proven: the identical shape in the gemmini im2col conv kernel WAS
+ * reached and cost max_abs_err=89 on yolov8_nano over a gemmini pair. */
+static int8_t  mb_wt_all   [MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_WT_MAX];
+static int8_t  mb_patch_all[MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_TILE * MB_CONV_PATCH_MAX];
+static int32_t mb_drain_all[MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_OC_MAX];
 
 static inline int32_t mb_q31_requant_pc(int32_t x, int32_t mult, int32_t shift) {
     int64_t prod = (int64_t)x * (int64_t)mult;
@@ -66,6 +91,7 @@ static inline void mb_store_pixel(vint32m4_t vacc, size_t vl, int oc_base,
                                   int output_offset, int activation_min,
                                   int activation_max, int8_t *out_pix,
                                   size_t pix_stride) {
+    int32_t *const mb_drain = mb_drain_all[MB_RVV_F16CONVPC_WS_SLOT];
     __riscv_vse32_v_i32m4(mb_drain, vacc, vl);
     for (size_t lane = 0; lane < vl; lane++) {
         int oc = oc_base + (int)lane;
@@ -87,6 +113,8 @@ void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
                          const int32_t *output_shift,
                          int activation_min, int activation_max)
 {
+    int8_t *const mb_wt    = mb_wt_all   [MB_RVV_F16CONVPC_WS_SLOT];
+    int8_t *const mb_patch = mb_patch_all[MB_RVV_F16CONVPC_WS_SLOT];
     (void)input_offset; (void)filter_offset;   /* symmetric quant only */
     int OH = (IH + 2 * PH - KH) / SH + 1;
     int OW = (IW + 2 * PW - KW) / SW + 1;

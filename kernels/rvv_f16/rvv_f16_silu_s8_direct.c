@@ -48,15 +48,47 @@
  *   3.1x/5.53-cyc/elem numbers above, which are the best currently
  *   available evidence but not yet a clean-conv confirmation. */
 
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros,
+ * enums or struct tags would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_RVV_F16SILU_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_RVV_F16SILU_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_RVV_F16SILU_WS_SLOTS = 1 };
+#define MB_RVV_F16SILU_WS_SLOT 0
+#endif
+
+struct mb_rvvf16_silu_memo {
+    int8_t lut[256];
+    float  c_si, c_so;
+    int    c_lo, c_hi, c_valid;
+};
+
 void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
                     float scale_in, float scale_out,
                     int activation_min, int activation_max) {
-    static int8_t lut[256];
-    static float  c_si = 0.0f, c_so = 0.0f;
-    static int    c_lo = 0, c_hi = 0, c_valid = 0;
+    /* ONE MEMO SLOT PER HART. lut and the (c_si, c_so, c_lo, c_hi, c_valid)
+     * cache key are shared mutable state: two harts running silu with
+     * DIFFERENT quant parameters at the same time interleave a table build
+     * with a table read, and the reader gathers from a half-rebuilt table.
+     * Latent so far -- no measured schedule runs two silu dispatches on
+     * different harts at once (yolov8_nano's rvv pair overlaps silu only
+     * with conv) -- but the sibling defect in the gemmini im2col conv
+     * kernel WAS reached and cost max_abs_err=89.
+     *
+     * Per-hart slots restore CORRECTNESS, not the memo hit rate: two harts
+     * alternating the same op now each build their own table instead of
+     * sharing one. Making that back into a shared cache would need real
+     * synchronisation and is a separate, measurable change. */
+    static struct mb_rvvf16_silu_memo mb_rvvf16_silu_memo_all[MB_RVV_F16SILU_WS_SLOTS];
+    struct mb_rvvf16_silu_memo *const mb_memo = &mb_rvvf16_silu_memo_all[MB_RVV_F16SILU_WS_SLOT];
+    int8_t *const lut = mb_memo->lut;
 
-    if (!c_valid || scale_in != c_si || scale_out != c_so
-                 || activation_min != c_lo || activation_max != c_hi) {
+    if (!mb_memo->c_valid || scale_in != mb_memo->c_si || scale_out != mb_memo->c_so
+                 || activation_min != mb_memo->c_lo || activation_max != mb_memo->c_hi) {
         for (int v = 0; v < 256; v++) {
             int8_t iv = (int8_t)(uint8_t)v;
             float f = (float)iv * scale_in;
@@ -66,8 +98,8 @@ void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
             if (q > activation_max) q = activation_max;
             lut[v] = (int8_t)q;
         }
-        c_si = scale_in; c_so = scale_out;
-        c_lo = activation_min; c_hi = activation_max; c_valid = 1;
+        mb_memo->c_si = scale_in; mb_memo->c_so = scale_out;
+        mb_memo->c_lo = activation_min; mb_memo->c_hi = activation_max; mb_memo->c_valid = 1;
     }
 
     size_t vlmax = __riscv_vsetvlmax_e8m8();
