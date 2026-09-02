@@ -606,6 +606,33 @@ def apply_split_hint(graph: dict[str, Any],
             continue
         if did in target_ids:
             n, tile_sizes, want_axis = target_ids[did]
+            # An OC slice is a pointer offset ONLY in NCHW, where a channel is a
+            # whole plane. Under NHWC the channel is innermost, so an OC slice
+            # becomes STRIDED -- and the codegen's alias for it
+            # (`elem_offset = oc0 * OH * OW` in generate_skeleton) would hand the
+            # tile a contiguous window that is not the data it was promised.
+            # Same bytes, same size, plausible wrong answer.
+            #
+            # OH is the mirror image: strided in NCHW (hence the gather/scatter
+            # the OH wrapper carries), contiguous in NHWC. Layout does not remove
+            # the split tax, it MOVES it -- docs/IR_TENSOR_LAYOUT_DESIGN.md §6.
+            #
+            # This guard lands in stage 2, BEFORE any NHWC tensor can exist,
+            # precisely so it can never become the thing someone debugs later.
+            if want_axis == "OC" or (want_axis is None
+                                     and _DEFAULT_AXIS.get(op["op"]) == "OC"):
+                _out = (op.get("outputs") or [None])[0]
+                _lay = ((graph.get("tensors") or {}).get(_out) or {}).get(
+                    "layout", "nchw")
+                if _lay != "nchw":
+                    raise SplitHintError(
+                        f"{network}: {op.get('name')} cannot be OC-split while "
+                        f"its output declares layout={_lay!r}. An OC slice is a "
+                        f"contiguous plane range only in nchw; under {_lay!r} "
+                        f"the channel is innermost, so the tile's offset alias "
+                        f"would select the wrong elements and return a "
+                        f"plausible wrong answer. Split on OH instead "
+                        f"(contiguous under nhwc), or keep this tensor nchw.")
             splitter, _axis = _resolve_splitter(op["op"], want_axis, network, did)
             tile_ops = splitter(op, n, network, tile_sizes)
             # Register the per-tile output tensors in the IR's tensors

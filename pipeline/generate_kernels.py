@@ -49,6 +49,59 @@ _ACCURACY_CLASS_RE = re.compile(
 )
 
 
+def _tensor_layout(ir, name):
+    """Declared layout of one IR tensor. Absent means "nchw".
+
+    Absent must keep meaning exactly what it means today: a graph that carries
+    no layout key produces byte-identical output to before this gate existed.
+    """
+    t = (ir.get("tensors") or {}).get(name) or {}
+    return t.get("layout", "nchw")
+
+
+def assert_act_layout_contract(ir, ops, spec, algorithm, backend):
+    """Refuse an (op, backend) whose activation layouts the kernel never agreed to.
+
+    DENY BY DEFAULT, and for a sharper reason than the weight contract above.
+    NCHW and NHWC hold the same bytes in a different order, so handing a kernel
+    the wrong one is not a link error, not a crash, and not even a size
+    mismatch -- it is a plausible wrong answer. And unlike weights, activations
+    cannot be fixed per backend: buffers.c is compiled once per MODEL and shared
+    (generate_skeleton.py:112-123), so a tensor has ONE physical layout whatever
+    hart the schedule lands its producer on.
+
+    So an op whose tensors carry a layout this algorithm does not declare is a
+    hard stop, never an assumption. Inert while every tensor is nchw and every
+    algorithm declares ("nchw",), which is the state stage 2 lands in.
+
+    See docs/IR_TENSOR_LAYOUT_DESIGN.md section 8.
+    """
+    declared = tuple(getattr(algorithm, "act_layouts", None) or ("nchw",))
+    for op in ops:
+        if op.get("op") != spec.op:
+            continue
+        for kind in ("inputs", "outputs"):
+            for tname in (op.get(kind) or []):
+                lay = _tensor_layout(ir, tname)
+                if lay in declared:
+                    continue
+                raise SystemExit(
+                    f"activation layout contract violated:\n"
+                    f"  op/algo   {spec.op}/{algorithm.name} on "
+                    f"backend {backend.name!r}\n"
+                    f"  tensor    {tname} ({kind[:-1]} of {op.get('name')}) "
+                    f"declares layout={lay!r}\n"
+                    f"  algorithm declares act_layouts={declared}\n"
+                    f"The kernel would index this tensor with the wrong strides "
+                    f"and return a plausible WRONG answer -- NCHW and NHWC are "
+                    f"size-identical, so nothing downstream would notice. Fix by "
+                    f"giving {algorithm.name!r} an act_layouts entry for {lay!r} "
+                    f"and a kernel that honours it, by letting assign_layouts "
+                    f"place a relayout op on this edge, or by keeping the tensor "
+                    f"nchw. Do NOT widen act_layouts without changing the C."
+                )
+
+
 def _assert_curated_layout_contract(spec, algorithm, backend, curated_path):
     """Refuse a curated kernel whose weight layout the skeleton doesn't pack.
 
