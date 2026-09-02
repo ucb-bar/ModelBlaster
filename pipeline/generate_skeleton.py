@@ -84,6 +84,23 @@ _DTYPE_TO_C = {
 }
 
 
+#: Bytes per element. Needed because EVERY intermediate buffer is emitted as
+#: `int8_t buf_...[N]` -- a byte array -- whatever the tensor's dtype
+#: (generate_skeleton emits the size in bytes). So a pointer alias built as
+#: `base + off` advances off BYTES, while every offset computed from a shape
+#: (`oc0 * OH * OW`, `tile_idx * tile_n`) is in ELEMENTS. The two agree only for
+#: 1-byte dtypes, which is why this went unnoticed until vint -- 306 of its
+#: tensors are f16, and its sharded output error jumped ~30x because every tile
+#: past the first landed at HALF its offset and overlapped tile 0.
+_DTYPE_BYTES = {"f32": 4, "f16": 2, "i8": 1, "i32": 4, "i64": 8}
+
+
+def _dtype_bytes(dtype: str) -> int:
+    if dtype not in _DTYPE_BYTES:
+        raise NotImplementedError(f"unknown IR dtype: {dtype}")
+    return _DTYPE_BYTES[dtype]
+
+
 def _dtype_to_c(dtype: str) -> str:
     if dtype not in _DTYPE_TO_C:
         raise NotImplementedError(f"unknown IR dtype: {dtype}")
@@ -2278,7 +2295,12 @@ def emit_model(ir: dict[str, Any], out_dir: str,
                     f"give it an operand/offset emitter -- leaving it here "
                     f"would emit a build that silently computes the wrong "
                     f"answer.")
-            offset_aliases[tile_out] = (base, elem_offset)
+            # Scale to BYTES: the alias is emitted as `base + off` where base
+            # is an `int8_t *` (every buffer is a byte array), so `off` must be
+            # a byte count, while elem_offset above is in elements. Identical
+            # for 1-byte dtypes, which is every graph that existed before vint.
+            _esz = _dtype_bytes((tensors.get(tile_out) or {}).get("dtype", "i8"))
+            offset_aliases[tile_out] = (base, elem_offset * _esz)
 
     # Split tiles: `<parent>.tile_k` produced by pipeline/apply_split_hint.py.
     # apply_split_hint's contract is "no final concat needed -- each tile writes
@@ -2305,8 +2327,16 @@ def emit_model(ir: dict[str, Any], out_dir: str,
         # `elem_offset` is recorded by apply_split_hint._register_tile_tensors
         # because only the splitter knows the partition; `k * prod(shape)` is
         # its even-tile special case and is wrong for an uneven one.
+        # Scale to BYTES here too. This is the SECOND alias source -- the one
+        # that reads the offset the splitter recorded on the tensor -- and it
+        # runs after (and overwrites) the per-op one above. Patching only that
+        # one left vint's f16 tiles still emitting element offsets: the model.c
+        # showed `buf_vint_conv2d_15 + 24192` where 48384 was needed. Two places
+        # computing the same thing, agreeing only for 1-byte dtypes.
+        _esz2 = _dtype_bytes(tinfo.get("dtype", "i8"))
         offset_aliases[tname] = (
-            base, int(tinfo.get("elem_offset", k * _prod(tinfo["shape"]))))
+            base,
+            int(tinfo.get("elem_offset", k * _prod(tinfo["shape"]))) * _esz2)
 
     # Number of ops that actually emit a kernel call (used to size the profile
     # record array). chunk2_c1 is a no-op at runtime (just sets up offset
