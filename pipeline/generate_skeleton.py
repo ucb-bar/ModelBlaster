@@ -1507,8 +1507,29 @@ static void mb_ohtile_conv2d_s8_{mid}(
 _OH_ZEROCOPY_BACKENDS = ("gemmini", "gemmini_q31")
 
 
-def _oh_tile_helper_for(backend: str, mid: str) -> str:
-    if backend in _OH_ZEROCOPY_BACKENDS:
+#: Conv algorithms that actually implement the per-hart OH window
+#: (mb_gem_ohwin_set/_clear). Being on a gemmini backend is NOT sufficient:
+#: gemmini_im2col_full_C does not implement it, and yolov8_nano picks exactly
+#: that one while dronet picks gemmini_tiled_conv. Emitting the zero-copy
+#: wrapper on the strength of the backend alone produced an undefined-reference
+#: link failure -- loud and pre-measurement, which is what the wrapper's own
+#: docstring promised, but avoidable by asking which kernel was actually chosen.
+_OH_ZEROCOPY_ALGOS = {"gemmini_tiled_conv"}
+
+
+def _oh_zerocopy_ok(backend: str, out_dir: str) -> bool:
+    if backend not in _OH_ZEROCOPY_BACKENDS:
+        return False
+    try:
+        with open(os.path.join(out_dir, backend, "kernel_picks.json")) as f:
+            algo = json.load(f)["picks"]["conv2d_s8"]["algorithm"]
+    except (OSError, ValueError, KeyError):
+        return False          # unknown pick -> portable path, never a link error
+    return algo in _OH_ZEROCOPY_ALGOS
+
+
+def _oh_tile_helper_for(backend: str, mid: str, out_dir: str = "") -> str:
+    if out_dir and _oh_zerocopy_ok(backend, out_dir):
         return _OH_TILE_HELPER_ZEROCOPY.format(mid=mid)
     return _OH_TILE_HELPER.format(mid=mid)
 
@@ -4241,7 +4262,7 @@ static inline unsigned long long mb_wall_ticks(void)
     # one produced before this axis existed. That is what lets this study reuse
     # the alignment study's already-measured baseline binaries.
     oh_helper_src = ("\n#include <string.h>\n"
-                     + _oh_tile_helper_for(backend, mid)) if oh_plan else ""
+                     + _oh_tile_helper_for(backend, mid, out_dir)) if oh_plan else ""
 
     c = f"""{HEADER}
 {timer_preamble}
