@@ -2802,8 +2802,15 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                     f"tensors in the kernel's own layout, or do not split it.")
             _e_off = int(_sf_e.get("tile_offset_E", 0))
             if _e_off:
-                for _nm in dict.fromkeys(op.get("inputs") or []):
-                    _shim_override[_nm] = f"({ptr_for(_nm, 'in')} + {_e_off})"
+                # Resolve EVERY base pointer before installing ANY override.
+                # `ptr_for` consults `_shim_override` first and follows
+                # aliases, so a binary op whose second input is a view of its
+                # first would otherwise resolve through the override just
+                # installed and come out offset twice.
+                _bases = {nm: ptr_for(nm, "in")
+                          for nm in dict.fromkeys(op.get("inputs") or [])}
+                for _nm, _base in _bases.items():
+                    _shim_override[_nm] = f"({_base} + {_e_off})"
         out_ptr = ptr_for(op["outputs"][0], "out")
         shape_lit = _shape_str(op)
         if op["op"] == "linear":
