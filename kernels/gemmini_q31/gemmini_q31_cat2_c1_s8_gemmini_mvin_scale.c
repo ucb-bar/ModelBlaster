@@ -70,6 +70,19 @@
 #include <gemmini.h>
 #include <gemmini_params.h>
 
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_CAT2_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_CAT2_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_CAT2_WS_SLOTS = 1 };
+#define MB_GEM_CAT2_WS_SLOT 0
+#endif
+
 static void cat2_gemmini_scale_copy(const int8_t *src, int8_t *dst,
                                     size_t count, float ratio)
 {
@@ -90,7 +103,17 @@ static void cat2_gemmini_scale_copy(const int8_t *src, int8_t *dst,
 
     enum { CHUNK_MAX = 4096 };
     static const elem_t ws_b[1] = {1};
-    static acc_t ws_c[CHUNK_MAX] __attribute__((aligned(64)));
+    /* ONE SLOT PER HART. ws_c is this CALL's int32 drain buffer for the
+     * current chunk -- written by gemmini's mvout and read back by the
+     * requantise loop below -- so two harts inside this function at once
+     * hand each other's chunk to the wrong destination. Latent today only
+     * because no measured schedule has ever run two cat dispatches
+     * concurrently (yolov8_nano's gemmini pair overlaps cat with conv, never
+     * cat with cat), and the sibling bug in the im2col conv kernel WAS
+     * reachable and did cost max_abs_err=89 there. 16 KB -> 64 KB. */
+    static acc_t ws_c_all[MB_GEM_CAT2_WS_SLOTS][CHUNK_MAX]
+        __attribute__((aligned(64)));
+    acc_t *const ws_c = ws_c_all[MB_GEM_CAT2_WS_SLOT];
 
     size_t remaining = count;
     size_t offset = 0;

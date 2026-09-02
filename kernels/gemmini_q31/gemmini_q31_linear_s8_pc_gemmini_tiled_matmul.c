@@ -55,6 +55,19 @@
  *             setup cost — mstatus, gemmini_flush, fence — exceeds the
  *             scalar dot-product cost).
  */
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_LINPC_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_LINPC_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_LINPC_WS_SLOTS = 1 };
+#define MB_GEM_LINPC_WS_SLOT 0
+#endif
+
 void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
                          const int32_t *bias, int8_t *output,
                          int M, int K, int N,
@@ -64,7 +77,29 @@ void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
                          int activation_min, int activation_max)
 {
     enum { GEMMINI_LIN_ACC_MAX = 16 * 4096 };
-    static int32_t ws_acc[GEMMINI_LIN_ACC_MAX] __attribute__((aligned(64)));
+    /* ONE SLOT PER HART. ws_acc holds THIS call's raw int32 accumulator
+     * between the gemmini mvout and the CPU requantise loop, so two harts in
+     * the gemmini path at once requantise each other's product.
+     *
+     * REACHED, AND CLEAN ANYWAY -- worth knowing why, because the obvious
+     * explanation is wrong. DroNet runs linear1 and linear2 CONCURRENTLY on
+     * a gemmini pair (trace: linear2 hart0 [4726,4740], linear1 hart1
+     * [4728,4740]) and still measures its serial max_abs_err=2. It is NOT
+     * that they take the scalar fallback: both are M=1, K=2048, N=1 with all
+     * three offsets 0 and output_shift 2, so total_out*K = 2048 >= 256 and
+     * every gemmini_ok condition holds. They run on the accelerator and they
+     * both write ws_acc[0].
+     *
+     * They get away with it because the exposed window is the handful of
+     * instructions between gemmini_fence() and the load of ws_acc[0], not
+     * the 14 us the dispatch takes. Two harts have to land inside tens of
+     * cycles of each other. That makes this a LOW-PROBABILITY race, not a
+     * benign one, and it means DroNet's pre-fix gemmini-pair number was
+     * right by luck rather than by construction. 256 KB -> 1 MB buys the
+     * construction. */
+    static int32_t ws_acc_all[MB_GEM_LINPC_WS_SLOTS][GEMMINI_LIN_ACC_MAX]
+        __attribute__((aligned(64)));
+    int32_t *const ws_acc = ws_acc_all[MB_GEM_LINPC_WS_SLOT];
 
     int total_out = M * N;
     /* Per-channel: the Q0.31 fold path needs every channel's shift in

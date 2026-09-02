@@ -67,6 +67,19 @@
 #include <gemmini.h>
 #include <gemmini_params.h>
 
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_RESADD_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_RESADD_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_RESADD_WS_SLOTS = 1 };
+#define MB_GEM_RESADD_WS_SLOT 0
+#endif
+
 void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
                    float scale_a, float scale_b, float scale_out,
                    int activation_min, int activation_max)
@@ -95,7 +108,23 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
      * clamp -- no multiplier in the loop at all. On a small in-order
      * Rocket the 64-bit multiplier is the loop's critical resource;
      * the tables trade it for L1 hits. */
-    static int64_t ta[256], tb[256];
+    /* ONE SLOT PER HART. ta/tb are rebuilt UNCONDITIONALLY on every call from
+     * this call's (ma, mb) -- they are per-call scratch that merely happens to
+     * live in static storage, not a cache -- so two harts adding tensors with
+     * DIFFERENT quant scales interleave two different tables and both read a
+     * mixture. What has been measured so far only ever ran the two TILES of a
+     * single add concurrently (dronet shardec 3 overlapping pairs, yolov8_nano
+     * shardec 6), where both harts write byte-identical tables and the race has
+     * no wrong outcome; that is why it has stayed invisible. It is not safe in
+     * general -- two DIFFERENT adds co-scheduled would corrupt each other.
+     * 4 KB -> 16 KB.
+     *
+     * Per-hart slots do NOT make this a memo: the table is still rebuilt per
+     * call. Adding a params key would be a separate, measurable change. */
+    static int64_t ta_all[MB_GEM_RESADD_WS_SLOTS][256];
+    static int64_t tb_all[MB_GEM_RESADD_WS_SLOTS][256];
+    int64_t *const ta = ta_all[MB_GEM_RESADD_WS_SLOT];
+    int64_t *const tb = tb_all[MB_GEM_RESADD_WS_SLOT];
     for (int v = 0; v < 256; v++) {
         int sv = v - 128;                 /* ta/tb are indexed by v+128 */
         ta[v] = (int64_t)sv * ma;

@@ -51,6 +51,19 @@
 #include <gemmini.h>
 #include <gemmini_params.h>
 
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_IM2CPC_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_IM2CPC_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_IM2CPC_WS_SLOTS = 1 };
+#define MB_GEM_IM2CPC_WS_SLOT 0
+#endif
+
 enum {
     PAD_BYTES  = 256 * 1024,  /* zero-padded NHWC activation (yolov8 max 105 KB) */
     PART_ELEMS = 16 * 1024,   /* int32 partial-sum tile: rows*OC (yolov8 max 6 KB) */
@@ -65,9 +78,31 @@ void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
                          const int32_t *output_shift,
                          int activation_min, int activation_max)
 {
-    static elem_t ws_pad[PAD_BYTES]  __attribute__((aligned(64)));
-    static acc_t  ws_p0 [PART_ELEMS] __attribute__((aligned(64)));
-    static acc_t  ws_p1 [PART_ELEMS] __attribute__((aligned(64)));
+    /* ONE WORKSPACE SLOT PER HART, for exactly the reason the per-tensor
+     * sibling gemmini_conv2d_s8_gemmini_im2col_full_C.c has them: ws_pad
+     * holds THIS call's zero-padded NHWC activation and ws_p0/ws_p1 hold
+     * THIS call's int32 partial sums across the KH-row chain, so two harts
+     * inside this function at once overwrite each other's image and
+     * accumulator. On the per-tensor sibling that cost max_abs_err=89 on
+     * yolov8_nano over a gemmini pair, against 0 on one gemmini hart.
+     *
+     * REACHED HERE? Not yet, and that is the only reason ViNT has been
+     * reporting a trustworthy 0.327884674 on a gemmini pair: in the
+     * measured ViNT gempair uartlogs conv2d_s8_pc NEVER overlaps another
+     * conv2d_s8_pc -- 332 cross-hart overlapping dispatch pairs, not one of
+     * them conv_pc||conv_pc, because the f16 encoder branch is what runs
+     * alongside. That is a property of one schedule, not of the kernel.
+     * Cost 384 KB -> 1.5 MB; the sizes are UNCHANGED because PAD_BYTES and
+     * PART_ELEMS also gate the `gemmini_ok` fallback below. */
+    static elem_t ws_pad_all[MB_GEM_IM2CPC_WS_SLOTS][PAD_BYTES]
+        __attribute__((aligned(64)));
+    static acc_t  ws_p0_all [MB_GEM_IM2CPC_WS_SLOTS][PART_ELEMS]
+        __attribute__((aligned(64)));
+    static acc_t  ws_p1_all [MB_GEM_IM2CPC_WS_SLOTS][PART_ELEMS]
+        __attribute__((aligned(64)));
+    elem_t *const ws_pad = ws_pad_all[MB_GEM_IM2CPC_WS_SLOT];
+    acc_t  *const ws_p0  = ws_p0_all [MB_GEM_IM2CPC_WS_SLOT];
+    acc_t  *const ws_p1  = ws_p1_all [MB_GEM_IM2CPC_WS_SLOT];
 
     const int OH  = (IH + 2*PH - KH) / SH + 1;
     const int OW  = (IW + 2*PW - KW) / SW + 1;
