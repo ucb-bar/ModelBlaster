@@ -81,10 +81,18 @@ class LinearSplitRejectTest(unittest.TestCase):
             apply_split_hint(g, [{"op": 99, "n_splits": 2}])
 
     def test_reject_non_splittable_op_kind(self):
+        # `conv2d_s8_pc`, not one of the pointwise kinds this used to use:
+        # those became splittable along E, and a rejection test whose subject
+        # is now supported passes for the wrong reason or not at all. The _pc
+        # convs are the ones deliberately refused -- they carry a
+        # per-output-channel scale array that nothing slices -- so they are the
+        # honest subject for "the registry is a gate, not a formality".
         g = _g({
-            "name": "e", "op": "elu_s8",
+            "name": "c", "op": "conv2d_s8_pc",
             "inputs": ["x"], "outputs": ["y"],
-            "shape": {"n": 4},
+            "shape": {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 8,
+                      "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1,
+                      "DH": 1, "DW": 1},
             "dispatch_id": 0, "hardware_target": "any", "depends_on": [],
         })
         with self.assertRaises(SplitHintError):
@@ -665,3 +673,188 @@ class Conv2dOhSplitTest(unittest.TestCase):
         self.assertEqual(out["id_remap"], {"0": [0, 1], "1": [2]})
         consumer = out["ops"][2]
         self.assertEqual(consumer["depends_on"], [0, 1])
+
+
+# ── Pointwise (E) and pool-channel (C) splits ──────────────────────────────
+#
+# These two axes exist because the conv work left them behind, not because they
+# are hard: `silu_s8` is 57 of yolov8n's 155 dispatches and `maxpool2d_s8` is
+# 28.9% of DroNet's gemmini time, and neither could be tiled at all. The tests
+# below pin the three things that make them correct and the two that would make
+# them silently wrong.
+
+def _pointwise_op(did, name, kind, n, inputs=("x",), outputs=("y",),
+                  depends_on=()):
+    return {
+        "name": name, "op": kind,
+        "inputs": list(inputs), "outputs": list(outputs),
+        "shape": {"n": n},
+        "quant": {"scale_in": 0.02, "scale_out": 0.02,
+                  "scale_a": 0.02, "scale_b": 0.02,
+                  "activation_min": -128, "activation_max": 127},
+        "dispatch_id": did, "hardware_target": "any",
+        "depends_on": list(depends_on),
+    }
+
+
+def _pool_op(did, name, C=32, IH=56, IW=56, KH=3, SH=2,
+             inputs=("x",), outputs=("y",), depends_on=()):
+    OH = (IH - KH) // SH + 1
+    return {
+        "name": name, "op": "maxpool2d_s8",
+        "inputs": list(inputs), "outputs": list(outputs),
+        "shape": {"N": 1, "C": C, "IH": IH, "IW": IW, "OH": OH, "OW": OH,
+                  "KH": KH, "KW": KH, "SH": SH, "SW": SH,
+                  "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        "dispatch_id": did, "hardware_target": "any",
+        "depends_on": list(depends_on),
+    }
+
+
+def _g_shaped(op, tensors):
+    g = _g(op)
+    g["tensors"] = tensors
+    return g
+
+
+class PointwiseESplitTest(unittest.TestCase):
+
+    def test_narrows_n_and_records_the_element_offset(self):
+        g = _g(_pointwise_op(0, "s", "silu_s8", 1024))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        t0, t1 = out["ops"]
+        self.assertEqual((t0["shape"]["n"], t1["shape"]["n"]), (512, 512))
+        self.assertEqual(t0["split_from"]["axis"], "E")
+        self.assertEqual(t0["split_from"]["tile_offset_E"], 0)
+        self.assertEqual(t1["split_from"]["tile_offset_E"], 512)
+
+    def test_uneven_partition_offsets_follow_the_widths(self):
+        """The reason `tile_offset_E` is recorded rather than recomputed."""
+        g = _g(_pointwise_op(0, "s", "silu_s8", 1000))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 3,
+                                    "tile_sizes": [200, 300, 500]}])
+        self.assertEqual([o["shape"]["n"] for o in out["ops"]],
+                         [200, 300, 500])
+        self.assertEqual([o["split_from"]["tile_offset_E"] for o in out["ops"]],
+                         [0, 200, 500])
+
+    def test_tile_tensors_are_flat_runs_of_the_parent(self):
+        g = _g_shaped(_pointwise_op(0, "s", "silu_s8", 1024),
+                      {"y": {"shape": [1, 16, 8, 8], "dtype": "i8"}})
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        # 1-D on purpose: the partition need not fall on a plane boundary, and
+        # a 4-D shape would only be true when it happens to.
+        self.assertEqual(out["tensors"]["y.tile_0"]["shape"], [512])
+        self.assertEqual(out["tensors"]["y.tile_0"]["elem_offset"], 0)
+        self.assertEqual(out["tensors"]["y.tile_1"]["elem_offset"], 512)
+
+    def test_binary_pointwise_splits(self):
+        g = _g(_pointwise_op(0, "a", "add_s8", 3136, inputs=("x", "x2")))
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        self.assertEqual([o["shape"]["n"] for o in out["ops"]], [1568, 1568])
+
+    def test_refuses_a_reduction_wearing_a_flat_signature(self):
+        """`mse_loss` has the same `(in, out, n)` shape and outputs ONE value.
+
+        It is absent from the registry, but the registry is a list someone has
+        to keep true. This asserts the operand-extent check catches the shape
+        of the mistake independently -- register a reduction by hand and it is
+        still refused, because its output does not hold `n` elements.
+        """
+        import pipeline.apply_split_hint as ash
+        op = _pointwise_op(0, "r", "silu_s8", 1024)   # registered kind...
+        g = _g_shaped(op, {"x": {"shape": [1024], "dtype": "i8"},
+                           "y": {"shape": [1], "dtype": "i8"}})  # ...reducing
+        with self.assertRaises(SplitHintError) as cm:
+            apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        self.assertIn("1 elements", str(cm.exception))
+        self.assertIn("n=1024", str(cm.exception))
+        del ash
+
+    def test_refuses_a_broadcast_input(self):
+        g = _g_shaped(_pointwise_op(0, "m", "mul_s8", 1024, inputs=("x", "c")),
+                      {"x": {"shape": [1, 16, 8, 8], "dtype": "i8"},
+                       "c": {"shape": [16], "dtype": "i8"},
+                       "y": {"shape": [1, 16, 8, 8], "dtype": "i8"}})
+        with self.assertRaises(SplitHintError) as cm:
+            apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        self.assertIn("'c'", str(cm.exception))
+
+    def test_layout_does_not_restrict_a_flat_split(self):
+        """The property that makes E the only unguarded axis.
+
+        An OC split of an nhwc tensor is refused because a channel range stops
+        being contiguous; a flat element range is contiguous under every
+        permutation, so the same tensor splits fine along E.
+        """
+        g = _g_shaped(_pointwise_op(0, "s", "silu_s8", 1024),
+                      {"y": {"shape": [1, 16, 8, 8], "dtype": "i8",
+                             "layout": "nhwc"}})
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        self.assertEqual(len(out["ops"]), 2)
+
+
+class PoolCSplitTest(unittest.TestCase):
+
+    def test_narrows_c_and_offsets_by_output_planes(self):
+        g = _g_shaped(_pool_op(0, "mp", C=32, IH=56, IW=56, KH=3, SH=2),
+                      {"y": {"shape": [1, 32, 27, 27], "dtype": "i8"}})
+        out = apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        t0, t1 = out["ops"]
+        self.assertEqual((t0["shape"]["C"], t1["shape"]["C"]), (16, 16))
+        self.assertEqual(t0["split_from"]["axis"], "C")
+        self.assertEqual(t1["split_from"]["tile_offset_C"], 16)
+        # OUTPUT planes (27*27), not input planes (56*56). The two differ
+        # whenever the pool subsamples, and using one for the other is a 4.3x
+        # address error on exactly this shape.
+        self.assertEqual(out["tensors"]["y.tile_1"]["elem_offset"], 16 * 27 * 27)
+        self.assertEqual(out["tensors"]["y.tile_1"]["shape"], [1, 16, 27, 27])
+
+    def test_refuses_a_channel_split_of_an_nhwc_tensor(self):
+        """Same contiguity claim as a conv's OC, so the same guard applies."""
+        g = _g_shaped(_pool_op(0, "mp", C=32),
+                      {"y": {"shape": [1, 32, 27, 27], "dtype": "i8",
+                             "layout": "nhwc"}})
+        with self.assertRaises(SplitHintError) as cm:
+            apply_split_hint(g, [{"op": 0, "n_splits": 2}])
+        self.assertIn("C-split", str(cm.exception))
+
+
+class RegistriesAgreeTest(unittest.TestCase):
+    """The two halves of a split registration must name the same kinds.
+
+    `apply_split_hint` decides what MAY be split and `generate_skeleton` decides
+    what CAN be emitted, and they hold independent literals on purpose -- two
+    lists that must agree is a check, one shared list is an assumption. This is
+    the check. A kind in the first and not the second builds and computes
+    garbage; that failure mode has already cost one debugging round (`linear`
+    registered without `_N_SLICEABLE_LINEAR_OPS`).
+    """
+
+    def _skeleton(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+        from pipeline import generate_skeleton
+        return generate_skeleton
+
+    def test_pointwise_registries_agree(self):
+        import pipeline.apply_split_hint as ash
+        gs = self._skeleton()
+        self.assertEqual(set(ash._POINTWISE_KINDS), gs._E_SLICEABLE_ELTWISE_OPS)
+
+    def test_pool_registries_agree(self):
+        import pipeline.apply_split_hint as ash
+        gs = self._skeleton()
+        self.assertEqual(set(ash._POOL_C_KINDS), gs._C_SLICEABLE_POOL_OPS)
+
+    def test_every_pointwise_kind_resolves_to_the_flat_splitter(self):
+        import pipeline.apply_split_hint as ash
+        for kind in ash._POINTWISE_KINDS:
+            self.assertIs(ash._SPLITTABLE[kind], ash._split_elementwise_n, kind)
+            self.assertEqual(ash._DEFAULT_AXIS[kind], "E", kind)
+            self.assertIn(kind, ash._SPLITTABLE_BY_AXIS["E"], kind)
+
+    def test_reductions_are_not_registered(self):
+        import pipeline.apply_split_hint as ash
+        for kind in ("frobenius_norm", "frobenius_norm_f16", "mse_loss",
+                     "hinge_loss", "huber_loss", "mul_c1_f16"):
+            self.assertNotIn(kind, ash._SPLITTABLE, kind)

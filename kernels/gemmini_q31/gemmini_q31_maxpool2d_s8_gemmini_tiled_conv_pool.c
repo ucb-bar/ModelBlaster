@@ -92,6 +92,19 @@
 #include <gemmini.h>
 #include <gemmini_params.h>
 
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and the two definitions would
+ * collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_POOL_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_POOL_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_POOL_WS_SLOTS = 1 };
+#define MB_GEM_POOL_WS_SLOT 0
+#endif
+
 void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
                          int N, int C, int IH, int IW,
                          int KH, int KW, int SH, int SW,
@@ -106,11 +119,40 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
      * and the two would collide once concatenated into kernels.c. */
     enum { GEMMINI_WS_BYTES = 512 * 1024 };
     enum { MAXPOOL_MAX_CHANNELS = 1024 };
-    static elem_t ws_input  [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
-    static elem_t ws_output [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    /* ONE WORKSPACE SLOT PER HART, for the same reason
+     * gemmini_conv2d_s8_gemmini_tiled_conv.c has them: these buffers hold this
+     * CALL's activation data across the NCHW->NHWC transpose, the gemmini
+     * call, and the transpose back, so two harts inside this function at once
+     * overwrite each other's image.
+     *
+     * It was unreachable until 2026-09-02. A maxpool was one dispatch, so only
+     * one hart could be in here at a time; registering the pool's `C` split
+     * axis (apply_split_hint._split_pool2d_c) made two tiles of the SAME pool
+     * schedulable on two harts, and DroNet's 2-way C split on a gemmini pair
+     * measured max_abs_err=72 against the arm's own baseline of 2 -- on
+     * hardware, while spike (one hart) reported the baseline's 2 exactly. A
+     * single-hart build still gets exactly one slot, so nothing changes there.
+     *
+     * NOT FIXED HERE, and worth knowing: 25 other gemmini kernels hold the
+     * same shape of shared static workspace with no per-hart slot (every
+     * im2col_full_C and bn_epilogue variant, the cat*_c1 mvin_scale kernels,
+     * both tiled_matmul linears, the nhwc pool and conv). They are latent for
+     * the same reason this one was -- their ops are either unsplittable today
+     * or never scheduled concurrently -- and fixing them is a separate change
+     * with a real BSS budget question, not a silent ride-along on this one. */
+    static elem_t ws_input_all  [MB_GEM_POOL_WS_SLOTS][GEMMINI_WS_BYTES]
+        __attribute__((aligned(64)));
+    static elem_t ws_output_all [MB_GEM_POOL_WS_SLOTS][GEMMINI_WS_BYTES]
+        __attribute__((aligned(64)));
+    elem_t *const ws_input  = ws_input_all [MB_GEM_POOL_WS_SLOT];
+    elem_t *const ws_output = ws_output_all[MB_GEM_POOL_WS_SLOT];
     /* Per-channel passthrough weights: +2 for every channel (see the FIX
      * note above -- +1 would silently halve every value through
-     * ACC_SCALE_IDENTITY), init once. */
+     * ACC_SCALE_IDENTITY), init once. Kept SHARED deliberately: every hart
+     * writes the identical constant +2, so the init is idempotent and a
+     * concurrent init cannot produce a value neither hart wrote. Per-slot
+     * copies here would cost memory to remove a race that has no wrong
+     * outcome. */
     static elem_t ws_weights[MAXPOOL_MAX_CHANNELS] __attribute__((aligned(64)));
     static int    ws_weights_inited = 0;
 
