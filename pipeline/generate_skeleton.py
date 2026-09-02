@@ -172,6 +172,60 @@ _N_SLICEABLE_LINEAR_OPS = {"linear_s8", "linear", "linear_f16"}
 #: The `raise` in the alias block below is what stops it.
 _OH_SLICEABLE_CONV_OPS = {"conv2d_s8"}
 
+#: Pointwise kinds that can be emitted as an E (flat element range) split tile.
+#:
+#: Unlike the three sets above, this one needs no per-kind emitter: every
+#: pointwise branch in the dispatch chain already reads `op["shape"]["n"]`
+#: (which the splitter narrows) and takes each operand through `ptr_for`
+#: (which the E block below redirects). So the set exists for exactly one
+#: reason -- to make the `raise` in the alias block reachable, so that a kind
+#: registered in `apply_split_hint._POINTWISE_KINDS` and NOT here fails the
+#: build instead of emitting tiles that all write at offset 0.
+#:
+#: Kept as an independent literal rather than imported from apply_split_hint on
+#: purpose: two lists that must agree is a check, one list shared between them
+#: is an assumption. `tests/test_apply_split_hint.py` asserts they agree.
+_E_SLICEABLE_ELTWISE_OPS = {
+    "add", "add_f16", "add_s8", "cast_f16_to_i8",
+    "cast_i8_to_f16", "elu", "elu_f16", "elu_s8",
+    "gelu", "gelu_exact", "gelu_exact_f16", "gelu_f16",
+    "gelu_s8", "hardsigmoid", "hardsigmoid_f16", "hardtanh",
+    "hardtanh_f16", "leaky_relu", "leaky_relu_f16", "leaky_relu_s8",
+    "log", "log_f16", "mul", "mul_f16",
+    "mul_s8", "relu", "relu6", "relu6_f16",
+    "relu6_s8", "relu_f16", "relu_s8", "selu",
+    "selu_f16", "sigmoid", "sigmoid_f16", "sigmoid_s8",
+    "silu", "silu_f16", "silu_s8", "softplus",
+    "softplus_f16", "softsign", "softsign_f16", "swish",
+    "swish_f16", "tanh", "tanh_f16",
+}
+
+#: Pooling kinds that can be emitted as a C (channel range) split tile. The
+#: pool's own emitter offsets the INPUT pointer (by `c0*IH*IW`, which differs
+#: from the output's `c0*OH*OW` whenever the pool subsamples), so unlike the E
+#: set this one does need its emitter kept in step.
+_C_SLICEABLE_POOL_OPS = {"maxpool2d_s8"}
+
+
+def _c_tile_in_offset(op, sh, in_ptr):
+    """Advance a C-split pool tile's INPUT pointer to its own channel planes.
+
+    The output pointer is handled by the tile's offset alias, and it is a
+    DIFFERENT offset: the output planes are `OH*OW` and the input planes are
+    `IH*IW`. A pool with SH>1 subsamples, so using one offset for both -- the
+    obvious simplification -- reads from the wrong channel by a factor of the
+    stride squared. DroNet's maxpool is 56x56 -> 27x27, where that is a 4.3x
+    error in the source address.
+    """
+    sf = op.get("split_from") or {}
+    if sf.get("axis") != "C":
+        return in_ptr
+    c0 = int(sf.get("tile_offset_C", 0))
+    if not c0:
+        return in_ptr
+    return f"({in_ptr} + {c0 * int(sh['IH']) * int(sh['IW'])})"
+
+
 
 def _n_tile_operands(op, sh, w, b):
     """Offset a split tile's weight/bias pointers to its own N-slice.
@@ -2282,6 +2336,20 @@ def emit_model(ir: dict[str, Any], out_dir: str,
                 # be handed its own standalone buffer and the parent would
                 # never be written at all.
                 elem_offset = 0
+            elif axis == "C" and op["op"] in _C_SLICEABLE_POOL_OPS:
+                # Pool output [N, C, OH, OW]: a channel range is `tile_c` whole
+                # planes of OH*OW at `c0*OH*OW`. Same contiguity as a conv's
+                # OC; the axis differs only so the COST model does not apply
+                # the vector/systolic slab quantum to it.
+                OH = int(sh.get("OH", 0))
+                OW = int(sh.get("OW", 0))
+                c0 = int(sf.get("tile_offset_C", 0))
+                elem_offset = c0 * OH * OW
+            elif axis == "E" and op["op"] in _E_SLICEABLE_ELTWISE_OPS:
+                # Flat element range: the offset IS the tile's element offset,
+                # with no shape to multiply through, because the parent's
+                # storage is what the op indexes.
+                elem_offset = int(sf.get("tile_offset_E", 0))
             else:
                 # Reaching here means apply_split_hint produced a tile whose
                 # (axis, op kind) pair has no emitter. Historically this fell
@@ -2710,6 +2778,32 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             _shim_post = (f"kernel_nchw_to_nhwc_s8_{mid}({_so}, {_dst}, "
                           f"{_sh_out[0]}, {_sh_out[1]}, {_sh_out[2]}, "
                           f"{_sh_out[3]})")
+        # ── Flat-element (E) split tile: shift every INPUT pointer ──────
+        # Done here, once, rather than in each of the 47 pointwise emitters.
+        # `_shim_override` is consulted first by `ptr_for`, so redirecting the
+        # operand names through it reaches every branch below without any of
+        # them knowing this axis exists -- which is the whole reason adding 47
+        # kinds needed no per-kind emitter work. The tile's OUTPUT pointer is
+        # already offset by its alias, and `shape["n"]` is already narrowed by
+        # the splitter, so this is the last of the three things a tile needs.
+        _sf_e = op.get("split_from") or {}
+        if _sf_e.get("axis") == "E":
+            if _shim_override:
+                # A layout shim rewrites the operands to point at scratch that
+                # holds the WHOLE tensor; offsetting into it would be right but
+                # each tile would relayout the whole tensor to use 1/n of it.
+                # No pointwise kind can reach here today (they are all in
+                # act_layout.LAYOUT_AGNOSTIC_OPS, which never plans a shim), so
+                # this is a guard against a future kind arriving that can.
+                raise SystemExit(
+                    f"{op.get('name')}: an E split tile also needs a layout "
+                    f"shim. That combination is not emitted -- the shim would "
+                    f"relayout the full tensor once per tile. Keep this op's "
+                    f"tensors in the kernel's own layout, or do not split it.")
+            _e_off = int(_sf_e.get("tile_offset_E", 0))
+            if _e_off:
+                for _nm in dict.fromkeys(op.get("inputs") or []):
+                    _shim_override[_nm] = f"({ptr_for(_nm, 'in')} + {_e_off})"
         out_ptr = ptr_for(op["outputs"][0], "out")
         shape_lit = _shape_str(op)
         if op["op"] == "linear":
@@ -3281,6 +3375,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         elif op["op"] == "maxpool2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
+            # C-split tile: its own input planes. `sh["C"]` is already the
+            # tile's narrowed channel count, so the call below needs nothing
+            # else.
+            in_ptr = _c_tile_in_offset(op, sh, in_ptr)
             PH, PW = sh.get("PH", 0), sh.get("PW", 0)
             DH, DW = sh.get("DH", 1), sh.get("DW", 1)
             call = (

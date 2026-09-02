@@ -554,3 +554,211 @@ class SplitFusedConvOperands(unittest.TestCase):
         tile_oc = self.OC // 2
         self.assertIn(f"bn_scale_scalar + {tile_oc}", calls[1])
         self.assertIn(f"bn_bias_fused_scalar + {tile_oc}", calls[1])
+
+
+# ── Pointwise (E) and pool-channel (C) tiles ───────────────────────────────
+#
+# Same reason as everything above this line: the IR can be perfect and the
+# emitted C still wrong. Two specific defects are in scope here.
+#
+#   * A pointwise tile gets its output pointer from its alias and its `n` from
+#     the splitter, so a tile whose INPUT pointer was left alone still builds,
+#     still runs, and computes tile 0's answer into every tile's slot. The E
+#     axis moves all 47 pointwise kinds at once through `_shim_override`, so
+#     one missed redirect would be 47 wrong kernels, not one.
+#
+#   * A pool tile's input and output offsets are DIFFERENT numbers -- `c0*IH*IW`
+#     and `c0*OH*OW` -- and are equal only when the pool does not subsample.
+#     Every unit test that used a stride-1 pool would pass on code that used one
+#     for both. DroNet's is 56x56 -> 27x27, so the test below subsamples.
+
+def _emit_bare(graph, weights=None, io_in=None, io_out=None, backend="scalar"):
+    """Emit model.c for a graph with no weight tensors of its own."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        ir = td / "graph.json"
+        ir.write_text(json.dumps(graph))
+        np.savez(td / "weights.npz", **(weights or {}))
+        np.savez(td / "io.npz",
+                 input=np.zeros(io_in, dtype=np.int8),
+                 output=np.zeros(io_out, dtype=np.int8))
+        out = td / "generated"
+        argv = sys.argv
+        sys.argv = ["generate_skeleton",
+                    "--ir", str(ir), "--weights", str(td / "weights.npz"),
+                    "--io", str(td / "io.npz"), "--out-dir", str(out),
+                    "--backend", backend, "--platform", "linux"]
+        try:
+            generate_skeleton.main()
+        finally:
+            sys.argv = argv
+        return (out / "model.c").read_text()
+
+
+def _calls(src, kernel):
+    return re.findall(rf"{kernel}[a-z0-9_]*\([^;]*\);", src, re.S)
+
+
+def _pointwise_graph(kind, n, shape, n_inputs=1):
+    ins = ["x"] if n_inputs == 1 else ["x", "x2"]
+    tensors = {"x": {"shape": list(shape), "dtype": "i8",
+                     "quant": {"scale": 0.02, "zero_point": 0}},
+               "y": {"shape": list(shape), "dtype": "i8",
+                     "quant": {"scale": 0.02, "zero_point": 0}}}
+    if n_inputs == 2:
+        tensors["x2"] = dict(tensors["x"])
+    return {
+        "name": "probe",
+        "input": {"tensor": "x"},
+        "output": {"tensors": ["y"]},
+        "tensors": tensors,
+        "ops": [{
+            "name": "pw", "op": kind, "inputs": ins, "outputs": ["y"],
+            "shape": {"n": n},
+            "quant": {"scale_in": 0.02, "scale_out": 0.02,
+                      "scale_a": 0.02, "scale_b": 0.02,
+                      "activation_min": -128, "activation_max": 127},
+            "dispatch_id": 0, "hardware_target": "any", "depends_on": [],
+        }],
+    }
+
+
+def _pool_graph(C, IH, IW, KH, SH):
+    OH = (IH - KH) // SH + 1
+    return {
+        "name": "probe",
+        "input": {"tensor": "x"},
+        "output": {"tensors": ["y"]},
+        "tensors": {
+            "x": {"shape": [1, C, IH, IW], "dtype": "i8",
+                  "quant": {"scale": 0.02, "zero_point": 0}},
+            "y": {"shape": [1, C, OH, OH], "dtype": "i8",
+                  "quant": {"scale": 0.02, "zero_point": 0}},
+        },
+        "ops": [{
+            "name": "mp", "op": "maxpool2d_s8",
+            "inputs": ["x"], "outputs": ["y"],
+            "shape": {"N": 1, "C": C, "IH": IH, "IW": IW, "OH": OH, "OW": OH,
+                      "KH": KH, "KW": KH, "SH": SH, "SW": SH,
+                      "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+            "dispatch_id": 0, "hardware_target": "any", "depends_on": [],
+        }],
+    }
+
+
+class SplitPointwiseElementOffsets(unittest.TestCase):
+
+    def test_unary_tile_offsets_both_pointers(self):
+        n, shape = 1024, [1, 16, 8, 8]
+        g = apply_split_hint(_pointwise_graph("silu_s8", n, shape),
+                             [{"op": 0, "n_splits": 2}])
+        calls = _calls(_emit_bare(g, io_in=shape, io_out=shape), "kernel_silu_s8")
+        self.assertEqual(len(calls), 2, calls)
+        self.assertNotIn("+ 512", calls[0], "tile 0 starts at element 0")
+        # Input AND output. Only the output is wired by the alias machinery;
+        # the input is the one this axis had to add, and without it both tiles
+        # read elements [0, 512) and tile 1 writes tile 0's answer.
+        self.assertEqual(calls[1].count("+ 512"), 2,
+                         f"tile 1 must offset BOTH its input and its output by "
+                         f"512 elements; call was:\n{calls[1]}")
+        self.assertIn(", 512,", calls[1], "tile 1's n must be the tile's, not "
+                                          "the parent's")
+
+    def test_binary_tile_offsets_all_three_pointers(self):
+        """`add_s8` has two inputs, and a redirect that missed one would read
+        the right `a` against the wrong `b`."""
+        n, shape = 1024, [1, 16, 8, 8]
+        g = apply_split_hint(_pointwise_graph("add_s8", n, shape, n_inputs=2),
+                             [{"op": 0, "n_splits": 2}])
+        calls = _calls(_emit_bare(g, io_in=shape, io_out=shape), "kernel_add_s8")
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(calls[1].count("+ 512"), 3,
+                         f"tile 1 must offset a, b and out; call was:\n{calls[1]}")
+
+    def test_the_broken_version_would_have_failed_this(self):
+        """Two tile calls that differ only in the OUTPUT pointer.
+
+        That is exactly what an E split emits if the input redirect is dropped,
+        and it is the same defect the linear tests above pin -- restated here
+        because the mechanism that prevents it is completely different
+        (`_shim_override` redirection, not a per-emitter offset).
+        """
+        n, shape = 1024, [1, 16, 8, 8]
+        g = apply_split_hint(_pointwise_graph("silu_s8", n, shape),
+                             [{"op": 0, "n_splits": 2}])
+        calls = _calls(_emit_bare(g, io_in=shape, io_out=shape), "kernel_silu_s8")
+
+        def _without_out_ptr(c):
+            args = c[c.index("(") + 1:c.rindex(")")].split(",")
+            del args[1]                      # in, OUT, n, ...
+            return ",".join(a.strip() for a in args)
+        self.assertNotEqual(_without_out_ptr(calls[0]), _without_out_ptr(calls[1]))
+
+    def test_uneven_partition_emits_the_recorded_offsets(self):
+        n, shape = 1000, [1000]
+        g = apply_split_hint(_pointwise_graph("silu_s8", n, shape),
+                             [{"op": 0, "n_splits": 3,
+                               "tile_sizes": [200, 300, 500]}])
+        calls = _calls(_emit_bare(g, io_in=shape, io_out=shape), "kernel_silu_s8")
+        self.assertEqual(len(calls), 3)
+        self.assertIn("+ 200", calls[1])
+        self.assertIn("+ 500", calls[2])
+        self.assertIn(", 500,", calls[2])
+
+
+class SplitPoolChannelOffsets(unittest.TestCase):
+
+    def test_input_and_output_offsets_are_different_numbers(self):
+        """The trap. A subsampling pool's planes are not the same size."""
+        C, IH, KH, SH = 32, 56, 3, 2
+        OH = (IH - KH) // SH + 1                      # 27
+        g = apply_split_hint(_pool_graph(C, IH, IH, KH, SH),
+                             [{"op": 0, "n_splits": 2}])
+        src = _emit_bare(g, io_in=[1, C, IH, IH], io_out=[1, C, OH, OH])
+        calls = _calls(src, "kernel_maxpool2d_s8")
+        self.assertEqual(len(calls), 2, calls)
+        c0 = C // 2
+        self.assertIn(f"+ {c0 * IH * IH}", calls[1],      # 50176
+                      f"tile 1's INPUT must skip {c0} planes of {IH}x{IH}; "
+                      f"call was:\n{calls[1]}")
+        self.assertIn(f"+ {c0 * OH * OH}", calls[1],      # 11664
+                      f"tile 1's OUTPUT must skip {c0} planes of {OH}x{OH}")
+        self.assertNotEqual(c0 * IH * IH, c0 * OH * OH,
+                            "this fixture must subsample, or it cannot "
+                            "distinguish the two offsets at all")
+        # And the tile's own channel count, not the parent's.
+        self.assertIn(f", 1, {c0}, {IH}, {IH},", calls[1])
+
+    def test_tile_zero_starts_at_the_base_pointers(self):
+        C, IH, KH, SH = 32, 56, 3, 2
+        OH = (IH - KH) // SH + 1
+        g = apply_split_hint(_pool_graph(C, IH, IH, KH, SH),
+                             [{"op": 0, "n_splits": 2}])
+        src = _emit_bare(g, io_in=[1, C, IH, IH], io_out=[1, C, OH, OH])
+        calls = _calls(src, "kernel_maxpool2d_s8")
+        self.assertNotIn("+ ", calls[0], f"tile 0 needs no offset:\n{calls[0]}")
+
+
+class SplitRegisteredWithoutAnEmitterIsFatal(unittest.TestCase):
+    """The loud failure, restated for the two new axes.
+
+    Three of the four registration sites a split kind needs fail by producing a
+    plausible wrong answer rather than an error. This is the one that does not:
+    a tile whose (axis, kind) pair has no codegen path stops the build. Without
+    it, adding a kind to `_POINTWISE_KINDS` and forgetting
+    `_E_SLICEABLE_ELTWISE_OPS` would ship tiles that all write at offset 0.
+    """
+
+    def test_unemittable_pointwise_kind_stops_the_build(self):
+        n, shape = 1024, [1, 16, 8, 8]
+        g = apply_split_hint(_pointwise_graph("silu_s8", n, shape),
+                             [{"op": 0, "n_splits": 2}])
+        saved = set(generate_skeleton._E_SLICEABLE_ELTWISE_OPS)
+        generate_skeleton._E_SLICEABLE_ELTWISE_OPS.discard("silu_s8")
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                _emit_bare(g, io_in=shape, io_out=shape)
+            self.assertIn("no codegen path", str(cm.exception))
+        finally:
+            generate_skeleton._E_SLICEABLE_ELTWISE_OPS.clear()
+            generate_skeleton._E_SLICEABLE_ELTWISE_OPS.update(saved)

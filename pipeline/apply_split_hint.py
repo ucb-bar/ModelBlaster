@@ -312,6 +312,118 @@ def _split_conv2d_s8_oh(op: dict[str, Any], n_splits: int,
         oh0 += tile_oh
     return tiles
 
+def _split_elementwise_n(op: dict[str, Any], n_splits: int,
+                         network: str, tile_sizes=None) -> list[dict[str, Any]]:
+    """Split a POINTWISE op along its flat element count `n`.
+
+    The cheapest split in the system, and the last one to be built. A pointwise
+    op's IR shape is a single `n` -- `{"n": 100352}`, not `{N, C, H, W}` --
+    because output element `i` is a function of input element `i` alone. So a
+    tile is a contiguous element RANGE: the same kernel, the same scalar quant
+    parameters, `n` narrowed, and every pointer advanced by the tile's offset.
+    There is no weight to slice, no per-channel array to keep in step, and no
+    halo, which is why this splitter is ten lines where `_split_conv2d_s8_oh`
+    is a hundred.
+
+    WHY IT IS LAYOUT-SAFE, uniquely among the axes here. `OC` is a contiguous
+    plane range only in NCHW and `OH` only in NHWC, so both carry a guard that
+    refuses the wrong layout (see `apply_split_hint`). A flat element range is
+    contiguous under EVERY layout -- permuting the axes of a tensor does not
+    change which elements a `[lo, hi)` byte range covers, only which logical
+    coordinates they carry, and a pointwise op does not read coordinates. That
+    is the same property `act_layout.LAYOUT_AGNOSTIC_OPS` records for these
+    kinds, arrived at from the other direction.
+
+    WHAT IT IS NOT SAFE FOR, and the reason the call site guards the operands
+    rather than trusting this registry alone: a kernel whose signature is
+    `(in, out, n, ...)` is not necessarily pointwise. `kernel_mse_loss` and
+    `kernel_frobenius_norm` have exactly that shape and REDUCE -- their output
+    is one scalar, so a "tile" would have both halves writing element 0 and the
+    result would be the last tile's partial sum. `_assert_flat_pointwise`
+    rejects those by checking the operands' extents against `n`, which catches
+    a reduction and a broadcast without either being enumerated.
+
+    Tile boundaries are element counts, not bytes: every buffer here is a typed
+    pointer (`int8_t *`, `_Float16 *`), so `buf + off` advances by `off`
+    ELEMENTS. Computing a byte offset and adding it is the vint `conv2d_f16`
+    bug in a new place.
+    """
+    shape = op["shape"]
+    n = int(shape["n"])
+    widths = _tile_widths(n, n_splits, tile_sizes, network, f"{op['op']} n")
+    out_tensor = op["outputs"][0]
+    tiles: list[dict[str, Any]] = []
+    n0 = 0
+    for t, tile_n in enumerate(widths):
+        tile = copy.deepcopy(op)
+        tile["shape"] = dict(shape)
+        tile["shape"]["n"] = tile_n
+        tile["outputs"] = [f"{out_tensor}.tile_{t}"]
+        tile["name"] = op["name"] + f".tile_{t}"
+        tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
+                              "n_splits": len(widths), "tile_n": tile_n,
+                              "tile_offset_E": n0,
+                              # Parent extent, so a cost model can price an
+                              # UNEVEN partition proportionally instead of
+                              # falling back to "every tile is 1/n" -- which is
+                              # the whole point of allowing uneven tiles.
+                              "parent_n": n,
+                              "axis": "E"}
+        tiles.append(tile)
+        n0 += tile_n
+    return tiles
+
+
+def _split_pool2d_c(op: dict[str, Any], n_splits: int,
+                    network: str, tile_sizes=None) -> list[dict[str, Any]]:
+    """Split a 2-D pooling op along the channel dim `C`.
+
+    Arithmetically this is `_split_conv2d_s8`'s OC split with the weights taken
+    away: NCHW makes a channel range a whole run of planes, every output plane
+    depends only on the input plane beneath it, and no accumulation is
+    reordered. It is strictly SIMPLER than the conv case -- a pool has no
+    filter bank, so `split_conv_tile_weights` has nothing to repack and the
+    whole layout question that forces the rvv convs into per-tile arrays does
+    not arise.
+
+    WHY IT IS AXIS "C" AND NOT "OC", which matters downstream rather than here.
+    A pool's shape key is `C`: input and output channel counts are the same
+    number and the IR names it once. Registering it under "OC" would have made
+    `profile_loader` cost it with the OUTPUT-CHANNEL SLAB model, which asks
+    "how many 32-wide vector slabs is this tile" -- meaningful for a conv whose
+    inner loop is blocked on `vsetvlmax_e32m4`, meaningless for a pool that
+    walks channels one at a time. On DroNet's `maxpool2d_s8` (C=32, the rvv
+    quantum exactly) the slab model answers that both halves of a 2-way split
+    cost a full slab each, i.e. that splitting the single most expensive
+    gemmini op in the network buys nothing. A pool's cost is linear in C, and a
+    separate axis is how the cost model gets told that.
+
+    The layout guard still applies and is applied to "C" by name at the call
+    site: a channel range is contiguous in NCHW and strided in NHWC, exactly as
+    for a conv's OC.
+    """
+    shape = op["shape"]
+    C = int(shape["C"])
+    widths = _tile_widths(C, n_splits, tile_sizes, network, f"{op['op']} C")
+    out_tensor = op["outputs"][0]
+    tiles: list[dict[str, Any]] = []
+    c0 = 0
+    for t, tile_c in enumerate(widths):
+        tile = copy.deepcopy(op)
+        tile["shape"] = dict(shape)
+        tile["shape"]["C"] = tile_c
+        tile["outputs"] = [f"{out_tensor}.tile_{t}"]
+        tile["name"] = op["name"] + f".tile_{t}"
+        tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
+                              "n_splits": len(widths), "tile_c": tile_c,
+                              "tile_offset_C": c0,
+                              "parent_C": C,
+                              "axis": "C"}
+        tiles.append(tile)
+        c0 += tile_c
+    return tiles
+
+
 #: Sub-op shape keys that name an output-channel count, in the order they are
 #: tried. A fused conv's constituents each describe the same tensor in their
 #: own vocabulary: the conv says `OC`, the batchnorm says `C`, the elementwise
@@ -414,6 +526,48 @@ def _split_fused_conv_s8(op: dict[str, Any], n_splits: int,
     return tiles
 
 
+#: Pointwise kinds an `E` (flat element) split can be built for.
+#:
+#: Derived mechanically, not by taste: every kind here has a branch in
+#: `generate_skeleton`'s dispatch chain that reads `op["shape"]["n"]` and takes
+#: each operand through `ptr_for`, which is exactly the shape the E emitter
+#: needs -- narrow `n`, advance the pointers, change nothing else. That is why
+#: no per-kind emitter work was needed to add all 47 of them at once, and why
+#: adding the 48th is a one-line change here IF it has such a branch.
+#:
+#: DELIBERATELY ABSENT: `frobenius_norm`, `mse_loss`, `hinge_loss`,
+#: `huber_loss`. Their kernels have the identical `(in, out, n, ...)`
+#: signature and they REDUCE -- one scalar out, not `n` -- so tiling them
+#: would have both halves writing element 0 and the answer would be whichever
+#: tile finished last. Their exclusion is enforced twice: they are not listed,
+#: and `_assert_flat_pointwise` re-derives the property from the operands'
+#: extents at split time so a future addition cannot reintroduce one silently.
+#:
+#: ALSO ABSENT: `mul_c1_*`. Flat-looking, but the `c1` is a per-CHANNEL
+#: broadcast -- one operand has `C` elements, not `n`.
+_POINTWISE_KINDS: tuple[str, ...] = (
+    "add", "add_f16", "add_s8", "cast_f16_to_i8",
+    "cast_i8_to_f16", "elu", "elu_f16", "elu_s8",
+    "gelu", "gelu_exact", "gelu_exact_f16", "gelu_f16",
+    "gelu_s8", "hardsigmoid", "hardsigmoid_f16", "hardtanh",
+    "hardtanh_f16", "leaky_relu", "leaky_relu_f16", "leaky_relu_s8",
+    "log", "log_f16", "mul", "mul_f16",
+    "mul_s8", "relu", "relu6", "relu6_f16",
+    "relu6_s8", "relu_f16", "relu_s8", "selu",
+    "selu_f16", "sigmoid", "sigmoid_f16", "sigmoid_s8",
+    "silu", "silu_f16", "silu_s8", "softplus",
+    "softplus_f16", "softsign", "softsign_f16", "swish",
+    "swish_f16", "tanh", "tanh_f16",
+)
+
+#: Pooling kinds a `C` (channel) split can be built for. Only the int8 maxpool
+#: today, because that is the one with a `C`-split emitter in
+#: `generate_skeleton` (`_C_SLICEABLE_POOL_OPS`) -- `upsample_nearest_s8` is
+#: the same shape of problem and is NOT here, because its output extent is
+#: `IH*scale` and it needs its own two lines in that emitter first.
+_POOL_C_KINDS: tuple[str, ...] = ("maxpool2d_s8",)
+
+
 #: Op kinds an OC/N split can be built for. The fused convs are here for the
 #: same reason they are in `generate_skeleton._SHARDABLE_CONV_OPS`: that is
 #: where the time is. `conv2d_batchnorm2d_silu_s8` alone is 97% of yolov8n and
@@ -441,6 +595,12 @@ _SPLITTABLE: dict[str, Any] = {
     "conv2d_f16": _split_conv2d_s8,
     "conv2d_batchnorm2d_s8": _split_fused_conv_s8,
     "conv2d_batchnorm2d_silu_s8": _split_fused_conv_s8,
+    # Pointwise and pooling, added together because they are the two kinds of
+    # op that were left unsplittable once the conv work landed and that
+    # DOMINATE what is left: silu_s8 is 57 of yolov8n's 155 dispatches and
+    # maxpool2d_s8 is 28.9% of DroNet's gemmini time.
+    **{k: _split_elementwise_n for k in _POINTWISE_KINDS},
+    **{k: _split_pool2d_c for k in _POOL_C_KINDS},
 }
 
 
@@ -457,6 +617,8 @@ _DEFAULT_AXIS: dict[str, str] = {
     "conv2d_f16": "OC",
     "conv2d_batchnorm2d_s8": "OC",
     "conv2d_batchnorm2d_silu_s8": "OC",
+    **{k: "E" for k in _POINTWISE_KINDS},
+    **{k: "C" for k in _POOL_C_KINDS},
 }
 
 #: axis -> {op kind: splitter}. Only conv2d_s8 has an OH splitter: the fused
@@ -493,7 +655,52 @@ _SPLITTABLE_BY_AXIS: dict[str, dict[str, Any]] = {
            "conv2d_batchnorm2d_s8": _split_fused_conv_s8,
            "conv2d_batchnorm2d_silu_s8": _split_fused_conv_s8},
     "OH": {"conv2d_s8": _split_conv2d_s8_oh},
+    # Flat element range: the only axis with no layout precondition, because a
+    # contiguous byte range is contiguous under every permutation of the axes.
+    "E": {k: _split_elementwise_n for k in _POINTWISE_KINDS},
+    # Channel range on a pool. Separate from "OC" so the cost model does not
+    # apply the output-channel slab quantum to it -- see `_split_pool2d_c`.
+    "C": {k: _split_pool2d_c for k in _POOL_C_KINDS},
 }
+
+
+def _assert_flat_pointwise(graph: dict[str, Any], op: dict[str, Any],
+                           network: str) -> None:
+    """Refuse an E split unless every operand really is `n` elements wide.
+
+    `_POINTWISE_KINDS` is a list, and a list is a claim someone has to keep
+    true. This re-derives the claim from the graph instead: if the op is
+    pointwise then each of its activation operands holds exactly `shape["n"]`
+    elements, so any operand whose declared shape multiplies out to something
+    else means the op is a reduction (output smaller), a broadcast (one input
+    smaller), or simply mis-shaped -- and in all three cases a tile would
+    address memory the parent never owned, or two tiles would address the same
+    element.
+
+    Skips operands the IR gives no shape for rather than guessing. That makes
+    it a check on what is knowable, not a completeness requirement: a graph
+    with no `tensors` entry for an operand loses the check for that operand,
+    which is the same position the conv splitters are in for all of theirs.
+    """
+    tensors = graph.get("tensors") or {}
+    n = int(op["shape"]["n"])
+    for role in ("inputs", "outputs"):
+        for name in (op.get(role) or []):
+            shape = (tensors.get(name) or {}).get("shape")
+            if not shape:
+                continue
+            extent = 1
+            for d in shape:
+                extent *= int(d)
+            if extent != n:
+                raise SplitHintError(
+                    f"{network}: {op.get('name')} ({op['op']}, "
+                    f"dispatch_id={op.get('dispatch_id')}) cannot be split "
+                    f"along E: its {role[:-1]} {name!r} has {extent} elements "
+                    f"but the op declares n={n}. A flat split assumes every "
+                    f"operand is the same {n} elements, so this op either "
+                    f"reduces, broadcasts, or is mis-shaped -- and tiling it "
+                    f"would read or write outside the tile's own range.")
 
 
 def _resolve_splitter(op_kind: str, axis, network: str, op_id):
@@ -537,8 +744,21 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
     # OC split narrows dim 1 of NCHW, an N split narrows the last dim. Keying
     # it on the op kind is why this used to name `conv2d_s8` explicitly, which
     # silently sent every fused conv down the linear branch and narrowed W.
-    if axis == "OC" and len(parent_shape) >= 4:
-        axis_dim = 1                       # [N, OC, OH, OW]
+    if axis == "E":
+        # A flat element range has no dim to narrow -- it is a run of `tile_n`
+        # elements out of the parent's flattened storage, and the parent's rank
+        # is irrelevant to it (that is what makes the axis layout-free). Record
+        # the tile as the 1-D thing it is rather than inventing a 4-D shape
+        # that would only be true when the partition happened to fall on a
+        # plane boundary.
+        off = 0
+        for t, tile_n in enumerate(widths):
+            _add_tile_tensor(tensors, parent, out_name, t, len(widths),
+                             [tile_n], off)
+            off += tile_n
+        return
+    if axis in ("OC", "C") and len(parent_shape) >= 4:
+        axis_dim = 1                       # [N, C, OH, OW]
     elif axis == "OH" and len(parent_shape) >= 4:
         axis_dim = 2                       # [N, OC, OH, OW]
     else:
@@ -555,35 +775,43 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
     for t, tile_n in enumerate(widths):
         tile_shape = list(parent_shape)
         tile_shape[axis_dim] = tile_n
-        tile_name = f"{out_name}.tile_{t}"
-        if tile_name not in tensors:
-            entry = {
-                "shape": tile_shape,
-                "dtype": parent.get("dtype", "i8"),
-                "split_from": out_name,
-                "tile": t,
-                "n_splits": n_splits,
-                # An OC/N tile is a CONTIGUOUS block of the parent, so it can
-                # be expressed as a pointer offset and the tile simply writes
-                # there. An OH tile is not: in NCHW a band of rows is `OC`
-                # separate runs, one per channel plane. So it aliases the
-                # parent at 0 and the codegen scatters row-band by row-band --
-                # recording any other offset here would put every tile's first
-                # channel plane at the wrong place.
-                "elem_offset": 0 if axis == "OH" else off_units * stride_per_unit,
-            }
-            if axis == "OH":
-                entry["alias_kind"] = "row_window"
-            # Carry the parent's quantization across. A tile is a slice of the
-            # parent tensor -- same scale, same zero point, by construction --
-            # and anything reading the tile's own metadata (the codegen's
-            # inspect blocks, an accuracy comparison against a golden, a
-            # downstream requantize) otherwise falls back to scale=1.0 and
-            # silently reports raw int8 counts as physical values.
-            if parent.get("quant") is not None:
-                entry["quant"] = copy.deepcopy(parent["quant"])
-            tensors[tile_name] = entry
+        _add_tile_tensor(tensors, parent, out_name, t, n_splits, tile_shape,
+                         0 if axis == "OH" else off_units * stride_per_unit,
+                         alias_kind="row_window" if axis == "OH" else None)
         off_units += tile_n
+
+
+def _add_tile_tensor(tensors, parent, out_name, t, n_splits, tile_shape,
+                     elem_offset, alias_kind=None) -> None:
+    """Register one `<parent>.tile_<t>` entry. Never overwrites an existing one."""
+    tile_name = f"{out_name}.tile_{t}"
+    if tile_name not in tensors:
+        entry = {
+            "shape": list(tile_shape),
+            "dtype": parent.get("dtype", "i8"),
+            "split_from": out_name,
+            "tile": t,
+            "n_splits": n_splits,
+            # An OC/N tile is a CONTIGUOUS block of the parent, so it can
+            # be expressed as a pointer offset and the tile simply writes
+            # there. An OH tile is not: in NCHW a band of rows is `OC`
+            # separate runs, one per channel plane. So it aliases the
+            # parent at 0 and the codegen scatters row-band by row-band --
+            # recording any other offset here would put every tile's first
+            # channel plane at the wrong place.
+            "elem_offset": int(elem_offset),
+        }
+        if alias_kind:
+            entry["alias_kind"] = alias_kind
+        # Carry the parent's quantization across. A tile is a slice of the
+        # parent tensor -- same scale, same zero point, by construction --
+        # and anything reading the tile's own metadata (the codegen's
+        # inspect blocks, an accuracy comparison against a golden, a
+        # downstream requantize) otherwise falls back to scale=1.0 and
+        # silently reports raw int8 counts as physical values.
+        if parent.get("quant") is not None:
+            entry["quant"] = copy.deepcopy(parent["quant"])
+        tensors[tile_name] = entry
 
 
 def apply_split_hint(graph: dict[str, Any],
@@ -649,16 +877,23 @@ def apply_split_hint(graph: dict[str, Any],
             #
             # This guard lands in stage 2, BEFORE any NHWC tensor can exist,
             # precisely so it can never become the thing someone debugs later.
-            if want_axis == "OC" or (want_axis is None
-                                     and _DEFAULT_AXIS.get(op["op"]) == "OC"):
+            eff_axis = want_axis or _DEFAULT_AXIS.get(op["op"])
+            if eff_axis == "E":
+                _assert_flat_pointwise(out, op, network)
+            # "C" (a pool's channel range) is the same contiguity claim as a
+            # conv's "OC" and gets the same guard: both name a run of whole
+            # NCHW planes, and both become strided the moment the tensor is
+            # nhwc.
+            if eff_axis in ("OC", "C"):
                 _out = (op.get("outputs") or [None])[0]
                 _lay = ((graph.get("tensors") or {}).get(_out) or {}).get(
                     "layout", "nchw")
                 if _lay != "nchw":
                     raise SplitHintError(
-                        f"{network}: {op.get('name')} cannot be OC-split while "
-                        f"its output declares layout={_lay!r}. An OC slice is a "
-                        f"contiguous plane range only in nchw; under {_lay!r} "
+                        f"{network}: {op.get('name')} cannot be "
+                        f"{eff_axis}-split while "
+                        f"its output declares layout={_lay!r}. A channel slice "
+                        f"is a contiguous plane range only in nchw; under {_lay!r} "
                         f"the channel is innermost, so the tile's offset alias "
                         f"would select the wrong elements and return a "
                         f"plausible wrong answer. Split on OH instead "
@@ -677,7 +912,8 @@ def apply_split_hint(graph: dict[str, Any],
                 # `buf_<net>_<out>_tile_0` at link time.
                 sf0 = tile_ops[0].get("split_from") or {}
                 axis = sf0.get("axis", "N")
-                key = {"OC": "tile_oc", "OH": "tile_oh"}.get(axis, "tile_n")
+                key = {"OC": "tile_oc", "OH": "tile_oh",
+                       "C": "tile_c"}.get(axis, "tile_n")
                 widths = [int((t.get("split_from") or {}).get(key, 0))
                           for t in tile_ops]
                 if all(w > 0 for w in widths):
