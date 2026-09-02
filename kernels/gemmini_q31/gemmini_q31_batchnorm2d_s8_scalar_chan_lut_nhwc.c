@@ -1,0 +1,1 @@
+../gemmini/gemmini_batchnorm2d_s8_scalar_chan_lut_nhwc.c
