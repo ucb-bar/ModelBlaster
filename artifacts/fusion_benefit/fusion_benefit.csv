@@ -1,0 +1,4 @@
+network,n_dispatch,total_cycles,heavy_pct,already_fused_pct,epilogue_ceiling_pct,verdict
+dronet,21,163657,58.2,26.1,15.6,MODEST — some epilogue headroom (15.6%)
+yolov8_nano,204,4232889,95.0,0.0,5.0,COMPUTE-BOUND — fuse for dispatch-collapse only (5.0% cycle ceiling)
+yolov8_nano_64x96,90,574753,2.3,94.2,3.5,ALREADY FUSED (deployed) — no headroom left
