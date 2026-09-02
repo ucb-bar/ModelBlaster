@@ -40,7 +40,26 @@
 #define MB_DWS8_TILE 256
 /* 64-byte aligned so introducing this TU cannot shift the alignment of the
  * static buffers other kernels in the same translation unit declare. */
-static int32_t mb_dws8_acc[MB_DWS8_TILE] __attribute__((aligned(64)));
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_RVV_F16DWS8_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_RVV_F16DWS8_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_RVV_F16DWS8_WS_SLOTS = 1 };
+#define MB_RVV_F16DWS8_WS_SLOT 0
+#endif
+
+/* ONE SLOT PER HART. mb_dws8_acc is THIS call's accumulator drain buffer
+ * between the vector store and the requantise loop, so two harts in this
+ * kernel at once requantise each other's lanes. Unmeasured: no curated pick
+ * in this campaign's four networks selects this kernel. Corrected because
+ * the same shape in the gemmini im2col conv kernel WAS reached and cost
+ * max_abs_err=89 on yolov8_nano over a gemmini pair. */
+static int32_t mb_dws8_acc_all[MB_RVV_F16DWS8_WS_SLOTS][MB_DWS8_TILE] __attribute__((aligned(64)));
 
 static inline int32_t mb_dws8_requant(int32_t x, int32_t mult, int32_t shift) {
     int64_t prod = (int64_t)x * (int64_t)mult;
@@ -61,6 +80,7 @@ void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
                                 int output_offset,
                                 int output_multiplier, int output_shift,
                                 int activation_min, int activation_max) {
+    int32_t *const mb_dws8_acc = mb_dws8_acc_all[MB_RVV_F16DWS8_WS_SLOT];
     const int OH = (IH + 2 * PH - KH) / SH + 1;
     const int OW = (IW + 2 * PW - KW) / SW + 1;
 

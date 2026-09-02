@@ -29,6 +29,19 @@
 #include <gemmini.h>
 #include <gemmini_params.h>
 
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_CBNSTQ_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_CBNSTQ_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_CBNSTQ_WS_SLOTS = 1 };
+#define MB_GEM_CBNSTQ_WS_SLOT 0
+#endif
+
 enum { CBNST_WS_BYTES = 512 * 1024 };
 
 void kernel_conv2d_batchnorm2d_silu_s8(const int8_t *input, const int8_t *weight, const int32_t *bias, const float *bn_scale, const float *bn_bias, int8_t *output,
@@ -42,8 +55,22 @@ void kernel_conv2d_batchnorm2d_silu_s8(const int8_t *input, const int8_t *weight
     float silu_scale_in, float silu_scale_out,
     int silu_activation_min, int silu_activation_max)
 {
-    static elem_t ws_input  [CBNST_WS_BYTES] __attribute__((aligned(64)));
-    static elem_t ws_output [CBNST_WS_BYTES] __attribute__((aligned(64)));
+    /* ONE WORKSPACE SLOT PER HART. These buffers hold THIS call's activation
+     * data / partial sums, so two harts inside this function at once
+     * overwrite each other's image. Same defect, same fix, as
+     * gemmini_conv2d_s8_gemmini_im2col_full_C.c, where it was REACHED and
+     * measured: yolov8_nano over a gemmini pair ran 14 concurrent conv pairs
+     * and reported max_abs_err=89 against 0 on a single gemmini hart.
+     *
+     * NOT REACHED HERE, and not measurable from this campaign: no curated
+     * pick in dronet / yolov8_nano / vint / mlp_control selects this kernel,
+     * so it contributes no .bss to any binary measured for that fix and no
+     * FPGA run in this campaign exercises it. It is corrected because the
+     * defect class is proven, not because a run showed it. */
+    static elem_t ws_input_all  [MB_GEM_CBNSTQ_WS_SLOTS][CBNST_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t ws_output_all [MB_GEM_CBNSTQ_WS_SLOTS][CBNST_WS_BYTES] __attribute__((aligned(64)));
+    elem_t *const ws_input  = ws_input_all [MB_GEM_CBNSTQ_WS_SLOT];
+    elem_t *const ws_output = ws_output_all[MB_GEM_CBNSTQ_WS_SLOT];
 
     int OH = (IH + 2*PH - KH) / SH + 1;
     int OW = (IW + 2*PW - KW) / SW + 1;
