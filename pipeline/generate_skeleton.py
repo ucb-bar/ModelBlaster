@@ -3839,6 +3839,15 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             w = _weight_name(model_name, op["weight"], backend)
             b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
+            # Split-tile pointer offset, exactly as the conv2d_s8 arm does it.
+            # Without this both tiles receive the SAME weight pointer, so tile k
+            # computes output channels [k*tile_oc, (k+1)*tile_oc) from the
+            # weights for [0, tile_oc). It builds, links and runs, and produces
+            # 1/n_splits correct output -- which is how it reached hardware:
+            # vint measured max_abs_err 2.787 from a SINGLE split against a
+            # 0.328 baseline, with the output alias already correct.
+            w, b, _ = _oc_tile_operands(op, sh, tile_w_plan, model_name, w, b,
+                                        backend=backend)
             call = (
                 # No dilation args: kernel_conv2d_f16 takes 15 parameters in
                 # BOTH lineages -- reference_kernels' CONV2D_F16 spec and the
