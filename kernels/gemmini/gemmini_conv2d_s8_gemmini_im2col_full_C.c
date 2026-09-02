@@ -38,6 +38,19 @@
 #include <gemmini.h>
 #include <gemmini_params.h>
 
+/* Workspace slot selector -- mirrors gemmini_conv2d_s8_gemmini_tiled_conv.c's
+ * MB_GEM_WS_SLOT. Named distinctly because kernels.c concatenates every
+ * selected kernel into one translation unit and identically-named macros or
+ * enums would collide. */
+#if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
+#include <zephyr/kernel.h>
+enum { MB_GEM_IM2C_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
+#define MB_GEM_IM2C_WS_SLOT ((int)arch_proc_id())
+#else
+enum { MB_GEM_IM2C_WS_SLOTS = 1 };
+#define MB_GEM_IM2C_WS_SLOT 0
+#endif
+
 enum {
     PAD_BYTES  = 256 * 1024,  /* zero-padded NHWC activation (yolov8 max 105 KB) */
     PART_ELEMS = 16 * 1024,   /* int32 partial-sum tile: rows*OC (yolov8 max 6 KB) */
@@ -51,9 +64,39 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                       int output_multiplier, int output_shift,
                       int activation_min, int activation_max)
 {
-    static elem_t ws_pad[PAD_BYTES]  __attribute__((aligned(64)));
-    static acc_t  ws_p0 [PART_ELEMS] __attribute__((aligned(64)));
-    static acc_t  ws_p1 [PART_ELEMS] __attribute__((aligned(64)));
+    /* ONE WORKSPACE SLOT PER HART. ws_pad holds THIS call's zero-padded NHWC
+     * activation and ws_p0/ws_p1 hold THIS call's int32 partial sums across
+     * the KH-row chain, so two harts inside this function at once overwrite
+     * each other's image and each other's accumulator. That is not a
+     * hypothetical: yolov8_nano on a gemmini PAIR runs 14 pairs of DIFFERENT
+     * convolutions concurrently on harts 0 and 1 (e.g. l16.conv on hart 0
+     * overlapping detect.cv2_0_0.conv on hart 1) and measured
+     * max_abs_err=89 on hardware, against max_abs_err=0 for the SAME binary
+     * shape with every dispatch pinned to ONE gemmini hart. DroNet never hit
+     * it only because its 10 convolutions are a serial dependency chain --
+     * zero concurrent conv pairs -- and because its conv kernel is
+     * gemmini_tiled_conv, which has had per-hart slots all along.
+     *
+     * CONFIG_MP_MAX_NUM_CPUS slots, not 2. Only harts 0/1 carry a Gemmini on
+     * this bitstream, so 2 would be enough for the accelerator path and would
+     * save 768 KB -- but the software fallback above this point runs on any
+     * hart, and sizing the array below arch_proc_id()'s range would turn a
+     * mis-scheduled dispatch from a clean illegal-instruction trap into an
+     * out-of-bounds write. There is ~170 MB of DRAM headroom; the 768 KB is
+     * not worth buying that. A single-hart build still gets exactly one slot.
+     *
+     * The sizes are UNCHANGED. PAD_BYTES and PART_ELEMS also gate the
+     * `gemmini_ok` fallback test below, so shrinking them to pay for the
+     * slots would silently move convolutions onto the scalar path. */
+    static elem_t ws_pad_all[MB_GEM_IM2C_WS_SLOTS][PAD_BYTES]
+        __attribute__((aligned(64)));
+    static acc_t  ws_p0_all [MB_GEM_IM2C_WS_SLOTS][PART_ELEMS]
+        __attribute__((aligned(64)));
+    static acc_t  ws_p1_all [MB_GEM_IM2C_WS_SLOTS][PART_ELEMS]
+        __attribute__((aligned(64)));
+    elem_t *const ws_pad = ws_pad_all[MB_GEM_IM2C_WS_SLOT];
+    acc_t  *const ws_p0  = ws_p0_all [MB_GEM_IM2C_WS_SLOT];
+    acc_t  *const ws_p1  = ws_p1_all [MB_GEM_IM2C_WS_SLOT];
 
     const int OH  = (IH + 2*PH - KH) / SH + 1;
     const int OW  = (IW + 2*PW - KW) / SW + 1;
