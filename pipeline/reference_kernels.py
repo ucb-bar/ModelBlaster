@@ -108,6 +108,77 @@ class AlgorithmCandidate:
     weight_layout: str = "oihw"
 
 
+# The Gemmini backend family, spelled as the EXACT strings the affinity filter
+# compares against (`backend.name in a.target_affinity`, generate_kernels:976).
+# Declaring only ("gemmini",) silently excludes gemmini_q31 and
+# gemmini_q31_rvv -- the backends the F2 sweeps actually run -- and the op then
+# falls back to the scalar `direct` synthesized in KernelSpec.__post_init__.
+# That fallback is numerically CORRECT, so it produces no error signal at all,
+# only a 10-50x slowdown; it is the same silent-performance-cliff class as the
+# weight-layout mismatch _assert_curated_layout_contract exists to catch. Use
+# this constant rather than retyping the tuple.
+GEMMINI_TARGETS = ("gemmini", "gemmini_q31", "gemmini_q31_rvv")
+
+
+def _gemmini_scalar_lut_algo(op: str, transcendental: str):
+    """The int8->int8 activation LUT, for the Gemmini targets.
+
+    silu_s8 / sigmoid_s8 / gelu_s8 all have the same shape: dequantize an
+    int8 by a loop-invariant scale, evaluate ONE transcendental, requantize
+    by another loop-invariant scale, clamp. Gemmini has no functional unit
+    for any of that -- it is a systolic int8 MAC array -- so these ops are
+    not "uncovered because nobody wrote the Gemmini kernel", they are
+    uncovered because there is no Gemmini instruction to write one with, and
+    they run on the scalar core beside it at `-march=rv64imafdc` (no `v`;
+    see backends.GEMMINI_Q31). The RVV targets' answer to this op
+    (rvv_memo_lut_gather, vrgather/vluxei8 out of a register-resident table)
+    therefore has no analogue here.
+
+    What does carry over is the part of that answer that was never about the
+    vector unit: the input is int8, so for a fixed (scale_in, scale_out,
+    activation_min, activation_max) the op has at most 256 distinct outputs,
+    and a quantized activation tensor repeats values heavily. Memoize the
+    table as values are encountered and the transcendental runs `distinct`
+    times instead of `n` times; everything after that is a byte load.
+
+    Bit-exact by construction, not by tolerance: each table entry is
+    evaluated with the KernelSpec.reference_impl expression verbatim -- same
+    float32 casts, same transcendental, same roundf, same clamp -- on the
+    same int8 value, and the gather loop contains no arithmetic at all.
+    """
+    return AlgorithmCandidate(
+        name="scalar_lut",
+        target_affinity=GEMMINI_TARGETS,
+        accuracy_class=AccuracyClass.BIT_EXACT,
+        description=(
+            f"Memoized 256-entry int8->int8 lookup table for {op}. The "
+            f"expensive part of this op is the {transcendental}, not the "
+            f"datapath: on the Gemmini targets there is no vector unit "
+            f"(-march=rv64imafdc) and no Gemmini instruction that evaluates "
+            f"a transcendental, so the reference runs one {transcendental} "
+            f"per element on the scalar core.\n\n"
+            f"The input is int8, so for a fixed (scale_in, scale_out, "
+            f"activation_min, activation_max) tuple the op has at most 256 "
+            f"distinct outputs. Memoize: keep a 256-byte table and a 256-byte "
+            f"'seen' map on the stack, evaluate the reference expression the "
+            f"first time each byte value is encountered, and read the table "
+            f"for every occurrence after that. Cost goes from n*{transcendental} "
+            f"to distinct*{transcendental} plus a byte load per element, and "
+            f"the memoized form never loses to the eager 256-entry build (which "
+            f"costs 256 evaluations no matter how small n is).\n\n"
+            f"Stack-local, not static: the sharding sweeps run two harts "
+            f"through the same kernels.c, and a static table cached on the "
+            f"quant tuple is a data race between them.\n\n"
+            f"BIT_EXACT by construction -- each entry IS the reference "
+            f"expression, on the same int8 value, in the same order."
+        ),
+        reference_impl=(
+            f"(use the curated kernel in kernels/gemmini_q31/"
+            f"gemmini_q31_{op}_scalar_lut.c)"
+        ),
+    )
+
+
 @dataclass
 class KernelSpec:
     op: str
@@ -4012,6 +4083,11 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
             reference_impl="(use the curated kernel in kernels/rvv/)",
             accuracy_class=AccuracyClass.BIT_EXACT,
         ),
+        # Kernel: kernels/gemmini_q31/gemmini_q31_sigmoid_s8_scalar_lut.c
+        # The "one appearance at n=1" note above is DroNet's. ViNT dispatches
+        # sigmoid_s8 65 times over real tensors: 416,508,975 spike cycles on
+        # gemmini_q31, 5.2% of that model, entirely expf.
+        _gemmini_scalar_lut_algo("sigmoid_s8", "expf"),
     ],
 )
 
@@ -6956,6 +7032,12 @@ void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
                 "}\n"
             ),
         ),
+        # Kernel: kernels/gemmini_q31/gemmini_q31_silu_s8_scalar_lut.c
+        # yolov8_nano's silu_s8 is 64.1% of the WHOLE model on gemmini_q31
+        # (99,691,648 of 155,628,733 spike cycles over 57 dispatches) purely
+        # because there was no (op, algorithm) pair for a Gemmini target to
+        # probe for and it ran the reference's expf per element.
+        _gemmini_scalar_lut_algo("silu_s8", "expf"),
     ],
 )
 
@@ -7956,7 +8038,16 @@ void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_gelu_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60"),
+            # rvv_f16 included because ViNT is a MIXED-precision graph: its int8
+            # ops run on the _f16 backend variant (examples/_run_lib.sh
+            # auto-promotes rvv -> rvv_f16 when the IR contains any f16 op),
+            # and rvv_f16 was not on this list, so gelu_s8 ran the scalar
+            # reference there -- 14,995,576 spike cycles, the largest
+            # non-convolution op left on ViNT's rvv arm, and SLOWER than the
+            # same op on gemmini_q31 once that arm got its LUT (861,508).
+            # rvv_f16 is rv64gcv_zfh_zvfh, a superset of rvv's rv64gcv, so
+            # the kernel is unchanged; kernels/rvv_f16/ symlinks it.
+            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
             description=(
                 "The expensive part of this op is the erff, not the "
                 "datapath width. One call per element, no vector erff "
@@ -7983,6 +8074,8 @@ void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
             reference_impl="(use the curated kernel in kernels/rvv/)",
             accuracy_class=AccuracyClass.BIT_EXACT,
         ),
+        # Kernel: kernels/gemmini_q31/gemmini_q31_gelu_s8_scalar_lut.c
+        _gemmini_scalar_lut_algo("gelu_s8", "erff"),
     ],
 )
 
@@ -8433,7 +8526,10 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
         ),
         AlgorithmCandidate(
             name="rvv_k_reduce_n_lanes",
-            target_affinity=("rvv", "rvv_x60"),
+            # + rvv_f16: see gelu_s8's rvv_memo_lut_gather for why the _f16
+            # backend variant has to be spelled out for a mixed-precision
+            # graph. kernels/rvv_f16/ symlinks the same file.
+            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "Plain RVV int8 matmul for the SpaceMiT X60 (VLEN=256, "
@@ -9551,7 +9647,8 @@ void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
         # Kernel: kernels/rvv/rvv_softmax_s8_rvv_cached_exp.c
         AlgorithmCandidate(
             name="rvv_cached_exp",
-            target_affinity=("rvv", "rvv_x60"),
+            # + rvv_f16: see gelu_s8's rvv_memo_lut_gather.
+            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
             description=(
                 "The reference calls expf TWICE per element with the SAME "
                 "argument -- once to build the denominator, once to "
@@ -12407,6 +12504,241 @@ void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
         ),
     ],
 )
+
+
+# ---------------------------------------------------------------------------
+# Gemmini soft-fp16 coverage.
+#
+# THE MEASUREMENT THAT MOTIVATES ALL OF THIS. ViNT is a mixed-precision graph
+# (int8 encoders, fp16 tail), and examples/_run_lib.sh only auto-promotes
+# {rvv, scalar} to their _f16 variants -- a TARGET=gemmini_q31 run stays on
+# gemmini_q31, whose kernel_cflags are -march=rv64imafdc: no `v`, and no Zfh.
+# Without Zfh, `(float)x` on a _Float16 is `call __extendhfsf2` and
+# `(_Float16)y` is `call __truncsfhf2`. So every fp16 op on this target pays
+# a libgcc function call PER OPERAND TOUCH, and none of them had a Gemmini
+# curated kernel to escape into (their algorithms are all rvv_f16-affined, or
+# they have no algorithm but the synthesized universal `direct`).
+#
+# spike, vint, target gemmini_q31, all-reference baseline
+# (experiments/kcov/logs/vint_gq31_base.log): the fp16 half of the graph is
+# 5.87 of 7.83 BILLION cycles -- 75% of the model -- with conv2d_f16 alone at
+# 5,146,370,253 (65.7%).
+#
+# The kernels registered here change nothing but the spelling of those
+# conversions: same loops, same accumulation order, same float accumulator.
+# See kernels/gemmini_q31/gemmini_q31_conv2d_f16_soft_f16.c.
+#
+# Registered here rather than in each KernelSpec's constructor because seven
+# of the ten specs declare no `algorithms` at all (they run on the `direct`
+# entry KernelSpec.__post_init__ synthesizes), and threading a one-line
+# addition through ten scattered constructor calls hides the fact that this
+# is ONE change with ONE justification.
+def _gemmini_soft_f16_algo(op: str, note: str) -> AlgorithmCandidate:
+    return AlgorithmCandidate(
+        name="soft_f16",
+        target_affinity=GEMMINI_TARGETS,
+        accuracy_class=AccuracyClass.BIT_EXACT,
+        description=(
+            f"{op} with the _Float16 <-> float conversions done inline "
+            f"instead of through libgcc. The Gemmini targets have no Zfh "
+            f"(-march=rv64imafdc), so each conversion in the reference is a "
+            f"function call, not an instruction; on a kernel like mul_f16 "
+            f"that is three calls per element around one fmul. Gemmini "
+            f"itself is an int8 systolic array and has no fp16 datapath to "
+            f"route the op to, so call-elimination is the honest ceiling "
+            f"here, not a stepping stone to a hardware kernel.\n\n"
+            f"{note}\n\n"
+            f"The conversions are the standard branchless bit-twiddle forms "
+            f"and are EXACT, validated exhaustively against the toolchain's "
+            f"own conversion before use (all 65536 half patterns for h2f; "
+            f"17M float patterns plus all 63488 round-to-nearest-even tie "
+            f"midpoints for f2h; zero mismatches -- harness at "
+            f"experiments/kcov/f16_cvt_selftest.c). The one documented "
+            f"difference is NaN payload, which does not occur in a "
+            f"quantized activation tensor. Loop order, accumulation order "
+            f"and the float accumulator are the reference's, unchanged, so "
+            f"the kernel is BIT_EXACT on all non-NaN inputs by "
+            f"construction rather than by tolerance."
+        ),
+        reference_impl=(
+            f"(use the curated kernel in kernels/gemmini_q31/"
+            f"gemmini_q31_{op}_soft_f16.c)"
+        ),
+    )
+
+
+for _op, _spec, _note in (
+    ("conv2d_f16", CONV2D_F16,
+     "65 dispatches, 5,146,370,253 spike cycles, 65.7% of ViNT on "
+     "gemmini_q31 -- the single largest line item in the model."),
+    ("depthwise_conv2d_f16", DEPTHWISE_CONV2D_F16,
+     "16 dispatches, 321,096,683 spike cycles, 4.10% of ViNT."),
+    ("sigmoid_f16", SIGMOID_F16,
+     "65 dispatches, 117,025,748 spike cycles, 1.49% of ViNT. This one "
+     "KEEPS its expf -- an fp16 input has 65536 distinct values, so the "
+     "256-entry memoized table that makes sigmoid_s8 fast has no analogue. "
+     "Expect a fraction removed, not a multiple."),
+    ("mul_f16", MUL_F16,
+     "49 dispatches, 99,217,379 spike cycles, 1.27% of ViNT."),
+    ("batchnorm2d_f16", BATCHNORM2D_F16,
+     "49 dispatches, 85,474,844 spike cycles, 1.09% of ViNT."),
+    ("linear_f16", LINEAR_F16,
+     "5 dispatches, 82,101,096 spike cycles, 1.05% of ViNT."),
+    ("mul_c1_f16", MUL_C1_F16,
+     "16 dispatches, 27,685,618 spike cycles, 0.35% of ViNT."),
+    ("adaptive_avg_pool2d_f16", ADAPTIVE_AVG_POOL2D_F16,
+     "17 dispatches, 19,928,088 spike cycles, 0.25% of ViNT."),
+    ("cast_i8_to_f16", CAST_I8_TO_F16,
+     "3 dispatches, 8,000,035 spike cycles, 0.10% of ViNT. Pure conversion, "
+     "so removing the call removes most of the op."),
+    ("add_f16", ADD_F16,
+     "9 dispatches, 3,217,580 spike cycles, 0.04% of ViNT. Small, and "
+     "reported as small; it is here because the fp16 residual adds sit "
+     "BETWEEN the convolutions a sharding sweep splits, and one op of the "
+     "chain left at reference speed distorts the per-shard cost the sweep "
+     "is trying to price."),
+):
+    _spec.algorithms.append(_gemmini_soft_f16_algo(_op, _note))
+del _op, _spec, _note
+
+
+# ---------------------------------------------------------------------------
+# Gemmini scalar-core coverage for the int8 ops Gemmini cannot execute.
+#
+# Everything registered above this line is fp16. These five are int8 ops that
+# a Gemmini target still runs on the scalar core beside the accelerator,
+# because Gemmini is a 16x16 int8 MAC array and none of them is a matmul:
+# an elementwise product, a per-channel gate, two data movements and a
+# depthwise convolution (whose "GEMM" is C independent 1-row matmuls, i.e.
+# 15/16 of the array idle). Each had NO Gemmini-affined algorithm, so each
+# ran the scalar reference_impl.
+#
+# spike, vint / yolov8_nano, target gemmini_q31, all-reference baselines
+# (experiments/kcov/logs/{vint,yolo}_gq31_base.log). The per-element costs
+# are what motivated each rewrite -- 16.8 cycles to copy ONE BYTE in pad_s8
+# is the clearest case that the reference nest, not the arithmetic, is the
+# thing being measured.
+for _op, _spec, _algo, _cls, _desc in (
+    ("mul_s8", MUL_S8, "scalar_dq_tables", AccuracyClass.BIT_EXACT,
+     "167,191,069 spike cycles over 49 dispatches and 3,817,320 elements = "
+     "43.8 cycles per element for one multiply. Two fixes, both exact: "
+     "(1) `(int32_t)roundf(x)` is a libgcc CALL followed by a truncating "
+     "fcvt, and RISC-V's fcvt.w.s has a static rmm rounding mode that IS "
+     "round-to-nearest-ties-away -- one instruction, no csrw, and better "
+     "defined out of range than the reference's UB cast; (2) both "
+     "dequantized operands are pure functions of one int8, so two 256-entry "
+     "float tables replace two int-to-float converts and two multiplies per "
+     "element. The divide is deliberately left as a divide: multiplying by a "
+     "precomputed reciprocal is a different float."),
+    ("mul_c1_s8", MUL_C1_S8, "scalar_chan_lut", AccuracyClass.BIT_EXACT,
+     "29,569,126 spike cycles over 16 dispatches and 1,415,808 elements = "
+     "20.9 cycles per element, dominated by one unpipelined fdiv.s. The gate "
+     "is per channel, so for a fixed channel the whole HW plane has at most "
+     "256 distinct outputs, and a MEMOIZED table takes the divide out of the "
+     "per-element path.\n\n"
+     "NEGATIVE RESULT worth keeping: the EAGER form of that table (build all "
+     "256 entries when HW >= 256) measured 30,191,022 cycles, 2% SLOWER than "
+     "the reference. ViNT's planes are HW=4/20/80/336/1344, so at HW=336 an "
+     "eager table pays 256 evaluations to save 336 and only the single "
+     "HW=1344 dispatch was ever ahead. Filling on demand costs "
+     "distinct*work with distinct <= min(256, HW) and cannot lose that way.\n\n"
+     "NOTE this op's reference does NOT use roundf -- it uses "
+     "(int32_t)(v >= 0 ? v+0.5f : v-0.5f), which rounds the addition in "
+     "float first -- so the fcvt-rmm substitution that mul_s8 uses would be a "
+     "real 1-LSB change here and is not applied."),
+    ("pad_s8", PAD_S8, "row_memcpy", AccuracyClass.BIT_EXACT,
+     "22,800,506 spike cycles over 5 dispatches and 1,358,208 output "
+     "elements = 16.8 cycles PER BYTE COPIED, because the reference tests "
+     "four bounds and rebuilds two four-term index expressions for every "
+     "output byte including the interior. Fill the plane with the pad value "
+     "once, then memcpy IW bytes per input row -- which is what pad_f16's "
+     "reference already does and pad_s8's never got."),
+    ("upsample_nearest_s8", UPSAMPLE_NEAREST_S8, "row_replicate",
+     AccuracyClass.BIT_EXACT,
+     "894,058 spike cycles over 2 dispatches on yolov8_nano -- 1.3% of that "
+     "model once silu_s8 is fixed, and the last op in it still on the "
+     "reference for this target. Two integer DIVIDES per output byte become "
+     "none: replicate each source pixel in a run, then memcpy row 0 of each "
+     "group to the other scale-1 rows."),
+    ("depthwise_conv2d_s8", DEPTHWISE_CONV2D_S8, "scalar_tap_ranges",
+     AccuracyClass.BIT_EXACT,
+     "459,599,735 spike cycles over 16 dispatches, 5.87% of ViNT and its "
+     "largest int8 op after the convolutions, at 29.5 cycles per MAC. All "
+     "integer, so the cost is addressing and bounds testing, not arithmetic. "
+     "ViNT's depthwise layers are 5x5 kernels with full padding over 2x2 and "
+     "4x5 spatial inputs, so 21 of every 25 taps are out of bounds and the "
+     "reference tests all 25 and recomputes a five-multiply index expression "
+     "for each. Clamping kh/kw to their valid ranges (which depend only on oh "
+     "and ow) visits exactly the taps the reference does not skip, in the "
+     "same order, and lets the input and weight row pointers be formed once "
+     "per kh. The Q0.31 requantize tail is the reference's, unchanged.\n\n"
+     "NEGATIVE RESULT, recorded because it is the obvious thing to try: an "
+     "earlier version of this kernel instead precomputed the channel's "
+     "KH*KW taps (weight + filter_offset) into a scratch. It measured "
+     "495,843,479 cycles -- 7.9% SLOWER than the reference -- because at "
+     "these shapes precomputing 25 taps per channel costs more than the "
+     "four real MACs per output it accelerates. Do not reintroduce it."),
+    ("adaptive_avg_pool2d_s8", ADAPTIVE_AVG_POOL2D_S8, "scalar_rows_rmm",
+     AccuracyClass.BIT_EXACT,
+     "19,855,989 spike cycles over 17 dispatches and 1,446,528 input "
+     "elements = 13.7 cycles to load one int8 and add it. ViNT's pools are "
+     "global (OH=OW=1), so the requantize tail is nothing and the accumulate "
+     "loop is everything -- and the reference recomputes a three-multiply "
+     "index expression for every element of it. A plane pointer and a row "
+     "pointer leave one add. The roundf-to-fcvt-rmm substitution is applied "
+     "for consistency with the other int8 kernels, not for the cycles: there "
+     "is one of them per OUTPUT and the outputs are few."),
+    ("batchnorm2d_s8", BATCHNORM2D_S8, "scalar_chan_lut",
+     AccuracyClass.BIT_EXACT,
+     "1,881,267 spike cycles over 3 dispatches = 32.4% OF DRONET on "
+     "gemmini_q31, more than all ten of its convolutions put together "
+     "(2,168,407). Its one algorithm (per_channel_lut) is affined to "
+     "rvv_opu and the curated RVV kernel sits in the universal `direct` slot "
+     "under kernels/rvv/, so no Gemmini target had a file to probe for. The "
+     "input is int8 and scale/bias are per channel, so each plane has at "
+     "most 256 distinct outputs; memoizing removes the roundf CALL and the "
+     "float divide from the per-element path. Memoized rather than eager "
+     "because two of dronet's three BN planes (H*W = 196 and 49) are SMALLER "
+     "than 256 elements, where an eager table is a straight loss."),
+    ("relu_s8", RELU_S8, "swar", AccuracyClass.BIT_EXACT,
+     "26,582 spike cycles for n=2048 on dronet = 13.0 cycles per byte for a "
+     "compare and a store, 0.5% of the model. relu_s8's only algorithm "
+     "(gemmini_resadd_relu) is withdrawn to kernels/gemmini_q31/archive/ for "
+     "declaring bit_exact and not being it (kernel_opt_log 1100-1108), so "
+     "there was no file left to probe for. Eight int8 ReLUs fit in one "
+     "64-bit register: sign | (sign - (sign >> 7)) is 0xff in exactly the "
+     "negative bytes, with no borrow crossing a byte, and masking with its "
+     "complement is the whole op. Small, and reported as small."),
+    ("elu", ELU, "scalar_cephes_exp", AccuracyClass.NUMERIC_DRIFT,
+     "23,334 spike cycles for 448 elements on mlp_control = 52 cycles per "
+     "element, against 1,093 on rvv -- 21.4x, on an op the rvv arm has a "
+     "curated kernel for. That asymmetry is what makes a 2-backend sweep's "
+     "gemmini arm uninterpretable for this network.\n\n"
+     "This is the ONE entry here that is not BIT_EXACT, and the reason is "
+     "structural rather than a concession: silu_s8/sigmoid_s8/gelu_s8 get "
+     "bit-exact LUTs because their input domain is 256 values, while elu is "
+     "fp32 with a continuous domain, nothing memoizes, and the entire cost "
+     "is picolibc's expf. The only move is to not call expf, and every "
+     "replacement returns a different float. So this evaluates the SAME "
+     "Cephes minimax expf, with the same constants and the same operation "
+     "order, that kernels/rvv/rvv_elu_direct.c already declares "
+     "numeric_drift for -- it does not widen the accuracy envelope the rvv "
+     "arm of a sweep already sits in, it makes the two arms agree.\n\n"
+     "FMA contraction is suppressed with an empty asm barrier on each "
+     "multiply, because the RVV kernel writes the Horner chain as separate "
+     "vfmul/vfadd and a contracted scalar version would drift AWAY from it."),
+):
+    _spec.algorithms.append(AlgorithmCandidate(
+        name=_algo,
+        target_affinity=GEMMINI_TARGETS,
+        accuracy_class=_cls,
+        description=_desc,
+        reference_impl=(
+            f"(use the curated kernel in kernels/gemmini_q31/"
+            f"gemmini_q31_{_op}_{_algo}.c)"
+        ),
+    ))
+del _op, _spec, _algo, _cls, _desc
 
 
 KERNEL_SPECS: dict[str, KernelSpec] = {

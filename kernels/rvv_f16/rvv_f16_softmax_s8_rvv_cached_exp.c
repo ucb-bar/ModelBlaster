@@ -1,0 +1,1 @@
+../rvv/rvv_softmax_s8_rvv_cached_exp.c

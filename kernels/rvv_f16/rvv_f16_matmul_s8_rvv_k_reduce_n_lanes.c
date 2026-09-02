@@ -1,0 +1,1 @@
+../rvv/rvv_matmul_s8_rvv_k_reduce_n_lanes.c

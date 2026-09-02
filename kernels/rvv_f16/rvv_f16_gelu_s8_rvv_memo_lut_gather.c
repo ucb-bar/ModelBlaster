@@ -1,0 +1,1 @@
+../rvv/rvv_gelu_s8_rvv_memo_lut_gather.c
