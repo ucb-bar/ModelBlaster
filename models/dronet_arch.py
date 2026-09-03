@@ -43,7 +43,22 @@ class DronetTorch(nn.Module):
 
         self.dropout1 = nn.Dropout()
 
-        linear_in = 2048 if small else 6272
+        # Flatten width FOLLOWS THE INPUT GEOMETRY. It used to be hardcoded
+        # (2048 for `small`), which silently pinned DroNet to a 112x112 input:
+        # every other resolution built a model whose head could not accept its
+        # own trunk output --
+        #   RuntimeError: mat1 and mat2 shapes cannot be multiplied
+        #                 (1x1152 and 2048x1)
+        # Probing the trunk gives the correct width for ANY img_dims and
+        # reproduces 2048 exactly at the default, so the trained checkpoint
+        # still loads unchanged.
+        _was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            _probe = torch.zeros(1, img_channels,
+                                 int(img_dims[0]), int(img_dims[1]))
+            linear_in = self._trunk(_probe).flatten(start_dim=1).shape[1]
+        self.train(_was_training)
         self.linear1 = nn.Linear(linear_in, output_dim)
         self.linear2 = nn.Linear(linear_in, output_dim)
         self.sigmoid1 = nn.Sigmoid()
@@ -58,7 +73,10 @@ class DronetTorch(nn.Module):
         torch.nn.init.kaiming_normal_(self.conv_modules[7].weight)
         torch.nn.init.kaiming_normal_(self.conv_modules[8].weight)
 
-    def forward(self, x):
+    def _trunk(self, x):
+        """Conv/BN/residual stack up to the flatten. Split out of forward so
+        __init__ can probe its output width; forward's behaviour is
+        unchanged."""
         bn_idx = 0
         conv_idx = 1
         relu_idx = 0
@@ -79,7 +97,10 @@ class DronetTorch(nn.Module):
             bn_idx += 2
             relu_idx += 2
             conv_idx += 3
+        return x3
 
+    def forward(self, x):
+        x3 = self._trunk(x)
         x4 = torch.flatten(x3, start_dim=1)
         x4 = self.relu_modules[-1](x4)
         x5 = self.dropout1(x4)
