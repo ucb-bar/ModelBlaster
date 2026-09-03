@@ -23,7 +23,14 @@ from torch import nn
 # Trained-model architecture (keep in sync with SteeringTrackingPPORunnerCfg).
 _OBS_DIM = 16
 _ACTION_DIM = 4
-_HIDDEN_DIMS = [256, 128, 64]
+# MODELBLASTER_MLP_HIDDEN ("512,256,128") rescales the actor for SCALED
+# VARIANTS. Same contract as dronet's input knob: a rescaled model keeps its
+# seeded random init because the trained checkpoint only fits the default,
+# the golden is generated from those weights so bit-exactness still checks,
+# and the variant exists to vary compute shape, not accuracy.
+_HIDDEN_DIMS = [int(x) for x in
+                os.environ.get("MODELBLASTER_MLP_HIDDEN", "256,128,64").split(",")]
+_SCALED = (_HIDDEN_DIMS != [256, 128, 64])
 
 # Committed alongside this module so a fresh clone works with no external
 # state (previously an absolute path into one user's home directory, which
@@ -89,6 +96,9 @@ def get_model(seed: int = 0) -> MLPControl:
     """Build + load the trained actor for inference."""
     torch.manual_seed(seed)
     m = MLPControl()
+    if _SCALED:
+        m.eval()
+        return m
     ckpt_path = os.environ.get("MODELBLASTER_MLP_CONTROL_CKPT", _DEFAULT_CKPT)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(

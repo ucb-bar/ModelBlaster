@@ -31,9 +31,17 @@ _DEFAULT_CKPT = os.path.join(
 )
 
 # Trained config: 3-channel input at 112x112.
+#
+# MODELBLASTER_DRONET_INPUT rescales the input for SCALED VARIANTS used in
+# scheduling / performance studies. The trained checkpoint only fits the
+# default 112, so a rescaled model is left at its seeded random init: the
+# golden is generated from those same weights, so bit-exactness still checks
+# and the compute SHAPE is what the variant exists to vary. Its predictions
+# are meaningless -- never quote a scaled variant as an accuracy result.
 _IMG_CHANNELS = 3
-_IMG_H = 112
-_IMG_W = 112
+_IMG_H = int(os.environ.get("MODELBLASTER_DRONET_INPUT", "112"))
+_IMG_W = _IMG_H
+_SCALED = (_IMG_H != 112)
 
 
 def get_model(seed: int = 0):
@@ -44,6 +52,10 @@ def get_model(seed: int = 0):
         output_dim=1,
         small=True,
     )
+    if _SCALED:
+        # Rescaled geometry cannot match the trained checkpoint's shapes.
+        m.eval()
+        return m
     ckpt_path = os.environ.get("MODELBLASTER_DRONET_CKPT", _DEFAULT_CKPT)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
