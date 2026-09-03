@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20.0)
+set(CONF_FILE "prj.conf")
+if(DEFINED EXTRA_CONF_FILE)
+endif()
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(kern_convfix)
+target_sources(app PRIVATE src/main.c src/kut.c)
+zephyr_link_libraries(-Wl,--no-relax)
+target_include_directories(app PRIVATE src)
+set_source_files_properties(src/kut.c PROPERTIES COMPILE_OPTIONS
+    "-march=rv64gcv_zfh_zvfh;-mabi=lp64d")
