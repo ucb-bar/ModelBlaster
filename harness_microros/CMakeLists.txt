@@ -141,7 +141,15 @@ foreach(_i RANGE ${_last})
         endif()
     endforeach()
     configure_file("${_primary_dir}/model.h"   "${_STAGE_DIR}/${_name}_model.h"   COPYONLY)
-    configure_file("${_primary_dir}/test_io.h" "${_STAGE_DIR}/${_name}_test_io.h" COPYONLY)
+    # test_io.h's own `#include "model.h"` must be rewritten to the staged,
+    # per-model-prefixed name: COPYONLY does not rewrite contents, and the
+    # staging dir is shared by every model, so plain "model.h" resolves to
+    # nothing (fatal error: model.h: No such file or directory) and would
+    # collide between models even if it did. Same rewrite harness_xpurt does.
+    file(READ "${_primary_dir}/test_io.h" _test_io_contents)
+    string(REPLACE "#include \"model.h\"" "#include \"${_name}_model.h\""
+           _test_io_contents "${_test_io_contents}")
+    file(WRITE "${_STAGE_DIR}/${_name}_test_io.h" "${_test_io_contents}")
 
     foreach(_bs IN LISTS MODEL_BACKENDS)
         set(_backend_dir "${_base}/${_bs}")
@@ -160,7 +168,6 @@ foreach(_i RANGE ${_last})
                 python -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}"
                     --backend "${_bs}"
-                    --weights-header "${_backend_dir}/weights.h"
                     --separator ";"
             OUTPUT_VARIABLE _rename_flags
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -204,6 +211,10 @@ foreach(_i RANGE ${_last})
     # weights are per-backend and live in the ${_obj_tgt} lib above: the
     # packed layouts differ per backend (gemmini OIHW vs rvv IHWOC), so a
     # single shared copy silently fed one backend the other's layout.
+    # generate_skeleton.py::_weight_name() bakes the backend into every
+    # weight symbol, so no -D rename is needed for them (which is why
+    # backend_rename.py has no --weights-header flag: passing one aborted
+    # every harness_microros configure).
 
     if(NOT EXISTS "${_primary_dir}/buffers.c")
         message(FATAL_ERROR

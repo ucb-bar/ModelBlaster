@@ -27,6 +27,10 @@
 #                  Set 0 to re-use existing artifacts (faster iteration).
 #   MICROROS_BROKER_HART  hart for the broker (default: highest CPU).
 #   RUNNER         {spike,firesim} default spike.
+#   STOP_AFTER     {build,""} default "". "build" stops after west build
+#                  and prints the ELF path, so an external submitter (e.g.
+#                  the F2 fq queue) can run it instead of the local U250
+#                  firesim_runner. Mirrors xpurt_demo/run.sh's STOP_AFTER.
 #
 # Pre-reqs (from repo root):
 #   source scripts/activate_conda.sh && conda activate zephyr
@@ -47,6 +51,7 @@ QUANTS="${QUANTS:-}"
 MODELBLASTER_POOL_THREADS="${MODELBLASTER_POOL_THREADS:-1}"
 FORCE_REGEN="${FORCE_REGEN:-1}"
 RUNNER="${RUNNER:-spike}"
+STOP_AFTER="${STOP_AFTER:-}"
 
 case "${RUNNER}" in
     spike)
@@ -209,6 +214,10 @@ west build -p -b "${BOARD_TARGET}" harness_microros \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
 # 6) Run.
+if [[ "${STOP_AFTER}" == "build" ]]; then
+    echo "[microros_demo] STOP_AFTER=build — elf=${BUILD_DIR}/zephyr/zephyr.elf"
+    exit 0
+fi
 echo "[microros_demo] ${RUNNER} run"
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_BIN="${SPIKE_BIN:-}"
