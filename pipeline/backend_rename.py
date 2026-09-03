@@ -67,6 +67,13 @@ def rename_defs(model_name: str, used_ops: Iterable[str], backend: str
         f"model_{mid}_profile_records",
     ):
         defs.append(f"-D{fn}={fn}_{bs}")
+    # The OH-window handshake between model.c and the gemmini tiled conv.
+    # Not keyed on the model in the source, but every model that uses that
+    # kernel gets its OWN copy in its kernels.c, so two such models in one
+    # binary collide at link time ("multiple definition of mb_gem_ohwin_set").
+    # It has to be renamed, not made static: model.c is the caller.
+    for fn in ("mb_gem_ohwin_set", "mb_gem_ohwin_clear"):
+        defs.append(f"-D{fn}={fn}_{mid}_{bs}")
     # Dispatch table — keep MODEL_<UMID>_DISPATCH_FNS as the prefix and
     # append _<BS> so the walker can pick by core_kind without parsing.
     defs.append(
