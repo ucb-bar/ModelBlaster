@@ -1,0 +1,44 @@
+Script started on 2026-08-28 11:04:22+00:00 [COMMAND="stty intr ^] && sudo LD_LIBRARY_PATH=/scratch/vnikiforov/rose-fsim/lib ./FireSim-f2 +permissive   +macaddr0=00:12:6D:00:00:02 +niclog0=niclog0  +trace-select=1 +trace-start=0 +trace-end=-1 +trace-output-format=0 +dwarf-file-name=fq-job-1560-z.elf-dwarf +autocounter-readrate=0 +autocounter-filename-base=AUTOCOUNTERFILE  +print-start=0 +print-end=-1 +linklatency0=6405 +netbw0=200 +shmemportname0=default +partitioned=1 +slotid=0 +permissive-off +prog0=fq-job-1560-z.elf   && stty intr ^c" TERM="screen" TTY="/dev/pts/6" COLUMNS="80" LINES="24"]
+AFI ID for Slot  0: agfi-024f2d6a1c6890cb4
+AFI PCI  Vendor ID: 0x1d0f, Device ID 0xf002
+Attached to BAR0 (OCL)
+Attached to BAR4 (PCIS)
+widget_registry_t::add_widget(StreamEngine)
+cpu2fpga: 0, fpga2cpu: 2
+UART0 is here (stdin/stdout).
+command line for program 0. argc=19:
++permissive +macaddr0=00:12:6D:00:00:02 +niclog0=niclog0 +trace-select=1 +trace-start=0 +trace-end=-1 +trace-output-format=0 +dwarf-file-name=fq-job-1560-z.elf-dwarf +autocounter-readrate=0 +autocounter-filename-base=AUTOCOUNTERFILE +print-start=0 +print-end=-1 +linklatency0=6405 +netbw0=200 +shmemportname0=default +partitioned=1 +slotid=0 +permissive-off fq-job-1560-z.elf 
+entered simulation flow execution
+finished waiting
+FireSim fingerprint: 0x46697265
+Commencing simulation.
+tsibridge_t::tick skipping tick
+tsibridge_t::tick skipping tick
+tsibridge_t::tick skipping tick
+tsibridge_t::tick skipping tick
+tsibridge_t::tick skipping tick
+tsibridge_t::tick skipping tick
+tsibridge_t::tick skipping tick
+tsibridge_t::tick skipping tick
+*** Booting Zephyr OS build c93d5bdb6078 ***
+modelblaster harness: model=yolov8_nano in=76800 out=75600
+
+ mcause: 1, Instruction Access fault
+  mtval: 0
+     a0: 000000008054af68    t0: 0000000000000001
+     a1: 0000000080547d68    t1: 0000000000000000
+     a2: 0000000000000000    t2: 0000000000000001
+     a3: 00000000800150a8    t3: 0000000000000020
+     a4: 000000003f856171    t4: 0000000000000001
+     a5: 0000000040056171    t5: 0000000000000014
+     a6: 000000008003c2d0    t6: 0000000000003200
+     a7: 0000000000000020
+     sp: 00000000806fc440
+     ra: 000000008000a056
+   mepc: 0000000000000000
+mstatus: 8000000a0001f880
+
+call trace:
+bash: line 1: 185367 Killed                  sudo LD_LIBRARY_PATH=/scratch/vnikiforov/rose-fsim/lib ./FireSim-f2 +permissive +macaddr0=00:12:6D:00:00:02 +niclog0=niclog0 +trace-select=1 +trace-start=0 +trace-end=-1 +trace-output-format=0 +dwarf-file-name=fq-job-1560-z.elf-dwarf +autocounter-readrate=0 +autocounter-filename-base=AUTOCOUNTERFILE +print-start=0 +print-end=-1 +linklatency0=6405 +netbw0=200 +shmemportname0=default +partitioned=1 +slotid=0 +permissive-off +prog0=fq-job-1560-z.elf
+
+Script done on 2026-08-28 11:05:02+00:00 [COMMAND_EXIT_CODE="137"]

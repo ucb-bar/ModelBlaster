@@ -1,0 +1,247 @@
+/dts-v1/;
+
+/* node '/' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:15 */
+/ {
+	#address-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:16 */
+	#size-cells = < 0x1 >;       /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:17 */
+	compatible = "riscv-virtio"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:18 */
+	model = "riscv-virtio,qemu"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:19 */
+
+	/* node '/flash@20000000' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:21 */
+	flash@20000000 {
+		bank-width = < 0x4 >;                                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:22 */
+		reg = < 0x20000000 0x2000000 0x22000000 0x2000000 >; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:23 */
+		compatible = "cfi-flash";                            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:24 */
+	};
+
+	/* node '/uart@10000000' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:27 */
+	uart0: uart@10000000 {
+		interrupts = < 0xa 0x1 >;       /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:28 */
+		interrupt-parent = < &plic >;   /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:29 */
+		clock-frequency = < 0x384000 >; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:30 */
+		reg = < 0x10000000 0x100 >;     /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:31 */
+		compatible = "ns16550";         /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:32 */
+		reg-shift = < 0x0 >;            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:33 */
+		status = "disabled";            /* in zephyr/boards/spike/riscv64/spike_riscv64.dts:18 */
+	};
+
+	/* node '/uart' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:36 */
+	htif: uart {
+		compatible = "ucb,htif"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:37 */
+		label = "HTIF_UART";     /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:38 */
+		status = "okay";         /* in zephyr/boards/spike/riscv64/spike_riscv64.dts:22 */
+	};
+
+	/* node '/cpus' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:41 */
+	cpus {
+		#address-cells = < 0x1 >; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:42 */
+		#size-cells = < 0x0 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:43 */
+
+		/* node '/cpus/cpu@0' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:45 */
+		cpu@0 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:46 */
+			reg = < 0x0 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:47 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:48 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:49 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:14 */
+
+			/* node '/cpus/cpu@0/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:51 */
+			hlic0: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:52 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:53 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:54 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:55 */
+				phandle = < 0x2 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+
+		/* node '/cpus/cpu@1' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:59 */
+		cpu@1 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:60 */
+			reg = < 0x1 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:61 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:62 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:63 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:18 */
+
+			/* node '/cpus/cpu@1/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:65 */
+			hlic1: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:66 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:67 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:68 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:69 */
+				phandle = < 0x3 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+
+		/* node '/cpus/cpu@2' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:73 */
+		cpu@2 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:74 */
+			reg = < 0x2 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:75 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:76 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:77 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:22 */
+
+			/* node '/cpus/cpu@2/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:79 */
+			hlic2: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:80 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:81 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:82 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:83 */
+				phandle = < 0x4 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+
+		/* node '/cpus/cpu@3' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:87 */
+		cpu@3 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:88 */
+			reg = < 0x3 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:89 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:90 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:91 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:26 */
+
+			/* node '/cpus/cpu@3/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:93 */
+			hlic3: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:94 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:95 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:96 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:97 */
+				phandle = < 0x5 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+
+		/* node '/cpus/cpu@4' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:101 */
+		cpu@4 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:102 */
+			reg = < 0x4 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:103 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:104 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:105 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:30 */
+
+			/* node '/cpus/cpu@4/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:107 */
+			hlic4: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:108 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:109 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:110 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:111 */
+				phandle = < 0x6 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+
+		/* node '/cpus/cpu@5' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:115 */
+		cpu@5 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:116 */
+			reg = < 0x5 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:117 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:118 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:119 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:34 */
+
+			/* node '/cpus/cpu@5/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:121 */
+			hlic5: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:122 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:123 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:124 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:125 */
+				phandle = < 0x7 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+
+		/* node '/cpus/cpu@6' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:129 */
+		cpu@6 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:130 */
+			reg = < 0x6 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:131 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:132 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:133 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:38 */
+
+			/* node '/cpus/cpu@6/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:135 */
+			hlic6: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:136 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:137 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:138 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:139 */
+				phandle = < 0x8 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+
+		/* node '/cpus/cpu@7' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:143 */
+		cpu@7 {
+			device_type = "cpu";            /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:144 */
+			reg = < 0x7 >;                  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:145 */
+			status = "okay";                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:146 */
+			compatible = "qemu,riscv-virt",
+			             "riscv";           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:147 */
+			riscv,isa = "rv64gc";           /* in zephyr/dts/riscv/spike/virt-riscv64.dtsi:42 */
+
+			/* node '/cpus/cpu@7/interrupt-controller' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:149 */
+			hlic7: interrupt-controller {
+				compatible = "riscv,cpu-intc"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:150 */
+				#address-cells = < 0x0 >;      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:151 */
+				#interrupt-cells = < 0x1 >;    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:152 */
+				interrupt-controller;          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:153 */
+				phandle = < 0x9 >;             /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			};
+		};
+	};
+
+	/* node '/memory@80000000' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:158 */
+	ram0: memory@80000000 {
+		device_type = "memory";          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:159 */
+		reg = < 0x80000000 0x10000000 >; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:160 */
+	};
+
+	/* node '/soc' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:163 */
+	soc {
+		#address-cells = < 0x1 >;  /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:164 */
+		#size-cells = < 0x1 >;     /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:165 */
+		compatible = "simple-bus"; /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:166 */
+		ranges;                    /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:167 */
+
+		/* node '/soc/interrupt-controller@c000000' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:169 */
+		plic: interrupt-controller@c000000 {
+			riscv,max-priority = < 0x7 >;                                                                               /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:170 */
+			riscv,ndev = < 0x400 >;                                                                                     /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:171 */
+			reg = < 0xc000000 0x4000000 >;                                                                              /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:172 */
+			interrupts-extended = < &hlic0 0xb &hlic0 0x9 &hlic1 0xb &hlic1 0x9 &hlic2 0xb &hlic2 0x9 &hlic3 0xb &hlic3
+			                        0x9 &hlic4 0xb &hlic4 0x9 &hlic5 0xb &hlic5 0x9 &hlic6 0xb &hlic6 0x9 &hlic7 0xb
+			                        &hlic7 0x9 >;                                                                       /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:173 */
+			interrupt-controller;                                                                                       /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:183 */
+			compatible = "sifive,plic-1.0.0";                                                                           /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:184 */
+			#address-cells = < 0x0 >;                                                                                   /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:185 */
+			#interrupt-cells = < 0x2 >;                                                                                 /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:186 */
+			phandle = < 0x1 >;                                                                                          /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:29 */
+		};
+
+		/* node '/soc/clint@2000000' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:189 */
+		clint: clint@2000000 {
+			compatible = "sifive,clint0";                                                                               /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:190 */
+			reg = < 0x2000000 0x10000 >;                                                                                /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:191 */
+			interrupts-extended = < &hlic0 0x3 &hlic0 0x7 &hlic1 0x3 &hlic1 0x7 &hlic2 0x3 &hlic2 0x7 &hlic3 0x3 &hlic3
+			                        0x7 &hlic4 0x3 &hlic4 0x7 &hlic5 0x3 &hlic5 0x7 &hlic6 0x3 &hlic6 0x7 &hlic7 0x3
+			                        &hlic7 0x7 >;                                                                       /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:192 */
+		};
+
+		/* node '/soc/timer@200bff8' defined in zephyr/dts/riscv/spike/virt-riscv.dtsi:202 */
+		mtimer: timer@200bff8 {
+			compatible = "riscv,machine-timer";                                                                         /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:203 */
+			interrupts-extended = < &hlic0 0x7 &hlic1 0x7 &hlic2 0x7 &hlic3 0x7 &hlic4 0x7 &hlic5 0x7 &hlic6 0x7 &hlic7
+			                        0x7 >;                                                                              /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:204 */
+			reg = < 0x200bff8 0x8 0x2004000 0x8 >;                                                                      /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:212 */
+			reg-names = "mtime",
+			            "mtimecmp";                                                                                     /* in zephyr/dts/riscv/spike/virt-riscv.dtsi:213 */
+		};
+	};
+
+	/* node '/chosen' defined in zephyr/boards/spike/riscv64/spike_riscv64.dts:9 */
+	chosen {
+		zephyr,console = &htif;    /* in zephyr/boards/spike/riscv64/spike_riscv64.dts:10 */
+		zephyr,shell-uart = &htif; /* in zephyr/boards/spike/riscv64/spike_riscv64.dts:11 */
+		zephyr,sram = &ram0;       /* in zephyr/boards/spike/riscv64/spike_riscv64.dts:12 */
+	};
+};

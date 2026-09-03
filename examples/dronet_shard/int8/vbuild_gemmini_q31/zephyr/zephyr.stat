@@ -1,0 +1,106 @@
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00 
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            UNIX - System V
+  ABI Version:                       0
+  Type:                              EXEC (Executable file)
+  Machine:                           RISC-V
+  Version:                           0x1
+  Entry point address:               0x80000000
+  Start of program headers:          64 (bytes into file)
+  Start of section headers:          958936 (bytes into file)
+  Flags:                             0x5, RVC, double-float ABI
+  Size of this header:               64 (bytes)
+  Size of program headers:           56 (bytes)
+  Number of program headers:         4
+  Size of section headers:           64 (bytes)
+  Number of section headers:         29
+  Section header string table index: 28
+
+Section Headers:
+  [Nr] Name              Type             Address           Offset
+       Size              EntSize          Flags  Link  Info  Align
+  [ 0]                   NULL             0000000000000000  00000000
+       0000000000000000  0000000000000000           0     0     0
+  [ 1] rom_start         PROGBITS         0000000080000000  00000140
+       000000000000001e  0000000000000000  AX       0     0     4
+  [ 2] reset             PROGBITS         0000000080000020  00000160
+       000000000000000a  0000000000000000  AX       0     0     4
+  [ 3] exceptions        PROGBITS         000000008000002c  0000016c
+       000000000000023a  0000000000000000  AX       0     0     4
+  [ 4] text              PROGBITS         0000000080000268  000003a8
+       00000000000068cc  0000000000000000  AX       0     0     4
+  [ 5] initlevel         PROGBITS         0000000080006b38  00006c78
+       0000000000000050  0000000000000000   A       0     0     8
+  [ 6] device_area       PROGBITS         0000000080006b88  00006cc8
+       0000000000000080  0000000000000000   A       0     0     8
+  [ 7] sw_isr_table      PROGBITS         0000000080006c08  00006d48
+       00000000000040c0  0000000000000000   A       0     0     8
+  [ 8] intc_table_area   PROGBITS         000000008000acc8  0000ae08
+       0000000000000018  0000000000000000   A       0     0     8
+  [ 9] tbss              NOBITS           000000008000ace0  0000ae20
+       0000000000000008  0000000000000000 WAT       0     0     8
+  [10] rodata            PROGBITS         000000008000ace0  0000ae20
+       00000000000576a8  0000000000000000   A       0     0     16
+  [11] datas             PROGBITS         0000000080062388  000624c8
+       000000000000003c  0000000000000000  WA       0     0     8
+  [12] device_states     PROGBITS         00000000800623c4  00062504
+       0000000000000004  0000000000000000  WA       0     0     1
+  [13] .htif             PROGBITS         00000000800623c8  00062508
+       0000000000000048  0000000000000000  WA       0     0     8
+  [14] bss               NOBITS           0000000080062440  00062550
+       00000000001d3ce8  0000000000000000  WA       0     0     64
+  [15] noinit            NOBITS           0000000080236130  00062550
+       0000000000400c00  0000000000000000  WA       0     0     16
+  [16] .comment          PROGBITS         0000000000000000  00062550
+       0000000000000025  0000000000000001  MS       0     0     1
+  [17] .debug_aranges    PROGBITS         0000000000000000  00062580
+       0000000000001640  0000000000000000           0     0     16
+  [18] .debug_info       PROGBITS         0000000000000000  00063bc0
+       0000000000026a7c  0000000000000000           0     0     1
+  [19] .debug_abbrev     PROGBITS         0000000000000000  0008a63c
+       0000000000007233  0000000000000000           0     0     1
+  [20] .debug_line       PROGBITS         0000000000000000  0009186f
+       000000000001e8c8  0000000000000000           0     0     1
+  [21] .debug_frame      PROGBITS         0000000000000000  000b0138
+       0000000000002af8  0000000000000000           0     0     8
+  [22] .debug_str        PROGBITS         0000000000000000  000b2c30
+       00000000000063ec  0000000000000001  MS       0     0     1
+  [23] .debug_loc        PROGBITS         0000000000000000  000b901c
+       000000000001ca38  0000000000000000           0     0     1
+  [24] .debug_ranges     PROGBITS         0000000000000000  000d5a60
+       0000000000006d40  0000000000000000           0     0     16
+  [25] .riscv.attributes RISCV_ATTRIBUTE  0000000000000000  000dc7a0
+       000000000000006a  0000000000000000           0     0     1
+  [26] .symtab           SYMTAB           0000000000000000  000dc810
+       0000000000007800  0000000000000018          27   428     8
+  [27] .strtab           STRTAB           0000000000000000  000e4010
+       00000000000060a6  0000000000000000           0     0     1
+  [28] .shstrtab         STRTAB           0000000000000000  000ea0b6
+       000000000000011c  0000000000000000           0     0     1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  D (mbind), p (processor specific)
+
+Program Headers:
+  Type           Offset             VirtAddr           PhysAddr
+                 FileSiz            MemSiz              Flags  Align
+  RISCV_ATTRIBUT 0x00000000000dc7a0 0x0000000000000000 0x0000000000000000
+                 0x000000000000006a 0x0000000000000000  R      0x1
+  LOAD           0x0000000000000140 0x0000000080000000 0x0000000080000000
+                 0x0000000000062410 0x0000000000636d30  RWE    0x40
+  TLS            0x000000000000ae20 0x000000008000ace0 0x000000008000ace0
+                 0x0000000000000000 0x0000000000000008  R      0x8
+  GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x0000000000000000 0x0000000000000000  RW     0x10
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     .riscv.attributes 
+   01     rom_start reset exceptions text initlevel device_area sw_isr_table intc_table_area rodata datas device_states .htif bss noinit 
+   02     tbss 
+   03     

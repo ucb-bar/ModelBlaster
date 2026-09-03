@@ -1,0 +1,93 @@
+menu "hal_espressif (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/hal/espressif)"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/hal/espressif/zephyr/Kconfig"
+config ZEPHYR_HAL_ESPRESSIF_MODULE
+	bool
+	default y
+
+config ZEPHYR_HAL_ESPRESSIF_MODULE_BLOBS
+	bool
+endmenu
+menu "hal_st (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/hal/st)"
+osource "$(ZEPHYR_HAL_ST_KCONFIG)"
+config ZEPHYR_HAL_ST_MODULE
+	bool
+	default y
+endmenu
+menu "acpica (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/acpica)"
+osource "$(ZEPHYR_ACPICA_KCONFIG)"
+config ZEPHYR_ACPICA_MODULE
+	bool
+	default y
+endmenu
+menu "cmsis (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/hal/cmsis)"
+osource "$(ZEPHYR_CMSIS_KCONFIG)"
+config ZEPHYR_CMSIS_MODULE
+	bool
+	default y
+endmenu
+menu "cmsis-dsp (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/cmsis-dsp)"
+osource "$(ZEPHYR_CMSIS_DSP_KCONFIG)"
+config ZEPHYR_CMSIS_DSP_MODULE
+	bool
+	default y
+endmenu
+menu "cmsis-nn (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/cmsis-nn)"
+osource "$(ZEPHYR_CMSIS_NN_KCONFIG)"
+config ZEPHYR_CMSIS_NN_MODULE
+	bool
+	default y
+endmenu
+menu "fatfs (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/fs/fatfs)"
+osource "$(ZEPHYR_FATFS_KCONFIG)"
+config ZEPHYR_FATFS_MODULE
+	bool
+	default y
+endmenu
+menu "littlefs (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/fs/littlefs)"
+osource "$(ZEPHYR_LITTLEFS_KCONFIG)"
+config ZEPHYR_LITTLEFS_MODULE
+	bool
+	default y
+endmenu
+menu "lvgl (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/gui/lvgl)"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/gui/lvgl/Kconfig"
+config ZEPHYR_LVGL_MODULE
+	bool
+	default y
+endmenu
+menu "mbedtls (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/crypto/mbedtls)"
+osource "$(ZEPHYR_MBEDTLS_KCONFIG)"
+config ZEPHYR_MBEDTLS_MODULE
+	bool
+	default y
+endmenu
+config ZEPHYR_MCUBOOT_MODULE
+	bool
+	default y
+config ZEPHYR_MIPI_SYS_T_MODULE
+	bool
+	default y
+config ZEPHYR_OPEN_AMP_MODULE
+	bool
+	default y
+menu "openthread (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/openthread)"
+osource "$(ZEPHYR_OPENTHREAD_KCONFIG)"
+config ZEPHYR_OPENTHREAD_MODULE
+	bool
+	default y
+endmenu
+menu "percepio (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/debug/percepio)"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/debug/percepio/zephyr/Kconfig"
+config ZEPHYR_PERCEPIO_MODULE
+	bool
+	default y
+endmenu
+menu "picolibc (/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/picolibc)"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/modules/lib/picolibc/zephyr/Kconfig"
+config ZEPHYR_PICOLIBC_MODULE
+	bool
+	default y
+endmenu
+config ZEPHYR_TINYCRYPT_MODULE
+	bool
+	default y

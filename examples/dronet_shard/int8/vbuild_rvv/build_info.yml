@@ -1,0 +1,49 @@
+cmake:
+  application:
+    configuration-dir: '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/harness'
+    source-dir: '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/harness'
+  board:
+    name: 'spike_riscv64'
+    path:
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/boards/spike/riscv64'
+    qualifiers: 'rocketchip_virt_riscv64'
+    revision: ''
+  devicetree:
+    bindings-dirs:
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/bindings'
+    files:
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/boards/spike/riscv64/spike_riscv64.dts'
+    include-dirs:
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/include'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/include/zephyr'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/common'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/vendor'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/rx'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/x86'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/xtensa'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/sparc'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/riscv'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/posix'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/arm64'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/arm'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts/arc'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/dts'
+  kconfig:
+    files:
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/boards/spike/riscv64/spike_riscv64_defconfig'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/harness/prj.conf'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/harness/backends/rvv.conf'
+    user-files:
+     - 'prj.conf'
+     - '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/harness/backends/rvv.conf'
+  toolchain:
+    name: 'zephyr'
+    path: '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/tools-manual/zephyr-sdk-1.0.0-beta1'
+  zephyr:
+    version: '4.2.99'
+    zephyr-base: '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr'
+version: '0.1.0'
+west:
+  command: '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/tools/miniforge3/envs/zephyr/bin/west build -b spike_riscv64 /scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/harness --build-dir /scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/examples/dronet_shard/int8/vbuild_rvv -- -DMODEL_DIR=/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/modelblaster/examples/dronet_shard/int8/generated/rvv -DMODELBLASTER_BACKEND=rvv -DMODELBLASTER_KERNEL_CFLAGS=-march=rv64gcv;-mabi=lp64d;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1'
+  topdir: '/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws'
+  version: '1.5.0'

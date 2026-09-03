@@ -1,0 +1,1 @@
+"mcuboot":"/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/bootloader/mcuboot":"/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/bootloader/mcuboot/boot/zephyr/sysbuild"

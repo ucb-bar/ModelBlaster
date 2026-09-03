@@ -1,0 +1,3 @@
+model==checkpoint : True  sum=3.581771
+model==randominit : False  randinit sum=-4.616352
+n_params: 29662397

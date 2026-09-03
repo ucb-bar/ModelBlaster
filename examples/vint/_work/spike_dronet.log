@@ -1,0 +1,32 @@
+*** Booting Zephyr OS build c93d5bdb6078 ***
+modelblaster harness: model=dronet in=37632 out=2
+=== MODELBLASTER_VERIFY === max_abs_err=0 max_rel_err=0 n=2
+=== MODELBLASTER_OUTPUT_BEGIN ===
+-56
+127
+=== MODELBLASTER_OUTPUT_END ===
+=== MODELBLASTER_PROFILE_BEGIN ===
+dispatch_id,name,op,shape,cycles
+0,conv_modules.0,conv2d_s8,N=1;IC=3;IH=112;IW=112;OC=32;OH=56;OW=56;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1,1771476
+1,maxpool1,maxpool2d_s8,N=1;C=32;IH=56;IW=56;OH=27;OW=27;KH=3;KW=3;SH=2;SW=2;PH=0;PW=0;DH=1;DW=1,192406
+2,bn_modules.0,batchnorm2d_s8,N=1;C=32;H=27;W=27,14791
+3,conv_modules.1,conv2d_s8,N=1;IC=32;IH=27;IW=27;OC=32;OH=14;OW=14;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1,1316160
+4,conv_modules.2,conv2d_s8,N=1;IC=32;IH=14;IW=14;OC=32;OH=14;OW=14;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1,1316160
+5,conv_modules.3,conv2d_s8,N=1;IC=32;IH=27;IW=27;OC=32;OH=14;OW=14;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0,221120
+6,add,add_s8,n=6272,5133
+7,bn_modules.2,batchnorm2d_s8,N=1;C=32;H=14;W=14,4803
+8,conv_modules.4,conv2d_s8,N=1;IC=32;IH=14;IW=14;OC=64;OH=7;OW=7;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1,880179
+9,conv_modules.5,conv2d_s8,N=1;IC=64;IH=7;IW=7;OC=64;OH=7;OW=7;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1,1711953
+10,conv_modules.6,conv2d_s8,N=1;IC=32;IH=14;IW=14;OC=64;OH=7;OW=7;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0,153011
+11,add_1,add_s8,n=3136,2585
+12,bn_modules.4,batchnorm2d_s8,N=1;C=64;H=7;W=7,3459
+13,conv_modules.7,conv2d_s8,N=1;IC=64;IH=7;IW=7;OC=128;OH=4;OW=4;KH=3;KW=3;SH=2;SW=2;PH=1;PW=1,958110
+14,conv_modules.8,conv2d_s8,N=1;IC=128;IH=4;IW=4;OC=128;OH=4;OW=4;KH=3;KW=3;SH=1;SW=1;PH=1;PW=1,1911413
+15,conv_modules.9,conv2d_s8,N=1;IC=64;IH=7;IW=7;OC=128;OH=4;OW=4;KH=1;KW=1;SH=2;SW=2;PH=0;PW=0,127933
+16,add_2,add_s8,n=2048,1701
+17,relu_modules.6,relu_s8,n=2048,172
+18,linear1,linear_s8,M=1;K=2048;N=1,1530
+19,linear2,linear_s8,M=1;K=2048;N=1,1531
+20,sigmoid1,sigmoid_s8,n=1,157
+=== MODELBLASTER_PROFILE_END ===
+=== MODELBLASTER_WALL_CYCLES === 105950

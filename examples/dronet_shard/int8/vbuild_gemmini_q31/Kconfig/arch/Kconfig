@@ -1,0 +1,11 @@
+# Load Zephyr Arch Kconfig descriptions.
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/rx/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/x86/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/xtensa/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/sparc/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/riscv/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/posix/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/mips/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/arm64/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/arm/Kconfig"
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/arch/arc/Kconfig"

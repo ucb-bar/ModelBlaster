@@ -1,0 +1,2 @@
+# Load board Kconfig descriptions.
+osource "/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw/zephyr_ws/zephyr/boards/spike/riscv64/Kconfig.spike_riscv64"

@@ -1,0 +1,51 @@
+config ZEPHYR_HAL_ESPRESSIF_MODULE
+   bool
+   default y
+config ZEPHYR_HAL_ST_MODULE
+   bool
+   default y
+config ZEPHYR_ACPICA_MODULE
+   bool
+   default y
+config ZEPHYR_CMSIS_MODULE
+   bool
+   default y
+config ZEPHYR_CMSIS_DSP_MODULE
+   bool
+   default y
+config ZEPHYR_CMSIS_NN_MODULE
+   bool
+   default y
+config ZEPHYR_FATFS_MODULE
+   bool
+   default y
+config ZEPHYR_LITTLEFS_MODULE
+   bool
+   default y
+config ZEPHYR_LVGL_MODULE
+   bool
+   default y
+config ZEPHYR_MBEDTLS_MODULE
+   bool
+   default y
+config ZEPHYR_MCUBOOT_MODULE
+   bool
+   default y
+config ZEPHYR_MIPI_SYS_T_MODULE
+   bool
+   default y
+config ZEPHYR_OPEN_AMP_MODULE
+   bool
+   default y
+config ZEPHYR_OPENTHREAD_MODULE
+   bool
+   default y
+config ZEPHYR_PERCEPIO_MODULE
+   bool
+   default y
+config ZEPHYR_PICOLIBC_MODULE
+   bool
+   default y
+config ZEPHYR_TINYCRYPT_MODULE
+   bool
+   default y
