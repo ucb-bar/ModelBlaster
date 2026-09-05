@@ -376,17 +376,29 @@ static inline void parallel_conv2d(void *pool_,
                                    int OC, int KH, int KW,
                                    int SH, int SW, int PH, int PW,
                                    int DH, int DW) {{
+    /* The fp32 reference conv2d takes 15 parameters and has no dilation
+     * support -- fp32 has no curated conv kernels at all, so this is the only
+     * implementation. Passing DH/DW to it was a 17-vs-15 argument mismatch that
+     * failed to compile the moment an fp32 CONVOLUTIONAL model was built
+     * (fastdepth was the one that surfaced it; the same defect was fixed for
+     * conv2d_f16 in b32dfe3). Dropping the arguments silently would compute a
+     * wrong answer for any dilated conv, so say so instead. */
+    if (DH != 1 || DW != 1) {{
+        printk("kernel_conv2d_{mid}: dilation %dx%d unsupported in the fp32 "
+               "reference kernel\\n", DH, DW);
+        return;
+    }}
 #ifdef MODELBLASTER_USE_POOL
     modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
     if (pool == NULL || N != 1) {{
         kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                            OC, KH, KW, SH, SW, PH, PW, DH, DW);
+                            OC, KH, KW, SH, SW, PH, PW);
         return;
     }}
     size_t T = modelblaster_pool_get_threads_count(pool);
     if (T <= 1 || (size_t)OC < T) {{
         kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                            OC, KH, KW, SH, SW, PH, PW, DH, DW);
+                            OC, KH, KW, SH, SW, PH, PW);
         return;
     }}
     int OH = (IH + 2 * PH - DH*(KH-1) - 1) / SH + 1;
@@ -402,7 +414,7 @@ static inline void parallel_conv2d(void *pool_,
 #else
     (void)pool_;
     kernel_conv2d_{mid}(in, w, b, out, N, IC, IH, IW,
-                        OC, KH, KW, SH, SW, PH, PW, DH, DW);
+                        OC, KH, KW, SH, SW, PH, PW);
 #endif
 }}
 """
@@ -1643,9 +1655,30 @@ _OC_SLICEABLE_CONV_OPS = {
     # N, IC, ...), no per-channel array, and _conv_weight_layout_for_op returns
     # None for it on every backend -- i.e. plain OIHW, where an OC slice IS
     # contiguous, so the `weight + t*tile_oc*IC*KH*KW` pointer offset is exactly
-    # right. conv2d_s8_pc is deliberately absent: it carries per-output-channel
-    # scales and nothing here slices a scale.
+    # right.
     "conv2d_f16",
+    # conv2d_s8_pc WAS excluded because it carries per-output-channel
+    # multiplier and shift arrays and nothing sliced them -- a tile would read
+    # the parent's scale vector from 0 and apply the wrong scale to every
+    # channel past the first tile, which is numerically wrong, size-identical
+    # and silent. It is included now because the emitter passes both arrays
+    # through `_oc_tile_operands(per_oc=...)`, the same path a fused conv's
+    # bn_scale/bn_bias already take: 1-D per-OC arrays are contiguous under
+    # every backend layout, so `+ oc0` reaches this tile's slice. Its 4-D
+    # weight IS layout-sensitive (hwio on gemmini_q31, like conv2d_s8), and
+    # membership here is exactly what routes it through
+    # split_conv_tile_weights for a re-packed per-tile array there.
+    "conv2d_s8_pc",
+}
+
+#: Conv kinds a BATCH split may be emitted for. Separate from the OC set
+#: because the two need opposite things from the operands: an OC tile slices
+#: weights, bias and any per-OC array, while a B tile shares all of them and
+#: slices only the two activations.
+_B_SLICEABLE_CONV_OPS = {
+    "conv2d_s8",
+    "conv2d_f16",
+    "conv2d_s8_pc",
 }
 
 #: The shard path's name for the same set, kept because `shard_conv_weights`
@@ -1869,6 +1902,45 @@ def _apply_tile_weight_plan(
                 b[oc0:oc0 + tile_oc])
             drop.add(bk)
     return extra, drop
+
+
+def _out_hw(sh: dict, who: str) -> tuple[int, int]:
+    """(OH, OW) for a conv shape, DERIVED when the IR does not carry them.
+
+    Not every conv op records OH/OW: vint's conv2d_s8_pc carries only
+    N/IC/IH/IW/OC plus the kernel geometry. Every caller here used
+    `int(sh.get("OH", 0))`, which turns a missing key into a plane size of
+    ZERO -- so an output offset of `tile * OC * OH * OW` becomes 0 for every
+    tile and they all write over each other. That is buildable, silent, and
+    it is exactly how the batch axis shipped with max_abs_err 1.31 against a
+    0.328 baseline on vint.
+
+    So: use the recorded values when present, derive them from the geometry
+    when not, and REFUSE when neither is possible rather than returning a
+    number that happens to be zero.
+    """
+    OH, OW = sh.get("OH"), sh.get("OW")
+    if OH is not None and OW is not None:
+        return int(OH), int(OW)
+    try:
+        IH, IW = int(sh["IH"]), int(sh["IW"])
+        KH, KW = int(sh["KH"]), int(sh["KW"])
+        SH, SW = int(sh.get("SH", 1)), int(sh.get("SW", 1))
+        PH, PW = int(sh.get("PH", 0)), int(sh.get("PW", 0))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"{who}: need the output plane size to place this tile, and the "
+            f"shape carries neither OH/OW nor the geometry to derive them "
+            f"({sorted(sh)}). Refusing rather than defaulting to 0, which "
+            f"would make every tile write at offset 0.") from exc
+    if OH is None:
+        OH = (IH + 2 * PH - KH) // SH + 1
+    if OW is None:
+        OW = (IW + 2 * PW - KW) // SW + 1
+    if int(OH) <= 0 or int(OW) <= 0:
+        raise SystemExit(f"{who}: derived a non-positive output plane "
+                         f"OH={OH} OW={OW} from {sorted(sh)}.")
+    return int(OH), int(OW)
 
 
 def _oc_tile_operands(
@@ -2316,8 +2388,7 @@ def emit_model(ir: dict[str, Any], out_dir: str,
                 # tile_oc rows of (OH*OW) elements at offset
                 # tile_idx * tile_oc * OH * OW.
                 tile_oc = int(sh.get("OC", 0))
-                OH = int(sh.get("OH", 0))
-                OW = int(sh.get("OW", 0))
+                OH, OW = _out_hw(sh, f"{op.get('name')} (OC tile)")
                 oc0 = int(sf.get("tile_offset_OC", tile_idx * tile_oc))
                 elem_offset = oc0 * OH * OW
             elif axis == "N" and op["op"] in _N_SLICEABLE_LINEAR_OPS:
@@ -2345,6 +2416,14 @@ def emit_model(ir: dict[str, Any], out_dir: str,
                 OW = int(sh.get("OW", 0))
                 c0 = int(sf.get("tile_offset_C", 0))
                 elem_offset = c0 * OH * OW
+            elif axis == "B" and op["op"] in _B_SLICEABLE_CONV_OPS:
+                # Output [N, OC, OH, OW] with batch outermost: this tile's
+                # batch range is `tile_n` whole images of OC*OH*OW at
+                # `n0*OC*OH*OW`. One contiguous run, unlike an OH band.
+                OCn = int(sh.get("OC", 0))
+                OH, OW = _out_hw(sh, f"{op.get('name')} (B tile)")
+                n0 = int(sf.get("tile_offset_B", 0))
+                elem_offset = n0 * OCn * OH * OW
             elif axis == "E" and op["op"] in _E_SLICEABLE_ELTWISE_OPS:
                 # Flat element range: the offset IS the tile's element offset,
                 # with no shape to multiply through, because the parent's
@@ -2786,6 +2865,29 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         # kinds needed no per-kind emitter work. The tile's OUTPUT pointer is
         # already offset by its alias, and `shape["n"]` is already narrowed by
         # the splitter, so this is the last of the three things a tile needs.
+        # A BATCH tile reads its own images out of the parent's input. Batch is
+        # outermost in [N, IC, IH, IW] too, so this is one offset -- and unlike
+        # the E case it applies to the conv's ACTIVATION input only, never to
+        # the weights, which every batch shares.
+        _sf_b = op.get("split_from") or {}
+        if _sf_b.get("axis") == "B" and op["op"] in _B_SLICEABLE_CONV_OPS:
+            if _shim_override:
+                raise SystemExit(
+                    f"{op.get('name')}: a B split tile also needs a layout "
+                    f"shim; that combination is not emitted.")
+            _shb = _conv_shape_of(op)
+            _b_off = int(_sf_b.get("tile_offset_B", 0))
+            if _b_off:
+                _per_img = (int(_shb.get("IC", 0)) * int(_shb.get("IH", 0))
+                            * int(_shb.get("IW", 0)))
+                if _per_img <= 0:
+                    raise SystemExit(
+                        f"{op.get('name')}: B split needs IC/IH/IW to size one "
+                        f"image; got {_shb}.")
+                _nm = (op.get("inputs") or [None])[0]
+                if _nm:
+                    _shim_override[_nm] = f"({ptr_for(_nm, 'in')} + {_b_off * _per_img})"
+
         _sf_e = op.get("split_from") or {}
         if _sf_e.get("axis") == "E":
             if _shim_override:
@@ -3734,6 +3836,15 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             q = op["quant"]
             mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
             shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
+            # An OC tile owns channels [oc0, oc0+tile_oc). The multiplier and
+            # shift arrays are indexed by output channel, so they have to move
+            # with the weight and bias or the tile applies channel 0's scale to
+            # its first channel -- correct for tile 0, wrong for every other,
+            # and the same size either way. `per_oc` is the same mechanism a
+            # fused conv's bn_scale/bn_bias uses.
+            w, b, (mult, shift) = _oc_tile_operands(
+                op, sh, tile_w_plan, model_name, w, b,
+                per_oc=(mult, shift), backend=backend)
             call = (
                 f"kernel_conv2d_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
