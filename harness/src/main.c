@@ -33,6 +33,28 @@
 #include <zephyr/arch/cpu.h>
 #endif
 
+/* Opt-in HARDWARE TACIT capture of the inference via raw MMIO (independent of
+ * the spike-oriented MB_TACIT_TRACE_MODEL / l_trace path above). Build with
+ * -DMB_TACIT_HW=1. Programs the TACIT encoder controller + DMA trace sink to
+ * stream the branch trace into a DDR region clear of the app/data, brackets
+ * exactly model_run_test(), then disables + flushes the sink and reports the
+ * byte count on the console. Register map matches the validated trace_test
+ * recipe (encoder ctrl @0x3000000, DMA sink @0x3010000). */
+#if defined(MB_TACIT_HW)
+#ifndef MB_TACIT_TRACE_BUF
+#define MB_TACIT_TRACE_BUF 0x90000000UL   /* 256 MiB into DDR, clear of app */
+#endif
+#define MB_TACIT_CTRL    0x3000000UL      /* +0x00 control: bit1=enable bit0=active */
+#define MB_TACIT_TARGET  0x3000020UL      /* trace sink target id */
+#define MB_TACIT_BPMODE  0x3000024UL      /* branch-predictor mode (0 = branch-target) */
+#define MB_TACIT_DMA_FLUSH 0x3010000UL    /* write 1 -> flush FIFO */
+#define MB_TACIT_DMA_DONE  0x3010004UL    /* read  1 -> flush drained */
+#define MB_TACIT_DMA_START 0x3010008UL    /* 64-bit dma_start_addr */
+#define MB_TACIT_DMA_BYTES 0x3010010UL    /* 64-bit addr_counter (bytes written) */
+#define MB_MMIO32(a) (*(volatile unsigned int  *)(a))
+#define MB_MMIO64(a) (*(volatile unsigned long *)(a))
+#endif
+
 static model_output_t model_output[MODEL_OUTPUT_SIZE];
 
 int main(void)
@@ -101,7 +123,36 @@ int main(void)
     unsigned int mb_irq_key = irq_lock();
 #endif
 
+#if defined(MB_TACIT_HW)
+    /* Program + enable the encoder immediately before the inference so the
+     * FSync lands on a real inference PC and the trace holds only model
+     * control flow (boot / verify / print are outside the window). */
+    unsigned long mb_tacit_bytes = 0;
+    MB_MMIO64(MB_TACIT_DMA_BYTES) = 0UL;               /* reset byte counter */
+    MB_MMIO64(MB_TACIT_DMA_START) = MB_TACIT_TRACE_BUF; /* dma start addr */
+    MB_MMIO32(MB_TACIT_TARGET)    = 1u;                 /* DMA sink (target id 1) */
+    MB_MMIO32(MB_TACIT_BPMODE)    = 0u;                 /* branch-target mode */
+    __asm__ volatile("fence" ::: "memory");
+    MB_MMIO32(MB_TACIT_CTRL)      = 3u;                 /* enable=1, active=1 */
+    __asm__ volatile("fence" ::: "memory");
+#endif
+
     model_run_test(model_output, NULL);
+
+#if defined(MB_TACIT_HW)
+    __asm__ volatile("fence" ::: "memory");
+    MB_MMIO32(MB_TACIT_CTRL) = 1u;                      /* disable tracing */
+    __asm__ volatile("fence" ::: "memory");
+    MB_MMIO32(MB_TACIT_DMA_FLUSH) = 1u;                 /* drain FIFO -> DDR */
+    /* FIFO is 32 bytes; a few thousand cycles is plenty. Poll done with a
+     * bounded spin (done_reg latches and cannot be cleared from SW, so also
+     * fall through after the delay regardless). */
+    for (volatile int _d = 0; _d < 200000; _d++) {
+        if (MB_MMIO32(MB_TACIT_DMA_DONE) & 1u) break;
+    }
+    __asm__ volatile("fence" ::: "memory");
+    mb_tacit_bytes = MB_MMIO64(MB_TACIT_DMA_BYTES);
+#endif
 #if defined(MB_TACIT_TRACE_MODEL)
     l_trace_encoder_stop(_tacit_enc);
     for (int _i = 0; _i < 16; _i++) { __asm__ volatile("nop"); } /* flush */
@@ -117,6 +168,11 @@ int main(void)
 
 #if MODELBLASTER_MASK_IRQ_DURING_RUN
     irq_unlock(mb_irq_key);
+#endif
+
+#if defined(MB_TACIT_HW)
+    printf("=== MB_TACIT_HW === trace_buf=0x%lx bytes=%lu\n",
+           (unsigned long)MB_TACIT_TRACE_BUF, mb_tacit_bytes);
 #endif
 
     /* In-binary golden compare.

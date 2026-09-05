@@ -118,3 +118,13 @@ if(MB_TACIT_TRACE_MODEL)
     target_compile_definitions(app PRIVATE MB_TACIT_TRACE_MODEL=1)
     message(STATUS "modelblaster harness: TACIT model tracing enabled")
 endif()
+
+# Opt-in: raw-MMIO HARDWARE TACIT capture of the inference (DDR DMA trace sink).
+# Pass -DMB_TACIT_HW=1 (optionally -DMB_TACIT_TRACE_BUF=<ddr addr>). See main.c.
+if(MB_TACIT_HW)
+    target_compile_definitions(app PRIVATE MB_TACIT_HW=1)
+    if(DEFINED MB_TACIT_TRACE_BUF)
+        target_compile_definitions(app PRIVATE MB_TACIT_TRACE_BUF=${MB_TACIT_TRACE_BUF})
+    endif()
+    message(STATUS "modelblaster harness: hardware TACIT capture enabled")
+endif()
