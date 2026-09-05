@@ -749,9 +749,17 @@ def _requantize_int(acc: np.ndarray, multiplier: int, shift: int) -> np.ndarray:
 # holds target-indep IR; generated/<target>/ holds the target-specific
 # code) -- this allowlist is a deliberate, narrow exception scoped to ONLY
 # the extended-fusion opt-in path, not a general target-coupling of the IR.
-_FUSION_SAFE_TARGETS: frozenset = frozenset()  # see above: every prior
-# entry was measured as a 7.8x-42.6x regression. Re-add only with an FPGA
-# measurement showing the fused path beats the unfused one.
+_FUSION_SAFE_TARGETS: frozenset = frozenset({"gemmini_q31_rvv"})  # the prior
+# 7.8x-42.6x regressions were the conv2d_pool_s8 fused kernel falling back to
+# the SCALAR reference: gemmini_tiled_conv_pool was affinity-tagged
+# (gemmini, gemmini_q31) only, so on gemmini_q31_rvv it lost the accelerated
+# path entirely. Now that a gemmini_q31_rvv-affined curated fused kernel
+# exists (kernels/gemmini_q31_rvv/gemmini_q31_rvv_conv2d_pool_s8_gemmini_
+# tiled_conv_pool.c), conv2d_pool_s8 folds the maxpool into the conv mvout on
+# this target instead. Re-add other targets only alongside their own FPGA
+# measurement + affined curated kernel. Fusion is still opt-in per build via
+# --enable-fusion / MB_ENABLE_FUSION=1, so this does not fire for models that
+# do not request it.
 
 
 def _fusion_target_is_safe(fusion_target: "str | None") -> bool:

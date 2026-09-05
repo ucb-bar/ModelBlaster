@@ -3325,8 +3325,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # (and few enough) that OC-parallelizing this call too is a
             # follow-up, not required for correctness or the measured win.
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            # Backend-suffixed packed-weight symbol name, same as conv2d_s8 /
+            # conv2d_silu_s8: the HWIO-packed weight blob is emitted as
+            # <model>_<key>_<backend>, so the fused call must reference that
+            # name too (without `backend` it names the unpacked OIHW symbol,
+            # which for a curated gemmini build is never emitted -> undefined
+            # reference at compile).
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             call = (

@@ -3658,7 +3658,7 @@ void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
     algorithms=[
         AlgorithmCandidate(
             name="gemmini_tiled_conv_pool",
-            target_affinity=("gemmini", "gemmini_q31"),
+            target_affinity=("gemmini", "gemmini_q31", "gemmini_q31_rvv"),
             weight_layout="hwio",
             accuracy_class=AccuracyClass.NUMERIC_DRIFT,
             description=(
