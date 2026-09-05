@@ -158,7 +158,8 @@ struct net_ctx {
     rcl_publisher_t        pub_done;
     std_msgs__msg__Int32   done_msg;
     void                 (*run_graph)(void);
-    uint64_t               period_ms;
+    uint64_t               period_ms;   /* kept for logging */
+    uint64_t               period_us;   /* authoritative; 0 = one-shot */
     uint64_t               wall_cycles;
     uint64_t               iter;
 };
@@ -235,6 +236,88 @@ static volatile void *last_dispatch_input_b  = NULL;
 static volatile void *last_dispatch_output_b = NULL;
 static volatile void *last_dispatch_pool_b   = NULL;
 
+/* MICROROS_DISPATCH_GUARD — do not let a THREAD SWITCH happen inside a
+ * vector kernel.
+ *
+ * On the Saturn RVV configs in this tree a trap taken while a vector kernel
+ * is executing can return with EXACTLY ONE scalar register corrupted --
+ * deterministic, bit-reproducible, and invisible on spike. The trigger is
+ * vector instructions being issued into Saturn's decoupled vector unit from
+ * the trap/context-switch path (z_riscv_vstate_save_thread /
+ * z_riscv_vstate_restore_thread in arch/riscv/core/v.c) while the
+ * interrupted thread's own vector memop is still in flight. Root-caused and
+ * hardware-proven in experiments/kernel_opt_log.jsonl, entries
+ * convfix-002-deterministic .. convfix-008-harness-irq-guard: stubbing
+ * z_riscv_vstate_save alone makes the fault vanish (fq job 287), and the
+ * same ELF that faults deterministically runs clean with MIE masked
+ * (fq jobs 283/285).
+ *
+ * Every other harness in the tree already carries this guard --
+ * modelblaster/harness/src/main.c via MODELBLASTER_MASK_IRQ_DURING_RUN, and
+ * the generated scheduled harness via XPURT_DISPATCH_IRQ_GUARD in
+ * modelblaster/pipeline/generate_xpurt_main.py. harness_microros is the one
+ * that never got it, because until CONFIG_TIMESLICING was turned on
+ * (2026-09-04, see experiments/microros/SERIALIZATION_ROOT_CAUSE.md) the
+ * dronet executor monopolised hart 2 and was never once preempted, so the
+ * hazard could not fire here. The starvation fix exposed it: dronet faulted
+ * on `vsse8.v v2,(a7),a0` (eager V, mcause=7) and on `vle8.v v1,(t3)`
+ * (decoupled-lazy V, mcause=5) with a base register the kernel's own
+ * arithmetic provably cannot compute.
+ *
+ * k_sched_lock(), NOT irq_lock(). Under CONFIG_SMP -- which every build here
+ * sets -- irq_lock() is redefined to z_smp_global_lock(), Zephyr's
+ * system-wide big kernel lock, so holding it across a kernel call makes the
+ * harts mutually exclusive. That is what produced the ~400 ms hart-1 stall
+ * during yolov8 that the raw `csrrc mie` MSIE masks below were bolted on to
+ * work around, and (measured on FPGA job 375) it serialises two harts that
+ * should run concurrently. k_sched_lock() suppresses exactly the thread
+ * switch and nothing else: ISRs still run, the system tick keeps advancing,
+ * and kernel/sched.c holds _sched_spinlock only long enough to bump a
+ * per-thread counter, so the other harts stay independent.
+ *
+ * Held across ONE dispatch call only. Every k_sem wait, scheduler decision,
+ * trace_record and rclc callback happens outside it, so this cannot starve
+ * the co-resident executor: with CONFIG_TIMESLICING on, mlp_control still
+ * preempts dronet between dispatches.
+ *
+ * MICROROS_DISPATCH_GUARD=0 disables it (reproduces the fault). */
+/* MICROROS_DISPATCH_GUARD_IRQ escalates the guard from "no thread switch"
+ * to "no trap at all on this hart", using arch_irq_lock() -- NOT irq_lock(),
+ * which include/zephyr/irq.h:259 redefines to z_smp_global_lock() under
+ * CONFIG_SMP. arch_irq_lock() is a plain per-hart mstatus.MIE clear
+ * (include/zephyr/arch/riscv/arch.h:257), so it costs the other harts
+ * nothing.
+ *
+ * Needed because convfix-007 in experiments/kernel_opt_log.jsonl showed the
+ * hazard is not only the context-switch path: with the ISR-entry V save
+ * removed and NO thread switches at all (single-threaded, cpu-pinned
+ * harness), a bare timer tick mid-kernel still returned with one scalar
+ * register wrong (shape 198, `vsse16.v v4,(a3),a6` with stride a6=0x5401
+ * where the correct value is 40). Masking MIE is the only measure that
+ * removed the crash class outright (convfix-008, fq jobs 283/285/297).
+ *
+ * Cost vs the sched-lock-only guard is one delayed tick per dispatch, not
+ * extra starvation: both guards already keep the co-resident executor out
+ * for exactly one dispatch call. */
+#if !defined(MICROROS_DISPATCH_GUARD)
+#define MICROROS_DISPATCH_GUARD 1
+#endif
+#if !defined(MICROROS_DISPATCH_GUARD_IRQ)
+#define MICROROS_DISPATCH_GUARD_IRQ 1
+#endif
+#if MICROROS_DISPATCH_GUARD && MICROROS_DISPATCH_GUARD_IRQ
+#define MB_DISPATCH_GUARD_ENTER() \
+	unsigned int mb_guard_key_ = arch_irq_lock(); k_sched_lock()
+#define MB_DISPATCH_GUARD_EXIT()  \
+	k_sched_unlock(); arch_irq_unlock(mb_guard_key_)
+#elif MICROROS_DISPATCH_GUARD
+#define MB_DISPATCH_GUARD_ENTER() k_sched_lock()
+#define MB_DISPATCH_GUARD_EXIT()  k_sched_unlock()
+#else
+#define MB_DISPATCH_GUARD_ENTER() do { } while (0)
+#define MB_DISPATCH_GUARD_EXIT()  do { } while (0)
+#endif
+
 static inline void trace_record(const char *net, int inst, int did, int hart,
                                 const char *kind, uint64_t s, uint64_t e) {
     int idx = atomic_inc(&ros_trace_count);
@@ -262,6 +345,16 @@ static void run_graph_a(void) {
      * (see plots/microros_3net_configB_*.png — hart 1 idle while
      * yolov8 runs). MICROROS_NO_LOCK_A=1 disables it for cross-config
      * comparison. */
+    /* net A is LEFT EXACTLY AS IT WAS. yolov8_nano is alone on hart 0 --
+     * nothing else is pinned there -- so it is never preempted and the
+     * mid-vector-kernel hazard the MB_DISPATCH_GUARD exists for cannot
+     * fire on this net. Swapping this whole-loop irq_lock() for the
+     * per-dispatch guard was tried (cfg3xJ, fq job 831) and the run
+     * stopped completing session bring-up: only 2 of 3 broker sessions
+     * came up. The fault itself was gone -- 600 s with no mcause at all,
+     * against a fault within ~16 s for the identical binary without the
+     * guard (cfg3xH, fq job 828) -- so the guard works; it is this net-A
+     * change that is not free. Do not "clean this up" without a run. */
 #ifndef MICROROS_NO_LOCK_A
     unsigned int irq_key = irq_lock();
 #endif
@@ -298,7 +391,9 @@ static void run_graph_c(void) {
                      : "memory");
     for (size_t i = 0; i < OP_COUNT(NET_C_NAME_UP); i++) {
         uint64_t s = (uint64_t)k_cycle_get_64() - global_t0;
+        MB_DISPATCH_GUARD_ENTER();
         DISPATCH_FNS(NET_C_NAME_UP, NET_C_BACKEND_UP)[i](&s_c);
+        MB_DISPATCH_GUARD_EXIT();
         uint64_t e = (uint64_t)k_cycle_get_64() - global_t0;
         trace_record(NET_C_NAME, iter, (int)i, NET_C_HART, ctx_c.kind_str, s, e);
     }
@@ -376,7 +471,9 @@ static void run_graph_b(void) {
         last_dispatch_output_b  = (void *)s_b.output;
         last_dispatch_pool_b    = (void *)s_b.pool;
         uint64_t s = (uint64_t)k_cycle_get_64() - global_t0;
+        MB_DISPATCH_GUARD_ENTER();
         DISPATCH_FNS(NET_B_NAME_UP, NET_B_BACKEND_UP)[i](&s_b);
+        MB_DISPATCH_GUARD_EXIT();
         uint64_t e = (uint64_t)k_cycle_get_64() - global_t0;
         last_dispatch_id_b_post = (int)i;
         trace_record(NET_B_NAME, iter, (int)i, NET_B_HART, ctx_b.kind_str, s, e);
@@ -521,8 +618,8 @@ static void node_thread_fn(void *arg1, void *arg2, void *arg3) {
 #endif
 
     rcl_timer_t timer;
-    bool one_shot = (ctx->period_ms == 0);
-    uint64_t period_ns = one_shot ? 1u : RCL_MS_TO_NS(ctx->period_ms);
+    bool one_shot = (ctx->period_us == 0);
+    uint64_t period_ns = one_shot ? 1u : (ctx->period_us * 1000ULL);
     rcl_timer_callback_t _tcb = (ctx == &ctx_a) ? timer_cb_a : timer_cb_b;
 #ifdef MICROROS_3NET
     if (ctx == &ctx_c) _tcb = timer_cb_c;
@@ -639,13 +736,13 @@ static void single_executor_thread_fn(void *a, void *b, void *c) {
     std_msgs__msg__Int32__init(&ctx_b.done_msg);
 
     rcl_timer_t timer_a, timer_b;
-    bool a_one_shot = (ctx_a.period_ms == 0);
-    bool b_one_shot = (ctx_b.period_ms == 0);
+    bool a_one_shot = (ctx_a.period_us == 0);
+    bool b_one_shot = (ctx_b.period_us == 0);
     rclc_timer_init_default2(&timer_a, &support,
-        a_one_shot ? 1u : RCL_MS_TO_NS(ctx_a.period_ms),
+        a_one_shot ? 1u : (ctx_a.period_us * 1000ULL),
         timer_cb_a, true);
     rclc_timer_init_default2(&timer_b, &support,
-        b_one_shot ? 1u : RCL_MS_TO_NS(ctx_b.period_ms),
+        b_one_shot ? 1u : (ctx_b.period_us * 1000ULL),
         timer_cb_b, true);
 
     rclc_executor_t executor;
@@ -734,7 +831,7 @@ static void bc_executor_thread_fn(void *a, void *b, void *c) {
      * the hart-1 stall is from "multi-timer-per-executor". */
     rcl_timer_t timer_bc;
     rclc_timer_init_default2(&timer_bc, &support,
-        RCL_MS_TO_NS(ctx_b.period_ms), timer_cb_bc_fused, true);
+        (ctx_b.period_us * 1000ULL), timer_cb_bc_fused, true);
     rclc_executor_init(&executor, &support.context, 1, &allocator);
     rclc_executor_add_timer(&executor, &timer_bc);
     printk("[bc_exec] FUSE_BC: 1 timer, callback runs b+2c\n");
@@ -742,8 +839,8 @@ static void bc_executor_thread_fn(void *a, void *b, void *c) {
     goto bc_ready;
 #endif
     rcl_timer_t timer_b, timer_c;
-    bool b_one_shot = (ctx_b.period_ms == 0);
-    bool c_one_shot = (ctx_c.period_ms == 0);
+    bool b_one_shot = (ctx_b.period_us == 0);
+    bool c_one_shot = (ctx_c.period_us == 0);
     /* MICROROS_2EXEC_FIRE_FAST: collapse both periods to 1ns so the
      * timers fire on every spin_some call. Tests whether the apparent
      * Config-B "gap" was just the bc_executor correctly waiting for
@@ -756,10 +853,10 @@ static void bc_executor_thread_fn(void *a, void *b, void *c) {
     printk("[bc_exec] FIRE_FAST: both timer periods=1ns\n");
 #else
     rclc_timer_init_default2(&timer_b, &support,
-        b_one_shot ? 1u : RCL_MS_TO_NS(ctx_b.period_ms),
+        b_one_shot ? 1u : (ctx_b.period_us * 1000ULL),
         timer_cb_b, true);
     rclc_timer_init_default2(&timer_c, &support,
-        c_one_shot ? 1u : RCL_MS_TO_NS(ctx_c.period_ms),
+        c_one_shot ? 1u : (ctx_c.period_us * 1000ULL),
         timer_cb_c, true);
 #endif
     printk("[bc_exec] T5 after timer_init x2 cyc=%llu\n",
@@ -881,7 +978,7 @@ static void no_microros_thread_fn(void *arg1, void *arg2, void *arg3) {
 
     /* Net A waits for net B to finish its first (one-shot) dispatch
      * before exiting; mirrors broker-mode handshake ordering. */
-    bool one_shot = (ctx->period_ms == 0);
+    bool one_shot = (ctx->period_us == 0);
     if (one_shot) {
         if (ctx->run_graph) ctx->run_graph();
         ctx->iter = 1;
@@ -1189,6 +1286,7 @@ int main(void) {
     ctx_a.kind_str    = STR(NET_A_BACKEND);
     ctx_a.run_graph   = run_graph_a;
     ctx_a.period_ms   = NET_A_PERIOD_MS;
+    ctx_a.period_us   = NET_A_PERIOD_US;
 
     ctx_b.session_idx = 1;
     ctx_b.cpu         = NET_B_HART;
@@ -1197,6 +1295,7 @@ int main(void) {
     ctx_b.kind_str    = STR(NET_B_BACKEND);
     ctx_b.run_graph   = run_graph_b;
     ctx_b.period_ms   = NET_B_PERIOD_MS;
+    ctx_b.period_us   = NET_B_PERIOD_US;
 
 #ifdef MICROROS_3NET
     ctx_c.session_idx = 2;
@@ -1206,6 +1305,7 @@ int main(void) {
     ctx_c.kind_str    = STR(NET_C_BACKEND);
     ctx_c.run_graph   = run_graph_c;
     ctx_c.period_ms   = NET_C_PERIOD_MS;
+    ctx_c.period_us   = NET_C_PERIOD_US;
 #endif
 
     global_t0 = (uint64_t)k_cycle_get_64();

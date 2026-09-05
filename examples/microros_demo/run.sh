@@ -148,6 +148,15 @@ MODEL_DIRS_BASE="${MODEL_DIRS_BASE#;}"
 PIN_BACKENDS_LIST="$(IFS=';'; echo "${PIN_BS_LIST[*]}")"
 PIN_HARTS_LIST="$(IFS=';'; echo "${PIN_HART_LIST[*]}")"
 PERIODS_LIST="$(IFS=';'; echo "${PERIOD_LIST[*]}")"
+# Integer milliseconds cannot express wl_sweep's tight_loop (0.048 ms) or
+# bimodal (0.032 ms): they truncate to 0, which main.c reads as ONE-SHOT, so the
+# harness silently runs a different workload than the one it was asked for.
+# Convert to integer MICROSECONDS here -- bash has no float arithmetic, and
+# CMake's math() is integer-only, so do it in python where it is exact.
+PERIODS_US_LIST="$(python3 -c "
+import sys
+print(';'.join(str(int(round(float(v)*1000))) for v in sys.argv[1].split(';')))
+" "${PERIODS_LIST}")"
 
 WEST_CMAKE_ARGS=(
     "-DMODEL_BACKENDS=${BACKENDS}"
@@ -156,6 +165,7 @@ WEST_CMAKE_ARGS=(
     "-DMODEL_PIN_BACKENDS=${PIN_BACKENDS_LIST}"
     "-DMODEL_PIN_HARTS=${PIN_HARTS_LIST}"
     "-DMODEL_PERIODS_MS=${PERIODS_LIST}"
+    "-DMODEL_PERIODS_US=${PERIODS_US_LIST}"
     "-DMODELBLASTER_POOL_THREADS=${MODELBLASTER_POOL_THREADS}"
 )
 if [[ -n "${MICROROS_BROKER_HART:-}" ]]; then

@@ -251,7 +251,9 @@ list(GET MODEL_PIN_BACKENDS  1 _pb1)
 list(GET MODEL_PIN_HARTS     0 _ph0)
 list(GET MODEL_PIN_HARTS     1 _ph1)
 list(GET MODEL_PERIODS_MS    0 _pm0)
+    list(GET MODEL_PERIODS_US    0 _pu0)
 list(GET MODEL_PERIODS_MS    1 _pm1)
+    list(GET MODEL_PERIODS_US    1 _pu1)
 string(TOUPPER "${_n0}" _N0_UP)
 string(TOUPPER "${_n1}" _N1_UP)
 string(TOUPPER "${_pb0}" _PB0_UP)
@@ -264,19 +266,22 @@ target_compile_definitions(app PRIVATE
     NET_A_BACKEND_UP=${_PB0_UP}
     NET_A_HART=${_ph0}
     NET_A_PERIOD_MS=${_pm0}
+    NET_A_PERIOD_US=${_pu0}
     NET_B_NAME=\"${_n1}\"
     NET_B_NAME_C=${_n1}
     NET_B_NAME_UP=${_N1_UP}
     NET_B_BACKEND=${_pb1}
     NET_B_BACKEND_UP=${_PB1_UP}
     NET_B_HART=${_ph1}
-    NET_B_PERIOD_MS=${_pm1})
+    NET_B_PERIOD_MS=${_pm1}
+    NET_B_PERIOD_US=${_pu1})
 
 if(_n_names GREATER_EQUAL 3)
     list(GET MODEL_NAMES         2 _n2)
     list(GET MODEL_PIN_BACKENDS  2 _pb2)
     list(GET MODEL_PIN_HARTS     2 _ph2)
     list(GET MODEL_PERIODS_MS    2 _pm2)
+    list(GET MODEL_PERIODS_US    2 _pu2)
     string(TOUPPER "${_n2}" _N2_UP)
     string(TOUPPER "${_pb2}" _PB2_UP)
     target_compile_definitions(app PRIVATE
@@ -287,7 +292,8 @@ if(_n_names GREATER_EQUAL 3)
         NET_C_BACKEND=${_pb2}
         NET_C_BACKEND_UP=${_PB2_UP}
         NET_C_HART=${_ph2}
-        NET_C_PERIOD_MS=${_pm2})
+        NET_C_PERIOD_MS=${_pm2}
+        NET_C_PERIOD_US=${_pu2})
 endif()
 
 if(DEFINED MICROROS_BROKER_HART)
