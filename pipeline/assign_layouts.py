@@ -51,7 +51,7 @@ LAYOUT_CONTRACT = "modelblaster.layout_hints/v1"
 #: kernel behind it -- though the codegen gate is deny-by-default and will refuse
 #: anything whose declared act_layouts do not cover what this pass assigned, so
 #: a stale entry here is caught rather than shipped.
-NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8"}  # bn dropped: scalar_chan_lut_nhwc is float-hot-path, unusable on misa.F=0; NCHW integer bn kept
+NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8", "conv2d_pool_s8"}  # bn dropped: scalar_chan_lut_nhwc is float-hot-path, unusable on misa.F=0; NCHW integer bn kept. conv2d_pool_s8 = fused conv+maxpool (NHWC HW mvout pool tail).
 
 #: Layout-agnostic: pure elementwise, same bytes in any order, so they never
 #: force a conversion and never need a variant. They join an island for free.

@@ -3674,6 +3674,27 @@ void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
             ),
             reference_impl="",  # the curated .c file supplies the impl
         ),
+        # ── NHWC fused conv+maxpool (integrated stack) ──────────────────────
+        # NHWC-native counterpart of gemmini_tiled_conv_pool: the conv is
+        # transpose-free (reads/writes NHWC) AND the maxpool rides the HW mvout
+        # pool tail, so both the per-conv transpose and the standalone maxpool
+        # (+ its boundary relayouts) are gone. Same pool constraints/exactness.
+        # Curated file:
+        # kernels/gemmini_q31_rvv/gemmini_q31_rvv_conv2d_pool_s8_gemmini_tiled_conv_pool_nhwc.c
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_pool_nhwc",
+            target_affinity=GEMMINI_TARGETS,
+            act_layouts=("nhwc",),
+            weight_layout="hwio",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "NHWC fused conv2d+maxpool: tiled_conv_auto with its pool tail "
+                "on NHWC activations, no NCHW<->NHWC transpose on either side. "
+                "Same square/unpadded pool constraints as gemmini_tiled_conv_"
+                "pool; anything else -> scalar NHWC conv-then-pool fallback."
+            ),
+            reference_impl="",  # the curated .c file supplies the impl
+        ),
     ],
 )
 
@@ -12480,7 +12501,7 @@ void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
         # winner, and the pick was decided by list position.
         AlgorithmCandidate(
             name='rvv_seg',
-            target_affinity=('rvv',),
+            target_affinity=('rvv', 'gemmini_q31_rvv'),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "RVV segment load/store (vlseg/vsseg and their strided forms, "
@@ -12653,7 +12674,7 @@ void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
         # winner, and the pick was decided by list position.
         AlgorithmCandidate(
             name='rvv_seg',
-            target_affinity=('rvv',),
+            target_affinity=('rvv', 'gemmini_q31_rvv'),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "RVV segment load/store (vlseg/vsseg and their strided forms, "
