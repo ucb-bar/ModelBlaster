@@ -24,6 +24,23 @@ Shape/size knobs, same convention as the other models here:
                                      DRAM budget and the int8 calibration fast.
   MODELBLASTER_FASTDEPTH_DECODER_CH  default 64, channels at the widest decoder
                                      stage; halves at each subsequent stage.
+  MODELBLASTER_FASTDEPTH_SKIPS       default 0. 1 adds the paper's additive
+                                     skip connections from the encoder into
+                                     each decoder stage. OFF by default so the
+                                     already-measured latency graphs reproduce
+                                     unchanged; the TRAINED checkpoint needs
+                                     them, because a decoder fed only by the
+                                     1/32-resolution bottleneck cannot recover
+                                     depth edges and scores far worse.
+  MODELBLASTER_FASTDEPTH_PRETRAINED  default 0. 1 initialises the encoder from
+                                     torchvision's ImageNet weights, which
+                                     exist ONLY for width_mult=1.0 -- any other
+                                     width raises rather than silently
+                                     returning a randomly-initialised encoder.
+  MODELBLASTER_FASTDEPTH_CKPT        path to a trained state_dict. This is what
+                                     turns the model from a shape/throughput
+                                     benchmark into something whose depth
+                                     output means anything.
 
 The decoder deliberately uses `nn.Upsample(scale_factor=2, mode='nearest')`
 rather than a transposed convolution: nearest-neighbour upsampling is what the
@@ -68,15 +85,30 @@ def _sep_conv(cin: int, cout: int) -> nn.Sequential:
     )
 
 
+#: torchvision mobilenet_v2 feature indices whose OUTPUT sits at 1/2, 1/4,
+#: 1/8 and 1/16 of the input. The decoder upsamples 1/32 -> 1/16 -> ... -> 1/1,
+#: so these are consumed in reverse. Taken by running the encoder rather than
+#: by arithmetic on width_mult: _make_divisible rounds channel counts, and
+#: guessing them is how a skip projection silently gets the wrong width.
+_TAPS = (1, 3, 6, 13)
+
+
 class FastDepth(nn.Module):
-    def __init__(self, width_mult: float = 0.25, dec_ch: int = 64):
+    def __init__(self, width_mult: float = 0.25, dec_ch: int = 64,
+                 skips: bool = False, pretrained: bool = False):
         super().__init__()
         from torchvision.models import mobilenet_v2
-        # No pretrained weights: this runs as a shape/throughput benchmark and
-        # against its own PyTorch golden, so random init is honest. Anything
-        # claiming depth ACCURACY would need the paper's NYUv2 checkpoint.
-        self.encoder = mobilenet_v2(weights=None, width_mult=width_mult).features
+        if pretrained and abs(width_mult - 1.0) > 1e-9:
+            raise ValueError(
+                f"MODELBLASTER_FASTDEPTH_PRETRAINED=1 needs width_mult=1.0; "
+                f"torchvision ships ImageNet weights only for the full-width "
+                f"MobileNetV2, and got width_mult={width_mult}. Silently "
+                f"falling back to random init would look like a trained model.")
+        self.encoder = mobilenet_v2(
+            weights="IMAGENET1K_V1" if pretrained else None,
+            width_mult=width_mult).features
         enc_out = self.encoder[-1].out_channels
+        self.skips = bool(skips)
 
         chs = [dec_ch, dec_ch // 2, dec_ch // 4, dec_ch // 8, dec_ch // 16]
         chs = [max(c, 8) for c in chs]
@@ -88,12 +120,46 @@ class FastDepth(nn.Module):
         self.dec5 = _sep_conv(chs[3], chs[4])
         self.head = nn.Conv2d(chs[4], 1, kernel_size=1)
 
+        if self.skips:
+            # 1x1 projections so an encoder tap can be ADDED to the decoder
+            # stage at the same resolution. Widths are measured, not derived.
+            # eval() for the probe (BatchNorm rejects a 1x1 spatial map in
+            # train mode) and 64x64 so the 1/32 stage is still 2x2. The module
+            # is constructed in train mode, so restore it afterwards.
+            was_training = self.encoder.training
+            self.encoder.eval()
+            with torch.no_grad():
+                widths, h = [], torch.zeros(1, 3, 64, 64)
+                for i, blk in enumerate(self.encoder):
+                    h = blk(h)
+                    if i in _TAPS:
+                        widths.append(h.shape[1])
+            self.encoder.train(was_training)
+            # decoder stage i lands at the resolution of tap (3 - i)
+            self.skip_proj = nn.ModuleList([
+                nn.Conv2d(widths[3 - i], chs[i], kernel_size=1, bias=False)
+                for i in range(4)])
+
+    def _encode(self, x):
+        taps = []
+        for i, blk in enumerate(self.encoder):
+            x = blk(x)
+            if i in _TAPS:
+                taps.append(x)
+        return x, taps
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.encoder(x)
-        x = self.dec1(self.up(x))
-        x = self.dec2(self.up(x))
-        x = self.dec3(self.up(x))
-        x = self.dec4(self.up(x))
+        if not self.skips:
+            x = self.encoder(x)
+            x = self.dec1(self.up(x))
+            x = self.dec2(self.up(x))
+            x = self.dec3(self.up(x))
+            x = self.dec4(self.up(x))
+            x = self.dec5(self.up(x))
+            return self.head(x)
+        x, taps = self._encode(x)
+        for i, dec in enumerate((self.dec1, self.dec2, self.dec3, self.dec4)):
+            x = dec(self.up(x)) + self.skip_proj[i](taps[3 - i])
         x = self.dec5(self.up(x))
         return self.head(x)
 
@@ -101,7 +167,17 @@ class FastDepth(nn.Module):
 def get_model(seed: int = 0):
     torch.manual_seed(seed)
     _input_size, width_mult, dec_ch = _cfg()
-    m = FastDepth(width_mult=width_mult, dec_ch=dec_ch)
+    m = FastDepth(width_mult=width_mult, dec_ch=dec_ch,
+                  skips=os.environ.get("MODELBLASTER_FASTDEPTH_SKIPS", "0") == "1",
+                  pretrained=os.environ.get("MODELBLASTER_FASTDEPTH_PRETRAINED", "0") == "1")
+    ckpt = os.environ.get("MODELBLASTER_FASTDEPTH_CKPT", "")
+    if ckpt:
+        sd = torch.load(ckpt, map_location="cpu")
+        sd = sd.get("model", sd)
+        # strict: a checkpoint trained with a different width or skip setting
+        # would otherwise load partially and quantize to a model that is part
+        # trained and part random, which no metric would flag.
+        m.load_state_dict(sd, strict=True)
     m.eval()
     return m
 
