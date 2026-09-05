@@ -38,10 +38,17 @@ _DEFAULT_CKPT = os.path.join(
 # golden is generated from those same weights, so bit-exactness still checks
 # and the compute SHAPE is what the variant exists to vary. Its predictions
 # are meaningless -- never quote a scaled variant as an accuracy result.
-_IMG_CHANNELS = 3
+# MODELBLASTER_DRONET_CHANNELS selects the input channel count for GRAYSCALE /
+# performance variants (default 3 = the trained RGB config, unchanged). A
+# non-3 channel count cannot match the trained checkpoint's conv0 shape, so it
+# is handled exactly like a rescaled geometry below: seeded random init, golden
+# generated from the same weights, so correctness still checks and the compute
+# SHAPE (grayscale = 1ch conv0) is what the variant exists to vary. Never quote
+# a grayscale/scaled variant as an accuracy result.
+_IMG_CHANNELS = int(os.environ.get("MODELBLASTER_DRONET_CHANNELS", "3"))
 _IMG_H = int(os.environ.get("MODELBLASTER_DRONET_INPUT", "112"))
 _IMG_W = _IMG_H
-_SCALED = (_IMG_H != 112)
+_SCALED = (_IMG_H != 112) or (_IMG_CHANNELS != 3)
 
 
 def get_model(seed: int = 0):
