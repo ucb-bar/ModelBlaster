@@ -1,0 +1,3 @@
+{"contract": "modelblaster.layout_hints/v1",
+ "reason": "On the flashed fast-conv (LoopConv) core, gemmini tiled_conv is ~87% scalar NCHW<->NHWC transpose (34% in + 53% out; measured fq475 + on-bench TACIT). NHWC-native island deletes both transposes on every conv and gives a transpose-free HW maxpool.",
+ "networks": [{"network": "dronet", "layout": "nhwc"}]}

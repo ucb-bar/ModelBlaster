@@ -51,7 +51,7 @@ LAYOUT_CONTRACT = "modelblaster.layout_hints/v1"
 #: kernel behind it -- though the codegen gate is deny-by-default and will refuse
 #: anything whose declared act_layouts do not cover what this pass assigned, so
 #: a stale entry here is caught rather than shipped.
-NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8", "batchnorm2d_s8"}
+NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8"}  # bn dropped: scalar_chan_lut_nhwc is float-hot-path, unusable on misa.F=0; NCHW integer bn kept
 
 #: Layout-agnostic: pure elementwise, same bytes in any order, so they never
 #: force a conversion and never need a variant. They join an island for free.
@@ -247,9 +247,17 @@ def assign_islands(graph: dict[str, Any]) -> dict[str, Any]:
                 tensors[t]["layout"] = "nhwc"
 
     # Rewire the island ops onto the nhwc names.
+    # FORK FIX: a tensor produced inside the island but consumed by BOTH an
+    # inside op (e.g. a 1x1 shortcut conv) and an outside op (e.g. an NCHW
+    # batchnorm kept off the island) is in tail_src -- its producer is retargeted
+    # to <t>.nhwc and a relayout restores <t> (nchw) for the outside consumer.
+    # The INSIDE consumer must read <t>.nhwc, not the relayout's nchw output, or
+    # generate_skeleton rejects the op for "mixing layouts". So map an island
+    # op's input through tail_src too (both head_src and tail_src map t -> t.nhwc).
     for d in island_ids:
         o = by_id[d]
-        o["inputs"] = [head_src.get(t, t) for t in (o.get("inputs") or [])]
+        o["inputs"] = [head_src.get(t) or tail_src.get(t) or t
+                       for t in (o.get("inputs") or [])]
         o["outputs"] = [tail_src.get(t, t) for t in (o.get("outputs") or [])]
 
     # Emit in the original order, dropping a head relayout in front of the first

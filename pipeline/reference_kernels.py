@@ -3890,6 +3890,55 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
 }
 """,
         ),
+        # ── NHWC RVV maxpool (fast STANDALONE) ──────────────────────────────
+        # gemmini_tiled_conv_pool_nhwc above reaches the HW pooler through
+        # tiled_conv_auto -- great when the pool is FUSED into a conv mvout, but
+        # run standalone it materialises a whole conv (measured 1.78 M cyc on
+        # dronet's one maxpool vs 89 K for the NCHW RVV direct). NHWC puts the
+        # channel innermost, so a pooling tap is a contiguous C-run and the whole
+        # window max is unit-stride vle8 + vmax over channels -- no gather.
+        # Curated file:
+        # kernels/gemmini_q31_rvv/gemmini_q31_rvv_maxpool2d_s8_direct_nhwc.c
+        AlgorithmCandidate(
+            name="direct_nhwc",
+            target_affinity=GEMMINI_TARGETS,
+            act_layouts=("nhwc",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Vectorised NHWC maxpool: vle8+vmax over the contiguous channel "
+                "dimension, unit stride everywhere (no gather). The right "
+                "standalone maxpool for an NHWC island; the HW-pool nhwc kernel "
+                "is only efficient fused into a conv mvout."
+            ),
+            reference_impl="""\
+void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
+                         int N, int C, int IH, int IW,
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int DH, int DW)
+{
+    /* NHWC seed: [N,H,W,C] on both sides. */
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++)
+    for (int oh = 0; oh < OH; oh++)
+    for (int ow = 0; ow < OW; ow++)
+    for (int c = 0; c < C; c++) {
+        int8_t m = INT8_MIN;
+        for (int kh = 0; kh < KH; kh++) {
+            int ih = oh*SH - PH + kh*DH;
+            if (ih < 0 || ih >= IH) continue;
+            for (int kw = 0; kw < KW; kw++) {
+                int iw = ow*SW - PW + kw*DW;
+                if (iw < 0 || iw >= IW) continue;
+                int8_t v = input[((n*IH+ih)*IW+iw)*C+c];
+                if (v > m) m = v;
+            }
+        }
+        output[((n*OH+oh)*OW+ow)*C+c] = m;
+    }
+}
+""",
+        ),
     ],
 )
 
