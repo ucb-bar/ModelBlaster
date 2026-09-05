@@ -874,6 +874,36 @@ def _sim_conv2d_s8(in_arr, sh, q, w_q, b_q):
     return scaled.astype(np.int8)
 
 
+def _sim_depthwise_conv2d_s8(in_arr, sh, q, w_q, b_q):
+    """Depthwise int8 conv: output channel c depends ONLY on input channel c.
+
+    Delegates to _sim_conv2d_s8 one channel at a time with a 1-in/1-out shape
+    rather than reimplementing the sliding window and the Q0.31 requantize.
+    That makes the depthwise golden bit-identical to the standard-conv golden
+    BY CONSTRUCTION -- if the requantize is ever changed, both move together
+    instead of silently diverging.
+
+    The shape carries IC=1 (channels per group) and `groups`==OC, matching the
+    schema already used by ViNT's int8 graph, so the real channel count comes
+    from `groups`.
+    """
+    C = int(sh.get("groups", sh["OC"]))
+    N, IH, IW = int(sh["N"]), int(sh["IH"]), int(sh["IW"])
+    OH, OW = int(sh["OH"]), int(sh["OW"])
+    in_4d = in_arr.reshape(N, C, IH, IW)
+    w_q = np.asarray(w_q)
+    b_q = np.asarray(b_q)
+    out = np.zeros((N, C, OH, OW), dtype=np.int8)
+    sub = dict(sh)
+    sub["IC"] = 1
+    sub["OC"] = 1
+    for c in range(C):
+        r = _sim_conv2d_s8(in_4d[:, c:c + 1].reshape(-1), sub, q,
+                           w_q[c:c + 1], b_q[c:c + 1])
+        out[:, c] = r.reshape(N, OH, OW)
+    return out.reshape(-1)
+
+
 def _sim_batchnorm2d_s8(in_arr, sh, q, scale_pc, bias_pc):
     """Per-channel BN affine on int8: dequant → gamma*x+beta → requant+clamp."""
     scale_pc = scale_pc.astype(np.float32)
@@ -1631,10 +1661,20 @@ def extract_int8(
                 })
 
             elif isinstance(mod, torch.nn.Conv2d):
-                if mod.groups != 1:
+                # groups==1 is a standard conv; groups==IC==OC is depthwise,
+                # which is the defining op of the MobileNet family and lowers
+                # to depthwise_conv2d_s8 -- an op this tree already has curated
+                # int8 kernels for on both backends, and that ViNT's own int8
+                # graph already carries. Anything in between is a genuine
+                # grouped conv with no kernel behind it, so it still refuses.
+                _dw = (mod.groups != 1)
+                if _dw and not (mod.groups == mod.in_channels ==
+                                mod.out_channels):
                     raise NotImplementedError(
-                        f"int8 extract: Conv2d groups={mod.groups} not "
-                        f"supported at {node.name}"
+                        f"int8 extract: Conv2d groups={mod.groups} "
+                        f"(in={mod.in_channels}, out={mod.out_channels}) not "
+                        f"supported at {node.name} -- only groups=1 and "
+                        f"groups=in=out (depthwise) lower to a kernel"
                     )
                 if mod.dilation != (1, 1):
                     raise NotImplementedError(
@@ -1677,14 +1717,22 @@ def extract_int8(
                     KH, KW = _pair(mod.kernel_size)
                     SH, SW = _pair(mod.stride)
                     PH, PW = _pair(mod.padding)
+                    # Depthwise carries IC=1 (channels PER GROUP) plus an
+                    # explicit `groups`, matching the schema already in ViNT's
+                    # int8 graph; a standard conv keeps IC=in_channels.
+                    _cs = {"N": N_, "IC": (1 if _dw else IC),
+                           "IH": IH, "IW": IW,
+                           "OC": OC, "OH": OH, "OW": OW,
+                           "KH": KH, "KW": KW, "SH": SH, "SW": SW,
+                           "PH": PH, "PW": PW}
+                    if _dw:
+                        _cs.update({"DH": 1, "DW": 1, "groups": int(mod.groups)})
                     conv_sub = {
-                        "name": str(node.target), "op": "conv2d_s8",
+                        "name": str(node.target),
+                        "op": "depthwise_conv2d_s8" if _dw else "conv2d_s8",
                         "inputs": [in_name], "outputs": [node.name],
                         "weight": w_key, "bias": b_key,
-                        "shape": {"N": N_, "IC": IC, "IH": IH, "IW": IW,
-                                  "OC": OC, "OH": OH, "OW": OW,
-                                  "KH": KH, "KW": KW, "SH": SH, "SW": SW,
-                                  "PH": PH, "PW": PW},
+                        "shape": _cs,
                         "quant": {
                             "input_offset": 0, "filter_offset": 0,
                             "output_offset": 0,
@@ -1859,13 +1907,21 @@ def extract_int8(
                     quant["silu_scale_in"] = out_scale
                     quant["silu_scale_out"] = scales[next_node.name]
                 shape = {
-                    "N": N_, "IC": IC, "IH": IH, "IW": IW,
+                    "N": N_, "IC": (1 if _dw else IC), "IH": IH, "IW": IW,
                     "OC": OC, "OH": OH, "OW": OW,
                     "KH": KH, "KW": KW,
                     "SH": SH, "SW": SW,
                     "PH": PH, "PW": PW,
                 }
-                op_kind = "conv2d_s8"
+                if _dw:
+                    shape.update({"DH": 1, "DW": 1, "groups": int(mod.groups)})
+                op_kind = "depthwise_conv2d_s8" if _dw else "conv2d_s8"
+                if _dw and (fuse_silu or fuse_pool):
+                    raise NotImplementedError(
+                        f"int8 extract: depthwise conv fused with "
+                        f"{'silu' if fuse_silu else 'pool'} at {node.name} has "
+                        f"no kernel -- only depthwise_conv2d_s8 and its "
+                        f"conv+bn(+relu) form are implemented")
                 if fuse_silu:
                     op_kind = "conv2d_silu_s8"
                 elif fuse_pool:
@@ -2874,6 +2930,10 @@ def extract_int8(
         elif op["op"] == "relu6_s8":
             activations[out_name] = np.clip(
                 in_arr, 0, op["clamp_max"]).astype(np.int8)
+        elif op["op"] == "depthwise_conv2d_s8":
+            activations[out_name] = _sim_depthwise_conv2d_s8(
+                in_arr, op["shape"], op["quant"],
+                weights_blob[op["weight"]], weights_blob[op["bias"]])
         elif op["op"] == "conv2d_s8":
             activations[out_name] = _sim_conv2d_s8(
                 in_arr, op["shape"], op["quant"],
@@ -2888,6 +2948,10 @@ def extract_int8(
                 sk = sub["op"]
                 if sk == "conv2d_s8":
                     cur = _sim_conv2d_s8(
+                        cur, sub["shape"], sub["quant"],
+                        weights_blob[sub["weight"]], weights_blob[sub["bias"]])
+                elif sk == "depthwise_conv2d_s8":
+                    cur = _sim_depthwise_conv2d_s8(
                         cur, sub["shape"], sub["quant"],
                         weights_blob[sub["weight"]], weights_blob[sub["bias"]])
                 elif sk == "batchnorm2d_s8":
