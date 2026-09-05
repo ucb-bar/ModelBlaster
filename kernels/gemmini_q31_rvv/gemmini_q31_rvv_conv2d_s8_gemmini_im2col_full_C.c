@@ -487,12 +487,16 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
          * between consecutive oc) via a strided vector store. No NHWC
          * staging buffer, no separate transpose pass (kernel_opt_log
          * id 304's fix, applied here too). */
+        /* TACIT tuning (kernel_opt: requant wrap-counters): replace the 3
+         * integer div/mods per output row with incremental (n,oh,ow) counters.
+         * out_idx = tile_i + i is contiguous, so decompose the tile's first
+         * out_idx once, then advance ow each row (wrapping into oh, then n).
+         * Bit-exact: identical (n_idx,oh_idx,ow_idx) every iteration. */
+        int owc = tile_i % OW;
+        int ohc = (tile_i / OW) % OH;
+        int nc  = tile_i / (OH * OW);
         for (int i = 0; i < tile_rows; i++) {
-            int out_idx = tile_i + i;
-            int ow_idx  = out_idx % OW;
-            int oh_idx  = (out_idx / OW) % OH;
-            int n_idx   = out_idx / (OH * OW);
-            int8_t *dst0 = output + (((size_t)n_idx * OC) * OH + oh_idx) * OW + ow_idx;
+            int8_t *dst0 = output + (((size_t)nc * OC) * OH + ohc) * OW + owc;
             ptrdiff_t oc_stride_bytes = (ptrdiff_t)OH * OW;  /* elem_t is 1 byte */
             int oc = 0;
             while (oc < OC) {
@@ -505,6 +509,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                                      oc_stride_bytes, vout, vl);
                 oc += (int)vl;
             }
+            if (++owc == OW) { owc = 0; if (++ohc == OH) { ohc = 0; ++nc; } }
         }
     }
 }
