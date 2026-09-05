@@ -41,6 +41,17 @@ Shape/size knobs, same convention as the other models here:
                                      turns the model from a shape/throughput
                                      benchmark into something whose depth
                                      output means anything.
+  MODELBLASTER_FASTDEPTH_CALIB       path to an .npz of REAL, already
+                                     ImageNet-normalised NYU frames (key
+                                     "samples", NxCxHxW). Used for int8
+                                     activation calibration and as the golden
+                                     anchor. Without it the calibration set is
+                                     torch.randn, whose activation ranges have
+                                     nothing to do with the ranges a trained
+                                     encoder actually sees -- the int8 model
+                                     would still verify bit-exact against its
+                                     own golden while being quantised to the
+                                     wrong scales.
 
 The decoder deliberately uses `nn.Upsample(scale_factor=2, mode='nearest')`
 rather than a transposed convolution: nearest-neighbour upsampling is what the
@@ -182,7 +193,41 @@ def get_model(seed: int = 0):
     return m
 
 
+#: ImageNet statistics. These MUST match what the training pipeline applied
+#: (experiments/fastdepth_train/scripts/train_fastdepth.py): the encoder is
+#: pretrained, and feeding it a different normalisation silently degrades
+#: every downstream number without failing anything.
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _calib_bank():
+    """The real-frame calibration bank, or None when unset."""
+    path = os.environ.get("MODELBLASTER_FASTDEPTH_CALIB", "")
+    if not path:
+        return None
+    import numpy as np  # noqa: PLC0415
+    return torch.from_numpy(np.load(path)["samples"]).float()
+
+
+def get_calibration_samples(n: int = 8):
+    """Real NYU frames for int8 activation calibration.
+
+    Falls back to nothing (the caller then uses get_sample_input) when no bank
+    is configured, so the untrained benchmark path is unchanged.
+    """
+    bank = _calib_bank()
+    if bank is None:
+        return [get_sample_input()]
+    return [bank[i:i + 1] for i in range(min(n, bank.shape[0]))]
+
+
 def get_sample_input(seed: int = 1) -> torch.Tensor:
     input_size, _wm, _dc = _cfg()
+    bank = _calib_bank()
+    if bank is not None:
+        # A trained model's golden should be a real frame: randn would pin the
+        # io.npz anchor to an input the network was never trained on.
+        return bank[0:1]
     g = torch.Generator().manual_seed(seed)
     return torch.randn(1, 3, input_size, input_size, generator=g)
