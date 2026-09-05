@@ -212,31 +212,38 @@ static inline void gq31_vzero_i8(elem_t *dst, size_t n)
  * the scalar '+ (1<<(shift-1)) >> shift'). Structurally the same
  * construction as kernels/rvv/rvv_conv2d_s8_rvv_vsmul_vnclip.c's
  * mb_requant_i32m4. */
-static inline vint8m1_t gq31_requant_i32m4(vint32m4_t vacc,
+/* TACIT tuning (kernel_opt: requant vl-widening): the requant chain was the
+ * single hottest phase of dronet conv (vnclip @ this helper ~30% of the whole
+ * inference on the At35 NoLoopConv+TACIT bitstream). It was e32m4 (VLMAX=16 on
+ * VLEN=128), so OC channels needed ceil(OC/16) short calls each paying the
+ * vsetvl + vsmul->vnclip dependency-chain latency. Widen the whole chain to
+ * e32m8 (VLMAX=32): identical per-element arithmetic (bit-exact), half the
+ * calls, dependency-chain latency amortized over 2x the elements. */
+static inline vint8m2_t gq31_requant_i32m8(vint32m8_t vacc,
                                            int output_multiplier, int output_shift,
                                            int output_offset,
                                            int activation_min, int activation_max,
                                            size_t vl)
 {
-    vint32m4_t vscaled = __riscv_vsmul_vx_i32m4(
+    vint32m8_t vscaled = __riscv_vsmul_vx_i32m8(
         vacc, output_multiplier, __RISCV_VXRM_RNU, vl);
-    vint16m2_t vout16;
+    vint16m4_t vout16;
     if (output_shift < 0) {
-        vint32m4_t vsh = __riscv_vsll_vx_i32m4(vscaled, (size_t)(-output_shift), vl);
-        vout16 = __riscv_vnclip_wx_i16m2(vsh, 0, __RISCV_VXRM_RNU, vl);
+        vint32m8_t vsh = __riscv_vsll_vx_i32m8(vscaled, (size_t)(-output_shift), vl);
+        vout16 = __riscv_vnclip_wx_i16m4(vsh, 0, __RISCV_VXRM_RNU, vl);
     } else if (output_shift < 32) {
-        vout16 = __riscv_vnclip_wx_i16m2(vscaled, (size_t)output_shift,
+        vout16 = __riscv_vnclip_wx_i16m4(vscaled, (size_t)output_shift,
                                          __RISCV_VXRM_RNU, vl);
     } else {
         int sa2 = output_shift - 31;
         if (sa2 > 31) sa2 = 31;
-        vint32m4_t v2 = __riscv_vsra_vx_i32m4(vscaled, 31, vl);
-        vout16 = __riscv_vnclip_wx_i16m2(v2, (size_t)sa2, __RISCV_VXRM_RNU, vl);
+        vint32m8_t v2 = __riscv_vsra_vx_i32m8(vscaled, 31, vl);
+        vout16 = __riscv_vnclip_wx_i16m4(v2, (size_t)sa2, __RISCV_VXRM_RNU, vl);
     }
-    vout16 = __riscv_vadd_vx_i16m2(vout16, (int16_t)output_offset, vl);
-    vout16 = __riscv_vmax_vx_i16m2(vout16, (int16_t)activation_min, vl);
-    vout16 = __riscv_vmin_vx_i16m2(vout16, (int16_t)activation_max, vl);
-    return __riscv_vnsra_wx_i8m1(vout16, 0, vl);
+    vout16 = __riscv_vadd_vx_i16m4(vout16, (int16_t)output_offset, vl);
+    vout16 = __riscv_vmax_vx_i16m4(vout16, (int16_t)activation_min, vl);
+    vout16 = __riscv_vmin_vx_i16m4(vout16, (int16_t)activation_max, vl);
+    return __riscv_vnsra_wx_i8m2(vout16, 0, vl);
 }
 
 void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
@@ -489,12 +496,12 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             ptrdiff_t oc_stride_bytes = (ptrdiff_t)OH * OW;  /* elem_t is 1 byte */
             int oc = 0;
             while (oc < OC) {
-                size_t vl = __riscv_vsetvl_e32m4((size_t)(OC - oc));
-                vint32m4_t vacc = __riscv_vle32_v_i32m4(&ws_acc_out[i * OC + oc], vl);
-                vint8m1_t vout = gq31_requant_i32m4(
+                size_t vl = __riscv_vsetvl_e32m8((size_t)(OC - oc));
+                vint32m8_t vacc = __riscv_vle32_v_i32m8(&ws_acc_out[i * OC + oc], vl);
+                vint8m2_t vout = gq31_requant_i32m8(
                     vacc, output_multiplier, output_shift, output_offset,
                     activation_min, activation_max, vl);
-                __riscv_vsse8_v_i8m1(dst0 + (size_t)oc * OH * OW,
+                __riscv_vsse8_v_i8m2(dst0 + (size_t)oc * OH * OW,
                                      oc_stride_bytes, vout, vl);
                 oc += (int)vl;
             }
