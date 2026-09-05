@@ -111,6 +111,22 @@ if(DEFINED MODELBLASTER_KERNEL_CFLAGS AND NOT "${MODELBLASTER_KERNEL_CFLAGS}" ST
     message(STATUS "modelblaster harness kernel cflags=${MODELBLASTER_KERNEL_CFLAGS}")
 endif()
 
+# Opt-in: pin kernel_conv2d_s8_dronet to a fixed, I-cache-friendly address.
+# conv0 is a ~5.8 KB monolithic function (Gemmini loop-conv inlined) = 1.43x the
+# Rocket L1I way-size (4096 B), so its cycle count swings +/-~290K purely from
+# where it lands (mod-4096 self-conflict in the gemm-handoff loop). conv_pin.ld
+# gathers it at ALIGN(4096) + MB_CONV_PIN_OFFSET via an INSERT-BEFORE-.text
+# fragment (no source edit; survives kernels.c regeneration). ALIGN(4096) makes
+# the placement independent of upstream code size -> robust to sibling changes.
+if(MB_CONV_PIN)
+    zephyr_link_libraries(-Wl,-T,${CMAKE_CURRENT_LIST_DIR}/conv_pin.ld)
+    if(NOT DEFINED MB_CONV_PIN_OFFSET)
+        set(MB_CONV_PIN_OFFSET 0)
+    endif()
+    zephyr_link_libraries(-Wl,--defsym=mb_conv_pin_offset=${MB_CONV_PIN_OFFSET})
+    message(STATUS "modelblaster harness: conv0 I-cache PIN active, offset=${MB_CONV_PIN_OFFSET}")
+endif()
+
 # Opt-in: TACIT / L-Trace of just the model inference (brackets run_model with
 # the encoder start/stop). Pass -DMB_TACIT_TRACE_MODEL=1 and run on the
 # TACIT-enabled spike with `--trace=l`. See samples/tacit/TACIT_TRACING.md.
