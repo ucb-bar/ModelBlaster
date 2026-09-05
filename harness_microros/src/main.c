@@ -651,7 +651,22 @@ static void node_thread_fn(void *arg1, void *arg2, void *arg3) {
         const uint64_t periodic_max_iters = NET_A_MAX_ITERS;
         while (!atomic_get(&net_b_done) && ctx->iter < periodic_max_iters) {
             rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
-            k_msleep(1);
+            /* Yield proportional to the period, not a flat 1 ms. The flat
+             * sleep was the entire ~1100 us executor floor: rclc never sleeps
+             * on this path (spin_some returns immediately, because rmw_wait
+             * takes its non-blocking branch with zero subscriptions), so the
+             * cadence was set here and nowhere else. CONFIG_SYS_CLOCK_TICKS_PER_SEC
+             * is 10000, i.e. 100 us granularity, so a sub-millisecond period is
+             * representable -- it just was not being asked for.
+             * Floor at one tick: yielding less than that cannot help and turns
+             * the loop into the busy-wait that starved a co-located executor
+             * before CONFIG_TIMESLICING existed. */
+            if (ctx->period_us && ctx->period_us < 4000ULL) {
+                uint64_t y = ctx->period_us / 4;
+                k_usleep(y < 100ULL ? 100ULL : (int32_t)y);
+            } else {
+                k_msleep(1);
+            }
         }
         if (ctx->iter >= periodic_max_iters) {
             printk("[%s] periodic-iter cap %llu hit before net_b done — "
