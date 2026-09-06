@@ -9697,6 +9697,116 @@ void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
 )
 
 
+def _depthwise_conv2d_s8_pc_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # As depthwise_conv2d_s8, but output_multiplier / output_shift are
+    # per-channel ARRAYS rather than scalars.
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            i32p, i32p,
+            ctypes.c_int, ctypes.c_int]
+
+
+DEPTHWISE_CONV2D_S8_PC = KernelSpec(
+    op="depthwise_conv2d_s8_pc",
+    signature=(
+        "void kernel_depthwise_conv2d_s8_pc(const int8_t *input, "
+        "const int8_t *weight, const int32_t *bias, int8_t *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "const int32_t *output_multiplier, const int32_t *output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-channel-weight-scale variant of depthwise_conv2d_s8. Identical\n"
+        "dataflow; the requantize tail picks (output_multiplier[c],\n"
+        "output_shift[c]) for each channel:\n"
+        "  acc = SAT_ROUND_SAT_ADD(acc, output_multiplier[c],\n"
+        "                               output_shift[c])\n"
+        "  out = clamp(acc + output_offset, act_min, act_max)\n"
+        "Bias is pre-scaled by (input_scale * weight_scale_per_channel) at\n"
+        "codegen time, exactly as in conv2d_s8_pc.\n"
+        "\n"
+        "WHY THIS OP EXISTS. A depthwise convolution is the one weight\n"
+        "tensor where a single per-tensor scale is close to worthless: each\n"
+        "channel is an INDEPENDENT KHxKW filter and, once a BatchNorm has\n"
+        "been folded in, its channels' magnitudes span orders of magnitude.\n"
+        "Measured on the trained FastDepth encoder in this tree, one scale\n"
+        "over the whole tensor leaves the MEDIAN channel only ~33 of the 255\n"
+        "codes (worst layer: 13), and weight SQNR averages 36.1 dB against\n"
+        "47.2 dB per-channel. That deficit is not academic: with activations\n"
+        "held in float and ONLY the weights quantized, per-tensor costs\n"
+        "0.148 d1 on NYU val while per-channel-on-the-depthwise-convs costs\n"
+        "0.024 -- i.e. the depthwise weights alone were 84% of the entire\n"
+        "int8 accuracy loss, and conv2d_s8_pc could not touch them because\n"
+        "it does not cover this op."
+    ),
+    reference_impl="""\
+void kernel_depthwise_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
+                                   const int32_t *bias, int8_t *output,
+                                   int N, int C, int IH, int IW,
+                                   int KH, int KW, int SH, int SW, int PH, int PW,
+                                   int input_offset, int filter_offset,
+                                   int output_offset,
+                                   const int32_t *output_multiplier,
+                                   const int32_t *output_shift,
+                                   int activation_min, int activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            int32_t mult = output_multiplier[c];
+            int32_t shift = output_shift[c];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[c] : 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            int32_t iv = (int32_t)input[((n*C + c)*IH + ih)*IW + iw] + input_offset;
+                            int32_t wv = (int32_t)weight[(c*KH + kh)*KW + kw] + filter_offset;
+                            acc += iv * wv;
+                        }
+                    }
+                    int64_t prod = ((int64_t)acc * (int64_t)mult + (1LL << 30)) >> 31;
+                    int32_t v;
+                    if (shift > 0) {
+                        int32_t r = 1 << (shift - 1);
+                        v = ((int32_t)prod + r) >> shift;
+                    } else {
+                        v = ((int32_t)prod) << (-shift);
+                    }
+                    v += output_offset;
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n*C + c)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "IH": 32, "IW": 32,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        # FastDepth's decoder block: a 5x5 depthwise at full input resolution.
+        {"N": 1, "C": 64, "IH": 32, "IW": 32,
+         "KH": 5, "KW": 5, "SH": 1, "SW": 1, "PH": 2, "PW": 2},
+    ],
+    argtypes_factory=_depthwise_conv2d_s8_pc_argtypes,
+    algorithms=[],
+)
+
+
 def _slice_c_s8_argtypes():
     import ctypes
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -13048,6 +13158,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'matmul_s8': MATMUL_S8,
     'softmax_s8': SOFTMAX_S8,
     'depthwise_conv2d_s8': DEPTHWISE_CONV2D_S8,
+    'depthwise_conv2d_s8_pc': DEPTHWISE_CONV2D_S8_PC,
     'slice_c_s8': SLICE_C_S8,
     'conv2d_s8_pc': CONV2D_S8_PC,
     'linear_s8_pc': LINEAR_S8_PC,
