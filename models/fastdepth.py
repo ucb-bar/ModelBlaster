@@ -41,6 +41,12 @@ Shape/size knobs, same convention as the other models here:
                                      turns the model from a shape/throughput
                                      benchmark into something whose depth
                                      output means anything.
+  MODELBLASTER_FASTDEPTH_NYU_DIR     directory of the original NYU HDF5
+                                     frames. Preferred over _CALIB when both
+                                     are set: a spec plus a dataset is
+                                     reproducible, whereas an .npz of
+                                     preprocessed floats has to be trusted.
+                                     Needs h5py; _CALIB does not.
   MODELBLASTER_FASTDEPTH_CALIB       path to an .npz of REAL, already
                                      ImageNet-normalised NYU frames (key
                                      "samples", NxCxHxW). Used for int8
@@ -201,33 +207,94 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def _calib_bank():
-    """The real-frame calibration bank, or None when unset."""
-    path = os.environ.get("MODELBLASTER_FASTDEPTH_CALIB", "")
-    if not path:
+def get_calibration_spec(num_samples: int = 8) -> "dict | None":
+    """Declarative calibration spec, the convention the rest of this tree uses.
+
+    Single-input model; the input tensor is named ``x`` in the IR. Returns
+    None -- meaning "I have no calibration data configured, use
+    get_sample_input()" -- when neither source env var is set, which is the
+    untrained shape/throughput benchmark path.
+
+    Two sources, preferring the reproducible one:
+
+      MODELBLASTER_FASTDEPTH_NYU_DIR   a directory of the original NYU HDF5
+                                       frames. Preferred: the spec plus the
+                                       dataset regenerate the exact scales,
+                                       which an .npz of preprocessed floats
+                                       cannot promise on its own.
+      MODELBLASTER_FASTDEPTH_CALIB     the pre-baked .npz bank. Portable
+                                       fallback for a build machine that has
+                                       neither the dataset nor h5py.
+
+    Both go through modelblaster/mb_datasets/nyu_depth.py, which applies the
+    same crop/resize/normalise to either, so the two sources are
+    interchangeable rather than two subtly different calibration sets.
+
+    NOTE ON SIZE. More calibration frames is NOT automatically better here,
+    and which way it goes depends on the range rule. Activation scales are
+    per-tensor MAX-ABS, so an extra frame can only WIDEN a range, never
+    tighten one, and a wider range is a coarser int8 step. Measured on the
+    trained epoch-0 FastDepth over all 654 NYU val frames
+    (experiments/fastdepth_int8):
+
+      plain max-abs ranges      1 frame  d1 0.7221          32 frames  0.7118
+      clamp-aware ranges        1 frame  d1 0.7238 / rmse 0.6663
+                                8 frames    0.7251 / 0.6514
+                               32 frames    0.7228 / 0.6511
+
+    i.e. under the stock rule 32x the data COSTS 0.010 d1, while with
+    clamp-aware ranges (which cap each range at what the consumer's ReLU/ReLU6
+    can pass) the extra frames buy a real 0.015 m of RMSE and then stop. 8 is
+    the measured sweet spot; the default is small deliberately.
+    """
+    import os  # noqa: PLC0415
+    _input_size, _wm, _dc = _cfg()
+    nyu_dir = os.environ.get("MODELBLASTER_FASTDEPTH_NYU_DIR", "")
+    calib = os.environ.get("MODELBLASTER_FASTDEPTH_CALIB", "")
+    if nyu_dir:
+        src = {"path": nyu_dir,
+               "image_size": [_input_size, _input_size],
+               "normalize": "imagenet", "spread": True}
+    elif calib:
+        # The bank is already cropped, resized and ImageNet-normalised, so it
+        # declares no image_size/normalize -- restating them would invite the
+        # two sources to drift apart.
+        src = {"npz": calib}
+    else:
         return None
-    import numpy as np  # noqa: PLC0415
-    return torch.from_numpy(np.load(path)["samples"]).float()
+    return {
+        "num_samples": num_samples,
+        "inputs": {
+            "x": dict(src, loader="nyu_depth", n_take=num_samples,
+                      compose={"kind": "one_per_sample"}),
+        },
+    }
 
 
 def get_calibration_samples(n: int = 8):
     """Real NYU frames for int8 activation calibration.
 
-    Falls back to nothing (the caller then uses get_sample_input) when no bank
-    is configured, so the untrained benchmark path is unchanged.
+    Back-compat wrapper around get_calibration_spec (same shape as
+    yolov8_nano's), so the two entry points cannot disagree about what the
+    calibration set is. Falls back to get_sample_input when nothing is
+    configured, leaving the untrained benchmark path unchanged.
     """
-    bank = _calib_bank()
-    if bank is None:
+    spec = get_calibration_spec(n)
+    if spec is None:
         return [get_sample_input()]
-    return [bank[i:i + 1] for i in range(min(n, bank.shape[0]))]
+    from modelblaster.mb_datasets.base import materialize_calibration_samples  # noqa: PLC0415
+    return [d["x"] for d in materialize_calibration_samples(spec)]
 
 
 def get_sample_input(seed: int = 1) -> torch.Tensor:
     input_size, _wm, _dc = _cfg()
-    bank = _calib_bank()
-    if bank is not None:
+    spec = get_calibration_spec(1)
+    if spec is not None:
         # A trained model's golden should be a real frame: randn would pin the
-        # io.npz anchor to an input the network was never trained on.
-        return bank[0:1]
+        # io.npz anchor to an input the network was never trained on. Routed
+        # through the SAME spec the calibration set comes from, so the golden
+        # anchor is calibration sample 0 whichever source is configured.
+        from modelblaster.mb_datasets.base import materialize_calibration_samples  # noqa: PLC0415
+        return materialize_calibration_samples(spec)[0]["x"]
     g = torch.Generator().manual_seed(seed)
     return torch.randn(1, 3, input_size, input_size, generator=g)

@@ -764,6 +764,63 @@ def _fusion_target_is_safe(fusion_target: "str | None") -> bool:
     return fusion_target in _FUSION_SAFE_TARGETS
 
 
+def _consumer_clamp_bounds(gm: "torch.fx.GraphModule") -> dict[str, float]:
+    """{producer node name: upper bound} for tensors whose EVERY consumer is a
+    ReLU or ReLU6 -- i.e. tensors from which the graph provably discards
+    everything negative (and, for ReLU6, everything above 6) before any other
+    op sees it.
+
+    This is the calibration-side counterpart of the conv->relu fusion that
+    already happens on the emit side. Without it, a conv feeding a ReLU6 is
+    handed an int8 scale sized to its full signed pre-activation range -- on
+    FastDepth's MobileNetV2 encoder that range runs to |x|~11-16 while the
+    only values the network goes on to USE lie in [0, 6], so a third to a half
+    of the 255 codes are spent representing values the very next op deletes.
+    ReLU6 in particular keeps its input's scale (see the relu6_s8 emit), so
+    that waste is inherited by the post-activation tensor too, and then by
+    everything downstream of it.
+
+    Empty (and therefore a complete no-op) unless MB_INT8_CLAMP_AWARE_RANGES=1.
+    """
+    if os.environ.get("MB_INT8_CLAMP_AWARE_RANGES", "0") != "1":
+        return {}
+    mods = dict(gm.named_modules())
+
+    def _clamp_hi_of(n) -> "float | None":
+        """The upper clamp this node applies, or None if it is not a clamp."""
+        if n.op == "call_module":
+            m = mods.get(str(n.target))
+            if isinstance(m, torch.nn.ReLU6):
+                return 6.0
+            if isinstance(m, torch.nn.ReLU):
+                return float("inf")
+            if isinstance(m, torch.nn.Hardtanh) and m.min_val == 0.0:
+                return float(m.max_val)
+        if n.op == "call_function":
+            if n.target in (torch.relu, torch.nn.functional.relu):
+                return float("inf")
+            if n.target is torch.nn.functional.relu6:
+                return 6.0
+        if n.op == "call_method" and n.target == "relu":
+            return float("inf")
+        return None
+
+    out: dict[str, float] = {}
+    for node in gm.graph.nodes:
+        if node.op in ("output", "placeholder"):
+            continue
+        users = list(node.users)
+        if not users:
+            continue
+        his = [_clamp_hi_of(u) for u in users]
+        # EVERY consumer must clamp, or some other op still sees the raw
+        # tensor and narrowing its range would be a real loss.
+        if any(h is None for h in his):
+            continue
+        out[node.name] = min(his)
+    return out
+
+
 def _sim_conv2d_int32_acc(in_4d: np.ndarray, w_q: np.ndarray, b_q: np.ndarray,
                           sh: dict, input_offset: int, filter_offset: int
                           ) -> np.ndarray:
@@ -899,6 +956,36 @@ def _sim_depthwise_conv2d_s8(in_arr, sh, q, w_q, b_q):
     sub["OC"] = 1
     for c in range(C):
         r = _sim_conv2d_s8(in_4d[:, c:c + 1].reshape(-1), sub, q,
+                           w_q[c:c + 1], b_q[c:c + 1])
+        out[:, c] = r.reshape(N, OH, OW)
+    return out.reshape(-1)
+
+
+def _sim_depthwise_conv2d_s8_pc(in_arr, sh, q, w_q, b_q, mult, shift):
+    """Depthwise int8 conv with PER-CHANNEL weight scales.
+
+    Same structure as _sim_depthwise_conv2d_s8 -- delegate one channel at a
+    time so the sliding window and the requantize are not reimplemented -- but
+    each channel carries its own (multiplier, shift), so the per-channel call
+    is to the scalar requantize with THAT channel's pair. Keeping the
+    delegation means this stays bit-identical to the per-tensor golden
+    whenever every channel happens to share a scale.
+    """
+    C = int(sh.get("groups", sh["OC"]))
+    N, IH, IW = int(sh["N"]), int(sh["IH"]), int(sh["IW"])
+    OH, OW = int(sh["OH"]), int(sh["OW"])
+    in_4d = in_arr.reshape(N, C, IH, IW)
+    w_q = np.asarray(w_q)
+    b_q = np.asarray(b_q)
+    out = np.zeros((N, C, OH, OW), dtype=np.int8)
+    sub = dict(sh)
+    sub["IC"] = 1
+    sub["OC"] = 1
+    for c in range(C):
+        qc = dict(q)
+        qc["output_multiplier"] = int(mult[c])
+        qc["output_shift"] = int(shift[c])
+        r = _sim_conv2d_s8(in_4d[:, c:c + 1].reshape(-1), sub, qc,
                            w_q[c:c + 1], b_q[c:c + 1])
         out[:, c] = r.reshape(N, OH, OW)
     return out.reshape(-1)
@@ -1071,14 +1158,35 @@ def _requantize_int_per_oc(acc, mult_arr, shift_arr, oc_axis):
     return out
 
 
+#: Op kinds `_apply_per_channel` will convert to their _pc variant. Depthwise
+#: is opt-in ON TOP of --per-channel (MB_INT8_PC_DEPTHWISE=1 /
+#: --per-channel-depthwise) purely so that every IR already extracted with
+#: --per-channel keeps reproducing byte-for-byte; on accuracy grounds it is
+#: the single highest-value entry in this set. See DEPTHWISE_CONV2D_S8_PC's
+#: semantics note for the measurement.
+_PC_OPS_BASE = ("conv2d_s8", "linear_s8")
+_PC_OPS_DEPTHWISE = ("depthwise_conv2d_s8",)
+
+
 def _apply_per_channel(ops, tensors_meta, weights_blob, fp32_stash, scales,
-                       skip_names):
+                       skip_names, include_depthwise: bool = False,
+                       include_dense: bool = True):
     """Re-quantize conv2d_s8 / linear_s8 weights per-OUTPUT-CHANNEL (tighter than
     one per-tensor scale) and switch the op to its _pc kind with per-oc
     multiplier/shift arrays. Ops in `skip_names` (e.g. fp16-promoted) are left
-    alone. Mirrors extract_graph_export's per-channel path on the FX IR."""
+    alone. Mirrors extract_graph_export's per-channel path on the FX IR.
+
+    With `include_depthwise`, depthwise_conv2d_s8 is converted too. The
+    arithmetic is the same -- a depthwise weight is [C, 1, KH, KW], so its
+    "output channel" axis is axis 0 exactly as for a dense conv -- but the
+    payoff is much larger, because each depthwise channel is an independent
+    filter and a folded BatchNorm leaves their magnitudes orders of magnitude
+    apart.
+    """
+    kinds = ((_PC_OPS_BASE if include_dense else ())
+             + (_PC_OPS_DEPTHWISE if include_depthwise else ()))
     for op in ops:
-        if op["name"] in skip_names or op["op"] not in ("conv2d_s8", "linear_s8"):
+        if op["name"] in skip_names or op["op"] not in kinds:
             continue
         wk = op.get("weight")
         w_fp32 = fp32_stash.get(wk)
@@ -1200,6 +1308,7 @@ def extract_int8(
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
     per_channel: bool = False,
+    per_channel_depthwise: bool = False,
     enable_fusion: bool = False,
     fusion_target: "str | None" = None,
     fold_conv_bn: bool = True,
@@ -1323,11 +1432,32 @@ def extract_int8(
             f"{len(input_node_names)} inputs")
     input_dtype_map = dict(zip(input_node_names, in_dtype_list))
 
+    # Opt-in (MB_INT8_CLAMP_AWARE_RANGES=1): when a tensor's only consumers
+    # clamp it, calibrate the range on what survives the clamp rather than on
+    # the raw tensor. Empty dict = stock behaviour, bit-identical IR.
+    clamp_hi = _consumer_clamp_bounds(gm)
+
+    def _cal_range(nname: str, t: "torch.Tensor") -> float:
+        """The magnitude this tensor's int8 scale has to span."""
+        hi = clamp_hi.get(nname)
+        if hi is None:
+            return float(t.detach().abs().max().item())
+        # Post-clamp the tensor is non-negative and bounded by `hi`, so the
+        # span it needs is just its clamped maximum. Everything excluded here
+        # (the negative tail; anything above `hi`) is deleted by the consumer
+        # regardless, so spending codes on it buys nothing.
+        r = float(t.detach().clamp(min=0.0, max=hi).max().item())
+        # A wholly non-positive tensor clamps to all-zero and would otherwise
+        # hand this tensor a degenerate ~1e-10 scale (and with it an enormous
+        # requantize multiplier downstream). The stock rule only hits that for
+        # an all-zero tensor; keep the same exposure by falling back to it.
+        return r if r > 0.0 else float(t.detach().abs().max().item())
+
     max_abs: dict[str, float] = {}
     for nm, si in zip(input_node_names, sample_inputs):
         max_abs[nm] = float(si.detach().abs().max().item())
     for nname, t in cap.tensors.items():
-        max_abs[nname] = float(t.detach().abs().max().item())
+        max_abs[nname] = _cal_range(nname, t)
 
     if calibration_samples:
         extra = [s for s in calibration_samples
@@ -1341,7 +1471,7 @@ def extract_int8(
                 if cur > max_abs.get(nm, 0.0):
                     max_abs[nm] = cur
             for nname, t in cap_i.tensors.items():
-                cur = float(t.detach().abs().max().item())
+                cur = _cal_range(nname, t)
                 if cur > max_abs.get(nname, 0.0):
                     max_abs[nname] = cur
         print(f"[extract_int8] calibrated across "
@@ -2797,9 +2927,19 @@ def extract_int8(
 
     # Per-channel int8: tighten conv/linear weights to per-output-channel scales
     # (skip ops about to be promoted to fp16). Backwards compatible — off by default.
-    if per_channel:
+    _pc_dw = (per_channel_depthwise
+              or os.environ.get("MB_INT8_PC_DEPTHWISE", "0") == "1")
+    # Either flag alone is meaningful and neither silently no-ops:
+    # --per-channel is dense conv/linear, --per-channel-depthwise is the
+    # depthwise convs, and passing both does both. (An earlier version gated
+    # the whole pass on per_channel, so --per-channel-depthwise on its own
+    # produced a byte-identical per-TENSOR IR with no warning -- exactly the
+    # kind of silent no-op this tree keeps getting bitten by.)
+    if per_channel or _pc_dw:
         _apply_per_channel(ops, tensors_meta, weights_blob, fp32_stash, scales,
-                           skip_names=(fp16_op_names or set()))
+                           skip_names=(fp16_op_names or set()),
+                           include_dense=per_channel,
+                           include_depthwise=_pc_dw)
 
     # Mixed precision: promote the requested ops to fp16 and materialize the
     # int8<->fp16 boundary casts. With no spec this is a no-op and the IR is
@@ -2934,6 +3074,12 @@ def extract_int8(
             activations[out_name] = _sim_depthwise_conv2d_s8(
                 in_arr, op["shape"], op["quant"],
                 weights_blob[op["weight"]], weights_blob[op["bias"]])
+        elif op["op"] == "depthwise_conv2d_s8_pc":
+            activations[out_name] = _sim_depthwise_conv2d_s8_pc(
+                in_arr, op["shape"], op["quant"],
+                weights_blob[op["weight"]], weights_blob[op["bias"]],
+                weights_blob[op["quant"]["output_multiplier_per_oc_key"]],
+                weights_blob[op["quant"]["output_shift_per_oc_key"]])
         elif op["op"] == "conv2d_s8":
             activations[out_name] = _sim_conv2d_s8(
                 in_arr, op["shape"], op["quant"],
@@ -3475,6 +3621,7 @@ def extract(
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
     per_channel: bool = False,
+    per_channel_depthwise: bool = False,
     enable_fusion: bool = False,
     fusion_target: "str | None" = None,
     fold_conv_bn: bool = True,
@@ -3499,6 +3646,7 @@ def extract(
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names,
             per_channel=per_channel,
+            per_channel_depthwise=per_channel_depthwise,
             enable_fusion=enable_fusion,
             fusion_target=fusion_target,
             fold_conv_bn=fold_conv_bn,
@@ -5715,6 +5863,20 @@ def main() -> None:
     ap.add_argument("--per-channel", action="store_true",
                     help="per-output-channel int8 weight quant for conv/linear "
                          "(tighter than per-tensor). No-op for fp32 / fp16.")
+    ap.add_argument("--per-channel-depthwise", action="store_true",
+                    default=os.environ.get("MB_INT8_PC_DEPTHWISE", "0") == "1",
+                    help="extend --per-channel to depthwise_conv2d_s8 "
+                         "(emits depthwise_conv2d_s8_pc). Separate opt-in so "
+                         "IRs already extracted with --per-channel keep "
+                         "reproducing byte-for-byte. This is the highest-value "
+                         "half of per-channel quant on any MobileNet-shaped "
+                         "net: on trained FastDepth, weights-only int8 costs "
+                         "0.148 d1 per-tensor and 0.024 with the depthwise "
+                         "convs per-channel, because a folded BatchNorm leaves "
+                         "each depthwise channel's filter magnitude orders of "
+                         "magnitude apart and one shared scale gives the "
+                         "median channel ~33 of 255 codes. Also settable via "
+                         "MB_INT8_PC_DEPTHWISE=1.")
     ap.add_argument("--no-bn-folding", dest="fold_conv_bn",
                     action="store_false",
                     default=os.environ.get("MB_NO_BN_FOLDING", "0") != "1",
@@ -5828,9 +5990,15 @@ def main() -> None:
 
     calibration_samples = None
     if model_mod is not None and args.quant == "int8" and args.num_calibration > 1:
-        if hasattr(model_mod, "get_calibration_spec"):
+        # A model may define get_calibration_spec and still decline to
+        # produce one at runtime (returning None) -- e.g. fastdepth, whose
+        # calibration source is configured by env var and is simply absent on
+        # the untrained shape/throughput path. Treat that as "no spec" and
+        # fall through, rather than handing None to the resolver.
+        spec = (model_mod.get_calibration_spec(args.num_calibration)
+                if hasattr(model_mod, "get_calibration_spec") else None)
+        if spec is not None:
             from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
-            spec = model_mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_graph] resolving calibration spec "
                   f"({args.num_calibration} samples) ...", flush=True)
             materialized = materialize_calibration_samples(spec)
@@ -5886,6 +6054,7 @@ def main() -> None:
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names,
             per_channel=getattr(args, "per_channel", False),
+            per_channel_depthwise=getattr(args, "per_channel_depthwise", False),
             enable_fusion=getattr(args, "enable_fusion", False),
             fold_conv_bn=getattr(args, "fold_conv_bn", True),
             fusion_target=getattr(args, "fusion_target", None))
