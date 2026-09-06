@@ -171,7 +171,7 @@ void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
     if (N == 1 && IC <= DIM
         && mb_conv2d_pool_loadonce_s8(input, weight, bias_used, output,
                IC, IH, IW, OC, KH, SH, PH, pool_KH, pool_SH,
-               act_kind, scale) == 0) {
+               act_kind, scale, /*yield_fn=*/NULL) == 0) {
         gemmini_fence();
         gemmini_flush(0);
         if (activation_max < 127) {

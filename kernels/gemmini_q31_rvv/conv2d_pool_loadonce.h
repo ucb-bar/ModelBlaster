@@ -47,6 +47,20 @@
 #define MB_LO_ACC_ACCUM      ((uint32_t)(3u << (ADDR_LEN - 2)))   /* 0xC0000000 */
 #define MB_LO_ACC_OVERWRITE  ((uint32_t)(1u << (ADDR_LEN - 1)))   /* 0x80000000 */
 
+/* Fence-free inter-tile sync: instead of gemmini_fence() between output tiles
+ * (which drains the whole array, blocking), gate accumulator reuse on a
+ * WDMA_BYTES_SENT poll (a k_COUNTER ROCC read that commits immediately and does
+ * NOT drain) and yield between reads. This makes the load-once conv0 preemptible
+ * (FC co-residency) while the standalone path stays max-throughput (NULL yield =
+ * spin). Uses counter slot 4 so it never clobbers a caller's slots 0-3. */
+#define MB_LO_WDMA_SLOT       4
+#define MB_LO_POLL_BUDGET_CYC (50000u * 35u)   /* ~50 ms @ 35 MHz safety cap */
+static uint32_t mb_lo_poll_timeouts;           /* diagnostics: budget breaches */
+static inline uint32_t mb_conv2d_pool_loadonce_poll_timeouts(void) { return mb_lo_poll_timeouts; }
+
+static inline uint64_t mb_lo_rdcycle(void)
+{ uint64_t c; asm volatile("rdcycle %0" : "=r"(c)); return c; }
+
 /* Returns 0 on success (kernel ran), nonzero if the shape is outside the
  * fast-path this kernel supports (caller should fall back). */
 static int mb_conv2d_pool_loadonce_s8(
@@ -55,7 +69,8 @@ static int mb_conv2d_pool_loadonce_s8(
         int IC, int IH, int IW, int OC,
         int K, int S, int P,
         int pool_size, int pool_stride,
-        int act, acc_scale_t scale)
+        int act, acc_scale_t scale,
+        void (*yield_fn)(void))   /* NULL => spin (max throughput); k_yield => preemptible */
 {
     if (IC > DIM) return 1;                 /* one kch block only */
 
@@ -143,12 +158,23 @@ static int mb_conv2d_pool_loadonce_s8(
 
     const int no_bias = (bias == NULL);
 
+    /* Fence-free inter-tile completion: track cumulative store bytes on a
+     * dedicated counter slot. Each output tile has one of two sizes (full band
+     * Pp_max, or the shorter final band); calibrate each size's WDMA delta ONCE
+     * with a fence (OC*OH*OW logical bytes don't map 1:1 to the HW counter), then
+     * poll subsequent same-size tiles against the running expected total. */
+    counter_configure(MB_LO_WDMA_SLOT, WDMA_BYTES_SENT);
+    const uint32_t wdma_snap = counter_read(MB_LO_WDMA_SLOT);
+    uint32_t exp_cum = 0;                  /* expected cumulative store bytes */
+    uint32_t wdma_full = 0, wdma_part = 0; /* 0 => that size not yet calibrated */
+
     /* ---------- 4. Loop output bands x och-blocks; no input reload ---------- */
     for (int P0 = 0; P0 < OHp; P0 += Pp_max) {
         const int Pp     = OHp - P0 > Pp_max ? Pp_max : OHp - P0;
         const int orows_ = (Pp - 1) * pool_stride + pool_size;   /* conv rows in band */
         const int ocols_ = ocols_full;                            /* conv cols (full width) */
         const int gr_lo  = P0 * pool_stride;                      /* first global conv row */
+        const int is_full = (Pp == Pp_max);
 
         for (int och = 0; och < OC; och += DIM) {
             const int J = OC - och > DIM ? DIM : OC - och;
@@ -216,7 +242,27 @@ static int mb_conv2d_pool_loadonce_s8(
             int8_t *pool_dram = output + ((size_t)P0 * OWp) * OC + och;
             gemmini_extended_mvout(pool_dram, MB_LO_ACC_ACCUM, J, 0);
 
-            gemmini_fence();   /* serialize acc reuse across tiles */
+            /* 4d. Gate accumulator reuse on this tile's mvout draining to DRAM,
+             *     WITHOUT a full-array fence: calibrate this size once, then poll
+             *     WDMA_BYTES_SENT and yield between reads (preemptible). The CPU
+             *     does not issue the next tile's bias-mvin until the poll clears,
+             *     so the acc is free -> bit-exact regardless of yielding.         */
+            uint32_t *unit = is_full ? &wdma_full : &wdma_part;
+            if (*unit == 0) {
+                gemmini_fence();                                   /* calibrate */
+                *unit = counter_read(MB_LO_WDMA_SLOT) - wdma_snap - exp_cum;
+                exp_cum += *unit;
+            } else {
+                exp_cum += *unit;
+                const uint64_t wt0 = mb_lo_rdcycle();
+                while ((counter_read(MB_LO_WDMA_SLOT) - wdma_snap) < exp_cum) {
+                    if (yield_fn) yield_fn();
+                    if ((mb_lo_rdcycle() - wt0) > MB_LO_POLL_BUDGET_CYC) {
+                        mb_lo_poll_timeouts++;
+                        break;
+                    }
+                }
+            }
         }
     }
 

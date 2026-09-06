@@ -25,13 +25,30 @@ conv0 params: IC=1 IH=IW=112 OC=32 K=3 S=2 P=1, pool 3×3 s2 p0 → 27×27×32,
 mult=1118622017 shift=7 clamp[-128,127] (scale_q31=8739235) — verbatim from
 `generated_gray_fusedpool/hetero_tiled/model.c`.
 
-| path | wall (cyc) | EX | LD | ST | ALL3 |
-|---|---:|---:|---:|---:|---:|
-| A = `tiled_conv_auto`+pool (current fused conv0) | 1,000,607 | 57 | 908,442 | 822 | 20 |
-| **E = load-once (this kernel)** | **456,145** | 34,956 | 390,474 | 21,301 | 0 |
+| path | wall (cyc) | EX | LD | ST | notes |
+|---|---:|---:|---:|---:|---|
+| A = `tiled_conv_auto`+pool (current fused conv0) | 998,000 | 64 | 909,731 | 554 | baseline |
+| **E = load-once, fence-free WDMA poll, NULL yield** | **451,843** | 34,319 | 390,498 | 21,109 | timeouts=0 |
+| Y = load-once, poll + yield hook (preemptible) | 455,243 | — | — | — | yield_calls=524, timeouts=0 |
 
-Bit-exact gate: **errAE = 0** (E vs A, identical), errE = 0, errA = 0 (both vs a
-scalar conv+requant+maxpool golden). pooled = 23,328 int8 outputs.
+Bit-exact gate: **errAE = 0** (E vs A, identical), errE = 0, errA = 0, **errY = 0,
+errYA = 0** (yield path identical too), vs a scalar conv+requant+maxpool golden.
+pooled = 23,328 int8 outputs. (Earlier fenced version measured 456,145; the
+targeted WDMA poll is a hair faster than a full-array fence.)
+
+## Fence-free + preemptible (FC co-residency reuse)
+Between output tiles the kernel does NOT `gemmini_fence()`; it gates accumulator
+reuse on a `WDMA_BYTES_SENT` poll (counter slot 4, a k_COUNTER ROCC read that
+commits immediately and does not drain), with an **optional `yield_fn` hook**
+called between reads (NULL ⇒ spin = max-throughput DroNet path; `k_yield` ⇒
+preemptible FC path). Per-tile store bytes are calibrated from ONE measured fence
+per tile size (full band + short final band — `OC*OH*OW` logical bytes don't map
+1:1 to the HW counter), then subsequent same-size tiles poll the running expected
+total; a ~50 ms budget guards against a stuck poll (`timeouts` counts breaches).
+This is the same fence-vs-poll mechanism as a41c8c06's `gwork.c` `GOP_TILES_POLL`,
+so the load-once conv0 doubles as the preemptible poll-conv the FC co-residency
+(accd7b08) needs — killing the load-DMA bottleneck AND giving preemptibility in
+one kernel. Measured: **yield hook fires (yield_calls=524), 0 timeouts, bit-exact.**
 
 ## Reading it
 - conv0 **1,000K → 456K cyc, bit-exact** (2.19×), inside the 300–500K target.
