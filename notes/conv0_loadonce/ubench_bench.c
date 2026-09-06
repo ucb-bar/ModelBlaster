@@ -63,6 +63,11 @@ static void emit(const char*fmt,...){ va_list ap; va_start(ap,fmt); vsnprintk(li
 
 static void gemmini_on(void){ asm volatile("csrs mstatus, %0"::"r"(0x18000):"memory"); gemmini_flush(0); }
 
+/* optional yield hook: counts invocations so we can confirm the poll actually
+ * reaches the yield point (stand-in for the FC path's k_yield). */
+static volatile uint32_t yield_calls;
+static void count_yield(void){ yield_calls++; }
+
 void bench_all(void)
 {
     const int OH = (IH+2*P-K)/S + 1;               /* 56 */
@@ -137,21 +142,42 @@ void bench_all(void)
     t0=rdc();
     int rc = mb_conv2d_pool_loadonce_s8(in_nhwc, w_hwio, bias_buf, out_lo,
         IC, IH, IW, OC, K, S, P, POOL_K, POOL_S,
-        NO_ACTIVATION, (acc_scale_t)scale_q31);
+        NO_ACTIVATION, (acc_scale_t)scale_q31, /*yield_fn=*/(void*)0);
     gemmini_fence(); gemmini_flush(0);
     t1=rdc();
     exE=counter_read(0)-x; ldE=counter_read(1)-l; stE=counter_read(2)-st; a3E=counter_read(3)-a3;
     uint64_t wallE=t1-t0;
+    uint32_t to_E = mb_conv2d_pool_loadonce_poll_timeouts();
+
+    /* ---- Path Y: load-once with the yield hook (preemptible / FC co-residency) ---- */
+    gemmini_on();
+    yield_calls = 0;
+    static elem_t out_y[64*64*OC] __attribute__((aligned(64)));
+    memset(out_y,0x55,pooled);
+    asm volatile("fence":::"memory");
+    t0=rdc();
+    int rcY = mb_conv2d_pool_loadonce_s8(in_nhwc, w_hwio, bias_buf, out_y,
+        IC, IH, IW, OC, K, S, P, POOL_K, POOL_S,
+        NO_ACTIVATION, (acc_scale_t)scale_q31, count_yield);
+    gemmini_fence(); gemmini_flush(0);
+    t1=rdc();
+    uint64_t wallY=t1-t0;
+    uint32_t to_Y = mb_conv2d_pool_loadonce_poll_timeouts() - to_E;
+    uint32_t yc = yield_calls;
 
     int errA = max_abs_err(out_ref, out_gold, pooled);
     int errE = max_abs_err(out_lo,  out_gold, pooled);
     int errAE= max_abs_err(out_lo,  out_ref,  pooled);
+    int errY = max_abs_err(out_y,   out_gold, pooled);
+    int errYA= max_abs_err(out_y,   out_ref,  pooled);
 
     emit("UBP,c0gA,wall=%llu,EX=%u,LD=%u,ST=%u,ALL3=%u\n",
          (unsigned long long)wallA,exA,ldA,stA,a3A);
-    emit("UBP,c0gE,wall=%llu,EX=%u,LD=%u,ST=%u,ALL3=%u,rc=%d\n",
-         (unsigned long long)wallE,exE,ldE,stE,a3E,rc);
-    emit("UBV,errA=%d,errE=%d,errAE=%d,pooled=%u\n",
-         errA,errE,errAE,(unsigned)pooled);
+    emit("UBP,c0gE,wall=%llu,EX=%u,LD=%u,ST=%u,ALL3=%u,rc=%d,timeouts=%u\n",
+         (unsigned long long)wallE,exE,ldE,stE,a3E,rc,to_E);
+    emit("UBY,c0gY,wall=%llu,rc=%d,yield_calls=%u,timeouts=%u\n",
+         (unsigned long long)wallY,rcY,yc,to_Y);
+    emit("UBV,errA=%d,errE=%d,errAE=%d,errY=%d,errYA=%d,pooled=%u\n",
+         errA,errE,errAE,errY,errYA,(unsigned)pooled);
     bench_print("=== GEMMINI_UBENCH_END ===\n");
 }
