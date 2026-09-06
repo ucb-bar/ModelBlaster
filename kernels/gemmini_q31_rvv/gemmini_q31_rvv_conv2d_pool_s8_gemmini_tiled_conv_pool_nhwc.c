@@ -38,6 +38,7 @@
 #include <math.h>
 #include <gemmini.h>
 #include <gemmini_params.h>
+#include "conv2d_pool_loadonce.h"
 
 #if defined(CONFIG_SMP) && defined(CONFIG_MP_MAX_NUM_CPUS) && CONFIG_MP_MAX_NUM_CPUS > 1
 #include <zephyr/kernel.h>
@@ -158,6 +159,29 @@ void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
     int act_kind = (activation_min == 0) ? 1 : 0;
 
     asm volatile("fence" ::: "memory");
+
+#ifdef MODELBLASTER_GEMMINI_Q31_ACC_SCALE
+    /* LOAD-ONCE conv0: mvin the whole input + weights ONCE and loop output tiles
+     * against the resident input, killing the per-tile input reload that makes the
+     * IC=1 grayscale conv0 ~79% LOAD-DMA-bound. Bit-exact reorder of the
+     * tiled_conv_auto+pool below (same int32 accumulate, same HW requant+pool);
+     * uses the SAME bias_used(+beta) so the result matches this path exactly.
+     * Returns nonzero for any shape it doesn't cover -> falls through to
+     * tiled_conv_auto unchanged. */
+    if (N == 1 && IC <= DIM
+        && mb_conv2d_pool_loadonce_s8(input, weight, bias_used, output,
+               IC, IH, IW, OC, KH, SH, PH, pool_KH, pool_SH,
+               act_kind, scale) == 0) {
+        gemmini_fence();
+        gemmini_flush(0);
+        if (activation_max < 127) {
+            size_t total = (size_t)N * OHp * OWp * OC;
+            for (size_t i = 0; i < total; i++)
+                if (output[i] > activation_max) output[i] = (int8_t)activation_max;
+        }
+        return;
+    }
+#endif
 
     /* tiled_conv_auto with the pool tail (pool_size, pool_stride, pool_padding).
      * input/output are NHWC -> no transpose; output holds the POOLED
