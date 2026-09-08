@@ -81,6 +81,16 @@ _NEW_COMPUTE = {
     # scaled_dot_product_attention is DECOMPOSED in the walker into
     # (matmul_s8, softmax_s8, matmul_s8) so it's not a single op here.
     "scaled_dot_product_attention.default": "_decompose_sdpa",
+    # Standalone matmul / softmax. Until now these existed ONLY as the
+    # walker's own SDPA decomposition, so a model that hand-writes its
+    # attention could not be extracted at all. That matters beyond
+    # convenience: _emit_sdpa_decomposed reads n.args[0..2] and never
+    # looks at args[3], so it SILENTLY DROPS THE ATTENTION MASK. A model
+    # whose attention is masked -- Octo's is -- must therefore spell the
+    # decomposition out itself, with the mask as an explicit add, and
+    # that requires these two.
+    "matmul.default":              "matmul_s8",
+    "softmax.int":                 "softmax_s8",
 }
 
 # Folded into the preceding op at extract time. The walker does the
@@ -729,6 +739,57 @@ class _ExportWalker:
                 "scale_out": self.scales.get(out_name, 1e-8),
                 "activation_min": -128, "activation_max": 127,
             }
+        if op_kind == "matmul.default":
+            # Mirrors the M/K/N convention _emit_sdpa_decomposed uses: the
+            # last two dims are what the kernel indexes, any leading dims
+            # are batch and are handled the same way the SDPA path handles
+            # heads.
+            def _vshape(a):
+                if hasattr(a, "meta") and "val" in a.meta:
+                    return tuple(int(x) for x in a.meta["val"].shape)
+                return None
+            b_in = self._resolve_input(n.args[1])
+            a_sh, b_sh = _vshape(n.args[0]), _vshape(n.args[1])
+            if not (a_sh and b_sh and len(a_sh) >= 2 and len(b_sh) >= 2):
+                raise NotImplementedError(
+                    f"matmul {n.name}: need >=2-D shapes from export meta, "
+                    f"got a={a_sh} b={b_sh}")
+            rec["inputs"] = [in_name, b_in]
+            rec["shape"] = {"M": a_sh[-2], "K": a_sh[-1], "N": b_sh[-1]}
+            if not is_fp16:
+                rec["quant"] = {
+                    "scale_a":   self.scales.get(in_name, 1e-8),
+                    "scale_b":   self.scales.get(b_in, 1e-8),
+                    "scale_out": self.scales.get(out_name, 1e-8),
+                    "transpose_b": 0,
+                    "scale_div_sqrt_dk": 1.0,
+                    "activation_min": -128, "activation_max": 127,
+                }
+            self.ops.append(rec)
+            return
+        if op_kind == "softmax.int":
+            # The kernel normalises over the LAST axis. Assert rather than
+            # assume: a softmax over any other axis would extract cleanly
+            # and then compute the wrong thing on device.
+            o_sh = tuple(self.tensors[out_name].shape)
+            dim = int(n.args[1]) if len(n.args) > 1 else -1
+            if dim not in (-1, len(o_sh) - 1):
+                raise NotImplementedError(
+                    f"softmax {n.name}: dim={dim} but the kernel reduces the "
+                    f"last axis of {o_sh}; no transpose is emitted for this.")
+            rec["shape"] = {"M": int(np.prod(o_sh[:-1])), "K": int(o_sh[-1])}
+            if not is_fp16:
+                # Output is a probability in [0, 1]; 1/127 is the same
+                # fixed scale the SDPA decomposition assigns its weights.
+                self.scales[out_name] = 1.0 / 127.0
+                rec["quant"] = {
+                    "scale_in":  self.scales.get(in_name, 1e-8),
+                    "scale_out": 1.0 / 127.0,
+                }
+            else:
+                rec["input_scale"] = 1.0
+            self.ops.append(rec)
+            return
         if op_kind == "mul.Tensor":
             b = self._resolve_input(n.args[1])
             rec["inputs"] = [in_name, b]
