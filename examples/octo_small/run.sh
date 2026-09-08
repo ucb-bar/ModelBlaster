@@ -95,4 +95,23 @@ export NUM_CALIBRATION
 # summed (measured max_abs 3.1e-06 vs the fused form in fp32) and keeps each
 # block's own scale.
 export MODELBLASTER_OCTO_SPLITFC="${MODELBLASTER_OCTO_SPLITFC:-1}"
+
+# Activation-range clipping. Per-tensor int8 on this model is very sensitive
+# to it -- measured on the 8 bridge_episodes samples, output cosine against
+# the fp32 reference:
+#
+#     max-abs (no clip)  0.8575   max_abs_err 22
+#     99.999             0.9085               14
+#     99.99              0.9757                7
+#     99.95              0.9354               18
+#     99.9               0.9254               19
+#     99.0               0.7332               95
+#
+# 99.99 is an EMPIRICALLY TUNED value on this calibration set, not a
+# principled quantile: the extractor estimates the percentile from at most
+# 2048 elements per tensor per sample, so for the 2.8 M-element attention
+# tensors it is closer to "max of a 16 k draw" than to a real 99.99th
+# percentile -- which is why the neighbours are not monotonic. Re-tune it if
+# the calibration set changes.
+export MODELBLASTER_ACT_PERCENTILE="${MODELBLASTER_ACT_PERCENTILE:-99.99}"
 source "${REPO_ROOT}/examples/_run_lib.sh"
