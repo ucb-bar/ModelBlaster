@@ -430,6 +430,16 @@ def _count_vector_insns(obj_path: str, cross: str) -> int:
     return n
 
 
+def _package_repo_root() -> str:
+    """The ModelBlaster repo root, from this file's own location.
+
+    `pipeline/generate_kernels.py` -> repo root is its parent's parent. Used when a
+    caller passes no repo_root, so a cwd-relative include cannot silently send every
+    curated kernel to the reference fallback.
+    """
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
                          repo_root: Optional[str]) -> VerifyResult:
     """Compile the candidate for the target ISA. Do not run it.
@@ -458,7 +468,18 @@ def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
             "riscv64 prefix (`eval \"$(scripts/setup_spacemit_toolchain.sh)\"`). "
             "Refusing to accept an unbuilt kernel.")
 
-    flags = list(backend.resolved_kernel_cflags(repo_root or "."))
+    # WHY NOT `repo_root or "."`. The rvv backends carry
+    # `-I<repo_root>/kernels/rvv`, where mb_rvv_vxrm_compat.h lives. With "." that
+    # include resolves against the CALLER'S cwd, so every curated RVV kernel fails
+    # to compile from anywhere but the ModelBlaster root -- and the failure is a
+    # fallback, not an error: the generator emits the scalar reference under a
+    # vector target's name, the board profiles it, and the row lands in the tree as
+    # a legitimate `source=k1` measurement roughly 5x slower than the curated
+    # kernel it stands in for (ffn_block fc1: 36.6 ms reference vs 14.1 ms curated).
+    # The package knows where its own repo root is; use that.
+    flags = list(backend.resolved_kernel_cflags(repo_root or _package_repo_root()))
+    missing_includes = [f[2:] for f in flags
+                        if f.startswith("-I") and not os.path.isdir(f[2:])]
     includes = "\n".join(f"#include {inc}" for inc in backend.kernel_includes)
     src = (f"#include <stddef.h>\n#include <stdint.h>\n#include <math.h>\n"
            f"{includes}\n\n{candidate}\n")
@@ -470,10 +491,21 @@ def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
         cmd = [cc, "-O2", "-c", cpath, "-o", os.path.join(d, "cand.o")] + flags
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
+            # Name a missing include directory as a SETUP fault. Otherwise the
+            # message reads as a kernel defect and the run quietly continues on the
+            # reference fallback -- which is a measurement of the wrong kernel.
+            setup = ""
+            if missing_includes:
+                setup = ("\n  SETUP FAULT: these include directories do not exist, "
+                         "so no curated kernel for this backend can compile: "
+                         + ", ".join(missing_includes)
+                         + ". Pass repo_root / --global-curated-dir correctly; the "
+                           "fallback below measures the scalar reference, not this "
+                           "kernel.")
             return VerifyResult(
                 False,
                 "candidate failed to cross-compile for "
-                f"{backend.name}:\n  cmd: {' '.join(cmd)}\n"
+                f"{backend.name}:{setup}\n  cmd: {' '.join(cmd)}\n"
                 f"  stderr:\n{proc.stderr}")
 
         # A "vector" kernel that compiled to no vector instructions is the
