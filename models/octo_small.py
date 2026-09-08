@@ -127,6 +127,18 @@ Shape / lowering knobs, same convention as the other models here:
                                masked slots (exp(-mask_neg)) and the int8
                                resolution of the real logits (mask_neg/127).
 
+  MODELBLASTER_OCTO_SPLITFC    default 0. Replaces the score net's
+                               `Linear(concat([cond,obs,action]))` with the
+                               sum of three per-block Linears. Identical in
+                               real arithmetic (W[a;b;c] = Wa.a + Wb.b + Wc.c)
+                               and strictly better in int8: the concat forces
+                               one per-tensor scale on three blocks whose
+                               ranges differ by 15.9x, so `noisy_actions` --
+                               the variable the diffusion loop is denoising --
+                               arrives at the matmul with 8 of its 127 levels.
+                               Measured scales at that cat: cond 0.010857,
+                               obs 0.085178, action 0.0053646, out 0.085178.
+
   MODELBLASTER_OCTO_CKPT       path to the converted PyTorch state_dict
                                (`experiments/octo_port/octo_small_torch.pt`).
                                WITHOUT IT THE WEIGHTS ARE RANDOM and every
@@ -185,6 +197,7 @@ def _cfg() -> dict:
     norm = os.environ.get("MODELBLASTER_OCTO_NORM", "1") == "1"
     time_mode = os.environ.get("MODELBLASTER_OCTO_TIME", "fourier")
     mask_neg = float(os.environ.get("MODELBLASTER_OCTO_MASK_NEG", 10.0))
+    split_fc = os.environ.get("MODELBLASTER_OCTO_SPLITFC", "0") == "1"
 
     if not 1 <= window <= MAX_HORIZON:
         raise ValueError(
@@ -221,6 +234,7 @@ def _cfg() -> dict:
     return dict(window=window, primary=primary, wrist=wrist, layers=layers,
                 part=part, gn=gn, attn=attn, goal=goal, norm=norm,
                 time_mode=time_mode, mask_neg=mask_neg,
+                split_fc=split_fc,
                 n_primary=n_primary, n_wrist=n_wrist)
 
 
@@ -726,9 +740,11 @@ class ScoreNet(nn.Module):
     checkpoint's `reverse_network/Dense_0/kernel [444, 256]`.
     """
 
-    def __init__(self, obs_dim: int = EMBED_DIM, time_mode: str = "fourier"):
+    def __init__(self, obs_dim: int = EMBED_DIM, time_mode: str = "fourier",
+                 split_fc: bool = False):
         super().__init__()
         self.time_mode = time_mode
+        self.split_fc = split_fc
         self.time_preprocess = FourierFeatures(TIME_DIM)
         # cond_encoder = MLP((2*time_dim, time_dim)); activate_final=False and
         # use_layer_norm defaults False, so swish goes between the two Denses
@@ -738,7 +754,15 @@ class ScoreNet(nn.Module):
 
         self.action_flat = ACTION_DIM * ACTION_HORIZON     # 28
         in_dim = TIME_DIM + obs_dim + self.action_flat     # 444
-        self.fc_in = nn.Linear(in_dim, SCORE_HIDDEN)
+        if split_fc:
+            # One Linear per concat block. The bias lives on the first so the
+            # sum has exactly one, like the single Linear it replaces.
+            self.fc_in_c = nn.Linear(TIME_DIM, SCORE_HIDDEN)
+            self.fc_in_o = nn.Linear(obs_dim, SCORE_HIDDEN, bias=False)
+            self.fc_in_a = nn.Linear(self.action_flat, SCORE_HIDDEN,
+                                     bias=False)
+        else:
+            self.fc_in = nn.Linear(in_dim, SCORE_HIDDEN)
         self.blocks = nn.ModuleList(
             [MLPResNetBlock(SCORE_HIDDEN) for _ in range(SCORE_BLOCKS)])
         self.fc_out = nn.Linear(SCORE_HIDDEN, self.action_flat)
@@ -755,8 +779,11 @@ class ScoreNet(nn.Module):
             c = t
         else:
             c = self.cond_embed(t)
-        x = torch.cat([c, obs_enc, noisy_actions], dim=-1)
-        x = self.fc_in(x)
+        if self.split_fc:
+            x = (self.fc_in_c(c) + self.fc_in_o(obs_enc)
+                 + self.fc_in_a(noisy_actions))
+        else:
+            x = self.fc_in(torch.cat([c, obs_enc, noisy_actions], dim=-1))
         for blk in self.blocks:
             x = blk(x)
         return self.fc_out(_swish(x))
@@ -811,7 +838,8 @@ class OctoSmall(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.backbone = OctoBackbone(cfg)
-        self.score = ScoreNet(EMBED_DIM, cfg["time_mode"])
+        self.score = ScoreNet(EMBED_DIM, cfg["time_mode"],
+                              cfg.get("split_fc", False))
         betas = cosine_beta_schedule(DIFFUSION_STEPS)
         alphas = 1.0 - betas
         self.register_buffer("betas", torch.tensor(betas, dtype=torch.float32),
@@ -972,6 +1000,18 @@ def get_model(seed: int = 0) -> nn.Module:
               "MODELBLASTER_OCTO_CKPT.", flush=True)
     else:
         sd = torch.load(ckpt, map_location="cpu", weights_only=True)
+        if cfg.get("split_fc") and "score.fc_in.weight" in sd:
+            # SPLITFC=1 replaces one Linear(444, 256) with three Linears whose
+            # inputs are the concat blocks, so the checkpoint's single kernel
+            # is sliced along K in the concat's order (cond, obs, action). The
+            # bias goes on the first, matching the ctor.
+            W = sd.pop("score.fc_in.weight")
+            b = sd.pop("score.fc_in.bias")
+            n_c, n_o = TIME_DIM, EMBED_DIM
+            sd["score.fc_in_c.weight"] = W[:, :n_c].clone()
+            sd["score.fc_in_c.bias"] = b.clone()
+            sd["score.fc_in_o.weight"] = W[:, n_c:n_c + n_o].clone()
+            sd["score.fc_in_a.weight"] = W[:, n_c + n_o:].clone()
         missing, unexpected = full.load_state_dict(sd, strict=False)
         real_missing = [k for k in missing if not k.endswith("mask_bias")]
         if real_missing:
@@ -991,7 +1031,9 @@ def get_sample_input(seed: int = 1):
 
     Images are float tensors valued in [0, 255] -- the /127.5 - 1 normalisation
     lives inside the model, as it does upstream, so the harness feeds raw
-    camera values.
+    camera values. With `MODELBLASTER_OCTO_NORM=0` that normalisation is moved
+    out of the graph, so the images come back ALREADY in [-1, 1]: the knob
+    changes the input contract, and this has to follow it.
 
     Random gaussian language embeddings and random images are fine for tracing
     and for shape/latency work. They are NOT a calibration set: see
@@ -1002,7 +1044,19 @@ def get_sample_input(seed: int = 1):
     w = cfg["window"]
 
     def _img(n: int, batch_dims: tuple) -> torch.Tensor:
-        return torch.randint(0, 256, batch_dims + (3, n, n), generator=g).float()
+        raw = torch.randint(0, 256, batch_dims + (3, n, n),
+                            generator=g).float()
+        if cfg["norm"]:
+            return raw
+        # MODELBLASTER_OCTO_NORM=0 moves `/127.5 - 1` OUT of the graph, which
+        # makes ALREADY-NORMALIZED values the input contract -- a camera
+        # driver or the harness does the scaling. Handing it raw [0,255]
+        # overdrives the stem by 128x, and leaves goal_const
+        # (= normalize_images(0) = -1.0) in a different domain from the image
+        # it is concatenated with: the cat's shared per-tensor scale came out
+        # 2.008 = 255/127, so the -1.0 goal channels quantized to a single
+        # LSB. Every activation scale downstream was fitted to that.
+        return raw / 127.5 - 1.0
 
     # Built by name so this cannot drift out of step with forward_arg_names().
     made = {
@@ -1039,18 +1093,86 @@ def get_calibration_spec(num_samples: int = 8) -> "dict | None":
     if not src:
         return None
     cfg = _cfg()
+    if cfg["part"] == "score":
+        # The score net's inputs are the backbone's OUTPUT plus the diffusion
+        # state; no dataset stands behind any of them. Calibrate PART=score
+        # from a PART=full run's captured obs_enc instead of pretending.
+        return None
+    # The spec must name every forward input in forward_arg_names() order --
+    # materialize_calibration_samples builds each positional tuple from the
+    # spec's keys, so a spec that covers only the cameras yields a short
+    # tuple and the forward call fails. Only the cameras have real data; the
+    # rest say so via the `synthetic` loader rather than being filled in
+    # silently somewhere else.
+    w = cfg["window"]
+    inputs: dict = {}
+    if cfg["wrist"]:
+        inputs["img_wrist"] = {
+            "loader": "bridge_episodes", "path": src,
+            # These episodes are single-camera, so the loader falls back to
+            # the primary frames and records it in the item meta. Primary
+            # frames are a closer stand-in for the wrist stem than noise.
+            "key": "image_wrist",
+            "image_size": [cfg["wrist"], cfg["wrist"]],
+            "domain": "raw" if cfg["norm"] else "unit",
+            "compose": {"kind": "window_stack", "frames_per_sample": w},
+        }
+    inputs["lang"] = {"loader": "synthetic",
+                      "shape": [LANG_TOKENS, T5_HIDDEN],
+                      "kind": "gaussian", "scale": 0.5,
+                      "comment": "T5 encoder output; T5 is not part of the "
+                                 "port (NOTES.md 7), so there is no source "
+                                 "for this here."}
+    if cfg["goal"]:
+        inputs["goal_primary"] = {
+            "loader": "bridge_episodes", "path": src, "key": "image_primary",
+            "image_size": [cfg["primary"], cfg["primary"]],
+            "domain": "raw" if cfg["norm"] else "unit",
+            "compose": {"kind": "one_per_sample"},
+        }
+        if cfg["wrist"]:
+            inputs["goal_wrist"] = {
+                "loader": "bridge_episodes", "path": src, "key": "image_wrist",
+                "image_size": [cfg["wrist"], cfg["wrist"]],
+                "domain": "raw" if cfg["norm"] else "unit",
+                "compose": {"kind": "one_per_sample"},
+            }
+    if cfg["part"] == "full":
+        inputs["noisy_actions"] = {
+            "loader": "synthetic",
+            "shape": [w, ACTION_DIM * ACTION_HORIZON],
+            "kind": "gaussian", "scale": 0.3,
+            "comment": "x_t of the DDPM chain: a function of the sampling "
+                       "loop, not of the dataset.",
+        }
+        inputs["t"] = ({"loader": "synthetic", "shape": [w, TIME_DIM],
+                        "kind": "gaussian", "scale": 0.5,
+                        "comment": "cond_table() row for the current step "
+                                   "(TIME=lut)."}
+                       if cfg["time_mode"] == "lut" else
+                       {"loader": "synthetic", "shape": [w, 1],
+                        "kind": "const", "scale": 7.0,
+                        "comment": "raw timestep (TIME=fourier)."})
     return {
         "num_samples": num_samples,
         "inputs": {
+            # window_stack, not rolling_window: img_primary is
+            # (B, window, 3, R, R) -- the window is a real axis, because each
+            # frame is tokenized by the ViT separately. rolling_window
+            # concatenates the frames along channels into (B, window*3, R, R),
+            # which has the same element count and so would trace, then
+            # tokenize 6 channels of one frame instead of 3 of two.
+            #
+            # `domain` follows MODELBLASTER_OCTO_NORM: with the /127.5 - 1
+            # moved out of the graph, pre-normalized frames ARE the input
+            # contract, and calibrating on [0,255] would fit every scale
+            # 128x too wide.
             "img_primary": {"loader": "bridge_episodes", "path": src,
                             "key": "image_primary",
                             "image_size": [cfg["primary"], cfg["primary"]],
-                            "compose": {"kind": "rolling_window",
+                            "domain": "raw" if cfg["norm"] else "unit",
+                            "compose": {"kind": "window_stack",
                                         "frames_per_sample": cfg["window"]}},
-            "img_wrist": {"loader": "bridge_episodes", "path": src,
-                          "key": "image_wrist",
-                          "image_size": [cfg["wrist"], cfg["wrist"]],
-                          "compose": {"kind": "rolling_window",
-                                      "frames_per_sample": cfg["window"]}},
+            **inputs,
         },
     }
