@@ -117,9 +117,36 @@ def _compose_one_per_sample(items: list[DatasetItem], spec: dict,
             for i in range(n_samples)]
 
 
+def _compose_window_stack(items: list[DatasetItem], spec: dict,
+                          n_samples: int) -> list[torch.Tensor]:
+    """Build N samples of K consecutive items on their OWN axis:
+    (1, K, C, H, W).
+
+    Distinct from rolling_window, which concatenates the K frames along the
+    channel dim into (1, K*C, H, W). A ViT-per-timestep model tokenizes each
+    frame separately and needs the window as a real axis -- Octo's
+    img_primary is (B, window, 3, R, R). Feeding it the channel-stacked form
+    would still trace (both have K*C*H*W elements) and would tokenize six
+    channels of one frame instead of three channels of two frames.
+    """
+    k = int(spec["frames_per_sample"])
+    if not items:
+        raise ValueError("window_stack: empty item list")
+    out = []
+    for i in range(n_samples):
+        anchor = (i * max(1, len(items) // n_samples)) % len(items)
+        frames = []
+        for j in range(k):
+            idx = max(0, anchor - (k - 1 - j)) % len(items)
+            frames.append(items[idx].data)
+        out.append(torch.stack(frames, dim=0).unsqueeze(0))  # (1, K, C, H, W)
+    return out
+
+
 _COMPOSERS = {
     "rolling_window": _compose_rolling_window,
     "one_per_sample": _compose_one_per_sample,
+    "window_stack": _compose_window_stack,
 }
 
 
