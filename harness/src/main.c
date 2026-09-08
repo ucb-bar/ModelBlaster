@@ -38,16 +38,26 @@ static model_output_t model_output[MODEL_OUTPUT_SIZE];
 int main(void)
 {
 #if defined(CONFIG_SMP) && defined(CONFIG_RISCV_ISA_EXT_V) && (CONFIG_MP_MAX_NUM_CPUS > 1)
-    /* Pin main to hart 1 on hetero bitstreams (GemminiAndOPUShuttleConfig,
-     * chipyard_hetero_q31, firesim_rocket_saturn) — hart 0 boots without
-     * V hardware on these, so running a V-using generated kernel from
-     * the boot hart would trap on the first vsetvli. Hart 1 has V (+
-     * Saturn OPU matrix). Pinning is a no-op on single-hart builds
-     * (e.g. spike) because the guard requires MP_MAX_NUM_CPUS > 1.
+    /* Pin main to a hart that HAS vector hardware. Hart 0 boots without V
+     * on the hetero bitstreams (GemminiAndOPUShuttleConfig,
+     * chipyard_hetero_q31, firesim_rocket_saturn), so running a V-using
+     * generated kernel from the boot hart would trap on the first
+     * vsetvli. Pinning is a no-op on single-hart builds (e.g. spike)
+     * because the guard requires MP_MAX_NUM_CPUS > 1.
+     *
+     * The default of 1 is right for the DUAL bitstreams. It is wrong for
+     * f2_quad_hetero_norose_tacit_q31_60mhz, where the tiles physically
+     * differ -- harts 0,1 are Rocket + Q0.31 Gemmini with NO vector,
+     * harts 2,3 are Rocket + Saturn with NO Gemmini -- so a vector
+     * kernel pinned to hart 1 traps there. Build that bitstream with
+     * -DMODELBLASTER_PIN_HART=2.
      *
      * Requires CONFIG_SCHED_CPU_MASK_PIN_ONLY=y in the FireSim overlay
      * (harness/backends/firesim_chipyard.conf) — already set. */
-    k_thread_cpu_pin(k_current_get(), 1);
+#ifndef MODELBLASTER_PIN_HART
+#define MODELBLASTER_PIN_HART 1
+#endif
+    k_thread_cpu_pin(k_current_get(), MODELBLASTER_PIN_HART);
 #endif
 
     printf("modelblaster harness: model=%s in=%d out=%d\n",
