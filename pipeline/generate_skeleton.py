@@ -2682,6 +2682,16 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         if tensor in out_tensor_to_offset:
             off = out_tensor_to_offset[tensor]
             return "output" if off == 0 else f"(output + {off})"
+        if ((tensors.get(tensor) or {}).get("quant") or {}) \
+                .get("kind") == "constant_buffer":
+            # A weight consumed as a plain positional input, not through a
+            # dedicated *_key field: a GroupNorm gamma/beta reaching
+            # mul_c1_s8 / add_c1_s8, a positional embedding reaching
+            # slice_c_s8 or add_s8, an attention mask reaching add_tile_s8.
+            # Falling through to _buf_name pointed those at an intermediate
+            # scratch buffer, which is zeroed -- so the op read all zeros
+            # and every downstream tensor was wrong, with nothing failing.
+            return _weight_name(model_name, tensor, backend)
         return _buf_name(mid, tensor)
 
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
@@ -3913,6 +3923,58 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_gate'])}, {_f32(q['scale_x'])}, "
                 f"{_f32(q['scale_out'])})"
             )
+        elif op["op"] == "permute4_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_permute4_s8({in_ptr}, {out_ptr}, "
+                f"{sh['d0']}, {sh['d1']}, {sh['d2']}, {sh['d3']}, "
+                f"{sh['p0']}, {sh['p1']}, {sh['p2']}, {sh['p3']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "matmul_b_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_matmul_b_s8({a_ptr}, {b_ptr}, {out_ptr}, "
+                f"{sh['B']}, {sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{_f32(q['scale_a'])}, {_f32(q['scale_b'])}, "
+                f"{_f32(q['scale_out'])}, {q.get('transpose_b', 0)}, "
+                f"{_f32(q.get('scale_div_sqrt_dk', 1.0))}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "add_tile_s8":
+            tile_ptr = ptr_for(op["inputs"][0], "in")
+            x_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_add_tile_s8({tile_ptr}, {x_ptr}, {out_ptr}, "
+                f"{sh['OUTER']}, {sh['INNER']}, "
+                f"{_f32(q['scale_tile'])}, {_f32(q['scale_x'])}, "
+                f"{_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "add_c1_s8":
+            gate_ptr = ptr_for(op["inputs"][0], "in")
+            x_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_add_c1_s8({gate_ptr}, {x_ptr}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['HW']}, "
+                f"{_f32(q['scale_gate'])}, {_f32(q['scale_x'])}, "
+                f"{_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
         elif op["op"] == "gelu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
@@ -4508,12 +4570,23 @@ static inline unsigned long long mb_wall_ticks(void)
 #include "kernels.h"
 #include "weights.h"
 
-/* Per-op timer: per-hart mcycle CSR. */
+/* Per-op timer: per-hart mcycle CSR.
+ *
+ * The __riscv guard is for board native_sim/native/64, which is a Zephyr
+ * build (so k_cycle_get_64 and the rest of the harness are available) done
+ * with the HOST compiler -- `rdcycle` is not an x86 instruction and the
+ * assembler rejects it, which is the whole native_sim path failing on the
+ * first timed dispatch. The RISC-V branch is unchanged, so every board
+ * build still emits a byte-identical mcycle read. */
 static inline unsigned long rdcycle(void)
 {
+#if defined(__riscv)
     unsigned long cc;
     __asm__ volatile("rdcycle %0" : "=r"(cc));
     return cc;
+#else
+    return (unsigned long)k_cycle_get_64();
+#endif
 }
 static inline unsigned long long mb_wall_ticks(void)
 {

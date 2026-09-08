@@ -6114,6 +6114,235 @@ void kernel_mul_c1_s8(const int8_t *gate, const int8_t *x, int8_t *output,
 )
 
 
+PERMUTE4_S8 = KernelSpec(
+    op="permute4_s8",
+    signature=(
+        "void kernel_permute4_s8(const int8_t *input, int8_t *output, "
+        "int d0, int d1, int d2, int d3, "
+        "int p0, int p1, int p2, int p3, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Rank-4 axis permutation (copy, not a view):\n"
+        "  output[o0,o1,o2,o3] = input[i0,i1,i2,i3]  with i[p_k] = o_k\n"
+        "d0..d3 are the INPUT extents; p0..p3 is the permutation, so output\n"
+        "extent k is d[p_k]. Both buffers are contiguous row-major. When\n"
+        "scale_in == scale_out this is a pure data move; otherwise each\n"
+        "element is requantized and clipped to [activation_min,\n"
+        "activation_max].\n\n"
+        "Needed because a transpose/permute is only a free alias when the\n"
+        "element ORDER is unchanged. A ViT's head split\n"
+        "(1,S,H,D)->(1,H,S,D) and a stem's NCHW->NHWC both reorder, and\n"
+        "aliasing them hands the next kernel the same bytes in the wrong\n"
+        "order -- a wrong answer with nothing to catch it."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_permute4_s8(const int8_t *input, int8_t *output,
+                        int d0, int d1, int d2, int d3,
+                        int p0, int p1, int p2, int p3,
+                        float scale_in, float scale_out,
+                        int activation_min, int activation_max) {
+    const int din[4] = { d0, d1, d2, d3 };
+    const int sin[4] = { d1*d2*d3, d2*d3, d3, 1 };
+    const int perm[4] = { p0, p1, p2, p3 };
+    int od[4], os[4];
+    for (int k = 0; k < 4; k++) { od[k] = din[perm[k]]; os[k] = sin[perm[k]]; }
+    const int pure = (scale_in == scale_out);
+    const float ratio = scale_in / scale_out;
+    int w = 0;
+    for (int o0 = 0; o0 < od[0]; o0++) {
+      for (int o1 = 0; o1 < od[1]; o1++) {
+        for (int o2 = 0; o2 < od[2]; o2++) {
+          const int base = o0*os[0] + o1*os[1] + o2*os[2];
+          for (int o3 = 0; o3 < od[3]; o3++) {
+            int8_t v = input[base + o3*os[3]];
+            if (pure) {
+                output[w++] = v;
+            } else {
+                float f = (float)v * ratio;
+                int32_t q = (int32_t)(f >= 0.0f ? f + 0.5f : f - 0.5f);
+                if (q < activation_min) q = activation_min;
+                if (q > activation_max) q = activation_max;
+                output[w++] = (int8_t)q;
+            }
+          }
+        }
+      }
+    }
+}
+""",
+    extra_shapes=[
+        {"d0": 1, "d1": 690, "d2": 6, "d3": 64,
+         "p0": 0, "p1": 2, "p2": 1, "p3": 3,
+         "scale_in": 0.02, "scale_out": 0.02,
+         "activation_min": -128, "activation_max": 127},
+    ],
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
+)
+
+
+MATMUL_B_S8 = KernelSpec(
+    op="matmul_b_s8",
+    signature=(
+        "void kernel_matmul_b_s8(const int8_t *a, const int8_t *b, "
+        "int8_t *output, int B, int M, int K, int N, "
+        "float scale_a, float scale_b, float scale_out, "
+        "int transpose_b, float scale_div, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Batched int8 matmul -- B independent M x K x N products over\n"
+        "contiguous slices:\n"
+        "  out[b,i,j] = round(sum_k a[b,i,k]*b[b,k,j] * (sa*sb)/(so*sdiv))\n"
+        "with b indexed as b[b,j,k] when transpose_b. Output clipped to\n"
+        "[activation_min, activation_max]. B == 1 is exactly matmul_s8.\n\n"
+        "Multi-head attention needs this: matmul_s8 takes only the last two\n"
+        "dims, so a (1,heads,S,D) x (1,heads,D,S) product silently\n"
+        "collapsed to one head's worth of work over the wrong elements."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+#include <math.h>
+
+void kernel_matmul_b_s8(const int8_t *a, const int8_t *b, int8_t *output,
+                        int B, int M, int K, int N,
+                        float scale_a, float scale_b, float scale_out,
+                        int transpose_b, float scale_div,
+                        int activation_min, int activation_max) {
+    float total = (scale_a * scale_b) / (scale_out * scale_div);
+    for (int bi = 0; bi < B; bi++) {
+        const int8_t *ab = a + (long)bi * M * K;
+        const int8_t *bb = b + (long)bi * K * N;
+        int8_t *ob = output + (long)bi * M * N;
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j++) {
+                int32_t acc = 0;
+                for (int k = 0; k < K; k++) {
+                    int8_t av = ab[i*K + k];
+                    int8_t bv = transpose_b ? bb[j*K + k] : bb[k*N + j];
+                    acc += (int32_t)av * (int32_t)bv;
+                }
+                int32_t v = (int32_t)roundf((float)acc * total);
+                if (v < activation_min) v = activation_min;
+                if (v > activation_max) v = activation_max;
+                ob[i*N + j] = (int8_t)v;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"B": 6, "M": 64, "K": 32, "N": 64,
+         "scale_a": 0.02, "scale_b": 0.02, "scale_out": 0.1,
+         "transpose_b": 0, "scale_div": 1.0,
+         "activation_min": -128, "activation_max": 127},
+    ],
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
+)
+
+
+ADD_TILE_S8 = KernelSpec(
+    op="add_tile_s8",
+    signature=(
+        "void kernel_add_tile_s8(const int8_t *tile, const int8_t *x, "
+        "int8_t *output, int OUTER, int INNER, "
+        "float scale_tile, float scale_x, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Int8 add of a repeated trailing block:\n"
+        "  output[o*INNER + i] = round(\n"
+        "    (scale_tile * tile[i] + scale_x * x[o*INNER + i]) / scale_out)\n"
+        "for o in [0, OUTER) and i in [0, INNER). Output clipped to\n"
+        "[activation_min, activation_max]. `tile` holds INNER elements and\n"
+        "is reused for every o -- a shared attention mask, (1,1,S,S) added\n"
+        "to (1,heads,S,S) scores. Without it such an add lowers to add_s8,\n"
+        "which walks OUTER*INNER elements of the INNER-element buffer."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_add_tile_s8(const int8_t *tile, const int8_t *x, int8_t *output,
+                        int OUTER, int INNER,
+                        float scale_tile, float scale_x, float scale_out,
+                        int activation_min, int activation_max) {
+    for (int o = 0; o < OUTER; o++) {
+        for (int i = 0; i < INNER; i++) {
+            int idx = o*INNER + i;
+            float sum = ((float)tile[i] * scale_tile)
+                      + ((float)x[idx] * scale_x);
+            float v = sum / scale_out;
+            int32_t q = (int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+            if (q < activation_min) q = activation_min;
+            if (q > activation_max) q = activation_max;
+            output[idx] = (int8_t)q;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"OUTER": 6, "INNER": 64*64,
+         "scale_tile": 0.25, "scale_x": 0.01, "scale_out": 0.26,
+         "activation_min": -128, "activation_max": 127},
+    ],
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
+)
+
+
+ADD_C1_S8 = KernelSpec(
+    op="add_c1_s8",
+    signature=(
+        "void kernel_add_c1_s8(const int8_t *gate, const int8_t *x, "
+        "int8_t *output, int N, int C, int HW, "
+        "float scale_gate, float scale_x, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Int8 channel-axis broadcast add:\n"
+        "  output[n, c, h, w] = round(\n"
+        "    (scale_gate * gate[c] + scale_x * x[n, c, h, w]) / scale_out)\n"
+        "Output clipped to [activation_min, activation_max]. The additive\n"
+        "counterpart of mul_c1_s8, for a per-channel bias (a GroupNorm or\n"
+        "GroupNormLN beta) against an NCHW activation. Without it, a\n"
+        "channel-broadcast add lowers to add_s8, which indexes both\n"
+        "operands with the same flat index and reads C*H*W elements out of\n"
+        "a length-C bias."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_add_c1_s8(const int8_t *gate, const int8_t *x, int8_t *output,
+                      int N, int C, int HW,
+                      float scale_gate, float scale_x, float scale_out,
+                      int activation_min, int activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float g_real = (float)gate[c] * scale_gate;
+            for (int i = 0; i < HW; i++) {
+                int idx = (n*C + c)*HW + i;
+                float sum = g_real + ((float)x[idx] * scale_x);
+                float v = sum / scale_out;
+                int32_t q = (int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+                if (q < activation_min) q = activation_min;
+                if (q > activation_max) q = activation_max;
+                output[idx] = (int8_t)q;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "HW": 32*42,
+         "scale_gate": 1.0/127.0, "scale_x": 0.08, "scale_out": 0.08,
+         "activation_min": -128, "activation_max": 127},
+    ],
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
+)
+
+
 def _adaptive_avg_pool2d_f16_argtypes():
     import ctypes
     h = ctypes.POINTER(ctypes.c_uint16)
@@ -13120,6 +13349,10 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'mul_f16': MUL_F16,
     'mul_c1_f16': MUL_C1_F16,
     'mul_c1_s8': MUL_C1_S8,
+    'add_c1_s8': ADD_C1_S8,
+    'add_tile_s8': ADD_TILE_S8,
+    'permute4_s8': PERMUTE4_S8,
+    'matmul_b_s8': MATMUL_B_S8,
     'adaptive_avg_pool2d_f16': ADAPTIVE_AVG_POOL2D_F16,
     'slice_c_f16': SLICE_C_F16,
     'cat2_c1_f16': CAT2_C1_F16,
