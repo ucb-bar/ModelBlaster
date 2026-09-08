@@ -10,6 +10,9 @@
 #                "--per-channel" (per-output-channel weight scales) or
 #                "--inspect a,b,c" (runtime dumps for staged accuracy
 #                debugging). Word-split on purpose.
+#   EXTRA_KERNEL_CFLAGS  ';'-separated cflags appended to the backend's
+#                kernel cflags, e.g. "-ffp-contract=off" to make two
+#                targets bit-comparable (see where it is applied).
 #   REPO_ROOT    repo root path; the script cd's into it
 #
 # Optional env vars (with defaults applied here):
@@ -350,6 +353,18 @@ if [[ "${RUNNER}" == "native" ]]; then
     # compile unoptimized — far too slow at stock KernelBench dims (e.g. a
     # 2048^3 matmul). Add -O2 (no -ffast-math, so fp semantics are unchanged).
     KERNEL_CFLAGS="${KERNEL_CFLAGS:+${KERNEL_CFLAGS};}-O2"
+fi
+# EXTRA_KERNEL_CFLAGS appends to whatever the backend resolved, as a ';'
+# separated list. The case it exists for: the int8 reference kernels that
+# dequantize to float (add_s8, add_c1_s8, add_tile_s8, layer_norm_s8) are
+# compiled with gcc's default -ffp-contract=fast, which fuses their
+# multiply-accumulates on a target that has FMA (RISC-V does; baseline
+# x86-64 does not). That is a real difference in results -- measured up to
+# 0.785% of add_s8's int8 outputs moving by 1 LSB -- so two targets running
+# the same IR are NOT bit-comparable unless both pin the same contraction.
+# Set EXTRA_KERNEL_CFLAGS='-ffp-contract=off' on both to make them so.
+if [[ -n "${EXTRA_KERNEL_CFLAGS:-}" ]]; then
+    KERNEL_CFLAGS="${KERNEL_CFLAGS:+${KERNEL_CFLAGS};}${EXTRA_KERNEL_CFLAGS}"
 fi
 WEST_CMAKE_ARGS=(
     -DMODEL_DIR="${GEN_DIR}"
