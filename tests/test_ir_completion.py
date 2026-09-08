@@ -72,9 +72,56 @@ _SKIP_REASON = (
     "pipeline, or run from a tree that has them): " + ", ".join(_MISSING)
 ) if _MISSING else ""
 
+def _fixture_pair_mismatch() -> str:
+    """Whether the schedule fixture and the IR fixtures describe the same build.
+
+    They are separate artifacts of one generator run and they drifted: the committed
+    schedule references `yolov8_nano_dispatch_99` while the committed yolov8_nano IR
+    stops short of it, so ingest raises on the reference rather than on anything these
+    tests are about. That is worth saying out loud -- the old blanket skip on "fixtures
+    absent" hid it, and the four tests then read as "not applicable here" when what
+    they actually are is un-runnable against this pair. Regenerating BOTH from a single
+    int8 extract/skeleton run is the fix; until then these xfail with this reason.
+    """
+    if _MISSING:
+        return ""
+    try:
+        sched = json.loads(Path(SCHEDULE).read_text())
+        irs = {k: json.loads(Path(v).read_text()) for k, v in IRS.items()}
+    except Exception as exc:  # unreadable fixture is the _MISSING case's problem
+        return f"fixtures unreadable: {exc}"
+    have = {net: {op.get("dispatch_id") for op in ir.get("ops", [])}
+            for net, ir in irs.items()}
+    for key in (sched.get("dispatches") or {}):
+        base = key.rsplit("_dispatch_", 1)[0] if "_dispatch_" in key else key
+        try:
+            did = int(key.rsplit("_dispatch_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        for net, ids in have.items():
+            # instance suffixes: dronet0/dronet1 all come from the `dronet` IR
+            if base == net or (base.startswith(net) and base[len(net):].isdigit()):
+                if did not in ids:
+                    return (f"schedule fixture references {key} but the {net} IR "
+                            f"fixture has no dispatch_id={did} (max "
+                            f"{max(i for i in ids if i is not None)}); the two "
+                            f"fixtures are from different builds")
+    return ""
+
+
+_MISMATCH = _fixture_pair_mismatch()
+
 try:
     import pytest
-    pytestmark = pytest.mark.skipif(bool(_MISSING), reason=_SKIP_REASON)
+    if _MISSING:
+        pytestmark = pytest.mark.skipif(True, reason=_SKIP_REASON)
+    elif _MISMATCH:
+        # xfail, not skip: the artifacts ARE here and these tests cannot pass against
+        # them. strict=False so a regenerated, consistent pair turns them green without
+        # anyone having to remember to remove a marker.
+        pytestmark = pytest.mark.xfail(reason=_MISMATCH, strict=False)
+    else:
+        pytestmark = ()
 except ImportError:  # direct `python test_ir_completion.py` invocation
     pytest = None
 _SCALAR_FP_OPS = {
