@@ -898,13 +898,24 @@ class _ExportWalker:
             tb = 1 if (isinstance(n.args[1], torch.fx.Node)
                        and n.args[1].name in self.transpose_b_nodes) else 0
             rec["inputs"] = [in_name, b_in]
-            if batch_a > 1:
-                rec["op"] = f"matmul_b{self._op_suffix_for(op_q)}"
-                rec["shape"] = {"B": batch_a, "M": a_sh[-2], "K": a_sh[-1],
-                                "N": b_sh[-1]}
+            M, K, N = a_sh[-2], a_sh[-1], b_sh[-1]
+            if is_fp16:
+                # fp16 has no scale fields, so the transpose and the batch
+                # are carried by the OP NAME, which is how the existing f16
+                # matmul family is shaped: {matmul, matmul_tb} x {., bmm}.
+                # bmm_tb_f16 is the one this completes.
+                if batch_a > 1:
+                    rec["op"] = "bmm_tb_f16" if tb else "bmm_f16"
+                    rec["shape"] = {"batch": batch_a, "M": M, "K": K, "N": N}
+                else:
+                    rec["op"] = "matmul_tb_f16" if tb else "matmul_f16"
+                    rec["shape"] = {"M": M, "K": K, "N": N}
             else:
-                rec["shape"] = {"M": a_sh[-2], "K": a_sh[-1], "N": b_sh[-1]}
-            if not is_fp16:
+                if batch_a > 1:
+                    rec["op"] = "matmul_b_s8"
+                    rec["shape"] = {"B": batch_a, "M": M, "K": K, "N": N}
+                else:
+                    rec["shape"] = {"M": M, "K": K, "N": N}
                 rec["quant"] = {
                     "scale_a":   self.scales.get(in_name, 1e-8),
                     "scale_b":   self.scales.get(b_in, 1e-8),
@@ -913,10 +924,6 @@ class _ExportWalker:
                     "scale_div_sqrt_dk": 1.0,
                     "activation_min": -128, "activation_max": 127,
                 }
-            elif tb:
-                raise NotImplementedError(
-                    f"matmul {n.name}: transpose_b folding is only wired for "
-                    f"the int8 record shape")
             self.ops.append(rec)
             return
         if op_kind == "softmax.int":
@@ -1080,10 +1087,20 @@ class _ExportWalker:
         """
         if self._quant_for(n) == "fp16":
             # fp16 carries no scale to fold into, so the multiply is real
-            # arithmetic and needs a kernel that can take a scalar.
-            raise NotImplementedError(
-                f"mul {n.name}: scalar operand {scalar} on an fp16 op has no "
-                f"scale to fold into; mul_f16 needs two tensor inputs")
+            # arithmetic. mul_f16 needs two tensor inputs, so this goes to
+            # mul_scalar_f16 rather than materializing a constant the size
+            # of the scores buffer.
+            in_name = self._resolve_input(n.args[0])
+            out_name = n.name
+            self._record_tensor(out_name, dtype="f16")
+            self.ops.append({
+                "name": str(n.name), "op": "mul_scalar_f16",
+                "precision": "fp16",
+                "inputs": [in_name], "outputs": [out_name],
+                "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
+                "scalar": float(scalar),
+            })
+            return
         c = float(scalar)
         if not c > 0.0:
             # c <= 0 would have to negate or zero the payload, which an
@@ -1834,13 +1851,10 @@ class _ExportWalker:
         if gate_idx is not None:
             # Per-channel bias broadcast over NCHW -- GroupNormLN's beta.
             # Same shape as mul's SE gate, so it gets the matching kernel.
-            if q != "int8":
-                raise NotImplementedError(
-                    f"add {n.name}: channel-broadcast add is only lowered for "
-                    f"int8 (add_c1_s8); no add_c1_f16 kernel exists")
             gate_name, nchw_name = (a, b) if gate_idx == 0 else (b, a)
             rec = {
-                "name": str(n.name), "op": "add_c1_s8",
+                "name": str(n.name),
+                "op": f"add_c1{self._op_suffix_for(q)}",
                 "precision": q,
                 "inputs": [gate_name, nchw_name], "outputs": [out_name],
                 "shape": {
@@ -1848,13 +1862,14 @@ class _ExportWalker:
                     "C": int(nchw_shape[1]),
                     "HW": int(nchw_shape[2]) * int(nchw_shape[3]),
                 },
-                "quant": {
+            }
+            if q == "int8":
+                rec["quant"] = {
                     "scale_gate": self.scales.get(gate_name, 1e-8),
                     "scale_x":    self.scales.get(nchw_name, 1e-8),
                     "scale_out":  self.scales.get(out_name, 1e-8),
                     "activation_min": -128, "activation_max": 127,
-                },
-            }
+                }
             self.ops.append(rec)
             return
         tile_idx, outer, inner = self._tile_roles(sh_a, sh_b)
@@ -1862,23 +1877,22 @@ class _ExportWalker:
             # A trailing block repeated over the leading axes -- the shared
             # attention mask, (1,1,S,S) against (1,heads,S,S). add_s8 would
             # have walked `heads * S * S` elements of a buffer holding S*S.
-            if q != "int8":
-                raise NotImplementedError(
-                    f"add {n.name}: tiled-broadcast add is only lowered for "
-                    f"int8 (add_tile_s8); no add_tile_f16 kernel exists")
             tile_name, full_name = (a, b) if tile_idx == 0 else (b, a)
-            self.ops.append({
-                "name": str(n.name), "op": "add_tile_s8",
+            rec = {
+                "name": str(n.name),
+                "op": f"add_tile{self._op_suffix_for(q)}",
                 "precision": q,
                 "inputs": [tile_name, full_name], "outputs": [out_name],
                 "shape": {"OUTER": int(outer), "INNER": int(inner)},
-                "quant": {
+            }
+            if q == "int8":
+                rec["quant"] = {
                     "scale_tile": self.scales.get(tile_name, 1e-8),
                     "scale_x":    self.scales.get(full_name, 1e-8),
                     "scale_out":  self.scales.get(out_name, 1e-8),
                     "activation_min": -128, "activation_max": 127,
-                },
-            })
+                }
+            self.ops.append(rec)
             return
         self._require_no_broadcast(n, sh_a, sh_b,
                                    f"add{self._op_suffix_for(q)}", "add_c1")
@@ -2091,11 +2105,6 @@ class _ExportWalker:
     def _emit_permute(self, n, perm, in_shape):
         """Emit permute4_s8 for a reordering transpose/permute."""
         q = self._quant_for(n)
-        if q != "int8":
-            raise NotImplementedError(
-                f"{_op_name(n)} at {n.name} reorders {in_shape} by {perm}, "
-                f"which needs a copy; only permute4_s8 exists, so fp16 is "
-                f"not lowered")
         rank = len(in_shape)
         if rank > 4:
             raise NotImplementedError(
@@ -2110,25 +2119,29 @@ class _ExportWalker:
         self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
         # A permute moves data; it must not change the value, so the output
         # carries the input's scale rather than its own captured one (which
-        # calibration derives from the same numbers anyway).
+        # calibration derives from the same numbers anyway). fp16 has no
+        # scale to carry.
         scale_in = self.scales.get(in_name, 1e-8)
-        self.scales[out_name] = scale_in
-        if out_name in self.tensors_meta and \
-                isinstance(self.tensors_meta[out_name].get("quant"), dict):
-            self.tensors_meta[out_name]["quant"]["scale"] = scale_in
-        self.ops.append({
-            "name": str(n.name), "op": "permute4_s8",
+        if q == "int8":
+            self.scales[out_name] = scale_in
+            if out_name in self.tensors_meta and \
+                    isinstance(self.tensors_meta[out_name].get("quant"), dict):
+                self.tensors_meta[out_name]["quant"]["scale"] = scale_in
+        rec = {
+            "name": str(n.name), "op": f"permute4{self._op_suffix_for(q)}",
             "precision": q,
             "inputs": [in_name], "outputs": [out_name],
             "shape": {
                 "d0": dims[0], "d1": dims[1], "d2": dims[2], "d3": dims[3],
                 "p0": pperm[0], "p1": pperm[1], "p2": pperm[2], "p3": pperm[3],
             },
-            "quant": {
+        }
+        if q == "int8":
+            rec["quant"] = {
                 "scale_in": scale_in, "scale_out": scale_in,
                 "activation_min": -128, "activation_max": 127,
-            },
-        })
+            }
+        self.ops.append(rec)
 
     def _slice_changes_extent(self, n) -> bool:
         """True iff this slice/select actually drops elements.
