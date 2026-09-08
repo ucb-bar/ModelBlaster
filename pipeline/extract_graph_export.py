@@ -115,6 +115,19 @@ _ALIAS = {
     "clone.default",
 }
 
+def _perm_preserves_order(perm, shape) -> bool:
+    """True iff permuting `shape` by `perm` leaves the flat element order
+    unchanged, i.e. the permutation is a free alias.
+
+    Only axes of extent > 1 can reorder anything, so drop the unit axes and
+    check that what is left is still in ascending input order. (1,2,1,384)
+    with a (0,2,1,3) swap qualifies; (1,690,6,64) with the same swap does
+    not.
+    """
+    kept = [int(ax) for ax in perm if int(shape[int(ax)]) > 1]
+    return all(a < b for a, b in zip(kept, kept[1:]))
+
+
 # Eval-time / artifact no-ops. Skipped entirely.
 _NOOP = {
     "dropout.default",
@@ -275,6 +288,8 @@ class _ExportWalker:
         # Map from node-name → tensor-name. Aliases let multiple
         # node names resolve to the same logical tensor.
         self.name_map: dict[str, str] = {}
+        # transpose nodes folded into a matmul's transpose_b flag.
+        self.transpose_b_nodes: set[str] = set()
 
     # ------------------------------------------------------------------
     # Phase 1: run the model, capture every tensor's value distribution,
@@ -299,6 +314,30 @@ class _ExportWalker:
         per-op precision override map, falling back to default_quant."""
         name = n.name if hasattr(n, "name") else str(n)
         return self.op_precision.get(name, self.default_quant)
+
+    def _arg_shape(self, a):
+        """The shape this op's argument HAS AT THE ATEN CALL, not the shape
+        of the buffer it resolves to.
+
+        `_resolve_input` collapses view / reshape / transpose chains, so the
+        resolved tensor holds the same bytes under a different rank and
+        different dims. Any emitter that reads dimensions has to ask the
+        node, not the buffer: reading the buffer is what made Octo's
+        GroupNormLN normalize over its last 128 elements instead of its
+        16384-element group, and what hid a channel-broadcast multiply
+        behind a rank-3 view so it emitted a full-size elementwise mul.
+        Returns None when the shape is unknown.
+        """
+        if isinstance(a, torch.fx.Node):
+            if hasattr(a, "meta") and "val" in a.meta:
+                try:
+                    return tuple(int(x) for x in a.meta["val"].shape)
+                except (TypeError, ValueError):
+                    return None
+            nm = self.name_map.get(a.name, a.name)
+            if nm in self.tensors:
+                return tuple(int(x) for x in self.tensors[nm].shape)
+        return None
 
     def _dtype_for_quant(self, q: str) -> str:
         return "f16" if q == "fp16" else "i8"
@@ -574,6 +613,63 @@ class _ExportWalker:
             return [self._resolve_input(v) for v in val]
         return val
 
+    def _materialize_or_alias(self, n, src_name: str):
+        """Complete an alias pass-through, or materialize a broadcast.
+
+        Broadcasting alias ops (expand / expand_as / broadcast_to) change
+        the element count, so `name_map`-ing them to the source is wrong.
+        When the source is a constant buffer the expansion is free at
+        extract time -- store the expanded constant under this node's own
+        name and let consumers reference it directly. When it is an
+        activation there is nothing to fold it into, and a broadcast
+        kernel would be needed, so say so instead of emitting a graph
+        that reads out of bounds.
+        """
+        out_shape = None
+        if hasattr(n, "meta") and "val" in n.meta:
+            out_shape = tuple(int(x) for x in n.meta["val"].shape)
+        elif n.name in self.tensors:
+            out_shape = tuple(int(x) for x in self.tensors[n.name].shape)
+        src_shape = None
+        if src_name in self.tensors:
+            src_shape = tuple(int(x) for x in self.tensors[src_name].shape)
+        elif src_name in self.tensors_meta:
+            src_shape = tuple(int(x) for x in self.tensors_meta[src_name]["shape"])
+        if out_shape is None or src_shape is None \
+                or int(np.prod(out_shape)) == int(np.prod(src_shape)):
+            self.name_map[n.name] = src_name
+            return
+        kind = (self.tensors_meta.get(src_name, {})
+                .get("quant", {}) or {}).get("kind")
+        src_t = self.tensors.get(src_name)
+        if kind == "constant_buffer" and src_t is not None:
+            # Prefer the value the calibration capture recorded for this
+            # node: it is the actual result, so it covers every
+            # size-changing alias, not just broadcasts -- a `slice` of a
+            # constant is the other direction of the same bug (aliasing
+            # it happens to read the right bytes for a [0:k] slice and
+            # the wrong ones for any other start).
+            val = self.tensors.get(n.name)
+            if val is None or tuple(int(x) for x in val.shape) != out_shape:
+                try:
+                    val = src_t.expand(out_shape).contiguous()
+                except RuntimeError as e:
+                    raise NotImplementedError(
+                        f"extract_graph_export: {_op_name(n)} at {n.name} takes "
+                        f"constant {src_name} {src_shape} to {out_shape}, which "
+                        f"is neither an alias nor a broadcast ({e}); nothing "
+                        f"materialized it at extract time.") from e
+            # Under this node's own name, so nothing else that reads
+            # src_name is disturbed and no name_map entry is needed.
+            self._record_constant(n.name, val)
+            return
+        raise NotImplementedError(
+            f"extract_graph_export: {_op_name(n)} at {n.name} broadcasts "
+            f"{src_shape} -> {out_shape}, which is not an alias (the element "
+            f"count changes) and cannot be folded because {src_name} is an "
+            f"activation, not a constant. A broadcast kernel is needed, or "
+            f"the model can materialize the operand at full size.")
+
     def _record_constant(self, name: str, t):
         if not isinstance(t, torch.Tensor):
             return
@@ -649,9 +745,30 @@ class _ExportWalker:
             # would lose the (C_start, C_end) range info downstream,
             # and the cat would end up reading the full source buffer.
             # Emit a slice_c_s8 op instead.
-            if op_kind == "slice.Tensor" and self._is_channel_slice_used_by_cat(n):
+            if op_kind == "slice.Tensor" and (
+                    self._is_channel_slice_used_by_cat(n)
+                    or self._slice_changes_extent(n)):
                 self._emit_slice_c(n)
                 return
+            if op_kind == "select.int" and self._slice_changes_extent(n):
+                self._emit_slice_c(n)
+                return
+            if op_kind in ("transpose.int", "permute.default"):
+                perm = self._permutation_of(n)
+                in_shape = self._arg_shape(n.args[0])
+                if perm is not None and in_shape is not None \
+                        and not _perm_preserves_order(perm, in_shape):
+                    if self._is_matmul_b_transpose(n, perm, in_shape):
+                        # Q @ Kᵀ: the kernel can index B transposed, so the
+                        # 2.9 MB copy (x12 layers) is pure waste.
+                        self._record_tensor(n.name)
+                        src = self._resolve_input(n.args[0])
+                        if isinstance(src, str):
+                            self.name_map[n.name] = src
+                            self.transpose_b_nodes.add(n.name)
+                            return
+                    self._emit_permute(n, perm, in_shape)
+                    return
             # Pass-through: alias this node's name to its first tensor
             # input so downstream consumers resolve to the underlying
             # tensor.
@@ -667,7 +784,15 @@ class _ExportWalker:
                     src_name = resolved
                     break
             if src_name is not None:
-                self.name_map[n.name] = src_name
+                # An alias is only an alias if the element count is
+                # unchanged. `expand`/`expand_as`/`broadcast_to` are in
+                # the alias set but BROADCAST: aliasing one makes every
+                # downstream op read the small source buffer as if it
+                # held the expanded tensor. Octo's goal-image constant
+                # is (1,3,1,1).expand_as((2,3,256,256)), and the cat that
+                # consumes it then read 393216 elements out of a
+                # 3-element buffer.
+                self._materialize_or_alias(n, src_name)
             return
         if cls == "fold":
             # Walker fuses these into the preceding op; nothing emitted.
@@ -713,6 +838,9 @@ class _ExportWalker:
         op_kind = _op_name(n)
         if op_kind == "scaled_dot_product_attention.default":
             self._emit_sdpa_decomposed(n); return
+        if op_kind == "mul.Tensor" and isinstance(n.args[1], (int, float)) \
+                and not isinstance(n.args[1], bool):
+            self._fold_scalar_mul(n, n.args[1]); return
         kern_base = _NEW_COMPUTE[op_kind].removesuffix("_s8")
         kern_name = f"{kern_base}{self._op_suffix_for(self._quant_for(n))}"
         in_name = self._resolve_input(n.args[0])
@@ -754,17 +882,41 @@ class _ExportWalker:
                 raise NotImplementedError(
                     f"matmul {n.name}: need >=2-D shapes from export meta, "
                     f"got a={a_sh} b={b_sh}")
+            # Leading dims are batch (attention heads). matmul_s8 has no
+            # batch loop, so anything with more than one has to go to
+            # matmul_b_s8 -- otherwise 6 heads' worth of product collapses
+            # into one.
+            batch_a = int(np.prod(a_sh[:-2])) if len(a_sh) > 2 else 1
+            batch_b = int(np.prod(b_sh[:-2])) if len(b_sh) > 2 else 1
+            if batch_a != batch_b:
+                raise NotImplementedError(
+                    f"matmul {n.name}: batch dims {a_sh[:-2]} vs {b_sh[:-2]} "
+                    f"differ; broadcasting a batched matmul is not lowered")
+            # A transpose of B's last two axes is folded into the kernel's
+            # transpose_b flag rather than materialized (see
+            # _is_matmul_b_transpose).
+            tb = 1 if (isinstance(n.args[1], torch.fx.Node)
+                       and n.args[1].name in self.transpose_b_nodes) else 0
             rec["inputs"] = [in_name, b_in]
-            rec["shape"] = {"M": a_sh[-2], "K": a_sh[-1], "N": b_sh[-1]}
+            if batch_a > 1:
+                rec["op"] = f"matmul_b{self._op_suffix_for(op_q)}"
+                rec["shape"] = {"B": batch_a, "M": a_sh[-2], "K": a_sh[-1],
+                                "N": b_sh[-1]}
+            else:
+                rec["shape"] = {"M": a_sh[-2], "K": a_sh[-1], "N": b_sh[-1]}
             if not is_fp16:
                 rec["quant"] = {
                     "scale_a":   self.scales.get(in_name, 1e-8),
                     "scale_b":   self.scales.get(b_in, 1e-8),
                     "scale_out": self.scales.get(out_name, 1e-8),
-                    "transpose_b": 0,
+                    "transpose_b": tb,
                     "scale_div_sqrt_dk": 1.0,
                     "activation_min": -128, "activation_max": 127,
                 }
+            elif tb:
+                raise NotImplementedError(
+                    f"matmul {n.name}: transpose_b folding is only wired for "
+                    f"the int8 record shape")
             self.ops.append(rec)
             return
         if op_kind == "softmax.int":
@@ -779,12 +931,21 @@ class _ExportWalker:
                     f"last axis of {o_sh}; no transpose is emitted for this.")
             rec["shape"] = {"M": int(np.prod(o_sh[:-1])), "K": int(o_sh[-1])}
             if not is_fp16:
-                # Output is a probability in [0, 1]; 1/127 is the same
-                # fixed scale the SDPA decomposition assigns its weights.
-                self.scales[out_name] = 1.0 / 127.0
+                # The output is a probability, but NOT one that fills [0, 1]:
+                # over 690 keys a typical attention weight is ~1e-3, and the
+                # 1/127 scale the SDPA decomposition uses for its synthesized
+                # weights tensor (it has no captured values to measure) puts
+                # every one of them below half an LSB -- the whole attention
+                # row quantizes to zero. This branch has a real captured
+                # tensor, so use its calibrated scale and keep 1/127 only as
+                # the fallback.
+                sm_scale = float(self.scales.get(out_name, 0.0) or 0.0)
+                if not sm_scale > 0.0:
+                    sm_scale = 1.0 / 127.0
+                    self.scales[out_name] = sm_scale
                 rec["quant"] = {
                     "scale_in":  self.scales.get(in_name, 1e-8),
-                    "scale_out": 1.0 / 127.0,
+                    "scale_out": sm_scale,
                 }
             else:
                 rec["input_scale"] = 1.0
@@ -800,26 +961,23 @@ class _ExportWalker:
             # would read past the end of the gate buffer and produce
             # garbage. Switch to mul_c1_{f16,s8} when this shape pattern
             # is detected; otherwise keep the plain elementwise mul.
-            in_a_shape = self.tensors[in_name].shape if in_name in self.tensors else None
-            in_b_shape = self.tensors[b].shape if b in self.tensors else None
-            def _is_channel_gate(sh, nchw_shape):
-                if sh is None or nchw_shape is None or len(nchw_shape) != 4:
-                    return False
-                # Accept gate as either (B, C, 1, 1), (1, C, 1, 1), or just (C,).
-                if len(sh) == 4 and sh[0] in (1, nchw_shape[0]) and \
-                        sh[1] == nchw_shape[1] and sh[2] == 1 and sh[3] == 1:
-                    return True
-                if len(sh) == 1 and sh[0] == nchw_shape[1]:
-                    return True
-                return False
+            # Aten-level shapes: the buffers these resolve to may be views
+            # with a different rank, which is exactly what hid the
+            # channel-broadcast case below.
+            in_a_shape = self._arg_shape(n.args[0])
+            in_b_shape = self._arg_shape(n.args[1])
+            if in_a_shape is None and in_name in self.tensors:
+                in_a_shape = tuple(self.tensors[in_name].shape)
+            if in_b_shape is None and b in self.tensors:
+                in_b_shape = tuple(self.tensors[b].shape)
             gate_name = None
             nchw_name = None
             nchw_shape = None
-            if in_a_shape is not None and in_b_shape is not None:
-                if _is_channel_gate(in_a_shape, in_b_shape):
-                    gate_name, nchw_name, nchw_shape = in_name, b, in_b_shape
-                elif _is_channel_gate(in_b_shape, in_a_shape):
-                    gate_name, nchw_name, nchw_shape = b, in_name, in_a_shape
+            gate_idx, nchw_shape = self._channel_gate_roles(in_a_shape, in_b_shape)
+            if gate_idx == 0:
+                gate_name, nchw_name = in_name, b
+            elif gate_idx == 1:
+                gate_name, nchw_name = b, in_name
             if gate_name is not None:
                 # Rewrite this record to mul_c1_*.
                 N = int(nchw_shape[0])
@@ -835,13 +993,20 @@ class _ExportWalker:
                         "scale_out":  self.scales.get(out_name, 1e-8),
                         "activation_min": -128, "activation_max": 127,
                     }
-            elif not is_fp16:
-                rec["quant"] = {
-                    "scale_a":   self.scales.get(in_name, 1e-8),
-                    "scale_b":   self.scales.get(b, 1e-8),
-                    "scale_out": self.scales.get(out_name, 1e-8),
-                    "activation_min": -128, "activation_max": 127,
-                }
+            else:
+                # Plain elementwise: both operands must cover every output
+                # element. mul_s8 indexes both buffers with the same flat
+                # index, so a broadcast that is not the channel-gate case
+                # above would read past the end of the smaller one.
+                self._require_no_broadcast(n, in_a_shape, in_b_shape,
+                                           rec["op"], "mul_c1")
+                if not is_fp16:
+                    rec["quant"] = {
+                        "scale_a":   self.scales.get(in_name, 1e-8),
+                        "scale_b":   self.scales.get(b, 1e-8),
+                        "scale_out": self.scales.get(out_name, 1e-8),
+                        "activation_min": -128, "activation_max": 127,
+                    }
         elif op_kind == "layer_norm.default":
             # aten signature: layer_norm(input, normalized_shape, weight,
             # bias, eps). Pull gamma + beta refs via _resolve_input so
@@ -849,12 +1014,27 @@ class _ExportWalker:
             gamma = self._resolve_input(n.args[2]) if len(n.args) > 2 and n.args[2] is not None else None
             beta = self._resolve_input(n.args[3]) if len(n.args) > 3 and n.args[3] is not None else None
             eps = float(n.args[4]) if len(n.args) > 4 else 1e-5
-            in_shape = self.tensors[in_name].shape
-            # Flatten leading dims into M; last dim is K (LayerNorm normalizes
-            # over the last axis when normalized_shape == [K]).
-            K = int(in_shape[-1])
-            M = 1
-            for d in in_shape[:-1]: M *= int(d)
+            # K comes from normalized_shape (aten arg 1), NOT from the
+            # resolved input buffer's last dim. GroupNormLN reshapes
+            # (N,C,H,W) to (N,G,group_numel) and normalizes the group; the
+            # reshape is alias-collapsed, so the buffer's last dim is W and
+            # using it normalized 128 elements instead of 16384.
+            norm_shape = n.args[1] if len(n.args) > 1 else None
+            if norm_shape is None:
+                raise ValueError(
+                    f"layer_norm {n.name}: no normalized_shape in args")
+            if isinstance(norm_shape, int):
+                norm_shape = [norm_shape]
+            K = int(np.prod([int(d) for d in norm_shape]))
+            in_shape = self._arg_shape(n.args[0])
+            if in_shape is None:
+                in_shape = tuple(self.tensors[in_name].shape)
+            total = int(np.prod(in_shape))
+            if K <= 0 or total % K:
+                raise ValueError(
+                    f"layer_norm {n.name}: normalized_shape {tuple(norm_shape)} "
+                    f"(K={K}) does not divide the input {in_shape}")
+            M = total // K
             rec["shape"] = {"M": M, "K": K}
             if is_fp16:
                 rec["gamma_key"] = gamma
@@ -882,6 +1062,45 @@ class _ExportWalker:
         elif op_kind in ("sigmoid.default", "gelu.default"):
             rec["shape"] = {"n": int(np.prod(self.tensors[out_name].shape))}
         self.ops.append(rec)
+
+    def _fold_scalar_mul(self, n, scalar):
+        """`x * c` for a Python-scalar c: on int8 there is nothing to
+        compute. The product's int8 payload is bit-identical to x's --
+        only the scale moves (c*s_x) -- so this becomes a buffer alias
+        plus a scale-table update. Octo's attention needs it: the
+        hand-decomposed path scales the scores by 1/sqrt(d_head) as a
+        separate `mul` instead of hiding it inside SDPA, and mul_s8
+        has no scalar-operand form (a materialized constant tensor
+        would cost the full 2.7 MB of the scores buffer).
+
+        Rewriting x's scale in place is only sound because x feeds
+        nothing else, which is checked below; x's own emitted record
+        captured its scale_out by value, so its requantize is untouched
+        and does not saturate.
+        """
+        if self._quant_for(n) == "fp16":
+            # fp16 carries no scale to fold into, so the multiply is real
+            # arithmetic and needs a kernel that can take a scalar.
+            raise NotImplementedError(
+                f"mul {n.name}: scalar operand {scalar} on an fp16 op has no "
+                f"scale to fold into; mul_f16 needs two tensor inputs")
+        c = float(scalar)
+        if not c > 0.0:
+            # c <= 0 would have to negate or zero the payload, which an
+            # alias cannot express.
+            raise NotImplementedError(
+                f"mul {n.name}: scalar operand {c} must be positive to fold "
+                f"into the quantization scale")
+        in_name = self._resolve_input(n.args[0])
+        users = getattr(n.args[0], "users", None)
+        if users is not None and len(users) != 1:
+            raise NotImplementedError(
+                f"mul {n.name}: folding {c} into {in_name}'s scale would "
+                f"change it for all {len(users)} consumers of {in_name}, not "
+                f"just this one")
+        self._record_tensor(n.name)
+        self.name_map[n.name] = in_name
+        self.scales[in_name] = self.scales.get(in_name, 1e-8) * c
 
     def _emit_sdpa_decomposed(self, n):
         """SDPA(Q, K, V) → matmul(Q, Kᵀ)/√d → softmax → matmul(_, V)
@@ -1479,6 +1698,77 @@ class _ExportWalker:
             }
         self.ops.append(rec)
 
+    @staticmethod
+    def _channel_gate_roles(sh_a, sh_b):
+        """(gate_index, nchw_shape) when one operand is a per-channel gate
+        broadcast over an NCHW operand, else (None, None).
+
+        Accepts the gate as (B,C,1,1), (1,C,1,1) or (C,) -- the three forms
+        a `weight.view(1, -1, 1, 1)` or a bare parameter arrive in.
+        """
+        def is_gate(sh, nchw):
+            if sh is None or nchw is None or len(nchw) != 4:
+                return False
+            if len(sh) == 4 and sh[0] in (1, nchw[0]) and sh[1] == nchw[1] \
+                    and sh[2] == 1 and sh[3] == 1:
+                return True
+            return len(sh) == 1 and sh[0] == nchw[1]
+        if is_gate(sh_a, sh_b):
+            return 0, sh_b
+        if is_gate(sh_b, sh_a):
+            return 1, sh_a
+        return None, None
+
+    @staticmethod
+    def _tile_roles(sh_a, sh_b):
+        """(tile_index, OUTER, INNER) when one operand is the other's
+        trailing block repeated over leading axes, else (None, None, None).
+
+        This is the shape of a shared attention mask: scores are
+        (1, heads, S, S) and the mask is (1, 1, S, S), i.e. the same S*S
+        block for every head. Right-align the two shapes, take the longest
+        matching suffix, and require every earlier dim of the smaller
+        operand to be 1 -- that is exactly the condition for the smaller
+        buffer to be a contiguous block that repeats.
+        """
+        if sh_a is None or sh_b is None:
+            return None, None, None
+        na, nb = int(np.prod(sh_a)), int(np.prod(sh_b))
+        if na == nb:
+            return None, None, None
+        tile_idx, big, small = (1, sh_a, sh_b) if na > nb else (0, sh_b, sh_a)
+        k = 0
+        while k < len(small) and k < len(big) \
+                and int(small[len(small) - 1 - k]) == int(big[len(big) - 1 - k]):
+            k += 1
+        if k == 0:
+            return None, None, None
+        if any(int(d) != 1 for d in small[:len(small) - k]):
+            return None, None, None
+        inner = int(np.prod([int(d) for d in big[len(big) - k:]]))
+        outer = int(np.prod([int(d) for d in big[:len(big) - k]])) if len(big) > k else 1
+        if inner * outer != int(np.prod(big)) or inner != int(np.prod(small)):
+            return None, None, None
+        return tile_idx, outer, inner
+
+    @staticmethod
+    def _require_no_broadcast(n, sh_a, sh_b, op_name, gate_op):
+        """Reject a two-operand elementwise op whose operands differ in
+        element count. The kernels index both buffers with one flat index,
+        so a broadcast silently reads off the end of the smaller operand
+        instead of failing -- Octo's GroupNormLN affine (a length-C weight
+        against an N*C*H*W tensor) hit this."""
+        if sh_a is None or sh_b is None:
+            return
+        na, nb = int(np.prod(sh_a)), int(np.prod(sh_b))
+        if na == nb:
+            return
+        raise NotImplementedError(
+            f"extract_graph_export: {op_name} at {n.name} broadcasts "
+            f"{sh_a} against {sh_b}; {op_name} indexes both operands with the "
+            f"same flat index, so this would read past the end of the smaller "
+            f"one. Only the per-channel gate form ({gate_op}) is lowered.")
+
     def _emit_add(self, n):
         a = self._resolve_input(n.args[0])
         bv = n.args[1]
@@ -1490,6 +1780,60 @@ class _ExportWalker:
         out_name = n.name
         q = self._quant_for(n)
         self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
+        sh_a = self._arg_shape(n.args[0])
+        sh_b = self._arg_shape(bv)
+        gate_idx, nchw_shape = self._channel_gate_roles(sh_a, sh_b)
+        if gate_idx is not None:
+            # Per-channel bias broadcast over NCHW -- GroupNormLN's beta.
+            # Same shape as mul's SE gate, so it gets the matching kernel.
+            if q != "int8":
+                raise NotImplementedError(
+                    f"add {n.name}: channel-broadcast add is only lowered for "
+                    f"int8 (add_c1_s8); no add_c1_f16 kernel exists")
+            gate_name, nchw_name = (a, b) if gate_idx == 0 else (b, a)
+            rec = {
+                "name": str(n.name), "op": "add_c1_s8",
+                "precision": q,
+                "inputs": [gate_name, nchw_name], "outputs": [out_name],
+                "shape": {
+                    "N": int(nchw_shape[0]),
+                    "C": int(nchw_shape[1]),
+                    "HW": int(nchw_shape[2]) * int(nchw_shape[3]),
+                },
+                "quant": {
+                    "scale_gate": self.scales.get(gate_name, 1e-8),
+                    "scale_x":    self.scales.get(nchw_name, 1e-8),
+                    "scale_out":  self.scales.get(out_name, 1e-8),
+                    "activation_min": -128, "activation_max": 127,
+                },
+            }
+            self.ops.append(rec)
+            return
+        tile_idx, outer, inner = self._tile_roles(sh_a, sh_b)
+        if tile_idx is not None:
+            # A trailing block repeated over the leading axes -- the shared
+            # attention mask, (1,1,S,S) against (1,heads,S,S). add_s8 would
+            # have walked `heads * S * S` elements of a buffer holding S*S.
+            if q != "int8":
+                raise NotImplementedError(
+                    f"add {n.name}: tiled-broadcast add is only lowered for "
+                    f"int8 (add_tile_s8); no add_tile_f16 kernel exists")
+            tile_name, full_name = (a, b) if tile_idx == 0 else (b, a)
+            self.ops.append({
+                "name": str(n.name), "op": "add_tile_s8",
+                "precision": q,
+                "inputs": [tile_name, full_name], "outputs": [out_name],
+                "shape": {"OUTER": int(outer), "INNER": int(inner)},
+                "quant": {
+                    "scale_tile": self.scales.get(tile_name, 1e-8),
+                    "scale_x":    self.scales.get(full_name, 1e-8),
+                    "scale_out":  self.scales.get(out_name, 1e-8),
+                    "activation_min": -128, "activation_max": 127,
+                },
+            })
+            return
+        self._require_no_broadcast(n, sh_a, sh_b,
+                                   f"add{self._op_suffix_for(q)}", "add_c1")
         rec = {
             "name": str(n.name), "op": f"add{self._op_suffix_for(q)}",
             "precision": q,
@@ -1534,11 +1878,30 @@ class _ExportWalker:
                 return
         # Out shape (from captured forward pass; rank-correct).
         out_shape = list(self.tensors[out_name].shape)
-        # Reinterpret any non-4-D cat as 4-D NCHW (N=outer, C=cat-axis,
-        # H=1, W=inner) so the existing cat{2,3,4}_c1_s8 skeleton works
-        # without per-rank variants. The "axis" of the reinterpreted
-        # form is always the channel dim (index 1).
-        if len(out_shape) == 4:
+        # Reinterpret any cat that is not a 4-D channel cat as 4-D NCHW
+        # (N=outer, C=cat-axis, H=1, W=inner) so the existing
+        # cat{2,3,4}_c1_s8 skeleton works without per-rank variants. The
+        # "axis" of the reinterpreted form is always the channel dim
+        # (index 1).
+        #
+        # The dim==1 guard matters: the 4-D branch below hardcodes the
+        # cat axis as index 1 when it splits N/H/W, but reads the
+        # per-input extents from `dim`. Octo cats its token axis of a
+        # (batch, window, tokens, embed) tensor, i.e. rank 4 with dim=2,
+        # and the mismatch produced N=1,H=337,W=384 with c=[256,64,16,1]
+        # -- a stride of H*W=129408 for buffers whose real stride is 384,
+        # so the kernel read 33 MB past a 98 KB buffer. Everything but a
+        # rank-4 dim-1 cat goes through the general fold, which is
+        # equivalent for dim==1 (stride is H*W either way) and correct
+        # for the rest.
+        rank = len(out_shape)
+        if dim < 0:
+            dim += rank
+        if not 0 <= dim < rank:
+            raise ValueError(
+                f"cat {n.name}: dim={n.args[1] if len(n.args) > 1 else 0} is "
+                f"out of range for a rank-{rank} output {tuple(out_shape)}")
+        if rank == 4 and dim == 1:
             N = int(out_shape[0])
             H = int(out_shape[2])
             W = int(out_shape[3])
@@ -1567,15 +1930,49 @@ class _ExportWalker:
                     C_inputs.append(int(src[dim]))
                 else:
                     C_inputs.append(0)
+        # The cat kernels index every buffer as (N, C_i, H*W) with a
+        # shared H*W stride, so the reinterpretation is only valid if the
+        # element counts line up. Checking it here is the difference
+        # between a wrong (N,H,W) and a 33 MB out-of-bounds read inside
+        # kernel_cat4_c1_s8 -- which is how the rank-4 dim!=1 case above
+        # first showed up.
+        if sum(C_inputs) != C_total:
+            raise ValueError(
+                f"cat {n.name}: per-input extents {C_inputs} on dim {dim} sum "
+                f"to {sum(C_inputs)}, but the output has {C_total} there "
+                f"({tuple(out_shape)})")
+        if N * C_total * H * W != int(np.prod(out_shape)):
+            raise ValueError(
+                f"cat {n.name}: reinterpreted as N={N} C={C_total} H={H} W={W} "
+                f"({N * C_total * H * W} elements) but the output "
+                f"{tuple(out_shape)} has {int(np.prod(out_shape))}")
+        for nm, c_i in zip(names, C_inputs):
+            if nm not in self.tensors:
+                continue
+            have = int(np.prod(self.tensors[nm].shape))
+            if N * c_i * H * W != have:
+                raise ValueError(
+                    f"cat {n.name}: input {nm} would be read as N={N} "
+                    f"C={c_i} H={H} W={W} ({N * c_i * H * W} elements) but it "
+                    f"holds {have} ({tuple(self.tensors[nm].shape)})")
         # Use the 4-D channel-dim cat skeleton for both native-4-D and
         # reinterpreted cases — they share the same kernel signature.
         op_q = self._quant_for(n)
         op_suffix = self._op_suffix_for(op_q)
-        # Re-stamp output dtype to match op precision.
-        self.tensors_meta[out_name] = {
-            "shape": list(self.tensors[out_name].shape) if out_name in self.tensors else self.tensors_meta[out_name]["shape"],
-            "dtype": self._dtype_for_quant(op_q),
-        }
+        # Re-stamp output dtype to match op precision. Keep whatever else
+        # _record_tensor put there -- rebuilding the dict from scratch
+        # dropped the `quant` block, and with it the tensor's scale, for
+        # every cat output in the IR (which is what the --inspect header
+        # reads, so cat dumps came out as raw int8).
+        meta = dict(self.tensors_meta.get(out_name, {}))
+        meta["shape"] = (list(self.tensors[out_name].shape)
+                         if out_name in self.tensors
+                         else self.tensors_meta[out_name]["shape"])
+        meta["dtype"] = self._dtype_for_quant(op_q)
+        if op_q == "int8" and "quant" not in meta:
+            meta["quant"] = {"scale": self.scales.get(out_name, 1e-8),
+                             "zero_point": 0}
+        self.tensors_meta[out_name] = meta
         if n_inputs <= 4:
             op_kind = f"cat{n_inputs}_c1{op_suffix}"
         else:
@@ -1600,6 +1997,107 @@ class _ExportWalker:
         else:
             rec["dim"] = dim
         self.ops.append(rec)
+
+    def _permutation_of(self, n):
+        """The permutation this transpose/permute applies, as a tuple where
+        entry k is the input axis that becomes output axis k. None if it
+        cannot be determined."""
+        op_kind = _op_name(n)
+        rank = None
+        sh = self._arg_shape(n.args[0])
+        if sh is not None:
+            rank = len(sh)
+        if rank is None:
+            return None
+        if op_kind == "permute.default":
+            dims = list(n.args[1])
+            perm = [int(d) % rank for d in dims]
+            return tuple(perm) if len(perm) == rank else None
+        # transpose.int(self, dim0, dim1)
+        d0 = int(n.args[1]) % rank
+        d1 = int(n.args[2]) % rank
+        perm = list(range(rank))
+        perm[d0], perm[d1] = perm[d1], perm[d0]
+        return tuple(perm)
+
+    def _is_matmul_b_transpose(self, n, perm, in_shape) -> bool:
+        """True iff this node only swaps the last two axes AND every
+        consumer is a matmul that takes it as the B operand -- the case
+        matmul's `transpose_b` flag already covers."""
+        rank = len(in_shape)
+        if rank < 2:
+            return False
+        expect = tuple(list(range(rank - 2)) + [rank - 1, rank - 2])
+        if tuple(perm) != expect:
+            return False
+        users = list(getattr(n, "users", []) or [])
+        if not users:
+            return False
+        for u in users:
+            if _op_name(u) != "matmul.default":
+                return False
+            if len(u.args) < 2 or u.args[1] is not n:
+                return False
+        return True
+
+    def _emit_permute(self, n, perm, in_shape):
+        """Emit permute4_s8 for a reordering transpose/permute."""
+        q = self._quant_for(n)
+        if q != "int8":
+            raise NotImplementedError(
+                f"{_op_name(n)} at {n.name} reorders {in_shape} by {perm}, "
+                f"which needs a copy; only permute4_s8 exists, so fp16 is "
+                f"not lowered")
+        rank = len(in_shape)
+        if rank > 4:
+            raise NotImplementedError(
+                f"{_op_name(n)} at {n.name}: rank {rank} > 4; permute4_s8 "
+                f"takes four axes (pad with leading 1s for less)")
+        # Left-pad to rank 4 with unit axes, keeping the permutation.
+        pad = 4 - rank
+        dims = [1] * pad + [int(d) for d in in_shape]
+        pperm = list(range(pad)) + [int(px) + pad for px in perm]
+        in_name = self._resolve_input(n.args[0])
+        out_name = n.name
+        self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
+        # A permute moves data; it must not change the value, so the output
+        # carries the input's scale rather than its own captured one (which
+        # calibration derives from the same numbers anyway).
+        scale_in = self.scales.get(in_name, 1e-8)
+        self.scales[out_name] = scale_in
+        if out_name in self.tensors_meta and \
+                isinstance(self.tensors_meta[out_name].get("quant"), dict):
+            self.tensors_meta[out_name]["quant"]["scale"] = scale_in
+        self.ops.append({
+            "name": str(n.name), "op": "permute4_s8",
+            "precision": q,
+            "inputs": [in_name], "outputs": [out_name],
+            "shape": {
+                "d0": dims[0], "d1": dims[1], "d2": dims[2], "d3": dims[3],
+                "p0": pperm[0], "p1": pperm[1], "p2": pperm[2], "p3": pperm[3],
+            },
+            "quant": {
+                "scale_in": scale_in, "scale_out": scale_in,
+                "activation_min": -128, "activation_max": 127,
+            },
+        })
+
+    def _slice_changes_extent(self, n) -> bool:
+        """True iff this slice/select actually drops elements.
+
+        A full-span slice is a genuine no-op and stays an alias. One that
+        narrows an axis is not: aliasing it points consumers at the whole
+        source buffer, which happens to read the right bytes only when the
+        kept run is a contiguous prefix of the whole tensor. Octo's readout
+        slice -- one token out of 256 along dim 2 of (1,2,256,384) -- is
+        neither, so it has to be a copy.
+        """
+        src = n.args[0]
+        if not (hasattr(src, "meta") and "val" in src.meta
+                and hasattr(n, "meta") and "val" in n.meta):
+            return False
+        return int(np.prod(tuple(src.meta["val"].shape))) != \
+            int(np.prod(tuple(n.meta["val"].shape)))
 
     def _is_channel_slice_used_by_cat(self, n) -> bool:
         """True iff this slice.Tensor is a NCHW dim=1 slice whose output
@@ -1632,17 +2130,60 @@ class _ExportWalker:
         return False
 
     def _emit_slice_c(self, n):
-        """Channel-axis slice of NCHW: aten::slice(input, dim=1,
-        start, end). Emits a slice_c_{s8,f16} op record consuming
-        (C_end - C_start) channels. Precision follows _quant_for(n)."""
+        """Slice along one axis: aten::slice(input, dim, start, end, step).
+
+        Emits a slice_c_{s8,f16} record. The kernel indexes its buffers as
+        (N, C, H*W) with the slice on C, so any axis works by folding the
+        dims before `dim` into N and the dims after it into W -- which is
+        what Octo's readout slice needs: (1,2,256,384) taking one token
+        along dim 2. The rank-4 dim-1 case keeps its original (H, W) split
+        so existing models emit byte-identical calls (H*W is the only way
+        the kernel uses them).
+
+        Precision follows _quant_for(n).
+        """
         src = n.args[0]
         src_name = self._resolve_input(src)
-        C_start = int(n.args[2]) if len(n.args) > 2 else 0
-        C_end = int(n.args[3]) if len(n.args) > 3 else None
         src_shape = tuple(int(s) for s in src.meta['val'].shape)
-        IC, H, W = src_shape[1], src_shape[2], src_shape[3]
-        if C_end is None or C_end > IC:
-            C_end = IC
+        rank = len(src_shape)
+        dim = int(n.args[1]) if len(n.args) > 1 and n.args[1] is not None else 0
+        if dim < 0:
+            dim += rank
+        if not 0 <= dim < rank:
+            raise ValueError(
+                f"slice {n.name}: dim={n.args[1]} out of range for rank "
+                f"{rank} input {src_shape}")
+        IC = src_shape[dim]
+        if _op_name(n) == "select.int":
+            # select drops the axis instead of keeping a length-1 one, but
+            # the bytes it keeps are exactly a width-1 slice, so the same
+            # record covers it. Octo's readout is x[:, :, -1, :].
+            idx = int(n.args[2])
+            if idx < 0:
+                idx += IC
+            C_start, C_end = idx, idx + 1
+        else:
+            step = int(n.args[4]) if len(n.args) > 4 and n.args[4] is not None else 1
+            if step != 1:
+                raise NotImplementedError(
+                    f"slice {n.name}: step={step}; slice_c copies a contiguous "
+                    f"run along the axis, so only step 1 is expressible")
+            C_start = int(n.args[2]) if len(n.args) > 2 and n.args[2] is not None else 0
+            C_end = int(n.args[3]) if len(n.args) > 3 and n.args[3] is not None else IC
+        # aten allows negative indices and the int64 max sentinel for "end".
+        if C_start < 0:
+            C_start += IC
+        if C_end < 0:
+            C_end += IC
+        C_start = max(0, min(C_start, IC))
+        C_end = max(C_start, min(C_end, IC))
+        if rank == 4 and dim == 1:
+            H, W = src_shape[2], src_shape[3]
+            N = src_shape[0]
+        else:
+            N = int(np.prod(src_shape[:dim])) if dim else 1
+            H = 1
+            W = int(np.prod(src_shape[dim + 1:])) if dim + 1 < rank else 1
         out_name = n.name
         q = self._quant_for(n)
         self._record_tensor(out_name, dtype=self._dtype_for_quant(q))
@@ -1651,7 +2192,7 @@ class _ExportWalker:
             "precision": q,
             "inputs": [src_name], "outputs": [out_name],
             "shape": {
-                "N": int(src_shape[0]), "IC": int(IC),
+                "N": int(N), "IC": int(IC),
                 "C_start": int(C_start), "C_end": int(C_end),
                 "H": int(H), "W": int(W),
             },
