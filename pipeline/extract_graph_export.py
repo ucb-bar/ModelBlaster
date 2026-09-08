@@ -1139,6 +1139,37 @@ class _ExportWalker:
         else:
             head_dim_v = head_dim
         scale_div = math.sqrt(max(head_dim, 1))
+        # Leading dims are batch x heads. They used to be dropped entirely:
+        # the three records below described ONE L_q x L_k product, so a
+        # multi-head SDPA computed one head's worth of work over the wrong
+        # elements and every head but the first was never written.
+        batch = int(np.prod(q_shape[:-2])) if q_shape and len(q_shape) > 2 else 1
+        for other in (k_shape, v_shape):
+            other_batch = (int(np.prod(other[:-2]))
+                           if other and len(other) > 2 else 1)
+            if other_batch != batch:
+                raise NotImplementedError(
+                    f"sdpa {n.name}: Q batch {q_shape[:-2]} vs {other[:-2]}; "
+                    f"broadcasting the batch dims is not lowered")
+        # attn_mask is aten arg 3. The decomposition has no place to put it
+        # (softmax_s8 takes no mask), and silently dropping it turns a
+        # causal or block mask into full attention -- a wrong answer that
+        # looks entirely plausible. A model with a mask must spell the
+        # decomposition out itself, with the mask as an explicit add.
+        if len(n.args) > 3 and n.args[3] is not None:
+            raise NotImplementedError(
+                f"sdpa {n.name}: attn_mask is set, and the matmul + softmax "
+                f"decomposition cannot carry it (softmax_s8 has no mask "
+                f"input). Write the attention out as matmul / add / softmax / "
+                f"matmul in the model instead -- see models/octo_small.py "
+                f"MODELBLASTER_OCTO_ATTN=matmul.")
+        if len(n.args) > 4 and n.args[4]:
+            raise NotImplementedError(
+                f"sdpa {n.name}: dropout_p is set; only inference is lowered")
+        if len(n.args) > 5 and n.args[5]:
+            raise NotImplementedError(
+                f"sdpa {n.name}: is_causal=True is a mask, which this "
+                f"decomposition cannot carry (see the attn_mask message)")
         scores_name = f"{n.name}__scores"
         weights_name = f"{n.name}__weights"
         out_name = n.name
@@ -1149,22 +1180,31 @@ class _ExportWalker:
             # to scale 1/127.
             self.scales[scores_name] = self.scales.get(q, 1e-8) * scale_div
             self.scales[weights_name] = 1.0 / 127.0
+            # The buffers hold every batch/head slice, not just one.
             self.tensors_meta[scores_name] = {
-                "shape": [L_q, L_k], "dtype": "i8",
+                "shape": [batch, L_q, L_k] if batch > 1 else [L_q, L_k],
+                "dtype": "i8",
                 "quant": {"scale": self.scales[scores_name], "zero_point": 0},
             }
             self.tensors_meta[weights_name] = {
-                "shape": [L_q, L_k], "dtype": "i8",
+                "shape": [batch, L_q, L_k] if batch > 1 else [L_q, L_k],
+                "dtype": "i8",
                 "quant": {"scale": self.scales[weights_name], "zero_point": 0},
             }
         else:
             self.tensors_meta[scores_name] = {
-                "shape": [L_q, L_k], "dtype": "f16",
+                "shape": [batch, L_q, L_k] if batch > 1 else [L_q, L_k],
+                "dtype": "f16",
             }
             self.tensors_meta[weights_name] = {
-                "shape": [L_q, L_k], "dtype": "f16",
+                "shape": [batch, L_q, L_k] if batch > 1 else [L_q, L_k],
+                "dtype": "f16",
             }
         self._record_tensor(out_name)
+        if is_fp16 and batch > 1:
+            raise NotImplementedError(
+                f"sdpa {n.name}: {batch} batch/head slices, and there is no "
+                f"matmul_b_f16 to carry them (matmul_f16 has no batch loop)")
         if is_fp16:
             # matmul_tb_f16 = matmul with B transposed = Q · Kᵀ.
             # The 1/√d_k pre-softmax scale is folded into softmax_f16's
@@ -1186,10 +1226,17 @@ class _ExportWalker:
                 "shape": {"M": L_q, "K": L_k, "N": head_dim_v},
             })
             return
+        # batch == 1 keeps emitting matmul_s8, byte-identically to before.
+        mm = "matmul_s8" if batch == 1 else "matmul_b_s8"
+        def _mm_shape(m, k, n_):
+            sh = {"M": m, "K": k, "N": n_}
+            if batch > 1:
+                sh = {"B": batch, **sh}
+            return sh
         self.ops.append({
-            "name": f"{n.name}_qk", "op": "matmul_s8",
+            "name": f"{n.name}_qk", "op": mm,
             "inputs": [q, k], "outputs": [scores_name],
-            "shape": {"M": L_q, "K": head_dim, "N": L_k},
+            "shape": _mm_shape(L_q, head_dim, L_k),
             "quant": {
                 "scale_a":   self.scales.get(q, 1e-8),
                 "scale_b":   self.scales.get(k, 1e-8),
@@ -1201,17 +1248,18 @@ class _ExportWalker:
         })
         self.ops.append({
             "name": f"{n.name}_softmax", "op": "softmax_s8",
+            # softmax normalizes rows, so the batch just makes more rows.
             "inputs": [scores_name], "outputs": [weights_name],
-            "shape": {"M": L_q, "K": L_k},
+            "shape": {"M": batch * L_q, "K": L_k},
             "quant": {
                 "scale_in":  self.scales[scores_name],
                 "scale_out": self.scales[weights_name],
             },
         })
         self.ops.append({
-            "name": f"{n.name}_av", "op": "matmul_s8",
+            "name": f"{n.name}_av", "op": mm,
             "inputs": [weights_name, v], "outputs": [out_name],
-            "shape": {"M": L_q, "K": L_k, "N": head_dim_v},
+            "shape": _mm_shape(L_q, L_k, head_dim_v),
             "quant": {
                 "scale_a":   self.scales[weights_name],
                 "scale_b":   self.scales.get(v, 1e-8),
