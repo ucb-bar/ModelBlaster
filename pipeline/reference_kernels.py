@@ -284,6 +284,34 @@ def _bmm_f16_argtypes():
     return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
 
+def _permute4_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # input, output, d0..d3, p0..p3
+    return [h, h] + [ctypes.c_int] * 8
+
+
+def _add_tile_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # tile, x, output, OUTER, INNER
+    return [h, h, h, ctypes.c_int, ctypes.c_int]
+
+
+def _add_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # gate, x, output, N, C, HW
+    return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _mul_scalar_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # input, output, n, s
+    return [h, h, ctypes.c_int, ctypes.c_float]
+
+
 def _relu_argtypes():
     import ctypes
     fp = ctypes.POINTER(ctypes.c_float)
@@ -915,8 +943,230 @@ void kernel_bmm_f16(const _Float16 *A, const _Float16 *B,
         {"batch": 2, "M": 4,  "K": 8,  "N": 4},
         {"batch": 4, "M": 8,  "K": 16, "N": 8},
         {"batch": 1, "M": 32, "K": 32, "N": 32},
+        # octo-small's attention-weights @ V, per head.
+        {"batch": 6, "M": 64, "K": 64, "N": 64},
     ],
     argtypes_factory=_bmm_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="n_lanes",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh batched GEMM vectorized over N, fp32 accumulator.\n"
+                "B is stored [K, N], so the reference's inner k-loop strides B "
+                "by N -- the wrong axis to vectorize. Hold vl fp32 "
+                "accumulators for a strip of N instead, and for each k "
+                "broadcast the scalar A[m,k] against a UNIT-STRIDE fp16 load "
+                "of B[k, n:n+vl] with vfwmacc.vf. Every load is contiguous and "
+                "each output still accumulates over k in the reference's own "
+                "order, so this is BIT-EXACT rather than reduction-order "
+                "equivalent."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv_f16/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+BMM_TB_F16 = KernelSpec(
+    op="bmm_tb_f16",
+    signature=(
+        "void kernel_bmm_tb_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int batch, int M, int K, int N)"
+    ),
+    semantics=(
+        "Batched matrix multiply with B transposed, C[b] = A[b] @ B[b].T,\n"
+        "_Float16 storage:\n"
+        "  A: [batch, M, K],  B stored: [batch, N, K],  C: [batch, M, N]\n\n"
+        "Completes the {matmul, matmul_tb, bmm} set: this is the shape a\n"
+        "multi-head Q @ K.T lands in, and without it the transpose has to be\n"
+        "materialized (12 x 2.9 MB on octo-small). Accumulates in fp32 and\n"
+        "stores fp16, like every other _f16 matmul here."
+    ),
+    reference_impl="""\
+void kernel_bmm_tb_f16(const _Float16 *A, const _Float16 *B,
+                       _Float16 *C, int batch, int M, int K, int N) {
+    for (int b = 0; b < batch; b++) {
+        const _Float16 *Ab = A + (long)b * M * K;
+        const _Float16 *Bb = B + (long)b * N * K;
+        _Float16 *Cb = C + (long)b * M * N;
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (int k = 0; k < K; k++)
+                    acc += (float)Ab[m * K + k] * (float)Bb[n * K + k];
+                Cb[m * N + n] = (_Float16)acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"batch": 1, "M": 1, "K": 1, "N": 1},
+        {"batch": 2, "M": 4, "K": 8, "N": 4},
+        {"batch": 6, "M": 32, "K": 64, "N": 32},
+        # octo-small's Q @ K.T, per head (K = head_dim = 64).
+        {"batch": 6, "M": 64, "K": 64, "N": 64},
+    ],
+    argtypes_factory=_bmm_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="k_reduce",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh batched GEMM with B transposed, fp32 accumulator "
+                "via vfwmacc.\n"
+                "With B stored [N, K] both operands run contiguously along K, "
+                "so the K-reduction is the axis to vectorize: load vl fp16 "
+                "from A[m, k:] and vl from B[n, k:], vfwmacc into an fp32 "
+                "accumulator vector, then vfredusum to a scalar. Same shape "
+                "as linear_f16_widening, one batch level up. Divergence from "
+                "the reference is reduction ORDER only (a pairwise tree "
+                "instead of left-to-right); both accumulate in fp32, so the "
+                "worst case is ~1 ulp of fp16 at the final cast."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv_f16/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        ),
+    ],
+)
+
+
+PERMUTE4_F16 = KernelSpec(
+    op="permute4_f16",
+    signature=(
+        "void kernel_permute4_f16(const _Float16 *input, _Float16 *output, "
+        "int d0, int d1, int d2, int d3, int p0, int p1, int p2, int p3)"
+    ),
+    semantics=(
+        "Rank-4 axis permutation (copy, not a view):\n"
+        "  output[o0,o1,o2,o3] = input[i0,i1,i2,i3]  with i[p_k] = o_k\n"
+        "d0..d3 are the INPUT extents; p0..p3 is the permutation, so output\n"
+        "extent k is d[p_k]. Both buffers are contiguous row-major. fp16\n"
+        "counterpart of permute4_s8, with no requantize to do -- a permute\n"
+        "cannot change a value, only its position."
+    ),
+    reference_impl="""\
+void kernel_permute4_f16(const _Float16 *input, _Float16 *output,
+                         int d0, int d1, int d2, int d3,
+                         int p0, int p1, int p2, int p3) {
+    const int din[4] = { d0, d1, d2, d3 };
+    const int sin[4] = { d1*d2*d3, d2*d3, d3, 1 };
+    const int perm[4] = { p0, p1, p2, p3 };
+    int od[4], os[4];
+    for (int k = 0; k < 4; k++) { od[k] = din[perm[k]]; os[k] = sin[perm[k]]; }
+    int w = 0;
+    for (int o0 = 0; o0 < od[0]; o0++) {
+      for (int o1 = 0; o1 < od[1]; o1++) {
+        for (int o2 = 0; o2 < od[2]; o2++) {
+          const int base = o0*os[0] + o1*os[1] + o2*os[2];
+          for (int o3 = 0; o3 < od[3]; o3++) {
+            output[w++] = input[base + o3*os[3]];
+          }
+        }
+      }
+    }
+}
+""",
+    extra_shapes=[
+        {"d0": 1, "d1": 690, "d2": 6, "d3": 64,
+         "p0": 0, "p1": 2, "p2": 1, "p3": 3},
+        {"d0": 2, "d1": 512, "d2": 16, "d3": 16,
+         "p0": 0, "p1": 2, "p2": 3, "p3": 1},
+    ],
+    argtypes_factory=_permute4_f16_argtypes,
+)
+
+
+ADD_TILE_F16 = KernelSpec(
+    op="add_tile_f16",
+    signature=(
+        "void kernel_add_tile_f16(const _Float16 *tile, const _Float16 *x, "
+        "_Float16 *output, int OUTER, int INNER)"
+    ),
+    semantics=(
+        "Add of a repeated trailing block, _Float16 storage:\n"
+        "  output[o*INNER + i] = tile[i] + x[o*INNER + i]\n"
+        "for o in [0, OUTER) and i in [0, INNER). `tile` holds INNER elements\n"
+        "and is reused for every o -- a shared attention mask, (1,1,S,S)\n"
+        "added to (1,heads,S,S) scores. Sum taken in fp32, stored fp16."
+    ),
+    reference_impl="""\
+void kernel_add_tile_f16(const _Float16 *tile, const _Float16 *x,
+                         _Float16 *output, int OUTER, int INNER) {
+    for (int o = 0; o < OUTER; o++) {
+        const int base = o * INNER;
+        for (int i = 0; i < INNER; i++)
+            output[base + i] = (_Float16)((float)tile[i] + (float)x[base + i]);
+    }
+}
+""",
+    extra_shapes=[
+        {"OUTER": 6, "INNER": 64 * 64},
+        {"OUTER": 1, "INNER": 97},
+    ],
+    argtypes_factory=_add_tile_f16_argtypes,
+)
+
+
+ADD_C1_F16 = KernelSpec(
+    op="add_c1_f16",
+    signature=(
+        "void kernel_add_c1_f16(const _Float16 *gate, const _Float16 *x, "
+        "_Float16 *output, int N, int C, int HW)"
+    ),
+    semantics=(
+        "Channel-axis broadcast add, _Float16 storage:\n"
+        "  output[n, c, h, w] = gate[c] + x[n, c, h, w]\n"
+        "The additive counterpart of mul_c1_f16, for a per-channel bias (a\n"
+        "GroupNorm or GroupNormLN beta) against an NCHW activation. Sum taken\n"
+        "in fp32, stored fp16."
+    ),
+    reference_impl="""\
+void kernel_add_c1_f16(const _Float16 *gate, const _Float16 *x,
+                       _Float16 *output, int N, int C, int HW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            const float g = (float)gate[c];
+            const int base = (n*C + c)*HW;
+            for (int i = 0; i < HW; i++)
+                output[base + i] = (_Float16)(g + (float)x[base + i]);
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 2, "C": 32, "HW": 101},
+        {"N": 1, "C": 96, "HW": 64 * 64},
+    ],
+    argtypes_factory=_add_c1_f16_argtypes,
+)
+
+
+MUL_SCALAR_F16 = KernelSpec(
+    op="mul_scalar_f16",
+    signature=(
+        "void kernel_mul_scalar_f16(const _Float16 *input, "
+        "_Float16 *output, int n, float s)"
+    ),
+    semantics=(
+        "Elementwise multiply by a compile-time scalar, _Float16 storage:\n"
+        "  output[i] = input[i] * s\n"
+        "In int8 this is free -- a scalar multiply is a scale change and the\n"
+        "payload does not move -- but fp16 carries no scale, so the 1/sqrt(d)\n"
+        "in a hand-written attention is real arithmetic. Product taken in\n"
+        "fp32, stored fp16."
+    ),
+    reference_impl="""\
+void kernel_mul_scalar_f16(const _Float16 *input, _Float16 *output,
+                           int n, float s) {
+    for (int i = 0; i < n; i++)
+        output[i] = (_Float16)((float)input[i] * s);
+}
+""",
+    extra_shapes=[{"n": 2856600, "s": 0.125}, {"n": 97, "s": 2.0}],
+    argtypes_factory=_mul_scalar_f16_argtypes,
 )
 
 
@@ -5852,7 +6102,8 @@ LAYER_NORM_F16 = KernelSpec(
         "  sigma  = sqrt(var(input[m, :]) + eps)\n"
         "  output[m, k] = gamma[k] * (input[m, k] - mu) / sigma + beta[k]\n"
         "Mean/variance computed in fp32, applied + stored as _Float16. gamma\n"
-        "and beta are _Float16 buffers of length K."
+        "and beta are _Float16 buffers of length K, or NULL for the\n"
+        "affine-free form (gamma = 1, beta = 0)."
     ),
     reference_impl="""\
 #include <math.h>
@@ -5872,8 +6123,13 @@ void kernel_layer_norm_f16(const _Float16 *input, const _Float16 *gamma,
         float inv_sigma = 1.0f / sqrtf(var + eps);
         for (int k = 0; k < K; k++) {
             float v = (float)input[m*K + k];
-            float g = (float)gamma[k];
-            float b = (float)beta[k];
+            /* gamma / beta are optional: a GroupNorm expressed as
+             * reshape + layer_norm + per-channel affine calls
+             * F.layer_norm(x, shape, None, None, eps) and applies the
+             * affine as a separate mul_c1 + add_c1. The s8 kernel already
+             * accepted NULL here; this one dereferenced it. */
+            float g = gamma ? (float)gamma[k] : 1.0f;
+            float b = beta  ? (float)beta[k]  : 0.0f;
             output[m*K + k] = (_Float16)(g * (v - mean) * inv_sigma + b);
         }
     }
@@ -13337,6 +13593,11 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'matmul_tb_f16': MATMUL_TB_F16,
     'matmul_tatb_f16': MATMUL_TATB_F16,
     'bmm_f16': BMM_F16,
+    'bmm_tb_f16': BMM_TB_F16,
+    'permute4_f16': PERMUTE4_F16,
+    'add_tile_f16': ADD_TILE_F16,
+    'add_c1_f16': ADD_C1_F16,
+    'mul_scalar_f16': MUL_SCALAR_F16,
     'cast_i8_to_f16': CAST_I8_TO_F16,
     'cast_f16_to_i8': CAST_F16_TO_I8,
     'linear_f16': LINEAR_F16,
