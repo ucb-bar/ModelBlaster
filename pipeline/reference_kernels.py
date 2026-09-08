@@ -1076,6 +1076,23 @@ void kernel_permute4_f16(const _Float16 *input, _Float16 *output,
          "p0": 0, "p1": 2, "p2": 3, "p3": 1},
     ],
     argtypes_factory=_permute4_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="inner_vec",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh rank-4 permute, vectorized on the innermost output "
+                "axis. The store is always unit-stride because the output is "
+                "written in order; the load is vle16 when the permuted "
+                "innermost axis was already innermost in the input (the ViT "
+                "head split lands here) and vlse16 at stride os[3] otherwise "
+                "(NCHW->NHWC). BIT_EXACT by construction -- a permute moves "
+                "data and cannot change a value."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv_f16/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
@@ -6167,6 +6184,33 @@ void kernel_gelu_f16(const _Float16 *input, _Float16 *output, int n) {
 """,
     extra_shapes=[{"n": 17}, {"n": 1024}, {"n": 14336}],
     argtypes_factory=_pointwise_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="vec_tanh",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh tanh-GELU with a VECTORIZED tanh. V+Zvfh has no "
+                "vector transcendental, so the reference's per-element tanhf "
+                "call is the entire cost of this op. Use the exp identity "
+                "tanh(a) = 1 - 2/(exp(2a)+1) with a vectorized exp: "
+                "z = 2a*log2(e), n = rint(z), r = z - n, a degree-5 minimax "
+                "polynomial for 2^r on |r| <= 0.5, and 2^n built directly as "
+                "float bits ((n+127) << 23). Clamping `a` to +/-8 first "
+                "saturates the tails on its own -- exp(+/-16) already gives "
+                "|t| = 0.99999978 against tanh(8) = 0.99999977 -- so there "
+                "are no masks and no branches, and z stays inside +/-23.1 "
+                "where n+127 is always a normal exponent.\n"
+                "Measured against glibc tanhf over x in +/-30, inside the "
+                "full GELU expression and cast to fp16: tanh max|d| "
+                "1.64e-06, gelu fp16 max|d| 9.77e-04, against an fp16 verify "
+                "atol of 1e-2. Frequent 1-ulp fp16 differences are expected "
+                "and are not a defect: tanhf is not correctly rounded, so "
+                "the reference's own last bits move with the libm."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv_f16/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        ),
+    ],
 )
 
 
@@ -6221,6 +6265,31 @@ void kernel_softmax_f16(const _Float16 *input, _Float16 *output,
     extra_shapes=[{"M": 1, "K": 7, "input_scale": 1.0},
                   {"M": 7, "K": 7, "input_scale": 0.0883883476}],  # 1/√128
     argtypes_factory=_softmax_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="vec_pass13",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh row softmax with the two exactly-vectorizable "
+                "passes vectorized and the expf pass left scalar, because "
+                "V+Zvfh has no vector exp.\n"
+                "  pass 1 (row max): vfredmax over the fp16 row plus ONE "
+                "scalar multiply by input_scale. For input_scale >= 0 that "
+                "multiply is monotonic, so the max of the scaled values is "
+                "the scaled max of the values -- the same fp32 expression on "
+                "the same element, hence exact. Negative scale falls back to "
+                "the scalar loop.\n"
+                "  pass 3 (normalize): vfwcvt + vfmul.vf + vfncvt over the "
+                "fp16 values pass 2 stored, which is what the reference "
+                "re-reads. Exact.\n"
+                "Deliberately NOT a polynomial exp: that trades an "
+                "approximation in the op feeding every attention weight for "
+                "a speedup the two exact passes already partly deliver."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv_f16/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
 )
 
 
