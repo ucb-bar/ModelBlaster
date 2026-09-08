@@ -117,6 +117,16 @@ Shape / lowering knobs, same convention as the other models here:
                                removes the `cos`/`sin` ops, the only other pair
                                neither extractor covers. See
                                ScoreNet.cond_table.
+  MODELBLASTER_OCTO_MASK_NEG   default 10.0. Magnitude of the additive
+                               attention-mask bias in disallowed slots.
+                               Upstream flax uses finfo(float32).min; that
+                               value cannot be quantized alongside the logits
+                               (see the comment where mask_bias is built), so
+                               a finite magnitude is used instead. Trade-off:
+                               the value bounds both the residual weight on
+                               masked slots (exp(-mask_neg)) and the int8
+                               resolution of the real logits (mask_neg/127).
+
   MODELBLASTER_OCTO_CKPT       path to the converted PyTorch state_dict
                                (`experiments/octo_port/octo_small_torch.pt`).
                                WITHOUT IT THE WEIGHTS ARE RANDOM and every
@@ -174,6 +184,7 @@ def _cfg() -> dict:
     goal = os.environ.get("MODELBLASTER_OCTO_GOAL", "0") == "1"
     norm = os.environ.get("MODELBLASTER_OCTO_NORM", "1") == "1"
     time_mode = os.environ.get("MODELBLASTER_OCTO_TIME", "fourier")
+    mask_neg = float(os.environ.get("MODELBLASTER_OCTO_MASK_NEG", 10.0))
 
     if not 1 <= window <= MAX_HORIZON:
         raise ValueError(
@@ -200,12 +211,16 @@ def _cfg() -> dict:
     if time_mode not in ("fourier", "lut"):
         raise ValueError(
             f"MODELBLASTER_OCTO_TIME={time_mode!r} must be fourier or lut.")
+    if not mask_neg > 0.0:
+        raise ValueError(
+            f"MODELBLASTER_OCTO_MASK_NEG={mask_neg} must be positive; it is a "
+            f"magnitude and is negated to build the additive bias.")
 
     n_primary = (primary // 16) ** 2
     n_wrist = (wrist // 16) ** 2 if wrist else 0
     return dict(window=window, primary=primary, wrist=wrist, layers=layers,
                 part=part, gn=gn, attn=attn, goal=goal, norm=norm,
-                time_mode=time_mode,
+                time_mode=time_mode, mask_neg=mask_neg,
                 n_primary=n_primary, n_wrist=n_wrist)
 
 
@@ -580,7 +595,16 @@ class OctoBackbone(nn.Module):
         n_ts += [LANG_TOKENS, 1]                       # tiled language, readout
         readout_idx = len(n_ts) - 1
         mask = build_attention_mask([LANG_TOKENS], n_ts, w, readout_idx)
-        bias = np.where(mask, 0.0, np.finfo(np.float32).min).astype(np.float32)
+        # Disallowed slots get a FINITE negative bias, not finfo.min.
+        # finfo.min is what flax uses and is exact in float, but it is
+        # unrepresentable in int8: per-tensor calibration of this buffer
+        # picks scale = 3.4e38/127, the add's output scale follows it, and
+        # every real logit then quantizes to 0 -- softmax degenerates to
+        # uniform-over-unmasked. -mask_neg keeps the same "zero weight
+        # after softmax" semantics (exp(-32) = 1.3e-14 relative) while
+        # leaving the add's output scale at mask_neg/127, which is what
+        # bounds the surviving logits' resolution.
+        bias = np.where(mask, 0.0, -cfg["mask_neg"]).astype(np.float32)
         self.register_buffer("mask_bias",
                              torch.from_numpy(bias)[None, None], persistent=False)
         self.n_prefix = LANG_TOKENS
