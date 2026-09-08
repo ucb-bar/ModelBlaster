@@ -19,16 +19,27 @@
 #                 attention mask, and the reference sdpa kernel documents
 #                 itself as maskless. Octo's attention is masked.
 set -euo pipefail
-export MB_DRIFT_ATOL="${MB_DRIFT_ATOL:-2}"
+# MB_DRIFT_ATOL is in int8 LSBs, and it is the one knob that LOOSENS a
+# verify gate -- so it must not leak into the fp16 flow. Observed: with
+# QUANT=fp16 it took the curated-kernel verify atol from 0.01 to 2.0 on
+# outputs that span +/-2, i.e. it would have accepted any kernel at all.
+if [[ "${QUANT:-fp32}" == "int8" ]]; then
+    export MB_DRIFT_ATOL="${MB_DRIFT_ATOL:-2}"
+fi
 export EXTRACTOR="${EXTRACTOR:-export}"
 export MODELBLASTER_OCTO_GN="${MODELBLASTER_OCTO_GN:-layernorm}"
 export MODELBLASTER_OCTO_TIME="${MODELBLASTER_OCTO_TIME:-lut}"
 export MODELBLASTER_OCTO_NORM="${MODELBLASTER_OCTO_NORM:-0}"
 export MODELBLASTER_OCTO_ATTN="${MODELBLASTER_OCTO_ATTN:-matmul}"
-# Per-output-channel weight scales. 83 linears and 10 convs deep, a single
+# Per-output-channel weight scales. 85 linears and 10 convs deep, a single
 # scale per weight tensor is not enough: the fp32 reference and the int8
-# graph disagree on the whole output range without this.
-EXTRACT_EXTRA_ARGS="${EXTRACT_EXTRA_ARGS:---per-channel}"
+# graph disagree on the whole output range without this. int8 only -- fp16
+# carries no scales at all, so the flag has nothing to act on there.
+if [[ "${QUANT:-fp32}" == "int8" ]]; then
+    EXTRACT_EXTRA_ARGS="${EXTRACT_EXTRA_ARGS:---per-channel}"
+else
+    EXTRACT_EXTRA_ARGS="${EXTRACT_EXTRA_ARGS:-}"
+fi
 export EXTRACT_EXTRA_ARGS
 MODEL_NAME=octo_small
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -113,5 +124,8 @@ export MODELBLASTER_OCTO_SPLITFC="${MODELBLASTER_OCTO_SPLITFC:-1}"
 # tensors it is closer to "max of a 16 k draw" than to a real 99.99th
 # percentile -- which is why the neighbours are not monotonic. Re-tune it if
 # the calibration set changes.
-export MODELBLASTER_ACT_PERCENTILE="${MODELBLASTER_ACT_PERCENTILE:-99.99}"
+# int8 only: fp16 has no activation scales to clip.
+if [[ "${QUANT:-fp32}" == "int8" ]]; then
+    export MODELBLASTER_ACT_PERCENTILE="${MODELBLASTER_ACT_PERCENTILE:-99.99}"
+fi
 source "${REPO_ROOT}/examples/_run_lib.sh"
