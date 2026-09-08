@@ -113,7 +113,15 @@ int main(void)
      * spurious miscompute (correct on spike, wrong on FireSim; worse in
      * complex kernels with more in-flight stores). Same root cause + fix as the
      * ExecuTorch riscv_executor_runner fence. */
+#if defined(__riscv)
     __asm__ volatile("fence rw, rw" ::: "memory");
+#else
+    /* board native_sim/native/64 is this same harness built by the HOST
+     * compiler, where `fence rw, rw` is not an instruction and the whole
+     * build fails here. There is no vector store buffer to drain on x86;
+     * a compiler barrier is all the ordering that case needs. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
 
 #if MODELBLASTER_MASK_IRQ_DURING_RUN
     irq_unlock(mb_irq_key);
