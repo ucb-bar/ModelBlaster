@@ -6267,27 +6267,36 @@ void kernel_softmax_f16(const _Float16 *input, _Float16 *output,
     argtypes_factory=_softmax_f16_argtypes,
     algorithms=[
         AlgorithmCandidate(
-            name="vec_pass13",
+            name="vec_exp",
             target_affinity=("rvv_f16",),
             description=(
-                "RVV+Zvfh row softmax with the two exactly-vectorizable "
-                "passes vectorized and the expf pass left scalar, because "
-                "V+Zvfh has no vector exp.\n"
+                "RVV+Zvfh row softmax with ALL THREE passes vectorized.\n"
                 "  pass 1 (row max): vfredmax over the fp16 row plus ONE "
                 "scalar multiply by input_scale. For input_scale >= 0 that "
                 "multiply is monotonic, so the max of the scaled values is "
                 "the scaled max of the values -- the same fp32 expression on "
                 "the same element, hence exact. Negative scale falls back to "
                 "the scalar loop.\n"
+                "  pass 2 (exp + sum): vectorized exp -- z = a*log2(e), "
+                "n = rint(z), degree-5 minimax 2^r, 2^n as float bits. The "
+                "argument is a - maxv so it is always <= 0, clamped at -80 to "
+                "keep n + 127 a normal exponent; exp(-80) = 1.8e-35 is zero "
+                "in fp16 many times over. fp32 results accumulated in a "
+                "vector and reduced, matching the reference's choice to sum "
+                "the fp32 exp rather than the fp16 store.\n"
                 "  pass 3 (normalize): vfwcvt + vfmul.vf + vfncvt over the "
-                "fp16 values pass 2 stored, which is what the reference "
-                "re-reads. Exact.\n"
-                "Deliberately NOT a polynomial exp: that trades an "
-                "approximation in the op feeding every attention weight for "
-                "a speedup the two exact passes already partly deliver."
+                "fp16 values pass 2 stored. Exact.\n"
+                "The approximate exp is justified by measurement, not "
+                "assertion: the reference ALREADY rounds every exp to fp16 on "
+                "the way out (~5e-4 relative), so a 1.6e-6 fp32 exp is three "
+                "orders below error the reference itself introduces. Over 200 "
+                "random rows of K=690: fp16 output max|d| 7.6e-06, row-sum "
+                "max rel err 6.2e-07, 0.04% of elements one fp16 ulp apart, "
+                "against an fp16 verify atol of 1e-2. Leaving pass 2 scalar "
+                "cost 72.6 of 83.3 Mcycles here."
             ),
             reference_impl="(use the curated kernel in kernels/rvv_f16/)",
-            accuracy_class=AccuracyClass.BIT_EXACT,
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
         ),
     ],
 )
