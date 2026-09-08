@@ -3,6 +3,13 @@
 #
 # Caller responsibilities (set before sourcing/exec'ing this script):
 #   MODEL_NAME   the model identifier passed to extract_graph (--model)
+#   EXTRACTOR    "fx" (default, extract_graph) or "export"
+#                (extract_graph_export). Only set this when the model
+#                cannot be fx-traced -- see the export branch below.
+#   EXTRACT_EXTRA_ARGS  extra flags for the EXTRACTOR=export stage, e.g.
+#                "--per-channel" (per-output-channel weight scales) or
+#                "--inspect a,b,c" (runtime dumps for staged accuracy
+#                debugging). Word-split on purpose.
 #   REPO_ROOT    repo root path; the script cd's into it
 #
 # Optional env vars (with defaults applied here):
@@ -127,6 +134,20 @@ elif [[ -n "${BENCH_FILE:-}" ]]; then
         --bench-target-mb "${BENCH_TARGET_MB:-256}" \
         --bench-target-gflops "${BENCH_TARGET_GFLOPS:-0}" \
         --bench-max-elements "${BENCH_MAX_ELEMENTS:-0}"
+elif [[ "${EXTRACTOR:-fx}" == "export" ]]; then
+    # torch.export path. Some models cannot be traced by torch.fx at all:
+    # a ViT's head-splitting and learned position embeddings arrive as
+    # shape call_methods and get_attrs, which extract_graph rejects, so
+    # this is the only route for them rather than a preference. Takes no
+    # --fusion-target / --no-bn-folding: it does its own folding and
+    # records what fired in passes_applied.json.
+    # shellcheck disable=SC2086  # EXTRACT_EXTRA_ARGS is a deliberate word list
+    python -m modelblaster.pipeline.extract_graph_export \
+        --model "${MODEL_NAME}" \
+        --out-dir "${IR_DIR}" \
+        --quant "${QUANT}" \
+        --num-calibration "${NUM_CALIBRATION:-1}" \
+        ${EXTRACT_EXTRA_ARGS:-}
 else
     python -m modelblaster.pipeline.extract_graph \
         --model "${MODEL_NAME}" \
