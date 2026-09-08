@@ -1748,6 +1748,14 @@ def emit_model(ir: dict[str, Any], out_dir: str,
                 # at offset tile_idx * tile_n (M=1 typical).
                 tile_n = int(sh.get("N", 0))
                 elem_offset = tile_idx * tile_n
+            elif axis == "M" and op["op"] == "linear_s8":
+                # Output buffer shape [M, N]. An M-tile owns whole ROWS, so its
+                # slice is tile_offset_M complete rows of N elements -- contiguous,
+                # which is exactly why M is emittable where N is not. N here is the
+                # FULL output width: an M split does not narrow it.
+                off_m = int((op.get("split_from") or {}).get("tile_offset_M",
+                                                             tile_idx * int(sh.get("M", 0))))
+                elem_offset = off_m * int(sh.get("N", 0))
             else:
                 # Unknown split axis / op kind — leave offset 0; tile
                 # measurement will surface the verify FAIL clearly.
@@ -2443,7 +2451,19 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # this tile owns -- so use it rather than recomputing tile*tile_n
             # and risking a second source of truth.
             sf = op.get("split_from") or {}
-            if sf and "tile_offset_N" in sf:
+            if sf.get("axis") == "M" and "tile_offset_M" in sf:
+                # An M-tile computes rows [off_m, off_m + M_tile) of the output from
+                # the SAME rows of the input. Input is [M, K] row-major, so that is
+                # a contiguous block at off_m*K; the output pointer is already the
+                # aliased tile buffer (see the split-tile output alias above).
+                # Weight [N, K] and bias [N] are shared by every tile: an M split
+                # does not partition them, so they take no offset -- the one place
+                # this differs from the N path.
+                off_m = int(sf["tile_offset_M"])
+                in_off = off_m * int(sh.get("K", 0))
+                if in_off:
+                    in_ptr = f"({in_ptr} + {in_off})"
+            elif sf and "tile_offset_N" in sf:
                 if int(sh.get("M", 1)) != 1:
                     raise SystemExit(
                         f"{op.get('name')}: split_from axis=N with M="

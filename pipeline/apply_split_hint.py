@@ -69,8 +69,18 @@ def _ops_by_id(ops: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
 
 
 def _split_linear_s8(op: dict[str, Any], n_splits: int,
-                     network: str) -> list[dict[str, Any]]:
-    """Split a linear_s8 op along the N (output features) dim.
+                     network: str, axis: str = "N") -> list[dict[str, Any]]:
+    """Split a linear_s8 op along N (output features) or M (output rows).
+
+    WHY M EXISTS. The N path below is only emittable when M == 1. Output is
+    [M, N] row-major, so for M > 1 an N-tile is a STRIDED column slice while the
+    tiles address their slice with a flat element offset -- they would overlap and
+    write past the parent buffer, and `generate_skeleton` refuses to emit it. An
+    M-split has no such problem in the same layout: tile t owns output rows
+    [t*M/n, (t+1)*M/n), which is one contiguous block; its input rows are the
+    matching contiguous block of [M, K]; and weight [N, K] and bias [N] are shared
+    by every tile with no offset at all. That makes M the axis a batched linear can
+    actually be cut on, which is the case the ffn_block advice (M=128, N=1024) hits.
 
     Generates `n_splits` new ops, each computing rows [t*N/n, (t+1)*N/n)
     of the original output. Weight and bias slices share the source
@@ -83,7 +93,39 @@ def _split_linear_s8(op: dict[str, Any], n_splits: int,
     concat op.
     """
     shape = op["shape"]
+    if axis not in ("N", "M"):
+        raise SplitHintError(
+            f"{network}: linear_s8 split axis {axis!r} is not one of N, M")
+    if axis == "M":
+        M = int(shape.get("M", 1))
+        if M % n_splits != 0:
+            raise SplitHintError(
+                f"{network}: linear_s8 M={M} doesn't divide cleanly into "
+                f"{n_splits} tiles (need M % n_splits == 0)")
+        tile_m = M // n_splits
+        out_tensor = op["outputs"][0]
+        tiles_m: list[dict[str, Any]] = []
+        for t in range(n_splits):
+            tile = copy.deepcopy(op)
+            tile["shape"] = dict(shape)
+            tile["shape"]["M"] = tile_m
+            tile["outputs"] = [f"{out_tensor}.tile_{t}"]
+            tile["name"] = op["name"] + f".tile_{t}"
+            tile["split_from"] = {"op_id": op["dispatch_id"], "tile": t,
+                                  "n_splits": n_splits, "axis": "M",
+                                  "tile_m": tile_m,
+                                  "tile_offset_M": t * tile_m}
+            tiles_m.append(tile)
+        return tiles_m
     N = int(shape["N"])
+    if int(shape.get("M", 1)) != 1:
+        # Refuse here rather than emit a graph the skeleton will reject: the
+        # applier used to produce N-tiles for a batched linear happily, and the
+        # failure surfaced two stages later as a codegen SystemExit.
+        raise SplitHintError(
+            f"{network}: linear_s8 M={shape.get('M')} > 1 cannot be split along N "
+            f"(output [M, N] is row-major, so an N-tile is a strided column slice "
+            f"the flat tile offset cannot express). Split along M instead.")
     if N % n_splits != 0:
         raise SplitHintError(
             f"{network}: linear_s8 N={N} doesn't divide cleanly into "
@@ -295,6 +337,8 @@ def _register_tile_tensors(graph: dict[str, Any], op: dict[str, Any],
     # silently sent every fused conv down the linear branch and narrowed W.
     if axis == "OC" and len(tile_shape) >= 4:
         tile_shape[1] = tile_n   # NCHW: OC is dim 1
+    elif axis == "M" and len(tile_shape) >= 2:
+        tile_shape[0] = tile_n   # linear_s8 [M, N]: M is the first dim
     else:
         tile_shape[-1] = tile_n  # linear_s8: N is last dim
     for t in range(n_splits):
@@ -349,6 +393,9 @@ def apply_split_hint(graph: dict[str, Any],
     # Single-pass rewrite: walk in original order, replacing split ops
     # with their tile lists. Re-assign dispatch_ids contiguously after.
     target_ids = {s["op"]: int(s.get("n_splits", 2)) for s in split_ops}
+    # `axis` is optional in the contract; absent means the splitter's own default,
+    # which keeps every existing hint file valid.
+    target_axis = {s["op"]: s.get("axis") for s in split_ops if s.get("axis")}
     new_ops: list[dict[str, Any]] = []
     id_remap: dict[int, list[int]] = {}  # original -> [new tile ids]
     next_new_id = 0
@@ -360,7 +407,11 @@ def apply_split_hint(graph: dict[str, Any],
         if did in target_ids:
             n = target_ids[did]
             splitter = _SPLITTABLE[op["op"]]
-            tile_ops = splitter(op, n, network)
+            want_axis = target_axis.get(did)
+            if want_axis and op["op"] == "linear_s8":
+                tile_ops = splitter(op, n, network, want_axis)
+            else:
+                tile_ops = splitter(op, n, network)
             # Register the per-tile output tensors in the IR's tensors
             # dict so generate_skeleton can allocate per-tile buffers
             # (fixes "buf_<network>_<out>_tile_0 undeclared" build error).
@@ -373,7 +424,8 @@ def apply_split_hint(graph: dict[str, Any],
                 # `buf_<net>_<out>_tile_0` at link time.
                 sf0 = tile_ops[0].get("split_from") or {}
                 axis = sf0.get("axis", "N")
-                tile_n = int(sf0.get("tile_oc" if axis == "OC" else "tile_n", 0))
+                _width_key = {"OC": "tile_oc", "M": "tile_m"}.get(axis, "tile_n")
+                tile_n = int(sf0.get(_width_key, 0))
                 if tile_n > 0:
                     _register_tile_tensors(out, op, n, tile_n, axis)
             new_tile_ids: list[int] = []

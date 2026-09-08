@@ -45,7 +45,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from pipeline.apply_split_hint import apply_split_hint  # noqa: E402
+from pipeline.apply_split_hint import (  # noqa: E402
+    SplitHintError, apply_split_hint)
 from pipeline import generate_skeleton  # noqa: E402
 
 
@@ -173,21 +174,93 @@ class SplitLinearWeightOffset(unittest.TestCase):
 
 class SplitLinearRejectsUnsupportedShapes(unittest.TestCase):
 
-    def test_M_greater_than_one_is_refused_not_silently_wrong(self):
+    def test_M_greater_than_one_is_refused_by_the_applier(self):
         """M>1 makes an N-tile a STRIDED column slice, not a contiguous block.
 
         With M=4, N=64, 2 tiles the contiguous assumption has tile 0 writing
         [0,128) and tile 1 writing [32,160): they overlap, and tile 1 runs past
-        the parent buffer. Refusing is the only safe answer until strided tile
-        emission exists.
+        the parent buffer.
+
+        This used to be caught two stages later, by the codegen. The applier now
+        refuses at the source, because emitting IR that only the skeleton will
+        reject sends a hint down the loop's whole bridge->apply->gate chain before
+        anything says no -- and the loop then records "applier succeeded" for a
+        rewrite that cannot be built.
         """
         M, K, N = 4, 32, 64
-        g = apply_split_hint(
-            _linear_graph(M, K, N),
-            [{"op": 0, "n_splits": 2}])
+        with self.assertRaises(SplitHintError) as cm:
+            apply_split_hint(_linear_graph(M, K, N), [{"op": 0, "n_splits": 2}])
+        msg = str(cm.exception).lower()
+        self.assertIn("strided", msg)
+        self.assertIn("split along m", msg)
+
+    def test_codegen_still_refuses_a_handmade_N_tile_with_M_gt_1(self):
+        """Defense in depth: the codegen guard must stay, for hand-written hints.
+
+        The applier refusing first does not make the codegen check redundant --
+        a hint file can be written by hand (round_003/_manual_split_hint.json in
+        the decision-loop artifacts is exactly that), and the IR can be edited.
+        """
+        M, K, N = 4, 32, 64
+        g = _linear_graph(M, K, N)
+        # Build the N-tiles the applier now refuses to produce.
+        base = g["ops"][0]
+        tile_n = N // 2
+        tiles = []
+        for t in range(2):
+            tile = json.loads(json.dumps(base))
+            tile["shape"]["N"] = tile_n
+            tile["outputs"] = [f"y.tile_{t}"]
+            tile["name"] = f"lin0.tile_{t}"
+            tile["dispatch_id"] = t
+            tile["split_from"] = {"op_id": 0, "tile": t, "n_splits": 2,
+                                  "tile_n": tile_n, "tile_offset_N": t * tile_n}
+            tiles.append(tile)
+        g["ops"] = tiles
+        g["tensors"]["y.tile_0"] = {"shape": [M, tile_n], "dtype": "i8",
+                                    "quant": {"scale": 0.05, "zero_point": 0}}
+        g["tensors"]["y.tile_1"] = dict(g["tensors"]["y.tile_0"])
         with self.assertRaises(SystemExit) as cm:
             _emit(g, M, K, N)
         self.assertIn("strided", str(cm.exception).lower())
+
+
+class SplitLinearAlongM(unittest.TestCase):
+    """The axis a BATCHED linear can actually be cut on.
+
+    ffn_block's advice is a linear with M=128, N=1024 that overruns its 13.3 ms
+    slot. Along N it is unemittable (above); along M every tile owns whole output
+    rows, so the slice is contiguous, the input rows are contiguous, and the
+    weight is shared unsliced by every tile.
+    """
+
+    def test_tiles_offset_the_input_and_share_the_weight(self):
+        M, K, N, n = 4, 32, 64, 2
+        g = apply_split_hint(_linear_graph(M, K, N),
+                             [{"op": 0, "n_splits": n, "axis": "M"}])
+        # Shapes: M is narrowed, N is untouched.
+        for t, op in enumerate(g["ops"]):
+            self.assertEqual(op["shape"]["M"], M // n)
+            self.assertEqual(op["shape"]["N"], N)
+            self.assertEqual(op["split_from"]["axis"], "M")
+            self.assertEqual(op["split_from"]["tile_offset_M"], t * (M // n))
+
+        calls = _linear_calls(_emit(g, M, K, N))
+        self.assertEqual(len(calls), n)
+        tile_m = M // n
+        # Tile 1 reads its own input rows: offset tile_m*K into [M, K].
+        self.assertIn(f"+ {tile_m * K}", calls[1],
+                      f"tile 1 must offset the INPUT pointer by {tile_m*K} "
+                      f"(tile_M * K).\ncall was: {calls[1]}")
+        # And it must NOT offset the weight: an M split does not partition [N, K].
+        self.assertNotIn("weight_q + ", calls[1].replace("weight_q + 0", ""),
+                         f"an M-split tile must share the full weight; "
+                         f"call was: {calls[1]}")
+
+    def test_M_that_does_not_divide_is_refused(self):
+        with self.assertRaises(SplitHintError):
+            apply_split_hint(_linear_graph(3, 32, 64),
+                             [{"op": 0, "n_splits": 2, "axis": "M"}])
 
 
 def _conv_graph(N, IC, IH, IW, OC, KH, KW):
