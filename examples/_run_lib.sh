@@ -476,6 +476,13 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
     )
+    # PIN_HART: which hart main() pins to. Default (unset) keeps the
+    # harness's own default of 1, which is right for the dual bitstreams.
+    # The quad-hetero bitstream needs 2 or 3 for any vector backend --
+    # harts 0,1 have Gemmini and no V there.
+    if [[ -n "${PIN_HART:-}" ]]; then
+        WEST_BUILD_EXTRA+=(-DMODELBLASTER_PIN_HART="${PIN_HART}")
+    fi
 elif [[ "${RUNNER}" == "spike" && "${ET_SMP:-0}" != "1" ]]; then
     # Default spike to a 1-core, 1-thread INLINE pthreadpool (+ unbuffered HTIF for
     # live markers). The harness prj.conf is MP_MAX_NUM_CPUS=4, which on spike is

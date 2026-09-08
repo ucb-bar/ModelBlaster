@@ -111,6 +111,24 @@ if(DEFINED MODELBLASTER_KERNEL_CFLAGS AND NOT "${MODELBLASTER_KERNEL_CFLAGS}" ST
     message(STATUS "modelblaster harness kernel cflags=${MODELBLASTER_KERNEL_CFLAGS}")
 endif()
 
+# Which hart main() pins itself to when this is an SMP + vector build. The
+# default of 1 is right for the dual bitstreams, where hart 0 boots without
+# vector hardware and hart 1 has Saturn. It is WRONG for
+# f2_quad_hetero_norose_tacit_q31_60mhz: there the tiles physically differ --
+# harts 0,1 are Rocket + Q0.31 Gemmini with NO vector, harts 2,3 are Rocket +
+# Saturn with NO Gemmini (see backends/firesim_chipyard_quad_hetero_q31.conf)
+# -- so a vector kernel pinned to hart 1 takes an illegal-instruction trap on
+# its first vsetvli. Pass -DMODELBLASTER_PIN_HART=2 for that bitstream.
+#
+# The XPU-RT harness places workers per kind from the schedule and does not
+# need this; it is the single-model harness that had the hart hardcoded.
+if(DEFINED MODELBLASTER_PIN_HART)
+    target_compile_definitions(app PRIVATE
+        MODELBLASTER_PIN_HART=${MODELBLASTER_PIN_HART})
+    message(STATUS "modelblaster harness: pinning main() to hart "
+                   "${MODELBLASTER_PIN_HART}")
+endif()
+
 # Opt-in: TACIT / L-Trace of just the model inference (brackets run_model with
 # the encoder start/stop). Pass -DMB_TACIT_TRACE_MODEL=1 and run on the
 # TACIT-enabled spike with `--trace=l`. See samples/tacit/TACIT_TRACING.md.
