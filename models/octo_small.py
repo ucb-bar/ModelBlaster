@@ -97,6 +97,26 @@ Shape / lowering knobs, same convention as the other models here:
                                half of the stem input is the constant -1.0
                                that upstream's zero-fill normalises to). 1 adds
                                goal_primary/goal_wrist forward inputs.
+  MODELBLASTER_OCTO_NORM       default 1: the /127.5 - 1 image normalisation
+                               is in the graph, as it is upstream. 0 expects
+                               input already in [-1, 1] (what a camera driver
+                               or the harness would hand you) and removes the
+                               `div` + `sub` nodes -- `sub` being one of only
+                               two op kinds in this port that the export
+                               extractor does not know.
+                               NOTE the normalisation canNOT be folded into
+                               conv0's weights: the scale folds cleanly but the
+                               -1 shift does not, for the same zero-padding
+                               reason the goal-channel fold fails (see
+                               ImageTokenizer).
+  MODELBLASTER_OCTO_TIME       default "fourier" (faithful: the score net takes
+                               the raw timestep and runs FourierFeatures + the
+                               cond MLP). "lut" makes it take the precomputed
+                               32-d conditioning vector instead, which the host
+                               looks up from a 20x32 table -- exact, and it
+                               removes the `cos`/`sin` ops, the only other pair
+                               neither extractor covers. See
+                               ScoreNet.cond_table.
   MODELBLASTER_OCTO_CKPT       path to the converted PyTorch state_dict
                                (`experiments/octo_port/octo_small_torch.pt`).
                                WITHOUT IT THE WEIGHTS ARE RANDOM and every
@@ -152,6 +172,8 @@ def _cfg() -> dict:
     gn = os.environ.get("MODELBLASTER_OCTO_GN", "native")
     attn = os.environ.get("MODELBLASTER_OCTO_ATTN", "sdpa")
     goal = os.environ.get("MODELBLASTER_OCTO_GOAL", "0") == "1"
+    norm = os.environ.get("MODELBLASTER_OCTO_NORM", "1") == "1"
+    time_mode = os.environ.get("MODELBLASTER_OCTO_TIME", "fourier")
 
     if not 1 <= window <= MAX_HORIZON:
         raise ValueError(
@@ -175,11 +197,15 @@ def _cfg() -> dict:
         raise ValueError(f"MODELBLASTER_OCTO_GN={gn!r} must be native or layernorm.")
     if attn not in ("sdpa", "matmul"):
         raise ValueError(f"MODELBLASTER_OCTO_ATTN={attn!r} must be sdpa or matmul.")
+    if time_mode not in ("fourier", "lut"):
+        raise ValueError(
+            f"MODELBLASTER_OCTO_TIME={time_mode!r} must be fourier or lut.")
 
     n_primary = (primary // 16) ** 2
     n_wrist = (wrist // 16) ** 2 if wrist else 0
     return dict(window=window, primary=primary, wrist=wrist, layers=layers,
-                part=part, gn=gn, attn=attn, goal=goal,
+                part=part, gn=gn, attn=attn, goal=goal, norm=norm,
+                time_mode=time_mode,
                 n_primary=n_primary, n_wrist=n_wrist)
 
 
@@ -294,11 +320,13 @@ class ImageTokenizer(nn.Module):
     offset on a border. `validate.py` check [2] pins this down.
     """
 
-    def __init__(self, resolution: int, window: int, gn_mode: str, goal: bool):
+    def __init__(self, resolution: int, window: int, gn_mode: str, goal: bool,
+                 normalize: bool = True):
         super().__init__()
         self.resolution = resolution
         self.window = window
         self.goal = goal
+        self.normalize = normalize
         self.stem = SmallStem16(6, resolution, gn_mode)
         self.num_tokens = self.stem.num_tokens
         if not goal:
@@ -308,13 +336,20 @@ class ImageTokenizer(nn.Module):
 
     def forward(self, images: torch.Tensor,
                 goal: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """images (B, W, 3, R, R) in [0, 255] -> (B, W, num_tokens, 512)."""
+        """images (B, W, 3, R, R) -> (B, W, num_tokens, 512).
+
+        In [0, 255] when `normalize` (the default); already in [-1, 1] when
+        `MODELBLASTER_OCTO_NORM=0`, which is the deployment-realistic form --
+        a camera driver or the harness does the scaling -- and which removes
+        the `div`/`sub` nodes from the graph.
+        """
         x = images.reshape(-1, 3, self.resolution, self.resolution)
-        x = x / 127.5 - 1.0
+        if self.normalize:
+            x = x / 127.5 - 1.0
         if self.goal:
             if goal is None:
                 raise ValueError("MODELBLASTER_OCTO_GOAL=1 but no goal image passed")
-            g = goal / 127.5 - 1.0
+            g = goal / 127.5 - 1.0 if self.normalize else goal
             # upstream: task_inputs[:, None].repeat(horizon, axis=1). Written as
             # a cat of a static number of copies rather than `expand`/`repeat`,
             # neither of which is in the export extractor's alias set.
@@ -519,13 +554,15 @@ class OctoBackbone(nn.Module):
         self.window = w
         self.use_wrist = cfg["wrist"] > 0
 
-        self.tok_primary = ImageTokenizer(cfg["primary"], w, cfg["gn"], cfg["goal"])
+        self.tok_primary = ImageTokenizer(cfg["primary"], w, cfg["gn"],
+                                          cfg["goal"], cfg["norm"])
         self.proj_primary = nn.Linear(STEM_NUM_FEATURES, EMBED_DIM)
         self.pos_primary = nn.Parameter(
             torch.zeros(1, MAX_HORIZON, self.tok_primary.num_tokens, EMBED_DIM))
 
         if self.use_wrist:
-            self.tok_wrist = ImageTokenizer(cfg["wrist"], w, cfg["gn"], cfg["goal"])
+            self.tok_wrist = ImageTokenizer(cfg["wrist"], w, cfg["gn"],
+                                            cfg["goal"], cfg["norm"])
             self.proj_wrist = nn.Linear(STEM_NUM_FEATURES, EMBED_DIM)
             self.pos_wrist = nn.Parameter(
                 torch.zeros(1, MAX_HORIZON, self.tok_wrist.num_tokens, EMBED_DIM))
@@ -550,11 +587,21 @@ class OctoBackbone(nn.Module):
         self.n_per_step = sum(n_ts)
         self.total_tokens = self.n_prefix + self.n_per_step * w
 
-    def forward(self, img_primary: torch.Tensor,
-                img_wrist: Optional[torch.Tensor] = None,
-                lang: Optional[torch.Tensor] = None,
-                goal_primary: Optional[torch.Tensor] = None,
-                goal_wrist: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, *args, **kwargs):
+        """Eager-mode entry point.
+
+        Delegates to `_run`. NOTE: do not trace THIS -- `*args` collapses to a
+        single fx placeholder holding an immutable_list. `get_model()` replaces
+        `__class__` with a `_traceable(...)` subclass whose `forward` has one
+        explicit parameter per real input; that is what the extractors see.
+        """
+        return self._run(*args, **kwargs)
+
+    def _run(self, img_primary: torch.Tensor,
+             img_wrist: Optional[torch.Tensor] = None,
+             lang: Optional[torch.Tensor] = None,
+             goal_primary: Optional[torch.Tensor] = None,
+             goal_wrist: Optional[torch.Tensor] = None) -> torch.Tensor:
         w = self.window
 
         # --- task prefix: language ------------------------------------------
@@ -655,8 +702,9 @@ class ScoreNet(nn.Module):
     checkpoint's `reverse_network/Dense_0/kernel [444, 256]`.
     """
 
-    def __init__(self, obs_dim: int = EMBED_DIM):
+    def __init__(self, obs_dim: int = EMBED_DIM, time_mode: str = "fourier"):
         super().__init__()
+        self.time_mode = time_mode
         self.time_preprocess = FourierFeatures(TIME_DIM)
         # cond_encoder = MLP((2*time_dim, time_dim)); activate_final=False and
         # use_layer_norm defaults False, so swish goes between the two Denses
@@ -671,15 +719,45 @@ class ScoreNet(nn.Module):
             [MLPResNetBlock(SCORE_HIDDEN) for _ in range(SCORE_BLOCKS)])
         self.fc_out = nn.Linear(SCORE_HIDDEN, self.action_flat)
 
-    def forward(self, obs_enc: torch.Tensor, noisy_actions: torch.Tensor,
-                t: torch.Tensor) -> torch.Tensor:
-        c = self.time_preprocess(t)
-        c = self.cond2(_swish(self.cond1(c)))
+    def forward(self, *args, **kwargs):
+        """Eager-mode entry point; see OctoBackbone.forward."""
+        return self._run(*args, **kwargs)
+
+    def _run(self, obs_enc: torch.Tensor, noisy_actions: torch.Tensor,
+             t: torch.Tensor) -> torch.Tensor:
+        """`t` is the raw timestep (B, W, 1) in "fourier" mode, or the
+        precomputed 32-d conditioning vector (B, W, 32) in "lut" mode."""
+        if self.time_mode == "lut":
+            c = t
+        else:
+            c = self.cond_embed(t)
         x = torch.cat([c, obs_enc, noisy_actions], dim=-1)
         x = self.fc_in(x)
         for blk in self.blocks:
             x = blk(x)
         return self.fc_out(_swish(x))
+
+    def cond_embed(self, t: torch.Tensor) -> torch.Tensor:
+        """FourierFeatures + cond_encoder: raw timestep -> 32-d conditioning."""
+        return self.cond2(_swish(self.cond1(self.time_preprocess(t))))
+
+    @torch.no_grad()
+    def cond_table(self, steps: int = DIFFUSION_STEPS) -> torch.Tensor:
+        """The whole time-conditioning branch, precomputed: (steps, 32).
+
+        `cond_embed` is a frozen function of the timestep alone, and DDPM
+        sampling visits exactly `diffusion_steps` = 20 integer timesteps. So
+        the entire branch -- FourierFeatures (cos/sin) plus a two-layer MLP
+        with a swish -- collapses to a 20x32 lookup the host computes once at
+        init. Exact for integer t in [0, steps).
+
+        Same argument as not porting T5 (NOTES.md 7): a frozen function of a
+        fixed, small input set is a constant, not compute. It also removes the
+        only two ops in the whole port that neither extractor knows (`cos`,
+        `sin`), which is why `MODELBLASTER_OCTO_TIME=lut` exists.
+        """
+        t = torch.arange(steps, dtype=torch.float32).reshape(steps, 1, 1)
+        return self.cond_embed(t).reshape(steps, TIME_DIM)
 
 
 def cosine_beta_schedule(timesteps: int = DIFFUSION_STEPS,
@@ -709,7 +787,7 @@ class OctoSmall(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.backbone = OctoBackbone(cfg)
-        self.score = ScoreNet(EMBED_DIM)
+        self.score = ScoreNet(EMBED_DIM, cfg["time_mode"])
         betas = cosine_beta_schedule(DIFFUSION_STEPS)
         alphas = 1.0 - betas
         self.register_buffer("betas", torch.tensor(betas, dtype=torch.float32),
@@ -720,19 +798,26 @@ class OctoSmall(nn.Module):
                              torch.tensor(np.cumprod(alphas), dtype=torch.float32),
                              persistent=False)
 
-    def forward(self, *args):
-        part = self.cfg["part"]
-        if part == "backbone":
-            return self.backbone(*args)
-        if part == "score":
-            return self.score(*args)
-        if self.cfg["goal"]:
-            img_p, img_w, lang, goal_p, goal_w, noisy, t = args
-            emb = self.backbone(img_p, img_w, lang, goal_p, goal_w)
-        else:
-            img_p, img_w, lang, noisy, t = args
-            emb = self.backbone(img_p, img_w, lang)
-        return self.score(emb, noisy, t)
+    def forward(self, *args, **kwargs):
+        """Eager-mode entry point.
+
+        Delegates to `_run`. NOTE: do not trace THIS -- `*args` collapses to a
+        single fx placeholder holding an immutable_list. `get_model()` replaces
+        `__class__` with a `_traceable(...)` subclass whose `forward` has one
+        explicit parameter per real input; that is what the extractors see.
+        """
+        return self._run(*args, **kwargs)
+
+    def _run(self, img_primary: torch.Tensor,
+             img_wrist: Optional[torch.Tensor] = None,
+             lang: Optional[torch.Tensor] = None,
+             noisy_actions: Optional[torch.Tensor] = None,
+             t: Optional[torch.Tensor] = None,
+             goal_primary: Optional[torch.Tensor] = None,
+             goal_wrist: Optional[torch.Tensor] = None) -> torch.Tensor:
+        emb = self.backbone._run(img_primary, img_wrist, lang,
+                                 goal_primary, goal_wrist)
+        return self.score(emb, noisy_actions, t)
 
     # -- not traced -------------------------------------------------------
     @torch.no_grad()
@@ -755,8 +840,13 @@ class OctoSmall(nn.Module):
         7 action dims.
         """
         x = noise
+        lut = (self.score.cond_table() if self.score.time_mode == "lut"
+               else None)
         for i, time in enumerate(range(DIFFUSION_STEPS - 1, -1, -1)):
-            t = torch.full(x.shape[:-1] + (1,), float(time), dtype=x.dtype)
+            if lut is not None:
+                t = lut[time].expand(x.shape[:-1] + (TIME_DIM,))
+            else:
+                t = torch.full(x.shape[:-1] + (1,), float(time), dtype=x.dtype)
             eps = self.score(embeddings, x, t)
             a1 = 1.0 / torch.sqrt(self.alphas[time])
             a2 = (1.0 - self.alphas[time]) / torch.sqrt(1.0 - self.alpha_hats[time])
@@ -766,6 +856,58 @@ class OctoSmall(nn.Module):
             x = torch.clamp(x, -MAX_ACTION, MAX_ACTION)
         x = x.reshape(x.shape[0], x.shape[1], ACTION_HORIZON, ACTION_DIM)
         return x[:, -1]          # only the last timestep in the window
+
+
+# --------------------------------------------------------------------------
+# Traceable signatures
+# --------------------------------------------------------------------------
+
+def forward_arg_names(cfg: dict) -> list[str]:
+    """Positional forward() parameter names for the active knob combination.
+
+    `get_sample_input` returns exactly these, in this order.
+    """
+    if cfg["part"] == "score":
+        return ["obs_enc", "noisy_actions", "t"]
+    names = ["img_primary"]
+    if cfg["wrist"]:
+        names.append("img_wrist")
+    names.append("lang")
+    if cfg["goal"]:
+        names.append("goal_primary")
+        if cfg["wrist"]:
+            names.append("goal_wrist")
+    if cfg["part"] == "full":
+        names += ["noisy_actions", "t"]
+    return names
+
+
+def _traceable(base: type, arg_names: list[str]) -> type:
+    """Subclass `base` with a `forward` whose signature is EXACTLY arg_names.
+
+    Why this exists: `torch.fx.symbolic_trace` turns a `forward(self, *args)`
+    into a SINGLE placeholder holding an `immutable_list` of proxies, and the
+    extractor's `_tensor_meta` then fails with
+    `'immutable_list' object has no attribute 'shape'`. Parameters that merely
+    have `None` defaults are no better -- they become dangling placeholders
+    with no tensor meta.
+
+    The knobs change the arity (wrist on/off x goal on/off x part), so the
+    signature cannot be written out statically without four near-duplicate
+    classes per part. Generating it once at build time keeps a single
+    implementation (`base._run`, keyword-dispatched) and gives fx and
+    torch.export a clean, explicit placeholder per real input.
+
+    Subclassing rather than wrapping keeps the state_dict keys unchanged, so
+    the converter's `backbone.*` / `score.*` names still apply.
+    """
+    src = (f"def forward(self, {', '.join(arg_names)}):\n"
+           f"    return self._run({', '.join(f'{n}={n}' for n in arg_names)})\n")
+    ns: dict = {}
+    exec(src, ns)                       # noqa: S102 - generated from a fixed list
+    fwd = ns["forward"]
+    fwd.__doc__ = f"Generated signature: forward({', '.join(arg_names)})"
+    return type(f"{base.__name__}Traceable", (base,), {"forward": fwd})
 
 
 # --------------------------------------------------------------------------
@@ -782,7 +924,17 @@ def get_model(seed: int = 0) -> nn.Module:
     """
     torch.manual_seed(seed)
     cfg = _cfg()
-    model = OctoSmall(cfg).eval()
+    names = forward_arg_names(cfg)
+    if cfg["part"] == "backbone":
+        cls = _traceable(OctoBackbone, names)
+    elif cfg["part"] == "score":
+        cls = _traceable(ScoreNet, names)
+    else:
+        cls = _traceable(OctoSmall, names)
+
+    # Always build the FULL policy so the converted state_dict loads under its
+    # own key names, then hand back the requested part.
+    full = OctoSmall(cfg).eval()
 
     ckpt = os.environ.get("MODELBLASTER_OCTO_CKPT", "")
     if not ckpt:
@@ -794,17 +946,20 @@ def get_model(seed: int = 0) -> nn.Module:
               "RANDOM-INIT weights (outputs are meaningless). Build one with "
               "experiments/octo_port/convert_weights.py, or set "
               "MODELBLASTER_OCTO_CKPT.", flush=True)
-        return model
+    else:
+        sd = torch.load(ckpt, map_location="cpu", weights_only=True)
+        missing, unexpected = full.load_state_dict(sd, strict=False)
+        real_missing = [k for k in missing if not k.endswith("mask_bias")]
+        if real_missing:
+            print(f"[octo_small.get_model] {len(real_missing)} missing keys "
+                  f"(e.g. {real_missing[:3]})", flush=True)
+        if unexpected:
+            print(f"[octo_small.get_model] {len(unexpected)} unexpected keys "
+                  f"(e.g. {unexpected[:3]})", flush=True)
 
-    sd = torch.load(ckpt, map_location="cpu", weights_only=True)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing:
-        print(f"[octo_small.get_model] {len(missing)} missing keys "
-              f"(e.g. {missing[:3]})", flush=True)
-    if unexpected:
-        print(f"[octo_small.get_model] {len(unexpected)} unexpected keys "
-              f"(e.g. {unexpected[:3]})", flush=True)
-    return model
+    part = {"backbone": full.backbone, "score": full.score}.get(cfg["part"], full)
+    part.__class__ = cls              # swap in the generated explicit signature
+    return part.eval()
 
 
 def get_sample_input(seed: int = 1):
@@ -822,28 +977,26 @@ def get_sample_input(seed: int = 1):
     g = torch.Generator().manual_seed(seed)
     w = cfg["window"]
 
-    if cfg["part"] == "score":
-        return (torch.randn(1, w, EMBED_DIM, generator=g),
-                torch.randn(1, w, ACTION_DIM * ACTION_HORIZON, generator=g) * 0.3,
-                torch.full((1, w, 1), 7.0))
+    def _img(n: int, batch_dims: tuple) -> torch.Tensor:
+        return torch.randint(0, 256, batch_dims + (3, n, n), generator=g).float()
 
-    img_p = torch.randint(0, 256, (1, w, 3, cfg["primary"], cfg["primary"]),
-                          generator=g).float()
-    img_w = (torch.randint(0, 256, (1, w, 3, cfg["wrist"], cfg["wrist"]),
-                           generator=g).float() if cfg["wrist"] else None)
-    lang = torch.randn(1, LANG_TOKENS, T5_HIDDEN, generator=g) * 0.5
-
-    obs = [img_p, img_w, lang]
-    if cfg["goal"]:
-        obs += [torch.randint(0, 256, (1, 3, cfg["primary"], cfg["primary"]),
-                              generator=g).float(),
-                (torch.randint(0, 256, (1, 3, cfg["wrist"], cfg["wrist"]),
-                               generator=g).float() if cfg["wrist"] else None)]
-    if cfg["part"] == "backbone":
-        return tuple(obs)
-    return tuple(obs) + (
-        torch.randn(1, w, ACTION_DIM * ACTION_HORIZON, generator=g) * 0.3,
-        torch.full((1, w, 1), 7.0))
+    # Built by name so this cannot drift out of step with forward_arg_names().
+    made = {
+        "img_primary": lambda: _img(cfg["primary"], (1, w)),
+        "img_wrist": lambda: _img(cfg["wrist"], (1, w)),
+        "lang": lambda: torch.randn(1, LANG_TOKENS, T5_HIDDEN, generator=g) * 0.5,
+        "goal_primary": lambda: _img(cfg["primary"], (1,)),
+        "goal_wrist": lambda: _img(cfg["wrist"], (1,)),
+        "noisy_actions": lambda: torch.randn(
+            1, w, ACTION_DIM * ACTION_HORIZON, generator=g) * 0.3,
+        # NB the parens: `lambda: A if c else lambda: B` parses as
+        # `lambda: (A if c else <lambda>)` and hands torch.export a function.
+        "t": ((lambda: torch.randn(1, w, TIME_DIM, generator=g) * 0.5)
+              if cfg["time_mode"] == "lut"
+              else (lambda: torch.full((1, w, 1), 7.0))),
+        "obs_enc": lambda: torch.randn(1, w, EMBED_DIM, generator=g),
+    }
+    return tuple(made[n]() for n in forward_arg_names(cfg))
 
 
 def get_calibration_spec(num_samples: int = 8) -> "dict | None":

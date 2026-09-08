@@ -1919,6 +1919,13 @@ def _import_model_module(name: str):
         from modelblaster.models import vint as model_mod
     elif name == "smolvla":
         from modelblaster.models import smolvla as model_mod
+    elif name == "octo_small":
+        # Octo needs the export path, not the FX one: its 110+ tensor-shape
+        # methods (transpose/unflatten/reshape/view/flatten/permute) and its
+        # learned position-embedding get_attr nodes are hard raises in
+        # extract_graph.py, and free aliases here. See
+        # RoSE experiments/octo_port/NOTES.md 10.
+        from modelblaster.models import octo_small as model_mod
     else:
         raise SystemExit(
             f"--model {name} doesn't need extract_graph_export; "
@@ -1937,7 +1944,8 @@ def _load_model(name: str):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True, choices=["vint", "smolvla"])
+    p.add_argument("--model", required=True,
+                   choices=["vint", "smolvla", "octo_small"])
     p.add_argument("--quant", default="int8", choices=["fp32", "int8", "fp16"])
     p.add_argument("--out-dir", required=True)
     p.add_argument("--inventory-only", action="store_true",
