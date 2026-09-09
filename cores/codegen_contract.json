@@ -85,8 +85,11 @@
       "networks": {
         "yolov8_nano_64x96": {
           "module": "yolov8_nano",
-          "build": "MODELBLASTER_YOLOV8N_INPUT=64x96 python -m pipeline.extract_graph --model yolov8_nano --quant int8 --out-dir <dir>",
-          "why": "The name registers the yolov8_nano module built at a different input size; the size comes from that env var, so `extract_graph --model yolov8_nano_64x96` has nothing to extract."
+          "build": "MODELBLASTER_YOLOV8N_INPUT=64x96 MODELBLASTER_YOLOV8N_NC=2 MODELBLASTER_YOLOV8N_WEIGHTS=<repo>/sims/models/warehouse/yolov8n_gate_person_64x96.pt python -m pipeline.extract_graph --model yolov8_nano --quant int8 --out-dir <dir>",
+          "why": "The name registers the yolov8_nano module built at a different input size AND a different class count, so `extract_graph --model yolov8_nano_64x96` has nothing to extract. The DEPLOYED detector is a 2-class (gate, person) fine-tune: the profile database records dispatch 89 as conv2d_s8 with OC=2 and the detect cat as C_inputs64|2xC_total66, and the checkpoint's cv3.*.2.weight is (2,64,1,1).",
+          "nc": 2,
+          "weights": "sims/models/warehouse/yolov8n_gate_person_64x96.pt (in the ORIGINAL XPU-RT checkout, not this one)",
+          "do_not_omit_the_weights": "A default extraction gives the stock COCO-80 head. It does not fail -- it produces a DIFFERENT NETWORK under the same name with the same 98 dispatches, and a board run against it measures 10 dispatches (2.02% of yolo time: the three final cls convs and the cats) doing more work than the schedule assumed. MODELBLASTER_YOLOV8N_NC=2 against the stock weights is refused, which is the only reason this was caught."
         }
       },
       "enforced_by": "scripts/run_xpurt_k1.sh --staged-ir",
