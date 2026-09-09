@@ -16,12 +16,31 @@ from pathlib import Path
 from typing import Any
 
 
-_PACKED_WEIGHT_SHARD_OPS = {
+#: Ops whose weights are packed per shard. THE CONTRACT IS THE SOURCE OF TRUTH:
+#: `cores/codegen_contract.json` is what XPU-RT reads to keep its solver inside what
+#: this module can build, so a list maintained separately here would be the same rule
+#: written twice in two languages, free to drift. The literal below is the fallback for
+#: a checkout without the contract file, and it is asserted equal to the contract by
+#: pipeline/tests/test_schedule_shards.py.
+_PACKED_WEIGHT_SHARD_OPS_FALLBACK = {
     "conv2d_s8",
     "conv2d_batchnorm2d_s8",
     "conv2d_batchnorm2d_silu_s8",
     "conv2d_silu_s8",
 }
+_CONTRACT_PATH = Path(__file__).resolve().parents[1] / "cores" / "codegen_contract.json"
+
+
+def _packed_weight_shard_ops() -> set[str]:
+    try:
+        rules = json.loads(_CONTRACT_PATH.read_text())["rules"]
+        ops = rules["uniform_width_across_instances"]["applies_to_ops"]
+        return set(ops) or set(_PACKED_WEIGHT_SHARD_OPS_FALLBACK)
+    except (OSError, ValueError, KeyError):
+        return set(_PACKED_WEIGHT_SHARD_OPS_FALLBACK)
+
+
+_PACKED_WEIGHT_SHARD_OPS = _packed_weight_shard_ops()
 _MARKER = "_xpurt_schedule_shard_factor"
 
 

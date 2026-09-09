@@ -105,3 +105,35 @@ class OnlyPackedWeightOpsAreConstrained(unittest.TestCase):
             }
         with self.assertRaisesRegex(ValueError, "different widths"):
             apply_schedule_shards(ir, sched, "dronet")
+
+
+class ContractAndCodeAgree(unittest.TestCase):
+    """The packed-weight op list has two readers and must have one definition.
+
+    XPU-RT reads `cores/codegen_contract.json` to keep its solver inside what this
+    module can build. If the two lists diverge the failure is silent in the worst
+    direction: the scheduler believes an op is unconstrained, emits a schedule with
+    per-instance widths, and the build refuses it at stage 1 of 5.
+    """
+
+    def test_the_module_uses_the_contracts_list(self):
+        import json
+        from pipeline.schedule_shards import (
+            _CONTRACT_PATH, _PACKED_WEIGHT_SHARD_OPS,
+            _PACKED_WEIGHT_SHARD_OPS_FALLBACK,
+        )
+        self.assertTrue(_CONTRACT_PATH.exists(), f"no contract at {_CONTRACT_PATH}")
+        rules = json.loads(_CONTRACT_PATH.read_text())["rules"]
+        contract_ops = set(rules["uniform_width_across_instances"]["applies_to_ops"])
+        self.assertEqual(_PACKED_WEIGHT_SHARD_OPS, contract_ops)
+        self.assertEqual(_PACKED_WEIGHT_SHARD_OPS_FALLBACK, contract_ops,
+                         "the offline fallback has drifted from the contract")
+
+    def test_runtime_sliceable_ops_are_not_also_packed(self):
+        """A contract that lists an op in both halves would be incoherent."""
+        import json
+        from pipeline.schedule_shards import _CONTRACT_PATH
+        rules = json.loads(_CONTRACT_PATH.read_text())["rules"]
+        packed = set(rules["uniform_width_across_instances"]["applies_to_ops"])
+        sliceable = set(rules["runtime_sliceable_ops"]["ops"])
+        self.assertEqual(packed & sliceable, set())

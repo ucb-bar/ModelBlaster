@@ -1,0 +1,96 @@
+{
+  "schema": "modelblaster_codegen_contract/v1",
+  "owner": "ModelBlaster",
+  "consumed_by": "XPU-RT (xpu-rt/codegen_contract.py)",
+  "description": "What ModelBlaster can GENERATE CODE FOR, as opposed to what the hardware can execute. `cores/spacemit_k1.json` is the hardware capability registry: which ops a core can run, and that IME traps on cluster 1. This file is the compiler's half of the same interface, and the two are not interchangeable -- a schedule can be perfectly executable and still impossible to generate. Every rule here was learned by a build failing, and each carries where it is enforced so the two sides cannot drift.",
+  "why_this_file_exists": "The scheduler's option space was wider than the compiler's. XPU-RT's `shard` machine-combination mode lets every periodic INSTANCE of a dispatch pick its own aligned core block, which for a convolution is not buildable -- the packed weight array is materialised per shard while generating the skeleton, so the width must be one value per dispatch. Nothing told the scheduler that, so it produced valid schedules the compiler refused: on the 5-net ladder rung greedy gave `dronet` dispatches 0, 3, 8 and 9 two or three different widths across their five instances, and the board build died at stage 1 of 5 -- after extracting and generating for every model -- with an error raised from inside a shell script. A contract turns that into a solver constraint, or failing that into a check that costs milliseconds and names the dispatch.",
+  "rules": {
+    "uniform_width_across_instances": {
+      "severity": "refuse",
+      "applies_to_ops": [
+        "conv2d_s8",
+        "conv2d_batchnorm2d_s8",
+        "conv2d_batchnorm2d_silu_s8",
+        "conv2d_silu_s8"
+      ],
+      "statement": "Every periodic instance of one dispatch must be given the same core width.",
+      "why": "The packed weight array is emitted per shard at skeleton-generation time, so one generated model cannot carry two layouts for one dispatch.",
+      "enforced_by": "pipeline/schedule_shards.py::apply_schedule_shards",
+      "checkable_from": "schedule"
+    },
+    "width_divides_output_channels": {
+      "severity": "refuse",
+      "applies_to_ops": [
+        "conv2d_s8",
+        "conv2d_batchnorm2d_s8",
+        "conv2d_batchnorm2d_silu_s8",
+        "conv2d_silu_s8"
+      ],
+      "statement": "The core width must divide the op's OC exactly.",
+      "why": "Each shard receives its own OC slice of the packed weights; a remainder has nowhere to go.",
+      "enforced_by": "pipeline/schedule_shards.py (raises 'not divisible')",
+      "checkable_from": "schedule (OC is in module_name)"
+    },
+    "runtime_sliceable_ops": {
+      "severity": "none",
+      "ops": [
+        "linear_s8",
+        "matmul_s8"
+      ],
+      "statement": "These may take a different width in every instance, and need no codegen annotation.",
+      "why": "Row-major weights are sliced at runtime using the entry's own pool width, so nothing is baked at generation time. Recorded explicitly because the width check was once applied to every dispatch, which refused schedules that generate perfectly well -- `ffn_block` has no convolution at all and was still rejected for varying a linear's width.",
+      "enforced_by": "pipeline/schedule_shards.py (absent from _PACKED_WEIGHT_SHARD_OPS)",
+      "checkable_from": "schedule"
+    },
+    "linear_split_axis": {
+      "severity": "refuse",
+      "applies_to_ops": [
+        "linear_s8"
+      ],
+      "axis": "M",
+      "statement": "A linear is split on M. An N-axis split is refused when M > 1.",
+      "why": "The N-split emits one output tile per shard and aliases them into a single output buffer at offset off_m*N; with M > 1 the rows interleave and the tiles overlap. M-split is offset off_m*K on the input and shares weights and bias.",
+      "enforced_by": "pipeline/apply_split_hint.py::_split_linear_s8",
+      "checkable_from": "rewrite proposal, not the schedule"
+    },
+    "ime": {
+      "severity": "refuse",
+      "ops": [
+        "ime_linear_s8",
+        "ime_matmul_s8",
+        "ime_conv2d_s8"
+      ],
+      "quant": "int8",
+      "clusters": [
+        0
+      ],
+      "statement": "IME kernels exist for int8 linear, matmul and (since 2026-09-01) convolution, and only on cluster 0.",
+      "why": "smt.vmadot executes on harts 0-3 and TRAPS on 4-7, established by a per-core SIGILL probe -- so this is a correctness constraint, not a performance hint. There is no fp16 matrix hardware; fp16 reaches IME only through an accuracy-gated int8 requant.",
+      "enforced_by": "cores/spacemit_k1.json capability lists; xpu-rt/capabilities.py",
+      "selection_policy": "per dispatch, only where MEASURED faster than RVV (pipeline/ime_cost.py). The win tracks K=IC*KH*KW and N=OC (tile fill), not M.",
+      "checkable_from": "schedule"
+    },
+    "machine_combinations": {
+      "severity": "refuse",
+      "same_kind_only": true,
+      "aligned_blocks_only": true,
+      "statement": "A combination contains cores of one kind, as an aligned block.",
+      "why": "`kind` is how the runtime resolves an abstract CPU_P#n slot to a hart -- it takes the n-th core of that kind -- so a cross-kind combination is attributed to one kind's backend. Alignment is what makes overlap tests honest.",
+      "enforced_by": "xpu-rt/workload_factory.py::build_machine_combinations, xpu-rt/capabilities.py::aligned_core_blocks",
+      "checkable_from": "schedule"
+    },
+    "staged_ir_networks": {
+      "severity": "refuse",
+      "statement": "These networks cannot be extracted by name and must be supplied as a built IR directory containing graph.json, weights.npz and io.npz.",
+      "networks": {
+        "yolov8_nano_64x96": {
+          "module": "yolov8_nano",
+          "build": "MODELBLASTER_YOLOV8N_INPUT=64x96 python -m pipeline.extract_graph --model yolov8_nano --quant int8 --out-dir <dir>",
+          "why": "The name registers the yolov8_nano module built at a different input size; the size comes from that env var, so `extract_graph --model yolov8_nano_64x96` has nothing to extract."
+        }
+      },
+      "enforced_by": "scripts/run_xpurt_k1.sh --staged-ir",
+      "checkable_from": "workload spec"
+    }
+  }
+}
