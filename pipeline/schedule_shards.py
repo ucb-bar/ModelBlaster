@@ -52,11 +52,28 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
     runtime using the exact entry pool width.
     """
     out = copy.deepcopy(ir)
+    # ONLY PACKED-WEIGHT OPS ARE CONSTRAINED. The uniformity rule exists because a
+    # packed convolution weight array is materialized per shard at codegen time, so one
+    # generated model cannot carry two layouts for one dispatch. A linear does not have
+    # that problem -- its row-major weights are sliced at runtime using the entry's own
+    # pool width, which is what the docstring above says and what
+    # `_PACKED_WEIGHT_SHARD_OPS` encodes.
+    #
+    # Checking every dispatch instead refused schedules that generate perfectly well.
+    # It cost a board run: greedy's w5 schedule gives `ffn_block` dispatch 1 -- a
+    # `linear_s8` -- width 1 in one periodic instance and width 4 in another, and this
+    # raised even though `ffn_block` contains no convolution at all, so the rule could
+    # never apply to it. The scheduler is allowed to vary a linear's width per instance;
+    # only the conv family has to commit.
+    packed_dids = {op.get("dispatch_id") for op in (ir.get("ops") or [])
+                   if op.get("op") in _PACKED_WEIGHT_SHARD_OPS}
     widths: dict[int, set[int]] = {}
     for entry in (schedule.get("dispatches") or {}).values():
         if not _is_instance(str(entry.get("job_name", "")), network):
             continue
         did = int(entry["id"])
+        if did not in packed_dids:
+            continue
         width = len([x for x in str(entry["hardware_target"]).split("+")
                      if x.strip()])
         widths.setdefault(did, set()).add(width)

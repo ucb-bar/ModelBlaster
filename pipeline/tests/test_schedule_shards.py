@@ -61,3 +61,47 @@ class ScheduleShardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OnlyPackedWeightOpsAreConstrained(unittest.TestCase):
+    """A linear may take a different width in each periodic instance.
+
+    Its weights are row-major and sliced at runtime from the entry's own pool width, so
+    nothing is baked at codegen time. Refusing it cost a board run: greedy's 5-net
+    schedule gives `ffn_block` dispatch 1 -- a `linear_s8` -- width 1 in one instance and
+    width 4 in another, and `ffn_block` has no convolution at all, so the packed-weight
+    rule could never have applied to it.
+    """
+
+    def test_a_linear_may_vary_its_width_across_instances(self):
+        ir = {"name": "ffn_block", "ops": [
+            {"dispatch_id": 0, "op": "layernorm_s8", "shape": {"N": 256}},
+            {"dispatch_id": 1, "op": "linear_s8", "shape": {"N": 1024}},
+        ]}
+        sched = {"dispatches": {}}
+        for inst, width in enumerate((1, 4)):
+            targets = "+".join(f"CPU_P#{i}" for i in range(width))
+            for did in (0, 1):
+                sched["dispatches"][f"ffn_block{inst}_dispatch_{did}"] = {
+                    "job_name": f"ffn_block{inst}", "id": did,
+                    "hardware_target": targets,
+                }
+        out, applied = apply_schedule_shards(ir, sched, "ffn_block")
+        self.assertEqual(applied, [], "a linear needs no shard annotation")
+        for op in out["ops"]:
+            self.assertNotIn("shard_factor", op)
+
+    def test_a_conv_still_has_to_commit(self):
+        """The rule is narrowed, not removed."""
+        ir = {"name": "dronet", "ops": [
+            {"dispatch_id": 0, "op": "conv2d_s8", "shape": {"OC": 32}},
+        ]}
+        sched = {"dispatches": {}}
+        for inst, width in enumerate((2, 4)):
+            targets = "+".join(f"CPU_P#{i}" for i in range(width))
+            sched["dispatches"][f"dronet{inst}_dispatch_0"] = {
+                "job_name": f"dronet{inst}", "id": 0,
+                "hardware_target": targets,
+            }
+        with self.assertRaisesRegex(ValueError, "different widths"):
+            apply_schedule_shards(ir, sched, "dronet")
