@@ -4117,6 +4117,34 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
             reference_impl="(use the curated kernel in kernels/rvv/)",
             accuracy_class=AccuracyClass.BIT_EXACT,
         ),
+        # The gemmini_q31_rvv entry (fast-conv DroNet path). Same gap as
+        # rvv_frm_rmm above but for the hetero gemmini_q31_rvv backend: the
+        # curated kernel kernels/gemmini_q31_rvv/gemmini_q31_rvv_add_s8_rvv.c
+        # (committed in 3414ec6) had no AlgorithmCandidate whose name+affinity
+        # the curated-file probe (<target>_<op>_<algo>.c) could match, so on
+        # this backend add_s8 silently fell back to the scalar reference
+        # (gemmini_q31_rvv_add_s8_direct.c) even after 3414ec6 landed -- this
+        # is the ladder's S2-vs-S7 double-count note (PERF_LADDER.md §2):
+        # the RVV add measured a real op-level win but the fast-conv E2E
+        # build kept running the scalar add until this affinity gap was
+        # closed. Registering it here is a pure wiring fix, no kernel change.
+        AlgorithmCandidate(
+            name="rvv",
+            target_affinity=("gemmini_q31_rvv",),
+            description=(
+                "Saturn RVV two-scale integer rescale, the gemmini_q31_rvv "
+                "counterpart of rvv_frm_rmm. DroNet's residual adds have "
+                "asymmetric input scales (a_ratio ~ 0.20) so gemmini_resadd's "
+                "float mvin-scale traps on this misa.F=0 core; this kernel "
+                "instead vectorises the SAME fixed-point rescale as the "
+                "scalar gemmini_q31_rvv_add_s8_direct.c fallback (fold "
+                "scale_a/scale_out, scale_b/scale_out into Q(S) integer "
+                "multipliers, vmul/vmacc + branch-free round-half-away, "
+                "e32m8) -- no floating point in the element loop."
+            ),
+            reference_impl="(use the curated kernel in kernels/gemmini_q31_rvv/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        ),
     ],
 )
 
