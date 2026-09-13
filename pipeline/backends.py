@@ -399,7 +399,7 @@ GEMMINI = Backend(
         # MODELBLASTER_GEMMINI_CONFIG (default: "default16x16").
         # See modelblaster/validation/config_matrix.json for the
         # canonical list.
-        "-isystem<repo_root>/modelblaster/cores/gemmini/include/per_config/<gemmini_config>",
+        "-isystem<repo_root>/cores/gemmini/include/per_config/<gemmini_config>",
         # Two more include paths:
         #   .../include — so kernels.c's `#include "gemmini.h"` resolves
         #   .../        — so gemmini.h's `#include "include/gemmini_params.h"`
@@ -545,6 +545,23 @@ GEMMINI_Q31_RVV = Backend(
         for f in GEMMINI.kernel_cflags
     ) + (
         "-DMODELBLASTER_GEMMINI_Q31_ACC_SCALE=1",
+        # The load-once conv0 fast path (f3ca727,
+        # kernels/gemmini_q31_rvv/conv2d_pool_s8_gemmini_tiled_conv_pool_nhwc.c
+        # -> #include "conv2d_pool_loadonce.h") is a sibling-header split
+        # across two files in kernels/gemmini_q31_rvv/. generate_kernels'
+        # curated-kernel merge TEXT-COPIES the .c body into the model's
+        # generated kernels.c (renaming kernel_* -> kernel_*_dronet), so
+        # the copy lands in examples/<model>/<quant>/generated/<target>/ --
+        # a different directory from the original curated source. A quoted
+        # #include only falls back to searching the directory of the file
+        # being COMPILED, and the generated kernels.c's directory has no
+        # such header, so without this the build fails with
+        # "conv2d_pool_loadonce.h: No such file or directory" (every
+        # curated candidate for this backend fails to verify, including
+        # ones that never call the load-once path, because the merged
+        # kernels.c always carries this #include once conv2d_pool_s8 has
+        # been curated-selected for an earlier op in the same file).
+        "-isystem<repo_root>/kernels/gemmini_q31_rvv",
     ),
     # + riscv_vector.h so the RVV fallback kernels (batchnorm2d_s8,
     # maxpool2d_s8, relu_s8, linear_s8 — kernels/gemmini_q31_rvv/)
