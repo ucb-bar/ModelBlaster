@@ -399,7 +399,16 @@ GEMMINI = Backend(
         # MODELBLASTER_GEMMINI_CONFIG (default: "default16x16").
         # See modelblaster/validation/config_matrix.json for the
         # canonical list.
-        "-isystem<repo_root>/modelblaster/cores/gemmini/include/per_config/<gemmini_config>",
+        # NOTE: no "modelblaster/" segment. Every other <repo_root> entry in
+        # this table -- the two below, and kernels/rvv above -- is relative to
+        # the modelblaster directory, so this one must be too. It carried an
+        # extra "modelblaster/" and therefore expanded to a path that does not
+        # exist, which GCC ignores silently: the per-config header was never
+        # actually selected and every gemmini build fell through to whatever
+        # cores/gemmini/include/gemmini_params.h happened to be. That is a
+        # dangerous way to fail, because the fallthrough header can describe a
+        # different mesh or a different mvin-scale type than the hardware.
+        "-isystem<repo_root>/cores/gemmini/include/per_config/<gemmini_config>",
         # Two more include paths:
         #   .../include — so kernels.c's `#include "gemmini.h"` resolves
         #   .../        — so gemmini.h's `#include "include/gemmini_params.h"`
