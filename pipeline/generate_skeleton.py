@@ -4570,8 +4570,20 @@ def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
     ]
 
     def _s_blob(sym, bin_abs):
+        # BASENAME, not the absolute path it was generated at. GNU as resolves
+        # .incbin through its include search path, and the harness already puts
+        # MODEL_DIR on it (target_include_directories(app PRIVATE ... MODEL_DIR)
+        # applies to the ASM source too), so the bare name resolves wherever the
+        # directory is.
+        #
+        # Baking the absolute path made a generated directory unmovable: copied
+        # or published to another machine, the build fails at
+        #   Error: file not found: /<build host>/.../test_input.bin
+        # even though the .bin sits right beside the .S that names it. That is
+        # the whole obstacle to shipping a verified codegen to a bench machine
+        # which cannot run the verification gate itself.
         return [f"    .globl  {sym}", f"    .type   {sym}, @object",
-                f"{sym}:", f'    .incbin "{bin_abs}"',
+                f"{sym}:", f'    .incbin "{os.path.basename(bin_abs)}"',
                 f"    .size   {sym}, . - {sym}", "    .align 4", ""]
 
     h_input_decls: list[str] = []       # extern + LEN macros (mangled)
