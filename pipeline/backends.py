@@ -654,6 +654,56 @@ GEMMINI_Q31_SOFTFP = Backend(
 )
 
 
+# The combined Gemmini + Saturn shell's target: gemmini_q31_rvv with no
+# -march/-mabi of its own, for the same reason gemmini_q31_softfp exists.
+# RocketArty200TDroneGemminiSaturnFp16At35Config carries both accelerators and an
+# FP16-only scalar FPU, so its image is built CONFIG_FPU=n and every kernel has
+# to inherit that ABI rather than demand lp64d.
+#
+# The vector extension is NOT dropped with the FPU: rv64imac_zicsr_zifencei_v is
+# what this shell wants, and Zephyr's RISCV_ISA_EXT_V is a separate symbol from
+# CONFIG_FPU. Saturn stays reachable on a no-scalar-FPU image.
+# BLOCKED, and kept so the blocker is written down rather than rediscovered.
+#
+# Dropping -march works for gemmini_q31_softfp because Gemmini reaches the
+# accelerator through inline asm that needs no ISA extension. It does NOT work
+# here: the RVV kernels use vector types (vint8m2_t, __riscv_vmv_x_s_i32m1_i32)
+# which require "v" in -march, and inheriting the image's flags gives
+# rv64imafdc_zicsr_zifencei -- no v -- so every kernel fails to compile. The
+# harness overlay does set CONFIG_RISCV_ISA_EXT_V=y and Zephyr still does not
+# put v in -march for the verify build, which is worth understanding on its own.
+#
+# The flags this variant actually wants are rv64imacv + lp64: vector, no f/d,
+# soft-float ABI. That cannot be verified today, because the verify harness
+# builds for spike_riscv64 as lp64d and an object compiled lp64 cannot be linked
+# against it. Verifying a soft-float vector variant needs the verify build to
+# inherit the target's ABI, which is a change to the verification flow rather
+# than to a flag table.
+#
+# Until then the combined Gemmini+Saturn shell runs via gemmini_q31_softfp, with
+# Gemmini working and Saturn idle.
+GEMMINI_Q31_RVV_SOFTFP = Backend(
+    name="gemmini_q31_rvv_softfp",
+    description=(
+        "Gemmini Q0.31 + Saturn RVV with no -march/-mabi of its own, so kernels "
+        "inherit the image's ABI. For the combined arty200t shell, whose scalar "
+        "FPU implements only Zfh."
+    ),
+    kernel_cflags=tuple(
+        f for f in GEMMINI_Q31_RVV.kernel_cflags
+        if not f.startswith(("-march=", "-mabi="))
+    ),
+    kernel_includes=GEMMINI_Q31_RVV.kernel_includes,
+    prj_conf_overlay=GEMMINI_Q31_RVV.prj_conf_overlay,
+    spike_args=GEMMINI_Q31_RVV.spike_args,
+    optimization_guide=GEMMINI_Q31_RVV.optimization_guide,
+    verify_method=GEMMINI_Q31_RVV.verify_method,
+    atol_override=GEMMINI_Q31_RVV.atol_override,
+    rtol_override=GEMMINI_Q31_RVV.rtol_override,
+    curated_aliases=("gemmini_q31_rvv",) + tuple(GEMMINI_Q31_RVV.curated_aliases),
+)
+
+
 BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
@@ -667,6 +717,7 @@ BACKENDS: dict[str, Backend] = {
     GEMMINI_Q31.name: GEMMINI_Q31,
     GEMMINI_Q31_SOFTFP.name: GEMMINI_Q31_SOFTFP,
     GEMMINI_Q31_RVV.name: GEMMINI_Q31_RVV,
+    GEMMINI_Q31_RVV_SOFTFP.name: GEMMINI_Q31_RVV_SOFTFP,
 }
 
 
