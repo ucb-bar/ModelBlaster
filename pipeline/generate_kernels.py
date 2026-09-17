@@ -1794,6 +1794,28 @@ def generate(
                                 f"falling back to reference_impl")
                             accepted = False
                             vres = None
+                            # Was this a BUILD failure, as opposed to this
+                            # kernel simply being wrong or the simulator being
+                            # absent? Only a build failure justifies the
+                            # recovery below, whose premise is a poisoned
+                            # baseline -- another op's kernel failing to
+                            # compile and taking this one down with it.
+                            # profile_kernel raises ProfileError for the
+                            # build/run path; anything else is this op's own
+                            # business and re-verifying against a clean
+                            # baseline would prove nothing.
+                            #
+                            # This was previously a bare reference to an
+                            # undefined name, so the handler raised NameError
+                            # instead of falling back to reference_impl. It
+                            # only fired when _verify itself raised, i.e.
+                            # exactly when spike is missing -- so on any
+                            # machine without a simulator, codegen died here
+                            # rather than degrading to correct-and-slow.
+                            from modelblaster.pipeline.profile_kernel import (
+                                ProfileError as _ProfileError,
+                            )
+                            _build_fail = isinstance(e, _ProfileError)
                             if (_build_fail and curated_seed
                                     and os.environ.get("MB_PRESEED_RECOVER")
                                     == "1"):
