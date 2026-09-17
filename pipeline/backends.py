@@ -611,6 +611,49 @@ RVV_HETERO = Backend(
 )
 
 
+# Gemmini Q0.31 on a shell with NO hardware fp32, i.e. the FP16-only scalar FPU
+# of RocketArty200TDroneGemminiSaturnFp16At35Config.
+#
+# THE ONLY DIFFERENCE IS THE ABSENCE OF -march/-mabi. GEMMINI_Q31 pins
+# rv64imafdc/lp64d, which is not something Gemmini needs -- gemmini.h mentions
+# float five times and all five are in comments, and the Q0.31 per-config
+# gemmini_params.h is integer throughout -- it is a default inherited from the
+# hard-float bitstreams. On a shell whose FPU implements only Zfh those flags
+# are not merely unnecessary, they are wrong twice over: they let gcc emit
+# fp32 the hardware cannot execute, and lp64d cannot be linked against a Zephyr
+# image built without the FPU.
+#
+# Omitting them lets kernels.c inherit the image's own -march/-mabi, whatever
+# Zephyr derived from CONFIG_FPU. That is correct on every shell rather than one
+# of them: hard-float image, hard-float kernels; soft-float image, soft-float
+# kernels; and the ABI can no longer disagree with the rest of the link.
+#
+# curated_aliases is load-bearing. Without it a variant finds no curated kernels
+# and every op silently falls back to the scalar reference while the build
+# reports success -- see backend_lineage's docstring, which records that trap
+# and a second one costing max_abs_err=57.
+GEMMINI_Q31_SOFTFP = Backend(
+    name="gemmini_q31_softfp",
+    description=(
+        "Gemmini Q0.31 with no -march/-mabi of its own, so kernels inherit the "
+        "image's float ABI. For shells with an FP16-only or absent scalar FPU, "
+        "where GEMMINI_Q31's rv64imafdc/lp64d is unbuildable."
+    ),
+    kernel_cflags=tuple(
+        f for f in GEMMINI_Q31.kernel_cflags
+        if not f.startswith(("-march=", "-mabi="))
+    ),
+    kernel_includes=GEMMINI_Q31.kernel_includes,
+    prj_conf_overlay=GEMMINI_Q31.prj_conf_overlay,
+    spike_args=GEMMINI_Q31.spike_args,
+    optimization_guide=GEMMINI_Q31.optimization_guide,
+    verify_method=GEMMINI_Q31.verify_method,
+    atol_override=GEMMINI_Q31.atol_override,
+    rtol_override=GEMMINI_Q31.rtol_override,
+    curated_aliases=("gemmini_q31",),
+)
+
+
 BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
@@ -622,6 +665,7 @@ BACKENDS: dict[str, Backend] = {
     IME.name: IME,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,
+    GEMMINI_Q31_SOFTFP.name: GEMMINI_Q31_SOFTFP,
     GEMMINI_Q31_RVV.name: GEMMINI_Q31_RVV,
 }
 
