@@ -89,6 +89,7 @@ _DTYPE_TO_C = {
     "f32": "float",
     "f16": "_Float16",
     "i8":  "int8_t",
+    "i16": "int16_t",
     "i32": "int32_t",
     "i64": "int64_t",
 }
@@ -104,7 +105,7 @@ _DTYPE_TO_C = {
 #: buffer -- past the end -- and made its error WORSE (10.82 -> 13.12). Only i8
 #: tensors get `int8_t` buffers, which is what made a single sampled declaration
 #: look like a general rule.
-_DTYPE_BYTES = {"f32": 4, "f16": 2, "i8": 1, "i32": 4, "i64": 8}
+_DTYPE_BYTES = {"f32": 4, "f16": 2, "i8": 1, "i16": 2, "i32": 4, "i64": 8}
 
 
 def _dtype_bytes(dtype: str) -> int:
@@ -127,6 +128,8 @@ def _np_to_c_dtype(np_dtype) -> tuple[str, str]:
         return "_Float16", "f16"
     if np_dtype == np.int8:
         return "int8_t", "i8"
+    if np_dtype == np.int16:
+        return "int16_t", "i16"
     if np_dtype == np.int32:
         return "int32_t", "i32"
     if np_dtype == np.int64:
@@ -2519,7 +2522,13 @@ def emit_model(ir: dict[str, Any], out_dir: str,
     # record array). chunk2_c1 is a no-op at runtime (just sets up offset
     # aliases at codegen time), so it doesn't contribute either.
     _zero_cost_ops = {"view", "chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"}
-    op_count = sum(1 for op in ir["ops"] if op["op"] not in _zero_cost_ops)
+    # OP_COUNT SIZES THE INVOKE TABLE, so it must count the ops that produce a row in it --
+    # which is the DISPATCHED ops, not every record.  patches/0112's collapsing rewrite leaves
+    # the three SDPA records in the IR with `dispatch_id = None`; counting them made the table
+    # [135] with 117 initialisers, so 18 entries were NULL and the runtime called address 0.
+    # A zero-cost op is excluded for the same reason it always was: it emits no row either.
+    op_count = sum(1 for op in ir["ops"]
+                   if op["op"] not in _zero_cost_ops and op.get("dispatch_id") is not None)
     used_ops = {op["op"] for op in ir["ops"] if op["op"] not in _zero_cost_ops}
 
     # All exported symbols are mangled by model name (model_<mid>_*,
@@ -2814,6 +2823,16 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 .replace("(pool, ", "(s->pool, "))
 
     for op in ir["ops"]:
+        # A RECORD WITH NO DISPATCH ID IS NOT DISPATCHED.  patches/0112's collapsing rewrite
+        # leaves the three SDPA records in the IR as `attention_s8`'s specification, marked
+        # `fused_into` with `dispatch_id = None`.  Without this they still reached the emitter
+        # below and produced `dispatch_moonshine_enc_None` -- six redefinitions of one C
+        # function and `None` undeclared -- so a fused IR could not be BUILT, not merely
+        # mis-counted.  ATTENTION_UNIT.md s8.1 predicted the class ("every consumer that walks
+        # ops counts three dispatches where the build runs one") and called it a reporting
+        # defect; it is a build failure.
+        if op.get("dispatch_id") is None:
+            continue
         # fp16 dispatch: an `_f16` op without a bespoke branch reuses its fp32
         # branch (identical args) — normalize to the base op for matching and
         # fold `_f16` into the mangled kernel name below.
@@ -3990,6 +4009,28 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q.get('activation_min', -128)}, "
                 f"{q.get('activation_max', 127)})"
             )
+        elif op["op"] == "attention_s8":
+            # The codegen half of patches/0112.  That patch taught extract_graph to EMIT the
+            # fused op and reference_kernels to DEFINE it, but not this dispatcher to call it,
+            # so `attention_s8` reached `raise NotImplementedError` and a fused IR could not be
+            # built at all.  Found by compiling the curated kernel that drives the attention
+            # unit (ATTENTION_UNIT.md s10.4): the gate was the chain, not the kernel.
+            q_ptr = ptr_for(op["inputs"][0], "in")
+            k_ptr = ptr_for(op["inputs"][1], "in")
+            v_ptr = ptr_for(op["inputs"][2], "in")
+            sh = op["shape"]
+            q = op["quant"]
+            call = (
+                f"kernel_attention_s8({q_ptr}, {k_ptr}, {v_ptr}, {out_ptr}, "
+                f"{sh['B']}, {sh['M']}, {sh['Dk']}, {sh['S']}, {sh['Dv']}, "
+                f"{_f32(q['scale_q'])}, {_f32(q['scale_k'])}, "
+                f"{_f32(q['scale_scores'])}, "
+                f"{_f32(q.get('scale_div_sqrt_dk', 1.0))}, "
+                f"{_f32(q['scale_probs'])}, {_f32(q['scale_v'])}, "
+                f"{_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
         elif op["op"] == "add_tile_s8":
             tile_ptr = ptr_for(op["inputs"][0], "in")
             x_ptr = ptr_for(op["inputs"][1], "in")
@@ -4022,6 +4063,105 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             q = op["quant"]
             call = (
                 f"kernel_gelu_s8({in_ptr}, {out_ptr}, {n}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "tanh_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            q = op["quant"]
+            call = (
+                f"kernel_tanh_s8({in_ptr}, {out_ptr}, {op['shape']['n']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        # ---- patches/0103: int16 / per-channel / split-dispatch lowering (extract_q16) ----
+        elif op["op"] == "split16_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            part = 0 if op["quant"]["part"] == "hi" else 1
+            call = f"kernel_split16_s8({in_ptr}, {out_ptr}, {op['shape']['n']}, {part})"
+        elif op["op"] == "mrcombine_s16":
+            sh = op["shape"]
+            ins = ", ".join(ptr_for(t, "in") for t in op["inputs"])
+            call = (
+                f"kernel_mrcombine_s16((const int8_t *const []){{{ins}}}, "
+                f"{_weight_name(model_name, op['gidx'], backend)}, "
+                f"{_weight_name(model_name, op['lidx'], backend)}, "
+                f"{_weight_name(model_name, op['goc'], backend)}, "
+                f"{_weight_name(model_name, op['ratios'], backend)}, {out_ptr}, "
+                f"{sh['N']}, {sh['OC']}, {sh['OH'] * sh['OW']}, {sh['G']}, {sh['R']})"
+            )
+        elif op["op"] == "lut16_s16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            call = (f"kernel_lut16_s16({in_ptr}, {_weight_name(model_name, op['weight'], backend)}, "
+                    f"{out_ptr}, {op['shape']['n']})")
+        elif op["op"] == "lut16_pc_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (f"kernel_lut16_pc_s8({in_ptr}, {_weight_name(model_name, op['weight'], backend)}, "
+                    f"{_weight_name(model_name, op['mult'], backend)}, {out_ptr}, "
+                    f"{sh['N']}, {sh['C']}, {sh['HW']})")
+        elif op["op"] == "groupnorm_s16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (f"kernel_groupnorm_s16({in_ptr}, {_weight_name(model_name, op['gmul'], backend)}, "
+                    f"{_weight_name(model_name, op['badd'], backend)}, {out_ptr}, "
+                    f"{sh['N']}, {sh['C']}, {sh['H'] * sh['W']}, {int(op['quant']['eps_q'])}LL)")
+        elif op["op"] in ("layernorm_pc_s8", "layernorm_s16_s8"):
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            umul = (f"{_weight_name(model_name, op['umul'], backend)}, "
+                    if op["op"] == "layernorm_pc_s8" else "")
+            call = (f"kernel_{op['op']}({in_ptr}, {umul}"
+                    f"{_weight_name(model_name, op['gmul'], backend)}, "
+                    f"{_weight_name(model_name, op['badd'], backend)}, {out_ptr}, "
+                    f"{sh['M']}, {sh['K']}, {int(op['quant']['eps_q'])}LL)")
+        elif op["op"] in ("add_pc_s8", "add_s16_pc_s8"):
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            sh = op["shape"]
+            call = (f"kernel_{op['op']}({a_ptr}, {b_ptr}, "
+                    f"{_weight_name(model_name, op['amul'], backend)}, "
+                    f"{_weight_name(model_name, op['bmul'], backend)}, {out_ptr}, "
+                    f"{sh['n']}, {sh['C']})")
+        elif op["op"] == "conv2d_s16_pc":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (f"kernel_conv2d_s16_pc({in_ptr}, {_weight_name(model_name, op['weight'], backend)}, "
+                    f"{_weight_name(model_name, op['bias'], backend)}, "
+                    f"{_weight_name(model_name, op['mult'], backend)}, "
+                    f"{_weight_name(model_name, op['shift'], backend)}, {out_ptr}, "
+                    f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, {sh['OC']}, {sh['OH']}, {sh['OW']}, "
+                    f"{sh['KH']}, {sh['KW']}, {sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})")
+        elif op["op"] == "permute4_s16":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]
+            call = (f"kernel_permute4_s16({in_ptr}, {out_ptr}, "
+                    f"{sh['d0']}, {sh['d1']}, {sh['d2']}, {sh['d3']}, "
+                    f"{sh['p0']}, {sh['p1']}, {sh['p2']}, {sh['p3']})")
+        elif op["op"] == "groupnorm_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            gamma = _weight_name(model_name, op["weight"], backend)
+            beta = (_weight_name(model_name, op["bias"], backend)
+                    if op.get("bias") else "NULL")
+            call = (
+                f"kernel_groupnorm_s8({in_ptr}, {gamma}, {beta}, {out_ptr}, "
+                f"{sh['N']}, {sh['C']}, {sh['H']}, {sh['W']}, "
+                f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
+                f"{_f32(q['eps'])}, "
+                f"{q.get('activation_min', -128)}, "
+                f"{q.get('activation_max', 127)})"
+            )
+        elif op["op"] == "rope_s8":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            sh = op["shape"]; q = op["quant"]
+            cos_t = _weight_name(model_name, op["weight"], backend)
+            sin_t = _weight_name(model_name, op["bias"], backend)
+            call = (
+                f"kernel_rope_s8({in_ptr}, {cos_t}, {sin_t}, {out_ptr}, "
+                f"{sh['T']}, {sh['H']}, {sh['D']}, {sh['R']}, "
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q.get('activation_min', -128)}, "
                 f"{q.get('activation_max', 127)})"

@@ -51,12 +51,14 @@ LAYOUT_CONTRACT = "modelblaster.layout_hints/v1"
 #: kernel behind it -- though the codegen gate is deny-by-default and will refuse
 #: anything whose declared act_layouts do not cover what this pass assigned, so
 #: a stale entry here is caught rather than shipped.
-NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8", "batchnorm2d_s8"}
+NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8", "batchnorm2d_s8",
+                          "groupnorm_s8"}   # patches/0105: pext_int_rsqrt_nhwc
 
 #: Layout-agnostic: pure elementwise, same bytes in any order, so they never
 #: force a conversion and never need a variant. They join an island for free.
 LAYOUT_AGNOSTIC = {"add_s8", "relu_s8", "mul_s8", "sigmoid_s8", "silu_s8",
-                   "relu6_s8", "gelu_s8", "add_f16", "relu_f16", "mul_f16"}
+                   "relu6_s8", "gelu_s8", "add_f16", "relu_f16", "mul_f16",
+                   "tanh_s8"}   # patches/0105: already agnostic in act_layout.py
 
 #: Ops that must never be inside an island even though they look harmless.
 #: `view` is a codegen alias and stays layout-preserving -- but the thing it

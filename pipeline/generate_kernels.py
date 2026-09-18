@@ -1875,6 +1875,15 @@ def generate(
         curated_seed = curated_seed_for(
             ir, specs, target, global_curated_dir, log=log)
         if curated_seed:
+            # A kind pinned by keep_reference_ops is NOT seeded. _probe_swap skips
+            # pinned kinds, so a seeded curated source was never replaced: the pin
+            # was a silent no-op for every kind with a curated kernel on the target,
+            # while kernel_picks.json still reported "reference" (patches/0100 found
+            # this measuring pext_nl's float-elementwise baseline on Moonshine).
+            for _op in sorted(set(curated_seed) & pinned_to_reference):
+                log(f"  [{_op}] pinned to reference by keep_reference_ops; "
+                    f"not pre-seeded with {curated_seed[_op][0]}")
+                del curated_seed[_op]
             for _op, (_algo, _cp, _src) in curated_seed.items():
                 impls[_op] = _src
             log(f"  [curated] pre-seeded verify baseline with "
