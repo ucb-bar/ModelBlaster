@@ -3,8 +3,13 @@
 End-to-end reproduction of the **heterogeneous 2-hart DroNet** that runs on the
 riskybird v3 KU040 board (`RocketKU040DroneDualConfig`): grayscale, fully-integer,
 conv on the 32x32 Gemmini + everything else on the Saturn RVV vector unit, driven
-by an XPU-RT capability schedule. **Measured on-board: `MODELBLASTER_VERIFY
-max_abs_err=2` (int8-mvout), ~18-20 fps.**
+by an XPU-RT capability schedule.
+
+**The canonical deploy is the NHWC variant** (Gemmini conv island runs native NHWC):
+`MODELBLASTER_VERIFY max_abs_err=3`, **~24-27 fps**. Build it with
+`examples/dronet/int8/build_ku040_dual_nhwc.sh`; the NCHW build
+(`build_ku040_dual.sh`, `max_abs_err=2`, ~18-20 fps) is kept as the baseline this
+was measured against -- see the layout section (9) below.
 
 ## 1. Hardware / bitstream
 - Bitstream `RocketKU040DroneDualConfig` (garden chipyard, lorenshung `ku040-codesign-cnn`):
@@ -130,3 +135,50 @@ Console on `/dev/ttyUSB3 @ 115200`. Entry 0x80000000.
   `harness_conv0_lo/` + `harness_gemmini_mm_sanity/` (validation harnesses, src only).
 - **Regenerable (gitignored):** `examples/*/*/generated/` model.c/weights/*.bin,
   `build/`, `cache/`, ELFs. Rebuild with `build_ku040_dual.sh`.
+
+
+## 9. NHWC (canonical) -- the layout win
+
+The NCHW build (sections 3-6) pays a per-op layout-conversion penalty inside every
+Gemmini conv kernel. Running the conv chain **native NHWC** removes it. `assign_layouts
+--policy islands` wraps the conv chain in one NHWC island
+(`islands=[[0,2,3,4,5,7,8,9,10,12,13,14,15]]`) and inserts `nchw_to_nhwc` / `nhwc_to_nchw`
+relayouts at the island boundaries (28 dispatch ops total vs 20 for NCHW).
+
+**Kernel picks:** conv0 -> `gemmini_tiled_conv_pool_nhwc`, conv1..conv9 ->
+`gemmini_tiled_conv_nhwc`, relayouts -> `gemmini_blocked_tb32` (a Gemmini RoCC transpose).
+
+**The NHWC kernels live only in the `gemmini_q31_rvv` backend.** To use them on the
+gemmini worker without renaming the on-wire impl (an `impl=gemmini_q31_rvv` FATALs -- the
+runner only knows the core-kinds `rvv`/`gemmini_q31`), map the kind to that backend at
+codegen: `generate_xpurt_main --core-kinds rvv,gemmini_q31 --backends rvv,gemmini_q31_rvv`.
+The generator emits `strcmp(impl,"gemmini_q31") -> DISPATCH_FNS_GEMMINI_Q31_RVV`, so the
+dispatch table keeps `.impl = gemmini_q31` (valid) while hart1 runs the NHWC kernels.
+`MODEL_BACKENDS=gemmini_q31_rvv,rvv`; the gemmini_q31_rvv cflags need `zve64x` (its bn/add
+rvv kernels, unused on hart1) and `-isystem kernels/gemmini_q31_rvv` (the conv2d_pool NHWC
+kernel `#include`s `conv2d_pool_loadonce.h`).
+
+**Schedule (28 ops):** hart1/gemmini (18) = conv0+pool, conv1..conv9, and the 8 relayouts
+(4 `nchw_to_nhwc` + 4 `nhwc_to_nchw`); hart0/rvv (10) = 3 batchnorm, 3 add, relu, 2 linear,
+sigmoid. Relayouts are pinned to hart1 -- `gemmini_blocked_tb32` is a Gemmini-only kernel,
+and keeping them with the conv island is the natural placement.
+
+### Measured on-board (NHWC vs NCHW baseline, same bitstream)
+| metric                     | NCHW baseline | NHWC canonical |
+|----------------------------|--------------:|---------------:|
+| conv1..conv9 (Gemmini)     |       1,587 K |     **174 K** (9x) |
+| conv0 (fused conv+pool)    |         934 K |     **602 K** |
+| relayouts (8, Gemmini)     |             - |         654 K |
+| Gemmini total              |       2,521 K |   **1,429 K** (-43%) |
+| frames/s                   |      ~18-20   |    **~24-27** |
+| VERIFY max_abs_err         |           2   |          3    |
+
+Net win despite the 654 K spent on relayouts: the native-NHWC conv chain more than pays
+for the boundary conversions.
+
+### Next levers (not yet applied)
+- **Fuse bn0 into the NHWC island** to drop the 2 big `C=32, 27x27` boundary relayouts
+  (~377 K of the 654 K relayout cost).
+- **conv0 load-once DIM=32 rewrite** (`conv2d_pool_loadonce.h`, currently path A
+  `tiled_conv_pool_nhwc`): the load-once path measured 602 K -> ~456 K standalone; it needs
+  a DIM=32 rewrite of the load-once kernel (it was authored for the At35 mesh16).
