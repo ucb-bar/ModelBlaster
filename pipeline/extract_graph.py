@@ -41,6 +41,95 @@ import torch.fx
 from torch.fx.passes.shape_prop import ShapeProp
 
 
+
+# ---------------------------------------------------------------------------------------
+# Fused attention: a COLLAPSING REWRITE, not a fused emitter.
+# ---------------------------------------------------------------------------------------
+_FUSE_ATTENTION = os.environ.get("MB_INT8_FUSE_ATTENTION", "0") == "1"
+
+
+def _collapse_attention(ops: list[dict]) -> list[int]:
+    """Collapse each SDPA triple into one `attention_s8` dispatch, KEEPING the three records.
+
+    WHY A REWRITE AND NOT AN EMITTER.  The three records the SDPA branches emit -- `.qk`
+    matmul_b_s8, `.softmax` softmax_s8, `.av` matmul_b_s8 -- are already measured bit-exact on
+    the board.  Collapsing rather than replacing leaves them in the IR as the SPECIFICATION of
+    what the fused kernel must compute, so the fused kernel is checked against three references
+    nobody wrote for this purpose.  A fused emitter would replace them with a new golden and a
+    new reference written together from one reading of the semantics and checked only against
+    each other -- the shape of three defects this campaign has already had to correct.
+
+    PROVENANCE, NOT A SHAPE HEURISTIC.  Both emitters give the triple a common prefix that is the
+    SDPA node's own name -- `extract_graph` uses a dot (`x.qk`) and `extract_graph_export` an
+    underscore (`x_qk`).  Matching on that is exact; matching on "a matmul, a softmax and a
+    matmul that happen to be adjacent" is a guess, and this pass does not make it.
+
+    THE THREE RECORDS MUST NOT LOOK LIVE.  They keep their fields but get `fused_into`, and
+    `_annotate_dispatches` gives them `dispatch_id = None` -- so a per-kind table does not report
+    three dispatches that never ran.  Anything downstream that wants the specification still has
+    it; anything that walks dispatches does not see it.
+
+    Off unless MB_INT8_FUSE_ATTENTION=1, so the default IR is byte-identical.
+    Returns the number of triples collapsed.
+    """
+    if not _FUSE_ATTENTION:
+        return 0
+    by_name = {o["name"]: o for o in ops}
+    reads: dict[str, int] = {}
+    for o in ops:
+        for t in o.get("inputs", []) or []:
+            reads[t] = reads.get(t, 0) + 1
+    fused = 0
+    out: list[dict] = []
+    for op in ops:
+        out.append(op)
+        if op.get("op") != "matmul_b_s8" or op.get("fused_into"):
+            continue
+        for sep in (".", "_"):
+            tail = sep + "av"
+            if not op["name"].endswith(tail):
+                continue
+            base = op["name"][: -len(tail)]
+            qk, sm = by_name.get(base + sep + "qk"), by_name.get(base + sep + "softmax")
+            if qk is None or sm is None:
+                break
+            if qk.get("op") != "matmul_b_s8" or sm.get("op") != "softmax_s8":
+                break
+            scores = (qk.get("outputs") or [None])[0]
+            probs = (sm.get("outputs") or [None])[0]
+            # the dataflow must be exactly qk -> softmax -> av, and the two intermediates must
+            # have no other reader: a fused unit materialises neither, so a second consumer
+            # would silently lose its input.
+            if (sm.get("inputs") != [scores] or not op.get("inputs")
+                    or op["inputs"][0] != probs
+                    or reads.get(scores) != 1 or reads.get(probs) != 1):
+                break
+            q_n, k_n = qk["inputs"][0], qk["inputs"][1]
+            v_n = op["inputs"][1]
+            qs, aq = qk["shape"], qk["quant"]
+            vs, av = op["shape"], op["quant"]
+            out.append({
+                "name": base + sep + "attn", "op": "attention_s8",
+                "inputs": [q_n, k_n, v_n], "outputs": list(op["outputs"]),
+                "shape": {"B": qs["B"], "M": qs["M"], "Dk": qs["K"], "S": qs["N"],
+                          "Dv": vs["N"]},
+                "quant": {"scale_q": aq["scale_a"], "scale_k": aq["scale_b"],
+                          "scale_scores": aq["scale_out"],
+                          "scale_div_sqrt_dk": aq["scale_div_sqrt_dk"],
+                          "scale_probs": av["scale_a"], "scale_v": av["scale_b"],
+                          "scale_out": av["scale_out"],
+                          "activation_min": -128, "activation_max": 127},
+                "fused_from": [qk["name"], sm["name"], op["name"]],
+            })
+            for spec in (qk, sm, op):
+                spec["fused_into"] = base + sep + "attn"
+            fused += 1
+            break
+    if fused:
+        ops[:] = out
+    return fused
+
+
 def _annotate_dispatches(ops: list[dict]) -> list[int]:
     """Promote each non-view op to a first-class dispatch.
 
@@ -59,6 +148,12 @@ def _annotate_dispatches(ops: list[dict]) -> list[int]:
     next_id = 0
     dispatches: list[int] = []
     for op in ops:
+        if op.get("fused_into"):
+            # kept as the fused op's specification; never executed, so never a dispatch.
+            op["dispatch_id"] = None
+            op["hardware_target"] = "any"
+            op["depends_on"] = []
+            continue
         if op["op"] == "view":
             # view aliases input tensor; propagate producer info so
             # downstream ops see the real upstream dispatch.
@@ -821,6 +916,48 @@ def _consumer_clamp_bounds(gm: "torch.fx.GraphModule") -> dict[str, float]:
     return out
 
 
+_GELU_NEG_FLOOR = 8.0
+
+
+def _gelu_only_consumers(gm: "torch.fx.GraphModule") -> set:
+    """Node names whose EVERY consumer is an exact GELU -- empty unless
+    MB_INT8_GELU_AWARE_RANGES=1.
+
+    The GELU counterpart of _consumer_clamp_bounds. A convolution feeding a GELU can
+    carry a negative tail two orders of magnitude beyond its positive range --
+    Moonshine's stem conv3 spans -1,390 .. +29 on real speech -- and a per-tensor
+    max-abs scale sized to that tail leaves the GELU a handful of codes over its whole
+    positive range. Measured on Moonshine: the int8 encoder output's cosine against
+    float moves from 0.56 to 0.78 with this (and the collapse at that one tensor goes);
+    what remains is the per-tensor int8 grid elsewhere, which this does not touch.
+    GELU(x <= -8) is 0 to 1e-15, so the scale only has to span
+    max(positive max, min(negative max, 8)); anything more negative saturates at the
+    producer's int8 floor, which GELU maps to the same 0. Off by default: stock
+    calibration, byte-identical IR.
+    """
+    if os.environ.get("MB_INT8_GELU_AWARE_RANGES", "0") != "1":
+        return set()
+    mods = dict(gm.named_modules())
+
+    def _is_gelu(n) -> bool:
+        if n.op == "call_module":
+            m = mods.get(str(n.target))
+            return isinstance(m, torch.nn.GELU) and getattr(m, "approximate", "none") == "none"
+        if n.op == "call_function":
+            return (n.target is torch.nn.functional.gelu
+                    and n.kwargs.get("approximate", "none") == "none")
+        return False
+
+    out = set()
+    for node in gm.graph.nodes:
+        if node.op in ("output", "placeholder"):
+            continue
+        users = list(node.users)
+        if users and all(_is_gelu(u) for u in users):
+            out.add(node.name)
+    return out
+
+
 def _sim_conv2d_int32_acc(in_4d: np.ndarray, w_q: np.ndarray, b_q: np.ndarray,
                           sh: dict, input_offset: int, filter_offset: int
                           ) -> np.ndarray:
@@ -831,34 +968,40 @@ def _sim_conv2d_int32_acc(in_4d: np.ndarray, w_q: np.ndarray, b_q: np.ndarray,
     (both reference C impls, and every algorithm candidate, use the same
     acc = bias + sum((in + input_offset) * (w + filter_offset)) order).
     """
-    OH, OW = sh["OH"], sh["OW"]
-    KH, KW = sh["KH"], sh["KW"]
-    SH, SW = sh["SH"], sh["SW"]
-    PH, PW = sh["PH"], sh["PW"]
-    out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
-    for n in range(sh["N"]):
-        for oc in range(sh["OC"]):
-            out[n, oc] = b_q[oc]
-            for ic in range(sh["IC"]):
-                for kh in range(KH):
-                    for kw in range(KW):
-                        ih_start = -PH + kh
-                        iw_start = -PW + kw
-                        for oh in range(OH):
-                            ih = oh * SH + ih_start
-                            if ih < 0 or ih >= sh["IH"]:
-                                in_row = np.full(OW, input_offset, dtype=np.int32)
-                            else:
-                                in_row = np.zeros(OW, dtype=np.int32)
-                                for ow in range(OW):
-                                    iw = ow * SW + iw_start
-                                    if iw < 0 or iw >= sh["IW"]:
-                                        in_row[ow] = input_offset
-                                    else:
-                                        in_row[ow] = in_4d[n, ic, ih, iw] + input_offset
-                            w_v = w_q[oc, ic, kh, kw] + filter_offset
-                            out[n, oc, oh] += in_row * w_v
-    return out
+    return _conv2d_acc_exact(in_4d, w_q, b_q, sh, input_offset, filter_offset)
+
+
+def _conv2d_acc_exact(in_4d, w_q, b_q, sh, input_offset, filter_offset) -> np.ndarray:
+    """The int32 conv accumulator, as ONE integer matrix product instead of a Python
+    loop per output element.
+
+    Same function, not an approximation: every tap is (x + input_offset) *
+    (w + filter_offset) with x = 0 outside the input (the loop form's
+    `in_row = input_offset` for an out-of-range tap), summed exactly in int64 and
+    then taken to int32 the way the loop form's int32 `+=` wraps. The loop form took
+    hours on Moonshine's stem (conv2: 576 x 288 x 7 x 331 Python iterations); this
+    takes a second.
+    """
+    N, IC, IH, IW = (int(sh["N"]), int(sh["IC"]), int(sh["IH"]), int(sh["IW"]))
+    OC, OH, OW = int(sh["OC"]), int(sh["OH"]), int(sh["OW"])
+    KH, KW = int(sh["KH"]), int(sh["KW"])
+    SH, SW = int(sh["SH"]), int(sh["SW"])
+    PH, PW = int(sh["PH"]), int(sh["PW"])
+    x = np.asarray(in_4d).reshape(N, IC, IH, IW).astype(np.int64)
+    # Pad far enough for every tap the output extent can reach, on both sides.
+    ph_hi = max(0, (OH - 1) * SH + KH - PH - IH)
+    pw_hi = max(0, (OW - 1) * SW + KW - PW - IW)
+    xp = np.pad(x, ((0, 0), (0, 0), (PH, ph_hi), (PW, pw_hi))) + int(input_offset)
+    out = np.zeros((N, OC, OH, OW), dtype=np.int64)
+    w = (np.asarray(w_q).reshape(OC, IC, KH, KW).astype(np.int64)
+         + int(filter_offset)).reshape(OC, -1)
+    for n in range(N):
+        win = np.lib.stride_tricks.sliding_window_view(xp[n], (KH, KW), axis=(1, 2))
+        win = win[:, : (OH - 1) * SH + 1: SH, : (OW - 1) * SW + 1: SW]   # [IC,OH,OW,KH,KW]
+        cols = np.ascontiguousarray(win.transpose(1, 2, 0, 3, 4)).reshape(OH * OW, -1)
+        out[n] = (cols @ w.T).T.reshape(OC, OH, OW)
+    out += np.asarray(b_q).astype(np.int64).reshape(1, OC, 1, 1)
+    return out.astype(np.int32)
 
 
 def _requantize_multiplier_shift(real_mult: float) -> tuple[int, int]:
@@ -895,36 +1038,8 @@ def _requantize_multiplier_shift(real_mult: float) -> tuple[int, int]:
 def _sim_conv2d_s8(in_arr, sh, q, w_q, b_q):
     """int8 conv2d + Q0.31 requantize (direct sliding window). Weights are
     OIHW ([OC, IC, KH, KW]) — the raw pre-pack layout stored in the blob."""
-    w_q = w_q.astype(np.int32)
-    b_q = b_q.astype(np.int32)
     in_4d = in_arr.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]).astype(np.int32)
-    OH, OW = sh["OH"], sh["OW"]
-    KH, KW = sh["KH"], sh["KW"]
-    SH, SW = sh["SH"], sh["SW"]
-    PH, PW = sh["PH"], sh["PW"]
-    out = np.zeros((sh["N"], sh["OC"], OH, OW), dtype=np.int32)
-    for n in range(sh["N"]):
-        for oc in range(sh["OC"]):
-            out[n, oc] = b_q[oc]
-            for ic in range(sh["IC"]):
-                for kh in range(KH):
-                    for kw in range(KW):
-                        ih_start = -PH + kh
-                        iw_start = -PW + kw
-                        for oh in range(OH):
-                            ih = oh * SH + ih_start
-                            if ih < 0 or ih >= sh["IH"]:
-                                in_row = np.full(OW, q["input_offset"], dtype=np.int32)
-                            else:
-                                in_row = np.zeros(OW, dtype=np.int32)
-                                for ow in range(OW):
-                                    iw = ow * SW + iw_start
-                                    if iw < 0 or iw >= sh["IW"]:
-                                        in_row[ow] = q["input_offset"]
-                                    else:
-                                        in_row[ow] = in_4d[n, ic, ih, iw] + q["input_offset"]
-                            w_v = w_q[oc, ic, kh, kw] + q["filter_offset"]
-                            out[n, oc, oh] += in_row * w_v
+    out = _conv2d_acc_exact(in_4d, w_q, b_q, sh, q["input_offset"], q["filter_offset"])
     scaled = _requantize_int(out, q["output_multiplier"], q["output_shift"])
     scaled += q["output_offset"]
     scaled = np.clip(scaled, q["activation_min"], q["activation_max"])
@@ -1012,6 +1127,68 @@ def _sim_silu_s8(in_arr, q):
     v = np.round(silu_out.astype(np.float32) / np.float32(q["scale_out"])).astype(np.int32)
     v = np.clip(v, q["activation_min"], q["activation_max"])
     return v.astype(np.int8)
+
+
+class _MbLeafTracer(torch.fx.Tracer):
+    """torch.fx.Tracer that also keeps modules declaring `mb_fx_leaf = True` whole.
+
+    A model can then hand the int8 extractor ONE node for a construct that has a
+    single kernel (Moonshine's rotary embedding: one `rope_s8` dispatch) instead of
+    the eight-node slice/neg/stack/flatten/cat subgraph it would trace to. Only the
+    attribute changes anything; torch's own leaf rule is kept for everything else.
+    """
+
+    def is_leaf_module(self, m, module_qualified_name):
+        if getattr(m, "mb_fx_leaf", False):
+            return True
+        return super().is_leaf_module(m, module_qualified_name)
+
+
+def _mb_symbolic_trace(model: torch.nn.Module) -> "torch.fx.GraphModule":
+    """torch.fx.symbolic_trace, unless the model declares an `mb_fx_leaf` module.
+
+    A model that declares none takes torch.fx.symbolic_trace itself, so every graph
+    that traced before this existed traces identically."""
+    if not any(getattr(m, "mb_fx_leaf", False) for m in model.modules()):
+        return torch.fx.symbolic_trace(model)
+    tracer = _MbLeafTracer()
+    graph = tracer.trace(model)
+    return torch.fx.GraphModule(tracer.root, graph, model.__class__.__name__)
+
+
+def _golden_c_float() -> bool:
+    """MB_INT8_GOLDEN_C_FLOAT=1: simulate the float-tail ops the way their C
+    reference evaluates them, so the golden is bit-exact against the device.
+
+    The default simulator for add_s8, mul_s8, softmax_s8, matmul_s8, gelu_s8 and
+    layernorm_s8 is close to, but not the same arithmetic as, the reference C:
+    softmax and matmul evaluate in float64 where the C is float32, gelu divides by
+    scale_out in float64, layernorm pairwise-sums where the C sums sequentially and
+    uses the float64 scale where the C sees the float32 literal, and add_s8 rounds
+    half-to-even (np.round) where the C calls roundf. On a block of a few hundred
+    elements none of that lands on a rounding boundary. On Moonshine's encoder --
+    5.8 M attention-score and 1.3 M softmax elements -- it does, and a golden that
+    disagrees with the reference kernels by an LSB is not a golden.
+
+    OFF by default, so every existing model's io.npz is byte-identical. The ops that
+    first appear alongside this switch (tanh_s8, groupnorm_s8, rope_s8, matmul_b_s8,
+    permute4_s8) are always simulated the C way: they have no earlier golden to keep.
+    """
+    return os.environ.get("MB_INT8_GOLDEN_C_FLOAT", "0") == "1"
+
+
+def _rha64(x):
+    """roundf / round, half away from zero, applied to the value as a float64.
+
+    A float32 array must be widened BEFORE adding 0.5: in float32,
+    0.49999997f + 0.5f rounds to 1.0f and floor() then returns 1, where roundf
+    returns 0."""
+    return _round_half_away(np.asarray(x).astype(np.float64))
+
+
+def _exp32(x32: np.ndarray) -> np.ndarray:
+    """expf, as the nearest float32 to the (float64) exponential of a float32."""
+    return np.exp(x32.astype(np.float64)).astype(np.float32)
 
 
 class _CaptureTensors(torch.fx.Interpreter):
@@ -1312,6 +1489,7 @@ def extract_int8(
     enable_fusion: bool = False,
     fusion_target: "str | None" = None,
     fold_conv_bn: bool = True,
+    range_overrides: "dict[str, float] | None" = None,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -1362,7 +1540,7 @@ def extract_int8(
     else:
         sample_inputs = [sample_input]
 
-    gm = torch.fx.symbolic_trace(model)
+    gm = _mb_symbolic_trace(model)
     # Graph-level BN folding, BEFORE ShapeProp/calibration/quantization —
     # a folded model has no batchnorm2d nodes at all, so everything
     # downstream (activation calibration, op emission) just never sees them.
@@ -1436,9 +1614,78 @@ def extract_int8(
     # clamp it, calibrate the range on what survives the clamp rather than on
     # the raw tensor. Empty dict = stock behaviour, bit-identical IR.
     clamp_hi = _consumer_clamp_bounds(gm)
+    gelu_fed = _gelu_only_consumers(gm)
+
+    # Opt-in (MB_INT8_CALIB_POLICY=pNN[.N], default "max"): calibrate the int8 range on a
+    # PERCENTILE of |t| POOLED OVER ALL CALIBRATION SAMPLES, instead of its maximum, so a handful
+    # of outlier activations do not set the scale for every ordinary one.  Default "max" is the
+    # stock rule and leaves every existing IR bit-identical.
+    #
+    # POOLED, not per-sample-then-max, and the difference is not academic: the largest per-sample
+    # p99.9 is 1.09x the pooled p99.9 at the median tensor but 1.5x on stem conv2/conv3 and 3.11x
+    # on stem conv1 -- the very tensors ROCC_DECOUPLED.md s8.12 identifies as the failure -- and
+    # that cost 5.32 WER points end to end when it was tried (MOONSHINE_MODEL.md s2.8.1).
+    #
+    # Measured on Moonshine Tiny's encoder with an unsplit stem: p99.9 scores 12.33 % WER on
+    # dev-clean 765 against max's 38.14 % -- the policy is worth 25.81 WER points on a model whose
+    # activations have outlier channels.
+    _calib_policy = os.environ.get("MB_INT8_CALIB_POLICY", "max")
+    if _calib_policy != "max" and not (
+            _calib_policy.startswith("p") and _calib_policy[1:].replace(".", "", 1).isdigit()):
+        raise SystemExit(f"MB_INT8_CALIB_POLICY={_calib_policy!r}: expected 'max' or 'pNN[.N]'")
+    _calib_q = float(_calib_policy[1:]) / 100.0 if _calib_policy != "max" else None
+    # |t| samples pooled across calibration samples, bounded so a long calibration cannot grow
+    # without limit.  Only populated when a percentile policy is selected.
+    _calib_pool: dict[str, list] = {}
+    _CALIB_POOL_PER_SAMPLE = 20000
+
+    def _pool(nname: str, t: "torch.Tensor") -> None:
+        v = t.detach().abs().reshape(-1).float()
+        if v.numel() == 0:
+            return
+        if v.numel() > _CALIB_POOL_PER_SAMPLE:
+            # DETERMINISTIC subsample.  This was torch.randint on the global RNG, which made
+            # every pNN extraction irreproducible: the percentile moved run to run, so every
+            # activation scale moved, so the quantised input and the baked golden moved too.
+            # An evenly spaced stride is as unbiased for a percentile as a random draw and it
+            # makes the IR a function of the model and the calibration set alone.
+            step = v.numel() / float(_CALIB_POOL_PER_SAMPLE)
+            idx = (torch.arange(_CALIB_POOL_PER_SAMPLE, device=v.device).double()
+                   * step).long().clamp_(max=v.numel() - 1)
+            v = v[idx]
+        _calib_pool.setdefault(nname, []).append(v.cpu())
+
+    def _apply_calib_percentile() -> None:
+        """Replace each pooled tensor's range with its percentile, never above the max already
+        accumulated (so this can only narrow a range, never widen one)."""
+        for nname, chunks in _calib_pool.items():
+            v = torch.cat(chunks).double()
+            r = float(torch.quantile(v, _calib_q).item())
+            if r > 0.0:
+                max_abs[nname] = min(max_abs.get(nname, r), r)
 
     def _cal_range(nname: str, t: "torch.Tensor") -> float:
         """The magnitude this tensor's int8 scale has to span."""
+        if _calib_q is not None:
+            # Pool the values the stock rule would have taken a maximum of -- the GELU- and
+            # clamp-aware narrowings still apply, because what a consumer deletes is deleted
+            # whatever the policy -- and return the stock maximum for now.  The percentile is
+            # applied once, over the pooled values, by _apply_calib_percentile().
+            if nname in gelu_fed:
+                pos = t.detach().clamp(min=0.0)
+                neg = (-t.detach()).clamp(min=0.0).clamp(max=_GELU_NEG_FLOOR)
+                _pool(nname, torch.cat([pos.reshape(-1), neg.reshape(-1)]))
+            else:
+                hi = clamp_hi.get(nname)
+                _pool(nname, t if hi is None else t.detach().clamp(min=0.0, max=hi))
+        if nname in gelu_fed:
+            # Every consumer is GELU, and GELU(x) for x <= -8 is 0 to within 1e-15:
+            # the negative tail beyond -8 is deleted by the consumer, so spending
+            # codes on it buys nothing. Saturating it at the int8 floor (which the
+            # producer's own clamp does) changes the consumer's output by < 1e-15.
+            pos = float(t.detach().clamp(min=0.0).max().item())
+            neg = float((-t.detach()).clamp(min=0.0).max().item())
+            return max(pos, min(neg, _GELU_NEG_FLOOR))
         hi = clamp_hi.get(nname)
         if hi is None:
             return float(t.detach().abs().max().item())
@@ -1459,6 +1706,34 @@ def extract_int8(
     for nname, t in cap.tensors.items():
         max_abs[nname] = _cal_range(nname, t)
 
+    # MULTI-HEAD scaled_dot_product_attention ([..., heads, S, D] with more than one
+    # head) gets a CALIBRATED attention-score scale: the scores are an internal tensor
+    # of that one FX node, so they are recomputed here from the captured q and k, on
+    # every calibration sample. The single-head form keeps its fixed heuristic below.
+    def _sdpa_mh_nodes():
+        out = []
+        for n in gm.graph.nodes:
+            if not (n.op == "call_function" and getattr(
+                    n.target, "__name__", "") == "scaled_dot_product_attention"):
+                continue
+            tm = n.args[0].meta.get("tensor_meta") if hasattr(n.args[0], "meta") else None
+            if tm is not None and len(tm.shape) == 4 and int(np.prod(tm.shape[:-2])) > 1:
+                out.append(n)
+        return out
+    _sdpa_mh = _sdpa_mh_nodes()
+
+    def _sdpa_score_ranges(tensors: dict) -> None:
+        for n in _sdpa_mh:
+            qt = tensors[n.args[0].name].double()
+            kt = tensors[n.args[1].name].double()
+            sc = n.kwargs.get("scale")
+            sc = float(sc) if sc is not None else 1.0 / float(np.sqrt(qt.shape[-1]))
+            r = float((qt @ kt.transpose(-1, -2)).abs().max().item()) * sc
+            key = f"{n.name}__scores"
+            if r > max_abs.get(key, 0.0):
+                max_abs[key] = r
+    _sdpa_score_ranges(cap.tensors)
+
     if calibration_samples:
         extra = [s for s in calibration_samples
                  if s is not sample_input]
@@ -1474,8 +1749,18 @@ def extract_int8(
                 cur = _cal_range(nname, t)
                 if cur > max_abs.get(nname, 0.0):
                     max_abs[nname] = cur
+            _sdpa_score_ranges(cap_i.tensors)
         print(f"[extract_int8] calibrated across "
               f"{1 + len(extra)} samples", flush=True)
+    if _calib_q is not None:
+        _apply_calib_percentile()
+        print(f"[extract_int8] calibration policy {_calib_policy}: "
+              f"{len(_calib_pool)} tensor ranges set from the pooled percentile", flush=True)
+
+    # patches/0103: a frozen quantisation plan (pipeline/extract_q16.py) supplies the range
+    # of every tensor it names, replacing what calibration measured.  None = stock.
+    if range_overrides:
+        max_abs.update({k: float(v) for k, v in range_overrides.items()})
 
     scales: dict[str, float] = {
         k: max(v, 1e-8) / _INT8_RANGE for k, v in max_abs.items()
@@ -2558,6 +2843,111 @@ def extract_int8(
                     "shape": {"N": N_, "C": C, "IH": IH, "IW": IW,
                               "scale": sf},
                 })
+
+            elif isinstance(mod, torch.nn.Tanh):
+                # A 256-value pointwise map, the same shape as gelu_s8.
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": str(node.target),
+                    "op": "tanh_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {
+                        "scale_in": scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128, "activation_max": 127,
+                    },
+                })
+
+            elif isinstance(mod, torch.nn.GroupNorm):
+                # Only ONE group: a layer norm over all of C*H*W per sample with a
+                # per-CHANNEL affine. Moonshine's stem is GroupNorm(1, 288). More
+                # groups is a different op (per-group statistics) and refuses.
+                if int(mod.num_groups) != 1:
+                    raise NotImplementedError(
+                        f"int8 extract: GroupNorm(num_groups={mod.num_groups}) at "
+                        f"{node.name}; only num_groups=1 lowers to groupnorm_s8")
+                _record(node.name, dtype="i8")
+                in_shape = [int(s) for s in tensors_meta[in_name]["shape"]]
+                if len(in_shape) == 4:
+                    N_, C, H_, W_ = in_shape
+                elif len(in_shape) == 3:
+                    N_, C, W_ = in_shape
+                    H_ = 1
+                else:
+                    raise NotImplementedError(
+                        f"int8 extract: GroupNorm at {node.name} on rank "
+                        f"{len(in_shape)}; only [N,C,L] and [N,C,H,W]")
+                base = f"{node.target}"
+                g = (mod.weight.detach().cpu().numpy().astype(np.float32)
+                     if mod.weight is not None else np.ones((C,), np.float32))
+                b = (mod.bias.detach().cpu().numpy().astype(np.float32)
+                     if mod.bias is not None else np.zeros((C,), np.float32))
+                weights_blob[f"{base}.gamma"] = g
+                weights_blob[f"{base}.beta"] = b
+                ops.append({
+                    "name": base,
+                    "op": "groupnorm_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "weight": f"{base}.gamma",
+                    "bias": f"{base}.beta",
+                    "shape": {"N": N_, "C": C, "H": H_, "W": W_},
+                    "quant": {
+                        "scale_in": scales[in_name],
+                        "scale_out": scales[node.name],
+                        "eps": float(mod.eps),
+                        "activation_min": -128, "activation_max": 127,
+                    },
+                })
+
+            elif getattr(mod, "mb_op", None) == "rope_s8":
+                # A model's own rotary-embedding LEAF (mb_fx_leaf; see
+                # _MbLeafTracer). Contract, per rope_s8's KernelSpec: input
+                # [.., T, heads, head_dim], interleaved pairs (2i, 2i+1) rotated by
+                # the (t, i) angle for i < rotary_dim/2, the rest passed through.
+                if not getattr(mod, "mb_interleaved", False):
+                    raise NotImplementedError(
+                        f"int8 extract: rope at {node.name} is not interleaved; "
+                        f"rope_s8 implements the (2i, 2i+1) pairing only")
+                _record(node.name, dtype="i8")
+                in_shape = [int(s) for s in tensors_meta[in_name]["shape"]]
+                if len(in_shape) < 3 or int(np.prod(in_shape[:-3])) != 1:
+                    raise NotImplementedError(
+                        f"int8 extract: rope at {node.name} on {in_shape}; expects "
+                        f"[1, T, heads, head_dim]")
+                T_, H_, D_ = in_shape[-3:]
+                R_ = int(mod.rotary_dim)
+                cos = mod.cos_tab.detach().cpu().numpy().astype(np.float32)
+                sin = mod.sin_tab.detach().cpu().numpy().astype(np.float32)
+                if cos.shape != (T_, R_ // 2) or sin.shape != (T_, R_ // 2):
+                    raise NotImplementedError(
+                        f"int8 extract: rope tables at {node.name} are {cos.shape}, "
+                        f"expected ({T_}, {R_ // 2})")
+                base = str(getattr(mod, "mb_table_key", None) or node.target)
+                for suffix, arr in ((".cos", cos), (".sin", sin)):
+                    prev = weights_blob.get(base + suffix)
+                    if prev is not None and not np.array_equal(prev, arr.reshape(-1)):
+                        raise RuntimeError(
+                            f"int8 extract: rope table key {base}{suffix} is shared "
+                            f"but {node.name}'s table differs")
+                    weights_blob[base + suffix] = arr.reshape(-1)
+                ops.append({
+                    "name": str(node.target),
+                    "op": "rope_s8",
+                    "inputs": [in_name],
+                    "outputs": [node.name],
+                    "weight": base + ".cos",
+                    "bias": base + ".sin",
+                    "shape": {"T": T_, "H": H_, "D": D_, "R": R_},
+                    "quant": {
+                        "scale_in": scales[in_name],
+                        "scale_out": scales[node.name],
+                        "activation_min": -128, "activation_max": 127,
+                    },
+                })
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported module {type(mod).__name__} "
@@ -2621,6 +3011,18 @@ def extract_int8(
                               "scale_out": scales[node.name],
                               "activation_min": -128, "activation_max": 127},
                 })
+            elif tname == "tanh" or target in (torch.tanh, torch.nn.functional.tanh):
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                ops.append({
+                    "name": node.name, "op": "tanh_s8",
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"n": n},
+                    "quant": {"scale_in": scales[in_name],
+                              "scale_out": scales[node.name],
+                              "activation_min": -128, "activation_max": 127},
+                })
             elif tname == "softmax" or target is torch.softmax \
                     or getattr(target, "__name__", "") == "softmax":
                 in_name = node.args[0].name
@@ -2653,6 +3055,67 @@ def extract_int8(
                     raise NotImplementedError(
                         f"int8 extract: causal sdpa at {node.name} needs a mask "
                         f"kernel; only the unmasked form is supported")
+                _qs4 = [int(s) for s in tensors_meta[q_n]["shape"]]
+                if len(_qs4) == 4 and int(np.prod(_qs4[:-2])) > 1:
+                    # MULTI-HEAD: [B, heads, S, D]. The single-head decomposition
+                    # below flattens every leading axis into M and would compute one
+                    # S*B-long attention across all heads -- the wrong function, with
+                    # nothing to catch it. Lower per head instead: matmul_b_s8 runs B
+                    # independent products over contiguous slices, and softmax_s8
+                    # needs nothing new because a batch of rows is just more rows.
+                    # The operands must already be head-major (the model permutes
+                    # them; those permutes are their own permute4_s8 dispatches).
+                    ks4 = [int(s) for s in tensors_meta[k_n]["shape"]]
+                    vs4 = [int(s) for s in tensors_meta[v_n]["shape"]]
+                    if (float(node.kwargs.get("dropout_p", 0.0) or 0.0) != 0.0
+                            or len(ks4) != 4 or len(vs4) != 4
+                            or ks4[:2] != _qs4[:2] or vs4[:2] != _qs4[:2]
+                            or ks4[3] != _qs4[3] or vs4[2] != ks4[2]):
+                        raise NotImplementedError(
+                            f"int8 extract: multi-head sdpa at {node.name} with q "
+                            f"{_qs4}, k {ks4}, v {vs4}: only equal head counts, no "
+                            f"dropout and matching key/value lengths lower to "
+                            f"matmul_b_s8")
+                    _sc = node.kwargs.get("scale")
+                    Bh, Mq, Dk = _qs4[0] * _qs4[1], _qs4[2], _qs4[3]
+                    Sk, Dv = ks4[2], vs4[3]
+                    scale_div = (1.0 / float(_sc)) if _sc is not None else float(np.sqrt(Dk))
+                    _record(node.name, dtype="i8")
+                    scores = f"{node.name}__scores"
+                    probs = f"{node.name}__probs"
+                    # calibrated in the capture pass (see _sdpa_score_ranges)
+                    sc_scale = max(float(max_abs[scores]), 1e-8) / _INT8_RANGE
+                    for nm, sc in ((scores, sc_scale), (probs, 1.0 / 127.0)):
+                        tensors_meta[nm] = {"shape": [Bh, Mq, Sk], "dtype": "i8",
+                                            "quant": {"scale": sc, "zero_point": 0}}
+                        scales[nm] = sc
+                    ops.append({
+                        "name": f"{node.name}.qk", "op": "matmul_b_s8",
+                        "inputs": [q_n, k_n], "outputs": [scores],
+                        "shape": {"B": Bh, "M": Mq, "K": Dk, "N": Sk,
+                                  "transpose_b": 1},
+                        "quant": {"scale_a": scales[q_n], "scale_b": scales[k_n],
+                                  "scale_out": sc_scale, "transpose_b": 1,
+                                  "scale_div_sqrt_dk": scale_div,
+                                  "activation_min": -128, "activation_max": 127},
+                    })
+                    ops.append({
+                        "name": f"{node.name}.softmax", "op": "softmax_s8",
+                        "inputs": [scores], "outputs": [probs],
+                        "shape": {"M": Bh * Mq, "K": Sk},
+                        "quant": {"scale_in": sc_scale, "scale_out": 1.0 / 127.0},
+                    })
+                    ops.append({
+                        "name": f"{node.name}.av", "op": "matmul_b_s8",
+                        "inputs": [probs, v_n], "outputs": [node.name],
+                        "shape": {"B": Bh, "M": Mq, "K": Sk, "N": Dv,
+                                  "transpose_b": 0},
+                        "quant": {"scale_a": 1.0 / 127.0, "scale_b": scales[v_n],
+                                  "scale_out": scales[node.name], "transpose_b": 0,
+                                  "scale_div_sqrt_dk": 1.0,
+                                  "activation_min": -128, "activation_max": 127},
+                    })
+                    continue
                 _record(node.name, dtype="i8")
                 qs = tensors_meta[q_n]["shape"]; ks = tensors_meta[k_n]["shape"]
                 M = int(np.prod(qs[:-1])); D = int(qs[-1]); S = int(np.prod(ks[:-1]))
@@ -2900,6 +3363,74 @@ def extract_int8(
                     "outputs": [node.name],
                     "shape": {"n": n},
                 })
+            elif target_name in ("view", "reshape", "contiguous", "flatten"):
+                # Every IR tensor is a contiguous buffer in its own shape's
+                # row-major order -- a permute that reorders is a COPY
+                # (permute4_s8 below), never an alias -- so a reshape of any IR
+                # tensor is a pure relabelling of the same bytes: a view.
+                in_name = node.args[0].name
+                _record(node.name, dtype="i8")
+                tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
+                scales[node.name] = scales[in_name]
+                n = int(np.prod(tensors_meta[in_name]["shape"]))
+                if n != int(np.prod(tensors_meta[node.name]["shape"])):
+                    raise NotImplementedError(
+                        f"int8 extract: {target_name} at {node.name} changed "
+                        f"the element count")
+                ops.append({
+                    "name": node.name, "op": "view",
+                    "inputs": [in_name], "outputs": [node.name],
+                    "shape": {"n": n},
+                })
+            elif target_name in ("permute", "transpose"):
+                in_name = node.args[0].name
+                in_shape = [int(s) for s in tensors_meta[in_name]["shape"]]
+                rank = len(in_shape)
+                if target_name == "permute":
+                    dims = list(node.args[1:]) or list(node.kwargs.get("dims", ()))
+                    if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+                        dims = list(dims[0])
+                    perm = [int(d) % rank for d in dims]
+                else:
+                    a0 = int(node.args[1] if len(node.args) > 1 else node.kwargs["dim0"]) % rank
+                    a1 = int(node.args[2] if len(node.args) > 2 else node.kwargs["dim1"]) % rank
+                    perm = list(range(rank))
+                    perm[a0], perm[a1] = perm[a1], perm[a0]
+                if sorted(perm) != list(range(rank)):
+                    raise NotImplementedError(
+                        f"int8 extract: {target_name} at {node.name}: {perm} is not "
+                        f"a permutation of {rank} axes")
+                _record(node.name, dtype="i8")
+                # A reorder never changes a value, so the output keeps the input's
+                # scale and the copy is a pure data move.
+                tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
+                scales[node.name] = scales[in_name]
+                n = int(np.prod(in_shape))
+                moved = [p for p in perm if in_shape[p] != 1]
+                if moved == sorted(moved):
+                    # Only unit axes moved: the element ORDER is unchanged.
+                    ops.append({
+                        "name": node.name, "op": "view",
+                        "inputs": [in_name], "outputs": [node.name],
+                        "shape": {"n": n},
+                    })
+                else:
+                    if rank > 4:
+                        raise NotImplementedError(
+                            f"int8 extract: {target_name} at {node.name} reorders "
+                            f"rank {rank}; permute4_s8 takes at most four axes")
+                    pad = 4 - rank
+                    d4 = [1] * pad + in_shape
+                    p4 = list(range(pad)) + [p + pad for p in perm]
+                    ops.append({
+                        "name": node.name, "op": "permute4_s8",
+                        "inputs": [in_name], "outputs": [node.name],
+                        "shape": {"d0": d4[0], "d1": d4[1], "d2": d4[2], "d3": d4[3],
+                                  "p0": p4[0], "p1": p4[1], "p2": p4[2], "p3": p4[3]},
+                        "quant": {"scale_in": scales[in_name],
+                                  "scale_out": scales[in_name],
+                                  "activation_min": -128, "activation_max": 127},
+                    })
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported call_method "
@@ -2961,6 +3492,7 @@ def extract_int8(
                       if output_names_multi is not None
                       else [output_name])
 
+    _collapse_attention(ops)
     dispatches = _annotate_dispatches(ops)
 
     # Quantize each input with its own scale and surface dtype. int8 inputs are
@@ -3035,6 +3567,13 @@ def extract_int8(
         nm: q for nm, q in zip(input_node_names, inputs_q)
     }
     for op in ops:
+        if op["op"] == "attention_s8":
+            # The fused op is SPECIFIED by the three records it collapsed, which are still in
+            # `ops` marked `fused_into` and which this simulator already knows how to execute.
+            # Skipping it here means the golden is produced BY the specification, so the fused
+            # kernel is checked against three references written for another purpose rather
+            # than against a second reading of its own semantics.
+            continue
         in_name = op["inputs"][0]
         out_name = op["outputs"][0]
         in_arr = activations[in_name]
@@ -3228,8 +3767,13 @@ def extract_int8(
             q = op["quant"]
             a = activations[op["inputs"][0]].astype(np.float32) * np.float32(q["scale_a"])
             b = activations[op["inputs"][1]].astype(np.float32) * np.float32(q["scale_b"])
+            if a.shape != b.shape and a.size == b.size:
+                # Equal element counts stored at different ranks (a view on one
+                # side): the op is elementwise over the flat buffers.
+                a, b = a.reshape(-1), b.reshape(-1)
             f = (a + b) / np.float32(q["scale_out"])
-            v = np.round(f).astype(np.int32)
+            # C: (int32_t)roundf(fout) -- half AWAY from zero, not np.round's half-even.
+            v = (_rha64(f) if _golden_c_float() else np.round(f)).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
         elif op["op"] == "batchnorm2d_s8":
@@ -3253,6 +3797,95 @@ def extract_int8(
             v = np.round(elu_out / np.float32(q["scale_out"])).astype(np.int32)
             v = np.clip(v, q["activation_min"], q["activation_max"])
             activations[out_name] = v.astype(np.int8)
+        elif op["op"] == "mul_s8" and _golden_c_float():
+            q = op["quant"]
+            a = activations[op["inputs"][0]].reshape(-1).astype(np.float32) \
+                * np.float32(q["scale_a"])
+            b = activations[op["inputs"][1]].reshape(-1).astype(np.float32) \
+                * np.float32(q["scale_b"])
+            v = _rha64((a * b) / np.float32(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "tanh_s8":
+            # C: f = (float)x * scale_in; y = tanhf(f); roundf(y / scale_out).
+            # tanhf as the nearest float32 to the float64 tanh of the float32 f.
+            q = op["quant"]
+            f = in_arr.reshape(-1).astype(np.float32) * np.float32(q["scale_in"])
+            y = np.tanh(f.astype(np.float64)).astype(np.float32)
+            v = _rha64(y / np.float32(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "groupnorm_s8":
+            # The reference in double, in the reference's own summation order:
+            # sequential over c, h, w (np.cumsum is sequential; np.sum is pairwise),
+            # with the float32 scale/eps literals the C is handed.
+            sh = op["shape"]; q = op["quant"]
+            N_, C_, H_, W_ = sh["N"], sh["C"], sh["H"], sh["W"]
+            HW = H_ * W_
+            s_in = float(np.float32(q["scale_in"]))
+            s_out = float(np.float32(q["scale_out"]))
+            eps = float(np.float32(q["eps"]))
+            g = weights_blob[op["weight"]].astype(np.float32).astype(np.float64)
+            bta = weights_blob[op["bias"]].astype(np.float32).astype(np.float64)
+            x_all = in_arr.reshape(N_, C_ * HW).astype(np.float64)
+            out = np.zeros((N_, C_ * HW), dtype=np.int8)
+            for n_ in range(N_):
+                xs = x_all[n_] * s_in
+                mu = float(np.cumsum(xs)[-1]) / float(C_ * HW)
+                d = xs - mu
+                var = float(np.cumsum(d * d)[-1]) / float(C_ * HW)
+                inv = 1.0 / np.sqrt(var + eps)
+                xn = d.reshape(C_, HW) * inv
+                y = xn * g[:, None] + bta[:, None]
+                v = _round_half_away(y / s_out)
+                out[n_] = np.clip(v, q["activation_min"],
+                                  q["activation_max"]).astype(np.int8).reshape(-1)
+            activations[out_name] = out
+        elif op["op"] == "rope_s8":
+            # C, float32 throughout, the reference's own operand order:
+            #   y0 = x0*c + (-x1)*s ;  y1 = x1*c + x0*s ;  pass-through d >= R
+            sh = op["shape"]; q = op["quant"]
+            T_, H_, D_, R_ = sh["T"], sh["H"], sh["D"], sh["R"]
+            R2 = R_ // 2
+            x = in_arr.reshape(T_, H_, D_).astype(np.float32) * np.float32(q["scale_in"])
+            c = weights_blob[op["weight"]].astype(np.float32).reshape(T_, 1, R2)
+            s = weights_blob[op["bias"]].astype(np.float32).reshape(T_, 1, R2)
+            y = x.copy()
+            x0 = x[:, :, 0:R_:2]
+            x1 = x[:, :, 1:R_:2]
+            y[:, :, 0:R_:2] = x0 * c + (-x1) * s
+            y[:, :, 1:R_:2] = x1 * c + x0 * s
+            v = _rha64(y / np.float32(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8).reshape(-1)
+        elif op["op"] == "permute4_s8":
+            sh = op["shape"]; q = op["quant"]
+            d4 = [sh["d0"], sh["d1"], sh["d2"], sh["d3"]]
+            p4 = [sh["p0"], sh["p1"], sh["p2"], sh["p3"]]
+            t = np.ascontiguousarray(in_arr.reshape(d4).transpose(p4)).reshape(-1)
+            if np.float32(q["scale_in"]) != np.float32(q["scale_out"]):
+                # C: f = (float)v * ratio; (int32_t)(f >= 0 ? f + 0.5f : f - 0.5f)
+                ratio = np.float32(q["scale_in"]) / np.float32(q["scale_out"])
+                f = t.astype(np.float32) * ratio
+                r = np.where(f >= 0, f + np.float32(0.5), f - np.float32(0.5))
+                t = np.clip(np.trunc(r.astype(np.float64)),
+                            q["activation_min"], q["activation_max"])
+            activations[out_name] = t.astype(np.int8)
+        elif op["op"] == "matmul_b_s8":
+            # C: total = (sa*sb)/(so*sdiv) in float32; v = roundf((float)acc * total)
+            sh = op["shape"]; q = op["quant"]
+            B_, M_, K_, N_ = sh["B"], sh["M"], sh["K"], sh["N"]
+            tb = int(q.get("transpose_b", sh.get("transpose_b", 0)))
+            a = activations[op["inputs"][0]].reshape(B_, M_, K_).astype(np.int64)
+            bm = activations[op["inputs"][1]]
+            bm = (bm.reshape(B_, N_, K_).transpose(0, 2, 1) if tb
+                  else bm.reshape(B_, K_, N_)).astype(np.int64)
+            acc = a @ bm                                            # [B, M, N], exact
+            total = (np.float32(q["scale_a"]) * np.float32(q["scale_b"])) / (
+                np.float32(q["scale_out"]) * np.float32(q.get("scale_div_sqrt_dk", 1.0)))
+            v = _rha64(acc.astype(np.float32) * np.float32(total))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8).reshape(-1)
         elif op["op"] == "mul_s8":
             q = op["quant"]
             # Flatten both: activations are stored with whatever rank their
@@ -3269,6 +3902,61 @@ def extract_int8(
             x = in_arr.astype(np.float64) * float(q["scale_in"])
             y = np.sin(x) if op["op"] == "sin_s8" else np.cos(x)
             v = _round_half_away(y / float(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "softmax_s8" and _golden_c_float():
+            # C: z = ((float)x - (float)max) * scale_in; sum += expf(z) sequentially
+            # in float32; p = expf(z) / sum; roundf(p / scale_out), clamp.
+            sh = op["shape"]; q = op["quant"]
+            xi = in_arr.reshape(sh["M"], sh["K"]).astype(np.float32)
+            z = (xi - xi.max(axis=1, keepdims=True)) * np.float32(q["scale_in"])
+            e = _exp32(z)
+            ssum = np.add.accumulate(e, axis=1, dtype=np.float32)[:, -1:]
+            p = e / ssum
+            v = _rha64(p / np.float32(q["scale_out"]))
+            activations[out_name] = np.clip(v, -128, 127).astype(np.int8)
+        elif op["op"] == "matmul_s8" and _golden_c_float():
+            sh = op["shape"]; q = op["quant"]
+            a = activations[op["inputs"][0]].reshape(sh["M"], sh["K"]).astype(np.int64)
+            bm = activations[op["inputs"][1]]
+            bm = (bm.reshape(sh["N"], sh["K"]).T if sh.get("transpose_b")
+                  else bm.reshape(sh["K"], sh["N"])).astype(np.int64)
+            total = (np.float32(q["scale_a"]) * np.float32(q["scale_b"])) / (
+                np.float32(q["scale_out"]) * np.float32(q.get("scale_div", 1.0)))
+            v = _rha64((a @ bm).astype(np.float32) * np.float32(total))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] == "gelu_s8" and _golden_c_float():
+            q = op["quant"]
+            import math as _math
+            kInvSqrt2 = np.float32(0.70710678118)
+            x = in_arr.astype(np.float32) * np.float32(q["scale_in"])
+            erf = np.vectorize(_math.erf, otypes=[np.float32])
+            y = np.float32(0.5) * x * (np.float32(1.0) + erf(x * kInvSqrt2))
+            v = _rha64(y / np.float32(q["scale_out"]))
+            activations[out_name] = np.clip(
+                v, q["activation_min"], q["activation_max"]).astype(np.int8)
+        elif op["op"] in ("layernorm_s8", "rmsnorm_s8") and _golden_c_float():
+            sh = op["shape"]; q = op["quant"]
+            M, K = sh["M"], sh["K"]
+            s_in = float(np.float32(q["scale_in"]))
+            s_out = float(np.float32(q["scale_out"]))
+            eps = float(np.float32(q["eps"]))
+            xs = in_arr.reshape(M, K).astype(np.float64) * s_in
+            g = weights_blob[op["weight"]].astype(np.float32).astype(np.float64)
+            if op["op"] == "rmsnorm_s8":
+                # kernel_rmsnorm_s8's own order is not mirrored here; refuse rather
+                # than claim a C-exact golden this branch does not compute.
+                raise NotImplementedError(
+                    "MB_INT8_GOLDEN_C_FLOAT=1 has no C-exact rmsnorm_s8 simulator")
+            mu = np.cumsum(xs, axis=1)[:, -1:] / float(K)
+            d = xs - mu
+            var = np.cumsum(d * d, axis=1)[:, -1:] / float(K)
+            inv = 1.0 / np.sqrt(var + eps)
+            y = (d * inv) * g
+            if op.get("bias"):
+                y = y + weights_blob[op["bias"]].astype(np.float32).astype(np.float64)
+            v = _round_half_away(y / s_out)
             activations[out_name] = np.clip(
                 v, q["activation_min"], q["activation_max"]).astype(np.int8)
         elif op["op"] == "softmax_s8":
@@ -3505,6 +4193,14 @@ def extract_int8(
             raise NotImplementedError(
                 f"int8 simulator: unsupported op {op['op']}"
             )
+
+    # MB_INT8_DUMP_ACTIVATIONS=<file.npz>: every tensor the simulator produced, flat,
+    # under its IR name -- so a host build of the generated C can be compared with the
+    # golden at EVERY intermediate, not only at the output. Off by default; writes
+    # nothing else and changes nothing.
+    _dump = os.environ.get("MB_INT8_DUMP_ACTIVATIONS")
+    if _dump:
+        np.savez(_dump, **{k: np.asarray(v).reshape(-1) for k, v in activations.items()})
 
     # Concatenate outputs in IR order (matching multi-output goldens
     # elsewhere). The surface dtype follows the IR: an fp16-promoted tail
@@ -5399,6 +6095,7 @@ def extract(
             if tmeta.get("dtype") == "f32":
                 tmeta["dtype"] = "f16"
 
+    _collapse_attention(ops)
     dispatches = _annotate_dispatches(ops)
     # Build the input IR field. For single-input models the legacy
     # `tensor` key is sufficient. For multi-input (matmul A+B, bmm)

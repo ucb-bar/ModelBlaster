@@ -1864,6 +1864,52 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
     ],
     argtypes_factory=_linear_s8_argtypes,
     algorithms=[
+        # MBP (fpga/pynq-z2/docs/PEXT_SPEC.md). linear is the one op whose reduction
+        # axis is already contiguous in both operands, so DOT8 needs no gather at all --
+        # only 8-byte alignment, which Rocket enforces with a trap. The input row is
+        # copied once per m into an aligned zero-padded scratch; the weight rows are
+        # read where they are and the input copy is SHIFTED to match each row's own
+        # misalignment, because at M = 1 (every linear dispatch in these models) a
+        # repack of the [N,K] weight tensor costs more copies than the DOT8 loop saves.
+        # patches/0102: the decoupled RoCC engine on hart 1 (backend roccmoon).
+        AlgorithmCandidate(
+            name="roccmoon_engine",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "linear_s8 on the decoupled RoCC engine: hart 0 hands the dispatch to a "
+                "hart-1 worker that tiles it over a planar BRAM scratchpad (weights cached "
+                "per layer, activations and results over TileLink), 32 MAC/cycle. Offsets "
+                "must be 0; smaller dispatches and anything else take pext_row_dot8."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_linear_s8_roccmoon_engine.c)"
+            ),
+        ),
+        AlgorithmCandidate(
+            name="pext_row_dot8",
+            target_affinity=("pext", "pext_nl"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "MBP DOT8/QMUL/CLIP8/MAX8 fully-connected layer. The K axis is "
+                "contiguous in both [M,K] input and [N,K] weight, so each "
+                "output is ceil((r+K)/8) MBP.DOT8s straight off the tensors. "
+                "r is the weight row's own 8-byte misalignment; the input row "
+                "is copied once into an aligned scratch with r leading zero "
+                "bytes and trailing zeros to the next multiple of 8, so the "
+                "weight bytes belonging to the neighbouring rows are multiplied "
+                "by zero and K % 8 != 0 costs nothing. r takes only "
+                "8/gcd(K,8) distinct values, so the n loop is walked once per "
+                "residue class with one shifted copy live at a time. The last "
+                "row's final group is done with scalar MACs so nothing reads "
+                "past the weight tensor. Output stage as for conv2d_s8."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext/pext_linear_s8_pext_row_dot8.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
             target_affinity=("ime", "ime_x60"),
@@ -2407,6 +2453,83 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     ],
     argtypes_factory=_conv2d_s8_argtypes,
     algorithms=[
+        # MBP (fpga/pynq-z2/docs/PEXT_SPEC.md) -- eight int8 MACs per DOT8.
+        #
+        # The spec's own kernel is NHWC, where eight consecutive input CHANNELS are
+        # contiguous in both operands. ModelBlaster emits NCHW (every algorithm here
+        # declares act_layouts=("nchw",) and buffers.c is shared by every backend), so
+        # the curated kernel takes the spec's section 6.3 answer for IC % 8 != 0 and
+        # applies it to every shape: gather one output pixel's K = IC*KH*KW reduction
+        # vector into an 8-aligned zero-padded scratch, repack the weight rows to
+        # 8-aligned rows once per dispatch, then run ceil(K/8) flat DOT8s per output
+        # channel, four channels deep. That is also what LeNet needs -- IC = 1 and
+        # IC = 6, which are not 8-wide in ANY layout.
+        #
+        # weight_layout stays "oihw": the reduction axis (ic, kh, kw) is already
+        # contiguous per output channel in PyTorch's own packing, which is exactly the
+        # order the gathered patch is built in.
+        # patches/0102: the decoupled RoCC engine on hart 1 (backend roccmoon).
+        AlgorithmCandidate(
+            name="roccmoon_engine",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="oihw",
+            description=(
+                "1-D conv2d_s8 (IH = KH = 1, no padding) on the decoupled RoCC engine: "
+                "the NCHW input is gathered once into an NHWC-contiguous window, the "
+                "engine strides it by SW*IC/8 words per output pixel with no im2col, and "
+                "the output is transposed back. Everything else takes pext_patch_dot8."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_conv2d_s8_roccmoon_engine.c)"
+            ),
+        ),
+        # patches/0105.  roccmoon_engine on NHWC activations: the engine strides an
+        # NHWC-contiguous window and writes [OW, OC], so on an NHWC island the gather and
+        # the transpose disappear (Moonshine's stem: 35 M of 983 M cycles, measured).
+        AlgorithmCandidate(
+            name="roccmoon_engine_nhwc",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="oihw",
+            act_layouts=("nhwc",),
+            description=(
+                "1-D conv2d_s8 on the decoupled RoCC engine with NHWC input and output: "
+                "no staging (one copy only for a misaligned input). Anything the engine "
+                "does not take is relaid to NCHW for pext_patch_dot8."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_conv2d_s8_roccmoon_engine_nhwc.c)"
+            ),
+        ),
+        AlgorithmCandidate(
+            name="pext_patch_dot8",
+            target_affinity=("pext", "pext_nl"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="oihw",
+            description=(
+                "MBP DOT8/QMUL/CLIP8/MAX8 direct convolution for NCHW "
+                "activations. Per output pixel, gather the K = IC*KH*KW "
+                "reduction vector into an 8-byte-aligned, zero-padded scratch "
+                "in (ic, kh, kw) order -- the order OIHW weights already have "
+                "-- and consume it with ceil(K/8) MBP.DOT8s per output "
+                "channel, unrolled four channels deep so one patch load feeds "
+                "four accumulators. Weights are repacked once per dispatch to "
+                "8-aligned rows because `weight + oc*K` is misaligned whenever "
+                "K % 8 != 0 and Rocket traps on misaligned loads. Out-of-bounds "
+                "taps and the align8 tail become zero bytes, which is exact "
+                "because input_offset and filter_offset are 0. The output "
+                "stage is MBP.QMUL, then a scalar round-half-up shift with the "
+                "rounding constant hoisted out of the loop, then MBP.CLIP8, "
+                "then MBP.MAX8 against x0 when activation_min == 0."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext/pext_conv2d_s8_pext_patch_dot8.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="indir_gemm",
             target_affinity=("rvv_opu",),
@@ -4018,6 +4141,33 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
     ],
     argtypes_factory=_maxpool2d_s8_argtypes,
     algorithms=[
+        # MBP (fpga/pynq-z2/docs/PEXT_SPEC.md section 2). MAX8 is in the ISA because of
+        # pooling, not because of ReLU -- DroNet's 3x3/s2 pool over 32 channels at 56x56
+        # is 2.27 M instructions, 16% of the post-MBP frame; the SWAR ReLU kernel already
+        # does eight ReLUs in four ordinary instructions.
+        AlgorithmCandidate(
+            name="pext_max8_rows",
+            target_affinity=("pext", "pext_nl"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "MBP.MAX8 max-pool for NCHW, in two passes because W is the "
+                "innermost axis. Pass 1 collapses the KH source rows of one "
+                "output row into a scratch row of vertical maxima, eight "
+                "columns per MBP.MAX8 with no lane interaction. Pass 2 takes "
+                "the horizontal maxima out of that row: for the common "
+                "non-overlapping KW == SW == 2 window that is also MBP.MAX8 "
+                "(max8(c, c >> 8) leaves the four pairwise maxima in lanes 0, "
+                "2, 4, 6), otherwise a scalar sweep of KW compares. Requires "
+                "PH == PW == 0, DH == DW == 1, IW % 8 == 0 and an 8-aligned "
+                "input so every row load is aligned -- Rocket traps on "
+                "misaligned rather than emulating; anything else falls through "
+                "to the reference expression."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext/pext_maxpool2d_s8_pext_max8_rows.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="gemmini_tiled_conv_pool",
             target_affinity=("gemmini", "gemmini_q31"),
@@ -4195,6 +4345,29 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
     extra_shapes=[{"n": 1}, {"n": 17}, {"n": 8192}],
     argtypes_factory=_add_s8_argtypes,
     algorithms=[
+        # patches/0100.  The residual add: 706 cycles/element as the float reference on
+        # this WithoutFPU core, 19 % of ffn_block after patches/0060 (ROCC_DECOUPLED.md
+        # 2.3), two per Moonshine encoder layer.
+        AlgorithmCandidate(
+            name="pext_int_add",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Integer, and bit-exact against this float32 reference.  Fast path: "
+                "two 256-entry int64 tables per dispatch (a*sa/so, b*sb/so in fixed "
+                "point), so an element is two loads, an add, a rounding shift and a "
+                "clamp.  Guard: the float32 chain errs by at most 3.0001*2^-24 of "
+                "(|a|sa+|b|sb)/so, the tables by a known number of units; an element "
+                "further than both bounds from every half-integer rounds as the "
+                "reference does, and any other element is evaluated in exact IEEE-754 "
+                "binary32 arithmetic on integers (fpga/pynq-z2/sw/fexact32.h) -- the "
+                "reference's own operations in its own order.  No floating-point "
+                "instruction executes; the scales are decoded from their bit patterns."
+            ),
+            reference_impl=(
+                "(use the curated kernel pext_nl/pext_nl_add_s8_pext_int_add.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="gemmini_resadd",
             target_affinity=("gemmini", "gemmini_q31"),
@@ -6514,6 +6687,29 @@ void kernel_permute4_s8(const int8_t *input, int8_t *output,
          "scale_in": 0.02, "scale_out": 0.02,
          "activation_min": -128, "activation_max": 127},
     ],
+    algorithms=[
+        # patches/0107.  The reference with its per-element soft-float compare and index
+        # arithmetic removed: every index is a pointer advanced by a stride, and when the innermost output axis is the
+        # input's innermost axis (attention head split/merge) each output row is one
+        # contiguous run, copied a 64-bit word at a time.  BIT-EXACT (the same elements in
+        # the same order; a requantising permute keeps the reference's float expression).
+        # Its curated file lives outside the default curated tree
+        # (iiswc-tutorial fpga/pynq-z2/modelblaster/kernels_t1), so no existing build
+        # changes its pick; the synthesized `direct` candidate follows it.
+        AlgorithmCandidate(
+            name="pext_block",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Rank-4 permute with stride pointers instead of per-element index "
+                "multiplies; contiguous innermost runs copied a 64-bit word at a time."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_permute4_s8_pext_block.c)"
+            ),
+        ),
+    ],
     argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
 )
 
@@ -6575,6 +6771,147 @@ void kernel_matmul_b_s8(const int8_t *a, const int8_t *b, int8_t *output,
          "activation_min": -128, "activation_max": 127},
     ],
     argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
+    algorithms=[
+        # patches/0100: multi-head attention in the FX int8 path lowers to this op
+        # (Q.K^T and probs.V per head).  pext_nl's matmul_s8 kernel takes DOT8 only
+        # when K % 8 == 0 and the operands happen to be 8-aligned; Moonshine's head_dim
+        # is 36 and its value product reads V by column, so it would never get there.
+        AlgorithmCandidate(
+            name="pext_dot8_exact",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Per batch, A's rows and B's rows (B's COLUMNS when not transpose_b) "
+                "are copied once into 8-aligned int64 scratch, zero-padded to a "
+                "multiple of 8, so every output element is ceil(K/8) MBP.DOT8s for any "
+                "K.  The requantise tail is integer and bit-exact: `total` is the "
+                "reference's own float32 (sa*sb)/(so*sdiv), computed once in exact "
+                "binary32 arithmetic (fpga/pynq-z2/sw/fexact32.h); P = |acc|*mantissa "
+                "is the exact product the reference rounds, and unless P lies within "
+                "that rounding's error of a half-integer the answer is one rounding "
+                "shift -- otherwise the exact binary32 slow path."
+            ),
+            reference_impl=(
+                "(use the curated kernel pext_nl/pext_nl_matmul_b_s8_pext_dot8_exact.c)"
+            ),
+        ),
+    ],
+)
+
+
+ATTENTION_S8 = KernelSpec(
+    op="attention_s8",
+    signature=(
+        "void kernel_attention_s8(const int8_t *q, const int8_t *k, const int8_t *v, "
+        "int8_t *output, int B, int M, int Dk, int S, int Dv, "
+        "float scale_q, float scale_k, float scale_scores, float scale_div_sqrt_dk, "
+        "float scale_probs, float scale_v, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Fused int8 scaled-dot-product attention -- exactly the composition of the\n"
+        "three dispatches the SDPA branches emit, and defined as that composition\n"
+        "rather than independently:\n"
+        "  scores = matmul_b_s8(q, k, transpose_b=1, scale_div=scale_div_sqrt_dk)\n"
+        "  probs  = softmax_s8(scores)\n"
+        "  out    = matmul_b_s8(probs, v, transpose_b=0)\n"
+        "with the intermediates at scale_scores and scale_probs respectively.\n\n"
+        "THE POINT IS THAT THE INTERMEDIATES ARE NEVER MATERIALISED.  The three-op\n"
+        "form writes and re-reads two [B, M, S] buffers -- 217 kB each at Moonshine's\n"
+        "encoder shapes -- which is the traffic a fused unit exists to remove.  The\n"
+        "reference below still materialises them, because a reference is for being\n"
+        "obviously correct, not fast; a curated kernel that drives the attention unit\n"
+        "is checked against it.\n\n"
+        "Emitted only by the collapsing rewrite in extract_graph._collapse_attention\n"
+        "(MB_INT8_FUSE_ATTENTION=1), which LEAVES the three original records in the IR\n"
+        "marked `fused_into`, so this kernel's specification is three references that\n"
+        "were written and measured for another purpose."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+#include <math.h>
+#include <stdlib.h>
+
+void kernel_attention_s8(const int8_t *q, const int8_t *k, const int8_t *v,
+                         int8_t *output, int B, int M, int Dk, int S, int Dv,
+                         float scale_q, float scale_k, float scale_scores,
+                         float scale_div_sqrt_dk, float scale_probs, float scale_v,
+                         float scale_out, int activation_min, int activation_max) {
+    /* Composed exactly as the three dispatches compose, in the same order and at the
+       same intermediate scales, so that any disagreement is this kernel's. */
+    int8_t *scores = (int8_t *)malloc((size_t)B * M * S);
+    int8_t *probs  = (int8_t *)malloc((size_t)B * M * S);
+    if (!scores || !probs) { free(scores); free(probs); return; }
+
+    float qk_total = (scale_q * scale_k) / (scale_scores * scale_div_sqrt_dk);
+    for (int b = 0; b < B; b++)
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < S; j++) {
+                int32_t acc = 0;
+                for (int d = 0; d < Dk; d++)
+                    acc += (int32_t)q[(b*M + i)*Dk + d] * (int32_t)k[(b*S + j)*Dk + d];
+                float r = roundf((float)acc * qk_total);
+                if (r < (float)activation_min) r = (float)activation_min;
+                if (r > (float)activation_max) r = (float)activation_max;
+                scores[(b*M + i)*S + j] = (int8_t)r;
+            }
+
+    for (int row = 0; row < B * M; row++) {
+        const int8_t *sr = scores + (size_t)row * S;
+        int8_t mx = sr[0];
+        for (int j = 1; j < S; j++) if (sr[j] > mx) mx = sr[j];
+        float sum = 0.0f;
+        for (int j = 0; j < S; j++) sum += expf(((float)sr[j] - (float)mx) * scale_scores);
+        for (int j = 0; j < S; j++) {
+            float p = expf(((float)sr[j] - (float)mx) * scale_scores) / sum;
+            float r = roundf(p / scale_probs);
+            if (r < 0.0f) r = 0.0f;
+            if (r > 127.0f) r = 127.0f;
+            probs[(size_t)row * S + j] = (int8_t)r;
+        }
+    }
+
+    float av_total = (scale_probs * scale_v) / scale_out;
+    for (int b = 0; b < B; b++)
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < Dv; j++) {
+                int32_t acc = 0;
+                for (int t = 0; t < S; t++)
+                    acc += (int32_t)probs[(b*M + i)*S + t] * (int32_t)v[(b*S + t)*Dv + j];
+                float r = roundf((float)acc * av_total);
+                if (r < (float)activation_min) r = (float)activation_min;
+                if (r > (float)activation_max) r = (float)activation_max;
+                output[(b*M + i)*Dv + j] = (int8_t)r;
+            }
+    free(scores);
+    free(probs);
+}
+""",
+    algorithms=[
+        # patches/0109's sibling: the ATTENTION UNIT inside the decoupled RoCC engine
+        # (mbxa_core as lane 0, mbxr_smx as lane 1).  Bit-exact because the unit computes
+        # this KernelSpec's composition term for term -- ATTENTION_UNIT.md s3: 28,453,700
+        # requantises and 210 dispatches / 441,695 bytes / 0 differ against the RTL, on four
+        # models' own activations.  Shapes the unit refuses fall back to the three curated
+        # kernels this spec is DEFINED as, so the fallback is the specification.
+        AlgorithmCandidate(
+            name="roccmoon_lane",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "One dispatch per (layer, head) to mbxa_core: a planar weight image "
+                "carrying k and v-transpose, a q activation image, and a drain straight "
+                "into the output tensor.  The two 217 kB intermediates are never "
+                "materialised -- they live in the unit's score ring.  Spins to the "
+                "computed completion before polling, because a cross-hart status read "
+                "costs 989 cycles on the board and one head is 79 of them long."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_attention_s8_roccmoon_lane.c)"
+            ),
+        ),
+    ],
 )
 
 
@@ -7737,6 +8074,28 @@ void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
     ],
     argtypes_factory=_silu_s8_argtypes,
     algorithms=[
+        # Lab B28's decoder profile: silu_s8 is 30.19 % of a Moonshine decoder at 2,800.23
+        # cycles/element, because the reference evaluates expf and a float divide PER ELEMENT
+        # on a core with no FPU.  With zero_point 0 it is a 256-entry pointwise map, the same
+        # shape gelu_s8 is, and the table is the reference memoised -- so bit_exact.
+        AlgorithmCandidate(
+            name="pext_memo_lut",
+            target_affinity=("pext_nl", "pext"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SiLU via the reference's own expression memoised into a 256-entry int8 "
+                "table, filled only for the input bytes that occur.  Bit-exact by "
+                "construction: every entry is the reference float32 expression, and the "
+                "kernel contains no other arithmetic.  The rate is a function of the "
+                "dispatch size AND of the distinct-byte count D -- fill is D*E with E the "
+                "reference's own per-evaluation cost, so it does NOT amortise at a "
+                "decoder's n = 1,152 the way it does at an encoder's 190,080."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_silu_s8_pext_memo_lut.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="rvv_lut_gather",
             target_affinity=("rvv_opu",),
@@ -7783,6 +8142,31 @@ void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
         # because there was no (op, algorithm) pair for a Gemmini target to
         # probe for and it ran the reference's expf per element.
         _gemmini_scalar_lut_algo("silu_s8", "expf"),
+        # The same 256-entry table with no float in it at all -- the sibling the memo_lut
+        # candidate above names and declines.  Lab B42 measured why it matters: a FLOAT table
+        # entry costs 5,087 cycles on this core and an INTEGER one 702 (T4_LANES.md s13), and
+        # silu_s8 is 95.1 % table build because its 144 dispatches carry 144 DISTINCT scale
+        # pairs and no cache across them is possible.  Worth 52.9 % of the operator with no
+        # accelerator.
+        AlgorithmCandidate(
+            name="pext_int_lut",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "int_nonlin.c's int_silu_s8: the same 256-entry table, filled by a "
+                "fixed-point sigmoid over the exp2 table int_softmax_s8 already "
+                "carries instead of expf.  No floating-point instruction executes; "
+                "scale_in and scale_out are decoded from their IEEE-754 bit "
+                "patterns.  The input domain is 256 values, so accuracy is "
+                "ENUMERATED rather than sampled: over the model's own 144 "
+                "(scale_in, scale_out) pairs x 256 inputs, 101 of 36,864 differ "
+                "and every one by 1 LSB."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_silu_s8_pext_int_lut.c)"
+            ),
+        ),
     ],
 )
 
@@ -8583,7 +8967,60 @@ CAT2_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32],  "C_total": 48},
     ],
     argtypes_factory=_cat2_c1_s8_argtypes,
-    algorithms=[_cat_gemmini_mvin_scale_algorithm(2)],
+    algorithms=[
+        # Lab B28: 26.42 % of a Moonshine decoder at 393.44 cycles/element for what looks
+        # like a byte copy.  It is not one -- the reference dequantises each input by its own
+        # scale and requantises to scale_out, per element, in soft float.  Per input that is
+        # a 256-entry pointwise map.
+        AlgorithmCandidate(
+            name="pext_memo_lut",
+            target_affinity=("pext_nl", "pext"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "One 256-entry int8 table per input, each entry the reference's own "
+                "float32 expression, filled only for the bytes that input contains; the "
+                "copy loop has no arithmetic.  memcpy when an input's scale equals "
+                "scale_out (the map is then the identity).  Does NOT address the larger "
+                "cost: the decoder's shapes are C_inputs = [t, 1], a KV-cache append that "
+                "re-copies the whole cache every token -- O(T^2) where an append is O(1), "
+                "which is a lowering change."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_cat2_c1_s8_pext_memo_lut.c)"
+            ),
+        ),
+        _cat_gemmini_mvin_scale_algorithm(2),
+        # T4's LUT LANE.  Registered for this op and NOT for silu_s8, and the difference is
+        # measured rather than stylistic: cat2_c1_s8 is 62.3 % table build with a builder that
+        # costs 221 cycles/entry (a multiply, a divide, a round -- no transcendental), so the
+        # 37.7 % that is the GATHER is worth removing; silu_s8 is 95.1 % build with a 5,087
+        # cycles/entry float builder, where the lane is worth 3.7 % and an integer builder is
+        # worth 52.9 % (T4_LANES.md s13, LANE_DISPATCH_RULES.md s8).
+        #
+        # BIT_EXACT: the lane is a pure 256-entry map and the table is this op's own expression,
+        # so the only risk is transcription, and that is checked against the curated kernel
+        # compiled under a rename rather than against a golden rebuilt from the transcription.
+        AlgorithmCandidate(
+            name="roccmoon_lut",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "One lane dispatch per input tensor -- the layout is [N, C, H*W], so "
+                "each input is one CONTIGUOUS RUN in both source and destination and "
+                "the drain writes straight into the caller's tensor.  Only the table "
+                "entries the run actually contains are written through lcfg: across "
+                "552 dispatches the difference between writing D and writing 256 is "
+                "0.7 M cycles.  The identity case (scale_i == scale_out, full clamp) "
+                "stays a copy -- a lane dispatch that computes the identity is a "
+                "dispatch spent to achieve nothing."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_cat2_c1_s8_roccmoon_lut.c)"
+            ),
+        ),
+    ],
 )
 
 CAT3_C1_S8 = KernelSpec(
@@ -8695,6 +9132,24 @@ void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
     extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}, {"n": 8192}],
     argtypes_factory=_mul_s8_argtypes,
     algorithms=[
+        # patches/0100.  704 cycles/element as the float reference (ROCC_DECOUPLED.md
+        # 2.2); the SiLU gate of every Moonshine decoder MLP.
+        AlgorithmCandidate(
+            name="pext_int_mul",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Integer, and bit-exact against this float32 reference: a 256-entry "
+                "int64 table b*sa*sb/so per dispatch, one int8-by-int64 multiply per "
+                "element, a rounding shift and a clamp; elements within the float32 "
+                "chain's error bound (4.0001*2^-24 of the result, taken per element) "
+                "plus the table's of a half-integer take the exact binary32 slow path "
+                "of fpga/pynq-z2/sw/fexact32.h.  No floating-point instruction executes."
+            ),
+            reference_impl=(
+                "(use the curated kernel pext_nl/pext_nl_mul_s8_pext_int_mul.c)"
+            ),
+        ),
         # This op had no AlgorithmCandidate at all, so the curated probe had
         # no (op, algorithm) pair to look for on any target and every mul ran
         # the scalar reference inside builds labelled rvv_x60 -- 19.3% of
@@ -8776,6 +9231,56 @@ void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
     extra_shapes=[{"n": 1}, {"n": 32}, {"n": 2048}],
     argtypes_factory=_gelu_s8_argtypes,
     algorithms=[
+        # MBP.  The interesting thing about this one is that it uses no MBP
+        # instruction: with per-tensor symmetric quantisation gelu_s8 is a pointwise map
+        # from 256 input bytes to 256 output bytes, so evaluating erff once per ELEMENT
+        # is never necessary whatever arithmetic it is evaluated in.  Lab B19 measured
+        # the reference at 3,093 cycles/element on a 131,072-element ffn_block
+        # activation -- 405 million cycles to evaluate a 256-entry function.  Measured
+        # on the board at that same dispatch: 5,320 -> 31 cycles/element, max_abs_err 0.
+        AlgorithmCandidate(
+            name="pext_memo_lut",
+            target_affinity=("pext", "pext_nl"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "One marking pass over the input, erff for each of the at most "
+                "256 DISTINCT byte values that actually occur, then a byte "
+                "gather.  Bit-exact by construction: every table entry is the "
+                "reference's own expression in float32 with the same "
+                "kInvSqrt2, the same casts and the same roundf, and there is "
+                "no arithmetic anywhere else in the kernel.  Below a small-n "
+                "guard the reference expression runs per element instead."
+            ),
+            reference_impl=(
+                "(use the curated kernel pext/pext_gelu_s8_pext_memo_lut.c)"
+            ),
+        ),
+        # The same table with no float in it at all.  Worth a further 1.55x over the
+        # erff-filled table and, more usefully, INPUT-INDEPENDENT: picolibc's erff takes
+        # a rational polynomial below |x| = 0.84 and an expf above it, so the float
+        # kernel measured 3,093 cycles/element on one activation and 6,605 on another.
+        AlgorithmCandidate(
+            name="pext_int_lut",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "int_nonlin.c's int_gelu_s8: the same 256-entry table, filled "
+                "by a fixed-point erf (Abramowitz & Stegun 7.1.26 over the "
+                "exp2 table int_softmax_s8 already carries) instead of erff. "
+                "No floating-point instruction executes; scale_in and "
+                "scale_out are decoded from their IEEE-754 bit patterns. "
+                "Measured 5,320 -> 20 cycles/element at n = 131,072.  The "
+                "input domain is 256 values, so accuracy is ENUMERATED rather "
+                "than sampled: over 144 (scale_in, scale_out) pairs x 256 "
+                "inputs, 99 of 36,864 differ, every one by 1 LSB, and every "
+                "one sits within 0.014 LSB of an exact half-integer rounding "
+                "boundary."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_gelu_s8_pext_int_lut.c)"
+            ),
+        ),
         # This op had no AlgorithmCandidate, so gelu ran the scalar reference
         # inside builds labelled rvv_x60 and ime_x60 -- 29.7% of ffn_block on
         # the vector unit and 42.2% of it on the MAC unit, the largest single
@@ -8821,7 +9326,883 @@ void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
         ),
         # Kernel: kernels/gemmini_q31/gemmini_q31_gelu_s8_scalar_lut.c
         _gemmini_scalar_lut_algo("gelu_s8", "erff"),
+        # T4's LUT LANE inside the decoupled RoCC engine (T4_LANES.md, mbxl_lut), measured on
+        # silicon at 0.1253 cycles/element -- one 64-bit word in and one out per cycle,
+        # 187,904 bytes byte-compared and 0 differing (EXPERIMENT_LOG L310).
+        #
+        # NAMED roccmoon_lut, NOT roccmoon_lane, and the distinction is load-bearing: this
+        # engine has THREE lanes and feature_gate.py prices what silicon a kernel needs on
+        # (op, algorithm).  Its table already carried ("gelu_s8", "roccmoon_lut") -> lut_lane
+        # before this kernel existed; matching that name is how a lane kernel declares the lane
+        # it needs, and it is what refused this kernel's first board arm.
+        # LAST IN THIS LIST ON PURPOSE.  The curated probe walks these in order and takes the
+        # first whose file exists, so appending leaves every other lab's pick exactly where it
+        # was; a run that wants the lane removes the earlier files from ITS OWN copy of the
+        # kernel tree, which is how scripts/50 and scripts/57 have always steered a pick.
+        #
+        # NUMERIC_DRIFT, NOT BIT_EXACT, and the distinction is the point.  The table is built
+        # by int_nonlin.c's int_gelu_s8_table -- the pext_int_lut kernel's OWN builder -- so
+        # this kernel is bit-identical to THAT kernel by construction.  Against the float
+        # reference above it inherits pext_int_lut's 1-LSB drift exactly, so it inherits its
+        # accuracy class too.  Claiming BIT_EXACT here would be a claim about the wrong
+        # comparison.
+        AlgorithmCandidate(
+            name="roccmoon_lut",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "The 256-entry table is written into mbxl_lut through lcfg ONCE PER "
+                "OPERATOR, and the tensor is then mapped eight elements per cycle. "
+                "Tiled at the activation buffer's 1,024-word reach; a scalar head of "
+                "under 64 elements aligns the destination so every tile's drain writes "
+                "STRAIGHT INTO THE CALLER'S TENSOR, and word0 absorbs the fill's "
+                "alignment, so nothing is staged and nothing is copied out.  That "
+                "matters more than the rate: a byte-wise copy-out of a lane's result "
+                "costs more than the lane saves (LANE_DISPATCH_RULES.md s1)."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_gelu_s8_roccmoon_lut.c)"
+            ),
+        ),
     ],
+)
+
+
+# ---------------------------------------------------------------------------
+# Moonshine's encoder (patches/0100): tanh, GroupNorm(1), rotary embedding.
+# All three were absent from ModelBlaster, which is what kept the model from being
+# code-generated at all (ROCC_DECOUPLED.md 7.8).  Each reference is written in the
+# same float shape as the op it most resembles -- tanh_s8 as gelu_s8, groupnorm_s8
+# as layernorm_s8, rope_s8 as mul_s8 -- and extract_graph's int8 simulator mirrors
+# each one's arithmetic (float32 where the C is float32, sequential double sums where
+# the C sums sequentially), so the baked golden is the reference's own answer.
+# ---------------------------------------------------------------------------
+
+def _groupnorm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, beta, output, N, C, H, W, scale_in, scale_out, eps, amin, amax
+    return [i8p, fp, fp, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+def _rope_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, cos_tab, sin_tab, output, T, H, D, R, scale_in, scale_out, amin, amax
+    return [i8p, fp, fp, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+TANH_S8 = KernelSpec(
+    op="tanh_s8",
+    signature=(
+        "void kernel_tanh_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized tanh on a contiguous int8 buffer, per-tensor symmetric\n"
+        "(zero_point = 0), in float32 like gelu_s8:\n"
+        "  f = input[i] * scale_in\n"
+        "  output[i] = clamp(roundf(tanhf(f) / scale_out), activation_min, activation_max)\n"
+        "roundf is round-half-AWAY-from-zero. With per-tensor quantisation this is\n"
+        "a map from 256 input bytes to 256 output bytes, so a memoised table is\n"
+        "exact by construction (see the pext_memo_lut candidate)."
+    ),
+    reference_impl="""\
+void kernel_tanh_s8(const int8_t *input, int8_t *output, int n,
+                    float scale_in, float scale_out,
+                    int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = tanhf(f);
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 31}, {"n": 32}, {"n": 4096}],
+    argtypes_factory=_gelu_s8_argtypes,
+    algorithms=[
+        # Moonshine's stem runs tanh over 287,712 elements (4 s of audio), and on a
+        # WithoutFPU core the reference is one soft-float tanhf per element.
+        AlgorithmCandidate(
+            name="pext_memo_lut",
+            target_affinity=("pext", "pext_nl"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "gelu_s8's pext_memo_lut with tanhf for erff: one marking pass "
+                "over the input, the reference expression (same float32 casts, "
+                "same tanhf, same roundf, same clamp) for each of the at most 256 "
+                "byte values that occur, then a byte gather.  Bit-exact by "
+                "construction; no arithmetic outside the table fill.  Below a "
+                "small-n guard the reference runs per element."
+            ),
+            reference_impl=(
+                "(use the curated kernel pext/pext_tanh_s8_pext_memo_lut.c)"
+            ),
+        ),
+        # The same lane and the same tile loop as gelu_s8's roccmoon_lut candidate; only the
+        # table differs, and appended last for the same reason.
+        #
+        # BIT_EXACT, unlike gelu's, and for a reason worth stating: gelu's curated kernel
+        # exports a table builder this one can CALL, while this op's does not -- so the table
+        # here is a TRANSCRIPTION of pext_memo_lut's expression, tanhf and roundf included, in
+        # the same order (roundf(y / scale_out), not a multiply by a reciprocal).  It is bit-
+        # exact against the reference because that expression is the reference, and the risk
+        # that a transcription drifts is bounded by checking it against the curated kernel
+        # compiled under a rename rather than against a golden rebuilt from itself.
+        AlgorithmCandidate(
+            name="roccmoon_lut",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "tanh_s8 on mbxl_lut: the same 256-entry map, the same one-table-per-"
+                "operator lcfg load and the same head/tile/tail plan as gelu_s8's "
+                "roccmoon_lut, drained straight into the caller's tensor."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_tanh_s8_roccmoon_lut.c)"
+            ),
+        ),
+    ],
+)
+
+
+GROUPNORM_S8 = KernelSpec(
+    op="groupnorm_s8",
+    signature=(
+        "void kernel_groupnorm_s8(const int8_t *input, const float *gamma, "
+        "const float *beta, int8_t *output, int N, int C, int H, int W, "
+        "float scale_in, float scale_out, float eps, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized GroupNorm with ONE group over an NCHW int8 tensor: per sample,\n"
+        "mean and (biased, 1/(C*H*W), as PyTorch) variance over ALL C*H*W\n"
+        "elements, then a per-CHANNEL affine:\n"
+        "  y[n,c,h,w] = (x - mu_n) / sqrt(var_n + eps) * gamma[c] + beta[c]\n"
+        "  out = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "in double, exactly as layernorm_s8 (whose K-wide row it generalises to\n"
+        "C*H*W with gamma indexed by channel).  gamma/beta stay float32 for the\n"
+        "same reason as layernorm_s8's.  num_groups > 1 is a different op."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stddef.h>
+#include <stdint.h>
+
+void kernel_groupnorm_s8(const int8_t *input, const float *gamma,
+                         const float *beta, int8_t *output,
+                         int N, int C, int H, int W,
+                         float scale_in, float scale_out, float eps,
+                         int activation_min, int activation_max) {
+    const size_t HW = (size_t)H * (size_t)W;
+    const size_t CHW = (size_t)C * HW;
+    for (int n = 0; n < N; n++) {
+        const int8_t *x = input + (size_t)n * CHW;
+        int8_t *y = output + (size_t)n * CHW;
+        double mu = 0.0;
+        for (size_t i = 0; i < CHW; i++) mu += (double)x[i] * (double)scale_in;
+        mu /= (double)CHW;
+        double var = 0.0;
+        for (size_t i = 0; i < CHW; i++) {
+            const double d = (double)x[i] * (double)scale_in - mu;
+            var += d * d;
+        }
+        var /= (double)CHW;
+        const double inv = 1.0 / sqrt(var + (double)eps);
+        for (int c = 0; c < C; c++) {
+            const double g = (double)(gamma ? gamma[c] : 1.0f);
+            for (size_t i = 0; i < HW; i++) {
+                const size_t j = (size_t)c * HW + i;
+                const double xn = ((double)x[j] * (double)scale_in - mu) * inv;
+                double yv = xn * g;
+                if (beta) yv += (double)beta[c];
+                int32_t v = (int32_t)round(yv / (double)scale_out);
+                if (v < activation_min) v = activation_min;
+                if (v > activation_max) v = activation_max;
+                y[j] = (int8_t)v;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"N": 1, "C": 4, "H": 1, "W": 16},
+                  {"N": 1, "C": 16, "H": 3, "W": 7},
+                  {"N": 2, "C": 32, "H": 1, "W": 99}],
+    argtypes_factory=_groupnorm_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="pext_int_rsqrt",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "layernorm_s8's pext_int_rsqrt with the row widened to C*H*W and "
+                "gamma/beta indexed by channel: one pass of int64 sums over the "
+                "raw codes, one integer reciprocal square root per SAMPLE, the "
+                "channel's gamma/scale_out and beta/scale_out decoded from their "
+                "IEEE-754 bits once per CHANNEL, and a multiply-shift per element. "
+                "scale_in cancels except inside eps/scale_in^2.  No floating-point "
+                "instruction executes."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_groupnorm_s8_pext_int_rsqrt.c)"
+            ),
+        ),
+        # patches/0105.  The same kernel on NHWC activations: GroupNorm(1, C) sums over
+        # every element, so only the per-channel affine's index changes -- the output is
+        # pext_int_rsqrt's bytes permuted.  Selected only when assign_layouts puts this op
+        # in an NHWC island (Moonshine's stem, iiswc-tutorial ROCC_DECOUPLED.md 8.14 T1).
+        # Affined to roccmoon too, so act_layout.native_layouts sees an NHWC kernel there.
+        AlgorithmCandidate(
+            name="pext_int_rsqrt_nhwc",
+            target_affinity=("pext_nl", "roccmoon"),
+            act_layouts=("nhwc",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "pext_int_rsqrt reading and writing [N, H, W, C]: identical integer "
+                "arithmetic per element, per-channel affine indexed innermost."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_groupnorm_s8_pext_int_rsqrt_nhwc.c)"
+            ),
+        ),
+    ],
+)
+
+
+ROPE_S8 = KernelSpec(
+    op="rope_s8",
+    signature=(
+        "void kernel_rope_s8(const int8_t *input, const float *cos_tab, "
+        "const float *sin_tab, int8_t *output, int T, int H, int D, int R, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Rotary position embedding, INTERLEAVED pairing (GPT-J / Moonshine), on an\n"
+        "int8 tensor laid out [T, H, D] (time, heads, head_dim), row-major.\n"
+        "cos_tab/sin_tab are [T, R/2]: the angle of pair i at position t, taken\n"
+        "from the model's own inv_freq.  In float32, for each t, h:\n"
+        "  x0 = in[2i]*scale_in, x1 = in[2i+1]*scale_in        (i < R/2)\n"
+        "  y[2i]   = x0*cos[t,i] + (-x1)*sin[t,i]\n"
+        "  y[2i+1] = x1*cos[t,i] +   x0 *sin[t,i]\n"
+        "  y[d]    = in[d]*scale_in                            (R <= d < D)\n"
+        "  out = clamp(roundf(y / scale_out), activation_min, activation_max)\n"
+        "which is HF's (x_rot*cos) + (rotate_half(x_rot)*sin) with the\n"
+        "interleaved rotate_half, element for element and operand for operand.\n"
+        "One dispatch replaces the two mul_s8, the negation and the add a\n"
+        "decomposed rotary embedding costs, and the tables are T*R/2 floats\n"
+        "rather than a T*H*R activation of cos and one of sin."
+    ),
+    reference_impl="""\
+void kernel_rope_s8(const int8_t *input, const float *cos_tab,
+                    const float *sin_tab, int8_t *output,
+                    int T, int H, int D, int R,
+                    float scale_in, float scale_out,
+                    int activation_min, int activation_max) {
+    const int R2 = R / 2;
+    for (int t = 0; t < T; t++) {
+        const float *c = cos_tab + (size_t)t * (size_t)R2;
+        const float *s = sin_tab + (size_t)t * (size_t)R2;
+        for (int h = 0; h < H; h++) {
+            const size_t base = ((size_t)t * (size_t)H + (size_t)h) * (size_t)D;
+            for (int i = 0; i < R2; i++) {
+                const float x0 = (float)input[base + 2 * i] * scale_in;
+                const float x1 = (float)input[base + 2 * i + 1] * scale_in;
+                const float y0 = x0 * c[i] + (-x1) * s[i];
+                const float y1 = x1 * c[i] + x0 * s[i];
+                int32_t v0 = (int32_t)roundf(y0 / scale_out);
+                int32_t v1 = (int32_t)roundf(y1 / scale_out);
+                if (v0 < activation_min) v0 = activation_min;
+                if (v0 > activation_max) v0 = activation_max;
+                if (v1 < activation_min) v1 = activation_min;
+                if (v1 > activation_max) v1 = activation_max;
+                output[base + 2 * i] = (int8_t)v0;
+                output[base + 2 * i + 1] = (int8_t)v1;
+            }
+            for (int d = R; d < D; d++) {
+                const float x = (float)input[base + d] * scale_in;
+                int32_t v = (int32_t)roundf(x / scale_out);
+                if (v < activation_min) v = activation_min;
+                if (v > activation_max) v = activation_max;
+                output[base + d] = (int8_t)v;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"T": 1, "H": 1, "D": 4, "R": 4},
+                  {"T": 7, "H": 3, "D": 12, "R": 10},
+                  {"T": 33, "H": 8, "D": 36, "R": 32}],
+    argtypes_factory=_rope_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="pext_int_rot",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "The rotation in integer, bit-exact against this float32 reference. "
+                "Per position, cos*si/so and sin*si/so in fixed point (one integer "
+                "multiply of each table mantissa by a truncated si/so -- the dispatch's "
+                "only divide); per element two int8-by-int64 multiplies, an add and a "
+                "rounding shift.  An element within the reference chain's error bound "
+                "(4.001*2^-24 of (|a0 c|+|a1 s|)si/so) plus the tables' of a "
+                "half-integer is evaluated in exact binary32 arithmetic on integers "
+                "(fpga/pynq-z2/sw/fexact32.h), operand for operand.  No floating-point "
+                "instruction executes."
+            ),
+            reference_impl=(
+                "(use the curated kernel pext_nl/pext_nl_rope_s8_pext_int_rot.c)"
+            ),
+        ),
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# patches/0103: the integer lowering of a frozen quantisation plan (pipeline/extract_q16.py):
+# int16 activations on Moonshine's stem, split dispatches for an int8-by-int8 engine,
+# per-channel residual scales.  Every one of these references IS its integer golden --
+# extract_q16's simulator computes the same integers -- so there is no float oracle to
+# drift against: a curated kernel is either bit-exact with these or wrong.
+# ---------------------------------------------------------------------------
+
+_Q16_NORM_CORE = r"""
+#ifndef MB_Q16_NORM_CORE
+#define MB_Q16_NORM_CORE
+/* floor(sqrt(v)), bit by bit */
+static inline unsigned __int128 mb_q16_isqrt128(unsigned __int128 v) {
+    unsigned __int128 r = 0, bit = (unsigned __int128)1 << 126;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; }
+        else r >>= 1;
+        bit >>= 2;
+    }
+    return r;
+}
+/* R = isqrt(floor(2^120 / V)), V = K*Q - S^2 + eps_q > 0 */
+static inline int64_t mb_q16_norm_r(int64_t K, int64_t S, __int128 Q, int64_t eps_q) {
+    __int128 V = (__int128)K * Q - (__int128)S * (__int128)S + (__int128)eps_q;
+    return (int64_t)mb_q16_isqrt128(((unsigned __int128)1 << 120) / (unsigned __int128)V);
+}
+/* t = floor((K*u - S) * R / 2^44), then out = floor((t*g + b*2^16 + 2^31) / 2^32) */
+static inline int64_t mb_q16_norm_out(int64_t K, int64_t u, int64_t S, int64_t R,
+                                      int64_t g, int64_t b) {
+    __int128 d = (__int128)K * (__int128)u - (__int128)S;
+    int64_t t = (int64_t)((d * (__int128)R) >> 44);
+    return (t * g + b * 65536 + ((int64_t)1 << 31)) >> 32;
+}
+#endif
+"""
+
+
+SPLIT16_S8 = KernelSpec(
+    op="split16_s8",
+    signature="void kernel_split16_s8(const int16_t *input, int8_t *output, int n, int part)",
+    semantics=(
+        "The two int8 halves of an int16 tensor that two int8-by-int8 engine dispatches read:\n"
+        "  hi = min((x + 128) >> 8, 127)             (part 0)\n"
+        "  lo = clamp(x - 256*hi, -128, 127)          (part 1)\n"
+        "so x = 256*hi + lo exactly for x < 32640 (the top 128 codes saturate lo)."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_split16_s8(const int16_t *input, int8_t *output, int n, int part) {
+    for (int i = 0; i < n; i++) {
+        int32_t x = input[i];
+        int32_t hi = (x + 128) >> 8;
+        if (hi > 127) hi = 127;
+        if (part == 0) {
+            output[i] = (int8_t)hi;
+        } else {
+            int32_t lo = x - 256 * hi;
+            if (lo < -128) lo = -128;
+            if (lo > 127) lo = 127;
+            output[i] = (int8_t)lo;
+        }
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+)
+
+
+MRCOMBINE_S16 = KernelSpec(
+    op="mrcombine_s16",
+    signature=(
+        "void kernel_mrcombine_s16(const int8_t *const *ins, const int32_t *gidx, "
+        "const int32_t *lidx, const int32_t *goc, const int32_t *ratios, "
+        "int16_t *output, int N, int OC, int HW, int G, int R)"
+    ),
+    semantics=(
+        "Recombines the int8 codes of a split multi-range convolution into int16.\n"
+        "ins[(g*R + k)*2 + 0] is dispatch H of row group g at range k (ratios ascending,\n"
+        "coarse first), ins[..+1] dispatch L; each is NCHW [N, goc[g], HW].  Output channel\n"
+        "c is row lidx[c] of group gidx[c].  Per element the finest k whose z_H and z_L are\n"
+        "both strictly inside (-128, 127) is taken, the coarsest (k = 0) if none:\n"
+        "  out = clamp16((z_H + z_L) * (ratios[R-1] / ratios[k]))"
+    ),
+    reference_impl="""\
+#include <stddef.h>
+#include <stdint.h>
+
+void kernel_mrcombine_s16(const int8_t *const *ins, const int32_t *gidx,
+                          const int32_t *lidx, const int32_t *goc,
+                          const int32_t *ratios, int16_t *output,
+                          int N, int OC, int HW, int G, int R) {
+    const int32_t rmax = ratios[R - 1];
+    (void)G;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < OC; c++) {
+            const int g = gidx[c];
+            const size_t base = ((size_t)n * (size_t)goc[g] + (size_t)lidx[c]) * (size_t)HW;
+            const size_t obase = ((size_t)n * (size_t)OC + (size_t)c) * (size_t)HW;
+            for (int p = 0; p < HW; p++) {
+                int64_t val = 0;
+                for (int k = 0; k < R; k++) {
+                    const int32_t zh = ins[(g * R + k) * 2][base + (size_t)p];
+                    const int32_t zl = ins[(g * R + k) * 2 + 1][base + (size_t)p];
+                    if (k == 0 || (zh > -128 && zh < 127 && zl > -128 && zl < 127))
+                        val = (int64_t)(zh + zl) * (int64_t)(rmax / ratios[k]);
+                }
+                if (val < -32768) val = -32768;
+                if (val > 32767) val = 32767;
+                output[obase + (size_t)p] = (int16_t)val;
+            }
+        }
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+    algorithms=[
+        AlgorithmCandidate(
+            name="pext_fine_first",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "The reference's selection rule walked from the finest range down with an early "
+                "exit, the (group, row) input rows hoisted out of the pixel loop."
+            ),
+            reference_impl="(use the curated kernel pext_nl/pext_nl_mrcombine_s16_pext_fine_first.c)",
+        ),
+    ],
+)
+
+
+LUT16_S16 = KernelSpec(
+    op="lut16_s16",
+    signature="void kernel_lut16_s16(const int16_t *input, const int16_t *table, int16_t *output, int n)",
+    semantics=(
+        "A pointwise map on an int16 tensor through a 65,536-entry table baked at extraction\n"
+        "(tanh or GELU in float64, rounded half-to-even, clamped):\n"
+        "  output[i] = table[input[i] + 32768]"
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_lut16_s16(const int16_t *input, const int16_t *table, int16_t *output, int n) {
+    for (int i = 0; i < n; i++)
+        output[i] = table[(int32_t)input[i] + 32768];
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+)
+
+
+LUT16_PC_S8 = KernelSpec(
+    op="lut16_pc_s8",
+    signature=(
+        "void kernel_lut16_pc_s8(const int16_t *input, const int32_t *table, "
+        "const int64_t *mult, int8_t *output, int N, int C, int HW)"
+    ),
+    semantics=(
+        "A pointwise map from int16 to PER-CHANNEL int8 (NCHW, channel axis 1): the table\n"
+        "holds f(x)/s_ref in Q16 (s_ref the largest channel scale), mult[c] = s_ref/s_c in Q16:\n"
+        "  out = clamp8((table[x + 32768] * mult[c] + 2^31) >> 32)"
+    ),
+    reference_impl="""\
+#include <stddef.h>
+#include <stdint.h>
+
+void kernel_lut16_pc_s8(const int16_t *input, const int32_t *table, const int64_t *mult,
+                        int8_t *output, int N, int C, int HW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            const size_t base = ((size_t)n * (size_t)C + (size_t)c) * (size_t)HW;
+            const int64_t m = mult[c];
+            for (int p = 0; p < HW; p++) {
+                int64_t v = ((int64_t)table[(int32_t)input[base + p] + 32768] * m
+                             + ((int64_t)1 << 31)) >> 32;
+                if (v < -128) v = -128;
+                if (v > 127) v = 127;
+                output[base + p] = (int8_t)v;
+            }
+        }
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+)
+
+
+GROUPNORM_S16 = KernelSpec(
+    op="groupnorm_s16",
+    signature=(
+        "void kernel_groupnorm_s16(const int16_t *input, const int64_t *gmul, "
+        "const int64_t *badd, int16_t *output, int N, int C, int HW, int64_t eps_q)"
+    ),
+    semantics=(
+        "GroupNorm with one group on int16, in exact integers (extract_q16's normalisation\n"
+        "core with K = C*HW and u = x):\n"
+        "  S = sum x, Q = sum x^2, V = K*Q - S^2 + eps_q, R = isqrt(floor(2^120 / V))\n"
+        "  t = floor((K*x - S) * R / 2^44)\n"
+        "  out = clamp16(floor((t*gmul[c] + badd[c]*2^16 + 2^31) / 2^32))"
+    ),
+    reference_impl=r"""
+#include <stddef.h>
+#include <stdint.h>
+""" + _Q16_NORM_CORE + r"""
+void kernel_groupnorm_s16(const int16_t *input, const int64_t *gmul, const int64_t *badd,
+                          int16_t *output, int N, int C, int HW, int64_t eps_q) {
+    const int64_t K = (int64_t)C * (int64_t)HW;
+    for (int n = 0; n < N; n++) {
+        const int16_t *x = input + (size_t)n * (size_t)K;
+        int16_t *y = output + (size_t)n * (size_t)K;
+        int64_t S = 0;
+        __int128 Q = 0;
+        for (int64_t i = 0; i < K; i++) {
+            S += x[i];
+            Q += (int64_t)x[i] * (int64_t)x[i];
+        }
+        const int64_t R = mb_q16_norm_r(K, S, Q, eps_q);
+        for (int c = 0; c < C; c++) {
+            for (int p = 0; p < HW; p++) {
+                const size_t i = (size_t)c * (size_t)HW + (size_t)p;
+                int64_t v = mb_q16_norm_out(K, x[i], S, R, gmul[c], badd[c]);
+                if (v < -32768) v = -32768;
+                if (v > 32767) v = 32767;
+                y[i] = (int16_t)v;
+            }
+        }
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+    algorithms=[
+        AlgorithmCandidate(
+            name="pext_int_memo",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Within a sample the normalised value depends on the int16 code alone: tabulated "
+                "once per sample over the codes it spans with the reference's own 128-bit "
+                "expression, then a table read and one int64 multiply-shift per element."
+            ),
+            reference_impl="(use the curated kernel pext_nl/pext_nl_groupnorm_s16_pext_int_memo.c)",
+        ),
+    ],
+)
+
+
+LAYERNORM_PC_S8 = KernelSpec(
+    op="layernorm_pc_s8",
+    signature=(
+        "void kernel_layernorm_pc_s8(const int8_t *input, const int32_t *umul, "
+        "const int64_t *gmul, const int64_t *badd, int8_t *output, int M, int K, int64_t eps_q)"
+    ),
+    semantics=(
+        "LayerNorm over the last axis of a PER-CHANNEL int8 tensor (scale s_c per position\n"
+        "k), in exact integers: u_k = x_k * umul[k] (umul = s_k/s_ref in Q24), then\n"
+        "extract_q16's normalisation core per row:\n"
+        "  S = sum u, Q = sum u^2, V = K*Q - S^2 + eps_q, R = isqrt(floor(2^120 / V))\n"
+        "  out = clamp8(floor((floor((K*u - S)*R / 2^44)*gmul[k] + badd[k]*2^16 + 2^31) / 2^32))"
+    ),
+    reference_impl=r"""
+#include <stddef.h>
+#include <stdint.h>
+""" + _Q16_NORM_CORE + r"""
+void kernel_layernorm_pc_s8(const int8_t *input, const int32_t *umul, const int64_t *gmul,
+                            const int64_t *badd, int8_t *output, int M, int K, int64_t eps_q) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *x = input + (size_t)m * (size_t)K;
+        int8_t *y = output + (size_t)m * (size_t)K;
+        int64_t S = 0;
+        __int128 Q = 0;
+        for (int k = 0; k < K; k++) {
+            const int64_t u = (int64_t)x[k] * (int64_t)umul[k];
+            S += u;
+            Q += (__int128)u * (__int128)u;
+        }
+        const int64_t R = mb_q16_norm_r(K, S, Q, eps_q);
+        for (int k = 0; k < K; k++) {
+            int64_t v = mb_q16_norm_out(K, (int64_t)x[k] * (int64_t)umul[k], S, R, gmul[k], badd[k]);
+            if (v < -128) v = -128;
+            if (v > 127) v = 127;
+            y[k] = (int8_t)v;
+        }
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+    algorithms=[
+        # patches/0109: the normalisation lane inside the decoupled RoCC engine (backend
+        # roccmoon).  The FIRST op on this engine that dispatches to a lane rather than to
+        # the tile sequencer -- custom-1 functs 9/10/11 instead of the matmul path.
+        AlgorithmCandidate(
+            name="roccmoon_lane",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "layernorm_pc_s8 on the engine's normalisation lane (mbxr_ln): hart 0 hands "
+                "each tile to a hart-1 worker which fills the scratchpad, writes the "
+                "per-channel affine table, and runs the lane at one element per cycle "
+                "(0.99826 measured, Lab B33). Bit-exact because the lane computes this "
+                "KernelSpec's expression term for term, not an approximation of it. A tile "
+                "is bounded by the lane's 1,024-word reach and must be a whole number of "
+                "64-byte drain blocks, so K = 288 needs an even row count; every other "
+                "shape, and any model whose per-channel constants overflow the lane's "
+                "25/40/32-bit fields, falls back to this reference."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_layernorm_pc_s8_roccmoon_lane.c)"
+            ),
+        ),
+    ],
+)
+
+
+LAYERNORM_S16_S8 = KernelSpec(
+    op="layernorm_s16_s8",
+    signature=(
+        "void kernel_layernorm_s16_s8(const int16_t *input, const int64_t *gmul, "
+        "const int64_t *badd, int8_t *output, int M, int K, int64_t eps_q)"
+    ),
+    semantics=(
+        "layernorm_pc_s8 on a per-tensor int16 input: u = x (no per-channel multiplier)."
+    ),
+    reference_impl=r"""
+#include <stddef.h>
+#include <stdint.h>
+""" + _Q16_NORM_CORE + r"""
+void kernel_layernorm_s16_s8(const int16_t *input, const int64_t *gmul, const int64_t *badd,
+                             int8_t *output, int M, int K, int64_t eps_q) {
+    for (int m = 0; m < M; m++) {
+        const int16_t *x = input + (size_t)m * (size_t)K;
+        int8_t *y = output + (size_t)m * (size_t)K;
+        int64_t S = 0;
+        __int128 Q = 0;
+        for (int k = 0; k < K; k++) {
+            S += x[k];
+            Q += (int64_t)x[k] * (int64_t)x[k];
+        }
+        const int64_t R = mb_q16_norm_r(K, S, Q, eps_q);
+        for (int k = 0; k < K; k++) {
+            int64_t v = mb_q16_norm_out(K, x[k], S, R, gmul[k], badd[k]);
+            if (v < -128) v = -128;
+            if (v > 127) v = 127;
+            y[k] = (int8_t)v;
+        }
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+)
+
+
+ADD_PC_S8 = KernelSpec(
+    op="add_pc_s8",
+    signature=(
+        "void kernel_add_pc_s8(const int8_t *a, const int8_t *b, const int64_t *amul, "
+        "const int64_t *bmul, int8_t *output, int n, int C)"
+    ),
+    semantics=(
+        "Residual add into a PER-CHANNEL int8 output over the last axis (C channels,\n"
+        "channel of element i = i mod C); each input may itself be per-channel:\n"
+        "  out = clamp8((a*amul[c] + b*bmul[c] + 2^23) >> 24),  amul = s_a,c/s_out,c in Q24"
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_add_pc_s8(const int8_t *a, const int8_t *b, const int64_t *amul,
+                      const int64_t *bmul, int8_t *output, int n, int C) {
+    for (int i = 0; i < n; i++) {
+        const int c = i % C;
+        int64_t v = ((int64_t)a[i] * amul[c] + (int64_t)b[i] * bmul[c] + (1 << 23)) >> 24;
+        if (v < -128) v = -128;
+        if (v > 127) v = 127;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+    algorithms=[
+        AlgorithmCandidate(
+            name="pext_int_block",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Whole channel blocks instead of a divide per element for the channel index; the "
+                "reference's int64 expression per element."
+            ),
+            reference_impl="(use the curated kernel pext_nl/pext_nl_add_pc_s8_pext_int_block.c)",
+        ),
+    ],
+)
+
+
+ADD_S16_PC_S8 = KernelSpec(
+    op="add_s16_pc_s8",
+    signature=(
+        "void kernel_add_s16_pc_s8(const int16_t *a, const int8_t *b, const int64_t *amul, "
+        "const int64_t *bmul, int8_t *output, int n, int C)"
+    ),
+    semantics="add_pc_s8 with an int16 first operand.",
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_add_s16_pc_s8(const int16_t *a, const int8_t *b, const int64_t *amul,
+                          const int64_t *bmul, int8_t *output, int n, int C) {
+    for (int i = 0; i < n; i++) {
+        const int c = i % C;
+        int64_t v = ((int64_t)a[i] * amul[c] + (int64_t)b[i] * bmul[c] + (1 << 23)) >> 24;
+        if (v < -128) v = -128;
+        if (v > 127) v = 127;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+    algorithms=[
+        AlgorithmCandidate(
+            name="pext_int_block",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "add_pc_s8's pext_int_block with an int16 first operand."
+            ),
+            reference_impl="(use the curated kernel pext_nl/pext_nl_add_s16_pc_s8_pext_int_block.c)",
+        ),
+    ],
+)
+
+
+CONV2D_S16_PC = KernelSpec(
+    op="conv2d_s16_pc",
+    signature=(
+        "void kernel_conv2d_s16_pc(const int16_t *input, const int8_t *weight, "
+        "const int64_t *bias, const int32_t *mult, const int32_t *shift, int16_t *output, "
+        "int N, int IC, int IH, int IW, int OC, int OH, int OW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "An int16-by-int8 convolution with per-ROW weight scales and a per-row requantise\n"
+        "(what a width-selectable engine computes), int64 accumulator, zero padding:\n"
+        "  acc = bias[oc] + sum x * w\n"
+        "  out = clamp16(floor((acc*mult[oc] + 2^(30+shift[oc])) / 2^(31+shift[oc])))\n"
+        "(mult in [2^30, 2^31); one rounding, in 128-bit arithmetic).  Weight OIHW."
+    ),
+    reference_impl="""\
+#include <stddef.h>
+#include <stdint.h>
+
+void kernel_conv2d_s16_pc(const int16_t *input, const int8_t *weight, const int64_t *bias,
+                          const int32_t *mult, const int32_t *shift, int16_t *output,
+                          int N, int IC, int IH, int IW, int OC, int OH, int OW,
+                          int KH, int KW, int SH, int SW, int PH, int PW) {
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            const int tot = 31 + shift[oc];
+            const __int128 rnd = (__int128)1 << (tot - 1);
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int64_t acc = bias[oc];
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            const int ih = oh * SH - PH + kh;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                const int iw = ow * SW - PW + kw;
+                                if (iw < 0 || iw >= IW) continue;
+                                const int64_t xv = input[(((size_t)n * IC + ic) * IH + ih) * IW + iw];
+                                const int64_t wv = weight[(((size_t)oc * IC + ic) * KH + kh) * KW + kw];
+                                acc += xv * wv;
+                            }
+                        }
+                    }
+                    int64_t v = (int64_t)(((__int128)acc * (__int128)mult[oc] + rnd) >> tot);
+                    if (v < -32768) v = -32768;
+                    if (v > 32767) v = 32767;
+                    output[(((size_t)n * OC + oc) * OH + oh) * OW + ow] = (int16_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
+    algorithms=[
+        AlgorithmCandidate(
+            name="pext_split_dot8",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Each int16 tap split exactly as 256*hi + lo + 128 (hi, lo int8), the patch gathered "
+                "once per position into 8-aligned words, 2*ceil(K/8) MBP.DOT8s per output element "
+                "and the reference's 128-bit per-row requantise; exact integers throughout."
+            ),
+            reference_impl="(use the curated kernel pext_nl/pext_nl_conv2d_s16_pc_pext_split_dot8.c)",
+        ),
+    ],
+)
+
+
+PERMUTE4_S16 = KernelSpec(
+    op="permute4_s16",
+    signature=(
+        "void kernel_permute4_s16(const int16_t *input, int16_t *output, "
+        "int d0, int d1, int d2, int d3, int p0, int p1, int p2, int p3)"
+    ),
+    semantics="permute4_s8's pure data move on int16 elements.",
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_permute4_s16(const int16_t *input, int16_t *output,
+                         int d0, int d1, int d2, int d3,
+                         int p0, int p1, int p2, int p3) {
+    const int din[4] = { d0, d1, d2, d3 };
+    const int sin[4] = { d1*d2*d3, d2*d3, d3, 1 };
+    const int perm[4] = { p0, p1, p2, p3 };
+    int od[4], os[4];
+    for (int k = 0; k < 4; k++) { od[k] = din[perm[k]]; os[k] = sin[perm[k]]; }
+    int w = 0;
+    for (int o0 = 0; o0 < od[0]; o0++)
+      for (int o1 = 0; o1 < od[1]; o1++)
+        for (int o2 = 0; o2 < od[2]; o2++) {
+          const int base = o0*os[0] + o1*os[1] + o2*os[2];
+          for (int o3 = 0; o3 < od[3]; o3++)
+            output[w++] = input[base + o3*os[3]];
+        }
+}
+""",
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; verified by extract_q16's golden
 )
 
 
@@ -9142,6 +10523,32 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
     ],
     argtypes_factory=_matmul_s8_argtypes,
     algorithms=[
+        # MBP + int_nonlin.c.  matmul_s8 LOOKS integer -- its reduction is int32 -- and
+        # its tail is one `roundf((float)acc * total)` per OUTPUT element, measured at
+        # 244 cycles on this WithoutFPU core.  For an encoder that population is
+        # heads*T*T per layer, 1.59 M elements per second of audio on Squeezeformer-XS,
+        # which makes it the largest float cost in a transformer after GELU, hiding
+        # inside an op every table calls integer.
+        AlgorithmCandidate(
+            name="pext_int_requant",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "The requantise tail becomes the same Q0.31 rescale every "
+                "curated convolution kernel already does, with `total` decoded "
+                "from its IEEE-754 bits; and MBP.DOT8 takes the reduction when "
+                "transpose_b makes the K axis contiguous in both operands and "
+                "both rows are 8-aligned, which is exactly the Q.K^T shape. "
+                "Anything else falls through to the scalar reduction rather "
+                "than pretending.  Not bit-exact and does not claim to be: "
+                "float32 has a 24-bit mantissa and this does not, so above "
+                "2^24 this kernel is the more accurate of the two."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_matmul_s8_pext_int_requant.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
             target_affinity=("ime", "ime_x60"),
@@ -9582,6 +10989,38 @@ void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
     ],
     argtypes_factory=_conv2d_s8_pc_argtypes,
     algorithms=[
+        # MBP, per-channel.  SPEECH_ON_ROCKET.md 3.4 measured per-channel weight
+        # scales at +3.62 accuracy points on kws_cnn (89.93% -> 93.55%, against 93.61%
+        # fp32) and then recorded that they could not be used at all: `--per-channel`
+        # renames the op to conv2d_s8_pc and the curated MBP kernels were registered for
+        # conv2d_s8 only, so the choice on offer was 3.6 points OR 25x, with nothing in
+        # between.  For a transcription model that is a correctness item.
+        #
+        # The kernel is the per-tensor one with the requantise descriptor turned into an
+        # array indexed by output channel; the patch gather, the weight repack, the
+        # four-deep DOT8 loop and the OIHW layout are untouched, so it is bit-exact for
+        # the same reason and at the same speed.
+        AlgorithmCandidate(
+            name="pext_patch_dot8_pc",
+            target_affinity=("pext", "pext_nl"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="oihw",
+            description=(
+                "conv2d_s8's pext_patch_dot8 with per-output-channel "
+                "(output_multiplier, output_shift).  One requantise descriptor "
+                "per output channel, built once per dispatch and indexed by "
+                "the channel the four-deep DOT8 loop is already iterating "
+                "over.  `simple` stays a per-DISPATCH property because the "
+                "output offset and the clamp are per-tensor even under "
+                "per-channel quantisation, and it is decided over ALL channels "
+                "so one channel with a non-positive shift demotes the dispatch "
+                "rather than being miscomputed."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext/pext_conv2d_s8_pc_pext_patch_dot8_pc.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="gemmini_im2col_full_C",
             target_affinity=("gemmini", "gemmini_q31", "gemmini_q31_rvv"),
@@ -9879,6 +11318,24 @@ void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
     ],
     argtypes_factory=_linear_s8_pc_argtypes,
     algorithms=[
+        # MBP, per-channel.  See conv2d_s8_pc's candidate for the 3.62 points.
+        AlgorithmCandidate(
+            name="pext_row_dot8_pc",
+            target_affinity=("pext", "pext_nl"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "linear_s8's pext_row_dot8 with per-output-feature "
+                "(output_multiplier, output_shift).  One requantise descriptor "
+                "per output feature, built once per dispatch and indexed by "
+                "the n the residue-class walk already carries.  The DOT8 "
+                "reduction, the shifted aligned input copy and the K mod 8 "
+                "tail are unchanged."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext/pext_linear_s8_pc_pext_row_dot8_pc.c)"
+            ),
+        ),
         AlgorithmCandidate(
             name="gemmini_tiled_matmul",
             target_affinity=("gemmini", "gemmini_q31", "gemmini_q31_rvv"),
@@ -10495,6 +11952,69 @@ void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
     ],
     argtypes_factory=_softmax_s8_argtypes,
     algorithms=[
+        # MBP + int_nonlin.c.  Measured on the board: 5,550 -> 168 cycles/element at
+        # K = 512, 32.9x, worst int8 output difference 1 LSB against THIS reference.
+        AlgorithmCandidate(
+            name="pext_int_row",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "2^x from a 33-entry table with linear interpolation, one "
+                "integer divide per ROW for the reciprocal and none per "
+                "element, and the output stage written as round(p / "
+                "scale_out) to match this reference -- int_nonlin.c's own "
+                "int_softmax_s8 uses a 0 -> -128, 1 -> +127 encoding, which is "
+                "a DIFFERENT TENSOR and would verify against the benchmark "
+                "while being wrong in every model.  scale_in and scale_out are "
+                "decoded from their IEEE-754 bits, so no float instruction "
+                "executes.  The row reciprocal is one plain 128-bit divide "
+                "rather than a Newton iteration: the first version used Newton "
+                "in Q0.62 and was wrong by 255 of a 255-wide output."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_softmax_s8_pext_int_row.c)"
+            ),
+        ),
+        # patches/0104.  pext_int_row with its exponential memoised per dispatch: the
+        # input is int8, so x - max takes 256 values and 2^z is a 256-entry table filled
+        # once with pext_int_row's own expression.  BIT-EXACT with pext_int_row (host:
+        # exhaustive over the table and 92.9 M elements of random and corner rows).  Placed
+        # AFTER pext_int_row so no existing build changes its pick; a build selects it
+        # from a curated tree without pext_int_row's file (ROCC_DECOUPLED.md 8.14).
+        AlgorithmCandidate(
+            name="pext_int_memo",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "pext_int_row, bit-exact, with 2^z read from a 256-entry table "
+                "filled once per dispatch (z depends only on the int8 "
+                "difference x - max and scale_in) instead of interpolated "
+                "twice per element; the row reciprocal as one 64-bit divide."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_softmax_s8_pext_int_memo.c)"
+            ),
+        ),
+        # patches/0106.  pext_int_memo with its per-element multiplies priced for an iterative
+        # multiplier (Rocket big core: mulUnroll = 8): 32-bit-operand products, a 64-bit
+        # rescale, and a per-row zero cutoff (outputs are monotone in x - max) with a per-row
+        # output cache.  BIT-EXACT with pext_int_row (host: exhaustive monotonicity over
+        # 1.02 B (scale, sum, scale_out, d) points; 186 M elements of random and corner rows).
+        AlgorithmCandidate(
+            name="pext_int_memo2",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "pext_int_memo, bit-exact, with 32-bit-operand multiplies and a "
+                "per-row monotone zero cutoff plus output cache."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_softmax_s8_pext_int_memo2.c)"
+            ),
+        ),
         # This op carried only the synthesized `direct` candidate, so the
         # curated probe had no named (op, algorithm) pair to look for and
         # softmax ran the scalar reference inside builds labelled rvv_x60 --
@@ -11033,6 +12553,30 @@ void kernel_layernorm_s8(const int8_t *input, const float *gamma,
     extra_shapes=[{"M": 1, "K": 16}, {"M": 1, "K": 64}, {"M": 4, "K": 128}],
     argtypes_factory=_layernorm_s8_argtypes,
     algorithms=[
+        # MBP + int_nonlin.c.  Measured on the board: 1,152 -> 69 cycles/element at
+        # K = 512, 16.6x, worst int8 output difference 1 LSB.
+        AlgorithmCandidate(
+            name="pext_int_rsqrt",
+            target_affinity=("pext_nl",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "One integer divide and one integer reciprocal square root "
+                "(Newton in Q0.31 from a linear seed) per ROW, and a "
+                "multiply-shift per element.  scale_in cancels out of the "
+                "whole row pass -- normalisation divides by its own standard "
+                "deviation -- and enters only as eps/scale_in^2, computed from "
+                "the two floats' bit patterns with one integer divide. "
+                "Dropping eps is the tempting simplification and is wrong for "
+                "a near-constant row.  gamma and beta stay float32 in the "
+                "signature and are decoded from their bits into (mantissa, "
+                "exponent, sign) and folded with 1/scale_out by integer "
+                "multiply; no float instruction executes."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "pext_nl/pext_nl_layernorm_s8_pext_int_rsqrt.c)"
+            ),
+        ),
         # Only the synthesized `direct` candidate existed, so the curated
         # probe had no named (op, algorithm) pair and layernorm ran the scalar
         # reference inside builds labelled rvv_x60 -- 13.9% of attn_block, and
@@ -11068,6 +12612,54 @@ void kernel_layernorm_s8(const int8_t *input, const float *gamma,
             ),
             reference_impl="(use the curated kernel in kernels/rvv/)",
             accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+        # ---- THE LayerNorm LANE, per-tensor ------------------------------------------
+        # mbxr_ln computes a row of LayerNorm at 3.8632 cycles/element on silicon against
+        # 60.67 for reference C -- 15.7x, bit-exact, Lab B41 -- and the shipping candidate
+        # QATU emits THIS op rather than layernorm_pc_s8, which is the only reason the lane
+        # could not reach it.  "Per-tensor" names the ACTIVATION scales, not the affine: this
+        # op carries per-channel gamma and beta exactly as layernorm_pc_s8 does, so the lane's
+        # table is the right shape and the kernel's work is a derivation, not a new dispatch.
+        #
+        # NAMED roccmoon_lane, matching feature_gate.py's table, which is how a lane kernel
+        # declares the silicon it needs.  The entry ("layernorm_s8", "roccmoon_lane") ->
+        # ln_lane was added in the same change; an unpriced lane pick is a REFUSAL there, by
+        # design, and that is what refused the LUT lane's first board arm.
+        #
+        # LAST IN THIS LIST ON PURPOSE.  The curated probe walks these in order and takes the
+        # first whose file exists, so appending leaves every other lab's pick where it was; a
+        # run that wants the lane removes the earlier files from ITS OWN copy of the tree.
+        # BUT target_affinity=("roccmoon",) STILL MAKES THE PROBE PREFER THIS for any roccmoon
+        # run whose tree carries the file, so a control arm must be steered EXPLICITLY and the
+        # pick asserted BOTH WAYS -- scripts/70 does that before it touches the board.
+        #
+        # NUMERIC_DRIFT, and for a WEAKER reason than the LUT lane's.  That kernel is
+        # bit-identical to pext_int_lut by construction because it shares its table builder.
+        # This one is NOT: it computes _Q16_NORM_CORE where pext_int_rsqrt computes a
+        # mantissa/shift pipeline, so it is a DIFFERENT quantised expression of the same
+        # operator.  Measured against the tree's own pext_int_rsqrt at every site of a real
+        # QATU graph (moonshine/ln_pt_check.py): 0.17-0.24 % of elements differ, never by more
+        # than 1 LSB, zero by 2 or more.  That is the honest basis for the class, and it is
+        # ALSO why max_abs_err cannot be this kernel's check -- the harness rebuilds its golden
+        # from whichever kernel is selected.  WER against the candidate's measured baseline is.
+        AlgorithmCandidate(
+            name="roccmoon_lane",
+            target_affinity=("roccmoon",),
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "gamma, beta, scale_in, scale_out and eps are lowered ONCE PER SITE to "
+                "the lane's affine table -- umul = 2^24 constant for a per-tensor input, "
+                "gmul = rint(gamma/scale_out * 65536), badd likewise, and "
+                "eps_q = rint(eps * K^2 * (2^24/scale_in)^2).  The Q24 scaling is forced "
+                "rather than chosen: eps_q scales as umul^2 and mbxr_ln_cfg_ok refuses an "
+                "eps_q below 262,144, so umul = 1 is not available.  The row is then "
+                "tiled at the activation buffer's 1,024-word reach (165x288 is six tiles) "
+                "and dispatched through the shared driver."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "roccmoon/roccmoon_layernorm_s8_roccmoon_lane.c)"
+            ),
         ),
     ],
 )
@@ -13692,6 +15284,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'add_tile_s8': ADD_TILE_S8,
     'permute4_s8': PERMUTE4_S8,
     'matmul_b_s8': MATMUL_B_S8,
+    'attention_s8': ATTENTION_S8,
     'adaptive_avg_pool2d_f16': ADAPTIVE_AVG_POOL2D_F16,
     'slice_c_f16': SLICE_C_F16,
     'cat2_c1_f16': CAT2_C1_F16,
@@ -13724,6 +15317,20 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'cat4_c1_s8': CAT4_C1_S8,
     'mul_s8': MUL_S8,
     'gelu_s8': GELU_S8,
+    'tanh_s8': TANH_S8,
+    'groupnorm_s8': GROUPNORM_S8,
+    'rope_s8': ROPE_S8,
+    'split16_s8': SPLIT16_S8,
+    'mrcombine_s16': MRCOMBINE_S16,
+    'lut16_s16': LUT16_S16,
+    'lut16_pc_s8': LUT16_PC_S8,
+    'groupnorm_s16': GROUPNORM_S16,
+    'layernorm_pc_s8': LAYERNORM_PC_S8,
+    'layernorm_s16_s8': LAYERNORM_S16_S8,
+    'add_pc_s8': ADD_PC_S8,
+    'add_s16_pc_s8': ADD_S16_PC_S8,
+    'conv2d_s16_pc': CONV2D_S16_PC,
+    'permute4_s16': PERMUTE4_S16,
     'pad_s8': PAD_S8,
     'adaptive_avg_pool2d_s8': ADAPTIVE_AVG_POOL2D_S8,
     'layer_norm_s8': LAYER_NORM_S8,
