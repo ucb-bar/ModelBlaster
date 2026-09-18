@@ -1,0 +1,24 @@
+{
+  "system": "chipyard-RocketKU040DroneDualConfig",
+  "description": "riskybird v3 KU040 dual-core bring-up bitstream (RocketKU040DroneDualConfig, Q31Ws32x32AccGemminiConfig): hart 0 = Rocket + Saturn V128D128 RVV + FcRoCC (custom0), hart 1 = Rocket + Q0.31 32x32 Gemmini (custom3). This is the SAME topology as cores/chipyard_dual_rocket_gemmini_q31.json but with the hart assignment SWAPPED to match the real bitstream: that file puts gemmini_q31 on hart 0 / rvv on hart 1, which is backwards for this board. Use this registry (not chipyard_dual_rocket_gemmini_q31.json) when targeting the physical KU040 board.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rvv0",
+      "kind": "rvv",
+      "isa": "rv64gcv",
+      "varch": "vlen:128,elen:64",
+      "harts": [0],
+      "description": "Rocket with Saturn V128D128 vector unit + FcRoCC (custom0, flight-controller accelerator, not used by the xpurt DroNet harness). Handles RVV-int8 conv2d/linear plus every non-Gemmini-covered op (silu, sigmoid, batchnorm, maxpool, relu, add, cat, upsample).",
+      "capabilities": ["linear_s8", "conv2d_s8", "relu", "add", "elu", "silu", "sigmoid", "batchnorm2d", "maxpool2d", "cat", "upsample"]
+    },
+    {
+      "name": "gemmini_q31_0",
+      "kind": "gemmini_q31",
+      "isa": "rv64gcv",
+      "harts": [1],
+      "description": "Rocket + Gemmini Q31Ws32x32AccGemminiConfig (DIM=32, WS-only dataflow, Q0.31 acc_scale, 128KB accumulator). Routes int8 conv2d_s8/add_s8/linear_s8 via gemmini's ROCC im2col/tiled_matmul path with Q0.31 acc_scale fold; every other op is scalar reference on this hart.",
+      "capabilities": ["linear_s8", "conv2d_s8"]
+    }
+  ]
+}

@@ -75,6 +75,22 @@ int main(void)
     printf("modelblaster harness: model=%s in=%d out=%d\n",
            MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE);
 
+    /* MODELBLASTER_PROFILE_ITERS: opt-in repeat loop for real-hardware
+     * per-op profiling (board mcycle counts). Iteration 0 is a WARMUP
+     * (I-cache/scratch/DMA-descriptor cold-start effects) and is tagged
+     * as such on every printed line so the host-side consumer can
+     * discard it and average the steady-state iterations that follow.
+     * Default 1 (single-shot, identical to the original behavior) so
+     * every other build of this harness (spike verify, single-run
+     * FireSim, etc.) is unaffected unless this is explicitly overridden
+     * at configure time (-DMODELBLASTER_PROFILE_ITERS=N). */
+#ifndef MODELBLASTER_PROFILE_ITERS
+#define MODELBLASTER_PROFILE_ITERS 1
+#endif
+    for (int mb_prof_iter = 0; mb_prof_iter < MODELBLASTER_PROFILE_ITERS; mb_prof_iter++) {
+    printf("=== MODELBLASTER_PROFILE_ITER === %d %s\n", mb_prof_iter,
+           mb_prof_iter == 0 ? "WARMUP" : "STEADY");
+
     /* Single-model harness has no thread pool — pass NULL. The
      * generated kernel bodies ignore it; only the parallel-for wrapper
      * (when emitted) would dispatch onto a real modelblaster_pool_t.
@@ -238,6 +254,7 @@ int main(void)
      * runner reads this line to get the cross-hart-correct number;
      * per-op rdcycle deltas above are used for relative comparisons. */
     printf("=== MODELBLASTER_WALL_CYCLES === %lu\n", model_wall_cycles());
+    } /* end MODELBLASTER_PROFILE_ITERS loop */
 
 #ifdef CONFIG_ARCH_POSIX
     /* native_sim: no HTIF/reboot — terminate the host process cleanly so the
