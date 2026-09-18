@@ -74,3 +74,6 @@ harness_linux/build/
 # ingests; a copy here is a leftover, and committing one invites a solve
 # against costs nothing else can see.
 gen/profile_mb/
+
+# per-config spike libs (binary, regenerable)
+cores/gemmini/include/per_config/*/libgemmini.so
