@@ -772,16 +772,142 @@ def _tensor_meta(node: torch.fx.Node) -> dict[str, Any]:
 # slot so multiplier math doesn't need to handle the asymmetric range).
 _INT8_RANGE = 127.0
 
+# SUB-BYTE WEIGHT GRIDS.  The same symmetric rule at b bits has 2^(b-1) - 1
+# positive levels; b = 8 reproduces _INT8_RANGE exactly, so every existing
+# extract is byte-for-byte unchanged.
+#
+# WHY THE GRID HAS TO BE CHOSEN HERE AND NOT IN THE IMAGE BUILDER.  Every
+# Moonshine decoder weight tensor has max|w8| = 127 exactly (_scale_from_max_abs
+# saturates), so a board-side restack of the deployed int8 codes to a 63-level
+# grid with an exact 127/31 factor folded into the per-dispatch multiplier looks
+# free -- no extractor, no lowering.  Measured (Lab B75, 765 utterances, paired
+# bootstrap) that double quantisation costs +0.740 WER points [+0.251, +1.238]
+# MORE than quantising the float weights direct, because 255 levels do not
+# divide into 63 (4.05) and the second rounding is a moire that does not average
+# out.  The grid must come from the float weights, which only this file sees.
+#
+# ACTIVATIONS ARE NOT AFFECTED.  This is a WEIGHT grid: `_record(..., dtype="i8")`
+# and every activation scale stay on the int8 rule.  The engine's requantiser
+# (mbxr_quant) carries ONE Q0.31 multiplier and ONE shift per dispatch, so it can
+# express a per-TENSOR weight scale and nothing finer -- which is why 6 bits is
+# the reachable grid and 4 is not (int4 per-tensor: 118.9 % WER, B75).
+_WEIGHT_BITS_DEFAULT = 8
+_WEIGHT_BITS_SUPPORTED = (8, 6, 4)
 
-def _scale_from_max_abs(t: torch.Tensor) -> float:
-    """Per-tensor symmetric scale: maps [-max_abs, max_abs] onto [-127, 127]."""
+
+def _sym_range(bits: int = 8) -> float:
+    """Positive levels of a symmetric `bits`-wide grid: 127, 31, 7."""
+    if bits not in _WEIGHT_BITS_SUPPORTED:
+        raise NotImplementedError(
+            f"weight_bits={bits!r} not supported (have: "
+            f"{', '.join(str(b) for b in _WEIGHT_BITS_SUPPORTED)})")
+    return float(2 ** (bits - 1) - 1)
+
+
+def _scale_from_max_abs(t: torch.Tensor, bits: int = 8) -> float:
+    """Per-tensor symmetric scale: maps [-max_abs, max_abs] onto [-qmax, qmax]."""
     m = float(t.detach().abs().max().item())
-    return max(m, 1e-8) / _INT8_RANGE
+    return max(m, 1e-8) / _sym_range(bits)
 
 
-def _quantize_per_tensor_sym(t: torch.Tensor, scale: float) -> np.ndarray:
-    q = torch.round(t.detach() / scale).clamp(-127, 127).to(torch.int8)
+def _quantize_per_tensor_sym(t: torch.Tensor, scale: float,
+                             bits: int = 8) -> np.ndarray:
+    """Codes on the `bits`-wide symmetric grid, stored ONE PER BYTE as int8.
+
+    Sub-byte codes are NOT packed here.  Unpacked codes keep the whole
+    downstream -- the numpy golden simulator, kernel_linear_s8, the curated and
+    generated C, every max_abs_err gate -- bit-exact and unmodified, because a
+    code in [-31, 31] is a perfectly ordinary int8 weight.  That is what makes
+    the ACCURACY half of a sub-byte grid shippable on the deployed bitstream
+    today, with only the byte saving waiting on RTL.  `pack_sub_byte_rows`
+    below is the packing the weight image needs, kept separate for exactly
+    that reason.
+    """
+    qmax = _sym_range(bits)
+    q = torch.round(t.detach() / scale).clamp(-qmax, qmax).to(torch.int8)
     return q.cpu().numpy()
+
+
+def pack_sub_byte_rows(codes: np.ndarray, bits: int) -> np.ndarray:
+    """[N, K] int8 codes -> [N, K*bits/8] uint8, little-endian bit order.
+
+    THE BIT ORDER IS THE CONTRACT with the engine's read-port unpacker and with
+    mbxr_wimage_build_fn's row_fn: code k of a row occupies bits
+    [k*bits, (k+1)*bits) of the row's packed byte string, least-significant
+    bit first, so a 64-bit scratchpad word read little-endian yields codes in
+    ascending k with no byte swap.  Codes are stored two's-complement in `bits`
+    bits; the unpacker sign-extends.
+
+    K*bits must be a multiple of 64 so a row is a whole number of scratchpad
+    words -- Moonshine's decoder K of 288 and 1152 give 27 and 108 words at
+    6 bits, and 18 and 72 at 4 bits, all exact.
+    """
+    if bits not in _WEIGHT_BITS_SUPPORTED:
+        raise NotImplementedError(f"pack: weight_bits={bits!r} not supported")
+    c = np.asarray(codes, dtype=np.int8)
+    if c.ndim != 2:
+        raise ValueError(f"pack: expected [N, K], got {c.shape}")
+    N, K = c.shape
+    if bits == 8:
+        return c.view(np.uint8)
+    if (K * bits) % 64 != 0:
+        raise ValueError(
+            f"pack: K={K} at {bits} bits is {K * bits} bits per row, not a whole "
+            f"number of 64-bit words; the image's row stride would not be integral")
+    qmax = int(_sym_range(bits))
+    if int(c.max(initial=0)) > qmax or int(c.min(initial=0)) < -qmax:
+        raise ValueError(f"pack: codes outside [-{qmax}, {qmax}] for {bits} bits")
+    u = (c.astype(np.int32) & ((1 << bits) - 1)).astype(np.uint64)   # two's complement
+    out = np.zeros((N, K * bits // 8), dtype=np.uint8)
+    # scatter each code into the row's bit string; a code may straddle two bytes
+    for k in range(K):
+        lo = k * bits
+        byte, off = lo // 8, lo % 8
+        v = u[:, k] << np.uint64(off)
+        out[:, byte] |= (v & np.uint64(0xFF)).astype(np.uint8)
+        if off + bits > 8:
+            out[:, byte + 1] |= ((v >> np.uint64(8)) & np.uint64(0xFF)).astype(np.uint8)
+    return out
+
+
+def unpack_sub_byte_rows(packed: np.ndarray, K: int, bits: int) -> np.ndarray:
+    """Inverse of `pack_sub_byte_rows`: [N, K*bits/8] uint8 -> [N, K] int8.
+
+    The host-side mirror of the read-port unpacker, so the packed image can be
+    validated against the unpacked codes before any bitstream exists.
+    """
+    if bits not in _WEIGHT_BITS_SUPPORTED:
+        raise NotImplementedError(f"unpack: weight_bits={bits!r} not supported")
+    p = np.asarray(packed, dtype=np.uint8)
+    if bits == 8:
+        return p.view(np.int8)
+    N = p.shape[0]
+    out = np.zeros((N, K), dtype=np.int8)
+    mask = (1 << bits) - 1
+    sign = 1 << (bits - 1)
+    for k in range(K):
+        lo = k * bits
+        byte, off = lo // 8, lo % 8
+        v = p[:, byte].astype(np.int32) >> off
+        if off + bits > 8:
+            v |= p[:, byte + 1].astype(np.int32) << (8 - off)
+        v &= mask
+        out[:, k] = ((v ^ sign) - sign).astype(np.int8)     # sign-extend
+    return out
+
+
+def sub_byte_row_bytes(K: int, bits: int) -> int:
+    """Packed bytes per weight row -- the `Kp` mbxr_wimage_plan_ex must be given.
+
+    The planner derives G = Kp / 8 words per row, so handing it the PACKED row
+    width is the whole software-side plan change: K=288 at 6 bits is Kp=216,
+    G=27, and every other field falls out.  (The planner does still need the
+    true K kept separately: act_extent() sizes the ACTIVATION fetch from
+    img->K, and the activations stay int8.)
+    """
+    if (K * bits) % 8 != 0:
+        raise ValueError(f"K={K} at {bits} bits is not a whole number of bytes")
+    return K * bits // 8
 
 
 def _requantize_int(acc: np.ndarray, multiplier: int, shift: int) -> np.ndarray:
@@ -1490,6 +1616,7 @@ def extract_int8(
     fusion_target: "str | None" = None,
     fold_conv_bn: bool = True,
     range_overrides: "dict[str, float] | None" = None,
+    weight_bits: int = _WEIGHT_BITS_DEFAULT,
 ) -> dict[str, Any]:
     """int8 PTQ extractor.
 
@@ -1977,8 +2104,14 @@ def extract_int8(
                 _record(node.name, dtype="i8")
                 w_fp32 = mod.weight.detach()
                 b_fp32 = mod.bias.detach() if mod.bias is not None else None
-                w_scale = _scale_from_max_abs(w_fp32)
-                w_q = _quantize_per_tensor_sym(w_fp32, w_scale)
+                # THE WEIGHT GRID.  `weight_bits` moves only this: the scale that
+                # maps the float weights onto the code grid and the clamp on the
+                # codes.  Activations, the bias' int32 accumulator domain and the
+                # Q0.31 requantiser are all untouched -- `real_mult` below picks
+                # the narrower grid up through `w_scale` and nothing else changes,
+                # which is why a sub-byte weight grid needs NO requantiser change.
+                w_scale = _scale_from_max_abs(w_fp32, weight_bits)
+                w_q = _quantize_per_tensor_sym(w_fp32, w_scale, weight_bits)
                 in_scale = scales[in_name]
                 out_scale = scales[node.name]
                 # bias is in scale s_in * s_w (int32 accumulator domain).
@@ -2035,6 +2168,8 @@ def extract_int8(
                         "output_shift": shift,
                         "activation_min": act_min,
                         "activation_max": act_max,
+                        **({} if weight_bits == 8
+                           else {"weight_bits": weight_bits}),
                     },
                 })
                 if fuse_relu:
@@ -3551,6 +3686,7 @@ def extract_int8(
         "name": name,
         "version": 1,
         "quant": "int8",
+        **({} if weight_bits == 8 else {"weight_bits": weight_bits}),
         "input": ir_input,
         "output": {
             "tensors": output_tensors,
@@ -4321,11 +4457,18 @@ def extract(
     enable_fusion: bool = False,
     fusion_target: "str | None" = None,
     fold_conv_bn: bool = True,
+    weight_bits: int = _WEIGHT_BITS_DEFAULT,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
     `quant` is recorded in the IR top-level field so downstream stages (and
     cache-key naming) can branch on it. Supported: fp32, fp16, int8.
+
+    `weight_bits` (int8 only) narrows the WEIGHT grid of nn.Linear to 6 or 4
+    bits while activations, biases and the requantiser stay exactly int8; it is
+    recorded top-level and on each linear_s8 op's `quant` so the image builder
+    knows to pack. 8 (the default) reproduces every existing extract
+    byte-for-byte.
 
     fp16 mode: the graph is traced at fp32 (more stable for ShapeProp —
     a few ops error out on half tensors during tracing), but weights,
@@ -4346,7 +4489,12 @@ def extract(
             enable_fusion=enable_fusion,
             fusion_target=fusion_target,
             fold_conv_bn=fold_conv_bn,
+            weight_bits=weight_bits,
         )
+    if weight_bits != _WEIGHT_BITS_DEFAULT:
+        raise NotImplementedError(
+            f"weight_bits={weight_bits!r} is an int8-path option; it has no "
+            f"meaning for quant={quant!r}")
     if quant not in ("fp32", "fp16"):
         raise NotImplementedError(
             f"quant={quant!r} not supported (have: fp32, fp16, int8)"
@@ -6539,6 +6687,20 @@ def main() -> None:
                          "half precision (uses torch.float16 model + "
                          "_Float16 C kernels, validated against half-cast "
                          "torch golden), int8 = symmetric per-tensor PTQ.")
+    ap.add_argument("--weight-bits", type=int, default=_WEIGHT_BITS_DEFAULT,
+                    choices=list(_WEIGHT_BITS_SUPPORTED),
+                    help="int8 only: WEIGHT grid width for nn.Linear. 8 (default) "
+                         "is the stock per-tensor int8 grid and reproduces every "
+                         "existing extract byte-for-byte. 6 and 4 narrow the "
+                         "weight grid alone -- activations, the int32 bias domain "
+                         "and the Q0.31 requantiser stay int8, so no requantiser "
+                         "change is needed. Codes are still stored one per byte; "
+                         "pack_sub_byte_rows() is the packing the weight image "
+                         "needs, and the byte saving is not realised until the "
+                         "engine unpacks at its read port. The grid CANNOT be "
+                         "applied downstream: restacking deployed int8 codes to "
+                         "63 levels costs +0.740 WER points more than quantising "
+                         "the float weights direct (Lab B75).")
     ap.add_argument("--fp16-ops", default=None,
                     help="comma-separated IR op names to promote to fp16 in an "
                          "int8 extract (mixed precision). Additive to the "
@@ -6754,6 +6916,7 @@ def main() -> None:
             per_channel_depthwise=getattr(args, "per_channel_depthwise", False),
             enable_fusion=getattr(args, "enable_fusion", False),
             fold_conv_bn=getattr(args, "fold_conv_bn", True),
+            weight_bits=getattr(args, "weight_bits", _WEIGHT_BITS_DEFAULT),
             fusion_target=getattr(args, "fusion_target", None))
 
     if args.core_registry:
