@@ -82,6 +82,20 @@ def _west_build(
         # verify path's equivalent.
         cflags = backend.resolved_kernel_cflags(repo_root)
         cmd.append(f"-DMODELBLASTER_KERNEL_CFLAGS={';'.join(cflags)}")
+        # The verify image must share the kernel's float ABI or the two do not
+        # link. spike_riscv64 and harness/prj.conf are CONFIG_FPU=y (lp64d);
+        # a soft-float kernel (-mabi=lp64 / ilp32) needs a CONFIG_FPU=n image,
+        # which Zephyr then builds lp64 with no f/d in -march. spike's --isa is
+        # a superset, so the soft-float image runs there unchanged -- and the
+        # object that is gated is the object the no-FPU shell will run.
+        abi = next((f.split("=", 1)[1] for f in cflags
+                    if f.startswith("-mabi=")), None)
+        # Stated in both directions: a -D CONFIG_ symbol is cached in the build
+        # directory, so a soft-float verify must not leave FPU=n behind for
+        # the next hard-float one sharing that directory.
+        if abi is not None:
+            hard = abi.endswith(("f", "d", "q"))
+            cmd.append(f"-DCONFIG_FPU={'y' if hard else 'n'}")
     env = os.environ.copy()
     # Ensure cmake is found (Vitis puts a broken cmake first in $PATH).
     # Also ensure west is findable via MODELBLASTER_WEST or the miniforge zephyr env.

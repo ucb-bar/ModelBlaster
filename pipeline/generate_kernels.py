@@ -1097,7 +1097,7 @@ def generate_one_llm(
     # Also drop algorithms whose target_affinity excludes this backend.
     candidates = [
         a for a in candidates
-        if not a.target_affinity or backend.name in a.target_affinity
+        if not a.target_affinity or backends_mod.affined(a.target_affinity, backend.name)
     ]
     if not candidates:
         log(f"  [{spec.op}] no algorithms remain after target_affinity "
@@ -1121,14 +1121,14 @@ def generate_one_llm(
     # selection toward target-affined kernels and let real-HW (FireSim)
     # rank them when re-rank is enabled.
     has_target_affined = any(
-        a.target_affinity and backend.name in a.target_affinity
+        backends_mod.affined(a.target_affinity, backend.name)
         for a in candidates
     )
     if has_target_affined:
         before = [a.name for a in candidates]
         candidates = [
             a for a in candidates
-            if a.target_affinity and backend.name in a.target_affinity
+            if backends_mod.affined(a.target_affinity, backend.name)
         ]
         dropped = [n for n in before if n not in (a.name for a in candidates)]
         if dropped:

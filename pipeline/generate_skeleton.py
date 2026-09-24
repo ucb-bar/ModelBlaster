@@ -1075,6 +1075,12 @@ def _weight_name(model_name: str, weight_key: str,
     return ident
 
 
+def _affined(target_affinity, backend: Optional[str]) -> bool:
+    """backends.affined, imported lazily (see _conv_weight_layout_for_backend)."""
+    from modelblaster.pipeline.backends import affined
+    return affined(target_affinity, backend)
+
+
 def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
     """Derive the conv weight layout for a backend from its algorithm declarations.
 
@@ -1158,7 +1164,7 @@ def _check_conv_family_layout_agreement(backend: Optional[str], s8_layout: Optio
         other_layouts = {
             algo.weight_layout
             for algo in spec.algorithms
-            if algo.target_affinity and backend in algo.target_affinity
+            if _affined(algo.target_affinity, backend)
         }
         if not other_layouts:
             continue
@@ -1224,7 +1230,7 @@ def _conv_weight_layout_for_op(op_name: Optional[str],
     declared = {
         algo.weight_layout
         for algo in spec.algorithms
-        if algo.target_affinity and backend in algo.target_affinity
+        if _affined(algo.target_affinity, backend)
     }
     if len(declared) > 1:
         raise SystemExit(

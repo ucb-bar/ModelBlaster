@@ -654,45 +654,72 @@ GEMMINI_Q31_SOFTFP = Backend(
 )
 
 
-# The combined Gemmini + Saturn shell's target: gemmini_q31_rvv with no
-# -march/-mabi of its own, for the same reason gemmini_q31_softfp exists.
-# RocketArty200TDroneGemminiSaturnFp16At35Config carries both accelerators and an
-# FP16-only scalar FPU, so its image is built CONFIG_FPU=n and every kernel has
-# to inherit that ABI rather than demand lp64d.
+# The combined Gemmini + Saturn shell's target, and the integer shell's.
 #
-# The vector extension is NOT dropped with the FPU: rv64imac_zicsr_zifencei_v is
-# what this shell wants, and Zephyr's RISCV_ISA_EXT_V is a separate symbol from
-# CONFIG_FPU. Saturn stays reachable on a no-scalar-FPU image.
-# BLOCKED, and kept so the blocker is written down rather than rediscovered.
+# gemmini_q31_rvv pins -march=rv64imafdcv -mabi=lp64d. Neither arty200t shell
+# that carries Saturn implements that:
 #
-# Dropping -march works for gemmini_q31_softfp because Gemmini reaches the
-# accelerator through inline asm that needs no ISA extension. It does NOT work
-# here: the RVV kernels use vector types (vint8m2_t, __riscv_vmv_x_s_i32m1_i32)
-# which require "v" in -march, and inheriting the image's flags gives
-# rv64imafdc_zicsr_zifencei -- no v -- so every kernel fails to compile. The
-# harness overlay does set CONFIG_RISCV_ISA_EXT_V=y and Zephyr still does not
-# put v in -march for the verify build, which is worth understanding on its own.
+#   RocketArty200TDroneGemminiSaturnFp16At35Config
+#       riscv,isa "rv64imafcbv..._zve64d_zvfh_zfh..." -- but the scalar FPU is
+#       WithRocketFPU16 (Zfh only, misa.F = misa.D = 0) and Saturn is
+#       robotMpcParams (fp16-only vector). The image is CONFIG_FPU=n, lp64.
+#   RocketArty200TDroneGemminiSaturnIntAt40Config
+#       riscv,isa "rv64imafdcb..._zve64x..." -- full scalar FPU, but Saturn is
+#       intOnlyParams: integer vector only (zve64x, no "v", no vector FP).
 #
-# The flags this variant actually wants are rv64imacv + lp64: vector, no f/d,
-# soft-float ABI. That cannot be verified today, because the verify harness
-# builds for spike_riscv64 as lp64d and an object compiled lp64 cannot be linked
-# against it. Verifying a soft-float vector variant needs the verify build to
-# inherit the target's ABI, which is a change to the verification flow rather
-# than to a flag table.
+# What both shells run is integer vector: zve64x. Dima's riskybird-integer-dronet
+# commits made every DroNet kernel on this target integer-only for exactly that
+# (2c037e8, 3053d80, 49f5786), and his FPGA runs -- including 10b50ba's 13.31
+# fps on the FP16 shell -- were built by overriding MODELBLASTER_KERNEL_CFLAGS
+# with "-march=rv64imac_zve64x -mabi=lp64" rather than with this table's flags.
+# These two variants put that override in the table.
 #
-# Until then the combined Gemmini+Saturn shell runs via gemmini_q31_softfp, with
-# Gemmini working and Saturn idle.
+# WHY NOT "v". rv64imacv + lp64 looks like the soft-float vector target and is
+# not one: GCC expands "v" to zve64d, which implies "d" and "f".
+#     riscv64-zephyr-elf-gcc 14.3 -march=rv64imacv -mabi=lp64 -Q --help=target
+#       -march= rv64imafdcv_zicsr_zve32f_..._zve64d_..._zvl128b
+# -mabi=lp64 only changes the calling convention; float arithmetic still
+# compiles to fadd.s/fcvt/flw, which trap on a shell with misa.F = 0. zve64x
+# implies nothing floating-point (rv64imac_zve32x_zve64x_zvl32b_zvl64b), so a
+# kernel that reaches for vector FP fails to COMPILE instead of trapping.
+#
+# The soft-float variant is verified on spike with a CONFIG_FPU=n harness image
+# (profile_kernel._west_build follows the kernel's -mabi), so the object that is
+# gated is the object that runs.
+_GEMMINI_Q31_RVV_NO_ISA = tuple(
+    f for f in GEMMINI_Q31_RVV.kernel_cflags
+    if not f.startswith(("-march=", "-mabi="))
+)
+
+# FP16-only scalar FPU (Fp16At35): integer vector, soft-float ABI.
 GEMMINI_Q31_RVV_SOFTFP = Backend(
     name="gemmini_q31_rvv_softfp",
     description=(
-        "Gemmini Q0.31 + Saturn RVV with no -march/-mabi of its own, so kernels "
-        "inherit the image's ABI. For the combined arty200t shell, whose scalar "
-        "FPU implements only Zfh."
+        "Gemmini Q0.31 + Saturn integer RVV, rv64imac_zve64x / lp64: no scalar "
+        "or vector FP at all. For the combined arty200t shell, whose scalar FPU "
+        "implements only Zfh (image CONFIG_FPU=n)."
     ),
-    kernel_cflags=tuple(
-        f for f in GEMMINI_Q31_RVV.kernel_cflags
-        if not f.startswith(("-march=", "-mabi="))
+    kernel_cflags=("-march=rv64imac_zve64x", "-mabi=lp64") + _GEMMINI_Q31_RVV_NO_ISA,
+    kernel_includes=GEMMINI_Q31_RVV.kernel_includes,
+    prj_conf_overlay=GEMMINI_Q31_RVV.prj_conf_overlay,
+    spike_args=GEMMINI_Q31_RVV.spike_args,
+    optimization_guide=GEMMINI_Q31_RVV.optimization_guide,
+    verify_method=GEMMINI_Q31_RVV.verify_method,
+    atol_override=GEMMINI_Q31_RVV.atol_override,
+    rtol_override=GEMMINI_Q31_RVV.rtol_override,
+    curated_aliases=("gemmini_q31_rvv",) + tuple(GEMMINI_Q31_RVV.curated_aliases),
+)
+
+# Full scalar FPU + integer-only Saturn (IntAt40): hard-float, integer vector.
+# The -march matches the shell's riscv,isa (rv64imafdc + zve64x) instead of
+# claiming "v", which would also permit vector FP the shell does not have.
+GEMMINI_Q31_RVV_ZVE64X = Backend(
+    name="gemmini_q31_rvv_zve64x",
+    description=(
+        "Gemmini Q0.31 + Saturn integer RVV, rv64imafdc_zve64x / lp64d. For the "
+        "integer arty200t shell: full scalar FPU, integer-only vector unit."
     ),
+    kernel_cflags=("-march=rv64imafdc_zve64x", "-mabi=lp64d") + _GEMMINI_Q31_RVV_NO_ISA,
     kernel_includes=GEMMINI_Q31_RVV.kernel_includes,
     prj_conf_overlay=GEMMINI_Q31_RVV.prj_conf_overlay,
     spike_args=GEMMINI_Q31_RVV.spike_args,
@@ -718,6 +745,7 @@ BACKENDS: dict[str, Backend] = {
     GEMMINI_Q31_SOFTFP.name: GEMMINI_Q31_SOFTFP,
     GEMMINI_Q31_RVV.name: GEMMINI_Q31_RVV,
     GEMMINI_Q31_RVV_SOFTFP.name: GEMMINI_Q31_RVV_SOFTFP,
+    GEMMINI_Q31_RVV_ZVE64X.name: GEMMINI_Q31_RVV_ZVE64X,
 }
 
 
@@ -742,6 +770,23 @@ def backend_lineage(name: str) -> tuple[str, ...]:
     if b is None:
         return (name,)
     return (name,) + tuple(b.curated_aliases)
+
+
+def affined(target_affinity, name: Optional[str]) -> bool:
+    """Is an algorithm with this target_affinity affined to backend `name`?
+
+    True when `name` OR anything it inherits from (backend_lineage) is listed.
+    Every per-backend affinity test goes through here, for the reason
+    backend_lineage's docstring gives: a variant that differs from its parent
+    only in -march/-mabi must make every decision its parent makes. With exact
+    matching, gemmini_q31_rvv_softfp on DroNet's NHWC graph found no NHWC
+    kernels (act_layout native=0 shim=10), packed conv2d_pool_s8 weights OIHW,
+    and every Gemmini kernel failed verify at max_abs_err=94 -- while the same
+    C under gemmini_q31_rvv verified at 3.
+    """
+    if not target_affinity or not name:
+        return False
+    return bool(set(backend_lineage(name)) & set(target_affinity))
 
 
 def get(name: str) -> Backend:
