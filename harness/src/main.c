@@ -123,6 +123,48 @@ int main(void)
     unsigned int mb_irq_key = irq_lock();
 #endif
 
+#if defined(CONFIG_RISCV_ISA_EXT_V)
+    /* ------------------------------------------------------------------
+     * Turn the vector unit on for a Zve*-only core (misa.V = 0).
+     *
+     * This Zephyr enables mstatus.VS in exactly two places, and both miss a
+     * core that implements Zve64x but not full V:
+     *   - arch/riscv/core/thread.c sets MSTATUS_VS_INIT in a new thread's
+     *     mstatus only under CONFIG_RISCV_ISA_EXT_V_LAZY (the harness
+     *     overlays use LAZY=n);
+     *   - the eager path, z_riscv_vstate_restore_thread() in
+     *     arch/riscv/core/v.c, sets VS_CLEAN on context switch, but it
+     *     returns first unless HAS_V(), i.e. misa bit 'V'.
+     * Rocket sets misa.V only when vLen >= 128 && eLen >= 64 && vfLen >= 64
+     * (rocket-chip tile/Core.scala hasV), so an integer-only Saturn
+     * (intOnlyParams: zve64x) has misa.V = 0, while mstatus.VS is still
+     * writable (CSR.scala formVS keys on usingVector). Result, measured on
+     * RocketArty200TDroneGemminiSaturnIntAt35Config: the first vsetvli in a
+     * kernel traps illegal-instruction with VS = Off. There is no Kconfig for
+     * Zve-without-V here (arch/riscv/Kconfig.isa has only RISCV_ISA_EXT_V).
+     *
+     * Where misa.V = 1 (the FP16 Saturn shell, spike's rv64gcv) Zephyr has
+     * already done this and the branch is not taken. On a core with no vector
+     * unit at all the write is a no-op (VS is hardwired Off) and behaviour is
+     * unchanged.
+     *
+     * SINGLE-THREAD ONLY. With misa.V = 0 Zephyr's HAS_V() also skips every
+     * vector save/restore, so vector registers are NOT preserved across a
+     * context switch or an ISR. This harness runs one thread and, by default,
+     * the whole inference under irq_lock() above, which is what makes this
+     * safe. A multi-threaded or IRQ-enabled RVV workload on such a core needs
+     * Zephyr's HAS_V() taught about Zve instead.
+     * ------------------------------------------------------------------ */
+    {
+        unsigned long mb_misa;
+        __asm__ volatile("csrr %0, misa" : "=r"(mb_misa));
+        if (!(mb_misa & (1UL << ('V' - 'A')))) {
+            /* mstatus.VS = Initial (bits 10:9 = 01) */
+            __asm__ volatile("csrs mstatus, %0" :: "r"(1UL << 9) : "memory");
+        }
+    }
+#endif
+
 #if defined(MB_TACIT_HW)
     /* Program + enable the encoder immediately before the inference so the
      * FSync lands on a real inference PC and the trace holds only model
