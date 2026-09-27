@@ -783,7 +783,7 @@ def _verify(
         return VerifyResult(False, struct_err)
 
     if backend.verify_method == VERIFY_HOST_CTYPES:
-        return host_verify(spec, candidate, shapes)
+        return host_verify(spec, candidate, shapes, includes=backend.kernel_includes)
 
     if backend.verify_method == VERIFY_CROSS_COMPILE:
         return cross_compile_verify(spec, candidate, backend, repo_root)
@@ -1315,6 +1315,7 @@ def beam_search_optimize(
 
     for it in range(1, iterations + 1):
         log(f"  [{spec.op}] iter {it}/{iterations}  beam=[{', '.join(str(c) for _, c in beam_set)}]  best={best_cycles}")
+        best_before = best_cycles
         proposals: Beam = []
         for parent_idx, (parent_code, parent_cycles) in enumerate(beam_set):
             for exp in range(1, expansions + 1):
@@ -1396,7 +1397,7 @@ def beam_search_optimize(
                 # numerical sweep — catches cases where the model shapes are
                 # narrow but extra_shapes are not.
                 if backend.verify_method == VERIFY_HOST_CTYPES:
-                    vres = host_verify(spec, candidate, shapes)
+                    vres = host_verify(spec, candidate, shapes, includes=backend.kernel_includes)
                     if not vres.ok:
                         log(f"      host verify FAIL: {vres.message.splitlines()[0]}")
                         history.append({
@@ -1427,7 +1428,9 @@ def beam_search_optimize(
             break
 
         beam_set = sorted(proposals, key=lambda x: x[1])[:beam]
-        if beam_set[0][1] >= best_cycles and best_cycles < baseline_cycles:
+        # best_cycles already includes this iteration's proposals, so compare with the best
+        # before it: stop when this iteration did not improve on an earlier improvement.
+        if best_cycles >= best_before and best_cycles < baseline_cycles:
             log(f"  [{spec.op}] no further improvement, stopping early")
             break
 

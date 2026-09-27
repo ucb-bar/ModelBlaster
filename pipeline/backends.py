@@ -624,7 +624,10 @@ PEXT = Backend(
         "Rocket. Hart 1 does not implement it; kernels must be pinned."
     ),
     kernel_cflags=("-DMB_PEXT_HW=1",),
-    optimization_guide="optimization_guide_scalar.md",
+    # pext.h is the SoC's header (the app supplies its -I); every kernel gets it, so the
+    # model can use the MBP functions without an #include, as RVV kernels use riscv_vector.h.
+    kernel_includes=('"pext.h"',),
+    optimization_guide="optimization_guide_pext.md",
     verify_method=VERIFY_HOST_CTYPES,
     # Every curated kernel for this target is bit-exact by construction: the
     # accelerated path recomputes the reference expression in the same rounding

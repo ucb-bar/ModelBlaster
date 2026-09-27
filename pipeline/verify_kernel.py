@@ -39,13 +39,19 @@ _HOST_PROLOGUE = (
 )
 
 
-def host_compile(c_source: str, label: str, workdir: str) -> str:
-    """Compile `c_source` into a shared library; return the .so path."""
+def host_compile(c_source: str, label: str, workdir: str, includes: tuple = ()) -> str:
+    """Compile `c_source` into a shared library; return the .so path.
+
+    `includes` are the target's kernel_includes, which a kernel may use without an
+    #include, as it does when cross-compiled."""
     src_path = os.path.join(workdir, f"{label}.c")
     so_path = os.path.join(workdir, f"{label}.so")
     with open(src_path, "w") as f:
         if "#include" not in c_source:
             f.write(_HOST_PROLOGUE)
+        for inc in includes:
+            if inc not in c_source:
+                f.write(f"#include {inc}\n")
         f.write(c_source)
     cmd = [HOST_CC, "-O2", "-fPIC", "-shared", "-Wno-unused-result",
            src_path, "-o", so_path, "-lm"]
@@ -827,6 +833,7 @@ def verify(
     atol: float = 1e-4,
     rtol: float = 1e-3,
     seed: int = 0,
+    includes: tuple = (),
 ) -> VerifyResult:
     """Compile the candidate, run it alongside the reference at each shape, and
     return whether numerics match within tolerance.
@@ -845,7 +852,7 @@ def verify(
         except CompileError as e:
             return VerifyResult(False, f"reference failed to compile: {e}")
         try:
-            cand_so = host_compile(candidate_c, f"cand_{op}", workdir)
+            cand_so = host_compile(candidate_c, f"cand_{op}", workdir, includes)
         except CompileError as e:
             return VerifyResult(False, f"candidate failed to compile:\n{e}")
 

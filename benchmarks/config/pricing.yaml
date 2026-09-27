@@ -31,6 +31,12 @@ sources:
 # session telemetry, extend the aggregator and the schema accordingly.
 models:
 
+  deepseek.v3.2:
+    input_uncached:        0.62
+    output:                1.85
+    provider: bedrock
+    # AWS Price List API, AmazonBedrock us-west-2 standard on-demand, effective 2026-09-01
+
   claude-opus-4-7:
     input_uncached:        5.00
     cache_write_5m:        6.25
