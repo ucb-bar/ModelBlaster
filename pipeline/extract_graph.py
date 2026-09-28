@@ -3299,6 +3299,22 @@ def extract_int8(
             activations[c_name] = c_new.astype(np.float16).reshape(1, H)
             activations[h_name] = out_f16.reshape(1, H)
             activations[out_name] = out_f16.reshape(1, H)
+        elif op['op'] == "relu_f16":
+            activations[out_name] = np.maximum(
+                in_arr.astype(np.float16), np.float16(0.0))
+        elif op['op'] == "add_f16":
+            a = activations[op['inputs'][0]].astype(np.float32)
+            b = activations[op['inputs'][1]].astype(np.float32)
+            activations[out_name] = (a + b).astype(np.float16)
+        elif op['op'] == "batchnorm2d_f16":
+            sh = op['shape']; q = op['quant']
+            scale_pc = weights_blob[op['weight']].astype(np.float32)
+            bias_pc = weights_blob[op['bias']].astype(np.float32)
+            x = in_arr.reshape(sh['N'], sh['C'], sh['H'], sh['W']).astype(np.float32)
+            y = scale_pc[None, :, None, None] * x + bias_pc[None, :, None, None]
+            if q.get('activation_min', -1) == 0:
+                y = np.maximum(y, np.float32(0.0))
+            activations[out_name] = y.astype(np.float16)
         else:
             raise NotImplementedError(
                 f"int8 simulator: unsupported op {op['op']}"
