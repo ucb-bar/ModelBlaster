@@ -73,7 +73,7 @@ def _west_build(
     if pristine:
         cmd.insert(2, "-p")
     cmd += ["--",
-            f"-DMODEL_DIR={model_dir}",
+            f"-DMODEL_DIR={os.path.abspath(model_dir)}",
             f"-DMODELBLASTER_BACKEND={backend.name}"]
     if backend.kernel_cflags:
         # Resolve <repo_root> placeholders (gemmini's -isystem paths use
@@ -83,6 +83,12 @@ def _west_build(
         cflags = backend.resolved_kernel_cflags(repo_root)
         cmd.append(f"-DMODELBLASTER_KERNEL_CFLAGS={';'.join(cflags)}")
     env = os.environ.copy()
+    # riskybird: default the Zephyr SDK toolchain variant when the caller has not
+    # already chosen one, so the west verify build resolves the CPP (CMake's
+    # Zephyr-sdk package registry can otherwise pick a stale/broken SDK).
+    # ZEPHYR_SDK_INSTALL_DIR / ZEPHYR_BASE are intentionally NOT hardcoded here --
+    # activate your west workspace (or export them) in the calling environment.
+    env.setdefault("ZEPHYR_TOOLCHAIN_VARIANT", "zephyr")
     # Ensure cmake is found (Vitis puts a broken cmake first in $PATH).
     # Also ensure west is findable via MODELBLASTER_WEST or the miniforge zephyr env.
     _WEST_FALLBACK = os.path.join(

@@ -84,6 +84,40 @@ def _load_cycles_per_dispatch(csv_path: pathlib.Path) -> dict[int, int]:
     return out
 
 
+_ZERO_COST_OPS = {"view", "chunk2_c1"}
+
+
+def _build_codegen_to_ir(ir_path) -> dict:
+    """Map profile-CSV codegen index (dense 0..N-1, from the profiling
+    harness which drops zero-cost IR ops) -> IR dispatch_id. Mirrors the
+    filter codegen/ingest_xpurt_schedule.py use so the mapping is exact.
+    Fixes the "dispatch_id rejected" mismatch when the IR carries
+    view/chunk2_c1 ops that consume an IR id but no codegen slot. For
+    DroNet the two views carry dispatch_id=None so this is the identity."""
+    import json as _json, pathlib as _pl
+    p = _pl.Path(ir_path)
+    if not p.exists():
+        return {}
+    ir = _json.loads(p.read_text())
+    ops = ir.get("ops", ir if isinstance(ir, list) else [])
+    c2i = {}
+    cg = 0
+    for op in ops:
+        if op.get("op") in _ZERO_COST_OPS:
+            continue
+        did = op.get("dispatch_id")
+        c2i[cg] = cg if did is None else int(did)
+        cg += 1
+    return c2i
+
+
+def _remap_codegen_to_ir(cycles, c2i):
+    """Translate {codegen_idx -> cycles} to {ir_dispatch_id -> cycles}."""
+    if not c2i:
+        return cycles
+    return {c2i.get(k, k): v for k, v in cycles.items()}
+
+
 def _emit_modelblaster_fixture(
     workload_name: str,
     dispatch_data: dict,
@@ -223,6 +257,12 @@ def main() -> int:
     sys.path.insert(0, str(REPO_ROOT))
     from benchmarks.profile_db import query as profile_db_query  # type: ignore
 
+    _ir_graph = (REPO_ROOT / "examples" / args.model_name / "int8"
+                 / "generated" / "graph.json")
+    codegen_to_ir = _build_codegen_to_ir(_ir_graph)
+    _ident = all(k == v for k, v in codegen_to_ir.items())
+    print("codegen->IR map: %d ops (%s) from %s"
+          % (len(codegen_to_ir), "identity" if _ident else "remapped", _ir_graph.name))
     for bs_idx, bs in enumerate(backends):
         if args.cycles_source == "db":
             cycles = profile_db_query(
@@ -248,6 +288,10 @@ def main() -> int:
                 return 1
             cycles = _load_cycles_per_dispatch(csv_path)
             print(f"  {bs}: read {len(cycles)} cycles from {csv_path}")
+        cycles = _remap_codegen_to_ir(cycles, codegen_to_ir)
+        _m = sum(1 for _d in dispatch_data["dispatches"].values() if _d["id"] in cycles)
+        print("  %s: %d/%d IR dispatches matched to profile cycles"
+              % (bs, _m, len(dispatch_data["dispatches"])))
         for dname, dinfo in dispatch_data["dispatches"].items():
             did = dinfo["id"]
             if did in cycles:

@@ -1,0 +1,14 @@
+{
+  "subconfig":         "q31ws_32x32_acc",
+  "soc_config":        "Q31Ws32x32AccGemminiRocketVCU118Config",
+  "sub_project":       "vcu118",
+  "snapshot_ts":       "2026-05-18T17:43:06-07:00",
+  "chipyard_sha":      "48f904ae",
+  "src_header":        "/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/gemmini_params_q31.h",
+  "header_defines": {
+    "DIM":          "32",
+    "elem_t":       "?",
+    "acc_t":        "?",
+    "acc_scale_t":  "?"
+  }
+}
