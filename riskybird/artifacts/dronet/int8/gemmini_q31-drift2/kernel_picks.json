@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "target": "gemmini_q31",
+  "picks": {
+    "add_s8": {
+      "source": "curated",
+      "algorithm": "gemmini_resadd",
+      "path": "/scratch2/loren/riskybird-dev-setup/backends/modelblaster/kernels/gemmini_q31/gemmini_q31_add_s8_gemmini_resadd.c"
+    },
+    "batchnorm2d_s8": {
+      "source": "curated",
+      "algorithm": "direct",
+      "path": "/scratch2/loren/riskybird-dev-setup/backends/modelblaster/kernels/gemmini_q31/gemmini_q31_batchnorm2d_s8_direct.c"
+    },
+    "conv2d_s8": {
+      "source": "curated",
+      "algorithm": "gemmini_tiled_conv",
+      "path": "/scratch2/loren/riskybird-dev-setup/backends/modelblaster/kernels/gemmini_q31/gemmini_q31_conv2d_s8_gemmini_tiled_conv.c"
+    },
+    "linear_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "maxpool2d_s8": {
+      "source": "curated",
+      "algorithm": "gemmini_tiled_conv_pool",
+      "path": "/scratch2/loren/riskybird-dev-setup/backends/modelblaster/kernels/gemmini_q31/gemmini_q31_maxpool2d_s8_gemmini_tiled_conv_pool.c"
+    },
+    "relu_s8": {
+      "source": "curated",
+      "algorithm": "swar",
+      "path": "/scratch2/loren/riskybird-dev-setup/backends/modelblaster/kernels/gemmini_q31/gemmini_q31_relu_s8_swar.c"
+    },
+    "sigmoid_s8": {
+      "source": "cache",
+      "algorithm": "direct",
+      "path": "/scratch2/loren/riskybird-dev-setup/backends/modelblaster/examples/dronet/int8/cache/gemmini_q31/gemmini_q31_sigmoid_s8_direct.c"
+    }
+  }
+}
