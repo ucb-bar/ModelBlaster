@@ -1075,6 +1075,12 @@ def _weight_name(model_name: str, weight_key: str,
     return ident
 
 
+def _affined(target_affinity, backend: Optional[str]) -> bool:
+    """backends.affined, imported lazily (see _conv_weight_layout_for_backend)."""
+    from modelblaster.pipeline.backends import affined
+    return affined(target_affinity, backend)
+
+
 def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
     """Derive the conv weight layout for a backend from its algorithm declarations.
 
@@ -1158,7 +1164,7 @@ def _check_conv_family_layout_agreement(backend: Optional[str], s8_layout: Optio
         other_layouts = {
             algo.weight_layout
             for algo in spec.algorithms
-            if algo.target_affinity and backend in algo.target_affinity
+            if _affined(algo.target_affinity, backend)
         }
         if not other_layouts:
             continue
@@ -1224,7 +1230,7 @@ def _conv_weight_layout_for_op(op_name: Optional[str],
     declared = {
         algo.weight_layout
         for algo in spec.algorithms
-        if algo.target_affinity and backend in algo.target_affinity
+        if _affined(algo.target_affinity, backend)
     }
     if len(declared) > 1:
         raise SystemExit(
@@ -4570,8 +4576,20 @@ def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
     ]
 
     def _s_blob(sym, bin_abs):
+        # BASENAME, not the absolute path it was generated at. GNU as resolves
+        # .incbin through its include search path, and the harness already puts
+        # MODEL_DIR on it (target_include_directories(app PRIVATE ... MODEL_DIR)
+        # applies to the ASM source too), so the bare name resolves wherever the
+        # directory is.
+        #
+        # Baking the absolute path made a generated directory unmovable: copied
+        # or published to another machine, the build fails at
+        #   Error: file not found: /<build host>/.../test_input.bin
+        # even though the .bin sits right beside the .S that names it. That is
+        # the whole obstacle to shipping a verified codegen to a bench machine
+        # which cannot run the verification gate itself.
         return [f"    .globl  {sym}", f"    .type   {sym}, @object",
-                f"{sym}:", f'    .incbin "{bin_abs}"',
+                f"{sym}:", f'    .incbin "{os.path.basename(bin_abs)}"',
                 f"    .size   {sym}, . - {sym}", "    .align 4", ""]
 
     h_input_decls: list[str] = []       # extern + LEN macros (mangled)
