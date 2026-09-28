@@ -1,0 +1,20 @@
+{
+  "system": "chipyard-single-rocket-scalar",
+  "description": "The rb_u250_rocket FireSim bitstream (FireSimRiskyBirdRocketConfig -> chipyard.RocketConfig on xilinx_alveo_u250, 30 MHz host): ONE Rocket hart, no vector unit, no Gemmini. Every dispatch runs on the scalar backend on hart 0, so a schedule built against this registry is necessarily serialized -- there is no second worker to overlap onto. Use chipyard_dual_rocket_gemmini_q31.json instead when a 2-hart saturn+gemmini_q31 bitstream is available; that is the machine the shipped gemmini_q31 and V256D128_rvv profiles were captured on.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rocket0",
+      "kind": "scalar",
+      "isa": "rv64imafdc",
+      "harts": [0],
+      "description": "Rocket, rv64gc, no RVV and no ROCC accelerator. Runs the MODELBLASTER_BACKEND=scalar reference kernels for every op.",
+      "capabilities": [
+        "linear", "conv2d", "relu", "elu", "add", "maxpool2d", "batchnorm2d",
+        "sigmoid", "silu", "cat", "upsample",
+        "linear_s8", "conv2d_s8", "relu_s8", "add_s8", "maxpool2d_s8",
+        "batchnorm2d_s8", "sigmoid_s8"
+      ]
+    }
+  ]
+}

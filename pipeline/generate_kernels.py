@@ -193,6 +193,30 @@ def _assert_curated_layout_contract(spec, algorithm, backend, curated_path):
         )
 
 
+def _curated_path(global_curated_dir, backend_name: str, op: str,
+                  algo_name: str) -> Optional[str]:
+    """Where a curated kernel for this backend lives, following its lineage.
+
+    A backend VARIANT keeps its parent's kernels: only the -march/-mabi differ,
+    and kernels are C. backends.backend_lineage says so, and its docstring says
+    the lineage "belongs in one place that every per-backend lookup consults" --
+    but the curated lookup did not consult it. It joined <dir>/<backend>/ and
+    stopped, so a variant found an empty directory, every op fell back to the
+    scalar reference, and the build reported success. That is precisely the
+    silent failure the docstring was written about; gemmini_q31_softfp hit it
+    on its first run, with all seven ops falling back.
+    """
+    if global_curated_dir is None:
+        return None
+    from modelblaster.pipeline import backends as _backends_mod
+    for name in _backends_mod.backend_lineage(backend_name):
+        candidate = os.path.join(
+            global_curated_dir, name, f"{name}_{op}_{algo_name}.c")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def _parse_curated_accuracy_class(src: str) -> Optional[AccuracyClass]:
     m = _ACCURACY_CLASS_RE.search(src)
     if not m:
@@ -1073,7 +1097,7 @@ def generate_one_llm(
     # Also drop algorithms whose target_affinity excludes this backend.
     candidates = [
         a for a in candidates
-        if not a.target_affinity or backend.name in a.target_affinity
+        if not a.target_affinity or backends_mod.affined(a.target_affinity, backend.name)
     ]
     if not candidates:
         log(f"  [{spec.op}] no algorithms remain after target_affinity "
@@ -1097,14 +1121,14 @@ def generate_one_llm(
     # selection toward target-affined kernels and let real-HW (FireSim)
     # rank them when re-rank is enabled.
     has_target_affined = any(
-        a.target_affinity and backend.name in a.target_affinity
+        backends_mod.affined(a.target_affinity, backend.name)
         for a in candidates
     )
     if has_target_affined:
         before = [a.name for a in candidates]
         candidates = [
             a for a in candidates
-            if a.target_affinity and backend.name in a.target_affinity
+            if backends_mod.affined(a.target_affinity, backend.name)
         ]
         dropped = [n for n in before if n not in (a.name for a in candidates)]
         if dropped:
@@ -1148,11 +1172,9 @@ def generate_one_llm(
             )
 
             # --- curated probe (subset: only algorithms that have a file) ---
-            curated_path = (
-                os.path.join(global_curated_dir, backend.name, filename)
-                if global_curated_dir else None
-            )
-            if curated_path and os.path.exists(curated_path):
+            curated_path = _curated_path(
+                global_curated_dir, backend.name, spec.op, algorithm.name)
+            if curated_path:
                 _assert_curated_layout_contract(
                     spec, algorithm, backend, curated_path)
                 curated = open(curated_path).read()
@@ -1505,9 +1527,9 @@ def curated_seed_for(ir, specs, target, global_curated_dir,
             key=lambda a: (getattr(a, "accuracy_class", 0) or 0),
         )
         for algorithm in cands:
-            fn = f"{target.name}_{spec.op}_{algorithm.name}.c"
-            cp = os.path.join(global_curated_dir, target.name, fn)
-            if not os.path.exists(cp):
+            cp = _curated_path(
+                global_curated_dir, target.name, spec.op, algorithm.name)
+            if cp is None:
                 continue
             if not act_layout_candidate_ok(ir, spec, algorithm, target):
                 _log(f"  [{spec.op}/{algorithm.name}] not seeded: "
@@ -1794,6 +1816,28 @@ def generate(
                                 f"falling back to reference_impl")
                             accepted = False
                             vres = None
+                            # Was this a BUILD failure, as opposed to this
+                            # kernel simply being wrong or the simulator being
+                            # absent? Only a build failure justifies the
+                            # recovery below, whose premise is a poisoned
+                            # baseline -- another op's kernel failing to
+                            # compile and taking this one down with it.
+                            # profile_kernel raises ProfileError for the
+                            # build/run path; anything else is this op's own
+                            # business and re-verifying against a clean
+                            # baseline would prove nothing.
+                            #
+                            # This was previously a bare reference to an
+                            # undefined name, so the handler raised NameError
+                            # instead of falling back to reference_impl. It
+                            # only fired when _verify itself raised, i.e.
+                            # exactly when spike is missing -- so on any
+                            # machine without a simulator, codegen died here
+                            # rather than degrading to correct-and-slow.
+                            from modelblaster.pipeline.profile_kernel import (
+                                ProfileError as _ProfileError,
+                            )
+                            _build_fail = isinstance(e, _ProfileError)
                             if (_build_fail and curated_seed
                                     and os.environ.get("MB_PRESEED_RECOVER")
                                     == "1"):

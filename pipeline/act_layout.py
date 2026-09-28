@@ -104,6 +104,7 @@ def native_layouts(kind: str, backend_name: Optional[str]) -> set[str]:
     KernelSpec.__post_init__ guarantees the algorithm queue is never empty.
     """
     from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    from modelblaster.pipeline.backends import affined as _affined
     lays = {NCHW}
     if kind in LAYOUT_AGNOSTIC_OPS:
         return {NCHW, NHWC}
@@ -113,7 +114,7 @@ def native_layouts(kind: str, backend_name: Optional[str]) -> set[str]:
     if spec is None or not backend_name:
         return lays
     for a in spec.algorithms:
-        if not a.target_affinity or backend_name not in a.target_affinity:
+        if not _affined(a.target_affinity, backend_name):
             continue
         lays |= set(getattr(a, "act_layouts", None) or (NCHW,))
     return lays
