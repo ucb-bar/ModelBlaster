@@ -9,6 +9,7 @@ env var so the optimize loop stays provider-agnostic.
 
   LLM_PROVIDER=gemini   (default) -> GeminiClient
   LLM_PROVIDER=bedrock            -> BedrockClient
+  LLM_PROVIDER=agy                -> AgyClient (official headless CLI)
 
 Per-call logging path is selected by the provider's own env var
 (`GEMINI_CALLS_LOG` / `BEDROCK_CALLS_LOG`); the factory threads any
@@ -71,7 +72,10 @@ def make_llm_client(
         # different model provider.
         from modelblaster.pipeline.codex_client import CodexClient
         return CodexClient(log_path=log_path)
+    if name == "agy":
+        from modelblaster.pipeline.agy_client import AgyClient
+        return AgyClient(log_path=log_path)
     raise RuntimeError(
         f"unknown LLM_PROVIDER={name!r} "
-        "(expected 'gemini', 'bedrock', 'claude_code', or 'codex')"
+        "(expected 'gemini', 'bedrock', 'claude_code', 'codex', or 'agy')"
     )
