@@ -15,16 +15,15 @@
 # --backends rvv,gemmini_q31_rvv so the on-wire impl stays a valid core-kind (no runtime FATAL).
 #
 # Same env gotcha as the NCHW script: do NOT source set_envvars_sdk.sh under set -e/pipefail.
-set -u
+set -euo pipefail
 : "${MB:=$(cd "$(dirname "$0")/../../.." && pwd)}"
-: "${ZCS:=/scratch2/dima/misc_sw/XPU-RT/zephyr-chipyard-sw}"
-: "${ZEPHYR_SDK:=$ZCS/tools-manual/zephyr-sdk-1.0.0-beta1}"
-: "${CONDA_SH:=/scratch2/dima/miniforge3/etc/profile.d/conda.sh}"
-: "${CONDA_ENV:=zephyr}"
-: "${GEMMINI_SPIKE:=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-: "${GEMMINI_LIB:=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so}"
-: "${CONSOLE_OVERLAY:=/scratch2/dima/misc_sw/ku040_dronedual_console.overlay}"
-: "${CONSOLE_CONF:=/scratch2/dima/misc_sw/ku040_dronedual_console.conf}"
+: "${ZCS:=$(dirname "$MB")}"
+: "${ZEPHYR_SDK:=${ZEPHYR_SDK_INSTALL_DIR:?activate the Zephyr SDK environment first}}"
+: "${CONSOLE_OVERLAY:?set CONSOLE_OVERLAY to the KU040 dual console devicetree overlay}"
+: "${CONSOLE_CONF:?set CONSOLE_CONF to the KU040 dual console Kconfig fragment}"
+for file in "$CONSOLE_OVERLAY" "$CONSOLE_CONF"; do
+  test -f "$file" || { echo "missing required file: $file" >&2; exit 2; }
+done
 : "${GEMMINI_CONFIG:=q31ws_32x32_acc}"
 : "${REGEN_MODEL:=1}"     # 1 = re-extract + assign_layouts + regen both backends
 : "${REGEN_SCHED:=0}"     # 1 = regenerate schedule/main; 0 = use committed ku040_dual_nhwc/ artifacts
@@ -34,18 +33,20 @@ GEN=$MB/examples/dronet/int8/generated
 DUAL=$MB/examples/dronet/int8/ku040_dual_nhwc   # committed NHWC schedule + dispatch table + main
 SO=$MB/examples/xpurt_demo/int8/generated       # scratch (gitignored)
 
-source "$CONDA_SH"; conda activate "$CONDA_ENV"
+command -v python >/dev/null
+command -v west >/dev/null
+TASK_TMP=$(mktemp -d)
+trap 'rm -rf "$TASK_TMP"' EXIT
+ln -s "$MB" "$TASK_TMP/modelblaster"
 export ZEPHYR_BASE="$ZCS/zephyr_ws/zephyr"
 export ZEPHYR_SDK_INSTALL_DIR="$ZEPHYR_SDK"
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
 export PATH="/usr/bin:$ZEPHYR_SDK/gnu/riscv64-zephyr-elf/bin:$PATH"
-export PYTHONPATH="$(dirname "$MB")"
+export PYTHONPATH="$TASK_TMP"
 export MODELBLASTER_GEMMINI_CONFIG="$GEMMINI_CONFIG"
 export MODELBLASTER_CURATED_VERIFY=0
 export MODELBLASTER_DRONET_CHANNELS=1
 export MB_ENABLE_FUSION=1
-export MODELBLASTER_GEMMINI_SPIKE="$GEMMINI_SPIKE"
-export MODELBLASTER_GEMMINI_LIB="$GEMMINI_LIB"
 cd "$MB"
 
 if [ "$REGEN_MODEL" = "1" ]; then
@@ -99,7 +100,7 @@ PY
 fi
 
 # ---- west build: kind gemmini_q31 -> backend gemmini_q31_rvv (NHWC kernels); impl stays gemmini_q31
-SOFTFLOAT_CONF=$(mktemp)
+SOFTFLOAT_CONF="$TASK_TMP/softfloat.conf"
 cat > "$SOFTFLOAT_CONF" <<CONF
 CONFIG_FPU=n
 CONFIG_RISCV_ISA_EXT_V=y

@@ -5,21 +5,25 @@ Grayscale 112x112 (deploy input). Official partition split. Steering head only.
 label_yaw_rate is raw deg/s (+-90) -> normalize /90 to [-1,+1] (+CCW=turn left, our convention).
 BALANCE=1 -> WeightedRandomSampler by |yaw| bins to counter the ~83% straight-flight zeros."""
 import os, sys, time, csv, glob, argparse
-X="/scratch2/dima/misc_sw/XPU-RT"; sys.path.insert(0, X)
+from _paths import ROOT as MB_ROOT
 import numpy as np, torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from PIL import Image, ImageFile; ImageFile.LOAD_TRUNCATED_IMAGES=True
 from torchvision import transforms
-from qnn_models.dronet import DronetTorch
+from modelblaster.models.dronet_arch import DronetTorch
 
 ap=argparse.ArgumentParser()
 ap.add_argument("--epochs",type=int,default=int(os.environ.get("EPOCHS","45")))
 ap.add_argument("--bs",type=int,default=64); ap.add_argument("--lr",type=float,default=1e-3)
-ap.add_argument("--root",default=f"{X}/datasets/pulp_dronet_himax/raw/Dataset_PULP_Dronet_v3")
-ap.add_argument("--out",default=f"{X}/logs/dronet_himax")
+ap.add_argument("--root",default=os.environ.get("MODELBLASTER_DRONET_STACK3_DATA"))
+ap.add_argument("--out",default=str(MB_ROOT / "build" / "dronet_himax"))
 ap.add_argument("--norm",type=float,default=90.0)  # deg/s -> [-1,1]
 ap.add_argument("--res",type=int,default=int(os.environ.get("RES","112")))  # 112=small(deploy) 200=original DroNet
 a=ap.parse_args()
+if not a.root or not os.path.isdir(a.root):
+    ap.error("--root (or MODELBLASTER_DRONET_STACK3_DATA) must name a Himax dataset directory")
+if a.epochs < 1 or a.bs < 1:
+    ap.error("epochs and batch size must be positive")
 BALANCE=os.environ.get("BALANCE","0")=="1"
 BAL_POW=float(os.environ.get("BAL_POW","1.0"))  # 1=inverse-freq(aggressive) 0.5=sqrt(mild) 0=natural
 RES=a.res; SMALL=(RES<200)  # linear_in 2048(4x4@112) vs 6272(7x7@200)
@@ -38,6 +42,7 @@ for c in sorted(glob.glob(os.path.join(a.root,"**","labels_partitioned.csv"),rec
         part=r["partition"]
         if part=="train": rows_tr.append((p,y))
         elif part=="valid": rows_va.append((p,y))
+if len(rows_tr) < a.bs or not rows_va: ap.error("need a full training batch and validation samples")
 print(f"[data] train={len(rows_tr)} valid={len(rows_va)}", flush=True)
 ytr=np.array([y for _,y in rows_tr]); yva=np.array([y for _,y in rows_va])
 print(f"[yaw norm] train std={ytr.std():.3f} frac|y|>0.02={np.mean(np.abs(ytr)>0.02):.3f}  valid std={yva.std():.3f} frac_nz={np.mean(np.abs(yva)>0.02):.3f}", flush=True)

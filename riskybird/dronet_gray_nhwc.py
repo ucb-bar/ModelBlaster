@@ -6,16 +6,16 @@ grayscale input, conv0 and maxpool fused into one Gemmini call, NHWC islands,
 and the gemmini_q31_rvv kernel family compiled for a shell that has an
 integer-only vector unit. Its output is committed, verified, under
 
-    artifacts/modelblaster/dronet/int8/gemmini_q31_rvv_softfp-gray-nhwc   (Fp16At35)
-    artifacts/modelblaster/dronet/int8/gemmini_q31_rvv_zve64x-gray-nhwc   (IntAt35)
+    riskybird/artifacts/dronet/int8/gemmini_q31_rvv_softfp-gray-nhwc   (Fp16At35)
+    riskybird/artifacts/dronet/int8/gemmini_q31_rvv_zve64x-gray-nhwc   (IntAt35)
 
 and a board image is built from those with `rb modelblaster build --gen-dir`.
 This script is how those directories were made, and how to check that they
 still come out the same:
 
-    python3 tools/modelblaster/dronet_gray_nhwc.py --target gemmini_q31_rvv_softfp
+    python3 riskybird/dronet_gray_nhwc.py --target gemmini_q31_rvv_softfp
     diff -r .rb/modelblaster/dronet-gray-nhwc/ir_gray_nhwc/gemmini_q31_rvv_softfp \\
-            artifacts/modelblaster/dronet/int8/gemmini_q31_rvv_softfp-gray-nhwc
+            riskybird/artifacts/dronet/int8/gemmini_q31_rvv_softfp-gray-nhwc
 
 SILICON TIER ONLY. Kernel selection is verify-gated: every curated kernel runs
 on spike against the scalar reference and is rejected past MB_DRIFT_ATOL. That
@@ -55,11 +55,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
-ROOT = HERE.parents[2]
-sys.path.insert(0, str(ROOT / "tools"))
-
-from rb.environments import zephyr_env  # noqa: E402
-from rb import modelblaster as mb  # noqa: E402
+ROOT = HERE.parents[1]
+CODEGEN_MARKER = ".rb-codegen.json"
 
 LIBGEMMINI_URL = "https://github.com/ucb-bar/libgemmini.git"
 LIBGEMMINI_COMMIT = "5b1254a7dc72f757442280e7f28ef30542c78533"
@@ -92,9 +89,8 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def q31_spike(work: Path) -> tuple[Path, Path]:
+def q31_spike(work: Path, tools: Path) -> tuple[Path, Path]:
     """Build the Q31 libgemmini and a spike wrapper that loads it. Idempotent."""
-    tools = mb.CHIPYARD_RISCV_TOOLS
     spike = tools / "bin" / "spike"
     if not spike.is_file() or not (tools / "include" / "riscv").is_dir():
         raise SystemExit(
@@ -110,7 +106,7 @@ def q31_spike(work: Path) -> tuple[Path, Path]:
         out.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "clone", "-q", LIBGEMMINI_URL, str(src)], check=True)
     subprocess.run(["git", "-C", str(src), "checkout", "-q", LIBGEMMINI_COMMIT], check=True)
-    header = mb.per_config_header_dir(GATE_HEADER) / "gemmini_params.h"
+    header = (ROOT / "cores/gemmini/include/per_config" / GATE_HEADER) / "gemmini_params.h"
     shutil.copy2(header, src / "gemmini_params.h")
     subprocess.run(
         ["g++", "-L", str(tools / "lib"), f"-Wl,-rpath,{tools / 'lib'}", "-shared",
@@ -136,7 +132,7 @@ def curated_dir(work: Path, target: str) -> Path:
     out = work / f"curated-{target}"
     if out.exists():
         shutil.rmtree(out)
-    kernels = mb.MODELBLASTER / "kernels"
+    kernels = ROOT / "kernels"
     for path in sorted(kernels.rglob("*")):
         rel = path.relative_to(kernels)
         if path.is_dir() or str(rel) in exclude:
@@ -156,19 +152,34 @@ def main() -> int:
     ap.add_argument("--target", required=True, choices=TARGETS)
     ap.add_argument("--work", default=str(ROOT / ".rb" / "modelblaster" / "dronet-gray-nhwc"),
                     help="scratch and output root (default: %(default)s)")
+    ap.add_argument("--riscv-tools", default=os.environ.get("RB_RISCV_TOOLS"),
+                    help="Chipyard riscv-tools prefix (or RB_RISCV_TOOLS)")
+    ap.add_argument("--python", default=sys.executable,
+                    help="Python with torch/numpy/west; use an activated Zephyr environment")
     args = ap.parse_args()
+    if not args.riscv_tools:
+        ap.error("--riscv-tools or RB_RISCV_TOOLS is required")
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
-    m = mb.MODELBLASTER
+    m = ROOT
     if not (m / "pipeline").is_dir():
         raise SystemExit(f"{m} is empty: git submodule update --init backends/modelblaster")
 
-    wrapper, lib = q31_spike(work)
+    wrapper, lib = q31_spike(work, Path(args.riscv_tools).resolve())
     curated = curated_dir(work, args.target)
 
-    env = zephyr_env()
+    env = os.environ.copy()
+    imports = work / "python-imports"
+    imports.mkdir(exist_ok=True)
+    package = imports / "modelblaster"
+    if package.is_symlink() and package.resolve() != m:
+        package.unlink()
+    if not package.exists():
+        package.symlink_to(m, target_is_directory=True)
+    if package.resolve() != m:
+        raise SystemExit(f"{package} must point at {m}")
     env.update({
-        "PYTHONPATH": str(m.parent),
+        "PYTHONPATH": str(imports),
         "MODELBLASTER_DRONET_CHANNELS": "1",
         "MB_REQUIRE_NHWC": "1",
         "MB_DRIFT_ATOL": str(DRIFT_ATOL),
@@ -176,7 +187,7 @@ def main() -> int:
         "MODELBLASTER_GEMMINI_LIB": str(lib),
     })
     env.pop("MODELBLASTER_GEMMINI_CONFIG", None)
-    py = "python"
+    py = args.python
     fused, nhwc = work / "ir_gray_fused", work / "ir_gray_nhwc"
     # The gate's verify builds find the model name (which every kernel symbol
     # is mangled with) in <gen>/../graph.json, so the sources must be written
@@ -220,7 +231,9 @@ def main() -> int:
     picks_path.write_text(json.dumps(picks, indent=2) + "\n")
 
     passed = log_path.read_text().count("verify PASS")
-    (gen / mb.CODEGEN_MARKER).write_text(json.dumps({
+    if not passed:
+        raise SystemExit(f"no curated verification passed; see {log_path}")
+    (gen / CODEGEN_MARKER).write_text(json.dumps({
         "verified": passed > 0,
         "spike": f"Chipyard spike --extlib libgemmini {LIBGEMMINI_COMMIT[:7]} "
                  f"+ per_config/{GATE_HEADER} (Q0.31 scale)",

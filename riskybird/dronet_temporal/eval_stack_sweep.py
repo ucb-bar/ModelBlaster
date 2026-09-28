@@ -8,8 +8,7 @@ import os, sys, json, csv, glob, time
 N=int(os.environ["N"]); NORM=90.0
 N_CALIB=int(os.environ.get("N_CALIB","64")); N_SUB=int(os.environ.get("N_SUB","6000"))
 OUT=os.environ.get("OUT_DIR",f"/tmp/stack{N}_sweep")
-X="/scratch2/dima/misc_sw/XPU-RT"; M="/scratch2/dima/misc_sw/xpurt_repro_wt"; SP="/scratch2/dima/misc_sw/dronet_int8_eval"
-for p in (X,M,SP): sys.path.insert(0,p)
+from _paths import ROOT as MB_ROOT, required_path
 import numpy as np, torch
 from PIL import Image, ImageFile; ImageFile.LOAD_TRUNCATED_IMAGES=True
 import torchvision.transforms.functional as TF
@@ -17,7 +16,10 @@ from modelblaster.models import dronet_arch
 from modelblaster.pipeline import extract_graph as EG
 from int8_sim import simulate_int8
 from hybrid_sim import simulate_hybrid
-ROOT=f"{X}/datasets/pulp_dronet_himax/raw/Dataset_PULP_Dronet_v3"; CKPT=f"{X}/logs/dronet_himax_stack{N}/best.pt"; HUGE=1e12
+ROOT=required_path("MODELBLASTER_DRONET_STACK3_DATA", directory=True)
+CKPT=required_path("MODELBLASTER_DRONET_STACK3_CKPT", default=str(MB_ROOT / "models/checkpoints/dronet_stack3/best.pt") if N == 3 else None)
+HUGE=1e12
+if min(N, N_CALIB, N_SUB) < 1: raise SystemExit("N, N_CALIB and N_SUB must be positive")
 def load_stack(paths,size=112):
     ch=[]
     for p in paths:
@@ -45,11 +47,16 @@ def build(part):
             st.append((tuple(w[2] for w in win), keyed[i][3]))
     return st
 tr=build("train"); va=build("valid")
+if not tr or not va: raise SystemExit("dataset needs nonempty train and valid stacks")
 sub=va[:N_SUB] if N_SUB<len(va) else va
 gt=np.array([y for _,y in sub]); nz=np.abs(gt)>0.02
 print(f"[data] N={N} valid={len(va)} eval_on={len(sub)} turn_frac={nz.mean():.3f}",flush=True)
 model=dronet_arch.DronetTorch(img_dims=(112,112),img_channels=N,output_dim=1,small=True).eval()
-model.load_state_dict(torch.load(CKPT,map_location="cpu",weights_only=False),strict=False)
+sd=torch.load(CKPT,map_location="cpu",weights_only=False)
+if isinstance(sd, dict) and "model_state_dict" in sd: sd=sd["model_state_dict"]
+missing, unexpected=model.load_state_dict(sd,strict=False)
+if unexpected or any(not k.startswith("linear2.") for k in missing):
+    raise SystemExit(f"checkpoint mismatch: missing={missing}, unexpected={unexpected}")
 fparams={}
 for i,c in enumerate(model.conv_modules): fparams[f"conv_modules.{i}"]={"W":c.weight.detach().numpy(),"b":(c.bias.detach().numpy() if c.bias is not None else None)}
 for i,bn in enumerate(model.bn_modules): fparams[f"bn_modules.{i}"]={"bn":(bn.weight.detach().numpy(),bn.bias.detach().numpy(),bn.running_mean.detach().numpy(),bn.running_var.detach().numpy(),float(bn.eps))}

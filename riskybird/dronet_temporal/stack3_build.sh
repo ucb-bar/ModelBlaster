@@ -1,16 +1,32 @@
 #!/usr/bin/env bash
-echo "ENV_SENTINEL: stack3_build $(date)"
-M=/scratch2/dima/misc_sw/xpurt_repro_wt/modelblaster
-ZCS=/scratch2/dima/misc_sw/XPU-RT/zephyr-chipyard-sw; SDK=$ZCS/tools-manual/zephyr-sdk-1.0.0-beta1
-source /scratch2/dima/miniforge3/etc/profile.d/conda.sh; conda activate zephyr
-export ZEPHYR_BASE=$ZCS/zephyr_ws/zephyr ZEPHYR_SDK_INSTALL_DIR=$SDK ZEPHYR_TOOLCHAIN_VARIANT=zephyr
-export PATH=/usr/bin:$SDK/gnu/riscv64-zephyr-elf/bin:$PATH ; export PYTHONPATH="$(dirname "$M")"
-export MODELBLASTER_GEMMINI_CONFIG=q31ws_32x32_acc MODELBLASTER_CURATED_VERIFY=0
+# Historical temporal benchmark recipe: synthetic input, trained temporal weights,
+# 14 Gemmini / 14 RVV operations. This is not real-data accuracy evaluation.
+set -euo pipefail
+M="${MB:-$(cd "$(dirname "$0")/../.." && pwd)}"
+ZCS="${ZCS:-$(dirname "$M")}"
+SDK="${ZEPHYR_SDK_INSTALL_DIR:?activate the Zephyr SDK environment first}"
+: "${CONSOLE_CONF:?set CONSOLE_CONF to the KU040 dual console Kconfig fragment}"
+: "${CONSOLE_OVERLAY:?set CONSOLE_OVERLAY to the KU040 dual console devicetree overlay}"
+export ZEPHYR_BASE="${ZEPHYR_BASE:-$ZCS/zephyr_ws/zephyr}"
+export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
+export PATH="$SDK/gnu/riscv64-zephyr-elf/bin:$PATH"
+export MODELBLASTER_GEMMINI_CONFIG=q31ws_32x32_acc
+# Preserve the original unverified fast-kernel selection explicitly.
+export MODELBLASTER_CURATED_VERIFY=0
 export MODELBLASTER_DRONET_CHANNELS=3 MB_ENABLE_FUSION=1
-export MODELBLASTER_DRONET_CKPT=/scratch2/dima/misc_sw/XPU-RT/logs/dronet_himax_stack3/best.pt
-export MODELBLASTER_GEMMINI_SPIKE=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike
-export MODELBLASTER_GEMMINI_LIB=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so
+export MODELBLASTER_DRONET_CKPT="${MODELBLASTER_DRONET_CKPT:-$M/models/checkpoints/dronet_stack3/best.pt}"
+for file in "$CONSOLE_CONF" "$CONSOLE_OVERLAY" "$MODELBLASTER_DRONET_CKPT"; do
+    test -f "$file" || { echo "missing required file: $file" >&2; exit 2; }
+done
+test -d "$ZEPHYR_BASE" || { echo "missing Zephyr tree: $ZEPHYR_BASE" >&2; exit 2; }
+command -v python >/dev/null
+command -v west >/dev/null
+TASK_TMP=$(mktemp -d)
+trap 'rm -rf "$TASK_TMP"' EXIT
+ln -s "$M" "$TASK_TMP/modelblaster"
+export PYTHONPATH="$TASK_TMP"
 cd "$M"; GEN=examples/dronet/int8/generated_stack3; SO=examples/xpurt_demo/int8/generated
+mkdir -p "$GEN" "$SO"
 echo "== extract grayscale+fused =="
 python -m modelblaster.pipeline.extract_graph --model dronet --out-dir $GEN --quant int8 --num-calibration 1 --fusion-target gemmini_q31_rvv 2>&1 | tail -2
 echo "== assign_layouts --policy islands (NHWC) =="
@@ -39,7 +55,11 @@ import json
 g=json.load(open("examples/dronet/int8/generated_stack3/graph.json"))
 opk={o.get("dispatch_id"):o.get("op") for o in g["ops"] if o.get("dispatch_id") is not None}
 S=json.load(open("examples/xpurt_demo/int8/generated/dronet_ku040_stack3_sched.json"))
-GEM={"conv2d_s8","conv2d_pool_s8","nchw_to_stack3_s8","nhwc_to_nchw_s8"}
+# Preserve the measured legacy 14/14 placement: NCHW->NHWC executes
+# on RVV; NHWC->NCHW executes on Gemmini. The original code spelled the
+# former "nchw_to_stack3_s8" (a nonexistent op), which caused this split.
+# An all-relayouts-on-Gemmini policy requires a separate measured experiment.
+GEM={"conv2d_s8","conv2d_pool_s8","nhwc_to_nchw_s8"}
 nP=nE=0
 for k,v in S["dispatches"].items():
     v.pop("impl",None)
@@ -59,7 +79,7 @@ python -m modelblaster.pipeline.generate_xpurt_main --schedule $SO/dronet_ku040_
   --model-gen-dir dronet=$GEN/gemmini_q31_rvv --networks dronet --registry cores/chipyard_ku040_dronedual_q31.json 2>&1 | tail -1
 cp $SO/dronet_ku040_stack3_sched.json $SO/ku040_dronet_stack3_dev.{c,h} $SO/ku040_dronet_stack3_dev_main.c examples/dronet/int8/ku040_dual_stack3/
 echo "== west build (NHWC, backends rvv+gemmini_q31_rvv) =="
-cat > /tmp/sf.conf <<CONF
+cat > "$TASK_TMP/sf.conf" <<CONF
 CONFIG_FPU=n
 CONFIG_RISCV_ISA_EXT_V=y
 CONFIG_RISCV_ISA_EXT_V_LAZY=n
@@ -75,10 +95,9 @@ west build -p always -b chipyard_riscv64 harness_xpurt --build-dir examples/xpur
   -DMODEL_NAMES=dronet -DMODEL_DIRS_BASE=$M/$GEN -DMODEL_BACKENDS=gemmini_q31_rvv,rvv \
   -DXPURT_SCHEDULE_C=$M/$D/ku040_dronet_stack3_dev.c -DXPURT_MAIN_C=$M/$D/ku040_dronet_stack3_dev_main.c -DXPURT_INCLUDE_DIR=$M/$D \
   -DMODELBLASTER_KERNEL_CFLAGS_GEMMINI_Q31_RVV="$GCF" -DMODELBLASTER_KERNEL_CFLAGS_RVV="$RCF" \
-  -DEXTRA_CONF_FILE="$M/harness_xpurt/backends/rvv.conf;$M/harness/backends/firesim_chipyard_dual_gemmini.conf;/scratch2/dima/misc_sw/ku040_dronedual_console.conf;/tmp/sf.conf" \
-  -DEXTRA_DTC_OVERLAY_FILE=/scratch2/dima/misc_sw/ku040_dronedual_console.overlay > /tmp/ninja_stack3.log 2>&1
-echo "BUILD_RC=$?"
-grep -nE "error:|FAILED:|undefined reference" /tmp/ninja_stack3.log | head -12
+  -DEXTRA_CONF_FILE="$M/harness_xpurt/backends/rvv.conf;$M/harness/backends/firesim_chipyard_dual_gemmini.conf;$CONSOLE_CONF;$TASK_TMP/sf.conf" \
+  -DEXTRA_DTC_OVERLAY_FILE="$CONSOLE_OVERLAY"
 E=examples/xpurt_demo/int8/build/ku040_dronet_stack3/zephyr/zephyr.elf
-[ -f "$E" ] && echo "ELF_OK $(stat -c %s "$E")"
+test -f "$E"
+echo "ELF_OK $E"
 echo STACK3_BUILD_DONE

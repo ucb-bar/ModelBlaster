@@ -9,8 +9,7 @@ os.environ["MODELBLASTER_DRONET_CHANNELS"]="1"
 DATASET=os.environ.get("DATASET","simforest")
 N_SUB=int(os.environ.get("N_SUB","40")); N_CALIB=int(os.environ.get("N_CALIB","64"))
 OUT=os.environ.get("OUT_DIR",f"/tmp/fp16char_{DATASET}")
-X="/scratch2/dima/misc_sw/XPU-RT"; M="/scratch2/dima/misc_sw/xpurt_repro_wt"; SP="/scratch2/dima/misc_sw/dronet_int8_eval"
-for p in (X,M,SP,os.path.dirname(os.path.abspath(__file__))): sys.path.insert(0,p)
+from _paths import ROOT as MB_ROOT, required_path
 import numpy as np, torch
 from PIL import Image, ImageFile; ImageFile.LOAD_TRUNCATED_IMAGES=True
 from torchvision import transforms
@@ -24,8 +23,8 @@ _tx=transforms.Compose([transforms.Resize((112,112)),transforms.ToTensor()])
 def load(p):
     with Image.open(p) as im: return _tx(im.convert("L"))
 if DATASET=="himax":
-    os.environ["MODELBLASTER_DRONET_CKPT"]=f"{X}/logs/dronet_himax/best.pt"
-    ROOT=f"{X}/datasets/pulp_dronet_himax/raw/Dataset_PULP_Dronet_v3"; NORM=90.0
+    os.environ["MODELBLASTER_DRONET_CKPT"]=required_path("MODELBLASTER_DRONET_CKPT")
+    ROOT=required_path("MODELBLASTER_DRONET_STACK3_DATA", directory=True); NORM=90.0
     tr=[];va=[]
     for c in sorted(glob.glob(os.path.join(ROOT,"**","labels_partitioned.csv"),recursive=True)):
         d=os.path.dirname(c); imgd=os.path.join(d,"images")
@@ -36,8 +35,8 @@ if DATASET=="himax":
             if not os.path.exists(p):continue
             (tr if r["partition"]=="train" else (va if r["partition"]=="valid" else [])).append((p,y))
 else:  # simforest
-    os.environ["MODELBLASTER_DRONET_CKPT"]=f"{X}/logs/dronet_simforest/best.pt"
-    DATA=f"{X}/datasets/sim_forest/extracted"
+    os.environ["MODELBLASTER_DRONET_CKPT"]=required_path("MODELBLASTER_DRONET_CKPT")
+    DATA=required_path("MODELBLASTER_SIMFOREST_DATA", directory=True)
     rows=[]
     for seg in sorted(os.listdir(DATA)):
         lf=f"{DATA}/{seg}/labels.csv"
@@ -45,13 +44,20 @@ else:  # simforest
             for r in csv.DictReader(open(lf)): rows.append((f"{DATA}/{seg}/{r['filename']}",float(r["steering_label"])))
     rng=np.random.RandomState(0); idx=rng.permutation(len(rows)); nval=len(rows)//6
     va=[rows[i] for i in idx[:nval]]; tr=[rows[i] for i in idx[nval:]]
+if min(N_SUB, N_CALIB) < 1 or not tr or not va: raise SystemExit("need positive sample counts and nonempty train/valid splits")
 print(f"[data] {DATASET} train={len(tr)} valid={len(va)} ckpt={os.environ['MODELBLASTER_DRONET_CKPT']}",flush=True)
 vy=np.array([y for _,y in va]); order=np.argsort(vy)
 si=np.linspace(0,len(va)-1,min(N_SUB,len(va))).astype(int); sub=[va[order[i]] for i in si]
 gt=np.array([y for _,y in sub])
 
 # ---- model + float params ----
-model=dmod.get_model().eval()
+from modelblaster.models.dronet_arch import DronetTorch
+model=DronetTorch(img_dims=(112,112), img_channels=1, output_dim=1, small=True).eval()
+sd=torch.load(os.environ["MODELBLASTER_DRONET_CKPT"], map_location="cpu", weights_only=False)
+if isinstance(sd, dict) and "model_state_dict" in sd: sd=sd["model_state_dict"]
+missing, unexpected=model.load_state_dict(sd, strict=False)
+if unexpected or any(not k.startswith("linear2.") for k in missing):
+    raise SystemExit(f"checkpoint mismatch: missing={missing}, unexpected={unexpected}")
 def find_dronet(m):
     if hasattr(m,"conv_modules"): return m
     for a in ("model","net","module","dronet"):

@@ -13,24 +13,29 @@ Adapted from himax/train_himax.py. Correctness rules:
   - drop anomalous huge-int filenames (>1e12; the ~31 tii uint64-overflow frames)
 """
 import os, sys, time, csv, glob, argparse
-X="/scratch2/dima/misc_sw/XPU-RT"; sys.path.insert(0, X)
+from _paths import ROOT as MB_ROOT
 import numpy as np, torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageFile; ImageFile.LOAD_TRUNCATED_IMAGES=True
 from torchvision import transforms
 import torchvision.transforms.functional as TF
-from qnn_models.dronet import DronetTorch
+from modelblaster.models.dronet_arch import DronetTorch
 
 ap=argparse.ArgumentParser()
 ap.add_argument("--N",type=int,default=int(os.environ.get("N","3")))
 ap.add_argument("--epochs",type=int,default=int(os.environ.get("EPOCHS","45")))
 ap.add_argument("--bs",type=int,default=64); ap.add_argument("--lr",type=float,default=1e-3)
-ap.add_argument("--root",default=f"{X}/datasets/pulp_dronet_himax/raw/Dataset_PULP_Dronet_v3")
+ap.add_argument("--root",default=os.environ.get("MODELBLASTER_DRONET_STACK3_DATA"))
 ap.add_argument("--out",default=None)
 ap.add_argument("--norm",type=float,default=90.0)
 a=ap.parse_args()
+if not a.root or not os.path.isdir(a.root):
+    ap.error("--root (or MODELBLASTER_DRONET_STACK3_DATA) must name a Himax dataset directory")
+if a.epochs < 1 or a.bs < 1:
+    ap.error("epochs and batch size must be positive")
 N=a.N
-OUT=a.out or f"{X}/logs/dronet_himax_stack{N}"
+if N < 1: ap.error("--N must be positive")
+OUT=a.out or str(MB_ROOT / "build" / f"dronet_himax_stack{N}")
 dev="cuda" if torch.cuda.is_available() else "cpu"
 HUGE=1e12
 
@@ -64,6 +69,7 @@ def build(partition):
     return stacks
 
 tr=build("train"); va=build("valid")
+if len(tr) < a.bs or not va: ap.error("need at least one full training batch and a nonempty validation split")
 ytr=np.array([y for _,y in tr]); yva=np.array([y for _,y in va])
 print(f"[data] train_stacks={len(tr)} valid_stacks={len(va)}",flush=True)
 print(f"[yaw] train std={ytr.std():.3f} frac|y|>0.02={np.mean(np.abs(ytr)>0.02):.3f}  "
