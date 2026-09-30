@@ -1112,6 +1112,9 @@ int main(void)
      * Captured just before workers spawn so it's the moment "t=0" of the
      * schedule maps to. */
     run_t0 = (uint64_t)k_cycle_get_64();
+    /* Absolute origin of the trace's cycle columns, so an out-of-band sampler
+     * (per-core /proc/stat) can be aligned to the run. */
+    printf("xpurt: run_t0_rdtime=%llu\\n", (unsigned long long)run_t0);
 
     for (int w = 0; w < g_n_workers; w++) {{
         pthread_attr_init(&attrs[w].a);

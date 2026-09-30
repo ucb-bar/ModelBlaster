@@ -220,6 +220,11 @@ def get_precision_spec() -> dict:
 
     The CLI ``--fp16-ops a,b,c`` flag is additive to this spec.
     """
+    if os.environ.get("MODELBLASTER_VINT_ALL_INT8", "") not in ("", "0"):
+        # A whole-network int8 build: every op on the int8 kernel path. Used to characterise
+        # the network's cost on a target whose curated library is int8; the accuracy of this
+        # variant is the all-int8 row of the mixed-precision notes, not the deployed one.
+        return {"default": "int8", "fp16_upstream_of": [], "fp16_ops": []}
     return {
         "default": "int8",
         # Promote the entire goal-encoder subgraph (everything upstream
