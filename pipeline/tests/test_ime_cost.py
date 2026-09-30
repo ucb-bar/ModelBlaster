@@ -41,6 +41,70 @@ class TestIMESpeedup(unittest.TestCase):
         self.assertEqual(prov, "unmeasured")
 
 
+class TestFusedConvUsesItsOwnTable(unittest.TestCase):
+    """A speedup is IME-vs-the-RVV-kernel-that-would-otherwise-run, so the fused
+    conv must be costed against the FUSED RVV kernel the deployed build runs --
+    not against the standalone conv, which nothing in that graph executes."""
+
+    # deployed yolov8_nano_64x96 l2.m0.cv1: 0.41x against the standalone RVV
+    # conv, 1.53x against the fused one. The wrong table is the difference
+    # between "stays RVV" and "goes to the matrix engine".
+    SHAPE = {"IC": 16, "IH": 16, "IW": 24, "OC": 16, "KH": 3, "KW": 3}
+
+    def test_fused_op_reads_the_fused_table(self):
+        sp, prov = ime_cost.ime_speedup_for("conv2d_batchnorm2d_silu_s8", self.SHAPE)
+        self.assertEqual(prov, "measured-fused")
+        self.assertGreater(sp, 1.0)
+
+    def test_plain_conv_still_reads_the_standalone_table(self):
+        sp, prov = ime_cost.ime_speedup_for("conv2d_s8", self.SHAPE)
+        self.assertEqual(prov, "measured")
+        self.assertLess(sp, 1.0)
+        # ... and the two tables really do disagree on this shape, which is the
+        # whole reason the op-kind has to pick its own.
+        fused, _ = ime_cost.ime_speedup_for("conv2d_batchnorm2d_silu_s8", self.SHAPE)
+        self.assertGreater(fused, sp)
+
+    def test_conv_op_with_no_table_stays_rvv(self):
+        # conv2d_batchnorm2d_s8 has no IME kernel and no measurement; borrowing
+        # another op's table is exactly the bug. Only-if-better => None.
+        sp, why = ime_cost.ime_speedup_for(
+            "conv2d_batchnorm2d_s8", {"IC": 32, "IH": 27, "IW": 27, "OC": 32, "KH": 3, "KW": 3})
+        self.assertIsNone(sp)
+        self.assertIn("no measured", why)
+
+    def test_unmeasured_fused_shape_stays_rvv(self):
+        sp, prov = ime_cost.ime_speedup_for(
+            "conv2d_batchnorm2d_silu_s8",
+            {"IC": 999, "IH": 7, "IW": 7, "OC": 999, "KH": 9, "KW": 9})
+        self.assertIsNone(sp)
+        self.assertEqual(prov, "unmeasured")
+
+    def test_fused_conv_kept_in_the_ime_table(self):
+        # ime_useful is the multi-impl build's inclusion guard: with the fused
+        # table the op is KNOWN faster on at least one shape, so the ime_x60
+        # build keeps the kernel and the per-dispatch scheduler can route to it.
+        keep, why = ime_cost.ime_useful("conv2d_batchnorm2d_silu_s8", [self.SHAPE])
+        self.assertTrue(keep, why)
+        # against the standalone table the same shape loses, i.e. the old
+        # lookup excluded the kernel from the build outright.
+        keep_wrong, _ = ime_cost.ime_useful("conv2d_s8", [self.SHAPE])
+        self.assertFalse(keep_wrong)
+
+    def test_repeated_shape_keeps_its_worst_row(self):
+        # The fused table has one row per DISPATCH, so a shape can appear more
+        # than once. The guard must not be decided by the luckiest instance.
+        table = ime_cost.measured_conv_table("conv2d_batchnorm2d_silu_s8")
+        self.assertIsNotNone(table)
+        import csv as _csv
+        rows = list(_csv.DictReader(open(ime_cost.CONV_TABLES["conv2d_batchnorm2d_silu_s8"])))
+        worst = {}
+        for r in rows:
+            k = tuple(int(r[c]) for c in ("IC", "IH", "IW", "OC", "KH", "KW"))
+            worst[k] = min(worst.get(k, 9e9), float(r["speedup"]))
+        self.assertEqual(table, worst)
+
+
 class TestAggregateVerdict(unittest.TestCase):
     def test_attention_stays_rvv(self):
         shapes = [{"M": 8, "K": 32, "N": 32}] * 4 + [{"M": 8, "K": 32, "N": 8}]

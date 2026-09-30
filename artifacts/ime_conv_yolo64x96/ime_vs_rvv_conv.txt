@@ -1,0 +1,2 @@
+verify: 34/34 bit-exact (max_abs_err=0)
+yolov8_nano_64x96: 34 shapes, IME wins 8; picker(best-of) 18641665 vs all-RVV 20336958 = 8.3% conv-cycle reduction

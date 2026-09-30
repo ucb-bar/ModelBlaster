@@ -7126,6 +7126,37 @@ void kernel_conv2d_batchnorm2d_silu_s8(
             reference_impl="(use the curated kernel in kernels/rvv/)",
             accuracy_class=AccuracyClass.BIT_EXACT,
         ),
+        AlgorithmCandidate(
+            name="ime_vmadot_4x4x8",
+            target_affinity=("ime", "ime_x60"),
+            weight_layout="ihwoc",
+            description=(
+                "The fused op on the SpaceMiT K1 IME (`smt.vmadot`): the "
+                "im2col->GEMM MAC core of conv2d_s8's ime_vmadot_4x4x8 "
+                "(4x4x8 micro-tiles, A gathered straight into tiles, B the "
+                "native IHWOC weight, symmetric int8 only) with the BN and "
+                "SiLU stages of the RVV fused kernel folded into its store "
+                "path.\n\n"
+                "WHY IT EXISTS. Curated kernels are looked up by exact op "
+                "name, so before this the IME library's conv2d_s8 could not "
+                "be reached by a graph whose convolutions are fused with BN "
+                "and SiLU -- on the deployed yolov8_nano_64x96 that is 57 of "
+                "90 dispatches, including every one the matrix engine could "
+                "win. Measured per shape on the K1 "
+                "(artifacts/ime_conv_yolo64x96), the MAC core is up to 1.71x "
+                "the standalone RVV conv on this net's 1x1 layers and loses "
+                "on its 3x3 and tiny-spatial ones, so it stays a per-dispatch "
+                "alternative the scheduler takes only where measurement says "
+                "it wins.\n\n"
+                "BIT-EXACT. The MAC is integer and identical to RVV's by "
+                "construction; the two float stages are the same expressions "
+                "in the same order as the RVV kernel, memoized per 4-channel "
+                "panel (both stages map int8 to int8, so a table IS the "
+                "function, not an approximation)."
+            ),
+            reference_impl="(use the curated kernel in kernels/ime/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
     ],
 )
 
@@ -11607,7 +11638,17 @@ def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
     for node in ir.get("ops", []):
         if node["op"] != op:
             continue
-        shape = node.get("shape", {})
+        shape = node.get("shape") or {}
+        if not shape:
+            # A FUSED node carries no shape of its own -- the numbers belong to the op it
+            # fused (`conv2d_batchnorm2d_silu_s8` -> its `conv2d_s8`). Reading only the top
+            # level returns {} for every one of them, which reads downstream as "no known
+            # shape": the IME guard then excludes the op from the ime table whatever the
+            # measurements say, and a shape-keyed lookup can never match.
+            for sub in node.get("sub_ops") or []:
+                if isinstance(sub, dict) and sub.get("shape"):
+                    shape = sub["shape"]
+                    break
         key = tuple(sorted(
             (k, tuple(v) if isinstance(v, list) else v)
             for k, v in shape.items()

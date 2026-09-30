@@ -1528,12 +1528,27 @@ def generate(
                 # this fixes. (For a hypothetical single-ime build with no
                 # scheduler, per-instance losers are still guarded by the profile
                 # cost comparison downstream.)
+                #
+                # MB_IME_FORCE=1 (ime_cost.force_requested) turns the guard OFF:
+                # every op that HAS an IME kernel takes it, measured or not,
+                # winner or loser. That is not a better rule -- it is the
+                # deployment an engineer makes who has an accelerator and no
+                # per-shape profiling, built so it can be MEASURED. The build
+                # records that it is not table-guided (kernel_picks.json), and
+                # nothing else about it changes: the kernel is still verified,
+                # and smt.vmadot still only executes on cluster 0.
                 if source_label.startswith("curated[ime"):
                     try:
                         shapes = collect_shapes(ir, spec.op, spec)
                         win, why = ime_cost.ime_useful(spec.op, shapes)
                     except Exception as _e:
                         win, why = True, f"ime_cost guard skipped ({_e})"
+                    if not win and ime_cost.force_requested():
+                        kernel_picks.setdefault(spec.op, {})
+                        kernel_picks[spec.op]["ime_forced_over_table"] = why
+                        log(f"  [{spec.op}] {ime_cost.FORCE_ENV}=1 — probing IME "
+                            f"ANYWAY; the table says: {why}")
+                        win = True
                     if not win:
                         kernel_picks.setdefault(spec.op, {})
                         kernel_picks[spec.op]["ime_skipped_reason"] = why
@@ -1594,11 +1609,22 @@ def generate(
                                 f"{source_label} verify PASS — {vres.message}")
                     if accepted:
                         impls[spec.op] = candidate_src
-                        kernel_picks[spec.op] = {
+                        _prev = kernel_picks.get(spec.op) or {}
+                        _pick = {
                             "source": source_label,
                             "algorithm": algorithm.name,
                             "path": candidate_path,
                         }
+                        # Whether the matrix engine was in play is a property of
+                        # the OP, not of whichever source was finally accepted.
+                        # These entries are written before the probe loop runs,
+                        # so replacing the record wholesale used to erase the one
+                        # line saying the IME was excluded here (or forced past
+                        # the table) the moment curated[rvv] picked the op up.
+                        for _k in ("ime_skipped_reason", "ime_forced_over_table"):
+                            if _prev.get(_k) is not None:
+                                _pick[_k] = _prev[_k]
+                        kernel_picks[spec.op] = _pick
                         break  # first-accepted-wins; try next spec
                     # If verify failed, continue to next algorithm; if
                     # all algorithms fail, kernel_picks keeps the original
@@ -1727,9 +1753,28 @@ def generate(
     # aggregator's kernel_picks extractors derive per-source counts +
     # algorithm diversity.
     picks_path = os.path.join(out_dir, "kernel_picks.json")
+    _picks_doc = {"schema_version": 1, "target": target.name,
+                  "picks": kernel_picks}
+    # A blanket-IME build must not be mistakable for a table-guided one three
+    # months from now: say so in the build metadata, next to the kernels.
+    if ime_cost.force_requested():
+        _forced = sorted(op for op, p in kernel_picks.items()
+                         if str((p or {}).get("source", "")).startswith("curated[ime"))
+        _picks_doc["table_guided"] = False
+        _picks_doc["ime_force"] = True
+        _picks_doc["ime_force_env"] = f"{ime_cost.FORCE_ENV}=1"
+        _picks_doc["ime_force_note"] = ime_cost.FORCE_NOTE
+        _picks_doc["ime_forced_ops"] = _forced
+        # The ops that are on the engine BECAUSE of the switch: the table
+        # excluded them and they took the IME kernel anyway. (An op the switch
+        # also probed but which has no IME kernel is not on the engine, so it
+        # does not belong in this list -- it is in `picks` with its reason.)
+        _picks_doc["ime_forced_over_table_ops"] = sorted(
+            op for op in _forced if (kernel_picks[op] or {}).get("ime_forced_over_table"))
+        print(f"*** {ime_cost.FORCE_NOTE}")
+        print(f"*** ops on the IME in this build: {_forced or 'none'}")
     with open(picks_path, "w") as _f:
-        json.dump({"schema_version": 1, "target": target.name,
-                   "picks": kernel_picks}, _f, indent=2)
+        json.dump(_picks_doc, _f, indent=2)
     print(f"wrote {os.path.join(out_dir, 'kernels.h')}")
     print(f"wrote {os.path.join(out_dir, 'kernels.c')}  "
           f"(source={backend_name} target={target.name})")

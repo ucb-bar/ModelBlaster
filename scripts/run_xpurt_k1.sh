@@ -92,7 +92,7 @@ JOBS="$(nproc)"
 HOST="${MODELBLASTER_K1_HOST:-k1}"
 REMOTE_ROOT="${MODELBLASTER_K1_REMOTE_ROOT:-/root/mb_k1}"
 RT_PRIORITY="${MODELBLASTER_K1_RT_PRIORITY:-}"
-CROSS="${CROSS:-/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-}"
+CROSS="${CROSS:-riscv64-unknown-linux-gnu-}"   # toolchain prefix; on PATH unless set
 PY="${PY:-python3}"
 # Same import root the single-model runner uses.
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -298,10 +298,17 @@ for model in "${MODEL_LIST[@]}"; do
             # So reuse only if nothing that FEEDS the generated sources is newer:
             # the curated kernel library and the generators themselves.
             _stale=""
+            # ime_cost.py belongs here for the same reason the kernel bodies do: it
+            # is the only-if-better guard the picker asks before it swaps a curated
+            # IME kernel in, so a correction to the measured table changes which
+            # kernel this file contains. Leave it out and a cost-model fix looks
+            # applied in the tree and is absent from the board.
             for _dep in "${REPO_ROOT}/kernels" \
                         "${CODEGEN_IR}" \
                         "${REPO_ROOT}/pipeline/generate_kernels.py" \
                         "${REPO_ROOT}/pipeline/generate_skeleton.py" \
+                        "${REPO_ROOT}/pipeline/ime_cost.py" \
+                        "${REPO_ROOT}/pipeline/reference_kernels.py" \
                         "${REPO_ROOT}/pipeline/backends.py"; do
                 [[ -e "${_dep}" ]] || continue
                 if [[ -n "$(find "${_dep}" -newer "${bdir}/kernels.c" -print -quit 2>/dev/null)" ]]; then

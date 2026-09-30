@@ -12,17 +12,18 @@ IME vs RVV with rdcycle (min of N reps). Emits artifacts/ime_conv/*.
 import json, os, subprocess, sys, textwrap
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CROSS = os.environ.get("CROSS",
-    "/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-")
+CROSS = os.environ.get("CROSS", "riscv64-unknown-linux-gnu-")   # toolchain prefix; on PATH unless set
 HOST = os.environ.get("MODELBLASTER_K1_HOST", "k1")
 REMOTE = os.environ.get("MODELBLASTER_K1_REMOTE_ROOT", "/root/mb_k1") + "/ime_conv"
-OUT = os.path.join(REPO, "artifacts", "ime_conv")
+OUT = os.environ.get("MB_IME_BENCH_OUT") or os.path.join(REPO, "artifacts", "ime_conv")
 MARCH = ["-march=rv64gcv_zvl256b", "-mabi=lp64d", "-O3"]
 
 
 def load_shapes():
     seen, shapes = set(), []
-    for net in ("dronet", "yolov8_nano"):
+    # nets whose real shapes are benched; the deployed chain's YOLO is 64x96, whose conv shapes are much
+    # smaller than the 10x10 / IC=384 ones this table was first built from
+    for net in os.environ.get("MB_IME_BENCH_NETS", "dronet,yolov8_nano").split(","):
         g = os.path.join(REPO, "build", "k1_xpurt", net, "int8", "graph.json")
         if not os.path.exists(g):
             g = os.path.join(REPO, "build", "k1", net, "int8", "graph.json")
@@ -173,7 +174,9 @@ def main():
     if bad:
         summ += f"  !! {len(bad)} MISMATCH: " + ", ".join(f"{r[1]}({r[-1]})" for r in bad[:6])
     # net cycle reduction: picker takes IME where it wins, RVV else
-    for net in ("dronet", "yolov8_nano"):
+    # nets whose real shapes are benched; the deployed chain's YOLO is 64x96, whose conv shapes are much
+    # smaller than the 10x10 / IC=384 ones this table was first built from
+    for net in os.environ.get("MB_IME_BENCH_NETS", "dronet,yolov8_nano").split(","):
         nr = [r for r in rows if r[0] == net and r[-1] == "OK"]
         if not nr:
             continue

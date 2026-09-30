@@ -1,0 +1,89 @@
+hart 0
+  vmadot ss  (f7=0x71,f3=3)    EXECUTES
+  vmadot uu  (f7=0x71,f3=0)    EXECUTES
+  vmadot us  (f7=0x71,f3=1)    EXECUTES
+  vmadot su  (f7=0x71,f3=2)    EXECUTES
+  vmadot1 ss (f7=0x73,f3=3)    EXECUTES
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+hart 1
+  vmadot ss  (f7=0x71,f3=3)    EXECUTES
+  vmadot uu  (f7=0x71,f3=0)    EXECUTES
+  vmadot us  (f7=0x71,f3=1)    EXECUTES
+  vmadot su  (f7=0x71,f3=2)    EXECUTES
+  vmadot1 ss (f7=0x73,f3=3)    EXECUTES
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+hart 2
+  vmadot ss  (f7=0x71,f3=3)    EXECUTES
+  vmadot uu  (f7=0x71,f3=0)    EXECUTES
+  vmadot us  (f7=0x71,f3=1)    EXECUTES
+  vmadot su  (f7=0x71,f3=2)    EXECUTES
+  vmadot1 ss (f7=0x73,f3=3)    EXECUTES
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+hart 3
+  vmadot ss  (f7=0x71,f3=3)    EXECUTES
+  vmadot uu  (f7=0x71,f3=0)    EXECUTES
+  vmadot us  (f7=0x71,f3=1)    EXECUTES
+  vmadot su  (f7=0x71,f3=2)    EXECUTES
+  vmadot1 ss (f7=0x73,f3=3)    EXECUTES
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+hart 4
+  vmadot ss  (f7=0x71,f3=3)    SIGILL
+  vmadot uu  (f7=0x71,f3=0)    SIGILL
+  vmadot us  (f7=0x71,f3=1)    SIGILL
+  vmadot su  (f7=0x71,f3=2)    SIGILL
+  vmadot1 ss (f7=0x73,f3=3)    SIGILL
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+hart 5
+  vmadot ss  (f7=0x71,f3=3)    SIGILL
+  vmadot uu  (f7=0x71,f3=0)    SIGILL
+  vmadot us  (f7=0x71,f3=1)    SIGILL
+  vmadot su  (f7=0x71,f3=2)    SIGILL
+  vmadot1 ss (f7=0x73,f3=3)    SIGILL
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+hart 6
+  vmadot ss  (f7=0x71,f3=3)    SIGILL
+  vmadot uu  (f7=0x71,f3=0)    SIGILL
+  vmadot us  (f7=0x71,f3=1)    SIGILL
+  vmadot su  (f7=0x71,f3=2)    SIGILL
+  vmadot1 ss (f7=0x73,f3=3)    SIGILL
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+hart 7
+  vmadot ss  (f7=0x71,f3=3)    SIGILL
+  vmadot uu  (f7=0x71,f3=0)    SIGILL
+  vmadot us  (f7=0x71,f3=1)    SIGILL
+  vmadot su  (f7=0x71,f3=2)    SIGILL
+  vmadot1 ss (f7=0x73,f3=3)    SIGILL
+  vmadot1 ss (f7=0x72,f3=3)    SIGILL
+  vfmadot    (f7=0x75,f3=0)    SIGILL
+  vfmadot    (f7=0x74,f3=0)    SIGILL
+=== e16 ===
+hart 0, SEW=16 configs
+  vmadot ss  e16 (f7=0x71,f3=3)      EXECUTES
+  vfmadot e16 (f7=0x74,f3=0)         SIGILL
+  vfmadot e16 (f7=0x74,f3=1)         SIGILL
+  vfmadot e16 (f7=0x75,f3=0)         SIGILL
+  vfmadot e16 (f7=0x75,f3=1)         SIGILL
+  vfmadot e16 (f7=0x76,f3=0)         SIGILL
+  vfmadot e16 (f7=0x77,f3=0)         SIGILL
+hart 4, SEW=16 configs
+  vmadot ss  e16 (f7=0x71,f3=3)      SIGILL
+  vfmadot e16 (f7=0x74,f3=0)         SIGILL
+  vfmadot e16 (f7=0x74,f3=1)         SIGILL
+  vfmadot e16 (f7=0x75,f3=0)         SIGILL
+  vfmadot e16 (f7=0x75,f3=1)         SIGILL
+  vfmadot e16 (f7=0x76,f3=0)         SIGILL
+  vfmadot e16 (f7=0x77,f3=0)         SIGILL
