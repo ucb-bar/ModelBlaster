@@ -70,7 +70,7 @@ build/
 harness_linux/build/
 
 # Scratch profile tree written by ad-hoc runs. The authoritative measured
-# profiles live in XPU-RT's `gen_mb/profile/`, which is what the scheduler
+# profiles live in XPU-RT's `gen/profile_mb/`, which is what the scheduler
 # ingests; a copy here is a leftover, and committing one invites a solve
 # against costs nothing else can see.
 gen/profile_mb/

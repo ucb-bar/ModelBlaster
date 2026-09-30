@@ -134,7 +134,7 @@ if [[ "${RUNNER}" == "k1" ]]; then
     # profiles the BASELINE and files the result under the rewrite's name.
     # That is the RVV_fused failure reached through a runbook step.
     #
-    # The profile tree is written in place and gen_mb/profile is a symlink, so
+    # The profile tree is written in place (gen/profile_mb, which gen/mb/profile links to), so
     # the baseline results.csv for this model is backed up and restored around
     # the run -- otherwise measuring a candidate destroys the baseline every
     # other number was solved from.
@@ -145,13 +145,13 @@ if [[ "${RUNNER}" == "k1" ]]; then
         echo "FAIL: no XPU-RT checkout at ${XPURT_ROOT}; set XPURT_ROOT" > "${OUT_DIR}/FAIL"
         exit 3
     fi
-    PROF_DIR="${XPURT_ROOT}/gen_mb/profile/${TARGET}/spacemit_x60/${MODEL}/${MODEL}.${QUANT}/${MODEL}_spacemit_x60_${TARGET}_${MODEL}.${QUANT}/topo_0"
+    PROF_DIR="${XPURT_ROOT}/gen/profile_mb/${TARGET}/spacemit_x60/${MODEL}/${MODEL}.${QUANT}/${MODEL}_spacemit_x60_${TARGET}_${MODEL}.${QUANT}/topo_0"
     PROF_BAK="${OUT_DIR}/baseline_results.csv"
     [[ -f "${PROF_DIR}/results.csv" ]] && cp "${PROF_DIR}/results.csv" "${PROF_BAK}"
 
     RUN_STATUS=0
     MB_IR="${IR_AFTER}" \
-    PROFILE_OUT_ROOT="${XPURT_ROOT}/gen_mb/profile" \
+    PROFILE_OUT_ROOT="${XPURT_ROOT}/gen/profile_mb" \
     CROSS="${CROSS:-}" \
         bash "${REPO_ROOT}/scripts/run_model_k1.sh" \
             "${MODEL}" "${QUANT}" "${TARGET}" 0 \
