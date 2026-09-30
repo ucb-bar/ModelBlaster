@@ -101,6 +101,32 @@ void modelblaster_pool_parallelize_1d(modelblaster_pool_t pool,
                                 size_t range,
                                 unsigned flags);
 
+/* ---- optional per-shard tracing ---------------------------------------------------------
+ * A parallel-for hides where its work ran: the caller sees one interval on the calling hart
+ * while the helpers run slices on theirs. With tracing armed, every slice a worker executes
+ * records the hart it ran on and its rdtime span, so a profile can place the work on the hart
+ * that did it instead of crediting a configured pool.
+ *
+ * Tracing is opt-in and allocation-free: the caller supplies the storage. Recording is a
+ * bounded, lock-free append (each worker writes its own reserved slot via an atomic index),
+ * so an armed pool costs two rdtime reads per slice. Passing n==0 disarms. */
+struct modelblaster_pool_shard {
+    unsigned long long t0, t1;   /* rdtime ticks at slice entry/exit */
+    int   hart;                  /* sched_getcpu() of the worker that ran it */
+    int   wid;                   /* worker index (0 = master) */
+    unsigned long call;          /* parallelize_1d invocation counter */
+    unsigned long i0, i1;        /* slice [i0, i1) of the range */
+};
+
+void modelblaster_pool_trace_arm(modelblaster_pool_t pool,
+                                 struct modelblaster_pool_shard *buf, unsigned n);
+
+/* Number of shards recorded since the last reset (saturates at the buffer size). */
+unsigned modelblaster_pool_trace_count(modelblaster_pool_t pool);
+
+/* Drop everything recorded so far; the next slice starts at index 0. */
+void modelblaster_pool_trace_reset(modelblaster_pool_t pool);
+
 #ifdef __cplusplus
 }
 #endif
