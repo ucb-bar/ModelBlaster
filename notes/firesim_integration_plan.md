@@ -57,7 +57,7 @@ equivalent that targets `chipyard_riscv64/rocketchip_virt_riscv64`
   `MERLIN_CPU_FEATURES` mask trick in
   `merlin/benchmarks/firesim_shuttle/run_hetero.sh`.
 - Use the `chipyard_riscv64.overlay` from
-  `/scratch2/agustin/zephyr-chipyard-sw/samples/merlin_hetero_runner/boards/`
+  `<zephyr-chipyard-sw checkout>/samples/merlin_hetero_runner/boards/`
   (disables harts 2-7 so Zephyr's SMP wakeup doesn't try to ping
   non-existent CPUs on the 2-tile SoC).
 
@@ -150,7 +150,7 @@ binaries via the embedded harness's job loop is fast).
 
 When ready to resume:
 
-1. Read `/scratch2/agustin/zephyr-chipyard-sw/samples/merlin_hetero_runner/`
+1. Read `<zephyr-chipyard-sw checkout>/samples/merlin_hetero_runner/`
    in detail. That sample is the closest existing analogue and the
    pinning / marker emission patterns transfer directly.
 2. Clone it into `zephyr-chipyard-sw/samples/modelblaster_firesim/`

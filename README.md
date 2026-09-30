@@ -37,8 +37,8 @@ candidates, the cached-kernel reuse model), read the KernelBlaster paper:
 
 ModelBlaster compiles and runs; XPU-RT schedules. They form a closed loop, and
 recent work landed in **both repos together** — read
-[`XPU-RT/docs/the_loop.md`](../docs/the_loop.md) for which script owns which
-arrow, and [`XPU-RT/docs/k1_board.md`](../docs/k1_board.md) to run any of it on
+XPU-RT's `docs/Feature/the_loop.md` for which script owns which
+arrow, and XPU-RT's `docs/K1/k1_board.md` to run any of it on
 hardware. The complete composite-target contract is in
 [`docs/xpurt_schedule_sharding.md`](docs/xpurt_schedule_sharding.md).
 
@@ -70,7 +70,7 @@ Three things worth knowing before changing any of them:
   through the wrong layout — dronet at `max_abs_err=51`, no link error. Any new
   emitter must pass `backend`.
 
-Environment: [`XPU-RT/docs/environment.md`](../docs/environment.md). Run this
+Environment: XPU-RT's `docs/Artifact/environment.md`. Run this
 repo's tests **from this directory** (the curated-kernel verify cross-compiles
 with repo-relative includes), with `CROSS` exported:
 
@@ -78,6 +78,112 @@ with repo-relative includes), with `CROSS` exported:
 eval "$(../scripts/setup_spacemit_toolchain.sh)"
 ../.venv/bin/python -m pytest tests pipeline/tests -q
 ```
+
+Scripts that reach outside this repo take the location from the environment rather
+than a built-in path:
+
+| variable | default | read by |
+|---|---|---|
+| `XPURT_ROOT` | the superproject (`..`) | the XPU-RT-facing scripts in `scripts/` (PDB, schedule, Gantt, sweep helpers) |
+| `MODELBLASTER_VITFLY_MODELS` | none (required) | `models/_fused_loader.py`: the `vitfly/models` dir holding `fused_model.py` |
+| `MODELBLASTER_FUSED_CKPT` | `../sims/models/warehouse/nav_fused_v12_cnn.pt` | `models/_fused_loader.py` |
+| `CHIPYARD_ROOT` | none | `scripts/setup_benchmark_env.sh` (conda env, FireSim install, `env.sh`), `scripts/bedrock_spike_loop.py` (required), `scripts/spike_verify_kernel.py` |
+| `ZEPHYR_BASE` | none | `scripts/setup_benchmark_env.sh` |
+| `FIRESIM_ROOT` | `$CHIPYARD_ROOT/sims/firesim` | the FireSim capture scripts (`scripts/run_*_capture.sh`, `run_*_reps.sh`, `run_3way_sweep.sh`), `scripts/run_xpurt_bundle.py` |
+| `FIRESIM_QUEUE_BIN` | `firesim-queue` on `PATH` | `validation/firesim_runner.py` |
+| `RISCV` | `$CHIPYARD_ROOT/.conda-env/riscv-tools`, else tools on `PATH` | `scripts/spike_verify_kernel.py`, `scripts/bedrock_spike_loop.py` (bare-metal gcc, spike, pk) |
+| `MODELBLASTER_HETERO_SPIKE` | `spike-hetero` on `PATH` | `scripts/bedrock_spike_loop.py` |
+| `PY` / `XPURT_PY` | the running interpreter | `scripts/wallclock_split_eval.py` |
+
+## The SpaceMiT K1 target
+
+The SpaceMiT K1 (BananaPi) is an 8-hart riscv64 Linux board: cluster 0 (harts 0–3) and cluster 1
+(harts 4–7) both run RVV at VLEN=256, and cluster 0 alone carries the IME int8 matrix engine
+(`smt.vmadot`). `cores/spacemit_k1.json` is the measured core registry. Two backends target it,
+both cross-compiled on the host and verified on the board (no simulator models `smt.vmadot`):
+
+| backend | kernels | what it is |
+|---|---|---|
+| `rvv_x60` | `kernels/rvv/` | rv64gcv, VLEN=256, Zfh/Zvfh; runs on either cluster |
+| `ime_x60` | `kernels/ime/`, then `kernels/rvv/` | the IME kernels where they exist, RVV for every other op; **cluster 0 only** |
+
+### Toolchain: `CROSS`
+
+Every board build uses the GCC cross toolchain named by the `CROSS` prefix. It defaults to
+`riscv64-unknown-linux-gnu-`, i.e. whatever `riscv64-unknown-linux-gnu-gcc` is found on `PATH`.
+Set it to use a specific toolchain; the SpaceMiT GCC 14.3 build is the one to use, because GCC 13.2
+reorders `vsetvl` calls in RVV intrinsic code and the result traps on the board. From an XPU-RT
+checkout, `eval "$(../scripts/setup_spacemit_toolchain.sh)"` fetches it and exports `CROSS`.
+
+| variable | default | read by |
+|---|---|---|
+| `CROSS` | `riscv64-unknown-linux-gnu-` (on `PATH`) | `scripts/run_xpurt_k1.sh`, `scripts/run_model_k1.sh`, `scripts/ime_conv_verify_bench.py`, `scripts/ime_fused_conv_bench.py`, `scripts/k1_verify_curated_rvv.py`, `scripts/k1_verify_fused_conv_rvv.py` |
+| `MODELBLASTER_K1_HOST` | `k1` (an ssh config entry) | the same scripts |
+| `MODELBLASTER_K1_REMOTE_ROOT` | `/root/mb_k1` | the staging directory on the board |
+| `MB_IME_FORCE` | `0` | `pipeline/generate_kernels.py` via `pipeline/ime_cost.py` (below) |
+| `MB_XPURT_STREAM` | `0` | `scripts/run_xpurt_k1.sh`: one JSON line per dispatch end, for XPU-RT's streaming feedback |
+
+`scripts/run_xpurt_k1.sh --schedule <scheduled_*.json>` runs an XPU-RT schedule on the board end to
+end: extract the int8 IR, generate kernels per backend, ingest the schedule into a dispatch table,
+cross-build `harness_xpurt_linux/`, run it pinned over ssh and pull back stdout and the per-dispatch
+trace. `scripts/run_model_k1.sh` is the single-model counterpart.
+
+### The IME kernels and when they are used
+
+`kernels/ime/` holds int8 `vmadot` kernels on a 4×4×8 micro-tile: `linear`, `matmul`, `conv2d`
+(im2col → `vmadot`), and the fused `conv2d_batchnorm2d_silu_s8`. The fused kernel exists because
+the deployed YOLO graph fuses Conv→BN→SiLU into one op and curated kernels are looked up by exact op
+name, so without it none of those convolutions could reach the engine. Its MAC is integer and its
+BN and SiLU stages are the RVV kernel's expressions in the same order, so its output is
+byte-identical to the RVV fused kernel's; that is the verification contract (`max_abs_err=0`).
+
+`pipeline/ime_cost.py` decides, per op and shape, whether the IME kernel is used. The rule is
+**only if measured faster** than the RVV kernel that would otherwise run:
+
+* convolutions use a measured table per op kind, each against its own RVV baseline —
+  `artifacts/ime_conv/ime_vs_rvv_conv.csv` for `conv2d_s8`,
+  `artifacts/ime_fused_conv/ime_vs_rvv_fused_conv.csv` for the fused op. A shape absent from the
+  table stays on RVV;
+* `linear` / `matmul` use a speedup curve over M measured on the board (0.25× at M=7, 2.30× at
+  M=128);
+* the kernel picker (`generate_kernels.py`) and `pipeline/apply_ime_hint.py` both consult it.
+
+`MB_IME_FORCE=1` is the explicit override for measuring the blanket deployment: the picker then takes
+the IME kernel for every op that has one, whatever the tables say, and records that in
+`kernel_picks.json` (`ime_force`, `table_guided: false`, `ime_forced_ops`). It does not relax
+verification, it does not change placement (a forced build still runs on harts 0–3 only), and
+nothing but the kernel build reads it. `pipeline/tests/test_ime_force.py` covers both modes.
+
+The per-shape tables are produced on the board by `scripts/ime_conv_verify_bench.py` (IME conv vs
+the standalone RVV conv, both checked against a scalar oracle) and `scripts/ime_fused_conv_bench.py`
+(the fused IME kernel vs the deployed RVV fused kernel, byte-identical outputs required). Each
+compiles one binary with `CROSS`, runs it pinned to cluster 0 and writes its CSV under
+`artifacts/`.
+
+### Which IME instructions the K1 implements
+
+`artifacts/ime_isa_probe/FINDINGS.md` records a probe of the three instruction families in the IME
+specification on all eight harts. On cluster 0, `vmadot` (all four signedness variants) and the
+sliding-window `vmadot1` execute; on cluster 1 every one raises `SIGILL`; the fp16/bf16 `vfmadot`
+family raises `SIGILL` everywhere, under SEW=8 and SEW=16. So the engine is int8 only, cluster 0
+only, and the sliding-window family is present but not used by any kernel here. The page also
+analyses which of the measured losing shapes a sliding window could affect. The probe sources and
+the raw output are beside it.
+
+### The worker pool and per-shard tracing
+
+`runtime/modelblaster_pool/` is the POSIX thread pool the generated code uses to split one op across
+harts (`parallelize_1d`). It can optionally record where every slice ran: the caller supplies a
+buffer of `struct modelblaster_pool_shard` (rdtime start/end, the hart from `sched_getcpu()`, the
+worker index, the call counter and the slice range) and arms it with
+`modelblaster_pool_trace_arm(pool, buf, n)`; `modelblaster_pool_trace_count()` and
+`modelblaster_pool_trace_reset()` read and clear it, and `n == 0` disarms. Recording is lock-free and
+costs two rdtime reads per slice. XPU-RT's traced ROS 2 node (`board/k1_ros_mb/ros_mb_chain_traced.cpp`)
+uses it to place each YOLO and nav shard on the hart that executed it.
+
+How these pieces are measured on the deployed chain, and what the IME is worth there, is in XPU-RT's
+`docs/K1/ime_kernel_reproduction.md`; the ROS 2 baseline with the
+IME kernels is XPU-RT's `docs/Baselines/ros_with_ime.md`.
 
 ## Quick orientation
 
@@ -94,7 +200,12 @@ modelblaster/
   harness_multi/     N-models-in-one-ELF harness (for pool sweeps)
   harness_xpurt/     schedule-driven multi-model harness (XPU-RT execution)
   harness_microros/  micro-ROS variant (DDS broker + N model nodes)
+  harness_linux/     single-model Linux harness (the K1)
+  harness_xpurt_linux/  schedule-driven multi-model Linux harness (the K1)
+  runtime/           modelblaster_pool (the worker pool, optional per-shard tracing)
   validation/        spike + firesim runners; profile CSV writer
+  scripts/           runners and benches (run_xpurt_k1.sh, ime_*_bench.py, ...)
+  artifacts/         measured tables and probe results the pipeline reads (ime_conv/, ime_fused_conv/, ime_isa_probe/)
   examples/          per-model run.sh + cached artifacts
   notes/             working design docs (deep-dives by topic)
 ```
@@ -186,6 +297,8 @@ overlay; nothing else hard-codes per-target logic.
 | `rvv_opu` | rv64gcv | Saturn OPU custom .insn (i8 outer-product) | spike harness (needs OPU spike fork — see below) |
 | `gemmini` | rv64imafdc | Gemmini int8 RoCC (DIM=16, f32 acc_scale) | chipyard spike harness |
 | `gemmini_q31` | rv64imafdc | Gemmini int8 RoCC + Q0.31 mvout requantize | chipyard spike harness |
+| `rvv_x60` | rv64gcv, VLEN=256 | Zfh + Zvfh (SpaceMiT K1) | cross-compile; verified on the board |
+| `ime_x60` | rv64gcv, VLEN=256 | K1 IME `smt.vmadot` int8, cluster 0 only | cross-compile; verified on the board |
 
 ## Quant axes supported
 

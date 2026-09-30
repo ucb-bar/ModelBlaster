@@ -1618,9 +1618,9 @@ def generate(
                         # Whether the matrix engine was in play is a property of
                         # the OP, not of whichever source was finally accepted.
                         # These entries are written before the probe loop runs,
-                        # so replacing the record wholesale used to erase the one
-                        # line saying the IME was excluded here (or forced past
-                        # the table) the moment curated[rvv] picked the op up.
+                        # so replacing the record wholesale would erase the line
+                        # saying the IME was excluded here (or forced past the
+                        # table) once curated[rvv] picks the op up.
                         for _k in ("ime_skipped_reason", "ime_forced_over_table"):
                             if _prev.get(_k) is not None:
                                 _pick[_k] = _prev[_k]

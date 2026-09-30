@@ -87,7 +87,7 @@ def _network_root(name: str) -> str:
     return name
 
 
-# ---- CSV reader (tolerates both XPU-RT and short fabricated schemas) ----
+# ---- CSV reader (tolerates both XPU-RT and short synthetic schemas) ----
 
 def _read_trace(path: str) -> list[dict]:
     rows: list[dict] = []

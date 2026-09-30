@@ -237,7 +237,7 @@ def ime_useful(op: str, shapes: List[Dict[str, int]],
 # `scripts/make_ime_profile.py` stay table-guided whether or not it is set, so
 # a per-dispatch schedule is never silently forced along with a build. What a
 # forced build measures, and the deployment it stands for, is in
-# docs/ros_with_ime.md.
+# docs/Baselines/ros_with_ime.md.
 FORCE_ENV = "MB_IME_FORCE"
 
 FORCE_NOTE = (

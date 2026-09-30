@@ -67,7 +67,7 @@ class TestFusedConvUsesItsOwnTable(unittest.TestCase):
 
     def test_conv_op_with_no_table_stays_rvv(self):
         # conv2d_batchnorm2d_s8 has no IME kernel and no measurement; borrowing
-        # another op's table is exactly the bug. Only-if-better => None.
+        # another op's table would compare against the wrong baseline. Only-if-better => None.
         sp, why = ime_cost.ime_speedup_for(
             "conv2d_batchnorm2d_s8", {"IC": 32, "IH": 27, "IW": 27, "OC": 32, "KH": 3, "KW": 3})
         self.assertIsNone(sp)

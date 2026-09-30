@@ -138,7 +138,7 @@ runner, contention model, eager-V on the hetero bitstream. The
 **iteration side** is what's still open: XPU-RT can already diagnose
 schedules, propose A/B/C candidate bundles, and emit fusion / split
 hints (Contracts 1 & 2 in
-`/scratch2/agustin/XPU-RT/docs/iterative_firesim_loop.md`), but
+`$XPURT/docs/iterative_firesim_loop.md`), but
 **ModelBlaster cannot yet realize axis-C** — rewrite a graph to fuse
 sub-1k-µs dispatch chains into a single coarser op. Without that,
 the predicted-vs-measured loop never closes for granularity.
@@ -156,7 +156,7 @@ This plan does three things:
    into XPU-RT's advisor.
 
 Outcome: one Claude session can run
-`bash /scratch2/agustin/XPU-RT/scripts/demo_iterate_firesim.sh`
+`bash $XPURT/scripts/demo_iterate_firesim.sh`
 → apply hint → build candidate bundle ELFs → FireSim batch
 → measured Gantt + re-advise, with the full 1×yolov8_nano +
 4×mlp_control + 2×dronet workload on the Gemmini+OPU hetero
@@ -202,7 +202,7 @@ codegen-emittable) in `reference_kernels.py`.
 CLI:
 ```bash
 python -m modelblaster.pipeline.apply_fusion_hint \
-    --hint   /scratch2/agustin/XPU-RT/artifacts/iterate/granularity_hint.json \
+    --hint   $XPURT/artifacts/iterate/granularity_hint.json \
     --model  mlp_control \
     --ir     examples/mlp_control/int8/generated/graph.json \
     --out    examples/mlp_control/int8/generated/graph.fused.json
@@ -334,7 +334,7 @@ per-kind busy cycles, etc. Add one small adapter
 - writes a `scheduled_<candidate>_measured_report.json` mimicking
   XPU-RT's `SchedulerReport` schema v2 with `actual_*_cycles` filled
   from the trace,
-- so `python3 /scratch2/agustin/XPU-RT/xpu-rt/advisor.py --report
+- so `python3 $XPURT/xpu-rt/advisor.py --report
   <measured_report.json> --deadline-us <N>` re-diagnoses on
   **measured** timings and the loop produces a Round-2 bundle.
 
@@ -387,7 +387,7 @@ Create `.claude/skills/` and add two skills:
 If skills aren't enough for an interactive demo, expose the three
 ModelBlaster CLIs (`apply_fusion_hint`, `run_xpurt_bundle`,
 `emit_measured_report`) as tools via a small MCP server modeled on
-`/scratch2/agustin/XPU-RT/scripts/compgen-mcp.sh`. Defer unless the
+`$XPURT/scripts/compgen-mcp.sh`. Defer unless the
 skill-only demo can't carry the narrative.
 
 ---
@@ -399,7 +399,7 @@ Workload: `data/toplevel/networks_1yolo_4mlp_2dronet_firesim.json`
 
 Demo path, single recorded session:
 
-1. `cd /scratch2/agustin/XPU-RT && bash scripts/demo_iterate_firesim.sh`
+1. `cd $XPURT && bash scripts/demo_iterate_firesim.sh`
 2. Invoke `/realize-and-run artifacts/iterate/firesim_batch.json
    artifacts/iterate/granularity_hint.json` (ModelBlaster skill).
 3. Wait for one batched FireSim session (FIRESIM_QUEUE=1
@@ -445,9 +445,9 @@ Demo path, single recorded session:
   `MODELBLASTER_XPURT_TRACE_BEGIN/END` blocks; reused by the
   loop-back adapter.
 - `scripts/plot_xpurt_trace.py` and
-  `/scratch2/agustin/XPU-RT/xpu-rt/plot_gantt.py --trace` — same CSV
+  `$XPURT/xpu-rt/plot_gantt.py --trace` — same CSV
   schema; both render predicted-vs-actual.
-- `/scratch2/agustin/XPU-RT/scripts/granularity_loop.py`,
+- `$XPURT/scripts/granularity_loop.py`,
   `iterate_firesim.py`, `bundle.py`, `advisor.py` — unchanged.
 
 ---
@@ -469,7 +469,7 @@ End-to-end gates, each must pass before the next:
      identity-style fuse_group: spike says `PASSED`.
 
 3. **Phase 1 full hint.** Apply the actual hint from
-   `/scratch2/agustin/XPU-RT/artifacts/iterate/granularity_hint.json`;
+   `$XPURT/artifacts/iterate/granularity_hint.json`;
    `RUNNER=spike` on all touched models PASSES with
    `max_abs_err ≤ atol OR max_rel_err ≤ rtol`.
 

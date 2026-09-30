@@ -18,7 +18,7 @@ according to an XPU-RT schedule.
   ``target in HETERO_TARGETS`` and shells out to ``xpurt_demo/run.sh``
   with MODELS / BACKENDS / REGISTRY / SCHEDULE_JSON / RUNNER set from
   the workload row. ``MODELBLASTER_HETERO_SPIKE`` is auto-pointed at
-  ``/scratch2/agustin/merlin/tools/spike-hetero/spike-hetero`` when
+  ``$MERLIN_DIR/tools/spike-hetero/spike-hetero`` when
   the runner is spike and the wrapper exists.
 - ``benchmarks/config/workloads.yaml`` rows for ``dronet_hetero_int8``,
   ``yolov8n_hetero_int8``, and ``vint_hetero_fp16`` carry the

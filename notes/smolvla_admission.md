@@ -31,8 +31,8 @@ attention + action head) and exposes the standard model-module API
 ## Dependencies
 
 The lerobot policy lives in a sibling clone (default at
-``/scratch2/agustin/merlin/third_party/lerobot``); ``Understanding-PI0``
-lives at ``/scratch2/agustin/merlin/third_party/Understanding-PI0``.
+``$MERLIN_DIR/third_party/lerobot``); ``Understanding-PI0``
+lives at ``$MERLIN_DIR/third_party/Understanding-PI0``.
 Both are wired in via ``sys.path`` injection at module import time
 rather than as pip dependencies — lerobot's full dep set
 (``transformers``, ``diffusers``, ``av``, ``opencv``, ``wandb``,
@@ -79,9 +79,9 @@ Understanding-PI0 sibling, HF cache for ``lerobot/smolvla_base``):
 
 ```bash
 uv sync --extra smolvla
-export PI0_ROOT=/scratch2/agustin/merlin/third_party/Understanding-PI0
-export LEROBOT_ROOT=/scratch2/agustin/merlin/third_party/lerobot
-export HF_HOME=/scratch2/agustin/hf_cache
+export PI0_ROOT=$MERLIN_DIR/third_party/Understanding-PI0
+export LEROBOT_ROOT=$MERLIN_DIR/third_party/lerobot
+export HF_HOME=<your HF cache dir>
 ```
 
 Trace + inventory:
@@ -116,4 +116,4 @@ print('out:', tuple(out.shape), out.dtype)
 | ``MODELBLASTER_SMOLVLA_DEVICE``   | ``cpu``                    | export requires CPU |
 | ``PI0_ROOT`` / ``UNDERSTANDING_PI0_ROOT`` | (fallback path) | Understanding-PI0 repo |
 | ``LEROBOT_ROOT``                  | (fallback path)            | lerobot repo |
-| ``HF_HOME``                       | ``/scratch2/agustin/hf_cache`` (fallback) | HF snapshot dir |
+| ``HF_HOME``                       | ``~/.cache/huggingface`` (fallback) | HF snapshot dir |

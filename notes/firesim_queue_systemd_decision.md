@@ -6,7 +6,7 @@
 
 ## Current state
 
-`firesim-queue` lives at `/scratch2/agustin/firesim_queue/bin/firesim-queue`
+`firesim-queue` lives at `<firesim_queue checkout>/bin/firesim-queue` (`$FIRESIM_QUEUE_BIN`)
 with a SQLite backing store in the same directory. All ModelBlaster
 FireSim runs go through this queue via `FIRESIM_QUEUE=1` (per
 `reference_firesim_queue.md` memory). Test battery passes (#92,

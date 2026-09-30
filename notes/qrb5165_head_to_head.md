@@ -168,7 +168,7 @@ where it dominates (25.30 ms vs HEFT's 29.21 ms).
 
 ```bash
 # Generate the fixture
-PYTHONPATH=.:/scratch2/agustin/XPU-RT/xpu-rt python3 scripts/run_xpurt_scheduler_multi.py \
+PYTHONPATH=.:$XPURT/xpu-rt python3 scripts/run_xpurt_scheduler_multi.py \
     --config configs/multi_dronet2_mlp4.yaml \
     --output schedule_fixtures/3way_mosek_dronet2_mlp4.json
 
@@ -177,7 +177,7 @@ bash scripts/run_cpsat_captures.sh mosek_dronet2_mlp4
 bash scripts/run_headline_3reps.sh
 
 # Render predicted-vs-actual Gantt
-PYTHONPATH=/scratch2/agustin/XPU-RT/xpu-rt python3 -m plot_gantt \
+PYTHONPATH=$XPURT/xpu-rt python3 -m plot_gantt \
     --trace benchmarks/results/A/3way_mosek_dronet2_mlp4/latest/xpurt_trace.csv \
     --out notes/figures/gantt_mosek_headline.png
 

@@ -68,8 +68,8 @@ firesim simulator upgrade or a different hetero bitstream), re-run:
 
 ```bash
 # Once bitstream is stable on 1+4+2:
-PYTHONPATH=/scratch2/agustin/XPU-RT/xpu-rt:/scratch2/agustin/ModelBlaster/src \
-    /scratch2/agustin/miniforge3/envs/merlin-dev/bin/python \
+PYTHONPATH=$XPURT/xpu-rt:$MODELBLASTER/src \
+    <merlin-dev env>/bin/python \
     -m scripts.run_xpurt_scheduler_multi \
     --config configs/multi_3way_qrb_y64.yaml \
     --output artifacts/bundle/cpsat/firesim_batch.json \

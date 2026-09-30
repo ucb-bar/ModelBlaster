@@ -23,7 +23,7 @@ predicted-vs-measured granularity loop with XPU-RT — see
 1. **Locate the hint** (typically produced by XPU-RT's
    `scripts/granularity_loop.py --emit-hint <path>`):
    ```bash
-   HINT=/scratch2/agustin/XPU-RT/artifacts/iterate/granularity_hint.json
+   HINT=$XPURT/artifacts/iterate/granularity_hint.json
    jq -r '.networks[] | "\(.network): fuse_groups=\(.fuse_groups | length) n_tiny=\(.n_tiny)"' "$HINT"
    ```
 

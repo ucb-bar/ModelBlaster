@@ -149,9 +149,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Log the temperature schedule applied per attempt in
         # generate_kernels.py (first attempt deterministic, retries
         # nudged off zero to escape repeating broken kernels). Bedrock's
-        # Converse API does NOT expose a seed parameter, so we log null
-        # rather than fabricating one -- this is the truth a future
-        # reviewer would need to know to assess reproducibility.
+        # Converse API does NOT expose a seed parameter, so the seed is
+        # logged as null rather than invented; reproducibility of this arm
+        # is bounded by that.
         "llm_temperature_schedule": [0.0, 0.3],
         "llm_seed": None,
     }

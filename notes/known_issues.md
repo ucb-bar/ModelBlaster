@@ -29,7 +29,7 @@ attempt (6 across two timeout configs) has been killed mid-run:
   rc=-15. Three reps timed out identically.
 - Without a timeout cap: simulator stays in the `RUNNING` phase
   indefinitely. Last observed at ~115 min wall with no progress in
-  the live UART (`/scratch2/agustin/FIRESIM_RUNS_DIR/sim_slot_0/uartlog`
+  the live UART (`$FIRESIM_SIM_DIR/sim_slot_0/uartlog`
   last touched ~16 min into the run, then silent).
 
 **What we know**:

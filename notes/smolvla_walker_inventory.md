@@ -117,9 +117,9 @@ One-time:
 
 ```bash
 uv sync --extra smolvla
-export PI0_ROOT=/scratch2/agustin/merlin/third_party/Understanding-PI0
-export LEROBOT_ROOT=/scratch2/agustin/merlin/third_party/lerobot
-export HF_HOME=/scratch2/agustin/hf_cache
+export PI0_ROOT=$MERLIN_DIR/third_party/Understanding-PI0
+export LEROBOT_ROOT=$MERLIN_DIR/third_party/lerobot
+export HF_HOME=<your HF cache dir>
 ```
 
 Outer inventory (only sees the wrap):

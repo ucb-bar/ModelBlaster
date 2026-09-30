@@ -11,13 +11,13 @@ single batched session, returning per-candidate measured timings that
 feed back into the advisor for the next round.
 
 This is the ModelBlaster half of the predicted-vs-measured loop. The
-XPU-RT half is `/close-loop` in `/scratch2/agustin/XPU-RT/.claude/skills/`.
+XPU-RT half is `/close-loop` in `$XPURT/.claude/skills/` (`$XPURT` = your XPU-RT checkout, the superproject of this repo).
 
 ## Steps
 
 1. **Read the bundle and classify candidates by axis:**
    ```bash
-   BATCH=/scratch2/agustin/XPU-RT/artifacts/iterate/firesim_batch.json
+   BATCH=$XPURT/artifacts/iterate/firesim_batch.json
    jq -r '.candidates[] | "\(.id) axis=\(.axis) realizable_by=\(.realizable_by)"' "$BATCH"
    ```
    - `realizable_by: "xpurt"` (axes A/B) — schedule fixture is already
@@ -69,7 +69,7 @@ XPU-RT half is `/close-loop` in `/scratch2/agustin/XPU-RT/.claude/skills/`.
    done
    ```
    Use `scripts/plot_xpurt_trace.py` (ModelBlaster) or
-   `/scratch2/agustin/XPU-RT/xpu-rt/plot_gantt.py --trace` (XPU-RT);
+   `$XPURT/xpu-rt/plot_gantt.py --trace` (XPU-RT);
    both consume the same CSV schema.
 
 6. **Summarize for the user**, one line per candidate:
