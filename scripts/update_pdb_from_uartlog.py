@@ -1,10 +1,13 @@
 """Re-ingest measured bit-exact cycles into the profile DB."""
-import csv, re, sys, shutil
+import csv, os, re, sys, shutil
 from pathlib import Path
 
-UART = Path("/scratch2/agustin/ModelBlaster/artifacts/audit/firesim_dronet_gemmini_bit_exact.uartlog")
+REPO = Path(__file__).resolve().parents[1]
+UART = REPO / "artifacts/audit/firesim_dronet_gemmini_bit_exact.uartlog"
 # Profile DB roots
-PDB_ROOT = Path("/scratch2/agustin/XPU-RT/zephyr-chipyard-sw/gen/profile/sweep_v8")
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT_ROOT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
+PDB_ROOT = XPURT_ROOT / "zephyr-chipyard-sw" / "gen" / "profile" / "sweep_v8"
 
 # Parse uartlog: each line "<backend>,<did>,<name>,<op>,<shape>,<cycles>"
 measured = {}  # (backend, dispatch_id) -> cycles

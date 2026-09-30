@@ -27,7 +27,7 @@ from pathlib import Path
 
 # Locate the repo from this file, not from an absolute path.
 #
-# This used to be a hardcoded /scratch2/agustin/ModelBlaster, which meant the
+# This used to be a hardcoded absolute path to one ModelBlaster clone, which meant the
 # test exercised whichever checkout happened to live there rather than the one
 # it ships in -- so a fix made in this tree was silently not under test. It also
 # made the test unrunnable for anyone else.

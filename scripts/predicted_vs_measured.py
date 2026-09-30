@@ -7,13 +7,17 @@ compare with the measured per-instance wall clock from v20b's run.log.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-FIXTURE = Path("/scratch2/agustin/XPU-RT/schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_hybrid.json")
-RUNLOG = Path("/scratch2/agustin/ModelBlaster/artifacts/runtime_optimization/v20b_transpose_elim_retry/run.log")
+REPO = Path(__file__).resolve().parents[1]
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT_ROOT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
+FIXTURE = XPURT_ROOT / "schedules/scheduled_networks_1yolo_4mlp_2dronet_firesim_hybrid.json"
+RUNLOG = REPO / "artifacts/runtime_optimization/v20b_transpose_elim_retry/run.log"
 
 
 def predicted_per_net() -> dict:

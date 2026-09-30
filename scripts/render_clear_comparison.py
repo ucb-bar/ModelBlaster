@@ -15,6 +15,7 @@ Improvements over the existing band Gantts:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -25,7 +26,8 @@ import matplotlib.patches as mpatches
 import re
 
 REPO = Path(__file__).resolve().parents[1]
-XPURT = Path("/scratch2/agustin/XPU-RT")
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
 sys.path.insert(0, str(XPURT / "xpu-rt"))
 from diagnostics.band_invariant import check_band_invariant, _periodic_metadata
 

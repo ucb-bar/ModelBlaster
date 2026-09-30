@@ -9,13 +9,19 @@
 #   - benchmarks/arms/arm_*          (uses both)
 #
 # Designed to be idempotent: re-sourcing in an already-activated shell is
-# harmless. Paths are pinned to the host this repo lives on; if they move,
-# edit the constants below.
+# harmless. Host-specific locations come from the environment:
+#
+#   CHIPYARD_ROOT   the chipyard checkout (its .conda-env gives west/spike/riscv-tools,
+#                   its sims/firesim is the FireSim install)
+#   ZEPHYR_BASE     the Zephyr tree (zephyr-chipyard-sw/zephyr_ws/zephyr)
+#   FIRESIM_ROOT / FIRESIM_ENV   override the FireSim install / its env.sh
 
-# ---- pinned paths (host-specific) -----------------------------------------
+# ---- host-specific paths ---------------------------------------------------
 
-_MB_CHIPYARD_CONDA="/scratch2/agustin/chipyard/.conda-env"
-_MB_ZEPHYR_BASE="/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr"
+[ -n "${CHIPYARD_ROOT:-}" ] || echo "warning: set CHIPYARD_ROOT to the chipyard checkout" >&2
+[ -n "${ZEPHYR_BASE:-}" ] || echo "warning: set ZEPHYR_BASE to the Zephyr tree (zephyr_ws/zephyr)" >&2
+_MB_CHIPYARD_CONDA="${CHIPYARD_ROOT:+${CHIPYARD_ROOT}/.conda-env}"
+_MB_ZEPHYR_BASE="${ZEPHYR_BASE:-}"
 _MB_ZEPHYR_SDK="/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1"
 
 # ---- resolve repo root (no matter where you sourced from) -----------------
@@ -25,7 +31,7 @@ _MB_REPO_ROOT="$(cd "$(dirname "${_MB_SCRIPT}")/.." && pwd)"
 
 # ---- 1) conda env (gives us west + spike + riscv-tools) -------------------
 
-if [ -f "${_MB_CHIPYARD_CONDA}/etc/profile.d/conda.sh" ]; then
+if [ -n "${_MB_CHIPYARD_CONDA}" ] && [ -f "${_MB_CHIPYARD_CONDA}/etc/profile.d/conda.sh" ]; then
     # shellcheck disable=SC1091
     source "${_MB_CHIPYARD_CONDA}/etc/profile.d/conda.sh"
     conda activate "${_MB_CHIPYARD_CONDA}" >/dev/null
@@ -34,7 +40,7 @@ else
 fi
 
 # riscv-tools/bin lives inside the conda env but isn't on PATH after activate.
-if [ -d "${_MB_CHIPYARD_CONDA}/riscv-tools/bin" ]; then
+if [ -n "${_MB_CHIPYARD_CONDA}" ] && [ -d "${_MB_CHIPYARD_CONDA}/riscv-tools/bin" ]; then
     export PATH="${_MB_CHIPYARD_CONDA}/riscv-tools/bin:${PATH}"
 fi
 
@@ -63,10 +69,10 @@ fi
 # Both are skipped silently when their prerequisites aren't present so
 # spike-only sessions don't hit avoidable warnings.
 
-_MB_FIRESIM_DIR="/scratch2/agustin/chipyard/sims/firesim"
+_MB_FIRESIM_DIR="${FIRESIM_ROOT:-${CHIPYARD_ROOT:+${CHIPYARD_ROOT}/sims/firesim}}"
 _MB_FIRESIM_SSH_KEY="${HOME}/.ssh/firesim"
 
-# Point validation/firesim_runner.py at OUR install (agustin's) -- the
+# Point validation/firesim_runner.py at OUR install ($CHIPYARD_ROOT) -- the
 # bitstream there is alveo_u250_firesim_shuttle_gemmini_opu (the
 # GemminiAndOPUShuttleConfig hetero, tile 0 Gemmini RoCC + tile 1 Saturn
 # OPU). dima's install has dual-rocket-saturn-gemmini-q31 but the logs
@@ -74,9 +80,9 @@ _MB_FIRESIM_SSH_KEY="${HOME}/.ssh/firesim"
 # from this user can't complete there. Override via FIRESIM_ROOT /
 # FIRESIM_ENV if pointing at a different chipyard install.
 export FIRESIM_ROOT="${FIRESIM_ROOT:-${_MB_FIRESIM_DIR}}"
-export FIRESIM_ENV="${FIRESIM_ENV:-/scratch2/agustin/chipyard/env.sh}"
+export FIRESIM_ENV="${FIRESIM_ENV:-${CHIPYARD_ROOT:+${CHIPYARD_ROOT}/env.sh}}"
 
-if [ -f "${_MB_FIRESIM_DIR}/sourceme-manager.sh" ]; then
+if [ -n "${_MB_FIRESIM_DIR}" ] && [ -f "${_MB_FIRESIM_DIR}/sourceme-manager.sh" ]; then
     # sourceme-manager appends ${dir}/deploy to PATH so the `firesim`
     # CLI becomes available. It also expects to be sourced FROM the
     # firesim dir, so cd-then-back.

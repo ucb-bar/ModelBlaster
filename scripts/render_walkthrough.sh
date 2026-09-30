@@ -8,7 +8,8 @@ cd "$(dirname "$0")/.."
 OUT=artifacts/bundle/walkthrough
 mkdir -p "${OUT}"
 
-XPURT=/scratch2/agustin/XPU-RT
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT="${XPURT_ROOT:-$(cd .. && pwd)}"
 
 python3 scripts/render_annotated_gantt.py \
   --fixture "${XPURT}/schedules/scheduled__iter_baseline_decomposed_profiled.json" \

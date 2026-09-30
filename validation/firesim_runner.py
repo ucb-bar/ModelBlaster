@@ -56,8 +56,8 @@ DEFAULT_FIRESIM_SLOT = os.environ.get(
 # decides where the simulator actually runs (it copies the staged binary
 # into <default_simulation_dir>/sim_slot_<N>/, writes uartlog there, etc.).
 # When unset / commented out, it defaults to firesim_rundir/sim_slot_<N>
-# under the firesim install. On this host it's overridden to
-# /scratch2/agustin/FIRESIM_RUNS_DIR. We read it dynamically rather than
+# under the firesim install. A host may override it (e.g. to a dedicated
+# FIRESIM_RUNS_DIR on a big scratch disk). We read it dynamically rather than
 # hard-coding so the integration follows whatever the user has wired up.
 DEFAULT_FIRESIM_SIM_DIR_ENV = "FIRESIM_SIM_DIR"
 
@@ -100,7 +100,7 @@ def _firesim_paths(root: str, slot: str) -> dict:
     """Return all paths the runner cares about.
 
     `root` is the firesim install root (e.g.
-    `/scratch2/agustin/chipyard/sims/firesim`). `slot` is the trailing
+    `$CHIPYARD_ROOT/sims/firesim`). `slot` is the trailing
     sim_slot path relative to the actual simulation dir
     (which comes from config_runtime.yaml::default_simulation_dir).
 
@@ -315,9 +315,9 @@ def _firesim_infrasetup(firesim_env: str, firesim_root: str,
               flush=True)
 
 
-FIRESIM_QUEUE_BIN = os.environ.get(
-    "FIRESIM_QUEUE_BIN",
-    "/scratch2/agustin/firesim_queue/bin/firesim-queue")
+# The shared FPGA queue client: $FIRESIM_QUEUE_BIN, else `firesim-queue` on PATH.
+FIRESIM_QUEUE_BIN = (os.environ.get("FIRESIM_QUEUE_BIN")
+                     or shutil.which("firesim-queue") or "firesim-queue")
 
 
 def _use_firesim_queue() -> bool:

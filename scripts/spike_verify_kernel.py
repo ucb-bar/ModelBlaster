@@ -32,9 +32,14 @@ sys.path.insert(0, str(REPO))
 import pipeline.reference_kernels as rk
 
 
-RISCV_GCC = "/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-elf-gcc"
-SPIKE = "/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/spike"
-PK = "/scratch2/agustin/chipyard/.conda-env/riscv-tools/riscv64-unknown-elf/bin/pk"
+# Bare-metal RISC-V tools under $RISCV (chipyard's env.sh sets it), else
+# $CHIPYARD_ROOT/.conda-env/riscv-tools; with neither, gcc/spike/pk come from PATH.
+_RISCV = os.environ.get("RISCV") or (
+    os.path.join(os.environ["CHIPYARD_ROOT"], ".conda-env", "riscv-tools")
+    if os.environ.get("CHIPYARD_ROOT") else "")
+RISCV_GCC = os.path.join(_RISCV, "bin", "riscv64-unknown-elf-gcc") if _RISCV else "riscv64-unknown-elf-gcc"
+SPIKE = os.path.join(_RISCV, "bin", "spike") if _RISCV else "spike"
+PK = os.path.join(_RISCV, "riscv64-unknown-elf", "bin", "pk") if _RISCV else "pk"
 # rv64gc + V (vector). Use lp64d ABI for fp.
 ISA = "rv64gcv_zicsr_zifencei"
 ABI = "lp64d"

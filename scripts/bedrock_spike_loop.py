@@ -29,10 +29,22 @@ from pipeline.bedrock_client import BedrockClient
 # This is REQUIRED because the AlgorithmCandidate descriptions emit
 # OPMVINBCAST / VOPACC / VMV_VR (OPU) and gemmini RoCC ops; the stock
 # spike traps these as illegal instructions.
-CHIPYARD_ROOT = "/scratch2/agustin/chipyard"
-RISCV_GCC = "/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-elf-gcc"
-SPIKE_HETERO = "/scratch2/agustin/merlin/build_tools/spike-hetero/spike-hetero"
-PK        = "/scratch2/agustin/chipyard/.conda-env/riscv-tools/riscv64-unknown-elf/bin/pk"
+#   CHIPYARD_ROOT               the chipyard checkout (required)
+#   RISCV                       its riscv-tools prefix
+#                               (default: $CHIPYARD_ROOT/.conda-env/riscv-tools)
+#   MODELBLASTER_HETERO_SPIKE   the spike-hetero binary (default: spike-hetero on PATH)
+def _require_env(name: str, what: str) -> str:
+    v = os.environ.get(name)
+    if not v:
+        raise SystemExit(f"set {name} to {what}")
+    return v
+
+
+CHIPYARD_ROOT = _require_env("CHIPYARD_ROOT", "the chipyard checkout")
+_RISCV = os.environ.get("RISCV") or os.path.join(CHIPYARD_ROOT, ".conda-env", "riscv-tools")
+RISCV_GCC = os.path.join(_RISCV, "bin", "riscv64-unknown-elf-gcc")
+SPIKE_HETERO = os.environ.get("MODELBLASTER_HETERO_SPIKE", "spike-hetero")
+PK        = os.path.join(_RISCV, "riscv64-unknown-elf", "bin", "pk")
 # rv64gcv_zicntr matches the spike-hetero default (counters needed for
 # the perf-counter MMIO some test harnesses use).
 # For Saturn-OPU: varch must be vlen=512 elen=64 to get OPU dim=64.

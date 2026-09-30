@@ -38,9 +38,11 @@ import sys
 from pathlib import Path
 
 
-REPO_ROOT = Path("/scratch2/agustin/ModelBlaster")
-XPURT_ROOT = Path("/scratch2/agustin/XPU-RT")
-PY = "/scratch2/agustin/miniforge3/envs/merlin-dev/bin/python"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT_ROOT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
+# interpreter for XPU-RT's scheduler (same lookup as scripts/decision_loop.py)
+PY = os.environ.get("PY") or os.environ.get("XPURT_PY") or sys.executable
 
 
 def _dispatch_graph_path_for_network(networks_json: Path,

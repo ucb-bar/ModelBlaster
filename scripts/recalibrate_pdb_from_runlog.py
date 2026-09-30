@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import shutil
 import sys
 from pathlib import Path
 
-PDB_ROOT = Path("/scratch2/agustin/XPU-RT/zephyr-chipyard-sw/gen/profile/sweep_v8")
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT_ROOT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
+PDB_ROOT = XPURT_ROOT / "zephyr-chipyard-sw" / "gen" / "profile" / "sweep_v8"
 BACKEND_TO_PDB = {"gemmini_q31": "gemmini_q31", "rvv_opu": "V256D128_rvv"}
 
 # PDB CSV layout: <backend>/firesim_rocket_saturn/<net>/<net>.int8/

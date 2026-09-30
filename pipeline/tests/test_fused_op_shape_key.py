@@ -34,7 +34,7 @@ import sys
 import unittest
 
 # `src` FIRST, then the repo root. The venv carries an editable install that
-# resolves `modelblaster` to a SIBLING clone at /scratch2/agustin/ModelBlaster,
+# can resolve `modelblaster` to a SIBLING clone of this repo elsewhere on disk,
 # so importing without this runs that checkout's generate_skeleton and the
 # assertions below silently describe the wrong tree -- which is exactly how the
 # first version of this test "failed" against a fix that was already applied.

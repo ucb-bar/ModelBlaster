@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
-_XPURT = Path("/scratch2/agustin/XPU-RT")
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+_XPURT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
 
 # Make pipeline imports work without modifying sys.path globally.
 sys.path.insert(0, str(_REPO))
@@ -80,9 +82,9 @@ def _scan_registry() -> list[dict]:
 
 
 _NETWORK_TO_IR = {
-    "mlp_control": "/scratch2/agustin/ModelBlaster/examples/mlp_control/fp32/generated/graph.json",
-    "dronet": "/scratch2/agustin/ModelBlaster/examples/dronet/int8/generated/graph.json",
-    "yolov8_nano": "/scratch2/agustin/ModelBlaster/examples/yolov8_nano_64/int8/generated/graph.json",
+    "mlp_control": str(_REPO / "examples/mlp_control/fp32/generated/graph.json"),
+    "dronet": str(_REPO / "examples/dronet/int8/generated/graph.json"),
+    "yolov8_nano": str(_REPO / "examples/yolov8_nano_64/int8/generated/graph.json"),
 }
 
 

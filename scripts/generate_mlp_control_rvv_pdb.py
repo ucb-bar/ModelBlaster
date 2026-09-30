@@ -20,6 +20,7 @@ same schema as existing rvv PDBs (e.g. dronet, yolov8_nano).
 from __future__ import annotations
 
 import csv
+import os
 import re
 import shutil
 import sys
@@ -28,7 +29,10 @@ from pathlib import Path
 NET = "mlp_control"
 QUANT = "fp32"
 
-PDB_ROOT = Path("/scratch2/agustin/XPU-RT/zephyr-chipyard-sw/gen/profile/sweep_v8")
+REPO = Path(__file__).resolve().parents[1]
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT_ROOT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
+PDB_ROOT = XPURT_ROOT / "zephyr-chipyard-sw" / "gen" / "profile" / "sweep_v8"
 GEMMINI_PDB = (PDB_ROOT / "gemmini_q31" / "firesim_rocket_saturn" / NET / f"{NET}.{QUANT}"
                / f"{NET}_firesim_rocket_saturn_gemmini_q31_{NET}.{QUANT}" / "topo_0"
                / "results.csv")
@@ -38,14 +42,14 @@ RVV_PDB = (PDB_ROOT / "V256D128_rvv" / "firesim_rocket_saturn" / NET / f"{NET}.{
 
 # Older alt-path PDB used as fallback for any did not measured under rvv_opu
 # in the v20b run (e.g. dispatch_0 which v20b routed to gemmini_q31).
-ALT_RVV_PDB = Path(
-    "/scratch2/agustin/XPU-RT/gen/profile/V256D128_rvv/firesim_rocket_saturn/"
+ALT_RVV_PDB = XPURT_ROOT / (
+    "gen/profile/V256D128_rvv/firesim_rocket_saturn/"
     f"{NET}/{NET}.{QUANT}/"
     f"{NET}_firesim_rocket_saturn_RVV_{NET}.{QUANT}/topo_0/results.csv"
 )
 
-RUNLOG = Path("/scratch2/agustin/ModelBlaster/artifacts/runtime_optimization/"
-              "v20b_transpose_elim_retry/run.log")
+RUNLOG = REPO / ("artifacts/runtime_optimization/"
+                 "v20b_transpose_elim_retry/run.log")
 
 FIELDNAMES = ["dispatch_id", "module_name", "vmfb_path", "mlir_path",
               "mean_time", "mean_unit", "mean_time_ns", "returncode",

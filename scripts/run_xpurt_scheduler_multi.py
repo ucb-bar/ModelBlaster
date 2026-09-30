@@ -339,7 +339,7 @@ def _emit_fixture(workload, t, alpha, instance_meta, machines, cfg, out_path: pa
     if os.environ.get("XPURT_NO_AUTOMERGE", "0") not in ("1", "true", "True"):
         try:
             import sys as _sys
-            _sys.path.insert(0, "/scratch2/agustin/XPU-RT/xpu-rt")
+            _sys.path.insert(0, str(XPURT_PKG))
             from automerge import automerge_adjacent, automerge_savings
             before = fixture
             fixture = automerge_adjacent(fixture, max_gap_us=50.0,

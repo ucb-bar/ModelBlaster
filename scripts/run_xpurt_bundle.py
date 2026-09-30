@@ -261,13 +261,22 @@ def _find_uartlog(stdout_log: Path, job_started_at: float) -> Path | None:
     """
     import re
     text = stdout_log.read_text(errors="replace") if stdout_log.is_file() else ""
-    results_root = Path("/scratch2/agustin/chipyard/sims/firesim/deploy/results-workload")
-
     m = re.search(r"firesim: reading per-run uartlog at (\S+)", text)
     if m:
         p = Path(m.group(1))
         if p.is_file():
             return p
+
+    # Strategies 2 and 3 search the results tree of the firesim install:
+    # $FIRESIM_ROOT, else $CHIPYARD_ROOT/sims/firesim.
+    _firesim_root = os.environ.get("FIRESIM_ROOT") or (
+        os.path.join(os.environ["CHIPYARD_ROOT"], "sims", "firesim")
+        if os.environ.get("CHIPYARD_ROOT") else None)
+    if not _firesim_root:
+        print("warning: set FIRESIM_ROOT (or CHIPYARD_ROOT) so the uartlog can be "
+              "found under <firesim>/deploy/results-workload", file=sys.stderr)
+        return None
+    results_root = Path(_firesim_root) / "deploy" / "results-workload"
 
     m = re.search(r"job_id=(\d+)", text)
     if m:

@@ -5,9 +5,16 @@ Loads the deployable v12 CNN checkpoint into ``FusedSensorNet(vision_encoder=
 exposes the two single-input feed-forward sub-branches (vision, depth) as plain
 conv/relu/linear wrappers that ModelBlaster can lower like DroNet.
 
-The collaborator's files under /scratch/agustin are NOT modified; we only add
-their directory to sys.path so ``fused_model`` and its ``ViTsubmodules`` import
-resolve.
+The collaborator's files (the separate ``vitfly`` checkout) are NOT modified; we
+only add their directory to sys.path so ``fused_model`` and its
+``ViTsubmodules`` import resolve.
+
+Paths:
+  MODELBLASTER_VITFLY_MODELS  the ``vitfly/models`` directory holding
+                              ``fused_model.py`` (required; no default).
+  MODELBLASTER_FUSED_CKPT     the checkpoint (default: the XPU-RT superproject's
+                              ``sims/models/warehouse/nav_fused_v12_cnn.pt``,
+                              the same bytes as the v12 CNN ``best.pt``).
 """
 
 from __future__ import annotations
@@ -15,26 +22,36 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-_VITFLY_MODELS = "/scratch/agustin/projects/DIMA/vitfly/models"
-_FUSED_SRC = os.path.join(_VITFLY_MODELS, "fused_model.py")
-_CKPT = (
-    "/scratch/agustin/projects/DIMA/train_out/"
-    "fused_bc_warehouse_v12_mixed_cnn/2026-08-03_19-51-49/best.pt"
-)
+# ModelBlaster is a submodule of XPU-RT: models/ -> ModelBlaster/ -> XPU-RT/.
+_XPURT_ROOT = Path(__file__).resolve().parents[2]
+_CKPT = str(_XPURT_ROOT / "sims" / "models" / "warehouse" / "nav_fused_v12_cnn.pt")
+
+
+def _vitfly_models() -> str:
+    d = os.environ.get("MODELBLASTER_VITFLY_MODELS", "")
+    if not d:
+        raise RuntimeError(
+            "set MODELBLASTER_VITFLY_MODELS to the vitfly checkout's models/ "
+            "directory (the one holding fused_model.py)")
+    return d
 
 
 def _load_fused_module():
     # fused_model.py does `from ViTsubmodules import ...` unconditionally, so the
     # collaborator's models dir must be importable.
-    if _VITFLY_MODELS not in sys.path:
-        sys.path.insert(0, _VITFLY_MODELS)
-    spec = importlib.util.spec_from_file_location("fused_model", _FUSED_SRC)
+    vitfly_models = _vitfly_models()
+    fused_src = os.path.join(vitfly_models, "fused_model.py")
+    if vitfly_models not in sys.path:
+        sys.path.insert(0, vitfly_models)
+    spec = importlib.util.spec_from_file_location("fused_model", fused_src)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load fused_model from {_FUSED_SRC}")
+        raise RuntimeError(f"could not load fused_model from {fused_src} "
+                           "(check MODELBLASTER_VITFLY_MODELS)")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

@@ -4,6 +4,9 @@
 # instance at a time (no scratchpad/weight cache thrashing).
 cd "$(dirname "$0")/.."
 source scripts/setup_benchmark_env.sh >/dev/null 2>&1 || true
+# FireSim results tree the queue writes uartlogs under (setup_benchmark_env.sh
+# derives FIRESIM_ROOT from CHIPYARD_ROOT when it is not set).
+FIRESIM_RESULTS="${FIRESIM_ROOT:?set FIRESIM_ROOT (or CHIPYARD_ROOT) to the firesim install, e.g. \$CHIPYARD_ROOT/sims/firesim}/deploy/results-workload"
 export FIRESIM_QUEUE=1
 export RUNNER="firesim"
 export FIRESIM_QUEUE_TIMEOUT="3600"
@@ -40,10 +43,10 @@ echo "  rc=$rc at $(date +%T)" | tee -a "$LOG"
 JOB_ID=$(grep -oE 'job_id=([0-9]+)' "$RESULTS_DIR/run_stdout.log" | head -1 | cut -d= -f2)
 Q_UART=""
 if [[ -n "$JOB_ID" ]]; then
-  Q_UART=$(find /scratch2/agustin/chipyard/sims/firesim/deploy/results-workload \
+  Q_UART=$(find "$FIRESIM_RESULTS" \
                 -path "*-q${JOB_ID}/*" -name 'uartlog' 2>/dev/null | head -1)
 fi
-[[ -z "$Q_UART" ]] && Q_UART=$(find /scratch2/agustin/chipyard/sims/firesim/deploy/results-workload \
+[[ -z "$Q_UART" ]] && Q_UART=$(find "$FIRESIM_RESULTS" \
                 -name 'uartlog' -newer "$RESULTS_DIR" 2>/dev/null | head -1)
 if [[ -n "$Q_UART" ]]; then
   cp "$Q_UART" "$RESULTS_DIR/uartlog"

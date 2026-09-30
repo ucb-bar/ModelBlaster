@@ -1,7 +1,10 @@
-import csv, sys, shutil
+import csv, os, sys, shutil
 from pathlib import Path
-UART = Path("/scratch2/agustin/ModelBlaster/artifacts/audit/firesim_yolov8_gemmini.uartlog")
-PDB_ROOT = Path("/scratch2/agustin/XPU-RT/zephyr-chipyard-sw/gen/profile/sweep_v8")
+REPO = Path(__file__).resolve().parents[1]
+UART = REPO / "artifacts/audit/firesim_yolov8_gemmini.uartlog"
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT_ROOT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
+PDB_ROOT = XPURT_ROOT / "zephyr-chipyard-sw" / "gen" / "profile" / "sweep_v8"
 measured = {}
 for line in UART.read_text().splitlines():
     if line.startswith(("gemmini_q31,", "rvv_opu,")):

@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[1]
-XPURT = Path("/scratch2/agustin/XPU-RT")
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+XPURT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
 
 
 def _render_predicted(fixture: Path, out: Path, deadline_ms: float | None,

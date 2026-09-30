@@ -32,7 +32,8 @@ import sys
 import time
 from pathlib import Path
 
-_XPURT = Path("/scratch2/agustin/XPU-RT")
+# XPU-RT checkout: $XPURT_ROOT, else the superproject this submodule sits in.
+_XPURT = Path(os.environ.get("XPURT_ROOT") or Path(__file__).resolve().parents[2])
 sys.path.insert(0, str(_XPURT))
 sys.path.insert(0, str(_XPURT / "xpu-rt"))
 

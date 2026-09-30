@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash scripts/run_bundle_firesim.sh \
-#       --batch /scratch2/agustin/XPU-RT/artifacts/iterate/firesim_batch.json \
+#       --batch "$XPURT_ROOT/artifacts/iterate/firesim_batch.json" \
 #       --out-dir artifacts/bundle \
 #       [--include baseline,A2]      # restrict to specific candidate ids
 #       [--runner firesim]           # firesim (default) | spike

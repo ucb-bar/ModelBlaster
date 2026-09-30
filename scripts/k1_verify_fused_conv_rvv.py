@@ -42,10 +42,7 @@ from modelblaster.pipeline.reference_kernels import (  # noqa: E402
     CONV2D_BATCHNORM2D_S8, CONV2D_BATCHNORM2D_SILU_S8,
 )
 
-CROSS = os.environ.get(
-    "CROSS",
-    "/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-",
-)
+CROSS = os.environ.get("CROSS", "riscv64-unknown-linux-gnu-")   # toolchain prefix; on PATH unless set
 HOST = os.environ.get("MODELBLASTER_K1_HOST", "k1")
 REMOTE_ROOT = os.environ.get("MODELBLASTER_K1_REMOTE_ROOT", "/root/mb_k1")
 MARCH = ["-march=rv64gcv_zvl256b", "-mabi=lp64d"]
