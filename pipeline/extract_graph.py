@@ -1325,11 +1325,46 @@ def extract_int8(
         print(f"[extract_int8] calibrated across "
               f"{1 + len(extra)} samples", flush=True)
 
+    # MB_INPUT_MAX_ABS pins the calibration range of the int8 GRAPH INPUTS
+    # (placeholders; no intermediate tensor, no float-surface input) instead
+    # of measuring it, so the input scale is a contract rather than a property
+    # of the calibration set: a deployment that feeds q = pixel - 128 needs
+    # max_abs 1.0 (scale exactly 1/127) whatever frames calibrated the rest.
+    # Unset or empty by default: the measured range is used, unchanged.
+    _pin_in = os.environ.get("MB_INPUT_MAX_ABS", "")
+    if _pin_in:
+        try:
+            _pin = float(_pin_in)
+        except ValueError:
+            raise SystemExit(f"MB_INPUT_MAX_ABS={_pin_in!r} is not a number")
+        if not (np.isfinite(_pin) and _pin > 0.0):
+            raise SystemExit(
+                f"MB_INPUT_MAX_ABS={_pin_in!r} must be finite and > 0")
+        for nm in input_node_names:
+            if input_dtype_map.get(nm, "i8") != "i8":
+                continue
+            print(f"[extract_int8] input {nm}: max_abs pinned "
+                  f"{max_abs[nm]:.9g} -> {_pin:.9g} (MB_INPUT_MAX_ABS)",
+                  flush=True)
+            max_abs[nm] = _pin
+
     scales: dict[str, float] = {
         k: max(v, 1e-8) / _INT8_RANGE for k, v in max_abs.items()
     }
 
     tensors_meta: dict[str, dict] = {}
+
+    def _alias_fused_relu_scale(relu_name: str, producer_scale: float) -> None:
+        """A ReLU absorbed into its producer (conv / bn / linear) holds data
+        written at the PRODUCER's output scale. Consumers look up
+        scales[<relu>] as their in_scale, and the ReLU node was calibrated on
+        its own (positive-only) range, so alias both the scale and the meta's
+        quant copy to the producer's, exactly as add->relu does. Without it a
+        consumer rescales the true value by relu_scale/producer_scale."""
+        scales[relu_name] = producer_scale
+        tensors_meta[relu_name]["quant"] = dict(
+            tensors_meta[relu_name]["quant"], scale=producer_scale)
+
     weights_blob: dict[str, np.ndarray] = {}
     # fp32 copies of every quantized weight, kept so that an op promoted to
     # fp16 (mixed precision, `fp16_op_names`) can re-store its weights as
@@ -1605,10 +1640,17 @@ def extract_int8(
                     # which is now the linear+relu output.
                     if next_node.name not in tensors_meta:
                         tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                    _alias_fused_relu_scale(next_node.name, out_scale)
 
             elif isinstance(mod, torch.nn.ReLU):
                 if node.name in fused_relu_after:
                     continue  # absorbed
+                # relu_s8 is max(x, 0) on the int8 codes: its output IS at
+                # the input's scale (as relu6 below). The node's own
+                # calibrated scale (positive range only) must not reach the
+                # consumer, which would rescale the true value by
+                # relu_scale / in_scale.
+                scales[node.name] = scales[in_name]
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[in_name]["shape"]))
                 ops.append({
@@ -1902,11 +1944,13 @@ def extract_int8(
                     "shape": shape,
                     "quant": quant,
                 })
-                if fuse_relu and next_node.name not in tensors_meta:
+                if fuse_relu:
                     # Relu alias: shape is UNCHANGED by relu, so copying the
                     # conv's whole tensors_meta entry (shape + scale) is
                     # exact.
-                    tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                    if next_node.name not in tensors_meta:
+                        tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                    _alias_fused_relu_scale(next_node.name, out_scale)
                 elif fuse_pool and next_node.name not in tensors_meta:
                     # Pool alias: UNLIKE relu, pool changes shape (that's
                     # the whole point) — must NOT blindly copy the conv's
@@ -2037,8 +2081,10 @@ def extract_int8(
                         "activation_max": 127,
                     },
                 })
-                if fuse_relu and next_node.name not in tensors_meta:
-                    tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                if fuse_relu:
+                    if next_node.name not in tensors_meta:
+                        tensors_meta[next_node.name] = dict(tensors_meta[node.name])
+                    _alias_fused_relu_scale(next_node.name, scales[node.name])
 
             elif isinstance(mod, torch.nn.Sigmoid):
                 _record(node.name, dtype="i8")
@@ -2394,6 +2440,7 @@ def extract_int8(
                 in_name = node.args[0].name
                 if node.name in fused_relu_after:
                     continue
+                scales[node.name] = scales[in_name]   # relu_s8 keeps scale
                 _record(node.name, dtype="i8")
                 n = int(np.prod(tensors_meta[in_name]["shape"]))
                 ops.append({
