@@ -85,8 +85,15 @@ MB_SLOT_CHECK <slot> rel_err=<e> ok=<0|1>                      every op alone on
 MB_PARTITION_US <us> reps=<n>                                  CUDA events, whole partition
 MB_SLOT_US <slot> <us>                                         CUDA events per op, summed per slot
 MB_OP_US <op name> <us>                                        CUDA events per op instance
+MB_PHASE_MS <phase> <ms>                                       wall time per driver phase
 passed | failed
 ```
+
+Run modes (environment; [gpu_harness_perf.md](gpu_harness_perf.md)): `MB_ONLY_SLOTS=a,b`
+limits the isolated checks to those slots' ops (KernelBlaster's one-slot candidates; the
+partition is always checked and timed), `MB_SCREEN=1` shortens the timing budgets, and
+`MB_GRAPH=1` (kernels built with `--default-stream per-thread`) adds `MB_PARTITION_GRAPH_US`,
+the partition replayed as a CUDA graph.
 
 Output bound: `err <= output_rel * max|finite ref| + output_abs` (1e-3, 1e-5, as the Level2/3
 gates). Isolated bound: `max err <= slot_rel * max(|finite inputs|, |finite ref|) + slot_abs`
