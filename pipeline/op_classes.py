@@ -3,7 +3,9 @@
 KernelBlaster shares implementations and lessons between kernels of the same
 class (a tiled-GEMM trick learned on `linear` applies to `bmm`), so every op
 an exported problem contains is tagged with one class. Unknown ops are
-"other"; the int8/fp16 variants take their base op's class.
+"other"; the int8/fp16 variants take their base op's class, and a fused op
+(``fused__<k0>__...``) its first stage's -- the producer whose kernel the
+epilogue joins.
 """
 from __future__ import annotations
 
@@ -34,6 +36,8 @@ _BY_OP = {op: c for c, ops in _CLASS.items() for op in ops}
 
 
 def op_class(op: str) -> str:
+    if op.startswith("fused__"):
+        op = op.split("__")[1]
     for suffix in ("_f16", "_s8_pc", "_s8", "_i8"):
         if op.endswith(suffix) and op not in _BY_OP:
             op = op[: -len(suffix)]
