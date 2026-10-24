@@ -195,8 +195,44 @@ def _have_gpu() -> bool:
         return False
 
 
+ARGMAX_MODEL = '''import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(64, 32)
+    def forward(self, x):
+        return torch.argmax(torch.selu(self.fc(x)), dim=1)
+def get_inputs():
+    return [torch.randn(8, 64)]
+def get_init_inputs():
+    return []
+'''
+
+
 @unittest.skipUnless(_have_gpu(), "needs torch, nvcc and a CUDA GPU")
 class EndToEndTest(unittest.TestCase):
+    def test_int64_argmax_output(self):
+        """argmax writes int64 indices: an i64 buffer end to end."""
+        from modelblaster.pipeline.kb_export import build_and_run, export_problem
+
+        root = Path(__file__).resolve().parents[3]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "am.py").write_text(ARGMAX_MODEL)
+            cp = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.extract_graph", "--bench-file",
+                                 str(d / "am.py"), "--out-dir", str(d / "ir"), "--quant", "fp32"],
+                                cwd=root, capture_output=True, text=True, timeout=600,
+                                env={**__import__("os").environ, "PYTHONPATH": str(root)})
+            self.assertEqual(cp.returncode, 0, cp.stderr[-2000:])
+            prob = export_problem(d / "ir", d / "prob")
+            man = json.loads((prob / "manifest.json").read_text())
+            self.assertIn("i64", {b["dtype"] for b in man["buffers"]})
+            arch = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                                  capture_output=True, text=True).stdout.split()[0].replace(".", "")
+            res = build_and_run(prob, arch=arch)
+            self.assertTrue(res["passed"], res.get("log"))
+
     def test_extract_export_build_run(self):
         from modelblaster.pipeline.kb_export import assemble, build_and_run, export_problem
 
