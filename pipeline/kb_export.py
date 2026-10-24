@@ -405,8 +405,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     order = boundary + [t for t in produced if t not in boundary]
     for t in order:                              # bases before aliases
         if t not in alias_of:
-            dtype = _tensor_dtype(ir, t) if tgt is None else tgt.buffer_dtype(tensors.get(t, {}), _tensor_dtype(ir, t))
-            add_buf(t, kind=kind_of(t), dtype=dtype,
+            add_buf(t, kind=kind_of(t), dtype=_tensor_dtype(ir, t),
                     numel=int(np.prod(ir.tshape(t))), alias=None)
     for t in order:
         if t in alias_of:

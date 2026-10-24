@@ -74,9 +74,6 @@ class OpenCLTarget:
             return lib.fused_seed(spec), "fused-seed"
         return lib.slot_source(entry), lib.origin(entry)
 
-    def buffer_dtype(self, tensor: dict, default: str) -> str:
-        return "i64" if tensor.get("dtype") == "i64" else default
-
     def head_source(self, lib) -> str:
         return "// OpenCL runtime shared by every slot (gpu_eval/harness/opencl/mb_opencl_runtime.h).\n" \
             + RUNTIME_H.read_text()
