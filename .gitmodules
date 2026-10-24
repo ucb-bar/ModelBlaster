@@ -1,4 +1,4 @@
 [submodule "third_party/KernelBlaster"]
 	path = third_party/KernelBlaster
 	url = git@github.com:kris-dong/KernelBlaster.git
-	branch = backend-refactor
+	branch = feat/multislot
