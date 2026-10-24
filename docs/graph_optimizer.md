@@ -343,6 +343,11 @@ python -m modelblaster.pipeline.graph_hints show H
 STRATEGY=plan bash gpu_eval/tools/kb_loop.sh IR W        # one round
 ```
 
+To make the LLM calls on another machine, set `KB_LLM_SERVER_URL=http://127.0.0.1:18080` and
+`KB_LLM_SERVER_TOKEN_FILE=...` before starting the run. This uses an `ssh -L` tunnel to a
+KernelBlaster `llm_server` running there. The KB subprocesses inherit the variables (KernelBlaster
+`docs/llm_server.md`).
+
 ## Validation (local TITAN RTX sm_75, shared with another process: timings vary ~±10 %)
 
 - **Unit tests** (pure python): `pipeline/tests/test_graph_hints.py` (15: chain names and
