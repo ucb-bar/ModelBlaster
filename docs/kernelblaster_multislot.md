@@ -46,6 +46,7 @@ fused variant problem → KernelBlaster → accept/reject (fusion_registry.json)
 | MB | `pipeline/op_classes.py` | op → class (gemm, conv, reduction, elementwise, data_movement, attention, scan, other) |
 | MB | `gpu_eval/harness/walk_torch.py` | reference values (torch IR walk; runs fused ops' `sub_ops`) |
 | MB | `gpu_eval/tools/kb_loop.sh` | the round above |
+| MB | `pipeline/kb_telemetry.py` | graph-optimiser telemetry: loads KB's `telemetry` package, rolls up KB runs |
 | KB | `data/sources/modelblaster_source.py` | `ModelBlasterSource` ("modelblaster"); `Problem.slots` |
 | KB | `knowledge/slots.py` | `SlotProblem`, assembly, driver-output parsing, `LocalEvaluator`, `ServerEvaluator` |
 | KB | `knowledge/impl_store.py` | implementation knowledgebase |
@@ -53,6 +54,7 @@ fused variant problem → KernelBlaster → accept/reject (fusion_registry.json)
 | KB | `agents/opt_multislot.py` | the slot-wise RL agent, roofline state, technique bandit, fusion proposals |
 | KB | `agents/utils/agentic_llm.py` | `claude-code:<model>` / `stub:<name>` LLM providers |
 | KB | `scripts/run_multislot.py` | runner |
+| KB | `telemetry/`, `scripts/telemetry_report.py` | token / time telemetry, `telemetry.jsonl` report |
 
 ## Problem format (`mb-kb-problem/1`)
 
@@ -202,6 +204,68 @@ Every LLM call goes through KernelBlaster's `generate_code`. Two keyless prefixe
 `claude-code:<model>` runs the Claude Code CLI headless (`claude -p`, tools disabled) on the
 logged-in account, and `stub:<name>` calls a registered Python function (tests). Moving to API
 keys is a model-name change (`--model`, `--reflect-model`).
+
+## Telemetry
+
+KernelBlaster records, for every LLM call:
+
+- input / cache / output tokens;
+- the stop reason, flagging truncation at `max_tokens`;
+- latency, retries and cost, by role (`codegen_simple`, `codegen_hard`, `fix`, `reflect`, `upkeep`, `hypothesis`)
+  and model.
+
+It also records where each step's wall clock goes:
+
+- prompt building and waiting for the LLM;
+- the compile-slot queue vs nvcc, build-cache hits;
+- the GPU-lease wait;
+- the driver's own phases from `MB_PHASE_MS` (CUDA init, partition / op checks, timing loops), NCU;
+- knowledge lookup / record / reflection, I/O.
+
+The results go to these places:
+
+- each step's `context.telemetry` in `result.json`;
+- the problem's `telemetry`;
+- a run-level `{"telemetry": ...}` entry in `summary.json`;
+- `OUT/telemetry.jsonl`.
+
+`KB_TELEMETRY=0` turns it off. The details are in KernelBlaster's `docs/telemetry.md`.
+
+ModelBlaster's graph optimiser (`pipeline/kb_graph_opt.py`, via `pipeline/kb_telemetry.py`) adds its own spans:
+
+| span | what |
+|---|---|
+| `mb.run` | the whole run |
+| `mb.round` | a round, with laps `mb.profile`, `mb.propose`, `mb.plan`, `mb.export`, `mb.kb_wait` (the plan's KernelBlaster run), `mb.ingest`, `mb.decide` |
+| `mb.prepare` | inside decide: exporting each hint's original and variant problems |
+| `mb.kb_wait` | inside decide: waiting for a wave's KernelBlaster run |
+| `mb.remeasure` | inside decide: re-timing, in the worker threads |
+| `mb.finish` | inside decide: decisions and ingest |
+| `mb.verify` | the final model-level verification |
+
+These go to `WORK/telemetry.jsonl`.
+
+`round.json` and `summary.json` get a `telemetry` entry with two parts:
+
+- `mb`: ModelBlaster's own breakdown and derived metrics;
+- `kb`: the sum over that round's (or the whole run's) KernelBlaster runs, read from each run's `summary.json`.
+  It has wall clocks, time by category, LLM totals and per role/model, truncations, `usd_per_win` and
+  `tokens_per_win`.
+
+Running and reading it:
+
+- **Report.** `python <KB>/scripts/telemetry_report.py WORK` prints the tables for ModelBlaster and every
+  KernelBlaster run under `WORK`.
+- **Where the code comes from.** ModelBlaster loads the span machinery from the KernelBlaster checkout it drives
+  (`--kb`): a stdlib-only package, under a private module name.
+- **Older checkouts.** A checkout without it, or `KB_TELEMETRY=0`, gives a no-op and the flow is unchanged.
+
+One live round on the ResNet basic block (Haiku 5.5, local TITAN RTX, 2 rollouts × 4 steps) took 202 s:
+
+- **ModelBlaster.** `mb.kb_wait` 164 s, `mb.profile` 21 s, `mb.verify` 16 s.
+- **Inside the 158 s KernelBlaster run.** 69 % waiting for the LLM, 25 % nvcc, under 2 % each for CUDA init,
+  checks, timing loops and GPU queueing.
+- **Cost.** 9 calls, 36 k input / 46 k output tokens, est. $0.27, $0.13 per accepted win.
 
 ## Design decisions
 
