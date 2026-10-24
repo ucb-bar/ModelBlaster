@@ -31,14 +31,17 @@ KernelBlaster knowledge carry over between rounds and runs):
    fixpoint), or after ``rounds``.
 
 Finally every IR is verified at model level with everything applied
-(``kb_ingest.verify_ir``) and ``summary.json`` lists first vs final times.
+(``kb_ingest.verify_ir``), the model's result is timed through KernelBlaster's
+evaluator on the runs' pool and GPU model (``kb_model_run``), and
+``summary.json`` lists first vs final times.
 
     python -m modelblaster.pipeline.kb_graph_opt IR_DIR [...] --work W --kb KB_CHECKOUT \\
         [--model claude-code:sonnet] [--plugin stubs.py] [--rounds 4] \\
         [--coverage 0.8 --top-k 6] [--rollouts 2 --steps 4 --variant-steps 3] \\
         [--max-variants 3 --remeasure 5 --accept-gain 0.03] [--arch 75] \\
         [--parallel-hints auto|N] [--gpus auto|all|0,2] \\
-        [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]]
+        [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]] \\
+        [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch]
 
 Work dir: ``graph_hints.json`` (modelblaster.graph_hints/v1), ``cache/``
 (mb-cuda-cache/1), ``knowledge/`` (KernelBlaster), ``state.json``,
@@ -101,11 +104,17 @@ class Config:
     cuda_visible_devices: list = field(default_factory=list)
     ssh_key: str | None = None
     remote_dir: str | None = None
+    # KernelBlaster's runtime (run_multislot / time_problems --runtime): auto | host | process
+    runtime: str = "auto"
+    # the GPU model every timing must run on (default: the model the KernelBlaster runs recorded);
+    # allow_gpu_mismatch: time anyway where it is not available (loud warnings)
+    gpu_model: str | None = None
+    allow_gpu_mismatch: bool = False
 
 
 _LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices")
 _MANUAL_FIELDS = ("kb", "model", "reflect_model", "python", "ssh_key", "remote_dir", "gpus", "parallel_hints",
-                  *_LIST_FIELDS)
+                  "runtime", "gpu_model", "allow_gpu_mismatch", *_LIST_FIELDS)
 
 
 def _safe(s: str) -> str:
@@ -171,7 +180,10 @@ class GpuLeases:
     another process's) wait instead of timing on it at the same time.
 
     ``devices``: [{"ident": UUID or index, "name": ...}]; empty = one
-    unpinned device (the environment's default GPU, no lock file)."""
+    unpinned device (the environment's default GPU, no lock file). A device
+    with a ``host`` (``--ssh-host``) is leased in this process only: the
+    KernelBlaster evaluator that times on it takes that host's GPU lock per
+    run (``lease_device``)."""
 
     def __init__(self, devices: list[dict] | None = None, *, lock_timeout: float = 3600.0):
         self.devices = list(devices) or [{"ident": None, "name": "default"}]
@@ -183,24 +195,32 @@ class GpuLeases:
 
     @contextlib.contextmanager
     def lease(self):
+        """-> the environment of the leased local GPU (``CUDA_VISIBLE_DEVICES``)."""
+        with self.lease_device() as dev:
+            ident = dev.get("ident")
+            yield {"CUDA_VISIBLE_DEVICES": str(ident)} if ident is not None else {}
+
+    @contextlib.contextmanager
+    def lease_device(self):
+        """-> the leased device dict (local: its KernelBlaster lock held)."""
         with self._cv:
             while len(self._busy) == len(self.devices):
                 self._cv.wait()
             i = min((k for k in range(len(self.devices)) if k not in self._busy),
                     key=lambda k: (self._last.get(k, 0.0), k))
             self._busy.add(i)
-        ident = self.devices[i].get("ident")
-        env = {"CUDA_VISIBLE_DEVICES": str(ident)} if ident is not None else {}
+        dev = self.devices[i]
+        ident = dev.get("ident")
         try:
             with contextlib.ExitStack() as stack:
-                if ident is not None and not _flock_off():
+                if ident is not None and not dev.get("host") and not _flock_off():
                     try:
                         stack.enter_context(_flock(gpu_lock_path(str(ident)), timeout=self.lock_timeout))
                     except PermissionError:            # another user's lock file: run unlocked, as KB does
                         pass
                 t0 = time.time()
                 try:
-                    yield env
+                    yield dev
                 finally:
                     self.log.append({"device": i, "t0": t0, "t1": time.time()})
         finally:
@@ -267,6 +287,7 @@ class KBRunner:
         self.cfg, self.knowledge = cfg, knowledge
         self.calls = 0
         self.telemetry: list = []                     # each run's run-level telemetry (kb_telemetry)
+        self.gpus: list = []                          # the GPU each problem's run recorded (kb_eval.recorded_gpus)
 
     def command(self, problems: list[Path], out: Path, *, steps: int | None = None,
                 winners: Path | None = None, parallel_problems: int | None = None) -> list[str]:
@@ -293,6 +314,10 @@ class KBRunner:
                 cmd += ["--remote-dir", c.remote_dir]
         elif c.gpus and c.gpus != "auto":
             cmd += ["--gpus", c.gpus]
+        if c.runtime and c.runtime != "auto":
+            cmd += ["--runtime", c.runtime]
+        if c.gpu_model:
+            cmd += ["--gpu-model", c.gpu_model]
         for p in c.plugins:
             cmd += ["--plugin", str(p)]
         return cmd
@@ -316,6 +341,8 @@ class KBRunner:
             r = read_result(out, Path(d)) or {"problem": problem_name(Path(d)), "final_ok": False}
             r["_dir"] = str(out / problem_name(Path(d)))
             self.calls += r.get("llm_calls", 0) or 0
+            if r.get("final_ok"):
+                self.gpus.append({"run": r["_dir"], "gpu": r.get("gpu"), "arch": r.get("arch")})
             res.append(r)
         self.telemetry.append(kbt.kb_run_summary(out))
         return res
@@ -525,15 +552,44 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     return job
 
 
+def kb_eval_for(cfg: Config):
+    """KernelBlaster's evaluator for ModelBlaster's own timings (the model run; re-measurement
+    over ssh) on the KernelBlaster runs' pool: ssh with ``ssh_hosts``, else local ``gpus``.
+    None when the checkout has no ``scripts/time_problems.py`` (an older pin)."""
+    from .kb_eval import KBEval
+
+    ev = KBEval(evaluator="ssh" if cfg.ssh_hosts else "local", kb=Path(cfg.kb), python=cfg.python, gpus=cfg.gpus,
+                ssh_hosts=list(cfg.ssh_hosts), cuda_visible_devices=list(cfg.cuda_visible_devices),
+                ssh_key=cfg.ssh_key, remote_dir=cfg.remote_dir, runtime=cfg.runtime)
+    return ev if ev.available() else None
+
+
 def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None) -> list | None:
     """Re-time both composite bests interleaved on one leased GPU ->
     [original times, variant times], or None (a side failed / no
-    re-measurement). Thread-safe: writes only under the job's problem dirs."""
+    re-measurement). Thread-safe: writes only under the job's problem dirs.
+
+    With ``ssh_hosts`` the leased GPU is a remote one (the KernelBlaster
+    runs' pool) and the runs go through KernelBlaster's ssh evaluator pinned
+    to it, on the GPU model the two runs recorded; locally, ModelBlaster's
+    own runs on the leased local GPU (its lock held)."""
     if not (ro.get("final_ok") and rv.get("final_ok")) or not cfg.remeasure:
         return None
-    lease = leases.lease() if leases is not None else None
-    return remeasure([(job["orig"], best_sources(Path(ro["_dir"]))), (job["variant"], best_sources(Path(rv["_dir"])))],
-                     arch=cfg.arch, reps=cfg.remeasure, lease=lease)
+    pair = [(job["orig"], best_sources(Path(ro["_dir"]))), (job["variant"], best_sources(Path(rv["_dir"])))]
+    ev = kb_eval_for(cfg) if cfg.ssh_hosts else None
+    if ev is None:
+        lease = leases.lease() if leases is not None else None
+        return remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, lease=lease)
+    from .kb_eval import recorded_gpus, required_hardware
+
+    hw = required_hardware(recorded_gpus([Path(ro["_dir"]), Path(rv["_dir"])]), gpu_model=cfg.gpu_model,
+                           arch=cfg.arch, allow_mismatch=cfg.allow_gpu_mismatch)
+    info: dict = {}
+    with (leases.lease_device() if leases is not None else contextlib.nullcontext(None)) as dev:
+        times = remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, kbeval=ev.for_device(dev),
+                          gpu_model=hw["gpu_model"], info=info, work=Path(job["variant"]).parent / "remeasure")
+    job["remeasure_device"] = info.get("device")
+    return times
 
 
 def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None, *, cache: CudaCache, doc: dict,
@@ -554,7 +610,8 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
         ok = bool(times and times[0] and times[1])
         if ok:
             ev.update(original_us=_median(times[0]), variant_us=_median(times[1]),
-                      remeasured={"original_us": times[0], "variant_us": times[1]})
+                      remeasured={"original_us": times[0], "variant_us": times[1],
+                                  **({"device": job["remeasure_device"]} if job.get("remeasure_device") else {})})
     if not ok:
         ev["why"] = ("KernelBlaster: " + ", ".join(f"{side} not final_ok ({r.get('error') or 'see result.json'})"
                                                    for side, r in (("original", ro), ("variant", rv))
@@ -682,7 +739,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     gpus = detect_gpus(cfg)
     n_gpus = len(gpus["remote"]) if cfg.ssh_hosts else len(gpus["local"])
     width = cfg.parallel_hints or auto_parallel_hints(n_gpus)
-    leases = GpuLeases(gpus["local"])
+    # MB's own timed runs (re-measurement) lease from the KernelBlaster runs' pool: remote with --ssh-host
+    leases = GpuLeases(gpus["remote"] if cfg.ssh_hosts else gpus["local"])
     state["gpus"] = {"pool": gpus, "parallel_hints": width}
     first = None
     T = kbt.get()
@@ -774,13 +832,18 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     first0 = state["rounds"][0]["partition_us"] if state["rounds"] else (first or {})
     # the model's result: the whole model on the final cache and hints, as deployed (CUDA graph
     # replay in the persistent runtime), against the hand-seeded original timed the same way
+    # -- through KernelBlaster's evaluator on the KernelBlaster runs' pool (local or ssh), on the GPU
+    # model those runs recorded (kb_eval), so the model and its components share the hardware
     from .kb_model_run import model_runtime
     models = {}
-    with T.span("mb.model_run"):
+    kbeval = kb_eval_for(cfg)
+    with T.span("mb.model_run", evaluator=kbeval.evaluator if kbeval else "builtin"):
         for d in irs:
             try:
                 models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
-                                                     hints=hints_path, arch=cfg.arch, specs=specs)
+                                                     hints=hints_path, arch=cfg.arch, specs=specs, kbeval=kbeval,
+                                                     gpu_model=cfg.gpu_model, recorded=kb.gpus,
+                                                     allow_gpu_mismatch=cfg.allow_gpu_mismatch)
             except Exception as e:                   # the verification above stands; report why
                 models[Path(d).name] = {"error": repr(e)}
     for name, v in final.items():
@@ -793,7 +856,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                               "cache_split": v.get("cache_split"),
                               "model_e2e_us": m.get("model_e2e_us"), "model_basis": m.get("model_basis"),
                               "seed_e2e_us": m.get("seed_e2e_us"), "model_speedup": m.get("speedup"),
-                              "model_passed": m.get("passed"), **({"model_error": m["error"]} if "error" in m else {})}
+                              "model_passed": m.get("passed"), "model_gpu": m.get("gpu_name"),
+                              "model_device": (m.get("device") or {}).get("label"),
+                              "model_hardware_match": (m.get("hardware") or {}).get("match"),
+                              **({"model_error": m["error"]} if "error" in m else {})}
     (work / "model_runtime.json").write_text(json.dumps(models, indent=1, default=str))
     tr = {"mb": kbt.compact(T.full_summary(run_span)), "kb": kbt.kb_rollup(kb.telemetry)}
     if tr["mb"] or tr["kb"]:
@@ -823,6 +889,12 @@ def main():
                     help="with --ssh-host: auto|ids, once for all hosts or once per host")
     ap.add_argument("--ssh-key")
     ap.add_argument("--remote-dir")
+    ap.add_argument("--runtime", choices=["auto", "host", "process"], default="auto",
+                    help="KernelBlaster runtime for its runs and ModelBlaster's timings through it")
+    ap.add_argument("--gpu-model", help="the GPU model every timing must use (default: what the KernelBlaster runs "
+                    "recorded), e.g. 'NVIDIA L40S'")
+    ap.add_argument("--allow-gpu-mismatch", action="store_true",
+                    help="time the model / re-measure even where no GPU of that model is available (warnings)")
     for k, v in asdict(Config(kb=Path("."))).items():
         if k in _MANUAL_FIELDS:
             continue
@@ -833,6 +905,7 @@ def main():
                  plugins=[str(Path(p).resolve()) for p in a.plugin], python=a.python,
                  parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
                  cuda_visible_devices=a.cuda_visible_devices, ssh_key=a.ssh_key, remote_dir=a.remote_dir,
+                 runtime=a.runtime, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
                  **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in _MANUAL_FIELDS})
     print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
 
