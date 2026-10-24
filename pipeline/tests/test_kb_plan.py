@@ -84,7 +84,7 @@ class CachePlanTest(unittest.TestCase):
         s0, s1 = [o["shape"] for o in g["ops"] if o["op"] == "conv2d"]
         with tempfile.TemporaryDirectory() as d:
             p = cache_plan(g, self._cache(d, [([s1], 1.0)]), "sm_75", K)
-            self.assertEqual(p["hints"][0]["groups"], [{"ops": ["conv1"], "cache": "w0"},
+            self.assertEqual(p["hints"][0]["groups"], [{"ops": ["conv1"], "cache": "w0", "as": "slot"},
                                                        {"ops": ["conv0"], "cache": None}])
             self.assertEqual(p["hints"][0]["source"][0]["by"], "mb-cache")
             self.assertEqual(p["sources"], {"conv2d__v0": "// winner 0\n"})
@@ -104,6 +104,23 @@ class CachePlanTest(unittest.TestCase):
             other = dict(conv_shape, IC=99)
             p = cache_plan(g2, self._cache(Path(d) / "x", [([other], 1.0)]), "sm_75", K)
             self.assertEqual(p["sub_sources"], {"fused__conv2d__batchnorm2d": {}})
+
+    def test_fused_slot_split_by_stage_winners(self):
+        """Fusing convs tuned per shape keeps each one's kernel: the fused slot
+        is split by which conv winner covers its first stage."""
+        from modelblaster.pipeline import graph_hints as gh
+        g = conv_block(2)
+        g2, _, _ = gh.apply_hints(g, [gh.fuse_hint("fused__conv2d__batchnorm2d", None, {}, "accepted")], K)
+        s0, s1 = [o["shape"] for o in g["ops"] if o["op"] == "conv2d"]
+        with tempfile.TemporaryDirectory() as d:
+            p = cache_plan(g2, self._cache(d, [([s0], 1.0), ([s1], 1.0)]), "sm_75", K)
+            self.assertEqual([gr["as"] for gr in p["hints"][0]["groups"]], ["stage", "stage"])
+            self.assertEqual(p["sub_sources"], {"fused__conv2d__batchnorm2d__v0": {"conv2d": "// winner 0\n"},
+                                                "fused__conv2d__batchnorm2d__v1": {"conv2d": "// winner 1\n"}})
+            # one winner covering both: no split, it seeds every instance
+            p = cache_plan(g2, self._cache(Path(d) / "y", [([s0, s1], 1.0)]), "sm_75", K)
+            self.assertEqual(p["hints"], [])
+            self.assertEqual(p["sub_sources"], {"fused__conv2d__batchnorm2d": {"conv2d": "// winner 0\n"}})
 
 
 if __name__ == "__main__":

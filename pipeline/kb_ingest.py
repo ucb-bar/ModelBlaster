@@ -138,13 +138,14 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
     ``split_slot`` hint (source ``mb-cache``) with one group per covering
     entry plus one for the rest (hand kernel), applied to the graph. Fused
     slots without an entry of their own get cached stage kernels guarded on
-    the stages' shapes (``sub_sources``) for their seed.
+    the stages' shapes (``sub_sources``) for their seed; a fused slot is also
+    split by which first-stage winner covers its instances, so fusing ops
+    whose kernels were tuned per shape keeps those kernels.
 
     -> {"graph", "sources" {slot id: code}, "tags", "used" {slot id: entry},
         "sub_sources" {fused slot id: {stage kind: code}}, "hints" [split hints]}"""
     from . import graph_hints as gh
-    from .kb_export import ALIAS_OPS, base_slot_id, slot_id_of
-
+    from .kb_export import ALIAS_OPS, slot_id_of
     from .kb_proposals import with_fused_specs
 
     g = gh.unique_names(json.loads(json.dumps(graph)))
@@ -162,6 +163,12 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
         return [e for e in cache.entries if e["entry"] == entry and e["signature_sha"] == signature_sha(sig)
                 and e["arch"] == arch and ir_name not in e["rejected"]]
 
+    def own_key(o):
+        return _shape_key(o.get("shape", {}))
+
+    def stage0_key(o):
+        return _shape_key(o["sub_ops"][0].get("shape", {}))
+
     src, tags, used, hints = {}, {}, {}, []
     for sid, ops in slots.items():
         entry, sig = entry_sig(ops[0]["op"])
@@ -171,29 +178,40 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
             continue
         if not split or any(o.get("slot_variant") for o in ops) or len(ops) < 2:
             continue
+        # covering candidates: the slot's own winners; for a fused slot also
+        # its first stage's (the dominant kernel), which seed it via sub_sources
+        cands = [(c, own_key, True) for c in usable(entry, sig)]
+        if "sub_ops" in ops[0]:
+            k0 = ops[0]["sub_ops"][0]["op"]
+            e0 = cache.lookup(*entry_sig(k0), arch, [o["sub_ops"][0].get("shape", {}) for o in ops], ir_name=ir_name)
+            if e0 is None:                                 # else every instance gets it as a stage seed
+                cands += [(c, stage0_key, False) for c in usable(*entry_sig(k0))]
         left, parts = list(ops), []
         while left:
-            def score(c):
-                n = sum(1 for o in left if _shape_key(o.get("shape", {})) in c["shape_guard"])
-                return (n, ir_name in c["model_verified"], -c["slot_us"])
-            cands = [c for c in usable(entry, sig) if score(c)[0]]
-            if not cands:
+            def score(cand):
+                c, key, own = cand
+                n = sum(1 for o in left if key(o) in c["shape_guard"])
+                return (n, own, ir_name in c["model_verified"], -c["slot_us"])
+            live = [x for x in cands if score(x)[0]]
+            if not live:
                 break
-            best = max(cands, key=score)
-            covered = [o for o in left if _shape_key(o.get("shape", {})) in best["shape_guard"]]
+            best = max(live, key=score)
+            covered = [o for o in left if best[1](o) in best[0]["shape_guard"]]
             parts.append((best, covered))
             left = [o for o in left if o not in covered]
-        if not parts:
-            continue
-        groups = [{"ops": [o["name"] for o in cov], "cache": c["impl_id"]} for c, cov in parts]
+        if not parts or (len(parts) == 1 and not left and not parts[0][0][2]):
+            continue                                       # one stage cover for all: plain sub_sources
+        groups = [{"ops": [o["name"] for o in cov], "cache": c["impl_id"], "as": "slot" if own else "stage"}
+                  for (c, _, own), cov in parts]
         if left:
             groups.append({"ops": [o["name"] for o in left], "cache": None})
         hints.append({"id": f"split:{sid}", "kind": "split_slot", "target": "cuda", "slot": sid,
                       "by": "cache", "groups": groups, "status": "accepted",
                       "source": [{"by": "mb-cache", "ir": ir_name}], "evidence": []})
-        for k, (c, _) in enumerate(parts):
-            src[f"{sid}__v{k}"], tags[f"{sid}__v{k}"], used[f"{sid}__v{k}"] = \
-                cache.code(c), f"cache:{c['impl_id']}", c
+        for k, ((c, _, own), _) in enumerate(parts):
+            if own:
+                src[f"{sid}__v{k}"], tags[f"{sid}__v{k}"], used[f"{sid}__v{k}"] = \
+                    cache.code(c), f"cache:{c['impl_id']}", c
     if hints:
         g, _, _ = gh.apply_hints(g, hints, specs)
     sub_sources: dict[str, dict[str, str]] = {}
