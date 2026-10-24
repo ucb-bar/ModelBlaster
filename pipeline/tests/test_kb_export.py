@@ -174,7 +174,10 @@ class EndToEndTest(unittest.TestCase):
             cp = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.extract_graph", "--bench-file",
                                  str(d / "tiny.py"), "--out-dir", str(d / "ir"), "--quant", "fp32"],
                                 cwd=root, capture_output=True, text=True, timeout=600,
-                                env={**__import__("os").environ, "PYTHONPATH": str(root)})
+                                # keep the caller's path too: a worktree not named modelblaster
+                                # is imported through a symlink on PYTHONPATH
+                                env={**__import__("os").environ, "PYTHONPATH": ":".join(
+                                    filter(None, [str(root), __import__("os").environ.get("PYTHONPATH")]))})
             self.assertEqual(cp.returncode, 0, cp.stderr[-2000:])
             prob = export_problem(d / "ir", d / "prob")
             man = json.loads((prob / "manifest.json").read_text())
