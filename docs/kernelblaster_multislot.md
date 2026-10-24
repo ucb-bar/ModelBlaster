@@ -219,9 +219,12 @@ keys is a model-name change (`--model`, `--reflect-model`).
 
 ## Validation (Phase 1, local TITAN RTX sm_75)
 
-- **Export coverage**: all 150 Level2 + Level3 IRs export as whole-graph problems, build and
-  pass every output and isolated-op check with the hand-kernel seeds
-  (`gpu_eval/work/kbx_sweep/`). Fixed along the way: op kinds sharing a C entry, > 2 GiB data.
+- **Export coverage**: every KernelBench Level1 (100), Level2 (100) and Level3 (50) IR exports
+  as a whole-graph problem that builds and passes every output and isolated-op check with the
+  hand-kernel seeds; SOL-ExecBench 139/144 (#021/#028 fp32 conditioning, #080 a 1.5e-5 miss on a
+  near-zero output, #072/#073 out of memory on the shared GPU). Level1 needed 24 more hand
+  kernels and reference ops (losses, norms, argmax/argmin with int64 index buffers, triu/tril,
+  flip, exclusive cumsum, ...) and a conv1d reshape fix in the torch walk.
 - **Tests**: MB `pipeline/tests/test_kb_export.py` (7, incl. extract → export → build → run and
   a deliberately wrong slot caught and attributed); KB `tests/` 77 (scripted-LLM end-to-end
   agent run with improve / no-op / broken-then-fixed candidates, store reuse across problems,
