@@ -247,7 +247,10 @@ class GraphOptFlowTest(unittest.TestCase):
         out = {}
         for par in (1, 4):
             work = self.tmp / f"par{par}"
-            s = run([ir], work, self._cfg(rounds=3, accept_gain=-1.0, max_variants=4, parallel_hints=par))
+            # min_gain_pct=0: proposal estimates use the elementwise kernels' GPU time (a few us
+            # here); this checks the wave mechanics, not which estimates clear 2 %
+            s = run([ir], work, self._cfg(rounds=3, accept_gain=-1.0, max_variants=4, parallel_hints=par,
+                                          min_gain_pct=0.0))
             doc = gh.load(work / "graph_hints.json")
             rounds = json.loads((work / "state.json").read_text())["rounds"]
             out[par] = (s, {h["id"]: h["status"] for h in doc["hints"] if h["status"] != "proposed"}, rounds)

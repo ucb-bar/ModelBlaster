@@ -293,18 +293,10 @@ Timing agreement with a full run, L40S, median ratio of `MB_SLOT_US` over 4 pair
    - the replay does not reproduce the outputs, which catches host-side state and work left
      out of the capture.
 
-**Decision: the KB reward stays eager.**
-
-- The reward is per slot (`MB_SLOT_US`), and a graph replay cannot attribute time to ops.
-- Graph time hides exactly the launch-overhead wins that fusion and fewer launches buy, and
-  deployment through MB's runtime is eager.
-- Graphs do not make the measurement quieter: on the idle L40S both have a CV of about 0.2 %.
-- Not every candidate is capturable.
-
-`MB_PARTITION_GRAPH_US` is reported next to the eager time as the deployment-with-graphs
-number. The gap between the two (`partition_us − partition_graph_us`) is a direct measure of
-launch overhead, the signal the graph optimiser should use to rank launch-bound partitions as
-fusion candidates.
+**Decision (superseded): the KB reward stayed eager here.** Graph replay could not attribute
+time to slots, and per-slot event times were the reward. The persistent runtime below makes
+the whole-partition graph replay the reward, with slot attribution from CUPTI. The eager time
+and the eager − graph gap stay as diagnostics.
 
 ### Seed launch configuration (`gpu_eval/harness/cuda/mb_cuda_kernels.cu`)
 
@@ -379,7 +371,292 @@ No slot got slower beyond noise, so the rule is adopted.
   with the new seeds: 49/50. The miss is `26_ShuffleNet`, out of memory on the shared 24 GB
   GPU, as before.
 
-## Remaining recommendations (not implemented)
+## Persistent runtime and the end-to-end reward
+
+This section covers the CUDA multi-slot flow on the `feat/persistent-runtime` branches:
+
+- the persistent runtime;
+- the end-to-end reward;
+- the whole-model result.
+
+It implements recommendations 1–3 of the list below.
+
+### What the deployed runtime is, and what is timed
+
+ModelBlaster's deployed GPU runtime for a partition (or a whole model):
+
+- preallocated buffers;
+- weights and inputs resident on the device;
+- one stream, no host syncs or allocations between ops;
+- the forward pass captured once as a CUDA graph and replayed.
+
+The driver's timed path is exactly that:
+
+- `MB_E2E_US` is the median graph replay of the whole partition: `basis=graph`, captured on
+  the per-thread default stream and checked against the reference once.
+- It falls back to the eager launch sequence (`basis=eager`) with `MB_GRAPH_SKIP <reason>`
+  when a slot syncs, allocates, copies to the host or launches on the legacy stream.
+- The eager time (`MB_PARTITION_US`) and `eager − graph` stay as diagnostics.
+
+### The persistent host (`driver.cpp -DMB_HOST`)
+
+**What it is.**
+
+- The same `driver.cpp` built with `-DMB_HOST` becomes a long-lived process. It keeps the
+  CUDA context, the device buffers and the mmapped/linked reference data.
+- Each request names a candidate's **shared object**: the slot units + `walker_tail.cu` built
+  `-shared -fPIC --default-stream per-thread`. Its C entry points are `mb_so_abi`,
+  `mb_so_run_op`, `mb_so_launch` and `mb_so_num_ops`, which `kb_export` writes into the tail.
+- The host dlopens it for the request and dlcloses it after.
+- The checks and timing are the one-process driver's own code (`mb_eval()`). A request prints
+  exactly what `MB_*=… ./driver` prints, minus the per-process `cuda_init`.
+- `driver.cpp` still builds and runs on its own for debugging, as before.
+
+**Protocol.** Stdin/stdout, one tab-separated line per request:
+`EVAL <nonce> so=<path> [ref=<path>] [lock=<file>] [lock_wait=<s>] [MB_*=<v> ...]`. The
+reply is the driver lines, then `MB_HOST_DONE <nonce> rc= poisoned= recycle=`.
+
+**`ref=`, the paired comparison.** It loads the incumbent's object too, and times candidate
+and incumbent alternately, rep by rep, in the same process (`MB_REF_E2E_US`,
+`MB_E2E_RATIO … basis=`).
+
+- Both sides are measured the same way: graph against graph when both capture, else eager
+  against eager.
+- The incumbent's own isolated checks are not repeated (it passed them when it was accepted).
+
+**Failures** never reach the next candidate:
+
+- **Crash.** A candidate that crashes the process ends the stream. The client reports a
+  runtime error and starts a new host.
+- **Hang.** Killed at the timeout, same outcome.
+- **Sticky CUDA error** (illegal address, launch failure). The host probes the context after
+  every request. A broken context replies `poisoned=1` and exits without dlclose.
+- **Leaks and old hosts.** The host recycles itself after `MB_HOST_MAX_EVALS` (500) requests
+  or `MB_HOST_LEAK_MB` (1 GiB) of leaked device memory.
+- **Lost client.** The host exits when its stdin closes (a killed client, a dropped ssh
+  channel), even with a hung kernel.
+- **State between candidates is a fresh process's.** Intermediates and outputs are zeroed and
+  the inputs re-uploaded per request.
+
+**GPU lock.** The host takes the GPU's flock (the same file as KernelBlaster's
+`gpu_lock_wrap`) for the request only, so an idle host holds memory but never the GPU.
+
+**dlopen vs a process per N candidates.** Measured on the TITAN with a static-cudart object,
+200 load / run / graph-capture / dlclose cycles:
+
+- correct results;
+- no device memory growth from the modules themselves;
+- 0.02 ms per load.
+
+A candidate's own leaks, such as a never-freed static scratch buffer, stay. That is what the
+leak recycle is for. So the host dlcloses per candidate and recycles rarely.
+
+**Python side.** `kb_export.build_host` / `build_so` / `DriverHost`;
+`build_and_run(..., runtime="host")`; `kb_export --build-check --runtime host`.
+
+**KernelBlaster side.** `LocalEvaluator` and `SSHEvaluator` use the host by default
+(`knowledge/runtime_host.py`, `--runtime auto|host|process`). The server evaluator stays one
+process per run.
+
+### Per-op attribution without the event inflation (CUPTI)
+
+The driver measures every op's kernels, memsets and copies with CUPTI activity records (the
+durations nsys reports):
+
+- ops run back to back as in the partition, with an external correlation id per op and no
+  events between ops;
+- output `MB_ATTR_SLOT_US <slot> <us> launches=<n>`, `MB_ATTR_OP_US`, `MB_ATTR_SUM_US` and
+  `MB_LAUNCH_OVERHEAD_US eager= graph= frac_eager=`;
+- libcupti is dlopen'ed at run time. A binary built without CUPTI's headers, or run without
+  the library, prints `MB_ATTR_SKIP` and keeps the event times.
+
+The ResNet18 winner on the L40S (µs per forward pass; nsys kernel sums from the earlier
+profile):
+
+| slot | `MB_SLOT_US` (events) | `MB_ATTR_SLOT_US` (CUPTI) | nsys | launches |
+|---|---|---|---|---|
+| conv2d | 612 | 540.4 | 541 | 39 |
+| batchnorm2d | 95 | 34.3 | 32.6 | 20 |
+| relu | 79 | 26.7 | 26.6 | 17 |
+| add | 36 | 12.6 | 12.6 | 8 |
+| linear | 64.8 | 61.9 | 61.8 | 1 |
+| maxpool2d | 8.8 | 5.7 | 5.6 | 1 |
+| adaptive_avg_pool2d | 5.9 | 3.1 | 3.1 | 1 |
+| **sum** | 902 | **684.7** | | 87 |
+
+- The CUPTI sum equals the graph replay (684 µs): under a graph the partition has no launch
+  overhead left.
+- Eager, it has 53 µs (7.2 %).
+- **CUPTI must be detached after each pass.** Left attached, it added about 1 % to every
+  later graph replay (686.7 → 694 µs), which the host's next request would have timed. The
+  driver calls `cuptiFinalize` after the pass and re-attaches next time (686.7 → 687.5 µs,
+  noise).
+
+### Measurements
+
+**Per-candidate evaluation wall time.**
+
+- Setup: idle L40S (firesim2 GPU 2) through `--evaluator ssh`; builds on the dev box; one
+  slot changed per candidate. Medians in seconds.
+- "Step" is the agent's step run: `MB_ONLY_SLOTS` + `MB_SCREEN`, and on the host paired with
+  the incumbent. "Full" is the confirm run, with every check.
+- Process = one driver process per run, as before. Process-graph = the same, built and run
+  for the graph time too.
+- Tool: `scripts/bench_runtime.py` (KernelBlaster).
+
+| problem | host step (of it: request) | process step | process-graph step | host full | process full |
+|---|---|---|---|---|---|
+| L2 `12_Gemm_Multiply_LeakyReLU`, winner | **1.62** (0.12) | 3.55 | 3.51 | 1.60 | 3.56 |
+| L3 ResNet18, winner (68 ops, 87 launches) | **1.61** (0.14) | 4.03 | 4.02 | 2.09 | 4.13 |
+| L3 MiniGPT, winner (29 ops) | **1.73** (0.18) | 6.25 | 8.08 | 2.50 | 8.85 |
+| L3 LSTM, seeds (6170 launches, 220 ms forward) | **6.23** (2.57) | 13.05 | 8.14 | 14.05 | 10.16 |
+
+What changed in each step:
+
+- The host step is a slot compile (about 1 s), a `-shared` link of small objects, an scp of
+  about 1 MB, and the request.
+- The process step relinks the binary with the incbin'd data (110–480 MB), rsyncs it and pays
+  CUDA init.
+- 60 host requests needed 4 host starts, one per problem: 0.9 s each, paid once.
+- Under a loaded dev box (a second measurement, while the test suites ran) the ratios held:
+  host 1.7–5.1 s against 5.9–14 s.
+- The LSTM's full run is slower on the host. A paired run times two 220 ms forward passes per
+  rep. For GPU-bound problems that long, pairing costs GPU time while the noise it removes is
+  small.
+- On the shared TITAN at the same time, the host's runs waited on the GPU lock behind another
+  agent's runs. Those numbers say nothing about the runtime.
+
+**Timing agreement**, L40S, 5 full evaluations each, interleaved: median µs (CV %).
+
+| problem | host graph (`MB_E2E_US`) | process-graph graph | host eager | process eager | CUPTI kernel sum |
+|---|---|---|---|---|---|
+| L2 gemm winner | 134.1 (0.0) | 134.1 (0.3) | 136.6 | 135.6 | 134.8 |
+| ResNet18 winner | 686.1 (0.06) | 684.0 (0.0) | 741.2 | 736.4 | 688.0 |
+| MiniGPT winner | 2508.8 (0.03) | 2505.7 (0.07) | 2522.1 | 2517.8 | 2501.6 |
+| LSTM seeds | 218 838 (0.0) | 218 808 (0.01) | 222 836 | 222 642 | 219 286 |
+
+- The host and the one-process driver agree within 0.3 %. A rerun of the same evaluations
+  differs by up to 0.4 %.
+- The paired ratio of a candidate against itself was 0.999–1.002 on every problem.
+
+### The end-to-end reward in KernelBlaster
+
+KernelBlaster's `docs/multislot_optimization.md` ("End-to-end reward and the persistent
+runtime") has the details. In short:
+
+- **Reward and acceptance.** The fraction of the deployed partition time saved, paired with
+  the incumbent. A gain of 1 % or more is re-measured with every check against the composite
+  best before it joins it.
+- **Not capturable** goes back to the fix loop as a defect.
+- **Attribution is diagnostics.** It chooses the slot (kernel time plus its launches' share of
+  the overhead), feeds the prompt (deployed time, kernel time, launches, a launch-bound note),
+  the techniques (fusion-in-slot / persistent kernel when launch-bound), the v2 `launch_frac`,
+  and the proposals.
+- **Records.** `OutcomeRecord` gains `timing_basis`, `e2e_*` and `partition_effect`, and old
+  records still load.
+
+**Live A/B** (Haiku 5.5 over Bedrock):
+
+- Setup: L40S through the host, 2 rollouts × 4 steps, on three KB winners as seeds. The
+  ResNet18 winner is launch-bound: graph saving 7.6 %, 87 launches. Each arm used its own GPU
+  and its own LLM samples. Every e2e step also logged what the per-slot rule would have
+  decided on the same runs. Cost: $1.65 for 64 calls.
+
+| problem | e2e arm: deployed speedup | slot arm | e2e-arm steps where the two rules disagree |
+|---|---|---|---|
+| L2 gemm winner | **1.58×** (134 → 85 µs; paired vs seeds 0.638) | 1.00× | 0 of 8 |
+| MiniGPT winner | **1.55×** (2503 → 1613 µs) | 1.53× | 1 of 8: bmm, its slot 12.6 % faster (event-timed), +0.6 % end to end; the slot rule would have taken it, the e2e reward kept it neutral (below its 1 % threshold) |
+| ResNet18 winner | **1.10×** (687 → 625 µs) | 1.00× | 0 of 8 |
+| ResNet18 conv+bn fused variant | 1.00× | 1.00× | 0 of 6 |
+
+What the A/B shows:
+
+- **The speedups differ mostly by LLM luck.** With 8 steps a run, the speedup difference is
+  mostly that.
+- **The slot rule misjudges the size of a win.** On ResNet18 a linear win was +6.5 % by the
+  slot rule and +8.5 % end to end.
+- **The only disagreement is a slot-only gain.** The end-to-end reward did not take it: 0.6 % of the partition is below its threshold.
+- **The launch-oriented techniques were offered.** The agent tried `kernel_fusion_in_slot`
+  and `persistent_kernel` on the launch-bound ResNet18 slots.
+- **No fusion win came out of the live runs.** Haiku did not produce a working epilogue
+  fusion of the 200-line implicit-GEMM conv in this budget.
+
+**A fusion win, measured deterministically** (`demo2`, L40S, 3 repeats):
+
+- The candidate is batchnorm folded into the conv epilogue of the fused conv+bn slot, also on
+  the split-K path, because batchnorm is affine. It cuts 59 launches to 39 and drops the
+  intermediate.
+- **The end-to-end reward accepts it:** paired graph gain +4.1–4.3 %, 625.7 → 599.0 µs.
+- **The per-slot rule accepts it too but misjudges it:** +6.4 % on its slot, a reward of
+  +5.0 %.
+- **The old proposal estimate was 13 %.** It took the consumer's event-timed 92 µs.
+  `propose_fusions` now estimates 5.5 %: the consumer's kernel time plus launch overhead.
+  The graph optimiser's `propose_from_profile` and `kb_proposals.decide` now use attributed
+  op times and the deployed time too.
+- **A capture-breaking candidate** (a `cudaStreamSynchronize` in the relu launcher) is
+  compared eager to eager: −12.5 %. The step flags it as a capture defect for the fix loop.
+
+### The model's result (`pipeline/kb_model_run.py`)
+
+The number reported for a model is one whole-model runtime with every partition's winners.
+The steps:
+
+1. The KernelBlaster runs' best slots go into a kernel cache, guarded by each slot's instance
+   shapes, together with an existing cache if given.
+2. `cache_plan` puts every op of the IR, with the accepted hints applied, on the winner that
+   covers its shape. One source verified on several windows' shape sets now serves all of
+   them as one slot.
+3. The result is exported as one problem, checked against the full reference (outputs and
+   every op isolated) and timed in the persistent host by graph replay, with eager as a
+   diagnostic.
+4. The hand-seeded original is timed the same way: in the same requests, paired, when the
+   slots match.
+
+Optional (`--time-partitions`): every partition timed the same way, for the sum.
+
+| piece | detail |
+|---|---|
+| output | `modelblaster.model_runtime/v1` |
+| wired into | `kb_loop.sh` (step 5), `kb_graph_opt` final summary (`model_e2e_us`, `seed_e2e_us`, `model_speedup`) |
+| on demand | `python -m modelblaster.pipeline.kb_model_run IR --kb-runs RUN_DIR [--cache DIR] [--hints F] [--time-partitions]` |
+| whole-graph export | the same path (the problem is the model) |
+
+**ResNet18, 6 windows of at most 12 ops**:
+
+- Setup: `kb_export --strategy window`, each window given the ResNet18 winner's slots as its
+  best. Shared TITAN, 3 requests.
+
+| | µs per forward pass (graph replay) |
+|---|---|
+| composed model (one runtime, 17 → 7 slots after merging same-code guards) | **1603.7** |
+| hand-seeded model, paired | 33 248 (speedup **20.7×**, paired 20.6×) |
+| sum of the 6 windows timed the same way | 1623.7 |
+| boundary effect (model − sum) | −20 µs (−1.2 %) |
+
+- The windows' sum overstates the model by 20 µs: each window pays its own graph launch and
+  ramp-up, which one whole-model replay pays once.
+- On launch-bound models this gap is what a per-partition number hides.
+
+### Tests and gates (persistent runtime)
+
+- **Export gate on the new runtime.** Setup: TITAN, `kb_export --build-check --runtime host`,
+  `MB_TIME_MS=50`. Each problem is built as host + shared object and evaluated in one host
+  request: partition check, every op isolated, graph replay. Results:
+  - Level1 100/100, Level2 100/100, Level3 50/50;
+  - every one of the 250 with `basis=graph`: the seeds capture everywhere.
+- **MB tests.** `pipeline/tests/test_kb_driver_modes.py` adds:
+  - the end-to-end / attribution parser;
+  - host vs one-process parity (same checks, outputs and errors);
+  - host crash recovery and pairing;
+  - the windowed model-runtime composition.
+- **KB tests.** `tests/test_runtime_host.py`: protocol and recovery against a fake host, the
+  evaluator's failure mapping, real-host parity and crash recovery (segfault, illegal address,
+  hang), the end-to-end reward decisions, the capture-defect fix loop, and record
+  compatibility.
+
+## Remaining recommendations
+
+Items 1–3 are implemented ("Persistent runtime and the end-to-end reward" above); 4–6 remain.
 
 1. **Persistent driver process.** Each run pays about 185 ms of CUDA context creation plus
    about 80 ms of process start and exit. That is 35–55 % of a ResNet18 or MiniGPT step run

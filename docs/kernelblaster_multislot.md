@@ -23,8 +23,9 @@ IR (graph.json, weights.npz, io.npz)
   ▼
 problem: manifest, slots/<id>.cu, walker head/tail, driver.cpp, data.bin
   │ KernelBlaster scripts/run_multislot.py → agents/opt_multislot.MultiSlotAgent
-  │   per step: pick slot → pick technique → LLM rewrites that slot → build + driver
-  │   → reward, OutcomeRecord, ImplStore record, (semantic reflection every N records)
+  │   per step: pick slot → pick technique → LLM rewrites that slot → build the slot
+  │   as a shared object → persistent driver host (CUDA graph replay, paired with the
+  │   incumbent) → end-to-end reward, OutcomeRecord, ImplStore record, (reflection)
   ▼
 result.json, best/slots/*.cu, proposals.json (kb-proposal/1), winners.json (kb-winners/1)
   │                                          │
@@ -32,6 +33,10 @@ result.json, best/slots/*.cu, proposals.json (kb-proposal/1), winners.json (kb-w
   ▼                                          ▼
 fused variant problem → KernelBlaster → accept/reject (fusion_registry.json)
                                              CUDA kernel cache (shape-guarded) → model-level verify
+                                             │ pipeline/kb_model_run.py
+                                             ▼
+                          the model's result: every partition's winners in ONE whole-model
+                          runtime, checked and timed by graph replay vs the hand-seeded model
 ```
 
 `gpu_eval/tools/kb_loop.sh IR_DIR WORK_DIR` runs one full round.
@@ -43,12 +48,14 @@ fused variant problem → KernelBlaster → accept/reject (fusion_registry.json)
 | MB | `pipeline/kb_export.py` | partitioning, slot extraction from the hand kernels, walker + driver codegen, local build/run |
 | MB | `pipeline/kb_ingest.py` | winners → CUDA kernel cache (shape guard), model-level verification |
 | MB | `pipeline/kb_proposals.py` | fusion: fused op + `FusedKernelSpec`, variant export, accept/reject registry |
+| MB | `pipeline/kb_model_run.py` | the model's result: winners composed into one whole-model runtime, checked, timed by graph replay against the seeds (and the sum of the partitions) |
 | MB | `pipeline/op_classes.py` | op → class (gemm, conv, reduction, elementwise, data_movement, attention, scan, other) |
 | MB | `gpu_eval/harness/walk_torch.py` | reference values (torch IR walk; runs fused ops' `sub_ops`) |
 | MB | `gpu_eval/tools/kb_loop.sh` | the round above |
 | MB | `pipeline/kb_telemetry.py` | graph-optimiser telemetry: loads KB's `telemetry` package, rolls up KB runs |
 | KB | `data/sources/modelblaster_source.py` | `ModelBlasterSource` ("modelblaster"); `Problem.slots` |
-| KB | `knowledge/slots.py` | `SlotProblem`, assembly, driver-output parsing, `LocalEvaluator`, `ServerEvaluator` |
+| KB | `knowledge/slots.py` | `SlotProblem`, assembly, driver-output parsing, `LocalEvaluator`, `SSHEvaluator`, `ServerEvaluator` |
+| KB | `knowledge/runtime_host.py` | client for the persistent driver host (protocol, crash recovery, host pool) |
 | KB | `knowledge/impl_store.py` | implementation knowledgebase |
 | KB | `knowledge/outcomes.py`, `claims.py`, `reflect.py`, `semantic.py` | outcome records + semantic update pass |
 | KB | `agents/opt_multislot.py` | the slot-wise RL agent, roofline state, technique bandit, fusion proposals |
@@ -275,11 +282,11 @@ One live round on the ResNet basic block (Haiku 5.5, local TITAN RTX, 2 rollouts
 | 2 | ModelBlaster generates the driver (no libtorch) with the reference data linked in | KB's libtorch drivers; reading data at run time | One oracle (the torch IR walk) for partition and per-op checks; the binary is self-contained, which KB's exec server needs (it only receives the executable). Above 1 GiB the data is read at start-up (relocation limits). |
 | 3 | Every candidate is checked as a partition **and** op by op on the reference's inputs | partition check only | Attribution: a failure names the slot; and ill-conditioned partitions (attention) can amplify fp32 rounding past the bound even when each kernel is right (seen in SOL-ExecBench). |
 | 4 | Slots wrapped in C++ namespaces, assembled into one TU | separate TUs per slot | Fits KB's existing one-driver/one-`.cu` compile path unchanged; helper names can't collide; every kernel name carries its slot. |
-| 5 | Timing by CUDA events inside the driver, per op and per partition | nsys (KB's CUDA reward), NCU | Works without profiler permissions (NCU counters are unavailable on the dev box), gives per-slot times directly, no trace parsing. nsys/NCU remain possible as optional detail. |
+| 5 | Timing inside the driver: the partition by CUDA events around a graph replay (eager as fallback and diagnostic), per-op attribution from CUPTI activity records | events around each op (the original choice); nsys; NCU | No profiler permissions needed, no trace parsing. Events around each op charged tiny ops 2–3× their kernel time; CUPTI's kernel durations match nsys (`gpu_harness_perf.md`). |
 | 6 | One slot per step, sampled by time share with stall decay | whole-file rewrite; argmax slot | Bounded context and clean attribution per edit (agreed). Sampling spreads parallel rollouts; stall decay stops a big slot that keeps failing from starving the rest (found in testing). |
 | 7 | Roofline state from the manifest instead of NCU-derived states | the technique DB's LLM state analysis on NCU reports | No counters needed, no extra LLM call per step, deterministic; the numbers are still shown to the LLM. The technique DB's states can be layered on when NCU is available. |
 | 8 | Bandit keyed (op class, state) with cross-key priors | per-problem bandit; (state) only | Transfers technique value across slots and problems of the same kind without a separate sharing mechanism. |
-| 9 | Partition-level reward (slot time saved / partition time) | slot speedup | Amdahl-aware: a 2× win on a 1 % slot is worth little; keeps the bandit's values comparable across slots. |
+| 9 | End-to-end reward: fraction of the deployed partition time saved (CUDA graph replay, paired with the incumbent in one process), accepted at 1 % after a full re-measure against the composite | slot time saved / sum of slot times (the original choice, `--reward slot`); slot speedup | What is deployed is the whole forward pass: fusion, fewer launches, capture-ability and cross-op cache effects count, and per-slot event times misjudge tiny slots. Same unit as before, so bandit and v2 statistics stay comparable. |
 | 10 | Composite best = per-slot winners, re-verified together | per-trajectory best only | Slots are separate kernels, so improvements found by different rollouts on different slots compose; the final re-verification guards the assumption. |
 | 11 | Implementation store keyed by op + signature hash + arch + shape bucket, retrieval as seed/adapt/examples | technique stats only; embedding search | Exact reuse is the common case across models (same layer shapes); the bucket allows transfer across nearby shapes; examples share structure across ops of a class. Deterministic and cheap. |
 | 12 | Strict exact-shape guard in MB's cache, plus model-level verification | bucket-level guard | A kernel tuned or tested only at some shapes is never silently used at others; relaxing to buckets is a later, measured step. |
@@ -288,6 +295,8 @@ One live round on the ResNet basic block (Haiku 5.5, local TITAN RTX, 2 rollouts
 | 15 | Keyless `claude-code:` provider for development | API keys now | Requested: our own agentic generation until keys are set up; switching is a model-name change. |
 | 17 | NCU: one run per candidate over all slots, attributed by namespace, opt-in | NCU per slot (KB native: per bottleneck kernel); always on | One run is cheaper than N; the namespace makes attribution exact; opt-in because counters need permissions and each run adds replay time. |
 | 18 | Fusion decisions compare only the touched ops (per-op `MB_OP_US`) | compare whole-partition bests | Partition bests also move with unrelated slots: on MiniGPT a lucky GEMM made a 2.3 % epilogue fusion look like +29 %. |
+| 19 | Persistent driver host per (problem, GPU); candidates as dlopen'ed shared objects, dlclosed after each request | a process per candidate (as before); a process per N candidates | Removes CUDA init and process start per candidate and the relink of the linked data. A candidate .so is about 1 MB. dlclose of CUDA modules measured clean: 200 cycles, no growth. Crashes, hangs and sticky CUDA errors kill and restart the host, so they never reach the next candidate. |
+| 20 | The model's result is one whole-model runtime with every partition's winners, timed like a partition | the sum of partition times; per-problem speedups | Partition boundaries hide and add launches and cache effects. What ships is the model. |
 | 16 | Same-op code from other problems only when shape buckets overlap | always offer the best same-op winner to adapt | Measured (ResNet18 seeded from a ResNet-block conv, same 10-call budget, one run each): 25× with no cross-problem conv code, 5.4× when it was offered to adapt, 7.5× as an ideas-only example. A winner's blocking is shape-specific and anchors the LLM. Needs a multi-seed ablation before relaxing. |
 
 ## Validation (Phase 1, local TITAN RTX sm_75)

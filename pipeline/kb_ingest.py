@@ -184,6 +184,17 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
         if e is not None:
             src[sid], tags[sid], used[sid] = cache.code(e), f"cache:{e['impl_id']}", e
             continue
+        # the same source verified on different shape sets (e.g. one winner taken by
+        # several windows of a model) whose guards together cover every instance
+        need = {own_key(o) for o in ops}
+        by_code: dict[str, list[dict]] = {}
+        for c in usable(entry, sig):
+            by_code.setdefault(c["file"], []).append(c)
+        whole = [cs for cs in by_code.values() if need <= set().union(*(set(c["shape_guard"]) for c in cs))]
+        if whole:
+            cs = min(whole, key=lambda cs: min(c["slot_us"] for c in cs))
+            src[sid], tags[sid], used[sid] = cache.code(cs[0]), "cache:" + "+".join(sorted({c["impl_id"] for c in cs})), cs[0]
+            continue
         if not split or any(o.get("slot_variant") for o in ops) or len(ops) < 2:
             continue
         # covering candidates: the slot's own winners; for a fused slot also
@@ -268,10 +279,11 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
         vir = write_variant_ir(ir_dir, plan["graph"], tmp / "ir")
         d = export_problem(vir, tmp / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
                            sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
-        res = build_and_run(d, arch=sm)
+        res = build_and_run(d, arch=sm, graph=True)
         man = json.loads((d / "manifest.json").read_text())
         ir_name = man["ir_name"]
         out = {"ir": ir_name, "passed": res.get("passed"), "partition_us": res.get("partition_us"),
+               "e2e_us": res.get("e2e_us"), "e2e_basis": res.get("e2e_basis"),
                "fused": applied, "hints": hint_ids, "cache_split": [h["id"] for h in plan["hints"]],
                "slots": {}}
         for key, e in plan["used"].items():

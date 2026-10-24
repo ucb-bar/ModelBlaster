@@ -305,18 +305,22 @@ def from_xpurt(doc: dict, status: str = "accepted") -> list[dict]:
 
 
 def propose_from_profile(graph: dict, op_us: dict[str, float], specs: dict, *, doc: dict | None = None,
-                         min_gain_pct: float = 2.0, ir: str | None = None) -> list[dict]:
+                         min_gain_pct: float = 2.0, ir: str | None = None, launch_us: float = 0.0,
+                         total_us: float | None = None) -> list[dict]:
     """ModelBlaster's own fusion proposals from a whole-model per-op profile:
     every producer -> elementwise consumer pair where the consumer is the
     producer output's only reader (fused producers and consumers included, so
     accepted fusions grow into chains), grouped by fused kind; gain estimate =
-    the consumers' measured time. Kinds already decided in ``doc`` are skipped."""
+    the consumers' measured time plus ``launch_us`` per consumer (the launch
+    and idle cost per kernel of the deployed partition: a launch-bound model's
+    fusions are worth more than their kernels), as a share of ``total_us``
+    (default: the sum of ``op_us``). Kinds already decided in ``doc`` are skipped."""
     from .kb_proposals import fuse_pair, with_fused_specs
     from .op_classes import op_class
 
     graph = unique_names(copy.deepcopy(graph))
     specs = with_fused_specs(graph, specs)
-    total = sum(op_us.values()) or 1.0
+    total = total_us or sum(op_us.values()) or 1.0
     done = decided(doc) if doc else set()
     outs = set(graph["output"].get("tensors") or [graph["output"]["tensor"]])
     readers: dict[str, list[dict]] = {}
@@ -335,7 +339,7 @@ def propose_from_profile(graph: dict, op_us: dict[str, float], specs: dict, *, d
         b = r[0]
         if b["op"] not in specs or op_class(b["op"]) != "elementwise":
             continue
-        pairs.append((op_us.get(b["name"], 0.0), len(pairs), o["name"], b["name"]))
+        pairs.append((op_us.get(b["name"], 0.0) + launch_us, len(pairs), o["name"], b["name"]))
     for gain, _, a, b in sorted(pairs, key=lambda p: (-p[0], p[1])):
         if a in used or b in used:
             continue
@@ -355,7 +359,8 @@ def propose_from_profile(graph: dict, op_us: dict[str, float], specs: dict, *, d
         if pct < min_gain_pct:
             continue
         out.append(fuse_hint(kind, c["chains"], {"by": "mb-cost", "ir": ir, "est_gain_us": round(c["gain_us"], 2),
-                                                 "est_gain_pct": round(pct, 2), "ts": _now()}))
+                                                 "est_gain_pct": round(pct, 2), "ts": _now(),
+                                                 **({"launch_us": launch_us} if launch_us else {})}))
     return out
 
 
