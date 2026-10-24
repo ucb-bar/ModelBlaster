@@ -15,6 +15,10 @@ An entry carries a **shape guard**: the instance shapes it was verified on.
 caller needs is in the guard (exact match), so a kernel tuned or only
 tested at one shape is never silently used at another. Entries are keyed by
 the KernelSpec signature hash too: a spec change makes old entries stale.
+The hash is of the CUDA spelling of the signature (`_Float16` -> `__half`,
+what the slot defines), and every entry carries its storage dtype (fp32 /
+fp16): an `_f16` op has its own kind and signature, and lookups also match
+the dtype, so fp16 and fp32 kernels never stand in for each other.
 
 Model-level verification exports the whole IR as one partition with the
 cached winners as slot sources and runs its driver (golden + every op in
@@ -33,6 +37,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from .cuda_dtypes import cuda_signature, op_dtype
 from .kernel_abi import parse_signature
 
 MB_ROOT = Path(__file__).resolve().parents[1]
@@ -67,17 +72,18 @@ class CudaCache:
         return (self.root / e["file"]).read_text()
 
     def add(self, *, op: str, entry: str, signature: str, arch: str, shapes: list, code: str,
-            slot_us: float, speedup, impl_id: str, source: dict) -> tuple[dict, str]:
+            slot_us: float, speedup, impl_id: str, source: dict, dtype: str | None = None) -> tuple[dict, str]:
         sha = hashlib.sha1(code.encode()).hexdigest()
         (self.root / "src").mkdir(parents=True, exist_ok=True)
         (self.root / "src" / f"{sha}.cu").write_text(code)
         guard = sorted({_shape_key(s) for s in shapes})
-        new = {"op": op, "entry": entry, "signature_sha": signature_sha(signature), "arch": arch,
+        new = {"op": op, "entry": entry, "signature_sha": signature_sha(cuda_signature(signature)),
+               "dtype": dtype or op_dtype(op), "arch": arch,
                "shape_guard": guard, "slot_us": slot_us, "speedup": speedup, "impl_id": impl_id,
                "file": f"src/{sha}.cu", "source": source, "model_verified": [], "rejected": []}
         for i, e in enumerate(self.entries):
-            if (e["op"], e["signature_sha"], e["arch"], e["shape_guard"]) == \
-                    (new["op"], new["signature_sha"], new["arch"], guard):
+            if (e["op"], e["signature_sha"], e.get("dtype", "fp32"), e["arch"], e["shape_guard"]) == \
+                    (new["op"], new["signature_sha"], new["dtype"], new["arch"], guard):
                 if slot_us < e["slot_us"]:
                     self.entries[i] = new
                     return new, "replaced"
@@ -90,9 +96,11 @@ class CudaCache:
         that wasn't rejected on ir_name). Keyed by entry, not op kind: op
         kinds sharing an entry (sum_dim / max_dim -> kernel_reduce) share code."""
         need = {_shape_key(s) for s in shapes}
-        sig = signature_sha(signature)
+        sig = signature_sha(cuda_signature(signature))
+        dtype = op_dtype(entry)                      # kernel_<op>_f16 entries are fp16
         ok = [e for e in self.entries
               if e["entry"] == entry and e["signature_sha"] == sig and e["arch"] == arch
+              and e.get("dtype", "fp32") == dtype
               and need <= set(e["shape_guard"]) and (ir_name is None or ir_name not in e["rejected"])]
         return min(ok, key=lambda e: (ir_name not in e["model_verified"], e["slot_us"]), default=None)
 
@@ -108,7 +116,7 @@ def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float
             st = "fusion-not-accepted" if r["op"].startswith("fused__") else "unknown-op"
             report.append({"op": r["op"], "impl_id": r["id"], "status": st})
             continue
-        if signature_sha(spec.signature) != r["signature_sha"]:
+        if signature_sha(cuda_signature(spec.signature)) != r["signature_sha"]:
             report.append({"op": r["op"], "impl_id": r["id"], "status": "stale-signature"})
             continue
         sp = r.get("speedup_vs_seed")
@@ -118,7 +126,7 @@ def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float
         entry, _ = parse_signature(spec.signature)
         e, st = cache.add(op=r["op"], entry=entry, signature=spec.signature, arch=r["arch"],
                           shapes=r["shapes"], code=(base / r["file"]).read_text(), slot_us=r["slot_us"],
-                          speedup=sp, impl_id=r["id"],
+                          speedup=sp, impl_id=r["id"], dtype=r.get("dtype"),
                           source={"run_id": r.get("run_id"), "problem_id": r.get("problem_id"),
                                   "techniques": r.get("techniques", [])})
         report.append({"op": r["op"], "impl_id": r["id"], "status": st, "speedup": sp})
