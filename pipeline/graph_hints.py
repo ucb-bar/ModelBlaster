@@ -77,6 +77,8 @@ import copy
 import hashlib
 import json
 import math
+import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -121,8 +123,13 @@ def load(path: Path | None) -> dict:
 
 
 def save(doc: dict, path: Path) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(doc, indent=1))
+    """Write atomically (temp file + rename): a reader never sees a partial
+    document, and two writers leave one complete document, not a mix."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(doc, indent=1))
+    os.replace(tmp, path)
 
 
 def get(doc: dict, hid: str) -> dict | None:
