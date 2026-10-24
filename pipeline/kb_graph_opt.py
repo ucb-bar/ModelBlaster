@@ -18,10 +18,15 @@ KernelBlaster knowledge carry over between rounds and runs):
    problem and, with the hint applied, as a *variant* problem, both seeded
    with the same current-best kernels; KernelBlaster optimises both with the
    same budget; both composite bests are rebuilt and re-timed back to back
-   (``kb_proposals.remeasure``); the hint is accepted if the variant is
-   ``accept_gain`` faster. Accepted hints apply from the next round on, and
-   the variant's new slots (the fused kernel, the split variants) go into the
-   cache;
+   on one GPU (``kb_proposals.remeasure``); the hint is accepted if the
+   variant is ``accept_gain`` faster. Accepted hints apply from the next
+   round on, and the variant's new slots (the fused kernel, the split
+   variants) go into the cache. Hints that cannot affect each other
+   (``footprint`` / ``conflicts``) are decided together in *waves*
+   (``schedule``): one KernelBlaster run for all their problems, re-timing
+   as soon as a hint's two problems finish; conflicting hints wait for the
+   wave before them, so the outcome is that of deciding them one by one in
+   rank order (``--parallel-hints 1``);
 5. stop when a round accepts nothing and has nothing new to send (the
    fixpoint), or after ``rounds``.
 
@@ -31,21 +36,28 @@ Finally every IR is verified at model level with everything applied
     python -m modelblaster.pipeline.kb_graph_opt IR_DIR [...] --work W --kb KB_CHECKOUT \\
         [--model claude-code:sonnet] [--plugin stubs.py] [--rounds 4] \\
         [--coverage 0.8 --top-k 6] [--rollouts 2 --steps 4 --variant-steps 3] \\
-        [--max-variants 3 --remeasure 5 --accept-gain 0.03] [--arch 75]
+        [--max-variants 3 --remeasure 5 --accept-gain 0.03] [--arch 75] \\
+        [--parallel-hints auto|N] [--gpus auto|all|0,2] \\
+        [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]]
 
 Work dir: ``graph_hints.json`` (modelblaster.graph_hints/v1), ``cache/``
 (mb-cuda-cache/1), ``knowledge/`` (KernelBlaster), ``state.json``,
 ``rNN/{profile,plan.json,problems,run,winners,variants,round.json}``,
-``summary.json``.
+``summary.json``. One process at a time owns a work dir (``.lock``).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -80,11 +92,172 @@ class Config:
     accept_gain: float = ACCEPT_GAIN
     profile_runs: int = 3
     seed: int = 0
+    # hints decided at once (0 = auto: max(4, 2 x GPUs in the pool)); 1 = one by one
+    parallel_hints: int = 0
+    # KernelBlaster's GPU pool (run_multislot --gpus / --ssh-host / --cuda-visible-devices)
+    gpus: str = "auto"
+    ssh_hosts: list = field(default_factory=list)
+    cuda_visible_devices: list = field(default_factory=list)
+    ssh_key: str | None = None
+    remote_dir: str | None = None
+
+
+_LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices")
+_MANUAL_FIELDS = ("kb", "model", "reflect_model", "python", "ssh_key", "remote_dir", "gpus", "parallel_hints",
+                  *_LIST_FIELDS)
 
 
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)[:80]
 
+
+# ---------------------------------------------------------------- locks
+
+def _flock_off() -> bool:
+    return os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() in ("0", "false", "no", "off")
+
+
+def gpu_lock_path(ident: str) -> Path:
+    """KernelBlaster's per-GPU lock file (``resources.gpu_lock_wrap``): every
+    KernelBlaster timed run holds an flock on it, so MB's own timed runs
+    holding it too take turns with KernelBlaster runs of any process."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ident)
+    return Path(os.getenv("KERNELBLASTER_GPU_LOCK_DIR", "/dev/shm")) / f"kernelblaster_gpu_{safe}.lock"
+
+
+@contextlib.contextmanager
+def _flock(path: Path, *, blocking: bool = True, timeout: float = 3600.0):
+    """flock(2) on ``path`` (created if missing). Blocking waits up to
+    ``timeout`` and then raises TimeoutError; non-blocking raises
+    BlockingIOError when the lock is held."""
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        if not blocking:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            t_end = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > t_end:
+                        raise TimeoutError(f"lock {path} held for more than {timeout:.0f} s")
+                    time.sleep(0.05)
+        yield fd
+    finally:
+        os.close(fd)                                  # closing releases the lock
+
+
+@contextlib.contextmanager
+def work_lock(work: Path):
+    """One kb_graph_opt process per work dir: it is the only writer of the
+    hints file, the cache index, state.json and (through the one
+    KernelBlaster process it runs at a time) the knowledge dir."""
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        with _flock(work / ".lock", blocking=False):
+            yield
+    except BlockingIOError:
+        raise RuntimeError(f"{work} is in use by another kb_graph_opt run (lock {work / '.lock'})") from None
+
+
+class GpuLeases:
+    """Exclusive leases on this host's GPUs for ModelBlaster's own timed runs
+    (the re-measurement that decides a hint): one lease per device in this
+    process, least recently used first, and while leased the device's
+    KernelBlaster lock file is held, so KernelBlaster runs (this flow's or
+    another process's) wait instead of timing on it at the same time.
+
+    ``devices``: [{"ident": UUID or index, "name": ...}]; empty = one
+    unpinned device (the environment's default GPU, no lock file)."""
+
+    def __init__(self, devices: list[dict] | None = None, *, lock_timeout: float = 3600.0):
+        self.devices = list(devices) or [{"ident": None, "name": "default"}]
+        self.lock_timeout = lock_timeout
+        self._cv = threading.Condition()
+        self._busy: set[int] = set()
+        self._last: dict[int, float] = {}
+        self.log: list[dict] = []                     # (device, t0, t1) per lease, for tests and stats
+
+    @contextlib.contextmanager
+    def lease(self):
+        with self._cv:
+            while len(self._busy) == len(self.devices):
+                self._cv.wait()
+            i = min((k for k in range(len(self.devices)) if k not in self._busy),
+                    key=lambda k: (self._last.get(k, 0.0), k))
+            self._busy.add(i)
+        ident = self.devices[i].get("ident")
+        env = {"CUDA_VISIBLE_DEVICES": str(ident)} if ident is not None else {}
+        try:
+            with contextlib.ExitStack() as stack:
+                if ident is not None and not _flock_off():
+                    try:
+                        stack.enter_context(_flock(gpu_lock_path(str(ident)), timeout=self.lock_timeout))
+                    except PermissionError:            # another user's lock file: run unlocked, as KB does
+                        pass
+                t0 = time.time()
+                try:
+                    yield env
+                finally:
+                    self.log.append({"device": i, "t0": t0, "t1": time.time()})
+        finally:
+            with self._cv:
+                self._busy.discard(i)
+                self._last[i] = time.monotonic()
+                self._cv.notify_all()
+
+
+# ---------------------------------------------------------------- GPUs
+
+_DETECT = r'''
+import asyncio, json, sys
+sys.path.insert(0, sys.argv[1] + "/src")
+from kernelblaster.servers.utils import resources as r
+a = json.loads(sys.argv[2])
+out = {"local": [], "remote": []}
+if not a["ssh_hosts"]:
+    inv = r.gpu_inventory()
+    chosen, why = r.select_gpus(a["gpus"], inv)
+    out["local"] = [{"ident": g.uuid or str(g.index), "index": g.index, "name": g.name} for g in chosen]
+    out["why"] = why
+else:
+    cvd = a["cvd"] or [None]
+    for k, h in enumerate(a["ssh_hosts"]):
+        spec = cvd[k] if len(cvd) == len(a["ssh_hosts"]) else cvd[0]
+        devs = asyncio.run(r.remote_devices(h, spec, ssh_key=a["ssh_key"]))
+        out["remote"] += [{"host": h, "ident": d.ident, "index": d.index, "name": d.name} for d in devs]
+print(json.dumps(out))
+'''
+
+
+def detect_gpus(cfg: Config) -> dict:
+    """KernelBlaster's own GPU selection (``resources.select_gpus``: auto =
+    the idle GPUs, else the least busy one) for the pool the KernelBlaster
+    runs will use -> {"local": [...], "remote": [...]}; on failure, one
+    unpinned local device."""
+    args = {"gpus": cfg.gpus, "ssh_hosts": list(cfg.ssh_hosts), "cvd": list(cfg.cuda_visible_devices),
+            "ssh_key": cfg.ssh_key}
+    try:
+        cp = subprocess.run([cfg.python, "-c", _DETECT, str(Path(cfg.kb).resolve()), json.dumps(args)],
+                            capture_output=True, text=True, timeout=120)
+        return json.loads(cp.stdout.strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001
+        return {"local": [], "remote": [], "why": f"detection failed: {e!r}"}
+
+
+def auto_parallel_hints(n_gpus: int) -> int:
+    """Hints per wave by default: max(4, 2 x GPUs). The wave width does not
+    decide how many runs share a GPU -- KernelBlaster's pool gives each timed
+    run a GPU of its own and its build limiter bounds the compiles -- it
+    decides how much LLM latency and compile time overlaps other hints'
+    runs. Measured (docs/graph_optimizer.md): 4 hints per wave beat 2 on one
+    TITAN RTX and on two L40S, most with LLM latency."""
+    return max(4, 2 * int(n_gpus))
+
+
+# ---------------------------------------------------------------- KernelBlaster
 
 class KBRunner:
     """KernelBlaster's ``scripts/run_multislot.py`` as a subprocess."""
@@ -93,8 +266,8 @@ class KBRunner:
         self.cfg, self.knowledge = cfg, knowledge
         self.calls = 0
 
-    def run(self, problems: list[Path], out: Path, *, steps: int | None = None,
-            winners: Path | None = None) -> list[dict]:
+    def command(self, problems: list[Path], out: Path, *, steps: int | None = None,
+                winners: Path | None = None, parallel_problems: int | None = None) -> list[str]:
         c = self.cfg
         cmd = [c.python, str(Path(c.kb) / "scripts" / "run_multislot.py"), *map(str, problems), "--out", str(out),
                "--knowledge-dir", str(self.knowledge), "--model", c.model, "--arch", c.arch,
@@ -104,22 +277,65 @@ class KBRunner:
             cmd += ["--reflect-model", c.reflect_model]
         if winners is not None:
             cmd += ["--export-winners", str(winners)]
+        if parallel_problems:
+            cmd += ["--parallel-problems", str(parallel_problems)]
+        if c.ssh_hosts:
+            cmd += ["--evaluator", "ssh"]
+            for h in c.ssh_hosts:
+                cmd += ["--ssh-host", h]
+            for v in c.cuda_visible_devices:
+                cmd += ["--cuda-visible-devices", v]
+            if c.ssh_key:
+                cmd += ["--ssh-key", c.ssh_key]
+            if c.remote_dir:
+                cmd += ["--remote-dir", c.remote_dir]
+        elif c.gpus and c.gpus != "auto":
+            cmd += ["--gpus", c.gpus]
         for p in c.plugins:
             cmd += ["--plugin", str(p)]
+        return cmd
+
+    def start(self, problems: list[Path], out: Path, **kw) -> subprocess.Popen:
         out.mkdir(parents=True, exist_ok=True)
-        with open(out.with_suffix(".log"), "w") as log:
-            cp = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(c.kb))
-        if cp.returncode != 0:
-            raise RuntimeError(f"KernelBlaster failed ({cp.returncode}); see {out.with_suffix('.log')}")
+        log = open(out.with_suffix(".log"), "w")
+        try:
+            p = subprocess.Popen(self.command(problems, out, **kw), stdout=log, stderr=subprocess.STDOUT,
+                                 cwd=str(self.cfg.kb))
+        finally:
+            log.close()                               # the child holds its own descriptor
+        return p
+
+    def collect(self, problems: list[Path], out: Path, proc: subprocess.Popen) -> list[dict]:
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"KernelBlaster failed ({rc}); see {out.with_suffix('.log')}")
         res = []
         for d in problems:
-            name = json.loads((Path(d) / "manifest.json").read_text())["name"]
-            f = out / name / "result.json"
-            r = json.loads(f.read_text()) if f.exists() else {"problem": name, "final_ok": False}
-            r["_dir"] = str(out / name)
+            r = read_result(out, Path(d)) or {"problem": problem_name(Path(d)), "final_ok": False}
+            r["_dir"] = str(out / problem_name(Path(d)))
             self.calls += r.get("llm_calls", 0) or 0
             res.append(r)
         return res
+
+    def run(self, problems: list[Path], out: Path, *, steps: int | None = None,
+            winners: Path | None = None, parallel_problems: int | None = None) -> list[dict]:
+        p = self.start(problems, out, steps=steps, winners=winners, parallel_problems=parallel_problems)
+        return self.collect(problems, out, p)
+
+
+def problem_name(d: Path) -> str:
+    return json.loads((Path(d) / "manifest.json").read_text())["name"]
+
+
+def read_result(out: Path, problem: Path) -> dict | None:
+    """A problem's result.json in a (possibly still running) KernelBlaster
+    run; None until it is complete. KernelBlaster writes the best slot
+    sources before result.json, so once it parses the bests are final."""
+    f = out / problem_name(problem) / "result.json"
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def _usage(results: list[dict]) -> dict:
@@ -155,6 +371,84 @@ def _scope_ops(h: dict, graph: dict, specs: dict) -> list[str]:
     return []
 
 
+# ---------------------------------------------------------------- conflicts
+
+def _entry(kind: str, specs: dict) -> str:
+    """The C entry a kind's kernels are cached under (kinds can share one)."""
+    try:
+        spec = specs.get(kind)
+        if spec is None and kind.startswith("fused__"):
+            from .kb_proposals import spec_from_kind
+            spec = spec_from_kind(kind, specs)
+        return parse_signature(spec.signature)[0] if spec is not None else kind
+    except Exception:  # noqa: BLE001
+        return kind
+
+
+def footprint(h: dict, ir: str, graph: dict, specs: dict) -> dict:
+    """What deciding ``h`` on ``graph`` (its IR's current state) reads and
+    writes of the shared state.
+
+    - ``ops``: (IR, original op name) of every op the hint's problems hold;
+    - ``reads``: cache entries its problems are seeded from -- the entries of
+      those ops and of their stages (fused ops), plus the variant's own new
+      slot (a cached fused kernel of that kind, a split variant's base slot);
+    - ``writes``: cache entries an acceptance ingests -- the fused kind
+      (``fuse``), or the base slot's entry, guarded on its shapes (``split``).
+
+    Entries, not (entry, shape): a slot's cache lookup and coverage split look
+    at every instance of the slot in the IR, not only the touched ones."""
+    specs = with_fused_specs(graph, specs)
+    names = _scope_ops(h, graph, specs)
+    by_name = {o["name"]: o for o in graph["ops"]}
+    ops, reads = set(), set()
+    for n in names:
+        ops.update((ir, a) for a in gh.atoms(n))
+        o = by_name.get(n)
+        if o is None:
+            continue
+        reads.add(_entry(o["op"], specs))
+        reads.update(_entry(s["op"], specs) for s in o.get("sub_ops", []))
+    if h["kind"] == "fuse":
+        writes = {_entry(h["fused_kind"], specs)}
+    elif h["kind"] == "split_slot":
+        writes = {_entry(by_name[names[0]]["op"], specs)} if names else {h["slot"]}
+    else:
+        writes = set()
+    return {"ops": ops, "reads": reads | writes, "writes": writes}
+
+
+def conflicts(a: dict, b: dict) -> bool:
+    """Two hints conflict when deciding one can change the other's inputs or
+    outcome: they share an op (one's rewrite changes the other's graph;
+    a chain and its prefix fusion), or one's acceptance writes a cache entry
+    the other's problems are seeded from."""
+    return bool(a["ops"] & b["ops"] or a["writes"] & b["reads"] or b["writes"] & a["reads"])
+
+
+def schedule(fps: list[dict], width: int) -> list[list[int]]:
+    """Waves of hint indices (``fps`` in rank order): hint i goes to the
+    first wave after every earlier hint it conflicts with, and that has
+    room (``width``). Every conflicting pair is thus decided in rank order,
+    so the result equals deciding the hints one by one in rank order;
+    independent hints share a wave. Deterministic: depends only on the
+    order and the footprints."""
+    width = max(1, int(width))
+    wave_of: list[int] = []
+    waves: list[list[int]] = []
+    for i, f in enumerate(fps):
+        w = 1 + max((wave_of[j] for j in range(i) if conflicts(fps[j], f)), default=-1)
+        while w < len(waves) and len(waves[w]) >= width:
+            w += 1
+        while len(waves) <= w:
+            waves.append([])
+        waves[w].append(i)
+        wave_of.append(w)
+    return waves
+
+
+# ---------------------------------------------------------------- decisions
+
 def _ingest_slots(cache: CudaCache, problem: Path, result: dict, slots: list[str], specs: dict, tag: str) -> list:
     """Put a run's best sources for ``slots`` into the cache (guarded on the
     problem's instance shapes), whatever their speedup over their seed: the
@@ -185,29 +479,28 @@ def man_arch(result: dict) -> str:
     return str(result.get("arch", "sm_75")).removeprefix("sm_")
 
 
-def evaluate_hint(h: dict, prof: dict, out: Path, *, kb: KBRunner, cache: CudaCache, doc: dict,
-                  cfg: Config, specs: dict) -> dict:
-    """Build original + variant problems for one hint on one IR, optimise
-    both with the same budget, re-measure, decide, record."""
+def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Config, specs: dict) -> dict:
+    """Export a hint's original and variant problems from the current state
+    (reads the cache, writes only under ``out``). -> a job; ``job["early"]``
+    is set when there is nothing to run (the hint does not occur / apply)."""
     base_graph = json.loads((Path(prof["ir_dir"]) / "graph.json").read_text())
     specs = with_fused_specs(base_graph, specs)
     base = cache_plan(base_graph, cache, f"sm_{cfg.arch}", specs)
     g0 = base["graph"]
     names = _scope_ops(h, g0, specs)
-    ev = {"problem": None, "ir": prof["ir"], "ts": gh._now()}
+    job = {"hint": h, "specs": specs, "names": names,
+           "ev": {"problem": None, "ir": prof["ir"], "ts": gh._now()}}
     if not names:
-        ev.update(decision="rejected", why="hint does not occur in this IR")
-        gh.record_decision(doc, h, ev)
-        return {"hint": h["id"], "status": "rejected", "why": ev["why"]}
+        job["early"] = "hint does not occur in this IR"
+        return job
     hh = dict(h)
     if h["kind"] == "fuse":                             # scope the variant to this IR's instances
         hh["chains"] = [c for c in (h.get("chains") or [])
                         if all(a in {x for n in names for x in gh.atoms(n)} for a in c)] or None
     vg, _, prov = gh.apply_hints(g0, [hh], specs, statuses=None)
     if not prov["applied"]:
-        ev.update(decision="rejected", why="; ".join(s["why"] for s in prov["skipped"])[:500])
-        gh.record_decision(doc, h, ev)
-        return {"hint": h["id"], "status": "rejected", "why": ev["why"]}
+        job["early"] = "; ".join(s["why"] for s in prov["skipped"])[:500]
+        return job
     vplan = cache_plan(vg, cache, f"sm_{cfg.arch}", specs, split=False)
     out.mkdir(parents=True, exist_ok=True)
     src_ir = Path(prof["source_ir"])
@@ -219,46 +512,162 @@ def evaluate_hint(h: dict, prof: dict, out: Path, *, kb: KBRunner, cache: CudaCa
     vidx = [i for i, o in enumerate(vplan["graph"]["ops"]) if o["name"] in vnames]
     seeds = {**base["sources"], **vplan["sources"]}
     tags = {**base["tags"], **vplan["tags"]}
-    op_ = export_problem(oir, out / "orig", op_indices=oidx, specs=specs, name=stem + "__orig",
-                         strategy="hint-original", slot_sources=base["sources"], slot_source_tags=base["tags"],
-                         sub_sources=base["sub_sources"])
-    vp_ = export_problem(vir, out / "variant", op_indices=vidx, specs=specs, name=stem + "__variant",
-                         strategy="hint-variant", slot_sources=seeds, slot_source_tags=tags,
-                         sub_sources=vplan["sub_sources"])
-    ro, rv = kb.run([op_, vp_], out / "run", steps=cfg.variant_steps)
-    ev.update(problem=stem, original_us=ro.get("final_partition_us"), variant_us=rv.get("final_partition_us"),
+    job["orig"] = export_problem(oir, out / "orig", op_indices=oidx, specs=specs, name=stem + "__orig",
+                                 strategy="hint-original", slot_sources=base["sources"],
+                                 slot_source_tags=base["tags"], sub_sources=base["sub_sources"])
+    job["variant"] = export_problem(vir, out / "variant", op_indices=vidx, specs=specs, name=stem + "__variant",
+                                    strategy="hint-variant", slot_sources=seeds, slot_source_tags=tags,
+                                    sub_sources=vplan["sub_sources"])
+    job["stem"], job["prov"] = stem, prov
+    return job
+
+
+def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None) -> list | None:
+    """Re-time both composite bests interleaved on one leased GPU ->
+    [original times, variant times], or None (a side failed / no
+    re-measurement). Thread-safe: writes only under the job's problem dirs."""
+    if not (ro.get("final_ok") and rv.get("final_ok")) or not cfg.remeasure:
+        return None
+    lease = leases.lease() if leases is not None else None
+    return remeasure([(job["orig"], best_sources(Path(ro["_dir"]))), (job["variant"], best_sources(Path(rv["_dir"])))],
+                     arch=cfg.arch, reps=cfg.remeasure, lease=lease)
+
+
+def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None, *, cache: CudaCache, doc: dict,
+                cfg: Config) -> dict:
+    """Decide from the measurements, record the evidence, ingest an accepted
+    variant's new slots. Writes the hints doc and the cache: call from one
+    thread, in rank order."""
+    h, ev, names = job["hint"], job["ev"], job["names"]
+    if "early" in job:
+        ev.update(decision="rejected", why=job["early"])
+        gh.record_decision(doc, h, ev)
+        return {"hint": h["id"], "status": "rejected", "why": ev["why"]}
+    ev.update(problem=job["stem"], original_us=ro.get("final_partition_us"), variant_us=rv.get("final_partition_us"),
               kb_original_us=ro.get("final_partition_us"), kb_variant_us=rv.get("final_partition_us"),
               llm_calls=(ro.get("llm_calls") or 0) + (rv.get("llm_calls") or 0))
     ok = bool(ro.get("final_ok") and rv.get("final_ok"))
     if ok and cfg.remeasure:
-        t = remeasure([(op_, best_sources(Path(ro["_dir"]))), (vp_, best_sources(Path(rv["_dir"])))],
-                      arch=cfg.arch, reps=cfg.remeasure)
-        ok = bool(t[0] and t[1])
+        ok = bool(times and times[0] and times[1])
         if ok:
-            ev.update(original_us=_median(t[0]), variant_us=_median(t[1]),
-                      remeasured={"original_us": t[0], "variant_us": t[1]})
+            ev.update(original_us=_median(times[0]), variant_us=_median(times[1]),
+                      remeasured={"original_us": times[0], "variant_us": times[1]})
+    if not ok:
+        ev["why"] = ("KernelBlaster: " + ", ".join(f"{side} not final_ok ({r.get('error') or 'see result.json'})"
+                                                   for side, r in (("original", ro), ("variant", rv))
+                                                   if not r.get("final_ok"))
+                     if not (ro.get("final_ok") and rv.get("final_ok")) else
+                     f"re-measurement: no passing run on a side ({[len(x) for x in times or []]} of {cfg.remeasure})")
     gain = (ev["original_us"] - ev["variant_us"]) / ev["original_us"] if ok else None
     status = "accepted" if ok and gain >= cfg.accept_gain else "rejected"
-    ev.update(gain=gain, decision=status, applied=prov["applied"])
+    ev.update(gain=gain, decision=status, applied=job["prov"]["applied"])
     rec = gh.record_decision(doc, h, ev)
     res = {"hint": h["id"], "status": status, "hint_status": rec["status"], "gain": gain,
            "original_us": ev["original_us"], "variant_us": ev["variant_us"], "ops": names}
     if rec["status"] == "accepted":
-        man = json.loads((Path(vp_) / "manifest.json").read_text())
+        man = json.loads((Path(job["variant"]) / "manifest.json").read_text())
         changed = [s["id"] for s in man["slots"]
                    if s["op"].startswith("fused__") or s.get("variant_of")]
-        res["cached"] = _ingest_slots(cache, vp_, rv, changed, specs, h["id"])
+        res["cached"] = _ingest_slots(cache, job["variant"], rv, changed, job["specs"], h["id"])
     return res
 
 
+def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: KBRunner, cache: CudaCache,
+                   doc: dict, cfg: Config, specs: dict, leases: GpuLeases | None = None,
+                   poll_s: float = 1.0) -> list[dict]:
+    """Decide a wave of independent hints ((hint, profile, out dir) each).
+
+    Every hint's original and variant problems go to one KernelBlaster run
+    (``--parallel-problems`` = all of them: KernelBlaster's GPU pool gives each
+    timed run one GPU, its build limiter bounds the compiles, and its store /
+    outcome log / claims stay single-writer in that one process); a hint is
+    re-timed as soon as both its results are written, on one leased GPU, while
+    KernelBlaster works on the others. Decisions and cache ingests are then
+    made in the given order, in this thread."""
+    jobs = [prepare_hint(h, prof, out, cache=cache, cfg=cfg, specs=specs) for h, prof, out in items]
+    live = [k for k, j in enumerate(jobs) if "early" not in j]
+    results: dict[int, tuple] = {}
+    if live:
+        problems = [p for k in live for p in (jobs[k]["orig"], jobs[k]["variant"])]
+        proc = kb.start(problems, run_dir, steps=cfg.variant_steps, parallel_problems=len(problems))
+        futs = {}
+        # re-timing workers: two per GPU (one builds while the other times), at most one per hint
+        n_dev = len(leases.devices) if leases is not None else 1
+        with ThreadPoolExecutor(max_workers=max(1, min(len(live), 2 * n_dev))) as ex:
+            try:
+                while True:
+                    done = proc.poll() is not None
+                    for k in live:
+                        if k in futs:
+                            continue
+                        ro, rv = read_result(run_dir, jobs[k]["orig"]), read_result(run_dir, jobs[k]["variant"])
+                        if (ro is not None and rv is not None) or done:
+                            ro = dict(ro or {"final_ok": False}, _dir=str(run_dir / problem_name(jobs[k]["orig"])))
+                            rv = dict(rv or {"final_ok": False},
+                                      _dir=str(run_dir / problem_name(jobs[k]["variant"])))
+                            futs[k] = ex.submit(measure_hint, jobs[k], ro, rv, cfg, leases)
+                    if done:
+                        break
+                    time.sleep(poll_s)
+            except BaseException:
+                proc.kill()
+                raise
+            res = kb.collect(problems, run_dir, proc)          # final result.json (llm calls, proposals)
+            times = {k: f.result() for k, f in futs.items()}
+        for n, k in enumerate(live):
+            results[k] = (res[2 * n], res[2 * n + 1], times.get(k))
+    return [finish_hint(j, *results.get(k, (None, None, None)), cache=cache, doc=doc, cfg=cfg)
+            for k, j in enumerate(jobs)]
+
+
+def evaluate_hint(h: dict, prof: dict, out: Path, *, kb: KBRunner, cache: CudaCache, doc: dict,
+                  cfg: Config, specs: dict, leases: GpuLeases | None = None) -> dict:
+    """Build original + variant problems for one hint on one IR, optimise
+    both with the same budget, re-measure, decide, record."""
+    return evaluate_hints([(h, prof, out)], out / "run", kb=kb, cache=cache, doc=doc, cfg=cfg, specs=specs,
+                          leases=leases)[0]
+
+
+def decide_hints(cands: list[tuple[dict, dict]], graphs: dict, out: Path, width: int, *, kb: KBRunner,
+                 cache: CudaCache, doc: dict, cfg: Config, specs: dict, leases: GpuLeases | None = None,
+                 hints_path: Path | None = None) -> tuple[list[list[str]], list[dict]]:
+    """A round's decisions: ``cands`` = (hint, profile) in rank order,
+    ``graphs`` = {IR: its current graph}. Schedules them into waves of at
+    most ``width`` independent hints, evaluates wave after wave (the hints
+    file is saved after each) -> (waves as hint ids, decisions in rank order)."""
+    fps = [footprint(h, p["ir"], graphs[p["ir"]], specs) for h, p in cands]
+    waves = schedule(fps, width)
+    decided: dict[int, dict] = {}
+    for k, w in enumerate(waves):
+        items = [(cands[i][0], cands[i][1], out / _safe(cands[i][0]["id"])) for i in w]
+        run_dir = items[0][2] / "run" if len(w) == 1 else out / f"wave{k:02d}"
+        for i, d in zip(w, evaluate_hints(items, run_dir, kb=kb, cache=cache, doc=doc, cfg=cfg, specs=specs,
+                                          leases=leases)):
+            decided[i] = d
+        if hints_path is not None:
+            gh.save(doc, hints_path)
+    return [[cands[i][0]["id"] for i in w] for w in waves], [decided[i] for i in sorted(decided)]
+
+
+# ---------------------------------------------------------------- rounds
+
 def run(irs: list[Path], work: Path, cfg: Config) -> dict:
     work = Path(work).resolve()
-    work.mkdir(parents=True, exist_ok=True)
+    with work_lock(work):
+        return _run(irs, work, cfg)
+
+
+def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hints_path, state_path = work / "graph_hints.json", work / "state.json"
     doc, cache = gh.load(hints_path), CudaCache(work / "cache")
     state = json.loads(state_path.read_text()) if state_path.exists() else {"sent": [], "rounds": []}
     kb = KBRunner(cfg, work / "knowledge")
     specs = dict(_all_specs())
+    gpus = detect_gpus(cfg)
+    n_gpus = len(gpus["remote"]) if cfg.ssh_hosts else len(gpus["local"])
+    width = cfg.parallel_hints or auto_parallel_hints(n_gpus)
+    leases = GpuLeases(gpus["local"])
+    state["gpus"] = {"pool": gpus, "parallel_hints": width}
     first = None
     for r in range(len(state["rounds"]), len(state["rounds"]) + cfg.rounds):
         R = work / f"r{r:02d}"
@@ -271,8 +680,9 @@ def run(irs: list[Path], work: Path, cfg: Config) -> dict:
             raise RuntimeError(f"round {r}: profile failed for {bad}; see {R / 'profile'}")
         first = first or {p["ir"]: p["partition_us"] for p in profiles}
         rec["partition_us"] = {p["ir"]: p["partition_us"] for p in profiles}
+        graphs = {}
         for p in profiles:                                  # MB's own proposals
-            g = json.loads((Path(p["ir_dir"]) / "graph.json").read_text())
+            g = graphs[p["ir"]] = json.loads((Path(p["ir_dir"]) / "graph.json").read_text())
             gh.merge(doc, gh.propose_from_profile(g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs,
                                                    doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"]))
         plan = make_plan(profiles, coverage=cfg.coverage, top_k=cfg.top_k, min_share=cfg.min_share,
@@ -300,15 +710,13 @@ def run(irs: list[Path], work: Path, cfg: Config) -> dict:
         gh.save(doc, hints_path)
         todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
                 and h["kind"] in ("fuse", "split_slot") and _est_gain(h) >= cfg.min_gain_pct]
-        todo.sort(key=lambda h: -_est_gain(h))
-        for h in todo[:cfg.max_variants]:
-            prof = _hint_ir(h, profiles)
-            if prof is None:
-                continue
-            d = evaluate_hint(h, prof, R / "variants" / _safe(h["id"]), kb=kb, cache=cache, doc=doc,
-                              cfg=cfg, specs=specs)
-            rec["decisions"].append(d)
-            gh.save(doc, hints_path)
+        todo.sort(key=lambda h: -_est_gain(h))              # stable: ties keep the hints file's order
+        cands = [(h, p) for h in todo[:cfg.max_variants] if (p := _hint_ir(h, profiles)) is not None]
+        t_dec = time.time()
+        waves, rec["decisions"] = decide_hints(cands, graphs, R / "variants", width, kb=kb, cache=cache, doc=doc,
+                                               cfg=cfg, specs=specs, leases=leases, hints_path=hints_path)
+        rec["parallel_hints"], rec["waves"] = width, waves
+        rec["decide_seconds"] = round(time.time() - t_dec, 1)
         rec["seconds"] = round(time.time() - t0, 1)
         rec["llm_calls_total"] = kb.calls
         state["rounds"].append(rec)
@@ -316,6 +724,7 @@ def run(irs: list[Path], work: Path, cfg: Config) -> dict:
         (R / "round.json").write_text(json.dumps(rec, indent=1))
         accepted = [d for d in rec["decisions"] if d.get("hint_status") == "accepted"]
         print(json.dumps({"round": r, "partition_us": rec["partition_us"], "plan": rec["plan"]["problems"],
+                          "waves": rec["waves"],
                           "decisions": [(d["hint"], d["status"], d.get("gain")) for d in rec["decisions"]]}),
               flush=True)
         if not accepted and not plan["problems"] and len(todo) <= cfg.max_variants:
@@ -328,7 +737,7 @@ def run(irs: list[Path], work: Path, cfg: Config) -> dict:
     summary = {"irs": {}, "rounds": len(state["rounds"]), "fixpoint": state.get("fixpoint"),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
-               "llm_calls": kb.calls}
+               "llm_calls": kb.calls, "parallel_hints": width}
     first0 = state["rounds"][0]["partition_us"] if state["rounds"] else (first or {})
     for name, v in final.items():
         ir = v.get("ir", name)
@@ -341,6 +750,10 @@ def run(irs: list[Path], work: Path, cfg: Config) -> dict:
     return summary
 
 
+def _parallel_arg(s: str) -> int:
+    return 0 if s == "auto" else max(1, int(s))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("irs", nargs="+")
@@ -350,16 +763,25 @@ def main():
     ap.add_argument("--reflect-model")
     ap.add_argument("--plugin", action="append", default=[], help="passed to run_multislot.py (stub: models)")
     ap.add_argument("--python", default=sys.executable, help="python for KernelBlaster")
+    ap.add_argument("--parallel-hints", type=_parallel_arg, default=0,
+                    help="hints decided at once: auto (default: max(4, 2 x GPUs in the pool)) or N (1 = one by one)")
+    ap.add_argument("--gpus", default="auto", help="local GPUs for KernelBlaster and re-timing: auto|all|0,2")
+    ap.add_argument("--ssh-host", action="append", default=[], help="KernelBlaster runs on these hosts (repeatable)")
+    ap.add_argument("--cuda-visible-devices", action="append", default=[],
+                    help="with --ssh-host: auto|ids, once for all hosts or once per host")
+    ap.add_argument("--ssh-key")
+    ap.add_argument("--remote-dir")
     for k, v in asdict(Config(kb=Path("."))).items():
-        if k in ("kb", "model", "reflect_model", "plugins", "python"):
+        if k in _MANUAL_FIELDS:
             continue
         ap.add_argument("--" + k.replace("_", "-"), type=type(v) if v is not None else
                         (int if k in ("top_k", "variant_steps") else str), default=v)
     a = ap.parse_args()
     cfg = Config(kb=Path(a.kb).resolve(), model=a.model, reflect_model=a.reflect_model,
                  plugins=[str(Path(p).resolve()) for p in a.plugin], python=a.python,
-                 **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in
-                    ("kb", "model", "reflect_model", "plugins", "python")})
+                 parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
+                 cuda_visible_devices=a.cuda_visible_devices, ssh_key=a.ssh_key, remote_dir=a.remote_dir,
+                 **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in _MANUAL_FIELDS})
     print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
 
 

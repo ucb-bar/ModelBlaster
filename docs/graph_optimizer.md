@@ -23,7 +23,8 @@ IRs ──► profile (accepted hints applied, cached winners)          pipeline
          ▼
         for the top undecided hints: original + variant problems of the affected ops,
         same seeds, same KB budget, both bests re-timed back to back ──► accept / reject
-         │                                                            kb_graph_opt.evaluate_hint
+        independent hints in waves: one KB run per wave, re-timed on leased GPUs
+         │                                          kb_graph_opt.schedule / evaluate_hints
          ▼
         accepted hints apply from the next round (fusions grow into chains); their new
         kernels go into the cache; stop when a round accepts nothing and sends nothing
@@ -44,7 +45,7 @@ rounds; `gpu_eval/tools/kb_loop.sh` is still one round (now on the hints file, w
 | MB | `pipeline/kb_plan.py` | profile, rank/dedup, select, problems, `export_plan` |
 | MB | `pipeline/kb_ingest.py` | `cache_plan` (per-slot lookups, coverage splits, cached stage kernels for fused seeds), `verify_ir` with hints |
 | MB | `pipeline/kb_export.py` | `MB_OP_US`, slot variants (`slot_variant`), fused specs rebuilt from their names, `build_and_run(runs=)`, `--hints`, `--plan` |
-| MB | `pipeline/kb_graph_opt.py` | rounds to a fixpoint; KernelBlaster as a subprocess |
+| MB | `pipeline/kb_graph_opt.py` | rounds to a fixpoint; KernelBlaster as a subprocess; hint footprints, conflict waves, GPU leases, work-dir lock |
 | KB | `agents/opt_multislot.py` | `propose_splits` (kind `split`) next to `propose_fusions`; fused shapes in the roofline cost |
 | KB | `knowledge/slots.py`, `impl_store.py` | `EvalResult.op_us`; fused shapes bucket by their first stage |
 | KB | `scripts/run_multislot.py` | `--plugin FILE` (register `stub:` models from another process) |
@@ -165,7 +166,8 @@ For a hint, `evaluate_hint` exports the affected ops twice from the current stat
 hints, cache): the *original* and, with the hint applied, the *variant*; both seeded with the
 same current-best kernels (fused seeds composed from them). KernelBlaster optimises both with
 the same budget in one run; then both composite bests are built once and run round-robin
-`remeasure` times (`kb_proposals.remeasure`), and the medians decide (`accept_gain`, 3 %).
+`remeasure` times on one leased GPU (`kb_proposals.remeasure`), and the medians decide
+(`accept_gain`, 3 %).
 Accepting caches the variant's new slots (the fused kernel, the split variants) on their shapes,
 whatever their speedup over their seed, since the decision already measured them against the
 unchanged graph.
@@ -175,10 +177,135 @@ unchanged graph.
 `kb_graph_opt.run` keeps `graph_hints.json`, `cache/`, KernelBlaster's `knowledge/` and
 `state.json` (items sent, rounds) in the work dir, so a later call resumes. A round: profile →
 MB proposals → plan → KB → ingest → KB proposals → decide the `max_variants` undecided hints with
-the largest estimated gain. Accepted fusions are applied in the next round's profile, which makes
+the largest estimated gain, independent ones together (next section). Accepted fusions are applied in the next round's profile, which makes
 the fused op's consumer a new candidate (chains grow: conv→bn, then (conv+bn)→relu) and the fused
 instances new plan items. It stops when a round accepts nothing, sends nothing and has no more
 undecided hints than it can evaluate, or after `rounds`.
+
+### Parallel hint decisions
+
+A round's candidates (the `max_variants` undecided hints, in rank order) are decided in
+*waves* of independent hints instead of one KernelBlaster run after another
+(`kb_graph_opt.footprint` / `conflicts` / `schedule` / `evaluate_hints`).
+
+**What deciding a hint touches.** `footprint(h)` on the hint's IR, in its round-start state:
+
+- `ops`: (IR, original op name) of every op its original/variant problems hold;
+- `reads`: the cache entries (C entries, not op kinds: `sum_dim`/`max_dim` share `kernel_reduce`)
+  its problems are seeded from -- those ops', their stages' (fused ops), and its own new slot;
+- `writes`: the entries an acceptance ingests -- the fused kind (`fuse`), or the base slot's entry,
+  guarded on its shapes (`split_slot`).
+
+Entries, not (entry, shape): a slot's cache lookup and coverage split look at every instance of
+the slot in the IR, so a split winner for some conv shapes can re-seed (and re-split) every conv
+slot of that IR.
+
+**Conflict rule.** Two hints conflict when they share an op, or when one writes an entry the
+other reads. Sharing an op covers the dependent cases: a chain and the fusion it extends
+(`conv→bn→relu` vs `conv→bn`), two fusions of one op (`conv→bn` vs `bn→relu`), a split and any
+fusion of its instances. Writing what the other reads covers composition through the cache: an
+accepted split caches conv kernels that a later conv fusion is seeded from. Two fusions of
+different ops never conflict -- an accepted fusion changes the graph only from the next round on
+(the next profile), and the fused kernel it caches is read only by ops of its own kind.
+
+**Ordering rule.** In rank order (estimated gain, ties in hints-file order), hint *i* goes to the
+first wave after every earlier hint it conflicts with that still has room (`--parallel-hints`).
+Every conflicting pair is therefore decided in rank order, after the earlier one's decision and
+cache ingest, which is exactly what deciding the hints one by one does; independent hints share a
+wave. The waves depend only on the order and the footprints (deterministic), and are recorded in
+`round.json` (`waves`). Decisions, evidence and ingests are made in rank order in the main thread.
+Example (unit test): split `conv2d` > `conv→bn` > `conv→sigmoid` > `bn→relu` > `conv→tanh` gives
+`[split] [conv→bn, conv→sigmoid, conv→tanh] [bn→relu]`.
+
+**What is still different from one-by-one.** KernelBlaster's knowledge (implementation store,
+outcome log, claims) is shared context, not an input of the comparison: a hint does not see the
+store records of hints in its own wave, as it would have when they ran before it; it does see
+every earlier wave's. Both sides of a hint read the same store state. Within one hint the original
+and variant problems now run concurrently (before, on one GPU, the variant ran after the original
+and could pick up its kernels from the store; with several GPUs that was already concurrent).
+
+**Mechanism.** One `run_multislot.py` per wave with all its problems and `--parallel-problems` =
+their number, rather than one process per hint:
+
+- KernelBlaster's GPU pool gives each timed run one GPU and its adaptive build limiter bounds the
+  compiles, so the wave width does not oversubscribe the GPUs; it only sets how much LLM latency and
+  compile time overlaps other hints' runs.
+- The knowledge dir has one writer: v1 `claims.json` is single-writer, and the store, outcome log
+  and claims writes are synchronous within one process.
+- A hint's original and variant run in the same process at the same time.
+
+A hint is re-timed as soon as both its `result.json` exist (KernelBlaster writes the best slot
+sources first), while KernelBlaster works on the others. The two composite bests are built, then
+run interleaved on **one** leased GPU (`GpuLeases`), so the decision always compares the two
+sides on the same device, close in time, whatever the pool's mix of models. A lease is exclusive
+within the process and holds KernelBlaster's per-GPU lock file
+(`/dev/shm/kernelblaster_gpu_<uuid>.lock`), so KernelBlaster runs of this flow or of any other
+process wait instead of timing on that GPU at the same time. There are at most two re-timing
+workers per GPU: one builds while the other times.
+
+**Shared state.**
+
+| state | writers |
+|---|---|
+| `graph_hints.json` | main thread only, after each wave; `graph_hints.save` is atomic (temp file + rename) |
+| `cache/index.json` | main thread only (`finish_hint`, rank order); sources are content-addressed |
+| `knowledge/` | one KernelBlaster process at a time (the plan run, then one per wave) |
+| `state.json`, `round.json` | main thread |
+| the work dir as a whole | one `kb_graph_opt` process: `run` holds an flock on `W/.lock` and fails fast if another run holds it |
+
+**Flags.**
+
+- `--parallel-hints auto|N`: auto is `max(4, 2 × GPUs)`; 1 decides one by one.
+- `--gpus`, or `--ssh-host` (repeatable) with `--cuda-visible-devices` (`--ssh-key`,
+  `--remote-dir`), are passed to every KernelBlaster run.
+- The GPU count comes from KernelBlaster's own `select_gpus`: auto takes the idle GPUs, else the
+  least busy one, bounded by an externally set `CUDA_VISIBLE_DEVICES`.
+- Re-timing uses this host's selected GPUs.
+
+**Measured** (`gpu_eval/work/graphopt_par`, scratch). The model has four independent
+conv → {bn, sigmoid, tanh, silu} branches with mixed 1×1 / 3×3 convs (`cat` output). The run is
+`--rounds 3 --rollouts 1 --steps 1 --variant-steps 2 --max-variants 4 --top-k 2 --remeasure 5
+--accept-gain -1`, so every verified variant is accepted and all runs make the same decisions:
+round 0 decides the four fusions, round 1 the `conv→bn→relu` chain, and round 2 is the fixpoint.
+The `stub:` LLM answers instantly (lat 0) or after an `asyncio.sleep(5)` (lat 5 s, standing in for
+LLM latency). Each cell is the median whole-run wall-clock with the range of N; "before" is
+`feat/kb-multislot` @2eb2a7d.
+
+| host | GPUs | lat | before | width 1 | width 2 | width 4 | before → 4 |
+|---|---|---|---|---|---|---|---|
+| local TITAN RTX (load 8–27, shared GPU) | 1 | 0 | 172 s (152–174), N=3 | — | 114 s (63–116), N=3 | 97 s (69–124), N=2 | 1.8× |
+| local | 1 | 5 s | 274 s (251–298), N=2 | — | 160 s (158–161), N=2 | 128 s (116–140), N=2 | 2.1× |
+| firesim2 L40S (GPU 2) | 1 | 0 | 108 s (100–116), N=2 | — | 80 s (76–83), N=2 | 82 s (67–96), N=2 | 1.3× |
+| firesim2 | 1 | 5 s | 231 s (230–232), N=2 | — | 127 s (118–136), N=2 | 100 s (100–101), N=2 | 2.3× |
+| firesim2 L40S (GPUs 2, 3) | 2 | 0 | 106 s (95–117), N=2 | 100 s (90–109), N=2 | 79 s (73–85), N=2 | 74 s (65–82), N=2 | 1.4× |
+| firesim2 | 2 | 5 s | 219 s (201–236), N=2 | 173 s (166–180), N=2 | 129 s (128–131), N=2 | 109 s (106–112), N=2 | 2.0× |
+
+- Round 0 alone (profile, plan run, four decisions) on two L40S at lat 5 s: 151 s before vs 48 s at
+  width 4 (3.1×).
+- Width 1 (this code, one by one) is a little faster than before, because a hint's two problems
+  now always run concurrently.
+- Width 4 is faster than or level with width 2 in every cell, by 15–21 % when there is LLM latency.
+  Hence the auto default of max(4, 2 × GPUs).
+- What is left in a round is the profile, the plan run and the chain round, which are serial.
+- Every run accepted the same five hints and the final model verified.
+- Firesim2 GPUs 0 and 1 had other users' processes and were not used (`CUDA_VISIBLE_DEVICES`
+  bounded both before and after to GPUs 2 and 3).
+- Locally the box had a load of 8–27 and, in the later runs, another user's process on the GPU, hence
+  the ranges.
+
+Live, Haiku (`us.anthropic.claude-haiku-5-5`), local TITAN RTX shared with another user's process,
+same model, `--rounds 2 --rollouts 1 --steps 2 --variant-steps 1 --max-variants 4 --top-k 2
+--remeasure 5`, default 3 % bar, one run each:
+
+| | wall | round 0 (4 hints) | round 1 | LLM calls | tokens in / out | decisions |
+|---|---|---|---|---|---|---|
+| before | 351 s | 267 s | 81 s | 15 | 58.9k / 38.8k | 4 accepted, `conv→bn` rejected |
+| width 4 (one wave) | 188 s (1.9×) | 99 s (2.7×) | 85 s | 15 | 51.9k / 39.8k | 3 accepted, `conv→bn` and `conv→tanh` rejected |
+
+The decisions differ on `conv→tanh` (+5.7 % in one run, −14 % in the other). These are few-µs
+kernels on a GPU another process kept busy, single LLM runs: the same noise as in the single-run
+caveats above, not an effect of the waves (the stub runs, with fixed decisions, are the
+equivalence check). Both final models verified. About $0.25 per run.
 
 ## Running
 
@@ -188,6 +315,7 @@ python -m modelblaster.pipeline.kb_graph_opt $L3/8_ResNetBasicBlock $L3/9_ResNet
     --kb $KB --python $KB_PY --model us.anthropic.claude-haiku-5-5 \
     --rounds 4 --rollouts 2 --steps 4 --variant-steps 2 --max-variants 3 --top-k 6 --remeasure 5
 # scripted runs: --model stub:<name> --plugin file.py (the file registers the stub)
+# GPU pool: --parallel-hints auto|N  --gpus auto|all|0,2  or  --ssh-host H --cuda-visible-devices auto
 
 # pieces
 python -m modelblaster.pipeline.kb_plan profile IR... --out P [--hints H --cache C]
@@ -223,9 +351,22 @@ STRATEGY=plan bash gpu_eval/tools/kb_loop.sh IR W        # one round
   takes a split hint through original/variant problems (`conv2d__v0`, `conv2d__v1`), KB and a
   re-measured decision. `kb_loop.sh STRATEGY=plan` with the same stub: conv→bn accepted at
   +12.7 %, ingested, model verified.
+- **Parallel decisions**: `pipeline/tests/test_kb_graph_opt_parallel.py` (7, no GPU) covers
+  footprints, conflicts and waves for every width, with conflicting pairs kept in rank order. On a
+  real exported IR with a fake KernelBlaster and a deterministic fake re-timing that depends on
+  every seed, the decide phase gives the same decisions, evidence, statuses and cache in waves as one
+  by one, including a conv fusion seeded from the conv kernel that the earlier split's acceptance
+  cached. If the conflict check is disabled, two of the five gains change. It also covers lease
+  exclusivity per GPU, a lease waiting for another process that holds KernelBlaster's GPU lock file,
+  the work-dir lock across processes, atomic hints-file writes under concurrent writers, and the
+  pool flags. In `test_kb_graph_opt_flow.py`, `test_parallel_hints_same_decisions` runs four
+  independent branches with the KernelBlaster subprocess: width 4 decides them in one wave, width 1
+  one by one, with the same accepted hints and the same fused model.
 - Suites: MB `pipeline/tests tests benchmarks/tests` 223 passed, 11 skipped, 1 pre-existing
   failure (`test_profile_db.py::test_hetero_runs_are_skipped`) with `MB_KB_ROOT`/`MB_KB_PYTHON`
   set (221 passed, 13 skipped without a KernelBlaster checkout); KB `tests` 83 passed.
+  With the parallel decisions (KB 5fbcfb1, `gpu_eval/venv_cu126`): `pipeline/tests` 182 passed,
+  4 skipped; `tests` 58 passed, 7 skipped.
 
 ### Live run (Bedrock `us.anthropic.claude-haiku-5-5`, single runs)
 
@@ -273,6 +414,9 @@ chain itself.
 | 14 | Items are sent once; fixpoint = a round accepts nothing, sends nothing and has no undecided hints left over | resend until no improvement | Bounded cost; a graph change creates new items (fused kinds) which are then sent, so accepted changes still get kernel work. |
 | 15 | Orchestrator in Python, KernelBlaster as a subprocess; `--plugin` registers `stub:` models in it | bash (Phase 1 `kb_loop.sh`); KB in-process | State, provenance and decisions need structure; process isolation keeps KB's dependencies and GPU state apart; tests exercise the real CLI. |
 | 16 | Per-op times are an additive driver line (`MB_OP_US`) in `mb-kb-problem/1` | a new format version; walk_cuda timing | Older parsers ignore it; it is the same CUDA-event timing as the per-slot numbers and covers fused ops and cached sources, which walk_cuda (hand/seed kernels only) does not. |
+| 17 | Independent hints are decided in waves; conflict = shared op, or one's cache writes are the other's seeds (by C entry); wave = first after every conflicting earlier hint | sequential (as before); a dependency graph executed as soon as inputs are ready; conflicts by (entry, shape) | Waves keep every conflicting pair in rank order, so the outcome is the one-by-one outcome; whole-entry conflicts are conservative because a slot's lookup and coverage split see every instance in the IR. A ready-as-soon-as scheduler would gain little with `max_variants` ≤ a few hints and complicate the determinism argument. |
+| 18 | One KernelBlaster process per wave with every problem (`--parallel-problems` = all), not one process per hint | a bounded pool of `run_multislot` processes | The knowledge dir stays single-writer (v1 claims.json); KernelBlaster's pool and build limiter already bound GPU and CPU use across problems; a hint's two sides run in the same process at the same time. |
+| 19 | Decisions are re-timed by ModelBlaster on one leased GPU per hint, holding KernelBlaster's per-GPU lock file; started as soon as the hint's two results exist | trust KB's final numbers; re-time after the whole wave | The two sides are compared on the same device, interleaved, regardless of where KB ran them (KB pins a problem's runs to one GPU model, but the two sides are two problems); overlapping with the rest of the wave hides the builds. |
 
 ## Further proposal kinds (designs, not implemented)
 
@@ -309,5 +453,9 @@ chain itself.
   the whole model, KB's only its partition. Only linear chains are fused.
 - `profile_ir` exports the whole model with its data (Level3 IRs up to a few GB) each round; it
   deletes data.bin afterwards.
-- The flow's per-hint KB runs are sequential; independent hints could run in parallel within the
-  GPU-memory and process limits.
+- Within a wave, a hint does not see KernelBlaster store records of the other hints in that wave
+  (it would one by one); `--parallel-hints 1` restores that order.
+- Re-timing runs on this host: with `--ssh-host` only, KernelBlaster runs remotely but the decisions
+  are re-timed on the local default GPU (`remeasure` would need the ssh evaluator's copy-and-run).
+- With `--remeasure 0` the decision uses KernelBlaster's two final numbers, which in a pool of mixed
+  GPU models can come from different models (each problem is pinned to one model, the pair is not).
