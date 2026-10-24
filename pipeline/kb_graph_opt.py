@@ -705,7 +705,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         for p in profiles:                                  # MB's own proposals
             g = graphs[p["ir"]] = json.loads((Path(p["ir_dir"]) / "graph.json").read_text())
             gh.merge(doc, gh.propose_from_profile(g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs,
-                                                   doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"]))
+                                                   doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"],
+                                                   launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
         T.lap("mb.plan")
         plan = make_plan(profiles, coverage=cfg.coverage, top_k=cfg.top_k, min_share=cfg.min_share,
                          exclude=set(state["sent"]))
@@ -771,13 +772,29 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
                "llm_calls": kb.calls, "parallel_hints": width}
     first0 = state["rounds"][0]["partition_us"] if state["rounds"] else (first or {})
+    # the model's result: the whole model on the final cache and hints, as deployed (CUDA graph
+    # replay in the persistent runtime), against the hand-seeded original timed the same way
+    from .kb_model_run import model_runtime
+    models = {}
+    with T.span("mb.model_run"):
+        for d in irs:
+            try:
+                models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
+                                                     hints=hints_path, arch=cfg.arch, specs=specs)
+            except Exception as e:                   # the verification above stands; report why
+                models[Path(d).name] = {"error": repr(e)}
     for name, v in final.items():
         ir = v.get("ir", name)
         f0 = first0.get(ir)
+        m = models.get(name, {})
         summary["irs"][ir] = {"first_us": f0, "final_us": v.get("partition_us"), "passed": v.get("passed"),
                               "speedup": (f0 / v["partition_us"]) if f0 and v.get("partition_us") else None,
                               "hints": v.get("hints"), "fused": v.get("fused"),
-                              "cache_split": v.get("cache_split")}
+                              "cache_split": v.get("cache_split"),
+                              "model_e2e_us": m.get("model_e2e_us"), "model_basis": m.get("model_basis"),
+                              "seed_e2e_us": m.get("seed_e2e_us"), "model_speedup": m.get("speedup"),
+                              "model_passed": m.get("passed"), **({"model_error": m["error"]} if "error" in m else {})}
+    (work / "model_runtime.json").write_text(json.dumps(models, indent=1, default=str))
     tr = {"mb": kbt.compact(T.full_summary(run_span)), "kb": kbt.kb_rollup(kb.telemetry)}
     if tr["mb"] or tr["kb"]:
         summary["telemetry"] = tr
