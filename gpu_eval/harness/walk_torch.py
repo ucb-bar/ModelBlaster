@@ -4,6 +4,10 @@ Answers "is graph.json + weights.npz enough to run the model on a GPU?"
 independently of any CUDA kernel work, and doubles as the per-op oracle
 walk_cuda.py diffs against.
 
+An `_f16` op runs its fp32 rule and rounds every output to fp16 (and the
+recurrent state of lstm_seq/gru_seq every step): the fp16 contract is fp16
+storage with fp32 math, so this is the value an exact fp16 kernel stores.
+
     python walk_torch.py IR_DIR [IR_DIR ...] [--json out.json] [--device cpu]
 """
 from __future__ import annotations
@@ -16,6 +20,15 @@ import torch
 import torch.nn.functional as F
 
 from mbir import IR, compare, load_ir, strict_fp32
+
+
+def _round_f16(t):
+    """The binary16 value an fp16 kernel stores for an fp32 result (RNE; inf past 65504)."""
+    return t.half().to(t.dtype) if t.is_floating_point() else t
+
+
+def _state_rounding(op):
+    return _round_f16 if op["op"].endswith("_f16") else (lambda t: t)
 
 
 def _unary(fn):
@@ -308,12 +321,14 @@ def _lstm_seq(ir, op, ins, dev):
     x = x.reshape(B, T, sh["I"])
     h, c = h.reshape(B, H).clone(), c.reshape(B, H).clone()
     y = torch.empty(B, T, H, device=x.device)
+    q = _state_rounding(op)                 # fp16: h and c are stored every step
     for s_ in range(T):
         t = T - 1 - s_ if sh["reverse"] else s_
         g = x[:, t] @ w_ih.T + h @ w_hh.T + bg
         i, f, gg, o = g.chunk(4, dim=1)
         c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(gg)
-        h = torch.sigmoid(o) * torch.tanh(c)
+        h = q(torch.sigmoid(o) * torch.tanh(c))
+        c = q(c)
         y[:, t] = h
     return [y, h, c]
 
@@ -325,6 +340,7 @@ def _gru_seq(ir, op, ins, dev):
     x = x.reshape(B, T, sh["I"])
     h = h.reshape(B, H).clone()
     y = torch.empty(B, T, H, device=x.device)
+    q = _state_rounding(op)
     for s_ in range(T):
         t = T - 1 - s_ if sh["reverse"] else s_
         gi = x[:, t] @ w_ih.T + b_ih
@@ -332,7 +348,7 @@ def _gru_seq(ir, op, ins, dev):
         r = torch.sigmoid(gi[:, :H] + gh[:, :H])
         z = torch.sigmoid(gi[:, H:2 * H] + gh[:, H:2 * H])
         n = torch.tanh(gi[:, 2 * H:] + r * gh[:, 2 * H:])
-        h = (1 - z) * n + z * h
+        h = q((1 - z) * n + z * h)
         y[:, t] = h
     return [y, h]
 
@@ -382,6 +398,11 @@ OPS.update({
 })
 
 
+def _rule(kind: str):
+    """An `_f16` kind runs its fp32 rule (walk rounds the outputs)."""
+    return OPS.get(kind) or (OPS.get(kind[:-4]) if kind.endswith("_f16") else None)
+
+
 def walk(ir: IR, dev="cuda", keep_all=False):
     """Returns (output_flat, env) — env maps every IR tensor to its value."""
     env = ir.input_tensors(dev)
@@ -391,10 +412,12 @@ def walk(ir: IR, dev="cuda", keep_all=False):
             for sub in op["sub_ops"]:
                 run_op(sub)
             return
-        fn = OPS.get(op["op"])
+        fn = _rule(op["op"])
         if fn is None:
             raise NotImplementedError(op["op"])
         outs = fn(ir, op, [env[t] for t in op["inputs"]], dev)
+        if op["op"].endswith("_f16"):
+            outs = [_round_f16(v) for v in outs]
         for name, val in zip(op["outputs"], outs):
             env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
 
@@ -407,14 +430,14 @@ def walk(ir: IR, dev="cuda", keep_all=False):
 def run_one(d: str, dev="cuda") -> dict:
     ir = load_ir(d)
     ops = sorted({o["op"] for o in ir.ops})
-    missing = [o for o in ops if o not in OPS]
+    missing = [o for o in ops if _rule(o) is None]
     rec = {"ir": ir.name, "n_ops": len(ir.ops), "op_types": ops, "unsupported": missing}
     if missing:
         rec["ok"] = False
         return rec
     with torch.no_grad():
         out, _ = walk(ir, dev)
-        rec.update(compare(out, ir.golden_out))
+        rec.update(compare(out, ir.golden_out, ir.dtype))
         if dev == "cuda":
             # warm timing of the whole walk (eager, includes launch overhead)
             torch.cuda.synchronize()
