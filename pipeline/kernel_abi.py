@@ -12,7 +12,8 @@ and any CUDA walker) derive the call from (signature, op):
     past the last input bind NULL (variadic kernels such as catn)
   * scalar                 -> op["shape"][name], then op[name] (or its
     alias, e.g. `s` <- op["scalar"]), then shape["C_inputs"][k] for c<k>,
-    then a few ABI defaults (DH/DW = 1)
+    then a few ABI defaults (DH/DW = 1), then per-op defaults
+    (_OP_DEFAULTS); `Ca`/`Cb` are C_inputs[0]/[1] like `c0`/`c1`
 """
 from __future__ import annotations
 
@@ -23,6 +24,12 @@ from typing import Any
 WEIGHT_ROLES = {"weight": "weight", "scale": "weight", "bias": "bias",
                 "gamma": "gamma_key", "beta": "beta_key"}
 _DEFAULTS = {"DH": 1, "DW": 1, "alpha": 1.0}
+# hand-written `_f16` specs with extra parameters (the values generate_skeleton
+# passes): softmax_f16's fused input scale, and the output size of
+# adaptive_avg_pool2d_f16 -- MB's adaptive_avg_pool2d is the global (1x1) pool
+_OP_DEFAULTS = {"softmax_f16": {"input_scale": 1.0},
+                "adaptive_avg_pool2d_f16": {"OH": 1, "OW": 1}}
+_C_INPUT_ALIASES = {"Ca": 0, "Cb": 1}
 # signature param name -> op field holding its value, where they differ
 _FIELD_ALIASES = {"s": "scalar"}
 
@@ -100,8 +107,12 @@ def bind(op: dict, params: list[Param]) -> list[Arg]:
                 v = op[_FIELD_ALIASES[p.name]]
             elif re.fullmatch(r"c\d", p.name) and "C_inputs" in shape:
                 v = shape["C_inputs"][int(p.name[1])]
+            elif p.name in _C_INPUT_ALIASES and "C_inputs" in shape:
+                v = shape["C_inputs"][_C_INPUT_ALIASES[p.name]]
             elif p.name in _DEFAULTS:
                 v = _DEFAULTS[p.name]
+            elif p.name in _OP_DEFAULTS.get(op["op"], {}):
+                v = _OP_DEFAULTS[op["op"]][p.name]
             else:
                 raise BindError(f"{op['op']}: no value for scalar {p.ctype} {p.name}")
             args.append(Arg("scalar", v, p))
