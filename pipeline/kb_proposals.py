@@ -389,11 +389,21 @@ def apply_accepted(graph: dict, registry: Path = DEFAULT_REGISTRY, specs: dict |
     return g, used, [a["op"] for a in prov["applied"]]
 
 
-def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5) -> list[list[float]]:
+def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, lease=None,
+              timeout: int = 1800) -> list[list[float]]:
     """Build each (problem dir, sources) once, then run them round-robin
     ``reps`` times -> partition times per problem. Interleaving keeps a
-    shared GPU's load changes from favouring one side."""
-    from .kb_export import build_and_run, run_built
+    shared GPU's load changes from favouring one side.
+
+    ``lease`` (optional) is a context manager yielding the environment for
+    the runs (e.g. ``CUDA_VISIBLE_DEVICES`` of one GPU, held exclusively):
+    it is entered after the builds, so every run of every problem goes to
+    the same GPU while nothing else times on it."""
+    import contextlib
+    import os
+    import subprocess
+
+    from .kb_export import build_and_run, parse_driver_output
 
     exes = []
     for k, (d, src) in enumerate(problems):
@@ -402,11 +412,14 @@ def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5) ->
             raise RuntimeError(f"{d}: {r.get('log', '')[-800:]}")
         exes.append(r["exe"])
     times: list[list[float]] = [[] for _ in problems]
-    for _ in range(reps):
-        for k, exe in enumerate(exes):
-            r = run_built(exe)
-            if r.get("passed") and r.get("partition_us"):
-                times[k].append(r["partition_us"])
+    with (lease if lease is not None else contextlib.nullcontext({})) as env:
+        run_env = {**os.environ, **(env or {})}
+        for _ in range(reps):
+            for k, exe in enumerate(exes):
+                rp = subprocess.run([str(exe)], capture_output=True, text=True, timeout=timeout, env=run_env)
+                r = parse_driver_output(rp.stdout)
+                if r.get("passed") and r.get("partition_us"):
+                    times[k].append(r["partition_us"])
     return times
 
 

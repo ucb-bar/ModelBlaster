@@ -48,6 +48,27 @@ def get_init_inputs():
     return []
 '''
 
+# Four independent conv -> elementwise branches, one conv shape (no split).
+BRANCHES = '''import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c1 = nn.Conv2d(8, 8, 3, padding=1)
+        self.b1 = nn.BatchNorm2d(8)
+        self.c2 = nn.Conv2d(8, 8, 3, padding=1)
+        self.c3 = nn.Conv2d(8, 8, 3, padding=1)
+        self.c4 = nn.Conv2d(8, 8, 3, padding=1)
+        self.relu = nn.ReLU()
+    def forward(self, x):
+        return torch.cat([self.b1(self.c1(x)), self.relu(self.c2(x)), torch.sigmoid(self.c3(x)),
+                          torch.tanh(self.c4(x))], dim=1)
+def get_inputs():
+    return [torch.randn(1, 8, 16, 16)]
+def get_init_inputs():
+    return []
+'''
+
 # One thread per output; the same arithmetic as the hand conv + bn (+ relu)
 # kernels, so the fused result is bit-identical -- but one launch and no
 # intermediate round trip.
@@ -206,6 +227,49 @@ class GraphOptFlowTest(unittest.TestCase):
         if final is not None:
             tags = [x["seed_source"] for x in final["slots"] if x["op"] == "fused__conv2d__batchnorm2d__relu"]
             self.assertTrue(tags and any(t.startswith("cache:") for t in tags), final["slots"])
+
+    def test_parallel_hints_same_decisions(self):
+        """Four independent branches (conv -> a different elementwise op each,
+        one conv shape so no split is proposed): the four fusions are decided
+        in one wave with --parallel-hints 4 and one by one with 1; both runs
+        accept the same hints and end with the same fused model."""
+        from modelblaster.pipeline import graph_hints as gh
+        from modelblaster.pipeline.kb_graph_opt import run
+
+        ir = self.tmp / "ir4"
+        if not ir.exists():
+            (self.tmp / "branches.py").write_text(BRANCHES)
+            env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT.parent), os.environ.get("PYTHONPATH", "")])}
+            cp = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.extract_graph", "--bench-file",
+                                 str(self.tmp / "branches.py"), "--out-dir", str(ir), "--quant", "fp32"],
+                                cwd=ROOT, capture_output=True, text=True, timeout=600, env=env)
+            self.assertEqual(cp.returncode, 0, cp.stderr[-2000:])
+        out = {}
+        for par in (1, 4):
+            work = self.tmp / f"par{par}"
+            s = run([ir], work, self._cfg(rounds=3, accept_gain=-1.0, max_variants=4, parallel_hints=par))
+            doc = gh.load(work / "graph_hints.json")
+            rounds = json.loads((work / "state.json").read_text())["rounds"]
+            out[par] = (s, {h["id"]: h["status"] for h in doc["hints"] if h["status"] != "proposed"}, rounds)
+        (s1, st1, r1), (s4, st4, r4) = out[1], out[4]
+        fusions = {f"fuse:fused__conv2d__{k}" for k in ("batchnorm2d", "relu", "sigmoid", "tanh")}
+        whys = {h["id"]: [e.get("why") for e in h.get("evidence", [])]
+                for h in gh.load(self.tmp / "par4" / "graph_hints.json")["hints"]}
+        self.assertTrue(fusions <= {h for h, v in st4.items() if v == "accepted"}, (st4, whys))
+        self.assertEqual(st1, st4)
+        self.assertEqual(len(r4[0]["waves"]), 1)                 # all four in one wave
+        self.assertEqual(len(r4[0]["waves"][0]), 4)
+        self.assertTrue(all(len(w) == 1 for w in r1[0]["waves"]))
+        for s in (s1, s4):
+            v = next(iter(s["irs"].values()))
+            self.assertTrue(v["passed"], s)
+        self.assertEqual(sorted(next(iter(s1["irs"].values()))["fused"]),
+                         sorted(next(iter(s4["irs"].values()))["fused"]))
+        for d in r4[0]["decisions"]:
+            self.assertEqual(len(d.get("ops") or []), 2, d)
+        ev = [e for h in gh.load(self.tmp / "par4" / "graph_hints.json")["hints"] for e in h.get("evidence", [])
+              if e.get("remeasured")]
+        self.assertTrue(ev and all(len(e["remeasured"]["variant_us"]) == 5 for e in ev))
 
     def test_split_hint_variant_and_decision(self):
         """KB-style split hint on the two convs (different shape buckets):
