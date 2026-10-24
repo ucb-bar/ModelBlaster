@@ -155,6 +155,8 @@ the prompt and the bandit key, the metrics and hints go into the prompt, and out
 (slot, code hash). Without counter access (`ERR_NVGPUCTRPERM`, as on the dev box) the first
 failure disables NCU for the run and the roofline state is used. `SSHEvaluator` builds locally
 and runs the self-contained binary on a remote GPU host (used to validate on firesim2's L40S).
+Problems whose `data.bin` is read at run time (above 1 GiB) also run there. The data is copied
+to each host once and passed as `MB_DATA_PATH`.
 
 ## Implementation knowledgebase (`knowledge/impl_store.py`)
 
@@ -279,7 +281,7 @@ One live round on the ResNet basic block (Haiku 5.5, local TITAN RTX, 2 rollouts
 | # | Decision | Alternatives considered | Why |
 |---|---|---|---|
 | 1 | The per-op C signature is the slot contract; slots are keyed by C entry point | op kind; a new KB-side kernel interface | It is already MB's ABI on every backend, so a winner drops into MB unchanged. Op kinds that share an entry (`sum_dim`/`max_dim` → `kernel_reduce`) share code, so they must share a slot. |
-| 2 | ModelBlaster generates the driver (no libtorch) with the reference data linked in | KB's libtorch drivers; reading data at run time | One oracle (the torch IR walk) for partition and per-op checks; the binary is self-contained, which KB's exec server needs (it only receives the executable). Above 1 GiB the data is read at start-up (relocation limits). |
+| 2 | ModelBlaster generates the driver (no libtorch) with the reference data linked in | KB's libtorch drivers; reading data at run time | One oracle (the torch IR walk) for partition and per-op checks; the binary is self-contained, which KB's exec server needs (it only receives the executable). Above 1 GiB the data is read at start-up (relocation limits) from `$MB_DATA_PATH`; KB's `SSHEvaluator` copies it to each GPU host once. |
 | 3 | Every candidate is checked as a partition **and** op by op on the reference's inputs | partition check only | Attribution: a failure names the slot; and ill-conditioned partitions (attention) can amplify fp32 rounding past the bound even when each kernel is right (seen in SOL-ExecBench). |
 | 4 | Slots wrapped in C++ namespaces, assembled into one TU | separate TUs per slot | Fits KB's existing one-driver/one-`.cu` compile path unchanged; helper names can't collide; every kernel name carries its slot. |
 | 5 | Timing inside the driver: the partition by CUDA events around a graph replay (eager as fallback and diagnostic), per-op attribution from CUPTI activity records | events around each op (the original choice); nsys; NCU | No profiler permissions needed, no trace parsing. Events around each op charged tiny ops 2–3× their kernel time; CUPTI's kernel durations match nsys (`gpu_harness_perf.md`). |
