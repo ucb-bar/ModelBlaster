@@ -71,6 +71,50 @@ def _harness():
     return mbir, walk_torch
 
 
+# ---------------------------------------------------------------- storage dtypes (fp32 / fp16)
+
+class _CudaSpelled:
+    """A KernelSpec seen with the CUDA spelling of its signature (`_Float16`
+    -> `__half`, cuda_dtypes.cuda_signature); everything else passes through."""
+
+    def __init__(self, spec):
+        self._spec = spec
+
+    def __getattr__(self, k):
+        return getattr(self._spec, k)
+
+    @property
+    def signature(self) -> str:
+        return cuda_dtypes.cuda_signature(self._spec.signature)
+
+
+def _problem_dtype(kinds: list[str]) -> str:
+    """fp16 when every op of the partition is an `_f16` op, else fp32."""
+    dts = {cuda_dtypes.op_dtype(k) for k in kinds}
+    return cuda_dtypes.FP16 if dts == {cuda_dtypes.FP16} else cuda_dtypes.FP32
+
+
+def _hand_source(hand_cu: Path, dtype: str) -> str:
+    """The hand kernels for a dtype: fp16 uses the generated `<stem>_f16.cu`
+    beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu for the default)."""
+    hand_cu = Path(hand_cu)
+    if dtype == cuda_dtypes.FP16:
+        hand_cu = hand_cu.with_name(hand_cu.stem + "_f16" + hand_cu.suffix)
+    return hand_cu.read_text()
+
+
+def _tensor_dtype(ir, t: str) -> str:
+    """Buffer dtype of IR tensor t: a constant's is its weights.npz array's,
+    else graph.json's (f16 for an fp16 extract)."""
+    key = ir.graph["tensors"].get(t, {}).get("const")
+    if key:
+        return cuda_dtypes.buffer_dtype(ir.weights[key].dtype)
+    return "f16" if ir.graph["tensors"].get(t, {}).get("dtype") == "f16" else "f32"
+
+
+_NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32}
+
+
 # ---------------------------------------------------------------- CUDA source library
 
 @dataclass
@@ -255,50 +299,6 @@ def _slot_id(op: str) -> str:
     return re.sub(r"\W", "_", op)
 
 
-# ---------------------------------------------------------------- storage dtypes (fp32 / fp16)
-
-class _CudaSpelled:
-    """A KernelSpec seen with the CUDA spelling of its signature (`_Float16`
-    -> `__half`, cuda_dtypes.cuda_signature); everything else passes through."""
-
-    def __init__(self, spec):
-        self._spec = spec
-
-    def __getattr__(self, k):
-        return getattr(self._spec, k)
-
-    @property
-    def signature(self) -> str:
-        return cuda_dtypes.cuda_signature(self._spec.signature)
-
-
-def _problem_dtype(kinds: list[str]) -> str:
-    """fp16 when every op of the partition is an `_f16` op, else fp32."""
-    dts = {cuda_dtypes.op_dtype(k) for k in kinds}
-    return cuda_dtypes.FP16 if dts == {cuda_dtypes.FP16} else cuda_dtypes.FP32
-
-
-def _hand_source(hand_cu: Path, dtype: str) -> str:
-    """The hand kernels for a dtype: fp16 uses the generated `<stem>_f16.cu`
-    beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu for the default)."""
-    hand_cu = Path(hand_cu)
-    if dtype == cuda_dtypes.FP16:
-        hand_cu = hand_cu.with_name(hand_cu.stem + "_f16" + hand_cu.suffix)
-    return hand_cu.read_text()
-
-
-def _tensor_dtype(ir, t: str) -> str:
-    """Buffer dtype of IR tensor t: a constant's is its weights.npz array's,
-    else graph.json's (f16 for an fp16 extract)."""
-    key = ir.graph["tensors"].get(t, {}).get("const")
-    if key:
-        return cuda_dtypes.buffer_dtype(ir.weights[key].dtype)
-    return "f16" if ir.graph["tensors"].get(t, {}).get("dtype") == "f16" else "f32"
-
-
-_NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32}
-
-
 def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name: str | None = None,
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
@@ -314,7 +314,6 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     if specs is None:
         from .reference_kernels import KERNEL_SPECS
         specs = KERNEL_SPECS
-    specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
     mbir, walk_torch = _harness()
     ir_dir, out = Path(ir_dir).resolve(), Path(out_dir).resolve()
     ir = mbir.load_ir(ir_dir)
@@ -323,6 +322,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
     sel_set = set(sel)
     tensors = g["tensors"]
+    specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
 
     with torch.no_grad():
         _, env = walk_torch.walk(ir, dev="cpu")
