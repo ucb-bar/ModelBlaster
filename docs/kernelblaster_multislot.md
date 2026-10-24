@@ -227,6 +227,14 @@ Every LLM call goes through KernelBlaster's `generate_code`. Two keyless prefixe
 logged-in account, and `stub:<name>` calls a registered Python function (tests). Moving to API
 keys is a model-name change (`--model`, `--reflect-model`).
 
+To make the calls on another machine (VPN, or keys kept only there), run KernelBlaster's relay
+server (`kernelblaster.servers.llm_server`) on that machine. Then set `KB_LLM_SERVER_URL` and
+`KB_LLM_SERVER_TOKEN_FILE` in the environment that starts the pipeline, typically through an
+`ssh -L` tunnel. `kb_graph_opt` starts `run_multislot.py` with the inherited environment, so no
+flags are needed. Accounting (`llm_usage`, telemetry) is unchanged. Only the calls that go through
+KernelBlaster are relayed; ModelBlaster's own kernel-generation clients (`pipeline/llm_client.py`
+and friends) are not. See KernelBlaster `docs/llm_server.md`.
+
 ## Telemetry
 
 KernelBlaster records, for every LLM call:
