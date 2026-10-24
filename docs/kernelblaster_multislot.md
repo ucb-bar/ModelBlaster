@@ -117,6 +117,23 @@ CUDA errors.
 KernelBlaster's compile and exec servers (`compile_cu`, `run_gpu_executable`), the same path
 the existing flows use. Both were run in Phase 1.
 
+## NCU profiles (`knowledge/ncu.py`, opt-in `--ncu best|all`)
+
+The driver's `MB_MODE=profile` runs every op exactly once on the reference inputs. Every
+kernel lives in its slot's namespace, so one `ncu --kernel-name-base demangled
+--print-kernel-base demangled -k regex:'mbslot_' --page details --csv` run (SpeedOfLight,
+Occupancy, LaunchStats, MemoryWorkloadAnalysis) profiles all slots, and each kernel row is
+attributed to its slot by name. Per slot: duration-weighted SM / memory / DRAM / L1 / L2
+throughput, achieved and theoretical occupancy, hit rates, registers, waves, the measured bound
+(`compute_bound`, `memory_bound`, `latency_bound`, `underutilized_*`), and NCU's top rule hints
+with their estimated speedups. With `--ncu best` the baseline and every new slot best are
+profiled (`all`: every verified candidate); the measured bound replaces the roofline state in
+the prompt and the bandit key, the metrics and hints go into the prompt, and outcome records get
+`state_after` and `metrics_delta` (input to the semantic pass). Profiles are cached by
+(slot, code hash). Without counter access (`ERR_NVGPUCTRPERM`, as on the dev box) the first
+failure disables NCU for the run and the roofline state is used. `SSHEvaluator` builds locally
+and runs the self-contained binary on a remote GPU host (used to validate on firesim2's L40S).
+
 ## Implementation knowledgebase (`knowledge/impl_store.py`)
 
 A record per verified slot source: `target`, `arch`, `op`, `op_class`, `signature_sha`,
@@ -192,6 +209,8 @@ keys is a model-name change (`--model`, `--reflect-model`).
 | 13 | Fused op keeps the intermediate as a scratch parameter | compute its size inside the kernel; drop it | The sequential seed is then trivially correct and needs no size formula; a fused kernel can ignore it. Cost: the buffer is still allocated. |
 | 14 | Fusion proposals are deterministic (structure + measured times) in Phase 1 | an LLM proposal action in the bandit | Cheap, reproducible, and the decision is measured anyway. An LLM proposal action (layouts, splits, algorithm parameters) is the next step. |
 | 15 | Keyless `claude-code:` provider for development | API keys now | Requested: our own agentic generation until keys are set up; switching is a model-name change. |
+| 17 | NCU: one run per candidate over all slots, attributed by namespace, opt-in | NCU per slot (KB native: per bottleneck kernel); always on | One run is cheaper than N; the namespace makes attribution exact; opt-in because counters need permissions and each run adds replay time. |
+| 18 | Fusion decisions compare only the touched ops (per-op `MB_OP_US`) | compare whole-partition bests | Partition bests also move with unrelated slots: on MiniGPT a lucky GEMM made a 2.3 % epilogue fusion look like +29 %. |
 | 16 | Same-op code from other problems only when shape buckets overlap | always offer the best same-op winner to adapt | Measured (ResNet18 seeded from a ResNet-block conv, same 10-call budget, one run each): 25× with no cross-problem conv code, 5.4× when it was offered to adapt, 7.5× as an ideas-only example. A winner's blocking is shape-specific and anchors the LLM. Needs a multi-seed ablation before relaxing. |
 
 ## Validation (Phase 1, local TITAN RTX sm_75)
@@ -209,6 +228,14 @@ keys is a model-name change (`--model`, `--reflect-model`).
   reflected. Winners ingested, shape guard kept them off ResNet18's different shapes, and the
   model-level verification of the ResNet block passed with the cached kernels.
 - **Server path**: the same agent through KB's compile and exec servers on the LeNet fixture.
+- **API key (Bedrock, `us.anthropic.claude-haiku-5-5`)**: full rounds on `8_ResNetBasicBlock`
+  (35.0 → 0.97 ms, 36×, 9 calls) and `44_MiniGPTBlock` (430 → 9.5 ms, 45×, 8 calls; fusion
+  variant 6.7 ms); per touched-op decision: batchnorm→add accepted (+4.6 %), mul_scalar→masked
+  fill rejected (2.3 %), conv→batchnorm rejected.
+- **NCU on L40S** (`--evaluator ssh` to firesim2, `--ncu best`, Haiku): Level2
+  `1_Conv2D_ReLU_BiasAdd` 3.79 → 0.14 ms (26.6×) in 8 calls; 5 NCU runs; measured bounds in the
+  prompts (conv compute-bound, relu memory-bound at 75 % DRAM throughput) and metric deltas in the
+  outcome records.
 - **Cross-problem** (`9_ResNet18`, 7 slots / 68 op instances, knowledge carried from the ResNet
   block): 25.4× (48.9 → 1.93 ms) in 10 calls on the first run. That run exposed a retrieval bug
   (the problem's own baseline records always won the seed tier, hiding other problems' work),
