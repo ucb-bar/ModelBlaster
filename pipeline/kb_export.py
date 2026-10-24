@@ -709,10 +709,20 @@ def main():
                     help="export every partition of the strategy under OUT_DIR/pNN")
     ap.add_argument("--max-ops", type=int, default=12)
     ap.add_argument("--hand-cu", default=str(DEFAULT_HAND_CU))
+    ap.add_argument("--fusion-registry", help="apply the fusions accepted in this registry first")
     ap.add_argument("--build-check", action="store_true", help="nvcc-build and run each problem")
     ap.add_argument("--arch", default="75")
     a = ap.parse_args()
-    g = json.loads((Path(a.ir_dir) / "graph.json").read_text())
+    ir_dir, specs = Path(a.ir_dir), None
+    g = json.loads((ir_dir / "graph.json").read_text())
+    if a.fusion_registry:
+        from .kb_proposals import apply_accepted, write_variant_ir
+        from .reference_kernels import KERNEL_SPECS
+        g, fused, done = apply_accepted(g, Path(a.fusion_registry), KERNEL_SPECS)
+        if done:
+            specs = {**KERNEL_SPECS, **fused}
+            ir_dir = write_variant_ir(Path(a.ir_dir), g, Path(a.out_dir) / "fused_ir")
+            print(json.dumps({"fused": done}), flush=True)
     if a.strategy:
         parts = [(f"p{k:02d}", p) for k, p in enumerate(partition_ir(g, a.strategy, a.max_ops))]
     elif a.ops:
@@ -724,8 +734,8 @@ def main():
     else:
         parts = [("", None)]
     for sub, idx in parts:
-        d = export_problem(a.ir_dir, Path(a.out_dir) / sub if sub else a.out_dir, op_indices=idx,
-                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom")
+        d = export_problem(ir_dir, Path(a.out_dir) / sub if sub else a.out_dir, op_indices=idx,
+                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", specs=specs)
         line = {"problem": str(d)}
         if a.build_check:
             r = build_and_run(d, arch=a.arch)
