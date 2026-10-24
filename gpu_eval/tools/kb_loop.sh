@@ -58,5 +58,5 @@ done
 
 step "ingest winners + model-level verify"
 $PY -m modelblaster.pipeline.kb_ingest "$W/winners/winners.json" --cache "$CACHE" --verify "$IR" --arch "$ARCH" \
-    | tee "$W/ingest.jsonl"
+    --fusion-registry "$W/fusion_registry.json" | tee "$W/ingest.jsonl"
 step "done: $W"
