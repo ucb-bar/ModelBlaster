@@ -9,7 +9,9 @@ ABI (`KernelSpec.signature`), which already is the CUDA entry point.
 This document covers the Phase 1 CUDA implementation. It is written for review: the
 "Design decisions" section lists each non-obvious choice, the alternatives and why.
 KernelBlaster's semantic update pass has its own document
-(`third_party/KernelBlaster/docs/semantic_update_pass.md`).
+(`third_party/KernelBlaster/docs/semantic_update_pass.md`). Phase 2 -- ModelBlaster as the
+graph optimiser (unified graph hints, cost-ranked selection, fusion chains, split proposals,
+rounds to a fixpoint) -- is in `docs/graph_optimizer.md`.
 
 ## Flow
 
@@ -224,6 +226,8 @@ keys is a model-name change (`--model`, `--reflect-model`).
   whose shapes are outside its guard.
 
 ## Known limitations / next steps
+
+(Phase 2, `docs/graph_optimizer.md`, addresses the proposal, chain and selection items below.)
 
 - fp32 only; fp16/bf16 and int8 slots need dtype-aware drivers and tolerances.
 - The exec server refuses a shared GPU; `KERNELBLASTER_ALLOW_SHARED_GPU=1` relaxes that on
