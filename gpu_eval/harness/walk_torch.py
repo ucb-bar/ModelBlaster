@@ -50,8 +50,9 @@ OPS = {
     # a view with `offset` is a contiguous window into its input
     "view": lambda ir, op, ins, dev: [ins[0].reshape(-1)[
         op.get("offset", 0):op.get("offset", 0) + op["shape"]["n"]].reshape(ir.tshape(op["outputs"][0]))],
+    # conv1d is extracted as conv2d with IH=1 on a 3-D tensor: shape from the op
     "conv2d": lambda ir, op, ins, dev: [F.conv2d(
-        ins[0], ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+        _nchw(ins[0], op["shape"]), ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
         stride=(op["shape"]["SH"], op["shape"]["SW"]),
         padding=(op["shape"]["PH"], op["shape"]["PW"]),
         dilation=(op["shape"].get("DH", 1), op["shape"].get("DW", 1)))],
@@ -257,11 +258,15 @@ def _maxpool2d_ex(ir, op, ins, dev):
     return [y[:, :, :sh["OH"], :sh["OW"]]]
 
 
+def _nchw(x, sh):
+    return x.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"])
+
+
 def _conv_transpose2d(ir, op, ins, dev):
     sh = op["shape"]
     opad = tuple(max(0, _out_pad(sh["I" + a], sh["O" + a], sh["K" + a], sh["S" + a], sh["P" + a],
                                  sh["D" + a])) for a in "HW")
-    y = F.conv_transpose2d(ins[0], ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+    y = F.conv_transpose2d(_nchw(ins[0], sh), ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
                            (sh["SH"], sh["SW"]), (sh["PH"], sh["PW"]), opad, groups=sh["G"],
                            dilation=(sh["DH"], sh["DW"]))
     return [y[:, :, :sh["OH"], :sh["OW"]]]
@@ -401,6 +406,56 @@ OPS.update({
 def _rule(kind: str):
     """An `_f16` kind runs its fp32 rule (walk rounds the outputs)."""
     return OPS.get(kind) or (OPS.get(kind[:-4]) if kind.endswith("_f16") else None)
+
+
+# ---- Level1-only ops (losses, norms, index ops); semantics as their KernelSpecs
+def _orit(sh, x):
+    return x.reshape(sh["outer"], sh.get("reduce", sh.get("axis", sh.get("R"))), sh["inner"])
+
+
+def _excl_cumsum(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(-1, sh["N"])[:sh["Bout"]]
+    return [torch.cat([torch.zeros(sh["Bout"], 1, dtype=x.dtype, device=x.device), x.cumsum(1)], dim=1)]
+
+
+OPS.update({
+    "hinge_loss": lambda ir, op, ins, dev: [torch.clamp(
+        1 - ins[0].reshape(-1, op["shape"]["targ_len"]) * ins[1].reshape(1, -1), min=0).mean()],
+    "diag_matmul": lambda ir, op, ins, dev: [ins[0].reshape(-1, 1) * ins[1].reshape(op["shape"]["N"], op["shape"]["M"])],
+    "triu": lambda ir, op, ins, dev: [torch.triu(ins[0].reshape(op["shape"]["M"], op["shape"]["N"]),
+                                                op["shape"].get("diagonal", 0))],
+    "tril": lambda ir, op, ins, dev: [torch.tril(ins[0].reshape(op["shape"]["M"], op["shape"]["N"]),
+                                                op["shape"].get("diagonal", 0))],
+    "matmul_tatb": lambda ir, op, ins, dev: [
+        ins[0].reshape(op["shape"]["K"], op["shape"]["M"]).T @ ins[1].reshape(op["shape"]["N"], op["shape"]["K"]).T],
+    "log_softmax": lambda ir, op, ins, dev: [torch.log_softmax(
+        ins[0].reshape(op["shape"]["M"], op["shape"]["K"]), dim=-1)],
+    "swish": _unary(lambda x, op: x * torch.sigmoid(x)),
+    "selu": _unary(lambda x, op: F.selu(x)),
+    "hardsigmoid": _unary(lambda x, op: F.hardsigmoid(x)),
+    "softsign": _unary(lambda x, op: x / (1 + x.abs())),
+    "log": _unary(lambda x, op: torch.log(x)),
+    "rms_norm": lambda ir, op, ins, dev: [(lambda x: x / torch.sqrt((x * x).mean(1, keepdim=True) + op["eps"]))(
+        _orit(op["shape"], ins[0]))],
+    "frobenius_norm": lambda ir, op, ins, dev: [ins[0] / torch.sqrt((ins[0] * ins[0]).sum())],
+    "mean_abs_norm": lambda ir, op, ins, dev: [(lambda x: x / x.abs().mean(1, keepdim=True))(_orit(op["shape"], ins[0]))],
+    "l2_norm": lambda ir, op, ins, dev: [(lambda x: x / torch.sqrt((x * x).sum(1, keepdim=True)))(_orit(op["shape"], ins[0]))],
+    "argmax_dim": lambda ir, op, ins, dev: [_orit(op["shape"], ins[0]).argmax(1)],
+    "argmin_dim": lambda ir, op, ins, dev: [_orit(op["shape"], ins[0]).argmin(1)],
+    "flip": lambda ir, op, ins, dev: [_orit(op["shape"], ins[0]).flip(1)],
+    "exclusive_cumsum": _excl_cumsum,
+    "mse_loss": lambda ir, op, ins, dev: [((ins[0].reshape(-1) - ins[1].reshape(-1)) ** 2).mean()],
+    "cross_entropy_loss": lambda ir, op, ins, dev: [F.cross_entropy(
+        ins[0].reshape(op["shape"]["N"], op["shape"]["C"]), ins[1].reshape(-1).long())],
+    "huber_loss": lambda ir, op, ins, dev: [F.smooth_l1_loss(
+        ins[0].reshape(-1), ins[1].reshape(-1), beta=op.get("beta", 1.0))],
+    "kldiv_loss": lambda ir, op, ins, dev: [F.kl_div(
+        ins[0].reshape(op["shape"]["N"], op["shape"]["C"]), ins[1].reshape(op["shape"]["N"], op["shape"]["C"]),
+        reduction="batchmean")],
+    "triplet_loss": lambda ir, op, ins, dev: [F.triplet_margin_loss(
+        *(t.reshape(op["shape"]["B"], op["shape"]["F"]) for t in ins), margin=op.get("margin", 1.0), p=2)],
+})
 
 
 def walk(ir: IR, dev="cuda", keep_all=False):
