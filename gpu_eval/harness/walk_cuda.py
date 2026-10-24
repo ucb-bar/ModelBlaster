@@ -100,14 +100,17 @@ def run(ir: IR, plan, dev="cuda", time_ops=False, feed=None):
                 env[t] = x.narrow(1, i * op["shape"]["c_each"], op["shape"]["c_each"])
             continue
         fn, params, src, lib = k
+        # the fed copies are this op's own: writing them into env would
+        # overwrite the producer's output before it is compared
+        fed = {}
         if feed is not None:
             for t in op["inputs"]:
                 # constants (int32 gather indices) are already exact
                 if t in feed and not ir.graph["tensors"].get(t, {}).get("const"):
-                    env[t] = feed[t].to(device=dev, dtype=env[t].dtype).contiguous().clone()
+                    fed[t] = feed[t].to(device=dev, dtype=env[t].dtype).contiguous().clone()
         for t in op["outputs"]:
             env[t] = torch.empty(ir.tshape(t), device=dev, dtype=torch.float32)
-        args = bind(op, params, lambda t: env[t].data_ptr(), wptr)
+        args = bind(op, params, lambda t: fed.get(t, env[t]).data_ptr(), wptr)
         if time_ops:
             s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             s.record()
