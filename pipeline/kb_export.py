@@ -27,12 +27,13 @@ The driver, run with no arguments:
   2. runs every op alone on the reference's inputs and checks its outputs
      (attributes a failure to a slot);
   3. times the partition and every op with CUDA events;
-and prints MB_CHECK / MB_SLOT_CHECK / MB_SLOT_US / MB_PARTITION_US lines
-followed by "passed" or "failed". With ``MB_MODE=profile`` it instead runs
+and prints MB_CHECK / MB_SLOT_CHECK / MB_PARTITION_US / MB_SLOT_US / MB_OP_US
+lines followed by "passed" or "failed". With ``MB_MODE=profile`` it instead runs
 every op once (for ncu) and prints MB_PROFILE_DONE.
 
-    python -m modelblaster.pipeline.kb_export IR_DIR OUT_DIR [--ops a,b|--range i:j]
-        [--build-check --arch 75]
+    python -m modelblaster.pipeline.kb_export IR_DIR OUT_DIR [--ops a,b|--range i:j|--strategy S]
+        [--hints graph_hints.json] [--build-check --arch 75]
+    python -m modelblaster.pipeline.kb_export --plan PLAN.json OUT_DIR [--cache DIR]
 """
 from __future__ import annotations
 
@@ -48,16 +49,19 @@ from pathlib import Path
 
 import numpy as np
 
+from . import cuda_dtypes
 from .kernel_abi import bind, parse_signature
 from .op_classes import op_class
 
 MB_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = MB_ROOT / "gpu_eval" / "harness"
 DEFAULT_HAND_CU = HARNESS / "cuda" / "mb_cuda_kernels.cu"
+DEFAULT_HAND_CU_F16 = HARNESS / "cuda" / "mb_cuda_kernels_f16.cu"    # generated (f16_kernels.py)
 FORMAT = "mb-kb-problem/1"
 NS_PREFIX = "mbslot_"
 ALIAS_OPS = ("view", "chunk2_c1")
 DEFAULT_TOL = {"output_rel": 1e-3, "output_abs": 1e-5, "slot_rel": 1e-3}
+DTYPE_TOL = {d: {k: t[k] for k in (*DEFAULT_TOL, "slot_abs")} for d, t in cuda_dtypes.TOLERANCE.items()}
 
 
 def _harness():
@@ -67,6 +71,50 @@ def _harness():
     import mbir
     import walk_torch
     return mbir, walk_torch
+
+
+# ---------------------------------------------------------------- storage dtypes (fp32 / fp16)
+
+class _CudaSpelled:
+    """A KernelSpec seen with the CUDA spelling of its signature (`_Float16`
+    -> `__half`, cuda_dtypes.cuda_signature); everything else passes through."""
+
+    def __init__(self, spec):
+        self._spec = spec
+
+    def __getattr__(self, k):
+        return getattr(self._spec, k)
+
+    @property
+    def signature(self) -> str:
+        return cuda_dtypes.cuda_signature(self._spec.signature)
+
+
+def _problem_dtype(kinds: list[str]) -> str:
+    """fp16 when every op of the partition is an `_f16` op, else fp32."""
+    dts = {cuda_dtypes.op_dtype(k) for k in kinds}
+    return cuda_dtypes.FP16 if dts == {cuda_dtypes.FP16} else cuda_dtypes.FP32
+
+
+def _hand_source(hand_cu: Path, dtype: str) -> str:
+    """The hand kernels for a dtype: fp16 uses the generated `<stem>_f16.cu`
+    beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu for the default)."""
+    hand_cu = Path(hand_cu)
+    if dtype == cuda_dtypes.FP16:
+        hand_cu = hand_cu.with_name(hand_cu.stem + "_f16" + hand_cu.suffix)
+    return hand_cu.read_text()
+
+
+def _tensor_dtype(ir, t: str) -> str:
+    """Buffer dtype of IR tensor t: a constant's is its weights.npz array's,
+    else graph.json's (f16 for an fp16 extract)."""
+    key = ir.graph["tensors"].get(t, {}).get("const")
+    if key:
+        return cuda_dtypes.buffer_dtype(ir.weights[key].dtype)
+    return "f16" if ir.graph["tensors"].get(t, {}).get("dtype") == "f16" else "f32"
+
+
+_NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i64": np.int64}
 
 
 # ---------------------------------------------------------------- CUDA source library
@@ -185,15 +233,20 @@ class CudaLibrary:
 
 # ---------------------------------------------------------------- assembly
 
-def wrap_slot(slot_id: str, code: str) -> str:
+def namespaced(ns: str, code: str) -> tuple[list[str], str]:
+    """(hoisted #include lines, ``namespace ns { body }`` + #undef of its macros)."""
     # C linkage would make two slots' entries the same symbol across namespaces
     code = code.replace('extern "C"', "")
     includes = [l for l in code.splitlines() if l.strip().startswith("#include")]
     body = "\n".join(l for l in code.splitlines() if not l.strip().startswith("#include"))
     defines = sorted(set(re.findall(r"^\s*#\s*define\s+([A-Za-z_]\w*)", body, re.M)))
     undefs = "".join(f"#undef {d}\n" for d in defines)
-    return ("\n".join(includes) + "\n" if includes else "") + (
-        f"// ==== slot {slot_id} ====\nnamespace {NS_PREFIX}{slot_id} {{\n{body}\n}}  // namespace {NS_PREFIX}{slot_id}\n{undefs}")
+    return includes, f"namespace {ns} {{\n{body}\n}}  // namespace {ns}\n{undefs}"
+
+
+def wrap_slot(slot_id: str, code: str) -> str:
+    includes, body = namespaced(f"{NS_PREFIX}{slot_id}", code)
+    return ("\n".join(includes) + "\n" if includes else "") + f"// ==== slot {slot_id} ====\n{body}"
 
 
 def assemble(problem_dir: Path, sources: dict[str, str] | None = None) -> str:
@@ -253,32 +306,55 @@ def _slot_id(op: str) -> str:
     return re.sub(r"\W", "_", op)
 
 
+def base_slot_id(kind: str, specs: dict) -> str:
+    """One slot per C entry point (kernel_<x> -> x)."""
+    entry, _ = parse_signature(specs[kind].signature)
+    return _slot_id(entry[len("kernel_"):] if entry.startswith("kernel_") else entry)
+
+
+def slot_id_of(op: dict, specs: dict) -> str:
+    """The slot an op instance calls: its entry's slot, or (entry,
+    ``slot_variant``) when a split hint gave it a shape-specialised variant."""
+    sid = base_slot_id(op["op"], specs)
+    return f"{sid}__{op['slot_variant']}" if op.get("slot_variant") else sid
+
+
 def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name: str | None = None,
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
-                   tolerance: dict | None = None, strategy: str = "custom", target: str = "cuda") -> Path:
+                   tolerance: dict | None = None, strategy: str = "custom",
+                   sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda") -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
-    ``slot_sources`` maps an op kind to a seed source replacing the hand
-    kernel (e.g. a cached KernelBlaster winner); ``slot_source_tags`` records
-    where each came from in the manifest. ``target="opencl"`` writes OpenCL
-    slots, runtime and driver (``kb_export_opencl``); the partition, buffers,
-    ops and data are the same.
+    ``slot_sources`` maps a slot id (or an op kind) to a seed source
+    replacing the hand kernel (e.g. a cached KernelBlaster winner);
+    ``slot_source_tags`` records where each came from in the manifest. A
+    fused slot without a source of its own is seeded with its stages called
+    back to back: each stage from ``sub_sources[fused slot id][stage kind]``
+    when given (e.g. cache entries guarded on the stage's shapes), else -- if
+    ``sub_sources`` is None -- from ``slot_sources`` by the stage's slot id or
+    kind, else the hand kernel. ``target="opencl"`` writes OpenCL slots,
+    runtime and driver (``kb_export_opencl``); the partition, buffers, ops and
+    data are the same.
     """
     import torch
+
+    from .graph_hints import unique_names
 
     if specs is None:
         from .reference_kernels import KERNEL_SPECS
         specs = KERNEL_SPECS
+    specs = dict(specs)
     tgt = _target(target)                        # None: CUDA (this module)
     mbir, walk_torch = _harness()
     ir_dir, out = Path(ir_dir).resolve(), Path(out_dir).resolve()
     ir = mbir.load_ir(ir_dir)
-    g = ir.graph
+    g = unique_names(ir.graph)
     ops = g["ops"]
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
     sel_set = set(sel)
     tensors = g["tensors"]
+    specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
 
     with torch.no_grad():
         _, env = walk_torch.walk(ir, dev="cpu")
@@ -327,47 +403,60 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     order = boundary + [t for t in produced if t not in boundary]
     for t in order:                              # bases before aliases
         if t not in alias_of:
-            const_key = tensors.get(t, {}).get("const")
-            is_int = bool(const_key) and ir.weights[const_key].dtype.kind in "iub"
-            dtype = "f32" if tgt is None else tgt.buffer_dtype(tensors.get(t, {}))
-            add_buf(t, kind=kind_of(t), dtype="i32" if is_int else dtype,
+            dtype = _tensor_dtype(ir, t) if tgt is None else tgt.buffer_dtype(tensors.get(t, {}), _tensor_dtype(ir, t))
+            add_buf(t, kind=kind_of(t), dtype=dtype,
                     numel=int(np.prod(ir.tshape(t))), alias=None)
     for t in order:
         if t in alias_of:
             base, off = alias_of[t]
-            add_buf(t, kind=kind_of(t), dtype="f32", numel=int(np.prod(ir.tshape(t))),
+            add_buf(t, kind=kind_of(t), dtype=_tensor_dtype(ir, t), numel=int(np.prod(ir.tshape(t))),
                     alias={"base": index[base], "offset": off})
 
     # ---- slots + per-op calls
     slots, slot_of, calls, op_recs = {}, {}, [], []
-    lib = CudaLibrary(Path(hand_cu).read_text()) if tgt is None else \
-        tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu)
+    dtype = _problem_dtype([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
+    lib = CudaLibrary(_hand_source(hand_cu, dtype)) if tgt is None else \
+        tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
     for i in sel:
         o = ops[i]
         if o["op"] in ALIAS_OPS:
             continue
         kind = o["op"]
+        if kind not in specs and kind.startswith("fused__"):      # rebuilt from its name
+            from .kb_proposals import spec_from_kind
+            specs[kind] = spec_from_kind(kind, specs)
         if kind not in specs:
             raise KeyError(f"{kind}: no KernelSpec")
         spec = specs[kind]
         entry, params = parse_signature(spec.signature)
         # one slot per C entry point: op kinds that share an entry (sum_dim /
         # max_dim -> kernel_reduce with a different opc) share its code
-        sid = _slot_id(entry[len("kernel_"):] if entry.startswith("kernel_") else entry)
+        sid, base_sid = slot_id_of(o, specs), base_slot_id(kind, specs)
         if sid not in slots:
-            key = next((x for x in (sid, kind) if slot_sources and x in slot_sources), None)
+            key = next((x for x in (sid, base_sid, kind) if slot_sources and x in slot_sources), None)
             if key is not None:
                 src, tag = slot_sources[key], (slot_source_tags or {}).get(key, "override")
             elif tgt is not None:
                 src, tag = tgt.seed(lib, entry, spec)
-            elif hasattr(spec, "cuda_seed"):           # fused ops: sub-op kernels back to back
-                src, tag = spec.cuda_seed(lib), "fused-seed"
+            elif hasattr(spec, "cuda_seed"):           # fused ops: stage kernels back to back
+                if sub_sources is not None:
+                    subs = sub_sources.get(sid, {})
+                else:
+                    subs = {}
+                    for k in spec.sub_ops:
+                        ssid = base_slot_id(k, specs)
+                        hit = next((x for x in (ssid, k) if slot_sources and x in slot_sources), None)
+                        if hit is not None:
+                            subs[k] = slot_sources[hit]
+                src = spec.cuda_seed(lib, sub_sources=subs)
+                tag = "fused-seed" + (":" + ",".join(sorted(subs)) if subs else "")
             else:
                 src, tag = lib.slot_source(entry), "hand"
             slots[sid] = {"id": sid, "op": kind, "ops": [], "op_class": op_class(kind), "entry": entry,
                           "signature": " ".join(spec.signature.split()),
                           "file": f"slots/{sid}{'.cu' if tgt is None else tgt.slot_ext}",
                           "reference_file": f"slots/{sid}.ref.c", "semantics": spec.semantics,
+                          **({"variant_of": base_sid} if o.get("slot_variant") else {}),
                           "seed_source": tag, "instances": [], "_src": src,
                           "_ref": spec.reference_impl}
         if kind not in slots[sid]["ops"]:
@@ -392,7 +481,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 key = f"w:{a.value}"
                 if key not in index:
                     arr = ir.weights[a.value]
-                    add_buf(key, kind="weight", dtype="i32" if arr.dtype.kind in "iub" else "f32",
+                    add_buf(key, kind="weight", dtype=cuda_dtypes.buffer_dtype(arr.dtype),
                             numel=int(arr.size), alias=None)
                 args.append(f"({p.ctype})b[{index[key]}]")
             elif a.kind == "null":
@@ -424,7 +513,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         else:
             v = env[b["name"]]
             arr = v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
-        arr = arr.astype({"i32": np.int32, "i64": np.int64}.get(b["dtype"], np.float32)).reshape(-1)
+        arr = arr.astype(_NP_OF_BUF[b["dtype"]]).reshape(-1)       # fp16 values are exact
         assert arr.size == b["numel"], (b["name"], arr.size, b["numel"])
         b["ref"] = put(arr)
 
@@ -447,7 +536,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         "void launch_gpu_implementation(void **b) {",
         f"    for (int i = 0; i < {len(op_recs)}; ++i) mb_run_op(i, b);", "}", ""]
     (out / tail_name).write_text("\n".join(tail))
-    tol = {**DEFAULT_TOL, **(tolerance or {})}
+    tol = {**DTYPE_TOL[dtype], **(tolerance or {})}
     slot_list = list(slots.values())
     (out / driver_name).write_text((_driver_source if tgt is None else tgt.driver_source)(
         out / "data.bin", bufs, op_recs, slot_list, tol))
@@ -457,7 +546,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         "source_ir": str(ir_dir), "ir_name": ir.name,
         "partition": {"strategy": strategy, "op_names": [ops[i]["name"] for i in sel],
                       "op_indices": sel, "is_whole_graph": len(sel) == len(ops)},
-        "target": target, "dtype": "fp32", "tolerance": tol,
+        "target": target, "dtype": dtype, "tolerance": tol,
         "assembly": {"head": head, "tail": tail_name,
                      "namespace_prefix": NS_PREFIX, "order": [s["id"] for s in slot_list]},
         "driver": driver_name, "data": "data.bin",
@@ -500,6 +589,7 @@ def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         f"static const int NB = {nb}, NOPS = {len(op_recs)}, NSLOTS = {len(slots)};",
         arr("B_KIND", "int", (kinds[b["kind"]] for b in bufs)),
         arr("B_INT", "int", (int(b["dtype"] == "i32") for b in bufs)),
+        arr("B_HALF", "int", (int(b["dtype"] == "f16") for b in bufs)),
         arr("B_NUMEL", "long", (b["numel"] for b in bufs)),
         arr("B_BASE", "int", (b["alias"]["base"] if b["alias"] else -1 for b in bufs)),
         arr("B_AOFF", "long", (b["alias"]["offset"] if b["alias"] else 0 for b in bufs)),
@@ -513,7 +603,7 @@ def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
     ])
     return _DRIVER_TEMPLATE.replace("@BLOB@", _blob_source(data_path)).replace("@TABLES@", tables) \
         .replace("@OUT_REL@", repr(tol["output_rel"])).replace("@OUT_ABS@", repr(tol["output_abs"])) \
-        .replace("@SLOT_REL@", repr(tol["slot_rel"]))
+        .replace("@SLOT_REL@", repr(tol["slot_rel"])).replace("@SLOT_ABS@", repr(tol.get("slot_abs", 0.0)))
 
 
 # data.bin is linked into the driver (.incbin) so the binary is self-contained
@@ -553,10 +643,11 @@ int mb_num_ops();
 @BLOB@
 
 @TABLES@
-static const double OUT_REL = @OUT_REL@, OUT_ABS = @OUT_ABS@, SLOT_REL = @SLOT_REL@;
+static const double OUT_REL = @OUT_REL@, OUT_ABS = @OUT_ABS@, SLOT_REL = @SLOT_REL@, SLOT_ABS = @SLOT_ABS@;
 enum { K_INPUT, K_CONST, K_WEIGHT, K_INTER, K_OUTPUT };
 
 static void *dev[NB];
+static long esz(int b) { return B_HALF[b] ? 2 : 4; }   // f16 buffers hold IEEE binary16
 
 static bool ok_cuda(const char *what) {
     cudaError_t e = cudaGetLastError();
@@ -565,20 +656,32 @@ static bool ok_cuda(const char *what) {
     return true;
 }
 static void upload(int b) {   // reference values into a non-alias buffer
-    if (B_REF[b] >= 0) cudaMemcpy(dev[b], mb_blob + B_REF[b], B_NUMEL[b] * 4, cudaMemcpyHostToDevice);
+    if (B_REF[b] >= 0) cudaMemcpy(dev[b], mb_blob + B_REF[b], B_NUMEL[b] * esz(b), cudaMemcpyHostToDevice);
 }
-static const float *ref_of(int b) { return B_REF[b] >= 0 ? (const float *)(mb_blob + B_REF[b]) : nullptr; }
-// reference for an alias buffer = slice of its base's reference
-static std::vector<float> ref_vec(int b) {
+// raw reference bytes of a buffer; an alias's are a slice of its base's
+static const unsigned char *ref_raw(int b) {
+    return B_BASE[b] >= 0 ? mb_blob + B_REF[B_BASE[b]] + B_AOFF[b] * esz(b) : mb_blob + B_REF[b];
+}
+static float half_to_float(unsigned short h) {
+    unsigned s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ffu, f;
+    if (e == 0x1f) f = s | 0x7f800000u | (m << 13);                  // inf / nan
+    else if (e) f = s | ((e + 112) << 23) | (m << 13);               // normal
+    else if (!m) f = s;                                                // +-0
+    else { e = 113; while (!(m & 0x400u)) { m <<= 1; --e; } f = s | (e << 23) | ((m & 0x3ffu) << 13); }
+    float x; memcpy(&x, &f, 4); return x;
+}
+// values as float (f16 widened; i32 buffers keep their bits, as before)
+static std::vector<float> as_float(const unsigned char *p, int b) {
     std::vector<float> v(B_NUMEL[b]);
-    if (B_BASE[b] >= 0) memcpy(v.data(), ref_of(B_BASE[b]) + B_AOFF[b], B_NUMEL[b] * 4);
-    else memcpy(v.data(), ref_of(b), B_NUMEL[b] * 4);
+    if (B_HALF[b]) for (long i = 0; i < B_NUMEL[b]; ++i) { unsigned short h; memcpy(&h, p + 2 * i, 2); v[i] = half_to_float(h); }
+    else memcpy(v.data(), p, B_NUMEL[b] * 4);
     return v;
 }
+static std::vector<float> ref_vec(int b) { return as_float(ref_raw(b), b); }
 static std::vector<float> dev_vec(int b) {
-    std::vector<float> v(B_NUMEL[b]);
-    cudaMemcpy(v.data(), dev[b], B_NUMEL[b] * 4, cudaMemcpyDeviceToHost);
-    return v;
+    std::vector<unsigned char> raw(B_NUMEL[b] * esz(b));
+    cudaMemcpy(raw.data(), dev[b], raw.size(), cudaMemcpyDeviceToHost);
+    return as_float(raw.data(), b);
 }
 static double max_finite(const std::vector<float> &v) {
     double m = 0; for (float x : v) if (std::isfinite(x)) m = std::max(m, (double)std::fabs(x)); return m;
@@ -606,7 +709,7 @@ int main() {
             cudaMemset(dev[b], 0, std::max(B_NUMEL[b], 1L) * 4);
         }
     for (int b = 0; b < NB; ++b)
-        if (B_BASE[b] >= 0) dev[b] = (float *)dev[B_BASE[b]] + B_AOFF[b];
+        if (B_BASE[b] >= 0) dev[b] = (char *)dev[B_BASE[b]] + B_AOFF[b] * esz(b);
     if (mb_num_ops() != NOPS) { printf("MB_ERROR walker has %d ops, driver %d\n", mb_num_ops(), NOPS); printf("failed\n"); return 1; }
 
     // MB_MODE=profile: every op exactly once on the reference inputs, no checks
@@ -641,8 +744,7 @@ int main() {
         for (int k = OP_IN_OFS[i]; k < OP_IN_OFS[i + 1]; ++k) {
             int b = OP_IN[k];
             if (B_KIND[b] == K_CONST || B_KIND[b] == K_WEIGHT) continue;
-            std::vector<float> r = ref_vec(b);
-            cudaMemcpy(dev[b], r.data(), B_NUMEL[b] * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(dev[b], ref_raw(b), B_NUMEL[b] * esz(b), cudaMemcpyHostToDevice);
         }
         mb_run_op(i, dev);
         if (!ok_cuda(OP_NAME[i])) { slot_bad[OP_SLOT[i]] = 1; slot_err[OP_SLOT[i]] = INFINITY; continue; }
@@ -652,9 +754,9 @@ int main() {
         for (int k = OP_OUT_OFS[i]; k < OP_OUT_OFS[i + 1]; ++k) {
             int b = OP_OUT[k];
             std::vector<float> r = ref_vec(b), a = dev_vec(b);
-            double s = std::max(scale, max_finite(r)), e = max_err(a, r) / std::max(s, 1e-12);
+            double s = std::max(scale, max_finite(r)), ae = max_err(a, r), e = ae / std::max(s, 1e-12);
             slot_err[OP_SLOT[i]] = std::max(slot_err[OP_SLOT[i]], e);
-            if (!(e <= SLOT_REL)) slot_bad[OP_SLOT[i]] = 1;
+            if (!(ae <= SLOT_REL * s + SLOT_ABS)) slot_bad[OP_SLOT[i]] = 1;   // abs: fp16 subnormals
         }
     }
     for (int s = 0; s < NSLOTS; ++s) {
@@ -703,7 +805,8 @@ int main() {
 
 def parse_driver_output(text: str) -> dict:
     res = {"passed": bool(re.search(r"^passed$", text, re.M)), "outputs": {}, "slots": {},
-           "slot_us": {}, "partition_us": None, "errors": re.findall(r"^MB_ERROR (.*)$", text, re.M)}
+           "slot_us": {}, "op_us": {}, "partition_us": None,
+           "errors": re.findall(r"^MB_ERROR (.*)$", text, re.M)}
     for m in re.finditer(r"^MB_CHECK output (\S+) max_abs_err=(\S+) bound=(\S+) ok=(\d)", text, re.M):
         res["outputs"][m.group(1)] = {"max_abs_err": float(m.group(2)), "bound": float(m.group(3)),
                                       "ok": m.group(4) == "1"}
@@ -718,9 +821,20 @@ def parse_driver_output(text: str) -> dict:
     return res
 
 
+def run_built(exe, timeout: int = 1800) -> dict:
+    rp = subprocess.run([str(exe)], capture_output=True, text=True, timeout=timeout)
+    res = parse_driver_output(rp.stdout)
+    res.update(stage="run", log=(rp.stdout + rp.stderr)[-4000:])
+    return res
+
+
 def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | None = None,
-                  work: Path | None = None, nvcc: str = "nvcc", timeout: int = 1800) -> dict:
-    """Assemble + nvcc-build + run the problem outside KernelBlaster."""
+                  work: Path | None = None, nvcc: str = "nvcc", timeout: int = 1800, runs: int = 1) -> dict:
+    """Assemble + nvcc-build + run the problem outside KernelBlaster.
+
+    ``runs`` > 1 runs the binary that many times and keeps the run with the
+    median partition time (``partition_us_runs`` has them all); ``runs=0``
+    only builds (``exe`` is the binary)."""
     problem_dir = Path(problem_dir)
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
@@ -731,42 +845,56 @@ def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | No
                         capture_output=True, text=True, timeout=timeout)
     if cp.returncode != 0:
         return {"passed": False, "stage": "compile", "log": (cp.stdout + cp.stderr)[-4000:]}
-    rp = subprocess.run([str(exe)], capture_output=True, text=True, timeout=timeout)
-    res = parse_driver_output(rp.stdout)
-    res.update(stage="run", log=(rp.stdout + rp.stderr)[-4000:])
-    return res
+    if runs <= 0:
+        return {"passed": None, "stage": "built", "exe": str(exe)}
+    rs = [run_built(exe, timeout) for _ in range(runs)]
+    ok = [r for r in rs if r["passed"] and r["partition_us"]]
+    if not ok:
+        return {**rs[0], "exe": str(exe)}
+    ok.sort(key=lambda r: r["partition_us"])
+    return {**ok[len(ok) // 2], "exe": str(exe), "partition_us_runs": [r["partition_us"] for r in rs if r["partition_us"]]}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("ir_dir")
+    ap.add_argument("ir_dir", nargs="?")
     ap.add_argument("out_dir")
     ap.add_argument("--ops", help="comma-separated op names")
     ap.add_argument("--range", help="op index range i:j")
     ap.add_argument("--strategy", default=None, choices=["whole", "per_op", "window"],
                     help="export every partition of the strategy under OUT_DIR/pNN")
     ap.add_argument("--max-ops", type=int, default=12)
+    ap.add_argument("--plan", help="export the problems of a kb_plan file (modelblaster.kb_plan/v1); "
+                                   "IR_DIR is not used")
+    ap.add_argument("--cache", help="with --plan: seed the problems from this kernel cache")
     ap.add_argument("--hand-cu", default=str(DEFAULT_HAND_CU))
-    ap.add_argument("--fusion-registry", help="apply the fusions accepted in this registry first")
+    ap.add_argument("--hints", "--fusion-registry", dest="hints",
+                    help="graph hints file: apply its accepted hints first")
     ap.add_argument("--build-check", action="store_true", help="build and run each problem (nvcc / g++ + OpenCL)")
     ap.add_argument("--arch", default="75")
     ap.add_argument("--target", default="cuda", choices=["cuda", "opencl"])
     a = ap.parse_args()
-    ir_dir, specs = Path(a.ir_dir), None
+    if a.plan:
+        from .kb_ingest import CudaCache
+        from .kb_plan import export_plan
+        cache = CudaCache(Path(a.cache)) if a.cache else None
+        for d in export_plan(json.loads(Path(a.plan).read_text()), Path(a.out_dir), cache=cache, arch=a.arch):
+            print(json.dumps({"problem": str(d)}), flush=True)
+        return
+    ir_dir = Path(a.ir_dir)
     g = json.loads((ir_dir / "graph.json").read_text())
-    if a.fusion_registry:
-        from .kb_proposals import apply_accepted, write_variant_ir
-        from .reference_kernels import KERNEL_SPECS
-        g, fused, done = apply_accepted(g, Path(a.fusion_registry), KERNEL_SPECS)
-        if done:
-            specs = {**KERNEL_SPECS, **fused}
-            ir_dir = write_variant_ir(Path(a.ir_dir), g, Path(a.out_dir) / "fused_ir")
-            print(json.dumps({"fused": done}), flush=True)
+    if a.hints:
+        from . import graph_hints as gh
+        ir_dir, _, prov = gh.apply_to_ir(ir_dir, gh.load(Path(a.hints)), Path(a.out_dir) / "hinted_ir")
+        if prov["applied"]:
+            g = json.loads((ir_dir / "graph.json").read_text())
+            print(json.dumps({"applied": prov["applied"]}), flush=True)
     if a.strategy:
         parts = [(f"p{k:02d}", p) for k, p in enumerate(partition_ir(g, a.strategy, a.max_ops))]
     elif a.ops:
+        from .graph_hints import unique_names
         names = a.ops.split(",")
-        parts = [("", [i for i, o in enumerate(g["ops"]) if o["name"] in names])]
+        parts = [("", [i for i, o in enumerate(unique_names(g)["ops"]) if o["name"] in names])]
     elif a.range:
         i, j = (int(x) for x in a.range.split(":"))
         parts = [("", list(range(i, j)))]
@@ -774,7 +902,7 @@ def main():
         parts = [("", None)]
     for sub, idx in parts:
         d = export_problem(ir_dir, Path(a.out_dir) / sub if sub else a.out_dir, op_indices=idx,
-                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", specs=specs, target=a.target)
+                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", target=a.target)
         line = {"problem": str(d)}
         if a.build_check:
             if a.target == "opencl":
