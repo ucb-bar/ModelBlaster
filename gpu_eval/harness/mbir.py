@@ -6,6 +6,7 @@ harnesses run on a GPU box that only has torch + numpy.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,12 @@ import torch
 
 # Ops ModelBlaster lowers to aliases (no kernel call in model.c).
 ZERO_COST_OPS = {"view", "chunk2_c1"}
+
+# storage dtypes + tolerances (pipeline/cuda_dtypes.py, loaded by path like mbabi)
+_spec = importlib.util.spec_from_file_location(
+    "cuda_dtypes", Path(__file__).resolve().parents[2] / "pipeline" / "cuda_dtypes.py")
+cuda_dtypes = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cuda_dtypes)
 
 
 @dataclass
@@ -28,6 +35,11 @@ class IR:
     @property
     def ops(self) -> list[dict]:
         return self.graph["ops"]
+
+    @property
+    def dtype(self) -> str:
+        """fp16 for an `--quant fp16` extract (every float tensor stored as binary16)."""
+        return cuda_dtypes.FP16 if self.graph.get("quant") == "fp16" else cuda_dtypes.FP32
 
     def tshape(self, t: str) -> list[int]:
         return self.graph["tensors"][t]["shape"]
@@ -71,7 +83,9 @@ def load_ir(d: str | Path) -> IR:
     return IR(g["name"], g, {k: w[k] for k in w.files}, io["input"], io["output"])
 
 
-def compare(out: torch.Tensor, golden: np.ndarray) -> dict:
+def compare(out: torch.Tensor, golden: np.ndarray, dtype: str = "fp32") -> dict:
+    """max |out - golden| <= golden_rel * max|finite golden| + golden_abs (per dtype)."""
+    tol = cuda_dtypes.TOLERANCE[dtype]
     o = out.detach().float().cpu().reshape(-1).numpy()
     g = golden.astype(np.float32).reshape(-1)
     if o.shape != g.shape:
@@ -85,7 +99,7 @@ def compare(out: torch.Tensor, golden: np.ndarray) -> dict:
     max_abs = float(err.max()) if err.size else 0.0
     # fp32 golden comes from PyTorch on CPU; GPU reduction order differs, so
     # use a relative-to-range bound rather than bit-exactness.
-    ok = bool((np.isfinite(o) | same).all() and max_abs <= 1e-3 * denom + 1e-5)
+    ok = bool((np.isfinite(o) | same).all() and max_abs <= tol["golden_rel"] * denom + tol["golden_abs"])
     return {"ok": ok, "max_abs_err": max_abs, "rel_to_range": max_abs / denom}
 
 
