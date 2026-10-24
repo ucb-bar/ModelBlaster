@@ -25,7 +25,7 @@ BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4}
 #   slot_rel/abs  each op alone on the reference's fp16 inputs: err <= slot_rel *
 #                 max(|inputs|, |ref|) + slot_abs. Kernel and reference round
 #                 (nearly) the same fp32 value once, so they differ by <= 1 ulp:
-#                 measured max 9.6e-4 of the scale in the normal range, and
+#                 measured max 7.8e-4 of the scale in the normal range, and
 #                 exactly 1 subnormal ulp (2^-24) where activations vanish
 #                 (EfficientNetB0/B1, MobileNetV2). Bound: 2 ulps, 2e-3 / 2^-23.
 #   output_*      a partition's outputs vs the fp16-storage reference walk
@@ -33,7 +33,7 @@ BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4}
 #                 downstream op; measured max 2.0e-3 of max|ref| (NetVLAD).
 #   golden_*      a model's output vs the extract golden (fp32 model on the
 #                 fp16-rounded inputs): the error of fp16 storage itself;
-#                 measured max 1.4e-3 (IR walk and hand CUDA alike).
+#                 measured max 1.5e-3 (IR walk, host C, hand CUDA).
 #                 Both output bounds: 1e-2, 5x the largest measured error.
 TOLERANCE = {
     FP32: {"output_rel": 1e-3, "output_abs": 1e-5, "slot_rel": 1e-3, "slot_abs": 0.0,
