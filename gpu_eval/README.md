@@ -13,6 +13,7 @@ problem.
 | `walk_torch.py` | walks an IR with PyTorch ops and checks it against the `io.npz` golden (`--device cpu` for the reference gate) |
 | `walk_cuda.py` | walks an IR on CUDA kernels via ctypes; checks the golden and every kernel on the reference's own inputs |
 | `cuda/mb_cuda_kernels.cu` | hand-written CUDA kernel per op, with MB's C signatures |
+| `cuda/mb_cuda_kernels_f16.cu` | the `_f16` kernels (fp16 storage, fp32 math), **generated** by `f16_kernels.py` from the fp32 file + `cuda/mb_cuda_kernels_f16_hand.cu`; see `docs/fp16_cuda.md` |
 | `ref2cuda.py` | ports each MB reference C kernel to a single-thread CUDA seed |
 | `kb_targets.py`, `kb_bridge.py` | one KernelBlaster problem per (op type) in an IR set, built and checked with KB's own split + `cuda_env` CMake |
 | `mbir.py`, `mbabi.py` | IR loading/comparison; ctypes binding over `pipeline/kernel_abi.py` |
@@ -46,3 +47,9 @@ PY=python bash gpu_eval/harness/run_level3_gpu.sh IR_ROOT GPU_OUT 89   # sm_89 =
 
 `run_level3_gpu.sh` uses `third_party/KernelBlaster` unless `KB` is set, and
 generates `specs.json` unless `SPECS` is set.
+
+fp16: extract with `MB_QUANT=fp16`; the walkers, `host_verify.sh` and
+`run_level3_gpu.sh` follow the IR's `quant` (fp16 bounds from
+`pipeline/cuda_dtypes.py`). After editing `cuda/mb_cuda_kernels.cu`, run
+`python gpu_eval/harness/f16_kernels.py` (a test fails while the generated file
+is stale).

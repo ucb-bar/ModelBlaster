@@ -9,7 +9,9 @@ ABI (`KernelSpec.signature`), which already is the CUDA entry point.
 This document covers the Phase 1 CUDA implementation. It is written for review: the
 "Design decisions" section lists each non-obvious choice, the alternatives and why.
 KernelBlaster's semantic update pass has its own document
-(`third_party/KernelBlaster/docs/semantic_update_pass.md`).
+(`third_party/KernelBlaster/docs/semantic_update_pass.md`). Phase 2 -- ModelBlaster as the
+graph optimiser (unified graph hints, cost-ranked selection, fusion chains, split proposals,
+rounds to a fixpoint) -- is in `docs/graph_optimizer.md`.
 
 ## Flow
 
@@ -55,14 +57,15 @@ fused variant problem → KernelBlaster → accept/reject (fusion_registry.json)
 `manifest.json` fields:
 
 - `name`, `source_ir`, `ir_name`, `partition` (`strategy`, `op_names`, `op_indices`, `is_whole_graph`)
-- `target` (`cuda`), `dtype` (`fp32`), `tolerance` (`output_rel`, `output_abs`, `slot_rel`)
+- `target` (`cuda`), `dtype` (`fp32` / `fp16`), `tolerance` (`output_rel`, `output_abs`, `slot_rel`,
+  `slot_abs`; per dtype, [fp16_cuda.md](fp16_cuda.md))
 - `assembly`: `head`, `tail`, `namespace_prefix` (`mbslot_`), `order` (slot ids)
 - `slots[]`: `id`, `op` (first op kind), `ops` (all kinds using it), `op_class`, `entry`,
   `signature`, `file`, `reference_file`, `semantics`, `seed_source`
   (`hand` / `cache:<impl_id>` / `fused-seed` / `override`), `instances[]` (`op_name`, `op`,
   `index`, `shape`)
 - `ops[]` (call order): `index`, `name`, `op`, `slot`, `inputs`/`outputs` (buffer indices)
-- `buffers[]`: `name`, `kind` (input, const, weight, intermediate, output), `dtype` (f32/i32),
+- `buffers[]`: `name`, `kind` (input, const, weight, intermediate, output), `dtype` (f32/f16/i32),
   `numel`, `alias` (`base`, `offset` — views), `ref` (`[offset, nbytes]` into `data.bin`)
 - `inputs`, `outputs` (buffer indices), `driver`, `data`, `data_sha1`
 
@@ -84,8 +87,9 @@ passed | failed
 ```
 
 Output bound: `err <= output_rel * max|finite ref| + output_abs` (1e-3, 1e-5, as the Level2/3
-gates). Isolated bound: `max err / max(|finite inputs|, |finite ref|) <= slot_rel` (1e-3, as
-`walk_cuda`'s per-kernel check). Matching infinities/NaNs are exact. `MB_ERROR` lines report
+gates). Isolated bound: `max err <= slot_rel * max(|finite inputs|, |finite ref|) + slot_abs`
+(1e-3 and 0, as `walk_cuda`'s per-kernel check; fp16: 2e-3 and 2^-23, see
+[fp16_cuda.md](fp16_cuda.md)); `rel_err` reports `max err / max(...)`. Matching infinities/NaNs are exact. `MB_ERROR` lines report
 CUDA errors.
 
 ## KernelBlaster agent (one slot per step)
@@ -255,7 +259,10 @@ keys is a model-name change (`--model`, `--reflect-model`).
 
 ## Known limitations / next steps
 
-- fp32 only; fp16/bf16 and int8 slots need dtype-aware drivers and tolerances.
+(Phase 2, `docs/graph_optimizer.md`, addresses the proposal, chain and selection items below.)
+
+- fp32 and fp16 ([fp16_cuda.md](fp16_cuda.md): contract, tolerances, generated `_f16` kernels, Level3
+  validation); bf16 and int8 slots are not implemented.
 - The exec server refuses a shared GPU; `KERNELBLASTER_ALLOW_SHARED_GPU=1` relaxes that on
   single-GPU dev boxes (timings get noisier, hence the re-measure of wins).
 - Proposals: only elementwise-consumer fusion, decided per partition; chains (conv → bn → relu)
