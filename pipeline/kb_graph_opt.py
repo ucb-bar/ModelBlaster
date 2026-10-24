@@ -62,6 +62,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import graph_hints as gh
+from . import kb_telemetry as kbt
 from .kb_export import base_slot_id, export_problem
 from .kb_ingest import CudaCache, cache_plan, ingest, verify_ir
 from .kb_plan import export_plan, make_plan, profile_ir
@@ -265,6 +266,7 @@ class KBRunner:
     def __init__(self, cfg: Config, knowledge: Path):
         self.cfg, self.knowledge = cfg, knowledge
         self.calls = 0
+        self.telemetry: list = []                     # each run's run-level telemetry (kb_telemetry)
 
     def command(self, problems: list[Path], out: Path, *, steps: int | None = None,
                 winners: Path | None = None, parallel_problems: int | None = None) -> list[str]:
@@ -315,6 +317,7 @@ class KBRunner:
             r["_dir"] = str(out / problem_name(Path(d)))
             self.calls += r.get("llm_calls", 0) or 0
             res.append(r)
+        self.telemetry.append(kbt.kb_run_summary(out))
         return res
 
     def run(self, problems: list[Path], out: Path, *, steps: int | None = None,
@@ -584,11 +587,15 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
     re-timed as soon as both its results are written, on one leased GPU, while
     KernelBlaster works on the others. Decisions and cache ingests are then
     made in the given order, in this thread."""
-    jobs = [prepare_hint(h, prof, out, cache=cache, cfg=cfg, specs=specs) for h, prof, out in items]
+    T = kbt.get()
+    with T.span("mb.prepare", hints=len(items)):
+        jobs = [prepare_hint(h, prof, out, cache=cache, cfg=cfg, specs=specs) for h, prof, out in items]
     live = [k for k, j in enumerate(jobs) if "early" not in j]
     results: dict[int, tuple] = {}
     if live:
         problems = [p for k in live for p in (jobs[k]["orig"], jobs[k]["variant"])]
+        parent = T.current()
+        wait = kbt.section("mb.kb_wait", kind="hints", problems=len(problems))
         proc = kb.start(problems, run_dir, steps=cfg.variant_steps, parallel_problems=len(problems))
         futs = {}
         # re-timing workers: two per GPU (one builds while the other times), at most one per hint
@@ -605,7 +612,8 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
                             ro = dict(ro or {"final_ok": False}, _dir=str(run_dir / problem_name(jobs[k]["orig"])))
                             rv = dict(rv or {"final_ok": False},
                                       _dir=str(run_dir / problem_name(jobs[k]["variant"])))
-                            futs[k] = ex.submit(measure_hint, jobs[k], ro, rv, cfg, leases)
+                            futs[k] = ex.submit(kbt.run_within, parent, "mb.remeasure", measure_hint, jobs[k],
+                                                ro, rv, cfg, leases)
                     if done:
                         break
                     time.sleep(poll_s)
@@ -613,11 +621,13 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
                 proc.kill()
                 raise
             res = kb.collect(problems, run_dir, proc)          # final result.json (llm calls, proposals)
+            wait.end()
             times = {k: f.result() for k, f in futs.items()}
         for n, k in enumerate(live):
             results[k] = (res[2 * n], res[2 * n + 1], times.get(k))
-    return [finish_hint(j, *results.get(k, (None, None, None)), cache=cache, doc=doc, cfg=cfg)
-            for k, j in enumerate(jobs)]
+    with T.span("mb.finish"):
+        return [finish_hint(j, *results.get(k, (None, None, None)), cache=cache, doc=doc, cfg=cfg)
+                for k, j in enumerate(jobs)]
 
 
 def evaluate_hint(h: dict, prof: dict, out: Path, *, kb: KBRunner, cache: CudaCache, doc: dict,
@@ -654,7 +664,13 @@ def decide_hints(cands: list[tuple[dict, dict]], graphs: dict, out: Path, width:
 def run(irs: list[Path], work: Path, cfg: Config) -> dict:
     work = Path(work).resolve()
     with work_lock(work):
-        return _run(irs, work, cfg)
+        tel = kbt.load(cfg.kb)                    # telemetry (kb_telemetry.py); a no-op without it
+        tel.configure(work / "telemetry.jsonl")
+        try:
+            with tel.span("mb.run", collect=True):
+                return _run(irs, work, cfg)
+        finally:
+            tel.close()
 
 
 def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
@@ -669,10 +685,14 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     leases = GpuLeases(gpus["local"])
     state["gpus"] = {"pool": gpus, "parallel_hints": width}
     first = None
+    T = kbt.get()
+    run_span = T.current()
     for r in range(len(state["rounds"]), len(state["rounds"]) + cfg.rounds):
         R = work / f"r{r:02d}"
         t0 = time.time()
         rec = {"round": r, "kb_runs": [], "decisions": []}
+        rsec, n_kb = kbt.section("mb.round", collect=True, laps=True, round=r), len(kb.telemetry)
+        T.lap("mb.profile")
         profiles = [profile_ir(Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
                                specs=specs, runs=cfg.profile_runs) for d in irs]
         bad = [p["ir"] for p in profiles if not p["passed"]]
@@ -680,20 +700,25 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             raise RuntimeError(f"round {r}: profile failed for {bad}; see {R / 'profile'}")
         first = first or {p["ir"]: p["partition_us"] for p in profiles}
         rec["partition_us"] = {p["ir"]: p["partition_us"] for p in profiles}
+        T.lap("mb.propose")
         graphs = {}
         for p in profiles:                                  # MB's own proposals
             g = graphs[p["ir"]] = json.loads((Path(p["ir_dir"]) / "graph.json").read_text())
             gh.merge(doc, gh.propose_from_profile(g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs,
                                                    doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"]))
+        T.lap("mb.plan")
         plan = make_plan(profiles, coverage=cfg.coverage, top_k=cfg.top_k, min_share=cfg.min_share,
                          exclude=set(state["sent"]))
         (R / "plan.json").write_text(json.dumps(plan, indent=1))
         rec["plan"] = {"selected_share": plan["selected_share"],
                        "problems": [(p["ir"], len(p["op_names"])) for p in plan["problems"]]}
         if plan["problems"]:
+            T.lap("mb.export")
             dirs = export_plan(plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
                                names={p["ir"]: f"{p['ir']}__r{r:02d}" for p in plan["problems"]})
+            T.lap("mb.kb_wait", kind="plan")
             results = kb.run(dirs, R / "run", winners=R / "winners")
+            T.lap("mb.ingest")
             rec["kb_runs"] = [{k: x.get(k) for k in ("problem", "baseline_partition_us", "final_partition_us",
                                                       "speedup", "final_ok", "llm_calls")} for x in results]
             if (R / "winners" / "winners.json").exists():
@@ -708,6 +733,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                             s["ir"] = json.loads((Path(props["problem_dir"]) / "manifest.json").read_text())["ir_name"]
                         gh.merge(doc, [h])
         gh.save(doc, hints_path)
+        T.lap("mb.decide")
         todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
                 and h["kind"] in ("fuse", "split_slot") and _est_gain(h) >= cfg.min_gain_pct]
         todo.sort(key=lambda h: -_est_gain(h))              # stable: ties keep the hints file's order
@@ -719,6 +745,11 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         rec["decide_seconds"] = round(time.time() - t_dec, 1)
         rec["seconds"] = round(time.time() - t0, 1)
         rec["llm_calls_total"] = kb.calls
+        T.end_laps(rsec.span)
+        rsec.end()
+        tr = {"mb": kbt.compact(T.full_summary(rsec.span)), "kb": kbt.kb_rollup(kb.telemetry[n_kb:])}
+        if tr["mb"] or tr["kb"]:
+            rec["telemetry"] = tr
         state["rounds"].append(rec)
         state_path.write_text(json.dumps(state, indent=1))
         (R / "round.json").write_text(json.dumps(rec, indent=1))
@@ -731,9 +762,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             state["fixpoint"] = r
             break
     final = {}
-    for d in irs:
-        final[Path(d).name] = verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
-                                        work=work / "final" / Path(d).name)
+    with T.span("mb.verify"):
+        for d in irs:
+            final[Path(d).name] = verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
+                                            work=work / "final" / Path(d).name)
     summary = {"irs": {}, "rounds": len(state["rounds"]), "fixpoint": state.get("fixpoint"),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
@@ -746,6 +778,9 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                               "speedup": (f0 / v["partition_us"]) if f0 and v.get("partition_us") else None,
                               "hints": v.get("hints"), "fused": v.get("fused"),
                               "cache_split": v.get("cache_split")}
+    tr = {"mb": kbt.compact(T.full_summary(run_span)), "kb": kbt.kb_rollup(kb.telemetry)}
+    if tr["mb"] or tr["kb"]:
+        summary["telemetry"] = tr
     (work / "summary.json").write_text(json.dumps(summary, indent=1))
     return summary
 
