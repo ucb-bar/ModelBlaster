@@ -20,18 +20,32 @@ back into the model graph and measures that.
    diagnostic, and the eager time where the model is not capturable), the
    hand-seeded original model timed the same way -- in the same process,
    interleaved rep by rep, when the two have the same slots -- for the speedup;
-4. **partitions** (``--time-partitions``) -- each run's problem timed the
-   same way, so the sum of partition times can be set against the model
-   time: the difference is what partition boundaries hide or add (inputs
-   that come from the reference instead of the previous window, caches,
-   launches across a window edge).
+4. **partitions** (``--time-partitions``) -- each run's problem with its best
+   slots, paired with the hand seeds, timed the same way, so the sum of
+   partition times can be set against the model time: the difference is what
+   partition boundaries hide or add (inputs that come from the reference
+   instead of the previous window, caches, launches across a window edge).
+
+Steps 3-4 run through KernelBlaster's evaluators (``kb_eval``: its
+``scripts/time_problems.py``): ``--evaluator local`` (this host's GPU pool
+and locks) or ``ssh`` (``--ssh-host``, remote GPUs; big ``data.bin`` copied
+once per host), all on one GPU by default (``--devices``), and on the **GPU
+model and arch the KernelBlaster runs recorded** (``result.json`` ``gpu``;
+or ``--gpu-model`` / ``--arch``, which must agree): no GPU of that model is an
+error (``--allow-gpu-mismatch``: time anyway, with warnings), so the model
+number and the component numbers come from the same hardware.
+``--evaluator builtin`` keeps ModelBlaster's own host on the default GPU.
 
 -> ``modelblaster.model_runtime/v1`` (``--out``): ``model_e2e_us`` (graph
 replay; the reported result), ``seed_e2e_us``, ``speedup``, eager times,
-launch overhead, the composed slots and, with partitions, their sum.
+launch overhead, the composed slots, the device (``device``, ``gpu_name``,
+``gpu_uuid``, ``gpu_host``), ``hardware`` (required vs recorded, ``match``)
+and, with partitions, each one's device and their sum.
 
     python -m modelblaster.pipeline.kb_model_run IR_DIR --kb-runs RUN_DIR [...] [--cache DIR] \\
-        [--hints graph_hints.json] [--arch 75] [--reps 3] [--time-partitions] --work DIR --out model.json
+        [--hints graph_hints.json] [--arch 89] [--reps 3] [--time-partitions] --work DIR --out model.json \\
+        [--evaluator local --gpus auto | --evaluator ssh --ssh-host H [--ssh-host H2] --remote-dir D \\
+         [--cuda-visible-devices auto|ids] [--ssh-key K]] [--runtime auto|host|process] [--gpu-model M]
 """
 from __future__ import annotations
 
@@ -39,7 +53,10 @@ import argparse
 import json
 import shutil
 import statistics
+import sys
 from pathlib import Path
+
+from . import kb_telemetry as kbt
 
 FORMAT = "modelblaster.model_runtime/v1"
 
@@ -94,16 +111,18 @@ def cache_from_runs(runs: list[Path], cache, specs: dict, arch: str) -> list[dic
                               speedup=(base / us) if base and us else None,
                               impl_id=sr.get("impl_id") or f"{res.get('run_id')}:{s['id']}", dtype=man.get("dtype"),
                               source={"run_id": res.get("run_id"), "problem_id": res.get("problem"),
-                                      "techniques": sr.get("techniques", [])})
+                                      "techniques": sr.get("techniques", []),
+                                      **({"gpu": res["gpu"]} if res.get("gpu") else {})})
             report.append({"run": str(run), "slot": s["id"], "impl_id": e["impl_id"], "status": st})
     cache.save()
     return report
 
 
-def _time(prob: Path, *, arch: str, work: Path, sources=None, ref_sources=None, reps: int = 3,
-          timeout: int = 3600) -> dict:
-    """Check + time a problem in the persistent host (graph replay; eager diagnostic):
-    medians over ``reps`` requests; ``ref_sources`` are timed interleaved in the same requests."""
+def _time_builtin(prob: Path, *, arch: str, work: Path, sources=None, ref_sources=None, reps: int = 3,
+                  timeout: int = 3600) -> dict:
+    """``--evaluator builtin``: check + time a problem in ModelBlaster's own persistent host on
+    this machine's default GPU (graph replay; eager diagnostic): medians over ``reps``
+    requests; ``ref_sources`` are timed interleaved in the same requests. No GPU pool or locks."""
     from .kb_export import DriverHost, build_host, build_so
 
     host, log = build_host(prob, arch=arch, work=work)
@@ -130,7 +149,8 @@ def _time(prob: Path, *, arch: str, work: Path, sources=None, ref_sources=None, 
            "launches": last.get("attr_launches"), "launch_overhead_us": _med([r["launch_overhead_us"] for r in rs]),
            "launch_overhead_frac": _med([r["launch_overhead_frac"] for r in rs]),
            "e2e_runs": [r["e2e_us"] for r in rs], "slots": last.get("slots"), "outputs": last.get("outputs"),
-           "attr_slot_us": last.get("attr_slot_us"), "errors": last.get("errors")}
+           "attr_slot_us": last.get("attr_slot_us"), "errors": last.get("errors"), "runtime": "host",
+           "device": _builtin_device(arch)}
     if ref is not None:
         out.update(ref_e2e_us=_med([r["ref_e2e_us"] for r in rs]),
                    paired_ratio=_med([(r.get("e2e_ratio") or {}).get("med") for r in rs]),
@@ -140,53 +160,219 @@ def _time(prob: Path, *, arch: str, work: Path, sources=None, ref_sources=None, 
     return out
 
 
+def _builtin_device(arch: str) -> dict | None:
+    """The GPU a builtin run lands on (the first visible one), from nvidia-smi."""
+    import os
+    import subprocess
+
+    try:
+        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    gpus = [[x.strip() for x in line.split(",")] for line in txt.splitlines() if line.count(",") >= 2]
+    vis = [v.strip() for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
+    if vis:
+        gpus = [g for v in vis for g in gpus if v == g[0] or (v.startswith("GPU-") and g[1].startswith(v))]
+    if not gpus:
+        return None
+    i, uuid, name = gpus[0][:3]
+    return {"host": None, "label": i, "index": int(i) if i.isdigit() else None, "uuid": uuid, "name": name,
+            "arch": f"sm_{arch}"}
+
+
+def _from_kb(job: dict, *, identical: bool = False) -> dict:
+    """A ``time_problems`` job (KernelBlaster EvalResults, one per request) -> the same
+    fields as a builtin timing: medians over the requests, the paired seed numbers."""
+    rs = job.get("runs") or []
+    if not rs:
+        return {"passed": False, "stage": "run", "log": "no run", "device": job.get("gpu")}
+    last = rs[-1]
+
+    def dep(r):                                    # as deployed: MB_E2E_US, else graph, else eager
+        return r.get("e2e_us") or r.get("partition_graph_us") or r.get("partition_us")
+    out = {"passed": all(r.get("ok") for r in rs), "e2e_us": _med([dep(r) for r in rs]),
+           "e2e_basis": last.get("e2e_basis"), "eager_us": _med([r.get("partition_us") for r in rs]),
+           "graph_us": _med([r.get("partition_graph_us") for r in rs]), "graph_skip": last.get("graph_skip"),
+           "graph_nodes": last.get("graph_nodes"), "kernel_us": _med([r.get("attr_sum_us") for r in rs]),
+           "launches": last.get("attr_launches"), "launch_overhead_us": _med([r.get("launch_overhead_us") for r in rs]),
+           "launch_overhead_frac": _med([r.get("launch_overhead_frac") for r in rs]),
+           "e2e_runs": [dep(r) for r in rs], "slots": last.get("slot_checks"), "outputs": last.get("outputs"),
+           "attr_slot_us": last.get("attr_slot_us"), "errors": last.get("errors"), "runtime": last.get("runtime"),
+           "device": job.get("gpu"), "devices": job.get("gpus"), "eval_wall_s": _med([r.get("eval_wall_s") for r in rs])}
+    if job.get("paired"):
+        if identical:                              # the composed model is the seed model: one timing
+            out.update(ref_e2e_us=out["e2e_us"], paired_ratio=1.0, paired_basis=out["e2e_basis"], identical=True)
+        elif job.get("pairing") == "host":
+            out.update(ref_e2e_us=_med([r.get("ref_e2e_us") for r in rs]),
+                       paired_ratio=_med([(r.get("e2e_ratio") or {}).get("med") for r in rs]),
+                       paired_basis=(last.get("e2e_ratio") or {}).get("basis"))
+        else:                                      # one process per run: the seed right after, same round
+            refs = job.get("ref_runs") or []
+            ratios = [dep(r) / dep(q) for r, q in zip(rs, refs) if dep(r) and dep(q)]
+            out.update(ref_e2e_us=_med([dep(q) for q in refs]), paired_ratio=_med(ratios),
+                       paired_basis=refs[-1].get("e2e_basis") if refs else None)
+    if not out["passed"]:
+        out["log"] = (last.get("log") or "\n".join(map(str, last.get("errors") or [])))[-2000:]
+    return out
+
+
 def _slot_texts(prob: Path) -> dict:
     man = json.loads((prob / "manifest.json").read_text())
     return {s["id"]: (prob / s["file"]).read_text() for s in man["slots"]}
 
 
-def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path | None = None, arch: str = "75",
-                  reps: int = 3, time_partitions: bool = False, keep: bool = False, specs: dict | None = None) -> dict:
-    """Compose the winners into the whole model, check it and time it (see the module doc)."""
+_AUTO = object()
+
+
+def _default_eval():
+    from .kb_eval import KBEval
+
+    ev = KBEval()
+    return ev if ev.available() else None
+
+
+def _part_jobs(run_dirs: list[Path], reps: int, hand: dict) -> tuple[list[dict], list[dict]]:
+    """Each run's problem with its best slots, paired with the hand seeds (``hand``: the
+    whole-model seed export's slot sources, by slot id; a slot the seed model has not --
+    a fused or split slot -- keeps the problem's own seed)."""
+    jobs, meta = [], []
+    for k, run in enumerate(run_dirs):
+        res = json.loads((run / "result.json").read_text())
+        pdir = Path(res["problem_dir"])
+        own = _slot_texts(pdir)
+        best = {sid: (run / "best" / "slots" / Path(f).name).read_text() for sid, f in _slot_files(pdir).items()
+                if (run / "best" / "slots" / Path(f).name).exists()}
+        inc = {sid: hand.get(sid, txt) for sid, txt in own.items()}
+        jobs.append({"id": f"part{k:02d}", "problem": str(pdir), "sources": best, "incumbent": inc, "reps": reps})
+        meta.append({"res": res, "pdir": pdir, "best": best, "identical": {**own, **best} == inc,
+                     "seed_kind": "hand" if all(sid in hand for sid in own) else "problem"})
+    return jobs, meta
+
+
+def _slot_files(prob: Path) -> dict:
+    return {s["id"]: s["file"] for s in json.loads((prob / "manifest.json").read_text())["slots"]}
+
+
+def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path | None = None, arch: str | None = None,
+                  reps: int = 3, time_partitions: bool = False, keep: bool = False, specs: dict | None = None,
+                  kbeval=_AUTO, gpu_model: str | None = None, allow_gpu_mismatch: bool = False,
+                  recorded: list | None = None) -> dict:
+    """Compose the winners into the whole model, check it and time it (see the module doc).
+
+    ``kbeval``: a :class:`kb_eval.KBEval` (KernelBlaster's local or ssh evaluator), None for
+    ModelBlaster's builtin host on the default GPU; by default the local evaluator of the
+    KernelBlaster checkout (``$MB_KB_ROOT`` / the submodule) when it has one, else builtin.
+    ``gpu_model`` / ``arch``: required hardware (default: what the KernelBlaster runs recorded,
+    see ``kb_eval.required_hardware``; ``recorded`` adds GPU records of runs not in ``runs``,
+    e.g. ``kb_graph_opt``'s rounds). ``allow_gpu_mismatch`` times anyway, with warnings."""
     from . import graph_hints as gh
+    from . import kb_eval as ke
     from .kb_export import export_problem
     from .kb_ingest import CudaCache, cache_plan
     from .kb_proposals import _all_specs, write_variant_ir
 
+    T = kbt.get()
+    if kbeval is _AUTO:
+        kbeval = _default_eval()
     ir_dir, work = Path(ir_dir), Path(work)
-    arch = str(arch).removeprefix("sm_")
     work.mkdir(parents=True, exist_ok=True)
-    specs = dict(specs or _all_specs())
-    g = json.loads((ir_dir / "graph.json").read_text())
-    hint_ids = []
-    if hints is not None and Path(hints).exists():
-        g, added, prov = gh.apply_hints(g, gh.load(Path(hints))["hints"], specs)
-        specs.update(added)
-        hint_ids = sorted({a["id"] for a in prov["applied"]})
-    # a working cache: the given one plus the runs' best slots (the given one is not modified)
-    wc = CudaCache(work / "cache")
-    wc.entries = [dict(e) for e in cache.entries] if cache is not None else []
-    if cache is not None:
-        (work / "cache" / "src").mkdir(parents=True, exist_ok=True)
-        for e in wc.entries:
-            dst = work / "cache" / e["file"]
-            if not dst.exists():
-                shutil.copyfile(cache.root / e["file"], dst)
     run_dirs = find_runs(runs)
-    added = cache_from_runs(run_dirs, wc, specs, arch)
-    plan = cache_plan(g, wc, f"sm_{arch}", specs)
-    vir = write_variant_ir(ir_dir, plan["graph"], work / "ir")
-    comp = export_problem(vir, work / "model", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
-                          sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
-    seed = export_problem(ir_dir, work / "seed", strategy="whole")
-    cm, sm = (json.loads((d / "manifest.json").read_text()) for d in (comp, seed))
-    # the same slots and ops: the seed model is the composed problem with the hand kernels,
-    # timed in the same requests (paired); otherwise (fused or split slots) on its own
-    pair = [s["id"] for s in cm["slots"]] == [s["id"] for s in sm["slots"]] and \
-        [o["name"] for o in cm["ops"]] == [o["name"] for o in sm["ops"]]
-    model = _time(comp, arch=arch, work=work / "build_model", reps=reps,
-                  ref_sources=_slot_texts(seed) if pair else None)
-    seed_t = None if pair else _time(seed, arch=arch, work=work / "build_seed", reps=reps)
+    rec = ke.recorded_gpus(run_dirs) + list(recorded or [])
+    hw = ke.required_hardware(rec, gpu_model=gpu_model, arch=arch, allow_mismatch=allow_gpu_mismatch)
+    arch = hw["arch"] or "75"
+    hw["arch"] = f"sm_{arch}"
+    with T.span("mb.model_run.compose", ir=ir_dir.name):
+        specs = dict(specs or _all_specs())
+        g = json.loads((ir_dir / "graph.json").read_text())
+        hint_ids = []
+        if hints is not None and Path(hints).exists():
+            g, added, prov = gh.apply_hints(g, gh.load(Path(hints))["hints"], specs)
+            specs.update(added)
+            hint_ids = sorted({a["id"] for a in prov["applied"]})
+        # a working cache: the given one plus the runs' best slots (the given one is not modified)
+        wc = CudaCache(work / "cache")
+        wc.entries = [dict(e) for e in cache.entries] if cache is not None else []
+        if cache is not None:
+            (work / "cache" / "src").mkdir(parents=True, exist_ok=True)
+            for e in wc.entries:
+                dst = work / "cache" / e["file"]
+                if not dst.exists():
+                    shutil.copyfile(cache.root / e["file"], dst)
+        added = cache_from_runs(run_dirs, wc, specs, arch)
+        plan = cache_plan(g, wc, f"sm_{arch}", specs)
+        # cache entries carry the GPU of the run they came from (cache_from_runs): they must agree too
+        used_gpus = [{"run": f"cache:{e.get('impl_id')}", "gpu": (e.get("source") or {}).get("gpu"), "arch": e.get("arch")}
+                     for e in plan.get("used", {}).values() if (e.get("source") or {}).get("gpu")]
+        if used_gpus:
+            hw2 = ke.required_hardware(rec + used_gpus, gpu_model=gpu_model, arch=arch,
+                                       allow_mismatch=allow_gpu_mismatch)
+            hw.update({k: hw2[k] for k in ("gpu_model", "recorded_models", "verified")})
+            hw["warnings"] = list(dict.fromkeys(hw["warnings"] + hw2["warnings"]))
+            if hw2["gpu_model"]:
+                hw["warnings"] = [w for w in hw["warnings"] if not w.startswith("no KernelBlaster run recorded")]
+        vir = write_variant_ir(ir_dir, plan["graph"], work / "ir")
+        comp = export_problem(vir, work / "model", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
+                              sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
+        seed = export_problem(ir_dir, work / "seed", strategy="whole")
+        cm, sm = (json.loads((d / "manifest.json").read_text()) for d in (comp, seed))
+        # the same slots and ops: the seed model is the composed problem with the hand kernels,
+        # timed in the same requests (paired); otherwise (fused or split slots) on its own
+        pair = [s["id"] for s in cm["slots"]] == [s["id"] for s in sm["slots"]] and \
+            [o["name"] for o in cm["ops"]] == [o["name"] for o in sm["ops"]]
+        seed_texts = _slot_texts(seed)
+        identical = pair and _slot_texts(comp) == seed_texts
+        if pair and (seed / sm.get("data", "data.bin")).exists():
+            (seed / sm.get("data", "data.bin")).unlink()          # paired: only its kernels are used (big models)
+    for w in hw["warnings"]:
+        print(f"[kb_model_run] WARNING: {w}", file=sys.stderr, flush=True)
+    part_jobs, part_meta = _part_jobs(run_dirs, reps, seed_texts) if time_partitions and run_dirs else ([], [])
+    with T.span("mb.model_run.time", ir=ir_dir.name, evaluator=kbeval.evaluator if kbeval else "builtin",
+                partitions=len(part_jobs)) as sp:
+        if kbeval is not None:
+            jobs = [{"id": "model", "problem": str(comp), "sources": None,
+                     "incumbent": seed_texts if pair else None, "reps": reps}]
+            if not pair:
+                jobs.append({"id": "seed", "problem": str(seed), "sources": None, "reps": reps})
+            jobs += part_jobs
+            try:
+                kr = kbeval.run(jobs, arch=arch, work=work / "kb_time", gpu_model=hw["gpu_model"], name="model")
+            except ke.HardwareMismatch as e:
+                if not allow_gpu_mismatch:
+                    raise ke.HardwareMismatch(f"{e} -- the components were optimised on {hw['gpu_model']}; select "
+                                              "GPUs of that model (--gpus / --ssh-host / --cuda-visible-devices) or "
+                                              "pass --allow-gpu-mismatch") from None
+                hw["warnings"].append(f"{e}; timed on another GPU model (--allow-gpu-mismatch)")
+                print(f"[kb_model_run] WARNING: {hw['warnings'][-1]}", file=sys.stderr, flush=True)
+                kr = kbeval.run(jobs, arch=arch, work=work / "kb_time", gpu_model=None, name="model")
+            J = kr["jobs"]
+            model = _from_kb(J["model"], identical=identical)
+            seed_t = None if pair else _from_kb(J["seed"])
+            parts_t = [_from_kb(J[j["id"]], identical=m["identical"]) for j, m in zip(part_jobs, part_meta)]
+            ktime = {k: kr.get(k) for k in ("seconds", "pool", "models", "host_stats", "pool_stats")}
+            if kr.get("telemetry"):
+                ktime["telemetry"] = kbt.compact(kr["telemetry"])
+        else:
+            model = _time_builtin(comp, arch=arch, work=work / "build_model", reps=reps,
+                                  ref_sources=seed_texts if pair else None)
+            if identical and model.get("ref_e2e_us") is None and model.get("e2e_us"):
+                model.update(ref_e2e_us=model["e2e_us"], paired_ratio=1.0, paired_basis=model.get("e2e_basis"))
+            seed_t = None if pair else _time_builtin(seed, arch=arch, work=work / "build_seed", reps=reps)
+            parts_t = [_time_builtin(m["pdir"], arch=arch, work=work / f"build_part{k:02d}", sources=m["best"],
+                                     ref_sources=j["incumbent"], reps=reps)
+                       for k, (j, m) in enumerate(zip(part_jobs, part_meta))]
+            ktime = None
+        if sp is not None and hasattr(sp, "set"):
+            sp.set(device=(model.get("device") or {}).get("label"), gpu=(model.get("device") or {}).get("name"),
+                   passed=model.get("passed"))
+    dev = model.get("device") or {}
+    match = ke.same_gpu_model(dev.get("name"), hw["gpu_model"]) if hw["gpu_model"] else None
+    if match is False and not allow_gpu_mismatch:
+        raise ke.HardwareMismatch(f"the model was timed on {dev.get('name')!r}, not on {hw['gpu_model']} "
+                                  "(the components' GPU model)")
+    if hw["gpu_model"] is None and dev.get("name"):
+        hw["warnings"].append(f"timed on {dev['name']} with no recorded component GPU to match")
+    hw.update(device=dev or None, match=match)
     seed_us = model.get("ref_e2e_us") if pair else (seed_t or {}).get("e2e_us")
     out = {"format": FORMAT, "ir": cm["ir_name"], "source_ir": str(ir_dir), "arch": f"sm_{arch}",
            "passed": model["passed"], "model_e2e_us": model.get("e2e_us"), "model_basis": model.get("e2e_basis"),
@@ -196,58 +382,90 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
            "speedup": (seed_us / model["e2e_us"]) if seed_us and model.get("e2e_us") else None,
            "paired": pair, "paired_ratio": model.get("paired_ratio"),
            "speedup_paired": (1.0 / model["paired_ratio"]) if model.get("paired_ratio") else None,
+           "identical_to_seed": identical,
+           "evaluator": kbeval.describe() if kbeval is not None else {"evaluator": "builtin", "runtime": "host"},
+           "device": dev or None, "gpu_name": dev.get("name"), "gpu_uuid": dev.get("uuid"), "gpu_host": dev.get("host"),
+           "hardware": hw,
            "model": model, "seed": seed_t, "hints": hint_ids, "cache_split": [h["id"] for h in plan["hints"]],
            "composed_slots": {sid: tag for sid, tag in plan["tags"].items()},
            "runs": [str(r) for r in run_dirs], "winners_added": added}
-    if time_partitions and run_dirs:
+    if ktime is not None:
+        out["kb_time"] = ktime
+    if part_jobs:
         parts = []
-        for k, run in enumerate(run_dirs):
-            res = json.loads((run / "result.json").read_text())
-            pdir = Path(res["problem_dir"])
-            best = {p.stem: p.read_text() for p in (run / "best" / "slots").glob("*.cu")}
-            t = _time(pdir, arch=arch, work=work / f"build_part{k:02d}", sources=best, ref_sources=_slot_texts(pdir),
-                      reps=reps)
+        for j, m, t in zip(part_jobs, part_meta, parts_t):
+            res = m["res"]
+            pd = t.get("device") or {}
             parts.append({"problem": res.get("problem"), "passed": t["passed"], "e2e_us": t.get("e2e_us"),
                           "seed_e2e_us": t.get("ref_e2e_us"), "basis": t.get("e2e_basis"),
-                          "kb_final_e2e_us": res.get("final_e2e_us"), "kb_final_partition_us": res.get("final_partition_us")})
-        sp = sum(p["e2e_us"] or 0.0 for p in parts)
+                          "eager_us": t.get("eager_us"), "paired_ratio": t.get("paired_ratio"),
+                          "seed_kind": m["seed_kind"],
+                          "kb_final_e2e_us": res.get("final_e2e_us"), "kb_final_partition_us": res.get("final_partition_us"),
+                          "kb_gpu": (res.get("gpu") or {}).get("name"), "device": pd or None,
+                          "same_device": bool(pd and dev and pd.get("label") == dev.get("label")
+                                              and pd.get("host") == dev.get("host")),
+                          "same_gpu_model": ke.same_gpu_model(pd.get("name"), dev.get("name")) if pd and dev else None})
+        sp_ = sum(p["e2e_us"] or 0.0 for p in parts)
         ss = sum(p["seed_e2e_us"] or 0.0 for p in parts)
         out["partitions"] = parts
-        out["sum_partitions_e2e_us"] = sp
+        out["sum_partitions_e2e_us"] = sp_
         out["sum_partitions_seed_e2e_us"] = ss
         if out["model_e2e_us"]:
-            out["boundary_effect_us"] = out["model_e2e_us"] - sp     # > 0: the model costs more than its parts
+            out["boundary_effect_us"] = out["model_e2e_us"] - sp_     # > 0: the model costs more than its parts
     if not keep:
         for d in work.glob("*"):
             if d.name.startswith("build") or d.name in ("model", "seed", "ir"):
                 shutil.rmtree(d, ignore_errors=True)
+        for d in (work / "kb_time").glob("*_kbwork"):
+            shutil.rmtree(d, ignore_errors=True)
     return out
 
 
 def main():
+    from . import kb_eval as ke
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ir_dir")
     ap.add_argument("--kb-runs", nargs="*", default=[], help="KernelBlaster run dirs (or roots holding them)")
     ap.add_argument("--cache", help="ModelBlaster CUDA kernel cache to compose from too (read only)")
     ap.add_argument("--hints", help="graph hints file: its accepted hints are applied")
-    ap.add_argument("--arch", default="75")
+    ap.add_argument("--arch", default=None, help="SM number (default: the KernelBlaster runs' arch, else 75)")
+    ap.add_argument("--gpu-model", default=None,
+                    help="GPU model to time on, e.g. 'NVIDIA L40S' (default: the one the KernelBlaster runs recorded)")
+    ap.add_argument("--allow-gpu-mismatch", action="store_true",
+                    help="time even where no GPU of the components' model / arch is available (loud warnings)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--time-partitions", action="store_true",
                     help="also time every run's partition the same way, for the sum of partition times")
     ap.add_argument("--work", required=True)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--out", help="write the result here (also printed)")
+    ke.add_args(ap)
     a = ap.parse_args()
     from .kb_ingest import CudaCache
 
-    res = model_runtime(Path(a.ir_dir), work=Path(a.work), cache=CudaCache(Path(a.cache)) if a.cache else None,
-                        runs=a.kb_runs, hints=Path(a.hints) if a.hints else None, arch=a.arch, reps=a.reps,
-                        time_partitions=a.time_partitions, keep=a.keep)
+    kbeval = ke.from_args(a)
+    tel = kbt.load(kbeval.root if kbeval is not None else ke.default_kb())
+    Path(a.work).mkdir(parents=True, exist_ok=True)
+    tel.configure(Path(a.work) / "telemetry.jsonl")
+    try:
+        with tel.span("mb.model_run", collect=True, ir=Path(a.ir_dir).name) as sp:
+            res = model_runtime(Path(a.ir_dir), work=Path(a.work), cache=CudaCache(Path(a.cache)) if a.cache else None,
+                                runs=a.kb_runs, hints=Path(a.hints) if a.hints else None, arch=a.arch, reps=a.reps,
+                                time_partitions=a.time_partitions, keep=a.keep, kbeval=kbeval,
+                                gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch)
+            summ = kbt.compact(tel.full_summary(sp))
+        if summ:
+            res["telemetry"] = summ
+    finally:
+        tel.close()
     txt = json.dumps(res, indent=1, default=str)
     if a.out:
         Path(a.out).write_text(txt)
     print(json.dumps({k: res.get(k) for k in ("ir", "passed", "model_e2e_us", "model_basis", "seed_e2e_us", "speedup",
-                                               "speedup_paired", "sum_partitions_e2e_us", "boundary_effect_us")}))
+                                               "speedup_paired", "sum_partitions_e2e_us", "boundary_effect_us",
+                                               "gpu_name", "gpu_host")}
+                     | {"device": (res.get("device") or {}).get("label"), "match": res["hardware"].get("match")}))
 
 
 if __name__ == "__main__":

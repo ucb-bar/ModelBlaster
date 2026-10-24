@@ -167,7 +167,8 @@ hints, cache): the *original* and, with the hint applied, the *variant*; both se
 same current-best kernels (fused seeds composed from them). KernelBlaster optimises both with
 the same budget in one run; then both composite bests are built once and run round-robin
 `remeasure` times on one leased GPU (`kb_proposals.remeasure`), and the medians decide
-(`accept_gain`, 3 %).
+(`accept_gain`, 3 %). With `--ssh-host` that GPU is one of the KernelBlaster runs' remote GPUs
+(see "Flags" below).
 Accepting caches the variant's new slots (the fused kernel, the split variants) on their shapes,
 whatever their speedup over their seed, since the decision already measured them against the
 unchanged graph.
@@ -258,9 +259,24 @@ workers per GPU: one builds while the other times.
 - `--parallel-hints auto|N`: auto is `max(4, 2 × GPUs)`; 1 decides one by one.
 - `--gpus`, or `--ssh-host` (repeatable) with `--cuda-visible-devices` (`--ssh-key`,
   `--remote-dir`), are passed to every KernelBlaster run.
+- `--runtime auto|host|process` and `--gpu-model M` are passed to every KernelBlaster run as well.
+  `--gpu-model` limits the runs to GPUs of model M (none there is an error). Every `result.json`
+  records the GPU it was timed on (`gpu`: name, UUID, host, arch).
 - The GPU count comes from KernelBlaster's own `select_gpus`: auto takes the idle GPUs, else the
   least busy one, bounded by an externally set `CUDA_VISIBLE_DEVICES`.
-- Re-timing uses this host's selected GPUs.
+- Re-timing leases from the same pool as the KernelBlaster runs:
+  - locally, one of this host's selected GPUs (ModelBlaster's own runs, the GPU lock held);
+  - with `--ssh-host`, one of the remote GPUs. The two bests are timed through KernelBlaster's
+    ssh evaluator pinned to that GPU (`scripts/time_problems.py`, persistent host, the remote
+    GPU lock taken per run), on the GPU model the two runs recorded.
+
+  The decision records the device it was timed on (`remeasured.device`).
+- The model's result (`kb_model_run`, after the final verification) goes through the same
+  evaluator: local pool or the `--ssh-host` GPUs. It times on the GPU model the rounds'
+  KernelBlaster runs recorded, or `--gpu-model`. Where no GPU of that model is available it is an
+  error (`model_error` in `summary.json`); `--allow-gpu-mismatch` times anyway, with warnings.
+  `summary.json` gets `model_gpu`, `model_device` and `model_hardware_match` per IR
+  ([gpu_harness_perf.md](gpu_harness_perf.md), "The model's result").
 
 **Measured** (`gpu_eval/work/graphopt_par`, scratch). The model has four independent
 conv → {bn, sigmoid, tanh, silu} branches with mixed 1×1 / 3×3 convs (`cat` output). The run is
@@ -455,7 +471,8 @@ chain itself.
   deletes data.bin afterwards.
 - Within a wave, a hint does not see KernelBlaster store records of the other hints in that wave
   (it would one by one); `--parallel-hints 1` restores that order.
-- Re-timing runs on this host: with `--ssh-host` only, KernelBlaster runs remotely but the decisions
-  are re-timed on the local default GPU (`remeasure` would need the ssh evaluator's copy-and-run).
+- The per-round profiles (`profile_ir`) and the final verification (`verify_ir`) still run on this
+  host's default GPU. They plan and check; the reported numbers (decisions, the model's result)
+  come from the KernelBlaster pool.
 - With `--remeasure 0` the decision uses KernelBlaster's two final numbers, which in a pool of mixed
   GPU models can come from different models (each problem is pinned to one model, the pair is not).
