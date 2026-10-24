@@ -197,6 +197,65 @@ def build_variant(proposals: dict, orig_problem: Path, out: Path) -> dict:
 
 # ---------------------------------------------------------------- registry + decision
 
+def spec_from_kind(kind: str, specs: dict) -> FusedKernelSpec:
+    """Rebuild a fused spec from its kind name (fused__<A>__<B>[__<param>])."""
+    parts = kind.split("__")
+    if parts[0] != "fused" or len(parts) not in (3, 4):
+        raise ValueError(f"not a fused kind: {kind}")
+    a, b = parts[1], parts[2]
+    if len(parts) == 4:
+        tp = parts[3]
+    else:
+        _, pb = parse_signature(specs[b].signature)
+        tp = next(p.name for p in pb if p.is_const_ptr)
+    spec = make_fused_spec(a, b, tp, specs)
+    assert spec.op == kind, (spec.op, kind)
+    return spec
+
+
+def accepted_fused_specs(registry: Path = DEFAULT_REGISTRY, specs: dict | None = None) -> dict:
+    """{kind: FusedKernelSpec} for every accepted fusion in the registry."""
+    specs = specs or _all_specs()
+    reg = _load_registry(Path(registry))
+    return {k: spec_from_kind(k, specs) for k, e in reg["fusions"].items() if e["status"] == "accepted"}
+
+
+def apply_accepted(graph: dict, registry: Path = DEFAULT_REGISTRY, specs: dict | None = None):
+    """Fuse every exclusive producer->consumer pair whose fused kind is
+    accepted in the registry. -> (graph, {kind: spec}, [fused op names])."""
+    specs = dict(specs or _all_specs())
+    accepted = accepted_fused_specs(registry, specs)
+    if not accepted:
+        return graph, {}, []
+    used, done = {}, []
+    changed = True
+    while changed:
+        changed = False
+        for o in graph["ops"]:
+            for t in o["outputs"]:
+                readers = [r for r in graph["ops"] if t in r["inputs"]]
+                if len(readers) != 1 or "sub_ops" in o or "sub_ops" in readers[0]:
+                    continue
+                b = readers[0]
+                try:
+                    kind = fused_kind(o["op"], b["op"], _t_param(b, t, specs), specs)
+                except (KeyError, StopIteration):
+                    continue
+                if kind not in accepted:
+                    continue
+                try:
+                    graph, spec = fuse_pair(graph, o["name"], b["name"], specs)
+                except ValueError:
+                    continue
+                used[kind] = spec
+                done.append(f"{o['name']}+{b['name']}")
+                changed = True
+                break
+            if changed:
+                break
+    return graph, used, done
+
+
 def _load_registry(path: Path) -> dict:
     if path.exists():
         return json.loads(path.read_text())
@@ -216,7 +275,8 @@ def decide(orig_result: Path, variant_result: Path, variant_json: Path | None = 
     gain = (ou - vu) / ou if ok else None
     status = "accepted" if ok and gain >= ACCEPT_GAIN else "rejected"
     reg = _load_registry(Path(registry))
-    for a in var["applied"]:
+    kinds = {a["kind"]: a for a in var["applied"]}            # one decision per kind, not per pair
+    for a in kinds.values():
         e = reg["fusions"].setdefault(a["kind"], {"kind": a["kind"], "signature": a["signature"],
                                                   "status": "proposed", "evidence": []})
         e["evidence"].append({"problem": o["problem"], "original_us": ou, "variant_us": vu, "gain": gain,
@@ -225,8 +285,7 @@ def decide(orig_result: Path, variant_result: Path, variant_json: Path | None = 
         e["status"] = "accepted" if wins > len(e["evidence"]) - wins else "rejected"
     Path(registry).parent.mkdir(parents=True, exist_ok=True)
     Path(registry).write_text(json.dumps(reg, indent=1))
-    return {"status": status, "gain": gain, "original_us": ou, "variant_us": vu,
-            "kinds": [a["kind"] for a in var["applied"]]}
+    return {"status": status, "gain": gain, "original_us": ou, "variant_us": vu, "kinds": list(kinds)}
 
 
 def main():
