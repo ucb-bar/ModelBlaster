@@ -21,6 +21,27 @@ extern "C" int mb_last_error(void) { return (int)cudaGetLastError(); }
 // kernel bounds-checks its thread id)
 #define MB_GRID(n) (int)(((long)(n) > 0 ? (long)(n) + MB_THREADS - 1 : MB_THREADS) / MB_THREADS)
 #define MB_TID ((long)blockIdx.x * blockDim.x + threadIdx.x)
+// one thread per output: blocks of MB_THREADS, halved (down to 32) while that
+// leaves an SM without a block -- row-parallel kernels (softmax, layer norm,
+// reductions over a dim, small GEMV outputs) have few outputs, and 256-thread
+// blocks put them on a handful of SMs. Same per-thread work, so outputs are
+// unchanged; large launches keep MB_THREADS.
+static inline int mb_sm_count() {
+    static int sms = 0;
+    if (!sms) {
+        int d = 0;
+        cudaGetDevice(&d);
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, d) != cudaSuccess || sms <= 0) sms = 1;
+    }
+    return sms;
+}
+static inline int mb_threads(long n) {
+    int b = MB_THREADS;
+    while (b > 32 && (long)b * mb_sm_count() > n) b /= 2;
+    return b;
+}
+// at least one block, as MB_GRID
+static inline int mb_blocks(long n) { int b = mb_threads(n); return (int)((n > 0 ? n + b - 1 : b) / b); }
 // dot-product kernels (conv, linear, matmul, bmm) accumulate in double: a
 // sequential fp32 sum over K ~ 1e3 is several times less accurate than
 // cuBLAS/torch blocked sums, which ill-conditioned graphs (attention with
@@ -34,12 +55,12 @@ __global__ void k_silu(const float *x, float *y, int n) { long i = MB_TID; if (i
 __global__ void k_elu(const float *x, float *y, int n, float a) { long i = MB_TID; if (i < n) { float v = x[i]; y[i] = v > 0.0f ? v : a * (expf(v) - 1.0f); } }
 __global__ void k_add(const float *a, const float *b, float *y, int n) { long i = MB_TID; if (i < n) y[i] = a[i] + b[i]; }
 
-extern "C" void kernel_relu(const float *input, float *output, int n) { k_relu<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_relu6(const float *input, float *output, int n) { k_relu6<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_sigmoid(const float *input, float *output, int n) { k_sigmoid<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_silu(const float *input, float *output, int n) { k_silu<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_elu(const float *input, float *output, int n, float alpha) { k_elu<<<MB_GRID(n), MB_THREADS>>>(input, output, n, alpha); }
-extern "C" void kernel_add(const float *a, const float *b, float *output, int n) { k_add<<<MB_GRID(n), MB_THREADS>>>(a, b, output, n); }
+extern "C" void kernel_relu(const float *input, float *output, int n) { k_relu<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_relu6(const float *input, float *output, int n) { k_relu6<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_sigmoid(const float *input, float *output, int n) { k_sigmoid<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_silu(const float *input, float *output, int n) { k_silu<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_elu(const float *input, float *output, int n, float alpha) { k_elu<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, alpha); }
+extern "C" void kernel_add(const float *a, const float *b, float *output, int n) { k_add<<<mb_blocks(n), mb_threads(n)>>>(a, b, output, n); }
 
 // ---------------------------------------------------------------- batchnorm (folded)
 __global__ void k_bn(const float *x, const float *s, const float *b, float *y, int N, int C, int HW) {
@@ -49,7 +70,7 @@ __global__ void k_bn(const float *x, const float *s, const float *b, float *y, i
 extern "C" void kernel_batchnorm2d(const float *input, const float *scale, const float *bias,
                                    float *output, int N, int C, int H, int W) {
     long tot = (long)N * C * H * W;
-    k_bn<<<MB_GRID(tot), MB_THREADS>>>(input, scale, bias, output, N, C, H * W);
+    k_bn<<<mb_blocks(tot), mb_threads(tot)>>>(input, scale, bias, output, N, C, H * W);
 }
 
 // ---------------------------------------------------------------- conv2d (direct)
@@ -77,7 +98,7 @@ extern "C" void kernel_conv2d(const float *input, const float *weight, const flo
                               int SH, int SW, int PH, int PW, int DH, int DW) {
     int OH = (IH + 2 * PH - DH * (KH - 1) - 1) / SH + 1, OW = (IW + 2 * PW - DW * (KW - 1) - 1) / SW + 1;
     long tot = (long)N * OC * OH * OW;
-    k_convg<<<MB_GRID(tot), MB_THREADS>>>(input, weight, bias, output, N, IC, IH, IW, OC, OH, OW, KH, KW,
+    k_convg<<<mb_blocks(tot), mb_threads(tot)>>>(input, weight, bias, output, N, IC, IH, IW, OC, OH, OW, KH, KW,
                                           SH, SW, PH, PW, DH, DW, 1);
 }
 extern "C" void kernel_conv2d_grouped(const float *input, const float *weight, const float *bias, float *output,
@@ -85,7 +106,7 @@ extern "C" void kernel_conv2d_grouped(const float *input, const float *weight, c
                                       int SH, int SW, int PH, int PW, int DH, int DW, int G) {
     int OH = (IH + 2 * PH - DH * (KH - 1) - 1) / SH + 1, OW = (IW + 2 * PW - DW * (KW - 1) - 1) / SW + 1;
     long tot = (long)N * OC * OH * OW;
-    k_convg<<<MB_GRID(tot), MB_THREADS>>>(input, weight, bias, output, N, IC, IH, IW, OC, OH, OW, KH, KW,
+    k_convg<<<mb_blocks(tot), mb_threads(tot)>>>(input, weight, bias, output, N, IC, IH, IW, OC, OH, OW, KH, KW,
                                           SH, SW, PH, PW, DH, DW, G);
 }
 
@@ -109,7 +130,7 @@ extern "C" void kernel_conv2d_dw(const float *input, const float *weight, const 
                                  int N, int C, int IH, int IW, int KH, int KW, int SH, int SW, int PH, int PW) {
     int OH = (IH + 2 * PH - KH) / SH + 1, OW = (IW + 2 * PW - KW) / SW + 1;
     long tot = (long)N * C * OH * OW;
-    k_conv2d_dw<<<MB_GRID(tot), MB_THREADS>>>(input, weight, bias, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW);
+    k_conv2d_dw<<<mb_blocks(tot), mb_threads(tot)>>>(input, weight, bias, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW);
 }
 
 // ---------------------------------------------------------------- pooling
@@ -132,7 +153,7 @@ extern "C" void kernel_maxpool2d(const float *input, float *output, int N, int C
                                  int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW) {
     int OH = (IH + 2 * PH - DH * (KH - 1) - 1) / SH + 1, OW = (IW + 2 * PW - DW * (KW - 1) - 1) / SW + 1;
     long tot = (long)N * C * OH * OW;
-    k_maxpool2d<<<MB_GRID(tot), MB_THREADS>>>(input, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW, DH, DW);
+    k_maxpool2d<<<mb_blocks(tot), mb_threads(tot)>>>(input, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW, DH, DW);
 }
 
 __global__ void k_avgpool2d(const float *x, float *y, int N, int C, int IH, int IW, int OH, int OW,
@@ -154,7 +175,7 @@ extern "C" void kernel_avgpool2d(const float *input, float *output, int N, int C
                                  int KH, int KW, int SH, int SW, int PH, int PW) {
     int OH = (IH + 2 * PH - KH) / SH + 1, OW = (IW + 2 * PW - KW) / SW + 1;
     long tot = (long)N * C * OH * OW;
-    k_avgpool2d<<<MB_GRID(tot), MB_THREADS>>>(input, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW);
+    k_avgpool2d<<<mb_blocks(tot), mb_threads(tot)>>>(input, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW);
 }
 
 __global__ void k_gap(const float *x, float *y, int NC, int HW) {
@@ -163,7 +184,7 @@ __global__ void k_gap(const float *x, float *y, int NC, int HW) {
     y[i] = s / HW;
 }
 extern "C" void kernel_adaptive_avg_pool2d(const float *input, float *output, int N, int C, int IH, int IW) {
-    k_gap<<<MB_GRID(N * C), MB_THREADS>>>(input, output, N * C, IH * IW);
+    k_gap<<<mb_blocks(N * C), mb_threads(N * C)>>>(input, output, N * C, IH * IW);
 }
 
 // ---------------------------------------------------------------- dense
@@ -175,7 +196,7 @@ __global__ void k_linear(const float *x, const float *w, const float *b, float *
     y[i] = acc;
 }
 extern "C" void kernel_linear(const float *input, const float *weight, const float *bias, float *output, int M, int K, int N) {
-    k_linear<<<MB_GRID((long)M * N), MB_THREADS>>>(input, weight, bias, output, M, K, N);
+    k_linear<<<mb_blocks((long)M * N), mb_threads((long)M * N)>>>(input, weight, bias, output, M, K, N);
 }
 
 __global__ void k_matmul(const float *A, const float *B, float *C, int M, int K, int N) {
@@ -186,7 +207,7 @@ __global__ void k_matmul(const float *A, const float *B, float *C, int M, int K,
     C[i] = acc;
 }
 extern "C" void kernel_matmul(const float *A, const float *B, float *C, int M, int K, int N) {
-    k_matmul<<<MB_GRID((long)M * N), MB_THREADS>>>(A, B, C, M, K, N);
+    k_matmul<<<mb_blocks((long)M * N), mb_threads((long)M * N)>>>(A, B, C, M, K, N);
 }
 // transposed operands: C[m,n] = sum_k A[m*sam + k*sak] * B[k*sbk + n*sbn]
 __global__ void k_matmul_s(const float *A, const float *B, float *C, int M, int K, int N,
@@ -199,11 +220,11 @@ __global__ void k_matmul_s(const float *A, const float *B, float *C, int M, int 
 }
 // A is [K, M]
 extern "C" void kernel_matmul_ta(const float *A, const float *B, float *C, int M, int K, int N) {
-    k_matmul_s<<<MB_GRID((long)M * N), MB_THREADS>>>(A, B, C, M, K, N, 1, M, N, 1);
+    k_matmul_s<<<mb_blocks((long)M * N), mb_threads((long)M * N)>>>(A, B, C, M, K, N, 1, M, N, 1);
 }
 // B is [N, K]
 extern "C" void kernel_matmul_tb(const float *A, const float *B, float *C, int M, int K, int N) {
-    k_matmul_s<<<MB_GRID((long)M * N), MB_THREADS>>>(A, B, C, M, K, N, K, 1, 1, K);
+    k_matmul_s<<<mb_blocks((long)M * N), mb_threads((long)M * N)>>>(A, B, C, M, K, N, K, 1, 1, K);
 }
 
 // ---------------------------------------------------------------- row ops (one thread per row)
@@ -216,7 +237,7 @@ __global__ void k_softmax(const float *x, float *y, int M, int K) {
     for (int k = 0; k < K; k++) yr[k] *= inv;
 }
 extern "C" void kernel_softmax(const float *input, float *output, int M, int K) {
-    k_softmax<<<MB_GRID(M), MB_THREADS>>>(input, output, M, K);
+    k_softmax<<<mb_blocks(M), mb_threads(M)>>>(input, output, M, K);
 }
 
 __global__ void k_layer_norm(const float *x, const float *g, const float *b, float *y, int M, int K, float eps) {
@@ -229,7 +250,7 @@ __global__ void k_layer_norm(const float *x, const float *g, const float *b, flo
 }
 extern "C" void kernel_layer_norm(const float *input, const float *gamma, const float *beta, float *output,
                                   int M, int K, float eps) {
-    k_layer_norm<<<MB_GRID(M), MB_THREADS>>>(input, gamma, beta, output, M, K, eps);
+    k_layer_norm<<<mb_blocks(M), mb_threads(M)>>>(input, gamma, beta, output, M, K, eps);
 }
 
 // One thread per (bh, query row); S is small for level1 shapes.
@@ -249,7 +270,7 @@ __global__ void k_sdpa(const float *Q, const float *Kt, const float *V, float *O
     for (int d = 0; d < D; d++) o[d] /= sum;
 }
 extern "C" void kernel_sdpa(const float *Q, const float *K, const float *V, float *output, int BH, int S, int D) {
-    k_sdpa<<<MB_GRID((long)BH * S), MB_THREADS>>>(Q, K, V, output, BH, S, D);
+    k_sdpa<<<mb_blocks((long)BH * S), mb_threads((long)BH * S)>>>(Q, K, V, output, BH, S, D);
 }
 
 // ---------------------------------------------------------------- layout
@@ -259,7 +280,7 @@ __global__ void k_copy_c(const float *src, float *dst, int N, int c, int C, int 
     dst[(n * C + c_off) * HW + r] = src[i];
 }
 static void cat_part(const float *src, float *dst, int N, int c, int C, int off, int HW) {
-    long tot = (long)N * c * HW; k_copy_c<<<MB_GRID(tot), MB_THREADS>>>(src, dst, N, c, C, off, HW);
+    long tot = (long)N * c * HW; k_copy_c<<<mb_blocks(tot), mb_threads(tot)>>>(src, dst, N, c, C, off, HW);
 }
 extern "C" void kernel_cat2_c1(const float *in0, int c0, const float *in1, int c1, float *out, int N, int H, int W) {
     int C = c0 + c1, HW = H * W;
@@ -284,7 +305,7 @@ __global__ void k_upsample(const float *x, float *y, long NC, int IH, int IW, in
 }
 extern "C" void kernel_upsample_nearest(const float *input, float *output, int N, int C, int IH, int IW, int scale) {
     long tot = (long)N * C * IH * scale * IW * scale;
-    k_upsample<<<MB_GRID(tot), MB_THREADS>>>(input, output, (long)N * C, IH, IW, scale);
+    k_upsample<<<mb_blocks(tot), mb_threads(tot)>>>(input, output, (long)N * C, IH, IW, scale);
 }
 
 
@@ -308,14 +329,14 @@ extern "C" void kernel_strided_copy(const float *input, float *output, int off,
                                     int d0, int d1, int d2, int d3, int d4, int d5,
                                     int s0, int s1, int s2, int s3, int s4, int s5) {
     long n = (long)d0 * d1 * d2 * d3 * d4 * d5;
-    k_strided_copy<<<MB_GRID(n), MB_THREADS>>>(input, output, n, off, d1, d2, d3, d4, d5, s0, s1, s2, s3, s4, s5);
+    k_strided_copy<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, off, d1, d2, d3, d4, d5, s0, s1, s2, s3, s4, s5);
 }
 
 __global__ void k_gather(const float *x, const int *idx, float *y, int n) {
     long i = MB_TID; if (i < n) { int j = idx[i]; y[i] = j >= 0 ? x[j] : 0.0f; }
 }
 extern "C" void kernel_gather(const float *input, const int *index, float *output, int n) {
-    k_gather<<<MB_GRID(n), MB_THREADS>>>(input, index, output, n);
+    k_gather<<<mb_blocks(n), mb_threads(n)>>>(input, index, output, n);
 }
 
 __global__ void k_cat_slab(const float *x, float *y, int outer, long slab, long ytot, long ybase) {
@@ -333,7 +354,7 @@ extern "C" void kernel_catn(const float *in0, const float *in1, const float *in2
     long cbase = 0;
     for (int k = 0; k < n_in; k++) {
         long slab = (long)cs[k] * inner;
-        k_cat_slab<<<MB_GRID((long)outer * slab), MB_THREADS>>>(ins[k], output, outer, slab, ctot * inner, cbase * inner);
+        k_cat_slab<<<mb_blocks((long)outer * slab), mb_threads((long)outer * slab)>>>(ins[k], output, outer, slab, ctot * inner, cbase * inner);
         cbase += cs[k];
     }
 }
@@ -363,7 +384,7 @@ __global__ void k_ewise1(const float *x, float *y, int n, int opc, float p0, flo
     long i = MB_TID; if (i < n) y[i] = mb_e1(x[i], opc, p0, p1);
 }
 extern "C" void kernel_ewise1(const float *input, float *output, int n, int opc, float p0, float p1) {
-    k_ewise1<<<MB_GRID(n), MB_THREADS>>>(input, output, n, opc, p0, p1);
+    k_ewise1<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, opc, p0, p1);
 }
 
 __device__ float mb_e2(float x, float y, int opc, float alpha) {
@@ -391,7 +412,7 @@ extern "C" void kernel_ewise2(const float *a, const float *b, float *output, int
                               int sa0, int sa1, int sa2, int sa3, int sa4, int sa5,
                               int sb0, int sb1, int sb2, int sb3, int sb4, int sb5) {
     long n = (long)d0 * d1 * d2 * d3 * d4 * d5;
-    k_ewise2<<<MB_GRID(n), MB_THREADS>>>(a, b, output, n, opc, alpha, d1, d2, d3, d4, d5,
+    k_ewise2<<<mb_blocks(n), mb_threads(n)>>>(a, b, output, n, opc, alpha, d1, d2, d3, d4, d5,
                                          sa0, sa1, sa2, sa3, sa4, sa5, sb0, sb1, sb2, sb3, sb4, sb5);
 }
 
@@ -410,7 +431,7 @@ __global__ void k_ewise_scalar(const float *x, float *y, int n, int opc, float c
     y[i] = z;
 }
 extern "C" void kernel_ewise_scalar(const float *input, float *output, int n, int opc, float c) {
-    k_ewise_scalar<<<MB_GRID(n), MB_THREADS>>>(input, output, n, opc, c);
+    k_ewise_scalar<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, opc, c);
 }
 
 // one thread per (outer, inner) output; serial over R
@@ -446,7 +467,7 @@ __global__ void k_reduce(const float *in, float *y, int outer, int R, int inner,
     y[i] = acc;
 }
 extern "C" void kernel_reduce(const float *input, float *output, int outer, int R, int inner, int opc) {
-    k_reduce<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, R, inner, opc);
+    k_reduce<<<mb_blocks((long)outer * inner), mb_threads((long)outer * inner)>>>(input, output, outer, R, inner, opc);
 }
 
 __global__ void k_softmax_dim(const float *in, float *out, int outer, int R, int inner, int log_out) {
@@ -462,7 +483,7 @@ __global__ void k_softmax_dim(const float *in, float *out, int outer, int R, int
     for (long r = 0; r < R; r++) y[r * inner] = log_out ? (x[r * inner] - m) - logf(s) : expf(x[r * inner] - m) / s;
 }
 extern "C" void kernel_softmax_dim(const float *input, float *output, int outer, int R, int inner, int log_out) {
-    k_softmax_dim<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, R, inner, log_out);
+    k_softmax_dim<<<mb_blocks((long)outer * inner), mb_threads((long)outer * inner)>>>(input, output, outer, R, inner, log_out);
 }
 
 __global__ void k_maxpool_ex(const float *x, float *y, int N, int C, int IH, int IW, int OH, int OW,
@@ -484,7 +505,7 @@ extern "C" void kernel_maxpool2d_ex(const float *input, float *output, int N, in
                                     int OH, int OW, int KH, int KW, int SH, int SW, int PH, int PW,
                                     int DH, int DW) {
     long tot = (long)N * C * OH * OW;
-    k_maxpool_ex<<<MB_GRID(tot), MB_THREADS>>>(input, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW, DH, DW);
+    k_maxpool_ex<<<mb_blocks(tot), mb_threads(tot)>>>(input, output, N, C, IH, IW, OH, OW, KH, KW, SH, SW, PH, PW, DH, DW);
 }
 
 __global__ void k_conv_t(const float *x, const float *w, const float *b, float *y,
@@ -513,7 +534,7 @@ extern "C" void kernel_conv_transpose2d(const float *input, const float *weight,
                                         int N, int IC, int IH, int IW, int OC, int OH, int OW,
                                         int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW, int G) {
     long tot = (long)N * OC * OH * OW;
-    k_conv_t<<<MB_GRID(tot), MB_THREADS>>>(input, weight, bias, output, N, IC, IH, IW, OC, OH, OW, KH, KW,
+    k_conv_t<<<mb_blocks(tot), mb_threads(tot)>>>(input, weight, bias, output, N, IC, IH, IW, OC, OH, OW, KH, KW,
                                            SH, SW, PH, PW, DH, DW, G);
 }
 
@@ -526,15 +547,15 @@ __global__ void k_bmm(const float *A, const float *B, float *C, int batch, int M
     C[i] = acc;
 }
 extern "C" void kernel_bmm(const float *A, const float *B, float *C, int batch, int M, int K, int N) {
-    k_bmm<<<MB_GRID((long)batch * M * N), MB_THREADS>>>(A, B, C, batch, M, K, N);
+    k_bmm<<<mb_blocks((long)batch * M * N), mb_threads((long)batch * M * N)>>>(A, B, C, batch, M, K, N);
 }
 
 __global__ void k_mul_scalar(const float *x, float *y, int n, float s) { long i = MB_TID; if (i < n) y[i] = x[i] * s; }
 __global__ void k_mul(const float *a, const float *b, float *y, int n) { long i = MB_TID; if (i < n) y[i] = a[i] * b[i]; }
 __global__ void k_tanh(const float *x, float *y, int n) { long i = MB_TID; if (i < n) y[i] = tanhf(x[i]); }
-extern "C" void kernel_mul_scalar(const float *input, float *output, int n, float s) { k_mul_scalar<<<MB_GRID(n), MB_THREADS>>>(input, output, n, s); }
-extern "C" void kernel_mul(const float *a, const float *b, float *output, int n) { k_mul<<<MB_GRID(n), MB_THREADS>>>(a, b, output, n); }
-extern "C" void kernel_tanh(const float *input, float *output, int n) { k_tanh<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_mul_scalar(const float *input, float *output, int n, float s) { k_mul_scalar<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, s); }
+extern "C" void kernel_mul(const float *a, const float *b, float *output, int n) { k_mul<<<mb_blocks(n), mb_threads(n)>>>(a, b, output, n); }
+extern "C" void kernel_tanh(const float *input, float *output, int n) { k_tanh<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
 
 // ---- recurrent: one launch per timestep, one thread per (b, j)
 __global__ void k_copy(const float *x, float *y, long n) { long i = MB_TID; if (i < n) y[i] = x[i]; }
@@ -566,12 +587,12 @@ extern "C" void kernel_lstm_seq(const float *x, const float *h0, const float *c0
                                 const float *w_hh, const float *b_gates, float *y, float *hn, float *cn,
                                 int B, int T, int I, int H, int reverse) {
     long bh = (long)B * H;
-    k_copy<<<MB_GRID(bh), MB_THREADS>>>(h0, hn, bh);
-    k_copy<<<MB_GRID(bh), MB_THREADS>>>(c0, cn, bh);
+    k_copy<<<mb_blocks(bh), mb_threads(bh)>>>(h0, hn, bh);
+    k_copy<<<mb_blocks(bh), mb_threads(bh)>>>(c0, cn, bh);
     for (int s = 0; s < T; s++) {
         int t = reverse ? T - 1 - s : s;
-        k_lstm_step<<<MB_GRID(bh), MB_THREADS>>>(x, w_ih, w_hh, b_gates, hn, cn, y, B, T, I, H, t);
-        k_rows_from_seq<<<MB_GRID(bh), MB_THREADS>>>(y, hn, B, T, H, t);
+        k_lstm_step<<<mb_blocks(bh), mb_threads(bh)>>>(x, w_ih, w_hh, b_gates, hn, cn, y, B, T, I, H, t);
+        k_rows_from_seq<<<mb_blocks(bh), mb_threads(bh)>>>(y, hn, B, T, H, t);
     }
 }
 __global__ void k_gru_step(const float *x, const float *w_ih, const float *w_hh, const float *b_ih,
@@ -595,11 +616,11 @@ extern "C" void kernel_gru_seq(const float *x, const float *h0, const float *w_i
                                const float *b_ih, const float *b_hh, float *y, float *hn,
                                int B, int T, int I, int H, int reverse) {
     long bh = (long)B * H;
-    k_copy<<<MB_GRID(bh), MB_THREADS>>>(h0, hn, bh);
+    k_copy<<<mb_blocks(bh), mb_threads(bh)>>>(h0, hn, bh);
     for (int s = 0; s < T; s++) {
         int t = reverse ? T - 1 - s : s;
-        k_gru_step<<<MB_GRID(bh), MB_THREADS>>>(x, w_ih, w_hh, b_ih, b_hh, hn, y, B, T, I, H, t);
-        k_rows_from_seq<<<MB_GRID(bh), MB_THREADS>>>(y, hn, B, T, H, t);
+        k_gru_step<<<mb_blocks(bh), mb_threads(bh)>>>(x, w_ih, w_hh, b_ih, b_hh, hn, y, B, T, I, H, t);
+        k_rows_from_seq<<<mb_blocks(bh), mb_threads(bh)>>>(y, hn, B, T, H, t);
     }
 }
 
@@ -607,13 +628,13 @@ extern "C" void kernel_gru_seq(const float *x, const float *h0, const float *w_i
 __global__ void k_gelu(const float *x, float *y, int n) {
     long i = MB_TID; if (i < n) { float v = x[i]; y[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)); }
 }
-extern "C" void kernel_gelu(const float *input, float *output, int n) { k_gelu<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_gelu(const float *input, float *output, int n) { k_gelu<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
 // MB's gelu_exact is the tanh (MinGPT) form
 __global__ void k_gelu_tanh(const float *x, float *y, int n) {
     long i = MB_TID;
     if (i < n) { float v = x[i]; y[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v))); }
 }
-extern "C" void kernel_gelu_exact(const float *input, float *output, int n) { k_gelu_tanh<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_gelu_exact(const float *input, float *output, int n) { k_gelu_tanh<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
 
 // sum/mean/max/min over the middle axis of [outer, reduce, inner] == kernel_reduce
 extern "C" void kernel_sum_dim(const float *input, float *output, int outer, int reduce, int inner) {
@@ -636,12 +657,12 @@ __global__ void k_softplus(const float *x, float *y, int n) {
     long i = MB_TID; if (i < n) { float v = x[i]; y[i] = v > 0.0f ? v + log1pf(expf(-v)) : log1pf(expf(v)); }
 }
 extern "C" void kernel_leaky_relu(const float *input, float *output, int n, float negative_slope) {
-    k_leaky_relu<<<MB_GRID(n), MB_THREADS>>>(input, output, n, negative_slope);
+    k_leaky_relu<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, negative_slope);
 }
 extern "C" void kernel_hardtanh(const float *input, float *output, int n, float min_val, float max_val) {
-    k_hardtanh<<<MB_GRID(n), MB_THREADS>>>(input, output, n, min_val, max_val);
+    k_hardtanh<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, min_val, max_val);
 }
-extern "C" void kernel_softplus(const float *input, float *output, int n) { k_softplus<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_softplus(const float *input, float *output, int n) { k_softplus<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
 
 // output index i -> (n, c, od, oh, ow) for an [N, C, OD, OH, OW] tensor
 #define MB_IDX5(i, C, OD, OH, OW) \
@@ -678,7 +699,7 @@ extern "C" void kernel_conv3d(const float *input, const float *weight, const flo
                               int KD, int KH, int KW, int SD, int SH, int SW, int PD, int PH, int PW,
                               int DD, int DH, int DW, int G) {
     long tot = (long)N * OC * OD * OH * OW;
-    k_conv3d<<<MB_GRID(tot), MB_THREADS>>>(input, weight, bias, output, N, IC, ID, IH, IW, OC, OD, OH, OW,
+    k_conv3d<<<mb_blocks(tot), mb_threads(tot)>>>(input, weight, bias, output, N, IC, ID, IH, IW, OC, OD, OH, OW,
                                            KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, G);
 }
 
@@ -715,7 +736,7 @@ extern "C" void kernel_conv_transpose3d(const float *input, const float *weight,
                                         int KD, int KH, int KW, int SD, int SH, int SW, int PD, int PH, int PW,
                                         int DD, int DH, int DW, int G) {
     long tot = (long)N * OC * OD * OH * OW;
-    k_conv_t3d<<<MB_GRID(tot), MB_THREADS>>>(input, weight, bias, output, N, IC, ID, IH, IW, OC, OD, OH, OW,
+    k_conv_t3d<<<mb_blocks(tot), mb_threads(tot)>>>(input, weight, bias, output, N, IC, ID, IH, IW, OC, OD, OH, OW,
                                              KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, G);
 }
 
@@ -744,14 +765,14 @@ extern "C" void kernel_maxpool3d(const float *input, float *output, int N, int C
                                  int OD, int OH, int OW, int KD, int KH, int KW, int SD, int SH, int SW,
                                  int PD, int PH, int PW, int DD, int DH, int DW) {
     long tot = (long)N * C * OD * OH * OW;
-    k_pool3d<<<MB_GRID(tot), MB_THREADS>>>(input, output, N, C, ID, IH, IW, OD, OH, OW, KD, KH, KW,
+    k_pool3d<<<mb_blocks(tot), mb_threads(tot)>>>(input, output, N, C, ID, IH, IW, OD, OH, OW, KD, KH, KW,
                                            SD, SH, SW, PD, PH, PW, DD, DH, DW, 0);
 }
 extern "C" void kernel_avgpool3d(const float *input, float *output, int N, int C, int ID, int IH, int IW,
                                  int OD, int OH, int OW, int KD, int KH, int KW, int SD, int SH, int SW,
                                  int PD, int PH, int PW) {
     long tot = (long)N * C * OD * OH * OW;
-    k_pool3d<<<MB_GRID(tot), MB_THREADS>>>(input, output, N, C, ID, IH, IW, OD, OH, OW, KD, KH, KW,
+    k_pool3d<<<mb_blocks(tot), mb_threads(tot)>>>(input, output, N, C, ID, IH, IW, OD, OH, OW, KD, KH, KW,
                                            SD, SH, SW, PD, PH, PW, 1, 1, 1, 1);
 }
 
@@ -799,7 +820,7 @@ __global__ void k_index_select(const float *x, const float *idx, float *y, long 
 extern "C" void kernel_index_select(const float *input, const float *index, float *output,
                                     int outer, int A, int J, int inner) {
     long n = (long)outer * J * inner;
-    k_index_select<<<MB_GRID(n), MB_THREADS>>>(input, index, output, n, A, J, inner);
+    k_index_select<<<mb_blocks(n), mb_threads(n)>>>(input, index, output, n, A, J, inner);
 }
 
 __global__ void k_gather_dim(const float *x, const float *idx, float *y, long n, int A, int J, int inner) {
@@ -810,7 +831,7 @@ __global__ void k_gather_dim(const float *x, const float *idx, float *y, long n,
 extern "C" void kernel_gather_dim(const float *input, const float *index, float *output,
                                   int outer, int A, int J, int inner) {
     long n = (long)outer * J * inner;
-    k_gather_dim<<<MB_GRID(n), MB_THREADS>>>(input, index, output, n, A, J, inner);
+    k_gather_dim<<<mb_blocks(n), mb_threads(n)>>>(input, index, output, n, A, J, inner);
 }
 
 __global__ void k_scatter_dim(const float *idx, const float *src, float *y, long n, int A, int J,
@@ -823,8 +844,8 @@ __global__ void k_scatter_dim(const float *idx, const float *src, float *y, long
 extern "C" void kernel_scatter_dim(const float *input, const float *index, const float *src,
                                    float *output, int outer, int A, int J, int inner, int mode) {
     long nb = (long)outer * A * inner, n = (long)outer * J * inner;
-    k_copy<<<MB_GRID(nb), MB_THREADS>>>(input, output, nb);
-    k_scatter_dim<<<MB_GRID(n), MB_THREADS>>>(index, src, output, n, A, J, inner, mode);
+    k_copy<<<mb_blocks(nb), mb_threads(nb)>>>(input, output, nb);
+    k_scatter_dim<<<mb_blocks(n), mb_threads(n)>>>(index, src, output, n, A, J, inner, mode);
 }
 
 __device__ __forceinline__ bool mb_topk_before(float a, long ia, float b, long ib, int largest) {
@@ -863,17 +884,17 @@ __global__ void k_scan(const float *in, float *out, long rows, int A, int inner,
 }
 extern "C" void kernel_cumsum(const float *input, float *output, int outer, int axis, int inner) {
     long rows = (long)outer * inner;
-    k_scan<<<MB_GRID(rows), MB_THREADS>>>(input, output, rows, axis, inner, 0);
+    k_scan<<<mb_blocks(rows), mb_threads(rows)>>>(input, output, rows, axis, inner, 0);
 }
 extern "C" void kernel_cumprod(const float *input, float *output, int outer, int axis, int inner) {
     long rows = (long)outer * inner;
-    k_scan<<<MB_GRID(rows), MB_THREADS>>>(input, output, rows, axis, inner, 1);
+    k_scan<<<mb_blocks(rows), mb_threads(rows)>>>(input, output, rows, axis, inner, 1);
 }
 
 extern "C" void kernel_topk(const float *input, float *values, float *indices, int outer,
                             int A, int inner, int K, int largest) {
     long rows = (long)outer * inner;
-    k_topk<<<MB_GRID(rows), MB_THREADS>>>(input, values, indices, rows, A, inner, K, largest);
+    k_topk<<<mb_blocks(rows), mb_threads(rows)>>>(input, values, indices, rows, A, inner, K, largest);
 }
 
 __global__ void k_convnd(const float *x, const float *w, const float *b, float *y, long tot,
@@ -906,7 +927,7 @@ extern "C" void kernel_convnd(const float *in0, const float *in1, const float *i
                               int KD, int KH, int KW, int SD, int SH, int SW, int PD, int PH, int PW,
                               int DD, int DH, int DW, int G) {
     long tot = (long)N * OC * OD * OH * OW;
-    k_convnd<<<MB_GRID(tot), MB_THREADS>>>(in0, in1, in2, output, tot, IC, ID, IH, IW, OC, OD, OH, OW,
+    k_convnd<<<mb_blocks(tot), mb_threads(tot)>>>(in0, in1, in2, output, tot, IC, ID, IH, IW, OC, OD, OH, OW,
                                           KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, G);
 }
 
@@ -920,8 +941,8 @@ extern "C" void kernel_strided_scatter(const float *input, const float *src, flo
                                        int d0, int d1, int d2, int d3, int d4, int d5,
                                        int s0, int s1, int s2, int s3, int s4, int s5) {
     long m = (long)d0 * d1 * d2 * d3 * d4 * d5;
-    k_copy<<<MB_GRID(n), MB_THREADS>>>(input, output, n);
-    k_strided_scatter<<<MB_GRID(m), MB_THREADS>>>(src, output, m, off, d1, d2, d3, d4, d5, s0, s1, s2, s3, s4, s5);
+    k_copy<<<mb_blocks(n), mb_threads(n)>>>(input, output, n);
+    k_strided_scatter<<<mb_blocks(m), mb_threads(m)>>>(src, output, m, off, d1, d2, d3, d4, d5, s0, s1, s2, s3, s4, s5);
 }
 
 // ---------------------------------------------------------------- Level1: elementwise / index ops
@@ -948,30 +969,30 @@ __global__ void k_flip(const float *x, float *y, long n, int A, int inner) {
     y[i] = x[(o * A + (A - 1 - a)) * inner + j];
 }
 
-extern "C" void kernel_swish(const float *input, float *output, int n) { k_swish<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_selu(const float *input, float *output, int n) { k_selu<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_hardsigmoid(const float *input, float *output, int n) { k_hardsigmoid<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_softsign(const float *input, float *output, int n) { k_softsign<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
-extern "C" void kernel_log(const float *input, float *output, int n) { k_log<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_swish(const float *input, float *output, int n) { k_swish<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_selu(const float *input, float *output, int n) { k_selu<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_hardsigmoid(const float *input, float *output, int n) { k_hardsigmoid<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_softsign(const float *input, float *output, int n) { k_softsign<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
+extern "C" void kernel_log(const float *input, float *output, int n) { k_log<<<mb_blocks(n), mb_threads(n)>>>(input, output, n); }
 extern "C" void kernel_triu(const float *input, float *output, int M, int N, int diagonal) {
-    k_tri<<<MB_GRID((long)M * N), MB_THREADS>>>(input, output, M, N, diagonal, 1);
+    k_tri<<<mb_blocks((long)M * N), mb_threads((long)M * N)>>>(input, output, M, N, diagonal, 1);
 }
 extern "C" void kernel_tril(const float *input, float *output, int M, int N, int diagonal) {
-    k_tri<<<MB_GRID((long)M * N), MB_THREADS>>>(input, output, M, N, diagonal, 0);
+    k_tri<<<mb_blocks((long)M * N), mb_threads((long)M * N)>>>(input, output, M, N, diagonal, 0);
 }
 extern "C" void kernel_diag_matmul(const float *a, const float *b, float *output, int N, int M) {
-    k_diag_matmul<<<MB_GRID((long)N * M), MB_THREADS>>>(a, b, output, N, M);
+    k_diag_matmul<<<mb_blocks((long)N * M), mb_threads((long)N * M)>>>(a, b, output, N, M);
 }
 // A stored [K, M], B stored [N, K]
 extern "C" void kernel_matmul_tatb(const float *A, const float *B, float *C, int M, int K, int N) {
-    k_matmul_s<<<MB_GRID((long)M * N), MB_THREADS>>>(A, B, C, M, K, N, 1, M, 1, K);
+    k_matmul_s<<<mb_blocks((long)M * N), mb_threads((long)M * N)>>>(A, B, C, M, K, N, 1, M, 1, K);
 }
 extern "C" void kernel_log_softmax(const float *input, float *output, int M, int K) {
     kernel_softmax_dim(input, output, M, K, 1, 1);
 }
 extern "C" void kernel_flip(const float *input, float *output, int outer, int axis, int inner) {
     long n = (long)outer * axis * inner;
-    k_flip<<<MB_GRID(n), MB_THREADS>>>(input, output, n, axis, inner);
+    k_flip<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, axis, inner);
 }
 
 // ---------------------------------------------------------------- Level1: per-(outer, inner) reductions
@@ -1002,22 +1023,22 @@ __global__ void k_excl_cumsum(const float *x, float *y, int Bout, int N) {
 }
 
 extern "C" void kernel_rms_norm(const float *input, float *output, int outer, int reduce, int inner, float eps) {
-    k_col_norm<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 0, eps);
+    k_col_norm<<<mb_blocks((long)outer * inner), mb_threads((long)outer * inner)>>>(input, output, outer, reduce, inner, 0, eps);
 }
 extern "C" void kernel_mean_abs_norm(const float *input, float *output, int outer, int reduce, int inner) {
-    k_col_norm<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 1, 0.0f);
+    k_col_norm<<<mb_blocks((long)outer * inner), mb_threads((long)outer * inner)>>>(input, output, outer, reduce, inner, 1, 0.0f);
 }
 extern "C" void kernel_l2_norm(const float *input, float *output, int outer, int reduce, int inner) {
-    k_col_norm<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 2, 0.0f);
+    k_col_norm<<<mb_blocks((long)outer * inner), mb_threads((long)outer * inner)>>>(input, output, outer, reduce, inner, 2, 0.0f);
 }
 extern "C" void kernel_argmax_dim(const float *input, int64_t *output, int outer, int reduce, int inner) {
-    k_arg_dim<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 1);
+    k_arg_dim<<<mb_blocks((long)outer * inner), mb_threads((long)outer * inner)>>>(input, output, outer, reduce, inner, 1);
 }
 extern "C" void kernel_argmin_dim(const float *input, int64_t *output, int outer, int reduce, int inner) {
-    k_arg_dim<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 0);
+    k_arg_dim<<<mb_blocks((long)outer * inner), mb_threads((long)outer * inner)>>>(input, output, outer, reduce, inner, 0);
 }
 extern "C" void kernel_exclusive_cumsum(const float *x, float *output, int Bout, int N) {
-    k_excl_cumsum<<<MB_GRID(Bout), MB_THREADS>>>(x, output, Bout, N);
+    k_excl_cumsum<<<mb_blocks(Bout), mb_threads(Bout)>>>(x, output, Bout, N);
 }
 
 // ---------------------------------------------------------------- Level1: whole-tensor reductions (losses, norms)
@@ -1123,5 +1144,5 @@ extern "C" void kernel_frobenius_norm(const float *input, float *output, int n) 
     int nb = mb_rblocks(n); double *part = mb_partials(nb + 1);
     k_loss_partial<<<nb, MB_THREADS>>>(input, nullptr, n, 1, 0.0f, 4, part + 1);
     k_sum_partials<<<1, MB_THREADS>>>(part + 1, nb, part, nullptr, 1.0);
-    k_div_by_norm<<<MB_GRID(n), MB_THREADS>>>(input, output, n, part);
+    k_div_by_norm<<<mb_blocks(n), mb_threads(n)>>>(input, output, n, part);
 }
