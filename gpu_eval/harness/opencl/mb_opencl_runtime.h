@@ -37,6 +37,9 @@
 #include <vector>
 
 #define MB_THREADS 256
+// _Float16 in host signatures (the CUDA spelling, cuda_dtypes.cuda_signature):
+// 2-byte binary16 storage; kernels read and write it with vload_half / vstore_half
+typedef cl_half __half;
 
 // Device prelude: prepended to every program.
 static const char *mb_cl_prelude = R"CL(
