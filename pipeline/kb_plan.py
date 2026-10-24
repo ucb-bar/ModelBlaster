@@ -73,7 +73,9 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
     pdir = write_variant_ir(Path(ir_dir), plan["graph"], work / "profile_ir") if plan["hints"] else hdir
     prob = export_problem(pdir, work / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
                           sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
-    res = build_and_run(prob, arch=arch, runs=runs)
+    # as deployed: CUDA graph where capturable; per-op GPU time from the driver's attribution
+    res = build_and_run(prob, arch=arch, runs=runs, graph=True)
+    attr = res.get("attr_op_us") or {}
     man = json.loads((prob / "manifest.json").read_text())
     ops_by_name = {o["name"]: o for o in plan["graph"]["ops"]}
     seed = {s["id"]: s["seed_source"] for s in man["slots"]}
@@ -83,12 +85,18 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
         entry, _ = parse_signature(specs[o["op"]].signature)
         recs.append({"name": r["name"], "op": o["op"], "slot": r["slot"], "entry": entry,
                      "signature_sha": signature_sha(specs[o["op"]].signature), "shape": o.get("shape", {}),
-                     "us": res.get("op_us", {}).get(r["name"]), "seed": seed.get(r["slot"]),
+                     "us": attr.get(r["name"], res.get("op_us", {}).get(r["name"])),
+                     "event_us": res.get("op_us", {}).get(r["name"]), "seed": seed.get(r["slot"]),
                      "slot_base": slot_id_of({"op": o["op"]}, specs)})
     out = {"format": PROFILE_FORMAT, "ir": man["ir_name"], "source_ir": str(ir_dir), "ir_dir": str(pdir),
            "hints_sha": gh.hints_sha(hints_doc or gh.new_doc()), "arch": f"sm_{arch}",
            "passed": res.get("passed"), "partition_us": res.get("partition_us"),
            "partition_us_runs": res.get("partition_us_runs"), "ops": recs,
+           "e2e_us": res.get("e2e_us"), "e2e_basis": res.get("e2e_basis"),
+           "op_time_basis": "cupti" if attr else "events",
+           "launches": res.get("attr_launches"), "launch_overhead_frac": res.get("launch_overhead_frac"),
+           # deployed time not spent in kernels, per launch: what a fusion saves besides the kernel
+           "launch_us": _launch_us(res),
            "applied_hints": [h["id"] for h in plan["hints"]]}
     if not res.get("passed"):
         out["log"] = res.get("log", "")[-1500:]
@@ -100,6 +108,11 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
                 p.unlink()
     (work / "profile.json").write_text(json.dumps(out, indent=1))
     return out
+
+
+def _launch_us(res: dict) -> float:
+    e2e, kern, n = res.get("e2e_us"), res.get("attr_sum_us"), res.get("attr_launches")
+    return round(max(0.0, e2e - kern) / n, 3) if e2e and kern is not None and n else 0.0
 
 
 def rank(profiles: list[dict], weights: dict[str, float] | None = None) -> list[dict]:

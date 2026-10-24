@@ -53,6 +53,23 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(r["graph_skip"], "operation not permitted when stream is capturing")
         self.assertIsNone(r["partition_graph_us"])
 
+    def test_e2e_and_attribution_lines(self):
+        r = parse_driver_output("\n".join([
+            "MB_PARTITION_US 12.0 reps=10", "MB_PARTITION_GRAPH_US 9.0 reps=10 nodes=4",
+            "MB_E2E_US 8.900 basis=graph mean=9.000 reps=10", "MB_REF_E2E_US 10.000 basis=graph mean=10.0 reps=10",
+            "MB_E2E_RATIO med=0.89000 mean=0.9 min=0.8 max=1.0 n=10",
+            "MB_ATTR_SLOT_US relu 1.500 launches=2.0", "MB_ATTR_OP_US relu 1.500",
+            "MB_ATTR_SUM_US 7.000 basis=cupti reps=5 launches=4.0 unmatched=0",
+            "MB_LAUNCH_OVERHEAD_US eager=5.000 graph=2.000 frac_eager=0.4167", "passed"]))
+        self.assertEqual((r["e2e_us"], r["e2e_basis"], r["ref_e2e_us"]), (8.9, "graph", 10.0))
+        self.assertEqual(r["e2e_ratio"]["med"], 0.89)
+        self.assertEqual(r["attr_slot_us"], {"relu": 1.5})
+        self.assertEqual(r["attr_slot_launches"], {"relu": 2.0})
+        self.assertEqual((r["attr_sum_us"], r["attr_basis"], r["attr_launches"]), (7.0, "cupti", 4.0))
+        self.assertEqual((r["launch_overhead_us"], r["launch_overhead_graph_us"]), (5.0, 2.0))
+        self.assertEqual(r["graph_nodes"], 4)
+        self.assertIsNone(parse_driver_output("MB_ATTR_SKIP no cupti\npassed\n")["attr_sum_us"])
+
 
 def _have_gpu() -> bool:
     if shutil.which("nvcc") is None or shutil.which("nvidia-smi") is None:
@@ -161,6 +178,94 @@ class DriverModesTest(unittest.TestCase):
         self.assertIsNone(res["partition_graph_us"])
         self.assertTrue(res["graph_skip"])
         self.assertIsNotNone(res["partition_us"])
+
+    # ---- the persistent host (driver.cpp -DMB_HOST + the kernels as a shared object)
+    def test_host_matches_one_process_driver(self):
+        """One host request prints what the one-process driver prints: same checks, same errors."""
+        from modelblaster.pipeline.kb_export import build_and_run, supports_host
+
+        self.assertTrue(supports_host(self.prob))
+        for env in ({}, {"MB_ONLY_SLOTS": "relu", "MB_SCREEN": "1"}):
+            h = build_and_run(self.prob, arch=self.arch, work=self.d / "host", runtime="host", env=env)
+            q = self.run_exe({"MB_GRAPH": "1", **env}, self.exe_ptds)
+            self.assertTrue(h["passed"] and q["passed"], h["log"])
+            self.assertEqual(h["slots"], q["slots"])
+            self.assertEqual(h["outputs"], q["outputs"])
+            self.assertEqual(set(h["slot_us"]), set(q["slot_us"]))
+            self.assertEqual((h["e2e_basis"], q["e2e_basis"]), ("graph", "graph"))
+            self.assertIn("load", h["phase_ms"])
+            self.assertNotIn("cuda_init", h["phase_ms"])          # paid once, at host start
+        if h["attr_skip"] is None:
+            self.assertEqual(set(h["attr_slot_us"]), {"linear", "relu"})
+            self.assertGreaterEqual(h["attr_launches"], 4)
+
+    def test_host_crash_recovery_and_pairing(self):
+        """A crashing candidate is a run error and the host restarts; a wrong one fails its slot;
+        ref= times the incumbent in the same request."""
+        from modelblaster.pipeline.kb_export import DriverHost, build_host, build_so
+
+        host, log = build_host(self.prob, arch=self.arch, work=self.d / "h2")
+        self.assertIsNotNone(host, log)
+        src = (self.prob / "slots" / "relu.cu").read_text()
+        segv = ("#include <cuda_runtime.h>\n"
+                "void kernel_relu(const float *input, float *output, int n) { *(volatile int *)nullptr = n; }\n")
+        wrong = src.replace("fmaxf(x[i], 0.0f)", "fmaxf(x[i], 1.0f)")
+        sos = {}
+        for name, s in (("good", None), ("segv", segv), ("wrong", wrong)):
+            so, log = build_so(self.prob, arch=self.arch, sources={"relu": s} if s else None, work=self.d / "h2",
+                               name=f"{name}.so")
+            self.assertIsNotNone(so, log)
+            sos[name] = so
+        h = DriverHost(host, timeout=120)
+        try:
+            env = {"MB_GRAPH": "1", "MB_SCREEN": "1"}
+            r = h.evaluate(sos["good"], env=env)
+            self.assertTrue(r["passed"], r["log"])
+            r = h.evaluate(sos["segv"], env=env)
+            self.assertFalse(r["passed"])
+            self.assertTrue(r["host_crash"])
+            r = h.evaluate(sos["wrong"], env={**env, "MB_ONLY_SLOTS": "relu"})
+            self.assertFalse(r["passed"])
+            self.assertFalse(r["slots"]["relu"]["ok"])
+            self.assertIsNone(r["host_crash"])
+            r = h.evaluate(sos["good"], ref=sos["good"], env=env)
+            self.assertTrue(r["passed"], r["log"])
+            self.assertIsNotNone(r["e2e_ratio"])
+            self.assertEqual(h.starts, 2)
+        finally:
+            h.close()
+
+    def test_model_runtime_composes_window_winners(self):
+        """kb_model_run: windows' best slots composed into one whole-model runtime, checked and
+        timed by graph replay against the hand-seeded model (paired), next to the windows' sum."""
+        import json
+        from modelblaster.pipeline.kb_export import export_problem, partition_ir
+        from modelblaster.pipeline.kb_model_run import model_runtime
+
+        ir = self.d / "ir"
+        g = json.loads((ir / "graph.json").read_text())
+        parts = partition_ir(g, "window", max_ops=2)
+        self.assertEqual(len(parts), 2)
+        for k, idx in enumerate(parts):
+            pdir = export_problem(ir, self.d / "win" / f"p{k}", op_indices=idx, strategy="window")
+            man = json.loads((pdir / "manifest.json").read_text())
+            run = self.d / "win_runs" / man["name"]
+            (run / "best" / "slots").mkdir(parents=True)
+            for sl in man["slots"]:          # "winners": the seeds with a marker (same code per window)
+                (run / "best" / "slots" / f"{sl['id']}.cu").write_text((pdir / sl["file"]).read_text() + "\n// win\n")
+            (run / "result.json").write_text(json.dumps({"problem": man["name"], "problem_dir": str(pdir),
+                                                         "final_ok": True, "run_id": "t", "slots": {}}))
+        r = model_runtime(ir, work=self.d / "model_run", runs=[self.d / "win_runs"], arch=self.arch, reps=1,
+                          time_partitions=True)
+        self.assertTrue(r["passed"], r["model"].get("log"))
+        self.assertEqual(r["model_basis"], "graph")
+        self.assertTrue(r["paired"])                 # same slots as the seed model: timed in one process
+        self.assertTrue(r["seed_e2e_us"] and r["model_e2e_us"] and r["speedup_paired"])
+        self.assertTrue(all(t.startswith("cache:") for t in r["composed_slots"].values()))
+        self.assertEqual(set(r["composed_slots"]), {"linear", "relu"})   # one slot each, not split by window
+        self.assertEqual(len(r["partitions"]), 2)
+        self.assertTrue(all(p["passed"] for p in r["partitions"]))
+        self.assertIsNotNone(r["boundary_effect_us"])
 
 
 if __name__ == "__main__":

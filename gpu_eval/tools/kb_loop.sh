@@ -10,6 +10,9 @@
 #      decision lands in WORK_DIR/graph_hints.json (modelblaster.graph_hints/v1)
 #   4. ingest the winners into the CUDA kernel cache and re-verify the whole
 #      IR with them and the accepted hints                     (pipeline/kb_ingest)
+#   5. the model's result: every partition's best slots composed into one
+#      whole-model runtime, checked and timed by CUDA-graph replay against the
+#      hand-seeded model                                      (pipeline/kb_model_run)
 # Accepted hints in WORK_DIR/graph_hints.json are applied before step 1, so
 # rerunning the script continues where the last round stopped. Rounds to a
 # fixpoint over several IRs: python -m modelblaster.pipeline.kb_graph_opt.
@@ -78,4 +81,7 @@ done
 step "ingest winners + model-level verify"
 $PY -m modelblaster.pipeline.kb_ingest "$W/winners/winners.json" --cache "$CACHE" --verify "$IR" --arch "$ARCH" \
     --hints "$HINTS" | tee "$W/ingest.jsonl"
+step "model result: every partition's winners in one whole-model runtime (CUDA graph replay)"
+$PY -m modelblaster.pipeline.kb_model_run "$IR" --kb-runs "$W/run" --cache "$CACHE" --hints "$HINTS" \
+    --arch "$ARCH" --work "$W/model_run" --out "$W/model_result.json" | tee "$W/model_result.line.json"
 step "done: $W"

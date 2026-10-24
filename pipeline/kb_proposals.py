@@ -407,19 +407,20 @@ def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, le
 
     exes = []
     for k, (d, src) in enumerate(problems):
-        r = build_and_run(d, arch=arch, sources=src, work=Path(d) / f"build_remeasure{k}", runs=0)
+        # as deployed: built for and timed as a CUDA graph (eager where not capturable)
+        r = build_and_run(d, arch=arch, sources=src, work=Path(d) / f"build_remeasure{k}", runs=0, graph=True)
         if r.get("stage") == "compile":
             raise RuntimeError(f"{d}: {r.get('log', '')[-800:]}")
         exes.append(r["exe"])
     times: list[list[float]] = [[] for _ in problems]
     with (lease if lease is not None else contextlib.nullcontext({})) as env:
-        run_env = {**os.environ, **(env or {})}
+        run_env = {**os.environ, **(env or {}), "MB_GRAPH": "1", "MB_ATTR": "0", "MB_OP_US_PASS": "0"}
         for _ in range(reps):
             for k, exe in enumerate(exes):
                 rp = subprocess.run([str(exe)], capture_output=True, text=True, timeout=timeout, env=run_env)
                 r = parse_driver_output(rp.stdout)
-                if r.get("passed") and r.get("partition_us"):
-                    times[k].append(r["partition_us"])
+                if r.get("passed") and (r.get("e2e_us") or r.get("partition_us")):
+                    times[k].append(r.get("e2e_us") or r["partition_us"])
     return times
 
 
@@ -429,8 +430,11 @@ def _median(xs: list[float]) -> float | None:
 
 
 def _per_instance_us(result: dict, manifest: dict) -> dict:
-    """op name -> its final time: measured per op (driver MB_OP_US) when the
-    result has it, else its slot's time / number of instances."""
+    """op name -> its final time: its kernels' GPU time (the driver's attribution,
+    ``attr_op_us``) or else its event-timed time (MB_OP_US) when the result has
+    them, else its slot's time / number of instances."""
+    if result.get("attr_op_us"):
+        return dict(result["attr_op_us"])
     if result.get("op_us"):
         return dict(result["op_us"])
     out = {}
@@ -461,7 +465,9 @@ def decide(orig_result: Path, variant_result: Path, variant_json: Path | None = 
     v = json.loads(Path(variant_result).read_text())
     vj = Path(variant_json) if variant_json else Path(v["problem_dir"]).parent / "variant.json"
     var = json.loads(vj.read_text())
-    ou, vu = o["final_partition_us"], v["final_partition_us"]
+    # end to end as deployed (CUDA graph replay) where both runs report it
+    basis = "e2e" if o.get("final_e2e_us") and v.get("final_e2e_us") else "partition"
+    ou, vu = (o["final_e2e_us"], v["final_e2e_us"]) if basis == "e2e" else (o["final_partition_us"], v["final_partition_us"])
     ok = bool(o.get("final_ok") and v.get("final_ok") and ou and vu)
     measured = None
     if ok and remeasure_reps:
@@ -478,7 +484,7 @@ def decide(orig_result: Path, variant_result: Path, variant_json: Path | None = 
     if kinds and all(k["gain"] is not None for k in kinds.values()):
         gain = sum(k["gain"] for k in kinds.values())
     status = "accepted" if ok and gain is not None and gain >= accept_gain else "rejected"
-    ev = {"problem": o["problem"], "ir": ir, "original_us": ou, "variant_us": vu, "gain": gain,
+    ev = {"problem": o["problem"], "ir": ir, "original_us": ou, "variant_us": vu, "gain": gain, "basis": basis,
           "decision": status, "remeasured": measured, "touched": kinds or None, "variant": str(vj),
           "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     doc = gh.load(Path(registry))
