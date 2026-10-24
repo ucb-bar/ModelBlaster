@@ -52,7 +52,7 @@ OPENCL_DIR = MB_ROOT / "gpu_eval" / "harness" / "opencl"
 RUNTIME_H = OPENCL_DIR / "mb_opencl_runtime.h"
 HAND_LIB = OPENCL_DIR / "mb_opencl_kernels.cpp"
 # element sizes of the manifest's buffer dtypes
-ELEM_BYTES = {"f32": 4, "i32": 4, "i64": 8}
+ELEM_BYTES = {"f32": 4, "i32": 4, "i64": 8, "f16": 2}
 CXX = os.environ.get("MB_OPENCL_CXX", "g++")
 CXXFLAGS = ["-O2", "-std=c++11", "-w"]
 LDFLAGS = ["-lOpenCL", "-lm"]
@@ -65,10 +65,8 @@ class OpenCLTarget:
     slot_ext = ".cpp"
     head_name, tail_name, driver_name = "walker_head.cpp", "walker_tail.cpp", "driver.cpp"
 
-    def library(self, hand=None, dtype: str = "fp32"):
+    def library(self, hand=None, dtype: str = "fp32"):          # fp16 seeds: OpenCLSeeds.slot_source(<entry>_f16)
         from .opencl_seeds import OpenCLSeeds
-        if dtype != "fp32":
-            raise NotImplementedError(f"OpenCL slots are fp32 only (partition dtype {dtype})")
         return OpenCLSeeds(Path(hand) if hand else HAND_LIB)
 
     def seed(self, lib, entry: str, spec) -> tuple[str, str]:
@@ -104,7 +102,7 @@ def driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         out_ofs.append(c); c += len(r["outputs"])
     in_ofs.append(a); out_ofs.append(c)
     kinds = {"input": 0, "const": 1, "weight": 2, "intermediate": 3, "output": 4}
-    dts = {"f32": 0, "i32": 1, "i64": 2}
+    dts = {"f32": 0, "i32": 1, "i64": 2, "f16": 3}
     tables = "\n".join([
         f"static const int NB = {len(bufs)}, NOPS = {len(op_recs)}, NSLOTS = {len(slots)};",
         arr("B_KIND", "int", (kinds[b["kind"]] for b in bufs)),
@@ -159,7 +157,13 @@ void mb_kernel_at(int i, cl_kernel *k, const char **name, int *op);
 @TABLES@
 static const double OUT_REL = @OUT_REL@, OUT_ABS = @OUT_ABS@, SLOT_REL = @SLOT_REL@, SLOT_ABS = @SLOT_ABS@;
 enum { K_INPUT, K_CONST, K_WEIGHT, K_INTER, K_OUTPUT };
-static const int ESZ[] = {4, 4, 8};
+static const int ESZ[] = {4, 4, 8, 2};
+// binary16 -> float, exact (subnormals, inf, NaN)
+static float half_to_float(unsigned short h) {
+    unsigned s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? std::ldexp((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : std::ldexp((float)(m | 1024), (int)e - 25);
+    return s ? -v : v;
+}
 
 static unsigned char *blob;
 static void *dev[NB];
@@ -186,7 +190,8 @@ static std::vector<double> widen(const unsigned char *p, int b) {
     for (long i = 0; i < B_NUMEL[b]; ++i) {
         if (B_DT[b] == 0) { float f; memcpy(&f, p + 4 * i, 4); v[i] = f; }
         else if (B_DT[b] == 1) { int x; memcpy(&x, p + 4 * i, 4); v[i] = x; }
-        else { long long x; memcpy(&x, p + 8 * i, 8); v[i] = (double)x; }
+        else if (B_DT[b] == 2) { long long x; memcpy(&x, p + 8 * i, 8); v[i] = (double)x; }
+        else { unsigned short x; memcpy(&x, p + 2 * i, 2); v[i] = half_to_float(x); }
     }
     return v;
 }
@@ -341,7 +346,7 @@ int main(int argc, char **argv) {
         if (!report(OP_NAME[i])) { slot_bad[OP_SLOT[i]] = 1; slot_err[OP_SLOT[i]] = INFINITY; continue; }
         double scale = 0;
         for (int k = OP_IN_OFS[i]; k < OP_IN_OFS[i + 1]; ++k)
-            if (B_DT[OP_IN[k]] == 0) scale = std::max(scale, max_finite(ref_vec(OP_IN[k])));
+            if (B_DT[OP_IN[k]] == 0 || B_DT[OP_IN[k]] == 3) scale = std::max(scale, max_finite(ref_vec(OP_IN[k])));
         for (int k = OP_OUT_OFS[i]; k < OP_OUT_OFS[i + 1]; ++k) {
             int b = OP_OUT[k];
             std::vector<double> r = ref_vec(b), a = dev_vec(b);
