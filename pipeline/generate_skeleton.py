@@ -132,6 +132,34 @@ def _buf_name(mid: str, tensor: str) -> str:
 # modelblaster_pool.h out of model.c so the harness has no POSIX dep.
 _PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 
+#: Ops whose call is derived from KernelSpec.signature by kernel_abi.bind
+#: rather than a hand-written branch below (see reference_kernels_ext).
+_GENERIC_ABI_OPS = {"strided_copy", "gather", "catn", "ewise1", "ewise2",
+                    "ewise_scalar", "reduce", "softmax_dim", "conv2d_grouped",
+                    "maxpool2d_ex", "lstm_seq", "gru_seq", "index_select",
+                    "gather_dim", "scatter_dim", "topk", "convnd", "strided_scatter"}
+
+
+def _generic_call(op: dict, ptr_for, model_name: str, backend) -> str:
+    from modelblaster.pipeline.kernel_abi import bind, parse_signature
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    fn, params = parse_signature(KERNEL_SPECS[op["op"]].signature)
+    parts = []
+    for a in bind(op, params):
+        if a.kind == "out":
+            parts.append(ptr_for(a.value, "out"))
+        elif a.kind == "in":
+            parts.append(ptr_for(a.value, "in"))
+        elif a.kind == "weight":
+            parts.append(_weight_name(model_name, a.value, backend))
+        elif a.kind == "null":
+            parts.append("NULL")
+        elif a.param.base_type == "float":
+            parts.append(_f32(a.value))
+        else:
+            parts.append(str(int(a.value)))
+    return f"{fn}({', '.join(parts)})"
+
 # fp16 ops that have a bespoke `_f16` skeleton branch (some with different args,
 # e.g. softmax_f16's input_scale). These route to their own branch unchanged.
 # Every OTHER `_f16` op reuses its fp32 branch (identical args) via the
@@ -1492,7 +1520,8 @@ def emit_weights(
     for k in keys:
         ident = _weight_name(model_name, k, backend)
         arr_in = weights[k]
-        arr_out, layout_tag = _backend_pack_weight(arr_in, backend)
+        arr_out, layout_tag = ((arr_in, None) if k.startswith("const.")
+                               else _backend_pack_weight(arr_in, backend))
         c_type, _ = _np_to_c_dtype(arr_out.dtype)
         if layout_tag:
             c_lines.append(
@@ -1699,7 +1728,11 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             name = aliases[name]
         return name
     for op in ir["ops"]:
-        if op["op"] == "view":
+        if op["op"] == "view" and op.get("offset"):
+            # Contiguous window into the input (slice / split / select of the
+            # leading dims): a pointer offset, no copy.
+            offset_aliases[op["outputs"][0]] = (op["inputs"][0], int(op["offset"]))
+        elif op["op"] == "view":
             aliases[op["outputs"][0]] = op["inputs"][0]
         elif op["op"] in ("chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"):
             # Two outputs: first half at offset 0, second half at offset
@@ -1887,6 +1920,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         t for t in tensors
         if t not in input_names_set and t not in out_tensor_set
         and t not in aliases and t not in offset_aliases
+        and not tensors[t].get("const")
     ]
     buf_defs: list[str] = []   # for buffers.c (definitions, no `static`)
     buf_externs: list[str] = []  # for model.c (declarations)
@@ -1898,6 +1932,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 
     def ptr_for(tensor: str, role: str) -> str:
         tensor = resolve_alias(tensor)
+        if tensors.get(tensor, {}).get("const"):
+            # Folded constant (get_attr / parameter-only subgraph): lives in
+            # weights.c under its weights.npz key.
+            return _weight_name(model_name, tensors[tensor]["const"], backend)
         if tensor in offset_aliases:
             base, off = offset_aliases[tensor]
             base_ptr = ptr_for(base, role)
@@ -3257,6 +3295,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, "
                 f"{sh['batch']}, {sh['M']}, {sh['K']}, {sh['N']})"
             )
+        elif op["op"] in _GENERIC_ABI_OPS:
+            call = _generic_call(op, ptr_for, model_name, backend)
         else:
             raise NotImplementedError(f"unsupported op {op['op']}")
         # Mangle the kernel call: every kernels.c emits kernel_<op>_<mid>
