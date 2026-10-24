@@ -34,7 +34,7 @@ import walk_torch
 from mbabi import bind, parse_signature
 from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
 
-_TORCH_DTYPE = {"f16": torch.float16, "f32": torch.float32}
+_TORCH_DTYPE = {"f16": torch.float16, "f32": torch.float32, "i64": torch.int64}   # i64: argmax/argmin indices
 
 
 def _storage(ir: IR, t: str) -> torch.dtype:

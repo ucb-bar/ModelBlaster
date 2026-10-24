@@ -16,7 +16,7 @@ from __future__ import annotations
 FP32, FP16 = "fp32", "fp16"
 
 # buffer dtype (mb-kb-problem/1 `buffers[].dtype`) -> element bytes
-BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4}
+BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4, "i64": 8}
 
 # Tolerances per storage dtype. fp32: the Level2/3 gates' bounds, unchanged.
 # fp16: from the fp16 rounding measured on KernelBench Level3 (all 50 IRs,
