@@ -20,7 +20,14 @@
 #   [PY=python] [KB=KernelBlaster checkout] [MODEL=claude-code:sonnet] [REFLECT_MODEL=...]
 #   [ARCH=75] [STRATEGY=whole|window|per_op|plan] [MAX_OPS=12] [COVERAGE=0.8] [TOP_K=6]
 #   [ROLLOUTS=3] [STEPS=5] [REMEASURE=5] [CACHE=dir] [PLUGIN=stubs.py] [MB_PATH_EXCLUDE=pattern] \
+#   [GPUS=auto|all|0,2] [SSH_HOST="user@h1 user@h2" REMOTE_DIR=dir [CVD=auto|ids] [SSH_KEY=file]] \
+#   [RUNTIME=auto|host|process] [GPU_MODEL="NVIDIA L40S"] \
 #       bash gpu_eval/tools/kb_loop.sh IR_DIR WORK_DIR
+#
+# GPUs: KernelBlaster's runs, the re-measurement of proposals (with SSH_HOST)
+# and the model's result (step 5) use the same evaluator -- local GPU pool
+# (GPUS) or the SSH_HOST GPUs -- and step 5 times on the GPU model the runs
+# recorded (or GPU_MODEL), so the model and its partitions share the hardware.
 #
 # WORK_DIR/knowledge is the shared KernelBlaster knowledge dir (impl store,
 # outcomes, claims): reuse WORK_DIR, or point KNOWLEDGE at one, to carry
@@ -37,11 +44,23 @@ KNOWLEDGE=${KNOWLEDGE:-$W/knowledge}; CACHE=${CACHE:-$W/cache}; HINTS=$W/graph_h
 [ -z "${MB_PATH_EXCLUDE:-}" ] || export PATH=$(echo "$PATH" | tr : '\n' | grep -Ev "$MB_PATH_EXCLUDE" | paste -sd:)
 export PYTHONPATH="$(dirname "$MB_ROOT")${PYTHONPATH:+:$PYTHONPATH}"
 step() { echo "[$(date +%H:%M:%S)] $*"; }
+# the evaluator flags (run_multislot.py, kb_model_run and kb_proposals decide take the same names)
+EVAL=(--runtime "${RUNTIME:-auto}")
+if [ -n "${SSH_HOST:-}" ]; then
+  EVAL+=(--evaluator ssh --remote-dir "${REMOTE_DIR:?SSH_HOST needs REMOTE_DIR}")
+  for h in $SSH_HOST; do EVAL+=(--ssh-host "$h"); done
+  for c in ${CVD:-}; do EVAL+=(--cuda-visible-devices "$c"); done
+  [ -z "${SSH_KEY:-}" ] || EVAL+=(--ssh-key "$SSH_KEY")
+else
+  EVAL+=(--evaluator local --gpus "${GPUS:-auto}")
+fi
+GPU=(); [ -z "${GPU_MODEL:-}" ] || GPU=(--gpu-model "$GPU_MODEL")
 run_kb() {  # problem(s) out [winners]
   local out=$1; shift
   $PY "$KB/scripts/run_multislot.py" "$@" --out "$out" --knowledge-dir "$KNOWLEDGE" --model "$MODEL" \
       ${REFLECT_MODEL:+--reflect-model "$REFLECT_MODEL"} --arch "$ARCH" --rollouts "$ROLLOUTS" \
-      --steps "$STEPS" --export-winners "$W/winners" ${PLUGIN:+--plugin "$PLUGIN"} > "$out.log" 2>&1
+      --steps "$STEPS" --export-winners "$W/winners" ${PLUGIN:+--plugin "$PLUGIN"} "${EVAL[@]}" "${GPU[@]}" \
+      > "$out.log" 2>&1
 }
 mkdir -p "$W"
 
@@ -75,7 +94,8 @@ for props in "$W"/run/*/proposals.json; do
   run_kb "$V/run" "$V/problem"
   $PY -m modelblaster.pipeline.kb_proposals decide "$(dirname "$props")/result.json" \
       "$V/run/$name"__variant/result.json --variant-json "$V/variant.json" \
-      --hints "$HINTS" --remeasure "$REMEASURE" --arch "$ARCH" | tee "$V.decision.json"
+      --hints "$HINTS" --remeasure "$REMEASURE" --arch "$ARCH" ${SSH_HOST:+"${EVAL[@]}" --kb "$KB" --kb-python "$PY"} \
+      | tee "$V.decision.json"
 done
 
 step "ingest winners + model-level verify"
@@ -83,5 +103,6 @@ $PY -m modelblaster.pipeline.kb_ingest "$W/winners/winners.json" --cache "$CACHE
     --hints "$HINTS" | tee "$W/ingest.jsonl"
 step "model result: every partition's winners in one whole-model runtime (CUDA graph replay)"
 $PY -m modelblaster.pipeline.kb_model_run "$IR" --kb-runs "$W/run" --cache "$CACHE" --hints "$HINTS" \
-    --arch "$ARCH" --work "$W/model_run" --out "$W/model_result.json" | tee "$W/model_result.line.json"
+    --arch "$ARCH" "${EVAL[@]}" "${GPU[@]}" --kb "$KB" --kb-python "$PY" --work "$W/model_run" \
+    --out "$W/model_result.json" | tee "$W/model_result.line.json"
 step "done: $W"

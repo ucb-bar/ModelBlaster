@@ -607,26 +607,64 @@ The number reported for a model is one whole-model runtime with every partition'
 The steps:
 
 1. The KernelBlaster runs' best slots go into a kernel cache, guarded by each slot's instance
-   shapes, together with an existing cache if given.
+   shapes, together with an existing cache if given. Each entry keeps the GPU its run recorded
+   (`source.gpu`).
 2. `cache_plan` puts every op of the IR, with the accepted hints applied, on the winner that
    covers its shape. One source verified on several windows' shape sets now serves all of
    them as one slot.
 3. The result is exported as one problem, checked against the full reference (outputs and
-   every op isolated) and timed in the persistent host by graph replay, with eager as a
-   diagnostic.
+   every op isolated) and timed by graph replay, with eager as a diagnostic.
 4. The hand-seeded original is timed the same way: in the same requests, paired, when the
-   slots match.
+   slots match. When the composed model is the seed model (no winner applies) it is timed once
+   and `identical_to_seed` is set.
 
-Optional (`--time-partitions`): every partition timed the same way, for the sum.
+Optional (`--time-partitions`): every partition timed the same way, with its best slots paired
+against the hand seeds (`seed_kind: hand`; a fused or split slot the seed model lacks keeps the
+problem's own seed), for the sum.
+
+**Where it is timed.** Steps 3–4 and the partitions run through KernelBlaster's evaluators
+(`pipeline/kb_eval.py` drives the checkout's `scripts/time_problems.py` as a subprocess), so the
+model and its components are timed the same way and on the same hardware:
+
+- `--evaluator local`: this host's GPU pool (`--gpus auto|all|ids`, auto = the idle GPUs) and the
+  per-GPU lock every KernelBlaster run takes.
+- `--evaluator ssh`: build here, run on remote GPUs (`--ssh-host`, repeatable,
+  `--cuda-visible-devices`, `--remote-dir`, `--ssh-key`). Binaries go as rsync deltas, and a
+  problem above 1 GiB gets one `data.bin` copy per host and data sha1, shared by the model and
+  partition problems, removed at the end.
+- `--runtime auto|host|process`: the persistent driver host by default. With one process per
+  run, the seeds are evaluated right after the candidate in the same round (`pairing:
+  interleaved`).
+- `--devices N` (default 1): every timing of the run on one GPU.
+- `--evaluator builtin` is ModelBlaster's own host on the default GPU, with no pool or locks.
+  `auto` (the default) picks ssh with `--ssh-host`, else local when the checkout has
+  `time_problems.py`, else builtin.
+
+**Same hardware.**
+
+- **What the runs record.** Every KernelBlaster result records the GPU it was timed on
+  (`result.json` `gpu`: name, UUID, host, arch; `EvalResult.gpu` per evaluation).
+- **What is required.** The model run requires the GPU model and arch those runs recorded, or
+  `--gpu-model` / `--arch`, which must agree with them. With `--arch` unset it builds for the
+  runs' arch: sm_89 for L40S runs, sm_75 for TITAN RTX.
+- **How it is enforced.** KernelBlaster keeps only the selected GPUs of that model (`gpu_model`).
+  With none, the run fails, naming the models it found. It never times on another model.
+- **Inconsistent inputs are errors too:** runs on several models or archs, or a cache entry
+  from another model.
+- **`--allow-gpu-mismatch`** times anyway, with the warnings in `hardware.warnings` and
+  `match: false`.
+- **Runs that predate the field** cannot be matched: a loud warning and `verified: false`. Pass
+  `--gpu-model` to pin them.
 
 | piece | detail |
 |---|---|
-| output | `modelblaster.model_runtime/v1` |
-| wired into | `kb_loop.sh` (step 5), `kb_graph_opt` final summary (`model_e2e_us`, `seed_e2e_us`, `model_speedup`) |
-| on demand | `python -m modelblaster.pipeline.kb_model_run IR --kb-runs RUN_DIR [--cache DIR] [--hints F] [--time-partitions]` |
+| output | `modelblaster.model_runtime/v1`, plus `device`, `gpu_name` / `gpu_uuid` / `gpu_host`, `hardware` (required model and arch, recorded ones, `match`, warnings), `evaluator`, `kb_time` (pool, host statistics, KernelBlaster's telemetry); per partition `device`, `same_device`, `kb_gpu` |
+| wired into | `kb_loop.sh` (step 5; `GPUS`, `SSH_HOST`, `REMOTE_DIR`, `CVD`, `SSH_KEY`, `RUNTIME`, `GPU_MODEL`), `kb_graph_opt` final summary (`model_e2e_us`, `seed_e2e_us`, `model_speedup`, `model_gpu`, `model_device`, `model_hardware_match`) with its `--gpus` / `--ssh-host` pool |
+| on demand | `python -m modelblaster.pipeline.kb_model_run IR --kb-runs RUN_DIR [--cache DIR] [--hints F] [--time-partitions] [--evaluator ssh --ssh-host H --remote-dir D] [--gpu-model M]` |
+| telemetry | `WORK/telemetry.jsonl`: `mb.model_run` → `mb.model_run.compose`, `mb.model_run.time` → `mb.kb_time` (one per KernelBlaster call); KernelBlaster's own spans in `WORK/kb_time/model.telemetry.jsonl` |
 | whole-graph export | the same path (the problem is the model) |
 
-**ResNet18, 6 windows of at most 12 ops**:
+**ResNet18, 6 windows of at most 12 ops, TITAN** (builtin host):
 
 - Setup: `kb_export --strategy window`, each window given the ResNet18 winner's slots as its
   best. Shared TITAN, 3 requests.
@@ -641,6 +679,50 @@ Optional (`--time-partitions`): every partition timed the same way, for the sum.
 - The windows' sum overstates the model by 20 µs: each window pays its own graph launch and
   ramp-up, which one whole-model replay pays once.
 - On launch-bound models this gap is what a per-partition number hides.
+
+**The same 6 windows on firesim2's L40S, over ssh.**
+
+- Setup: the windows exported seeded with the winner's slots. KernelBlaster run with 0 rollouts
+  on the L40S pool (no LLM calls); each `result.json` recorded an `NVIDIA L40S`, sm_89, on GPU 2
+  or 3.
+- `kb_model_run --evaluator ssh --time-partitions --reps 3`, no `--arch`: it built for sm_89 and
+  required the L40S. Model, seed and all six partitions ran on GPU 2 (`GPU-22350958…`, 21
+  host requests). 72 s end to end, 70 s of it KernelBlaster's timing.
+
+| | KB run (GPU) | µs, graph replay, `kb_model_run` on L40S GPU 2 | hand seeds, paired |
+|---|---|---|---|
+| window conv1…layer1.1.conv1 | 141.3 (GPU 2) | 141.3 | 3208.2 |
+| window layer1.1.bn1…layer2.0.downsample.0 | 100.4 (GPU 2) | 100.4 | 2107.4 |
+| window layer2.0.downsample.1…layer3.0.bn1 | 92.2 (GPU 2) | 93.2 | 2065.4 |
+| window layer3.0.relu…layer3.1.bn2 | 115.7 (GPU 2) | 116.7 | 2503.7 |
+| window add_5…layer4.1.conv1 | 123.9 (GPU 3) | 123.9 | 2764.8 |
+| window layer4.1.bn1…fc | 114.7 (GPU 3) | 114.7 | 1102.8 |
+| sum of the windows | 688.1 | 690.2 | 13 752 |
+| **composed model** (one runtime) | | **683.0** (eager 738.2) | 13 795 (speedup **20.2×**, paired 20.2×) |
+| boundary effect (model − sum) | | −7.2 µs (−1.0 %) | |
+
+- The partitions re-timed by the model run agree with KernelBlaster's own final numbers within
+  1 µs: same model, same runtime.
+- The same composition with `--evaluator local` on this host's TITAN RTX fails before timing:
+  `no NVIDIA L40S GPU among the selected devices (0 (NVIDIA TITAN RTX))`.
+
+**SwinV2, whole graph, 2.27 GB of data, L40S over ssh.**
+
+- Setup: one problem; its driver maps `data.bin` at run time. KernelBlaster ran it with 0
+  rollouts on GPU 3 (151 336 µs).
+- No winner applies, so the composed model is the seed model (`identical_to_seed`).
+- `data.bin` was copied once (23 s) and served both the model and the partition problem.
+- 93 s end to end (20 s compose and export, 72 s timing).
+
+| | µs, graph replay, L40S GPU 2 |
+|---|---|
+| composed model (3 requests: 151 232, 151 194, 151 237) | **151 232.5** (eager 151 397) |
+| the KernelBlaster run's problem, re-timed | 151 257.1 |
+| KernelBlaster's own final (GPU 3) | 151 335.9 |
+
+The hint re-measurement uses the same path with `--ssh-host`. Two ResNet18 window bests,
+leased from the remote pool, re-timed 3 × interleaved on L40S GPU 2 gave 123.9 / 122.9 /
+122.9 µs and 141.3 µs; KernelBlaster's own numbers were 123.9 and 141.3.
 
 ### Tests and gates (persistent runtime)
 

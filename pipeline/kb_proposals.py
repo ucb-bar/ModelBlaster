@@ -37,7 +37,9 @@ op to ``KERNEL_SPECS`` stays a reviewed change.
     python -m modelblaster.pipeline.kb_proposals variant PROPOSALS.json ORIG_PROBLEM_DIR OUT_DIR \\
         [--only HINT_ID] [--seed-from KB_RESULT_DIR]
     python -m modelblaster.pipeline.kb_proposals decide ORIG_RESULT.json VARIANT_RESULT.json \\
-        [--hints graph_hints.json] [--remeasure 5 --arch 75]
+        [--hints graph_hints.json] [--remeasure 5 --arch 75] \\
+        [--evaluator local|ssh --ssh-host H --remote-dir D ...]   # re-time through KernelBlaster's
+                                                                 # evaluator, on the runs' GPU model
 """
 from __future__ import annotations
 
@@ -390,7 +392,8 @@ def apply_accepted(graph: dict, registry: Path = DEFAULT_REGISTRY, specs: dict |
 
 
 def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, lease=None,
-              timeout: int = 1800) -> list[list[float]]:
+              timeout: int = 1800, kbeval=None, gpu_model: str | None = None, info: dict | None = None,
+              work: Path | None = None) -> list[list[float]]:
     """Build each (problem dir, sources) once, then run them round-robin
     ``reps`` times -> partition times per problem. Interleaving keeps a
     shared GPU's load changes from favouring one side.
@@ -398,13 +401,32 @@ def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, le
     ``lease`` (optional) is a context manager yielding the environment for
     the runs (e.g. ``CUDA_VISIBLE_DEVICES`` of one GPU, held exclusively):
     it is entered after the builds, so every run of every problem goes to
-    the same GPU while nothing else times on it."""
+    the same GPU while nothing else times on it.
+
+    ``kbeval`` (a :class:`kb_eval.KBEval`, e.g. pinned to one remote GPU with
+    ``for_device``): the runs go through KernelBlaster's evaluator instead --
+    the same rounds, on one GPU of ``gpu_model`` (the model the two
+    KernelBlaster runs were timed on; none there is an error), local or over
+    ssh. ``info`` (a dict) receives the device and evaluator used."""
     import contextlib
     import os
     import subprocess
 
     from .kb_export import build_and_run, parse_driver_output
 
+    if kbeval is not None:
+        jobs = [{"id": f"p{k}", "problem": str(d), "sources": dict(src), "reps": reps} for k, (d, src) in enumerate(problems)]
+        wd = Path(work) if work is not None else Path(problems[0][0]).parent / "remeasure"
+        res = kbeval.run(jobs, arch=arch, work=wd, gpu_model=gpu_model, name="remeasure")
+        times = []
+        for j in jobs:
+            runs = res["jobs"][j["id"]]["runs"]
+            times.append([r.get("e2e_us") or r.get("partition_graph_us") or r["partition_us"] for r in runs
+                          if r.get("ok") and (r.get("e2e_us") or r.get("partition_us"))])
+        if info is not None:
+            info.update(device=res["jobs"][jobs[0]["id"]].get("gpu"), evaluator=kbeval.describe(),
+                        devices=sorted({lab for j in jobs for lab in res["jobs"][j["id"]].get("gpus") or []}))
+        return times
     exes = []
     for k, (d, src) in enumerate(problems):
         # as deployed: built for and timed as a CUDA graph (eager where not capturable)
@@ -449,7 +471,8 @@ def _per_instance_us(result: dict, manifest: dict) -> dict:
 
 def decide(orig_result: Path, variant_result: Path, variant_json: Path | None = None,
            registry: Path = DEFAULT_REGISTRY, *, remeasure_reps: int = 0, arch: str = "75",
-           accept_gain: float = ACCEPT_GAIN, ir: str | None = None) -> dict:
+           accept_gain: float = ACCEPT_GAIN, ir: str | None = None, kbeval=None,
+           allow_gpu_mismatch: bool = False) -> dict:
     """Accept the hints of a variant if its best beats the original's best by
     ``accept_gain``; record the evidence either way.
 
@@ -471,12 +494,20 @@ def decide(orig_result: Path, variant_result: Path, variant_json: Path | None = 
     ok = bool(o.get("final_ok") and v.get("final_ok") and ou and vu)
     measured = None
     if ok and remeasure_reps:
+        info = {}
+        gpu_model = None
+        if kbeval is not None:                       # on the GPU model the two runs were timed on
+            from .kb_eval import recorded_gpus, required_hardware
+            hw = required_hardware(recorded_gpus([Path(orig_result).parent, Path(variant_result).parent]),
+                                   arch=arch, allow_mismatch=allow_gpu_mismatch)
+            gpu_model = hw["gpu_model"]
         t = remeasure([(Path(o["problem_dir"]), best_sources(Path(orig_result).parent)),
                        (Path(v["problem_dir"]), best_sources(Path(variant_result).parent))],
-                      arch=arch, reps=remeasure_reps)
+                      arch=arch, reps=remeasure_reps, kbeval=kbeval, gpu_model=gpu_model, info=info,
+                      work=Path(variant_result).parent / "remeasure" if kbeval is not None else None)
         if t[0] and t[1]:
             ou, vu = _median(t[0]), _median(t[1])
-            measured = {"original_us": t[0], "variant_us": t[1]}
+            measured = {"original_us": t[0], "variant_us": t[1], **({"device": info["device"]} if info else {})}
         else:
             ok = False
     gain = (ou - vu) / ou if ok else None
@@ -541,6 +572,11 @@ def main():
     d.add_argument("--hints", "--registry", dest="hints", default=str(DEFAULT_REGISTRY))
     d.add_argument("--remeasure", type=int, default=0, help="re-time both bests N times, interleaved")
     d.add_argument("--arch", default="75")
+    d.add_argument("--allow-gpu-mismatch", action="store_true",
+                   help="re-time even where no GPU of the runs' model is available (with warnings)")
+    from . import kb_eval as ke
+    ke.add_args(d, prefix_help="--remeasure runs; default: ModelBlaster's own runs on the default GPU")
+    d.set_defaults(evaluator="builtin")
     a = ap.parse_args()
     if a.cmd == "variant":
         from . import graph_hints as gh
@@ -553,7 +589,8 @@ def main():
     else:
         print(json.dumps(decide(Path(a.orig_result), Path(a.variant_result),
                                 Path(a.variant_json) if a.variant_json else None, Path(a.hints),
-                                remeasure_reps=a.remeasure, arch=a.arch), indent=1))
+                                remeasure_reps=a.remeasure, arch=a.arch, kbeval=ke.from_args(a),
+                                allow_gpu_mismatch=a.allow_gpu_mismatch), indent=1))
 
 
 if __name__ == "__main__":
