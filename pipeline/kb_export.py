@@ -28,7 +28,8 @@ The driver, run with no arguments:
      (attributes a failure to a slot);
   3. times the partition and every op with CUDA events;
 and prints MB_CHECK / MB_SLOT_CHECK / MB_SLOT_US / MB_PARTITION_US lines
-followed by "passed" or "failed".
+followed by "passed" or "failed". With ``MB_MODE=profile`` it instead runs
+every op once (for ncu) and prints MB_PROFILE_DONE.
 
     python -m modelblaster.pipeline.kb_export IR_DIR OUT_DIR [--ops a,b|--range i:j]
         [--build-check --arch 75]
@@ -586,6 +587,17 @@ int main() {
     for (int b = 0; b < NB; ++b)
         if (B_BASE[b] >= 0) dev[b] = (float *)dev[B_BASE[b]] + B_AOFF[b];
     if (mb_num_ops() != NOPS) { printf("MB_ERROR walker has %d ops, driver %d\n", mb_num_ops(), NOPS); printf("failed\n"); return 1; }
+
+    // MB_MODE=profile: every op exactly once on the reference inputs, no checks
+    // or timing reps -- what a profiler (ncu -k regex:mbslot_<slot>::) should see
+    const char *mode = getenv("MB_MODE");
+    if (mode && !strcmp(mode, "profile")) {
+        upload_inputs();
+        for (int i = 0; i < NOPS; ++i) mb_run_op(i, dev);
+        bool ok = ok_cuda("profile");
+        printf(ok ? "MB_PROFILE_DONE\n" : "failed\n");
+        return ok ? 0 : 1;
+    }
 
     // 1. whole partition vs reference
     upload_inputs();
