@@ -23,6 +23,7 @@ slot gets its launcher's dependency closure (the CUDA library mechanism).
 from __future__ import annotations
 
 import argparse
+import re as _re
 from pathlib import Path
 
 from .kb_export import CudaLibrary
@@ -191,27 +192,167 @@ __kernel void k_{op}_final(__global const float *part, int np, __global float *o
 """
 
 
+# ---------------------------------------------------------------- fp16 (binary16 storage, fp32 math)
+#
+# The `_f16` seeds follow the CUDA fp16 contract (docs/fp16_cuda.md): data is
+# stored as IEEE binary16 and every element is widened to fp32 on load; each
+# stored value is rounded once (round-to-nearest-even). In OpenCL that is
+# `__global half *` with vload_half / vstore_half -- core OpenCL 1.2, no
+# cl_khr_fp16 needed. They are generated from the fp32 seeds: data pointers
+# become half (scratch partials stay float), element reads p[e] become
+# vload_half(e, p), stores p[e] = v become vstore_half(v, e, p), compound
+# stores p[e] op= v become vstore_half(vload_half(e, p) op (v), e, p); on the
+# host `float *` becomes `__half *` (cl_half, the CUDA spelling of _Float16)
+# and entries get their _f16 names. Ops whose _f16 spec has a different
+# signature are hand-written in mb_opencl_kernels_f16_hand.cpp.
+
+
+F16_KEEP = {"part"}                 # float scratch (loss / norm partial sums)
+F16_UNSUPPORTED = {"kernel_scatter_dim"}   # scatter-add needs half atomics
+_CL_CHUNK = _re.compile(r'(R"CL\()(.*?)(\)CL")', _re.S)
+_PTR_DECL = _re.compile(r"__global\s+(const\s+)?float\s*\*\s*(\w+)")
+
+
+def _match(text: str, i: int, open_c: str = "[", close_c: str = "]") -> int:
+    """Index just past the bracket that closes text[i] (an opening bracket)."""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] in "([{":
+            depth += 1
+        elif text[j] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    raise ValueError("unbalanced brackets")
+
+
+def _stmt_end(text: str, i: int) -> int:
+    """Index of the `;` (or unmatched `)`/`,` at depth 0) ending the expression starting at i."""
+    depth = 0
+    for j in range(i, len(text)):
+        c = text[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return j
+            depth -= 1
+        elif c in ";," and depth == 0:
+            return j
+    return len(text)
+
+
+def _half_access(code: str, names: set) -> str:
+    if not names:
+        return code
+    pat = _re.compile(r"\b(" + "|".join(sorted(map(_re.escape, names))) + r")\s*\[")
+    out, i = [], 0
+    while True:
+        m = pat.search(code, i)
+        if not m:
+            out.append(code[i:])
+            return "".join(out)
+        name, lb = m.group(1), m.end() - 1
+        rb = _match(code, lb)
+        idx = _half_access(code[lb + 1:rb - 1], names)
+        out.append(code[i:m.start()])
+        rest = code[rb:]
+        am = _re.match(r"\s*([-+*/]?)=(?!=)", rest)
+        if am:
+            rs = rb + am.end()
+            re_ = _stmt_end(code, rs)
+            rhs = _half_access(code[rs:re_], names).strip()
+            if am.group(1):
+                rhs = f"vload_half({idx}, {name}) {am.group(1)} ({rhs})"
+            out.append(f"vstore_half({rhs}, {idx}, {name})")
+            i = re_
+        else:
+            out.append(f"vload_half({idx}, {name})")
+            i = rb
+
+
+def f16_device(cl: str) -> str:
+    names = {m.group(2) for m in _PTR_DECL.finditer(cl)} - F16_KEEP
+    cl = _PTR_DECL.sub(lambda m: m.group(0) if m.group(2) in F16_KEEP else
+                       f"__global {m.group(1) or ''}half *{m.group(2)}", cl)
+    # `__global const float *a = ..., *b = ...`: the later declarators too
+    for m in _re.finditer(r"__global\s+(?:const\s+)?half\s*\*[^;]*;", cl):
+        names |= set(_re.findall(r",\s*\*\s*(\w+)", m.group(0)))
+    return _half_access(cl, names)
+
+
+def f16_host(code: str, renames: dict) -> str:
+    lines = []
+    for line in code.split("\n"):
+        if "MB_SCRATCH" not in line and not _re.search(r"\bpart\b", line):
+            line = _re.sub(r"\bfloat\s*\*", "__half *", line).replace("sizeof(float)", "sizeof(__half)")
+        lines.append(line)
+    code = "\n".join(lines)
+    for a, b in renames.items():
+        code = _re.sub(rf"\b{a}\s*\(", f"{b}(", code)
+    return code
+
+
+def to_f16(src: str, renames: dict) -> str:
+    """fp32 slot source -> its fp16 variant (see above)."""
+    parts, last = [], 0
+    for m in _CL_CHUNK.finditer(src):
+        parts.append(f16_host(src[last:m.start()], renames))
+        parts.append(m.group(1) + f16_device(m.group(2)) + m.group(3))
+        last = m.end()
+    parts.append(f16_host(src[last:], renames))
+    return "".join(parts)
+
+
 TEMPLATED = set(MAP1) | set(MAP2) | set(AXIS) | set(LOSS)
 
 
 class OpenCLSeeds:
     """Seed sources by C entry point: templates first, then the hand library."""
 
-    def __init__(self, hand_path: Path):
+    def __init__(self, hand_path: Path, f16_hand_path: Path | None = None):
         from .reference_kernels import KERNEL_SPECS
         self.lib = CudaLibrary(Path(hand_path).read_text())
+        f16 = Path(f16_hand_path) if f16_hand_path else Path(hand_path).with_name("mb_opencl_kernels_f16_hand.cpp")
+        self.lib16 = CudaLibrary(f16.read_text()) if f16.exists() else None
         self._op_of = {}
         for op, spec in KERNEL_SPECS.items():
             self._op_of.setdefault(parse_signature(spec.signature)[0], (op, spec.signature))
 
+    def _f16_base(self, entry: str):
+        if entry.endswith("_f16") and not (self.lib16 and entry in self.lib16.items):
+            base = entry[:-len("_f16")]
+            return None if base in F16_UNSUPPORTED else base
+        return None
+
     def has(self, entry: str) -> bool:
+        if self.lib16 is not None and entry in self.lib16.items:
+            return True
+        base = self._f16_base(entry)
+        if base is not None:
+            return self.has(base)
+        if entry.endswith("_f16"):
+            return False
         op = self._op_of.get(entry, (None,))[0]
         return op in TEMPLATED or entry in self.lib.items
 
     def origin(self, entry: str) -> str:
+        if self.lib16 is not None and entry in self.lib16.items:
+            return "hand-f16"
+        base = self._f16_base(entry)
+        if base is not None:
+            return self.origin(base) + "-f16"
         return "template" if self._op_of.get(entry, (None,))[0] in TEMPLATED else "hand"
 
     def slot_source(self, entry: str) -> str:
+        if self.lib16 is not None and entry in self.lib16.items:
+            return self.lib16.slot_source(entry)
+        base = self._f16_base(entry)
+        if base is not None:
+            src = self.slot_source(base)
+            renames = {e: e + "_f16" for e in _re.findall(r"\bvoid\s+(kernel_\w+)\s*\(", src)
+                       if e + "_f16" in self._op_of}
+            return to_f16(src, renames)
         op, sig = self._op_of.get(entry, (None, None))
         src = template_source(op, sig) if op in TEMPLATED else None
         return src if src is not None else self.lib.slot_source(entry)
@@ -238,12 +379,12 @@ class OpenCLSeeds:
                 f"void {entry}({plist}) {{\n    {a_entry}({a_args});\n    {b_entry}({b_args});\n}}\n")
 
 
-def all_fp32_entries() -> dict[str, str]:
-    """entry -> op for every fp32 KernelSpec (the target set of the seeds)."""
+def all_entries(dtype: str = "fp32") -> dict[str, str]:
+    """entry -> op for every fp32 (or `_f16`) KernelSpec: the target set of the seeds."""
     from .reference_kernels import KERNEL_SPECS
     out = {}
     for op, spec in KERNEL_SPECS.items():
-        if any(s in op for s in ("_s8", "_f16", "_i8")) or "int8_t" in spec.signature:
+        if any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op.endswith("_f16") != (dtype == "fp16"):
             continue
         out.setdefault(parse_signature(spec.signature)[0], op)
     return out
@@ -252,13 +393,14 @@ def all_fp32_entries() -> dict[str, str]:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out_dir")
+    ap.add_argument("--dtype", default="fp32", choices=["fp32", "fp16"])
     a = ap.parse_args()
     from .kb_export import wrap_slot
     from .kb_export_opencl import HAND_LIB, RUNTIME_H
     seeds, out = OpenCLSeeds(HAND_LIB), Path(a.out_dir)
     (out / "slots").mkdir(parents=True, exist_ok=True)
     parts, missing = [RUNTIME_H.read_text()], []
-    for entry, op in sorted(all_fp32_entries().items()):
+    for entry, op in sorted(all_entries(a.dtype).items()):
         if not seeds.has(entry):
             missing.append(op)
             continue
@@ -271,3 +413,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
