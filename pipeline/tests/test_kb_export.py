@@ -93,6 +93,31 @@ class FusionTest(unittest.TestCase):
             fuse_pair(g3, "s", "r", KERNEL_SPECS)
 
 
+class RegistryTest(unittest.TestCase):
+    def test_accepted_fusions_round_trip(self):
+        from modelblaster.pipeline.kb_proposals import apply_accepted, make_fused_spec, spec_from_kind
+        from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+
+        s = make_fused_spec("sigmoid", "relu", "input", KERNEL_SPECS)
+        self.assertEqual(spec_from_kind(s.op, KERNEL_SPECS).signature, s.signature)
+        g = {"name": "t", "input": {"tensor": "x"}, "output": {"tensor": "z"},
+             "tensors": {k: {"shape": [8]} for k in "xyz"},
+             "ops": [{"name": "s", "op": "sigmoid", "inputs": ["x"], "outputs": ["y"], "shape": {"n": 8}},
+                     {"name": "r", "op": "relu", "inputs": ["y"], "outputs": ["z"], "shape": {"n": 8}}]}
+        with tempfile.TemporaryDirectory() as d:
+            reg = Path(d) / "r.json"
+            reg.write_text(json.dumps({"format": "mb-fusion-registry/1", "fusions": {
+                s.op: {"kind": s.op, "signature": s.signature, "status": "rejected", "evidence": []}}}))
+            self.assertEqual(apply_accepted(g, reg, KERNEL_SPECS)[2], [])
+            r = json.loads(reg.read_text())
+            r["fusions"][s.op]["status"] = "accepted"
+            reg.write_text(json.dumps(r))
+            g2, used, done = apply_accepted(g, reg, KERNEL_SPECS)
+            self.assertEqual(done, ["s+r"])
+            self.assertEqual([o["op"] for o in g2["ops"]], [s.op])
+            self.assertIn(s.op, used)
+
+
 class CacheTest(unittest.TestCase):
     def test_shape_guard(self):
         with tempfile.TemporaryDirectory() as d:
