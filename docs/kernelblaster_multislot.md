@@ -11,7 +11,9 @@ This document covers the Phase 1 CUDA implementation. It is written for review: 
 KernelBlaster's semantic update pass has its own document
 (`third_party/KernelBlaster/docs/semantic_update_pass.md`). Phase 2 -- ModelBlaster as the
 graph optimiser (unified graph hints, cost-ranked selection, fusion chains, split proposals,
-rounds to a fixpoint) -- is in `docs/graph_optimizer.md`.
+rounds to a fixpoint) -- is in `docs/graph_optimizer.md`. The OpenCL / Qualcomm Adreno target
+(`kb_export --target opencl`: OpenCL slots, runtime and driver, Level1-3 coverage, fp16) is in
+[opencl_adreno.md](opencl_adreno.md).
 
 ## Flow
 
