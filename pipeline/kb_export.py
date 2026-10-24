@@ -656,16 +656,20 @@ int main() {
             cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1); total += ms; ++reps;
         }
         printf("MB_PARTITION_US %.3f reps=%d\n", 1000.0 * total / reps, reps);
-        std::vector<double> slot_us(NSLOTS, 0.0);
+        std::vector<double> slot_us(NSLOTS, 0.0), op_us(NOPS, 0.0);
         int oreps = std::max(1, std::min(reps, 20));
         std::vector<cudaEvent_t> ev(2 * NOPS);
         for (auto &e : ev) cudaEventCreate(&e);
         for (int r = 0; r < oreps; ++r) {
             for (int i = 0; i < NOPS; ++i) { cudaEventRecord(ev[2 * i]); mb_run_op(i, dev); cudaEventRecord(ev[2 * i + 1]); }
             cudaEventSynchronize(ev[2 * NOPS - 1]);
-            for (int i = 0; i < NOPS; ++i) { float ms; cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]); slot_us[OP_SLOT[i]] += 1000.0 * ms / oreps; }
+            for (int i = 0; i < NOPS; ++i) {
+                float ms; cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]);
+                slot_us[OP_SLOT[i]] += 1000.0 * ms / oreps; op_us[i] += 1000.0 * ms / oreps;
+            }
         }
         for (int s = 0; s < NSLOTS; ++s) printf("MB_SLOT_US %s %.3f\n", SLOT_NAME[s], slot_us[s]);
+        for (int i = 0; i < NOPS; ++i) printf("MB_OP_US %s %.3f\n", OP_NAME[i], op_us[i]);
         all_ok &= ok_cuda("timing");
     }
     printf(all_ok ? "passed\n" : "failed\n");
@@ -686,6 +690,7 @@ def parse_driver_output(text: str) -> dict:
         res["slots"][m.group(1)] = {"rel_err": float(m.group(2)), "ok": m.group(3) == "1"}
     for m in re.finditer(r"^MB_SLOT_US (\S+) (\S+)", text, re.M):
         res["slot_us"][m.group(1)] = float(m.group(2))
+    res["op_us"] = {m.group(1): float(m.group(2)) for m in re.finditer(r"^MB_OP_US (\S+) (\S+)", text, re.M)}
     m = re.search(r"^MB_PARTITION_US (\S+)", text, re.M)
     if m:
         res["partition_us"] = float(m.group(1))

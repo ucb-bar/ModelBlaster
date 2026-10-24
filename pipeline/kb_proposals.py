@@ -262,30 +262,68 @@ def _load_registry(path: Path) -> dict:
     return {"format": "mb-fusion-registry/1", "fusions": {}}
 
 
+def _per_instance_us(result: dict, manifest: dict) -> dict:
+    """op name -> its final time: measured per op (driver MB_OP_US) when the
+    result has it, else its slot's time / number of instances."""
+    if result.get("op_us"):
+        return dict(result["op_us"])
+    out = {}
+    for sl in manifest["slots"]:
+        us = (result["slots"].get(sl["id"]) or {}).get("final_us")
+        if us is None:
+            continue
+        for inst in sl["instances"]:
+            out[inst["op_name"]] = us / max(len(sl["instances"]), 1)
+    return out
+
+
 def decide(orig_result: Path, variant_result: Path, variant_json: Path | None = None,
            registry: Path = DEFAULT_REGISTRY) -> dict:
-    """Accept the fusions of a variant if its best partition time beats the
-    original's best by ACCEPT_GAIN; record evidence either way."""
+    """Accept a fused kind if, after both partitions were optimised, its fused
+    slot is faster than the two slots it replaced by >= ACCEPT_GAIN of the
+    original partition. Only the touched ops are compared: whole-partition
+    bests also move with unrelated slots (e.g. the variant run happening to
+    find a better GEMM), which would credit or blame the fusion. The
+    partition times are recorded too."""
     o = json.loads(Path(orig_result).read_text())
     v = json.loads(Path(variant_result).read_text())
     vj = Path(variant_json) if variant_json else Path(v["problem_dir"]).parent / "variant.json"
     var = json.loads(vj.read_text())
     ou, vu = o["final_partition_us"], v["final_partition_us"]
     ok = bool(o.get("final_ok") and v.get("final_ok") and ou and vu)
-    gain = (ou - vu) / ou if ok else None
-    status = "accepted" if ok and gain >= ACCEPT_GAIN else "rejected"
+    o_inst = _per_instance_us(o, json.loads((Path(o["problem_dir"]) / "manifest.json").read_text())) if ok else {}
+    v_inst = _per_instance_us(v, json.loads((Path(v["problem_dir"]) / "manifest.json").read_text())) if ok else {}
     reg = _load_registry(Path(registry))
-    kinds = {a["kind"]: a for a in var["applied"]}            # one decision per kind, not per pair
-    for a in kinds.values():
-        e = reg["fusions"].setdefault(a["kind"], {"kind": a["kind"], "signature": a["signature"],
-                                                  "status": "proposed", "evidence": []})
+    per_kind = {}
+    for a in var["applied"]:
+        k = per_kind.setdefault(a["kind"], {"signature": a["signature"], "orig_us": 0.0, "fused_us": 0.0,
+                                            "pairs": 0, "missing": False})
+        x, y = a["pair"]
+        f = f"{x}+{y}"
+        if x in o_inst and y in o_inst and f in v_inst:
+            k["orig_us"] += o_inst[x] + o_inst[y]
+            k["fused_us"] += v_inst[f]
+            k["pairs"] += 1
+        else:
+            k["missing"] = True
+    out = {"original_us": ou, "variant_us": vu, "partition_gain": (ou - vu) / ou if ok else None, "kinds": {}}
+    for kind, k in per_kind.items():
+        gain = (k["orig_us"] - k["fused_us"]) / ou if ok and k["pairs"] and not k["missing"] else None
+        status = "accepted" if gain is not None and gain >= ACCEPT_GAIN else "rejected"
+        e = reg["fusions"].setdefault(kind, {"kind": kind, "signature": k["signature"],
+                                             "status": "proposed", "evidence": []})
         e["evidence"].append({"problem": o["problem"], "original_us": ou, "variant_us": vu, "gain": gain,
-                              "decision": status, "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+                              "touched_original_us": round(k["orig_us"], 3), "fused_us": round(k["fused_us"], 3),
+                              "pairs": k["pairs"], "decision": status,
+                              "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")})
         wins = sum(1 for x in e["evidence"] if x["decision"] == "accepted")
         e["status"] = "accepted" if wins > len(e["evidence"]) - wins else "rejected"
+        out["kinds"][kind] = {"status": status, "gain": gain, "touched_original_us": round(k["orig_us"], 3),
+                              "fused_us": round(k["fused_us"], 3), "pairs": k["pairs"]}
     Path(registry).parent.mkdir(parents=True, exist_ok=True)
     Path(registry).write_text(json.dumps(reg, indent=1))
-    return {"status": status, "gain": gain, "original_us": ou, "variant_us": vu, "kinds": list(kinds)}
+    out["status"] = "accepted" if any(x["status"] == "accepted" for x in out["kinds"].values()) else "rejected"
+    return out
 
 
 def main():
