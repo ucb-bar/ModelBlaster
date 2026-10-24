@@ -33,12 +33,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from typing import Any
 
 import numpy as np
 import torch
 import torch.fx
 from torch.fx.passes.shape_prop import ShapeProp
+
+
+# The fx node extract() is lowering; read by its generic-lowering retry.
+_LOWERING_NODE: list = [None]
+
+
+def _trace(model: torch.nn.Module, sample_inputs) -> torch.fx.GraphModule:
+    """fx-trace `model`, specializing shape-dependent Python to the sample
+    inputs (see pipeline/concrete_trace.py). MB_FX_TRACER=symbolic restores
+    plain torch.fx.symbolic_trace."""
+    if os.environ.get("MB_FX_TRACER") == "symbolic":
+        return torch.fx.symbolic_trace(model)
+    from modelblaster.pipeline.concrete_trace import concrete_trace
+    gm = concrete_trace(model, sample_inputs)
+    if gm.meta.get("value_branches"):
+        print(f"[extract] note: control flow specialized to the sample input "
+              f"at {gm.meta['value_branches']}")
+    return gm
 
 
 def _annotate_dispatches(ops: list[dict]) -> list[int]:
@@ -107,6 +126,36 @@ def _round_half_away(x):
     """
     import numpy as _np
     return _np.sign(x) * _np.floor(_np.abs(x) + 0.5)
+
+
+def _check_traced_shapes(gm, tensors) -> None:
+    """Every IR tensor named after an fx node must have the traced shape.
+
+    The per-op branches compute output shapes by hand; one that is wrong
+    but has the right numel (a dropped keepdim, say) produces correct
+    buffers until a later op reads the shape, then silently wrong output.
+    Some branches squeeze on purpose (LSTM's [1, H] for a traced [1, 1, H]),
+    so this warns; MB_STRICT_SHAPES=1 makes it an error.
+    """
+    strict = os.environ.get("MB_STRICT_SHAPES") == "1"
+    for node in gm.graph.nodes:
+        meta = node.meta.get("tensor_meta")
+        t = tensors.get(node.name)
+        if t is None or not hasattr(meta, "shape"):
+            continue
+        want = [int(d) for d in meta.shape]
+        if list(t["shape"]) != want and int(np.prod(t["shape"])) == int(np.prod(want)):
+            msg = f"IR tensor {node.name} has shape {list(t['shape'])}, traced {want}"
+            if strict:
+                raise RuntimeError(msg)
+            print(f"[extract_graph] warning: {msg}", file=sys.stderr)
+
+
+def _keepdim_arg(node) -> bool:
+    """keepdim of a torch.max/min(x, dim, keepdim) call (positional or kw)."""
+    if "keepdim" in (node.kwargs or {}):
+        return bool(node.kwargs["keepdim"])
+    return len(node.args) > 2 and bool(node.args[2])
 
 
 def _find_getitem_consumer(node, index: int):
@@ -663,7 +712,7 @@ def _tensor_meta(node: torch.fx.Node) -> dict[str, Any]:
         raise RuntimeError(f"missing tensor_meta on node {node.name}; ShapeProp failed")
     shape = list(tm.shape)
     dtype = {torch.float32: "f32", torch.float16: "f16", torch.int8: "i8",
-             torch.int32: "i32", torch.int64: "i64"}.get(tm.dtype)
+             torch.int32: "i32", torch.int64: "i64", torch.bool: "b8"}.get(tm.dtype)
     if dtype is None:
         raise RuntimeError(f"unsupported dtype {tm.dtype} on {node.name}")
     return {"shape": shape, "dtype": dtype, "quant": None}
@@ -1025,7 +1074,7 @@ def extract_int8(
     else:
         sample_inputs = [sample_input]
 
-    gm = torch.fx.symbolic_trace(model)
+    gm = _trace(model, sample_inputs)
     ShapeProp(gm).propagate(*sample_inputs)
 
     # Capture every node's tensor for activation calibration.
@@ -2991,6 +3040,38 @@ def extract_int8(
 # fp32 extractor (unchanged path)
 # ---------------------------------------------------------------------------
 
+class _SortedTopk(torch.overrides.TorchFunctionMode):
+    """topk(sorted=False) returns its k results in an unspecified order; the
+    IR's topk sorts them, so compute the golden with the same (legal) order."""
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = dict(kwargs or {})
+        if func in (torch.topk, torch.Tensor.topk):
+            if len(args) > 4:
+                args = tuple(args[:4]) + (True,) + tuple(args[5:])
+            else:
+                kwargs["sorted"] = True
+        return func(*args, **kwargs)
+
+
+def _lowering_signature(node: "torch.fx.Node"):
+    """What extract()'s specific branches look at: op, target, each argument's
+    kind and shape (or literal value), and the output shape."""
+    def arg(a):
+        if isinstance(a, torch.fx.Node):
+            tm = a.meta.get("tensor_meta")
+            return (a.op, tuple(tm.shape) if hasattr(tm, "shape") else None)
+        if isinstance(a, (tuple, list)):
+            return tuple(arg(x) for x in a)
+        if isinstance(a, dict):
+            return tuple(sorted((k, arg(v)) for k, v in a.items()))
+        if isinstance(a, slice):
+            return ("slice", arg(a.start), arg(a.stop), arg(a.step))
+        return repr(a)
+    tm = node.meta.get("tensor_meta")
+    return (node.op, node.target, arg(node.args), arg(node.kwargs),
+            tuple(tm.shape) if hasattr(tm, "shape") else None)
+
+
 def extract(
     model: torch.nn.Module,
     sample_input: "torch.Tensor | list[torch.Tensor]",
@@ -3001,6 +3082,8 @@ def extract(
     input_dtypes: "list[str] | None" = None,
     fp16_op_names: "set[str] | None" = None,
     per_channel: bool = False,
+    _generic: "set[str] | None" = None,
+    _gm: "torch.fx.GraphModule | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -3039,8 +3122,45 @@ def extract(
     else:
         sample_inputs = list(sample_input)
 
-    gm = torch.fx.symbolic_trace(model)
-    ShapeProp(gm).propagate(*sample_inputs)
+    if _gm is not None:
+        gm = _gm
+    else:
+        gm = _trace(model, sample_inputs)
+        ShapeProp(gm).propagate(*sample_inputs)
+        _maybe_fuse_compound_activation(gm)
+        _maybe_fuse_loss(gm)
+
+    if _generic is None:
+        # Lower every node with its specific branch below; a node that branch
+        # rejects is retried through generic_lowering (shape-generic ops)
+        # when that can express it. Graphs that extracted before are
+        # unchanged. Each retry re-runs the lowering loop on the same traced
+        # graph, so only nodes that actually fail pay for it.
+        from modelblaster.pipeline.generic_lowering import GenericLowering
+        probe = GenericLowering(gm, {}, [], {}, weight_dtype, set())
+        generic = {n.name for n in gm.graph.nodes if probe.obviously_generic(n)}
+        while True:
+            _LOWERING_NODE[0] = None
+            try:
+                return extract(model, sample_input, name, out_dir, quant=quant,
+                               calibration_samples=calibration_samples,
+                               input_dtypes=input_dtypes,
+                               fp16_op_names=fp16_op_names,
+                               per_channel=per_channel, _generic=generic, _gm=gm)
+            except (NotImplementedError, AttributeError, TypeError, KeyError,
+                    IndexError, ValueError):
+                node = _LOWERING_NODE[0]
+                if node is None or node.name in generic or not probe.can_lower(node):
+                    raise
+                # the specific branches decide from op, target, shapes and
+                # argument kinds, so a node's structural twins (one per step
+                # of an unrolled loop) would be rejected the same way: route
+                # them together rather than paying one re-lowering each
+                sig = _lowering_signature(node)
+                generic.update(n.name for n in gm.graph.nodes
+                               if n.name not in generic and _lowering_signature(n) == sig
+                               and probe.can_lower(n))
+                generic.add(node.name)
 
     # KernelBench Phase 2 has a few compound activations that don't
     # appear as a single FX node — they're hand-rolled with primitive
@@ -3050,9 +3170,7 @@ def extract(
     # rewrites the FX graph in place by replacing the multi-node
     # subgraph with a single call to a stub `_agents_compound_<name>`
     # marker function. The per-node iteration below then sees that
-    # marker and emits a clean single-op IR.
-    _maybe_fuse_compound_activation(gm)
-    _maybe_fuse_loss(gm)
+    # marker and emits a clean single-op IR. (Applied right after tracing.)
 
     tensors: dict[str, dict] = {}
     ops: list[dict] = []
@@ -3095,8 +3213,15 @@ def extract(
                       and getattr(_arg.target, "__name__", "") == "diag"):
                     _skip_nodes.add(_arg)
 
+    from modelblaster.pipeline.generic_lowering import GenericLowering
+    _gl = GenericLowering(gm, tensors, ops, weights, weight_dtype, _skip_nodes)
+
     for node in gm.graph.nodes:
         if node in _skip_nodes:
+            continue
+        _LOWERING_NODE[0] = node
+        if node.name in _generic:
+            _gl.lower(node)
             continue
         if node.op == "placeholder":
             input_names.append(node.name)
@@ -3427,6 +3552,12 @@ def extract(
                 SH, SW = _pair(mod.stride)
                 PH, PW = _pair(mod.padding)
                 DH, DW = _pair(mod.dilation)
+                if (OH != (IH + 2 * PH - DH * (KH - 1) - 1) // SH + 1 or
+                        OW != (IW + 2 * PW - DW * (KW - 1) - 1) // SW + 1):
+                    # ceil_mode=True: kernel_maxpool2d derives OH/OW with
+                    # floor and would mis-index; maxpool2d_ex takes them.
+                    raise NotImplementedError(
+                        f"MaxPool2d ceil_mode at {node.name}")
                 ops.append({
                     "name": str(node.target),
                     "op": "maxpool2d",
@@ -3789,6 +3920,12 @@ def extract(
                 # run_model calls, BSS-zeroed => correct step-0 init).
                 if mod.bidirectional:
                     raise NotImplementedError("fp32 LSTM: bidirectional unsupported")
+                if (len(node.args) > 1 or node.kwargs or
+                        int(np.prod(tensors[in_name]["shape"][:-1])) > 1):
+                    # This branch is the streaming (seq-len-1, batch-1,
+                    # persistent-state) cell; whole sequences / explicit
+                    # (h0, c0) go to generic_lowering's lstm_seq.
+                    raise NotImplementedError(f"sequence LSTM at {node.name}")
                 L = int(mod.num_layers)
                 H = int(mod.hidden_size)
                 in_size0 = int(tensors[in_name]["shape"][-1])
@@ -4228,7 +4365,10 @@ def extract(
             elif tname == "sum" or target is torch.sum:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -4240,7 +4380,10 @@ def extract(
             elif tname == "mean" or target is torch.mean:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -4252,7 +4395,10 @@ def extract(
             elif tname == "prod" or target is torch.prod:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -4264,7 +4410,10 @@ def extract(
             elif tname == "argmax" or target is torch.argmax:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -4276,7 +4425,10 @@ def extract(
             elif tname == "argmin" or target is torch.argmin:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -4297,7 +4449,10 @@ def extract(
                     and (len(node.args) > 1 or "dim" in (node.kwargs or {})):
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -4313,7 +4468,10 @@ def extract(
                 _skip_nodes.add(gi)
                 # Compute output shape: drop the reduced dim from input.
                 out_shape = list(in_shape)
-                del out_shape[dim]
+                if _keepdim_arg(node):
+                    out_shape[dim] = 1
+                else:
+                    del out_shape[dim]
                 tensors[values_name] = {"shape": out_shape, "dtype": "f32",
                                         "quant": None}
                 ops.append({
@@ -4325,7 +4483,10 @@ def extract(
                     and (len(node.args) > 1 or "dim" in (node.kwargs or {})):
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -4337,7 +4498,10 @@ def extract(
                 values_name = gi.name
                 _skip_nodes.add(gi)
                 out_shape = list(in_shape)
-                del out_shape[dim]
+                if _keepdim_arg(node):
+                    out_shape[dim] = 1
+                else:
+                    del out_shape[dim]
                 tensors[values_name] = {"shape": out_shape, "dtype": "f32",
                                         "quant": None}
                 ops.append({
@@ -4509,6 +4673,12 @@ def extract(
                     b_node = arg_b_node.args[0] if trans_b else arg_b_node
                     a_shape = list(tensors[a_node.name]["shape"])
                     b_shape = list(tensors[b_node.name]["shape"])
+                    if len(b_shape) != 2 or (trans_a and len(a_shape) != 2):
+                        # Batched B ([..., K, N]) is a bmm with broadcasting —
+                        # flattening only A's leading dims would be wrong.
+                        raise NotImplementedError(
+                            f"matmul at {node.name}: batched operands "
+                            f"{a_shape} @ {b_shape}")
                     # N-D @ 2D: flatten A's leading dims into M (contiguous
                     # row-major, so the matmul kernel sees a plain [M,K]). This
                     # covers torch.matmul(A_3d/4d, B_2d) (KernelBench 10) and the
@@ -4538,6 +4708,10 @@ def extract(
                 b_name = node.args[1].name
                 a_shape = list(tensors[a_name]["shape"])
                 b_shape = list(tensors[b_name]["shape"])
+                if (len(a_shape) != 3 or len(b_shape) != 3
+                        or a_shape[0] != b_shape[0]):
+                    raise NotImplementedError(
+                        f"bmm at {node.name}: {a_shape} @ {b_shape}")
                 ops.append({
                     "name": node.name, "op": "bmm",
                     "inputs": [a_name, b_name],
@@ -4756,8 +4930,37 @@ def extract(
         else:
             raise NotImplementedError(f"unhandled fx op {node.op} at {node.name}")
 
+    _LOWERING_NODE[0] = None
     if not input_names or not output_names:
         raise RuntimeError("graph missing input/output")
+    # The fp32 pipeline carries integer / bool tensors (indices, masks) as
+    # exact float values: io.npz packs every input as float32 and the kernels
+    # read them through float pointers (also via views). The exception is
+    # what argmax/argmin write: an int64_t buffer.
+    ints = {t for o in ops if o["op"] in ("argmax_dim", "argmin_dim")
+            for t in o["inputs"] + o["outputs"]}
+    grew = True
+    while grew:   # a view shares its base's buffer
+        grew = False
+        for o in ops:
+            io_ = set(o["inputs"] + o["outputs"])
+            if o["op"] == "view" and io_ & ints and not io_ <= ints:
+                ints |= io_
+                grew = True
+    for tname_, tmeta in tensors.items():
+        if tmeta.get("dtype") in ("i64", "i32", "b8") and tname_ not in ints:
+            tmeta["dtype"] = "f32"
+    _check_traced_shapes(gm, tensors)
+    from modelblaster.pipeline.generic_lowering import materialize_output_views
+    materialize_output_views(ops, tensors, input_names, output_names)
+    # constants nothing reads (a value snapshotted before an in-place write
+    # that DCE then dropped) would still be baked into weights
+    used = {t for o in ops for t in o["inputs"] + o["outputs"]} | set(input_names) | set(output_names)
+    refs = {v for o in ops for v in o.values() if isinstance(v, str)}
+    for t in [t for t, m in tensors.items() if m.get("const") and t not in used]:
+        key = tensors.pop(t)["const"]
+        if key not in refs:
+            weights.pop(key, None)
 
     # In fp16 mode, suffix every op name (and update tensor dtypes) so
     # downstream stages pick the half-precision kernel variants without
@@ -4829,7 +5032,10 @@ def extract(
             ref_inputs_exec = list(sample_inputs)
             ref_model = model
             torch_dtype = torch.float32
-            out = ref_model(*ref_inputs_exec)
+            # same draws as the trace for tensors sampled inside forward
+            torch.manual_seed(0)
+            with _SortedTopk():
+                out = ref_model(*ref_inputs_exec)
 
     # Multi-output models return a tuple; flatten in IR-output order so the
     # downstream comparator just needs to do an elementwise compare.
@@ -4971,6 +5177,7 @@ def _shrink_for_flops(mod, target_flops: int,
     instead of pinning a tiny-io / huge-FLOP shape. Falls back to a byte cap if
     FLOPs can't be counted; reverts any shrink that makes the forward invalid."""
     order = ["batch", "spatial", "channel"]
+    frozen: set = set()   # dims whose halving broke the forward
     for _ in range(400):
         try:
             fl = _kb_flops(mod)
@@ -4982,7 +5189,8 @@ def _shrink_for_flops(mod, target_flops: int,
         if fl <= target_flops and (target_bytes is None or fp <= target_bytes):
             return
         ints = {k: v for k, v in vars(mod).items()
-                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+                if isinstance(v, int) and v > 1 and not k.startswith("_")
+                and k not in frozen}
         cand = None
         for grp in order:
             pool = {k: v for k, v in ints.items()
@@ -4998,8 +5206,9 @@ def _shrink_for_flops(mod, target_flops: int,
         try:
             _kb_footprint_bytes(mod)   # validate the new dims forward-pass
         except Exception:
+            # e.g. num_channels tied to embed_dim: keep it, try the next dim
             setattr(mod, cand, oldv)
-            return
+            frozen.add(cand)
 
 
 def _shrink_for_utilization(mod, target_bytes: int) -> None:
@@ -5008,6 +5217,7 @@ def _shrink_for_utilization(mod, target_bytes: int) -> None:
     still exercises the vector/GEMM units). Reverts any shrink that makes the
     forward invalid."""
     order = ["batch", "spatial", "channel"]
+    frozen: set = set()   # dims whose halving broke the forward
     for _ in range(200):
         try:
             fp = _kb_footprint_bytes(mod)
@@ -5016,7 +5226,8 @@ def _shrink_for_utilization(mod, target_bytes: int) -> None:
         if fp <= target_bytes:
             return
         ints = {k: v for k, v in vars(mod).items()
-                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+                if isinstance(v, int) and v > 1 and not k.startswith("_")
+                and k not in frozen}
         cand = None
         for grp in order:
             pool = {k: v for k, v in ints.items()
@@ -5032,14 +5243,57 @@ def _shrink_for_utilization(mod, target_bytes: int) -> None:
         try:
             _kb_footprint_bytes(mod)   # validate the new dims forward-pass
         except Exception:
+            # e.g. num_channels tied to embed_dim: keep it, try the next dim
             setattr(mod, cand, oldv)
+            frozen.add(cand)
+
+
+def _kb_param_bytes(mod) -> int:
+    """fp32 bytes of the Model's parameters + buffers at the current dims."""
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    return 4 * sum(t.numel() for t in list(m.parameters()) + list(m.buffers()))
+
+
+def _shrink_for_weights(mod, target_bytes: int) -> None:
+    """Halve the largest non-structural dim — including list-valued globals
+    such as `layer_sizes = [16384, 16384]`, which the io-based policies never
+    touch — until parameters fit `target_bytes` (level3 MLPs / VanillaRNN ship
+    2-8 GB of weights). Reverts a shrink that breaks the forward."""
+    def is_int(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+    for _ in range(200):
+        try:
+            if _kb_param_bytes(mod) <= target_bytes:
+                return
+        except Exception:
+            return
+        cands = {}
+        for k, v in vars(mod).items():
+            if k.startswith("_") or _kb_attr_group(k) is None:
+                continue
+            if is_int(v) and v > 1:
+                cands[k] = v
+            elif isinstance(v, list) and v and all(is_int(x) for x in v) and max(v) > 1:
+                cands[k] = max(v)
+        if not cands:
+            return
+        k = max(cands, key=cands.get)
+        old = vars(mod)[k]
+        new = [max(1, x // 2) for x in old] if isinstance(old, list) else max(1, old // 2)
+        setattr(mod, k, new)
+        try:
+            _kb_footprint_bytes(mod)
+        except Exception:
+            setattr(mod, k, old)
             return
 
 
 def _load_kernelbench(bench_path: str,
                       max_elements: "int | None" = None,
                       target_bytes: "int | None" = None,
-                      target_flops: "int | None" = None
+                      target_flops: "int | None" = None,
+                      target_weight_bytes: "int | None" = None,
                       ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
     """Load a KernelBench level1 file (single-input variant only).
 
@@ -5127,46 +5381,51 @@ def _load_kernelbench(bench_path: str,
             # Default policy: cap the baked-io footprint while protecting the
             # channel/feature dims that drive vector/GEMM utilization.
             _shrink_for_utilization(mod, target_bytes)
+        if target_weight_bytes:
+            _shrink_for_weights(mod, target_weight_bytes)
 
         init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
         model = mod.Model(*init_args)
         model.eval()
         inputs = mod.get_inputs()
+        if isinstance(inputs, tuple):
+            inputs = list(inputs)
         if not isinstance(inputs, list) or not inputs:
             raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
-    # Bool masks (e.g. masked_cumsum) become float in the model anyway
-    # (x * bool == x * float); cast them so the fp32 pipeline can carry them.
-    # Integer class-index targets (cross_entropy) are left alone.
-    inputs = [t.float() if (torch.is_tensor(t) and t.dtype == torch.bool) else t
-              for t in inputs]
+    # Bool masks stay bool for the trace and the golden (`~mask`, `x[mask]`
+    # need real bools); like integer index inputs they are packed into io.npz
+    # as exact float32 values and carried as f32 in the IR.
 
     # Bind non-tensor (scalar) forward args as constants so only tensors are
-    # graph inputs (KernelBench 5: `A * s` with s a Python float). The trace
-    # then sees `A * <const>`, extracted as a mul_scalar op. Only a single
-    # tensor input is supported here (fx can't trace a *args wrapper).
+    # graph inputs (KernelBench 5: `A * s` with s a Python float; SOL-ExecBench
+    # passes eps / flags / None next to several tensors). The trace then sees
+    # `A * <const>`, extracted as a mul_scalar op. fx can't trace a *args
+    # wrapper, so the wrapper's forward gets one named parameter per tensor.
     if any(not torch.is_tensor(t) for t in inputs):
         _tensor_pos = [i for i, t in enumerate(inputs) if torch.is_tensor(t)]
-        if len(_tensor_pos) != 1:
-            raise NotImplementedError(
-                f"{bench_path}: scalar forward args are only supported with a "
-                f"single tensor input (got {len(_tensor_pos)})")
-        _pos0 = _tensor_pos[0]
-        _full = list(inputs)  # concrete scalars + placeholder slot for the tensor
+        if not _tensor_pos:
+            raise NotImplementedError(f"{bench_path}: forward takes no tensor inputs")
+        _full = list(inputs)  # concrete scalars + placeholder slots for the tensors
         _orig = model
+        # one tensor input is `x`, as the single-input path names it
+        _params = ["x"] if len(_tensor_pos) == 1 else [f"x{i}" for i in range(len(_tensor_pos))]
+        _ns: dict = {}
+        exec(f"def forward(self, {', '.join(_params)}):\n"
+             f"    args = list(self._full)\n"
+             + "".join(f"    args[{p}] = {nm}\n" for p, nm in zip(_tensor_pos, _params))
+             + "    return self.m(*args)\n", _ns)
 
         class _ScalarBind(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.m = _orig
+                self._full = _full
 
-            def forward(self, x):
-                args = list(_full)
-                args[_pos0] = x
-                return self.m(*args)
+            forward = _ns["forward"]
 
         model = _ScalarBind()
         model.eval()
-        inputs = [inputs[_pos0]]
+        inputs = [inputs[i] for i in _tensor_pos]
 
     base = os.path.splitext(os.path.basename(bench_path))[0]
     name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
@@ -5196,6 +5455,10 @@ def main() -> None:
                          "to this many MiB, shrinking batch->spatial and "
                          "protecting channel/feature dims for good HW "
                          "utilization (default 256). 0 = stock dims.")
+    ap.add_argument("--bench-target-weights-mb", type=int, default=0,
+                    help="if >0, also cap the bench's parameter bytes to this "
+                         "many MiB (shrinks the largest dims, including "
+                         "list-valued ones). 0 = off.")
     ap.add_argument("--bench-max-elements", type=int, default=0,
                     help="LEGACY override: if >0, cap total input ELEMENTS by "
                          "halving the largest int attr (the old tiny-toy policy). "
@@ -5253,7 +5516,8 @@ def main() -> None:
             args.bench_file,
             max_elements=(args.bench_max_elements or None),
             target_bytes=_tgt,
-            target_flops=_tflops)
+            target_flops=_tflops,
+            target_weight_bytes=(args.bench_target_weights_mb * 2**20 or None))
     else:
         if args.model == "mlp_generic":
             from modelblaster.models import mlp_generic as model_mod

@@ -1,3 +1,4 @@
 [submodule "third_party/KernelBlaster"]
 	path = third_party/KernelBlaster
-	url = https://github.com/ucb-bar/KernelBlaster.git
+	url = git@github.com:kris-dong/KernelBlaster.git
+	branch = backend-refactor
