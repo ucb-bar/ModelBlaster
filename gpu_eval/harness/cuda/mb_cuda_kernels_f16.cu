@@ -919,6 +919,208 @@ extern "C" void kernel_strided_scatter_f16(const __half *input, const __half *sr
     k_strided_scatter<<<MB_GRID(m), MB_THREADS>>>(src, output, m, off, d1, d2, d3, d4, d5, s0, s1, s2, s3, s4, s5);
 }
 
+// ---------------------------------------------------------------- Level1: elementwise / index ops
+__global__ void k_swish(const __half *x, __half *y, long n) { long i = MB_TID; if (i < n) { float v = mb_ld(x[i]); y[i] = v / (1.0f + expf(-v)); } }
+__global__ void k_selu(const __half *x, __half *y, long n) {
+    long i = MB_TID; if (i >= n) return;
+    float v = mb_ld(x[i]);
+    y[i] = 1.0507009873554805f * (v > 0.0f ? v : 1.6732632423543772f * (expf(v) - 1.0f));
+}
+__global__ void k_hardsigmoid(const __half *x, __half *y, long n) { long i = MB_TID; if (i < n) y[i] = fminf(fmaxf(mb_ld(x[i]) / 6.0f + 0.5f, 0.0f), 1.0f); }
+__global__ void k_softsign(const __half *x, __half *y, long n) { long i = MB_TID; if (i < n) { float v = mb_ld(x[i]); y[i] = v / (1.0f + fabsf(v)); } }
+__global__ void k_log(const __half *x, __half *y, long n) { long i = MB_TID; if (i < n) y[i] = logf(mb_ld(x[i])); }
+__global__ void k_tri(const __half *x, __half *y, int M, int N, int d, int upper) {
+    long i = MB_TID; if (i >= (long)M * N) return;
+    long r = i / N, c = i % N;
+    y[i] = (upper ? c >= r + d : c <= r + d) ? mb_ld(x[i]) : 0.0f;
+}
+__global__ void k_diag_matmul(const __half *a, const __half *b, __half *y, int N, int M) {
+    long i = MB_TID; if (i < (long)N * M) y[i] = mb_ld(a[i / M]) * mb_ld(b[i]);
+}
+__global__ void k_flip(const __half *x, __half *y, long n, int A, int inner) {
+    long i = MB_TID; if (i >= n) return;
+    long j = i % inner, a = (i / inner) % A, o = i / ((long)inner * A);
+    y[i] = mb_ld(x[(o * A + (A - 1 - a)) * inner + j]);
+}
+
+extern "C" void kernel_swish_f16(const __half *input, __half *output, int n) { k_swish<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_selu_f16(const __half *input, __half *output, int n) { k_selu<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_hardsigmoid_f16(const __half *input, __half *output, int n) { k_hardsigmoid<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_softsign_f16(const __half *input, __half *output, int n) { k_softsign<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_log_f16(const __half *input, __half *output, int n) { k_log<<<MB_GRID(n), MB_THREADS>>>(input, output, n); }
+extern "C" void kernel_triu_f16(const __half *input, __half *output, int M, int N, int diagonal) {
+    k_tri<<<MB_GRID((long)M * N), MB_THREADS>>>(input, output, M, N, diagonal, 1);
+}
+extern "C" void kernel_tril_f16(const __half *input, __half *output, int M, int N, int diagonal) {
+    k_tri<<<MB_GRID((long)M * N), MB_THREADS>>>(input, output, M, N, diagonal, 0);
+}
+extern "C" void kernel_diag_matmul_f16(const __half *a, const __half *b, __half *output, int N, int M) {
+    k_diag_matmul<<<MB_GRID((long)N * M), MB_THREADS>>>(a, b, output, N, M);
+}
+// A stored [K, M], B stored [N, K]
+extern "C" void kernel_matmul_tatb_f16(const __half *A, const __half *B, __half *C, int M, int K, int N) {
+    k_matmul_s<<<MB_GRID((long)M * N), MB_THREADS>>>(A, B, C, M, K, N, 1, M, 1, K);
+}
+extern "C" void kernel_log_softmax_f16(const __half *input, __half *output, int M, int K) {
+    kernel_softmax_dim_f16(input, output, M, K, 1, 1);
+}
+extern "C" void kernel_flip_f16(const __half *input, __half *output, int outer, int axis, int inner) {
+    long n = (long)outer * axis * inner;
+    k_flip<<<MB_GRID(n), MB_THREADS>>>(input, output, n, axis, inner);
+}
+
+// ---------------------------------------------------------------- Level1: per-(outer, inner) reductions
+// one thread per (o, i) column of [outer, reduce, inner]; double accumulators
+__global__ void k_col_norm(const __half *x, __half *y, int outer, int R, int inner, int kind, float eps) {
+    long i = MB_TID; if (i >= (long)outer * inner) return;
+    long o = i / inner, j = i % inner;
+    const __half *xp = x + o * (long)R * inner + j; __half *yp = y + o * (long)R * inner + j;
+    double a = 0.0;
+    for (long r = 0; r < R; r++) { double v = mb_ld(xp[r * inner]); a += kind == 1 ? fabs(v) : v * v; }
+    double d = kind == 0 ? sqrt(a / R + eps) : kind == 1 ? a / R : sqrt(a);   // rms, mean|x|, l2
+    for (long r = 0; r < R; r++) yp[r * inner] = mb_ld(xp[r * inner]) / d;
+}
+__global__ void k_arg_dim(const __half *x, int64_t *y, int outer, int R, int inner, int is_max) {
+    long i = MB_TID; if (i >= (long)outer * inner) return;
+    long o = i / inner, j = i % inner;
+    const __half *xp = x + o * (long)R * inner + j;
+    long best = 0; float bv = mb_ld(xp[0]);
+    for (long r = 1; r < R; r++) { float v = mb_ld(xp[r * inner]); if (is_max ? v > bv : v < bv) { bv = v; best = r; } }
+    y[i] = best;                                   // ties: first index, as torch
+}
+// one thread per kept row: out[b] = [0, x0, x0+x1, ...]
+__global__ void k_excl_cumsum(const __half *x, __half *y, int Bout, int N) {
+    long b = MB_TID; if (b >= Bout) return;
+    const __half *xr = x + b * (long)N; __half *yr = y + b * (long)(N + 1);
+    double a = 0.0; yr[0] = 0.0f;
+    for (long k = 0; k < N; k++) { a += mb_ld(xr[k]); yr[k + 1] = (float)a; }
+}
+
+extern "C" void kernel_rms_norm_f16(const __half *input, __half *output, int outer, int reduce, int inner, float eps) {
+    k_col_norm<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 0, eps);
+}
+extern "C" void kernel_mean_abs_norm_f16(const __half *input, __half *output, int outer, int reduce, int inner) {
+    k_col_norm<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 1, 0.0f);
+}
+extern "C" void kernel_l2_norm_f16(const __half *input, __half *output, int outer, int reduce, int inner) {
+    k_col_norm<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 2, 0.0f);
+}
+extern "C" void kernel_argmax_dim_f16(const __half *input, int64_t *output, int outer, int reduce, int inner) {
+    k_arg_dim<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 1);
+}
+extern "C" void kernel_argmin_dim_f16(const __half *input, int64_t *output, int outer, int reduce, int inner) {
+    k_arg_dim<<<MB_GRID((long)outer * inner), MB_THREADS>>>(input, output, outer, reduce, inner, 0);
+}
+extern "C" void kernel_exclusive_cumsum_f16(const __half *x, __half *output, int Bout, int N) {
+    k_excl_cumsum<<<MB_GRID(Bout), MB_THREADS>>>(x, output, Bout, N);
+}
+
+// ---------------------------------------------------------------- Level1: whole-tensor reductions (losses, norms)
+// two stages: block partial sums (double) into a cached device scratch, then one
+// block sums the partials and writes the scaled scalar
+#define MB_RBLOCKS 1024
+__device__ double mb_block_sum_d(double v, double *shd) {
+    shd[threadIdx.x] = v; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) shd[threadIdx.x] += shd[threadIdx.x + s];
+        __syncthreads();
+    }
+    double r = shd[0]; __syncthreads();
+    return r;
+}
+static double *mb_partials(long n) {
+    static double *p = nullptr; static long cap = 0;
+    if (n > cap) { if (p) cudaFree(p); cudaMalloc(&p, n * sizeof(double)); cap = n; }
+    return p;
+}
+static int mb_rblocks(long n) { long b = (n + MB_THREADS - 1) / MB_THREADS; return (int)(b < 1 ? 1 : (b > MB_RBLOCKS ? MB_RBLOCKS : b)); }
+__global__ void k_sum_partials(const double *part, int nb, double *dst, __half *out, double scale) {
+    __shared__ double shd[MB_THREADS];
+    double v = 0.0;
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) v += part[i];
+    v = mb_block_sum_d(v, shd);
+    if (threadIdx.x == 0) { if (dst) dst[0] = v; if (out) out[0] = (float)(v * scale); }
+}
+// kind: 0 hinge(a=pred, b=targ, m=targ_len), 1 mse, 2 huber(p=beta), 3 kldiv, 4 sum of squares(a)
+__global__ void k_loss_partial(const __half *a, const __half *b, long n, long m, float p, int kind, double *part) {
+    __shared__ double shd[MB_THREADS];
+    double acc = 0.0;
+    for (long i = MB_TID; i < n; i += (long)gridDim.x * blockDim.x) {
+        double x = mb_ld(a[i]), t;
+        if (kind == 0) { t = 1.0 - x * (double)mb_ld(b[i % m]); t = t > 0.0 ? t : 0.0; }
+        else if (kind == 1) { double d = x - (double)mb_ld(b[i]); t = d * d; }
+        else if (kind == 2) { double d = fabs(x - (double)mb_ld(b[i])); t = d < p ? 0.5 * d * d / p : d - 0.5 * p; }
+        else if (kind == 3) { double g = mb_ld(b[i]); t = g > 0.0 ? g * (log(g) - x) : 0.0; }
+        else t = x * x;
+        acc += t;
+    }
+    acc = mb_block_sum_d(acc, shd);
+    if (threadIdx.x == 0) part[blockIdx.x] = acc;
+}
+static void mb_loss(const __half *a, const __half *b, long n, long m, float p, int kind, __half *out, double scale) {
+    int nb = mb_rblocks(n); double *part = mb_partials(nb);
+    k_loss_partial<<<nb, MB_THREADS>>>(a, b, n, m, p, kind, part);
+    k_sum_partials<<<1, MB_THREADS>>>(part, nb, nullptr, out, scale);
+}
+// one block per row: loss_i = logsumexp(x_i) - x_i[t_i]
+__global__ void k_ce_rows(const __half *x, const __half *t, int C, double *part) {
+    __shared__ double shd[MB_THREADS];
+    const __half *xr = x + (long)blockIdx.x * C;
+    double mx = -INFINITY;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) mx = fmax(mx, (double)mb_ld(xr[c]));
+    shd[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) shd[threadIdx.x] = fmax(shd[threadIdx.x], shd[threadIdx.x + s]); __syncthreads(); }
+    mx = shd[0]; __syncthreads();
+    double se = 0.0;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) se += exp((double)mb_ld(xr[c]) - mx);
+    se = mb_block_sum_d(se, shd);
+    if (threadIdx.x == 0) part[blockIdx.x] = mx + log(se) - (double)mb_ld(xr[(int)mb_ld(t[blockIdx.x])]);
+}
+// one block per sample: max(0, ||a-p|| - ||a-n|| + margin)
+__global__ void k_triplet_rows(const __half *a, const __half *p, const __half *ng, int F, float margin, double *part) {
+    __shared__ double shd[MB_THREADS];
+    long base = (long)blockIdx.x * F;
+    double dp = 0.0, dn = 0.0;
+    for (int f = threadIdx.x; f < F; f += blockDim.x) {
+        double x = mb_ld(a[base + f]), u = x - (double)mb_ld(p[base + f]), w = x - (double)mb_ld(ng[base + f]);
+        dp += u * u; dn += w * w;
+    }
+    dp = mb_block_sum_d(dp, shd); dn = mb_block_sum_d(dn, shd);
+    if (threadIdx.x == 0) { double l = sqrt(dp) - sqrt(dn) + margin; part[blockIdx.x] = l > 0.0 ? l : 0.0; }
+}
+__global__ void k_div_by_norm(const __half *x, __half *y, long n, const double *ss) {
+    long i = MB_TID; if (i < n) y[i] = (float)(mb_ld(x[i]) / sqrt(ss[0]));
+}
+
+extern "C" void kernel_hinge_loss_f16(const __half *pred, const __half *targ, __half *output, int n, int targ_len) {
+    mb_loss(pred, targ, n, targ_len, 0.0f, 0, output, 1.0 / n);
+}
+extern "C" void kernel_mse_loss_f16(const __half *a, const __half *b, __half *output, int n) {
+    mb_loss(a, b, n, n, 0.0f, 1, output, 1.0 / n);
+}
+extern "C" void kernel_huber_loss_f16(const __half *a, const __half *b, __half *output, int n, float beta) {
+    mb_loss(a, b, n, n, beta, 2, output, 1.0 / n);
+}
+extern "C" void kernel_kldiv_loss_f16(const __half *log_input, const __half *target, __half *output, int N, int C) {
+    mb_loss(log_input, target, (long)N * C, 1, 0.0f, 3, output, 1.0 / N);
+}
+extern "C" void kernel_cross_entropy_loss_f16(const __half *logits, const __half *targets, __half *output, int N, int C) {
+    double *part = mb_partials(N);
+    k_ce_rows<<<N, MB_THREADS>>>(logits, targets, C, part);
+    k_sum_partials<<<1, MB_THREADS>>>(part, N, nullptr, output, 1.0 / N);
+}
+extern "C" void kernel_triplet_loss_f16(const __half *anchor, const __half *pos, const __half *neg, __half *output, int B, int F, float margin) {
+    double *part = mb_partials(B);
+    k_triplet_rows<<<B, MB_THREADS>>>(anchor, pos, neg, F, margin, part);
+    k_sum_partials<<<1, MB_THREADS>>>(part, B, nullptr, output, 1.0 / B);
+}
+extern "C" void kernel_frobenius_norm_f16(const __half *input, __half *output, int n) {
+    int nb = mb_rblocks(n); double *part = mb_partials(nb + 1);
+    k_loss_partial<<<nb, MB_THREADS>>>(input, nullptr, n, 1, 0.0f, 4, part + 1);
+    k_sum_partials<<<1, MB_THREADS>>>(part + 1, nb, part, nullptr, 1.0);
+    k_div_by_norm<<<MB_GRID(n), MB_THREADS>>>(input, output, n, part);
+}
+
 // fp16 launchers whose `_f16` KernelSpec is hand-written with a signature
 // that differs from the fp32 op's (so they can't be generated from
 // mb_cuda_kernels.cu). f16_kernels.py appends these to the generated
