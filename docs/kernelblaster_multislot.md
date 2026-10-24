@@ -79,6 +79,7 @@ MB_CHECK output <name> max_abs_err=<e> bound=<b> ok=<0|1>    every partition out
 MB_SLOT_CHECK <slot> rel_err=<e> ok=<0|1>                      every op alone on the reference's inputs
 MB_PARTITION_US <us> reps=<n>                                  CUDA events, whole partition
 MB_SLOT_US <slot> <us>                                         CUDA events per op, summed per slot
+MB_OP_US <op name> <us>                                        CUDA events per op instance
 passed | failed
 ```
 
@@ -157,8 +158,10 @@ gain (the consumer instance's measured time) and evidence. ModelBlaster:
 3. seeds the slot with both hand kernels called back to back (`a_<out>` is scratch) — correct
    by construction; the LLM may fuse and stop writing the scratch;
 4. exports the variant partition (references from the torch walk, which runs `sub_ops`);
-5. after KernelBlaster optimises it, `decide` accepts the fusion if the variant's best
-   partition time beats the original's by ≥ 3 %, and records the evidence in
+5. after KernelBlaster optimises both, `decide` accepts a fused kind if its fused slot is faster
+   than the two ops it replaced (measured per op, `MB_OP_US`) by ≥ 3 % of the original
+   partition — only the touched ops are compared, because whole-partition bests also move with
+   unrelated slots — and records the evidence in
    `kernels/cuda/fusion_registry.json` (`mb-fusion-registry/1`). A fusion's status is the
    majority of its decisions. Promotion of an accepted fusion into `KERNEL_SPECS` is a reviewed
    change.

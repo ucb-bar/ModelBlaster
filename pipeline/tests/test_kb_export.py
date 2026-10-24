@@ -118,6 +118,38 @@ class RegistryTest(unittest.TestCase):
             self.assertIn(s.op, used)
 
 
+class DecideTest(unittest.TestCase):
+    def test_decide_compares_only_touched_ops(self):
+        from modelblaster.pipeline.kb_proposals import decide
+
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "o").mkdir()
+            (d / "v").mkdir()
+            man = lambda slots: {"slots": [{"id": s, "instances": [{"op_name": n} for n in ns]}
+                                           for s, ns in slots.items()]}
+            (d / "o" / "manifest.json").write_text(json.dumps(man({"gemm": ["g"], "sig": ["s"], "relu": ["r"]})))
+            (d / "v" / "manifest.json").write_text(json.dumps(man({"gemm": ["g"], "f": ["s+r"]})))
+            # the variant's partition is much faster only because its GEMM got lucky;
+            # the fusion itself saves 40 of 1000 us (4%) -> accepted on its own merit
+            o = {"problem": "p", "problem_dir": str(d / "o"), "final_ok": True, "final_partition_us": 1000.0,
+                 "op_us": {"g": 900.0, "s": 50.0, "r": 50.0}, "slots": {}}
+            v = {"problem": "p", "problem_dir": str(d / "v"), "final_ok": True, "final_partition_us": 560.0,
+                 "op_us": {"g": 500.0, "s+r": 60.0}, "slots": {}}
+            var = {"applied": [{"pair": ["s", "r"], "kind": "fused__sigmoid__relu", "signature": "x"}]}
+            for n, x in (("o.json", o), ("v.json", v), ("var.json", var)):
+                (d / n).write_text(json.dumps(x))
+            r = decide(d / "o.json", d / "v.json", d / "var.json", registry=d / "reg.json")
+            k = r["kinds"]["fused__sigmoid__relu"]
+            self.assertAlmostEqual(k["gain"], 0.04)
+            self.assertEqual(k["status"], "accepted")
+            self.assertAlmostEqual(r["partition_gain"], 0.44)
+            v["op_us"]["s+r"] = 90.0                         # fusion only saves 1% -> rejected
+            (d / "v.json").write_text(json.dumps(v))
+            r = decide(d / "o.json", d / "v.json", d / "var.json", registry=d / "reg2.json")
+            self.assertEqual(r["kinds"]["fused__sigmoid__relu"]["status"], "rejected")
+
+
 class CacheTest(unittest.TestCase):
     def test_shape_guard(self):
         with tempfile.TemporaryDirectory() as d:
