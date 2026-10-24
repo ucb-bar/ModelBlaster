@@ -20,13 +20,15 @@ what the slot defines), and every entry carries its storage dtype (fp32 /
 fp16): an `_f16` op has its own kind and signature, and lookups also match
 the dtype, so fp16 and fp32 kernels never stand in for each other.
 
-Model-level verification exports the whole IR as one partition with the
-cached winners as slot sources and runs its driver (golden + every op in
-isolation). Entries that pass are marked ``model_verified`` for that IR;
-a failing slot marks its entry ``rejected`` for that IR.
+Model-level verification exports the whole IR as one partition -- accepted
+graph hints applied, the cached winners as slot sources (``cache_plan``,
+which also splits a slot whose instances only some winners cover) -- and
+runs its driver (golden + every op in isolation). Entries that pass are
+marked ``model_verified`` for that IR; a failing slot marks its entry
+``rejected`` for that IR.
 
     python -m modelblaster.pipeline.kb_ingest WINNERS.json [--cache DIR] \\
-        [--verify IR_DIR ...] [--arch 75]
+        [--verify IR_DIR ...] [--hints graph_hints.json] [--arch 75]
 """
 from __future__ import annotations
 
@@ -134,65 +136,152 @@ def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float
     return report
 
 
-def cache_sources(ir_dir: Path, cache: CudaCache, arch: str, specs: dict) -> tuple[dict, dict, dict]:
-    """Slot sources from the cache for an IR: ({op: code}, {op: tag}, {op: entry})."""
-    g = json.loads((Path(ir_dir) / "graph.json").read_text())
-    shapes: dict[str, list] = {}          # entry -> instance shapes (all op kinds using it)
-    sig_of, ops_of = {}, {}
+def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: bool = True) -> dict:
+    """Which cached sources an IR can use, per slot.
+
+    A slot (C entry, or a split variant of one) takes the best entry whose
+    shape guard covers every instance. When no entry covers them all but some
+    cover a part (winners tuned on one partition's shapes), ``split`` makes
+    ModelBlaster's own decision to give those instances their own slot: a
+    ``split_slot`` hint (source ``mb-cache``) with one group per covering
+    entry plus one for the rest (hand kernel), applied to the graph. Fused
+    slots without an entry of their own get cached stage kernels guarded on
+    the stages' shapes (``sub_sources``) for their seed; a fused slot is also
+    split by which first-stage winner covers its instances, so fusing ops
+    whose kernels were tuned per shape keeps those kernels.
+
+    -> {"graph", "sources" {slot id: code}, "tags", "used" {slot id: entry},
+        "sub_sources" {fused slot id: {stage kind: code}}, "hints" [split hints]}"""
+    from . import graph_hints as gh
+    from .kb_export import ALIAS_OPS, slot_id_of
+    from .kb_proposals import with_fused_specs
+
+    g = gh.unique_names(json.loads(json.dumps(graph)))
+    specs = with_fused_specs(g, specs)
+    ir_name = g["name"]
+    slots: dict[str, list[dict]] = {}
     for o in g["ops"]:
-        if o["op"] in specs:
-            entry, _ = parse_signature(specs[o["op"]].signature)
-            shapes.setdefault(entry, []).append(o.get("shape", {}))
-            sig_of[entry] = specs[o["op"]].signature
-            ops_of.setdefault(entry, set()).add(o["op"])
-    src, tags, used = {}, {}, {}
-    for entry, sh in shapes.items():
-        e = cache.lookup(entry, sig_of[entry], arch, sh, ir_name=g["name"])
+        if o["op"] in specs and o["op"] not in ALIAS_OPS:
+            slots.setdefault(slot_id_of(o, specs), []).append(o)
+
+    def entry_sig(kind):
+        return parse_signature(specs[kind].signature)[0], specs[kind].signature
+
+    def usable(entry, sig):
+        return [e for e in cache.entries if e["entry"] == entry and e["signature_sha"] == signature_sha(sig)
+                and e["arch"] == arch and ir_name not in e["rejected"]]
+
+    def own_key(o):
+        return _shape_key(o.get("shape", {}))
+
+    def stage0_key(o):
+        return _shape_key(o["sub_ops"][0].get("shape", {}))
+
+    src, tags, used, hints = {}, {}, {}, []
+    for sid, ops in slots.items():
+        entry, sig = entry_sig(ops[0]["op"])
+        e = cache.lookup(entry, sig, arch, [o.get("shape", {}) for o in ops], ir_name=ir_name)
         if e is not None:
-            for op in ops_of[entry]:       # export_problem looks sources up by op kind
-                src[op], tags[op] = cache.code(e), f"cache:{e['impl_id']}"
-            used[entry] = e
-    return src, tags, used
+            src[sid], tags[sid], used[sid] = cache.code(e), f"cache:{e['impl_id']}", e
+            continue
+        if not split or any(o.get("slot_variant") for o in ops) or len(ops) < 2:
+            continue
+        # covering candidates: the slot's own winners; for a fused slot also
+        # its first stage's (the dominant kernel), which seed it via sub_sources
+        cands = [(c, own_key, True) for c in usable(entry, sig)]
+        if "sub_ops" in ops[0]:
+            k0 = ops[0]["sub_ops"][0]["op"]
+            e0 = cache.lookup(*entry_sig(k0), arch, [o["sub_ops"][0].get("shape", {}) for o in ops], ir_name=ir_name)
+            if e0 is None:                                 # else every instance gets it as a stage seed
+                cands += [(c, stage0_key, False) for c in usable(*entry_sig(k0))]
+        left, parts = list(ops), []
+        while left:
+            def score(cand):
+                c, key, own = cand
+                n = sum(1 for o in left if key(o) in c["shape_guard"])
+                return (n, own, ir_name in c["model_verified"], -c["slot_us"])
+            live = [x for x in cands if score(x)[0]]
+            if not live:
+                break
+            best = max(live, key=score)
+            covered = [o for o in left if best[1](o) in best[0]["shape_guard"]]
+            parts.append((best, covered))
+            left = [o for o in left if o not in covered]
+        if not parts or (len(parts) == 1 and not left and not parts[0][0][2]):
+            continue                                       # one stage cover for all: plain sub_sources
+        groups = [{"ops": [o["name"] for o in cov], "cache": c["impl_id"], "as": "slot" if own else "stage"}
+                  for (c, _, own), cov in parts]
+        if left:
+            groups.append({"ops": [o["name"] for o in left], "cache": None})
+        hints.append({"id": f"split:{sid}", "kind": "split_slot", "target": "cuda", "slot": sid,
+                      "by": "cache", "groups": groups, "status": "accepted",
+                      "source": [{"by": "mb-cache", "ir": ir_name}], "evidence": []})
+        for k, ((c, _, own), _) in enumerate(parts):
+            if own:
+                src[f"{sid}__v{k}"], tags[f"{sid}__v{k}"], used[f"{sid}__v{k}"] = \
+                    cache.code(c), f"cache:{c['impl_id']}", c
+    if hints:
+        g, _, _ = gh.apply_hints(g, hints, specs)
+    sub_sources: dict[str, dict[str, str]] = {}
+    for o in g["ops"]:
+        sid = slot_id_of(o, specs) if o["op"] in specs else None
+        if "sub_ops" not in o or sid in src or sid in sub_sources:
+            continue
+        mine = [x for x in g["ops"] if x["op"] in specs and slot_id_of(x, specs) == sid]
+        subs = {}
+        for i, st in enumerate(o["sub_ops"]):
+            entry, sig = entry_sig(st["op"])
+            shapes = [x["sub_ops"][i].get("shape", {}) for x in mine]
+            e = cache.lookup(entry, sig, arch, shapes, ir_name=ir_name)
+            if e is not None:
+                subs[st["op"]] = cache.code(e)
+                used[f"{sid}/{st['op']}"] = e
+        sub_sources[sid] = subs
+    return {"graph": g, "sources": src, "tags": tags, "used": used, "sub_sources": sub_sources, "hints": hints}
 
 
 def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: Path | None = None,
-              fusion_registry: Path | None = None) -> dict:
-    """Whole-IR export with cached winners (and accepted fusions applied),
-    build and run; mark entries."""
+              hints: Path | None = None, fusion_registry: Path | None = None) -> dict:
+    """Whole-IR export with the accepted graph hints applied and the cached
+    winners as sources (``cache_plan``), build and run; mark entries."""
+    from . import graph_hints as gh
     from .kb_export import build_and_run, export_problem
+    from .kb_proposals import write_variant_ir
 
     ir_dir = Path(ir_dir)
     sm = arch.removeprefix("sm_")
-    fused_names = []
-    if fusion_registry is not None:
-        from .kb_proposals import apply_accepted, write_variant_ir
-        g, fused, fused_names = apply_accepted(json.loads((ir_dir / "graph.json").read_text()),
-                                               Path(fusion_registry), specs)
-        if fused_names:
-            specs = {**specs, **fused}
-            ir_dir = write_variant_ir(ir_dir, g, Path(tempfile.mkdtemp(prefix="mb_fused_ir_")))
-    src, tags, used = cache_sources(ir_dir, cache, f"sm_{sm}", specs)
-    if not used:
+    g = json.loads((ir_dir / "graph.json").read_text())
+    specs = dict(specs)
+    hpath = hints or fusion_registry
+    applied, hint_ids = [], []
+    if hpath is not None:
+        g, added, prov = gh.apply_hints(g, gh.load(Path(hpath))["hints"], specs)
+        specs.update(added)
+        applied = [a["op"] for a in prov["applied"] if a["kind"] == "fuse"]
+        hint_ids = sorted({a["id"] for a in prov["applied"]})
+    plan = cache_plan(g, cache, f"sm_{sm}", specs)
+    if not plan["used"]:
         return {"ir": ir_dir.name, "status": "no-cache-entries"}
     tmp = Path(work or tempfile.mkdtemp(prefix="mb_verify_", dir=str(MB_ROOT / "tmp")
                                        if (MB_ROOT / "tmp").exists() else None))
     try:
-        d = export_problem(ir_dir, tmp / "problem", slot_sources=src, slot_source_tags=tags,
-                           specs=specs, strategy="whole")
+        vir = write_variant_ir(ir_dir, plan["graph"], tmp / "ir")
+        d = export_problem(vir, tmp / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
+                           sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
         res = build_and_run(d, arch=sm)
         man = json.loads((d / "manifest.json").read_text())
         ir_name = man["ir_name"]
-        slot_of_entry = {s["entry"]: s["id"] for s in man["slots"]}
         out = {"ir": ir_name, "passed": res.get("passed"), "partition_us": res.get("partition_us"),
-               "fused": fused_names, "slots": {}}
-        for entry, e in used.items():
-            sid = slot_of_entry[entry]
+               "fused": applied, "hints": hint_ids, "cache_split": [h["id"] for h in plan["hints"]],
+               "slots": {}}
+        for key, e in plan["used"].items():
+            sid = key.split("/")[0]
             sc = res.get("slots", {}).get(sid, {})
             good = bool(res.get("passed")) or bool(sc.get("ok"))
             lst = e["model_verified"] if good else e["rejected"]
             if ir_name not in lst:
                 lst.append(ir_name)
-            out["slots"][sid] = {"impl_id": e["impl_id"], "ok": good, "rel_err": sc.get("rel_err"),
+            out["slots"][key] = {"impl_id": e["impl_id"], "ok": good, "rel_err": sc.get("rel_err"),
                                  "slot_us": res.get("slot_us", {}).get(sid)}
         if not res.get("passed"):
             out["log"] = res.get("log", "")[-1500:]
@@ -209,20 +298,21 @@ def main():
     ap.add_argument("--cache", default=str(DEFAULT_CACHE))
     ap.add_argument("--verify", nargs="*", default=[], help="IR dirs to verify at model level")
     ap.add_argument("--arch", default="75")
-    ap.add_argument("--fusion-registry", default=None,
-                    help="accepted fusions here are known ops (default kernels/cuda/fusion_registry.json)")
+    ap.add_argument("--hints", "--fusion-registry", dest="hints", default=None,
+                    help="graph hints file: accepted fusions are applied and known ops "
+                         "(default kernels/cuda/graph_hints.json)")
     a = ap.parse_args()
     from .kb_proposals import DEFAULT_REGISTRY, accepted_fused_specs
     from .reference_kernels import KERNEL_SPECS
 
-    specs = {**KERNEL_SPECS, **accepted_fused_specs(Path(a.fusion_registry or DEFAULT_REGISTRY), KERNEL_SPECS)}
+    specs = {**KERNEL_SPECS, **accepted_fused_specs(Path(a.hints or DEFAULT_REGISTRY), KERNEL_SPECS)}
     cache = CudaCache(Path(a.cache))
     if a.winners:
         for r in ingest(Path(a.winners), cache, specs):
             print(json.dumps(r))
     for d in a.verify:
         print(json.dumps(verify_ir(Path(d), cache, arch=a.arch, specs=specs,
-                                   fusion_registry=Path(a.fusion_registry or DEFAULT_REGISTRY))))
+                                   hints=Path(a.hints or DEFAULT_REGISTRY))))
 
 
 if __name__ == "__main__":
