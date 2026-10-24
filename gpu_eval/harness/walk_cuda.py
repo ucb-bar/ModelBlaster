@@ -9,6 +9,11 @@ timed with CUDA events.
     python walk_cuda.py IR_DIR --specs specs.json --hand lib_hand.so \
         [--seeds SEED_DIR] [--impl hand|seed|mixed] [--reps 20] [--json out.json]
 
+An fp16 IR (`--quant fp16`, `_f16` ops) runs on fp16 buffers: tensors and
+weights are stored as torch.float16 and the `_f16` kernels (lib built from
+cuda/mb_cuda_kernels_f16.cu) read and write __half; the per-intermediate
+oracle is walk_torch's fp16-storage walk and the bounds are cuda_dtypes'.
+
 impl=hand   only hand-written kernels (fails on an op without one)
 impl=seed   only auto-ported single-thread reference kernels (ref2cuda.py)
 impl=mixed  hand kernel when available, else seed
@@ -22,11 +27,19 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 import walk_torch
 from mbabi import bind, parse_signature
-from mbir import IR, compare, load_ir, strict_fp32
+from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
+
+_TORCH_DTYPE = {"f16": torch.float16, "f32": torch.float32}
+
+
+def _storage(ir: IR, t: str) -> torch.dtype:
+    """Device dtype of IR tensor t (graph.json `dtype`: f16 / f32)."""
+    return _TORCH_DTYPE.get(ir.graph["tensors"].get(t, {}).get("dtype"), torch.float32)
 
 
 class KernelSet:
@@ -74,14 +87,15 @@ def build_plan(ir: IR, ks: KernelSet):
 def run(ir: IR, plan, dev="cuda", time_ops=False, feed=None):
     """feed: an env (the PyTorch walk's) whose values replace every kernel's
     inputs, so each op is checked in isolation from upstream rounding."""
-    env = ir.input_tensors(dev)
+    env = {t: v.to(_storage(ir, t)) for t, v in ir.input_tensors(dev).items()}
     # folded constants / gather indices (int32, the kernels' `const int *`)
-    env.update(ir.const_tensors(dev, int_dtype=torch.int32))
+    env.update({t: v if not v.is_floating_point() else v.to(_storage(ir, t))
+                for t, v in ir.const_tensors(dev, int_dtype=torch.int32).items()})
     weights = {}
 
     def wptr(key):
-        if key not in weights:
-            weights[key] = ir.weight(key, dev)
+        if key not in weights:      # as stored: float16 weights for an fp16 IR
+            weights[key] = torch.from_numpy(np.ascontiguousarray(ir.weights[key])).to(dev)
         return weights[key].data_ptr()
 
     per_op = []
@@ -100,14 +114,17 @@ def run(ir: IR, plan, dev="cuda", time_ops=False, feed=None):
                 env[t] = x.narrow(1, i * op["shape"]["c_each"], op["shape"]["c_each"])
             continue
         fn, params, src, lib = k
+        # the fed copies are this op's own: writing them into env would
+        # overwrite the producer's output before it is compared
+        fed = {}
         if feed is not None:
             for t in op["inputs"]:
                 # constants (int32 gather indices) are already exact
                 if t in feed and not ir.graph["tensors"].get(t, {}).get("const"):
-                    env[t] = feed[t].to(device=dev, dtype=env[t].dtype).contiguous().clone()
+                    fed[t] = feed[t].to(device=dev, dtype=env[t].dtype).contiguous().clone()
         for t in op["outputs"]:
-            env[t] = torch.empty(ir.tshape(t), device=dev, dtype=torch.float32)
-        args = bind(op, params, lambda t: env[t].data_ptr(), wptr)
+            env[t] = torch.empty(ir.tshape(t), device=dev, dtype=_storage(ir, t))
+        args = bind(op, params, lambda t: fed.get(t, env[t]).data_ptr(), wptr)
         if time_ops:
             s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             s.record()
@@ -126,7 +143,7 @@ def evaluate(d: str, ks: KernelSet, reps: int) -> dict:
     ir = load_ir(d)
     plan, missing = build_plan(ir, ks)
     srcs = [k[2] for _, k in plan if k]
-    rec = {"ir": ir.name, "impl": ks.impl, "n_kernel_ops": len(srcs),
+    rec = {"ir": ir.name, "impl": ks.impl, "dtype": ir.dtype, "n_kernel_ops": len(srcs),
            "from_hand": srcs.count("hand"), "from_seed": srcs.count("seed"), "missing": missing}
     if missing:
         rec["ok"] = False
@@ -136,7 +153,7 @@ def evaluate(d: str, ks: KernelSet, reps: int) -> dict:
         out, env, _ = run(ir, plan)
         torch.cuda.synchronize()
         rec["first_run_s"] = round(time.time() - t0, 3)
-        rec.update(compare(out, ir.golden_out))
+        rec.update(compare(out, ir.golden_out, ir.dtype))
         # Localise: diff every intermediate against the PyTorch walk. cuDNN
         # is off for this oracle: its fast conv algorithms (FFT/Winograd) are
         # ~2e-3 off fp64 on e.g. AlexNet conv2, where the naive kernel is 2e-6.
@@ -145,7 +162,9 @@ def evaluate(d: str, ks: KernelSet, reps: int) -> dict:
         # each kernel on the reference's inputs: a diff is that kernel's own
         # error, not rounding propagated through an ill-conditioned graph
         _, iso_env, _ = run(ir, plan, feed=ref_env)
-        worst, first_bad = 0.0, None
+        rec["output_vs_ref_walk"] = compare(out, torch.cat(
+            [ref_env[t].reshape(-1) for t in ir.output_names()]).cpu().numpy(), ir.dtype)["rel_to_range"]
+        worst, first_bad, by_kind = 0.0, None, {}
         for op, _k in plan:
             if _k is None:
                 continue
@@ -163,10 +182,14 @@ def evaluate(d: str, ks: KernelSet, reps: int) -> dict:
                     scale = max(scale, fin.abs().max().item() if fin.numel() else 0.0)
                 e = d.max().item() / max(scale, 1e-12)
                 worst = max(worst, e)
-                if first_bad is None and (e > 1e-3 or not (torch.isfinite(a) == torch.isfinite(b)).all()):
+                by_kind[op["op"]] = max(by_kind.get(op["op"], 0.0), e)
+                tol = cuda_dtypes.TOLERANCE[cuda_dtypes.op_dtype(op["op"])]
+                bad = d.max().item() > tol["slot_rel"] * scale + tol["slot_abs"]   # abs: fp16 subnormals
+                if first_bad is None and (bad or not (torch.isfinite(a) == torch.isfinite(b)).all()):
                     first_bad = f"{op['name']} ({op['op']}) rel_err={e:.2e}"
         rec["worst_intermediate_rel_err"] = worst
         rec["first_divergent_op"] = first_bad
+        rec["intermediate_rel_err_by_op"] = {k: float(f"{v:.3g}") for k, v in sorted(by_kind.items())}
         # Timing: whole-model wall (events) + per-op breakdown.
         for _ in range(2):
             run(ir, plan)

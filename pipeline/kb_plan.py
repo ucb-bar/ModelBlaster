@@ -1,0 +1,247 @@
+"""Cost-ranked partition selection: what ModelBlaster sends to KernelBlaster.
+
+A KernelBlaster budget is best spent where the time is. For one or more IRs:
+
+1. **profile** -- apply the accepted graph hints, take the kernel cache's
+   current winners (``kb_ingest.cache_plan``), export the whole graph as one
+   problem and run its driver (median of ``runs``): per-op times
+   (``MB_OP_US``) with each op's C entry, signature and shape;
+2. **rank** -- group op instances by (C entry, signature, shape) across every
+   profiled IR: the same layer shape in two models is one item, so it is
+   optimised once and its winner (shape-guarded) serves both;
+3. **select** -- items in order of total time while they cover less than
+   ``coverage`` of the total, at most ``top_k``, each at least ``min_share``,
+   skipping ``exclude`` (items already sent in an earlier round);
+4. **problems** -- each selected item goes to the IR where it costs most;
+   per IR one problem with every instance of its selected items (a partition
+   need not be contiguous: inputs come from the reference walk). A winner
+   tuned on some of a slot's shapes is used for exactly those instances later
+   (``cache_plan`` splits the slot by the cache's shape guards).
+
+The plan (``modelblaster.kb_plan/v1``) records every item, its share and
+whether it was selected and why not; :func:`export_plan` (also
+``kb_export --plan``) writes its problems.
+
+    python -m modelblaster.pipeline.kb_plan profile IR_DIR [...] --out PROFILE_DIR \\
+        [--hints graph_hints.json --cache DIR --arch 75 --runs 3]
+    python -m modelblaster.pipeline.kb_plan select PROFILE.json [...] --out PLAN.json \\
+        [--coverage 0.8 --top-k 8 --min-share 0.01 --exclude-from OLD_PLAN.json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from pathlib import Path
+
+from .kernel_abi import parse_signature
+
+FORMAT = "modelblaster.kb_plan/v1"
+PROFILE_FORMAT = "mb-kb-profile/1"
+
+
+def _shape_key(shape: dict) -> str:
+    return json.dumps(shape, sort_keys=True)
+
+
+def item_key(entry: str, sig_sha: str, shape: dict) -> str:
+    return f"{entry}|{sig_sha}|{_shape_key(shape)}"
+
+
+def hinted_ir(ir_dir: Path, hints_doc: dict, work: Path, specs: dict):
+    """(IR dir with the accepted hints applied, specs, cache-plan input graph)."""
+    from . import graph_hints as gh
+
+    d, specs, _ = gh.apply_to_ir(Path(ir_dir), hints_doc, Path(work) / "ir")
+    return d, specs, json.loads((d / "graph.json").read_text())
+
+
+def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache=None, arch: str = "75",
+               specs: dict | None = None, runs: int = 3, keep: bool = False) -> dict:
+    """Whole-graph per-op profile of an IR in its current state (accepted
+    hints applied, cached winners in place)."""
+    from . import graph_hints as gh
+    from .kb_export import build_and_run, export_problem, slot_id_of
+    from .kb_ingest import cache_plan, signature_sha
+    from .kb_proposals import _all_specs, write_variant_ir
+
+    work = Path(work)
+    specs = dict(specs or _all_specs())
+    hdir, specs, g = hinted_ir(Path(ir_dir), hints_doc or gh.new_doc(), work, specs)
+    plan = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else \
+        {"graph": gh.unique_names(g), "sources": {}, "tags": {}, "sub_sources": None, "hints": []}
+    pdir = write_variant_ir(Path(ir_dir), plan["graph"], work / "profile_ir") if plan["hints"] else hdir
+    prob = export_problem(pdir, work / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
+                          sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
+    res = build_and_run(prob, arch=arch, runs=runs)
+    man = json.loads((prob / "manifest.json").read_text())
+    ops_by_name = {o["name"]: o for o in plan["graph"]["ops"]}
+    seed = {s["id"]: s["seed_source"] for s in man["slots"]}
+    recs = []
+    for r in man["ops"]:
+        o = ops_by_name[r["name"]]
+        entry, _ = parse_signature(specs[o["op"]].signature)
+        recs.append({"name": r["name"], "op": o["op"], "slot": r["slot"], "entry": entry,
+                     "signature_sha": signature_sha(specs[o["op"]].signature), "shape": o.get("shape", {}),
+                     "us": res.get("op_us", {}).get(r["name"]), "seed": seed.get(r["slot"]),
+                     "slot_base": slot_id_of({"op": o["op"]}, specs)})
+    out = {"format": PROFILE_FORMAT, "ir": man["ir_name"], "source_ir": str(ir_dir), "ir_dir": str(pdir),
+           "hints_sha": gh.hints_sha(hints_doc or gh.new_doc()), "arch": f"sm_{arch}",
+           "passed": res.get("passed"), "partition_us": res.get("partition_us"),
+           "partition_us_runs": res.get("partition_us_runs"), "ops": recs,
+           "applied_hints": [h["id"] for h in plan["hints"]]}
+    if not res.get("passed"):
+        out["log"] = res.get("log", "")[-1500:]
+    if not keep:                                   # data.bin and the build are the big parts
+        for p in (prob / "data.bin", prob / "build"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+    (work / "profile.json").write_text(json.dumps(out, indent=1))
+    return out
+
+
+def rank(profiles: list[dict], weights: dict[str, float] | None = None) -> list[dict]:
+    """Op instances grouped by (entry, signature, shape) across IRs, by total
+    time (an IR's times scaled by ``weights[ir]``, default 1)."""
+    items: dict[str, dict] = {}
+    for p in profiles:
+        w = (weights or {}).get(p["ir"], 1.0)
+        for r in p["ops"]:
+            if r["us"] is None:
+                continue
+            k = item_key(r["entry"], r["signature_sha"], r["shape"])
+            it = items.setdefault(k, {"key": k, "entry": r["entry"], "op": r["op"], "signature_sha": r["signature_sha"],
+                                      "shape": r["shape"], "total_us": 0.0, "count": 0, "occurrences": {}})
+            it["total_us"] += w * r["us"]
+            it["count"] += 1
+            occ = it["occurrences"].setdefault(p["ir"], {"ir": p["ir"], "ir_dir": p["ir_dir"], "ops": [], "us": 0.0,
+                                                         "seed": r["seed"]})
+            occ["ops"].append(r["name"])
+            occ["us"] += w * r["us"]
+    out = sorted(items.values(), key=lambda it: -it["total_us"])
+    for it in out:
+        it["occurrences"] = sorted(it["occurrences"].values(), key=lambda o: -o["us"])
+    return out
+
+
+def select(items: list[dict], *, coverage: float = 0.8, top_k: int | None = None, min_share: float = 0.01,
+           exclude: set | None = None) -> dict:
+    """Mark items selected (see module doc) -> plan dict without problems."""
+    total = sum(it["total_us"] for it in items) or 1.0
+    exclude = exclude or set()
+    cum, n, chosen = 0.0, 0, 0.0
+    for it in items:
+        it["share"] = it["total_us"] / total
+        why = None
+        if it["key"] in exclude:
+            why = "sent-before"
+        elif cum >= coverage:
+            why = "coverage-reached"
+        elif top_k is not None and n >= top_k:
+            why = "top-k"
+        elif it["share"] < min_share:
+            why = "below-min-share"
+        it["selected"], it["why_not"] = why is None, why
+        if why is None:
+            n += 1
+            chosen += it["total_us"]
+        if why != "sent-before":
+            cum += it["share"]
+    return {"format": FORMAT, "budget": {"coverage": coverage, "top_k": top_k, "min_share": min_share},
+            "total_us": total, "selected_us": chosen, "selected_share": chosen / total, "items": items}
+
+
+def problems(plan: dict) -> dict:
+    """Group the selected items into one problem per representative IR."""
+    by_ir: dict[str, dict] = {}
+    for it in plan["items"]:
+        if not it.get("selected"):
+            continue
+        rep = it["occurrences"][0]
+        it["rep_ir"] = rep["ir"]
+        p = by_ir.setdefault(rep["ir"], {"ir": rep["ir"], "ir_dir": rep["ir_dir"], "op_names": [], "keys": [],
+                                         "est_us": 0.0})
+        p["op_names"] += [n for n in rep["ops"] if n not in p["op_names"]]
+        p["keys"].append(it["key"])
+        p["est_us"] += rep["us"]
+    plan["problems"] = sorted(by_ir.values(), key=lambda p: -p["est_us"])
+    return plan
+
+
+def make_plan(profiles: list[dict], **kw) -> dict:
+    plan = problems(select(rank(profiles, kw.pop("weights", None)), **kw))
+    plan["profiles"] = [{"ir": p["ir"], "ir_dir": p["ir_dir"], "partition_us": p["partition_us"]} for p in profiles]
+    return plan
+
+
+def export_plan(plan: dict, out: Path, *, cache=None, arch: str = "75", specs: dict | None = None,
+                names: dict | None = None) -> list[Path]:
+    """Export each problem of a plan under ``out/<ir>``, seeded from the
+    cache's winners for those ops' shapes (``cache_plan`` on the problem's
+    IR; the plan's IR dirs already carry the accepted hints)."""
+    from .kb_export import export_problem
+    from .kb_ingest import cache_plan
+    from .kb_proposals import _all_specs, with_fused_specs, write_variant_ir
+
+    specs = dict(specs or _all_specs())
+    dirs = []
+    for p in plan["problems"]:
+        ir_dir = Path(p["ir_dir"])
+        g = json.loads((ir_dir / "graph.json").read_text())
+        specs = with_fused_specs(g, specs)
+        cp = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else None
+        if cp is not None and cp["hints"]:
+            ir_dir = write_variant_ir(ir_dir, cp["graph"], Path(out) / f"{p['ir']}.ir")
+            g = cp["graph"]
+        idx = [i for i, o in enumerate(g["ops"]) if o["name"] in set(p["op_names"])]
+        name = (names or {}).get(p["ir"], f"{p['ir']}__plan")
+        dirs.append(export_problem(ir_dir, Path(out) / p["ir"], op_indices=idx, specs=specs, name=name,
+                                   strategy="plan", slot_sources=cp["sources"] if cp else None,
+                                   slot_source_tags=cp["tags"] if cp else None,
+                                   sub_sources=cp["sub_sources"] if cp else None))
+    return dirs
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    pr = sub.add_parser("profile")
+    pr.add_argument("irs", nargs="+")
+    pr.add_argument("--out", required=True)
+    pr.add_argument("--hints")
+    pr.add_argument("--cache")
+    pr.add_argument("--arch", default="75")
+    pr.add_argument("--runs", type=int, default=3)
+    se = sub.add_parser("select")
+    se.add_argument("profiles", nargs="+")
+    se.add_argument("--out", required=True)
+    se.add_argument("--coverage", type=float, default=0.8)
+    se.add_argument("--top-k", type=int, default=None)
+    se.add_argument("--min-share", type=float, default=0.01)
+    se.add_argument("--exclude-from", nargs="*", default=[], help="earlier plans: their selected items are skipped")
+    a = ap.parse_args()
+    if a.cmd == "profile":
+        from . import graph_hints as gh
+        from .kb_ingest import CudaCache
+
+        doc = gh.load(Path(a.hints)) if a.hints else None
+        cache = CudaCache(Path(a.cache)) if a.cache else None
+        for d in a.irs:
+            p = profile_ir(Path(d), Path(a.out) / Path(d).name, hints_doc=doc, cache=cache, arch=a.arch, runs=a.runs)
+            top = sorted(p["ops"], key=lambda r: -(r["us"] or 0))[:5]
+            print(json.dumps({"ir": p["ir"], "passed": p["passed"], "partition_us": p["partition_us"],
+                              "top": [(r["name"], r["us"]) for r in top]}))
+    else:
+        excl = {it["key"] for f in a.exclude_from for it in json.loads(Path(f).read_text())["items"]
+                if it.get("selected")}
+        plan = make_plan([json.loads(Path(f).read_text()) for f in a.profiles], coverage=a.coverage,
+                         top_k=a.top_k, min_share=a.min_share, exclude=excl)
+        Path(a.out).write_text(json.dumps(plan, indent=1))
+        print(json.dumps({"selected_share": round(plan["selected_share"], 3),
+                          "problems": [(p["ir"], len(p["op_names"])) for p in plan["problems"]]}))
+
+
+if __name__ == "__main__":
+    main()

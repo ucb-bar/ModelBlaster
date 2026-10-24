@@ -65,8 +65,10 @@ class OpenCLTarget:
     slot_ext = ".cpp"
     head_name, tail_name, driver_name = "walker_head.cpp", "walker_tail.cpp", "driver.cpp"
 
-    def library(self, hand=None):
+    def library(self, hand=None, dtype: str = "fp32"):
         from .opencl_seeds import OpenCLSeeds
+        if dtype != "fp32":
+            raise NotImplementedError(f"OpenCL slots are fp32 only (partition dtype {dtype})")
         return OpenCLSeeds(Path(hand) if hand else HAND_LIB)
 
     def seed(self, lib, entry: str, spec) -> tuple[str, str]:
@@ -74,8 +76,8 @@ class OpenCLTarget:
             return lib.fused_seed(spec), "fused-seed"
         return lib.slot_source(entry), lib.origin(entry)
 
-    def buffer_dtype(self, tensor: dict) -> str:
-        return "i64" if tensor.get("dtype") == "i64" else "f32"
+    def buffer_dtype(self, tensor: dict, default: str) -> str:
+        return "i64" if tensor.get("dtype") == "i64" else default
 
     def head_source(self, lib) -> str:
         return "// OpenCL runtime shared by every slot (gpu_eval/harness/opencl/mb_opencl_runtime.h).\n" \

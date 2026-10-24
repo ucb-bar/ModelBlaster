@@ -5,10 +5,12 @@ set -e
 IR=$(realpath "$1"); W=$(realpath -m "$2")
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"; MB=$MB_ROOT
 rm -rf "$W"; mkdir -p "$W/gen"; cp "$IR/graph.json" "$W/gen/graph.json"
+# fp16 IRs (`--quant fp16`) build the `_f16` (_Float16) reference kernels
+Q=$(python -c "import json, sys; print(json.load(open(sys.argv[1])).get('quant', 'fp32'))" "$IR/graph.json")
 python -m modelblaster.pipeline.generate_skeleton --ir "$W/gen/graph.json" --weights "$IR/weights.npz" \
   --io "$IR/io.npz" --out-dir "$W/gen" --backend scalar --platform host > "$W/skeleton.log" 2>&1
 python -m modelblaster.pipeline.generate_kernels --ir "$W/gen/graph.json" --out-dir "$W/gen" \
-  --target scalar --backend reference --quant fp32 --global-curated-dir "$MB/kernels" > "$W/kernels.log" 2>&1
+  --target scalar --backend reference --quant "$Q" --global-curated-dir "$MB/kernels" > "$W/kernels.log" 2>&1
 make -s -C "$MB/harness_linux" MODEL_DIR="$W/gen" OUT="$W/harness" CFLAGS="-O2 -mcmodel=medium" > "$W/make.log" 2>&1 \
   || { [ -n "$KEEP_BUILD" ] || rm -rf "$W/gen" "$W/harness.objs"; echo "BUILD FAILED"; tail -3 "$W/make.log"; exit 1; }
 timeout ${HOST_TIMEOUT:-900} "$W/harness" > "$W/run.out" 2>&1 || true
