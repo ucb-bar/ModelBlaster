@@ -17,7 +17,7 @@ __global__ void k_softmax_scaled(const __half *x, __half *y, int M, int K, float
     for (int k = 0; k < K; k++) yr[k] = expf(mb_ld(xr[k]) * scale - mx) * inv;
 }
 extern "C" void kernel_softmax_f16(const __half *input, __half *output, int M, int K, float input_scale) {
-    k_softmax_scaled<<<MB_GRID(M), MB_THREADS>>>(input, output, M, K, input_scale);
+    k_softmax_scaled<<<mb_blocks(M), mb_threads(M)>>>(input, output, M, K, input_scale);
 }
 
 // torch AdaptiveAvgPool2d windows: [floor(o*I/O), ceil((o+1)*I/O))
@@ -35,7 +35,7 @@ __global__ void k_adaptive_avg(const __half *x, __half *y, int N, int C, int IH,
 extern "C" void kernel_adaptive_avg_pool2d_f16(const __half *input, __half *output, int N, int C,
                                                int IH, int IW, int OH, int OW) {
     long tot = (long)N * C * OH * OW;
-    k_adaptive_avg<<<MB_GRID(tot), MB_THREADS>>>(input, output, N, C, IH, IW, OH, OW);
+    k_adaptive_avg<<<mb_blocks(tot), mb_threads(tot)>>>(input, output, N, C, IH, IW, OH, OW);
 }
 
 __global__ void k_copy_c_h(const __half *src, __half *dst, int N, int c, int C, int c_off, int HW) {
@@ -46,8 +46,8 @@ __global__ void k_copy_c_h(const __half *src, __half *dst, int N, int c, int C, 
 extern "C" void kernel_cat2_c1_f16(const __half *a, const __half *b, __half *output,
                                    int N, int H, int W, int Ca, int Cb) {
     int C = Ca + Cb, HW = H * W;
-    k_copy_c_h<<<MB_GRID((long)N * Ca * HW), MB_THREADS>>>(a, output, N, Ca, C, 0, HW);
-    k_copy_c_h<<<MB_GRID((long)N * Cb * HW), MB_THREADS>>>(b, output, N, Cb, C, Ca, HW);
+    k_copy_c_h<<<mb_blocks((long)N * Ca * HW), mb_threads((long)N * Ca * HW)>>>(a, output, N, Ca, C, 0, HW);
+    k_copy_c_h<<<mb_blocks((long)N * Cb * HW), mb_threads((long)N * Cb * HW)>>>(b, output, N, Cb, C, Ca, HW);
 }
 
 // The fp32 k_sdpa accumulates P.V in its output row, which in fp16 would be
@@ -71,5 +71,5 @@ __global__ void k_sdpa_h(const __half *Q, const __half *Kt, const __half *V, __h
     O[t] = acc / sum;
 }
 extern "C" void kernel_sdpa_f16(const __half *Q, const __half *K, const __half *V, __half *output, int BH, int S, int D) {
-    k_sdpa_h<<<MB_GRID((long)BH * S * D), MB_THREADS>>>(Q, K, V, output, BH, S, D);
+    k_sdpa_h<<<mb_blocks((long)BH * S * D), mb_threads((long)BH * S * D)>>>(Q, K, V, output, BH, S, D);
 }
