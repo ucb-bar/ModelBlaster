@@ -238,5 +238,5 @@ keys is a model-name change (`--model`, `--reflect-model`).
   ResNet18 numbers). The live results above are single runs.
 - RISC-V: the same manifest and agent apply once the Zephyr harness emits per-op PROFILE rows
   and the bridge builds per-slot files; open RISC-V issues are listed in the KB bug-fix notes.
-- The KB submodule pin still points at `backend-refactor` @ 4dfeabd; the multi-slot work lives
-  on KB branch `feat/multislot` until it is pushed and the pin bumped.
+- The KB submodule tracks `kris-dong/KernelBlaster` `feat/multislot`; merge it into
+  `backend-refactor` (and upstream) after review.
