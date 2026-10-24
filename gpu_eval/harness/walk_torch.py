@@ -386,13 +386,20 @@ def walk(ir: IR, dev="cuda", keep_all=False):
     """Returns (output_flat, env) — env maps every IR tensor to its value."""
     env = ir.input_tensors(dev)
     env.update(ir.const_tensors(dev))
-    for op in ir.ops:
+    def run_op(op):
+        if "sub_ops" in op:                    # fused op (kb_proposals): its parts in order
+            for sub in op["sub_ops"]:
+                run_op(sub)
+            return
         fn = OPS.get(op["op"])
         if fn is None:
             raise NotImplementedError(op["op"])
         outs = fn(ir, op, [env[t] for t in op["inputs"]], dev)
         for name, val in zip(op["outputs"], outs):
             env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
+
+    for op in ir.ops:
+        run_op(op)
     out = torch.cat([env[t].reshape(-1) for t in ir.output_names()])
     return out, env
 
