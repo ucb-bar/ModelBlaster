@@ -3229,7 +3229,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_adaptive_avg_pool2d_f16({in_ptr}, {out_ptr}, "
                 f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['OH']}, {sh['OW']})"
+                # the IR's adaptive_avg_pool2d is the global pool and carries
+                # no OH/OW (a bench-file fp16 extract raised KeyError here)
+                f"{sh.get('OH', 1)}, {sh.get('OW', 1)})"
             )
         elif op["op"] == "slice_c_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
