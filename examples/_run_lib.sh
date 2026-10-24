@@ -126,6 +126,7 @@ elif [[ -n "${BENCH_FILE:-}" ]]; then
         --quant "${QUANT}" \
         --bench-target-mb "${BENCH_TARGET_MB:-256}" \
         --bench-target-gflops "${BENCH_TARGET_GFLOPS:-0}" \
+        --bench-target-weights-mb "${BENCH_TARGET_WEIGHTS_MB:-0}" \
         --bench-max-elements "${BENCH_MAX_ELEMENTS:-0}"
 else
     python -m modelblaster.pipeline.extract_graph \
