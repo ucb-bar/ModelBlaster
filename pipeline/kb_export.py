@@ -27,11 +27,12 @@ The driver, run with no arguments:
   2. runs every op alone on the reference's inputs and checks its outputs
      (attributes a failure to a slot);
   3. times the partition and every op with CUDA events;
-and prints MB_CHECK / MB_SLOT_CHECK / MB_SLOT_US / MB_PARTITION_US lines
-followed by "passed" or "failed".
+and prints MB_CHECK / MB_SLOT_CHECK / MB_PARTITION_US / MB_SLOT_US / MB_OP_US
+lines followed by "passed" or "failed".
 
-    python -m modelblaster.pipeline.kb_export IR_DIR OUT_DIR [--ops a,b|--range i:j]
-        [--build-check --arch 75]
+    python -m modelblaster.pipeline.kb_export IR_DIR OUT_DIR [--ops a,b|--range i:j|--strategy S]
+        [--hints graph_hints.json] [--build-check --arch 75]
+    python -m modelblaster.pipeline.kb_export --plan PLAN.json OUT_DIR [--cache DIR]
 """
 from __future__ import annotations
 
@@ -184,15 +185,20 @@ class CudaLibrary:
 
 # ---------------------------------------------------------------- assembly
 
-def wrap_slot(slot_id: str, code: str) -> str:
+def namespaced(ns: str, code: str) -> tuple[list[str], str]:
+    """(hoisted #include lines, ``namespace ns { body }`` + #undef of its macros)."""
     # C linkage would make two slots' entries the same symbol across namespaces
     code = code.replace('extern "C"', "")
     includes = [l for l in code.splitlines() if l.strip().startswith("#include")]
     body = "\n".join(l for l in code.splitlines() if not l.strip().startswith("#include"))
     defines = sorted(set(re.findall(r"^\s*#\s*define\s+([A-Za-z_]\w*)", body, re.M)))
     undefs = "".join(f"#undef {d}\n" for d in defines)
-    return ("\n".join(includes) + "\n" if includes else "") + (
-        f"// ==== slot {slot_id} ====\nnamespace {NS_PREFIX}{slot_id} {{\n{body}\n}}  // namespace {NS_PREFIX}{slot_id}\n{undefs}")
+    return includes, f"namespace {ns} {{\n{body}\n}}  // namespace {ns}\n{undefs}"
+
+
+def wrap_slot(slot_id: str, code: str) -> str:
+    includes, body = namespaced(f"{NS_PREFIX}{slot_id}", code)
+    return ("\n".join(includes) + "\n" if includes else "") + f"// ==== slot {slot_id} ====\n{body}"
 
 
 def assemble(problem_dir: Path, sources: dict[str, str] | None = None) -> str:
@@ -252,25 +258,47 @@ def _slot_id(op: str) -> str:
     return re.sub(r"\W", "_", op)
 
 
+def base_slot_id(kind: str, specs: dict) -> str:
+    """One slot per C entry point (kernel_<x> -> x)."""
+    entry, _ = parse_signature(specs[kind].signature)
+    return _slot_id(entry[len("kernel_"):] if entry.startswith("kernel_") else entry)
+
+
+def slot_id_of(op: dict, specs: dict) -> str:
+    """The slot an op instance calls: its entry's slot, or (entry,
+    ``slot_variant``) when a split hint gave it a shape-specialised variant."""
+    sid = base_slot_id(op["op"], specs)
+    return f"{sid}__{op['slot_variant']}" if op.get("slot_variant") else sid
+
+
 def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name: str | None = None,
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
-                   tolerance: dict | None = None, strategy: str = "custom") -> Path:
+                   tolerance: dict | None = None, strategy: str = "custom",
+                   sub_sources: dict[str, dict[str, str]] | None = None) -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
-    ``slot_sources`` maps an op kind to a seed source replacing the hand
-    kernel (e.g. a cached KernelBlaster winner); ``slot_source_tags`` records
-    where each came from in the manifest.
+    ``slot_sources`` maps a slot id (or an op kind) to a seed source
+    replacing the hand kernel (e.g. a cached KernelBlaster winner);
+    ``slot_source_tags`` records where each came from in the manifest. A
+    fused slot without a source of its own is seeded with its stages called
+    back to back: each stage from ``sub_sources[fused slot id][stage kind]``
+    when given (e.g. cache entries guarded on the stage's shapes), else -- if
+    ``sub_sources`` is None -- from ``slot_sources`` by the stage's slot id or
+    kind, else the hand kernel.
     """
     import torch
+
+    from .graph_hints import unique_names
 
     if specs is None:
         from .reference_kernels import KERNEL_SPECS
         specs = KERNEL_SPECS
+    specs = dict(specs)
     mbir, walk_torch = _harness()
     ir_dir, out = Path(ir_dir).resolve(), Path(out_dir).resolve()
     ir = mbir.load_ir(ir_dir)
-    g = ir.graph
+    g = unique_names(ir.graph)
     ops = g["ops"]
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
     sel_set = set(sel)
@@ -341,24 +369,38 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         if o["op"] in ALIAS_OPS:
             continue
         kind = o["op"]
+        if kind not in specs and kind.startswith("fused__"):      # rebuilt from its name
+            from .kb_proposals import spec_from_kind
+            specs[kind] = spec_from_kind(kind, specs)
         if kind not in specs:
             raise KeyError(f"{kind}: no KernelSpec")
         spec = specs[kind]
         entry, params = parse_signature(spec.signature)
         # one slot per C entry point: op kinds that share an entry (sum_dim /
         # max_dim -> kernel_reduce with a different opc) share its code
-        sid = _slot_id(entry[len("kernel_"):] if entry.startswith("kernel_") else entry)
+        sid, base_sid = slot_id_of(o, specs), base_slot_id(kind, specs)
         if sid not in slots:
-            key = next((x for x in (sid, kind) if slot_sources and x in slot_sources), None)
+            key = next((x for x in (sid, base_sid, kind) if slot_sources and x in slot_sources), None)
             if key is not None:
                 src, tag = slot_sources[key], (slot_source_tags or {}).get(key, "override")
-            elif hasattr(spec, "cuda_seed"):           # fused ops: sub-op kernels back to back
-                src, tag = spec.cuda_seed(lib), "fused-seed"
+            elif hasattr(spec, "cuda_seed"):           # fused ops: stage kernels back to back
+                if sub_sources is not None:
+                    subs = sub_sources.get(sid, {})
+                else:
+                    subs = {}
+                    for k in spec.sub_ops:
+                        ssid = base_slot_id(k, specs)
+                        hit = next((x for x in (ssid, k) if slot_sources and x in slot_sources), None)
+                        if hit is not None:
+                            subs[k] = slot_sources[hit]
+                src = spec.cuda_seed(lib, sub_sources=subs)
+                tag = "fused-seed" + (":" + ",".join(sorted(subs)) if subs else "")
             else:
                 src, tag = lib.slot_source(entry), "hand"
             slots[sid] = {"id": sid, "op": kind, "ops": [], "op_class": op_class(kind), "entry": entry,
                           "signature": " ".join(spec.signature.split()), "file": f"slots/{sid}.cu",
                           "reference_file": f"slots/{sid}.ref.c", "semantics": spec.semantics,
+                          **({"variant_of": base_sid} if o.get("slot_variant") else {}),
                           "seed_source": tag, "instances": [], "_src": src,
                           "_ref": spec.reference_impl}
         if kind not in slots[sid]["ops"]:
@@ -644,16 +686,17 @@ int main() {
             cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1); total += ms; ++reps;
         }
         printf("MB_PARTITION_US %.3f reps=%d\n", 1000.0 * total / reps, reps);
-        std::vector<double> slot_us(NSLOTS, 0.0);
+        std::vector<double> slot_us(NSLOTS, 0.0), op_us(NOPS, 0.0);
         int oreps = std::max(1, std::min(reps, 20));
         std::vector<cudaEvent_t> ev(2 * NOPS);
         for (auto &e : ev) cudaEventCreate(&e);
         for (int r = 0; r < oreps; ++r) {
             for (int i = 0; i < NOPS; ++i) { cudaEventRecord(ev[2 * i]); mb_run_op(i, dev); cudaEventRecord(ev[2 * i + 1]); }
             cudaEventSynchronize(ev[2 * NOPS - 1]);
-            for (int i = 0; i < NOPS; ++i) { float ms; cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]); slot_us[OP_SLOT[i]] += 1000.0 * ms / oreps; }
+            for (int i = 0; i < NOPS; ++i) { float ms; cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]); slot_us[OP_SLOT[i]] += 1000.0 * ms / oreps; op_us[i] += 1000.0 * ms / oreps; }
         }
         for (int s = 0; s < NSLOTS; ++s) printf("MB_SLOT_US %s %.3f\n", SLOT_NAME[s], slot_us[s]);
+        for (int i = 0; i < NOPS; ++i) printf("MB_OP_US %s %.3f\n", OP_NAME[i], op_us[i]);
         all_ok &= ok_cuda("timing");
     }
     printf(all_ok ? "passed\n" : "failed\n");
@@ -666,7 +709,8 @@ int main() {
 
 def parse_driver_output(text: str) -> dict:
     res = {"passed": bool(re.search(r"^passed$", text, re.M)), "outputs": {}, "slots": {},
-           "slot_us": {}, "partition_us": None, "errors": re.findall(r"^MB_ERROR (.*)$", text, re.M)}
+           "slot_us": {}, "op_us": {}, "partition_us": None,
+           "errors": re.findall(r"^MB_ERROR (.*)$", text, re.M)}
     for m in re.finditer(r"^MB_CHECK output (\S+) max_abs_err=(\S+) bound=(\S+) ok=(\d)", text, re.M):
         res["outputs"][m.group(1)] = {"max_abs_err": float(m.group(2)), "bound": float(m.group(3)),
                                       "ok": m.group(4) == "1"}
@@ -674,15 +718,28 @@ def parse_driver_output(text: str) -> dict:
         res["slots"][m.group(1)] = {"rel_err": float(m.group(2)), "ok": m.group(3) == "1"}
     for m in re.finditer(r"^MB_SLOT_US (\S+) (\S+)", text, re.M):
         res["slot_us"][m.group(1)] = float(m.group(2))
+    for m in re.finditer(r"^MB_OP_US (\S+) (\S+)", text, re.M):
+        res["op_us"][m.group(1)] = float(m.group(2))
     m = re.search(r"^MB_PARTITION_US (\S+)", text, re.M)
     if m:
         res["partition_us"] = float(m.group(1))
     return res
 
 
+def run_built(exe, timeout: int = 1800) -> dict:
+    rp = subprocess.run([str(exe)], capture_output=True, text=True, timeout=timeout)
+    res = parse_driver_output(rp.stdout)
+    res.update(stage="run", log=(rp.stdout + rp.stderr)[-4000:])
+    return res
+
+
 def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | None = None,
-                  work: Path | None = None, nvcc: str = "nvcc", timeout: int = 1800) -> dict:
-    """Assemble + nvcc-build + run the problem outside KernelBlaster."""
+                  work: Path | None = None, nvcc: str = "nvcc", timeout: int = 1800, runs: int = 1) -> dict:
+    """Assemble + nvcc-build + run the problem outside KernelBlaster.
+
+    ``runs`` > 1 runs the binary that many times and keeps the run with the
+    median partition time (``partition_us_runs`` has them all); ``runs=0``
+    only builds (``exe`` is the binary)."""
     problem_dir = Path(problem_dir)
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
@@ -693,41 +750,55 @@ def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | No
                         capture_output=True, text=True, timeout=timeout)
     if cp.returncode != 0:
         return {"passed": False, "stage": "compile", "log": (cp.stdout + cp.stderr)[-4000:]}
-    rp = subprocess.run([str(exe)], capture_output=True, text=True, timeout=timeout)
-    res = parse_driver_output(rp.stdout)
-    res.update(stage="run", log=(rp.stdout + rp.stderr)[-4000:])
-    return res
+    if runs <= 0:
+        return {"passed": None, "stage": "built", "exe": str(exe)}
+    rs = [run_built(exe, timeout) for _ in range(runs)]
+    ok = [r for r in rs if r["passed"] and r["partition_us"]]
+    if not ok:
+        return {**rs[0], "exe": str(exe)}
+    ok.sort(key=lambda r: r["partition_us"])
+    return {**ok[len(ok) // 2], "exe": str(exe), "partition_us_runs": [r["partition_us"] for r in rs if r["partition_us"]]}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("ir_dir")
+    ap.add_argument("ir_dir", nargs="?")
     ap.add_argument("out_dir")
     ap.add_argument("--ops", help="comma-separated op names")
     ap.add_argument("--range", help="op index range i:j")
     ap.add_argument("--strategy", default=None, choices=["whole", "per_op", "window"],
                     help="export every partition of the strategy under OUT_DIR/pNN")
     ap.add_argument("--max-ops", type=int, default=12)
+    ap.add_argument("--plan", help="export the problems of a kb_plan file (modelblaster.kb_plan/v1); "
+                                   "IR_DIR is not used")
+    ap.add_argument("--cache", help="with --plan: seed the problems from this kernel cache")
     ap.add_argument("--hand-cu", default=str(DEFAULT_HAND_CU))
-    ap.add_argument("--fusion-registry", help="apply the fusions accepted in this registry first")
+    ap.add_argument("--hints", "--fusion-registry", dest="hints",
+                    help="graph hints file: apply its accepted hints first")
     ap.add_argument("--build-check", action="store_true", help="nvcc-build and run each problem")
     ap.add_argument("--arch", default="75")
     a = ap.parse_args()
-    ir_dir, specs = Path(a.ir_dir), None
+    if a.plan:
+        from .kb_ingest import CudaCache
+        from .kb_plan import export_plan
+        cache = CudaCache(Path(a.cache)) if a.cache else None
+        for d in export_plan(json.loads(Path(a.plan).read_text()), Path(a.out_dir), cache=cache, arch=a.arch):
+            print(json.dumps({"problem": str(d)}), flush=True)
+        return
+    ir_dir = Path(a.ir_dir)
     g = json.loads((ir_dir / "graph.json").read_text())
-    if a.fusion_registry:
-        from .kb_proposals import apply_accepted, write_variant_ir
-        from .reference_kernels import KERNEL_SPECS
-        g, fused, done = apply_accepted(g, Path(a.fusion_registry), KERNEL_SPECS)
-        if done:
-            specs = {**KERNEL_SPECS, **fused}
-            ir_dir = write_variant_ir(Path(a.ir_dir), g, Path(a.out_dir) / "fused_ir")
-            print(json.dumps({"fused": done}), flush=True)
+    if a.hints:
+        from . import graph_hints as gh
+        ir_dir, _, prov = gh.apply_to_ir(ir_dir, gh.load(Path(a.hints)), Path(a.out_dir) / "hinted_ir")
+        if prov["applied"]:
+            g = json.loads((ir_dir / "graph.json").read_text())
+            print(json.dumps({"applied": prov["applied"]}), flush=True)
     if a.strategy:
         parts = [(f"p{k:02d}", p) for k, p in enumerate(partition_ir(g, a.strategy, a.max_ops))]
     elif a.ops:
+        from .graph_hints import unique_names
         names = a.ops.split(",")
-        parts = [("", [i for i, o in enumerate(g["ops"]) if o["name"] in names])]
+        parts = [("", [i for i, o in enumerate(unique_names(g)["ops"]) if o["name"] in names])]
     elif a.range:
         i, j = (int(x) for x in a.range.split(":"))
         parts = [("", list(range(i, j)))]
@@ -735,7 +806,7 @@ def main():
         parts = [("", None)]
     for sub, idx in parts:
         d = export_problem(ir_dir, Path(a.out_dir) / sub if sub else a.out_dir, op_indices=idx,
-                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", specs=specs)
+                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom")
         line = {"problem": str(d)}
         if a.build_check:
             r = build_and_run(d, arch=a.arch)
