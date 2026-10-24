@@ -69,10 +69,11 @@
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW)
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW)
 {
-    const int OH = (IH + 2*PH - KH) / SH + 1;
-    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    const int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     const ptrdiff_t w_oc_stride_bytes = (ptrdiff_t)IC * KH * KW * sizeof(_Float16);
     const ptrdiff_t out_oc_stride_bytes = (ptrdiff_t)OH * OW * sizeof(_Float16);
 
@@ -110,10 +111,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                      * tap, broadcast the single input scalar and macc-add
                      * vl weight lanes (one per oc in the current block). */
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh * SH - PH + kh;
+                        int ih = oh * SH - PH + kh * DH;
                         if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PW + kw;
+                            int iw = ow * SW - PW + kw * DW;
                             if (iw < 0 || iw >= IW) continue;
                             for (int ic = 0; ic < IC; ic++) {
                                 /* Scalar input element shared across
