@@ -226,7 +226,12 @@ The default run checks and times what it did before. Inside it:
   in place, without a copy; device values come back through one pinned staging buffer; the
   scans are split across up to 8 threads. Max is order-independent, so the results are
   identical.
-- **Big data files are mmapped** instead of `fread` (the > 1 GiB `MB_DATA_PATH` case).
+- **Big data files are mmapped** instead of `fread` (the > 1 GiB `MB_DATA_PATH` case). Such a
+  driver is not self-contained, but it is not local-only either. KernelBlaster's
+  `SSHEvaluator` copies `data.bin` to each GPU host once per data sha1, before leasing a GPU,
+  and sets `MB_DATA_PATH` for the run or the persistent host. On SwinV2 (2.27 GB) to firesim2,
+  the copy takes 23.5 s once, a step candidate on the host 3.9 s, and the timings match one
+  process per run (KernelBlaster `docs/fast_paths.md`).
 - **Timing events are recorded on `cudaStreamLegacy`.** With legacy-stream kernels this is
   stream 0, as before. In a per-thread-default-stream build the event still waits for every
   blocking stream, so work a slot puts on its own streams stays inside the measurement.
