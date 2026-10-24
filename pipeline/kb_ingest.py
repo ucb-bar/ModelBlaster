@@ -105,7 +105,8 @@ def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float
     for r in w["winners"]:
         spec = specs.get(r["op"])
         if spec is None:
-            report.append({"op": r["op"], "impl_id": r["id"], "status": "unknown-op"})
+            st = "fusion-not-accepted" if r["op"].startswith("fused__") else "unknown-op"
+            report.append({"op": r["op"], "impl_id": r["id"], "status": st})
             continue
         if signature_sha(spec.signature) != r["signature_sha"]:
             report.append({"op": r["op"], "impl_id": r["id"], "status": "stale-signature"})
@@ -146,12 +147,22 @@ def cache_sources(ir_dir: Path, cache: CudaCache, arch: str, specs: dict) -> tup
     return src, tags, used
 
 
-def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: Path | None = None) -> dict:
-    """Whole-IR export with cached winners, build and run; mark entries."""
+def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: Path | None = None,
+              fusion_registry: Path | None = None) -> dict:
+    """Whole-IR export with cached winners (and accepted fusions applied),
+    build and run; mark entries."""
     from .kb_export import build_and_run, export_problem
 
     ir_dir = Path(ir_dir)
     sm = arch.removeprefix("sm_")
+    fused_names = []
+    if fusion_registry is not None:
+        from .kb_proposals import apply_accepted, write_variant_ir
+        g, fused, fused_names = apply_accepted(json.loads((ir_dir / "graph.json").read_text()),
+                                               Path(fusion_registry), specs)
+        if fused_names:
+            specs = {**specs, **fused}
+            ir_dir = write_variant_ir(ir_dir, g, Path(tempfile.mkdtemp(prefix="mb_fused_ir_")))
     src, tags, used = cache_sources(ir_dir, cache, f"sm_{sm}", specs)
     if not used:
         return {"ir": ir_dir.name, "status": "no-cache-entries"}
@@ -165,7 +176,7 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
         ir_name = man["ir_name"]
         slot_of_entry = {s["entry"]: s["id"] for s in man["slots"]}
         out = {"ir": ir_name, "passed": res.get("passed"), "partition_us": res.get("partition_us"),
-               "slots": {}}
+               "fused": fused_names, "slots": {}}
         for entry, e in used.items():
             sid = slot_of_entry[entry]
             sc = res.get("slots", {}).get(sid, {})
@@ -190,15 +201,20 @@ def main():
     ap.add_argument("--cache", default=str(DEFAULT_CACHE))
     ap.add_argument("--verify", nargs="*", default=[], help="IR dirs to verify at model level")
     ap.add_argument("--arch", default="75")
+    ap.add_argument("--fusion-registry", default=None,
+                    help="accepted fusions here are known ops (default kernels/cuda/fusion_registry.json)")
     a = ap.parse_args()
+    from .kb_proposals import DEFAULT_REGISTRY, accepted_fused_specs
     from .reference_kernels import KERNEL_SPECS
 
+    specs = {**KERNEL_SPECS, **accepted_fused_specs(Path(a.fusion_registry or DEFAULT_REGISTRY), KERNEL_SPECS)}
     cache = CudaCache(Path(a.cache))
     if a.winners:
-        for r in ingest(Path(a.winners), cache, KERNEL_SPECS):
+        for r in ingest(Path(a.winners), cache, specs):
             print(json.dumps(r))
     for d in a.verify:
-        print(json.dumps(verify_ir(Path(d), cache, arch=a.arch, specs=KERNEL_SPECS)))
+        print(json.dumps(verify_ir(Path(d), cache, arch=a.arch, specs=specs,
+                                   fusion_registry=Path(a.fusion_registry or DEFAULT_REGISTRY))))
 
 
 if __name__ == "__main__":
