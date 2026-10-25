@@ -30,6 +30,7 @@
 #   [ROLLOUTS=3] [STEPS=5] [REMEASURE=5] [CACHE=dir] [PLUGIN=stubs.py] [MB_PATH_EXCLUDE=pattern] \
 #   [GPUS=auto|all|0,2] [SSH_HOST="user@h1 user@h2" REMOTE_DIR=dir [CVD=auto|ids] [SSH_KEY=file]] \
 #   [RUNTIME=auto|host|process] [GPU_MODEL="NVIDIA L40S"] \
+#   [KNOWLEDGE_MODE=v2|v1] [NCU=off|best|all] [MODEL_SIMPLE=m MODEL_HARD=m] [UPKEEP_MODEL=m] \
 #       bash gpu_eval/tools/kb_loop.sh IR_DIR WORK_DIR
 #
 # GPUs: KernelBlaster's runs, the re-measurement of proposals (with SSH_HOST)
@@ -63,12 +64,17 @@ else
   EVAL+=(--evaluator local --gpus "${GPUS:-auto}")
 fi
 GPU=(); [ -z "${GPU_MODEL:-}" ] || GPU=(--gpu-model "$GPU_MODEL")
+# knowledge v2 folds this work dir's graph-hint decisions into KernelBlaster's graph hypotheses
+HINTS_SYNC=(); [ "${KNOWLEDGE_MODE:-v2}" != v2 ] || HINTS_SYNC=(--graph-hints "$W/graph_hints.json")
 run_kb() {  # out problem(s): KernelBlaster continues a killed run from its journals (--resume)
   local out=$1; shift
   # in the background so a signal to this script reaches it (forwarded once: it stops cleanly, exit 75)
   $PY "$KB/scripts/run_multislot.py" "$@" --out "$out" --knowledge-dir "$KNOWLEDGE" --model "$MODEL" \
       ${REFLECT_MODEL:+--reflect-model "$REFLECT_MODEL"} --arch "$ARCH" --rollouts "$ROLLOUTS" \
       --steps "$STEPS" --export-winners "$W/winners" ${PLUGIN:+--plugin "$PLUGIN"} "${EVAL[@]}" "${GPU[@]}" \
+      --knowledge "${KNOWLEDGE_MODE:-v2}" --ncu "${NCU:-off}" ${MODEL_SIMPLE:+--model-simple "$MODEL_SIMPLE"} \
+      ${MODEL_HARD:+--model-hard "$MODEL_HARD"} ${UPKEEP_MODEL:+--upkeep-model "$UPKEEP_MODEL"} \
+      "${HINTS_SYNC[@]}" \
       $RESUME_FLAG >> "$out.log" 2>&1 &
   KB_PID=$!
   local rc=0; wait "$KB_PID" || rc=$?
