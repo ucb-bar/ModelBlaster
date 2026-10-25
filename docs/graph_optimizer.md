@@ -499,6 +499,9 @@ python -m modelblaster.pipeline.kb_graph_opt $L3/8_ResNetBasicBlock $L3/9_ResNet
 # GPU pool: --parallel-hints auto|N  --gpus auto|all|0,2  or  --ssh-host H --cuda-visible-devices auto
 # everything on remote GPUs (the local host only builds):
 #   --ssh-host u@gpuhost --ssh-key K --cuda-visible-devices 2,3 --remote-dir /scratch/u/mb --arch 89
+# KernelBlaster's search, passed to every run_multislot: --knowledge v2 (default; also syncs W/graph_hints.json
+#   into KB's graph hypotheses) | v1, --ncu off|best|all, --reward e2e|slot, --model-simple M --model-hard M
+#   [--hetero-policy P | --models-config F], --upkeep-model M, anything else verbatim with --kb-arg=--flag
 
 # pieces
 python -m modelblaster.pipeline.kb_plan profile IR... --out P [--hints H --cache C]
