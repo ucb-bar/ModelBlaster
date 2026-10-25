@@ -513,6 +513,11 @@ python -m modelblaster.pipeline.graph_hints show H
 STRATEGY=plan bash gpu_eval/tools/kb_loop.sh IR W        # one round
 ```
 
+To compare configurations of this flow, use `python -m modelblaster.pipeline.kb_ablate run SPEC`
+(`entry: "graph_opt"`). It runs the arms x repeats in isolated work dirs with frozen code,
+interleaves them, enforces a budget and writes a paired-statistics report; see
+[ablations.md](ablations.md).
+
 To make the LLM calls on another machine, set `KB_LLM_SERVER_URL=http://127.0.0.1:18080` and
 `KB_LLM_SERVER_TOKEN_FILE=...` before starting the run. This uses an `ssh -L` tunnel to a
 KernelBlaster `llm_server` running there. The KB subprocesses inherit the variables (KernelBlaster
