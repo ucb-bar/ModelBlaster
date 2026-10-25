@@ -85,6 +85,7 @@ from pathlib import Path
 from . import graph_hints as gh
 from . import kb_resume
 from . import kb_telemetry as kbt
+from . import kb_trace
 from .kb_export import base_slot_id, export_problem
 from .kb_ingest import CudaCache, cache_plan, ingest, verify_ir
 from .kb_plan import export_plan, make_plan, profile_ir
@@ -135,6 +136,10 @@ class Config:
     # --ssh-host GPUs); builtin = built and run by ModelBlaster here (profiles / verification on the
     # default GPU, re-measurement on a leased local GPU); auto = kb with ssh_hosts, else builtin
     mb_evaluator: str = "auto"
+    # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
+    # KernelBlaster run's <out>/trace (prompts, responses, candidates, builds, driver output):
+    # full | meta (hashes and sizes only) | off; env KB_TRACE
+    trace: str = field(default_factory=lambda: os.getenv("KB_TRACE") or "full")
 
 
 _LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices")
@@ -314,6 +319,7 @@ class KBRunner:
         self.calls = 0
         self.telemetry: list = []                     # each run's run-level telemetry (kb_telemetry)
         self.gpus: list = []                          # the GPU each problem's run recorded (kb_eval.recorded_gpus)
+        self.commands: dict = {}                      # out dir -> its command line
 
     def command(self, problems: list[Path], out: Path, *, steps: int | None = None,
                 winners: Path | None = None, parallel_problems: int | None = None) -> list[str]:
@@ -348,6 +354,9 @@ class KBRunner:
             cmd += ["--gpu-model", c.gpu_model]
         for p in c.plugins:
             cmd += ["--plugin", str(p)]
+        if kb_trace.kb_supports_trace(c.kb):
+            cmd += ["--trace", kb_trace._level(c.trace)]
+        self.commands[str(out)] = cmd                 # the trace's mb.kb_run record
         return cmd
 
     def start(self, problems: list[Path], out: Path, **kw) -> subprocess.Popen:
@@ -377,6 +386,13 @@ class KBRunner:
                 self.gpus.append({"run": r["_dir"], "gpu": r.get("gpu"), "arch": r.get("arch")})
             res.append(r)
         self.telemetry.append(kbt.kb_run_summary(out))
+        # the run as a whole; its own trace store has the steps inside it
+        kb_trace.record("kb_run", run_dir=str(out), rc=rc, cmd=self.commands.get(str(out)),
+                        kb_trace=str(out / "trace") if (out / "trace" / "index.jsonl").exists() else None,
+                        files=kb_trace.files({"log": out.with_suffix(".log"), "summary.json": out / "summary.json"}),
+                        problems=[{k: r.get(k) for k in ("problem", "run_id", "final_ok", "baseline_e2e_us",
+                                                          "final_e2e_us", "e2e_speedup", "llm_calls", "_dir")}
+                                  for r in res])
         return res
 
     def run(self, problems: list[Path], out: Path, *, steps: int | None = None,
@@ -654,6 +670,11 @@ def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases |
     own runs on the leased local GPU (its lock held)."""
     if not (ro.get("final_ok") and rv.get("final_ok")) or not cfg.remeasure:
         return None
+    with kb_trace.get().scope(mb_stage="remeasure", hint=(job.get("hint") or {}).get("id")):   # its runs' driver output
+        return _measure_hint(job, ro, rv, cfg, leases)
+
+
+def _measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None) -> list | None:
     pair = [(job["orig"], best_sources(Path(ro["_dir"]))), (job["variant"], best_sources(Path(rv["_dir"])))]
     ev = kb_eval_for(cfg) if use_kb_eval(cfg) else None
     if ev is None:
@@ -684,6 +705,8 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
     if "early" in job:
         ev.update(decision="rejected", why=job["early"])
         gh.record_decision(doc, h, ev)
+        kb_trace.record("hint", rid_parts=(h["id"],), hint=h["id"], hint_kind=h.get("kind"), mb_stage="decide",
+                        decision="rejected", why=ev["why"], evidence=ev)
         return {"hint": h["id"], "status": "rejected", "why": ev["why"]}
     ev.update(problem=job["stem"], original_us=ro.get("final_partition_us"), variant_us=rv.get("final_partition_us"),
               kb_original_us=ro.get("final_partition_us"), kb_variant_us=rv.get("final_partition_us"),
@@ -714,7 +737,24 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
         changed = [s["id"] for s in man["slots"]
                    if s["op"].startswith("fused__") or s.get("variant_of")]
         res["cached"] = _ingest_slots(cache, job["variant"], rv, changed, job["specs"], h["id"])
+    _trace_hint(job, ro, rv, times, ev, res)
     return res
+
+
+def _trace_hint(job: dict, ro: dict | None, rv: dict | None, times, ev: dict, res: dict) -> None:
+    """The hint decision's record: both problems (IR graphs, manifests), KernelBlaster's two
+    results and run dirs (their traces), the re-measured times, the decision."""
+    if not kb_trace.get().enabled():
+        return
+    o, v = Path(job["orig"]), Path(job["variant"])
+    kb_trace.record("hint", rid_parts=(job["hint"]["id"],), hint=job["hint"]["id"], hint_kind=job["hint"].get("kind"),
+                    mb_stage="decide", decision=res["status"], why=ev.get("why"), gain=res.get("gain"),
+                    evidence=ev, remeasured=times, provenance=job.get("prov"),
+                    kb_dirs={"original": (ro or {}).get("_dir"), "variant": (rv or {}).get("_dir")},
+                    files=kb_trace.files({"orig_ir/graph.json": o.parent / "orig_ir" / "graph.json",
+                                          "variant_ir/graph.json": v.parent / "variant_ir" / "graph.json",
+                                          "orig/manifest.json": o / "manifest.json",
+                                          "variant/manifest.json": v / "manifest.json"}))
 
 
 def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: KBRunner, cache: CudaCache,
@@ -810,10 +850,12 @@ def run(irs: list[Path], work: Path, cfg: Config) -> dict:
     with work_lock(work):
         tel = kbt.load(cfg.kb)                    # telemetry (kb_telemetry.py); a no-op without it
         tel.configure(work / "telemetry.jsonl")
+        kb_trace.configure(cfg.kb, work, cfg.trace)   # trace store (kb_trace.py); a no-op when off
         try:
-            with tel.span("mb.run", collect=True):
+            with tel.span("mb.run", collect=True), kb_trace.get().scope(mb="graph_opt"):
                 return _run(irs, work, cfg)
         finally:
+            kb_trace.close()
             tel.close()
 
 
