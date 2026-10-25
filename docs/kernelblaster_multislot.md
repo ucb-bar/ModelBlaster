@@ -416,3 +416,19 @@ paired geo-mean ratios with bootstrap CIs and permutation / Wilcoxon p-values. S
   and the bridge builds per-slot files; open RISC-V issues are listed in the KB bug-fix notes.
 - The KB submodule tracks `kris-dong/KernelBlaster` `feat/multislot`; merge it into
   `backend-refactor` (and upstream) after review.
+
+## Trace store
+
+Every KernelBlaster run writes `OUT/trace/` (KernelBlaster `docs/trace.md`). For each step
+it records:
+
+- the exact prompts and raw responses
+- every candidate source, winning and losing, and every fix attempt
+- the build commands and compiler output
+- the raw driver and NCU output
+- the decision, with links to `result.json` `steps[]`, the outcome id and the telemetry
+  span
+
+The graph optimiser adds ModelBlaster's own steps in `WORK/trace/` (`pipeline/kb_trace.py`,
+`docs/graph_optimizer.md`, "Trace"). Use `scripts/trace_view.py` in the KernelBlaster
+checkout to view a trace.

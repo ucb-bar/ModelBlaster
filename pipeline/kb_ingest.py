@@ -136,6 +136,9 @@ def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float
                                   "techniques": r.get("techniques", [])})
         report.append({"op": r["op"], "impl_id": r["id"], "status": st, "speedup": sp})
     cache.save()
+    from . import kb_trace
+    kb_trace.record("ingest", mb_stage="ingest", winners=str(winners_json), report=report,
+                    files=kb_trace.files({"winners.json": winners_json}))
     return report
 
 
@@ -295,8 +298,10 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
         vir = write_variant_ir(ir_dir, plan["graph"], tmp / "ir")
         d = export_problem(vir, tmp / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
                            sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
+        from . import kb_trace
         with kbt.get().span("mb.verify.run", ir=ir_dir.name,
-                            evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp:
+                            evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp, \
+                kb_trace.get().scope(mb_stage="verify", ir=ir_dir.name):
             if kbeval is not None:
                 res = run_problem(kbeval, d, arch=sm, work=tmp / "kb_time", reps=1, gpu_model=gpu_model,
                                   allow_mismatch=allow_gpu_mismatch, name="verify")
@@ -328,6 +333,9 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
         if not res.get("passed"):
             out["log"] = res.get("log", "")[-1500:]
         cache.save()
+        kb_trace.record("verify", mb_stage="verify", ir=ir_name, passed=out["passed"], result=out,
+                        log=kb_trace.get().put(res.get("log")) if res.get("log") else None,
+                        files=kb_trace.files({"manifest.json": d / "manifest.json", "graph.json": vir / "graph.json"}))
         return out
     finally:
         if work is None:
