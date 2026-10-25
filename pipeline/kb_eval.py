@@ -161,6 +161,9 @@ class KBEval:
                                    + log.read_text()[-1500:]) from None
             if sp is not None and hasattr(sp, "set"):
                 sp.set(models=res.get("models"), seconds=res.get("seconds"), error=res.get("error"))
+            from . import kb_trace
+            kb_trace.record("kb_time", name=name, evaluator=self.evaluator, cmd=[str(c) for c in cmd],
+                            rc=cp.returncode, files=kb_trace.files({"jobs": jf, "result": of, "log": log}))
         err = res.get("error")
         if err:
             if "NoDevice" in err:
