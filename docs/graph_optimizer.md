@@ -666,3 +666,18 @@ chain itself.
   when it closes.
 - With `--remeasure 0` the decision uses KernelBlaster's two final numbers, which in a pool of mixed
   GPU models can come from different models (each problem is pinned to one model, the pair is not).
+
+## Trace
+
+`WORK/trace/` holds a full trace of the run (`--trace full|meta|off`, env `KB_TRACE`,
+default `full`; `pipeline/kb_trace.py` loads KernelBlaster's `kernelblaster.trace`).
+ModelBlaster records each step: `mb.profile`, `mb.plan`, `mb.export`, `mb.kb_run`,
+`mb.ingest`, `mb.hint`, `mb.kb_time`, `mb.verify` and `mb.model_run`. It also records the
+build and driver output of its own runs, including every re-timing run. Each step is
+linked to the KernelBlaster run's own `OUT/trace`, which holds that run's prompts,
+responses, candidates, builds and decisions.
+
+To view a trace, run `python KB/scripts/trace_view.py WORK --mb` or `... WORK --list`.
+For the record formats, see KernelBlaster `docs/trace.md`.
+
+Traces contain prompts and generated code. Secrets are scrubbed.
