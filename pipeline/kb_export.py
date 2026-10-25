@@ -1389,6 +1389,8 @@ int main() {
 # ---------------------------------------------------------------- local build/run (MB-side checks)
 
 def parse_driver_output(text: str) -> dict:
+    from . import kb_trace
+    kb_trace.get().output("driver", text)      # raw run output (graph optimiser trace; no-op otherwise)
     res = {"passed": bool(re.search(r"^passed$", text, re.M)), "outputs": {}, "slots": {},
            "slot_us": {}, "op_us": {}, "partition_us": None, "partition_graph_us": None,
            "graph_skip": None, "phase_ms": {},
@@ -1535,9 +1537,11 @@ def _build_and_run_process(problem_dir, *, arch, sources, work, nvcc, timeout, r
     work.mkdir(parents=True, exist_ok=True)
     (work / "kernels.cu").write_text(assemble(problem_dir, sources))
     exe = work / "problem"
-    cp = subprocess.run([nvcc, *NVCC_FLAGS, f"-arch=sm_{arch}", *(PTDS_FLAGS if graph else []), *cupti_flags(nvcc), "-o", str(exe),
-                         str(work / "kernels.cu"), str(problem_dir / "driver.cpp")],
-                        capture_output=True, text=True, timeout=timeout)
+    cmd = [nvcc, *NVCC_FLAGS, f"-arch=sm_{arch}", *(PTDS_FLAGS if graph else []), *cupti_flags(nvcc), "-o", str(exe),
+           str(work / "kernels.cu"), str(problem_dir / "driver.cpp")]
+    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    from . import kb_trace
+    kb_trace.get().tool("nvcc", cmd, cp.returncode, cp.stdout + cp.stderr)
     if cp.returncode != 0:
         return {"passed": False, "stage": "compile", "log": (cp.stdout + cp.stderr)[-4000:]}
     if runs <= 0:
@@ -1571,7 +1575,9 @@ def supports_host(problem_dir) -> bool:
 
 
 def _nvcc(args, timeout):
+    from . import kb_trace
     cp = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    kb_trace.get().tool("nvcc", list(args), cp.returncode, cp.stdout + cp.stderr)
     return cp.returncode, (cp.stdout + cp.stderr)[-4000:]
 
 

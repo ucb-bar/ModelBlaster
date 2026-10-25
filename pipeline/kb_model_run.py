@@ -403,6 +403,8 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
                 shutil.rmtree(d, ignore_errors=True)
         for d in (work / "kb_time").glob("*_kbwork"):
             shutil.rmtree(d, ignore_errors=True)
+    from . import kb_trace
+    kb_trace.record("model_run", mb_stage="model_run", ir=Path(ir_dir).name, work=str(work), result=out)
     return out
 
 
