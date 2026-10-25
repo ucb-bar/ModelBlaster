@@ -106,7 +106,7 @@ class KBEval:
         return replace(self, evaluator="local", gpus=str(dev["ident"]), devices=1)
 
     def command(self, jobs: Path, out: Path, *, arch: str, work: Path, gpu_model: str | None = None,
-                telemetry: Path | None = None) -> list[str]:
+                telemetry: Path | None = None, driver_env: dict | None = None) -> list[str]:
         cmd = [self.python, str(self.root / "scripts" / "time_problems.py"), str(jobs), "--out", str(out),
                "--arch", str(arch).removeprefix("sm_"), "--evaluator", self.evaluator, "--runtime", self.runtime,
                "--devices", str(self.devices), "--timeout", str(self.timeout), "--work", str(work)]
@@ -130,10 +130,12 @@ class KBEval:
             cmd += ["--gpu-model", gpu_model]
         if telemetry is not None:
             cmd += ["--telemetry", str(telemetry)]
+        for k, v in (driver_env or {}).items():    # e.g. MB_WALL=1 (torch_baseline): every driver run
+            cmd += ["--driver-env", f"{k}={v}"]
         return cmd
 
     def run(self, jobs: list[dict], *, arch: str, work: Path, gpu_model: str | None = None,
-            name: str = "time") -> dict:
+            name: str = "time", driver_env: dict | None = None) -> dict:
         """Time ``jobs`` (``time_problems.py``'s job list) -> its result
         (``kernelblaster.time_problems/v1``); raises on a failure to run it,
         :class:`HardwareMismatch` when no GPU of ``gpu_model`` is there."""
@@ -147,7 +149,7 @@ class KBEval:
         jf.write_text(json.dumps({"jobs": jobs}))
         of.unlink(missing_ok=True)
         cmd = self.command(jf, of, arch=arch, work=work / f"{name}_kbwork", gpu_model=gpu_model,
-                           telemetry=work / f"{name}.telemetry.jsonl")
+                           telemetry=work / f"{name}.telemetry.jsonl", driver_env=driver_env)
         T = kbt.get()
         with T.span("mb.kb_time", evaluator=self.evaluator, jobs=len(jobs), gpu_model=gpu_model,
                     arch=f"sm_{str(arch).removeprefix('sm_')}") as sp:
@@ -293,8 +295,8 @@ def driver_result(row: dict) -> dict:
         "outputs", "slot_us", "op_us", "partition_us", "partition_graph_us", "graph_skip", "errors",
         "e2e_us", "e2e_basis", "ref_e2e_us", "ref_e2e_basis", "e2e_ratio", "attr_slot_us", "attr_op_us",
         "attr_sum_us", "attr_launches", "attr_slot_launches", "attr_skip", "launch_overhead_us",
-        "launch_overhead_graph_us", "launch_overhead_frac", "graph_nodes", "runtime", "eval_wall_s")}
-    for k in ("outputs", "slot_us", "op_us", "attr_slot_us", "attr_op_us", "attr_slot_launches"):
+        "launch_overhead_graph_us", "launch_overhead_frac", "graph_nodes", "runtime", "eval_wall_s", "timing")}
+    for k in ("outputs", "slot_us", "op_us", "attr_slot_us", "attr_op_us", "attr_slot_launches", "timing"):
         res[k] = res[k] or {}
     res["errors"] = res["errors"] or []
     res.update(passed=bool(row.get("ok")), slots=row.get("slot_checks") or {}, stage=row.get("stage"),

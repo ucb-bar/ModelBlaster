@@ -841,6 +841,9 @@ def collect_graph_opt(rdir: Path, prices: dict | None, inputs: list | None = Non
                         "base_us": base, "final_us": fin, "speedup": (base / fin) if base and fin else None,
                         "partition_speedup": _num(v.get("speedup")), "model_speedup": _num(v.get("model_speedup")),
                         "torch_us": _torch_keys(v), "hints_accepted": len(v.get("hints") or []),
+                        # kb_model_run --torch-baseline: ours and torch timed interleaved on one GPU
+                        "vs_torch_paired": _num(v.get("speedup_vs_torch")),
+                        "vs_torch_wall": _num(v.get("speedup_vs_torch_wall")),
                         "gpu": v.get("model_gpu") or v.get("verify_gpu")}
         gpu = {"models": sorted(m for m in models if m), "uuids": sorted(uuids)}
     # LLM usage per IR from the KernelBlaster runs' result.json files (problem names start with the IR's)
@@ -1423,7 +1426,11 @@ def build_report(root: Path, *, force: bool = False) -> dict:
             t = d.get("torch_us") or (torch_base or {}).get(p)
             rows.append({"arm": r["arm"], "repeat": r["repeat"], "seed": r["seed"], "run": rid, "problem": p,
                          "run_status": r["status"], **{k: v for k, v in d.items()},
-                         "vs_torch": (t / d["final_us"]) if t and d.get("final_us") else None})
+                         # the paired ratio of the model run's torch comparison when there is one
+                         # (same GPU, same session, same timing; docs/gpu_harness_perf.md "Against
+                         # PyTorch"), else torch_us over the run's own final time
+                         "vs_torch": d.get("vs_torch_paired") or
+                         ((t / d["final_us"]) if t and d.get("final_us") else None)})
     arms = list(spec["arms"])
     issues = comparability(runs, manifests)
     if not any((manifests.get(r["id"]) or {}).get("gpu_recorded", {}).get("models") for r in runs):
@@ -1448,6 +1455,7 @@ def build_report(root: Path, *, force: bool = False) -> dict:
                       "geomean_speedup": geomean([x["speedup"] for x in ok]),
                       "geomean_final_us": geomean([x["final_us"] for x in ok]),
                       "geomean_vs_torch": geomean([x["vs_torch"] for x in ok if x.get("vs_torch")]),
+                      "geomean_vs_torch_wall": geomean([x.get("vs_torch_wall") for x in ok if x.get("vs_torch_wall")]),
                       "improved": sum(1 for x in ok if x["speedup"] and x["speedup"] > 1.01),
                       "wins": wins, "llm_calls": calls,
                       "input_tokens": sum(x["input_tokens"] for x in t),
@@ -1536,13 +1544,13 @@ def render_markdown(rep: dict) -> str:
                  f"| {k.get('snapshot') or ('prebuilt v2' if k.get('prebuild') else 'empty')} | "
                  f"{json.dumps(d['mb_cache']) if d['mb_cache'] else 'fresh per run'} |")
     L += ["", "## Per arm", "",
-          "| arm | runs (failed) | results ok/all | geo-mean speedup | geo-mean final us | vs torch | improved | wins "
+          "| arm | runs (failed) | results ok/all | geo-mean speedup | geo-mean final us | vs torch | vs torch wall | improved | wins "
           "| LLM calls | tokens in / out | $ | $/win | wall s/run | truncation | GPUs |",
-          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for a, d in rep["per_arm"].items():
         L.append(f"| {a} | {d['runs']}/{d['runs_planned']} ({d['runs_failed']}) | {d['results_ok']}/{d['results']} | "
                  f"{_f(d['geomean_speedup'])} | {_f(d['geomean_final_us'], 1)} | {_f(d['geomean_vs_torch'])} | "
-                 f"{d['improved']} | {d['wins']} | {d['llm_calls']} | {d['input_tokens']} / {d['output_tokens']} | "
+                 f"{_f(d.get('geomean_vs_torch_wall'))} | {d['improved']} | {d['wins']} | {d['llm_calls']} | {d['input_tokens']} / {d['output_tokens']} | "
                  f"{d['usd']:.4f} | {_f(d['usd_per_win'], 4)} | {_f(d['wall_s_mean'], 0)} | "
                  f"{_f(d['truncation_rate'], pct=True)} | {', '.join(d['gpus']) or '-'} |")
     arms = list(rep["arms"])
@@ -1585,7 +1593,7 @@ def render_markdown(rep: dict) -> str:
 
 
 ROW_FIELDS = ("arm", "repeat", "seed", "problem", "run", "run_status", "ok", "basis", "base_us", "final_us",
-              "speedup", "partition_speedup", "model_speedup", "vs_torch", "wins", "llm_calls", "input_tokens",
+              "speedup", "partition_speedup", "model_speedup", "vs_torch", "vs_torch_wall", "wins", "llm_calls", "input_tokens",
               "output_tokens", "usd", "truncated", "seconds", "gpu", "error")
 
 

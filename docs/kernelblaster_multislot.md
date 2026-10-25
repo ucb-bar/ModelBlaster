@@ -78,6 +78,7 @@ from the same GPU model, by default from one GPU. No GPU of that model is an err
 | MB | `pipeline/kb_ingest.py` | winners → CUDA kernel cache (shape guard), model-level verification |
 | MB | `pipeline/kb_proposals.py` | fusion: fused op + `FusedKernelSpec`, variant export, accept/reject registry |
 | MB | `pipeline/kb_model_run.py` | the model's result: winners composed into one whole-model runtime, checked, timed by graph replay against the seeds (and the sum of the partitions) on the components' GPU model |
+| MB | `pipeline/torch_baseline.py`, `pipeline/torch_bench.py` | the model's result against the original PyTorch module (eager, CUDA graph, `torch.compile`; TF32 off / on) on the same GPU, interleaved, GPU and wall-clock time ([gpu_harness_perf.md](gpu_harness_perf.md), "Against PyTorch") |
 | MB | `pipeline/kb_eval.py` | ModelBlaster's GPU runs (model result; with `--ssh-host` the graph optimiser's profiles, re-measurement and verification) through KernelBlaster's local / ssh evaluators (`KBEval`, `run_problem`); the GPU model and arch the runs recorded (`required_hardware`, `check_device`); the evaluator flags |
 | MB | `pipeline/op_classes.py` | op → class (gemm, conv, reduction, elementwise, data_movement, attention, scan, other) |
 | MB | `gpu_eval/harness/walk_torch.py` | reference values (torch IR walk; runs fused ops' `sub_ops`) |

@@ -359,6 +359,13 @@ workers per GPU: one builds while the other times.
   error (`model_error` in `summary.json`); `--allow-gpu-mismatch` times anyway, with warnings.
   `summary.json` gets `model_gpu`, `model_device` and `model_hardware_match` per IR
   ([gpu_harness_perf.md](gpu_harness_perf.md), "The model's result").
+- The model run also times the original PyTorch module against it on the same GPU
+  (`--torch-baseline auto|on|off`, default auto; `--torch-python` for the timing host,
+  `--torch-source`, `--torch-rounds`, `--torch-variants`). `summary.json` gets the model run's
+  `torch_*` fields per IR (`torch_status`, `torch_reason`, `torch_us`, `torch_<variant>_us`,
+  `torch_<variant>_wall_us`, `torch_wall_us`, ...) and `speedup_vs_torch` (GPU time),
+  `speedup_vs_torch_wall` and `speedup_vs_torch_eager`, and `model_runtime.json` the full
+  table ([gpu_harness_perf.md](gpu_harness_perf.md), "Against PyTorch").
 
 **Measured** (`gpu_eval/work/graphopt_par`, scratch). The model has four independent
 conv → {bn, sigmoid, tanh, silu} branches with mixed 1×1 / 3×3 convs (`cat` output). The run is
