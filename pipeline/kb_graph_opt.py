@@ -54,7 +54,9 @@ devices.
         [--max-variants 3 --remeasure 5 --accept-gain 0.03] [--arch 75] \\
         [--parallel-hints auto|N] [--gpus auto|all|0,2] \\
         [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]] \\
-        [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch] [--mb-evaluator auto|kb|builtin]
+        [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch] [--mb-evaluator auto|kb|builtin] \\
+        [--knowledge v1|v2] [--ncu off|best|all] [--reward e2e|slot] [--model-simple M --model-hard M] \\
+        [--hetero-policy P] [--models-config F] [--upkeep-model M] [--kb-arg=--flag --kb-arg=value]
 
 Work dir: ``graph_hints.json`` (modelblaster.graph_hints/v1), ``cache/``
 (mb-cuda-cache/1), ``knowledge/`` (KernelBlaster), ``state.json``,
@@ -135,9 +137,21 @@ class Config:
     # --ssh-host GPUs); builtin = built and run by ModelBlaster here (profiles / verification on the
     # default GPU, re-measurement on a leased local GPU); auto = kb with ssh_hosts, else builtin
     mb_evaluator: str = "auto"
+    # KernelBlaster's knowledge and search (run_multislot flags of the same names): v2 also syncs
+    # this work dir's graph_hints.json into its graph hypotheses at the start of every KB run
+    knowledge: str = "v2"
+    ncu: str = "off"
+    reward: str | None = None
+    model_simple: str | None = None
+    model_hard: str | None = None
+    hetero_policy: str | None = None
+    models_config: str | None = None
+    upkeep_model: str | None = None
+    # anything else for run_multislot, verbatim (e.g. --kb-arg=--explore-frac --kb-arg=0.2)
+    kb_args: list = field(default_factory=list)
 
 
-_LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices")
+_LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices", "kb_args")
 _MANUAL_FIELDS = ("kb", "model", "reflect_model", "python", "ssh_key", "remote_dir", "gpus", "parallel_hints",
                   "runtime", "gpu_model", "allow_gpu_mismatch", "mb_evaluator", *_LIST_FIELDS)
 
@@ -326,6 +340,14 @@ class KBRunner:
             cmd += ["--resume"]
         if c.reflect_model:
             cmd += ["--reflect-model", c.reflect_model]
+        cmd += ["--knowledge", c.knowledge, "--ncu", c.ncu]
+        if c.knowledge == "v2":
+            cmd += ["--graph-hints", str(self.knowledge.parent / "graph_hints.json")]
+        for flag, v in (("--reward", c.reward), ("--model-simple", c.model_simple), ("--model-hard", c.model_hard),
+                        ("--hetero-policy", c.hetero_policy), ("--models-config", c.models_config),
+                        ("--upkeep-model", c.upkeep_model)):
+            if v:
+                cmd += [flag, str(v)]
         if winners is not None:
             cmd += ["--export-winners", str(winners)]
         if parallel_problems:
@@ -348,7 +370,7 @@ class KBRunner:
             cmd += ["--gpu-model", c.gpu_model]
         for p in c.plugins:
             cmd += ["--plugin", str(p)]
-        return cmd
+        return cmd + list(c.kb_args)
 
     def start(self, problems: list[Path], out: Path, **kw) -> subprocess.Popen:
         out.mkdir(parents=True, exist_ok=True)
@@ -1123,6 +1145,8 @@ def main():
                          "KernelBlaster's evaluator on the runs' pool (local --gpus or the --ssh-host GPUs); builtin "
                          "= built and run here (default GPU / a leased local GPU); auto (default): kb with "
                          "--ssh-host, else builtin")
+    ap.add_argument("--kb-arg", action="append", default=[],
+                    help="extra run_multislot argument, verbatim (repeatable; use --kb-arg=--flag for dashes)")
     for k, v in asdict(Config(kb=Path("."))).items():
         if k in _MANUAL_FIELDS:
             continue
@@ -1134,7 +1158,7 @@ def main():
                  parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
                  cuda_visible_devices=a.cuda_visible_devices, ssh_key=a.ssh_key, remote_dir=a.remote_dir,
                  runtime=a.runtime, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
-                 mb_evaluator=a.mb_evaluator,
+                 mb_evaluator=a.mb_evaluator, kb_args=a.kb_arg,
                  **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in _MANUAL_FIELDS})
     try:
         print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))

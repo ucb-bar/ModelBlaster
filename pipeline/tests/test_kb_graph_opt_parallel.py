@@ -391,6 +391,15 @@ class CommandTest(unittest.TestCase):
         cmd = go.KBRunner(go.Config(kb=Path("/kb"), gpus="2,3"), Path("/k")).command([Path("/p")], Path("/o"))
         self.assertIn("--gpus 2,3", " ".join(cmd))
         self.assertNotIn("--parallel-problems", " ".join(cmd))
+        self.assertIn("--knowledge v2 --ncu off --graph-hints /graph_hints.json", " ".join(cmd))
+        self.assertNotIn("--model-hard", " ".join(cmd))
+        cfg = go.Config(kb=Path("/kb"), knowledge="v1", ncu="best", model_simple="s", model_hard="h",
+                        hetero_policy="category", upkeep_model="u", reward="slot", kb_args=["--explore-frac", "0.2"])
+        s = " ".join(go.KBRunner(cfg, Path("/w/knowledge")).command([Path("/p")], Path("/o")))
+        self.assertIn("--knowledge v1 --ncu best --reward slot --model-simple s --model-hard h", s)
+        self.assertIn("--hetero-policy category --upkeep-model u", s)
+        self.assertNotIn("--graph-hints", s)
+        self.assertTrue(s.endswith("--explore-frac 0.2"))
         self.assertEqual(go.auto_parallel_hints(0), 4)
         self.assertEqual(go.auto_parallel_hints(4), 8)
 
