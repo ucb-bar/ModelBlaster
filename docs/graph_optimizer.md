@@ -12,6 +12,7 @@ every non-obvious choice with the alternatives and why.
 
 ```
 IRs ──► profile (accepted hints applied, cached winners)          pipeline/kb_plan.profile_ir
+         │ (with --ssh-host every GPU step runs on the remote pool: "Where the GPU steps run")
          │ per-op times (driver MB_OP_US)
          ├─► MB proposals (fuse elementwise consumers, grow chains)  graph_hints.propose_from_profile
          ▼
@@ -260,17 +261,21 @@ workers per GPU: one builds while the other times.
 - `--gpus`, or `--ssh-host` (repeatable) with `--cuda-visible-devices` (`--ssh-key`,
   `--remote-dir`), are passed to every KernelBlaster run.
 - `--runtime auto|host|process` and `--gpu-model M` are passed to every KernelBlaster run as well.
-  `--gpu-model` limits the runs to GPUs of model M (none there is an error). Every `result.json`
-  records the GPU it was timed on (`gpu`: name, UUID, host, arch).
+  `--gpu-model` limits the runs to GPUs of model M (none there is an error). Without it, the model
+  the first profile ran on is passed (next section). Every `result.json` records the GPU it was
+  timed on (`gpu`: name, UUID, host, arch).
 - The GPU count comes from KernelBlaster's own `select_gpus`: auto takes the idle GPUs, else the
   least busy one, bounded by an externally set `CUDA_VISIBLE_DEVICES`.
-- Re-timing leases from the same pool as the KernelBlaster runs:
+- Re-timing leases from the same pool as the KernelBlaster runs, restricted to the flow's GPU model:
   - locally, one of this host's selected GPUs (ModelBlaster's own runs, the GPU lock held);
-  - with `--ssh-host`, one of the remote GPUs. The two bests are timed through KernelBlaster's
-    ssh evaluator pinned to that GPU (`scripts/time_problems.py`, persistent host, the remote
-    GPU lock taken per run), on the GPU model the two runs recorded.
+  - with `--ssh-host` (or `--mb-evaluator kb`), one of the pool's GPUs. The two bests are timed
+    through KernelBlaster's evaluator pinned to that GPU (`scripts/time_problems.py`, persistent
+    host, the GPU lock taken per run by KernelBlaster, not by the lease), on the GPU model the two
+    runs recorded.
 
-  The decision records the device it was timed on (`remeasured.device`).
+  The decision records the device it was timed on (`remeasured.device`, and `remeasure_device`
+  in `round.json`'s decisions), locally too.
+- `--mb-evaluator auto|kb|builtin`: where the profiles and the verification run (next section).
 - The model's result (`kb_model_run`, after the final verification) goes through the same
   evaluator: local pool or the `--ssh-host` GPUs. It times on the GPU model the rounds'
   KernelBlaster runs recorded, or `--gpu-model`. Where no GPU of that model is available it is an
@@ -323,6 +328,101 @@ kernels on a GPU another process kept busy, single LLM runs: the same noise as i
 caveats above, not an effect of the waves (the stub runs, with fixed decisions, are the
 equivalence check). Both final models verified. About $0.25 per run.
 
+## Where the GPU steps run
+
+A round has five GPU steps: the profile of every IR, the KernelBlaster runs, the re-measurement
+of the decisions, and at the end the model-level verification and the model's result. With
+`--ssh-host` all five go through KernelBlaster's evaluators on the same pool, so a run can use
+nothing but remote GPUs (the local host only builds). Without remote flags, the profiles, the
+verification and the re-measurement are ModelBlaster's own runs on this host, as before.
+
+| step | function | no remote flags (default) | `--ssh-host` (or `--mb-evaluator kb`) |
+|---|---|---|---|
+| profile (per-op times, CUPTI attribution, launch overhead: the planning inputs) | `kb_plan.profile_ir` | `build_and_run` on the default GPU, median of `--profile-runs` | `kb_eval.run_problem`: one job, `reps` = `--profile-runs`, median by partition time as `build_and_run` |
+| KernelBlaster runs | `KBRunner` (`run_multislot.py`) | local pool (`--gpus`) | ssh evaluator |
+| re-measurement | `measure_hint` → `kb_proposals.remeasure` | a leased local GPU, its lock held | KernelBlaster's evaluator pinned to a leased pool GPU |
+| verification | `kb_ingest.verify_ir` | `build_and_run` on the default GPU | `kb_eval.run_problem`, one full run |
+| model's result | `kb_model_run.model_runtime` | KernelBlaster's local evaluator | ssh evaluator |
+
+`--mb-evaluator kb` without `--ssh-host` sends the profiles, the verification and the
+re-measurement to KernelBlaster's local evaluator, on the `--gpus` pool, with its locks.
+`--mb-evaluator builtin` with `--ssh-host` keeps them local. When a KernelBlaster evaluator is
+asked for and the checkout has no `scripts/time_problems.py`, the run fails; it never falls back to
+the local GPU. `state.json` `gpus.mb_evaluator` records the choice.
+
+**What runs where.** The profile and the verification export the IR here, as before, and the
+reference walk (`walk_torch`) runs here on the CPU at export. The inputs, the weights and every
+op's reference output are linked into the problem (`data.bin`; above 1 GiB it is copied to each
+remote host at run time). The driver checks the partition outputs and every op in isolation
+against them. So the problem is self-contained and checked: the evaluator runs only the composed
+CUDA side, and the reference never needs the GPU. A full run of KernelBlaster's evaluator
+(`only_slots` unset, no screening) prints the same lines as `build_and_run`: `MB_OP_US`,
+`MB_ATTR_*`, `MB_LAUNCH_OVERHEAD_US`, `MB_SLOT_CHECK`, `MB_CHECK`. `kb_eval.driver_result` maps its
+`EvalResult` to the keys `profile_ir` / `verify_ir` read (`slot_checks` → `slots`, `ok` →
+`passed`), so the planning inputs and the cache marks (`model_verified` / `rejected`) come out the
+same.
+
+**One GPU model.** `FlowHardware` holds the model every step must use: `--gpu-model`, else the
+model the first profile ran on, kept in `state.json` (`gpu_model`) so a resumed run keeps it. From
+then on:
+
+- it is the required model of the later profiles and of the verification (`time_problems
+  --gpu-model`);
+- it is passed as `--gpu-model` to every KernelBlaster run;
+- it is the model the re-timing leases are restricted to, and the required model of the
+  re-measurement and of the model's result;
+- every step's recorded device is checked against it (`kb_eval.check_device`): the profile, every
+  KernelBlaster run's `result.json` `gpu`, each re-measurement, the verification and the model run.
+
+Another model is a `HardwareMismatch` that stops the run. With `--allow-gpu-mismatch` it is a
+warning instead, and only an explicit `--gpu-model` pins the KernelBlaster runs. No GPU of the
+model in the pool is the same error. `summary.json` `gpu` has the model, `models` (every model a
+step recorded), `same_model`, `hosts`, `local_gpu_used`, the device of every step (`steps`:
+profile, kb, remeasure, verify, model_run) and the warnings. Per IR it adds `verify_device` and
+`verify_gpu`. `profile.json` and the verification result carry `device` and `evaluator`.
+
+**Telemetry.** `mb.profile.run` (per IR, inside the profile lap) and `mb.verify.run` record the
+evaluator, the device, the host and whether the run passed. With a KernelBlaster evaluator, each
+has an `mb.kb_time` child, and KernelBlaster's own spans go to
+`rNN/profile/<ir>/kb_time/profile.telemetry.jsonl` and `final/<ir>/kb_time/verify.telemetry.jsonl`.
+
+The pieces take the same flags: `kb_plan profile ... --ssh-host H --remote-dir D
+[--cuda-visible-devices ids] [--gpu-model M]`, and `kb_ingest --verify IR ... --ssh-host H
+--remote-dir D`. In both, `auto` without `--ssh-host` keeps ModelBlaster's own run.
+
+**Live run: every GPU step on firesim2 L40S** (`gpu_eval/work/graphopt_remote/live1`, scratch).
+This is one round on the four-branch conv model from "Parallel hint decisions". The run used
+`--ssh-host chrisdong@firesim2... --cuda-visible-devices 2,3 --remote-dir ... --arch 89 --rounds 1
+--rollouts 1 --steps 1 --variant-steps 2 --max-variants 4 --remeasure 5 --profile-runs 3
+--accept-gain -1` with the scripted `stub:` LLM, so it made no paid LLM calls. Locally it ran with
+`CUDA_VISIBLE_DEVICES=""`, and a 1 s `nvidia-smi --query-compute-apps` sampler saw no process on
+the local GPU during the run.
+
+- `summary.json` `gpu`: `gpu_model` "NVIDIA L40S", taken from the first profile. `same_model` is
+  true, `hosts` is firesim2 only, `local_gpu_used` is false, and there are no warnings.
+- Devices per step:
+  - profile: GPU 2;
+  - the 9 KernelBlaster runs (the plan run, then 4 hints × original/variant in one wave): GPUs 2
+    and 3;
+  - the 4 re-measurements: GPUs 2 and 3, two each;
+  - verification: GPU 2;
+  - model's result: GPU 2.
+
+  All of them are L40S.
+- Telemetry, inside the 91 s wall clock:
+  - `mb.profile.run`: 7.9 s, `evaluator` ssh, device firesim2:2, passed. The profile has 3 runs
+    with CUPTI per-op times and 13 launches.
+  - `mb.verify.run`: 7.5 s, firesim2:2, passed. All 4 cached fused slots were checked.
+  - `mb.model_run.time`: 12.2 s.
+  - The decide phase took 51 s.
+- The decisions were 4 fusions, all accepted (+6.7 %, +12.5 %, +22 %, 0 % re-measured). The model
+  verified, at 49.5 → 49.7 µs eager and 40.0 → 41.0 µs graph replay. The stub's fused kernels are
+  naive: this checks the mechanics, not the speed.
+- `kb_plan profile ... --ssh-host ... --gpu-model "NVIDIA TITAN RTX"` fails with `NoDevice: no
+  NVIDIA TITAN RTX GPU among the selected devices (...:2 (NVIDIA L40S), ...:3 (NVIDIA L40S))`.
+  With `--gpu-model l40s` it profiles on firesim2:2. `kb_ingest --verify` with the same flags
+  verifies the final cache on firesim2:2.
+
 ## Running
 
 ```bash
@@ -332,6 +432,8 @@ python -m modelblaster.pipeline.kb_graph_opt $L3/8_ResNetBasicBlock $L3/9_ResNet
     --rounds 4 --rollouts 2 --steps 4 --variant-steps 2 --max-variants 3 --top-k 6 --remeasure 5
 # scripted runs: --model stub:<name> --plugin file.py (the file registers the stub)
 # GPU pool: --parallel-hints auto|N  --gpus auto|all|0,2  or  --ssh-host H --cuda-visible-devices auto
+# everything on remote GPUs (the local host only builds):
+#   --ssh-host u@gpuhost --ssh-key K --cuda-visible-devices 2,3 --remote-dir /scratch/u/mb --arch 89
 
 # pieces
 python -m modelblaster.pipeline.kb_plan profile IR... --out P [--hints H --cache C]
@@ -383,6 +485,22 @@ KernelBlaster `llm_server` running there. The KB subprocesses inherit the variab
   pool flags. In `test_kb_graph_opt_flow.py`, `test_parallel_hints_same_decisions` runs four
   independent branches with the KernelBlaster subprocess: width 4 decides them in one wave, width 1
   one by one, with the same accepted hints and the same fused model.
+- **Remote profile / verification** (`pipeline/tests/test_graphopt_remote.py`, 20):
+  - mapping and parity: the `EvalResult` → driver-result mapping and `build_and_run`'s median
+    choice;
+  - `profile_ir` / `verify_ir` with a fake evaluator: the job sent, the median run, the CUPTI
+    basis, the device, the cache marks on pass and fail, mismatch errors and
+    `--allow-gpu-mismatch`;
+  - `FlowHardware`: the first device fixes the model, explicit and resumed models, pinning, and
+    the summary;
+  - re-timing leases restricted to the model; a local re-measurement records its device; a
+    KernelBlaster-local re-measurement leases without holding the GPU lock;
+  - the `--mb-evaluator` selection and the CLI flags;
+  - `kb_graph_opt._run` with every GPU step faked: what each step is given, the KernelBlaster
+    runs pinned on resume, a profile on another model refused, and the builtin default without
+    remote flags;
+  - on the local GPU, the builtin path and KernelBlaster's local evaluator give the same ops,
+    attribution basis, launches, checks and device for the profile and the verification.
 - Suites: MB `pipeline/tests tests benchmarks/tests` 223 passed, 11 skipped, 1 pre-existing
   failure (`test_profile_db.py::test_hetero_runs_are_skipped`) with `MB_KB_ROOT`/`MB_KB_PYTHON`
   set (221 passed, 13 skipped without a KernelBlaster checkout); KB `tests` 83 passed.
@@ -438,6 +556,8 @@ chain itself.
 | 17 | Independent hints are decided in waves; conflict = shared op, or one's cache writes are the other's seeds (by C entry); wave = first after every conflicting earlier hint | sequential (as before); a dependency graph executed as soon as inputs are ready; conflicts by (entry, shape) | Waves keep every conflicting pair in rank order, so the outcome is the one-by-one outcome; whole-entry conflicts are conservative because a slot's lookup and coverage split see every instance in the IR. A ready-as-soon-as scheduler would gain little with `max_variants` ≤ a few hints and complicate the determinism argument. |
 | 18 | One KernelBlaster process per wave with every problem (`--parallel-problems` = all), not one process per hint | a bounded pool of `run_multislot` processes | The knowledge dir stays single-writer (v1 claims.json); KernelBlaster's pool and build limiter already bound GPU and CPU use across problems; a hint's two sides run in the same process at the same time. |
 | 19 | Decisions are re-timed by ModelBlaster on one leased GPU per hint, holding KernelBlaster's per-GPU lock file; started as soon as the hint's two results exist | trust KB's final numbers; re-time after the whole wave | The two sides are compared on the same device, interleaved, regardless of where KB ran them (KB pins a problem's runs to one GPU model, but the two sides are two problems); overlapping with the rest of the wave hides the builds. |
+| 20 | The verification (and the profile) export a self-contained, checked problem here (reference walk on the CPU at export, references linked in) and only the composed CUDA side runs on the evaluator's GPU | run the torch reference on the remote GPU too (`walk_cuda` with torch there); a new `time_problems` job kind for checks | The driver already checks every output and op against linked references, so the reference never needs the GPU and stays valid computed on the CPU (the GPU torch walk is ~0.6 % off for conv-transpose with cuDNN); the remote host needs no torch or ModelBlaster, only the binary; a full `EvalResult` already carries the checks, per-op times and attribution, so no new job kind was needed. |
+| 21 | One GPU model per run: `--gpu-model`, else the first profile's, persisted, enforced on every step and passed to the KernelBlaster runs | infer it from the first KernelBlaster run; check only the model's result (before) | The first profile is the flow's first GPU step, so a mixed pool cannot split the plan from the runs it plans; persisting it keeps a resumed run on the same model; refusing (unless `--allow-gpu-mismatch`) is the same rule as `kb_model_run`. |
 
 ## Further proposal kinds (designs, not implemented)
 
@@ -476,8 +596,8 @@ chain itself.
   deletes data.bin afterwards.
 - Within a wave, a hint does not see KernelBlaster store records of the other hints in that wave
   (it would one by one); `--parallel-hints 1` restores that order.
-- The per-round profiles (`profile_ir`) and the final verification (`verify_ir`) still run on this
-  host's default GPU. They plan and check; the reported numbers (decisions, the model's result)
-  come from the KernelBlaster pool.
+- With `--ssh-host`, each round's profile is one `time_problems.py` call. It copies a whole-model
+  `data.bin` above 1 GiB to the host again each round, because the evaluator removes its copies
+  when it closes.
 - With `--remeasure 0` the decision uses KernelBlaster's two final numbers, which in a pool of mixed
   GPU models can come from different models (each problem is pinned to one model, the pair is not).

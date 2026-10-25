@@ -7,8 +7,10 @@ nothing else of KernelBlaster is imported into this process. A checkout
 without it (an older pin) or ``KB_TELEMETRY=0`` gives the no-op
 :class:`_Off`, and the flow runs unchanged.
 
-ModelBlaster's own spans (``mb.*``: profile, propose, plan, export,
-kb_wait, ingest, decide, prepare, remeasure, finish, verify) go to
+ModelBlaster's own spans (``mb.*``: profile, profile.run, propose, plan,
+export, kb_wait, ingest, decide, prepare, remeasure, finish, verify,
+verify.run, model_run, kb_time; the ``.run`` spans record the evaluator
+and the device each run used) go to
 ``<work>/telemetry.jsonl``; every KernelBlaster run writes its own
 ``telemetry.jsonl`` and ``summary.json`` telemetry, which
 :func:`kb_run_summary` reads back so ``round.json`` and ``summary.json``

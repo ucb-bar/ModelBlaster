@@ -35,13 +35,26 @@ Finally every IR is verified at model level with everything applied
 evaluator on the runs' pool and GPU model (``kb_model_run``), and
 ``summary.json`` lists first vs final times.
 
+Where the GPU steps run: KernelBlaster's runs, the re-measurement and the
+model's result use KernelBlaster's pool (``--gpus`` here, or the
+``--ssh-host`` GPUs). The profiles (step 1) and the final verification go
+there too with ``--ssh-host`` (or ``--mb-evaluator kb``): through
+KernelBlaster's evaluator (``kb_eval.run_problem``, ``scripts/time_problems.py``),
+the references computed here at export; without it they are built and run
+on this host's default GPU, as before. Every GPU step records its device and
+must run on one GPU model: ``--gpu-model``, else the model the first profile
+ran on (``state.json`` ``gpu_model``), which then also pins the
+KernelBlaster runs (``--gpu-model``); another model anywhere is an error
+unless ``--allow-gpu-mismatch``. ``summary.json`` ``gpu`` lists each step's
+devices.
+
     python -m modelblaster.pipeline.kb_graph_opt IR_DIR [...] --work W --kb KB_CHECKOUT \\
         [--model claude-code:sonnet] [--plugin stubs.py] [--rounds 4] \\
         [--coverage 0.8 --top-k 6] [--rollouts 2 --steps 4 --variant-steps 3] \\
         [--max-variants 3 --remeasure 5 --accept-gain 0.03] [--arch 75] \\
         [--parallel-hints auto|N] [--gpus auto|all|0,2] \\
         [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]] \\
-        [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch]
+        [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch] [--mb-evaluator auto|kb|builtin]
 
 Work dir: ``graph_hints.json`` (modelblaster.graph_hints/v1), ``cache/``
 (mb-cuda-cache/1), ``knowledge/`` (KernelBlaster), ``state.json``,
@@ -110,11 +123,16 @@ class Config:
     # allow_gpu_mismatch: time anyway where it is not available (loud warnings)
     gpu_model: str | None = None
     allow_gpu_mismatch: bool = False
+    # where ModelBlaster's own GPU steps run (the per-round profiles, the final verification, the
+    # local re-measurement): kb = KernelBlaster's evaluator on the runs' pool (local GPUs or the
+    # --ssh-host GPUs); builtin = built and run by ModelBlaster here (profiles / verification on the
+    # default GPU, re-measurement on a leased local GPU); auto = kb with ssh_hosts, else builtin
+    mb_evaluator: str = "auto"
 
 
 _LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices")
 _MANUAL_FIELDS = ("kb", "model", "reflect_model", "python", "ssh_key", "remote_dir", "gpus", "parallel_hints",
-                  "runtime", "gpu_model", "allow_gpu_mismatch", *_LIST_FIELDS)
+                  "runtime", "gpu_model", "allow_gpu_mismatch", "mb_evaluator", *_LIST_FIELDS)
 
 
 def _safe(s: str) -> str:
@@ -201,8 +219,9 @@ class GpuLeases:
             yield {"CUDA_VISIBLE_DEVICES": str(ident)} if ident is not None else {}
 
     @contextlib.contextmanager
-    def lease_device(self):
-        """-> the leased device dict (local: its KernelBlaster lock held)."""
+    def lease_device(self, lock: bool = True):
+        """-> the leased device dict (local: its KernelBlaster lock held, unless ``lock`` is
+        False -- a KernelBlaster evaluator pinned to the device takes it per run)."""
         with self._cv:
             while len(self._busy) == len(self.devices):
                 self._cv.wait()
@@ -213,7 +232,7 @@ class GpuLeases:
         ident = dev.get("ident")
         try:
             with contextlib.ExitStack() as stack:
-                if ident is not None and not dev.get("host") and not _flock_off():
+                if lock and ident is not None and not dev.get("host") and not _flock_off():
                     try:
                         stack.enter_context(_flock(gpu_lock_path(str(ident)), timeout=self.lock_timeout))
                     except PermissionError:            # another user's lock file: run unlocked, as KB does
@@ -564,6 +583,53 @@ def kb_eval_for(cfg: Config):
     return ev if ev.available() else None
 
 
+def use_kb_eval(cfg: Config) -> bool:
+    """Do ModelBlaster's own GPU steps (profiles, verification, re-measurement) go through
+    KernelBlaster's evaluator (``cfg.mb_evaluator``)?"""
+    if cfg.mb_evaluator not in ("auto", "kb", "builtin"):
+        raise ValueError(f"mb_evaluator must be auto|kb|builtin, not {cfg.mb_evaluator!r}")
+    return cfg.mb_evaluator == "kb" or (cfg.mb_evaluator == "auto" and bool(cfg.ssh_hosts))
+
+
+def mb_kb_eval(cfg: Config):
+    """KernelBlaster's evaluator for the profiles and the verification (one GPU of the pool),
+    or None for ModelBlaster's builtin runs here. Asked for (``kb`` / ``--ssh-host``) but the
+    checkout has no ``scripts/time_problems.py``: an error, never a silent local run."""
+    if not use_kb_eval(cfg):
+        return None
+    ev = kb_eval_for(cfg)
+    if ev is None:
+        raise RuntimeError(f"{cfg.kb} has no scripts/time_problems.py: the profiles and the verification cannot "
+                           "run on KernelBlaster's pool (--ssh-host / --mb-evaluator kb); use a newer checkout "
+                           "or --mb-evaluator builtin")
+    return ev
+
+
+def _device_record(dev: dict | None, arch: str) -> dict | None:
+    """A leased local device (``detect_gpus``) as a result's ``gpu`` record; the
+    environment's default GPU (nvidia-smi) when the lease is unpinned."""
+    from .kb_eval import builtin_device
+
+    if not dev or dev.get("ident") is None:
+        return builtin_device(arch)
+    ident = str(dev["ident"])
+    return {"host": dev.get("host"), "label": str(dev.get("index", ident)), "index": dev.get("index"),
+            "uuid": ident if ident.startswith("GPU-") else None, "name": dev.get("name"), "arch": f"sm_{arch}"}
+
+
+@contextlib.contextmanager
+def _recorded_lease(leases: GpuLeases | None, info: dict, arch: str):
+    """``GpuLeases.lease`` that also records the leased device in ``info["device"]``."""
+    if leases is None:
+        info["device"] = _device_record(None, arch)
+        yield {}
+        return
+    with leases.lease_device() as dev:
+        info["device"] = _device_record(dev, arch)
+        ident = dev.get("ident")
+        yield {"CUDA_VISIBLE_DEVICES": str(ident)} if ident is not None else {}
+
+
 def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None) -> list | None:
     """Re-time both composite bests interleaved on one leased GPU ->
     [original times, variant times], or None (a side failed / no
@@ -576,16 +642,20 @@ def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases |
     if not (ro.get("final_ok") and rv.get("final_ok")) or not cfg.remeasure:
         return None
     pair = [(job["orig"], best_sources(Path(ro["_dir"]))), (job["variant"], best_sources(Path(rv["_dir"])))]
-    ev = kb_eval_for(cfg) if cfg.ssh_hosts else None
+    ev = kb_eval_for(cfg) if use_kb_eval(cfg) else None
     if ev is None:
-        lease = leases.lease() if leases is not None else None
-        return remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, lease=lease)
+        info: dict = {}
+        times = remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, lease=_recorded_lease(leases, info, cfg.arch))
+        if info.get("device"):
+            job["remeasure_device"] = info["device"]
+        return times
     from .kb_eval import recorded_gpus, required_hardware
 
     hw = required_hardware(recorded_gpus([Path(ro["_dir"]), Path(rv["_dir"])]), gpu_model=cfg.gpu_model,
                            arch=cfg.arch, allow_mismatch=cfg.allow_gpu_mismatch)
     info: dict = {}
-    with (leases.lease_device() if leases is not None else contextlib.nullcontext(None)) as dev:
+    # a local device's lock is taken per run by the KernelBlaster evaluator pinned to it
+    with (leases.lease_device(lock=False) if leases is not None else contextlib.nullcontext(None)) as dev:
         times = remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, kbeval=ev.for_device(dev),
                           gpu_model=hw["gpu_model"], info=info, work=Path(job["variant"]).parent / "remeasure")
     job["remeasure_device"] = info.get("device")
@@ -624,6 +694,8 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
     rec = gh.record_decision(doc, h, ev)
     res = {"hint": h["id"], "status": status, "hint_status": rec["status"], "gain": gain,
            "original_us": ev["original_us"], "variant_us": ev["variant_us"], "ops": names}
+    if job.get("remeasure_device"):
+        res["remeasure_device"] = job["remeasure_device"]
     if rec["status"] == "accepted":
         man = json.loads((Path(job["variant"]) / "manifest.json").read_text())
         changed = [s["id"] for s in man["slots"]
@@ -730,10 +802,75 @@ def run(irs: list[Path], work: Path, cfg: Config) -> dict:
             tel.close()
 
 
+class FlowHardware:
+    """The one GPU model every GPU step of a run uses, and the device each step ran on.
+
+    The model is ``--gpu-model``, else the model the first profile ran on (kept in
+    ``state.json`` across resumed calls). Once it is known it pins the KernelBlaster runs
+    (their ``--gpu-model``), the re-measurement and the model's result, and every step's
+    recorded device is checked against it (:meth:`check`): another model is a
+    ``HardwareMismatch`` unless ``allow_gpu_mismatch`` (then a warning)."""
+
+    STEPS = ("profile", "kb", "remeasure", "verify", "model_run")
+
+    def __init__(self, cfg: Config, state: dict):
+        self.explicit = cfg.gpu_model
+        self.model = cfg.gpu_model or state.get("gpu_model")
+        self.allow = cfg.allow_gpu_mismatch
+        self.devices: dict[str, list] = {k: [] for k in self.STEPS}
+        self.warnings: list[str] = []
+
+    def check(self, step: str, device: dict | None, what: str) -> None:
+        from .kb_eval import check_device, gpu_model_key
+
+        d = dict(device or {})
+        self.devices[step].append({"what": what, **{k: d.get(k) for k in ("host", "label", "uuid", "name", "arch")}})
+        if self.model is None and gpu_model_key(d.get("name")):
+            self.model = d["name"]                      # the first step that ran fixes the model
+            return
+        check_device(d, self.model, what=f"{step} {what}", allow_mismatch=self.allow, warnings=self.warnings)
+
+    def pin(self, cfg: Config) -> Config:
+        """``cfg`` with the flow's model as the required one (KernelBlaster runs, re-measurement,
+        model run); with ``allow_gpu_mismatch`` only an explicit ``--gpu-model`` pins."""
+        from dataclasses import replace
+
+        if self.model and not (self.allow and not self.explicit) and cfg.gpu_model != self.model:
+            return replace(cfg, gpu_model=self.model)
+        return cfg
+
+    def summary(self) -> dict:
+        from .kb_eval import gpu_model_key
+
+        names = sorted({d["name"] for v in self.devices.values() for d in v if gpu_model_key(d.get("name"))})
+        hosts = sorted({d["host"] or "local" for v in self.devices.values() for d in v if d.get("name")})
+        return {"gpu_model": self.model, "explicit": bool(self.explicit), "models": names,
+                "same_model": len({gpu_model_key(n) for n in names + ([self.model] if self.model else [])}) <= 1,
+                "hosts": hosts,
+                "local_gpu_used": any(d.get("name") and not d.get("host") for v in self.devices.values() for d in v),
+                "steps": {k: v for k, v in self.devices.items() if v}, "warnings": self.warnings}
+
+
+def _restrict_leases(leases: GpuLeases, model: str | None, allow: bool) -> None:
+    """Re-timing leases only on GPUs of the flow's model (when the pool knows its models)."""
+    from .kb_eval import HardwareMismatch, gpu_model_key, same_gpu_model
+
+    if not model or not any(gpu_model_key(d.get("name")) for d in leases.devices):
+        return
+    keep = [d for d in leases.devices if same_gpu_model(d.get("name"), model)]
+    if keep:
+        leases.devices = keep
+    elif not allow:
+        raise HardwareMismatch(f"no GPU of the flow's model {model} in the re-timing pool "
+                               f"{[d.get('name') for d in leases.devices]} (--allow-gpu-mismatch to go on)")
+
+
 def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hints_path, state_path = work / "graph_hints.json", work / "state.json"
     doc, cache = gh.load(hints_path), CudaCache(work / "cache")
     state = json.loads(state_path.read_text()) if state_path.exists() else {"sent": [], "rounds": []}
+    hw = FlowHardware(cfg, state)
+    cfg = hw.pin(cfg)
     kb = KBRunner(cfg, work / "knowledge")
     specs = dict(_all_specs())
     gpus = detect_gpus(cfg)
@@ -741,8 +878,13 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     width = cfg.parallel_hints or auto_parallel_hints(n_gpus)
     # MB's own timed runs (re-measurement) lease from the KernelBlaster runs' pool: remote with --ssh-host
     leases = GpuLeases(gpus["remote"] if cfg.ssh_hosts else gpus["local"])
-    state["gpus"] = {"pool": gpus, "parallel_hints": width}
+    _restrict_leases(leases, hw.model, hw.allow)
+    # the profiles and the final verification: KernelBlaster's evaluator with --ssh-host / --mb-evaluator kb
+    mbev = mb_kb_eval(cfg)
+    state["gpus"] = {"pool": gpus, "parallel_hints": width,
+                     "mb_evaluator": mbev.describe() if mbev is not None else {"evaluator": "builtin"}}
     first = None
+    n_gpu_rec = len(kb.gpus)
     T = kbt.get()
     run_span = T.current()
     for r in range(len(state["rounds"]), len(state["rounds"]) + cfg.rounds):
@@ -751,8 +893,20 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         rec = {"round": r, "kb_runs": [], "decisions": []}
         rsec, n_kb = kbt.section("mb.round", collect=True, laps=True, round=r), len(kb.telemetry)
         T.lap("mb.profile")
-        profiles = [profile_ir(Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
-                               specs=specs, runs=cfg.profile_runs) for d in irs]
+        profiles = []
+        for d in irs:
+            p = profile_ir(Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
+                           specs=specs, runs=cfg.profile_runs, kbeval=mbev, gpu_model=hw.model,
+                           allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+            had = hw.model
+            hw.check("profile", p.get("device"), f"r{r:02d}/{p['ir']}")
+            if hw.model != had:                          # the first profile fixed the flow's model
+                state["gpu_model"] = hw.model
+                cfg = hw.pin(cfg)
+                kb.cfg = cfg
+                _restrict_leases(leases, hw.model, hw.allow)
+            profiles.append(p)
+        rec["profile_devices"] = {p["ir"]: (p.get("device") or {}).get("label") for p in profiles}
         bad = [p["ir"] for p in profiles if not p["passed"]]
         if bad:
             raise RuntimeError(f"round {r}: profile failed for {bad}; see {R / 'profile'}")
@@ -801,6 +955,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         waves, rec["decisions"] = decide_hints(cands, graphs, R / "variants", width, kb=kb, cache=cache, doc=doc,
                                                cfg=cfg, specs=specs, leases=leases, hints_path=hints_path)
         rec["parallel_hints"], rec["waves"] = width, waves
+        for g in kb.gpus[n_gpu_rec:]:
+            hw.check("kb", g.get("gpu"), Path(g["run"]).name)
+        n_gpu_rec = len(kb.gpus)
+        for dec in rec["decisions"]:
+            if dec.get("remeasure_device"):
+                hw.check("remeasure", dec["remeasure_device"], dec["hint"])
         rec["decide_seconds"] = round(time.time() - t_dec, 1)
         rec["seconds"] = round(time.time() - t0, 1)
         rec["llm_calls_total"] = kb.calls
@@ -821,10 +981,13 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             state["fixpoint"] = r
             break
     final = {}
-    with T.span("mb.verify"):
+    with T.span("mb.verify", evaluator=mbev.evaluator if mbev is not None else "builtin"):
         for d in irs:
-            final[Path(d).name] = verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
-                                            work=work / "final" / Path(d).name)
+            v = final[Path(d).name] = verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
+                                                work=work / "final" / Path(d).name, kbeval=mbev,
+                                                gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+            if "device" in v:
+                hw.check("verify", v.get("device"), v.get("ir", Path(d).name))
     summary = {"irs": {}, "rounds": len(state["rounds"]), "fixpoint": state.get("fixpoint"),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
@@ -846,6 +1009,11 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                                      allow_gpu_mismatch=cfg.allow_gpu_mismatch)
             except Exception as e:                   # the verification above stands; report why
                 models[Path(d).name] = {"error": repr(e)}
+            else:
+                try:
+                    hw.check("model_run", models[Path(d).name].get("device"), Path(d).name)
+                except Exception as e:  # noqa: BLE001 -- kb_model_run already enforces it; report
+                    models[Path(d).name]["error"] = repr(e)
     for name, v in final.items():
         ir = v.get("ir", name)
         f0 = first0.get(ir)
@@ -859,8 +1027,13 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                               "model_passed": m.get("passed"), "model_gpu": m.get("gpu_name"),
                               "model_device": (m.get("device") or {}).get("label"),
                               "model_hardware_match": (m.get("hardware") or {}).get("match"),
+                              "verify_device": (v.get("device") or {}).get("label"),
+                              "verify_gpu": (v.get("device") or {}).get("name"),
                               **({"model_error": m["error"]} if "error" in m else {})}
     (work / "model_runtime.json").write_text(json.dumps(models, indent=1, default=str))
+    summary["gpu"] = hw.summary()
+    state["gpu_check"] = summary["gpu"]
+    state_path.write_text(json.dumps(state, indent=1))
     tr = {"mb": kbt.compact(T.full_summary(run_span)), "kb": kbt.kb_rollup(kb.telemetry)}
     if tr["mb"] or tr["kb"]:
         summary["telemetry"] = tr
@@ -895,6 +1068,11 @@ def main():
                     "recorded), e.g. 'NVIDIA L40S'")
     ap.add_argument("--allow-gpu-mismatch", action="store_true",
                     help="time the model / re-measure even where no GPU of that model is available (warnings)")
+    ap.add_argument("--mb-evaluator", choices=["auto", "kb", "builtin"], default="auto",
+                    help="where the per-round profiles, the final verification and the re-measurement run: kb = "
+                         "KernelBlaster's evaluator on the runs' pool (local --gpus or the --ssh-host GPUs); builtin "
+                         "= built and run here (default GPU / a leased local GPU); auto (default): kb with "
+                         "--ssh-host, else builtin")
     for k, v in asdict(Config(kb=Path("."))).items():
         if k in _MANUAL_FIELDS:
             continue
@@ -906,6 +1084,7 @@ def main():
                  parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
                  cuda_visible_devices=a.cuda_visible_devices, ssh_key=a.ssh_key, remote_dir=a.remote_dir,
                  runtime=a.runtime, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
+                 mb_evaluator=a.mb_evaluator,
                  **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in _MANUAL_FIELDS})
     print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
 

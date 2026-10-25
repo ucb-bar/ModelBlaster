@@ -25,10 +25,13 @@ graph hints applied, the cached winners as slot sources (``cache_plan``,
 which also splits a slot whose instances only some winners cover) -- and
 runs its driver (golden + every op in isolation). Entries that pass are
 marked ``model_verified`` for that IR; a failing slot marks its entry
-``rejected`` for that IR.
+``rejected`` for that IR. The references are computed here at export (CPU)
+and linked into the problem, so the run can go to another GPU: with
+``--ssh-host`` (or ``--evaluator local``) through KernelBlaster's evaluator.
 
     python -m modelblaster.pipeline.kb_ingest WINNERS.json [--cache DIR] \\
-        [--verify IR_DIR ...] [--hints graph_hints.json] [--arch 75]
+        [--verify IR_DIR ...] [--hints graph_hints.json] [--arch 75] \\
+        [--ssh-host H --remote-dir D [--cuda-visible-devices ids] | --evaluator local] [--gpu-model M]
 """
 from __future__ import annotations
 
@@ -252,10 +255,23 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
 
 
 def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: Path | None = None,
-              hints: Path | None = None, fusion_registry: Path | None = None) -> dict:
+              hints: Path | None = None, fusion_registry: Path | None = None, kbeval=None,
+              gpu_model: str | None = None, allow_gpu_mismatch: bool = False) -> dict:
     """Whole-IR export with the accepted graph hints applied and the cached
-    winners as sources (``cache_plan``), build and run; mark entries."""
+    winners as sources (``cache_plan``), build and run; mark entries.
+
+    The export is self-contained and checked: the reference walk runs here,
+    at export, on the CPU (``walk_torch``), and its inputs, weights and every
+    op's reference output are linked into the problem, whose driver checks
+    the partition outputs and every op in isolation against them on the GPU.
+    So only the composed CUDA side needs a GPU: with ``kbeval`` (a
+    :class:`kb_eval.KBEval`) that run goes through KernelBlaster's evaluator
+    (local GPU pool or the ``--ssh-host`` GPUs) on one GPU of ``gpu_model``
+    (none there: ``HardwareMismatch`` unless ``allow_gpu_mismatch``); without
+    it, it is built and run here on the default GPU. ``device`` records the GPU."""
     from . import graph_hints as gh
+    from . import kb_telemetry as kbt
+    from .kb_eval import builtin_device, run_problem
     from .kb_export import build_and_run, export_problem
     from .kb_proposals import write_variant_ir
 
@@ -279,13 +295,27 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
         vir = write_variant_ir(ir_dir, plan["graph"], tmp / "ir")
         d = export_problem(vir, tmp / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
                            sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
-        res = build_and_run(d, arch=sm, graph=True)
+        with kbt.get().span("mb.verify.run", ir=ir_dir.name,
+                            evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp:
+            if kbeval is not None:
+                res = run_problem(kbeval, d, arch=sm, work=tmp / "kb_time", reps=1, gpu_model=gpu_model,
+                                  allow_mismatch=allow_gpu_mismatch, name="verify")
+                shutil.rmtree(tmp / "kb_time" / "verify_kbwork", ignore_errors=True)
+            else:
+                res = build_and_run(d, arch=sm, graph=True)
+                res["device"] = builtin_device(sm)
+            dev = res.get("device") or {}
+            if sp is not None and hasattr(sp, "set"):
+                sp.set(device=dev.get("label"), gpu=dev.get("name"), host=dev.get("host"), passed=res.get("passed"))
         man = json.loads((d / "manifest.json").read_text())
         ir_name = man["ir_name"]
         out = {"ir": ir_name, "passed": res.get("passed"), "partition_us": res.get("partition_us"),
                "e2e_us": res.get("e2e_us"), "e2e_basis": res.get("e2e_basis"),
                "fused": applied, "hints": hint_ids, "cache_split": [h["id"] for h in plan["hints"]],
-               "slots": {}}
+               "slots": {}, "device": res.get("device"),
+               "evaluator": res.get("evaluator") or {"evaluator": "builtin", "runtime": "process"}}
+        if res.get("hw_warnings"):
+            out["hw_warnings"] = res["hw_warnings"]
         for key, e in plan["used"].items():
             sid = key.split("/")[0]
             sc = res.get("slots", {}).get(sid, {})
@@ -313,7 +343,12 @@ def main():
     ap.add_argument("--hints", "--fusion-registry", dest="hints", default=None,
                     help="graph hints file: accepted fusions are applied and known ops "
                          "(default kernels/cuda/graph_hints.json)")
+    ap.add_argument("--gpu-model", help="the GPU model the verification must run on (KernelBlaster evaluator)")
+    ap.add_argument("--allow-gpu-mismatch", action="store_true")
+    from . import kb_eval as ke
+    ke.add_args(ap, prefix_help="where --verify runs", local_default="builtin")
     a = ap.parse_args()
+    kbeval = ke.from_args(a, local_default="builtin")
     from .kb_proposals import DEFAULT_REGISTRY, accepted_fused_specs
     from .reference_kernels import KERNEL_SPECS
 
@@ -324,7 +359,8 @@ def main():
             print(json.dumps(r))
     for d in a.verify:
         print(json.dumps(verify_ir(Path(d), cache, arch=a.arch, specs=specs,
-                                   hints=Path(a.hints or DEFAULT_REGISTRY))))
+                                   hints=Path(a.hints or DEFAULT_REGISTRY), kbeval=kbeval,
+                                   gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch)))
 
 
 if __name__ == "__main__":

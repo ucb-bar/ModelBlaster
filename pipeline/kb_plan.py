@@ -23,7 +23,9 @@ whether it was selected and why not; :func:`export_plan` (also
 ``kb_export --plan``) writes its problems.
 
     python -m modelblaster.pipeline.kb_plan profile IR_DIR [...] --out PROFILE_DIR \\
-        [--hints graph_hints.json --cache DIR --arch 75 --runs 3]
+        [--hints graph_hints.json --cache DIR --arch 75 --runs 3] \\
+        [--ssh-host H --remote-dir D [--cuda-visible-devices ids] [--ssh-key K] | --evaluator local] \\
+        [--gpu-model M]
     python -m modelblaster.pipeline.kb_plan select PROFILE.json [...] --out PLAN.json \\
         [--coverage 0.8 --top-k 8 --min-share 0.01 --exclude-from OLD_PLAN.json]
 """
@@ -57,10 +59,20 @@ def hinted_ir(ir_dir: Path, hints_doc: dict, work: Path, specs: dict):
 
 
 def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache=None, arch: str = "75",
-               specs: dict | None = None, runs: int = 3, keep: bool = False) -> dict:
+               specs: dict | None = None, runs: int = 3, keep: bool = False, kbeval=None,
+               gpu_model: str | None = None, allow_gpu_mismatch: bool = False) -> dict:
     """Whole-graph per-op profile of an IR in its current state (accepted
-    hints applied, cached winners in place)."""
+    hints applied, cached winners in place).
+
+    ``kbeval`` (a :class:`kb_eval.KBEval`): the ``runs`` go through
+    KernelBlaster's evaluator -- this host's GPU pool or the ``--ssh-host``
+    GPUs -- on one GPU of ``gpu_model`` (none there: ``HardwareMismatch``
+    unless ``allow_gpu_mismatch``); None: built and run here on the default
+    GPU (``build_and_run``). Either way the run with the median partition
+    time is used and ``device`` records the GPU it ran on."""
     from . import graph_hints as gh
+    from . import kb_telemetry as kbt
+    from .kb_eval import builtin_device, run_problem
     from .kb_export import build_and_run, export_problem, slot_id_of
     from .kb_ingest import cache_plan, signature_sha
     from .kb_proposals import _all_specs, write_variant_ir
@@ -74,7 +86,17 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
     prob = export_problem(pdir, work / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
                           sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
     # as deployed: CUDA graph where capturable; per-op GPU time from the driver's attribution
-    res = build_and_run(prob, arch=arch, runs=runs, graph=True)
+    with kbt.get().span("mb.profile.run", ir=Path(ir_dir).name, runs=runs,
+                        evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp:
+        if kbeval is not None:
+            res = run_problem(kbeval, prob, arch=arch, work=work / "kb_time", reps=runs, gpu_model=gpu_model,
+                              allow_mismatch=allow_gpu_mismatch, name="profile")
+        else:
+            res = build_and_run(prob, arch=arch, runs=runs, graph=True)
+            res["device"] = builtin_device(arch)
+        dev = res.get("device") or {}
+        if sp is not None and hasattr(sp, "set"):
+            sp.set(device=dev.get("label"), gpu=dev.get("name"), host=dev.get("host"), passed=res.get("passed"))
     attr = res.get("attr_op_us") or {}
     man = json.loads((prob / "manifest.json").read_text())
     ops_by_name = {o["name"]: o for o in plan["graph"]["ops"]}
@@ -97,11 +119,16 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
            "launches": res.get("attr_launches"), "launch_overhead_frac": res.get("launch_overhead_frac"),
            # deployed time not spent in kernels, per launch: what a fusion saves besides the kernel
            "launch_us": _launch_us(res),
-           "applied_hints": [h["id"] for h in plan["hints"]]}
+           "applied_hints": [h["id"] for h in plan["hints"]],
+           # where it ran: the GPU (host, label, uuid, name, arch) and the evaluator
+           "device": res.get("device"),
+           "evaluator": res.get("evaluator") or {"evaluator": "builtin", "runtime": "process"}}
+    if res.get("hw_warnings"):
+        out["hw_warnings"] = res["hw_warnings"]
     if not res.get("passed"):
         out["log"] = res.get("log", "")[-1500:]
     if not keep:                                   # data.bin and the build are the big parts
-        for p in (prob / "data.bin", prob / "build"):
+        for p in (prob / "data.bin", prob / "build", work / "kb_time" / "profile_kbwork"):
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
             elif p.exists():
@@ -227,6 +254,10 @@ def main():
     pr.add_argument("--cache")
     pr.add_argument("--arch", default="75")
     pr.add_argument("--runs", type=int, default=3)
+    pr.add_argument("--gpu-model", help="the GPU model the runs must use (with a KernelBlaster evaluator)")
+    pr.add_argument("--allow-gpu-mismatch", action="store_true")
+    from . import kb_eval as ke
+    ke.add_args(pr, prefix_help="where the profiles run", local_default="builtin")
     se = sub.add_parser("select")
     se.add_argument("profiles", nargs="+")
     se.add_argument("--out", required=True)
@@ -241,11 +272,15 @@ def main():
 
         doc = gh.load(Path(a.hints)) if a.hints else None
         cache = CudaCache(Path(a.cache)) if a.cache else None
+        kbeval = ke.from_args(a, local_default="builtin")
         for d in a.irs:
-            p = profile_ir(Path(d), Path(a.out) / Path(d).name, hints_doc=doc, cache=cache, arch=a.arch, runs=a.runs)
+            p = profile_ir(Path(d), Path(a.out) / Path(d).name, hints_doc=doc, cache=cache, arch=a.arch, runs=a.runs,
+                           kbeval=kbeval, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch)
             top = sorted(p["ops"], key=lambda r: -(r["us"] or 0))[:5]
             print(json.dumps({"ir": p["ir"], "passed": p["passed"], "partition_us": p["partition_us"],
-                              "top": [(r["name"], r["us"]) for r in top]}))
+                              "top": [(r["name"], r["us"]) for r in top],
+                              "device": (p.get("device") or {}).get("label"),
+                              "gpu": (p.get("device") or {}).get("name")}))
     else:
         excl = {it["key"] for f in a.exclude_from for it in json.loads(Path(f).read_text())["items"]
                 if it.get("selected")}
