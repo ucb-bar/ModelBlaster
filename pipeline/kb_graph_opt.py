@@ -116,6 +116,12 @@ class Config:
     min_gain_pct: float = 2.0
     max_variants: int = 3
     remeasure: int = 5
+    # a re-measurement lost to an infrastructure failure (the copy to / the link to / the GPU of the
+    # leased device failed, not a candidate) is retried on a fresh lease this many times in all, the
+    # k-th retry after k x remeasure_retry_s, and once more when the wave's KernelBlaster run has
+    # finished; still failing, the hint is left undecided (a candidate again next round)
+    remeasure_attempts: int = 3
+    remeasure_retry_s: float = 20.0
     accept_gain: float = ACCEPT_GAIN
     profile_runs: int = 3
     seed: int = 0
@@ -682,7 +688,8 @@ def _recorded_lease(leases: GpuLeases | None, info: dict, arch: str):
         yield {"CUDA_VISIBLE_DEVICES": str(ident)} if ident is not None else {}
 
 
-def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None) -> list | None:
+def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None,
+                 attempts: int | None = None) -> list | None:
     """Re-time both composite bests interleaved on one leased GPU ->
     [original times, variant times], or None (a side failed / no
     re-measurement). Thread-safe: writes only under the job's problem dirs.
@@ -690,32 +697,94 @@ def measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases |
     With ``ssh_hosts`` the leased GPU is a remote one (the KernelBlaster
     runs' pool) and the runs go through KernelBlaster's ssh evaluator pinned
     to it, on the GPU model the two runs recorded; locally, ModelBlaster's
-    own runs on the leased local GPU (its lock held)."""
+    own runs on the leased local GPU (its lock held).
+
+    An infrastructure failure is retried on a fresh lease (``attempts``, default
+    ``cfg.remeasure_attempts``); the failures' texts are kept in ``job``
+    (``remeasure_failures``, ``remeasure_attempts``) for the hint's evidence, and
+    ``job["remeasure_infra"]`` tells :func:`finish_hint` to leave the hint undecided."""
     if not (ro.get("final_ok") and rv.get("final_ok")) or not cfg.remeasure:
         return None
     with kb_trace.get().scope(mb_stage="remeasure", hint=(job.get("hint") or {}).get("id")):   # its runs' driver output
-        return _measure_hint(job, ro, rv, cfg, leases)
+        return _measure_hint(job, ro, rv, cfg, leases, attempts=attempts)
 
 
-def _measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None) -> list | None:
-    pair = [(job["orig"], best_sources(Path(ro["_dir"]))), (job["variant"], best_sources(Path(rv["_dir"])))]
-    ev = kb_eval_for(cfg) if use_kb_eval(cfg) else None
+def _remeasure_once(pair, cfg: Config, leases: GpuLeases | None, ev, hw: dict | None, info: dict, work: Path):
+    """One re-measurement on a fresh lease (``info``: device, failures)."""
     if ev is None:
-        info: dict = {}
-        times = remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, lease=_recorded_lease(leases, info, cfg.arch))
-        if info.get("device"):
-            job["remeasure_device"] = info["device"]
-        return times
-    from .kb_eval import recorded_gpus, required_hardware
-
-    hw = required_hardware(recorded_gpus([Path(ro["_dir"]), Path(rv["_dir"])]), gpu_model=cfg.gpu_model,
-                           arch=cfg.arch, allow_mismatch=cfg.allow_gpu_mismatch)
-    info: dict = {}
+        return remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, lease=_recorded_lease(leases, info, cfg.arch),
+                         info=info)
     # a local device's lock is taken per run by the KernelBlaster evaluator pinned to it
     with (leases.lease_device(lock=False) if leases is not None else contextlib.nullcontext(None)) as dev:
-        times = remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, kbeval=ev.for_device(dev),
-                          gpu_model=hw["gpu_model"], info=info, work=Path(job["variant"]).parent / "remeasure")
-    job["remeasure_device"] = info.get("device")
+        return remeasure(pair, arch=cfg.arch, reps=cfg.remeasure, kbeval=ev.for_device(dev),
+                         gpu_model=hw["gpu_model"], info=info, work=work)
+
+
+def _failure_text(fails: list) -> str:
+    return "; ".join(f"{f.get('side') or 'run'}: " + (f"[{f['stage']}] " if f.get("stage") else "") +
+                     str(f.get("error") or "?")[:600] for f in fails)
+
+
+def _measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases | None,
+                  attempts: int | None = None) -> list | None:
+    """The attempts: an infrastructure failure (every failing side's error is one) is
+    retried on a fresh lease; a candidate's own failure is not. Records them in ``job``:
+    ``remeasure_attempts`` (each one's device, failures and work dir),
+    ``remeasure_failures`` (the last one's, with the error texts) and ``remeasure_infra``."""
+    from .kb_eval import HardwareMismatch, recorded_gpus, required_hardware
+    from .kb_proposals import is_infra_text
+
+    pair = [(job["orig"], best_sources(Path(ro["_dir"]))), (job["variant"], best_sources(Path(rv["_dir"])))]
+    sides = {str(job["orig"]): "original", str(job["variant"]): "variant"}
+    ev = kb_eval_for(cfg) if use_kb_eval(cfg) else None
+    hw = None if ev is None else required_hardware(
+        recorded_gpus([Path(ro["_dir"]), Path(rv["_dir"])]), gpu_model=cfg.gpu_model, arch=cfg.arch,
+        allow_mismatch=cfg.allow_gpu_mismatch)
+    log = job.setdefault("remeasure_attempts", [])
+    hid = (job.get("hint") or {}).get("id")
+    T = kbt.get()
+    times, fails, infra = None, [], False
+    for a in range(max(1, int(attempts or cfg.remeasure_attempts))):
+        if a:
+            time.sleep(cfg.remeasure_retry_s * a)
+        k = len(log) + 1
+        work = Path(job["variant"]).parent / ("remeasure" if k == 1 else f"remeasure_a{k}")
+        info: dict = {}
+        with T.span("mb.remeasure.attempt", attempt=k, hint=hid) as sp:
+            try:
+                times = _remeasure_once(pair, cfg, leases, ev, hw, info, work)
+            except HardwareMismatch:
+                raise
+            except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+                # time_problems did not run / write its result (it says why), a timeout, a lost link
+                msg = " ".join(f"{type(e).__name__}: {e}".split())[:1500]
+                times, info["failures"] = None, [{"problem": None, "stage": "time", "error": msg,
+                                                  "infra": is_infra_text(msg) or "time_problems failed" in msg or
+                                                  isinstance(e, (OSError, subprocess.SubprocessError))}]
+            ok = bool(times and len(times) == 2 and times[0] and times[1])
+            fails = [] if ok else [dict(f, side=sides.get(str(f.get("problem")))) for f in info.get("failures") or []]
+            if not ok and not fails:
+                fails = [{"problem": None, "side": None, "stage": "run", "error": "no passing timed run "
+                          f"({[len(x) for x in times or []]} of {cfg.remeasure}; the evaluator reported no error)",
+                          "infra": False}]
+            infra = not ok and all(f.get("infra") for f in fails)
+            dev = info.get("device")
+            log.append({"attempt": k, "ok": ok, "infra": infra, "work": str(work), "failures": fails,
+                        "device": dev.get("label") if isinstance(dev, dict) else dev})
+            if sp is not None and hasattr(sp, "set"):
+                sp.set(ok=ok, infra=infra, error=_failure_text(fails)[:800] if fails else None,
+                       device=log[-1]["device"])
+            kb_trace.record("remeasure", rid_parts=(hid or "?", k), hint=hid, attempt=k, ok=ok, infra=infra,
+                            failures=fails, times=times, device=dev, work=str(work))
+        if dev:
+            job["remeasure_device"] = dev
+        else:
+            job.setdefault("remeasure_device", None)
+        if ok or not infra:
+            break
+        print(f"[kb_graph_opt] {hid}: re-measurement attempt {k}: infrastructure failure: "
+              f"{_failure_text(fails)[:400]}", file=sys.stderr, flush=True)
+    job["remeasure_failures"], job["remeasure_infra"] = fails, infra
     return times
 
 
@@ -735,18 +804,36 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
               kb_original_us=ro.get("final_partition_us"), kb_variant_us=rv.get("final_partition_us"),
               llm_calls=(ro.get("llm_calls") or 0) + (rv.get("llm_calls") or 0))
     ok = bool(ro.get("final_ok") and rv.get("final_ok"))
+    fails = []
+    bad = [(side, r) for side, r in (("original", ro), ("variant", rv)) if not r.get("final_ok")]
+    if bad and all(r.get("final_infra") for _, r in bad):
+        # KernelBlaster's final run lost to the GPU / link / staging, not to the composite
+        ev["kb_errors"] = {side: r.get("final_error") for side, r in bad}
+        return _undecided(job, ro, rv, times, ev, doc, "KernelBlaster: infrastructure failure of the final run, "
+                          "left undecided: " + "; ".join(f"{side}: {r.get('final_error') or '?'}" for side, r in bad))
     if ok and cfg.remeasure:
         ok = bool(times and times[0] and times[1])
+        if job.get("remeasure_attempts"):
+            ev["remeasure_attempts"] = len(job["remeasure_attempts"])
         if ok:
             ev.update(original_us=_median(times[0]), variant_us=_median(times[1]),
                       remeasured={"original_us": times[0], "variant_us": times[1],
                                   **({"device": job["remeasure_device"]} if job.get("remeasure_device") else {})})
+        else:
+            fails = job.get("remeasure_failures") or []
+            ev["remeasure_errors"] = fails
+            if job.get("remeasure_infra"):
+                return _undecided(job, ro, rv, times, ev, doc,
+                                  f"re-measurement: infrastructure failure after "
+                                  f"{len(job.get('remeasure_attempts') or [])} attempt(s), left undecided: "
+                                  f"{_failure_text(fails)}")
     if not ok:
-        ev["why"] = ("KernelBlaster: " + ", ".join(f"{side} not final_ok ({r.get('error') or 'see result.json'})"
-                                                   for side, r in (("original", ro), ("variant", rv))
-                                                   if not r.get("final_ok"))
+        ev["why"] = ("KernelBlaster: " + ", ".join(
+                         f"{side} not final_ok ({r.get('error') or r.get('final_error') or 'see result.json'})"
+                         for side, r in bad)
                      if not (ro.get("final_ok") and rv.get("final_ok")) else
-                     f"re-measurement: no passing run on a side ({[len(x) for x in times or []]} of {cfg.remeasure})")
+                     f"re-measurement: no passing run on a side ({[len(x) for x in times or []]} of {cfg.remeasure})"
+                     + (f": {_failure_text(fails)}" if fails else ""))
     gain = (ev["original_us"] - ev["variant_us"]) / ev["original_us"] if ok else None
     status = "accepted" if ok and gain >= cfg.accept_gain else "rejected"
     ev.update(gain=gain, decision=status, applied=job["prov"]["applied"])
@@ -760,6 +847,19 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
         changed = [s["id"] for s in man["slots"]
                    if s["op"].startswith("fused__") or s.get("variant_of")]
         res["cached"] = _ingest_slots(cache, job["variant"], rv, changed, job["specs"], h["id"])
+    _trace_hint(job, ro, rv, times, ev, res)
+    return res
+
+
+def _undecided(job: dict, ro: dict, rv: dict, times, ev: dict, doc: dict, why: str) -> dict:
+    """Record an infrastructure failure's evidence without a decision on the hint's merit:
+    it does not vote, and the hint stays a candidate for a later round."""
+    h = job["hint"]
+    ev.update(decision="undecided", infra=True, gain=None, applied=job["prov"]["applied"], why=why)
+    rec = gh.record_decision(doc, h, ev)
+    res = {"hint": h["id"], "status": "undecided", "hint_status": rec["status"], "infra": True, "why": why,
+           "gain": None, "original_us": ev.get("original_us"), "variant_us": ev.get("variant_us"),
+           "ops": job["names"]}
     _trace_hint(job, ro, rv, times, ev, res)
     return res
 
@@ -803,7 +903,7 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
         parent = T.current()
         wait = kbt.section("mb.kb_wait", kind="hints", problems=len(problems))
         proc = kb.start(problems, run_dir, steps=cfg.variant_steps, parallel_problems=len(problems))
-        futs = {}
+        futs, sides = {}, {}
         # re-timing workers: two per GPU (one builds while the other times), at most one per hint
         n_dev = len(leases.devices) if leases is not None else 1
         with ThreadPoolExecutor(max_workers=max(1, min(len(live), 2 * n_dev))) as ex:
@@ -818,6 +918,7 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
                             ro = dict(ro or {"final_ok": False}, _dir=str(run_dir / problem_name(jobs[k]["orig"])))
                             rv = dict(rv or {"final_ok": False},
                                       _dir=str(run_dir / problem_name(jobs[k]["variant"])))
+                            sides[k] = (ro, rv)
                             futs[k] = ex.submit(kbt.run_within, parent, "mb.remeasure", measure_hint, jobs[k],
                                                 ro, rv, cfg, leases)
                     if done:
@@ -829,6 +930,12 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
             res = kb.collect(problems, run_dir, proc)          # final result.json (llm calls, proposals)
             wait.end()
             times = {k: f.result() for k, f in futs.items()}
+        # lost to an infrastructure failure while the wave's KernelBlaster run still shared the GPUs (and
+        # the remote dir): once more, on a fresh lease, now that the run has finished
+        for k in sorted(times):
+            if jobs[k].get("remeasure_infra"):
+                times[k] = kbt.run_within(parent, "mb.remeasure", measure_hint, jobs[k], *sides[k], cfg, leases,
+                                          attempts=1)
         for n, k in enumerate(live):
             results[k] = (res[2 * n], res[2 * n + 1], times.get(k))
     with T.span("mb.finish"):
@@ -1090,7 +1197,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                           "waves": rec["waves"],
                           "decisions": [(d["hint"], d["status"], d.get("gain")) for d in rec["decisions"]]}),
               flush=True)
-        if not accepted and not plan["problems"] and len(todo) <= cfg.max_variants:
+        undecided = [d for d in rec["decisions"] if d.get("status") == "undecided"]
+        if not accepted and not undecided and not plan["problems"] and len(todo) <= cfg.max_variants:
             state["fixpoint"], state["fixpoint_key"] = r, kh
             kb_resume.atomic_write_json(state_path, state)
             break
