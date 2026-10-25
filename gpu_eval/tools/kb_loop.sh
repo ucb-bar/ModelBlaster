@@ -14,8 +14,16 @@
 #      whole-model runtime, checked and timed by CUDA-graph replay against the
 #      hand-seeded model                                      (pipeline/kb_model_run)
 # Accepted hints in WORK_DIR/graph_hints.json are applied before step 1, so
-# rerunning the script continues where the last round stopped. Rounds to a
-# fixpoint over several IRs: python -m modelblaster.pipeline.kb_graph_opt.
+# rerunning the script after a finished round starts the next round from where
+# the last one stopped. Rounds to a fixpoint over several IRs:
+# python -m modelblaster.pipeline.kb_graph_opt.
+#
+# Resume: a round that was killed (SIGKILL, reboot, ssh drop, Ctrl-C) continues
+# when the script is rerun: finished steps are skipped (WORK_DIR/.kb_loop/
+# markers) and the KernelBlaster runs continue from their journals (no LLM
+# response paid twice). FRESH=1 discards an unfinished round and starts anew.
+# SIGTERM / SIGINT / SIGHUP stop the running KernelBlaster run cleanly (exit 75,
+# resumable).
 #
 #   [PY=python] [KB=KernelBlaster checkout] [MODEL=claude-code:sonnet] [REFLECT_MODEL=...]
 #   [ARCH=75] [STRATEGY=whole|window|per_op|plan] [MAX_OPS=12] [COVERAGE=0.8] [TOP_K=6]
@@ -55,16 +63,38 @@ else
   EVAL+=(--evaluator local --gpus "${GPUS:-auto}")
 fi
 GPU=(); [ -z "${GPU_MODEL:-}" ] || GPU=(--gpu-model "$GPU_MODEL")
-run_kb() {  # problem(s) out [winners]
+run_kb() {  # out problem(s): KernelBlaster continues a killed run from its journals (--resume)
   local out=$1; shift
+  # in the background so a signal to this script reaches it (forwarded once: it stops cleanly, exit 75)
   $PY "$KB/scripts/run_multislot.py" "$@" --out "$out" --knowledge-dir "$KNOWLEDGE" --model "$MODEL" \
       ${REFLECT_MODEL:+--reflect-model "$REFLECT_MODEL"} --arch "$ARCH" --rollouts "$ROLLOUTS" \
       --steps "$STEPS" --export-winners "$W/winners" ${PLUGIN:+--plugin "$PLUGIN"} "${EVAL[@]}" "${GPU[@]}" \
-      > "$out.log" 2>&1
+      $RESUME_FLAG >> "$out.log" 2>&1 &
+  KB_PID=$!
+  local rc=0; wait "$KB_PID" || rc=$?
+  while [ "$rc" -gt 128 ] && kill -0 "$KB_PID" 2>/dev/null; do rc=0; wait "$KB_PID" || rc=$?; done
+  KB_PID=
+  [ "$rc" -eq 0 ] || { step "KernelBlaster exited $rc (see $out.log)"; exit "$rc"; }
 }
+KB_PID=
+export KB_STOP_WITH_PARENT=1      # KernelBlaster stops cleanly by itself if this script is killed
+# KernelBlaster checkouts with resumable runs take --resume (explicit; it is also their default)
+RESUME_FLAG=; grep -q -- "--force-restart" "$KB/scripts/run_multislot.py" 2>/dev/null && RESUME_FLAG=--resume
+trap 'step "signal: stopping KernelBlaster (resumable)"; [ -z "$KB_PID" ] || kill -TERM "$KB_PID" 2>/dev/null' TERM INT HUP
 mkdir -p "$W"
+M=$W/.kb_loop                     # step markers of the current round (resume)
+if [ -e "$M/round_done" ] || [ -n "${FRESH:-}" ]; then
+  # a new round: the previous one's per-round outputs go (hints, cache, knowledge stay)
+  rm -rf "$M" "$W/problems" "$W/run" "$W/run.log" "$W/variants" "$W/profile"
+elif [ -d "$M" ]; then
+  step "resuming the unfinished round (done: $(ls "$M" | tr '\n' ' '))"
+fi
+mkdir -p "$M"
+done_() { touch "$M/$1"; }
+is_done() { [ -e "$M/$1" ]; }
 
 step "export ($STRATEGY)"
+if is_done export; then step "  (done)"; else
 rm -rf "$W/problems"
 if [ "$STRATEGY" = plan ]; then
   $PY -m modelblaster.pipeline.kb_plan profile "$IR" --out "$W/profile" --hints "$HINTS" --cache "$CACHE" \
@@ -77,32 +107,49 @@ else
   $PY -m modelblaster.pipeline.kb_export "$IR" "$W/problems" --strategy "$STRATEGY" --max-ops "$MAX_OPS" \
       --hints "$HINTS" > "$W/export.jsonl"
 fi
+done_ export; fi
 
 step "optimise $(grep -c problem "$W/export.jsonl") problem(s)"
-run_kb "$W/run" "$W/problems"
+is_done optimise || { run_kb "$W/run" "$W/problems"; done_ optimise; }
 
 for props in "$W"/run/*/proposals.json; do
   [ -f "$props" ] || continue
   n=$($PY -c "import json,sys; print(len(json.load(open(sys.argv[1]))['proposals']))" "$props")
   [ "$n" -gt 0 ] || continue
   name=$(basename "$(dirname "$props")"); V="$W/variants/$name"
+  is_done "decide_$name" && { step "$name: decided"; continue; }
   step "$name: $n proposal(s) -> variant"
-  rm -rf "$V"; mkdir -p "$W/variants"
-  $PY -m modelblaster.pipeline.kb_proposals variant "$props" \
-      "$($PY -c "import json,sys; print(json.load(open(sys.argv[1]))['problem_dir'])" "$props")" "$V" \
-      --seed-from "$(dirname "$props")" > "$V.variant.json"
-  run_kb "$V/run" "$V/problem"
+  if ! is_done "variant_$name"; then
+    rm -rf "$V"; mkdir -p "$W/variants"
+    $PY -m modelblaster.pipeline.kb_proposals variant "$props" \
+        "$($PY -c "import json,sys; print(json.load(open(sys.argv[1]))['problem_dir'])" "$props")" "$V" \
+        --seed-from "$(dirname "$props")" > "$V.variant.json"
+    done_ "variant_$name"
+  fi
+  is_done "kb_$name" || { run_kb "$V/run" "$V/problem"; done_ "kb_$name"; }
+  # the decision is recorded in the hints file: marked right after, so it is never recorded twice
   $PY -m modelblaster.pipeline.kb_proposals decide "$(dirname "$props")/result.json" \
       "$V/run/$name"__variant/result.json --variant-json "$V/variant.json" \
       --hints "$HINTS" --remeasure "$REMEASURE" --arch "$ARCH" ${SSH_HOST:+"${EVAL[@]}" --kb "$KB" --kb-python "$PY"} \
-      | tee "$V.decision.json"
+      > "$V.decision.json.tmp"
+  mv "$V.decision.json.tmp" "$V.decision.json"; done_ "decide_$name"
+  cat "$V.decision.json"
 done
 
 step "ingest winners + model-level verify"
-$PY -m modelblaster.pipeline.kb_ingest "$W/winners/winners.json" --cache "$CACHE" --verify "$IR" --arch "$ARCH" \
-    --hints "$HINTS" | tee "$W/ingest.jsonl"
+if ! is_done ingest; then
+  $PY -m modelblaster.pipeline.kb_ingest "$W/winners/winners.json" --cache "$CACHE" --verify "$IR" --arch "$ARCH" \
+      --hints "$HINTS" > "$W/ingest.jsonl.tmp"
+  mv "$W/ingest.jsonl.tmp" "$W/ingest.jsonl"; done_ ingest
+fi
+cat "$W/ingest.jsonl"
 step "model result: every partition's winners in one whole-model runtime (CUDA graph replay)"
-$PY -m modelblaster.pipeline.kb_model_run "$IR" --kb-runs "$W/run" --cache "$CACHE" --hints "$HINTS" \
-    --arch "$ARCH" "${EVAL[@]}" "${GPU[@]}" --kb "$KB" --kb-python "$PY" --work "$W/model_run" \
-    --out "$W/model_result.json" | tee "$W/model_result.line.json"
+if ! is_done model_run; then
+  $PY -m modelblaster.pipeline.kb_model_run "$IR" --kb-runs "$W/run" --cache "$CACHE" --hints "$HINTS" \
+      --arch "$ARCH" "${EVAL[@]}" "${GPU[@]}" --kb "$KB" --kb-python "$PY" --work "$W/model_run" \
+      --out "$W/model_result.json" > "$W/model_result.line.json"
+  done_ model_run
+fi
+cat "$W/model_result.line.json"
+done_ round_done
 step "done: $W"
