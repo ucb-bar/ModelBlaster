@@ -47,6 +47,7 @@ import argparse
 import copy
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -407,7 +408,9 @@ def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, le
     ``for_device``): the runs go through KernelBlaster's evaluator instead --
     the same rounds, on one GPU of ``gpu_model`` (the model the two
     KernelBlaster runs were timed on; none there is an error), local or over
-    ssh. ``info`` (a dict) receives the device and evaluator used."""
+    ssh. ``info`` (a dict) receives the device and evaluator used, and
+    ``failures``: for each problem without a passing run, why (``run_failure``:
+    the stage, the error text, whether it is an infrastructure failure)."""
     import contextlib
     import os
     import subprocess
@@ -418,14 +421,25 @@ def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, le
         jobs = [{"id": f"p{k}", "problem": str(d), "sources": dict(src), "reps": reps} for k, (d, src) in enumerate(problems)]
         wd = Path(work) if work is not None else Path(problems[0][0]).parent / "remeasure"
         res = kbeval.run(jobs, arch=arch, work=wd, gpu_model=gpu_model, name="remeasure")
-        times = []
-        for j in jobs:
+        times, failures = [], []
+        for j, (d, _) in zip(jobs, problems):
             runs = res["jobs"][j["id"]]["runs"]
             times.append([r.get("e2e_us") or r.get("partition_graph_us") or r["partition_us"] for r in runs
                           if r.get("ok") and (r.get("e2e_us") or r.get("partition_us"))])
+            if not times[-1]:
+                failures.append(run_failure(d, runs, log=wd / "remeasure.result.json"))
+        if failures:                     # why, next to the runs (each run's own errors are in its row)
+            of = wd / "remeasure.result.json"
+            try:
+                doc = json.loads(of.read_text())
+                doc["failures"] = failures
+                of.write_text(json.dumps(doc, indent=1))
+            except (OSError, ValueError):
+                pass
         if info is not None:
             info.update(device=res["jobs"][jobs[0]["id"]].get("gpu"), evaluator=kbeval.describe(),
-                        devices=sorted({lab for j in jobs for lab in res["jobs"][j["id"]].get("gpus") or []}))
+                        devices=sorted({lab for j in jobs for lab in res["jobs"][j["id"]].get("gpus") or []}),
+                        failures=failures)
         return times
     exes = []
     for k, (d, src) in enumerate(problems):
@@ -435,6 +449,7 @@ def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, le
             raise RuntimeError(f"{d}: {r.get('log', '')[-800:]}")
         exes.append(r["exe"])
     times: list[list[float]] = [[] for _ in problems]
+    last: dict[int, str] = {}
     with (lease if lease is not None else contextlib.nullcontext({})) as env:
         run_env = {**os.environ, **(env or {}), "MB_GRAPH": "1", "MB_ATTR": "0", "MB_OP_US_PASS": "0"}
         for _ in range(reps):
@@ -443,7 +458,43 @@ def remeasure(problems: list[tuple[Path, dict]], *, arch: str, reps: int = 5, le
                 r = parse_driver_output(rp.stdout)
                 if r.get("passed") and (r.get("e2e_us") or r.get("partition_us")):
                     times[k].append(r.get("e2e_us") or r["partition_us"])
+                else:
+                    last[k] = f"rc {rp.returncode}: " + (rp.stdout + rp.stderr)[-1500:]
+    if info is not None:
+        info["failures"] = [{"problem": str(problems[k][0]), "stage": "run", "error": last.get(k, "no timed run"),
+                             "infra": is_infra_text(last.get(k))} for k in range(len(problems)) if not times[k]]
     return times
+
+
+# KernelBlaster's infrastructure-failure patterns (resources._INFRA_PATTERNS) plus its "[infra]" tag:
+# the GPU, the driver or the link failed, not the candidate
+_INFRA = re.compile(
+    r"\[infra\]|no CUDA-capable device is detected|all CUDA-capable devices are busy or unavailable|"
+    r"CUDA driver version is insufficient|cudaErrorNoDevice|cudaErrorDevicesUnavailable|cudaErrorInsufficientDriver|"
+    r"cudaErrorSystemNotReady|CUDA_ERROR_NO_DEVICE|Failed to initialize NVML|ssh: connect to host|"
+    r"Connection timed out|Connection refused|Connection reset by peer|Could not resolve hostname|"
+    r"Host key verification failed|Permission denied \(publickey", re.I)
+
+
+def is_infra_text(text) -> bool:
+    return bool(text) and bool(_INFRA.search(str(text)))
+
+
+def run_failure(problem, runs: list[dict], log=None) -> dict:
+    """Why a problem has no passing timed run (``time_problems`` rows) -> {"problem", "stage",
+    "error" (the evaluator's error text, else its log's tail), "infra", "runs", "log"}."""
+    bad = [r for r in runs if not r.get("ok")]
+    r = bad[0] if bad else (runs[0] if runs else {})
+    err = "; ".join(str(e) for e in (r.get("errors") or []) if e) or (r.get("log") or "")[-1500:]
+    if not runs:
+        err = "no run"
+    elif not bad:
+        err = err or "passed without a partition time"
+    out = {"problem": str(problem), "stage": r.get("stage"), "error": " ".join(err.split())[:1500],
+           "infra": is_infra_text(err) or is_infra_text(r.get("log")), "runs": len(runs)}
+    if log is not None:
+        out["log"] = str(log)
+    return out
 
 
 def _median(xs: list[float]) -> float | None:
