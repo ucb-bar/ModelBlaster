@@ -1,0 +1,21 @@
+{
+ "_": "Needs MB_KB_ROOT and MB_ABLATE_PROBLEMS. The hetero arms escalate codegen to Sonnet; budget accordingly.",
+ "name": "hetero_policy",
+ "description": "Model heterogeneity: Haiku only vs Haiku with escalation to Sonnet on structural techniques / failed fixes vs on stalls.",
+ "entry": "multislot",
+ "kb": "${MB_KB_ROOT}",
+ "inputs": ["${MB_ABLATE_PROBLEMS}/p_12_Gemm_Multiply_LeakyReLU", "${MB_ABLATE_PROBLEMS}/p_99_Matmul_GELU_Softmax"],
+ "flags": {"--model": "us.anthropic.claude-haiku-5-5", "--knowledge": "v2", "--rollouts": 2, "--steps": 3,
+           "--max-fix": 1},
+ "env": {"KERNELBLASTER_ALLOW_SHARED_GPU": "1", "BEDROCK_MAX_TOKENS": "16384"},
+ "path_exclude": "xilinx", "path_prepend": ["/usr/local/cuda/bin"],
+ "gpu_model": "NVIDIA TITAN RTX",
+ "knowledge": {"mined": false},
+ "seeds": [0, 1], "max_parallel": 2,
+ "budget": {"usd": 5.0, "est_usd_per_run": 0.6, "who": "ablate",
+            "ledger": "/scratch/dima/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+ "arms": {"haiku": {"flags": {"--hetero-policy": "never"}},
+          "category": {"flags": {"--model-hard": "us.anthropic.claude-sonnet-5-5",
+                                 "--hetero-policy": "category,fix-escalate"}},
+          "stall": {"flags": {"--model-hard": "us.anthropic.claude-sonnet-5-5", "--hetero-policy": "stall:2"}}}
+}

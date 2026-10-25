@@ -303,6 +303,15 @@ One live round on the ResNet basic block (Haiku 5.5, local TITAN RTX, 2 rollouts
   checks, timing loops and GPU queueing.
 - **Cost.** 9 calls, 36 k input / 46 k output tokens, est. $0.27, $0.13 per accepted win.
 
+## Ablations
+
+`python -m modelblaster.pipeline.kb_ablate` compares configurations of `run_multislot.py`
+(`entry: "multislot"`) or of the graph optimiser. Examples: knowledge v1 vs v2, mined evidence on
+vs off, reward, model policies, NCU. Each arm x repeat runs in its own directory with a per-run
+knowledge seed and snapshot copy, and the arms are interleaved on one GPU model. The report gives
+paired geo-mean ratios with bootstrap CIs and permutation / Wilcoxon p-values. See
+[ablations.md](ablations.md); example specs are in `gpu_eval/ablations/`.
+
 ## Design decisions
 
 | # | Decision | Alternatives considered | Why |
