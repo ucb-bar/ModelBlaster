@@ -31,12 +31,17 @@
 #   [GPUS=auto|all|0,2] [SSH_HOST="user@h1 user@h2" REMOTE_DIR=dir [CVD=auto|ids] [SSH_KEY=file]] \
 #   [RUNTIME=auto|host|process] [GPU_MODEL="NVIDIA L40S"] \
 #   [KNOWLEDGE_MODE=v2|v1] [NCU=off|best|all] [MODEL_SIMPLE=m MODEL_HARD=m] [UPKEEP_MODEL=m] \
+#   [TORCH_BASELINE=auto|on|off TORCH_PYTHON=py TORCH_SOURCE=file TORCH_ROUNDS=4 TORCH_VARIANTS=...] \
 #       bash gpu_eval/tools/kb_loop.sh IR_DIR WORK_DIR
 #
 # GPUs: KernelBlaster's runs, the re-measurement of proposals (with SSH_HOST)
 # and the model's result (step 5) use the same evaluator -- local GPU pool
 # (GPUS) or the SSH_HOST GPUs -- and step 5 times on the GPU model the runs
 # recorded (or GPU_MODEL), so the model and its partitions share the hardware.
+#
+# Step 5 also times the original PyTorch module on the same GPU, interleaved with
+# the model (TORCH_*: kb_model_run --torch-*; docs/gpu_harness_perf.md "Against
+# PyTorch"); with SSH_HOST it needs TORCH_PYTHON, a python with torch on that host.
 #
 # WORK_DIR/knowledge is the shared KernelBlaster knowledge dir (impl store,
 # outcomes, claims): reuse WORK_DIR, or point KNOWLEDGE at one, to carry
@@ -64,6 +69,11 @@ else
   EVAL+=(--evaluator local --gpus "${GPUS:-auto}")
 fi
 GPU=(); [ -z "${GPU_MODEL:-}" ] || GPU=(--gpu-model "$GPU_MODEL")
+TORCH=(--torch-baseline "${TORCH_BASELINE:-auto}")
+[ -z "${TORCH_PYTHON:-}" ] || TORCH+=(--torch-python "$TORCH_PYTHON")
+[ -z "${TORCH_SOURCE:-}" ] || TORCH+=(--torch-source "$TORCH_SOURCE")
+[ -z "${TORCH_ROUNDS:-}" ] || TORCH+=(--torch-rounds "$TORCH_ROUNDS")
+[ -z "${TORCH_VARIANTS:-}" ] || TORCH+=(--torch-variants "$TORCH_VARIANTS")
 # knowledge v2 folds this work dir's graph-hint decisions into KernelBlaster's graph hypotheses
 HINTS_SYNC=(); [ "${KNOWLEDGE_MODE:-v2}" != v2 ] || HINTS_SYNC=(--graph-hints "$W/graph_hints.json")
 run_kb() {  # out problem(s): KernelBlaster continues a killed run from its journals (--resume)
@@ -152,7 +162,7 @@ cat "$W/ingest.jsonl"
 step "model result: every partition's winners in one whole-model runtime (CUDA graph replay)"
 if ! is_done model_run; then
   $PY -m modelblaster.pipeline.kb_model_run "$IR" --kb-runs "$W/run" --cache "$CACHE" --hints "$HINTS" \
-      --arch "$ARCH" "${EVAL[@]}" "${GPU[@]}" --kb "$KB" --kb-python "$PY" --work "$W/model_run" \
+      --arch "$ARCH" "${EVAL[@]}" "${GPU[@]}" --kb "$KB" --kb-python "$PY" --work "$W/model_run" "${TORCH[@]}" \
       --out "$W/model_result.json" > "$W/model_result.line.json"
   done_ model_run
 fi

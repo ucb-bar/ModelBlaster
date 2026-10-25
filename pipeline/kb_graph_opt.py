@@ -32,7 +32,9 @@ KernelBlaster knowledge carry over between rounds and runs):
 
 Finally every IR is verified at model level with everything applied
 (``kb_ingest.verify_ir``), the model's result is timed through KernelBlaster's
-evaluator on the runs' pool and GPU model (``kb_model_run``), and
+evaluator on the runs' pool and GPU model (``kb_model_run``) -- with the
+PyTorch module timed against it on the same GPU (``--torch-baseline``,
+``--torch-python``; ``torch_us`` / ``speedup_vs_torch`` in the summary) -- and
 ``summary.json`` lists first vs final times.
 
 Where the GPU steps run: KernelBlaster's runs, the re-measurement and the
@@ -154,6 +156,14 @@ class Config:
     hetero_policy: str | None = None
     models_config: str | None = None
     upkeep_model: str | None = None
+    # the model's result against PyTorch on the same GPU (kb_model_run --torch-*; docs/gpu_harness_perf.md
+    # "Against PyTorch"): auto | on | off, the torch python of the timing host ("" = $MB_TORCH_PYTHON /
+    # the local python), the model's PyTorch source ("" = found next to the IR set), ABBA rounds, variants
+    torch_baseline: str = "auto"
+    torch_python: str = ""
+    torch_source: str = ""
+    torch_rounds: int = 4
+    torch_variants: str = "eager,graph,compile_mna,compile_ro"
     # anything else for run_multislot, verbatim (e.g. --kb-arg=--explore-frac --kb-arg=0.2)
     kb_args: list = field(default_factory=list)
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
@@ -1228,7 +1238,13 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                 models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
                                                      hints=hints_path, arch=cfg.arch, specs=specs, kbeval=kbeval,
                                                      gpu_model=cfg.gpu_model, recorded=kb.gpus,
-                                                     allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+                                                     allow_gpu_mismatch=cfg.allow_gpu_mismatch,
+                                                     torch_baseline=cfg.torch_baseline,
+                                                     torch_opts={"python": cfg.torch_python or None,
+                                                                 "source": cfg.torch_source or None,
+                                                                 "rounds": cfg.torch_rounds,
+                                                                 "variants": [v for v in cfg.torch_variants.split(",")
+                                                                              if v]})
             except Exception as e:                   # the verification above stands; report why
                 models[Path(d).name] = {"error": repr(e)}
             else:
@@ -1251,6 +1267,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                               "model_hardware_match": (m.get("hardware") or {}).get("match"),
                               "verify_device": (v.get("device") or {}).get("label"),
                               "verify_gpu": (v.get("device") or {}).get("name"),
+                              # kb_model_run --torch-baseline: torch_status, torch_us, torch_<variant>_us,
+                              # torch_<variant>_wall_us, speedup_vs_torch(_wall, _eager), ... (the table is in
+                              # model_runtime.json's torch_baseline)
+                              **{k: v for k, v in m.items() if k.startswith(("torch_", "speedup_vs_torch",
+                                                                              "ours_cmp_"))
+                                 and k != "torch_baseline"},
                               **({"model_error": m["error"]} if "error" in m else {})}
     (work / "model_runtime.json").write_text(json.dumps(models, indent=1, default=str))
     summary["gpu"] = hw.summary()

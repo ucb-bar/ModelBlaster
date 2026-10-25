@@ -724,6 +724,235 @@ The hint re-measurement uses the same path with `--ssh-host`. Two ResNet18 windo
 leased from the remote pool, re-timed 3 × interleaved on L40S GPU 2 gave 123.9 / 122.9 /
 122.9 µs and 141.3 µs; KernelBlaster's own numbers were 123.9 and 141.3.
 
+### Against PyTorch (`pipeline/torch_baseline.py`, `pipeline/torch_bench.py`)
+
+After its own timing, the model run times the original PyTorch module against the composed
+model on the same GPU (`kb_model_run --torch-baseline auto|on|off`, default auto). Both are
+measured the same way and in the same session, so `speedup_vs_torch` is a like-for-like number.
+
+    python -m modelblaster.pipeline.kb_model_run IR --cache C [...] \
+        --torch-baseline on --torch-python /path/to/torch/python [--torch-source FILE] \
+        [--torch-rounds 4] [--torch-variants eager,graph,compile_mna,compile_ro]
+
+`kb_graph_opt` has the same flags (`--torch-baseline`, `--torch-python`, `--torch-source`,
+`--torch-rounds`, `--torch-variants`), and `gpu_eval/tools/kb_loop.sh` takes them as
+`TORCH_BASELINE`, `TORCH_PYTHON`, `TORCH_SOURCE`, `TORCH_ROUNDS` and `TORCH_VARIANTS`.
+
+- With `auto`, the comparison is skipped, with the reason recorded (`torch_status: skipped`),
+  when the model failed its checks, its device has no UUID, no PyTorch source is found, or there
+  is no torch python for the timing host. A failure is `torch_status: failed` and the model's own
+  result stands. `on` raises in both cases.
+- The torch python is `--torch-python` or `$MB_TORCH_PYTHON`. Locally it falls back to the
+  KernelBlaster python, then this python, if either imports torch with CUDA. Over ssh it must be
+  given: it is only run on the remote host, never installed into or modified.
+- The PyTorch source is `--torch-source`, `$MB_TORCH_SRC`, or `<stem>.py` under the `adapted/` or
+  `src/` trees next to the IR set (`.../level2/ir16/21_X` finds `.../level2/src/**/21_X.py`).
+
+**Same model and data.**
+
+1. The KernelBench source is resized to the dims the extractor shrank it to. This reuses the
+   extractor's own sizing helpers, and the sizing is the one whose `get_inputs()` matches the
+   IR's input count.
+2. The IR's `weights.npz` is loaded into the module's state dict by name. A BatchNorm folded at
+   extraction becomes weight = scale, bias = folded bias, mean 0 and var 1 − eps, which is the
+   same affine map. Any state key without an IR weight refuses the bundle.
+3. The forward runs on the inputs from `io.npz`, and its outputs are checked against
+   `io.npz`'s reference with the driver's tolerance (the problem manifest's `output_rel` /
+   `output_abs`): `max|out − ref| ≤ rel·max|ref| + abs`, with non-finite values matched exactly.
+   This check runs once on the CPU when the bundle is built, and again on the GPU for every
+   variant. A variant that fails it is reported and not timed.
+4. An fp16 IR (`extract_graph --quant fp16`, [fp16_cuda.md](fp16_cuda.md)) runs torch in half
+   (`module.half()`, half inputs). That is fp16 storage like ours, with torch's own fp16 math
+   (tensor cores by default). The CPU check runs in fp32 on the fp16-rounded data, the golden's
+   own recipe.
+
+The bundle (`model.py`, `recipe.json`, `state.npz`, `io.npz`) and `torch_bench.py`, which needs
+only torch and numpy, are built here. For a remote GPU they are copied to
+`<remote-dir>/torch_baseline/bundles/<key>`.
+
+**Same device.**
+
+- The torch servers run with `CUDA_VISIBLE_DEVICES=<uuid>` of the GPU the model run used.
+- Our side is pinned to that device (`KBEval.for_device`).
+- Every block reports its UUID, and any other device raises `DeviceMismatch`.
+- `same_device`, `uuid`, `torch_device` (name, cc, SMs) and the versions (torch, CUDA, cuDNN,
+  triton, driver) are recorded.
+- Both sides hold KernelBlaster's per-GPU flock for each block, so no KernelBlaster run times on
+  the GPU at the same time.
+
+**Same measurement.** Each block uses the driver's `time_multi` rule on both sides:
+
+1. W warm-up passes of every body (W = 10).
+2. Round robin, one CUDA event pair on the body's stream around one forward pass, synchronised
+   before the next pass, so the GPU is idle before each. This repeats until every body has had
+   the 200 ms budget or 200 reps.
+3. As many host wall-clock reps, round robin. One rep runs from issuing the forward pass to the
+   return of the device synchronise (`steady_clock` in the driver, `perf_counter` in torch).
+   Inputs stay resident and outputs stay on the device, so a rep has no H2D, D2H or allocation
+   of ours.
+4. The steady-state throughput: one warm pass, then 100 passes back to back with one sync, per
+   pass (wall and events).
+
+The statistic is the driver's upper median, per block and then over the blocks, together with
+the within-block CV and the spread of the block medians.
+
+- Ours runs through KernelBlaster's evaluator (`time_problems.py --driver-env MB_WALL=1
+  MB_WARM=10 MB_TIME_MS=200 MB_THRU_N=100 MB_ATTR=0 MB_OP_US_PASS=0`). The persistent driver host
+  prints one `MB_TIMING` line per body (eager, graph, the paired seed), which lands in
+  `EvalResult.timing`. `MB_WALL` is off by default, and drivers exported before it ignore it.
+- Torch runs as one long-lived `torch_bench.py` server per math mode, speaking JSON lines over
+  stdin/stdout (ssh for a remote GPU). TF32 is process-wide, and torch.compile bakes it into its
+  kernels, so each mode needs its own server.
+- The ssh round trip and process start are outside every timed region.
+- Blocks alternate ABBA over `--torch-rounds` (default 4): round *k* runs ours, torch TF32 off,
+  torch TF32 on, and round *k* + 1 runs them in reverse.
+
+**Torch variants.**
+
+| variant | what |
+|---|---|
+| `eager` | the module under `torch.inference_mode()` |
+| `graph` | the forward captured once with `torch.cuda.graph` on static inputs, replayed |
+| `compile_mna` | `torch.compile(mode="max-autotune-no-cudagraphs")` |
+| `compile_ro` | `torch.compile(mode="reduce-overhead")` (inductor + CUDA graph trees) |
+
+Every variant runs with `cudnn.benchmark` on, warmed (3 passes at build plus the block's
+warm-up). A variant that fails to build is reported in the table with its error.
+
+**Same math.**
+
+- `detect_math` reads our slot sources, ignoring comments:
+  - `tf32` for TF32 markers (`tf32`, `cvt.rna.tf32`, cuBLAS TF32 modes);
+  - `tensor_cores` for `wmma` / `mma.sync` / `wgmma` / `ldmatrix`;
+  - `reduced` for `__half` / bf16;
+  - `fp32` otherwise.
+- Torch is timed with TF32 off (`allow_tf32` false for matmul and cuDNN, `highest` matmul
+  precision) and with TF32 on.
+- The headline mode follows from that:
+  - `tf32_off` when ours is plain fp32: the same arithmetic;
+  - `best` (the faster torch mode) when ours uses TF32 or tensor cores;
+  - `fp16` for an fp16 IR, with one server, because TF32 does not apply.
+
+**Result.**
+
+- `model_runtime.json` gets `torch_baseline`, with these parts:
+  - `rows`, one per variant and mode, with GPU and wall µs (and the block means), CV, spread, block medians,
+    throughput, the check and the speedups of ours over it;
+  - `headline`, `math`, `method`, `versions`, `flags`, `checks`, `bundle` (source, sizing,
+    weight mapping, CPU check);
+  - `raw`, every block.
+- The top-level fields are `torch_status` (`ok`, `skipped`, `failed`), `torch_reason`,
+  `torch_uuid`, `torch_same_device`, `torch_us` (the headline mode's fastest variant by
+  GPU time), `torch_best_variant`, `torch_wall_us`, `torch_<variant>_us`,
+  `torch_<variant>_wall_us`, `speedup_vs_torch` (ours graph replay vs `torch_us`, GPU),
+  `speedup_vs_torch_wall` and `speedup_vs_torch_eager`.
+- `kb_graph_opt`'s `summary.json` copies them per IR.
+- The ablation report's "vs torch" and "vs torch wall" columns use the paired ratios
+  ([ablations.md](ablations.md)).
+- The table is printed to stderr (`torch_baseline.table`).
+- Ours is our CUDA-graph replay; our eager pass is a row too.
+
+**Remaining asymmetries.**
+
+- **"GPU time" is the event span of one forward pass.** For a host-bound eager pass (torch
+  eager, `compile_mna`) the span includes the gaps while the GPU waits for launches, so it is
+  close to the wall time. The throughput column shows the pipelined rate. Ours eager has the
+  same property, but its launches are cheaper.
+- **The wall clock includes each side's own host stack.** That is the Python dispatcher and
+  caching allocator for torch, and a C++ launch sequence or `cudaGraphLaunch` for ours. This is
+  what each side costs per inference, so it is part of the comparison and not removed.
+- **The processes differ in lifetime.** The torch server lives for the whole comparison. Our
+  driver host is started per block by `time_problems.py` and warmed with the same 10 passes.
+  If anything, that disadvantages ours.
+- **The neighbours in the round robin differ.** Ours alternates eager, graph and the hand
+  seed. Torch alternates its 2 to 4 variants. The GPU is idle before every rep on both sides,
+  but the L2 contents left by the previous body differ.
+- **The references differ, the tolerance does not.** Ours is checked by the driver against the
+  CPU torch-walk references linked in at export. Torch is checked against `io.npz`.
+- **`reduce-overhead` copies the inputs** into its graph's static buffers on every call (CUDA
+  graph trees). That is torch's cost of that mode and is counted. The `graph` variant
+  (static inputs) is the copy-free torch number.
+- **Clocks are not locked** on either side. ABBA interleaving and the block spread bound the
+  drift.
+- **The event clock is coarse.** On the L40S, CUDA event times land on 1.024 µs ticks, the
+  same for both sides. A median is therefore a tick (51.2 µs = 50 ticks), and a block spread
+  of 0.00 means every block's median fell on the same tick. `gpu_mean_us` (the median of the
+  block means, the "GPU mean" column) resolves below a tick.
+
+**Live, firesim2 L40S GPU 2** (`GPU-22350958-ee15-b07b-0e89-77c5157f1d3b`, the GPU the model
+runs timed on; every block reported that UUID). Software: torch 2.11.0+cu128, CUDA 12.8, cuDNN
+9.19.0, triton 3.6.0, driver 580.126.18. Each comparison is 4 ABBA rounds with up to 200 reps
+per block, and every row passed its check. In each row, "ours faster" is that row's time divided
+by ours (CUDA graph). No LLM calls: the winners come from the graph-optimiser runs' caches.
+
+Level2 #21 Conv2d_Add_Scale_Sigmoid_GroupNorm, FP32. Its winning slots use float / float4
+only, so the headline is against TF32 off. Setup took 20 s and the 12 blocks 62 s.
+
+| variant | TF32 | check | GPU µs (CV %, spread %) | GPU mean µs | wall µs (CV %) | throughput wall / GPU µs | ours faster (GPU) | ours faster (wall) |
+|---|---|---|---|---|---|---|---|---|
+| ModelBlaster CUDA graph | - | pass | 51.2 (1.50, 0.00) | 51.2 | 54.8 (1.21) | 49.0 / 48.9 | - | - |
+| ModelBlaster eager | - | pass | 55.3 (1.28, 0.00) | 55.2 | 58.1 (0.94) | 51.7 / 51.6 | - | - |
+| torch eager | off | pass | 230.4 (3.04, 2.22) | 232.4 | 234.4 (3.14) | 134.0 / 133.6 | 4.50x | 4.28x |
+| torch CUDA graph | off | pass | 135.2 (1.36, 0.00) | 135.4 | 140.1 (1.55) | 127.4 / 127.2 | 2.64x | 2.56x |
+| torch.compile max-autotune-no-cudagraphs | off | pass | 246.8 (4.10, 3.32) | 247.9 | 262.8 (4.45) | 193.1 / 192.8 | 4.82x | 4.80x |
+| torch.compile reduce-overhead | off | pass | 163.8 (4.20, 3.12) | 166.4 | 169.6 (4.21) | 90.5 / 90.1 | 3.20x | 3.10x |
+| torch eager | on | pass | 229.4 (3.74, 2.66) | 234.2 | 235.7 (2.80) | 134.2 / 133.8 | 4.48x | 4.31x |
+| torch CUDA graph | on | pass | 135.2 (0.84, 0.00) | 135.4 | 140.3 (1.23) | 127.3 / 127.0 | 2.64x | 2.56x |
+| torch.compile max-autotune-no-cudagraphs | on | pass | 260.1 (4.79, 3.15) | 265.9 | 278.8 (3.77) | 209.4 / 209.0 | 5.08x | 5.09x |
+| torch.compile reduce-overhead | on | pass | 160.8 (4.48, 3.18) | 165.7 | 170.9 (4.66) | 90.7 / 90.3 | 3.14x | 3.12x |
+
+headline (tf32_off): ours graph 51.2 µs vs torch best graph 135.2 µs -> 2.64x (GPU); wall 54.8 vs 140.1 µs (graph) -> 2.56x
+
+Level2 #21, FP16 (`--quant fp16`; `--torch-source` given, since the fp16 IR set has no
+`src/` tree). The conv slot uses `mma.sync` (fp16 inputs, fp32 accumulate) and the others use
+`half2`. Torch runs in half. Setup took 15 s and the 8 blocks 35 s.
+
+| variant | TF32 | check | GPU µs (CV %, spread %) | GPU mean µs | wall µs (CV %) | throughput wall / GPU µs | ours faster (GPU) | ours faster (wall) |
+|---|---|---|---|---|---|---|---|---|
+| ModelBlaster CUDA graph | - | pass | 38.9 (1.72, 0.00) | 39.0 | 42.4 (1.41) | 36.8 / 36.7 | - | - |
+| ModelBlaster eager | - | pass | 43.0 (1.72, 2.38) | 43.0 | 45.8 (1.96) | 39.3 / 39.2 | - | - |
+| torch eager fp16 | - | pass | 232.4 (3.26, 15.86) | 233.5 | 238.9 (3.03) | 127.9 / 127.5 | 5.97x | 5.63x |
+| torch CUDA graph fp16 | - | pass | 128.0 (1.31, 1.60) | 128.7 | 133.6 (1.37) | 120.6 / 120.4 | 3.29x | 3.15x |
+| torch.compile max-autotune-no-cudagraphs fp16 | - | pass | 252.9 (4.60, 27.94) | 253.5 | 271.0 (3.69) | 201.5 / 201.2 | 6.50x | 6.39x |
+| torch.compile reduce-overhead fp16 | - | pass | 152.6 (4.76, 26.85) | 153.4 | 169.4 (4.70) | 90.0 / 89.7 | 3.92x | 3.99x |
+
+headline (fp16): ours graph 38.9 µs vs torch best graph 128.0 µs -> 3.29x (GPU); wall 42.4 vs 133.6 µs (graph) -> 3.15x
+
+Level3 9_ResNet18, FP32 (batch 2, 3×224×224), composed from the L40S KernelBlaster runs'
+winners. The slots are plain fp32, so the headline is against TF32 off. Setup took 38 s and the
+blocks 56 s.
+
+| variant | TF32 | check | GPU µs (CV %, spread %) | GPU mean µs | wall µs (CV %) | throughput wall / GPU µs | ours faster (GPU) | ours faster (wall) |
+|---|---|---|---|---|---|---|---|---|
+| ModelBlaster CUDA graph | - | pass | 687.1 (0.22, 0.89) | 686.9 | 692.7 (0.21) | 686.1 / 686.0 | - | - |
+| ModelBlaster eager | - | pass | 738.3 (0.25, 0.55) | 738.2 | 742.3 (0.32) | 736.3 / 736.1 | - | - |
+| torch eager | off | pass | 1611.8 (2.66, 2.22) | 1614.3 | 1619.7 (2.93) | 1552.3 / 1551.9 | 2.35x | 2.34x |
+| torch CUDA graph | off | pass | 726.0 (0.19, 0.00) | 726.0 | 732.6 (0.26) | 666.1 / 665.8 | 1.06x | 1.06x |
+| torch.compile max-autotune-no-cudagraphs | off | pass | 1382.4 (2.44, 1.93) | 1382.2 | 1373.6 (3.49) | 1203.5 / 1203.1 | 2.01x | 1.98x |
+| torch.compile reduce-overhead | off | pass | 1009.7 (0.67, 0.30) | 1010.4 | 1016.1 (0.93) | 817.6 / 817.1 | 1.47x | 1.47x |
+| torch eager | on | pass | 1767.4 (2.45, 2.90) | 1790.9 | 1800.7 (2.29) | 1715.1 / 1714.7 | 2.57x | 2.60x |
+| torch CUDA graph | on | pass | 440.3 (0.44, 0.00) | 440.9 | 446.5 (0.49) | 427.9 / 427.6 | 0.64x | 0.64x |
+| torch.compile max-autotune-no-cudagraphs | on | pass | 1302.5 (2.68, 3.07) | 1321.0 | 1332.0 (2.62) | 1260.8 / 1260.4 | 1.90x | 1.92x |
+| torch.compile reduce-overhead | on | pass | 628.7 (1.24, 0.81) | 631.3 | 635.7 (1.10) | 456.6 / 456.3 | 0.92x | 0.92x |
+
+headline (tf32_off): ours graph 687.1 µs vs torch best graph 726.0 µs -> 1.06x (GPU); wall 692.7 vs 732.6 µs (graph) -> 1.06x
+
+Findings:
+
+- On all three runs, the torch CUDA graph is torch's fastest single-inference number.
+  `reduce-overhead` has torch's best back-to-back throughput on #21 (90.5 µs per pass in fp32,
+  vs 127.4 µs for the CUDA graph), but its single call is slower (163.8 µs).
+- ResNet18 is close to parity with torch in fp32: 1.06× over torch's CUDA graph with TF32 off
+  (1.03× in an earlier session: torch's graph moved 702 → 726 µs between sessions, ours 685 →
+  687 µs). With TF32 on, torch's cuDNN convolutions run on tensor cores at reduced precision and
+  are faster than ours (0.64×). That row is the secondary comparison, because our slots do not
+  use TF32.
+- #21 is 2.6× (fp32) and 3.3× (fp16) over the fastest torch variant, and 4.5× / 6.0× over
+  torch eager. TF32 makes no difference to torch's cuDNN path on #21.
+- The headline wall-clock speedups are within 0.15× of the GPU ones (2.56 vs 2.64, 3.15 vs
+  3.29, 1.06 vs 1.06). The inputs are resident and both sides synchronise once per pass, so the
+  remaining host cost per call is 3 to 7 µs on each side.
+
 ### Tests and gates (persistent runtime)
 
 - **Export gate on the new runtime.** Setup: TITAN, `kb_export --build-check --runtime host`,
@@ -731,6 +960,14 @@ leased from the remote pool, re-timed 3 × interleaved on L40S GPU 2 gave 123.9 
   request: partition check, every op isolated, graph replay. Results:
   - Level1 100/100, Level2 100/100, Level3 50/50;
   - every one of the 250 with `basis=graph`: the seeds capture everywhere.
+- **MB tests (against PyTorch).** `pipeline/tests/test_torch_baseline.py` covers:
+  - the method: ABBA order, upper medians, CV and spread, same-device enforcement;
+  - the tolerance check, TF32 / tensor-core detection, and the headline modes (fp32, TF32,
+    fp16);
+  - the bundle: sizing, folded-BatchNorm mapping, fp16, refusals;
+  - the result fields, the `--driver-env` pass-through, the auto-skip reasons, and the
+    ablation's paired column;
+  - with a GPU, the whole comparison on a tiny model.
 - **MB tests.** `pipeline/tests/test_kb_driver_modes.py` adds:
   - the end-to-end / attribution parser;
   - host vs one-process parity (same checks, outputs and errors);
