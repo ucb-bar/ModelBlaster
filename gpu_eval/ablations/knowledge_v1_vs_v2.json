@@ -1,0 +1,19 @@
+{
+ "_": "Needs MB_KB_ROOT and MB_ABLATE_PROBLEMS (exported mb-kb-problem/1 dirs, e.g. gpu_eval/work/knowledge_v2/problems). Haiku; ~$0.15-0.3 per run; dry-run first.",
+ "name": "knowledge_v1_vs_v2",
+ "description": "Knowledge v1 (claims + bandit) vs v2 (knowledge.db), both from the seed WITHOUT mined evidence, so v2 is not helped by earlier runs on the same problems.",
+ "entry": "multislot",
+ "kb": "${MB_KB_ROOT}",
+ "inputs": ["${MB_ABLATE_PROBLEMS}/p_12_Gemm_Multiply_LeakyReLU", "${MB_ABLATE_PROBLEMS}/p_57_Conv2d_ReLU_HardSwish"],
+ "flags": {"--model": "us.anthropic.claude-haiku-5-5", "--reflect-model": "us.anthropic.claude-haiku-5-5",
+           "--rollouts": 2, "--steps": 3, "--max-fix": 1},
+ "env": {"KERNELBLASTER_ALLOW_SHARED_GPU": "1", "BEDROCK_MAX_TOKENS": "16384"},
+ "path_exclude": "xilinx", "path_prepend": ["/usr/local/cuda/bin"],
+ "gpu_model": "NVIDIA TITAN RTX",
+ "knowledge": {"mined": false},
+ "seeds": [0, 1, 2], "max_parallel": 2,
+ "budget": {"usd": 3.0, "est_usd_per_run": 0.3, "who": "ablate",
+            "ledger": "/scratch/dima/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+ "arms": {"v1": {"flags": {"--knowledge": "v1"}},
+          "v2": {"flags": {"--knowledge": "v2"}}}
+}
