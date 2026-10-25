@@ -1,8 +1,11 @@
 """ModelBlaster's timed runs through KernelBlaster's evaluators.
 
-The whole-model result (``kb_model_run``) and the hint re-measurement
-(``kb_proposals.remeasure``) are timed by KernelBlaster's own evaluators, so
-they run where -- and the way -- the KernelBlaster runs that optimised the
+The whole-model result (``kb_model_run``), the hint re-measurement
+(``kb_proposals.remeasure``) and, with ``--ssh-host`` (or ``kb_graph_opt
+--mb-evaluator kb``), the graph optimiser's per-round profiles
+(``kb_plan.profile_ir``) and final verification (``kb_ingest.verify_ir``,
+both through :func:`run_problem`) are run by KernelBlaster's own evaluators,
+so they run where -- and the way -- the KernelBlaster runs that optimised the
 components ran:
 
 - ``local``: this host's GPU pool (``--gpus auto|all|ids``; auto = the idle
@@ -137,8 +140,9 @@ class KBEval:
         if not self.available():
             raise FileNotFoundError(f"no KernelBlaster checkout with scripts/time_problems.py at {self.root} "
                                     "(set --kb or MB_KB_ROOT)")
-        work = Path(work)
+        work = Path(work).resolve()                 # time_problems.py runs in the checkout: absolute paths
         work.mkdir(parents=True, exist_ok=True)
+        jobs = [{**j, "problem": str(Path(j["problem"]).resolve())} for j in jobs]
         jf, of, log = work / f"{name}.jobs.json", work / f"{name}.result.json", work / f"{name}.log"
         jf.write_text(json.dumps({"jobs": jobs}))
         of.unlink(missing_ok=True)
@@ -165,13 +169,16 @@ class KBEval:
         return res
 
 
-def add_args(ap, *, prefix_help: str = "") -> None:
-    """The evaluator flags (``kb_model_run``, ``kb_proposals decide``)."""
+def add_args(ap, *, prefix_help: str = "", local_default: str = "local") -> None:
+    """The evaluator flags (``kb_model_run``, ``kb_proposals decide``; ``kb_plan profile`` and
+    ``kb_ingest --verify`` with ``local_default="builtin"``: auto without ``--ssh-host`` keeps
+    ModelBlaster's own run on the default GPU)."""
     g = ap.add_argument_group("KernelBlaster evaluator" + (f" ({prefix_help})" if prefix_help else ""))
+    auto = ("local when the KernelBlaster checkout has scripts/time_problems.py, else builtin"
+            if local_default == "local" else "builtin")
     g.add_argument("--evaluator", choices=["auto", "local", "ssh", "builtin"], default="auto",
                    help="local: this host's GPU pool + locks; ssh: remote GPUs (--ssh-host); builtin: ModelBlaster's "
-                        "own host on the default GPU (no pool); auto: ssh with --ssh-host, else local when the "
-                        "KernelBlaster checkout has scripts/time_problems.py, else builtin")
+                        f"own run on the default GPU (no pool); auto: ssh with --ssh-host, else {auto}")
     g.add_argument("--kb", help="KernelBlaster checkout (default $MB_KB_ROOT, else third_party/KernelBlaster)")
     g.add_argument("--kb-python", default=sys.executable, help="python for KernelBlaster")
     g.add_argument("--gpus", default="auto", help="local GPUs: auto (idle ones) | all | nvidia-smi indices / UUIDs")
@@ -187,11 +194,11 @@ def add_args(ap, *, prefix_help: str = "") -> None:
     g.add_argument("--eval-timeout", type=int, default=1800, help="seconds per evaluation")
 
 
-def from_args(a) -> KBEval | None:
+def from_args(a, *, local_default: str = "local") -> KBEval | None:
     """The evaluator the flags select; None for ``builtin``."""
     ev = a.evaluator
     if ev == "auto":
-        ev = "ssh" if a.ssh_host else "local"
+        ev = "ssh" if a.ssh_host else local_default
         if ev == "local" and not KBEval(kb=Path(a.kb) if a.kb else None).available():
             return None
     if ev == "builtin":
@@ -252,3 +259,103 @@ def required_hardware(recorded: list[dict], *, gpu_model: str | None = None, arc
     return {"gpu_model": model, "arch": a or (archs[0] if archs else None), "recorded_models": models,
             "recorded_archs": [f"sm_{x}" for x in archs], "verified": bool(models) and not problems,
             "explicit": bool(gpu_model), "warnings": warnings}
+
+
+# ---------------------------------------------------------------- ModelBlaster's check / profile runs
+
+def builtin_device(arch: str) -> dict | None:
+    """The GPU a builtin run lands on (the first visible one), from nvidia-smi."""
+    try:
+        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    gpus = [[x.strip() for x in line.split(",")] for line in txt.splitlines() if line.count(",") >= 2]
+    vis = [v.strip() for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
+    if vis:
+        gpus = [g for v in vis for g in gpus if v == g[0] or (v.startswith("GPU-") and g[1].startswith(v))]
+    if not gpus:
+        return None
+    i, uuid, name = gpus[0][:3]
+    return {"host": None, "label": i, "index": int(i) if i.isdigit() else None, "uuid": uuid, "name": name,
+            "arch": f"sm_{arch}"}
+
+
+def driver_result(row: dict) -> dict:
+    """One ``time_problems`` run (a KernelBlaster ``EvalResult`` as JSON) -> the
+    dict ``kb_export.parse_driver_output`` / ``build_and_run`` give for the same
+    driver output (``passed``, ``slots`` = the isolated-op checks, ...), plus
+    ``device`` (the GPU it ran on) and ``runtime``."""
+    res = {k: row.get(k) for k in (
+        "outputs", "slot_us", "op_us", "partition_us", "partition_graph_us", "graph_skip", "errors",
+        "e2e_us", "e2e_basis", "ref_e2e_us", "ref_e2e_basis", "e2e_ratio", "attr_slot_us", "attr_op_us",
+        "attr_sum_us", "attr_launches", "attr_slot_launches", "attr_skip", "launch_overhead_us",
+        "launch_overhead_graph_us", "launch_overhead_frac", "graph_nodes", "runtime", "eval_wall_s")}
+    for k in ("outputs", "slot_us", "op_us", "attr_slot_us", "attr_op_us", "attr_slot_launches"):
+        res[k] = res[k] or {}
+    res["errors"] = res["errors"] or []
+    res.update(passed=bool(row.get("ok")), slots=row.get("slot_checks") or {}, stage=row.get("stage"),
+               log=row.get("log") or "", device=row.get("gpu"))
+    return res
+
+
+def median_run(rows: list[dict]) -> dict:
+    """``build_and_run``'s choice over ``runs``: the passing run with the median
+    partition time (``partition_us_runs`` has every run's), else the first run."""
+    rs = [driver_result(r) for r in rows]
+    if not rs:
+        return {"passed": False, "stage": "run", "log": "no run", "device": None, "partition_us_runs": []}
+    ok = sorted((r for r in rs if r["passed"] and r["partition_us"]), key=lambda r: r["partition_us"])
+    best = ok[len(ok) // 2] if ok else rs[0]
+    return {**best, "partition_us_runs": [r["partition_us"] for r in rs if r["partition_us"]]}
+
+
+def check_device(device: dict | None, gpu_model: str | None, *, what: str, allow_mismatch: bool = False,
+                 warnings: list | None = None) -> bool | None:
+    """Did ``what`` run on ``gpu_model``? None when there is nothing to compare (no
+    required model or no recorded device name); a different model is a
+    :class:`HardwareMismatch` unless ``allow_mismatch`` (then a warning)."""
+    name = (device or {}).get("name")
+    if not gpu_model or not gpu_model_key(name):
+        return None
+    if same_gpu_model(name, gpu_model):
+        return True
+    msg = f"{what} ran on {name!r} ({(device or {}).get('label')}), not on {gpu_model} (the flow's GPU model)"
+    if not allow_mismatch:
+        raise HardwareMismatch(msg + " (--allow-gpu-mismatch to go on)")
+    if warnings is not None:
+        warnings.append(msg)
+    print(f"[kb_eval] WARNING: {msg}", file=sys.stderr, flush=True)
+    return False
+
+
+def run_problem(kbeval: KBEval, problem: Path, *, arch: str, work: Path, reps: int = 1,
+                gpu_model: str | None = None, allow_mismatch: bool = False, name: str = "check",
+                sources: dict | None = None) -> dict:
+    """Check (and time) one exported problem -- the driver checks every output
+    and op against the references linked into it -- through KernelBlaster's
+    evaluator, ``reps`` runs on one GPU of ``gpu_model`` -> :func:`median_run`'s
+    dict plus ``evaluator`` (``describe()``), ``kb_time`` (seconds, pool, models).
+
+    No GPU of ``gpu_model`` there is a :class:`HardwareMismatch`; with
+    ``allow_mismatch`` it runs on whatever the pool has, with a warning
+    (``hw_warnings``)."""
+    job = [{"id": "p", "problem": str(problem), "sources": sources, "reps": max(1, int(reps))}]
+    warn = []
+    try:
+        kr = kbeval.run(job, arch=arch, work=work, gpu_model=gpu_model, name=name)
+    except HardwareMismatch as e:
+        if not allow_mismatch:
+            raise
+        warn.append(f"{e}; ran on another GPU model (--allow-gpu-mismatch)")
+        print(f"[kb_eval] WARNING: {warn[-1]}", file=sys.stderr, flush=True)
+        kr = kbeval.run(job, arch=arch, work=work, gpu_model=None, name=name)
+    j = kr["jobs"]["p"]
+    res = median_run(j.get("runs") or [])
+    res["device"] = res.get("device") or j.get("gpu")
+    res["devices"] = j.get("gpus")
+    res["evaluator"] = kbeval.describe()
+    res["kb_time"] = {k: kr.get(k) for k in ("seconds", "models", "pool")}
+    if warn:
+        res["hw_warnings"] = warn
+    return res
