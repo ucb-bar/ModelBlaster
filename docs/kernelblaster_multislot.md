@@ -43,6 +43,22 @@ fused variant problem → KernelBlaster → accept/reject (fusion_registry.json)
 
 `gpu_eval/tools/kb_loop.sh IR_DIR WORK_DIR` runs one full round.
 
+**Resume.** Every stage survives a kill (SIGKILL, OOM, reboot, ssh drop, Ctrl-C): rerun the
+same command.
+
+- **KernelBlaster.** `run_multislot.py` keeps a journal per problem: an atomic snapshot after the
+  baseline and every step, plus each LLM response, fsynced before its candidate is evaluated. A
+  rerun skips finished problems and continues the others from their last completed step. An
+  in-flight step reuses its journaled responses, so only a call in flight at the kill is paid
+  again. Store, outcome-log and claims records are idempotent. A different configuration is
+  refused (exit 3; `--force-restart`). SIGTERM / SIGINT stop it cleanly with exit 75.
+- **`kb_graph_opt`.** It continues inside the interrupted round (`rNN/progress.json`), and
+  `--rounds` is the total for the work dir.
+- **`kb_loop.sh`.** It skips its finished steps (`W/.kb_loop/`).
+
+Details: [graph_optimizer.md](graph_optimizer.md), "Resume", and KernelBlaster
+`docs/multislot_optimization.md`, "Resume".
+
 **One hardware for the model and its components.** KernelBlaster records the GPU every
 result was timed on (`result.json` `gpu`: model name, UUID, host, arch). The model's result
 (`kb_model_run`) and, with `--ssh-host`, the graph optimiser's per-round profiles, re-measurement
