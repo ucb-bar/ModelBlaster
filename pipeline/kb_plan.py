@@ -72,6 +72,7 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
     time is used and ``device`` records the GPU it ran on."""
     from . import graph_hints as gh
     from . import kb_telemetry as kbt
+    from . import kb_trace
     from .kb_eval import builtin_device, run_problem
     from .kb_export import build_and_run, export_problem, slot_id_of
     from .kb_ingest import cache_plan, signature_sha
@@ -87,7 +88,8 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
                           sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
     # as deployed: CUDA graph where capturable; per-op GPU time from the driver's attribution
     with kbt.get().span("mb.profile.run", ir=Path(ir_dir).name, runs=runs,
-                        evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp:
+                        evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp, \
+            kb_trace.get().scope(mb_stage="profile", ir=Path(ir_dir).name):
         if kbeval is not None:
             res = run_problem(kbeval, prob, arch=arch, work=work / "kb_time", reps=runs, gpu_model=gpu_model,
                               allow_mismatch=allow_gpu_mismatch, name="profile")
@@ -134,6 +136,11 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
             elif p.exists():
                 p.unlink()
     (work / "profile.json").write_text(json.dumps(out, indent=1))
+    kb_trace.record("profile", ir=out["ir"], mb_stage="profile", work=str(work), passed=out["passed"],
+                    partition_us=out["partition_us"], e2e_us=out["e2e_us"], device=out["device"],
+                    files=kb_trace.files({"profile.json": work / "profile.json",
+                                          "manifest.json": prob / "manifest.json"}),
+                    log=kb_trace.get().put(res.get("log")) if res.get("log") else None)
     return out
 
 
@@ -211,8 +218,15 @@ def problems(plan: dict) -> dict:
 
 
 def make_plan(profiles: list[dict], **kw) -> dict:
+    from . import kb_trace
+    excl = len(kw.get("exclude") or ())
+    opts = {k: v for k, v in kw.items() if k != "exclude"}
     plan = problems(select(rank(profiles, kw.pop("weights", None)), **kw))
     plan["profiles"] = [{"ir": p["ir"], "ir_dir": p["ir_dir"], "partition_us": p["partition_us"]} for p in profiles]
+    # the plan's inputs (every profile's per-op times) and its output
+    kb_trace.record("plan", mb_stage="plan", options=opts, excluded=excl, selected_share=plan.get("selected_share"),
+                    profiles=kb_trace.put_json(profiles), plan=kb_trace.put_json(plan),
+                    problems=[(p["ir"], len(p["op_names"])) for p in plan["problems"]])
     return plan
 
 
@@ -241,6 +255,9 @@ def export_plan(plan: dict, out: Path, *, cache=None, arch: str = "75", specs: d
                                    strategy="plan", slot_sources=cp["sources"] if cp else None,
                                    slot_source_tags=cp["tags"] if cp else None,
                                    sub_sources=cp["sub_sources"] if cp else None))
+    from . import kb_trace
+    kb_trace.record("export", mb_stage="export", out=str(out), problems=[str(d) for d in dirs],
+                    manifests={Path(d).name: kb_trace.files({"m": Path(d) / "manifest.json"}).get("m") for d in dirs})
     return dirs
 
 
