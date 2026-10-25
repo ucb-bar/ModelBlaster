@@ -130,7 +130,7 @@ class FakeKB(go.KBRunner):
         return _FakeProc(t)
 
 
-def fake_remeasure(problems, *, arch, reps, lease=None):
+def fake_remeasure(problems, *, arch, reps, lease=None, **kw):
     """Original 100 us; the variant's gain is a function of the problem and
     every source it runs (seeds included), so a hint evaluated from a
     different cache state gets a different number. The split and the

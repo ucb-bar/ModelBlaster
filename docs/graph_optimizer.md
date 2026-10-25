@@ -171,6 +171,18 @@ the same budget in one run; then both composite bests are built once and run rou
 `remeasure` times on one leased GPU (`kb_proposals.remeasure`), and the medians decide
 (`accept_gain`, 3 %). With `--ssh-host` that GPU is one of the KernelBlaster runs' remote GPUs
 (see "Flags" below).
+A re-measurement without a passing run on a side says why: each failing side's stage and error
+text go to `remeasure.result.json` (`failures`), the hint's evidence (`why`, `remeasure_errors`)
+and the trace (`mb.remeasure` records, the `mb.remeasure.attempt` telemetry span). An
+infrastructure failure -- the copy to, the link to or the GPU of the leased device failed, not
+the candidate (KernelBlaster's `[infra]` tag, its CUDA-device / ssh patterns) -- is retried on a
+fresh lease (`remeasure_attempts`, 3 in all, the k-th retry after k x `remeasure_retry_s`, 20 s)
+and once more after the wave's KernelBlaster run has finished. Still failing, the hint is
+recorded `undecided`: the evidence is kept, it does not vote, the hint stays `proposed` (a
+candidate again next round) and the round is no fixpoint. A candidate's own failure (wrong
+output, crash) rejects the hint, with its error in `why`. The same holds for KernelBlaster's own
+final runs of the two sides: a side that is not `final_ok` says why (`final_error`), and when
+every failing side lost to the infrastructure (`final_infra`) the hint is undecided, not rejected.
 Accepting caches the variant's new slots (the fused kernel, the split variants) on their shapes,
 whatever their speedup over their seed, since the decision already measured them against the
 unchanged graph.
