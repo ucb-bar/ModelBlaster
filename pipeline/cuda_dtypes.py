@@ -44,9 +44,15 @@ TOLERANCE = {
 
 
 def op_dtype(kind: str) -> str:
-    """Storage dtype of an op kind (``*_f16`` ops are fp16; fused ops follow
-    their name, ``fused__a_f16__b_f16``)."""
-    return FP16 if kind.endswith("_f16") else FP32
+    """Storage dtype of an op kind or C entry (``*_f16`` ops are fp16). A fused
+    op follows its stages: ``fused__<kind>[__<param>]__<kind>[__<param>]...``,
+    whose name may end in the param that reads the intermediate
+    (``fused__ewise2_f16__ewise2_f16__a``: still fp16)."""
+    base = kind.removeprefix("kernel_")
+    if base.startswith("fused__"):
+        stages = [p for p in base.split("__")[1:] if p]
+        return FP16 if stages and stages[0].endswith("_f16") else FP32
+    return FP16 if base.endswith("_f16") else FP32
 
 
 def cuda_signature(signature: str) -> str:

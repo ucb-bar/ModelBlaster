@@ -26,6 +26,13 @@ class ContractTest(unittest.TestCase):
     def test_dtypes_and_spelling(self):
         self.assertEqual(cuda_dtypes.op_dtype("conv2d_f16"), "fp16")
         self.assertEqual(cuda_dtypes.op_dtype("conv2d"), "fp32")
+        # fused kinds follow their stages, also when the name ends in the param that reads
+        # the intermediate (these were fp32: the variant compiled without cuda_fp16.h)
+        for k in ("fused__ewise2_f16__sigmoid_f16", "fused__ewise2_f16__ewise2_f16__a",
+                  "fused__conv2d_f16__ewise2_f16__a", "kernel_fused__ewise2_f16__ewise2_f16__a"):
+            self.assertEqual(cuda_dtypes.op_dtype(k), "fp16", k)
+        for k in ("fused__ewise2__ewise2__a", "fused__add__relu", "kernel_fused__ewise2__ewise2__a"):
+            self.assertEqual(cuda_dtypes.op_dtype(k), "fp32", k)
         self.assertEqual(cuda_dtypes.cuda_signature("void kernel_relu_f16(const _Float16 *x, _Float16 *y, int n)"),
                          "void kernel_relu_f16(const __half *x, __half *y, int n)")
         import numpy as np
