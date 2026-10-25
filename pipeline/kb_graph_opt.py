@@ -60,6 +60,11 @@ Work dir: ``graph_hints.json`` (modelblaster.graph_hints/v1), ``cache/``
 (mb-cuda-cache/1), ``knowledge/`` (KernelBlaster), ``state.json``,
 ``rNN/{profile,plan.json,problems,run,winners,variants,round.json}``,
 ``summary.json``. One process at a time owns a work dir (``.lock``).
+
+Resume (``kb_resume.py``): ``--rounds`` is the total for the work dir, IR set and
+settings (``--more-rounds N`` adds N); a killed run continues inside the
+interrupted round from ``rNN/progress.json`` (the KernelBlaster runs from their
+journals); SIGTERM / SIGINT / SIGHUP stop cleanly, exit 75.
 """
 from __future__ import annotations
 
@@ -78,6 +83,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import graph_hints as gh
+from . import kb_resume
 from . import kb_telemetry as kbt
 from .kb_export import base_slot_id, export_problem
 from .kb_ingest import CudaCache, cache_plan, ingest, verify_ir
@@ -95,7 +101,8 @@ class Config:
     plugins: list = field(default_factory=list)
     python: str = sys.executable
     arch: str = "75"
-    rounds: int = 4
+    rounds: int = 4                     # rounds in total for this work dir, IR set and configuration
+    more_rounds: int = 0                # run this many rounds more than were run (even past a fixpoint)
     rollouts: int = 2
     steps: int = 4
     variant_steps: int | None = None
@@ -315,6 +322,8 @@ class KBRunner:
                "--knowledge-dir", str(self.knowledge), "--model", c.model, "--arch", c.arch,
                "--rollouts", str(c.rollouts), "--steps", str(steps if steps is not None else c.steps),
                "--max-fix", str(c.max_fix), "--seed", str(c.seed)]
+        if kb_resume.kb_supports_resume(c.kb):         # a killed run's out dir continues (its journals)
+            cmd += ["--resume"]
         if c.reflect_model:
             cmd += ["--reflect-model", c.reflect_model]
         if winners is not None:
@@ -345,14 +354,18 @@ class KBRunner:
         out.mkdir(parents=True, exist_ok=True)
         log = open(out.with_suffix(".log"), "w")
         try:
+            # own session: a terminal's Ctrl-C reaches it once, forwarded by kb_resume.STOP
             p = subprocess.Popen(self.command(problems, out, **kw), stdout=log, stderr=subprocess.STDOUT,
-                                 cwd=str(self.cfg.kb))
+                                 cwd=str(self.cfg.kb), start_new_session=True)
         finally:
             log.close()                               # the child holds its own descriptor
+        kb_resume.STOP.register(p)
         return p
 
     def collect(self, problems: list[Path], out: Path, proc: subprocess.Popen) -> list[dict]:
         rc = proc.wait()
+        kb_resume.STOP.unregister(proc)
+        kb_resume.kb_exit(rc, out.with_suffix(".log"))  # 75: stopped on a signal -> Interrupted
         if rc != 0:
             raise RuntimeError(f"KernelBlaster failed ({rc}); see {out.with_suffix('.log')}")
         res = []
@@ -718,7 +731,8 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
     made in the given order, in this thread."""
     T = kbt.get()
     with T.span("mb.prepare", hints=len(items)):
-        jobs = [prepare_hint(h, prof, out, cache=cache, cfg=cfg, specs=specs) for h, prof, out in items]
+        jobs = [kb_resume.prepared(prepare_hint, h, prof, out, cache=cache, cfg=cfg, specs=specs)
+                for h, prof, out in items]
     live = [k for k, j in enumerate(jobs) if "early" not in j]
     results: dict[int, tuple] = {}
     if live:
@@ -792,6 +806,7 @@ def decide_hints(cands: list[tuple[dict, dict]], graphs: dict, out: Path, width:
 
 def run(irs: list[Path], work: Path, cfg: Config) -> dict:
     work = Path(work).resolve()
+    kb_resume.STOP.install()                      # SIGTERM / SIGINT / SIGHUP: stop cleanly, resumable
     with work_lock(work):
         tel = kbt.load(cfg.kb)                    # telemetry (kb_telemetry.py); a no-op without it
         tel.configure(work / "telemetry.jsonl")
@@ -887,17 +902,34 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     n_gpu_rec = len(kb.gpus)
     T = kbt.get()
     run_span = T.current()
-    for r in range(len(state["rounds"]), len(state["rounds"]) + cfg.rounds):
+    # resume (kb_resume.py): --rounds counts the rounds of this IR set and configuration in the
+    # work dir; a round killed midway continues in the phase it was in (rNN/progress.json)
+    key = kb_resume.round_key(cfg, irs)
+    kh = kb_resume.key_hash(key)
+    n_rounds = (cfg.more_rounds if cfg.more_rounds else
+                0 if state.get("fixpoint_key") == kh else
+                max(0, cfg.rounds - sum(1 for x in state["rounds"] if x.get("key") == kh)))
+    if not n_rounds and state.get("complete") == kh and (work / "summary.json").exists():
+        print(json.dumps({"resume": "work dir already complete for these IRs and settings"}), flush=True)
+        return json.loads((work / "summary.json").read_text())
+    for r in range(len(state["rounds"]), len(state["rounds"]) + n_rounds):
+        kb_resume.STOP.check()
+        state.pop("complete", None)
         R = work / f"r{r:02d}"
+        prog = kb_resume.RoundProgress(R, key)
+        if prog.resumed:
+            print(json.dumps({"round": r, "resume": sorted(prog.data["phases"])}), flush=True)
         t0 = time.time()
-        rec = {"round": r, "kb_runs": [], "decisions": []}
+        rec = {"round": r, "key": kh, "kb_runs": [], "decisions": []}
         rsec, n_kb = kbt.section("mb.round", collect=True, laps=True, round=r), len(kb.telemetry)
         T.lap("mb.profile")
         profiles = []
-        for d in irs:
-            p = profile_ir(Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
-                           specs=specs, runs=cfg.profile_runs, kbeval=mbev, gpu_model=hw.model,
-                           allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+        saved = prog.get("profile")
+        for i, d in enumerate(irs):
+            p = saved[i] if saved else profile_ir(
+                Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
+                specs=specs, runs=cfg.profile_runs, kbeval=mbev, gpu_model=hw.model,
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch)
             had = hw.model
             hw.check("profile", p.get("device"), f"r{r:02d}/{p['ir']}")
             if hw.model != had:                          # the first profile fixed the flow's model
@@ -910,6 +942,9 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         bad = [p["ir"] for p in profiles if not p["passed"]]
         if bad:
             raise RuntimeError(f"round {r}: profile failed for {bad}; see {R / 'profile'}")
+        if not saved:
+            prog.mark("profile", profiles)
+        kb_resume.STOP.check()
         first = first or {p["ir"]: p["partition_us"] for p in profiles}
         rec["partition_us"] = {p["ir"]: p["partition_us"] for p in profiles}
         T.lap("mb.propose")
@@ -920,22 +955,23 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                                    doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"],
                                                    launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
         T.lap("mb.plan")
-        plan = make_plan(profiles, coverage=cfg.coverage, top_k=cfg.top_k, min_share=cfg.min_share,
-                         exclude=set(state["sent"]))
+        plan = prog.once("plan", lambda: make_plan(profiles, coverage=cfg.coverage, top_k=cfg.top_k,
+                                                   min_share=cfg.min_share, exclude=set(state["sent"])))
         (R / "plan.json").write_text(json.dumps(plan, indent=1))
         rec["plan"] = {"selected_share": plan["selected_share"],
                        "problems": [(p["ir"], len(p["op_names"])) for p in plan["problems"]]}
         if plan["problems"]:
             T.lap("mb.export")
-            dirs = export_plan(plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
-                               names={p["ir"]: f"{p['ir']}__r{r:02d}" for p in plan["problems"]})
+            dirs = [Path(x) for x in prog.once("export", lambda: [str(x) for x in export_plan(
+                plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
+                names={p["ir"]: f"{p['ir']}__r{r:02d}" for p in plan["problems"]})])]
             T.lap("mb.kb_wait", kind="plan")
             results = kb.run(dirs, R / "run", winners=R / "winners")
             T.lap("mb.ingest")
             rec["kb_runs"] = [{k: x.get(k) for k in ("problem", "baseline_partition_us", "final_partition_us",
                                                       "speedup", "final_ok", "llm_calls")} for x in results]
             if (R / "winners" / "winners.json").exists():
-                rec["ingest"] = ingest(R / "winners" / "winners.json", cache, specs)
+                rec["ingest"] = prog.once("ingest", lambda: ingest(R / "winners" / "winners.json", cache, specs))
             state["sent"] += [it["key"] for it in plan["items"] if it.get("selected")]
             for x in results:
                 pf = Path(x["_dir"]) / "proposals.json"
@@ -947,13 +983,25 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                         gh.merge(doc, [h])
         gh.save(doc, hints_path)
         T.lap("mb.decide")
-        todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
-                and h["kind"] in ("fuse", "split_slot") and _est_gain(h) >= cfg.min_gain_pct]
-        todo.sort(key=lambda h: -_est_gain(h))              # stable: ties keep the hints file's order
-        cands = [(h, p) for h in todo[:cfg.max_variants] if (p := _hint_ir(h, profiles)) is not None]
+        kb_resume.STOP.check()
+
+        def _cands():
+            todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
+                    and h["kind"] in ("fuse", "split_slot") and _est_gain(h) >= cfg.min_gain_pct]
+            todo.sort(key=lambda h: -_est_gain(h))          # stable: ties keep the hints file's order
+            return {"n_todo": len(todo), "cands": [(h["id"], p["ir"]) for h in todo[:cfg.max_variants]
+                                                   if (p := _hint_ir(h, profiles)) is not None]}
+        cs = prog.once("cands", _cands)                     # the candidates before any was decided
+        todo = [None] * cs["n_todo"]
+        cands = [(gh.get(doc, hid), next(p for p in profiles if p["ir"] == ir)) for hid, ir in cs["cands"]]
         t_dec = time.time()
-        waves, rec["decisions"] = decide_hints(cands, graphs, R / "variants", width, kb=kb, cache=cache, doc=doc,
-                                               cfg=cfg, specs=specs, leases=leases, hints_path=hints_path)
+
+        def _wave(k, items):
+            run_dir = items[0][2] / "run" if len(items) == 1 else R / "variants" / f"wave{k:02d}"
+            return evaluate_hints(items, run_dir, kb=kb, cache=cache, doc=doc, cfg=cfg, specs=specs, leases=leases)
+        waves, rec["decisions"] = kb_resume.decide_hints(
+            prog, cands, graphs, R / "variants", width, decide_wave=_wave, schedule=schedule, footprint=footprint,
+            specs=specs, hints_path=hints_path, save_hints=lambda: gh.save(doc, hints_path))
         rec["parallel_hints"], rec["waves"] = width, waves
         for g in kb.gpus[n_gpu_rec:]:
             hw.check("kb", g.get("gpu"), Path(g["run"]).name)
@@ -970,7 +1018,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         if tr["mb"] or tr["kb"]:
             rec["telemetry"] = tr
         state["rounds"].append(rec)
-        state_path.write_text(json.dumps(state, indent=1))
+        kb_resume.atomic_write_json(state_path, state)
         (R / "round.json").write_text(json.dumps(rec, indent=1))
         accepted = [d for d in rec["decisions"] if d.get("hint_status") == "accepted"]
         print(json.dumps({"round": r, "partition_us": rec["partition_us"], "plan": rec["plan"]["problems"],
@@ -978,7 +1026,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                           "decisions": [(d["hint"], d["status"], d.get("gain")) for d in rec["decisions"]]}),
               flush=True)
         if not accepted and not plan["problems"] and len(todo) <= cfg.max_variants:
-            state["fixpoint"] = r
+            state["fixpoint"], state["fixpoint_key"] = r, kh
+            kb_resume.atomic_write_json(state_path, state)
             break
     final = {}
     with T.span("mb.verify", evaluator=mbev.evaluator if mbev is not None else "builtin"):
@@ -1033,11 +1082,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     (work / "model_runtime.json").write_text(json.dumps(models, indent=1, default=str))
     summary["gpu"] = hw.summary()
     state["gpu_check"] = summary["gpu"]
-    state_path.write_text(json.dumps(state, indent=1))
     tr = {"mb": kbt.compact(T.full_summary(run_span)), "kb": kbt.kb_rollup(kb.telemetry)}
     if tr["mb"] or tr["kb"]:
         summary["telemetry"] = tr
-    (work / "summary.json").write_text(json.dumps(summary, indent=1))
+    kb_resume.atomic_write_json(work / "summary.json", summary)
+    state["complete"] = kh                         # a rerun with nothing to do returns this summary
+    kb_resume.atomic_write_json(state_path, state)
     return summary
 
 
@@ -1086,7 +1136,11 @@ def main():
                  runtime=a.runtime, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
                  mb_evaluator=a.mb_evaluator,
                  **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in _MANUAL_FIELDS})
-    print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
+    try:
+        print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
+    except kb_resume.Interrupted as e:
+        print(f"[kb_graph_opt] interrupted: {e}; rerun the same command to resume", file=sys.stderr, flush=True)
+        sys.exit(kb_resume.EXIT_INTERRUPTED)
 
 
 if __name__ == "__main__":

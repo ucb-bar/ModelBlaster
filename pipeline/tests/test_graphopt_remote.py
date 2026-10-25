@@ -402,9 +402,9 @@ class RunWiringTest(unittest.TestCase):
         # the KernelBlaster runs of a resumed call are pinned to it
         kb = go.KBRunner(go.FlowHardware(self.cfg(), st).pin(self.cfg()), self.t / "k")
         self.assertIn("--gpu-model NVIDIA L40S", " ".join(kb.command([self.t / "p"], self.t / "o")))
-        # and a resumed call's profile is pinned too
+        # and a later call's profile is pinned too (--rounds is the work dir's total: one more round)
         self.install([L40S])
-        go.run([self.t / "ir"], self.t / "w", self.cfg())
+        go.run([self.t / "ir"], self.t / "w", self.cfg(more_rounds=1))
         self.assertEqual(self.calls["profile"][-1]["gpu_model"], "NVIDIA L40S")
 
     def test_a_profile_on_another_model_is_an_error(self):

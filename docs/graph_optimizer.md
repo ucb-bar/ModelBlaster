@@ -47,6 +47,7 @@ rounds; `gpu_eval/tools/kb_loop.sh` is still one round (now on the hints file, w
 | MB | `pipeline/kb_ingest.py` | `cache_plan` (per-slot lookups, coverage splits, cached stage kernels for fused seeds), `verify_ir` with hints |
 | MB | `pipeline/kb_export.py` | `MB_OP_US`, slot variants (`slot_variant`), fused specs rebuilt from their names, `build_and_run(runs=)`, `--hints`, `--plan` |
 | MB | `pipeline/kb_graph_opt.py` | rounds to a fixpoint; KernelBlaster as a subprocess; hint footprints, conflict waves, GPU leases, work-dir lock |
+| MB | `pipeline/kb_resume.py` | resume inside a round (`rNN/progress.json`), resumed hint waves, signal forwarding |
 | KB | `agents/opt_multislot.py` | `propose_splits` (kind `split`) next to `propose_fusions`; fused shapes in the roofline cost |
 | KB | `knowledge/slots.py`, `impl_store.py` | `EvalResult.op_us`; fused shapes bucket by their first stage |
 | KB | `scripts/run_multislot.py` | `--plugin FILE` (register `stub:` models from another process) |
@@ -177,12 +178,76 @@ unchanged graph.
 ### Rounds and the fixpoint
 
 `kb_graph_opt.run` keeps `graph_hints.json`, `cache/`, KernelBlaster's `knowledge/` and
-`state.json` (items sent, rounds) in the work dir, so a later call resumes. A round: profile →
+`state.json` (items sent, rounds) in the work dir, so a later call resumes. A round killed midway
+continues in the phase it was in ("Resume" below). A round: profile →
 MB proposals → plan → KB → ingest → KB proposals → decide the `max_variants` undecided hints with
 the largest estimated gain, independent ones together (next section). Accepted fusions are applied in the next round's profile, which makes
 the fused op's consumer a new candidate (chains grow: conv→bn, then (conv+bn)→relu) and the fused
 instances new plan items. It stops when a round accepts nothing, sends nothing and has no more
-undecided hints than it can evaluate, or after `rounds`.
+undecided hints than it can evaluate, or once the work dir has `rounds` rounds for these IRs and
+settings (`--more-rounds N`: N beyond that).
+
+### Resume
+
+A run killed by SIGKILL, OOM, a reboot, an ssh drop or Ctrl-C continues when the same command is
+rerun on the work dir. Only the interrupted phase is redone, and no LLM response that reached a
+KernelBlaster run is paid for again. The phase state is in `pipeline/kb_resume.py`; the hooks
+are in `kb_graph_opt._run`.
+
+**Rounds.** `--rounds N` is the total for the work dir, IR set and round-affecting settings
+(model, budgets, thresholds, seed, arch). A rerun of a finished run does nothing: it returns
+`summary.json`. A fixpoint reached under those settings ends the rounds too. `--more-rounds N`
+runs N more rounds, even past a fixpoint. Earlier rounds of other IR sets in a shared work dir
+do not count.
+
+**Within a round.** `rNN/progress.json` is written atomically and records the finished phases:
+
+| Phase | On resume |
+|---|---|
+| profile | The saved profiles are used, so the proposals and the plan are the killed attempt's. |
+| plan | `plan.json` is reused. |
+| export | The exported problem dirs are reused, never re-exported, so KernelBlaster's journals still match. |
+| KernelBlaster run | It runs again on the same out dir with `--resume`. Finished problems are skipped. In-flight steps reuse their journaled codegen / fix responses. Only an LLM call in flight at the kill is repeated. |
+| ingest | Its saved report is used. |
+| KernelBlaster proposals | Merged again (idempotent). |
+| decide | The candidate hints and their waves are fixed when the phase starts. Finished waves are skipped, and their decisions come from `progress.json`. The interrupted wave is redone on the problems it exported (`<hint>/job.json`). Its KernelBlaster run resumes. The re-measurement and the decision are made again. A decision lands in `progress.json` only after the hints file is saved, so it is never recorded twice. |
+| final verify, `kb_model_run`, `summary.json` | Redone until `summary.json` is written. |
+
+**Stale rounds.** A round started under other round settings or another IR set is moved aside to
+`rNN.stale-<time>` and redone. So is a round dir from before `progress.json` existed.
+
+**Signals.** The first SIGTERM / SIGINT / SIGHUP is forwarded to the running KernelBlaster
+processes. They finish their in-flight steps, flush their journals and exit 75, and then
+`kb_graph_opt` exits **75**. A second signal is forwarded too, and both exit at once
+(`kb_graph_opt` with **76**); this is still resumable.
+
+KernelBlaster children run in their own session, so a terminal's Ctrl-C reaches them once.
+They also stop by themselves when `kb_graph_opt` dies (`KB_STOP_WITH_PARENT=1`: they poll
+their parent). When a resumed run starts KernelBlaster on the same out dir, KernelBlaster waits
+on the out dir's lock until the orphan has stopped.
+
+**Locks.** The work-dir lock `W/.lock` and the GPU locks in `/dev/shm` are `flock`s, so they are
+released when their process dies; a stale lock file never blocks a resume.
+
+**Remote leftovers.** With `--ssh-host`, KernelBlaster records what each process staged and
+started remotely. A resumed run removes the killed process's one-shot binaries and partial
+data.bin transfers and stops its orphan persistent hosts, by recorded pid and only in the remote
+dir. Other runs' files are not touched. The KernelBlaster docs (`docs/multislot_optimization.md`,
+"Resume") have the journal format and its idempotency rules.
+
+**`kb_loop.sh`.** It keeps step markers in `W/.kb_loop/` and skips finished steps on a rerun:
+export, the KernelBlaster run, each variant's build, run and decision, ingest, and the model run.
+The KernelBlaster runs resume from their journals. After a finished round, a rerun starts the
+next round; `FRESH=1` discards an unfinished one. It forwards signals the same way (exit 75).
+
+**Tests.** `pipeline/tests/test_kb_resume.py` covers the round progress, stale rounds,
+resumed waves, kept hint jobs and signal forwarding. With a GPU, it also runs the tiny
+conv→bn→relu model (stub LLM, three rounds) twice:
+
+- **Killed and resumed.** It is SIGKILLed while round 0's KernelBlaster run is going, then again
+  in the middle of a hint's variant run. The final result after resuming has the same hint
+  statuses, decision counts, fused ops, fixpoint and LLM call totals as an uninterrupted run.
+- **SIGTERM.** It exits 75 and resumes to completion.
 
 ### Parallel hint decisions
 
@@ -510,7 +575,7 @@ KernelBlaster `llm_server` running there. The KB subprocesses inherit the variab
 ### Live run (Bedrock `us.anthropic.claude-haiku-5-5`, single runs)
 
 `kb_graph_opt` on Level3 `8_ResNetBasicBlock` + `9_ResNet18` together, one round per call
-(the work dir resumes), `--rollouts 1 --steps 3 (2 in round 2) --variant-steps 1
+(the work dir resumes; with `--rounds` now the work dir's total, that is `--more-rounds 1` per call), `--rollouts 1 --steps 3 (2 in round 2) --variant-steps 1
 --max-variants 2 (1) --max-fix 1 --top-k 3 --remeasure 5`, no reflection model:
 
 | round | profile at start (block / R18, ms) | sent to KB | decisions (re-measured gain) | LLM calls |
