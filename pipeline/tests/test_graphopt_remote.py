@@ -273,7 +273,7 @@ class RemeasureDeviceTest(unittest.TestCase):
     def test_local_remeasure_records_the_leased_device(self):
         seen = {}
 
-        def fake_remeasure(pair, *, arch, reps, lease=None):
+        def fake_remeasure(pair, *, arch, reps, lease=None, **kw):
             with lease as env:
                 seen["env"] = env
             return [[10.0], [9.0]]

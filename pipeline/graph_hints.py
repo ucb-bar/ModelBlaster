@@ -155,7 +155,10 @@ def merge(doc: dict, hints: list[dict]) -> list[dict]:
 
 def record_decision(doc: dict, hint: dict | str, evidence: dict) -> dict:
     """Append a decision to a hint (added if unknown); its status becomes the
-    majority of its decisions (a tie rejects)."""
+    majority of its decisions (a tie rejects). An ``undecided`` decision (its
+    re-measurement lost to an infrastructure failure) is kept as evidence but
+    does not vote: with no vote the status stays as it was (``proposed``: the
+    hint is a candidate again in a later round)."""
     hid = hint if isinstance(hint, str) else hint["id"]
     h = get(doc, hid)
     if h is None:
@@ -164,8 +167,11 @@ def record_decision(doc: dict, hint: dict | str, evidence: dict) -> dict:
         h = copy.deepcopy(hint)
         doc["hints"].append(h)
     h.setdefault("evidence", []).append(evidence)
-    wins = sum(1 for x in h["evidence"] if x["decision"] == "accepted")
-    h["status"] = "accepted" if wins > len(h["evidence"]) - wins else "rejected"
+    votes = [x for x in h["evidence"] if x["decision"] in ("accepted", "rejected")]
+    if not votes:
+        return h
+    wins = sum(1 for x in votes if x["decision"] == "accepted")
+    h["status"] = "accepted" if wins > len(votes) - wins else "rejected"
     if h["status"] == "accepted":
         # an accepted change applies wherever its pattern matches (split: by
         # shape bucket); the instances it was measured on stay as evidence
