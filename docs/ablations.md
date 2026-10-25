@@ -105,7 +105,7 @@ paths are relative to the spec file, and `${VAR}` is expanded; an unset variable
 | `trace` | value for `--trace` when the target supports it (default `meta`; `null` = the target's default) |
 | `timeout_s` | per-run timeout (SIGTERM) |
 | `stop_grace_s` | how long runs get to stop after a signal (default 150) |
-| `torch_baseline` | JSON `{problem: us}`; adds a "vs torch" column. A run's own `torch_us` / `torch_e2e_us` key is used if present |
+| `torch_baseline` | JSON `{problem: us}`; adds a "vs torch" column. A run's own `torch_us` / `torch_e2e_us` key is used if present. A `graph_opt` run whose model run timed torch itself (`kb_model_run --torch-baseline`, [gpu_harness_perf.md](gpu_harness_perf.md), "Against PyTorch") reports its paired `speedup_vs_torch` (same GPU, same session) in "vs torch" and `speedup_vs_torch_wall` in "vs torch wall"; this file is then only the fallback |
 | `report` | `baseline` (default: the first arm); `pairs` (`baseline` or `all`); `bootstrap`; `permutations` |
 
 ### Arm keys
