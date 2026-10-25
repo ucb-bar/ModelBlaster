@@ -45,8 +45,10 @@ fused variant problem → KernelBlaster → accept/reject (fusion_registry.json)
 
 **One hardware for the model and its components.** KernelBlaster records the GPU every
 result was timed on (`result.json` `gpu`: model name, UUID, host, arch). The model's result
-(`kb_model_run`) and, with `--ssh-host`, the graph optimiser's re-measurement are timed through
-the same KernelBlaster evaluators: the local GPU pool with its locks, or SSH to the remote GPUs.
+(`kb_model_run`) and, with `--ssh-host`, the graph optimiser's per-round profiles, re-measurement
+and final verification run through the same KernelBlaster evaluators: the local GPU pool with its
+locks, or SSH to the remote GPUs ([graph_optimizer.md](graph_optimizer.md), "Where the GPU steps
+run").
 They require that GPU model and arch, so a model number and its partition numbers always come
 from the same GPU model, by default from one GPU. No GPU of that model is an error unless
 `--allow-gpu-mismatch` is given. Details and the L40S measurements are in
@@ -60,14 +62,14 @@ from the same GPU model, by default from one GPU. No GPU of that model is an err
 | MB | `pipeline/kb_ingest.py` | winners → CUDA kernel cache (shape guard), model-level verification |
 | MB | `pipeline/kb_proposals.py` | fusion: fused op + `FusedKernelSpec`, variant export, accept/reject registry |
 | MB | `pipeline/kb_model_run.py` | the model's result: winners composed into one whole-model runtime, checked, timed by graph replay against the seeds (and the sum of the partitions) on the components' GPU model |
-| MB | `pipeline/kb_eval.py` | ModelBlaster's timed runs (model result, re-measurement over ssh) through KernelBlaster's local / ssh evaluators; the GPU model and arch the runs recorded (`required_hardware`); the evaluator flags |
+| MB | `pipeline/kb_eval.py` | ModelBlaster's GPU runs (model result; with `--ssh-host` the graph optimiser's profiles, re-measurement and verification) through KernelBlaster's local / ssh evaluators (`KBEval`, `run_problem`); the GPU model and arch the runs recorded (`required_hardware`, `check_device`); the evaluator flags |
 | MB | `pipeline/op_classes.py` | op → class (gemm, conv, reduction, elementwise, data_movement, attention, scan, other) |
 | MB | `gpu_eval/harness/walk_torch.py` | reference values (torch IR walk; runs fused ops' `sub_ops`) |
 | MB | `gpu_eval/tools/kb_loop.sh` | the round above |
 | MB | `pipeline/kb_telemetry.py` | graph-optimiser telemetry: loads KB's `telemetry` package, rolls up KB runs |
 | KB | `data/sources/modelblaster_source.py` | `ModelBlasterSource` ("modelblaster"); `Problem.slots` |
 | KB | `knowledge/slots.py` | `SlotProblem`, assembly, driver-output parsing, `LocalEvaluator`, `SSHEvaluator` (`gpu_model` / `max_devices` pinning, `EvalResult.gpu`), `ServerEvaluator` |
-| KB | `scripts/time_problems.py` | check + time problems outside the agent loop (paired with an incumbent, rounds or jobs order), for ModelBlaster's model result and re-measurement |
+| KB | `scripts/time_problems.py` | check + time problems outside the agent loop (paired with an incumbent, rounds or jobs order), for ModelBlaster's model result, re-measurement, profiles and verification |
 | KB | `knowledge/runtime_host.py` | client for the persistent driver host (protocol, crash recovery, host pool) |
 | KB | `knowledge/impl_store.py` | implementation knowledgebase |
 | KB | `knowledge/outcomes.py`, `claims.py`, `reflect.py`, `semantic.py` | outcome records + semantic update pass |
@@ -267,11 +269,13 @@ ModelBlaster's graph optimiser (`pipeline/kb_graph_opt.py`, via `pipeline/kb_tel
 |---|---|
 | `mb.run` | the whole run |
 | `mb.round` | a round, with laps `mb.profile`, `mb.propose`, `mb.plan`, `mb.export`, `mb.kb_wait` (the plan's KernelBlaster run), `mb.ingest`, `mb.decide` |
+| `mb.profile.run` | inside the profile lap: one IR's profile runs (`evaluator` builtin / local / ssh, `device`, `gpu`, `host`, `passed`); with a KernelBlaster evaluator its child is `mb.kb_time` |
 | `mb.prepare` | inside decide: exporting each hint's original and variant problems |
 | `mb.kb_wait` | inside decide: waiting for a wave's KernelBlaster run |
 | `mb.remeasure` | inside decide: re-timing, in the worker threads |
 | `mb.finish` | inside decide: decisions and ingest |
-| `mb.verify` | the final model-level verification |
+| `mb.verify` | the final model-level verification (`evaluator`) |
+| `mb.verify.run` | one IR's verification run (`evaluator`, `device`, `gpu`, `host`, `passed`); child `mb.kb_time` with a KernelBlaster evaluator |
 | `mb.model_run` | the model's result per IR; children `mb.model_run.compose` (cache, plan, export), `mb.model_run.time` |
 | `mb.kb_time` | one call of KernelBlaster's `time_problems.py` (evaluator, GPU model, jobs, seconds); its own spans go to `<work>/kb_time/<name>.telemetry.jsonl` |
 
@@ -385,7 +389,5 @@ One live round on the ResNet basic block (Haiku 5.5, local TITAN RTX, 2 rollouts
   ResNet18 numbers). The live results above are single runs.
 - RISC-V: the same manifest and agent apply once the Zephyr harness emits per-op PROFILE rows
   and the bridge builds per-slot files; open RISC-V issues are listed in the KB bug-fix notes.
-- The per-round profiles and the final model-level verification of the graph optimiser still run
-  on this host's default GPU (they plan and check; the reported numbers come from the pool).
 - The KB submodule tracks `kris-dong/KernelBlaster` `feat/multislot`; merge it into
   `backend-refactor` (and upstream) after review.

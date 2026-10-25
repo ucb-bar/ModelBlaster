@@ -161,24 +161,9 @@ def _time_builtin(prob: Path, *, arch: str, work: Path, sources=None, ref_source
 
 
 def _builtin_device(arch: str) -> dict | None:
-    """The GPU a builtin run lands on (the first visible one), from nvidia-smi."""
-    import os
-    import subprocess
+    from .kb_eval import builtin_device
 
-    try:
-        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader"],
-                             capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    gpus = [[x.strip() for x in line.split(",")] for line in txt.splitlines() if line.count(",") >= 2]
-    vis = [v.strip() for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
-    if vis:
-        gpus = [g for v in vis for g in gpus if v == g[0] or (v.startswith("GPU-") and g[1].startswith(v))]
-    if not gpus:
-        return None
-    i, uuid, name = gpus[0][:3]
-    return {"host": None, "label": i, "index": int(i) if i.isdigit() else None, "uuid": uuid, "name": name,
-            "arch": f"sm_{arch}"}
+    return builtin_device(arch)
 
 
 def _from_kb(job: dict, *, identical: bool = False) -> dict:
