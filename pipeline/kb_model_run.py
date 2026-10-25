@@ -36,16 +36,25 @@ error (``--allow-gpu-mismatch``: time anyway, with warnings), so the model
 number and the component numbers come from the same hardware.
 ``--evaluator builtin`` keeps ModelBlaster's own host on the default GPU.
 
+5. **against PyTorch** (``--torch-baseline auto|on|off``, default auto): the
+   original PyTorch module with the IR's weights and inputs, on the same GPU
+   (UUID), eager / CUDA graph / ``torch.compile``, TF32 off and on, timed in ABBA
+   blocks with the model the same way (GPU events and host wall clock per
+   forward pass, steady-state throughput) -- ``pipeline/torch_baseline.py``.
+
 -> ``modelblaster.model_runtime/v1`` (``--out``): ``model_e2e_us`` (graph
 replay; the reported result), ``seed_e2e_us``, ``speedup``, eager times,
 launch overhead, the composed slots, the device (``device``, ``gpu_name``,
 ``gpu_uuid``, ``gpu_host``), ``hardware`` (required vs recorded, ``match``)
-and, with partitions, each one's device and their sum.
+and, with partitions, each one's device and their sum; with the baseline
+``torch_baseline`` (the table) and ``torch_us`` / ``torch_*_us`` / ``speedup_vs_torch``
+(``_wall``, ``_eager``).
 
     python -m modelblaster.pipeline.kb_model_run IR_DIR --kb-runs RUN_DIR [...] [--cache DIR] \\
         [--hints graph_hints.json] [--arch 89] [--reps 3] [--time-partitions] --work DIR --out model.json \\
         [--evaluator local --gpus auto | --evaluator ssh --ssh-host H [--ssh-host H2] --remote-dir D \\
-         [--cuda-visible-devices auto|ids] [--ssh-key K]] [--runtime auto|host|process] [--gpu-model M]
+         [--cuda-visible-devices auto|ids] [--ssh-key K]] [--runtime auto|host|process] [--gpu-model M] \\
+        [--torch-baseline auto|on|off] [--torch-python PY] [--torch-source FILE] [--torch-rounds 4]
 """
 from __future__ import annotations
 
@@ -242,7 +251,7 @@ def _slot_files(prob: Path) -> dict:
 def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path | None = None, arch: str | None = None,
                   reps: int = 3, time_partitions: bool = False, keep: bool = False, specs: dict | None = None,
                   kbeval=_AUTO, gpu_model: str | None = None, allow_gpu_mismatch: bool = False,
-                  recorded: list | None = None) -> dict:
+                  recorded: list | None = None, torch_baseline: str = "off", torch_opts: dict | None = None) -> dict:
     """Compose the winners into the whole model, check it and time it (see the module doc).
 
     ``kbeval``: a :class:`kb_eval.KBEval` (KernelBlaster's local or ssh evaluator), None for
@@ -250,7 +259,9 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
     KernelBlaster checkout (``$MB_KB_ROOT`` / the submodule) when it has one, else builtin.
     ``gpu_model`` / ``arch``: required hardware (default: what the KernelBlaster runs recorded,
     see ``kb_eval.required_hardware``; ``recorded`` adds GPU records of runs not in ``runs``,
-    e.g. ``kb_graph_opt``'s rounds). ``allow_gpu_mismatch`` times anyway, with warnings."""
+    e.g. ``kb_graph_opt``'s rounds). ``allow_gpu_mismatch`` times anyway, with warnings.
+    ``torch_baseline`` (off | auto | on) with ``torch_opts`` (:func:`torch_comparison`): the
+    model against the PyTorch module on the same GPU (``torch_baseline``, ``torch_*`` fields)."""
     from . import graph_hints as gh
     from . import kb_eval as ke
     from .kb_export import export_problem
@@ -397,15 +408,93 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
         out["sum_partitions_seed_e2e_us"] = ss
         if out["model_e2e_us"]:
             out["boundary_effect_us"] = out["model_e2e_us"] - sp_     # > 0: the model costs more than its parts
+    if torch_baseline and torch_baseline != "off":
+        tres = torch_comparison(ir_dir, comp, model, mode=torch_baseline, work=work / "torch", kbeval=kbeval,
+                                arch=arch, gpu_model=hw["gpu_model"], **(torch_opts or {}))
+        out["torch_baseline"] = tres
+        from .torch_baseline import summary_fields, table
+        out.update(summary_fields(tres))
+        print(table(tres), file=sys.stderr, flush=True)
     if not keep:
         for d in work.glob("*"):
             if d.name.startswith("build") or d.name in ("model", "seed", "ir"):
                 shutil.rmtree(d, ignore_errors=True)
-        for d in (work / "kb_time").glob("*_kbwork"):
+        for d in [*(work / "kb_time").glob("*_kbwork"), *(work / "torch" / "kb_time").glob("*_kbwork"),
+                  work / "torch" / "build_ours", work / "torch" / "bundle"]:
             shutil.rmtree(d, ignore_errors=True)
     from . import kb_trace
     kb_trace.record("model_run", mb_stage="model_run", ir=Path(ir_dir).name, work=str(work), result=out)
     return out
+
+
+def torch_comparison(ir_dir: Path, comp: Path, model: dict, *, mode: str, work: Path, kbeval, arch: str,
+                     gpu_model: str | None, python: str | None = None, source: str | None = None, rounds: int = 4,
+                     variants=None, warm: int = 10, budget_ms: float = 200.0, thru_n: int = 100) -> dict:
+    """The composed model against PyTorch on the model run's GPU (``torch_baseline.compare``).
+
+    ``mode``: ``auto`` runs it when it can -- the model passed, its device has a UUID, the
+    IR's PyTorch source is found, and there is a torch python for the timing host
+    (``python`` / ``$MB_TORCH_PYTHON``; locally also KernelBlaster's python when it imports
+    torch with CUDA) -- else records why not (``status: skipped``), and a failure is
+    ``status: failed`` (the model's own result stands); ``on`` raises instead."""
+    import os
+    from . import torch_baseline as tb
+
+    if mode not in ("auto", "on"):
+        raise ValueError(f"torch_baseline must be auto|on|off, not {mode!r}")
+    dev = model.get("device") or {}
+    python = python or os.environ.get("MB_TORCH_PYTHON") or None
+
+    def no(status, why):
+        if mode == "on":
+            raise RuntimeError(f"torch baseline {status}: {why}")
+        print(f"[kb_model_run] torch baseline {status}: {why}", file=sys.stderr, flush=True)
+        return {"format": tb.FORMAT, "status": status, "reason": why}
+    if not model.get("passed"):
+        return no("skipped", "the model did not pass its checks")
+    if not dev.get("uuid"):
+        return no("skipped", "the model's device has no UUID")
+    if source is None and tb.find_source(ir_dir) is None:
+        return no("skipped", f"no PyTorch source for {Path(ir_dir).name} (--torch-source / $MB_TORCH_SRC)")
+    if dev.get("host"):
+        if not python:
+            return no("skipped", f"no torch python for {dev['host']} (--torch-python / $MB_TORCH_PYTHON)")
+    elif not python:
+        cands = [getattr(kbeval, "python", None), sys.executable]
+        python = next((p for p in cands if p and tb.torch_python_ok(p)), None)
+        if python is None:
+            return no("skipped", "no local python with torch + CUDA (--torch-python)")
+    try:
+        with kbt.get().span("mb.model_run.torch", ir=Path(ir_dir).name, device=dev.get("label")):
+            return tb.compare(ir_dir=ir_dir, problem=comp, device=dev, work=work, kbeval=kbeval, arch=arch,
+                              gpu_model=gpu_model, python=python, source=source, rounds=rounds,
+                              variants=tuple(variants or tb.VARIANTS), warm=warm, budget_ms=budget_ms, thru_n=thru_n)
+    except tb.Skip as e:
+        return no("skipped", str(e))
+    except Exception as e:  # noqa: BLE001 -- auto: reported next to the model's result
+        if mode == "on":
+            raise
+        return no("failed", f"{type(e).__name__}: {e}")
+
+
+def add_torch_args(ap) -> None:
+    """``--torch-*`` flags (``kb_model_run``; ``kb_graph_opt`` has the same names)."""
+    g = ap.add_argument_group("PyTorch baseline (docs/gpu_harness_perf.md, 'Against PyTorch')")
+    g.add_argument("--torch-baseline", choices=["auto", "on", "off"], default="auto",
+                   help="time the PyTorch module on the model's GPU, interleaved with the model: auto (default) "
+                        "when the source and a torch python are there, on (an error otherwise), off")
+    g.add_argument("--torch-python", help="python with torch on the timing host (default $MB_TORCH_PYTHON; local: "
+                                          "--kb-python / this python when it imports torch)")
+    g.add_argument("--torch-source", help="the model's PyTorch source (default: found next to the IR set)")
+    g.add_argument("--torch-rounds", type=int, default=4, help="ABBA rounds of ours / torch blocks (default 4)")
+    g.add_argument("--torch-variants", default="eager,graph,compile_mna,compile_ro",
+                   help="torch variants: eager, graph, compile_mna (max-autotune-no-cudagraphs), compile_ro "
+                        "(reduce-overhead)")
+
+
+def torch_opts(a) -> dict:
+    return {"python": a.torch_python, "source": a.torch_source, "rounds": a.torch_rounds,
+            "variants": [v for v in a.torch_variants.split(",") if v]}
 
 
 def main():
@@ -428,6 +517,7 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--out", help="write the result here (also printed)")
     ke.add_args(ap)
+    add_torch_args(ap)
     a = ap.parse_args()
     from .kb_ingest import CudaCache
 
@@ -440,7 +530,8 @@ def main():
             res = model_runtime(Path(a.ir_dir), work=Path(a.work), cache=CudaCache(Path(a.cache)) if a.cache else None,
                                 runs=a.kb_runs, hints=Path(a.hints) if a.hints else None, arch=a.arch, reps=a.reps,
                                 time_partitions=a.time_partitions, keep=a.keep, kbeval=kbeval,
-                                gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch)
+                                gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
+                                torch_baseline=a.torch_baseline, torch_opts=torch_opts(a))
             summ = kbt.compact(tel.full_summary(sp))
         if summ:
             res["telemetry"] = summ
@@ -451,7 +542,8 @@ def main():
         Path(a.out).write_text(txt)
     print(json.dumps({k: res.get(k) for k in ("ir", "passed", "model_e2e_us", "model_basis", "seed_e2e_us", "speedup",
                                                "speedup_paired", "sum_partitions_e2e_us", "boundary_effect_us",
-                                               "gpu_name", "gpu_host")}
+                                               "gpu_name", "gpu_host", "torch_status", "torch_best_us",
+                                               "torch_best_variant", "speedup_vs_torch", "speedup_vs_torch_wall")}
                      | {"device": (res.get("device") or {}).get("label"), "match": res["hardware"].get("match")}))
 
 
