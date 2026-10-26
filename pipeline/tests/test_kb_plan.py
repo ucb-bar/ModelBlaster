@@ -123,5 +123,86 @@ class CachePlanTest(unittest.TestCase):
             self.assertEqual(p["sub_sources"], {"fused__conv2d__batchnorm2d": {"conv2d": "// winner 0\n"}})
 
 
+class CachePlanFp16Test(unittest.TestCase):
+    """fp16 entries are keyed by the CUDA-side signature (_Float16 -> __half): the split path must find them
+    (it compared the raw signature's sha, so a slot with winners tuned on different shapes was never split and
+    the model ran on the seed kernels)."""
+
+    def test_fp16_slot_splits_by_shape_winners(self):
+        spec = K["linear_f16"]
+        shapes = [{"M": 128, "K": 64, "N": 64}, {"M": 128, "K": 64, "N": 64}, {"M": 128, "K": 64, "N": 32}]
+        g = {"name": "mlp16", "ops": [{"name": f"l{i}", "op": "linear_f16", "shape": sh} for i, sh in enumerate(shapes)]}
+        with tempfile.TemporaryDirectory() as d:
+            c = CudaCache(Path(d))
+            for k, sh in enumerate((shapes[0], shapes[2])):
+                c.add(op="linear_f16", entry="kernel_linear_f16", signature=spec.signature, arch="sm_89",
+                      shapes=[sh], code=f"// winner {k}\n", slot_us=1.0, speedup=3.0, impl_id=f"w{k}", source={})
+            p = cache_plan(g, c, "sm_89", K)
+        self.assertEqual(p["sources"], {"linear_f16__v0": "// winner 0\n", "linear_f16__v1": "// winner 1\n"})
+        self.assertEqual(p["hints"][0]["groups"], [{"ops": ["l0", "l1"], "cache": "w0", "as": "slot"},
+                                                   {"ops": ["l2"], "cache": "w1", "as": "slot"}])
+
+
+class PerItemPlanTest(unittest.TestCase):
+    def test_one_problem_per_selected_item(self):
+        plan = make_plan(_profiles(), coverage=2.0, top_k=None, min_share=0.0, per_item=True)
+        sel = [it for it in plan["items"] if it["selected"]]
+        self.assertEqual(len(plan["problems"]), len(sel))
+        ids = [p["id"] for p in plan["problems"]]
+        self.assertEqual(len(ids), len(set(ids)))                     # unique export dirs / names
+        for p in plan["problems"]:
+            self.assertEqual(len(p["keys"]), 1)
+        # the budgeted plan is unchanged: one problem per IR, no ids
+        base = make_plan(_profiles(), coverage=0.8)
+        self.assertTrue(all("id" not in p for p in base["problems"]))
+
+
+class ExportPlanRepeatedNamesTest(unittest.TestCase):
+    """49_Mamba2ReturnFinalState: einsum_1 lowers to six ops all named einsum_1 in graph.json; the profile (and the
+    plan) call them einsum_1, einsum_1#1..#5. export_plan matched those against the raw names, so the 6.9 ms
+    einsum_1#4 bmm went to KernelBlaster as an empty partition (baseline 1.28 us, 0 LLM calls) and the
+    einsum_2 problem silently carried all three einsum_2 ops."""
+
+    def _graph(self):
+        ops = [{"name": "einsum_1", "op": "strided_copy_f16"}, {"name": "einsum_1", "op": "bmm_f16"},
+               {"name": "einsum_1", "op": "bmm_f16"}, {"name": "einsum_2", "op": "strided_copy_f16"},
+               {"name": "einsum_2", "op": "bmm_f16"}]
+        return {"name": "m", "ops": ops, "tensors": {}}
+
+    def test_export_matches_unique_names(self):
+        import json
+        from unittest import mock
+
+        from modelblaster.pipeline import kb_export
+        from modelblaster.pipeline.kb_plan import export_plan
+
+        plan = {"problems": [{"id": "m__bmm_f16_0", "ir": "m", "op_names": ["einsum_1#2"]},
+                             {"id": "m__strided_copy_f16_1", "ir": "m", "op_names": ["einsum_2"]},
+                             {"id": "m__bmm_f16_2", "ir": "m", "op_names": ["einsum_1#1", "einsum_2#1"]}]}
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "graph.json").write_text(json.dumps(self._graph()))
+            for p in plan["problems"]:
+                p["ir_dir"] = d
+
+            def fake(ir_dir, out, op_indices=None, **kw):
+                got[Path(out).name] = op_indices
+                return out
+            with mock.patch.object(kb_export, "export_problem", fake):
+                export_plan(plan, Path(d) / "out", specs={})
+        self.assertEqual(got, {"m__bmm_f16_0": [2], "m__strided_copy_f16_1": [3], "m__bmm_f16_2": [1, 4]})
+
+    def test_unknown_op_name_is_an_error_not_an_empty_problem(self):
+        from modelblaster.pipeline import graph_hints as gh
+        from modelblaster.pipeline.kb_plan import plan_op_indices
+
+        g = gh.unique_names(self._graph())
+        with self.assertRaises(ValueError):
+            plan_op_indices(g, ["einsum_1#7"], "p")
+        with self.assertRaises(ValueError):
+            plan_op_indices(g, ["einsum_1#1", "nope"], "p")
+        self.assertEqual(plan_op_indices(g, ["einsum_1"], "p"), [0])
+
+
 if __name__ == "__main__":
     unittest.main()
