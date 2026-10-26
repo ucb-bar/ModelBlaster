@@ -83,7 +83,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 FORMAT = "modelblaster.graph_hints/v1"
-CUDA_KINDS = ("fuse", "split_slot", "unfuse")
+CUDA_KINDS = ("fuse", "split_slot", "unfuse", "fold_layout", "fuse_attention", "fuse_siblings", "fuse_region",
+              "fuse_view")
 NOT_ON_CUDA = {
     "tile_split": "OC/N tiles exist to run one op on several cores at once; a CUDA kernel already spans "
                   "every SM and the driver runs one stream, so tiles would serialise (use split_slot for "
@@ -194,6 +195,7 @@ _BUCKET_KEYS = {
     "gemm": ("M", "N", "K", "batch"),
     "conv": ("N", "IC", "OC", "OH", "OW", "KH", "KW", "G"),
     "attention": ("BH", "S", "D"),
+    "recurrent": ("T", "B", "I", "H"),          # op_classes recurrent class (opt-in)
 }
 
 
@@ -449,6 +451,152 @@ def _apply_split_cuda(graph, h, specs, prov):
     return graph
 
 
+def _apply_fold_layout_cuda(graph, h, specs, prov):
+    """``fold_layout``: strided copies around bmm folded into bmm_strided
+    (layout_fold.fold); ``ops`` (optional) limits it to those gemm ops."""
+    from .layout_fold import fold
+
+    only = {prov["renamed"].get(n, n) for n in h["ops"]} if h.get("ops") else None
+    g2, rep = fold(graph, only=only)
+    if not rep["folded"]:
+        prov["skipped"].append({"id": h["id"], "why": "no foldable copy around a bmm"})
+        return graph
+    for f in rep["folded"]:
+        next(o for o in g2["ops"] if o["name"] == f["op"])["hint"] = h["id"]
+    prov["applied"].append({"id": h["id"], "kind": "fold_layout",
+                            "folded": {f["op"]: f["copies"] for f in rep["folded"]}})
+    return g2
+
+
+def _apply_fuse_attention_cuda(graph, h, specs, prov, const_lookup=None):
+    """``fuse_attention``: bmm -> scale -> mask -> softmax|relu -> bmm chains (and the copies around them) into
+    one ``attention_f16`` op (attention_fuse.fuse); ``ops`` (optional) limits it to chains whose score bmm
+    is one of those ops (original or renamed names)."""
+    from .attention_fuse import VERIFIED_TRIU, fuse
+
+    only = None
+    if h.get("ops"):
+        only = set()
+        for n in h["ops"]:
+            only.add(prov["renamed"].get(n, n))
+            only.add(n)
+    if const_lookup is None and h.get("verified_masks"):
+        ok = set(h["verified_masks"])                # mask constants the proposer checked against triu(1)
+        const_lookup = lambda key: VERIFIED_TRIU if key in ok else None
+    g2, rep = fuse(graph, const_lookup=const_lookup, only=only)
+    if not rep["fused"]:
+        prov["skipped"].append({"id": h["id"], "why": "no attention chain (or the mask is not causal / constant)"})
+        return graph
+    for f in rep["fused"]:
+        next(o for o in g2["ops"] if o["name"] == f["op"])["hint"] = h["id"]
+        for n in f["removed"]:
+            prov["renamed"][n] = f["op"]
+    prov["applied"].append({"id": h["id"], "kind": "fuse_attention",
+                            "fused": {f["op"]: f["removed"] for f in rep["fused"]}})
+    return g2
+
+
+def _apply_fuse_siblings_cuda(graph, h, specs, prov):
+    """``fuse_siblings`` (fusion_ext, --fusion-extended siblings): each group of independent same-kind ops reading one
+    input becomes a ``fused__par__`` op (kb_proposals.fuse_siblings); without ``groups`` wherever find_siblings
+    finds the kind."""
+    from .kb_proposals import find_siblings, fuse_siblings, parse_kind
+
+    kind = h.get("fused_kind")
+    groups = h.get("groups")
+    if groups is None:
+        try:
+            want = parse_kind(kind, specs)[0]
+        except (ValueError, KeyError) as e:
+            prov["skipped"].append({"id": h["id"], "why": str(e)})
+            return graph, {}
+        groups = [g for g in find_siblings(graph, specs) if
+                  [next(o["op"] for o in graph["ops"] if o["name"] == n) for n in g] == want]
+    used = {}
+    for grp in groups:
+        try:
+            cur = _locate(graph, grp)
+            if len(cur) < 2:
+                raise ValueError("already one op")
+            g2, s = fuse_siblings(graph, cur, specs)
+            if kind and s.op != kind:
+                raise ValueError(f"group fuses to {s.op}, not {kind}")
+        except (ValueError, StopIteration, KeyError) as e:
+            prov["skipped"].append({"id": h["id"], "group": grp, "why": str(e)})
+            continue
+        graph = g2
+        new = "+".join(cur)
+        next(o for o in graph["ops"] if o["name"] == new)["hint"] = h["id"]
+        for n in list(grp) + list(cur):
+            prov["renamed"][n] = new
+        prov["applied"].append({"id": h["id"], "kind": "fuse_siblings", "op": new, "from": cur, "fused_kind": s.op})
+        used[s.op] = s
+    if not used and h.get("groups") is None:
+        prov["skipped"].append({"id": h["id"], "why": "pattern does not occur"})
+    return graph, used
+
+
+def _apply_fuse_view_cuda(graph, h, specs, prov):
+    """``fuse_view`` (view_fusion, --view-fusion on): elide the hint's pure-reshape views in front of flat elementwise
+    consumers, then fuse its chains like ``fuse``."""
+    from .view_fusion import elide
+
+    present = {o["name"] for o in graph["ops"]}
+    views = [v for v in h.get("views", []) if v in present]
+    try:
+        g2, _ = elide(graph, views)
+    except ValueError as e:
+        prov["skipped"].append({"id": h["id"], "why": str(e)})
+        return graph, {}
+    g3, used = _apply_fuse_cuda(g2, h, specs, prov)
+    if not used:
+        return graph, {}                                 # nothing fused: keep the views (no-op rewrite)
+    for a in prov["applied"]:
+        if a["id"] == h["id"]:
+            a["kind"], a["views"] = "fuse_view", views
+    return g3, used
+
+
+def _apply_fuse_region_cuda(graph, h, specs, prov):
+    """``fuse_region`` (region_slots, --region-slots): the hint's ``pattern`` (rnn_stack | attention_block | all)
+    wherever region_slots.find_regions finds it, or its explicit ``members`` (op names), becomes one ``region__`` op.
+    Applied after every other kind (the members keep their split variants: the region's composite seed calls each
+    member's own slot variant)."""
+    from .region_slots import find_regions, fuse_region
+
+    groups = [h["members"]] if h.get("members") else find_regions(graph, h.get("pattern", "all"), specs)
+    used = {}
+    for grp in groups:
+        try:
+            cur = _locate(graph, grp)
+            g2, s = fuse_region(graph, cur, specs, h.get("pattern", "ops"))
+        except (ValueError, StopIteration, KeyError) as e:
+            prov["skipped"].append({"id": h["id"], "group": grp, "why": str(e)})
+            continue
+        graph = g2
+        new = next(o for o in graph["ops"] if o["op"] == s.op)
+        new["hint"] = h["id"]
+        for n in list(grp) + list(cur):
+            prov["renamed"][n] = new["name"]
+        prov["applied"].append({"id": h["id"], "kind": "fuse_region", "op": new["name"], "from": cur,
+                                "fused_kind": s.op})
+        used[s.op] = s
+    if not used:
+        prov["skipped"].append({"id": h["id"], "why": "pattern does not occur"})
+    return graph, used
+
+
+def _fold_specs(graph, specs):
+    """Fused kinds whose head became bmm_strided need their FusedKernelSpec."""
+    from .kb_proposals import spec_from_kind
+
+    out = {}
+    for o in graph["ops"]:
+        if o["op"].startswith("fused__bmm_strided") and o["op"] not in specs:
+            out[o["op"]] = spec_from_kind(o["op"], {**specs, **out})
+    return out
+
+
 def _apply_unfuse_cuda(graph, h, specs, prov):
     ops = graph["ops"]
     targets = [o for o in ops if "sub_ops" in o and (o["name"] in (h.get("ops") or [])
@@ -521,7 +669,7 @@ def _renumber(graph: dict, before: dict[str, int]) -> None:
 
 
 def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, target: str = "cuda",
-                statuses: tuple | None = ("accepted",)) -> tuple[dict, dict, dict]:
+                statuses: tuple | None = ("accepted",), const_lookup=None) -> tuple[dict, dict, dict]:
     """Apply ``hints`` (those whose status is in ``statuses``; None = all) to
     a copy of ``graph`` for ``target``.
 
@@ -545,7 +693,12 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
                 return (0, -len(parse_kind(h["fused_kind"], specs)[0]))
             except (ValueError, KeyError):
                 return (0, 0)
-        return ({"fuse": 0, "unfuse": -1, "split_slot": 1}.get(h["kind"], 2), 0)
+        # fold_layout runs after fusion (it folds into a fused group's head bmm too)
+        # and before split_slot (the folded ops get new slot kinds to split)
+        # fuse_attention consumes accepted bmm/scale/mask fusions and folds the q/k/v/o copies itself, so it
+        # runs after fuse and before fold_layout (which would otherwise rewrite the same bmms)
+        return ({"fuse": 0, "unfuse": -1, "fuse_siblings": 0.3, "fuse_attention": 0.4, "fold_layout": 0.5,
+                 "split_slot": 1, "fuse_region": 1.5, "fuse_view": 0.1}.get(h["kind"], 2), 0)
 
     added = {}
     for h in sorted(todo, key=order):
@@ -572,6 +725,24 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
             g, sp = _apply_fuse_cuda(g, h, specs, prov)
             added.update(sp)
             specs.update(sp)
+        elif h["kind"] == "fuse_siblings":
+            g, sp = _apply_fuse_siblings_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "fuse_attention":
+            g = _apply_fuse_attention_cuda(g, h, specs, prov, const_lookup)
+        elif h["kind"] == "fuse_view":
+            g, sp = _apply_fuse_view_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "fuse_region":
+            g, sp = _apply_fuse_region_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "fold_layout":
+            g = _apply_fold_layout_cuda(g, h, specs, prov)
+            added.update(_fold_specs(g, specs))
+            specs.update(added)
         elif h["kind"] == "split_slot":
             g = _apply_split_cuda(g, h, specs, prov)
         elif h["kind"] == "unfuse":
@@ -639,7 +810,16 @@ def verify_rewrite(ir_dir: Path, graph: dict, *, specs: dict | None = None, buil
         out, _ = walk_torch.walk(new_ir, dev="cpu")
     res = {"golden": mbir.compare(out, ir.golden_out),
            "vs_original_walk": float((out - ref).abs().max()) if out.shape == ref.shape else None}
-    res["ok"] = bool(res["golden"]["ok"] and res["vs_original_walk"] == 0.0)
+    exact = res["vs_original_walk"] == 0.0
+    if not exact and res["vs_original_walk"] is not None and any(o.get("approx") for o in graph["ops"]):
+        # an approximate rewrite (attention_fuse: exact-fp32 reference instead of the fp16-rounded op chain) must
+        # stay within the fp16 OUTPUT tolerance of the original walk (not slot_rel: at 31's T=16384 the rounded
+        # chain itself is 2.3e-3 from the fp32 truth, l3_farm/analysis/attention_fusion.md) and pass the golden
+        from .cuda_dtypes import FP16, TOLERANCE
+        scale = float(ref.abs()[torch.isfinite(ref)].max()) if ref.numel() else 0.0
+        res["vs_original_rel"] = res["vs_original_walk"] / scale if scale else None
+        exact = res["vs_original_walk"] <= TOLERANCE[FP16]["output_rel"] * scale + TOLERANCE[FP16]["output_abs"]
+    res["ok"] = bool(res["golden"]["ok"] and exact)
     if build:
         from .kb_export import build_and_run, export_problem
         from .kb_proposals import write_variant_ir

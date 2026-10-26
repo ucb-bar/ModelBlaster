@@ -73,3 +73,101 @@ __global__ void k_sdpa_h(const __half *Q, const __half *Kt, const __half *V, __h
 extern "C" void kernel_sdpa_f16(const __half *Q, const __half *K, const __half *V, __half *output, int BH, int S, int D) {
     k_sdpa_h<<<mb_blocks((long)BH * S * D), mb_threads((long)BH * S * D)>>>(Q, K, V, output, BH, S, D);
 }
+
+// bmm with strided operands (layout_fold): one thread per C element, any strides
+__global__ void k_bmm_strided(const __half *A, const __half *B, __half *C, int B0, int B1, int M, int K, int N,
+                              int a_off, int a_s0, int a_s1, int a_sm, int a_sk,
+                              int b_off, int b_s0, int b_s1, int b_sk, int b_sn,
+                              int c_off, int c_s0, int c_s1, int c_sm, int c_sn) {
+    long i = MB_TID; if (i >= (long)B0 * B1 * M * N) return;
+    long n = i % N, m = (i / N) % M, b1 = (i / ((long)M * N)) % B1, b0 = i / ((long)B1 * M * N);
+    const __half *a = A + a_off + b0 * a_s0 + b1 * a_s1 + m * a_sm;
+    const __half *bb = B + b_off + b0 * b_s0 + b1 * b_s1 + n * b_sn;
+    double acc = 0.0f;
+    for (long k = 0; k < K; k++) acc += mb_ld(a[k * a_sk]) * mb_ld(bb[k * b_sk]);
+    C[c_off + b0 * c_s0 + b1 * c_s1 + m * c_sm + n * c_sn] = acc;
+}
+extern "C" void kernel_bmm_strided_f16(const __half *A, const __half *B, __half *C, int B0, int B1, int M, int K, int N,
+                                       int a_off, int a_s0, int a_s1, int a_sm, int a_sk,
+                                       int b_off, int b_s0, int b_s1, int b_sk, int b_sn,
+                                       int c_off, int c_s0, int c_s1, int c_sm, int c_sn) {
+    long tot = (long)B0 * B1 * M * N;
+    k_bmm_strided<<<mb_blocks(tot), mb_threads(tot)>>>(A, B, C, B0, B1, M, K, N, a_off, a_s0, a_s1, a_sm, a_sk,
+                                                       b_off, b_s0, b_s1, b_sk, b_sn, c_off, c_s0, c_s1, c_sm, c_sn);
+}
+
+
+// fused attention (attention_fuse) seed: one warp per query row, 32 keys per step (one per lane), online
+// softmax (running max / rescaled sum) in fp32, so the [M, N] score matrix is never materialised. Correct for any
+// strides with unit inner stride, D, DV <= 256; no tensor cores (KernelBlaster's job: mma.sync / ldmatrix / cp.async).
+#define MB_ATT_WARPS 4
+__global__ void k_attention(const __half *Q, const __half *K, const __half *V, __half *O,
+                            int B0, int B1, int M, int N, int D, int DV,
+                            int q_off, int q_s0, int q_s1, int q_sm, int k_off, int k_s0, int k_s1, int k_sn,
+                            int v_off, int v_s0, int v_s1, int v_sn, int o_off, int o_s0, int o_s1, int o_sm,
+                            int causal, int act, float scale) {
+    __shared__ float qs[MB_ATT_WARPS][256];
+    const unsigned FULL = 0xffffffffu;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    long row = (long)blockIdx.x * MB_ATT_WARPS + warp;
+    if (row >= (long)B0 * B1 * M) return;            // whole warp leaves together
+    long m = row % M, b1 = (row / M) % B1, b0 = row / ((long)M * B1);
+    const __half *q = Q + q_off + b0 * q_s0 + b1 * q_s1 + m * q_sm;
+    for (int d = lane; d < D; d += 32) qs[warp][d] = mb_ld(q[d]);
+    __syncwarp();
+    const __half *kb = K + k_off + b0 * k_s0 + b1 * k_s1;
+    const __half *vb = V + v_off + b0 * v_s0 + b1 * v_s1;
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+    float mx = -INFINITY, l = 0.0f;
+    long nend = (causal && m + 1 < N) ? m + 1 : N;
+    for (long n0 = 0; n0 < nend; n0 += 32) {
+        long n = n0 + lane;
+        float s = -INFINITY;
+        if (n < nend) {
+            const __half *kr = kb + n * k_sn;
+            float t = 0.0f;
+            for (int d = 0; d < D; d++) t += qs[warp][d] * mb_ld(kr[d]);
+            s = t * scale;
+        }
+        float p;
+        if (act == 1) {
+            p = s > 0.0f ? s : 0.0f;
+        } else {
+            float cm = s;
+            for (int o = 16; o; o >>= 1) cm = fmaxf(cm, __shfl_xor_sync(FULL, cm, o));
+            float nm = fmaxf(mx, cm);
+            float alpha = mx == -INFINITY ? 0.0f : expf(mx - nm);
+            p = s == -INFINITY ? 0.0f : expf(s - nm);
+            float ps = p;
+            for (int o = 16; o; o >>= 1) ps += __shfl_xor_sync(FULL, ps, o);
+            l = l * alpha + ps;
+#pragma unroll
+            for (int i = 0; i < 8; i++) acc[i] *= alpha;
+            mx = nm;
+        }
+        int cnt = (int)(nend - n0 < 32 ? nend - n0 : 32);
+        for (int j = 0; j < cnt; j++) {
+            float pj = __shfl_sync(FULL, p, j);
+            const __half *vr = vb + (n0 + j) * v_sn;
+#pragma unroll
+            for (int i = 0; i < 8; i++) { int e = lane + 32 * i; if (e < DV) acc[i] += pj * mb_ld(vr[e]); }
+        }
+    }
+    float inv = act == 1 ? 1.0f : 1.0f / l;
+    __half *o = O + o_off + b0 * o_s0 + b1 * o_s1 + m * o_sm;
+#pragma unroll
+    for (int i = 0; i < 8; i++) { int e = lane + 32 * i; if (e < DV) o[e] = acc[i] * inv; }
+}
+extern "C" void kernel_attention_f16(const __half *Q, const __half *K, const __half *V, __half *O,
+                                     int B0, int B1, int M, int N, int D, int DV,
+                                     int q_off, int q_s0, int q_s1, int q_sm, int k_off, int k_s0, int k_s1, int k_sn,
+                                     int v_off, int v_s0, int v_s1, int v_sn, int o_off, int o_s0, int o_s1, int o_sm,
+                                     int causal, int act, float scale) {
+    long rows = (long)B0 * B1 * M;
+    if (rows <= 0) return;
+    k_attention<<<(unsigned)((rows + MB_ATT_WARPS - 1) / MB_ATT_WARPS), 32 * MB_ATT_WARPS>>>(
+        Q, K, V, O, B0, B1, M, N, D, DV, q_off, q_s0, q_s1, q_sm, k_off, k_s0, k_s1, k_sn,
+        v_off, v_s0, v_s1, v_sn, o_off, o_s0, o_s1, o_sm, causal, act, scale);
+}

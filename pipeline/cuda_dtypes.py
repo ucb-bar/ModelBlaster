@@ -50,7 +50,7 @@ def op_dtype(kind: str) -> str:
     (``fused__ewise2_f16__ewise2_f16__a``: still fp16)."""
     base = kind.removeprefix("kernel_")
     if base.startswith("fused__"):
-        stages = [p for p in base.split("__")[1:] if p]
+        stages = [p for p in base.split("__")[1:] if p and p != "par"]     # fused__par__: sibling fusion
         return FP16 if stages and stages[0].endswith("_f16") else FP32
     return FP16 if base.endswith("_f16") else FP32
 

@@ -1,0 +1,940 @@
+{
+ "name": "kb_problem",
+ "version": 1,
+ "quant": "fp16",
+ "input": {
+  "tensor": "x"
+ },
+ "output": {
+  "tensors": [
+   "resid_dropout"
+  ],
+  "tensor": "resid_dropout"
+ },
+ "tensors": {
+  "x": {
+   "shape": [
+    128,
+    512,
+    768
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "c_attn": {
+   "shape": [
+    128,
+    512,
+    2304
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "getitem": {
+   "shape": [
+    128,
+    512,
+    768
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "getitem_1": {
+   "shape": [
+    128,
+    512,
+    768
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "getitem_2": {
+   "shape": [
+    128,
+    512,
+    768
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "view": {
+   "shape": [
+    128,
+    512,
+    8,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "transpose": {
+   "shape": [
+    128,
+    8,
+    512,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "view_1": {
+   "shape": [
+    128,
+    512,
+    8,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "transpose_1": {
+   "shape": [
+    128,
+    8,
+    512,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "view_2": {
+   "shape": [
+    128,
+    512,
+    8,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "transpose_2": {
+   "shape": [
+    128,
+    8,
+    512,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "transpose_3": {
+   "shape": [
+    128,
+    8,
+    96,
+    512
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "matmul": {
+   "shape": [
+    128,
+    8,
+    512,
+    512
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "mul": {
+   "shape": [
+    128,
+    8,
+    512,
+    512
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "_tensor_constant0": {
+   "shape": [
+    1,
+    1,
+    512,
+    512
+   ],
+   "dtype": "f16",
+   "quant": null,
+   "const": "const._tensor_constant0"
+  },
+  "masked_fill": {
+   "shape": [
+    128,
+    8,
+    512,
+    512
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "softmax": {
+   "shape": [
+    128,
+    8,
+    512,
+    512
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "attn_dropout": {
+   "shape": [
+    128,
+    8,
+    512,
+    512
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "matmul_1": {
+   "shape": [
+    128,
+    8,
+    512,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "transpose_4": {
+   "shape": [
+    128,
+    512,
+    8,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "contiguous": {
+   "shape": [
+    128,
+    512,
+    8,
+    96
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "view_3": {
+   "shape": [
+    128,
+    512,
+    768
+   ],
+   "dtype": "f16",
+   "quant": null
+  },
+  "resid_dropout": {
+   "shape": [
+    128,
+    512,
+    768
+   ],
+   "dtype": "f16",
+   "quant": null
+  }
+ },
+ "ops": [
+  {
+   "name": "c_attn",
+   "op": "linear_f16",
+   "inputs": [
+    "x"
+   ],
+   "outputs": [
+    "c_attn"
+   ],
+   "weight": "c_attn.weight",
+   "bias": "c_attn.bias",
+   "shape": {
+    "M": 65536,
+    "K": 768,
+    "N": 2304
+   },
+   "dispatch_id": 0,
+   "hardware_target": "any",
+   "depends_on": [],
+   "slot_variant": "v1",
+   "hint": "split:linear_f16"
+  },
+  {
+   "name": "getitem",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "c_attn"
+   ],
+   "outputs": [
+    "getitem"
+   ],
+   "shape": {
+    "off": 0,
+    "d0": 1,
+    "d1": 1,
+    "d2": 1,
+    "d3": 1,
+    "d4": 65536,
+    "d5": 768,
+    "s0": 0,
+    "s1": 0,
+    "s2": 0,
+    "s3": 0,
+    "s4": 2304,
+    "s5": 1
+   },
+   "dispatch_id": 1,
+   "hardware_target": "any",
+   "depends_on": [
+    0
+   ],
+   "slot_variant": "v1",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "getitem_1",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "c_attn"
+   ],
+   "outputs": [
+    "getitem_1"
+   ],
+   "shape": {
+    "off": 768,
+    "d0": 1,
+    "d1": 1,
+    "d2": 1,
+    "d3": 1,
+    "d4": 65536,
+    "d5": 768,
+    "s0": 0,
+    "s1": 0,
+    "s2": 0,
+    "s3": 0,
+    "s4": 2304,
+    "s5": 1
+   },
+   "dispatch_id": 2,
+   "hardware_target": "any",
+   "depends_on": [
+    0
+   ],
+   "slot_variant": "v3",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "getitem_2",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "c_attn"
+   ],
+   "outputs": [
+    "getitem_2"
+   ],
+   "shape": {
+    "off": 1536,
+    "d0": 1,
+    "d1": 1,
+    "d2": 1,
+    "d3": 1,
+    "d4": 65536,
+    "d5": 768,
+    "s0": 0,
+    "s1": 0,
+    "s2": 0,
+    "s3": 0,
+    "s4": 2304,
+    "s5": 1
+   },
+   "dispatch_id": 3,
+   "hardware_target": "any",
+   "depends_on": [
+    0
+   ],
+   "slot_variant": "v5",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "view",
+   "op": "view",
+   "inputs": [
+    "getitem_1"
+   ],
+   "outputs": [
+    "view"
+   ],
+   "shape": {
+    "n": 50331648
+   },
+   "dispatch_id": null,
+   "hardware_target": "any",
+   "depends_on": []
+  },
+  {
+   "name": "transpose",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "view"
+   ],
+   "outputs": [
+    "transpose"
+   ],
+   "shape": {
+    "off": 0,
+    "d0": 1,
+    "d1": 1,
+    "d2": 128,
+    "d3": 8,
+    "d4": 512,
+    "d5": 96,
+    "s0": 0,
+    "s1": 0,
+    "s2": 393216,
+    "s3": 96,
+    "s4": 768,
+    "s5": 1
+   },
+   "dispatch_id": 4,
+   "hardware_target": "any",
+   "depends_on": [],
+   "slot_variant": "v0",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "view_1",
+   "op": "view",
+   "inputs": [
+    "getitem"
+   ],
+   "outputs": [
+    "view_1"
+   ],
+   "shape": {
+    "n": 50331648
+   },
+   "dispatch_id": null,
+   "hardware_target": "any",
+   "depends_on": []
+  },
+  {
+   "name": "transpose_1",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "view_1"
+   ],
+   "outputs": [
+    "transpose_1"
+   ],
+   "shape": {
+    "off": 0,
+    "d0": 1,
+    "d1": 1,
+    "d2": 128,
+    "d3": 8,
+    "d4": 512,
+    "d5": 96,
+    "s0": 0,
+    "s1": 0,
+    "s2": 393216,
+    "s3": 96,
+    "s4": 768,
+    "s5": 1
+   },
+   "dispatch_id": 5,
+   "hardware_target": "any",
+   "depends_on": [],
+   "slot_variant": "v0",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "view_2",
+   "op": "view",
+   "inputs": [
+    "getitem_2"
+   ],
+   "outputs": [
+    "view_2"
+   ],
+   "shape": {
+    "n": 50331648
+   },
+   "dispatch_id": null,
+   "hardware_target": "any",
+   "depends_on": []
+  },
+  {
+   "name": "transpose_2",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "view_2"
+   ],
+   "outputs": [
+    "transpose_2"
+   ],
+   "shape": {
+    "off": 0,
+    "d0": 1,
+    "d1": 1,
+    "d2": 128,
+    "d3": 8,
+    "d4": 512,
+    "d5": 96,
+    "s0": 0,
+    "s1": 0,
+    "s2": 393216,
+    "s3": 96,
+    "s4": 768,
+    "s5": 1
+   },
+   "dispatch_id": 6,
+   "hardware_target": "any",
+   "depends_on": [],
+   "slot_variant": "v0",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "transpose_3",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "transpose"
+   ],
+   "outputs": [
+    "transpose_3"
+   ],
+   "shape": {
+    "off": 0,
+    "d0": 1,
+    "d1": 1,
+    "d2": 1,
+    "d3": 1024,
+    "d4": 96,
+    "d5": 512,
+    "s0": 0,
+    "s1": 0,
+    "s2": 0,
+    "s3": 49152,
+    "s4": 1,
+    "s5": 96
+   },
+   "dispatch_id": 7,
+   "hardware_target": "any",
+   "depends_on": [
+    4
+   ],
+   "slot_variant": "v2",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "matmul+mul+masked_fill",
+   "op": "fused__bmm_f16__mul_scalar_f16__ewise2_f16__a",
+   "inputs": [
+    "transpose_1",
+    "transpose_3",
+    "_tensor_constant0"
+   ],
+   "outputs": [
+    "masked_fill"
+   ],
+   "internal": [
+    "matmul",
+    "mul"
+   ],
+   "sub_ops": [
+    {
+     "name": "matmul",
+     "op": "bmm_f16",
+     "inputs": [
+      "transpose_1",
+      "transpose_3"
+     ],
+     "outputs": [
+      "matmul"
+     ],
+     "shape": {
+      "batch": 1024,
+      "M": 512,
+      "K": 96,
+      "N": 512
+     },
+     "dispatch_id": 8,
+     "hardware_target": "any",
+     "depends_on": [
+      5,
+      7
+     ]
+    },
+    {
+     "name": "mul",
+     "op": "mul_scalar_f16",
+     "inputs": [
+      "matmul"
+     ],
+     "outputs": [
+      "mul"
+     ],
+     "scalar": 0.10206207261596577,
+     "shape": {
+      "n": 268435456
+     },
+     "dispatch_id": 9,
+     "hardware_target": "any",
+     "depends_on": [
+      8
+     ]
+    },
+    {
+     "name": "masked_fill",
+     "op": "ewise2_f16",
+     "inputs": [
+      "mul",
+      "_tensor_constant0"
+     ],
+     "outputs": [
+      "masked_fill"
+     ],
+     "shape": {
+      "d0": 1,
+      "d1": 1,
+      "d2": 1,
+      "d3": 1,
+      "d4": 1024,
+      "d5": 262144,
+      "sa0": 0,
+      "sa1": 0,
+      "sa2": 0,
+      "sa3": 0,
+      "sa4": 262144,
+      "sa5": 1,
+      "sb0": 0,
+      "sb1": 0,
+      "sb2": 0,
+      "sb3": 0,
+      "sb4": 0,
+      "sb5": 1
+     },
+     "opc": 7,
+     "fn": "masked_fill",
+     "alpha": -Infinity,
+     "dispatch_id": 10,
+     "hardware_target": "any",
+     "depends_on": [
+      9
+     ]
+    }
+   ],
+   "shape": {
+    "a": {
+     "batch": 1024,
+     "M": 512,
+     "K": 96,
+     "N": 512
+    },
+    "b": {
+     "n": 268435456
+    },
+    "c": {
+     "d0": 1,
+     "d1": 1,
+     "d2": 1,
+     "d3": 1,
+     "d4": 1024,
+     "d5": 262144,
+     "sa0": 0,
+     "sa1": 0,
+     "sa2": 0,
+     "sa3": 0,
+     "sa4": 262144,
+     "sa5": 1,
+     "sb0": 0,
+     "sb1": 0,
+     "sb2": 0,
+     "sb3": 0,
+     "sb4": 0,
+     "sb5": 1
+    }
+   },
+   "hint": "fuse:fused__bmm_f16__mul_scalar_f16__ewise2_f16__a",
+   "dispatch_id": 8,
+   "depends_on": [
+    5,
+    7
+   ]
+  },
+  {
+   "name": "softmax",
+   "op": "softmax_f16",
+   "inputs": [
+    "masked_fill"
+   ],
+   "outputs": [
+    "softmax"
+   ],
+   "shape": {
+    "M": 524288,
+    "K": 512
+   },
+   "dispatch_id": 9,
+   "hardware_target": "any",
+   "depends_on": [
+    8
+   ]
+  },
+  {
+   "name": "attn_dropout",
+   "op": "view",
+   "inputs": [
+    "softmax"
+   ],
+   "outputs": [
+    "attn_dropout"
+   ],
+   "shape": {
+    "n": 268435456
+   },
+   "dispatch_id": null,
+   "hardware_target": "any",
+   "depends_on": []
+  },
+  {
+   "name": "matmul_1",
+   "op": "bmm_f16",
+   "inputs": [
+    "attn_dropout",
+    "transpose_2"
+   ],
+   "outputs": [
+    "matmul_1"
+   ],
+   "shape": {
+    "batch": 1024,
+    "M": 512,
+    "K": 512,
+    "N": 96
+   },
+   "dispatch_id": 10,
+   "hardware_target": "any",
+   "depends_on": [
+    6
+   ]
+  },
+  {
+   "name": "transpose_4",
+   "op": "strided_copy_f16",
+   "inputs": [
+    "matmul_1"
+   ],
+   "outputs": [
+    "transpose_4"
+   ],
+   "shape": {
+    "off": 0,
+    "d0": 1,
+    "d1": 1,
+    "d2": 128,
+    "d3": 512,
+    "d4": 8,
+    "d5": 96,
+    "s0": 0,
+    "s1": 0,
+    "s2": 393216,
+    "s3": 96,
+    "s4": 49152,
+    "s5": 1
+   },
+   "dispatch_id": 11,
+   "hardware_target": "any",
+   "depends_on": [
+    10
+   ],
+   "slot_variant": "v4",
+   "hint": "split:strided_copy_f16"
+  },
+  {
+   "name": "contiguous",
+   "op": "view",
+   "inputs": [
+    "transpose_4"
+   ],
+   "outputs": [
+    "contiguous"
+   ],
+   "shape": {
+    "n": 50331648
+   },
+   "dispatch_id": null,
+   "hardware_target": "any",
+   "depends_on": []
+  },
+  {
+   "name": "view_3",
+   "op": "view",
+   "inputs": [
+    "contiguous"
+   ],
+   "outputs": [
+    "view_3"
+   ],
+   "shape": {
+    "n": 50331648
+   },
+   "dispatch_id": null,
+   "hardware_target": "any",
+   "depends_on": []
+  },
+  {
+   "name": "c_proj",
+   "op": "linear_f16",
+   "inputs": [
+    "view_3"
+   ],
+   "outputs": [
+    "resid_dropout"
+   ],
+   "weight": "c_proj.weight",
+   "bias": "c_proj.bias",
+   "shape": {
+    "M": 65536,
+    "K": 768,
+    "N": 768
+   },
+   "dispatch_id": 12,
+   "hardware_target": "any",
+   "depends_on": [],
+   "slot_variant": "v0",
+   "hint": "split:linear_f16"
+  }
+ ],
+ "dispatches": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12
+ ],
+ "id_remap": {
+  "0": [
+   0
+  ],
+  "1": [
+   1
+  ],
+  "2": [
+   2
+  ],
+  "3": [
+   3
+  ],
+  "4": [
+   4
+  ],
+  "5": [
+   5
+  ],
+  "6": [
+   6
+  ],
+  "7": [
+   7
+  ],
+  "8": [
+   8
+  ],
+  "9": [
+   9
+  ],
+  "10": [
+   10
+  ],
+  "11": [
+   11
+  ],
+  "12": [
+   12
+  ]
+ },
+ "graph_hints": {
+  "format": "modelblaster.graph_hints/v1",
+  "rounds": [
+   {
+    "target": "cuda",
+    "applied": [
+     {
+      "id": "fuse:fused__bmm_f16__mul_scalar_f16__ewise2_f16__a",
+      "kind": "fuse",
+      "op": "matmul+mul+masked_fill",
+      "from": [
+       "matmul",
+       "mul",
+       "masked_fill"
+      ],
+      "fused_kind": "fused__bmm_f16__mul_scalar_f16__ewise2_f16__a"
+     }
+    ],
+    "skipped": [
+     {
+      "id": "fuse:fused__mul_scalar_f16__ewise2_f16__a",
+      "why": "pattern does not occur"
+     }
+    ],
+    "ts": "2026-10-25T13:17:42+00:00"
+   },
+   {
+    "target": "cuda",
+    "applied": [
+     {
+      "id": "split:linear_f16",
+      "kind": "split_slot",
+      "slot": "linear_f16",
+      "variants": {
+       "v0": [
+        "c_proj"
+       ],
+       "v1": [
+        "c_attn"
+       ]
+      }
+     },
+     {
+      "id": "split:strided_copy_f16",
+      "kind": "split_slot",
+      "slot": "strided_copy_f16",
+      "variants": {
+       "v0": [
+        "transpose",
+        "transpose_1",
+        "transpose_2"
+       ],
+       "v1": [
+        "getitem"
+       ],
+       "v2": [
+        "transpose_3"
+       ],
+       "v3": [
+        "getitem_1"
+       ],
+       "v4": [
+        "transpose_4"
+       ],
+       "v5": [
+        "getitem_2"
+       ]
+      }
+     }
+    ],
+    "skipped": [],
+    "ts": "2026-10-25T13:17:42+00:00"
+   }
+  ]
+ }
+}

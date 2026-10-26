@@ -83,6 +83,27 @@ class ReadPathTest(unittest.TestCase):
         self.assertEqual(kb_global.part_for(Config(kb=KB, arch="100"), [ir(self.tmp / "b", "f32")]), "cuda:sm_100|fp32")
         self.assertEqual(kb_global.part_for(Config(kb=KB, arch="89", knowledge_global_part="x|y"), []), "x|y")
 
+    def test_refresh_off_changes_nothing_and_on_only_adds_a_constant_key(self):
+        seed = fake_seed(self.tmp / "seed")
+        cfg = Config(kb=KB, arch="89", knowledge_global="read", knowledge_global_seed=str(seed))
+        state = {"sent": [], "rounds": []}
+        gk = kb_global.apply_seed(self.work, cfg, [ir(self.tmp / "ir")], state)
+        self.assertEqual(kb_global.key_fields(cfg, gk), {"knowledge_global": "v0007"})
+        self.assertEqual(kb_global.key_fields(Config(kb=KB), None), {})
+        (self.tmp / "inbox").mkdir()
+        (self.tmp / "inbox" / "x.tar.gz").write_bytes(b"junk")
+        self.assertIsNone(kb_global.refresh_at_round(self.work, cfg, state, 1))     # flag off: not even looked at
+        self.assertTrue((self.tmp / "inbox" / "x.tar.gz").exists())
+        cfg2 = Config(kb=KB, arch="89", knowledge_global="read", knowledge_global_seed=str(seed),
+                      knowledge_global_refresh=str(self.tmp / "inbox"))
+        k1 = kb_global.key_fields(cfg2, gk)
+        self.assertEqual(k1, {"knowledge_global": "v0007", "knowledge_global_refresh": True})
+        rf = kb_global.refresh_at_round(self.work, cfg2, state, 1)       # an unreadable package: refused, moved
+        self.assertNotEqual(rf["status"], "applied")
+        self.assertFalse((self.tmp / "inbox" / "x.tar.gz").exists())
+        self.assertEqual(state["knowledge_global"]["refreshes"][0]["round"], 1)
+        self.assertEqual(kb_global.key_fields(cfg2, state["knowledge_global"]), k1)   # stable across refreshes
+
     def test_bad_mode_and_missing_seed(self):
         with self.assertRaises(SystemExit):
             kb_global.apply_seed(self.work, Config(kb=KB, knowledge_global="sometimes"), [], {})
@@ -113,6 +134,47 @@ class ReadWriteStoreTest(unittest.TestCase):
         out = kb_global.merge_back(work, cfg, rec)            # nothing learned: still one (empty) merge
         self.assertEqual(out.get("status"), "merged", out)
         self.assertEqual(kb_global.merge_back(work, cfg, rec)["status"], "duplicate")
+
+    def test_refresh_imports_another_runs_merge_at_a_round_start(self):
+        import shutil
+        sys.path.insert(0, str(KB / "src"))
+        from kernelblaster.knowledge.outcomes import OutcomeRecord
+        from kernelblaster.knowledge.v2 import KnowledgeV2
+        from kernelblaster.knowledge.v2.stats import path as stat_path
+        tmp = Path(tempfile.mkdtemp())
+        store = str(tmp / "store")
+        wa, wb = tmp / "a", tmp / "b"
+        wa.mkdir()
+        wb.mkdir()
+        inbox = tmp / "inbox"
+        inbox.mkdir()
+        cfa = Config(kb=KB, arch="89", knowledge_global="readwrite", knowledge_global_store=store,
+                     knowledge_global_problem="a", python=sys.executable)
+        cfb = Config(kb=KB, arch="89", knowledge_global="read", knowledge_global_store=store,
+                     knowledge_global_problem="b", knowledge_global_refresh=str(inbox), python=sys.executable)
+        sa, sb = {}, {}
+        ra = kb_global.apply_seed(wa, cfa, [ir(tmp / "ir")], sa)
+        kb_global.apply_seed(wb, cfb, [ir(tmp / "ir")], sb)
+        kv = KnowledgeV2(wa / "knowledge")
+        t = sorted(kv.ontology.techniques)[0]
+        chain = [sorted(x.id for x in kv.hierarchy.states.values() if x.parent is None)[0]]
+        for _ in range(2):
+            rec = OutcomeRecord(technique=t, status="improved", target="cuda", arch="sm_89", problem_id="p", slot="s0",
+                                op_class="gemm", dtype="fp16", speedup=1.2)
+            kv.outcomes.append(rec, {"item_id": t, "reward": 0.2, "chain": chain})
+            kv.stats.update(t, stat_path(kv.registry, target_key="cuda:sm_89", op_class="gemm", chain=chain,
+                                         dtype="fp16"), 0.2)
+        kv.db.conn.close()
+        self.assertEqual(kb_global.merge_back(wa, cfa, ra)["status"], "merged")
+        out = kb_global._merge_cli(cfb, ["--store", store, "refresh", "--run-db", str(wb / "knowledge" / "knowledge.db"),
+                                         "--out", str(inbox / "p1")])
+        self.assertEqual(out.get("status"), "ready", out)
+        rf = kb_global.refresh_at_round(wb, cfb, sb, 1)
+        self.assertEqual(rf["status"], "applied", rf)
+        self.assertGreater(rf["counts"]["stats"], 0)
+        self.assertTrue((inbox / "done" / "p1").exists())
+        self.assertIsNone(kb_global.refresh_at_round(wb, cfb, sb, 2))         # nothing new in the inbox
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
