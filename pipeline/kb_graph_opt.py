@@ -1625,6 +1625,14 @@ def main():
     ap.add_argument("--remote-build", action="store_true",
                     help="with --ssh-host: KernelBlaster compiles candidate units on the pool hosts "
                          "(KERNELBLASTER_REMOTE_BUILD=1; the driver's CPUs stay free); off by default")
+    ap.add_argument("--ncu-clock-control", choices=["base", "none"], default=None,
+                    help="ncu's --clock-control for the slot profiles (KERNELBLASTER_NCU_CLOCK_CONTROL; X-149): base = "
+                         "ncu locks the GPU to base clocks (a killed / timed-out ncu can leave them locked); none = "
+                         "profile at the running clocks. Default: KernelBlaster's default (analysis/ncu_clock_guard.md)")
+    ap.add_argument("--clock-guard", choices=["off", "on"], default=None,
+                    help="on: query the GPU's SM clock before each timed step and after an ncu failure, quarantine a "
+                         "locked / throttled GPU, re-time elsewhere or mark the step clock-suspect "
+                         "(KERNELBLASTER_CLOCK_GUARD=1; X-149); off by default")
     for k, v in asdict(Config(kb=Path("."))).items():
         if k in _MANUAL_FIELDS:
             continue
@@ -1636,6 +1644,12 @@ def main():
         os.environ["KERNELBLASTER_BUILD_CACHE"] = str(Path(a.build_cache).expanduser())
     if a.remote_build:
         os.environ["KERNELBLASTER_REMOTE_BUILD"] = "1"
+    if a.ncu_clock_control:                 # inherited by the KernelBlaster subprocesses (X-149)
+        os.environ["KERNELBLASTER_NCU_CLOCK_CONTROL"] = a.ncu_clock_control
+    if a.clock_guard == "on":
+        os.environ["KERNELBLASTER_CLOCK_GUARD"] = "1"
+    elif a.clock_guard == "off":
+        os.environ.pop("KERNELBLASTER_CLOCK_GUARD", None)
     cfg = Config(kb=Path(a.kb).resolve(), model=a.model, reflect_model=a.reflect_model,
                  plugins=[str(Path(p).resolve()) for p in a.plugin], python=a.python,
                  parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
