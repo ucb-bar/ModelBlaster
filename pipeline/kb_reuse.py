@@ -333,6 +333,16 @@ def _write_back(cache, kind, specs, arch, ir_name, table, pick, cands, inc_sha, 
     from .kernel_abi import parse_signature
 
     entry, _ = parse_signature(specs[kind].signature)
+    # An incumbent that is not one of the pool's max_cands sources must still be written back: the kind's old entries
+    # are superseded below, so a shape left without an entry falls back to the hand seed (E1: 15_DenseNet121 65 ms vs
+    # 2.4 ms, 10_ResNet101 52 vs 3.2 ms, 20_MobileNetV2 -> the model guard reverted the whole pass).
+    have = {c["sha"] for c in cands}
+    for k, row in table.items():
+        sha = inc_sha.get(k)
+        if sha and sha not in have and row["ops"] and row["ops"][0] in inc_of_op:
+            cands = list(cands) + [{"code": inc_of_op[row["ops"][0]], "sha": sha, "from": "incumbent",
+                                    "us_per_inst": 0.0, "verified": False}]
+            have.add(sha)
     by_sha = {c["sha"][:12]: c for c in cands}
     groups: dict[str, dict] = {}            # code sha -> {"code", "shapes", "us", "from"}
     for k, row in table.items():
