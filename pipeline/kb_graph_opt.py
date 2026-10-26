@@ -108,6 +108,7 @@ from pathlib import Path
 from . import graph_hints as gh
 from . import kb_efficiency
 from . import kb_global
+from . import kb_halfway
 from . import kb_resume
 from . import kb_telemetry as kbt
 from . import kb_trace
@@ -221,6 +222,11 @@ class Config:
     # the newest one is imported into knowledge/ (other runs' claims, statistics, impl winners since this
     # run's last sync; never its own). "" (default) = off: no import and the round key is unchanged
     knowledge_global_refresh: str = ""
+    # halfway sync (kb_halfway.py; l3_farm/analysis/halfway_sync.md): "on" pauses the round's plan run once every rollout
+    # completed half its steps, waits (bounded) for the controller's refresh package, imports it and goes on with each
+    # rollout's own state. Needs a seed and --knowledge-global-refresh. "off" (default) = nothing changes, round key too
+    knowledge_global_halfway: str = "off"
+    knowledge_global_halfway_wait_s: float = 180.0
     # anything else for run_multislot, verbatim (e.g. --kb-arg=--explore-frac --kb-arg=0.2)
     kb_args: list = field(default_factory=list)
     # CUDA-only-baseline learnings (cuda_learnings.py; l3_farm/analysis/cuda_learnings_impl.md), all off by default:
@@ -482,6 +488,8 @@ class KBRunner:
         self.telemetry: list = []                     # each run's run-level telemetry (kb_telemetry)
         self.gpus: list = []                          # the GPU each problem's run recorded (kb_eval.recorded_gpus)
         self.commands: dict = {}                      # out dir -> its command line
+        self.halfway = None                           # kb_halfway.Halfway (--knowledge-global-halfway on) or None
+        self._kw: dict = {}                           # out dir -> the start() arguments (a paused run restarts alike)
 
     def command(self, problems: list[Path], out: Path, *, steps: int | None = None,
                 winners: Path | None = None, parallel_problems: int | None = None,
@@ -534,13 +542,19 @@ class KBRunner:
         if kb_efficiency.kb_supports_patience(c.kb):   # always explicit: KernelBlaster's own default is on
             sp = c.stop_patience if stop_patience is None else stop_patience
             cmd += ["--stop-patience", str(int(sp or 0))]
+        if self.halfway is not None:                  # halfway sync: the plan run's first half carries --pause-spec
+            cmd += self.halfway.flags(out)
         cmd += list(c.kb_args)
         self.commands[str(out)] = cmd                 # the trace's mb.kb_run record
         return cmd
 
-    def start(self, problems: list[Path], out: Path, **kw) -> subprocess.Popen:
+    def start(self, problems: list[Path], out: Path, _append: bool = False, **kw) -> subprocess.Popen:
         out.mkdir(parents=True, exist_ok=True)
-        log = open(out.with_suffix(".log"), "w")
+        self._kw[str(out)] = dict(kw)
+        if self.halfway is not None and self.halfway.mode(out) == "paused":   # a crash during the pause: no run to start
+            from .kb_halfway import _PausedProc
+            return _PausedProc()
+        log = open(out.with_suffix(".log"), "a" if _append else "w")
         try:
             # own session: a terminal's Ctrl-C reaches it once, forwarded by kb_resume.STOP
             p = subprocess.Popen(self.command(problems, out, **kw), stdout=log, stderr=subprocess.STDOUT,
@@ -553,6 +567,14 @@ class KBRunner:
     def collect(self, problems: list[Path], out: Path, proc: subprocess.Popen) -> list[dict]:
         rc = proc.wait()
         kb_resume.STOP.unregister(proc)
+        if rc == kb_halfway.EXIT_PAUSED and self.halfway is not None and self.halfway.active(out) \
+                and kb_resume.STOP.requested is None:
+            # halfway sync: the plan's problems are parked at their pause step (journals flushed, no process has the
+            # knowledge db open): wait for the controller's package, import it, then the same command without the pause
+            self.halfway.sync(out)
+            proc = self.start(problems, out, _append=True, **self._kw.get(str(out), {}))
+            rc = proc.wait()
+            kb_resume.STOP.unregister(proc)
         kb_resume.kb_exit(rc, out.with_suffix(".log"))  # 75: stopped on a signal -> Interrupted
         if rc != 0:
             raise RuntimeError(f"KernelBlaster failed ({rc}); see {out.with_suffix('.log')}")
@@ -1255,6 +1277,11 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hw = FlowHardware(cfg, state)
     cfg = hw.pin(cfg)
     kb = KBRunner(cfg, work / "knowledge")
+    if kb_halfway.enabled(cfg, gk):                      # --knowledge-global-halfway on (needs seed + refresh inbox)
+        kb.halfway = kb_halfway.Halfway(cfg, work, state, state_path, gk)
+    elif str(cfg.knowledge_global_halfway).lower() == "on":
+        print(json.dumps({"knowledge_global_halfway": "inactive (needs a seed, --knowledge-global-refresh and a "
+                                                      "KernelBlaster with --pause-spec)"}), flush=True)
     specs = dict(_all_specs())
     from . import cuda_learnings as cl
     ext = cl.CURRENT["ext"] = cl.Ext(cfg, work)          # all off by default (no effect)
@@ -1291,6 +1318,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     # work dir; a round killed midway continues in the phase it was in (rNN/progress.json)
     key = kb_resume.round_key(cfg, irs)
     key.update(kb_global.key_fields(cfg, gk))       # only when enabled: existing work dirs keep their key
+    key.update(kb_halfway.key_fields(cfg, gk))      # halfway sync: a constant marker, only when it is on
     key.update(ext.round_key())                     # cuda_learnings: likewise
     key.update(sf.round_key())                      # search fixes: only non-default switches
     key.update(caps.round_key())                    # capabilities: only non-default switches
@@ -1405,6 +1433,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                 stop_patience=cfg.stop_patience)])]
             caps.annotate(dirs, profiles)                    # --model-context (no-op when off)
             T.lap("mb.kb_wait", kind="plan")
+            if kb.halfway is not None:                       # halfway sync: the plan problems park at half their steps
+                kb.halfway.arm(r, R / "run", [problem_name(d) for d in dirs])
             par = (cfg.plan_parallel or len(dirs)) if cfg.plan_mode == "all" and len(dirs) > 1 else None
             results = gs.run_interleaved(r, R, prog, plan_dirs=dirs, plan=plan, **_inter_kw())["plan_results"] \
                 if gs.inter else kb.run(dirs, R / "run", winners=R / "winners", parallel_problems=par)
