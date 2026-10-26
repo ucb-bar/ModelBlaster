@@ -58,7 +58,13 @@ devices.
         [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]] \\
         [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch] [--mb-evaluator auto|kb|builtin] \\
         [--knowledge v1|v2] [--ncu off|best|all] [--reward e2e|slot] [--model-simple M --model-hard M] \\
-        [--hetero-policy P] [--models-config F] [--upkeep-model M] [--kb-arg=--flag --kb-arg=value]
+        [--hetero-policy P] [--models-config F] [--upkeep-model M] [--kb-arg=--flag --kb-arg=value] \\
+        [--knowledge-global off|read|readwrite --knowledge-global-seed SEED_DIR \\
+         --knowledge-global-store STORE --knowledge-global-part cuda:sm_89|fp16]
+
+Global knowledge (``kb_global.py``, off by default): ``read`` starts a fresh ``knowledge/`` from a
+global snapshot's seed instead of the repo seed (recorded in ``state.json`` / ``summary.json``
+``knowledge_global`` and in the round key); ``readwrite`` also merges the run back into the store.
 
 Work dir: ``graph_hints.json`` (modelblaster.graph_hints/v1), ``cache/``
 (mb-cuda-cache/1), ``knowledge/`` (KernelBlaster), ``state.json``,
@@ -87,6 +93,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import graph_hints as gh
+from . import kb_global
 from . import kb_resume
 from . import kb_telemetry as kbt
 from . import kb_trace
@@ -116,6 +123,15 @@ class Config:
     top_k: int | None = 6
     min_share: float = 0.01
     min_gain_pct: float = 2.0
+    # what a round sends to KernelBlaster: "budget" = the cost-ranked selection (coverage / top_k / min_share),
+    # one problem per IR; "all" = every op kind x shape of the IRs not sent before, one problem per kernel,
+    # run in parallel (plan_parallel at a time, 0 = all of them): each kernel gets its own rollouts in one round
+    plan_mode: str = "budget"
+    plan_parallel: int = 0
+    # plan_mode "all": cap the per-item problems to the plan_top_k largest ops (0 = no cap) above plan_min_share of the
+    # model time -- large nets have hundreds of op/shape items, which one GPU cannot work through in a round
+    plan_top_k: int = 0
+    plan_min_share: float = 0.0
     max_variants: int = 3
     remeasure: int = 5
     # a re-measurement lost to an infrastructure failure (the copy to / the link to / the GPU of the
@@ -137,6 +153,9 @@ class Config:
     remote_dir: str | None = None
     # KernelBlaster's runtime (run_multislot / time_problems --runtime): auto | host | process
     runtime: str = "auto"
+    # KernelBlaster run_multislot --eval-timeout-s / --eval-timeout-mode (fixed | adaptive)
+    eval_timeout_s: int = 900
+    eval_timeout_mode: str = "fixed"
     # the GPU model every timing must run on (default: the model the KernelBlaster runs recorded);
     # allow_gpu_mismatch: time anyway where it is not available (loud warnings)
     gpu_model: str | None = None
@@ -164,6 +183,16 @@ class Config:
     torch_source: str = ""
     torch_rounds: int = 4
     torch_variants: str = "eager,graph,compile_mna,compile_ro"
+    # global knowledge across problems / sweeps (kb_global.py): off (default: knowledge/ starts from the
+    # repo seed) | read (a fresh knowledge/ starts from a global snapshot's seed) | readwrite (and the run
+    # is merged back into the store at the end); the seed dir to start from (as `merge seed` / the farm
+    # writes it), the store root (read without a seed: materialize from its current snapshot), the
+    # partition (default cuda:sm_<arch>|<IR dtype>) and the provenance name (default: the work dir name)
+    knowledge_global: str = "off"
+    knowledge_global_seed: str = ""
+    knowledge_global_store: str = ""
+    knowledge_global_part: str = ""
+    knowledge_global_problem: str = ""
     # anything else for run_multislot, verbatim (e.g. --kb-arg=--explore-frac --kb-arg=0.2)
     kb_args: list = field(default_factory=list)
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
@@ -388,6 +417,10 @@ class KBRunner:
             cmd += ["--gpus", c.gpus]
         if c.runtime and c.runtime != "auto":
             cmd += ["--runtime", c.runtime]
+        if c.eval_timeout_s != 900:
+            cmd += ["--eval-timeout-s", str(c.eval_timeout_s)]
+        if c.eval_timeout_mode != "fixed":
+            cmd += ["--eval-timeout-mode", c.eval_timeout_mode]
         if c.gpu_model:
             cmd += ["--gpu-model", c.gpu_model]
         for p in c.plugins:
@@ -1066,6 +1099,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hints_path, state_path = work / "graph_hints.json", work / "state.json"
     doc, cache = gh.load(hints_path), CudaCache(work / "cache")
     state = json.loads(state_path.read_text()) if state_path.exists() else {"sent": [], "rounds": []}
+    # global knowledge (off by default): seed a fresh knowledge/ from a snapshot, once
+    gk = kb_global.apply_seed(work, cfg, irs, state)
+    if gk is not None:
+        kb_resume.atomic_write_json(state_path, state)
     hw = FlowHardware(cfg, state)
     cfg = hw.pin(cfg)
     kb = KBRunner(cfg, work / "knowledge")
@@ -1087,6 +1124,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     # resume (kb_resume.py): --rounds counts the rounds of this IR set and configuration in the
     # work dir; a round killed midway continues in the phase it was in (rNN/progress.json)
     key = kb_resume.round_key(cfg, irs)
+    if gk is not None:                               # only when enabled: existing work dirs keep their key
+        key["knowledge_global"] = gk.get("snapshot") if gk.get("applied") else "unseeded"
     kh = kb_resume.key_hash(key)
     n_rounds = (cfg.more_rounds if cfg.more_rounds else
                 0 if state.get("fixpoint_key") == kh else
@@ -1137,8 +1176,11 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                                    doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"],
                                                    launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
         T.lap("mb.plan")
-        plan = prog.once("plan", lambda: make_plan(profiles, coverage=cfg.coverage, top_k=cfg.top_k,
-                                                   min_share=cfg.min_share, exclude=set(state["sent"])))
+        if cfg.plan_mode == "all":
+            plan_kw = dict(coverage=2.0, top_k=cfg.plan_top_k or None, min_share=cfg.plan_min_share, per_item=True)
+        else:
+            plan_kw = dict(coverage=cfg.coverage, top_k=cfg.top_k, min_share=cfg.min_share)
+        plan = prog.once("plan", lambda: make_plan(profiles, exclude=set(state["sent"]), **plan_kw))
         (R / "plan.json").write_text(json.dumps(plan, indent=1))
         rec["plan"] = {"selected_share": plan["selected_share"],
                        "problems": [(p["ir"], len(p["op_names"])) for p in plan["problems"]]}
@@ -1146,9 +1188,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             T.lap("mb.export")
             dirs = [Path(x) for x in prog.once("export", lambda: [str(x) for x in export_plan(
                 plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
-                names={p["ir"]: f"{p['ir']}__r{r:02d}" for p in plan["problems"]})])]
+                names={p.get("id", p["ir"]): f"{p.get('id', p['ir'])}__r{r:02d}" for p in plan["problems"]})])]
             T.lap("mb.kb_wait", kind="plan")
-            results = kb.run(dirs, R / "run", winners=R / "winners")
+            par = (cfg.plan_parallel or len(dirs)) if cfg.plan_mode == "all" and len(dirs) > 1 else None
+            results = kb.run(dirs, R / "run", winners=R / "winners", parallel_problems=par)
             T.lap("mb.ingest")
             rec["kb_runs"] = [{k: x.get(k) for k in ("problem", "baseline_partition_us", "final_partition_us",
                                                       "speedup", "final_ok", "llm_calls")} for x in results]
@@ -1280,6 +1323,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     tr = {"mb": kbt.compact(T.full_summary(run_span)), "kb": kbt.kb_rollup(kb.telemetry)}
     if tr["mb"] or tr["kb"]:
         summary["telemetry"] = tr
+    if gk is not None:
+        summary["knowledge_global"] = dict(gk)
+        merged = kb_global.merge_back(work, cfg, gk)
+        if merged is not None:
+            summary["knowledge_global"]["merge"] = {k: merged.get(k) for k in ("status", "version", "parent",
+                                                                                "fingerprint", "error") if k in merged}
     kb_resume.atomic_write_json(work / "summary.json", summary)
     state["complete"] = kh                         # a rerun with nothing to do returns this summary
     kb_resume.atomic_write_json(state_path, state)

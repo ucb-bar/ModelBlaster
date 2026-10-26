@@ -174,8 +174,11 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
         return parse_signature(specs[kind].signature)[0], specs[kind].signature
 
     def usable(entry, sig):
-        return [e for e in cache.entries if e["entry"] == entry and e["signature_sha"] == signature_sha(sig)
-                and e["arch"] == arch and ir_name not in e["rejected"]]
+        # entries store the sha of the CUDA-side signature (``cuda_signature``: _Float16 -> __half, ...),
+        # exactly as ``CudaCache.lookup`` and ``ingest`` compare it; the raw signature never matches an fp16 entry
+        sig_sha, dtype = signature_sha(cuda_signature(sig)), op_dtype(entry)
+        return [e for e in cache.entries if e["entry"] == entry and e["signature_sha"] == sig_sha
+                and e["arch"] == arch and e.get("dtype", "fp32") == dtype and ir_name not in e["rejected"]]
 
     def own_key(o):
         return _shape_key(o.get("shape", {}))

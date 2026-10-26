@@ -102,6 +102,10 @@ def read_json(path: Path) -> Any:
 
 def round_key(cfg, irs) -> dict:
     key = {k: getattr(cfg, k, None) for k in ROUND_FIELDS}
+    if getattr(cfg, "plan_mode", "budget") != "budget":      # only when set: existing work dirs keep their key
+        key["plan_mode"] = cfg.plan_mode
+        if getattr(cfg, "plan_top_k", 0) or getattr(cfg, "plan_min_share", 0.0):
+            key["plan_caps"] = [cfg.plan_top_k, cfg.plan_min_share]
     key["irs"] = sorted(str(Path(d).resolve()) for d in irs)
     return key
 
