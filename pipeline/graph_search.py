@@ -29,6 +29,22 @@ nothing here runs, the flow is the round-based one, and existing work dirs keep 
                                          shared), paired whole-model re-timing of the members at every round end,
                                          successive halving to one member whose hints are then accepted.
     --graph-layout-fold on|off           propose fold_layout hints (layout_fold matcher; composite seeds).
+    --graph-preapply-classes auto|high|all|none
+                                         which pre-apply candidates may be accepted without a measurement (class table
+                                         graph_priors_standard.json): high = elementwise-tail chains only (conv / GEMM
+                                         heads are decided by measurement); all = every class with a prior (A4's
+                                         behavior); none = no pre-apply. auto = high with --graph-priors standard,
+                                         else all (A4's behavior, unchanged).
+    --graph-preapply-audit auto|off|final|rounds
+                                         unapply audit of the pre-applied hints (preapply_audit.py): rebuild the graph
+                                         without each one (``unfuse``), stage kernels from the cache / nearest-shape
+                                         routing / hand seeds, verify, time incumbent vs alternative paired and
+                                         interleaved, revert if faster by --graph-preapply-margin; zero LLM calls.
+                                         final = before the final model is reported; rounds = also at each round end;
+                                         auto = final when pre-apply is on, else off.
+    --graph-preapply-margin F            revert margin (default: the flow's --accept-gain, 0.03).
+    --graph-preapply-route on|off        zero-LLM nearest-shape routing of stage kernels with no cached winner (A3
+                                         ``search_fixes.route_ops``) before the audit's timing.
 
 Every graph decision is a line in ``<work>/graph_decisions.jsonl`` (time, round, phase, budget used, evidence,
 prior used) and is summarised in ``round.json`` / ``summary.json`` ``graph_search``.
@@ -50,7 +66,8 @@ CFG_DEFAULTS = {"graph_search": "rounds", "graph_priors": "auto", "graph_prior_c
                 "graph_explore": 0.1, "graph_prior_min_gain": 0.0, "graph_characterize": -1, "graph_char_top": 8,
                 "graph_char_rollouts": 1, "graph_survival": "auto", "graph_survival_head": 0.25,
                 "graph_rung_steps": 0, "graph_eta": 2.0, "graph_cap_steps": 8, "graph_defer": 1,
-                "graph_diverse_beam": 0, "graph_layout_fold": "off"}
+                "graph_diverse_beam": 0, "graph_layout_fold": "off", "graph_preapply_classes": "auto",
+                "graph_preapply_audit": "auto", "graph_preapply_margin": -1.0, "graph_preapply_route": "on"}
 PRICES = {"in": 5.0, "out": 25.0}            # $/M tokens (assumed Opus list prices; no cache split in result.json)
 
 CURRENT: dict = {"gs": None}
@@ -96,9 +113,10 @@ class GraphSearch:
             raise ValueError(f"--graph-search must be rounds|interleaved, not {self.mode!r}")
         self.inter = self.mode == "interleaved"
         pm = (g("graph_priors") or "auto").lower()
-        if pm not in ("auto", "off", "rank", "preapply"):
-            raise ValueError(f"--graph-priors must be auto|off|rank|preapply, not {pm!r}")
-        self.priors_mode = ("preapply" if self.inter else "off") if pm == "auto" else pm
+        if pm not in ("auto", "off", "rank", "preapply", "standard"):
+            raise ValueError(f"--graph-priors must be auto|off|rank|preapply|standard, not {pm!r}")
+        self.standard = pm == "standard"              # class table only (graph_priors_standard.json), pre-apply of class 'high'
+        self.priors_mode = ("preapply" if self.inter else "off") if pm == "auto" else "preapply" if pm == "standard" else pm
         self.prior_conf, self.prior_min_n = float(g("graph_prior_conf")), int(g("graph_prior_min_n"))
         self.explore_rate, self.prior_min_gain = float(g("graph_explore")), float(g("graph_prior_min_gain"))
         ch = int(g("graph_characterize"))
@@ -116,12 +134,30 @@ class GraphSearch:
         if lf not in ("on", "off"):
             raise ValueError(f"--graph-layout-fold must be on|off, not {lf!r}")
         self.layout_fold = lf == "on"
+        pc = (g("graph_preapply_classes") or "auto").lower()
+        if pc not in ("auto", "high", "all", "none"):
+            raise ValueError(f"--graph-preapply-classes must be auto|high|all|none, not {pc!r}")
+        self.pre_classes = ("high" if self.standard else "all") if pc == "auto" else pc
+        pa = (g("graph_preapply_audit") or "auto").lower()
+        if pa not in ("auto", "off", "final", "rounds"):
+            raise ValueError(f"--graph-preapply-audit must be auto|off|final|rounds, not {pa!r}")
+        self.audit_mode = ("final" if self.priors_mode == "preapply" and self.pre_classes != "none" else "off") \
+            if pa == "auto" else pa
+        m = float(g("graph_preapply_margin"))
+        self.audit_margin = m if m >= 0 else float(getattr(cfg, "accept_gain", 0.03))
+        ro = (g("graph_preapply_route") or "on").lower()
+        if ro not in ("on", "off"):
+            raise ValueError(f"--graph-preapply-route must be on|off, not {ro!r}")
+        self.audit_route = ro == "on"
+        self.preapplied: dict = {}                    # hint id -> record (pre-fusion graph, stage ops) of this work dir
+        self.audit_results: list[dict] = []
         self.part = None
         self.priors: gp.Priors | None = None
         if self.active():
             from .kb_global import part_for
             self.part = part_for(cfg, irs or [])
-            self.priors = gp.Priors.default(self.part, self.work, min_n=self.prior_min_n)
+            self.priors = gp.Priors.standard(self.part, self.work, min_n=self.prior_min_n) if self.standard else \
+                gp.Priors.default(self.part, self.work, min_n=self.prior_min_n)
         self.log_path = self.work / "graph_decisions.jsonl"
         self.t_run = time.time()
         self.round_t0 = self.t_run
@@ -143,7 +179,24 @@ class GraphSearch:
                 "characterize": [self.char_steps, self.char_top, self.char_rollouts],
                 "survival": [self.survival_on, self.survival_head],
                 "rungs": [self.rung_steps, self.eta, self.cap_steps, self.defer],
-                "beam": self.beam, "layout_fold": self.layout_fold}
+                "beam": self.beam, "layout_fold": self.layout_fold,
+                **({"priors_table": "standard"} if getattr(self, "standard", False) else {}),
+                **self.preapply_key()}
+
+    def preapply_key(self) -> dict:
+        """Round-key entries of the pre-apply flags, only for non-default values: the classes (they change what the
+        rounds pre-apply); the audit only in ``rounds`` mode (it then changes the graph between rounds). The end-of-run
+        audit (auto / final / off) and its margin / routing are not in the key: a finished work dir can be audited."""
+        out = {}
+        if str(getattr(self.cfg, "graph_preapply_classes", "auto")).lower() != "auto":
+            out["preapply_classes"] = self.pre_classes
+        if self.audit_mode == "rounds":
+            out["preapply_audit"] = ["rounds", self.audit_margin, self.audit_route]
+        return out
+
+    def preapply_resolved(self) -> dict:
+        return {"classes": self.pre_classes, "audit": self.audit_mode, "margin": self.audit_margin,
+                "route": self.audit_route}
 
     def round_key(self) -> dict:
         """Only when a flag is set: existing work dirs keep their key."""
@@ -217,6 +270,8 @@ class GraphSearch:
     def summary(self) -> dict:
         dec = [e for e in self.events if e["event"] == "decision"]
         return {**self.resolved(), "part": self.part,
+                **({"preapply": self.preapply_resolved(), "preapply_audit": self.audit_results}
+                   if self.priors_mode == "preapply" or self.audit_results else {}),
                 "prior_sources": sorted(self.priors.sources) if self.priors else [],
                 "decisions": [{k: e.get(k) for k in ("round", "phase", "hint", "status", "t_run_s", "measured",
                                                      "steps", "gain")} for e in dec],
@@ -237,15 +292,29 @@ class GraphSearch:
             return est
         return est * float(self.prior(h)["p_mean"])
 
-    def eligible(self, pr: dict | None) -> bool:
-        return bool(pr) and pr.get("n", 0) >= self.prior_min_n and pr.get("lb", 0.0) >= self.prior_conf
+    def eligible(self, pr: dict | None, h: dict | None = None) -> bool:
+        """May this prior pre-apply the hint ``h`` without a measurement? ``--graph-preapply-classes``: none -> never;
+        high -> only the class table's 'high' (elementwise-tail) patterns, and never a conv / GEMM-headed fusion;
+        all -> A4's rule (class table: every class but 'unknown'; sweep / A5 priors: n >= min_n and lb >= conf)."""
+        pc = self.pre_classes
+        if pc == "none":
+            return False
+        if pr and pr.get("source") == "standard":     # class table: only the 'high' class (elementwise tails) is pre-applied
+            if pc == "all":
+                return pr.get("class") in ("high", "medium")
+            return pr.get("class") == "high" and not (h is not None and gp.heavy_head(h))
+        ok = bool(pr) and pr.get("n", 0) >= self.prior_min_n and pr.get("lb", 0.0) >= self.prior_conf
+        if ok and pc == "high":                      # sweep / A5 priors restricted to the elementwise-tail class
+            src = h if h is not None else (pr or {}).get("key", "")
+            return gp.pattern_class(src) == "high" and not gp.heavy_head(src)
+        return ok
 
     def preapply(self, r: int, doc: dict, graphs: dict, profiles: list[dict], specs: dict, *, kinds=("fuse",)) -> list:
         """Accept the hints whose prior is confident enough, without a measurement (``--graph-priors preapply``):
         proposals of every fusable chain on the current graphs (gain threshold ``--graph-prior-min-gain``) plus the
         doc's proposed hints. -> the pre-applied hint ids. An exploration draw leaves a hint to the measured
         decision (``--graph-explore``)."""
-        if self.priors_mode != "preapply" or self.beam > 1:
+        if self.priors_mode != "preapply" or self.beam > 1 or self.pre_classes == "none":
             return []
         cands: dict[str, dict] = {}
         for p in profiles:
@@ -274,7 +343,7 @@ class GraphSearch:
             if gh.get(doc, hid) is not None and gh.get(doc, hid).get("status") != "proposed":
                 continue
             pr = pri[hid]
-            if not self.eligible(pr):
+            if not self.eligible(pr, h):
                 continue
             taken |= atoms_
             gh.merge(doc, [h])
@@ -290,8 +359,39 @@ class GraphSearch:
                        exec_mode=self.exec_mode("none: not measured"),
                        steps=0, llm_calls=0, usd=0.0, ir=ir,
                        evidence={"est_gain_pct": max((s.get("est_gain_pct") or 0.0) for s in h.get("source") or [{}])})
+            self.note_preapplied(r, h, ir, pr, graphs)
             done.append(hid)
         return done
+
+    # ---- unapply audit of the pre-applied hints (preapply_audit.py)
+    def note_preapplied(self, r: int, h: dict, ir: str | None, pr: dict | None, graphs: dict) -> None:
+        """Keep what the audit needs to rebuild the graph WITHOUT this hint: the hint, its stage ops (name, kind, shape of
+        every op its chains cover) and the pre-fusion graph of every IR that has them
+        (``<work>/preapply_audit/pre/<hint>__<ir>.graph.json``). Never fails the run."""
+        try:
+            from . import preapply_audit as pa
+            rec = pa.record_preapplied(self.work, r, h, ir, pr, graphs)
+            self.preapplied[h["id"]] = rec
+        except Exception as e:  # noqa: BLE001 -- bookkeeping only
+            self.event("audit_error", hint=h.get("id"), stage="record_preapplied", error=f"{type(e).__name__}: {e}"[:400])
+
+    def audit(self, phase: str, *, irs: list, doc: dict, hints_path: Path, cache, specs: dict, cfg=None, leases=None,
+              recorded: list | None = None, state: dict | None = None, state_path: Path | None = None) -> dict | None:
+        """Unapply audit hook (``phase``: ``round`` at a round end, ``final`` before the final model is verified). A
+        no-op (None, no file) unless ``--graph-preapply-audit`` applies to the phase and the doc holds pre-applied
+        hints not audited yet. Never raises: a failure is recorded as ``audit_error`` and the incumbent kept."""
+        if self.audit_mode == "off" or (phase == "round" and self.audit_mode != "rounds"):
+            return None
+        try:
+            from . import preapply_audit as pa
+            return pa.audit_hook(self, phase, irs=irs, doc=doc, hints_path=hints_path, cache=cache, specs=specs,
+                                 cfg=cfg or self.cfg, leases=leases, recorded=recorded or [], state=state,
+                                 state_path=state_path)
+        except Exception as e:  # noqa: BLE001 -- the audit never blocks the run
+            rec = {"phase": phase, "audit_error": f"{type(e).__name__}: {e}"[:600], "hints": []}
+            self.audit_results.append(rec)
+            self.event("audit_error", phase=phase, error=rec["audit_error"])
+            return rec
 
     # ---- characterization (round 0)
     def characterize(self, R: Path, prog, profiles: list[dict], *, kb, cache, specs: dict, reprofile) -> list[dict]:
