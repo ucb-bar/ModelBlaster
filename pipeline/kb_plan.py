@@ -51,6 +51,55 @@ def item_key(entry: str, sig_sha: str, shape: dict) -> str:
     return f"{entry}|{sig_sha}|{_shape_key(shape)}"
 
 
+# ---- shape-key canonicalization (--reuse-winners; l3_farm/analysis/cuda_learnings_impl.md)
+# Shape fields that select a code path but do not change the kernel's work: instances that differ only in them are
+# one plan item (one KernelBlaster problem with every instance), so one winner serves them all. Per op kind (the
+# `_f16` / `_s8` variants share their base kind's list); a field is only dropped when it is a scalar int parameter
+# of the kind's signature (canon_fields checks it), i.e. the same source receives it at run time.
+CANON_FLAGS: dict[str, tuple[str, ...]] = {
+    "gru_seq": ("reverse",),
+    "lstm_seq": ("reverse",),
+}
+
+
+def parse_canon_flags(spec: str | None) -> dict[str, tuple[str, ...]]:
+    """``"gru_seq:reverse,lstm_seq:reverse"`` (or "default" / "") -> {kind: fields}."""
+    if not spec or spec == "default":
+        return dict(CANON_FLAGS)
+    out: dict[str, list[str]] = {}
+    for part in spec.split(","):
+        if ":" in part:
+            k, f = part.split(":", 1)
+            out.setdefault(k.strip(), []).append(f.strip())
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def _base_kind(kind: str) -> str:
+    for suffix in ("_f16", "_s8_pc", "_s8", "_i8"):
+        if kind.endswith(suffix):
+            return kind[: -len(suffix)]
+    return kind
+
+
+def canon_fields(kind: str, specs: dict | None, flags: dict | None = None) -> tuple[str, ...]:
+    """The shape fields of ``kind`` that are flags (see CANON_FLAGS), verified against its signature: each must be
+    a scalar ``int`` parameter, so every instance calls the same source with its own value. Unverifiable -> ()."""
+    want = (flags if flags is not None else CANON_FLAGS).get(kind) or \
+        (flags if flags is not None else CANON_FLAGS).get(_base_kind(kind)) or ()
+    if not want or not specs or kind not in specs:
+        return ()
+    try:
+        _, params = parse_signature(specs[kind].signature)
+    except Exception:  # noqa: BLE001
+        return ()
+    ints = {p.name for p in params if not p.is_ptr and p.base_type in ("int", "int32_t", "long", "int64_t")}
+    return tuple(f for f in want if f in ints)
+
+
+def canon_shape(shape: dict, fields: tuple[str, ...]) -> dict:
+    return {k: v for k, v in shape.items() if k not in fields} if fields else shape
+
+
 def hinted_ir(ir_dir: Path, hints_doc: dict, work: Path, specs: dict):
     """(IR dir with the accepted hints applied, specs, cache-plan input graph)."""
     from . import graph_hints as gh
@@ -75,9 +124,13 @@ def failed_cached_slots(res: dict, plan: dict) -> dict:
 
 def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache=None, arch: str = "75",
                specs: dict | None = None, runs: int = 3, keep: bool = False, kbeval=None,
-               gpu_model: str | None = None, allow_gpu_mismatch: bool = False) -> dict:
+               gpu_model: str | None = None, allow_gpu_mismatch: bool = False, on_fallback=None) -> dict:
     """Whole-graph per-op profile of an IR in its current state (accepted
     hints applied, cached winners in place).
+
+    ``on_fallback`` (search_fixes.fallback_router; None = off): called after cached winners were rejected for this
+    IR (profile fallback), before the profile is redone -- it may add cache entries for the affected instances
+    (routing), which the next attempt then deploys and checks in the whole model.
 
     ``kbeval`` (a :class:`kb_eval.KBEval`): the ``runs`` go through
     KernelBlaster's evaluator -- this host's GPU pool or the ``--ssh-host``
@@ -97,7 +150,8 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
     specs = dict(specs or _all_specs())
     hdir, specs, g = hinted_ir(Path(ir_dir), hints_doc or gh.new_doc(), work, specs)
     fallback = []
-    for attempt in range(PROFILE_FALLBACKS + 1):
+    attempts = PROFILE_FALLBACKS + (2 if on_fallback is not None else 0)     # routed kernels may fail too
+    for attempt in range(attempts + 1):
         plan = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else \
             {"graph": gh.unique_names(g), "sources": {}, "tags": {}, "sub_sources": None, "hints": [], "used": {}}
         pdir = write_variant_ir(Path(ir_dir), plan["graph"], work / "profile_ir") if plan["hints"] else hdir
@@ -118,7 +172,7 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
                 sp.set(device=dev.get("label"), gpu=dev.get("name"), host=dev.get("host"), passed=res.get("passed"))
         man = json.loads((prob / "manifest.json").read_text())
         bad = failed_cached_slots(res, plan)
-        if res.get("passed") or not bad or attempt == PROFILE_FALLBACKS:
+        if res.get("passed") or not bad or attempt == attempts:
             break
         # cached winners that fail in the whole model (each was validated in its own problem): rejected
         # for this IR, as the verification would, and the profile redone on the next best source (the
@@ -128,7 +182,17 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
                 e["rejected"].append(man["ir_name"])
         cache.save()
         step = {"attempt": attempt, "rejected": {k: e["impl_id"] for k, e in bad.items()},
-                "errors": (res.get("errors") or [])[:20]}
+                "errors": (res.get("errors") or [])[:20],
+                # the instances that lost their winner (search_fixes: re-queue / routing / the final guard)
+                "ops": {k: [r["name"] for r in man["ops"] if r["slot"] == k.split("/")[0]] for k in bad}}
+        if on_fallback is not None:
+            try:
+                rt = on_fallback(ir_dir=Path(ir_dir), graph=g, bad=bad, man=man, res=res, cache=cache, specs=specs,
+                                 arch=arch, work=work, attempt=attempt)
+            except Exception as e:  # noqa: BLE001 -- routing is best effort; the fallback itself stands
+                rt = [{"result": "route failed", "error": f"{type(e).__name__}: {e}"[:600]}]
+            if rt:
+                step["route"] = rt
         fallback.append(step)
         kb_trace.record("profile_fallback", ir=man["ir_name"], mb_stage="profile", **step)
         print(json.dumps({"profile_fallback": man["ir_name"], **step}), flush=True)
@@ -185,18 +249,31 @@ def _launch_us(res: dict) -> float:
     return round(max(0.0, e2e - kern) / n, 3) if e2e and kern is not None and n else 0.0
 
 
-def rank(profiles: list[dict], weights: dict[str, float] | None = None) -> list[dict]:
+def rank(profiles: list[dict], weights: dict[str, float] | None = None, canon: dict | None = None,
+         specs: dict | None = None) -> list[dict]:
     """Op instances grouped by (entry, signature, shape) across IRs, by total
-    time (an IR's times scaled by ``weights[ir]``, default 1)."""
+    time (an IR's times scaled by ``weights[ir]``, default 1). ``canon`` ({kind: flag fields},
+    see CANON_FLAGS; None = off): instances that differ only in verified flag fields are one item
+    (its ``shape`` is the canonical one, ``shapes`` lists the instance shapes)."""
     items: dict[str, dict] = {}
+    if canon is not None and specs is None:
+        from .kb_proposals import _all_specs
+        specs = _all_specs()
     for p in profiles:
         w = (weights or {}).get(p["ir"], 1.0)
         for r in p["ops"]:
             if r["us"] is None:
                 continue
-            k = item_key(r["entry"], r["signature_sha"], r["shape"])
+            shape = r["shape"]
+            if canon is not None:
+                shape = canon_shape(r["shape"], canon_fields(r["op"], specs, canon))
+            k = item_key(r["entry"], r["signature_sha"], shape)
             it = items.setdefault(k, {"key": k, "entry": r["entry"], "op": r["op"], "signature_sha": r["signature_sha"],
-                                      "shape": r["shape"], "total_us": 0.0, "count": 0, "occurrences": {}})
+                                      "shape": shape, "total_us": 0.0, "count": 0, "occurrences": {}})
+            if shape is not r["shape"]:
+                shs = it.setdefault("shapes", [])
+                if r["shape"] not in shs:
+                    shs.append(r["shape"])
             it["total_us"] += w * r["us"]
             it["count"] += 1
             occ = it["occurrences"].setdefault(p["ir"], {"ir": p["ir"], "ir_dir": p["ir_dir"], "ops": [], "us": 0.0,
@@ -265,7 +342,10 @@ def make_plan(profiles: list[dict], **kw) -> dict:
     excl = len(kw.get("exclude") or ())
     opts = {k: v for k, v in kw.items() if k != "exclude"}
     per_item = kw.pop("per_item", False)
-    plan = problems(select(rank(profiles, kw.pop("weights", None)), **kw), per_item=per_item)
+    canon, specs = kw.pop("canon", None), kw.pop("specs", None)
+    plan = problems(select(rank(profiles, kw.pop("weights", None), canon=canon, specs=specs), **kw), per_item=per_item)
+    if canon is not None:
+        plan["canon"] = {k: list(v) for k, v in canon.items()}
     plan["profiles"] = [{"ir": p["ir"], "ir_dir": p["ir_dir"], "partition_us": p["partition_us"]} for p in profiles]
     # the plan's inputs (every profile's per-op times) and its output
     kb_trace.record("plan", mb_stage="plan", options=opts, excluded=excl, selected_share=plan.get("selected_share"),

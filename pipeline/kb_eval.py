@@ -336,7 +336,7 @@ def check_device(device: dict | None, gpu_model: str | None, *, what: str, allow
 
 def run_problem(kbeval: KBEval, problem: Path, *, arch: str, work: Path, reps: int = 1,
                 gpu_model: str | None = None, allow_mismatch: bool = False, name: str = "check",
-                sources: dict | None = None) -> dict:
+                sources: dict | None = None, driver_env: dict | None = None) -> dict:
     """Check (and time) one exported problem -- the driver checks every output
     and op against the references linked into it -- through KernelBlaster's
     evaluator, ``reps`` runs on one GPU of ``gpu_model`` -> :func:`median_run`'s
@@ -348,15 +348,25 @@ def run_problem(kbeval: KBEval, problem: Path, *, arch: str, work: Path, reps: i
     job = [{"id": "p", "problem": str(problem), "sources": sources, "reps": max(1, int(reps))}]
     warn = []
     try:
-        kr = kbeval.run(job, arch=arch, work=work, gpu_model=gpu_model, name=name)
+        kr = kbeval.run(job, arch=arch, work=work, gpu_model=gpu_model, name=name, driver_env=driver_env)
     except HardwareMismatch as e:
         if not allow_mismatch:
             raise
         warn.append(f"{e}; ran on another GPU model (--allow-gpu-mismatch)")
         print(f"[kb_eval] WARNING: {warn[-1]}", file=sys.stderr, flush=True)
-        kr = kbeval.run(job, arch=arch, work=work, gpu_model=None, name=name)
+        kr = kbeval.run(job, arch=arch, work=work, gpu_model=None, name=name, driver_env=driver_env)
     j = kr["jobs"]["p"]
     res = median_run(j.get("runs") or [])
+    from .kb_concurrency import deadlocked
+    if deadlocked(res) and (driver_env or {}).get("MB_CONCURRENCY") != "0":
+        # concurrent CUDA-graph branches hung (the driver's watchdog): rerun launched sequentially (recorded)
+        first = (res.get("log") or "")[-800:]
+        res = run_problem(kbeval, problem, arch=arch, work=work, reps=reps, gpu_model=gpu_model,
+                          allow_mismatch=allow_mismatch, name=name + "_seq", sources=sources,
+                          driver_env={**(driver_env or {}), "MB_CONCURRENCY": "0"})
+        res["concurrency_fallback"] = {"why": "deadlock watchdog", "log": first}
+        print(json.dumps({"concurrency_fallback": str(problem), "why": "deadlock watchdog"}), flush=True)
+        return res
     res["device"] = res.get("device") or j.get("gpu")
     res["devices"] = j.get("gpus")
     res["evaluator"] = kbeval.describe()
