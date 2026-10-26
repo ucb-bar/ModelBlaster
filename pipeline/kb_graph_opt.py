@@ -106,6 +106,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import graph_hints as gh
+from . import kb_barrier
 from . import kb_efficiency
 from . import kb_global
 from . import kb_halfway
@@ -227,6 +228,15 @@ class Config:
     # rollout's own state. Needs a seed and --knowledge-global-refresh. "off" (default) = nothing changes, round key too
     knowledge_global_halfway: str = "off"
     knowledge_global_halfway_wait_s: float = 180.0
+    # barrier scheduling (kb_barrier.py; l3_farm/analysis/barrier_scheduling.md): "on" parks the run after the characterization pass
+    # (writes <work>/parked.json, exits 78) so the farm can resume every problem once all have parked; rerun the same command
+    # without the flag to resume. Not part of the round key. "off" (default) = nothing changes
+    park_after_char: str = "off"
+    # characterization sync (kb_barrier.py): after A4's characterization pass, write <round>/char_sync.json (stage paused), wait (bounded)
+    # for the controller's package (ack char-r00.ack.json in --knowledge-global-refresh), import it (why="char") and go on to the
+    # re-profile / plan. Needs a seed + the refresh inbox. Superseded by --park-after-char. "off" (default) = nothing changes
+    knowledge_global_char_sync: str = "off"
+    knowledge_global_char_sync_wait_s: float = 180.0
     # anything else for run_multislot, verbatim (e.g. --kb-arg=--explore-frac --kb-arg=0.2)
     kb_args: list = field(default_factory=list)
     # CUDA-only-baseline learnings (cuda_learnings.py; l3_farm/analysis/cuda_learnings_impl.md), all off by default:
@@ -1277,6 +1287,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hw = FlowHardware(cfg, state)
     cfg = hw.pin(cfg)
     kb = KBRunner(cfg, work / "knowledge")
+    bar = kb_barrier.Barrier(cfg, work, state, state_path, gk, irs)    # barrier scheduling: park after the characterization pass
     if kb_halfway.enabled(cfg, gk):                      # --knowledge-global-halfway on (needs seed + refresh inbox)
         kb.halfway = kb_halfway.Halfway(cfg, work, state, state_path, gk)
     elif str(cfg.knowledge_global_halfway).lower() == "on":
@@ -1294,6 +1305,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     caps.apply_env()
     from . import graph_search as gsm
     gs = gsm.CURRENT["gs"] = gsm.GraphSearch(cfg, work, irs)   # all off by default (no effect)
+    if kb_barrier.enabled(cfg) or kb_barrier.char_sync_enabled(cfg, gk):
+        gs.on_char_done = bar.after_char                     # --park-after-char on: park once the characterization has run
 
     def _reprofile(R, sub, hints_doc=None):              # graph search: profiles redone mid-round
         return [profile_ir(Path(d), R / sub / Path(d).name, hints_doc=hints_doc or doc, cache=cache, arch=cfg.arch,
@@ -1335,6 +1348,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     if not n_rounds and state.get("complete") == kh and (work / "summary.json").exists():
         print(json.dumps({"resume": "work dir already complete for these IRs and settings"}), flush=True)
         return json.loads((work / "summary.json").read_text())
+    if (work / kb_barrier.PARKED_FILE).exists() and not kb_barrier.enabled(cfg):   # a parked run resumes: import the post-barrier package once
+        bar.resume_import()
     for r in range(len(state["rounds"]), len(state["rounds"]) + n_rounds):
         kb_resume.STOP.check()
         state.pop("complete", None)
@@ -1380,6 +1395,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         if gs.active():                                      # round 0: characterization pass (re-profiled)
             profiles = gs.before_propose(r, R, prog, profiles, kb=kb, cache=cache, specs=specs,
                                          reprofile=lambda sub, hd=None, R=R: _reprofile(R, sub, hd))
+        if r == 0 and kb_barrier.enabled(cfg) and not prog.done("gs_char"):
+            bar.skipped("characterization is off (--graph-characterize 0 / no --graph-* flag): nothing to park after")
         T.lap("mb.propose")
         graphs = {}
         for p in profiles:                                  # MB's own proposals
@@ -1692,6 +1709,9 @@ def main():
     except kb_resume.Interrupted as e:
         print(f"[kb_graph_opt] interrupted: {e}; rerun the same command to resume", file=sys.stderr, flush=True)
         sys.exit(kb_resume.EXIT_INTERRUPTED)
+    except kb_barrier.Parked as e:
+        print(f"[kb_graph_opt] parked: {e}; rerun the same command without --park-after-char to resume", flush=True)
+        sys.exit(kb_barrier.EXIT_PARKED)
 
 
 if __name__ == "__main__":

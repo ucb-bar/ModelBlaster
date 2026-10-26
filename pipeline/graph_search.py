@@ -163,6 +163,7 @@ class GraphSearch:
         self.round_t0 = self.t_run
         self.round = None
         self.events: list[dict] = []
+        self.on_char_done = None                    # barrier scheduling (kb_barrier.Barrier.after_char): may raise Parked
 
     # ---- switches
     def explicit(self) -> dict:
@@ -423,6 +424,8 @@ class GraphSearch:
                                                          "speedup", "llm_calls")} for x in res],
                     "ingested": sum(1 for x in ing if x.get("status") in ("added", "replaced"))}
         rep = prog.once("gs_char", run)
+        if self.on_char_done is not None:            # --park-after-char on: park here (after the char run + ingest, before the re-profile)
+            self.on_char_done(R, prog, rep)
         new = prog.get("gs_char_profile")
         if new is None:
             new = reprofile("profile_char")
