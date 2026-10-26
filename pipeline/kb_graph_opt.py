@@ -249,6 +249,9 @@ class Config:
     final_guard_min_speedup: float = 1.25
     seed_nearest: str = "off"
     rollout_resync: float = 0.0
+    # fused-slot winners of the plan runs are ingested (their specs carry the fused kinds of the round's graphs; X-137):
+    # on (default, correctness fix) | off (kill switch, also env MB_INGEST_FUSED=0: the pre-fix behaviour)
+    ingest_fused: str = "on"
     # graph search redesign (graph_search.py; l3_farm/analysis/graph_search_redesign.md), all off by default
     # (rounds = the round-based flow; nothing else runs and the round key is unchanged): interleaved = hint
     # decisions inside the plan's KernelBlaster run on successive-halving rungs, decided and applied mid-round;
@@ -1279,6 +1282,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(ext.round_key())                     # cuda_learnings: likewise
     key.update(sf.round_key())                      # search fixes: only non-default switches
     key.update(caps.round_key())                    # capabilities: only non-default switches
+    if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
+        key["ingest_fused"] = "off"                 # kill switch: only when set
     key.update(gs.round_key())                      # graph search: only when a --graph-* flag is set
     key.update(kb_efficiency.key_fields(cfg))       # efficiency rules: only when on (off = the legacy key)
     kh = kb_resume.key_hash(key)
