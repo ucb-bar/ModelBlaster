@@ -504,11 +504,17 @@ class GraphSearch:
 
     def ingest_specs(self, specs: dict, graphs: dict) -> dict:
         """Specs for the winners' ingest with every fused kind of the round's graphs: a fused slot's plan winner is
-        cached (the default flow drops them as ``fusion-not-accepted``: its specs lack the fused kinds)."""
-        if not self.active():
+        cached. Default ON also without graph search (the round-based flow used to drop these winners as
+        ``fusion-not-accepted`` because its specs lacked the fused kinds; X-137). Kill switch: ``--ingest-fused off``
+        or ``MB_INGEST_FUSED=0``."""
+        off = str(getattr(self.cfg, "ingest_fused", "on")).lower() in ("0", "off", "false", "no") or \
+            os.getenv("MB_INGEST_FUSED", "1").lower() in ("0", "off", "false", "no")
+        if off:
+            return specs
+        if not self.active() and not graphs:
             return specs
         from .kb_proposals import with_fused_specs
-        out = dict(specs)
+        out = specs                                    # with_fused_specs returns its input when nothing is missing
         for g in list(graphs.values()) + list((getattr(self, "member_graphs", None) or {}).values()):
             out = with_fused_specs(g, out)
         return out
