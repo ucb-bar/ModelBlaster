@@ -360,6 +360,8 @@ def _try_fold(graph, op, prod, readers, outs):
         else:                                          # head stage of a fused group: A/B only
             new = copy.deepcopy(op)
             new["sub_ops"][0] = g2
+            if isinstance(new.get("shape"), dict) and "a" in new["shape"]:
+                new["shape"] = {**new["shape"], "a": g2["shape"]}      # stage a's shape (strides): the shape key / guard
             ext = {a_t: a_root, b_t: b_root}
             new["inputs"] = list(dict.fromkeys(ext.get(t, t) for t in op["inputs"]))
             new["op"] = op["op"].replace(f"fused__{gm['op']}__", f"fused__{GEMM_OPS[gm['op']]}__", 1)
