@@ -1907,8 +1907,11 @@ def build_host(problem_dir, *, arch: str = "75", work: Path | None = None, nvcc:
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
     exe = work / "host"
-    rc, log = _nvcc([nvcc, *NVCC_FLAGS, f"-arch={arch_flag(arch)}", *HOST_FLAGS, *cupti_flags(nvcc), "-o", str(exe),
-                     str(problem_dir / "driver.cpp"), "-ldl"], timeout)
+    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *HOST_FLAGS, *cupti_flags(nvcc)]
+    drv = problem_dir / "driver.cpp"
+    # the shared build cache (KERNELBLASTER_BUILD_CACHE, off by default): same driver text / flags / data / toolchain
+    rc, log = _cached_nvcc("nvcc-host", nvcc, flags, drv.read_text(), exe, ".host",
+                           lambda tmp: _nvcc([nvcc, *flags, "-o", str(tmp), str(drv), "-ldl"], timeout))
     return (exe if rc == 0 else None), log
 
 
@@ -1924,9 +1927,23 @@ def build_so(problem_dir, *, arch: str = "75", sources: dict[str, str] | None = 
                    link_flags=["-shared"], nvcc=nvcc, timeout=timeout):
         return so, ""
     cu = work / (Path(name).stem + ".cu")
-    cu.write_text(assemble(problem_dir, sources))
-    rc, log = _nvcc([nvcc, *NVCC_FLAGS, f"-arch={arch_flag(arch)}", *SO_FLAGS, "-o", str(so), str(cu)], timeout)
+    tu = assemble(problem_dir, sources)
+    cu.write_text(tu)
+    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *SO_FLAGS]
+    rc, log = _cached_nvcc("nvcc-so-tu", nvcc, flags, tu, so, ".so",
+                           lambda tmp: _nvcc([nvcc, *flags, "-o", str(tmp), str(cu)], timeout))
     return (so if rc == 0 else None), log
+
+
+def _cached_nvcc(kind: str, nvcc: str, flags: list, text: str, out: Path, suffix: str, run, extra=()) -> tuple:
+    """``run(tmp) -> (rc, log)`` through the shared build cache (pipeline/build_cache.py; ``KERNELBLASTER_BUILD_CACHE``
+    unset = ``run(out)`` as before). ``text`` and the absolute inputs it names are part of the key."""
+    from . import build_cache
+
+    if build_cache.cache() is None:
+        return run(out)
+    return build_cache.cached_build(kind, [f"nvcc={nvcc}", *flags, *extra, text, *build_cache.external_inputs(text)],
+                                    out, suffix, run)
 
 
 # one TU per slot in the builtin builds (KernelBlaster's incremental build); MB_BUILD_UNITS=0: the assembled TU
@@ -1952,20 +1969,27 @@ def build_units(problem_dir, out: Path, *, sources: dict[str, str] | None = None
     udir = work / "units"
     udir.mkdir(parents=True, exist_ok=True)
     jobs = []
+    texts = {}                                       # object -> (flags, source text) for the shared cache key
     for name, text in units(problem_dir, sources):
         (udir / name).write_text(text)
         jobs.append(([nvcc, *flags, "-c", str(udir / name), "-o", str(udir / (name + ".o"))], udir / (name + ".o")))
+        texts[udir / (name + ".o")] = (flags, text)
     if driver_flags is not None:
         jobs.append(([nvcc, *flags, *driver_flags, "-c", str(problem_dir / "driver.cpp"),
                       "-o", str(udir / "driver.o")], udir / "driver.o"))
-    from . import kb_trace
+        texts[udir / "driver.o"] = ([*flags, *driver_flags], (problem_dir / "driver.cpp").read_text())
+    from . import kb_trace, build_cache
 
     def compile_one(job):
-        try:
-            cp = subprocess.run(job[0], capture_output=True, text=True, timeout=timeout)
-            return cp.returncode, cp.stdout + cp.stderr
-        except subprocess.TimeoutExpired:
-            return -1, f"nvcc timed out after {timeout}s"
+        def run(tmp):
+            try:
+                cmd = [*job[0][:-1], str(tmp)]
+                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                return cp.returncode, cp.stdout + cp.stderr
+            except subprocess.TimeoutExpired:
+                return -1, f"nvcc timed out after {timeout}s"
+        fl, text = texts[job[1]]
+        return _cached_nvcc("nvcc-c", nvcc, fl, text, job[1], ".o", run)     # cache off: run(job[1]) = the plain nvcc
 
     with ThreadPoolExecutor(max_workers=max(1, min(len(jobs), os.cpu_count() or 4, 16))) as ex:
         res = list(ex.map(compile_one, jobs))
@@ -1974,10 +1998,17 @@ def build_units(problem_dir, out: Path, *, sources: dict[str, str] | None = None
     if any(rc for rc, _ in res):
         return False
     arch = next(f for f in flags if f.startswith("-arch="))
-    try:
-        rc, _ = _nvcc([nvcc, *(link_flags or []), arch, *[str(o) for _, o in jobs], "-o", str(out)], timeout)
-    except subprocess.TimeoutExpired:
-        return False
+    objs = [str(o) for _, o in jobs]
+
+    def link(tmp):
+        try:
+            return _nvcc([nvcc, *(link_flags or []), arch, *objs, "-o", str(tmp)], timeout)
+        except subprocess.TimeoutExpired:
+            return -1, "nvcc timed out"
+    # the link is determined by the objects' sources + flags (cache key); off: link(out)
+    whole = "\x00".join(" ".join(fl) + "\x01" + t for fl, t in texts.values())
+    rc, _ = _cached_nvcc("nvcc-link", nvcc, [*(link_flags or []), arch], whole, Path(out),
+                         ".so" if "-shared" in (link_flags or []) else ".exe", link)
     return rc == 0
 
 

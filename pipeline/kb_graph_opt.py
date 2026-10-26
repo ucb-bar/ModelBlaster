@@ -1619,6 +1619,12 @@ def main():
                          "--ssh-host, else builtin")
     ap.add_argument("--kb-arg", action="append", default=[],
                     help="extra run_multislot argument, verbatim (repeatable; use --kb-arg=--flag for dashes)")
+    ap.add_argument("--build-cache", metavar="DIR", default=None,
+                    help="shared content-addressed nvcc build cache (KERNELBLASTER_BUILD_CACHE) for every build of this "
+                         "run and its KernelBlaster subprocesses; off by default (analysis/compile_pool.md)")
+    ap.add_argument("--remote-build", action="store_true",
+                    help="with --ssh-host: KernelBlaster compiles candidate units on the pool hosts "
+                         "(KERNELBLASTER_REMOTE_BUILD=1; the driver's CPUs stay free); off by default")
     for k, v in asdict(Config(kb=Path("."))).items():
         if k in _MANUAL_FIELDS:
             continue
@@ -1626,6 +1632,10 @@ def main():
                         (int if k in ("top_k", "variant_steps", "stop_patience") else
                          float if k == "plan_min_share_late" else str), default=v)
     a = ap.parse_args()
+    if a.build_cache:                       # inherited by the KernelBlaster subprocesses (compile pool, X-148)
+        os.environ["KERNELBLASTER_BUILD_CACHE"] = str(Path(a.build_cache).expanduser())
+    if a.remote_build:
+        os.environ["KERNELBLASTER_REMOTE_BUILD"] = "1"
     cfg = Config(kb=Path(a.kb).resolve(), model=a.model, reflect_model=a.reflect_model,
                  plugins=[str(Path(p).resolve()) for p in a.plugin], python=a.python,
                  parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
