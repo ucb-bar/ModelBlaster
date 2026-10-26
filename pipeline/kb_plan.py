@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -58,6 +59,20 @@ def hinted_ir(ir_dir: Path, hints_doc: dict, work: Path, specs: dict):
     return d, specs, json.loads((d / "graph.json").read_text())
 
 
+# profiles redone after rejecting the cached winners that failed in the whole model
+PROFILE_FALLBACKS = 3
+
+
+def failed_cached_slots(res: dict, plan: dict) -> dict:
+    """The cache entries (``plan["used"]`` key -> entry) of the slots a failed run blames: a slot check
+    with ok=0 (a launch / API error of one of its ops, or a wrong result). {} when the run passed or
+    names no slot (a fault ends the run before the slot checks) -- nothing to fall back from."""
+    if res.get("passed"):
+        return {}
+    bad = {sid for sid, sc in (res.get("slots") or {}).items() if not sc.get("ok")}
+    return {k: e for k, e in (plan.get("used") or {}).items() if k.split("/")[0] in bad}
+
+
 def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache=None, arch: str = "75",
                specs: dict | None = None, runs: int = 3, keep: bool = False, kbeval=None,
                gpu_model: str | None = None, allow_gpu_mismatch: bool = False) -> dict:
@@ -81,26 +96,45 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
     work = Path(work)
     specs = dict(specs or _all_specs())
     hdir, specs, g = hinted_ir(Path(ir_dir), hints_doc or gh.new_doc(), work, specs)
-    plan = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else \
-        {"graph": gh.unique_names(g), "sources": {}, "tags": {}, "sub_sources": None, "hints": []}
-    pdir = write_variant_ir(Path(ir_dir), plan["graph"], work / "profile_ir") if plan["hints"] else hdir
-    prob = export_problem(pdir, work / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
-                          sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
-    # as deployed: CUDA graph where capturable; per-op GPU time from the driver's attribution
-    with kbt.get().span("mb.profile.run", ir=Path(ir_dir).name, runs=runs,
-                        evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp, \
-            kb_trace.get().scope(mb_stage="profile", ir=Path(ir_dir).name):
-        if kbeval is not None:
-            res = run_problem(kbeval, prob, arch=arch, work=work / "kb_time", reps=runs, gpu_model=gpu_model,
-                              allow_mismatch=allow_gpu_mismatch, name="profile")
-        else:
-            res = build_and_run(prob, arch=arch, runs=runs, graph=True)
-            res["device"] = builtin_device(arch)
-        dev = res.get("device") or {}
-        if sp is not None and hasattr(sp, "set"):
-            sp.set(device=dev.get("label"), gpu=dev.get("name"), host=dev.get("host"), passed=res.get("passed"))
+    fallback = []
+    for attempt in range(PROFILE_FALLBACKS + 1):
+        plan = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else \
+            {"graph": gh.unique_names(g), "sources": {}, "tags": {}, "sub_sources": None, "hints": [], "used": {}}
+        pdir = write_variant_ir(Path(ir_dir), plan["graph"], work / "profile_ir") if plan["hints"] else hdir
+        prob = export_problem(pdir, work / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
+                              sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
+        # as deployed: CUDA graph where capturable; per-op GPU time from the driver's attribution
+        with kbt.get().span("mb.profile.run", ir=Path(ir_dir).name, runs=runs,
+                            evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp, \
+                kb_trace.get().scope(mb_stage="profile", ir=Path(ir_dir).name):
+            if kbeval is not None:
+                res = run_problem(kbeval, prob, arch=arch, work=work / "kb_time", reps=runs, gpu_model=gpu_model,
+                                  allow_mismatch=allow_gpu_mismatch, name="profile")
+            else:
+                res = build_and_run(prob, arch=arch, runs=runs, graph=True)
+                res["device"] = builtin_device(arch)
+            dev = res.get("device") or {}
+            if sp is not None and hasattr(sp, "set"):
+                sp.set(device=dev.get("label"), gpu=dev.get("name"), host=dev.get("host"), passed=res.get("passed"))
+        man = json.loads((prob / "manifest.json").read_text())
+        bad = failed_cached_slots(res, plan)
+        if res.get("passed") or not bad or attempt == PROFILE_FALLBACKS:
+            break
+        # cached winners that fail in the whole model (each was validated in its own problem): rejected
+        # for this IR, as the verification would, and the profile redone on the next best source (the
+        # seed when none) -- one slot's bad kernel must not end a model's run
+        for key, e in bad.items():
+            if man["ir_name"] not in e["rejected"]:
+                e["rejected"].append(man["ir_name"])
+        cache.save()
+        step = {"attempt": attempt, "rejected": {k: e["impl_id"] for k, e in bad.items()},
+                "errors": (res.get("errors") or [])[:20]}
+        fallback.append(step)
+        kb_trace.record("profile_fallback", ir=man["ir_name"], mb_stage="profile", **step)
+        print(json.dumps({"profile_fallback": man["ir_name"], **step}), flush=True)
+        for p in (work / "problem", work / "profile_ir", work / "kb_time"):
+            shutil.rmtree(p, ignore_errors=True)
     attr = res.get("attr_op_us") or {}
-    man = json.loads((prob / "manifest.json").read_text())
     ops_by_name = {o["name"]: o for o in plan["graph"]["ops"]}
     seed = {s["id"]: s["seed_source"] for s in man["slots"]}
     recs = []
@@ -122,6 +156,8 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
            # deployed time not spent in kernels, per launch: what a fusion saves besides the kernel
            "launch_us": _launch_us(res),
            "applied_hints": [h["id"] for h in plan["hints"]],
+           # cached winners dropped because they failed in this whole model (see failed_cached_slots)
+           **({"cache_fallback": fallback} if fallback else {}),
            # where it ran: the GPU (host, label, uuid, name, arch) and the evaluator
            "device": res.get("device"),
            "evaluator": res.get("evaluator") or {"evaluator": "builtin", "runtime": "process"}}
@@ -200,14 +236,21 @@ def select(items: list[dict], *, coverage: float = 0.8, top_k: int | None = None
             "total_us": total, "selected_us": chosen, "selected_share": chosen / total, "items": items}
 
 
-def problems(plan: dict) -> dict:
-    """Group the selected items into one problem per representative IR."""
+def problems(plan: dict, per_item: bool = False) -> dict:
+    """Group the selected items into one problem per representative IR, or (``per_item``) one problem per
+    selected item (op kind x shape): each kernel gets its own KernelBlaster run, so the runs go in parallel and
+    their winners carry one shape guard each (a model's linears of different shapes are all tuned in one round)."""
     by_ir: dict[str, dict] = {}
     for it in plan["items"]:
         if not it.get("selected"):
             continue
         rep = it["occurrences"][0]
         it["rep_ir"] = rep["ir"]
+        if per_item:
+            pid = re.sub(r"[^A-Za-z0-9_]+", "_", f"{rep['ir']}__{it['op']}_{len(by_ir)}")
+            by_ir[pid] = {"id": pid, "ir": rep["ir"], "ir_dir": rep["ir_dir"], "op_names": list(rep["ops"]),
+                          "keys": [it["key"]], "est_us": rep["us"]}
+            continue
         p = by_ir.setdefault(rep["ir"], {"ir": rep["ir"], "ir_dir": rep["ir_dir"], "op_names": [], "keys": [],
                                          "est_us": 0.0})
         p["op_names"] += [n for n in rep["ops"] if n not in p["op_names"]]
@@ -221,13 +264,26 @@ def make_plan(profiles: list[dict], **kw) -> dict:
     from . import kb_trace
     excl = len(kw.get("exclude") or ())
     opts = {k: v for k, v in kw.items() if k != "exclude"}
-    plan = problems(select(rank(profiles, kw.pop("weights", None)), **kw))
+    per_item = kw.pop("per_item", False)
+    plan = problems(select(rank(profiles, kw.pop("weights", None)), **kw), per_item=per_item)
     plan["profiles"] = [{"ir": p["ir"], "ir_dir": p["ir_dir"], "partition_us": p["partition_us"]} for p in profiles]
     # the plan's inputs (every profile's per-op times) and its output
     kb_trace.record("plan", mb_stage="plan", options=opts, excluded=excl, selected_share=plan.get("selected_share"),
                     profiles=kb_trace.put_json(profiles), plan=kb_trace.put_json(plan),
                     problems=[(p["ir"], len(p["op_names"])) for p in plan["problems"]])
     return plan
+
+
+def plan_op_indices(graph: dict, op_names: list[str], pid: str = "") -> list[int]:
+    """Indices of a plan problem's ops in ``graph`` (op names already unique). Every name must be there: a
+    problem with a missing op would be tuned (and its winner ingested) on the wrong partition or none."""
+    want = set(op_names)
+    idx = [i for i, o in enumerate(graph["ops"]) if o["name"] in want]
+    missing = want - {graph["ops"][i]["name"] for i in idx}
+    if missing or not idx:
+        raise ValueError(f"plan problem {pid}: ops {sorted(missing) or sorted(want)} not in the IR graph "
+                         f"(op names: {[o['name'] for o in graph['ops']][:20]})")
+    return idx
 
 
 def export_plan(plan: dict, out: Path, *, cache=None, arch: str = "75", specs: dict | None = None,
@@ -239,19 +295,25 @@ def export_plan(plan: dict, out: Path, *, cache=None, arch: str = "75", specs: d
     from .kb_ingest import cache_plan
     from .kb_proposals import _all_specs, with_fused_specs, write_variant_ir
 
+    from .graph_hints import unique_names
+
     specs = dict(specs or _all_specs())
     dirs = []
     for p in plan["problems"]:
         ir_dir = Path(p["ir_dir"])
-        g = json.loads((ir_dir / "graph.json").read_text())
+        # the plan's op names are the profile's: unique (`einsum_1#4` for the 5th op named einsum_1), as
+        # export_problem numbers them; matched against graph.json's raw names, every repeat of a name missed
+        # (an empty partition was sent to KernelBlaster) and the first instance pulled in all of its repeats
+        g = unique_names(json.loads((ir_dir / "graph.json").read_text()))
         specs = with_fused_specs(g, specs)
         cp = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else None
         if cp is not None and cp["hints"]:
             ir_dir = write_variant_ir(ir_dir, cp["graph"], Path(out) / f"{p['ir']}.ir")
             g = cp["graph"]
-        idx = [i for i, o in enumerate(g["ops"]) if o["name"] in set(p["op_names"])]
-        name = (names or {}).get(p["ir"], f"{p['ir']}__plan")
-        dirs.append(export_problem(ir_dir, Path(out) / p["ir"], op_indices=idx, specs=specs, name=name,
+        idx = plan_op_indices(g, p["op_names"], p.get("id", p["ir"]))
+        pid = p.get("id", p["ir"])                                 # per-item plans: several problems per IR
+        name = (names or {}).get(pid, f"{pid}__plan")
+        dirs.append(export_problem(ir_dir, Path(out) / pid, op_indices=idx, specs=specs, name=name,
                                    strategy="plan", slot_sources=cp["sources"] if cp else None,
                                    slot_source_tags=cp["tags"] if cp else None,
                                    sub_sources=cp["sub_sources"] if cp else None))
