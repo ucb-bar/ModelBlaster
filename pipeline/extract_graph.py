@@ -41,6 +41,9 @@ import torch
 import torch.fx
 from torch.fx.passes.shape_prop import ShapeProp
 
+# precision_policy.extract sets this to a list to receive the fp32 golden output (A2); None = off
+GOLDEN_SINK = None
+
 
 # The fx node extract() is lowering; read by its generic-lowering retry.
 _LOWERING_NODE: list = [None]
@@ -5036,6 +5039,12 @@ def extract(
             torch.manual_seed(0)
             with _SortedTopk():
                 out = ref_model(*ref_inputs_exec)
+
+    # precision_policy (A2): the fp32 model output before the storage cast (fp16 storage overflows to inf for
+    # e.g. Mamba2); None (default) = no-op
+    if GOLDEN_SINK is not None:
+        GOLDEN_SINK.append(np.concatenate([o.detach().cpu().float().numpy().reshape(-1) for o in out])
+                           if isinstance(out, (tuple, list)) else out.detach().cpu().float().numpy().reshape(-1))
 
     # Multi-output models return a tuple; flatten in IR-output order so the
     # downstream comparator just needs to do an elementwise compare.

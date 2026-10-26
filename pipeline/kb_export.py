@@ -109,6 +109,39 @@ def _problem_dtype(kinds: list[str]) -> str:
     return cuda_dtypes.FP16 if dts == {cuda_dtypes.FP16} else cuda_dtypes.FP32
 
 
+def _is_mixed(kinds: list[str]) -> bool:
+    """fp16 ops next to fp32 ones / casts: only IRs rewritten by the precision policy."""
+    from .precision_casts import CAST_KINDS
+    if any(k in CAST_KINDS for k in kinds):        # casts live in their own library (mb_cuda_kernels_casts.cu)
+        return True
+    dts = {cuda_dtypes.op_dtype(k) for k in kinds}
+    return cuda_dtypes.FP16 in dts and len(dts) > 1
+
+
+class _MixedLibrary:
+    """The fp16 and fp32 hand libraries side by side (precision-policy partitions): an entry comes from the
+    library that defines it (``kernel_<op>_f16`` and the casts: fp16 file; ``kernel_<op>``: fp32 file); the head is
+    the union of both heads (fp16 first: it adds cuda_fp16.h). The casts come from mb_cuda_kernels_casts.cu."""
+
+    def __init__(self, hand_cu: Path):
+        self.f16 = CudaLibrary(_hand_source(Path(hand_cu), cuda_dtypes.FP16))
+        self.f32 = CudaLibrary(_hand_source(Path(hand_cu), cuda_dtypes.FP32))
+        self.casts = CudaLibrary((HARNESS / "cuda" / "mb_cuda_kernels_casts.cu").read_text())
+        self.items = {**self.f32.items, **self.f16.items, **self.casts.items}
+
+    def _lib(self, entry: str) -> "CudaLibrary":
+        return self.casts if entry in self.casts.items else self.f16 if entry in self.f16.items else self.f32
+
+    def closure(self, entry: str) -> list[str]:
+        return self._lib(entry).closure(entry)
+
+    def slot_source(self, entry: str) -> str:
+        return self._lib(entry).slot_source(entry)
+
+    def head_source(self) -> str:
+        return "\n".join(self.f16.head + [h for h in self.f32.head if h not in self.f16.head]) + "\n"
+
+
 def _hand_source(hand_cu: Path, dtype: str) -> str:
     """The hand kernels for a dtype: fp16 uses the generated `<stem>_f16.cu`
     beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu for the default)."""
@@ -273,6 +306,8 @@ def assemble(problem_dir: Path, sources: dict[str, str] | None = None) -> str:
     for s in man["slots"]:
         code = (sources or {}).get(s["id"]) or (problem_dir / s["file"]).read_text()
         parts.append(wrap_slot(s["id"], code))
+        for ln in range(1, int((asm.get("lanes") or {}).get(s["id"], 1))):     # concurrent instances' copies
+            parts.append(wrap_slot(f"{s['id']}__lane{ln}", code))
     parts.append((problem_dir / asm["tail"]).read_text())
     return "\n".join(parts)
 
@@ -293,10 +328,14 @@ def units(problem_dir: Path, sources: dict[str, str] | None = None) -> list[tupl
     asm = man["assembly"]
     head = (problem_dir / asm["head"]).read_text()
     out = []
+    lanes = asm.get("lanes") or {}
     for s in man["slots"]:
         code = (sources or {}).get(s["id"]) or (problem_dir / s["file"]).read_text()
         out.append((f"slot_{s['id']}.cu", "\n".join([head, wrap_slot(s["id"], code)])))
-    decls = "".join(f"namespace {NS_PREFIX}{s['id']} {{ {s['signature']}; }}\n" for s in man["slots"])
+        for ln in range(1, int(lanes.get(s["id"], 1))):                       # concurrent instances' copies
+            out.append((f"slot_{s['id']}__lane{ln}.cu", "\n".join([head, wrap_slot(f"{s['id']}__lane{ln}", code)])))
+    decls = "".join(f"namespace {NS_PREFIX}{sid} {{ {s['signature']}; }}\n" for s in man["slots"]
+                    for sid in [s["id"]] + [f"{s['id']}__lane{ln}" for ln in range(1, int(lanes.get(s["id"], 1)))])
     out.append(("walker_tail.cu", "\n".join([head, decls, (problem_dir / asm["tail"]).read_text()])))
     return out
 
@@ -405,7 +444,9 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
                    tolerance: dict | None = None, strategy: str = "custom",
-                   sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda") -> Path:
+                   sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda",
+                   concurrency: str | None = None, sm_budget_policy: str | None = None,
+                   prune_dead: bool | str | None = None) -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
     ``slot_sources`` maps a slot id (or an op kind) to a seed source
@@ -418,6 +459,17 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     kind, else the hand kernel. ``target="opencl"`` writes OpenCL slots,
     runtime and driver (``kb_export_opencl``); the partition, buffers, ops and
     data are the same.
+
+    ``concurrency`` ("off" | "on"; None: ``$MB_GRAPH_CONCURRENCY``, default off) and ``sm_budget_policy``
+    ("split" | "none" | "strict"; None: ``$MB_SM_BUDGET_POLICY``, default split): with "on", ops that are
+    independent in the whole IR graph (``kb_concurrency``) become concurrent branches of the CUDA graph the driver
+    captures, an op instance that may overlap another of its slot gets its own copy of the slot (a *lane*: separate
+    static state), the slots see ``mb_sm_budget()`` (the SMs an op should size a persistent grid for) and the driver
+    gets a deadlock watchdog. With off (the default) every output file is what it was.
+
+    ``prune_dead`` (None: ``$MB_PRUNE_DEAD``, default on; ``graph_prune``): selected ops whose outputs never reach
+    a graph output (whole-graph liveness) are not exported; the manifest lists them under
+    ``partition.pruned_dead``. Graphs without dead ops export byte-identically either way.
     """
     import torch
 
@@ -434,6 +486,13 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     g = unique_names(ir.graph)
     ops = g["ops"]
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
+    sel_requested = list(sel)
+    # dead-op pruning (graph_prune; $MB_PRUNE_DEAD, default on): ops whose outputs never reach a graph output
+    # get no call; with no dead op in the graph every output file is what it was
+    from . import graph_prune
+    sel, dead = graph_prune.prune_selection(g, sel, list(ir.output_names()), prune_dead)
+    dead_set = set(dead)
+    pruned = [ops[i]["name"] for i in dead if i in set(sel_requested)]
     sel_set = set(sel)
     tensors = g["tensors"]
     specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
@@ -444,7 +503,8 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     # fused ops keep their internal tensor (A's output) as a scratch buffer
     produced = [t for i in sel for t in ops[i]["outputs"] + ops[i].get("internal", [])]
     produced_set = set(produced)
-    consumed_outside = {t for i, o in enumerate(ops) if i not in sel_set for t in o["inputs"]}
+    consumed_outside = {t for i, o in enumerate(ops) if i not in sel_set and i not in dead_set
+                        for t in o["inputs"]}
     graph_outs = set(ir.output_names())
     outputs = [t for t in produced if t in consumed_outside or t in graph_outs]
     boundary = []
@@ -495,9 +555,15 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
 
     # ---- slots + per-op calls
     slots, slot_of, calls, op_recs = {}, {}, [], []
+    conc_ops = []                                 # (full op index, slot id, call stmt, scratch buffers) per op_rec
     dtype = _problem_dtype([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
-    lib = CudaLibrary(_hand_source(hand_cu, dtype)) if tgt is None else \
+    # precision policy (precision_policy.py): a partition mixing fp16 ops and an fp32 island takes its slots from
+    # both hand libraries and the fp16 tolerances; partitions of one dtype (every IR without a policy) unchanged
+    mixed = tgt is None and _is_mixed([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
+    lib = _MixedLibrary(hand_cu) if mixed else CudaLibrary(_hand_source(hand_cu, dtype)) if tgt is None else \
         tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
+    if mixed:
+        dtype = cuda_dtypes.FP16              # the problem's rules / tolerances; fp32 slots say so in their semantics
     for i in sel:
         o = ops[i]
         if o["op"] in ALIAS_OPS:
@@ -506,6 +572,9 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         if kind not in specs and kind.startswith("fused__"):      # rebuilt from its name
             from .kb_proposals import spec_from_kind
             specs[kind] = spec_from_kind(kind, specs)
+        if kind not in specs and kind.startswith("region__"):     # region slots: from the op's members
+            from .region_slots import region_spec
+            specs[kind] = _CudaSpelled(region_spec(o, specs))
         if kind not in specs:
             raise KeyError(f"{kind}: no KernelSpec")
         spec = specs[kind]
@@ -519,6 +588,11 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 src, tag = slot_sources[key], (slot_source_tags or {}).get(key, "override")
             elif tgt is not None:
                 src, tag = tgt.seed(lib, entry, spec)
+            elif kind.startswith("region__"):          # region: members' current kernels in order (region_slots)
+                from .region_slots import seed_sources
+                subs = (sub_sources or {}).get(sid) or seed_sources(o, slot_sources or {}, specs)
+                src = spec.cuda_seed(lib, sub_sources=subs)
+                tag = f"region-seed:{len(subs)}/{sum(m['op'] not in ALIAS_OPS for m in o['sub_ops'])}"
             elif hasattr(spec, "cuda_seed"):           # fused ops: stage kernels back to back
                 if sub_sources is not None:
                     subs = sub_sources.get(sid, {})
@@ -540,13 +614,21 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                           **({"variant_of": base_sid} if o.get("slot_variant") else {}),
                           "seed_source": tag, "instances": [], "_src": src,
                           "_ref": spec.reference_impl}
+            if mixed and cuda_dtypes.op_dtype(kind) == cuda_dtypes.FP32:
+                slots[sid]["semantics"] = ("(fp32 island of the precision policy: this slot's float pointers are "
+                                           "fp32 `float` buffers, not __half; values exceed the fp16 range) "
+                                           + (spec.semantics or ""))
         if kind not in slots[sid]["ops"]:
             slots[sid]["ops"].append(kind)
             if kind != slots[sid]["op"] and spec.semantics:
                 slots[sid]["semantics"] += f"\n[{kind}] {spec.semantics}"
         k = len(op_recs)
         args, ins, outs, scalars, ptrs = [], [], [], [], []
-        if "sub_ops" in o:
+        scratch = []
+        if kind.startswith("region__"):
+            from .region_slots import bind_region
+            arglist = bind_region(o, specs)
+        elif "sub_ops" in o:
             from .kb_proposals import bind_fused
             arglist = bind_fused(o, specs)
         else:
@@ -557,6 +639,8 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 b = index[a.value]
                 if a.kind != "scratch":
                     (ins if a.kind == "in" else outs).append(b)
+                else:
+                    scratch.append(b)
                 ptrs.append((len(args), b))
                 args.append(_ptr_arg(p.ctype, b))
             elif a.kind == "weight":
@@ -576,6 +660,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                           n_ptr_params=sum(x.param.is_ptr for x in arglist),
                           elementwise=op_class(kind) == "elementwise", cuda=tgt is None, op_name=o["name"])
         calls.append(f"    case {k}: {stmt} break;  // {o['name']}")
+        conc_ops.append((i, sid, stmt, scratch))
         slots[sid]["instances"].append({"op_name": o["name"], "op": kind, "index": k, "shape": o.get("shape", {})})
         op_recs.append({"index": k, "name": o["name"], "op": kind, "slot": sid,
                         "inputs": ins, "outputs": outs})
@@ -613,33 +698,45 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     (out / "data.bin").write_bytes(bytes(blob))
     head, tail_name, driver_name = ("walker_head.cu", "walker_tail.cu", "driver.cpp") if tgt is None else \
         (tgt.head_name, tgt.tail_name, tgt.driver_name)
+    from . import kb_concurrency as kc
+    conc = kc.resolve(concurrency, sm_budget_policy) if tgt is None else None
+    if conc is None and tgt is None and concurrency is None and any(ops[i]["op"].startswith("region__") for i in sel):
+        conc = kc.resolve("on", sm_budget_policy)    # region slots (spin-waiting megakernels): watchdog + SM budget
+    sched = kc.schedule(g, sel, op_recs, conc_ops, bufs, conc) if conc is not None else None
     (out / head).write_text(
         "// Shared preamble for every slot (from the ModelBlaster hand kernels).\n"
         # winners are written against KernelBlaster's harness, which provides these; the walker must too
         + ("#include <stdint.h>\n#include <cstddef>\n" if tgt is None else "") + lib.head_source()
+        + (kc.HEAD if conc is not None else "")
         if tgt is None else tgt.head_source(lib))
     tail = [
         "// Generated by modelblaster.pipeline.kb_export: one call per op, in IR order.",
         *([] if tgt is not None else [MB_ANY_PTR]),
         "void mb_run_op(int i, void **b) {", "    switch (i) {", *calls, "    default: break;", "    }", "}",
         f"int mb_num_ops() {{ return {len(op_recs)}; }}",
-        "void launch_gpu_implementation(void **b) {",
-        f"    for (int i = 0; i < {len(op_recs)}; ++i) mb_run_op(i, b);", "}",
+        *(kc.tail(sched, conc, len(op_recs), NS_PREFIX) if conc is not None else [
+            "void launch_gpu_implementation(void **b) {",
+            f"    for (int i = 0; i < {len(op_recs)}; ++i) mb_run_op(i, b);", "}"]),
         *([] if tgt is not None else SO_ABI), ""]
     (out / tail_name).write_text("\n".join(tail))
     tol = {**DTYPE_TOL[dtype], **(tolerance or {})}
     slot_list = list(slots.values())
-    (out / driver_name).write_text((_driver_source if tgt is None else tgt.driver_source)(
-        out / "data.bin", bufs, op_recs, slot_list, tol))
+    if conc is not None:
+        kc.annotate_slots(slot_list, sched)
+    drv_src = (_driver_source if tgt is None else tgt.driver_source)(out / "data.bin", bufs, op_recs, slot_list, tol)
+    (out / driver_name).write_text(kc.driver(drv_src) if conc is not None else drv_src)
     man = {
         "format": FORMAT,
-        "name": name or f"{ir.name}__{ops[sel[0]]['name']}__{ops[sel[-1]]['name']}",
+        "name": name or f"{ir.name}__{ops[sel_requested[0]]['name']}__{ops[sel_requested[-1]]['name']}",
         "source_ir": str(ir_dir), "ir_name": ir.name,
         "partition": {"strategy": strategy, "op_names": [ops[i]["name"] for i in sel],
-                      "op_indices": sel, "is_whole_graph": len(sel) == len(ops)},
+                      "op_indices": sel, "is_whole_graph": len(sel_requested) == len(ops),
+                      **({"pruned_dead": pruned} if pruned else {})},
         "target": target, "dtype": dtype, "tolerance": tol,
         "assembly": {"head": head, "tail": tail_name,
-                     "namespace_prefix": NS_PREFIX, "order": [s["id"] for s in slot_list]},
+                     "namespace_prefix": NS_PREFIX, "order": [s["id"] for s in slot_list],
+                     **({"lanes": sched["lanes"]} if sched and sched.get("lanes") else {})},
+        **({"concurrency": kc.summary(sched, conc)} if conc is not None else {}),
         "driver": driver_name, "data": "data.bin",
         "data_sha1": hashlib.sha1(bytes(blob)).hexdigest(),
         "slots": slot_list, "ops": op_recs, "buffers": bufs,
@@ -1708,10 +1805,20 @@ def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | No
     object and evaluates them in one host request (CUDA graph on, as the host
     always builds with the per-thread default stream); ``runs`` requests."""
     if runtime == "host":
-        return _build_and_run_host(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
-                                   timeout=timeout, runs=runs, env=env)
-    return _build_and_run_process(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
-                                  timeout=timeout, runs=runs, env=env, graph=graph)
+        res = _build_and_run_host(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
+                                  timeout=timeout, runs=runs, env=env)
+    else:
+        res = _build_and_run_process(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
+                                     timeout=timeout, runs=runs, env=env, graph=graph)
+    from .kb_concurrency import deadlocked
+    if deadlocked(res) and (env or {}).get("MB_CONCURRENCY") != "0":
+        # concurrent branches hung (the driver's watchdog): the same program, launched sequentially (recorded)
+        first = res.get("log", "")[-800:]
+        res = build_and_run(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc, timeout=timeout,
+                            runs=runs, env={**(env or {}), "MB_CONCURRENCY": "0"}, graph=graph, runtime=runtime)
+        res["concurrency_fallback"] = {"why": "deadlock watchdog", "log": first}
+        print(json.dumps({"concurrency_fallback": str(problem_dir), "why": "deadlock watchdog"}), flush=True)
+    return res
 
 
 def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs, env) -> dict:
