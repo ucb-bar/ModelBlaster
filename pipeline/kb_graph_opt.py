@@ -59,8 +59,21 @@ devices.
         [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch] [--mb-evaluator auto|kb|builtin] \\
         [--knowledge v1|v2] [--ncu off|best|all] [--reward e2e|slot] [--model-simple M --model-hard M] \\
         [--hetero-policy P] [--models-config F] [--upkeep-model M] [--kb-arg=--flag --kb-arg=value] \\
+        [--efficiency-rules on|safe|off] [--stop-patience N] [--plan-min-share-late X] \\
         [--knowledge-global off|read|readwrite --knowledge-global-seed SEED_DIR \\
          --knowledge-global-store STORE --knowledge-global-part cuda:sm_89|fp16]
+
+Efficiency rules (``kb_efficiency.py``; ``l3_farm/analysis/efficiency_rules.md``), ON by default since X-129 --
+results before and after are not directly comparable: ``--efficiency-rules on`` (default) = R1 patience (the
+plan's KernelBlaster runs stop a slot problem after ``--stop-patience`` 8 consecutive committed steps without a
+new slot best; never the hint-decision runs) + R2 late min-share (rounds >= 1 only: plan items below
+``--plan-min-share-late`` 0.005 of the round's model time are not sent; round 0 keeps ``--plan-min-share`` /
+``--min-share``); ``safe`` = late min-share 0.01, no patience; ``off`` = the behaviour before X-129 (ablations:
+pass ``--efficiency-rules off``). A per-rule flag overrides the preset (0 = that rule off). Without any of these
+flags a work dir keeps the rules it was started with (``state.json`` ``efficiency``); a work dir from before
+X-129 resumes with the rules off and its round key unchanged. Recorded per round (``round.json`` /
+``state.json`` ``efficiency``: late-skipped items with their shares, patience stops with their commit) and in
+``summary.json`` ``efficiency``.
 
 Global knowledge (``kb_global.py``, off by default): ``read`` starts a fresh ``knowledge/`` from a
 global snapshot's seed instead of the repo seed (recorded in ``state.json`` / ``summary.json``
@@ -93,6 +106,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import graph_hints as gh
+from . import kb_efficiency
 from . import kb_global
 from . import kb_resume
 from . import kb_telemetry as kbt
@@ -132,6 +146,15 @@ class Config:
     # model time -- large nets have hundreds of op/shape items, which one GPU cannot work through in a round
     plan_top_k: int = 0
     plan_min_share: float = 0.0
+    # E7 cost-efficiency rules (kb_efficiency.py; l3_farm/analysis/efficiency_rules.md), ON by default since X-129:
+    # efficiency_rules on (patience 8 + late min-share 0.005) | safe (late min-share 0.01) | off (the behaviour
+    # before X-129); None = auto: on for a new work dir, else the rules the work dir was started with (off for a
+    # work dir from before X-129). stop_patience: KernelBlaster --stop-patience for the plan's runs (never the hint
+    # decisions'), 0 = off; plan_min_share_late: the plan's min share in rounds >= 1 (round 0 keeps min_share /
+    # plan_min_share), 0 = off. An explicit per-rule value overrides the preset's.
+    efficiency_rules: str | None = None
+    stop_patience: int | None = None
+    plan_min_share_late: float | None = None
     max_variants: int = 3
     remeasure: int = 5
     # a re-measurement lost to an infrastructure failure (the copy to / the link to / the GPU of the
@@ -193,8 +216,75 @@ class Config:
     knowledge_global_store: str = ""
     knowledge_global_part: str = ""
     knowledge_global_problem: str = ""
+    # mid-run sharing (kb_global.refresh_at_round, KernelBlaster knowledge/v2/refresh.py): a directory where a
+    # controller drops refresh packages (*.tar.gz or dirs with refresh.json); at the start of every round
+    # the newest one is imported into knowledge/ (other runs' claims, statistics, impl winners since this
+    # run's last sync; never its own). "" (default) = off: no import and the round key is unchanged
+    knowledge_global_refresh: str = ""
     # anything else for run_multislot, verbatim (e.g. --kb-arg=--explore-frac --kb-arg=0.2)
     kb_args: list = field(default_factory=list)
+    # CUDA-only-baseline learnings (cuda_learnings.py; l3_farm/analysis/cuda_learnings_impl.md), all off by default:
+    # winner reuse across split variants / problems (off|siblings|global; reuse_canon: flag fields that are not
+    # shape, "default" = kb_plan.CANON_FLAGS; rollout_accept: auto = local with reuse on | local | composite),
+    # concurrent CUDA-graph branches (off|on) with an SM budget per branch (split|none|strict) and a deadlock watchdog,
+    # fusion beyond producer->elementwise (off|siblings|epilogue|attention|all; fused variants keep per-shape kernels)
+    reuse_winners: str = "off"
+    reuse_canon: str = "default"
+    rollout_accept: str = "auto"
+    graph_concurrency: str = "off"
+    sm_budget_policy: str = "split"
+    conc_timeout_s: float = 30.0
+    fusion_extended: str = "off"
+    # search fixes (search_fixes.py; l3_farm/analysis/search_fixes.md): fallback_repair on (route + re-queue the
+    # instances a profile fallback left on a seed; default, kill switch off) | route | requeue | off, at most
+    # fallback_requeue_max re-queues per item; final_guard warn (default) | repair (route, zero LLM, and verify again)
+    # | off: dominant ops (>= final_guard_share of the model) on or near (< final_guard_min_speedup x) their seed;
+    # seed_nearest off | on: nearest-shape verified kernels as trial seeds; rollout_resync X (0 = off): KernelBlaster
+    # rollouts lagging the composite by > X after a non-improving step restart from it (rollout_accept lineage = local
+    # acceptance + resync 1.5)
+    fallback_repair: str = "on"
+    fallback_requeue_max: int = 1
+    final_guard: str = "warn"
+    final_guard_share: float = 0.10
+    final_guard_min_speedup: float = 1.25
+    seed_nearest: str = "off"
+    rollout_resync: float = 0.0
+    # graph search redesign (graph_search.py; l3_farm/analysis/graph_search_redesign.md), all off by default
+    # (rounds = the round-based flow; nothing else runs and the round key is unchanged): interleaved = hint
+    # decisions inside the plan's KernelBlaster run on successive-halving rungs, decided and applied mid-round;
+    # dataset priors (auto|off|rank|preapply), round-0 characterization pass, survival-weighted plan budgets,
+    # graph-diverse beam (members), fold_layout proposals
+    graph_search: str = "rounds"
+    graph_priors: str = "auto"
+    graph_prior_conf: float = 0.55
+    graph_prior_min_n: int = 3
+    graph_explore: float = 0.1
+    graph_prior_min_gain: float = 0.0
+    graph_characterize: int = -1
+    graph_char_top: int = 8
+    graph_char_rollouts: int = 1
+    graph_survival: str = "auto"
+    graph_survival_head: float = 0.25
+    graph_rung_steps: int = 0
+    graph_eta: float = 2.0
+    graph_cap_steps: int = 8
+    graph_defer: int = 1
+    graph_diverse_beam: int = 0
+    graph_layout_fold: str = "off"
+    # graph and kernel capabilities (capabilities.py; l3_farm/analysis/capabilities_impl.md): dead-op pruning at
+    # export on (kill switch off); recurrent op class off|on; precision policy off|auto (acts at extraction);
+    # region slots off|rnn_stack,attention_block,all; multi-turn codegen with an experiment tool off|on and its
+    # per-step budget "turns,runs,seconds"; whole-model context in slot problems off|on
+    prune_dead: str = "on"
+    recurrent_class: str = "off"
+    precision_policy: str = "off"
+    region_slots: str = "off"
+    multiturn: str = "off"
+    multiturn_budget: str = "3,4,120"
+    # X-145 experiment recording (needs --multiturn on): off | record | ingest | ingest+prompt
+    experiments: str = "off"
+    model_context: str = "off"
+    view_fusion: str = "off"
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
     # KernelBlaster run's <out>/trace (prompts, responses, candidates, builds, driver output):
     # full | meta (hashes and sizes only) | off; env KB_TRACE
@@ -381,7 +471,8 @@ class KBRunner:
         self.commands: dict = {}                      # out dir -> its command line
 
     def command(self, problems: list[Path], out: Path, *, steps: int | None = None,
-                winners: Path | None = None, parallel_problems: int | None = None) -> list[str]:
+                winners: Path | None = None, parallel_problems: int | None = None,
+                stop_patience: int | None = None) -> list[str]:
         c = self.cfg
         cmd = [c.python, str(Path(c.kb) / "scripts" / "run_multislot.py"), *map(str, problems), "--out", str(out),
                "--knowledge-dir", str(self.knowledge), "--model", c.model, "--arch", c.arch,
@@ -427,6 +518,9 @@ class KBRunner:
             cmd += ["--plugin", str(p)]
         if kb_trace.kb_supports_trace(c.kb):
             cmd += ["--trace", kb_trace._level(c.trace)]
+        if kb_efficiency.kb_supports_patience(c.kb):   # always explicit: KernelBlaster's own default is on
+            sp = c.stop_patience if stop_patience is None else stop_patience
+            cmd += ["--stop-patience", str(int(sp or 0))]
         cmd += list(c.kb_args)
         self.commands[str(out)] = cmd                 # the trace's mb.kb_run record
         return cmd
@@ -518,6 +612,10 @@ def _scope_ops(h: dict, graph: dict, specs: dict) -> list[str]:
         return list(dict.fromkeys(names))
     if h["kind"] == "split_slot":
         return [o["name"] for o in graph["ops"] if o["op"] in specs and base_slot_id(o["op"], specs) == h["slot"]]
+    from . import cuda_learnings as cl
+    if cl.ext_kind(h) or h["kind"] in ("fold_layout", "fuse_region", "fuse_view"):   # ext fusion / fold / A2 kinds
+        from .fusion_ext import scope_ops
+        return scope_ops(h, graph, specs)
     return []
 
 
@@ -563,6 +661,9 @@ def footprint(h: dict, ir: str, graph: dict, specs: dict) -> dict:
         writes = {_entry(h["fused_kind"], specs)}
     elif h["kind"] == "split_slot":
         writes = {_entry(by_name[names[0]]["op"], specs)} if names else {h["slot"]}
+    elif h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout"):   # extended kinds: the new ops' entries
+        from .fusion_ext import new_kinds
+        writes = {_entry(k, specs) for k in new_kinds(h, graph, specs)}
     else:
         writes = set()
     return {"ops": ops, "reads": reads | writes, "writes": writes}
@@ -651,7 +752,9 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     if not prov["applied"]:
         job["early"] = "; ".join(s["why"] for s in prov["skipped"])[:500]
         return job
-    vplan = cache_plan(vg, cache, f"sm_{cfg.arch}", specs, split=False)
+    from . import cuda_learnings as cl
+    # --fusion-extended: a fused slot is split by its stages' per-shape winners (each split slot seeded with them)
+    vplan = cache_plan(vg, cache, f"sm_{cfg.arch}", specs, split=cl.variant_split())
     out.mkdir(parents=True, exist_ok=True)
     src_ir = Path(prof["source_ir"])
     oir = write_variant_ir(src_ir, g0, out / "orig_ir")
@@ -662,12 +765,29 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     vidx = [i for i, o in enumerate(vplan["graph"]["ops"]) if o["name"] in vnames]
     seeds = {**base["sources"], **vplan["sources"]}
     tags = {**base["tags"], **vplan["tags"]}
+    from . import graph_search as gsm                   # a promising hint's next rung continues from its best
+    gsm.variant_seed_override(h, vplan, seeds, tags, specs)
+    if h["kind"] == "fold_layout":                      # --graph-layout-fold: composite seed (parity start)
+        specs = with_fused_specs(vplan["graph"], specs)
+        job["specs"] = specs
+        job["composite"] = gsm.fold_seeds(h, g0, vplan, base, seeds, tags, specs)
+    if h["kind"] == "fuse_region":                      # region slots: specs of the region kinds (parity seed in export)
+        specs = with_fused_specs(vplan["graph"], specs)
+        job["specs"] = specs
+    if cl.ext_kind(h):                                  # composite seeds for structural kinds (attention)
+        from .fusion_ext import variant_seeds
+        specs = with_fused_specs(vplan["graph"], specs)
+        job["specs"] = specs
+        job["composite"] = variant_seeds(h, g0, vplan, base, seeds, tags, specs)
     job["orig"] = export_problem(oir, out / "orig", op_indices=oidx, specs=specs, name=stem + "__orig",
                                  strategy="hint-original", slot_sources=base["sources"],
                                  slot_source_tags=base["tags"], sub_sources=base["sub_sources"])
     job["variant"] = export_problem(vir, out / "variant", op_indices=vidx, specs=specs, name=stem + "__variant",
                                     strategy="hint-variant", slot_sources=seeds, slot_source_tags=tags,
                                     sub_sources=vplan["sub_sources"])
+    if job.get("composite"):
+        from .fusion_ext import note_composite
+        note_composite(job["variant"], job["composite"])
     job["stem"], job["prov"] = stem, prov
     return job
 
@@ -888,7 +1008,9 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
     if rec["status"] == "accepted":
         man = json.loads((Path(job["variant"]) / "manifest.json").read_text())
         changed = [s["id"] for s in man["slots"]
-                   if s["op"].startswith("fused__") or s.get("variant_of")]
+                   if s["op"].startswith("fused__") or s.get("variant_of")
+                   or h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout")   # only new ops there
+                   or s["op"].startswith("region__")]                                   # region slots (A2)
         res["cached"] = _ingest_slots(cache, job["variant"], rv, changed, job["specs"], h["id"])
     _trace_hint(job, ro, rv, times, ev, res)
     return res
@@ -945,7 +1067,8 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
         problems = [p for k in live for p in (jobs[k]["orig"], jobs[k]["variant"])]
         parent = T.current()
         wait = kbt.section("mb.kb_wait", kind="hints", problems=len(problems))
-        proc = kb.start(problems, run_dir, steps=cfg.variant_steps, parallel_problems=len(problems))
+        # no patience in the hint decisions: the original and the variant get the same budget (E7 replayed it so)
+        proc = kb.start(problems, run_dir, steps=cfg.variant_steps, parallel_problems=len(problems), stop_patience=0)
         futs, sides = {}, {}
         # re-timing workers: two per GPU (one builds while the other times), at most one per hint
         n_dev = len(leases.devices) if leases is not None else 1
@@ -1099,6 +1222,17 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hints_path, state_path = work / "graph_hints.json", work / "state.json"
     doc, cache = gh.load(hints_path), CudaCache(work / "cache")
     state = json.loads(state_path.read_text()) if state_path.exists() else {"sent": [], "rounds": []}
+    # E7 efficiency rules (kb_efficiency.py): resolved against the work dir before the round key is made, so a
+    # resumed work dir keeps its rules (a pre-X-129 one: off, its round key unchanged)
+    eff = kb_efficiency.resolve(cfg, work, state)
+    cfg = kb_efficiency.apply(cfg, eff)
+    rec_eff = {k: eff[k] for k in ("rules", "stop_patience", "plan_min_share_late", "source")}
+    if {k: v for k, v in (state.get("efficiency") or {}).items() if k != "source"} != \
+            {k: v for k, v in rec_eff.items() if k != "source"}:
+        state["efficiency"] = rec_eff
+        kb_resume.atomic_write_json(state_path, state)
+    print(json.dumps({"efficiency": rec_eff, "note": eff.get("note")}), flush=True)
+    print(f"[kb_graph_opt] {kb_efficiency.describe(eff)}", flush=True)
     # global knowledge (off by default): seed a fresh knowledge/ from a snapshot, once
     gk = kb_global.apply_seed(work, cfg, irs, state)
     if gk is not None:
@@ -1107,6 +1241,23 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     cfg = hw.pin(cfg)
     kb = KBRunner(cfg, work / "knowledge")
     specs = dict(_all_specs())
+    from . import cuda_learnings as cl
+    ext = cl.CURRENT["ext"] = cl.Ext(cfg, work)          # all off by default (no effect)
+    ext.apply_env()
+    from . import search_fixes as sfx
+    sf = sfx.Fixes(cfg, work)                            # fallback repair + final guard on by default (kill switches)
+    sf.apply_env()
+    from . import capabilities as capm
+    caps = capm.Caps(cfg, work)                          # A2 switches (defaults: prune on, the rest off)
+    caps.apply_env()
+    from . import graph_search as gsm
+    gs = gsm.CURRENT["gs"] = gsm.GraphSearch(cfg, work, irs)   # all off by default (no effect)
+
+    def _reprofile(R, sub, hints_doc=None):              # graph search: profiles redone mid-round
+        return [profile_ir(Path(d), R / sub / Path(d).name, hints_doc=hints_doc or doc, cache=cache, arch=cfg.arch,
+                           specs=specs, runs=cfg.profile_runs, kbeval=mbev, gpu_model=hw.model,
+                           allow_gpu_mismatch=cfg.allow_gpu_mismatch, on_fallback=sf.on_fallback(mbev, hw.model))
+                for d in irs]
     gpus = detect_gpus(cfg)
     n_gpus = len(gpus["remote"]) if cfg.ssh_hosts else len(gpus["local"])
     width = cfg.parallel_hints or auto_parallel_hints(n_gpus)
@@ -1124,8 +1275,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     # resume (kb_resume.py): --rounds counts the rounds of this IR set and configuration in the
     # work dir; a round killed midway continues in the phase it was in (rNN/progress.json)
     key = kb_resume.round_key(cfg, irs)
-    if gk is not None:                               # only when enabled: existing work dirs keep their key
-        key["knowledge_global"] = gk.get("snapshot") if gk.get("applied") else "unseeded"
+    key.update(kb_global.key_fields(cfg, gk))       # only when enabled: existing work dirs keep their key
+    key.update(ext.round_key())                     # cuda_learnings: likewise
+    key.update(sf.round_key())                      # search fixes: only non-default switches
+    key.update(caps.round_key())                    # capabilities: only non-default switches
+    key.update(gs.round_key())                      # graph search: only when a --graph-* flag is set
+    key.update(kb_efficiency.key_fields(cfg))       # efficiency rules: only when on (off = the legacy key)
     kh = kb_resume.key_hash(key)
     n_rounds = (cfg.more_rounds if cfg.more_rounds else
                 0 if state.get("fixpoint_key") == kh else
@@ -1140,6 +1295,13 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         prog = kb_resume.RoundProgress(R, key)
         if prog.resumed:
             print(json.dumps({"round": r, "resume": sorted(prog.data["phases"])}), flush=True)
+        elif gk is not None and cfg.knowledge_global_refresh:   # a round boundary: no KernelBlaster run is open
+            rf = kb_global.refresh_at_round(work, cfg, state, r)
+            if rf is not None:
+                kb_resume.atomic_write_json(state_path, state)
+                print(json.dumps({"round": r, "knowledge_global_refresh": {k: rf.get(k) for k in
+                                                                           ("status", "counts", "reason", "error")}}),
+                      flush=True)
         t0 = time.time()
         rec = {"round": r, "key": kh, "kb_runs": [], "decisions": []}
         rsec, n_kb = kbt.section("mb.round", collect=True, laps=True, round=r), len(kb.telemetry)
@@ -1150,7 +1312,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             p = saved[i] if saved else profile_ir(
                 Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
                 specs=specs, runs=cfg.profile_runs, kbeval=mbev, gpu_model=hw.model,
-                allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch, on_fallback=sf.on_fallback(mbev, hw.model))
             had = hw.model
             hw.check("profile", p.get("device"), f"r{r:02d}/{p['ir']}")
             if hw.model != had:                          # the first profile fixed the flow's model
@@ -1168,6 +1330,9 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         kb_resume.STOP.check()
         first = first or {p["ir"]: p["partition_us"] for p in profiles}
         rec["partition_us"] = {p["ir"]: p["partition_us"] for p in profiles}
+        if gs.active():                                      # round 0: characterization pass (re-profiled)
+            profiles = gs.before_propose(r, R, prog, profiles, kb=kb, cache=cache, specs=specs,
+                                         reprofile=lambda sub, hd=None, R=R: _reprofile(R, sub, hd))
         T.lap("mb.propose")
         graphs = {}
         for p in profiles:                                  # MB's own proposals
@@ -1175,28 +1340,64 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             gh.merge(doc, gh.propose_from_profile(g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs,
                                                    doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"],
                                                    launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
+        ext.propose(graphs, profiles, doc, specs)             # --fusion-extended (no-op when off)
+        caps.propose(graphs, profiles, doc, specs)            # --region-slots (no-op when off)
+        if gs.active():                                      # priors pre-apply, fold proposals, beam members
+            profiles, graphs = gs.after_propose(r, R, prog, profiles, graphs, doc, specs, hints_path=hints_path,
+                                                reprofile=lambda sub, hd=None, R=R: _reprofile(R, sub, hd))
         T.lap("mb.plan")
         if cfg.plan_mode == "all":
-            plan_kw = dict(coverage=2.0, top_k=cfg.plan_top_k or None, min_share=cfg.plan_min_share, per_item=True)
+            plan_kw = dict(coverage=2.0, top_k=cfg.plan_top_k or None, per_item=True,
+                           min_share=kb_efficiency.round_min_share(cfg.plan_min_share, cfg.plan_min_share_late, r))
         else:
-            plan_kw = dict(coverage=cfg.coverage, top_k=cfg.top_k, min_share=cfg.min_share)
-        plan = prog.once("plan", lambda: make_plan(profiles, exclude=set(state["sent"]), **plan_kw))
+            plan_kw = dict(coverage=cfg.coverage, top_k=cfg.top_k,
+                           min_share=kb_efficiency.round_min_share(cfg.min_share, cfg.plan_min_share_late, r))
+        plan_kw.update(ext.plan_kw(specs))                   # --reuse-winners: canonical item keys
+        plan = prog.once("plan", lambda: make_plan(gs.plan_input(profiles), **plan_kw, exclude=sf.exclude(
+            set(state["sent"]), profiles, state, r, plan_kw, specs)))        # + re-queued items (search fixes)
         (R / "plan.json").write_text(json.dumps(plan, indent=1))
         rec["plan"] = {"selected_share": plan["selected_share"],
                        "problems": [(p["ir"], len(p["op_names"])) for p in plan["problems"]]}
+        base_ms = cfg.plan_min_share if cfg.plan_mode == "all" else cfg.min_share
+        if kb_efficiency.active(eff):
+            rec["efficiency"] = {"stop_patience": cfg.stop_patience, "min_share": plan_kw["min_share"],
+                                 "late_min_share": cfg.plan_min_share_late if r >= 1 else None,
+                                 "late_skipped": kb_efficiency.late_skipped(plan, base_ms) if r >= 1 else []}
+
+        def _cands():
+            if gs.active():                                 # graph search: prior ranking; beam: members decide
+                return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + gs.decide_kinds(),
+                                     _est_gain, _hint_ir, cfg)
+            todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
+                    and h["kind"] in ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() and _est_gain(h) >= cfg.min_gain_pct]
+            todo.sort(key=lambda h: -_est_gain(h))          # stable: ties keep the hints file's order
+            return {"n_todo": len(todo), "cands": [(h["id"], p["ir"]) for h in todo[:cfg.max_variants]
+                                                   if (p := _hint_ir(h, profiles)) is not None]}
+
+        def _inter_kw():                                    # --graph-search interleaved: the engine's inputs
+            return dict(cands_fn=_cands, doc=doc, profiles=profiles, graphs=graphs, kb=kb, cache=cache, cfg=cfg,
+                        specs=specs, leases=leases, width=width, hints_path=hints_path)
         if plan["problems"]:
             T.lap("mb.export")
-            dirs = [Path(x) for x in prog.once("export", lambda: [str(x) for x in export_plan(
-                plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
-                names={p.get("id", p["ir"]): f"{p.get('id', p['ir'])}__r{r:02d}" for p in plan["problems"]})])]
+            dirs = [Path(x) for x in prog.once("export", lambda: [str(x) for x in gs.budget(sf.seed_problems(ext.seed_problems(
+                export_plan(plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
+                            names={p.get("id", p["ir"]): f"{p.get('id', p['ir'])}__r{r:02d}" for p in plan["problems"]}),
+                cache, specs), plan, cache, specs, r), plan, doc, graphs, specs, _scope_ops, steps=cfg.steps,
+                stop_patience=cfg.stop_patience)])]
+            caps.annotate(dirs, profiles)                    # --model-context (no-op when off)
             T.lap("mb.kb_wait", kind="plan")
             par = (cfg.plan_parallel or len(dirs)) if cfg.plan_mode == "all" and len(dirs) > 1 else None
-            results = kb.run(dirs, R / "run", winners=R / "winners", parallel_problems=par)
+            results = gs.run_interleaved(r, R, prog, plan_dirs=dirs, plan=plan, **_inter_kw())["plan_results"] \
+                if gs.inter else kb.run(dirs, R / "run", winners=R / "winners", parallel_problems=par)
+            if "efficiency" in rec:
+                rec["efficiency"].update(kb_efficiency.kb_patience(results))
             T.lap("mb.ingest")
             rec["kb_runs"] = [{k: x.get(k) for k in ("problem", "baseline_partition_us", "final_partition_us",
                                                       "speedup", "final_ok", "llm_calls")} for x in results]
             if (R / "winners" / "winners.json").exists():
-                rec["ingest"] = prog.once("ingest", lambda: ingest(R / "winners" / "winners.json", cache, specs))
+                rec["ingest"] = prog.once("ingest", lambda: ingest(gs.winners(R), cache, gs.ingest_specs(specs, graphs)))
+            if (rq := sf.ingest_requeued(results, cache, specs, r)):      # search fixes: re-queued problems' bests
+                rec["requeue_ingest"] = rq
             state["sent"] += [it["key"] for it in plan["items"] if it.get("selected")]
             for x in results:
                 pf = Path(x["_dir"]) / "proposals.json"
@@ -1206,16 +1407,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                         for s in h["source"]:
                             s["ir"] = json.loads((Path(props["problem_dir"]) / "manifest.json").read_text())["ir_name"]
                         gh.merge(doc, [h])
+        if ext.wants_after_round():                          # zero-LLM: winner cross-application, concurrency auto
+            rec["reuse"] = prog.once("reuse", lambda: ext.after_round(R, profiles, doc, cache, specs, mbev, hw.model))
         gh.save(doc, hints_path)
         T.lap("mb.decide")
         kb_resume.STOP.check()
 
-        def _cands():
-            todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
-                    and h["kind"] in ("fuse", "split_slot") and _est_gain(h) >= cfg.min_gain_pct]
-            todo.sort(key=lambda h: -_est_gain(h))          # stable: ties keep the hints file's order
-            return {"n_todo": len(todo), "cands": [(h["id"], p["ir"]) for h in todo[:cfg.max_variants]
-                                                   if (p := _hint_ir(h, profiles)) is not None]}
         cs = prog.once("cands", _cands)                     # the candidates before any was decided
         todo = [None] * cs["n_todo"]
         cands = [(gh.get(doc, hid), next(p for p in profiles if p["ir"] == ir)) for hid, ir in cs["cands"]]
@@ -1224,7 +1421,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         def _wave(k, items):
             run_dir = items[0][2] / "run" if len(items) == 1 else R / "variants" / f"wave{k:02d}"
             return evaluate_hints(items, run_dir, kb=kb, cache=cache, doc=doc, cfg=cfg, specs=specs, leases=leases)
-        waves, rec["decisions"] = kb_resume.decide_hints(
+        waves, rec["decisions"] = gs.interleaved_decide(r, R, prog, **_inter_kw()) if gs.inter else kb_resume.decide_hints(
             prog, cands, graphs, R / "variants", width, decide_wave=_wave, schedule=schedule, footprint=footprint,
             specs=specs, hints_path=hints_path, save_hints=lambda: gh.save(doc, hints_path))
         rec["parallel_hints"], rec["waves"] = width, waves
@@ -1237,6 +1434,11 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         rec["decide_seconds"] = round(time.time() - t_dec, 1)
         rec["seconds"] = round(time.time() - t0, 1)
         rec["llm_calls_total"] = kb.calls
+        if (sfr := sf.round_record()) is not None:
+            rec["search_fixes"] = sfr
+        if gs.active():                                      # beam checkpoint; graph decisions of the round
+            rec["graph_search"] = gs.end_round(r, R, prog, profiles=profiles, doc=doc, cache=cache, specs=specs,
+                                               kbeval=mbev, gpu_model=hw.model, hints_path=hints_path)
         T.end_laps(rsec.span)
         rsec.end()
         tr = {"mb": kbt.compact(T.full_summary(rsec.span)), "kb": kbt.kb_rollup(kb.telemetry[n_kb:])}
@@ -1250,8 +1452,16 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                           "waves": rec["waves"],
                           "decisions": [(d["hint"], d["status"], d.get("gain")) for d in rec["decisions"]]}),
               flush=True)
-        undecided = [d for d in rec["decisions"] if d.get("status") == "undecided"]
-        if not accepted and not undecided and not plan["problems"] and len(todo) <= cfg.max_variants:
+        if "efficiency" in rec:
+            ef = rec["efficiency"]
+            print(json.dumps({"round": r, "efficiency": {
+                "late_skipped": [(x["op"], x["share"]) for x in ef["late_skipped"]],
+                "patience_stopped": [(x["problem"], x["at_commit"]) for x in ef.get("patience_stopped", [])],
+                "steps": [ef.get("steps_committed"), ef.get("steps_planned")]}}), flush=True)
+        # graph search: a promising hint (next rung next round) or a beam still deciding is not a fixpoint
+        undecided = [d for d in rec["decisions"] if d.get("status") in ("undecided", "promising")]
+        if not accepted and not undecided and not plan["problems"] and len(todo) <= cfg.max_variants \
+                and not gs.blocks_fixpoint(r, doc):
             state["fixpoint"], state["fixpoint_key"] = r, kh
             kb_resume.atomic_write_json(state_path, state)
             break
@@ -1263,10 +1473,19 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                                 gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch)
             if "device" in v:
                 hw.check("verify", v.get("device"), v.get("ir", Path(d).name))
+    # search fixes: dominant ops left on / near their seed kernel (warn; repair = route them, zero LLM, verify again)
+    guard = sf.final_guard(irs, final, state, cache, specs, kbeval=mbev, gpu_model=hw.model, hints_doc=doc,
+                           reverify=lambda d: verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
+                                                        work=work / "final" / Path(d).name, kbeval=mbev,
+                                                        gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch))
     summary = {"irs": {}, "rounds": len(state["rounds"]), "fixpoint": state.get("fixpoint"),
+               **({"cuda_learnings": ext.summary()} if ext.round_key() else {}),
+               **({"capabilities": caps.summary()} if caps.round_key() else {}),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
-               "llm_calls": kb.calls, "parallel_hints": width}
+               "llm_calls": kb.calls, "parallel_hints": width,
+               "efficiency": kb_efficiency.summarize(rec_eff, state["rounds"]),
+               **({"graph_search": gs.summary()} if gs.active() else {})}
     first0 = state["rounds"][0]["partition_us"] if state["rounds"] else (first or {})
     # the model's result: the whole model on the final cache and hints, as deployed (CUDA graph
     # replay in the persistent runtime), against the hand-seeded original timed the same way
@@ -1317,6 +1536,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                                                               "ours_cmp_"))
                                  and k != "torch_baseline"},
                               **({"model_error": m["error"]} if "error" in m else {})}
+    summary["search_fixes"] = {**sf.summary(), "final_guard": guard}
+    for ir, x in ((guard or {}).get("irs") or {}).items():
+        if ir in summary["irs"]:
+            summary["irs"][ir]["seed_left"] = x.get("flagged")
     (work / "model_runtime.json").write_text(json.dumps(models, indent=1, default=str))
     summary["gpu"] = hw.summary()
     state["gpu_check"] = summary["gpu"]
@@ -1373,7 +1596,8 @@ def main():
         if k in _MANUAL_FIELDS:
             continue
         ap.add_argument("--" + k.replace("_", "-"), type=type(v) if v is not None else
-                        (int if k in ("top_k", "variant_steps") else str), default=v)
+                        (int if k in ("top_k", "variant_steps", "stop_patience") else
+                         float if k == "plan_min_share_late" else str), default=v)
     a = ap.parse_args()
     cfg = Config(kb=Path(a.kb).resolve(), model=a.model, reflect_model=a.reflect_model,
                  plugins=[str(Path(p).resolve()) for p in a.plugin], python=a.python,

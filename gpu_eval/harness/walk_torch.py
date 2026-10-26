@@ -403,6 +403,59 @@ OPS.update({
 })
 
 
+def _bmm_strided(ir, op, ins, dev):
+    """layout_fold's bmm with strided operands (reference_kernels_ext.BMM_STRIDED)."""
+    sh = op["shape"]
+    a, b = ins[0].reshape(-1), ins[1].reshape(-1)
+    A = torch.as_strided(a, (sh["B0"], sh["B1"], sh["M"], sh["K"]),
+                         (sh["a_s0"], sh["a_s1"], sh["a_sm"], sh["a_sk"]), sh["a_off"])
+    B = torch.as_strided(b, (sh["B0"], sh["B1"], sh["K"], sh["N"]),
+                         (sh["b_s0"], sh["b_s1"], sh["b_sk"], sh["b_sn"]), sh["b_off"])
+    n = 1
+    for d in ir.graph["tensors"][op["outputs"][0]]["shape"]:
+        n *= int(d)
+    c = torch.zeros(n, dtype=a.dtype, device=a.device)
+    torch.as_strided(c, (sh["B0"], sh["B1"], sh["M"], sh["N"]),
+                     (sh["c_s0"], sh["c_s1"], sh["c_sm"], sh["c_sn"]), sh["c_off"]).copy_(A @ B)
+    return [c]
+
+
+OPS["bmm_strided"] = _bmm_strided
+
+
+def _attention(ir, op, ins, dev):
+    """attention_fuse's fused attention (reference_kernels_ext.ATTENTION): EXACT fp32 math (no rounding of the
+    scores / probabilities; walk rounds the output once), rows in chunks so the score matrix stays ~1 GB."""
+    sh = op["shape"]
+    B0, B1, M, N, D, DV = (int(sh[k]) for k in ("B0", "B1", "M", "N", "D", "DV"))
+    q, k, v = (t.reshape(-1).float() for t in ins[:3])
+    Q = torch.as_strided(q, (B0, B1, M, D), (sh["q_s0"], sh["q_s1"], sh["q_sm"], 1), sh["q_off"])
+    K = torch.as_strided(k, (B0, B1, N, D), (sh["k_s0"], sh["k_s1"], sh["k_sn"], 1), sh["k_off"])
+    V = torch.as_strided(v, (B0, B1, N, DV), (sh["v_s0"], sh["v_s1"], sh["v_sn"], 1), sh["v_off"])
+    n = 1
+    for d in ir.graph["tensors"][op["outputs"][0]]["shape"]:
+        n *= int(d)
+    out = torch.zeros(n, dtype=torch.float32, device=q.device)
+    O = torch.as_strided(out, (B0, B1, M, DV), (sh["o_s0"], sh["o_s1"], sh["o_sm"], 1), sh["o_off"])
+    step = max(1, (1 << 28) // max(1, B0 * B1 * N))
+    kt = K.transpose(-1, -2)
+    for m0 in range(0, M, step):
+        m1 = min(M, m0 + step)
+        s = (Q[:, :, m0:m1] @ kt) * float(op["scale"])
+        if sh.get("causal"):
+            rows = torch.arange(m0, m1, device=s.device)[:, None]
+            s = s.masked_fill(torch.arange(N, device=s.device)[None, :] > rows, float("-inf"))
+        p = torch.relu(s) if sh.get("act") == 1 else torch.softmax(s, -1)
+        O[:, :, m0:m1] = p @ V
+    return [out]
+
+
+OPS["attention"] = _attention
+# precision-policy casts (pipeline/precision_casts.py): values pass through; cast_f32_to_f16 ends in _f16, so the
+# walk rounds its output to fp16 like any fp16 op
+OPS["cast_f16_to_f32"] = lambda ir, op, ins, dev: [ins[0].reshape(-1).clone()]
+OPS["cast_f32_to_f16"] = lambda ir, op, ins, dev: [ins[0].reshape(-1).clone()]
+
 def _rule(kind: str):
     """An `_f16` kind runs its fp32 rule (walk rounds the outputs)."""
     return OPS.get(kind) or (OPS.get(kind[:-4]) if kind.endswith("_f16") else None)
