@@ -168,7 +168,7 @@ def key_fields(cfg, gk: dict | None) -> dict:
     return out
 
 
-def refresh_at_round(work: Path, cfg, state: dict, rnd: int) -> dict | None:
+def refresh_at_round(work: Path, cfg, state: dict, rnd: int, why: str | None = None) -> dict | None:
     """``--knowledge-global-refresh DIR`` at the start of round ``rnd``: import the newest refresh package the
     controller dropped in DIR (``*.tar.gz`` or a dir with ``refresh.json``) into ``work/knowledge`` (KernelBlaster
     ``merge import``: one transaction, other runs' knowledge only, logged in the db for the merge). Every
@@ -230,6 +230,8 @@ def refresh_at_round(work: Path, cfg, state: dict, rnd: int) -> dict | None:
             pass
     out = {"round": rnd, "ts": time.time(), **{k: res.get(k) for k in ("status", "rid", "counts", "reason", "error",
                                                                           "sync") if k in res}}
+    if why:                                           # halfway sync (kb_halfway.py): the import at a pause, not a round start
+        out["at"] = why
     rec.setdefault("refreshes", []).append(out)
     return out
 
