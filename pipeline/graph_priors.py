@@ -33,6 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BOOTSTRAP = HERE / "graph_priors_l3sweep.json"
+STANDARD = HERE / "graph_priors_standard.json"     # hand-set confidence classes, nothing derived from runs (--graph-priors standard)
 STRUCTURAL = ("fuse_attention", "fold_layout", "fuse_siblings", "split_slot", "unfuse")
 
 _DTYPE = ("_f16", "_f32", "_s8_pc", "_s8", "_i8", "_bf16")
@@ -78,6 +79,44 @@ def fusion_keys(hint_or_kind) -> list[str]:
         return [kind]
     fam = [_FAMILY.get(s, s) for s in st]
     return ["+".join(st), "+".join(fam), f"{fam[0]}+*{len(fam) - 1}"]
+
+
+# ---------------------------------------------------------------- class table (graph_priors_standard.json)
+
+HEAVY_HEADS = ("conv", "dwconv", "gconv", "linear", "gemm")     # a fusion with one of these heads is never 'elementwise tail'
+_STD_TABLE: dict = {}
+
+
+def standard_table(path: Path | None = None) -> dict:
+    """The hand-set class table (cached); {} when the file is missing or unreadable (every pattern then 'unknown')."""
+    key = str(path or STANDARD)
+    if key not in _STD_TABLE:
+        try:
+            _STD_TABLE[key] = json.loads(Path(key).read_text())
+        except (OSError, ValueError):
+            _STD_TABLE[key] = {}
+    return _STD_TABLE[key]
+
+
+def _family_key(hint_or_kind) -> str:
+    """L1 key of a hint / fused kind, or of an L0 key ``conv2d+batchnorm2d`` (as written in a prior's ``key``)."""
+    if isinstance(hint_or_kind, str) and "+" in hint_or_kind and "__" not in hint_or_kind:
+        return "+".join(_FAMILY.get(t, t) for t in hint_or_kind.split("+"))
+    ks = fusion_keys(hint_or_kind)
+    return ks[1] if len(ks) > 1 else ks[0]
+
+
+def pattern_class(hint_or_kind, table: dict | None = None) -> str:
+    """'high' | 'medium' | 'unknown' of a hint (or fused kind / L0 key) in the class table."""
+    tab = table if table is not None else standard_table()
+    return (tab.get("patterns") or {}).get(_family_key(hint_or_kind), "unknown")
+
+
+def heavy_head(hint_or_kind) -> bool:
+    """A fusion whose first stage is a conv / GEMM family op (never pre-applied under ``--graph-preapply-classes high``,
+    whatever a table says)."""
+    fam = _family_key(hint_or_kind)
+    return fam.split("+")[0] in HEAVY_HEADS
 
 
 # ---------------------------------------------------------------- Beta posterior
@@ -207,6 +246,14 @@ class Priors:
         self.sources: set[str] = set()
 
     @classmethod
+    def standard(cls, part: str, work: Path | None = None, *, table: Path | None = None, **kw) -> "Priors":
+        """Class-table priors (``--graph-priors standard``): ONLY the hand-set classes of graph_priors_standard.json. No sweep
+        counts, no A5 store, no work-dir decisions: nothing derived from runs or experiments on these problems."""
+        p = cls(part, tables=[], local=None, use_a5=False, **kw)
+        p.standard_table = json.loads(Path(table or STANDARD).read_text())
+        return p
+
+    @classmethod
     def default(cls, part: str, work: Path | None = None, **kw) -> "Priors":
         tabs = []
         if BOOTSTRAP.exists():
@@ -254,6 +301,13 @@ class Priors:
 
     def prior(self, hint) -> dict:
         keys = fusion_keys(hint)
+        tab = getattr(self, "standard_table", None)
+        if tab is not None:
+            cls_ = tab["patterns"].get(keys[1] if len(keys) > 1 else keys[0], "unknown")
+            c = tab["classes"][cls_]
+            self.sources.add("standard")
+            return {"accepted": 0, "rejected": 0, "n": 0, "p_mean": c["p_mean"], "lb": c["lb"], "q": self.q, "key": keys[0],
+                    "level": "class", "class": cls_, "source": "standard", "part": self.part}
         h = hint if isinstance(hint, dict) else {"kind": "fuse", "fused_kind": str(hint)}
         for lvl, k in enumerate(keys):
             acc, rej, src = self.counts(k, h, lvl)

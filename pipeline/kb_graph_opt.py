@@ -252,6 +252,9 @@ class Config:
     # fused-slot winners of the plan runs are ingested (their specs carry the fused kinds of the round's graphs; X-137):
     # on (default, correctness fix) | off (kill switch, also env MB_INGEST_FUSED=0: the pre-fix behaviour)
     ingest_fused: str = "on"
+    # technique-only knowledge seed: off = KERNELBLASTER_SEED_MINED=0 for this process and every KernelBlaster run it starts
+    # (the repo's mined.json evidence is not folded into a fresh knowledge.db); on = unchanged (default)
+    seed_mined: str = "on"
     # graph search redesign (graph_search.py; l3_farm/analysis/graph_search_redesign.md), all off by default
     # (rounds = the round-based flow; nothing else runs and the round key is unchanged): interleaved = hint
     # decisions inside the plan's KernelBlaster run on successive-halving rungs, decided and applied mid-round;
@@ -274,6 +277,13 @@ class Config:
     graph_defer: int = 1
     graph_diverse_beam: int = 0
     graph_layout_fold: str = "off"
+    # unapply audit of pre-applied hints (preapply_audit.py; l3_farm/analysis/preapply_audit.md): which classes may be
+    # pre-applied (auto|high|all|none), the audit (auto|off|final|rounds), its revert margin (-1 = accept_gain) and
+    # the zero-LLM nearest-shape routing of stage kernels (on|off)
+    graph_preapply_classes: str = "auto"
+    graph_preapply_audit: str = "auto"
+    graph_preapply_margin: float = -1.0
+    graph_preapply_route: str = "on"
     # graph and kernel capabilities (capabilities.py; l3_farm/analysis/capabilities_impl.md): dead-op pruning at
     # export on (kill switch off); recurrent op class off|on; precision policy off|auto (acts at extraction);
     # region slots off|rnn_stack,attention_block,all; multi-turn codegen with an experiment tool off|on and its
@@ -1236,6 +1246,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         kb_resume.atomic_write_json(state_path, state)
     print(json.dumps({"efficiency": rec_eff, "note": eff.get("note")}), flush=True)
     print(f"[kb_graph_opt] {kb_efficiency.describe(eff)}", flush=True)
+    if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
+        os.environ["KERNELBLASTER_SEED_MINED"] = "0"
     # global knowledge (off by default): seed a fresh knowledge/ from a snapshot, once
     gk = kb_global.apply_seed(work, cfg, irs, state)
     if gk is not None:
@@ -1284,6 +1296,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(caps.round_key())                    # capabilities: only non-default switches
     if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
         key["ingest_fused"] = "off"                 # kill switch: only when set
+    if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
+        key["seed_mined"] = "off"                   # technique-only seed: only when set
     key.update(gs.round_key())                      # graph search: only when a --graph-* flag is set
     key.update(kb_efficiency.key_fields(cfg))       # efficiency rules: only when on (off = the legacy key)
     kh = kb_resume.key_hash(key)
@@ -1441,6 +1455,11 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         rec["llm_calls_total"] = kb.calls
         if (sfr := sf.round_record()) is not None:
             rec["search_fixes"] = sfr
+        if gs.active() and gs.audit_mode == "rounds":        # --graph-preapply-audit rounds: unapply audit at the round end
+            if (au := gs.audit("round", irs=irs, doc=doc, hints_path=hints_path, cache=cache, specs=specs, cfg=cfg,
+                               leases=leases, recorded=list(kb.gpus))):
+                rec["preapply_audit"] = {k: au.get(k) for k in ("reverted", "kept", "skipped", "audit_error")}
+                rec["decisions"] += au.get("decisions") or []
         if gs.active():                                      # beam checkpoint; graph decisions of the round
             rec["graph_search"] = gs.end_round(r, R, prog, profiles=profiles, doc=doc, cache=cache, specs=specs,
                                                kbeval=mbev, gpu_model=hw.model, hints_path=hints_path)
@@ -1470,6 +1489,9 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             state["fixpoint"], state["fixpoint_key"] = r, kh
             kb_resume.atomic_write_json(state_path, state)
             break
+    if gs.active() and gs.audit_mode in ("final", "rounds"):   # unapply audit of the pre-applied hints, before the final model
+        gs.audit("final", irs=irs, doc=doc, hints_path=hints_path, cache=cache, specs=specs, cfg=cfg, leases=leases,
+                 recorded=list(kb.gpus), state=state, state_path=state_path)
     final = {}
     with T.span("mb.verify", evaluator=mbev.evaluator if mbev is not None else "builtin"):
         for d in irs:
