@@ -533,8 +533,11 @@ def _launch(row: dict, cfg: dict, out: Path, a) -> dict:
                        capture_output=True, text=True)
     rf.unlink(missing_ok=True)
     cf.unlink(missing_ok=True)
-    if res.exists():
-        return json.loads(res.read_text())
+    if res.exists() and res.stat().st_size:
+        try:
+            return json.loads(res.read_text())
+        except ValueError:
+            pass
     rec = {"stem": row["stem"], "set": row["set"], "problem": row["problem"], "pick": row["pick"],
            "uuid": row["uuid"], "variant": row["variant"], "io_mib": row["io_mib"],
            "quant": native_quant(row) if cfg["quant"] == "native" else cfg["quant"],
@@ -657,7 +660,10 @@ def cmd_remote(a):
     while True:
         todo = []
         for f in sorted((out / "results").glob("*.json")):
-            r = json.loads(f.read_text())
+            try:
+                r = json.loads(f.read_text())
+            except (OSError, ValueError):        # being written, or truncated by a full disk
+                continue
             ir = out / "ir" / r["stem"]
             if "cuda" in r["gates"] or not (ir / "io.npz").exists():
                 continue
@@ -714,7 +720,13 @@ def cmd_remote(a):
 # ── summary ───────────────────────────────────────────────────────────────────
 
 def load_results(out: Path) -> list:
-    return [json.loads(f.read_text()) for f in sorted((out / "results").glob("*.json"))]
+    recs = []
+    for f in sorted((out / "results").glob("*.json")):
+        try:
+            recs.append(json.loads(f.read_text()))
+        except ValueError:
+            print(f"warning: unreadable {f}", file=sys.stderr)
+    return recs
 
 
 def _native_of(r: dict) -> str:
