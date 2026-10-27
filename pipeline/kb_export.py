@@ -346,22 +346,31 @@ def slot_id_of(op: dict, specs: dict) -> str:
     return f"{sid}__{op['slot_variant']}" if op.get("slot_variant") else sid
 
 
-def reference_error(ir, env: dict, names: list[str]) -> dict[str, float | None]:
-    """max |env[t] - exact| per float tensor in ``names``: how far the walk's
-    reference values (``env``, the fp32 / store-rounded walk) are from the exact
-    math (a float64 walk without store rounding, holding only its live set).
-    None for every name when the float64 walk fails (a rule that cannot run in
-    float64): the bound then has no conditioning term."""
+def exact_values(ir, names: list[str]) -> dict | None:
+    """The exact values of the tensors ``names``: a float64 walk without the
+    fp16 / bf16 store rounding, holding only its live set. None when it fails
+    (a rule that cannot run in float64)."""
     import torch
     _, walk_torch = _harness()
     try:
         with torch.no_grad():
             _, ex = walk_torch.walk(ir, dev="cpu", dtype=torch.float64, store_rounding=False, keep=set(names))
-    except Exception:  # noqa: BLE001 -- best effort: no term
+    except Exception:  # noqa: BLE001 -- best effort: no conditioning term
+        return None
+    return {t: ex.get(t) for t in names}
+
+
+def reference_error(env: dict, exact: dict | None, names: list[str]) -> dict[str, float | None]:
+    """max |env[t] - exact[t]| per float tensor in ``names``: how far the walk's
+    reference values (``env``, the fp32 / store-rounded walk) are from the exact
+    math (``exact_values``). None for every name when there are no exact values:
+    the bound then has no conditioning term."""
+    import torch
+    if exact is None:
         return {t: None for t in names}
     res = {}
     for t in names:
-        a, b = env.get(t), ex.get(t)
+        a, b = env.get(t), exact.get(t)
         if a is None or b is None or not torch.is_tensor(a) or not a.is_floating_point() \
                 or a.numel() != b.numel():
             res[t] = 0.0
@@ -451,7 +460,8 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     kind, else the hand kernel. ``target="opencl"`` writes OpenCL slots,
     runtime and driver (``kb_export_opencl``); the partition, buffers, ops and
     data are the same. ``conditioning`` adds each output's reference error
-    (``reference_error``; a second, float64 walk) to its bound; off, the term is 0.
+    (``reference_error``; a second, float64 walk, ``exact_values``) to its
+    bound; off, the term is 0.
     """
     import torch
 
@@ -474,15 +484,18 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     tensors = g["tensors"]
     specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
 
-    with torch.no_grad():
-        _, env = walk_torch.walk(ir, dev="cpu")
-
     # fused ops keep their internal tensor (A's output) as a scratch buffer
     produced = [t for i in sel for t in ops[i]["outputs"] + ops[i].get("internal", [])]
     produced_set = set(produced)
     consumed_outside = {t for i, o in enumerate(ops) if i not in sel_set for t in o["inputs"]}
     graph_outs = set(ir.output_names())
     outputs = [t for t in produced if t in consumed_outside or t in graph_outs]
+
+    # the exact outputs first (the float64 walk's live set and the fp32 walk's
+    # full env are never held together), then the reference walk
+    exact = exact_values(ir, outputs) if conditioning else None
+    with torch.no_grad():
+        _, env = walk_torch.walk(ir, dev="cpu")
     boundary = []
     for i in sel:
         for t in ops[i]["inputs"]:
@@ -645,7 +658,8 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
 
     # ---- the outputs' reference error (their bound's conditioning term)
     env = {t: env[t] for t in outputs}                # the rest is in data.bin now
-    rerr = reference_error(ir, env, outputs) if conditioning else {}
+    rerr = reference_error(env, exact, outputs) if conditioning else {}
+    del exact
     for b in bufs:
         if b["kind"] == "output":
             b["ref_err"] = rerr.get(b["name"])
@@ -1933,7 +1947,8 @@ class DriverHost:
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
             pass                                           # the read below sees the EOF
-        out, deadline, done = [], t0 + (timeout or self.timeout), None
+        # the lock wait does not count against the run (as KernelBlaster's runtime_host)
+        out, deadline, done = [], t0 + (timeout or self.timeout) + (lock_wait if lock else 0), None
         while True:
             line = self._readline(deadline)
             if not line:                                   # EOF (crash) or timeout

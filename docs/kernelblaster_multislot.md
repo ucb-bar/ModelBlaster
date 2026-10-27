@@ -140,7 +140,7 @@ the partition replayed as a CUDA graph.
 Output bound: `err <= output_rel * max|finite ref| + output_abs + output_cond * ref_err` (1e-3,
 1e-5, as the Level2/3 gates; `output_cond` 2). `ref_err` is how far the reference itself is from
 the exact value: a second walk at export, in float64 without the fp16/bf16 store rounding, holding
-only its live set (`reference_error`; `export_problem(conditioning=False)` /
+only its live set (`exact_values`, run before the reference walk so the two are never held together; `export_problem(conditioning=False)` /
 `kb_export --no-conditioning` skip it, the term is then 0). A candidate as close to the exact value
 as the reference differs from it by up to `2 * ref_err`. For a well-conditioned output the term is
 noise next to the relative bound; it matters for an output that cancels to ~0, whose fp32
