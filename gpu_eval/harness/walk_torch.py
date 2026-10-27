@@ -7,7 +7,11 @@ walk_cuda.py diffs against.
 An `_f16` op runs its fp32 rule and rounds every output to fp16 (and the
 recurrent state of lstm_seq/gru_seq every step): the fp16 contract is fp16
 storage with fp32 math, so this is the value an exact fp16 kernel stores.
-A `_bf16` op does the same with bfloat16 (docs/bf16_cuda.md).
+A `_bf16` op does the same with bfloat16 (docs/bf16_cuda.md). A mixed IR
+(`--quant native`, docs/tensor_dtypes.md) is walked op by op the same way:
+each op rounds to its own kind's dtype, and its `cast_<src>_to_<dst>` ops
+convert (one rounding to a float dtype, truncation to an integer one). Every
+value is held as float32 (integers exact below 2^24).
 
     python walk_torch.py IR_DIR [IR_DIR ...] [--json out.json] [--device cpu]
 """
@@ -20,7 +24,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from mbir import IR, compare, load_ir, strict_fp32
+from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
 
 
 def _round_f16(t):
@@ -421,6 +425,20 @@ OPS.update({
 })
 
 
+def _cast_rule(dst: str):
+    """`cast_<src>_to_<dst>`: the value as float32 (an f16 / bf16 destination is
+    rounded by _store_rounding, as every op of that kind); integer destinations
+    truncate toward zero, bool is `!= 0`."""
+    if dst == "b8":
+        return lambda ir, op, ins, dev: [(ins[0].float() != 0).float()]
+    if dst in ("i64", "i32", "u8"):
+        return lambda ir, op, ins, dev: [torch.trunc(ins[0].float())]
+    return lambda ir, op, ins, dev: [ins[0].float()]
+
+
+OPS.update({cuda_dtypes.cast_kind(a, b): _cast_rule(b) for a, b in cuda_dtypes.CASTS})
+
+
 def _rule(kind: str):
     """An `_f16` / `_bf16` kind runs its fp32 rule (walk rounds the outputs)."""
     if kind in OPS:
@@ -502,7 +520,7 @@ def walk(ir: IR, dev="cuda", keep_all=False):
 
     for op in ir.ops:
         run_op(op)
-    out = torch.cat([env[t].reshape(-1) for t in ir.output_names()])
+    out = torch.cat([env[t].reshape(-1).float() for t in ir.output_names()])
     return out, env
 
 

@@ -99,12 +99,24 @@ def _load(path: Path, name: str):
 
 @contextmanager
 def gpu_lock(out: Path):
-    """One GPU user at a time among our workers."""
+    """One GPU user at a time among our workers; with ``MB_GPU_FLOCK`` (a lock file, e.g.
+    KernelBlaster's ``/dev/shm/kernelblaster_gpu_<uuid>.lock``) also among every process on the
+    host that takes that flock (other runs, other agents)."""
     with open(out / ".gpu.lock", "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
+        shared = None
         try:
+            if os.environ.get("MB_GPU_FLOCK"):
+                try:
+                    shared = open(os.environ["MB_GPU_FLOCK"], "a")
+                    fcntl.flock(shared, fcntl.LOCK_EX)
+                except OSError:               # not ours to open: run unlocked, as KB's gpu_lock_wrap
+                    shared = None
             yield
         finally:
+            if shared is not None:
+                fcntl.flock(shared, fcntl.LOCK_UN)
+                shared.close()
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
@@ -204,16 +216,30 @@ def hi_reference(bench, ins):
     return None, err
 
 
-def io_rounding(bench, ins, quant: str) -> dict:
-    """Inputs MB's 16-bit io buffer changes (every tensor input, ints included, is stored in it):
+# IR tensor dtype -> the SOL / torch dtype name it stores (float64 has no MB storage: f32)
+IR_TO_SOL = {"f32": "float32", "bf16": "bfloat16", "f16": "float16", "i64": "int64", "i32": "int32",
+             "b8": "bool", "u8": "uint8"}
+
+
+def _ir_io_dtypes(g: dict, which: str) -> list:
+    if which == "in":
+        names = [p["name"] for p in g["input"].get("packed_inputs") or [{"name": g["input"]["tensor"]}]]
+    else:
+        names = g["output"].get("tensors") or [g["output"]["tensor"]]
+    return [g["tensors"][n].get("dtype", "f32") for n in names]
+
+
+def io_rounding(bench, ins, g: dict) -> dict:
+    """Inputs the IR's io stores at a narrower dtype than the workload's (a 16-bit IR stores every
+    tensor input, ints included, in its 16-bit buffer; a mixed IR keeps each input's own dtype):
     {name: {dtype, changed, of}} -- ints past 256 (bf16) / 2048 (fp16), fp32 values it cannot hold."""
     import torch
-    dt = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(quant)
+    tdt = {"bf16": torch.bfloat16, "f16": torch.float16}
     out = {}
-    if dt is None:
-        return out
-    for (name, spec), t in zip(bench.SOL_INPUTS.items(), ins):
-        if torch.is_tensor(t) and t.numel():
+    tens = [(name, spec, t) for (name, spec), t in zip(bench.SOL_INPUTS.items(), ins) if torch.is_tensor(t)]
+    for (name, spec, t), d_ir in zip(tens, _ir_io_dtypes(g, "in")):
+        dt = tdt.get(d_ir)
+        if dt is not None and t.numel():
             d = t.double()
             n = int((d.to(dt).double() != d).sum())
             if n:
@@ -221,14 +247,18 @@ def io_rounding(bench, ins, quant: str) -> dict:
     return out
 
 
-def hi_gates(bench, ins, flat, refs, tol, quant: str) -> dict:
+def out_dtype_mismatch(bench, g: dict) -> list:
+    """Outputs the IR stores at another dtype than the workload's (SOL would score them
+    INCORRECT_DTYPE); float64 counts as f32, which is all MB stores."""
+    return [n for (n, v), d in zip(bench.SOL_OUTPUTS.items(), _ir_io_dtypes(g, "out"))
+            if IR_TO_SOL.get(d, d) != ("float32" if v["dtype"] == "float64" else v["dtype"])]
+
+
+def hi_gates(bench, ins, flat, refs, tol, g: dict) -> dict:
     """The walk against the high-precision reference, and whether SOL's tolerance can be met at all
     by the correctly rounded answer (the hi reference stored at each output's SOL dtype)."""
     import torch
-    r = {"io_rounding": io_rounding(bench, ins, quant),
-         "out_dtype_mismatch": [n for n, v in bench.SOL_OUTPUTS.items()
-                                if v["dtype"] in ("float32", "float64", "bfloat16", "float16")
-                                and v["dtype"] != {"bf16": "bfloat16", "fp16": "float16"}.get(quant, v["dtype"])]}
+    r = {"io_rounding": io_rounding(bench, ins, g), "out_dtype_mismatch": out_dtype_mismatch(bench, g)}
     hi, dt = hi_reference(bench, ins)
     if hi is None:
         r["hi_error"] = dt
@@ -244,8 +274,8 @@ def hi_gates(bench, ins, flat, refs, tol, quant: str) -> dict:
 # ── one workload ──────────────────────────────────────────────────────────────
 
 def native_quant(row: dict) -> str:
-    """The MB storage dtype closest to the problem's own: bf16 if any of its tensors is bfloat16,
-    else fp16 if any is float16, else fp32 (an IR has one float storage dtype)."""
+    """The single MB storage dtype closest to the problem's own (``--quant preset``): bf16 if any
+    of its tensors is bfloat16, else fp16 if any is float16, else fp32."""
     dts = set(row.get("dtype_map") or {})
     return "bf16" if "bfloat16" in dts else "fp16" if "float16" in dts else "fp32"
 
@@ -253,7 +283,8 @@ def native_quant(row: dict) -> str:
 def run_one(row: dict, cfg: dict) -> dict:
     out = Path(cfg["out"])
     stem = row["stem"]
-    quant = native_quant(row) if cfg["quant"] == "native" else cfg["quant"]
+    # native: per-tensor dtypes (extract_graph --quant native); preset: one dtype per problem
+    quant = native_quant(row) if cfg["quant"] == "preset" else cfg["quant"]
     ir = out / "ir" / stem
     rec = {"stem": stem, "set": row["set"], "problem": row["problem"], "pick": row["pick"], "uuid": row["uuid"],
            "variant": row["variant"], "quant": quant, "io_mib": row["io_mib"],
@@ -343,7 +374,7 @@ def run_one(row: dict, cfg: dict) -> dict:
                 cpu["port_floor_ok"] = bool(cpu["sol_vs_golden"]["ok"])
                 cpu["range_risk"] = range_risk(refs)
                 if cfg.get("hi_ref", True):
-                    cpu.update(hi_gates(bench, ins, flat, refs, tol, quant))
+                    cpu.update(hi_gates(bench, ins, flat, refs, tol, g))
                     cpu["sol_ok_hi"] = bool(cpu.get("sol_vs_walk_hi", {}).get("ok"))
                     cpu["sol_tol_attainable"] = cpu.get("sol_floor_hi", {}).get("ok")
                 if not cpu["sol_ok"] and ref_dev != "cpu":
@@ -459,8 +490,10 @@ def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -
     import math
     if not g["ops"]:
         return {"ok": None, "skipped": "no ops (the workload's output is an input: nothing to optimise)"}
-    nbytes = sum(math.prod(t["shape"]) if t["shape"] else 1 for t in g["tensors"].values()) * \
-        (2 if g.get("quant") in ("fp16", "bf16") else 4)
+    esz = {"f16": 2, "bf16": 2, "i64": 8, "b8": 1, "u8": 1}
+    nbytes = sum((math.prod(t["shape"]) if t["shape"] else 1) *
+                 (esz.get(t.get("dtype"), 4) if g.get("quant") == "native" else
+                  2 if g.get("quant") in ("fp16", "bf16") else 4) for t in g["tensors"].values())
     if nbytes > cfg["export_cap_mb"] * 2 ** 20:
         return {"ok": None, "skipped": f"data.bin ~{nbytes / 2 ** 20:.0f} MiB > {cfg['export_cap_mb']} MiB"}
     if not wait_for_disk(out, nbytes / 2 ** 20 + cfg["reserve_mb"], cfg["disk_wait_s"]):
@@ -597,9 +630,12 @@ def cmd_gpu(a):
         except (OSError, ValueError) as e:
             res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
             continue
-        # the hand kernels of the IR's storage dtype: lib_hand.so, lib_hand_f16.so, lib_hand_bf16.so
+        # the hand kernels of the IR's storage dtype: lib_hand.so, lib_hand_f16.so, lib_hand_bf16.so;
+        # a mixed IR (--quant native) resolves each op in all of them and lib_hand_cast.so
         q = {"fp16": "_f16", "bf16": "_bf16"}.get(g.get("quant"), "")
-        c = dict(cfg, hand=cfg["hand"].replace(".so", f"{q}.so"))
+        hand = ",".join(cfg["hand"].replace(".so", f"{x}.so") for x in ("", "_f16", "_bf16", "_cast")) \
+            if g.get("quant") == "native" else cfg["hand"].replace(".so", f"{q}.so")
+        c = dict(cfg, hand=hand)
         try:
             res[ir.name] = gpu_gates(ir, g, c, a.gates.split(","), out, env, ir.name)
         except Exception as e:  # noqa: BLE001
@@ -648,7 +684,7 @@ def cmd_remote(a):
         setup = (f"cd {rd}/mb/modelblaster/gpu_eval/harness && export PATH=/usr/local/cuda/bin:$PATH && "
                  f"PYTHONPATH={rd}/mb {py} ../tools/dump_specs.py {rd}/gpu/specs.json > /dev/null && "
                  + " && ".join(f"nvcc -O3 -arch=sm_{a.arch} -Xcompiler -fPIC -shared -o {rd}/gpu/lib_hand{q}.so "
-                               f"cuda/mb_cuda_kernels{q}.cu" for q in ("", "_f16", "_bf16")))
+                               f"cuda/mb_cuda_kernels{q}.cu" for q in ("", "_f16", "_bf16", "_cast")))
         p = _ssh(a, setup)
         if p.returncode:
             raise SystemExit(f"remote setup failed: {p.stderr[-2000:]}")
@@ -682,7 +718,10 @@ def cmd_remote(a):
             print("rsync failed:", p.stderr[-500:], flush=True)
             time.sleep(60)
             continue
-        cmd = (f"cd {rd}/mb/modelblaster && export PATH=/usr/local/cuda/bin:$PATH "
+        # KernelBlaster's per-GPU flock (gpu_lock_wrap's file), taken around every GPU step
+        flock = (f"MB_GPU_FLOCK=/dev/shm/kernelblaster_gpu_$(nvidia-smi -i {a.gpu} --query-gpu=uuid "
+                 f"--format=csv,noheader | tr -d ' ').lock " if a.kb_flock else "")
+        cmd = (f"cd {rd}/mb/modelblaster && export PATH=/usr/local/cuda/bin:$PATH {flock}"
                f"CUDA_VISIBLE_DEVICES={a.gpu} PYTHONPATH={rd}/mb OMP_NUM_THREADS=4 && "
                f"{py} gpu_eval/tools/sol_upstream_gates.py gpu {rd}/ir {rd}/work {rd}/work/batch.json "
                f"--specs {rd}/gpu/specs.json --hand {rd}/gpu/lib_hand.so --arch {a.arch} "
@@ -751,11 +790,12 @@ def sol_fail_class(r: dict) -> str:
 
 def cmd_summary(a):
     """Per-set coverage + failure taxonomy over one or more gate dirs. --native keeps, per stem,
-    the record run at the problem's own dtype (bf16 / fp16 / fp32); --by-quant splits the sets."""
+    the record run at the problem's own dtype (bf16 / fp16 / fp32, or per-tensor: quant native);
+    --by-quant splits the sets."""
     by = {}
     for d in a.out:
         for r in load_results(Path(d)):
-            if a.native and r.get("quant") and r["quant"] != _native_of(r):
+            if a.native and r.get("quant") and r["quant"] not in ("native", _native_of(r)):
                 continue
             by.setdefault(r["stem"], r)
     recs = list(by.values())
@@ -824,7 +864,8 @@ def main(argv=None):
     r.add_argument("--threads", type=int, default=4)
     r.add_argument("--gates", default="extract,shapes,cpu",
                    help="add cuda,export to run the GPU gates here (default: on the GPU host via `remote`)")
-    r.add_argument("--quant", default=None, help="extract_graph --quant: fp32 | fp16 | bf16 | native (per "
+    r.add_argument("--quant", default=None, help="extract_graph --quant: fp32 | fp16 | bf16 | native "
+                   "(per-tensor dtypes from the reference, docs/tensor_dtypes.md) | preset (one dtype per "
                    "problem: bf16 if it has bfloat16 tensors, else fp16 if float16, else fp32); default: the "
                    "manifest's variant")
     r.add_argument("--timeout", type=int, default=1800)
@@ -870,6 +911,9 @@ def main(argv=None):
     rm.add_argument("--until-done", action="store_true", help="keep polling while `run` is still going")
     rm.add_argument("--no-sync", action="store_true", help="the remote code / kernels are current")
     rm.add_argument("--keep", action="store_true", help="keep the local io.npz")
+    rm.add_argument("--kb-flock", action="store_true",
+                    help="hold KernelBlaster's per-GPU flock (/dev/shm/kernelblaster_gpu_<uuid>.lock) around "
+                         "each IR's GPU steps, so other KB runs on the host interleave rather than collide")
     s = sub.add_parser("summary")
     s.add_argument("out", nargs="+")
     s.add_argument("--native", action="store_true", help="per stem, only the record at its own dtype")
