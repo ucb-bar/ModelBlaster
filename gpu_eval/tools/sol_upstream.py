@@ -29,7 +29,9 @@ Rules (docs/sol_execbench.md):
   non-native variant the reference's low-precision dtypes are rewritten to the
   variant's (``torch.bfloat16`` -> ``torch.float32``; ``.bfloat16()`` ->
   ``.float()``); ``bf16`` keeps the reference byte-for-byte. A dict return is
-  packed in definition output order.
+  packed in definition output order. ``NativeModel`` / ``get_native_inputs()``
+  are the original reference on the definition's own dtypes, for
+  ``extract_graph --quant native`` (per-tensor dtypes, docs/tensor_dtypes.md).
 * **Refusals** are named: unsupported dtypes (fp8 / fp4 / int8 storage),
   safetensors inputs without a blob root, no tensor inputs.
 
@@ -439,6 +441,11 @@ def get_inputs():
     return out
 
 
+def get_native_inputs():
+    """The workload's inputs at the definition's own dtypes (``extract_graph --quant native``)."""
+    return _native_inputs()
+
+
 def get_init_inputs():
     return []
 
@@ -469,6 +476,21 @@ class Model(nn.Module):
 
     def forward(self, __ARGS__):
         out = _sol_run(__ARGS__)
+        return out if torch.is_tensor(out) else _pack(out)
+
+
+class NativeModel(nn.Module):
+    """The original reference ``run`` (no dtype rewrite) as a module: what ``extract_graph --quant
+    native`` traces, on ``get_native_inputs()``, for the per-tensor dtypes (docs/tensor_dtypes.md)."""
+
+    def __init__(self):
+        super().__init__()
+        ns = {}
+        exec(compile(SOL_REFERENCE, "sol_reference", "exec"), ns)
+        self._run = ns["run"]
+
+    def forward(self, __ARGS__):
+        out = self._run(__ARGS__)
         return out if torch.is_tensor(out) else _pack(out)
 '''
 

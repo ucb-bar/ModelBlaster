@@ -11600,6 +11600,42 @@ from modelblaster.pipeline.reference_kernels_ext import ext_specs as _ext_specs 
 KERNEL_SPECS.update(_ext_specs(KernelSpec))
 
 
+def _cast_spec(src: str, dst: str) -> "KernelSpec":
+    """`cast_<src>_to_<dst>`: the dtype conversion a mixed IR (`--quant native`,
+    docs/tensor_dtypes.md) inserts where a tensor's dtype differs from what its
+    op reads or writes. Float -> float rounds once (round-to-nearest-even);
+    an integer / bool source converts exactly (ints are integer-valued f32
+    inside the graph, exact below 2^24); f32 -> integer truncates toward zero,
+    -> bool (b8) is `!= 0`."""
+    from modelblaster.pipeline.cuda_dtypes import CTYPE, cast_kind
+    cs, cd = CTYPE[src][0], CTYPE[dst][0]
+    op = cast_kind(src, dst)
+    if dst == "b8":
+        body, rule = "out[i] = (float)in[i] != 0.0f;", "out[i] = in[i] != 0 (bool, one byte)"
+    elif dst in ("i64", "i32", "u8"):
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})in[i] (truncation toward zero)"
+    else:
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})(float)in[i] (one rounding to {dst})"
+    sig = f"void kernel_{op}(const {cs} *in, {cd} *out, int n)"
+    return KernelSpec(
+        op=op,
+        signature=sig,
+        semantics=(f"Convert a {src} tensor to {dst}, elementwise over n elements:\n  {rule}\n"
+                   "Inserted by extraction where a tensor's dtype differs from the dtype its op "
+                   "reads or writes (per-tensor dtypes, docs/tensor_dtypes.md)."),
+        reference_impl=(f"{sig} {{\n    for (int i = 0; i < n; i++) {{\n        {body}\n    }}\n}}\n"),
+        extra_shapes=[{"n": 1}, {"n": 257}],
+    )
+
+
+def _cast_specs() -> dict:
+    from modelblaster.pipeline.cuda_dtypes import CASTS
+    return {s.op: s for s in (_cast_spec(a, b) for a, b in CASTS)}
+
+
+KERNEL_SPECS.update(_cast_specs())
+
+
 def _make_reduced_variant(spec: "KernelSpec", suffix: str, ctype: str, label: str) -> "KernelSpec":
     """Synthesize the `<op><suffix>` storage variant of an fp32 KernelSpec:
     rename kernel_<op> -> kernel_<op><suffix> and change every float POINTER
