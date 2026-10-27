@@ -91,15 +91,57 @@ def _load(path: Path, name: str):
     return mod
 
 
+def _visible_gpu() -> tuple:
+    """(uuid, free MiB) of the single GPU in CUDA_VISIBLE_DEVICES, or (None, None)."""
+    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not dev or "," in dev or not shutil.which("nvidia-smi"):
+        return None, None
+    p = subprocess.run(["nvidia-smi", "-i", dev, "--query-gpu=uuid,memory.free", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    try:
+        uuid, free = (x.strip() for x in p.stdout.strip().split(","))
+        return uuid, float(free)
+    except ValueError:
+        return None, None
+
+
 @contextmanager
 def gpu_lock(out: Path):
-    """One GPU user at a time among our workers."""
-    with open(out / ".gpu.lock", "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    """One GPU user at a time: among our workers (``out/.gpu.lock``) and, for the GPU in
+    CUDA_VISIBLE_DEVICES, with every KernelBlaster run on the host (its per-GPU flock,
+    ``$KERNELBLASTER_GPU_LOCK_DIR`` or /dev/shm ``/kernelblaster_gpu_<uuid>.lock``)."""
+    files = [open(out / ".gpu.lock", "w")]
+    uuid, _ = _visible_gpu()
+    if uuid and os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() not in ("0", "false", "no", "off"):
+        d = os.getenv("KERNELBLASTER_GPU_LOCK_DIR", "/dev/shm")
         try:
-            yield
-        finally:
+            files.append(open(f"{d}/kernelblaster_gpu_{re.sub(r'[^A-Za-z0-9_.-]', '_', uuid)}.lock", "a"))
+        except OSError:                       # another user's file: run unlocked, as KernelBlaster does
+            pass
+    for f in files:
+        fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        for f in reversed(files):
             fcntl.flock(f, fcntl.LOCK_UN)
+            f.close()
+
+
+def gpu_room(g: dict, wait_s: float) -> bool:
+    """Enough free memory on the visible GPU for every tensor of the IR (x1.5), waiting up to
+    wait_s for other users to finish; True when it cannot be checked."""
+    import math
+    need = sum(math.prod(t["shape"]) if t["shape"] else 1 for t in g["tensors"].values()) * \
+        (2 if g.get("quant") in ("fp16", "bf16") else 4) * 1.5 / 2 ** 20
+    t = time.time()
+    while True:
+        _, free = _visible_gpu()
+        if free is None or free >= need + 1024:
+            return True
+        if time.time() - t > wait_s:
+            return False
+        time.sleep(30)
 
 
 # ── SOL correctness (sol_execbench/core/bench/correctness.py @834c7c1, Apache-2.0) ──
@@ -255,8 +297,16 @@ def run_one(row: dict, cfg: dict) -> dict:
             else:
                 tol = row["tolerance"]
                 cpu["ref_device"] = ref_dev
+                cast = cfg.get("score_cast")
+                if cast:
+                    # diagnostic variants (e.g. fp16 of a bf16 problem): score in the reference's dtype
+                    cpu["sol_vs_walk_raw"] = sol_compare(flat.float(), refs, tol)
+                    cpu["score_cast"] = cast
+                    flat = flat.to(getattr(torch, cast)).float()
                 cpu["sol_vs_walk"] = sol_compare(flat.float(), refs, tol)
                 golden = torch.from_numpy(np.asarray(irm.golden_out, np.float32))
+                if cast:
+                    golden = golden.to(getattr(torch, cast)).float()
                 cpu["sol_vs_golden"] = sol_compare(golden, refs, tol)
                 cpu["ok"] = bool(cpu["mb_golden"]["ok"])
                 cpu["sol_ok"] = bool(cpu["sol_vs_walk"]["ok"])
@@ -291,6 +341,13 @@ def gpu_gates(ir: Path, g: dict, cfg: dict, gates, out: Path, env: dict, stem: s
     res = {}
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    if {"cuda", "export"} & set(gates) and not gpu_room(g, cfg.get("gpu_wait_s", 1800)):
+        return {k: {"ok": None, "skipped": "GPU memory (not enough free on the GPU)"}
+                for k in ("cuda", "export") if k in gates}
+    # the hand kernels of the IR's storage dtype: lib_hand.so -> lib_hand_f16.so / lib_hand_bf16.so
+    q = {"fp16": "_f16", "bf16": "_bf16"}.get(g.get("quant"), "")
+    if q and cfg.get("hand") and not cfg["hand"].endswith(f"{q}.so"):
+        cfg = dict(cfg, hand=cfg["hand"].replace(".so", f"{q}.so"))
     if "cuda" in gates:
         with gpu_lock(out):
             j = out / "tmp" / f"{stem}.wc.json"
@@ -309,7 +366,9 @@ def gpu_gates(ir: Path, g: dict, cfg: dict, gates, out: Path, env: dict, stem: s
                 "missing", "error", "model_ms", "torch_eager_ms", "why")
         c = {k: r.get(k) for k in keep if k in r}
         c["ok"] = bool(r.get("ok")) and not r.get("first_divergent_op")
-        if not c["ok"]:
+        if not c["ok"] and re.search(r"out of memory|cudaErrorMemoryAllocation", str(r.get("error", "")), re.I):
+            c = {"ok": None, "skipped": "GPU memory (out of memory)", "error": str(r.get("error"))[:200]}
+        elif not c["ok"]:
             c["cls"] = ("missing kernel" if r.get("missing") else
                         "divergent intermediate" if r.get("first_divergent_op") else
                         "out of memory" if "memory" in str(r.get("error", "")).lower() else
@@ -383,14 +442,18 @@ def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -
         return {"ok": None, "skipped": "disk: no room for data.bin"}
     d = out / "tmp" / f"{stem}.kbx"
     shutil.rmtree(d, ignore_errors=True)
-    cmd = [sys.executable, "-m", "modelblaster.pipeline.kb_export", str(ir), str(d), "--strategy", "whole",
-           "--build-check", "--runtime", "host", "--arch", str(cfg["arch"])]
-    with gpu_lock(out):
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout"], env=env)
-            log = p.stdout + p.stderr
-        except subprocess.TimeoutExpired:
-            log = "timeout"
+    # export and nvcc build without the GPU; only the driver host's run holds the GPU lock
+    cmd = [sys.executable, "-m", "modelblaster.pipeline.kb_export", str(ir), str(d), "--strategy", "whole"]
+    chk = [sys.executable, __file__, "export-check", str(d / "p00"), "--arch", str(cfg["arch"]),
+           "--lock-dir", str(out), "--timeout", str(cfg["timeout"])]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout"], env=env)
+        log = p.stdout + p.stderr
+        if p.returncode == 0:
+            p = subprocess.run(chk, capture_output=True, text=True, timeout=2 * cfg["timeout"], env=env)
+            log += p.stdout + p.stderr
+    except subprocess.TimeoutExpired:
+        log += "timeout"
     (out / "logs" / f"{stem}.export.log").write_text(log[-100000:])
     shutil.rmtree(d, ignore_errors=True)
     res = [json.loads(ln) for ln in log.splitlines() if ln.startswith("{") and '"passed"' in ln]
@@ -404,6 +467,29 @@ def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -
         o.update(cls="slot check" if bad else f"stage {r.get('stage')}", failed_slots=list(bad)[:8],
                  errors=(r.get("errors") or [])[:3])
     return o
+
+
+def cmd_export_check(a):
+    """kb_export --build-check --runtime host, with the build outside the GPU lock: build the
+    persistent driver host and the kernels' .so, then evaluate once holding the lock; prints
+    kb_export's result line."""
+    from modelblaster.pipeline import kb_export as kx
+    prob = Path(a.problem)
+    r = kx.build_and_run(prob, arch=a.arch, runtime="host", runs=0, timeout=a.timeout)
+    line = {"problem": str(prob)}
+    if r.get("stage") == "built":
+        with gpu_lock(Path(a.lock_dir)):
+            h = kx.DriverHost(r["exe"], timeout=a.timeout)
+            try:
+                r = h.evaluate(r["so"], env={"MB_GRAPH": "1"})
+            finally:
+                h.close()
+    line.update({k: r.get(k) for k in ("passed", "stage", "partition_us", "slot_us", "slots", "errors",
+                                       "e2e_us", "e2e_basis", "graph_skip")})
+    if not r.get("passed"):
+        line["log"] = (r.get("log") or "")[-1500:]
+    print(json.dumps(line), flush=True)
+    return 0
 
 
 # ── driver ────────────────────────────────────────────────────────────────────
@@ -451,6 +537,8 @@ def _launch(row: dict, cfg: dict, out: Path, a) -> dict:
         return json.loads(res.read_text())
     rec = {"stem": row["stem"], "set": row["set"], "problem": row["problem"], "pick": row["pick"],
            "uuid": row["uuid"], "variant": row["variant"], "io_mib": row["io_mib"],
+           "quant": native_quant(row) if cfg["quant"] == "native" else cfg["quant"],
+           "ref_dtypes": sorted(row.get("dtype_map", {})),
            "gates": {"extract": {"ok": None, "skipped": f"too large for host memory (MemoryMax={cap:g}G, rc "
                                                         f"{p.returncode})"}},
            "stderr": (p.stderr or "")[-1000:]}
@@ -477,7 +565,8 @@ def cmd_run(a):
     cfg = {"out": str(out), "quant": a.quant or ("fp32" if man["variant"] == "fp32" else man["variant"]),
            "gates": a.gates.split(","), "timeout": a.timeout, "ref_device": a.ref_device, "arch": a.arch,
            "specs": a.specs, "hand": a.hand, "keep": a.keep, "export_cap_mb": a.export_cap_mb,
-           "threads": a.threads, "reserve_mb": a.reserve_mb, "disk_wait_s": a.disk_wait_s}
+           "threads": a.threads, "reserve_mb": a.reserve_mb, "disk_wait_s": a.disk_wait_s,
+           "score_cast": a.score_cast}
     rows.sort(key=lambda r: r["io_mib"])          # the small ones report first
     big = threading.Semaphore(a.jobs_large)       # at most this many large workloads at once
 
@@ -512,11 +601,8 @@ def cmd_gpu(a):
         except (OSError, ValueError) as e:
             res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
             continue
-        # the hand kernels of the IR's storage dtype: lib_hand.so, lib_hand_f16.so, lib_hand_bf16.so
-        q = {"fp16": "_f16", "bf16": "_bf16"}.get(g.get("quant"), "")
-        c = dict(cfg, hand=cfg["hand"].replace(".so", f"{q}.so"))
         try:
-            res[ir.name] = gpu_gates(ir, g, c, a.gates.split(","), out, env, ir.name)
+            res[ir.name] = gpu_gates(ir, g, cfg, a.gates.split(","), out, env, ir.name)
         except Exception as e:  # noqa: BLE001
             res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
         for v in res[ir.name].values():
@@ -726,6 +812,8 @@ def main(argv=None):
                    "manifest's variant")
     r.add_argument("--timeout", type=int, default=1800)
     r.add_argument("--ref-device", default="cpu", help="where the SOL reference run() executes")
+    r.add_argument("--score-cast", default=None, help="cast the walk output (and golden) to this torch dtype "
+                   "before the SOL check, e.g. bfloat16 for an fp16 diagnostic of a bf16 problem")
     r.add_argument("--arch", default="89")
     r.add_argument("--specs")
     r.add_argument("--hand")
@@ -759,18 +847,26 @@ def main(argv=None):
     rm.add_argument("--gates", default="cuda,export")
     rm.add_argument("--batch", type=int, default=16)
     rm.add_argument("--stems")
-    rm.add_argument("--export-cap-mb", type=int, default=1024)
-    rm.add_argument("--idle-util", type=float, default=10)
-    rm.add_argument("--idle-mem-mb", type=float, default=2000)
+    rm.add_argument("--export-cap-mb", type=int, default=16384)
+    # the GPU host's GPUs are shared through KernelBlaster's per-GPU flock (gpu_lock) and checked for
+    # free memory per IR (gpu_room); these optional thresholds also wait for an otherwise idle GPU
+    rm.add_argument("--idle-util", type=float, default=100)
+    rm.add_argument("--idle-mem-mb", type=float, default=1e9)
     rm.add_argument("--until-done", action="store_true", help="keep polling while `run` is still going")
     rm.add_argument("--no-sync", action="store_true", help="the remote code / kernels are current")
     rm.add_argument("--keep", action="store_true", help="keep the local io.npz")
+    ec = sub.add_parser("export-check", help="build a kb_export problem, run it holding the GPU lock")
+    ec.add_argument("problem")
+    ec.add_argument("--arch", default="89")
+    ec.add_argument("--lock-dir", required=True)
+    ec.add_argument("--timeout", type=int, default=1800)
     s = sub.add_parser("summary")
     s.add_argument("out", nargs="+")
     s.add_argument("--native", action="store_true", help="per stem, only the record at its own dtype")
     s.add_argument("--by-quant", action="store_true")
     a = ap.parse_args(argv)
-    return {"run": cmd_run, "one": cmd_one, "gpu": cmd_gpu, "remote": cmd_remote, "summary": cmd_summary}[a.cmd](a)
+    return {"run": cmd_run, "one": cmd_one, "gpu": cmd_gpu, "remote": cmd_remote, "summary": cmd_summary,
+            "export-check": cmd_export_check}[a.cmd](a)
 
 
 if __name__ == "__main__":
