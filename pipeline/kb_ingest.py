@@ -86,15 +86,30 @@ class CudaCache:
                "dtype": dtype or op_dtype(op), "arch": arch,
                "shape_guard": guard, "slot_us": slot_us, "speedup": speedup, "impl_id": impl_id,
                "file": f"src/{sha}.cu", "source": source, "model_verified": [], "rejected": []}
-        for i, e in enumerate(self.entries):
-            if (e["op"], e["signature_sha"], e.get("dtype", "fp32"), e["arch"], e["shape_guard"]) == \
-                    (new["op"], new["signature_sha"], new["dtype"], new["arch"], guard):
-                if slot_us < e["slot_us"]:
-                    self.entries[i] = new
-                    return new, "replaced"
-                return e, "kept-existing"
-        self.entries.append(new)
-        return new, "added"
+        key = (new["op"], new["signature_sha"], new["dtype"], new["arch"], guard)
+        same = [i for i, e in enumerate(self.entries)
+                if (e["op"], e["signature_sha"], e.get("dtype", "fp32"), e["arch"], e["shape_guard"]) == key]
+        if not same:
+            self.entries.append(new)
+            return new, "added"
+        beside = BESIDE_REJECTED()
+        for i in same:                                   # the same code again (a cumulative winners file): no change
+            if beside and self.entries[i]["file"] == new["file"]:
+                return self.entries[i], "kept-existing"
+        live = [i for i in same if not self.entries[i].get("rejected")]
+        i = min(live or same, key=lambda j: self.entries[j]["slot_us"]) if beside else same[0]     # legacy: first
+        e = self.entries[i]
+        if slot_us < e["slot_us"]:
+            self.entries[i] = new
+            return new, "replaced"
+        if beside and not live:
+            # every faster entry of these shapes failed in some whole model: the slower winner must still be usable
+            # there (lookup / cache_plan skip a rejected entry per IR); before this, a re-optimized winner of a rejected
+            # shape was dropped as "kept-existing" and the shape stayed on its seed (search fixes; kill switch
+            # MB_CACHE_BESIDE_REJECTED=0, set by --fallback-repair off)
+            self.entries.append(new)
+            return new, "added-beside-rejected"
+        return e, "kept-existing"
 
     def lookup(self, entry: str, signature: str, arch: str, shapes: list, ir_name: str | None = None):
         """Best entry for a C entry point whose guard covers every shape (and
@@ -106,8 +121,34 @@ class CudaCache:
         ok = [e for e in self.entries
               if e["entry"] == entry and e["signature_sha"] == sig and e["arch"] == arch
               and e.get("dtype", "fp32") == dtype
-              and need <= set(e["shape_guard"]) and (ir_name is None or ir_name not in e["rejected"])]
+              and need <= set(e["shape_guard"]) and (ir_name is None or ir_name not in e["rejected"])
+              and not superseded(e, ir_name)]
         return min(ok, key=lambda e: (ir_name not in e["model_verified"], e["slot_us"]), default=None)
+
+    def add_reuse(self, *, op: str, entry: str, signature: str, arch: str, shapes: list, code: str, slot_us: float,
+                  impl_id: str, source: dict, dtype: str | None = None) -> dict:
+        """A cross-application winner (kb_reuse): always a new entry (never merged with an existing one of the
+        same guard), marked ``reuse`` -- the pass supersedes the entries it replaces for the IR it measured."""
+        sha = hashlib.sha1(code.encode()).hexdigest()
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        (self.root / "src" / f"{sha}.cu").write_text(code)
+        new = {"op": op, "entry": entry, "signature_sha": signature_sha(cuda_signature(signature)),
+               "dtype": dtype or op_dtype(op), "arch": arch, "shape_guard": sorted({_shape_key(s) for s in shapes}),
+               "slot_us": slot_us, "speedup": None, "impl_id": impl_id, "file": f"src/{sha}.cu", "source": source,
+               "model_verified": [], "rejected": [], "reuse": True}
+        self.entries.append(new)
+        return new
+
+
+def BESIDE_REJECTED() -> bool:
+    """CudaCache.add keeps a new winner next to a faster same-guard entry that was rejected for some IR (default on)."""
+    import os
+    return os.getenv("MB_CACHE_BESIDE_REJECTED", "1") != "0"
+
+
+def superseded(e: dict, ir_name: str | None) -> bool:
+    """An entry a cross-application pass (kb_reuse) replaced for this IR: not used there (absent field: never)."""
+    return bool(ir_name is not None and ir_name in (e.get("superseded") or ()))
 
 
 def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float = 1.05) -> list[dict]:
@@ -117,6 +158,9 @@ def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float
     report = []
     for r in w["winners"]:
         spec = specs.get(r["op"])
+        if spec is None and r["op"].startswith("region__"):       # region slots: built by this process's exports
+            from .region_slots import known_spec
+            spec = known_spec(r["op"])
         if spec is None:
             st = "fusion-not-accepted" if r["op"].startswith("fused__") else "unknown-op"
             report.append({"op": r["op"], "impl_id": r["id"], "status": st})
@@ -174,8 +218,12 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
         return parse_signature(specs[kind].signature)[0], specs[kind].signature
 
     def usable(entry, sig):
-        return [e for e in cache.entries if e["entry"] == entry and e["signature_sha"] == signature_sha(sig)
-                and e["arch"] == arch and ir_name not in e["rejected"]]
+        # entries store the sha of the CUDA-side signature (``cuda_signature``: _Float16 -> __half, ...),
+        # exactly as ``CudaCache.lookup`` and ``ingest`` compare it; the raw signature never matches an fp16 entry
+        sig_sha, dtype = signature_sha(cuda_signature(sig)), op_dtype(entry)
+        return [e for e in cache.entries if e["entry"] == entry and e["signature_sha"] == sig_sha
+                and e["arch"] == arch and e.get("dtype", "fp32") == dtype and ir_name not in e["rejected"]
+                and not superseded(e, ir_name)]
 
     def own_key(o):
         return _shape_key(o.get("shape", {}))
@@ -330,6 +378,7 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
                 lst.append(ir_name)
             out["slots"][key] = {"impl_id": e["impl_id"], "ok": good, "rel_err": sc.get("rel_err"),
                                  "slot_us": res.get("slot_us", {}).get(sid)}
+        out["ops"] = verify_ops(man, plan["graph"], res, specs)
         if not res.get("passed"):
             out["log"] = res.get("log", "")[-1500:]
         cache.save()
@@ -340,6 +389,28 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
     finally:
         if work is None:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def verify_ops(man: dict, graph: dict, res: dict, specs: dict) -> list[dict]:
+    """Per-op record of a whole-model run (search_fixes' final-model guard): name, kind, slot, the slot's source tag
+    (``hand`` = the seed kernel, ``cache:<id>`` = a cached winner, ``fused-seed...``), the op's GPU time (CUPTI
+    attribution, else events), and its plan-item identity (entry, signature hash, shape)."""
+    seed = {s["id"]: s.get("seed_source") for s in man.get("slots", [])}
+    attr, ev = res.get("attr_op_us") or {}, res.get("op_us") or {}
+    shapes = {o["name"]: o.get("shape", {}) for o in graph.get("ops", [])}
+    out = []
+    for r in man.get("ops", []):
+        rec = {"name": r["name"], "op": r["op"], "slot": r["slot"], "seed_source": seed.get(r["slot"]),
+               "us": attr.get(r["name"], ev.get(r["name"])), "shape": shapes.get(r["name"], {})}
+        spec = specs.get(r["op"])
+        if spec is not None:
+            try:
+                rec["entry"] = parse_signature(spec.signature)[0]
+                rec["signature_sha"] = signature_sha(spec.signature)
+            except Exception:  # noqa: BLE001
+                pass
+        out.append(rec)
+    return out
 
 
 def main():

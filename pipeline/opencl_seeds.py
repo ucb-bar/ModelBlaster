@@ -379,12 +379,17 @@ class OpenCLSeeds:
                 f"void {entry}({plist}) {{\n    {a_entry}({a_args});\n    {b_entry}({b_args});\n}}\n")
 
 
+# kinds that only CUDA graph hints create (graph_hints.CUDA_KINDS fold_layout / fuse_attention): no OpenCL seed
+CUDA_ONLY = {"bmm_strided", "bmm_strided_f16", "attention", "attention_f16",
+             "cast_f16_to_f32", "cast_f32_to_f16"}           # precision-policy casts (CUDA path only)
+
+
 def all_entries(dtype: str = "fp32") -> dict[str, str]:
     """entry -> op for every fp32 (or `_f16`) KernelSpec: the target set of the seeds."""
     from .reference_kernels import KERNEL_SPECS
     out = {}
     for op, spec in KERNEL_SPECS.items():
-        if any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op.endswith("_f16") != (dtype == "fp16"):
+        if op in CUDA_ONLY or any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op.endswith("_f16") != (dtype == "fp16"):
             continue
         out.setdefault(parse_signature(spec.signature)[0], op)
     return out
