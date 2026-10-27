@@ -101,7 +101,7 @@ from the same GPU model, by default from one GPU. No GPU of that model is an err
 
 - `name`, `source_ir`, `ir_name`, `partition` (`strategy`, `op_names`, `op_indices`, `is_whole_graph`)
 - `target` (`cuda`), `dtype` (`fp32` / `fp16`), `tolerance` (`output_rel`, `output_abs`, `slot_rel`,
-  `slot_abs`; per dtype, [fp16_cuda.md](fp16_cuda.md))
+  `slot_abs`; per dtype, [fp16_cuda.md](fp16_cuda.md); `output_cond`, 2)
 - `assembly`: `head`, `tail`, `namespace_prefix` (`mbslot_`), `order` (slot ids)
 - `slots[]`: `id`, `op` (first op kind), `ops` (all kinds using it), `op_class`, `entry`,
   `signature`, `file`, `reference_file`, `semantics`, `seed_source`
@@ -109,7 +109,8 @@ from the same GPU model, by default from one GPU. No GPU of that model is an err
   `index`, `shape`)
 - `ops[]` (call order): `index`, `name`, `op`, `slot`, `inputs`/`outputs` (buffer indices)
 - `buffers[]`: `name`, `kind` (input, const, weight, intermediate, output), `dtype` (f32/f16/i32),
-  `numel`, `alias` (`base`, `offset` — views), `ref` (`[offset, nbytes]` into `data.bin`)
+  `numel`, `alias` (`base`, `offset` — views), `ref` (`[offset, nbytes]` into `data.bin`),
+  `ref_err` (outputs: max |reference − exact|, below; null when not computed)
 - `inputs`, `outputs` (buffer indices), `driver`, `data`, `data_sha1`
 
 **Assembly** (implemented identically in `kb_export.assemble` and `SlotProblem.assemble`):
@@ -136,8 +137,17 @@ partition is always checked and timed), `MB_SCREEN=1` shortens the timing budget
 `MB_GRAPH=1` (kernels built with `--default-stream per-thread`) adds `MB_PARTITION_GRAPH_US`,
 the partition replayed as a CUDA graph.
 
-Output bound: `err <= output_rel * max|finite ref| + output_abs` (1e-3, 1e-5, as the Level2/3
-gates). Isolated bound: `max err <= slot_rel * max(|finite inputs|, |finite ref|) + slot_abs`
+Output bound: `err <= output_rel * max|finite ref| + output_abs + output_cond * ref_err` (1e-3,
+1e-5, as the Level2/3 gates; `output_cond` 2). `ref_err` is how far the reference itself is from
+the exact value: a second walk at export, in float64 without the fp16/bf16 store rounding, holding
+only its live set (`reference_error`; `export_problem(conditioning=False)` /
+`kb_export --no-conditioning` skip it, the term is then 0). A candidate as close to the exact value
+as the reference differs from it by up to `2 * ref_err`. For a well-conditioned output the term is
+noise next to the relative bound; it matters for an output that cancels to ~0, whose fp32
+reference is rounding noise of its summands' scale: the gradient of a key bias through a softmax
+(SOL L2_021 `sum_4`: reference max 1.45e-5, exact 3e-14, plain bound 1.0e-5) or a routing
+gradient (L2_080 `matmul_7`: 6.8e-5 against an exact 1e-13). Without it the reference would fail
+its own check. Isolated bound: `max err <= slot_rel * max(|finite inputs|, |finite ref|) + slot_abs`
 (1e-3 and 0, as `walk_cuda`'s per-kernel check; fp16: 2e-3 and 2^-23, see
 [fp16_cuda.md](fp16_cuda.md)); `rel_err` reports `max err / max(...)`. Matching infinities/NaNs are exact. `MB_ERROR` lines report
 CUDA errors.
