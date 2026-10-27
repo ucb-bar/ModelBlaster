@@ -223,6 +223,30 @@ class ExtractTest(unittest.TestCase):
                 export_problem(ir, Path(d) / "ocl", target="opencl")
 
 
+class FusedSeedTest(unittest.TestCase):
+    def test_fused_bf16_seed_is_cuda_spelled_and_compiles(self):
+        """A fusion proposal's seed calls the bf16 stage kernels: its entry must be
+        `__nv_bfloat16`, not the C `__bf16` (nvcc rejects the mix)."""
+        import shutil
+        from modelblaster.pipeline.kb_export import namespaced
+        from modelblaster.pipeline.kb_proposals import spec_from_kind
+        from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+        lib = CudaLibrary(DEFAULT_HAND_CU_BF16.read_text())
+        spec = spec_from_kind("fused__ewise2_bf16__sigmoid_bf16", KERNEL_SPECS)
+        src = spec.cuda_seed(lib)
+        entry = next(l for l in src.splitlines() if l.startswith("void kernel_fused"))
+        self.assertIn("__nv_bfloat16", entry)
+        self.assertNotIn("__bf16 ", entry)
+        if shutil.which("nvcc") is None:
+            self.skipTest("no nvcc")
+        inc, body = namespaced("mbslot_f", src)
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "t.cu").write_text(lib.head_source() + "\n".join(inc) + "\n" + body)
+            cp = subprocess.run(["nvcc", "-arch=sm_75", "-c", "-o", str(Path(d) / "t.o"), str(Path(d) / "t.cu")],
+                                capture_output=True, text=True)
+        self.assertEqual(cp.returncode, 0, cp.stderr[-2000:])
+
+
 class CacheDtypeTest(unittest.TestCase):
     def test_bf16_fp16_and_fp32_entries_never_mix(self):
         sigb = "void kernel_relu_bf16(const __bf16 *input, __bf16 *output, int n)"
