@@ -97,6 +97,20 @@ def _load(path: Path, name: str):
     return mod
 
 
+def _visible_gpu() -> tuple:
+    """(uuid, free MiB) of the single GPU in CUDA_VISIBLE_DEVICES, or (None, None)."""
+    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not dev or "," in dev or not shutil.which("nvidia-smi"):
+        return None, None
+    p = subprocess.run(["nvidia-smi", "-i", dev, "--query-gpu=uuid,memory.free", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    try:
+        uuid, free = (x.strip() for x in p.stdout.strip().split(","))
+        return uuid, float(free)
+    except ValueError:
+        return None, None
+
+
 @contextmanager
 def gpu_lock(out: Path, device: bool = False):
     """One GPU user at a time among our workers; ``device`` also holds KernelBlaster's
@@ -120,7 +134,22 @@ def gpu_lock(out: Path, device: bool = False):
             if g is not None:
                 fcntl.flock(g, fcntl.LOCK_UN)
                 g.close()
-            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def gpu_room(g: dict, wait_s: float) -> bool:
+    """Enough free memory on the visible GPU for every tensor of the IR (x1.5), waiting up to
+    wait_s for other users to finish; True when it cannot be checked."""
+    import math
+    need = sum(math.prod(t["shape"]) if t["shape"] else 1 for t in g["tensors"].values()) * \
+        (2 if g.get("quant") in ("fp16", "bf16") else 4) * 1.5 / 2 ** 20
+    t = time.time()
+    while True:
+        _, free = _visible_gpu()
+        if free is None or free >= need + 1024:
+            return True
+        if time.time() - t > wait_s:
+            return False
+        time.sleep(30)
 
 
 # ── SOL correctness (sol_execbench/core/bench/correctness.py @834c7c1, Apache-2.0) ──
@@ -369,8 +398,16 @@ def run_one(row: dict, cfg: dict) -> dict:
             else:
                 tol = row["tolerance"]
                 cpu["ref_device"] = ref_dev
+                cast = cfg.get("score_cast")
+                if cast:
+                    # diagnostic variants (e.g. fp16 of a bf16 problem): score in the reference's dtype
+                    cpu["sol_vs_walk_raw"] = sol_compare(flat.float(), refs, tol)
+                    cpu["score_cast"] = cast
+                    flat = flat.to(getattr(torch, cast)).float()
                 cpu["sol_vs_walk"] = sol_compare(flat.float(), refs, tol)
                 golden = torch.from_numpy(np.asarray(irm.golden_out, np.float32))
+                if cast:
+                    golden = golden.to(getattr(torch, cast)).float()
                 cpu["sol_vs_golden"] = sol_compare(golden, refs, tol)
                 cpu["ok"] = bool(cpu["mb_golden"]["ok"])
                 cpu["sol_ok"] = bool(cpu["sol_vs_walk"]["ok"])
@@ -409,6 +446,16 @@ def gpu_gates(ir: Path, g: dict, cfg: dict, gates, out: Path, env: dict, stem: s
     res = {}
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    if {"cuda", "export"} & set(gates) and not gpu_room(g, cfg.get("gpu_wait_s", 1800)):
+        return {k: {"ok": None, "skipped": "GPU memory (not enough free on the GPU)"}
+                for k in ("cuda", "export") if k in gates}
+    # the hand kernels of the IR's storage dtype: lib_hand.so -> lib_hand_f16.so / lib_hand_bf16.so;
+    # a mixed IR (--quant native) resolves each op in all of them and lib_hand_cast.so
+    q = {"fp16": "_f16", "bf16": "_bf16"}.get(g.get("quant"), "")
+    if g.get("quant") == "native" and cfg.get("hand") and "," not in cfg["hand"]:
+        cfg = dict(cfg, hand=",".join(cfg["hand"].replace(".so", f"{x}.so") for x in ("", "_f16", "_bf16", "_cast")))
+    elif q and cfg.get("hand") and not cfg["hand"].endswith(f"{q}.so"):
+        cfg = dict(cfg, hand=cfg["hand"].replace(".so", f"{q}.so"))
     if "cuda" in gates:
         with gpu_lock(out, device=True):
             j = out / "tmp" / f"{stem}.wc.json"
@@ -427,7 +474,9 @@ def gpu_gates(ir: Path, g: dict, cfg: dict, gates, out: Path, env: dict, stem: s
                 "missing", "error", "model_ms", "torch_eager_ms", "why")
         c = {k: r.get(k) for k in keep if k in r}
         c["ok"] = bool(r.get("ok")) and not r.get("first_divergent_op")
-        if not c["ok"]:
+        if not c["ok"] and re.search(r"out of memory|cudaErrorMemoryAllocation", str(r.get("error", "")), re.I):
+            c = {"ok": None, "skipped": "GPU memory (out of memory)", "error": str(r.get("error"))[:200]}
+        elif not c["ok"]:
             c["cls"] = ("missing kernel" if r.get("missing") else
                         "divergent intermediate" if r.get("first_divergent_op") else
                         "out of memory" if "memory" in str(r.get("error", "")).lower() else
@@ -566,10 +615,15 @@ def _launch(row: dict, cfg: dict, out: Path, a) -> dict:
                        capture_output=True, text=True)
     rf.unlink(missing_ok=True)
     cf.unlink(missing_ok=True)
-    if res.exists():
-        return json.loads(res.read_text())
+    if res.exists() and res.stat().st_size:
+        try:
+            return json.loads(res.read_text())
+        except ValueError:
+            pass
     rec = {"stem": row["stem"], "set": row["set"], "problem": row["problem"], "pick": row["pick"],
            "uuid": row["uuid"], "variant": row["variant"], "io_mib": row["io_mib"],
+           "quant": native_quant(row) if cfg["quant"] == "native" else cfg["quant"],
+           "ref_dtypes": sorted(row.get("dtype_map", {})),
            "gates": {"extract": {"ok": None, "skipped": f"too large for host memory (MemoryMax={cap:g}G, rc "
                                                         f"{p.returncode})"}},
            "stderr": (p.stderr or "")[-1000:]}
@@ -597,7 +651,7 @@ def cmd_run(a):
            "gates": a.gates.split(","), "timeout": a.timeout, "ref_device": a.ref_device, "arch": a.arch,
            "specs": a.specs, "hand": a.hand, "keep": a.keep, "export_cap_mb": a.export_cap_mb,
            "threads": a.threads, "reserve_mb": a.reserve_mb, "disk_wait_s": a.disk_wait_s,
-           "hi_ref": not a.no_hi_ref}
+           "score_cast": a.score_cast, "hi_ref": not a.no_hi_ref}
     rows.sort(key=lambda r: r["io_mib"])          # the small ones report first
     big = threading.Semaphore(a.jobs_large)       # at most this many large workloads at once
 
@@ -632,14 +686,8 @@ def cmd_gpu(a):
         except (OSError, ValueError) as e:
             res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
             continue
-        # the hand kernels of the IR's storage dtype: lib_hand.so, lib_hand_f16.so, lib_hand_bf16.so;
-        # a mixed IR (--quant native) resolves each op in all of them and lib_hand_cast.so
-        q = {"fp16": "_f16", "bf16": "_bf16"}.get(g.get("quant"), "")
-        hand = ",".join(cfg["hand"].replace(".so", f"{x}.so") for x in ("", "_f16", "_bf16", "_cast")) \
-            if g.get("quant") == "native" else cfg["hand"].replace(".so", f"{q}.so")
-        c = dict(cfg, hand=hand)
         try:
-            res[ir.name] = gpu_gates(ir, g, c, a.gates.split(","), out, env, ir.name)
+            res[ir.name] = gpu_gates(ir, g, cfg, a.gates.split(","), out, env, ir.name)
         except Exception as e:  # noqa: BLE001
             res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
         for v in res[ir.name].values():
@@ -694,7 +742,10 @@ def cmd_remote(a):
     while True:
         todo = []
         for f in sorted((out / "results").glob("*.json")):
-            r = json.loads(f.read_text())
+            try:
+                r = json.loads(f.read_text())
+            except (OSError, ValueError):        # being written, or truncated by a full disk
+                continue
             ir = out / "ir" / r["stem"]
             if "cuda" in r["gates"] or not (ir / "io.npz").exists():
                 continue
@@ -751,7 +802,13 @@ def cmd_remote(a):
 # ── summary ───────────────────────────────────────────────────────────────────
 
 def load_results(out: Path) -> list:
-    return [json.loads(f.read_text()) for f in sorted((out / "results").glob("*.json"))]
+    recs = []
+    for f in sorted((out / "results").glob("*.json")):
+        try:
+            recs.append(json.loads(f.read_text()))
+        except ValueError:
+            print(f"warning: unreadable {f}", file=sys.stderr)
+    return recs
 
 
 def _native_of(r: dict) -> str:
@@ -869,6 +926,8 @@ def main(argv=None):
                    "manifest's variant")
     r.add_argument("--timeout", type=int, default=1800)
     r.add_argument("--ref-device", default="cpu", help="where the SOL reference run() executes")
+    r.add_argument("--score-cast", default=None, help="cast the walk output (and golden) to this torch dtype "
+                   "before the SOL check, e.g. bfloat16 for an fp16 diagnostic of a bf16 problem")
     r.add_argument("--arch", default="89")
     r.add_argument("--specs")
     r.add_argument("--hand")
@@ -904,9 +963,11 @@ def main(argv=None):
     rm.add_argument("--gates", default="cuda,export")
     rm.add_argument("--batch", type=int, default=16)
     rm.add_argument("--stems")
-    rm.add_argument("--export-cap-mb", type=int, default=1024)
-    rm.add_argument("--idle-util", type=float, default=10)
-    rm.add_argument("--idle-mem-mb", type=float, default=2000)
+    rm.add_argument("--export-cap-mb", type=int, default=16384)
+    # the GPU host's GPUs are shared through KernelBlaster's per-GPU flock (gpu_lock) and checked for
+    # free memory per IR (gpu_room); these optional thresholds also wait for an otherwise idle GPU
+    rm.add_argument("--idle-util", type=float, default=100)
+    rm.add_argument("--idle-mem-mb", type=float, default=1e9)
     rm.add_argument("--until-done", action="store_true", help="keep polling while `run` is still going")
     rm.add_argument("--no-sync", action="store_true", help="the remote code / kernels are current")
     rm.add_argument("--keep", action="store_true", help="keep the local io.npz")
