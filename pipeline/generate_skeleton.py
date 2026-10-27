@@ -137,7 +137,8 @@ _PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 _GENERIC_ABI_OPS = {"strided_copy", "gather", "catn", "ewise1", "ewise2",
                     "ewise_scalar", "reduce", "softmax_dim", "conv2d_grouped",
                     "maxpool2d_ex", "lstm_seq", "gru_seq", "index_select",
-                    "gather_dim", "scatter_dim", "topk", "convnd", "strided_scatter"}
+                    "gather_dim", "scatter_dim", "topk", "convnd", "strided_scatter",
+                    "bmm_strided", "attention"}
 
 
 def _generic_call(op: dict, ptr_for, model_name: str, backend) -> str:

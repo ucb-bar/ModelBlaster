@@ -11598,6 +11598,9 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
 # reference_kernels_ext.py.
 from modelblaster.pipeline.reference_kernels_ext import ext_specs as _ext_specs  # noqa: E402
 KERNEL_SPECS.update(_ext_specs(KernelSpec))
+# fp16 <-> fp32 casts at precision-policy island boundaries (precision_casts.py; only policy IRs use them)
+from modelblaster.pipeline.precision_casts import cast_specs as _cast_specs  # noqa: E402
+KERNEL_SPECS.update(_cast_specs(KernelSpec))
 
 
 def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":

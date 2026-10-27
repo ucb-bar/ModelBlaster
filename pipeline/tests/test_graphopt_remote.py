@@ -80,7 +80,7 @@ class FakeEval(ke.KBEval):
     def available(self):
         return True
 
-    def run(self, jobs, *, arch, work, gpu_model=None, name="time"):
+    def run(self, jobs, *, arch, work, gpu_model=None, name="time", driver_env=None):
         self.calls.append({"jobs": jobs, "arch": arch, "gpu_model": gpu_model, "name": name})
         if self.fail_model and gpu_model:
             raise ke.HardwareMismatch(f"NoDevice: no {gpu_model} GPU among the selected devices")
