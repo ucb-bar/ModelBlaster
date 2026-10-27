@@ -1126,8 +1126,10 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
                             continue
                         ro, rv = read_result(run_dir, jobs[k]["orig"]), read_result(run_dir, jobs[k]["variant"])
                         if (ro is not None and rv is not None) or done:
-                            ro = dict(ro or {"final_ok": False}, _dir=str(run_dir / problem_name(jobs[k]["orig"])))
-                            rv = dict(rv or {"final_ok": False},
+                            _lost = {"final_ok": False, "final_infra": True,      # missing result.json at exit: infra/crash,
+                                     "final_error": "no result.json when the KernelBlaster process exited"}   # not a verdict
+                            ro = dict(ro or _lost, _dir=str(run_dir / problem_name(jobs[k]["orig"])))
+                            rv = dict(rv or _lost,
                                       _dir=str(run_dir / problem_name(jobs[k]["variant"])))
                             sides[k] = (ro, rv)
                             futs[k] = ex.submit(kbt.run_within, parent, "mb.remeasure", measure_hint, jobs[k],
