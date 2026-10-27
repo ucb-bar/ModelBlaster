@@ -481,10 +481,47 @@ OPS.update({
 })
 
 
-def walk(ir: IR, dev="cuda", keep_all=False):
-    """Returns (output_flat, env) — env maps every IR tensor to its value."""
+class _Cast:
+    """``ir`` with every float input / constant / weight cast to ``dtype`` (the exact-math walk)."""
+
+    def __init__(self, ir: IR, dtype):
+        self._ir, self._dt = ir, dtype
+
+    def __getattr__(self, k):
+        return getattr(self._ir, k)
+
+    def _c(self, t):
+        return t.to(self._dt) if t is not None and t.is_floating_point() else t
+
+    def input_tensors(self, device):
+        return {k: self._c(v) for k, v in self._ir.input_tensors(device).items()}
+
+    def const_tensors(self, device, **kw):
+        return {k: self._c(v) for k, v in self._ir.const_tensors(device, **kw).items()}
+
+    def weight(self, key, device):
+        return self._c(self._ir.weight(key, device))
+
+
+def walk(ir: IR, dev="cuda", keep_all=False, *, dtype=None, store_rounding=True, keep=None):
+    """Returns (output_flat, env) — env maps every IR tensor to its value.
+
+    ``dtype`` (e.g. torch.float64) runs the math in that dtype: float inputs,
+    constants, weights and every op's float outputs are cast to it;
+    ``store_rounding=False`` drops the `_f16` / `_bf16` store rounding (with
+    float64: the exact value the reference approximates). ``keep``: a set of
+    tensor names -- every other tensor leaves env after its last use (the
+    graph outputs are always kept), so the walk holds only its live set."""
+    if dtype is not None:
+        ir = _Cast(ir, dtype)
     env = ir.input_tensors(dev)
     env.update(ir.const_tensors(dev))
+    if keep is not None:
+        keep = set(keep) | set(ir.output_names())
+        last = {}
+        for k, op in enumerate(ir.ops):
+            for t in op["inputs"]:
+                last[t] = k
     def run_op(op):
         if "sub_ops" in op:                    # fused op (kb_proposals): its parts in order
             for sub in op["sub_ops"]:
@@ -494,14 +531,21 @@ def walk(ir: IR, dev="cuda", keep_all=False):
         if fn is None:
             raise NotImplementedError(op["op"])
         outs = fn(ir, op, [env[t] for t in op["inputs"]], dev)
-        rnd = _store_rounding(op["op"])
+        rnd = _store_rounding(op["op"]) if store_rounding else _identity
         if rnd is not _identity:
             outs = [rnd(v) for v in outs]
+        if dtype is not None:
+            outs = [v.to(dtype) if v.is_floating_point() else v for v in outs]
         for name, val in zip(op["outputs"], outs):
             env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
 
-    for op in ir.ops:
+    for k, op in enumerate(ir.ops):
         run_op(op)
+        if keep is not None:
+            for t in [*op["inputs"], *op["outputs"], *op.get("internal", []),
+                      *(t for s in op.get("sub_ops", []) for t in s["outputs"])]:
+                if t not in keep and last.get(t, -1) <= k:
+                    env.pop(t, None)
     out = torch.cat([env[t].reshape(-1) for t in ir.output_names()])
     return out, env
 
