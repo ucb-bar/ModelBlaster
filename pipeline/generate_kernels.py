@@ -1329,6 +1329,7 @@ def generate(
         raise SystemExit(
             f"quant={quant!r} not implemented in generate_kernels yet "
             f"(have: fp32, fp16, int8)."
+            + (" bf16 is CUDA-only (docs/bf16_cuda.md)." if quant == "bf16" else "")
         )
 
     target = backends_mod.get(target_name)
