@@ -41,6 +41,10 @@ slots a candidate changed, shorten the timing, and add a CUDA-graph time.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import functools
+import gc
 import hashlib
 import json
 import math
@@ -440,7 +444,7 @@ def slot_id_of(op: dict, specs: dict) -> str:
     return f"{sid}__{op['slot_variant']}" if op.get("slot_variant") else sid
 
 
-def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name: str | None = None,
+def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None, name: str | None = None,
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
                    tolerance: dict | None = None, strategy: str = "custom",
@@ -744,6 +748,51 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     }
     (out / "manifest.json").write_text(json.dumps(man, indent=1))
     return out
+
+
+def _walk_bytes(ir_dir) -> int:
+    """Upper bound of the CPU walk's footprint: every IR tensor held as fp32 (the walk keeps them all)."""
+    try:
+        g = json.loads((Path(ir_dir) / "graph.json").read_text())
+        return sum(4 * math.prod(t.get("shape") or [1]) for t in g.get("tensors", {}).values())
+    except (OSError, ValueError, AttributeError, TypeError):
+        return 0
+
+
+@contextlib.contextmanager
+def _heavy_export_lock(ir_dir):
+    """Serialise the exports whose CPU walk needs more than $MB_EXPORT_LOCK_GB (default 4) GB across all
+    controllers of this node (flock on $MB_EXPORT_LOCK, default /tmp/krisd/export_walk.lock): pooled mode runs
+    every problem's controller on one node, and a big model's export peaks at 2-3x its fp32 activations (walk env
+    + data.bin bytearray + bytes copy; 18_SqueezeNet 33 GB, 44_MiniGPTBlock 31 GB)."""
+    import os
+    lim = float(os.environ.get("MB_EXPORT_LOCK_GB", "4")) * 2**30
+    if lim <= 0 or _walk_bytes(ir_dir) < lim:
+        yield
+        return
+    path = os.environ.get("MB_EXPORT_LOCK", "/tmp/krisd/export_walk.lock")
+    try:
+        f = open(path, "a")
+    except OSError:
+        yield
+        return
+    with f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+@functools.wraps(_export_problem_impl)
+def export_problem(ir_dir, out_dir, *args, **kw):
+    """:func:`_export_problem_impl` with the heavy-walk lock; the cyclic garbage of the walk (closures pinning the
+    activations) is collected before the lock is released, so a long-lived controller never accumulates it."""
+    with _heavy_export_lock(ir_dir):
+        try:
+            return _export_problem_impl(ir_dir, out_dir, *args, **kw)
+        finally:
+            gc.collect()
 
 
 # C entry points of a candidate's shared object (the slot units + this tail,
