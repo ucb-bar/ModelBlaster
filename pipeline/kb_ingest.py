@@ -295,6 +295,8 @@ def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: 
         mine = [x for x in g["ops"] if x["op"] in specs and slot_id_of(x, specs) == sid]
         subs = {}
         for i, st in enumerate(o["sub_ops"]):
+            if st["op"] not in specs:                      # an alias stage (view / reshape ...) has no slot kernel to look up
+                continue
             entry, sig = entry_sig(st["op"])
             shapes = [x["sub_ops"][i].get("shape", {}) for x in mine]
             e = cache.lookup(entry, sig, arch, shapes, ir_name=ir_name)
