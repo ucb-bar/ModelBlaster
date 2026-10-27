@@ -393,10 +393,53 @@ def fuse_region(graph: dict, names: list[str], specs: dict, pattern: str = "ops"
     rop = {"name": f"region:{mem[0]['name']}..{mem[-1]['name']}", "op": kind, "region": True, "pattern": pattern,
            "inputs": ins, "outputs": outs, "internal": internal, "sub_ops": members,
            "shape": {f"m{i}": m.get("shape", {}) for i, m in enumerate(members)}}
-    ops[idx[-1]] = rop
-    for i in sorted(idx[:-1], reverse=True):
-        del ops[i]
+    # Dead non-member ops between the members that read a member's output (or each other's) must not stay in front
+    # of the region: the region produces those tensors at ITS position, and the walker (walk_torch.walk) still runs
+    # every IR op in list order (dead ones included) => KeyError on the tensor (49_Mamba2: dead getitem_3 reads
+    # einsum_1; 35/37/38/40/42: dead h_n/c_n readers). They move behind the region (the walk's env then holds the
+    # region's internals; the export prunes them anyway). MB_REGION_DEAD_MOVE=0: legacy behaviour.
+    moved: list[int] = []
+    if os.environ.get("MB_REGION_DEAD_MOVE", "1") != "0":
+        avail = set(produced)
+        for j in range(idx[0], idx[-1]):
+            if j not in mset and j in dead and avail & set(ops[j]["inputs"]):
+                moved.append(j)
+                avail.update(ops[j]["outputs"])
+    mv = set(moved)
+    new_ops = []
+    for j, o in enumerate(ops):
+        if (j in mset and j != idx[-1]) or j in mv:
+            continue
+        new_ops.append(o)
+        if j == idx[-1]:
+            new_ops[-1] = rop
+            new_ops.extend(ops[k] for k in moved)
+    g["ops"] = new_ops
+    late = _read_before_defined(g)
+    if late:                                              # never hand the walker/exporter a mis-ordered IR
+        raise ValueError(f"region would leave {late[0][0]} reading {late[0][1]} before it is produced")
     return g, region_spec(rop, specs)
+
+
+def _read_before_defined(g: dict) -> list[tuple[str, str]]:
+    """(op, tensor) pairs where an op (members of fused/region ops included) reads a tensor that some LATER op
+    defines: the order walk_torch.walk executes (list order, sub_ops recursed)."""
+    produced: dict[str, int] = {}
+
+    def outs(o):
+        yield from o.get("outputs", [])
+        yield from o.get("internal", [])
+        for s in o.get("sub_ops", []):
+            yield from outs(s)
+    for i, o in enumerate(g["ops"]):
+        for t in outs(o):
+            produced.setdefault(t, i)
+    bad = []
+    for i, o in enumerate(g["ops"]):
+        for t in o.get("inputs", []):
+            if produced.get(t, -1) > i:
+                bad.append((o["name"], t))
+    return bad
 
 
 def find_regions(graph: dict, pattern: str, specs: dict) -> list[list[str]]:
