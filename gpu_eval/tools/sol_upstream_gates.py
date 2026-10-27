@@ -9,7 +9,7 @@ Per converted workload (a row of ``manifest.<variant>.json``), in one worker pro
    are the bench's own ``get_inputs()`` values;
 3. **cpu**: ``walk_torch`` on the CPU, against the MB golden (``mbir.compare``, MB's bound) and
    against the **SOL ground truth**, the original reference run on the native inputs
-   (``--ref-device``, SOL's own GPU by default), with SOL's per-workload tolerance
+   (``--ref-device``: the CPU by default; SOL runs it on its GPU), with SOL's per-workload tolerance
    (``|out - ref| <= atol + rtol*|ref|`` on >= ``required_matched_ratio`` of the elements, no
    non-finite values, ``max_error_cap``). The MB golden is checked against it the same way: that
    is the port's floor (the fp32 math against the bf16 reference);
@@ -19,11 +19,17 @@ Per converted workload (a row of ``manifest.<variant>.json``), in one worker pro
    the persistent driver host), skipped with a reason when its data.bin would exceed
    ``--export-cap-mb``.
 
-io.npz / data.bin are deleted afterwards unless ``--keep``: native shapes are large.
+``run`` does 1-3 locally, each workload in its own memory-capped scope (``systemd-run --user
+--scope -p MemoryMax``; at most ``--jobs-large`` large workloads at once, and only while the host
+has the memory free): a workload the cap kills is recorded as "too large for host memory", not
+retried. ``remote`` ships the extracted IRs in batches to an ssh GPU host (only when its GPU is
+idle), runs 4-5 there (``gpu``, with the host's own torch python, never modified) and merges the
+results back; io.npz is deleted once consumed, unless ``--keep``.
 
-    sol_upstream_gates.py run MANIFEST OUT [--stems REGEX] [--jobs 4] [--gates extract,shapes,cpu,cuda,export]
-        [--arch 75] [--ref-device cuda] [--keep]
-    sol_upstream_gates.py summary OUT [--md]
+    sol_upstream_gates.py run MANIFEST OUT [--stems REGEX] [--jobs 4 --jobs-large 2] [--ref-device cpu]
+    sol_upstream_gates.py remote OUT --host U@H --ssh-key K --remote-dir D --python PY [--gpu 2] [--until-done]
+    sol_upstream_gates.py gpu IR_ROOT WORK OUT_JSON --specs S --hand LIB [--arch 89]   # on the GPU host
+    sol_upstream_gates.py summary OUT
 """
 from __future__ import annotations
 
@@ -38,7 +44,7 @@ import subprocess
 import sys
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -257,42 +263,52 @@ def run_one(row: dict, cfg: dict) -> dict:
                     except Exception as e:  # noqa: BLE001
                         cpu["sol_ref_cpu_error"] = f"{type(e).__name__}: {str(e)[:200]}"
             rec["gates"]["cpu"] = cpu
-        if "cuda" in gates:
-            with gpu_lock(out):
-                j = out / "tmp" / f"{stem}.wc.json"
-                j.parent.mkdir(parents=True, exist_ok=True)
-                cmd = [sys.executable, "walk_cuda.py", str(ir), "--specs", cfg["specs"], "--hand", cfg["hand"],
-                       "--impl", "hand", "--reps", "1", "--json", str(j)]
-                try:
-                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout"], cwd=HARNESS,
-                                       env=env)
-                    (logs / f"{stem}.cuda.log").write_text((p.stdout + p.stderr)[-100000:])
-                    r = json.loads(j.read_text())[0] if j.exists() else {"ok": False, "error": last_error(p.stderr)}
-                except subprocess.TimeoutExpired:
-                    r = {"ok": False, "error": "timeout"}
-                j.unlink(missing_ok=True)
-            keep = ("ok", "max_abs_err", "rel_to_range", "worst_intermediate_rel_err", "first_divergent_op",
-                    "missing", "error", "model_ms", "torch_eager_ms", "why")
-            rec["gates"]["cuda"] = {k: r.get(k) for k in keep if k in r}
-            rec["gates"]["cuda"]["ok"] = bool(r.get("ok")) and not r.get("first_divergent_op")
-            if not rec["gates"]["cuda"]["ok"]:
-                rec["gates"]["cuda"]["cls"] = ("missing kernel" if r.get("missing") else
-                                               "divergent intermediate" if r.get("first_divergent_op") else
-                                               "out of memory" if "memory" in str(r.get("error", "")).lower() else
-                                               "golden bound" if "max_abs_err" in r else "error")
-        if "export" in gates:
-            rec["gates"]["export"] = export_gate(ir, g, out, cfg, env, stem)
+        rec["gates"].update(gpu_gates(ir, g, cfg, gates, out, env, stem))
     except Exception as e:  # noqa: BLE001
         rec["error"] = f"{type(e).__name__}: {e}"
         rec["traceback"] = traceback.format_exc()[-3000:]
     finally:
         rec["s"] = round(time.time() - t0, 1)
-        if not cfg.get("keep"):
-            for f in ("io.npz",):
-                (ir / f).unlink(missing_ok=True)
+        # io.npz stays for the GPU gates when they run elsewhere (``remote``), else it goes
+        if not cfg.get("keep") and ({"cuda", "export"} & set(gates) or not rec["gates"].get("extract", {}).get("ok")):
+            (ir / "io.npz").unlink(missing_ok=True)
         (out / "results").mkdir(exist_ok=True)
         (out / "results" / f"{stem}.json").write_text(json.dumps(rec, indent=1, default=str))
     return rec
+
+
+def gpu_gates(ir: Path, g: dict, cfg: dict, gates, out: Path, env: dict, stem: str) -> dict:
+    """The CUDA walk and the multi-slot export of one IR (on the host this runs on)."""
+    res = {}
+    logs = out / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    if "cuda" in gates:
+        with gpu_lock(out):
+            j = out / "tmp" / f"{stem}.wc.json"
+            j.parent.mkdir(parents=True, exist_ok=True)
+            cmd = [sys.executable, "walk_cuda.py", str(ir), "--specs", cfg["specs"], "--hand", cfg["hand"],
+                   "--impl", "hand", "--reps", "1", "--json", str(j)]
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout"], cwd=HARNESS,
+                                   env=env)
+                (logs / f"{stem}.cuda.log").write_text((p.stdout + p.stderr)[-100000:])
+                r = json.loads(j.read_text())[0] if j.exists() else {"ok": False, "error": last_error(p.stderr)}
+            except subprocess.TimeoutExpired:
+                r = {"ok": False, "error": "timeout"}
+            j.unlink(missing_ok=True)
+        keep = ("ok", "max_abs_err", "rel_to_range", "worst_intermediate_rel_err", "first_divergent_op",
+                "missing", "error", "model_ms", "torch_eager_ms", "why")
+        c = {k: r.get(k) for k in keep if k in r}
+        c["ok"] = bool(r.get("ok")) and not r.get("first_divergent_op")
+        if not c["ok"]:
+            c["cls"] = ("missing kernel" if r.get("missing") else
+                        "divergent intermediate" if r.get("first_divergent_op") else
+                        "out of memory" if "memory" in str(r.get("error", "")).lower() else
+                        "golden bound" if "max_abs_err" in r else "error")
+        res["cuda"] = c
+    if "export" in gates:
+        res["export"] = export_gate(ir, g, out, cfg, env, stem)
+    return res
 
 
 def wait_for_disk(path: Path, need_mb: float, wait_s: int) -> bool:
@@ -379,17 +395,66 @@ def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -
     return o
 
 
-# ── driver / summary ──────────────────────────────────────────────────────────
+# ── driver ────────────────────────────────────────────────────────────────────
 
-def _worker(args):
-    row, cfg = args
-    return run_one(row, cfg)
+def mem_available_gb() -> float:
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 2 ** 20
+    return 0.0
+
+
+def capped(cmd: list, max_gb: float) -> list:
+    """``cmd`` in its own memory-capped scope (no swap): the OOM is ours, not the host's."""
+    if shutil.which("systemd-run"):
+        return ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={max_gb:g}G",
+                "-p", "MemorySwapMax=0", "--", *cmd]
+    return ["prlimit", f"--as={int(max_gb * 2 ** 30)}", "--", *cmd]
+
+
+def cmd_one(a):
+    row = json.loads(Path(a.row).read_text())
+    cfg = json.loads(Path(a.cfg).read_text())
+    run_one(row, cfg)
+    return 0
+
+
+def _launch(row: dict, cfg: dict, out: Path, a) -> dict:
+    """One workload in a capped subprocess; a kill by the cap is recorded, not retried."""
+    large = row["io_mib"] > a.large_mib
+    cap = a.mem_large_gb if large else a.mem_small_gb
+    while mem_available_gb() < cap + a.mem_reserve_gb:      # the host is shared: wait for room
+        time.sleep(15)
+    tmp = out / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    rf, cf = tmp / f"{row['stem']}.row.json", tmp / f"{row['stem']}.cfg.json"
+    rf.write_text(json.dumps(row))
+    cf.write_text(json.dumps(cfg))
+    res = out / "results" / f"{row['stem']}.json"
+    res.unlink(missing_ok=True)
+    p = subprocess.run(capped([sys.executable, __file__, "one", str(rf), str(cf)], cap),
+                       capture_output=True, text=True)
+    rf.unlink(missing_ok=True)
+    cf.unlink(missing_ok=True)
+    if res.exists():
+        return json.loads(res.read_text())
+    rec = {"stem": row["stem"], "set": row["set"], "problem": row["problem"], "pick": row["pick"],
+           "uuid": row["uuid"], "variant": row["variant"], "io_mib": row["io_mib"],
+           "gates": {"extract": {"ok": None, "skipped": f"too large for host memory (MemoryMax={cap:g}G, rc "
+                                                        f"{p.returncode})"}},
+           "stderr": (p.stderr or "")[-1000:]}
+    shutil.rmtree(out / "ir" / row["stem"], ignore_errors=True)
+    res.parent.mkdir(parents=True, exist_ok=True)
+    res.write_text(json.dumps(rec, indent=1))
+    return rec
 
 
 def cmd_run(a):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
     man = json.loads(Path(a.manifest).read_text())
     out = Path(a.out).resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    (out / "results").mkdir(parents=True, exist_ok=True)
     rows = [r for r in man["workloads"] if not a.stems or re.search(a.stems, r["stem"])]
     if a.skip_done:
         rows = [r for r in rows if not (out / "results" / f"{r['stem']}.json").exists()]
@@ -402,14 +467,17 @@ def cmd_run(a):
            "gates": a.gates.split(","), "timeout": a.timeout, "ref_device": a.ref_device, "arch": a.arch,
            "specs": a.specs, "hand": a.hand, "keep": a.keep, "export_cap_mb": a.export_cap_mb,
            "threads": a.threads, "reserve_mb": a.reserve_mb, "disk_wait_s": a.disk_wait_s}
-    if a.quant == "fp32" and man["variant"] != "fp32":
-        print("warning: fp32 extract of a non-fp32 bench", file=sys.stderr)
-    # largest last: the small ones report quickly
-    rows.sort(key=lambda r: r["io_mib"])
+    rows.sort(key=lambda r: r["io_mib"])          # the small ones report first
+    big = threading.Semaphore(a.jobs_large)       # at most this many large workloads at once
+
+    def job(row):
+        if row["io_mib"] > a.large_mib:
+            with big:
+                return _launch(row, cfg, out, a)
+        return _launch(row, cfg, out, a)
     n = 0
-    with ProcessPoolExecutor(max_workers=a.jobs) as ex:
-        futs = [ex.submit(_worker, (r, cfg)) for r in rows]
-        for fut in as_completed(futs):
+    with ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        for fut in as_completed([ex.submit(job, r) for r in rows]):
             rec = fut.result()
             n += 1
             gs = " ".join(f"{k}={'ok' if v.get('ok') else ('skip' if v.get('ok') is None else 'FAIL')}"
@@ -417,6 +485,125 @@ def cmd_run(a):
             print(f"[{n}/{len(rows)}] {rec['stem']} {gs} {rec.get('error', '')}", flush=True)
     return 0
 
+
+def cmd_gpu(a):
+    """The GPU gates over IR_ROOT/<stem> (run on the GPU host): -> OUT_JSON {stem: gates}."""
+    root, out = Path(a.ir_root).resolve(), Path(a.work).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    cfg = {"specs": str(Path(a.specs).resolve()), "hand": str(Path(a.hand).resolve()), "timeout": a.timeout,
+           "arch": a.arch, "export_cap_mb": a.export_cap_mb, "reserve_mb": a.reserve_mb, "disk_wait_s": 600}
+    env = dict(os.environ)
+    res = {}
+    for ir in sorted(d for d in root.iterdir() if (d / "graph.json").exists() and (d / "io.npz").exists()):
+        g = json.loads((ir / "graph.json").read_text())
+        t = time.time()
+        try:
+            res[ir.name] = gpu_gates(ir, g, cfg, a.gates.split(","), out, env, ir.name)
+        except Exception as e:  # noqa: BLE001
+            res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
+        for v in res[ir.name].values():
+            v["host"] = os.uname().nodename
+        print(f"{ir.name} {round(time.time() - t, 1)} s "
+              + " ".join(f"{k}={v.get('ok')}" for k, v in res[ir.name].items()), flush=True)
+        Path(a.out_json).write_text(json.dumps(res, indent=1))
+    Path(a.out_json).write_text(json.dumps(res, indent=1))
+    return 0
+
+
+def _ssh(a, cmd: str, **kw):
+    return subprocess.run(["ssh", "-i", a.ssh_key, "-o", "ConnectTimeout=30", a.host, cmd],
+                          capture_output=True, text=True, **kw)
+
+
+def _rsync(a, src: list, dst: str, *extra):
+    return subprocess.run(["rsync", "-a", *extra, "-e", f"ssh -i {a.ssh_key}", *src, dst],
+                          capture_output=True, text=True)
+
+
+def gpu_idle(a) -> bool:
+    p = _ssh(a, f"nvidia-smi -i {a.gpu} --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits")
+    try:
+        mem, util = (float(x) for x in p.stdout.strip().split(","))
+    except ValueError:
+        return False
+    return util <= a.idle_util and mem <= a.idle_mem_mb
+
+
+def cmd_remote(a):
+    """Ship extracted IRs to the GPU host in batches, run ``gpu`` there, merge the results back.
+    Polls until ``run`` has finished (``--until-done``), then cleans its remote IR copies."""
+    out = Path(a.out).resolve()
+    rd = a.remote_dir.rstrip("/")
+    py = a.python
+    if not a.no_sync:
+        _ssh(a, f"mkdir -p {rd}/mb/modelblaster {rd}/gpu {rd}/ir {rd}/work")
+        p = _rsync(a, [str(MB_ROOT) + "/"], f"{a.host}:{rd}/mb/modelblaster/", "--delete",
+                   "--exclude=.git", "--exclude=third_party", "--exclude=__pycache__", "--exclude=artifacts",
+                   "--exclude=mb_datasets", "--exclude=*.npz", "--exclude=*.bin")
+        if p.returncode:
+            raise SystemExit(p.stderr)
+        setup = (f"cd {rd}/mb/modelblaster/gpu_eval/harness && export PATH=/usr/local/cuda/bin:$PATH && "
+                 f"PYTHONPATH={rd}/mb {py} ../tools/dump_specs.py {rd}/gpu/specs.json > /dev/null && "
+                 f"nvcc -O3 -arch=sm_{a.arch} -Xcompiler -fPIC -shared -o {rd}/gpu/lib_hand.so "
+                 f"cuda/mb_cuda_kernels.cu")
+        p = _ssh(a, setup)
+        if p.returncode:
+            raise SystemExit(f"remote setup failed: {p.stderr[-2000:]}")
+    while True:
+        todo = []
+        for f in sorted((out / "results").glob("*.json")):
+            r = json.loads(f.read_text())
+            ir = out / "ir" / r["stem"]
+            if "cuda" in r["gates"] or not (ir / "io.npz").exists():
+                continue
+            if a.stems and not re.search(a.stems, r["stem"]):
+                continue
+            todo.append((r, f, ir))
+        running = subprocess.run(["pgrep", "-f", f"sol_upstream_gates.py run .* {out}"],
+                                 capture_output=True).returncode == 0 or \
+            subprocess.run(["pgrep", "-f", f"sol_upstream_gates.py run .*{out.name}"],
+                           capture_output=True).returncode == 0
+        if not todo:
+            if a.until_done and running:
+                time.sleep(60)
+                continue
+            break
+        batch = todo[:a.batch]
+        while not gpu_idle(a):
+            print(f"GPU {a.gpu} busy; waiting", flush=True)
+            time.sleep(120)
+        _ssh(a, f"rm -rf {rd}/ir/* && mkdir -p {rd}/ir")
+        p = _rsync(a, [str(ir) for _, _, ir in batch], f"{a.host}:{rd}/ir/")
+        if p.returncode:
+            print("rsync failed:", p.stderr[-500:], flush=True)
+            time.sleep(60)
+            continue
+        cmd = (f"cd {rd}/mb/modelblaster && export PATH=/usr/local/cuda/bin:$PATH "
+               f"CUDA_VISIBLE_DEVICES={a.gpu} PYTHONPATH={rd}/mb OMP_NUM_THREADS=4 && "
+               f"{py} gpu_eval/tools/sol_upstream_gates.py gpu {rd}/ir {rd}/work {rd}/work/batch.json "
+               f"--specs {rd}/gpu/specs.json --hand {rd}/gpu/lib_hand.so --arch {a.arch} "
+               f"--export-cap-mb {a.export_cap_mb} --gates {a.gates} > {rd}/work/batch.log 2>&1")
+        p = _ssh(a, cmd)
+        got = _ssh(a, f"cat {rd}/work/batch.json")
+        try:
+            res = json.loads(got.stdout or "{}")
+        except json.JSONDecodeError:
+            res = {}
+        _rsync(a, [f"{a.host}:{rd}/work/logs/"], str(out / "logs") + "/")
+        for r, f, ir in batch:
+            gg = res.get(ir.name)
+            if gg is None:
+                gg = {"cuda": {"ok": False, "cls": "remote error", "error": (p.stderr or "")[-300:]}}
+            r["gates"].update(gg)
+            f.write_text(json.dumps(r, indent=1, default=str))
+            if not a.keep:
+                (ir / "io.npz").unlink(missing_ok=True)
+            print(r["stem"], " ".join(f"{k}={v.get('ok')}" for k, v in gg.items()), flush=True)
+    _ssh(a, f"rm -rf {rd}/ir {rd}/work/tmp")
+    return 0
+
+
+# ── summary ───────────────────────────────────────────────────────────────────
 
 def load_results(out: Path) -> list:
     return [json.loads(f.read_text()) for f in sorted((out / "results").glob("*.json"))]
@@ -481,17 +668,23 @@ def cmd_summary(a):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run")
+    r = sub.add_parser("run", help="extract + CPU gates locally (each workload memory-capped)")
     r.add_argument("manifest")
     r.add_argument("out")
     r.add_argument("--stems")
-    r.add_argument("--jobs", type=int, default=4)
+    r.add_argument("--jobs", type=int, default=4, help="workloads at once")
+    r.add_argument("--jobs-large", type=int, default=2, help="of which large (io > --large-mib)")
+    r.add_argument("--large-mib", type=float, default=32)
+    r.add_argument("--mem-large-gb", type=float, default=40)
+    r.add_argument("--mem-small-gb", type=float, default=12)
+    r.add_argument("--mem-reserve-gb", type=float, default=16, help="host memory left to other users")
     r.add_argument("--threads", type=int, default=4)
-    r.add_argument("--gates", default=",".join(GATES))
+    r.add_argument("--gates", default="extract,shapes,cpu",
+                   help="add cuda,export to run the GPU gates here (default: on the GPU host via `remote`)")
     r.add_argument("--quant", default=None, help="extract_graph --quant (default: the manifest's variant)")
     r.add_argument("--timeout", type=int, default=1800)
-    r.add_argument("--ref-device", default="cuda")
-    r.add_argument("--arch", default="75")
+    r.add_argument("--ref-device", default="cpu", help="where the SOL reference run() executes")
+    r.add_argument("--arch", default="89")
     r.add_argument("--specs")
     r.add_argument("--hand")
     r.add_argument("--export-cap-mb", type=int, default=1024)
@@ -499,11 +692,42 @@ def main(argv=None):
     r.add_argument("--reserve-mb", type=int, default=1200, help="free disk to leave untouched")
     r.add_argument("--disk-wait-s", type=int, default=1800)
     r.add_argument("--skip-done", action="store_true")
+    o = sub.add_parser("one")
+    o.add_argument("row")
+    o.add_argument("cfg")
+    gp = sub.add_parser("gpu", help="CUDA walk + multi-slot export over IR_ROOT (on the GPU host)")
+    gp.add_argument("ir_root")
+    gp.add_argument("work")
+    gp.add_argument("out_json")
+    gp.add_argument("--specs", required=True)
+    gp.add_argument("--hand", required=True)
+    gp.add_argument("--arch", default="89")
+    gp.add_argument("--gates", default="cuda,export")
+    gp.add_argument("--timeout", type=int, default=1800)
+    gp.add_argument("--export-cap-mb", type=int, default=1024)
+    gp.add_argument("--reserve-mb", type=int, default=2000)
+    rm = sub.add_parser("remote", help="run `gpu` on an ssh GPU host for the IRs `run` extracted")
+    rm.add_argument("out")
+    rm.add_argument("--host", required=True)
+    rm.add_argument("--ssh-key", required=True)
+    rm.add_argument("--remote-dir", required=True)
+    rm.add_argument("--python", required=True, help="the remote torch python (used, never modified)")
+    rm.add_argument("--gpu", default="2")
+    rm.add_argument("--arch", default="89")
+    rm.add_argument("--gates", default="cuda,export")
+    rm.add_argument("--batch", type=int, default=16)
+    rm.add_argument("--stems")
+    rm.add_argument("--export-cap-mb", type=int, default=1024)
+    rm.add_argument("--idle-util", type=float, default=10)
+    rm.add_argument("--idle-mem-mb", type=float, default=2000)
+    rm.add_argument("--until-done", action="store_true", help="keep polling while `run` is still going")
+    rm.add_argument("--no-sync", action="store_true", help="the remote code / kernels are current")
+    rm.add_argument("--keep", action="store_true", help="keep the local io.npz")
     s = sub.add_parser("summary")
     s.add_argument("out")
     s.add_argument("--md", action="store_true")
     a = ap.parse_args(argv)
-    return cmd_run(a) if a.cmd == "run" else cmd_summary(a)
+    return {"run": cmd_run, "one": cmd_one, "gpu": cmd_gpu, "remote": cmd_remote, "summary": cmd_summary}[a.cmd](a)
 
 
 if __name__ == "__main__":
