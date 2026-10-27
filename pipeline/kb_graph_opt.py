@@ -116,8 +116,8 @@ from . import kb_trace
 from .kb_export import base_slot_id, export_problem
 from .kb_ingest import CudaCache, cache_plan, ingest, verify_ir
 from .kb_plan import export_plan, make_plan, profile_ir
-from .kb_proposals import (ACCEPT_GAIN, _all_specs, _median, best_sources, find_chains, remeasure,
-                           with_fused_specs, write_variant_ir)
+from .kb_proposals import (ACCEPT_GAIN, _all_specs, _median, best_sources, find_chains, is_infra_result,
+                           remeasure, with_fused_specs, write_variant_ir)
 from .kernel_abi import parse_signature
 
 
@@ -967,7 +967,7 @@ def _measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases 
                 # time_problems did not run / write its result (it says why), a timeout, a lost link
                 msg = " ".join(f"{type(e).__name__}: {e}".split())[:1500]
                 times, info["failures"] = None, [{"problem": None, "stage": "time", "error": msg,
-                                                  "infra": is_infra_text(msg) or "time_problems failed" in msg or
+                                                  "infra": is_infra_text(msg) or is_infra_result({"final_error": msg}) or "time_problems failed" in msg or
                                                   isinstance(e, (OSError, subprocess.SubprocessError))}]
             ok = bool(times and len(times) == 2 and times[0] and times[1])
             fails = [] if ok else [dict(f, side=sides.get(str(f.get("problem")))) for f in info.get("failures") or []]
@@ -1014,8 +1014,9 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
     ok = bool(ro.get("final_ok") and rv.get("final_ok"))
     fails = []
     bad = [(side, r) for side, r in (("original", ro), ("variant", rv)) if not r.get("final_ok")]
-    if bad and all(r.get("final_infra") for _, r in bad):
-        # KernelBlaster's final run lost to the GPU / link / staging, not to the composite
+    if bad and all(is_infra_result(r) for _, r in bad):
+        # KernelBlaster's final run lost to the GPU / link / staging, not to the composite (the result's own tag, or an
+        # infra signature in its error when the tag is missing: scp, NoDevice, relay 503 / queue_full)
         ev["kb_errors"] = {side: r.get("final_error") for side, r in bad}
         return _undecided(job, ro, rv, times, ev, doc, "KernelBlaster: infrastructure failure of the final run, "
                           "left undecided: " + "; ".join(f"{side}: {r.get('final_error') or '?'}" for side, r in bad))
@@ -1061,15 +1062,39 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
     return res
 
 
+INFRA_UNRESOLVED = "infra_unresolved"     # hint status: lost to infrastructure after its re-evaluations; not accepted,
+#                                           not rejected, never a candidate again (the candidate filters want "proposed")
+
+
+def infra_retry_budget() -> int:
+    """Automatic re-evaluations of a hint whose decision was lost to infrastructure (``MB_INFRA_RETRY``, default 1: the
+    hint stays ``proposed`` and is decided again in the next round; a second loss makes it ``infra_unresolved``).
+    0 = the old behaviour (undecided every time, no bound)."""
+    try:
+        return max(0, int(os.environ.get("MB_INFRA_RETRY", "1")))
+    except ValueError:
+        return 1
+
+
+def _infra_failures(rec: dict) -> int:
+    return sum(1 for x in rec.get("evidence") or [] if x.get("decision") == "undecided" and x.get("infra"))
+
+
 def _undecided(job: dict, ro: dict, rv: dict, times, ev: dict, doc: dict, why: str) -> dict:
     """Record an infrastructure failure's evidence without a decision on the hint's merit:
     it does not vote, and the hint stays a candidate for a later round."""
     h = job["hint"]
     ev.update(decision="undecided", infra=True, gain=None, applied=job["prov"]["applied"], why=why)
     rec = gh.record_decision(doc, h, ev)
-    res = {"hint": h["id"], "status": "undecided", "hint_status": rec["status"], "infra": True, "why": why,
+    status = "undecided"
+    n, budget = _infra_failures(rec), infra_retry_budget()
+    if budget > 0 and n > budget:                  # re-evaluated ``budget`` time(s) and lost again: stop, no verdict
+        rec["status"] = status = INFRA_UNRESOLVED
+        why += f" [infra_unresolved: {n} infrastructure failures, {budget} re-evaluation(s) allowed]"
+        ev["why"] = why
+    res = {"hint": h["id"], "status": status, "hint_status": rec["status"], "infra": True, "why": why,
            "gain": None, "original_us": ev.get("original_us"), "variant_us": ev.get("variant_us"),
-           "ops": job["names"]}
+           "ops": job["names"], "infra_failures": n}
     _trace_hint(job, ro, rv, times, ev, res)
     return res
 
@@ -1466,7 +1491,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                 rec["ingest"] = prog.once("ingest", lambda: ingest(gs.winners(R), cache, gs.ingest_specs(specs, graphs)))
             if (rq := sf.ingest_requeued(results, cache, specs, r)):      # search fixes: re-queued problems' bests
                 rec["requeue_ingest"] = rq
-            state["sent"] += [it["key"] for it in plan["items"] if it.get("selected")]
+            sf.mark_sent(plan, results, state, r)        # search fixes: sent = measured (lost / infra items stay eligible)
             for x in results:
                 pf = Path(x["_dir"]) / "proposals.json"
                 if pf.exists():
