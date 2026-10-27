@@ -381,10 +381,11 @@ class OpenCLSeeds:
 
 def all_entries(dtype: str = "fp32") -> dict[str, str]:
     """entry -> op for every fp32 (or `_f16`) KernelSpec: the target set of the seeds."""
+    from .cuda_dtypes import op_dtype
     from .reference_kernels import KERNEL_SPECS
     out = {}
     for op, spec in KERNEL_SPECS.items():
-        if any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op.endswith("_f16") != (dtype == "fp16"):
+        if any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op_dtype(op) != dtype:
             continue
         out.setdefault(parse_signature(spec.signature)[0], op)
     return out

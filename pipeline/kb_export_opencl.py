@@ -66,6 +66,9 @@ class OpenCLTarget:
     head_name, tail_name, driver_name = "walker_head.cpp", "walker_tail.cpp", "driver.cpp"
 
     def library(self, hand=None, dtype: str = "fp32"):          # fp16 seeds: OpenCLSeeds.slot_source(<entry>_f16)
+        if dtype == "bf16":
+            raise NotImplementedError("bf16 partitions are CUDA-only (docs/bf16_cuda.md); "
+                                      "OpenCL has no bfloat16 storage type")
         from .opencl_seeds import OpenCLSeeds
         return OpenCLSeeds(Path(hand) if hand else HAND_LIB)
 
