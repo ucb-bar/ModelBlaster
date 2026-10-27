@@ -297,6 +297,49 @@ class ExtractTest(unittest.TestCase):
             self.assertEqual(r["stage"], "built", (kw, str(r.get("log", ""))[-2000:]))
 
 
+# an integer output that is also read inside the graph (SOL's routing: topk indices -> gather)
+TOPK = '''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x):
+        s = torch.sigmoid(x.float())
+        _, idx = torch.topk(s, 3, dim=-1)
+        return idx, torch.gather(s, 1, idx)
+
+
+NativeModel = Model
+
+
+def get_native_inputs():
+    return [torch.randn(4, 16, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16)]
+
+
+def get_inputs():
+    return [get_native_inputs()[0].float()]
+
+
+def get_init_inputs():
+    return []
+'''
+
+
+class IntOutputReadTest(unittest.TestCase):
+    def test_gather_reads_the_indices_as_f32(self):
+        with tempfile.TemporaryDirectory() as d:
+            ir = _extract(Path(d), "native", TOPK)
+            g = json.loads((ir / "graph.json").read_text())
+        out_idx = g["output"]["tensors"][0]
+        self.assertEqual(g["tensors"][out_idx]["dtype"], "i64")
+        for o in g["ops"]:
+            if cuda_dtypes.parse_cast(o["op"]):
+                continue
+            for t in o["inputs"]:     # no kernel reads an i64 tensor through a float pointer
+                self.assertNotIn(g["tensors"][t]["dtype"], ("i64", "i32"), (o["op"], t))
+
+
 class PresetTest(unittest.TestCase):
     def test_single_dtype_problem_dtypes(self):
         from modelblaster.pipeline.kb_export import _problem_dtype
