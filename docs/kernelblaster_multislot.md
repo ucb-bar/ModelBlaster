@@ -13,7 +13,8 @@ KernelBlaster's semantic update pass has its own document
 graph optimiser (unified graph hints, cost-ranked selection, fusion chains, split proposals,
 rounds to a fixpoint) -- is in `docs/graph_optimizer.md`. The OpenCL / Qualcomm Adreno target
 (`kb_export --target opencl`: OpenCL slots, runtime and driver, Level1-3 coverage, fp16) is in
-[opencl_adreno.md](opencl_adreno.md).
+[opencl_adreno.md](opencl_adreno.md). SOL-ExecBench, ported from the original repository at native workload shapes and run
+through this flow, is in [sol_execbench.md](sol_execbench.md).
 
 ## Flow
 
