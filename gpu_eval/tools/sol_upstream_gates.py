@@ -163,9 +163,17 @@ def sol_compare(flat, refs, tol) -> dict:
 
 # ── one workload ──────────────────────────────────────────────────────────────
 
+def native_quant(row: dict) -> str:
+    """The MB storage dtype closest to the problem's own: bf16 if any of its tensors is bfloat16,
+    else fp16 if any is float16, else fp32 (an IR has one float storage dtype)."""
+    dts = set(row.get("dtype_map") or {})
+    return "bf16" if "bfloat16" in dts else "fp16" if "float16" in dts else "fp32"
+
+
 def run_one(row: dict, cfg: dict) -> dict:
     out = Path(cfg["out"])
-    stem, quant = row["stem"], cfg["quant"]
+    stem = row["stem"]
+    quant = native_quant(row) if cfg["quant"] == "native" else cfg["quant"]
     ir = out / "ir" / stem
     rec = {"stem": stem, "set": row["set"], "problem": row["problem"], "pick": row["pick"], "uuid": row["uuid"],
            "variant": row["variant"], "quant": quant, "io_mib": row["io_mib"],
@@ -623,26 +631,39 @@ def load_results(out: Path) -> list:
     return [json.loads(f.read_text()) for f in sorted((out / "results").glob("*.json"))]
 
 
+def _native_of(r: dict) -> str:
+    return native_quant({"dtype_map": {k: k for k in r.get("ref_dtypes") or []}})
+
+
 def sol_fail_class(r: dict) -> str:
     """Why an IR walk that meets MB's bound misses SOL's tolerance."""
     c = r["gates"]["cpu"]
     dev = c.get("sol_ref_cpu_vs_gpu")
+    q = r.get("quant", "fp32")
     if c.get("sol_vs_walk_cpu_ref", {}).get("ok"):
         return "reference device (passes vs the CPU reference run)"
     if dev is not None and not dev.get("ok"):
         return "reference not reproducible at SOL tol (its own CPU vs GPU run fails)"
     if not c.get("port_floor_ok"):
-        return ("precision floor (MB golden misses too: the variant's math vs the "
-                f"{'/'.join(sorted(set(r.get('ref_dtypes', [])))) or 'native'} reference)")
-    if r.get("quant") in ("bf16", "fp16"):
-        return (f"{r['quant']} intermediate storage (MB golden passes: the reference keeps "
-                "intermediates in fp32 that the IR stores in " + r["quant"] + ")")
-    return "walk only (MB golden passes)"
+        return f"precision floor: the {q} golden misses too"
+    if q in ("bf16", "fp16"):
+        return f"{q} intermediate storage (the golden passes; the reference keeps these in fp32)"
+    return "walk only (the golden passes)"
 
 
 def cmd_summary(a):
-    recs = load_results(Path(a.out))
-    sets = sorted({r["set"] for r in recs}, key=lambda s: ("L1", "L2", "Quant", "FlashInfer-Bench").index(s))
+    """Per-set coverage + failure taxonomy over one or more gate dirs. --native keeps, per stem,
+    the record run at the problem's own dtype (bf16 / fp16 / fp32); --by-quant splits the sets."""
+    by = {}
+    for d in a.out:
+        for r in load_results(Path(d)):
+            if a.native and r.get("quant") and r["quant"] != _native_of(r):
+                continue
+            by.setdefault(r["stem"], r)
+    recs = list(by.values())
+    order = ("L1", "L2", "Quant", "FlashInfer-Bench")
+    key = (lambda r: f"{r['set']} {r.get('quant', '?')}") if a.by_quant else (lambda r: r["set"])
+    groups = sorted({key(r) for r in recs}, key=lambda k: (order.index(k.split()[0]), k))
     cols = ["extract", "shapes", "cpu (MB bound)", "cpu (SOL tol)", "golden (SOL tol)", "cuda", "export"]
 
     def val(r, c):
@@ -655,29 +676,31 @@ def cmd_summary(a):
             return g.get("cpu", {}).get("port_floor_ok")
         return g.get(c, {}).get("ok")
     lines = ["| set | workloads | problems | " + " | ".join(cols) + " |", "|---" * (len(cols) + 3) + "|"]
-    for s in sets + ["all"]:
-        rs = [r for r in recs if s == "all" or r["set"] == s]
-        probs = {r["problem"] for r in rs}
+    for grp in groups + ["all"]:
+        rs = [r for r in recs if grp == "all" or key(r) == grp]
         cells = []
         for c in cols:
-            ok = sum(1 for r in rs if val(r, c) is True)
-            pk = len({r["problem"] for r in rs if val(r, c) is True})
-            cells.append(f"{ok} ({pk} p)")
-        lines.append(f"| {s} | {len(rs)} | {len(probs)} | " + " | ".join(cells) + " |")
+            ok = [r for r in rs if val(r, c) is True]
+            cells.append(f"{len(ok)} ({len({r['problem'] for r in ok})})")
+        lines.append(f"| {grp} | {len(rs)} | {len({r['problem'] for r in rs})} | " + " | ".join(cells) + " |")
     tax = {}
     for r in recs:
         for gname, g in r["gates"].items():
             if g.get("ok") is False:
-                k = (gname, g.get("cls") or g.get("why") or "fail")
-                tax.setdefault(k, []).append(r["stem"])
+                cls = g.get("cls") or g.get("why") or (f"{r.get('quant')} golden bound" if gname == "cpu" else "fail")
+                tax.setdefault((gname, cls), []).append(r["stem"])
+            elif g.get("ok") is None and g.get("skipped"):
+                tax.setdefault((gname, "skipped: " + re.sub(r"\d[\d.]*", "N", g["skipped"])[:70]),
+                               []).append(r["stem"])
         c = r["gates"].get("cpu", {})
         if c.get("ok") and c.get("sol_ok") is False:
             tax.setdefault(("cpu", "SOL tolerance: " + sol_fail_class(r)), []).append(r["stem"])
         if r.get("error"):
             tax.setdefault(("worker", r["error"][:80]), []).append(r["stem"])
-    lines += ["", "| gate | class | n | examples |", "|---|---|---|---|"]
+    lines += ["", "| gate | class | workloads | problems | examples |", "|---|---|---|---|---|"]
     for (gname, cls), stems in sorted(tax.items(), key=lambda kv: (kv[0][0], -len(kv[1]))):
-        lines.append(f"| {gname} | {cls} | {len(stems)} | {', '.join(sorted(stems)[:4])} |")
+        probs = sorted({by[s]["set"] + "/" + by[s]["problem"][:3] for s in stems})
+        lines.append(f"| {gname} | {cls} | {len(stems)} | {len(probs)} | {', '.join(probs[:6])} |")
     print("\n".join(lines))
     return 0
 
@@ -698,7 +721,9 @@ def main(argv=None):
     r.add_argument("--threads", type=int, default=4)
     r.add_argument("--gates", default="extract,shapes,cpu",
                    help="add cuda,export to run the GPU gates here (default: on the GPU host via `remote`)")
-    r.add_argument("--quant", default=None, help="extract_graph --quant (default: the manifest's variant)")
+    r.add_argument("--quant", default=None, help="extract_graph --quant: fp32 | fp16 | bf16 | native (per "
+                   "problem: bf16 if it has bfloat16 tensors, else fp16 if float16, else fp32); default: the "
+                   "manifest's variant")
     r.add_argument("--timeout", type=int, default=1800)
     r.add_argument("--ref-device", default="cpu", help="where the SOL reference run() executes")
     r.add_argument("--arch", default="89")
@@ -741,8 +766,9 @@ def main(argv=None):
     rm.add_argument("--no-sync", action="store_true", help="the remote code / kernels are current")
     rm.add_argument("--keep", action="store_true", help="keep the local io.npz")
     s = sub.add_parser("summary")
-    s.add_argument("out")
-    s.add_argument("--md", action="store_true")
+    s.add_argument("out", nargs="+")
+    s.add_argument("--native", action="store_true", help="per stem, only the record at its own dtype")
+    s.add_argument("--by-quant", action="store_true")
     a = ap.parse_args(argv)
     return {"run": cmd_run, "one": cmd_one, "gpu": cmd_gpu, "remote": cmd_remote, "summary": cmd_summary}[a.cmd](a)
 
