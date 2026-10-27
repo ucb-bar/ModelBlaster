@@ -108,7 +108,10 @@ class FusedKernelSpec(KernelSpec):
                     else stage_prefix(i) + p.name for p in ps]
             callee = f"stage_{k}::{e}" if k in sub_sources else e
             calls.append(f"    {callee}({', '.join(args)});")
-        entry, params = parse_signature(self.signature)
+        # the entry is CUDA: `_Float16` / `__bf16` pointers are spelled `__half` / `__nv_bfloat16`,
+        # as the stage kernels it calls (the manifest's slot signature is the same spelling)
+        from .cuda_dtypes import cuda_signature
+        entry, params = parse_signature(cuda_signature(self.signature))
         scratch = ", ".join(f"`{stage_prefix(i)}{o}`" for i, o in enumerate(outs[:-1]))
         plist = ", ".join(f"{p.ctype} {p.name}" for p in params)
         return ("\n".join(includes) + ("\n\n" if includes else "") + "\n\n".join(blocks) +
