@@ -132,12 +132,57 @@ reports neither. `summary --native` keeps native records. The GPU host builds
 flock (`/dev/shm/kernelblaster_gpu_<uuid>.lock`) around each IR's GPU steps
 (`MB_GPU_FLOCK`).
 
+## Validation (2026-10-27)
+
+**SOL-ExecBench**, the 222 native-bf16 workloads with cpu results, before
+(`--quant bf16`, `run/g2_bf16`) and after (`--quant native`); scored with SOL's
+own rule (`sol_ok`) against SOL's reference on the CPU. Classes are the
+failure causes of the bf16 run.
+
+| class (bf16 run) | n | sol_ok bf16 | sol_ok native |
+|---|---|---|---|
+| fp32 output stored bf16 | 28 | 0 | 25 |
+| bf16 storage of values the reference keeps fp32 | 29 | 0 | 28 |
+| integer input corrupted by the bf16 io | 12 | 0 | 11 |
+| fp32 input rounded | 11 | 0 | 11 |
+| unattainable tolerance | 11 | 0 | 10 |
+| reference outlier | 1 | 0 | 1 |
+| passed already | 130 | 129 | 128 |
+| **all** | **222** | **129** | **214** |
+
+The 8 misses: 3 workloads quantise to fp8 inside `run()` (refused, as the fp32
+lowering already refuses them); the 3 group-limited top-k routings return
+`topk(sorted=False)` indices in an order no sorted answer reproduces (the walk
+equals the float64 reference exactly); one tolerance no correctly rounded
+answer meets; one extraction ran out of its 40 GB cap (the native trace holds
+the bf16 trace and its fp32 twin).
+
+GPU gates (firesim2 L40S): hand-CUDA walk 214/222 (bf16: 196), multi-slot
+export with the persistent host 215 of the 216 exported (bf16: 201 of 201,
+21 more skipped by the then 1 GiB data cap); the misses are out-of-memory on the
+shared GPU. The export's end-to-end time (CUDA graph) is unchanged at the
+median (1.00×, geomean 1.07× over 201 workloads); 23 are more than 1.2×
+slower, up to 3.5×: where the reference computes in fp32 the native IR does
+too, with fp32 intermediates and outputs that the bf16 IR stored (wrongly) in
+half the bytes.
+
+**KernelBench** (L1 19, 23, 1; L2 12, 21; fp32 / fp16 / bf16): graph.json is
+byte-identical, data.bin, slots and walker files are identical, the driver
+differs only by the new tables (every entry the old constant); build-check on
+the L40S passes with both trees, one-process and host, at the same times.
+
+A KernelBlaster smoke run on a mixed problem (SOL L2/046, bf16 matmuls and
+gathers with fp32 math and casts; Haiku, 1 rollout × 2 steps plus a fusion
+variant) passed its checks: model 10.2 → 2.2 ms (4.6×).
+
 ## Limitations
 
 - Integer intermediates are exact f32: integer values past 2^24 inside the
   graph are not exact (graph inputs and outputs are).
 - No float64 storage (stored f32), no fp8 / fp4 (refused).
 - An argmax that is a graph output keeps `i64` even if the source asks for `i32`.
+- Extraction holds the native trace and its fp32 twin: more host memory than
+  the single-dtype modes.
 - Casts add kernels (and their memory traffic) where the source changes
   dtype; the torch baseline (`torch_baseline`) still runs a native IR's module
   in fp32.
