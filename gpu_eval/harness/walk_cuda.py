@@ -13,6 +13,9 @@ An fp16 IR (`--quant fp16`, `_f16` ops) runs on fp16 buffers: tensors and
 weights are stored as torch.float16 and the `_f16` kernels (lib built from
 cuda/mb_cuda_kernels_f16.cu) read and write __half; the per-intermediate
 oracle is walk_torch's fp16-storage walk and the bounds are cuda_dtypes'.
+A bf16 IR (`--quant bf16`, `_bf16` ops; lib from cuda/mb_cuda_kernels_bf16.cu)
+runs the same way on torch.bfloat16 buffers; its weights.npz holds float32
+arrays with bf16-exact values, which are narrowed (exactly) on upload.
 
 impl=hand   only hand-written kernels (fails on an op without one)
 impl=seed   only auto-ported single-thread reference kernels (ref2cuda.py)
@@ -34,11 +37,12 @@ import walk_torch
 from mbabi import bind, parse_signature
 from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
 
-_TORCH_DTYPE = {"f16": torch.float16, "f32": torch.float32, "i64": torch.int64}   # i64: argmax/argmin indices
+_TORCH_DTYPE = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32,
+                "i64": torch.int64}   # i64: argmax/argmin indices
 
 
 def _storage(ir: IR, t: str) -> torch.dtype:
-    """Device dtype of IR tensor t (graph.json `dtype`: f16 / f32)."""
+    """Device dtype of IR tensor t (graph.json `dtype`: f16 / bf16 / f32)."""
     return _TORCH_DTYPE.get(ir.graph["tensors"].get(t, {}).get("dtype"), torch.float32)
 
 
@@ -95,7 +99,10 @@ def run(ir: IR, plan, dev="cuda", time_ops=False, feed=None):
 
     def wptr(key):
         if key not in weights:      # as stored: float16 weights for an fp16 IR
-            weights[key] = torch.from_numpy(np.ascontiguousarray(ir.weights[key])).to(dev)
+            w = torch.from_numpy(np.ascontiguousarray(ir.weights[key]))
+            if ir.dtype == cuda_dtypes.BF16 and w.is_floating_point():
+                w = w.to(torch.bfloat16)        # bf16-exact float32 in weights.npz
+            weights[key] = w.to(dev)
         return weights[key].data_ptr()
 
     per_op = []

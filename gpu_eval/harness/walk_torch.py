@@ -7,6 +7,7 @@ walk_cuda.py diffs against.
 An `_f16` op runs its fp32 rule and rounds every output to fp16 (and the
 recurrent state of lstm_seq/gru_seq every step): the fp16 contract is fp16
 storage with fp32 math, so this is the value an exact fp16 kernel stores.
+A `_bf16` op does the same with bfloat16 (docs/bf16_cuda.md).
 
     python walk_torch.py IR_DIR [IR_DIR ...] [--json out.json] [--device cpu]
 """
@@ -27,8 +28,25 @@ def _round_f16(t):
     return t.half().to(t.dtype) if t.is_floating_point() else t
 
 
+def _round_bf16(t):
+    """The bfloat16 value a bf16 kernel stores for an fp32 result (RNE)."""
+    return t.to(torch.bfloat16).to(t.dtype) if t.is_floating_point() else t
+
+
+def _identity(t):
+    return t
+
+
+def _store_rounding(kind: str):
+    """What a kernel of this kind stores for an fp32 result: fp16 / bf16 rounding
+    for `_f16` / `_bf16` kinds, else the value itself."""
+    if kind.endswith("_bf16"):
+        return _round_bf16
+    return _round_f16 if kind.endswith("_f16") else _identity
+
+
 def _state_rounding(op):
-    return _round_f16 if op["op"].endswith("_f16") else (lambda t: t)
+    return _store_rounding(op["op"])
 
 
 def _unary(fn):
@@ -404,8 +422,13 @@ OPS.update({
 
 
 def _rule(kind: str):
-    """An `_f16` kind runs its fp32 rule (walk rounds the outputs)."""
-    return OPS.get(kind) or (OPS.get(kind[:-4]) if kind.endswith("_f16") else None)
+    """An `_f16` / `_bf16` kind runs its fp32 rule (walk rounds the outputs)."""
+    if kind in OPS:
+        return OPS[kind]
+    for sfx in ("_bf16", "_f16"):
+        if kind.endswith(sfx):
+            return OPS.get(kind[:-len(sfx)])
+    return None
 
 
 # ---- Level1-only ops (losses, norms, index ops); semantics as their KernelSpecs
@@ -471,8 +494,9 @@ def walk(ir: IR, dev="cuda", keep_all=False):
         if fn is None:
             raise NotImplementedError(op["op"])
         outs = fn(ir, op, [env[t] for t in op["inputs"]], dev)
-        if op["op"].endswith("_f16"):
-            outs = [_round_f16(v) for v in outs]
+        rnd = _store_rounding(op["op"])
+        if rnd is not _identity:
+            outs = [rnd(v) for v in outs]
         for name, val in zip(op["outputs"], outs):
             env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
 
