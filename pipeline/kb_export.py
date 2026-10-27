@@ -61,6 +61,8 @@ HARNESS = MB_ROOT / "gpu_eval" / "harness"
 DEFAULT_HAND_CU = HARNESS / "cuda" / "mb_cuda_kernels.cu"
 DEFAULT_HAND_CU_F16 = HARNESS / "cuda" / "mb_cuda_kernels_f16.cu"    # generated (f16_kernels.py)
 DEFAULT_HAND_CU_BF16 = HARNESS / "cuda" / "mb_cuda_kernels_bf16.cu"  # generated (f16_kernels.py)
+# the casts of a mixed IR (cast_<src>_to_<dst>), beside the hand kernels
+CAST_CU = "mb_cuda_kernels_cast.cu"
 FORMAT = "mb-kb-problem/1"
 NS_PREFIX = "mbslot_"
 ALIAS_OPS = ("view", "chunk2_c1")
@@ -95,10 +97,17 @@ class _CudaSpelled:
         return cuda_dtypes.cuda_signature(self._spec.signature)
 
 
-def _problem_dtype(kinds: list[str]) -> str:
-    """fp16 / bf16 when every op of the partition is an `_f16` / `_bf16` op, else fp32."""
+def _problem_dtype(kinds: list[str], mixed: bool = False) -> str:
+    """fp16 / bf16 when every op of the partition is an `_f16` / `_bf16` op, else fp32.
+    A mixed IR's partition (``mixed``; --quant native) whose ops have more than one
+    storage dtype is ``mixed``: each slot then carries its own (manifest slot ``dtype``)."""
     dts = {cuda_dtypes.op_dtype(k) for k in kinds}
+    if mixed and len(dts) > 1:
+        return MIXED
     return dts.pop() if len(dts) == 1 else cuda_dtypes.FP32
+
+
+MIXED = "mixed"
 
 
 def _hand_source(hand_cu: Path, dtype: str) -> str:
@@ -112,25 +121,57 @@ def _hand_source(hand_cu: Path, dtype: str) -> str:
 
 
 def _tensor_dtype(ir, t: str) -> str:
-    """Buffer dtype of IR tensor t: a constant's is its weights.npz array's,
-    else graph.json's (f16 / bf16 for an fp16 / bf16 extract)."""
+    """Buffer dtype of IR tensor t: a constant's is its weights.npz array's
+    (a mixed IR names it in ``weight_dtypes``), else graph.json's (f16 / bf16 for
+    an fp16 / bf16 extract; every tensor's own in a mixed IR)."""
     key = ir.graph["tensors"].get(t, {}).get("const")
     if key:
-        return cuda_dtypes.buffer_dtype(ir.weights[key].dtype, ir.dtype)
+        return cuda_dtypes.weight_dtype(ir.graph, key, ir.weights[key].dtype)
     dt = ir.graph["tensors"].get(t, {}).get("dtype")
-    # i64: the index outputs of argmax/argmin (kernel_argmax_dim writes int64_t)
-    return {"f16": "f16", "bf16": "bf16", "i64": "i64"}.get(dt, "f32")
+    # i64: the index outputs of argmax/argmin (kernel_argmax_dim writes int64_t);
+    # i32 / b8 / u8: a mixed IR's integer / bool graph inputs and outputs
+    return {"f16": "f16", "bf16": "bf16", "i64": "i64", "i32": "i32", "b8": "b8", "u8": "u8"}.get(dt, "f32")
 
 
-_NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i64": np.int64}
+_NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i64": np.int64, "b8": np.uint8,
+              "u8": np.uint8}
 
 
 def _buffer_values(arr: np.ndarray, dtype: str) -> np.ndarray:
     """A buffer's reference values as stored on the device (bf16: the 2-byte
-    patterns; the walk's values are bf16-exact, so this is exact)."""
+    patterns; the walk's values are bf16-exact, so this is exact; b8: bool as
+    one byte 0 / 1)."""
     if dtype == "bf16":
         return cuda_dtypes.bf16_bits(arr)
+    if dtype == "b8":
+        arr = np.asarray(arr) != 0
     return arr.astype(_NP_OF_BUF[dtype]).reshape(-1)               # fp16 values are exact
+
+
+class _Libraries:
+    """The hand-kernel libraries a partition draws its slot seeds from: one per
+    storage dtype (fp32 / `_f16` / `_bf16` hand files) plus the casts file for a
+    mixed IR. Every entry name is unique across them (``kernel_relu`` /
+    ``kernel_relu_bf16`` / ``kernel_cast_bf16_to_f32``), so a slot's seed is the
+    closure of its entry in the library that defines it, and the shared head is
+    the union of the used libraries' preprocessor lines. A single-dtype partition
+    uses exactly one library, as before."""
+
+    def __init__(self, hand_cu: Path, dtypes, casts: bool):
+        self.libs = {d: CudaLibrary(_hand_source(hand_cu, d)) for d in dtypes}
+        if casts:
+            self.libs["cast"] = CudaLibrary((Path(hand_cu).with_name(CAST_CU)).read_text())
+
+    def of(self, kind: str) -> CudaLibrary:
+        return self.libs["cast" if cuda_dtypes.parse_cast(kind) else cuda_dtypes.op_dtype(kind)]
+
+    def head_source(self) -> str:
+        if len(self.libs) == 1:
+            return next(iter(self.libs.values())).head_source()
+        lines = []
+        for lib in self.libs.values():
+            lines += [ln for ln in lib.head if ln not in lines]
+        return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------- CUDA source library
@@ -429,9 +470,17 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
 
     # ---- slots + per-op calls
     slots, slot_of, calls, op_recs = {}, {}, [], []
-    dtype = _problem_dtype([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
-    lib = CudaLibrary(_hand_source(hand_cu, dtype)) if tgt is None else \
-        tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
+    kinds = [ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS]
+    dtype = _problem_dtype(kinds, cuda_dtypes.is_mixed(g))
+    casts = any(cuda_dtypes.parse_cast(k) for k in kinds)
+    if tgt is not None:
+        if casts:
+            raise NotImplementedError("per-tensor casts (--quant native, docs/tensor_dtypes.md) are "
+                                      f"CUDA-only; no {target} seeds")
+        lib = libs = tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
+    else:
+        libs = _Libraries(hand_cu, sorted({cuda_dtypes.op_dtype(k) for k in kinds if not cuda_dtypes.parse_cast(k)})
+                          or [cuda_dtypes.FP32 if dtype == MIXED else dtype], casts)
     for i in sel:
         o = ops[i]
         if o["op"] in ALIAS_OPS:
@@ -454,6 +503,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
             elif tgt is not None:
                 src, tag = tgt.seed(lib, entry, spec)
             elif hasattr(spec, "cuda_seed"):           # fused ops: stage kernels back to back
+                lib = libs.of(kind)
                 if sub_sources is not None:
                     subs = sub_sources.get(sid, {})
                 else:
@@ -466,14 +516,18 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 src = spec.cuda_seed(lib, sub_sources=subs)
                 tag = "fused-seed" + (":" + ",".join(sorted(subs)) if subs else "")
             else:
-                src, tag = lib.slot_source(entry), "hand"
+                src, tag = libs.of(kind).slot_source(entry), "hand"
+            sdt = cuda_dtypes.op_dtype(kind)
             slots[sid] = {"id": sid, "op": kind, "ops": [], "op_class": op_class(kind), "entry": entry,
                           "signature": " ".join(spec.signature.split()),
                           "file": f"slots/{sid}{'.cu' if tgt is None else tgt.slot_ext}",
                           "reference_file": f"slots/{sid}.ref.c", "semantics": spec.semantics,
                           **({"variant_of": base_sid} if o.get("slot_variant") else {}),
                           "seed_source": tag, "instances": [], "_src": src,
-                          "_ref": spec.reference_impl}
+                          "_ref": spec.reference_impl,
+                          # the slot's storage dtype and its isolated-op bound (a mixed problem's
+                          # slots differ; a cast slot's is its destination's)
+                          "dtype": sdt, "tolerance": {k: DTYPE_TOL[sdt][k] for k in ("slot_rel", "slot_abs")}}
         if kind not in slots[sid]["ops"]:
             slots[sid]["ops"].append(kind)
             if kind != slots[sid]["op"] and spec.semantics:
@@ -496,7 +550,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 key = f"w:{a.value}"
                 if key not in index:
                     arr = ir.weights[a.value]
-                    add_buf(key, kind="weight", dtype=cuda_dtypes.buffer_dtype(arr.dtype, ir.dtype),
+                    add_buf(key, kind="weight", dtype=cuda_dtypes.weight_dtype(ir.graph, a.value, arr.dtype),
                             numel=int(arr.size), alias=None)
                 args.append(f"({p.ctype})b[{index[key]}]")
             elif a.kind == "null":
@@ -507,6 +561,9 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         slots[sid]["instances"].append({"op_name": o["name"], "op": kind, "index": k, "shape": o.get("shape", {})})
         op_recs.append({"index": k, "name": o["name"], "op": kind, "slot": sid,
                         "inputs": ins, "outputs": outs})
+        if dtype == MIXED:                       # the driver's isolated bound of this op (its dtype's)
+            op_recs[-1]["tolerance"] = {**slots[sid]["tolerance"], **{
+                k: v for k, v in (tolerance or {}).items() if k in ("slot_rel", "slot_abs")}}
 
     # ---- data.bin: reference values of every non-alias tensor, then weights
     blob, off = bytearray(), 0
@@ -542,7 +599,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     head, tail_name, driver_name = ("walker_head.cu", "walker_tail.cu", "driver.cpp") if tgt is None else \
         (tgt.head_name, tgt.tail_name, tgt.driver_name)
     (out / head).write_text(
-        "// Shared preamble for every slot (from the ModelBlaster hand kernels).\n" + lib.head_source()
+        "// Shared preamble for every slot (from the ModelBlaster hand kernels).\n" + libs.head_source()
         if tgt is None else tgt.head_source(lib))
     tail = [
         "// Generated by modelblaster.pipeline.kb_export: one call per op, in IR order.",
@@ -552,7 +609,15 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         f"    for (int i = 0; i < {len(op_recs)}; ++i) mb_run_op(i, b);", "}",
         *([] if tgt is not None else SO_ABI), ""]
     (out / tail_name).write_text("\n".join(tail))
-    tol = {**DTYPE_TOL[dtype], **(tolerance or {})}
+    tol = {**DTYPE_TOL[dtype if dtype != MIXED else _mixed_bound(slots)], **(tolerance or {})}
+    if dtype == MIXED:
+        # per output: its dtype's bound, or a narrower one it was computed through
+        # (an fp32 output of bf16 intermediates carries their rounding)
+        cone = cuda_dtypes.cone_dtypes(g, [b["name"] for b in bufs if b["kind"] == "output"])
+        for b in bufs:
+            if b["kind"] == "output":
+                b["tolerance"] = {k: v for k, v in {**DTYPE_TOL[cone[b["name"]]], **(tolerance or {})}.items()
+                                  if k in ("output_rel", "output_abs")}
     slot_list = list(slots.values())
     (out / driver_name).write_text((_driver_source if tgt is None else tgt.driver_source)(
         out / "data.bin", bufs, op_recs, slot_list, tol))
@@ -583,6 +648,11 @@ SO_ABI = [
     'extern "C" void mb_so_launch(void **b) { launch_gpu_implementation(b); }',
     'extern "C" int mb_so_num_ops() { return mb_num_ops(); }',
 ]
+
+
+def _mixed_bound(slots: dict) -> str:
+    """A mixed problem's manifest-level dtype for its bounds: its narrowest slot dtype."""
+    return cuda_dtypes.narrowest(s["dtype"] for s in slots.values())
 
 
 def _target(name: str):
@@ -619,6 +689,14 @@ def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         arr("B_I64", "int", (int(b["dtype"] == "i64") for b in bufs)),
         arr("B_HALF", "int", (int(b["dtype"] == "f16") for b in bufs)),
         arr("B_BF16", "int", (int(b["dtype"] == "bf16") for b in bufs)),
+        # mixed IRs: i32 / bool / u8 graph inputs and outputs, read as numbers
+        arr("B_I32", "int", (int(b["dtype"] == "i32") for b in bufs)),
+        arr("B_BYTE", "int", (int(b["dtype"] in ("b8", "u8")) for b in bufs)),
+        # bounds per output buffer / per op (a mixed problem's differ by dtype)
+        arr("B_OUT_REL", "double", (repr(float(b.get("tolerance", tol)["output_rel"])) for b in bufs)),
+        arr("B_OUT_ABS", "double", (repr(float(b.get("tolerance", tol)["output_abs"])) for b in bufs)),
+        arr("OP_SLOT_REL", "double", (repr(float(r.get("tolerance", tol)["slot_rel"])) for r in op_recs)),
+        arr("OP_SLOT_ABS", "double", (repr(float(r.get("tolerance", tol).get("slot_abs", 0.0))) for r in op_recs)),
         arr("B_NUMEL", "long", (b["numel"] for b in bufs)),
         arr("B_BASE", "int", (b["alias"]["base"] if b["alias"] else -1 for b in bufs)),
         arr("B_AOFF", "long", (b["alias"]["offset"] if b["alias"] else 0 for b in bufs)),
@@ -732,7 +810,7 @@ static const double OUT_REL = @OUT_REL@, OUT_ABS = @OUT_ABS@, SLOT_REL = @SLOT_R
 enum { K_INPUT, K_CONST, K_WEIGHT, K_INTER, K_OUTPUT };
 
 static void *dev[NB];
-static long esz(int b) { return B_HALF[b] || B_BF16[b] ? 2 : B_I64[b] ? 8 : 4; }   // f16: IEEE binary16; bf16: bfloat16; i64: argmax indices
+static long esz(int b) { return B_HALF[b] || B_BF16[b] ? 2 : B_I64[b] ? 8 : B_BYTE[b] ? 1 : 4; }   // f16: IEEE binary16; bf16: bfloat16; i64: argmax indices; bool / u8: one byte
 
 // wall time per phase, printed as MB_PHASE_MS at the end
 static std::vector<std::pair<const char *, double>> phases;
@@ -761,11 +839,15 @@ static float half_to_float(unsigned short h) {
     else { e = 113; while (!(m & 0x400u)) { m <<= 1; --e; } f = s | (e << 23) | ((m & 0x3ffu) << 13); }
     float x; memcpy(&x, &f, 4); return x;
 }
-// values as float (f16 / bf16 widened; i32 buffers keep their bits, as before). An
-// f32 buffer is used in place (no copy); `tmp` holds a widened copy otherwise.
+// values as float (f16 / bf16 widened; i64, and a mixed IR's i32 / bool / u8 io,
+// converted; other i32 buffers -- gather indices, never checked -- keep their bits,
+// as before). An f32 buffer is used in place (no copy); `tmp` holds a widened copy
+// otherwise.
 static const float *as_float(const unsigned char *p, int b, std::vector<float> &tmp) {
-    if (!B_HALF[b] && !B_BF16[b] && !B_I64[b]) return (const float *)p;
+    if (!B_HALF[b] && !B_BF16[b] && !B_I64[b] && !B_I32[b] && !B_BYTE[b]) return (const float *)p;
     tmp.resize(B_NUMEL[b]);
+    if (B_I32[b]) { for (long i = 0; i < B_NUMEL[b]; ++i) { int32_t q; memcpy(&q, p + 4 * i, 4); tmp[i] = (float)q; } return tmp.data(); }
+    if (B_BYTE[b]) { for (long i = 0; i < B_NUMEL[b]; ++i) tmp[i] = (float)p[i]; return tmp.data(); }
     if (B_HALF[b]) for (long i = 0; i < B_NUMEL[b]; ++i) { unsigned short h; memcpy(&h, p + 2 * i, 2); tmp[i] = half_to_float(h); }
     else if (B_BF16[b]) for (long i = 0; i < B_NUMEL[b]; ++i) {   // bf16 = the top half of an fp32
         unsigned short h; memcpy(&h, p + 2 * i, 2); unsigned f = (unsigned)h << 16; memcpy(&tmp[i], &f, 4); }
@@ -843,7 +925,7 @@ static bool check_outputs(const char *tag) {
         if (B_KIND[b] != K_OUTPUT) continue;
         std::vector<float> tr, ta;
         const float *r = ref_f(b, tr), *a = dev_f(b, ta);
-        double e = max_err(a, r, B_NUMEL[b]), bound = OUT_REL * ref_max_finite(b) + OUT_ABS;
+        double e = max_err(a, r, B_NUMEL[b]), bound = B_OUT_REL[b] * ref_max_finite(b) + B_OUT_ABS[b];
         bool ok = e <= bound;
         all &= ok;
         printf("%s %s max_abs_err=%.6g bound=%.6g ok=%d\n", tag, B_NAME[b], e, bound, (int)ok);
@@ -1148,7 +1230,7 @@ static int mb_eval() {
             const float *r = ref_f(b, tr), *a = dev_f(b, ta);
             double s = std::max(scale, ref_max_finite(b)), ae = max_err(a, r, B_NUMEL[b]), e = ae / std::max(s, 1e-12);
             slot_err[OP_SLOT[i]] = std::max(slot_err[OP_SLOT[i]], e);
-            if (!(ae <= SLOT_REL * s + SLOT_ABS)) slot_bad[OP_SLOT[i]] = 1;   // abs: fp16 subnormals (0 for fp32 / bf16)
+            if (!(ae <= OP_SLOT_REL[i] * s + OP_SLOT_ABS[i])) slot_bad[OP_SLOT[i]] = 1;   // abs: fp16 subnormals (0 for fp32 / bf16)
         }
     }
     for (int s = 0; s < NSLOTS; ++s) {

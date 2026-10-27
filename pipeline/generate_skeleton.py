@@ -1592,7 +1592,13 @@ def _shape_str(op: dict) -> str:
 def refuse_unsupported_quant(ir: dict[str, Any]) -> None:
     """bf16 IRs are CUDA-only (docs/bf16_cuda.md): the host / Zephyr C codegen
     has no `__bf16` path (RISC-V GCC has no bfloat16 arithmetic before
-    Zfbfmin), so refuse rather than emit float code for bf16 buffers."""
+    Zfbfmin), so refuse rather than emit float code for bf16 buffers. So are
+    mixed IRs (--quant native, docs/tensor_dtypes.md)."""
+    if ir.get("quant") == "native":
+        raise SystemExit(
+            f"{ir.get('name', 'IR')}: quant=native (per-tensor dtypes, docs/tensor_dtypes.md) is "
+            "supported on the CUDA path only (gpu_eval walkers, kb_export); the C/RVV codegen "
+            "has one storage dtype per IR. Re-extract with --quant fp32 or fp16 for this target.")
     if ir.get("quant") == "bf16":
         raise SystemExit(
             f"{ir.get('name', 'IR')}: quant=bf16 is supported on the CUDA path only "
