@@ -60,6 +60,7 @@ MB_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = MB_ROOT / "gpu_eval" / "harness"
 DEFAULT_HAND_CU = HARNESS / "cuda" / "mb_cuda_kernels.cu"
 DEFAULT_HAND_CU_F16 = HARNESS / "cuda" / "mb_cuda_kernels_f16.cu"    # generated (f16_kernels.py)
+DEFAULT_HAND_CU_BF16 = HARNESS / "cuda" / "mb_cuda_kernels_bf16.cu"  # generated (f16_kernels.py)
 FORMAT = "mb-kb-problem/1"
 NS_PREFIX = "mbslot_"
 ALIAS_OPS = ("view", "chunk2_c1")
@@ -76,11 +77,12 @@ def _harness():
     return mbir, walk_torch
 
 
-# ---------------------------------------------------------------- storage dtypes (fp32 / fp16)
+# ---------------------------------------------------------------- storage dtypes (fp32 / fp16 / bf16)
 
 class _CudaSpelled:
     """A KernelSpec seen with the CUDA spelling of its signature (`_Float16`
-    -> `__half`, cuda_dtypes.cuda_signature); everything else passes through."""
+    -> `__half`, `__bf16` -> `__nv_bfloat16`, cuda_dtypes.cuda_signature);
+    everything else passes through."""
 
     def __init__(self, spec):
         self._spec = spec
@@ -94,32 +96,41 @@ class _CudaSpelled:
 
 
 def _problem_dtype(kinds: list[str]) -> str:
-    """fp16 when every op of the partition is an `_f16` op, else fp32."""
+    """fp16 / bf16 when every op of the partition is an `_f16` / `_bf16` op, else fp32."""
     dts = {cuda_dtypes.op_dtype(k) for k in kinds}
-    return cuda_dtypes.FP16 if dts == {cuda_dtypes.FP16} else cuda_dtypes.FP32
+    return dts.pop() if len(dts) == 1 else cuda_dtypes.FP32
 
 
 def _hand_source(hand_cu: Path, dtype: str) -> str:
-    """The hand kernels for a dtype: fp16 uses the generated `<stem>_f16.cu`
-    beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu for the default)."""
+    """The hand kernels for a dtype: fp16 / bf16 use the generated `<stem>_f16.cu`
+    / `<stem>_bf16.cu` beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu /
+    _bf16.cu for the default)."""
     hand_cu = Path(hand_cu)
-    if dtype == cuda_dtypes.FP16:
-        hand_cu = hand_cu.with_name(hand_cu.stem + "_f16" + hand_cu.suffix)
+    if dtype in cuda_dtypes.SUFFIX:
+        hand_cu = hand_cu.with_name(hand_cu.stem + cuda_dtypes.SUFFIX[dtype] + hand_cu.suffix)
     return hand_cu.read_text()
 
 
 def _tensor_dtype(ir, t: str) -> str:
     """Buffer dtype of IR tensor t: a constant's is its weights.npz array's,
-    else graph.json's (f16 for an fp16 extract)."""
+    else graph.json's (f16 / bf16 for an fp16 / bf16 extract)."""
     key = ir.graph["tensors"].get(t, {}).get("const")
     if key:
-        return cuda_dtypes.buffer_dtype(ir.weights[key].dtype)
+        return cuda_dtypes.buffer_dtype(ir.weights[key].dtype, ir.dtype)
     dt = ir.graph["tensors"].get(t, {}).get("dtype")
     # i64: the index outputs of argmax/argmin (kernel_argmax_dim writes int64_t)
-    return {"f16": "f16", "i64": "i64"}.get(dt, "f32")
+    return {"f16": "f16", "bf16": "bf16", "i64": "i64"}.get(dt, "f32")
 
 
 _NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i64": np.int64}
+
+
+def _buffer_values(arr: np.ndarray, dtype: str) -> np.ndarray:
+    """A buffer's reference values as stored on the device (bf16: the 2-byte
+    patterns; the walk's values are bf16-exact, so this is exact)."""
+    if dtype == "bf16":
+        return cuda_dtypes.bf16_bits(arr)
+    return arr.astype(_NP_OF_BUF[dtype]).reshape(-1)               # fp16 values are exact
 
 
 # ---------------------------------------------------------------- CUDA source library
@@ -485,7 +496,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 key = f"w:{a.value}"
                 if key not in index:
                     arr = ir.weights[a.value]
-                    add_buf(key, kind="weight", dtype=cuda_dtypes.buffer_dtype(arr.dtype),
+                    add_buf(key, kind="weight", dtype=cuda_dtypes.buffer_dtype(arr.dtype, ir.dtype),
                             numel=int(arr.size), alias=None)
                 args.append(f"({p.ctype})b[{index[key]}]")
             elif a.kind == "null":
@@ -517,7 +528,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         else:
             v = env[b["name"]]
             arr = v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
-        arr = arr.astype(_NP_OF_BUF[b["dtype"]]).reshape(-1)       # fp16 values are exact
+        arr = _buffer_values(arr, b["dtype"])
         assert arr.size == b["numel"], (b["name"], arr.size, b["numel"])
         b["ref"] = put(arr)
 
@@ -607,6 +618,7 @@ def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         arr("B_INT", "int", (int(b["dtype"] in ("i32", "i64")) for b in bufs)),
         arr("B_I64", "int", (int(b["dtype"] == "i64") for b in bufs)),
         arr("B_HALF", "int", (int(b["dtype"] == "f16") for b in bufs)),
+        arr("B_BF16", "int", (int(b["dtype"] == "bf16") for b in bufs)),
         arr("B_NUMEL", "long", (b["numel"] for b in bufs)),
         arr("B_BASE", "int", (b["alias"]["base"] if b["alias"] else -1 for b in bufs)),
         arr("B_AOFF", "long", (b["alias"]["offset"] if b["alias"] else 0 for b in bufs)),
@@ -720,7 +732,7 @@ static const double OUT_REL = @OUT_REL@, OUT_ABS = @OUT_ABS@, SLOT_REL = @SLOT_R
 enum { K_INPUT, K_CONST, K_WEIGHT, K_INTER, K_OUTPUT };
 
 static void *dev[NB];
-static long esz(int b) { return B_HALF[b] ? 2 : B_I64[b] ? 8 : 4; }   // f16: IEEE binary16; i64: argmax indices
+static long esz(int b) { return B_HALF[b] || B_BF16[b] ? 2 : B_I64[b] ? 8 : 4; }   // f16: IEEE binary16; bf16: bfloat16; i64: argmax indices
 
 // wall time per phase, printed as MB_PHASE_MS at the end
 static std::vector<std::pair<const char *, double>> phases;
@@ -749,12 +761,14 @@ static float half_to_float(unsigned short h) {
     else { e = 113; while (!(m & 0x400u)) { m <<= 1; --e; } f = s | (e << 23) | ((m & 0x3ffu) << 13); }
     float x; memcpy(&x, &f, 4); return x;
 }
-// values as float (f16 widened; i32 buffers keep their bits, as before). An
+// values as float (f16 / bf16 widened; i32 buffers keep their bits, as before). An
 // f32 buffer is used in place (no copy); `tmp` holds a widened copy otherwise.
 static const float *as_float(const unsigned char *p, int b, std::vector<float> &tmp) {
-    if (!B_HALF[b] && !B_I64[b]) return (const float *)p;
+    if (!B_HALF[b] && !B_BF16[b] && !B_I64[b]) return (const float *)p;
     tmp.resize(B_NUMEL[b]);
     if (B_HALF[b]) for (long i = 0; i < B_NUMEL[b]; ++i) { unsigned short h; memcpy(&h, p + 2 * i, 2); tmp[i] = half_to_float(h); }
+    else if (B_BF16[b]) for (long i = 0; i < B_NUMEL[b]; ++i) {   // bf16 = the top half of an fp32
+        unsigned short h; memcpy(&h, p + 2 * i, 2); unsigned f = (unsigned)h << 16; memcpy(&tmp[i], &f, 4); }
     else for (long i = 0; i < B_NUMEL[b]; ++i) { int64_t q; memcpy(&q, p + 8 * i, 8); tmp[i] = (float)q; }
     return tmp.data();
 }
@@ -1134,7 +1148,7 @@ static int mb_eval() {
             const float *r = ref_f(b, tr), *a = dev_f(b, ta);
             double s = std::max(scale, ref_max_finite(b)), ae = max_err(a, r, B_NUMEL[b]), e = ae / std::max(s, 1e-12);
             slot_err[OP_SLOT[i]] = std::max(slot_err[OP_SLOT[i]], e);
-            if (!(ae <= SLOT_REL * s + SLOT_ABS)) slot_bad[OP_SLOT[i]] = 1;   // abs: fp16 subnormals
+            if (!(ae <= SLOT_REL * s + SLOT_ABS)) slot_bad[OP_SLOT[i]] = 1;   // abs: fp16 subnormals (0 for fp32 / bf16)
         }
     }
     for (int s = 0; s < NSLOTS; ++s) {
