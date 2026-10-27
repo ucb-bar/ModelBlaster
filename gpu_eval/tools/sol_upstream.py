@@ -577,6 +577,8 @@ def convert(bench: Path, out: Path, sets, variant: str, cap_mb: float, picks, pr
                        "workload_index": i, "uuid": wl["uuid"], "axes": meta["axes"], "scalars": meta["scalars"],
                        "io_mib": round(dict((ix, b) for b, ix in fits)[i] / 2 ** 20, 3),
                        "variant": variant, "dtype_map": {k: VARIANTS[variant].get(k, k) for k in prob["dtypes"]},
+                       "native_quant": ("bf16" if "bfloat16" in prob["dtypes"] else
+                                        "fp16" if "float16" in prob["dtypes"] else "fp32"),
                        "dtype_rewrites": meta["rewrites"], "tolerance": tolerance(wl),
                        "input_types": sorted({v["type"] for v in wl["inputs"].values()})}
                 rows.append(row)
