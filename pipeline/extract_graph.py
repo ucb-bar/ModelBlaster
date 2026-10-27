@@ -3097,6 +3097,13 @@ def extract(
     variants. The golden is recomputed via `model.half()` on
     `input.half()` so we're comparing genuine fp16 numerics, not
     fp32-traced numerics down-cast at the boundary.
+
+    bf16 mode (docs/bf16_cuda.md): extracted exactly like fp32 (same trace,
+    same shapes, fp32 weight folding), then op kinds get a "_bf16" suffix,
+    float tensors dtype "bf16", and every float weight, the inputs and the
+    golden are rounded to bfloat16. numpy has no bfloat16, so the npz arrays
+    are float32 holding bf16-exact values (cuda_dtypes.round_bf16). The
+    golden is the fp32 model on the bf16-rounded inputs, stored as bf16.
     """
     if quant == "int8":
         return extract_int8(
@@ -3106,12 +3113,15 @@ def extract(
             fp16_op_names=fp16_op_names,
             per_channel=per_channel,
         )
-    if quant not in ("fp32", "fp16"):
+    if quant not in ("fp32", "fp16", "bf16"):
         raise NotImplementedError(
-            f"quant={quant!r} not supported (have: fp32, fp16, int8)"
+            f"quant={quant!r} not supported (have: fp32, fp16, bf16, int8)"
         )
+    # bf16: everything below runs as fp32; the bf16 rounding is applied when
+    # the artifacts are written (numpy has no bfloat16)
     weight_dtype = np.float16 if quant == "fp16" else np.float32
-    op_suffix = "_f16" if quant == "fp16" else ""
+    op_suffix = {"fp16": "_f16", "bf16": "_bf16"}.get(quant, "")
+    store_dtype = {"fp16": "f16", "bf16": "bf16"}.get(quant)
     os.makedirs(out_dir, exist_ok=True)
     model = model.eval()
 
@@ -4972,7 +4982,7 @@ def extract(
                 op["op"] = op["op"] + op_suffix
         for tname, tmeta in tensors.items():
             if tmeta.get("dtype") == "f32":
-                tmeta["dtype"] = "f16"
+                tmeta["dtype"] = store_dtype
 
     dispatches = _annotate_dispatches(ops)
     # Build the input IR field. For single-input models the legacy
@@ -5028,6 +5038,17 @@ def extract(
                                for t in sample_inputs]
             torch_dtype = torch.float16
             out = model.float()(*ref_inputs_exec)
+        elif quant == "bf16":
+            # as fp16: the fp32 model on the bf16-rounded inputs (every tensor
+            # input, ints included, round-trips through the bf16 io buffer;
+            # bf16 holds integers exactly only up to 256), stored as bf16
+            ref_inputs_exec = [t.to(torch.bfloat16).to(t.dtype)
+                               if torch.is_tensor(t) else t
+                               for t in sample_inputs]
+            torch_dtype = torch.bfloat16
+            torch.manual_seed(0)
+            with _SortedTopk():
+                out = model.float()(*ref_inputs_exec)
         else:
             ref_inputs_exec = list(sample_inputs)
             ref_model = model
@@ -5052,6 +5073,10 @@ def extract(
         t.detach().cpu().numpy().astype(weight_dtype).reshape(-1)
         for t in ref_inputs_exec
     ])
+    if quant == "bf16":
+        from modelblaster.pipeline.cuda_dtypes import round_bf16
+        flat, flat_input = round_bf16(flat), round_bf16(flat_input)
+        weights = {k: round_bf16(v) if v.dtype.kind == "f" else v for k, v in weights.items()}
 
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
@@ -5088,7 +5113,7 @@ def _cpu_fp32_tensor_creation():
         def inner(*args, **kwargs):
             if kwargs.get("device") is not None:
                 kwargs["device"] = "cpu"
-            if kwargs.get("dtype") == torch.float16:
+            if kwargs.get("dtype") in (torch.float16, torch.bfloat16):
                 kwargs["dtype"] = torch.float32
             return fn(*args, **kwargs)
         return inner
@@ -5472,11 +5497,13 @@ def main() -> None:
                          "--bench-target-mb stays an io ceiling. Overridden by "
                          "--bench-max-elements. Env: BENCH_TARGET_GFLOPS.")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
+    ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "bf16", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
                          "half precision (uses torch.float16 model + "
                          "_Float16 C kernels, validated against half-cast "
-                         "torch golden), int8 = symmetric per-tensor PTQ.")
+                         "torch golden), bf16 = bfloat16 storage with fp32 "
+                         "math (CUDA path only; docs/bf16_cuda.md; shapes as "
+                         "fp32), int8 = symmetric per-tensor PTQ.")
     ap.add_argument("--fp16-ops", default=None,
                     help="comma-separated IR op names to promote to fp16 in an "
                          "int8 extract (mixed precision). Additive to the "

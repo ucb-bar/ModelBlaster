@@ -192,6 +192,18 @@ class MethodTest(unittest.TestCase):
         self.assertEqual((head["mode"], head["torch_best_variant"], head["torch_best_us"]), ("fp16", "graph", 150))
         self.assertEqual(tb.headline_mode({"mode": "fp32"}, "float16"), "fp16")
 
+    def test_bf16_headline(self):
+        """A bf16 IR: torch in bfloat16, one math mode, headline 'bf16'."""
+        raw = self._raw()
+        raw["torch"] = {0: raw["torch"][0]}
+        rows, head = tb.build_rows(raw, {0: (None, _ready(0))}, {"mode": "reduced"}, "bfloat16")
+        t = [r for r in rows if r["side"] == "torch"]
+        self.assertTrue(t and all(r["tf32"] is None and r["label"].endswith(" bf16") for r in t))
+        self.assertEqual((head["mode"], head["torch_best_variant"], head["torch_best_us"]), ("bf16", "graph", 150))
+        self.assertEqual(tb.headline_mode({"mode": "fp32"}, "bfloat16"), "bf16")
+        self.assertEqual([tb.torch_dtype_name({"quant": q}) for q in ("bf16", "fp16", "fp32", "int8")],
+                         ["bfloat16", "float16", "float32", "float32"])
+
     def test_compare_fp16_uses_one_mode(self):
         tmp = Path(tempfile.mkdtemp())
         try:
@@ -357,6 +369,27 @@ class MethodTest(unittest.TestCase):
             rec = tb.build_bundle(ir, tmp / "b", tol={"out_rel": 1e-2, "out_abs": 1e-5})
             self.assertEqual(rec["dtype"], "float16")
             self.assertEqual(rec["inputs"], [{"shape": [2, 3, 12, 12], "dtype": "float16"}])
+            self.assertTrue(rec["cpu_check"]["ok"], rec["cpu_check"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bundle_bf16(self):
+        """A bf16 IR (bf16-exact float32 npz arrays): the bundle runs torch in bfloat16."""
+        import numpy as np
+
+        from modelblaster.pipeline.cuda_dtypes import round_bf16
+
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            ir, _ = self._tiny_ir(tmp)
+            g = json.loads((ir / "graph.json").read_text())
+            (ir / "graph.json").write_text(json.dumps({**g, "quant": "bf16"}))
+            W, io = np.load(ir / "weights.npz"), np.load(ir / "io.npz")
+            np.savez(ir / "weights.npz", **{k: round_bf16(W[k]) if W[k].dtype.kind == "f" else W[k] for k in W.files})
+            np.savez(ir / "io.npz", **{k: round_bf16(io[k]) for k in io.files})
+            rec = tb.build_bundle(ir, tmp / "b", tol={"out_rel": 8e-2, "out_abs": 1e-5})
+            self.assertEqual(rec["dtype"], "bfloat16")
+            self.assertEqual(rec["inputs"], [{"shape": [2, 3, 12, 12], "dtype": "bfloat16"}])
             self.assertTrue(rec["cpu_check"]["ok"], rec["cpu_check"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

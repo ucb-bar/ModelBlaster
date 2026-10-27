@@ -38,8 +38,9 @@ class IR:
 
     @property
     def dtype(self) -> str:
-        """fp16 for an `--quant fp16` extract (every float tensor stored as binary16)."""
-        return cuda_dtypes.FP16 if self.graph.get("quant") == "fp16" else cuda_dtypes.FP32
+        """fp16 / bf16 for an `--quant fp16` / `--quant bf16` extract (every float
+        tensor stored as binary16 / bfloat16), else fp32."""
+        return cuda_dtypes.ir_dtype(self.graph)
 
     def tshape(self, t: str) -> list[int]:
         return self.graph["tensors"][t]["shape"]

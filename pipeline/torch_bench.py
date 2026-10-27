@@ -38,7 +38,7 @@ Variants: ``eager`` (the module under ``torch.inference_mode``), ``graph`` (the
 forward captured once with ``torch.cuda.graph`` on static inputs, replayed),
 ``compile_mna`` (``torch.compile(mode="max-autotune-no-cudagraphs")``),
 ``compile_ro`` (``torch.compile(mode="reduce-overhead")``: inductor + CUDA
-graphs). An fp16 bundle (``recipe.json`` ``dtype``) runs the module in half. cuDNN autotuning on (``cudnn.benchmark``), deterministic off; a
+graphs). An fp16 / bf16 bundle (``recipe.json`` ``dtype``) runs the module in half / bfloat16. cuDNN autotuning on (``cudnn.benchmark``), deterministic off; a
 variant that fails to build or check is reported, not timed.
 """
 from __future__ import annotations
@@ -153,6 +153,8 @@ def load_bundle(root: str):
     model.load_state_dict(sd, strict=True)
     if rec.get("dtype") == "float16":             # an fp16 IR: the module in half, like our fp16 storage
         model = model.half()
+    elif rec.get("dtype") == "bfloat16":          # a bf16 IR: the module in bfloat16
+        model = model.to(torch.bfloat16)
     io = np.load(os.path.join(root, rec["io"]))
     flat, off, tensors = io["input"], 0, []
     for s in rec["inputs"]:

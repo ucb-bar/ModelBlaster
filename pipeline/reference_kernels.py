@@ -11600,26 +11600,23 @@ from modelblaster.pipeline.reference_kernels_ext import ext_specs as _ext_specs 
 KERNEL_SPECS.update(_ext_specs(KernelSpec))
 
 
-def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
-    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec.
-
-    The transformation is purely mechanical: rename kernel_<op> -> kernel_<op>_f16
-    and change every float POINTER (`const float *` / `float *`, in both the
-    signature and the body's pointer locals) to `_Float16 *`. Scalar `float`
-    params (eps, scale, beta, margin) and `float` locals / `(float)` casts stay
-    — loads widen `_Float16`->float and stores narrow float->`_Float16`
-    implicitly, so the math still runs in fp32. Mirrors the hand-written _f16
-    kernels (relu_f16, softmax_f16, ...)."""
+def _make_reduced_variant(spec: "KernelSpec", suffix: str, ctype: str, label: str) -> "KernelSpec":
+    """Synthesize the `<op><suffix>` storage variant of an fp32 KernelSpec:
+    rename kernel_<op> -> kernel_<op><suffix> and change every float POINTER
+    (`const float *` / `float *`, in both the signature and the body's pointer
+    locals) to `ctype *`. Scalar `float` params (eps, scale, beta, margin) and
+    `float` locals / `(float)` casts stay -- loads widen to float and stores
+    narrow from float implicitly, so the math still runs in fp32."""
     import ctypes
 
     def _c(s: str) -> str:
-        s = s.replace("const float *", "const _Float16 *")
-        s = s.replace("float *", "_Float16 *")
-        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}_f16(")
+        s = s.replace("const float *", f"const {ctype} *")
+        s = s.replace("float *", f"{ctype} *")
+        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}{suffix}(")
         return s
 
     _fp = ctypes.POINTER(ctypes.c_float)
-    _hp = ctypes.POINTER(ctypes.c_uint16)  # _Float16 has no ctypes type; use u16
+    _hp = ctypes.POINTER(ctypes.c_uint16)  # 2-byte float types have no ctypes type; use u16
 
     def _argtypes(_orig=spec.argtypes_factory):
         if _orig is None:
@@ -11627,23 +11624,40 @@ def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
         return [_hp if a is _fp else a for a in _orig()]
 
     return KernelSpec(
-        op=spec.op + "_f16",
+        op=spec.op + suffix,
         signature=_c(spec.signature),
-        semantics="(fp16) " + spec.semantics,
+        semantics=f"({label}) " + spec.semantics,
         reference_impl=_c(spec.reference_impl),
         extra_shapes=list(spec.extra_shapes),
         argtypes_factory=(None if spec.argtypes_factory is None else _argtypes),
     )
 
 
-for _op_name in list(KERNEL_SPECS):
-    if _op_name.endswith("_f16") or _op_name.endswith("_s8"):
-        continue
-    if _op_name.startswith("cast_"):
-        continue
+def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec:
+    `_Float16` storage, fp32 math (see _make_reduced_variant). Mirrors the
+    hand-written _f16 kernels (relu_f16, softmax_f16, ...)."""
+    return _make_reduced_variant(spec, "_f16", "_Float16", "fp16")
+
+
+def _make_bf16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the bfloat16 (`_bf16`) counterpart of an fp32 KernelSpec:
+    `__bf16` storage (GCC/Clang's bfloat16; `__nv_bfloat16` in the CUDA
+    spelling, cuda_dtypes.cuda_signature), fp32 math, one rounding per store
+    (docs/bf16_cuda.md). Every `_bf16` spec is derived from the fp32 one --
+    including the ops with hand-written `_f16` specs -- so its signature and
+    argument binding are the fp32 op's."""
+    return _make_reduced_variant(spec, "_bf16", "__bf16", "bf16")
+
+
+_FP32_OPS = [_op_name for _op_name in KERNEL_SPECS
+             if not (_op_name.endswith(("_f16", "_bf16", "_s8")) or _op_name.startswith("cast_"))]
+for _op_name in _FP32_OPS:
     _f16_name = _op_name + "_f16"
     if _f16_name not in KERNEL_SPECS:
         KERNEL_SPECS[_f16_name] = _make_f16_variant(KERNEL_SPECS[_op_name])
+for _op_name in _FP32_OPS:
+    KERNEL_SPECS[_op_name + "_bf16"] = _make_bf16_variant(KERNEL_SPECS[_op_name])
 
 
 def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
