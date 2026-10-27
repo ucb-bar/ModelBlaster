@@ -3254,12 +3254,14 @@ def _native_views(ops, tensors, S, input_names) -> list:
     return R.ops
 
 
-def _native_ops(ops, tensors, S, weight_roles) -> tuple[list, dict]:
+def _native_ops(ops, tensors, S, weight_roles, ints=frozenset()) -> tuple[list, dict]:
     """Second pass: every kernel op gets one float storage dtype. When all of
     its float tensors share bf16 / fp16 it becomes that op's `_bf16` / `_f16`
     kind; otherwise (fp32 tensors, integer-valued operands, a mix) it runs as
     the fp32 op, reading its bf16 / fp16 inputs through exact casts to f32 and
-    writing f32, cast once to each output's dtype. -> (ops, weight key -> dtype)."""
+    writing f32, cast once to each output's dtype. An integer graph output that
+    other ops also read (topk indices fed to a gather) is read through its f32
+    copy, as an integer input is. -> (ops, weight key -> dtype)."""
     from modelblaster.pipeline.cuda_dtypes import SUFFIX, FLOAT_TENSOR
     R = _Retyper(tensors, S)
     wdt = {}
@@ -3267,6 +3269,8 @@ def _native_ops(ops, tensors, S, weight_roles) -> tuple[list, dict]:
         if o["op"] in _ALIAS or o["op"].startswith("cast_"):
             R.ops.append(o)
             continue
+        o["inputs"] = [R.as_dtype(t, "f32") if S.get(t) in _INT_IR and t not in ints else t
+                       for t in o["inputs"]]
         fl = [t for t in o["inputs"] + o["outputs"] if S.get(t) in _FLOAT_IR]
         dts = {S[t] for t in fl}
         st = FLOAT_TENSOR[dts.pop()] if len(dts) == 1 else "fp32"
@@ -5239,7 +5243,7 @@ def extract(
     weight_dtypes: dict = {}
     if native:
         from modelblaster.pipeline.kernel_abi import WEIGHT_ROLES
-        ops[:], weight_dtypes = _native_ops(ops, tensors, S, set(WEIGHT_ROLES.values()))
+        ops[:], weight_dtypes = _native_ops(ops, tensors, S, set(WEIGHT_ROLES.values()), ints)
         for tname, tmeta in tensors.items():
             if tmeta.get("const") and weights[tmeta["const"]].dtype.kind == "f":
                 weight_dtypes[tmeta["const"]] = tmeta["dtype"]
