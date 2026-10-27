@@ -92,13 +92,28 @@ def _load(path: Path, name: str):
 
 
 @contextmanager
-def gpu_lock(out: Path):
-    """One GPU user at a time among our workers."""
+def gpu_lock(out: Path, device: bool = False):
+    """One GPU user at a time among our workers; ``device`` also holds KernelBlaster's
+    lock of the visible GPU (``kb_export.gpu_lock_path``: other agents' runs on it wait,
+    and we wait for theirs). The export gate leaves that one to the driver host, which
+    takes it per request."""
+    from modelblaster.pipeline.kb_export import gpu_lock_path
+    dev = gpu_lock_path("auto") if device else None
     with open(out / ".gpu.lock", "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
+        g = None
         try:
+            if dev:
+                try:
+                    g = open(dev, "a")
+                    fcntl.flock(g, fcntl.LOCK_EX)
+                except OSError:                       # not ours to open: run unlocked, as KB does
+                    g = None
             yield
         finally:
+            if g is not None:
+                fcntl.flock(g, fcntl.LOCK_UN)
+                g.close()
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
@@ -292,7 +307,7 @@ def gpu_gates(ir: Path, g: dict, cfg: dict, gates, out: Path, env: dict, stem: s
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     if "cuda" in gates:
-        with gpu_lock(out):
+        with gpu_lock(out, device=True):
             j = out / "tmp" / f"{stem}.wc.json"
             j.parent.mkdir(parents=True, exist_ok=True)
             cmd = [sys.executable, "walk_cuda.py", str(ir), "--specs", cfg["specs"], "--hand", cfg["hand"],
@@ -372,11 +387,10 @@ def check_shapes(g: dict, ir: Path, bench, ins) -> dict:
 
 
 def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -> dict:
-    import math
+    from modelblaster.pipeline.kb_export import data_bin_bytes
     if not g["ops"]:
         return {"ok": None, "skipped": "no ops (the workload's output is an input: nothing to optimise)"}
-    nbytes = sum(math.prod(t["shape"]) if t["shape"] else 1 for t in g["tensors"].values()) * \
-        (2 if g.get("quant") in ("fp16", "bf16") else 4)
+    nbytes = data_bin_bytes(ir)            # what kb_export writes (aliases excluded, weights included)
     if nbytes > cfg["export_cap_mb"] * 2 ** 20:
         return {"ok": None, "skipped": f"data.bin ~{nbytes / 2 ** 20:.0f} MiB > {cfg['export_cap_mb']} MiB"}
     if not wait_for_disk(out, nbytes / 2 ** 20 + cfg["reserve_mb"], cfg["disk_wait_s"]):
@@ -384,7 +398,7 @@ def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -
     d = out / "tmp" / f"{stem}.kbx"
     shutil.rmtree(d, ignore_errors=True)
     cmd = [sys.executable, "-m", "modelblaster.pipeline.kb_export", str(ir), str(d), "--strategy", "whole",
-           "--build-check", "--runtime", "host", "--arch", str(cfg["arch"])]
+           "--build-check", "--runtime", "host", "--arch", str(cfg["arch"]), "--gpu-lock", "auto"]
     with gpu_lock(out):
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout"], env=env)
@@ -399,10 +413,12 @@ def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -
     r = res[-1]
     bad = {k: v for k, v in (r.get("slots") or {}).items() if not v.get("ok")}
     o = {"ok": bool(r.get("passed")), "stage": r.get("stage"), "e2e_us": r.get("e2e_us"),
-         "n_slots": len(r.get("slots") or {})}
+         "n_slots": len(r.get("slots") or {}), "data_mib": round(nbytes / 2 ** 20, 1)}
     if not o["ok"]:
-        o.update(cls="slot check" if bad else f"stage {r.get('stage')}", failed_slots=list(bad)[:8],
-                 errors=(r.get("errors") or [])[:3])
+        outs = re.findall(r"MB_CHECK output (\S+) max_abs_err=(\S+) bound=(\S+) ok=0", r.get("log") or "")
+        o.update(cls="slot check" if bad else "output check" if outs else f"stage {r.get('stage')}",
+                 failed_slots=list(bad)[:8], errors=(r.get("errors") or [])[:3],
+                 failed_outputs=[{"name": n, "max_abs_err": float(e), "bound": float(b)} for n, e, b in outs[:8]])
     return o
 
 

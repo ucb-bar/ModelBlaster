@@ -233,3 +233,23 @@ def test_fp8_cast_is_refused(tmp_path):
                          str(tmp_path / "fp8.py"), "--out-dir", str(tmp_path / "ir"), "--quant", "fp32"],
                         capture_output=True, text=True, timeout=300, env=env)
     assert cp.returncode != 0 and "no fp8/fp4 storage" in cp.stderr
+
+
+def test_export_gate_sizes_data_bin_exactly(tmp_path):
+    """The export cap is checked against what kb_export writes: a view is an alias (no bytes),
+    a weight is stored (graph.json's tensors alone miss it)."""
+    import numpy as np
+    ir = tmp_path / "ir"
+    ir.mkdir()
+    n = 1 << 20
+    g = {"name": "t", "tensors": {"x": {"shape": [n]}, "v": {"shape": [1024, 1024]}, "y": {"shape": [n]}},
+         "ops": [{"op": "view", "name": "view", "inputs": ["x"], "outputs": ["v"], "shape": {"n": n}},
+                 {"op": "relu", "name": "relu", "inputs": ["v"], "outputs": ["y"], "shape": {"n": n}}],
+         "input": {"tensor": "x"}, "output": {"tensor": "y"}}
+    (ir / "graph.json").write_text(json.dumps(g))
+    np.savez(ir / "weights.npz", w=np.zeros(n // 2, np.float32))
+    from modelblaster.pipeline.kb_export import data_bin_bytes
+    assert data_bin_bytes(ir) == 4 * n + 4 * n + 2 * n            # x, y, the weight; not the view
+    (tmp_path / "logs").mkdir()
+    r = sg.export_gate(ir, g, tmp_path, {"export_cap_mb": 9}, {}, "t")
+    assert r == {"ok": None, "skipped": "data.bin ~10 MiB > 9 MiB"}
