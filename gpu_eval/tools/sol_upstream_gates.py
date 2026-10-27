@@ -12,7 +12,13 @@ Per converted workload (a row of ``manifest.<variant>.json``), in one worker pro
    (``--ref-device``: the CPU by default; SOL runs it on its GPU), with SOL's per-workload tolerance
    (``|out - ref| <= atol + rtol*|ref|`` on >= ``required_matched_ratio`` of the elements, no
    non-finite values, ``max_error_cap``). The MB golden is checked against it the same way: that
-   is the port's floor (the fp32 math against the bf16 reference);
+   is the port's floor (the fp32 math against the bf16 reference). Unless ``--no-hi-ref``, also
+   against a **float64 reference** (the dtype-rewritten reference on the problem's own inputs in
+   float64: ``sol_vs_walk_hi`` / ``sol_ok_hi``), whether SOL's tolerance is attainable at all
+   (``sol_floor_hi`` / ``sol_tol_attainable``: that answer, stored at each output's SOL dtype,
+   against SOL's reference), the inputs a 16-bit io buffer changes (``io_rounding``: ints past
+   bf16's 256, fp32 values) and the fp32 outputs a bf16 / fp16 IR stores at 16 bits
+   (``out_dtype_mismatch``); ``summary`` uses them to say why a walk misses SOL's tolerance;
 4. **cuda**: ``walk_cuda.py --impl hand`` (whole model on the hand kernels, every intermediate
    isolated);
 5. **export**: ``kb_export --strategy whole --build-check --runtime host`` (multi-slot problem in
@@ -153,16 +159,18 @@ def sol_check(out, ref, tol: dict) -> dict:
     if x.shape != y.shape:
         return {"ok": False, "why": f"numel {x.numel()} != {y.numel()}"}
     rn, sn = ~torch.isfinite(y), ~torch.isfinite(x)
+    both = None
     if tol.get("allow_negative_inf"):
         both = (y == float("-inf")) & (x == float("-inf"))
         rn, sn = rn & ~both, sn & ~both
-        keep = ~both
-        x, y = x[keep], y[keep]
     if rn.any() or sn.any():
         return {"ok": False, "why": "non-finite " + ("in reference" if rn.any() else "in output"),
                 "nonfinite_ref": int(rn.sum()), "nonfinite_out": int(sn.sum())}
+    # SOL's all-zero test runs on the whole tensors, before the matching -inf are dropped
     if float(torch.linalg.vector_norm(y)) > 0 and float(torch.linalg.vector_norm(x)) == 0:
         return {"ok": False, "why": "all-zero output"}
+    if both is not None:
+        x, y = x[~both], y[~both]
     if x.numel() == 0:
         return {"ok": True, "max_abs": 0.0, "max_rel": 0.0, "matched_ratio": 1.0}
     err = (x - y).abs()
@@ -201,6 +209,78 @@ def sol_compare(flat, refs, tol) -> dict:
     return {"ok": all(p["ok"] for p in per), "outputs": per,
             "worst_matched_ratio": min(p.get("matched_ratio", 0.0) for p in per),
             "max_abs": max(p.get("max_abs", float("inf")) for p in per)}
+
+
+def _sorted_topk():
+    """topk(sorted=True), as extract_graph computes the golden (the IR's topk sorts)."""
+    import torch
+
+    class SortedTopk(torch.overrides.TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = dict(kwargs or {})
+            if func in (torch.topk, torch.Tensor.topk):
+                if len(args) > 4:
+                    args = tuple(args[:4]) + (True,) + tuple(args[5:])
+                else:
+                    kwargs["sorted"] = True
+            return func(*args, **kwargs)
+    return SortedTopk()
+
+
+def hi_reference(bench, ins):
+    """The problem at high precision on its own inputs: the dtype-rewritten reference (bench.Model)
+    on ``get_inputs()`` with every float tensor in float64 (float32 when the reference refuses it;
+    explicit casts inside run() still apply) -> (list of outputs, dtype name) or (None, error)."""
+    import torch
+    err = None
+    for dt in (torch.float64, torch.float32):
+        try:
+            x = [t.to(dt) if torch.is_tensor(t) and t.is_floating_point() else t for t in ins]
+            torch.manual_seed(0)
+            with torch.no_grad(), _sorted_topk():
+                o = bench.Model().to(dt)(*x)
+            o = [o] if torch.is_tensor(o) else list(o.values()) if isinstance(o, dict) else list(o)
+            return [v if torch.is_tensor(v) else torch.tensor(v) for v in o], str(dt).split(".")[-1]
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {str(e)[:200]}"
+    return None, err
+
+
+def io_rounding(bench, ins, quant: str) -> dict:
+    """Inputs MB's 16-bit io buffer changes (every tensor input, ints included, is stored in it):
+    {name: {dtype, changed, of}} -- ints past 256 (bf16) / 2048 (fp16), fp32 values it cannot hold."""
+    import torch
+    dt = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(quant)
+    out = {}
+    if dt is None:
+        return out
+    for (name, spec), t in zip(bench.SOL_INPUTS.items(), ins):
+        if torch.is_tensor(t) and t.numel():
+            d = t.double()
+            n = int((d.to(dt).double() != d).sum())
+            if n:
+                out[name] = {"dtype": spec["dtype"], "changed": n, "of": t.numel()}
+    return out
+
+
+def hi_gates(bench, ins, flat, refs, tol, quant: str) -> dict:
+    """The walk against the high-precision reference, and whether SOL's tolerance can be met at all
+    by the correctly rounded answer (the hi reference stored at each output's SOL dtype)."""
+    import torch
+    r = {"io_rounding": io_rounding(bench, ins, quant),
+         "out_dtype_mismatch": [n for n, v in bench.SOL_OUTPUTS.items()
+                                if v["dtype"] in ("float32", "float64", "bfloat16", "float16")
+                                and v["dtype"] != {"bf16": "bfloat16", "fp16": "float16"}.get(quant, v["dtype"])]}
+    hi, dt = hi_reference(bench, ins)
+    if hi is None:
+        r["hi_error"] = dt
+        return r
+    r["hi_dtype"] = dt
+    r["sol_vs_walk_hi"] = sol_compare(flat.float(), hi, tol)
+    if len(hi) == len(refs) and all(h.numel() == f.numel() for h, f in zip(hi, refs)):
+        rounded = torch.cat([h.to(f.dtype).float().reshape(-1) for h, f in zip(hi, refs)])
+        r["sol_floor_hi"] = sol_compare(rounded, refs, tol)
+    return r
 
 
 # ── one workload ──────────────────────────────────────────────────────────────
@@ -312,6 +392,10 @@ def run_one(row: dict, cfg: dict) -> dict:
                 cpu["sol_ok"] = bool(cpu["sol_vs_walk"]["ok"])
                 cpu["port_floor_ok"] = bool(cpu["sol_vs_golden"]["ok"])
                 cpu["range_risk"] = range_risk(refs)
+                if cfg.get("hi_ref", True):
+                    cpu.update(hi_gates(bench, ins, flat, refs, tol, quant))
+                    cpu["sol_ok_hi"] = bool(cpu.get("sol_vs_walk_hi", {}).get("ok"))
+                    cpu["sol_tol_attainable"] = cpu.get("sol_floor_hi", {}).get("ok")
                 if not cpu["sol_ok"] and ref_dev != "cpu":
                     # is the reference itself reproducible at SOL's tolerance? (GPU vs CPU run of run())
                     try:
@@ -569,7 +653,7 @@ def cmd_run(a):
            "gates": a.gates.split(","), "timeout": a.timeout, "ref_device": a.ref_device, "arch": a.arch,
            "specs": a.specs, "hand": a.hand, "keep": a.keep, "export_cap_mb": a.export_cap_mb,
            "threads": a.threads, "reserve_mb": a.reserve_mb, "disk_wait_s": a.disk_wait_s,
-           "score_cast": a.score_cast}
+           "score_cast": a.score_cast, "hi_ref": not a.no_hi_ref}
     rows.sort(key=lambda r: r["io_mib"])          # the small ones report first
     big = threading.Semaphore(a.jobs_large)       # at most this many large workloads at once
 
@@ -738,6 +822,19 @@ def sol_fail_class(r: dict) -> str:
     c = r["gates"]["cpu"]
     dev = c.get("sol_ref_cpu_vs_gpu")
     q = r.get("quant", "fp32")
+    io = c.get("io_rounding") or {}
+    if q in ("bf16", "fp16") and r.get("quant") != _native_of(r):
+        return f"not a {q} problem ({'/'.join(r.get('ref_dtypes') or [])} reference)"
+    if any(v["dtype"].startswith(("int", "uint", "bool")) for v in io.values()):
+        return f"integer input changed by the {q} io (indices past its exact range)"
+    if c.get("out_dtype_mismatch"):
+        return f"output dtype: an fp32 output stored as {q}"
+    if io:
+        return f"fp32 input rounded to {q} by the io"
+    if c.get("sol_tol_attainable") is False:
+        return "SOL tolerance unattainable: the correctly rounded float64 answer misses SOL's reference too"
+    if c.get("sol_ok_hi"):
+        return "SOL's reference is the outlier: the walk passes vs the float64 reference"
     if c.get("sol_vs_walk_cpu_ref", {}).get("ok"):
         return "reference device (passes vs the CPU reference run)"
     if dev is not None and not dev.get("ok"):
@@ -762,7 +859,8 @@ def cmd_summary(a):
     order = ("L1", "L2", "Quant", "FlashInfer-Bench")
     key = (lambda r: f"{r['set']} {r.get('quant', '?')}") if a.by_quant else (lambda r: r["set"])
     groups = sorted({key(r) for r in recs}, key=lambda k: (order.index(k.split()[0]), k))
-    cols = ["extract", "shapes", "cpu (MB bound)", "cpu (SOL tol)", "golden (SOL tol)", "cuda", "export"]
+    cols = ["extract", "shapes", "cpu (MB bound)", "cpu (SOL tol)", "cpu (SOL tol, fp64 ref)", "golden (SOL tol)",
+            "SOL tol attainable", "cuda", "export"]
 
     def val(r, c):
         g = r["gates"]
@@ -772,6 +870,10 @@ def cmd_summary(a):
             return g.get("cpu", {}).get("sol_ok")
         if c == "golden (SOL tol)":
             return g.get("cpu", {}).get("port_floor_ok")
+        if c == "cpu (SOL tol, fp64 ref)":
+            return g.get("cpu", {}).get("sol_ok_hi")
+        if c == "SOL tol attainable":
+            return g.get("cpu", {}).get("sol_tol_attainable")
         return g.get(c, {}).get("ok")
     lines = ["| set | workloads | problems | " + " | ".join(cols) + " |", "|---" * (len(cols) + 3) + "|"]
     for grp in groups + ["all"]:
@@ -834,6 +936,8 @@ def main(argv=None):
     r.add_argument("--reserve-mb", type=int, default=1200, help="free disk to leave untouched")
     r.add_argument("--disk-wait-s", type=int, default=1800)
     r.add_argument("--skip-done", action="store_true")
+    r.add_argument("--no-hi-ref", action="store_true",
+                   help="skip the float64 reference (sol_vs_walk_hi / sol_floor_hi; ~2x the io in memory)")
     o = sub.add_parser("one")
     o.add_argument("row")
     o.add_argument("cfg")
