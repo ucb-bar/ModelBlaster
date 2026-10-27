@@ -61,6 +61,7 @@ EXTRACT_CLASSES = [
     (r"masked_select|boolean.mask|bool.mask|mask indexing", "value-dependent: boolean-mask indexing"),
     (r"unique", "value-dependent: unique()"),
     (r"single-argument where|where\(cond\)", "value-dependent: where(cond)"),
+    (r"no fp8/fp4 storage", "in-graph fp8/fp4 quantisation"),
     (r"complex|fft", "complex / FFT"),
     (r"no tensor inputs", "no tensor inputs"),
     (r"does not depend on any input", "output independent of inputs"),
