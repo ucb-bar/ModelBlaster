@@ -355,6 +355,8 @@ def check_shapes(g: dict, ir: Path, bench, ins) -> dict:
     mine = np.concatenate([t.detach().float().reshape(-1).numpy() for t in tens]) if tens else np.zeros(0)
     if g.get("quant") == "fp16":
         mine = mine.astype(np.float16).astype(np.float32)
+    elif g.get("quant") == "bf16":                # --quant bf16 rounds every float input to bfloat16
+        mine = torch.from_numpy(mine).bfloat16().float().numpy()
     r["inputs_equal"] = bool(flat.shape == mine.shape and np.array_equal(flat, mine))
     r["ok"] = r["inputs_match"] and r["outputs_match"] and r["inputs_equal"]
     return r
@@ -495,10 +497,17 @@ def cmd_gpu(a):
     env = dict(os.environ)
     res = {}
     for ir in sorted(d for d in root.iterdir() if (d / "graph.json").exists() and (d / "io.npz").exists()):
-        g = json.loads((ir / "graph.json").read_text())
         t = time.time()
         try:
-            res[ir.name] = gpu_gates(ir, g, cfg, a.gates.split(","), out, env, ir.name)
+            g = json.loads((ir / "graph.json").read_text())
+        except (OSError, ValueError) as e:
+            res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
+            continue
+        # the hand kernels of the IR's storage dtype: lib_hand.so, lib_hand_f16.so, lib_hand_bf16.so
+        q = {"fp16": "_f16", "bf16": "_bf16"}.get(g.get("quant"), "")
+        c = dict(cfg, hand=cfg["hand"].replace(".so", f"{q}.so"))
+        try:
+            res[ir.name] = gpu_gates(ir, g, c, a.gates.split(","), out, env, ir.name)
         except Exception as e:  # noqa: BLE001
             res[ir.name] = {"cuda": {"ok": False, "cls": "error", "error": f"{type(e).__name__}: {e}"}}
         for v in res[ir.name].values():
@@ -544,11 +553,12 @@ def cmd_remote(a):
             raise SystemExit(p.stderr)
         setup = (f"cd {rd}/mb/modelblaster/gpu_eval/harness && export PATH=/usr/local/cuda/bin:$PATH && "
                  f"PYTHONPATH={rd}/mb {py} ../tools/dump_specs.py {rd}/gpu/specs.json > /dev/null && "
-                 f"nvcc -O3 -arch=sm_{a.arch} -Xcompiler -fPIC -shared -o {rd}/gpu/lib_hand.so "
-                 f"cuda/mb_cuda_kernels.cu")
+                 + " && ".join(f"nvcc -O3 -arch=sm_{a.arch} -Xcompiler -fPIC -shared -o {rd}/gpu/lib_hand{q}.so "
+                               f"cuda/mb_cuda_kernels{q}.cu" for q in ("", "_f16", "_bf16")))
         p = _ssh(a, setup)
         if p.returncode:
             raise SystemExit(f"remote setup failed: {p.stderr[-2000:]}")
+    tries: dict = {}
     while True:
         todo = []
         for f in sorted((out / "results").glob("*.json")):
@@ -592,7 +602,10 @@ def cmd_remote(a):
         _rsync(a, [f"{a.host}:{rd}/work/logs/"], str(out / "logs") + "/")
         for r, f, ir in batch:
             gg = res.get(ir.name)
-            if gg is None:
+            if gg is None:                       # the batch died before this IR: retry it once
+                tries[ir.name] = tries.get(ir.name, 0) + 1
+                if tries[ir.name] < 2:
+                    continue
                 gg = {"cuda": {"ok": False, "cls": "remote error", "error": (p.stderr or "")[-300:]}}
             r["gates"].update(gg)
             f.write_text(json.dumps(r, indent=1, default=str))
@@ -620,6 +633,9 @@ def sol_fail_class(r: dict) -> str:
     if not c.get("port_floor_ok"):
         return ("precision floor (MB golden misses too: the variant's math vs the "
                 f"{'/'.join(sorted(set(r.get('ref_dtypes', [])))) or 'native'} reference)")
+    if r.get("quant") in ("bf16", "fp16"):
+        return (f"{r['quant']} intermediate storage (MB golden passes: the reference keeps "
+                "intermediates in fp32 that the IR stores in " + r["quant"] + ")")
     return "walk only (MB golden passes)"
 
 
