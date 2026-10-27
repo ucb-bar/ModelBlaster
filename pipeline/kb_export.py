@@ -23,7 +23,9 @@ helpers from colliding and makes every kernel name carry its slot.
 
 The driver, run with no arguments:
   1. runs the whole partition and checks every output against the reference
-     (err <= rel * max|finite ref| + abs);
+     (err <= rel * max|finite ref| + abs + cond * ref_err, ref_err the fp32
+     reference's own distance from an exact (float64) walk: an output whose
+     value cancels to ~0 is rounding noise in the reference too);
   2. runs every op alone on the reference's inputs and checks its outputs
      (attributes a failure to a slot);
   3. times the partition and every op with CUDA events;
@@ -65,7 +67,16 @@ FORMAT = "mb-kb-problem/1"
 NS_PREFIX = "mbslot_"
 ALIAS_OPS = ("view", "chunk2_c1")
 DEFAULT_TOL = {"output_rel": 1e-3, "output_abs": 1e-5, "slot_rel": 1e-3}
-DTYPE_TOL = {d: {k: t[k] for k in (*DEFAULT_TOL, "slot_abs")} for d, t in cuda_dtypes.TOLERANCE.items()}
+# The partition-output bound also admits OUTPUT_COND times the reference's own
+# error (max |reference - exact|, the exact value from a float64 walk without
+# store rounding): a candidate as far from the exact value as the reference is
+# differs from it by up to twice that. Negligible for a well-conditioned output;
+# it is what an output that cancels to ~0 (the gradient of a key bias through a
+# softmax, sum_k d/dk of a shift-invariant function) needs, where the fp32
+# reference is pure rounding noise of the summands' scale.
+OUTPUT_COND = 2.0
+DTYPE_TOL = {d: {**{k: t[k] for k in (*DEFAULT_TOL, "slot_abs")}, "output_cond": OUTPUT_COND}
+             for d, t in cuda_dtypes.TOLERANCE.items()}
 
 
 def _harness():
@@ -335,11 +346,108 @@ def slot_id_of(op: dict, specs: dict) -> str:
     return f"{sid}__{op['slot_variant']}" if op.get("slot_variant") else sid
 
 
+def exact_values(ir, names: list[str]) -> dict | None:
+    """The exact values of the tensors ``names``: a float64 walk without the
+    fp16 / bf16 store rounding, holding only its live set. None when it fails
+    (a rule that cannot run in float64)."""
+    import torch
+    _, walk_torch = _harness()
+    try:
+        with torch.no_grad():
+            _, ex = walk_torch.walk(ir, dev="cpu", dtype=torch.float64, store_rounding=False, keep=set(names))
+    except Exception:  # noqa: BLE001 -- best effort: no conditioning term
+        return None
+    return {t: ex.get(t) for t in names}
+
+
+def reference_error(env: dict, exact: dict | None, names: list[str]) -> dict[str, float | None]:
+    """max |env[t] - exact[t]| per float tensor in ``names``: how far the walk's
+    reference values (``env``, the fp32 / store-rounded walk) are from the exact
+    math (``exact_values``). None for every name when there are no exact values:
+    the bound then has no conditioning term."""
+    import torch
+    if exact is None:
+        return {t: None for t in names}
+    res = {}
+    for t in names:
+        a, b = env.get(t), exact.get(t)
+        if a is None or b is None or not torch.is_tensor(a) or not a.is_floating_point() \
+                or a.numel() != b.numel():
+            res[t] = 0.0
+            continue
+        a, b = a.detach().double().reshape(-1), b.detach().double().reshape(-1)
+        same = (a == b) | (torch.isnan(a) & torch.isnan(b))
+        fin = torch.isfinite(a) & torch.isfinite(b)
+        d = torch.where(same | ~fin, torch.zeros_like(a), (a - b).abs())
+        res[t] = float(d.max()) if d.numel() else 0.0
+    return res
+
+
+def data_bin_bytes(ir_dir, op_indices: list[int] | None = None) -> int:
+    """data.bin's size for the ops ``op_indices`` (default: all) of the IR at
+    ``ir_dir``, from graph.json and weights.npz's headers (nothing is walked):
+    every non-alias tensor the ops touch at its buffer dtype, every weight
+    array that is not a constant tensor's, 256-byte aligned as written. A
+    weight the ops do not bind is counted too (an upper bound by that much)."""
+    import zipfile
+
+    from numpy.lib import format as npf
+
+    from .graph_hints import unique_names
+    ir_dir = Path(ir_dir)
+    g = unique_names(json.loads((ir_dir / "graph.json").read_text()))
+    storage = cuda_dtypes.ir_dtype(g)
+    ops, tensors = g["ops"], g["tensors"]
+    sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
+    wshape = {}
+    wp = ir_dir / "weights.npz"
+    if wp.exists():
+        with zipfile.ZipFile(wp) as z:
+            for n in z.namelist():
+                with z.open(n) as fh:
+                    v = npf.read_magic(fh)
+                    shape, _, dt = (npf.read_array_header_1_0 if v[0] == 1 else npf.read_array_header_2_0)(fh)
+                wshape[n.removesuffix(".npy")] = (shape, dt)
+    esz = {"f32": 4, "f16": 2, "bf16": 2, "i32": 4, "i64": 8}
+
+    def nbytes(shape, dt):
+        return (-(-(math.prod(shape) * esz[dt]) // 256)) * 256
+
+    alias, touched = set(), []
+    for i in sel:
+        o = ops[i]
+        if o["op"] in ALIAS_OPS:
+            alias.update(o["outputs"])
+        for t in (*o["inputs"], *o["outputs"], *o.get("internal", [])):
+            if t not in touched:
+                touched.append(t)
+    total, consts = 0, set()
+    for t in touched:
+        meta = tensors.get(t)
+        if meta is None or t in alias:
+            continue
+        key = meta.get("const")
+        if key:
+            consts.add(key)
+            shape, dt = wshape.get(key, (meta["shape"], np.dtype(np.float32)))
+            total += nbytes(shape, cuda_dtypes.buffer_dtype(dt, storage))
+        else:
+            dt = {"f16": "f16", "bf16": "bf16", "i64": "i64"}.get(meta.get("dtype"), "f32")
+            if storage in (cuda_dtypes.FP16, cuda_dtypes.BF16) and dt == "f32":
+                dt = "f16" if storage == cuda_dtypes.FP16 else "bf16"
+            total += nbytes(meta["shape"], dt)
+    for k, (shape, dt) in wshape.items():
+        if k not in consts:
+            total += nbytes(shape, cuda_dtypes.buffer_dtype(dt, storage))
+    return total
+
+
 def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name: str | None = None,
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
                    tolerance: dict | None = None, strategy: str = "custom",
-                   sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda") -> Path:
+                   sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda",
+                   conditioning: bool = True) -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
     ``slot_sources`` maps a slot id (or an op kind) to a seed source
@@ -351,7 +459,9 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     ``sub_sources`` is None -- from ``slot_sources`` by the stage's slot id or
     kind, else the hand kernel. ``target="opencl"`` writes OpenCL slots,
     runtime and driver (``kb_export_opencl``); the partition, buffers, ops and
-    data are the same.
+    data are the same. ``conditioning`` adds each output's reference error
+    (``reference_error``; a second, float64 walk, ``exact_values``) to its
+    bound; off, the term is 0.
     """
     import torch
 
@@ -368,12 +478,11 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     g = unique_names(ir.graph)
     ops = g["ops"]
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
+    if not sel:
+        raise ValueError(f"{ir_dir}: no ops to export (the graph has {len(ops)}; its output may be an input)")
     sel_set = set(sel)
     tensors = g["tensors"]
     specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
-
-    with torch.no_grad():
-        _, env = walk_torch.walk(ir, dev="cpu")
 
     # fused ops keep their internal tensor (A's output) as a scratch buffer
     produced = [t for i in sel for t in ops[i]["outputs"] + ops[i].get("internal", [])]
@@ -381,6 +490,12 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     consumed_outside = {t for i, o in enumerate(ops) if i not in sel_set for t in o["inputs"]}
     graph_outs = set(ir.output_names())
     outputs = [t for t in produced if t in consumed_outside or t in graph_outs]
+
+    # the exact outputs first (the float64 walk's live set and the fp32 walk's
+    # full env are never held together), then the reference walk
+    exact = exact_values(ir, outputs) if conditioning else None
+    with torch.no_grad():
+        _, env = walk_torch.walk(ir, dev="cpu")
     boundary = []
     for i in sel:
         for t in ops[i]["inputs"]:
@@ -508,37 +623,53 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         op_recs.append({"index": k, "name": o["name"], "op": kind, "slot": sid,
                         "inputs": ins, "outputs": outs})
 
-    # ---- data.bin: reference values of every non-alias tensor, then weights
-    blob, off = bytearray(), 0
+    # ---- data.bin: reference values of every non-alias tensor, then weights,
+    # streamed to the file (a partition's data can be many GB: no copy of it
+    # is held, only the walk's values and one buffer at a time)
+    out.mkdir(parents=True, exist_ok=True)
+    sha = hashlib.sha1()
+    with open(out / "data.bin", "wb") as fh:
+        pos = 0
 
-    def put(arr: np.ndarray) -> list[int]:
-        nonlocal off
-        pad = (-len(blob)) % 256
-        blob.extend(b"\0" * pad)
-        start = len(blob)
-        blob.extend(np.ascontiguousarray(arr).tobytes())
-        return [start, len(blob) - start]
+        def put(arr: np.ndarray) -> list[int]:
+            nonlocal pos
+            pad = b"\0" * ((-pos) % 256)
+            fh.write(pad)
+            sha.update(pad)
+            start = pos + len(pad)
+            mv = memoryview(np.ascontiguousarray(arr)).cast("B")
+            fh.write(mv)
+            sha.update(mv)
+            pos = start + mv.nbytes
+            return [start, mv.nbytes]
 
+        for b in bufs:
+            if b["alias"] is not None:
+                b["ref"] = None
+                continue
+            if b["kind"] == "weight":
+                arr = ir.weights[b["name"][2:]]
+            else:
+                v = env[b["name"]]
+                arr = v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
+            arr = _buffer_values(arr, b["dtype"])
+            assert arr.size == b["numel"], (b["name"], arr.size, b["numel"])
+            b["ref"] = put(arr)
+
+    # ---- the outputs' reference error (their bound's conditioning term)
+    env = {t: env[t] for t in outputs}                # the rest is in data.bin now
+    rerr = reference_error(env, exact, outputs) if conditioning else {}
+    del exact
     for b in bufs:
-        if b["alias"] is not None:
-            b["ref"] = None
-            continue
-        if b["kind"] == "weight":
-            arr = ir.weights[b["name"][2:]]
-        else:
-            v = env[b["name"]]
-            arr = v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
-        arr = _buffer_values(arr, b["dtype"])
-        assert arr.size == b["numel"], (b["name"], arr.size, b["numel"])
-        b["ref"] = put(arr)
+        if b["kind"] == "output":
+            b["ref_err"] = rerr.get(b["name"])
+    del env
 
     # ---- write
-    out.mkdir(parents=True, exist_ok=True)
     (out / "slots").mkdir(exist_ok=True)
     for s in slots.values():
         (out / s["file"]).write_text(s.pop("_src"))
         (out / s["reference_file"]).write_text(s.pop("_ref"))
-    (out / "data.bin").write_bytes(bytes(blob))
     head, tail_name, driver_name = ("walker_head.cu", "walker_tail.cu", "driver.cpp") if tgt is None else \
         (tgt.head_name, tgt.tail_name, tgt.driver_name)
     (out / head).write_text(
@@ -566,7 +697,7 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         "assembly": {"head": head, "tail": tail_name,
                      "namespace_prefix": NS_PREFIX, "order": [s["id"] for s in slot_list]},
         "driver": driver_name, "data": "data.bin",
-        "data_sha1": hashlib.sha1(bytes(blob)).hexdigest(),
+        "data_sha1": sha.hexdigest(),
         "slots": slot_list, "ops": op_recs, "buffers": bufs,
         "inputs": [index[t] for t in boundary], "outputs": [index[t] for t in outputs],
     }
@@ -596,6 +727,11 @@ def _target(name: str):
 
 # ---------------------------------------------------------------- driver
 
+def output_cond_term(b: dict, tol: dict) -> str:
+    """A buffer's conditioning term of the output bound (a C double literal)."""
+    return repr(float(tol.get("output_cond", 0.0)) * float(b.get("ref_err") or 0.0))
+
+
 def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
     slot_ix = {s["id"]: k for k, s in enumerate(slots)}
 
@@ -623,6 +759,7 @@ def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         arr("B_BASE", "int", (b["alias"]["base"] if b["alias"] else -1 for b in bufs)),
         arr("B_AOFF", "long", (b["alias"]["offset"] if b["alias"] else 0 for b in bufs)),
         arr("B_REF", "long", (b["ref"][0] if b["ref"] else -1 for b in bufs)),
+        arr("B_COND", "double", (output_cond_term(b, tol) for b in bufs)),
         arr("OP_IN_OFS", "int", in_ofs), arr("OP_IN", "int", op_in),
         arr("OP_OUT_OFS", "int", out_ofs), arr("OP_OUT", "int", op_out),
         arr("OP_SLOT", "int", (slot_ix[r["slot"]] for r in op_recs)),
@@ -843,7 +980,7 @@ static bool check_outputs(const char *tag) {
         if (B_KIND[b] != K_OUTPUT) continue;
         std::vector<float> tr, ta;
         const float *r = ref_f(b, tr), *a = dev_f(b, ta);
-        double e = max_err(a, r, B_NUMEL[b]), bound = OUT_REL * ref_max_finite(b) + OUT_ABS;
+        double e = max_err(a, r, B_NUMEL[b]), bound = OUT_REL * ref_max_finite(b) + OUT_ABS + B_COND[b];
         bool ok = e <= bound;
         all &= ok;
         printf("%s %s max_abs_err=%.6g bound=%.6g ok=%d\n", tag, B_NAME[b], e, bound, (int)ok);
@@ -1582,20 +1719,56 @@ def run_built(exe, timeout: int = 1800, env: dict | None = None) -> dict:
 
 def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | None = None,
                   work: Path | None = None, nvcc: str = "nvcc", timeout: int = 1800, runs: int = 1,
-                  env: dict | None = None, graph: bool = False, runtime: str = "process") -> dict:
+                  env: dict | None = None, graph: bool = False, runtime: str = "process",
+                  gpu_lock: str | None = None) -> dict:
     """Assemble + nvcc-build + run the problem outside KernelBlaster.
 
     ``runtime="host"`` builds the persistent host and the kernels' shared
     object and evaluates them in one host request (CUDA graph on, as the host
-    always builds with the per-thread default stream); ``runs`` requests."""
+    always builds with the per-thread default stream); ``runs`` requests.
+    ``gpu_lock`` (host runtime): a lock file the host flocks for each request
+    (``gpu_lock_path``: KernelBlaster's per-GPU lock), so the checks and
+    timing do not overlap another user's on that GPU."""
     if runtime == "host":
         return _build_and_run_host(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
-                                   timeout=timeout, runs=runs, env=env)
+                                   timeout=timeout, runs=runs, env=env, gpu_lock=gpu_lock)
     return _build_and_run_process(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
                                   timeout=timeout, runs=runs, env=env, graph=graph)
 
 
-def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs, env) -> dict:
+def gpu_lock_path(spec: str | None = "auto") -> str | None:
+    """The lock file of the GPU this process uses, as KernelBlaster names it
+    (``$KERNELBLASTER_GPU_LOCK_DIR``, default /dev/shm, ``/kernelblaster_gpu_<uuid>.lock``).
+    ``spec``: "auto" (the first CUDA_VISIBLE_DEVICES entry, default 0, its
+    uuid from nvidia-smi), "none" / None, or a path. None when locking is off
+    (``KERNELBLASTER_GPU_FLOCK=0``) or the GPU cannot be named."""
+    import os
+
+    if spec in (None, "", "none"):
+        return None
+    if spec != "auto":
+        return spec
+    if os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() in ("0", "false", "no", "off"):
+        return None
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    dev = "0" if vis is None else vis.split(",")[0].strip()     # set but empty: no GPU
+    if not dev or dev.startswith("-"):
+        return None
+    ident = dev
+    if not dev.startswith(("GPU-", "MIG-")):
+        try:
+            cp = subprocess.run(["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader", "-i", dev],
+                                capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        ident = cp.stdout.strip().splitlines()[0].strip() if cp.returncode == 0 and cp.stdout.strip() else ""
+        if not ident:
+            return None
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ident)
+    return f"{os.getenv('KERNELBLASTER_GPU_LOCK_DIR', '/dev/shm')}/kernelblaster_gpu_{safe}.lock"
+
+
+def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs, env, gpu_lock=None) -> dict:
     problem_dir = Path(problem_dir)
     work = Path(work or problem_dir / "build")
     host, log = build_host(problem_dir, arch=arch, work=work, nvcc=nvcc, timeout=timeout)
@@ -1607,7 +1780,7 @@ def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs
         return {"passed": None, "stage": "built", "exe": str(host), "so": str(so)}
     h = DriverHost(host, timeout=timeout)
     try:
-        rs = [h.evaluate(so, env={"MB_GRAPH": "1", **(env or {})}) for _ in range(runs)]
+        rs = [h.evaluate(so, env={"MB_GRAPH": "1", **(env or {})}, lock=gpu_lock) for _ in range(runs)]
     finally:
         h.close()
     ok = sorted((r for r in rs if r["passed"] and r["partition_us"]), key=lambda r: r["partition_us"])
@@ -1756,7 +1929,9 @@ class DriverHost:
                 self.ready_line = line.strip()
                 return
 
-    def evaluate(self, so, ref=None, env: dict | None = None, timeout: int | None = None) -> dict:
+    def evaluate(self, so, ref=None, env: dict | None = None, timeout: int | None = None,
+                 lock: str | None = None, lock_wait: float = 3600) -> dict:
+        """One request; ``lock``: a file the host flocks around it (waiting up to ``lock_wait`` s)."""
         import time
         import uuid
 
@@ -1764,6 +1939,7 @@ class DriverHost:
             self.start()
         nonce = uuid.uuid4().hex[:12]
         fields = ["EVAL", nonce, f"so={so}"] + ([f"ref={ref}"] if ref else []) + \
+                 ([f"lock={lock}", f"lock_wait={int(lock_wait)}"] if lock else []) + \
                  [f"{k}={v}" for k, v in (env or {}).items()]
         t0 = time.time()
         try:
@@ -1771,7 +1947,8 @@ class DriverHost:
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
             pass                                           # the read below sees the EOF
-        out, deadline, done = [], t0 + (timeout or self.timeout), None
+        # the lock wait does not count against the run (as KernelBlaster's runtime_host)
+        out, deadline, done = [], t0 + (timeout or self.timeout) + (lock_wait if lock else 0), None
         while True:
             line = self._readline(deadline)
             if not line:                                   # EOF (crash) or timeout
@@ -1841,6 +2018,11 @@ def main():
                     help="with --build-check: one-process driver, or the persistent host + kernels .so")
     ap.add_argument("--arch", default="75")
     ap.add_argument("--target", default="cuda", choices=["cuda", "opencl"])
+    ap.add_argument("--gpu-lock", default="none",
+                    help="with --build-check --runtime host: auto (KernelBlaster's lock of the visible GPU), "
+                         "a lock file, or none")
+    ap.add_argument("--no-conditioning", action="store_true",
+                    help="no reference-error term in the output bounds (skips the float64 walk)")
     a = ap.parse_args()
     if a.plan:
         from .kb_ingest import CudaCache
@@ -1870,14 +2052,15 @@ def main():
         parts = [("", None)]
     for sub, idx in parts:
         d = export_problem(ir_dir, Path(a.out_dir) / sub if sub else a.out_dir, op_indices=idx,
-                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", target=a.target)
+                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", target=a.target,
+                           conditioning=not a.no_conditioning)
         line = {"problem": str(d)}
         if a.build_check:
             if a.target == "opencl":
                 from .kb_export_opencl import build_and_run as build_and_run_cl
                 r = build_and_run_cl(d)
             else:
-                r = build_and_run(d, arch=a.arch, runtime=a.runtime)
+                r = build_and_run(d, arch=a.arch, runtime=a.runtime, gpu_lock=gpu_lock_path(a.gpu_lock))
             line.update({k: r.get(k) for k in ("passed", "stage", "partition_us", "slot_us", "slots", "errors",
                                                *(("e2e_us", "e2e_basis", "graph_skip") if a.runtime == "host" else ()))})
             if not r.get("passed"):
