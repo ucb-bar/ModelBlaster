@@ -168,6 +168,36 @@ class Bf16ChunkTest(unittest.TestCase):
         self.assertEqual(cd.round_bf16(np.ones((3, 4), np.float32)).shape, (3, 4))
 
 
+FAKE_HOST = """#!/usr/bin/env python3
+import sys, time
+print("MB_HOST_READY abi=1 nb=0 nops=0 nslots=0 init_ms=0", flush=True)
+for line in sys.stdin:
+    f = line.rstrip("\\n").split("\\t")
+    if f[0] != "EVAL":
+        break
+    time.sleep(1.5 if any(x.startswith("lock=") for x in f) else 0)    # 'waiting for the GPU lock'
+    print("passed", flush=True)
+    print(f"MB_HOST_DONE {f[1]} rc=0 poisoned=0 recycle=0", flush=True)
+"""
+
+
+class DriverHostLockTest(unittest.TestCase):
+    def test_lock_wait_not_counted_against_the_run(self):
+        """A request queued behind another user's lock gets its run timeout after the lock wait
+        (as KernelBlaster's runtime_host): timeout 1 s, 1.5 s in the lock, still answered."""
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "host"
+            exe.write_text(FAKE_HOST.replace("/usr/bin/env python3", sys.executable))
+            exe.chmod(0o755)
+            h = kb_export.DriverHost(exe, timeout=1)
+            try:
+                r = h.evaluate("x.so", lock=str(Path(d) / "gpu.lock"), lock_wait=30)
+                self.assertIsNone(r["host_crash"], r)
+                self.assertTrue(r["passed"])
+            finally:
+                h.close()
+
+
 class GpuLockPathTest(unittest.TestCase):
     def test_specs(self):
         self.assertIsNone(kb_export.gpu_lock_path("none"))
