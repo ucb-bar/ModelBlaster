@@ -105,23 +105,41 @@ def buffer_dtype(np_dtype, storage: str = FP32) -> str:
     return "f16" if size == 2 else "f32"
 
 
+_BF16_CHUNK = 1 << 24          # elements per step: bounded temporaries for multi-GB arrays
+
+
+def _bf16_hi(u):
+    """High halves (uint32, still shifted) of the RNE bf16 roundings of float32 bit patterns
+    ``u`` (uint32; nan quiet). uint32 arithmetic: only nan patterns can wrap, and those are
+    replaced."""
+    import numpy as np
+    r = (u + np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1))) & np.uint32(0xFFFF0000)
+    nan = (u & np.uint32(0x7FFFFFFF)) > np.uint32(0x7F800000)
+    return np.where(nan, (u | np.uint32(0x400000)) & np.uint32(0xFFFF0000), r)
+
+
 def round_bf16(a):
     """float32 array of the bfloat16 values nearest to ``a`` (round-to-nearest-
     even; inf / nan kept, nan quiet). numpy only; ``a`` is any float array."""
     import numpy as np
-    x = np.ascontiguousarray(a, dtype=np.float32)
-    u = x.view(np.uint32).astype(np.uint64)
-    r = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
-    nan = np.isnan(x)
-    out = np.where(nan, (u | 0x400000) & 0xFFFF0000, r).astype(np.uint32)
+    x = np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+    out = np.empty(x.size, np.uint32)
+    u = x.view(np.uint32)
+    for i in range(0, x.size, _BF16_CHUNK):
+        out[i:i + _BF16_CHUNK] = _bf16_hi(u[i:i + _BF16_CHUNK])
     return out.view(np.float32).reshape(np.shape(a))
 
 
 def bf16_bits(a):
     """uint16 bit patterns of the bf16 values nearest to ``a`` (the 2-byte
-    storage a `__nv_bfloat16` buffer holds)."""
+    storage a `__nv_bfloat16` buffer holds), in chunks: no full-size temporary."""
     import numpy as np
-    return (round_bf16(a).reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
+    x = np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+    out = np.empty(x.size, np.uint16)
+    u = x.view(np.uint32)
+    for i in range(0, x.size, _BF16_CHUNK):
+        out[i:i + _BF16_CHUNK] = _bf16_hi(u[i:i + _BF16_CHUNK]) >> np.uint32(16)
+    return out
 
 
 def bf16_exact(a) -> bool:
