@@ -1,4 +1,5 @@
-"""kb_export: data.bin size, streamed data.bin, the outputs' conditioning term, GPU lock path.
+"""kb_export: data.bin size, streamed data.bin, the outputs' conditioning term, GPU lock path,
+chunked bf16 narrowing.
 
 CPU only (extract + export, no build): the reference-error term of an output
 that cancels to ~0, data_bin_bytes against the file written, the float64 /
@@ -138,6 +139,33 @@ class EmptyPartitionTest(unittest.TestCase):
             np.savez(d / "ir" / "io.npz", input=np.zeros(4, np.float32), output=np.zeros(4, np.float32))
             with self.assertRaisesRegex(ValueError, "no ops to export"):
                 kb_export.export_problem(d / "ir", d / "prob")
+
+
+class Bf16ChunkTest(unittest.TestCase):
+    """round_bf16 / bf16_bits in bounded chunks (uint32, no uint64 copies of a multi-GB
+    array): the same bits across chunk edges, torch's RNE on finite values, quiet nans."""
+
+    def test_chunks_and_specials(self):
+        import numpy as np
+        from modelblaster.pipeline import cuda_dtypes as cd
+        rng = np.random.default_rng(1)
+        u = np.concatenate([rng.integers(0, 2 ** 32, 10007, dtype=np.uint64).astype(np.uint32),
+                            np.array([0, 0x80000000, 0x7F800000, 0xFF800000, 0x7F7FFFFF, 0xFF7FFFFF,
+                                      0x7F800001, 0xFFFFFFFF, 0x3F808000, 0x3F818000], np.uint32)])
+        x = u.view(np.float32)
+        whole = cd.bf16_bits(x)
+        with mock.patch.object(cd, "_BF16_CHUNK", 97):
+            self.assertTrue(np.array_equal(cd.bf16_bits(x), whole))
+            self.assertTrue(np.array_equal(cd.round_bf16(x).view(np.uint32) >> 16, whole.astype(np.uint32)))
+        fin = np.isfinite(x)
+        if _have_torch():
+            import torch
+            ref = torch.from_numpy(x[fin]).bfloat16().view(torch.int16).numpy().view(np.uint16)
+            self.assertTrue(np.array_equal(whole[fin], ref))
+        nan = np.isnan(x)
+        self.assertTrue(np.all(np.isnan(cd.round_bf16(x)[nan])))
+        self.assertTrue(np.all(whole[nan] & 0x40))                       # quiet
+        self.assertEqual(cd.round_bf16(np.ones((3, 4), np.float32)).shape, (3, 4))
 
 
 class GpuLockPathTest(unittest.TestCase):
