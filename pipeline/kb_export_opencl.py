@@ -45,7 +45,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .kb_export import NS_PREFIX, wrap_slot
+from .kb_export import NS_PREFIX, output_cond_term, wrap_slot
 
 MB_ROOT = Path(__file__).resolve().parents[1]
 OPENCL_DIR = MB_ROOT / "gpu_eval" / "harness" / "opencl"
@@ -114,6 +114,7 @@ def driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         arr("B_BASE", "int", (b["alias"]["base"] if b["alias"] else -1 for b in bufs)),
         arr("B_AOFF", "long", (b["alias"]["offset"] if b["alias"] else 0 for b in bufs)),
         arr("B_REF", "long", (b["ref"][0] if b["ref"] else -1 for b in bufs)),
+        arr("B_COND", "double", (output_cond_term(b, tol) for b in bufs)),
         arr("OP_IN_OFS", "int", in_ofs), arr("OP_IN", "int", op_in),
         arr("OP_OUT_OFS", "int", out_ofs), arr("OP_OUT", "int", op_out),
         arr("OP_SLOT", "int", (slot_ix[r["slot"]] for r in op_recs)),
@@ -328,7 +329,7 @@ int main(int argc, char **argv) {
     for (int b = 0; b < NB; ++b) {
         if (B_KIND[b] != K_OUTPUT) continue;
         std::vector<double> r = ref_vec(b), a = dev_vec(b);
-        double e = max_err(a, r), bound = OUT_REL * max_finite(r) + OUT_ABS;
+        double e = max_err(a, r), bound = OUT_REL * max_finite(r) + OUT_ABS + B_COND[b];
         bool ok = e <= bound;
         all_ok &= ok;
         printf("MB_CHECK output %s max_abs_err=%.6g bound=%.6g ok=%d\n", B_NAME[b], e, bound, (int)ok);

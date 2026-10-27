@@ -72,6 +72,8 @@ class ParseTest(unittest.TestCase):
 
 
 def _have_gpu() -> bool:
+    if os.environ.get("CUDA_VISIBLE_DEVICES", "0").strip() in ("", "-1"):   # GPUs hidden: skip
+        return False
     if shutil.which("nvcc") is None or shutil.which("nvidia-smi") is None:
         return False
     try:
