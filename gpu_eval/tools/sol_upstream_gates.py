@@ -112,26 +112,28 @@ def _visible_gpu() -> tuple:
 
 
 @contextmanager
-def gpu_lock(out: Path):
-    """One GPU user at a time: among our workers (``out/.gpu.lock``) and, for the GPU in
-    CUDA_VISIBLE_DEVICES, with every KernelBlaster run on the host (its per-GPU flock,
-    ``$KERNELBLASTER_GPU_LOCK_DIR`` or /dev/shm ``/kernelblaster_gpu_<uuid>.lock``)."""
-    files = [open(out / ".gpu.lock", "w")]
-    uuid, _ = _visible_gpu()
-    if uuid and os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() not in ("0", "false", "no", "off"):
-        d = os.getenv("KERNELBLASTER_GPU_LOCK_DIR", "/dev/shm")
-        try:
-            files.append(open(f"{d}/kernelblaster_gpu_{re.sub(r'[^A-Za-z0-9_.-]', '_', uuid)}.lock", "a"))
-        except OSError:                       # another user's file: run unlocked, as KernelBlaster does
-            pass
-    for f in files:
+def gpu_lock(out: Path, device: bool = False):
+    """One GPU user at a time among our workers; ``device`` also holds KernelBlaster's
+    lock of the visible GPU (``kb_export.gpu_lock_path``: other agents' runs on it wait,
+    and we wait for theirs). The export gate leaves that one to the driver host, which
+    takes it per request."""
+    from modelblaster.pipeline.kb_export import gpu_lock_path
+    dev = gpu_lock_path("auto") if device else None
+    with open(out / ".gpu.lock", "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-    try:
-        yield
-    finally:
-        for f in reversed(files):
-            fcntl.flock(f, fcntl.LOCK_UN)
-            f.close()
+        g = None
+        try:
+            if dev:
+                try:
+                    g = open(dev, "a")
+                    fcntl.flock(g, fcntl.LOCK_EX)
+                except OSError:                       # not ours to open: run unlocked, as KB does
+                    g = None
+            yield
+        finally:
+            if g is not None:
+                fcntl.flock(g, fcntl.LOCK_UN)
+                g.close()
 
 
 def gpu_room(g: dict, wait_s: float) -> bool:
@@ -433,7 +435,7 @@ def gpu_gates(ir: Path, g: dict, cfg: dict, gates, out: Path, env: dict, stem: s
     if q and cfg.get("hand") and not cfg["hand"].endswith(f"{q}.so"):
         cfg = dict(cfg, hand=cfg["hand"].replace(".so", f"{q}.so"))
     if "cuda" in gates:
-        with gpu_lock(out):
+        with gpu_lock(out, device=True):
             j = out / "tmp" / f"{stem}.wc.json"
             j.parent.mkdir(parents=True, exist_ok=True)
             cmd = [sys.executable, "walk_cuda.py", str(ir), "--specs", cfg["specs"], "--hand", cfg["hand"],
@@ -515,29 +517,24 @@ def check_shapes(g: dict, ir: Path, bench, ins) -> dict:
 
 
 def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -> dict:
-    import math
+    from modelblaster.pipeline.kb_export import data_bin_bytes
     if not g["ops"]:
         return {"ok": None, "skipped": "no ops (the workload's output is an input: nothing to optimise)"}
-    nbytes = sum(math.prod(t["shape"]) if t["shape"] else 1 for t in g["tensors"].values()) * \
-        (2 if g.get("quant") in ("fp16", "bf16") else 4)
+    nbytes = data_bin_bytes(ir)            # what kb_export writes (aliases excluded, weights included)
     if nbytes > cfg["export_cap_mb"] * 2 ** 20:
         return {"ok": None, "skipped": f"data.bin ~{nbytes / 2 ** 20:.0f} MiB > {cfg['export_cap_mb']} MiB"}
     if not wait_for_disk(out, nbytes / 2 ** 20 + cfg["reserve_mb"], cfg["disk_wait_s"]):
         return {"ok": None, "skipped": "disk: no room for data.bin"}
     d = out / "tmp" / f"{stem}.kbx"
     shutil.rmtree(d, ignore_errors=True)
-    # export and nvcc build without the GPU; only the driver host's run holds the GPU lock
-    cmd = [sys.executable, "-m", "modelblaster.pipeline.kb_export", str(ir), str(d), "--strategy", "whole"]
-    chk = [sys.executable, __file__, "export-check", str(d / "p00"), "--arch", str(cfg["arch"]),
-           "--lock-dir", str(out), "--timeout", str(cfg["timeout"])]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout"], env=env)
-        log = p.stdout + p.stderr
-        if p.returncode == 0:
-            p = subprocess.run(chk, capture_output=True, text=True, timeout=2 * cfg["timeout"], env=env)
-            log += p.stdout + p.stderr
-    except subprocess.TimeoutExpired:
-        log += "timeout"
+    cmd = [sys.executable, "-m", "modelblaster.pipeline.kb_export", str(ir), str(d), "--strategy", "whole",
+           "--build-check", "--runtime", "host", "--arch", str(cfg["arch"]), "--gpu-lock", "auto"]
+    with gpu_lock(out):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout"], env=env)
+            log = p.stdout + p.stderr
+        except subprocess.TimeoutExpired:
+            log = "timeout"
     (out / "logs" / f"{stem}.export.log").write_text(log[-100000:])
     shutil.rmtree(d, ignore_errors=True)
     res = [json.loads(ln) for ln in log.splitlines() if ln.startswith("{") and '"passed"' in ln]
@@ -546,34 +543,13 @@ def export_gate(ir: Path, g: dict, out: Path, cfg: dict, env: dict, stem: str) -
     r = res[-1]
     bad = {k: v for k, v in (r.get("slots") or {}).items() if not v.get("ok")}
     o = {"ok": bool(r.get("passed")), "stage": r.get("stage"), "e2e_us": r.get("e2e_us"),
-         "n_slots": len(r.get("slots") or {})}
+         "n_slots": len(r.get("slots") or {}), "data_mib": round(nbytes / 2 ** 20, 1)}
     if not o["ok"]:
-        o.update(cls="slot check" if bad else f"stage {r.get('stage')}", failed_slots=list(bad)[:8],
-                 errors=(r.get("errors") or [])[:3])
+        outs = re.findall(r"MB_CHECK output (\S+) max_abs_err=(\S+) bound=(\S+) ok=0", r.get("log") or "")
+        o.update(cls="slot check" if bad else "output check" if outs else f"stage {r.get('stage')}",
+                 failed_slots=list(bad)[:8], errors=(r.get("errors") or [])[:3],
+                 failed_outputs=[{"name": n, "max_abs_err": float(e), "bound": float(b)} for n, e, b in outs[:8]])
     return o
-
-
-def cmd_export_check(a):
-    """kb_export --build-check --runtime host, with the build outside the GPU lock: build the
-    persistent driver host and the kernels' .so, then evaluate once holding the lock; prints
-    kb_export's result line."""
-    from modelblaster.pipeline import kb_export as kx
-    prob = Path(a.problem)
-    r = kx.build_and_run(prob, arch=a.arch, runtime="host", runs=0, timeout=a.timeout)
-    line = {"problem": str(prob)}
-    if r.get("stage") == "built":
-        with gpu_lock(Path(a.lock_dir)):
-            h = kx.DriverHost(r["exe"], timeout=a.timeout)
-            try:
-                r = h.evaluate(r["so"], env={"MB_GRAPH": "1"})
-            finally:
-                h.close()
-    line.update({k: r.get(k) for k in ("passed", "stage", "partition_us", "slot_us", "slots", "errors",
-                                       "e2e_us", "e2e_basis", "graph_skip")})
-    if not r.get("passed"):
-        line["log"] = (r.get("log") or "")[-1500:]
-    print(json.dumps(line), flush=True)
-    return 0
 
 
 # ── driver ────────────────────────────────────────────────────────────────────
@@ -971,18 +947,12 @@ def main(argv=None):
     rm.add_argument("--until-done", action="store_true", help="keep polling while `run` is still going")
     rm.add_argument("--no-sync", action="store_true", help="the remote code / kernels are current")
     rm.add_argument("--keep", action="store_true", help="keep the local io.npz")
-    ec = sub.add_parser("export-check", help="build a kb_export problem, run it holding the GPU lock")
-    ec.add_argument("problem")
-    ec.add_argument("--arch", default="89")
-    ec.add_argument("--lock-dir", required=True)
-    ec.add_argument("--timeout", type=int, default=1800)
     s = sub.add_parser("summary")
     s.add_argument("out", nargs="+")
     s.add_argument("--native", action="store_true", help="per stem, only the record at its own dtype")
     s.add_argument("--by-quant", action="store_true")
     a = ap.parse_args(argv)
-    return {"run": cmd_run, "one": cmd_one, "gpu": cmd_gpu, "remote": cmd_remote, "summary": cmd_summary,
-            "export-check": cmd_export_check}[a.cmd](a)
+    return {"run": cmd_run, "one": cmd_one, "gpu": cmd_gpu, "remote": cmd_remote, "summary": cmd_summary}[a.cmd](a)
 
 
 if __name__ == "__main__":
