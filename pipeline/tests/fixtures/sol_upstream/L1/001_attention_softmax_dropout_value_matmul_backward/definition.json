@@ -1,0 +1,120 @@
+{
+    "name": "001_attention_softmax_dropout_value_matmul_backward",
+    "hf_id": "ByteDance/Seed-Seed-OSS-36B-Instruct",
+    "description": "Backward pass for attention softmax, dropout, and value matmul. Computes gradients through: transpose -> batched matmul -> dropout -> softmax -> GQA head expansion.",
+    "axes": {
+        "batch_size": {
+            "type": "var",
+            "description": "Batch size"
+        },
+        "seq_len_q": {
+            "type": "var",
+            "description": "Query sequence length"
+        },
+        "seq_len_kv": {
+            "type": "var",
+            "description": "Key-value sequence length"
+        },
+        "num_attention_heads": {
+            "type": "const",
+            "value": 80,
+            "description": "Number of attention heads"
+        },
+        "num_key_value_heads": {
+            "type": "const",
+            "value": 8,
+            "description": "Number of key-value heads for GQA"
+        },
+        "head_dim": {
+            "type": "const",
+            "value": 128,
+            "description": "Dimension per attention head"
+        },
+        "num_key_value_groups": {
+            "type": "expr",
+            "expression": "num_attention_heads // num_key_value_heads",
+            "description": "Number of groups for GQA"
+        }
+    },
+    "custom_inputs_entrypoint": "get_inputs",
+    "inputs": {
+        "grad_attn_output": {
+            "shape": [
+                "batch_size",
+                "seq_len_q",
+                "num_attention_heads",
+                "head_dim"
+            ],
+            "dtype": "bfloat16",
+            "description": "Gradient of attention output"
+        },
+        "attn_weights": {
+            "shape": [
+                "batch_size",
+                "num_attention_heads",
+                "seq_len_q",
+                "seq_len_kv"
+            ],
+            "dtype": "bfloat16",
+            "description": "Attention weights after softmax (before dropout)"
+        },
+        "attn_weights_dropped": {
+            "shape": [
+                "batch_size",
+                "num_attention_heads",
+                "seq_len_q",
+                "seq_len_kv"
+            ],
+            "dtype": "bfloat16",
+            "description": "Attention weights after dropout"
+        },
+        "value_states": {
+            "shape": [
+                "batch_size",
+                "num_key_value_heads",
+                "seq_len_kv",
+                "head_dim"
+            ],
+            "dtype": "bfloat16",
+            "description": "Original value states"
+        },
+        "dropout_mask": {
+            "shape": [
+                "batch_size",
+                "num_attention_heads",
+                "seq_len_q",
+                "seq_len_kv"
+            ],
+            "dtype": "bool",
+            "description": "Dropout mask from forward pass"
+        },
+        "attention_dropout": {
+            "shape": null,
+            "dtype": "float32",
+            "description": "Dropout probability"
+        }
+    },
+    "outputs": {
+        "grad_attn_scores": {
+            "shape": [
+                "batch_size",
+                "num_attention_heads",
+                "seq_len_q",
+                "seq_len_kv"
+            ],
+            "dtype": "bfloat16",
+            "description": "Gradient w.r.t. attention scores"
+        },
+        "grad_value_states": {
+            "shape": [
+                "batch_size",
+                "num_key_value_heads",
+                "seq_len_kv",
+                "head_dim"
+            ],
+            "dtype": "bfloat16",
+            "description": "Gradient w.r.t. value states"
+        }
+    },
+    "reference": "import torch\n\n\ndef get_inputs(\n    axes_and_scalars: dict[str, ...], device: torch.device\n) -> dict[str, torch.Tensor]:\n    \"\"\"Generate inputs for backward pass testing.\"\"\"\n    batch_size = axes_and_scalars[\"batch_size\"]\n    seq_len_q = axes_and_scalars[\"seq_len_q\"]\n    seq_len_kv = axes_and_scalars[\"seq_len_kv\"]\n    num_attention_heads = 80\n    num_key_value_heads = 8\n    head_dim = 128\n    # Use a fixed dropout probability for testing\n    attention_dropout = 0.1\n    \n    # Gradient of attention output\n    grad_attn_output = torch.randn(\n        batch_size, seq_len_q, num_attention_heads, head_dim,\n        dtype=torch.bfloat16, device=device\n    )\n    \n    # Attention weights after softmax (should sum to 1 along last dim)\n    attn_scores_raw = torch.randn(\n        batch_size, num_attention_heads, seq_len_q, seq_len_kv,\n        dtype=torch.float32, device=device\n    )\n    attn_weights = torch.softmax(attn_scores_raw, dim=-1).to(torch.bfloat16)\n    \n    # Generate dropout mask\n    dropout_mask = torch.rand(\n        batch_size, num_attention_heads, seq_len_q, seq_len_kv,\n        device=device\n    ) > attention_dropout\n    \n    # Attention weights after dropout\n    if attention_dropout > 0.0:\n        attn_weights_dropped = (attn_weights.float() * dropout_mask / (1.0 - attention_dropout)).to(torch.bfloat16)\n    else:\n        attn_weights_dropped = attn_weights\n    \n    # Value states\n    value_states = torch.randn(\n        batch_size, num_key_value_heads, seq_len_kv, head_dim,\n        dtype=torch.bfloat16, device=device\n    )\n    \n    return {\n        \"grad_attn_output\": grad_attn_output,\n        \"attn_weights\": attn_weights,\n        \"attn_weights_dropped\": attn_weights_dropped,\n        \"value_states\": value_states,\n        \"dropout_mask\": dropout_mask,\n        \"attention_dropout\": attention_dropout,\n    }\n\n\n@torch.no_grad()\ndef run(\n    grad_attn_output: torch.Tensor,\n    attn_weights: torch.Tensor,\n    attn_weights_dropped: torch.Tensor,\n    value_states: torch.Tensor,\n    dropout_mask: torch.Tensor,\n    attention_dropout: float,\n):\n    \"\"\"Backward pass for attention softmax, dropout, and value matmul.\n    \n    Computes gradients through:\n    1. Transpose gradient\n    2. Batched matmul gradients\n    3. Dropout gradient\n    4. Softmax gradient\n    5. GQA gradient aggregation\n    \"\"\"\n    num_attention_heads = 80\n    num_key_value_heads = 8\n    num_key_value_groups = num_attention_heads // num_key_value_heads\n    \n    batch_size = grad_attn_output.shape[0]\n    seq_len_q = grad_attn_output.shape[1]\n    seq_len_kv = value_states.shape[2]\n    head_dim = value_states.shape[3]\n    \n    # Expand value states for GQA\n    value_states_expanded = value_states\n    if num_key_value_groups > 1:\n        value_states_expanded = value_states[:, :, None, :, :].expand(\n            batch_size, num_key_value_heads, num_key_value_groups, seq_len_kv, head_dim\n        ).reshape(batch_size, num_attention_heads, seq_len_kv, head_dim)\n    \n    # 1. Transpose gradient: (batch, seq_q, heads, head_dim) -> (batch, heads, seq_q, head_dim)\n    grad_attn_output_transposed = grad_attn_output.transpose(1, 2).to(torch.float32)\n    \n    # 2. Gradient w.r.t. attn_weights_dropped from matmul\n    # Forward: attn_output = attn_weights_dropped @ value_states_expanded\n    # grad_attn_weights_dropped = grad_attn_output @ value_states_expanded^T\n    grad_attn_weights_dropped = torch.matmul(\n        grad_attn_output_transposed,\n        value_states_expanded.to(torch.float32).transpose(-2, -1)\n    )\n    \n    # 3. Gradient through dropout\n    # Forward: attn_weights_dropped = attn_weights * mask / (1 - p)\n    # Backward: grad_attn_weights = grad_attn_weights_dropped * mask / (1 - p)\n    if attention_dropout > 0.0:\n        grad_attn_weights = grad_attn_weights_dropped * dropout_mask / (1.0 - attention_dropout)\n    else:\n        grad_attn_weights = grad_attn_weights_dropped\n    \n    # 4. Gradient through softmax\n    # Using stable formulation: grad_input = softmax * (grad_output - sum(grad_output * softmax))\n    attn_weights_f32 = attn_weights.to(torch.float32)\n    sum_term = (grad_attn_weights * attn_weights_f32).sum(dim=-1, keepdim=True)\n    grad_attn_scores = attn_weights_f32 * (grad_attn_weights - sum_term)\n    grad_attn_scores = grad_attn_scores.to(torch.bfloat16)\n    \n    # 5. Gradient w.r.t. value_states_expanded from matmul\n    # grad_value_states_expanded = attn_weights_dropped^T @ grad_attn_output\n    grad_value_states_expanded = torch.matmul(\n        attn_weights_dropped.to(torch.float32).transpose(-2, -1),\n        grad_attn_output_transposed\n    )\n    \n    # 6. GQA gradient aggregation\n    if num_key_value_groups > 1:\n        grad_value_states_expanded = grad_value_states_expanded.reshape(\n            batch_size, num_key_value_heads, num_key_value_groups, seq_len_kv, head_dim\n        )\n        grad_value_states = grad_value_states_expanded.sum(dim=2)\n    else:\n        grad_value_states = grad_value_states_expanded\n    \n    grad_value_states = grad_value_states.to(torch.bfloat16)\n    \n    return grad_attn_scores, grad_value_states\n"
+}
