@@ -241,6 +241,13 @@ def fuse_pair(graph: dict, a_name: str, b_name: str, specs: dict) -> tuple[dict,
     sa, sb = stages_of(A), stages_of(B)
     if t not in sb[0]["inputs"]:
         raise ValueError(f"{t}: read by a later stage of {b_name}, not a chain")
+    # one storage dtype per fused kernel (a mixed IR's ops differ; its casts stay apart):
+    # the seed calls its stages from one hand-kernel library
+    from .cuda_dtypes import op_dtype, parse_cast
+    if any(parse_cast(s["op"]) for s in sa + sb):
+        raise ValueError(f"{a_name}->{b_name}: a dtype cast is not fused")
+    if len({op_dtype(s["op"]) for s in sa + sb}) > 1:
+        raise ValueError(f"{a_name}->{b_name}: stages of different storage dtypes")
     stages = [copy.deepcopy(s) for s in sa + sb]
     internal = A.get("internal", []) + [t] + B.get("internal", [])
     tps = [_t_param(stages[i + 1], internal[i], specs) for i in range(len(stages) - 1)]

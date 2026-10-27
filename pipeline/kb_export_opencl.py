@@ -69,6 +69,9 @@ class OpenCLTarget:
         if dtype == "bf16":
             raise NotImplementedError("bf16 partitions are CUDA-only (docs/bf16_cuda.md); "
                                       "OpenCL has no bfloat16 storage type")
+        if dtype == "mixed":
+            raise NotImplementedError("mixed-dtype partitions (--quant native, docs/tensor_dtypes.md) "
+                                      "are CUDA-only; the OpenCL seeds have one storage dtype")
         from .opencl_seeds import OpenCLSeeds
         return OpenCLSeeds(Path(hand) if hand else HAND_LIB)
 
