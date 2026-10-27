@@ -928,8 +928,13 @@ class Interleaved:
                             continue
                         ro, rv = self.read(j["orig"]), self.read(j["variant"])
                         if (ro is not None and rv is not None) or done:
-                            ro = dict(ro or {"final_ok": False}, _dir=str(self.run_dir / _manifest(j["orig"])["name"]))
-                            rv = dict(rv or {"final_ok": False},
+                            # a missing result.json at process exit is infra or a crash, never a merit verdict: tag it so
+                            # finish_hint leaves the hint undecided (proposed) instead of rejecting it unmeasured
+                            _lost = {"final_ok": False, "final_infra": True,
+                                     "final_error": "no result.json when the KernelBlaster process exited (rc=%s)"
+                                                    % proc.poll()}
+                            ro = dict(ro or _lost, _dir=str(self.run_dir / _manifest(j["orig"])["name"]))
+                            rv = dict(rv or _lost,
                                       _dir=str(self.run_dir / _manifest(j["variant"])["name"]))
                             res_by[hid] = (ro, rv)
                             futs[hid] = ex.submit(self.measure, j, ro, rv)
