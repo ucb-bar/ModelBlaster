@@ -717,6 +717,113 @@ void kernel_convnd(const float *in0, const float *in1, const float *in2,
 """)
 
 
+BMM_STRIDED = _spec(
+    "bmm_strided",
+    "void kernel_bmm_strided(const float *A, const float *B, float *C, "
+    "int B0, int B1, int M, int K, int N, "
+    "int a_off, int a_s0, int a_s1, int a_sm, int a_sk, "
+    "int b_off, int b_s0, int b_s1, int b_sk, int b_sn, "
+    "int c_off, int c_s0, int c_s1, int c_sm, int c_sn)",
+    "Batched matmul with strided operands (layout_fold: the permute/transpose/"
+    "split copies around a bmm folded into its addressing). For b0 < B0, "
+    "b1 < B1: C[b0,b1] = A[b0,b1] @ B[b0,b1] with A[b0,b1][m,k] = "
+    "A[a_off + b0*a_s0 + b1*a_s1 + m*a_sm + k*a_sk], B[b0,b1][k,n] = "
+    "B[b_off + b0*b_s0 + b1*b_s1 + k*b_sk + n*b_sn], and the result stored at "
+    "C[c_off + b0*c_s0 + b1*c_s1 + m*c_sm + n*c_sn]. Every (b0,b1,m,n) maps to "
+    "a distinct C element and C is fully written. For each of A, B, C one of "
+    "the two inner strides is 1 (row- or column-major tile: a_sk==1 or "
+    "a_sm==1, b_sn==1 or b_sk==1, c_sn==1 or c_sm==1); strides are fixed per "
+    "shape, so a kernel may branch on them (e.g. ldmatrix vs ldmatrix.trans).",
+    """\
+void kernel_bmm_strided(const float *A, const float *B, float *C,
+                        int B0, int B1, int M, int K, int N,
+                        int a_off, int a_s0, int a_s1, int a_sm, int a_sk,
+                        int b_off, int b_s0, int b_s1, int b_sk, int b_sn,
+                        int c_off, int c_s0, int c_s1, int c_sm, int c_sn) {
+    for (long b0 = 0; b0 < B0; b0++)
+    for (long b1 = 0; b1 < B1; b1++) {
+        const float *Ab = A + a_off + b0 * a_s0 + b1 * a_s1;
+        const float *Bb = B + b_off + b0 * b_s0 + b1 * b_s1;
+        float *Cb = C + c_off + b0 * c_s0 + b1 * c_s1;
+        for (long m = 0; m < M; m++)
+            for (long n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (long k = 0; k < K; k++)
+                    acc += (float)Ab[m * a_sm + k * a_sk] * (float)Bb[k * b_sk + n * b_sn];
+                Cb[m * c_sm + n * c_sn] = acc;
+            }
+    }
+}
+""")
+
+
+ATTENTION = _spec(
+    "attention",
+    "void kernel_attention(const float *Q, const float *K, const float *V, float *O, "
+    "int B0, int B1, int M, int N, int D, int DV, "
+    "int q_off, int q_s0, int q_s1, int q_sm, "
+    "int k_off, int k_s0, int k_s1, int k_sn, "
+    "int v_off, int v_s0, int v_s1, int v_sn, "
+    "int o_off, int o_s0, int o_s1, int o_sm, "
+    "int causal, int act, float scale)",
+    "Fused attention (attention_fuse: bmm -> scale -> causal masked_fill -> "
+    "softmax|relu -> bmm, with the q/k/v split/transpose copies and the output "
+    "transpose folded into strides). For b0 < B0, b1 < B1, m < M:\n"
+    "  q[m][d]  = Q[q_off + b0*q_s0 + b1*q_s1 + m*q_sm + d]      (d < D)\n"
+    "  k[n][d]  = K[k_off + b0*k_s0 + b1*k_s1 + n*k_sn + d]      (n < N)\n"
+    "  v[n][e]  = V[v_off + b0*v_s0 + b1*v_s1 + n*v_sn + e]      (e < DV)\n"
+    "  s[n]     = scale * sum_d q[m][d]*k[n][d]; if causal and n > m: s[n] = -inf\n"
+    "  act == 0 (softmax): p = softmax(s) over n;  act == 1 (relu): p[n] = max(s[n], 0) (masked -> 0)\n"
+    "  O[o_off + b0*o_s0 + b1*o_s1 + m*o_sm + e] = sum_n p[n]*v[n][e]\n"
+    "The innermost (d / e) stride of every operand is 1; all other strides are "
+    "fixed per shape (q, k and v may be three windows of the same buffer, e.g. "
+    "a fused qkv projection). The reference is EXACT fp32 math rounded once at "
+    "the output: the [M, N] score matrix need not (and should not) be "
+    "materialised -- tile K/V through shared memory with an online softmax "
+    "(running max + rescaled sum, flash-attention style); with causal, key "
+    "tiles entirely above the diagonal can be skipped. D, DV <= 256.",
+    """\
+#include <math.h>
+
+void kernel_attention(const float *Q, const float *K, const float *V, float *O,
+                      int B0, int B1, int M, int N, int D, int DV,
+                      int q_off, int q_s0, int q_s1, int q_sm,
+                      int k_off, int k_s0, int k_s1, int k_sn,
+                      int v_off, int v_s0, int v_s1, int v_sn,
+                      int o_off, int o_s0, int o_s1, int o_sm,
+                      int causal, int act, float scale) {
+    for (long b0 = 0; b0 < B0; b0++)
+    for (long b1 = 0; b1 < B1; b1++)
+    for (long m = 0; m < M; m++) {
+        const float *q = Q + q_off + b0 * q_s0 + b1 * q_s1 + m * q_sm;
+        const float *kb = K + k_off + b0 * k_s0 + b1 * k_s1;
+        const float *vb = V + v_off + b0 * v_s0 + b1 * v_s1;
+        float *o = O + o_off + b0 * o_s0 + b1 * o_s1 + m * o_sm;
+        long nend = (causal && m + 1 < N) ? m + 1 : N;
+        float mx = -INFINITY;
+        if (act == 0)
+            for (long n = 0; n < nend; n++) {
+                float s = 0.0f;
+                for (long d = 0; d < D; d++) s += (float)q[d] * (float)kb[n * k_sn + d];
+                s *= scale;
+                if (s > mx) mx = s;
+            }
+        float sum = 0.0f, acc[256];   /* DV <= 256; fp32 accumulators (O may be fp16) */
+        for (long e = 0; e < DV; e++) acc[e] = 0.0f;
+        for (long n = 0; n < nend; n++) {
+            float s = 0.0f;
+            for (long d = 0; d < D; d++) s += (float)q[d] * (float)kb[n * k_sn + d];
+            s *= scale;
+            float p = act == 0 ? expf(s - mx) : (s > 0.0f ? s : 0.0f);
+            sum += p;
+            for (long e = 0; e < DV; e++) acc[e] += p * (float)vb[n * v_sn + e];
+        }
+        for (long e = 0; e < DV; e++) o[e] = act == 0 ? acc[e] / sum : acc[e];
+    }
+}
+""")
+
+
 def ext_specs(kernel_spec_cls) -> dict:
     """KernelSpecs for the ops above. Called by reference_kernels while it
     builds KERNEL_SPECS (taking the class avoids a circular import)."""

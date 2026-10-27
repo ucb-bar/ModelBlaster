@@ -1,0 +1,408 @@
+{
+ "counts": {
+  "add+relu": [
+   1,
+   0
+  ],
+  "batchnorm2d+add": [
+   3,
+   0
+  ],
+  "batchnorm2d+add+relu": [
+   1,
+   0
+  ],
+  "batchnorm2d+relu": [
+   6,
+   0
+  ],
+  "batchnorm2d+relu+add": [
+   1,
+   0
+  ],
+  "batchnorm2d+relu6": [
+   2,
+   0
+  ],
+  "bmm+ewise2": [
+   1,
+   0
+  ],
+  "bmm+ewise2+ewise2": [
+   0,
+   1
+  ],
+  "bmm+mul_scalar+ewise2": [
+   3,
+   0
+  ],
+  "bmm+mul_scalar+ewise2+relu": [
+   1,
+   0
+  ],
+  "bn+*1": [
+   11,
+   0
+  ],
+  "bn+*2": [
+   2,
+   0
+  ],
+  "bn+ewise": [
+   3,
+   0
+  ],
+  "bn+ewise+relu": [
+   1,
+   0
+  ],
+  "bn+relu": [
+   6,
+   0
+  ],
+  "bn+relu+ewise": [
+   1,
+   0
+  ],
+  "bn+relu6": [
+   2,
+   0
+  ],
+  "cat+*1": [
+   10,
+   0
+  ],
+  "cat+*2": [
+   7,
+   0
+  ],
+  "cat+bn": [
+   9,
+   0
+  ],
+  "cat+bn+relu": [
+   7,
+   0
+  ],
+  "cat+ewise": [
+   1,
+   0
+  ],
+  "cat2_c1+batchnorm2d": [
+   2,
+   0
+  ],
+  "cat2_c1+batchnorm2d+relu": [
+   1,
+   0
+  ],
+  "cat3_c1+batchnorm2d": [
+   2,
+   0
+  ],
+  "cat3_c1+batchnorm2d+relu": [
+   1,
+   0
+  ],
+  "cat4_c1+batchnorm2d": [
+   2,
+   0
+  ],
+  "cat4_c1+batchnorm2d+relu": [
+   2,
+   0
+  ],
+  "catn+batchnorm2d": [
+   3,
+   0
+  ],
+  "catn+batchnorm2d+relu": [
+   3,
+   0
+  ],
+  "catn+ewise2": [
+   1,
+   0
+  ],
+  "conv+*1": [
+   14,
+   9
+  ],
+  "conv+*2": [
+   10,
+   4
+  ],
+  "conv+bn": [
+   9,
+   5
+  ],
+  "conv+bn+ewise": [
+   1,
+   2
+  ],
+  "conv+bn+relu": [
+   5,
+   2
+  ],
+  "conv+bn+relu6": [
+   4,
+   0
+  ],
+  "conv+relu": [
+   4,
+   4
+  ],
+  "conv+sigmoid": [
+   1,
+   0
+  ],
+  "conv2d+batchnorm2d": [
+   9,
+   5
+  ],
+  "conv2d+batchnorm2d+add": [
+   1,
+   2
+  ],
+  "conv2d+batchnorm2d+relu": [
+   5,
+   2
+  ],
+  "conv2d+batchnorm2d+relu6": [
+   4,
+   0
+  ],
+  "conv2d+relu": [
+   4,
+   4
+  ],
+  "conv2d+sigmoid": [
+   1,
+   0
+  ],
+  "conv2d_dw+batchnorm2d": [
+   6,
+   1
+  ],
+  "conv2d_dw+batchnorm2d+relu": [
+   2,
+   0
+  ],
+  "conv2d_dw+batchnorm2d+relu6": [
+   4,
+   0
+  ],
+  "conv2d_grouped+batchnorm2d": [
+   2,
+   0
+  ],
+  "conv2d_grouped+batchnorm2d+relu": [
+   2,
+   0
+  ],
+  "conv2d_grouped+batchnorm2d+relu+add": [
+   2,
+   0
+  ],
+  "dwconv+*1": [
+   6,
+   1
+  ],
+  "dwconv+*2": [
+   6,
+   0
+  ],
+  "dwconv+bn": [
+   6,
+   1
+  ],
+  "dwconv+bn+relu": [
+   2,
+   0
+  ],
+  "dwconv+bn+relu6": [
+   4,
+   0
+  ],
+  "ewise+*1": [
+   6,
+   0
+  ],
+  "ewise+ewise": [
+   5,
+   0
+  ],
+  "ewise+relu": [
+   1,
+   0
+  ],
+  "ewise2+ewise2": [
+   5,
+   0
+  ],
+  "ewise_scalar+ewise2": [
+   1,
+   2
+  ],
+  "ewise_scalar+mul_scalar+add": [
+   1,
+   0
+  ],
+  "gconv+*1": [
+   2,
+   0
+  ],
+  "gconv+*2": [
+   2,
+   0
+  ],
+  "gconv+*3": [
+   2,
+   0
+  ],
+  "gconv+bn": [
+   2,
+   0
+  ],
+  "gconv+bn+relu": [
+   2,
+   0
+  ],
+  "gconv+bn+relu+ewise": [
+   2,
+   0
+  ],
+  "gemm+*1": [
+   1,
+   0
+  ],
+  "gemm+*2": [
+   3,
+   3
+  ],
+  "gemm+*3": [
+   1,
+   0
+  ],
+  "gemm+ewise": [
+   1,
+   0
+  ],
+  "gemm+ewise+ewise": [
+   0,
+   3
+  ],
+  "gemm+sewise+ewise": [
+   3,
+   0
+  ],
+  "gemm+sewise+ewise+relu": [
+   1,
+   0
+  ],
+  "linear+*1": [
+   7,
+   1
+  ],
+  "linear+gelu": [
+   2,
+   0
+  ],
+  "linear+relu": [
+   4,
+   0
+  ],
+  "linear+tanh": [
+   1,
+   1
+  ],
+  "matmul+ewise2+ewise2": [
+   0,
+   2
+  ],
+  "mul_scalar+add": [
+   1,
+   0
+  ],
+  "mul_scalar+ewise2": [
+   3,
+   0
+  ],
+  "mul_scalar+mul": [
+   1,
+   0
+  ],
+  "mul_scalar+tanh": [
+   1,
+   0
+  ],
+  "mul_scalar+tanh+ewise_scalar": [
+   1,
+   0
+  ],
+  "reduce+*2": [
+   3,
+   0
+  ],
+  "reduce+ewise+ewise": [
+   2,
+   0
+  ],
+  "reduce+ewise_scalar+ewise2": [
+   1,
+   0
+  ],
+  "reduce+sewise+ewise": [
+   1,
+   0
+  ],
+  "relu+*1": [
+   2,
+   0
+  ],
+  "relu+add": [
+   2,
+   0
+  ],
+  "relu+ewise": [
+   2,
+   0
+  ],
+  "sewise+*1": [
+   7,
+   2
+  ],
+  "sewise+*2": [
+   2,
+   0
+  ],
+  "sewise+ewise": [
+   6,
+   2
+  ],
+  "sewise+sewise+ewise": [
+   1,
+   0
+  ],
+  "sewise+tanh": [
+   1,
+   0
+  ],
+  "sewise+tanh+sewise": [
+   1,
+   0
+  ],
+  "split_slot": [
+   0,
+   1
+  ],
+  "sum_dim+ewise2+ewise2": [
+   2,
+   0
+  ]
+ },
+ "exclude_problem": null,
+ "format": "mb-graph-priors/1",
+ "part": "cuda:sm_89|fp16",
+ "source": "/Users/krisd/Documents/ModelBlaster-clone/l3_farm/analysis/e7_data/decisions.csv"
+}

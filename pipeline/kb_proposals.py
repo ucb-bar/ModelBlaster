@@ -75,6 +75,7 @@ def _act_inputs(kind: str, specs: dict) -> list[str]:
 class FusedKernelSpec(KernelSpec):
     sub_ops: list = field(default_factory=list)          # stage kinds, in order
     t_params: list = field(default_factory=list)         # stage i+1's param that reads stage i's output
+    parallel: bool = False                               # fused__par__: independent siblings, no intermediates
 
     @property
     def t_param(self) -> str:                            # two-stage name (Phase 1)
@@ -97,24 +98,58 @@ class FusedKernelSpec(KernelSpec):
         includes, blocks = [], []
         if names:
             blocks.append("\n\n".join(lib.items[k].text for k in lib.items if k in names))
-        for k in dict.fromkeys(k for k, _, _ in stages if k in sub_sources):
-            inc, body = namespaced(f"stage_{k}", sub_sources[k])
-            includes += [i for i in inc if i not in includes]
+        # a parallel (sibling) fusion runs its stages concurrently: each stage gets its own copy (own statics)
+        ns = {i: (f"stage{i}_{k}" if self.parallel else f"stage_{k}") for i, (k, _, _) in enumerate(stages)}
+        for i, k in dict.fromkeys((i if self.parallel else 0, k) for i, (k, _, _) in enumerate(stages)
+                                  if k in sub_sources):
+            inc, body = namespaced(ns[i] if self.parallel else f"stage_{k}", sub_sources[k])
+            includes += [x for x in inc if x not in includes]
             blocks.append(f"// current best {k} kernel\n{body}")
         outs = [next(p.name for p in ps if p.is_ptr and not p.is_const_ptr) for _, _, ps in stages]
         calls = []
         for i, (k, e, ps) in enumerate(stages):
-            args = [stage_prefix(i - 1) + outs[i - 1] if i and p.name == self.t_params[i - 1]
+            args = [stage_prefix(i - 1) + outs[i - 1]
+                    if i and not self.parallel and p.name == self.t_params[i - 1]
                     else stage_prefix(i) + p.name for p in ps]
-            callee = f"stage_{k}::{e}" if k in sub_sources else e
+            callee = f"{ns[i]}::{e}" if k in sub_sources else e
             calls.append(f"    {callee}({', '.join(args)});")
-        entry, params = parse_signature(self.signature)
+        if self.parallel and len(calls) > 1:
+            calls = _par_calls(calls)
+        # the stage sources (hand kernels, cached winners) spell fp16 `__half`; a raw `_Float16` wrapper would not
+        # bind to their parameters (two distinct, non-convertible C++ types)
+        from .cuda_dtypes import cuda_signature
+        entry, params = parse_signature(cuda_signature(self.signature))
         scratch = ", ".join(f"`{stage_prefix(i)}{o}`" for i, o in enumerate(outs[:-1]))
         plist = ", ".join(f"{p.ctype} {p.name}" for p in params)
+        note = (f"// Seed: the {len(self.sub_ops)} independent sibling ops {', '.join(self.sub_ops)}, each its stage's "
+                f"current best kernel,\n// run concurrently (stage 0 on this thread's stream, the others on helper "
+                f"threads' streams, fork/join\n// with events, also inside a CUDA-graph capture). One kernel may compute "
+                f"them together.\n" if self.parallel else
+                f"// Seed: {' then '.join(self.sub_ops)}; {scratch} hold the intermediates\n"
+                f"// (scratch). A fused kernel need not write them.\n")
+        if self.parallel and len(stages) > 1:
+            includes += [x for x in ("#include <thread>", "#include <cuda_runtime.h>") if x not in includes]
         return ("\n".join(includes) + ("\n\n" if includes else "") + "\n\n".join(blocks) +
-                f"\n\n// Seed: {' then '.join(self.sub_ops)}; {scratch} hold the intermediates\n"
-                f"// (scratch). A fused kernel need not write them.\n"
-                f"void {entry}({plist}) {{\n" + "\n".join(calls) + "\n}\n")
+                "\n\n" + note + f"void {entry}({plist}) {{\n" + "\n".join(calls) + "\n}\n")
+
+
+def _par_calls(calls: list[str]) -> list[str]:
+    """Stage 0 on the calling thread's per-thread stream, stage i > 0 on a helper thread's: forked from an event on
+    the caller's stream and joined back, so the stages overlap eagerly and as parallel branches of a captured graph."""
+    n = len(calls)
+    out = ["    static cudaEvent_t mb_fork = nullptr, mb_join[%d];" % n,
+           "    if (!mb_fork) { cudaEventCreateWithFlags(&mb_fork, cudaEventDisableTiming);",
+           "                    for (int i = 0; i < %d; ++i) cudaEventCreateWithFlags(&mb_join[i], cudaEventDisableTiming); }" % n,
+           "    cudaEventRecord(mb_fork, cudaStreamPerThread);",
+           "    std::thread mb_t[%d];" % (n - 1)]
+    for i, c in enumerate(calls[1:], 1):
+        out.append(f"    mb_t[{i - 1}] = std::thread([&] {{ cudaStreamWaitEvent(cudaStreamPerThread, mb_fork, 0);")
+        out.append(f"    {c.strip()}")
+        out.append(f"        cudaEventRecord(mb_join[{i}], cudaStreamPerThread); }});")
+    out.append(calls[0])
+    out.append("    for (auto &t : mb_t) t.join();")
+    out.append(f"    for (int i = 1; i < {n}; ++i) cudaStreamWaitEvent(cudaStreamPerThread, mb_join[i], 0);")
+    return out
 
 
 _SPECS_CACHE: dict = {}
@@ -153,6 +188,10 @@ def parse_kind(kind: str, specs: dict) -> tuple[list[str], list[str]]:
     parts = kind.split("__")
     if parts[0] != "fused" or len(parts) < 3:
         raise ValueError(f"not a fused kind: {kind}")
+    if parts[1] == PAR:                                   # fused__par__<k>__<k>...: siblings, no intermediates
+        if len(parts) < 4 or any(k not in specs for k in parts[2:]):
+            raise ValueError(f"{kind}: unknown sibling kind")
+        return parts[2:], []
     kinds, tps, i = [parts[1]], [], 2
     while i < len(parts):
         k = parts[i]
@@ -196,17 +235,53 @@ def make_fused_spec(a_kind: str, b_kind: str, t_param: str, specs: dict) -> Fuse
     return make_chain_spec([a_kind, b_kind], [t_param], specs)
 
 
+PAR = "par"
+
+
+def par_kind(kinds: list[str]) -> str:
+    return "__".join(["fused", PAR, *kinds])
+
+
+def make_par_spec(kinds: list[str], specs: dict) -> FusedKernelSpec:
+    """A horizontal fusion of independent sibling ops (``fused__par__<k0>__<k1>...``, ``--fusion-extended siblings``):
+    every stage's parameters with its stage prefix (a shared input appears once per stage, bound to the same
+    buffer), every stage's outputs checked. Reference = the stages' references, each on its own arguments."""
+    kind = par_kind(kinds)
+    sigs = [parse_signature(specs[k].signature)[1] for k in kinds]
+    params = [Param(p.ctype, stage_prefix(i) + p.name) for i, ps in enumerate(sigs) for p in ps]
+    sig = f"void kernel_{kind}(" + ", ".join(f"{p.ctype} {p.name}" for p in params) + ");"
+    sem = (f"{len(kinds)} independent sibling ops computed by one entry point: " +
+           "; ".join(f"{k} with parameters {stage_prefix(i)}*" for i, k in enumerate(kinds)) +
+           ". They read some inputs in common (the same buffer is passed to each stage's parameter) and write "
+           "disjoint outputs; every output is checked. A fused kernel may share work between them (e.g. one GEMM "
+           "for both input projections, both recurrence directions in one grid).\n" +
+           "\n".join(f"[{k}] {specs[k].semantics}" for k in dict.fromkeys(kinds)))
+    refs = "\n\n".join(specs[k].reference_impl for k in dict.fromkeys(kinds))
+    ref = f"/* reference = the {len(kinds)} sibling reference kernels, each on its own arguments */\n{refs}\n"
+    return FusedKernelSpec(op=kind, signature=sig, semantics=sem, reference_impl=ref, sub_ops=list(kinds),
+                           t_params=[None] * (len(kinds) - 1), parallel=True)
+
+
 def spec_from_kind(kind: str, specs: dict) -> FusedKernelSpec:
     """Rebuild a fused spec from its kind name."""
+    if kind.startswith(f"fused__{PAR}__"):
+        spec = make_par_spec(parse_kind(kind, specs)[0], specs)
+        assert spec.op == kind, (spec.op, kind)
+        return spec
     spec = make_chain_spec(*parse_kind(kind, specs), specs)
     assert spec.op == kind, (spec.op, kind)
     return spec
 
 
 def with_fused_specs(graph: dict, specs: dict) -> dict:
-    """``specs`` plus a FusedKernelSpec for every fused kind ``graph`` uses."""
+    """``specs`` plus a FusedKernelSpec for every fused kind ``graph`` uses (and a RegionKernelSpec for every
+    ``region__`` op: region_slots, built from the op's members)."""
     missing = {o["op"] for o in graph["ops"] if o["op"].startswith("fused__") and o["op"] not in specs}
-    return {**specs, **{k: spec_from_kind(k, specs) for k in missing}} if missing else specs
+    out = {**specs, **{k: spec_from_kind(k, specs) for k in missing}} if missing else specs
+    if any(o["op"].startswith("region__") and o["op"] not in out for o in graph["ops"]):
+        from .region_slots import with_region_specs
+        out = with_region_specs(graph, dict(out))
+    return out
 
 
 def stages_of(op: dict) -> list[dict]:
@@ -304,18 +379,106 @@ def bind_fused(op: dict, specs: dict) -> list:
 
     Every intermediate stage output becomes kind ``scratch`` (its internal
     tensor); the next stage's input that reads it is dropped."""
-    stages, internal = op["sub_ops"], op["internal"]
+    stages, internal = op["sub_ops"], op.get("internal") or []
     args = []
     for i, s in enumerate(stages):
         _, ps = parse_signature(specs[s["op"]].signature)
         aa = bind(s, ps)
         for x in aa:
-            if i < len(stages) - 1 and x.kind == "out" and x.value == internal[i]:
+            if i < len(internal) and i < len(stages) - 1 and x.kind == "out" and x.value == internal[i]:
                 x.kind = "scratch"
-        if i:
+        if i and i - 1 < len(internal):
             aa = [x for x in aa if not (x.kind == "in" and x.value == internal[i - 1])]
         args += aa
     return args
+
+
+# ---------------------------------------------------------------- sibling (horizontal) fusion
+
+# op kinds whose independent instances reading one input are worth one entry point (--fusion-extended siblings):
+# the two directions of a bidirectional RNN layer, Q/K/V projections of one input
+SIBLING_KINDS = ("gru_seq", "lstm_seq", "gru_seq_f16", "lstm_seq_f16", "linear", "linear_f16")
+
+
+def _ancestors(ops: list[dict]) -> list[int]:
+    producer, anc = {}, []
+    for i, o in enumerate(ops):
+        a = 0
+        for t in o["inputs"]:
+            p = producer.get(t)
+            if p is not None:
+                a |= (1 << p) | anc[p]
+        anc.append(a)
+        for t in list(o["outputs"]) + list(o.get("internal", [])):
+            producer[t] = i
+    return anc
+
+
+def find_siblings(graph: dict, specs: dict, kinds=SIBLING_KINDS, max_group: int = 4) -> list[list[str]]:
+    """Groups of unfused ops of one kind that read the same activation tensor and are independent of each other
+    (neither reads, transitively, what another writes), in graph order; disjoint, 2..max_group ops each."""
+    ops = graph["ops"]
+    anc = _ancestors(ops)
+    groups: dict[tuple, list[int]] = {}
+    for i, o in enumerate(ops):
+        if o["op"] not in kinds or "sub_ops" in o or o["op"] not in specs or not o["inputs"]:
+            continue
+        acts = _act_inputs(o["op"], specs)
+        try:
+            first = next(a.value for a in bind(o, parse_signature(specs[o["op"]].signature)[1])
+                         if a.kind == "in" and a.param.name == acts[0])
+        except (StopIteration, IndexError, KeyError):
+            continue
+        groups.setdefault((o["op"], first), []).append(i)
+    out = []
+    for (_, _), idx in groups.items():
+        cur = []
+        for i in idx:
+            if all(not ((anc[i] >> j) & 1) and not ((anc[j] >> i) & 1) for j in cur):
+                cur.append(i)
+            if len(cur) == max_group:
+                break
+        if len(cur) >= 2:
+            out.append(cur)
+    return [[ops[i]["name"] for i in g] for g in sorted(out)]
+
+
+def fuse_siblings(graph: dict, names: list[str], specs: dict) -> tuple[dict, FusedKernelSpec]:
+    """(new graph, spec) with the independent ops ``names`` replaced by one ``fused__par__`` op at the position of
+    the last of them; no op between them may read their outputs (the result stays in topological order)."""
+    g = copy.deepcopy(graph)
+    ops = g["ops"]
+    idx = [next(i for i, o in enumerate(ops) if o["name"] == n) for n in names]
+    if len(set(idx)) != len(idx) or len(idx) < 2:
+        raise ValueError(f"{names}: need >= 2 distinct ops")
+    order = sorted(range(len(idx)), key=lambda k: idx[k])
+    idx = [idx[k] for k in order]
+    names = [names[k] for k in order]
+    sel = [ops[i] for i in idx]
+    if any("sub_ops" in o for o in sel):
+        raise ValueError(f"{names}: already fused")
+    anc = _ancestors(ops)
+    for a in idx:
+        for b in idx:
+            if a != b and (anc[b] >> a) & 1:
+                raise ValueError(f"{names}: not independent")
+    outs = {t for o in sel for t in o["outputs"]}
+    for j in range(idx[0] + 1, idx[-1]):
+        if j not in idx and outs & set(ops[j]["inputs"]):
+            raise ValueError(f"{ops[j]['name']} reads a sibling's output before the last sibling")
+    spec = make_par_spec([o["op"] for o in sel], specs)
+    fused = {"name": "+".join(names), "op": spec.op,
+             "inputs": list(dict.fromkeys(t for o in sel for t in o["inputs"])),
+             "outputs": [t for o in sel for t in o["outputs"]], "internal": [],
+             "sub_ops": [copy.deepcopy(o) for o in sel], "parallel": True,
+             "shape": {STAGE_LETTERS[i]: o.get("shape", {}) for i, o in enumerate(sel)}}
+    for s in fused["sub_ops"]:
+        for k in ("slot_variant", "hint", "depends_on", "dispatch_id"):
+            s.pop(k, None)
+    ops[idx[-1]] = fused
+    for i in sorted(idx[:-1], reverse=True):
+        del ops[i]
+    return g, spec
 
 
 # ---------------------------------------------------------------- variants

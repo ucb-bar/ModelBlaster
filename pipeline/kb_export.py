@@ -67,6 +67,16 @@ DEFAULT_TOL = {"output_rel": 1e-3, "output_abs": 1e-5, "slot_rel": 1e-3}
 DTYPE_TOL = {d: {k: t[k] for k in (*DEFAULT_TOL, "slot_abs")} for d, t in cuda_dtypes.TOLERANCE.items()}
 
 
+# A slot may spell its fp16 pointers `_Float16*` or `__half*` (the cache hashes both as one signature), and the two
+# are distinct, non-convertible C++ types: a plain `(const __half*)b[i]` cast fails to bind to `const _Float16*`.
+# `mb_any` converts the raw buffer pointer to whatever pointer type the kernel declares.
+MB_ANY_PTR = "struct mb_any { void *p; template <class T> operator T *() const { return (T *)p; } };"
+
+
+def _ptr_arg(ctype, buf):
+    return f"mb_any{{b[{buf}]}}" if "*" in ctype else f"({ctype})b[{buf}]"
+
+
 def _harness():
     """The torch IR walker (reference values) lives with the GPU harness."""
     if str(HARNESS) not in sys.path:
@@ -97,6 +107,39 @@ def _problem_dtype(kinds: list[str]) -> str:
     """fp16 when every op of the partition is an `_f16` op, else fp32."""
     dts = {cuda_dtypes.op_dtype(k) for k in kinds}
     return cuda_dtypes.FP16 if dts == {cuda_dtypes.FP16} else cuda_dtypes.FP32
+
+
+def _is_mixed(kinds: list[str]) -> bool:
+    """fp16 ops next to fp32 ones / casts: only IRs rewritten by the precision policy."""
+    from .precision_casts import CAST_KINDS
+    if any(k in CAST_KINDS for k in kinds):        # casts live in their own library (mb_cuda_kernels_casts.cu)
+        return True
+    dts = {cuda_dtypes.op_dtype(k) for k in kinds}
+    return cuda_dtypes.FP16 in dts and len(dts) > 1
+
+
+class _MixedLibrary:
+    """The fp16 and fp32 hand libraries side by side (precision-policy partitions): an entry comes from the
+    library that defines it (``kernel_<op>_f16`` and the casts: fp16 file; ``kernel_<op>``: fp32 file); the head is
+    the union of both heads (fp16 first: it adds cuda_fp16.h). The casts come from mb_cuda_kernels_casts.cu."""
+
+    def __init__(self, hand_cu: Path):
+        self.f16 = CudaLibrary(_hand_source(Path(hand_cu), cuda_dtypes.FP16))
+        self.f32 = CudaLibrary(_hand_source(Path(hand_cu), cuda_dtypes.FP32))
+        self.casts = CudaLibrary((HARNESS / "cuda" / "mb_cuda_kernels_casts.cu").read_text())
+        self.items = {**self.f32.items, **self.f16.items, **self.casts.items}
+
+    def _lib(self, entry: str) -> "CudaLibrary":
+        return self.casts if entry in self.casts.items else self.f16 if entry in self.f16.items else self.f32
+
+    def closure(self, entry: str) -> list[str]:
+        return self._lib(entry).closure(entry)
+
+    def slot_source(self, entry: str) -> str:
+        return self._lib(entry).slot_source(entry)
+
+    def head_source(self) -> str:
+        return "\n".join(self.f16.head + [h for h in self.f32.head if h not in self.f16.head]) + "\n"
 
 
 def _hand_source(hand_cu: Path, dtype: str) -> str:
@@ -263,8 +306,38 @@ def assemble(problem_dir: Path, sources: dict[str, str] | None = None) -> str:
     for s in man["slots"]:
         code = (sources or {}).get(s["id"]) or (problem_dir / s["file"]).read_text()
         parts.append(wrap_slot(s["id"], code))
+        for ln in range(1, int((asm.get("lanes") or {}).get(s["id"], 1))):     # concurrent instances' copies
+            parts.append(wrap_slot(f"{s['id']}__lane{ln}", code))
     parts.append((problem_dir / asm["tail"]).read_text())
     return "\n".join(parts)
+
+
+def units(problem_dir: Path, sources: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """The program of :func:`assemble`, one TU per slot -- what KernelBlaster builds and validates
+    (``SlotProblem.units``): ``slot_<id>.cu`` = head + the wrapped slot per slot, and
+    ``walker_tail.cu`` = head + a declaration of every slot entry (manifest signature) + tail.
+
+    One TU per slot keeps every slot the program it was validated as. In one assembled TU a slot
+    is compiled together with every other slot, and nvcc lays out shared memory per TU: one
+    slot's ``extern __shared__ __align__(128)`` raises every kernel's static shared size to 128
+    bytes, so another slot's launch with 48 KB - 16 B of dynamic shared memory (no opt-in
+    needed alone) exceeds the 48 KB default and fails with ``invalid argument`` (15_DenseNet121,
+    round 2: per-shape conv winners next to winners declaring 128-aligned dynamic smem)."""
+    problem_dir = Path(problem_dir)
+    man = json.loads((problem_dir / "manifest.json").read_text())
+    asm = man["assembly"]
+    head = (problem_dir / asm["head"]).read_text()
+    out = []
+    lanes = asm.get("lanes") or {}
+    for s in man["slots"]:
+        code = (sources or {}).get(s["id"]) or (problem_dir / s["file"]).read_text()
+        out.append((f"slot_{s['id']}.cu", "\n".join([head, wrap_slot(s["id"], code)])))
+        for ln in range(1, int(lanes.get(s["id"], 1))):                       # concurrent instances' copies
+            out.append((f"slot_{s['id']}__lane{ln}.cu", "\n".join([head, wrap_slot(f"{s['id']}__lane{ln}", code)])))
+    decls = "".join(f"namespace {NS_PREFIX}{sid} {{ {s['signature']}; }}\n" for s in man["slots"]
+                    for sid in [s["id"]] + [f"{s['id']}__lane{ln}" for ln in range(1, int(lanes.get(s["id"], 1)))])
+    out.append(("walker_tail.cu", "\n".join([head, decls, (problem_dir / asm["tail"]).read_text()])))
+    return out
 
 
 # ---------------------------------------------------------------- partitioning
@@ -307,6 +380,49 @@ def _c_scalar(base: str, v) -> str:
     return str(int(v))
 
 
+INT32_MIN, INT32_MAX = -2 ** 31, 2 ** 31 - 1
+# elements per launch of a chunked flat-elementwise call: a power of two, so every chunk keeps the
+# buffers' (vector) alignment
+CHUNK_ELEMS = 1 << 30
+_INT_CTYPES = ("int", "int32_t", "unsigned", "unsigned int", "uint32_t")
+
+
+def _call_stmt(fn: str, args: list[str], scalars: list[tuple[int, "object", object]],
+               ptrs: list[tuple[int, int]], *, n_ptr_params: int, bufs: list[dict], elementwise: bool,
+               cuda: bool = True, op_name: str = "") -> str:
+    """The C statement calling ``fn(args)``.
+
+    The kernel ABI passes sizes as C ``int``; a value outside int32 (e.g. the
+    2**31-element ``[8, 16384, 16384]`` attention score tensor of a
+    ``ewise_scalar n``) would be narrowed at the call and the kernel would see
+    a negative size and write nothing. A flat elementwise op -- an
+    ``elementwise``-class op whose only oversized scalar is ``n`` and whose
+    every pointer is a buffer of exactly ``n`` elements -- is split into
+    ``CHUNK_ELEMS`` launches over offset pointers (CUDA only); anything else
+    fails the export rather than run on a wrapped size.
+
+    ``scalars``: (arg position, Param, value); ``ptrs``: (arg position, buffer
+    index) of every pointer argument bound to a buffer.
+    """
+    big = [(j, p, int(v)) for j, p, v in scalars
+           if p.base_type in _INT_CTYPES and isinstance(v, (int, float, np.integer, np.floating))
+           and not INT32_MIN <= int(v) <= INT32_MAX]
+    if not big:
+        return f"{fn}({', '.join(args)});"
+    j, p, n = big[0]
+    chunkable = (cuda and elementwise and len(big) == 1 and p.name == "n" and ptrs
+                 and len(ptrs) == n_ptr_params and all(bufs[b]["numel"] == n for _, b in ptrs))
+    if not chunkable:
+        raise ValueError(f"{op_name or fn}: {p.ctype} {p.name}={n} does not fit the kernel's C int "
+                         f"parameter (and the op is not a flat elementwise op that can be chunked)")
+    a = list(args)
+    for k, b in ptrs:
+        esz = np.dtype(_NP_OF_BUF[bufs[b]["dtype"]]).itemsize
+        a[k] = f"mb_any{{(char *)b[{b}] + o_ * {esz}L}}"
+    a[j] = f"(int)({n}L - o_ < {CHUNK_ELEMS}L ? {n}L - o_ : {CHUNK_ELEMS}L)"
+    return f"{{ for (long o_ = 0; o_ < {n}L; o_ += {CHUNK_ELEMS}L) {fn}({', '.join(a)}); }}"
+
+
 def _slot_id(op: str) -> str:
     return re.sub(r"\W", "_", op)
 
@@ -328,7 +444,9 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
                    tolerance: dict | None = None, strategy: str = "custom",
-                   sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda") -> Path:
+                   sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda",
+                   concurrency: str | None = None, sm_budget_policy: str | None = None,
+                   prune_dead: bool | str | None = None) -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
     ``slot_sources`` maps a slot id (or an op kind) to a seed source
@@ -341,6 +459,17 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     kind, else the hand kernel. ``target="opencl"`` writes OpenCL slots,
     runtime and driver (``kb_export_opencl``); the partition, buffers, ops and
     data are the same.
+
+    ``concurrency`` ("off" | "on"; None: ``$MB_GRAPH_CONCURRENCY``, default off) and ``sm_budget_policy``
+    ("split" | "none" | "strict"; None: ``$MB_SM_BUDGET_POLICY``, default split): with "on", ops that are
+    independent in the whole IR graph (``kb_concurrency``) become concurrent branches of the CUDA graph the driver
+    captures, an op instance that may overlap another of its slot gets its own copy of the slot (a *lane*: separate
+    static state), the slots see ``mb_sm_budget()`` (the SMs an op should size a persistent grid for) and the driver
+    gets a deadlock watchdog. With off (the default) every output file is what it was.
+
+    ``prune_dead`` (None: ``$MB_PRUNE_DEAD``, default on; ``graph_prune``): selected ops whose outputs never reach
+    a graph output (whole-graph liveness) are not exported; the manifest lists them under
+    ``partition.pruned_dead``. Graphs without dead ops export byte-identically either way.
     """
     import torch
 
@@ -357,6 +486,13 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     g = unique_names(ir.graph)
     ops = g["ops"]
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
+    sel_requested = list(sel)
+    # dead-op pruning (graph_prune; $MB_PRUNE_DEAD, default on): ops whose outputs never reach a graph output
+    # get no call; with no dead op in the graph every output file is what it was
+    from . import graph_prune
+    sel, dead = graph_prune.prune_selection(g, sel, list(ir.output_names()), prune_dead)
+    dead_set = set(dead)
+    pruned = [ops[i]["name"] for i in dead if i in set(sel_requested)]
     sel_set = set(sel)
     tensors = g["tensors"]
     specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
@@ -367,7 +503,8 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     # fused ops keep their internal tensor (A's output) as a scratch buffer
     produced = [t for i in sel for t in ops[i]["outputs"] + ops[i].get("internal", [])]
     produced_set = set(produced)
-    consumed_outside = {t for i, o in enumerate(ops) if i not in sel_set for t in o["inputs"]}
+    consumed_outside = {t for i, o in enumerate(ops) if i not in sel_set and i not in dead_set
+                        for t in o["inputs"]}
     graph_outs = set(ir.output_names())
     outputs = [t for t in produced if t in consumed_outside or t in graph_outs]
     boundary = []
@@ -418,9 +555,15 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
 
     # ---- slots + per-op calls
     slots, slot_of, calls, op_recs = {}, {}, [], []
+    conc_ops = []                                 # (full op index, slot id, call stmt, scratch buffers) per op_rec
     dtype = _problem_dtype([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
-    lib = CudaLibrary(_hand_source(hand_cu, dtype)) if tgt is None else \
+    # precision policy (precision_policy.py): a partition mixing fp16 ops and an fp32 island takes its slots from
+    # both hand libraries and the fp16 tolerances; partitions of one dtype (every IR without a policy) unchanged
+    mixed = tgt is None and _is_mixed([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
+    lib = _MixedLibrary(hand_cu) if mixed else CudaLibrary(_hand_source(hand_cu, dtype)) if tgt is None else \
         tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
+    if mixed:
+        dtype = cuda_dtypes.FP16              # the problem's rules / tolerances; fp32 slots say so in their semantics
     for i in sel:
         o = ops[i]
         if o["op"] in ALIAS_OPS:
@@ -429,6 +572,9 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
         if kind not in specs and kind.startswith("fused__"):      # rebuilt from its name
             from .kb_proposals import spec_from_kind
             specs[kind] = spec_from_kind(kind, specs)
+        if kind not in specs and kind.startswith("region__"):     # region slots: from the op's members
+            from .region_slots import region_spec
+            specs[kind] = _CudaSpelled(region_spec(o, specs))
         if kind not in specs:
             raise KeyError(f"{kind}: no KernelSpec")
         spec = specs[kind]
@@ -442,6 +588,11 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 src, tag = slot_sources[key], (slot_source_tags or {}).get(key, "override")
             elif tgt is not None:
                 src, tag = tgt.seed(lib, entry, spec)
+            elif kind.startswith("region__"):          # region: members' current kernels in order (region_slots)
+                from .region_slots import seed_sources
+                subs = (sub_sources or {}).get(sid) or seed_sources(o, slot_sources or {}, specs)
+                src = spec.cuda_seed(lib, sub_sources=subs)
+                tag = f"region-seed:{len(subs)}/{sum(m['op'] not in ALIAS_OPS for m in o['sub_ops'])}"
             elif hasattr(spec, "cuda_seed"):           # fused ops: stage kernels back to back
                 if sub_sources is not None:
                     subs = sub_sources.get(sid, {})
@@ -463,13 +614,21 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                           **({"variant_of": base_sid} if o.get("slot_variant") else {}),
                           "seed_source": tag, "instances": [], "_src": src,
                           "_ref": spec.reference_impl}
+            if mixed and cuda_dtypes.op_dtype(kind) == cuda_dtypes.FP32:
+                slots[sid]["semantics"] = ("(fp32 island of the precision policy: this slot's float pointers are "
+                                           "fp32 `float` buffers, not __half; values exceed the fp16 range) "
+                                           + (spec.semantics or ""))
         if kind not in slots[sid]["ops"]:
             slots[sid]["ops"].append(kind)
             if kind != slots[sid]["op"] and spec.semantics:
                 slots[sid]["semantics"] += f"\n[{kind}] {spec.semantics}"
         k = len(op_recs)
-        args, ins, outs = [], [], []
-        if "sub_ops" in o:
+        args, ins, outs, scalars, ptrs = [], [], [], [], []
+        scratch = []
+        if kind.startswith("region__"):
+            from .region_slots import bind_region
+            arglist = bind_region(o, specs)
+        elif "sub_ops" in o:
             from .kb_proposals import bind_fused
             arglist = bind_fused(o, specs)
         else:
@@ -480,19 +639,28 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
                 b = index[a.value]
                 if a.kind != "scratch":
                     (ins if a.kind == "in" else outs).append(b)
-                args.append(f"({p.ctype})b[{b}]")
+                else:
+                    scratch.append(b)
+                ptrs.append((len(args), b))
+                args.append(_ptr_arg(p.ctype, b))
             elif a.kind == "weight":
                 key = f"w:{a.value}"
                 if key not in index:
                     arr = ir.weights[a.value]
                     add_buf(key, kind="weight", dtype=cuda_dtypes.buffer_dtype(arr.dtype),
                             numel=int(arr.size), alias=None)
-                args.append(f"({p.ctype})b[{index[key]}]")
+                ptrs.append((len(args), index[key]))
+                args.append(_ptr_arg(p.ctype, index[key]))
             elif a.kind == "null":
                 args.append("nullptr")
             else:
+                scalars.append((len(args), p, a.value))
                 args.append(_c_scalar(p.base_type, a.value))
-        calls.append(f"    case {k}: {NS_PREFIX}{sid}::{entry}({', '.join(args)}); break;  // {o['name']}")
+        stmt = _call_stmt(f"{NS_PREFIX}{sid}::{entry}", args, scalars, ptrs, bufs=bufs,
+                          n_ptr_params=sum(x.param.is_ptr for x in arglist),
+                          elementwise=op_class(kind) == "elementwise", cuda=tgt is None, op_name=o["name"])
+        calls.append(f"    case {k}: {stmt} break;  // {o['name']}")
+        conc_ops.append((i, sid, stmt, scratch))
         slots[sid]["instances"].append({"op_name": o["name"], "op": kind, "index": k, "shape": o.get("shape", {})})
         op_recs.append({"index": k, "name": o["name"], "op": kind, "slot": sid,
                         "inputs": ins, "outputs": outs})
@@ -530,30 +698,45 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     (out / "data.bin").write_bytes(bytes(blob))
     head, tail_name, driver_name = ("walker_head.cu", "walker_tail.cu", "driver.cpp") if tgt is None else \
         (tgt.head_name, tgt.tail_name, tgt.driver_name)
+    from . import kb_concurrency as kc
+    conc = kc.resolve(concurrency, sm_budget_policy) if tgt is None else None
+    if conc is None and tgt is None and concurrency is None and any(ops[i]["op"].startswith("region__") for i in sel):
+        conc = kc.resolve("on", sm_budget_policy)    # region slots (spin-waiting megakernels): watchdog + SM budget
+    sched = kc.schedule(g, sel, op_recs, conc_ops, bufs, conc) if conc is not None else None
     (out / head).write_text(
-        "// Shared preamble for every slot (from the ModelBlaster hand kernels).\n" + lib.head_source()
+        "// Shared preamble for every slot (from the ModelBlaster hand kernels).\n"
+        # winners are written against KernelBlaster's harness, which provides these; the walker must too
+        + ("#include <stdint.h>\n#include <cstddef>\n" if tgt is None else "") + lib.head_source()
+        + (kc.HEAD if conc is not None else "")
         if tgt is None else tgt.head_source(lib))
     tail = [
         "// Generated by modelblaster.pipeline.kb_export: one call per op, in IR order.",
+        *([] if tgt is not None else [MB_ANY_PTR]),
         "void mb_run_op(int i, void **b) {", "    switch (i) {", *calls, "    default: break;", "    }", "}",
         f"int mb_num_ops() {{ return {len(op_recs)}; }}",
-        "void launch_gpu_implementation(void **b) {",
-        f"    for (int i = 0; i < {len(op_recs)}; ++i) mb_run_op(i, b);", "}",
+        *(kc.tail(sched, conc, len(op_recs), NS_PREFIX) if conc is not None else [
+            "void launch_gpu_implementation(void **b) {",
+            f"    for (int i = 0; i < {len(op_recs)}; ++i) mb_run_op(i, b);", "}"]),
         *([] if tgt is not None else SO_ABI), ""]
     (out / tail_name).write_text("\n".join(tail))
     tol = {**DTYPE_TOL[dtype], **(tolerance or {})}
     slot_list = list(slots.values())
-    (out / driver_name).write_text((_driver_source if tgt is None else tgt.driver_source)(
-        out / "data.bin", bufs, op_recs, slot_list, tol))
+    if conc is not None:
+        kc.annotate_slots(slot_list, sched)
+    drv_src = (_driver_source if tgt is None else tgt.driver_source)(out / "data.bin", bufs, op_recs, slot_list, tol)
+    (out / driver_name).write_text(kc.driver(drv_src) if conc is not None else drv_src)
     man = {
         "format": FORMAT,
-        "name": name or f"{ir.name}__{ops[sel[0]]['name']}__{ops[sel[-1]]['name']}",
+        "name": name or f"{ir.name}__{ops[sel_requested[0]]['name']}__{ops[sel_requested[-1]]['name']}",
         "source_ir": str(ir_dir), "ir_name": ir.name,
         "partition": {"strategy": strategy, "op_names": [ops[i]["name"] for i in sel],
-                      "op_indices": sel, "is_whole_graph": len(sel) == len(ops)},
+                      "op_indices": sel, "is_whole_graph": len(sel_requested) == len(ops),
+                      **({"pruned_dead": pruned} if pruned else {})},
         "target": target, "dtype": dtype, "tolerance": tol,
         "assembly": {"head": head, "tail": tail_name,
-                     "namespace_prefix": NS_PREFIX, "order": [s["id"] for s in slot_list]},
+                     "namespace_prefix": NS_PREFIX, "order": [s["id"] for s in slot_list],
+                     **({"lanes": sched["lanes"]} if sched and sched.get("lanes") else {})},
+        **({"concurrency": kc.summary(sched, conc)} if conc is not None else {}),
         "driver": driver_name, "data": "data.bin",
         "data_sha1": hashlib.sha1(bytes(blob)).hexdigest(),
         "slots": slot_list, "ops": op_recs, "buffers": bufs,
@@ -571,6 +754,8 @@ SO_ABI = [
     'extern "C" void mb_so_run_op(int i, void **b) { mb_run_op(i, b); }',
     'extern "C" void mb_so_launch(void **b) { launch_gpu_implementation(b); }',
     'extern "C" int mb_so_num_ops() { return mb_num_ops(); }',
+    # the library links its own CUDA runtime: its last error is only visible from in here
+    'extern "C" int mb_so_last_error() { return (int)cudaGetLastError(); }',
 ]
 
 
@@ -692,6 +877,10 @@ struct MbKernels {
     void (*launch)(void **) = nullptr;
     int (*num_ops)() = nullptr;
     void *handle = nullptr;
+    // the slot library's own CUDA runtime last error (host only; nullptr in one process or
+    // for an older library): a launch or cudaFuncSetAttribute that failed inside slot code is
+    // recorded there, where the host's cudaGetLastError never sees it
+    int (*last_error)() = nullptr;
 };
 #ifndef MB_HOST
 void launch_gpu_implementation(void **bufs);
@@ -728,8 +917,34 @@ static double phase_t0 = MB_T_START;
 static void phase(const char *name) { double t = mb_now_ms(); phases.push_back({name, t - phase_t0}); phase_t0 = t; }
 static double env_num(const char *k, double dflt) { const char *v = getenv(k); return v && *v ? atof(v) : dflt; }
 
-static bool ok_cuda(const char *what) {
+// the pending runtime error (cleared): this process's, else the slot library's
+static cudaError_t take_error() {
     cudaError_t e = cudaGetLastError();
+    if (K.last_error) {
+        cudaError_t s = (cudaError_t)K.last_error();
+        if (e == cudaSuccess) e = s;
+    }
+    return e;
+}
+// every op once, in IR order (= K.launch), each launch's error named at once: a bad
+// launch configuration or a failed cudaFuncSetAttribute is reported synchronously by the
+// call that made it, so it is the op's (and its slot's), not the whole partition's.
+// slot_bad[s] = 1 for the slots of the ops that failed; false if any did.
+static bool run_ops_checked(std::vector<int> &slot_bad) {
+    bool ok = true;
+    for (int i = 0; i < NOPS; ++i) {
+        K.run_op(i, dev);
+        cudaError_t e = take_error();
+        if (e != cudaSuccess) {
+            printf("MB_ERROR %s (slot %s): %s\n", OP_NAME[i], SLOT_NAME[OP_SLOT[i]], cudaGetErrorString(e));
+            slot_bad[OP_SLOT[i]] = 1;
+            ok = false;
+        }
+    }
+    return ok;
+}
+static bool ok_cuda(const char *what) {
+    cudaError_t e = take_error();
     if (e == cudaSuccess) e = cudaDeviceSynchronize();
     if (e != cudaSuccess) { printf("MB_ERROR %s: %s\n", what, cudaGetErrorString(e)); return false; }
     return true;
@@ -1070,8 +1285,9 @@ static int mb_eval() {
     const char *mode = getenv("MB_MODE");
     if (mode && !strcmp(mode, "profile")) {
         upload_inputs();
-        for (int i = 0; i < NOPS; ++i) K.run_op(i, dev);
-        bool ok = ok_cuda("profile");
+        std::vector<int> bad(NSLOTS, 0);
+        bool ok = run_ops_checked(bad);
+        ok = ok_cuda("profile") && ok;
         printf(ok ? "MB_PROFILE_DONE\n" : "failed\n");
         return ok ? 0 : 1;
     }
@@ -1106,9 +1322,14 @@ static int mb_eval() {
     // 1. whole partition vs reference
     MB_RANGE("check_partition");
     upload_inputs();
-    K.launch(dev);
+    // op by op (K.launch's sequence): a launch / API error fails its op's slot and leaves the
+    // context usable, so the per-op checks below still give every other slot its verdict; a
+    // fault (seen at the sync) poisons the context and ends the evaluation
+    std::vector<int> launch_bad(NSLOTS, 0);
+    bool launched = run_ops_checked(launch_bad);
     if (!ok_cuda("partition")) { printf("failed\n"); return 1; }
-    all_ok &= check_outputs("MB_CHECK output");
+    if (launched) all_ok &= check_outputs("MB_CHECK output");
+    else all_ok = false;
     MB_RANGE_END();
     phase("check_partition");
 
@@ -1116,7 +1337,8 @@ static int mb_eval() {
     // inputs, weights included, is reset to the reference first
     MB_RANGE("check_ops");
     std::vector<double> slot_err(NSLOTS, 0.0);
-    std::vector<int> slot_bad(NSLOTS, 0);
+    std::vector<int> slot_bad(launch_bad);
+    for (int s = 0; s < NSLOTS; ++s) if (slot_bad[s]) slot_err[s] = INFINITY;
     for (int i = 0; i < NOPS; ++i) {
         if (!sel_op[i]) continue;
         for (int k = OP_IN_OFS[i]; k < OP_IN_OFS[i + 1]; ++k) {
@@ -1339,6 +1561,7 @@ static bool load_so(const char *path, MbKernels &k, std::string &err) {
     if (!abi || abi() != 1 || !k.run_op || !k.launch || !k.num_ops) {
         err = "not an MB slot library (mb_so_abi 1)"; dlclose(h); k = MbKernels{}; return false;
     }
+    k.last_error = (int (*)())dlsym(h, "mb_so_last_error");     // optional: older libraries lack it
     k.handle = h;
     return true;
 }
@@ -1542,6 +1765,13 @@ def parse_timing(text: str) -> dict:
 # nvcc flags of a local build; PTDS_FLAGS puts every <<<>>> launch on the
 # per-thread default stream, which MB_GRAPH=1 needs to capture the partition
 NVCC_FLAGS = ["-O3", "-std=c++17"]
+
+
+def arch_flag(arch) -> str:
+    """nvcc -arch for an sm number: the architecture-specific target (sm_90a / sm_100a) on Hopper / Blackwell,
+    which wgmma and tcgen05 need."""
+    a = str(arch).removeprefix("sm_").rstrip("af")
+    return f"sm_{a}a" if a in ("90", "100") else f"sm_{a}"
 PTDS_FLAGS = ["--default-stream", "per-thread"]
 
 
@@ -1575,10 +1805,20 @@ def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | No
     object and evaluates them in one host request (CUDA graph on, as the host
     always builds with the per-thread default stream); ``runs`` requests."""
     if runtime == "host":
-        return _build_and_run_host(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
-                                   timeout=timeout, runs=runs, env=env)
-    return _build_and_run_process(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
-                                  timeout=timeout, runs=runs, env=env, graph=graph)
+        res = _build_and_run_host(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
+                                  timeout=timeout, runs=runs, env=env)
+    else:
+        res = _build_and_run_process(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
+                                     timeout=timeout, runs=runs, env=env, graph=graph)
+    from .kb_concurrency import deadlocked
+    if deadlocked(res) and (env or {}).get("MB_CONCURRENCY") != "0":
+        # concurrent branches hung (the driver's watchdog): the same program, launched sequentially (recorded)
+        first = res.get("log", "")[-800:]
+        res = build_and_run(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc, timeout=timeout,
+                            runs=runs, env={**(env or {}), "MB_CONCURRENCY": "0"}, graph=graph, runtime=runtime)
+        res["concurrency_fallback"] = {"why": "deadlock watchdog", "log": first}
+        print(json.dumps({"concurrency_fallback": str(problem_dir), "why": "deadlock watchdog"}), flush=True)
+    return res
 
 
 def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs, env) -> dict:
@@ -1611,15 +1851,18 @@ def _build_and_run_process(problem_dir, *, arch, sources, work, nvcc, timeout, r
     problem_dir = Path(problem_dir)
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
-    (work / "kernels.cu").write_text(assemble(problem_dir, sources))
     exe = work / "problem"
-    cmd = [nvcc, *NVCC_FLAGS, f"-arch=sm_{arch}", *(PTDS_FLAGS if graph else []), *cupti_flags(nvcc), "-o", str(exe),
-           str(work / "kernels.cu"), str(problem_dir / "driver.cpp")]
-    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    from . import kb_trace
-    kb_trace.get().tool("nvcc", cmd, cp.returncode, cp.stdout + cp.stderr)
-    if cp.returncode != 0:
-        return {"passed": False, "stage": "compile", "log": (cp.stdout + cp.stderr)[-4000:]}
+    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *(PTDS_FLAGS if graph else [])]
+    if not build_units(problem_dir, exe, sources=sources, work=work, flags=flags, nvcc=nvcc, timeout=timeout,
+                       driver_flags=cupti_flags(nvcc)):
+        # the assembled TU: what a slot the per-slot split cannot express still builds as (and the errors)
+        (work / "kernels.cu").write_text(assemble(problem_dir, sources))
+        cmd = [nvcc, *flags, *cupti_flags(nvcc), "-o", str(exe), str(work / "kernels.cu"), str(problem_dir / "driver.cpp")]
+        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        from . import kb_trace
+        kb_trace.get().tool("nvcc", cmd, cp.returncode, cp.stdout + cp.stderr)
+        if cp.returncode != 0:
+            return {"passed": False, "stage": "compile", "log": (cp.stdout + cp.stderr)[-4000:]}
     if runs <= 0:
         return {"passed": None, "stage": "built", "exe": str(exe)}
     env = {**({"MB_GRAPH": "1"} if graph else {}), **(env or {})}
@@ -1664,8 +1907,11 @@ def build_host(problem_dir, *, arch: str = "75", work: Path | None = None, nvcc:
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
     exe = work / "host"
-    rc, log = _nvcc([nvcc, *NVCC_FLAGS, f"-arch=sm_{arch}", *HOST_FLAGS, *cupti_flags(nvcc), "-o", str(exe),
-                     str(problem_dir / "driver.cpp"), "-ldl"], timeout)
+    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *HOST_FLAGS, *cupti_flags(nvcc)]
+    drv = problem_dir / "driver.cpp"
+    # the shared build cache (KERNELBLASTER_BUILD_CACHE, off by default): same driver text / flags / data / toolchain
+    rc, log = _cached_nvcc("nvcc-host", nvcc, flags, drv.read_text(), exe, ".host",
+                           lambda tmp: _nvcc([nvcc, *flags, "-o", str(tmp), str(drv), "-ldl"], timeout))
     return (exe if rc == 0 else None), log
 
 
@@ -1675,11 +1921,95 @@ def build_so(problem_dir, *, arch: str = "75", sources: dict[str, str] | None = 
     problem_dir = Path(problem_dir)
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
-    cu = work / (Path(name).stem + ".cu")
-    cu.write_text(assemble(problem_dir, sources))
     so = work / name
-    rc, log = _nvcc([nvcc, *NVCC_FLAGS, f"-arch=sm_{arch}", *SO_FLAGS, "-o", str(so), str(cu)], timeout)
+    if build_units(problem_dir, so, sources=sources, work=work / (Path(name).stem + "_units"),
+                   flags=[*NVCC_FLAGS, f"-arch={arch_flag(arch)}", "-Xcompiler", "-fPIC", *PTDS_FLAGS],
+                   link_flags=["-shared"], nvcc=nvcc, timeout=timeout):
+        return so, ""
+    cu = work / (Path(name).stem + ".cu")
+    tu = assemble(problem_dir, sources)
+    cu.write_text(tu)
+    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *SO_FLAGS]
+    rc, log = _cached_nvcc("nvcc-so-tu", nvcc, flags, tu, so, ".so",
+                           lambda tmp: _nvcc([nvcc, *flags, "-o", str(tmp), str(cu)], timeout))
     return (so if rc == 0 else None), log
+
+
+def _cached_nvcc(kind: str, nvcc: str, flags: list, text: str, out: Path, suffix: str, run, extra=()) -> tuple:
+    """``run(tmp) -> (rc, log)`` through the shared build cache (pipeline/build_cache.py; ``KERNELBLASTER_BUILD_CACHE``
+    unset = ``run(out)`` as before). ``text`` and the absolute inputs it names are part of the key."""
+    from . import build_cache
+
+    if build_cache.cache() is None:
+        return run(out)
+    return build_cache.cached_build(kind, [f"nvcc={nvcc}", *flags, *extra, text, *build_cache.external_inputs(text)],
+                                    out, suffix, run)
+
+
+# one TU per slot in the builtin builds (KernelBlaster's incremental build); MB_BUILD_UNITS=0: the assembled TU
+def _units_enabled() -> bool:
+    import os
+
+    return os.environ.get("MB_BUILD_UNITS", "1") != "0"
+
+
+def build_units(problem_dir, out: Path, *, sources: dict[str, str] | None = None, work: Path, flags: list[str],
+                nvcc: str = "nvcc", timeout: int = 1800, driver_flags: list[str] | None = None,
+                link_flags: list[str] | None = None) -> bool:
+    """Build ``out`` from :func:`units` (each compiled ``-c`` with ``flags``, in parallel) plus, when
+    ``driver_flags`` is given, driver.cpp (with them), then one nvcc link (``link_flags``, e.g. -shared).
+    False -- nothing usable at ``out`` -- when disabled (MB_BUILD_UNITS=0) or any step fails; the caller
+    then builds the assembled TU, as KernelBlaster's evaluators fall back."""
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not _units_enabled():
+        return False
+    problem_dir, work = Path(problem_dir), Path(work)
+    udir = work / "units"
+    udir.mkdir(parents=True, exist_ok=True)
+    jobs = []
+    texts = {}                                       # object -> (flags, source text) for the shared cache key
+    for name, text in units(problem_dir, sources):
+        (udir / name).write_text(text)
+        jobs.append(([nvcc, *flags, "-c", str(udir / name), "-o", str(udir / (name + ".o"))], udir / (name + ".o")))
+        texts[udir / (name + ".o")] = (flags, text)
+    if driver_flags is not None:
+        jobs.append(([nvcc, *flags, *driver_flags, "-c", str(problem_dir / "driver.cpp"),
+                      "-o", str(udir / "driver.o")], udir / "driver.o"))
+        texts[udir / "driver.o"] = ([*flags, *driver_flags], (problem_dir / "driver.cpp").read_text())
+    from . import kb_trace, build_cache
+
+    def compile_one(job):
+        def run(tmp):
+            try:
+                cmd = [*job[0][:-1], str(tmp)]
+                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                return cp.returncode, cp.stdout + cp.stderr
+            except subprocess.TimeoutExpired:
+                return -1, f"nvcc timed out after {timeout}s"
+        fl, text = texts[job[1]]
+        return _cached_nvcc("nvcc-c", nvcc, fl, text, job[1], ".o", run)     # cache off: run(job[1]) = the plain nvcc
+
+    with ThreadPoolExecutor(max_workers=max(1, min(len(jobs), os.cpu_count() or 4, 16))) as ex:
+        res = list(ex.map(compile_one, jobs))
+    for (cmd, _), (rc, log) in zip(jobs, res):          # the trace from this thread only
+        kb_trace.get().tool("nvcc", cmd, rc, log)
+    if any(rc for rc, _ in res):
+        return False
+    arch = next(f for f in flags if f.startswith("-arch="))
+    objs = [str(o) for _, o in jobs]
+
+    def link(tmp):
+        try:
+            return _nvcc([nvcc, *(link_flags or []), arch, *objs, "-o", str(tmp)], timeout)
+        except subprocess.TimeoutExpired:
+            return -1, "nvcc timed out"
+    # the link is determined by the objects' sources + flags (cache key); off: link(out)
+    whole = "\x00".join(" ".join(fl) + "\x01" + t for fl, t in texts.values())
+    rc, _ = _cached_nvcc("nvcc-link", nvcc, [*(link_flags or []), arch], whole, Path(out),
+                         ".so" if "-shared" in (link_flags or []) else ".exe", link)
+    return rc == 0
 
 
 class DriverHost:
