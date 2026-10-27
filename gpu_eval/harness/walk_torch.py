@@ -529,9 +529,12 @@ def walk(ir: IR, dev="cuda", keep_all=False):
         for name, val in zip(op["outputs"], outs):
             env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
 
-    for op in ir.ops:
-        run_op(op)
-    out = torch.cat([env[t].reshape(-1) for t in ir.output_names()])
+    try:
+        for op in ir.ops:
+            run_op(op)
+        out = torch.cat([env[t].reshape(-1) for t in ir.output_names()])
+    finally:
+        run_op = None      # break the closure<->cell reference cycle (run_op calls itself): it pins `env`
     return out, env
 
 
