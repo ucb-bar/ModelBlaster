@@ -1480,6 +1480,10 @@ def _f_cast(g: GenericLowering, node):
                 target = a
     sdt = src.meta.get("tensor_meta").dtype if isinstance(src, torch.fx.Node) and \
         hasattr(src.meta.get("tensor_meta"), "dtype") else None
+    if target is not None and target.is_floating_point and target.itemsize == 1 or \
+            str(target).startswith("torch.float4"):
+        # a view would silently drop the rounding (SOL-ExecBench Quant: x.to(torch.float8_e4m3fn))
+        raise NotImplementedError(f"{node.name}: cast to {target}: no fp8/fp4 storage in the IR")
     x = g._tensor_arg(src)
     out = g._out(node)
     if target == torch.bool and sdt != torch.bool:

@@ -209,3 +209,27 @@ def test_outer_lowers(tmp_path):
     ir = mbir.load_ir(tmp_path / "ir")
     out, _ = walk_torch.walk(ir, "cpu")
     assert mbir.compare(out, ir.golden_out, ir.dtype)["ok"]
+
+
+FP8 = '''import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def forward(self, x):
+        return x.to(torch.float8_e4m3fn).to(torch.float32) * 2.0
+def get_inputs():
+    return [torch.randn(4, 8)]
+def get_init_inputs():
+    return []
+'''
+
+
+def test_fp8_cast_is_refused(tmp_path):
+    """A cast to fp8 (SOL Quant's in-graph quantisation) is refused, not lowered as a view that
+    drops the rounding."""
+    import subprocess
+    (tmp_path / "fp8.py").write_text(FP8)
+    env = {**__import__("os").environ, "PYTHONPATH": str(MB.parent)}
+    cp = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.extract_graph", "--bench-file",
+                         str(tmp_path / "fp8.py"), "--out-dir", str(tmp_path / "ir"), "--quant", "fp32"],
+                        capture_output=True, text=True, timeout=300, env=env)
+    assert cp.returncode != 0 and "no fp8/fp4 storage" in cp.stderr
