@@ -56,6 +56,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 from . import graph_hints as gh
@@ -100,6 +101,31 @@ def set_budget(problem: Path, budget: dict) -> bool:
     man["mb_budget"] = b
     f.write_text(json.dumps(man, indent=1))
     return True
+
+
+def _env_on(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "off", "false", "no")
+
+
+def _env_num(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+def est_gain_pct(h: dict) -> float:
+    return max((s.get("est_gain_pct") or 0.0) for s in (h.get("source") or [{}]))
+
+
+def is_region(h: dict) -> bool:
+    return str(h.get("kind", "")).endswith("_region") or str(h.get("id", "")).startswith("region:")
+
+
+def is_fusion(h: dict) -> bool:
+    """A hint whose acceptance removes ops (the plan problems of those ops are then wasted work): fuse, fuse_siblings,
+    fuse_attention ...; not a region (it has its own, capped budget), not a layout fold or a split."""
+    return str(h.get("kind", "")).startswith("fuse") and not is_region(h)
 
 
 class GraphSearch:
@@ -465,6 +491,8 @@ class GraphSearch:
         for h in doc["hints"]:
             if h.get("status") != "proposed" or h.get("target", "cuda") != "cuda":
                 continue
+            if self.survival_on and is_region(h) and _env_on("MB_SURVIVAL_EXCLUDE_REGION"):
+                continue            # region:all was accepted on 0 of ~21 attempts: it must not cut the slots' steps
             p = float((self.prior(h) or {}).get("p_mean", 0.5))
             for ir, g in graphs.items():
                 try:
@@ -517,12 +545,36 @@ class GraphSearch:
         return vp.BudgetCfg(base_steps=base, min_steps=1, max_steps=max(base, vs), cap_steps=self.cap_steps,
                             eta=self.eta)
 
+    def high_gain_mult(self, h: dict) -> int:
+        """Step multiplier of a hint with a large predicted gain (``MB_HIGHGAIN_PCT`` est. gain %, default 10; 0 = off;
+        ``MB_HIGHGAIN_MULT``, default 2): more steps per rung and a higher cap than the default. Only with survival."""
+        thr = _env_num("MB_HIGHGAIN_PCT", 10.0)
+        if not self.survival_on or thr <= 0 or is_region(h) or est_gain_pct(h) < thr:
+            return 1
+        return max(1, int(_env_num("MB_HIGHGAIN_MULT", 2)))
+
+    def region_cap(self, h: dict) -> int:
+        """Total decision steps a region hint may spend over all rungs (``MB_REGION_DECISION_STEPS``, default 2; 0 = no
+        cap). Only with survival. 0 here = no cap."""
+        if not self.survival_on or not is_region(h):
+            return 0
+        return max(0, int(_env_num("MB_REGION_DECISION_STEPS", 2)))
+
+    def cap_for(self, h: dict) -> int:
+        """The hint's cap over all its rungs (``--graph-cap-steps``; a region's and a high-gain hint's differ)."""
+        rc = self.region_cap(h)
+        return min(self.cap_steps, rc) if rc else self.cap_steps * self.high_gain_mult(h)
+
     def hint_budget(self, h: dict) -> dict:
         d = h.get("gs_deferred") or {}
         rung = int(d.get("rung", -1)) + 1
         used = int(d.get("steps_used", 0))
-        bc = self.bc()
+        bc, m = self.bc(), self.high_gain_mult(h)
+        if m > 1:
+            bc = replace(bc, base_steps=bc.base_steps * m, max_steps=bc.max_steps * m, cap_steps=bc.cap_steps * m)
         st = vp.rung_steps(rung, bc.base_steps, bc, used)
+        if (rc := self.region_cap(h)):
+            st = min(st, max(0, rc - used))
         return {"rung": rung, "steps": max(1, st) if st > 0 else 0, "used": used}
 
 
@@ -665,7 +717,7 @@ class GraphSearch:
             job["gs"] = b
             if "early" not in job:
                 if b["steps"] <= 0:
-                    job["early"] = f"graph search: hint budget exhausted ({b['used']}/{self.cap_steps} steps)"
+                    job["early"] = f"graph search: hint budget exhausted ({b['used']}/{self.cap_for(h)} steps)"
                 else:
                     for side in ("orig", "variant"):
                         set_budget(job[side], {"steps": b["steps"], "stop_patience": 0})
@@ -677,8 +729,8 @@ class GraphSearch:
         run_dir = R / "run"
         eng = Interleaved(
             self, run_dir=run_dir, prog=prog,
-            start=lambda probs: kb.start(probs, run_dir, winners=R / "winners", parallel_problems=par,
-                                         stop_patience=cfg.stop_patience),
+            start=lambda probs, append=False: kb.start(probs, run_dir, _append=append, winners=R / "winners",
+                                                       parallel_problems=par, stop_patience=cfg.stop_patience),
             read=lambda d: go.read_result(run_dir, Path(d)),
             measure=lambda j, ro, rv, attempts=None: kbt.run_within(parent, "mb.remeasure", go.measure_hint, j, ro,
                                                                     rv, cfg, leases, attempts=attempts),
@@ -688,7 +740,8 @@ class GraphSearch:
             collect=lambda probs, proc: kb.collect([Path(x) for x in probs], run_dir, proc),
             scope_after=lambda j: self.absorbed(j, doc, graphs, specs),
             save_hints=lambda: gh.save(doc, hints_path), poll_s=poll_s,
-            workers=max(1, min(max(1, len(jobs)), 2 * (len(leases.devices) if leases is not None else 1))))
+            workers=max(1, min(max(1, len(jobs)), 2 * (len(leases.devices) if leases is not None else 1))),
+            fusion_first=self.survival_on and _env_on("MB_FUSION_FIRST") and kb.halfway is None)
         self.event("interleaved_start", plan_problems=len(plan_dirs), hints=[j["hint"]["id"] for j in jobs],
                    waiting=[cands[i][0]["id"] for w in waves[1:] for i in w],
                    budgets={j["hint"]["id"]: j["gs"] for j in jobs})
@@ -873,8 +926,10 @@ class Interleaved:
     results``. ``prog``: a kb_resume.RoundProgress (phase ``gs_inter``: budgets and finished decisions)."""
 
     def __init__(self, gs: GraphSearch, *, run_dir: Path, prog, start, read, measure, finish, collect,
-                 scope_after=None, save_hints=None, poll_s: float = 1.0, workers: int = 2):
+                 scope_after=None, save_hints=None, poll_s: float = 1.0, workers: int = 2,
+                 fusion_first: bool = False):
         self.gs, self.run_dir, self.prog = gs, Path(run_dir), prog
+        self.fusion_first = fusion_first         # hold the plan problems a pending fusion would absorb (see held())
         self.start, self.read, self.measure, self.finish, self.collect = start, read, measure, finish, collect
         self.scope_after, self.save_hints = scope_after, save_hints
         self.poll_s, self.workers = poll_s, workers
@@ -900,6 +955,27 @@ class Interleaved:
                     out.append(name)
         return out
 
+    def held(self, plan_dirs: list[Path], plan_irs: list[str], live: list[dict]) -> list[Path]:
+        """``fusion_first``: the plan problems whose ops are all absorbed by the union of this round's pending fusion
+        decisions (the problems :meth:`stop_absorbed` would stop on acceptance) wait for those decisions: a run that
+        an accepted fusion absorbs wasted ~$76 / 319 steps in the sweep. The decisions are made first (the hint pairs
+        run in the first KernelBlaster invocation), then the members the accepted fusions did not absorb run."""
+        if not self.fusion_first or self.scope_after is None:
+            return []
+        absorb: dict[str, set] = {}
+        for j in live:
+            if is_fusion(j["hint"]):
+                try:
+                    absorb.setdefault(j["ev"].get("ir"), set()).update(self.scope_after(j))
+                except Exception:  # noqa: BLE001 -- a failed scope only means "do not hold"
+                    continue
+        out = []
+        for d, pir in zip(plan_dirs, plan_irs):
+            atoms = _problem_atoms(d)
+            if atoms and atoms <= absorb.get(pir, set()):
+                out.append(Path(d))
+        return out
+
     def run(self, plan_dirs: list[Path], plan_irs: list[str], jobs: list[dict]) -> dict:
         """jobs: prepared hint jobs (``orig`` / ``variant`` dirs, ``hint``, ``ev``, ``names``; ``early`` = nothing
         to run), each with ``gs`` = {rung, steps, used}. -> {"plan_results", "decisions", "stopped"}."""
@@ -907,7 +983,10 @@ class Interleaved:
         decided: dict[str, dict] = dict(st.get("decided") or {})
         live = [j for j in jobs if "early" not in j]
         hint_probs = [p for j in live for p in (j["orig"], j["variant"])]
-        problems = hint_probs + list(plan_dirs)      # hint problems first: they start at once
+        hold = self.held(list(plan_dirs), plan_irs, live)
+        problems = hint_probs + [d for d in plan_dirs if d not in hold]   # hint problems first: they start at once
+        if hold:
+            self.gs.event("fusion_first", held=[_manifest(d)["name"] for d in hold])
         res_by: dict[str, tuple] = {}
         stopped: list[str] = list(st.get("stopped") or [])
         decisions: dict[str, dict] = {}
@@ -969,6 +1048,25 @@ class Interleaved:
                 raise
         results = self.collect(problems, proc) if proc is not None else []
         n = len(hint_probs)
+        if hold:                                     # the fusions are decided: the members they left alive run now
+            by_name = {str(r.get("problem")): r for r in results}
+            absorbed = {ir: set(a) for ir, a in self.absorbed_so_far.items()}
+            for j in live:                           # accepted before a restart: not in absorbed_so_far
+                if (decided.get(j["hint"]["id"]) or {}).get("hint_status") == "accepted" and self.scope_after:
+                    absorbed.setdefault(j["ev"].get("ir"), set()).update(self.scope_after(j))
+            irs = dict(zip(map(str, plan_dirs), plan_irs))
+            go_on = [d for d in hold if not (_problem_atoms(d) and _problem_atoms(d) <= absorbed.get(irs[str(d)], set()))]
+            for d in hold:
+                if d not in go_on:                   # absorbed by an accepted fusion: never started (as a stopped run)
+                    nm = _manifest(d)["name"]
+                    by_name[nm] = {"problem": nm, "final_ok": False, "_dir": str(self.run_dir / nm),
+                                   "efficiency": {"external_stop": {"by": "graph_search", "why": "absorbed before start"}}}
+            if go_on:
+                res2 = self.collect(go_on, self.start(go_on, append=True))
+                by_name.update({str(r.get("problem")): r for r in res2})
+            self.gs.event("fusion_first_run", started=[_manifest(d)["name"] for d in go_on],
+                          skipped=[_manifest(d)["name"] for d in hold if d not in go_on])
+            results = [by_name[_manifest(d)["name"]] for d in list(hint_probs) + list(plan_dirs)]
         for j in jobs:
             decisions[j["hint"]["id"]] = decided.get(j["hint"]["id"])
         return {"plan_results": results[n:], "hint_results": results[:n],
@@ -999,7 +1097,7 @@ def decide_checkpoint(gs: GraphSearch, job: dict, ro: dict | None, rv: dict | No
         d = h.get("gs_deferred") or {}
         hr = next((s.get("headroom") for s in reversed(h.get("source") or []) if s.get("headroom")), None)
         x = vp.checkpoint(orig_us=o, var_us=v, accept_gain=cfg.accept_gain, rung=b["rung"],
-                          steps_used=b["used"] + b["steps"], cap_steps=gs.cap_steps, hr=hr,
+                          steps_used=b["used"] + b["steps"], cap_steps=gs.cap_for(h), hr=hr,
                           history=d.get("history") or [], traj=vp.trajectory(rv), prior=pr, defer=True)
     if x is not None and x["decision"] == "promising":
         rec = gh.get(doc, h["id"]) or h
