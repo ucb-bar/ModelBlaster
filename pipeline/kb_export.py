@@ -50,6 +50,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -625,7 +626,7 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                    tolerance: dict | None = None, strategy: str = "custom",
                    sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda",
                    concurrency: str | None = None, sm_budget_policy: str | None = None,
-                   prune_dead: bool | str | None = None, conditioning: bool = True) -> Path:
+                   prune_dead: bool | str | None = None, conditioning: bool | None = None) -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
     ``slot_sources`` maps a slot id (or an op kind) to a seed source
@@ -639,7 +640,9 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     runtime and driver (``kb_export_opencl``); the partition, buffers, ops and
     data are the same. ``conditioning`` adds each output's reference error
     (``reference_error``; a second, float64 walk, ``exact_values``) to its
-    bound; off, the term is 0.
+    bound; off, the term is 0. ``None`` (the default): ``$MB_EXPORT_CONDITIONING`` (1 / 0) if set, else on for
+    a bf16 or native (per-tensor dtype) IR -- the SOL-ExecBench problems -- and off for fp16 / fp32 IRs, so the
+    KernelBench default path keeps the bound and cost it had before tensor-dtypes (X-153).
 
     ``concurrency`` ("off" | "on"; None: ``$MB_GRAPH_CONCURRENCY``, default off) and ``sm_budget_policy``
     ("split" | "none" | "strict"; None: ``$MB_SM_BUDGET_POLICY``, default split): with "on", ops that are
@@ -664,6 +667,10 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     mbir, walk_torch = _harness()
     ir_dir, out = Path(ir_dir).resolve(), Path(out_dir).resolve()
     ir = mbir.load_ir(ir_dir)
+    if conditioning is None:
+        _env = os.environ.get("MB_EXPORT_CONDITIONING")
+        conditioning = (_env.strip().lower() not in ("0", "off", "false", "no") if _env is not None
+                        else ir.graph.get("quant") in ("native", "bf16"))
     g = unique_names(ir.graph)
     ops = g["ops"]
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
@@ -2531,7 +2538,7 @@ def main():
     for sub, idx in parts:
         d = export_problem(ir_dir, Path(a.out_dir) / sub if sub else a.out_dir, op_indices=idx,
                            hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", target=a.target,
-                           conditioning=not a.no_conditioning)
+                           conditioning=False if a.no_conditioning else None)
         line = {"problem": str(d)}
         if a.build_check:
             if a.target == "opencl":

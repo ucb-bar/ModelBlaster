@@ -61,7 +61,7 @@ class ConditioningTest(unittest.TestCase):
                             env={**os.environ, "PYTHONPATH": os.pathsep.join(
                                 [str(ROOT.parent), os.environ.get("PYTHONPATH", "")])})
         assert cp.returncode == 0, cp.stderr[-2000:]
-        cls.prob = kb_export.export_problem(d / "ir", d / "prob", strategy="whole")
+        cls.prob = kb_export.export_problem(d / "ir", d / "prob", strategy="whole", conditioning=True)
         cls.man = json.loads((cls.prob / "manifest.json").read_text())
 
     @classmethod
@@ -93,6 +93,28 @@ class ConditioningTest(unittest.TestCase):
         vals = ref[cancel["ref"][0]:cancel["ref"][0] + cancel["ref"][1]].view(np.float32)
         plain = 1e-3 * float(np.abs(vals).max()) + 1e-5
         self.assertGreater(cancel["ref_err"], plain)
+
+    def test_default_follows_the_ir_dtype_and_the_env(self):
+        """conditioning=None (the default): off for this fp32 IR (the KernelBench default path keeps its old bound and
+        cost), forced on by $MB_EXPORT_CONDITIONING=1; a bf16 / native IR defaults to on (the SOL problems)."""
+        def refs(out):
+            man = json.loads((out / "manifest.json").read_text())
+            return [man["buffers"][i].get("ref_err") for i in man["outputs"]]
+        p = kb_export.export_problem(self.d / "ir", self.d / "dflt", strategy="whole")
+        self.assertTrue(all(r is None for r in refs(p)))
+        old = os.environ.get("MB_EXPORT_CONDITIONING")
+        os.environ["MB_EXPORT_CONDITIONING"] = "1"
+        try:
+            p = kb_export.export_problem(self.d / "ir", self.d / "dflt_env", strategy="whole")
+            self.assertTrue(all(r is not None for r in refs(p)))
+            os.environ["MB_EXPORT_CONDITIONING"] = "0"
+            p = kb_export.export_problem(self.d / "ir", self.d / "dflt_env0", strategy="whole", conditioning=None)
+            self.assertTrue(all(r is None for r in refs(p)))
+        finally:
+            if old is None:
+                os.environ.pop("MB_EXPORT_CONDITIONING", None)
+            else:
+                os.environ["MB_EXPORT_CONDITIONING"] = old
 
     def test_no_conditioning(self):
         p = kb_export.export_problem(self.d / "ir", self.d / "nocond", strategy="whole", conditioning=False)
