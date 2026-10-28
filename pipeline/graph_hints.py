@@ -84,7 +84,7 @@ from pathlib import Path
 
 FORMAT = "modelblaster.graph_hints/v1"
 CUDA_KINDS = ("fuse", "split_slot", "unfuse", "fold_layout", "fuse_attention", "fuse_siblings", "fuse_region",
-              "fuse_view")
+              "fuse_view", "rewrite")
 NOT_ON_CUDA = {
     "tile_split": "OC/N tiles exist to run one op on several cores at once; a CUDA kernel already spans "
                   "every SM and the driver runs one stream, so tiles would serialise (use split_slot for "
@@ -700,8 +700,18 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
         return ({"fuse": 0, "unfuse": -1, "fuse_siblings": 0.3, "fuse_attention": 0.4, "fold_layout": 0.5,
                  "split_slot": 1, "fuse_region": 1.5, "fuse_view": 0.1}.get(h["kind"], 2), 0)
 
+    ordered = sorted(todo, key=order)
+    if any(h["kind"] == "rewrite" for h in ordered):
+        # a graph rewrite (graph_rewrite.py) was proposed on the graph the hints accepted AT THAT TIME had produced: it applies right
+        # after the last of them (``rewrite.after_hints``), before every hint accepted later (their patterns then see the new ops;
+        # a later hint that names an op the rewrite removed is skipped as not applicable)
+        rws = [h for h in ordered if h["kind"] == "rewrite"]
+        ordered = [h for h in ordered if h["kind"] != "rewrite"]
+        for h in rws:
+            after = set((h.get("rewrite") or {}).get("after_hints") or [])
+            ordered.insert(max((i for i, x in enumerate(ordered) if x["id"] in after), default=-1) + 1, h)
     added = {}
-    for h in sorted(todo, key=order):
+    for h in ordered:
         if h.get("target", "cuda") == "riscv" and h["kind"] == "fuse" and "dispatch_groups" in h:
             try:
                 chains = _xpurt_fuse_to_chains(g, h)
@@ -737,6 +747,11 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
             specs.update(sp)
         elif h["kind"] == "fuse_region":
             g, sp = _apply_fuse_region_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "rewrite":                 # graph_rewrite.py: an agent / MB rewrite stored as a patch + derived weights
+            from .graph_rewrite import apply_rewrite_hint
+            g, sp = apply_rewrite_hint(g, h, specs, prov)
             added.update(sp)
             specs.update(sp)
         elif h["kind"] == "fold_layout":
@@ -806,7 +821,11 @@ def verify_rewrite(ir_dir: Path, graph: dict, *, specs: dict | None = None, buil
     ir = mbir.load_ir(ir_dir)
     with torch.no_grad():
         ref, _ = walk_torch.walk(ir, dev="cpu")
-        new_ir = mbir.IR(ir.name, graph, ir.weights, ir.golden_in, ir.golden_out)
+        weights = ir.weights
+        if graph.get("weight_derivations"):                  # a rewrite's derived weights: rebuilt from the base ones
+            from . import weight_derivations as wd
+            weights = wd.fill_missing(graph, weights)
+        new_ir = mbir.IR(ir.name, graph, weights, ir.golden_in, ir.golden_out)
         out, _ = walk_torch.walk(new_ir, dev="cpu")
     res = {"golden": mbir.compare(out, ir.golden_out),
            "vs_original_walk": float((out - ref).abs().max()) if out.shape == ref.shape else None}
