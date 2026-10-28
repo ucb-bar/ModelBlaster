@@ -72,9 +72,20 @@ Members are stored as **atom names** (`graph_hints.atoms`), so a window survives
 ops. The hint key is `windows`, not `groups`: `groups` belongs to the split hints and `record_decision` moves it to `tried_groups` when a
 hint is accepted.
 
-## Measurements (`l3_farm/region_loop/results/windows_*.txt`; CPU, real final IRs of the headline runs, synthetic weights of the right shapes)
+## Measurements (`l3_farm/region_loop/results/windows_measure.txt`; CPU; the real final graphs of the headline runs, synthetic weights of the right shapes; `export_problem` only, nothing built)
 
-See SUMMARY.txt: windows / ops proposed, largest exported region (source KB, signature pointers), proposer and `export_problem` seconds.
+`windows_probe.py` (proposer) and `windows_export.py` (hint applied through `apply_hints`, then `export_problem`; the fused members' seeds are the hand-kernel
+composites):
+
+| problem (final IR) | candidates (sizes 64,128,256,512) | windows (ops incl. views) | proposer s | export s | largest region: source / entry pointers |
+|---|---|---|---|---|---|
+| 34_VanillaRNNHidden, 1062 ops (805 executed) | whole; chunk512; chunk256; chunk128; chunk64; motif sets duplicate chunk | whole 1 x 1062; chunk512 640+640+37 atoms; **chunk256: 4 x 64 recurrence steps (256 ops) + the 37-op stack**; chunk128: 8 x 32 steps + stack; chunk64: 16 x 16 steps + stack | 0.13 (M=256) - 0.5 (4 sizes) | 0.1-0.2 | whole 318 KB / 1067; chunk256 75 KB / 293; chunk128 40 KB / 293; chunk64 23 KB / 293 |
+| 15_DenseNet121, 305 ops (246 executed) | whole; chunk256 (= blocks); chunk128; chunk64 | whole 1 x 305; **chunk256: 2 windows (221 + 84 ops: dense blocks 0-2 + transitions, block 3)**; chunk128: 2 windows; chunk64: 4 windows (whole dense blocks only, ~70% of the ops left plain; chunk128 covers 56%) | 0.04-0.07 | 0.7-0.8 | whole 133 KB / 516; chunk256 104 KB / 377 |
+| 14_DenseNet121DenseBlock, 19 ops | whole (the flow's own `region:all` shape) | 1 | 0.0 | - | - |
+
+Before this change none of these could be proposed (34: 805-1062 ops, 15: 246-305 ops, cap 256); by default the top 3 candidates per IR are proposed (`--region-window-candidates`). 0 windows are dropped by validation on these graphs; peak RSS 0.3 GB
+(34) / 3 GB (15, the walk of the synthetic export). A window never cuts a DenseNet block (every later concat reads the block's views): chunk64 on 15 therefore
+covers only the blocks that fit.
 
 ## Invariants
 
