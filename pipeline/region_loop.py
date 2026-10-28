@@ -61,9 +61,18 @@ def _budget(cfg) -> str:
     return b
 
 
+_ROUND: bool | None = None       # the round controller's per-round switch (round_controller.py); None = the flag alone decides
+
+
+def set_round(v: bool | None) -> None:
+    global _ROUND
+    _ROUND = v
+
+
 def kb_args(cfg) -> list:
-    """The KernelBlaster ``run_multislot.py`` flags of the setting: ``[]`` when off (the command line is then what it was)."""
-    if resolve_mode(cfg) != "on":
+    """The KernelBlaster ``run_multislot.py`` flags of the setting: ``[]`` when off (the command line is then what it was), and when the
+    round controller left the region loop out of this round."""
+    if resolve_mode(cfg) != "on" or _ROUND is False:
         return []
     b = _budget(cfg)
     return ["--region-loop", "on"] + (["--region-loop-budget", b] if b else [])
