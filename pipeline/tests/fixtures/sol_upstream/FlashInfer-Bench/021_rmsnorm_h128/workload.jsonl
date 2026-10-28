@@ -1,0 +1,5 @@
+{"uuid": "4b7f0d02-8404-4eb4-be5c-64b0fd639684", "axes": {"batch_size": 192}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}}
+{"uuid": "6abd9329-a1de-4704-9378-d7d70388cbfd", "axes": {"batch_size": 24}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}}
+{"uuid": "52688c58-7dd4-4ce5-8ed7-bc8aabac4d7b", "axes": {"batch_size": 32}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}}
+{"uuid": "e971e0cc-d914-424e-a3ea-187e9cec413f", "axes": {"batch_size": 4}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}}
+{"uuid": "3b02c1b8-29dc-4c13-86a0-b7834daad8a1", "axes": {"batch_size": 1088}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}}
