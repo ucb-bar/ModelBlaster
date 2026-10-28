@@ -43,6 +43,8 @@ class IR:
     # a mixed IR's io.npz (--quant native, docs/tensor_dtypes.md): every graph
     # input / output at its own dtype, as `in.<name>` / `out.<name>`
     io_tensors: dict | None = None
+    # the directory it was loaded from (sol_tolerance finds SOL's reference outputs beside it)
+    dir: str | None = None
 
     @property
     def ops(self) -> list[dict]:
@@ -114,11 +116,45 @@ def load_ir(d: str | Path) -> IR:
     if g.get("weight_derivations"):
         # derived weights (pipeline/weight_derivations.py): rebuild any entry weights.npz lacks from its base weights
         weights = _weight_derivations().fill_missing(g, weights)
-    return IR(g["name"], g, weights, io["input"], io["output"], per or None)
+    return IR(g["name"], g, weights, io["input"], io["output"], per or None, str(d))
 
 
-def compare(out: torch.Tensor, golden: np.ndarray, dtype: str = "fp32") -> dict:
-    """max |out - golden| <= golden_rel * max|finite golden| + golden_abs (per dtype)."""
+def _sol_tolerance():
+    """pipeline/sol_tolerance.py, loaded by path like cuda_dtypes (numpy only at import)."""
+    spec = importlib.util.spec_from_file_location(
+        "sol_tolerance", Path(__file__).resolve().parents[2] / "pipeline" / "sol_tolerance.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def compare_sol(out, ref, tol: dict | None) -> dict:
+    """SOL-ExecBench's per-element check of ``out`` against ``ref`` (sol_tolerance.sol_compare): matched ratio on
+    ``|out - ref| <= max_atol + max_rtol * |ref|``, inf / NaN, all-zero vs non-zero, max_error_cap."""
+    return _sol_tolerance().sol_compare(out, ref, tol)
+
+
+def sol_for(ir: "IR") -> dict | None:
+    """The SOL tolerance the golden checks add (docs/sol_gate.md): the first output's recorded ``sol_tolerance``, only when the
+    SOL gate is on (``MB_SOL_GATE`` final | accept) -- off (the default): None, the checks are what they were."""
+    import os
+    if os.environ.get("MB_SOL_GATE", "off").strip().lower() in ("", "off", "0", "no", "false"):
+        return None
+    outs = (ir.graph.get("sol_tolerance") or {}).get("outputs")
+    return dict(outs[0]) if outs else None
+
+
+def compare(out: torch.Tensor, golden: np.ndarray, dtype: str = "fp32", sol: dict | None = None) -> dict:
+    """max |out - golden| <= golden_rel * max|finite golden| + golden_abs (per dtype). With ``sol`` (a SOL_TOLERANCE
+    dict) the result also carries ``sol`` = SOL's check of ``out`` against the golden, and ``ok`` is both."""
+    res = _compare_bound(out, golden, dtype)
+    if sol is not None and "why" not in res:
+        res["sol"] = compare_sol(out, golden, sol)
+        res["ok"] = bool(res["ok"] and res["sol"]["ok"])
+    return res
+
+
+def _compare_bound(out: torch.Tensor, golden: np.ndarray, dtype: str = "fp32") -> dict:
     tol = cuda_dtypes.TOLERANCE[dtype]
     o = out.detach().float().cpu().reshape(-1).numpy()
     g = golden.astype(np.float32).reshape(-1)

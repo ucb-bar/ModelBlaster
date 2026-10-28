@@ -494,8 +494,11 @@ def fuse_siblings(graph: dict, names: list[str], specs: dict) -> tuple[dict, Fus
 def write_variant_ir(ir_dir: Path, graph: dict, out: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     (out / "graph.json").write_text(json.dumps(graph, indent=1))
-    for f in ("weights.npz", "io.npz"):
+    for f in ("weights.npz", "io.npz", "sol_ref.npz"):
         dst = out / f
+        if f == "sol_ref.npz":                     # SOL's reference outputs (sol_tolerance.py), only when the IR has them
+            if not (Path(ir_dir).resolve() / f).exists():
+                continue
         if f == "weights.npz" and graph.get("weight_derivations"):
             # a graph rewrite with derived weights (weight_derivations.py): the variant's weights.npz holds the base
             # weights AND the derived ones, rebuilt from the source IR's weights by the recorded derivations
