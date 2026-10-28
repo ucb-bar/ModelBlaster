@@ -20,3 +20,14 @@ class ArchOptTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LinkArchTest(unittest.TestCase):
+    def test_build_units_finds_the_arch_token(self):
+        """build_units links with the arch token of its flags: -arch=... or, on Blackwell, one -gencode=... token
+        (it raised StopIteration on the first B200 run, 2026-10-27)."""
+        import inspect
+        src = inspect.getsource(kb_export.build_units)
+        self.assertIn('startswith(("-arch=", "-gencode="))', src)
+        for flags in (["-O3", kb_export.arch_opt(89)], ["-O3", kb_export.arch_opt(100), "-std=c++17"]):
+            self.assertTrue(next(f for f in flags if f.startswith(("-arch=", "-gencode="))))

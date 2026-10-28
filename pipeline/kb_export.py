@@ -2349,7 +2349,7 @@ def build_units(problem_dir, out: Path, *, sources: dict[str, str] | None = None
         kb_trace.get().tool("nvcc", cmd, rc, log)
     if any(rc for rc, _ in res):
         return False
-    arch = next(f for f in flags if f.startswith("-arch="))
+    arch = next(f for f in flags if f.startswith(("-arch=", "-gencode=")))      # arch_opt(): Blackwell is one -gencode= token
     objs = [str(o) for _, o in jobs]
 
     def link(tmp):
