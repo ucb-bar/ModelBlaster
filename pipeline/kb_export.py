@@ -60,6 +60,7 @@ from pathlib import Path
 import numpy as np
 
 from . import cuda_dtypes
+from . import sol_tolerance
 from .kernel_abi import bind, parse_signature
 from .op_classes import op_class
 
@@ -626,7 +627,8 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                    tolerance: dict | None = None, strategy: str = "custom",
                    sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda",
                    concurrency: str | None = None, sm_budget_policy: str | None = None,
-                   prune_dead: bool | str | None = None, conditioning: bool | None = None) -> Path:
+                   prune_dead: bool | str | None = None, conditioning: bool | None = None,
+                   sol: bool | None = None) -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
     ``slot_sources`` maps a slot id (or an op kind) to a seed source
@@ -643,6 +645,11 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     bound; off, the term is 0. ``None`` (the default): ``$MB_EXPORT_CONDITIONING`` (1 / 0) if set, else on for
     a bf16 or native (per-tensor dtype) IR -- the SOL-ExecBench problems -- and off for fp16 / fp32 IRs, so the
     KernelBench default path keeps the bound and cost it had before tensor-dtypes (X-153).
+
+    ``sol`` (None: as ``--sol-gate`` / ``$MB_SOL_GATE`` say; False: never): the driver also checks the graph outputs the
+    partition produces with SOL-ExecBench's rule (``sol_tolerance``: matched ratio of ``|out - ref| <= atol + rtol*|ref|``
+    against SOL's reference outputs and / or the golden), fp32 slots get a bound derived from SOL's tolerance, and the
+    manifest has a ``sol`` block. Off (the default), or a problem without a SOL tolerance: every output file is what it was.
 
     ``concurrency`` ("off" | "on"; None: ``$MB_GRAPH_CONCURRENCY``, default off) and ``sm_budget_policy``
     ("split" | "none" | "strict"; None: ``$MB_SM_BUDGET_POLICY``, default split): with "on", ops that are
@@ -746,6 +753,12 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
             add_buf(t, kind=kind_of(t), dtype=_tensor_dtype(ir, t), numel=int(np.prod(ir.tshape(t))),
                     alias={"base": index[base], "offset": off})
 
+    # ---- SOL-ExecBench's tolerance (sol_tolerance.py): None unless --sol-gate / MB_SOL_GATE and the IR has one
+    sol_spec, sol_cap, cap_used = None, None, False
+    if sol is not False and tgt is None:
+        sol_spec = sol_tolerance.export_spec(ir, ir.graph, list(ir.output_names()), bufs)
+        sol_cap = sol_tolerance.slot_cap_for(ir, ir.graph, env)      # every export, a one-op partition's included
+
     # ---- slots + per-op calls
     slots, slot_of, calls, op_recs = {}, {}, [], []
     conc_ops = []                                 # (full op index, slot id, call stmt, scratch buffers) per op_rec
@@ -821,6 +834,12 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                           # the slot's storage dtype and its isolated-op bound (a mixed problem's
                           # slots differ; a cast slot's is its destination's)
                           "dtype": sdt, "tolerance": {k: DTYPE_TOL[sdt][k] for k in ("slot_rel", "slot_abs")}}
+            if sol_cap is not None and sdt == cuda_dtypes.FP32:
+                # SOL's tolerance bounds what one fp32 slot may lose (sol_tolerance.slot_cap): a candidate the flow's
+                # bound accepts (single-pass TF32) can still break the final output's SOL check
+                if sol_cap < slots[sid]["tolerance"]["slot_rel"]:
+                    slots[sid]["tolerance"]["slot_rel"] = sol_cap
+                    cap_used = True
             if mixed and sdt == cuda_dtypes.FP32:
                 slots[sid]["semantics"] = ("(fp32 island of the precision policy: this slot's float pointers are "
                                            "fp32 `float` buffers, not __half; values exceed the fp16 range) "
@@ -874,6 +893,8 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
         if dtype == MIXED:                       # the driver's isolated bound of this op (its dtype's)
             op_recs[-1]["tolerance"] = {**slots[sid]["tolerance"], **{
                 k: v for k, v in (tolerance or {}).items() if k in ("slot_rel", "slot_abs")}}
+        elif cap_used and slots[sid]["dtype"] == cuda_dtypes.FP32:
+            op_recs[-1]["tolerance"] = dict(slots[sid]["tolerance"])
 
     # ---- data.bin: reference values of every non-alias tensor, then weights,
     # streamed to the file (a partition's data can be many GB: no copy of it
@@ -907,6 +928,10 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
             arr = _buffer_values(arr, b["dtype"])
             assert arr.size == b["numel"], (b["name"], arr.size, b["numel"])
             b["ref"] = put(arr)
+        # SOL's reference outputs (float32, whatever the buffer's dtype), after everything else: data.bin of an
+        # ungated export is unchanged
+        for name, rarr in ((sol_spec or {}).get("_ref") or {}).items():
+            sol_spec["outputs"][name]["ref_offset"] = put(rarr)[0]
 
     # ---- the outputs' reference error (their bound's conditioning term)
     env = {t: env[t] for t in outputs}                # the rest is in data.bin now
@@ -946,6 +971,9 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
         *([] if tgt is not None else SO_ABI), ""]
     (out / tail_name).write_text("\n".join(tail))
     tol = {**DTYPE_TOL[dtype if dtype != MIXED else _mixed_bound(slots)], **(tolerance or {})}
+    if sol_cap is not None and dtype == cuda_dtypes.FP32 and sol_cap < tol["slot_rel"]:
+        tol["slot_rel"] = sol_cap                             # the manifest-level slot bound (prompts, driver default)
+        cap_used = True
     if dtype == MIXED:
         # per output: its dtype's bound, or a narrower one it was computed through
         # (an fp32 output of bf16 intermediates carries their rounding)
@@ -957,7 +985,8 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     slot_list = list(slots.values())
     if conc is not None:
         kc.annotate_slots(slot_list, sched)
-    drv_src = (_driver_source if tgt is None else tgt.driver_source)(out / "data.bin", bufs, op_recs, slot_list, tol)
+    drv_src = (_driver_source(out / "data.bin", bufs, op_recs, slot_list, tol, sol_spec) if tgt is None else
+               tgt.driver_source(out / "data.bin", bufs, op_recs, slot_list, tol))
     (out / driver_name).write_text(kc.driver(drv_src) if conc is not None else drv_src)
     man = {
         "format": FORMAT,
@@ -967,6 +996,8 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                       "op_indices": sel, "is_whole_graph": len(sel_requested) == len(ops),
                       **({"pruned_dead": pruned} if pruned else {})},
         "target": target, "dtype": dtype, "tolerance": tol,
+        **({"sol": sol_tolerance.public(sol_spec)} if sol_spec else {}),
+        **({"sol_slot_cap": sol_cap} if cap_used else {}),
         "assembly": {"head": head, "tail": tail_name,
                      "namespace_prefix": NS_PREFIX, "order": [s["id"] for s in slot_list],
                      **({"lanes": sched["lanes"]} if sched and sched.get("lanes") else {})},
@@ -1059,7 +1090,7 @@ def output_cond_term(b: dict, tol: dict) -> str:
     return repr(float(tol.get("output_cond", 0.0)) * float(b.get("ref_err") or 0.0))
 
 
-def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
+def _driver_source(data_path: Path, bufs, op_recs, slots, tol, sol: dict | None = None) -> str:
     slot_ix = {s["id"]: k for k, s in enumerate(slots)}
 
     def arr(name, ctype, vals):
@@ -1102,7 +1133,15 @@ def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         "static const char *SLOT_NAME[] = {" + ", ".join(json.dumps(s["id"]) for s in slots) + "};",
         "static const char *OP_NAME[] = {" + ", ".join(json.dumps(r["name"]) for r in op_recs) + "};",
     ])
+    sol_code, sol_ok = "", ""
+    if sol:                                   # a gated export (sol_tolerance.py): tables, the check, its call
+        offs = {n: o["ref_offset"] for n, o in sol["outputs"].items() if "ref_offset" in o}
+        sol_tables, sol_code = sol_tolerance.driver_parts(sol, bufs, offs)
+        tables += "\n" + sol_tables
+        sol_code = "\n" + sol_code
+        sol_ok = " if (B_SOL[b]) ok = mb_sol_buffer(tag, b, a, r, ok);"
     return _DRIVER_TEMPLATE.replace("@BLOB@", _blob_source(data_path)).replace("@TABLES@", tables) \
+        .replace("@SOL_CHECK@", sol_code).replace("@SOL_OK@", sol_ok) \
         .replace("@OUT_REL@", repr(tol["output_rel"])).replace("@OUT_ABS@", repr(tol["output_abs"])) \
         .replace("@SLOT_REL@", repr(tol["slot_rel"])).replace("@SLOT_ABS@", repr(tol.get("slot_abs", 0.0)))
 
@@ -1342,7 +1381,7 @@ static void zero_produced() {   // intermediates and outputs back to their start
         if (B_BASE[b] < 0 && (B_KIND[b] == K_INTER || B_KIND[b] == K_OUTPUT))
             cudaMemset(dev[b], 0, std::max(B_NUMEL[b], 1L) * esz(b));
 }
-// every partition output vs the reference (prints MB_CHECK lines with `tag`)
+// every partition output vs the reference (prints MB_CHECK lines with `tag`)@SOL_CHECK@
 static bool check_outputs(const char *tag) {
     bool all = true;
     for (int b = 0; b < NB; ++b) {
@@ -1350,7 +1389,7 @@ static bool check_outputs(const char *tag) {
         std::vector<float> tr, ta;
         const float *r = ref_f(b, tr), *a = dev_f(b, ta);
         double e = max_err(a, r, B_NUMEL[b]), bound = B_OUT_REL[b] * ref_max_finite(b) + B_OUT_ABS[b] + B_COND[b];
-        bool ok = e <= bound;
+        bool ok = e <= bound;@SOL_OK@
         all &= ok;
         printf("%s %s max_abs_err=%.6g bound=%.6g ok=%d\n", tag, B_NAME[b], e, bound, (int)ok);
     }
@@ -2004,6 +2043,9 @@ def parse_driver_output(text: str) -> dict:
             res[k] = {"min": float(m.group(1)), "med": float(m.group(2)), "max": float(m.group(3))}
     res["phase_ms"] = {m.group(1): float(m.group(2)) for m in re.finditer(r"^MB_PHASE_MS (\S+) (\S+)", text, re.M)}
     res.update(parse_e2e(text))
+    sol = sol_tolerance.parse_sol_lines(text)
+    if sol:                                   # a gated run (MB_SOL lines): the per-output SOL verdicts
+        res["sol"] = sol
     return res
 
 

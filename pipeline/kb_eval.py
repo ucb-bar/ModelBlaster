@@ -301,6 +301,8 @@ def driver_result(row: dict) -> dict:
     res["errors"] = res["errors"] or []
     res.update(passed=bool(row.get("ok")), slots=row.get("slot_checks") or {}, stage=row.get("stage"),
                log=row.get("log") or "", device=row.get("gpu"))
+    if row.get("sol"):                             # a SOL-gated export (sol_tolerance.py): the per-output verdicts
+        res["sol"] = row["sol"]
     return res
 
 
