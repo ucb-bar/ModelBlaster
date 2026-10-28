@@ -23,7 +23,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from modelblaster.pipeline import graph_edit as ge  # noqa: E402
-from modelblaster.pipeline import kb_proposals  # noqa: E402
 from modelblaster.pipeline.kb_export import _harness  # noqa: E402
 
 C, S, E1, E3, H, W = 4, 3, 2, 3, 6, 6
@@ -51,15 +50,16 @@ def relu_op(name, inp, out, n, quant):
     return {"name": name, "op": "relu" + _suffix(quant), "inputs": [inp], "outputs": [out], "shape": {"n": n}}
 
 
-def fire_graph(quant: str = "fp32") -> dict:
+def fire_graph(quant: str = "fp32", hw=(H, W)) -> dict:
+    H, W = hw
     t = _tdt(quant)
     sh = {"x": [1, C, H, W], "sq_o": [1, S, H, W], "s": [1, S, H, W], "e1_o": [1, E1, H, W], "e1r": [1, E1, H, W],
           "e3_o": [1, E3, H, W], "e3r": [1, E3, H, W], "cat_out": [1, E1 + E3, H, W], "pooled": [1, E1 + E3, 1, 1], "out": [1, 4]}
-    ops = [conv_op("sq", "x", "sq_o", "sq.weight", "sq.bias", C, S, 1, quant),
+    ops = [conv_op("sq", "x", "sq_o", "sq.weight", "sq.bias", C, S, 1, quant, hw),
            relu_op("sq_relu", "sq_o", "s", S * H * W, quant),
-           conv_op("e1", "s", "e1_o", "e1.weight", "e1.bias", S, E1, 1, quant),
+           conv_op("e1", "s", "e1_o", "e1.weight", "e1.bias", S, E1, 1, quant, hw),
            relu_op("e1_relu", "e1_o", "e1r", E1 * H * W, quant),
-           conv_op("e3", "s", "e3_o", "e3.weight", "e3.bias", S, E3, 3, quant),
+           conv_op("e3", "s", "e3_o", "e3.weight", "e3.bias", S, E3, 3, quant, hw),
            relu_op("e3_relu", "e3_o", "e3r", E3 * H * W, quant),
            {"name": "cat", "op": "cat2_c1" + _suffix(quant), "inputs": ["e1r", "e3r"], "outputs": ["cat_out"],
             "shape": {"N": 1, "H": H, "W": W, "C_inputs": [E1, E3]}},
@@ -109,8 +109,8 @@ def write_ir(d: Path, graph: dict, weights: dict, golden_in: np.ndarray | None =
     return d
 
 
-def fire_ir(d: Path, quant: str = "fp32", seed: int = 0, tiny_head: bool = False) -> Path:
-    return write_ir(d, fire_graph(quant), fire_weights(quant, seed, tiny_head))
+def fire_ir(d: Path, quant: str = "fp32", seed: int = 0, tiny_head: bool = False, hw=(H, W)) -> Path:
+    return write_ir(d, fire_graph(quant, hw), fire_weights(quant, seed, tiny_head))
 
 
 def merge_expand(orig_dir: Path, out_dir: Path, wrong: str | None = None, *, with_map: bool = False):
@@ -122,6 +122,7 @@ def merge_expand(orig_dir: Path, out_dir: Path, wrong: str | None = None, *, wit
     z = np.load(Path(orig_dir) / "weights.npz")
     base = {k: z[k] for k in z.files}
     q = g0["quant"]
+    H, W = g0["tensors"]["x"]["shape"][2:]
     ed = ge.Editor(g0, base)
     D = ed.derive
     pads = [[0, 0], [0, 0], [0, 2], [0, 2]] if wrong == "pad" else [[0, 0], [0, 0], [1, 1], [1, 1]]
@@ -131,14 +132,13 @@ def merge_expand(orig_dir: Path, out_dir: Path, wrong: str | None = None, *, wit
     ed.remove_ops(["e1", "e1_relu", "e3", "e3_relu", "cat"])
     t = _tdt(q)
     ed.add_tensor("mc_o", [1, E1 + E3, H, W], t)
-    ed.add_op(conv_op("merged", "s", "mc_o", "d.fire.w", "d.fire.b", S, E1 + E3, 3, q))
+    ed.add_op(conv_op("merged", "s", "mc_o", "d.fire.w", "d.fire.b", S, E1 + E3, 3, q, (H, W)))
     ed.g["tensors"].pop("cat_out")                     # re-registered below as the relu's output (same name, shape, dtype)
     ed.add_tensor("cat_out", [1, E1 + E3, H, W], t)
     ed.add_op(relu_op("merged_relu", "mc_o", "cat_out", (E1 + E3) * H * W, q))
     for k in ("e1_o", "e1r", "e3_o", "e3r"):
         ed.g["tensors"].pop(k)
     g1 = ed.result()
-    kb_proposals.write_variant_ir  # (kept for parity with the flow's writer)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "graph.json").write_text(json.dumps(g1, indent=1))
