@@ -165,6 +165,8 @@ def _time_builtin(prob: Path, *, arch: str, work: Path, sources=None, ref_source
         out.update(ref_e2e_us=_med([r["ref_e2e_us"] for r in rs]),
                    paired_ratio=_med([(r.get("e2e_ratio") or {}).get("med") for r in rs]),
                    paired_basis=(last.get("e2e_ratio") or {}).get("basis"))
+    if last.get("sol"):                            # a SOL-gated export (sol_tolerance.py)
+        out["sol"] = last["sol"]
     if not out["passed"]:
         out["log"] = last.get("log", "")[-2000:]
     return out
@@ -207,6 +209,10 @@ def _from_kb(job: dict, *, identical: bool = False) -> dict:
             ratios = [dep(r) / dep(q) for r, q in zip(rs, refs) if dep(r) and dep(q)]
             out.update(ref_e2e_us=_med([dep(q) for q in refs]), paired_ratio=_med(ratios),
                        paired_basis=refs[-1].get("e2e_basis") if refs else None)
+    if last.get("sol"):                            # a SOL-gated export: every run's verdicts, the last one's record
+        out["sol"] = last["sol"]
+        out["sol_runs_ok"] = [all((d.get(d.get("gate")) or {}).get("ok", True) for d in (r.get("sol") or {}).values())
+                              for r in rs]
     if not out["passed"]:
         out["log"] = (last.get("log") or "\n".join(map(str, last.get("errors") or [])))[-2000:]
     return out
