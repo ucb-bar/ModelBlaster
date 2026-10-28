@@ -50,6 +50,10 @@ and why); fused ops carry ``hint``. On CUDA:
   ops and tensors are unchanged;
 * ``unfuse`` -> the fused op's stages restored (fp32 sub_ops keep their
   registered tensors, so nothing needs synthesizing);
+* ``merge_sibling_convs`` (``--merge-sibling-convs auto``, merge_convs.py; id ``merge:<pattern>``, ``instances`` / ``chains`` scope):
+  sibling convolutions reading one tensor and joined by a channel concat become ONE convolution (largest odd kernel, centred
+  zero-padded filters concatenated along the output channels, biases concatenated, one shared activation) whose weights are
+  derived weights (weight_derivations.py: pad + concat; originals untouched); applied before the fusions so they see the new ops;
 * the RISC-V kinds: ``fuse`` with ``dispatch_groups`` is translated to op-name
   chains (each group must be an exclusive producer->consumer chain); the
   others are skipped with the reason -- ``tile_split`` (OC/N tiles placed on
@@ -84,7 +88,7 @@ from pathlib import Path
 
 FORMAT = "modelblaster.graph_hints/v1"
 CUDA_KINDS = ("fuse", "split_slot", "unfuse", "fold_layout", "fuse_attention", "fuse_siblings", "fuse_region",
-              "fuse_view", "rewrite")
+              "fuse_view", "rewrite", "merge_sibling_convs")
 NOT_ON_CUDA = {
     "tile_split": "OC/N tiles exist to run one op on several cores at once; a CUDA kernel already spans "
                   "every SM and the driver runs one stream, so tiles would serialise (use split_slot for "
@@ -697,7 +701,8 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
         # and before split_slot (the folded ops get new slot kinds to split)
         # fuse_attention consumes accepted bmm/scale/mask fusions and folds the q/k/v/o copies itself, so it
         # runs after fuse and before fold_layout (which would otherwise rewrite the same bmms)
-        return ({"fuse": 0, "unfuse": -1, "fuse_siblings": 0.3, "fuse_attention": 0.4, "fold_layout": 0.5,
+        # merge_sibling_convs (merge_convs.py) runs on the unfused ops (right after unfuse): the fusions that follow see the merged conv
+        return ({"fuse": 0, "unfuse": -1, "merge_sibling_convs": -0.5, "fuse_siblings": 0.3, "fuse_attention": 0.4, "fold_layout": 0.5,
                  "split_slot": 1, "fuse_region": 1.5, "fuse_view": 0.1}.get(h["kind"], 2), 0)
 
     ordered = sorted(todo, key=order)
@@ -747,6 +752,11 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
             specs.update(sp)
         elif h["kind"] == "fuse_region":
             g, sp = _apply_fuse_region_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "merge_sibling_convs":     # merge_convs.py: sibling convs joined by a channel concat -> one conv, derived weights
+            from .merge_convs import apply_hint as _merge_apply
+            g, sp = _merge_apply(g, h, specs, prov)
             added.update(sp)
             specs.update(sp)
         elif h["kind"] == "rewrite":                 # graph_rewrite.py: an agent / MB rewrite stored as a patch + derived weights
