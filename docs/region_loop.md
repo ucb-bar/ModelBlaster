@@ -105,6 +105,14 @@ Knowledge feeds back like slot steps: every failed `verify` (compile / run / che
 (technique `region_loop`, e2e timing basis, diff summary), v1 claims observe it, v2 appends it to the outcome store; the committed source is stored
 as an implementation; `maybe_reflect` / `maybe_upkeep` run after the phase.
 
+Environment (KernelBlaster side): `KERNELBLASTER_REGION_LOOP_BUDGET` (`turns,tools,usd,wall_s`), `KERNELBLASTER_REGION_LOOP_COMMIT`
+(`commit_gain,repeat_gain` fractions; `-1,-1` accepts any timing: smoke tests only), `KERNELBLASTER_REGION_LOOP_PRICE` (`in,out` USD per M tokens when the
+model has no price). SIGTERM / SIGINT of the run ends the loop between turns (`stop: interrupted`; commits so far are adopted, the slot's loop reruns on resume).
+
+GPU smoke without LLM spend: `tests/fixtures/region_echo_plugin.py` registers `stub:region_echo` (`--plugin FILE`, `--model stub:region_echo`): a fixed
+script show / profile / no-op edit / verify / time / commit / status / finish; with the commit rule lowered it exercises the real evaluator backend, the
+paired timing, the final re-verification and the adoption on a GPU (RUNBOOK step 2).
+
 ## Pre-loop gate (MB)
 
 `prepare_hint` (flag on, gate on): a variant that contains region ops is checked with `graph_verify.verify` (CPU: structural, then the torch
