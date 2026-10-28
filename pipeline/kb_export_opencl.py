@@ -290,11 +290,22 @@ int main(int argc, char **argv) {
         printf("MB_DEVICE_INFO max_wg=%zu compute_units=%u local_mem=%llu global_mem=%llu fp16=%d\n", mwg, cus,
                (unsigned long long)lmem, (unsigned long long)gmem, strstr(ext, "cl_khr_fp16") != NULL);
     }
+    // Adreno 650: at most 256 MiB per allocation (its 1 GiB GLOBAL_MEM_SIZE does not cap the sum)
+    cl_ulong max_alloc = 0, global_mem = 0;
+    clGetDeviceInfo(mb_device(), CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof max_alloc, &max_alloc, NULL);
+    clGetDeviceInfo(mb_device(), CL_DEVICE_GLOBAL_MEM_SIZE, sizeof global_mem, &global_mem, NULL);
+    size_t total = 0;
     for (int b = 0; b < NB; ++b)
         if (B_BASE[b] < 0) {
             size_t n = std::max(nbytes(b), (size_t)ESZ[B_DT[b]]);
+            total += n;
             dev[b] = clSVMAlloc(mb_context(), CL_MEM_READ_WRITE, n, 0);
-            if (!dev[b]) { printf("MB_ERROR alloc %s (%zu bytes)\nfailed\n", B_NAME[b], n); return 1; }
+            if (!dev[b]) {
+                printf("MB_ERROR alloc %s (%zu bytes; device max_alloc=%llu global_mem=%llu, %zu bytes allocated "
+                       "so far)\nfailed\n", B_NAME[b], n, (unsigned long long)max_alloc,
+                       (unsigned long long)global_mem, total - n);
+                return 1;
+            }
             cl_uchar z = 0;
             clEnqueueSVMMemFill(mb_queue(), dev[b], &z, 1, n, 0, NULL, NULL);
         }
