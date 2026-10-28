@@ -51,7 +51,22 @@ PREFIX = "region__"
 PATTERNS = ("rnn_stack", "attention_block", "all")
 ENV = "MB_REGION_SLOTS"
 RECURRENT = ("gru_seq", "lstm_seq", "lstm")
-MAX_MEMBERS = 256
+MAX_MEMBERS = 256                     # the default cap on a region's members (views included)
+ENV_MAX = "MB_REGION_MAX_MEMBERS"     # raise / lower it (region windows, docs/region_windows.md); unset = MAX_MEMBERS
+
+
+def max_members() -> int:
+    """The member cap of ``fuse_region``: ``$MB_REGION_MAX_MEMBERS`` (a positive int), else :data:`MAX_MEMBERS` (256)."""
+    v = os.environ.get(ENV_MAX, "").strip()
+    if not v:
+        return MAX_MEMBERS
+    try:
+        n = int(v)
+    except ValueError:
+        raise ValueError(f"{ENV_MAX}={v!r}: expected a positive integer") from None
+    if n < 2:
+        raise ValueError(f"{ENV_MAX}={v!r}: expected a positive integer >= 2")
+    return n
 
 
 def enabled(mode: str | None = None) -> set[str]:
@@ -363,8 +378,9 @@ def fuse_region(graph: dict, names: list[str], specs: dict, pattern: str = "ops"
     pos = {o["name"]: i for i, o in enumerate(ops)}
     idx = sorted(pos[n] for n in dict.fromkeys(names))
     mem = [ops[i] for i in idx]
-    if sum(m["op"] not in ALIAS_OPS for m in mem) < 2 or len(mem) > MAX_MEMBERS:
-        raise ValueError(f"region needs 2..{MAX_MEMBERS} ops")
+    cap = max_members()
+    if sum(m["op"] not in ALIAS_OPS for m in mem) < 2 or len(mem) > cap:
+        raise ValueError(f"region needs 2..{cap} ops")
     if any(is_region(m) for m in mem):
         raise ValueError("nested regions")
     mset = set(idx)

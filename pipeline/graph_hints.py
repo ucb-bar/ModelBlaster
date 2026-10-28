@@ -559,12 +559,16 @@ def _apply_fuse_view_cuda(graph, h, specs, prov):
 
 def _apply_fuse_region_cuda(graph, h, specs, prov):
     """``fuse_region`` (region_slots, --region-slots): the hint's ``pattern`` (rnn_stack | attention_block | all)
-    wherever region_slots.find_regions finds it, or its explicit ``members`` (op names), becomes one ``region__`` op.
+    wherever region_slots.find_regions finds it, or its explicit ``members`` (op names), becomes one ``region__`` op (explicit
+    ``windows``: one per member list, the windows of --region-windows).
     Applied after every other kind (the members keep their split variants: the region's composite seed calls each
     member's own slot variant)."""
     from .region_slots import find_regions, fuse_region
 
-    groups = [h["members"]] if h.get("members") else find_regions(graph, h.get("pattern", "all"), specs)
+    # ``windows`` (region_windows.py, --region-windows): several explicit member lists, one region op each. NOT ``groups``: that
+    # key is the split hints' shape groups, which record_decision moves to ``tried_groups`` once the hint is accepted
+    groups = ([list(g) for g in h["windows"]] if h.get("windows") else
+              [h["members"]] if h.get("members") else find_regions(graph, h.get("pattern", "all"), specs))
     used = {}
     for grp in groups:
         try:
