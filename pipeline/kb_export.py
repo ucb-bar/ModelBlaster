@@ -618,18 +618,11 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
             if key is not None:
                 src, tag = slot_sources[key], (slot_source_tags or {}).get(key, "override")
             elif tgt is not None:
-                src, tag = tgt.seed(lib, entry, spec)
+                src, tag = tgt.seed(lib, entry, spec, _stage_sources(spec, sid, specs, slot_sources, sub_sources)
+                                    if hasattr(spec, "sub_ops") else None)
             elif hasattr(spec, "cuda_seed"):           # fused ops: stage kernels back to back
                 lib = libs.of(kind)
-                if sub_sources is not None:
-                    subs = sub_sources.get(sid, {})
-                else:
-                    subs = {}
-                    for k in spec.sub_ops:
-                        ssid = base_slot_id(k, specs)
-                        hit = next((x for x in (ssid, k) if slot_sources and x in slot_sources), None)
-                        if hit is not None:
-                            subs[k] = slot_sources[hit]
+                subs = _stage_sources(spec, sid, specs, slot_sources, sub_sources)
                 src = spec.cuda_seed(lib, sub_sources=subs)
                 tag = "fused-seed" + (":" + ",".join(sorted(subs)) if subs else "")
             else:
@@ -770,6 +763,19 @@ def export_problem(ir_dir, out_dir, *, op_indices: list[int] | None = None, name
     }
     (out / "manifest.json").write_text(json.dumps(man, indent=1))
     return out
+
+
+def _stage_sources(spec, sid: str, specs: dict, slot_sources, sub_sources) -> dict:
+    """A fused slot's stage seeds: ``sub_sources[sid]`` when given, else each stage's slot
+    id / kind in ``slot_sources``; stages missing here get the target's own seed kernel."""
+    if sub_sources is not None:
+        return dict(sub_sources.get(sid, {}))
+    subs = {}
+    for k in spec.sub_ops:
+        hit = next((x for x in (base_slot_id(k, specs), k) if slot_sources and x in slot_sources), None)
+        if hit is not None:
+            subs[k] = slot_sources[hit]
+    return subs
 
 
 # C entry points of a candidate's shared object (the slot units + this tail,

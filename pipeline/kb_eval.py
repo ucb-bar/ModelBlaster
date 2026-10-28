@@ -14,7 +14,11 @@ components ran:
 - ``ssh``: build here, run on remote GPUs (``--ssh-host``, repeatable,
   ``--cuda-visible-devices``, ``--remote-dir``, ``--ssh-key``), with
   KernelBlaster's rsync deltas and run-time ``data.bin`` copies for problems
-  above 1 GiB.
+  above 1 GiB;
+- ``board`` (OpenCL problems): build and run on the Adreno board over ssh
+  (``--board-host``, ``--remote-dir``, ``--ssh-key``), KernelBlaster's
+  ``AdrenoEvaluator``, the board's flock held per build + run
+  (``--board-lock``); ``local`` with OpenCL problems is this host's OpenCL GPU.
 
 KernelBlaster is driven as a subprocess (``scripts/time_problems.py`` of the
 checkout, with its python), as ``kb_graph_opt`` drives ``run_multislot.py``;
@@ -66,7 +70,7 @@ class HardwareMismatch(RuntimeError):
 class KBEval:
     """Where and how KernelBlaster's evaluators time ModelBlaster's runs."""
 
-    evaluator: str = "local"                    # local | ssh
+    evaluator: str = "local"                    # local | ssh | board (OpenCL)
     kb: Path | None = None                      # checkout (default: default_kb())
     python: str = sys.executable
     gpus: str = "auto"
@@ -78,6 +82,10 @@ class KBEval:
     runtime: str = "auto"                       # auto | host | process
     devices: int = 1                            # GPUs in the pool (1: every run on one GPU)
     timeout: int = 1800
+    # OpenCL (evaluator board): the board, its lock file (None: KernelBlaster's default), NAME=value run env
+    board_host: str | None = None
+    board_lock: str | None = None
+    board_env: list = field(default_factory=list)
 
     @property
     def root(self) -> Path:
@@ -91,6 +99,8 @@ class KBEval:
         if self.evaluator == "ssh":
             d.update(ssh_hosts=list(self.ssh_hosts), cuda_visible_devices=list(self.cuda_visible_devices) or ["auto"],
                      remote_dir=self.remote_dir)
+        elif self.evaluator == "board":
+            d.update(board_host=self.board_host, remote_dir=self.remote_dir, runtime="process")
         else:
             d["gpus"] = self.gpus
         return d
@@ -98,7 +108,7 @@ class KBEval:
     def for_device(self, dev: dict | None) -> "KBEval":
         """Pinned to one detected device (``{"host", "ident", ...}``, as
         ``kb_graph_opt.detect_gpus`` lists them); None: unchanged."""
-        if not dev or dev.get("ident") is None:
+        if not dev or dev.get("ident") is None or self.evaluator == "board":
             return self
         if dev.get("host"):
             return replace(self, evaluator="ssh", ssh_hosts=[dev["host"]], cuda_visible_devices=[str(dev["ident"])],
@@ -124,6 +134,18 @@ class KBEval:
             cmd += ["--remote-dir", self.remote_dir]
             if self.remote_cuda_bin:
                 cmd += ["--remote-cuda-bin", self.remote_cuda_bin]
+        elif self.evaluator == "board":
+            if not self.remote_dir:
+                raise ValueError("--evaluator board needs --remote-dir")
+            if self.board_host:
+                cmd += ["--board-host", self.board_host]
+            if self.ssh_key:
+                cmd += ["--ssh-key", self.ssh_key]
+            cmd += ["--remote-dir", self.remote_dir]
+            if self.board_lock is not None:
+                cmd += ["--board-lock", self.board_lock]
+            for kv in self.board_env:
+                cmd += ["--board-env", kv]
         elif self.gpus and self.gpus != "auto":
             cmd += ["--gpus", str(self.gpus)]
         if gpu_model:
@@ -181,9 +203,10 @@ def add_args(ap, *, prefix_help: str = "", local_default: str = "local") -> None
     g = ap.add_argument_group("KernelBlaster evaluator" + (f" ({prefix_help})" if prefix_help else ""))
     auto = ("local when the KernelBlaster checkout has scripts/time_problems.py, else builtin"
             if local_default == "local" else "builtin")
-    g.add_argument("--evaluator", choices=["auto", "local", "ssh", "builtin"], default="auto",
-                   help="local: this host's GPU pool + locks; ssh: remote GPUs (--ssh-host); builtin: ModelBlaster's "
-                        f"own run on the default GPU (no pool); auto: ssh with --ssh-host, else {auto}")
+    g.add_argument("--evaluator", choices=["auto", "local", "ssh", "board", "builtin"], default="auto",
+                   help="local: this host's GPU pool + locks; ssh: remote GPUs (--ssh-host); board: OpenCL problems "
+                        "on the Adreno board (--board-host); builtin: ModelBlaster's own run on the default GPU "
+                        f"(no pool); auto: ssh with --ssh-host, board with --board-host, else {auto}")
     g.add_argument("--kb", help="KernelBlaster checkout (default $MB_KB_ROOT, else third_party/KernelBlaster)")
     g.add_argument("--kb-python", default=sys.executable, help="python for KernelBlaster")
     g.add_argument("--gpus", default="auto", help="local GPUs: auto (idle ones) | all | nvidia-smi indices / UUIDs")
@@ -191,7 +214,11 @@ def add_args(ap, *, prefix_help: str = "", local_default: str = "local") -> None
     g.add_argument("--cuda-visible-devices", action="append", default=[],
                    help="GPUs on the ssh host(s): auto | all | ids; once for every host or once per --ssh-host")
     g.add_argument("--ssh-key")
-    g.add_argument("--remote-dir", help="writable dir on the ssh host(s)")
+    g.add_argument("--remote-dir", help="writable dir on the ssh host(s) / the board")
+    g.add_argument("--board-host", help="user@board for OpenCL problems (--evaluator board)")
+    g.add_argument("--board-lock", help="flock file on the board held per build + run (default: KernelBlaster's, "
+                                        "~/mb_board.lock; off: none)")
+    g.add_argument("--board-env", action="append", default=[], help="NAME=value for every OpenCL run (repeatable)")
     g.add_argument("--remote-cuda-bin", help="CUDA bin dir on the ssh host(s) (default /usr/local/cuda/bin)")
     g.add_argument("--runtime", choices=["auto", "host", "process"], default="auto",
                    help="persistent driver host (auto: where the driver has it) or one process per run")
@@ -203,7 +230,7 @@ def from_args(a, *, local_default: str = "local") -> KBEval | None:
     """The evaluator the flags select; None for ``builtin``."""
     ev = a.evaluator
     if ev == "auto":
-        ev = "ssh" if a.ssh_host else local_default
+        ev = "ssh" if a.ssh_host else "board" if getattr(a, "board_host", None) else local_default
         if ev == "local" and not KBEval(kb=Path(a.kb) if a.kb else None).available():
             return None
     if ev == "builtin":
@@ -211,7 +238,8 @@ def from_args(a, *, local_default: str = "local") -> KBEval | None:
     return KBEval(evaluator=ev, kb=Path(a.kb) if a.kb else None, python=a.kb_python, gpus=a.gpus,
                   ssh_hosts=list(a.ssh_host), cuda_visible_devices=list(a.cuda_visible_devices), ssh_key=a.ssh_key,
                   remote_dir=a.remote_dir, remote_cuda_bin=a.remote_cuda_bin, runtime=a.runtime,
-                  devices=a.devices, timeout=a.eval_timeout)
+                  devices=a.devices, timeout=a.eval_timeout, board_host=getattr(a, "board_host", None),
+                  board_lock=getattr(a, "board_lock", None), board_env=list(getattr(a, "board_env", []) or []))
 
 
 def recorded_gpus(run_dirs) -> list[dict]:
