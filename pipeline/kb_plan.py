@@ -100,11 +100,11 @@ def canon_shape(shape: dict, fields: tuple[str, ...]) -> dict:
     return {k: v for k, v in shape.items() if k not in fields} if fields else shape
 
 
-def hinted_ir(ir_dir: Path, hints_doc: dict, work: Path, specs: dict):
+def hinted_ir(ir_dir: Path, hints_doc: dict, work: Path, specs: dict, target: str = "cuda"):
     """(IR dir with the accepted hints applied, specs, cache-plan input graph)."""
     from . import graph_hints as gh
 
-    d, specs, _ = gh.apply_to_ir(Path(ir_dir), hints_doc, Path(work) / "ir")
+    d, specs, _ = gh.apply_to_ir(Path(ir_dir), hints_doc, Path(work) / "ir", target=target)
     return d, specs, json.loads((d / "graph.json").read_text())
 
 
@@ -129,7 +129,8 @@ def failed_cached_slots(res: dict, plan: dict) -> dict:
 
 def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache=None, arch: str = "75",
                specs: dict | None = None, runs: int = 3, keep: bool = False, kbeval=None,
-               gpu_model: str | None = None, allow_gpu_mismatch: bool = False, on_fallback=None) -> dict:
+               gpu_model: str | None = None, allow_gpu_mismatch: bool = False, on_fallback=None,
+               target: str = "cuda") -> dict:
     """Whole-graph per-op profile of an IR in its current state (accepted
     hints applied, cached winners in place).
 
@@ -142,29 +143,36 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
     GPUs -- on one GPU of ``gpu_model`` (none there: ``HardwareMismatch``
     unless ``allow_gpu_mismatch``); None: built and run here on the default
     GPU (``build_and_run``). Either way the run with the median partition
-    time is used and ``device`` records the GPU it ran on."""
+    time is used and ``device`` records the GPU it ran on. ``target="opencl"``
+    exports OpenCL slots (``cache`` must be an OpenCL cache) and needs
+    ``kbeval`` (the board or an OpenCL GPU); ``arch`` is then the device label."""
     from . import graph_hints as gh
     from . import kb_telemetry as kbt
     from . import kb_trace
     from .kb_eval import builtin_device, run_problem
     from .kb_export import build_and_run, export_problem, slot_id_of
-    from .kb_ingest import cache_plan, signature_sha
+    from .kb_ingest import arch_key, cache_plan, signature_sha
     from .kb_proposals import _all_specs, write_variant_ir
 
+    if target != "cuda" and kbeval is None:
+        raise ValueError(f"{target} profiles run through KernelBlaster's evaluator (kbeval): ModelBlaster's "
+                         "builtin runs are CUDA-only")
+    if cache is not None and cache.target != target:
+        raise ValueError(f"a {cache.target} kernel cache for a {target} profile")
     work = Path(work)
     specs = dict(specs or _all_specs())
-    hdir, specs, g = hinted_ir(Path(ir_dir), hints_doc or gh.new_doc(), work, specs)
+    hdir, specs, g = hinted_ir(Path(ir_dir), hints_doc or gh.new_doc(), work, specs, target=target)
     fallback = []
     attempts = PROFILE_FALLBACKS + (2 if on_fallback is not None else 0)     # routed kernels may fail too
     from . import sol_tolerance
     if sol_tolerance.mode() == "accept":
         attempts += 5                              # SOL failures drop one class of winners per attempt (sol_gate.blame)
     for attempt in range(attempts + 1):
-        plan = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else \
+        plan = cache_plan(g, cache, arch_key(arch, target), specs) if cache is not None else \
             {"graph": gh.unique_names(g), "sources": {}, "tags": {}, "sub_sources": None, "hints": [], "used": {}}
         pdir = write_variant_ir(Path(ir_dir), plan["graph"], work / "profile_ir") if plan["hints"] else hdir
         prob = export_problem(pdir, work / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
-                              sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
+                              sub_sources=plan["sub_sources"], specs=specs, strategy="whole", target=target)
         # as deployed: CUDA graph where capturable; per-op GPU time from the driver's attribution
         with kbt.get().span("mb.profile.run", ir=Path(ir_dir).name, runs=runs,
                             evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp, \
@@ -219,7 +227,7 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
                      "event_us": res.get("op_us", {}).get(r["name"]), "seed": seed.get(r["slot"]),
                      "slot_base": slot_id_of({"op": o["op"]}, specs)})
     out = {"format": PROFILE_FORMAT, "ir": man["ir_name"], "source_ir": str(ir_dir), "ir_dir": str(pdir),
-           "hints_sha": gh.hints_sha(hints_doc or gh.new_doc()), "arch": f"sm_{arch}",
+           "hints_sha": gh.hints_sha(hints_doc or gh.new_doc()), "arch": arch_key(arch, target), "target": target,
            "passed": res.get("passed"), "partition_us": res.get("partition_us"),
            "partition_us_runs": res.get("partition_us_runs"), "ops": recs,
            "e2e_us": res.get("e2e_us"), "e2e_basis": res.get("e2e_basis"),
@@ -377,12 +385,12 @@ def plan_op_indices(graph: dict, op_names: list[str], pid: str = "") -> list[int
 
 
 def export_plan(plan: dict, out: Path, *, cache=None, arch: str = "75", specs: dict | None = None,
-                names: dict | None = None) -> list[Path]:
+                names: dict | None = None, target: str = "cuda") -> list[Path]:
     """Export each problem of a plan under ``out/<ir>``, seeded from the
     cache's winners for those ops' shapes (``cache_plan`` on the problem's
     IR; the plan's IR dirs already carry the accepted hints)."""
     from .kb_export import export_problem
-    from .kb_ingest import cache_plan
+    from .kb_ingest import arch_key, cache_plan
     from .kb_proposals import _all_specs, with_fused_specs, write_variant_ir
 
     from .graph_hints import unique_names
@@ -396,7 +404,7 @@ def export_plan(plan: dict, out: Path, *, cache=None, arch: str = "75", specs: d
         # (an empty partition was sent to KernelBlaster) and the first instance pulled in all of its repeats
         g = unique_names(json.loads((ir_dir / "graph.json").read_text()))
         specs = with_fused_specs(g, specs)
-        cp = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else None
+        cp = cache_plan(g, cache, arch_key(arch, target), specs) if cache is not None else None
         if cp is not None and cp["hints"]:
             ir_dir = write_variant_ir(ir_dir, cp["graph"], Path(out) / f"{p['ir']}.ir")
             g = cp["graph"]
@@ -406,7 +414,7 @@ def export_plan(plan: dict, out: Path, *, cache=None, arch: str = "75", specs: d
         dirs.append(export_problem(ir_dir, Path(out) / pid, op_indices=idx, specs=specs, name=name,
                                    strategy="plan", slot_sources=cp["sources"] if cp else None,
                                    slot_source_tags=cp["tags"] if cp else None,
-                                   sub_sources=cp["sub_sources"] if cp else None))
+                                   sub_sources=cp["sub_sources"] if cp else None, target=target))
     from . import kb_trace
     kb_trace.record("export", mb_stage="export", out=str(out), problems=[str(d) for d in dirs],
                     manifests={Path(d).name: kb_trace.files({"m": Path(d) / "manifest.json"}).get("m") for d in dirs})
@@ -421,7 +429,8 @@ def main():
     pr.add_argument("--out", required=True)
     pr.add_argument("--hints")
     pr.add_argument("--cache")
-    pr.add_argument("--arch", default="75")
+    pr.add_argument("--arch", default="75", help="SM number (CUDA) or device label (OpenCL, e.g. adreno650)")
+    pr.add_argument("--target", default="cuda", choices=["cuda", "opencl"])
     pr.add_argument("--runs", type=int, default=3)
     pr.add_argument("--gpu-model", help="the GPU model the runs must use (with a KernelBlaster evaluator)")
     pr.add_argument("--allow-gpu-mismatch", action="store_true")
@@ -440,11 +449,12 @@ def main():
         from .kb_ingest import CudaCache
 
         doc = gh.load(Path(a.hints)) if a.hints else None
-        cache = CudaCache(Path(a.cache)) if a.cache else None
+        cache = CudaCache(Path(a.cache), target=a.target) if a.cache else None
         kbeval = ke.from_args(a, local_default="builtin")
         for d in a.irs:
             p = profile_ir(Path(d), Path(a.out) / Path(d).name, hints_doc=doc, cache=cache, arch=a.arch, runs=a.runs,
-                           kbeval=kbeval, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch)
+                           kbeval=kbeval, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
+                           target=a.target)
             top = sorted(p["ops"], key=lambda r: -(r["us"] or 0))[:5]
             print(json.dumps({"ir": p["ir"], "passed": p["passed"], "partition_us": p["partition_us"],
                               "top": [(r["name"], r["us"]) for r in top],

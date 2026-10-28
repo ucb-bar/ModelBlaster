@@ -512,9 +512,9 @@ def write_variant_ir(ir_dir: Path, graph: dict, out: Path) -> Path:
 
 
 def best_sources(kb_result_dir: Path) -> dict[str, str]:
-    """{slot id: source} of a KernelBlaster run's composite best."""
+    """{slot id: source} of a KernelBlaster run's composite best (CUDA ``.cu`` / OpenCL ``.cpp`` slots)."""
     d = Path(kb_result_dir) / "best" / "slots"
-    return {p.stem: p.read_text() for p in sorted(d.glob("*.cu"))} if d.is_dir() else {}
+    return {p.stem: p.read_text() for p in sorted([*d.glob("*.cu"), *d.glob("*.cpp")])} if d.is_dir() else {}
 
 
 def build_variant(hints, orig_problem: Path, out: Path, *, seed_sources: dict | None = None,
