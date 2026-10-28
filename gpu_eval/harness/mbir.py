@@ -24,6 +24,15 @@ cuda_dtypes = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cuda_dtypes)
 
 
+def _weight_derivations():
+    """pipeline/weight_derivations.py, loaded by path like cuda_dtypes (only IRs with derived weights need it)."""
+    spec = importlib.util.spec_from_file_location(
+        "weight_derivations", Path(__file__).resolve().parents[2] / "pipeline" / "weight_derivations.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 @dataclass
 class IR:
     name: str
@@ -101,7 +110,11 @@ def load_ir(d: str | Path) -> IR:
     w = np.load(d / "weights.npz")
     io = np.load(d / "io.npz")
     per = {k: io[k] for k in io.files if k.startswith(("in.", "out."))}
-    return IR(g["name"], g, {k: w[k] for k in w.files}, io["input"], io["output"], per or None)
+    weights = {k: w[k] for k in w.files}
+    if g.get("weight_derivations"):
+        # derived weights (pipeline/weight_derivations.py): rebuild any entry weights.npz lacks from its base weights
+        weights = _weight_derivations().fill_missing(g, weights)
+    return IR(g["name"], g, weights, io["input"], io["output"], per or None)
 
 
 def compare(out: torch.Tensor, golden: np.ndarray, dtype: str = "fp32") -> dict:
