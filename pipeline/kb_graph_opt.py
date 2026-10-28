@@ -1255,17 +1255,31 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
             except BaseException:
                 proc.kill()
                 raise
-            res = kb.collect(problems, run_dir, proc)          # final result.json (llm calls, proposals)
-            wait.end()
+            try:
+                res = kb.collect(problems, run_dir, proc)      # final result.json (llm calls, proposals)
+            except RuntimeError as e:
+                # the wave's KernelBlaster run exited non-zero (a startup error such as `problem names collide`, a crash): the hints stay
+                # undecided (the lost-result path below, as a missing result.json) instead of aborting the whole problem
+                msg = " ".join(str(e).split())[:400]
+                print(f"[kb_graph_opt] hint wave failed, {len(live)} hint(s) left undecided: {msg}", flush=True)
+                res = None
+                wait.end()
+                for k in live:
+                    lost = {"final_ok": False, "final_infra": True, "final_error": f"KernelBlaster wave failed: {msg}"}
+                    results[k] = ({**lost, "_dir": str(run_dir / problem_name(jobs[k]["orig"]))},
+                                  {**lost, "_dir": str(run_dir / problem_name(jobs[k]["variant"]))}, None)
+            else:
+                wait.end()
             times = {k: f.result() for k, f in futs.items()}
         # lost to an infrastructure failure while the wave's KernelBlaster run still shared the GPUs (and
         # the remote dir): once more, on a fresh lease, now that the run has finished
         for k in sorted(times):
-            if jobs[k].get("remeasure_infra"):
+            if res is not None and jobs[k].get("remeasure_infra"):
                 times[k] = kbt.run_within(parent, "mb.remeasure", measure_hint, jobs[k], *sides[k], cfg, leases,
                                           attempts=1)
         for n, k in enumerate(live):
-            results[k] = (res[2 * n], res[2 * n + 1], times.get(k))
+            if res is not None:
+                results[k] = (res[2 * n], res[2 * n + 1], times.get(k))
     with T.span("mb.finish"):
         return [finish_hint(j, *results.get(k, (None, None, None)), cache=cache, doc=doc, cfg=cfg)
                 for k, j in enumerate(jobs)]
