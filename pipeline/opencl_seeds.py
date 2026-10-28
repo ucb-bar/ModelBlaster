@@ -201,7 +201,8 @@ __kernel void k_{op}_final(__global const float *part, int np, __global float *o
 # cl_khr_fp16 needed. They are generated from the fp32 seeds: data pointers
 # become half (scratch partials stay float), element reads p[e] become
 # vload_half(e, p), stores p[e] = v become vstore_half(v, e, p), compound
-# stores p[e] op= v become vstore_half(vload_half(e, p) op (v), e, p); on the
+# stores p[e] op= v become vstore_half(vload_half(e, p) op (v), e, p) (and
+# `(long)` of a loaded half goes through int, see f16_device); on the
 # host `float *` becomes `__half *` (cl_half, the CUDA spelling of _Float16)
 # and entries get their _f16 names. Ops whose _f16 spec has a different
 # signature are hand-written in mb_opencl_kernels_f16_hand.cpp.
@@ -278,7 +279,9 @@ def f16_device(cl: str) -> str:
     # `__global const float *a = ..., *b = ...`: the later declarators too
     for m in _re.finditer(r"__global\s+(?:const\s+)?half\s*\*[^;]*;", cl):
         names |= set(_re.findall(r",\s*\*\s*(\w+)", m.group(0)))
-    return _half_access(cl, names)
+    # an index stored as half: convert through int. Adreno's compiler aborts
+    # (QGPUI64Emulate: "Unsupported FtoI/ItoF") on a half -> 64-bit int conversion
+    return _re.sub(r"\(long\)\s*vload_half\(", "(long)(int)vload_half(", _half_access(cl, names))
 
 
 def f16_host(code: str, renames: dict) -> str:
