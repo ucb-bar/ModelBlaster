@@ -572,7 +572,10 @@ def _apply_fuse_region_cuda(graph, h, specs, prov):
     # ``windows`` (region_windows.py, --region-windows): several explicit member lists, one region op each. NOT ``groups``: that
     # key is the split hints' shape groups, which record_decision moves to ``tried_groups`` once the hint is accepted
     groups = ([list(g) for g in h["windows"]] if h.get("windows") else
-              [h["members"]] if h.get("members") else find_regions(graph, h.get("pattern", "all"), specs))
+              [h["members"]] if h.get("members") else
+              # a pattern's groups are CURRENT op names (a fused op is `a+b`): _locate takes atoms, so give it the atoms (a pattern
+              # hint applied to a graph whose accepted fusions are already in the IR was skipped with "op(s) [...] not in the graph")
+              [[a for n in grp for a in atoms(n)] for grp in find_regions(graph, h.get("pattern", "all"), specs)])
     used = {}
     for grp in groups:
         try:

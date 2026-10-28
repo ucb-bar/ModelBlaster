@@ -131,6 +131,15 @@ class FusedMemberFallbackTest(unittest.TestCase):
         src = self.spec.cuda_seed(self.lib, {"linear_f16": marker + "\n" + hand}, parallel=False)
         self.assertIn(marker, src)
 
+    def test_pattern_hint_on_an_already_fused_graph_applies(self):
+        """region:all proposed/applied on a graph whose accepted fusions are in the IR: the pattern's groups are fused op names
+        (`a+b`), _locate takes atoms: the hint used to be skipped with 'op(s) [...] not in the graph'."""
+        from modelblaster.pipeline import graph_hints as gh
+        h = {"id": "region:all", "kind": "fuse_region", "pattern": "all", "status": "proposed"}
+        g2, _, prov = gh.apply_hints(json.loads(json.dumps(self.g)), [h], self.sp, statuses=None)
+        self.assertTrue(prov["applied"], prov["skipped"])
+        self.assertTrue(any(o["op"].startswith("region__") for o in g2["ops"]))
+
     def test_explicit_fused_source_still_wins(self):
         fk = "fused__linear_f16__tanh_f16"
         own = self.sp[fk].cuda_seed(self.lib, sub_sources={}) + "\n// MARKER-OWN-FUSED\n"
