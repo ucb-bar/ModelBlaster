@@ -267,6 +267,13 @@ def region_seed(spec: RegionKernelSpec, lib, sub_sources: dict, parallel: bool |
             if key in sub_sources:
                 src = sub_sources[key]
                 break
+        if src is None and ("sub_ops" in m or kind.startswith("fused__")) and hasattr(specs.get(kind), "cuda_seed"):
+            # a fused member with no cached source (no kernel round has produced a winner for its kind yet, e.g. a graph-first
+            # round, and a region op the cache has never seen): the member's own stage-by-stage seed, its sub-ops' sources
+            # where sub_sources has them else the hand kernels -- the seed the non-region fused slot path (kb_export) builds
+            fs = specs[kind]
+            subs = {k: sub_sources[k] for k in getattr(fs, "sub_ops", ()) if k in sub_sources}
+            src = fs.cuda_seed(lib.of(kind) if hasattr(lib, "of") else lib, sub_sources=subs)
         if src is not None:
             # concurrent members of one level never share a copy (statics); lane k = k-th member of the level
             # using this source, copies reused across levels
