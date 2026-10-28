@@ -321,6 +321,16 @@ class Config:
     experiments: str = "off"
     model_context: str = "off"
     view_fusion: str = "off"
+    # open-ended graph rewrites (graph_rewrite.py; docs/graph_rewrite.md): off (default; None = $MB_GRAPH_REWRITE, else off: nothing
+    # runs, the round key and every output are unchanged) | agent (a RewriteProposer is asked for candidate edits each round; each
+    # is gated by graph_verify and decided by the paired variant-vs-original timing like any hint). graph_rewrite_proposer: ""
+    # = the LLM proposer (not implemented: raises NotImplementedError), a registered name or module:Class; _max candidates per IR
+    # per round; _seeds random-input seeds of the verification gate; _device the gate's walker device
+    graph_rewrite: str | None = None
+    graph_rewrite_proposer: str = ""
+    graph_rewrite_max: int = 3
+    graph_rewrite_seeds: int = 2
+    graph_rewrite_device: str = "cpu"
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
     # KernelBlaster run's <out>/trace (prompts, responses, candidates, builds, driver output):
     # full | meta (hashes and sizes only) | off; env KB_TRACE
@@ -668,6 +678,9 @@ def _scope_ops(h: dict, graph: dict, specs: dict) -> list[str]:
         return list(dict.fromkeys(names))
     if h["kind"] == "split_slot":
         return [o["name"] for o in graph["ops"] if o["op"] in specs and base_slot_id(o["op"], specs) == h["slot"]]
+    if h["kind"] == "rewrite":                          # graph_rewrite.py: the ops the patch removes (and the new ones, on the variant side)
+        have = {o["name"] for o in graph["ops"]}
+        return [n for n in h["rewrite"]["patch"]["remove_ops"] if n in have]
     from . import cuda_learnings as cl
     if cl.ext_kind(h) or h["kind"] in ("fold_layout", "fuse_region", "fuse_view"):   # ext fusion / fold / A2 kinds
         from .fusion_ext import scope_ops
@@ -720,6 +733,8 @@ def footprint(h: dict, ir: str, graph: dict, specs: dict) -> dict:
     elif h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout"):   # extended kinds: the new ops' entries
         from .fusion_ext import new_kinds
         writes = {_entry(k, specs) for k in new_kinds(h, graph, specs)}
+    elif h["kind"] == "rewrite":                                           # graph_rewrite: the entries of the ops it adds
+        writes = {_entry(o["op"], specs) for o in h["rewrite"]["patch"]["add_ops"]}
     else:
         writes = set()
     return {"ops": ops, "reads": reads | writes, "writes": writes}
@@ -817,7 +832,7 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     vir = write_variant_ir(src_ir, vplan["graph"], out / "variant_ir")
     stem = _safe(f"{prof['ir']}__{h['id']}")
     oidx = [i for i, o in enumerate(g0["ops"]) if o["name"] in set(names)]
-    vnames = {prov["renamed"].get(n, n) for n in names}
+    vnames = {prov["renamed"].get(n, n) for n in names} | set(prov.get("added", []))   # + the ops a rewrite adds
     vidx = [i for i, o in enumerate(vplan["graph"]["ops"]) if o["name"] in vnames]
     seeds = {**base["sources"], **vplan["sources"]}
     tags = {**base["tags"], **vplan["tags"]}
@@ -1066,7 +1081,7 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
         man = json.loads((Path(job["variant"]) / "manifest.json").read_text())
         changed = [s["id"] for s in man["slots"]
                    if s["op"].startswith("fused__") or s.get("variant_of")
-                   or h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout")   # only new ops there
+                   or h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout", "rewrite")   # only new ops there
                    or s["op"].startswith("region__")]                                   # region slots (A2)
         res["cached"] = _ingest_slots(cache, job["variant"], rv, changed, job["specs"], h["id"])
     _trace_hint(job, ro, rv, times, ev, res)
@@ -1341,6 +1356,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     from . import capabilities as capm
     caps = capm.Caps(cfg, work)                          # A2 switches (defaults: prune on, the rest off)
     caps.apply_env()
+    from . import graph_rewrite as grm
+    rw = grm.RewriteHook(cfg, work)                      # --graph-rewrite off (default): inert
     from . import graph_search as gsm
     gs = gsm.CURRENT["gs"] = gsm.GraphSearch(cfg, work, irs)   # all off by default (no effect)
     if kb_barrier.enabled(cfg) or kb_barrier.char_sync_enabled(cfg, gk):
@@ -1373,6 +1390,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(ext.round_key())                     # cuda_learnings: likewise
     key.update(sf.round_key())                      # search fixes: only non-default switches
     key.update(caps.round_key())                    # capabilities: only non-default switches
+    key.update(rw.round_key())                      # graph rewrites: only when --graph-rewrite is on
     if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
         key["ingest_fused"] = "off"                 # kill switch: only when set
     if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
@@ -1444,6 +1462,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                                    launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
         ext.propose(graphs, profiles, doc, specs)             # --fusion-extended (no-op when off)
         caps.propose(graphs, profiles, doc, specs)            # --region-slots (no-op when off)
+        rw.propose(r, R, prog, graphs, profiles, doc, specs)  # --graph-rewrite agent: gated candidate edits (no-op when off)
         if gs.active():                                      # priors pre-apply, fold proposals, beam members
             profiles, graphs = gs.after_propose(r, R, prog, profiles, graphs, doc, specs, hints_path=hints_path,
                                                 reprofile=lambda sub, hd=None, R=R: _reprofile(R, sub, hd))
@@ -1468,10 +1487,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
 
         def _cands():
             if gs.active():                                 # graph search: prior ranking; beam: members decide
-                return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + gs.decide_kinds(),
+                return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + gs.decide_kinds(),
                                      _est_gain, _hint_ir, cfg)
             todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
-                    and h["kind"] in ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() and _est_gain(h) >= cfg.min_gain_pct]
+                    and h["kind"] in ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() and _est_gain(h) >= cfg.min_gain_pct]
             todo.sort(key=lambda h: -_est_gain(h))          # stable: ties keep the hints file's order
             return {"n_todo": len(todo), "cands": [(h["id"], p["ir"]) for h in todo[:cfg.max_variants]
                                                    if (p := _hint_ir(h, profiles)) is not None]}
@@ -1593,6 +1612,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     summary = {"irs": {}, "rounds": len(state["rounds"]), "fixpoint": state.get("fixpoint"),
                **({"cuda_learnings": ext.summary()} if ext.round_key() else {}),
                **({"capabilities": caps.summary()} if caps.round_key() else {}),
+               **({"graph_rewrite": rw.summary()} if rw.active() else {}),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
                "llm_calls": kb.calls, "parallel_hints": width,
