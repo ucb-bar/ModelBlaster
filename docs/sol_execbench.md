@@ -138,6 +138,9 @@ SOL's tolerances were set for kernels in the problem's own dtype, checked agains
 The CPU gate counts the reference values above fp16's maximum (65504) and in fp16's subnormal
 range (`range_risk`), for the fp16 mapping.
 
+SOL's tolerance can also gate the optimisation flow itself (`--sol-gate`, off by default): see
+[sol_gate.md](sol_gate.md).
+
 ## Gates (`gpu_eval/tools/sol_upstream_gates.py`)
 
 ```bash

@@ -121,6 +121,7 @@ CUDA-only, like bf16 ([bf16_cuda.md](bf16_cuda.md)).
 | partition outputs (driver `MB_CHECK`) | per output: the narrowest storage in its cone's `output_*` |
 | golden (walkers vs io.npz) | the IR's narrowest storage's `golden_*` |
 | SOL scoring | SOL's own rule (`sol_check`), unchanged |
+| SOL gate (`--sol-gate`, default off) | SOL's rule per graph output in the driver, against SOL's reference outputs or the golden: [sol_gate.md](sol_gate.md) |
 
 ## SOL gates
 
