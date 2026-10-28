@@ -138,6 +138,45 @@ class FusedMemberFallbackTest(unittest.TestCase):
         self.assertIn("MARKER-OWN-FUSED", src)
 
 
+@unittest.skipUnless(__import__("importlib.util").util.find_spec("torch"), "no torch")
+class NativeCastRegionTest(unittest.TestCase):
+    """--quant native (SOL): a region op that contains cast members (cast_bf16_to_f32 ...) exports. The partition's hand
+    libraries used to be chosen from the region op's own kind only, so the casts file was missing and the region seed raised
+    KeyError 'no definition of kernel_cast_bf16_to_f32' (B200 A6 smoke, 92016_SOL_L2_043_MambaChunkScanWithSegsum)."""
+
+    N = 1024
+
+    def _graph(self):
+        n = self.N
+        t = lambda dt: {"shape": [n], "dtype": dt, "quant": None}
+        return {"name": "native_cast", "version": 1, "quant": "native", "input": {"tensor": "x"},
+                "output": {"tensors": ["z"], "tensor": "z"},
+                "tensors": {"x": t("bf16"), "y": t("f32"), "r": t("f32"), "z": t("bf16")},
+                "ops": [{"name": "c0", "op": "cast_bf16_to_f32", "inputs": ["x"], "outputs": ["y"], "shape": {"n": n}},
+                        {"name": "r0", "op": "relu", "inputs": ["y"], "outputs": ["r"], "shape": {"n": n}},
+                        {"name": "c1", "op": "cast_f32_to_bf16", "inputs": ["r"], "outputs": ["z"], "shape": {"n": n}}],
+                "weight_dtypes": {}}
+
+    def test_region_with_casts_exports(self):
+        from modelblaster.pipeline import graph_hints as gh, kb_export
+        from modelblaster.pipeline.tests import window_fixtures as wf
+        g = gh.unique_names(self._graph())
+        sp = _specs(g)
+        names = rs.find_regions(json.loads(json.dumps(g)), "all", sp)[0]
+        g2, _ = rs.fuse_region(g, names, sp, "all")
+        d = Path(tempfile.mkdtemp())
+        try:
+            ird = wf.ir_dir_from_graph(d / "ir", g2)
+            out = kb_export.export_problem(ird, d / "p", specs=_specs(g2), name="native_region")
+            man = json.loads((Path(out) / "manifest.json").read_text())
+            slot = next(s for s in man["slots"] if s["id"].startswith("region__"))
+            src = (Path(out) / slot["file"]).read_text()
+            self.assertIn("kernel_cast_bf16_to_f32", src)
+            self.assertIn("kernel_cast_f32_to_bf16", src)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class Region43Test(unittest.TestCase):
     def test_attention_block(self):
         g = json.loads((HERE / "data" / "mingpt43_final_graph.json").read_text())

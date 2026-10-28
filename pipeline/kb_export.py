@@ -775,8 +775,13 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                                       f"CUDA-only; no {target} seeds")
         lib = libs = tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
     else:
-        libs = _Libraries(hand_cu, sorted({cuda_dtypes.op_dtype(k) for k in kinds if not cuda_dtypes.parse_cast(k)})
-                          or [cuda_dtypes.FP32 if dtype == MIXED else dtype], casts)
+        # a region op seeds its members from the hand libraries of THEIR dtypes (and the casts file when a member is a cast:
+        # --quant native), not only the region's own: the libraries cover every member kind of the partition
+        lib_kinds = list(kinds) + [m["op"] for i in sel if ops[i]["op"].startswith("region__")
+                                   for m in ops[i].get("sub_ops", []) if m["op"] not in ALIAS_OPS]
+        libs = _Libraries(hand_cu, sorted({cuda_dtypes.op_dtype(k) for k in lib_kinds if not cuda_dtypes.parse_cast(k)})
+                          or [cuda_dtypes.FP32 if dtype == MIXED else dtype],
+                          casts or any(cuda_dtypes.parse_cast(k) for k in lib_kinds))
     if mixed:
         dtype = cuda_dtypes.FP16              # the problem's rules / tolerances; fp32 slots say so in their semantics
     for i in sel:
