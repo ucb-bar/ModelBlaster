@@ -28,7 +28,9 @@ def _k(b):
     return (k, k) if isinstance(k, int) else tuple(k)
 
 
-def graph_and_weights(branches, quant="fp32", hw=(6, 6), seed=0, cin=4):
+def graph_and_weights(branches, quant="fp32", hw=(6, 6), seed=0, cin=4, modules=1):
+    """``modules`` > 1 chains identical modules: module m > 0 reads the previous module's concat (IC = its channel total) and its ops /
+    tensors / weights are prefixed ``m{m}_``."""
     H, W = hw
     t = F._tdt(quant)
     suf = SUF(quant)
@@ -37,51 +39,57 @@ def graph_and_weights(branches, quant="fp32", hw=(6, 6), seed=0, cin=4):
     tens = {"x": [1, cin, H, W], "sq_o": [1, S, H, W], "s": [1, S, H, W]}
     ops = [F.conv_op("sq", "x", "sq_o", "sq.weight", "sq.bias", cin, S, 1, quant, hw), F.relu_op("sq_relu", "sq_o", "s", S * H * W, quant)]
     w = {"sq.weight": wt(S, cin, 1, 1), "sq.bias": wt(S)}
-    ins, ch = [], []
-    OH = OW = None
-    for i, b in enumerate(branches):
-        oc = b["oc"]
-        if b.get("pool"):
-            ops.append({"name": f"b{i}", "op": "avgpool2d" + suf, "inputs": ["s"], "outputs": [f"b{i}"],
-                        "shape": {"N": 1, "C": S, "IH": H, "IW": W, "OH": H, "OW": W, "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1}})
-            tens[f"b{i}"] = [1, S, H, W]
-            ins.append(f"b{i}")
-            ch.append(S)
-            continue
-        kh, kw = _k(b)
-        st, dl, g = b.get("stride", 1), b.get("dil", 1), b.get("groups", 1)
-        ph = b["pad"] if b.get("pad") is not None else dl * (kh - 1) // 2
-        pw = b["pad"] if b.get("pad") is not None else dl * (kw - 1) // 2
-        oh = (H + 2 * ph - dl * (kh - 1) - 1) // st + 1
-        ow = (W + 2 * pw - dl * (kw - 1) - 1) // st + 1
-        OH, OW = oh, ow
-        kind = "conv2d_grouped" if g != 1 else "conv2d"
-        op = {"name": f"c{i}", "op": kind + suf, "inputs": ["s"], "outputs": [f"c{i}_o"], "weight": f"c{i}.weight",
-              "shape": {"N": 1, "IC": S, "IH": H, "IW": W, "OC": oc, "OH": oh, "OW": ow, "KH": kh, "KW": kw, "SH": st, "SW": st,
-                        "PH": ph, "PW": pw, "DH": dl, "DW": dl, **({"G": g} if g != 1 else {})}}
-        w[f"c{i}.weight"] = wt(oc, S // g, kh, kw)
-        if b.get("bias", True):
-            op["bias"] = f"c{i}.bias"
-            w[f"c{i}.bias"] = wt(oc)
-        ops.append(op)
-        tens[f"c{i}_o"] = [1, oc, oh, ow]
-        last = f"c{i}_o"
-        if b.get("act", "relu"):
-            ops.append({"name": f"a{i}", "op": b.get("act", "relu") + suf, "inputs": [last], "outputs": [f"a{i}_o"], "shape": {"n": oc * oh * ow}})
-            tens[f"a{i}_o"] = [1, oc, oh, ow]
-            last = f"a{i}_o"
-        ins.append(last)
-        ch.append(oc)
-    OH, OW = tens[ins[0]][2:]
-    tot = sum(ch)
-    ops.append({"name": "cat", "op": f"cat{len(ins)}_c1" + suf, "inputs": ins, "outputs": ["cat_out"],
-                "shape": {"N": 1, "H": OH, "W": OW, "C_inputs": ch, "C_total": tot}})
-    ops.append({"name": "pool", "op": "adaptive_avg_pool2d" + suf, "inputs": ["cat_out"], "outputs": ["pooled"],
-                "shape": {"N": 1, "C": tot, "IH": OH, "IW": OW}})
+    src, ic = "s", S
+    for m in range(modules):
+        p = "" if m == 0 else f"m{m}_"
+        ins, ch = [], []
+        for i, b in enumerate(branches):
+            oc = b["oc"]
+            if b.get("pool"):
+                ops.append({"name": f"{p}b{i}", "op": "avgpool2d" + suf, "inputs": [src], "outputs": [f"{p}b{i}"],
+                            "shape": {"N": 1, "C": ic, "IH": H, "IW": W, "OH": H, "OW": W, "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1}})
+                tens[f"{p}b{i}"] = [1, ic, H, W]
+                ins.append(f"{p}b{i}")
+                ch.append(ic)
+                continue
+            kh, kw = _k(b)
+            st, dl, g = b.get("stride", 1), b.get("dil", 1), b.get("groups", 1)
+            ph = b["pad"] if b.get("pad") is not None else dl * (kh - 1) // 2
+            pw = b["pad"] if b.get("pad") is not None else dl * (kw - 1) // 2
+            oh = (H + 2 * ph - dl * (kh - 1) - 1) // st + 1
+            ow = (W + 2 * pw - dl * (kw - 1) - 1) // st + 1
+            kind = "conv2d_grouped" if g != 1 else "conv2d"
+            op = {"name": f"{p}c{i}", "op": kind + suf, "inputs": [src], "outputs": [f"{p}c{i}_o"], "weight": f"{p}c{i}.weight",
+                  "shape": {"N": 1, "IC": ic, "IH": H, "IW": W, "OC": oc, "OH": oh, "OW": ow, "KH": kh, "KW": kw, "SH": st, "SW": st,
+                            "PH": ph, "PW": pw, "DH": dl, "DW": dl, **({"G": g} if g != 1 else {})}}
+            w[f"{p}c{i}.weight"] = wt(oc, ic // g, kh, kw)
+            if b.get("bias", True):
+                op["bias"] = f"{p}c{i}.bias"
+                w[f"{p}c{i}.bias"] = wt(oc)
+            ops.append(op)
+            tens[f"{p}c{i}_o"] = [1, oc, oh, ow]
+            last = f"{p}c{i}_o"
+            if b.get("act", "relu"):
+                ops.append({"name": f"{p}a{i}", "op": b.get("act", "relu") + suf, "inputs": [last], "outputs": [f"{p}a{i}_o"], "shape": {"n": oc * oh * ow}})
+                tens[f"{p}a{i}_o"] = [1, oc, oh, ow]
+                last = f"{p}a{i}_o"
+            ins.append(last)
+            ch.append(oc)
+        OH, OW = tens[ins[0]][2:]
+        tot = sum(ch)
+        out = "cat_out" if m == modules - 1 else f"{p}cat_out"
+        if m == 0 and modules > 1:
+            out = "cat_out_0"
+        ops.append({"name": f"{p}cat", "op": f"cat{len(ins)}_c1" + suf, "inputs": ins, "outputs": [out],
+                    "shape": {"N": 1, "H": OH, "W": OW, "C_inputs": ch, "C_total": tot}})
+        tens[out] = [1, tot, OH, OW]
+        src, ic, H, W = out, tot, OH, OW
+    ops.append({"name": "pool", "op": "adaptive_avg_pool2d" + suf, "inputs": [src], "outputs": ["pooled"],
+                "shape": {"N": 1, "C": ic, "IH": H, "IW": W}})
     ops.append({"name": "fc", "op": "linear" + suf, "inputs": ["pooled"], "outputs": ["out"], "weight": "fc.weight", "bias": "fc.bias",
-                "shape": {"M": 1, "K": tot, "N": 4}})
-    tens.update(cat_out=[1, tot, OH, OW], pooled=[1, tot, 1, 1], out=[1, 4])
-    w.update({"fc.weight": wt(4, tot), "fc.bias": wt(4)})
+                "shape": {"M": 1, "K": ic, "N": 4}})
+    tens.update(pooled=[1, ic, 1, 1], out=[1, 4])
+    w.update({"fc.weight": wt(4, ic), "fc.bias": wt(4)})
     for i, o in enumerate(ops):
         o["dispatch_id"], o["depends_on"] = i, [i - 1] if i else []
     g = {"name": "branchy", "version": 1, "quant": quant, "input": {"tensor": "x"}, "output": {"tensors": ["out"], "tensor": "out"},
@@ -93,8 +101,8 @@ def graph_and_weights(branches, quant="fp32", hw=(6, 6), seed=0, cin=4):
     return g, w
 
 
-def branchy_ir(d, branches, quant="fp32", hw=(6, 6), seed=0, cin=4):
-    g, w = graph_and_weights(branches, quant, hw, seed, cin)
+def branchy_ir(d, branches, quant="fp32", hw=(6, 6), seed=0, cin=4, modules=1):
+    g, w = graph_and_weights(branches, quant, hw, seed, cin, modules)
     return F.write_ir(Path(d), g, w)
 
 
