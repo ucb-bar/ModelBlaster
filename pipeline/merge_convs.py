@@ -490,7 +490,9 @@ def _apply_one(g: dict, ctx: Ctx, p: dict, hid: str) -> dict:
     for k in ("dispatch_id", "depends_on", "hint", "slot_variant"):
         cop.pop(k, None)
     cop.update(name=uniq(f"merge_{tag}"), inputs=[p["x"]], outputs=[conv_out], weight=wk, bias=bk,
-               shape={**s0, "OC": oc_t, "KH": p["kh"], "KW": p["kw"], "PH": p["ph"], "PW": p["pw"]})
+               shape={**s0, "OC": oc_t, "KH": p["kh"], "KW": p["kw"], "PH": p["ph"], "PW": p["pw"]},
+               approx=True)       # the merged conv is not bit-identical (zero padding reorders the accumulation): graph_hints.verify_rewrite then
+                                  # checks the fp16 OUTPUT tolerance instead of bit equality (found on the first B200 run: verify.ok was false at 3e-5)
     if bk is None:
         cop.pop("bias", None)
     new_ops = [cop]
