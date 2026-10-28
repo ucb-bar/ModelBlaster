@@ -1339,7 +1339,7 @@ class FlowHardware:
         from .kb_eval import check_device, gpu_model_key
 
         d = dict(device or {})
-        self.devices[step].append({"what": what, **{k: d.get(k) for k in ("host", "label", "uuid", "name", "arch")}})
+        self.devices.setdefault(step, []).append({"what": what, **{k: d.get(k) for k in ("host", "label", "uuid", "name", "arch")}})   # setdefault: sol_gate's "sol_probe" is not one of STEPS
         if self.model is None and gpu_model_key(d.get("name")):
             self.model = d["name"]                      # the first step that ran fixes the model
             return
