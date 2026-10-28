@@ -847,10 +847,20 @@ def _f_adaptive_avg_pool2d(g: GenericLowering, node):
 
 
 def _f_einsum(g: GenericLowering, node):
-    eq = node.args[0].replace(" ", "")
     operands = node.args[1:]
     if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
         operands = operands[0]
+    return _einsum(g, node, node.args[0].replace(" ", ""), operands)
+
+
+def _f_outer(g: GenericLowering, node):
+    """torch.outer / ger (SOL-ExecBench rope frequencies): einsum i,j->ij."""
+    a = node.args[0]
+    b = node.args[1] if len(node.args) > 1 else node.kwargs.get("vec2")
+    return _einsum(g, node, "i,j->ij", [a, b])
+
+
+def _einsum(g: GenericLowering, node, eq: str, operands):
     srcs = [g._tensor_arg(o) for o in operands]
     lhs, rhs = eq.split("->")
     terms = lhs.split(",")
@@ -1470,6 +1480,10 @@ def _f_cast(g: GenericLowering, node):
                 target = a
     sdt = src.meta.get("tensor_meta").dtype if isinstance(src, torch.fx.Node) and \
         hasattr(src.meta.get("tensor_meta"), "dtype") else None
+    if target is not None and target.is_floating_point and target.itemsize == 1 or \
+            str(target).startswith("torch.float4"):
+        # a view would silently drop the rounding (SOL-ExecBench Quant: x.to(torch.float8_e4m3fn))
+        raise NotImplementedError(f"{node.name}: cast to {target}: no fp8/fp4 storage in the IR")
     x = g._tensor_arg(src)
     out = g._out(node)
     if target == torch.bool and sdt != torch.bool:
@@ -1714,7 +1728,7 @@ _FUNCS = {
     "normalize": _f_normalize, "linear": _f_linear, "layer_norm": _f_layer_norm_any,
     "max_pool2d": _f_max_pool2d, "avg_pool2d": _f_avg_pool2d,
     "adaptive_avg_pool2d": _f_adaptive_avg_pool2d,
-    "einsum": _f_einsum, "conv2d": _f_conv2d, "batch_norm": _f_batch_norm,
+    "einsum": _f_einsum, "outer": _f_outer, "ger": _f_outer, "conv2d": _f_conv2d, "batch_norm": _f_batch_norm,
     "logsumexp": _f_logsumexp,
     # functionalized in-place ops (concrete_trace)
     "mb_setitem": _f_mb_setitem, "mb_copy": lambda g, n: g._lower_movement(n),

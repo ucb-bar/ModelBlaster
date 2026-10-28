@@ -23,7 +23,9 @@ helpers from colliding and makes every kernel name carry its slot.
 
 The driver, run with no arguments:
   1. runs the whole partition and checks every output against the reference
-     (err <= rel * max|finite ref| + abs);
+     (err <= rel * max|finite ref| + abs + cond * ref_err, ref_err the fp32
+     reference's own distance from an exact (float64) walk: an output whose
+     value cancels to ~0 is rounding noise in the reference too);
   2. runs every op alone on the reference's inputs and checks its outputs
      (attributes a failure to a slot);
   3. times the partition and every op with CUDA events;
@@ -64,11 +66,23 @@ MB_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = MB_ROOT / "gpu_eval" / "harness"
 DEFAULT_HAND_CU = HARNESS / "cuda" / "mb_cuda_kernels.cu"
 DEFAULT_HAND_CU_F16 = HARNESS / "cuda" / "mb_cuda_kernels_f16.cu"    # generated (f16_kernels.py)
+DEFAULT_HAND_CU_BF16 = HARNESS / "cuda" / "mb_cuda_kernels_bf16.cu"  # generated (f16_kernels.py)
+# the casts of a mixed IR (cast_<src>_to_<dst>), beside the hand kernels
+CAST_CU = "mb_cuda_kernels_cast.cu"
 FORMAT = "mb-kb-problem/1"
 NS_PREFIX = "mbslot_"
 ALIAS_OPS = ("view", "chunk2_c1")
 DEFAULT_TOL = {"output_rel": 1e-3, "output_abs": 1e-5, "slot_rel": 1e-3}
-DTYPE_TOL = {d: {k: t[k] for k in (*DEFAULT_TOL, "slot_abs")} for d, t in cuda_dtypes.TOLERANCE.items()}
+# The partition-output bound also admits OUTPUT_COND times the reference's own
+# error (max |reference - exact|, the exact value from a float64 walk without
+# store rounding): a candidate as far from the exact value as the reference is
+# differs from it by up to twice that. Negligible for a well-conditioned output;
+# it is what an output that cancels to ~0 (the gradient of a key bias through a
+# softmax, sum_k d/dk of a shift-invariant function) needs, where the fp32
+# reference is pure rounding noise of the summands' scale.
+OUTPUT_COND = 2.0
+DTYPE_TOL = {d: {**{k: t[k] for k in (*DEFAULT_TOL, "slot_abs")}, "output_cond": OUTPUT_COND}
+             for d, t in cuda_dtypes.TOLERANCE.items()}
 
 
 # A slot may spell its fp16 pointers `_Float16*` or `__half*` (the cache hashes both as one signature), and the two
@@ -90,11 +104,12 @@ def _harness():
     return mbir, walk_torch
 
 
-# ---------------------------------------------------------------- storage dtypes (fp32 / fp16)
+# ---------------------------------------------------------------- storage dtypes (fp32 / fp16 / bf16)
 
 class _CudaSpelled:
     """A KernelSpec seen with the CUDA spelling of its signature (`_Float16`
-    -> `__half`, cuda_dtypes.cuda_signature); everything else passes through."""
+    -> `__half`, `__bf16` -> `__nv_bfloat16`, cuda_dtypes.cuda_signature);
+    everything else passes through."""
 
     def __init__(self, spec):
         self._spec = spec
@@ -107,10 +122,17 @@ class _CudaSpelled:
         return cuda_dtypes.cuda_signature(self._spec.signature)
 
 
-def _problem_dtype(kinds: list[str]) -> str:
-    """fp16 when every op of the partition is an `_f16` op, else fp32."""
+def _problem_dtype(kinds: list[str], mixed: bool = False) -> str:
+    """fp16 / bf16 when every op of the partition is an `_f16` / `_bf16` op, else fp32.
+    A mixed IR's partition (``mixed``; --quant native) whose ops have more than one
+    storage dtype is ``mixed``: each slot then carries its own (manifest slot ``dtype``)."""
     dts = {cuda_dtypes.op_dtype(k) for k in kinds}
-    return cuda_dtypes.FP16 if dts == {cuda_dtypes.FP16} else cuda_dtypes.FP32
+    if mixed and len(dts) > 1:
+        return MIXED
+    return dts.pop() if len(dts) == 1 else cuda_dtypes.FP32
+
+
+MIXED = "mixed"
 
 
 def _is_mixed(kinds: list[str]) -> bool:
@@ -147,26 +169,81 @@ class _MixedLibrary:
 
 
 def _hand_source(hand_cu: Path, dtype: str) -> str:
-    """The hand kernels for a dtype: fp16 uses the generated `<stem>_f16.cu`
-    beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu for the default)."""
+    """The hand kernels for a dtype: fp16 / bf16 use the generated `<stem>_f16.cu`
+    / `<stem>_bf16.cu` beside ``hand_cu`` (cuda/mb_cuda_kernels_f16.cu /
+    _bf16.cu for the default)."""
     hand_cu = Path(hand_cu)
-    if dtype == cuda_dtypes.FP16:
-        hand_cu = hand_cu.with_name(hand_cu.stem + "_f16" + hand_cu.suffix)
+    if dtype in cuda_dtypes.SUFFIX:
+        hand_cu = hand_cu.with_name(hand_cu.stem + cuda_dtypes.SUFFIX[dtype] + hand_cu.suffix)
     return hand_cu.read_text()
 
 
 def _tensor_dtype(ir, t: str) -> str:
-    """Buffer dtype of IR tensor t: a constant's is its weights.npz array's,
-    else graph.json's (f16 for an fp16 extract)."""
+    """Buffer dtype of IR tensor t: a constant's is its weights.npz array's
+    (a mixed IR names it in ``weight_dtypes``), else graph.json's (f16 / bf16 for
+    an fp16 / bf16 extract; every tensor's own in a mixed IR)."""
     key = ir.graph["tensors"].get(t, {}).get("const")
     if key:
-        return cuda_dtypes.buffer_dtype(ir.weights[key].dtype)
+        return cuda_dtypes.weight_dtype(ir.graph, key, ir.weights[key].dtype)
     dt = ir.graph["tensors"].get(t, {}).get("dtype")
-    # i64: the index outputs of argmax/argmin (kernel_argmax_dim writes int64_t)
-    return {"f16": "f16", "i64": "i64"}.get(dt, "f32")
+    # i64: the index outputs of argmax/argmin (kernel_argmax_dim writes int64_t);
+    # i32 / b8 / u8: a mixed IR's integer / bool graph inputs and outputs
+    return {"f16": "f16", "bf16": "bf16", "i64": "i64", "i32": "i32", "b8": "b8", "u8": "u8"}.get(dt, "f32")
 
 
-_NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i64": np.int64}
+_NP_OF_BUF = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i64": np.int64, "b8": np.uint8,
+              "u8": np.uint8}
+
+
+def _buffer_values(arr: np.ndarray, dtype: str) -> np.ndarray:
+    """A buffer's reference values as stored on the device (bf16: the 2-byte
+    patterns; the walk's values are bf16-exact, so this is exact; b8: bool as
+    one byte 0 / 1)."""
+    if dtype == "bf16":
+        return cuda_dtypes.bf16_bits(arr)
+    if dtype == "b8":
+        arr = np.asarray(arr) != 0
+    return arr.astype(_NP_OF_BUF[dtype]).reshape(-1)               # fp16 values are exact
+
+
+class _Libraries:
+    """The hand-kernel libraries a partition draws its slot seeds from: one per
+    storage dtype (fp32 / `_f16` / `_bf16` hand files) plus the casts file for a
+    mixed IR. Every entry name is unique across them (``kernel_relu`` /
+    ``kernel_relu_bf16`` / ``kernel_cast_bf16_to_f32``), so a slot's seed is the
+    closure of its entry in the library that defines it, and the shared head is
+    the union of the used libraries' preprocessor lines. A single-dtype partition
+    uses exactly one library, as before."""
+
+    def __init__(self, hand_cu: Path, dtypes, casts: bool):
+        self.libs = {d: CudaLibrary(_hand_source(hand_cu, d)) for d in dtypes}
+        if casts:
+            self.libs["cast"] = CudaLibrary((Path(hand_cu).with_name(CAST_CU)).read_text())
+
+    def of(self, kind: str) -> CudaLibrary:
+        return self.libs["cast" if cuda_dtypes.parse_cast(kind) else cuda_dtypes.op_dtype(kind)]
+
+    # the union view (region slots seed from members of any dtype; entry names are unique across the libraries)
+    @property
+    def items(self) -> dict:
+        return {k: v for lib in self.libs.values() for k, v in lib.items.items()}
+
+    def _lib(self, entry: str) -> CudaLibrary:
+        return next((lib for lib in self.libs.values() if entry in lib.items), next(iter(self.libs.values())))
+
+    def closure(self, entry: str) -> list[str]:
+        return self._lib(entry).closure(entry)
+
+    def slot_source(self, entry: str) -> str:
+        return self._lib(entry).slot_source(entry)
+
+    def head_source(self) -> str:
+        if len(self.libs) == 1:
+            return next(iter(self.libs.values())).head_source()
+        lines = []
+        for lib in self.libs.values():
+            lines += [ln for ln in lib.head if ln not in lines]
+        return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------- CUDA source library
@@ -444,13 +521,111 @@ def slot_id_of(op: dict, specs: dict) -> str:
     return f"{sid}__{op['slot_variant']}" if op.get("slot_variant") else sid
 
 
+def exact_values(ir, names: list[str]) -> dict | None:
+    """The exact values of the tensors ``names``: a float64 walk without the
+    fp16 / bf16 store rounding, holding only its live set. None when it fails
+    (a rule that cannot run in float64)."""
+    import torch
+    _, walk_torch = _harness()
+    try:
+        with torch.no_grad():
+            _, ex = walk_torch.walk(ir, dev="cpu", dtype=torch.float64, store_rounding=False, keep=set(names))
+    except Exception:  # noqa: BLE001 -- best effort: no conditioning term
+        return None
+    return {t: ex.get(t) for t in names}
+
+
+def reference_error(env: dict, exact: dict | None, names: list[str]) -> dict[str, float | None]:
+    """max |env[t] - exact[t]| per float tensor in ``names``: how far the walk's
+    reference values (``env``, the fp32 / store-rounded walk) are from the exact
+    math (``exact_values``). None for every name when there are no exact values:
+    the bound then has no conditioning term."""
+    import torch
+    if exact is None:
+        return {t: None for t in names}
+    res = {}
+    for t in names:
+        a, b = env.get(t), exact.get(t)
+        if a is None or b is None or not torch.is_tensor(a) or not a.is_floating_point() \
+                or a.numel() != b.numel():
+            res[t] = 0.0
+            continue
+        a, b = a.detach().double().reshape(-1), b.detach().double().reshape(-1)
+        same = (a == b) | (torch.isnan(a) & torch.isnan(b))
+        fin = torch.isfinite(a) & torch.isfinite(b)
+        d = torch.where(same | ~fin, torch.zeros_like(a), (a - b).abs())
+        res[t] = float(d.max()) if d.numel() else 0.0
+    return res
+
+
+def data_bin_bytes(ir_dir, op_indices: list[int] | None = None) -> int:
+    """data.bin's size for the ops ``op_indices`` (default: all) of the IR at
+    ``ir_dir``, from graph.json and weights.npz's headers (nothing is walked):
+    every non-alias tensor the ops touch at its buffer dtype, every weight
+    array that is not a constant tensor's, 256-byte aligned as written. A
+    weight the ops do not bind is counted too (an upper bound by that much)."""
+    import zipfile
+
+    from numpy.lib import format as npf
+
+    from .graph_hints import unique_names
+    ir_dir = Path(ir_dir)
+    g = unique_names(json.loads((ir_dir / "graph.json").read_text()))
+    storage = cuda_dtypes.ir_dtype(g)
+    ops, tensors = g["ops"], g["tensors"]
+    sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
+    wshape = {}
+    wp = ir_dir / "weights.npz"
+    if wp.exists():
+        with zipfile.ZipFile(wp) as z:
+            for n in z.namelist():
+                with z.open(n) as fh:
+                    v = npf.read_magic(fh)
+                    shape, _, dt = (npf.read_array_header_1_0 if v[0] == 1 else npf.read_array_header_2_0)(fh)
+                wshape[n.removesuffix(".npy")] = (shape, dt)
+    esz = cuda_dtypes.BUFFER_BYTES
+    mixed = cuda_dtypes.is_mixed(g)              # every tensor at its own dtype (--quant native)
+
+    def nbytes(shape, dt):
+        return (-(-(math.prod(shape) * esz[dt]) // 256)) * 256
+
+    alias, touched = set(), []
+    for i in sel:
+        o = ops[i]
+        if o["op"] in ALIAS_OPS:
+            alias.update(o["outputs"])
+        for t in (*o["inputs"], *o["outputs"], *o.get("internal", [])):
+            if t not in touched:
+                touched.append(t)
+    total, consts = 0, set()
+    for t in touched:
+        meta = tensors.get(t)
+        if meta is None or t in alias:
+            continue
+        key = meta.get("const")
+        if key:
+            consts.add(key)
+            shape, dt = wshape.get(key, (meta["shape"], np.dtype(np.float32)))
+            total += nbytes(shape, cuda_dtypes.weight_dtype(g, key, dt))
+        else:
+            dt = {"f16": "f16", "bf16": "bf16", "i64": "i64", "i32": "i32", "b8": "b8", "u8": "u8"}.get(
+                meta.get("dtype"), "f32")
+            if not mixed and storage in (cuda_dtypes.FP16, cuda_dtypes.BF16) and dt == "f32":
+                dt = "f16" if storage == cuda_dtypes.FP16 else "bf16"
+            total += nbytes(meta["shape"], dt)
+    for k, (shape, dt) in wshape.items():
+        if k not in consts:
+            total += nbytes(shape, cuda_dtypes.weight_dtype(g, k, dt))
+    return total
+
+
 def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None, name: str | None = None,
                    hand_cu: Path = DEFAULT_HAND_CU, slot_sources: dict[str, str] | None = None,
                    slot_source_tags: dict[str, str] | None = None, specs: dict | None = None,
                    tolerance: dict | None = None, strategy: str = "custom",
                    sub_sources: dict[str, dict[str, str]] | None = None, target: str = "cuda",
                    concurrency: str | None = None, sm_budget_policy: str | None = None,
-                   prune_dead: bool | str | None = None) -> Path:
+                   prune_dead: bool | str | None = None, conditioning: bool = True) -> Path:
     """Write a problem directory for the ops ``op_indices`` of the IR at ``ir_dir``.
 
     ``slot_sources`` maps a slot id (or an op kind) to a seed source
@@ -462,7 +637,9 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     ``sub_sources`` is None -- from ``slot_sources`` by the stage's slot id or
     kind, else the hand kernel. ``target="opencl"`` writes OpenCL slots,
     runtime and driver (``kb_export_opencl``); the partition, buffers, ops and
-    data are the same.
+    data are the same. ``conditioning`` adds each output's reference error
+    (``reference_error``; a second, float64 walk, ``exact_values``) to its
+    bound; off, the term is 0.
 
     ``concurrency`` ("off" | "on"; None: ``$MB_GRAPH_CONCURRENCY``, default off) and ``sm_budget_policy``
     ("split" | "none" | "strict"; None: ``$MB_SM_BUDGET_POLICY``, default split): with "on", ops that are
@@ -490,6 +667,8 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     g = unique_names(ir.graph)
     ops = g["ops"]
     sel = sorted(op_indices) if op_indices is not None else list(range(len(ops)))
+    if not sel:
+        raise ValueError(f"{ir_dir}: no ops to export (the graph has {len(ops)}; its output may be an input)")
     sel_requested = list(sel)
     # dead-op pruning (graph_prune; $MB_PRUNE_DEAD, default on): ops whose outputs never reach a graph output
     # get no call; with no dead op in the graph every output file is what it was
@@ -501,9 +680,6 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     tensors = g["tensors"]
     specs = {k: _CudaSpelled(v) for k, v in specs.items()}     # slots are CUDA: __half
 
-    with torch.no_grad():
-        _, env = walk_torch.walk(ir, dev="cpu")
-
     # fused ops keep their internal tensor (A's output) as a scratch buffer
     produced = [t for i in sel for t in ops[i]["outputs"] + ops[i].get("internal", [])]
     produced_set = set(produced)
@@ -511,6 +687,12 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                         for t in o["inputs"]}
     graph_outs = set(ir.output_names())
     outputs = [t for t in produced if t in consumed_outside or t in graph_outs]
+
+    # the exact outputs first (the float64 walk's live set and the fp32 walk's
+    # full env are never held together), then the reference walk
+    exact = exact_values(ir, outputs) if conditioning else None
+    with torch.no_grad():
+        _, env = walk_torch.walk(ir, dev="cpu")
     boundary = []
     for i in sel:
         for t in ops[i]["inputs"]:
@@ -560,12 +742,21 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     # ---- slots + per-op calls
     slots, slot_of, calls, op_recs = {}, {}, [], []
     conc_ops = []                                 # (full op index, slot id, call stmt, scratch buffers) per op_rec
-    dtype = _problem_dtype([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
+    kinds = [ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS]
+    dtype = _problem_dtype(kinds, cuda_dtypes.is_mixed(g))
+    casts = any(cuda_dtypes.parse_cast(k) for k in kinds)
     # precision policy (precision_policy.py): a partition mixing fp16 ops and an fp32 island takes its slots from
-    # both hand libraries and the fp16 tolerances; partitions of one dtype (every IR without a policy) unchanged
-    mixed = tgt is None and _is_mixed([ops[i]["op"] for i in sel if ops[i]["op"] not in ALIAS_OPS])
-    lib = _MixedLibrary(hand_cu) if mixed else CudaLibrary(_hand_source(hand_cu, dtype)) if tgt is None else \
-        tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
+    # both hand libraries and the fp16 tolerances; partitions of one dtype (every IR without a policy) unchanged.
+    # (A --quant native IR is the per-slot-dtype case below: dtype == MIXED.)
+    mixed = tgt is None and not cuda_dtypes.is_mixed(g) and _is_mixed(kinds)
+    if tgt is not None:
+        if casts:
+            raise NotImplementedError("per-tensor casts (--quant native, docs/tensor_dtypes.md) are "
+                                      f"CUDA-only; no {target} seeds")
+        lib = libs = tgt.library(None if Path(hand_cu) == DEFAULT_HAND_CU else hand_cu, dtype)
+    else:
+        libs = _Libraries(hand_cu, sorted({cuda_dtypes.op_dtype(k) for k in kinds if not cuda_dtypes.parse_cast(k)})
+                          or [cuda_dtypes.FP32 if dtype == MIXED else dtype], casts)
     if mixed:
         dtype = cuda_dtypes.FP16              # the problem's rules / tolerances; fp32 slots say so in their semantics
     for i in sel:
@@ -595,9 +786,10 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
             elif kind.startswith("region__"):          # region: members' current kernels in order (region_slots)
                 from .region_slots import seed_sources
                 subs = (sub_sources or {}).get(sid) or seed_sources(o, slot_sources or {}, specs)
-                src = spec.cuda_seed(lib, sub_sources=subs)
+                src = spec.cuda_seed(libs, sub_sources=subs)
                 tag = f"region-seed:{len(subs)}/{sum(m['op'] not in ALIAS_OPS for m in o['sub_ops'])}"
             elif hasattr(spec, "cuda_seed"):           # fused ops: stage kernels back to back
+                lib = libs.of(kind)
                 if sub_sources is not None:
                     subs = sub_sources.get(sid, {})
                 else:
@@ -610,15 +802,19 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                 src = spec.cuda_seed(lib, sub_sources=subs)
                 tag = "fused-seed" + (":" + ",".join(sorted(subs)) if subs else "")
             else:
-                src, tag = lib.slot_source(entry), "hand"
+                src, tag = libs.of(kind).slot_source(entry), "hand"
+            sdt = cuda_dtypes.op_dtype(kind)
             slots[sid] = {"id": sid, "op": kind, "ops": [], "op_class": op_class(kind), "entry": entry,
                           "signature": " ".join(spec.signature.split()),
                           "file": f"slots/{sid}{'.cu' if tgt is None else tgt.slot_ext}",
                           "reference_file": f"slots/{sid}.ref.c", "semantics": spec.semantics,
                           **({"variant_of": base_sid} if o.get("slot_variant") else {}),
                           "seed_source": tag, "instances": [], "_src": src,
-                          "_ref": spec.reference_impl}
-            if mixed and cuda_dtypes.op_dtype(kind) == cuda_dtypes.FP32:
+                          "_ref": spec.reference_impl,
+                          # the slot's storage dtype and its isolated-op bound (a mixed problem's
+                          # slots differ; a cast slot's is its destination's)
+                          "dtype": sdt, "tolerance": {k: DTYPE_TOL[sdt][k] for k in ("slot_rel", "slot_abs")}}
+            if mixed and sdt == cuda_dtypes.FP32:
                 slots[sid]["semantics"] = ("(fp32 island of the precision policy: this slot's float pointers are "
                                            "fp32 `float` buffers, not __half; values exceed the fp16 range) "
                                            + (spec.semantics or ""))
@@ -651,7 +847,7 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                 key = f"w:{a.value}"
                 if key not in index:
                     arr = ir.weights[a.value]
-                    add_buf(key, kind="weight", dtype=cuda_dtypes.buffer_dtype(arr.dtype),
+                    add_buf(key, kind="weight", dtype=cuda_dtypes.weight_dtype(ir.graph, a.value, arr.dtype),
                             numel=int(arr.size), alias=None)
                 ptrs.append((len(args), index[key]))
                 args.append(_ptr_arg(p.ctype, index[key]))
@@ -668,38 +864,57 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
         slots[sid]["instances"].append({"op_name": o["name"], "op": kind, "index": k, "shape": o.get("shape", {})})
         op_recs.append({"index": k, "name": o["name"], "op": kind, "slot": sid,
                         "inputs": ins, "outputs": outs})
+        if dtype == MIXED:                       # the driver's isolated bound of this op (its dtype's)
+            op_recs[-1]["tolerance"] = {**slots[sid]["tolerance"], **{
+                k: v for k, v in (tolerance or {}).items() if k in ("slot_rel", "slot_abs")}}
 
-    # ---- data.bin: reference values of every non-alias tensor, then weights
-    blob, off = bytearray(), 0
+    # ---- data.bin: reference values of every non-alias tensor, then weights,
+    # streamed to the file (a partition's data can be many GB: no copy of it
+    # is held, only the walk's values and one buffer at a time)
+    out.mkdir(parents=True, exist_ok=True)
+    sha = hashlib.sha1()
+    with open(out / "data.bin", "wb") as fh:
+        pos = 0
 
-    def put(arr: np.ndarray) -> list[int]:
-        nonlocal off
-        pad = (-len(blob)) % 256
-        blob.extend(b"\0" * pad)
-        start = len(blob)
-        blob.extend(np.ascontiguousarray(arr).tobytes())
-        return [start, len(blob) - start]
+        def put(arr: np.ndarray) -> list[int]:
+            nonlocal pos
+            pad = b"\0" * ((-pos) % 256)
+            fh.write(pad)
+            sha.update(pad)
+            start = pos + len(pad)
+            mv = memoryview(np.ascontiguousarray(arr)).cast("B")
+            fh.write(mv)
+            sha.update(mv)
+            pos = start + mv.nbytes
+            return [start, mv.nbytes]
 
+        for b in bufs:
+            if b["alias"] is not None:
+                b["ref"] = None
+                continue
+            if b["kind"] == "weight":
+                arr = ir.weights[b["name"][2:]]
+            else:
+                v = env[b["name"]]
+                arr = v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
+            arr = _buffer_values(arr, b["dtype"])
+            assert arr.size == b["numel"], (b["name"], arr.size, b["numel"])
+            b["ref"] = put(arr)
+
+    # ---- the outputs' reference error (their bound's conditioning term)
+    env = {t: env[t] for t in outputs}                # the rest is in data.bin now
+    rerr = reference_error(env, exact, outputs) if conditioning else {}
+    del exact
     for b in bufs:
-        if b["alias"] is not None:
-            b["ref"] = None
-            continue
-        if b["kind"] == "weight":
-            arr = ir.weights[b["name"][2:]]
-        else:
-            v = env[b["name"]]
-            arr = v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
-        arr = arr.astype(_NP_OF_BUF[b["dtype"]]).reshape(-1)       # fp16 values are exact
-        assert arr.size == b["numel"], (b["name"], arr.size, b["numel"])
-        b["ref"] = put(arr)
+        if b["kind"] == "output":
+            b["ref_err"] = rerr.get(b["name"])
+    del env
 
     # ---- write
-    out.mkdir(parents=True, exist_ok=True)
     (out / "slots").mkdir(exist_ok=True)
     for s in slots.values():
         (out / s["file"]).write_text(s.pop("_src"))
         (out / s["reference_file"]).write_text(s.pop("_ref"))
-    (out / "data.bin").write_bytes(bytes(blob))
     head, tail_name, driver_name = ("walker_head.cu", "walker_tail.cu", "driver.cpp") if tgt is None else \
         (tgt.head_name, tgt.tail_name, tgt.driver_name)
     from . import kb_concurrency as kc
@@ -710,7 +925,7 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
     (out / head).write_text(
         "// Shared preamble for every slot (from the ModelBlaster hand kernels).\n"
         # winners are written against KernelBlaster's harness, which provides these; the walker must too
-        + ("#include <stdint.h>\n#include <cstddef>\n" if tgt is None else "") + lib.head_source()
+        + ("#include <stdint.h>\n#include <cstddef>\n" if tgt is None else "") + libs.head_source()
         + (kc.HEAD if conc is not None else "")
         if tgt is None else tgt.head_source(lib))
     tail = [
@@ -723,7 +938,15 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
             f"    for (int i = 0; i < {len(op_recs)}; ++i) mb_run_op(i, b);", "}"]),
         *([] if tgt is not None else SO_ABI), ""]
     (out / tail_name).write_text("\n".join(tail))
-    tol = {**DTYPE_TOL[dtype], **(tolerance or {})}
+    tol = {**DTYPE_TOL[dtype if dtype != MIXED else _mixed_bound(slots)], **(tolerance or {})}
+    if dtype == MIXED:
+        # per output: its dtype's bound, or a narrower one it was computed through
+        # (an fp32 output of bf16 intermediates carries their rounding)
+        cone = cuda_dtypes.cone_dtypes(g, [b["name"] for b in bufs if b["kind"] == "output"])
+        for b in bufs:
+            if b["kind"] == "output":
+                b["tolerance"] = {k: v for k, v in {**DTYPE_TOL[cone[b["name"]]], **(tolerance or {})}.items()
+                                  if k in ("output_rel", "output_abs")}
     slot_list = list(slots.values())
     if conc is not None:
         kc.annotate_slots(slot_list, sched)
@@ -742,7 +965,7 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
                      **({"lanes": sched["lanes"]} if sched and sched.get("lanes") else {})},
         **({"concurrency": kc.summary(sched, conc)} if conc is not None else {}),
         "driver": driver_name, "data": "data.bin",
-        "data_sha1": hashlib.sha1(bytes(blob)).hexdigest(),
+        "data_sha1": sha.hexdigest(),
         "slots": slot_list, "ops": op_recs, "buffers": bufs,
         "inputs": [index[t] for t in boundary], "outputs": [index[t] for t in outputs],
     }
@@ -808,6 +1031,11 @@ SO_ABI = [
 ]
 
 
+def _mixed_bound(slots: dict) -> str:
+    """A mixed problem's manifest-level dtype for its bounds: its narrowest slot dtype."""
+    return cuda_dtypes.narrowest(s["dtype"] for s in slots.values())
+
+
 def _target(name: str):
     if name == "cuda":
         return None
@@ -818,6 +1046,11 @@ def _target(name: str):
 
 
 # ---------------------------------------------------------------- driver
+
+def output_cond_term(b: dict, tol: dict) -> str:
+    """A buffer's conditioning term of the output bound (a C double literal)."""
+    return repr(float(tol.get("output_cond", 0.0)) * float(b.get("ref_err") or 0.0))
+
 
 def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
     slot_ix = {s["id"]: k for k, s in enumerate(slots)}
@@ -841,10 +1074,20 @@ def _driver_source(data_path: Path, bufs, op_recs, slots, tol) -> str:
         arr("B_INT", "int", (int(b["dtype"] in ("i32", "i64")) for b in bufs)),
         arr("B_I64", "int", (int(b["dtype"] == "i64") for b in bufs)),
         arr("B_HALF", "int", (int(b["dtype"] == "f16") for b in bufs)),
+        arr("B_BF16", "int", (int(b["dtype"] == "bf16") for b in bufs)),
+        # mixed IRs: i32 / bool / u8 graph inputs and outputs, read as numbers
+        arr("B_I32", "int", (int(b["dtype"] == "i32") for b in bufs)),
+        arr("B_BYTE", "int", (int(b["dtype"] in ("b8", "u8")) for b in bufs)),
+        # bounds per output buffer / per op (a mixed problem's differ by dtype)
+        arr("B_OUT_REL", "double", (repr(float(b.get("tolerance", tol)["output_rel"])) for b in bufs)),
+        arr("B_OUT_ABS", "double", (repr(float(b.get("tolerance", tol)["output_abs"])) for b in bufs)),
+        arr("OP_SLOT_REL", "double", (repr(float(r.get("tolerance", tol)["slot_rel"])) for r in op_recs)),
+        arr("OP_SLOT_ABS", "double", (repr(float(r.get("tolerance", tol).get("slot_abs", 0.0))) for r in op_recs)),
         arr("B_NUMEL", "long", (b["numel"] for b in bufs)),
         arr("B_BASE", "int", (b["alias"]["base"] if b["alias"] else -1 for b in bufs)),
         arr("B_AOFF", "long", (b["alias"]["offset"] if b["alias"] else 0 for b in bufs)),
         arr("B_REF", "long", (b["ref"][0] if b["ref"] else -1 for b in bufs)),
+        arr("B_COND", "double", (output_cond_term(b, tol) for b in bufs)),
         arr("OP_IN_OFS", "int", in_ofs), arr("OP_IN", "int", op_in),
         arr("OP_OUT_OFS", "int", out_ofs), arr("OP_OUT", "int", op_out),
         arr("OP_SLOT", "int", (slot_ix[r["slot"]] for r in op_recs)),
@@ -958,7 +1201,7 @@ static const double OUT_REL = @OUT_REL@, OUT_ABS = @OUT_ABS@, SLOT_REL = @SLOT_R
 enum { K_INPUT, K_CONST, K_WEIGHT, K_INTER, K_OUTPUT };
 
 static void *dev[NB];
-static long esz(int b) { return B_HALF[b] ? 2 : B_I64[b] ? 8 : 4; }   // f16: IEEE binary16; i64: argmax indices
+static long esz(int b) { return B_HALF[b] || B_BF16[b] ? 2 : B_I64[b] ? 8 : B_BYTE[b] ? 1 : 4; }   // f16: IEEE binary16; bf16: bfloat16; i64: argmax indices; bool / u8: one byte
 
 // wall time per phase, printed as MB_PHASE_MS at the end
 static std::vector<std::pair<const char *, double>> phases;
@@ -1013,12 +1256,18 @@ static float half_to_float(unsigned short h) {
     else { e = 113; while (!(m & 0x400u)) { m <<= 1; --e; } f = s | (e << 23) | ((m & 0x3ffu) << 13); }
     float x; memcpy(&x, &f, 4); return x;
 }
-// values as float (f16 widened; i32 buffers keep their bits, as before). An
-// f32 buffer is used in place (no copy); `tmp` holds a widened copy otherwise.
+// values as float (f16 / bf16 widened; i64, and a mixed IR's i32 / bool / u8 io,
+// converted; other i32 buffers -- gather indices, never checked -- keep their bits,
+// as before). An f32 buffer is used in place (no copy); `tmp` holds a widened copy
+// otherwise.
 static const float *as_float(const unsigned char *p, int b, std::vector<float> &tmp) {
-    if (!B_HALF[b] && !B_I64[b]) return (const float *)p;
+    if (!B_HALF[b] && !B_BF16[b] && !B_I64[b] && !B_I32[b] && !B_BYTE[b]) return (const float *)p;
     tmp.resize(B_NUMEL[b]);
+    if (B_I32[b]) { for (long i = 0; i < B_NUMEL[b]; ++i) { int32_t q; memcpy(&q, p + 4 * i, 4); tmp[i] = (float)q; } return tmp.data(); }
+    if (B_BYTE[b]) { for (long i = 0; i < B_NUMEL[b]; ++i) tmp[i] = (float)p[i]; return tmp.data(); }
     if (B_HALF[b]) for (long i = 0; i < B_NUMEL[b]; ++i) { unsigned short h; memcpy(&h, p + 2 * i, 2); tmp[i] = half_to_float(h); }
+    else if (B_BF16[b]) for (long i = 0; i < B_NUMEL[b]; ++i) {   // bf16 = the top half of an fp32
+        unsigned short h; memcpy(&h, p + 2 * i, 2); unsigned f = (unsigned)h << 16; memcpy(&tmp[i], &f, 4); }
     else for (long i = 0; i < B_NUMEL[b]; ++i) { int64_t q; memcpy(&q, p + 8 * i, 8); tmp[i] = (float)q; }
     return tmp.data();
 }
@@ -1093,7 +1342,7 @@ static bool check_outputs(const char *tag) {
         if (B_KIND[b] != K_OUTPUT) continue;
         std::vector<float> tr, ta;
         const float *r = ref_f(b, tr), *a = dev_f(b, ta);
-        double e = max_err(a, r, B_NUMEL[b]), bound = OUT_REL * ref_max_finite(b) + OUT_ABS;
+        double e = max_err(a, r, B_NUMEL[b]), bound = B_OUT_REL[b] * ref_max_finite(b) + B_OUT_ABS[b] + B_COND[b];
         bool ok = e <= bound;
         all &= ok;
         printf("%s %s max_abs_err=%.6g bound=%.6g ok=%d\n", tag, B_NAME[b], e, bound, (int)ok);
@@ -1405,7 +1654,7 @@ static int mb_eval() {
             const float *r = ref_f(b, tr), *a = dev_f(b, ta);
             double s = std::max(scale, ref_max_finite(b)), ae = max_err(a, r, B_NUMEL[b]), e = ae / std::max(s, 1e-12);
             slot_err[OP_SLOT[i]] = std::max(slot_err[OP_SLOT[i]], e);
-            if (!(ae <= SLOT_REL * s + SLOT_ABS)) slot_bad[OP_SLOT[i]] = 1;   // abs: fp16 subnormals
+            if (!(ae <= OP_SLOT_REL[i] * s + OP_SLOT_ABS[i])) slot_bad[OP_SLOT[i]] = 1;   // abs: fp16 subnormals (0 for fp32 / bf16)
         }
     }
     for (int s = 0; s < NSLOTS; ++s) {
@@ -1847,15 +2096,19 @@ def run_built(exe, timeout: int = 1800, env: dict | None = None) -> dict:
 
 def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | None = None,
                   work: Path | None = None, nvcc: str = "nvcc", timeout: int = 1800, runs: int = 1,
-                  env: dict | None = None, graph: bool = False, runtime: str = "process") -> dict:
+                  env: dict | None = None, graph: bool = False, runtime: str = "process",
+                  gpu_lock: str | None = None) -> dict:
     """Assemble + nvcc-build + run the problem outside KernelBlaster.
 
     ``runtime="host"`` builds the persistent host and the kernels' shared
     object and evaluates them in one host request (CUDA graph on, as the host
-    always builds with the per-thread default stream); ``runs`` requests."""
+    always builds with the per-thread default stream); ``runs`` requests.
+    ``gpu_lock`` (host runtime): a lock file the host flocks for each request
+    (``gpu_lock_path``: KernelBlaster's per-GPU lock), so the checks and
+    timing do not overlap another user's on that GPU."""
     if runtime == "host":
         res = _build_and_run_host(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
-                                  timeout=timeout, runs=runs, env=env)
+                                  timeout=timeout, runs=runs, env=env, gpu_lock=gpu_lock)
     else:
         res = _build_and_run_process(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc,
                                      timeout=timeout, runs=runs, env=env, graph=graph)
@@ -1864,13 +2117,46 @@ def build_and_run(problem_dir, *, arch: str = "75", sources: dict[str, str] | No
         # concurrent branches hung (the driver's watchdog): the same program, launched sequentially (recorded)
         first = res.get("log", "")[-800:]
         res = build_and_run(problem_dir, arch=arch, sources=sources, work=work, nvcc=nvcc, timeout=timeout,
-                            runs=runs, env={**(env or {}), "MB_CONCURRENCY": "0"}, graph=graph, runtime=runtime)
+                            runs=runs, env={**(env or {}), "MB_CONCURRENCY": "0"}, graph=graph, runtime=runtime,
+                            gpu_lock=gpu_lock)
         res["concurrency_fallback"] = {"why": "deadlock watchdog", "log": first}
         print(json.dumps({"concurrency_fallback": str(problem_dir), "why": "deadlock watchdog"}), flush=True)
     return res
 
 
-def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs, env) -> dict:
+def gpu_lock_path(spec: str | None = "auto") -> str | None:
+    """The lock file of the GPU this process uses, as KernelBlaster names it
+    (``$KERNELBLASTER_GPU_LOCK_DIR``, default /dev/shm, ``/kernelblaster_gpu_<uuid>.lock``).
+    ``spec``: "auto" (the first CUDA_VISIBLE_DEVICES entry, default 0, its
+    uuid from nvidia-smi), "none" / None, or a path. None when locking is off
+    (``KERNELBLASTER_GPU_FLOCK=0``) or the GPU cannot be named."""
+    import os
+
+    if spec in (None, "", "none"):
+        return None
+    if spec != "auto":
+        return spec
+    if os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() in ("0", "false", "no", "off"):
+        return None
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    dev = "0" if vis is None else vis.split(",")[0].strip()     # set but empty: no GPU
+    if not dev or dev.startswith("-"):
+        return None
+    ident = dev
+    if not dev.startswith(("GPU-", "MIG-")):
+        try:
+            cp = subprocess.run(["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader", "-i", dev],
+                                capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        ident = cp.stdout.strip().splitlines()[0].strip() if cp.returncode == 0 and cp.stdout.strip() else ""
+        if not ident:
+            return None
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ident)
+    return f"{os.getenv('KERNELBLASTER_GPU_LOCK_DIR', '/dev/shm')}/kernelblaster_gpu_{safe}.lock"
+
+
+def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs, env, gpu_lock=None) -> dict:
     problem_dir = Path(problem_dir)
     work = Path(work or problem_dir / "build")
     host, log = build_host(problem_dir, arch=arch, work=work, nvcc=nvcc, timeout=timeout)
@@ -1882,7 +2168,7 @@ def _build_and_run_host(problem_dir, *, arch, sources, work, nvcc, timeout, runs
         return {"passed": None, "stage": "built", "exe": str(host), "so": str(so)}
     h = DriverHost(host, timeout=timeout)
     try:
-        rs = [h.evaluate(so, env={"MB_GRAPH": "1", **(env or {})}) for _ in range(runs)]
+        rs = [h.evaluate(so, env={"MB_GRAPH": "1", **(env or {})}, lock=gpu_lock) for _ in range(runs)]
     finally:
         h.close()
     ok = sorted((r for r in rs if r["passed"] and r["partition_us"]), key=lambda r: r["partition_us"])
@@ -2121,7 +2407,9 @@ class DriverHost:
                 self.ready_line = line.strip()
                 return
 
-    def evaluate(self, so, ref=None, env: dict | None = None, timeout: int | None = None) -> dict:
+    def evaluate(self, so, ref=None, env: dict | None = None, timeout: int | None = None,
+                 lock: str | None = None, lock_wait: float = 3600) -> dict:
+        """One request; ``lock``: a file the host flocks around it (waiting up to ``lock_wait`` s)."""
         import time
         import uuid
 
@@ -2129,6 +2417,7 @@ class DriverHost:
             self.start()
         nonce = uuid.uuid4().hex[:12]
         fields = ["EVAL", nonce, f"so={so}"] + ([f"ref={ref}"] if ref else []) + \
+                 ([f"lock={lock}", f"lock_wait={int(lock_wait)}"] if lock else []) + \
                  [f"{k}={v}" for k, v in (env or {}).items()]
         t0 = time.time()
         try:
@@ -2136,7 +2425,8 @@ class DriverHost:
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
             pass                                           # the read below sees the EOF
-        out, deadline, done = [], t0 + (timeout or self.timeout), None
+        # the lock wait does not count against the run (as KernelBlaster's runtime_host)
+        out, deadline, done = [], t0 + (timeout or self.timeout) + (lock_wait if lock else 0), None
         while True:
             line = self._readline(deadline)
             if not line:                                   # EOF (crash) or timeout
@@ -2206,6 +2496,11 @@ def main():
                     help="with --build-check: one-process driver, or the persistent host + kernels .so")
     ap.add_argument("--arch", default="75")
     ap.add_argument("--target", default="cuda", choices=["cuda", "opencl"])
+    ap.add_argument("--gpu-lock", default="none",
+                    help="with --build-check --runtime host: auto (KernelBlaster's lock of the visible GPU), "
+                         "a lock file, or none")
+    ap.add_argument("--no-conditioning", action="store_true",
+                    help="no reference-error term in the output bounds (skips the float64 walk)")
     a = ap.parse_args()
     if a.plan:
         from .kb_ingest import CudaCache
@@ -2235,14 +2530,15 @@ def main():
         parts = [("", None)]
     for sub, idx in parts:
         d = export_problem(ir_dir, Path(a.out_dir) / sub if sub else a.out_dir, op_indices=idx,
-                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", target=a.target)
+                           hand_cu=Path(a.hand_cu), strategy=a.strategy or "custom", target=a.target,
+                           conditioning=not a.no_conditioning)
         line = {"problem": str(d)}
         if a.build_check:
             if a.target == "opencl":
                 from .kb_export_opencl import build_and_run as build_and_run_cl
                 r = build_and_run_cl(d)
             else:
-                r = build_and_run(d, arch=a.arch, runtime=a.runtime)
+                r = build_and_run(d, arch=a.arch, runtime=a.runtime, gpu_lock=gpu_lock_path(a.gpu_lock))
             line.update({k: r.get(k) for k in ("passed", "stage", "partition_us", "slot_us", "slots", "errors",
                                                *(("e2e_us", "e2e_basis", "graph_skip") if a.runtime == "host" else ()))})
             if not r.get("passed"):
