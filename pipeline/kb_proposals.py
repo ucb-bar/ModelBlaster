@@ -643,6 +643,33 @@ def is_infra_text(text) -> bool:
     return bool(text) and bool(_INFRA.search(str(text)))
 
 
+# what the sweep's lost results looked like beyond _INFRA (live_debug/43_sdpa_rejected.md, 25_shufflenet_regression.md):
+# a failed scp to the eval host, a node that lost its GPU, the relay's 503 / queue_full, a missing result.json
+_INFRA_RESULT = re.compile(
+    r"\bscp: |Connection closed|\bNoDevice\b|no usable GPU|queue_full|\b503 Service Unavailable|"
+    r"Service Unavailable|no result\.json when the KernelBlaster process exited|quarantined for \d+s|"
+    r"cannot open shared object file|node timed out|ssh: .*timed out", re.I)
+
+
+def infra_aware() -> bool:
+    """``MB_INFRA_AWARE=0`` restores the old rule (only ``final_infra`` / :func:`is_infra_text` count)."""
+    return os.environ.get("MB_INFRA_AWARE", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def is_infra_result(res: dict | None) -> bool:
+    """A KernelBlaster result that failed for infrastructure reasons (never a verdict on the kernel): its own
+    ``final_infra`` tag, or (``MB_INFRA_AWARE``, default on) an error text with an infra signature though the tag is
+    missing (an older KernelBlaster, a synthetic result). A passing result is never infra."""
+    if not res or res.get("final_ok"):
+        return False
+    if res.get("final_infra"):
+        return True
+    if not infra_aware():
+        return False
+    return any(is_infra_text(t) or bool(t and _INFRA_RESULT.search(str(t)))
+               for t in (res.get("final_error"), res.get("error")))
+
+
 def run_failure(problem, runs: list[dict], log=None) -> dict:
     """Why a problem has no passing timed run (``time_problems`` rows) -> {"problem", "stage",
     "error" (the evaluator's error text, else its log's tail), "infra", "runs", "log"}."""
