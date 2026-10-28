@@ -12,6 +12,7 @@
 | ``--experiments`` | ``off`` \\| ``record`` \\| ``ingest`` \\| ``ingest+prompt`` | with ``--multiturn on``: record each probe program (X-145, knowledge/v2/experiments.py): ``record`` writes ``<out>/experiments.jsonl``; ``ingest`` also turns them into experiment claims / probe templates in the run's knowledge dir; ``ingest+prompt`` also shows up to 3 prior facts (800 chars) at the start of a multi-turn step |
 | ``--model-context`` | ``off`` \\| ``on`` | each exported slot problem's manifest gets ``model_context`` (whole-model op shares, sibling ops) for the prompt |
 | ``--view-fusion`` | ``off`` \\| ``on`` | propose ``fuse_view`` hints: producer -> pure-reshape view -> flat elementwise pairs (view_fusion) |
+| ``--region-windows`` | ``off`` \\| ``auto`` | propose ``fuse_region`` WINDOW sets (region_windows, docs/region_windows.md): chunked / motif-aligned / whole-block regions with explicit members, lifting the 256-member cap for them; ``$MB_REGION_WINDOWS``; kept OUT of ``DEFAULTS`` (off: no key, no output change) |
 
 Round key: only switches that differ from their defaults (existing work dirs keep their key).
 """
@@ -38,6 +39,8 @@ class Caps:
             if self.v[k] not in ("on", "off"):
                 raise ValueError(f"--{k.replace('_', '-')} must be on|off, not {self.v[k]!r}")
         parse_budget(self.v["multiturn_budget"])
+        from . import region_windows as rw             # --region-windows (not in DEFAULTS: off leaves every output as it was)
+        self.windows = rw.WindowConfig.from_cfg(cfg)
         if self.v["experiments"] not in ("off", "record", "ingest", "ingest+prompt"):
             raise ValueError(f"--experiments must be off|record|ingest|ingest+prompt, not {self.v['experiments']!r}")
 
@@ -49,6 +52,8 @@ class Caps:
             os.environ["MB_RECURRENT_CLASS"] = "1"
         if self.regions:
             os.environ["MB_REGION_SLOTS"] = ",".join(sorted(self.regions))
+        if self.windows.on:                              # the windows need the lifted member cap (region_slots.max_members)
+            os.environ["MB_REGION_MAX_MEMBERS"] = str(max(self.windows.member_cap(), int(os.environ.get("MB_REGION_MAX_MEMBERS") or 0)))
         if self.v["multiturn"] == "on":
             os.environ["KERNELBLASTER_MULTITURN"] = "1"
             os.environ["KERNELBLASTER_MULTITURN_BUDGET"] = self.v["multiturn_budget"]
@@ -59,15 +64,21 @@ class Caps:
                 os.environ["KERNELBLASTER_EXPERIMENT_PROMPT"] = "3"
 
     def round_key(self) -> dict:
-        return {f"caps_{k}": v for k, v in self.v.items() if v != DEFAULTS[k]}
+        key = {f"caps_{k}": v for k, v in self.v.items() if v != DEFAULTS[k]}
+        if self.windows.on:
+            key.update(caps_region_windows="auto", caps_region_windows_cfg=self.windows.key())
+        return key
 
     def summary(self) -> dict:
-        return dict(self.v)
+        return {**self.v, **({"region_windows": self.windows.key()} if self.windows.on else {})}
 
     # ---- proposals: fuse_region hints
     def propose(self, graphs: dict, profiles: list, doc: dict, specs: dict) -> list:
         out = self._propose_views(graphs, profiles, doc, specs) if self.v["view_fusion"] == "on" else []
-        return out + self._propose_regions(graphs, profiles, doc, specs)
+        out = out + self._propose_regions(graphs, profiles, doc, specs)
+        if self.windows.on:
+            out = out + self._propose_windows(graphs, profiles, doc, specs)
+        return out
 
     def _propose_views(self, graphs, profiles, doc, specs) -> list:
         from . import graph_hints as gh
@@ -121,8 +132,36 @@ class Caps:
                                         "est_gain_pct": round(100 * 0.08 * share, 2)}]})
         return gh.merge(doc, new) if new else []
 
+    def _propose_windows(self, graphs, profiles, doc, specs) -> list:
+        """``--region-windows auto``: window-set ``fuse_region`` hints (``region_windows.propose_windows``), one candidate per
+        label, decided like any hint; a candidate already in the registry (any status) is not proposed again."""
+        from . import graph_hints as gh
+        from . import region_windows as rw
+        from .graph_hints import decided
+        from .kb_proposals import with_fused_specs
+        done = decided(doc) if doc else set()
+        known = {h["id"] for h in (doc or {}).get("hints", [])}
+        new = []
+        for p in profiles:
+            g = graphs.get(p["ir"])
+            if g is None:
+                continue
+            op_us = {o["name"]: o.get("us") or 0.0 for o in p.get("ops", [])}
+            total = p.get("e2e_us") or sum(op_us.values()) or None
+            try:
+                gu = gh.unique_names(json.loads(json.dumps(g)))
+                cands, rep = rw.propose_windows(gu, with_fused_specs(g, specs), self.windows, op_us=op_us or None, total_us=total)
+            except Exception as e:  # noqa: BLE001 -- a proposer never breaks a round
+                print(f"[kb_graph_opt] region-windows proposer: {type(e).__name__}: {e}", flush=True)
+                continue
+            for c in cands:
+                if c.id in done or c.id in known:
+                    continue
+                new.append(rw.hint_for(c, p["ir"], self.windows))
+        return gh.merge(doc, new) if new else []
+
     def decide_kinds(self) -> tuple:
-        return (("fuse_region",) if self.regions else ()) + (("fuse_view",) if self.v["view_fusion"] == "on" else ())
+        return (("fuse_region",) if (self.regions or self.windows.on) else ()) + (("fuse_view",) if self.v["view_fusion"] == "on" else ())
 
     # ---- model context for each exported slot problem (multi-turn / prompt)
     def annotate(self, dirs: list, profiles: list) -> list:
