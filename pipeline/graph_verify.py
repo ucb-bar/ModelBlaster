@@ -431,7 +431,7 @@ def structural(v: Verdict, g0: dict, g1: dict, w0: dict, w1: dict, specs: dict |
 
 
 def _slots(v: Verdict, g0: dict, g1: dict, sp: dict) -> None:
-    from .kb_export import slot_id_of
+    from .kb_export import base_slot_id, slot_id_of
     bad, slots1, slots0 = [], {}, {}
     sig_of = {}
     for g, out in ((g0, slots0), (g1, slots1)):
@@ -447,9 +447,10 @@ def _slots(v: Verdict, g0: dict, g1: dict, sp: dict) -> None:
                 bad.append(f"op {o['name']}: slot id {sid!r} is not a valid identifier")
             out.setdefault(sid, []).append(o["name"])
             if g is g1:
+                base_id = base_slot_id(o["op"], sp)        # one slot per C entry point (a split variant is its own slot)
                 sig = " ".join(sp[o["op"]].signature.split())
-                if sig_of.setdefault(sid.split("__")[0], (sig, o["op"]))[0] != sig and not o.get("slot_variant"):
-                    bad.append(f"slot {sid!r} would hold two kernel signatures ({o['op']} vs {sig_of[sid.split('__')[0]][1]})")
+                if sig_of.setdefault(base_id, (sig, o["op"]))[0] != sig:
+                    bad.append(f"slot {base_id!r} would hold two kernel signatures ({o['op']} vs {sig_of[base_id][1]})")
     if bad:
         v.fail("slots", "; ".join(bad[:4]))
     new = sorted(set(slots1) - set(slots0))
