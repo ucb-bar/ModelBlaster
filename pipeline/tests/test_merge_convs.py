@@ -57,6 +57,23 @@ def merge_ir(orig: Path, out: Path, policy=None, **kw):
     return write_variant_ir(orig, g1, out), g1, hints[0], prov
 
 
+class VerifyRewriteTest(unittest.TestCase):
+    """graph_hints.verify_rewrite (apply --verify) must accept a merged graph: the merged conv is not bit-identical to the original walk
+    (zero padding reorders the accumulation), so the op carries approx=True and the check is the fp16 output tolerance. On the first B200
+    run `graph_hints apply --verify --build` said ok: false at an abs difference of 3e-5 before this."""
+
+    def test_merged_graph_verifies(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            ir = MF.branchy_ir(d / "ir", FIRE, "fp32")
+            vir, g1, h, _ = merge_ir(ir, d / "merged")
+            self.assertIsNotNone(h)
+            self.assertTrue(any(o.get("approx") for o in g1["ops"]))
+            res = gh.verify_rewrite(ir, g1, specs=dict(_all_specs()), build=False)
+            self.assertTrue(res["golden"]["ok"])
+            self.assertTrue(res["ok"], res)
+
+
 class DetectTest(unittest.TestCase):
     def find(self, branches, quant="fp32", **kw):
         return mc.find(_graph(branches, quant), pol(**kw))
