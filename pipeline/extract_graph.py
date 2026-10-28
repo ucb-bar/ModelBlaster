@@ -5963,6 +5963,21 @@ def main() -> None:
             input_dtypes=input_dtypes,
             fp16_op_names=fp16_op_names)
 
+    if args.bench_file is not None:
+        # a SOL-ExecBench bench (SOL_TOLERANCE at module level): its tolerance goes into graph.json (sol_tolerance;
+        # docs/sol_gate.md) -- nothing happens for a KernelBench file. $MB_SOL_REF=1 also writes sol_ref.npz: SOL's
+        # reference outputs, run on the GPU if this host has one (what the SOL gate compares against).
+        try:
+            from modelblaster.pipeline import sol_tolerance
+            rec = sol_tolerance.record_in_ir(args.out_dir, args.bench_file)
+            if rec is not None:
+                print(f"[extract_graph] sol_tolerance recorded: {rec['outputs'][0]}", flush=True)
+                if os.environ.get("MB_SOL_REF", "").strip().lower() in ("1", "on", "true", "yes", "gpu", "auto"):
+                    p = sol_tolerance.ensure_reference(args.out_dir, args.bench_file)
+                    print(f"[extract_graph] SOL reference outputs: {p}", flush=True)
+        except Exception as e:  # noqa: BLE001 -- metadata only: the extraction stands
+            print(f"[extract_graph] WARN: sol_tolerance not recorded: {type(e).__name__}: {e}", flush=True)
+
     if args.core_registry:
         from modelblaster.pipeline import core_registry
         reg = core_registry.load(args.core_registry)

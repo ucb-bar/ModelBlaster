@@ -40,7 +40,7 @@ import torch
 
 import walk_torch
 from mbabi import bind, parse_signature
-from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
+from mbir import IR, compare, cuda_dtypes, load_ir, sol_for, strict_fp32
 
 _TORCH_DTYPE = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32,
                 "i64": torch.int64,   # i64: argmax/argmin indices, a mixed IR's integer io
@@ -169,7 +169,7 @@ def evaluate(d: str, ks: KernelSet, reps: int) -> dict:
         out, env, _ = run(ir, plan)
         torch.cuda.synchronize()
         rec["first_run_s"] = round(time.time() - t0, 3)
-        rec.update(compare(out, ir.golden_out, ir.dtype))
+        rec.update(compare(out, ir.golden_out, ir.dtype, sol=sol_for(ir)))
         # Localise: diff every intermediate against the PyTorch walk. cuDNN
         # is off for this oracle: its fast conv algorithms (FFT/Winograd) are
         # ~2e-3 off fp64 on e.g. AlexNet conv2, where the naive kernel is 2e-6.

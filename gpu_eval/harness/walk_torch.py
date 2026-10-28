@@ -24,7 +24,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
+from mbir import IR, compare, cuda_dtypes, load_ir, sol_for, strict_fp32
 
 
 def _round_f16(t):
@@ -711,7 +711,7 @@ def run_one(d: str, dev="cuda") -> dict:
         return rec
     with torch.no_grad():
         out, _ = walk(ir, dev)
-        rec.update(compare(out, ir.golden_out, ir.dtype))
+        rec.update(compare(out, ir.golden_out, ir.dtype, sol=sol_for(ir)))
         if dev == "cuda":
             # warm timing of the whole walk (eager, includes launch overhead)
             torch.cuda.synchronize()
