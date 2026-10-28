@@ -930,8 +930,8 @@ def _export_problem_impl(ir_dir, out_dir, *, op_indices: list[int] | None = None
             b["ref"] = put(arr)
         # SOL's reference outputs (float32, whatever the buffer's dtype), after everything else: data.bin of an
         # ungated export is unchanged
-        for name, rarr in ((sol_spec or {}).get("_ref") or {}).items():
-            sol_spec["outputs"][name]["ref_offset"] = put(rarr)[0]
+        for oname, rarr in ((sol_spec or {}).get("_ref") or {}).items():       # not `name`: it is export_problem's argument (the manifest name)
+            sol_spec["outputs"][oname]["ref_offset"] = put(rarr)[0]
 
     # ---- the outputs' reference error (their bound's conditioning term)
     env = {t: env[t] for t in outputs}                # the rest is in data.bin now
