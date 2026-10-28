@@ -763,9 +763,10 @@ void kernel_gather(const float *input, const int *index, float *output, int n) {
     mb_launch(MB_KERNEL(cl_gather, k_gather), mb_grid(n), input, index, output, n);
 }
 
-// Index tensors are float (the fp32 pipeline carries them as exact floats).
+// Index tensors are float (the fp32 pipeline carries them as exact floats); they
+// convert through int: Adreno 650's compiler aborts on half -> long (the _f16 seeds).
 static mb_program cl_index_select = MB_CL(R"CL(
-long mb_wrap(float f, long A) { long a = (long)f; return a < 0 ? a + A : a; }
+long mb_wrap(float f, long A) { long a = (long)(int)f; return a < 0 ? a + A : a; }
 __kernel void k_index_select(__global const float *x, __global const float *idx, __global float *y, long n,
                              int A, int J, int inner) {
     long k = MB_TID; if (k >= n) return;
@@ -779,7 +780,7 @@ void kernel_index_select(const float *input, const float *index, float *output, 
 }
 
 static mb_program cl_gather_dim = MB_CL(R"CL(
-long mb_wrap(float f, long A) { long a = (long)f; return a < 0 ? a + A : a; }
+long mb_wrap(float f, long A) { long a = (long)(int)f; return a < 0 ? a + A : a; }
 __kernel void k_gather_dim(__global const float *x, __global const float *idx, __global float *y, long n,
                            int A, int J, int inner) {
     long k = MB_TID; if (k >= n) return;
@@ -794,7 +795,7 @@ void kernel_gather_dim(const float *input, const float *index, float *output, in
 
 // mode 1: scatter-add (float atomics), else overwrite
 static mb_program cl_scatter_dim = MB_CL(R"CL(
-long mb_wrap(float f, long A) { long a = (long)f; return a < 0 ? a + A : a; }
+long mb_wrap(float f, long A) { long a = (long)(int)f; return a < 0 ? a + A : a; }
 __kernel void k_scatter_dim(__global const float *idx, __global const float *src, __global float *y, long n,
                             int A, int J, int inner, int mode) {
     long k = MB_TID; if (k >= n) return;
