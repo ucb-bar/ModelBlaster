@@ -43,8 +43,9 @@ def mlp_chain(n_layers: int = 12) -> dict:
 def rnn_unrolled(steps: int = 24, fused: bool = True) -> dict:
     """The 34_VanillaRNNHidden shape: per step view(x slice) -> cat2(x_t, h) -> linear+tanh (fused) -> linear (output head); every
     head output is kept (stacked at the end by a two-level tree of catn ops of at most 8 inputs, as 34's 37 catn are), so the
-    head outputs stay live across any cut. ``steps`` <= 64. ``fused=False``: linear and tanh are separate ops (no fused kinds,
+    head outputs stay live across any cut. ``steps`` a multiple of 8, <= 64. ``fused=False``: linear and tanh are separate ops (no fused kinds,
     so no cached stage sources are needed by an exported region)."""
+    assert steps % 8 == 0 and 8 <= steps <= 64, "steps: a multiple of 8 up to 64"
     ops, ts = [], {"x": [steps, 2, H], "h0": [2, H // 2]}
     ops.append({"name": "to", "op": "view", "inputs": ["h0"], "outputs": ["to"], "shape": {"n": 2 * (H // 2)}})
     ts["to"] = [2, H // 2]
