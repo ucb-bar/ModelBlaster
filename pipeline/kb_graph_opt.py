@@ -57,7 +57,8 @@ devices.
         [--parallel-hints auto|N] [--gpus auto|all|0,2] \\
         [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]] \\
         [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch] [--mb-evaluator auto|kb|builtin] \\
-        [--knowledge v1|v2] [--ncu off|best|all] [--reward e2e|slot] [--model-simple M --model-hard M] \\
+        [--knowledge v1|v2] [--ncu off|best|all] [--reward e2e|slot] \\
+        [--search independent|beam --beam-width 4 --beam-expand 2 --beam-refill on|off] [--model-simple M --model-hard M] \\
         [--hetero-policy P] [--models-config F] [--upkeep-model M] [--kb-arg=--flag --kb-arg=value] \\
         [--efficiency-rules on|safe|off] [--stop-patience N] [--plan-min-share-late X] \\
         [--knowledge-global off|read|readwrite --knowledge-global-seed SEED_DIR \\
@@ -195,6 +196,12 @@ class Config:
     knowledge: str = "v2"
     ncu: str = "off"
     reward: str | None = None
+    # beam search (run_multislot --search beam): every step expands the best beam_width states
+    # beam_expand ways; passed on only when search != independent
+    search: str = "independent"
+    beam_width: int = 4
+    beam_expand: int = 2
+    beam_refill: str = "off"          # on: a beam shorter than beam_width is expanded wider (same candidates per step)
     model_simple: str | None = None
     model_hard: str | None = None
     hetero_policy: str | None = None
@@ -521,6 +528,10 @@ class KBRunner:
                         ("--upkeep-model", c.upkeep_model)):
             if v:
                 cmd += [flag, str(v)]
+        if c.search != "independent":
+            cmd += ["--search", c.search, "--beam-width", str(c.beam_width), "--beam-expand", str(c.beam_expand)]
+            if c.beam_refill == "on":
+                cmd += ["--beam-refill", "on"]
         if winners is not None:
             cmd += ["--export-winners", str(winners)]
         if parallel_problems:
