@@ -103,6 +103,8 @@ def read_json(path: Path) -> Any:
 def round_key(cfg, irs) -> dict:
     key = {k: getattr(cfg, k, None) for k in ROUND_FIELDS}
     key["irs"] = sorted(str(Path(d).resolve()) for d in irs)
+    if getattr(cfg, "target", "cuda") != "cuda":      # (absent for CUDA: its keys are unchanged)
+        key["target"] = cfg.target
     return key
 
 

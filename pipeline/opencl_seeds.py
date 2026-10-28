@@ -360,23 +360,39 @@ class OpenCLSeeds:
     def head_source(self) -> str:
         return ""
 
-    def fused_seed(self, spec) -> str:
-        """A fused op's seed: A's and B's seeds, called back to back (as the CUDA ``cuda_seed``)."""
-        from .kb_proposals import _all_specs
+    def fused_seed(self, spec, sub_sources: dict | None = None) -> str:
+        """A fused op's seed: its stages' seeds called back to back (the CUDA ``cuda_seed``).
+
+        Each stage is a complete slot source -- ``sub_sources[stage kind]`` when given (e.g.
+        the current best OpenCL kernel of that stage), else its seed -- wrapped in its own
+        namespace (``stage_<kind>``), so stage programs and helpers never collide; chains of
+        any length (``make_chain_spec``)."""
+        from .cuda_dtypes import cuda_signature
+        from .kb_export import namespaced
+        from .kb_proposals import _all_specs, stage_prefix
+
         specs = _all_specs()
-        a_spec, b_spec = specs[spec.sub_ops[0]], specs[spec.sub_ops[1]]
-        a_entry, pa = parse_signature(a_spec.signature)
-        b_entry, pb = parse_signature(b_spec.signature)
-        a_src = self.slot_source(a_entry)
-        b_src = self.slot_source(b_entry) if b_entry != a_entry else ""
-        entry, params = parse_signature(spec.signature)
-        a_out = next(p.name for p in pa if p.is_ptr and not p.is_const_ptr)
-        a_args = ", ".join("a_" + p.name for p in pa)
-        b_args = ", ".join(f"a_{a_out}" if p.name == spec.t_param else "b_" + p.name for p in pb)
+        sub_sources = sub_sources or {}
+        stages = [(k, *parse_signature(specs[k].signature)) for k in spec.sub_ops]
+        includes, blocks = [], []
+        for k, e, _ in dict.fromkeys((k, e, None) for k, e, _ in stages):
+            src = sub_sources.get(k) or self.slot_source(e)
+            inc, body = namespaced(f"stage_{k}", src)
+            includes += [i for i in inc if i not in includes]
+            blocks.append(f"// {'current best' if k in sub_sources else 'seed'} {k} kernel\n{body}")
+        outs = [next(p.name for p in ps if p.is_ptr and not p.is_const_ptr) for _, _, ps in stages]
+        calls = []
+        for i, (k, e, ps) in enumerate(stages):
+            args = [stage_prefix(i - 1) + outs[i - 1] if i and p.name == spec.t_params[i - 1]
+                    else stage_prefix(i) + p.name for p in ps]
+            calls.append(f"    stage_{k}::{e}({', '.join(args)});")
+        entry, params = parse_signature(cuda_signature(spec.signature))
+        scratch = ", ".join(f"`{stage_prefix(i)}{o}`" for i, o in enumerate(outs[:-1]))
         plist = ", ".join(f"{p.ctype} {p.name}" for p in params)
-        return (f"{a_src}\n{b_src}\n// Seed: {spec.sub_ops[0]} then {spec.sub_ops[1]}; `a_{a_out}` is the\n"
-                f"// intermediate (scratch). A fused kernel need not write it.\n"
-                f"void {entry}({plist}) {{\n    {a_entry}({a_args});\n    {b_entry}({b_args});\n}}\n")
+        return ("\n".join(includes) + ("\n\n" if includes else "") + "\n\n".join(blocks) +
+                f"\n\n// Seed: {' then '.join(spec.sub_ops)}; {scratch} hold the intermediates\n"
+                f"// (scratch). A fused kernel need not write them.\n"
+                f"void {entry}({plist}) {{\n" + "\n".join(calls) + "\n}\n")
 
 
 def all_entries(dtype: str = "fp32") -> dict[str, str]:
