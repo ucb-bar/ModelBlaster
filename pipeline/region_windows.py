@@ -246,8 +246,7 @@ def detect_motifs(tokens: list, max_period: int = MAX_PERIOD, min_reps: int = MI
         b = a + p * reps
         if any(a < y and x < b for x, y in taken):
             continue
-        # a segment whose tokens are one repeated token of a bigger accepted period is already covered (overlap test)
-        out.append(Motif(a, p, reps))
+        out.append(Motif(a, p, reps))                   # (multiples of an accepted period overlap it: skipped above)
         taken.append((a, b))
     return sorted(out, key=lambda m: m.start)
 
