@@ -20,13 +20,11 @@ table at the end lists each choice, the alternatives and the reason.
 | run + checks + timing | the same machine; the driver needs only `data.bin` |
 | agent | anywhere; it reaches the board over ssh (`AdrenoEvaluator`) or through KernelBlaster's OpenCL compile server + Adreno exec server (`OpenCLServerEvaluator`) |
 
-No Adreno board was reachable during this work (the `qrb_cloud` QDC tunnel,
-localhost:2222, was down; no adb/NDK on the box). Everything below ran on the
-local NVIDIA TITAN RTX through its OpenCL 3.0 ICD (OpenCL C 1.2, coarse-grained
-SVM, no `cl_khr_fp16`) as a functional stand-in: correctness results carry over,
-**timings do not** (they are NVIDIA's, and the GPU was shared). The board path
-(`AdrenoEvaluator`: scp, build with g++ on the target, run, `rm -rf`) was
-exercised end to end against `ssh localhost`.
+The flow was first validated on the local NVIDIA TITAN RTX through its OpenCL
+3.0 ICD (OpenCL C 1.2, coarse-grained SVM, no `cl_khr_fp16`) as a functional
+stand-in, then on a real Qualcomm RB5 (QRB5165, Adreno 650, OpenCL 2.0, Ubuntu
+20.04 aarch64, g++ 9.4) -- see "Validation on the RB5" below. Stand-in timings
+are NVIDIA's; only the RB5 numbers are Adreno's.
 
 ## Problem format (target `opencl`)
 
@@ -168,8 +166,68 @@ launches). They are NVIDIA's; Adreno 650 has ~1/13 of the TITAN's fp32 peak and
   implicit GEMM (one fix round), rel err 2.9e-7; batchnorm/relu attempts neutral
   or regressed and were not kept. Stand-in timings, not Adreno's.
 - **Board path**: `AdrenoEvaluator` against `ssh localhost` (scp, g++ on the
-  target, run, compile errors reported, remote dir removed);
+  target, run, compile errors reported, remote dir removed; later against the
+  RB5 itself, with the board lock);
   `OpenCLServerEvaluator` plumbing with the servers faked.
+
+## Validation on the RB5 (Adreno 650; 2026-10-28)
+
+Device as the driver reports it: `QUALCOMM Adreno(TM) | OpenCL 2.0 Adreno(TM) 650`,
+3 compute units, max work-group 1024, 32 KiB local memory, SVM caps 0xb
+(coarse + fine-grained buffer, atomics), `cl_khr_fp16`, **CL_DEVICE_MAX_MEM_ALLOC_SIZE
+256 MiB**, CL_DEVICE_GLOBAL_MEM_SIZE 1 GiB (7.5 GB of RAM shared with the CPU). Every
+problem was exported on the host (`kb_export --target opencl`), shipped as one
+`main.cpp` (`single_tu`) + `data.bin`, built with the board's g++ and run there, each
+build + run under `flock` of the board's shared lock.
+
+**Seeds.** Every seed program (89 fp32, 88 fp16) was built on the device and every
+kernel created; both all-seed TUs compile with the board's g++. Seed launches use
+256 work-items (`MB_THREADS`) everywhere; the device's `CL_KERNEL_WORK_GROUP_SIZE` is
+1024 for every kernel except `k_group_norm` (768, 276 B private memory), so no seed
+exceeds its kernel's limit. One compiler bug: the Adreno OpenCL compiler **aborts the
+process** (`QGPUI64Emulate: Unsupported FtoI/ItoF instructions!`, SIGABRT inside
+`clBuildProgram`) on a half -> 64-bit integer conversion, and every later build in the
+same process then fails (`ReplacementGlobalContext not set?`). The `_f16` seeds of
+`gather_dim`, `index_select` and `topk` hit it (6 programs failed, 3 of them knock-ons);
+indices now convert through `int` (`mb_wrap`, and `(long)(int)vload_half(...)` in the
+fp16 transform), and all 177 programs build.
+
+**Problems** (whole-graph, partition check + every op isolated + cl_event timing):
+
+| set | run | pass | partition time of the seeds (median / max) | failures |
+|---|---|---|---|---|
+| Level1 (`kbx_sweep2/l1_ir`) | 99 (all but 100_HingeLoss: a 4 GiB buffer) | **99** | 51 ms / 345 ms | -- |
+| Level2 (`level2/ir16`) | 13 | **11** | 2.2 s / 98.5 s (72_ConvTranspose3d, 771 MB) | 89, 96: one 512 / 481 MiB conv-transpose output > the 256 MiB allocation limit |
+| Level3 (`level3/ir16`) | 6 | **6** | 2.9 s / 44 s (27_RegNet, 1.08 GB) | -- |
+| Level3 fp16 (`work/fp16/ir`) | 5 | **5** | 0.87 s / 9.4 s (35_LSTM) | -- |
+
+Level1 covers every Level1 op kind; Level2: 1, 6, 11, 12, 19, 28, 34, 43, 66, 72, 84, 89,
+96; Level3: 8_ResNetBasicBlock, 27_RegNet, 31_VisionAttention, 32_CvT,
+34_VanillaRNNHidden, 47_NetVlad; fp16: 6, 8, 17, 32, 35. Every partition check and every
+isolated op passed (worst isolated rel err 1.8e-6 fp32, 6.3e-4 fp16). Memory: one
+allocation is capped at 256 MiB, but the sum is not capped at GLOBAL_MEM_SIZE (RegNet
+allocates 1.08 GB and passes); the driver's `MB_ERROR alloc` line now names the
+device's limits. The driver also holds data.bin in host memory, so a problem needs
+about twice its data.bin in RAM. Seed times are far above the stand-in's (Level1 median
+51 ms vs 178 us): the seeds are naive (one work-item per output, no tiling, 256-wide
+groups where the kernels report a preferred multiple of 128 and allow 1024) on a GPU
+with ~1/13 of the TITAN's fp32 peak -- the agent's first steps fix exactly that.
+
+**Live agent** (KernelBlaster `run_multislot.py --evaluator board --arch adreno650
+--board-lock ...`, Bedrock `us.anthropic.claude-haiku-5-5`, 1 rollout x 4 steps, <= 1 fix,
+`--ncu best`), Adreno times of the seeds vs the best variants, both measured on the board:
+
+| problem | seed | best | speedup | winning steps |
+|---|---|---|---|---|
+| L1 1_Square_matmul | 56.3 ms | 2.12 ms | 26.6x | work-group retile, then native math / mad |
+| L1 63_conv2d | 138.4 ms | 5.45 ms | 25.4x | thread coarsening, then implicit GEMM |
+| L2 19_ConvTranspose2d_GELU_GroupNorm | 436.1 ms | 28.4 ms | 15.4x | group_norm coarsening (51.5 -> 3.4 ms), conv_transpose2d 384 -> 24.6 ms |
+| L1 40_LayerNorm | 3.21 ms | 0.349 ms | 9.2x | work-group size, coarsening, native math |
+| L3 32_CvT (10 slots) | 113.7 ms | 36.8 ms | 3.1x | strided_copy 45.4 -> 0.30 ms, linear 40.9 -> 9.2 ms (local tiling) |
+
+22 LLM calls, 99 k prompt / 110 k completion tokens, about $0.65. Two of the 20 steps
+produced no code (the response hit the 8192-token cap); no Adreno-specific build or
+run failure.
 
 ## Design decisions
 
@@ -186,22 +244,23 @@ launches). They are NVIDIA's; Adreno 650 has ~1/13 of the TITAN's fp32 peak and
 | 9 | OpenCL profile = event times + kernel resource queries | Snapdragon Profiler; none | Adreno exposes no counters to an OpenCL program; `CL_KERNEL_WORK_GROUP_SIZE` falls when a kernel needs many registers and `CL_KERNEL_PRIVATE_MEM_SIZE` shows spills -- the two register-pressure signals Adreno gives, plus launch counts for launch-bound slots. |
 | 10 | Validate functionally on local OpenCL when no board is reachable | wait for the board; POCL | The NVIDIA ICD is a real OpenCL 3.0 implementation with SVM; POCL was not installed and installing system packages was out of scope. |
 
-## Limitations / what remains for real Adreno hardware
+## Limitations / what remains
 
-- **Run on the board**: export as above, then `scripts/run_multislot.py PROBLEMS
-  --evaluator board --board-host root@<rb5> --arch adreno650` (needs the QDC
-  tunnel or a lab RB5, `g++` and `libOpenCL.so` on it). Expected issues to
-  check first: the Adreno compiler's limits on kernel work-group size (seeds use
-  256 for `__local` reductions; a kernel whose `CL_KERNEL_WORK_GROUP_SIZE` is
-  lower would fail to enqueue), SVM allocation limits for the largest Level3
-  problems on 8 GB shared memory, and the 3.8 GiB `/tmp` tmpfs for `data.bin`
-  (use `--remote-dir` on persistent storage for VGG-size problems).
-- The live agent run and every timing above are NVIDIA's. Adreno speedups and
-  technique values (bandit statistics, claims) must be re-learned on the board;
-  records are keyed by arch so the stand-in's do not leak into Adreno's.
+- **Allocation limit**: one buffer is at most `CL_DEVICE_MAX_MEM_ALLOC_SIZE` (256 MiB
+  on Adreno 650); Level2 89/96 (and Level3 VGG16/19 activations, 392 MiB) do not fit.
+  Splitting a buffer would change the slot ABI (one pointer per tensor); smaller
+  shapes or a partition boundary at that tensor are the workarounds.
+- **Board resources**: the RB5's `/tmp` is a 3.8 GiB tmpfs -- put `data.bin`
+  (`--remote-dir`) on persistent storage; the driver needs about 2x data.bin of RAM.
+- **Compiler aborts**: an OpenCL C construct that crashes the Adreno compiler kills
+  the driver process (SIGABRT, no `MB_ERROR` line); the half -> 64-bit int conversion
+  is the one found so far.
+- The seeds are correctness seeds and slow on Adreno (see above); Adreno technique
+  values (bandit statistics, claims) are re-learned per arch -- records are keyed by
+  arch, so the stand-in's do not leak into Adreno's.
 - Write-back (`kb_ingest`) and fusion variants (`kb_proposals`) are CUDA-only:
   OpenCL winners are exported by KernelBlaster (`--export-winners`, per target)
   but not yet ingested into an MB OpenCL kernel cache.
 - No Android/NDK build; no `cl_mem`/OpenCL 1.2-only path (decision 2).
-- fp16 seeds compute in fp32; Adreno's 2× `half` ALU rate is left to the agent
+- fp16 seeds compute in fp32; Adreno's 2x `half` ALU rate is left to the agent
   (technique `3.4_half_precision` of the Adreno flow).
