@@ -628,6 +628,79 @@ def walk(ir: IR, dev="cuda", keep_all=False, *, dtype=None, store_rounding=True,
     return out, env
 
 
+def walk_free(ir: IR, dev="cuda", *, dtype=None, store_rounding=True, grab=None, skip=None, cpu_fallback=True):
+    """``walk`` with the memory discipline of a verifier: every intermediate leaves the environment after its last
+    reader (``walk``'s ``keep`` pruning, but also for the sampled tensors), tensors in ``grab`` are copied to host the
+    moment they are produced, ops whose index is in ``skip`` (dead ops, graph_prune) do not run, and a CUDA
+    out-of-memory error is retried on the CPU. Same op rules, same store rounding, same float64 option as ``walk`` --
+    the values are identical (pipeline/tests/test_graph_rewrite.py compares them bit for bit).
+
+    -> (output_flat, got): ``got`` maps each name in ``grab`` that the walk produced to its value on the CPU (a copy;
+    float tensors keep the walk's dtype, so float64 in the exact walk)."""
+    try:
+        return _walk_free(ir, dev, dtype, store_rounding, grab, skip)
+    except (torch.cuda.OutOfMemoryError, MemoryError):
+        if not cpu_fallback or dev == "cpu":
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return _walk_free(ir, "cpu", dtype, store_rounding, grab, skip)
+
+
+def _walk_free(ir, dev, dtype, store_rounding, grab, skip):
+    if dtype is not None:
+        ir = _Cast(ir, dtype)
+    grab, skip = set(grab or ()), set(skip or ())
+    env = ir.input_tensors(dev)
+    consts = ir.const_tensors(dev)
+    env.update(consts)
+    outs = list(ir.output_names())
+    keep = set(outs) | set(consts)
+    last = {}
+    for k, op in enumerate(ir.ops):
+        if k in skip:
+            continue
+        for t in op["inputs"]:
+            last[t] = k
+    got = {}
+
+    def run_op(op):
+        if "sub_ops" in op:
+            for sub in op["sub_ops"]:
+                run_op(sub)
+            return
+        fn = _rule(op["op"])
+        if fn is None:
+            raise NotImplementedError(op["op"])
+        res = fn(ir, op, [env[t] for t in op["inputs"]], dev)
+        rnd = _store_rounding(op["op"]) if store_rounding else _identity
+        if rnd is not _identity:
+            res = [rnd(v) for v in res]
+        if dtype is not None:
+            res = [v.to(dtype) if v.is_floating_point() else v for v in res]
+        for name, val in zip(op["outputs"], res):
+            env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
+
+    try:
+        for k, op in enumerate(ir.ops):
+            if k in skip:
+                continue
+            run_op(op)
+            names = [*op["inputs"], *op["outputs"], *op.get("internal", []),
+                     *(t for s in op.get("sub_ops", []) for t in s["outputs"])]
+            for t in names:
+                if t in grab and t not in got and t in env and t not in op["inputs"]:
+                    got[t] = env[t].detach().cpu().clone()
+            for t in names:
+                if t not in keep and last.get(t, -1) <= k:
+                    env.pop(t, None)
+        out = torch.cat([env[t].reshape(-1) if env[t].is_floating_point() else env[t].reshape(-1).float()
+                         for t in outs])
+    finally:
+        run_op = None      # break the closure<->cell reference cycle (run_op calls itself): it pins `env`
+    return out, got
+
+
 def run_one(d: str, dev="cuda") -> dict:
     ir = load_ir(d)
     ops = sorted({o["op"] for o in ir.ops})
