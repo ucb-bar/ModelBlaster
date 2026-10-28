@@ -321,12 +321,26 @@ class Config:
     experiments: str = "off"
     model_context: str = "off"
     view_fusion: str = "off"
+    # region windows (region_windows.py; docs/region_windows.md): off (default; None = $MB_REGION_WINDOWS, else off) | auto. The
+    # knobs are 0 / "" = unset (env, then the defaults: sizes 256, 3 candidates, whole up to 1100 members, >= 4 non-alias ops)
+    region_windows: str | None = None
+    region_window_sizes: str = ""
+    region_window_candidates: int = 0
+    region_window_hard_cap: int = 0
+    region_window_min_ops: int = 0
     # open-ended graph rewrites (graph_rewrite.py; docs/graph_rewrite.md): off (default; None = $MB_GRAPH_REWRITE, else off: nothing
     # runs, the round key and every output are unchanged) | agent (a RewriteProposer is asked for candidate edits each round; each
     # is gated by graph_verify and decided by the paired variant-vs-original timing like any hint). graph_rewrite_proposer: ""
     # = the LLM proposer (not implemented: raises NotImplementedError), a registered name or module:Class; _max candidates per IR
     # per round; _seeds random-input seeds of the verification gate; _device the gate's walker device
     graph_rewrite: str | None = None
+    # region loop (region_loop.py; docs/region_loop.md): off (default; None = $MB_REGION_LOOP, else off: nothing runs and every output is
+    # unchanged) | on (KernelBlaster's tool-using loop on the REGION slots of the exported problems, over the flow's LLM path). The budget
+    # "turns,tools,usd,wall_s" is per problem ("" = $MB_REGION_LOOP_BUDGET, else 40,120,8,3600); the gate (on|off) is graph_verify on
+    # every variant that contains region ops, before it is exported to KernelBlaster
+    region_loop: str | None = None
+    region_loop_budget: str = ""
+    region_loop_gate: str = "on"
     graph_rewrite_proposer: str = ""
     graph_rewrite_max: int = 3
     graph_rewrite_seeds: int = 2
@@ -581,6 +595,8 @@ class KBRunner:
             cmd += ["--stop-patience", str(int(sp or 0))]
         if self.halfway is not None:                  # halfway sync: the plan run's first half carries --pause-spec
             cmd += self.halfway.flags(out)
+        from . import region_loop as rlm
+        cmd += rlm.kb_args(c)                          # --region-loop on: the loop on the problems' region slots ([] when off)
         cmd += list(c.kb_args)
         self.commands[str(out)] = cmd                 # the trace's mb.kb_run record
         return cmd
@@ -862,6 +878,11 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
         specs = with_fused_specs(vplan["graph"], specs)
         job["specs"] = specs
         job["composite"] = variant_seeds(h, g0, vplan, base, seeds, tags, specs)
+    from . import region_loop as rlm
+    why = rlm.gate(cfg, h, vplan["graph"], oir, vir, job.get("specs") or specs)   # --region-loop on: graph_verify before the variant is exported
+    if why:
+        job["early"] = why
+        return job
     job["orig"] = export_problem(oir, out / "orig", op_indices=oidx, specs=specs, name=stem + "__orig",
                                  strategy="hint-original", slot_sources=base["sources"],
                                  slot_source_tags=base["tags"], sub_sources=base["sub_sources"])
@@ -1372,6 +1393,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     rw = grm.RewriteHook(cfg, work)                      # --graph-rewrite off (default): inert
     from . import merge_convs as mcv
     msc = mcv.MergeHook(cfg, work)                       # --merge-sibling-convs off (default): inert
+    from . import region_loop as rlm
+    rl = rlm.RegionLoopHook(cfg, work)                   # --region-loop off (default): inert
     from . import graph_search as gsm
     gs = gsm.CURRENT["gs"] = gsm.GraphSearch(cfg, work, irs)   # all off by default (no effect)
     if kb_barrier.enabled(cfg) or kb_barrier.char_sync_enabled(cfg, gk):
@@ -1406,6 +1429,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(caps.round_key())                    # capabilities: only non-default switches
     key.update(rw.round_key())                      # graph rewrites: only when --graph-rewrite is on
     key.update(msc.round_key())                     # merge_sibling_convs: only when --merge-sibling-convs is on
+    key.update(rl.round_key())                      # region loop: only when --region-loop is on
     if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
         key["ingest_fused"] = "off"                 # kill switch: only when set
     if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
@@ -1630,6 +1654,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                **({"capabilities": caps.summary()} if caps.round_key() else {}),
                **({"graph_rewrite": rw.summary()} if rw.active() else {}),
                **({"merge_sibling_convs": msc.summary()} if msc.active() else {}),
+               **({"region_loop": rl.summary()} if rl.active() else {}),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
                "llm_calls": kb.calls, "parallel_hints": width,
