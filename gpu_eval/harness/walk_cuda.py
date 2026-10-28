@@ -13,6 +13,14 @@ An fp16 IR (`--quant fp16`, `_f16` ops) runs on fp16 buffers: tensors and
 weights are stored as torch.float16 and the `_f16` kernels (lib built from
 cuda/mb_cuda_kernels_f16.cu) read and write __half; the per-intermediate
 oracle is walk_torch's fp16-storage walk and the bounds are cuda_dtypes'.
+A bf16 IR (`--quant bf16`, `_bf16` ops; lib from cuda/mb_cuda_kernels_bf16.cu)
+runs the same way on torch.bfloat16 buffers; its weights.npz holds float32
+arrays with bf16-exact values, which are narrowed (exactly) on upload.
+A mixed IR (`--quant native`, docs/tensor_dtypes.md) puts every tensor in a
+buffer of its own dtype (integer graph inputs / outputs as int64 / int32 /
+bool) and resolves each op's entry in whichever of the `--hand` libraries
+(comma-separated: lib_hand.so, the _f16 / _bf16 ones, lib_hand_cast.so for
+cuda/mb_cuda_kernels_cast.cu) defines it.
 
 impl=hand   only hand-written kernels (fails on an op without one)
 impl=seed   only auto-ported single-thread reference kernels (ref2cuda.py)
@@ -34,18 +42,22 @@ import walk_torch
 from mbabi import bind, parse_signature
 from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
 
-_TORCH_DTYPE = {"f16": torch.float16, "f32": torch.float32, "i64": torch.int64}   # i64: argmax/argmin indices
+_TORCH_DTYPE = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32,
+                "i64": torch.int64,   # i64: argmax/argmin indices, a mixed IR's integer io
+                "i32": torch.int32, "b8": torch.bool, "u8": torch.uint8}
 
 
 def _storage(ir: IR, t: str) -> torch.dtype:
-    """Device dtype of IR tensor t (graph.json `dtype`: f16 / f32)."""
+    """Device dtype of IR tensor t (graph.json `dtype`: f16 / bf16 / f32)."""
     return _TORCH_DTYPE.get(ir.graph["tensors"].get(t, {}).get("dtype"), torch.float32)
 
 
 class KernelSet:
     def __init__(self, specs: dict, hand: str | None, seeds: str | None, impl: str):
         self.specs, self.impl = specs, impl
-        self.hand = ctypes.CDLL(hand) if hand else None
+        # one or more hand libraries (comma-separated): a mixed IR's ops come from several
+        self.hands = [ctypes.CDLL(h) for h in (hand or "").split(",") if h]
+        self.hand = self.hands[0] if self.hands else None
         self.seed_dir = Path(seeds) if seeds else None
         self._seed_libs: dict[str, ctypes.CDLL] = {}
 
@@ -62,12 +74,12 @@ class KernelSet:
         name, params = parse_signature(self.specs[op]["signature"])
         order = {"hand": ["hand"], "seed": ["seed"], "mixed": ["hand", "seed"]}[self.impl]
         for src in order:
-            lib = self.hand if src == "hand" else self._seed(op)
-            if lib is not None and hasattr(lib, name):
-                fn = getattr(lib, name)
-                fn.argtypes = [p.ctypes_type() for p in params]
-                fn.restype = None
-                return fn, params, src, lib
+            for lib in (self.hands if src == "hand" else [self._seed(op)]):
+                if lib is not None and hasattr(lib, name):
+                    fn = getattr(lib, name)
+                    fn.argtypes = [p.ctypes_type() for p in params]
+                    fn.restype = None
+                    return fn, params, src, lib
         raise KeyError(f"no {self.impl} kernel for {op}")
 
 
@@ -95,7 +107,11 @@ def run(ir: IR, plan, dev="cuda", time_ops=False, feed=None):
 
     def wptr(key):
         if key not in weights:      # as stored: float16 weights for an fp16 IR
-            weights[key] = torch.from_numpy(np.ascontiguousarray(ir.weights[key])).to(dev)
+            w = torch.from_numpy(np.ascontiguousarray(ir.weights[key]))
+            if w.is_floating_point() and cuda_dtypes.weight_dtype(
+                    ir.graph, key, ir.weights[key].dtype) == "bf16":
+                w = w.to(torch.bfloat16)        # bf16-exact float32 in weights.npz
+            weights[key] = w.to(dev)
         return weights[key].data_ptr()
 
     per_op = []
@@ -135,7 +151,7 @@ def run(ir: IR, plan, dev="cuda", time_ops=False, feed=None):
         if time_ops:
             e.record()
             per_op.append((op, src, s, e))
-    out = torch.cat([env[t].reshape(-1) for t in ir.output_names()])
+    out = torch.cat([env[t].reshape(-1).float() for t in ir.output_names()])
     return out, env, per_op
 
 
@@ -163,7 +179,7 @@ def evaluate(d: str, ks: KernelSet, reps: int) -> dict:
         # error, not rounding propagated through an ill-conditioned graph
         _, iso_env, _ = run(ir, plan, feed=ref_env)
         rec["output_vs_ref_walk"] = compare(out, torch.cat(
-            [ref_env[t].reshape(-1) for t in ir.output_names()]).cpu().numpy(), ir.dtype)["rel_to_range"]
+            [ref_env[t].reshape(-1).float() for t in ir.output_names()]).cpu().numpy(), ir.dtype)["rel_to_range"]
         worst, first_bad, by_kind = 0.0, None, {}
         for op, _k in plan:
             if _k is None:

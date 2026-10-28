@@ -3056,6 +3056,249 @@ class _SortedTopk(torch.overrides.TorchFunctionMode):
         return func(*args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# per-tensor dtypes (--quant native, docs/tensor_dtypes.md)
+# ---------------------------------------------------------------------------
+
+# torch dtype of a traced node -> IR tensor dtype (MB has no float64 storage:
+# a float64 tensor is stored f32; int8 / int16 never reach a graph input --
+# the SOL port refuses that storage -- and are carried as integer-valued f32)
+_IR_DTYPE = {torch.float32: "f32", torch.float64: "f32", torch.bfloat16: "bf16", torch.float16: "f16",
+             torch.int64: "i64", torch.int32: "i32", torch.int16: "i32", torch.int8: "i32",
+             torch.uint8: "u8", torch.bool: "b8"}
+_INT_IR = ("i64", "i32", "b8", "u8")
+_FLOAT_IR = ("f32", "bf16", "f16")
+# data movement: an output the lowering made (no traced node of its own) keeps
+# its inputs' float dtype instead of widening to f32
+_VALUE_MOVES = {"strided_copy", "strided_scatter", "gather", "gather_dim", "index_select", "cat2_c1",
+                "cat3_c1", "cat4_c1", "catn", "flip", "upsample_nearest"}
+_ALIAS = ("view", "chunk2_c1")
+_TO_FP32_METHODS = {"bfloat16": "float", "half": "float", "double": "float"}
+
+
+def _fp32_twin(gm: "torch.fx.GraphModule") -> None:
+    """Turn a graph traced at the model's own dtypes into its fp32 twin (in
+    place): every bf16 / fp16 / fp64 dtype argument becomes float32
+    (``x.to(torch.bfloat16)``, ``torch.zeros(..., dtype=...)``), ``.bfloat16()``
+    / ``.half()`` / ``.double()`` become ``.float()``, and float parameters,
+    buffers and constants are widened (exactly). This is the SOL port's fp32
+    rewrite done on the traced graph, so the lowering sees the graph it always
+    sees, while the dtypes of the original trace are kept apart."""
+    low = (torch.bfloat16, torch.float16, torch.float64)
+
+    def sub(a):
+        return torch.float32 if isinstance(a, torch.dtype) and a in low else a
+    for n in gm.graph.nodes:
+        n.args = torch.fx.node.map_aggregate(n.args, sub)
+        n.kwargs = torch.fx.node.map_aggregate(n.kwargs, sub)
+        if n.op == "call_method" and n.target in _TO_FP32_METHODS:
+            n.target = _TO_FP32_METHODS[n.target]
+    gm.float()
+    for n in gm.graph.nodes:
+        if n.op != "get_attr":
+            continue
+        *path, leaf = str(n.target).split(".")
+        obj = gm
+        for p in path:
+            obj = getattr(obj, p)
+        v = getattr(obj, leaf, None)
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != torch.float32:
+            if isinstance(v, torch.nn.Parameter):
+                v.data = v.data.float()
+            elif leaf in getattr(obj, "_buffers", {}):
+                obj._buffers[leaf] = v.float()
+            else:
+                setattr(obj, leaf, v.float())
+    gm.recompile()
+
+
+def _native_trace(model: torch.nn.Module, sample_inputs: list):
+    """--quant native: trace ``model`` on ``sample_inputs`` at their own dtypes,
+    record every node's dtype (``gm.meta["mb_native_dtypes"]``: node name ->
+    IR dtype), then make the graph its fp32 twin (``_fp32_twin``) for the
+    lowering -> (gm, reference, the inputs with float tensors widened to
+    float32). ``reference`` is the twin before the compound-activation /
+    loss rewrites (whose marker nodes do not compute): the golden's model."""
+    gm = _trace(model, sample_inputs)
+    ShapeProp(gm).propagate(*sample_inputs)
+    native = {}
+    for n in gm.graph.nodes:
+        tm = n.meta.get("tensor_meta")
+        dt = getattr(tm, "dtype", None)
+        if dt is not None:
+            if dt not in _IR_DTYPE:
+                # (the wording extract-failure classifiers match, as _f_cast's)
+                raise NotImplementedError(f"{n.name}: {dt}: no fp8/fp4 storage in the IR"
+                                          if "float8" in str(dt) or "float4" in str(dt) else
+                                          f"{n.name}: no IR storage for {dt}")
+            native[n.name] = _IR_DTYPE[dt]
+    _fp32_twin(gm)
+    f32 = [t.float() if torch.is_tensor(t) and t.is_floating_point() else t for t in sample_inputs]
+    ShapeProp(gm).propagate(*f32)
+    import copy
+    ref = copy.deepcopy(gm)
+    _maybe_fuse_compound_activation(gm)
+    _maybe_fuse_loss(gm)
+    gm.meta["mb_native_dtypes"] = native
+    return gm, ref, f32
+
+
+def _native_storage(ops, tensors, weights, input_names, output_names, native, ints) -> dict:
+    """Storage dtype of every IR tensor of a mixed IR (docs/tensor_dtypes.md):
+
+    * graph inputs and outputs: the source's dtype (integer / bool ones as
+      real integers: i64 / i32 / b8 / u8);
+    * every other tensor of a traced node: its float dtype; integer-valued
+      ones (indices, masks) are exact f32 inside the graph, as in an fp32 IR;
+    * argmax / argmin outputs: i64 (their kernels write int64_t);
+    * float constants: their traced dtype; integer constants keep their array;
+    * tensors the lowering made (no node of their own): an alias' or a data
+      movement's keeps its input's dtype, a computed one is f32 -- a torch op
+      on bf16 computes in fp32 and rounds once, at its output."""
+    S = {}
+    for t, m in tensors.items():
+        nat = native.get(t)
+        if m.get("const"):
+            arr = weights.get(m["const"])
+            S[t] = None if arr is not None and arr.dtype.kind in "iub" else \
+                (nat if nat in _FLOAT_IR else "f32")
+        elif t in ints:
+            S[t] = "i64"
+        elif t in input_names or t in output_names:
+            S[t] = nat or "f32"
+        elif nat is not None:
+            S[t] = nat if nat in _FLOAT_IR else "f32"
+    for o in ops:                         # lowering-made tensors, in op order
+        for t in o["outputs"]:
+            if t in S:
+                continue
+            fl = {S.get(i) for i in o["inputs"] if S.get(i) in _FLOAT_IR}
+            if (o["op"] in _ALIAS or o["op"] in _VALUE_MOVES) and len(fl) == 1:
+                S[t] = fl.pop()
+            else:
+                S[t] = "f32"
+    for t in tensors:
+        S.setdefault(t, None if tensors[t].get("const") else "f32")
+    return S
+
+
+def _cast_path(src: str, dst: str) -> list:
+    from modelblaster.pipeline.cuda_dtypes import CASTS
+    if (src, dst) in CASTS:
+        return [(src, dst)]
+    return [(src, "f32"), ("f32", dst)]
+
+
+class _Retyper:
+    """Rebuilds a mixed IR's op list with the casts its dtypes need."""
+
+    def __init__(self, tensors, S):
+        self.tensors, self.S, self.ops, self.memo = tensors, S, [], {}
+
+    def _new(self, base: str, dt: str) -> str:
+        name, k = f"{base}__{dt}", 1
+        while name in self.tensors:
+            name, k = f"{base}__{dt}{k}", k + 1
+        self.tensors[name] = {"shape": list(self.tensors[base]["shape"]), "dtype": dt, "quant": None}
+        self.S[name] = dt
+        return name
+
+    def cast(self, src: str, dst_t: str) -> None:
+        """Append the cast(s) writing tensor dst_t from tensor src."""
+        from modelblaster.pipeline.cuda_dtypes import cast_kind
+        steps = _cast_path(self.S[src], self.S[dst_t])
+        cur = src
+        for k, (a, b) in enumerate(steps):
+            out = dst_t if k == len(steps) - 1 else self._new(src, b)
+            n = int(np.prod(self.tensors[src]["shape"])) if self.tensors[src]["shape"] else 1
+            self.ops.append({"name": f"{out}__cast", "op": cast_kind(a, b), "inputs": [cur], "outputs": [out],
+                             "shape": {"n": n}})
+            cur = out
+
+    def as_dtype(self, t: str, dt: str) -> str:
+        """Tensor t at storage dt (a cast, made once per (t, dt))."""
+        if self.S.get(t) in (None, dt):
+            return t
+        if (t, dt) not in self.memo:
+            out = self._new(t, dt)
+            self.cast(t, out)
+            self.memo[(t, dt)] = out
+        return self.memo[(t, dt)]
+
+
+def _native_views(ops, tensors, S, input_names) -> list:
+    """First pass of the retyping (before output views are materialized): the
+    integer graph inputs are read through an f32 copy, and an alias whose two
+    sides differ in dtype (a traced ``.to()`` / ``.float()`` lowers to a view)
+    becomes a cast -- of its window when it is not the whole input."""
+    R = _Retyper(tensors, S)
+    int_in = {t for t in input_names if S.get(t) in _INT_IR}
+    for o in ops:
+        o["inputs"] = [R.as_dtype(t, "f32") if t in int_in else t for t in o["inputs"]]
+        if o["op"] not in _ALIAS:
+            R.ops.append(o)
+            continue
+        src = o["inputs"][0]
+        bad = [t for t in o["outputs"] if S[t] != S[src]]
+        if not bad:
+            R.ops.append(o)
+            continue
+        n_src = int(np.prod(tensors[src]["shape"])) if tensors[src]["shape"] else 1
+        if o["op"] == "view" and not o.get("offset") and o["shape"].get("n") == n_src:
+            R.cast(src, o["outputs"][0])          # a pure dtype conversion
+            continue
+        ren = {}
+        for t in bad:
+            ren[t] = R._new(t, S[src])
+        o["outputs"] = [ren.get(t, t) for t in o["outputs"]]
+        R.ops.append(o)
+        for t, tmp in ren.items():
+            R.cast(tmp, t)
+    return R.ops
+
+
+def _native_ops(ops, tensors, S, weight_roles, ints=frozenset()) -> tuple[list, dict]:
+    """Second pass: every kernel op gets one float storage dtype. When all of
+    its float tensors share bf16 / fp16 it becomes that op's `_bf16` / `_f16`
+    kind; otherwise (fp32 tensors, integer-valued operands, a mix) it runs as
+    the fp32 op, reading its bf16 / fp16 inputs through exact casts to f32 and
+    writing f32, cast once to each output's dtype. An integer graph output that
+    other ops also read (topk indices fed to a gather) is read through its f32
+    copy, as an integer input is. -> (ops, weight key -> dtype)."""
+    from modelblaster.pipeline.cuda_dtypes import SUFFIX, FLOAT_TENSOR
+    R = _Retyper(tensors, S)
+    wdt = {}
+    for o in ops:
+        if o["op"] in _ALIAS or o["op"].startswith("cast_"):
+            R.ops.append(o)
+            continue
+        o["inputs"] = [R.as_dtype(t, "f32") if S.get(t) in _INT_IR and t not in ints else t
+                       for t in o["inputs"]]
+        fl = [t for t in o["inputs"] + o["outputs"] if S.get(t) in _FLOAT_IR]
+        dts = {S[t] for t in fl}
+        st = FLOAT_TENSOR[dts.pop()] if len(dts) == 1 else "fp32"
+        for role in weight_roles:
+            if isinstance(o.get(role), str):
+                wdt[o[role]] = {"fp32": "f32", "fp16": "f16", "bf16": "bf16"}[st]
+        if st in SUFFIX:
+            o["op"] = o["op"] + SUFFIX[st]
+            R.ops.append(o)
+            continue
+        o["inputs"] = [R.as_dtype(t, "f32") if S.get(t) in ("bf16", "f16") else t for t in o["inputs"]]
+        ren = {t: R._new(t, "f32") for t in o["outputs"] if S.get(t) not in (None, "f32", "i64")
+               or (S.get(t) == "i64" and not o["op"].startswith(("argmax", "argmin")))}
+        o["outputs"] = [ren.get(t, t) for t in o["outputs"]]
+        for k, v in list((o.get("state") or {}).items()):
+            o["state"][k] = ren.get(v, v)
+        R.ops.append(o)
+        for t, tmp in ren.items():
+            R.cast(tmp, t)
+    for t, m in tensors.items():
+        if S.get(t) is not None:
+            m["dtype"] = S[t]
+    return R.ops, wdt
+
+
 def _lowering_signature(node: "torch.fx.Node"):
     """What extract()'s specific branches look at: op, target, each argument's
     kind and shape (or literal value), and the output shape."""
@@ -3100,6 +3343,24 @@ def extract(
     variants. The golden is recomputed via `model.half()` on
     `input.half()` so we're comparing genuine fp16 numerics, not
     fp32-traced numerics down-cast at the boundary.
+
+    bf16 mode (docs/bf16_cuda.md): extracted exactly like fp32 (same trace,
+    same shapes, fp32 weight folding), then op kinds get a "_bf16" suffix,
+    float tensors dtype "bf16", and every float weight, the inputs and the
+    golden are rounded to bfloat16. numpy has no bfloat16, so the npz arrays
+    are float32 holding bf16-exact values (cuda_dtypes.round_bf16). The
+    golden is the fp32 model on the bf16-rounded inputs, stored as bf16.
+
+    native mode (per-tensor dtypes, docs/tensor_dtypes.md): `model` and
+    `sample_input` are the model at its own dtypes (bf16 / fp32 / integer
+    tensors as the source has them). It is traced at those dtypes (each
+    node's dtype is recorded), then lowered as its fp32 twin (_fp32_twin).
+    Every tensor keeps the source's dtype (_native_storage), each op gets one
+    float storage dtype and casts are inserted where they differ
+    (_native_views, _native_ops). Integer graph inputs / outputs are real
+    integer tensors. io.npz holds each input / output at its own dtype
+    (`in.<name>`, `out.<name>`) next to the flat float32 `input` / `output`;
+    the golden is the fp32 twin on the inputs, each output stored at its dtype.
     """
     if quant == "int8":
         return extract_int8(
@@ -3109,12 +3370,16 @@ def extract(
             fp16_op_names=fp16_op_names,
             per_channel=per_channel,
         )
-    if quant not in ("fp32", "fp16"):
+    if quant not in ("fp32", "fp16", "bf16", "native"):
         raise NotImplementedError(
-            f"quant={quant!r} not supported (have: fp32, fp16, int8)"
+            f"quant={quant!r} not supported (have: fp32, fp16, bf16, native, int8)"
         )
+    native = quant == "native"
+    # bf16: everything below runs as fp32; the bf16 rounding is applied when
+    # the artifacts are written (numpy has no bfloat16)
     weight_dtype = np.float16 if quant == "fp16" else np.float32
-    op_suffix = "_f16" if quant == "fp16" else ""
+    op_suffix = {"fp16": "_f16", "bf16": "_bf16"}.get(quant, "")
+    store_dtype = {"fp16": "f16", "bf16": "bf16"}.get(quant)
     os.makedirs(out_dir, exist_ok=True)
     model = model.eval()
 
@@ -3125,6 +3390,11 @@ def extract(
     else:
         sample_inputs = list(sample_input)
 
+    if native and _gm is None:
+        # trace at the model's own dtypes; lower (and compute the golden on)
+        # its fp32 twin, which then stands in for the model
+        gm, ref, f32_inputs = _native_trace(model, sample_inputs)
+        return extract(ref, f32_inputs, name, out_dir, quant=quant, _gm=gm)
     if _gm is not None:
         gm = _gm
     else:
@@ -4954,6 +5224,10 @@ def extract(
         if tmeta.get("dtype") in ("i64", "i32", "b8") and tname_ not in ints:
             tmeta["dtype"] = "f32"
     _check_traced_shapes(gm, tensors)
+    if native:
+        S = _native_storage(ops, tensors, weights, input_names, output_names,
+                            gm.meta.get("mb_native_dtypes", {}), ints)
+        ops[:] = _native_views(ops, tensors, S, input_names)
     from modelblaster.pipeline.generic_lowering import materialize_output_views
     materialize_output_views(ops, tensors, input_names, output_names)
     # constants nothing reads (a value snapshotted before an in-place write
@@ -4969,13 +5243,20 @@ def extract(
     # downstream stages pick the half-precision kernel variants without
     # touching the otherwise-identical graph extraction logic. Done as
     # a post-pass to keep the per-module branches dtype-agnostic.
+    weight_dtypes: dict = {}
+    if native:
+        from modelblaster.pipeline.kernel_abi import WEIGHT_ROLES
+        ops[:], weight_dtypes = _native_ops(ops, tensors, S, set(WEIGHT_ROLES.values()), ints)
+        for tname, tmeta in tensors.items():
+            if tmeta.get("const") and weights[tmeta["const"]].dtype.kind == "f":
+                weight_dtypes[tmeta["const"]] = tmeta["dtype"]
     if op_suffix:
         for op in ops:
             if op["op"] != "view":
                 op["op"] = op["op"] + op_suffix
         for tname, tmeta in tensors.items():
             if tmeta.get("dtype") == "f32":
-                tmeta["dtype"] = "f16"
+                tmeta["dtype"] = store_dtype
 
     dispatches = _annotate_dispatches(ops)
     # Build the input IR field. For single-input models the legacy
@@ -5008,6 +5289,10 @@ def extract(
         "ops": ops,
         "dispatches": dispatches,
     }
+    if native:
+        # weights.npz arrays of a mixed IR: bf16 ones are float32 holding
+        # bf16-exact values, so the dtype is named here
+        ir["weight_dtypes"] = {k: v for k, v in sorted(weight_dtypes.items()) if k in weights}
 
     # Run reference to capture golden I/O. fp16 mode runs `model.half()`
     # on `input.half()` so the golden reflects genuine half-precision
@@ -5031,6 +5316,17 @@ def extract(
                                for t in sample_inputs]
             torch_dtype = torch.float16
             out = model.float()(*ref_inputs_exec)
+        elif quant == "bf16":
+            # as fp16: the fp32 model on the bf16-rounded inputs (every tensor
+            # input, ints included, round-trips through the bf16 io buffer;
+            # bf16 holds integers exactly only up to 256), stored as bf16
+            ref_inputs_exec = [t.to(torch.bfloat16).to(t.dtype)
+                               if torch.is_tensor(t) else t
+                               for t in sample_inputs]
+            torch_dtype = torch.bfloat16
+            torch.manual_seed(0)
+            with _SortedTopk():
+                out = model.float()(*ref_inputs_exec)
         else:
             ref_inputs_exec = list(sample_inputs)
             ref_model = model
@@ -5061,6 +5357,25 @@ def extract(
         t.detach().cpu().numpy().astype(weight_dtype).reshape(-1)
         for t in ref_inputs_exec
     ])
+    if quant == "bf16":
+        from modelblaster.pipeline.cuda_dtypes import round_bf16
+        flat, flat_input = round_bf16(flat), round_bf16(flat_input)
+        weights = {k: round_bf16(v) if v.dtype.kind == "f" else v for k, v in weights.items()}
+    per_tensor = {}
+    if native:
+        # every graph input / output at its own dtype; the flat float32 arrays
+        # hold the same values (integers exact below 2^24)
+        from modelblaster.pipeline.cuda_dtypes import np_storage
+        outs = list(out) if isinstance(out, (tuple, list)) else [out]
+        for pre, names, vals in (("in.", input_names, ref_inputs_exec), ("out.", output_names, outs)):
+            for nm, v in zip(names, vals):
+                per_tensor[pre + nm] = np_storage(v.detach().cpu().numpy(), tensors[nm]["dtype"])
+        flat_input = np.concatenate([per_tensor["in." + nm].astype(np.float32).reshape(-1)
+                                     for nm in input_names])
+        flat = np.concatenate([per_tensor["out." + nm].astype(np.float32).reshape(-1)
+                               for nm in output_names])
+        weights = {k: np_storage(v, weight_dtypes[k]) if k in weight_dtypes and v.dtype.kind == "f" else v
+                   for k, v in weights.items()}
 
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
@@ -5073,6 +5388,7 @@ def extract(
         io_path,
         input=flat_input,
         output=flat,
+        **per_tensor,
     )
 
     print(f"wrote {ir_path}")
@@ -5085,10 +5401,11 @@ import contextlib
 
 
 @contextlib.contextmanager
-def _cpu_fp32_tensor_creation():
+def _cpu_fp32_tensor_creation(keep_dtype: bool = False):
     """Patch torch tensor-creation ops so benches that hard-code
     device='cuda' and/or dtype=float16 in get_inputs (e.g. 97 SDPA) still
-    materialize on CPU in fp32. Restores the originals on exit."""
+    materialize on CPU in fp32. Restores the originals on exit.
+    ``keep_dtype`` (--quant native): only the device is patched."""
     names = ["rand", "randn", "zeros", "ones", "empty", "full", "randint",
              "arange", "tensor", "eye", "linspace"]
     saved = {n: getattr(torch, n) for n in names if hasattr(torch, n)}
@@ -5097,7 +5414,7 @@ def _cpu_fp32_tensor_creation():
         def inner(*args, **kwargs):
             if kwargs.get("device") is not None:
                 kwargs["device"] = "cpu"
-            if kwargs.get("dtype") == torch.float16:
+            if not keep_dtype and kwargs.get("dtype") in (torch.float16, torch.bfloat16):
                 kwargs["dtype"] = torch.float32
             return fn(*args, **kwargs)
         return inner
@@ -5303,6 +5620,7 @@ def _load_kernelbench(bench_path: str,
                       target_bytes: "int | None" = None,
                       target_flops: "int | None" = None,
                       target_weight_bytes: "int | None" = None,
+                      native: bool = False,
                       ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
     """Load a KernelBench level1 file (single-input variant only).
 
@@ -5324,6 +5642,12 @@ def _load_kernelbench(bench_path: str,
     Multi-input forwards are threaded through extract()'s packed_inputs path.
     Loss-style benches (preds+targets → scalar) load but fail later at the
     unsupported loss op. See modelblaster/notes/kernelbench_rvv_port_plan.md.
+
+    ``native`` (--quant native): the model and inputs at the source's own
+    dtypes -- the bench's ``NativeModel`` / ``get_native_inputs()`` when it
+    defines them (the SOL-ExecBench port: the original reference on the
+    definition's dtypes), else ``Model`` / ``get_inputs()``, with creation
+    dtypes left as written.
     """
     import importlib.util
     if not os.path.isfile(bench_path):
@@ -5338,7 +5662,7 @@ def _load_kernelbench(bench_path: str,
     if not hasattr(mod, "get_inputs"):
         raise RuntimeError(f"{bench_path} missing get_inputs()")
 
-    with _cpu_fp32_tensor_creation():
+    with _cpu_fp32_tensor_creation(keep_dtype=native):
         if max_elements is not None and max_elements > 0:
             SHAPE_ATTRS_BLOCKLIST = {"num_classes"}  # not a spatial dim
             ints = {k: v for k, v in vars(mod).items()
@@ -5394,9 +5718,9 @@ def _load_kernelbench(bench_path: str,
             _shrink_for_weights(mod, target_weight_bytes)
 
         init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
-        model = mod.Model(*init_args)
+        model = (mod.NativeModel if native and hasattr(mod, "NativeModel") else mod.Model)(*init_args)
         model.eval()
-        inputs = mod.get_inputs()
+        inputs = (mod.get_native_inputs if native and hasattr(mod, "get_native_inputs") else mod.get_inputs)()
         if isinstance(inputs, tuple):
             inputs = list(inputs)
         if not isinstance(inputs, list) or not inputs:
@@ -5481,11 +5805,17 @@ def main() -> None:
                          "--bench-target-mb stays an io ceiling. Overridden by "
                          "--bench-max-elements. Env: BENCH_TARGET_GFLOPS.")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
+    ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "bf16", "native", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
                          "half precision (uses torch.float16 model + "
                          "_Float16 C kernels, validated against half-cast "
-                         "torch golden), int8 = symmetric per-tensor PTQ.")
+                         "torch golden), bf16 = bfloat16 storage with fp32 "
+                         "math (CUDA path only; docs/bf16_cuda.md; shapes as "
+                         "fp32), native = per-tensor dtypes from the source "
+                         "(each tensor at the model's own dtype: bf16 / fp32 / "
+                         "integer; a bench's get_native_inputs() / NativeModel "
+                         "when it has them; CUDA path only; "
+                         "docs/tensor_dtypes.md), int8 = symmetric per-tensor PTQ.")
     ap.add_argument("--fp16-ops", default=None,
                     help="comma-separated IR op names to promote to fp16 in an "
                          "int8 extract (mixed precision). Additive to the "
@@ -5526,7 +5856,8 @@ def main() -> None:
             max_elements=(args.bench_max_elements or None),
             target_bytes=_tgt,
             target_flops=_tflops,
-            target_weight_bytes=(args.bench_target_weights_mb * 2**20 or None))
+            target_weight_bytes=(args.bench_target_weights_mb * 2**20 or None),
+            native=args.quant == "native")
     else:
         if args.model == "mlp_generic":
             from modelblaster.models import mlp_generic as model_mod

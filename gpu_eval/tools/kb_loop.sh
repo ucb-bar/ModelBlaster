@@ -154,8 +154,11 @@ done
 
 step "ingest winners + model-level verify"
 if ! is_done ingest; then
+  # with SSH_HOST the verification runs on the remote GPUs too (its binaries are built for ARCH);
+  # without it, ModelBlaster's own run on this host's default GPU (kb_ingest's default)
+  VERIFY_EVAL=(); [ -z "${SSH_HOST:-}" ] || VERIFY_EVAL=("${EVAL[@]}" "${GPU[@]}" --kb "$KB" --kb-python "$PY")
   $PY -m modelblaster.pipeline.kb_ingest "$W/winners/winners.json" --cache "$CACHE" --verify "$IR" --arch "$ARCH" \
-      --hints "$HINTS" > "$W/ingest.jsonl.tmp"
+      --hints "$HINTS" "${VERIFY_EVAL[@]}" > "$W/ingest.jsonl.tmp"
   mv "$W/ingest.jsonl.tmp" "$W/ingest.jsonl"; done_ ingest
 fi
 cat "$W/ingest.jsonl"
