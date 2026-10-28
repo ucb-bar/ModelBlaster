@@ -49,7 +49,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 KIND = "merge_sibling_convs"
 ENV = "MB_MERGE_SIBLING_CONVS"
@@ -386,7 +386,7 @@ def propose(graph: dict, profile: dict | None, specs: dict, doc: dict | None, *,
             if pct is not None and pct < min_gain_pct:
                 report.append({"pattern": pat, "why": f"estimated gain {pct}% < min_gain_pct {min_gain_pct}"})
             continue
-        out.append({"id": hid, "kind": KIND, "target": "cuda", "pattern": pat,
+        out.append({"id": hid, "kind": KIND, "target": "cuda", "pattern": pat, "policy": asdict(policy),
                     "instances": [{"ir": ir, "cat": p["cat"], "convs": p["convs"], "acts": p["acts"]} for p in ps],
                     "chains": [p["convs"] + p["acts"] + [p["cat"]] for p in ps],
                     "status": "proposed",
@@ -561,7 +561,16 @@ def apply_hint(graph: dict, h: dict, specs: dict, prov: dict):
     from . import graph_edit as ge
     g = graph
     n_ok = 0
-    for inst in h.get("instances") or []:
+    instances = list(h.get("instances") or [])
+    if h.get("status") == "accepted":
+        # an accepted hint applies wherever its pattern matches (the rule of ``fuse``): the other instances of the same pattern in this graph,
+        # found by the detector under the policy the hint was proposed with (waste cap and cost gate), join the measured ones
+        pol = Policy(**{k: v for k, v in (h.get("policy") or {}).items() if k in Policy.__dataclass_fields__})
+        plans, _ = find(g, pol)
+        known = {(i["cat"], tuple(i["convs"])) for i in instances}
+        instances += [{"cat": p["cat"], "convs": p["convs"], "acts": p["acts"]} for p in plans
+                      if p["pattern"] == h.get("pattern") and (p["cat"], tuple(p["convs"])) not in known]
+    for inst in instances:
         ctx = Ctx(g)
         try:
             p = _resolve(ctx, inst)
@@ -640,4 +649,49 @@ class MergeHook:
             hints, report = propose(g, p, specs, doc, policy=self.policy, min_gain_pct=getattr(self.cfg, "min_gain_pct", 2.0), ir=p["ir"])
             self.log.append({"ir": p["ir"], "proposed": [h["id"] for h in hints], "skipped": report[:20]})
             new += gh.merge(doc, hints)
+            for h in hints:                                  # gh.merge extends ``chains`` of a known id; the instances (the applier's scope) too
+                cur = gh.get(doc, h["id"])
+                if cur is not None and cur is not h:
+                    have = {(i["cat"], tuple(i["convs"])) for i in cur.get("instances", [])}
+                    cur.setdefault("instances", []).extend(i for i in h["instances"] if (i["cat"], tuple(i["convs"])) not in have)
         return new
+
+
+# ------------------------------------------------------------------------------ CLI (candidates, skip report, a hints file for graph_hints apply)
+def main(argv=None) -> int:
+    """``python -m modelblaster.pipeline.merge_convs IR_DIR [--profile P.json] [--max-waste X] [--out HINTS.json [--accept]]``: print the
+    merge candidates of an IR (cost per instance) and the skipped list with reasons; ``--out`` writes a graph_hints document with the hint
+    (``--accept``: status accepted, for ``graph_hints apply IR HINTS OUT --verify``). CPU only."""
+    import argparse
+    import json
+    from pathlib import Path
+
+    from . import graph_hints as gh
+    from .kb_proposals import _all_specs
+    ap = argparse.ArgumentParser(description=main.__doc__)
+    ap.add_argument("ir")
+    ap.add_argument("--profile", help="a kb_plan.profile_ir style JSON ({'ops': [{'name', 'us'}], 'e2e_us', 'launch_us'}) for the cost model")
+    ap.add_argument("--max-waste", type=float, default=None)
+    ap.add_argument("--min-gain-pct", type=float, default=0.0)
+    ap.add_argument("--out")
+    ap.add_argument("--accept", action="store_true")
+    a = ap.parse_args(argv)
+    g = json.loads((Path(a.ir) / "graph.json").read_text())
+    pol = Policy.from_cfg(None)
+    if a.max_waste is not None:
+        pol.max_waste = a.max_waste
+    prof = json.loads(Path(a.profile).read_text()) if a.profile else None
+    hints, report = propose(g, prof, dict(_all_specs()), None, policy=pol, min_gain_pct=a.min_gain_pct, ir=g.get("name"))
+    print(json.dumps({"hints": [{k: h[k] for k in ("id", "pattern", "instances")} | {"source": h["source"][0]} for h in hints], "skipped": report}, indent=1))
+    if a.out:
+        doc = gh.new_doc()
+        for h in hints:
+            h["status"] = "accepted" if a.accept else "proposed"
+        gh.merge(doc, hints)
+        gh.save(doc, Path(a.out))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

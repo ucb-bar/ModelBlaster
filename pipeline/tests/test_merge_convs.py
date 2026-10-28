@@ -383,6 +383,62 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual([x["kind"] for x in prov["applied"]], [mc.KIND])
         self.assertTrue(any(s["id"] == "fuse:c0" for s in prov["skipped"]))
 
+    def test_accepted_hint_applies_wherever_the_pattern_matches_and_proposed_only_to_its_instances(self):
+        o = self.ir(FIRE, "fp16", modules=2)
+        g0 = json.loads((o / "graph.json").read_text())
+        plans, _ = mc.find(g0, pol())
+        self.assertEqual(len(plans), 2)
+        h = mc.propose(g0, None, dict(_all_specs()), None, policy=pol())[0][0]
+        self.assertEqual((len(h["instances"]), h["policy"]["max_waste"]), (2, 2.0))
+        h["instances"] = h["instances"][:1]                                                     # the hint was measured on the first module only
+        gp, _, pp = gh.apply_hints(g0, [h], dict(_all_specs()), statuses=None)                  # proposed: its recorded instance only
+        self.assertEqual(len(pp["applied"]), 1)
+        ga, _, pa = gh.apply_hints(g0, [_accepted(h)], dict(_all_specs()))                      # accepted: every match of the pattern
+        self.assertEqual(len(pa["applied"]), 2, pa)
+        self.assertEqual(sum(x["name"].startswith("merge_") and x["op"].startswith("conv") for x in ga["ops"]), 2)
+        e = write_variant_ir(o, ga, self.tmp / "two_mod")
+        v = gv.verify(o, e, seeds=(0,), tensor_map={k: m for a_ in pa["applied"] for k, m in a_["tensor_map"].items()})
+        self.assertTrue(v.ok, v.summary())
+
+    def test_a_second_ir_extends_the_instances_of_a_known_hint(self):
+        g = _graph(FIRE)
+        hk = mc.MergeHook(go.Config(kb=Path("."), merge_sibling_convs="auto", merge_sibling_max_waste="2", min_gain_pct=0.0))
+        doc = gh.new_doc()
+        prof = lambda n: {"ir": n, "ops": [{"name": "cat", "us": 30.0}], "e2e_us": 100.0}  # noqa: E731
+        hk.propose({"irA": g}, [prof("irA")], doc, dict(_all_specs()))
+        hk.propose({"irB": copy.deepcopy(g)}, [prof("irB")], doc, dict(_all_specs()))
+        self.assertEqual(len(doc["hints"]), 1)
+        self.assertEqual([i["ir"] for i in doc["hints"][0]["instances"]], ["irA"])               # the same ops (same names) are one instance
+        g2 = copy.deepcopy(g)
+        for o_ in g2["ops"]:
+            if o_["name"] == "cat":
+                o_["name"] = "cat_b"
+        hk.propose({"irC": g2}, [prof("irC")], doc, dict(_all_specs()))
+        self.assertEqual(sorted(i["cat"] for i in doc["hints"][0]["instances"]), ["cat", "cat_b"])
+        self.assertEqual(len(doc["hints"][0]["source"]), 3)
+
+    def test_cli_then_graph_hints_apply_verify(self):
+        import subprocess
+        o = self.ir(FIRE, "fp16")
+        hints = self.tmp / "cli_hints.json"
+        r = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.merge_convs", str(o), "--out", str(hints), "--accept"],
+                           capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rep = json.loads(r.stdout)
+        self.assertEqual([h["id"] for h in rep["hints"]], ["merge:conv1x1+conv3x3+relu"])
+        self.assertEqual(json.loads(hints.read_text())["hints"][0]["status"], "accepted")
+        out = self.tmp / "cli_ir"
+        r = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.graph_hints", "apply", str(o), str(hints), str(out), "--verify"],
+                           capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(mc.KIND, r.stdout)
+        g = json.loads((out / "graph.json").read_text())
+        self.assertEqual(len(g["ops"]), 6)
+        r = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.merge_convs", str(o), "--max-waste", "0.1"], capture_output=True, text=True, timeout=300)
+        rep = json.loads(r.stdout)
+        self.assertEqual(rep["hints"], [])
+        self.assertTrue(any("padding waste" in x["why"] for x in rep["skipped"]))
+
     def test_export_of_the_merged_ir(self):
         from modelblaster.pipeline.kb_export import export_problem
         for q in ("fp16", "native", "fp32"):
@@ -486,10 +542,12 @@ class RealSqueezeNetTest(unittest.TestCase):
             vir = write_variant_ir(REAL_SQ, g1, Path(d) / "v")
             v = gv.verify(REAL_SQ, vir, structural_only=True)
             self.assertTrue(v.ok, v.summary())
-            # the single module hint verifies against the unchanged rest
-            h1 = {**_accepted(h), "instances": h["instances"][:1]}
-            g2, _, _ = gh.apply_hints(g0, [h1], dict(_all_specs()))
+            # a hint measured on ONE module: proposed it applies to that instance only; accepted it applies wherever the pattern matches
+            h1 = {**h, "instances": h["instances"][:1]}
+            g2, _, _ = gh.apply_hints(g0, [h1], dict(_all_specs()), statuses=None)
             self.assertEqual(len(g2["ops"]), 65 - 3)
+            g3, _, _ = gh.apply_hints(g0, [_accepted(h1)], dict(_all_specs()))
+            self.assertEqual(len(g3["ops"]), 65 - 8 * 3)
 
 
 TITAN = {"host": None, "label": "0", "index": 0, "uuid": "GPU-titan", "name": "NVIDIA TITAN RTX", "arch": "sm_75"}
