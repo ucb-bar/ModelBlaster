@@ -89,6 +89,10 @@ from pathlib import Path
 FORMAT = "modelblaster.graph_hints/v1"
 CUDA_KINDS = ("fuse", "split_slot", "unfuse", "fold_layout", "fuse_attention", "fuse_siblings", "fuse_region",
               "fuse_view", "rewrite", "merge_sibling_convs")
+# the KernelSpec-per-slot targets: their fuse / split_slot / unfuse rewrites are the same mechanics
+# (``target="opencl"`` applies them as on CUDA), but a hint decided on one target's device applies
+# only there
+SLOT_TARGETS = ("cuda", "opencl")
 NOT_ON_CUDA = {
     "tile_split": "OC/N tiles exist to run one op on several cores at once; a CUDA kernel already spans "
                   "every SM and the driver runs one stream, so tiles would serialise (use split_slot for "
@@ -724,6 +728,11 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
             ordered.insert(max((i for i, x in enumerate(ordered) if x["id"] in after), default=-1) + 1, h)
     added = {}
     for h in ordered:
+        ht = h.get("target", "cuda")
+        if ht in SLOT_TARGETS and ht != target:
+            # decided by measurement on another slot target's device (CUDA vs OpenCL)
+            prov["skipped"].append({"id": h["id"], "why": f"decided for target {ht}, not {target}"})
+            continue
         if h.get("target", "cuda") == "riscv" and h["kind"] == "fuse" and "dispatch_groups" in h:
             try:
                 chains = _xpurt_fuse_to_chains(g, h)
@@ -872,14 +881,14 @@ def verify_rewrite(ir_dir: Path, graph: dict, *, specs: dict | None = None, buil
 
 
 def apply_to_ir(ir_dir: Path, hints_doc: dict, out_dir: Path, specs: dict | None = None,
-                statuses: tuple | None = ("accepted",)) -> tuple[Path, dict, dict]:
+                statuses: tuple | None = ("accepted",), target: str = "cuda") -> tuple[Path, dict, dict]:
     """Apply a hints document to an IR dir; writes the rewritten IR (weights
     and io symlinked) when anything applied. -> (IR dir to use, specs, prov)."""
     from .kb_proposals import _all_specs, write_variant_ir
 
     specs = dict(specs or _all_specs())
     g = json.loads((Path(ir_dir) / "graph.json").read_text())
-    g2, added, prov = apply_hints(g, hints_doc["hints"], specs, statuses=statuses)
+    g2, added, prov = apply_hints(g, hints_doc["hints"], specs, statuses=statuses, target=target)
     specs.update(added)
     if not prov["applied"]:
         return Path(ir_dir), specs, prov
@@ -899,7 +908,7 @@ def main():
     a1.add_argument("hints")
     a1.add_argument("out_ir")
     a1.add_argument("--all", action="store_true", help="apply proposed hints too, not only accepted")
-    a1.add_argument("--target", default="cuda", choices=["cuda", "riscv"])
+    a1.add_argument("--target", default="cuda", choices=["cuda", "opencl", "riscv"])
     a1.add_argument("--verify", action="store_true")
     a1.add_argument("--build", action="store_true")
     a1.add_argument("--arch", default="75")

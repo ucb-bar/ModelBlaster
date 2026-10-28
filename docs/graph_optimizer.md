@@ -507,6 +507,27 @@ the local GPU during the run.
   With `--gpu-model l40s` it profiles on firesim2:2. `kb_ingest --verify` with the same flags
   verifies the final cache on firesim2:2.
 
+## OpenCL (Qualcomm Adreno): `--target opencl`
+
+The same rounds run on the OpenCL target: OpenCL problems, an OpenCL kernel cache, fused-op
+variants with generated OpenCL seeds, and every timed step -- the profiles, the KernelBlaster
+runs, the re-measurements, the verification and the model's result -- on the board through
+KernelBlaster's `AdrenoEvaluator` (`--board-host`, `--remote-dir`; the board's flock held per
+build + run). Details, results and the design decisions are in
+[opencl_adreno.md](opencl_adreno.md), "Graph optimiser on OpenCL". What differs from CUDA here:
+
+- `--target opencl --arch adreno650 --board-host root@rb5 --remote-dir /root/mb` (`--board-lock`,
+  `--board-env NAME=value`); without `--board-host` this host's OpenCL GPU is used;
+  `--mb-evaluator builtin` is refused (ModelBlaster's own runs are CUDA-only);
+- the model-level time is `MB_E2E_US basis=replay` (the forward pass replayed on the driver's warm
+  context and in-order queue, host wall clock), not CUDA graph replay; KernelBlaster's e2e reward
+  uses it as it uses the graph time;
+- cache entries carry `target: opencl`, `.cpp` sources and the device label as arch; hints the flow
+  produces are stamped `target: opencl`, and `apply_hints` applies a hint only on its own slot target;
+- the baseline is the seed model on the board (there is no PyTorch there; `torch_status: skipped`);
+- the GPU model the run is pinned to is the driver's `MB_DEVICE` string;
+- `state.json`'s round key includes the target (CUDA keys are unchanged).
+
 ## Running
 
 ```bash
