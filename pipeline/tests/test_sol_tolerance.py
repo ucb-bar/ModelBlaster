@@ -506,6 +506,20 @@ class ExportTest(unittest.TestCase):
                 self.assertTrue(np.array_equal(a[k], b[k]))
         self.assertFalse((self.ir / st.REF_FILE).exists())                        # SOL's reference only with MB_SOL_REF
 
+    def test_manifest_name_survives_the_reference_loop(self):
+        """The reference loop reused the name `name` and overwrote export_problem's argument: a hint's orig / variant exports got the output
+        op's name ("add") and KernelBlaster refused the pair (`problem names collide`) in 4 of the first 30 B200 pilot problems."""
+        st.STATE.mode_cfg = "accept"
+        np.savez(self.ir / st.REF_FILE, meta=np.array(json.dumps({"device": "cuda", "dtypes": ["float32"]})),
+                 out0=np.full((16, 24), 1.5, np.float32))
+        try:
+            d = self.export(name="hint__orig")
+        finally:
+            os.unlink(self.ir / st.REF_FILE)
+        man = json.loads((d / "manifest.json").read_text())
+        self.assertIn("ref_offset", man["sol"]["outputs"]["add"])                 # the reference branch ran
+        self.assertEqual(man["name"], "hint__orig")
+
     def test_record_and_reference_cli_helpers(self):
         d = self.tmp / "ir_copy"
         shutil.copytree(self.tmp / "ir_plain", d)
