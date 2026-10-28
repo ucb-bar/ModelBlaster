@@ -321,6 +321,13 @@ class Config:
     experiments: str = "off"
     model_context: str = "off"
     view_fusion: str = "off"
+    # region windows (region_windows.py; docs/region_windows.md): off (default; None = $MB_REGION_WINDOWS, else off) | auto. The
+    # knobs are 0 / "" = unset (env, then the defaults: sizes 256, 3 candidates, whole up to 1100 members, >= 4 non-alias ops)
+    region_windows: str | None = None
+    region_window_sizes: str = ""
+    region_window_candidates: int = 0
+    region_window_hard_cap: int = 0
+    region_window_min_ops: int = 0
     # open-ended graph rewrites (graph_rewrite.py; docs/graph_rewrite.md): off (default; None = $MB_GRAPH_REWRITE, else off: nothing
     # runs, the round key and every output are unchanged) | agent (a RewriteProposer is asked for candidate edits each round; each
     # is gated by graph_verify and decided by the paired variant-vs-original timing like any hint). graph_rewrite_proposer: ""
