@@ -496,6 +496,12 @@ def write_variant_ir(ir_dir: Path, graph: dict, out: Path) -> Path:
     (out / "graph.json").write_text(json.dumps(graph, indent=1))
     for f in ("weights.npz", "io.npz"):
         dst = out / f
+        if f == "weights.npz" and graph.get("weight_derivations"):
+            # a graph rewrite with derived weights (weight_derivations.py): the variant's weights.npz holds the base
+            # weights AND the derived ones, rebuilt from the source IR's weights by the recorded derivations
+            from . import weight_derivations as wd
+            wd.write_weights(Path(ir_dir).resolve() / f, graph, dst)
+            continue
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         os.symlink(Path(ir_dir).resolve() / f, dst)
