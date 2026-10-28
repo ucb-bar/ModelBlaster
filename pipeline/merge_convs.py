@@ -570,12 +570,16 @@ def apply_hint(graph: dict, h: dict, specs: dict, prov: dict):
         known = {(i["cat"], tuple(i["convs"])) for i in instances}
         instances += [{"cat": p["cat"], "convs": p["convs"], "acts": p["acts"]} for p in plans
                       if p["pattern"] == h.get("pattern") and (p["cat"], tuple(p["convs"])) not in known]
+    gone = []                                           # recorded instances whose ops are not in this graph at all (another IR's, or already merged)
     for inst in instances:
         ctx = Ctx(g)
         try:
             p = _resolve(ctx, inst)
         except Skip as e:
-            prov["skipped"].append({"id": h["id"], "group": inst.get("convs"), "why": str(e)})
+            if "is not in the graph" in str(e) or "are not in the graph" in str(e):
+                gone.append({"id": h["id"], "group": inst.get("convs"), "why": str(e)})
+            else:
+                prov["skipped"].append({"id": h["id"], "group": inst.get("convs"), "why": str(e)})
             continue
         try:
             info = _apply_one(g, ctx, p, h["id"])
@@ -588,6 +592,10 @@ def apply_hint(graph: dict, h: dict, specs: dict, prov: dict):
         prov.setdefault("added", []).extend(info["added"])
         prov["applied"].append({"id": h["id"], "kind": KIND, "op": info["added"][0], "from": info["removed"], "added": info["added"],
                                 "derived_weights": info["weights"], "waste": p["waste"], "tensor_map": info["tensor_map"]})
+    if gone and (not n_ok or len(gone) <= 3):             # an instance list that spans several IRs would otherwise flood the record
+        prov["skipped"].extend(gone)
+    elif gone:
+        prov["skipped"].append({"id": h["id"], "why": f"{len(gone)} recorded instance(s) are not in this graph (e.g. {gone[0]['why']})"})
     if n_ok:
         try:
             ge.toposort(g)
