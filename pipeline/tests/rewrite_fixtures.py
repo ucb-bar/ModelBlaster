@@ -29,15 +29,15 @@ C, S, E1, E3, H, W = 4, 3, 2, 3, 6, 6
 
 
 def _suffix(quant: str) -> str:
-    return {"fp16": "_f16", "bf16": "_bf16"}.get(quant, "")
+    return {"fp16": "_f16", "native": "_f16", "bf16": "_bf16"}.get(quant, "")      # "native": per-tensor dtypes, all f16 here
 
 
 def _tdt(quant: str) -> str:
-    return {"fp16": "f16", "bf16": "bf16"}.get(quant, "f32")
+    return {"fp16": "f16", "native": "f16", "bf16": "bf16"}.get(quant, "f32")
 
 
 def _wdt(quant: str):
-    return np.float16 if quant == "fp16" else np.float32
+    return np.float16 if quant in ("fp16", "native") else np.float32
 
 
 def conv_op(name, inp, out, w, b, ic, oc, k, quant, hw=(H, W)):
@@ -69,10 +69,13 @@ def fire_graph(quant: str = "fp32", hw=(H, W)) -> dict:
             "bias": "fc.bias", "shape": {"M": 1, "K": E1 + E3, "N": 4}}]
     for i, o in enumerate(ops):
         o["dispatch_id"], o["depends_on"] = i, [i - 1] if i else []
-    return {"name": "fire", "version": 1, "quant": quant, "input": {"tensor": "x"},
-            "output": {"tensors": ["out"], "tensor": "out"},
-            "tensors": {k: {"shape": v, "dtype": t, "quant": None} for k, v in sh.items()}, "ops": ops,
-            "dispatches": list(range(len(ops)))}
+    g = {"name": "fire", "version": 1, "quant": quant, "input": {"tensor": "x"},
+         "output": {"tensors": ["out"], "tensor": "out"},
+         "tensors": {k: {"shape": v, "dtype": t, "quant": None} for k, v in sh.items()}, "ops": ops,
+         "dispatches": list(range(len(ops)))}
+    if quant == "native":                       # --quant native: every float weight names its dtype (docs/tensor_dtypes.md)
+        g["weight_dtypes"] = {k: "f16" for k in ("sq.weight", "sq.bias", "e1.weight", "e1.bias", "e3.weight", "e3.bias", "fc.weight", "fc.bias")}
+    return g
 
 
 def fire_weights(quant: str = "fp32", seed: int = 0, tiny_head: bool = False) -> dict:
@@ -96,7 +99,7 @@ def write_ir(d: Path, graph: dict, weights: dict, golden_in: np.ndarray | None =
     q = graph.get("quant")
     if golden_in is None:
         golden_in = np.random.default_rng(1234).random(nin).astype(np.float32)
-        if q == "fp16":
+        if q in ("fp16", "native"):
             golden_in = golden_in.astype(np.float16).astype(np.float32)
     (d / "graph.json").write_text(json.dumps(graph, indent=1))
     np.savez(d / "weights.npz", **weights)
