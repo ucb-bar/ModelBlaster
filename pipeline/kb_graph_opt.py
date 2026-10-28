@@ -91,7 +91,7 @@ from . import kb_resume
 from . import kb_telemetry as kbt
 from . import kb_trace
 from .kb_export import base_slot_id, export_problem
-from .kb_ingest import CudaCache, cache_plan, ingest, verify_ir
+from .kb_ingest import CudaCache, arch_key, cache_plan, ingest, verify_ir
 from .kb_plan import export_plan, make_plan, profile_ir
 from .kb_proposals import (ACCEPT_GAIN, _all_specs, _median, best_sources, find_chains, remeasure,
                            with_fused_specs, write_variant_ir)
@@ -101,6 +101,13 @@ from .kernel_abi import parse_signature
 @dataclass
 class Config:
     kb: Path
+    # slot target: cuda (default) | opencl (Qualcomm Adreno; docs/opencl_adreno.md, "Graph optimiser"):
+    # OpenCL problems, an OpenCL kernel cache, every timed step on board_host (KernelBlaster's
+    # AdrenoEvaluator, the board's lock per build + run) or, without one, this host's OpenCL GPU
+    target: str = "cuda"
+    board_host: str | None = None
+    board_lock: str | None = None               # None: KernelBlaster's default (~/mb_board.lock)
+    board_env: list = field(default_factory=list)   # NAME=value for every OpenCL run
     model: str = "claude-code:sonnet"
     reflect_model: str | None = None
     plugins: list = field(default_factory=list)
@@ -172,9 +179,10 @@ class Config:
     trace: str = field(default_factory=lambda: os.getenv("KB_TRACE") or "full")
 
 
-_LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices", "kb_args")
+_LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices", "kb_args", "board_env")
 _MANUAL_FIELDS = ("kb", "model", "reflect_model", "python", "ssh_key", "remote_dir", "gpus", "parallel_hints",
-                  "runtime", "gpu_model", "allow_gpu_mismatch", "mb_evaluator", *_LIST_FIELDS)
+                  "runtime", "gpu_model", "allow_gpu_mismatch", "mb_evaluator", "target", "board_host", "board_lock",
+                  *_LIST_FIELDS)
 
 
 def _safe(s: str) -> str:
@@ -318,7 +326,11 @@ def detect_gpus(cfg: Config) -> dict:
     """KernelBlaster's own GPU selection (``resources.select_gpus``: auto =
     the idle GPUs, else the least busy one) for the pool the KernelBlaster
     runs will use -> {"local": [...], "remote": [...]}; on failure, one
-    unpinned local device."""
+    unpinned local device. OpenCL: the one device the runs use (the board, or
+    this host's OpenCL GPU), its model unknown until a run records it."""
+    if cfg.target == "opencl":
+        return {"local": [], "remote": [{"host": cfg.board_host or "localhost", "ident": "opencl", "index": None,
+                                         "name": None}], "why": "opencl: one device"}
     args = {"gpus": cfg.gpus, "ssh_hosts": list(cfg.ssh_hosts), "cvd": list(cfg.cuda_visible_devices),
             "ssh_key": cfg.ssh_key}
     try:
@@ -374,7 +386,19 @@ class KBRunner:
             cmd += ["--export-winners", str(winners)]
         if parallel_problems:
             cmd += ["--parallel-problems", str(parallel_problems)]
-        if c.ssh_hosts:
+        if c.target == "opencl":                    # the board over ssh, or this host's OpenCL GPU
+            cmd += ["--evaluator", "board" if c.board_host else "local"]
+            if c.board_host:
+                cmd += ["--board-host", c.board_host]
+                if c.ssh_key:
+                    cmd += ["--ssh-key", c.ssh_key]
+                if c.remote_dir:
+                    cmd += ["--remote-dir", c.remote_dir]
+                if c.board_lock is not None:
+                    cmd += ["--board-lock", c.board_lock]
+            for kv in c.board_env:
+                cmd += ["--board-env", kv]
+        elif c.ssh_hosts:
             cmd += ["--evaluator", "ssh"]
             for h in c.ssh_hosts:
                 cmd += ["--ssh-host", h]
@@ -386,9 +410,9 @@ class KBRunner:
                 cmd += ["--remote-dir", c.remote_dir]
         elif c.gpus and c.gpus != "auto":
             cmd += ["--gpus", c.gpus]
-        if c.runtime and c.runtime != "auto":
+        if c.runtime and c.runtime != "auto" and c.target == "cuda":
             cmd += ["--runtime", c.runtime]
-        if c.gpu_model:
+        if c.gpu_model and c.target == "cuda":
             cmd += ["--gpu-model", c.gpu_model]
         for p in c.plugins:
             cmd += ["--plugin", str(p)]
@@ -582,7 +606,8 @@ def _ingest_slots(cache: CudaCache, problem: Path, result: dict, slots: list[str
             spec = spec_from_kind(s["op"], specs)
         entry, _ = parse_signature(spec.signature)
         sr = result.get("slots", {}).get(s["id"], {})
-        e, st = cache.add(op=s["op"], entry=entry, signature=spec.signature, arch=f"sm_{man_arch(result)}",
+        e, st = cache.add(op=s["op"], entry=entry, signature=spec.signature,
+                          arch=arch_key(man_arch(result), cache.target),
                           shapes=[i["shape"] for i in s["instances"]], code=best[s["id"]],
                           slot_us=sr.get("best_us") or sr.get("final_us") or 0.0,
                           speedup=(sr["baseline_us"] / sr["best_us"]) if sr.get("baseline_us") and sr.get("best_us") else None,
@@ -602,7 +627,7 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     is set when there is nothing to run (the hint does not occur / apply)."""
     base_graph = json.loads((Path(prof["ir_dir"]) / "graph.json").read_text())
     specs = with_fused_specs(base_graph, specs)
-    base = cache_plan(base_graph, cache, f"sm_{cfg.arch}", specs)
+    base = cache_plan(base_graph, cache, arch_key(cfg.arch, cfg.target), specs)
     g0 = base["graph"]
     names = _scope_ops(h, g0, specs)
     job = {"hint": h, "specs": specs, "names": names,
@@ -614,11 +639,11 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     if h["kind"] == "fuse":                             # scope the variant to this IR's instances
         hh["chains"] = [c for c in (h.get("chains") or [])
                         if all(a in {x for n in names for x in gh.atoms(n)} for a in c)] or None
-    vg, _, prov = gh.apply_hints(g0, [hh], specs, statuses=None)
+    vg, _, prov = gh.apply_hints(g0, [hh], specs, statuses=None, target=cfg.target)
     if not prov["applied"]:
         job["early"] = "; ".join(s["why"] for s in prov["skipped"])[:500]
         return job
-    vplan = cache_plan(vg, cache, f"sm_{cfg.arch}", specs, split=False)
+    vplan = cache_plan(vg, cache, arch_key(cfg.arch, cfg.target), specs, split=False)
     out.mkdir(parents=True, exist_ok=True)
     src_ir = Path(prof["source_ir"])
     oir = write_variant_ir(src_ir, g0, out / "orig_ir")
@@ -631,10 +656,10 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     tags = {**base["tags"], **vplan["tags"]}
     job["orig"] = export_problem(oir, out / "orig", op_indices=oidx, specs=specs, name=stem + "__orig",
                                  strategy="hint-original", slot_sources=base["sources"],
-                                 slot_source_tags=base["tags"], sub_sources=base["sub_sources"])
+                                 slot_source_tags=base["tags"], sub_sources=base["sub_sources"], target=cfg.target)
     job["variant"] = export_problem(vir, out / "variant", op_indices=vidx, specs=specs, name=stem + "__variant",
                                     strategy="hint-variant", slot_sources=seeds, slot_source_tags=tags,
-                                    sub_sources=vplan["sub_sources"])
+                                    sub_sources=vplan["sub_sources"], target=cfg.target)
     job["stem"], job["prov"] = stem, prov
     return job
 
@@ -645,6 +670,11 @@ def kb_eval_for(cfg: Config):
     None when the checkout has no ``scripts/time_problems.py`` (an older pin)."""
     from .kb_eval import KBEval
 
+    if cfg.target == "opencl":                      # the board (one device), or this host's OpenCL GPU
+        ev = KBEval(evaluator="board" if cfg.board_host else "local", kb=Path(cfg.kb), python=cfg.python,
+                    ssh_key=cfg.ssh_key, remote_dir=cfg.remote_dir, board_host=cfg.board_host,
+                    board_lock=cfg.board_lock, board_env=list(cfg.board_env))
+        return ev if ev.available() else None
     ev = KBEval(evaluator="ssh" if cfg.ssh_hosts else "local", kb=Path(cfg.kb), python=cfg.python, gpus=cfg.gpus,
                 ssh_hosts=list(cfg.ssh_hosts), cuda_visible_devices=list(cfg.cuda_visible_devices),
                 ssh_key=cfg.ssh_key, remote_dir=cfg.remote_dir, runtime=cfg.runtime)
@@ -656,6 +686,11 @@ def use_kb_eval(cfg: Config) -> bool:
     KernelBlaster's evaluator (``cfg.mb_evaluator``)?"""
     if cfg.mb_evaluator not in ("auto", "kb", "builtin"):
         raise ValueError(f"mb_evaluator must be auto|kb|builtin, not {cfg.mb_evaluator!r}")
+    if cfg.target == "opencl":                      # ModelBlaster's builtin runs are CUDA-only
+        if cfg.mb_evaluator == "builtin":
+            raise ValueError("--target opencl: the profiles, the verification and the re-measurement run through "
+                             "KernelBlaster's evaluator (--mb-evaluator auto|kb), not builtin")
+        return True
     return cfg.mb_evaluator == "kb" or (cfg.mb_evaluator == "auto" and bool(cfg.ssh_hosts))
 
 
@@ -982,6 +1017,16 @@ def decide_hints(cands: list[tuple[dict, dict]], graphs: dict, out: Path, width:
     return [[cands[i][0]["id"] for i in w] for w in waves], [decided[i] for i in sorted(decided)]
 
 
+def _targeted(hints: list[dict], cfg: Config) -> list[dict]:
+    """New hints of this flow are decided on its target's device: stamped with ``cfg.target``
+    (the proposers write ``cuda``; the rewrites are the same, a decision is per target)."""
+    if cfg.target != "cuda":
+        for h in hints:
+            if h.get("target", "cuda") == "cuda":
+                h["target"] = cfg.target
+    return hints
+
+
 # ---------------------------------------------------------------- rounds
 
 def run(irs: list[Path], work: Path, cfg: Config) -> dict:
@@ -1064,17 +1109,19 @@ def _restrict_leases(leases: GpuLeases, model: str | None, allow: bool) -> None:
 
 def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hints_path, state_path = work / "graph_hints.json", work / "state.json"
-    doc, cache = gh.load(hints_path), CudaCache(work / "cache")
+    doc, cache = gh.load(hints_path), CudaCache(work / "cache", target=cfg.target)
     state = json.loads(state_path.read_text()) if state_path.exists() else {"sent": [], "rounds": []}
     hw = FlowHardware(cfg, state)
     cfg = hw.pin(cfg)
     kb = KBRunner(cfg, work / "knowledge")
     specs = dict(_all_specs())
     gpus = detect_gpus(cfg)
-    n_gpus = len(gpus["remote"]) if cfg.ssh_hosts else len(gpus["local"])
+    remote = bool(cfg.ssh_hosts) or cfg.target == "opencl"
+    n_gpus = len(gpus["remote"]) if remote else len(gpus["local"])
     width = cfg.parallel_hints or auto_parallel_hints(n_gpus)
     # MB's own timed runs (re-measurement) lease from the KernelBlaster runs' pool: remote with --ssh-host
-    leases = GpuLeases(gpus["remote"] if cfg.ssh_hosts else gpus["local"])
+    # (OpenCL: the one board, whose lock KernelBlaster's evaluator takes per run)
+    leases = GpuLeases(gpus["remote"] if remote else gpus["local"])
     _restrict_leases(leases, hw.model, hw.allow)
     # the profiles and the final verification: KernelBlaster's evaluator with --ssh-host / --mb-evaluator kb
     mbev = mb_kb_eval(cfg)
@@ -1111,7 +1158,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             p = saved[i] if saved else profile_ir(
                 Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
                 specs=specs, runs=cfg.profile_runs, kbeval=mbev, gpu_model=hw.model,
-                allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch, target=cfg.target)
             had = hw.model
             hw.check("profile", p.get("device"), f"r{r:02d}/{p['ir']}")
             if hw.model != had:                          # the first profile fixed the flow's model
@@ -1133,9 +1180,9 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         graphs = {}
         for p in profiles:                                  # MB's own proposals
             g = graphs[p["ir"]] = json.loads((Path(p["ir_dir"]) / "graph.json").read_text())
-            gh.merge(doc, gh.propose_from_profile(g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs,
-                                                   doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"],
-                                                   launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
+            gh.merge(doc, _targeted(gh.propose_from_profile(
+                g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs, doc=doc, min_gain_pct=cfg.min_gain_pct,
+                ir=p["ir"], launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")), cfg))
         T.lap("mb.plan")
         plan = prog.once("plan", lambda: make_plan(profiles, coverage=cfg.coverage, top_k=cfg.top_k,
                                                    min_share=cfg.min_share, exclude=set(state["sent"])))
@@ -1146,7 +1193,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             T.lap("mb.export")
             dirs = [Path(x) for x in prog.once("export", lambda: [str(x) for x in export_plan(
                 plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
-                names={p["ir"]: f"{p['ir']}__r{r:02d}" for p in plan["problems"]})])]
+                names={p["ir"]: f"{p['ir']}__r{r:02d}" for p in plan["problems"]}, target=cfg.target)])]
             T.lap("mb.kb_wait", kind="plan")
             results = kb.run(dirs, R / "run", winners=R / "winners")
             T.lap("mb.ingest")
@@ -1159,7 +1206,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                 pf = Path(x["_dir"]) / "proposals.json"
                 if pf.exists():
                     props = json.loads(pf.read_text())
-                    for h in gh.from_kb_proposals(props, specs=specs):
+                    for h in _targeted(gh.from_kb_proposals(props, specs=specs), cfg):
                         for s in h["source"]:
                             s["ir"] = json.loads((Path(props["problem_dir"]) / "manifest.json").read_text())["ir_name"]
                         gh.merge(doc, [h])
@@ -1168,7 +1215,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         kb_resume.STOP.check()
 
         def _cands():
-            todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
+            todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == cfg.target
                     and h["kind"] in ("fuse", "split_slot") and _est_gain(h) >= cfg.min_gain_pct]
             todo.sort(key=lambda h: -_est_gain(h))          # stable: ties keep the hints file's order
             return {"n_todo": len(todo), "cands": [(h["id"], p["ir"]) for h in todo[:cfg.max_variants]
@@ -1238,7 +1285,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                 models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
                                                      hints=hints_path, arch=cfg.arch, specs=specs, kbeval=kbeval,
                                                      gpu_model=cfg.gpu_model, recorded=kb.gpus,
-                                                     allow_gpu_mismatch=cfg.allow_gpu_mismatch,
+                                                     allow_gpu_mismatch=cfg.allow_gpu_mismatch, target=cfg.target,
                                                      torch_baseline=cfg.torch_baseline,
                                                      torch_opts={"python": cfg.torch_python or None,
                                                                  "source": cfg.torch_source or None,
@@ -1318,6 +1365,14 @@ def main():
                          "KernelBlaster's evaluator on the runs' pool (local --gpus or the --ssh-host GPUs); builtin "
                          "= built and run here (default GPU / a leased local GPU); auto (default): kb with "
                          "--ssh-host, else builtin")
+    ap.add_argument("--target", choices=["cuda", "opencl"], default="cuda",
+                    help="slot target: cuda (default) | opencl (Qualcomm Adreno: --board-host, --arch adreno650)")
+    ap.add_argument("--board-host", help="--target opencl: user@board; every timed step builds and runs there "
+                                         "(without it: this host's OpenCL GPU)")
+    ap.add_argument("--board-lock", help="--target opencl: flock file on the board held per build + run "
+                                         "(default: KernelBlaster's, ~/mb_board.lock; off: none)")
+    ap.add_argument("--board-env", action="append", default=[],
+                    help="--target opencl: NAME=value for every OpenCL run (repeatable)")
     ap.add_argument("--kb-arg", action="append", default=[],
                     help="extra run_multislot argument, verbatim (repeatable; use --kb-arg=--flag for dashes)")
     for k, v in asdict(Config(kb=Path("."))).items():
@@ -1331,8 +1386,16 @@ def main():
                  parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
                  cuda_visible_devices=a.cuda_visible_devices, ssh_key=a.ssh_key, remote_dir=a.remote_dir,
                  runtime=a.runtime, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
-                 mb_evaluator=a.mb_evaluator, kb_args=a.kb_arg,
+                 mb_evaluator=a.mb_evaluator, kb_args=a.kb_arg, target=a.target, board_host=a.board_host,
+                 board_lock=a.board_lock, board_env=a.board_env,
                  **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in _MANUAL_FIELDS})
+    if cfg.target == "opencl" and cfg.board_host and not cfg.remote_dir:
+        ap.error("--target opencl --board-host: give --remote-dir (a writable dir on the board for data.bin "
+                 "and the binaries; not a small tmpfs)")
+    if cfg.target == "opencl" and cfg.arch.isdigit():
+        if a.arch != "75":
+            ap.error("--target opencl: --arch is the OpenCL device label (e.g. adreno650), not an SM number")
+        cfg.arch = "adreno650"                    # KernelBlaster's OpenCL default device
     try:
         print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
     except kb_resume.Interrupted as e:
