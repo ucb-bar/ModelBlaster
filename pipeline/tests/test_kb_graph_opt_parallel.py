@@ -257,6 +257,39 @@ class DecideParallelTest(unittest.TestCase):
             self.assertTrue(tags["conv2d"].startswith("cache:"), tags)
         self.assertEqual(json.loads((wp / "graph_hints.json").read_text())["hints"], doc_p["hints"])
 
+    def test_failed_wave_leaves_hints_undecided_instead_of_aborting(self):
+        """A wave's KernelBlaster run that exits non-zero (the B200 pilot: `problem names collide`) used to raise and kill the whole problem;
+        now its hints stay undecided (proposed) and the round goes on."""
+        from modelblaster.pipeline.kb_ingest import CudaCache
+
+        class BrokenKB(FakeKB):
+            def start(self, problems, out, **kw):
+                out.mkdir(parents=True, exist_ok=True)
+                self.runs.append([go.problem_name(Path(p)) for p in problems])
+                return _FakeProc(threading.Thread(target=lambda: None))
+
+            def collect(self, problems, out, proc):
+                raise RuntimeError("KernelBlaster failed (1); see wave.log")
+
+        work = self.tmp / "broken"
+        cfg = go.Config(kb=Path("."), arch="75", remeasure=3, accept_gain=0.0, parallel_hints=8)
+        kb = BrokenKB(cfg, work / "knowledge")
+        cache, doc = CudaCache(work / "cache"), gh.new_doc()
+        hs = hints_for(self.ir)
+        gh.merge(doc, hs)
+        prof = {"ir": self.ir, "ir_dir": str(self.tmp / "ir"), "source_ir": str(self.tmp / "ir")}
+        orig = go.remeasure
+        go.remeasure = fake_remeasure
+        try:
+            waves, decisions = go.decide_hints([(h, prof) for h in hs], {self.ir: self.graph}, work / "variants", 8, kb=kb, cache=cache,
+                                               doc=doc, cfg=cfg, specs=self._specs(), leases=go.GpuLeases([]),
+                                               hints_path=work / "graph_hints.json")
+        finally:
+            go.remeasure = orig
+        self.assertEqual(len(decisions), len(hs))
+        self.assertTrue(all(d["status"] == "undecided" and d["hint_status"] == "proposed" for d in decisions), decisions)
+        self.assertTrue(all(h["status"] == "proposed" for h in doc["hints"]))
+
 
 class LockTest(unittest.TestCase):
     def setUp(self):
