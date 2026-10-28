@@ -642,24 +642,11 @@ def _cmp(a: np.ndarray, ref: np.ndarray, rel: float, abs_: float, cond: float = 
 
 def _sol_check(out, ref, tol: dict) -> dict:
     """SOL's rule (docs/sol_execbench.md): |out - ref| <= max_atol + max_rtol * |ref| on >= required_matched_ratio of elements,
-    no inf / NaN (unless both are -inf and allowed), an all-zero output against a non-zero reference fails, max_error_cap."""
-    o, r = np.asarray(out, np.float64).reshape(-1), np.asarray(ref, np.float64).reshape(-1)
-    if o.shape != r.shape:
-        return {"ok": False, "why": f"shape {o.shape} != {r.shape}"}
-    neg_inf = np.isneginf(o) & np.isneginf(r) if tol.get("allow_negative_inf") else np.zeros(o.shape, bool)
-    bad_fin = (~np.isfinite(o) | ~np.isfinite(r)) & ~neg_inf
-    with np.errstate(invalid="ignore"):
-        err = np.abs(o - r)
-        match = (err <= tol.get("max_atol", 1e-2) + tol.get("max_rtol", 1e-2) * np.abs(r)) | neg_inf
-    ratio = float(match.mean()) if match.size else 1.0
-    ok = ratio >= tol.get("required_matched_ratio", 0.99) and not bad_fin.any()
-    if np.all(o == 0) and np.any(r != 0):
-        ok = False
-    cap = tol.get("max_error_cap")
-    maxe = float(np.nanmax(np.where(bad_fin, 0, err))) if err.size else 0.0
-    if cap is not None and maxe > cap:
-        ok = False
-    return {"ok": bool(ok), "matched_ratio": ratio, "max_abs_err": maxe}
+    no inf / NaN (unless both are -inf and allowed), an all-zero output against a non-zero reference fails, max_error_cap.
+    The one implementation of it (sol_tolerance.sol_compare, also the flow's gate and the CLI): {"ok", "matched_ratio",
+    "max_abs_err", ...}."""
+    from .sol_tolerance import sol_compare
+    return sol_compare(out, ref, tol)
 
 
 def _device(device: str) -> str:
