@@ -7,6 +7,11 @@ walk_cuda.py diffs against.
 An `_f16` op runs its fp32 rule and rounds every output to fp16 (and the
 recurrent state of lstm_seq/gru_seq every step): the fp16 contract is fp16
 storage with fp32 math, so this is the value an exact fp16 kernel stores.
+A `_bf16` op does the same with bfloat16 (docs/bf16_cuda.md). A mixed IR
+(`--quant native`, docs/tensor_dtypes.md) is walked op by op the same way:
+each op rounds to its own kind's dtype, and its `cast_<src>_to_<dst>` ops
+convert (one rounding to a float dtype, truncation to an integer one). Every
+value is held as float32 (integers exact below 2^24).
 
     python walk_torch.py IR_DIR [IR_DIR ...] [--json out.json] [--device cpu]
 """
@@ -19,7 +24,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from mbir import IR, compare, load_ir, strict_fp32
+from mbir import IR, compare, cuda_dtypes, load_ir, strict_fp32
 
 
 def _round_f16(t):
@@ -27,8 +32,25 @@ def _round_f16(t):
     return t.half().to(t.dtype) if t.is_floating_point() else t
 
 
+def _round_bf16(t):
+    """The bfloat16 value a bf16 kernel stores for an fp32 result (RNE)."""
+    return t.to(torch.bfloat16).to(t.dtype) if t.is_floating_point() else t
+
+
+def _identity(t):
+    return t
+
+
+def _store_rounding(kind: str):
+    """What a kernel of this kind stores for an fp32 result: fp16 / bf16 rounding
+    for `_f16` / `_bf16` kinds, else the value itself."""
+    if kind.endswith("_bf16"):
+        return _round_bf16
+    return _round_f16 if kind.endswith("_f16") else _identity
+
+
 def _state_rounding(op):
-    return _round_f16 if op["op"].endswith("_f16") else (lambda t: t)
+    return _store_rounding(op["op"])
 
 
 def _unary(fn):
@@ -451,14 +473,35 @@ def _attention(ir, op, ins, dev):
 
 
 OPS["attention"] = _attention
+def _cast_rule(dst: str):
+    """`cast_<src>_to_<dst>`: the value as float32 (an f16 / bf16 destination is
+    rounded by _store_rounding, as every op of that kind); integer destinations
+    truncate toward zero, bool is `!= 0`."""
+    def val(x):                    # a float keeps its dtype (float64 in the exact walk)
+        return x if x.is_floating_point() else x.float()
+    if dst == "b8":
+        return lambda ir, op, ins, dev: [(val(ins[0]) != 0).float()]
+    if dst in ("i64", "i32", "u8"):
+        return lambda ir, op, ins, dev: [torch.trunc(val(ins[0]))]
+    return lambda ir, op, ins, dev: [val(ins[0])]
+
+
+OPS.update({cuda_dtypes.cast_kind(a, b): _cast_rule(b) for a, b in cuda_dtypes.CASTS})
+
+
 # precision-policy casts (pipeline/precision_casts.py): values pass through; cast_f32_to_f16 ends in _f16, so the
 # walk rounds its output to fp16 like any fp16 op
 OPS["cast_f16_to_f32"] = lambda ir, op, ins, dev: [ins[0].reshape(-1).clone()]
 OPS["cast_f32_to_f16"] = lambda ir, op, ins, dev: [ins[0].reshape(-1).clone()]
 
 def _rule(kind: str):
-    """An `_f16` kind runs its fp32 rule (walk rounds the outputs)."""
-    return OPS.get(kind) or (OPS.get(kind[:-4]) if kind.endswith("_f16") else None)
+    """An `_f16` / `_bf16` kind runs its fp32 rule (walk rounds the outputs)."""
+    if kind in OPS:
+        return OPS[kind]
+    for sfx in ("_bf16", "_f16"):
+        if kind.endswith(sfx):
+            return OPS.get(kind[:-len(sfx)])
+    return None
 
 
 # ---- Level1-only ops (losses, norms, index ops); semantics as their KernelSpecs
@@ -511,10 +554,47 @@ OPS.update({
 })
 
 
-def walk(ir: IR, dev="cuda", keep_all=False):
-    """Returns (output_flat, env) — env maps every IR tensor to its value."""
+class _Cast:
+    """``ir`` with every float input / constant / weight cast to ``dtype`` (the exact-math walk)."""
+
+    def __init__(self, ir: IR, dtype):
+        self._ir, self._dt = ir, dtype
+
+    def __getattr__(self, k):
+        return getattr(self._ir, k)
+
+    def _c(self, t):
+        return t.to(self._dt) if t is not None and t.is_floating_point() else t
+
+    def input_tensors(self, device):
+        return {k: self._c(v) for k, v in self._ir.input_tensors(device).items()}
+
+    def const_tensors(self, device, **kw):
+        return {k: self._c(v) for k, v in self._ir.const_tensors(device, **kw).items()}
+
+    def weight(self, key, device):
+        return self._c(self._ir.weight(key, device))
+
+
+def walk(ir: IR, dev="cuda", keep_all=False, *, dtype=None, store_rounding=True, keep=None):
+    """Returns (output_flat, env) — env maps every IR tensor to its value.
+
+    ``dtype`` (e.g. torch.float64) runs the math in that dtype: float inputs,
+    constants, weights and every op's float outputs are cast to it;
+    ``store_rounding=False`` drops the `_f16` / `_bf16` store rounding (with
+    float64: the exact value the reference approximates). ``keep``: a set of
+    tensor names -- every other tensor leaves env after its last use (the
+    graph outputs are always kept), so the walk holds only its live set."""
+    if dtype is not None:
+        ir = _Cast(ir, dtype)
     env = ir.input_tensors(dev)
     env.update(ir.const_tensors(dev))
+    if keep is not None:
+        keep = set(keep) | set(ir.output_names())
+        last = {}
+        for k, op in enumerate(ir.ops):
+            for t in op["inputs"]:
+                last[t] = k
     def run_op(op):
         if "sub_ops" in op:                    # fused op (kb_proposals): its parts in order
             for sub in op["sub_ops"]:
@@ -524,15 +604,25 @@ def walk(ir: IR, dev="cuda", keep_all=False):
         if fn is None:
             raise NotImplementedError(op["op"])
         outs = fn(ir, op, [env[t] for t in op["inputs"]], dev)
-        if op["op"].endswith("_f16"):
-            outs = [_round_f16(v) for v in outs]
+        rnd = _store_rounding(op["op"]) if store_rounding else _identity
+        if rnd is not _identity:
+            outs = [rnd(v) for v in outs]
+        if dtype is not None:
+            outs = [v.to(dtype) if v.is_floating_point() else v for v in outs]
         for name, val in zip(op["outputs"], outs):
             env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
 
     try:
-        for op in ir.ops:
+        for k, op in enumerate(ir.ops):
             run_op(op)
-        out = torch.cat([env[t].reshape(-1) for t in ir.output_names()])
+            if keep is not None:
+                for t in [*op["inputs"], *op["outputs"], *op.get("internal", []),
+                          *(t for s in op.get("sub_ops", []) for t in s["outputs"])]:
+                    if t not in keep and last.get(t, -1) <= k:
+                        env.pop(t, None)
+        # integer outputs (a mixed IR's i64 io) as float; floats keep their dtype (float64 walk)
+        out = torch.cat([env[t].reshape(-1) if env[t].is_floating_point() else env[t].reshape(-1).float()
+                         for t in ir.output_names()])
     finally:
         run_op = None      # break the closure<->cell reference cycle (run_op calls itself): it pins `env`
     return out, env

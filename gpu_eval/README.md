@@ -28,7 +28,10 @@ problem.
 | `extract_many.sh` | `extract_graph` over many KernelBench-style files in parallel |
 | `host_verify.sh`, `host_verify_all.sh` | builds an IR's C model for x86 (`harness_linux`) and runs the verify |
 | `dump_specs.py` | writes `specs.json` (kernel signatures + reference C) for the harness |
-| `sol_adapt.py` | adapts SOL-ExecBench problems: fp32, input dims shrunk toward a memory target |
+| `sol_upstream.py` | converts SOL-ExecBench problems from the original repo (definition.json + workload.jsonl) to bench files at native workload shapes ([docs/sol_execbench.md](../docs/sol_execbench.md)) |
+| `sol_upstream_gates.py` | the SOL port's gates: extract, shapes, CPU walk vs MB golden and vs SOL's reference + tolerance, CUDA walk and multi-slot export (memory-capped; GPU gates on an ssh host) |
+| `sol_kb_map.py` | maps the SOL problems to KernelBlaster's earlier `sol-level1/2` port and its results |
+| `sol_adapt.py` | the earlier SOL port (KernelBlaster's copy): fp32, input dims shrunk toward a memory target |
 | `sol_survey.py`, `sol_aten_census.py` | which problems trace, and which aten ops they use |
 | `sol_gates.py`, `level3_table.py`, `sol_walk_summary.py` | per-problem gate tables from the run outputs |
 | `fp64_tiebreak.py` | for an IR that misses the fp32 bound: walks it in fp64 to tell a wrong IR from an ill-conditioned problem |

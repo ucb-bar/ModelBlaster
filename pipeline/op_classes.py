@@ -5,7 +5,7 @@ class (a tiled-GEMM trick learned on `linear` applies to `bmm`), so every op
 an exported problem contains is tagged with one class. Unknown ops are
 "other"; the int8/fp16 variants take their base op's class, and a fused op
 (``fused__<k0>__...``) its first stage's -- the producer whose kernel the
-epilogue joins.
+epilogue joins. The dtype casts of a mixed IR are elementwise.
 
 Recurrent class (A2, opt-in): with ``$MB_RECURRENT_CLASS=1`` (``kb_graph_opt --recurrent-class on``) the sequence
 recurrences (``gru_seq``, ``lstm_seq``, ``lstm``) are class ``recurrent`` instead of ``gemm``: KernelBlaster then
@@ -51,6 +51,9 @@ _CLASS = {
     "scan": ["cumsum", "cumprod", "exclusive_cumsum"],
 }
 _BY_OP = {op: c for c, ops in _CLASS.items() for op in ops}
+# the per-tensor dtype casts of a mixed IR (cast_<src>_to_<dst>, docs/tensor_dtypes.md)
+_CAST_DTYPES = ("f32", "f16", "bf16", "i64", "i32", "b8", "u8")
+_BY_OP.update({f"cast_{a}_to_{b}": "elementwise" for a in _CAST_DTYPES for b in _CAST_DTYPES if a != b})
 
 
 def op_class(op: str, recurrent=None) -> str:
@@ -69,7 +72,7 @@ def _base_kind(op: str) -> str:
     if op.startswith("fused__"):
         parts = op.split("__")
         op = parts[2] if parts[1] == "par" and len(parts) > 2 else parts[1]
-    for suffix in ("_f16", "_s8_pc", "_s8", "_i8"):
+    for suffix in ("_bf16", "_f16", "_s8_pc", "_s8", "_i8"):
         if op.endswith(suffix) and op not in _BY_OP:
             op = op[: -len(suffix)]
     return op

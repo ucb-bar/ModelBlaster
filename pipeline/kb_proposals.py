@@ -115,8 +115,9 @@ class FusedKernelSpec(KernelSpec):
             calls.append(f"    {callee}({', '.join(args)});")
         if self.parallel and len(calls) > 1:
             calls = _par_calls(calls)
-        # the stage sources (hand kernels, cached winners) spell fp16 `__half`; a raw `_Float16` wrapper would not
-        # bind to their parameters (two distinct, non-convertible C++ types)
+        # the entry is CUDA: `_Float16` / `__bf16` pointers are spelled `__half` / `__nv_bfloat16`, as the stage
+        # kernels it calls (hand kernels, cached winners; a raw `_Float16` wrapper would not bind to their
+        # parameters: two distinct, non-convertible C++ types; the manifest's slot signature is the same spelling)
         from .cuda_dtypes import cuda_signature
         entry, params = parse_signature(cuda_signature(self.signature))
         scratch = ", ".join(f"`{stage_prefix(i)}{o}`" for i, o in enumerate(outs[:-1]))
@@ -313,6 +314,13 @@ def fuse_pair(graph: dict, a_name: str, b_name: str, specs: dict) -> tuple[dict,
     sa, sb = stages_of(A), stages_of(B)
     if t not in sb[0]["inputs"]:
         raise ValueError(f"{t}: read by a later stage of {b_name}, not a chain")
+    # one storage dtype per fused kernel (a mixed IR's ops differ; its casts stay apart):
+    # the seed calls its stages from one hand-kernel library
+    from .cuda_dtypes import op_dtype, parse_cast
+    if any(parse_cast(s["op"]) for s in sa + sb):
+        raise ValueError(f"{a_name}->{b_name}: a dtype cast is not fused")
+    if len({op_dtype(s["op"]) for s in sa + sb}) > 1:
+        raise ValueError(f"{a_name}->{b_name}: stages of different storage dtypes")
     stages = [copy.deepcopy(s) for s in sa + sb]
     internal = A.get("internal", []) + [t] + B.get("internal", [])
     tps = [_t_param(stages[i + 1], internal[i], specs) for i in range(len(stages) - 1)]

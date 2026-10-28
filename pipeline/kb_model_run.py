@@ -118,7 +118,8 @@ def cache_from_runs(runs: list[Path], cache, specs: dict, arch: str) -> list[dic
             e, st = cache.add(op=s["op"], entry=entry, signature=spec.signature, arch=f"sm_{arch}",
                               shapes=[i.get("shape", {}) for i in s.get("instances", [])], code=code, slot_us=us,
                               speedup=(base / us) if base and us else None,
-                              impl_id=sr.get("impl_id") or f"{res.get('run_id')}:{s['id']}", dtype=man.get("dtype"),
+                              impl_id=sr.get("impl_id") or f"{res.get('run_id')}:{s['id']}",
+                              dtype=s.get("dtype") or man.get("dtype"),   # a mixed problem: the slot's
                               source={"run_id": res.get("run_id"), "problem_id": res.get("problem"),
                                       "techniques": sr.get("techniques", []),
                                       **({"gpu": res["gpu"]} if res.get("gpu") else {})})

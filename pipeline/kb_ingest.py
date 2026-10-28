@@ -83,7 +83,8 @@ class CudaCache:
         (self.root / "src" / f"{sha}.cu").write_text(code)
         guard = sorted({_shape_key(s) for s in shapes})
         new = {"op": op, "entry": entry, "signature_sha": signature_sha(cuda_signature(signature)),
-               "dtype": dtype or op_dtype(op), "arch": arch,
+               # a slot's own storage dtype (never a mixed problem's "mixed": the op's then)
+               "dtype": dtype if dtype in ("fp32", "fp16", "bf16") else op_dtype(op), "arch": arch,
                "shape_guard": guard, "slot_us": slot_us, "speedup": speedup, "impl_id": impl_id,
                "file": f"src/{sha}.cu", "source": source, "model_verified": [], "rejected": []}
         key = (new["op"], new["signature_sha"], new["dtype"], new["arch"], guard)
