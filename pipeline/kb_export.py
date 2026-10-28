@@ -2077,6 +2077,16 @@ def arch_flag(arch) -> str:
     which wgmma and tcgen05 need."""
     a = str(arch).removeprefix("sm_").rstrip("af")
     return f"sm_{a}a" if a in ("90", "100") else f"sm_{a}"
+
+
+def arch_opt(arch) -> str:
+    """The one nvcc argument selecting the target. Blackwell (sm_100): ``-gencode=arch=compute_100a,code=sm_100a``, because with
+    nvcc 13.3 ``-arch=sm_100a`` (and sm_100f, compute_100a) drops the suffix and ptxas then rejects tcgen05 PTX ("not supported on
+    .target sm_100"; verified on a B200 host, l3_farm/b200_seed). Every other target keeps ``-arch=<arch_flag>``."""
+    a = str(arch).removeprefix("sm_").rstrip("af")
+    return "-gencode=arch=compute_100a,code=sm_100a" if a == "100" else f"-arch={arch_flag(arch)}"
+
+
 PTDS_FLAGS = ["--default-stream", "per-thread"]
 
 
@@ -2194,7 +2204,7 @@ def _build_and_run_process(problem_dir, *, arch, sources, work, nvcc, timeout, r
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
     exe = work / "problem"
-    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *(PTDS_FLAGS if graph else [])]
+    flags = [*NVCC_FLAGS, arch_opt(arch), *(PTDS_FLAGS if graph else [])]
     if not build_units(problem_dir, exe, sources=sources, work=work, flags=flags, nvcc=nvcc, timeout=timeout,
                        driver_flags=cupti_flags(nvcc)):
         # the assembled TU: what a slot the per-slot split cannot express still builds as (and the errors)
@@ -2249,7 +2259,7 @@ def build_host(problem_dir, *, arch: str = "75", work: Path | None = None, nvcc:
     work = Path(work or problem_dir / "build")
     work.mkdir(parents=True, exist_ok=True)
     exe = work / "host"
-    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *HOST_FLAGS, *cupti_flags(nvcc)]
+    flags = [*NVCC_FLAGS, arch_opt(arch), *HOST_FLAGS, *cupti_flags(nvcc)]
     drv = problem_dir / "driver.cpp"
     # the shared build cache (KERNELBLASTER_BUILD_CACHE, off by default): same driver text / flags / data / toolchain
     rc, log = _cached_nvcc("nvcc-host", nvcc, flags, drv.read_text(), exe, ".host",
@@ -2265,13 +2275,13 @@ def build_so(problem_dir, *, arch: str = "75", sources: dict[str, str] | None = 
     work.mkdir(parents=True, exist_ok=True)
     so = work / name
     if build_units(problem_dir, so, sources=sources, work=work / (Path(name).stem + "_units"),
-                   flags=[*NVCC_FLAGS, f"-arch={arch_flag(arch)}", "-Xcompiler", "-fPIC", *PTDS_FLAGS],
+                   flags=[*NVCC_FLAGS, arch_opt(arch), "-Xcompiler", "-fPIC", *PTDS_FLAGS],
                    link_flags=["-shared"], nvcc=nvcc, timeout=timeout):
         return so, ""
     cu = work / (Path(name).stem + ".cu")
     tu = assemble(problem_dir, sources)
     cu.write_text(tu)
-    flags = [*NVCC_FLAGS, f"-arch={arch_flag(arch)}", *SO_FLAGS]
+    flags = [*NVCC_FLAGS, arch_opt(arch), *SO_FLAGS]
     rc, log = _cached_nvcc("nvcc-so-tu", nvcc, flags, tu, so, ".so",
                            lambda tmp: _nvcc([nvcc, *flags, "-o", str(tmp), str(cu)], timeout))
     return (so if rc == 0 else None), log
