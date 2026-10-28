@@ -61,8 +61,14 @@ devices.
         [--search independent|beam --beam-width 4 --beam-expand 2 --beam-refill on|off] [--model-simple M --model-hard M] \\
         [--hetero-policy P] [--models-config F] [--upkeep-model M] [--kb-arg=--flag --kb-arg=value] \\
         [--efficiency-rules on|safe|off] [--stop-patience N] [--plan-min-share-late X] \\
+        [--sol-gate off|final|accept [--sol-slot-frac 0.5 --sol-golden-margin 0.5 --sol-bound and|replace --sol-bench F]] \\
         [--knowledge-global off|read|readwrite --knowledge-global-seed SEED_DIR \\
          --knowledge-global-store STORE --knowledge-global-part cuda:sm_89|fp16]
+
+SOL gate (``sol_gate.py``, ``sol_tolerance.py``; ``docs/sol_gate.md``), OFF by default: ``--sol-gate final`` makes the final whole
+model pass SOL-ExecBench's per-element matched-ratio rule (the winners it points at are rolled back until it does);
+``accept`` also derives a bound for fp32 slots from SOL's tolerance and checks each round's winners in the whole model before
+the next step builds on them. Only IRs extracted from a SOL bench (graph.json ``sol_tolerance``) are gated.
 
 Efficiency rules (``kb_efficiency.py``; ``l3_farm/analysis/efficiency_rules.md``), ON by default since X-129 --
 results before and after are not directly comparable: ``--efficiency-rules on`` (default) = R1 patience (the
@@ -351,6 +357,20 @@ class Config:
     # merge_sibling_max_waste: reject when the merged FLOPs exceed the originals' by more than this ratio (None = $MB_MERGE_SIBLING_MAX_WASTE, else 1.0)
     merge_sibling_convs: str | None = None
     merge_sibling_max_waste: float | None = None
+    # SOL-ExecBench's correctness tolerance as an acceptance gate (sol_gate.py, sol_tolerance.py; docs/sol_gate.md): off (default; None =
+    # $MB_SOL_GATE, else off: nothing runs and every output is unchanged) | final (the final whole model must pass SOL's per-element
+    # matched-ratio rule, the winners it points at are rolled back until it does) | accept (final + SOL tables in every export, a bound on
+    # fp32 slots derived from SOL's tolerance, the winners of each round checked in the whole model before the next step builds on them).
+    # sol_slot_frac: share of the output tolerance one fp32 slot may use (None = $MB_SOL_SLOT_FRAC, else 0.5; 0 = no derived bound);
+    # sol_golden_margin: scale of SOL's atol / rtol when comparing with the MB golden (None = $MB_SOL_GOLDEN_MARGIN, else 0.5);
+    # sol_bound: and (the flow's bound AND SOL's rule; default) | replace; sol_bench: a bench file giving the tolerance (and SOL's
+    # reference) of an IR extracted before the tolerance was recorded; sol_max_rollbacks: whole-model attempts per verification
+    sol_gate: str | None = None
+    sol_slot_frac: float | None = None
+    sol_golden_margin: float | None = None
+    sol_bound: str | None = None
+    sol_bench: str = ""
+    sol_max_rollbacks: int = 8
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
     # KernelBlaster run's <out>/trace (prompts, responses, candidates, builds, driver output):
     # full | meta (hashes and sizes only) | off; env KB_TRACE
@@ -1389,6 +1409,9 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     from . import capabilities as capm
     caps = capm.Caps(cfg, work)                          # A2 switches (defaults: prune on, the rest off)
     caps.apply_env()
+    from . import sol_gate as sgm
+    sg = sgm.SolGate(cfg, work)                          # --sol-gate off (default): inert
+    sg.apply_env()
     from . import graph_rewrite as grm
     rw = grm.RewriteHook(cfg, work)                      # --graph-rewrite off (default): inert
     from . import merge_convs as mcv
@@ -1430,6 +1453,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(rw.round_key())                      # graph rewrites: only when --graph-rewrite is on
     key.update(msc.round_key())                     # merge_sibling_convs: only when --merge-sibling-convs is on
     key.update(rl.round_key())                      # region loop: only when --region-loop is on
+    key.update(sg.round_key())                      # SOL gate: only when --sol-gate is on
     if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
         key["ingest_fused"] = "off"                 # kill switch: only when set
     if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
@@ -1484,6 +1508,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             raise RuntimeError(f"round {r}: profile failed for {bad}; see {R / 'profile'}")
         if not saved:
             prog.mark("profile", profiles)
+        if sg.active():                                  # SOL gate: tolerance, reference outputs, the seed's verdict (once per IR)
+            T.lap("mb.sol_gate")
+            sg.start(irs, specs=specs, arch=cfg.arch, kbeval=mbev, gpu_model=hw.model, allow_mismatch=cfg.allow_gpu_mismatch,
+                     hw_check=hw.check)
         kb_resume.STOP.check()
         first = first or {p["ir"]: p["partition_us"] for p in profiles}
         rec["partition_us"] = {p["ir"]: p["partition_us"] for p in profiles}
@@ -1570,6 +1598,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                         for s in h["source"]:
                             s["ir"] = json.loads((Path(props["problem_dir"]) / "manifest.json").read_text())["ir_name"]
                         gh.merge(doc, [h])
+        if sg.accepting():                                   # SOL gate: the round's ingested winners, checked in the whole model
+            gh.save(doc, hints_path)
+            T.lap("mb.sol_gate")
+            rec["sol_gate"] = sg.after_ingest(r, irs, lambda d, w: verify_ir(
+                Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path, work=w, kbeval=mbev, gpu_model=hw.model,
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache)
         if ext.wants_after_round():                          # zero-LLM: winner cross-application, concurrency auto
             rec["reuse"] = prog.once("reuse", lambda: ext.after_round(R, profiles, doc, cache, specs, mbev, hw.model))
         gh.save(doc, hints_path)
@@ -1588,6 +1622,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             prog, cands, graphs, R / "variants", width, decide_wave=_wave, schedule=schedule, footprint=footprint,
             specs=specs, hints_path=hints_path, save_hints=lambda: gh.save(doc, hints_path))
         rec["parallel_hints"], rec["waves"] = width, waves
+        if sg.accepting():                                   # SOL gate: winners the hint decisions added
+            gh.save(doc, hints_path)
+            T.lap("mb.sol_gate")
+            rec["sol_gate_decide"] = sg.after_ingest(r, irs, lambda d, w: verify_ir(
+                Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path, work=w, kbeval=mbev, gpu_model=hw.model,
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache)
         for g in kb.gpus[n_gpu_rec:]:
             hw.check("kb", g.get("gpu"), Path(g["run"]).name)
         n_gpu_rec = len(kb.gpus)
@@ -1633,28 +1673,33 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             state["fixpoint"], state["fixpoint_key"] = r, kh
             kb_resume.atomic_write_json(state_path, state)
             break
+    if sg.active():                                      # a resumed run with no round left: the seed's verdict is still needed
+        sg.start(irs, specs=specs, arch=cfg.arch, kbeval=mbev, gpu_model=hw.model, allow_mismatch=cfg.allow_gpu_mismatch,
+                 hw_check=hw.check)
     if gs.active() and gs.audit_mode in ("final", "rounds"):   # unapply audit of the pre-applied hints, before the final model
         gs.audit("final", irs=irs, doc=doc, hints_path=hints_path, cache=cache, specs=specs, cfg=cfg, leases=leases,
                  recorded=list(kb.gpus), state=state, state_path=state_path)
     final = {}
     with T.span("mb.verify", evaluator=mbev.evaluator if mbev is not None else "builtin"):
         for d in irs:
-            v = final[Path(d).name] = verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
-                                                work=work / "final" / Path(d).name, kbeval=mbev,
-                                                gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+            v = final[Path(d).name] = sg.verify(Path(d), lambda d=d: verify_ir(
+                Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path, work=work / "final" / Path(d).name,
+                kbeval=mbev, gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache, where="final")
             if "device" in v:
                 hw.check("verify", v.get("device"), v.get("ir", Path(d).name))
     # search fixes: dominant ops left on / near their seed kernel (warn; repair = route them, zero LLM, verify again)
     guard = sf.final_guard(irs, final, state, cache, specs, kbeval=mbev, gpu_model=hw.model, hints_doc=doc,
-                           reverify=lambda d: verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
-                                                        work=work / "final" / Path(d).name, kbeval=mbev,
-                                                        gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch))
+                           reverify=lambda d: sg.verify(Path(d), lambda: verify_ir(
+                               Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
+                               work=work / "final" / Path(d).name, kbeval=mbev, gpu_model=hw.model,
+                               allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache, where="final-guard"))
     summary = {"irs": {}, "rounds": len(state["rounds"]), "fixpoint": state.get("fixpoint"),
                **({"cuda_learnings": ext.summary()} if ext.round_key() else {}),
                **({"capabilities": caps.summary()} if caps.round_key() else {}),
                **({"graph_rewrite": rw.summary()} if rw.active() else {}),
                **({"merge_sibling_convs": msc.summary()} if msc.active() else {}),
                **({"region_loop": rl.summary()} if rl.active() else {}),
+               **({"sol_gate": sg.summary()} if sg.active() else {}),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
                "llm_calls": kb.calls, "parallel_hints": width,
@@ -1671,16 +1716,19 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     with T.span("mb.model_run", evaluator=kbeval.evaluator if kbeval else "builtin"):
         for d in irs:
             try:
-                models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
-                                                     hints=hints_path, arch=cfg.arch, specs=specs, kbeval=kbeval,
-                                                     gpu_model=cfg.gpu_model, recorded=kb.gpus,
-                                                     allow_gpu_mismatch=cfg.allow_gpu_mismatch,
-                                                     torch_baseline=cfg.torch_baseline,
-                                                     torch_opts={"python": cfg.torch_python or None,
-                                                                 "source": cfg.torch_source or None,
-                                                                 "rounds": cfg.torch_rounds,
-                                                                 "variants": [v for v in cfg.torch_variants.split(",")
-                                                                              if v]})
+                with sg.final_scope():               # --sol-gate: the composed model's run carries SOL's check too
+                    models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
+                                                         hints=hints_path, arch=cfg.arch, specs=specs, kbeval=kbeval,
+                                                         gpu_model=cfg.gpu_model, recorded=kb.gpus,
+                                                         allow_gpu_mismatch=cfg.allow_gpu_mismatch,
+                                                         torch_baseline=cfg.torch_baseline,
+                                                         torch_opts={"python": cfg.torch_python or None,
+                                                                     "source": cfg.torch_source or None,
+                                                                     "rounds": cfg.torch_rounds,
+                                                                     "variants": [v for v in cfg.torch_variants.split(",")
+                                                                                  if v]})
+                if sg.active() and (rec_sol := sg.model_record(Path(d).name, models[Path(d).name].get("model"))):
+                    models[Path(d).name]["sol"] = rec_sol
             except Exception as e:                   # the verification above stands; report why
                 models[Path(d).name] = {"error": repr(e)}
             else:
@@ -1709,7 +1757,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                               **{k: v for k, v in m.items() if k.startswith(("torch_", "speedup_vs_torch",
                                                                               "ours_cmp_"))
                                  and k != "torch_baseline"},
-                              **({"model_error": m["error"]} if "error" in m else {})}
+                              **({"model_error": m["error"]} if "error" in m else {}),
+                              **({"sol": m["sol"]} if sg.active() and m.get("sol") else {})}
     summary["search_fixes"] = {**sf.summary(), "final_guard": guard}
     for ir, x in ((guard or {}).get("irs") or {}).items():
         if ir in summary["irs"]:

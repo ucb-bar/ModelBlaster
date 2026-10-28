@@ -109,6 +109,8 @@ from the same GPU model, by default from one GPU. No GPU of that model is an err
   (`hand` / `cache:<impl_id>` / `fused-seed` / `override`), `instances[]` (`op_name`, `op`,
   `index`, `shape`)
 - `ops[]` (call order): `index`, `name`, `op`, `slot`, `inputs`/`outputs` (buffer indices)
+- `sol`, `sol_slot_cap` (only with `--sol-gate`, [sol_gate.md](sol_gate.md)): SOL-ExecBench's tolerance and reference per graph
+  output the partition produces; the fp32 slot bound derived from it (already in `tolerance` / `slots[].tolerance`)
 - `buffers[]`: `name`, `kind` (input, const, weight, intermediate, output), `dtype` (f32/f16/i32),
   `numel`, `alias` (`base`, `offset` — views), `ref` (`[offset, nbytes]` into `data.bin`),
   `ref_err` (outputs: max |reference − exact|, below; null when not computed)
@@ -125,6 +127,8 @@ slot defines; then the walker tail (`mb_run_op(i, bufs)` with one generated call
 ```
 MB_CHECK output <name> max_abs_err=<e> bound=<b> ok=<0|1>    every partition output vs reference
 MB_SLOT_CHECK <slot> rel_err=<e> ok=<0|1>                      every op alone on the reference's inputs
+MB_SOL <output> ref=sol|golden|golden1 matched=<r> required=<q> ...   only for a --sol-gate export: SOL-ExecBench's rule
+                                                               ([sol_gate.md](sol_gate.md)); its verdict is ANDed into MB_CHECK's ok
 MB_PARTITION_US <us> reps=<n>                                  CUDA events, whole partition
 MB_SLOT_US <slot> <us>                                         CUDA events per op, summed per slot
 MB_OP_US <op name> <us>                                        CUDA events per op instance
