@@ -351,6 +351,15 @@ class Config:
     # merge_sibling_max_waste: reject when the merged FLOPs exceed the originals' by more than this ratio (None = $MB_MERGE_SIBLING_MAX_WASTE, else 1.0)
     merge_sibling_convs: str | None = None
     merge_sibling_max_waste: float | None = None
+    # round controller (round_controller.py; docs/round_controller.md): off (default; None = $MB_ROUND_CONTROLLER, else off: no key, no
+    # record, every output byte-identical) | fixed | graph-first | auto. Picks per round which of kernel steps / graph decisions / the
+    # region loop run (the flags above stay the capability switches). min_gain = the budget guard's percent (0 = $MB_RC_MIN_GAIN, else 3),
+    # budget_usd = stop once the KernelBlaster runs' LLM spend reaches it (0 = $MB_RC_BUDGET_USD, else none), small_us = "small unfused op"
+    # (0 = $MB_RC_SMALL_US, else 15)
+    round_controller: str | None = None
+    round_controller_min_gain: float = 0.0
+    round_controller_budget_usd: float = 0.0
+    round_controller_small_us: float = 0.0
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
     # KernelBlaster run's <out>/trace (prompts, responses, candidates, builds, driver output):
     # full | meta (hashes and sizes only) | off; env KB_TRACE
@@ -532,6 +541,7 @@ class KBRunner:
     def __init__(self, cfg: Config, knowledge: Path):
         self.cfg, self.knowledge = cfg, knowledge
         self.calls = 0
+        self.usd = 0.0                                # the runs' LLM spend so far (round controller's budget; no output)
         self.telemetry: list = []                     # each run's run-level telemetry (kb_telemetry)
         self.gpus: list = []                          # the GPU each problem's run recorded (kb_eval.recorded_gpus)
         self.commands: dict = {}                      # out dir -> its command line
@@ -636,6 +646,7 @@ class KBRunner:
             r = read_result(out, Path(d)) or {"problem": problem_name(Path(d)), "final_ok": False}
             r["_dir"] = str(out / problem_name(Path(d)))
             self.calls += r.get("llm_calls", 0) or 0
+            self.usd += float((r.get("llm_usage") or {}).get("cost_usd", 0.0) or 0.0)
             if r.get("final_ok"):
                 self.gpus.append({"run": r["_dir"], "gpu": r.get("gpu"), "arch": r.get("arch")})
             res.append(r)
@@ -1395,8 +1406,14 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     msc = mcv.MergeHook(cfg, work)                       # --merge-sibling-convs off (default): inert
     from . import region_loop as rlm
     rl = rlm.RegionLoopHook(cfg, work)                   # --region-loop off (default): inert
+    from . import round_controller as rcm
+    ctl = rcm.RoundController(cfg, work, region_loop_active=rl.active())   # --round-controller off (default): inert
+    rlm.set_round(None)                                  # the controller's per-round region-loop switch: the flag decides
     from . import graph_search as gsm
     gs = gsm.CURRENT["gs"] = gsm.GraphSearch(cfg, work, irs)   # all off by default (no effect)
+    if ctl.on and gs.active():
+        raise ValueError("--round-controller is not combined with the --graph-* search flags (they schedule their own interleaved "
+                         "decisions and beams): use one or the other")
     if kb_barrier.enabled(cfg) or kb_barrier.char_sync_enabled(cfg, gk):
         gs.on_char_done = bar.after_char                     # --park-after-char on: park once the characterization has run
 
@@ -1430,6 +1447,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(rw.round_key())                      # graph rewrites: only when --graph-rewrite is on
     key.update(msc.round_key())                     # merge_sibling_convs: only when --merge-sibling-convs is on
     key.update(rl.round_key())                      # region loop: only when --region-loop is on
+    key.update(ctl.round_key())                     # round controller: only when --round-controller is not off
     if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
         key["ingest_fused"] = "off"                 # kill switch: only when set
     if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
@@ -1445,9 +1463,17 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         return json.loads((work / "summary.json").read_text())
     if (work / kb_barrier.PARKED_FILE).exists() and not kb_barrier.enabled(cfg):   # a parked run resumes: import the post-barrier package once
         bar.resume_import()
-    for r in range(len(state["rounds"]), len(state["rounds"]) + n_rounds):
+    r_first = len(state["rounds"])
+    usd0 = float(((rcm.RoundController.history(state, kh) or [{}])[-1]).get("spent_usd") or 0.0) if ctl.on else 0.0   # spend before this process
+    for r in range(r_first, r_first + n_rounds):
         kb_resume.STOP.check()
         state.pop("complete", None)
+        if ctl.on and (why := ctl.pre_stop(rcm.RoundController.history(state, kh), usd0 + kb.usd)):   # before the profile: no spend yet
+            state["rounds"].append({"round": r, "key": kh, "kb_runs": [], "decisions": [], "controller": ctl.stop_record(r, None, why)})
+            state["fixpoint"], state["fixpoint_key"] = r, kh
+            kb_resume.atomic_write_json(state_path, state)
+            print(json.dumps({"round": r, "controller": {"move": "stop", "reasons": [why]}}), flush=True)
+            break
         R = work / f"r{r:02d}"
         prog = kb_resume.RoundProgress(R, key)
         if prog.resumed:
@@ -1494,6 +1520,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             bar.skipped("characterization is off (--graph-characterize 0 / no --graph-* flag): nothing to park after")
         T.lap("mb.propose")
         graphs = {}
+        mv = ctl_rec = None
         for p in profiles:                                  # MB's own proposals
             g = graphs[p["ir"]] = json.loads((Path(p["ir_dir"]) / "graph.json").read_text())
             gh.merge(doc, gh.propose_from_profile(g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs,
@@ -1501,8 +1528,38 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                                    launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
         ext.propose(graphs, profiles, doc, specs)             # --fusion-extended (no-op when off)
         caps.propose(graphs, profiles, doc, specs)            # --region-slots (no-op when off)
-        rw.propose(r, R, prog, graphs, profiles, doc, specs)  # --graph-rewrite agent: gated candidate edits (no-op when off)
-        msc.propose(graphs, profiles, doc, specs)             # --merge-sibling-convs auto (no-op when off)
+        if ctl.on:                                            # --round-controller: cheap CPU proposals first, then the move, then the LLM proposer
+            msc.propose(graphs, profiles, doc, specs)
+            _kinds = ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + msc.decide_kinds()
+            _hist = rcm.RoundController.history(state, kh)
+            _prev = next((x for x in reversed(state["rounds"]) if x.get("key") == kh and x.get("partition_us")), None)
+
+            def _decide():
+                f = ctl.features(r=r, first=not _hist, rounds_left=r_first + n_rounds - r, profiles=profiles, min_gain_pct=cfg.min_gain_pct,
+                                 hist=_hist, spent_usd=usd0 + kb.usd,
+                                 hints=[h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
+                                        and h["kind"] in _kinds],
+                                 prev_total=sum(_prev["partition_us"].values()) if _prev else None,
+                                 cur_total=sum(rec["partition_us"].values()))
+                return ctl.begin(ctl.decide(f, _hist))
+            ctl_rec = prog.once("controller", _decide)        # saved: a resumed round keeps its move
+            mv = rcm.Move.from_dict(ctl_rec)
+            print(json.dumps({"round": r, "controller": {"move": ctl_rec["move"], "reasons": ctl_rec["reasons"]}}), flush=True)
+            if mv.stop:
+                rec["controller"] = ctl.stop_record(r, mv, "; ".join(mv.reasons))
+                T.end_laps(rsec.span)
+                rsec.end()
+                state["rounds"].append(rec)
+                state["fixpoint"], state["fixpoint_key"] = r, kh
+                kb_resume.atomic_write_json(state_path, state)
+                (R / "round.json").write_text(json.dumps(rec, indent=1))
+                break
+            rlm.set_round(mv.region_loop)                     # the region loop only where the controller wants it (kb_args)
+            if mv.graph:
+                rw.propose(r, R, prog, graphs, profiles, doc, specs)   # --graph-rewrite agent: gated candidate edits (no-op when off)
+        else:
+            rw.propose(r, R, prog, graphs, profiles, doc, specs)  # --graph-rewrite agent: gated candidate edits (no-op when off)
+            msc.propose(graphs, profiles, doc, specs)             # --merge-sibling-convs auto (no-op when off)
         if gs.active():                                      # priors pre-apply, fold proposals, beam members
             profiles, graphs = gs.after_propose(r, R, prog, profiles, graphs, doc, specs, hints_path=hints_path,
                                                 reprofile=lambda sub, hd=None, R=R: _reprofile(R, sub, hd))
@@ -1517,6 +1574,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         plan = prog.once("plan", lambda: make_plan(gs.plan_input(profiles), **plan_kw, exclude=sf.exclude(
             set(state["sent"]), profiles, state, r, plan_kw, specs)))        # + re-queued items (search fixes)
         (R / "plan.json").write_text(json.dumps(plan, indent=1))
+        if ctl.on and not mv.kernel:                         # a graph-only round: the kernel steps wait (nothing is marked sent)
+            plan = {**plan, "problems": [], "selected_share": 0.0}
         rec["plan"] = {"selected_share": plan["selected_share"],
                        "problems": [(p["ir"], len(p["op_names"])) for p in plan["problems"]]}
         base_ms = cfg.plan_min_share if cfg.plan_mode == "all" else cfg.min_share
@@ -1526,6 +1585,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                  "late_skipped": kb_efficiency.late_skipped(plan, base_ms) if r >= 1 else []}
 
         def _cands():
+            if ctl.on and not mv.graph:                     # a kernel-only round: the graph hints stay proposed for a later round
+                return {"n_todo": 0, "cands": []}
             if gs.active():                                 # graph search: prior ranking; beam: members decide
                 return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + msc.decide_kinds() + gs.decide_kinds(),
                                      _est_gain, _hint_ir, cfg)
@@ -1607,6 +1668,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         if gs.active():                                      # beam checkpoint; graph decisions of the round
             rec["graph_search"] = gs.end_round(r, R, prog, profiles=profiles, doc=doc, cache=cache, specs=specs,
                                                kbeval=mbev, gpu_model=hw.model, hints_path=hints_path)
+        if ctl.on:                                            # the move's record: gains, what worked, the spend (budget guard input)
+            rec["controller"] = ctl.end_round(ctl_rec, rec, doc, plan_problems=len(plan["problems"]), spent_usd=usd0 + kb.usd)
         T.end_laps(rsec.span)
         rsec.end()
         tr = {"mb": kbt.compact(T.full_summary(rsec.span)), "kb": kbt.kb_rollup(kb.telemetry[n_kb:])}
@@ -1629,7 +1692,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         # graph search: a promising hint (next rung next round) or a beam still deciding is not a fixpoint
         undecided = [d for d in rec["decisions"] if d.get("status") in ("undecided", "promising")]
         if not accepted and not undecided and not plan["problems"] and len(todo) <= cfg.max_variants \
-                and not gs.blocks_fixpoint(r, doc):
+                and not gs.blocks_fixpoint(r, doc) and not (ctl.on and mv.deferred):
             state["fixpoint"], state["fixpoint_key"] = r, kh
             kb_resume.atomic_write_json(state_path, state)
             break
@@ -1655,6 +1718,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                **({"graph_rewrite": rw.summary()} if rw.active() else {}),
                **({"merge_sibling_convs": msc.summary()} if msc.active() else {}),
                **({"region_loop": rl.summary()} if rl.active() else {}),
+               **({"round_controller": ctl.summary()} if ctl.on else {}),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
                "llm_calls": kb.calls, "parallel_hints": width,
