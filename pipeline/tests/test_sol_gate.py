@@ -429,3 +429,16 @@ class LoopTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HardwareStepTest(unittest.TestCase):
+    """FlowHardware.check takes a step that is not in STEPS: sol_gate's seed probe records "sol_probe" (the first B200 run died with
+    KeyError: 'sol_probe' in every problem because the CPU loop test faked the check)."""
+
+    def test_sol_probe_step_is_recorded(self):
+        hw = go.FlowHardware(go.Config(kb=Path(".")), {})
+        hw.check("sol_probe", {"name": "NVIDIA B200", "arch": "sm_100", "label": "0"}, "irA")
+        self.assertEqual(hw.devices["sol_probe"][0]["what"], "irA")
+
+    def test_default_steps_unchanged(self):
+        self.assertEqual(tuple(go.FlowHardware(go.Config(kb=Path(".")), {}).devices), go.FlowHardware.STEPS)
