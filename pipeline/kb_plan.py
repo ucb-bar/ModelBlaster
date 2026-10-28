@@ -119,6 +119,11 @@ def failed_cached_slots(res: dict, plan: dict) -> dict:
     if res.get("passed"):
         return {}
     bad = {sid for sid, sc in (res.get("slots") or {}).items() if not sc.get("ok")}
+    if not bad and res.get("sol"):
+        # no slot failed its own check but the whole model fails SOL's tolerance (sol_gate, --sol-gate accept): the
+        # winners that lose the most precision are the ones to drop
+        from .sol_gate import blame_slots
+        return blame_slots(res, plan)
     return {k: e for k, e in (plan.get("used") or {}).items() if k.split("/")[0] in bad}
 
 
@@ -151,6 +156,9 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
     hdir, specs, g = hinted_ir(Path(ir_dir), hints_doc or gh.new_doc(), work, specs)
     fallback = []
     attempts = PROFILE_FALLBACKS + (2 if on_fallback is not None else 0)     # routed kernels may fail too
+    from . import sol_tolerance
+    if sol_tolerance.mode() == "accept":
+        attempts += 5                              # SOL failures drop one class of winners per attempt (sol_gate.blame)
     for attempt in range(attempts + 1):
         plan = cache_plan(g, cache, f"sm_{arch}", specs) if cache is not None else \
             {"graph": gh.unique_names(g), "sources": {}, "tags": {}, "sub_sources": None, "hints": [], "used": {}}
@@ -227,6 +235,8 @@ def profile_ir(ir_dir: Path, work: Path, *, hints_doc: dict | None = None, cache
            "evaluator": res.get("evaluator") or {"evaluator": "builtin", "runtime": "process"}}
     if res.get("hw_warnings"):
         out["hw_warnings"] = res["hw_warnings"]
+    if res.get("sol"):
+        out["sol"] = res["sol"]
     if not res.get("passed"):
         out["log"] = res.get("log", "")[-1500:]
     if not keep:                                   # data.bin and the build are the big parts

@@ -372,6 +372,8 @@ def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: P
                "evaluator": res.get("evaluator") or {"evaluator": "builtin", "runtime": "process"}}
         if res.get("hw_warnings"):
             out["hw_warnings"] = res["hw_warnings"]
+        if res.get("sol"):                         # a SOL-gated export (sol_tolerance.py): the outputs' verdicts
+            out["sol"] = res["sol"]
         for key, e in plan["used"].items():
             sid = key.split("/")[0]
             sc = res.get("slots", {}).get(sid, {})
