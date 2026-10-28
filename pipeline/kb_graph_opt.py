@@ -331,6 +331,12 @@ class Config:
     graph_rewrite_max: int = 3
     graph_rewrite_seeds: int = 2
     graph_rewrite_device: str = "cpu"
+    # merge_sibling_convs hint kind (merge_convs.py; docs/merge_sibling_convs.md): off (default; None = $MB_MERGE_SIBLING_CONVS, else off:
+    # nothing runs, the round key and every output are unchanged) | auto (sibling convolutions joined by a channel concat are proposed as ONE
+    # convolution with derived zero-padded weights, gated by the padding-waste cost model; decided by the paired variant-vs-original timing).
+    # merge_sibling_max_waste: reject when the merged FLOPs exceed the originals' by more than this ratio (None = $MB_MERGE_SIBLING_MAX_WASTE, else 1.0)
+    merge_sibling_convs: str | None = None
+    merge_sibling_max_waste: float | None = None
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
     # KernelBlaster run's <out>/trace (prompts, responses, candidates, builds, driver output):
     # full | meta (hashes and sizes only) | off; env KB_TRACE
@@ -678,6 +684,9 @@ def _scope_ops(h: dict, graph: dict, specs: dict) -> list[str]:
         return list(dict.fromkeys(names))
     if h["kind"] == "split_slot":
         return [o["name"] for o in graph["ops"] if o["op"] in specs and base_slot_id(o["op"], specs) == h["slot"]]
+    if h["kind"] == "merge_sibling_convs":              # merge_convs.py: the convs / activations / concat of the instances that still match
+        from .merge_convs import scope_ops as _merge_scope
+        return _merge_scope(h, graph, specs)
     if h["kind"] == "rewrite":                          # graph_rewrite.py: the ops the patch removes (and the new ones, on the variant side)
         have = {o["name"] for o in graph["ops"]}
         return [n for n in h["rewrite"]["patch"]["remove_ops"] if n in have]
@@ -731,6 +740,9 @@ def footprint(h: dict, ir: str, graph: dict, specs: dict) -> dict:
     elif h["kind"] == "split_slot":
         writes = {_entry(by_name[names[0]]["op"], specs)} if names else {h["slot"]}
     elif h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout"):   # extended kinds: the new ops' entries
+        from .fusion_ext import new_kinds
+        writes = {_entry(k, specs) for k in new_kinds(h, graph, specs)}
+    elif h["kind"] == "merge_sibling_convs":                               # merge_convs: the merged conv's entry (a new shape of conv2d)
         from .fusion_ext import new_kinds
         writes = {_entry(k, specs) for k in new_kinds(h, graph, specs)}
     elif h["kind"] == "rewrite":                                           # graph_rewrite: the entries of the ops it adds
@@ -1081,7 +1093,7 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
         man = json.loads((Path(job["variant"]) / "manifest.json").read_text())
         changed = [s["id"] for s in man["slots"]
                    if s["op"].startswith("fused__") or s.get("variant_of")
-                   or h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout", "rewrite")   # only new ops there
+                   or h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout", "rewrite", "merge_sibling_convs")   # only new ops there
                    or s["op"].startswith("region__")]                                   # region slots (A2)
         res["cached"] = _ingest_slots(cache, job["variant"], rv, changed, job["specs"], h["id"])
     _trace_hint(job, ro, rv, times, ev, res)
@@ -1358,6 +1370,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     caps.apply_env()
     from . import graph_rewrite as grm
     rw = grm.RewriteHook(cfg, work)                      # --graph-rewrite off (default): inert
+    from . import merge_convs as mcv
+    msc = mcv.MergeHook(cfg, work)                       # --merge-sibling-convs off (default): inert
     from . import graph_search as gsm
     gs = gsm.CURRENT["gs"] = gsm.GraphSearch(cfg, work, irs)   # all off by default (no effect)
     if kb_barrier.enabled(cfg) or kb_barrier.char_sync_enabled(cfg, gk):
@@ -1391,6 +1405,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(sf.round_key())                      # search fixes: only non-default switches
     key.update(caps.round_key())                    # capabilities: only non-default switches
     key.update(rw.round_key())                      # graph rewrites: only when --graph-rewrite is on
+    key.update(msc.round_key())                     # merge_sibling_convs: only when --merge-sibling-convs is on
     if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
         key["ingest_fused"] = "off"                 # kill switch: only when set
     if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
@@ -1463,6 +1478,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         ext.propose(graphs, profiles, doc, specs)             # --fusion-extended (no-op when off)
         caps.propose(graphs, profiles, doc, specs)            # --region-slots (no-op when off)
         rw.propose(r, R, prog, graphs, profiles, doc, specs)  # --graph-rewrite agent: gated candidate edits (no-op when off)
+        msc.propose(graphs, profiles, doc, specs)             # --merge-sibling-convs auto (no-op when off)
         if gs.active():                                      # priors pre-apply, fold proposals, beam members
             profiles, graphs = gs.after_propose(r, R, prog, profiles, graphs, doc, specs, hints_path=hints_path,
                                                 reprofile=lambda sub, hd=None, R=R: _reprofile(R, sub, hd))
@@ -1487,10 +1503,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
 
         def _cands():
             if gs.active():                                 # graph search: prior ranking; beam: members decide
-                return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + gs.decide_kinds(),
+                return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + msc.decide_kinds() + gs.decide_kinds(),
                                      _est_gain, _hint_ir, cfg)
             todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
-                    and h["kind"] in ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() and _est_gain(h) >= cfg.min_gain_pct]
+                    and h["kind"] in ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + msc.decide_kinds() and _est_gain(h) >= cfg.min_gain_pct]
             todo.sort(key=lambda h: -_est_gain(h))          # stable: ties keep the hints file's order
             return {"n_todo": len(todo), "cands": [(h["id"], p["ir"]) for h in todo[:cfg.max_variants]
                                                    if (p := _hint_ir(h, profiles)) is not None]}
@@ -1613,6 +1629,7 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                **({"cuda_learnings": ext.summary()} if ext.round_key() else {}),
                **({"capabilities": caps.summary()} if caps.round_key() else {}),
                **({"graph_rewrite": rw.summary()} if rw.active() else {}),
+               **({"merge_sibling_convs": msc.summary()} if msc.active() else {}),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
                "llm_calls": kb.calls, "parallel_hints": width,
