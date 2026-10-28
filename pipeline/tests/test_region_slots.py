@@ -105,6 +105,39 @@ class Region41Test(unittest.TestCase):
         self.assertEqual(op["outputs"], ["getitem"])
 
 
+class FusedMemberFallbackTest(unittest.TestCase):
+    """A region whose member is a fused op (conv+relu, linear+tanh) with NO cached source for its kind -- a graph-first round
+    has produced no kernel winner and the cache has never seen this region op -- seeds from the member's own stage-by-stage
+    seed (the non-region fused slot path's rule) instead of raising 'a fused member needs its source in sub_sources'
+    (abl3 17018_SqueezeNet, round 1 plan export: region:all and region:win:whole both accepted in round 0)."""
+
+    def setUp(self):
+        from modelblaster.pipeline.tests import window_fixtures as wf
+        from modelblaster.pipeline.kb_export import DEFAULT_HAND_CU, CudaLibrary, _hand_source
+        self.g = wf.rnn_unrolled(8, fused=True)
+        self.sp = _specs(self.g)
+        names = rs.find_regions(self.g, "all", self.sp)[0]
+        self.g2, self.spec = rs.fuse_region(self.g, names, self.sp, "all")
+        self.lib = CudaLibrary(_hand_source(DEFAULT_HAND_CU, "fp16"))
+
+    def test_no_source_falls_back_to_the_fused_seed(self):
+        src = self.spec.cuda_seed(self.lib, {}, parallel=False)
+        self.assertIn("current kernel of fused__linear_f16__tanh_f16", src)
+
+    def test_sub_ops_sources_are_used(self):
+        marker = "// MARKER-LINEAR-WINNER"
+        from modelblaster.pipeline.kb_export import DEFAULT_HAND_CU, _hand_source
+        hand = self.lib.slot_source("kernel_linear_f16").replace("kernel_linear_f16", "kernel_linear_f16", 1)
+        src = self.spec.cuda_seed(self.lib, {"linear_f16": marker + "\n" + hand}, parallel=False)
+        self.assertIn(marker, src)
+
+    def test_explicit_fused_source_still_wins(self):
+        fk = "fused__linear_f16__tanh_f16"
+        own = self.sp[fk].cuda_seed(self.lib, sub_sources={}) + "\n// MARKER-OWN-FUSED\n"
+        src = self.spec.cuda_seed(self.lib, {fk: own}, parallel=False)
+        self.assertIn("MARKER-OWN-FUSED", src)
+
+
 class Region43Test(unittest.TestCase):
     def test_attention_block(self):
         g = json.loads((HERE / "data" / "mingpt43_final_graph.json").read_text())
