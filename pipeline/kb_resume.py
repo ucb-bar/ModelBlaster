@@ -111,6 +111,8 @@ def round_key(cfg, irs) -> dict:
         if getattr(cfg, "beam_refill", "off") == "on":
             key["beam_refill"] = "on"
     key["irs"] = sorted(str(Path(d).resolve()) for d in irs)
+    if getattr(cfg, "target", "cuda") != "cuda":      # (absent for CUDA: its keys are unchanged)
+        key["target"] = cfg.target
     return key
 
 
