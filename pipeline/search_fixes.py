@@ -541,8 +541,15 @@ class Fixes:
                               "routes": self.route_log}
 
     @property
+    def cuda(self) -> bool:
+        """The cache-entry routing / re-ingest below read CUDA arch keys (``sm_<N>``) and ``.cu`` slot sources: on another
+        slot target (``--target opencl``) they are off (the profile's own fallback -- reject a failing winner, redo the
+        profile on the next best source -- and the final-guard warning are target-independent and stay)."""
+        return getattr(self.cfg, "target", "cuda") == "cuda"
+
+    @property
     def routing(self) -> bool:
-        return self.fallback in ("on", "route")
+        return self.fallback in ("on", "route") and self.cuda
 
     @property
     def requeueing(self) -> bool:
@@ -636,7 +643,7 @@ class Fixes:
         and the fastest is the rejected kernel, so a re-optimized, slower but working winner never reached the
         deployed model: 15_DenseNet121's 960x7x7 conv was re-optimized in round 1 (8.22 us in its own problem) and
         dropped next to the rejected 8.19 us entry. The cache keeps it beside the rejected one (CudaCache.add)."""
-        if self.fallback == "off":
+        if self.fallback == "off" or not self.cuda:
             return None
         from .kb_ingest import _shape_key
         from .kernel_abi import parse_signature

@@ -657,6 +657,8 @@ class MergeHook:
             if g is None:
                 continue
             hints, report = propose(g, p, specs, doc, policy=self.policy, min_gain_pct=getattr(self.cfg, "min_gain_pct", 2.0), ir=p["ir"])
+            for h in hints:                                  # decided on the flow's slot target's device (cuda | opencl)
+                h["target"] = getattr(self.cfg, "target", "cuda") or "cuda"
             self.log.append({"ir": p["ir"], "proposed": [h["id"] for h in hints], "skipped": report[:20]})
             new += gh.merge(doc, hints)
             for h in hints:                                  # gh.merge extends ``chains`` of a known id; the instances (the applier's scope) too

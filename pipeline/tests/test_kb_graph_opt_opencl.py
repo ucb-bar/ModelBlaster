@@ -201,7 +201,7 @@ class FakeBoard(ke.KBEval):
     def available(self):
         return True
 
-    def run(self, jobs, *, arch, work, gpu_model=None, name="time"):
+    def run(self, jobs, *, arch, work, gpu_model=None, name="time", driver_env=None):
         self.calls.append({"jobs": jobs, "arch": arch, "gpu_model": gpu_model, "name": name})
         out = {}
         for j in jobs:
@@ -332,7 +332,11 @@ class RunWiringTest(unittest.TestCase):
         self.assertEqual(s["irs"]["tiny"]["model_speedup"], 2.0)
         st = json.loads((self.t / "w" / "state.json").read_text())
         self.assertEqual(st["gpus"]["mb_evaluator"]["evaluator"], "board")
-        self.assertEqual(st["rounds"][0]["key"], go.kb_resume.key_hash(go.kb_resume.round_key(cfg, [self.t / "ir"])))
+        key = go.kb_resume.round_key(cfg, [self.t / "ir"])
+        eff = st["efficiency"]                          # the E7 efficiency rules (on by default) are part of this flow's key
+        key["efficiency"] = {"rules": eff["rules"], "stop_patience": eff["stop_patience"],
+                             "plan_min_share_late": eff["plan_min_share_late"]}
+        self.assertEqual(st["rounds"][0]["key"], go.kb_resume.key_hash(key))
         self.assertEqual(go.kb_resume.round_key(cfg, [])["target"], "opencl")
         self.assertNotIn("target", go.kb_resume.round_key(go.Config(kb=Path(".")), []))   # CUDA keys unchanged
 
