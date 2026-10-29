@@ -1361,7 +1361,49 @@ def _targeted(hints: list[dict], cfg: Config) -> list[dict]:
 
 # ---------------------------------------------------------------- rounds
 
+def opencl_refusals(cfg: Config) -> list[str]:
+    """Flags ``--target opencl`` cannot honour, as messages (empty on CUDA / when none is set). A flag the flow
+    would otherwise ignore on OpenCL -- its hints are CUDA-stamped and never decided there, its KernelBlaster side
+    builds with nvcc -- fails the run instead of running as a silent no-op:
+
+    * ``--region-slots`` / ``--region-windows`` / ``--region-loop``: a region slot's seed is the CUDA composite
+      (``cuda_seed``: streams / events / one launcher over every member's CUDA kernel) and the region loop's tools
+      build and time CUDA programs; no OpenCL composite seed or loop backend exists;
+    * ``--view-fusion``, ``--graph-rewrite agent``: their hints are proposed for CUDA only;
+    * ``--sol-gate``: SOL-ExecBench's per-element rule reads the CUDA driver's ``MB_SOL`` lines;
+    * ``--multiturn``: the experiment tool compiles with nvcc.
+
+    Supported on OpenCL: ``--round-controller`` (flow level), ``--merge-sibling-convs`` (a graph rewrite, its
+    merged conv is an ordinary conv2d shape)."""
+    if cfg.target != "opencl":
+        return []
+    from . import graph_rewrite as grm, region_loop as rlm, region_windows as rwm
+    why = []
+    rs = str(cfg.region_slots or "off").strip().lower()
+    if rs != "off":
+        why.append(f"--region-slots {rs}: region slots (one slot owning a sub-graph) have only a CUDA composite seed")
+    if rwm.resolve_mode(cfg.region_windows) != "off":
+        why.append("--region-windows: region windows are region slots (CUDA composite seed only)")
+    if rlm.resolve_mode(cfg) != "off":
+        why.append("--region-loop: KernelBlaster's region loop builds and times CUDA programs (nvcc, streams); "
+                   "there is no OpenCL loop backend")
+    if str(cfg.view_fusion).strip().lower() != "off":
+        why.append("--view-fusion: its fuse_view hints are proposed for CUDA only")
+    if grm.resolve_mode(cfg) != "off":
+        why.append("--graph-rewrite: its candidate edits are proposed for CUDA only")
+    if str(cfg.sol_gate if cfg.sol_gate is not None else os.environ.get("MB_SOL_GATE", "off")).strip().lower() \
+            not in ("", "off", "0", "false", "no"):
+        why.append("--sol-gate: SOL-ExecBench's tolerance check reads the CUDA driver's MB_SOL lines")
+    if str(cfg.multiturn).strip().lower() != "off":
+        why.append("--multiturn: the experiment tool compiles with nvcc")
+    return why
+
+
 def run(irs: list[Path], work: Path, cfg: Config) -> dict:
+    refused = opencl_refusals(cfg)
+    if refused:
+        raise ValueError("--target opencl does not support: " + "; ".join(refused) + ". Supported A6 mechanisms on OpenCL: "
+                         "--round-controller, --merge-sibling-convs (docs/opencl_a6.md)")
     work = Path(work).resolve()
     kb_resume.STOP.install()                      # SIGTERM / SIGINT / SIGHUP: stop cleanly, resumable
     with work_lock(work):
@@ -1996,6 +2038,13 @@ def main():
         if a.arch != "75":
             ap.error("--target opencl: --arch is the OpenCL device label (e.g. adreno650), not an SM number")
         cfg.arch = "adreno650"                    # KernelBlaster's OpenCL default device
+    try:
+        refused = opencl_refusals(cfg)
+    except ValueError as e:
+        ap.error(str(e))
+    if refused:
+        ap.error("--target opencl does not support: " + "; ".join(refused) + ". Supported A6 mechanisms on OpenCL: "
+                 "--round-controller, --merge-sibling-convs (docs/opencl_a6.md)")
     try:
         print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
     except kb_resume.Interrupted as e:
