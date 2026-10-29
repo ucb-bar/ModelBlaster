@@ -197,6 +197,8 @@ class ControllerOnOpenCLTest(_Env):
                 s = go.run([o], t / "w", c)
             finally:
                 go.profile_ir, go.verify_ir, mr.model_runtime, go.evaluate_hints, go.make_plan = saved
+                from modelblaster.pipeline import region_loop as rlm
+                rlm.set_round(None)                                   # the controller's per-round switch is module state
             rc = s["round_controller"]
             self.assertEqual(rc["policy"], "graph-first")
             self.assertIn("2 candidate(s)", rc["rounds"][0]["reasons"][0])             # the fuse + the merge hint, both stamped opencl, counted
