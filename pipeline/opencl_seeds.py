@@ -23,6 +23,7 @@ slot gets its launcher's dependency closure (the CUDA library mechanism).
 from __future__ import annotations
 
 import argparse
+import os
 import re as _re
 from pathlib import Path
 
@@ -201,7 +202,8 @@ __kernel void k_{op}_final(__global const float *part, int np, __global float *o
 # cl_khr_fp16 needed. They are generated from the fp32 seeds: data pointers
 # become half (scratch partials stay float), element reads p[e] become
 # vload_half(e, p), stores p[e] = v become vstore_half(v, e, p), compound
-# stores p[e] op= v become vstore_half(vload_half(e, p) op (v), e, p); on the
+# stores p[e] op= v become vstore_half(vload_half(e, p) op (v), e, p) (and
+# `(long)` of a loaded half goes through int, see f16_device); on the
 # host `float *` becomes `__half *` (cl_half, the CUDA spelling of _Float16)
 # and entries get their _f16 names. Ops whose _f16 spec has a different
 # signature are hand-written in mb_opencl_kernels_f16_hand.cpp.
@@ -278,7 +280,9 @@ def f16_device(cl: str) -> str:
     # `__global const float *a = ..., *b = ...`: the later declarators too
     for m in _re.finditer(r"__global\s+(?:const\s+)?half\s*\*[^;]*;", cl):
         names |= set(_re.findall(r",\s*\*\s*(\w+)", m.group(0)))
-    return _half_access(cl, names)
+    # an index stored as half: convert through int. Adreno's compiler aborts
+    # (QGPUI64Emulate: "Unsupported FtoI/ItoF") on a half -> 64-bit int conversion
+    return _re.sub(r"\(long\)\s*vload_half\(", "(long)(int)vload_half(", _half_access(cl, names))
 
 
 def f16_host(code: str, renames: dict) -> str:
@@ -306,13 +310,97 @@ def to_f16(src: str, renames: dict) -> str:
 
 TEMPLATED = set(MAP1) | set(MAP2) | set(AXIS) | set(LOSS)
 
+# ---------------------------------------------------------------- fp16 MATH (cl_khr_fp16 devices: Adreno)
+#
+# MB_OPENCL_F16_MATH selects the `_f16` seed generation:
+#   "0"/"off"   storage-only seeds (above): vload_half / vstore_half, fp32 math -- bit-for-bit the previous output;
+#   "1"/"on"    fp16-math seeds (gpu_eval/harness/opencl/mb_opencl_kernels_f16_math.cpp + the templates below),
+#               for the ops they cover; the others keep the storage-only seed. Needs cl_khr_fp16 on the device;
+#   unset/"auto" (the default) on for the Adreno devices in F16_MATH_ARCHS (arch from the call, else
+#               $MB_OPENCL_ARCH, which kb_graph_opt / kb_export / kb_plan set from --arch), off otherwise
+#               (the NVIDIA stand-in has no cl_khr_fp16).
+F16_MATH_ARCHS = {"adreno650", "adreno660", "adreno730", "adreno740", "adreno750"}
+
+
+def f16_math_enabled(arch: str | None = None) -> bool:
+    v = os.environ.get("MB_OPENCL_F16_MATH", "auto").strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return False
+    if v in ("1", "on", "true", "yes"):
+        return True
+    a = (arch or os.environ.get("MB_OPENCL_ARCH", "")).strip().lower()
+    return a in F16_MATH_ARCHS
+
+
+# elementwise maps: pure half arithmetic (exact: one correctly-rounded half operation = the fp32 result rounded once)
+F16M_HALF = {
+    "relu": "fmax(v, 0.0h)",
+    "relu6": "fmin(fmax(v, 0.0h), 6.0h)",
+}
+F16M_HALF2 = {"add": "va + vb", "mul": "va * vb"}
+# the other maps widen to fp32 per element (transcendentals / float scalar parameters), half8 loads and stores
+VEC = 8
+
+
+def template_source_f16_math(op: str, signature: str) -> str | None:
+    """fp16-math slot source of a MAP op ``op`` (the fp32 op name) from its ``_f16`` signature (8 elements per
+    work-item, direct half8 loads / stores), or None."""
+    entry, params, host, dev, names = _sig(signature)
+    ptrs = [p for p in params if p.is_ptr]
+    dev = dev.replace("_Float16", "half")                  # `signature` is the op's _f16 KernelSpec signature
+    host = host.replace("_Float16", "__half")
+    args = ", ".join(names)
+    pre = "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
+    if op in F16M_HALF:
+        x, y = ptrs[0].name, ptrs[1].name
+        e = F16M_HALF[op]
+        body = (f"    long i = get_global_id(0) * 8;\n    if (i + 8 <= n) {{ half8 v = vload8(0, {x} + i); vstore8({e}, 0, {y} + i); }}\n"
+                f"    else for (long j = i; j < n; j++) {{ half v = {x}[j]; {y}[j] = {e}; }}\n")
+        helper = ""
+    elif op in F16M_HALF2:
+        a, b, y = (p.name for p in ptrs[:3])
+        e = F16M_HALF2[op]
+        body = (f"    long i = get_global_id(0) * 8;\n    if (i + 8 <= n) {{ half8 va = vload8(0, {a} + i), vb = vload8(0, {b} + i); vstore8({e}, 0, {y} + i); }}\n"
+                f"    else for (long j = i; j < n; j++) {{ half va = {a}[j], vb = {b}[j]; {y}[j] = {e}; }}\n")
+        helper = ""
+    elif op in MAP1:
+        x, y = ptrs[0].name, ptrs[1].name
+        extra = [p for p in params if not p.is_ptr and p.name != "n"]
+        hp = "".join(f", {p.ctype} {p.name}" for p in extra)
+        ha = "".join(f", {p.name}" for p in extra)
+        helper = f"float mb_f_{op}(float v{hp}) {{ return {MAP1[op]}; }}\n"
+        comps = ", ".join(f"mb_f_{op}(f.s{k}{ha})" for k in range(VEC))
+        body = (f"    long i = get_global_id(0) * 8;\n"
+                f"    if (i + 8 <= n) {{ float8 f = convert_float8(vload8(0, {x} + i)); vstore8(convert_half8((float8)({comps})), 0, {y} + i); }}\n"
+                f"    else for (long j = i; j < n; j++) {{ float v = (float){x}[j]; {y}[j] = convert_half(mb_f_{op}(v{ha})); }}\n")
+    else:
+        return None
+    return (f"// fp16 math seed (cl_khr_fp16): 8 elements per work-item, half8 loads / stores\n"
+            f"static mb_program cl_{op} = MB_CL(R\"CL(\n{pre}{helper}__kernel void k_{op}({dev}) {{\n{body}}}\n)CL\");\n"
+            f"{host} {{\n    mb_launch(MB_KERNEL(cl_{op}, k_{op}), mb_grid(((long)n + 7) / 8), {args});\n}}\n")
+
+
+def _f16m_opcode_source(fp32_src: str, kernel: str, entry: str, host_sig: str, launch_args: str, body: str) -> str:
+    """The opcode ops (ewise1 / ewise_scalar): keep the fp32 seed's device helper, replace the kernel + launcher."""
+    head = fp32_src[:fp32_src.index(f"__kernel void {kernel}(")]
+    return (head.replace('MB_CL(R"CL(', 'MB_CL(R"CL(\n#pragma OPENCL EXTENSION cl_khr_fp16 : enable', 1) +
+            body + f')CL");\n{host_sig} {{\n    mb_launch(MB_KERNEL(cl_{entry}, {kernel}), mb_grid(((long)n + 7) / 8), {launch_args});\n}}\n')
+
+
+
 
 class OpenCLSeeds:
     """Seed sources by C entry point: templates first, then the hand library."""
 
-    def __init__(self, hand_path: Path, f16_hand_path: Path | None = None):
+    def __init__(self, hand_path: Path, f16_hand_path: Path | None = None, f16_math: bool | None = None,
+                 arch: str | None = None):
+        """``f16_math`` (None: :func:`f16_math_enabled` for ``arch`` / $MB_OPENCL_ARCH / $MB_OPENCL_F16_MATH)
+        selects the fp16-math ``_f16`` seeds; False: the storage-only ones, exactly as before."""
         from .reference_kernels import KERNEL_SPECS
         self.lib = CudaLibrary(Path(hand_path).read_text())
+        self.f16_math = f16_math_enabled(arch) if f16_math is None else bool(f16_math)
+        fm = Path(hand_path).with_name("mb_opencl_kernels_f16_math.cpp")
+        self.lib16m = CudaLibrary(fm.read_text()) if self.f16_math and fm.exists() else None
         f16 = Path(f16_hand_path) if f16_hand_path else Path(hand_path).with_name("mb_opencl_kernels_f16_hand.cpp")
         self.lib16 = CudaLibrary(f16.read_text()) if f16.exists() else None
         self._op_of = {}
@@ -323,6 +411,39 @@ class OpenCLSeeds:
         if entry.endswith("_f16") and not (self.lib16 and entry in self.lib16.items):
             base = entry[:-len("_f16")]
             return None if base in F16_UNSUPPORTED else base
+        return None
+
+    def _math_source(self, entry: str) -> str | None:
+        """The fp16-math seed of an `_f16` entry, or None (not covered / switch off: the storage-only seed)."""
+        if not self.f16_math or not entry.endswith("_f16"):
+            return None
+        if self.lib16m is not None and entry in self.lib16m.items:
+            return self.lib16m.slot_source(entry)
+        base = entry[:-len("_f16")]
+        op, sig16 = self._op_of.get(base, (None, None))[0], self._op_of.get(entry, (None, None))[1]
+        if op is None or sig16 is None or (self.lib16 and entry in self.lib16.items):
+            return None
+        if op in MAP1 or op in MAP2:
+            return template_source_f16_math(op, sig16)
+        if op in ("ewise1", "ewise_scalar"):
+            _, params, host, _, _ = _sig(sig16)
+            host = host.replace("_Float16", "__half")
+            f32 = self.lib.slot_source(base)
+            if op == "ewise1":
+                comps = ", ".join(f"mb_e1(f.s{k}, opc, p0, p1)" for k in range(VEC))
+                body = ("__kernel void k_ewise1(__global const half *x, __global half *y, int n, int opc, float p0, float p1) {\n"
+                        "    long i = get_global_id(0) * 8;\n"
+                        f"    if (i + 8 <= n) {{ float8 f = convert_float8(vload8(0, x + i)); vstore8(convert_half8((float8)({comps})), 0, y + i); }}\n"
+                        "    else for (long j = i; j < n; j++) y[j] = convert_half(mb_e1((float)x[j], opc, p0, p1));\n}\n")
+                return _f16m_opcode_source(f32, "k_ewise1", "ewise1", host, "input, output, n, opc, p0, p1", body)
+            cases = f32[f32.index("switch (opc) {"):f32.index("    y[i] = z;")]
+            comps = ", ".join(f"mb_es(f.s{k}, opc, c)" for k in range(VEC))
+            body = ("float mb_es(float v, int opc, float c) {\n    float z;\n    " + cases.rstrip() + "\n    return z;\n}\n"
+                    "__kernel void k_ewise_scalar(__global const half *x, __global half *y, int n, int opc, float c) {\n"
+                    "    long i = get_global_id(0) * 8;\n"
+                    f"    if (i + 8 <= n) {{ float8 f = convert_float8(vload8(0, x + i)); vstore8(convert_half8((float8)({comps})), 0, y + i); }}\n"
+                    "    else for (long j = i; j < n; j++) y[j] = convert_half(mb_es((float)x[j], opc, c));\n}\n")
+            return _f16m_opcode_source(f32, "k_ewise_scalar", "ewise_scalar", host, "input, output, n, opc, c", body)
         return None
 
     def has(self, entry: str) -> bool:
@@ -337,6 +458,8 @@ class OpenCLSeeds:
         return op in TEMPLATED or entry in self.lib.items
 
     def origin(self, entry: str) -> str:
+        if self._math_source(entry) is not None:
+            return "hand-f16math" if self.lib16m is not None and entry in self.lib16m.items else "template-f16math"
         if self.lib16 is not None and entry in self.lib16.items:
             return "hand-f16"
         base = self._f16_base(entry)
@@ -345,6 +468,9 @@ class OpenCLSeeds:
         return "template" if self._op_of.get(entry, (None,))[0] in TEMPLATED else "hand"
 
     def slot_source(self, entry: str) -> str:
+        m = self._math_source(entry)
+        if m is not None:
+            return m
         if self.lib16 is not None and entry in self.lib16.items:
             return self.lib16.slot_source(entry)
         base = self._f16_base(entry)
@@ -360,23 +486,39 @@ class OpenCLSeeds:
     def head_source(self) -> str:
         return ""
 
-    def fused_seed(self, spec) -> str:
-        """A fused op's seed: A's and B's seeds, called back to back (as the CUDA ``cuda_seed``)."""
-        from .kb_proposals import _all_specs
+    def fused_seed(self, spec, sub_sources: dict | None = None) -> str:
+        """A fused op's seed: its stages' seeds called back to back (the CUDA ``cuda_seed``).
+
+        Each stage is a complete slot source -- ``sub_sources[stage kind]`` when given (e.g.
+        the current best OpenCL kernel of that stage), else its seed -- wrapped in its own
+        namespace (``stage_<kind>``), so stage programs and helpers never collide; chains of
+        any length (``make_chain_spec``)."""
+        from .cuda_dtypes import cuda_signature
+        from .kb_export import namespaced
+        from .kb_proposals import _all_specs, stage_prefix
+
         specs = _all_specs()
-        a_spec, b_spec = specs[spec.sub_ops[0]], specs[spec.sub_ops[1]]
-        a_entry, pa = parse_signature(a_spec.signature)
-        b_entry, pb = parse_signature(b_spec.signature)
-        a_src = self.slot_source(a_entry)
-        b_src = self.slot_source(b_entry) if b_entry != a_entry else ""
-        entry, params = parse_signature(spec.signature)
-        a_out = next(p.name for p in pa if p.is_ptr and not p.is_const_ptr)
-        a_args = ", ".join("a_" + p.name for p in pa)
-        b_args = ", ".join(f"a_{a_out}" if p.name == spec.t_param else "b_" + p.name for p in pb)
+        sub_sources = sub_sources or {}
+        stages = [(k, *parse_signature(specs[k].signature)) for k in spec.sub_ops]
+        includes, blocks = [], []
+        for k, e, _ in dict.fromkeys((k, e, None) for k, e, _ in stages):
+            src = sub_sources.get(k) or self.slot_source(e)
+            inc, body = namespaced(f"stage_{k}", src)
+            includes += [i for i in inc if i not in includes]
+            blocks.append(f"// {'current best' if k in sub_sources else 'seed'} {k} kernel\n{body}")
+        outs = [next(p.name for p in ps if p.is_ptr and not p.is_const_ptr) for _, _, ps in stages]
+        calls = []
+        for i, (k, e, ps) in enumerate(stages):
+            args = [stage_prefix(i - 1) + outs[i - 1] if i and p.name == spec.t_params[i - 1]
+                    else stage_prefix(i) + p.name for p in ps]
+            calls.append(f"    stage_{k}::{e}({', '.join(args)});")
+        entry, params = parse_signature(cuda_signature(spec.signature))
+        scratch = ", ".join(f"`{stage_prefix(i)}{o}`" for i, o in enumerate(outs[:-1]))
         plist = ", ".join(f"{p.ctype} {p.name}" for p in params)
-        return (f"{a_src}\n{b_src}\n// Seed: {spec.sub_ops[0]} then {spec.sub_ops[1]}; `a_{a_out}` is the\n"
-                f"// intermediate (scratch). A fused kernel need not write it.\n"
-                f"void {entry}({plist}) {{\n    {a_entry}({a_args});\n    {b_entry}({b_args});\n}}\n")
+        return ("\n".join(includes) + ("\n\n" if includes else "") + "\n\n".join(blocks) +
+                f"\n\n// Seed: {' then '.join(spec.sub_ops)}; {scratch} hold the intermediates\n"
+                f"// (scratch). A fused kernel need not write them.\n"
+                f"void {entry}({plist}) {{\n" + "\n".join(calls) + "\n}\n")
 
 
 # kinds that only CUDA graph hints create (graph_hints.CUDA_KINDS fold_layout / fuse_attention): no OpenCL seed
@@ -385,11 +527,14 @@ CUDA_ONLY = {"bmm_strided", "bmm_strided_f16", "attention", "attention_f16",
 
 
 def all_entries(dtype: str = "fp32") -> dict[str, str]:
-    """entry -> op for every fp32 (or `_f16`) KernelSpec: the target set of the seeds."""
+    """entry -> op for every fp32 (or `_f16`) KernelSpec: the target set of the seeds. The
+    per-tensor casts of a mixed IR (`cast_<src>_to_<dst>`) are CUDA-only and not in it."""
+    from .cuda_dtypes import op_dtype, parse_cast
     from .reference_kernels import KERNEL_SPECS
     out = {}
     for op, spec in KERNEL_SPECS.items():
-        if op in CUDA_ONLY or any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op.endswith("_f16") != (dtype == "fp16"):
+        if op in CUDA_ONLY or any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op_dtype(op) != dtype \
+                or parse_cast(op):
             continue
         out.setdefault(parse_signature(spec.signature)[0], op)
     return out

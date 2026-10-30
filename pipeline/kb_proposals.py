@@ -115,8 +115,9 @@ class FusedKernelSpec(KernelSpec):
             calls.append(f"    {callee}({', '.join(args)});")
         if self.parallel and len(calls) > 1:
             calls = _par_calls(calls)
-        # the stage sources (hand kernels, cached winners) spell fp16 `__half`; a raw `_Float16` wrapper would not
-        # bind to their parameters (two distinct, non-convertible C++ types)
+        # the entry is CUDA: `_Float16` / `__bf16` pointers are spelled `__half` / `__nv_bfloat16`, as the stage
+        # kernels it calls (hand kernels, cached winners; a raw `_Float16` wrapper would not bind to their
+        # parameters: two distinct, non-convertible C++ types; the manifest's slot signature is the same spelling)
         from .cuda_dtypes import cuda_signature
         entry, params = parse_signature(cuda_signature(self.signature))
         scratch = ", ".join(f"`{stage_prefix(i)}{o}`" for i, o in enumerate(outs[:-1]))
@@ -313,6 +314,13 @@ def fuse_pair(graph: dict, a_name: str, b_name: str, specs: dict) -> tuple[dict,
     sa, sb = stages_of(A), stages_of(B)
     if t not in sb[0]["inputs"]:
         raise ValueError(f"{t}: read by a later stage of {b_name}, not a chain")
+    # one storage dtype per fused kernel (a mixed IR's ops differ; its casts stay apart):
+    # the seed calls its stages from one hand-kernel library
+    from .cuda_dtypes import op_dtype, parse_cast
+    if any(parse_cast(s["op"]) for s in sa + sb):
+        raise ValueError(f"{a_name}->{b_name}: a dtype cast is not fused")
+    if len({op_dtype(s["op"]) for s in sa + sb}) > 1:
+        raise ValueError(f"{a_name}->{b_name}: stages of different storage dtypes")
     stages = [copy.deepcopy(s) for s in sa + sb]
     internal = A.get("internal", []) + [t] + B.get("internal", [])
     tps = [_t_param(stages[i + 1], internal[i], specs) for i in range(len(stages) - 1)]
@@ -486,8 +494,17 @@ def fuse_siblings(graph: dict, names: list[str], specs: dict) -> tuple[dict, Fus
 def write_variant_ir(ir_dir: Path, graph: dict, out: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     (out / "graph.json").write_text(json.dumps(graph, indent=1))
-    for f in ("weights.npz", "io.npz"):
+    for f in ("weights.npz", "io.npz", "sol_ref.npz"):
         dst = out / f
+        if f == "sol_ref.npz":                     # SOL's reference outputs (sol_tolerance.py), only when the IR has them
+            if not (Path(ir_dir).resolve() / f).exists():
+                continue
+        if f == "weights.npz" and graph.get("weight_derivations"):
+            # a graph rewrite with derived weights (weight_derivations.py): the variant's weights.npz holds the base
+            # weights AND the derived ones, rebuilt from the source IR's weights by the recorded derivations
+            from . import weight_derivations as wd
+            wd.write_weights(Path(ir_dir).resolve() / f, graph, dst)
+            continue
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         os.symlink(Path(ir_dir).resolve() / f, dst)
@@ -495,9 +512,9 @@ def write_variant_ir(ir_dir: Path, graph: dict, out: Path) -> Path:
 
 
 def best_sources(kb_result_dir: Path) -> dict[str, str]:
-    """{slot id: source} of a KernelBlaster run's composite best."""
+    """{slot id: source} of a KernelBlaster run's composite best (CUDA ``.cu`` / OpenCL ``.cpp`` slots)."""
     d = Path(kb_result_dir) / "best" / "slots"
-    return {p.stem: p.read_text() for p in sorted(d.glob("*.cu"))} if d.is_dir() else {}
+    return {p.stem: p.read_text() for p in sorted([*d.glob("*.cu"), *d.glob("*.cpp")])} if d.is_dir() else {}
 
 
 def build_variant(hints, orig_problem: Path, out: Path, *, seed_sources: dict | None = None,
@@ -641,6 +658,33 @@ _INFRA = re.compile(
 
 def is_infra_text(text) -> bool:
     return bool(text) and bool(_INFRA.search(str(text)))
+
+
+# what the sweep's lost results looked like beyond _INFRA (live_debug/43_sdpa_rejected.md, 25_shufflenet_regression.md):
+# a failed scp to the eval host, a node that lost its GPU, the relay's 503 / queue_full, a missing result.json
+_INFRA_RESULT = re.compile(
+    r"\bscp: |Connection closed|\bNoDevice\b|no usable GPU|queue_full|\b503 Service Unavailable|"
+    r"Service Unavailable|no result\.json when the KernelBlaster process exited|quarantined for \d+s|"
+    r"cannot open shared object file|node timed out|ssh: .*timed out", re.I)
+
+
+def infra_aware() -> bool:
+    """``MB_INFRA_AWARE=0`` restores the old rule (only ``final_infra`` / :func:`is_infra_text` count)."""
+    return os.environ.get("MB_INFRA_AWARE", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def is_infra_result(res: dict | None) -> bool:
+    """A KernelBlaster result that failed for infrastructure reasons (never a verdict on the kernel): its own
+    ``final_infra`` tag, or (``MB_INFRA_AWARE``, default on) an error text with an infra signature though the tag is
+    missing (an older KernelBlaster, a synthetic result). A passing result is never infra."""
+    if not res or res.get("final_ok"):
+        return False
+    if res.get("final_infra"):
+        return True
+    if not infra_aware():
+        return False
+    return any(is_infra_text(t) or bool(t and _INFRA_RESULT.search(str(t)))
+               for t in (res.get("final_error"), res.get("error")))
 
 
 def run_failure(problem, runs: list[dict], log=None) -> dict:
