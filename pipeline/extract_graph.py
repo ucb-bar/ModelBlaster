@@ -45,6 +45,9 @@ from torch.fx.passes.shape_prop import ShapeProp
 GOLDEN_SINK = None
 
 
+# What the last trace evaluated at trace time on value-specialized inputs (concrete_trace.py); written to graph.json
+_VALUE_SPECIALIZED: list = [None]
+
 # The fx node extract() is lowering; read by its generic-lowering retry.
 _LOWERING_NODE: list = [None]
 
@@ -57,6 +60,11 @@ def _trace(model: torch.nn.Module, sample_inputs) -> torch.fx.GraphModule:
         return torch.fx.symbolic_trace(model)
     from modelblaster.pipeline.concrete_trace import concrete_trace
     gm = concrete_trace(model, sample_inputs)
+    _VALUE_SPECIALIZED[0] = gm.meta.get("value_specialized")
+    if _VALUE_SPECIALIZED[0]:
+        vs = _VALUE_SPECIALIZED[0]
+        print(f"[extract] note: DATA-SPECIALIZED IR: {vs['n']} data-dependent op(s) {vs['ops']} evaluated at trace time on "
+              f"input(s) {[i['name'] for i in vs['inputs']]} (graph.json data_specialized)")
     if gm.meta.get("value_branches"):
         print(f"[extract] note: control flow specialized to the sample input "
               f"at {gm.meta['value_branches']}")
@@ -5289,6 +5297,9 @@ def extract(
         "ops": ops,
         "dispatches": dispatches,
     }
+    if _VALUE_SPECIALIZED[0]:
+        # the IR is only valid for these input values (indptr / page tables baked as slice bounds and loop counts)
+        ir["data_specialized"] = _VALUE_SPECIALIZED[0]
     if native:
         # weights.npz arrays of a mixed IR: bf16 ones are float32 holding
         # bf16-exact values, so the dtype is named here
@@ -5734,6 +5745,7 @@ def _load_kernelbench(bench_path: str,
     # passes eps / flags / None next to several tensors). The trace then sees
     # `A * <const>`, extracted as a mul_scalar op. fx can't trace a *args
     # wrapper, so the wrapper's forward gets one named parameter per tensor.
+    _inputs_before_bind = list(inputs)
     if any(not torch.is_tensor(t) for t in inputs):
         _tensor_pos = [i for i, t in enumerate(inputs) if torch.is_tensor(t)]
         if not _tensor_pos:
@@ -5759,6 +5771,13 @@ def _load_kernelbench(bench_path: str,
         model = _ScalarBind()
         model.eval()
         inputs = [inputs[i] for i in _tensor_pos]
+
+    # inputs whose VALUES the workload fixes (SOL: the integer index inputs, MB_VALUE_SPECIALIZED_INPUTS = positions in
+    # get_inputs()): data-dependent ops on them are evaluated at trace time (concrete_trace.py, graph.json data_specialized)
+    _spec_pos = list(getattr(mod, "MB_VALUE_SPECIALIZED_INPUTS", None) or [])
+    if _spec_pos:
+        _tp = [i for i, t in enumerate(_inputs_before_bind) if torch.is_tensor(t)]
+        model.mb_value_specialized = sorted({_tp.index(i) for i in _spec_pos if i in _tp})
 
     base = os.path.splitext(os.path.basename(bench_path))[0]
     name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
