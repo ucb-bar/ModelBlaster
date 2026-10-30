@@ -8,7 +8,8 @@ Qualcomm Adreno OpenCL flow works (`backends/opencl.py`, `agents/opt_opencl_rl.p
 `docs/adreno_opencl_profiling_methodology.md` in KernelBlaster). The partition,
 buffers, ops, data and checks are the CUDA design's; what changes is the slot
 language, the runtime, the driver and where things build and run. fp16 follows
-the CUDA fp16 contract ([fp16_cuda.md](fp16_cuda.md)). The "Design decisions"
+the CUDA fp16 contract ([fp16_cuda.md](fp16_cuda.md)) -- on cl_khr_fp16 devices (Adreno) the seeds start from
+half-precision arithmetic and vector loads ("fp16 math seeds" below). The "Design decisions"
 table at the end lists each choice, the alternatives and the reason.
 
 ## What runs where
@@ -56,9 +57,17 @@ problem as the walker head):
 - pointers in the signature are coarse-grained **SVM** pointers (`clSVMAlloc`),
   so views/aliases (`view`, `chunk2_c1`) are pointer arithmetic, as in MB's C
   ABI, and the tail is the CUDA tail (`mbslot_<id>::kernel_x((const float*)b[3], ...)`);
-- a program is built on first use (`-cl-std=CL1.2` + `MB_CL_OPTS(opts, src)` +
-  `$MB_CL_OPTS`) with a device prelude: `MB_THREADS`, `MB_TID`, `mb_ksum`/`mb_kadd`
-  (compensated fp32 sum), `mb_idx6`, `mb_atomic_addf`;
+- a program is built on first use (`-cl-std=` the device's OpenCL C level: CL2.0 on Adreno, CL1.2 elsewhere,
+  `$MB_CL_STD` overrides; + `MB_CL_OPTS(opts, src)` + `$MB_CL_OPTS`; nothing else is forced, `-cl-mad-enable`,
+  `-cl-fast-relaxed-math`, `-cl-unsafe-math-optimizations`, ... are the slot's choice) with a device prelude:
+  `cl_khr_fp16` enabled and `MB_HAS_FP16` defined when the device lists it (`$MB_CL_FP16=0` off), `MB_THREADS`, `MB_TID`,
+  `mb_ksum`/`mb_kadd` (compensated fp32 sum), `mb_idx6`, `mb_atomic_addf`;
+- images: the ABI pointers are SVM, which an image cannot wrap, so `MB_SCRATCH_IMAGE(prog, idx, w, h, CL_RGBA,
+  CL_HALF_FLOAT)` gives a slot-owned buffer plus an `image2d_t` view of it (`cl_khr_image2d_from_buffer`;
+  `mb_image{buf, img, pitch_bytes}`): one kernel packs weights or a staged input into `.buf` (a `__global` pointer
+  argument), the next reads `.img` with `read_imageh`. `cl_mem` / image arguments go through `mb_launch` like any
+  argument; slots still never call `clCreate*` / `clEnqueue*` / `clFinish` themselves (checked as before). Validated on
+  the board (a relu through the image path: correct, 369 us vs 185 us for the direct half8 kernel: staging costs a pass);
 - `mb_launch(kernel, range, args...)` sets arguments by C++ type (SVM pointer,
   scalar, `mb_local{bytes}`, `cl_mem`; `double` is a compile error) and enqueues
   with a profiling event; ranges `mb_grid(n)`, `mb_groups(g, local)`, `mb_range2/3`;
@@ -117,7 +126,7 @@ differences from CUDA: no fp64 (dot products and long sums use compensated fp32
 `mb_kadd` where CUDA used `double`), and row ops use one work-group per row (a
 Level1 LayerNorm is one row of 524 288).
 
-**fp16** (`_f16` ops): binary16 storage, fp32 math, one RNE rounding per store
+**fp16, storage-only mode** (`_f16` ops; legacy, `MB_OPENCL_F16_MATH=0`, and the default off Adreno): binary16 storage, fp32 math, one RNE rounding per store
 -- the CUDA fp16 contract. In OpenCL that is `__global half *` with
 `vload_half`/`vstore_half`, core OpenCL 1.2 (no `cl_khr_fp16`, so it also runs
 on the NVIDIA stand-in). The `_f16` seeds are generated from the fp32 ones
@@ -132,6 +141,36 @@ fp16 problems. `scatter_dim_f16` (half atomics) has no seed.
     python -m modelblaster.pipeline.kb_export IR_DIR OUT --target opencl --build-check
     python -m modelblaster.pipeline.opencl_seeds OUT [--dtype fp16]   # every seed + one TU of all
     python -m modelblaster.pipeline.kb_export_opencl PROBLEM_DIR       # build + run here
+
+### fp16 math seeds (default on `adreno650`; `MB_OPENCL_F16_MATH`)
+
+`opencl_seeds.f16_math_enabled(arch)`: `MB_OPENCL_F16_MATH=0` -> the storage-only seeds above (their output is
+byte-identical to before this change, test `test_opencl_f16_math.py`, and the problem's head file defines
+`MB_CL_STD_DEFAULT "CL1.2"` / `MB_NO_FP16_PRELUDE`: the legacy build); `1` -> fp16-math seeds; unset / `auto` (default) -> on
+when the device label (`--arch`, `$MB_OPENCL_ARCH`; `kb_graph_opt` / `kb_export` / `kb_plan` set it from `--arch`) is an
+Adreno that has `cl_khr_fp16` (`adreno650` ... `adreno750`), off for the NVIDIA stand-in (no `cl_khr_fp16`) and with no label.
+The fp16-math seeds (`mb_opencl_kernels_f16_math.cpp` + templates in `opencl_seeds.py`; each entry keeps its KernelSpec
+signature) cover `conv2d`, `matmul`, `linear`, `batchnorm2d`, `ewise2`, `ewise1`, `ewise_scalar`, the 17 unary and 2 binary
+elementwise maps (relu, relu6, add, mul in pure `half8` arithmetic; the transcendental maps widen to `float8` per element),
+all other `_f16` ops keep the storage-only seed. Common design: `#pragma OPENCL EXTENSION cl_khr_fp16 : enable`, data read and
+written through the half pointer with `vload8`/`vload4`/`vstore8`, register tiles (conv: 4 pixels x `MB_OT` = 8 channels,
+weights re-laid out `[tap][OC]` by a small kernel in the same call; GEMM: 4 rows x 8 columns, B re-laid out `[K][Np]` for
+`linear`), 32-bit index math, one kernel per common opcode. Numerics: fp16 operands with fp32 accumulators and one
+`convert_half` (RNE) per stored value -- the CUDA fp16 contract; `-DMB_ACC_HALF=1 [-DMB_ACC_FLUSH=n]` (in `kConvOpts`) accumulates
+the conv in `half8` and flushes to fp32 every n taps (0 = never), a documented switch, NOT the default. The flow's
+correctness gate (per-slot `rel_err`, output bound) is unchanged.
+
+Board results (Adreno 650, one run per row unless noted, seeds exported by `kb_export --target opencl --arch adreno650`
+with and without the switch; every check passed; `REPORT.md` of the change has the full table): L3 `8_ResNetBasicBlock`
+(fp16, mb16) 3 988 ms -> 58 ms (conv1 883 -> 2.3, conv2 1 010 -> 53, downsample 873 -> 0.5, BN 406 -> 0.46 ms each); L2
+`1_Conv2D_ReLU_BiasAdd` 1 690 -> 32 ms (conv 579 -> 30, bias add 1 110 -> 1.7 ms); L1 `1_Square_matrix_multiplication_` 299 ->
+43 ms; L1 `19_ReLU` 349 -> 185 us. These are SEEDS: ~50-70 GFLOP/s on the conv and GEMM, 4-6 % of the fp32 peak (QNN: 330-900 GFLOP/s).
+What the measurements say about half arithmetic: the large wins came from vector I/O (`vload8` on `half`), register tiling,
+weight layout, 32-bit index math and removing the `pow()`-carrying opcode `switch` -- not from half ALUs. A `half` `fma()` is
+emulated (BatchNorm: 38 ms with `fma` on `half8`, 0.46 ms with an fp32 `mad`), fp16 accumulation (flush 16) was slower than
+fp32 accumulation (71 vs 65 ms) and used 1.5e-3 of the 2e-3 bound, a sliding input window and `MB_OT=4` (46 vs 30 ms at
+IC = 64) were slower here, and the four hand-directed sessions of `l3_farm/qrb_a6/cc_runs` (their `REPORT.md`s) found the same
+(half4 mads with per-channel partial sums: 5.2 vs 2.9 ms; `MB_OT=4` 1.8x faster at IC = 8).
 
 ## KernelBlaster side
 
@@ -264,10 +303,10 @@ user's processes keep at load ~2; the re-measurement interleaves the two sides o
 | 2 | Coarse-grained SVM pointers as the ABI | `cl_mem` + offset per pointer; sub-buffers for views | Keeps the KernelSpec signature (and its hash) as on CUDA; views are pointer arithmetic, while sub-buffers need `CL_DEVICE_MEM_BASE_ADDR_ALIGN`-aligned offsets that `chunk2_c1` views do not have. Adreno 5xx+ and NVIDIA support coarse-grained SVM. Cost: OpenCL 1.2-only devices (POCL builds without SVM) are not supported. |
 | 3 | All launches through `mb_launch`/`mb_copy`/`mb_zero`, timed by `cl_event` | wall clock around `clFinish`; trusting the slot's own timing | Per-op/slot/kernel GPU times without a profiler, matching the Adreno flow's methodology; direct enqueues are rejected so no work runs untimed. |
 | 4 | Driver reads `data.bin` at run time | `.incbin` as on CUDA | The binary is built on the board; the data travels once per problem (`AdrenoEvaluator`) or as an exec-server kernel file, and a 500 MB VGG problem does not have to be linked per candidate. |
-| 5 | Build on the target with g++, OpenCL C 1.2 kernels | NDK cross-compile; OpenCL C 2.0/3.0 | The RB5 runs Ubuntu with gcc and KernelBlaster's Adreno flow already compiles there; CL 1.2 C runs on Adreno and on the NVIDIA stand-in alike. Android-only devices would need an NDK build of the same two files (not done). |
+| 5 | Build on the target with g++; kernels as OpenCL C 2.0 where the device reports it (Adreno 650: yes), 1.2 otherwise (`$MB_CL_STD`, or `MB_OPENCL_F16_MATH=0` at export, force 1.2) | NDK cross-compile; always 1.2 (the original choice, which also hid `cl_khr_subgroups` and the generic address space from the agent) | The RB5 runs Ubuntu with gcc and KernelBlaster's Adreno flow already compiles there (its own drivers use `-cl-std=CL2.0`); the device's level is queried, so the NVIDIA stand-in (1.2) is unchanged. Android-only devices would need an NDK build of the same two files (not done). |
 | 6 | Compensated fp32 (`mb_kadd`) instead of the CUDA seeds' fp64 | plain fp32; `cl_khr_fp64` when present | Adreno has no fp64; a plain fp32 sum over ~1e3-1e6 terms misses the 1e-3 checks the CUDA seeds were tuned against. The same code runs on both devices, so the stand-in validates what the board runs. |
 | 7 | Templates for map/axis/loss ops, a hand library for the rest | 89 hand seeds; auto-porting the C references (like `ref2cuda`) | ~36 ops differ in one expression; the references are serial (one work-item for a whole conv would time out on Adreno). Hand seeds are translated from the CUDA kernels that already pass Level2/3. |
-| 8 | fp16 = binary16 storage via `vload_half`/`vstore_half`, generated from fp32 | `half` arithmetic under `cl_khr_fp16`; separate fp16 seeds | Matches the CUDA fp16 contract (fp32 math, one rounding), needs no extension (validated on the NVIDIA stand-in), and keeps one source of truth; `half` math is a technique the agent may apply on the board. |
+| 8 | fp16 on a `cl_khr_fp16` device (Adreno, default; `MB_OPENCL_F16_MATH`): hand fp16-math seeds -- `half` pointers read and written with `vload8`/`vstore8`, register tiles, `half8` arithmetic where exact, fp16 operands with fp32 accumulators and one RNE rounding per store (the CUDA fp16 contract's numerics). Elsewhere, and with `MB_OPENCL_F16_MATH=0`: binary16 storage via `vload_half`/`vstore_half`, generated from fp32 (the original decision, bit-for-bit) | the storage-only seeds only (original decision 8: "`half` math is a technique the agent may apply on the board"); half accumulation as the default | The storage-only seeds were the design the agent never left in 4 steps per slot (every `_f16` seed = the fp32 seed with `vload_half`, scalar loads, direct NCHW; conv 5-32 GFLOP/s on the board against QNN's 330-900), so the starting point and the prompt now put vector I/O, tiling and `half` data first; the extension is gated on the device so the stand-in keeps its seeds. The numerics contract and the gate are unchanged, and fp16 accumulation stays a documented switch because it was not faster and used 75 % of the bound on a 576-term conv. |
 | 9 | OpenCL profile = event times + kernel resource queries | Snapdragon Profiler; none | Adreno exposes no counters to an OpenCL program; `CL_KERNEL_WORK_GROUP_SIZE` falls when a kernel needs many registers and `CL_KERNEL_PRIVATE_MEM_SIZE` shows spills -- the two register-pressure signals Adreno gives, plus launch counts for launch-bound slots. |
 | 10 | Validate functionally on local OpenCL when no board is reachable | wait for the board; POCL | The NVIDIA ICD is a real OpenCL 3.0 implementation with SVM; POCL was not installed and installing system packages was out of scope. |
 | 11 | Model-level time = the whole pass replayed in the one-shot driver on its warm context and in-order queue, host wall clock first enqueue → `clFinish`, median (`MB_E2E_US basis=replay`) | a persistent OpenCL host (`-DMB_HOST`, one `.so` per candidate, process kept across candidates); the sum of cl_event spans; a queue of N passes divided by N | It is what one inference costs on the board, enqueue and gaps included, which event spans hide; context, programs and SVM buffers are already resident in the driver, so a persistent host would only save process start-up and the `data.bin` read -- small next to the board's g++ build per candidate, which it would not save (the `.so` is built on the board too). Per-pass sync measures latency, not a pipelined throughput no deployment of one model sees. |
@@ -293,5 +332,5 @@ user's processes keep at load ~2; the re-measurement interleaves the two sides o
 - No persistent OpenCL host (decision 11): each candidate is one process and one g++ build on the
   board (about 1.5 s for a Level2 problem); re-measurements rebuild per repetition.
 - No Android/NDK build; no `cl_mem`/OpenCL 1.2-only path (decision 2).
-- fp16 seeds compute in fp32; Adreno's 2× `half` ALU rate is left to the agent
-  (technique `3.4_half_precision` of the Adreno flow).
+- Storage-only fp16 seeds (the non-Adreno default, and `MB_OPENCL_F16_MATH=0`) compute in fp32; see "fp16 math seeds"
+  for what the Adreno default does and what was measured about the 2× `half` ALU rate.

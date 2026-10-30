@@ -2038,6 +2038,8 @@ def main():
         if a.arch != "75":
             ap.error("--target opencl: --arch is the OpenCL device label (e.g. adreno650), not an SM number")
         cfg.arch = "adreno650"                    # KernelBlaster's OpenCL default device
+    if cfg.target == "opencl":                    # the seeds' fp16-math default follows the device label (opencl_seeds.f16_math_enabled)
+        os.environ.setdefault("MB_OPENCL_ARCH", cfg.arch)
     try:
         refused = opencl_refusals(cfg)
     except ValueError as e:
