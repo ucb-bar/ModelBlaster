@@ -1,0 +1,16 @@
+{
+ "_": "$0 mechanics check: KernelBlaster's deterministic stub LLM (tests/fixtures/resume_plugin.py) on its LeNet fixture, local GPU. Needs MB_KB_ROOT.",
+ "name": "stub_mechanics",
+ "description": "Runner mechanics with a stub LLM: v1 vs v2 knowledge (no mined evidence), 2 repeats.",
+ "entry": "multislot",
+ "kb": "${MB_KB_ROOT}",
+ "inputs": ["${MB_KB_ROOT}/tests/fixtures/mb_lenet"],
+ "flags": {"--model": "stub:resume", "--plugin": "${MB_KB_ROOT}/tests/fixtures/resume_plugin.py",
+           "--rollouts": 1, "--steps": 2, "--max-fix": 1},
+ "env": {"KERNELBLASTER_ALLOW_SHARED_GPU": "1"},
+ "path_exclude": "xilinx", "path_prepend": ["/usr/local/cuda/bin"],
+ "knowledge": {"mined": false},
+ "seeds": [0, 1], "max_parallel": 2,
+ "arms": {"v1": {"flags": {"--knowledge": "v1"}},
+          "v2": {"flags": {"--knowledge": "v2"}}}
+}

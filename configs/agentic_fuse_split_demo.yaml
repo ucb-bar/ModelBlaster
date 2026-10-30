@@ -1,0 +1,55 @@
+# Curated workload for the agentic fuse/split demo (closes #168).
+#
+# This is the ACTUAL robotics scenario: drone control with
+# vision + depth + actor policy running concurrently. All three
+# networks are present and have non-obvious fuse/split decisions:
+#
+#   * yolov8_nano @ 64x64 — perception. 30+ heavy conv2d_s8 ops
+#     dominated by the 5x5 and 3x3 ops on Saturn OPU. These are
+#     the "too_coarse" candidates — the granularity advisor proposes
+#     splitting the heaviest conv along OC to fill the gemmini core
+#     while the OPU works through the original tile.
+#
+#   * mlp_control — PPO actor. 7 sub-50µs dispatches × 4 instances at
+#     5 ms period. These are the "too_fine" candidates — the granularity
+#     advisor proposes fusing the linear+elu chains via Phase 1d's
+#     `linear_s8_elu_s8` registered kernel.
+#
+#   * dronet — depth. 2D convs on the OPU at ~20 ms period. Acts as
+#     a periodic backlog producer: when dronet is in flight, mlp_control
+#     instances accumulate; when dronet drops, the agent has to absorb
+#     the burst.
+#
+# Solver choice: CPSAT. MOSEK formulation diverges at ~300 ops on the
+# hetero combinatorics (see oracle_table.md). CPSAT handles it fine
+# and reaches the same optimum on smaller workloads.
+
+bitstream: GemminiAndOPUShuttleConfig
+registry:  cores/chipyard_gemmini_opu_hetero.json
+cores:
+  - { id: gemmini0, kind: CPU_P, hart: 0 }
+  - { id: opu0,     kind: CPU_E, hart: 1 }
+requantize_ops: [conv2d_s8, linear_s8]
+networks:
+  - { name: yolov8_nano_64, quant: int8, instances: 1 }     # one-shot, 64×64
+  - { name: dronet,         quant: int8, instances: 2, period_ms: 20.0 }
+  - { name: mlp_control,    quant: int8, instances: 4, period_ms: 5.0 }
+# Horizon: tight enough that fuse/split decisions actually move
+# the makespan, loose enough that the optimum solver can find feasible.
+# The CPSAT y64 result on the larger 75 ms horizon (Section 9) gives
+# us a sanity bound — this workload's optimum should be ≤ that.
+horizon_ms: 75.0
+# Honor the period_ms entries above. Without this, period_ms is ignored
+# and the workload becomes "place N instances anywhere in the horizon" —
+# which made the prior Gantt degenerate (yolo monopolized 0-82 ms, all 4
+# mlp_control instances stacked at t≈81 ms, dronet first start at 40 ms).
+enforce_periodic: true
+# Periodic ops still count toward makespan (otherwise the C_max lower-bound
+# would ignore mlp_control + dronet entirely and the schedule would
+# under-report its actual span).
+restrict_makespan_to_nonperiodic: false
+solver: CPSAT
+time_limit_s: 600
+cycles_source: db
+cycles_agg: median
+cycles_per_ms: 1000000

@@ -1,0 +1,169 @@
+diff --git a/include/zephyr/posix/pthread.h b/include/zephyr/posix/pthread.h
+index 8b9b03e490c..4e05988c682 100644
+--- a/include/zephyr/posix/pthread.h
++++ b/include/zephyr/posix/pthread.h
+@@ -413,6 +413,16 @@ int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate);
+ int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *detachstate);
+ int pthread_attr_init(pthread_attr_t *attr);
+ int pthread_attr_destroy(pthread_attr_t *attr);
++#ifdef CONFIG_POSIX_THREADS_AFFINITY
++/* GNU extension: pre-create thread CPU affinity. Applied between
++ * k_thread_create(K_FOREVER) and k_thread_start() inside pthread_create().
++ * cpusetsize must be sizeof(cpu_set_t).
++ */
++int pthread_attr_setaffinity_np(pthread_attr_t *attr, size_t cpusetsize,
++				const cpu_set_t *cpuset);
++int pthread_attr_getaffinity_np(const pthread_attr_t *attr, size_t cpusetsize,
++				cpu_set_t *cpuset);
++#endif
+ int pthread_attr_getschedparam(const pthread_attr_t *attr,
+ 			       struct sched_param *schedparam);
+ int pthread_getschedparam(pthread_t pthread, int *policy,
+diff --git a/include/zephyr/posix/sched.h b/include/zephyr/posix/sched.h
+index 572475df02f..006c33ae1f9 100644
+--- a/include/zephyr/posix/sched.h
++++ b/include/zephyr/posix/sched.h
+@@ -52,6 +52,23 @@ int sched_setparam(pid_t pid, const struct sched_param *param);
+ int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param);
+ int sched_rr_get_interval(pid_t pid, struct timespec *interval);
+ 
++/*
++ * cpu_set_t + CPU_* macros for pthread_attr_{set,get}affinity_np().
++ * Vendored as part of CONFIG_POSIX_THREADS_AFFINITY (see lib/posix/options/Kconfig.pthread).
++ * 64-bit bitmask covers up to CONFIG_MP_MAX_NUM_CPUS=64; embedded targets are well below that.
++ */
++#ifdef CONFIG_POSIX_THREADS_AFFINITY
++#define CPU_SETSIZE (sizeof(uint64_t) * 8)
++typedef struct {
++	uint64_t bits;
++} cpu_set_t;
++#define CPU_ZERO(s)     ((s)->bits = 0)
++#define CPU_SET(c, s)   ((s)->bits |= (1ULL << (c)))
++#define CPU_CLR(c, s)   ((s)->bits &= ~(1ULL << (c)))
++#define CPU_ISSET(c, s) (((s)->bits >> (c)) & 1U)
++#define CPU_COUNT(s)    __builtin_popcountll((s)->bits)
++#endif /* CONFIG_POSIX_THREADS_AFFINITY */
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/posix/options/Kconfig.pthread b/lib/posix/options/Kconfig.pthread
+index c4563a56c04..5ce9f631920 100644
+--- a/lib/posix/options/Kconfig.pthread
++++ b/lib/posix/options/Kconfig.pthread
+@@ -112,6 +112,15 @@ config POSIX_THREADS_EXT
+ 	  For more information, please see
+ 	  https://pubs.opengroup.org/onlinepubs/9699919799/xrat/V4_subprofiles.html
+ 
++config POSIX_THREADS_AFFINITY
++	bool "POSIX thread CPU affinity (GNU extension)"
++	depends on SCHED_CPU_MASK
++	help
++	  Enable pthread_attr_setaffinity_np() / pthread_attr_getaffinity_np() to
++	  pin threads to specific CPU cores at creation time. Mirrors the GNU
++	  extension; required for deterministic worker placement in xnnpack-style
++	  thread pools when CONFIG_SMP=y.
++
+ config POSIX_THREAD_PRIORITY_SCHEDULING
+ 	bool "Run POSIX threads with different priorities and schedulers"
+ 	help
+diff --git a/lib/posix/options/posix_internal.h b/lib/posix/options/posix_internal.h
+index d149b51e63a..8a510e6a500 100644
+--- a/lib/posix/options/posix_internal.h
++++ b/lib/posix/options/posix_internal.h
+@@ -44,6 +44,10 @@ struct posix_thread_attr
+ 	bool cancelstate: 1;
+ 	bool canceltype: 1;
+ 	bool detachstate: 1;
++#ifdef CONFIG_POSIX_THREADS_AFFINITY
++	bool cpu_affinity_set: 1;
++	uint64_t cpu_affinity;
++#endif
+ };
+ 
+ struct posix_thread {
+diff --git a/lib/posix/options/pthread.c b/lib/posix/options/pthread.c
+index b7a727557c6..c865aa7377a 100644
+--- a/lib/posix/options/pthread.c
++++ b/lib/posix/options/pthread.c
+@@ -659,11 +659,44 @@ int pthread_create(pthread_t *th, const pthread_attr_t *_attr, void *(*threadrou
+ 	}
+ 
+ 	/* spawn the thread */
++#ifdef CONFIG_POSIX_THREADS_AFFINITY
++	{
++		k_timeout_t start_delay = K_NO_WAIT;
++		bool pin_after_create = t->attr.cpu_affinity_set && t->attr.cpu_affinity != 0;
++
++		if (pin_after_create) {
++			/* k_thread_cpu_mask_* requires the thread not currently
++			 * runnable, so create suspended, mask, then start.
++			 */
++			start_delay = K_FOREVER;
++		}
++
++		k_thread_create(&t->thread, t->attr.stack,
++				__get_attr_stacksize(&t->attr) + t->attr.guardsize,
++				zephyr_thread_wrapper, (void *)arg, threadroutine,
++				IS_ENABLED(CONFIG_PTHREAD_CREATE_BARRIER)
++					? UINT_TO_POINTER(barrier) : NULL,
++				posix_to_zephyr_priority(t->attr.priority,
++							 t->attr.schedpolicy),
++				0, start_delay);
++
++		if (pin_after_create) {
++			(void)k_thread_cpu_mask_clear(&t->thread);
++			for (int cpu = 0; cpu < CONFIG_MP_MAX_NUM_CPUS; cpu++) {
++				if (t->attr.cpu_affinity & (1ULL << cpu)) {
++					(void)k_thread_cpu_mask_enable(&t->thread, cpu);
++				}
++			}
++			k_thread_start(&t->thread);
++		}
++	}
++#else
+ 	k_thread_create(
+ 		&t->thread, t->attr.stack, __get_attr_stacksize(&t->attr) + t->attr.guardsize,
+ 		zephyr_thread_wrapper, (void *)arg, threadroutine,
+ 		IS_ENABLED(CONFIG_PTHREAD_CREATE_BARRIER) ? UINT_TO_POINTER(barrier) : NULL,
+ 		posix_to_zephyr_priority(t->attr.priority, t->attr.schedpolicy), 0, K_NO_WAIT);
++#endif
+ 
+ 	if (IS_ENABLED(CONFIG_PTHREAD_CREATE_BARRIER)) {
+ 		/* wait for the spawned thread to cross our barrier */
+@@ -1434,6 +1467,35 @@ int pthread_attr_destroy(pthread_attr_t *_attr)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_POSIX_THREADS_AFFINITY
++int pthread_attr_setaffinity_np(pthread_attr_t *_attr, size_t cpusetsize,
++				const cpu_set_t *cpuset)
++{
++	struct posix_thread_attr *attr = (struct posix_thread_attr *)_attr;
++
++	if (!__attr_is_initialized(attr) || cpuset == NULL ||
++	    cpusetsize != sizeof(cpu_set_t)) {
++		return EINVAL;
++	}
++	attr->cpu_affinity = cpuset->bits;
++	attr->cpu_affinity_set = (cpuset->bits != 0);
++	return 0;
++}
++
++int pthread_attr_getaffinity_np(const pthread_attr_t *_attr, size_t cpusetsize,
++				cpu_set_t *cpuset)
++{
++	const struct posix_thread_attr *attr = (const struct posix_thread_attr *)_attr;
++
++	if (!__attr_is_initialized(attr) || cpuset == NULL ||
++	    cpusetsize != sizeof(cpu_set_t)) {
++		return EINVAL;
++	}
++	cpuset->bits = attr->cpu_affinity_set ? attr->cpu_affinity : 0;
++	return 0;
++}
++#endif /* CONFIG_POSIX_THREADS_AFFINITY */
++
+ int pthread_setname_np(pthread_t thread, const char *name)
+ {
+ #ifdef CONFIG_THREAD_NAME

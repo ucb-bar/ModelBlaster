@@ -1,0 +1,52 @@
+{
+  "_comment": "Iterative-demo workload: 1 yolov8_nano (one-shot) + 4 mlp_control (10ms period) + 2 dronet (20ms period) on firesim_rocket_saturn. Heterogeneous baseline: CPU_P->gemmini_q31, CPU_E->V256D128_rvv. compare_backends.py / iterate_firesim.py rewrite hardware.profile_hw to compare backends (axis B) and swap --solver/--scheduler (axis A). Deadlines for the advisor are passed via --deadline-us (periodic max_end_t is not propagated to op.deadline_us).",
+  "hardware": {
+    "machines": {
+      "cpu_p": 1,
+      "cpu_e": 1
+    },
+    "profile_hw": {
+      "cpu_p": "gemmini_q31",
+      "cpu_e": "V256D128_rvv"
+    },
+    "profile": {
+      "target": "firesim_rocket_saturn",
+      "topo_tag": "topo_0",
+      "topo_tag_override": true,
+      "gen_root": "zephyr-chipyard-sw/gen"
+    },
+    "p_core_speedup": 1.0
+  },
+  "scheduler": {
+    "random_seed": 42,
+    "solver_verbosity": 2,
+    "time_limit": 60,
+    "use_profiled": true,
+    "prune_periodic": true,
+    "restrict_makespan_to_nonperiodic": false
+  },
+  "networks": {
+    "mlp_control": {
+      "id": 0,
+      "identifier": "mlp_control",
+      "dispatch_deps_path": "zephyr-chipyard-sw/gen/vmfb/mlp_control/generic_riscv64/RVV/mlp_control.fp32/mlp_control.fp32_dispatch_graph.json",
+      "period": 10,
+      "window_duration": 10,
+      "num_instances": 8
+    },
+    "dronet": {
+      "id": 1,
+      "identifier": "dronet",
+      "dispatch_deps_path": "zephyr-chipyard-sw/gen/vmfb/dronet/firesim_rocket_saturn/gemmini/dronet.int8/dronet.int8_dispatch_graph.json",
+      "period": 20,
+      "window_duration": 20,
+      "num_instances": 4
+    },
+    "yolov8_nano": {
+      "id": 2,
+      "identifier": "yolov8_nano",
+      "dispatch_deps_path": "zephyr-chipyard-sw/gen/vmfb/yolov8_nano/firesim_rocket_saturn/gemmini/yolov8_nano.int8/yolov8_nano.int8_dispatch_graph.json"
+    }
+  },
+  "edges": []
+}

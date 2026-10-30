@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "arm": "A",
+  "workload_id": "mlp_generic_scalar_smoke",
+  "run_id": "2026-05-26T06-59-24Z",
+  "git_sha": "7ea176a",
+  "started_at": "2026-05-26T06:59:24.715829+00:00",
+  "ended_at": "2026-05-26T06:59:31.849145+00:00",
+  "wall_clock_s": 7.133,
+  "peak_rss_mb": 99.8,
+  "exit_status": "ok",
+  "model": "mlp_generic",
+  "target": "scalar",
+  "quant": "int8",
+  "runner": "spike"
+}

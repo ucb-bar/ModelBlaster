@@ -1,0 +1,72 @@
+You will write a C implementation of the fused kernel below.
+The output must be:
+  * A SINGLE C function with EXACTLY the signature below.
+  * Self-contained: include any helpers as `static inline` above the function.
+  * Bit-exact match vs the reference impl. The verification compares
+    output element-by-element with max_abs_err == 0.
+  * No `#include` statements — they are added by the harness.
+  * No comments other than 1-2 short lines explaining each major step.
+
+IMPORTANT — PORTABILITY REQUIREMENT:
+  * Do NOT use RISC-V vector intrinsics (`__riscv_v*`, `vint*_t`,
+    `vfloat*_t`, etc.) in this kernel. Write PORTABLE C99 only.
+  * You may use: static inline helpers, restrict pointers,
+    precomputed LUTs, manual unrolling, loop tiling, strength
+    reduction (replace divides with reciprocal multiplies), and
+    plain arrays. These are real optimizations that compile on
+    any target including x86-64 (verification) and rv64-gcc
+    (production).
+  * The LUT and register-resident intermediate value from the
+    algorithm description are the WIN — implement those as
+    plain C. The RVV intrinsic version is generated separately
+    later; do not include it here.
+  * Use `expf`, `roundf`, etc. from <math.h> (already included).
+
+SIGNATURE (must match exactly, no rename, no reorder):
+void kernel_batchnorm2d_silu_s8(const int8_t *input, const float *scale, const float *bias, int8_t *output, int N, int C, int H, int W, float bn_scale_in, float bn_scale_out, int bn_activation_min, int bn_activation_max, float silu_scale_in, float silu_scale_out, int silu_activation_min, int silu_activation_max)
+
+REFERENCE IMPLEMENTATION (your output must produce bit-identical results):
+void kernel_batchnorm2d_silu_s8(
+    const int8_t *input, const float *scale, const float *bias,
+    int8_t *output,
+    int N, int C, int H, int W,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max,
+    float silu_scale_in, float silu_scale_out,
+    int silu_activation_min, int silu_activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float s = scale[c];
+            float b = bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    /* --- batchnorm2d_s8 math --- */
+                    float fv = (float)input[idx] * bn_scale_in;
+                    float y = s * fv + b;
+                    int32_t bv = (int32_t)roundf(y / bn_scale_out);
+                    if (bv < bn_activation_min) bv = bn_activation_min;
+                    if (bv > bn_activation_max) bv = bn_activation_max;
+                    int8_t bn_int8 = (int8_t)bv;
+                    /* --- silu_s8 math, in-register (no intermediate tensor) --- */
+                    float fbv = (float)bn_int8 * silu_scale_in;
+                    float sy = fbv / (1.0f + expf(-fbv));
+                    int32_t v = (int32_t)roundf(sy / silu_scale_out);
+                    if (v < silu_activation_min) v = silu_activation_min;
+                    if (v > silu_activation_max) v = silu_activation_max;
+                    output[idx] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+
+
+ALGORITHM TO IMPLEMENT (target_affinity=('gemmini',)):
+Gemmini doesn't run BN natively (it's a matmul/conv accelerator) — the fused BN+SiLU runs on the scalar host or via gemmini's activation-stage LUT slot if available. The fused kernel reduces the per-channel (scale, bias) memory traffic by a factor of 2 vs running BN and SiLU as separate dispatches (each of which would load the per-channel params anew).
+
+Verify gate: bit-exact match vs reference scalar impl.
+
+OUTPUT FORMAT:
+Wrap your final answer in ```c ... ``` fences. Output ONLY the code,
+nothing else. No prose before or after the fenced block.

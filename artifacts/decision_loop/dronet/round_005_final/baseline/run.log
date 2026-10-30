@@ -1,0 +1,5 @@
+[measure_candidate] hint=artifacts/decision_loop/dronet/round_005_final/_empty_hint.json (modelblaster.fusion_hints/v1)  model=dronet
+apply_fusion_hint: no fuse_groups for network 'dronet' in artifacts/decision_loop/dronet/round_005_final/_empty_hint.json — copying IR through unchanged
+apply_fusion_hint: wrote artifacts/decision_loop/dronet/round_005_final/baseline/dronet.afterhint.graph.json (0 fused ops, 30 total dispatches; input had 30)
+ingest_measured_cycles: wrote artifacts/decision_loop/dronet/round_005_final/baseline/measured_cycles.json (n=30, total=454544606 cyc, wall=4546550)
+[measure_candidate] OK -> artifacts/decision_loop/dronet/round_005_final/baseline/measured_cycles.json

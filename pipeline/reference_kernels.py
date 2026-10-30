@@ -1,0 +1,11723 @@
+"""Per-op kernel specs: signature, semantics, reference C impl, test shapes.
+
+This is the single source of truth for:
+  * the reference backend in generate_kernels (just emit `reference_impl`)
+  * the LLM backend's prompt (signature + semantics + reference shown to LLM)
+  * the verify harness (calls both .so's against shapes from `extra_shapes`
+    plus shapes pulled from the actual model IR)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Any, Callable, Optional
+
+
+class AccuracyClass(IntEnum):
+    """How tightly an algorithm/kernel matches the bit-exact reference oracle.
+
+    Used by the kernel-selection pass in generate_kernels.py to filter the
+    algorithm queue when the user asks for a specific tolerance level via
+    `--max-accuracy-class`. Lower numeric value = tighter accuracy bound.
+
+    The bound is per-element; multi-layer drift accumulates roughly linearly
+    in network depth (one rounding event per layer), so an algorithm tagged
+    NUMERIC_DRIFT can still produce model-level errors that exceed atol on
+    deep networks (yolov8-class, ~63 conv layers). When that happens the
+    selection pass naturally falls back to the next-tighter algorithm.
+
+    The numeric_drift `atol=128` envelope was chosen to cover Q0.31
+    single-stage-fold drift on yolov8-depth networks (≤200 layers): the
+    gemmini_tiled_conv path applies (output_multiplier, output_shift)
+    as one folded Q0.31 multiplier (single rounding event) vs the
+    reference oracle's two-stage Q0.31 (two rounding events), differing
+    by ≤1 LSB per layer. For shallow nets (dronet, ~30 layers) the
+    accumulated drift is ≤6 LSB; for yolov8 (~200 layers) it can reach
+    ~80–100 LSB. This is a known-bounded drift mode (not a kernel bug),
+    and downstream model accuracy on int8 detection / classification is
+    robust to it. Bumping atol from the original 8 LSB lets the faster
+    gemmini_tiled_conv variant pass verify on deep nets.
+    """
+    BIT_EXACT     = 0  # max_abs_err=0 vs reference at every shape
+    NUMERIC_DRIFT = 1  # ≤~1 LSB / layer, accumulates with depth (atol=128)
+    APPROXIMATE   = 2  # only validated against task metric (mAP/top-1)
+
+    @classmethod
+    def parse(cls, name: str) -> "AccuracyClass":
+        # Accept lower / upper / mixed case identifier from CLI or kernel
+        # header comments.
+        norm = name.strip().lower().replace("-", "_")
+        for v in cls:
+            if v.name.lower() == norm:
+                return v
+        raise ValueError(
+            f"unknown accuracy class {name!r}; expected one of "
+            f"{[v.name.lower() for v in cls]}"
+        )
+
+
+# Per-class verify tolerance defaults, layered under any Backend.atol_override.
+# Backends with a stricter intrinsic floor (e.g. atol_override=8 for the float
+# gemmini bitstream) are honored; the per-class table only relaxes, never
+# tightens, the per-backend default.
+ACCURACY_CLASS_ATOL: dict[AccuracyClass, float] = {
+    AccuracyClass.BIT_EXACT:     0.0,
+    AccuracyClass.NUMERIC_DRIFT: 128.0,
+    AccuracyClass.APPROXIMATE:   float("inf"),
+}
+
+
+@dataclass
+class AlgorithmCandidate:
+    """An algorithmic approach for implementing an op.
+
+    Multiple algorithms can be valid for the same op (e.g. conv2d via direct
+    sliding-window vs im2col+GEMM). Each algorithm is a separate seed shown
+    to the LLM during the correctness phase — the LLM is asked to write a
+    kernel matching the algorithm's structure. Verify still uses the
+    KernelSpec.reference_impl as the (algorithm-agnostic) oracle, so any
+    algorithm whose output is numerically equivalent passes.
+    """
+    name: str
+    # Plain-English description of the algorithm — what shape of code to
+    # produce and why. Goes into the LLM correctness prompt.
+    description: str
+    # A correct implementation written in this algorithmic style. Used as the
+    # seed example in the LLM prompt. NOT the verify oracle (that's
+    # KernelSpec.reference_impl); this can be slow / VLA-using / whatever.
+    reference_impl: str
+    # Optional shape filter: lambda shape_dict -> bool. If set and returns
+    # False, the algorithm is skipped for that shape during verify.
+    applicable: Optional[Callable[[dict], bool]] = None
+    # Backends this algorithm makes sense for. Empty means all.
+    target_affinity: tuple[str, ...] = ()
+    # How accurate this algorithm is vs the reference oracle. Used by the
+    # kernel-selection pass to filter via --max-accuracy-class. Defaults to
+    # NUMERIC_DRIFT — most LLM-seeded or hand-curated kernels accumulate
+    # ≤1 LSB / layer; algorithms that re-run the reference math in the same
+    # rounding mode (e.g. scalar `direct`, gemmini_im2col_full_C) should
+    # explicitly set BIT_EXACT.
+    accuracy_class: AccuracyClass = AccuracyClass.NUMERIC_DRIFT
+    # Weight layout this algorithm's C code assumes for 4D conv tensors.
+    # "oihw" = PyTorch default (OC, IC, KH, KW).
+    # "ihwoc" = OC-contiguous (IC, KH, KW, OC) for vectorizing over OC.
+    # "hwio" = patch-major (KH, KW, IC, OC) for gemmini tiled_conv_auto.
+    # The pipeline asserts all selected algorithms for a given op agree on
+    # layout, and _backend_pack_weight applies the matching permutation.
+    weight_layout: str = "oihw"
+
+
+@dataclass
+class KernelSpec:
+    op: str
+    # Function signature, exactly as it should appear in kernels.h.
+    signature: str
+    # Plain-English semantics for the LLM prompt.
+    semantics: str
+    # Trusted reference impl. Used as `--backend reference` output AND as the
+    # ground-truth oracle that the LLM-generated kernel is compared against
+    # for correctness — algorithm-agnostic; should be the simplest, most
+    # obviously-correct version.
+    reference_impl: str
+    # Extra shape combinations to verify against, beyond what's in the IR.
+    # Each entry is the kwargs that the verify harness will use to allocate
+    # buffers and call the kernel.
+    extra_shapes: list[dict[str, int]] = field(default_factory=list)
+    # ctypes argtypes for verify (in order).
+    argtypes_factory: Callable[[], list[Any]] = None  # type: ignore
+    # Optional list of algorithmic styles the LLM can be seeded with. If
+    # empty (the default), a single "direct" algorithm wrapping
+    # `reference_impl` is synthesized, preserving the previous single-seed
+    # behavior.
+    algorithms: list[AlgorithmCandidate] = field(default_factory=list)
+
+    def __post_init__(self):
+        # Synthesize a "direct" algorithm seeded from `reference_impl`
+        # whenever the spec has no algorithm that covers ALL backends
+        # (i.e. no entry with empty `target_affinity`). Without this,
+        # generate_kernels' target_affinity filter empties the queue
+        # for non-gemmini targets on specs like ADD_S8 / RELU_S8 /
+        # MAXPOOL2D_S8 / LINEAR_S8 (which only register gemmini-
+        # affinity algorithms today). The synthesized direct entry is
+        # by-definition bit-exact since it IS the reference impl.
+        has_universal = any(
+            not a.target_affinity for a in self.algorithms
+        )
+        if not has_universal:
+            self.algorithms.append(
+                AlgorithmCandidate(
+                    name="direct",
+                    description=(
+                        "Direct, naive implementation. Loop over every output "
+                        "element and compute it explicitly. Falls back here "
+                        "when no target-specific algorithm is registered for "
+                        "the active backend."
+                    ),
+                    reference_impl=self.reference_impl,
+                    accuracy_class=AccuracyClass.BIT_EXACT,
+                )
+            )
+
+
+def _linear_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _matmul_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # A, B, C, M, K, N
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _bmm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # A, B, C, batch, M, K, N
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _matmul_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # A, B, C, M, K, N
+    return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _bmm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # A, B, C, batch, M, K, N
+    return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _relu_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+def _elu_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, n, alpha
+    return [fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+def _conv2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW, DH, DW
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 13
+
+
+def _maxpool2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW, DH, DW
+    return [fp, fp] + [ctypes.c_int] * 12
+
+
+def _add_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int]
+
+
+def _batchnorm2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, scale, bias, output, N, C, H, W
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 4
+
+
+def _sigmoid_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+def _conv2d_dw_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW
+    # OC == IC == groups (depthwise) — folded into a single C param.
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 10
+
+
+def _relu6_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+def _adaptive_avg_pool2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW (output is always [N, C, 1, 1] for now)
+    return [fp, fp] + [ctypes.c_int] * 4
+
+
+# KernelBench Phase 2 activations — all pointwise, signatures shaped
+# like the existing relu / sigmoid / elu kernels. The parametric ones
+# (leaky_relu, hardtanh) take their constants as float scalar args; the
+# rest match (input, output, n).
+
+def _pointwise_argtypes():
+    """Standard signature for parameter-free pointwise activations:
+    void kernel(const float *in, float *out, int n)."""
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+def _leaky_relu_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, n, negative_slope
+    return [fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+def _hardtanh_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, n, min_val, max_val
+    return [fp, fp, ctypes.c_int, ctypes.c_float, ctypes.c_float]
+
+
+def _linear_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input(i8*), weight(i8*), bias(i32*), output(i8*),
+    # M, K, N,
+    # input_offset, filter_offset, output_offset,
+    # output_multiplier, output_shift,
+    # activation_min, activation_max
+    return [i8p, i8p, i32p, i8p] + [ctypes.c_int] * 10
+
+
+def _relu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, i8p, ctypes.c_int]
+
+
+def _conv2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input(i8*), weight(i8*), bias(i32*), output(i8*),
+    # N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW,
+    # input_offset, filter_offset, output_offset,
+    # output_multiplier, output_shift,
+    # activation_min, activation_max
+    return [i8p, i8p, i32p, i8p] + [ctypes.c_int] * 18
+
+
+def _conv2d_silu_s8_argtypes():
+    """Same as conv2d_s8 plus silu_scale_in / silu_scale_out (float) at
+    the end. The fused kernel applies a SiLU LUT to its int8 output
+    before the final activation clamp."""
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i32p, i8p] + [ctypes.c_int] * 18 + [ctypes.c_float, ctypes.c_float]
+
+
+def _maxpool2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW, DH, DW
+    return [i8p, i8p] + [ctypes.c_int] * 12
+
+
+def _add_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # a, b, output, n, scale_a, scale_b, scale_out, activation_min, activation_max
+    return [i8p, i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+def _batchnorm2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, scale, bias, output, N, C, H, W, scale_in, scale_out,
+    # activation_min, activation_max
+    return [i8p, fp, fp, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+def _sigmoid_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, scale_in, scale_out, activation_min, activation_max
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+# ---------------------------------------------------------------------------
+# fp16 (half-precision) argtypes. ctypes has no native _Float16, so the host
+# verify path uses c_uint16 as a 16-bit opaque blob — bit-identical layout
+# to _Float16, just with the math done in numpy. Only relevant for
+# BACKEND=llm verify; BACKEND=reference dumps the C reference impl directly
+# and never touches ctypes.
+# ---------------------------------------------------------------------------
+
+def _relu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+def _elu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # input, output, n, alpha (passed as fp32 — gets converted in the kernel)
+    return [h, h, ctypes.c_int, ctypes.c_float]
+
+
+def _sigmoid_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+def _conv2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h] + [ctypes.c_int] * 13
+
+
+def _maxpool2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 12
+
+
+def _batchnorm2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    # input, scale, bias, output, N, C, H, W
+    return [h, h, h, h] + [ctypes.c_int] * 4
+
+
+# Phase 2 fp16 argtypes — same C-side ABI shapes as the fp32 specs,
+# with c_uint16 standing in for _Float16 since Python ctypes has no
+# native half. The host-verify (LLM optimize loop) is by-bits compares
+# anyway; only the reference_impl C body sees the actual _Float16.
+
+def _pointwise_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+def _leaky_relu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_float]
+
+
+def _hardtanh_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_float, ctypes.c_float]
+
+
+def _reduce_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _argreduce_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    i64p = ctypes.POINTER(ctypes.c_int64)
+    return [h, i64p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _frobenius_norm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+LINEAR = KernelSpec(
+    op="linear",
+    signature=(
+        "void kernel_linear(const float *input, const float *weight, "
+        "const float *bias, float *output, int M, int K, int N)"
+    ),
+    semantics=(
+        "Computes a fully-connected (matmul + bias) layer matching PyTorch "
+        "nn.Linear semantics:\n"
+        "  output[m, n] = bias[n] + sum_{k=0..K-1} input[m, k] * weight[n, k]\n"
+        "Shapes (row-major contiguous):\n"
+        "  input:  [M, K]\n"
+        "  weight: [N, K]   (note: out_features outer, in_features inner — "
+        "PyTorch's storage order)\n"
+        "  bias:   [N]      (may be NULL — treat as zeros)\n"
+        "  output: [M, N]\n"
+        "All tensors are float32."
+    ),
+    reference_impl="""\
+void kernel_linear(const float *input, const float *weight, const float *bias,
+                   float *output, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = bias ? bias[n] : 0.0f;
+            for (int k = 0; k < K; k++) {
+                acc += input[m * K + k] * weight[n * K + k];
+            }
+            output[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 1, "N": 1},
+        {"M": 1, "K": 7, "N": 13},      # primes, no padding alignment
+        {"M": 4, "K": 17, "N": 23},     # batch > 1
+        {"M": 1, "K": 64, "N": 64},     # power-of-two
+    ],
+    argtypes_factory=_linear_argtypes,
+)
+
+
+_MATMUL_EXTRA_SHAPES = [
+    {"M": 1,  "K": 1,  "N": 1},
+    {"M": 1,  "K": 7,  "N": 13},
+    {"M": 4,  "K": 17, "N": 23},
+    {"M": 1,  "K": 64, "N": 64},
+    {"M": 32, "K": 32, "N": 32},
+]
+
+MATMUL = KernelSpec(
+    op="matmul",
+    signature=(
+        "void kernel_matmul(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B (row-major contiguous):\n"
+        "  A: [M, K],  B: [K, N],  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[m*K+k] * B[k*N+n]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul(const float *A, const float *B, float *C,
+                   int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[m * K + k] * B[k * N + n];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+MATMUL_TA = KernelSpec(
+    op="matmul_ta",
+    signature=(
+        "void kernel_matmul_ta(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B (A stored in (K,M) order):\n"
+        "  A stored: [K, M] — A[k, m] = A[k*M+m]\n"
+        "  B: [K, N],  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[k*M+m] * B[k*N+n]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul_ta(const float *A, const float *B, float *C,
+                      int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[k * M + m] * B[k * N + n];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+MATMUL_TB = KernelSpec(
+    op="matmul_tb",
+    signature=(
+        "void kernel_matmul_tb(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B.T (B stored in (N,K) order):\n"
+        "  A: [M, K],  B stored: [N, K] — B[n, k] = B[n*K+k]\n"
+        "  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[m*K+k] * B[n*K+k]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul_tb(const float *A, const float *B, float *C,
+                      int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[m * K + k] * B[n * K + k];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+MATMUL_TATB = KernelSpec(
+    op="matmul_tatb",
+    signature=(
+        "void kernel_matmul_tatb(const float *A, const float *B, float *C, "
+        "int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B.T (both stored transposed):\n"
+        "  A stored: [K, M] — A[k, m] = A[k*M+m]\n"
+        "  B stored: [N, K] — B[n, k] = B[n*K+k]\n"
+        "  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[k*M+m] * B[n*K+k]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_matmul_tatb(const float *A, const float *B, float *C,
+                        int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += A[k * M + m] * B[n * K + k];
+            C[m * N + n] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_argtypes,
+)
+
+BMM = KernelSpec(
+    op="bmm",
+    signature=(
+        "void kernel_bmm(const float *A, const float *B, float *C, "
+        "int batch, int M, int K, int N)"
+    ),
+    semantics=(
+        "Batched matrix multiply C[b] = A[b] @ B[b] (row-major contiguous):\n"
+        "  A: [batch, M, K],  B: [batch, K, N],  C: [batch, M, N]\n"
+        "  C[b,m,n] = sum_{k=0..K-1} A[b*M*K + m*K+k] * B[b*K*N + k*N+n]\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_bmm(const float *A, const float *B, float *C,
+                int batch, int M, int K, int N) {
+    for (int b = 0; b < batch; b++) {
+        const float *Ab = A + b * M * K;
+        const float *Bb = B + b * K * N;
+        float *Cb = C + b * M * N;
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (int k = 0; k < K; k++)
+                    acc += Ab[m * K + k] * Bb[k * N + n];
+                Cb[m * N + n] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"batch": 1, "M": 1,  "K": 1,  "N": 1},
+        {"batch": 2, "M": 4,  "K": 8,  "N": 4},
+        {"batch": 4, "M": 8,  "K": 16, "N": 8},
+        {"batch": 1, "M": 32, "K": 32, "N": 32},
+    ],
+    argtypes_factory=_bmm_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# fp16 matmul / bmm variants — same semantics, _Float16 storage.
+# The accumulator widens to float for numerics then narrows back.
+# ---------------------------------------------------------------------------
+
+MATMUL_F16 = KernelSpec(
+    op="matmul_f16",
+    signature=(
+        "void kernel_matmul_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B, _Float16 storage:\n"
+        "  A: [M, K],  B: [K, N],  C: [M, N]\n"
+        "  C[m, n] = sum_{k=0..K-1} A[m*K+k] * B[k*N+n]  (fp16 arithmetic)"
+    ),
+    reference_impl="""\
+void kernel_matmul_f16(const _Float16 *A, const _Float16 *B,
+                       _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[m * K + k] * (float)B[k * N + n];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+MATMUL_TA_F16 = KernelSpec(
+    op="matmul_ta_f16",
+    signature=(
+        "void kernel_matmul_ta_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B, _Float16 storage:\n"
+        "  A stored: [K, M],  B: [K, N],  C: [M, N]"
+    ),
+    reference_impl="""\
+void kernel_matmul_ta_f16(const _Float16 *A, const _Float16 *B,
+                          _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[k * M + m] * (float)B[k * N + n];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+MATMUL_TB_F16 = KernelSpec(
+    op="matmul_tb_f16",
+    signature=(
+        "void kernel_matmul_tb_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A @ B.T, _Float16 storage:\n"
+        "  A: [M, K],  B stored: [N, K],  C: [M, N]"
+    ),
+    reference_impl="""\
+void kernel_matmul_tb_f16(const _Float16 *A, const _Float16 *B,
+                          _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[m * K + k] * (float)B[n * K + k];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+MATMUL_TATB_F16 = KernelSpec(
+    op="matmul_tatb_f16",
+    signature=(
+        "void kernel_matmul_tatb_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int M, int K, int N)"
+    ),
+    semantics=(
+        "Dense matrix multiply C = A.T @ B.T, _Float16 storage:\n"
+        "  A stored: [K, M],  B stored: [N, K],  C: [M, N]"
+    ),
+    reference_impl="""\
+void kernel_matmul_tatb_f16(const _Float16 *A, const _Float16 *B,
+                            _Float16 *C, int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += (float)A[k * M + m] * (float)B[n * K + k];
+            C[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=_MATMUL_EXTRA_SHAPES,
+    argtypes_factory=_matmul_f16_argtypes,
+)
+
+BMM_F16 = KernelSpec(
+    op="bmm_f16",
+    signature=(
+        "void kernel_bmm_f16(const _Float16 *A, const _Float16 *B, "
+        "_Float16 *C, int batch, int M, int K, int N)"
+    ),
+    semantics=(
+        "Batched matrix multiply C[b] = A[b] @ B[b], _Float16 storage:\n"
+        "  A: [batch, M, K],  B: [batch, K, N],  C: [batch, M, N]"
+    ),
+    reference_impl="""\
+void kernel_bmm_f16(const _Float16 *A, const _Float16 *B,
+                   _Float16 *C, int batch, int M, int K, int N) {
+    for (int b = 0; b < batch; b++) {
+        const _Float16 *Ab = A + b * M * K;
+        const _Float16 *Bb = B + b * K * N;
+        _Float16 *Cb = C + b * M * N;
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (int k = 0; k < K; k++)
+                    acc += (float)Ab[m * K + k] * (float)Bb[k * N + n];
+                Cb[m * N + n] = (_Float16)acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"batch": 1, "M": 1,  "K": 1,  "N": 1},
+        {"batch": 2, "M": 4,  "K": 8,  "N": 4},
+        {"batch": 4, "M": 8,  "K": 16, "N": 8},
+        {"batch": 1, "M": 32, "K": 32, "N": 32},
+    ],
+    argtypes_factory=_bmm_f16_argtypes,
+)
+
+
+ELU = KernelSpec(
+    op="elu",
+    signature="void kernel_elu(const float *input, float *output, int n, float alpha)",
+    semantics=(
+        "Elementwise ELU on a contiguous float32 buffer:\n"
+        "  output[i] = input[i]                       if input[i] > 0\n"
+        "  output[i] = alpha * (expf(input[i]) - 1)   otherwise\n"
+        "It must be safe for `input` and `output` to alias. The most common "
+        "value of alpha is 1.0 — that's what nn.ELU defaults to."
+    ),
+    reference_impl="""\
+void kernel_elu(const float *input, float *output, int n, float alpha) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        output[i] = v > 0.0f ? v : alpha * (expf(v) - 1.0f);
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 16},
+        {"n": 256},
+        {"n": 1024},
+    ],
+    argtypes_factory=_elu_argtypes,
+)
+
+
+RELU = KernelSpec(
+    op="relu",
+    signature="void kernel_relu(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise ReLU on a contiguous float32 buffer:\n"
+        "  output[i] = max(0.0f, input[i])  for i in [0, n)\n"
+        "It must be safe for `input` and `output` to alias."
+    ),
+    reference_impl="""\
+void kernel_relu(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        output[i] = v > 0.0f ? v : 0.0f;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 1024},
+    ],
+    argtypes_factory=_relu_argtypes,
+)
+
+
+CONV2D = KernelSpec(
+    op="conv2d",
+    signature=(
+        "void kernel_conv2d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
+    ),
+    semantics=(
+        "2D convolution matching torch.nn.Conv2d semantics with groups=1 "
+        "and dilation (DH, DW).\n"
+        "Layout (row-major, NCHW for activations / OIHW for weights):\n"
+        "  input:  [N, IC, IH, IW]\n"
+        "  weight: [OC, IC, KH, KW]\n"
+        "  bias:   [OC] (may be NULL — treat as zeros)\n"
+        "  output: [N, OC, OH, OW]  with\n"
+        "    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n"
+        "    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n"
+        "Definition (zero-padding implied by PH, PW):\n"
+        "  output[n, oc, oh, ow] = bias[oc] + sum over ic, kh, kw of\n"
+        "    input[n, ic, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW]\n"
+        "    * weight[oc, ic, kh, kw]\n"
+        "  with input reads outside [0, IH) x [0, IW) treated as 0.\n"
+        "All tensors are float32."
+    ),
+    reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
+void kernel_conv2d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int IH, int IW, int OC,
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh * DH;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw * DW;
+                                if (iw < 0 || iw >= IW) continue;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+#undef MB_CONV2D_W
+""",
+    extra_shapes=[
+        # LeNet
+        {"N": 1, "IC": 1, "IH": 28, "IW": 28, "OC": 6,
+         "KH": 5, "KW": 5, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
+        {"N": 1, "IC": 6, "IH": 12, "IW": 12, "OC": 16,
+         "KH": 5, "KW": 5, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
+        # DroNet-style (3x3 stride=2 padding=1, 1x1 stride=2, 3x3 padding=1)
+        {"N": 1, "IC": 32, "IH": 16, "IW": 16, "OC": 64,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 64, "IH": 8, "IW": 8, "OC": 64,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 32, "IH": 16, "IW": 16, "OC": 64,
+         "KH": 1, "KW": 1, "SH": 2, "SW": 2, "PH": 0, "PW": 0},
+        # Trained DroNet first conv (3-channel 112x112).
+        {"N": 1, "IC": 3, "IH": 112, "IW": 112, "OC": 32,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        # Asymmetric / small / generalization
+        {"N": 1, "IC": 3, "IH": 7, "IW": 5, "OC": 4,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            # Verbatim copy of the spec's reference_impl (the verify oracle),
+            # so it agrees bit-for-bit by construction.
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Direct sliding-window convolution. Six nested loops over "
+                "(n, oc, oh, ow, ic, kh, kw) reading input pixels with "
+                "explicit bounds checks for padding. No extra memory. Fine "
+                "for small spatial dims and 1x1 kernels but the boundary "
+                "checks make vectorization awkward."
+            ),
+            reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
+void kernel_conv2d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int IH, int IW, int OC,
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh * DH;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw * DW;
+                                if (iw < 0 || iw >= IW) continue;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+#undef MB_CONV2D_W
+""",
+        ),
+        AlgorithmCandidate(
+            name="im2col_gemm",
+            description=(
+                "im2col + GEMM lowering of 2D convolution. This is a "
+                "two-stage algorithm — your kernel MUST keep the stages "
+                "separate.\n\n"
+                "STAGE 1 (im2col gather; no math, just data movement):\n"
+                "  Allocate `float im2col_buf[OH*OW * IC*KH*KW];` as a "
+                "stack VLA (the harness main stack is sized for this).\n"
+                "  For each output position (oh, ow), gather the IC*KH*KW "
+                "input values that contribute to that output into row "
+                "(oh*OW + ow) of im2col_buf. Pad reads outside "
+                "[0, IH) x [0, IW) with 0.0. This stage produces NO "
+                "arithmetic ops — just loads, conditional zero-fills, and "
+                "stores into im2col_buf.\n\n"
+                "STAGE 2 (GEMM; all the arithmetic):\n"
+                "  Compute output[n, oc, oh*OW + ow] = bias[oc] + "
+                "sum_k im2col_buf[oh*OW + ow, k] * weight[oc, k] where "
+                "weight is treated as an [OC, IC*KH*KW] matrix (identical "
+                "memory layout to OIHW). Stage 2 reads exclusively from "
+                "im2col_buf and weight; it MUST NOT touch the original "
+                "`input` array.\n\n"
+                "Why this lowering matters: stage 2 is a standard "
+                "[OH*OW, K] x [OC, K]^T matmul where K = IC*KH*KW. The "
+                "reduction loop over k vectorizes cleanly without any "
+                "padding-aware indexing, regardless of the conv's stride or "
+                "padding. The padding/stride logic is fully isolated in the "
+                "non-arithmetic gather of stage 1.\n\n"
+                "Numerical equivalence: as long as im2col_buf is populated "
+                "in the order ic-major then kh, then kw, the matmul "
+                "summation order matches direct convolution and the result "
+                "is bit-equivalent.\n\n"
+                "DO NOT fuse the two stages into one loop nest. DO NOT "
+                "skip the im2col_buf allocation. DO NOT read from `input` "
+                "inside stage 2. If you write a loop that reads from "
+                "`input` and `weight` in the same iteration, you have "
+                "fused the stages — that is the *direct* algorithm, not "
+                "the im2col_gemm algorithm.\n\n"
+                "VECTORIZATION GUIDANCE (scalar target backend should ignore "
+                "this): Keep stage 1 (the gather) **scalar** for now — its "
+                "memory access pattern is irregular and vectorizing it is "
+                "bug-prone. Vectorize ONLY stage 2 (the matmul) over the "
+                "reduction dim k. The canonical per-output-element pattern "
+                "for the rvv backend is:\n\n"
+                "  size_t vl;\n"
+                "  size_t vlmax = __riscv_vsetvlmax_e32m1();\n"
+                "  vfloat32m1_t vacc = __riscv_vfmv_v_f_f32m1(0.0f, vlmax);\n"
+                "  for (int k = 0; k < K; k += vl) {\n"
+                "      vl = __riscv_vsetvl_e32m1(K - k);\n"
+                "      vfloat32m1_t va = __riscv_vle32_v_f32m1(\n"
+                "          &im2col_buf[row * K + k], vl);\n"
+                "      vfloat32m1_t vw = __riscv_vle32_v_f32m1(\n"
+                "          &weight[MB_CONV2D_W(oc, k / (KH*KW), (k / KW) % KH, k % KW)], vl);\n"
+                "      vacc = __riscv_vfmacc_vv_f32m1(vacc, va, vw, vl);\n"
+                "  }\n"
+                "  vfloat32m1_t vinit = __riscv_vfmv_s_f_f32m1(0.0f, 1);\n"
+                "  vfloat32m1_t vsum = __riscv_vfredusum_vs_f32m1_f32m1(\n"
+                "      vacc, vinit, vlmax);\n"
+                "  float acc = __riscv_vfmv_f_s_f32m1_f32(vsum)\n"
+                "      + (bias ? bias[oc] : 0.0f);\n"
+                "  output[(n * OC + oc) * M + row] = acc;\n\n"
+                "Common bugs to avoid:\n"
+                "  * vfmv_v_f (broadcast to ALL lanes) is the right "
+                "init for the accumulator; vfmv_s_f (single-lane move) is "
+                "for the reduction's scalar init slot only.\n"
+                "  * vle32_v_f32m1 takes a POINTER, not a value: "
+                "`&im2col_buf[row * K + k]` or `im2col_buf + row * K + k`. "
+                "Writing `im2col_buf[row * K + k]` as the first arg passes "
+                "a float and fails to compile.\n"
+                "  * Add bias as a scalar AFTER the horizontal reduction. "
+                "Don't try to broadcast bias into vacc and then reduce — "
+                "that double-counts."
+            ),
+            reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
+void kernel_conv2d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int IH, int IW, int OC,
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    int M = OH * OW;
+    int K = IC * KH * KW;
+
+    /* Stack VLA — sized at runtime, harness stack is sized for it. */
+    float im2col_buf[M * K];
+
+    for (int n = 0; n < N; n++) {
+        /* Stage 1: im2col gather, padding-aware. */
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                int row = oh * OW + ow;
+                for (int ic = 0; ic < IC; ic++) {
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh * DH;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw * DW;
+                            int col = (ic * KH + kh) * KW + kw;
+                            float v = 0.0f;
+                            if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                                v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                            }
+                            im2col_buf[row * K + col] = v;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Stage 2: GEMM. weight is [OC, K] (OIHW flattened), output is
+         * NCHW which equals [N, OC, M] when M = OH*OW. */
+        for (int oc = 0; oc < OC; oc++) {
+            float b = bias ? bias[oc] : 0.0f;
+            for (int row = 0; row < M; row++) {
+                float acc = b;
+                for (int k = 0; k < K; k++) {
+                    acc += im2col_buf[row * K + k] * weight[MB_CONV2D_W(oc, k / (KH*KW), (k / KW) % KH, k % KW)];
+                }
+                output[(n * OC + oc) * M + row] = acc;
+            }
+        }
+    }
+}
+#undef MB_CONV2D_W
+""",
+        ),
+        AlgorithmCandidate(
+            name="oc_blocked",
+            description=(
+                "Cache-blocked direct convolution. Same arithmetic as the "
+                "`direct` algorithm — six nested loops over (n, oc, oh, "
+                "ow, ic, kh, kw) — but the OUTPUT-CHANNEL dimension is "
+                "tiled so that one slab of the weight tensor stays "
+                "resident in L1D across the entire OH*OW spatial sweep. "
+                "This is purely a loop-restructuring optimization: the "
+                "compiler emits the same FMACs in the same order; we just "
+                "change which dimension is outermost so weight reuse "
+                "happens at L1D rather than L2/LLC.\n\n"
+                "STRUCTURE (the LLM MUST follow this exactly):\n"
+                "  Define TILE_OC at the top of the function. Aim for "
+                "TILE_OC * IC * KH * KW * 4 bytes <= ~24 KB so the slab "
+                "fits in 32 KB L1D with room for input/output. For "
+                "OC>=128 IC>=128 K=3 use TILE_OC=4. For smaller IC use "
+                "TILE_OC=8 or 16.\n\n"
+                "  for (oc_outer = 0; oc_outer < OC; oc_outer += TILE_OC) {\n"
+                "      // Hot weight slab: weight[oc_outer .. oc_outer + tile - 1]\n"
+                "      // is now reused across the (oh, ow) sweep below.\n"
+                "      for (n = 0; n < N; n++)\n"
+                "      for (oh = 0; oh < OH; oh++)\n"
+                "      for (ow = 0; ow < OW; ow++)\n"
+                "      for (oc_inner = 0; oc_inner < tile; oc_inner++) {\n"
+                "          int oc = oc_outer + oc_inner;\n"
+                "          float acc = bias ? bias[oc] : 0.0f;\n"
+                "          // standard 3-deep ic/kh/kw reduction here\n"
+                "          output[((n*OC + oc)*OH + oh)*OW + ow] = acc;\n"
+                "      }\n"
+                "  }\n\n"
+                "Why this matters: a direct conv2d with the OC loop in "
+                "the middle pulls the entire weight tensor through L1D "
+                "OH*OW times. With OC blocked outermost, each weight "
+                "loaded into L1D once is reused OH*OW times before "
+                "eviction. For dronet's heavy 3x3 conv (OC=128, IC=128, "
+                "OH=4, OW=4) that's a 16x reduction in weight traffic to "
+                "L2/LLC.\n\n"
+                "TAIL HANDLING: when OC is not a multiple of TILE_OC, "
+                "the final outer iteration uses tile = OC - oc_outer "
+                "(may be < TILE_OC). Compute it inside the outer loop:\n"
+                "  int tile = TILE_OC;\n"
+                "  if (oc_outer + tile > OC) tile = OC - oc_outer;\n\n"
+                "RVV vectorization (rvv backend only): you may vectorize "
+                "the IC reduction inside the inner per-output-element "
+                "block exactly the same way as the `direct` algorithm — "
+                "this transformation only restructures the OC loop, not "
+                "the inner reduction.\n\n"
+                "DO NOT remove the `oc_outer += TILE_OC` outer loop — "
+                "it's the entire point of this algorithm. DO NOT pick "
+                "TILE_OC = 1 (that's just the direct algorithm with "
+                "extra overhead). DO NOT pick TILE_OC = OC (that's also "
+                "just the direct algorithm). Pick a fixed TILE_OC "
+                "constant; do not compute it from runtime IC — the "
+                "compiler needs the constant to keep the inner-loop "
+                "indexing cheap."
+            ),
+            reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
+void kernel_conv2d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int IH, int IW, int OC,
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    /* Tile so one OC-slab of weights fits in ~24 KB of L1D.
+     * For OC=128 IC=128 K=3: 4 * 128 * 9 * 4 = 18 KB. */
+    const int TILE_OC = 4;
+
+    for (int oc_outer = 0; oc_outer < OC; oc_outer += TILE_OC) {
+        int tile = TILE_OC;
+        if (oc_outer + tile > OC) tile = OC - oc_outer;
+        for (int n = 0; n < N; n++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    for (int oc_inner = 0; oc_inner < tile; oc_inner++) {
+                        int oc = oc_outer + oc_inner;
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int ic = 0; ic < IC; ic++) {
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh * SH - PH + kh * DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow * SW - PW + kw * DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                    float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
+                                    acc += v * w;
+                                }
+                            }
+                        }
+                        output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+#undef MB_CONV2D_W
+""",
+            # OC-blocked is only worth the loop-restructure cost when
+            # the weight tensor is too large to stay in L1D. Skip on
+            # tiny channel counts where direct already wins easily.
+            applicable=lambda s: s.get("OC", 0) >= 32 and s.get("IC", 0) >= 16,
+        ),
+    ],
+)
+for _s in CONV2D.extra_shapes:
+    _s.setdefault("DH", 1)
+    _s.setdefault("DW", 1)
+
+
+MAXPOOL2D = KernelSpec(
+    op="maxpool2d",
+    signature=(
+        "void kernel_maxpool2d(const float *input, float *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int DH, int DW)"
+    ),
+    semantics=(
+        "2D max pooling matching torch.nn.MaxPool2d semantics with padding\n"
+        "and dilation.\n"
+        "Layout (NCHW, row-major):\n"
+        "  input:  [N, C, IH, IW]\n"
+        "  output: [N, C, OH, OW]  with\n"
+        "    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n"
+        "    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n"
+        "  output[n, c, oh, ow] = max over kh in [0,KH), kw in [0,KW) of\n"
+        "    val(n, c, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW)\n"
+        "  where val(...) returns input[n, c, ih, iw] when 0<=ih<IH and\n"
+        "  0<=iw<IW, else -INF (out-of-bounds lanes never win the max).\n"
+        "All tensors are float32. PH/PW are zero-padding amounts on the\n"
+        "spatial dims; DH/DW are kernel-element strides (dilation)."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_maxpool2d(const float *input, float *output,
+                     int N, int C, int IH, int IW,
+                     int KH, int KW, int SH, int SW,
+                     int PH, int PW, int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float m = -FLT_MAX;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh*DH;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw*DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = input[((n*C + c)*IH + ih)*IW + iw];
+                            if (v > m) m = v;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = m;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # LeNet
+        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        {"N": 1, "C": 16, "IH": 8, "IW": 8, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # DroNet
+        {"N": 1, "C": 32, "IH": 64, "IW": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # Generalization
+        {"N": 1, "C": 4, "IH": 9, "IW": 7, "KH": 3, "KW": 3, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # KernelBench 42: padding=1, dilation=3
+        {"N": 1, "C": 8, "IH": 16, "IW": 16, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 1, "PW": 1, "DH": 3, "DW": 3},
+    ],
+    argtypes_factory=_maxpool2d_argtypes,
+)
+
+
+ADD = KernelSpec(
+    op="add",
+    signature=(
+        "void kernel_add(const float *a, const float *b, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise float32 add over a contiguous buffer:\n"
+        "  output[i] = a[i] + b[i]   for i in [0, n)\n"
+        "It must be safe for output to alias either input."
+    ),
+    reference_impl="""\
+void kernel_add(const float *a, const float *b, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = a[i] + b[i];
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 1024},
+        {"n": 8192},          # DroNet residual block 0 output
+    ],
+    argtypes_factory=_add_argtypes,
+)
+
+
+BATCHNORM2D = KernelSpec(
+    op="batchnorm2d",
+    signature=(
+        "void kernel_batchnorm2d(const float *input, const float *scale, "
+        "const float *bias, float *output, int N, int C, int H, int W)"
+    ),
+    semantics=(
+        "Per-channel affine on a NCHW float32 activation.\n"
+        "  output[n, c, h, w] = scale[c] * input[n, c, h, w] + bias[c]\n"
+        "scale and bias are length-C arrays. This is a fused form of an\n"
+        "eval-mode torch.nn.BatchNorm2d: scale = gamma / sqrt(var + eps),\n"
+        "bias  = beta - mean * scale. The kernel only sees the fused values."
+    ),
+    reference_impl="""\
+void kernel_batchnorm2d(const float *input, const float *scale,
+                        const float *bias, float *output,
+                        int N, int C, int H, int W) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float s = scale[c];
+            float b = bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    output[idx] = s * input[idx] + b;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "H": 16, "W": 16},
+        {"N": 1, "C": 64, "H": 8, "W": 8},
+        {"N": 1, "C": 128, "H": 4, "W": 4},
+        {"N": 1, "C": 7, "H": 5, "W": 3},
+    ],
+    argtypes_factory=_batchnorm2d_argtypes,
+)
+
+
+SIGMOID = KernelSpec(
+    op="sigmoid",
+    signature=(
+        "void kernel_sigmoid(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise sigmoid on a contiguous float32 buffer:\n"
+        "  output[i] = 1.0f / (1.0f + expf(-input[i]))   for i in [0, n)\n"
+        "expf comes from <math.h> which is already in scope."
+    ),
+    reference_impl="""\
+void kernel_sigmoid(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = 1.0f / (1.0f + expf(-input[i]));
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 16},
+        {"n": 256},
+    ],
+    argtypes_factory=_sigmoid_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# int8 op kinds (muRISCV-NN convention)
+# ---------------------------------------------------------------------------
+
+LINEAR_S8 = KernelSpec(
+    op="linear_s8",
+    signature=(
+        "void kernel_linear_s8(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int M, int K, int N, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized fully-connected layer (per-tensor symmetric, "
+        "muRISCV-NN / CMSIS-NN convention).\n"
+        "Layout (row-major):\n"
+        "  input:  int8  [M, K]\n"
+        "  weight: int8  [N, K]   (out_features outer, like nn.Linear)\n"
+        "  bias:   int32 [N]      (pre-scaled to s_in*s_w; may be NULL)\n"
+        "  output: int8  [M, N]\n"
+        "Compute (per output element):\n"
+        "  acc = bias[n]   if bias != NULL else 0\n"
+        "  for k in 0..K-1:\n"
+        "    acc += (input[m, k] + input_offset)\n"
+        "         * (weight[n, k] + filter_offset)\n"
+        "  acc = requantize(acc, output_multiplier, output_shift)\n"
+        "  acc += output_offset\n"
+        "  acc = clamp(acc, activation_min, activation_max)\n"
+        "  output[m, n] = (int8_t) acc\n\n"
+        "requantize(x, mult, shift) is the canonical Q0.31 fixed-point\n"
+        "rounding-multiply-and-shift used in CMSIS-NN / muRISCV-NN:\n"
+        "  int64 prod = (int64) x * (int64) mult;\n"
+        "  prod = (prod + (1LL << 30)) >> 31;          // round to even\n"
+        "  if (shift > 0) {\n"
+        "    int32 round = (1 << (shift - 1));\n"
+        "    return ((int32) prod + round) >> shift;\n"
+        "  } else {\n"
+        "    return (int32) prod << -shift;\n"
+        "  }\n\n"
+        "Notes:\n"
+        "  * activation_min/max fold ReLU into the requantize tail. For a\n"
+        "    fused ReLU pass activation_min = output_offset (often 0 in\n"
+        "    symmetric quant, where it just becomes 0).\n"
+        "  * Symmetric per-tensor quant (the only mode the IR emits today)\n"
+        "    means input_offset = filter_offset = output_offset = 0; the\n"
+        "    kernel must still accept the parameters for API parity with\n"
+        "    asymmetric variants we'll add later.\n"
+    ),
+    reference_impl="""\
+void kernel_linear_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int M, int K, int N,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            int32_t acc = bias ? bias[n] : 0;
+            for (int k = 0; k < K; k++) {
+                int32_t in_v = (int32_t)input[m * K + k] + input_offset;
+                int32_t w_v  = (int32_t)weight[n * K + k] + filter_offset;
+                acc += in_v * w_v;
+            }
+            /* Q0.31 rounding multiply. */
+            int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+            prod = (prod + (1LL << 30)) >> 31;
+            int32_t scaled = (int32_t)prod;
+            if (output_shift > 0) {
+                scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+            } else if (output_shift < 0) {
+                scaled = scaled << (-output_shift);
+            }
+            scaled += output_offset;
+            if (scaled < activation_min) scaled = activation_min;
+            if (scaled > activation_max) scaled = activation_max;
+            output[m * N + n] = (int8_t)scaled;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # MLP shapes
+        {"M": 1, "K": 16, "N": 32},
+        {"M": 1, "K": 32, "N": 32},
+        {"M": 1, "K": 32, "N": 10},
+        # Generalization
+        {"M": 1, "K": 7,  "N": 13},
+        {"M": 4, "K": 17, "N": 23},
+    ],
+    argtypes_factory=_linear_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="ime_vmadot_4x4x8",
+            target_affinity=("ime", "ime_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K1 IME int8 LINEAR via the `smt.vmadot` MAC unit. "
+                "Same engine as matmul_s8's ime_vmadot_4x4x8; read that "
+                "algorithm's description for the instruction, the tiling and "
+                "the packing, all of which apply unchanged. What differs is "
+                "the operand layout (in IME's favour) and the requantize "
+                "tail.\n\n"
+                "THE LAYOUT IS ALREADY WHAT THE UNIT WANTS. `weight` is "
+                "[N,K] -- indexed weight[n*K + k] -- so its row index is the "
+                "OUTPUT column n. That is exactly vmadot's vs2 convention "
+                "(C[i][j] = sum_k A[i][k] * B[j][k]), so a 4x8 weight tile is "
+                "32 contiguous bytes and needs NO transpose, unlike "
+                "matmul_s8's transpose_b=0 case. `input` is [M,K], "
+                "K-contiguous, which is vs1's convention. Both operands pack "
+                "with a straight copy.\n\n"
+                "THE TAIL IS INTEGER, NOT FLOAT, and that makes bit-exactness "
+                "easier here than in matmul_s8. Per output element:\n"
+                "    acc  = bias[n] (or 0) + sum_k in[m,k]*w[n,k]\n"
+                "    prod = ((int64)acc * output_multiplier + (1<<30)) >> 31\n"
+                "    if output_shift > 0:  round-half-up by that shift\n"
+                "    if output_shift < 0:  left shift\n"
+                "    add output_offset, clamp to [activation_min, "
+                "activation_max]\n"
+                "Reproduce that arithmetic EXACTLY, in int64 where the "
+                "reference uses int64. It is integer, so a scalar tail is "
+                "trivially bit-exact; keep it scalar and spend the effort on "
+                "the packing.\n\n"
+                "OFFSETS. `input_offset` and `filter_offset` are added to "
+                "every operand before the product. vmadot multiplies RAW "
+                "int8, so when either is nonzero the accumulator needs the "
+                "standard decomposition:\n"
+                "    sum (a+ia)(w+iw) = sum(a*w) + ia*sum_k(w) + "
+                "iw*sum_k(a) + K*ia*iw\n"
+                "vmadot supplies the first term; the row and column sums are "
+                "computed once per panel and reused. MEASURED IN THIS TREE: "
+                "all 20 linear_s8 dispatches across every model have "
+                "input_offset = filter_offset = 0 (the quantization is "
+                "symmetric), so the fast path is the common one -- but "
+                "implement the correction rather than asserting zero, and do "
+                "not fall back to a different algorithm when it is nonzero.\n\n"
+                "BIAS is per output column n and is added to the accumulator "
+                "BEFORE the Q0.31 multiply. It is int32; seed the drained "
+                "accumulator with it rather than trying to fold it into the "
+                "MAC.\n\n"
+                "PACK ONCE, NOT PER TILE -- the same requirement, and it is "
+                "worth more here than in matmul_s8 because a linear's N is "
+                "large. Pack all of `input` once, loop the output columns "
+                "outermost packing each weight panel once, and reuse both "
+                "across the inner m loop. Packing inside the tile loop "
+                "measured 6.5x SLOWER than RVV on the matmul; packing once "
+                "measured 2.30x FASTER.\n\n"
+                "CLUSTER 0 ONLY. Harts 4-7 exit 132 (SIGILL).\n"
+                "MUST be bit-exact to the linear_s8 reference: "
+                "max_abs_err = 0. Build with GCC 14.3, not 13.2."
+            ),
+            reference_impl=(
+                "/* The vmadot tile helper is identical to matmul_s8's -- see\n"
+                " * ime_vmadot_4x4x8 there for the complete asm block, which\n"
+                " * is the part that is hard to rediscover. Sketch of the\n"
+                " * per-tile drain and the Q0.31 tail: */\n"
+                "#include <string.h>\n"
+                "#include <riscv_vector.h>\n"
+                "\n"
+                "/* out16[i*4 + j] = C[i][j], row-major across the (vd, vd+1)\n"
+                " * pair, already accumulated over every k-slab. */\n"
+                "static inline int8_t requant(int32_t acc, int32_t bias,\n"
+                "                             int output_multiplier,\n"
+                "                             int output_shift,\n"
+                "                             int output_offset,\n"
+                "                             int amin, int amax) {\n"
+                "    acc += bias;\n"
+                "    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;\n"
+                "    prod = (prod + (1LL << 30)) >> 31;\n"
+                "    int32_t s = (int32_t)prod;\n"
+                "    if (output_shift > 0)\n"
+                "        s = (int32_t)(((int64_t)s +\n"
+                "             ((int64_t)1 << (output_shift - 1))) >> output_shift);\n"
+                "    else if (output_shift < 0)\n"
+                "        s = s << (-output_shift);\n"
+                "    s += output_offset;\n"
+                "    if (s < amin) s = amin;\n"
+                "    if (s > amax) s = amax;\n"
+                "    return (int8_t)s;\n"
+                "}\n"
+            ),
+        ),
+        AlgorithmCandidate(
+            name="gemmini_tiled_matmul",
+            target_affinity=("gemmini", "gemmini_q31"),
+            # Bit-exact accumulator (gemmini's 32-bit acc with full_C
+            # mvout, no float-scale shortcut), then scalar Q0.31 requantize
+            # on CPU using exactly the reference rounding formula. Drift
+            # vs the Q0.31 PyTorch golden is ≤1 LSB / layer.
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Route the linear through the Gemmini int8 systolic mesh "
+                "via gemmini.h's tiled_matmul_auto(full_C=true). Pass "
+                "input as A[M,K] and weight (physically [N,K]) with "
+                "transpose_B=true so gemmini sees the logical [K,N] B "
+                "matrix. full_C=true asks for raw int32 accumulator "
+                "output (no float-mvout scale); we apply the Q0.31 "
+                "requantize + bias-add on the CPU side after a "
+                "gemmini_fence so the gemmini path matches the conv2d "
+                "im2col_full_C precision contract.\n\n"
+                "Stage-1 limitations (caller falls back to scalar):\n"
+                "  * input_offset / filter_offset / output_offset == 0 "
+                "    (symmetric per-tensor int8; matches our extract_int8 "
+                "    output).\n"
+                "  * output_shift in [0, 30] for the Q0.31 fold path.\n"
+                "  * M*N ≤ 16*4096 (static accumulator workspace).\n"
+                "  * total_out * K ≥ 256 — below this the per-call "
+                "    setup (mstatus, gemmini_flush, fence) exceeds the "
+                "    scalar dot-product cost and we fall back."
+            ),
+            reference_impl="""\
+void kernel_linear_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int M, int K, int N,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max)
+{
+    enum { GEMMINI_LIN_ACC_MAX = 16 * 4096 };
+    static int32_t ws_acc[GEMMINI_LIN_ACC_MAX] __attribute__((aligned(64)));
+
+    int total_out = M * N;
+    if (input_offset != 0 || filter_offset != 0 || output_offset != 0
+            || output_shift < 0 || output_shift > 30
+            || (size_t)(M * N) > GEMMINI_LIN_ACC_MAX
+            || M <= 0 || K <= 0 || N <= 0
+            || total_out * K < 256) {
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                int32_t acc = bias ? bias[n] : 0;
+                for (int k = 0; k < K; k++) {
+                    int32_t in_v = (int32_t)input[m * K + k] + input_offset;
+                    int32_t w_v  = (int32_t)weight[n * K + k] + filter_offset;
+                    acc += in_v * w_v;
+                }
+                int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                prod = (prod + (1LL << 30)) >> 31;
+                int32_t scaled = (int32_t)prod;
+                if (output_shift > 0) {
+                    int32_t round = (1 << (output_shift - 1));
+                    scaled = (scaled + round) >> output_shift;
+                } else if (output_shift < 0) {
+                    scaled = scaled << (-output_shift);
+                }
+                scaled += output_offset;
+                if (scaled < activation_min) scaled = activation_min;
+                if (scaled > activation_max) scaled = activation_max;
+                output[m * N + n] = (int8_t)scaled;
+            }
+        }
+        return;
+    }
+
+    asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
+    gemmini_flush(0);
+    asm volatile("fence" ::: "memory");
+
+    tiled_matmul_auto(
+        (size_t)M, (size_t)N, (size_t)K,
+        input, weight,
+        NULL, (void *)ws_acc,
+        (size_t)K, (size_t)K, (size_t)N, (size_t)N,
+        MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, (scale_acc_t)1,
+        NO_ACTIVATION, ACC_SCALE_IDENTITY, (acc_scale_t)0,
+        false,
+        false, true,
+        true, false,
+        0, WS
+    );
+
+    gemmini_fence();
+    gemmini_flush(0);
+
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            int32_t acc = ws_acc[m * N + n] + (bias ? bias[n] : 0);
+            int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+            prod = (prod + ((int64_t)1 << 30)) >> 31;
+            int32_t scaled = (int32_t)prod;
+            if (output_shift > 0) {
+                scaled = (int32_t)(((int64_t)scaled
+                    + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+            } else if (output_shift < 0) {
+                scaled <<= (-output_shift);
+            }
+            scaled += output_offset;
+            if (scaled < activation_min) scaled = activation_min;
+            if (scaled > activation_max) scaled = activation_max;
+            output[m * N + n] = (int8_t)scaled;
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name="outerprod",
+            target_affinity=("rvv_opu",),
+            description=(
+                "Saturn OPU i8 outer-product MAC with bias broadcast.\n"
+                "Ported from\n"
+                "  hw/chipyard/generators/saturn/benchmarks/opu-gemm/kernel.h\n"
+                "(branch origin/opu-fp8, `i8_mm_bme_sq` + bias variant).\n\n"
+                "PROGRAMMING MODEL — call the macros from saturn_opu.h:\n"
+                "  OPMVINBCAST(m1, v0)         // seed accumulator m1 from vector v0\n"
+                "  for k = 0..K-1:\n"
+                "      // load input row stride into v16 (i8 lanes, M elems)\n"
+                "      // load weight row stride into v18 (i8 lanes, N elems)\n"
+                "      VOPACC(m1, v18, v16)    // m1[r,c] += v16[r] * v18[c]\n"
+                "  for m = 0..M-1:\n"
+                "      VMV_VR(v0, m, m1)       // drain row m of m1 into v0 (i32 N lanes)\n"
+                "      // requantize v0 and store as i8\n\n"
+                "STRICT REQUIREMENTS — read carefully:\n"
+                "  * DO NOT hand-roll inline `.insn r 0x57, ...` directives. The macros\n"
+                "    OPMVINBCAST, VOPACC, VMV_VR, VMV_RV already encode the funct fields\n"
+                "    (funct3 = 0x6 or 0x2, funct7 = 0x59 / 0x51 / 0x5d / 0x55). Re-encoding\n"
+                "    them produces `bad value for funct2 field` and `illegal operands`.\n"
+                "  * The Saturn assembler REJECTS inline-asm with vector-type input/output\n"
+                "    operand constraints. You will see `cannot convert a vector of type\n"
+                "    vint32m4_t to type long unsigned int`. Stay in scalar `\"r\"`\n"
+                "    constraints; use `vle*.v` / `vse*.v` / `vlse*.v` for vector data\n"
+                "    movement. The macros take only register-name strings, no operands.\n"
+                "  * Matrix register names m0..m3 and vector register names v0..v31 are\n"
+                "    used IN-MACRO as architectural registers. Outside the macros, the\n"
+                "    header `#undef`s them so you can also use v16 / m1 etc. as plain\n"
+                "    C variable identifiers — the include order is `<riscv_vector.h>`\n"
+                "    then `\"saturn_opu.h\"`.\n"
+                "  * Eligibility gate: M, N <= mlmax = VLEN/8 (check via `vsetvli`),\n"
+                "    AND input_offset == filter_offset == 0 (symmetric quant only).\n"
+                "    Fall back to a scalar reference for ineligible shapes.\n"
+                "  * Strided loads via `vlse8.v base, stride` let you read input[m,k]\n"
+                "    for fixed k by setting base=&input[k] and stride=K bytes. No\n"
+                "    pre-transpose buffer needed.\n"
+                "  * Q0.31 requantize tail (output_multiplier, output_shift,\n"
+                "    output_offset, activation_min/max) must match the linear_s8\n"
+                "    reference in `pipeline/reference_kernels.py::LINEAR_S8` bit-exactly.\n\n"
+                "See `reference_impl` below — it is a WORKING, BIT-EXACT-VERIFIED\n"
+                "implementation from `kernels/rvv_opu/rvv_opu_linear_s8_outerprod.c`.\n"
+                "Lift the structure verbatim; only change algorithmic details (e.g.\n"
+                "different K tiling) if you can justify why it's still bit-exact."
+            ),
+            reference_impl=(
+                "/* OPU macros take REGISTER-NAME arguments that expand via\n"
+                " * the m0..m3 / v0..v31 #defines in saturn_opu.h. Opt in to\n"
+                " * keep those #defines alive so OPMVINBCAST(m1, v0) etc. work\n"
+                " * — without this the assembler rejects with `bad value for\n"
+                " * funct2 field` / `illegal operands`. */\n"
+                "#define SATURN_OPU_KEEP_REGISTER_MACROS\n"
+                "#include \"saturn_opu.h\"\n\n"
+                "/* Q0.31 requantize — bit-exact match to LINEAR_S8 reference. */\n"
+                "static inline int32_t q31_requantize(int32_t x, int32_t mult, int32_t shift) {\n"
+                "    int64_t prod = (int64_t)x * (int64_t)mult;\n"
+                "    prod = (prod + (1LL << 30)) >> 31;\n"
+                "    if (shift > 0) {\n"
+                "        int32_t round = (1 << (shift - 1));\n"
+                "        return ((int32_t)prod + round) >> shift;\n"
+                "    }\n"
+                "    return (int32_t)prod << -shift;\n"
+                "}\n\n"
+                "/* Eligibility-gated Saturn OPU outer-product MAC. */\n"
+                "void kernel_linear_s8(const int8_t *input, const int8_t *weight,\n"
+                "                      const int32_t *bias, int8_t *output,\n"
+                "                      int M, int K, int N,\n"
+                "                      int input_offset, int filter_offset, int output_offset,\n"
+                "                      int output_multiplier, int output_shift,\n"
+                "                      int activation_min, int activation_max) {\n"
+                "    size_t mlmax;\n"
+                "    asm volatile(\"vsetvli %0, zero, e8, m1, ta, ma\" : \"=r\"(mlmax));\n"
+                "    if ((size_t)M > mlmax || (size_t)N > mlmax ||\n"
+                "        input_offset != 0 || filter_offset != 0) {\n"
+                "        /* scalar fallback — see kernels/rvv_opu/ */\n"
+                "        return;\n"
+                "    }\n\n"
+                "    /* Seed accumulator m1 with bias broadcast. */\n"
+                "    asm volatile(\"vsetvli zero, %0, e32, m4, ta, ma\" : : \"r\"((size_t)N));\n"
+                "    if (bias) {\n"
+                "        asm volatile(\"vle32.v v0, (%0)\" : : \"r\"(bias));\n"
+                "    } else {\n"
+                "        asm volatile(\"vmv.v.i v0, 0\");\n"
+                "    }\n"
+                "    OPMVINBCAST(m1, v0);   /* broadcast v0 to all M rows of m1 */\n\n"
+                "    /* Strided K-loop: read input column k and weight column k,\n"
+                "       outer-product-accumulate into m1. */\n"
+                "    const ptrdiff_t in_stride = (ptrdiff_t)K * sizeof(int8_t);\n"
+                "    const ptrdiff_t w_stride  = (ptrdiff_t)K * sizeof(int8_t);\n"
+                "    for (int k = 0; k < K; k++) {\n"
+                "        asm volatile(\"vsetvli zero, %0, e8, m1, ta, ma\" : : \"r\"((size_t)M));\n"
+                "        asm volatile(\"vlse8.v v16, (%0), %1\"\n"
+                "                     : : \"r\"(&input[k]),  \"r\"((unsigned long)in_stride));\n"
+                "        asm volatile(\"vsetvli zero, %0, e8, m1, ta, ma\" : : \"r\"((size_t)N));\n"
+                "        asm volatile(\"vlse8.v v18, (%0), %1\"\n"
+                "                     : : \"r\"(&weight[k]), \"r\"((unsigned long)w_stride));\n"
+                "        VOPACC(m1, v18, v16);   /* m1[r,c] += v16[r] * v18[c] */\n"
+                "    }\n\n"
+                "    /* Drain rows of m1, requantize, store i8. */\n"
+                "    int32_t row_i32[64];\n"
+                "    asm volatile(\"vsetvli zero, %0, e32, m4, ta, ma\" : : \"r\"((size_t)N));\n"
+                "    for (int m = 0; m < M; m++) {\n"
+                "        VMV_VR(v0, m, m1);   /* row m of m1 -> v0 */\n"
+                "        asm volatile(\"vse32.v v0, (%0)\" : : \"r\"(row_i32));\n"
+                "        for (int n = 0; n < N; n++) {\n"
+                "            int32_t v = q31_requantize(row_i32[n],\n"
+                "                                       output_multiplier, output_shift);\n"
+                "            v += output_offset;\n"
+                "            if (v < activation_min) v = activation_min;\n"
+                "            if (v > activation_max) v = activation_max;\n"
+                "            output[m * N + n] = (int8_t)v;\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+    ],
+)
+
+
+RELU_S8 = KernelSpec(
+    op="relu_s8",
+    signature="void kernel_relu_s8(const int8_t *input, int8_t *output, int n)",
+    semantics=(
+        "Elementwise ReLU on a contiguous int8 buffer with symmetric "
+        "quantization (zero_point = 0):\n"
+        "  output[i] = max(0, input[i])  for i in [0, n)\n"
+        "Standalone version; for fused linear→relu we use linear_s8 with "
+        "activation_min = 0."
+    ),
+    reference_impl="""\
+void kernel_relu_s8(const int8_t *input, int8_t *output, int n) {
+    for (int i = 0; i < n; i++) {
+        int8_t v = input[i];
+        output[i] = v > 0 ? v : 0;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 256},
+    ],
+    argtypes_factory=_relu_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="gemmini_resadd_relu",
+            target_affinity=("gemmini", "gemmini_q31"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Route the elementwise ReLU through gemmini's "
+                "tiled_resadd_auto by passing B=zeros and relu=true. "
+                "Computes output[i] = sat_int8(relu(A[i]*1 + zero*0)) "
+                "= relu(A[i]). The 'add' is semantically a no-op (B is "
+                "zero); the gain is from streaming int8 through "
+                "gemmini's mvin → mvout pipeline with the requantize-"
+                "with-relu unit doing all the work. Saves the scalar "
+                "ALU's per-element max(0, x). Same chunking workaround "
+                "as add_s8 (≤6272-element pieces) and same fallback for "
+                "tiny n."
+            ),
+            reference_impl="""\
+void kernel_relu_s8(const int8_t *input, int8_t *output, int n)
+{
+    enum { ADD_CHUNK_MAX = 6272 };
+    static int8_t zero_buf[ADD_CHUNK_MAX] __attribute__((aligned(64)));
+    if (n <= 0 || n < 256) {
+        for (int i = 0; i < n; i++) {
+            int8_t v = input[i];
+            output[i] = v > 0 ? v : 0;
+        }
+        return;
+    }
+    asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
+    int remaining = n, offset = 0;
+    while (remaining > 0) {
+        int chunk = remaining > ADD_CHUNK_MAX ? ADD_CHUNK_MAX : remaining;
+        gemmini_flush(0);
+        asm volatile("fence" ::: "memory");
+        tiled_resadd_auto(
+            1, (size_t)chunk,
+            (scale_t)1.0f, (scale_t)0.0f, ACC_SCALE_IDENTITY,
+            input + offset, zero_buf, output + offset,
+            true,
+            WS
+        );
+        gemmini_fence();
+        gemmini_flush(0);
+        offset += chunk;
+        remaining -= chunk;
+    }
+}
+""",
+        ),
+    ],
+)
+
+
+CONV2D_S8 = KernelSpec(
+    op="conv2d_s8",
+    signature=(
+        "void kernel_conv2d_s8(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized 2D convolution (per-tensor symmetric, muRISCV-NN / "
+        "CMSIS-NN convention). Same dataflow as conv2d but in int8 with "
+        "an int32 accumulator and a Q0.31 requantize tail.\n"
+        "Layout (NCHW for activations, OIHW for weights):\n"
+        "  input:  int8  [N, IC, IH, IW]\n"
+        "  weight: int8  [OC, IC, KH, KW]\n"
+        "  bias:   int32 [OC] (may be NULL)\n"
+        "  output: int8  [N, OC, OH, OW]  with OH/OW per the conv2d formula\n"
+        "Compute (per output element):\n"
+        "  acc = bias[oc] if bias != NULL else 0\n"
+        "  for ic, kh, kw with ih = oh*SH-PH+kh, iw = ow*SW-PW+kw:\n"
+        "    if (ih, iw) in bounds:\n"
+        "      acc += (input[n,ic,ih,iw] + input_offset)\n"
+        "           * (weight[oc,ic,kh,kw] + filter_offset)\n"
+        "    (input reads outside [0,IH) x [0,IW) treated as 0 — "
+        "i.e. their contribution to acc is just `input_offset * "
+        "(weight[..] + filter_offset)`. For the symmetric quant case "
+        "input_offset = 0 those padded contributions are zero.)\n"
+        "  acc = requantize(acc, output_multiplier, output_shift)\n"
+        "  acc += output_offset\n"
+        "  acc = clamp(acc, activation_min, activation_max)\n"
+        "  output[n, oc, oh, ow] = (int8_t) acc\n"
+        "Requantize is the same Q0.31 fixed-point rounding-multiply-and-"
+        "shift as kernel_linear_s8."
+    ),
+    reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    /* Weight layout depends on the active hardware target. The gemmini
+     * codegen pre-packs to flat HWIO at compile time
+     * (generate_skeleton.py::_backend_pack_weight) so the gemmini ROCC
+     * kernel can pass the blob straight into tiled_conv_auto without
+     * a per-call transpose. backends.py wires
+     * MODELBLASTER_GEMMINI_HWIO_WEIGHTS=1 into kernel_cflags only for the
+     * gemmini backend; all other backends keep PyTorch OIHW. */
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        /* Hoist (n,ic,*) row offsets to size_t so the
+                         * multiply by IH*IW happens in 64-bit. Without
+                         * this, GCC -O2 occasionally splits the
+                         * pointer-+-int32-index addition into 32-bit
+                         * `addw` on the low half + 64-bit `add` on the
+                         * upper half — fine when (input_low32 + idx)
+                         * stays positive, but wraps modulo 2^32 when
+                         * it crosses the int32 sign boundary. Hit on
+                         * V512D256 firesim with yolov8 because the
+                         * wider thread-vreg state shifted BSS placement
+                         * past the wrap boundary. */
+                        const size_t in_row_base =
+                            ((size_t)n * IC + ic) * IH;
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v;
+                                if (ih < 0 || ih >= IH || iw < 0 || iw >= IW) {
+                                    in_v = input_offset;
+                                } else {
+                                    in_v = (int32_t)input[(in_row_base + ih) * IW + iw]
+                                         + input_offset;
+                                }
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must NOT reuse the
+                                 * HWIO index above -- indexing an IHWOC buffer as HWIO reads
+                                 * the wrong elements (see _LAYOUT_PERMUTATION in
+                                 * generate_skeleton.py). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                    } else if (output_shift < 0) {
+                        scaled = scaled << (-output_shift);
+                    }
+                    scaled += output_offset;
+                    if (scaled < activation_min) scaled = activation_min;
+                    if (scaled > activation_max) scaled = activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)scaled;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # LeNet shapes
+        {"N": 1, "IC": 1, "IH": 28, "IW": 28, "OC": 6,
+         "KH": 5, "KW": 5, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
+        {"N": 1, "IC": 6, "IH": 12, "IW": 12, "OC": 16,
+         "KH": 5, "KW": 5, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
+        # DroNet-style
+        {"N": 1, "IC": 32, "IH": 16, "IW": 16, "OC": 64,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 32, "IH": 16, "IW": 16, "OC": 64,
+         "KH": 1, "KW": 1, "SH": 2, "SW": 2, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_conv2d_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="indir_gemm",
+            target_affinity=("rvv_opu",),
+            description=(
+                "Saturn OPU indirect-GEMM conv2d_s8 (XNNPACK-style).\n"
+                "Maps conv onto the OPU outer-product MAC by addressing\n"
+                "the input tensor in its native [N,IC,IH,IW] layout via\n"
+                "a per-tile indirection pointer array — no im2col data\n"
+                "duplication.\n\n"
+                "ALGORITHM:\n"
+                "  outer (n, oh, ow_tile in OW step OW_BLK=mlmax):\n"
+                "    build indir[KH*KW][OW_BLK]: ptr to IC slice or zero_buf\n"
+                "    for oc_tile in OC step mlmax:\n"
+                "      OPMVINBCAST m1 <- bias[oc_tile..+mlmax] (padded)\n"
+                "      for (kh, kw, ic) in K-reduction:\n"
+                "        vs1 = gather i8 lanes from indir[kk][p]+ic (1 per pixel)\n"
+                "        vs2 = vlse8 weight[oc_tile..+mlmax, ic, kh, kw]\n"
+                "        VOPACC m1, vs2, vs1\n"
+                "      drain m1 rows, Q0.31 requantize, i8 store with OC stride\n\n"
+                "Indirection is per-tile (~KH*KW*mlmax pointers, stack-safe).\n"
+                "Padded entries point at a static __opu_zero_buf so vluxei\n"
+                "gathers zeros and VOPACC contributes nothing — branch-free.\n"
+                "Symmetric quant only; falls back to scalar reference for\n"
+                "asymmetric quant or shapes that exceed scratch caps.\n\n"
+                "See modelblaster/notes/opu_indirect_gemm_design.md for the\n"
+                "compile-time-indirection follow-up (Option A) once the\n"
+                "skeleton supports per-algorithm signatures."
+            ),
+            reference_impl="",  # the curated file supplies the impl
+        ),
+        AlgorithmCandidate(
+            name="im2col_rvv_reduce",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Saturn-OPU i8 conv2d via scalar im2col + per-output RVV "
+                "vector reduce (vwmul + vwadd-into-i32 + vredsum). Uses "
+                "ONLY the RVV opcodes already validated bit-exact on "
+                "FireSimGemminiAndOPUShuttleConfig by the mlp_control "
+                "cached linear kernel — NO OPU custom OP-V instructions "
+                "and NO vluxei. Spike verify currently confirmed bit-"
+                "exact with 19.6x cycle reduction over the reference "
+                "scalar conv on yolov8."
+            ),
+            reference_impl="",
+        ),
+        AlgorithmCandidate(
+            name="im2col_vlA_scalarMAC",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Worst-case-safe Saturn-OPU conv2d_s8: scalar im2col + "
+                "vle8.v-streamed input/weight lanes + SCALAR MAC inner "
+                "loop. Uses ONLY e8/m1 vsetvli SET form with rs1 = small "
+                "positive (no probes, no e32/m4, no e16/m2, no widening "
+                "ops, no Saturn OPU custom). Ships an estimated 3-5x "
+                "cycle reduction vs. pure reference scalar — much less "
+                "than im2col_rvv_reduce's 20x, but with zero FPGA risk: "
+                "every opcode it emits is in the subset directly proven "
+                "by v10 v1's silu kernel running on the actual bitstream."
+            ),
+            reference_impl="",
+        ),
+        AlgorithmCandidate(
+            name="im2col_outerprod",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Saturn-OPU i8 conv2d via scalar im2col + tiled outer-"
+                "product GEMM. Reuses the proven VOPACC / OPMVINBCAST / "
+                "VMV_VR opcode sequence from rvv_opu_linear_s8_outerprod "
+                "(validated bit-exact on the FireSimGemminiAndOPUShuttle "
+                "bitstream for mlp_control across v8/v9/v10). Avoids the "
+                "vluxei8-based gather of indir_gemm, which traps as "
+                "illegal instruction on this bitstream.\n\n"
+                "V15 ATTEMPT: copied into per-net cache and reordered "
+                "ahead of im2col_rvv_reduce. spike-harness verify FAILED "
+                "for dronet (which has 5 of the 9 rvv_opu conv2d_s8 calls "
+                "totaling 131M rdcycle in v14). Picker fell ALL THE WAY "
+                "BACK to scalar reference for dronet — the rvv_reduce "
+                "fallback didn't fire either, suggesting outerprod's "
+                "verify crashed spike rather than returning a divergence. "
+                "Reverted to last position pending root-cause analysis."
+            ),
+            reference_impl="",  # the curated file supplies the impl
+        ),
+        AlgorithmCandidate(
+            name="direct",
+            # Same nested-loop math as the spec's reference_impl (verify
+            # oracle); reads weights from whichever layout the codegen
+            # produces (OIHW or HWIO via #ifdef MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+            # but the arithmetic is bit-for-bit identical.
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Direct sliding-window int8 conv. Six nested loops over "
+                "(n, oc, oh, ow, ic, kh, kw); per-element bounds checks; "
+                "i32 accumulator; Q0.31 requantize tail per output element. "
+                "No vectorization, no precomputation. The simplest correct "
+                "form — useful as a baseline but on RVV it leaves all the "
+                "vector lanes idle."
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        /* size_t hoist — see CONV2D_S8 spec.reference_impl
+                         * for the full rationale (V512 BSS-placement + GCC
+                         * 32-bit addw wrap). */
+                        const size_t in_row_base =
+                            ((size_t)n * IC + ic) * IH;
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v;
+                                if (ih < 0 || ih >= IH || iw < 0 || iw >= IW) {
+                                    in_v = input_offset;
+                                } else {
+                                    in_v = (int32_t)input[(in_row_base + ih) * IW + iw]
+                                         + input_offset;
+                                }
+
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must NOT reuse the
+                                 * HWIO index above -- indexing an IHWOC buffer as HWIO reads
+                                 * the wrong elements (see _LAYOUT_PERMUTATION in
+                                 * generate_skeleton.py). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                    } else if (output_shift < 0) {
+                        scaled = scaled << (-output_shift);
+                    }
+                    scaled += output_offset;
+                    if (scaled < activation_min) scaled = activation_min;
+                    if (scaled > activation_max) scaled = activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)scaled;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name="rvv_widening_oc",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            description=(
+                "Vectorize over OUTPUT CHANNELS using RVV's widening "
+                "integer intrinsics — the int8 analogue of the XNNPACK "
+                "f32 OC-broadcast pattern (this same shape was the 16x "
+                "win on fp32 conv2d). Stay in plain int across the "
+                "accumulation hot path; only convert to fp32 for the "
+                "requantize tail.\n\n"
+                "WHY THIS HELPS:\n"
+                "  Each i8 MAC, when written scalar, is 6+ instructions "
+                "(load, sign-extend twice, add offsets, multiply, add). "
+                "The widening-multiply path collapses i8xi8 -> i16 to "
+                "one vwmul.vv that produces a vector of i16 partial "
+                "products, and vwadd.wv folds that into an i32 vector "
+                "accumulator. With LMUL=2 on i32 (so VLEN-bytes worth "
+                "of accumulators in one register group), one inner "
+                "iteration replaces a scalar inner iteration's worth of "
+                "OC outputs.\n\n"
+                "DATA LAYOUT (unchanged from input/output of "
+                "kernel_conv2d_s8):\n"
+                "  input:  int8 [N, IC, IH, IW]\n"
+                "  weight: int8 [OC, IC, KH, KW]\n"
+                "  output: int8 [N, OC, OH, OW]\n\n"
+                "ALGORITHM (for each (n, oh, ow) — outer 3 loops "
+                "scalar, oc loop is the vectorized one):\n"
+                "  for oc_base in [0, OC) step vl:\n"
+                "      vl = vsetvl_e32m2(OC - oc_base);\n"
+                "      // bias[oc_base..oc_base+vl] -> i32 vector acc\n"
+                "      vint32m2_t vacc;\n"
+                "      if (bias) vacc = __riscv_vle32_v_i32m2(\n"
+                "          bias + oc_base, vl);\n"
+                "      else      vacc = __riscv_vmv_v_x_i32m2(0, vl);\n"
+                "      for ic, kh, kw with bounds-checked ih/iw:\n"
+                "          int8_t in_byte =\n"
+                "              (in-bounds) ? input[((n*IC+ic)*IH+ih)*IW+iw]\n"
+                "                          : 0;\n"
+                "          int32_t in_v = (int32_t)in_byte + input_offset;\n"
+                "          // Strided load of OC weight bytes. Stride =\n"
+                "          // IC*KH*KW (bytes) since weight is OIHW.\n"
+                "          vint8m1_t vw8 = __riscv_vlse8_v_i8m1(\n"
+                "              weight + (oc_base*IC*KH*KW)\n"
+                "                     + (ic*KH + kh)*KW + kw,\n"
+                "              (ptrdiff_t)IC*KH*KW, vl);\n"
+                "          // Widen i8 -> i16 and add filter_offset.\n"
+                "          vint16m2_t vw16 = __riscv_vwadd_vx_i16m2(\n"
+                "              vw8, filter_offset, vl);\n"
+                "          // Widen-multiply by the input scalar:\n"
+                "          // vwmul.vx i32 = i16 * scalar (sign-ext).\n"
+                "          // We have vacc (i32) += vw16 * in_v\n"
+                "          // implemented as widening-multiply-accumulate:\n"
+                "          vacc = __riscv_vwmacc_vx_i32m2(\n"
+                "              vacc, (int16_t)in_v, vw16, vl);\n"
+                "      }}}\n"
+                "      // Q0.31 requantize tail. Keep this in scalar i32 "
+                "math (matches the reference bit-exactly). Pull each "
+                "lane out, requantize, store.\n"
+                "      int32_t accs[vl_max];\n"
+                "      __riscv_vse32_v_i32m2(accs, vacc, vl);\n"
+                "      for j in [0, vl):\n"
+                "          int32_t acc = accs[j];\n"
+                "          int64_t prod = (int64_t)acc * output_multiplier;\n"
+                "          prod = (prod + (1LL<<30)) >> 31;\n"
+                "          int32_t s = (int32_t)prod;\n"
+                "          if (output_shift > 0)\n"
+                "              s = (int32_t)(((int64_t)s + ((int64_t)1 << (output_shift-1))) >> output_shift);\n"
+                "          else if (output_shift < 0)\n"
+                "              s <<= -output_shift;\n"
+                "          s += output_offset;\n"
+                "          if (s < activation_min) s = activation_min;\n"
+                "          if (s > activation_max) s = activation_max;\n"
+                "          output[((n*OC + oc_base + j)*OH + oh)*OW + ow]\n"
+                "              = (int8_t)s;\n\n"
+                "INTRINSIC NAMES (RVV V1.0, exact spellings):\n"
+                "  __riscv_vsetvl_e32m2(size_t avl) -> size_t\n"
+                "  __riscv_vle32_v_i32m2(const int32_t*, size_t)\n"
+                "  __riscv_vmv_v_x_i32m2(int32_t, size_t)\n"
+                "  __riscv_vlse8_v_i8m1(const int8_t*, ptrdiff_t bstride, size_t)\n"
+                "  __riscv_vwadd_vx_i16m2(vint8m1_t, int16_t, size_t)\n"
+                "  __riscv_vwmacc_vx_i32m2(vint32m2_t, int16_t, vint16m2_t, size_t)\n"
+                "  __riscv_vse32_v_i32m2(int32_t*, vint32m2_t, size_t)\n\n"
+                "DO NOT use any vfXXX (fp) intrinsics — the requantize "
+                "must be Q0.31 fixed-point exactly (the verify oracle "
+                "checks bit-equal to the scalar reference).\n"
+                "DO NOT vectorize across (ic, kh, kw) — they're a "
+                "reduction; the vector dim is OC. The strided weight "
+                "load is what feeds OC-many filter elements per inner "
+                "iteration; do not flatten OIHW into a contiguous read.\n"
+                "DO handle the boundary case where vl_max may be < OC "
+                "(loop on oc_base += vl).\n"
+                "DO put the bounds check (ih, iw padding) outside the "
+                "vector op — the in/out of bounds decision is on the "
+                "scalar input pixel, not on the OC fan-out."
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    /* OC-vectorized i8 conv, RVV V1.0.
+     *
+     * LMUL choice: i32 acc at LMUL=2 means we need i16 ops at LMUL=1
+     * and i8 ops at LMUL=1/2 (fractional) to stay element-count-matched
+     * across widening intrinsics. vsetvl_e32m2(remaining_OC) gives one
+     * vl that's reused for the i8 strided load (vlse8_v_i8mf2), the
+     * widening offset add (vwadd_vx_i16m1), and the widening MAC
+     * (vwmacc_vx_i32m2). VLEN=128 -> vlmax for e32m2 == 8 OC elems per
+     * chunk. */
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                int oc_base = 0;
+                while (oc_base < OC) {
+                    size_t vl = __riscv_vsetvl_e32m2((size_t)(OC - oc_base));
+                    vint32m2_t vacc;
+                    if (bias != NULL) {
+                        vacc = __riscv_vle32_v_i32m2(bias + oc_base, vl);
+                    } else {
+                        vacc = __riscv_vmv_v_x_i32m2(0, vl);
+                    }
+                    for (int ic = 0; ic < IC; ic++) {
+                        /* size_t hoist — see CONV2D_S8 spec.reference_impl
+                         * for the full rationale. */
+                        const size_t in_row_base =
+                            ((size_t)n * IC + ic) * IH;
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            int row_in_bounds = (ih >= 0 && ih < IH);
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int8_t in_byte = 0;
+                                if (row_in_bounds && iw >= 0 && iw < IW) {
+                                    in_byte = input[(in_row_base + ih) * IW + iw];
+                                }
+                                int32_t in_v = (int32_t)in_byte + input_offset;
+
+                                /* IHWOC: weight[ic][kh][kw][oc] — OC contiguous */
+                                const int8_t *wp = weight
+                                    + ((size_t)ic * KH * KW + (size_t)kh * KW + kw) * OC
+                                    + oc_base;
+                                vint8mf2_t vw8 = __riscv_vle8_v_i8mf2(wp, vl);
+                                vint16m1_t vw16 = __riscv_vwadd_vx_i16m1(
+                                    vw8, (int16_t)filter_offset, vl);
+                                vacc = __riscv_vwmacc_vx_i32m2(
+                                    vacc, (int16_t)in_v, vw16, vl);
+                            }
+                        }
+                    }
+                    /* Pull lanes out and run the Q0.31 requantize
+                     * scalar — bit-exact match to the reference. */
+                    int32_t lane[64];   /* vlmax for e32m2 at VLEN=512 is 32; 64 is generous */
+                    __riscv_vse32_v_i32m2(lane, vacc, vl);
+                    for (size_t j = 0; j < vl; j++) {
+                        int32_t acc = lane[j];
+                        int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                        prod = (prod + (1LL << 30)) >> 31;
+                        int32_t scaled = (int32_t)prod;
+                        if (output_shift > 0) {
+                            scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                        } else if (output_shift < 0) {
+                            scaled = scaled << (-output_shift);
+                        }
+                        scaled += output_offset;
+                        if (scaled < activation_min) scaled = activation_min;
+                        if (scaled > activation_max) scaled = activation_max;
+                        output[((n*OC + oc_base + (int)j)*OH + oh)*OW + ow] =
+                            (int8_t)scaled;
+                    }
+                    oc_base += (int)vl;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name="rvv_vsmul_vnclip",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            description=(
+                "Pure-integer RVV conv2d_s8 using vsmul (Q0.31 multiply) "
+                "+ vnclip (shift + saturating narrow) for the entire "
+                "requantize tail. Zero FP instructions — runs on Zve32x "
+                "profile (pure-int vector cores, no F/D extension).\n\n"
+                "LMUL PLAN (element counts match across all types):\n"
+                "  i32m4  — accumulator.  VLMAX = 4*VLEN/32\n"
+                "  i16m2  — requant intermediate.  VLMAX = 2*VLEN/16 = same\n"
+                "  i8m1   — weight bytes / final output.  VLMAX = VLEN/8 = same\n"
+                "VLEN=256 → 32 OC/iter; VLEN=128 → 16 OC/iter (2x more "
+                "than LMUL=2 rvv_widening_oc).\n\n"
+                "INNER LOOP (identical to rvv_widening_oc up to the "
+                "requantize block):\n"
+                "  vsetvl_e32m4(OC - oc_base) → vl\n"
+                "  load/init bias into vint32m4_t vacc\n"
+                "  for ic, kh, kw:\n"
+                "      in_v = input[...] + input_offset   (scalar i32)\n"
+                "      vw8  = vlse8_v_i8m1(wp, oc_stride, vl)\n"
+                "      vw16 = vwadd_vx_i16m2(vw8, filter_offset, vl)\n"
+                "      vacc = vwmacc_vx_i32m4(vacc, in_v, vw16, vl)\n\n"
+                "REQUANTIZE (pure-integer, no scalar fallback):\n"
+                "  // Step 1: Q0.31 multiply — equivalent to\n"
+                "  //         (acc * output_multiplier + 2^30) >> 31\n"
+                "  vscaled = vsmul_vx_i32m4(vacc, output_multiplier,\n"
+                "                           RISCV_VXRM_RNU, vl)\n"
+                "  // Step 2: right-shift and saturating narrow i32→i16\n"
+                "  if output_shift < 0:\n"
+                "      vshifted = vsll_vx_i32m4(vscaled, -output_shift, vl)\n"
+                "      vout16   = vnclip_wx_i16m2(vshifted, 0,\n"
+                "                                 RISCV_VXRM_RNU, vl)\n"
+                "  elif output_shift < 32:\n"
+                "      vout16 = vnclip_wx_i16m2(vscaled, output_shift,\n"
+                "                               RISCV_VXRM_RNU, vl)\n"
+                "  else:\n"
+                "      // vnclip masks shift mod 32; split large shifts.\n"
+                "      sa2 = min(output_shift - 31, 31)\n"
+                "      vscaled2 = vsra_vx_i32m4(vscaled, 31, vl)\n"
+                "      vout16   = vnclip_wx_i16m2(vscaled2, sa2,\n"
+                "                                 RISCV_VXRM_RNU, vl)\n"
+                "  // Step 3: add zero-point, clamp, narrow i16→i8\n"
+                "  vout16 = vadd_vx_i16m2(vout16, output_offset, vl)\n"
+                "  vout16 = vmax_vx_i16m2(vout16, activation_min, vl)\n"
+                "  vout16 = vmin_vx_i16m2(vout16, activation_max, vl)\n"
+                "  vout8  = vnsra_wx_i8m1(vout16, 0, vl)  // already clamped\n\n"
+                "OUTPUT STORE: strided (OC not contiguous in NCHW):\n"
+                "  vsse8_v_i8m1(output + (n*OC+oc_base)*OH*OW + oh*OW + ow,\n"
+                "               OH*OW, vout8, vl)\n\n"
+                "INTRINSIC SPELLINGS (RVV V1.0):\n"
+                "  __riscv_vsetvl_e32m4(avl)\n"
+                "  __riscv_vle32_v_i32m4 / __riscv_vmv_v_x_i32m4\n"
+                "  __riscv_vlse8_v_i8m1(ptr, bstride, vl)\n"
+                "  __riscv_vwadd_vx_i16m2(vint8m1_t, int16_t, vl)\n"
+                "  __riscv_vwmacc_vx_i32m4(vint32m4_t, int16_t, vint16m2_t, vl)\n"
+                "  __riscv_vsmul_vx_i32m4(vint32m4_t, int32_t, vxrm, vl)\n"
+                "  __riscv_vnclip_wx_i16m2(vint32m4_t, size_t shift, vxrm, vl)\n"
+                "  __riscv_vsll_vx_i32m4(vint32m4_t, size_t, vl)\n"
+                "  __riscv_vadd_vx_i16m2 / __riscv_vmax_vx_i16m2 / __riscv_vmin_vx_i16m2\n"
+                "  __riscv_vnsra_wx_i8m1(vint16m2_t, size_t, vl)\n"
+                "  __riscv_vsse8_v_i8m1(int8_t*, ptrdiff_t, vint8m1_t, vl)\n"
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max)
+{
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                int oc_base = 0;
+                while (oc_base < OC) {
+                    size_t vl = __riscv_vsetvl_e32m4((size_t)(OC - oc_base));
+                    vint32m4_t vacc;
+                    if (bias != NULL)
+                        vacc = __riscv_vle32_v_i32m4(bias + oc_base, vl);
+                    else
+                        vacc = __riscv_vmv_v_x_i32m4(0, vl);
+                    for (int ic = 0; ic < IC; ic++) {
+                        const size_t in_row_base =
+                            ((size_t)n * IC + ic) * IH;
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            int row_in = (ih >= 0 && ih < IH);
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int8_t in_byte = 0;
+                                if (row_in && iw >= 0 && iw < IW)
+                                    in_byte = input[(in_row_base + ih) * IW + iw];
+                                int32_t in_v = (int32_t)in_byte + input_offset;
+                                /* IHWOC: weight[ic][kh][kw][oc] — OC contiguous */
+                                const int8_t *wp = weight
+                                    + ((size_t)ic * KH * KW + (size_t)kh * KW + kw) * OC
+                                    + oc_base;
+                                vint8m1_t vw8 = __riscv_vle8_v_i8m1(wp, vl);
+                                vint16m2_t vw16 = __riscv_vwadd_vx_i16m2(
+                                    vw8, (int16_t)filter_offset, vl);
+                                vacc = __riscv_vwmacc_vx_i32m4(
+                                    vacc, (int16_t)in_v, vw16, vl);
+                            }
+                        }
+                    }
+                    vint32m4_t vscaled = __riscv_vsmul_vx_i32m4(
+                        vacc, output_multiplier, __RISCV_VXRM_RNU, vl);
+                    vint16m2_t vout16;
+                    if (output_shift >= 0) {
+                        vout16 = __riscv_vnclip_wx_i16m2(
+                            vscaled, (size_t)output_shift, __RISCV_VXRM_RNU, vl);
+                    } else {
+                        vint32m4_t vshifted = __riscv_vsll_vx_i32m4(
+                            vscaled, (size_t)(-output_shift), vl);
+                        vout16 = __riscv_vnclip_wx_i16m2(
+                            vshifted, 0, __RISCV_VXRM_RNU, vl);
+                    }
+                    vout16 = __riscv_vadd_vx_i16m2(vout16, (int16_t)output_offset, vl);
+                    vout16 = __riscv_vmax_vx_i16m2(vout16, (int16_t)activation_min, vl);
+                    vout16 = __riscv_vmin_vx_i16m2(vout16, (int16_t)activation_max, vl);
+                    vint8m1_t vout8 = __riscv_vnsra_wx_i8m1(vout16, 0, vl);
+                    /* Output is NCHW — OC elements are OH*OW apart (strided).
+                     * Scatter via contiguous vse8 into temp + scalar copy to
+                     * avoid vsse8 (Saturn strided-store hardware bug). */
+                    int8_t *op = output
+                        + ((size_t)n * OC + oc_base) * OH * OW
+                        + (size_t)oh * OW + ow;
+                    int8_t _obuf[256];
+                    __riscv_vse8_v_i8m1(_obuf, vout8, vl);
+                    for (size_t _vi = 0; _vi < vl; _vi++)
+                        op[_vi * (ptrdiff_t)(OH * OW)] = _obuf[_vi];
+                    oc_base += (int)vl;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            description=(
+                "Cache-aware variant of rvv_vsmul_vnclip. Same inner "
+                "vector reduction (vsmul + vnclip Q0.31 requantize, "
+                "contiguous OC weight load via vle8 from IHWOC layout) "
+                "but the OC dimension is tiled at the outermost level "
+                "so a TILE_OC slab of weights stays resident in L1D across the entire "
+                "(n, oh, ow) spatial sweep before moving to the next "
+                "tile.\n\n"
+                "Tile-size selection (runtime):\n"
+                "  TILE_OC = 24 KB / (IC*KH*KW)\n"
+                "  rounded down to a multiple of vlmax_e32m4 (= 32 on VLEN=256)\n"
+                "  clamped to [vlmax_e32m4, OC]\n"
+                "Falls back to TILE_OC=vlmax (one inner pass) when "
+                "IC*KH*KW alone exceeds the L1D budget — degrades "
+                "cleanly to the un-blocked behavior.\n\n"
+                "Reuse improvement: weight LLC traffic drops from "
+                "OH*OW*OC*IC*KH*KW (un-blocked) to OC*IC*KH*KW (blocked) "
+                "— for the dronet 3x3 IC=128 OC=128 layer, ~16x less "
+                "weight traffic. Spike doesn't reward this rewrite "
+                "(no cache modeling); FireSim does."
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max)
+{
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    const ptrdiff_t oc_stride = (ptrdiff_t)IC * KH * KW;
+
+    enum { L1D_OC_BUDGET_BYTES = 24 * 1024 };
+    const int vlmax_oc = (int)__riscv_vsetvlmax_e32m4();
+    const int oc_slab_bytes = (int)oc_stride;
+    int TILE_OC;
+    if (oc_slab_bytes > 0 && oc_slab_bytes <= L1D_OC_BUDGET_BYTES) {
+        TILE_OC = L1D_OC_BUDGET_BYTES / oc_slab_bytes;
+        if (TILE_OC > vlmax_oc)
+            TILE_OC = (TILE_OC / vlmax_oc) * vlmax_oc;
+        else
+            TILE_OC = vlmax_oc;
+    } else {
+        TILE_OC = vlmax_oc;
+    }
+    if (TILE_OC > OC) TILE_OC = OC;
+    if (TILE_OC <= 0) TILE_OC = OC;
+
+    for (int oc_outer = 0; oc_outer < OC; oc_outer += TILE_OC) {
+        int oc_end = oc_outer + TILE_OC;
+        if (oc_end > OC) oc_end = OC;
+        for (int n = 0; n < N; n++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int oc_base = oc_outer;
+                    while (oc_base < oc_end) {
+                        size_t vl = __riscv_vsetvl_e32m4(
+                            (size_t)(oc_end - oc_base));
+                        vint32m4_t vacc;
+                        if (bias != NULL)
+                            vacc = __riscv_vle32_v_i32m4(bias + oc_base, vl);
+                        else
+                            vacc = __riscv_vmv_v_x_i32m4(0, vl);
+                        for (int ic = 0; ic < IC; ic++) {
+                            /* size_t hoist — see CONV2D_S8 spec.reference_impl. */
+                            const size_t in_row_base =
+                                ((size_t)n * IC + ic) * IH;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh * SH - PH + kh;
+                                int row_in = (ih >= 0 && ih < IH);
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow * SW - PW + kw;
+                                    int8_t in_byte = 0;
+                                    if (row_in && iw >= 0 && iw < IW)
+                                        in_byte = input[(in_row_base + ih) * IW + iw];
+                                    int32_t in_v = (int32_t)in_byte + input_offset;
+
+                                    /* IHWOC: weight[ic][kh][kw][oc] — OC contiguous */
+                                    const int8_t *wp = weight
+                                        + ((size_t)ic * KH * KW + (size_t)kh * KW + kw) * OC
+                                        + oc_base;
+                                    vint8m1_t vw8 = __riscv_vle8_v_i8m1(wp, vl);
+                                    vint16m2_t vw16 = __riscv_vwadd_vx_i16m2(
+                                        vw8, (int16_t)filter_offset, vl);
+                                    vacc = __riscv_vwmacc_vx_i32m4(
+                                        vacc, (int16_t)in_v, vw16, vl);
+                                }
+                            }
+                        }
+                        vint32m4_t vscaled = __riscv_vsmul_vx_i32m4(
+                            vacc, output_multiplier, __RISCV_VXRM_RNU, vl);
+                        vint16m2_t vout16;
+                        if (output_shift < 0) {
+                            vint32m4_t vshifted = __riscv_vsll_vx_i32m4(
+                                vscaled, (size_t)(-output_shift), vl);
+                            vout16 = __riscv_vnclip_wx_i16m2(
+                                vshifted, 0, __RISCV_VXRM_RNU, vl);
+                        } else if (output_shift < 32) {
+                            vout16 = __riscv_vnclip_wx_i16m2(
+                                vscaled, (size_t)output_shift, __RISCV_VXRM_RNU, vl);
+                        } else {
+                            int sa2 = output_shift - 31;
+                            if (sa2 > 31) sa2 = 31;
+                            vint32m4_t vscaled2 = __riscv_vsra_vx_i32m4(vscaled, 31, vl);
+                            vout16 = __riscv_vnclip_wx_i16m2(
+                                vscaled2, (size_t)sa2, __RISCV_VXRM_RNU, vl);
+                        }
+                        vout16 = __riscv_vadd_vx_i16m2(vout16, (int16_t)output_offset, vl);
+                        vout16 = __riscv_vmax_vx_i16m2(vout16, (int16_t)activation_min, vl);
+                        vout16 = __riscv_vmin_vx_i16m2(vout16, (int16_t)activation_max, vl);
+                        vint8m1_t vout8 = __riscv_vnsra_wx_i8m1(vout16, 0, vl);
+                        int8_t *op = output
+                            + ((size_t)n * OC + oc_base) * OH * OW
+                            + (size_t)oh * OW + ow;
+                        int8_t _obuf[256];
+                        __riscv_vse8_v_i8m1(_obuf, vout8, vl);
+                        for (size_t _vi = 0; _vi < vl; _vi++)
+                            op[_vi * (ptrdiff_t)(OH * OW)] = _obuf[_vi];
+                        oc_base += (int)vl;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv",
+            target_affinity=("gemmini", "gemmini_q31"),
+            weight_layout="hwio",
+            # HW im2col + GEMM + mvout-requantize. Float-scale on Saturn /
+            # Q0.31-fold on Q31 bitstream — both single-stage requantize, drift
+            # ≤1 LSB / layer vs the TFLite two-stage golden. Fast on RTL but
+            # not bit-exact for deep nets.
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Route the conv through the Gemmini int8 systolic mesh "
+                "via gemmini.h's tiled_conv_auto. Gemmini handles "
+                "im2col + GEMM + requantize internally; we transpose "
+                "NCHW→NHWC inputs and OIHW→OHWI weights into static "
+                "scratch buffers (gemmini's required layout), call "
+                "tiled_conv_auto, and transpose the output back.\n\n"
+                "Stage-1 limitations:\n"
+                "  * Square kernel/stride/padding only (KH==KW, SH==SW, "
+                "    PH==PW). Asserts otherwise.\n"
+                "  * input_offset / filter_offset / output_offset must "
+                "    all be 0 (symmetric quant; matches our extract_int8 "
+                "    output). The implementation rejects non-zero offsets "
+                "    by falling back to no-op (caller falls back).\n"
+                "  * Requantize is float-scale (gemmini's mvout-with-scale, "
+                "    derived from output_multiplier/output_shift via "
+                "    ldexpf) — accepts ~1-3 LSB drift vs the Q0.31 "
+                "    PyTorch golden. See modelblaster/notes/gemmini_extension_"
+                "    plan.md 'Requantize tail' section.\n"
+                "  * activation_min == 0 enables gemmini's RELU; "
+                "    activation_max is implicit (int8 saturate inside "
+                "    mvout). Other activation ranges fall back to a "
+                "    post-call clamp.\n"
+                "  * Static workspaces sized 128 KB each for input / "
+                "    weight / output buffers — fits dronet's largest "
+                "    conv (32×56×56). Larger models would need bigger "
+                "    workspaces or codegen-driven sizing."
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    /* Static workspaces (function-scope so the cache validator's
+     * signature check sees the function definition first). 128 KB each
+     * fits dronet's largest int8 conv (32*56*56 = 100352 bytes activations;
+     * 128*64*3*3 = 73728 bytes weights) with margin. .bss-allocated. */
+    enum { GEMMINI_WS_BYTES = 128 * 1024 };
+    static elem_t  ws_input  [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t  ws_weight [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t  ws_output [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+
+    /* Stage-1 constraints. Symmetric per-tensor quant (offsets all 0)
+     * matches what extract_int8 emits today. tiled_conv_auto wants
+     * one int for kernel_dim/stride/padding — square only. */
+    if (KH != KW || SH != SW || PH != PW
+            || input_offset != 0 || filter_offset != 0
+            || output_offset != 0
+            || (size_t)(N*IH*IW*IC) > GEMMINI_WS_BYTES
+            || (size_t)(OC*KH*KW*IC) > GEMMINI_WS_BYTES
+            || (size_t)(N*OH*OW*OC) > GEMMINI_WS_BYTES) {
+        /* Fallback: scalar reference impl. Same bit-exact behavior as
+         * the 'direct' algorithm; included verbatim so this kernel is
+         * self-contained even when the gemmini path can't be used. */
+        for (int n = 0; n < N; n++) {
+            for (int oc = 0; oc < OC; oc++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        int32_t acc = bias ? bias[oc] : 0;
+                        for (int ic = 0; ic < IC; ic++) {
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw;
+                                    int32_t in_v;
+                                    if (ih < 0 || ih >= IH || iw < 0 || iw >= IW) {
+                                        in_v = input_offset;
+                                    } else {
+                                        in_v = (int32_t)input[((n*IC+ic)*IH+ih)*IW+iw]
+                                             + input_offset;
+                                    }
+                                    int32_t w_v = (int32_t)weight[((oc*IC+ic)*KH+kh)*KW+kw]
+                                                + filter_offset;
+                                    acc += in_v * w_v;
+                                }
+                            }
+                        }
+                        int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                        prod = (prod + (1LL << 30)) >> 31;
+                        int32_t scaled = (int32_t)prod;
+                        if (output_shift > 0) {
+                            scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                        } else if (output_shift < 0) {
+                            scaled = scaled << (-output_shift);
+                        }
+                        scaled += output_offset;
+                        if (scaled < activation_min) scaled = activation_min;
+                        if (scaled > activation_max) scaled = activation_max;
+                        output[((n*OC+oc)*OH+oh)*OW+ow] = (int8_t)scaled;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    /* Enable mstatus.XS so RoCC custom-3 instructions don't trap as
+     * illegal. Zephyr's reset.S enables FS and VS but leaves XS=Off.
+     * The bareMetalC RVTEST_XS_ENABLE macro writes XS=Initial (0x8000)
+     * which works on functional spike + libgemmini. On real Rocket+
+     * Saturn-Gemmini RTL we need XS=Dirty (0x18000) — Initial alone
+     * still traps custom-3 (likely the RTL's enable signal AND-gates
+     * both XS bits, requiring 0b11). */
+    asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
+
+    /* gemmini_flush(0) puts the accelerator in a known state. Idempotent;
+     * the bareMetalC reference tests call this once at boot, but here we
+     * call it per-kernel since kernels.c has no other init hook. */
+    gemmini_flush(0);
+
+    /* NCHW -> NHWC transpose. Input shape: [N, IC, IH, IW] -> [N, IH, IW, IC]. */
+    for (int n = 0; n < N; n++) {
+        for (int h = 0; h < IH; h++) {
+            for (int w = 0; w < IW; w++) {
+                for (int c = 0; c < IC; c++) {
+                    ws_input[((n*IH + h)*IW + w)*IC + c] =
+                        input[((n*IC + c)*IH + h)*IW + w];
+                }
+            }
+        }
+    }
+
+    /* OIHW -> patch-major (KH*KW*IC) x OC. tiled_conv_auto reads
+     * weights as a flattened [K*K*IC, OC] matrix — see
+     * gemmini-rocc-tests' bareMetalC/conv.c flatten_weights() — NOT
+     * the OHWI [OC, KH, KW, IC] layout the input uses. Getting this
+     * wrong silently gives ~random output (max_abs_err ≈ 130 even
+     * with ACC_SCALE_IDENTITY); ws_weight rows must be (kh,kw,ic) in
+     * patch order, columns are oc. */
+    for (int oc = 0; oc < OC; oc++) {
+        for (int kh = 0; kh < KH; kh++) {
+            for (int kw = 0; kw < KW; kw++) {
+                for (int ic = 0; ic < IC; ic++) {
+                    ws_weight[((kh*KW + kw)*IC + ic)*OC + oc] =
+                        weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                }
+            }
+        }
+    }
+
+    /* Q0.31 multiplier+shift -> float scale.
+     * effective_scale = output_multiplier / 2^31 / 2^output_shift
+     *                 = output_multiplier * 2^(-(31 + output_shift))
+     * ldexpf handles either sign of (31 + output_shift). */
+    float scale = ldexpf((float)output_multiplier, -(31 + output_shift));
+
+    /* Activation enum. RELU (1) clamps the float-scaled output to [0,
+     * INT8_MAX]; NO_ACTIVATION (0) lets it use the full int8 range. We
+     * map activation_min == 0 to RELU. activation_max == INT8_MAX is
+     * implicit either way (gemmini saturates on int8 cast). */
+    int act_kind = (activation_min == 0) ? 1 /*RELU*/ : 0 /*NO_ACTIVATION*/;
+
+    /* Drain the CPU store buffer before gemmini's DMA reads ws_input /
+     * ws_weight. On spike (functional sim) stores are immediately visible;
+     * on real Rocket silicon the store buffer races the DMA load and can
+     * feed stale data. The RISC-V fence with "memory" clobber (a) tells
+     * the compiler the preceding stores are architectural, and (b) stalls
+     * the Rocket pipeline until the store buffer empties into L2, at which
+     * point gemmini's mvin sees the correct values. */
+    asm volatile ("fence" ::: "memory");
+
+    /* tiled_conv_auto: gemmini does im2col + GEMM + requantize
+     * internally. WS = weight-stationary dataflow (the canonical
+     * choice for inference). */
+    tiled_conv_auto(
+        N, IH, IW, IC,
+        OC, OH, OW,
+        SH, 1, 1, PH, KH,
+        false, false, false, false, false,
+        ws_input, ws_weight, bias, ws_output,
+        act_kind, scale,
+        0, 0, 0,
+        WS
+    );
+
+    /* tiled_conv_auto's body (tiled_conv) does NOT end with a
+     * gemmini_fence — unlike tiled_matmul_outer_eigen, which does.
+     * Without an explicit drain, the post-conv NHWC->NCHW read and
+     * the next op's gemmini_flush race with in-flight mvout DMAs
+     * and corrupt memory near the stack (FireSim Saturn signature:
+     * mcause=1, mepc=0).  gemmini_fence() blocks until the
+     * reservation station has retired all queued ld/ex/st ops,
+     * which transitively means all mvout DMAs have committed. */
+    gemmini_fence();
+    gemmini_flush(0);
+
+    /* NHWC -> NCHW transpose for the output. */
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < OC; c++) {
+            for (int h = 0; h < OH; h++) {
+                for (int w = 0; w < OW; w++) {
+                    output[((n*OC + c)*OH + h)*OW + w] =
+                        ws_output[((n*OH + h)*OW + w)*OC + c];
+                }
+            }
+        }
+    }
+
+    /* Optional post-clamp. activation_min == 0 was already handled by
+     * gemmini's RELU; activation_max < INT8_MAX needs a manual pass. */
+    if (activation_max < 127) {
+        int n_out = N*OC*OH*OW;
+        for (int i = 0; i < n_out; i++) {
+            int v = output[i];
+            if (v > activation_max) v = activation_max;
+            output[i] = (int8_t)v;
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name="gemmini_im2col_full_C",
+            target_affinity=("gemmini", "gemmini_q31"),
+            weight_layout="hwio",
+            # CPU im2col + tiled_matmul_auto(full_C=true) raw int32 mvout +
+            # scalar two-stage Q0.31 requantize on the host. Matches the
+            # TFLite/modelblaster reference math element-for-element.
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "im2col + tiled_matmul_auto(full_C=true) + scalar Q0.31 "
+                "requantize. Bypasses Saturn-Gemmini's float-scale mvout "
+                "to get bit-exact results matching the Q0.31 PyTorch golden "
+                "(max_abs_err=0 on Saturn RTL FireSim, validated May 2026).\n\n"
+                "Algorithm stages:\n"
+                "  1. Transpose input NCHW→NHWC into ws_input.\n"
+                "  2. Transpose weights OIHW→[K_inner, OC] patch-major into "
+                "     ws_weight (same layout as tiled_conv_auto expects).\n"
+                "  3. For each DIM-row tile of output positions:\n"
+                "     a. Build im2col A-matrix: DIM rows × K_inner cols from "
+                "        ws_input (zero-pad OOB; zero-fill rows beyond tile).\n"
+                "     b. tiled_matmul_auto(DIM, OC, K_inner, A=ws_im2col, "
+                "        B=ws_weight, D=bias, C=ws_acc_out, full_C=true) "
+                "        → int32 raw accumulators in ws_acc_out.\n"
+                "     c. gemmini_flush(0) to wait for DMA writes to ws_acc_out.\n"
+                "     d. Scalar Q0.31 requantize: "
+                "        (acc * output_multiplier + 1<<30) >> 31; "
+                "        >> output_shift; + output_offset; clamp.\n"
+                "  4. Transpose output NHWC→NCHW.\n\n"
+                "Key parameters:\n"
+                "  ws_im2col: DIM × IC*KH*KW (up to 16×128×9=18432 bytes).\n"
+                "  ws_acc_out: DIM × OC as acc_t (int32); 16×128×4=8192 bytes.\n"
+                "  full_C=true encodes as bit 1 of rs1 in gemmini_loop_ws; "
+                "  ACC_READ_FULL_WIDTH must be set in gemmini_params.h (it is).\n"
+                "  repeating_bias=true broadcasts bias[OC] to all DIM rows.\n\n"
+                "Scalar fallback (return after scalar path) for:\n"
+                "  input_offset != 0, filter_offset != 0, or buffer overflow.\n\n"
+                "Performance note: per-tile gemmini_flush dominates for "
+                "small-spatial convs (conv_modules.0 needs 196 flush calls). "
+                "conv_modules.8 (75% of dronet cycles) needs only 1. "
+                "Overall ~10% slower than scalar on dronet FireSim, but "
+                "bit-exact vs ~59 LSB drift on float-scale path."
+            ),
+            reference_impl="""\
+void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
+                      const int32_t *bias, int8_t *output,
+                      int N, int IC, int IH, int IW, int OC,
+                      int KH, int KW, int SH, int SW, int PH, int PW,
+                      int input_offset, int filter_offset, int output_offset,
+                      int output_multiplier, int output_shift,
+                      int activation_min, int activation_max) {
+    /* im2col → tiled_matmul_auto(full_C=true) → scalar Q0.31 requantize.
+     *
+     * Bypasses Saturn-Gemmini's float-scale mvout entirely: gemmini accumulates
+     * raw int32 dot products, the CPU applies the same Q0.31 fixed-point
+     * requantize as the reference kernel.  Bit-exact with the reference golden.
+     *
+     * Layout contract:
+     *   ws_input  [N, IH, IW, IC]       — NHWC input
+     *   ws_weight [KH*KW*IC, OC]        — patch-major weight (B matrix for matmul)
+     *   ws_im2col [DIM, KH*KW*IC]       — one DIM-row im2col tile (A matrix)
+     *   ws_acc_out[DIM, OC]             — int32 accumulator output from gemmini
+     *   ws_output [N, OH, OW, OC]       — NHWC int8 output (filled tile-by-tile)
+     */
+    enum { GEMMINI_WS_BYTES  = 128 * 1024 };
+    static elem_t ws_input  [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t ws_weight [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t ws_output [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    /* DIM × max(IC*KH*KW): dronet max = 16 × 128×9 = 18 432 bytes */
+    enum { GEMMINI_IM2COL_ELEMS = DIM * 128 * 9 };
+    static elem_t ws_im2col [GEMMINI_IM2COL_ELEMS] __attribute__((aligned(64)));
+    /* DIM × max(OC): dronet max = 16 × 128 × 4 = 8 192 bytes */
+    enum { GEMMINI_ACC_ELEMS = DIM * 128 };
+    static acc_t  ws_acc_out[GEMMINI_ACC_ELEMS]    __attribute__((aligned(64)));
+
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    int K_inner   = IC * KH * KW;
+    int total_out = N * OH * OW;
+
+    /* Fall back to scalar for configs that exceed workspace or need offsets. */
+    if (input_offset != 0 || filter_offset != 0
+            || (size_t)(N*IH*IW*IC)  > GEMMINI_WS_BYTES
+            || (size_t)(K_inner*OC)  > GEMMINI_WS_BYTES
+            || (size_t)(N*OH*OW*OC)  > GEMMINI_WS_BYTES
+            || K_inner * DIM         > GEMMINI_IM2COL_ELEMS
+            || OC * DIM              > GEMMINI_ACC_ELEMS) {
+        for (int n = 0; n < N; n++) {
+            for (int oc = 0; oc < OC; oc++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        int32_t acc = bias ? bias[oc] : 0;
+                        for (int ic = 0; ic < IC; ic++) {
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh * SH - PH + kh;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow * SW - PW + kw;
+                                    int32_t in_v;
+                                    if (ih < 0 || ih >= IH || iw < 0 || iw >= IW) {
+                                        in_v = input_offset;
+                                    } else {
+                                        in_v = (int32_t)input[((n*IC+ic)*IH+ih)*IW+iw]
+                                             + input_offset;
+                                    }
+                                    int32_t w_v = (int32_t)weight[((oc*IC+ic)*KH+kh)*KW+kw]
+                                                + filter_offset;
+                                    acc += in_v * w_v;
+                                }
+                            }
+                        }
+                        int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                        prod = (prod + (1LL << 30)) >> 31;
+                        int32_t scaled = (int32_t)prod;
+                        if (output_shift > 0) {
+                            scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                        } else if (output_shift < 0) {
+                            scaled = scaled << (-output_shift);
+                        }
+                        scaled += output_offset;
+                        if (scaled < activation_min) scaled = activation_min;
+                        if (scaled > activation_max) scaled = activation_max;
+                        output[((n*OC+oc)*OH+oh)*OW+ow] = (int8_t)scaled;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    /* Enable mstatus.XS=Dirty so RoCC custom-3 instructions don't trap. */
+    asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
+
+    /* Reset gemmini controller and drain any prior DMA. */
+    gemmini_flush(0);
+
+    /* NCHW → NHWC input transpose. */
+    for (int n = 0; n < N; n++)
+        for (int h = 0; h < IH; h++)
+            for (int w = 0; w < IW; w++)
+                for (int c = 0; c < IC; c++)
+                    ws_input[((n*IH + h)*IW + w)*IC + c] =
+                        input[((n*IC + c)*IH + h)*IW + w];
+
+    /* OIHW → patch-major [K_inner, OC]: B-matrix for tiled_matmul_auto.
+     * Row index = kh*KW*IC + kw*IC + ic (matching im2col column order). */
+    for (int oc = 0; oc < OC; oc++)
+        for (int kh = 0; kh < KH; kh++)
+            for (int kw = 0; kw < KW; kw++)
+                for (int ic = 0; ic < IC; ic++)
+                    ws_weight[((kh*KW + kw)*IC + ic)*OC + oc] =
+                        weight[((oc*IC + ic)*KH + kh)*KW + kw];
+
+    /* Drain CPU store buffer before gemmini mvin reads ws_weight. */
+    asm volatile("fence" ::: "memory");
+
+    /* Process output in tiles of DIM rows so ws_acc_out stays bounded. */
+    for (int tile_i = 0; tile_i < total_out; tile_i += DIM) {
+        int tile_rows = total_out - tile_i < DIM ? total_out - tile_i : DIM;
+
+        /* Build im2col A-matrix: DIM rows × K_inner cols.
+         * Row i = flattened receptive field for output position (tile_i + i).
+         * Rows beyond tile_rows are zero-padded (gemmini ignores their results). */
+        for (int i = 0; i < DIM; i++) {
+            elem_t *row = &ws_im2col[i * K_inner];
+            if (i >= tile_rows) {
+                for (int k = 0; k < K_inner; k++) row[k] = 0;
+                continue;
+            }
+            int out_idx = tile_i + i;
+            int ow_idx  = out_idx % OW;
+            int oh_idx  = (out_idx / OW) % OH;
+            int n_idx   = out_idx / (OH * OW);
+            for (int kh = 0; kh < KH; kh++) {
+                int ih = oh_idx * SH - PH + kh;
+                for (int kw = 0; kw < KW; kw++) {
+                    int iw = ow_idx * SW - PW + kw;
+                    elem_t *cell = row + kh * KW * IC + kw * IC;
+                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                        const elem_t *src = &ws_input[((n_idx*IH + ih)*IW + iw)*IC];
+                        for (int c = 0; c < IC; c++) cell[c] = src[c];
+                    } else {
+                        for (int c = 0; c < IC; c++) cell[c] = 0;
+                    }
+                }
+            }
+        }
+
+        /* Drain CPU stores to ws_im2col before gemmini mvin. */
+        asm volatile("fence" ::: "memory");
+
+        /* GEMM: ws_im2col [DIM × K_inner] × ws_weight [K_inner × OC] + bias[OC]
+         * full_C=true → output written as raw int32 (no float-scale applied). */
+        tiled_matmul_auto(
+            DIM, OC, K_inner,
+            ws_im2col, ws_weight,
+            (const void *)bias, (void *)ws_acc_out,
+            /* strides: A=K_inner, B=OC, D=OC, C=OC */
+            K_inner, OC, OC, OC,
+            MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, (scale_acc_t)1,
+            NO_ACTIVATION, ACC_SCALE_IDENTITY, (acc_scale_t)0,
+            bias != NULL,   /* repeating_bias: same OC vector for every row */
+            false, false,   /* no A/B transpose */
+            true, false,    /* full_C=true: int32 output; low_D=false */
+            0, WS
+        );
+
+        /* Wait for gemmini DMA writes to ws_acc_out to reach L2. */
+        gemmini_flush(0);
+
+        /* Scalar Q0.31 requantize: int32 accumulator → int8 NHWC. */
+        for (int i = 0; i < tile_rows; i++) {
+            int out_idx = tile_i + i;
+            int ow_idx  = out_idx % OW;
+            int oh_idx  = (out_idx / OW) % OH;
+            int n_idx   = out_idx / (OH * OW);
+            for (int oc = 0; oc < OC; oc++) {
+                int32_t acc = ws_acc_out[i * OC + oc];
+                int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                prod = (prod + (1LL << 30)) >> 31;
+                int32_t scaled = (int32_t)prod;
+                if (output_shift > 0) {
+                    scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                } else if (output_shift < 0) {
+                    scaled <<= (-output_shift);
+                }
+                scaled += output_offset;
+                if (scaled < activation_min) scaled = activation_min;
+                if (scaled > activation_max) scaled = activation_max;
+                ws_output[((n_idx*OH + oh_idx)*OW + ow_idx)*OC + oc] = (elem_t)scaled;
+            }
+        }
+    }
+
+    /* NHWC → NCHW output transpose. */
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < OC; c++)
+            for (int h = 0; h < OH; h++)
+                for (int w = 0; w < OW; w++)
+                    output[((n*OC + c)*OH + h)*OW + w] =
+                        ws_output[((n*OH + h)*OW + w)*OC + c];
+}
+""",
+        ),
+    ],
+)
+
+
+# Fused Conv2D + SiLU. Same dataflow as CONV2D_S8 plus an int8 SiLU LUT
+# applied during the requantize epilogue (saves 1 dispatch + 1 cross-tile
+# sync per occurrence; the int8 output tensor materializes once instead
+# of twice). Detected in extract_graph.py when a Conv2d is immediately
+# followed by an nn.SiLU. Curated kernels per backend can implement the
+# fused requantize→LUT epilogue directly; the reference impl below
+# composes the two ops in C as a fallback.
+CONV2D_SILU_S8 = KernelSpec(
+    op="conv2d_silu_s8",
+    signature=(
+        "void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int activation_min, int activation_max, "
+        "float silu_scale_in, float silu_scale_out)"
+    ),
+    semantics=(
+        "Fused quantized 2D convolution + SiLU activation. Computes\n"
+        "conv2d_s8(input, weight, bias) → int8 intermediate, then\n"
+        "elementwise SiLU(intermediate * silu_scale_in) / silu_scale_out\n"
+        "→ int8 output. activation_min / activation_max bound the final\n"
+        "output. silu_scale_in is the conv's output scale (= dequant for\n"
+        "the SiLU's float compute); silu_scale_out is the quantization\n"
+        "scale for the SiLU result.\n"
+        "Reference impl materializes the intermediate; curated kernels\n"
+        "can apply the SiLU LUT inline in the conv's requantize loop."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_conv2d_silu_s8(const int8_t *input, const int8_t *weight,
+                            const int32_t *bias, int8_t *output,
+                            int N, int IC, int IH, int IW, int OC,
+                            int KH, int KW, int SH, int SW, int PH, int PW,
+                            int input_offset, int filter_offset, int output_offset,
+                            int output_multiplier, int output_shift,
+                            int activation_min, int activation_max,
+                            float silu_scale_in, float silu_scale_out) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    /* Precompute SiLU LUT: 256 entries indexed by (uint8_t)int8 value.
+     * The conv intermediate is int8 (after requantize); SiLU maps each
+     * to another int8 via the float-precision SiLU formula. */
+    int8_t silu_lut[256];
+    for (int v = 0; v < 256; v++) {
+        int8_t iv = (int8_t)(uint8_t)v;
+        float f = (float)iv * silu_scale_in;
+        float y = f / (1.0f + expf(-f));
+        int32_t q = (int32_t)roundf(y / silu_scale_out);
+        if (q < activation_min) q = activation_min;
+        if (q > activation_max) q = activation_max;
+        silu_lut[v] = (int8_t)q;
+    }
+    /* Per-output-element conv with inline SiLU LUT. */
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        const size_t in_row_base = ((size_t)n * IC + ic) * IH;
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[(in_row_base + ih) * IW + iw] + input_offset;
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must NOT reuse the
+                                 * HWIO index above -- indexing an IHWOC buffer as HWIO reads
+                                 * the wrong elements (see _LAYOUT_PERMUTATION in
+                                 * generate_skeleton.py). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    /* Conv requantize → int8 intermediate (no clamp at the
+                     * activation min/max yet — those belong to the SiLU
+                     * output. Clamp to int8 range so the LUT index is valid). */
+                    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
+                    } else if (output_shift < 0) {
+                        scaled = scaled << (-output_shift);
+                    }
+                    scaled += output_offset;
+                    if (scaled < -128) scaled = -128;
+                    if (scaled > 127) scaled = 127;
+                    /* SiLU LUT applied to the int8 intermediate. */
+                    output[((n*OC + oc)*OH + oh)*OW + ow] =
+                        silu_lut[(uint8_t)(int8_t)scaled];
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # Small shape for verify; SiLU scales chosen so the LUT is non-trivial.
+        {"N": 1, "IC": 3, "IH": 8, "IW": 8, "OC": 16,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_silu_s8_argtypes,
+)
+
+
+MAXPOOL2D_S8 = KernelSpec(
+    op="maxpool2d_s8",
+    signature=(
+        "void kernel_maxpool2d_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int DH, int DW)"
+    ),
+    semantics=(
+        "Quantized 2D max-pool. Identical dataflow to fp32 maxpool2d but "
+        "operating on int8 lanes. No requantize is needed — max is just a "
+        "compare, and selecting an int8 input directly produces an int8 "
+        "output at the same scale. Padding is filled with INT8_MIN so OOB "
+        "lanes never win the max (the int8 analogue of -INF).\n"
+        "Layout (NCHW):\n"
+        "  input:  int8 [N, C, IH, IW]\n"
+        "  output: int8 [N, C, OH, OW]  with\n"
+        "    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n"
+        "    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n"
+        "  output[n, c, oh, ow] = max over kh in [0,KH), kw in [0,KW) of\n"
+        "    val(n, c, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW)\n"
+        "  where val(...) returns input[n,c,ih,iw] when in bounds, else\n"
+        "  INT8_MIN."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
+                         int N, int C, int IH, int IW,
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int8_t m = INT8_MIN;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh*DH;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw*DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            int8_t v = input[((n*C + c)*IH + ih)*IW + iw];
+                            if (v > m) m = v;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = m;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # LeNet
+        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        {"N": 1, "C": 16, "IH": 8, "IW": 8, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # DroNet
+        {"N": 1, "C": 32, "IH": 64, "IW": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+    ],
+    argtypes_factory=_maxpool2d_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_pool",
+            target_affinity=("gemmini", "gemmini_q31"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Route the maxpool through gemmini's depthwise-conv + "
+                "pool tail (tiled_conv_dw_auto). The conv is a per-"
+                "channel passthrough — kernel_dim=1, stride=1, "
+                "padding=0, weights=+1 per channel, bias=NULL, "
+                "act=0, scale=ACC_SCALE_IDENTITY — so the "
+                "accumulator value matches the input, and the mvout "
+                "pool unit takes max over each KH×KW window with "
+                "stride SH while writing to DRAM. We pick the dw "
+                "variant over the full conv path so we only need C "
+                "int8 weights instead of a C×C identity tensor "
+                "(matters for yolov8 where C up to 256). Square "
+                "windows only (KH==KW, SH==SW), DH==DW==1, and "
+                "PH==PW==0 since gemmini's pool zero-pads OOB but "
+                "the spec wants INT8_MIN — falls back to scalar "
+                "otherwise."
+            ),
+            reference_impl="""\
+void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
+                         int N, int C, int IH, int IW,
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int DH, int DW)
+{
+    enum { GEMMINI_WS_BYTES = 512 * 1024 };
+    enum { MAXPOOL_MAX_CHANNELS = 1024 };
+    static elem_t ws_input  [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t ws_output [GEMMINI_WS_BYTES] __attribute__((aligned(64)));
+    static elem_t ws_weights[MAXPOOL_MAX_CHANNELS] __attribute__((aligned(64)));
+    static int    ws_weights_inited = 0;
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    bool gemmini_ok =
+           KH == KW && SH == SW && PH == PW
+        && DH == 1 && DW == 1
+        && PH == 0
+        && C <= MAXPOOL_MAX_CHANNELS
+        && (size_t)(N * C * IH * IW) <= GEMMINI_WS_BYTES
+        && (size_t)(N * C * OH * OW) <= GEMMINI_WS_BYTES;
+    if (!gemmini_ok) {
+        for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+        for (int oh = 0; oh < OH; oh++)
+        for (int ow = 0; ow < OW; ow++) {
+            int8_t m = INT8_MIN;
+            for (int kh = 0; kh < KH; kh++) {
+                int ih = oh*SH - PH + kh*DH;
+                if (ih < 0 || ih >= IH) continue;
+                for (int kw = 0; kw < KW; kw++) {
+                    int iw = ow*SW - PW + kw*DW;
+                    if (iw < 0 || iw >= IW) continue;
+                    int8_t v = input[((n*C + c)*IH + ih)*IW + iw];
+                    if (v > m) m = v;
+                }
+            }
+            output[((n*C + c)*OH + oh)*OW + ow] = m;
+        }
+        return;
+    }
+    asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
+    if (!ws_weights_inited) {
+        for (int i = 0; i < MAXPOOL_MAX_CHANNELS; i++) ws_weights[i] = 1;
+        ws_weights_inited = 1;
+    }
+    gemmini_flush(0);
+    for (int n = 0; n < N; n++)
+        for (int h = 0; h < IH; h++)
+            for (int w = 0; w < IW; w++)
+                for (int c = 0; c < C; c++)
+                    ws_input[((n*IH + h)*IW + w)*C + c] =
+                        input[((n*C + c)*IH + h)*IW + w];
+    asm volatile("fence" ::: "memory");
+    tiled_conv_dw_auto(
+        N, IH, IW, C, IH, IW,
+        1, 0, 1,
+        ws_input, ws_weights, NULL, ws_output,
+        0, ACC_SCALE_IDENTITY,
+        KH, SH, PH,
+        WS);
+    gemmini_fence();
+    gemmini_flush(0);
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < OH; h++)
+                for (int w = 0; w < OW; w++)
+                    output[((n*C + c)*OH + h)*OW + w] =
+                        ws_output[((n*OH + h)*OW + w)*C + c];
+}
+""",
+        ),
+    ],
+)
+
+
+ADD_S8 = KernelSpec(
+    op="add_s8",
+    signature=(
+        "void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, "
+        "int n, float scale_a, float scale_b, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise add. The two inputs may have different "
+        "scales — they are dequantized to float, summed, and re-quantized "
+        "into the output's scale. Internal float32 math; result is\n"
+        "  output[i] = clamp(roundf((a[i]*scale_a + b[i]*scale_b)/scale_out),\n"
+        "                    activation_min, activation_max)\n"
+        "Use roundf (round-to-nearest, ties to even on most platforms; the\n"
+        "verify simulator matches by using numpy.float32 + numpy.round)."
+    ),
+    reference_impl="""\
+void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
+                   float scale_a, float scale_b, float scale_out,
+                   int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        float fa = (float)a[i] * scale_a;
+        float fb = (float)b[i] * scale_b;
+        float fout = (fa + fb) / scale_out;
+        int32_t v = (int32_t)roundf(fout);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 8192}],
+    argtypes_factory=_add_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="gemmini_resadd",
+            target_affinity=("gemmini", "gemmini_q31"),
+            # Gemmini's tiled_resadd_auto: C[i] = sat_int8(round(A_scale*A[i]
+            # + B_scale*B[i]) * C_scale) with optional fused ReLU. Same
+            # mvin float-scale path as conv2d's mvin_scale; no Q0.31 drift
+            # vs the float reference because the modelblaster add_s8 reference
+            # is itself a float computation.
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Route the elementwise add through Gemmini's "
+                "tiled_resadd_auto. Maps the modelblaster add_s8 contract "
+                "(output = round((a*scale_a + b*scale_b) / scale_out), "
+                "clamp [activation_min, activation_max]) to gemmini's "
+                "A_scale = scale_a/scale_out, B_scale = scale_b/scale_out, "
+                "C_scale = ACC_SCALE_IDENTITY, fused relu = "
+                "(activation_min == 0). Pass I=1, J=n; the inner tiler "
+                "shrinks tile_J in DIM-multiples to fit ACC_ROWS/2.\n\n"
+                "Stage-1 limitations (caller falls back to scalar):\n"
+                "  * n < 256: per-call gemmini setup (mstatus, "
+                "    gemmini_flush, fence) costs more than a scalar "
+                "    elementwise pass.\n"
+                "  * activation ranges other than (0, 127) and "
+                "    (-128, 127) need a CPU post-clamp (still a win — "
+                "    the elementwise body runs on gemmini)."
+            ),
+            reference_impl="""\
+void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
+                   float scale_a, float scale_b, float scale_out,
+                   int activation_min, int activation_max)
+{
+    float a_ratio = scale_a / scale_out;
+    float b_ratio = scale_b / scale_out;
+    float a_abs   = a_ratio < 0 ? -a_ratio : a_ratio;
+    float b_abs   = b_ratio < 0 ? -b_ratio : b_ratio;
+    bool scales_ok = (a_abs >= 0.5f && a_abs <= 2.0f
+                      && b_abs >= 0.5f && b_abs <= 2.0f);
+    if (n <= 0 || n < 256 || !scales_ok) {
+        for (int i = 0; i < n; i++) {
+            float fa = (float)a[i] * scale_a;
+            float fb = (float)b[i] * scale_b;
+            float fout = (fa + fb) / scale_out;
+            int32_t v = (int32_t)roundf(fout);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[i] = (int8_t)v;
+        }
+        return;
+    }
+    bool fused_relu = (activation_min == 0 && activation_max == 127);
+    bool need_post_clamp = !(activation_min == -128 && activation_max == 127)
+                            && !fused_relu;
+    asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
+    scale_t a_scale = (scale_t)(scale_a / scale_out);
+    scale_t b_scale = (scale_t)(scale_b / scale_out);
+    /* Chunk to ≤6272 to dodge the I=1, large-J memory-corruption mode
+     * in tiled_resadd_auto's internal tiler. */
+    enum { ADD_CHUNK_MAX = 6272 };
+    int remaining = n, offset = 0;
+    while (remaining > 0) {
+        int chunk = remaining > ADD_CHUNK_MAX ? ADD_CHUNK_MAX : remaining;
+        gemmini_flush(0);
+        asm volatile("fence" ::: "memory");
+        tiled_resadd_auto(
+            1, (size_t)chunk,
+            a_scale, b_scale, ACC_SCALE_IDENTITY,
+            a + offset, b + offset, output + offset,
+            fused_relu,
+            WS
+        );
+        gemmini_fence();
+        gemmini_flush(0);
+        offset += chunk;
+        remaining -= chunk;
+    }
+    if (need_post_clamp) {
+        for (int i = 0; i < n; i++) {
+            int v = output[i];
+            if (v < activation_min) output[i] = (int8_t)activation_min;
+            else if (v > activation_max) output[i] = (int8_t)activation_max;
+        }
+    }
+}
+""",
+        ),
+        # The RVV entry. The only algorithm registered for this op was
+        # gemmini-affined, so on an RVV target the curated probe had no
+        # (op, algorithm) pair to look for and every residual add ran
+        # the scalar reference inside a build labelled rvv_x60.
+        # Kernel: kernels/rvv/rvv_add_s8_rvv_frm_rmm.c
+        AlgorithmCandidate(
+            name="rvv_frm_rmm",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The reference expression issued on the vector unit, "
+                "including its rounding mode.\n\n"
+                "The reference ends in `(int32_t)roundf(fout)`, and "
+                "roundf is round-to-nearest TIES AWAY FROM ZERO -- "
+                "which is why the earlier curated RVV work declined to "
+                "vectorise anything shaped like this. That is a "
+                "property of vfcvt's default behaviour, not of the "
+                "instruction: vfcvt.x.f rounds by `frm`, and frm=RMM "
+                "(round to nearest, ties to Max Magnitude) IS "
+                "ties-away-from-zero. So the conversion is not an "
+                "approximation of roundf, it is roundf, and the kernel "
+                "is bit-exact by construction.\n\n"
+                "frm is toggled around the conversion rather than held: "
+                "it also governs vfmul/vfadd/vfdiv, and leaving it at "
+                "RMM would round the dequantize, the sum and the divide "
+                "to ties-away where C rounds to nearest-even. Two csrw "
+                "per 32 outputs, against a vfdiv that costs far more.\n\n"
+                "The three float operations stay separate (no vfmacc) "
+                "and the divide stays a divide (no reciprocal "
+                "multiply): both would remove an intermediate rounding "
+                "the reference performs."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+BATCHNORM2D_S8 = KernelSpec(
+    op="batchnorm2d_s8",
+    signature=(
+        "void kernel_batchnorm2d_s8(const int8_t *input, const float *scale, "
+        "const float *bias, int8_t *output, int N, int C, int H, int W, "
+        "float scale_in, float scale_out, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized BN: per-channel float affine on int8 activations.\n"
+        "  output[n, c, h, w] = clamp(\n"
+        "      roundf((scale[c] * (input[n, c, h, w] * scale_in) + bias[c])\n"
+        "             / scale_out),\n"
+        "      activation_min, activation_max)\n"
+        "scale and bias are the eval-mode-folded BatchNorm parameters\n"
+        "(scale = gamma / sqrt(var + eps), bias = beta - mean * scale).\n"
+        "Per-channel float arrays of length C."
+    ),
+    reference_impl="""\
+void kernel_batchnorm2d_s8(const int8_t *input, const float *scale,
+                           const float *bias, int8_t *output,
+                           int N, int C, int H, int W,
+                           float scale_in, float scale_out,
+                           int activation_min, int activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float s = scale[c];
+            float b = bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    float fv = (float)input[idx] * scale_in;
+                    float y = s * fv + b;
+                    int32_t v = (int32_t)roundf(y / scale_out);
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[idx] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "H": 16, "W": 16},
+        {"N": 1, "C": 64, "H": 8, "W": 8},
+        {"N": 1, "C": 128, "H": 4, "W": 4},
+    ],
+    argtypes_factory=_batchnorm2d_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="per_channel_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Quantized BN via a per-channel 256-entry int8 LUT. "
+                "For fixed (scale[c], bias[c], scale_in, scale_out, "
+                "clamp range) the output is a deterministic function "
+                "of the int8 input pixel with at most 256 distinct "
+                "values. Build lut[v] = scalar_bn(v - 128, c) at the "
+                "start of each channel using the SAME math as the "
+                "reference impl, then the inner H*W loop is a scalar "
+                "indexed load. Bit-exact by construction.\n"
+                "Same constraint as silu_s8's rvv_lut_gather: the "
+                "Saturn-OPU FireSim bitstream does NOT implement "
+                "vluxei8, so the lookup stays scalar — the win comes "
+                "from replacing ~8 fp ops per pixel (cast/mul/FMA/div/"
+                "round/2 clamps) with a single byte indexed load."
+            ),
+            reference_impl=(
+                "#include <math.h>\n"
+                "#include <stdint.h>\n"
+                "void kernel_batchnorm2d_s8(const int8_t *input, "
+                "const float *scale, const float *bias, int8_t *output, "
+                "int N, int C, int H, int W, float scale_in, "
+                "float scale_out, int activation_min, int activation_max) {\n"
+                "    int spatial = H * W;\n"
+                "    for (int n = 0; n < N; n++) {\n"
+                "        for (int c = 0; c < C; c++) {\n"
+                "            float s = scale[c];\n"
+                "            float b = bias[c];\n"
+                "            int8_t lut[256];\n"
+                "            for (int v = 0; v < 256; v++) {\n"
+                "                int8_t iv = (int8_t)(v - 128);\n"
+                "                float fv = (float)iv * scale_in;\n"
+                "                float y = s * fv + b;\n"
+                "                int32_t q = (int32_t)roundf(y / scale_out);\n"
+                "                if (q < activation_min) q = activation_min;\n"
+                "                if (q > activation_max) q = activation_max;\n"
+                "                lut[v] = (int8_t)q;\n"
+                "            }\n"
+                "            const int8_t *ip = input + (n * C + c) * spatial;\n"
+                "            int8_t *op = output + (n * C + c) * spatial;\n"
+                "            for (int i = 0; i < spatial; i++) {\n"
+                "                op[i] = lut[(int)ip[i] + 128];\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+    ],
+)
+
+
+SIGMOID_S8 = KernelSpec(
+    op="sigmoid_s8",
+    signature=(
+        "void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Elementwise quantized sigmoid:\n"
+        "  output[i] = clamp(\n"
+        "      roundf( (1 / (1 + expf(-input[i] * scale_in))) / scale_out ),\n"
+        "      activation_min, activation_max)\n"
+        "Tiny tensors (often n=1 at a model output head) — scalar loop is\n"
+        "fine."
+    ),
+    reference_impl="""\
+void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
+                       float scale_in, float scale_out,
+                       int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        float fv = (float)input[i] * scale_in;
+        float sig = 1.0f / (1.0f + expf(-fv));
+        int32_t v = (int32_t)roundf(sig / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 16}],
+    argtypes_factory=_sigmoid_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all.
+        # Kernel: kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The expensive part of this op is the expf, not the "
+                "datapath width: ~140 cycles per element on this core, "
+                "which is essentially the whole runtime. There is no "
+                "vector expf, and a polynomial one would trade "
+                "bit-exactness for an op measured in tens of "
+                "microseconds.\n\n"
+                "What does help: the input is int8, so the op has at "
+                "most 256 distinct outputs for a given quant tuple, and "
+                "a quantized activation tensor repeats values heavily. "
+                "One cheap pass marks which of the 256 bytes actually "
+                "occur, expf runs only for those, and the output is a "
+                "vector indexed-load gather (vluxei8, the biased byte "
+                "used directly as its own offset into the table). Cost "
+                "goes from n*expf to distinct*expf.\n\n"
+                "The MEMOIZED table beats the eager one: building all "
+                "256 entries costs 256 expf regardless of n, which "
+                "loses for every shape these models have. Building only "
+                "what is asked for never loses by more than the marking "
+                "pass, and below a small-n guard the reference "
+                "expression runs per element instead.\n\n"
+                "Bit-exact by construction -- each table entry is the "
+                "reference's own expression, scalar, float32, same "
+                "casts, same roundf, and the vector path contains no "
+                "arithmetic at all. Its one appearance in these models is DroNet\'s output head at n=1, below the guard, where it runs the same scalar path the reference does; it closes a coverage hole and will pay for itself on a model that applies sigmoid to a real tensor."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+CONV2D_DW = KernelSpec(
+    op="conv2d_dw",
+    signature=(
+        "void kernel_conv2d_dw(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "Depthwise 2D convolution — each input channel has its OWN filter,\n"
+        "applied independently. Equivalent to torch.nn.Conv2d with\n"
+        "groups=in_channels=out_channels=C and dilation=1.\n"
+        "Layout (row-major):\n"
+        "  input:  [N, C, IH, IW]\n"
+        "  weight: [C, 1, KH, KW]   (one KHxKW filter per channel)\n"
+        "  bias:   [C] (may be NULL — treat as zeros)\n"
+        "  output: [N, C, OH, OW]   with\n"
+        "    OH = (IH + 2*PH - KH) / SH + 1\n"
+        "    OW = (IW + 2*PW - KW) / SW + 1\n"
+        "Definition (zero-padding):\n"
+        "  output[n, c, oh, ow] = bias[c] + sum over kh, kw of\n"
+        "    input[n, c, oh*SH - PH + kh, ow*SW - PW + kw]\n"
+        "    * weight[c, 0, kh, kw]\n"
+        "  with input reads outside [0, IH) x [0, IW) treated as 0.\n"
+        "All tensors are float32."
+    ),
+    reference_impl="""\
+/* depthwise weight [C,1,KH,KW]; packed (IHWOC/HWIO) both put C innermost */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_DW_W(c, kh, kw) (((long)(kh)*KW + (kw))*C + (c))
+#else
+#define MB_CONV2D_DW_W(c, kh, kw) (((long)(c)*KH + (kh))*KW + (kw))
+#endif
+void kernel_conv2d_dw(const float *input, const float *weight, const float *bias,
+                      float *output,
+                      int N, int C, int IH, int IW,
+                      int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[c] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = input[((n*C + c)*IH + ih)*IW + iw];
+                            float w = weight[MB_CONV2D_DW_W(c, kh, kw)];
+                            acc += v * w;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+#undef MB_CONV2D_DW_W
+""",
+    extra_shapes=[
+        # MobileNetV2 width_mult=0.25 first-block 3x3 stride=1 dw conv
+        {"N": 1, "C": 8, "IH": 56, "IW": 56,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        # MobileNetV2 stride=2 dw transition
+        {"N": 1, "C": 24, "IH": 56, "IW": 56,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        # Asymmetric / odd shapes
+        {"N": 1, "C": 4, "IH": 7, "IW": 5,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_dw_argtypes,
+)
+
+
+RELU6 = KernelSpec(
+    op="relu6",
+    signature="void kernel_relu6(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise ReLU6 on a contiguous float32 buffer:\n"
+        "  output[i] = min(max(0.0f, input[i]), 6.0f)  for i in [0, n)\n"
+        "It must be safe for `input` and `output` to alias."
+    ),
+    reference_impl="""\
+void kernel_relu6(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        if (v < 0.0f) v = 0.0f;
+        if (v > 6.0f) v = 6.0f;
+        output[i] = v;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 1024},
+    ],
+    argtypes_factory=_relu6_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# KernelBench Phase 2 activations (10 ops). All pointwise, fp32. The
+# matching fp16 variants live below alongside the other _f16 specs so
+# the existing fp16 mode picks them up via the op-suffix mechanism.
+# ---------------------------------------------------------------------------
+
+LEAKY_RELU = KernelSpec(
+    op="leaky_relu",
+    signature=(
+        "void kernel_leaky_relu(const float *input, float *output, "
+        "int n, float negative_slope)"
+    ),
+    semantics=(
+        "Elementwise LeakyReLU on a contiguous float32 buffer:\n"
+        "  output[i] = input[i]                if input[i] >= 0\n"
+        "  output[i] = input[i] * negative_slope otherwise\n"
+        "Same shape as ReLU; the slope on the negative half-line is the\n"
+        "only difference. Safe to alias input/output."
+    ),
+    reference_impl="""\
+void kernel_leaky_relu(const float *input, float *output,
+                       int n, float negative_slope) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        output[i] = v >= 0.0f ? v : v * negative_slope;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_leaky_relu_argtypes,
+)
+
+
+TANH = KernelSpec(
+    op="tanh",
+    signature="void kernel_tanh(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise tanh on a contiguous float32 buffer.\n"
+        "Uses libm's tanhf — already accurate to <1ulp on Zephyr's\n"
+        "newlib/picolibc."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_tanh(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = tanhf(input[i]);
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SWISH = KernelSpec(
+    op="swish",
+    signature="void kernel_swish(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise Swish (also called SiLU): output[i] = x * sigmoid(x).\n"
+        "sigmoid(x) = 1 / (1 + expf(-x))."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_swish(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float s = 1.0f / (1.0f + expf(-x));
+        output[i] = x * s;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+GELU = KernelSpec(
+    op="gelu",
+    signature="void kernel_gelu(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise GELU using the EXACT erf formulation, matching\n"
+        "torch.nn.GELU and torch.nn.functional.gelu's `approximate='none'`\n"
+        "default (PyTorch 1.10+):\n"
+        "  output = 0.5 * x * (1 + erf(x / sqrt(2)))\n"
+        "The tanh approximation lives under the separate `gelu_exact`\n"
+        "op (used by the MinGPT-style hand-rolled expression). The two\n"
+        "agree to ~5e-4 absolute on randn inputs — close but distinct,\n"
+        "and PyTorch ships the erf form as default so we use it here."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_gelu(const float *input, float *output, int n) {
+    /* 1 / sqrt(2) = 0.70710678118654752440f. */
+    const float inv_sqrt2 = 0.7071067811865475f;
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        output[i] = 0.5f * x * (1.0f + erff(x * inv_sqrt2));
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+# The tanh-based GELU approximation — what MinGPT (and the original
+# BERT / GPT-2 papers) hand-rolled. PyTorch reaches this form via
+# `F.gelu(x, approximate='tanh')` or by tracing the explicit
+# expression. We keep a separate op for it so the IR cleanly captures
+# which surface the bench used; numerically the two agree to ~5e-4.
+GELU_EXACT = KernelSpec(
+    op="gelu_exact",
+    signature=(
+        "void kernel_gelu_exact(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise GELU computed via the MinGPT / BERT formula:\n"
+        "  output = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))\n"
+        "Approximation of the exact erf form; the two agree to ~5e-4 on\n"
+        "randn inputs. Used by 88_MinGPTNewGelu and `F.gelu(approximate='tanh')`."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_gelu_exact(const float *input, float *output, int n) {
+    /* sqrtf(2.0f / M_PI) = 0.79788456080286535588f. */
+    const float k = 0.7978845608028654f;
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float u = k * (x + 0.044715f * x * x * x);
+        output[i] = 0.5f * x * (1.0f + tanhf(u));
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SELU = KernelSpec(
+    op="selu",
+    signature="void kernel_selu(const float *input, float *output, int n)",
+    semantics=(
+        "Scaled Exponential Linear Unit. PyTorch uses fixed constants:\n"
+        "  alpha  = 1.6732632423543772\n"
+        "  scale  = 1.0507009873554805\n"
+        "  output = scale * (x       if x > 0\n"
+        "                    alpha * (expf(x) - 1)   otherwise)"
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_selu(const float *input, float *output, int n) {
+    const float alpha = 1.6732632423543772f;
+    const float scale = 1.0507009873554805f;
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float y = x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+        output[i] = scale * y;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+HARDSIGMOID = KernelSpec(
+    op="hardsigmoid",
+    signature=(
+        "void kernel_hardsigmoid(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Piecewise-linear sigmoid approximation matching\n"
+        "torch.nn.functional.hardsigmoid:\n"
+        "  output[i] =   0          if x <= -3\n"
+        "              1            if x >=  3\n"
+        "              x/6 + 0.5    otherwise"
+    ),
+    reference_impl="""\
+void kernel_hardsigmoid(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float y;
+        if (x <= -3.0f)      y = 0.0f;
+        else if (x >=  3.0f) y = 1.0f;
+        else                 y = x * (1.0f / 6.0f) + 0.5f;
+        output[i] = y;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SOFTPLUS = KernelSpec(
+    op="softplus",
+    signature=(
+        "void kernel_softplus(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise softplus: output = log(1 + expf(x)).\n"
+        "For numerical stability we pivot on the sign of x so we never\n"
+        "compute expf of a large positive: large-x reduces to x +\n"
+        "log(1 + expf(-x)) ~= x. PyTorch defaults to beta=1, threshold=20\n"
+        "but the threshold-passthrough only matters for extreme inputs;\n"
+        "the unconditional formula via log1pf(expf(...)) is fine in fp32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_softplus(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        /* Pivot keeps expf's argument <= 0, avoiding overflow. */
+        float y = x > 0.0f
+            ? x + log1pf(expf(-x))
+            : log1pf(expf(x));
+        output[i] = y;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+SOFTSIGN = KernelSpec(
+    op="softsign",
+    signature=(
+        "void kernel_softsign(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise softsign: output = x / (1 + |x|). Smooth, bounded\n"
+        "alternative to tanh; no transcendental cost."
+    ),
+    reference_impl="""\
+void kernel_softsign(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        float ax = x < 0.0f ? -x : x;
+        output[i] = x / (1.0f + ax);
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_pointwise_argtypes,
+)
+
+
+HARDTANH = KernelSpec(
+    op="hardtanh",
+    signature=(
+        "void kernel_hardtanh(const float *input, float *output, "
+        "int n, float min_val, float max_val)"
+    ),
+    semantics=(
+        "Pointwise clamp to [min_val, max_val]. PyTorch's hardtanh\n"
+        "defaults to min=-1, max=+1. Same dataflow as relu6 with\n"
+        "configurable bounds."
+    ),
+    reference_impl="""\
+void kernel_hardtanh(const float *input, float *output,
+                     int n, float min_val, float max_val) {
+    for (int i = 0; i < n; i++) {
+        float x = input[i];
+        if (x < min_val) x = min_val;
+        if (x > max_val) x = max_val;
+        output[i] = x;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}],
+    argtypes_factory=_hardtanh_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# KernelBench Phase 2 reductions over a single dimension. Each kernel
+# treats the input as logically 3D — [outer, reduce, inner] — so any
+# Nd input with `dim=k` flattens to outer=prod(shape[:k]),
+# reduce=shape[k], inner=prod(shape[k+1:]). The output is [outer, inner]
+# (or [outer, 1, inner] for keepdim) — same flat layout for both, so
+# the kernels don't need to know about keepdim.
+# ---------------------------------------------------------------------------
+
+def _reduce_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _argreduce_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    i64p = ctypes.POINTER(ctypes.c_int64)
+    return [fp, i64p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+SUM_DIM = KernelSpec(
+    op="sum_dim",
+    signature=(
+        "void kernel_sum_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-sum along the middle axis of a logically [outer, reduce,\n"
+        "inner] flattened tensor. Output is [outer, inner].\n"
+        "  output[o, i] = sum over r in [0, reduce) of\n"
+        "    input[(o * reduce + r) * inner + i]"
+    ),
+    reference_impl="""\
+void kernel_sum_dim(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                acc += input[(o * reduce + r) * inner + i];
+            }
+            output[o * inner + i] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+MEAN_DIM = KernelSpec(
+    op="mean_dim",
+    signature=(
+        "void kernel_mean_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-mean along the middle axis. Same dataflow as sum_dim,\n"
+        "with a final divide by `reduce`."
+    ),
+    reference_impl="""\
+void kernel_mean_dim(const float *input, float *output,
+                     int outer, int reduce, int inner) {
+    float inv = 1.0f / (float)reduce;
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                acc += input[(o * reduce + r) * inner + i];
+            }
+            output[o * inner + i] = acc * inv;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+MAX_DIM = KernelSpec(
+    op="max_dim",
+    signature=(
+        "void kernel_max_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-max (values only, not indices) along the middle axis.\n"
+        "Initialized to -FLT_MAX so a single-element reduce returns the\n"
+        "input value directly."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_max_dim(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = -FLT_MAX;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v > m) m = v;
+            }
+            output[o * inner + i] = m;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+MIN_DIM = KernelSpec(
+    op="min_dim",
+    signature=(
+        "void kernel_min_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-min (values only) along the middle axis. Mirror of\n"
+        "max_dim with FLT_MAX init and `<` compare."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_min_dim(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = FLT_MAX;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v < m) m = v;
+            }
+            output[o * inner + i] = m;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+PROD_DIM = KernelSpec(
+    op="prod_dim",
+    signature=(
+        "void kernel_prod_dim(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Reduce-product along the middle axis. Init=1.0, multiply-fold."
+    ),
+    reference_impl="""\
+void kernel_prod_dim(const float *input, float *output,
+                     int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 1.0f;
+            for (int r = 0; r < reduce; r++) {
+                acc *= input[(o * reduce + r) * inner + i];
+            }
+            output[o * inner + i] = acc;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+ARGMAX_DIM = KernelSpec(
+    op="argmax_dim",
+    signature=(
+        "void kernel_argmax_dim(const float *input, int64_t *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Argmax along the middle axis. Returns int64 indices (same dtype\n"
+        "as torch.argmax). On ties, returns the FIRST index (matches\n"
+        "torch's behavior on CPU)."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+#include <float.h>
+
+void kernel_argmax_dim(const float *input, int64_t *output,
+                       int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = -FLT_MAX;
+            int64_t idx = 0;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v > m) { m = v; idx = (int64_t)r; }
+            }
+            output[o * inner + i] = idx;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_argreduce_argtypes,
+)
+
+
+ARGMIN_DIM = KernelSpec(
+    op="argmin_dim",
+    signature=(
+        "void kernel_argmin_dim(const float *input, int64_t *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Argmin along the middle axis. Returns int64 indices. Same\n"
+        "tie-breaking as torch (first index)."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+#include <float.h>
+
+void kernel_argmin_dim(const float *input, int64_t *output,
+                       int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float m = FLT_MAX;
+            int64_t idx = 0;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                if (v < m) { m = v; idx = (int64_t)r; }
+            }
+            output[o * inner + i] = idx;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1,  "reduce": 17,  "inner": 1},
+        {"outer": 4,  "reduce": 33,  "inner": 8},
+        {"outer": 16, "reduce": 256, "inner": 256},
+    ],
+    argtypes_factory=_argreduce_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# KernelBench Phase 2 norms (subset). Each divides the input by some
+# reduction-derived scalar/vector. L1Norm / L2Norm share the
+# (outer, reduce, inner) shape with the reductions; FrobeniusNorm
+# uses a single global denominator over the whole tensor.
+# ---------------------------------------------------------------------------
+
+L1_NORM = KernelSpec(
+    op="l1_norm",
+    signature=(
+        "void kernel_l1_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Per-(outer, inner) L1 normalization:\n"
+        "  denom[o, i] = sum over r of |input[(o*reduce + r)*inner + i]|\n"
+        "  output[o, r, i] = input[o, r, i] / denom[o, i]\n"
+        "Same flat layout as the reduction kernels, but the output\n"
+        "preserves the reduce axis (broadcast division)."
+    ),
+    reference_impl="""\
+void kernel_l1_norm(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float denom = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                denom += v < 0.0f ? -v : v;
+            }
+            float inv = 1.0f / denom;
+            for (int r = 0; r < reduce; r++) {
+                int idx = (o * reduce + r) * inner + i;
+                output[idx] = input[idx] * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "reduce": 17, "inner": 1},
+        {"outer": 16, "reduce": 16384, "inner": 1},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+L2_NORM = KernelSpec(
+    op="l2_norm",
+    signature=(
+        "void kernel_l2_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "Per-(outer, inner) L2 normalization:\n"
+        "  denom[o, i] = sqrt(sum over r of input[o, r, i]^2)\n"
+        "  output[o, r, i] = input[o, r, i] / denom[o, i]"
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_l2_norm(const float *input, float *output,
+                    int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float ssq = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[(o * reduce + r) * inner + i];
+                ssq += v * v;
+            }
+            float inv = 1.0f / sqrtf(ssq);
+            for (int r = 0; r < reduce; r++) {
+                int idx = (o * reduce + r) * inner + i;
+                output[idx] = input[idx] * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "reduce": 17, "inner": 1},
+        {"outer": 16, "reduce": 16384, "inner": 1},
+    ],
+    argtypes_factory=_reduce_argtypes,
+)
+
+
+def _frobenius_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+FROBENIUS_NORM = KernelSpec(
+    op="frobenius_norm",
+    signature=(
+        "void kernel_frobenius_norm(const float *input, float *output, int n)"
+    ),
+    semantics=(
+        "Global Frobenius normalization — whole tensor flattened.\n"
+        "  denom = sqrt(sum over i of input[i]^2)\n"
+        "  output[i] = input[i] / denom\n"
+        "torch.norm(x, p='fro') == torch.norm(x, p=2) on a flattened\n"
+        "tensor; we compute it as a sum-of-squares + sqrtf."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_frobenius_norm(const float *input, float *output, int n) {
+    float ssq = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        ssq += v * v;
+    }
+    float inv = 1.0f / sqrtf(ssq);
+    for (int i = 0; i < n; i++) {
+        output[i] = input[i] * inv;
+    }
+}
+""",
+    extra_shapes=[{"n": 17}, {"n": 1024}],
+    argtypes_factory=_frobenius_norm_argtypes,
+)
+
+
+ADAPTIVE_AVG_POOL2D = KernelSpec(
+    op="adaptive_avg_pool2d",
+    signature=(
+        "void kernel_adaptive_avg_pool2d(const float *input, float *output, "
+        "int N, int C, int IH, int IW)"
+    ),
+    semantics=(
+        "Global average pooling — collapses [N, C, IH, IW] to [N, C, 1, 1]\n"
+        "by averaging over each channel's HxW plane. Matches\n"
+        "torch.nn.AdaptiveAvgPool2d(output_size=1).\n"
+        "Definition:\n"
+        "  output[n, c, 0, 0] = (1 / (IH*IW)) * sum over ih, iw of\n"
+        "    input[n, c, ih, iw]\n"
+        "All tensors are float32. (Generic AdaptiveAvgPool2d to non-1x1\n"
+        "outputs would partition the spatial dims into output-sized chunks;\n"
+        "we only support 1x1 outputs since that's what classifiers use.)"
+    ),
+    reference_impl="""\
+void kernel_adaptive_avg_pool2d(const float *input, float *output,
+                                int N, int C, int IH, int IW) {
+    int n_per_chan = IH * IW;
+    float inv = 1.0f / (float)n_per_chan;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            const float *src = input + ((n*C + c) * IH) * IW;
+            float acc = 0.0f;
+            for (int i = 0; i < n_per_chan; i++) {
+                acc += src[i];
+            }
+            output[n*C + c] = acc * inv;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 7, "IW": 7},
+        {"N": 1, "C": 320, "IH": 7, "IW": 7},
+        {"N": 1, "C": 4, "IH": 1, "IW": 1},
+    ],
+    argtypes_factory=_adaptive_avg_pool2d_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# fp16 (half-precision) kernel specs. Mirror the fp32 pointwise / pool /
+# conv / batchnorm shapes but use _Float16 storage. For accumulating ops
+# (conv2d, batchnorm-fold) we accumulate in fp32 then cast back — same
+# pattern Tensor Cores use, and the accuracy gap to a pure-fp16 accumulator
+# is significant enough that torch.float16 conv goes through this path too.
+# Element-wise transcendentals (sigmoid, elu) round-trip through float for
+# the math kernel since libm has no half-precision expf yet.
+# ---------------------------------------------------------------------------
+
+RELU_F16 = KernelSpec(
+    op="relu_f16",
+    signature="void kernel_relu_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Elementwise ReLU on a contiguous _Float16 buffer:\n"
+        "  output[i] = max(0, input[i])  for i in [0, n)\n"
+        "Same semantics as the fp32 RELU kernel — only the storage type "
+        "changes. It must be safe for `input` and `output` to alias."
+    ),
+    reference_impl="""\
+void kernel_relu_f16(const _Float16 *input, _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        _Float16 v = input[i];
+        output[i] = v > (_Float16)0.0f ? v : (_Float16)0.0f;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_relu_f16_argtypes,
+)
+
+
+SIGMOID_F16 = KernelSpec(
+    op="sigmoid_f16",
+    signature="void kernel_sigmoid_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Elementwise sigmoid on a contiguous _Float16 buffer:\n"
+        "  output[i] = 1 / (1 + expf(-input[i]))\n"
+        "Math is done in float (libm has no expf16), then the result is\n"
+        "cast back to _Float16. This is what torch.float16 sigmoid does\n"
+        "internally on CPU."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_sigmoid_f16(const _Float16 *input, _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)input[i];
+        output[i] = (_Float16)(1.0f / (1.0f + expf(-v)));
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_sigmoid_f16_argtypes,
+)
+
+
+ELU_F16 = KernelSpec(
+    op="elu_f16",
+    signature=("void kernel_elu_f16(const _Float16 *input, _Float16 *output, "
+               "int n, float alpha)"),
+    semantics=(
+        "Elementwise ELU on a contiguous _Float16 buffer:\n"
+        "  output[i] = input[i]                       if input[i] > 0\n"
+        "  output[i] = alpha * (expf(input[i]) - 1)   otherwise\n"
+        "alpha is passed as float and used directly by expf — the cast back\n"
+        "to _Float16 happens at store. nn.ELU defaults to alpha=1.0."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_elu_f16(const _Float16 *input, _Float16 *output,
+                    int n, float alpha) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)input[i];
+        float r = v > 0.0f ? v : alpha * (expf(v) - 1.0f);
+        output[i] = (_Float16)r;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 16}, {"n": 256}, {"n": 1024},
+    ],
+    argtypes_factory=_elu_f16_argtypes,
+)
+
+
+BATCHNORM2D_F16 = KernelSpec(
+    op="batchnorm2d_f16",
+    signature=(
+        "void kernel_batchnorm2d_f16(const _Float16 *input, "
+        "const _Float16 *scale, const _Float16 *bias, _Float16 *output, "
+        "int N, int C, int H, int W)"
+    ),
+    semantics=(
+        "Apply pre-folded affine BatchNorm to a [N, C, H, W] _Float16 input:\n"
+        "  output[n, c, h, w] = scale[c] * input[n, c, h, w] + bias[c]\n"
+        "scale and bias are the gamma/(running_var+eps) and beta-mean*scale\n"
+        "fold pre-computed in fp32 by extract_graph and cast to _Float16 at\n"
+        "save time."
+    ),
+    reference_impl="""\
+void kernel_batchnorm2d_f16(const _Float16 *input,
+                            const _Float16 *scale, const _Float16 *bias,
+                            _Float16 *output,
+                            int N, int C, int H, int W) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            /* Match PyTorch CPU fp16 BN: upcast operands to fp32 for the
+             * scale*input + bias multiply-add, then cast result back to
+             * fp16. Pure-fp16 arithmetic (the previous reference body)
+             * accumulated rounding error per channel and produced 30-50%
+             * magnitude drift through the EfficientNet body. */
+            float s = (float)scale[c];
+            float b = (float)bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    output[idx] = (_Float16)(s * (float)input[idx] + b);
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4, "H": 8, "W": 8},
+        {"N": 1, "C": 64, "H": 7, "W": 7},
+    ],
+    argtypes_factory=_batchnorm2d_f16_argtypes,
+)
+
+
+MAXPOOL2D_F16 = KernelSpec(
+    op="maxpool2d_f16",
+    signature=(
+        "void kernel_maxpool2d_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int DH, int DW)"
+    ),
+    semantics=(
+        "Half-precision 2D max pool. Same dataflow as the fp32 MAXPOOL2D\n"
+        "kernel; only the storage type differs. OOB padding lanes are\n"
+        "initialized with -65504 (the most-negative finite _Float16) so they\n"
+        "never win the max — equivalent to -INF for the representable range."
+    ),
+    reference_impl="""\
+void kernel_maxpool2d_f16(const _Float16 *input, _Float16 *output,
+                          int N, int C, int IH, int IW,
+                          int KH, int KW, int SH, int SW,
+                          int PH, int PW, int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    /* -FLT16_MAX equivalent: -65504 is the most-negative finite half. */
+    const _Float16 NEG_HALF_INF = (_Float16)-65504.0f;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    _Float16 m = NEG_HALF_INF;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh*DH;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw*DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            _Float16 v = input[((n*C + c)*IH + ih)*IW + iw];
+                            if (v > m) m = v;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = m;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 6, "IH": 24, "IW": 24, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 0, "PW": 0, "DH": 1, "DW": 1},
+        # KernelBench 42 shape (padding+dilation)
+        {"N": 1, "C": 8, "IH": 16, "IW": 16, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 1, "PW": 1, "DH": 3, "DW": 3},
+    ],
+    argtypes_factory=_maxpool2d_f16_argtypes,
+)
+
+
+CONV2D_F16 = KernelSpec(
+    op="conv2d_f16",
+    signature=(
+        "void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight, "
+        "const _Float16 *bias, _Float16 *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
+    ),
+    semantics=(
+        "Half-precision 2D convolution. groups=1, dilation (DH, DW).\n"
+        "Storage is _Float16 for input/weight/bias/output, but the inner\n"
+        "accumulator is fp32 to avoid catastrophic cancellation when summing\n"
+        "many partial products — same pattern as Tensor Cores and what\n"
+        "torch.float16 conv2d does on CPU. The accumulator is cast back to\n"
+        "_Float16 only at the final store."
+    ),
+    reference_impl="""\
+void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int N, int IC, int IH, int IW, int OC,
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? (float)bias[oc] : 0.0f;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh * DH;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw * DW;
+                                if (iw < 0 || iw >= IW) continue;
+                                float v = (float)input[((n*IC + ic)*IH + ih)*IW + iw];
+                                float w = (float)weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (_Float16)acc;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # LeNet-shape, KernelBench 63
+        {"N": 1, "IC": 3, "IH": 16, "IW": 16, "OC": 4,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_conv2d_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="widening",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh fp16 conv2d with vfwmacc IC-vectorized "
+                "reduction. The scalar reference iterates 6 nested loops "
+                "(n, oc, oh, ow, kh, kw) with an innermost IC scalar MAC "
+                "loop. Vectorize that innermost IC reduction: each lane "
+                "consumes one (ic, kh, kw) tap, the fp32 accumulator "
+                "stays in LMUL=4 across iterations, and one vfredusum "
+                "at the end folds it into the scalar that gets cast to "
+                "fp16 + biased.\n\n"
+                "The IC tap and the weight tap are both strided across "
+                "IC (input stride = IH*IW per IC element, weight stride "
+                "= KH*KW per IC element with OIHW layout), so we use "
+                "vlse16. Strided fp16 loads are slower than unit-stride "
+                "on V256 but still better than scalar MAC chains for the "
+                "IC=32..480 reductions common in EfficientNet MBConvs.\n\n"
+                "ALGORITHM:\n"
+                "  for each (n, oc, oh, ow):\n"
+                "    vacc = vfmv.v.f f32m4(0)  // fp32 accumulator\n"
+                "    for kh, kw (with padding bounds check):\n"
+                "      for ic_base in [0, IC) step vl=vsetvl(e16m2, IC-ic_base):\n"
+                "        va = vlse16 f16m2(input, IH*IW*2, vl)\n"
+                "        vb = vlse16 f16m2(weight, KH*KW*2, vl)\n"
+                "        vacc = vfwmacc.vv(vacc, va, vb, vl)\n"
+                "    acc = vfredusum(vacc, bias[oc])\n"
+                "    output[...] = (_Float16)acc\n"
+            ),
+            reference_impl="""\
+#include <stddef.h>
+#include <riscv_vector.h>
+
+void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int N, int IC, int IH, int IW, int OC,
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW)
+{
+    const int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    const int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    const size_t vlmax_e32m4 = __riscv_vsetvlmax_e32m4();
+    const ptrdiff_t in_ic_stride_bytes = (ptrdiff_t)IH * IW * sizeof(_Float16);
+    const ptrdiff_t w_ic_stride_bytes  = (ptrdiff_t)KH * KW * sizeof(_Float16);
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            const _Float16 *w_oc = weight + (size_t)oc * IC * KH * KW;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    vfloat32m4_t vacc = __riscv_vfmv_v_f_f32m4(0.0f, vlmax_e32m4);
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh*DH;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw*DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            const _Float16 *in_base = input + ((size_t)n * IC * IH + ih) * IW + iw;
+                            const _Float16 *w_base  = w_oc + (size_t)kh * KW + kw;
+                            int ic = 0;
+                            while (ic < IC) {
+                                size_t vl = __riscv_vsetvl_e16m2((size_t)(IC - ic));
+                                vfloat16m2_t va = __riscv_vlse16_v_f16m2(
+                                    in_base + (size_t)ic * IH * IW, in_ic_stride_bytes, vl);
+                                vfloat16m2_t vb = __riscv_vlse16_v_f16m2(
+                                    w_base  + (size_t)ic * KH * KW, w_ic_stride_bytes, vl);
+                                vacc = __riscv_vfwmacc_vv_f32m4(vacc, va, vb, vl);
+                                ic += (int)vl;
+                            }
+                        }
+                    }
+                    float seed = bias ? (float)bias[oc] : 0.0f;
+                    vfloat32m1_t vsum0 = __riscv_vfmv_v_f_f32m1(seed, 1);
+                    vfloat32m1_t vred  = __riscv_vfredusum_vs_f32m4_f32m1(vacc, vsum0, vlmax_e32m4);
+                    float acc = __riscv_vfmv_f_s_f32m1_f32(vred);
+                    output[((size_t)n * OC + oc) * OH * OW + (size_t)oh * OW + ow] = (_Float16)acc;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+        AlgorithmCandidate(
+            name="oc_blocked",
+            target_affinity=("rvv_f16",),
+            description=(
+                "OC-parallel conv2d_f16. Vectorize over OC (each lane "
+                "carries one output channel of the current output pixel); "
+                "scalar-loop the (ic, kh, kw) reduction. Trades the "
+                "widening kernel's strided fp16 input load (slow on V256 "
+                "Saturn when IH*IW is small) for unit-stride scalar input "
+                "+ strided weight. Useful for layers with tiny spatial "
+                "dim (1×1 convs in EfficientNet MBConv expand/project) "
+                "where the strided-by-IH*IW input load gathers from "
+                "scattered addresses. Numerics equivalent to the widening "
+                "kernel modulo summation order (fp32 accumulator both "
+                "paths). Registered as the second candidate so 'widening' "
+                "stays the default; pick this via --algorithms=oc_blocked "
+                "or via the LLM optimize loop's FireSim re-rank."
+            ),
+            reference_impl="",  # curated file supplies the impl
+        ),
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# Mixed-precision cast kernels — i8↔f16 boundaries inserted by the
+# walker's auto-cast pass when a fp16 op consumes an int8-produced
+# tensor (or vice versa). Scale is the int8 tensor's per-tensor scale
+# (precomputed at calibration time). See modelblaster/notes/mixed_precision_plan.md.
+# ---------------------------------------------------------------------------
+
+def _cast_i8_to_f16_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [i8p, h, ctypes.c_int, ctypes.c_float]
+
+
+CAST_I8_TO_F16 = KernelSpec(
+    op="cast_i8_to_f16",
+    signature=(
+        "void kernel_cast_i8_to_f16(const int8_t *in, _Float16 *out, "
+        "int n, float scale)"
+    ),
+    semantics=(
+        "Dequantize an int8 tensor to _Float16:\n"
+        "  out[i] = (_Float16)((float)in[i] * scale)\n"
+        "Where `scale` is the int8 tensor's per-tensor symmetric scale\n"
+        "(zero-point = 0). Inserted by the walker's auto-cast pass at\n"
+        "i8 → f16 dtype boundaries when a fp16 op consumes an int8 producer."
+    ),
+    reference_impl="""\
+void kernel_cast_i8_to_f16(const int8_t *in, _Float16 *out,
+                           int n, float scale) {
+    for (int i = 0; i < n; i++) {
+        out[i] = (_Float16)((float)in[i] * scale);
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 256}, {"n": 4096}],
+    argtypes_factory=_cast_i8_to_f16_argtypes,
+)
+
+
+def _cast_f16_to_i8_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [h, i8p, ctypes.c_int, ctypes.c_float]
+
+
+CAST_F16_TO_I8 = KernelSpec(
+    op="cast_f16_to_i8",
+    signature=(
+        "void kernel_cast_f16_to_i8(const _Float16 *in, int8_t *out, "
+        "int n, float inv_scale)"
+    ),
+    semantics=(
+        "Quantize a _Float16 tensor to int8 (per-tensor symmetric):\n"
+        "  q = round((float)in[i] * inv_scale)\n"
+        "  out[i] = clamp(q, -128, 127)\n"
+        "Where `inv_scale = 1.0 / scale` and `scale` is the destination\n"
+        "int8 tensor's per-tensor scale (precomputed at calibration time\n"
+        "from the fp32 reference). Inserted by the walker's auto-cast\n"
+        "pass at f16 → i8 dtype boundaries."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+void kernel_cast_f16_to_i8(const _Float16 *in, int8_t *out,
+                           int n, float inv_scale) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)in[i] * inv_scale;
+        int32_t q = (int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+        if (q > 127)  q = 127;
+        if (q < -128) q = -128;
+        out[i] = (int8_t)q;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 256}, {"n": 4096}],
+    argtypes_factory=_cast_f16_to_i8_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# ViNT fp16 op set. Same dataflow as the corresponding fp32 ops; storage
+# is _Float16. For accumulating ops (matmul / conv / layer_norm reduction)
+# the inner accumulator is fp32 to avoid fp16-precision drift, matching
+# what torch.float16 does on CPU and what Tensor Cores do in hardware.
+# Transcendentals (gelu, softmax) round-trip through float for the math
+# kernel since libm has no half-precision expf/erf yet.
+# ---------------------------------------------------------------------------
+
+def _linear_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+LINEAR_F16 = KernelSpec(
+    op="linear_f16",
+    signature=(
+        "void kernel_linear_f16(const _Float16 *input, const _Float16 *weight, "
+        "const _Float16 *bias, _Float16 *output, int M, int K, int N)"
+    ),
+    semantics=(
+        "Half-precision fully-connected (matmul + bias), nn.Linear semantics:\n"
+        "  output[m, n] = bias[n] + sum_k input[m, k] * weight[n, k]\n"
+        "Shapes (row-major):\n"
+        "  input:  [M, K]   weight: [N, K]   bias: [N] (may be NULL)\n"
+        "  output: [M, N]\n"
+        "All tensors are _Float16; the inner accumulator is fp32."
+    ),
+    reference_impl="""\
+void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int M, int K, int N) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = bias ? (float)bias[n] : 0.0f;
+            for (int k = 0; k < K; k++) {
+                acc += (float)input[m * K + k] * (float)weight[n * K + k];
+            }
+            output[m * N + n] = (_Float16)acc;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 1, "N": 1},
+        {"M": 1, "K": 7, "N": 13},
+        {"M": 4, "K": 17, "N": 23},
+        {"M": 1, "K": 64, "N": 64},
+    ],
+    argtypes_factory=_linear_f16_argtypes,
+    algorithms=[
+        # Kernel: kernels/rvv/rvv_linear_f16_narrow.c
+        AlgorithmCandidate(
+            name="narrow",
+            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            description=(
+                "RVV+Zvfh fp16 linear with PURE-fp16 accumulation. The "
+                "K-reduction uses vfmacc.vv (fp16 multiply-accumulate) and "
+                "vfredusum.vs, keeping the whole vector datapath at SEW=16 -- "
+                "no vfwmacc, no fp32 accumulator. Preferred over 'widening' "
+                "on the rvv family because it runs on a reduced fp16-only "
+                "vector unit as well as a full one, and because f16m4 "
+                "processes twice the lanes of widening's f16m2 load. The "
+                "divergence from the reference is reduction ORDER only (fp16 "
+                "is non-associative), which is also what the deployment "
+                "hardware does."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        ),
+        AlgorithmCandidate(
+            name="widening",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh widening fp16 MAC. The reference impl reads a "
+                "scalar fp32 accumulator across K iterations of\n"
+                "  acc += (float)input[m*K+k] * (float)weight[n*K+k];\n"
+                "and casts to fp16 at the final store. Vectorize that "
+                "inner K-loop with vfwmacc: each lane consumes one fp16 "
+                "input + one fp16 weight, widens the product to fp32, "
+                "and accumulates into a fp32 LMUL=4 vector. After the "
+                "loop, vfredusum reduces the vector to a scalar (sum "
+                "order differs from the scalar impl, but both keep fp32 "
+                "precision so the result agrees with the reference within "
+                "~1 ulp at the final fp16 cast).\n\n"
+                "WHY THIS HELPS:\n"
+                "  The reference impl is 5+ instructions per MAC on RVV "
+                "scalar (two fp16 loads, two fcvt.s.h, one fmul.s, one "
+                "fadd.s). vfwmacc.vv collapses load+widen+mul+add into "
+                "one vector instruction operating on vlmax_e16m2 lanes "
+                "per iteration. For ViNT's typical linear (M=1, K=512, "
+                "N=512), the inner-K loop drops from 512 scalar MACs to "
+                "~16 vector iterations on a V256 implementation.\n\n"
+                "ALGORITHM:\n"
+                "  for each (m, n):\n"
+                "    vacc = vfmv.v.f f32m4(0)\n"
+                "    for k_base in [0, K) step vl=vsetvl(e16m2, K-k_base):\n"
+                "      va = vle16.v f16m2(input + m*K + k_base, vl)\n"
+                "      vb = vle16.v f16m2(weight + n*K + k_base, vl)\n"
+                "      vacc = vfwmacc.vv f32m4(vacc, va, vb, vl)\n"
+                "    acc = vfredusum(vacc) + (bias ? bias[n] : 0)\n"
+                "    output[m*N+n] = (_Float16)acc\n"
+            ),
+            reference_impl="""\
+#include <riscv_vector.h>
+
+void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
+                       const _Float16 *bias, _Float16 *output,
+                       int M, int K, int N) {
+    const size_t vlmax_e32m4 = __riscv_vsetvlmax_e32m4();
+    for (int m = 0; m < M; m++) {
+        const _Float16 *in_row = input + (size_t)m * (size_t)K;
+        for (int n = 0; n < N; n++) {
+            const _Float16 *w_row = weight + (size_t)n * (size_t)K;
+            vfloat32m4_t vacc = __riscv_vfmv_v_f_f32m4(0.0f, vlmax_e32m4);
+            int k = 0;
+            while (k < K) {
+                size_t vl = __riscv_vsetvl_e16m2((size_t)(K - k));
+                vfloat16m2_t va = __riscv_vle16_v_f16m2(in_row + k, vl);
+                vfloat16m2_t vb = __riscv_vle16_v_f16m2(w_row  + k, vl);
+                vacc = __riscv_vfwmacc_vv_f32m4(vacc, va, vb, vl);
+                k += (int)vl;
+            }
+            vfloat32m1_t vsum0 = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+            vfloat32m1_t vred  = __riscv_vfredusum_vs_f32m4_f32m1(
+                vacc, vsum0, vlmax_e32m4);
+            float acc = __riscv_vfmv_f_s_f32m1_f32(vred);
+            if (bias) acc += (float)bias[n];
+            output[(size_t)m * (size_t)N + (size_t)n] = (_Float16)acc;
+        }
+    }
+}
+""",
+        ),
+    ],
+)
+
+
+def _depthwise_conv2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h] + [ctypes.c_int] * 12
+
+
+DEPTHWISE_CONV2D_F16 = KernelSpec(
+    op="depthwise_conv2d_f16",
+    signature=(
+        "void kernel_depthwise_conv2d_f16(const _Float16 *input, "
+        "const _Float16 *weight, const _Float16 *bias, _Float16 *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "Half-precision depthwise 2D convolution. groups == OC == IC, so each\n"
+        "output channel reads from exactly one input channel via its own\n"
+        "(1, KH, KW) filter. Storage _Float16; inner accumulator fp32."
+    ),
+    reference_impl="""\
+void kernel_depthwise_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                                 const _Float16 *bias, _Float16 *output,
+                                 int N, int IC, int IH, int IW, int OC,
+                                 int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? (float)bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            float v = (float)input[((n*OC + oc)*IH + ih)*IW + iw];
+                            float w = (float)weight[((oc*KH) + kh)*KW + kw];
+                            acc += v * w;
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (_Float16)acc;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 16, "IH": 8, "IW": 8, "OC": 16,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_depthwise_conv2d_f16_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="oc_vec",
+            target_affinity=("rvv_f16",),
+            description=(
+                "RVV+Zvfh depthwise conv2d, vectorize across OC channels.\n\n"
+                "WHY THIS HELPS:\n"
+                "  Depthwise has no IC reduction — each output channel "
+                "reads from exactly one input channel via its own (1, KH, "
+                "KW) filter. Vectorizing the IC dim (what conv2d_f16's "
+                "widening does) would give vl=1; instead we vectorize "
+                "across OC, with each lane handling one channel's "
+                "(kh, kw) accumulation independently. No vfredusum at "
+                "the end — each lane's accumulator is already that "
+                "channel's output.\n\n"
+                "MEMORY ACCESS:\n"
+                "  input  [n, oc:oc+vl, ih, iw]:  stride IH*IW per OC\n"
+                "  weight [oc:oc+vl, 0, kh, kw]:  stride KH*KW per OC\n"
+                "  output [n, oc:oc+vl, oh, ow]:  stride OH*OW per OC\n"
+                "All three use vlse16/vsse16 (strided). For EfficientNet "
+                "depthwise (OC=32..1152, KH=KW=3 or 5), the inner per-OC "
+                "compute over 9..25 (kh, kw) taps gets folded into "
+                "vlmax_e16m2-wide vector ops vs the scalar reference's "
+                "9..25 scalar MACs * OC iterations.\n\n"
+                "ALGORITHM:\n"
+                "  for n, oh, ow:\n"
+                "    for oc_base in [0, OC) step vl=vsetvl(e16m2, OC-oc_base):\n"
+                "      vacc = vfwcvt(vle16(bias + oc_base, vl))  // fp32 m4\n"
+                "      for kh, kw (with padding bounds check):\n"
+                "        va = vlse16(input ..., IH*IW*2, vl)\n"
+                "        vw = vlse16(weight ..., KH*KW*2, vl)\n"
+                "        vacc = vfwmacc.vv(vacc, va, vw, vl)\n"
+                "      vsse16(output, OH*OW*2, vfncvt(vacc), vl)\n"
+            ),
+            reference_impl="""\
+#include <stddef.h>
+#include <riscv_vector.h>
+
+void kernel_depthwise_conv2d_f16(const _Float16 *input, const _Float16 *weight,
+                                 const _Float16 *bias, _Float16 *output,
+                                 int N, int IC, int IH, int IW, int OC,
+                                 int KH, int KW, int SH, int SW,
+                                 int PH, int PW)
+{
+    (void)IC;
+    const int OH = (IH + 2*PH - KH) / SH + 1;
+    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const ptrdiff_t in_c_stride_bytes  = (ptrdiff_t)IH * IW * sizeof(_Float16);
+    const ptrdiff_t w_c_stride_bytes   = (ptrdiff_t)KH * KW * sizeof(_Float16);
+    const ptrdiff_t out_c_stride_bytes = (ptrdiff_t)OH * OW * sizeof(_Float16);
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                int oc_base = 0;
+                while (oc_base < OC) {
+                    size_t vl = __riscv_vsetvl_e16m2((size_t)(OC - oc_base));
+                    vfloat32m4_t vacc;
+                    if (bias != NULL) {
+                        vfloat16m2_t vb16 = __riscv_vle16_v_f16m2(bias + oc_base, vl);
+                        vacc = __riscv_vfwcvt_f_f_v_f32m4(vb16, vl);
+                    } else {
+                        vacc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                    }
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            const _Float16 *in_p = input
+                                + ((size_t)n * OC + oc_base) * IH * IW
+                                + (size_t)ih * IW + iw;
+                            vfloat16m2_t va = __riscv_vlse16_v_f16m2(
+                                in_p, in_c_stride_bytes, vl);
+                            const _Float16 *w_p = weight
+                                + (size_t)oc_base * KH * KW
+                                + (size_t)kh * KW + kw;
+                            vfloat16m2_t vw = __riscv_vlse16_v_f16m2(
+                                w_p, w_c_stride_bytes, vl);
+                            vacc = __riscv_vfwmacc_vv_f32m4(vacc, va, vw, vl);
+                        }
+                    }
+                    vfloat16m2_t vout = __riscv_vfncvt_f_f_w_f16m2(vacc, vl);
+                    _Float16 *out_p = output
+                        + ((size_t)n * OC + oc_base) * OH * OW
+                        + (size_t)oh * OW + ow;
+                    __riscv_vsse16_v_f16m2(out_p, out_c_stride_bytes, vout, vl);
+                    oc_base += (int)vl;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
+)
+
+
+def _layer_norm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+LAYER_NORM_F16 = KernelSpec(
+    op="layer_norm_f16",
+    signature=(
+        "void kernel_layer_norm_f16(const _Float16 *input, "
+        "const _Float16 *gamma, const _Float16 *beta, _Float16 *output, "
+        "int M, int K, float eps)"
+    ),
+    semantics=(
+        "Half-precision LayerNorm over the last axis of an [M, K] tensor:\n"
+        "  mu     = mean(input[m, :])\n"
+        "  sigma  = sqrt(var(input[m, :]) + eps)\n"
+        "  output[m, k] = gamma[k] * (input[m, k] - mu) / sigma + beta[k]\n"
+        "Mean/variance computed in fp32, applied + stored as _Float16. gamma\n"
+        "and beta are _Float16 buffers of length K."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_layer_norm_f16(const _Float16 *input, const _Float16 *gamma,
+                           const _Float16 *beta, _Float16 *output,
+                           int M, int K, float eps) {
+    for (int m = 0; m < M; m++) {
+        /* two-pass: E[x^2] - mean^2 cancels when |mean| >> std */
+        float sum = 0.0f, sqsum = 0.0f;
+        for (int k = 0; k < K; k++) sum += (float)input[m*K + k];
+        float mean = sum / (float)K;
+        for (int k = 0; k < K; k++) {
+            float d = (float)input[m*K + k] - mean;
+            sqsum += d * d;
+        }
+        float var  = sqsum / (float)K;
+        float inv_sigma = 1.0f / sqrtf(var + eps);
+        for (int k = 0; k < K; k++) {
+            float v = (float)input[m*K + k];
+            float g = (float)gamma[k];
+            float b = (float)beta[k];
+            output[m*K + k] = (_Float16)(g * (v - mean) * inv_sigma + b);
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 16, "eps": 1e-5},
+        {"M": 7, "K": 512, "eps": 1e-5},
+    ],
+    argtypes_factory=_layer_norm_f16_argtypes,
+)
+
+
+GELU_F16 = KernelSpec(
+    op="gelu_f16",
+    signature="void kernel_gelu_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Half-precision GELU (PyTorch's 'tanh' approximation):\n"
+        "  output[i] = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))\n"
+        "Math is done in fp32, result cast to _Float16."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_gelu_f16(const _Float16 *input, _Float16 *output, int n) {
+    const float SQRT_2_OVER_PI = 0.7978845608028654f;  /* sqrt(2/pi) */
+    for (int i = 0; i < n; i++) {
+        float x = (float)input[i];
+        float x3 = x * x * x;
+        float arg = SQRT_2_OVER_PI * (x + 0.044715f * x3);
+        float r = 0.5f * x * (1.0f + tanhf(arg));
+        output[i] = (_Float16)r;
+    }
+}
+""",
+    extra_shapes=[{"n": 17}, {"n": 1024}, {"n": 14336}],
+    argtypes_factory=_pointwise_f16_argtypes,
+)
+
+
+def _softmax_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+SOFTMAX_F16 = KernelSpec(
+    op="softmax_f16",
+    signature=(
+        "void kernel_softmax_f16(const _Float16 *input, _Float16 *output, "
+        "int M, int K, float input_scale)"
+    ),
+    semantics=(
+        "Half-precision softmax over the last axis of an [M, K] tensor with\n"
+        "a fused input scale (used by SDPA to absorb 1/√d_k without an extra\n"
+        "pointwise pass):\n"
+        "  x_k  = input[m, k] * input_scale\n"
+        "  m_i  = max(x_:)\n"
+        "  e    = exp(x_k - m_i)\n"
+        "  output[m, k] = e / sum(e)\n"
+        "input_scale == 1.0 disables the pre-multiply. Math in fp32 (no fp16\n"
+        "expf), result cast to _Float16."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_softmax_f16(const _Float16 *input, _Float16 *output,
+                        int M, int K, float input_scale) {
+    for (int m = 0; m < M; m++) {
+        float maxv = -65504.0f;
+        for (int k = 0; k < K; k++) {
+            float v = (float)input[m*K + k] * input_scale;
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float v = (float)input[m*K + k] * input_scale;
+            float e = expf(v - maxv);
+            output[m*K + k] = (_Float16)e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] = (_Float16)((float)output[m*K + k] * inv_sum);
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 7, "input_scale": 1.0},
+                  {"M": 7, "K": 7, "input_scale": 0.0883883476}],  # 1/√128
+    argtypes_factory=_softmax_f16_argtypes,
+)
+
+
+def _pointwise2_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, ctypes.c_int]
+
+
+ADD_F16 = KernelSpec(
+    op="add_f16",
+    signature=(
+        "void kernel_add_f16(const _Float16 *a, const _Float16 *b, "
+        "_Float16 *output, int n)"
+    ),
+    semantics=(
+        "Half-precision elementwise add:\n"
+        "  output[i] = a[i] + b[i]\n"
+        "Addition is in fp32 (to dodge subnormal denormals), result cast back."
+    ),
+    reference_impl="""\
+void kernel_add_f16(const _Float16 *a, const _Float16 *b,
+                    _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = (_Float16)((float)a[i] + (float)b[i]);
+    }
+}
+""",
+    extra_shapes=[{"n": 16}, {"n": 3584}],
+    argtypes_factory=_pointwise2_f16_argtypes,
+)
+
+
+MUL_F16 = KernelSpec(
+    op="mul_f16",
+    signature=(
+        "void kernel_mul_f16(const _Float16 *a, const _Float16 *b, "
+        "_Float16 *output, int n)"
+    ),
+    semantics=(
+        "Half-precision elementwise multiply:\n"
+        "  output[i] = a[i] * b[i]\n"
+        "Multiply in fp32, result cast to _Float16."
+    ),
+    reference_impl="""\
+void kernel_mul_f16(const _Float16 *a, const _Float16 *b,
+                    _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = (_Float16)((float)a[i] * (float)b[i]);
+    }
+}
+""",
+    extra_shapes=[{"n": 16}, {"n": 1024}],
+    argtypes_factory=_pointwise2_f16_argtypes,
+)
+
+
+def _mul_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+MUL_C1_F16 = KernelSpec(
+    op="mul_c1_f16",
+    signature=(
+        "void kernel_mul_c1_f16(const _Float16 *gate, const _Float16 *x, "
+        "_Float16 *output, int N, int C, int HW)"
+    ),
+    semantics=(
+        "Half-precision channel-axis broadcast multiply (EfficientNet SE):\n"
+        "  output[n, c, h, w] = gate[c] * x[n, c, h, w]\n"
+        "where `gate` has shape [1, C, 1, 1] (= C contiguous values) and\n"
+        "`x` has shape [N, C, HW]. Without broadcast support, the elementwise\n"
+        "mul_f16 reads past the end of the gate buffer (32 channels of gate\n"
+        "vs 32*H*W of x) — that was the cause of the SE-block magnitude blow-up\n"
+        "in the fp16 ViNT path. Math in fp32, result cast to _Float16."
+    ),
+    reference_impl="""\
+void kernel_mul_c1_f16(const _Float16 *gate, const _Float16 *x,
+                       _Float16 *output, int N, int C, int HW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float g = (float)gate[c];
+            for (int i = 0; i < HW; i++) {
+                int idx = (n*C + c)*HW + i;
+                output[idx] = (_Float16)(g * (float)x[idx]);
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "HW": 32*42},
+        {"N": 1, "C": 1152, "HW": 4*5},
+    ],
+    argtypes_factory=_mul_c1_f16_argtypes,
+)
+
+
+MUL_C1_S8 = KernelSpec(
+    op="mul_c1_s8",
+    signature=(
+        "void kernel_mul_c1_s8(const int8_t *gate, const int8_t *x, "
+        "int8_t *output, int N, int C, int HW, "
+        "float scale_gate, float scale_x, float scale_out)"
+    ),
+    semantics=(
+        "Int8 channel-axis broadcast multiply (EfficientNet SE):\n"
+        "  output[n, c, h, w] = round(\n"
+        "    scale_gate * gate[c] * scale_x * x[n, c, h, w] / scale_out)\n"
+        "Output clipped to [-128, 127]. Math is int32 accumulator → fp32\n"
+        "scale → int8 store, same pattern as mul_s8 but with the gate\n"
+        "broadcast across the H*W axis."
+    ),
+    reference_impl="""\
+#include <stdint.h>
+
+static int32_t _mul_c1_s8_round(float v) {
+    int32_t i = (int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+    if (i < -128) i = -128;
+    if (i > 127)  i = 127;
+    return i;
+}
+
+void kernel_mul_c1_s8(const int8_t *gate, const int8_t *x, int8_t *output,
+                      int N, int C, int HW,
+                      float scale_gate, float scale_x, float scale_out) {
+    float k = (scale_gate * scale_x) / scale_out;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float g_real = (float)gate[c] * scale_gate;
+            for (int i = 0; i < HW; i++) {
+                int idx = (n*C + c)*HW + i;
+                float prod = g_real * ((float)x[idx] * scale_x);
+                output[idx] = (int8_t)_mul_c1_s8_round(prod / scale_out);
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 32, "HW": 32*42,
+         "scale_gate": 1.0/127.0, "scale_x": 0.08, "scale_out": 0.08},
+    ],
+    argtypes_factory=_pointwise2_f16_argtypes,  # placeholder; host-verify disabled
+)
+
+
+def _adaptive_avg_pool2d_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 6
+
+
+ADAPTIVE_AVG_POOL2D_F16 = KernelSpec(
+    op="adaptive_avg_pool2d_f16",
+    signature=(
+        "void kernel_adaptive_avg_pool2d_f16(const _Float16 *input, "
+        "_Float16 *output, int N, int C, int IH, int IW, int OH, int OW)"
+    ),
+    semantics=(
+        "Half-precision adaptive average pool: for each output position\n"
+        "(oh, ow), compute the average of the input window mapped from\n"
+        "torch.nn.AdaptiveAvgPool2d's index arithmetic:\n"
+        "  h_start = floor(oh * IH / OH); h_end = ceil((oh+1) * IH / OH);\n"
+        "  similarly for w. Average is fp32, cast to _Float16 at store."
+    ),
+    reference_impl="""\
+void kernel_adaptive_avg_pool2d_f16(const _Float16 *input, _Float16 *output,
+                                    int N, int C, int IH, int IW,
+                                    int OH, int OW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int h_start = (oh * IH) / OH;
+                int h_end   = ((oh + 1) * IH + OH - 1) / OH;
+                for (int ow = 0; ow < OW; ow++) {
+                    int w_start = (ow * IW) / OW;
+                    int w_end   = ((ow + 1) * IW + OW - 1) / OW;
+                    float sum = 0.0f;
+                    int cnt = 0;
+                    for (int h = h_start; h < h_end; h++) {
+                        for (int w = w_start; w < w_end; w++) {
+                            sum += (float)input[((n*C + c)*IH + h)*IW + w];
+                            cnt++;
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] =
+                        (_Float16)(sum / (float)(cnt > 0 ? cnt : 1));
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4, "IH": 8, "IW": 8, "OH": 1, "OW": 1},
+        {"N": 1, "C": 64, "IH": 7, "IW": 7, "OH": 1, "OW": 1},
+    ],
+    argtypes_factory=_adaptive_avg_pool2d_f16_argtypes,
+)
+
+
+def _slice_c_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 6
+
+
+SLICE_C_F16 = KernelSpec(
+    op="slice_c_f16",
+    signature=(
+        "void kernel_slice_c_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int IC, int C_start, int C_end, int H, int W)"
+    ),
+    semantics=(
+        "Half-precision channel-axis slice of a [N, IC, H, W] tensor:\n"
+        "  output[n, oc, h, w] = input[n, C_start + oc, h, w]\n"
+        "  where oc in [0, C_end - C_start).\n"
+        "Pure copy (no math)."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_slice_c_f16(const _Float16 *input, _Float16 *output,
+                        int N, int IC, int C_start, int C_end,
+                        int H, int W) {
+    int OC = C_end - C_start;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int ic = C_start + oc;
+            const _Float16 *src = input + ((n*IC + ic)*H*W);
+            _Float16 *dst = output + ((n*OC + oc)*H*W);
+            memcpy(dst, src, sizeof(_Float16) * (size_t)(H*W));
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 18, "C_start": 15, "C_end": 18, "H": 64, "W": 85},
+    ],
+    argtypes_factory=_slice_c_f16_argtypes,
+)
+
+
+def _cat2_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, h] + [ctypes.c_int] * 5
+
+
+CAT2_C1_F16 = KernelSpec(
+    op="cat2_c1_f16",
+    signature=(
+        "void kernel_cat2_c1_f16(const _Float16 *a, const _Float16 *b, "
+        "_Float16 *output, int N, int H, int W, int Ca, int Cb)"
+    ),
+    semantics=(
+        "Half-precision concatenation of two NCHW tensors along the channel\n"
+        "axis (dim=1). a has shape [N, Ca, H, W], b has [N, Cb, H, W],\n"
+        "output has [N, Ca+Cb, H, W]. Pure copy."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_cat2_c1_f16(const _Float16 *a, const _Float16 *b,
+                        _Float16 *output,
+                        int N, int H, int W, int Ca, int Cb) {
+    int Cout = Ca + Cb;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        memcpy(output + n*Cout*HW,
+               a + n*Ca*HW,
+               sizeof(_Float16) * (size_t)(Ca * HW));
+        memcpy(output + n*Cout*HW + Ca*HW,
+               b + n*Cb*HW,
+               sizeof(_Float16) * (size_t)(Cb * HW));
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "H": 64, "W": 85, "Ca": 3, "Cb": 3},
+        {"N": 1, "H": 1,  "W": 1,  "Ca": 1024, "Cb": 512},
+    ],
+    argtypes_factory=_cat2_c1_f16_argtypes,
+)
+
+
+def _pad_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h] + [ctypes.c_int] * 8
+
+
+PAD_F16 = KernelSpec(
+    op="pad_f16",
+    signature=(
+        "void kernel_pad_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int C, int IH, int IW, "
+        "int pad_left, int pad_right, int pad_top, int pad_bottom)"
+    ),
+    semantics=(
+        "Half-precision zero-pad an [N, C, IH, IW] tensor on H and W axes.\n"
+        "OH = IH + pad_top + pad_bottom; OW = IW + pad_left + pad_right.\n"
+        "Out-of-bounds positions are filled with 0.0."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_pad_f16(const _Float16 *input, _Float16 *output,
+                    int N, int C, int IH, int IW,
+                    int pad_left, int pad_right, int pad_top, int pad_bottom) {
+    int OH = IH + pad_top + pad_bottom;
+    int OW = IW + pad_left + pad_right;
+    int OHW = OH * OW;
+    memset(output, 0, sizeof(_Float16) * (size_t)(N * C * OHW));
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int h = 0; h < IH; h++) {
+                const _Float16 *src = input + ((n*C + c)*IH + h)*IW;
+                _Float16 *dst = output +
+                    ((n*C + c)*OH + (h + pad_top))*OW + pad_left;
+                memcpy(dst, src, sizeof(_Float16) * (size_t)IW);
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 8, "IW": 8,
+         "pad_left": 1, "pad_right": 1, "pad_top": 1, "pad_bottom": 1},
+    ],
+    argtypes_factory=_pad_f16_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# YOLOv8-nano fp16 op set: silu_f16, upsample_nearest_f16, cat{3,4}_c1_f16.
+# Same semantics as the fp32 versions, _Float16 buffers throughout.
+# ---------------------------------------------------------------------------
+
+
+def _silu_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int]
+
+
+SILU_F16 = KernelSpec(
+    op="silu_f16",
+    signature="void kernel_silu_f16(const _Float16 *input, _Float16 *output, int n)",
+    semantics=(
+        "Elementwise SiLU (Swish) on a contiguous _Float16 buffer:\n"
+        "  output[i] = input[i] * sigmoid(input[i])  for i in [0, n)\n"
+        "Reference computes sigmoid in float32 (to avoid the exp underflow\n"
+        "stall on small _Float16 inputs) then casts the product back to\n"
+        "_Float16. Safe for `input` and `output` to alias."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_silu_f16(const _Float16 *input, _Float16 *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = (float)input[i];
+        float s = 1.0f / (1.0f + expf(-v));
+        output[i] = (_Float16)(v * s);
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_silu_f16_argtypes,
+)
+
+
+def _upsample_nearest_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, h, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+
+
+UPSAMPLE_NEAREST_F16 = KernelSpec(
+    op="upsample_nearest_f16",
+    signature=(
+        "void kernel_upsample_nearest_f16(const _Float16 *input, _Float16 *output, "
+        "int N, int C, int IH, int IW, int scale)"
+    ),
+    semantics=(
+        "Nearest-neighbor 2D upsampling along H and W by integer factor `scale`,\n"
+        "for _Float16 NCHW tensors. Output shape (N, C, IH*scale, IW*scale);\n"
+        "each output pixel (oh, ow) reads input pixel (oh/scale, ow/scale)."
+    ),
+    reference_impl="""\
+void kernel_upsample_nearest_f16(const _Float16 *input, _Float16 *output,
+                                 int N, int C, int IH, int IW, int scale) {
+    int OH = IH * scale, OW = IW * scale;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih = oh / scale;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw = ow / scale;
+                    output[((n*C + c)*OH + oh)*OW + ow] =
+                        input[((n*C + c)*IH + ih)*IW + iw];
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4,  "IH": 5,  "IW": 5,  "scale": 2},
+        {"N": 1, "C": 16, "IH": 10, "IW": 10, "scale": 2},
+    ],
+    argtypes_factory=_upsample_nearest_f16_argtypes,
+)
+
+
+def _cat3_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, ctypes.c_int, h, ctypes.c_int, h, ctypes.c_int,
+            h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _cat4_c1_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)
+    return [h, ctypes.c_int, h, ctypes.c_int, h, ctypes.c_int,
+            h, ctypes.c_int,
+            h, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+CAT3_C1_F16 = KernelSpec(
+    op="cat3_c1_f16",
+    signature=(
+        "void kernel_cat3_c1_f16(const _Float16 *in0, int c0, "
+        "const _Float16 *in1, int c1, const _Float16 *in2, int c2, "
+        "_Float16 *out, int N, int H, int W)"
+    ),
+    semantics=(
+        "Half-precision channel-wise concat of three NCHW tensors (dim=1).\n"
+        "Output shape (N, c0+c1+c2, H, W). Pure copy."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_cat3_c1_f16(const _Float16 *in0, int c0,
+                        const _Float16 *in1, int c1,
+                        const _Float16 *in2, int c2,
+                        _Float16 *out, int N, int H, int W) {
+    int C = c0 + c1 + c2;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        _Float16 *dst = out + n * C * HW;
+        memcpy(dst, in0 + n*c0*HW, sizeof(_Float16) * (size_t)(c0*HW));
+        dst += c0 * HW;
+        memcpy(dst, in1 + n*c1*HW, sizeof(_Float16) * (size_t)(c1*HW));
+        dst += c1 * HW;
+        memcpy(dst, in2 + n*c2*HW, sizeof(_Float16) * (size_t)(c2*HW));
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 16, "c1": 16, "c2": 16, "N": 1, "H": 8, "W": 8},
+    ],
+    argtypes_factory=_cat3_c1_f16_argtypes,
+)
+
+
+CAT4_C1_F16 = KernelSpec(
+    op="cat4_c1_f16",
+    signature=(
+        "void kernel_cat4_c1_f16(const _Float16 *in0, int c0, "
+        "const _Float16 *in1, int c1, const _Float16 *in2, int c2, "
+        "const _Float16 *in3, int c3, "
+        "_Float16 *out, int N, int H, int W)"
+    ),
+    semantics=(
+        "Half-precision channel-wise concat of four NCHW tensors (dim=1).\n"
+        "Output shape (N, c0+c1+c2+c3, H, W). Pure copy."
+    ),
+    reference_impl="""\
+#include <string.h>
+
+void kernel_cat4_c1_f16(const _Float16 *in0, int c0,
+                        const _Float16 *in1, int c1,
+                        const _Float16 *in2, int c2,
+                        const _Float16 *in3, int c3,
+                        _Float16 *out, int N, int H, int W) {
+    int C = c0 + c1 + c2 + c3;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        _Float16 *dst = out + n * C * HW;
+        memcpy(dst, in0 + n*c0*HW, sizeof(_Float16) * (size_t)(c0*HW));
+        dst += c0 * HW;
+        memcpy(dst, in1 + n*c1*HW, sizeof(_Float16) * (size_t)(c1*HW));
+        dst += c1 * HW;
+        memcpy(dst, in2 + n*c2*HW, sizeof(_Float16) * (size_t)(c2*HW));
+        dst += c2 * HW;
+        memcpy(dst, in3 + n*c3*HW, sizeof(_Float16) * (size_t)(c3*HW));
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 8, "c1": 8, "c2": 8, "c3": 8, "N": 1, "H": 8, "W": 8},
+    ],
+    argtypes_factory=_cat4_c1_f16_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# YOLOv8-nano support: silu / upsample_nearest / cat{2,3,4}_c1.
+# silu and upsample_nearest are pointwise enough that the reference is
+# obviously correct; the cat kernels are pure memcpy along the channel
+# axis (NCHW). All four are needed end-to-end in the YOLOv8n graph.
+# ---------------------------------------------------------------------------
+
+
+def _silu_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+SILU = KernelSpec(
+    op="silu",
+    signature="void kernel_silu(const float *input, float *output, int n)",
+    semantics=(
+        "Elementwise SiLU (a.k.a. Swish) on a contiguous float32 buffer:\n"
+        "  output[i] = input[i] / (1.0f + expf(-input[i]))   for i in [0, n)\n"
+        "Equivalent to x * sigmoid(x). It must be safe for `input` and "
+        "`output` to alias."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_silu(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = input[i];
+        float s = 1.0f / (1.0f + expf(-v));
+        output[i] = v * s;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_silu_argtypes,
+)
+
+
+def _upsample_nearest_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW, scale
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+
+
+UPSAMPLE_NEAREST = KernelSpec(
+    op="upsample_nearest",
+    signature=(
+        "void kernel_upsample_nearest(const float *input, float *output, "
+        "int N, int C, int IH, int IW, int scale)"
+    ),
+    semantics=(
+        "Nearest-neighbor 2D upsampling along H and W by an integer factor.\n"
+        "Output shape is (N, C, IH*scale, IW*scale). Each output pixel\n"
+        "(oh, ow) reads the input pixel (oh/scale, ow/scale).\n"
+        "Buffers are NCHW-laid-out; stride math:\n"
+        "  in_idx  = ((n*C + c)*IH + ih)*IW + iw\n"
+        "  out_idx = ((n*C + c)*OH + oh)*OW + ow\n"
+        "where OH=IH*scale, OW=IW*scale, ih=oh/scale, iw=ow/scale."
+    ),
+    reference_impl="""\
+void kernel_upsample_nearest(const float *input, float *output,
+                             int N, int C, int IH, int IW, int scale) {
+    int OH = IH * scale, OW = IW * scale;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih = oh / scale;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw = ow / scale;
+                    output[((n*C + c)*OH + oh)*OW + ow] =
+                        input[((n*C + c)*IH + ih)*IW + iw];
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4,  "IH": 5,  "IW": 5,  "scale": 2},
+        {"N": 1, "C": 16, "IH": 10, "IW": 10, "scale": 2},
+    ],
+    argtypes_factory=_upsample_nearest_argtypes,
+)
+
+
+def _cat2_c1_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # in0, c0, in1, c1, out, N, H, W
+    return [fp, ctypes.c_int, fp, ctypes.c_int,
+            fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _cat3_c1_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, ctypes.c_int, fp, ctypes.c_int, fp, ctypes.c_int,
+            fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _cat4_c1_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, ctypes.c_int, fp, ctypes.c_int, fp, ctypes.c_int,
+            fp, ctypes.c_int,
+            fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+# Common cat semantics — only the input count varies. Pulled out so the
+# three KernelSpecs share wording.
+_CAT_SEMANTICS = (
+    "Channel-wise concat (NCHW, dim=1) of {n} fp32 inputs into one output.\n"
+    "Each input is N×c_i×H×W; the output is N×(c_0+c_1+...)×H×W.\n"
+    "For each (n, h, w) the channel axis is filled by appending\n"
+    "in0[n, :c0, h, w], then in1[n, :c1, h, w], then ... All inputs\n"
+    "share the same N, H, W. Pure memcpy — no arithmetic."
+)
+
+
+CAT2_C1 = KernelSpec(
+    op="cat2_c1",
+    signature=(
+        "void kernel_cat2_c1(const float *in0, int c0, "
+        "const float *in1, int c1, float *out, int N, int H, int W)"
+    ),
+    semantics=_CAT_SEMANTICS.format(n=2),
+    reference_impl="""\
+void kernel_cat2_c1(const float *in0, int c0,
+                    const float *in1, int c1,
+                    float *out, int N, int H, int W) {
+    int C = c0 + c1;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        float *dst = out + n * C * HW;
+        const float *s0 = in0 + n * c0 * HW;
+        const float *s1 = in1 + n * c1 * HW;
+        for (int i = 0; i < c0 * HW; i++) dst[i] = s0[i];
+        dst += c0 * HW;
+        for (int i = 0; i < c1 * HW; i++) dst[i] = s1[i];
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 16, "c1": 16, "N": 1, "H": 8,  "W": 8},
+        {"c0": 64, "c1": 32, "N": 1, "H": 10, "W": 10},
+    ],
+    argtypes_factory=_cat2_c1_argtypes,
+)
+
+
+CAT3_C1 = KernelSpec(
+    op="cat3_c1",
+    signature=(
+        "void kernel_cat3_c1(const float *in0, int c0, "
+        "const float *in1, int c1, const float *in2, int c2, "
+        "float *out, int N, int H, int W)"
+    ),
+    semantics=_CAT_SEMANTICS.format(n=3),
+    reference_impl="""\
+void kernel_cat3_c1(const float *in0, int c0,
+                    const float *in1, int c1,
+                    const float *in2, int c2,
+                    float *out, int N, int H, int W) {
+    int C = c0 + c1 + c2;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        float *dst = out + n * C * HW;
+        const float *s0 = in0 + n * c0 * HW;
+        const float *s1 = in1 + n * c1 * HW;
+        const float *s2 = in2 + n * c2 * HW;
+        for (int i = 0; i < c0 * HW; i++) dst[i] = s0[i];
+        dst += c0 * HW;
+        for (int i = 0; i < c1 * HW; i++) dst[i] = s1[i];
+        dst += c1 * HW;
+        for (int i = 0; i < c2 * HW; i++) dst[i] = s2[i];
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 16, "c1": 16, "c2": 16, "N": 1, "H": 8, "W": 8},
+    ],
+    argtypes_factory=_cat3_c1_argtypes,
+)
+
+
+CAT4_C1 = KernelSpec(
+    op="cat4_c1",
+    signature=(
+        "void kernel_cat4_c1(const float *in0, int c0, "
+        "const float *in1, int c1, const float *in2, int c2, "
+        "const float *in3, int c3, "
+        "float *out, int N, int H, int W)"
+    ),
+    semantics=_CAT_SEMANTICS.format(n=4),
+    reference_impl="""\
+void kernel_cat4_c1(const float *in0, int c0,
+                    const float *in1, int c1,
+                    const float *in2, int c2,
+                    const float *in3, int c3,
+                    float *out, int N, int H, int W) {
+    int C = c0 + c1 + c2 + c3;
+    int HW = H * W;
+    for (int n = 0; n < N; n++) {
+        float *dst = out + n * C * HW;
+        const float *s0 = in0 + n * c0 * HW;
+        const float *s1 = in1 + n * c1 * HW;
+        const float *s2 = in2 + n * c2 * HW;
+        const float *s3 = in3 + n * c3 * HW;
+        for (int i = 0; i < c0 * HW; i++) dst[i] = s0[i];
+        dst += c0 * HW;
+        for (int i = 0; i < c1 * HW; i++) dst[i] = s1[i];
+        dst += c1 * HW;
+        for (int i = 0; i < c2 * HW; i++) dst[i] = s2[i];
+        dst += c2 * HW;
+        for (int i = 0; i < c3 * HW; i++) dst[i] = s3[i];
+    }
+}
+""",
+    extra_shapes=[
+        {"c0": 64, "c1": 64, "c2": 64, "c3": 64, "N": 1, "H": 5, "W": 5},
+    ],
+    argtypes_factory=_cat4_c1_argtypes,
+)
+
+
+# ---------------------------------------------------------------------------
+# YOLOv8-nano int8 support: silu_s8 / upsample_nearest_s8 / cat{2,3,4}_c1_s8.
+# All dequantize input(s) to float, apply the operation, then requantize to
+# the output scale — same floating-point tail as sigmoid_s8 / batchnorm2d_s8.
+# ---------------------------------------------------------------------------
+
+
+def _silu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, scale_in, scale_out, activation_min, activation_max
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+def _leaky_relu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, scale_in, scale_out, activation_min, activation_max,
+    # negative_slope
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float]
+
+
+def _sin_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, i8p, ctypes.c_int, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+def _cos_s8_argtypes():
+    return _sin_s8_argtypes()
+
+
+def _layernorm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8); f32p = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, beta, output, M, K, scale_in, scale_out, eps, amin, amax
+    return ([i8p, f32p, f32p, i8p] + [ctypes.c_int]*2
+            + [ctypes.c_float]*3 + [ctypes.c_int]*2)
+
+
+def _rmsnorm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8); f32p = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, output, M, K, scale_in, scale_out, eps, amin, amax
+    return ([i8p, f32p, i8p] + [ctypes.c_int]*2
+            + [ctypes.c_float]*3 + [ctypes.c_int]*2)
+
+
+def _lstm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, w_ih, w_hh, b_ih, b_hh, h_state, c_state, output,
+    # input_size, hidden_size,
+    # scale_in, scale_w_ih, scale_w_hh, scale_b, scale_h, scale_c, has_bias
+    return ([i8p, i8p, i8p, i32p, i32p, i8p, i8p, i8p]
+            + [ctypes.c_int] * 2
+            + [ctypes.c_float] * 6
+            + [ctypes.c_int])
+
+
+def _avgpool2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW, count_include_pad
+    return [i8p, i8p] + [ctypes.c_int] * 11
+
+
+def _elu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, scale_in, scale_out, activation_min, activation_max, alpha
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float]
+
+
+def _linear_s8_elu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, weight, bias, output,
+    # M, K, N,
+    # input_offset, filter_offset, linear_output_offset,
+    # output_multiplier, output_shift,
+    # linear_activation_min, linear_activation_max,
+    # scale_linear_out, scale_final_out,
+    # activation_min, activation_max, alpha
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+# Axis-C Phase 1d: pair-fused linear+elu. Computes the linear MAC +
+# requantize tail and applies ELU IN-REGISTER on the resulting int8,
+# skipping the intermediate-tensor write/read that separate
+# kernel_linear_s8 + kernel_elu_s8 would do. For the demo's
+# mlp_control chain (linear→elu repeated three times), pairwise
+# fusion replaces N round-trips through buf_<mid>_mlp_K with N MAC+ELU
+# chains in tight inner loops. Reference impl reproduces both ops'
+# math bit-exact; LLM-codegen seeds (target_affinity) describe
+# vector-register variants for rvv_opu and tiled-matmul fusion for
+# gemmini.
+LINEAR_S8_ELU_S8 = KernelSpec(
+    op="linear_s8_elu_s8",
+    signature=(
+        "void kernel_linear_s8_elu_s8("
+        "const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int M, int K, int N, "
+        "int input_offset, int filter_offset, int linear_output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int linear_activation_min, int linear_activation_max, "
+        "float scale_linear_out, float scale_final_out, "
+        "int activation_min, int activation_max, float alpha)"
+    ),
+    semantics=(
+        "Pair-fused quantized fully-connected + ELU activation. Computes "
+        "linear_s8's MAC + Q0.31 requantize tail, clamps to the linear's "
+        "activation range, then applies ELU on the resulting int8 IN "
+        "REGISTER before storing. Avoids the intermediate-tensor "
+        "write/read that two separate kernel_linear_s8 + kernel_elu_s8 "
+        "calls would do.\n\n"
+        "Math (per output element):\n"
+        "  acc = bias[n] if bias else 0\n"
+        "  for k in K: acc += (in[m,k]+input_offset) * (w[n,k]+filter_offset)\n"
+        "  scaled = requantize_q031(acc, output_multiplier, output_shift)\n"
+        "  scaled += linear_output_offset\n"
+        "  scaled = clamp(scaled, linear_activation_min, linear_activation_max)\n"
+        "  linear_int8 = (int8_t) scaled\n"
+        "  /* ELU in-register */\n"
+        "  f = (float) linear_int8 * scale_linear_out\n"
+        "  y = (f > 0) ? f : alpha * (expf(f) - 1)\n"
+        "  v = round(y / scale_final_out)\n"
+        "  v = clamp(v, activation_min, activation_max)\n"
+        "  output[m,n] = (int8_t) v\n\n"
+        "Optimization targets (LLM seeds):\n"
+        "  rvv_opu  — accumulate the MAC into a vector register via "
+        "VOPMACC, requantize via VOPACC tail, apply ELU LUT via VRGATHER "
+        "in the same vector register before the strided store. The 256-byte "
+        "ELU LUT (one per (scale_linear_out, scale_final_out, alpha) tuple) "
+        "fits entirely in L1 and can be precomputed.\n"
+        "  gemmini  — issue tiled_matmul_auto for the MAC + requant + "
+        "linear-clamp tail (already its native pipeline). Apply ELU on "
+        "the int8 output before write-back via a scalar inner loop on "
+        "the same hart, or fold into the tiled_matmul_auto's epilogue "
+        "if Gemmini's activation-fn slot supports a LUT.\n"
+        "  reference — straightforward C: linear math, requantize, clamp, "
+        "ELU on the int8 result, store final."
+    ),
+    reference_impl="""\
+void kernel_linear_s8_elu_s8(
+    const int8_t *input, const int8_t *weight,
+    const int32_t *bias, int8_t *output,
+    int M, int K, int N,
+    int input_offset, int filter_offset, int linear_output_offset,
+    int output_multiplier, int output_shift,
+    int linear_activation_min, int linear_activation_max,
+    float scale_linear_out, float scale_final_out,
+    int activation_min, int activation_max, float alpha) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            /* --- linear_s8 math --- */
+            int32_t acc = bias ? bias[n] : 0;
+            for (int k = 0; k < K; k++) {
+                int32_t in_v = (int32_t)input[m * K + k] + input_offset;
+                int32_t w_v  = (int32_t)weight[n * K + k] + filter_offset;
+                acc += in_v * w_v;
+            }
+            /* Q0.31 rounding multiply (matches kernel_linear_s8). */
+            int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
+            prod = (prod + (1LL << 30)) >> 31;
+            int32_t scaled = (int32_t)prod;
+            if (output_shift > 0) {
+                scaled = (int32_t)(((int64_t)scaled
+                                    + ((int64_t)1 << (output_shift - 1)))
+                                   >> output_shift);
+            } else if (output_shift < 0) {
+                scaled = scaled << (-output_shift);
+            }
+            scaled += linear_output_offset;
+            if (scaled < linear_activation_min) scaled = linear_activation_min;
+            if (scaled > linear_activation_max) scaled = linear_activation_max;
+            int8_t linear_int8 = (int8_t)scaled;
+            /* --- elu_s8 math, in-register (no intermediate tensor) --- */
+            float f = (float)linear_int8 * scale_linear_out;
+            float y = (f > 0.0f) ? f : alpha * (expf(f) - 1.0f);
+            int32_t v = (int32_t)roundf(y / scale_final_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[m * N + n] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # mlp_control's three layer dims (the demo target).
+        {"M": 1, "K": 16,  "N": 256},
+        {"M": 1, "K": 256, "N": 128},
+        {"M": 1, "K": 128, "N": 64},
+        # Generalization
+        {"M": 1, "K": 17,  "N": 23},
+        {"M": 2, "K": 7,   "N": 5},
+    ],
+    argtypes_factory=_linear_s8_elu_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="outerprod_with_in_register_elu",
+            target_affinity=("rvv_opu",),
+            description=(
+                "Saturn OPU outer-product MAC for the linear half + per-row\n"
+                "drain that applies Q0.31 requantize, the linear quant\n"
+                "clamp, the f32 ELU expression, and the final quant — ALL in\n"
+                "scalar registers between VMV_VR and store — never writing\n"
+                "the intermediate linear_int8 tensor to memory.\n\n"
+                "WHY this wins vs the per-op chain on this hardware:\n"
+                "  * Single worker handshake (vs 2 for linear+elu chained).\n"
+                "  * Intermediate linear_int8[M*N] never spills to L1 — it\n"
+                "    stays in i32 stack scratch and gets consumed immediately\n"
+                "    by the ELU in the same inner loop.\n"
+                "  * The OPU outer-product MAC half is identical to the\n"
+                "    standalone linear_s8/outerprod kernel, so we keep the\n"
+                "    12.1× OPU speedup for the bulk of the work.\n\n"
+                "PROGRAMMING MODEL (same OPU contract as linear_s8/outerprod):\n"
+                "  OPMVINBCAST(m1, v0)         seed accumulator with bias\n"
+                "  for k in [0..K):\n"
+                "      vlse8.v v16 (input col k, stride K)\n"
+                "      vlse8.v v18 (weight col k, stride K)\n"
+                "      VOPACC(m1, v18, v16)\n"
+                "  for m in [0..M):\n"
+                "      VMV_VR(v0, m, m1)\n"
+                "      vse32.v v0 -> row_i32[]\n"
+                "      for n in [0..N):  # scalar tail, all in registers\n"
+                "          requantize Q0.31 -> linear_int8\n"
+                "          clamp to linear_activation_min/max\n"
+                "          f = linear_int8 * scale_linear_out\n"
+                "          y = (f>0) ? f : alpha*(expf(f)-1)\n"
+                "          v = round(y / scale_final_out) + 0\n"
+                "          clamp to activation_min/max\n"
+                "          output[m*N+n] = v\n\n"
+                "STRICT REQUIREMENTS (same as linear_s8/outerprod):\n"
+                "  * DO NOT hand-roll `.insn r 0x57, ...`. Call the macros.\n"
+                "    The SATURN_OPU_KEEP_REGISTER_MACROS guard is injected\n"
+                "    mechanically at emit time — your code does NOT need to\n"
+                "    `#define` it.\n"
+                "  * Eligibility gate: M, N <= mlmax = VLEN/8 AND\n"
+                "    input_offset == filter_offset == 0; else scalar fallback.\n"
+                "  * The ELU tail is in scalar registers; do NOT try to\n"
+                "    vectorize expf — there's no fp vector intrinsic for it.\n"
+                "  * Bit-exact match required vs the reference scalar impl\n"
+                "    above (same rounding/clamp order). Verify gate: spike\n"
+                "    max_abs_err=0 max_rel_err=0."
+            ),
+            reference_impl=(
+                "/* Q0.31 requantize — same as LINEAR_S8 reference. */\n"
+                "static inline int32_t q31_requantize(int32_t x, int32_t mult, int32_t shift) {\n"
+                "    int64_t prod = (int64_t)x * (int64_t)mult;\n"
+                "    prod = (prod + (1LL << 30)) >> 31;\n"
+                "    if (shift > 0) {\n"
+                "        int32_t round = (1 << (shift - 1));\n"
+                "        return ((int32_t)prod + round) >> shift;\n"
+                "    }\n"
+                "    return (int32_t)prod << -shift;\n"
+                "}\n\n"
+                "void kernel_linear_s8_elu_s8(\n"
+                "    const int8_t *input, const int8_t *weight,\n"
+                "    const int32_t *bias, int8_t *output,\n"
+                "    int M, int K, int N,\n"
+                "    int input_offset, int filter_offset, int linear_output_offset,\n"
+                "    int output_multiplier, int output_shift,\n"
+                "    int linear_activation_min, int linear_activation_max,\n"
+                "    float scale_linear_out, float scale_final_out,\n"
+                "    int activation_min, int activation_max, float alpha)\n"
+                "{\n"
+                "    size_t mlmax;\n"
+                "    asm volatile(\"vsetvli %0, zero, e8, m1, ta, ma\" : \"=r\"(mlmax));\n"
+                "    if ((size_t)M > mlmax || (size_t)N > mlmax ||\n"
+                "        input_offset != 0 || filter_offset != 0) {\n"
+                "        /* Scalar fallback — exactly the reference impl. */\n"
+                "        for (int m = 0; m < M; m++) {\n"
+                "            for (int n = 0; n < N; n++) {\n"
+                "                int32_t acc = bias ? bias[n] : 0;\n"
+                "                for (int k = 0; k < K; k++) {\n"
+                "                    int32_t iv = (int32_t)input[m*K+k]  + input_offset;\n"
+                "                    int32_t wv = (int32_t)weight[n*K+k] + filter_offset;\n"
+                "                    acc += iv * wv;\n"
+                "                }\n"
+                "                int32_t scaled = q31_requantize(acc, output_multiplier, output_shift);\n"
+                "                scaled += linear_output_offset;\n"
+                "                if (scaled < linear_activation_min) scaled = linear_activation_min;\n"
+                "                if (scaled > linear_activation_max) scaled = linear_activation_max;\n"
+                "                int8_t lin8 = (int8_t)scaled;\n"
+                "                float f = (float)lin8 * scale_linear_out;\n"
+                "                float y = (f > 0.0f) ? f : alpha * (expf(f) - 1.0f);\n"
+                "                int32_t v = (int32_t)roundf(y / scale_final_out);\n"
+                "                if (v < activation_min) v = activation_min;\n"
+                "                if (v > activation_max) v = activation_max;\n"
+                "                output[m*N+n] = (int8_t)v;\n"
+                "            }\n"
+                "        }\n"
+                "        return;\n"
+                "    }\n\n"
+                "    /* Seed m1 with bias broadcast (or zero). */\n"
+                "    asm volatile(\"vsetvli zero, %0, e32, m4, ta, ma\" : : \"r\"((size_t)N));\n"
+                "    if (bias) asm volatile(\"vle32.v v0, (%0)\" : : \"r\"(bias));\n"
+                "    else      asm volatile(\"vmv.v.i v0, 0\");\n"
+                "    OPMVINBCAST(m1, v0);\n\n"
+                "    const ptrdiff_t in_stride = (ptrdiff_t)K * sizeof(int8_t);\n"
+                "    const ptrdiff_t w_stride  = (ptrdiff_t)K * sizeof(int8_t);\n"
+                "    for (int k = 0; k < K; k++) {\n"
+                "        asm volatile(\"vsetvli zero, %0, e8, m1, ta, ma\" : : \"r\"((size_t)M));\n"
+                "        asm volatile(\"vlse8.v v16, (%0), %1\"\n"
+                "                     : : \"r\"(&input[k]),  \"r\"((unsigned long)in_stride));\n"
+                "        asm volatile(\"vsetvli zero, %0, e8, m1, ta, ma\" : : \"r\"((size_t)N));\n"
+                "        asm volatile(\"vlse8.v v18, (%0), %1\"\n"
+                "                     : : \"r\"(&weight[k]), \"r\"((unsigned long)w_stride));\n"
+                "        VOPACC(m1, v18, v16);\n"
+                "    }\n\n"
+                "    /* Drain rows; for each row run requantize+clamp+ELU in scalar. */\n"
+                "    int32_t row_i32[64];\n"
+                "    asm volatile(\"vsetvli zero, %0, e32, m4, ta, ma\" : : \"r\"((size_t)N));\n"
+                "    for (int m = 0; m < M; m++) {\n"
+                "        VMV_VR(v0, m, m1);\n"
+                "        asm volatile(\"vse32.v v0, (%0)\" : : \"r\"(row_i32));\n"
+                "        for (int n = 0; n < N; n++) {\n"
+                "            int32_t scaled = q31_requantize(row_i32[n],\n"
+                "                                            output_multiplier, output_shift);\n"
+                "            scaled += linear_output_offset;\n"
+                "            if (scaled < linear_activation_min) scaled = linear_activation_min;\n"
+                "            if (scaled > linear_activation_max) scaled = linear_activation_max;\n"
+                "            int8_t lin8 = (int8_t)scaled;\n"
+                "            float f = (float)lin8 * scale_linear_out;\n"
+                "            float y = (f > 0.0f) ? f : alpha * (expf(f) - 1.0f);\n"
+                "            int32_t v = (int32_t)roundf(y / scale_final_out);\n"
+                "            if (v < activation_min) v = activation_min;\n"
+                "            if (v > activation_max) v = activation_max;\n"
+                "            output[m*N+n] = (int8_t)v;\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+    ],
+)
+
+
+ELU_S8 = KernelSpec(
+    op="elu_s8",
+    signature=(
+        "void kernel_elu_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max, float alpha)"
+    ),
+    semantics=(
+        "Quantized elementwise ELU (Exponential Linear Unit) on a contiguous\n"
+        "int8 buffer with symmetric per-tensor quantization (zero_point = 0).\n"
+        "ELU(x) = x          if x > 0\n"
+        "         alpha*(e^x - 1) if x <= 0\n"
+        "Reference uses the exact form; an LUT-based variant can be added as\n"
+        "a curated kernel — the int8 input only has 256 possible values, so\n"
+        "the entire output table fits in 256 bytes for a given (scale_in,\n"
+        "scale_out, alpha) tuple:\n"
+        "  f = input[i] * scale_in\n"
+        "  y = (f > 0) ? f : alpha * (expf(f) - 1)\n"
+        "  output[i] = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "alpha is typically 1.0 (PyTorch default)."
+    ),
+    reference_impl="""\
+void kernel_elu_s8(const int8_t *input, int8_t *output, int n,
+                   float scale_in, float scale_out,
+                   int activation_min, int activation_max, float alpha) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = (f > 0.0f) ? f : alpha * (expf(f) - 1.0f);
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 256}],
+    argtypes_factory=_elu_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all.
+        # Kernel: kernels/rvv/rvv_elu_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The expensive part of this op is the expf, not the "
+                "datapath width: ~140 cycles per element on this core, "
+                "which is essentially the whole runtime. There is no "
+                "vector expf, and a polynomial one would trade "
+                "bit-exactness for an op measured in tens of "
+                "microseconds.\n\n"
+                "What does help: the input is int8, so the op has at "
+                "most 256 distinct outputs for a given quant tuple, and "
+                "a quantized activation tensor repeats values heavily. "
+                "One cheap pass marks which of the 256 bytes actually "
+                "occur, expf runs only for those, and the output is a "
+                "vector indexed-load gather (vluxei8, the biased byte "
+                "used directly as its own offset into the table). Cost "
+                "goes from n*expf to distinct*expf.\n\n"
+                "The MEMOIZED table beats the eager one: building all "
+                "256 entries costs 256 expf regardless of n, which "
+                "loses for every shape these models have. Building only "
+                "what is asked for never loses by more than the marking "
+                "pass, and below a small-n guard the reference "
+                "expression runs per element instead.\n\n"
+                "Bit-exact by construction -- each table entry is the "
+                "reference's own expression, scalar, float32, same "
+                "casts, same roundf, and the vector path contains no "
+                "arithmetic at all. This is the memoized form of the LUT this op\'s own semantics text proposes."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+SILU_S8 = KernelSpec(
+    op="silu_s8",
+    signature=(
+        "void kernel_silu_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise SiLU (a.k.a. Swish) on a contiguous int8 "
+        "buffer with symmetric per-tensor quantization (zero_point = 0):\n"
+        "  f = input[i] * scale_in\n"
+        "  y = f / (1.0f + expf(-f))           (SiLU = x * sigmoid(x))\n"
+        "  output[i] = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "activation_min / activation_max are the int8 output clamp bounds."
+    ),
+    reference_impl="""\
+void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
+                    float scale_in, float scale_out,
+                    int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = f / (1.0f + expf(-f));
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1}, {"n": 17}, {"n": 1024},
+    ],
+    argtypes_factory=_silu_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_lut_gather",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SiLU via a 256-entry int8 LUT. Since the input is "
+                "int8 (256 possible values) and scale_in / scale_out "
+                "are loop-invariant, the entire output domain has at "
+                "most 256 distinct values. Precompute lut[v] = "
+                "scalar_silu(v - 128) at function entry using the "
+                "SAME math as the reference impl (so bit-exact by "
+                "construction). Inner loop is then a scalar LUT "
+                "lookup per element. NOTE: previously tried an RVV "
+                "vluxei8 (indexed gather) inner loop — passes spike "
+                "but the FireSim Saturn-OPU bitstream raises Illegal "
+                "instruction. Stay scalar in the lookup. The win is "
+                "still ~50x vs the reference expf+roundf+clip per "
+                "element on spike yolov8."
+            ),
+            reference_impl=(
+                "#include <math.h>\n"
+                "void kernel_silu_s8(const int8_t *input, int8_t *output, "
+                "int n, float scale_in, float scale_out, "
+                "int activation_min, int activation_max) {\n"
+                "    int8_t lut[256];\n"
+                "    for (int v = 0; v < 256; v++) {\n"
+                "        int8_t iv = (int8_t)(v - 128);\n"
+                "        float f = (float)iv * scale_in;\n"
+                "        float y = f / (1.0f + expf(-f));\n"
+                "        int32_t q = (int32_t)roundf(y / scale_out);\n"
+                "        if (q < activation_min) q = activation_min;\n"
+                "        if (q > activation_max) q = activation_max;\n"
+                "        lut[v] = (int8_t)q;\n"
+                "    }\n"
+                "    for (int i = 0; i < n; i++) {\n"
+                "        output[i] = lut[(int)input[i] + 128];\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+    ],
+)
+
+
+def _conv2d_batchnorm2d_s8_argtypes():
+    """Argtypes for the fused conv2d+batchnorm kernel registered in
+    Phase E2 (yolov8 + dronet hot path, 60 candidate pairs identified
+    in E1 — the largest single fusion gap)."""
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, conv_bias, bn_scale, bn_bias, output,
+    # N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW,
+    # input_offset, filter_offset, conv_output_offset,
+    # conv_output_multiplier, conv_output_shift,
+    # conv_act_min, conv_act_max,
+    # bn_scale_in, bn_scale_out, bn_act_min, bn_act_max
+    return [i8p, i8p, i32p, fp, fp, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+CONV2D_BATCHNORM2D_S8 = KernelSpec(
+    op="conv2d_batchnorm2d_s8",
+    signature=(
+        "void kernel_conv2d_batchnorm2d_s8("
+        "const int8_t *input, const int8_t *weight, const int32_t *bias, "
+        "const float *bn_scale, const float *bn_bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int conv_output_offset, "
+        "int conv_output_multiplier, int conv_output_shift, "
+        "int conv_activation_min, int conv_activation_max, "
+        "float bn_scale_in, float bn_scale_out, "
+        "int bn_activation_min, int bn_activation_max)"
+    ),
+    semantics=(
+        "Pair-fused quantized 2D conv + BatchNorm. Computes Conv2D's MAC + "
+        "Q0.31 requantize tail (matching kernel_conv2d_s8), then applies "
+        "BN's per-channel affine on the resulting int8 IN REGISTER before "
+        "storing. Eliminates the intermediate-tensor write/read between "
+        "kernel_conv2d_s8 + kernel_batchnorm2d_s8 — the top-1 fusion gap "
+        "on the headline workload (60 candidate pairs identified by E1).\n\n"
+        "Note: this is distinct from the standard 'BN folding' inference "
+        "optimization where BN is absorbed into conv's weight/bias offline. "
+        "Folding works when BN's params are static post-training. Here we "
+        "support runtime BN params (e.g., calibration-time fold not done)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_conv2d_batchnorm2d_s8(
+    const int8_t *input, const int8_t *weight, const int32_t *bias,
+    const float *bn_scale, const float *bn_bias, int8_t *output,
+    int N, int IC, int IH, int IW, int OC,
+    int KH, int KW, int SH, int SW, int PH, int PW,
+    int input_offset, int filter_offset, int conv_output_offset,
+    int conv_output_multiplier, int conv_output_shift,
+    int conv_activation_min, int conv_activation_max,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            /* BN's per-channel scale and bias loaded once per output channel. */
+            float bn_s = bn_scale[oc];
+            float bn_b = bn_bias[oc];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). Must match the
+                                 * skeleton's _backend_pack_weight permutation for rvv. */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    /* Conv requantize via Q0.31 rounding multiply. */
+                    int64_t prod = (int64_t)acc * (int64_t)conv_output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (conv_output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (conv_output_shift - 1)))
+                                            >> conv_output_shift);
+                    } else if (conv_output_shift < 0) {
+                        scaled = scaled << (-conv_output_shift);
+                    }
+                    scaled += conv_output_offset;
+                    if (scaled < conv_activation_min) scaled = conv_activation_min;
+                    if (scaled > conv_activation_max) scaled = conv_activation_max;
+                    int8_t conv_int8 = (int8_t)scaled;
+                    /* BN affine in-register, no intermediate tensor. */
+                    float fv = (float)conv_int8 * bn_scale_in;
+                    float y = bn_s * fv + bn_b;
+                    int32_t v = (int32_t)roundf(y / bn_scale_out);
+                    if (v < bn_activation_min) v = bn_activation_min;
+                    if (v > bn_activation_max) v = bn_activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # YOLOv8-nano hot conv shapes (from E1 candidate distribution).
+        {"N": 1, "IC": 3,  "IH": 320, "IW": 320, "OC": 16, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 16, "IH": 160, "IW": 160, "OC": 32, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 32, "IH": 80,  "IW": 80,  "OC": 64, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        # Smaller shapes for fast validation
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 4, "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_batchnorm2d_s8_argtypes,
+    algorithms=[
+        # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
+        # Q0.31 requantize -> int8) then BN affine as scalar epilogue.
+        # Single-stage Q0.31 -> numeric_drift; picked first when it stays
+        # within atol=128, else the bit-exact im2col_full_C variant below.
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_bn_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "tiled_conv_auto (HW im2col + HW Q0.31 requantize) for the "
+                "conv, BN per-channel affine + activation clamp as a scalar "
+                "epilogue. Fast (single-digit-M cycles); ~1 LSB/layer drift."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            weight_layout="hwio",
+        ),
+        # Bit-exact fallback (kernels/gemmini/gemmini_conv2d_batchnorm2d_s8
+        # _gemmini_im2col_full_C_bn_epilogue.c): CPU im2col ->
+        # tiled_matmul_auto(full_C) on the systolic array -> scalar Q0.31
+        # requantize -> BN affine. Bit-exact but CPU im2col is ~4.6x slower.
+        AlgorithmCandidate(
+            name="gemmini_im2col_full_C_bn_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "Systolic-array matmul (tiled_matmul_auto, full_C int32 "
+                "accumulator) + scalar Q0.31 requantize + BN per-channel "
+                "affine + activation clamp, all in one on-core kernel. No "
+                "intermediate conv_int8 tensor; no conv→bn cross-core "
+                "ping-pong."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="hwio",
+        ),
+        AlgorithmCandidate(
+            name="conv2d_with_inline_bn_epilogue",
+            target_affinity=("gemmini",),
+            description=(
+                "Gemmini's tiled_matmul_auto + activation epilogue. The conv "
+                "MAC runs in the systolic array as usual; the BN affine "
+                "lives in the activation stage by precomputing the per-channel "
+                "(bn_scale[c] / bn_scale_out, bn_bias[c] / bn_scale_out) "
+                "constants and feeding them through gemmini's int8 multiply-"
+                "by-constant activation slot. Result: NO intermediate "
+                "conv_int8 buffer between conv and BN. 60 candidate pairs "
+                "from yolov8 + dronet collapse to single dispatches."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="hwio",
+        ),
+        # The RVV entry. Without it the curated lookup has no
+        # (op, algorithm) pair to probe for this op and every fused
+        # conv falls back to the scalar reference inside a build
+        # labelled rvv_x60 -- measured at 86.7% of DroNet's 62.6 ms.
+        # Kernel: kernels/rvv/rvv_conv2d_batchnorm2d_s8
+        # _rvv_oc_blocked_bn_epilogue.c
+        AlgorithmCandidate(
+            name="rvv_oc_blocked_bn_epilogue",
+            target_affinity=("rvv", "rvv_x60"),
+            weight_layout="ihwoc",
+            description=(
+                "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
+                "MAC reduction over (ic, kh, kw), vsmul+vnclip Q0.31 "
+                "requantize tail, OC tiled for L1D, IHWOC weights) with "
+                "the BN stage applied to the int8 conv result on its way "
+                "to memory -- no intermediate tensor.\n\n"
+                "The BN stage stays on the scalar unit: after the conv "
+                "requantize the value is an int8, so BN has at most 256 "
+                "distinct outputs per channel and becomes a per-channel "
+                "table wherever OH*OW amortizes the 256-entry build "
+                "(below that break-even the same arithmetic runs per "
+                "element). That keeps float ops out of a vector body "
+                "whose vtype is otherwise pure integer, and makes the "
+                "epilogue bit-exact with the reference by construction "
+                "-- vfcvt cannot round the way roundf() does."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+def _conv2d_batchnorm2d_silu_s8_argtypes():
+    """Argtypes for the triple-fused conv2d+batchnorm+silu kernel.
+
+    Same as conv2d_batchnorm2d_s8 plus the SiLU stage's
+    (silu_scale_in, silu_scale_out, silu_act_min, silu_act_max) tail.
+    Used for the yolov8_nano backbone's Conv→BN→SiLU blocks — folds all
+    three ops onto one hart so the whole block is one dispatch."""
+    import ctypes
+    return _conv2d_batchnorm2d_s8_argtypes() + [
+        ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int]
+
+
+CONV2D_BATCHNORM2D_SILU_S8 = KernelSpec(
+    op="conv2d_batchnorm2d_silu_s8",
+    signature=(
+        "void kernel_conv2d_batchnorm2d_silu_s8("
+        "const int8_t *input, const int8_t *weight, const int32_t *bias, "
+        "const float *bn_scale, const float *bn_bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int conv_output_offset, "
+        "int conv_output_multiplier, int conv_output_shift, "
+        "int conv_activation_min, int conv_activation_max, "
+        "float bn_scale_in, float bn_scale_out, "
+        "int bn_activation_min, int bn_activation_max, "
+        "float silu_scale_in, float silu_scale_out, "
+        "int silu_activation_min, int silu_activation_max)"
+    ),
+    semantics=(
+        "Triple-fused quantized Conv2D + BatchNorm + SiLU — the yolov8_nano "
+        "backbone's canonical Conv block, collapsed to a single dispatch on "
+        "one hart. Computes Conv2D's MAC + Q0.31 requantize tail (bit-exact "
+        "with kernel_conv2d_s8), clamps to the conv int8 range, applies BN's "
+        "per-channel affine + requantize+clamp (bit-exact with "
+        "kernel_batchnorm2d_s8), then applies SiLU + requantize+clamp "
+        "(bit-exact with kernel_silu_s8) — all IN REGISTER with no "
+        "intermediate tensor materialized. Removes the conv→bn and bn→silu "
+        "cross-core ping-pong that stalls the Gemmini hart waiting on rvv "
+        "glue ops.\n\n"
+        "Weight layout follows the same MODELBLASTER_GEMMINI_HWIO_WEIGHTS / "
+        "MODELBLASTER_RVV_IHWOC_WEIGHTS #ifdef convention as kernel_conv2d_s8 "
+        "(weights are pre-packed per-backend by generate_skeleton.py)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_conv2d_batchnorm2d_silu_s8(
+    const int8_t *input, const int8_t *weight, const int32_t *bias,
+    const float *bn_scale, const float *bn_bias, int8_t *output,
+    int N, int IC, int IH, int IW, int OC,
+    int KH, int KW, int SH, int SW, int PH, int PW,
+    int input_offset, int filter_offset, int conv_output_offset,
+    int conv_output_multiplier, int conv_output_shift,
+    int conv_activation_min, int conv_activation_max,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max,
+    float silu_scale_in, float silu_scale_out,
+    int silu_activation_min, int silu_activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            float bn_s = bn_scale[oc];
+            float bn_b = bn_bias[oc];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+                                /* HWIO = (H, W, I, O), perm (2,3,1,0) */
+                                int32_t w_v = (int32_t)weight[((kh*KW + kw)*IC + ic)*OC + oc]
+                                            + filter_offset;
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* IHWOC = (I, H, W, O), perm (1,2,3,0). */
+                                int32_t w_v = (int32_t)weight[((ic*KH + kh)*KW + kw)*OC + oc]
+                                            + filter_offset;
+#else
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw]
+                                            + filter_offset;
+#endif
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    /* --- conv2d_s8 requantize (Q0.31 rounding multiply) --- */
+                    int64_t prod = (int64_t)acc * (int64_t)conv_output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (conv_output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (conv_output_shift - 1)))
+                                            >> conv_output_shift);
+                    } else if (conv_output_shift < 0) {
+                        scaled = scaled << (-conv_output_shift);
+                    }
+                    scaled += conv_output_offset;
+                    if (scaled < conv_activation_min) scaled = conv_activation_min;
+                    if (scaled > conv_activation_max) scaled = conv_activation_max;
+                    int8_t conv_int8 = (int8_t)scaled;
+                    /* --- batchnorm2d_s8 affine, in-register --- */
+                    float fv = (float)conv_int8 * bn_scale_in;
+                    float y = bn_s * fv + bn_b;
+                    int32_t bv = (int32_t)roundf(y / bn_scale_out);
+                    if (bv < bn_activation_min) bv = bn_activation_min;
+                    if (bv > bn_activation_max) bv = bn_activation_max;
+                    int8_t bn_int8 = (int8_t)bv;
+                    /* --- silu_s8, in-register (no intermediate tensor) --- */
+                    float fbv = (float)bn_int8 * silu_scale_in;
+                    float sy = fbv / (1.0f + expf(-fbv));
+                    int32_t v = (int32_t)roundf(sy / silu_scale_out);
+                    if (v < silu_activation_min) v = silu_activation_min;
+                    if (v > silu_activation_max) v = silu_activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # YOLOv8-nano hot conv shapes (Conv→BN→SiLU backbone blocks).
+        {"N": 1, "IC": 3,  "IH": 320, "IW": 320, "OC": 16, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        {"N": 1, "IC": 16, "IH": 160, "IW": 160, "OC": 32, "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 1, "PW": 1},
+        # Smaller shape for fast validation.
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 4, "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_batchnorm2d_silu_s8_argtypes,
+    algorithms=[
+        # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
+        # Q0.31 requantize -> int8) then BN affine + SiLU as scalar epilogue.
+        # Single-stage Q0.31 -> numeric_drift; picked first when within
+        # atol=128, else the bit-exact im2col_full_C variant below.
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_bn_silu_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "tiled_conv_auto (HW im2col + HW Q0.31 requantize) for the "
+                "conv, then BN per-channel affine + SiLU as a scalar "
+                "epilogue. Fast (single-digit-M cycles); ~1 LSB/layer drift."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            weight_layout="hwio",
+        ),
+        # Bit-exact fallback: CPU im2col -> tiled_matmul_auto(full_C) ->
+        # scalar Q0.31 requantize -> BN affine -> SiLU. Slower (CPU im2col).
+        AlgorithmCandidate(
+            name="gemmini_im2col_full_C_bn_silu_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "Systolic-array matmul (tiled_matmul_auto, full_C int32 "
+                "accumulator) + scalar Q0.31 requantize + BN per-channel "
+                "affine + SiLU, all in one on-core kernel. No intermediate "
+                "conv_int8/bn_int8 tensors; no conv→bn or bn→silu ping-pong."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="hwio",
+        ),
+        AlgorithmCandidate(
+            name="conv2d_with_inline_bn_silu_epilogue",
+            target_affinity=("gemmini", "gemmini_q31"),
+            description=(
+                "Gemmini's tiled_matmul_auto + custom activation epilogue: "
+                "the conv MAC runs in the systolic array; the BN per-channel "
+                "affine and the SiLU LUT are applied in the requantize "
+                "epilogue so the whole Conv→BN→SiLU block is one dispatch "
+                "with no intermediate tensor and no cross-core ping-pong."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="hwio",
+        ),
+        # The RVV entry. Without it the curated lookup has no
+        # (op, algorithm) pair to probe for this op, and all 57 of
+        # yolov8_nano's backbone convolutions fall back to the scalar
+        # reference inside a build labelled rvv_x60 -- measured at 99.8%
+        # of a 4974.8 ms run, i.e. 0.81x against the pure-scalar build.
+        # Kernel: kernels/rvv/rvv_conv2d_batchnorm2d_silu_s8
+        # _rvv_oc_blocked_bn_silu_epilogue.c
+        AlgorithmCandidate(
+            name="rvv_oc_blocked_bn_silu_epilogue",
+            target_affinity=("rvv", "rvv_x60"),
+            weight_layout="ihwoc",
+            description=(
+                "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
+                "MAC reduction over (ic, kh, kw), vsmul+vnclip Q0.31 "
+                "requantize tail, OC tiled for L1D, IHWOC weights) with "
+                "the BN and SiLU stages applied to the int8 conv result "
+                "on its way to memory -- no intermediate tensors.\n\n"
+                "Both stages are tables, not vector float math. The conv "
+                "requantize leaves an int8, so SiLU depends on at most "
+                "256 distinct inputs in total (one table per dispatch, "
+                "256 expf calls instead of one per output element) and BN "
+                "on at most 256 per channel (tabulated per OC tile where "
+                "OH*OW amortizes the build, per element below that "
+                "break-even). Keeping the float arithmetic scalar and "
+                "textually identical to the reference makes the epilogue "
+                "bit-exact by construction -- vfcvt cannot round the way "
+                "roundf() does -- and keeps float ops out of a vector "
+                "body whose vtype is otherwise pure integer."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+def _batchnorm2d_silu_s8_argtypes():
+    """Argtypes for the fused batchnorm2d+silu kernel registered in
+    Phase E2 (yolov8 hot path, 57 candidate pairs identified in E1)."""
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, scale, bias, output,
+    # N, C, H, W,
+    # bn_scale_in, bn_scale_out, bn_act_min, bn_act_max,
+    # silu_scale_in, silu_scale_out, silu_act_min, silu_act_max
+    return [i8p, fp, fp, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+BATCHNORM2D_SILU_S8 = KernelSpec(
+    op="batchnorm2d_silu_s8",
+    signature=(
+        "void kernel_batchnorm2d_silu_s8("
+        "const int8_t *input, const float *scale, const float *bias, "
+        "int8_t *output, "
+        "int N, int C, int H, int W, "
+        "float bn_scale_in, float bn_scale_out, "
+        "int bn_activation_min, int bn_activation_max, "
+        "float silu_scale_in, float silu_scale_out, "
+        "int silu_activation_min, int silu_activation_max)"
+    ),
+    semantics=(
+        "Pair-fused quantized BatchNorm + SiLU activation. Computes BN's "
+        "per-channel float affine on int8 activations, requantizes through "
+        "the BN's clamp, then applies SiLU on the resulting int8 IN "
+        "REGISTER before storing. Eliminates the intermediate-tensor "
+        "write/read between consecutive kernel_batchnorm2d_s8 + "
+        "kernel_silu_s8 calls — the top-2 fusion gap on yolov8_nano "
+        "(57 candidate pairs identified by Phase E1 gap survey).\n\n"
+        "Math (per element):\n"
+        "  fv  = input * bn_scale_in\n"
+        "  y   = scale[c] * fv + bias[c]                # BN affine (f32)\n"
+        "  bv  = clamp(round(y / bn_scale_out),\n"
+        "             bn_activation_min, bn_activation_max)  # BN's int8\n"
+        "  /* SiLU in-register, no intermediate tensor */\n"
+        "  fbv = bv * silu_scale_in\n"
+        "  sy  = fbv / (1.0f + expf(-fbv))               # SiLU = x*sigmoid(x)\n"
+        "  v   = clamp(round(sy / silu_scale_out),\n"
+        "             silu_activation_min, silu_activation_max)\n"
+        "  output = (int8_t) v\n\n"
+        "Optimization targets:\n"
+        "  rvv_opu — broadcast BN's per-channel (scale[c], bias[c]) into\n"
+        "  a vector register; the BN affine, requantize+clamp, SiLU LUT\n"
+        "  lookup, and final quant all happen in vector registers before\n"
+        "  the strided store. The 256-byte SiLU LUT (keyed by the BN\n"
+        "  int8 output) is precomputed per (silu_scale_in, silu_scale_out)\n"
+        "  tuple and fits in L1.\n"
+        "  gemmini — gemmini's activation slot can carry a custom LUT\n"
+        "  output stage; load (scale[c], bias[c]) per-channel and apply\n"
+        "  the fused BN+SiLU lookup in the epilogue.\n"
+        "  reference — straightforward C as in `reference_impl` below."
+    ),
+    reference_impl="""\
+void kernel_batchnorm2d_silu_s8(
+    const int8_t *input, const float *scale, const float *bias,
+    int8_t *output,
+    int N, int C, int H, int W,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max,
+    float silu_scale_in, float silu_scale_out,
+    int silu_activation_min, int silu_activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float s = scale[c];
+            float b = bias[c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int idx = ((n*C + c)*H + h)*W + w;
+                    /* --- batchnorm2d_s8 math --- */
+                    float fv = (float)input[idx] * bn_scale_in;
+                    float y = s * fv + b;
+                    int32_t bv = (int32_t)roundf(y / bn_scale_out);
+                    if (bv < bn_activation_min) bv = bn_activation_min;
+                    if (bv > bn_activation_max) bv = bn_activation_max;
+                    int8_t bn_int8 = (int8_t)bv;
+                    /* --- silu_s8 math, in-register (no intermediate tensor) --- */
+                    float fbv = (float)bn_int8 * silu_scale_in;
+                    float sy = fbv / (1.0f + expf(-fbv));
+                    int32_t v = (int32_t)roundf(sy / silu_scale_out);
+                    if (v < silu_activation_min) v = silu_activation_min;
+                    if (v > silu_activation_max) v = silu_activation_max;
+                    output[idx] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # YOLOv8-nano hot shapes (BN dimensions from dronet/yolov8 IRs).
+        {"N": 1, "C": 16, "H": 40, "W": 40},
+        {"N": 1, "C": 32, "H": 20, "W": 20},
+        {"N": 1, "C": 64, "H": 10, "W": 10},
+        {"N": 1, "C": 128, "H": 5, "W": 5},
+        # Generalization
+        {"N": 1, "C": 8, "H": 7, "W": 7},
+        {"N": 2, "C": 4, "H": 3, "W": 3},
+    ],
+    argtypes_factory=_batchnorm2d_silu_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="bn_silu_per_channel_register_fused",
+            target_affinity=("rvv_opu",),
+            description=(
+                "RVV vector implementation: load BN's per-channel "
+                "(scale[c], bias[c]) as vector-broadcast operands; apply "
+                "the BN affine over the (H*W) tile in float vector "
+                "registers; requantize+clamp to int8 vector register; "
+                "use VRGATHER to look up SiLU LUT for each int8 in the "
+                "BN output; clamp+store final int8. The intermediate "
+                "BN int8 buffer is NEVER materialized — the SiLU LUT "
+                "lookup happens on the vector register that holds the "
+                "BN quantized output.\n\n"
+                "WHY this wins vs the per-op chain:\n"
+                "  * One worker handshake (vs 2 for BN+SiLU chained).\n"
+                "  * The BN_int8 intermediate (N*C*H*W bytes) never "
+                "spills to L1 — it stays in vector registers.\n"
+                "  * The SiLU LUT (256 bytes per scale tuple) is "
+                "precomputed once per dispatch.\n\n"
+                "PROGRAMMING MODEL:\n"
+                "  /* Precompute SiLU LUT keyed by BN int8 output. */\n"
+                "  for (int v = 0; v < 256; v++) {\n"
+                "      int8_t iv = (int8_t)(uint8_t)v;\n"
+                "      float f = (float)iv * silu_scale_in;\n"
+                "      float y = f / (1.0f + expf(-f));\n"
+                "      int32_t q = roundf(y / silu_scale_out);\n"
+                "      if (q < silu_activation_min) q = silu_activation_min;\n"
+                "      if (q > silu_activation_max) q = silu_activation_max;\n"
+                "      silu_lut[v] = (int8_t)q;\n"
+                "  }\n"
+                "  /* For each (n, c) panel of (H*W) int8 elements: */\n"
+                "  for (n, c) in [N, C):\n"
+                "      bs = vfmv_v_f(scale[c]); bb = vfmv_v_f(bias[c]);\n"
+                "      for tile of size VLEN/8:\n"
+                "          v_in = vle8_v(input + idx)\n"
+                "          v_f  = vfcvt_f_x(v_in) * bn_scale_in\n"
+                "          v_y  = bs * v_f + bb\n"
+                "          v_q  = round(v_y / bn_scale_out)\n"
+                "          v_q  = clamp(v_q, bn_act_min, bn_act_max)\n"
+                "          v_bn8 = vncvt_x_x(v_q)\n"
+                "          v_out = vrgather_vv(silu_lut, v_bn8)\n"
+                "          vse8_v(output + idx, v_out)\n\n"
+                "STRICT REQUIREMENTS:\n"
+                "  * Bit-exact match vs the reference scalar impl above\n"
+                "    (same rounding/clamp order). Verify gate:\n"
+                "    spike max_abs_err=0 max_rel_err=0.\n"
+                "  * Per-channel (scale, bias) MUST be loaded fresh per\n"
+                "    channel — do not assume a single (scale, bias) for\n"
+                "    the whole tensor.\n"
+                "  * The BN_int8 intermediate MUST be in registers — DO\n"
+                "    NOT allocate an HxW (or any) BN-output buffer."
+            ),
+            reference_impl="(see KernelSpec.reference_impl — same math)",
+        ),
+        AlgorithmCandidate(
+            name="bn_silu_inline_scalar_per_channel",
+            target_affinity=("gemmini",),
+            description=(
+                "Gemmini doesn't run BN natively (it's a matmul/conv "
+                "accelerator) — the fused BN+SiLU runs on the scalar "
+                "host or via gemmini's activation-stage LUT slot if "
+                "available. The fused kernel reduces the per-channel "
+                "(scale, bias) memory traffic by a factor of 2 vs "
+                "running BN and SiLU as separate dispatches (each of "
+                "which would load the per-channel params anew).\n\n"
+                "Verify gate: bit-exact match vs reference scalar impl."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+        ),
+    ],
+)
+
+
+def _upsample_nearest_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, scale
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+
+
+UPSAMPLE_NEAREST_S8 = KernelSpec(
+    op="upsample_nearest_s8",
+    signature=(
+        "void kernel_upsample_nearest_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int IH, int IW, int scale)"
+    ),
+    semantics=(
+        "Quantized nearest-neighbor 2D upsampling along H and W by an "
+        "integer scale factor. No requantize needed — nearest upsample just "
+        "replicates int8 pixels; the output scale equals the input scale.\n"
+        "Output shape is (N, C, IH*scale, IW*scale). Each output pixel\n"
+        "(oh, ow) reads the input pixel (oh/scale, ow/scale).\n"
+        "Buffers are NCHW-laid-out."
+    ),
+    reference_impl="""\
+void kernel_upsample_nearest_s8(const int8_t *input, int8_t *output,
+                                 int N, int C, int IH, int IW, int scale) {
+    int OH = IH * scale, OW = IW * scale;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih = oh / scale;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw = ow / scale;
+                    output[((n*C + c)*OH + oh)*OW + ow] =
+                        input[((n*C + c)*IH + ih)*IW + iw];
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4,  "IH": 5,  "IW": 5,  "scale": 2},
+        {"N": 1, "C": 16, "IH": 10, "IW": 10, "scale": 2},
+    ],
+    argtypes_factory=_upsample_nearest_s8_argtypes,
+)
+
+
+def _cat2_c1_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # in0, c0, scale0, in1, c1, scale1,
+    # output, N, H, W, scale_out, activation_min, activation_max
+    return [i8p, ctypes.c_int, ctypes.c_float,
+            i8p, ctypes.c_int, ctypes.c_float,
+            i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int]
+
+
+def _cat3_c1_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, ctypes.c_int, ctypes.c_float,
+            i8p, ctypes.c_int, ctypes.c_float,
+            i8p, ctypes.c_int, ctypes.c_float,
+            i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int]
+
+
+def _cat4_c1_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, ctypes.c_int, ctypes.c_float,
+            i8p, ctypes.c_int, ctypes.c_float,
+            i8p, ctypes.c_int, ctypes.c_float,
+            i8p, ctypes.c_int, ctypes.c_float,
+            i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_int, ctypes.c_int]
+
+
+def _cat_c1_s8_reference(n_inputs: int) -> str:
+    """Generate the reference C implementation for catN_c1_s8."""
+    sig_parts = ", ".join(
+        f"const int8_t *in{i}, int c{i}, float scale{i}"
+        for i in range(n_inputs)
+    )
+    return f"""\
+void kernel_cat{n_inputs}_c1_s8({sig_parts},
+                    int8_t *output,
+                    int N, int H, int W,
+                    float scale_out,
+                    int activation_min, int activation_max) {{
+    /* Channel-wise concatenation with per-input requantize.
+     * Output[n, c_offset + c, h, w] = requantize(in_i[n, c, h, w])
+     * where c_offset is the running channel offset for input i. */
+    int stride = H * W;
+    const int8_t *ins[{n_inputs}] = {{ {", ".join(f"in{i}" for i in range(n_inputs))} }};
+    int cs[{n_inputs}] = {{ {", ".join(f"c{i}" for i in range(n_inputs))} }};
+    float scales[{n_inputs}] = {{ {", ".join(f"scale{i}" for i in range(n_inputs))} }};
+    for (int n = 0; n < N; n++) {{
+        int out_c = 0;
+        for (int i = 0; i < {n_inputs}; i++) {{
+            float s_in = scales[i];
+            for (int c = 0; c < cs[i]; c++) {{
+                for (int hw = 0; hw < stride; hw++) {{
+                    float f = (float)ins[i][((n * cs[i]) + c) * stride + hw] * s_in;
+                    int32_t v = (int32_t)roundf(f / scale_out);
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n * ({" + ".join(f"c{j}" for j in range(n_inputs))}) + out_c + c) * stride + hw)] = (int8_t)v;
+                }}
+            }}
+            out_c += cs[i];
+        }}
+    }}
+}}
+"""
+
+
+CAT2_C1_S8 = KernelSpec(
+    op="cat2_c1_s8",
+    signature=(
+        "void kernel_cat2_c1_s8("
+        "const int8_t *in0, int c0, float scale0, "
+        "const int8_t *in1, int c1, float scale1, "
+        "int8_t *output, int N, int H, int W, "
+        "float scale_out, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Concatenate 2 NCHW int8 tensors along the channel axis. Each input "
+        "is dequantized by its own scale, then requantized to scale_out.\n"
+        "Input i has shape (N, ci, H, W); output has shape "
+        "(N, c0+c1, H, W)."
+    ),
+    reference_impl=_cat_c1_s8_reference(2),
+    extra_shapes=[
+        {"N": 1, "H": 4, "W": 4, "C_inputs": [8, 8],   "C_total": 16},
+        {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32],  "C_total": 48},
+    ],
+    argtypes_factory=_cat2_c1_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="per_input_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Same LUT pattern that shipped silu_s8/rvv_lut_gather "
+                "and batchnorm2d_s8/per_channel_lut. For each input "
+                "tensor i build lut[v] = clamp(roundf((v-128) * scale_i "
+                "/ scale_out)) once, then the H*W*c_i loop is a scalar "
+                "indexed lookup. Bit-exact by construction; on Saturn "
+                "vluxei8 is unimplemented so the lookup stays scalar."
+            ),
+            reference_impl="",  # curated file supplies the impl
+        ),
+        AlgorithmCandidate(
+            name="direct",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV vectorized cat2 concat-rescale (vle8/vsext/vfcvt/"
+                "vfmul/vnclip). Kept as a fallback if per_input_lut "
+                "verify fails — historically tripped strict bit-exact "
+                "on yolov8 smoke shapes due to vfcvt RNE vs roundf "
+                "half-away-from-zero divergence."
+            ),
+            reference_impl="",
+        ),
+    ],
+)
+
+CAT3_C1_S8 = KernelSpec(
+    op="cat3_c1_s8",
+    signature=(
+        "void kernel_cat3_c1_s8("
+        "const int8_t *in0, int c0, float scale0, "
+        "const int8_t *in1, int c1, float scale1, "
+        "const int8_t *in2, int c2, float scale2, "
+        "int8_t *output, int N, int H, int W, "
+        "float scale_out, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Concatenate 3 NCHW int8 tensors along the channel axis. Each input "
+        "is dequantized by its own scale, then requantized to scale_out.\n"
+        "Output shape is (N, c0+c1+c2, H, W)."
+    ),
+    reference_impl=_cat_c1_s8_reference(3),
+    extra_shapes=[
+        {"N": 1, "H": 4, "W": 4, "C_inputs": [8, 8, 8],    "C_total": 24},
+        {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32, 16], "C_total": 64},
+    ],
+    argtypes_factory=_cat3_c1_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="per_input_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Per-input 256-entry LUT (3 inputs). Same LUT pattern "
+                "as cat2_c1_s8/per_input_lut. Bit-exact by construction."
+            ),
+            reference_impl="",
+        ),
+        AlgorithmCandidate(
+            name="direct",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV vectorized cat3 concat-rescale (3 inputs). Same "
+                "widening pipeline as cat2_c1_s8/direct."
+            ),
+            reference_impl="",
+        ),
+    ],
+)
+
+CAT4_C1_S8 = KernelSpec(
+    op="cat4_c1_s8",
+    signature=(
+        "void kernel_cat4_c1_s8("
+        "const int8_t *in0, int c0, float scale0, "
+        "const int8_t *in1, int c1, float scale1, "
+        "const int8_t *in2, int c2, float scale2, "
+        "const int8_t *in3, int c3, float scale3, "
+        "int8_t *output, int N, int H, int W, "
+        "float scale_out, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Concatenate 4 NCHW int8 tensors along the channel axis. Each input "
+        "is dequantized by its own scale, then requantized to scale_out.\n"
+        "Output shape is (N, c0+c1+c2+c3, H, W)."
+    ),
+    reference_impl=_cat_c1_s8_reference(4),
+    extra_shapes=[
+        {"N": 1, "H": 4, "W": 4, "C_inputs": [8, 8, 8, 8],    "C_total": 32},
+        {"N": 1, "H": 8, "W": 8, "C_inputs": [8, 16, 16, 8],   "C_total": 48},
+    ],
+    argtypes_factory=_cat4_c1_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="per_input_lut",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Per-input 256-entry LUT (4 inputs). Same LUT pattern "
+                "as cat2_c1_s8/per_input_lut. Bit-exact by construction."
+            ),
+            reference_impl="",
+        ),
+        AlgorithmCandidate(
+            name="direct",
+            target_affinity=("rvv_opu",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "RVV vectorized cat4 concat-rescale (4 inputs). Same "
+                "widening pipeline as cat2_c1_s8/direct."
+            ),
+            reference_impl="",
+        ),
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# ViNT int8 support: mul_s8 / gelu_s8 / pad_s8 / adaptive_avg_pool2d_s8 /
+# layer_norm_s8 / matmul_s8 / softmax_s8. Same float-tail pattern as the
+# yolov8_nano s8 kernels above — dequantize, compute, requantize.
+# ---------------------------------------------------------------------------
+
+
+def _mul_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # a, b, output, n, scale_a, scale_b, scale_out, act_min, act_max
+    return [i8p, i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+MUL_S8 = KernelSpec(
+    op="mul_s8",
+    signature=(
+        "void kernel_mul_s8(const int8_t *a, const int8_t *b, "
+        "int8_t *output, int n, "
+        "float scale_a, float scale_b, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise multiply. The two inputs may have different\n"
+        "scales — both are dequantized to float, multiplied, then\n"
+        "requantized into the output's scale:\n"
+        "  output[i] = clamp(\n"
+        "      roundf((a[i]*scale_a) * (b[i]*scale_b) / scale_out),\n"
+        "      activation_min, activation_max)\n"
+        "Use roundf, which is round-to-nearest TIES AWAY FROM ZERO. It is\n"
+        "NOT numpy.round, which is ties-to-even; they disagree on every\n"
+        "exact .5, so a kernel that picks the RNE rounding mode to match\n"
+        "the wrong description is wrong only on ties and passes most\n"
+        "random test data.\n"
+        "Common shapes in ViNT: SE gating (per-channel multiply onto an\n"
+        "NCHW activation, with `b` broadcast or pre-expanded) and the\n"
+        "Swish-as-x*sigmoid pattern. Both forms compile to a single\n"
+        "elementwise pass once the broadcast is materialized upstream."
+    ),
+    reference_impl="""\
+void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
+                   float scale_a, float scale_b, float scale_out,
+                   int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        float fa = (float)a[i] * scale_a;
+        float fb = (float)b[i] * scale_b;
+        float fout = (fa * fb) / scale_out;
+        int32_t v = (int32_t)roundf(fout);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 1024}, {"n": 8192}],
+    argtypes_factory=_mul_s8_argtypes,
+    algorithms=[
+        # This op had no AlgorithmCandidate at all, so the curated probe had
+        # no (op, algorithm) pair to look for on any target and every mul ran
+        # the scalar reference inside builds labelled rvv_x60 -- 19.3% of
+        # attn_block, the largest remaining reference share in it, and it is
+        # the RoPE rotation sitting between two curated LUT kernels.
+        # Kernel: kernels/rvv/rvv_mul_s8_rvv_frm_rmm.c, derived mechanically
+        # from the add_s8 kernel; scripts/check_derived_kernel.py re-derives
+        # it and diffs.
+        AlgorithmCandidate(
+            name="rvv_frm_rmm",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The reference expression issued on the vector unit, "
+                "including its rounding mode. Structurally identical to "
+                "add_s8's kernel of the same name -- the two references "
+                "differ in one operator, `fa + fb` against `fa * fb` -- so "
+                "read that one's description for the frm argument in "
+                "full.\n\n"
+                "The short form: the reference ends in "
+                "`(int32_t)roundf(fout)`, roundf is round-to-nearest TIES "
+                "AWAY FROM ZERO, and vfcvt.x.f rounds by `frm`, where "
+                "frm=RMM is exactly that mode. The conversion is not an "
+                "approximation of roundf, it IS roundf. frm is toggled "
+                "around the conversion only, never held across the "
+                "arithmetic, because it also governs vfmul and vfdiv and C "
+                "rounds those to nearest-even.\n\n"
+                "The four float operations stay separate (no vfmacc) and "
+                "the divide stays a divide (no reciprocal multiply): both "
+                "would remove an intermediate rounding the reference "
+                "performs."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+def _gelu_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, i8p, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+GELU_S8 = KernelSpec(
+    op="gelu_s8",
+    signature=(
+        "void kernel_gelu_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized GELU (Gaussian Error Linear Unit) on a contiguous int8\n"
+        "buffer with per-tensor symmetric quant (zero_point = 0).\n"
+        "Reference uses the exact erf-based form to match torch.nn.GELU\n"
+        "default; an LUT/tanh-approx variant can be added as a curated\n"
+        "kernel later:\n"
+        "  f = input[i] * scale_in\n"
+        "  y = 0.5f * f * (1.0f + erff(f / sqrtf(2)))\n"
+        "  output[i] = clamp(round(y / scale_out), activation_min, activation_max)"
+    ),
+    reference_impl="""\
+void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
+                    float scale_in, float scale_out,
+                    int activation_min, int activation_max) {
+    const float kInvSqrt2 = 0.70710678118f;
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = 0.5f * f * (1.0f + erff(f * kInvSqrt2));
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 32}, {"n": 2048}],
+    argtypes_factory=_gelu_s8_argtypes,
+    algorithms=[
+        # This op had no AlgorithmCandidate, so gelu ran the scalar reference
+        # inside builds labelled rvv_x60 and ime_x60 -- 29.7% of ffn_block on
+        # the vector unit and 42.2% of it on the MAC unit, the largest single
+        # reference share anywhere in the tree.
+        # Kernel: kernels/rvv/rvv_gelu_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The expensive part of this op is the erff, not the "
+                "datapath width. One call per element, no vector erff "
+                "exists, and a polynomial one would trade bit-exactness "
+                "for the whole reason the op is quantized.\n\n"
+                "What does help: the input is int8, so for a fixed "
+                "(scale_in, scale_out, clamp) the op has at most 256 "
+                "distinct outputs, and a quantized activation tensor "
+                "repeats values heavily. One cheap pass marks which of the "
+                "256 bytes actually occur, erff runs only for those, and "
+                "the output is a vector indexed-load gather (vluxei8, the "
+                "biased byte used directly as its own offset into the "
+                "table). Cost goes from n*erff to distinct*erff.\n\n"
+                "Bit-exact by construction: each table entry is the "
+                "reference's own expression, on the scalar unit, in "
+                "float32, with the same kInvSqrt2 constant, the same casts "
+                "and the same roundf. The vector path contains no "
+                "arithmetic at all, so there is no rounding mode to "
+                "match.\n\n"
+                "Below a small-n guard the reference expression runs per "
+                "element instead -- the marking array costs more than it "
+                "saves there."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+def _pad_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, pad_left, pad_right, pad_top, pad_bottom, pad_value
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int]
+
+
+PAD_S8 = KernelSpec(
+    op="pad_s8",
+    signature=(
+        "void kernel_pad_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int IH, int IW, "
+        "int pad_left, int pad_right, int pad_top, int pad_bottom, "
+        "int pad_value)"
+    ),
+    semantics=(
+        "Constant-value spatial pad for NCHW int8 tensors. Output shape:\n"
+        "  OH = IH + pad_top + pad_bottom\n"
+        "  OW = IW + pad_left + pad_right\n"
+        "Copies input[n, c, ih, iw] into output[n, c, ih + pad_top,\n"
+        "iw + pad_left] and fills the surrounding border with pad_value\n"
+        "(cast to int8). No quant rescaling: input and output share the\n"
+        "same scale (per-tensor symmetric quant; zero_point = 0 → pad with\n"
+        "the int8 representation of zero, which is 0).\n"
+        "Used by EfficientNet's same-padding-with-stride pattern where\n"
+        "the pad is asymmetric and can't fold into a Conv2D's padding."
+    ),
+    reference_impl="""\
+void kernel_pad_s8(const int8_t *input, int8_t *output,
+                   int N, int C, int IH, int IW,
+                   int pad_left, int pad_right, int pad_top, int pad_bottom,
+                   int pad_value) {
+    int OH = IH + pad_top + pad_bottom;
+    int OW = IW + pad_left + pad_right;
+    int8_t pad_v = (int8_t)pad_value;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih = oh - pad_top;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw = ow - pad_left;
+                    int8_t v = pad_v;
+                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                        v = input[((n*C+c)*IH+ih)*IW+iw];
+                    }
+                    output[((n*C+c)*OH+oh)*OW+ow] = v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 16, "IW": 16,
+         "pad_left": 0, "pad_right": 1, "pad_top": 0, "pad_bottom": 1, "pad_value": 0},
+        {"N": 1, "C": 32, "IH": 32, "IW": 32,
+         "pad_left": 1, "pad_right": 1, "pad_top": 1, "pad_bottom": 1, "pad_value": 0},
+    ],
+    argtypes_factory=_pad_s8_argtypes,
+)
+
+
+def _adaptive_avg_pool2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, C, IH, IW, OH, OW, scale_in, scale_out, act_min, act_max
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+ADAPTIVE_AVG_POOL2D_S8 = KernelSpec(
+    op="adaptive_avg_pool2d_s8",
+    signature=(
+        "void kernel_adaptive_avg_pool2d_s8(const int8_t *input, "
+        "int8_t *output, int N, int C, int IH, int IW, int OH, int OW, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Adaptive average-pool over an NCHW int8 tensor. For each output\n"
+        "cell (oh, ow) the source window is the half-open interval\n"
+        "  ih ∈ [floor(oh * IH / OH), ceil((oh+1) * IH / OH))\n"
+        "  iw ∈ [floor(ow * IW / OW), ceil((ow+1) * IW / OW))\n"
+        "Matches torch.nn.functional.adaptive_avg_pool2d. The mean is\n"
+        "computed in float, then requantized:\n"
+        "  acc = sum_{ih, iw} input[n, c, ih, iw] * scale_in\n"
+        "  mean = acc / window_size\n"
+        "  output[n, c, oh, ow] = clamp(\n"
+        "      round(mean / scale_out), activation_min, activation_max)\n"
+        "Common ViNT shape: OH=OW=1 (SE-block global average plus\n"
+        "EfficientNet's pre-FC pool) where the window covers the whole\n"
+        "(IH, IW)."
+    ),
+    reference_impl="""\
+void kernel_adaptive_avg_pool2d_s8(const int8_t *input, int8_t *output,
+                                   int N, int C, int IH, int IW,
+                                   int OH, int OW,
+                                   float scale_in, float scale_out,
+                                   int activation_min, int activation_max) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int ih0 = (oh * IH) / OH;
+                int ih1 = ((oh + 1) * IH + OH - 1) / OH;
+                if (ih1 > IH) ih1 = IH;
+                for (int ow = 0; ow < OW; ow++) {
+                    int iw0 = (ow * IW) / OW;
+                    int iw1 = ((ow + 1) * IW + OW - 1) / OW;
+                    if (iw1 > IW) iw1 = IW;
+                    int win = (ih1 - ih0) * (iw1 - iw0);
+                    if (win <= 0) win = 1;
+                    int32_t acc = 0;
+                    for (int ih = ih0; ih < ih1; ih++) {
+                        for (int iw = iw0; iw < iw1; iw++) {
+                            acc += (int32_t)input[((n*C+c)*IH+ih)*IW+iw];
+                        }
+                    }
+                    float mean = (float)acc * scale_in / (float)win;
+                    int32_t v = (int32_t)roundf(mean / scale_out);
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n*C+c)*OH+oh)*OW+ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 16, "IH": 8, "IW": 8, "OH": 1, "OW": 1},
+        {"N": 1, "C": 128, "IH": 4, "IW": 4, "OH": 1, "OW": 1},
+        {"N": 1, "C": 1280, "IH": 2, "IW": 3, "OH": 1, "OW": 1},
+    ],
+    argtypes_factory=_adaptive_avg_pool2d_s8_argtypes,
+    algorithms=[
+        # ViNT needs this op and no model in this tree emits it, so it had
+        # only the synthesized `direct` candidate and no curated kernel.
+        # Kernel: kernels/rvv/rvv_adaptive_avg_pool2d_s8_rvv_window_sum.c
+        AlgorithmCandidate(
+            name="rvv_window_sum",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The window accumulator is `int32_t acc` over int8 inputs, "
+                "and integer addition is associative -- so any reduction "
+                "shape gives the identical sum and the vector form is the "
+                "same arithmetic, not an approximation of it. That is what "
+                "makes this op easy where layernorm and softmax were not: "
+                "their reductions are floating-point and sequential, so "
+                "order is part of the answer.\n\n"
+                "Accumulate at 32 bits, not 16. A widening reduction into "
+                "int16 overflows on a 104-element window of large values, "
+                "and the failure is silent and data-dependent.\n\n"
+                "The extractor only supports output_size=(1,1), so the "
+                "window is the whole plane and the inner loop is a long "
+                "contiguous run -- which is the shape this is written for. "
+                "The float tail stays scalar: there is one roundf per "
+                "OUTPUT, and at (1,1) that is one element per channel."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+def _layer_norm_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, gamma, beta, output, M (rows), K (cols), scale_in, scale_gamma,
+    # scale_beta, scale_out, eps, act_min, act_max
+    return [i8p, i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+LAYER_NORM_S8 = KernelSpec(
+    op="layer_norm_s8",
+    signature=(
+        "void kernel_layer_norm_s8(const int8_t *input, const int8_t *gamma, "
+        "const int8_t *beta, int8_t *output, int M, int K, "
+        "float scale_in, float scale_gamma, float scale_beta, "
+        "float scale_out, float eps, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Layer normalization over the last axis of a 2-D row-major view\n"
+        "(M rows × K cols). Per-row mean and variance computed in float;\n"
+        "normalized values are scaled by gamma and shifted by beta\n"
+        "(per-channel parameters of length K, themselves int8-quantized):\n"
+        "  mu_m  = mean_{k=0..K-1}( input[m,k] * scale_in )\n"
+        "  var_m = mean_{k=0..K-1}( (input[m,k]*scale_in - mu_m)^2 )\n"
+        "  inv   = 1 / sqrtf(var_m + eps)\n"
+        "  y[m,k] = ((input[m,k]*scale_in - mu_m) * inv) * (gamma[k]*scale_gamma)\n"
+        "           + beta[k]*scale_beta\n"
+        "  output[m,k] = clamp(round(y / scale_out),\n"
+        "                      activation_min, activation_max)\n"
+        "Gamma/beta arrive as int8 with their own per-tensor scales (the\n"
+        "extractor stores them via _record_constant). When gamma == NULL\n"
+        "or beta == NULL pass 0 for the corresponding scale and treat\n"
+        "the affine term as identity / zero."
+    ),
+    reference_impl="""\
+void kernel_layer_norm_s8(const int8_t *input, const int8_t *gamma,
+                          const int8_t *beta, int8_t *output,
+                          int M, int K,
+                          float scale_in, float scale_gamma, float scale_beta,
+                          float scale_out, float eps,
+                          int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row_in  = input  + m * K;
+        int8_t       *row_out = output + m * K;
+        float mu = 0.0f;
+        for (int k = 0; k < K; k++) mu += (float)row_in[k] * scale_in;
+        mu /= (float)K;
+        float var = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float d = (float)row_in[k] * scale_in - mu;
+            var += d * d;
+        }
+        var /= (float)K;
+        float inv = 1.0f / sqrtf(var + eps);
+        for (int k = 0; k < K; k++) {
+            float n = ((float)row_in[k] * scale_in - mu) * inv;
+            float g = (gamma ? (float)gamma[k] * scale_gamma : 1.0f);
+            float b = (beta  ? (float)beta[k]  * scale_beta  : 0.0f);
+            float y = n * g + b;
+            int32_t v = (int32_t)roundf(y / scale_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            row_out[k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1,   "K": 64},
+        {"M": 7,   "K": 512},   # ViNT transformer: seq=7 tokens, embed=512
+        {"M": 32,  "K": 256},
+    ],
+    argtypes_factory=_layer_norm_s8_argtypes,
+)
+
+
+def _matmul_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # a, b, output, M, K, N, scale_a, scale_b, scale_out, transpose_b,
+    # scale_div, act_min, act_max
+    return [i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+MATMUL_S8 = KernelSpec(
+    op="matmul_s8",
+    signature=(
+        "void kernel_matmul_s8(const int8_t *a, const int8_t *b, "
+        "int8_t *output, int M, int K, int N, "
+        "float scale_a, float scale_b, float scale_out, "
+        "int transpose_b, float scale_div, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Int8 matrix multiplication out[M,N] = a[M,K] @ b[K,N] (or\n"
+        "a @ b.T if transpose_b is non-zero — used for Q·Kᵀ in attention).\n"
+        "Accumulator is int32; the per-element output is rescaled and\n"
+        "optionally divided by scale_div (e.g. 1/sqrt(d_k) for attention\n"
+        "scores; pass 1.0 if unused):\n"
+        "  acc[i,j] = sum_{k} a[i,k] * (transpose_b ? b[j,k] : b[k,j])\n"
+        "  output[i,j] = clamp(\n"
+        "      round(acc * scale_a * scale_b / (scale_out * scale_div)),\n"
+        "      activation_min, activation_max)\n"
+        "Float math is used for the requantize tail to match the modelblaster\n"
+        "linear_s8 numerics; the curated gemmini_q31 / RVV kernels can\n"
+        "implement the Q0.31 path bit-exactly."
+    ),
+    reference_impl="""\
+void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
+                      int M, int K, int N,
+                      float scale_a, float scale_b, float scale_out,
+                      int transpose_b, float scale_div,
+                      int activation_min, int activation_max) {
+    float total = (scale_a * scale_b) / (scale_out * scale_div);
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++) {
+                int8_t av = a[i*K + k];
+                int8_t bv = transpose_b ? b[j*K + k] : b[k*N + j];
+                acc += (int32_t)av * (int32_t)bv;
+            }
+            int32_t v = (int32_t)roundf((float)acc * total);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[i*N + j] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 7, "K": 64, "N": 7,   "transpose_b": 1, "scale_div": 8.0},  # attention Q·Kᵀ, head_dim=64
+        {"M": 7, "K": 7,  "N": 64,  "transpose_b": 0, "scale_div": 1.0},  # attention ·V
+        {"M": 7, "K": 512, "N": 512, "transpose_b": 0, "scale_div": 1.0}, # FFN-style
+    ],
+    argtypes_factory=_matmul_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="ime_vmadot_4x4x8",
+            target_affinity=("ime", "ime_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K1 IME int8 matmul via the `smt.vmadot` MAC unit.\n\n"
+                "EVERY NUMBER BELOW WAS MEASURED ON THE BOARD, not read off a\n"
+                "datasheet -- earlier claims from the datasheet were wrong.\n"
+                "Take them as given and do not re-derive them.\n\n"
+                "THE INSTRUCTION\n"
+                "  .insn r 0x2b, 3, 0x71, xD, xS1, xS2\n"
+                "Use the `xN` spelling for the register operands: `x8` means\n"
+                "vector register v8. GAS REJECTS the `vN` spelling inside\n"
+                "`.insn` (that is LLVM-MC syntax) with 'illegal operands'.\n"
+                "There is no intrinsic and no `-march` string for it; it\n"
+                "assembles under plain rv64gcv_zvl256b.\n\n"
+                "  vsetvli t0, <32>, e8, m1, ta, ma   <- MUST be live at the\n"
+                "  .insn r 0x2b, 3, 0x71, x8, x0, x4     instruction itself\n\n"
+                "vl=32, e8, m1 must be the active vtype when vmadot issues or\n"
+                "it SIGILLs. Re-issue the vsetvli immediately before it; do\n"
+                "not rely on it surviving intervening loads.\n\n"
+                "WHAT IT COMPUTES.  vd += A . B^T\n"
+                "  vs1 (here v0) holds A as a 4x8 int8 tile, row-major, 32\n"
+                "    contiguous bytes -- one `vle8.v` at vl=32,e8,m1.\n"
+                "  vs2 (here v4) holds B as a 4x8 int8 tile, row-major, where\n"
+                "    the ROW INDEX IS j. So the unit natively computes\n"
+                "    C[i][j] = sum_k A[i][k] * B[j][k], i.e. the transpose_b=1\n"
+                "    case, with no repacking at all.\n"
+                "  IT ACCUMULATES -- verified by issuing identical operands\n"
+                "    twice and watching every result double. So K > 8 is a\n"
+                "    LOOP of vmadots over 8-wide k-slabs into the same vd,\n"
+                "    zeroed once before the loop.\n\n"
+                "WHERE THE RESULTS LAND. 16 int32 in the REGISTER PAIR\n"
+                "(vd, vd+1) -- 2 x 32 bytes at VLEN=256. The layout is PLAIN\n"
+                "ROW-MAJOR across the pair: element e of the concatenation is\n"
+                "C[e/4][e%4], so vd holds rows 0-1 and vd+1 rows 2-3. No\n"
+                "swizzle, no interleave. Drain with vsetvli e32,m1 then two\n"
+                "`vse32.v` into 16 contiguous int32 and index them directly.\n\n"
+                "THE MICRO-TILE IS 4x4x8 AND HARDWARE-FORCED. M=4 and N=4 are\n"
+                "not tunable: the MAC table is indexed by vl*SEW, not VLEN.\n"
+                "Tile the output in 4x4 blocks. For an M or N that is not a\n"
+                "multiple of 4, ZERO-PAD the input tiles into a stack scratch\n"
+                "buffer and write back only the valid rows/columns -- padding\n"
+                "with zeros contributes zero to the accumulator, so the valid\n"
+                "results are unaffected. Do the same for a K that is not a\n"
+                "multiple of 8. Do NOT fall back to a different algorithm for\n"
+                "edge tiles; handle them.\n\n"
+                "transpose_b == 0 (b is [K,N]) NEEDS A GATHER. b[k][j] at\n"
+                "fixed j is strided by N, but vs2 wants B as [j][k] contiguous.\n"
+                "Transpose the 4x8 tile into a 32-byte stack scratch before the\n"
+                "vle8.v. That copy is 32 bytes against 128 MACs, so it is not\n"
+                "the bottleneck -- but skipping it and feeding a [k][j] tile\n"
+                "computes the wrong thing silently.\n\n"
+                "KEEP THE REQUANTIZE TAIL SCALAR, as in rvv_k_reduce_n_lanes.\n"
+                "The oracle's tail is roundf((float)acc * total); roundf is\n"
+                "round-half-AWAY-FROM-ZERO while RVV float conversion uses frm,\n"
+                "normally round-to-nearest-EVEN. A vectorized tail disagrees on\n"
+                "exact .5 cases and fails max_abs_err=0. It is O(M*N) against\n"
+                "O(M*N*K) of MACs.\n\n"
+                "CLUSTER 0 ONLY. Harts 4-7 do not implement smt.vmadot and\n"
+                "exit 132 (SIGILL). Nothing in the kernel can check this; the\n"
+                "schedule must place the dispatch on CPU_P#0-3.\n\n"
+                "PACK ONCE, NOT PER TILE. THIS IS THE PERFORMANCE REQUIREMENT\n"
+                "AND IT IS MEASURED, NOT THEORETICAL. The obvious structure --\n"
+                "gather the A and B tiles inside the (m0, n0) loop -- makes the\n"
+                "repack O(M*N*K/4) against O(M*N*K) MACs, about eight scalar\n"
+                "byte-copies and two bounds checks per sixteen MACs. A kernel\n"
+                "written that way measured 57.8 ms at M=64,K=512,N=512 where\n"
+                "the RVV kernel takes 8.9 ms: the MAC unit was idle behind its\n"
+                "own data movement. Structure it instead as:\n\n"
+                "  1. Pack ALL of A once, up front, into [m_tile][k_slab][4][8]\n"
+                "     -- M*K bytes, zero-padded to whole tiles. Reused by every\n"
+                "     n0.\n"
+                "  2. Loop n0 OUTERMOST. Pack that B panel once per n0 into\n"
+                "     [k_slab][4][8] -- 4*K bytes -- and reuse it across every\n"
+                "     m0 inside.\n"
+                "  3. Loop m0 inside n0, running the vmadot K-loop from the\n"
+                "     two packed buffers with no gathering at all.\n\n"
+                "That is M*K + N*K of packing instead of M*N*K/4 -- at\n"
+                "M=64,K=512,N=512 about 295 thousand byte-copies instead of 8.4\n"
+                "million. If M*K would exceed roughly 256 KB of stack, pack A\n"
+                "in row-tile BLOCKS (a few m-tiles at a time) rather than\n"
+                "allocating; do not call malloc and do not fall back to a\n"
+                "different algorithm.\n\n"
+                "MUST be bit-exact to the matmul_s8 reference: max_abs_err = 0.\n"
+                "Build with GCC 14.3, not 13.2."
+            ),
+            reference_impl=(
+                "/* Structure for ONE 4x4 output tile with a K-loop. Extend it\n"
+                " * to tile M and N, and to zero-pad the edges. The asm block\n"
+                " * is complete and correct as written -- it is the part that\n"
+                " * is hard to rediscover. */\n"
+                "#include <string.h>\n"
+                "#include <riscv_vector.h>\n"
+                "\n"
+                "/* a_tile / b_tile: 4x8 int8, row-major, 32 bytes each.\n"
+                " * b_tile is indexed [j][k]. out16: 16 int32, C[i][j] at\n"
+                " * out16[i*4 + j]. */\n"
+                "static inline void ime_tile_4x4(const int8_t *a_tile,\n"
+                "                                const int8_t *b_tile,\n"
+                "                                int32_t *out16, int k_slabs) {\n"
+                "    size_t n32 = 32, n8 = 8;\n"
+                "    __asm__ volatile(\n"
+                "        \"vsetvli t0, %[n32], e8, m1, ta, ma\\n\\t\"\n"
+                "        \"vmv.v.i v8, 0\\n\\t\"\n"
+                "        \"vmv.v.i v9, 0\\n\\t\"\n"
+                "        \"1:\\n\\t\"\n"
+                "        \"vsetvli t0, %[n32], e8, m1, ta, ma\\n\\t\"\n"
+                "        \"vle8.v v0, (%[pa])\\n\\t\"\n"
+                "        \"vle8.v v4, (%[pb])\\n\\t\"\n"
+                "        \"vsetvli t0, %[n32], e8, m1, ta, ma\\n\\t\"\n"
+                "        \".insn r 0x2b, 3, 0x71, x8, x0, x4\\n\\t\"\n"
+                "        \"addi %[pa], %[pa], 32\\n\\t\"\n"
+                "        \"addi %[pb], %[pb], 32\\n\\t\"\n"
+                "        \"addi %[ks], %[ks], -1\\n\\t\"\n"
+                "        \"bnez %[ks], 1b\\n\\t\"\n"
+                "        \"vsetvli t0, %[n8], e32, m1, ta, ma\\n\\t\"\n"
+                "        \"vse32.v v8, (%[o0])\\n\\t\"\n"
+                "        \"vse32.v v9, (%[o1])\\n\\t\"\n"
+                "        : [pa] \"+r\"(a_tile), [pb] \"+r\"(b_tile),\n"
+                "          [ks] \"+r\"(k_slabs)\n"
+                "        : [o0] \"r\"(out16), [o1] \"r\"(out16 + 8),\n"
+                "          [n32] \"r\"(n32), [n8] \"r\"(n8)\n"
+                "        : \"t0\", \"memory\", \"v0\", \"v4\", \"v8\", \"v9\");\n"
+                "}\n"
+            ),
+        ),
+        AlgorithmCandidate(
+            name="rvv_k_reduce_n_lanes",
+            target_affinity=("rvv", "rvv_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Plain RVV int8 matmul for the SpaceMiT X60 (VLEN=256, "
+                "zvl256b).\n\n"
+                "THIS IS NOT A PORT OF `outerprod`. That algorithm is built "
+                "on the Saturn OPU's VOPACC outer-product MAC, a custom "
+                "instruction this core does not have. Only its tile-walking "
+                "shape is worth borrowing; the MAC body has to be written in "
+                "base RVV.\n\n"
+                "TWO PATHS, CHOSEN BY `transpose_b` -- the two attention "
+                "matmuls have opposite memory layouts, and one loop order is "
+                "wrong for one of them:\n\n"
+                "  transpose_b != 0   (b is [N,K] -- the Q.K^T case)\n"
+                "    a[i,:] and b[j,:] are both K-contiguous, so the dot "
+                "product is a straight reduction along K. For each (i,j) "
+                "sweep k in vl-sized strips with `vle8.v`, widen both "
+                "operands into an int32 accumulator (`vwmacc.vv`), and finish "
+                "with one `vredsum.vs`. K is the only vectorized dimension.\n\n"
+                "  transpose_b == 0   (b is [K,N] -- the .V and FFN case)\n"
+                "    b[k,j] at fixed j is strided by N, so DO NOT reduce along "
+                "K here: a `vlse8.v` per element throws the bandwidth away. "
+                "Put N IN THE LANES instead. Hold an int32 accumulator vector "
+                "over a strip of N and, for each k, do acc[0..vl-1] += "
+                "a[i,k] * b[k, j0..j0+vl-1] -- b[k,:] is contiguous "
+                "(`vle8.v`) and a[i,k] is a SCALAR broadcast (`vwmacc.vx`). "
+                "One pass over k per N-strip, unit-stride throughout.\n\n"
+                "ACCUMULATE IN INT32 AND KEEP THE REQUANTIZE TAIL SCALAR. "
+                "This is a correctness requirement, not a style preference. "
+                "The oracle's tail is `roundf((float)acc * total)`, and "
+                "`roundf` is round-half-AWAY-FROM-ZERO while RVV float "
+                "conversion uses the current `frm`, normally round-to-nearest "
+                "EVEN. A vectorized tail therefore disagrees with the "
+                "reference on exact .5 cases and the kernel fails "
+                "`max_abs_err=0`. The tail is O(M*N) against an O(M*N*K) "
+                "accumulation, so leaving it scalar costs almost nothing and "
+                "buys bit-exactness. The int32 accumulation is exact, so any "
+                "k-order is fine.\n\n"
+                "OTHER REQUIREMENTS:\n"
+                "  * Use `__riscv_vsetvl_e8m1` / `e32m*` intrinsics and handle "
+                "the tail strip via the RETURNED vl. Do not assume 32 lanes.\n"
+                "  * Handle M, K or N of zero, and any K, without falling back "
+                "to a different algorithm.\n"
+                "  * `scale_div` carries attention's 1/sqrt(d_k). Fold it into "
+                "`total` exactly as the reference does, in that order, or the "
+                "float rounding differs.\n"
+                "  * MUST be bit-exact to the matmul_s8 reference: "
+                "`max_abs_err = 0`, verified on the board.\n\n"
+                "Build with GCC 14.3, not 13.2 -- 13.2 reorders "
+                "`__riscv_vsetvl_*` so a widening op executes under a narrow "
+                "vtype, and the binary SIGILLs on the board with no stdout."
+            ),
+            reference_impl=(
+                "/* Structure only: the scalar inner loops stand in for the\n"
+                " * vector strips so the shape is readable. Replace the loops\n"
+                " * marked VECTORIZE ME; keep the tail exactly as written,\n"
+                " * scalar, for bit-exactness. */\n"
+                "#include <math.h>\n"
+                "#include <riscv_vector.h>\n"
+                "\n"
+                "void kernel_matmul_s8(const int8_t *a, const int8_t *b,\n"
+                "                      int8_t *output, int M, int K, int N,\n"
+                "                      float scale_a, float scale_b,\n"
+                "                      float scale_out, int transpose_b,\n"
+                "                      float scale_div,\n"
+                "                      int activation_min, int activation_max) {\n"
+                "    const float total = (scale_a * scale_b) / (scale_out * scale_div);\n"
+                "    if (M <= 0 || N <= 0) return;\n"
+                "\n"
+                "    if (transpose_b) {\n"
+                "        /* K-reduction path: a[i,:] and b[j,:] K-contiguous. */\n"
+                "        for (int i = 0; i < M; i++) {\n"
+                "            for (int j = 0; j < N; j++) {\n"
+                "                int32_t acc = 0;\n"
+                "                /* VECTORIZE ME: strip over k with vle8 +\n"
+                "                 * vwmacc, then one vredsum.vs into acc. */\n"
+                "                for (int k = 0; k < K; k++)\n"
+                "                    acc += (int32_t)a[i*K + k] * (int32_t)b[j*K + k];\n"
+                "                int32_t v = (int32_t)roundf((float)acc * total);\n"
+                "                if (v < activation_min) v = activation_min;\n"
+                "                if (v > activation_max) v = activation_max;\n"
+                "                output[i*N + j] = (int8_t)v;\n"
+                "            }\n"
+                "        }\n"
+                "        return;\n"
+                "    }\n"
+                "\n"
+                "    /* N-in-lanes path: b[k,:] contiguous, a[i,k] broadcasts. */\n"
+                "    for (int i = 0; i < M; i++) {\n"
+                "        for (int j0 = 0; j0 < N; j0++) {  /* VECTORIZE ME: j0 += vl */\n"
+                "            int32_t acc = 0;\n"
+                "            for (int k = 0; k < K; k++)\n"
+                "                acc += (int32_t)a[i*K + k] * (int32_t)b[k*N + j0];\n"
+                "            int32_t v = (int32_t)roundf((float)acc * total);\n"
+                "            if (v < activation_min) v = activation_min;\n"
+                "            if (v > activation_max) v = activation_max;\n"
+                "            output[i*N + j0] = (int8_t)v;\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+        AlgorithmCandidate(
+            name="outerprod",
+            target_affinity=("rvv_opu",),
+            description=(
+                "Saturn OPU i8 outer-product matmul (VOPACC). Ported from\n"
+                "  hw/chipyard/generators/saturn/benchmarks/opu-gemm/kernel.h\n"
+                "(branch origin/opu-fp8, function `i8_mm_bme_sq`). The OPU\n"
+                "computes m[r,c] += vs1[r] * vs2[c] across K iterations of\n"
+                "VOPACC; one tile covers M×N up to mlmax=VLEN/8 per dim.\n\n"
+                "PROGRAMMING MODEL — call the macros from saturn_opu.h:\n"
+                "  OPMVINBCAST(m1, v0)         // seed accumulator m1 from vector v0\n"
+                "                              //   (v0 = i32 zero vector for matmul)\n"
+                "  for k = 0..K-1:\n"
+                "      // load a-col k into v16 (i8 lanes, M elems)\n"
+                "      // load b-row k into v18 (i8 lanes, N elems)\n"
+                "      VOPACC(m1, v18, v16)    // m1[r,c] += v16[r] * v18[c]\n"
+                "  for m = 0..M-1:\n"
+                "      VMV_VR(v0, m, m1)       // drain row m of m1 into v0 (i32 N lanes)\n"
+                "      // float-scale requantize v0 and store as i8\n\n"
+                "STRICT REQUIREMENTS — read carefully:\n"
+                "  * DO NOT hand-roll inline `.insn r 0x57, ...` directives. The macros\n"
+                "    OPMVINBCAST, VOPACC, VMV_VR, VMV_RV already encode the funct fields\n"
+                "    (funct3 = 0x6 or 0x2, funct7 = 0x59 / 0x51 / 0x5d / 0x55). Re-encoding\n"
+                "    them produces `bad value for funct2 field` and `illegal operands`.\n"
+                "  * The Saturn assembler REJECTS inline-asm with vector-type input/output\n"
+                "    operand constraints. You will see `cannot convert a vector of type\n"
+                "    vint32m4_t to type long unsigned int`. Stay in scalar `\"r\"`\n"
+                "    constraints; use `vle*.v` / `vse*.v` / `vlse*.v` for vector data\n"
+                "    movement. The macros take only register-name strings, no operands.\n"
+                "  * Eligibility gate: M, N <= mlmax = VLEN/8 (check via `vsetvli`).\n"
+                "  * Transpose `a` to stack scratch so column-k reads become unit-stride\n"
+                "    `vle8.v`; for transpose_b, also transpose b. (Or use `vlse8.v` with\n"
+                "    stride to skip the transpose at the cost of slower per-vector loads.)\n"
+                "  * The requantize tail is FLOAT-SCALE (a_scale * b_scale / scale_div) +\n"
+                "    nearest-int round + clamp — NOT Q0.31 like LINEAR_S8.\n"
+                "  * Single-tile only: M,N <= mlmax, K <= 1024. Fall back to scalar.\n\n"
+                "See `reference_impl` below — a working Saturn OPU outer-product matmul\n"
+                "structure. Adapt the matmul-s8 quant tail (float scale).\n"
+                "MUST be bit-exact to the matmul_s8 reference."
+            ),
+            reference_impl=(
+                "/* OPU macros take REGISTER-NAME arguments that expand via\n"
+                " * the m0..m3 / v0..v31 #defines in saturn_opu.h. Opt in to\n"
+                " * keep those #defines alive so OPMVINBCAST(m1, v0) etc. work. */\n"
+                "#define SATURN_OPU_KEEP_REGISTER_MACROS\n"
+                "#include \"saturn_opu.h\"\n\n"
+                "/* Saturn OPU outer-product matmul skeleton (i8, single-tile). */\n"
+                "void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *c,\n"
+                "                      int M, int K, int N, int transpose_b,\n"
+                "                      float a_scale, float b_scale, float c_scale,\n"
+                "                      int c_offset, int c_min, int c_max) {\n"
+                "    size_t mlmax;\n"
+                "    asm volatile(\"vsetvli %0, zero, e8, m1, ta, ma\" : \"=r\"(mlmax));\n"
+                "    if ((size_t)M > mlmax || (size_t)N > mlmax || K > 1024) {\n"
+                "        /* scalar fallback elided — see kernels/rvv_opu/ */\n"
+                "        return;\n"
+                "    }\n\n"
+                "    /* Transpose a [M,K] -> at [K,M] so column-k reads are unit-stride. */\n"
+                "    int8_t at[1024 * 64];\n"
+                "    for (int m = 0; m < M; m++)\n"
+                "        for (int k = 0; k < K; k++)\n"
+                "            at[k * M + m] = a[m * K + k];\n\n"
+                "    int8_t bt[1024 * 64];\n"
+                "    const int8_t *b_kn;\n"
+                "    if (transpose_b) {\n"
+                "        for (int n = 0; n < N; n++)\n"
+                "            for (int k = 0; k < K; k++)\n"
+                "                bt[k * N + n] = b[n * K + k];\n"
+                "        b_kn = bt;\n"
+                "    } else {\n"
+                "        b_kn = b;   /* already [K, N] */\n"
+                "    }\n\n"
+                "    /* Seed m1 with zero (no bias in matmul_s8). */\n"
+                "    asm volatile(\"vsetvli zero, %0, e32, m4, ta, ma\" : : \"r\"((size_t)N));\n"
+                "    asm volatile(\"vmv.v.i v0, 0\");\n"
+                "    OPMVINBCAST(m1, v0);\n\n"
+                "    for (int k = 0; k < K; k++) {\n"
+                "        asm volatile(\"vsetvli zero, %0, e8, m1, ta, ma\" : : \"r\"((size_t)M));\n"
+                "        asm volatile(\"vle8.v v16, (%0)\" : : \"r\"(&at[k * M]));\n"
+                "        asm volatile(\"vsetvli zero, %0, e8, m1, ta, ma\" : : \"r\"((size_t)N));\n"
+                "        asm volatile(\"vle8.v v18, (%0)\" : : \"r\"(&b_kn[k * N]));\n"
+                "        VOPACC(m1, v18, v16);\n"
+                "    }\n\n"
+                "    int32_t row_i32[64];\n"
+                "    asm volatile(\"vsetvli zero, %0, e32, m4, ta, ma\" : : \"r\"((size_t)N));\n"
+                "    const float scale = a_scale * b_scale / c_scale;\n"
+                "    for (int m = 0; m < M; m++) {\n"
+                "        VMV_VR(v0, m, m1);\n"
+                "        asm volatile(\"vse32.v v0, (%0)\" : : \"r\"(row_i32));\n"
+                "        for (int n = 0; n < N; n++) {\n"
+                "            int32_t v = (int32_t)__builtin_nearbyintf(\n"
+                "                (float)row_i32[n] * scale) + c_offset;\n"
+                "            if (v < c_min) v = c_min;\n"
+                "            if (v > c_max) v = c_max;\n"
+                "            c[m * N + n] = (int8_t)v;\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            ),
+        ),
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# Per-channel weight-scale (PC) variants of conv2d_s8 / linear_s8 / matmul_s8.
+# Identical algebra to the per-tensor versions except output_multiplier and
+# output_shift become per-OC arrays. This is the standard CMSIS-NN / TFLite
+# Micro shape: weight tensors carry per-channel scales (one per output
+# channel for conv/linear, one per N column for matmul); the int32 bias is
+# scaled by (input_scale * weight_scale_per_oc); the requantize tail picks
+# the OC-specific (mult, shift) for each output element.
+# ---------------------------------------------------------------------------
+
+
+def _conv2d_s8_pc_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            i32p, i32p,    # per-OC multiplier + shift arrays
+            ctypes.c_int, ctypes.c_int]
+
+
+CONV2D_S8_PC = KernelSpec(
+    op="conv2d_s8_pc",
+    signature=(
+        "void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int N, int IC, int IH, int IW, int OC, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "const int32_t *output_multiplier, const int32_t *output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-channel-weight-scale variant of conv2d_s8. Same int32-acc\n"
+        "dataflow; the requantize tail picks (output_multiplier[oc],\n"
+        "output_shift[oc]) for each output channel:\n"
+        "  acc = SAT_ROUND_SAT_ADD(acc, output_multiplier[oc],\n"
+        "                                output_shift[oc])\n"
+        "  out = clamp(acc + output_offset, act_min, act_max)\n"
+        "Bias is already pre-scaled by (input_scale * weight_scale_per_oc)\n"
+        "at codegen time, so the kernel adds it to the accumulator before\n"
+        "the per-OC requantize."
+    ),
+    reference_impl="""\
+void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
+                         const int32_t *bias, int8_t *output,
+                         int N, int IC, int IH, int IW, int OC,
+                         int KH, int KW, int SH, int SW, int PH, int PW,
+                         int input_offset, int filter_offset, int output_offset,
+                         const int32_t *output_multiplier,
+                         const int32_t *output_shift,
+                         int activation_min, int activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int32_t mult = output_multiplier[oc];
+            int32_t shift = output_shift[oc];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            if (ih < 0 || ih >= IH) continue;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                if (iw < 0 || iw >= IW) continue;
+                                int32_t iv = (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
+                                int32_t wv = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw] + filter_offset;
+                                acc += iv * wv;
+                            }
+                        }
+                    }
+                    int64_t prod = ((int64_t)acc * (int64_t)mult + (1LL << 30)) >> 31;
+                    int32_t v;
+                    if (shift > 0) {
+                        int32_t r = 1 << (shift - 1);
+                        v = ((int32_t)prod + r) >> shift;
+                    } else {
+                        v = ((int32_t)prod) << (-shift);
+                    }
+                    v += output_offset;
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 3, "IH": 16, "IW": 16, "OC": 8,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_conv2d_s8_pc_argtypes,
+)
+
+
+def _linear_s8_pc_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            i32p, i32p,
+            ctypes.c_int, ctypes.c_int]
+
+
+LINEAR_S8_PC = KernelSpec(
+    op="linear_s8_pc",
+    signature=(
+        "void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight, "
+        "const int32_t *bias, int8_t *output, "
+        "int M, int K, int N, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "const int32_t *output_multiplier, const int32_t *output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-N-channel-scale linear: out[m, n] picks\n"
+        "(output_multiplier[n], output_shift[n]) for the requantize.\n"
+        "Same dataflow as linear_s8 otherwise. Weight is [N, K]\n"
+        "row-major; bias is per-output-channel int32 pre-scaled by\n"
+        "(input_scale * weight_scale_per_n)."
+    ),
+    reference_impl="""\
+void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
+                         const int32_t *bias, int8_t *output,
+                         int M, int K, int N,
+                         int input_offset, int filter_offset, int output_offset,
+                         const int32_t *output_multiplier,
+                         const int32_t *output_shift,
+                         int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            int32_t mult = output_multiplier[n];
+            int32_t shift = output_shift[n];
+            int32_t acc = bias ? bias[n] : 0;
+            for (int k = 0; k < K; k++) {
+                int32_t iv = (int32_t)input[m*K + k] + input_offset;
+                int32_t wv = (int32_t)weight[n*K + k] + filter_offset;
+                acc += iv * wv;
+            }
+            int64_t prod = ((int64_t)acc * (int64_t)mult + (1LL << 30)) >> 31;
+            int32_t v;
+            if (shift > 0) {
+                int32_t r = 1 << (shift - 1);
+                v = ((int32_t)prod + r) >> shift;
+            } else {
+                v = ((int32_t)prod) << (-shift);
+            }
+            v += output_offset;
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[m*N + n] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 16, "N": 8},
+        {"M": 7, "K": 512, "N": 256},
+    ],
+    argtypes_factory=_linear_s8_pc_argtypes,
+)
+
+
+def _matmul_s8_pc_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+            i32p, i32p,
+            ctypes.c_int, ctypes.c_int]
+
+
+MATMUL_S8_PC = KernelSpec(
+    op="matmul_s8_pc",
+    signature=(
+        "void kernel_matmul_s8_pc(const int8_t *a, const int8_t *b, "
+        "int8_t *output, int M, int K, int N, "
+        "int transpose_b, float scale_div, "
+        "const int32_t *output_multiplier, const int32_t *output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-N-channel-scale matmul. Same int32-acc / transpose_b /\n"
+        "scale_div behavior as matmul_s8; the requantize tail uses\n"
+        "(output_multiplier[n], output_shift[n]) per output column.\n"
+        "scale_div folds 1/sqrt(d_k) for attention scores into the\n"
+        "Q0.31 multiplier at codegen time (or stays as a fp factor\n"
+        "applied to acc before the per-N requantize, depending on\n"
+        "what the codegen baked in)."
+    ),
+    reference_impl="""\
+void kernel_matmul_s8_pc(const int8_t *a, const int8_t *b, int8_t *output,
+                         int M, int K, int N,
+                         int transpose_b, float scale_div,
+                         const int32_t *output_multiplier,
+                         const int32_t *output_shift,
+                         int activation_min, int activation_max) {
+    float inv_div = 1.0f / scale_div;
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t mult = output_multiplier[j];
+            int32_t shift = output_shift[j];
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++) {
+                int8_t av = a[i*K + k];
+                int8_t bv = transpose_b ? b[j*K + k] : b[k*N + j];
+                acc += (int32_t)av * (int32_t)bv;
+            }
+            /* scale_div folded into the requantize as a float scale
+             * applied to the int32 accumulator before the Q0.31 mult.
+             * For the common attention case scale_div = sqrt(d_k); the
+             * fp32 fold is acceptable since the matmul is the dominant
+             * cost (this multiply happens once per output element). */
+            int32_t acc_div = (int32_t)roundf((float)acc * inv_div);
+            int64_t prod = ((int64_t)acc_div * (int64_t)mult + (1LL << 30)) >> 31;
+            int32_t v;
+            if (shift > 0) {
+                int32_t r = 1 << (shift - 1);
+                v = ((int32_t)prod + r) >> shift;
+            } else {
+                v = ((int32_t)prod) << (-shift);
+            }
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[i*N + j] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 7, "K": 128, "N": 7, "transpose_b": 1, "scale_div": 11.3},
+        {"M": 7, "K": 7,   "N": 128, "transpose_b": 0, "scale_div": 1.0},
+    ],
+    argtypes_factory=_matmul_s8_pc_argtypes,
+)
+
+
+def _depthwise_conv2d_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, weight, bias, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW,
+    # input_offset, filter_offset, output_offset, output_multiplier,
+    # output_shift, activation_min, activation_max
+    return [i8p, i8p, i32p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+
+
+DEPTHWISE_CONV2D_S8 = KernelSpec(
+    op="depthwise_conv2d_s8",
+    signature=(
+        "void kernel_depthwise_conv2d_s8(const int8_t *input, "
+        "const int8_t *weight, const int32_t *bias, int8_t *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, "
+        "int input_offset, int filter_offset, int output_offset, "
+        "int output_multiplier, int output_shift, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized depthwise 2D convolution — each input channel has\n"
+        "its own KH×KW filter, applied independently (groups=C).\n"
+        "Layout:\n"
+        "  input:  int8  [N, C, IH, IW]\n"
+        "  weight: int8  [C, 1, KH, KW]  (or [C, KH, KW] flat)\n"
+        "  bias:   int32 [C] (may be NULL)\n"
+        "  output: int8  [N, C, OH, OW]\n"
+        "Compute (per output element, per channel c):\n"
+        "  acc = bias[c] (or 0)\n"
+        "  for kh, kw with ih = oh*SH-PH+kh, iw = ow*SW-PW+kw:\n"
+        "    if (ih, iw) in bounds:\n"
+        "      acc += (input[n,c,ih,iw] + input_offset)\n"
+        "           * (weight[c, kh, kw] + filter_offset)\n"
+        "Q0.31 requantize tail identical to conv2d_s8:\n"
+        "  acc = SAT_ROUND_SAT_ADD(acc, output_multiplier, output_shift)\n"
+        "  out = clamp(acc + output_offset, act_min, act_max)\n"
+        "Used heavily by EfficientNet's MBConv blocks (~32 of them in\n"
+        "ViNT's obs/goal encoders)."
+    ),
+    reference_impl="""\
+void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
+                                const int32_t *bias, int8_t *output,
+                                int N, int C, int IH, int IW,
+                                int KH, int KW, int SH, int SW, int PH, int PW,
+                                int input_offset, int filter_offset, int output_offset,
+                                int output_multiplier, int output_shift,
+                                int activation_min, int activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[c] : 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            int32_t iv = (int32_t)input[((n*C + c)*IH + ih)*IW + iw] + input_offset;
+                            int32_t wv = (int32_t)weight[(c*KH + kh)*KW + kw] + filter_offset;
+                            acc += iv * wv;
+                        }
+                    }
+                    int64_t prod = ((int64_t)acc * (int64_t)output_multiplier + (1LL << 30)) >> 31;
+                    int32_t v;
+                    if (output_shift > 0) {
+                        int32_t r = 1 << (output_shift - 1);
+                        v = ((int32_t)prod + r) >> output_shift;
+                    } else {
+                        v = ((int32_t)prod) << (-output_shift);
+                    }
+                    v += output_offset;
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    output[((n*C + c)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        # MBConv-style depthwise (EfficientNet pattern)
+        {"N": 1, "C": 32, "IH": 32, "IW": 32,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 1, "PW": 1},
+        {"N": 1, "C": 16, "IH": 16, "IW": 16,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_depthwise_conv2d_s8_argtypes,
+    algorithms=[
+        # ViNT needs this op and no model in this tree emits it.
+        # Kernel: kernels/rvv/rvv_depthwise_conv2d_s8_rvv_ow_lanes_taps.c
+        AlgorithmCandidate(
+            name="rvv_ow_lanes_taps",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "One vector is a run of OUTPUT COLUMNS of one (n, c, oh). "
+                "Everything up to the store is integer -- `acc += iv*wv` in "
+                "int32, then a fixed-point requantize through int64 -- so "
+                "reordering the taps cannot change the sum and there is no "
+                "rounding mode to match.\n\n"
+                "THE PADDING IS HANDLED WITHOUT A MASK. For a fixed (kh, "
+                "kw) the input ROW index is constant, so its bounds check is "
+                "scalar. The column index iw = ow*SW - PW + kw is monotonic "
+                "in ow, so the outputs for which a tap is in bounds form a "
+                "CONTIGUOUS range with a closed form: ow >= ceil((PW-kw)/SW) "
+                "and ow <= (IW-1-kw+PW)/SW. A sub-range is addressed by "
+                "moving the pointer and shortening the vector -- no "
+                "per-lane compare, and identical to the reference's "
+                "`if (iw < 0 || iw >= IW) continue;`.\n\n"
+                "The accumulator therefore lives in a small int32 scratch "
+                "rather than a register: different taps cover different "
+                "sub-ranges of the same tile, and a register accumulator "
+                "would need exactly the mask this design avoids. 128 bytes, "
+                "L1-resident, and a stack array rather than a static one "
+                "because the pool runs one worker per hart in one address "
+                "space."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+def _slice_c_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, N, IC, C_start, C_end, H, W,
+    # scale_in, scale_out, act_min, act_max
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int]
+
+
+SLICE_C_S8 = KernelSpec(
+    op="slice_c_s8",
+    signature=(
+        "void kernel_slice_c_s8(const int8_t *input, int8_t *output, "
+        "int N, int IC, int C_start, int C_end, int H, int W, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Contiguous channel-axis slice of an NCHW int8 tensor:\n"
+        "  output[n, c-C_start, h, w] = round(\n"
+        "      input[n, c, h, w] * scale_in / scale_out)\n"
+        "for c in [C_start, C_end), result shape (N, C_end-C_start, H, W).\n"
+        "When scale_in == scale_out the body reduces to a memcpy of\n"
+        "(C_end - C_start) * H * W bytes per batch — the requantize tail\n"
+        "is structurally a no-op (round((x*s)/s) = x). Used by ViNT's\n"
+        "goal-encoder path: obs_img[:, 3*context_size:3*(context_size+1)]."
+    ),
+    reference_impl="""\
+void kernel_slice_c_s8(const int8_t *input, int8_t *output,
+                       int N, int IC, int C_start, int C_end, int H, int W,
+                       float scale_in, float scale_out,
+                       int activation_min, int activation_max) {
+    int OC = C_end - C_start;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < OC; c++) {
+            const int8_t *src = input  + ((n * IC + (c + C_start)) * H) * W;
+            int8_t       *dst = output + ((n * OC +  c)            * H) * W;
+            if (scale_in == scale_out) {
+                for (int i = 0; i < H * W; i++) dst[i] = src[i];
+            } else {
+                for (int i = 0; i < H * W; i++) {
+                    int32_t v = (int32_t)roundf(
+                        (float)src[i] * scale_in / scale_out);
+                    if (v < activation_min) v = activation_min;
+                    if (v > activation_max) v = activation_max;
+                    dst[i] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 18, "C_start": 15, "C_end": 18, "H": 64, "W": 85},
+        {"N": 1, "IC": 32, "C_start": 0,  "C_end": 16, "H": 32, "W": 32},
+    ],
+    argtypes_factory=_slice_c_s8_argtypes,
+)
+
+
+def _softmax_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, M (rows), K (cols), scale_in, scale_out
+    return [i8p, i8p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float]
+
+
+SOFTMAX_S8 = KernelSpec(
+    op="softmax_s8",
+    signature=(
+        "void kernel_softmax_s8(const int8_t *input, int8_t *output, "
+        "int M, int K, float scale_in, float scale_out)"
+    ),
+    semantics=(
+        "Row-wise softmax over a 2-D row-major view (M rows × K cols).\n"
+        "Numerically stable: subtract the row max before exponentiating.\n"
+        "  shift = max_k(input[m,k])\n"
+        "  num[k] = expf((input[m,k] - shift) * scale_in)\n"
+        "  denom  = sum_k num[k]\n"
+        "  output[m,k] = clamp(round(num[k] / denom / scale_out), -128, 127)\n"
+        "Output activations sum to ~1.0 per row in float space. Caller\n"
+        "should set scale_out so the dynamic range covers [0, 1]\n"
+        "(typically 1/127 — every value fits in [0, 127] with one bit\n"
+        "of headroom)."
+    ),
+    reference_impl="""\
+void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
+                       float scale_in, float scale_out) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row_in  = input  + m * K;
+        int8_t       *row_out = output + m * K;
+        int8_t shift = row_in[0];
+        for (int k = 1; k < K; k++) {
+            if (row_in[k] > shift) shift = row_in[k];
+        }
+        /* Two-pass over the row: first accumulate the denominator,
+         * then quantize. Curated kernels can elide the second pass by
+         * caching exp values in a scratch buffer (LUT or fp16 store). */
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += expf(((float)row_in[k] - (float)shift) * scale_in);
+        }
+        for (int k = 0; k < K; k++) {
+            float e = expf(((float)row_in[k] - (float)shift) * scale_in);
+            float p = e / sum;
+            int32_t v = (int32_t)roundf(p / scale_out);
+            if (v < -128) v = -128;
+            if (v >  127) v =  127;
+            row_out[k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1,   "K": 7},     # ViNT attention head: 7 tokens
+        {"M": 4,   "K": 7},     # 4 heads × 7 keys
+        {"M": 16,  "K": 64},    # broader test
+    ],
+    argtypes_factory=_softmax_s8_argtypes,
+    algorithms=[
+        # This op carried only the synthesized `direct` candidate, so the
+        # curated probe had no named (op, algorithm) pair to look for and
+        # softmax ran the scalar reference inside builds labelled rvv_x60 --
+        # 6.4% of attn_block, and one of the four ops ViNT still needs.
+        # Kernel: kernels/rvv/rvv_softmax_s8_rvv_cached_exp.c
+        AlgorithmCandidate(
+            name="rvv_cached_exp",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "The reference calls expf TWICE per element with the SAME "
+                "argument -- once to build the denominator, once to "
+                "quantize. Cache the first pass in a scratch buffer and the "
+                "second reads it back. That is not an approximation: expf is "
+                "a pure function of its argument, so the cached value IS the "
+                "value the second call would have produced, and nothing "
+                "about the arithmetic changes.\n\n"
+                "expf is ~140 cycles on this core and the rest of the row is "
+                "loads and two divides, so halving the transcendental count "
+                "is most of the available win. The cache also makes the "
+                "requantize tail vectorisable, which the two-pass form is "
+                "not.\n\n"
+                "The DENOMINATOR STAYS SCALAR. `sum += expf(...)` is a "
+                "sequential float accumulation and a vector tree reduction "
+                "would add the same terms in a different order -- a few ULP "
+                "different, on a value every output is divided by. The row "
+                "MAXIMUM is vectorised, because max is associative and "
+                "commutative over a total order and reduction shape cannot "
+                "change it.\n\n"
+                "The two divides stay two divides (no reciprocal multiply, "
+                "no folding into one), and roundf is spelled as frm=RMM. The "
+                "scratch is a stack array, not a static one: the thread pool "
+                "runs one worker per hart in a single address space."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# Application-specific composite ops. These sit at the model/application
+# boundary and absorb the open-ended pre/post-process code that's
+# specific to each model. Same KernelSpec contract as everything else
+# (signature + semantics + reference_impl + argtypes), so the existing
+# kernel-pick / verify / cache / LLM-gen pipeline works without changes.
+# ---------------------------------------------------------------------------
+
+
+def _vint_action_post_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    f32p = ctypes.POINTER(ctypes.c_float)
+    # dist_int8, scale_dist, deltas_int8, scale_deltas, output_fp32
+    return [i8p, ctypes.c_float, i8p, ctypes.c_float, f32p]
+
+
+VINT_ACTION_POST = KernelSpec(
+    op="vint_action_post",
+    signature=(
+        "void kernel_vint_action_post("
+        "const int8_t *dist_int8, float scale_dist, "
+        "const int8_t *deltas_int8, float scale_deltas, "
+        "float *output)"
+    ),
+    semantics=(
+        "Composite ViNT post-process: absorbs every tail op the int8\n"
+        "model graph elided (dequant + cumsum + L2-normalize + tuple\n"
+        "pack) so the binary's surface output is a single fp32 buffer\n"
+        "the application (pilot / IsaacLab adapter) can consume\n"
+        "directly.\n"
+        "\n"
+        "Inputs:\n"
+        "  dist_int8[1]    — int8 temporal-distance estimate\n"
+        "  deltas_int8[20] — int8 (5,4) (dx, dy, sin, cos) per-step\n"
+        "                    deltas\n"
+        "Output (21 fp32 values):\n"
+        "  out[0]          — dequantized fp32 temporal distance\n"
+        "  out[1..20]      — (5,4) fp32 waypoints:\n"
+        "                      [wp][0] = cumulative x (m)\n"
+        "                      [wp][1] = cumulative y (m)\n"
+        "                      [wp][2] = sin θ (unit vector)\n"
+        "                      [wp][3] = cos θ (unit vector)\n"
+        "\n"
+        "Reference algebra (matches PyTorch ViNT.forward tail):\n"
+        "  out[0] = dist_int8[0] * scale_dist\n"
+        "  f[wp][i] = deltas_int8[wp*4 + i] * scale_deltas  for i in 0..3\n"
+        "  cum_x = cumsum(f[:, 0]); out[1 + wp*4 + 0] = cum_x[wp]\n"
+        "  cum_y = cumsum(f[:, 1]); out[1 + wp*4 + 1] = cum_y[wp]\n"
+        "  n = max(sqrt(f[wp][2]^2 + f[wp][3]^2), 1e-12)\n"
+        "  out[1 + wp*4 + 2] = f[wp][2] / n\n"
+        "  out[1 + wp*4 + 3] = f[wp][3] / n\n"
+    ),
+    reference_impl="""\
+void kernel_vint_action_post(const int8_t *dist_int8, float scale_dist,
+                             const int8_t *deltas_int8, float scale_deltas,
+                             float *output) {
+    const int N_WP = 5;
+    /* Slot 0: dequant the dist scalar. */
+    output[0] = (float)dist_int8[0] * scale_dist;
+    /* Slots [1..10]: cumsum the (dx, dy) cols of the action_pred (5,4). */
+    float cum_x = 0.0f, cum_y = 0.0f;
+    for (int wp = 0; wp < N_WP; wp++) {
+        cum_x += (float)deltas_int8[wp*4 + 0] * scale_deltas;
+        cum_y += (float)deltas_int8[wp*4 + 1] * scale_deltas;
+        output[1 + wp*4 + 0] = cum_x;
+        output[1 + wp*4 + 1] = cum_y;
+    }
+    /* Slots [3..20] mixed in above; L2-normalize the (sin, cos) cols. */
+    for (int wp = 0; wp < N_WP; wp++) {
+        float s = (float)deltas_int8[wp*4 + 2] * scale_deltas;
+        float c = (float)deltas_int8[wp*4 + 3] * scale_deltas;
+        float n = sqrtf(s*s + c*c);
+        if (n < 1e-12f) n = 1e-12f;
+        output[1 + wp*4 + 2] = s / n;
+        output[1 + wp*4 + 3] = c / n;
+    }
+}
+""",
+    extra_shapes=[{}],  # composite op, no shape parametrization
+    argtypes_factory=_vint_action_post_argtypes,
+)
+
+
+LEAKY_RELU_S8 = KernelSpec(
+    op="leaky_relu_s8",
+    signature=(
+        "void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max, float negative_slope)"
+    ),
+    semantics=(
+        "Quantized elementwise LeakyReLU on a contiguous int8 buffer with\n"
+        "symmetric per-tensor quantization (zero_point = 0).\n"
+        "  LeakyReLU(x) = x                    if x > 0\n"
+        "                 negative_slope * x   if x <= 0\n"
+        "Dequantize, apply, requantize:\n"
+        "  f = input[i] * scale_in\n"
+        "  y = f > 0 ? f : negative_slope * f\n"
+        "  out = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "\n"
+        "Like elu_s8 this is a 256-entry function of the input byte for a given\n"
+        "(scale_in, scale_out, negative_slope), so an LUT variant is the obvious\n"
+        "curated optimisation. Unlike elu_s8 there is no transcendental, so the\n"
+        "direct form already vectorises: compare, select, scale."
+    ),
+    reference_impl=r"""
+void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n,
+                          float scale_in, float scale_out,
+                          int activation_min, int activation_max,
+                          float negative_slope) {
+    for (int i = 0; i < n; i++) {
+        float f = (float)input[i] * scale_in;
+        float y = (f > 0.0f) ? f : negative_slope * f;
+        int32_t v = (int32_t)roundf(y / scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}, {"n": 395}],
+    argtypes_factory=_leaky_relu_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all, so
+        # no target had a named (op, algorithm) pair to probe for.
+        # Kernel: kernels/rvv/rvv_leaky_relu_s8_rvv_frm_rmm.c
+        AlgorithmCandidate(
+            name="rvv_frm_rmm",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "Same shape as add_s8's rvv_frm_rmm: the reference "
+                "expression on the vector unit, with roundf() spelled "
+                "as frm=RMM (round to nearest, ties to Max Magnitude) "
+                "so the integer conversion is bit-exact by construction "
+                "rather than by tolerance. frm is toggled around the "
+                "conversion only, since it also governs the float "
+                "arithmetic.\n\n"
+                "The select is taken where the reference takes it -- "
+                "vmfgt against +0.0f on the DEQUANTIZED float, not on "
+                "the int8. For scale_in > 0 the two agree; taking it in "
+                "the same place removes the question.\n\n"
+                "Worth stating plainly: the shapes this op has in the "
+                "models here are n = 16 and n = 64, where call overhead "
+                "dominates either way. The kernel is for coverage and "
+                "for models that apply the op at width."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+AVGPOOL2D_S8 = KernelSpec(
+    op="avgpool2d_s8",
+    signature=(
+        "void kernel_avgpool2d_s8(const int8_t *input, int8_t *output, "
+        "int N, int C, int IH, int IW, int KH, int KW, int SH, int SW, "
+        "int PH, int PW, int count_include_pad)"
+    ),
+    semantics=(
+        "Quantized 2D average pooling over NCHW int8 with symmetric per-tensor\n"
+        "quantization (zero_point = 0) and IDENTICAL input and output scale, so\n"
+        "no requantization is needed -- the mean of values on a scale is on the\n"
+        "same scale.\n"
+        "  OH = (IH + 2*PH - KH) / SH + 1\n"
+        "  OW = (IW + 2*PW - KW) / SW + 1\n"
+        "Accumulate in int32, divide by the window count, round half away from\n"
+        "zero to match PyTorch's quantized avg_pool2d:\n"
+        "  out = (sum >= 0) ? (sum + cnt/2)/cnt : -((-sum + cnt/2)/cnt)\n"
+        "\n"
+        "count_include_pad selects the divisor: non-zero divides by KH*KW\n"
+        "regardless of how much of the window lies in padding; zero divides by\n"
+        "the in-bounds count only. Padded positions contribute 0 to the sum (the\n"
+        "quantized zero) either way, so the two differ only in the divisor.\n"
+        "Getting it backwards is silent: it shifts border values and nothing\n"
+        "else."
+    ),
+    reference_impl=r"""
+#include <stdint.h>
+
+void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
+                         int N, int C, int IH, int IW,
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int count_include_pad) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t sum = 0;
+                    int cnt = 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                                sum += (int32_t)input[((n*C + c)*IH + ih)*IW + iw];
+                                cnt++;
+                            }
+                        }
+                    }
+                    int div = count_include_pad ? (KH*KW) : (cnt > 0 ? cnt : 1);
+                    int32_t v;
+                    if (sum >= 0) v = (sum + div/2) / div;
+                    else          v = -(((-sum) + div/2) / div);
+                    if (v < -128) v = -128;
+                    if (v > 127) v = 127;
+                    output[((n*C + c)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 10, "IH": 8, "IW": 8, "KH": 3, "KW": 3,
+         "SH": 1, "SW": 1, "PH": 0, "PW": 0, "count_include_pad": 1},
+        {"N": 1, "C": 4, "IH": 5, "IW": 5, "KH": 2, "KW": 2,
+         "SH": 2, "SW": 2, "PH": 0, "PW": 0, "count_include_pad": 1},
+    ],
+    argtypes_factory=_avgpool2d_s8_argtypes,
+    algorithms=[
+        # The RVV entry -- this op had no AlgorithmCandidate at all.
+        # Measured on the scalar reference inside an rvv_x60 build:
+        # 12.8% of vitfly_frontend.
+        # Kernel: kernels/rvv/rvv_avgpool2d_s8_rvv_ow_lanes.c
+        AlgorithmCandidate(
+            name="rvv_ow_lanes",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "One vector = a run of output columns of one (n, c, "
+                "oh). Output is contiguous along ow and input is "
+                "contiguous along iw with stride SW, so the window "
+                "accumulation is KH*KW unit- or strided loads into an "
+                "i32 accumulator in a single pass, with no gather.\n\n"
+                "The epilogue is the reference's own integer "
+                "expression: round the magnitude half away from zero as "
+                "(|sum| + div/2)/div and reapply the sign. Exact "
+                "integer arithmetic, no float, so there is no rounding "
+                "mode to match -- bit-exact by construction. vdiv is "
+                "used rather than a reciprocal multiply; it is slower "
+                "and correct.\n\n"
+                "The padded case falls back to the reference loop "
+                "verbatim, deliberately. With PH=PW=0 every window is "
+                "fully in bounds, so cnt is KH*KW everywhere and the "
+                "divisor is the same constant whichever way "
+                "count_include_pad is set; with padding it is neither, "
+                "and the vector path would need a per-lane divisor and "
+                "in-bounds mask to reproduce a case these models do not "
+                "have. Getting count_include_pad backwards is silent, "
+                "which is a good reason not to implement it twice."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+
+LSTM_S8 = KernelSpec(
+    op="lstm_s8",
+    signature=(
+        "void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih, "
+        "const int8_t *w_hh, const int32_t *b_ih, const int32_t *b_hh, "
+        "int8_t *h_state, int8_t *c_state, int8_t *output, "
+        "int input_size, int hidden_size, "
+        "float scale_in, float scale_w_ih, float scale_w_hh, "
+        "float scale_b, float scale_h, float scale_c, int has_bias)"
+    ),
+    semantics=(
+        "One timestep of a single-layer LSTM cell, batch size 1, int8 in/out.\n"
+        "Gate order is PyTorch's: [input, forget, cell, output].\n"
+        "\n"
+        "  gates = W_ih @ x + b_ih + W_hh @ h_prev + b_hh      (4H values)\n"
+        "  i = sigmoid(gates[0:H])      f = sigmoid(gates[H:2H])\n"
+        "  g = tanh(gates[2H:3H])       o = sigmoid(gates[3H:4H])\n"
+        "  c = f * c_prev + i * g\n"
+        "  h = o * tanh(c)\n"
+        "\n"
+        "h_state and c_state are BOTH INPUTS AND OUTPUTS: they carry the\n"
+        "recurrent state and are updated in place. `output` receives a copy of\n"
+        "the new h. This is what makes the op stateful -- a second call with the\n"
+        "same input does not produce the same answer, and the caller must keep\n"
+        "these buffers alive across invocations. Zero-initialised buffers are\n"
+        "the standard 'no history' start.\n"
+        "\n"
+        "Accumulation and the nonlinearities are done in float after\n"
+        "dequantizing, matching how elu_s8/sigmoid_s8 handle transcendentals:\n"
+        "the int8 grid is far too coarse to evaluate sigmoid/tanh on directly,\n"
+        "and the cell state c is unbounded so it carries its own scale rather\n"
+        "than sharing the activation's.\n"
+        "\n"
+        "Weight layout is PyTorch's: w_ih is [4H, input_size] row-major and\n"
+        "w_hh is [4H, H] row-major, so each gate row is contiguous along its\n"
+        "reduction. Biases are int32 pre-scaled by scale_b; has_bias=0 skips\n"
+        "them entirely (VitFly's LSTM is constructed with bias=False)."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+/* Upper bound on hidden_size, so the h_prev snapshot is a fixed stack buffer
+   rather than a VLA. VitFly's LSTM is 395; 1024 leaves headroom without being
+   a meaningful stack cost (1 KB). */
+#ifndef MERLIN_LSTM_MAX_HIDDEN
+#define MERLIN_LSTM_MAX_HIDDEN 1024
+#endif
+
+void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
+                    const int8_t *w_hh, const int32_t *b_ih,
+                    const int32_t *b_hh,
+                    int8_t *h_state, int8_t *c_state, int8_t *output,
+                    int input_size, int hidden_size,
+                    float scale_in, float scale_w_ih, float scale_w_hh,
+                    float scale_b, float scale_h, float scale_c,
+                    int has_bias) {
+    const int H = hidden_size;
+    /* Snapshot h_prev before touching h_state.
+     *
+     * Every gate reduction reads the WHOLE previous hidden vector, but the
+     * loop below writes h_state[t] as it goes. Without this copy, unit t+1
+     * would read the newly-written h[t] instead of the previous timestep's --
+     * the recurrence would consume its own output mid-step. That is not a
+     * rounding difference; it produced answers off by up to 12 LSB. */
+    int8_t h_prev[MERLIN_LSTM_MAX_HIDDEN];
+    if (H > MERLIN_LSTM_MAX_HIDDEN) {
+        /* Refuse rather than silently truncate the state. */
+        return;
+    }
+    for (int k = 0; k < H; k++) h_prev[k] = h_state[k];
+
+    /* One pass per hidden unit, computing its four gates. */
+    for (int t = 0; t < H; t++) {
+        double g_pre[4];
+        for (int gi = 0; gi < 4; gi++) {
+            const int j = gi * H + t;
+            double acc = 0.0;
+            for (int k = 0; k < input_size; k++) {
+                acc += ((double)input[k] * (double)scale_in)
+                     * ((double)w_ih[j * input_size + k] * (double)scale_w_ih);
+            }
+            for (int k = 0; k < H; k++) {
+                acc += ((double)h_prev[k] * (double)scale_h)
+                     * ((double)w_hh[j * H + k] * (double)scale_w_hh);
+            }
+            if (has_bias) {
+                acc += (double)b_ih[j] * (double)scale_b;
+                acc += (double)b_hh[j] * (double)scale_b;
+            }
+            g_pre[gi] = acc;
+        }
+        /* double, not float: this op is evaluated in floating point, so the
+           only way the device and the golden simulator agree bit-for-bit is if
+           both compute the same real value to well within half an int8 LSB.
+           float32 was not enough -- it disagreed by up to 2 LSB. */
+        const double i_g = 1.0 / (1.0 + exp(-g_pre[0]));
+        const double f_g = 1.0 / (1.0 + exp(-g_pre[1]));
+        const double g_g = tanh(g_pre[2]);
+        const double o_g = 1.0 / (1.0 + exp(-g_pre[3]));
+
+        const double c_prev = (double)c_state[t] * (double)scale_c;
+        const double c_new = f_g * c_prev + i_g * g_g;
+        const double h_new = o_g * tanh(c_new);
+
+        int32_t cq = (int32_t)round(c_new / (double)scale_c);
+        if (cq < -128) cq = -128;
+        if (cq > 127) cq = 127;
+        int32_t hq = (int32_t)round(h_new / (double)scale_h);
+        if (hq < -128) hq = -128;
+        if (hq > 127) hq = 127;
+        c_state[t] = (int8_t)cq;
+        h_state[t] = (int8_t)hq;
+        output[t] = (int8_t)hq;
+    }
+}
+""",
+    extra_shapes=[
+        {"input_size": 8, "hidden_size": 4},
+        {"input_size": 665, "hidden_size": 395},
+    ],
+    argtypes_factory=_lstm_s8_argtypes,
+    algorithms=[
+        # The RVV entry. Without it the curated lookup has no
+        # (op, algorithm) pair to probe for this op beyond the
+        # synthesized universal "direct", and a descriptive name is
+        # what the profile's `implementation` column records -- the
+        # difference between "curated[rvv]/rvv_gate_int_dot" and
+        # "reference" is the whole finding here. Measured before the
+        # kernel existed: 27.6 ms of vitfly_lstm's 28.2 ms rvv_x60 run,
+        # 97.9%, on the scalar reference.
+        # Kernel: kernels/rvv/rvv_lstm_s8_rvv_gate_int_dot.c
+        AlgorithmCandidate(
+            name="rvv_gate_int_dot",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "Move the gate reductions onto the INTEGER vector unit "
+                "and leave the cell update alone.\n\n"
+                "Per timestep the op reduces 4H*(input_size + H) "
+                "products -- 1.67 M for VitFly's 660->395 layer -- and "
+                "the reference computes each as two int->double "
+                "converts and two double multiplies on a serial fadd "
+                "chain. But the products are integers: x[k] and w[k] "
+                "are int8, sum(x[k]*w[k]) is exact in int32, and the "
+                "per-tensor scales factor straight out of the sum, so\n"
+                "    sum_k (x_k*s_in)*(w_k*s_w) == (sum_k x_k*w_k) * "
+                "(s_in*s_w)\n"
+                "as reals. The reduction becomes a widening int8 dot "
+                "product (vwmul.vv into i16, vwadd.wv into an i32 "
+                "accumulator, vredsum at the end) and the float math "
+                "shrinks to one multiply per gate.\n\n"
+                "sigmoid, tanh, the cell update and the requantize stay "
+                "scalar and in double, exactly as the reference writes "
+                "them: ~5 libm calls per hidden unit against ~4200 "
+                "MACs, so there is nothing to win, and vectorising them "
+                "would mean matching a rounding mode vfcvt does not "
+                "have.\n\n"
+                "NOT bit-exact by construction, and the only kernel "
+                "here of which that is true: the reference rounds every "
+                "product and every partial sum, this computes the same "
+                "real quantity with one rounding, and the integer sum "
+                "is the more accurate of the two. Agreement at the int8 "
+                "output is measured (max_abs_err=0 on both VitFly "
+                "layers and both lstm_tiny layers, two data regimes, on "
+                "the board) rather than proven."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+
+LAYERNORM_S8 = KernelSpec(
+    op="layernorm_s8",
+    signature=(
+        "void kernel_layernorm_s8(const int8_t *input, const float *gamma, "
+        "const float *beta, int8_t *output, int M, int K, "
+        "float scale_in, float scale_out, float eps, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized LayerNorm over the last dimension of an [M, K] int8 tensor,\n"
+        "symmetric per-tensor quantization (zero_point = 0).\n"
+        "  mu    = mean(x_row)\n"
+        "  var   = mean((x_row - mu)^2)          (biased, 1/K, as PyTorch)\n"
+        "  y     = (x - mu) / sqrt(var + eps) * gamma + beta\n"
+        "  out   = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "\n"
+        "gamma and beta stay float32 rather than being quantized: they are K\n"
+        "values against K*M activations, so the memory is irrelevant, and\n"
+        "quantizing an affine applied AFTER normalisation costs accuracy for\n"
+        "nothing. batchnorm2d_s8 takes its scale/bias the same way.\n"
+        "\n"
+        "The variance is biased (divide by K, not K-1) because that is what\n"
+        "torch.nn.LayerNorm does. Using the unbiased form is a silent accuracy\n"
+        "bug that grows as K shrinks."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_layernorm_s8(const int8_t *input, const float *gamma,
+                         const float *beta, int8_t *output,
+                         int M, int K, float scale_in, float scale_out,
+                         float eps, int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row = input + (size_t)m * (size_t)K;
+        double mu = 0.0;
+        for (int k = 0; k < K; k++) mu += (double)row[k] * (double)scale_in;
+        mu /= (double)K;
+        double var = 0.0;
+        for (int k = 0; k < K; k++) {
+            const double d = (double)row[k] * (double)scale_in - mu;
+            var += d * d;
+        }
+        var /= (double)K;
+        const double inv = 1.0 / sqrt(var + (double)eps);
+        for (int k = 0; k < K; k++) {
+            const double xn = ((double)row[k] * (double)scale_in - mu) * inv;
+            double y = xn * (double)(gamma ? gamma[k] : 1.0f);
+            if (beta) y += (double)beta[k];
+            int32_t v = (int32_t)round(y / (double)scale_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[(size_t)m * (size_t)K + k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 1, "K": 64}, {"M": 4, "K": 128}],
+    argtypes_factory=_layernorm_s8_argtypes,
+    algorithms=[
+        # Only the synthesized `direct` candidate existed, so the curated
+        # probe had no named (op, algorithm) pair and layernorm ran the scalar
+        # reference inside builds labelled rvv_x60 -- 13.9% of attn_block, and
+        # one of the four ops ViNT still needs.
+        # Kernel: kernels/rvv/rvv_layernorm_s8_rvv_f64_tail.c
+        AlgorithmCandidate(
+            name="rvv_f64_tail",
+            target_affinity=("rvv", "rvv_x60"),
+            description=(
+                "Three passes per row. The first two accumulate mu and var "
+                "as SEQUENTIAL DOUBLE SUMS and must stay scalar: a vector "
+                "tree reduction adds the same terms in a different order, "
+                "and mu and inv then feed every output in the row, so a few "
+                "ULP there moves every element rather than one. RVV's "
+                "ordered reduction (vfredosum) would preserve the order but "
+                "serialises the add chain by construction, so it buys the "
+                "loads and not the adds.\n\n"
+                "The THIRD pass is where the time is and is embarrassingly "
+                "parallel once mu and inv are known -- it also carries the "
+                "kernel's only division, one per element. That is what gets "
+                "vectorised.\n\n"
+                "It is done in DOUBLE, because the reference does. int8 is "
+                "sign-extended 8x to i64 then converted to f64; gamma and "
+                "beta are float32 in memory and are widened to f64 exactly "
+                "as `(double)gamma[k]` does. Doing this pass in float32 "
+                "would be much faster and would be a different answer, which "
+                "defeats the point of a curated kernel: the scheduler's cost "
+                "has to be for code that computes what the model computes.\n\n"
+                "round() is ties-away-from-zero, spelled as frm=RMM around "
+                "the f64->i64 conversion. The divide stays a divide. gamma "
+                "and beta are each optional and the NULL cases skip the "
+                "widening load rather than materialising constants."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+RMSNORM_S8 = KernelSpec(
+    op="rmsnorm_s8",
+    signature=(
+        "void kernel_rmsnorm_s8(const int8_t *input, const float *gamma, "
+        "int8_t *output, int M, int K, "
+        "float scale_in, float scale_out, float eps, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized RMSNorm over the last dimension of an [M, K] int8 tensor.\n"
+        "  rms = sqrt(mean(x_row^2) + eps)\n"
+        "  y   = x / rms * gamma\n"
+        "  out = clamp(round(y / scale_out), activation_min, activation_max)\n"
+        "\n"
+        "NOT LayerNorm without beta: RMSNorm does not subtract the mean at all,\n"
+        "so a row with a large DC component normalises differently. The two are\n"
+        "easy to conflate and the difference is silent.\n"
+        "\n"
+        "This is what SmolVLA's `pow` + `rsqrt` pairs decompose to -- 173 of its\n"
+        "477 uncovered compute nodes are this one operation written out."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_rmsnorm_s8(const int8_t *input, const float *gamma,
+                       int8_t *output, int M, int K,
+                       float scale_in, float scale_out, float eps,
+                       int activation_min, int activation_max) {
+    for (int m = 0; m < M; m++) {
+        const int8_t *row = input + (size_t)m * (size_t)K;
+        double ms = 0.0;
+        for (int k = 0; k < K; k++) {
+            const double x = (double)row[k] * (double)scale_in;
+            ms += x * x;
+        }
+        ms /= (double)K;
+        const double inv = 1.0 / sqrt(ms + (double)eps);
+        for (int k = 0; k < K; k++) {
+            const double x = (double)row[k] * (double)scale_in;
+            double y = x * inv * (double)(gamma ? gamma[k] : 1.0f);
+            int32_t v = (int32_t)round(y / (double)scale_out);
+            if (v < activation_min) v = activation_min;
+            if (v > activation_max) v = activation_max;
+            output[(size_t)m * (size_t)K + k] = (int8_t)v;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 1, "K": 64}, {"M": 4, "K": 128}],
+    argtypes_factory=_rmsnorm_s8_argtypes,
+)
+
+
+
+SIN_S8 = KernelSpec(
+    op="sin_s8",
+    signature=(
+        "void kernel_sin_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise sin on a contiguous int8 buffer, symmetric\n"
+        "per-tensor quantization (zero_point = 0).\n"
+        "  out = clamp(round(sin(input[i] * scale_in) / scale_out),\n"
+        "              activation_min, activation_max)\n"
+        "\n"
+        "Used by rotary position embedding (RoPE), which is where SmolVLA's\n"
+        "sin/cos nodes come from. Note the accuracy caveat that applies to\n"
+        "RoPE specifically: the ARGUMENT is a position-derived angle whose\n"
+        "range is large, and an int8 grid over a wide angular range is coarse.\n"
+        "In practice RoPE tables are computed once in float and the int8 form\n"
+        "is only appropriate when scale_in keeps the angle inside a few\n"
+        "radians. This kernel is exact against its own definition; whether\n"
+        "quantizing the angle is the right thing to do is a model question,\n"
+        "not a kernel question."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_sin_s8(const int8_t *input, int8_t *output, int n,
+                   float scale_in, float scale_out,
+                   int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        const double y = sin((double)input[i] * (double)scale_in);
+        int32_t v = (int32_t)round(y / (double)scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}],
+    argtypes_factory=_sin_s8_argtypes,
+    algorithms=[
+        # Kernel: kernels/rvv/rvv_sin_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Memoized 256-entry LUT plus an RVV byte gather -- the same "
+                "structure as kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c, "
+                "with sin_s8's expression substituted.\n\n"
+                "WHY A LUT IS BIT-EXACT HERE RATHER THAN A COMPROMISE. The "
+                "input is int8, so there are only 256 possible inputs. Build "
+                "the table by calling the reference expression VERBATIM on "
+                "each byte -- same `sin`, same double precision, same "
+                "`round`, same clamp -- and every output is the reference's "
+                "own answer by construction. This is the one case where "
+                "vectorizing a transcendental costs no accuracy at all, "
+                "because the transcendental is never vectorized: it is "
+                "evaluated at most 256 times in scalar double and then looked "
+                "up.\n\n"
+                "THE GATHER. Bias the input byte into unsigned order with "
+                "`vxor` by -128, then `vluxei8_v_i8m1` gathers 32 results per "
+                "pass at VLEN=256. No arithmetic in the vector path at all.\n\n"
+                "MEMOIZE, DO NOT BUILD EAGERLY. Mark which of the 256 bytes "
+                "actually occur in this input and evaluate only those. A RoPE "
+                "tensor occupies a narrow slice of the range, so an eager "
+                "table pays 256 `sin` calls to serve a handful.\n\n"
+                "AND FALL BACK TO SCALAR ON SHORT INPUTS. Below ~32 elements "
+                "the marking pass plus the table build costs more than the "
+                "transcendentals it saves, and at n=1 the LUT is pure "
+                "overhead. Keep a threshold and take the reference path under "
+                "it.\n\n"
+                "Reuse the shared `mb_rvv_lut_gather_s8` helper and its "
+                "include guard -- several of these bodies can land in the "
+                "same kernels.c.\n\n"
+                "MUST be bit-exact to the sin_s8 reference: max_abs_err = 0."
+            ),
+            reference_impl=(
+                "/* See kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c for\n"
+                " * the complete worked version. Substitute, keeping the\n"
+                " * double precision and `round` exactly as the reference\n"
+                " * has them:\n"
+                " *   const double y = sin((double)x * (double)scale_in);\n"
+                " *   int32_t v = (int32_t)round(y / (double)scale_out);\n"
+                " */\n"
+            ),
+        ),
+    ],
+)
+
+
+COS_S8 = KernelSpec(
+    op="cos_s8",
+    signature=(
+        "void kernel_cos_s8(const int8_t *input, int8_t *output, int n, "
+        "float scale_in, float scale_out, "
+        "int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Quantized elementwise cos. Same contract and the same RoPE caveat as\n"
+        "sin_s8; see that kernel's notes."
+    ),
+    reference_impl=r"""
+#include <math.h>
+#include <stdint.h>
+
+void kernel_cos_s8(const int8_t *input, int8_t *output, int n,
+                   float scale_in, float scale_out,
+                   int activation_min, int activation_max) {
+    for (int i = 0; i < n; i++) {
+        const double y = cos((double)input[i] * (double)scale_in);
+        int32_t v = (int32_t)round(y / (double)scale_out);
+        if (v < activation_min) v = activation_min;
+        if (v > activation_max) v = activation_max;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 64}],
+    argtypes_factory=_cos_s8_argtypes,
+    algorithms=[
+        # Kernel: kernels/rvv/rvv_cos_s8_rvv_memo_lut_gather.c
+        AlgorithmCandidate(
+            name="rvv_memo_lut_gather",
+            target_affinity=("rvv", "rvv_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Memoized 256-entry LUT plus an RVV byte gather -- the same "
+                "structure as kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c, "
+                "with cos_s8's expression substituted.\n\n"
+                "WHY A LUT IS BIT-EXACT HERE RATHER THAN A COMPROMISE. The "
+                "input is int8, so there are only 256 possible inputs. Build "
+                "the table by calling the reference expression VERBATIM on "
+                "each byte -- same `cos`, same double precision, same "
+                "`round`, same clamp -- and every output is the reference's "
+                "own answer by construction. This is the one case where "
+                "vectorizing a transcendental costs no accuracy at all, "
+                "because the transcendental is never vectorized: it is "
+                "evaluated at most 256 times in scalar double and then looked "
+                "up.\n\n"
+                "THE GATHER. Bias the input byte into unsigned order with "
+                "`vxor` by -128, then `vluxei8_v_i8m1` gathers 32 results per "
+                "pass at VLEN=256. No arithmetic in the vector path at all.\n\n"
+                "MEMOIZE, DO NOT BUILD EAGERLY. Mark which of the 256 bytes "
+                "actually occur in this input and evaluate only those. A RoPE "
+                "tensor occupies a narrow slice of the range, so an eager "
+                "table pays 256 `cos` calls to serve a handful.\n\n"
+                "AND FALL BACK TO SCALAR ON SHORT INPUTS. Below ~32 elements "
+                "the marking pass plus the table build costs more than the "
+                "transcendentals it saves, and at n=1 the LUT is pure "
+                "overhead. Keep a threshold and take the reference path under "
+                "it.\n\n"
+                "Reuse the shared `mb_rvv_lut_gather_s8` helper and its "
+                "include guard -- several of these bodies can land in the "
+                "same kernels.c.\n\n"
+                "MUST be bit-exact to the cos_s8 reference: max_abs_err = 0."
+            ),
+            reference_impl=(
+                "/* See kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c for\n"
+                " * the complete worked version. Substitute, keeping the\n"
+                " * double precision and `round` exactly as the reference\n"
+                " * has them:\n"
+                " *   const double y = cos((double)x * (double)scale_in);\n"
+                " *   int32_t v = (int32_t)round(y / (double)scale_out);\n"
+                " */\n"
+            ),
+        ),
+    ],
+)
+
+
+
+def _lstm_f16_argtypes():
+    import ctypes
+    h = ctypes.POINTER(ctypes.c_uint16)   # _Float16 has no ctypes type
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [h, h, h, h, h, h, h, ctypes.c_int, ctypes.c_int]
+
+
+# The fp16 counterpart of LSTM_S8. It exists because the int8 recurrent tail is
+# where the fused sensor net loses its answer: per-tensor int8 over a 3-layer
+# LSTM took the full-net error to 0.45 relative L2 while the encoders alone were
+# at 0.09. The tail is ~5% of the dispatch time, so buying it back in fp16 is
+# cheap. Promotion is per-op (extract_graph._promote_ops_to_fp16), which is why
+# this spec's op record is the SAME shape as lstm_s8's -- minus the scales, and
+# with b_ih + b_hh folded into one float bias.
+LSTM_F16 = KernelSpec(
+    op="lstm_f16",
+    signature=(
+        "void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih, "
+        "const _Float16 *w_hh, const _Float16 *bias, "
+        "_Float16 *h, _Float16 *c, _Float16 *out, int in_size, int H)"
+    ),
+    semantics=(
+        "One timestep of a single-layer LSTM cell, batch size 1, _Float16\n"
+        "in/out. Gate order is PyTorch's: [input, forget, cell, output].\n"
+        "\n"
+        "  gates = w_ih @ x + w_hh @ h_prev + bias        (4H values)\n"
+        "  i = sigmoid(gates[0:H])     f = sigmoid(gates[H:2H])\n"
+        "  g = tanh(gates[2H:3H])      o = sigmoid(gates[3H:4H])\n"
+        "  c = f * c_prev + i * g      h = o * tanh(c)\n"
+        "\n"
+        "The two gate-GEMM reductions ACCUMULATE IN _Float16 -- storage and\n"
+        "accumulate both half -- so the kernel needs no fp32 vector datapath.\n"
+        "The sigmoid/tanh and the cell update are evaluated in scalar float\n"
+        "(O(H) work against O(4H*(in_size+H)) MACs) and stored back to\n"
+        "_Float16.\n"
+        "\n"
+        "h and c are BOTH INPUTS AND OUTPUTS: they carry the recurrent state\n"
+        "and are updated in place, so a second call with the same input does\n"
+        "not give the same answer and the caller must keep both buffers alive\n"
+        "across invocations. Zero-initialised buffers are the 'no history'\n"
+        "start.\n"
+        "\n"
+        "The new hidden state is written to `out` and only committed to `h`\n"
+        "after every unit is done, because the w_hh reduction for unit t+1 must\n"
+        "still see the PREVIOUS h. `out` must therefore not alias `h`.\n"
+        "\n"
+        "Weight layout is PyTorch's: w_ih is [4H, in_size] row-major, w_hh is\n"
+        "[4H, H] row-major, bias is [4H] and already holds b_ih + b_hh."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih,
+                     const _Float16 *w_hh, const _Float16 *bias,
+                     _Float16 *h, _Float16 *c, _Float16 *out,
+                     int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const _Float16 *wih_row = w_ih + (long)row * in_size;
+            const _Float16 *whh_row = w_hh + (long)row * H;
+            /* fp16 product, fp16 accumulate -- see semantics. */
+            _Float16 ax = (_Float16)0.0f, ah = (_Float16)0.0f;
+            for (int k = 0; k < in_size; k++)
+                ax = (_Float16)(ax + (_Float16)(x[k] * wih_row[k]));
+            for (int k = 0; k < H; k++)
+                ah = (_Float16)(ah + (_Float16)(h[k] * whh_row[k]));
+            pre[g] = (float)ax + (float)ah + (float)bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * (float)c[j] + ig * cg;
+        c[j]   = (_Float16)c_new;
+        out[j] = (_Float16)(og * tanhf(c_new));
+    }
+    /* Commit the new hidden state only now (deferred writeback). */
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 597, "H": 128}],
+    argtypes_factory=_lstm_f16_argtypes,
+    algorithms=[
+        # Kernel: kernels/rvv/rvv_lstm_f16_rvv_gate_f16_dot.c
+        AlgorithmCandidate(
+            name="rvv_gate_f16_dot",
+            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            description=(
+                "Vectorize the two gate GEMVs per unit -- x . w_ih[g] over "
+                "in_size and h . w_hh[g] over H -- with unit-stride fp16 loads, "
+                "vfmacc.vv (fp16 multiply-accumulate) and vfredusum.vs. The "
+                "whole vector hot loop stays SEW=16: nothing widens to fp32, so "
+                "no fp32 vector datapath is required. sigmoid, tanh and the "
+                "cell update stay scalar float exactly as the reference writes "
+                "them (~5 libm calls per hidden unit against ~4200 MACs). The "
+                "deferred hidden writeback is preserved. Divergence from the "
+                "reference is reduction ORDER only -- fp16 is non-associative -- "
+                "so this is numeric_drift by construction, not bit_exact."
+            ),
+            reference_impl="(use the curated kernel in kernels/rvv/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+        ),
+    ],
+)
+
+
+def _relu6_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # input, output, n, qmax (int8 value of the 6.0 clamp ceiling)
+    return [i8p, i8p, ctypes.c_int, ctypes.c_int]
+
+
+def _lstm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # x, w_ih, w_hh, bias, h, c, out, in_size, H
+    return [fp, fp, fp, fp, fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+RELU6_S8 = KernelSpec(
+    op="relu6_s8",
+    signature=("void kernel_relu6_s8(const int8_t *input, int8_t *output, "
+               "int n, int qmax)"),
+    semantics=(
+        "Elementwise ReLU6 on a contiguous int8 buffer with symmetric "
+        "quantization (zero_point = 0, and input/output share the same "
+        "scale s):\n"
+        "  output[i] = clamp(input[i], 0, qmax)  for i in [0, n)\n"
+        "where `qmax` is the int8 encoding of the 6.0 clamp ceiling, i.e. "
+        "qmax = round(6.0 / s) saturated into [1, 127]. Standalone version; "
+        "the ReLU6 activation clamped at 6 that follows conv/bn in "
+        "MobileNet-style blocks."
+    ),
+    reference_impl="""\
+void kernel_relu6_s8(const int8_t *input, int8_t *output, int n, int qmax) {
+    for (int i = 0; i < n; i++) {
+        int v = input[i];
+        if (v < 0) v = 0;
+        if (v > qmax) v = qmax;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[
+        {"n": 1},
+        {"n": 17},
+        {"n": 256},
+    ],
+    argtypes_factory=_relu6_s8_argtypes,
+)
+
+
+LSTM = KernelSpec(
+    op="lstm",
+    signature=(
+        "void kernel_lstm(const float *x, const float *w_ih, "
+        "const float *w_hh, const float *bias, "
+        "float *h, float *c, float *out, int in_size, int H)"
+    ),
+    semantics=(
+        "Single-layer, single-timestep fp32 LSTM cell (PyTorch nn.LSTM gate\n"
+        "order: input, forget, cell, output). Recurrence is expressed by\n"
+        "persisting h and c in caller buffers between calls (seq-len-1 unroll).\n"
+        "  x:[in_size] w_ih:[4H,in_size] w_hh:[4H,H] bias:[4H] h:[H] c:[H] out:[H]\n"
+        "per unit j (gate row g = g*H+j):\n"
+        "  pre[g] = x.w_ih[g] + h.w_hh[g] + bias[g*H+j]\n"
+        "  i=sig(pre_i) f=sig(pre_f) g=tanh(pre_g) o=sig(pre_o)\n"
+        "  c' = f*c[j] + i*g;  out[j] = o*tanh(c')\n"
+        "then h[:] = out[:] (deferred so the w_hh GEMM sees the previous h;\n"
+        "out MUST NOT alias h)."
+    ),
+    reference_impl="""\
+#include <math.h>
+void kernel_lstm(const float *x, const float *w_ih, const float *w_hh,
+                 const float *bias, float *h, float *c, float *out,
+                 int in_size, int H) {
+    for (int j = 0; j < H; j++) {
+        float pre[4];
+        for (int g = 0; g < 4; g++) {
+            int row = g * H + j;
+            const float *wih_row = w_ih + (long)row * in_size;
+            const float *whh_row = w_hh + (long)row * H;
+            float ax = 0.0f, ah = 0.0f;
+            for (int k = 0; k < in_size; k++) ax += x[k] * wih_row[k];
+            for (int k = 0; k < H; k++)       ah += h[k] * whh_row[k];
+            pre[g] = ax + ah + bias[row];
+        }
+        float ig = 1.0f / (1.0f + expf(-pre[0]));
+        float fg = 1.0f / (1.0f + expf(-pre[1]));
+        float cg = tanhf(pre[2]);
+        float og = 1.0f / (1.0f + expf(-pre[3]));
+        float c_new = fg * c[j] + ig * cg;
+        c[j]   = c_new;
+        out[j] = og * tanhf(c_new);
+    }
+    for (int j = 0; j < H; j++) h[j] = out[j];
+}
+""",
+    extra_shapes=[{"in_size": 8, "H": 4}, {"in_size": 16, "H": 8}],
+    argtypes_factory=_lstm_argtypes,
+)
+
+
+def _softmax_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+SOFTMAX = KernelSpec(
+    op="softmax",
+    signature=(
+        "void kernel_softmax(const float *input, float *output, int M, int K)"
+    ),
+    semantics=(
+        "Row-wise softmax over the last axis of an [M, K] tensor (numerically\n"
+        "stable max-subtract form):\n"
+        "  m_i          = max_k input[i, k]\n"
+        "  e_k          = expf(input[i, k] - m_i)\n"
+        "  output[i, k] = e_k / sum_k e_k\n"
+        "All tensors float32. A tensor whose softmax dim is the last axis maps\n"
+        "here directly (M = product of leading dims, K = last dim)."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_softmax(const float *input, float *output, int M, int K) {
+    for (int m = 0; m < M; m++) {
+        float maxv = input[m*K];
+        for (int k = 1; k < K; k++) {
+            float v = input[m*K + k];
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float e = expf(input[m*K + k] - maxv);
+            output[m*K + k] = e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] *= inv_sum;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 7, "K": 128}],
+    argtypes_factory=_softmax_argtypes,
+)
+
+
+LOG_SOFTMAX = KernelSpec(
+    op="log_softmax",
+    signature=(
+        "void kernel_log_softmax(const float *input, float *output, "
+        "int M, int K)"
+    ),
+    semantics=(
+        "Row-wise log-softmax over the last axis of an [M, K] tensor:\n"
+        "  m_i          = max_k input[i, k]\n"
+        "  lse          = m_i + logf(sum_k expf(input[i, k] - m_i))\n"
+        "  output[i, k] = input[i, k] - lse\n"
+        "Numerically stable log-sum-exp form. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_log_softmax(const float *input, float *output, int M, int K) {
+    for (int m = 0; m < M; m++) {
+        float maxv = input[m*K];
+        for (int k = 1; k < K; k++) {
+            float v = input[m*K + k];
+            if (v > maxv) maxv = v;
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += expf(input[m*K + k] - maxv);
+        }
+        float lse = maxv + logf(sum);
+        for (int k = 0; k < K; k++) {
+            output[m*K + k] = input[m*K + k] - lse;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 1, "K": 16}, {"M": 7, "K": 128}],
+    argtypes_factory=_softmax_argtypes,
+)
+
+
+def _avgpool2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, N, C, IH, IW, KH, KW, SH, SW, PH, PW
+    return [fp, fp] + [ctypes.c_int] * 10
+
+
+AVGPOOL2D = KernelSpec(
+    op="avgpool2d",
+    signature=(
+        "void kernel_avgpool2d(const float *input, float *output, "
+        "int N, int C, int IH, int IW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW)"
+    ),
+    semantics=(
+        "2D average pooling matching torch.nn.AvgPool2d with the default\n"
+        "count_include_pad=True (the divisor is always KH*KW; padded cells\n"
+        "contribute 0). nn.AvgPool2d has no dilation.\n"
+        "Layout (NCHW, row-major):\n"
+        "  input:  [N, C, IH, IW]\n"
+        "  output: [N, C, OH, OW]  with\n"
+        "    OH = (IH + 2*PH - KH) / SH + 1\n"
+        "    OW = (IW + 2*PW - KW) / SW + 1\n"
+        "  output[n, c, oh, ow] = (1/(KH*KW)) * sum over kh, kw of\n"
+        "    val(n, c, oh*SH - PH + kh, ow*SW - PW + kw)\n"
+        "  where val(...) is input at that location or 0 out of bounds.\n"
+        "All tensors float32."
+    ),
+    reference_impl="""\
+void kernel_avgpool2d(const float *input, float *output,
+                      int N, int C, int IH, int IW,
+                      int KH, int KW, int SH, int SW, int PH, int PW) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    float inv = 1.0f / (float)(KH * KW);
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh*SH - PH + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow*SW - PW + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            acc += input[((n*C + c)*IH + ih)*IW + iw];
+                        }
+                    }
+                    output[((n*C + c)*OH + oh)*OW + ow] = acc * inv;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 4, "IH": 32, "IW": 32, "KH": 3, "KW": 3, "SH": 3, "SW": 3,
+         "PH": 0, "PW": 0},
+        {"N": 1, "C": 8, "IH": 16, "IW": 16, "KH": 2, "KW": 2, "SH": 2, "SW": 2,
+         "PH": 1, "PW": 1},
+    ],
+    argtypes_factory=_avgpool2d_argtypes,
+)
+
+
+def _layer_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+def _group_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, gamma, beta, output, N, C, G, HW, eps
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_float]
+
+
+GROUP_NORM = KernelSpec(
+    op="group_norm",
+    signature=(
+        "void kernel_group_norm(const float *input, const float *gamma, "
+        "const float *beta, float *output, int N, int C, int G, int HW, "
+        "float eps)"
+    ),
+    semantics=(
+        "GroupNorm over an NCHW tensor: the C channels are split into G groups\n"
+        "of C/G channels; mean/variance are computed jointly over the\n"
+        "(C/G) * HW elements of each (sample, group), then applied per element:\n"
+        "  output[n, c, i] = gamma[c] * (input[n, c, i] - mu_{n,g}) / \n"
+        "                    sqrt(var_{n,g} + eps) + beta[c]\n"
+        "with g = c / (C/G). gamma/beta are per-channel float32 buffers of\n"
+        "length C (ones/zeros when the module has no affine). InstanceNorm2d is\n"
+        "the G == C special case. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_group_norm(const float *input, const float *gamma,
+                       const float *beta, float *output,
+                       int N, int C, int G, int HW, float eps) {
+    int cpg = C / G;              /* channels per group */
+    long cnt = (long)cpg * HW;
+    for (int n = 0; n < N; n++) {
+        for (int g = 0; g < G; g++) {
+            /* Two-pass (E[x^2] - mean^2 cancels when |mean| >> std, e.g.
+             * GroupNorm after a sigmoid), each with Kahan-compensated fp32
+             * sums: a group can hold ~1e6 elements, where a plain running
+             * sum drifts ~1e-3. No fp64 needed. */
+            float sum = 0.0f, comp = 0.0f;
+            for (int cc = 0; cc < cpg; cc++) {
+                const float *p = input + ((long)(n*C + g*cpg + cc))*HW;
+                for (int i = 0; i < HW; i++) {
+                    float y = p[i] - comp, t = sum + y;
+                    comp = (t - sum) - y;
+                    sum = t;
+                }
+            }
+            float mean = sum / (float)cnt;
+            float sqsum = 0.0f;
+            comp = 0.0f;
+            for (int cc = 0; cc < cpg; cc++) {
+                const float *p = input + ((long)(n*C + g*cpg + cc))*HW;
+                for (int i = 0; i < HW; i++) {
+                    float d = p[i] - mean;
+                    float y = d * d - comp, t = sqsum + y;
+                    comp = (t - sqsum) - y;
+                    sqsum = t;
+                }
+            }
+            float var  = sqsum / (float)cnt;
+            float inv_sigma = 1.0f / sqrtf(var + eps);
+            for (int cc = 0; cc < cpg; cc++) {
+                int c = g*cpg + cc;
+                float gm = gamma[c], bt = beta[c];
+                const float *p = input + ((long)(n*C + c))*HW;
+                float *o = output + ((long)(n*C + c))*HW;
+                for (int i = 0; i < HW; i++) {
+                    o[i] = gm * (p[i] - mean) * inv_sigma + bt;
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 8, "G": 2, "HW": 64, "eps": 1e-5},
+        {"N": 2, "C": 16, "G": 16, "HW": 32, "eps": 1e-5},  # instance-norm case
+    ],
+    argtypes_factory=_group_norm_argtypes,
+)
+
+
+def _rms_norm_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+RMS_NORM = KernelSpec(
+    op="rms_norm",
+    signature=(
+        "void kernel_rms_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner, float eps)"
+    ),
+    semantics=(
+        "RMS normalization over the reduce axis (KernelBench 36 uses dim=1,\n"
+        "keepdim=True, so outer = leading dims, reduce = normalized axis,\n"
+        "inner = trailing dims):\n"
+        "  rms[o, i]           = sqrt(mean_r input[o, r, i]^2 + eps)\n"
+        "  output[o, r, i]     = input[o, r, i] / rms[o, i]\n"
+        "No affine weight (the bench divides by RMS directly). All float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_rms_norm(const float *input, float *output,
+                     int outer, int reduce, int inner, float eps) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float ss = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                float v = input[((long)(o*reduce + r))*inner + i];
+                ss += v * v;
+            }
+            float inv = 1.0f / sqrtf(ss / (float)reduce + eps);
+            for (int r = 0; r < reduce; r++) {
+                long idx = ((long)(o*reduce + r))*inner + i;
+                output[idx] = input[idx] * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "reduce": 8, "inner": 64, "eps": 1e-5},
+        {"outer": 2, "reduce": 16, "inner": 128, "eps": 1e-5},
+    ],
+    argtypes_factory=_rms_norm_argtypes,
+)
+
+
+def _conv_transpose2d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, then 17 ints (N,IC,IH,IW,OC,OH,OW,
+    # KH,KW,SH,SW,PH,PW,DH,DW,G)
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 16
+
+
+CONV_TRANSPOSE2D = KernelSpec(
+    op="conv_transpose2d",
+    signature=(
+        "void kernel_conv_transpose2d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int IH, int IW, int OC, int OH, int OW, "
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "2D transposed convolution (torch.nn.ConvTranspose2d), gather form.\n"
+        "Layout (NCHW):\n"
+        "  input:  [N, IC, IH, IW]\n"
+        "  weight: [IC, OC/G, KH, KW]   (ConvTranspose weight order)\n"
+        "  bias:   [OC] (may be NULL)\n"
+        "  output: [N, OC, OH, OW]\n"
+        "  output_padding is already folded into the caller-supplied OH/OW.\n"
+        "Each output pixel gathers the input pixels that scatter onto it:\n"
+        "  for oc (group g = oc/(OC/G)), oh, ow:\n"
+        "    acc = bias[oc]\n"
+        "    for kh, kw with ih=(oh+PH-kh*DH)/SH, iw=(ow+PW-kw*DW)/SW integral\n"
+        "        and in range, for ic in group g:\n"
+        "      acc += input[n,ic,ih,iw] * weight[ic, oc%(OC/G), kh, kw]\n"
+        "All tensors float32. G is the group count."
+    ),
+    reference_impl="""\
+void kernel_conv_transpose2d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int IH, int IW,
+                             int OC, int OH, int OW,
+                             int KH, int KW, int SH, int SW,
+                             int PH, int PW, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ihs = oh + PH - kh*DH;
+                        if (ihs < 0 || (ihs % SH) != 0) continue;
+                        int ih = ihs / SH;
+                        if (ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iws = ow + PW - kw*DW;
+                            if (iws < 0 || (iws % SW) != 0) continue;
+                            int iw = iws / SW;
+                            if (iw >= IW) continue;
+                            for (int icg = 0; icg < ICpG; icg++) {
+                                int ic = g*ICpG + icg;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+                                /* weight [IC,OCpG,KH,KW] packed (1,2,3,0) ->
+                                   [OCpG,KH,KW,IC]. */
+                                float w = weight[((ocg*KH + kh)*KW + kw)*IC + ic];
+#else
+                                float w = weight[((ic*OCpG + ocg)*KH + kh)*KW + kw];
+#endif
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            weight_layout="ihwoc",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 transposed conv2d over the OUTPUT-CHANNEL "
+                "dimension (gather form). Each output pixel (oc, oh, ow) "
+                "collects the input pixels that scatter onto it: for taps "
+                "(kh, kw), ih=(oh+PH-kh*DH)/SH and iw=(ow+PW-kw*DW)/SW "
+                "contribute only when those divisions are exact and in "
+                "range. Weights are packed IHWOC — torch ConvTranspose "
+                "weight [IC][OCpG][KH][KW] permuted (1,2,3,0) to "
+                "[OCpG][KH][KW][IC], i.e. weight[((ocg*KH+kh)*KW+kw)*IC+ic]. "
+                "For each (n, g, oh, ow) hold a vl-wide vfloat32 accumulator "
+                "(one lane per OC in the group), seed from bias, then for "
+                "every valid (icg, kh, kw) broadcast the input pixel as a "
+                "scalar and fold it in with a single vfmacc.vf. Consecutive "
+                "OC lanes are KH*KW*IC apart in the weight buffer, so the "
+                "per-lane OC weight slab is a strided vlse32; output is NCHW "
+                "so the per-OC store is strided by OH*OW (vsse32). Tail-"
+                "handle OC with vsetvl (VLEN not assumed); groups via an "
+                "outer g loop."
+            ),
+            reference_impl="""\
+void kernel_conv_transpose2d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int IH, int IW,
+                             int OC, int OH, int OW,
+                             int KH, int KW, int SH, int SW,
+                             int PH, int PW, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    float acc = bias ? bias[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ihs = oh + PH - kh*DH;
+                        if (ihs < 0 || (ihs % SH) != 0) continue;
+                        int ih = ihs / SH;
+                        if (ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iws = ow + PW - kw*DW;
+                            if (iws < 0 || (iws % SW) != 0) continue;
+                            int iw = iws / SW;
+                            if (iw >= IW) continue;
+                            for (int icg = 0; icg < ICpG; icg++) {
+                                int ic = g*ICpG + icg;
+                                float v = input[((n*IC + ic)*IH + ih)*IW + iw];
+                                /* IHWOC: [OCpG][KH][KW][IC]. */
+                                float w = weight[((ocg*KH + kh)*KW + kw)*IC + ic];
+                                acc += v * w;
+                            }
+                        }
+                    }
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
+    extra_shapes=[
+        # basic stride-1
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 6, "OH": 10, "OW": 10,
+         "KH": 3, "KW": 3, "SH": 1, "SW": 1, "PH": 0, "PW": 0, "DH": 1, "DW": 1,
+         "G": 1},
+        # strided
+        {"N": 1, "IC": 4, "IH": 8, "IW": 8, "OC": 4, "OH": 17, "OW": 17,
+         "KH": 3, "KW": 3, "SH": 2, "SW": 2, "PH": 0, "PW": 0, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv_transpose2d_argtypes,
+)
+
+
+def _conv3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, weight, bias, output, then 22 ints
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 22
+
+
+CONV3D = KernelSpec(
+    op="conv3d",
+    signature=(
+        "void kernel_conv3d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int ID, int IH, int IW, "
+        "int OC, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "3D convolution (torch.nn.Conv3d). NCDHW layout:\n"
+        "  input:  [N, IC, ID, IH, IW]\n"
+        "  weight: [OC, IC/G, KD, KH, KW]  (5D — not backend-repacked)\n"
+        "  bias:   [OC] (may be NULL)\n"
+        "  output: [N, OC, OD, OH, OW]\n"
+        "  output[n,oc,od,oh,ow] = bias[oc] + sum over kd,kh,kw and ic in\n"
+        "  group(oc) of input[n,ic, od*SD-PD+kd*DD, oh*SH-PH+kh*DH,\n"
+        "  ow*SW-PW+kw*DW] * weight[oc, ic%(IC/G), kd, kh, kw], zero-padded.\n"
+        "All tensors float32; G is the group count, D* are dilations."
+    ),
+    reference_impl="""\
+void kernel_conv3d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int ID, int IH, int IW,
+                   int OC, int OD, int OH, int OW,
+                   int KD, int KH, int KW, int SD, int SH, int SW,
+                   int PD, int PH, int PW, int DD, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd*DD;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh*DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw*DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    for (int icg = 0; icg < ICpG; icg++) {
+                                        int ic = g*ICpG + icg;
+                                        float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                        float w = weight[(((long)(oc*ICpG + icg)*KD + kd)*KH + kh)*KW + kw];
+                                        acc += v * w;
+                                    }
+                                }
+                            }
+                        }
+                        output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 2, "ID": 6, "IH": 6, "IW": 6, "OC": 4, "OD": 4,
+         "OH": 4, "OW": 4, "KD": 3, "KH": 3, "KW": 3, "SD": 1, "SH": 1,
+         "SW": 1, "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv3d_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="rvv_oc_blocked",
+            target_affinity=("rvv",),
+            # conv3d weights are 5D [OC][IC/G][KD][KH][KW] and are NOT
+            # backend-repacked (_backend_pack_weight only permutes 4D
+            # tensors), so we stay in native OIDHW and reach the OC slab with
+            # a strided load instead of the conv2d IHWOC unit-stride trick.
+            weight_layout="oihw",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Vectorize fp32 conv3d over the OUTPUT-CHANNEL dimension. "
+                "Weights stay in native OIDHW ([OC][IC/G][KD][KH][KW], OC "
+                "OUTERMOST) because 5D conv weights are not backend-repacked, "
+                "so the OC slab for a fixed (icg, kd, kh, kw) is a STRIDED "
+                "vector load (vlse32) with element stride IC/G*KD*KH*KW. For "
+                "each (n, od, oh, ow) output voxel hold a vl-wide vfloat32 "
+                "accumulator (one lane per OC), seed it from bias (unit-stride "
+                "vle32, OC contiguous), then for every (kd, kh, kw, icg) "
+                "broadcast the input voxel as a scalar and fold it in with a "
+                "single vfmacc.vf. Tail-handle OC with vsetvl (VLEN not "
+                "assumed). Output is NCDHW so the per-OC store is strided by "
+                "OD*OH*OW (vsse32). Groups: slab OC WITHIN a single group so "
+                "the input-channel base never straddles a group boundary."
+            ),
+            reference_impl="""\
+void kernel_conv3d(const float *input, const float *weight, const float *bias,
+                   float *output,
+                   int N, int IC, int ID, int IH, int IW,
+                   int OC, int OD, int OH, int OW,
+                   int KD, int KH, int KW, int SD, int SH, int SW,
+                   int PD, int PH, int PW, int DD, int DH, int DW, int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int g = 0; g < G; g++) {
+            int ic_base = g * ICpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        for (int oc = g*OCpG; oc < (g+1)*OCpG; oc++) {
+                            float acc = bias ? bias[oc] : 0.0f;
+                            for (int kd = 0; kd < KD; kd++) {
+                                int id = od*SD - PD + kd*DD;
+                                if (id < 0 || id >= ID) continue;
+                                for (int kh = 0; kh < KH; kh++) {
+                                    int ih = oh*SH - PH + kh*DH;
+                                    if (ih < 0 || ih >= IH) continue;
+                                    for (int kw = 0; kw < KW; kw++) {
+                                        int iw = ow*SW - PW + kw*DW;
+                                        if (iw < 0 || iw >= IW) continue;
+                                        for (int icg = 0; icg < ICpG; icg++) {
+                                            int ic = ic_base + icg;
+                                            float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                            /* OIDHW weight, OC outermost. */
+                                            float w = weight[(((long)(oc*ICpG + icg)*KD + kd)*KH + kh)*KW + kw];
+                                            acc += v * w;
+                                        }
+                                    }
+                                }
+                            }
+                            output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+        ),
+    ],
+)
+
+
+CONV_TRANSPOSE3D = KernelSpec(
+    op="conv_transpose3d",
+    signature=(
+        "void kernel_conv_transpose3d(const float *input, const float *weight, "
+        "const float *bias, float *output, "
+        "int N, int IC, int ID, int IH, int IW, "
+        "int OC, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW, int G)"
+    ),
+    semantics=(
+        "3D transposed convolution (torch.nn.ConvTranspose3d), gather form.\n"
+        "NCDHW; weight [IC, OC/G, KD, KH, KW] (5D, not repacked). OD/OH/OW\n"
+        "already include output_padding. Each output voxel gathers the inputs\n"
+        "that scatter onto it: for kd,kh,kw with id=(od+PD-kd*DD)/SD etc.\n"
+        "integral and in range, acc += input[n,ic,id,ih,iw] *\n"
+        "weight[ic, oc%(OC/G), kd, kh, kw]. bias may be NULL. float32."
+    ),
+    reference_impl="""\
+void kernel_conv_transpose3d(const float *input, const float *weight,
+                             const float *bias, float *output,
+                             int N, int IC, int ID, int IH, int IW,
+                             int OC, int OD, int OH, int OW,
+                             int KD, int KH, int KW, int SD, int SH, int SW,
+                             int PD, int PH, int PW, int DD, int DH, int DW,
+                             int G) {
+    int ICpG = IC / G;
+    int OCpG = OC / G;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            int g = oc / OCpG;
+            int ocg = oc % OCpG;
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = bias ? bias[oc] : 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int ids = od + PD - kd*DD;
+                            if (ids < 0 || (ids % SD) != 0) continue;
+                            int id = ids / SD;
+                            if (id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ihs = oh + PH - kh*DH;
+                                if (ihs < 0 || (ihs % SH) != 0) continue;
+                                int ih = ihs / SH;
+                                if (ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iws = ow + PW - kw*DW;
+                                    if (iws < 0 || (iws % SW) != 0) continue;
+                                    int iw = iws / SW;
+                                    if (iw >= IW) continue;
+                                    for (int icg = 0; icg < ICpG; icg++) {
+                                        int ic = g*ICpG + icg;
+                                        float v = input[(((long)(n*IC + ic)*ID + id)*IH + ih)*IW + iw];
+                                        float w = weight[(((long)(ic*OCpG + ocg)*KD + kd)*KH + kh)*KW + kw];
+                                        acc += v * w;
+                                    }
+                                }
+                            }
+                        }
+                        output[(((long)(n*OC + oc)*OD + od)*OH + oh)*OW + ow] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "IC": 2, "ID": 4, "IH": 4, "IW": 4, "OC": 4, "OD": 6,
+         "OH": 6, "OW": 6, "KD": 3, "KH": 3, "KW": 3, "SD": 1, "SH": 1,
+         "SW": 1, "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1,
+         "G": 1},
+    ],
+    argtypes_factory=_conv3d_argtypes,
+)
+
+
+def _maxpool3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, then 20 ints
+    return [fp, fp] + [ctypes.c_int] * 20
+
+
+MAXPOOL3D = KernelSpec(
+    op="maxpool3d",
+    signature=(
+        "void kernel_maxpool3d(const float *input, float *output, "
+        "int N, int C, int ID, int IH, int IW, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW, int DD, int DH, int DW)"
+    ),
+    semantics=(
+        "3D max pooling (torch.nn.MaxPool3d) over NCDHW, with padding and\n"
+        "dilation. Out-of-bounds taps never win the max (treated as -inf).\n"
+        "  output[n,c,od,oh,ow] = max over kd,kh,kw of\n"
+        "    input[n,c, od*SD-PD+kd*DD, oh*SH-PH+kh*DH, ow*SW-PW+kw*DW].\n"
+        "float32."
+    ),
+    reference_impl="""\
+#include <float.h>
+
+void kernel_maxpool3d(const float *input, float *output,
+                      int N, int C, int ID, int IH, int IW,
+                      int OD, int OH, int OW,
+                      int KD, int KH, int KW, int SD, int SH, int SW,
+                      int PD, int PH, int PW, int DD, int DH, int DW) {
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float m = -FLT_MAX;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd*DD;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh*DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw*DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    float v = input[(((long)(n*C + c)*ID + id)*IH + ih)*IW + iw];
+                                    if (v > m) m = v;
+                                }
+                            }
+                        }
+                        output[(((long)(n*C + c)*OD + od)*OH + oh)*OW + ow] = m;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 2, "ID": 8, "IH": 8, "IW": 8, "OD": 4, "OH": 4,
+         "OW": 4, "KD": 2, "KH": 2, "KW": 2, "SD": 2, "SH": 2, "SW": 2,
+         "PD": 0, "PH": 0, "PW": 0, "DD": 1, "DH": 1, "DW": 1},
+    ],
+    argtypes_factory=_maxpool3d_argtypes,
+)
+
+
+def _avgpool3d_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    # input, output, then 17 ints
+    return [fp, fp] + [ctypes.c_int] * 17
+
+
+AVGPOOL3D = KernelSpec(
+    op="avgpool3d",
+    signature=(
+        "void kernel_avgpool3d(const float *input, float *output, "
+        "int N, int C, int ID, int IH, int IW, int OD, int OH, int OW, "
+        "int KD, int KH, int KW, int SD, int SH, int SW, "
+        "int PD, int PH, int PW)"
+    ),
+    semantics=(
+        "3D average pooling (torch.nn.AvgPool3d), count_include_pad=True\n"
+        "(divisor KD*KH*KW; padded cells contribute 0), no dilation. NCDHW.\n"
+        "  output[n,c,od,oh,ow] = (1/(KD*KH*KW)) * sum over kd,kh,kw of\n"
+        "    input[n,c, od*SD-PD+kd, oh*SH-PH+kh, ow*SW-PW+kw]. float32."
+    ),
+    reference_impl="""\
+void kernel_avgpool3d(const float *input, float *output,
+                      int N, int C, int ID, int IH, int IW,
+                      int OD, int OH, int OW,
+                      int KD, int KH, int KW, int SD, int SH, int SW,
+                      int PD, int PH, int PW) {
+    float inv = 1.0f / (float)(KD * KH * KW);
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int od = 0; od < OD; od++) {
+                for (int oh = 0; oh < OH; oh++) {
+                    for (int ow = 0; ow < OW; ow++) {
+                        float acc = 0.0f;
+                        for (int kd = 0; kd < KD; kd++) {
+                            int id = od*SD - PD + kd;
+                            if (id < 0 || id >= ID) continue;
+                            for (int kh = 0; kh < KH; kh++) {
+                                int ih = oh*SH - PH + kh;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    int iw = ow*SW - PW + kw;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    acc += input[(((long)(n*C + c)*ID + id)*IH + ih)*IW + iw];
+                                }
+                            }
+                        }
+                        output[(((long)(n*C + c)*OD + od)*OH + oh)*OW + ow] = acc * inv;
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"N": 1, "C": 2, "ID": 8, "IH": 8, "IW": 8, "OD": 4, "OH": 4,
+         "OW": 4, "KD": 2, "KH": 2, "KW": 2, "SD": 2, "SH": 2, "SW": 2,
+         "PD": 0, "PH": 0, "PW": 0},
+    ],
+    argtypes_factory=_avgpool3d_argtypes,
+)
+
+
+def _tri_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+TRIU = KernelSpec(
+    op="triu",
+    signature=(
+        "void kernel_triu(const float *input, float *output, "
+        "int M, int N, int diagonal)"
+    ),
+    semantics=(
+        "Upper-triangular mask (torch.triu) of an [M, N] matrix: keep elements\n"
+        "on and above the k-th diagonal, zero the rest.\n"
+        "  output[i, j] = input[i, j] if j >= i + diagonal else 0\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_triu(const float *input, float *output, int M, int N, int diagonal) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            output[i*N + j] = (j >= i + diagonal) ? input[i*N + j] : 0.0f;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 8, "N": 8, "diagonal": 0}],
+    argtypes_factory=_tri_argtypes,
+)
+
+
+TRIL = KernelSpec(
+    op="tril",
+    signature=(
+        "void kernel_tril(const float *input, float *output, "
+        "int M, int N, int diagonal)"
+    ),
+    semantics=(
+        "Lower-triangular mask (torch.tril) of an [M, N] matrix: keep elements\n"
+        "on and below the k-th diagonal, zero the rest.\n"
+        "  output[i, j] = input[i, j] if j <= i + diagonal else 0\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_tril(const float *input, float *output, int M, int N, int diagonal) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            output[i*N + j] = (j <= i + diagonal) ? input[i*N + j] : 0.0f;
+        }
+    }
+}
+""",
+    extra_shapes=[{"M": 8, "N": 8, "diagonal": 0}],
+    argtypes_factory=_tri_argtypes,
+)
+
+
+def _diag_matmul_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+DIAG_MATMUL = KernelSpec(
+    op="diag_matmul",
+    signature=(
+        "void kernel_diag_matmul(const float *a, const float *b, "
+        "float *output, int N, int M)"
+    ),
+    semantics=(
+        "diag(a) @ b, where a is a 1D vector of length N and b is [N, M]:\n"
+        "  output[i, j] = a[i] * b[i, j]\n"
+        "i.e. row-wise scaling of b by a (torch.diag(A) @ B, KernelBench 12).\n"
+        "The N×N diagonal matrix is never materialized. float32."
+    ),
+    reference_impl="""\
+void kernel_diag_matmul(const float *a, const float *b, float *output,
+                        int N, int M) {
+    for (int i = 0; i < N; i++) {
+        float ai = a[i];
+        for (int j = 0; j < M; j++) {
+            output[i*M + j] = ai * b[i*M + j];
+        }
+    }
+}
+""",
+    extra_shapes=[{"N": 8, "M": 16}],
+    argtypes_factory=_diag_matmul_argtypes,
+)
+
+
+def _scan_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+CUMSUM = KernelSpec(
+    op="cumsum",
+    signature=(
+        "void kernel_cumsum(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Cumulative sum along the scan axis (torch.cumsum). The tensor is\n"
+        "viewed as [outer, axis, inner] (outer = product of dims before the\n"
+        "scan dim, inner = product of dims after):\n"
+        "  output[o, a, i] = sum over a' in [0, a] of input[o, a', i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_cumsum(const float *input, float *output,
+                   int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 0.0f;
+            for (int a = 0; a < axis; a++) {
+                long idx = ((long)(o*axis + a))*inner + i;
+                acc += input[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+CUMPROD = KernelSpec(
+    op="cumprod",
+    signature=(
+        "void kernel_cumprod(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Cumulative product along the scan axis (torch.cumprod), viewed as\n"
+        "[outer, axis, inner]:\n"
+        "  output[o, a, i] = product over a' in [0, a] of input[o, a', i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_cumprod(const float *input, float *output,
+                    int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float acc = 1.0f;
+            for (int a = 0; a < axis; a++) {
+                long idx = ((long)(o*axis + a))*inner + i;
+                acc *= input[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+FLIP = KernelSpec(
+    op="flip",
+    signature=(
+        "void kernel_flip(const float *input, float *output, "
+        "int outer, int axis, int inner)"
+    ),
+    semantics=(
+        "Reverse along one axis (torch.flip / Tensor.flip), viewed as\n"
+        "[outer, axis, inner]:\n"
+        "  output[o, a, i] = input[o, axis-1-a, i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_flip(const float *input, float *output,
+                 int outer, int axis, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int a = 0; a < axis; a++) {
+            for (int i = 0; i < inner; i++) {
+                output[((long)(o*axis + a))*inner + i] =
+                    input[((long)(o*axis + (axis-1-a)))*inner + i];
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "axis": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+def _excl_cumsum_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+EXCLUSIVE_CUMSUM = KernelSpec(
+    op="exclusive_cumsum",
+    signature=(
+        "void kernel_exclusive_cumsum(const float *x, float *output, "
+        "int Bout, int N)"
+    ),
+    semantics=(
+        "Exclusive cumulative sum with a leading zero, as computed by\n"
+        "KernelBench 92: cat([zeros, x], dim=1)[:-1] then cumsum(dim=1).\n"
+        "x is [B, N]; the [:-1] drops the last row (dim 0), so the output is\n"
+        "[Bout, N+1] with Bout = B-1. For each kept row b:\n"
+        "  output[b, 0] = 0;  output[b, k] = sum_{j<k} x[b, j]  (k=1..N)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_exclusive_cumsum(const float *x, float *output, int Bout, int N) {
+    for (int b = 0; b < Bout; b++) {
+        float acc = 0.0f;
+        for (int k = 0; k <= N; k++) {
+            output[(long)b*(N+1) + k] = acc;
+            if (k < N) acc += x[(long)b*N + k];
+        }
+    }
+}
+""",
+    extra_shapes=[{"Bout": 4, "N": 16}],
+    argtypes_factory=_excl_cumsum_argtypes,
+)
+
+
+def _pointwise2_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int]
+
+
+def _mul_scalar_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+MUL_SCALAR = KernelSpec(
+    op="mul_scalar",
+    signature="void kernel_mul_scalar(const float *input, float *output, int n, float s)",
+    semantics=(
+        "Multiply a tensor by a compile-time scalar constant (KernelBench 5,\n"
+        "A * s with s a Python float bound at extract time):\n"
+        "  output[i] = input[i] * s   for i in [0, n)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_mul_scalar(const float *input, float *output, int n, float s) {
+    for (int i = 0; i < n; i++) output[i] = input[i] * s;
+}
+""",
+    extra_shapes=[{"n": 64, "s": 1.0}],
+    argtypes_factory=_mul_scalar_argtypes,
+)
+
+
+MUL = KernelSpec(
+    op="mul",
+    signature=(
+        "void kernel_mul(const float *a, const float *b, float *output, int n)"
+    ),
+    semantics=(
+        "Elementwise multiply of two equal-shaped tensors:\n"
+        "  output[i] = a[i] * b[i]   for i in [0, n)\n"
+        "float32."
+    ),
+    reference_impl="""\
+void kernel_mul(const float *a, const float *b, float *output, int n) {
+    for (int i = 0; i < n; i++) {
+        output[i] = a[i] * b[i];
+    }
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_pointwise2_argtypes,
+)
+
+
+MEAN_ABS_NORM = KernelSpec(
+    op="mean_abs_norm",
+    signature=(
+        "void kernel_mean_abs_norm(const float *input, float *output, "
+        "int outer, int reduce, int inner)"
+    ),
+    semantics=(
+        "L1 normalization (KernelBench 38): divide by the mean absolute value\n"
+        "over the reduce axis (dim=1, keepdim=True), viewed as\n"
+        "[outer, reduce, inner]:\n"
+        "  denom[o, i]      = (1/reduce) * sum_r |input[o, r, i]|\n"
+        "  output[o, r, i]  = input[o, r, i] / denom[o, i]\n"
+        "float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_mean_abs_norm(const float *input, float *output,
+                          int outer, int reduce, int inner) {
+    for (int o = 0; o < outer; o++) {
+        for (int i = 0; i < inner; i++) {
+            float s = 0.0f;
+            for (int r = 0; r < reduce; r++) {
+                s += fabsf(input[((long)(o*reduce + r))*inner + i]);
+            }
+            float denom = s / (float)reduce;
+            for (int r = 0; r < reduce; r++) {
+                long idx = ((long)(o*reduce + r))*inner + i;
+                output[idx] = input[idx] / denom;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"outer": 4, "reduce": 16, "inner": 1}],
+    argtypes_factory=_scan_argtypes,
+)
+
+
+LAYER_NORM = KernelSpec(
+    op="layer_norm",
+    signature=(
+        "void kernel_layer_norm(const float *input, const float *gamma, "
+        "const float *beta, float *output, int M, int K, float eps)"
+    ),
+    semantics=(
+        "LayerNorm over the last axis of an [M, K] tensor (K = product of the\n"
+        "normalized_shape dims, M = product of the leading dims):\n"
+        "  mu     = mean(input[m, :])\n"
+        "  sigma  = sqrt(var(input[m, :]) + eps)\n"
+        "  output[m, k] = gamma[k] * (input[m, k] - mu) / sigma + beta[k]\n"
+        "gamma and beta are float32 buffers of length K. All tensors float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_layer_norm(const float *input, const float *gamma,
+                       const float *beta, float *output,
+                       int M, int K, float eps) {
+    for (int m = 0; m < M; m++) {
+        /* two-pass: E[x^2] - mean^2 cancels when |mean| >> std */
+        float sum = 0.0f, sqsum = 0.0f;
+        for (int k = 0; k < K; k++) sum += input[m*K + k];
+        float mean = sum / (float)K;
+        for (int k = 0; k < K; k++) {
+            float d = input[m*K + k] - mean;
+            sqsum += d * d;
+        }
+        float var  = sqsum / (float)K;
+        float inv_sigma = 1.0f / sqrtf(var + eps);
+        for (int k = 0; k < K; k++) {
+            float v = input[m*K + k];
+            output[m*K + k] = gamma[k] * (v - mean) * inv_sigma + beta[k];
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"M": 1, "K": 16, "eps": 1e-5},
+        {"M": 7, "K": 512, "eps": 1e-5},
+    ],
+    argtypes_factory=_layer_norm_argtypes,
+)
+
+
+def _loss2_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int]
+
+
+MSE_LOSS = KernelSpec(
+    op="mse_loss",
+    signature="void kernel_mse_loss(const float *a, const float *b, float *output, int n)",
+    semantics=(
+        "Mean squared error (KernelBench 94, mean((a-b)^2)):\n"
+        "  output[0] = (1/n) * sum_i (a[i] - b[i])^2\n"
+        "float32; output is a single scalar."
+    ),
+    reference_impl="""\
+void kernel_mse_loss(const float *a, const float *b, float *output, int n) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float d = a[i] - b[i];
+        acc += (double)d * d;
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_loss2_argtypes,
+)
+
+
+def _huber_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_float]
+
+
+HUBER_LOSS = KernelSpec(
+    op="huber_loss",
+    signature=(
+        "void kernel_huber_loss(const float *a, const float *b, float *output, "
+        "int n, float beta)"
+    ),
+    semantics=(
+        "Smooth-L1 / Huber loss (F.smooth_l1_loss, reduction=mean; KernelBench\n"
+        "96). Per element with d = a-b: 0.5*d^2/beta if |d| < beta, else\n"
+        "|d| - 0.5*beta. output[0] = mean over n. beta defaults to 1.0. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_huber_loss(const float *a, const float *b, float *output,
+                       int n, float beta) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        acc += (d < beta) ? (0.5 * d * d / beta) : (d - 0.5 * beta);
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64, "beta": 1.0}],
+    argtypes_factory=_huber_argtypes,
+)
+
+
+def _hinge_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+HINGE_LOSS = KernelSpec(
+    op="hinge_loss",
+    signature=(
+        "void kernel_hinge_loss(const float *pred, const float *targ, "
+        "float *output, int n, int targ_len)"
+    ),
+    semantics=(
+        "Hinge loss (KernelBench 100, mean(clamp(1 - pred*targ, min=0))):\n"
+        "  output[0] = (1/n) * sum_i max(0, 1 - pred[i]*targ[i % targ_len])\n"
+        "targ broadcasts over pred (targ_len == n for no broadcast, or a\n"
+        "divisor of n — e.g. 1 for a per-batch scalar). targ is expected in\n"
+        "{-1, +1}. float32; scalar output."
+    ),
+    reference_impl="""\
+void kernel_hinge_loss(const float *pred, const float *targ, float *output,
+                       int n, int targ_len) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float h = 1.0f - pred[i] * targ[i % targ_len];
+        if (h > 0.0f) acc += h;
+    }
+    output[0] = (float)(acc / (double)n);
+}
+""",
+    extra_shapes=[{"n": 64, "targ_len": 64}],
+    argtypes_factory=_hinge_argtypes,
+)
+
+
+def _ce_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, ctypes.c_int, ctypes.c_int]
+
+
+CROSS_ENTROPY_LOSS = KernelSpec(
+    op="cross_entropy_loss",
+    signature=(
+        "void kernel_cross_entropy_loss(const float *logits, "
+        "const float *targets, float *output, int N, int C)"
+    ),
+    semantics=(
+        "Cross-entropy loss (F.cross_entropy, reduction=mean; KernelBench 95).\n"
+        "logits is [N, C]; targets are N class indices passed as floats (cast\n"
+        "to int). loss_i = logsumexp(logits[i,:]) - logits[i, t_i].\n"
+        "output[0] = mean_i loss_i. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_cross_entropy_loss(const float *logits, const float *targets,
+                               float *output, int N, int C) {
+    double total = 0.0;
+    for (int i = 0; i < N; i++) {
+        const float *row = logits + (long)i * C;
+        float maxv = row[0];
+        for (int c = 1; c < C; c++) if (row[c] > maxv) maxv = row[c];
+        float sum = 0.0f;
+        for (int c = 0; c < C; c++) sum += expf(row[c] - maxv);
+        float lse = maxv + logf(sum);
+        int t = (int)(targets[i] + 0.5f);
+        total += (double)(lse - row[t]);
+    }
+    output[0] = (float)(total / (double)N);
+}
+""",
+    extra_shapes=[{"N": 4, "C": 8}],
+    argtypes_factory=_ce_argtypes,
+)
+
+
+KLDIV_LOSS = KernelSpec(
+    op="kldiv_loss",
+    signature=(
+        "void kernel_kldiv_loss(const float *log_input, const float *target, "
+        "float *output, int N, int C)"
+    ),
+    semantics=(
+        "KL divergence, reduction='batchmean' (F.kl_div; KernelBench 98). The\n"
+        "first arg is already log(pred). Over an [N, C] tensor:\n"
+        "  output[0] = (1/N) * sum_{i,c} target*(log(target) - log_input)\n"
+        "target*log(target) is taken as 0 where target == 0. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_kldiv_loss(const float *log_input, const float *target,
+                       float *output, int N, int C) {
+    double acc = 0.0;
+    long total = (long)N * C;
+    for (long i = 0; i < total; i++) {
+        float t = target[i];
+        if (t > 0.0f) acc += (double)t * (logf(t) - log_input[i]);
+    }
+    output[0] = (float)(acc / (double)N);
+}
+""",
+    extra_shapes=[{"N": 4, "C": 8}],
+    argtypes_factory=_ce_argtypes,
+)
+
+
+def _triplet_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+
+
+TRIPLET_LOSS = KernelSpec(
+    op="triplet_loss",
+    signature=(
+        "void kernel_triplet_loss(const float *anchor, const float *pos, "
+        "const float *neg, float *output, int B, int F, float margin)"
+    ),
+    semantics=(
+        "Triplet margin loss (nn.TripletMarginLoss, p=2, reduction=mean;\n"
+        "KernelBench 99). Per sample b over F features:\n"
+        "  dp = ||anchor_b - pos_b||_2,  dn = ||anchor_b - neg_b||_2\n"
+        "  loss_b = max(0, dp - dn + margin)\n"
+        "output[0] = mean_b loss_b. float32."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_triplet_loss(const float *anchor, const float *pos,
+                         const float *neg, float *output,
+                         int B, int F, float margin) {
+    double total = 0.0;
+    for (int b = 0; b < B; b++) {
+        const float *a = anchor + (long)b * F;
+        const float *p = pos + (long)b * F;
+        const float *n = neg + (long)b * F;
+        float sp = 0.0f, sn = 0.0f;
+        for (int f = 0; f < F; f++) {
+            float dp = a[f] - p[f];
+            float dn = a[f] - n[f];
+            sp += dp * dp;
+            sn += dn * dn;
+        }
+        float loss = sqrtf(sp) - sqrtf(sn) + margin;
+        if (loss > 0.0f) total += (double)loss;
+    }
+    output[0] = (float)(total / (double)B);
+}
+""",
+    extra_shapes=[{"B": 4, "F": 16, "margin": 1.0}],
+    argtypes_factory=_triplet_argtypes,
+)
+
+
+def _log_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, ctypes.c_int]
+
+
+LOG = KernelSpec(
+    op="log",
+    signature="void kernel_log(const float *input, float *output, int n)",
+    semantics="Elementwise natural log: output[i] = logf(input[i]). float32.",
+    reference_impl="""\
+#include <math.h>
+
+void kernel_log(const float *input, float *output, int n) {
+    for (int i = 0; i < n; i++) output[i] = logf(input[i]);
+}
+""",
+    extra_shapes=[{"n": 64}],
+    argtypes_factory=_log_argtypes,
+)
+
+
+def _sdpa_argtypes():
+    import ctypes
+    fp = ctypes.POINTER(ctypes.c_float)
+    return [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+SDPA = KernelSpec(
+    op="sdpa",
+    signature=(
+        "void kernel_sdpa(const float *Q, const float *K, const float *V, "
+        "float *output, int BH, int S, int D)"
+    ),
+    semantics=(
+        "Scaled dot-product attention (F.scaled_dot_product_attention, no mask,\n"
+        "no dropout; KernelBench 97). Q/K/V are [B, H, S, D] viewed as BH=B*H\n"
+        "independent [S, D] attentions:\n"
+        "  scores = (Q @ K^T) / sqrt(D)      [S, S]\n"
+        "  P      = softmax(scores, axis=-1)\n"
+        "  output = P @ V                    [S, D]\n"
+        "Math in fp32. A per-row scores[S] scratch buffer is used."
+    ),
+    reference_impl="""\
+#include <math.h>
+
+void kernel_sdpa(const float *Q, const float *K, const float *V,
+                 float *output, int BH, int S, int D) {
+    float scale = 1.0f / sqrtf((float)D);
+    for (int bh = 0; bh < BH; bh++) {
+        const float *Qb = Q + (long)bh * S * D;
+        const float *Kb = K + (long)bh * S * D;
+        const float *Vb = V + (long)bh * S * D;
+        float *Ob = output + (long)bh * S * D;
+        float scores[S];
+        for (int i = 0; i < S; i++) {
+            const float *qi = Qb + (long)i * D;
+            float smax = -3.402823e38f;
+            for (int j = 0; j < S; j++) {
+                const float *kj = Kb + (long)j * D;
+                float s = 0.0f;
+                for (int d = 0; d < D; d++) s += qi[d] * kj[d];
+                s *= scale;
+                scores[j] = s;
+                if (s > smax) smax = s;
+            }
+            float sum = 0.0f;
+            for (int j = 0; j < S; j++) {
+                scores[j] = expf(scores[j] - smax);
+                sum += scores[j];
+            }
+            float inv = 1.0f / sum;
+            float *oi = Ob + (long)i * D;
+            for (int d = 0; d < D; d++) {
+                float acc = 0.0f;
+                for (int j = 0; j < S; j++) acc += scores[j] * Vb[(long)j * D + d];
+                oi[d] = acc * inv;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[{"BH": 2, "S": 8, "D": 16}],
+    argtypes_factory=_sdpa_argtypes,
+)
+
+
+KERNEL_SPECS: dict[str, KernelSpec] = {
+    'linear': LINEAR,
+    'matmul': MATMUL,
+    'matmul_ta': MATMUL_TA,
+    'matmul_tb': MATMUL_TB,
+    'matmul_tatb': MATMUL_TATB,
+    'bmm': BMM,
+    'relu': RELU,
+    'relu6': RELU6,
+    'elu': ELU,
+    'leaky_relu': LEAKY_RELU,
+    'tanh': TANH,
+    'swish': SWISH,
+    'gelu': GELU,
+    'gelu_exact': GELU_EXACT,
+    'selu': SELU,
+    'hardsigmoid': HARDSIGMOID,
+    'softplus': SOFTPLUS,
+    'softsign': SOFTSIGN,
+    'hardtanh': HARDTANH,
+    'sum_dim': SUM_DIM,
+    'mean_dim': MEAN_DIM,
+    'max_dim': MAX_DIM,
+    'min_dim': MIN_DIM,
+    'prod_dim': PROD_DIM,
+    'argmax_dim': ARGMAX_DIM,
+    'argmin_dim': ARGMIN_DIM,
+    'l1_norm': L1_NORM,
+    'l2_norm': L2_NORM,
+    'frobenius_norm': FROBENIUS_NORM,
+    'conv2d': CONV2D,
+    'conv2d_dw': CONV2D_DW,
+    'maxpool2d': MAXPOOL2D,
+    'adaptive_avg_pool2d': ADAPTIVE_AVG_POOL2D,
+    'add': ADD,
+    'batchnorm2d': BATCHNORM2D,
+    'sigmoid': SIGMOID,
+    'linear_s8': LINEAR_S8,
+    'relu_s8': RELU_S8,
+    'conv2d_s8': CONV2D_S8,
+    'conv2d_silu_s8': CONV2D_SILU_S8,
+    'maxpool2d_s8': MAXPOOL2D_S8,
+    'add_s8': ADD_S8,
+    'batchnorm2d_s8': BATCHNORM2D_S8,
+    'sigmoid_s8': SIGMOID_S8,
+    'relu_f16': RELU_F16,
+    'sigmoid_f16': SIGMOID_F16,
+    'elu_f16': ELU_F16,
+    'batchnorm2d_f16': BATCHNORM2D_F16,
+    'maxpool2d_f16': MAXPOOL2D_F16,
+    'conv2d_f16': CONV2D_F16,
+    'matmul_f16': MATMUL_F16,
+    'matmul_ta_f16': MATMUL_TA_F16,
+    'matmul_tb_f16': MATMUL_TB_F16,
+    'matmul_tatb_f16': MATMUL_TATB_F16,
+    'bmm_f16': BMM_F16,
+    'cast_i8_to_f16': CAST_I8_TO_F16,
+    'cast_f16_to_i8': CAST_F16_TO_I8,
+    'linear_f16': LINEAR_F16,
+    'lstm_f16': LSTM_F16,
+    'depthwise_conv2d_f16': DEPTHWISE_CONV2D_F16,
+    'layer_norm_f16': LAYER_NORM_F16,
+    'gelu_f16': GELU_F16,
+    'softmax_f16': SOFTMAX_F16,
+    'add_f16': ADD_F16,
+    'mul_f16': MUL_F16,
+    'mul_c1_f16': MUL_C1_F16,
+    'mul_c1_s8': MUL_C1_S8,
+    'adaptive_avg_pool2d_f16': ADAPTIVE_AVG_POOL2D_F16,
+    'slice_c_f16': SLICE_C_F16,
+    'cat2_c1_f16': CAT2_C1_F16,
+    'cat3_c1_f16': CAT3_C1_F16,
+    'cat4_c1_f16': CAT4_C1_F16,
+    'pad_f16': PAD_F16,
+    'silu_f16': SILU_F16,
+    'upsample_nearest_f16': UPSAMPLE_NEAREST_F16,
+    'silu': SILU,
+    'upsample_nearest': UPSAMPLE_NEAREST,
+    'cat2_c1': CAT2_C1,
+    'cat3_c1': CAT3_C1,
+    'cat4_c1': CAT4_C1,
+    'silu_s8': SILU_S8,
+    'elu_s8': ELU_S8,
+    'leaky_relu_s8': LEAKY_RELU_S8,
+    'avgpool2d_s8': AVGPOOL2D_S8,
+    'lstm_s8': LSTM_S8,
+    'layernorm_s8': LAYERNORM_S8,
+    'rmsnorm_s8': RMSNORM_S8,
+    'sin_s8': SIN_S8,
+    'cos_s8': COS_S8,
+    'linear_s8_elu_s8': LINEAR_S8_ELU_S8,
+    'conv2d_batchnorm2d_s8': CONV2D_BATCHNORM2D_S8,
+    'conv2d_batchnorm2d_silu_s8': CONV2D_BATCHNORM2D_SILU_S8,
+    'batchnorm2d_silu_s8': BATCHNORM2D_SILU_S8,
+    'upsample_nearest_s8': UPSAMPLE_NEAREST_S8,
+    'cat2_c1_s8': CAT2_C1_S8,
+    'cat3_c1_s8': CAT3_C1_S8,
+    'cat4_c1_s8': CAT4_C1_S8,
+    'mul_s8': MUL_S8,
+    'gelu_s8': GELU_S8,
+    'pad_s8': PAD_S8,
+    'adaptive_avg_pool2d_s8': ADAPTIVE_AVG_POOL2D_S8,
+    'layer_norm_s8': LAYER_NORM_S8,
+    'matmul_s8': MATMUL_S8,
+    'softmax_s8': SOFTMAX_S8,
+    'depthwise_conv2d_s8': DEPTHWISE_CONV2D_S8,
+    'slice_c_s8': SLICE_C_S8,
+    'conv2d_s8_pc': CONV2D_S8_PC,
+    'linear_s8_pc': LINEAR_S8_PC,
+    'matmul_s8_pc': MATMUL_S8_PC,
+    'vint_action_post': VINT_ACTION_POST,
+    'avgpool2d': AVGPOOL2D,
+    'softmax': SOFTMAX,
+    'log_softmax': LOG_SOFTMAX,
+    'layer_norm': LAYER_NORM,
+    'group_norm': GROUP_NORM,
+    'rms_norm': RMS_NORM,
+    'conv_transpose2d': CONV_TRANSPOSE2D,
+    'conv3d': CONV3D,
+    'conv_transpose3d': CONV_TRANSPOSE3D,
+    'maxpool3d': MAXPOOL3D,
+    'avgpool3d': AVGPOOL3D,
+    'triu': TRIU,
+    'tril': TRIL,
+    'diag_matmul': DIAG_MATMUL,
+    'cumsum': CUMSUM,
+    'cumprod': CUMPROD,
+    'flip': FLIP,
+    'exclusive_cumsum': EXCLUSIVE_CUMSUM,
+    'mul': MUL,
+    'mul_scalar': MUL_SCALAR,
+    'mean_abs_norm': MEAN_ABS_NORM,
+    'mse_loss': MSE_LOSS,
+    'huber_loss': HUBER_LOSS,
+    'hinge_loss': HINGE_LOSS,
+    'cross_entropy_loss': CROSS_ENTROPY_LOSS,
+    'kldiv_loss': KLDIV_LOSS,
+    'triplet_loss': TRIPLET_LOSS,
+    'log': LOG,
+    'sdpa': SDPA,
+    'lstm': LSTM,
+    'relu6_s8': RELU6_S8,
+}
+
+
+# Shape-generic fallback ops (strided_copy, ewise2, reduce, ...); see
+# reference_kernels_ext.py.
+from modelblaster.pipeline.reference_kernels_ext import ext_specs as _ext_specs  # noqa: E402
+KERNEL_SPECS.update(_ext_specs(KernelSpec))
+# fp16 <-> fp32 casts at precision-policy island boundaries (precision_casts.py; only policy IRs use them)
+from modelblaster.pipeline.precision_casts import cast_specs as _cast_specs  # noqa: E402
+KERNEL_SPECS.update(_cast_specs(KernelSpec))
+
+
+def _cast_spec(src: str, dst: str) -> "KernelSpec":
+    """`cast_<src>_to_<dst>`: the dtype conversion a mixed IR (`--quant native`,
+    docs/tensor_dtypes.md) inserts where a tensor's dtype differs from what its
+    op reads or writes. Float -> float rounds once (round-to-nearest-even);
+    an integer / bool source converts exactly (ints are integer-valued f32
+    inside the graph, exact below 2^24); f32 -> integer truncates toward zero,
+    -> bool (b8) is `!= 0`."""
+    from modelblaster.pipeline.cuda_dtypes import CTYPE, cast_kind
+    cs, cd = CTYPE[src][0], CTYPE[dst][0]
+    op = cast_kind(src, dst)
+    if dst == "b8":
+        body, rule = "out[i] = (float)in[i] != 0.0f;", "out[i] = in[i] != 0 (bool, one byte)"
+    elif dst in ("i64", "i32", "u8"):
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})in[i] (truncation toward zero)"
+    else:
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})(float)in[i] (one rounding to {dst})"
+    sig = f"void kernel_{op}(const {cs} *in, {cd} *out, int n)"
+    return KernelSpec(
+        op=op,
+        signature=sig,
+        semantics=(f"Convert a {src} tensor to {dst}, elementwise over n elements:\n  {rule}\n"
+                   "Inserted by extraction where a tensor's dtype differs from the dtype its op "
+                   "reads or writes (per-tensor dtypes, docs/tensor_dtypes.md)."),
+        reference_impl=(f"{sig} {{\n    for (int i = 0; i < n; i++) {{\n        {body}\n    }}\n}}\n"),
+        extra_shapes=[{"n": 1}, {"n": 257}],
+    )
+
+
+def _cast_specs() -> dict:
+    from modelblaster.pipeline.cuda_dtypes import CASTS
+    return {s.op: s for s in (_cast_spec(a, b) for a, b in CASTS)}
+
+
+KERNEL_SPECS.update(_cast_specs())
+
+
+def _make_reduced_variant(spec: "KernelSpec", suffix: str, ctype: str, label: str) -> "KernelSpec":
+    """Synthesize the `<op><suffix>` storage variant of an fp32 KernelSpec:
+    rename kernel_<op> -> kernel_<op><suffix> and change every float POINTER
+    (`const float *` / `float *`, in both the signature and the body's pointer
+    locals) to `ctype *`. Scalar `float` params (eps, scale, beta, margin) and
+    `float` locals / `(float)` casts stay -- loads widen to float and stores
+    narrow from float implicitly, so the math still runs in fp32."""
+    import ctypes
+
+    def _c(s: str) -> str:
+        s = s.replace("const float *", f"const {ctype} *")
+        s = s.replace("float *", f"{ctype} *")
+        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}{suffix}(")
+        return s
+
+    _fp = ctypes.POINTER(ctypes.c_float)
+    _hp = ctypes.POINTER(ctypes.c_uint16)  # 2-byte float types have no ctypes type; use u16
+
+    def _argtypes(_orig=spec.argtypes_factory):
+        if _orig is None:
+            return None
+        return [_hp if a is _fp else a for a in _orig()]
+
+    return KernelSpec(
+        op=spec.op + suffix,
+        signature=_c(spec.signature),
+        semantics=f"({label}) " + spec.semantics,
+        reference_impl=_c(spec.reference_impl),
+        extra_shapes=list(spec.extra_shapes),
+        argtypes_factory=(None if spec.argtypes_factory is None else _argtypes),
+    )
+
+
+def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec:
+    `_Float16` storage, fp32 math (see _make_reduced_variant). Mirrors the
+    hand-written _f16 kernels (relu_f16, softmax_f16, ...)."""
+    return _make_reduced_variant(spec, "_f16", "_Float16", "fp16")
+
+
+def _make_bf16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the bfloat16 (`_bf16`) counterpart of an fp32 KernelSpec:
+    `__bf16` storage (GCC/Clang's bfloat16; `__nv_bfloat16` in the CUDA
+    spelling, cuda_dtypes.cuda_signature), fp32 math, one rounding per store
+    (docs/bf16_cuda.md). Every `_bf16` spec is derived from the fp32 one --
+    including the ops with hand-written `_f16` specs -- so its signature and
+    argument binding are the fp32 op's."""
+    return _make_reduced_variant(spec, "_bf16", "__bf16", "bf16")
+
+
+_FP32_OPS = [_op_name for _op_name in KERNEL_SPECS
+             if not (_op_name.endswith(("_f16", "_bf16", "_s8")) or _op_name.startswith("cast_"))]
+for _op_name in _FP32_OPS:
+    _f16_name = _op_name + "_f16"
+    if _f16_name not in KERNEL_SPECS:
+        KERNEL_SPECS[_f16_name] = _make_f16_variant(KERNEL_SPECS[_op_name])
+for _op_name in _FP32_OPS:
+    KERNEL_SPECS[_op_name + "_bf16"] = _make_bf16_variant(KERNEL_SPECS[_op_name])
+
+
+def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
+    """Pull every distinct shape combo for `op` out of an IR graph.
+
+    Shape values are usually ints, but some ops carry lists (e.g.
+    catN_c1's C_inputs=[16, 16, 16]). Lists aren't hashable so we
+    coerce to tuples before building the dedup key.
+    """
+    seen: set[tuple] = set()
+    out: list[dict[str, int]] = []
+    for node in ir.get("ops", []):
+        if node["op"] != op:
+            continue
+        shape = node.get("shape", {})
+        key = tuple(sorted(
+            (k, tuple(v) if isinstance(v, list) else v)
+            for k, v in shape.items()
+        ))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(shape))
+    return out

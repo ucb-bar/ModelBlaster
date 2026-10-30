@@ -1,0 +1,20 @@
+{
+  "contract": "modelblaster.fusion_hints/v1",
+  "reason": "granularity is too_fine; fusing ['mlp_control3_dispatch_0', 'mlp_control3_dispatch_1', 'mlp_control3_dispatch_2', 'mlp_control3_dispatch_3', 'mlp_control3_dispatch_4', 'mlp_control3_dispatch_5'] removes 5 dispatches (predicted makespan -5.04 us \u2014 launch/transition overhead not modelled here, so confirm the win on FireSim).",
+  "networks": [
+    {
+      "network": "mlp_control",
+      "fuse_groups": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      ],
+      "n_tiny": 6
+    }
+  ]
+}

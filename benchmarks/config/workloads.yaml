@@ -1,0 +1,116 @@
+# The things being measured — workload + execution environment. One
+# row per (model, quant, slice?, target, runner). Independent of which
+# arm produced the artifacts; the same workload is measured across all
+# arms that the matrix allows.
+#
+# `blocked_by` marks workloads whose prerequisites haven't landed yet.
+# The matrix doesn't exclude them — they just stay empty in the
+# dashboard until the prereq commits. This makes the "what's missing"
+# question concrete.
+
+workloads:
+
+  # ───── Smoke (cheap, fast — used to validate the harness itself) ─────
+  # Tiniest viable end-to-end: 3 Linear + 2 ReLU. ~5 ops, runs in
+  # seconds, exercises every metric without burning real money.
+  - id: mlp_generic_scalar_smoke
+    model: mlp_generic
+    target: scalar
+    quant: int8
+    runner: spike
+    tags: [smoke]
+
+  - id: dronet_rvv_smoke
+    model: dronet
+    target: rvv
+    quant: int8
+    runner: spike
+    tags: [smoke]
+
+  - id: dronet_scalar_smoke
+    model: dronet
+    target: scalar
+    quant: int8
+    runner: spike
+    tags: [smoke]
+
+  # ───── DroNet — the well-understood small baseline ─────
+  - { id: dronet_rvv_opu_int8,    model: dronet, target: rvv_opu,            quant: int8, runner: firesim }
+  - { id: dronet_gemmini_int8,    model: dronet, target: gemmini,            quant: int8, runner: firesim }
+  - { id: dronet_gemmini_q31_int8, model: dronet, target: gemmini_q31,       quant: int8, runner: firesim }
+  - id: dronet_hetero_int8
+    model: dronet
+    target: hetero_gemmini_opu
+    quant: int8
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    # Schedule is the hand-authored fixture from scripts/gen_hetero_schedule.py
+    # (gemmini_main_opu_skip policy). Replace with FreshScheduler-emitted
+    # output against profiled per-op cycles when the harness produces them.
+    xpurt_schedule_path: schedule_fixtures/dronet_hetero_gemmini_opu.json
+
+  # XPU-RT MOSEK MIP-emitted schedule (the "gold standard" reference)
+  # from per-op profiled cycles. Same model, same backends, same
+  # cores registry — differs only in the schedule fixture. Compare
+  # this cell's cycles against dronet_hetero_int8 to measure the
+  # MIP's improvement (or not) over the hand-authored placement.
+  # See scripts/run_xpurt_scheduler.py + notes/xpurt_mosek_baseline.md.
+  - id: dronet_hetero_xpurt_mosek_int8
+    model: dronet
+    target: hetero_gemmini_opu
+    quant: int8
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    xpurt_schedule_path: schedule_fixtures/dronet_xpurt_mosek.json
+
+  # ───── yolov8n — recent focus, exercises silu/depthwise/upsample ─────
+  # Smoke cells for spike-side validation. The matrix cells below run on
+  # firesim for authoritative cycles on accelerator targets.
+  - { id: yolov8_nano_scalar_smoke, model: yolov8_nano, target: scalar, quant: int8, runner: spike, tags: [smoke] }
+  - { id: yolov8_nano_rvv_smoke,    model: yolov8_nano, target: rvv,    quant: int8, runner: spike, tags: [smoke] }
+  - { id: yolov8n_rvv_opu_int8,     model: yolov8_nano, target: rvv_opu,            quant: int8, runner: firesim }
+  - { id: yolov8n_gemmini_int8,     model: yolov8_nano, target: gemmini,            quant: int8, runner: firesim }
+  - { id: yolov8n_gemmini_q31_int8, model: yolov8_nano, target: gemmini_q31,        quant: int8, runner: firesim }
+
+  # ───── yolov8_nano at 64x64 input — smaller variant to fit 1+2+4
+  # bundle into the qrb5165 reference's 75.71 ms period budget. Same
+  # architecture as yolov8_nano, 6.25× less spatial compute. ─────
+  - { id: yolov8_nano_64_rvv_opu_int8,  model: yolov8_nano_64, target: rvv_opu, quant: int8, runner: firesim }
+  - { id: yolov8_nano_64_gemmini_int8,  model: yolov8_nano_64, target: gemmini, quant: int8, runner: firesim }
+
+  # ───── mlp_control — PPO actor (16->256->128->64->4, ELU). int8 path
+  # newly unblocked by `elu_s8` reference kernel. ─────
+  - { id: mlp_control_rvv_opu_int8,     model: mlp_control, target: rvv_opu,     quant: int8, runner: firesim }
+  - { id: mlp_control_gemmini_int8,     model: mlp_control, target: gemmini,     quant: int8, runner: firesim }
+  - { id: mlp_control_gemmini_q31_int8, model: mlp_control, target: gemmini_q31, quant: int8, runner: firesim }
+
+  - id: yolov8n_hetero_int8
+    model: yolov8_nano
+    target: hetero_gemmini_opu
+    quant: int8
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    xpurt_schedule_path: schedule_fixtures/yolov8n_hetero_gemmini_opu.json
+    blocked_by: P2.1-schedule
+
+  # ───── ViNT — transformer, exercises attention + LayerNorm via torch.export ─────
+  - { id: vint_rvv_opu_fp16,      model: vint,    target: rvv_opu,            quant: fp16, runner: firesim }
+  - id: vint_hetero_fp16
+    model: vint
+    target: hetero_gemmini_opu
+    quant: fp16
+    runner: firesim
+    xpurt_cores_registry: cores/chipyard_gemmini_opu_hetero.json
+    xpurt_backends: gemmini,rvv_opu
+    xpurt_schedule_path: schedule_fixtures/vint_hetero_gemmini_opu.json
+    blocked_by: P2.1-schedule
+
+  # ───── SmolVLA — admission done (loads + exports via models/smolvla.py);
+  #       end-to-end codegen waits on walker support for the attention
+  #       block (scaled_dot_product_attention, rotary_emb, masked
+  #       embeddings). See notes/smolvla_admission.md.
+  - { id: smolvla_scalar_fp16_step, model: smolvla, target: scalar, quant: fp16, runner: spike,   slice: single_step, blocked_by: walker-smolvla-ops }
+  - { id: smolvla_rvv_opu_fp16_step, model: smolvla, target: rvv_opu, quant: fp16, runner: firesim, slice: single_step, blocked_by: walker-smolvla-ops }

@@ -1,0 +1,15 @@
+{
+  "makespan_us": 75.570546,
+  "meets_deadline": false,
+  "margin_us": -10.570545999999993,
+  "bottleneck_backend": "CPU_E#0",
+  "granularity_verdict": "too_fine",
+  "recommendations": [
+    {
+      "kind": "coarsen",
+      "target": "fusion_threshold = 1000 cycles",
+      "rationale": "388/388 dispatches (100.0%) fall below 1000 cycles. Fusing them collapses the dispatch-overhead tail.",
+      "confidence": "medium"
+    }
+  ]
+}

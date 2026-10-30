@@ -1,0 +1,154 @@
+{
+  "system": "spacemit-k1-x60",
+  "description": "SpaceMiT K1 / X60: 8x riscv64, VLEN=256 (zvl256b), two 4-core clusters distinguished by their L2 domain. Everything here was measured on the board, not read off a datasheet -- see artifacts/k1_bringup/*/ in the XPU-RT checkout.",
+  "default_dispatch_target": "any",
+  "notes": {
+    "clusters": "cores 0-3 share one 512K L2, cores 4-7 share another (cpu_freq_cache.txt: index2 lvl=2 Unified 512K shared=0-3 / shared=4-7). /proc/cpuinfo reports an identical ISA on all 8 harts and never mentions IME, so the split is not discoverable that way.",
+    "ime": "smt.vmadot EXECUTES on cores 0-3 and TRAPS on cores 4-7, established with a per-core SIGILL probe repeated three times (ime_capability_probe.txt). An IME kernel on cluster 1 does not degrade, it dies -- so the capability list below is a correctness constraint, not a performance hint.",
+    "ime_reachability": "Declared here because the hardware has it. Note that as of artifacts/k1_run/ime_gate/FINDINGS.md no CONVOLUTION can reach the matrix engine through the current compiler: every xsmtvdot hook is matmul-only, and the one vmadot observed in DroNet was a 1x1x2048 GEMV padded up to the mandatory 4x4 tile with 15 of 16 lanes discarded. Treat ime_* capabilities as available-in-principle until a conv path exists.",
+    "clock": "cores are pinned to the `performance` governor at 1.6 GHz; there is a single cpufreq policy with related_cpus 0-7, so the clusters CANNOT be clocked independently. rdcycle raises SIGILL from userspace; rdtime is unprivileged and runs at a fixed 24.000 MHz (device-tree timebase-frequency = 24000000). Timing MUST convert with 24 MHz, never the 1.6 GHz core clock.",
+    "rvv_symmetry": "measured cluster-1/cluster-0 median ratio 0.996 on compute-bound dispatches -- the two clusters are equivalent for RVV, so placement across them is a scheduling choice rather than a performance one.",
+    "contention": "measured co-runner slowdown is 1.043x same-cluster vs 1.185x cross-cluster. That is the OPPOSITE of the shared-L2 intuition and means 'spread across clusters' is the wrong default on this board.",
+    "core_kind": "Cluster 1's cores are kind 'rvv_c1', not 'rvv', even though both clusters run the same ISA and measure equivalent for RVV (0.996 ratio). `kind` is what _resolve_target uses to pick a hart -- it takes the n-th core OF THAT KIND -- so giving all eight cores one kind made CPU_E#n resolve to the same hart as CPU_P#n. A 4+4 config then double-booked harts 0-3 and never touched cluster 1, silently: the schedule looked like it used eight cores and the binary used four. The kind is a PLACEMENT POOL label here, not a codegen label -- both pools compile with the same rvv_x60 backend."
+  },
+  "cores": [
+    {
+      "name": "cluster0_core0",
+      "kind": "rvv",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        0
+      ],
+      "cluster": 0,
+      "description": "Cluster 0, L2 domain 0. Carries IME (smt.vmadot) in addition to RVV.",
+      "capabilities": [
+        "linear",
+        "conv2d",
+        "linear_s8",
+        "conv2d_s8",
+        "matmul_s8",
+        "relu",
+        "leaky_relu_s8",
+        "elu",
+        "add",
+        "add_s8",
+        "mul",
+        "maxpool2d",
+        "maxpool2d_s8",
+        "avgpool2d_s8",
+        "batchnorm2d",
+        "sigmoid",
+        "silu",
+        "gelu_s8",
+        "softmax_s8",
+        "layernorm_s8",
+        "rmsnorm_s8",
+        "lstm_s8",
+        "sin_s8",
+        "cos_s8",
+        "cat",
+        "upsample_nearest_s8",
+        "ime_matmul_s8",
+        "ime_linear_s8"
+      ]
+    },
+    {
+      "name": "cluster0_core1",
+      "kind": "rvv",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        1
+      ],
+      "cluster": 0,
+      "capabilities_ref": "cluster0_core0"
+    },
+    {
+      "name": "cluster0_core2",
+      "kind": "rvv",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        2
+      ],
+      "cluster": 0,
+      "capabilities_ref": "cluster0_core0"
+    },
+    {
+      "name": "cluster0_core3",
+      "kind": "rvv",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        3
+      ],
+      "cluster": 0,
+      "capabilities_ref": "cluster0_core0"
+    },
+    {
+      "name": "cluster1_core4",
+      "kind": "rvv_c1",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        4
+      ],
+      "cluster": 1,
+      "description": "Cluster 1, L2 domain 1. RVV only -- smt.vmadot traps here. No ime_* capability, deliberately.",
+      "capabilities": [
+        "linear",
+        "conv2d",
+        "linear_s8",
+        "conv2d_s8",
+        "matmul_s8",
+        "relu",
+        "leaky_relu_s8",
+        "elu",
+        "add",
+        "add_s8",
+        "mul",
+        "maxpool2d",
+        "maxpool2d_s8",
+        "avgpool2d_s8",
+        "batchnorm2d",
+        "sigmoid",
+        "silu",
+        "gelu_s8",
+        "softmax_s8",
+        "layernorm_s8",
+        "rmsnorm_s8",
+        "lstm_s8",
+        "sin_s8",
+        "cos_s8",
+        "cat",
+        "upsample_nearest_s8"
+      ]
+    },
+    {
+      "name": "cluster1_core5",
+      "kind": "rvv_c1",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        5
+      ],
+      "cluster": 1,
+      "capabilities_ref": "cluster1_core4"
+    },
+    {
+      "name": "cluster1_core6",
+      "kind": "rvv_c1",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        6
+      ],
+      "cluster": 1,
+      "capabilities_ref": "cluster1_core4"
+    },
+    {
+      "name": "cluster1_core7",
+      "kind": "rvv_c1",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        7
+      ],
+      "cluster": 1,
+      "capabilities_ref": "cluster1_core4"
+    }
+  ]
+}

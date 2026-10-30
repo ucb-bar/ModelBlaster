@@ -1,0 +1,590 @@
+"""YOLOv8-nano wrapper for the modelblaster flow.
+
+Pure-PyTorch reimplementation of the ultralytics YOLOv8n architecture
+that traces cleanly through torch.fx.symbolic_trace. The original
+ultralytics C2f.forward uses Python list + generator extend, and the
+top-level DetectionModel.forward is a Python loop over self.model
+with conditional skip-connection routing — neither is fx-traceable.
+
+This wrapper:
+  * statically unrolls C2f into n=1 / n=2 variants (the only counts
+    YOLOv8n uses);
+  * wires backbone / neck / head as a flat sequence of submodule calls
+    with explicit cat / upsample / chunk operations;
+  * exposes only the raw 3-scale detection head outputs (post-NMS
+    decode and DFL stay in PyTorch land — the C harness needs only
+    the raw conv outputs).
+
+`get_model()` loads pretrained ultralytics yolov8n.pt weights into the
+matching submodules. The COCO-trained weights stream in cleanly since
+backbone/neck channel counts are identical; head re-init to a smaller
+`nc` would be a fine-tune-time concern, out of scope here.
+
+Env knobs:
+  MODELBLASTER_YOLOV8N_INPUT       default 160. `96` = square, `64x96` = H x W.
+                                   Every dimension must be a multiple of 32.
+  MODELBLASTER_YOLOV8N_NC          default 80 (COCO classes)
+  MODELBLASTER_YOLOV8N_PRETRAINED  default 1 (load weights; 0 → random init)
+  MODELBLASTER_YOLOV8N_WEIGHTS     default yolov8n.pt. A fine-tuned checkpoint
+                                   may use any nc; the stock one is COCO-80.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# Building blocks
+# ---------------------------------------------------------------------------
+
+
+class _Conv(nn.Module):
+    """Conv2d + BatchNorm2d + SiLU. Matches ultralytics' Conv module."""
+
+    def __init__(self, c1: int, c2: int, k: int = 1, s: int = 1,
+                 p: Optional[int] = None, g: int = 1):
+        super().__init__()
+        if p is None:
+            p = k // 2
+        self.conv = nn.Conv2d(c1, c2, k, s, p, groups=g, bias=False)
+        # ultralytics' BN defaults — must match exactly for pretrained
+        # weight numerics to round-trip. Standard pytorch uses 1e-5/0.1
+        # which silently corrupts the activations by 1-2 orders of
+        # magnitude per BN layer.
+        self.bn = nn.BatchNorm2d(c2, eps=1e-3, momentum=0.03)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class _Bottleneck(nn.Module):
+    """YOLOv8 bottleneck: two 3×3 Convs, optional residual.
+
+    Always operates on c×H×W tensors (c1 == c2), so the residual
+    add is dimensionally valid whenever shortcut=True.
+    """
+
+    def __init__(self, c: int, shortcut: bool = True):
+        super().__init__()
+        self.cv1 = _Conv(c, c, 3, 1)
+        self.cv2 = _Conv(c, c, 3, 1)
+        self.add = shortcut
+
+    def forward(self, x):
+        out = self.cv2(self.cv1(x))
+        return x + out if self.add else out
+
+
+class _C2fN1(nn.Module):
+    """C2f with n=1 bottleneck — the most common variant in YOLOv8n.
+
+        y0, y1 = cv1(x).chunk(2, dim=1)
+        y2 = m0(y1)
+        return cv2(cat([y0, y1, y2], dim=1))
+    """
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True):
+        super().__init__()
+        self.c = c2 // 2
+        self.cv1 = _Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = _Conv(3 * self.c, c2, 1, 1)
+        self.m0 = _Bottleneck(self.c, shortcut)
+
+    def forward(self, x):
+        t = self.cv1(x)
+        y0, y1 = t.chunk(2, 1)
+        y2 = self.m0(y1)
+        return self.cv2(torch.cat([y0, y1, y2], 1))
+
+
+class _C2fN2(nn.Module):
+    """C2f with n=2 bottlenecks — used in backbone layers 4 and 6 only."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True):
+        super().__init__()
+        self.c = c2 // 2
+        self.cv1 = _Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = _Conv(4 * self.c, c2, 1, 1)
+        self.m0 = _Bottleneck(self.c, shortcut)
+        self.m1 = _Bottleneck(self.c, shortcut)
+
+    def forward(self, x):
+        t = self.cv1(x)
+        y0, y1 = t.chunk(2, 1)
+        y2 = self.m0(y1)
+        y3 = self.m1(y2)
+        return self.cv2(torch.cat([y0, y1, y2, y3], 1))
+
+
+class _SPPF(nn.Module):
+    """Spatial Pyramid Pooling - Fast: 3 chained 5×5 max-pools concat'd
+    with the input. The maxpool has stride=1, padding=k//2 so spatial
+    dims are preserved across all 4 branches (input + 3 pooled)."""
+
+    def __init__(self, c1: int, c2: int, k: int = 5):
+        super().__init__()
+        c_ = c1 // 2
+        self.cv1 = _Conv(c1, c_, 1, 1)
+        self.cv2 = _Conv(4 * c_, c2, 1, 1)
+        self.m1 = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.m2 = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.m3 = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        y1 = self.m1(x)
+        y2 = self.m2(y1)
+        y3 = self.m3(y2)
+        return self.cv2(torch.cat([x, y1, y2, y3], 1))
+
+
+class _DetectHead(nn.Module):
+    """Simplified Detect head: per-scale (cv2 box, cv3 cls) towers,
+    output is cat([box, cls], dim=1) per scale. Returns the 3 raw
+    detection feature maps as a tuple — no DFL decode, no NMS, no
+    end2end fork. Those live in Python post-processing where they
+    belong.
+
+    Channel layout per scale: [reg_max*4 (box) | nc (cls)]. For the
+    stock YOLOv8n with reg_max=16 nc=80 that's [64 | 80] = 144 ch.
+    """
+
+    def __init__(self, ch: tuple[int, int, int] = (64, 128, 256),
+                 nc: int = 80, reg_max: int = 16):
+        super().__init__()
+        self.nc = nc
+        self.reg_max = reg_max
+        c2 = max(16, ch[0] // 4, reg_max * 4)
+        c3 = max(ch[0], min(nc, 100))
+        for s, in_c in enumerate(ch):
+            setattr(self, f"cv2_{s}_0", _Conv(in_c, c2, 3, 1))
+            setattr(self, f"cv2_{s}_1", _Conv(c2, c2, 3, 1))
+            setattr(self, f"cv2_{s}_2", nn.Conv2d(c2, 4 * reg_max, 1))
+            setattr(self, f"cv3_{s}_0", _Conv(in_c, c3, 3, 1))
+            setattr(self, f"cv3_{s}_1", _Conv(c3, c3, 3, 1))
+            setattr(self, f"cv3_{s}_2", nn.Conv2d(c3, nc, 1))
+
+    def forward(self, x_p3, x_p4, x_p5):
+        b0 = self.cv2_0_2(self.cv2_0_1(self.cv2_0_0(x_p3)))
+        c0 = self.cv3_0_2(self.cv3_0_1(self.cv3_0_0(x_p3)))
+        out0 = torch.cat([b0, c0], 1)
+        b1 = self.cv2_1_2(self.cv2_1_1(self.cv2_1_0(x_p4)))
+        c1 = self.cv3_1_2(self.cv3_1_1(self.cv3_1_0(x_p4)))
+        out1 = torch.cat([b1, c1], 1)
+        b2 = self.cv2_2_2(self.cv2_2_1(self.cv2_2_0(x_p5)))
+        c2v = self.cv3_2_2(self.cv3_2_1(self.cv3_2_0(x_p5)))
+        out2 = torch.cat([b2, c2v], 1)
+        return out0, out1, out2
+
+
+# ---------------------------------------------------------------------------
+# Top-level model
+# ---------------------------------------------------------------------------
+
+
+class YOLOv8Nano(nn.Module):
+    """YOLOv8-nano — flat-forward variant of ultralytics yolov8n.
+
+    Layer numbering matches the upstream YAML:
+        0..9   backbone (Conv/C2f/SPPF chain)
+        10..21 PAN-FPN neck (upsamples, concats, C2fs)
+        22     detection head (3 scales)
+
+    Layers 11/14/17/20 are pure cat ops (no parameters), so they
+    aren't allocated as submodules — they appear as torch.cat calls
+    in forward(). Layer 22's outputs are 3 tensors covering the P3,
+    P4, P5 detection scales.
+    """
+
+    def __init__(self, nc: int = 80):
+        super().__init__()
+        # backbone
+        self.l0 = _Conv(3, 16, 3, 2)
+        self.l1 = _Conv(16, 32, 3, 2)
+        self.l2 = _C2fN1(32, 32, shortcut=True)
+        self.l3 = _Conv(32, 64, 3, 2)
+        self.l4 = _C2fN2(64, 64, shortcut=True)
+        self.l5 = _Conv(64, 128, 3, 2)
+        self.l6 = _C2fN2(128, 128, shortcut=True)
+        self.l7 = _Conv(128, 256, 3, 2)
+        self.l8 = _C2fN1(256, 256, shortcut=True)
+        self.l9 = _SPPF(256, 256, 5)
+        # neck
+        self.l10 = nn.Upsample(scale_factor=2, mode="nearest")
+        self.l12 = _C2fN1(256 + 128, 128, shortcut=False)
+        self.l13 = nn.Upsample(scale_factor=2, mode="nearest")
+        self.l15 = _C2fN1(128 + 64, 64, shortcut=False)
+        self.l16 = _Conv(64, 64, 3, 2)
+        self.l18 = _C2fN1(64 + 128, 128, shortcut=False)
+        self.l19 = _Conv(128, 128, 3, 2)
+        self.l21 = _C2fN1(128 + 256, 256, shortcut=False)
+        # head
+        self.detect = _DetectHead(ch=(64, 128, 256), nc=nc)
+
+    def forward(self, x):
+        # backbone
+        x = self.l0(x)
+        x = self.l1(x)
+        x = self.l2(x)
+        x = self.l3(x)
+        x4 = self.l4(x)        # save: P3 source
+        x = self.l5(x4)
+        x6 = self.l6(x)        # save: P4 source
+        x = self.l7(x6)
+        x = self.l8(x)
+        x9 = self.l9(x)        # save: P5 source
+        # neck
+        u10 = self.l10(x9)
+        cat11 = torch.cat([u10, x6], 1)
+        x12 = self.l12(cat11)
+        u13 = self.l13(x12)
+        cat14 = torch.cat([u13, x4], 1)
+        x15 = self.l15(cat14)
+        x16 = self.l16(x15)
+        cat17 = torch.cat([x16, x12], 1)
+        x18 = self.l18(cat17)
+        x19 = self.l19(x18)
+        cat20 = torch.cat([x19, x9], 1)
+        x21 = self.l21(cat20)
+        # detect head — 3 raw detection scale outputs
+        return self.detect(x15, x18, x21)
+
+
+# ---------------------------------------------------------------------------
+# Weight loading from ultralytics yolov8n.pt
+# ---------------------------------------------------------------------------
+
+
+# Layer-index → (kind, our-attr-name).  None means "no params".
+_LAYER_MAP = {
+    0:  ("conv", "l0"),  1:  ("conv", "l1"),  2:  ("c2f1", "l2"),
+    3:  ("conv", "l3"),  4:  ("c2f2", "l4"),  5:  ("conv", "l5"),
+    6:  ("c2f2", "l6"),  7:  ("conv", "l7"),  8:  ("c2f1", "l8"),
+    9:  ("sppf", "l9"),
+    10: (None,   None),  11: (None,    None),
+    12: ("c2f1", "l12"), 13: (None,   None),  14: (None,   None),
+    15: ("c2f1", "l15"), 16: ("conv", "l16"), 17: (None,   None),
+    18: ("c2f1", "l18"), 19: ("conv", "l19"), 20: (None,   None),
+    21: ("c2f1", "l21"),
+    22: ("detect", "detect"),
+}
+
+
+def _ultra_to_local_key(ultra_key: str) -> Optional[str]:
+    """Translate an ultralytics state_dict key like
+        model.4.m.0.cv2.bn.weight   →  l4.m0.cv2.bn.weight
+        model.22.cv2.0.0.conv.weight →  detect.cv2_0_0.conv.weight
+    Returns None for keys that don't belong to a parameterized layer
+    (e.g. layer 10 nn.Upsample, layer 11 Concat, the DFL inside Detect)."""
+    m = re.match(r"^model\.(\d+)\.(.*)$", ultra_key)
+    if not m:
+        return None
+    layer_idx = int(m.group(1))
+    rest = m.group(2)
+    kind_attr = _LAYER_MAP.get(layer_idx, (None, None))
+    kind, attr = kind_attr
+    if kind is None:
+        return None
+
+    if kind == "conv":
+        # rest is e.g. "conv.weight" or "bn.running_mean"
+        return f"{attr}.{rest}"
+
+    if kind in ("c2f1", "c2f2"):
+        # rest paths:
+        #   cv1.conv.weight       →  cv1.conv.weight   (direct)
+        #   m.0.cv1.conv.weight   →  m0.cv1.conv.weight
+        m2 = re.match(r"^m\.(\d+)\.(.*)$", rest)
+        if m2:
+            return f"{attr}.m{m2.group(1)}.{m2.group(2)}"
+        return f"{attr}.{rest}"
+
+    if kind == "sppf":
+        # rest: cv1.conv.weight, cv2.bn.bias, etc. m.* has no params.
+        if rest.startswith("m."):
+            return None
+        return f"{attr}.{rest}"
+
+    if kind == "detect":
+        # rest: cv2.<scale>.<idx>.<...>  or cv3.<scale>.<idx>.<...>
+        #   cv2.0.0.conv.weight   →  cv2_0_0.conv.weight
+        #   cv2.0.2.weight        →  cv2_0_2.weight
+        m2 = re.match(r"^(cv[23])\.(\d+)\.(\d+)\.(.*)$", rest)
+        if m2:
+            br, scale, idx, tail = m2.groups()
+            return f"{attr}.{br}_{scale}_{idx}.{tail}"
+        # dfl.* and other sub-modules: ignore
+        return None
+
+    return None
+
+
+#: The stock COCO checkpoint. Anything else is a fine-tune, and the two are
+#: treated differently: see `get_model`.
+STOCK_WEIGHTS = "yolov8n.pt"
+
+
+def weights_path() -> str:
+    return os.environ.get("MODELBLASTER_YOLOV8N_WEIGHTS", STOCK_WEIGHTS)
+
+
+def _load_ultralytics_weights(model: YOLOv8Nano, path: str | None = None) -> int:
+    """Stream weights from an ultralytics checkpoint into model.
+
+    `path` defaults to the stock COCO yolov8n.pt. A custom fine-tune is passed
+    through MODELBLASTER_YOLOV8N_WEIGHTS -- without which a retrained model
+    could not be built here at all, because this used to hardcode the stock
+    filename and there was no way to name another.
+
+    Resolution does not appear here, and that is worth stating: conv and BN
+    weight shapes depend on channel counts, not on input size. So a checkpoint
+    trained at 64x96 loads into a model configured for any resolution. What
+    must match is `nc` and the width multiple; what must NOT be assumed to
+    match is the input geometry, which is set separately by
+    MODELBLASTER_YOLOV8N_INPUT and has to agree with how the model was trained
+    and with the board preprocess.
+    """
+    # Path check BEFORE the import, so a mistyped checkpoint is reported as a
+    # mistyped checkpoint even in an environment without ultralytics. The
+    # reverse order hides the specific error behind the generic one.
+    path = path or weights_path()
+    if not os.path.exists(path) and path != STOCK_WEIGHTS:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_WEIGHTS={path!r} does not exist. "
+            f"Point it at the trained .pt, or unset it to use {STOCK_WEIGHTS}.")
+    try:
+        from ultralytics import YOLO
+    except ImportError as e:
+        raise RuntimeError(
+            f"failed to import ultralytics ({e}). If ultralytics itself is "
+            "already installed, this is likely a missing system dependency "
+            "of one of ITS dependencies (e.g. opencv-python needs libgl1) -- "
+            "see the chained traceback above for the actual failing import. "
+            "`pip install ultralytics` if it's genuinely missing, or set "
+            "MODELBLASTER_YOLOV8N_PRETRAINED=0 to use random init instead."
+        ) from e
+    yolo = YOLO(path)
+    src_state = yolo.model.state_dict()
+    dst_state = model.state_dict()
+    n_copied = 0
+    for k_src, v_src in src_state.items():
+        k_dst = _ultra_to_local_key(k_src)
+        if k_dst is None:
+            continue
+        if k_dst not in dst_state:
+            continue
+        if dst_state[k_dst].shape != v_src.shape:
+            raise RuntimeError(
+                f"shape mismatch loading {k_src} → {k_dst}: "
+                f"src {tuple(v_src.shape)} vs dst {tuple(dst_state[k_dst].shape)}"
+            )
+        dst_state[k_dst].copy_(v_src)
+        n_copied += 1
+    model.load_state_dict(dst_state)
+    return n_copied
+
+
+# ---------------------------------------------------------------------------
+# Module entry points (matching the modelblaster/models/<x>.py interface)
+# ---------------------------------------------------------------------------
+
+
+def parse_input_size(raw: str) -> tuple[int, int]:
+    """`"96"` -> (96, 96); `"64x96"` or `"64,96"` -> (64, 96), as (H, W).
+
+    WHY RECTANGULAR INPUT EXISTS. A square input forces a non-square camera
+    frame to be letterboxed, and the padding is then convolved at full cost
+    through the entire backbone. For a 90x60 (WxH) FPV frame letterboxed into
+    96x96, a third of every tensor is constant grey -- measured against the
+    fitted per-shape cost model, 88.5 ms of which ~26 ms buys nothing.
+
+    Matching the aspect instead (64x96 for a 3:2 frame) keeps every real pixel
+    and drops the padding to zero. It is not a speed/accuracy trade; it is
+    declining to convolve over grey bars.
+
+    Both dimensions must be multiples of 32 -- YOLOv8's deepest level
+    downsamples by 32, so a non-multiple has no valid stride-32 feature map.
+    """
+    txt = str(raw).strip().lower().replace(",", "x")
+    parts = [p for p in txt.split("x") if p]
+    try:
+        vals = [int(p) for p in parts]
+    except ValueError:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r} is not a size. Use `96` for "
+            f"square or `64x96` for rectangular (H x W).")
+    if len(vals) == 1:
+        h = w = vals[0]
+    elif len(vals) == 2:
+        h, w = vals
+    else:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r} has {len(vals)} dimensions; "
+            f"want 1 (square) or 2 (H x W).")
+    bad = [n for n in (h, w) if n <= 0 or n % 32 != 0]
+    if bad:
+        raise SystemExit(
+            f"MODELBLASTER_YOLOV8N_INPUT={raw!r}: {bad} not a positive "
+            f"multiple of 32 (YOLOv8 stride-32 head requires it).")
+    return h, w
+
+
+def _cfg() -> tuple[tuple[int, int], int, bool]:
+    """`((H, W), nc, pretrained)`.
+
+    The first element became a PAIR rather than an int when rectangular input
+    landed. Every caller unpacks it as `img`, so an accidental `(img, img)`
+    downstream would now build a 4-D shape and fail loudly rather than
+    silently squaring one dimension.
+    """
+    img = parse_input_size(os.environ.get("MODELBLASTER_YOLOV8N_INPUT", "160"))
+    nc = int(os.environ.get("MODELBLASTER_YOLOV8N_NC", 80))
+    pretrained = os.environ.get("MODELBLASTER_YOLOV8N_PRETRAINED", "1") == "1"
+    return img, nc, pretrained
+
+
+def get_model(seed: int = 0):
+    img, nc, pretrained = _cfg()
+    torch.manual_seed(seed)
+    m = YOLOv8Nano(nc=nc)
+    if pretrained:
+        wp = weights_path()
+        if nc != 80 and wp == STOCK_WEIGHTS:
+            # The STOCK checkpoint is COCO-80. Its cv3 head's last conv is
+            # nc-dependent and would shape-mismatch, so refuse rather than
+            # silently skip those tensors and ship a randomly-initialised head.
+            raise SystemExit(
+                f"MODELBLASTER_YOLOV8N_NC={nc} != 80 against the stock "
+                f"{STOCK_WEIGHTS}: the cv3 head shapes do not match. Either set "
+                f"MODELBLASTER_YOLOV8N_WEIGHTS=<your fine-tuned .pt>, or set "
+                f"MODELBLASTER_YOLOV8N_PRETRAINED=0 for random init."
+            )
+        # A custom checkpoint is allowed any nc. It is not trusted, though:
+        # _load_ultralytics_weights raises on any per-tensor shape mismatch, so
+        # a checkpoint whose head disagrees with MODELBLASTER_YOLOV8N_NC fails
+        # loudly and names the tensor, rather than loading a partial head.
+        n = _load_ultralytics_weights(m, wp)
+        print(f"yolov8_nano: loaded {n} pretrained tensors from {wp} (nc={nc})")
+    m.eval()
+    return m
+
+
+def get_sample_input(seed: int = 1) -> torch.Tensor:
+    """One real-image frame at the configured resolution, NCHW float
+    in [0, 1] (matches ultralytics yolov8 preprocessing — divide by 255).
+
+    Real-image calibration is critical for detection PTQ. With
+    `torch.randn` activation scales saturated the cls-head logits and
+    produced 50 false-positive detections at confidence=1.0 (verified
+    in compare_detections.py before this change). One IDSIA forest-trail
+    frame gives realistic activation ranges across the backbone and
+    detect head; the resulting int8 ceiling tracks fp32 wrapper within
+    1–2 ulp instead of L∞≈59.
+
+    Override the source via ``MODELBLASTER_YOLOV8N_CALIB_IMAGE`` (path,
+    absolute or repo-root-relative). Falls back to `torch.randn` only
+    if the file is missing, with a warning."""
+    import os
+    from pathlib import Path
+
+    img, _, _ = _cfg()
+    src = os.environ.get(
+        "MODELBLASTER_YOLOV8N_CALIB_IMAGE",
+        "datasets/idsia/samples/sc/000_seg001_00000388.jpg")
+
+    # Resolve repo-root-relative paths the same way the image_dir loader
+    # does (search _REPO_ROOT and its parent).
+    p = Path(src)
+    if not p.is_absolute():
+        repo_root = Path(__file__).resolve().parents[2]  # zephyr-chipyard-sw/
+        for root in (repo_root, repo_root.parent, Path.cwd()):
+            cand = root / src
+            if cand.exists():
+                p = cand
+                break
+
+    if p.is_file():
+        try:
+            from PIL import Image  # noqa: PLC0415
+            from torchvision import transforms  # noqa: PLC0415
+            tfm = transforms.Compose([
+                transforms.Resize(img),   # (H, W)
+                transforms.ToTensor(),  # HWC [0,255] -> CHW [0,1]
+            ])
+            pil = Image.open(p).convert("RGB")
+            return tfm(pil).unsqueeze(0)  # (1, 3, H, W)
+        except Exception as e:
+            print(f"[yolov8_nano.get_sample_input] WARN: couldn't load "
+                  f"{p} ({e}); falling back to torch.randn.")
+
+    print(f"[yolov8_nano.get_sample_input] WARN: {src} not found — "
+          f"falling back to torch.randn (won't give meaningful PTQ "
+          f"calibration). Set MODELBLASTER_YOLOV8N_CALIB_IMAGE to a "
+          f"real RGB image to fix.")
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(1, 3, img[0], img[1], generator=g)
+
+
+def get_calibration_spec(num_samples: int = 16) -> dict:
+    """Declarative calibration spec for the modelblaster/datasets loader.
+
+    Single-input model — the input tensor is named ``x`` in the IR
+    (matches the forward signature). For a detection model trained on
+    natural images, calibrating activation scales from a few real
+    photographs is far better than `torch.randn` (the random distribution
+    saturates the cls-head logits during requantize; verdict section
+    of compare_detections.py auto-fires when this happens).
+
+    Default source: IDSIA forest-trail samples (60 RGB jpgs at 1280×720,
+    resized to the configured input size). Not COCO but natural enough
+    to give realistic activation ranges for the early backbone layers
+    where the worst saturation otherwise occurs.
+
+    Override the dataset dir via ``MODELBLASTER_YOLOV8N_CALIB_DIR``
+    (path under datasets/, repo-root-relative). To use COCO val you
+    can point it there directly — the image_dir loader is path-agnostic.
+
+    Normalization: ``"none"`` (0–1 RGB after ToTensor), matching
+    ultralytics' yolov8 preprocessing (`/255` and CHW). NOT imagenet
+    normalize (that's a classification-model convention; detection
+    networks trained with ultralytics expect 0–1 input).
+    """
+    import os
+    img, _, _ = _cfg()
+    src = os.environ.get(
+        "MODELBLASTER_YOLOV8N_CALIB_DIR", "datasets/idsia/samples/sc")
+    return {
+        "num_samples": num_samples,
+        "inputs": {
+            "x": {
+                "loader": "image_dir",
+                "path": src,
+                # [W, H] -- the image_dir loader's order, NOT (H, W).
+                # `img` is (H, W) to match NCHW and transforms.Resize, so it
+                # has to be reversed here. This was invisible while the input
+                # was square, and the first rectangular build extracted a
+                # 96x64 graph from a 64x96 request: silently transposed, and
+                # the shapes still looked plausible all the way to the board.
+                "image_size": [img[1], img[0]],
+                "normalize": "none",
+                "compose": {"kind": "one_per_sample"},
+            },
+        },
+    }
+
+
+def get_calibration_samples(n: int = 16) -> list[tuple[torch.Tensor, ...]]:
+    """Back-compat wrapper around ``get_calibration_spec``: walks the
+    spec and returns a list of single-input tuples. Used by some old
+    callers; the walker prefers ``get_calibration_spec`` directly."""
+    from modelblaster.mb_datasets.base import materialize_calibration_samples
+    spec = get_calibration_spec(n)
+    raw = materialize_calibration_samples(spec)
+    return [(item["x"],) for item in raw]

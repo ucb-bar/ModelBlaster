@@ -1,0 +1,8 @@
+backend,dispatch_id,name,op,shape,cycles
+scalar,0,mlp.0,linear,M=1;K=16;N=256,45918
+scalar,1,mlp.1,elu,n=256,25193
+scalar,2,mlp.2,linear,M=1;K=256;N=128,319225
+scalar,3,mlp.3,elu,n=128,15516
+scalar,4,mlp.4,linear,M=1;K=128;N=64,81088
+scalar,5,mlp.5,elu,n=64,6543
+scalar,6,mlp.6,linear,M=1;K=64;N=4,2736

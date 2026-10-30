@@ -1,0 +1,952 @@
+"""Unified graph hints (``modelblaster.graph_hints/v1``): one schema and one
+apply path for every graph-level change ModelBlaster makes to an IR.
+
+Every producer of graph changes writes the same hint records:
+
+* KernelBlaster proposals (``kb-proposal/1``: fuse, split)   -> from_kb_proposals
+* ModelBlaster's own cost-driven proposals (whole-model
+  per-op profile)                                            -> propose_from_profile
+* ModelBlaster's kernel cache (shape-guarded winners that
+  cover only some instances of a slot)                        -> kb_ingest.cache_plan
+* XPU-RT's RISC-V hints (fusion_hints/v1, split_hints/v1,
+  shard_hints/v1, unfuse_hints/v1)                           -> from_xpurt
+* the Phase 1 fusion registry (mb-fusion-registry/1)         -> load() reads it
+
+A hints file::
+
+    {"format": "modelblaster.graph_hints/v1",
+     "hints": [
+       {"id": "fuse:fused__conv2d__batchnorm2d", "kind": "fuse", "target": "cuda",
+        "fused_kind": "fused__conv2d__batchnorm2d",
+        "chains": [["conv1", "bn1"]],          # optional scope (original op names);
+                                               # absent = everywhere the pattern matches
+        "status": "proposed|accepted|rejected",
+        "source": [{"by": "kb|mb-cost|mb-cache|xpurt|user", ...}],
+        "evidence": [{"problem", "ir", "original_us", "variant_us", "gain", "decision", "ts"}]},
+       {"id": "split:conv2d", "kind": "split_slot", "target": "cuda", "slot": "conv2d",
+        "by": "shape_bucket", "groups": [{"bucket": "conv:N1,...", "ops": [...]}], ...},
+       {"id": "unfuse:fused__linear__relu", "kind": "unfuse", "target": "cuda",
+        "fused_kind": "...", "ops": [...]},
+       {"id": "xpurt:fuse:mlp_control", "kind": "fuse", "target": "riscv", "network": "...",
+        "dispatch_groups": [[0, 1, 2]]},
+       {"id": "xpurt:tile_split:...", "kind": "tile_split", "target": "riscv", "split_ops": [...]},
+       {"id": "xpurt:shard:...", "kind": "shard", "target": "riscv", "shard_ops": [...]},
+       ...]}
+
+The id is the hint's identity across rounds and models: a fusion is decided
+per fused kind (``fuse:<kind>``), a split per slot (``split:<slot>``), so the
+evidence from every problem that tried it accumulates on one record and the
+status is the majority of its decisions.
+
+:func:`apply_hints` rewrites an IR for one target and records provenance in
+``graph["graph_hints"]`` (applied hints, what each became, what was skipped
+and why); fused ops carry ``hint``. On CUDA:
+
+* ``fuse`` -> a fused op (``kb_proposals.fuse_chain``; chains of any length,
+  fused ops extend by fusing with their consumer);
+* ``split_slot`` -> ``slot_variant`` annotations: instances of one C entry are
+  given shape-specialised slots (``kb_export`` exports one slot per variant,
+  the kernel cache's shape guard keys each variant's winner). The graph's
+  ops and tensors are unchanged;
+* ``unfuse`` -> the fused op's stages restored (fp32 sub_ops keep their
+  registered tensors, so nothing needs synthesizing);
+* ``merge_sibling_convs`` (``--merge-sibling-convs auto``, merge_convs.py; id ``merge:<pattern>``, ``instances`` / ``chains`` scope):
+  sibling convolutions reading one tensor and joined by a channel concat become ONE convolution (largest odd kernel, centred
+  zero-padded filters concatenated along the output channels, biases concatenated, one shared activation) whose weights are
+  derived weights (weight_derivations.py: pad + concat; originals untouched); applied before the fusions so they see the new ops;
+* the RISC-V kinds: ``fuse`` with ``dispatch_groups`` is translated to op-name
+  chains (each group must be an exclusive producer->consumer chain); the
+  others are skipped with the reason -- ``tile_split`` (OC/N tiles placed on
+  several cores) and ``shard`` (an RVV codegen width for composite-hart
+  dispatch) parallelise one op across cores, which a CUDA kernel already
+  does across SMs inside the kernel; their CUDA analogue for heterogeneous
+  shapes is ``split_slot``.
+
+With ``target="riscv"`` the RISC-V kinds go through the existing appliers
+(``apply_fusion_hint``, ``apply_split_hint``, ``apply_shard_hint``,
+``apply_unfuse_hint``) unchanged.
+
+:func:`verify_rewrite` walks the rewritten IR with the torch walker (which
+runs fused ops' stages) against the original golden and the original walk,
+and optionally builds and runs the whole-graph driver with seed kernels.
+
+    python -m modelblaster.pipeline.graph_hints apply IR_DIR HINTS.json OUT_IR_DIR [--verify] [--build --arch 75]
+    python -m modelblaster.pipeline.graph_hints import {kb,xpurt,registry} FILE... --into HINTS.json
+    python -m modelblaster.pipeline.graph_hints show HINTS.json
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import os
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+FORMAT = "modelblaster.graph_hints/v1"
+CUDA_KINDS = ("fuse", "split_slot", "unfuse", "fold_layout", "fuse_attention", "fuse_siblings", "fuse_region",
+              "fuse_view", "rewrite", "merge_sibling_convs")
+# the KernelSpec-per-slot targets: their fuse / split_slot / unfuse rewrites are the same mechanics
+# (``target="opencl"`` applies them as on CUDA), but a hint decided on one target's device applies
+# only there
+SLOT_TARGETS = ("cuda", "opencl")
+NOT_ON_CUDA = {
+    "tile_split": "OC/N tiles exist to run one op on several cores at once; a CUDA kernel already spans "
+                  "every SM and the driver runs one stream, so tiles would serialise (use split_slot for "
+                  "shape-specialised kernels)",
+    "shard": "shard_factor is an RVV codegen width for composite-hart dispatch; CUDA parallelism is inside "
+             "the kernel",
+}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- documents
+
+def new_doc() -> dict:
+    return {"format": FORMAT, "hints": []}
+
+
+def load(path: Path | None) -> dict:
+    """A hints document; a missing file is empty, a Phase 1 fusion registry
+    (``mb-fusion-registry/1``) is converted."""
+    if path is None or not Path(path).exists():
+        return new_doc()
+    d = json.loads(Path(path).read_text())
+    if d.get("format") == FORMAT:
+        return d
+    if d.get("format") == "mb-fusion-registry/1":
+        doc = new_doc()
+        for kind, e in d.get("fusions", {}).items():
+            doc["hints"].append({"id": f"fuse:{kind}", "kind": "fuse", "target": "cuda", "fused_kind": kind,
+                                 "status": e.get("status", "proposed"), "signature": e.get("signature"),
+                                 "source": [{"by": "registry", "ref": str(path)}],
+                                 "evidence": list(e.get("evidence", []))})
+        return doc
+    raise ValueError(f"{path}: not {FORMAT} (format={d.get('format')!r})")
+
+
+def save(doc: dict, path: Path) -> None:
+    """Write atomically (temp file + rename): a reader never sees a partial
+    document, and two writers leave one complete document, not a mix."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(doc, indent=1))
+    os.replace(tmp, path)
+
+
+def get(doc: dict, hid: str) -> dict | None:
+    return next((h for h in doc["hints"] if h["id"] == hid), None)
+
+
+def merge(doc: dict, hints: list[dict]) -> list[dict]:
+    """Add new hints; for known ids add the new sources and scope (a decided
+    status is kept). -> the hints that were new."""
+    added = []
+    for h in hints:
+        cur = get(doc, h["id"])
+        if cur is None:
+            doc["hints"].append(copy.deepcopy(h))
+            added.append(h)
+            continue
+        cur.setdefault("source", []).extend(s for s in h.get("source", []) if s not in cur["source"])
+        for key in ("chains", "groups"):
+            if key in h and cur.get(key) is not None:
+                cur[key] = cur[key] + [c for c in h[key] if c not in cur[key]]
+    return added
+
+
+def record_decision(doc: dict, hint: dict | str, evidence: dict) -> dict:
+    """Append a decision to a hint (added if unknown); its status becomes the
+    majority of its decisions (a tie rejects). An ``undecided`` decision (its
+    re-measurement lost to an infrastructure failure) is kept as evidence but
+    does not vote: with no vote the status stays as it was (``proposed``: the
+    hint is a candidate again in a later round)."""
+    hid = hint if isinstance(hint, str) else hint["id"]
+    h = get(doc, hid)
+    if h is None:
+        if isinstance(hint, str):
+            raise KeyError(f"unknown hint {hid}")
+        h = copy.deepcopy(hint)
+        doc["hints"].append(h)
+    h.setdefault("evidence", []).append(evidence)
+    votes = [x for x in h["evidence"] if x["decision"] in ("accepted", "rejected")]
+    if not votes:
+        return h
+    wins = sum(1 for x in votes if x["decision"] == "accepted")
+    h["status"] = "accepted" if wins > len(votes) - wins else "rejected"
+    if h["status"] == "accepted":
+        # an accepted change applies wherever its pattern matches (split: by
+        # shape bucket); the instances it was measured on stay as evidence
+        for key in ("chains", "groups"):
+            if key in h:
+                h.setdefault("tried_" + key, []).extend(x for x in h.pop(key) if x not in h.get("tried_" + key, []))
+    return h
+
+
+def decided(doc: dict) -> set[str]:
+    return {h["id"] for h in doc["hints"] if h.get("status") in ("accepted", "rejected")}
+
+
+# ---------------------------------------------------------------- shape buckets
+
+# Same bucketing as KernelBlaster's knowledge/impl_store.shape_bucket (kept
+# identical: split proposals name their groups by these keys): powers of 4 of
+# the work dimensions, else of the element count.
+_BUCKET_KEYS = {
+    "gemm": ("M", "N", "K", "batch"),
+    "conv": ("N", "IC", "OC", "OH", "OW", "KH", "KW", "G"),
+    "attention": ("BH", "S", "D"),
+    "recurrent": ("T", "B", "I", "H"),          # op_classes recurrent class (opt-in)
+}
+
+
+def _mag(v) -> str:
+    v = max(int(v), 1)
+    return f"{4 ** int(math.log(v, 4)):d}"
+
+
+def shape_bucket(op_class: str, shape: dict) -> str:
+    if isinstance(shape.get("a"), dict):                 # fused op: its first stage's work
+        shape = shape["a"]
+    keys = _BUCKET_KEYS.get(op_class)
+    if keys:
+        parts = [f"{k}{_mag(shape[k])}" for k in keys if k in shape]
+        if parts:
+            return op_class + ":" + ",".join(parts)
+    n = shape.get("n")
+    if n is None:
+        ints = [v for v in shape.values() if isinstance(v, int) and v > 0]
+        n = math.prod(ints) if ints else 1
+    return f"{op_class}:n{_mag(n)}"
+
+
+# ---------------------------------------------------------------- producers
+
+def _graph_of_problem(problem_dir: Path) -> dict:
+    man = json.loads((Path(problem_dir) / "manifest.json").read_text())
+    return json.loads((Path(man["source_ir"]) / "graph.json").read_text())
+
+
+def unique_names(graph: dict) -> dict:
+    """Make op names unique in place: the k-th repeat of a name becomes
+    ``name#k``. Op names are the handle of every hint, proposal and manifest
+    op, but a module called twice (one ``nn.ReLU`` used after two convs)
+    gives two ops one name; tensor names stay as they are. Deterministic and
+    idempotent, so every reader of an IR agrees on the names."""
+    seen: dict[str, int] = {}
+    taken = {o["name"] for o in graph["ops"]}
+    for o in graph["ops"]:
+        n = o["name"]
+        k = seen.get(n, 0)
+        seen[n] = k + 1
+        if k:
+            while f"{n}#{k}" in taken:
+                k += 1
+            o["name"] = f"{n}#{k}"
+            taken.add(o["name"])
+    return graph
+
+
+def atoms(name: str) -> list[str]:
+    """Original op names inside a (possibly fused, ``a+b+c``) op name."""
+    return name.split("+")
+
+
+def fuse_hint(kind: str, chains: list[list[str]] | None, source: dict, status: str = "proposed") -> dict:
+    h = {"id": f"fuse:{kind}", "kind": "fuse", "target": "cuda", "fused_kind": kind, "status": status,
+         "source": [source], "evidence": []}
+    if chains is not None:
+        h["chains"] = chains
+    return h
+
+
+def from_kb_proposals(doc: dict, graph: dict | None = None, specs: dict | None = None) -> list[dict]:
+    """``kb-proposal/1`` -> hints. Fusion pairs are grouped by the fused kind
+    they produce (a dry run of the fusion on the problem's IR, which also
+    flattens fused producers into chains); infeasible pairs are dropped."""
+    from .kb_proposals import _all_specs, fuse_pair
+
+    specs = specs or _all_specs()
+    graph = unique_names(copy.deepcopy(graph) if graph is not None else _graph_of_problem(Path(doc["problem_dir"])))
+    names = {o["name"] for o in graph["ops"]}
+    out: dict[str, dict] = {}
+    for p in doc.get("proposals", []):
+        src = {"by": "kb", "problem": doc.get("problem"), "arch": doc.get("arch"),
+               **{k: p.get("evidence", {}).get(k) for k in ("est_gain_us", "est_gain_pct")},
+               "rationale": p.get("rationale"), "ts": _now()}
+        if p.get("kind") == "fuse":
+            for a, b, _t in p["pairs"]:
+                if a not in names or b not in names:
+                    continue
+                try:
+                    _, spec = fuse_pair(graph, a, b, specs)
+                except (ValueError, StopIteration, KeyError):
+                    continue
+                h = out.setdefault(spec.op, fuse_hint(spec.op, [], src))
+                h["chains"].append(atoms(a) + atoms(b))
+        elif p.get("kind") == "split":
+            hid = f"split:{p['slot']}"
+            out[hid] = {"id": hid, "kind": "split_slot", "target": "cuda", "slot": p["slot"],
+                        "by": "shape_bucket", "groups": p["groups"], "status": "proposed",
+                        "source": [src], "evidence": []}
+    return list(out.values())
+
+
+def from_xpurt(doc: dict, status: str = "accepted") -> list[dict]:
+    """XPU-RT's Contract-2 hints -> RISC-V hints, one per network entry."""
+    kinds = {"modelblaster.fusion_hints/v1": ("fuse", "fuse_groups", "dispatch_groups"),
+             "modelblaster.split_hints/v1": ("tile_split", "split_ops", "split_ops"),
+             "modelblaster.shard_hints/v1": ("shard", "shard_ops", "shard_ops"),
+             "modelblaster.unfuse_hints/v1": ("unfuse", "unfuse_ops", "unfuse_ops")}
+    contract = doc.get("contract")
+    if contract not in kinds:
+        raise ValueError(f"not an XPU-RT hint contract: {contract!r}")
+    kind, field_in, field_out = kinds[contract]
+    out = []
+    for n in doc.get("networks", []):
+        if not n.get(field_in):
+            continue
+        out.append({"id": f"xpurt:{kind}:{n['network']}", "kind": kind, "target": "riscv",
+                    "network": n["network"], field_out: n[field_in], "status": status,
+                    "source": [{"by": "xpurt", "contract": contract, "reason": doc.get("reason"), "ts": _now()}],
+                    "evidence": []})
+    return out
+
+
+def propose_from_profile(graph: dict, op_us: dict[str, float], specs: dict, *, doc: dict | None = None,
+                         min_gain_pct: float = 2.0, ir: str | None = None, launch_us: float = 0.0,
+                         total_us: float | None = None) -> list[dict]:
+    """ModelBlaster's own fusion proposals from a whole-model per-op profile:
+    every producer -> elementwise consumer pair where the consumer is the
+    producer output's only reader (fused producers and consumers included, so
+    accepted fusions grow into chains), grouped by fused kind; gain estimate =
+    the consumers' measured time plus ``launch_us`` per consumer (the launch
+    and idle cost per kernel of the deployed partition: a launch-bound model's
+    fusions are worth more than their kernels), as a share of ``total_us``
+    (default: the sum of ``op_us``). Kinds already decided in ``doc`` are skipped."""
+    from .kb_proposals import fuse_pair, with_fused_specs
+    from .op_classes import op_class
+
+    graph = unique_names(copy.deepcopy(graph))
+    specs = with_fused_specs(graph, specs)
+    total = total_us or sum(op_us.values()) or 1.0
+    done = decided(doc) if doc else set()
+    outs = set(graph["output"].get("tensors") or [graph["output"]["tensor"]])
+    readers: dict[str, list[dict]] = {}
+    for o in graph["ops"]:
+        for t in o["inputs"]:
+            readers.setdefault(t, []).append(o)
+    cands: dict[str, dict] = {}
+    used: set[str] = set()
+    pairs = []
+    for o in graph["ops"]:
+        if len(o["outputs"]) != 1 or o["op"] not in specs:
+            continue
+        r = readers.get(o["outputs"][0], [])
+        if len(r) != 1 or o["outputs"][0] in outs:
+            continue
+        b = r[0]
+        if b["op"] not in specs or op_class(b["op"]) != "elementwise":
+            continue
+        pairs.append((op_us.get(b["name"], 0.0) + launch_us, len(pairs), o["name"], b["name"]))
+    for gain, _, a, b in sorted(pairs, key=lambda p: (-p[0], p[1])):
+        if a in used or b in used:
+            continue
+        try:
+            _, spec = fuse_pair(graph, a, b, specs)
+        except (ValueError, StopIteration, KeyError):
+            continue
+        if f"fuse:{spec.op}" in done:
+            continue
+        used.update((a, b))
+        c = cands.setdefault(spec.op, {"chains": [], "gain_us": 0.0})
+        c["chains"].append(atoms(a) + atoms(b))
+        c["gain_us"] += gain
+    out = []
+    for kind, c in sorted(cands.items(), key=lambda kv: -kv[1]["gain_us"]):
+        pct = 100.0 * c["gain_us"] / total
+        if pct < min_gain_pct:
+            continue
+        out.append(fuse_hint(kind, c["chains"], {"by": "mb-cost", "ir": ir, "est_gain_us": round(c["gain_us"], 2),
+                                                 "est_gain_pct": round(pct, 2), "ts": _now(),
+                                                 **({"launch_us": launch_us} if launch_us else {})}))
+    return out
+
+
+# ---------------------------------------------------------------- apply
+
+def _locate(graph: dict, chain: list[str]) -> list[str]:
+    """Current op names covering a chain of original names (consecutive
+    atoms already fused into one op collapse to it)."""
+    where = {a: o["name"] for o in graph["ops"] for a in atoms(o["name"])}
+    if any(a not in where for a in chain):
+        raise ValueError(f"{chain}: op(s) {[a for a in chain if a not in where]} not in the graph")
+    return list(dict.fromkeys(where[a] for a in chain))
+
+
+def _apply_fuse_cuda(graph, h, specs, prov):
+    from .kb_proposals import find_chains, fuse_chain, spec_from_kind
+
+    kind = h["fused_kind"]
+    try:
+        spec = spec_from_kind(kind, specs)
+    except (ValueError, KeyError) as e:
+        prov["skipped"].append({"id": h["id"], "why": str(e)})
+        return graph, {}
+    chains = h.get("chains")
+    if chains is None:
+        chains = find_chains(graph, kind, specs)
+    used = {}
+    for chain in chains:
+        try:
+            cur = _locate(graph, chain)
+            if len(cur) < 2:
+                raise ValueError("already one op")
+            g2, s = fuse_chain(graph, cur, specs)
+            if s.op != kind:
+                raise ValueError(f"chain fuses to {s.op}, not {kind}")
+        except (ValueError, StopIteration, KeyError) as e:
+            prov["skipped"].append({"id": h["id"], "chain": chain, "why": str(e)})
+            continue
+        graph = g2
+        new = "+".join(cur)
+        next(o for o in graph["ops"] if o["name"] == new)["hint"] = h["id"]
+        for n in chain:
+            prov["renamed"][n] = new
+        for n in cur:
+            prov["renamed"][n] = new
+        prov["applied"].append({"id": h["id"], "kind": "fuse", "op": new, "from": cur, "fused_kind": kind})
+        used[kind] = s
+    if not used and h.get("chains") is None:
+        prov["skipped"].append({"id": h["id"], "why": "pattern does not occur"})
+    return graph, ({kind: spec} if used else {})
+
+
+def _apply_split_cuda(graph, h, specs, prov):
+    from .kb_export import base_slot_id
+    from .op_classes import op_class
+
+    groups = h.get("groups")
+    inst = [o for o in graph["ops"] if o["op"] in specs and base_slot_id(o["op"], specs) == h["slot"]]
+    if groups is None:                                   # pattern level: by shape bucket
+        by: dict[str, list[str]] = {}
+        for o in inst:
+            by.setdefault(shape_bucket(op_class(o["op"]), o.get("shape", {})), []).append(o["name"])
+        groups = [{"bucket": b, "ops": n} for b, n in by.items()]
+    names = {o["name"]: o for o in inst}
+    live = []
+    for grp in groups:
+        ops = [prov["renamed"].get(n, n) for n in grp["ops"]]
+        ops = [n for n in dict.fromkeys(ops) if n in names]
+        if ops:
+            live.append({**grp, "ops": ops})
+    if len(live) < 2:
+        prov["skipped"].append({"id": h["id"], "why": f"{len(live)} shape group(s) of slot {h['slot']} here"})
+        return graph
+    for k, grp in enumerate(live):
+        for n in grp["ops"]:
+            names[n]["slot_variant"] = f"v{k}"
+            names[n]["hint"] = h["id"]
+    prov["applied"].append({"id": h["id"], "kind": "split_slot", "slot": h["slot"],
+                            "variants": {f"v{k}": g["ops"] for k, g in enumerate(live)}})
+    return graph
+
+
+def _apply_fold_layout_cuda(graph, h, specs, prov):
+    """``fold_layout``: strided copies around bmm folded into bmm_strided
+    (layout_fold.fold); ``ops`` (optional) limits it to those gemm ops."""
+    from .layout_fold import fold
+
+    only = {prov["renamed"].get(n, n) for n in h["ops"]} if h.get("ops") else None
+    g2, rep = fold(graph, only=only)
+    if not rep["folded"]:
+        prov["skipped"].append({"id": h["id"], "why": "no foldable copy around a bmm"})
+        return graph
+    for f in rep["folded"]:
+        next(o for o in g2["ops"] if o["name"] == f["op"])["hint"] = h["id"]
+    prov["applied"].append({"id": h["id"], "kind": "fold_layout",
+                            "folded": {f["op"]: f["copies"] for f in rep["folded"]}})
+    return g2
+
+
+def _apply_fuse_attention_cuda(graph, h, specs, prov, const_lookup=None):
+    """``fuse_attention``: bmm -> scale -> mask -> softmax|relu -> bmm chains (and the copies around them) into
+    one ``attention_f16`` op (attention_fuse.fuse); ``ops`` (optional) limits it to chains whose score bmm
+    is one of those ops (original or renamed names)."""
+    from .attention_fuse import VERIFIED_TRIU, fuse
+
+    only = None
+    if h.get("ops"):
+        only = set()
+        for n in h["ops"]:
+            only.add(prov["renamed"].get(n, n))
+            only.add(n)
+    if const_lookup is None and h.get("verified_masks"):
+        ok = set(h["verified_masks"])                # mask constants the proposer checked against triu(1)
+        const_lookup = lambda key: VERIFIED_TRIU if key in ok else None
+    g2, rep = fuse(graph, const_lookup=const_lookup, only=only)
+    if not rep["fused"]:
+        prov["skipped"].append({"id": h["id"], "why": "no attention chain (or the mask is not causal / constant)"})
+        return graph
+    for f in rep["fused"]:
+        next(o for o in g2["ops"] if o["name"] == f["op"])["hint"] = h["id"]
+        for n in f["removed"]:
+            prov["renamed"][n] = f["op"]
+    prov["applied"].append({"id": h["id"], "kind": "fuse_attention",
+                            "fused": {f["op"]: f["removed"] for f in rep["fused"]}})
+    return g2
+
+
+def _apply_fuse_siblings_cuda(graph, h, specs, prov):
+    """``fuse_siblings`` (fusion_ext, --fusion-extended siblings): each group of independent same-kind ops reading one
+    input becomes a ``fused__par__`` op (kb_proposals.fuse_siblings); without ``groups`` wherever find_siblings
+    finds the kind."""
+    from .kb_proposals import find_siblings, fuse_siblings, parse_kind
+
+    kind = h.get("fused_kind")
+    groups = h.get("groups")
+    if groups is None:
+        try:
+            want = parse_kind(kind, specs)[0]
+        except (ValueError, KeyError) as e:
+            prov["skipped"].append({"id": h["id"], "why": str(e)})
+            return graph, {}
+        groups = [g for g in find_siblings(graph, specs) if
+                  [next(o["op"] for o in graph["ops"] if o["name"] == n) for n in g] == want]
+    used = {}
+    for grp in groups:
+        try:
+            cur = _locate(graph, grp)
+            if len(cur) < 2:
+                raise ValueError("already one op")
+            g2, s = fuse_siblings(graph, cur, specs)
+            if kind and s.op != kind:
+                raise ValueError(f"group fuses to {s.op}, not {kind}")
+        except (ValueError, StopIteration, KeyError) as e:
+            prov["skipped"].append({"id": h["id"], "group": grp, "why": str(e)})
+            continue
+        graph = g2
+        new = "+".join(cur)
+        next(o for o in graph["ops"] if o["name"] == new)["hint"] = h["id"]
+        for n in list(grp) + list(cur):
+            prov["renamed"][n] = new
+        prov["applied"].append({"id": h["id"], "kind": "fuse_siblings", "op": new, "from": cur, "fused_kind": s.op})
+        used[s.op] = s
+    if not used and h.get("groups") is None:
+        prov["skipped"].append({"id": h["id"], "why": "pattern does not occur"})
+    return graph, used
+
+
+def _apply_fuse_view_cuda(graph, h, specs, prov):
+    """``fuse_view`` (view_fusion, --view-fusion on): elide the hint's pure-reshape views in front of flat elementwise
+    consumers, then fuse its chains like ``fuse``."""
+    from .view_fusion import elide
+
+    present = {o["name"] for o in graph["ops"]}
+    views = [v for v in h.get("views", []) if v in present]
+    try:
+        g2, _ = elide(graph, views)
+    except ValueError as e:
+        prov["skipped"].append({"id": h["id"], "why": str(e)})
+        return graph, {}
+    g3, used = _apply_fuse_cuda(g2, h, specs, prov)
+    if not used:
+        return graph, {}                                 # nothing fused: keep the views (no-op rewrite)
+    for a in prov["applied"]:
+        if a["id"] == h["id"]:
+            a["kind"], a["views"] = "fuse_view", views
+    return g3, used
+
+
+def _apply_fuse_region_cuda(graph, h, specs, prov):
+    """``fuse_region`` (region_slots, --region-slots): the hint's ``pattern`` (rnn_stack | attention_block | all)
+    wherever region_slots.find_regions finds it, or its explicit ``members`` (op names), becomes one ``region__`` op (explicit
+    ``windows``: one per member list, the windows of --region-windows).
+    Applied after every other kind (the members keep their split variants: the region's composite seed calls each
+    member's own slot variant)."""
+    from .region_slots import find_regions, fuse_region
+
+    # ``windows`` (region_windows.py, --region-windows): several explicit member lists, one region op each. NOT ``groups``: that
+    # key is the split hints' shape groups, which record_decision moves to ``tried_groups`` once the hint is accepted
+    groups = ([list(g) for g in h["windows"]] if h.get("windows") else
+              [h["members"]] if h.get("members") else
+              # a pattern's groups are CURRENT op names (a fused op is `a+b`): _locate takes atoms, so give it the atoms (a pattern
+              # hint applied to a graph whose accepted fusions are already in the IR was skipped with "op(s) [...] not in the graph")
+              [[a for n in grp for a in atoms(n)] for grp in find_regions(graph, h.get("pattern", "all"), specs)])
+    used = {}
+    for grp in groups:
+        try:
+            cur = _locate(graph, grp)
+            g2, s = fuse_region(graph, cur, specs, h.get("pattern", "ops"))
+        except (ValueError, StopIteration, KeyError) as e:
+            prov["skipped"].append({"id": h["id"], "group": grp, "why": str(e)})
+            continue
+        graph = g2
+        new = next(o for o in graph["ops"] if o["op"] == s.op)
+        new["hint"] = h["id"]
+        for n in list(grp) + list(cur):
+            prov["renamed"][n] = new["name"]
+        prov["applied"].append({"id": h["id"], "kind": "fuse_region", "op": new["name"], "from": cur,
+                                "fused_kind": s.op})
+        used[s.op] = s
+    if not used:
+        prov["skipped"].append({"id": h["id"], "why": "pattern does not occur"})
+    return graph, used
+
+
+def _fold_specs(graph, specs):
+    """Fused kinds whose head became bmm_strided need their FusedKernelSpec."""
+    from .kb_proposals import spec_from_kind
+
+    out = {}
+    for o in graph["ops"]:
+        if o["op"].startswith("fused__bmm_strided") and o["op"] not in specs:
+            out[o["op"]] = spec_from_kind(o["op"], {**specs, **out})
+    return out
+
+
+def _apply_unfuse_cuda(graph, h, specs, prov):
+    ops = graph["ops"]
+    targets = [o for o in ops if "sub_ops" in o and (o["name"] in (h.get("ops") or [])
+                                                     or o["op"] == h.get("fused_kind"))]
+    if not targets:
+        prov["skipped"].append({"id": h["id"], "why": "no matching fused op"})
+        return graph
+    for t in targets:
+        missing = [x for x in t.get("internal", []) if x not in graph["tensors"]]
+        if missing:
+            prov["skipped"].append({"id": h["id"], "op": t["name"],
+                                    "why": f"internal tensors {missing} are not registered (an int8 RISC-V "
+                                           f"fused op: use target riscv / apply_unfuse_hint)"})
+            continue
+        i = ops.index(t)
+        stages = [copy.deepcopy(s) for s in t["sub_ops"]]
+        for s in stages:
+            s.pop("depends_on", None)
+            s["unfused_from"] = t["name"]
+        ops[i:i + 1] = stages
+        for s in stages:
+            prov["renamed"][s["name"]] = s["name"]
+        prov["applied"].append({"id": h["id"], "kind": "unfuse", "op": t["name"], "to": [s["name"] for s in stages]})
+    return graph
+
+
+def _xpurt_fuse_to_chains(graph: dict, h: dict) -> list[list[str]]:
+    """XPU-RT dispatch groups -> op-name chains (validated by the RISC-V
+    applier's closure check, then required to be a producer->consumer chain)."""
+    from .apply_fusion_hint import _ops_by_id, _validate_fuse_group
+
+    by_id = _ops_by_id(graph["ops"])
+    chains = []
+    for grp in h["dispatch_groups"]:
+        _validate_fuse_group(grp, by_id, graph.get("name", "?"))
+        chains.append([by_id[d]["name"] for d in grp])
+    return chains
+
+
+def _renumber(graph: dict, before: dict[str, int]) -> None:
+    """Contiguous dispatch ids, depends_on from tensor producers (the rule
+    extract_graph uses), and ``id_remap`` {old id: [new ids]} by the original
+    op names each op is made of. View ops (no dispatch id) stay as they are."""
+    if not any(v is not None for v in before.values()):        # an IR without dispatch ids
+        return
+    nid, producer, new_of_atom = 0, {}, {}
+    for o in graph["ops"]:
+        if "dispatch_id" in o and o["dispatch_id"] is None:          # a view: no dispatch
+            continue
+        o["dispatch_id"] = nid
+        for a in atoms(o["name"]):
+            new_of_atom.setdefault(a, []).append(nid)
+        nid += 1
+    for o in graph["ops"]:
+        if o.get("dispatch_id") is None:
+            continue
+        o["depends_on"] = sorted({producer[t] for t in o["inputs"] if t in producer} - {o["dispatch_id"]})
+        for t in o["outputs"]:
+            producer[t] = o["dispatch_id"]
+    remap = {}
+    for name, old in before.items():
+        if old is None:
+            continue
+        new = sorted({i for a in atoms(name) for i in new_of_atom.get(a, [])})
+        for d in ([old] if not isinstance(old, list) else old):
+            remap.setdefault(str(d), sorted(set(remap.get(str(d), [])) | set(new)))
+    graph["id_remap"] = remap
+    if isinstance(graph.get("dispatches"), list):
+        graph["dispatches"] = [o["dispatch_id"] for o in graph["ops"] if o.get("dispatch_id") is not None]
+
+
+def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, target: str = "cuda",
+                statuses: tuple | None = ("accepted",), const_lookup=None) -> tuple[dict, dict, dict]:
+    """Apply ``hints`` (those whose status is in ``statuses``; None = all) to
+    a copy of ``graph`` for ``target``.
+
+    -> (graph, {fused kind: FusedKernelSpec} the CUDA graph now needs,
+        provenance {"applied", "skipped", "renamed": {old op name: new}}).
+    Fusions apply longest chain first, so an accepted conv->bn->relu wins over
+    its accepted conv->bn prefix where both match."""
+    from .kb_proposals import _all_specs, parse_kind
+
+    specs = dict(specs or _all_specs())
+    g = unique_names(copy.deepcopy(graph))
+    prov = {"applied": [], "skipped": [], "renamed": {}}
+    todo = [h for h in hints if statuses is None or h.get("status") in statuses]
+    if target == "riscv":
+        return _apply_riscv(g, todo, prov)
+    before = {o["name"]: o.get("dispatch_id") for o in g["ops"]}
+
+    def order(h):
+        if h["kind"] == "fuse" and h.get("fused_kind"):
+            try:
+                return (0, -len(parse_kind(h["fused_kind"], specs)[0]))
+            except (ValueError, KeyError):
+                return (0, 0)
+        # fold_layout runs after fusion (it folds into a fused group's head bmm too)
+        # and before split_slot (the folded ops get new slot kinds to split)
+        # fuse_attention consumes accepted bmm/scale/mask fusions and folds the q/k/v/o copies itself, so it
+        # runs after fuse and before fold_layout (which would otherwise rewrite the same bmms)
+        # merge_sibling_convs (merge_convs.py) runs on the unfused ops (right after unfuse): the fusions that follow see the merged conv
+        return ({"fuse": 0, "unfuse": -1, "merge_sibling_convs": -0.5, "fuse_siblings": 0.3, "fuse_attention": 0.4, "fold_layout": 0.5,
+                 "split_slot": 1, "fuse_region": 1.5, "fuse_view": 0.1}.get(h["kind"], 2), 0)
+
+    ordered = sorted(todo, key=order)
+    if any(h["kind"] == "rewrite" for h in ordered):
+        # a graph rewrite (graph_rewrite.py) was proposed on the graph the hints accepted AT THAT TIME had produced: it applies right
+        # after the last of them (``rewrite.after_hints``), before every hint accepted later (their patterns then see the new ops;
+        # a later hint that names an op the rewrite removed is skipped as not applicable)
+        rws = [h for h in ordered if h["kind"] == "rewrite"]
+        ordered = [h for h in ordered if h["kind"] != "rewrite"]
+        for h in rws:
+            after = set((h.get("rewrite") or {}).get("after_hints") or [])
+            ordered.insert(max((i for i, x in enumerate(ordered) if x["id"] in after), default=-1) + 1, h)
+    added = {}
+    for h in ordered:
+        ht = h.get("target", "cuda")
+        if ht in SLOT_TARGETS and ht != target:
+            # decided by measurement on another slot target's device (CUDA vs OpenCL)
+            prov["skipped"].append({"id": h["id"], "why": f"decided for target {ht}, not {target}"})
+            continue
+        if h.get("target", "cuda") == "riscv" and h["kind"] == "fuse" and "dispatch_groups" in h:
+            try:
+                chains = _xpurt_fuse_to_chains(g, h)
+            except ValueError as e:
+                prov["skipped"].append({"id": h["id"], "why": str(e)})
+                continue
+            from .kb_proposals import fuse_chain
+            for ch in chains:
+                try:
+                    _, s = fuse_chain(g, ch, specs)
+                except (ValueError, StopIteration, KeyError) as e:
+                    prov["skipped"].append({"id": h["id"], "chain": ch, "why": f"not a fusable chain on cuda: {e}"})
+                    continue
+                g, sp = _apply_fuse_cuda(g, {**h, "fused_kind": s.op, "chains": [ch]}, specs, prov)
+                added.update(sp)
+                specs.update(sp)
+        elif h.get("target", "cuda") != "cuda" and h["kind"] not in CUDA_KINDS:
+            prov["skipped"].append({"id": h["id"], "why": "not applicable on cuda: " +
+                                    NOT_ON_CUDA.get(h["kind"], f"kind {h['kind']}")})
+        elif h["kind"] == "fuse":
+            g, sp = _apply_fuse_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "fuse_siblings":
+            g, sp = _apply_fuse_siblings_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "fuse_attention":
+            g = _apply_fuse_attention_cuda(g, h, specs, prov, const_lookup)
+        elif h["kind"] == "fuse_view":
+            g, sp = _apply_fuse_view_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "fuse_region":
+            g, sp = _apply_fuse_region_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "merge_sibling_convs":     # merge_convs.py: sibling convs joined by a channel concat -> one conv, derived weights
+            from .merge_convs import apply_hint as _merge_apply
+            g, sp = _merge_apply(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "rewrite":                 # graph_rewrite.py: an agent / MB rewrite stored as a patch + derived weights
+            from .graph_rewrite import apply_rewrite_hint
+            g, sp = apply_rewrite_hint(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "fold_layout":
+            g = _apply_fold_layout_cuda(g, h, specs, prov)
+            added.update(_fold_specs(g, specs))
+            specs.update(added)
+        elif h["kind"] == "split_slot":
+            g = _apply_split_cuda(g, h, specs, prov)
+        elif h["kind"] == "unfuse":
+            if h.get("target") == "riscv":
+                prov["skipped"].append({"id": h["id"], "why": "int8 unfuse needs quant blocks: target riscv"})
+            else:
+                g = _apply_unfuse_cuda(g, h, specs, prov)
+        else:
+            prov["skipped"].append({"id": h["id"], "why": f"unknown kind {h['kind']}"})
+    _renumber(g, before)
+    _record(g, prov, target)
+    return g, added, prov
+
+
+def _apply_riscv(g: dict, hints: list[dict], prov: dict):
+    from .apply_fusion_hint import apply_hint
+    from .apply_shard_hint import apply_shard_hint
+    from .apply_split_hint import apply_split_hint
+    from .apply_unfuse_hint import apply_unfuse_hint
+
+    net = g.get("name")
+    for h in hints:
+        if h.get("network") not in (None, net):
+            prov["skipped"].append({"id": h["id"], "why": f"hint is for network {h.get('network')}"})
+            continue
+        if h["kind"] == "fuse" and "dispatch_groups" in h:
+            g = apply_hint(g, h["dispatch_groups"], pairwise=bool(h.get("pairwise")))
+        elif h["kind"] == "tile_split":
+            g = apply_split_hint(g, h["split_ops"])
+        elif h["kind"] == "shard":
+            g = apply_shard_hint(g, h["shard_ops"])
+        elif h["kind"] == "unfuse" and "unfuse_ops" in h:
+            g = apply_unfuse_hint(g, h["unfuse_ops"])
+        else:
+            prov["skipped"].append({"id": h["id"], "why": f"{h['kind']} has no RISC-V applier"})
+            continue
+        prov["applied"].append({"id": h["id"], "kind": h["kind"]})
+    _record(g, prov, "riscv")
+    return g, {}, prov
+
+
+def _record(g: dict, prov: dict, target: str) -> None:
+    rec = g.setdefault("graph_hints", {"format": FORMAT, "rounds": []})
+    rec["rounds"].append({"target": target, "applied": prov["applied"], "skipped": prov["skipped"], "ts": _now()})
+
+
+# ---------------------------------------------------------------- verify
+
+def verify_rewrite(ir_dir: Path, graph: dict, *, specs: dict | None = None, build: bool = False,
+                   arch: str = "75", work: Path | None = None) -> dict:
+    """Torch-walk the rewritten ``graph`` (weights/io of ``ir_dir``) against
+    the original golden and the original walk; with ``build``, also export
+    the whole rewritten graph (seed kernels) and run its driver."""
+    import tempfile
+
+    import torch
+
+    from .kb_export import _harness
+
+    mbir, walk_torch = _harness()
+    ir = mbir.load_ir(ir_dir)
+    with torch.no_grad():
+        ref, _ = walk_torch.walk(ir, dev="cpu")
+        weights = ir.weights
+        if graph.get("weight_derivations"):                  # a rewrite's derived weights: rebuilt from the base ones
+            from . import weight_derivations as wd
+            weights = wd.fill_missing(graph, weights)
+        new_ir = mbir.IR(ir.name, graph, weights, ir.golden_in, ir.golden_out)
+        out, _ = walk_torch.walk(new_ir, dev="cpu")
+    res = {"golden": mbir.compare(out, ir.golden_out),
+           "vs_original_walk": float((out - ref).abs().max()) if out.shape == ref.shape else None}
+    exact = res["vs_original_walk"] == 0.0
+    if not exact and res["vs_original_walk"] is not None and any(o.get("approx") for o in graph["ops"]):
+        # an approximate rewrite (attention_fuse: exact-fp32 reference instead of the fp16-rounded op chain) must
+        # stay within the fp16 OUTPUT tolerance of the original walk (not slot_rel: at 31's T=16384 the rounded
+        # chain itself is 2.3e-3 from the fp32 truth, l3_farm/analysis/attention_fusion.md) and pass the golden
+        from .cuda_dtypes import FP16, TOLERANCE
+        scale = float(ref.abs()[torch.isfinite(ref)].max()) if ref.numel() else 0.0
+        res["vs_original_rel"] = res["vs_original_walk"] / scale if scale else None
+        exact = res["vs_original_walk"] <= TOLERANCE[FP16]["output_rel"] * scale + TOLERANCE[FP16]["output_abs"]
+    res["ok"] = bool(res["golden"]["ok"] and exact)
+    if build:
+        from .kb_export import build_and_run, export_problem
+        from .kb_proposals import write_variant_ir
+
+        tmp = Path(work or tempfile.mkdtemp(prefix="mb_hints_"))
+        vir = write_variant_ir(Path(ir_dir), graph, tmp / "ir")
+        prob = export_problem(vir, tmp / "problem", specs=specs, strategy="whole")
+        r = build_and_run(prob, arch=arch)
+        res["driver"] = {k: r.get(k) for k in ("passed", "stage", "partition_us", "slot_us")}
+        if not r.get("passed"):
+            res["driver"]["log"] = r.get("log", "")[-1500:]
+        res["ok"] = res["ok"] and bool(r.get("passed"))
+    return res
+
+
+def apply_to_ir(ir_dir: Path, hints_doc: dict, out_dir: Path, specs: dict | None = None,
+                statuses: tuple | None = ("accepted",), target: str = "cuda") -> tuple[Path, dict, dict]:
+    """Apply a hints document to an IR dir; writes the rewritten IR (weights
+    and io symlinked) when anything applied. -> (IR dir to use, specs, prov)."""
+    from .kb_proposals import _all_specs, write_variant_ir
+
+    specs = dict(specs or _all_specs())
+    g = json.loads((Path(ir_dir) / "graph.json").read_text())
+    g2, added, prov = apply_hints(g, hints_doc["hints"], specs, statuses=statuses, target=target)
+    specs.update(added)
+    if not prov["applied"]:
+        return Path(ir_dir), specs, prov
+    return write_variant_ir(Path(ir_dir), g2, Path(out_dir)), specs, prov
+
+
+def hints_sha(doc: dict) -> str:
+    key = [(h["id"], h.get("status"), h.get("chains"), h.get("groups")) for h in doc["hints"]]
+    return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:10]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a1 = sub.add_parser("apply")
+    a1.add_argument("ir_dir")
+    a1.add_argument("hints")
+    a1.add_argument("out_ir")
+    a1.add_argument("--all", action="store_true", help="apply proposed hints too, not only accepted")
+    a1.add_argument("--target", default="cuda", choices=["cuda", "opencl", "riscv"])
+    a1.add_argument("--verify", action="store_true")
+    a1.add_argument("--build", action="store_true")
+    a1.add_argument("--arch", default="75")
+    a2 = sub.add_parser("import")
+    a2.add_argument("source", choices=["kb", "xpurt", "registry"])
+    a2.add_argument("files", nargs="+")
+    a2.add_argument("--into", required=True)
+    a3 = sub.add_parser("show")
+    a3.add_argument("hints")
+    a = ap.parse_args()
+    if a.cmd == "apply":
+        from .kb_proposals import _all_specs, write_variant_ir
+
+        doc, specs = load(Path(a.hints)), dict(_all_specs())
+        g = json.loads((Path(a.ir_dir) / "graph.json").read_text())
+        g2, added, prov = apply_hints(g, doc["hints"], specs, target=a.target,
+                                      statuses=None if a.all else ("accepted",))
+        specs.update(added)
+        write_variant_ir(Path(a.ir_dir), g2, Path(a.out_ir))
+        out = {"applied": prov["applied"], "skipped": prov["skipped"]}
+        if a.verify or a.build:
+            out["verify"] = verify_rewrite(Path(a.ir_dir), g2, specs=specs, build=a.build, arch=a.arch)
+        print(json.dumps(out, indent=1))
+    elif a.cmd == "import":
+        doc = load(Path(a.into))
+        for f in a.files:
+            d = json.loads(Path(f).read_text())
+            new = (from_kb_proposals(d) if a.source == "kb" else from_xpurt(d) if a.source == "xpurt"
+                   else load(Path(f))["hints"])
+            merge(doc, new)
+        save(doc, Path(a.into))
+        print(json.dumps([h["id"] for h in doc["hints"]]))
+    else:
+        for h in load(Path(a.hints))["hints"]:
+            ev = h.get("evidence", [])
+            print(f"{h['id']:<55} {h.get('status', '?'):<9} {h.get('target', 'cuda'):<6} "
+                  f"decisions={len(ev)} last_gain={ev[-1].get('gain') if ev else None}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,258 @@
+# Per-LLM-model token pricing. Used by aggregate.compute_cost_usd to
+# derive `dollars_equivalent` from tokens_input_cached / _uncached /
+# output. Rates are $ per million tokens (MTok).
+#
+# Rates rotate. Update this file (and only this file) to re-price the
+# entire dashboard.
+
+last_updated: 2026-05-25
+sources:
+  anthropic:        https://platform.claude.com/docs/en/about-claude/pricing
+  bedrock:          https://aws.amazon.com/bedrock/pricing/
+  bedrock_models:   https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html
+  gemini:           https://ai.google.dev/pricing
+
+# Bedrock pricing for Anthropic Claude 4.5+ models follows a different
+# structure than 3.5/4.0:
+#   - Global endpoints (dynamic routing):  same rates as Anthropic first-party.
+#   - Regional endpoints (e.g. us-east-1): +10% premium.
+# The `us.` prefix in model ids (us.anthropic.claude-sonnet-4-5-...) is a
+# US cross-region inference profile -- effectively a US-scoped global
+# endpoint, so it uses STANDARD rates with no +10% premium. If a future
+# experiment pins to a single-region (non-`us.`-prefixed) endpoint, the
+# pricing entries below need a +10% multiplier applied.
+#
+# Older Bedrock-Anthropic models (3.5 Sonnet v2 and earlier) used the
+# legacy 2x first-party markup -- preserved below for `us.anthropic.claude-3-5-sonnet-v2`.
+
+# Claude API (first-party) rates. Cache writes have two flavors:
+# 5-minute and 1-hour. The 5-minute write is the default and what the
+# Claude Code session JSONL records. If 1-hour writes ever appear in
+# session telemetry, extend the aggregator and the schema accordingly.
+models:
+
+  claude-opus-4-7:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: anthropic
+
+  claude-opus-4-6:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: anthropic
+
+  claude-opus-4-5:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: anthropic
+
+  claude-sonnet-4-6:
+    input_uncached:        3.00
+    cache_write_5m:        3.75
+    cache_write_1h:        6.00
+    cache_read:            0.30
+    output:               15.00
+    provider: anthropic
+
+  claude-sonnet-4-5:
+    input_uncached:        3.00
+    cache_write_5m:        3.75
+    cache_write_1h:        6.00
+    cache_read:            0.30
+    output:               15.00
+    provider: anthropic
+
+  claude-haiku-4-5:
+    input_uncached:        1.00
+    cache_write_5m:        1.25
+    cache_write_1h:        2.00
+    cache_read:            0.10
+    output:                5.00
+    provider: anthropic
+
+  # ──────────── AWS Bedrock — Anthropic Claude 4.x ────────────
+  # Rates match Anthropic first-party because these models use US
+  # cross-region inference profiles (the `us.` prefix). Verified against
+  # the Anthropic pricing page; the public Bedrock pricing page does
+  # not surface 4.x rates yet. Mark verified=false until a real Bedrock
+  # invoice line cross-references the per-token charge.
+
+  us.anthropic.claude-opus-4-7-20251029-v1:0:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: bedrock
+    verified: false
+
+  us.anthropic.claude-opus-4-6-20251015-v1:0:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: bedrock
+    verified: false
+
+  us.anthropic.claude-opus-4-5-20250929-v1:0:
+    input_uncached:        5.00
+    cache_write_5m:        6.25
+    cache_write_1h:       10.00
+    cache_read:            0.50
+    output:               25.00
+    provider: bedrock
+    verified: false
+
+  us.anthropic.claude-sonnet-4-6-20251015-v1:0:
+    input_uncached:        3.00
+    cache_write_5m:        3.75
+    cache_write_1h:        6.00
+    cache_read:            0.30
+    output:               15.00
+    provider: bedrock
+    verified: false
+
+  us.anthropic.claude-sonnet-4-5-20250929-v1:0:
+    input_uncached:        3.00
+    cache_write_5m:        3.75
+    cache_write_1h:        6.00
+    cache_read:            0.30
+    output:               15.00
+    provider: bedrock
+    verified: false
+
+  us.anthropic.claude-haiku-4-5-20251001-v1:0:
+    input_uncached:        1.00
+    cache_write_5m:        1.25
+    cache_write_1h:        2.00
+    cache_read:            0.10
+    output:                5.00
+    provider: bedrock
+    verified: false
+
+  # ──────────── AWS Bedrock — Anthropic Claude 3.x (legacy 2x markup) ────────────
+  # Pre-4.5 Anthropic models on Bedrock kept a 2x markup over first-party
+  # rates. These entries reflect what the Bedrock pricing page lists today.
+
+  us.anthropic.claude-3-5-sonnet-v2:
+    input_uncached:        6.00
+    cache_write_5m:        7.50
+    cache_read:            0.60
+    output:               30.00
+    provider: bedrock
+    verified: true
+
+  # ──────────── AWS Bedrock — Meta Llama ────────────
+  # Llama 4 rates are not surfaced on the public Bedrock pricing page.
+  # Marked placeholder so the aggregator notes the gap instead of
+  # silently zero-costing.
+  us.meta.llama4-maverick-17b-instruct-v1:0:
+    input_uncached:        null
+    cache_read:            null
+    output:                null
+    provider: bedrock
+    placeholder: true
+
+  us.meta.llama4-scout-17b-instruct-v1:0:
+    input_uncached:        null
+    cache_read:            null
+    output:                null
+    provider: bedrock
+    placeholder: true
+
+  # ──────────── AWS Bedrock — Mistral / code-specialist ────────────
+  # Mistral Large 3 rates from the Bedrock pricing page (Mistral section).
+  # Devstral 2 123B is a coding-specialist model with no public Bedrock
+  # rate yet -- placeholder until surfaced or invoice-confirmed.
+  mistral.mistral-large-3:
+    input_uncached:        0.50
+    cache_read:            null
+    output:                1.50
+    provider: bedrock
+    verified: false
+
+  mistral.devstral-2-123b:
+    input_uncached:        null
+    cache_read:            null
+    output:                null
+    provider: bedrock
+    placeholder: true
+
+  # ──────────── AWS Bedrock — Qwen3 Coder ────────────
+  # Coding-specialist; no public Bedrock rate yet.
+  qwen.qwen3-coder-480b-a35b-instruct:
+    input_uncached:        null
+    cache_read:            null
+    output:                null
+    provider: bedrock
+    placeholder: true
+
+  # Google Gemini API (Arm B-gemini). Rates per https://ai.google.dev/pricing.
+  # `cache_read` is Google's "context caching" hit rate; cache writes have
+  # no separate billing line on Gemini today, so cache_write_* are unset.
+  gemini-2.5-pro:
+    input_uncached:        1.25
+    cache_read:            0.125
+    output:               10.00
+    long_context_threshold_tokens: 200000
+    input_uncached_long:   2.50
+    output_long:          15.00
+    provider: gemini
+
+  gemini-2.5-flash:
+    input_uncached:        0.30
+    cache_read:            0.03
+    output:                2.50
+    provider: gemini
+
+  gemini-2.5-flash-lite:
+    input_uncached:        0.10
+    cache_read:            0.01
+    output:                0.40
+    provider: gemini
+
+  gemini-2.0-flash:
+    input_uncached:        0.10
+    cache_read:            0.025
+    output:                0.40
+    provider: gemini
+
+  gemini-3.1-pro-preview:
+    input_uncached:        2.00
+    cache_read:            0.20
+    output:               12.00
+    long_context_threshold_tokens: 200000
+    input_uncached_long:   4.00
+    output_long:          18.00
+    provider: gemini
+
+  gemini-3.1-flash-lite:
+    input_uncached:        0.25
+    cache_read:            0.025
+    output:                1.50
+    provider: gemini
+
+  gemini-3-flash-preview:
+    input_uncached:        0.50
+    cache_read:            0.05
+    output:                3.00
+    provider: gemini
+
+# Fallback applied when a model id in the logs has no match here. The
+# aggregator emits a warning so missing entries surface immediately
+# rather than silently zero-costing.
+fallback:
+  input_uncached:        3.00
+  cache_read:            0.30
+  output:               15.00
+  provider: unknown

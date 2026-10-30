@@ -1,0 +1,19 @@
+{
+  "hint": "/tmp/yolov8_split_195_hint.json",
+  "solver": "decomposed",
+  "before": {
+    "makespan_us": 75.57,
+    "deadline_miss": 0,
+    "cross_dev": 180,
+    "solver_s": 1.733
+  },
+  "after": {
+    "makespan_us": 75.57,
+    "deadline_miss": 0,
+    "cross_dev": 180,
+    "solver_s": 1.741
+  },
+  "delta_makespan_us": 0.0,
+  "delta_pct": 0.0,
+  "decision": "REJECT"
+}

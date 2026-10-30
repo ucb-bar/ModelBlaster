@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "arm": "B-bedrock",
+  "workload_id": "mlp_generic_scalar_smoke",
+  "run_id": "2026-05-26T07-00-12Z",
+  "git_sha": "7ea176a",
+  "started_at": "2026-05-26T07:00:12.555065+00:00",
+  "ended_at": "2026-05-26T07:01:00.626847+00:00",
+  "wall_clock_s": 48.072,
+  "peak_rss_mb": 99.8,
+  "exit_status": "ok",
+  "model": "mlp_generic",
+  "target": "scalar",
+  "quant": "int8",
+  "runner": "spike",
+  "beam": 1,
+  "expansions": 2,
+  "iterations": 1,
+  "firesim_eval": false,
+  "llm_provider": "bedrock",
+  "max_usd": 1.0
+}

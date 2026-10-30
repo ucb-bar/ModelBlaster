@@ -1,0 +1,18 @@
+{
+ "_": "Needs MB_KB_ROOT, MB_ABLATE_IRS (IR dirs) and a kb_graph_opt that passes --ncu through to KernelBlaster (an older one exits with unrecognized arguments).",
+ "name": "graph_opt_ncu",
+ "description": "Whole flow (kb_graph_opt, 2 rounds) with NCU profiles per slot off vs best; headline = whole-model graph replay vs the hand-seeded model.",
+ "entry": "graph_opt",
+ "kb": "${MB_KB_ROOT}",
+ "inputs": ["${MB_ABLATE_IRS}/8_ResNetBasicBlock"],
+ "flags": {"--model": "us.anthropic.claude-haiku-5-5", "--rounds": 2, "--rollouts": 1, "--steps": 3},
+ "env": {"KERNELBLASTER_ALLOW_SHARED_GPU": "1", "BEDROCK_MAX_TOKENS": "16384"},
+ "path_exclude": "xilinx", "path_prepend": ["/usr/local/cuda/bin"],
+ "gpu_model": "NVIDIA TITAN RTX",
+ "knowledge": {"mined": false},
+ "seeds": [0, 1], "max_parallel": 2,
+ "budget": {"usd": 4.0, "est_usd_per_run": 0.8, "who": "ablate",
+            "ledger": "/path/to/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+ "arms": {"ncu_off": {"flags": {}},
+          "ncu_best": {"flags": {"--ncu": "best"}}}
+}

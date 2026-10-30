@@ -1,0 +1,28 @@
+{
+  "per_network": {
+    "yolov8_nano": {
+      "n_ops": 204,
+      "rvv_total_ms": 705.2228399999999,
+      "gem_total_ms": 450.31585399999994,
+      "min_lower_bound_ms": 414.54981900000007
+    },
+    "dronet": {
+      "n_ops": 30,
+      "rvv_total_ms": 24.35366,
+      "gem_total_ms": 15.494358000000002,
+      "min_lower_bound_ms": 14.09588
+    },
+    "mlp_control": {
+      "n_ops": 7,
+      "rvv_total_ms": 0.5841409999999999,
+      "gem_total_ms": 0.5266449999999999,
+      "min_lower_bound_ms": 0.5266449999999999
+    }
+  },
+  "workload_lb": {
+    "mlp_control_x4_lb_ms": 2.1065799999999997,
+    "dronet_x2_lb_ms": 28.19176,
+    "yolov8_x1_lb_ms": 414.54981900000007,
+    "total_lb_ms": 444.84815900000007
+  }
+}

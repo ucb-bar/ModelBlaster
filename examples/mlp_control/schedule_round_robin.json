@@ -1,0 +1,14 @@
+{
+  "model": "mlp_control",
+  "registry": "spike-rocket-quad",
+  "comment": "Round-robin placement across the 4 Rocket harts. Linear chain — every dispatch depends on the previous one, so the placement won't yield parallelism on its own. The schedule is here to exercise the ingest + dispatch-table emission path; real schedules will be produced by XPU-RT from the per-dispatch profile data and may issue independent dispatches in parallel where the IR allows.",
+  "dispatches": [
+    {"dispatch_id": 0, "core": "rocket0"},
+    {"dispatch_id": 1, "core": "rocket1"},
+    {"dispatch_id": 2, "core": "rocket2"},
+    {"dispatch_id": 3, "core": "rocket3"},
+    {"dispatch_id": 4, "core": "rocket0"},
+    {"dispatch_id": 5, "core": "rocket1"},
+    {"dispatch_id": 6, "core": "rocket2"}
+  ]
+}

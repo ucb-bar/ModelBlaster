@@ -1,0 +1,43 @@
+{
+  "dot_file": "",
+  "dispatches": {
+    "mlp_huge0_dispatch_0": {
+      "id": 0,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [],
+      "hardware_target": "CPU_P#0",
+      "start_time": 0.0,
+      "duration": 4.0,
+      "job_name": "dronet0",
+      "module_name": "mlp_huge.linear_big"
+    },
+    "mlp_huge0_dispatch_1": {
+      "id": 1,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_huge0_dispatch_0"
+      ],
+      "hardware_target": "CPU_E#0",
+      "start_time": 4.0,
+      "duration": 0.5,
+      "job_name": "dronet0",
+      "module_name": "mlp_huge.linear_mid"
+    },
+    "mlp_huge0_dispatch_2": {
+      "id": 2,
+      "ordinal": 1,
+      "total": 1,
+      "dependencies": [
+        "mlp_huge0_dispatch_1"
+      ],
+      "hardware_target": "CPU_E#0",
+      "start_time": 4.5,
+      "duration": 0.5,
+      "job_name": "dronet0",
+      "module_name": "mlp_huge.linear_small"
+    }
+  },
+  "metadata": {}
+}

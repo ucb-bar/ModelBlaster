@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# End-to-end runner for ViNT (visual-navigation transformer).
+#
+# ViNT can't be traced via torch.fx.symbolic_trace (EfficientNet's
+# len(...) plus nn.TransformerEncoder internals defeat it). We use
+# torch.export through extract_graph_export.py instead — see
+# modelblaster/notes/vint_zephyr_plan.md.
+#
+# Two-env split: extract_graph_export runs in the xpurt conda env
+# (where vint_train + efficientnet_pytorch live); codegen + west
+# build + spike run in zephyr like every other example.
+#
+# Defaults:
+#   QUANT=int8 TARGET=scalar BACKEND=reference RUNNER=spike
+set -euo pipefail
+
+MODEL_NAME=vint
+QUANT="${QUANT:-int8}"
+TARGET="${TARGET:-scalar}"
+BACKEND="${BACKEND:-reference}"
+RUNNER="${RUNNER:-spike}"
+# Default to 16 IDSIA samples for activation-scale calibration.
+# Override via MODELBLASTER_VINT_CALIB_DIR for the data source.
+N_CALIB="${VINT_NUM_CALIBRATION:-16}"
+# Per-channel weight quant for conv + linear. 1 = on (default for
+# trained nets; needed for ViNT to verify against the fp32 golden).
+PC_FLAG="${VINT_PER_CHANNEL:-1}"
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
+EXAMPLE_DIR="${REPO_ROOT}/examples/${MODEL_NAME}"
+IR_DIR="${EXAMPLE_DIR}/${QUANT}/generated"
+
+# Stage 1 — extract IR via torch.export. Runs in the xpurt env where
+# ViNT's deps live. Re-run when FORCE_EXTRACT=1 or when IR is missing.
+if [[ "${FORCE_EXTRACT:-0}" == "1" \
+      || ! -f "${IR_DIR}/graph.json" \
+      || ! -f "${IR_DIR}/weights.npz" \
+      || ! -f "${IR_DIR}/io.npz" ]]; then
+    echo "[vint] extract_graph_export (xpurt env) -> ${IR_DIR}"
+    mkdir -p "${IR_DIR}"
+    XPURT_PY="${XPURT_PY:-/path/to/miniforge3/envs/xpurt/bin/python}"
+    EXTRA_ARGS=()
+    if [[ "${PC_FLAG}" == "1" ]]; then EXTRA_ARGS+=(--per-channel); fi
+    PYTHONPATH="${REPO_ROOT}" "${XPURT_PY}" -m modelblaster.pipeline.extract_graph_export \
+        --model "${MODEL_NAME}" --quant "${QUANT}" \
+        --num-calibration "${N_CALIB}" \
+        "${EXTRA_ARGS[@]}" --out-dir "${IR_DIR}"
+fi
+
+# Stage 2–5 — delegate to _run_lib.sh. Re-source the Zephyr SDK env
+# unconditionally before this hand-off: the xpurt python in stage 1
+# is invoked via full path (no `conda activate`), so the shell's
+# active env is whatever the caller was in — could be xpurt without
+# the build-aware west extension, could be base, etc. Forcing
+# set_envvars_sdk here means run.sh works from any starting env as
+# long as the conda zephyr binaries are reachable.
+source "${REPO_ROOT}/scripts/set_envvars_sdk.sh"
+# Clear FORCE_EXTRACT so _run_lib.sh doesn't try to re-run its FX-based
+# extract_graph (which doesn't know about vint). The IR is already on
+# disk from the xpurt-side extract_graph_export above.
+unset FORCE_EXTRACT
+export MODEL_NAME REPO_ROOT QUANT TARGET BACKEND RUNNER
+source "${REPO_ROOT}/examples/_run_lib.sh"

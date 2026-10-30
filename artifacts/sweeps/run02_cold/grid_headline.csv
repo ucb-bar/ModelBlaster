@@ -1,0 +1,13 @@
+cell_id,policy,mlp_period_ms,dronet_period_ms,mlp_count,dronet_count,yolo_count,status,makespan_ms,n_deadline_miss,n_release_viol,n_dispatches,solve_wall_s,feasibility_checked,feasibility_note
+canon__yolo_anchor,yolo_anchor,10,20,4,2,1,ok,61.19647900000001,67,0,236,5.659,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+canon__periodic_anchor,periodic_anchor,10,20,4,2,1,ok,75.570546,0,0,248,3.035,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+canon__critical_path_first,critical_path_first,10,20,4,2,1,ok,54.429872,88,0,245,1.881,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+canon__cpsat_unconstrained,cpsat_unconstrained,10,20,4,2,1,ok,135.22494500000008,73,0,230,62.102,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+tight_mlp__yolo_anchor,yolo_anchor,5,20,4,2,1,ok,65.22726100000003,82,0,250,9.696,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+tight_mlp__periodic_anchor,periodic_anchor,5,20,4,2,1,ok,108.49842499999998,0,0,279,6.747,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+tight_mlp__critical_path_first,critical_path_first,5,20,4,2,1,ok,54.429872,88,0,245,1.73,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+tight_mlp__cpsat_unconstrained,cpsat_unconstrained,5,20,4,2,1,ok,163.67369299999996,57,0,217,62.062,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+slack_dronet__yolo_anchor,yolo_anchor,10,33,4,2,1,ok,56.54074600000001,28,0,213,3.58,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+slack_dronet__periodic_anchor,periodic_anchor,10,33,4,2,1,ok,92.59226799999999,0,0,213,3.008,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+slack_dronet__critical_path_first,critical_path_first,10,33,4,2,1,ok,54.429872,58,0,245,1.77,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal
+slack_dronet__cpsat_unconstrained,cpsat_unconstrained,10,33,4,2,1,ok,123.43092300000008,32,0,201,62.089,False,profile-DB driven feasibility deferred; policy results provide the actual feasibility signal

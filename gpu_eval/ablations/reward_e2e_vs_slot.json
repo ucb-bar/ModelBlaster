@@ -1,0 +1,19 @@
+{
+ "_": "Needs MB_KB_ROOT and MB_ABLATE_PROBLEMS.",
+ "name": "reward_e2e_vs_slot",
+ "description": "Step reward / acceptance on the deployed end-to-end partition time (default) vs the changed slot's time.",
+ "entry": "multislot",
+ "kb": "${MB_KB_ROOT}",
+ "inputs": ["${MB_ABLATE_PROBLEMS}/p_12_Gemm_Multiply_LeakyReLU", "${MB_ABLATE_PROBLEMS}/p_21_Conv2d_Add_Scale_Sigmoid_GroupNorm"],
+ "flags": {"--model": "us.anthropic.claude-haiku-5-5", "--knowledge": "v2", "--rollouts": 2, "--steps": 3,
+           "--max-fix": 1},
+ "env": {"KERNELBLASTER_ALLOW_SHARED_GPU": "1", "BEDROCK_MAX_TOKENS": "16384"},
+ "path_exclude": "xilinx", "path_prepend": ["/usr/local/cuda/bin"],
+ "gpu_model": "NVIDIA TITAN RTX",
+ "knowledge": {"mined": false},
+ "seeds": [0, 1, 2], "max_parallel": 2,
+ "budget": {"usd": 3.0, "est_usd_per_run": 0.25, "who": "ablate",
+            "ledger": "/path/to/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+ "arms": {"e2e": {"flags": {"--reward": "e2e"}},
+          "slot": {"flags": {"--reward": "slot"}}}
+}

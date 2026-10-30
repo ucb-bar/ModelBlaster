@@ -1,0 +1,15 @@
+{
+  "contract": "modelblaster.split_hints/v1",
+  "reason": "splitting ['dronet1_dispatch_0'] lowers predicted makespan by 0.58 us (exposes parallelism).",
+  "networks": [
+    {
+      "network": "dronet",
+      "split_ops": [
+        {
+          "op": 0,
+          "n_splits": 2
+        }
+      ]
+    }
+  ]
+}

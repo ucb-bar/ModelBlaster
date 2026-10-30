@@ -1,0 +1,2 @@
+# Reports are intentionally tracked so teammates can swap them via
+# git commit / PR. .json + .md pairs go in here from `mb-cost export`.

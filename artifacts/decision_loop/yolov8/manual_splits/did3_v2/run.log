@@ -1,0 +1,4 @@
+[measure_candidate] hint=artifacts/decision_loop/yolov8/manual_splits/hint_did3.json (modelblaster.split_hints/v1)  model=yolov8_nano
+apply_split_hint: wrote artifacts/decision_loop/yolov8/manual_splits/did3_v2/yolov8_nano.afterhint.graph.json (2 tile ops from splits, 213 total dispatches)
+ingest_measured_cycles: wrote artifacts/decision_loop/yolov8/manual_splits/did3_v2/measured_cycles.json (n=205, total=10437959601 cyc, wall=104405750)
+[measure_candidate] OK -> artifacts/decision_loop/yolov8/manual_splits/did3_v2/measured_cycles.json

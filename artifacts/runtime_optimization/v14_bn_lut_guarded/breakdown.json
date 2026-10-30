@@ -1,0 +1,35 @@
+{
+  "harts": [
+    {
+      "kind_idx": 0,
+      "kind": "gemmini",
+      "kernel_us": 108852,
+      "dep_wait_us": 325460,
+      "sync_overhead_us": 148,
+      "target_gate_spin_us": 456,
+      "hart_idle_us": 52,
+      "gemmini_cfg_emit_us": 0,
+      "entries_done": 105,
+      "wall_total_us": 434994,
+      "attributed_us": 434968,
+      "unattributed_us": 26,
+      "attribution_pct": 99.99402290606307
+    },
+    {
+      "kind_idx": 1,
+      "kind": "rvv_opu",
+      "kernel_us": 452560,
+      "dep_wait_us": 61667,
+      "sync_overhead_us": 289,
+      "target_gate_spin_us": 0,
+      "hart_idle_us": 55,
+      "gemmini_cfg_emit_us": 0,
+      "entries_done": 283,
+      "wall_total_us": 514622,
+      "attributed_us": 514571,
+      "unattributed_us": 51,
+      "attribution_pct": 99.99008981349418
+    }
+  ],
+  "per_network": {}
+}

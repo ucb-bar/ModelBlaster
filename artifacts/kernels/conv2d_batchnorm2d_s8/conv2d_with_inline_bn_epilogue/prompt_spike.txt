@@ -1,0 +1,86 @@
+You will write a C implementation of the fused kernel below for the
+RVV 1.0 target (rv64gcv with vector). Output must be:
+  * A SINGLE C function with EXACTLY the signature below.
+  * Self-contained: include any helpers as `static inline` above the function.
+  * Bit-exact match vs the reference impl on spike (max_abs_err == 0).
+  * No `#include` statements — they are added by the harness (which already
+    pulls in <stdint.h>, <stddef.h>, <math.h>, <riscv_vector.h>).
+  * RVV 1.0 intrinsic names: `__riscv_v*` prefix. Important conversions:
+    - int8→int16 widen: `__riscv_vsext_vf2_i16m2(v_int8, vl)`
+    - int16→float32 widen-convert: `__riscv_vfwcvt_f_x_v_f32m4(v_int16, vl)`
+      (NOT `vfcvt` — that's same-width; for widening to f32 from i16 use `vfwcvt`)
+    - float32→int32 same-width: `__riscv_vfcvt_x_f_v_i32m4(v_f32, vl)`
+    - int32→int16 narrow: `__riscv_vnsra_wx_i16m2(v_int32, 0, vl)`
+    - int16→int8 narrow: `__riscv_vnsra_wx_i8m1(v_int16, 0, vl)`
+    - Set VL: `__riscv_vsetvl_e8m1(n)` for e8m1, etc.
+
+SIGNATURE (must match exactly):
+void kernel_conv2d_batchnorm2d_s8(const int8_t *input, const int8_t *weight, const int32_t *bias, const float *bn_scale, const float *bn_bias, int8_t *output, int N, int IC, int IH, int IW, int OC, int KH, int KW, int SH, int SW, int PH, int PW, int input_offset, int filter_offset, int conv_output_offset, int conv_output_multiplier, int conv_output_shift, int conv_activation_min, int conv_activation_max, float bn_scale_in, float bn_scale_out, int bn_activation_min, int bn_activation_max)
+
+REFERENCE IMPLEMENTATION (must produce bit-identical results on spike):
+void kernel_conv2d_batchnorm2d_s8(
+    const int8_t *input, const int8_t *weight, const int32_t *bias,
+    const float *bn_scale, const float *bn_bias, int8_t *output,
+    int N, int IC, int IH, int IW, int OC,
+    int KH, int KW, int SH, int SW, int PH, int PW,
+    int input_offset, int filter_offset, int conv_output_offset,
+    int conv_output_multiplier, int conv_output_shift,
+    int conv_activation_min, int conv_activation_max,
+    float bn_scale_in, float bn_scale_out,
+    int bn_activation_min, int bn_activation_max) {
+    int OH = (IH + 2*PH - KH) / SH + 1;
+    int OW = (IW + 2*PW - KW) / SW + 1;
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            /* BN's per-channel scale and bias loaded once per output channel. */
+            float bn_s = bn_scale[oc];
+            float bn_b = bn_bias[oc];
+            for (int oh = 0; oh < OH; oh++) {
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t acc = bias ? bias[oc] : 0;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < KH; kh++) {
+                            int ih = oh * SH - PH + kh;
+                            for (int kw = 0; kw < KW; kw++) {
+                                int iw = ow * SW - PW + kw;
+                                int32_t in_v = (ih < 0 || ih >= IH || iw < 0 || iw >= IW)
+                                    ? input_offset
+                                    : (int32_t)input[((n*IC + ic)*IH + ih)*IW + iw] + input_offset;
+                                int32_t w_v = (int32_t)weight[((oc*IC + ic)*KH + kh)*KW + kw] + filter_offset;
+                                acc += in_v * w_v;
+                            }
+                        }
+                    }
+                    /* Conv requantize via Q0.31 rounding multiply. */
+                    int64_t prod = (int64_t)acc * (int64_t)conv_output_multiplier;
+                    prod = (prod + (1LL << 30)) >> 31;
+                    int32_t scaled = (int32_t)prod;
+                    if (conv_output_shift > 0) {
+                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (conv_output_shift - 1)))
+                                            >> conv_output_shift);
+                    } else if (conv_output_shift < 0) {
+                        scaled = scaled << (-conv_output_shift);
+                    }
+                    scaled += conv_output_offset;
+                    if (scaled < conv_activation_min) scaled = conv_activation_min;
+                    if (scaled > conv_activation_max) scaled = conv_activation_max;
+                    int8_t conv_int8 = (int8_t)scaled;
+                    /* BN affine in-register, no intermediate tensor. */
+                    float fv = (float)conv_int8 * bn_scale_in;
+                    float y = bn_s * fv + bn_b;
+                    int32_t v = (int32_t)roundf(y / bn_scale_out);
+                    if (v < bn_activation_min) v = bn_activation_min;
+                    if (v > bn_activation_max) v = bn_activation_max;
+                    output[((n*OC + oc)*OH + oh)*OW + ow] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+
+
+ALGORITHM (target_affinity=('gemmini',)):
+Gemmini's tiled_matmul_auto + activation epilogue. The conv MAC runs in the systolic array as usual; the BN affine lives in the activation stage by precomputing the per-channel (bn_scale[c] / bn_scale_out, bn_bias[c] / bn_scale_out) constants and feeding them through gemmini's int8 multiply-by-constant activation slot. Result: NO intermediate conv_int8 buffer between conv and BN. 60 candidate pairs from yolov8 + dronet collapse to single dispatches.
+
+OUTPUT FORMAT:
+Wrap your final code in ```c ... ``` fences. Output ONLY the code.

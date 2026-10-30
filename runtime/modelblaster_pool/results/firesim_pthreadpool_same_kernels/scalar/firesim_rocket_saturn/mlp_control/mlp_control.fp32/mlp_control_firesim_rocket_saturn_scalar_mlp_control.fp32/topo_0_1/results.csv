@@ -1,0 +1,8 @@
+dispatch_id,module_name,vmfb_path,mlir_path,mean_time,mean_unit,mean_time_ns,returncode,log_path,source,op,shape,cycles
+0,mlp_control$dispatch_0_scalar_linear_M1xK16xN256,,,13.069995,ms,13069995.000000,0,,firesim,linear,M=1;K=16;N=256,13069995
+1,mlp_control$dispatch_1_scalar_elu_n256,,,0.025896,ms,25896.000000,0,,firesim,elu,n=256,25896
+2,mlp_control$dispatch_2_scalar_linear_M1xK256xN128,,,13.401410,ms,13401410.000000,0,,firesim,linear,M=1;K=256;N=128,13401410
+3,mlp_control$dispatch_3_scalar_elu_n128,,,0.015710,ms,15710.000000,0,,firesim,elu,n=128,15710
+4,mlp_control$dispatch_4_scalar_linear_M1xK128xN64,,,13.109751,ms,13109751.000000,0,,firesim,linear,M=1;K=128;N=64,13109751
+5,mlp_control$dispatch_5_scalar_elu_n64,,,0.006690,ms,6690.000000,0,,firesim,elu,n=64,6690
+6,mlp_control$dispatch_6_scalar_linear_M1xK64xN4,,,13.013755,ms,13013755.000000,0,,firesim,linear,M=1;K=64;N=4,13013755
