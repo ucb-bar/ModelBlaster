@@ -32,6 +32,19 @@ raises, as do data-dependent shapes/values (`nonzero`, `.item()`,
 boolean-mask indexing, ...): the IR is static, so those would otherwise be
 baked to the sample.
 
+Value specialization (opt-in). A model may declare input tensors whose VALUES are
+fixed data of the workload (`model.mb_value_specialized`: placeholder indices; a SOL
+bench sets `MB_VALUE_SPECIALIZED_INPUTS`: the integer index inputs -- indptr, page
+tables -- that the workload carries). Data-dependent ops (`.item()`, `.tolist()`,
+`nonzero`, `bincount`, ...) whose operand derives ONLY from such inputs (and
+constants) are then evaluated at trace time instead of refused: a Python result
+(`kv_indptr[b].item()`) becomes a Python value, i.e. static slice bounds / loop
+counts; a tensor result becomes a constant. The tensors themselves stay runtime
+graph inputs wherever the program feeds them to an op (a gather's page table).
+Every such evaluation is recorded (`gm.meta["value_specialized"]`) and the IR says
+which input values it is only valid for (graph.json `data_specialized`). The same
+ops on any other tensor are still refused.
+
 The resulting GraphModule has the same node vocabulary as symbolic_trace
 for code symbolic_trace could already handle, so the extractor's lowering
 is unchanged.
@@ -139,9 +152,15 @@ class ConcreteProxy(Proxy):
 
 
 class ConcreteTracer(torch.fx.Tracer):
-    def __init__(self, sample_inputs, **kw):
+    def __init__(self, sample_inputs, specialize=(), **kw):
         super().__init__(**kw)
         self._samples = list(sample_inputs)
+        # value specialization (module docstring): placeholder indices whose values are fixed;
+        # nodes computed only from them (and constants); what was evaluated at trace time
+        self._spec_idx = set(specialize or ())
+        self._spec_in: dict[torch.fx.Node, int] = {}      # placeholder node -> sample index
+        self._spec_nodes: set = set()
+        self.specialized: list[dict] = []
         self._n_placeholders = 0
         self._values: dict[torch.fx.Node, Any] = {}
         self._eager = 0
@@ -258,12 +277,45 @@ class ConcreteTracer(torch.fx.Tracer):
             return slice(self._cur(a.start), self._cur(a.stop), self._cur(a.step))
         return a
 
+    def _specializable(self, args) -> bool:
+        """Every tensor operand derives only from value-specialized inputs / constants (and one at least
+        from an input): the op can be evaluated at trace time."""
+        nodes: list = []
+
+        def visit(a):
+            if isinstance(a, Proxy):
+                nodes.append(a.node)
+            elif isinstance(a, (tuple, list)):
+                for x in a:
+                    visit(x)
+            elif isinstance(a, dict):
+                for x in a.values():
+                    visit(x)
+        visit(args)
+        return bool(nodes) and all(n in self._spec_nodes or n.op == "get_attr" for n in nodes) and \
+            any(n in self._spec_nodes for n in nodes)
+
+    def _spec_sources(self, node) -> list:
+        """The specialized inputs (names) a node derives from."""
+        seen, todo, out = set(), [node], []
+        while todo:
+            n = todo.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            if n in self._spec_in:
+                out.append(n.name)
+            todo.extend(n.all_input_nodes)
+        return sorted(out)
+
     def _check_data_dependent(self, kind, target, args):
         nm = target if isinstance(target, str) else getattr(target, "__name__", "")
         if nm == "where" and len(args) == 1 and isinstance(args[0], Proxy):
             nm = "nonzero"   # torch.where(cond) is nonzero(cond, as_tuple=True)
         if kind in ("call_method", "call_function") and nm in _DATA_DEP:
             if kind == "call_function" or isinstance(args[0], Proxy):
+                if self._specializable(args):
+                    return nm
                 raise NotImplementedError(
                     f"data-dependent {nm}(): the result's shape/value depends on tensor "
                     "data, which a static IR can't represent")
@@ -318,6 +370,7 @@ class ConcreteTracer(torch.fx.Tracer):
         self._run(kind, target, args, kwargs)        # mutate the concrete value too
         fargs = (base_arg,) + tuple(args[1:])
         p = super().create_proxy(fkind, ftarget, fargs, kwargs)
+        self._mark_spec(p.node)                       # an in-place write of fixed data stays fixed data
         self._values[p.node] = live.clone()
         self._storage[p.node] = _storage(self._values[p.node])
         if isinstance(base, Proxy):
@@ -339,6 +392,7 @@ class ConcreteTracer(torch.fx.Tracer):
             self._pre.setdefault(base, self.concrete(base).clone())
             newval = super().create_proxy("call_function", mb_setitem,
                                           (cur, node.args[1], newval), {})
+            self._mark_spec(newval.node)
             self._values[newval.node] = self.concrete(base).clone()
             self._alias[base] = newval
             handled.add(base)
@@ -357,7 +411,15 @@ class ConcreteTracer(torch.fx.Tracer):
         args, kwargs = self._fold(args), self._fold(kwargs)
         if kind not in ("placeholder", "get_attr", "output"):
             args, kwargs = self._cur(args), self._cur(kwargs)
-            self._check_data_dependent(kind, target, args)
+            spec_op = self._check_data_dependent(kind, target, args)
+            if spec_op:
+                # a data-dependent op on value-specialized inputs: evaluate it now (a Python value or a
+                # constant tensor, never a graph node) and record it
+                value = self._run(kind, target, args, kwargs)
+                src = [x for a in args for x in ([a] if isinstance(a, Proxy) else [])]
+                self.specialized.append({"op": spec_op, "node": src[0].node.name if src else None,
+                                         "inputs": self._spec_sources(src[0].node) if src else []})
+                return value
             f = self._inplace(kind, target, args, kwargs)
             if f is not None and (isinstance(args[0], Proxy) or any(
                     isinstance(x, Proxy) for x in list(args[1:]) + list(kwargs.values()))):
@@ -372,7 +434,21 @@ class ConcreteTracer(torch.fx.Tracer):
         self._values[p.node] = value
         if isinstance(value, torch.Tensor):
             self._storage[p.node] = _storage(value)
+        if kind == "placeholder":
+            if self._n_placeholders - 1 in self._spec_idx:
+                self._spec_nodes.add(p.node)
+                self._spec_in[p.node] = self._n_placeholders - 1
+        else:
+            self._mark_spec(p.node)
         return p
+
+    def _mark_spec(self, node) -> None:
+        """A node computed only from value-specialized nodes and constants (one at least specialized) is one."""
+        if self._spec_nodes:
+            ins = node.all_input_nodes
+            if (any(i in self._spec_nodes for i in ins)
+                    and all(i in self._spec_nodes or i.op == "get_attr" for i in ins)):
+                self._spec_nodes.add(node)
 
     # Containers whose forward is plain module calls + Python control flow:
     # trace through them so their parts lower individually.
@@ -453,7 +529,10 @@ def _fold_constants(gm: torch.fx.GraphModule, values: dict) -> None:
         n.replace_all_uses_with(new)
 
 
-def concrete_trace(model: torch.nn.Module, sample_inputs) -> torch.fx.GraphModule:
+def concrete_trace(model: torch.nn.Module, sample_inputs, specialize=None) -> torch.fx.GraphModule:
+    """``specialize``: placeholder indices whose values are fixed (default: ``model.mb_value_specialized``)."""
+    if specialize is None:
+        specialize = getattr(model, "mb_value_specialized", None)
     if isinstance(sample_inputs, torch.Tensor):
         sample_inputs = [sample_inputs]
     # forward may rebind module attributes (RNN state: `self.hidden = ...`)
@@ -467,7 +546,7 @@ def concrete_trace(model: torch.nn.Module, sample_inputs) -> torch.fx.GraphModul
              for m in model.modules()}
     torch.manual_seed(TRACE_SEED)
     _register_einops()
-    tracer = ConcreteTracer(sample_inputs)
+    tracer = ConcreteTracer(sample_inputs, specialize=specialize)
     # forward params past the sample inputs (`mask=None`, `initial_states=None`)
     # are bound to their defaults rather than becoming graph inputs.
     import inspect
@@ -510,7 +589,28 @@ def concrete_trace(model: torch.nn.Module, sample_inputs) -> torch.fx.GraphModul
     gm.recompile()
     _check_outputs_depend_on_inputs(gm)
     gm.meta["value_branches"] = tracer.value_branches
+    gm.meta["value_specialized"] = _summarize_specialized(tracer, sample_inputs)
     return gm
+
+
+def _summarize_specialized(tracer, sample_inputs) -> dict | None:
+    """What the trace baked: {"inputs": [{index, name, dtype, shape, sha256}], "ops": {op: n}, "n": N}, or None."""
+    if not tracer.specialized:
+        return None
+    import hashlib
+    used = sorted({i for r in tracer.specialized for i in r["inputs"]})
+    by_name = {n.name: idx for n, idx in tracer._spec_in.items()}
+    ins = []
+    for nm in used:
+        idx = by_name[nm]
+        t = sample_inputs[idx].detach().cpu().contiguous()
+        ins.append({"index": idx, "name": nm, "dtype": str(t.dtype).replace("torch.", ""),
+                    "shape": list(t.shape),
+                    "sha256": hashlib.sha256(t.reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest()})
+    ops: dict = {}
+    for r in tracer.specialized:
+        ops[r["op"]] = ops.get(r["op"], 0) + 1
+    return {"inputs": ins, "ops": ops, "n": len(tracer.specialized)}
 
 
 _PY_DTYPES = {bool: torch.bool, int: torch.int64, float: torch.float32, complex: torch.complex64}

@@ -390,18 +390,41 @@ What would be needed:
 - scale tensors with block layouts, and quantise/dequantise ops;
 - fp8 tensor-core slots (`mma` e4m3, sm_89+) in KernelBlaster, with their prompt rules.
 
-**FlashInfer-Bench (26 problems): 17 pass every gate.** These are rmsnorm, fused add+rmsnorm
-and every gemm, at their native bf16/fp16 dtypes.
+**FlashInfer-Bench (26 problems).** Rmsnorm, fused add+rmsnorm and every gemm pass every gate at their native
+bf16/fp16 dtypes. The paged/ragged GQA and paged MLA problems (012-019) were refused at extraction as value-dependent
+(`.item()`); they are now extracted as **data-specialized IRs** (next section). **020_moe_fp8_block_scale** is refused at
+conversion: it has fp8 inputs and block scales (no fp8 storage in the IR).
 
-- **8 are refused at extraction as value-dependent** (`.item()`): the paged decode/prefill
-  GQA, the ragged prefill GQA and the paged MLA problems. Their page tables and
-  `qo_indptr`/`kv_indptr` arrays come from SOL's safetensors blobs, and `run()` loops over
-  sequences with `indptr[i].item()` bounds. A static IR cannot hold this. It would need
-  dynamic shapes, or a dense rewrite: gather the pages into a padded KV and mask it, which
-  changes the problem.
-- **020_moe_fp8_block_scale** is refused at conversion: it has fp8 inputs.
+### Value-specialized extraction (012-019: `.item()` on the workload's own indptr)
 
+A SOL workload carries its inputs: the page tables and `qo_indptr`/`kv_indptr` arrays are safetensors blobs, i.e. fixed
+data of the problem, not random activations. The references loop over sequences with `int(indptr[b].item())` bounds.
+The extractor now evaluates such an op at trace time **when its operand derives only from inputs the bench declares
+value-specialized** (and constants); everything else stays refused.
 
+- The converter declares `MB_VALUE_SPECIALIZED_INPUTS = [positions in get_inputs()]`: the integer inputs of type
+  `safetensors` or `custom` (never random ones). `extract_graph` maps them to traced placeholders
+  (`model.mb_value_specialized`, `concrete_trace(..., specialize=...)`).
+- A specialized tensor's `.item()` / `.tolist()` becomes a Python value (static slice bounds, loop counts, causal
+  deltas); `nonzero` / `argwhere` / `bincount` / `unique` / `masked_select` / `histc` and `torch.where(cond)` become constant
+  tensors. A node is specializable if all its tensor operands are specialized-derived or constants, at least one of them
+  specialized-derived; a float activation, a free input or a mix is refused as before (tests: `test_value_specialize.py`).
+- **Index tensors stay runtime inputs** wherever the program feeds them to an op: `kv_indices` is a gather's index
+  (`k_cache[kv_indices[s:e].to(long)]`), an IR input. What is baked is the *shape-determining* data: `kv_indptr` /
+  `qo_indptr` (slice bounds, per-sequence loops).
+- graph.json `data_specialized` = `{"inputs": [{index, name, dtype, shape, sha256}], "ops": {"item": N}, "n": N}`:
+  the IR is only valid for those input values (the workload's: io.npz holds them). `inputs` lists only the tensors whose
+  values were baked.
+- The IR unrolls the reference's Python loops: decode = `batch_size x 32` heads x ~18 ops (589 ops at batch 1), paged
+  prefill = `total_q x 32` heads x ~18 ops; ragged prefill and MLA loop per sequence only (30-36 ops at one sequence).
+  Large `total_q` (e.g. median of 014, 9145 query tokens) is not extractable in practice.
+- Any `safetensors` input (also a float one: MoE routing logits) is declared; a custom-entrypoint input only if integer.
+  In-place writes of fixed data (`zeros_like(x).scatter_(...)`) stay fixed.
+- `convert --fp8-widen` (opt-in, never the default) carries fp8 INPUTS as bf16/fp32 (exact: every e4m3 value is
+  representable), so 020 (fp8 block-scale MoE) converts: the reference's dequantisation and output are unchanged, but
+  the kernel problem is no longer fp8. Extraction needs ~55 GB of host memory (5.4 GiB io) and ~8 min.
+- A bench converted with small safetensors blobs (<= 1 MiB: indptr, page tables) stores them inline (`SOL_BLOB_DATA`),
+  so the file runs wherever it is staged; larger ones are read from `SOL_BLOBS` / `$SOL_BLOB_ROOT`.
 
 ## Mapping to KernelBlaster's earlier port (`gpu_eval/tools/sol_kb_map.py`)
 
@@ -483,9 +506,9 @@ model run and the torch comparison, all on one GPU UUID. Then with
 - **Per-tensor storage dtypes.** An IR has one float storage dtype. A bf16 problem's fp32
   sections, fp32 outputs and integer indices therefore become bf16, and this accounts for most
   of the SOL-tolerance misses at bf16 (another branch is adding this).
-- **Value-dependent shapes.** MoE dispatch (`nonzero`), varlen and paged attention (`.item()`,
-  `tolist()` on indptr / page tables), bincount and boolean masks would need dynamic shapes,
-  or dense rewrites that change the problem.
+- **Value-dependent shapes.** FlashInfer's varlen / paged attention is now a data-specialized IR (above). Data-dependent
+  ops on non-fixed values (MoE dispatch `nonzero` of routing logits, bincount, boolean masks of activations) still would
+  need dynamic shapes, or dense rewrites that change the problem.
 - **fp8 / fp4** storage, block scales and quantise ops (all of Quant, and FlashInfer's fp8
   MoE).
 - **Extractor memory.** The peak is about 40-50× the workload's io, which skips most workloads
