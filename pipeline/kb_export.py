@@ -2572,6 +2572,8 @@ def main():
     ap.add_argument("--no-conditioning", action="store_true",
                     help="no reference-error term in the output bounds (skips the float64 walk)")
     a = ap.parse_args()
+    if a.target == "opencl" and not str(a.arch).isdigit():     # --arch adreno650: fp16-math seeds (opencl_seeds.f16_math_enabled)
+        os.environ.setdefault("MB_OPENCL_ARCH", a.arch)
     if a.plan:
         from .kb_ingest import CudaCache
         from .kb_plan import export_plan
