@@ -57,11 +57,18 @@ devices.
         [--parallel-hints auto|N] [--gpus auto|all|0,2] \\
         [--ssh-host H [--ssh-host H2] --cuda-visible-devices auto|ids [--ssh-key K]] \\
         [--runtime auto|host|process] [--gpu-model M] [--allow-gpu-mismatch] [--mb-evaluator auto|kb|builtin] \\
-        [--knowledge v1|v2] [--ncu off|best|all] [--reward e2e|slot] [--model-simple M --model-hard M] \\
+        [--knowledge v1|v2] [--ncu off|best|all] [--reward e2e|slot] \\
+        [--search independent|beam --beam-width 4 --beam-expand 2 --beam-refill on|off] [--model-simple M --model-hard M] \\
         [--hetero-policy P] [--models-config F] [--upkeep-model M] [--kb-arg=--flag --kb-arg=value] \\
         [--efficiency-rules on|safe|off] [--stop-patience N] [--plan-min-share-late X] \\
+        [--sol-gate off|final|accept [--sol-slot-frac 0.5 --sol-golden-margin 0.5 --sol-bound and|replace --sol-bench F]] \\
         [--knowledge-global off|read|readwrite --knowledge-global-seed SEED_DIR \\
          --knowledge-global-store STORE --knowledge-global-part cuda:sm_89|fp16]
+
+SOL gate (``sol_gate.py``, ``sol_tolerance.py``; ``docs/sol_gate.md``), OFF by default: ``--sol-gate final`` makes the final whole
+model pass SOL-ExecBench's per-element matched-ratio rule (the winners it points at are rolled back until it does);
+``accept`` also derives a bound for fp32 slots from SOL's tolerance and checks each round's winners in the whole model before
+the next step builds on them. Only IRs extracted from a SOL bench (graph.json ``sol_tolerance``) are gated.
 
 Efficiency rules (``kb_efficiency.py``; ``l3_farm/analysis/efficiency_rules.md``), ON by default since X-129 --
 results before and after are not directly comparable: ``--efficiency-rules on`` (default) = R1 patience (the
@@ -114,16 +121,23 @@ from . import kb_resume
 from . import kb_telemetry as kbt
 from . import kb_trace
 from .kb_export import base_slot_id, export_problem
-from .kb_ingest import CudaCache, cache_plan, ingest, verify_ir
+from .kb_ingest import CudaCache, arch_key, cache_plan, ingest, verify_ir
 from .kb_plan import export_plan, make_plan, profile_ir
-from .kb_proposals import (ACCEPT_GAIN, _all_specs, _median, best_sources, find_chains, remeasure,
-                           with_fused_specs, write_variant_ir)
+from .kb_proposals import (ACCEPT_GAIN, _all_specs, _median, best_sources, find_chains, is_infra_result,
+                           remeasure, with_fused_specs, write_variant_ir)
 from .kernel_abi import parse_signature
 
 
 @dataclass
 class Config:
     kb: Path
+    # slot target: cuda (default) | opencl (Qualcomm Adreno; docs/opencl_adreno.md, "Graph optimiser"):
+    # OpenCL problems, an OpenCL kernel cache, every timed step on board_host (KernelBlaster's
+    # AdrenoEvaluator, the board's lock per build + run) or, without one, this host's OpenCL GPU
+    target: str = "cuda"
+    board_host: str | None = None
+    board_lock: str | None = None               # None: KernelBlaster's default (~/mb_board.lock)
+    board_env: list = field(default_factory=list)   # NAME=value for every OpenCL run
     model: str = "claude-code:sonnet"
     reflect_model: str | None = None
     plugins: list = field(default_factory=list)
@@ -195,6 +209,12 @@ class Config:
     knowledge: str = "v2"
     ncu: str = "off"
     reward: str | None = None
+    # beam search (run_multislot --search beam): every step expands the best beam_width states
+    # beam_expand ways; passed on only when search != independent
+    search: str = "independent"
+    beam_width: int = 4
+    beam_expand: int = 2
+    beam_refill: str = "off"          # on: a beam shorter than beam_width is expanded wider (same candidates per step)
     model_simple: str | None = None
     model_hard: str | None = None
     hetero_policy: str | None = None
@@ -314,15 +334,69 @@ class Config:
     experiments: str = "off"
     model_context: str = "off"
     view_fusion: str = "off"
+    # region windows (region_windows.py; docs/region_windows.md): off (default; None = $MB_REGION_WINDOWS, else off) | auto. The
+    # knobs are 0 / "" = unset (env, then the defaults: sizes 256, 3 candidates, whole up to 1100 members, >= 4 non-alias ops)
+    region_windows: str | None = None
+    region_window_sizes: str = ""
+    region_window_candidates: int = 0
+    region_window_hard_cap: int = 0
+    region_window_min_ops: int = 0
+    # open-ended graph rewrites (graph_rewrite.py; docs/graph_rewrite.md): off (default; None = $MB_GRAPH_REWRITE, else off: nothing
+    # runs, the round key and every output are unchanged) | agent (a RewriteProposer is asked for candidate edits each round; each
+    # is gated by graph_verify and decided by the paired variant-vs-original timing like any hint). graph_rewrite_proposer: ""
+    # = the LLM proposer (not implemented: raises NotImplementedError), a registered name or module:Class; _max candidates per IR
+    # per round; _seeds random-input seeds of the verification gate; _device the gate's walker device
+    graph_rewrite: str | None = None
+    # region loop (region_loop.py; docs/region_loop.md): off (default; None = $MB_REGION_LOOP, else off: nothing runs and every output is
+    # unchanged) | on (KernelBlaster's tool-using loop on the REGION slots of the exported problems, over the flow's LLM path). The budget
+    # "turns,tools,usd,wall_s" is per problem ("" = $MB_REGION_LOOP_BUDGET, else 40,120,8,3600); the gate (on|off) is graph_verify on
+    # every variant that contains region ops, before it is exported to KernelBlaster
+    region_loop: str | None = None
+    region_loop_budget: str = ""
+    region_loop_gate: str = "on"
+    graph_rewrite_proposer: str = ""
+    graph_rewrite_max: int = 3
+    graph_rewrite_seeds: int = 2
+    graph_rewrite_device: str = "cpu"
+    # merge_sibling_convs hint kind (merge_convs.py; docs/merge_sibling_convs.md): off (default; None = $MB_MERGE_SIBLING_CONVS, else off:
+    # nothing runs, the round key and every output are unchanged) | auto (sibling convolutions joined by a channel concat are proposed as ONE
+    # convolution with derived zero-padded weights, gated by the padding-waste cost model; decided by the paired variant-vs-original timing).
+    # merge_sibling_max_waste: reject when the merged FLOPs exceed the originals' by more than this ratio (None = $MB_MERGE_SIBLING_MAX_WASTE, else 1.0)
+    merge_sibling_convs: str | None = None
+    merge_sibling_max_waste: float | None = None
+    # SOL-ExecBench's correctness tolerance as an acceptance gate (sol_gate.py, sol_tolerance.py; docs/sol_gate.md): off (default; None =
+    # $MB_SOL_GATE, else off: nothing runs and every output is unchanged) | final (the final whole model must pass SOL's per-element
+    # matched-ratio rule, the winners it points at are rolled back until it does) | accept (final + SOL tables in every export, a bound on
+    # fp32 slots derived from SOL's tolerance, the winners of each round checked in the whole model before the next step builds on them).
+    # sol_slot_frac: share of the output tolerance one fp32 slot may use (None = $MB_SOL_SLOT_FRAC, else 0.5; 0 = no derived bound);
+    # sol_golden_margin: scale of SOL's atol / rtol when comparing with the MB golden (None = $MB_SOL_GOLDEN_MARGIN, else 0.5);
+    # sol_bound: and (the flow's bound AND SOL's rule; default) | replace; sol_bench: a bench file giving the tolerance (and SOL's
+    # reference) of an IR extracted before the tolerance was recorded; sol_max_rollbacks: whole-model attempts per verification
+    sol_gate: str | None = None
+    sol_slot_frac: float | None = None
+    sol_golden_margin: float | None = None
+    sol_bound: str | None = None
+    sol_bench: str = ""
+    sol_max_rollbacks: int = 8
+    # round controller (round_controller.py; docs/round_controller.md): off (default; None = $MB_ROUND_CONTROLLER, else off: no key, no
+    # record, every output byte-identical) | fixed | graph-first | auto. Picks per round which of kernel steps / graph decisions / the
+    # region loop run (the flags above stay the capability switches). min_gain = the budget guard's percent (0 = $MB_RC_MIN_GAIN, else 3),
+    # budget_usd = stop once the KernelBlaster runs' LLM spend reaches it (0 = $MB_RC_BUDGET_USD, else none), small_us = "small unfused op"
+    # (0 = $MB_RC_SMALL_US, else 15)
+    round_controller: str | None = None
+    round_controller_min_gain: float = 0.0
+    round_controller_budget_usd: float = 0.0
+    round_controller_small_us: float = 0.0
     # trace store (KernelBlaster docs/trace.md): <work>/trace for ModelBlaster's steps and each
     # KernelBlaster run's <out>/trace (prompts, responses, candidates, builds, driver output):
     # full | meta (hashes and sizes only) | off; env KB_TRACE
     trace: str = field(default_factory=lambda: os.getenv("KB_TRACE") or "full")
 
 
-_LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices", "kb_args")
+_LIST_FIELDS = ("plugins", "ssh_hosts", "cuda_visible_devices", "kb_args", "board_env")
 _MANUAL_FIELDS = ("kb", "model", "reflect_model", "python", "ssh_key", "remote_dir", "gpus", "parallel_hints",
-                  "runtime", "gpu_model", "allow_gpu_mismatch", "mb_evaluator", *_LIST_FIELDS)
+                  "runtime", "gpu_model", "allow_gpu_mismatch", "mb_evaluator", "target", "board_host", "board_lock",
+                  *_LIST_FIELDS)
 
 
 def _safe(s: str) -> str:
@@ -466,7 +540,11 @@ def detect_gpus(cfg: Config) -> dict:
     """KernelBlaster's own GPU selection (``resources.select_gpus``: auto =
     the idle GPUs, else the least busy one) for the pool the KernelBlaster
     runs will use -> {"local": [...], "remote": [...]}; on failure, one
-    unpinned local device."""
+    unpinned local device. OpenCL: the one device the runs use (the board, or
+    this host's OpenCL GPU), its model unknown until a run records it."""
+    if cfg.target == "opencl":
+        return {"local": [], "remote": [{"host": cfg.board_host or "localhost", "ident": "opencl", "index": None,
+                                         "name": None}], "why": "opencl: one device"}
     args = {"gpus": cfg.gpus, "ssh_hosts": list(cfg.ssh_hosts), "cvd": list(cfg.cuda_visible_devices),
             "ssh_key": cfg.ssh_key}
     try:
@@ -495,6 +573,7 @@ class KBRunner:
     def __init__(self, cfg: Config, knowledge: Path):
         self.cfg, self.knowledge = cfg, knowledge
         self.calls = 0
+        self.usd = 0.0                                # the runs' LLM spend so far (round controller's budget; no output)
         self.telemetry: list = []                     # each run's run-level telemetry (kb_telemetry)
         self.gpus: list = []                          # the GPU each problem's run recorded (kb_eval.recorded_gpus)
         self.commands: dict = {}                      # out dir -> its command line
@@ -521,11 +600,27 @@ class KBRunner:
                         ("--upkeep-model", c.upkeep_model)):
             if v:
                 cmd += [flag, str(v)]
+        if c.search != "independent":
+            cmd += ["--search", c.search, "--beam-width", str(c.beam_width), "--beam-expand", str(c.beam_expand)]
+            if c.beam_refill == "on":
+                cmd += ["--beam-refill", "on"]
         if winners is not None:
             cmd += ["--export-winners", str(winners)]
         if parallel_problems:
             cmd += ["--parallel-problems", str(parallel_problems)]
-        if c.ssh_hosts:
+        if c.target == "opencl":                    # the board over ssh, or this host's OpenCL GPU
+            cmd += ["--evaluator", "board" if c.board_host else "local"]
+            if c.board_host:
+                cmd += ["--board-host", c.board_host]
+                if c.ssh_key:
+                    cmd += ["--ssh-key", c.ssh_key]
+                if c.remote_dir:
+                    cmd += ["--remote-dir", c.remote_dir]
+                if c.board_lock is not None:
+                    cmd += ["--board-lock", c.board_lock]
+            for kv in c.board_env:
+                cmd += ["--board-env", kv]
+        elif c.ssh_hosts:
             cmd += ["--evaluator", "ssh"]
             for h in c.ssh_hosts:
                 cmd += ["--ssh-host", h]
@@ -537,13 +632,13 @@ class KBRunner:
                 cmd += ["--remote-dir", c.remote_dir]
         elif c.gpus and c.gpus != "auto":
             cmd += ["--gpus", c.gpus]
-        if c.runtime and c.runtime != "auto":
+        if c.runtime and c.runtime != "auto" and c.target == "cuda":
             cmd += ["--runtime", c.runtime]
         if c.eval_timeout_s != 900:
             cmd += ["--eval-timeout-s", str(c.eval_timeout_s)]
         if c.eval_timeout_mode != "fixed":
             cmd += ["--eval-timeout-mode", c.eval_timeout_mode]
-        if c.gpu_model:
+        if c.gpu_model and c.target == "cuda":
             cmd += ["--gpu-model", c.gpu_model]
         for p in c.plugins:
             cmd += ["--plugin", str(p)]
@@ -554,6 +649,8 @@ class KBRunner:
             cmd += ["--stop-patience", str(int(sp or 0))]
         if self.halfway is not None:                  # halfway sync: the plan run's first half carries --pause-spec
             cmd += self.halfway.flags(out)
+        from . import region_loop as rlm
+        cmd += rlm.kb_args(c)                          # --region-loop on: the loop on the problems' region slots ([] when off)
         cmd += list(c.kb_args)
         self.commands[str(out)] = cmd                 # the trace's mb.kb_run record
         return cmd
@@ -593,6 +690,7 @@ class KBRunner:
             r = read_result(out, Path(d)) or {"problem": problem_name(Path(d)), "final_ok": False}
             r["_dir"] = str(out / problem_name(Path(d)))
             self.calls += r.get("llm_calls", 0) or 0
+            self.usd += float((r.get("llm_usage") or {}).get("cost_usd", 0.0) or 0.0)
             if r.get("final_ok"):
                 self.gpus.append({"run": r["_dir"], "gpu": r.get("gpu"), "arch": r.get("arch")})
             res.append(r)
@@ -657,6 +755,12 @@ def _scope_ops(h: dict, graph: dict, specs: dict) -> list[str]:
         return list(dict.fromkeys(names))
     if h["kind"] == "split_slot":
         return [o["name"] for o in graph["ops"] if o["op"] in specs and base_slot_id(o["op"], specs) == h["slot"]]
+    if h["kind"] == "merge_sibling_convs":              # merge_convs.py: the convs / activations / concat of the instances that still match
+        from .merge_convs import scope_ops as _merge_scope
+        return _merge_scope(h, graph, specs)
+    if h["kind"] == "rewrite":                          # graph_rewrite.py: the ops the patch removes (and the new ones, on the variant side)
+        have = {o["name"] for o in graph["ops"]}
+        return [n for n in h["rewrite"]["patch"]["remove_ops"] if n in have]
     from . import cuda_learnings as cl
     if cl.ext_kind(h) or h["kind"] in ("fold_layout", "fuse_region", "fuse_view"):   # ext fusion / fold / A2 kinds
         from .fusion_ext import scope_ops
@@ -709,6 +813,11 @@ def footprint(h: dict, ir: str, graph: dict, specs: dict) -> dict:
     elif h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout"):   # extended kinds: the new ops' entries
         from .fusion_ext import new_kinds
         writes = {_entry(k, specs) for k in new_kinds(h, graph, specs)}
+    elif h["kind"] == "merge_sibling_convs":                               # merge_convs: the merged conv's entry (a new shape of conv2d)
+        from .fusion_ext import new_kinds
+        writes = {_entry(k, specs) for k in new_kinds(h, graph, specs)}
+    elif h["kind"] == "rewrite":                                           # graph_rewrite: the entries of the ops it adds
+        writes = {_entry(o["op"], specs) for o in h["rewrite"]["patch"]["add_ops"]}
     else:
         writes = set()
     return {"ops": ops, "reads": reads | writes, "writes": writes}
@@ -761,7 +870,8 @@ def _ingest_slots(cache: CudaCache, problem: Path, result: dict, slots: list[str
             spec = spec_from_kind(s["op"], specs)
         entry, _ = parse_signature(spec.signature)
         sr = result.get("slots", {}).get(s["id"], {})
-        e, st = cache.add(op=s["op"], entry=entry, signature=spec.signature, arch=f"sm_{man_arch(result)}",
+        e, st = cache.add(op=s["op"], entry=entry, signature=spec.signature,
+                          arch=arch_key(man_arch(result), cache.target),
                           shapes=[i["shape"] for i in s["instances"]], code=best[s["id"]],
                           slot_us=sr.get("best_us") or sr.get("final_us") or 0.0,
                           speedup=(sr["baseline_us"] / sr["best_us"]) if sr.get("baseline_us") and sr.get("best_us") else None,
@@ -781,7 +891,7 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     is set when there is nothing to run (the hint does not occur / apply)."""
     base_graph = json.loads((Path(prof["ir_dir"]) / "graph.json").read_text())
     specs = with_fused_specs(base_graph, specs)
-    base = cache_plan(base_graph, cache, f"sm_{cfg.arch}", specs)
+    base = cache_plan(base_graph, cache, arch_key(cfg.arch, cfg.target), specs)
     g0 = base["graph"]
     names = _scope_ops(h, g0, specs)
     job = {"hint": h, "specs": specs, "names": names,
@@ -793,20 +903,20 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
     if h["kind"] == "fuse":                             # scope the variant to this IR's instances
         hh["chains"] = [c for c in (h.get("chains") or [])
                         if all(a in {x for n in names for x in gh.atoms(n)} for a in c)] or None
-    vg, _, prov = gh.apply_hints(g0, [hh], specs, statuses=None)
+    vg, _, prov = gh.apply_hints(g0, [hh], specs, statuses=None, target=cfg.target)
     if not prov["applied"]:
         job["early"] = "; ".join(s["why"] for s in prov["skipped"])[:500]
         return job
     from . import cuda_learnings as cl
     # --fusion-extended: a fused slot is split by its stages' per-shape winners (each split slot seeded with them)
-    vplan = cache_plan(vg, cache, f"sm_{cfg.arch}", specs, split=cl.variant_split())
+    vplan = cache_plan(vg, cache, arch_key(cfg.arch, cfg.target), specs, split=cl.variant_split())
     out.mkdir(parents=True, exist_ok=True)
     src_ir = Path(prof["source_ir"])
     oir = write_variant_ir(src_ir, g0, out / "orig_ir")
     vir = write_variant_ir(src_ir, vplan["graph"], out / "variant_ir")
     stem = _safe(f"{prof['ir']}__{h['id']}")
     oidx = [i for i, o in enumerate(g0["ops"]) if o["name"] in set(names)]
-    vnames = {prov["renamed"].get(n, n) for n in names}
+    vnames = {prov["renamed"].get(n, n) for n in names} | set(prov.get("added", []))   # + the ops a rewrite adds
     vidx = [i for i, o in enumerate(vplan["graph"]["ops"]) if o["name"] in vnames]
     seeds = {**base["sources"], **vplan["sources"]}
     tags = {**base["tags"], **vplan["tags"]}
@@ -824,12 +934,17 @@ def prepare_hint(h: dict, prof: dict, out: Path, *, cache: CudaCache, cfg: Confi
         specs = with_fused_specs(vplan["graph"], specs)
         job["specs"] = specs
         job["composite"] = variant_seeds(h, g0, vplan, base, seeds, tags, specs)
+    from . import region_loop as rlm
+    why = rlm.gate(cfg, h, vplan["graph"], oir, vir, job.get("specs") or specs)   # --region-loop on: graph_verify before the variant is exported
+    if why:
+        job["early"] = why
+        return job
     job["orig"] = export_problem(oir, out / "orig", op_indices=oidx, specs=specs, name=stem + "__orig",
                                  strategy="hint-original", slot_sources=base["sources"],
-                                 slot_source_tags=base["tags"], sub_sources=base["sub_sources"])
+                                 slot_source_tags=base["tags"], sub_sources=base["sub_sources"], target=cfg.target)
     job["variant"] = export_problem(vir, out / "variant", op_indices=vidx, specs=specs, name=stem + "__variant",
                                     strategy="hint-variant", slot_sources=seeds, slot_source_tags=tags,
-                                    sub_sources=vplan["sub_sources"])
+                                    sub_sources=vplan["sub_sources"], target=cfg.target)
     if job.get("composite"):
         from .fusion_ext import note_composite
         note_composite(job["variant"], job["composite"])
@@ -843,6 +958,11 @@ def kb_eval_for(cfg: Config):
     None when the checkout has no ``scripts/time_problems.py`` (an older pin)."""
     from .kb_eval import KBEval
 
+    if cfg.target == "opencl":                      # the board (one device), or this host's OpenCL GPU
+        ev = KBEval(evaluator="board" if cfg.board_host else "local", kb=Path(cfg.kb), python=cfg.python,
+                    ssh_key=cfg.ssh_key, remote_dir=cfg.remote_dir, board_host=cfg.board_host,
+                    board_lock=cfg.board_lock, board_env=list(cfg.board_env))
+        return ev if ev.available() else None
     ev = KBEval(evaluator="ssh" if cfg.ssh_hosts else "local", kb=Path(cfg.kb), python=cfg.python, gpus=cfg.gpus,
                 ssh_hosts=list(cfg.ssh_hosts), cuda_visible_devices=list(cfg.cuda_visible_devices),
                 ssh_key=cfg.ssh_key, remote_dir=cfg.remote_dir, runtime=cfg.runtime)
@@ -854,6 +974,11 @@ def use_kb_eval(cfg: Config) -> bool:
     KernelBlaster's evaluator (``cfg.mb_evaluator``)?"""
     if cfg.mb_evaluator not in ("auto", "kb", "builtin"):
         raise ValueError(f"mb_evaluator must be auto|kb|builtin, not {cfg.mb_evaluator!r}")
+    if cfg.target == "opencl":                      # ModelBlaster's builtin runs are CUDA-only
+        if cfg.mb_evaluator == "builtin":
+            raise ValueError("--target opencl: the profiles, the verification and the re-measurement run through "
+                             "KernelBlaster's evaluator (--mb-evaluator auto|kb), not builtin")
+        return True
     return cfg.mb_evaluator == "kb" or (cfg.mb_evaluator == "auto" and bool(cfg.ssh_hosts))
 
 
@@ -967,7 +1092,7 @@ def _measure_hint(job: dict, ro: dict, rv: dict, cfg: Config, leases: GpuLeases 
                 # time_problems did not run / write its result (it says why), a timeout, a lost link
                 msg = " ".join(f"{type(e).__name__}: {e}".split())[:1500]
                 times, info["failures"] = None, [{"problem": None, "stage": "time", "error": msg,
-                                                  "infra": is_infra_text(msg) or "time_problems failed" in msg or
+                                                  "infra": is_infra_text(msg) or is_infra_result({"final_error": msg}) or "time_problems failed" in msg or
                                                   isinstance(e, (OSError, subprocess.SubprocessError))}]
             ok = bool(times and len(times) == 2 and times[0] and times[1])
             fails = [] if ok else [dict(f, side=sides.get(str(f.get("problem")))) for f in info.get("failures") or []]
@@ -1014,8 +1139,9 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
     ok = bool(ro.get("final_ok") and rv.get("final_ok"))
     fails = []
     bad = [(side, r) for side, r in (("original", ro), ("variant", rv)) if not r.get("final_ok")]
-    if bad and all(r.get("final_infra") for _, r in bad):
-        # KernelBlaster's final run lost to the GPU / link / staging, not to the composite
+    if bad and all(is_infra_result(r) for _, r in bad):
+        # KernelBlaster's final run lost to the GPU / link / staging, not to the composite (the result's own tag, or an
+        # infra signature in its error when the tag is missing: scp, NoDevice, relay 503 / queue_full)
         ev["kb_errors"] = {side: r.get("final_error") for side, r in bad}
         return _undecided(job, ro, rv, times, ev, doc, "KernelBlaster: infrastructure failure of the final run, "
                           "left undecided: " + "; ".join(f"{side}: {r.get('final_error') or '?'}" for side, r in bad))
@@ -1054,11 +1180,29 @@ def finish_hint(job: dict, ro: dict | None, rv: dict | None, times: list | None,
         man = json.loads((Path(job["variant"]) / "manifest.json").read_text())
         changed = [s["id"] for s in man["slots"]
                    if s["op"].startswith("fused__") or s.get("variant_of")
-                   or h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout")   # only new ops there
+                   or h["kind"] in ("fuse_siblings", "fuse_attention", "fold_layout", "rewrite", "merge_sibling_convs")   # only new ops there
                    or s["op"].startswith("region__")]                                   # region slots (A2)
         res["cached"] = _ingest_slots(cache, job["variant"], rv, changed, job["specs"], h["id"])
     _trace_hint(job, ro, rv, times, ev, res)
     return res
+
+
+INFRA_UNRESOLVED = "infra_unresolved"     # hint status: lost to infrastructure after its re-evaluations; not accepted,
+#                                           not rejected, never a candidate again (the candidate filters want "proposed")
+
+
+def infra_retry_budget() -> int:
+    """Automatic re-evaluations of a hint whose decision was lost to infrastructure (``MB_INFRA_RETRY``, default 1: the
+    hint stays ``proposed`` and is decided again in the next round; a second loss makes it ``infra_unresolved``).
+    0 = the old behaviour (undecided every time, no bound)."""
+    try:
+        return max(0, int(os.environ.get("MB_INFRA_RETRY", "1")))
+    except ValueError:
+        return 1
+
+
+def _infra_failures(rec: dict) -> int:
+    return sum(1 for x in rec.get("evidence") or [] if x.get("decision") == "undecided" and x.get("infra"))
 
 
 def _undecided(job: dict, ro: dict, rv: dict, times, ev: dict, doc: dict, why: str) -> dict:
@@ -1067,9 +1211,15 @@ def _undecided(job: dict, ro: dict, rv: dict, times, ev: dict, doc: dict, why: s
     h = job["hint"]
     ev.update(decision="undecided", infra=True, gain=None, applied=job["prov"]["applied"], why=why)
     rec = gh.record_decision(doc, h, ev)
-    res = {"hint": h["id"], "status": "undecided", "hint_status": rec["status"], "infra": True, "why": why,
+    status = "undecided"
+    n, budget = _infra_failures(rec), infra_retry_budget()
+    if budget > 0 and n > budget:                  # re-evaluated ``budget`` time(s) and lost again: stop, no verdict
+        rec["status"] = status = INFRA_UNRESOLVED
+        why += f" [infra_unresolved: {n} infrastructure failures, {budget} re-evaluation(s) allowed]"
+        ev["why"] = why
+    res = {"hint": h["id"], "status": status, "hint_status": rec["status"], "infra": True, "why": why,
            "gain": None, "original_us": ev.get("original_us"), "variant_us": ev.get("variant_us"),
-           "ops": job["names"]}
+           "ops": job["names"], "infra_failures": n}
     _trace_hint(job, ro, rv, times, ev, res)
     return res
 
@@ -1126,8 +1276,10 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
                             continue
                         ro, rv = read_result(run_dir, jobs[k]["orig"]), read_result(run_dir, jobs[k]["variant"])
                         if (ro is not None and rv is not None) or done:
-                            ro = dict(ro or {"final_ok": False}, _dir=str(run_dir / problem_name(jobs[k]["orig"])))
-                            rv = dict(rv or {"final_ok": False},
+                            _lost = {"final_ok": False, "final_infra": True,      # missing result.json at exit: infra/crash,
+                                     "final_error": "no result.json when the KernelBlaster process exited"}   # not a verdict
+                            ro = dict(ro or _lost, _dir=str(run_dir / problem_name(jobs[k]["orig"])))
+                            rv = dict(rv or _lost,
                                       _dir=str(run_dir / problem_name(jobs[k]["variant"])))
                             sides[k] = (ro, rv)
                             futs[k] = ex.submit(kbt.run_within, parent, "mb.remeasure", measure_hint, jobs[k],
@@ -1138,17 +1290,31 @@ def evaluate_hints(items: list[tuple[dict, dict, Path]], run_dir: Path, *, kb: K
             except BaseException:
                 proc.kill()
                 raise
-            res = kb.collect(problems, run_dir, proc)          # final result.json (llm calls, proposals)
-            wait.end()
+            try:
+                res = kb.collect(problems, run_dir, proc)      # final result.json (llm calls, proposals)
+            except RuntimeError as e:
+                # the wave's KernelBlaster run exited non-zero (a startup error such as `problem names collide`, a crash): the hints stay
+                # undecided (the lost-result path below, as a missing result.json) instead of aborting the whole problem
+                msg = " ".join(str(e).split())[:400]
+                print(f"[kb_graph_opt] hint wave failed, {len(live)} hint(s) left undecided: {msg}", flush=True)
+                res = None
+                wait.end()
+                for k in live:
+                    lost = {"final_ok": False, "final_infra": True, "final_error": f"KernelBlaster wave failed: {msg}"}
+                    results[k] = ({**lost, "_dir": str(run_dir / problem_name(jobs[k]["orig"]))},
+                                  {**lost, "_dir": str(run_dir / problem_name(jobs[k]["variant"]))}, None)
+            else:
+                wait.end()
             times = {k: f.result() for k, f in futs.items()}
         # lost to an infrastructure failure while the wave's KernelBlaster run still shared the GPUs (and
         # the remote dir): once more, on a fresh lease, now that the run has finished
         for k in sorted(times):
-            if jobs[k].get("remeasure_infra"):
+            if res is not None and jobs[k].get("remeasure_infra"):
                 times[k] = kbt.run_within(parent, "mb.remeasure", measure_hint, jobs[k], *sides[k], cfg, leases,
                                           attempts=1)
         for n, k in enumerate(live):
-            results[k] = (res[2 * n], res[2 * n + 1], times.get(k))
+            if res is not None:
+                results[k] = (res[2 * n], res[2 * n + 1], times.get(k))
     with T.span("mb.finish"):
         return [finish_hint(j, *results.get(k, (None, None, None)), cache=cache, doc=doc, cfg=cfg)
                 for k, j in enumerate(jobs)]
@@ -1183,9 +1349,61 @@ def decide_hints(cands: list[tuple[dict, dict]], graphs: dict, out: Path, width:
     return [[cands[i][0]["id"] for i in w] for w in waves], [decided[i] for i in sorted(decided)]
 
 
+def _targeted(hints: list[dict], cfg: Config) -> list[dict]:
+    """New hints of this flow are decided on its target's device: stamped with ``cfg.target``
+    (the proposers write ``cuda``; the rewrites are the same, a decision is per target)."""
+    if cfg.target != "cuda":
+        for h in hints:
+            if h.get("target", "cuda") == "cuda":
+                h["target"] = cfg.target
+    return hints
+
+
 # ---------------------------------------------------------------- rounds
 
+def opencl_refusals(cfg: Config) -> list[str]:
+    """Flags ``--target opencl`` cannot honour, as messages (empty on CUDA / when none is set). A flag the flow
+    would otherwise ignore on OpenCL -- its hints are CUDA-stamped and never decided there, its KernelBlaster side
+    builds with nvcc -- fails the run instead of running as a silent no-op:
+
+    * ``--region-slots`` / ``--region-windows`` / ``--region-loop``: a region slot's seed is the CUDA composite
+      (``cuda_seed``: streams / events / one launcher over every member's CUDA kernel) and the region loop's tools
+      build and time CUDA programs; no OpenCL composite seed or loop backend exists;
+    * ``--view-fusion``, ``--graph-rewrite agent``: their hints are proposed for CUDA only;
+    * ``--sol-gate``: SOL-ExecBench's per-element rule reads the CUDA driver's ``MB_SOL`` lines;
+    * ``--multiturn``: the experiment tool compiles with nvcc.
+
+    Supported on OpenCL: ``--round-controller`` (flow level), ``--merge-sibling-convs`` (a graph rewrite, its
+    merged conv is an ordinary conv2d shape)."""
+    if cfg.target != "opencl":
+        return []
+    from . import graph_rewrite as grm, region_loop as rlm, region_windows as rwm
+    why = []
+    rs = str(cfg.region_slots or "off").strip().lower()
+    if rs != "off":
+        why.append(f"--region-slots {rs}: region slots (one slot owning a sub-graph) have only a CUDA composite seed")
+    if rwm.resolve_mode(cfg.region_windows) != "off":
+        why.append("--region-windows: region windows are region slots (CUDA composite seed only)")
+    if rlm.resolve_mode(cfg) != "off":
+        why.append("--region-loop: KernelBlaster's region loop builds and times CUDA programs (nvcc, streams); "
+                   "there is no OpenCL loop backend")
+    if str(cfg.view_fusion).strip().lower() != "off":
+        why.append("--view-fusion: its fuse_view hints are proposed for CUDA only")
+    if grm.resolve_mode(cfg) != "off":
+        why.append("--graph-rewrite: its candidate edits are proposed for CUDA only")
+    if str(cfg.sol_gate if cfg.sol_gate is not None else os.environ.get("MB_SOL_GATE", "off")).strip().lower() \
+            not in ("", "off", "0", "false", "no"):
+        why.append("--sol-gate: SOL-ExecBench's tolerance check reads the CUDA driver's MB_SOL lines")
+    if str(cfg.multiturn).strip().lower() != "off":
+        why.append("--multiturn: the experiment tool compiles with nvcc")
+    return why
+
+
 def run(irs: list[Path], work: Path, cfg: Config) -> dict:
+    refused = opencl_refusals(cfg)
+    if refused:
+        raise ValueError("--target opencl does not support: " + "; ".join(refused) + ". Supported A6 mechanisms on OpenCL: "
+                         "--round-controller, --merge-sibling-convs (docs/opencl_a6.md)")
     work = Path(work).resolve()
     kb_resume.STOP.install()                      # SIGTERM / SIGINT / SIGHUP: stop cleanly, resumable
     with work_lock(work):
@@ -1222,7 +1440,7 @@ class FlowHardware:
         from .kb_eval import check_device, gpu_model_key
 
         d = dict(device or {})
-        self.devices[step].append({"what": what, **{k: d.get(k) for k in ("host", "label", "uuid", "name", "arch")}})
+        self.devices.setdefault(step, []).append({"what": what, **{k: d.get(k) for k in ("host", "label", "uuid", "name", "arch")}})   # setdefault: sol_gate's "sol_probe" is not one of STEPS
         if self.model is None and gpu_model_key(d.get("name")):
             self.model = d["name"]                      # the first step that ran fixes the model
             return
@@ -1265,7 +1483,7 @@ def _restrict_leases(leases: GpuLeases, model: str | None, allow: bool) -> None:
 
 def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     hints_path, state_path = work / "graph_hints.json", work / "state.json"
-    doc, cache = gh.load(hints_path), CudaCache(work / "cache")
+    doc, cache = gh.load(hints_path), CudaCache(work / "cache", target=cfg.target)
     state = json.loads(state_path.read_text()) if state_path.exists() else {"sent": [], "rounds": []}
     # E7 efficiency rules (kb_efficiency.py): resolved against the work dir before the round key is made, so a
     # resumed work dir keeps its rules (a pre-X-129 one: off, its round key unchanged)
@@ -1303,8 +1521,23 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     from . import capabilities as capm
     caps = capm.Caps(cfg, work)                          # A2 switches (defaults: prune on, the rest off)
     caps.apply_env()
+    from . import sol_gate as sgm
+    sg = sgm.SolGate(cfg, work)                          # --sol-gate off (default): inert
+    sg.apply_env()
+    from . import graph_rewrite as grm
+    rw = grm.RewriteHook(cfg, work)                      # --graph-rewrite off (default): inert
+    from . import merge_convs as mcv
+    msc = mcv.MergeHook(cfg, work)                       # --merge-sibling-convs off (default): inert
+    from . import region_loop as rlm
+    rl = rlm.RegionLoopHook(cfg, work)                   # --region-loop off (default): inert
+    from . import round_controller as rcm
+    ctl = rcm.RoundController(cfg, work, region_loop_active=rl.active())   # --round-controller off (default): inert
+    rlm.set_round(None)                                  # the controller's per-round region-loop switch: the flag decides
     from . import graph_search as gsm
     gs = gsm.CURRENT["gs"] = gsm.GraphSearch(cfg, work, irs)   # all off by default (no effect)
+    if ctl.on and gs.active():
+        raise ValueError("--round-controller is not combined with the --graph-* search flags (they schedule their own interleaved "
+                         "decisions and beams): use one or the other")
     if kb_barrier.enabled(cfg) or kb_barrier.char_sync_enabled(cfg, gk):
         gs.on_char_done = bar.after_char                     # --park-after-char on: park once the characterization has run
 
@@ -1314,10 +1547,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                            allow_gpu_mismatch=cfg.allow_gpu_mismatch, on_fallback=sf.on_fallback(mbev, hw.model))
                 for d in irs]
     gpus = detect_gpus(cfg)
-    n_gpus = len(gpus["remote"]) if cfg.ssh_hosts else len(gpus["local"])
+    remote = bool(cfg.ssh_hosts) or cfg.target == "opencl"
+    n_gpus = len(gpus["remote"]) if remote else len(gpus["local"])
     width = cfg.parallel_hints or auto_parallel_hints(n_gpus)
     # MB's own timed runs (re-measurement) lease from the KernelBlaster runs' pool: remote with --ssh-host
-    leases = GpuLeases(gpus["remote"] if cfg.ssh_hosts else gpus["local"])
+    # (OpenCL: the one board, whose lock KernelBlaster's evaluator takes per run)
+    leases = GpuLeases(gpus["remote"] if remote else gpus["local"])
     _restrict_leases(leases, hw.model, hw.allow)
     # the profiles and the final verification: KernelBlaster's evaluator with --ssh-host / --mb-evaluator kb
     mbev = mb_kb_eval(cfg)
@@ -1335,6 +1570,11 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     key.update(ext.round_key())                     # cuda_learnings: likewise
     key.update(sf.round_key())                      # search fixes: only non-default switches
     key.update(caps.round_key())                    # capabilities: only non-default switches
+    key.update(rw.round_key())                      # graph rewrites: only when --graph-rewrite is on
+    key.update(msc.round_key())                     # merge_sibling_convs: only when --merge-sibling-convs is on
+    key.update(rl.round_key())                      # region loop: only when --region-loop is on
+    key.update(sg.round_key())                      # SOL gate: only when --sol-gate is on
+    key.update(ctl.round_key())                     # round controller: only when --round-controller is not off
     if str(cfg.ingest_fused).lower() in ("0", "off", "false", "no"):
         key["ingest_fused"] = "off"                 # kill switch: only when set
     if str(cfg.seed_mined).lower() in ("0", "off", "false", "no"):
@@ -1350,9 +1590,17 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         return json.loads((work / "summary.json").read_text())
     if (work / kb_barrier.PARKED_FILE).exists() and not kb_barrier.enabled(cfg):   # a parked run resumes: import the post-barrier package once
         bar.resume_import()
-    for r in range(len(state["rounds"]), len(state["rounds"]) + n_rounds):
+    r_first = len(state["rounds"])
+    usd0 = float(((rcm.RoundController.history(state, kh) or [{}])[-1]).get("spent_usd") or 0.0) if ctl.on else 0.0   # spend before this process
+    for r in range(r_first, r_first + n_rounds):
         kb_resume.STOP.check()
         state.pop("complete", None)
+        if ctl.on and (why := ctl.pre_stop(rcm.RoundController.history(state, kh), usd0 + kb.usd)):   # before the profile: no spend yet
+            state["rounds"].append({"round": r, "key": kh, "kb_runs": [], "decisions": [], "controller": ctl.stop_record(r, None, why)})
+            state["fixpoint"], state["fixpoint_key"] = r, kh
+            kb_resume.atomic_write_json(state_path, state)
+            print(json.dumps({"round": r, "controller": {"move": "stop", "reasons": [why]}}), flush=True)
+            break
         R = work / f"r{r:02d}"
         prog = kb_resume.RoundProgress(R, key)
         if prog.resumed:
@@ -1374,7 +1622,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             p = saved[i] if saved else profile_ir(
                 Path(d), R / "profile" / Path(d).name, hints_doc=doc, cache=cache, arch=cfg.arch,
                 specs=specs, runs=cfg.profile_runs, kbeval=mbev, gpu_model=hw.model,
-                allow_gpu_mismatch=cfg.allow_gpu_mismatch, on_fallback=sf.on_fallback(mbev, hw.model))
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch, on_fallback=sf.on_fallback(mbev, hw.model),
+                target=cfg.target)
             had = hw.model
             hw.check("profile", p.get("device"), f"r{r:02d}/{p['ir']}")
             if hw.model != had:                          # the first profile fixed the flow's model
@@ -1389,6 +1638,10 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             raise RuntimeError(f"round {r}: profile failed for {bad}; see {R / 'profile'}")
         if not saved:
             prog.mark("profile", profiles)
+        if sg.active():                                  # SOL gate: tolerance, reference outputs, the seed's verdict (once per IR)
+            T.lap("mb.sol_gate")
+            sg.start(irs, specs=specs, arch=cfg.arch, kbeval=mbev, gpu_model=hw.model, allow_mismatch=cfg.allow_gpu_mismatch,
+                     hw_check=hw.check)
         kb_resume.STOP.check()
         first = first or {p["ir"]: p["partition_us"] for p in profiles}
         rec["partition_us"] = {p["ir"]: p["partition_us"] for p in profiles}
@@ -1399,13 +1652,46 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             bar.skipped("characterization is off (--graph-characterize 0 / no --graph-* flag): nothing to park after")
         T.lap("mb.propose")
         graphs = {}
+        mv = ctl_rec = None
         for p in profiles:                                  # MB's own proposals
             g = graphs[p["ir"]] = json.loads((Path(p["ir_dir"]) / "graph.json").read_text())
-            gh.merge(doc, gh.propose_from_profile(g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs,
-                                                   doc=doc, min_gain_pct=cfg.min_gain_pct, ir=p["ir"],
-                                                   launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")))
+            gh.merge(doc, _targeted(gh.propose_from_profile(
+                g, {o["name"]: o["us"] or 0.0 for o in p["ops"]}, specs, doc=doc, min_gain_pct=cfg.min_gain_pct,
+                ir=p["ir"], launch_us=p.get("launch_us") or 0.0, total_us=p.get("e2e_us")), cfg))
         ext.propose(graphs, profiles, doc, specs)             # --fusion-extended (no-op when off)
         caps.propose(graphs, profiles, doc, specs)            # --region-slots (no-op when off)
+        if ctl.on:                                            # --round-controller: cheap CPU proposals first, then the move, then the LLM proposer
+            msc.propose(graphs, profiles, doc, specs)
+            _kinds = ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + msc.decide_kinds()
+            _hist = rcm.RoundController.history(state, kh)
+            _prev = next((x for x in reversed(state["rounds"]) if x.get("key") == kh and x.get("partition_us")), None)
+
+            def _decide():
+                f = ctl.features(r=r, first=not _hist, rounds_left=r_first + n_rounds - r, profiles=profiles, min_gain_pct=cfg.min_gain_pct,
+                                 hist=_hist, spent_usd=usd0 + kb.usd,
+                                 hints=[h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == cfg.target
+                                        and h["kind"] in _kinds],
+                                 prev_total=sum(_prev["partition_us"].values()) if _prev else None,
+                                 cur_total=sum(rec["partition_us"].values()))
+                return ctl.begin(ctl.decide(f, _hist))
+            ctl_rec = prog.once("controller", _decide)        # saved: a resumed round keeps its move
+            mv = rcm.Move.from_dict(ctl_rec)
+            print(json.dumps({"round": r, "controller": {"move": ctl_rec["move"], "reasons": ctl_rec["reasons"]}}), flush=True)
+            if mv.stop:
+                rec["controller"] = ctl.stop_record(r, mv, "; ".join(mv.reasons))
+                T.end_laps(rsec.span)
+                rsec.end()
+                state["rounds"].append(rec)
+                state["fixpoint"], state["fixpoint_key"] = r, kh
+                kb_resume.atomic_write_json(state_path, state)
+                (R / "round.json").write_text(json.dumps(rec, indent=1))
+                break
+            rlm.set_round(mv.region_loop)                     # the region loop only where the controller wants it (kb_args)
+            if mv.graph:
+                rw.propose(r, R, prog, graphs, profiles, doc, specs)   # --graph-rewrite agent: gated candidate edits (no-op when off)
+        else:
+            rw.propose(r, R, prog, graphs, profiles, doc, specs)  # --graph-rewrite agent: gated candidate edits (no-op when off)
+            msc.propose(graphs, profiles, doc, specs)             # --merge-sibling-convs auto (no-op when off)
         if gs.active():                                      # priors pre-apply, fold proposals, beam members
             profiles, graphs = gs.after_propose(r, R, prog, profiles, graphs, doc, specs, hints_path=hints_path,
                                                 reprofile=lambda sub, hd=None, R=R: _reprofile(R, sub, hd))
@@ -1420,6 +1706,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         plan = prog.once("plan", lambda: make_plan(gs.plan_input(profiles), **plan_kw, exclude=sf.exclude(
             set(state["sent"]), profiles, state, r, plan_kw, specs)))        # + re-queued items (search fixes)
         (R / "plan.json").write_text(json.dumps(plan, indent=1))
+        if ctl.on and not mv.kernel:                         # a graph-only round: the kernel steps wait (nothing is marked sent)
+            plan = {**plan, "problems": [], "selected_share": 0.0}
         rec["plan"] = {"selected_share": plan["selected_share"],
                        "problems": [(p["ir"], len(p["op_names"])) for p in plan["problems"]]}
         base_ms = cfg.plan_min_share if cfg.plan_mode == "all" else cfg.min_share
@@ -1429,11 +1717,13 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                                  "late_skipped": kb_efficiency.late_skipped(plan, base_ms) if r >= 1 else []}
 
         def _cands():
+            if ctl.on and not mv.graph:                     # a kernel-only round: the graph hints stay proposed for a later round
+                return {"n_todo": 0, "cands": []}
             if gs.active():                                 # graph search: prior ranking; beam: members decide
-                return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + gs.decide_kinds(),
+                return gs.candidates(doc, profiles, ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + msc.decide_kinds() + gs.decide_kinds(),
                                      _est_gain, _hint_ir, cfg)
-            todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == "cuda"
-                    and h["kind"] in ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() and _est_gain(h) >= cfg.min_gain_pct]
+            todo = [h for h in doc["hints"] if h.get("status") == "proposed" and h.get("target", "cuda") == cfg.target
+                    and h["kind"] in ("fuse", "split_slot") + ext.decide_kinds() + caps.decide_kinds() + rw.decide_kinds() + msc.decide_kinds() and _est_gain(h) >= cfg.min_gain_pct]
             todo.sort(key=lambda h: -_est_gain(h))          # stable: ties keep the hints file's order
             return {"n_todo": len(todo), "cands": [(h["id"], p["ir"]) for h in todo[:cfg.max_variants]
                                                    if (p := _hint_ir(h, profiles)) is not None]}
@@ -1445,7 +1735,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             T.lap("mb.export")
             dirs = [Path(x) for x in prog.once("export", lambda: [str(x) for x in gs.budget(sf.seed_problems(ext.seed_problems(
                 export_plan(plan, R / "problems", cache=cache, arch=cfg.arch, specs=specs,
-                            names={p.get("id", p["ir"]): f"{p.get('id', p['ir'])}__r{r:02d}" for p in plan["problems"]}),
+                            names={p.get("id", p["ir"]): f"{p.get('id', p['ir'])}__r{r:02d}" for p in plan["problems"]},
+                            target=cfg.target),
                 cache, specs), plan, cache, specs, r), plan, doc, graphs, specs, _scope_ops, steps=cfg.steps,
                 stop_patience=cfg.stop_patience)])]
             caps.annotate(dirs, profiles)                    # --model-context (no-op when off)
@@ -1464,15 +1755,21 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                 rec["ingest"] = prog.once("ingest", lambda: ingest(gs.winners(R), cache, gs.ingest_specs(specs, graphs)))
             if (rq := sf.ingest_requeued(results, cache, specs, r)):      # search fixes: re-queued problems' bests
                 rec["requeue_ingest"] = rq
-            state["sent"] += [it["key"] for it in plan["items"] if it.get("selected")]
+            sf.mark_sent(plan, results, state, r)        # search fixes: sent = measured (lost / infra items stay eligible)
             for x in results:
                 pf = Path(x["_dir"]) / "proposals.json"
                 if pf.exists():
                     props = json.loads(pf.read_text())
-                    for h in gh.from_kb_proposals(props, specs=specs):
+                    for h in _targeted(gh.from_kb_proposals(props, specs=specs), cfg):
                         for s in h["source"]:
                             s["ir"] = json.loads((Path(props["problem_dir"]) / "manifest.json").read_text())["ir_name"]
                         gh.merge(doc, [h])
+        if sg.accepting():                                   # SOL gate: the round's ingested winners, checked in the whole model
+            gh.save(doc, hints_path)
+            T.lap("mb.sol_gate")
+            rec["sol_gate"] = sg.after_ingest(r, irs, lambda d, w: verify_ir(
+                Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path, work=w, kbeval=mbev, gpu_model=hw.model,
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache)
         if ext.wants_after_round():                          # zero-LLM: winner cross-application, concurrency auto
             rec["reuse"] = prog.once("reuse", lambda: ext.after_round(R, profiles, doc, cache, specs, mbev, hw.model))
         gh.save(doc, hints_path)
@@ -1491,6 +1788,12 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
             prog, cands, graphs, R / "variants", width, decide_wave=_wave, schedule=schedule, footprint=footprint,
             specs=specs, hints_path=hints_path, save_hints=lambda: gh.save(doc, hints_path))
         rec["parallel_hints"], rec["waves"] = width, waves
+        if sg.accepting():                                   # SOL gate: winners the hint decisions added
+            gh.save(doc, hints_path)
+            T.lap("mb.sol_gate")
+            rec["sol_gate_decide"] = sg.after_ingest(r, irs, lambda d, w: verify_ir(
+                Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path, work=w, kbeval=mbev, gpu_model=hw.model,
+                allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache)
         for g in kb.gpus[n_gpu_rec:]:
             hw.check("kb", g.get("gpu"), Path(g["run"]).name)
         n_gpu_rec = len(kb.gpus)
@@ -1510,6 +1813,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         if gs.active():                                      # beam checkpoint; graph decisions of the round
             rec["graph_search"] = gs.end_round(r, R, prog, profiles=profiles, doc=doc, cache=cache, specs=specs,
                                                kbeval=mbev, gpu_model=hw.model, hints_path=hints_path)
+        if ctl.on:                                            # the move's record: gains, what worked, the spend (budget guard input)
+            rec["controller"] = ctl.end_round(ctl_rec, rec, doc, plan_problems=len(plan["problems"]), spent_usd=usd0 + kb.usd)
         T.end_laps(rsec.span)
         rsec.end()
         tr = {"mb": kbt.compact(T.full_summary(rsec.span)), "kb": kbt.kb_rollup(kb.telemetry[n_kb:])}
@@ -1532,29 +1837,38 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
         # graph search: a promising hint (next rung next round) or a beam still deciding is not a fixpoint
         undecided = [d for d in rec["decisions"] if d.get("status") in ("undecided", "promising")]
         if not accepted and not undecided and not plan["problems"] and len(todo) <= cfg.max_variants \
-                and not gs.blocks_fixpoint(r, doc):
+                and not gs.blocks_fixpoint(r, doc) and not (ctl.on and mv.deferred):
             state["fixpoint"], state["fixpoint_key"] = r, kh
             kb_resume.atomic_write_json(state_path, state)
             break
+    if sg.active():                                      # a resumed run with no round left: the seed's verdict is still needed
+        sg.start(irs, specs=specs, arch=cfg.arch, kbeval=mbev, gpu_model=hw.model, allow_mismatch=cfg.allow_gpu_mismatch,
+                 hw_check=hw.check)
     if gs.active() and gs.audit_mode in ("final", "rounds"):   # unapply audit of the pre-applied hints, before the final model
         gs.audit("final", irs=irs, doc=doc, hints_path=hints_path, cache=cache, specs=specs, cfg=cfg, leases=leases,
                  recorded=list(kb.gpus), state=state, state_path=state_path)
     final = {}
     with T.span("mb.verify", evaluator=mbev.evaluator if mbev is not None else "builtin"):
         for d in irs:
-            v = final[Path(d).name] = verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
-                                                work=work / "final" / Path(d).name, kbeval=mbev,
-                                                gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch)
+            v = final[Path(d).name] = sg.verify(Path(d), lambda d=d: verify_ir(
+                Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path, work=work / "final" / Path(d).name,
+                kbeval=mbev, gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache, where="final")
             if "device" in v:
                 hw.check("verify", v.get("device"), v.get("ir", Path(d).name))
     # search fixes: dominant ops left on / near their seed kernel (warn; repair = route them, zero LLM, verify again)
     guard = sf.final_guard(irs, final, state, cache, specs, kbeval=mbev, gpu_model=hw.model, hints_doc=doc,
-                           reverify=lambda d: verify_ir(Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
-                                                        work=work / "final" / Path(d).name, kbeval=mbev,
-                                                        gpu_model=hw.model, allow_gpu_mismatch=cfg.allow_gpu_mismatch))
+                           reverify=lambda d: sg.verify(Path(d), lambda: verify_ir(
+                               Path(d), cache, arch=cfg.arch, specs=specs, hints=hints_path,
+                               work=work / "final" / Path(d).name, kbeval=mbev, gpu_model=hw.model,
+                               allow_gpu_mismatch=cfg.allow_gpu_mismatch), cache, where="final-guard"))
     summary = {"irs": {}, "rounds": len(state["rounds"]), "fixpoint": state.get("fixpoint"),
                **({"cuda_learnings": ext.summary()} if ext.round_key() else {}),
                **({"capabilities": caps.summary()} if caps.round_key() else {}),
+               **({"graph_rewrite": rw.summary()} if rw.active() else {}),
+               **({"merge_sibling_convs": msc.summary()} if msc.active() else {}),
+               **({"region_loop": rl.summary()} if rl.active() else {}),
+               **({"sol_gate": sg.summary()} if sg.active() else {}),
+               **({"round_controller": ctl.summary()} if ctl.on else {}),
                "accepted": [h["id"] for h in doc["hints"] if h.get("status") == "accepted"],
                "rejected": [h["id"] for h in doc["hints"] if h.get("status") == "rejected"],
                "llm_calls": kb.calls, "parallel_hints": width,
@@ -1571,16 +1885,19 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
     with T.span("mb.model_run", evaluator=kbeval.evaluator if kbeval else "builtin"):
         for d in irs:
             try:
-                models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
-                                                     hints=hints_path, arch=cfg.arch, specs=specs, kbeval=kbeval,
-                                                     gpu_model=cfg.gpu_model, recorded=kb.gpus,
-                                                     allow_gpu_mismatch=cfg.allow_gpu_mismatch,
-                                                     torch_baseline=cfg.torch_baseline,
-                                                     torch_opts={"python": cfg.torch_python or None,
-                                                                 "source": cfg.torch_source or None,
-                                                                 "rounds": cfg.torch_rounds,
-                                                                 "variants": [v for v in cfg.torch_variants.split(",")
-                                                                              if v]})
+                with sg.final_scope():               # --sol-gate: the composed model's run carries SOL's check too
+                    models[Path(d).name] = model_runtime(Path(d), work=work / "final_model" / Path(d).name, cache=cache,
+                                                         hints=hints_path, arch=cfg.arch, specs=specs, kbeval=kbeval,
+                                                         gpu_model=cfg.gpu_model, recorded=kb.gpus,
+                                                         allow_gpu_mismatch=cfg.allow_gpu_mismatch,
+                                                         target=cfg.target, torch_baseline=cfg.torch_baseline,
+                                                         torch_opts={"python": cfg.torch_python or None,
+                                                                     "source": cfg.torch_source or None,
+                                                                     "rounds": cfg.torch_rounds,
+                                                                     "variants": [v for v in cfg.torch_variants.split(",")
+                                                                                  if v]})
+                if sg.active() and (rec_sol := sg.model_record(Path(d).name, models[Path(d).name].get("model"))):
+                    models[Path(d).name]["sol"] = rec_sol
             except Exception as e:                   # the verification above stands; report why
                 models[Path(d).name] = {"error": repr(e)}
             else:
@@ -1609,7 +1926,8 @@ def _run(irs: list[Path], work: Path, cfg: Config) -> dict:
                               **{k: v for k, v in m.items() if k.startswith(("torch_", "speedup_vs_torch",
                                                                               "ours_cmp_"))
                                  and k != "torch_baseline"},
-                              **({"model_error": m["error"]} if "error" in m else {})}
+                              **({"model_error": m["error"]} if "error" in m else {}),
+                              **({"sol": m["sol"]} if sg.active() and m.get("sol") else {})}
     summary["search_fixes"] = {**sf.summary(), "final_guard": guard}
     for ir, x in ((guard or {}).get("irs") or {}).items():
         if ir in summary["irs"]:
@@ -1664,6 +1982,14 @@ def main():
                          "KernelBlaster's evaluator on the runs' pool (local --gpus or the --ssh-host GPUs); builtin "
                          "= built and run here (default GPU / a leased local GPU); auto (default): kb with "
                          "--ssh-host, else builtin")
+    ap.add_argument("--target", choices=["cuda", "opencl"], default="cuda",
+                    help="slot target: cuda (default) | opencl (Qualcomm Adreno: --board-host, --arch adreno650)")
+    ap.add_argument("--board-host", help="--target opencl: user@board; every timed step builds and runs there "
+                                         "(without it: this host's OpenCL GPU)")
+    ap.add_argument("--board-lock", help="--target opencl: flock file on the board held per build + run "
+                                         "(default: KernelBlaster's, ~/mb_board.lock; off: none)")
+    ap.add_argument("--board-env", action="append", default=[],
+                    help="--target opencl: NAME=value for every OpenCL run (repeatable)")
     ap.add_argument("--kb-arg", action="append", default=[],
                     help="extra run_multislot argument, verbatim (repeatable; use --kb-arg=--flag for dashes)")
     ap.add_argument("--build-cache", metavar="DIR", default=None,
@@ -1702,8 +2028,25 @@ def main():
                  parallel_hints=a.parallel_hints, gpus=a.gpus, ssh_hosts=a.ssh_host,
                  cuda_visible_devices=a.cuda_visible_devices, ssh_key=a.ssh_key, remote_dir=a.remote_dir,
                  runtime=a.runtime, gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,
-                 mb_evaluator=a.mb_evaluator, kb_args=a.kb_arg,
+                 mb_evaluator=a.mb_evaluator, kb_args=a.kb_arg, target=a.target, board_host=a.board_host,
+                 board_lock=a.board_lock, board_env=a.board_env,
                  **{k: getattr(a, k) for k in asdict(Config(kb=Path("."))) if k not in _MANUAL_FIELDS})
+    if cfg.target == "opencl" and cfg.board_host and not cfg.remote_dir:
+        ap.error("--target opencl --board-host: give --remote-dir (a writable dir on the board for data.bin "
+                 "and the binaries; not a small tmpfs)")
+    if cfg.target == "opencl" and cfg.arch.isdigit():
+        if a.arch != "75":
+            ap.error("--target opencl: --arch is the OpenCL device label (e.g. adreno650), not an SM number")
+        cfg.arch = "adreno650"                    # KernelBlaster's OpenCL default device
+    if cfg.target == "opencl":                    # the seeds' fp16-math default follows the device label (opencl_seeds.f16_math_enabled)
+        os.environ.setdefault("MB_OPENCL_ARCH", cfg.arch)
+    try:
+        refused = opencl_refusals(cfg)
+    except ValueError as e:
+        ap.error(str(e))
+    if refused:
+        ap.error("--target opencl does not support: " + "; ".join(refused) + ". Supported A6 mechanisms on OpenCL: "
+                 "--round-controller, --merge-sibling-convs (docs/opencl_a6.md)")
     try:
         print(json.dumps(run([Path(d) for d in a.irs], Path(a.work), cfg), indent=1))
     except kb_resume.Interrupted as e:

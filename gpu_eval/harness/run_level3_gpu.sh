@@ -5,6 +5,7 @@
 # An fp16 IR set (`--quant fp16`) walks on the generated `_f16` kernels
 # (cuda/mb_cuda_kernels_f16.cu); H4's libtorch problems are fp32-only, so for
 # fp16 use the multi-slot export (pipeline/kb_export.py --build-check) instead.
+# A bf16 IR set (`--quant bf16`) likewise walks on cuda/mb_cuda_kernels_bf16.cu.
 #
 #   [PY=python] [KB=KernelBlaster checkout] [NCU=1] [SPECS=specs.json] [MB_PATH_EXCLUDE=pattern] \
 #       bash harness/run_level3_gpu.sh IR_ROOT OUT_DIR [SM_ARCH=89]
@@ -17,11 +18,12 @@ SPECS="${SPECS:-$OUT/specs.json}"; [ -f "$SPECS" ] || $PY "$H/../tools/dump_spec
 IRS=$(ls -d "$IRR"/*/graph.json | xargs -n1 dirname | sort -V)
 Q=$($PY -c "import json, sys; print(json.load(open(sys.argv[1])).get('quant', 'fp32'))" "$(echo "$IRS" | head -1)/graph.json")
 CU=$H/cuda/mb_cuda_kernels.cu; [ "$Q" = fp16 ] && CU=$H/cuda/mb_cuda_kernels_f16.cu
+[ "$Q" = bf16 ] && CU=$H/cuda/mb_cuda_kernels_bf16.cu
 nvcc -O3 -arch=sm_$ARCH -Xcompiler -fPIC -shared -o "$OUT/lib_hand.so" "$CU" \
     > "$OUT/hand_build.log" 2>&1 || { cat "$OUT/hand_build.log"; exit 1; }
 (cd "$H" && $PY walk_cuda.py $IRS --specs "$SPECS" --hand "$OUT/lib_hand.so" --impl hand \
     --reps 3 --json "$OUT/h3_hand.json" > "$OUT/h3_hand.log" 2>&1)
-[ "$Q" = fp16 ] && H4=0
+[ "$Q" = fp16 ] || [ "$Q" = bf16 ] && H4=0
 if [ "${H4:-1}" = 1 ]; then
 $PY "$H/kb_targets.py" "$IRR" > "$OUT/kb_targets.txt"
 (cd "$H" && $PY kb_bridge.py --kb "$KB" --specs "$SPECS" --hand-cu cuda/mb_cuda_kernels.cu \

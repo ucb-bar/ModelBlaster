@@ -105,6 +105,87 @@ class Region41Test(unittest.TestCase):
         self.assertEqual(op["outputs"], ["getitem"])
 
 
+class FusedMemberFallbackTest(unittest.TestCase):
+    """A region whose member is a fused op (conv+relu, linear+tanh) with NO cached source for its kind -- a graph-first round
+    has produced no kernel winner and the cache has never seen this region op -- seeds from the member's own stage-by-stage
+    seed (the non-region fused slot path's rule) instead of raising 'a fused member needs its source in sub_sources'
+    (abl3 17018_SqueezeNet, round 1 plan export: region:all and region:win:whole both accepted in round 0)."""
+
+    def setUp(self):
+        from modelblaster.pipeline.tests import window_fixtures as wf
+        from modelblaster.pipeline.kb_export import DEFAULT_HAND_CU, CudaLibrary, _hand_source
+        self.g = wf.rnn_unrolled(8, fused=True)
+        self.sp = _specs(self.g)
+        names = rs.find_regions(self.g, "all", self.sp)[0]
+        self.g2, self.spec = rs.fuse_region(self.g, names, self.sp, "all")
+        self.lib = CudaLibrary(_hand_source(DEFAULT_HAND_CU, "fp16"))
+
+    def test_no_source_falls_back_to_the_fused_seed(self):
+        src = self.spec.cuda_seed(self.lib, {}, parallel=False)
+        self.assertIn("current kernel of fused__linear_f16__tanh_f16", src)
+
+    def test_sub_ops_sources_are_used(self):
+        marker = "// MARKER-LINEAR-WINNER"
+        from modelblaster.pipeline.kb_export import DEFAULT_HAND_CU, _hand_source
+        hand = self.lib.slot_source("kernel_linear_f16").replace("kernel_linear_f16", "kernel_linear_f16", 1)
+        src = self.spec.cuda_seed(self.lib, {"linear_f16": marker + "\n" + hand}, parallel=False)
+        self.assertIn(marker, src)
+
+    def test_pattern_hint_on_an_already_fused_graph_applies(self):
+        """region:all proposed/applied on a graph whose accepted fusions are in the IR: the pattern's groups are fused op names
+        (`a+b`), _locate takes atoms: the hint used to be skipped with 'op(s) [...] not in the graph'."""
+        from modelblaster.pipeline import graph_hints as gh
+        h = {"id": "region:all", "kind": "fuse_region", "pattern": "all", "status": "proposed"}
+        g2, _, prov = gh.apply_hints(json.loads(json.dumps(self.g)), [h], self.sp, statuses=None)
+        self.assertTrue(prov["applied"], prov["skipped"])
+        self.assertTrue(any(o["op"].startswith("region__") for o in g2["ops"]))
+
+    def test_explicit_fused_source_still_wins(self):
+        fk = "fused__linear_f16__tanh_f16"
+        own = self.sp[fk].cuda_seed(self.lib, sub_sources={}) + "\n// MARKER-OWN-FUSED\n"
+        src = self.spec.cuda_seed(self.lib, {fk: own}, parallel=False)
+        self.assertIn("MARKER-OWN-FUSED", src)
+
+
+@unittest.skipUnless(__import__("importlib.util").util.find_spec("torch"), "no torch")
+class NativeCastRegionTest(unittest.TestCase):
+    """--quant native (SOL): a region op that contains cast members (cast_bf16_to_f32 ...) exports. The partition's hand
+    libraries used to be chosen from the region op's own kind only, so the casts file was missing and the region seed raised
+    KeyError 'no definition of kernel_cast_bf16_to_f32' (B200 A6 smoke, 92016_SOL_L2_043_MambaChunkScanWithSegsum)."""
+
+    N = 1024
+
+    def _graph(self):
+        n = self.N
+        t = lambda dt: {"shape": [n], "dtype": dt, "quant": None}
+        return {"name": "native_cast", "version": 1, "quant": "native", "input": {"tensor": "x"},
+                "output": {"tensors": ["z"], "tensor": "z"},
+                "tensors": {"x": t("bf16"), "y": t("f32"), "r": t("f32"), "z": t("bf16")},
+                "ops": [{"name": "c0", "op": "cast_bf16_to_f32", "inputs": ["x"], "outputs": ["y"], "shape": {"n": n}},
+                        {"name": "r0", "op": "relu", "inputs": ["y"], "outputs": ["r"], "shape": {"n": n}},
+                        {"name": "c1", "op": "cast_f32_to_bf16", "inputs": ["r"], "outputs": ["z"], "shape": {"n": n}}],
+                "weight_dtypes": {}}
+
+    def test_region_with_casts_exports(self):
+        from modelblaster.pipeline import graph_hints as gh, kb_export
+        from modelblaster.pipeline.tests import window_fixtures as wf
+        g = gh.unique_names(self._graph())
+        sp = _specs(g)
+        names = rs.find_regions(json.loads(json.dumps(g)), "all", sp)[0]
+        g2, _ = rs.fuse_region(g, names, sp, "all")
+        d = Path(tempfile.mkdtemp())
+        try:
+            ird = wf.ir_dir_from_graph(d / "ir", g2)
+            out = kb_export.export_problem(ird, d / "p", specs=_specs(g2), name="native_region")
+            man = json.loads((Path(out) / "manifest.json").read_text())
+            slot = next(s for s in man["slots"] if s["id"].startswith("region__"))
+            src = (Path(out) / slot["file"]).read_text()
+            self.assertIn("kernel_cast_bf16_to_f32", src)
+            self.assertIn("kernel_cast_f32_to_bf16", src)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class Region43Test(unittest.TestCase):
     def test_attention_block(self):
         g = json.loads((HERE / "data" / "mingpt43_final_graph.json").read_text())

@@ -358,6 +358,83 @@ def requeue(profiles: list[dict], sent: set, state: dict, round_no: int, *, max_
     return keys, notes
 
 
+# ---- sent-on-success (live_debug/search_inefficiency_cross_problem.md: ~70% of round >= 1 plan items were `sent-before`)
+
+def sent_on_success() -> bool:
+    """``MB_SENT_ON_SUCCESS=0`` restores the old rule: every dispatched plan item is ``sent``."""
+    return os.environ.get("MB_SENT_ON_SUCCESS", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def sent_retry_max() -> int:
+    """Times a lost item may be planned again before it is marked sent anyway (``MB_SENT_RETRY_MAX``, default 2)."""
+    try:
+        return max(0, int(os.environ.get("MB_SENT_RETRY_MAX", "2")))
+    except ValueError:
+        return 2
+
+
+def result_measured(res: dict | None) -> bool:
+    """Did a plan problem's KernelBlaster run end in a measured outcome? Yes: it passed (accepted or not faster), or
+    it was measured and failed as a kernel (baseline timed, final not ok, no infrastructure signature), or an accepted
+    fusion absorbed its ops (``external_stop``). No: no result, or a result lost to infrastructure (``final_infra``,
+    scp / NoDevice / relay errors) or without a baseline time: those items stay eligible."""
+    from . import kb_proposals
+    if not res:
+        return False
+    if res.get("final_ok"):
+        return True
+    if (res.get("efficiency") or {}).get("external_stop"):
+        return True
+    # the broader infra test (scp / NoDevice / relay text without the tag) when fix 2 is in, else the tag + [infra] text
+    infra = getattr(kb_proposals, "is_infra_result", None) or (
+        lambda r: bool(r.get("final_infra") or kb_proposals.is_infra_text(r.get("final_error"))))
+    if infra(res):
+        return False
+    return res.get("baseline_partition_us") is not None
+
+
+def sent_keys(plan: dict, results: list[dict], state: dict, round_no: int, *, max_retries: int | None = None
+              ) -> tuple[list[str], dict]:
+    """The selected plan items to mark sent after a round -> (keys, {key: why held}). An item whose problem has no
+    measured outcome stays eligible, at most ``max_retries`` times (``state["sent_retry"]`` = {key: {n, rounds}},
+    resume-safe like ``requeued``); the last time it is sent anyway, so a persistently failing item ends."""
+    mx = sent_retry_max() if max_retries is None else max_retries
+    by_name = {str(r.get("problem")): r for r in results if r}
+    probs = plan.get("problems") or []
+    pos = results if len(results) == len(probs) else []
+    key_res: dict[str, dict | None] = {}
+    for i, p in enumerate(probs):
+        pid = p.get("id", p["ir"])
+        res = by_name.get(f"{pid}__r{round_no:02d}") or next(
+            (r for n, r in by_name.items() if n.endswith(f"{pid}__r{round_no:02d}")), None) or \
+            (pos[i] if pos else None)
+        for k in p.get("keys") or []:
+            key_res[k] = res
+    retry = state.setdefault("sent_retry", {})
+    out, held = [], {}
+    for it in plan["items"]:
+        if not it.get("selected"):
+            continue
+        k = it["key"]
+        res = key_res.get(k)
+        if k not in key_res or result_measured(res):
+            out.append(k)                           # (an item with no problem of its own: as before)
+            continue
+        rec = retry.setdefault(k, {"n": 0, "rounds": []})
+        if round_no in rec["rounds"]:               # resumed round: already counted
+            held[k] = "requeued (resumed round)"
+            continue
+        if rec["n"] < mx:
+            rec["n"] += 1
+            rec["rounds"].append(round_no)
+            held[k] = "no measured outcome: " + ("no result" if not res else
+                                                  str(res.get("final_error") or "baseline not timed")[:160])
+        else:
+            out.append(k)                           # retries exhausted: sent
+            rec["gave_up"] = round_no
+    return out, held
+
+
 def rejection_note(note: dict) -> str:
     errs = "; ".join(note.get("errors") or [])[:600]
     return ("\n[ModelBlaster] The previous winner for this op/shape (impl "
@@ -460,11 +537,19 @@ class Fixes:
         self.resync = float(g("rollout_resync") or 0.0)
         self.rollout_accept = (getattr(cfg, "rollout_accept", "auto") or "auto").lower()
         self.route_log: list = []
-        self.reports: dict = {"requeued": {}, "annotated": {}, "nearest_seeds": {}, "routes": self.route_log}
+        self.reports: dict = {"requeued": {}, "annotated": {}, "nearest_seeds": {}, "sent_held": {},
+                              "routes": self.route_log}
+
+    @property
+    def cuda(self) -> bool:
+        """The cache-entry routing / re-ingest below read CUDA arch keys (``sm_<N>``) and ``.cu`` slot sources: on another
+        slot target (``--target opencl``) they are off (the profile's own fallback -- reject a failing winner, redo the
+        profile on the next best source -- and the final-guard warning are target-independent and stay)."""
+        return getattr(self.cfg, "target", "cuda") == "cuda"
 
     @property
     def routing(self) -> bool:
-        return self.fallback in ("on", "route")
+        return self.fallback in ("on", "route") and self.cuda
 
     @property
     def requeueing(self) -> bool:
@@ -516,6 +601,21 @@ class Fixes:
             print(json.dumps({"search_fixes": {"round": round_no, "requeued": sorted(notes)}})[:2000], flush=True)
         return sent - keys
 
+    def mark_sent(self, plan: dict, results: list[dict], state: dict, round_no: int) -> list[str]:
+        """After a round's plan run: ``state["sent"]`` += the selected items that produced a measured outcome
+        (``MB_SENT_ON_SUCCESS``, default on; off = every selected item, as before). Items lost to infrastructure or
+        never evaluated stay eligible for the next round's plan, ``MB_SENT_RETRY_MAX`` times each."""
+        if not sent_on_success():
+            keys = [it["key"] for it in plan["items"] if it.get("selected")]
+            state["sent"] += keys
+            return keys
+        keys, held = sent_keys(plan, results, state, round_no)
+        state["sent"] += [k for k in keys if k not in state["sent"]]
+        if held:
+            self.reports["sent_held"][str(round_no)] = held
+            print(json.dumps({"search_fixes": {"round": round_no, "not_sent": sorted(held)}})[:2000], flush=True)
+        return keys
+
     def seed_problems(self, dirs: list[Path], plan: dict, cache, specs: dict, round_no: int | None = None) -> list[Path]:
         notes = getattr(self, "_notes", {}) or {}
         if notes:
@@ -543,7 +643,7 @@ class Fixes:
         and the fastest is the rejected kernel, so a re-optimized, slower but working winner never reached the
         deployed model: 15_DenseNet121's 960x7x7 conv was re-optimized in round 1 (8.22 us in its own problem) and
         dropped next to the rejected 8.19 us entry. The cache keeps it beside the rejected one (CudaCache.add)."""
-        if self.fallback == "off":
+        if self.fallback == "off" or not self.cuda:
             return None
         from .kb_ingest import _shape_key
         from .kernel_abi import parse_signature
@@ -588,9 +688,10 @@ class Fixes:
     def round_record(self) -> dict | None:
         """What the fixes did since the last call (one round): re-queued items, annotated problems, nearest seeds,
         fallback routes."""
-        seen = getattr(self, "_seen", {"routes": 0, "requeued": set(), "annotated": set(), "nearest_seeds": set()})
+        seen = getattr(self, "_seen", {"routes": 0, "requeued": set(), "annotated": set(), "nearest_seeds": set(),
+                                       "sent_held": set()})
         r = {}
-        for k in ("requeued", "annotated", "nearest_seeds"):
+        for k in ("requeued", "annotated", "nearest_seeds", "sent_held"):
             new = {kk: v for kk, v in self.reports[k].items() if kk not in seen[k]}
             if new:
                 r[k] = new

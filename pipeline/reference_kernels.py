@@ -11603,26 +11603,59 @@ from modelblaster.pipeline.precision_casts import cast_specs as _cast_specs  # n
 KERNEL_SPECS.update(_cast_specs(KernelSpec))
 
 
-def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
-    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec.
+def _cast_spec(src: str, dst: str) -> "KernelSpec":
+    """`cast_<src>_to_<dst>`: the dtype conversion a mixed IR (`--quant native`,
+    docs/tensor_dtypes.md) inserts where a tensor's dtype differs from what its
+    op reads or writes. Float -> float rounds once (round-to-nearest-even);
+    an integer / bool source converts exactly (ints are integer-valued f32
+    inside the graph, exact below 2^24); f32 -> integer truncates toward zero,
+    -> bool (b8) is `!= 0`."""
+    from modelblaster.pipeline.cuda_dtypes import CTYPE, cast_kind
+    cs, cd = CTYPE[src][0], CTYPE[dst][0]
+    op = cast_kind(src, dst)
+    if dst == "b8":
+        body, rule = "out[i] = (float)in[i] != 0.0f;", "out[i] = in[i] != 0 (bool, one byte)"
+    elif dst in ("i64", "i32", "u8"):
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})in[i] (truncation toward zero)"
+    else:
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})(float)in[i] (one rounding to {dst})"
+    sig = f"void kernel_{op}(const {cs} *in, {cd} *out, int n)"
+    return KernelSpec(
+        op=op,
+        signature=sig,
+        semantics=(f"Convert a {src} tensor to {dst}, elementwise over n elements:\n  {rule}\n"
+                   "Inserted by extraction where a tensor's dtype differs from the dtype its op "
+                   "reads or writes (per-tensor dtypes, docs/tensor_dtypes.md)."),
+        reference_impl=(f"{sig} {{\n    for (int i = 0; i < n; i++) {{\n        {body}\n    }}\n}}\n"),
+        extra_shapes=[{"n": 1}, {"n": 257}],
+    )
 
-    The transformation is purely mechanical: rename kernel_<op> -> kernel_<op>_f16
-    and change every float POINTER (`const float *` / `float *`, in both the
-    signature and the body's pointer locals) to `_Float16 *`. Scalar `float`
-    params (eps, scale, beta, margin) and `float` locals / `(float)` casts stay
-    — loads widen `_Float16`->float and stores narrow float->`_Float16`
-    implicitly, so the math still runs in fp32. Mirrors the hand-written _f16
-    kernels (relu_f16, softmax_f16, ...)."""
+
+def _cast_specs() -> dict:
+    from modelblaster.pipeline.cuda_dtypes import CASTS
+    return {s.op: s for s in (_cast_spec(a, b) for a, b in CASTS)}
+
+
+KERNEL_SPECS.update(_cast_specs())
+
+
+def _make_reduced_variant(spec: "KernelSpec", suffix: str, ctype: str, label: str) -> "KernelSpec":
+    """Synthesize the `<op><suffix>` storage variant of an fp32 KernelSpec:
+    rename kernel_<op> -> kernel_<op><suffix> and change every float POINTER
+    (`const float *` / `float *`, in both the signature and the body's pointer
+    locals) to `ctype *`. Scalar `float` params (eps, scale, beta, margin) and
+    `float` locals / `(float)` casts stay -- loads widen to float and stores
+    narrow from float implicitly, so the math still runs in fp32."""
     import ctypes
 
     def _c(s: str) -> str:
-        s = s.replace("const float *", "const _Float16 *")
-        s = s.replace("float *", "_Float16 *")
-        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}_f16(")
+        s = s.replace("const float *", f"const {ctype} *")
+        s = s.replace("float *", f"{ctype} *")
+        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}{suffix}(")
         return s
 
     _fp = ctypes.POINTER(ctypes.c_float)
-    _hp = ctypes.POINTER(ctypes.c_uint16)  # _Float16 has no ctypes type; use u16
+    _hp = ctypes.POINTER(ctypes.c_uint16)  # 2-byte float types have no ctypes type; use u16
 
     def _argtypes(_orig=spec.argtypes_factory):
         if _orig is None:
@@ -11630,23 +11663,40 @@ def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
         return [_hp if a is _fp else a for a in _orig()]
 
     return KernelSpec(
-        op=spec.op + "_f16",
+        op=spec.op + suffix,
         signature=_c(spec.signature),
-        semantics="(fp16) " + spec.semantics,
+        semantics=f"({label}) " + spec.semantics,
         reference_impl=_c(spec.reference_impl),
         extra_shapes=list(spec.extra_shapes),
         argtypes_factory=(None if spec.argtypes_factory is None else _argtypes),
     )
 
 
-for _op_name in list(KERNEL_SPECS):
-    if _op_name.endswith("_f16") or _op_name.endswith("_s8"):
-        continue
-    if _op_name.startswith("cast_"):
-        continue
+def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec:
+    `_Float16` storage, fp32 math (see _make_reduced_variant). Mirrors the
+    hand-written _f16 kernels (relu_f16, softmax_f16, ...)."""
+    return _make_reduced_variant(spec, "_f16", "_Float16", "fp16")
+
+
+def _make_bf16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the bfloat16 (`_bf16`) counterpart of an fp32 KernelSpec:
+    `__bf16` storage (GCC/Clang's bfloat16; `__nv_bfloat16` in the CUDA
+    spelling, cuda_dtypes.cuda_signature), fp32 math, one rounding per store
+    (docs/bf16_cuda.md). Every `_bf16` spec is derived from the fp32 one --
+    including the ops with hand-written `_f16` specs -- so its signature and
+    argument binding are the fp32 op's."""
+    return _make_reduced_variant(spec, "_bf16", "__bf16", "bf16")
+
+
+_FP32_OPS = [_op_name for _op_name in KERNEL_SPECS
+             if not (_op_name.endswith(("_f16", "_bf16", "_s8")) or _op_name.startswith("cast_"))]
+for _op_name in _FP32_OPS:
     _f16_name = _op_name + "_f16"
     if _f16_name not in KERNEL_SPECS:
         KERNEL_SPECS[_f16_name] = _make_f16_variant(KERNEL_SPECS[_op_name])
+for _op_name in _FP32_OPS:
+    KERNEL_SPECS[_op_name + "_bf16"] = _make_bf16_variant(KERNEL_SPECS[_op_name])
 
 
 def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
