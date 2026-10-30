@@ -585,7 +585,7 @@ def mem_available_gb() -> float:
 
 def capped(cmd: list, max_gb: float) -> list:
     """``cmd`` in its own memory-capped scope (no swap): the OOM is ours, not the host's."""
-    if shutil.which("systemd-run"):
+    if shutil.which("systemd-run") and not os.environ.get("MB_GATES_NO_SYSTEMD"):   # no user bus (ssh): prlimit
         return ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={max_gb:g}G",
                 "-p", "MemorySwapMax=0", "--", *cmd]
     return ["prlimit", f"--as={int(max_gb * 2 ** 30)}", "--", *cmd]
