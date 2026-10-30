@@ -89,8 +89,13 @@ class OpenCLTarget:
         return lib.slot_source(entry), lib.origin(entry)
 
     def head_source(self, lib) -> str:
+        # fp16-math off (MB_OPENCL_F16_MATH=0, or an arch without cl_khr_fp16): the legacy build -- OpenCL C 1.2 and no
+        # fp16 prelude, as before the hardware-aware seeds; on: the runtime picks OpenCL C 2.0 and enables cl_khr_fp16
+        # from the device it finds ($MB_CL_STD / $MB_CL_FP16 override at run time)
+        legacy = "" if getattr(lib, "f16_math", True) else \
+            '#define MB_CL_STD_DEFAULT "CL1.2"\n#define MB_NO_FP16_PRELUDE 1\n'
         return "// OpenCL runtime shared by every slot (gpu_eval/harness/opencl/mb_opencl_runtime.h).\n" \
-            + RUNTIME_H.read_text()
+            + legacy + RUNTIME_H.read_text()
 
     def driver_source(self, data_path: Path, bufs, op_recs, slots, tol) -> str:
         return driver_source(data_path, bufs, op_recs, slots, tol)

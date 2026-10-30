@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -444,6 +445,8 @@ def main():
     se.add_argument("--min-share", type=float, default=0.01)
     se.add_argument("--exclude-from", nargs="*", default=[], help="earlier plans: their selected items are skipped")
     a = ap.parse_args()
+    if not str(getattr(a, "arch", "75")).isdigit():            # OpenCL device label: fp16-math seeds (opencl_seeds.f16_math_enabled)
+        os.environ.setdefault("MB_OPENCL_ARCH", a.arch)
     if a.cmd == "profile":
         from . import graph_hints as gh
         from .kb_ingest import CudaCache
