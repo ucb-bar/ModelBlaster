@@ -70,6 +70,10 @@ class SeedTest(unittest.TestCase):
         self.assertEqual(s.origin("kernel_softmax_f16"), "hand-f16")
         self.assertEqual(s.origin("kernel_relu_f16"), "template-f16")
         self.assertFalse(s.has("kernel_scatter_dim_f16"))
+        # Adreno 650's compiler aborts on half -> 64-bit int conversions: indices go through int
+        for e in ("kernel_topk_f16", "kernel_gather_dim_f16", "kernel_index_select_f16", "kernel_gather_f16"):
+            if s.has(e):
+                self.assertNotRegex(s.slot_source(e), r"\(long\)\s*(vload_half|f\b)", e)
 
     def test_templates_use_the_signature(self):
         from modelblaster.pipeline.reference_kernels import KERNEL_SPECS

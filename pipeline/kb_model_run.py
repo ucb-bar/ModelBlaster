@@ -86,8 +86,9 @@ def find_runs(roots) -> list[Path]:
 
 
 def cache_from_runs(runs: list[Path], cache, specs: dict, arch: str) -> list[dict]:
-    """Every verified run's changed best slots into ``cache`` (guard = the slot's instance shapes)."""
-    from .kb_ingest import signature_sha
+    """Every verified run's changed best slots into ``cache`` (guard = the slot's instance shapes);
+    runs of another slot target than the cache's are skipped."""
+    from .kb_ingest import arch_key, signature_sha
     from .kernel_abi import parse_signature
     from .cuda_dtypes import cuda_signature
 
@@ -99,6 +100,9 @@ def cache_from_runs(runs: list[Path], cache, specs: dict, arch: str) -> list[dic
             continue
         pdir = Path(res["problem_dir"])
         man = json.loads((pdir / "manifest.json").read_text())
+        if man.get("target", "cuda") != cache.target:
+            report.append({"run": str(run), "status": "other-target", "target": man.get("target", "cuda")})
+            continue
         for s in man["slots"]:
             f = run / "best" / "slots" / Path(s["file"]).name
             spec = specs.get(s["op"])
@@ -115,10 +119,11 @@ def cache_from_runs(runs: list[Path], cache, specs: dict, arch: str) -> list[dic
             us = sr.get("final_attr_us") or sr.get("final_us") or sr.get("best_us") or 0.0
             base = sr.get("baseline_attr_us") or sr.get("baseline_us")
             entry, _ = parse_signature(spec.signature)
-            e, st = cache.add(op=s["op"], entry=entry, signature=spec.signature, arch=f"sm_{arch}",
+            e, st = cache.add(op=s["op"], entry=entry, signature=spec.signature, arch=arch_key(arch, cache.target),
                               shapes=[i.get("shape", {}) for i in s.get("instances", [])], code=code, slot_us=us,
                               speedup=(base / us) if base and us else None,
-                              impl_id=sr.get("impl_id") or f"{res.get('run_id')}:{s['id']}", dtype=man.get("dtype"),
+                              impl_id=sr.get("impl_id") or f"{res.get('run_id')}:{s['id']}",
+                              dtype=s.get("dtype") or man.get("dtype"),   # a mixed problem: the slot's
                               source={"run_id": res.get("run_id"), "problem_id": res.get("problem"),
                                       "techniques": sr.get("techniques", []),
                                       **({"gpu": res["gpu"]} if res.get("gpu") else {})})
@@ -164,6 +169,8 @@ def _time_builtin(prob: Path, *, arch: str, work: Path, sources=None, ref_source
         out.update(ref_e2e_us=_med([r["ref_e2e_us"] for r in rs]),
                    paired_ratio=_med([(r.get("e2e_ratio") or {}).get("med") for r in rs]),
                    paired_basis=(last.get("e2e_ratio") or {}).get("basis"))
+    if last.get("sol"):                            # a SOL-gated export (sol_tolerance.py)
+        out["sol"] = last["sol"]
     if not out["passed"]:
         out["log"] = last.get("log", "")[-2000:]
     return out
@@ -206,6 +213,10 @@ def _from_kb(job: dict, *, identical: bool = False) -> dict:
             ratios = [dep(r) / dep(q) for r, q in zip(rs, refs) if dep(r) and dep(q)]
             out.update(ref_e2e_us=_med([dep(q) for q in refs]), paired_ratio=_med(ratios),
                        paired_basis=refs[-1].get("e2e_basis") if refs else None)
+    if last.get("sol"):                            # a SOL-gated export: every run's verdicts, the last one's record
+        out["sol"] = last["sol"]
+        out["sol_runs_ok"] = [all((d.get(d.get("gate")) or {}).get("ok", True) for d in (r.get("sol") or {}).values())
+                              for r in rs]
     if not out["passed"]:
         out["log"] = (last.get("log") or "\n".join(map(str, last.get("errors") or [])))[-2000:]
     return out
@@ -251,7 +262,8 @@ def _slot_files(prob: Path) -> dict:
 def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path | None = None, arch: str | None = None,
                   reps: int = 3, time_partitions: bool = False, keep: bool = False, specs: dict | None = None,
                   kbeval=_AUTO, gpu_model: str | None = None, allow_gpu_mismatch: bool = False,
-                  recorded: list | None = None, torch_baseline: str = "off", torch_opts: dict | None = None) -> dict:
+                  recorded: list | None = None, torch_baseline: str = "off", torch_opts: dict | None = None,
+                  target: str | None = None) -> dict:
     """Compose the winners into the whole model, check it and time it (see the module doc).
 
     ``kbeval``: a :class:`kb_eval.KBEval` (KernelBlaster's local or ssh evaluator), None for
@@ -261,33 +273,45 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
     see ``kb_eval.required_hardware``; ``recorded`` adds GPU records of runs not in ``runs``,
     e.g. ``kb_graph_opt``'s rounds). ``allow_gpu_mismatch`` times anyway, with warnings.
     ``torch_baseline`` (off | auto | on) with ``torch_opts`` (:func:`torch_comparison`): the
-    model against the PyTorch module on the same GPU (``torch_baseline``, ``torch_*`` fields)."""
+    model against the PyTorch module on the same GPU (``torch_baseline``, ``torch_*`` fields).
+
+    ``target`` (default: the cache's slot target, else cuda): ``opencl`` composes OpenCL slots and
+    times them through ``kbeval`` (the board: one process per run, ``MB_E2E_US basis=replay``, the
+    seed model timed right after the composed one in each round); ``arch`` is the device label.
+    There is no PyTorch on the board: the reported baseline is the seed model there, and
+    ``torch_baseline`` records why not (``status: skipped``)."""
     from . import graph_hints as gh
     from . import kb_eval as ke
     from .kb_export import export_problem
-    from .kb_ingest import CudaCache, cache_plan
+    from .kb_ingest import CudaCache, arch_key, cache_plan
     from .kb_proposals import _all_specs, write_variant_ir
 
     T = kbt.get()
+    target = target or (cache.target if cache is not None else "cuda")
     if kbeval is _AUTO:
         kbeval = _default_eval()
+    if target != "cuda" and kbeval is None:
+        raise ValueError(f"the {target} model is timed through KernelBlaster's evaluator (kbeval): ModelBlaster's "
+                         "builtin host is CUDA-only")
     ir_dir, work = Path(ir_dir), Path(work)
     work.mkdir(parents=True, exist_ok=True)
     run_dirs = find_runs(runs)
     rec = ke.recorded_gpus(run_dirs) + list(recorded or [])
     hw = ke.required_hardware(rec, gpu_model=gpu_model, arch=arch, allow_mismatch=allow_gpu_mismatch)
-    arch = hw["arch"] or "75"
-    hw["arch"] = f"sm_{arch}"
+    arch = hw["arch"] or ("75" if target == "cuda" else None)
+    if arch is None:
+        raise ValueError(f"{target}: pass the device label as arch (e.g. adreno650)")
+    hw["arch"] = arch_key(arch, target)
     with T.span("mb.model_run.compose", ir=ir_dir.name):
         specs = dict(specs or _all_specs())
         g = json.loads((ir_dir / "graph.json").read_text())
         hint_ids = []
         if hints is not None and Path(hints).exists():
-            g, added, prov = gh.apply_hints(g, gh.load(Path(hints))["hints"], specs)
+            g, added, prov = gh.apply_hints(g, gh.load(Path(hints))["hints"], specs, target=target)
             specs.update(added)
             hint_ids = sorted({a["id"] for a in prov["applied"]})
         # a working cache: the given one plus the runs' best slots (the given one is not modified)
-        wc = CudaCache(work / "cache")
+        wc = CudaCache(work / "cache", target=target)
         wc.entries = [dict(e) for e in cache.entries] if cache is not None else []
         if cache is not None:
             (work / "cache" / "src").mkdir(parents=True, exist_ok=True)
@@ -296,7 +320,7 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
                 if not dst.exists():
                     shutil.copyfile(cache.root / e["file"], dst)
         added = cache_from_runs(run_dirs, wc, specs, arch)
-        plan = cache_plan(g, wc, f"sm_{arch}", specs)
+        plan = cache_plan(g, wc, arch_key(arch, target), specs)
         # cache entries carry the GPU of the run they came from (cache_from_runs): they must agree too
         used_gpus = [{"run": f"cache:{e.get('impl_id')}", "gpu": (e.get("source") or {}).get("gpu"), "arch": e.get("arch")}
                      for e in plan.get("used", {}).values() if (e.get("source") or {}).get("gpu")]
@@ -309,8 +333,8 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
                 hw["warnings"] = [w for w in hw["warnings"] if not w.startswith("no KernelBlaster run recorded")]
         vir = write_variant_ir(ir_dir, plan["graph"], work / "ir")
         comp = export_problem(vir, work / "model", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
-                              sub_sources=plan["sub_sources"], specs=specs, strategy="whole")
-        seed = export_problem(ir_dir, work / "seed", strategy="whole")
+                              sub_sources=plan["sub_sources"], specs=specs, strategy="whole", target=target)
+        seed = export_problem(ir_dir, work / "seed", strategy="whole", target=target)
         cm, sm = (json.loads((d / "manifest.json").read_text()) for d in (comp, seed))
         # the same slots and ops: the seed model is the composed problem with the hand kernels,
         # timed in the same requests (paired); otherwise (fused or split slots) on its own
@@ -370,7 +394,7 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
         hw["warnings"].append(f"timed on {dev['name']} with no recorded component GPU to match")
     hw.update(device=dev or None, match=match)
     seed_us = model.get("ref_e2e_us") if pair else (seed_t or {}).get("e2e_us")
-    out = {"format": FORMAT, "ir": cm["ir_name"], "source_ir": str(ir_dir), "arch": f"sm_{arch}",
+    out = {"format": FORMAT, "ir": cm["ir_name"], "source_ir": str(ir_dir), "arch": arch_key(arch, target),
            "passed": model["passed"], "model_e2e_us": model.get("e2e_us"), "model_basis": model.get("e2e_basis"),
            "model_eager_us": model.get("eager_us"), "graph_skip": model.get("graph_skip"),
            "seed_e2e_us": seed_us, "seed_basis": "graph" if pair and model.get("paired_basis") == "graph"
@@ -408,7 +432,21 @@ def model_runtime(ir_dir: Path, *, work: Path, cache=None, runs=(), hints: Path 
         out["sum_partitions_seed_e2e_us"] = ss
         if out["model_e2e_us"]:
             out["boundary_effect_us"] = out["model_e2e_us"] - sp_     # > 0: the model costs more than its parts
-    if torch_baseline and torch_baseline != "off":
+    if target != "cuda":
+        out["target"] = target
+    if torch_baseline and torch_baseline != "off" and target != "cuda":
+        # the PyTorch baseline is CUDA-only (torch_baseline.compare times the module on the model's
+        # CUDA GPU by UUID); the board has no torch: the baseline is the seed model, timed above
+        why = (f"no PyTorch baseline on the {target} device (no torch there; the baseline is the seed model, "
+               f"seed_e2e_us)")
+        print(f"[kb_model_run] torch baseline skipped: {why}", file=sys.stderr, flush=True)
+        if torch_baseline == "on":
+            raise RuntimeError(f"torch baseline skipped: {why}")
+        from .torch_baseline import FORMAT as TB_FORMAT, summary_fields
+        tres = {"format": TB_FORMAT, "status": "skipped", "reason": why}
+        out["torch_baseline"] = tres
+        out.update(summary_fields(tres))
+    elif torch_baseline and torch_baseline != "off":
         tres = torch_comparison(ir_dir, comp, model, mode=torch_baseline, work=work / "torch", kbeval=kbeval,
                                 arch=arch, gpu_model=hw["gpu_model"], **(torch_opts or {}))
         out["torch_baseline"] = tres
@@ -505,7 +543,10 @@ def main():
     ap.add_argument("--kb-runs", nargs="*", default=[], help="KernelBlaster run dirs (or roots holding them)")
     ap.add_argument("--cache", help="ModelBlaster CUDA kernel cache to compose from too (read only)")
     ap.add_argument("--hints", help="graph hints file: its accepted hints are applied")
-    ap.add_argument("--arch", default=None, help="SM number (default: the KernelBlaster runs' arch, else 75)")
+    ap.add_argument("--arch", default=None, help="SM number (default: the KernelBlaster runs' arch, else 75); "
+                    "OpenCL: the device label (adreno650)")
+    ap.add_argument("--target", default="cuda", choices=["cuda", "opencl"],
+                    help="slot target of the cache and the composed model (opencl: --evaluator board|local)")
     ap.add_argument("--gpu-model", default=None,
                     help="GPU model to time on, e.g. 'NVIDIA L40S' (default: the one the KernelBlaster runs recorded)")
     ap.add_argument("--allow-gpu-mismatch", action="store_true",
@@ -527,7 +568,8 @@ def main():
     tel.configure(Path(a.work) / "telemetry.jsonl")
     try:
         with tel.span("mb.model_run", collect=True, ir=Path(a.ir_dir).name) as sp:
-            res = model_runtime(Path(a.ir_dir), work=Path(a.work), cache=CudaCache(Path(a.cache)) if a.cache else None,
+            res = model_runtime(Path(a.ir_dir), work=Path(a.work),
+                                cache=CudaCache(Path(a.cache), target=a.target) if a.cache else None, target=a.target,
                                 runs=a.kb_runs, hints=Path(a.hints) if a.hints else None, arch=a.arch, reps=a.reps,
                                 time_partitions=a.time_partitions, keep=a.keep, kbeval=kbeval,
                                 gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch,

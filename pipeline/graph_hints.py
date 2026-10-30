@@ -50,6 +50,10 @@ and why); fused ops carry ``hint``. On CUDA:
   ops and tensors are unchanged;
 * ``unfuse`` -> the fused op's stages restored (fp32 sub_ops keep their
   registered tensors, so nothing needs synthesizing);
+* ``merge_sibling_convs`` (``--merge-sibling-convs auto``, merge_convs.py; id ``merge:<pattern>``, ``instances`` / ``chains`` scope):
+  sibling convolutions reading one tensor and joined by a channel concat become ONE convolution (largest odd kernel, centred
+  zero-padded filters concatenated along the output channels, biases concatenated, one shared activation) whose weights are
+  derived weights (weight_derivations.py: pad + concat; originals untouched); applied before the fusions so they see the new ops;
 * the RISC-V kinds: ``fuse`` with ``dispatch_groups`` is translated to op-name
   chains (each group must be an exclusive producer->consumer chain); the
   others are skipped with the reason -- ``tile_split`` (OC/N tiles placed on
@@ -84,7 +88,11 @@ from pathlib import Path
 
 FORMAT = "modelblaster.graph_hints/v1"
 CUDA_KINDS = ("fuse", "split_slot", "unfuse", "fold_layout", "fuse_attention", "fuse_siblings", "fuse_region",
-              "fuse_view")
+              "fuse_view", "rewrite", "merge_sibling_convs")
+# the KernelSpec-per-slot targets: their fuse / split_slot / unfuse rewrites are the same mechanics
+# (``target="opencl"`` applies them as on CUDA), but a hint decided on one target's device applies
+# only there
+SLOT_TARGETS = ("cuda", "opencl")
 NOT_ON_CUDA = {
     "tile_split": "OC/N tiles exist to run one op on several cores at once; a CUDA kernel already spans "
                   "every SM and the driver runs one stream, so tiles would serialise (use split_slot for "
@@ -559,12 +567,19 @@ def _apply_fuse_view_cuda(graph, h, specs, prov):
 
 def _apply_fuse_region_cuda(graph, h, specs, prov):
     """``fuse_region`` (region_slots, --region-slots): the hint's ``pattern`` (rnn_stack | attention_block | all)
-    wherever region_slots.find_regions finds it, or its explicit ``members`` (op names), becomes one ``region__`` op.
+    wherever region_slots.find_regions finds it, or its explicit ``members`` (op names), becomes one ``region__`` op (explicit
+    ``windows``: one per member list, the windows of --region-windows).
     Applied after every other kind (the members keep their split variants: the region's composite seed calls each
     member's own slot variant)."""
     from .region_slots import find_regions, fuse_region
 
-    groups = [h["members"]] if h.get("members") else find_regions(graph, h.get("pattern", "all"), specs)
+    # ``windows`` (region_windows.py, --region-windows): several explicit member lists, one region op each. NOT ``groups``: that
+    # key is the split hints' shape groups, which record_decision moves to ``tried_groups`` once the hint is accepted
+    groups = ([list(g) for g in h["windows"]] if h.get("windows") else
+              [h["members"]] if h.get("members") else
+              # a pattern's groups are CURRENT op names (a fused op is `a+b`): _locate takes atoms, so give it the atoms (a pattern
+              # hint applied to a graph whose accepted fusions are already in the IR was skipped with "op(s) [...] not in the graph")
+              [[a for n in grp for a in atoms(n)] for grp in find_regions(graph, h.get("pattern", "all"), specs)])
     used = {}
     for grp in groups:
         try:
@@ -697,11 +712,27 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
         # and before split_slot (the folded ops get new slot kinds to split)
         # fuse_attention consumes accepted bmm/scale/mask fusions and folds the q/k/v/o copies itself, so it
         # runs after fuse and before fold_layout (which would otherwise rewrite the same bmms)
-        return ({"fuse": 0, "unfuse": -1, "fuse_siblings": 0.3, "fuse_attention": 0.4, "fold_layout": 0.5,
+        # merge_sibling_convs (merge_convs.py) runs on the unfused ops (right after unfuse): the fusions that follow see the merged conv
+        return ({"fuse": 0, "unfuse": -1, "merge_sibling_convs": -0.5, "fuse_siblings": 0.3, "fuse_attention": 0.4, "fold_layout": 0.5,
                  "split_slot": 1, "fuse_region": 1.5, "fuse_view": 0.1}.get(h["kind"], 2), 0)
 
+    ordered = sorted(todo, key=order)
+    if any(h["kind"] == "rewrite" for h in ordered):
+        # a graph rewrite (graph_rewrite.py) was proposed on the graph the hints accepted AT THAT TIME had produced: it applies right
+        # after the last of them (``rewrite.after_hints``), before every hint accepted later (their patterns then see the new ops;
+        # a later hint that names an op the rewrite removed is skipped as not applicable)
+        rws = [h for h in ordered if h["kind"] == "rewrite"]
+        ordered = [h for h in ordered if h["kind"] != "rewrite"]
+        for h in rws:
+            after = set((h.get("rewrite") or {}).get("after_hints") or [])
+            ordered.insert(max((i for i, x in enumerate(ordered) if x["id"] in after), default=-1) + 1, h)
     added = {}
-    for h in sorted(todo, key=order):
+    for h in ordered:
+        ht = h.get("target", "cuda")
+        if ht in SLOT_TARGETS and ht != target:
+            # decided by measurement on another slot target's device (CUDA vs OpenCL)
+            prov["skipped"].append({"id": h["id"], "why": f"decided for target {ht}, not {target}"})
+            continue
         if h.get("target", "cuda") == "riscv" and h["kind"] == "fuse" and "dispatch_groups" in h:
             try:
                 chains = _xpurt_fuse_to_chains(g, h)
@@ -737,6 +768,16 @@ def apply_hints(graph: dict, hints: list[dict], specs: dict | None = None, *, ta
             specs.update(sp)
         elif h["kind"] == "fuse_region":
             g, sp = _apply_fuse_region_cuda(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "merge_sibling_convs":     # merge_convs.py: sibling convs joined by a channel concat -> one conv, derived weights
+            from .merge_convs import apply_hint as _merge_apply
+            g, sp = _merge_apply(g, h, specs, prov)
+            added.update(sp)
+            specs.update(sp)
+        elif h["kind"] == "rewrite":                 # graph_rewrite.py: an agent / MB rewrite stored as a patch + derived weights
+            from .graph_rewrite import apply_rewrite_hint
+            g, sp = apply_rewrite_hint(g, h, specs, prov)
             added.update(sp)
             specs.update(sp)
         elif h["kind"] == "fold_layout":
@@ -806,7 +847,11 @@ def verify_rewrite(ir_dir: Path, graph: dict, *, specs: dict | None = None, buil
     ir = mbir.load_ir(ir_dir)
     with torch.no_grad():
         ref, _ = walk_torch.walk(ir, dev="cpu")
-        new_ir = mbir.IR(ir.name, graph, ir.weights, ir.golden_in, ir.golden_out)
+        weights = ir.weights
+        if graph.get("weight_derivations"):                  # a rewrite's derived weights: rebuilt from the base ones
+            from . import weight_derivations as wd
+            weights = wd.fill_missing(graph, weights)
+        new_ir = mbir.IR(ir.name, graph, weights, ir.golden_in, ir.golden_out)
         out, _ = walk_torch.walk(new_ir, dev="cpu")
     res = {"golden": mbir.compare(out, ir.golden_out),
            "vs_original_walk": float((out - ref).abs().max()) if out.shape == ref.shape else None}
@@ -836,14 +881,14 @@ def verify_rewrite(ir_dir: Path, graph: dict, *, specs: dict | None = None, buil
 
 
 def apply_to_ir(ir_dir: Path, hints_doc: dict, out_dir: Path, specs: dict | None = None,
-                statuses: tuple | None = ("accepted",)) -> tuple[Path, dict, dict]:
+                statuses: tuple | None = ("accepted",), target: str = "cuda") -> tuple[Path, dict, dict]:
     """Apply a hints document to an IR dir; writes the rewritten IR (weights
     and io symlinked) when anything applied. -> (IR dir to use, specs, prov)."""
     from .kb_proposals import _all_specs, write_variant_ir
 
     specs = dict(specs or _all_specs())
     g = json.loads((Path(ir_dir) / "graph.json").read_text())
-    g2, added, prov = apply_hints(g, hints_doc["hints"], specs, statuses=statuses)
+    g2, added, prov = apply_hints(g, hints_doc["hints"], specs, statuses=statuses, target=target)
     specs.update(added)
     if not prov["applied"]:
         return Path(ir_dir), specs, prov
@@ -863,7 +908,7 @@ def main():
     a1.add_argument("hints")
     a1.add_argument("out_ir")
     a1.add_argument("--all", action="store_true", help="apply proposed hints too, not only accepted")
-    a1.add_argument("--target", default="cuda", choices=["cuda", "riscv"])
+    a1.add_argument("--target", default="cuda", choices=["cuda", "opencl", "riscv"])
     a1.add_argument("--verify", action="store_true")
     a1.add_argument("--build", action="store_true")
     a1.add_argument("--arch", default="75")

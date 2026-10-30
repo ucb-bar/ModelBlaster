@@ -1590,9 +1590,27 @@ def _shape_str(op: dict) -> str:
     return ";".join(parts)
 
 
+def refuse_unsupported_quant(ir: dict[str, Any]) -> None:
+    """bf16 IRs are CUDA-only (docs/bf16_cuda.md): the host / Zephyr C codegen
+    has no `__bf16` path (RISC-V GCC has no bfloat16 arithmetic before
+    Zfbfmin), so refuse rather than emit float code for bf16 buffers. So are
+    mixed IRs (--quant native, docs/tensor_dtypes.md)."""
+    if ir.get("quant") == "native":
+        raise SystemExit(
+            f"{ir.get('name', 'IR')}: quant=native (per-tensor dtypes, docs/tensor_dtypes.md) is "
+            "supported on the CUDA path only (gpu_eval walkers, kb_export); the C/RVV codegen "
+            "has one storage dtype per IR. Re-extract with --quant fp32 or fp16 for this target.")
+    if ir.get("quant") == "bf16":
+        raise SystemExit(
+            f"{ir.get('name', 'IR')}: quant=bf16 is supported on the CUDA path only "
+            "(gpu_eval walkers, kb_export); the C/RVV codegen handles fp32, fp16 and "
+            "int8. Re-extract with --quant fp16 or fp32 for this target.")
+
+
 def emit_model(ir: dict[str, Any], out_dir: str,
                platform: str = "zephyr",
                backend: Optional[str] = None) -> None:
+    refuse_unsupported_quant(ir)
     # `backend` reaches the codegen for exactly one reason: the conv weight
     # LAYOUT is a per-backend codegen decision (_backend_pack_weight), and a
     # split conv's tile pointers depend on it. Without it here, the conv2d_s8
@@ -3744,6 +3762,7 @@ def generate(
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
         ir = json.load(f)
+    refuse_unsupported_quant(ir)
     weights = dict(np.load(weights_path))
     model_name = ir["name"]
 

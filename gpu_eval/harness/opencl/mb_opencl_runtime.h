@@ -14,8 +14,8 @@
 //       mb_launch(MB_KERNEL(cl_relu, k_relu), mb_grid(n), input, output, n);
 //   }
 //
-// A program is built on first use (OpenCL C 1.2, plus its own options and the
-// device prelude below). Every enqueue goes through mb_launch / mb_copy /
+// A program is built on first use (OpenCL C 2.0 when the device reports it, else
+// 1.2; $MB_CL_STD overrides; plus its own options and the device prelude below). Every enqueue goes through mb_launch / mb_copy /
 // mb_zero, which record a profiling event per command; the driver turns those
 // into per-op, per-slot and per-kernel times (cl_event START..END, the Adreno
 // flow's methodology). Errors never abort: the first one is kept in
@@ -63,6 +63,16 @@ void mb_atomic_addf(volatile __global float *p, float v) {
 }
 )CL";
 
+// Prepended before mb_cl_prelude when the device has cl_khr_fp16 (half arithmetic, half2/4/8/16 vector
+// operators); a program may still write the pragma itself. A problem exported with MB_OPENCL_F16_MATH=0
+// defines MB_NO_FP16_PRELUDE and MB_CL_STD_DEFAULT "CL1.2" ahead of this file: the legacy storage-only build.
+static const char *mb_cl_fp16_prelude =
+    "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
+    "#define MB_HAS_FP16 1\n";
+#ifndef MB_CL_STD_DEFAULT
+#define MB_CL_STD_DEFAULT "auto"      // OpenCL C 2.0 if CL_DEVICE_OPENCL_C_VERSION says so, else 1.2
+#endif
+
 struct mb_program {
     const char *src;
     const char *opts;            // extra build options, e.g. "-cl-mad-enable -DTILE=16"
@@ -90,6 +100,9 @@ struct mb_runtime {
     std::vector<mb_event> events;
     std::vector<mb_kinfo> kinfo; // every kernel created, with the op that first used it
     std::string build_opts;      // global extra options (env MB_CL_OPTS)
+    std::string cl_std;          // -cl-std value ("" = none): $MB_CL_STD, else MB_CL_STD_DEFAULT (auto: device's OpenCL C)
+    int has_fp16 = 0;            // device lists cl_khr_fp16 (and $MB_CL_FP16 != 0): prelude enables it, MB_HAS_FP16 defined
+    size_t pitch_align = 1, base_align = 1;   // CL_DEVICE_IMAGE_PITCH_ALIGNMENT / BASE_ADDRESS_ALIGNMENT (pixels)
     std::deque<std::string> names;   // kernel names (stable addresses for events)
     std::map<std::pair<cl_kernel, unsigned>, cl_kernel> variants;   // (kernel, NULL-arg mask) -> kernel object
 };
@@ -111,9 +124,10 @@ cl_kernel mb_kernel(mb_program *p, const char *name) {
     if (mb_rt.failed || p->failed) return NULL;
     cl_int e;
     if (!p->prog) {
-        const char *srcs[2] = {mb_cl_prelude, p->src};
-        p->prog = clCreateProgramWithSource(mb_rt.ctx, 2, srcs, NULL, &e);
-        std::string opts = std::string("-cl-std=CL1.2 ") + (p->opts ? p->opts : "") + " " + mb_rt.build_opts;
+        const char *srcs[3] = {mb_rt.has_fp16 ? mb_cl_fp16_prelude : "", mb_cl_prelude, p->src};
+        p->prog = clCreateProgramWithSource(mb_rt.ctx, 3, srcs, NULL, &e);
+        std::string opts = (mb_rt.cl_std.empty() ? std::string() : "-cl-std=" + mb_rt.cl_std + " ") +
+                           (p->opts ? p->opts : "") + " " + mb_rt.build_opts;
         e = clBuildProgram(p->prog, 1, &mb_rt.device, opts.c_str(), NULL, NULL);
         if (e != CL_SUCCESS) {
             size_t n = 0;
@@ -149,6 +163,46 @@ void *mb_scratch(mb_program *p, size_t bytes) {
     return p->scratch;
 }
 #define MB_SCRATCH(prog, bytes) mb_scratch(&(prog), (bytes))
+
+// Image path from a slot: an image2d view of a slot-owned scratch buffer (cl_khr_image2d_from_buffer, OpenCL 2.0).
+// The slot's ABI pointers are SVM, which an image cannot wrap, so an image is the *second* use of data a kernel of
+// the slot wrote into this scratch buffer (a weight re-layout, an input staging copy): pass `.buf` as a
+// `__global T *` kernel argument to write it, `.img` as an `image2d_t` argument to read it (read_imageh /
+// read_imagef; CL_RGBA + CL_HALF_FLOAT = 4 halves per texel = 8 bytes). Rows are padded to the device's pitch
+// alignment: element (x, y) of pixel size `px` bytes lives at byte offset y * pitch_bytes + x * px. Owned by the
+// program (`idx` tells several images of one program apart); a request with other sizes re-creates it.
+// Returns {NULL, NULL, 0, ...} on failure (the error is recorded).
+struct mb_image { cl_mem buf; cl_mem img; size_t pitch_bytes; size_t w, h; cl_channel_order order; cl_channel_type type; };
+static std::map<std::pair<mb_program *, int>, mb_image> mb_images;
+static size_t mb_pixel_bytes(cl_channel_order o, cl_channel_type t) {
+    size_t ch = (o == CL_RGBA || o == CL_BGRA || o == CL_ARGB) ? 4 : (o == CL_RG || o == CL_RA) ? 2 : 1;
+    size_t cb = (t == CL_FLOAT || t == CL_SIGNED_INT32 || t == CL_UNSIGNED_INT32) ? 4 :
+                (t == CL_HALF_FLOAT || t == CL_SIGNED_INT16 || t == CL_UNSIGNED_INT16 || t == CL_UNORM_INT16 ||
+                 t == CL_SNORM_INT16) ? 2 : 1;
+    return ch * cb;
+}
+mb_image mb_scratch_image(mb_program *p, int idx, size_t w, size_t h, cl_channel_order order, cl_channel_type type) {
+    mb_image none = {NULL, NULL, 0, 0, 0, order, type};
+    if (mb_rt.failed) return none;
+    mb_image &im = mb_images[std::make_pair(p, idx)];
+    if (im.img && im.w == w && im.h == h && im.order == order && im.type == type) return im;
+    if (im.img) { clFinish(mb_rt.queue); clReleaseMemObject(im.img); clReleaseMemObject(im.buf); im = none; }
+    size_t px = mb_pixel_bytes(order, type);
+    size_t pitch_px = (w + mb_rt.pitch_align - 1) / mb_rt.pitch_align * mb_rt.pitch_align;
+    size_t pitch = pitch_px * px;
+    cl_int e;
+    cl_mem buf = clCreateBuffer(mb_rt.ctx, CL_MEM_READ_WRITE, pitch * h, NULL, &e);
+    if (e != CL_SUCCESS) { mb_error("mb_scratch_image: buffer %zu bytes: error %d", pitch * h, e); return none; }
+    cl_image_format fmt = {order, type};
+    cl_image_desc d;
+    memset(&d, 0, sizeof d);
+    d.image_type = CL_MEM_OBJECT_IMAGE2D; d.image_width = w; d.image_height = h; d.image_row_pitch = pitch; d.buffer = buf;
+    cl_mem img = clCreateImage(mb_rt.ctx, CL_MEM_READ_WRITE, &fmt, &d, NULL, &e);
+    if (e != CL_SUCCESS) { clReleaseMemObject(buf); mb_error("mb_scratch_image: clCreateImage %zux%zu: error %d", w, h, e); return none; }
+    im = {buf, img, pitch, w, h, order, type};
+    return im;
+}
+#define MB_SCRATCH_IMAGE(prog, idx, w, h, order, type) mb_scratch_image(&(prog), (idx), (w), (h), (order), (type))
 
 // ---- NDRange
 struct mb_range { cl_uint dims; size_t g[3]; size_t l[3]; };
@@ -283,6 +337,33 @@ int mb_cl_init() {
     cl_queue_properties qp[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
     mb_rt.queue = clCreateCommandQueueWithProperties(mb_rt.ctx, mb_rt.device, qp, &e);
     if (e != CL_SUCCESS) { mb_error("clCreateCommandQueueWithProperties: %d", e); return 1; }
+    {   // OpenCL C level and fp16 capability of the device
+        char buf[4096] = {0};
+        clGetDeviceInfo(mb_rt.device, CL_DEVICE_EXTENSIONS, sizeof buf - 1, buf, NULL);
+        const char *f16e = getenv("MB_CL_FP16");
+#ifdef MB_NO_FP16_PRELUDE
+        int want16 = f16e ? atoi(f16e) : 0;       // legacy build: only on request
+#else
+        int want16 = f16e ? atoi(f16e) : 1;
+#endif
+        mb_rt.has_fp16 = strstr(buf, "cl_khr_fp16") != NULL && want16;
+        const char *se = getenv("MB_CL_STD");
+        std::string std_ = se ? se : MB_CL_STD_DEFAULT;
+        if (std_ == "auto") {
+            char ver[256] = {0};
+            clGetDeviceInfo(mb_rt.device, CL_DEVICE_OPENCL_C_VERSION, sizeof ver - 1, ver, NULL);
+            int ma = 0, mi = 0;
+            const char *q = strstr(ver, "OpenCL C ");
+            if (q) sscanf(q + 9, "%d.%d", &ma, &mi);
+            std_ = (ma >= 2) ? "CL2.0" : "CL1.2";
+        }
+        mb_rt.cl_std = std_;
+        cl_uint pa = 1, ba = 1;
+        clGetDeviceInfo(mb_rt.device, CL_DEVICE_IMAGE_PITCH_ALIGNMENT, sizeof pa, &pa, NULL);
+        clGetDeviceInfo(mb_rt.device, CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT, sizeof ba, &ba, NULL);
+        mb_rt.pitch_align = pa ? pa : 1;
+        mb_rt.base_align = ba ? ba : 1;
+    }
     cl_device_svm_capabilities svm = 0;
     clGetDeviceInfo(mb_rt.device, CL_DEVICE_SVM_CAPABILITIES, sizeof svm, &svm, NULL);
     if (!(svm & CL_DEVICE_SVM_COARSE_GRAIN_BUFFER)) { mb_error("device has no coarse-grain SVM"); return 1; }

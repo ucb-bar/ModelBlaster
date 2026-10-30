@@ -240,8 +240,8 @@ def tolerance(problem: Path | None, graph: dict) -> dict:
         tol = json.loads((Path(problem) / "manifest.json").read_text()).get("tolerance") or {}
     if not tol:                                   # no problem: the exporter's fp32 default
         from .kb_export import DTYPE_TOL
-        from .cuda_dtypes import FP16, FP32
-        tol = DTYPE_TOL[FP16 if graph.get("quant") == "fp16" else FP32]
+        from .cuda_dtypes import ir_dtype
+        tol = DTYPE_TOL[ir_dtype(graph)]
     return {"out_rel": float(tol.get("output_rel", 1e-3)), "out_abs": float(tol.get("output_abs", 1e-5))}
 
 
@@ -312,14 +312,16 @@ def build_bundle(ir_dir, out, *, source=None, tol: dict, sizings=None, cpu_check
                 call.append({"v": t})
             else:
                 raise Skip(f"{src.name}: a forward argument of type {type(t).__name__} is not supported")
-        # fp16 IRs (extract_graph --quant fp16, docs/fp16_cuda.md): torch runs the module in half
-        # (module.half(), float inputs half) -- fp16 storage like ours, torch's own fp16 math
-        half = g.get("quant") == "fp16"
-        dtypes = ["float16" if half and t.is_floating_point() else str(t.dtype).replace("torch.", "")
+        # fp16 / bf16 IRs (extract_graph --quant fp16 / bf16, docs/fp16_cuda.md, bf16_cuda.md):
+        # torch runs the module in half / bfloat16 (float inputs too) -- the same storage as
+        # ours, torch's own reduced-precision math
+        tdt = torch_dtype_name(g)
+        half = tdt != "float32"
+        dtypes = [tdt if half and t.is_floating_point() else str(t.dtype).replace("torch.", "")
                   for t in tens]
         rec = {"format": FORMAT + ":bundle", "key": key, "source": "model.py", "source_path": str(src),
                "ir": str(ir_dir), "ir_name": g.get("name"), "sizing": list(sz), "attrs": attrs,
-               "dtype": "float16" if half else "float32",
+               "dtype": tdt,
                "inputs": [{"shape": list(t.shape), "dtype": d} for t, d in zip(tens, dtypes)], "call": call,
                "outputs": spec_out, "tolerance": tol, "state": "state.npz", "io": "io.npz", "mapping": rep,
                "tried": tried}
@@ -327,9 +329,9 @@ def build_bundle(ir_dir, out, *, source=None, tol: dict, sizings=None, cpu_check
             off, args = 0, []
             for t, d in zip(tens, dtypes):
                 n = t.numel()
-                # the CPU check runs in fp32 on the (fp16-rounded) IR data: the golden's own recipe
+                # the CPU check runs in fp32 on the (fp16 / bf16-rounded) IR data: the golden's own recipe
                 args.append(torch.from_numpy(flat_in[off:off + n].reshape(tuple(t.shape)).copy())
-                            .to(torch.float32 if d == "float16" else getattr(torch, d)))
+                            .to(torch.float32 if d in REDUCED_MODE else getattr(torch, d)))
                 off += n
             argv = [args[c["t"]] if "t" in c else c["v"] for c in call]
             with torch.inference_mode():
@@ -610,12 +612,23 @@ def run_rounds(ours, servers: dict, *, rounds: int, uuid: str, params: dict, tim
     return res
 
 
+# torch dtype of a reduced-precision IR -> its headline mode
+REDUCED_MODE = {"float16": "fp16", "bfloat16": "bf16"}
+
+
+def torch_dtype_name(graph: dict) -> str:
+    """The torch dtype the baseline runs an IR's module in: ``float16`` / ``bfloat16`` for an
+    fp16 / bf16 IR, else ``float32``."""
+    return {"fp16": "float16", "bf16": "bfloat16"}.get(graph.get("quant"), "float32")
+
+
 def headline_mode(math: dict, dtype: str = "float32") -> str:
-    """Which torch math mode the headline compares with: ``fp16`` for an fp16 IR (torch in
-    half, its default tensor-core math; TF32 does not apply), ``tf32_off`` when ours is plain
-    fp32 (the same arithmetic), else ``best`` (the faster of TF32 off / on per variant)."""
-    if dtype == "float16":
-        return "fp16"
+    """Which torch math mode the headline compares with: ``fp16`` / ``bf16`` for an fp16 / bf16
+    IR (torch in half / bfloat16, its default tensor-core math; TF32 does not apply),
+    ``tf32_off`` when ours is plain fp32 (the same arithmetic), else ``best`` (the faster of
+    TF32 off / on per variant)."""
+    if dtype in REDUCED_MODE:
+        return REDUCED_MODE[dtype]
     return "tf32_off" if (math or {}).get("mode") == "fp32" else "best"
 
 
@@ -639,8 +652,9 @@ def build_rows(raw: dict, ready: dict, math: dict, dtype: str = "float32") -> tu
         for v in VARIANTS:
             if v not in info:
                 continue
-            row = {"side": "torch", "variant": v, "label": LABELS[v] + (" fp16" if dtype == "float16" else ""),
-                   "tf32": None if dtype == "float16" else bool(m),
+            row = {"side": "torch", "variant": v,
+                   "label": LABELS[v] + (f" {REDUCED_MODE[dtype]}" if dtype in REDUCED_MODE else ""),
+                   "tf32": None if dtype in REDUCED_MODE else bool(m),
                    "check": bool(info[v].get("ok")), "error": info[v].get("error"),
                    "check_detail": info[v].get("check"), "setup_s": info[v].get("setup_s")}
             if info[v].get("ok") and blocks and all(v in blk for blk in blocks):
@@ -651,7 +665,7 @@ def build_rows(raw: dict, ready: dict, math: dict, dtype: str = "float32") -> tu
             rows.append(row)
     hm = headline_mode(math, dtype)
     cands = [r for r in rows if r["side"] == "torch" and r.get("gpu_us") and
-             (hm in ("best", "fp16") or r["tf32"] is False)]
+             (hm in ("best", "fp16", "bf16") or r["tf32"] is False)]
 
     def pick(key):
         ok = [r for r in cands if r.get(key)]
@@ -698,9 +712,9 @@ def compare(*, ir_dir: Path, problem: Path, device: dict, work: Path, kbeval=Non
     host = (device or {}).get("host")
     g = json.loads((Path(ir_dir) / "graph.json").read_text())
     tol = tolerance(problem, g)
-    dtype = "float16" if g.get("quant") == "fp16" else "float32"
-    if modes is None:                              # TF32 only changes fp32 math: one mode for fp16
-        modes = (0,) if dtype == "float16" else (0, 1)
+    dtype = torch_dtype_name(g)
+    if modes is None:                              # TF32 only changes fp32 math: one mode for fp16 / bf16
+        modes = (0,) if dtype in REDUCED_MODE else (0, 1)
     man = json.loads((Path(problem) / "manifest.json").read_text())
     texts = {s["id"]: (Path(problem) / s["file"]).read_text() for s in man["slots"]}
     math = detect_math(texts)
@@ -747,6 +761,7 @@ def compare(*, ir_dir: Path, problem: Path, device: dict, work: Path, kbeval=Non
             "flags": {("tf32_on" if m else "tf32_off"): r.get("flags") for m, r in ready.items()},
             "math": {**math, "headline_mode": head["mode"],
                      "note": "fp16 IR: torch in half (its default tensor-core math)" if head["mode"] == "fp16" else
+                     "bf16 IR: torch in bfloat16 (its default tensor-core math)" if head["mode"] == "bf16" else
                      "ours is plain fp32: headline vs torch with TF32 off" if head["mode"] == "tf32_off" else
                      f"ours uses {math['mode']}: headline vs the faster of torch TF32 off / on"},
             "rows": rows, "headline": head,
