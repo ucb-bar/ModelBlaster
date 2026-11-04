@@ -30,7 +30,7 @@ runner_common parses them exactly as it does for spike and FireSim.
 Building the simulator is deliberately NOT this module's job -- it is a Chipyard
 make flow with its own toolchain environment. Pass the built binary with --sim:
 
-    make -C backends/chipyard/sims/verilator CONFIG=<cfg> \
+    make -C $CHIPYARD/sims/verilator CONFIG=<cfg> \
          CONFIG_PACKAGE=chipyard MODEL=TestHarness \
          MODEL_PACKAGE=chipyard.harness GENERATOR_PACKAGE=chipyard TOP=ChipTop
 
@@ -74,18 +74,21 @@ def find_sim(explicit: Optional[str] = None,
              config: Optional[str] = None) -> str:
     """Locate a built Chipyard Verilator simulator.
 
-    --sim wins. Otherwise glob `search_dir` (default: the chipyard verilator sim
-    directory) and, if `config` is given, require it in the filename so a tree
-    holding several built simulators cannot silently pick the wrong one.
+    --sim wins. Otherwise glob `search_dir` (default: $CHIPYARD/sims/verilator)
+    and, if `config` is given, require it in the filename so a tree holding
+    several built simulators cannot silently pick the wrong one.
     """
     if explicit:
         if not os.path.exists(explicit):
             raise FileNotFoundError(f"--sim {explicit} not found")
         return explicit
     if search_dir is None:
-        here = os.path.dirname(os.path.abspath(__file__))
-        repo = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-        search_dir = os.path.join(repo, "backends", "chipyard", "sims", "verilator")
+        chipyard = os.environ.get("CHIPYARD")
+        if not chipyard:
+            raise FileNotFoundError(
+                "no Verilator simulator given: pass --sim or --sim-dir, or set "
+                "CHIPYARD to the Chipyard checkout that built it")
+        search_dir = os.path.join(chipyard, "sims", "verilator")
     found = sorted(
         p for p in glob.glob(os.path.join(search_dir, _SIM_GLOB))
         if os.path.isfile(p) and os.access(p, os.X_OK) and not p.endswith(".log")
