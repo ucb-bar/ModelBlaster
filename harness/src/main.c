@@ -155,7 +155,7 @@ int main(void)
      * (rocket-chip tile/Core.scala hasV), so an integer-only Saturn
      * (intOnlyParams: zve64x) has misa.V = 0, while mstatus.VS is still
      * writable (CSR.scala formVS keys on usingVector). Result, measured on
-     * RocketArty200TDroneGemminiSaturnIntAt35Config: the first vsetvli in a
+     * an FPGA Rocket + integer-only Saturn shell: the first vsetvli in a
      * kernel traps illegal-instruction with VS = Off. There is no Kconfig for
      * Zve-without-V here (arch/riscv/Kconfig.isa has only RISCV_ISA_EXT_V).
      *

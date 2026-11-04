@@ -114,7 +114,7 @@ def _west_build(
         extra = [a for a in _env_extra.split(";") if a.strip()]
     cmd += extra
     env = os.environ.copy()
-    # riskybird: default the Zephyr SDK toolchain variant when the caller has not
+    # Default the Zephyr SDK toolchain variant when the caller has not
     # already chosen one, so the west verify build resolves the CPP (CMake's
     # Zephyr-sdk package registry can otherwise pick a stale/broken SDK).
     # ZEPHYR_SDK_INSTALL_DIR / ZEPHYR_BASE are intentionally NOT hardcoded here --
