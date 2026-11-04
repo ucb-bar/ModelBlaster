@@ -1,0 +1,7 @@
+{
+  "verified": true,
+  "spike": "Chipyard spike --extlib libgemmini 5b1254a + per_config/default16x16 (Q0.31 scale)",
+  "verification_disabled_by": [],
+  "drift_atol": 3,
+  "recipe": "tools/modelblaster/dronet_gray_nhwc.py"
+}

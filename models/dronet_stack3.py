@@ -49,9 +49,7 @@ _HUGE = 1e12            # drop anomalous huge-int filenames (tii uint64 overflow
 # checkpoint was trained/evaluated against; override with
 # MODELBLASTER_DRONET_STACK3_DATA to point at any PULP-DroNet v3 layout
 # (directories each containing labels_partitioned.csv + images/).
-_DEFAULT_DATA = ("/scratch2/dima/misc_sw/XPU-RT/datasets/pulp_dronet_himax/"
-                 "raw/Dataset_PULP_Dronet_v3")
-_DATA_ROOT = os.environ.get("MODELBLASTER_DRONET_STACK3_DATA", _DEFAULT_DATA)
+_DATA_ROOT = os.environ.get("MODELBLASTER_DRONET_STACK3_DATA", "")
 
 # Cache the leakage-free stack lists per partition so repeated calls
 # (get_sample_input + get_calibration_samples) don't rescan the whole dataset.
@@ -119,6 +117,8 @@ def _build(partition: str) -> list:
     """
     if partition in _STACKS_CACHE:
         return _STACKS_CACHE[partition]
+    if not _DATA_ROOT or not os.path.isdir(_DATA_ROOT):
+        raise RuntimeError("set MODELBLASTER_DRONET_STACK3_DATA to a PULP-DroNet v3 dataset directory")
     stacks = []
     csvs = sorted(glob.glob(
         os.path.join(_DATA_ROOT, "**", "labels_partitioned.csv"),
@@ -174,12 +174,14 @@ def get_sample_input(seed: int = 1) -> torch.Tensor:
     """One real stacked TRAIN frame, NCHW [1, 3, 112, 112] in [0, 1].
 
     Real stacked input makes a meaningful io.npz golden even at
-    --num-calibration 1. Falls back to a deterministic torch.randn only if the
-    Himax dataset isn't available (with a warning); with --num-calibration > 1
+    --num-calibration 1. A synthetic fallback requires explicit
+    MODELBLASTER_DRONET_STACK3_ALLOW_SYNTHETIC=1 (with a warning); with --num-calibration > 1
     the golden anchor is get_calibration_samples()[0] anyway."""
     try:
         return _train_tensors(1)[0]
     except Exception as e:  # noqa: BLE001
+        if os.environ.get("MODELBLASTER_DRONET_STACK3_ALLOW_SYNTHETIC") != "1":
+            raise
         print(f"[dronet_stack3.get_sample_input] WARN: couldn't load Himax "
               f"stacks from {_DATA_ROOT} ({e}); falling back to torch.randn. "
               f"Set MODELBLASTER_DRONET_STACK3_DATA to fix.")
