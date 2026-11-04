@@ -284,3 +284,11 @@ zephyr_link_libraries(-Wl,--no-relax)
 message(STATUS "harness_xpurt: backends=${MODEL_BACKENDS} models=${MODEL_NAMES}")
 message(STATUS "harness_xpurt: xpurt_main=${XPURT_MAIN_C}")
 message(STATUS "harness_xpurt: dispatch_table=${XPURT_SCHEDULE_C}")
+
+# --- co-residency crash-test: extra FC preemptor sources (added out-of-band) ---
+if(DEFINED XPURT_FC_SOURCES)
+  target_sources(app PRIVATE ${XPURT_FC_SOURCES})
+endif()
+if(DEFINED XPURT_FC_INCLUDE)
+  target_include_directories(app PRIVATE ${XPURT_FC_INCLUDE})
+endif()
