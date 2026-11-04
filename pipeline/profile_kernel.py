@@ -67,6 +67,7 @@ def _west_build(
     backend: Backend,
     pristine: bool,
     repo_root: str,
+    extra_cmake_args: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     cmd = ["west", "build", "-b", "spike_riscv64", harness_dir,
            "--build-dir", build_dir]
@@ -96,6 +97,22 @@ def _west_build(
         if abi is not None:
             hard = abi.endswith(("f", "d", "q"))
             cmd.append(f"-DCONFIG_FPU={'y' if hard else 'n'}")
+    # Extra cmake args, from the caller or from
+    # MODELBLASTER_EXTRA_CMAKE_ARGS (';'-separated) so a wrapper script can
+    # set them without threading a parameter through every verify call site.
+    #
+    # The one that matters: a ram0 devicetree overlay. This harness links the
+    # WHOLE model dir, so a model whose buffers exceed the stock 256 MB ram0
+    # fails to LINK -- and that failure surfaces as the kernel under test
+    # failing verify, so every curated kernel silently falls back to
+    # reference_impl and the run measures scalar code under a vector
+    # backend's name. Octo fp16 overflowed by 244 MB and lost all 12 of its
+    # curated picks that way.
+    extra = list(extra_cmake_args)
+    if not extra:
+        _env_extra = os.environ.get("MODELBLASTER_EXTRA_CMAKE_ARGS", "")
+        extra = [a for a in _env_extra.split(";") if a.strip()]
+    cmd += extra
     env = os.environ.copy()
     # riskybird: default the Zephyr SDK toolchain variant when the caller has not
     # already chosen one, so the west verify build resolves the CPP (CMake's
@@ -216,6 +233,7 @@ def build_and_run(
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
     model_name: Optional[str] = None,
+    extra_cmake_args: tuple[str, ...] = (),
 ) -> HarnessResult:
     """Build the harness with `impls` substituted in, run spike, parse profile
     and (optionally) compare model output to a PyTorch golden.
@@ -244,6 +262,7 @@ def build_and_run(
     ok, err = _west_build(
         harness_dir=harness_dir, build_dir=build_dir, model_dir=model_dir,
         backend=backend, pristine=pristine, repo_root=repo_root,
+        extra_cmake_args=extra_cmake_args,
     )
     if not ok:
         raise ProfileError(err)

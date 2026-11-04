@@ -35,7 +35,11 @@ from dataclasses import dataclass
 
 
 _BEGIN = "=== MODELBLASTER_ROS_TRACE_BEGIN ==="
-_END = "=== MODELBLASTER_ROS_TRACE_END ==="
+# PREFIX only. The emitter (harness_microros/src/main.c) writes
+#   === MODELBLASTER_ROS_TRACE_END (skipped=%d corrupted) ===
+# so the full "... ===" string is never present and matching it made
+# _extract_block reject every real uartlog.
+_END = "=== MODELBLASTER_ROS_TRACE_END"
 
 
 @dataclass
@@ -64,14 +68,33 @@ def _read_text(path: str) -> str:
 
 
 def _extract_block(text: str) -> str:
-    if _BEGIN not in text or _END not in text:
+    if _BEGIN not in text:
         raise SystemExit(
             "MODELBLASTER_ROS_TRACE markers not found — was the binary built "
             "from harness_microros and was the full uartlog captured?"
         )
     start = text.index(_BEGIN) + len(_BEGIN)
-    end = text.index(_END, start)
-    return text[start:end].strip()
+    if _END in text[start:]:
+        end = text.index(_END, start)
+        return text[start:end].strip()
+    # No END marker: the run was cut short (FireSim timeout mid-dump). Take
+    # every well-formed CSV row up to the truncation instead of refusing the
+    # log outright — ROS_FLOW.md §6.2 records hand-appending a synthetic END
+    # marker as a recurring manual step, which this removes.
+    rows = []
+    for line in text[start:].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("==="):
+            break
+        if line.count(",") != 9:
+            break
+        rows.append(line)
+    sys.stderr.write(
+        f"warning: no ROS_TRACE_END marker — treating {len(rows) - 1} rows "
+        "before the truncation as the trace\n")
+    return "\n".join(rows)
 
 
 def _load_graph_op_map(graph_path: str) -> dict[int, tuple[str, str]]:

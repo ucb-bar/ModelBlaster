@@ -27,6 +27,10 @@
 #                  Set 0 to re-use existing artifacts (faster iteration).
 #   MICROROS_BROKER_HART  hart for the broker (default: highest CPU).
 #   RUNNER         {spike,firesim} default spike.
+#   STOP_AFTER     {build,""} default "". "build" stops after west build
+#                  and prints the ELF path, so an external submitter (e.g.
+#                  the F2 fq queue) can run it instead of the local U250
+#                  firesim_runner. Mirrors xpurt_demo/run.sh's STOP_AFTER.
 #
 # Pre-reqs (from repo root):
 #   source scripts/activate_conda.sh && conda activate zephyr
@@ -47,6 +51,7 @@ QUANTS="${QUANTS:-}"
 MODELBLASTER_POOL_THREADS="${MODELBLASTER_POOL_THREADS:-1}"
 FORCE_REGEN="${FORCE_REGEN:-1}"
 RUNNER="${RUNNER:-spike}"
+STOP_AFTER="${STOP_AFTER:-}"
 
 case "${RUNNER}" in
     spike)
@@ -143,6 +148,15 @@ MODEL_DIRS_BASE="${MODEL_DIRS_BASE#;}"
 PIN_BACKENDS_LIST="$(IFS=';'; echo "${PIN_BS_LIST[*]}")"
 PIN_HARTS_LIST="$(IFS=';'; echo "${PIN_HART_LIST[*]}")"
 PERIODS_LIST="$(IFS=';'; echo "${PERIOD_LIST[*]}")"
+# Integer milliseconds cannot express wl_sweep's tight_loop (0.048 ms) or
+# bimodal (0.032 ms): they truncate to 0, which main.c reads as ONE-SHOT, so the
+# harness silently runs a different workload than the one it was asked for.
+# Convert to integer MICROSECONDS here -- bash has no float arithmetic, and
+# CMake's math() is integer-only, so do it in python where it is exact.
+PERIODS_US_LIST="$(python3 -c "
+import sys
+print(';'.join(str(int(round(float(v)*1000))) for v in sys.argv[1].split(';')))
+" "${PERIODS_LIST}")"
 
 WEST_CMAKE_ARGS=(
     "-DMODEL_BACKENDS=${BACKENDS}"
@@ -151,6 +165,7 @@ WEST_CMAKE_ARGS=(
     "-DMODEL_PIN_BACKENDS=${PIN_BACKENDS_LIST}"
     "-DMODEL_PIN_HARTS=${PIN_HARTS_LIST}"
     "-DMODEL_PERIODS_MS=${PERIODS_LIST}"
+    "-DMODEL_PERIODS_US=${PERIODS_US_LIST}"
     "-DMODELBLASTER_POOL_THREADS=${MODELBLASTER_POOL_THREADS}"
 )
 if [[ -n "${MICROROS_BROKER_HART:-}" ]]; then
@@ -209,6 +224,10 @@ west build -p -b "${BOARD_TARGET}" harness_microros \
     -- "${WEST_CMAKE_ARGS[@]}" "${WEST_BUILD_EXTRA[@]}"
 
 # 6) Run.
+if [[ "${STOP_AFTER}" == "build" ]]; then
+    echo "[microros_demo] STOP_AFTER=build — elf=${BUILD_DIR}/zephyr/zephyr.elf"
+    exit 0
+fi
 echo "[microros_demo] ${RUNNER} run"
 if [[ "${RUNNER}" == "spike" ]]; then
     SPIKE_BIN="${SPIKE_BIN:-}"
