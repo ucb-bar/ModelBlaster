@@ -60,7 +60,21 @@ def get_model(seed: int = 0):
         small=True,
     )
     if _SCALED:
-        # Rescaled geometry cannot match the trained checkpoint's shapes.
+        # riskybird: a geometry-MATCHED checkpoint (e.g. grayscale-trained best.pt
+        # with conv0 [32,1,3,3] for channels=1) can be loaded via
+        # MODELBLASTER_DRONET_CKPT so the quantized model reflects TRAINED weights
+        # rather than random init. Falls back to random if no ckpt / mismatch.
+        _ck = os.environ.get("MODELBLASTER_DRONET_CKPT")
+        if _ck and os.path.exists(_ck):
+            _sd = torch.load(_ck, map_location="cpu", weights_only=False)
+            if isinstance(_sd, dict) and "model_state_dict" in _sd:
+                _sd = _sd["model_state_dict"]
+            _miss, _unexp = m.load_state_dict(_sd, strict=False)
+            if _unexp:
+                raise RuntimeError(f"unexpected keys in grayscale ckpt: {_unexp[:8]}")
+            _bad = [k for k in _miss if not k.startswith("linear2.")]
+            if _bad:
+                raise RuntimeError(f"grayscale ckpt missing (non-collision) weights: {_bad[:8]}")
         m.eval()
         return m
     ckpt_path = os.environ.get("MODELBLASTER_DRONET_CKPT", _DEFAULT_CKPT)
