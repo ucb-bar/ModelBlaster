@@ -1,0 +1,13 @@
+{
+  "pcb_commit": "f2ef0775cd7f9e3b502e52b2644797742ad05169",
+  "recovered_original_sha256": {
+    "scripts/dronet_temporal/eval_stack_sweep.py": "89a7ab7db3f54df1ae129fafc0c07290af829f34388b6e3fc492e8734feaf82e",
+    "scripts/dronet_temporal/fp16_char.py": "f7d9b5f45d990188158eda849a3ca712a0db781011b3a4745e8f326ba2d837f5",
+    "scripts/dronet_temporal/hybrid_sim.py": "d0667c2bc4c7dd3274cda3d4c71a3b96089858efc49166033a6c8a986eda5dd3",
+    "scripts/dronet_temporal/stack3_build.sh": "84c384739c5a8a13c057c291445d1f8d8b7faeed1b94eb476d9c51e121c736f9",
+    "scripts/dronet_temporal/train_himax.py": "a90b5a92a343cf7e458d57aea2016f2f95ec01a9275e4577fac641c1ee61c447",
+    "scripts/dronet_temporal/train_stack.py": "bdbfc2379cc3e7d94986472410fd9d36884a90f9d76bd0e1f10494cd3756a308",
+    "scripts/dronet_temporal/verify_ordering.py": "1bca6a195ed287969c97dd27be4127ee8d4fcd55d09fd2ddbce5e15b308b2857",
+    "/scratch2/dima/misc_sw/dronet_int8_eval/int8_sim.py": "13d6fd7f51360097eb56271e6b34081e5f3092258a2f610ff34f6f9e46c3ceea"
+  }
+}

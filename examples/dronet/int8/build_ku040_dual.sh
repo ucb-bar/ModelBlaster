@@ -11,16 +11,15 @@
 # All machine-specific paths are variables below; override via the environment.
 # IMPORTANT env gotcha: do NOT `source set_envvars_sdk.sh` under `set -e`/pipefail
 # (its find|head SIGPIPEs and aborts the script). Set the ZEPHYR_* vars explicitly.
-set -u
+set -euo pipefail
 : "${MB:=$(cd "$(dirname "$0")/../../.." && pwd)}"          # modelblaster repo root
-: "${ZCS:=/scratch2/dima/misc_sw/XPU-RT/zephyr-chipyard-sw}" # zephyr-chipyard-sw workspace
-: "${ZEPHYR_SDK:=$ZCS/tools-manual/zephyr-sdk-1.0.0-beta1}"
-: "${CONDA_SH:=/scratch2/dima/miniforge3/etc/profile.d/conda.sh}"
-: "${CONDA_ENV:=zephyr}"                                      # env with torch+west+numpy
-: "${GEMMINI_SPIKE:=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-: "${GEMMINI_LIB:=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so}"
-: "${CONSOLE_OVERLAY:=/scratch2/dima/misc_sw/ku040_dronedual_console.overlay}" # uart0/50MHz/1GiB DTS
-: "${CONSOLE_CONF:=/scratch2/dima/misc_sw/ku040_dronedual_console.conf}"        # uart0 Kconfig
+: "${ZCS:=$(dirname "$MB")}"
+: "${ZEPHYR_SDK:=${ZEPHYR_SDK_INSTALL_DIR:?activate the Zephyr SDK environment first}}"
+: "${CONSOLE_OVERLAY:?set CONSOLE_OVERLAY to the KU040 dual console devicetree overlay}"
+: "${CONSOLE_CONF:?set CONSOLE_CONF to the KU040 dual console Kconfig fragment}"
+for file in "$CONSOLE_OVERLAY" "$CONSOLE_CONF"; do
+  test -f "$file" || { echo "missing required file: $file" >&2; exit 2; }
+done
 : "${GEMMINI_CONFIG:=q31ws_32x32_acc}"                       # per_config header dir (DIM=32)
 : "${REGEN_MODEL:=1}"     # 1 = re-extract + regen both backends; 0 = reuse existing generated/
 : "${REGEN_SCHED:=0}"     # 1 = regenerate schedule/main; 0 = use committed ku040_dual/ artifacts
@@ -31,18 +30,20 @@ DUAL=$MB/examples/dronet/int8/ku040_dual   # committed schedule + dispatch table
 SO=$MB/examples/xpurt_demo/int8/generated  # scratch for regenerated schedule (gitignored)
 
 # ---- environment (explicit; portable) ---------------------------------------
-source "$CONDA_SH"; conda activate "$CONDA_ENV"
+command -v python >/dev/null
+command -v west >/dev/null
+TASK_TMP=$(mktemp -d)
+trap 'rm -rf "$TASK_TMP"' EXIT
+ln -s "$MB" "$TASK_TMP/modelblaster"
 export ZEPHYR_BASE="$ZCS/zephyr_ws/zephyr"
 export ZEPHYR_SDK_INSTALL_DIR="$ZEPHYR_SDK"
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
 export PATH="/usr/bin:$ZEPHYR_SDK/gnu/riscv64-zephyr-elf/bin:$PATH"  # keep stale Vitis cmake off PATH
-export PYTHONPATH="$(dirname "$MB")"
+export PYTHONPATH="$TASK_TMP"
 export MODELBLASTER_GEMMINI_CONFIG="$GEMMINI_CONFIG"
 export MODELBLASTER_CURATED_VERIFY=0          # grayscale golden is random-init; select by pick, not verify
 export MODELBLASTER_DRONET_CHANNELS=1         # grayscale conv0 (IC=1)
 export MB_ENABLE_FUSION=1                     # fuse conv0 -> maxpool1
-export MODELBLASTER_GEMMINI_SPIKE="$GEMMINI_SPIKE"
-export MODELBLASTER_GEMMINI_LIB="$GEMMINI_LIB"
 cd "$MB"
 
 # ---- 1/2. regen grayscale+fused NCHW model for BOTH backends ------------------
@@ -92,7 +93,7 @@ PY
 fi
 
 # ---- 4. west build (two-backend, soft-float, eager-V + V_KERNEL_ONLY) ---------
-SOFTFLOAT_CONF=$(mktemp)
+SOFTFLOAT_CONF="$TASK_TMP/softfloat.conf"
 cat > "$SOFTFLOAT_CONF" <<CONF
 CONFIG_FPU=n
 CONFIG_RISCV_ISA_EXT_V=y

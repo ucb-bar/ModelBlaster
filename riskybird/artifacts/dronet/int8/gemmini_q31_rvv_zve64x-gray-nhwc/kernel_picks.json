@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "target": "gemmini_q31_rvv_zve64x",
+  "picks": {
+    "add_s8": {
+      "source": "curated[gemmini_q31_rvv]",
+      "algorithm": "direct",
+      "path": "kernels/gemmini_q31_rvv/gemmini_q31_rvv_add_s8_direct.c"
+    },
+    "batchnorm2d_s8": {
+      "source": "curated[gemmini_q31_rvv]",
+      "algorithm": "direct",
+      "path": "kernels/gemmini_q31_rvv/gemmini_q31_rvv_batchnorm2d_s8_direct.c"
+    },
+    "conv2d_pool_s8": {
+      "source": "curated[gemmini_q31_rvv]",
+      "algorithm": "gemmini_tiled_conv_pool_nhwc",
+      "path": "kernels/gemmini_q31_rvv/gemmini_q31_rvv_conv2d_pool_s8_gemmini_tiled_conv_pool_nhwc.c"
+    },
+    "conv2d_s8": {
+      "source": "curated[gemmini_q31_rvv]",
+      "algorithm": "gemmini_tiled_conv_nhwc",
+      "path": "kernels/gemmini_q31_rvv/gemmini_q31_rvv_conv2d_s8_gemmini_tiled_conv_nhwc.c"
+    },
+    "linear_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    },
+    "nchw_to_nhwc_s8": {
+      "source": "curated[gemmini_q31_rvv]",
+      "algorithm": "rvv_seg",
+      "path": "kernels/gemmini_q31_rvv/gemmini_q31_rvv_nchw_to_nhwc_s8_rvv_seg.c"
+    },
+    "nhwc_to_nchw_s8": {
+      "source": "curated[gemmini_q31_rvv]",
+      "algorithm": "rvv_seg",
+      "path": "kernels/gemmini_q31_rvv/gemmini_q31_rvv_nhwc_to_nchw_s8_rvv_seg.c"
+    },
+    "relu_s8": {
+      "source": "curated[gemmini_q31_rvv]",
+      "algorithm": "direct",
+      "path": "kernels/gemmini_q31_rvv/gemmini_q31_rvv_relu_s8_direct.c"
+    },
+    "sigmoid_s8": {
+      "source": "reference",
+      "algorithm": null,
+      "path": null
+    }
+  }
+}

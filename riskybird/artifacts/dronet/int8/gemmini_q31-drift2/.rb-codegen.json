@@ -1,0 +1,6 @@
+{
+  "verified": true,
+  "spike": "/scratch2/loren/riskybird-dev/backends/chipyard/.conda-env/riscv-tools/bin/spike",
+  "verification_disabled_by": [],
+  "drift_atol": 2
+}
