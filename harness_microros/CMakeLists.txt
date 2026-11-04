@@ -141,7 +141,15 @@ foreach(_i RANGE ${_last})
         endif()
     endforeach()
     configure_file("${_primary_dir}/model.h"   "${_STAGE_DIR}/${_name}_model.h"   COPYONLY)
-    configure_file("${_primary_dir}/test_io.h" "${_STAGE_DIR}/${_name}_test_io.h" COPYONLY)
+    # test_io.h's own `#include "model.h"` must be rewritten to the staged,
+    # per-model-prefixed name: COPYONLY does not rewrite contents, and the
+    # staging dir is shared by every model, so plain "model.h" resolves to
+    # nothing (fatal error: model.h: No such file or directory) and would
+    # collide between models even if it did. Same rewrite harness_xpurt does.
+    file(READ "${_primary_dir}/test_io.h" _test_io_contents)
+    string(REPLACE "#include \"model.h\"" "#include \"${_name}_model.h\""
+           _test_io_contents "${_test_io_contents}")
+    file(WRITE "${_STAGE_DIR}/${_name}_test_io.h" "${_test_io_contents}")
 
     foreach(_bs IN LISTS MODEL_BACKENDS)
         set(_backend_dir "${_base}/${_bs}")
@@ -160,7 +168,6 @@ foreach(_i RANGE ${_last})
                 python -m modelblaster.pipeline.backend_rename
                     --ir "${_graph_json}"
                     --backend "${_bs}"
-                    --weights-header "${_backend_dir}/weights.h"
                     --separator ";"
             OUTPUT_VARIABLE _rename_flags
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -204,6 +211,10 @@ foreach(_i RANGE ${_last})
     # weights are per-backend and live in the ${_obj_tgt} lib above: the
     # packed layouts differ per backend (gemmini OIHW vs rvv IHWOC), so a
     # single shared copy silently fed one backend the other's layout.
+    # generate_skeleton.py::_weight_name() bakes the backend into every
+    # weight symbol, so no -D rename is needed for them (which is why
+    # backend_rename.py has no --weights-header flag: passing one aborted
+    # every harness_microros configure).
 
     if(NOT EXISTS "${_primary_dir}/buffers.c")
         message(FATAL_ERROR
@@ -240,7 +251,9 @@ list(GET MODEL_PIN_BACKENDS  1 _pb1)
 list(GET MODEL_PIN_HARTS     0 _ph0)
 list(GET MODEL_PIN_HARTS     1 _ph1)
 list(GET MODEL_PERIODS_MS    0 _pm0)
+    list(GET MODEL_PERIODS_US    0 _pu0)
 list(GET MODEL_PERIODS_MS    1 _pm1)
+    list(GET MODEL_PERIODS_US    1 _pu1)
 string(TOUPPER "${_n0}" _N0_UP)
 string(TOUPPER "${_n1}" _N1_UP)
 string(TOUPPER "${_pb0}" _PB0_UP)
@@ -253,19 +266,22 @@ target_compile_definitions(app PRIVATE
     NET_A_BACKEND_UP=${_PB0_UP}
     NET_A_HART=${_ph0}
     NET_A_PERIOD_MS=${_pm0}
+    NET_A_PERIOD_US=${_pu0}
     NET_B_NAME=\"${_n1}\"
     NET_B_NAME_C=${_n1}
     NET_B_NAME_UP=${_N1_UP}
     NET_B_BACKEND=${_pb1}
     NET_B_BACKEND_UP=${_PB1_UP}
     NET_B_HART=${_ph1}
-    NET_B_PERIOD_MS=${_pm1})
+    NET_B_PERIOD_MS=${_pm1}
+    NET_B_PERIOD_US=${_pu1})
 
 if(_n_names GREATER_EQUAL 3)
     list(GET MODEL_NAMES         2 _n2)
     list(GET MODEL_PIN_BACKENDS  2 _pb2)
     list(GET MODEL_PIN_HARTS     2 _ph2)
     list(GET MODEL_PERIODS_MS    2 _pm2)
+    list(GET MODEL_PERIODS_US    2 _pu2)
     string(TOUPPER "${_n2}" _N2_UP)
     string(TOUPPER "${_pb2}" _PB2_UP)
     target_compile_definitions(app PRIVATE
@@ -276,7 +292,8 @@ if(_n_names GREATER_EQUAL 3)
         NET_C_BACKEND=${_pb2}
         NET_C_BACKEND_UP=${_PB2_UP}
         NET_C_HART=${_ph2}
-        NET_C_PERIOD_MS=${_pm2})
+        NET_C_PERIOD_MS=${_pm2}
+        NET_C_PERIOD_US=${_pu2})
 endif()
 
 if(DEFINED MICROROS_BROKER_HART)

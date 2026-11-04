@@ -365,7 +365,7 @@ def _emit(networks: list[str], schedule_name: str,
             f"                .pool = (void *)pool_for_entry(e_),\n"
             f"            }};\n"
             f"            lock_entry_harts(e_);\n"
-            f"            XPURT_DISPATCH_GUARD_ENTER();\n"
+            f"            XPURT_DISPATCH_GUARD_ENTER(e_);\n"
             f"            uint64_t t_disp0 = (uint64_t)k_cycle_get_64();\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].start_cycles = t_disp0 - run_t0;\n"
@@ -760,11 +760,22 @@ def _emit(networks: list[str], schedule_name: str,
 #define XPURT_DISPATCH_IRQ_GUARD 1
 #endif
 #if XPURT_DISPATCH_IRQ_GUARD
-#define XPURT_DISPATCH_GUARD_ENTER() k_sched_lock()
-#define XPURT_DISPATCH_GUARD_EXIT()  k_sched_unlock()
+#if defined(MODELBLASTER_PLATFORM_LINUX)
+#define XPURT_DISPATCH_GUARD_ENTER(e_) do {{ }} while (0)
+#define XPURT_DISPATCH_GUARD_EXIT()    do {{ }} while (0)
 #else
-#define XPURT_DISPATCH_GUARD_ENTER() do {{ }} while (0)
-#define XPURT_DISPATCH_GUARD_EXIT()  do {{ }} while (0)
+#define XPURT_DISPATCH_GUARD_ENTER(e_)                                        \
+    const int _xpurt_mask_irq = ((e_)->n_harts <= 1);                         \
+    unsigned int _xpurt_irq_key = 0;                                          \
+    if (_xpurt_mask_irq) {{ _xpurt_irq_key = arch_irq_lock(); }}              \
+    k_sched_lock()
+#define XPURT_DISPATCH_GUARD_EXIT()                                           \
+    k_sched_unlock();                                                         \
+    if (_xpurt_mask_irq) {{ arch_irq_unlock(_xpurt_irq_key); }}
+#endif
+#else
+#define XPURT_DISPATCH_GUARD_ENTER(e_) do {{ }} while (0)
+#define XPURT_DISPATCH_GUARD_EXIT()    do {{ }} while (0)
 #endif
 
 static struct k_sem completion_sems[{upper}_N_ENTRIES];
