@@ -1,1 +1,1 @@
-per_config/RocketArty200TDroneGemminiSaturnFp16At35Config/gemmini_params.h
+per_config/default16x16/gemmini_params.h
