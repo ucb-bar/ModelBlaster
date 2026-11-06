@@ -586,6 +586,104 @@ GEMMINI_Q31_RVV = Backend(
 # doesn't have V (the GemminiAndOPUShuttleConfig case). Used to test
 # Dima's qrb-image kernel set on the existing OPU FireSim bitstream
 # without rebuilding the bitstream.
+# MBP -- the four-instruction packed-integer extension on hart 0 of the PYNQ-Z1
+# big.LITTLE Rocket SoC.  Spec: fpga/pynq-z2/docs/PEXT_SPEC.md in the iiswc-tutorial
+# repo; contract header: fpga/pynq-z2/sw/pext.h there.  Four R-type ops in custom-0
+# (0x0b), funct7=0: DOT8 (f3=0), MAX8 (f3=1), QMUL (f3=2), CLIP8 (f3=3).
+#
+# NO NEW -march, FOR THE SAME REASON AS ime_x60.  No assembler knows these mnemonics,
+# so pext.h emits every op with GAS's `.insn r` directive.  That assembles under the
+# board's own -march=rv64imac_zicsr_zifencei with no extension string at all, which is
+# also what keeps the exact multilib match the Zephyr SDK selects
+# (rv64imac_zicsr_zifencei/lp64/medany).  So this backend's kernel_cflags carry ONE
+# flag: the switch that turns the header's software model into real encodings.
+#
+# THE HEADER LIVES OUTSIDE THIS TREE.  pext.h belongs to the SoC, not to ModelBlaster,
+# and the app that builds for this target supplies the -I.  Nothing here hardcodes a
+# path into a sibling repo.  For the host-ctypes verify below, put the header's
+# directory on CPATH.
+#
+# verify_method=HOST_CTYPES, and that is not a compromise: pext.h compiles both ways
+# and MB_PEXT_HW defaults to 0 off-target, so the host builds the bit-identical
+# SOFTWARE MODEL of all four instructions and runs it against the reference oracle at
+# x86 speed.  That is the check PEXT_SPEC.md section 4 relies on, and it is stronger
+# than cross_compile_verify (which only proves the file builds).  Contrast rvv_x60,
+# which declares cross_compile because the host cannot compile `vint32m4_t` at all --
+# an inline-asm `.insn` has no such problem, and neither does the C model.
+#
+# HETEROGENEITY.  The unit exists ONLY on hart 0.  A kernel built with MB_PEXT_HW=1
+# takes an illegal-instruction trap on hart 1, so any thread running one must be pinned
+# with k_thread_cpu_pin(tid, 0).  That is the same "must be pinned or it traps" contract
+# cores/chipyard_quad_hetero_gemmini_q31.json already states for RVV and Gemmini; the
+# registry entry for this SoC is chipyard_pynqz1_biglittle_pext.json.
+PEXT = Backend(
+    name="pext",
+    description=(
+        "rv64imac + MBP packed-integer extension (DOT8/MAX8/QMUL/CLIP8 in "
+        "custom-0, emitted as .insn) on hart 0 of the PYNQ-Z1 big.LITTLE "
+        "Rocket. Hart 1 does not implement it; kernels must be pinned."
+    ),
+    kernel_cflags=("-DMB_PEXT_HW=1",),
+    optimization_guide="optimization_guide_scalar.md",
+    verify_method=VERIFY_HOST_CTYPES,
+    # Every curated kernel for this target is bit-exact by construction: the
+    # accelerated path recomputes the reference expression in the same rounding
+    # mode, and every shape it cannot accelerate falls through to the reference
+    # expression verbatim. A drifting kernel here would be a bug, not a trade.
+    atol_override=0.0,
+    rtol_override=0.0,
+)
+
+
+# MBP plus the INTEGER nonlinearities of fpga/pynq-z2/sw/int_nonlin.c.
+#
+# WHY IT IS A SEPARATE BACKEND AND NOT A FLAG ON `pext`.  The pext backend declares
+# atol_override = rtol_override = 0.0, and it means it: every curated kernel for it
+# recomputes the reference expression in the same rounding mode and every shape it
+# cannot accelerate falls through to the reference verbatim.  The integer softmax,
+# layer norm, GELU and matmul requantise CANNOT be bit-exact against a reference
+# written in `expf`, `double` and `roundf`, and they do not claim to be.  Shipping them
+# under `pext` would mean widening that backend's tolerance for every op it has, which
+# would retire the strongest claim in this project.  So they get their own name, its
+# tolerance is the MEASURED worst int8 output difference rather than a round number,
+# and `pext` is unchanged.
+#
+# WHAT THE TOLERANCE IS AND WHERE IT COMES FROM.  Lab B20 (scripts/40_rocket_int_nonlin.sh)
+# measures each replacement on the silicon against the reference expression compiled into
+# the same image, and reports the worst int8 OUTPUT difference, because that is all a
+# downstream layer can see:
+#
+#     softmax_s8    32.9x   2 LSB  (1 LSB for the reference's own p/scale_out encoding)
+#     layernorm_s8  16.6x   1 LSB
+#     gelu_s8      262x     1 LSB, and its ENTIRE 256-value input domain enumerated
+#     matmul_s8 requantise tail   6.6x   1 LSB
+#
+# 2 LSB on a 255-level encoding is 0.8% of full scale, on a quantity the next layer
+# immediately requantises.  `--max-accuracy-class bit_exact` still tightens the
+# convolution and fully-connected kernels back to atol 0 on this backend, because that
+# filter only ever tightens.
+#
+# curated_aliases = ("pext",) so this backend inherits every pext kernel rather than
+# needing a second copy of them -- and, per backend_lineage's own docstring, inherits
+# the conv weight layout decision with them.  Without it every op would silently fall
+# back to the scalar reference and the build would still report success.
+PEXT_NL = Backend(
+    name="pext_nl",
+    description=(
+        "rv64imac + MBP (as `pext`) plus the integer softmax / layer norm / GELU / "
+        "matmul-requantise kernels of fpga/pynq-z2/sw/int_nonlin.c. Same hart-0 "
+        "pinning contract as pext; numeric_drift on the four nonlinear ops, bounded "
+        "and measured at 1-2 int8 LSB."
+    ),
+    kernel_cflags=("-DMB_PEXT_HW=1",),
+    optimization_guide="optimization_guide_scalar.md",
+    verify_method=VERIFY_HOST_CTYPES,
+    curated_aliases=("pext",),
+    atol_override=2.0,
+    rtol_override=0.0,
+)
+
+
 RVV_HETERO = Backend(
     name="rvv_hetero",
     description=(
@@ -602,6 +700,30 @@ RVV_HETERO = Backend(
 )
 
 
+# patches/0102.  The decoupled RoCC engine (iiswc-tutorial ROCC_DECOUPLED.md section 8): a
+# RoCC on hart 1 of bitstream 0x5A5A0010 whose linear_s8 and 1-D conv2d_s8 kernels are the
+# engine, driven from hart 0 through a hart-1 worker (fpga/pynq-z2/sw/roccmoon/mbxr_rt.h).
+# Everything else is pext_nl's, and the engine's kernels fall back to pext's curated MBP
+# kernels for shapes the engine does not take -- so lineage is (roccmoon, pext_nl, pext).
+# The engine kernels are bit_exact: checked against kernel_linear_s8's reference by the RTL
+# testbench (tb_mbxr.cpp), in the SoC's RTL (samples/roccmoon_rtl_sim) and on the board.
+# The tolerance is pext_nl's, for pext_nl's integer nonlinear kernels.
+ROCCMOON = Backend(
+    name="roccmoon",
+    description=(
+        "pext_nl on hart 0 plus the decoupled RoCC engine on hart 1 (bitstream "
+        "0x5A5A0010) for linear_s8 and 1-D conv2d_s8: 64-byte fill with three "
+        "outstanding, planar BRAM scratchpad, 32 MAC/cycle, result drain. Falls back to "
+        "the curated MBP kernels. The engine paths are bit_exact."
+    ),
+    kernel_cflags=("-DMB_PEXT_HW=1",),
+    optimization_guide="optimization_guide_scalar.md",
+    verify_method=VERIFY_HOST_CTYPES,
+    curated_aliases=("pext_nl", "pext"),
+    atol_override=2.0,
+    rtol_override=0.0,
+)
+
 BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
@@ -614,6 +736,9 @@ BACKENDS: dict[str, Backend] = {
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,
     GEMMINI_Q31_RVV.name: GEMMINI_Q31_RVV,
+    PEXT.name: PEXT,
+    PEXT_NL.name: PEXT_NL,
+    ROCCMOON.name: ROCCMOON,
 }
 
 

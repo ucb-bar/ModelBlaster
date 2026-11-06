@@ -408,6 +408,32 @@ def _gen_inputs_gelu_s8(shape: dict, rng: np.random.Generator):
     return inp, out
 
 
+def _gen_inputs_tanh_s8(shape: dict, rng: np.random.Generator):
+    n = shape["n"]
+    inp = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    out = np.zeros((n,), dtype=np.int8)
+    return inp, out
+
+
+def _gen_inputs_groupnorm_s8(shape: dict, rng: np.random.Generator):
+    N, C, H, W = shape["N"], shape["C"], shape["H"], shape["W"]
+    inp = rng.integers(-128, 128, size=(N * C * H * W,), dtype=np.int8)
+    gamma = (rng.standard_normal((C,)) * 0.5 + 1.0).astype(np.float32)
+    beta = (rng.standard_normal((C,)) * 0.2).astype(np.float32)
+    out = np.zeros((N * C * H * W,), dtype=np.int8)
+    return inp, gamma, beta, out
+
+
+def _gen_inputs_rope_s8(shape: dict, rng: np.random.Generator):
+    T, H, D, R = shape["T"], shape["H"], shape["D"], shape["R"]
+    inp = rng.integers(-128, 128, size=(T * H * D,), dtype=np.int8)
+    ang = (np.arange(T)[:, None] * (1.0 / 10000.0 ** (np.arange(0, R, 2) / R))[None, :])
+    cos = np.cos(ang).astype(np.float32).reshape(-1)
+    sin = np.sin(ang).astype(np.float32).reshape(-1)
+    out = np.zeros((T * H * D,), dtype=np.int8)
+    return inp, cos, sin, out
+
+
 def _gen_inputs_pad_s8(shape: dict, rng: np.random.Generator):
     N, C, IH, IW = shape["N"], shape["C"], shape["IH"], shape["IW"]
     pl, pr = shape["pad_left"], shape["pad_right"]
@@ -679,6 +705,24 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         fn(_i8p(inp), _i8p(out), shape["n"],
            ctypes.c_float(0.05), ctypes.c_float(0.05), -128, 127)
         return out
+    if op == "tanh_s8":
+        inp, out = inputs
+        fn(_i8p(inp), _i8p(out), shape["n"],
+           ctypes.c_float(0.02), ctypes.c_float(1.0 / 127), -128, 127)
+        return out
+    if op == "groupnorm_s8":
+        inp, gamma, beta, out = inputs
+        fn(_i8p(inp), _fp(gamma), _fp(beta), _i8p(out),
+           shape["N"], shape["C"], shape["H"], shape["W"],
+           ctypes.c_float(0.05), ctypes.c_float(0.03), ctypes.c_float(1e-5),
+           -128, 127)
+        return out
+    if op == "rope_s8":
+        inp, cos, sin, out = inputs
+        fn(_i8p(inp), _fp(cos), _fp(sin), _i8p(out),
+           shape["T"], shape["H"], shape["D"], shape["R"],
+           ctypes.c_float(0.05), ctypes.c_float(0.06), -128, 127)
+        return out
     if op == "pad_s8":
         inp, out = inputs
         fn(_i8p(inp), _i8p(out),
@@ -756,7 +800,9 @@ _INTEGER_OPS = {"nchw_to_nhwc_s8", "nhwc_to_nchw_s8",
                 "mul_s8", "gelu_s8", "pad_s8",
                 "adaptive_avg_pool2d_s8", "layer_norm_s8",
                 "matmul_s8", "softmax_s8",
-                "depthwise_conv2d_s8", "slice_c_s8"}
+                "depthwise_conv2d_s8", "slice_c_s8",
+                # patches/0100
+                "tanh_s8", "groupnorm_s8", "rope_s8"}
 
 
 @dataclass
@@ -885,6 +931,12 @@ def verify(
                     inputs_ref = _gen_inputs_mul_s8(shape, rng)
                 elif op == "gelu_s8":
                     inputs_ref = _gen_inputs_gelu_s8(shape, rng)
+                elif op == "tanh_s8":
+                    inputs_ref = _gen_inputs_tanh_s8(shape, rng)
+                elif op == "groupnorm_s8":
+                    inputs_ref = _gen_inputs_groupnorm_s8(shape, rng)
+                elif op == "rope_s8":
+                    inputs_ref = _gen_inputs_rope_s8(shape, rng)
                 elif op == "pad_s8":
                     inputs_ref = _gen_inputs_pad_s8(shape, rng)
                 elif op == "adaptive_avg_pool2d_s8":
