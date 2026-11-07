@@ -1911,6 +1911,29 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
             ),
         ),
         AlgorithmCandidate(
+            name="zvt_tile_i8i32",
+            target_affinity=("zvt",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Zvt (draft RISC-V vector-matrix tile extension) int8 LINEAR via "
+                "vtmms.tvv, mtype widen=4, vtype e8+altfmt (signed x signed): "
+                "acc[m][n] += sum_{ki<4} A_ki[m]*B_ki[n] into a 32x32 int32 tile. "
+                "A_ki / B_ki are K-columns held in v0,v2,v4,v6 / v8,v10,v12,v14 "
+                "(LMUL=2). input [M,K] and weight [N,K] are both row-major, so "
+                "every K-column is one strided load (vlse8, stride K) -- no "
+                "packing. msettm/msettn shrink edge tiles (msettn also sets vl, "
+                "avoiding a vsetvli that would clear mtype). K%4 and the Q0.31 "
+                "requantize are a scalar tail mirroring the reference, so the "
+                "kernel is bit-exact by construction. Config, vtzero, K-loop and "
+                "vtse32 read-out MUST be one asm block per tile. Encodings come "
+                "from cores/zvt/include/zvt_insn.h."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "zvt/zvt_linear_s8_zvt_tile_i8i32.c)"
+            ),
+        ),
+        AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
             target_affinity=("ime", "ime_x60"),
             accuracy_class=AccuracyClass.BIT_EXACT,

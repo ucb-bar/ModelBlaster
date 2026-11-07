@@ -371,6 +371,45 @@ RVV_OPU = Backend(
 )
 
 
+# zvt backend: RVV + the draft RISC-V vector-matrix tile extension (Zvt), as
+# implemented in upstream riscv-isa-sim 72958551 ("Add Zvt support"). Same
+# programming model the Saturn OPU is moving to (VME). Unlike rvv_opu this
+# needs no customext: it is a stock upstream spike (built from
+# riscv-software-src/riscv-isa-sim >= 72958551), selected via
+# MODELBLASTER_ZVT_SPIKE in _run_lib.sh.
+#
+# Tile context: the harness opts its kernel thread in with
+# arch_riscv_zvt_enable() (ucb-bar/zephyr branch zvt-matrix-context,
+# CONFIG_RISCV_ISA_EXT_ZVT), so tile state survives preemption and the
+# kernels need no irq_lock. Kernels must keep each tile computation in ONE
+# asm block -- a compiler vsetvli in between clears mtype.
+ZVT = Backend(
+    name="zvt",
+    description=(
+        "rv64gcv + Zvt draft vector-matrix tile extension (vtmms i8xi8->i32 "
+        "tile MAC, vtfmm fp). Encoded via .insn/.word from zvt_insn.h; runs "
+        "on upstream spike with --isa=..._zvtbase_zvt32t_zvt8e_zvti8i32mm."
+    ),
+    kernel_cflags=(
+        "-march=rv64gcv",
+        "-mabi=lp64d",
+        "-isystem<repo_root>/cores/zvt/include",
+        "-DMODELBLASTER_ZVT=1",
+        # Like rvv_opu: no IHWOC flag until a zvt conv2d algorithm declares
+        # its weight layout.
+    ),
+    kernel_includes=("<riscv_vector.h>", "\"zvt_insn.h\""),
+    prj_conf_overlay="zvt.conf",
+    # TE=32 tiles (zvt32t) with VLEN=128 gives 32x32 int8 tiles; must match
+    # CONFIG_RISCV_ZVT_TE in harness/backends/zvt.conf.
+    spike_args=("--isa=rv64gcv_zicntr_zvtbase_zvt32t_zvt8e_zvti8i32mm_zvtfmm",),
+    optimization_guide="optimization_guide_rvv.md",
+    verify_method=VERIFY_SPIKE_HARNESS,
+    # Fall back to the curated RVV kernels for ops with no zvt algorithm.
+    curated_aliases=("zvt", "rvv"),
+)
+
+
 # Gemmini integer accelerator (chipyard's default int8 RoCC config —
 # DIM=16, elem_t=int8, acc_t=int32). Stage 1 is RoCC-only; ReRoCC
 # variants will be added later behind separate target names.
@@ -732,6 +771,7 @@ BACKENDS: dict[str, Backend] = {
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,
     RVV_OPU.name: RVV_OPU,
+    ZVT.name: ZVT,
     IME.name: IME,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,

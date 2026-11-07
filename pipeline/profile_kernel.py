@@ -154,6 +154,12 @@ def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
         _env["LD_LIBRARY_PATH"] = (
             _lib_dir + ":" + _env.get("LD_LIBRARY_PATH", "")
         ).rstrip(":")
+    elif backend.name == "zvt":
+        # Zvt needs an upstream spike with "Add Zvt support"
+        # (riscv-isa-sim >= 72958551); the default spike rejects
+        # --isa=..._zvtbase. Same env var _run_lib.sh uses.
+        spike = os.environ.get("MODELBLASTER_ZVT_SPIKE") or find_spike()
+        _env = None
     else:
         spike = find_spike()
         _env = None

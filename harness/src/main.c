@@ -18,6 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <zephyr/kernel.h>
+#if defined(CONFIG_RISCV_ISA_EXT_ZVT)
+#include <zephyr/arch/riscv/zvt.h>
+#endif
 #include <zephyr/sys/reboot.h>
 
 #include "model.h"
@@ -58,6 +61,19 @@ int main(void)
 #define MODELBLASTER_PIN_HART 1
 #endif
     k_thread_cpu_pin(k_current_get(), MODELBLASTER_PIN_HART);
+#endif
+
+#if defined(CONFIG_RISCV_ISA_EXT_ZVT)
+    /* zvt backend: opt this (kernel-running) thread in to Zvt tile state.
+     * Until then mstatus.MS=Off and every tile instruction faults. */
+    {
+        static Z_RISCV_ZVT_SAVE_AREA_DEFINE(mb_zvt_save_area);
+        int zrc = arch_riscv_zvt_enable(mb_zvt_save_area, sizeof(mb_zvt_save_area));
+        if (zrc != 0) {
+            printf("modelblaster harness: arch_riscv_zvt_enable failed (%d)\n", zrc);
+            return 0;
+        }
+    }
 #endif
 
     printf("modelblaster harness: model=%s in=%d out=%d\n",

@@ -540,7 +540,7 @@ LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
 
 #: Backends whose whole point is a vector unit. A curated kernel for one of
 #: these that contains no vector instruction is a mistake, not a style.
-_VECTOR_BACKENDS = {"rvv", "rvv_x60", "rvv_f16", "rvv_opu", "ime"}
+_VECTOR_BACKENDS = {"rvv", "rvv_x60", "rvv_f16", "rvv_opu", "ime", "zvt"}
 
 
 def _count_vector_insns(obj_path: str, cross: str) -> int:
@@ -2095,7 +2095,7 @@ def generate(
     # it also won't penalize one, and FireSim re-rank (when active)
     # picks it up. `cache_aware_prompt=False` opts out for cases where
     # the user wants a strictly flat-memory prompt.
-    _CACHE_AWARE_TARGETS = {"rvv", "rvv_f16", "rvv_opu", "scalar", "scalar_f16"}
+    _CACHE_AWARE_TARGETS = {"rvv", "rvv_f16", "rvv_opu", "zvt", "scalar", "scalar_f16"}
     if cache_aware_prompt or target.name in _CACHE_AWARE_TARGETS:
         from modelblaster.optimize.firesim_eval import memory_model_stanza
         stanza = memory_model_stanza()
