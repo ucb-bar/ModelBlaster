@@ -608,6 +608,16 @@ print(' '.join(b.spike_args))
             export LD_LIBRARY_PATH="${_OPU_LIB_DIR}:${LD_LIBRARY_PATH:-}"
         fi
     fi
+    # zvt backend needs an upstream spike with Zvt (riscv-isa-sim >= 72958551,
+    # "Add Zvt support"). No customext. Set MODELBLASTER_ZVT_SPIKE to it.
+    if [[ "${GEN_TARGET}" == "zvt" ]]; then
+        if [[ -n "${MODELBLASTER_ZVT_SPIKE:-}" && -f "${MODELBLASTER_ZVT_SPIKE}" ]]; then
+            SPIKE_BIN_FLAGS+=(--spike "${MODELBLASTER_ZVT_SPIKE}")
+        else
+            echo "WARNING: TARGET=zvt but MODELBLASTER_ZVT_SPIKE is unset/missing;" \
+                 "the default spike likely lacks Zvt (riscv-isa-sim >= 72958551)." >&2
+        fi
+    fi
     python -m modelblaster.validation.spike_runner \
         --elf "${BUILD_DIR}/zephyr/zephyr.elf" \
         --io "${IR_DIR}/io.npz" \
