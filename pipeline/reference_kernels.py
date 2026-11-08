@@ -226,6 +226,18 @@ class KernelSpec:
     # `reference_impl` is synthesized, preserving the previous single-seed
     # behavior.
     algorithms: list[AlgorithmCandidate] = field(default_factory=list)
+    # For op kinds generate_skeleton has no built-in call for (normally ones an
+    # extension adds; see load_extensions below). Called as
+    # emit_call(op, ctx) -> (call, init_calls): `call` is the kernel call with
+    # the plain kernel_<op>( name, which the skeleton mangles like any other;
+    # `init_calls` are complete C statements for model_<mid>_init(), the
+    # one-time setup the schedule-driven runtime runs before its timed region.
+    # ctx carries mid, model_name, backend, tensors, out_ptr, ptr_for(tensor,
+    # role) and weight_name(key).
+    emit_call: Optional[Callable[[dict, Any], tuple[str, list[str]]]] = None
+    # True when emit_call returns init calls, so model.h declares
+    # model_<mid>_init() for any graph that contains this op.
+    has_model_init: bool = False
 
     def __post_init__(self):
         # Synthesize a "direct" algorithm seeded from `reference_impl`
@@ -15701,3 +15713,64 @@ def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
         seen.add(key)
         out.append(dict(shape))
     return out
+
+
+# ── Extensions: kernel specs and algorithms from outside this repository ─────
+# A downstream project (an SoC with its own accelerators, say) can add op kinds,
+# algorithms and their curated kernels without editing ModelBlaster:
+#
+#   MODELBLASTER_EXTENSIONS=/path/a.py:/path/b.py   (os.pathsep-separated)
+#
+# Each file is imported once, when this module is, and must define
+# register(rk), which receives this module. It typically calls
+# rk.add_algorithm(op, AlgorithmCandidate(..., pin_only=True)) or
+# rk.register_kernel_spec(KernelSpec(..., emit_call=...)). Every pipeline stage
+# imports this module, so the same environment gives every stage the same
+# library. The curated sources for the new algorithms go in a second
+# --global-curated-dir root (generate_kernels), laid out like kernels/.
+EXTENSIONS_ENV = "MODELBLASTER_EXTENSIONS"
+
+
+def register_kernel_spec(spec: KernelSpec) -> KernelSpec:
+    """Add a new op kind. Refuses to replace a built-in one."""
+    if spec.op in KERNEL_SPECS:
+        raise ValueError(f"register_kernel_spec: {spec.op!r} already exists; "
+                         f"add an algorithm to it instead")
+    KERNEL_SPECS[spec.op] = spec
+    return spec
+
+
+def add_algorithm(op: str, algorithm: AlgorithmCandidate) -> AlgorithmCandidate:
+    """Append an algorithm to an existing op kind. Names must stay unique."""
+    spec = KERNEL_SPECS[op]
+    if any(a.name == algorithm.name for a in spec.algorithms):
+        raise ValueError(f"add_algorithm: {op} already has an algorithm "
+                         f"{algorithm.name!r}")
+    spec.algorithms.append(algorithm)
+    return algorithm
+
+
+def load_extensions(paths: Optional[str] = None) -> list[str]:
+    """Import every extension file named in `paths` (default: $MODELBLASTER_EXTENSIONS)."""
+    import importlib.util
+    import os
+    import sys
+    raw = os.environ.get(EXTENSIONS_ENV, "") if paths is None else paths
+    loaded = []
+    for i, path in enumerate(p for p in raw.split(os.pathsep) if p):
+        if not os.path.isfile(path):
+            raise SystemExit(f"{EXTENSIONS_ENV}: no such file {path!r}")
+        stem = os.path.splitext(os.path.basename(path))[0]
+        modspec = importlib.util.spec_from_file_location(
+            f"_modelblaster_extension_{i}_{stem}", path)
+        mod = importlib.util.module_from_spec(modspec)
+        modspec.loader.exec_module(mod)
+        register = getattr(mod, "register", None)
+        if not callable(register):
+            raise SystemExit(f"{EXTENSIONS_ENV}: {path} defines no register(rk)")
+        register(sys.modules[__name__])
+        loaded.append(path)
+    return loaded
+
+
+load_extensions()

@@ -2209,6 +2209,17 @@ def _apply_linear_weight_perm(w: np.ndarray, p: dict) -> np.ndarray:
         w.reshape(w.shape[0], C, H, W).transpose(0, 2, 3, 1).reshape(w.shape[0], -1))
 
 
+def _ops_with_model_init() -> set[str]:
+    """Op kinds whose KernelSpec asks for one-time setup in model_<mid>_init()."""
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    return {k for k, sp in KERNEL_SPECS.items() if getattr(sp, "has_model_init", False)}
+
+
+class _EmitContext:
+    """What a KernelSpec.emit_call sees of the skeleton while emitting one op."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
 
 def _shape_str(op: dict) -> str:
@@ -2702,6 +2713,15 @@ typedef model_{mid}_state_t       model_state_t;
 typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 #endif
 """
+    # One-time model setup (see model_init_calls). Declared only for graphs that
+    # need it; the xpurt main calls it before its timed region under this macro.
+    _init_ops = _ops_with_model_init()
+    if any(o.get("op") in _init_ops for o in ir["ops"]):
+        h = h.rstrip("\n") + (
+            f"\n\n/* One-time setup before the first inference (e.g. loading an accelerator's\n"
+            f" * weights); the schedule-driven runtime calls it outside its timed region. */\n"
+            f"#define MODEL_{umid}_HAS_INIT 1\n"
+            f"void model_{mid}_init(void);\n")
     with open(os.path.join(out_dir, "model.h"), "w") as f:
         f.write(h)
 
@@ -2802,6 +2822,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         return _buf_name(mid, tensor)
 
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
+    # Per-model one-time setup calls (model_<mid>_init). Only ops that need one
+    # add to it, and model.h/model.c gain the init entry point only then, so a
+    # graph without such an op generates exactly what it did before.
+    model_init_calls: list[str] = []
     dispatch_fns: list[str] = []
     # File-scope `static const` tables of per-shard weight pointers, one per
     # sharded conv. File scope rather than inside the dispatch function so the
@@ -4643,7 +4667,18 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['batch']}, {sh['M']}, {sh['K']}, {sh['N']})"
             )
         else:
-            raise NotImplementedError(f"unsupported op {op['op']}")
+            # An op kind with no built-in arm: its KernelSpec may say how to
+            # call it (reference_kernels.KernelSpec.emit_call; extensions).
+            from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+            _spec = KERNEL_SPECS.get(op["op"])
+            _emit = getattr(_spec, "emit_call", None)
+            if _emit is None:
+                raise NotImplementedError(f"unsupported op {op['op']}")
+            call, _init = _emit(op, _EmitContext(
+                mid=mid, model_name=model_name, backend=backend, tensors=tensors,
+                out_ptr=out_ptr, ptr_for=ptr_for,
+                weight_name=lambda key: _weight_name(model_name, key, backend)))
+            model_init_calls.extend(_init)
         # Mangle the kernel call: every kernels.c emits kernel_<op>_<mid>
         # (set via emit_kernels_h/c's model_name arg) so multiple models can
         # link side-by-side without colliding on bare kernel_<op> symbols.
@@ -5004,6 +5039,10 @@ unsigned long model_{mid}_wall_cycles(void) {{
     return wall_cycles_;
 }}
 """
+    if model_init_calls:
+        c = c.rstrip("\n") + (
+            f"\n\nvoid model_{mid}_init(void) {{\n"
+            + "".join(f"    {x}\n" for x in model_init_calls) + "}\n")
     with open(os.path.join(out_dir, "model.c"), "w") as f:
         f.write(c)
 
