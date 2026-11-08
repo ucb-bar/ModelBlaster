@@ -64,6 +64,7 @@ def rename_defs(model_name: str, used_ops: Iterable[str], backend: str
         f"model_{mid}_reset_profile",
         f"model_{mid}_wall_cycles",
         f"model_{mid}_set_wall_cycles",
+        f"model_{mid}_init",
         f"model_{mid}_profile_records",
     ):
         defs.append(f"-D{fn}={fn}_{bs}")

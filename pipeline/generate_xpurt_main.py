@@ -268,6 +268,14 @@ def _emit(networks: list[str], schedule_name: str,
                 f"const model_{mid}_op_record_t *"
                 f"model_{mid}_profile_records_{bs}(int *count);")
             reset_calls.append(f"    model_{mid}_reset_profile_{bs}();")
+            # One-time model setup, outside the timed region. Weak: a backend whose
+            # model.c has no init (no op needs one) links to NULL and is skipped.
+            # Under the model.h macro, so a model without init generates the same code.
+            reset_calls.append(
+                f"#ifdef MODEL_{umid}_HAS_INIT\n"
+                f"    {{ extern void model_{mid}_init_{bs}(void) __attribute__((weak));\n"
+                f"      if (model_{mid}_init_{bs}) model_{mid}_init_{bs}(); }}\n"
+                f"#endif")
 
         # Build the per-backend selection inside the dispatch branch.
         # The selection axis is the entry's `impl` -- the kernel

@@ -209,9 +209,33 @@ def _curated_path(global_curated_dir, backend_name: str, op: str,
     if global_curated_dir is None:
         return None
     from modelblaster.pipeline import backends as _backends_mod
-    for name in _backends_mod.backend_lineage(backend_name):
-        candidate = os.path.join(
-            global_curated_dir, name, f"{name}_{op}_{algo_name}.c")
+    for root in _curated_roots(global_curated_dir):
+        for name in _backends_mod.backend_lineage(backend_name):
+            candidate = os.path.join(
+                root, name, f"{name}_{op}_{algo_name}.c")
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def _curated_roots(global_curated_dir) -> list[str]:
+    """The curated library roots, in probe order.
+
+    --global-curated-dir takes one directory or an os.pathsep-separated list.
+    The first root is normally this repository's kernels/; later roots let a
+    downstream project supply curated kernels for its own algorithms (see
+    reference_kernels.load_extensions) in the same <root>/<target>/ layout
+    without copying them in here. The first root holding a file wins.
+    """
+    if not global_curated_dir:
+        return []
+    return [r for r in str(global_curated_dir).split(os.pathsep) if r]
+
+
+def _curated_file(global_curated_dir, subdir: str, filename: str) -> Optional[str]:
+    """<root>/<subdir>/<filename> in the first curated root that has it."""
+    for root in _curated_roots(global_curated_dir):
+        candidate = os.path.join(root, subdir, filename)
         if os.path.exists(candidate):
             return candidate
     return None
@@ -1974,7 +1998,7 @@ def generate(
         _probe_swap(
             "curated",
             global_curated_dir,
-            lambda spec, algorithm: os.path.join(
+            lambda spec, algorithm: _curated_file(
                 global_curated_dir, target.name,
                 f"{target.name}_{spec.op}_{algorithm.name}.c",
             ) if global_curated_dir else None,
@@ -1988,7 +2012,7 @@ def generate(
             _probe_swap(
                 f"curated[{_alias}]",
                 global_curated_dir,
-                lambda spec, algorithm, _a=_alias: os.path.join(
+                lambda spec, algorithm, _a=_alias: _curated_file(
                     global_curated_dir, _a,
                     f"{_a}_{spec.op}_{algorithm.name}.c",
                 ) if global_curated_dir else None,
@@ -2361,7 +2385,9 @@ def main() -> None:
                          "spike-harness verify and --optimize)")
     ap.add_argument("--global-curated-dir", default=None,
                     help="root of the global curated kernel library "
-                         "(<root>/<target>/<backend>_<op>_<algo>.c). "
+                         "(<root>/<target>/<backend>_<op>_<algo>.c), or an "
+                         "os.pathsep-separated list of roots probed in order "
+                         "(extra roots hold an extension's kernels). "
                          "Probed before the per-model cache; hits are "
                          "promoted into the per-model cache on first use.")
     ap.add_argument("--cache-dir", default=None,
