@@ -209,17 +209,118 @@ def main():
     ap.add_argument("--num-calibration", type=int, default=32)
     ap.add_argument("--R", type=int, default=16)
     ap.add_argument("--cal-percentile", type=float, default=100.0)
+    ap.add_argument("--mode", default="bias", choices=["bias", "digits"],
+                    help="bias: linear_seg_s32 per-tick bias (default); digits: fold into W_ih (no new op)")
     a = ap.parse_args()
     mm = importlib.import_module(f"modelblaster.models.{a.model}")
     segs = [(s.split(":")[0], int(s.split(":")[1]), int(s.split(":")[2])) for s in a.segments.split(",") if s]
     ir = json.load(open(a.graph))
     w = dict(np.load(a.weights))
     io = dict(np.load(a.io))
-    ir, w, io = lower(ir, w, io, mm, a.lstm, a.input, segs, [x for x in a.lo_digit.split(",") if x],
-                      a.num_calibration, a.R, a.cal_percentile)
+    if a.mode == "digits":
+        ir, w, io = lower_digits(ir, w, io, mm, a.lstm, a.input, a.num_calibration, a.cal_percentile)
+    else:
+        ir, w, io = lower(ir, w, io, mm, a.lstm, a.input, segs, [x for x in a.lo_digit.split(",") if x],
+                          a.num_calibration, a.R, a.cal_percentile)
     json.dump(ir, open(a.graph, "w"), indent=2)
     np.savez(a.weights, **w)
     np.savez(a.io, **io)
+
+
+
+def lower_digits(ir, w, io, model_mod, lstm_name="lstm.l0", input_name="lowdim", n_cal=32, pct=100.0, log=print):
+    """--mode digits: the state's gate term folded into the LSTM's own int8 W_ih (no new op, no per-tick bias).
+
+    Each state feature k is quantized by the host with its own scale s_k (max |x_k| over the calibration samples /
+    127, or the pct percentile) to an int8 code q_k. Its exact contribution to A_x, in A_x's unit p = s_in * s_w, is
+    G[j,k] * q_k with G = rha(W_ih[j,k] * s_k / p), an integer that may exceed int8; it is split into n_k digits
+    g_1..g_n (|g| <= 127, same sign, sum = G) and the host feeds q_k n_k times. The graph input becomes `<input>_rep`
+    (sum n_k bytes) and joins the concat as an identity input (its declared scale is the concat's output scale), so
+    the LSTM input is [other inputs | q copies] and W_ih = [W_other (int8 at s_w) | digit columns]. Everything stays
+    lstm_s8 / lstm_q_s8: any backend, and any engine that runs a concat plus an int8 matvec, runs it unchanged.
+    The host encoding (feature, scale per byte) is recorded in the input tensor's `host_encode`."""
+    import torch
+    model = model_mod.get_model()
+    lstm, layer = _lstm_module(model, lstm_name)
+    W = getattr(lstm, f"weight_ih_l{layer}").detach().double().numpy()
+    b = (getattr(lstm, f"bias_ih_l{layer}") + getattr(lstm, f"bias_hh_l{layer}")).detach().double().numpy() \
+        if lstm.bias else np.zeros(W.shape[0])
+    ops = ir["ops"]
+    li = next(i for i, o in enumerate(ops) if o["name"] == lstm_name)
+    lop = ops[li]
+    cat_t = lop["inputs"][0]
+    cop = next(o for o in ops if cat_t in o["outputs"])
+    pos = cop["inputs"].index(input_name)
+    if pos != len(cop["inputs"]) - 1:
+        raise SystemExit("lower_lstm_seg: the state input must be the concat's last input")
+    sizes = [int(np.prod(ir["tensors"][t]["shape"])) for t in cop["inputs"]]
+    col0, nx = sum(sizes[:pos]), sizes[pos]
+    in_names = [e["name"] for e in ir["input"]["packed_inputs"]]
+    xi_graph = in_names.index(input_name)
+    cal = model_mod.get_calibration_samples(n_cal)
+    X = np.abs(np.array([np.asarray(s[xi_graph], np.float64).reshape(-1) for s in cal]))
+    rng = np.percentile(X, pct, axis=0)
+    s_k = np.where(rng > 0, rng / 127.0, 0.0)          # constant-zero features get no columns
+
+    q = cop["quant"]
+    s_in = max(q["scales_in"][:pos])
+    s_w = float(np.abs(W[:, :col0]).max()) / 127.0
+    p = s_in * s_w
+    cols, enc = [], []
+    for k in range(nx):
+        if s_k[k] == 0:
+            continue
+        G = np.rint(W[:, col0 + k] * s_k[k] / p).astype(np.int64)
+        n = max(1, int(-(-np.abs(G).max() // 127)))
+        base, rem = np.divmod(np.abs(G), n)            # |G| = n*base + rem: rem digits of base+1, the rest base
+        for d in range(n):
+            cols.append(np.sign(G) * (base + (d < rem)))
+            enc.append([k, float(s_k[k])])
+    D = np.stack(cols, 1)
+    assert np.abs(D).max() <= 127
+    rep = f"{input_name}_rep"
+    n_rep = D.shape[1]
+    w[lop["weight"]] = np.concatenate([np.clip(np.rint(W[:, :col0] / s_w), -127, 127), D], 1).astype(np.int8)
+    w[lop["bias"]] = np.rint(b / p).astype(np.int32)
+    w[lop["bias_hh"]] = np.zeros(W.shape[0], np.int32)
+    lop["quant"].update(scale_in=s_in, scale_w_ih=s_w, scale_b=p, has_bias=1)
+    lop["shape"]["input_size"] = col0 + n_rep
+    cop["inputs"][pos] = rep
+    q["scales_in"][pos] = s_in
+    q["scale_out"] = s_in
+    for key in ("n_inputs", "C_inputs"):
+        if key in cop.get("shape", {}):
+            cop["shape"][key][pos] = n_rep
+    if "C_total" in cop.get("shape", {}):
+        cop["shape"]["C_total"] = col0 + n_rep
+    ir["tensors"][cat_t]["shape"] = [1, col0 + n_rep]
+    ir["tensors"][cat_t]["quant"]["scale"] = s_in
+    ent = ir["input"]["packed_inputs"]
+    e0 = next(e for e in ent if e["name"] == input_name)
+    delta = n_rep - e0["size"]
+    for e in ent:
+        if e["byte_offset"] > e0["byte_offset"]:
+            e["byte_offset"] += delta; e["offset"] += delta
+    e0.update(name=rep, size=n_rep)
+    ir["input"]["tensors"] = [e["name"] for e in ent]
+    ir["input"]["packed_bytes"] = ir["input"].get("packed_bytes", 0) + delta
+    del ir["tensors"][input_name]
+    ir["tensors"][rep] = {"shape": [1, n_rep], "dtype": "i8", "quant": {"scale": s_in, "zero_point": 0},
+                          "host_encode": {"source": input_name, "bytes": enc,
+                                          "rule": "byte i = clamp(round_half_even(x[feature_i] / scale_i), -127, 127)"}}
+    bound = np.abs(w[lop["weight"]].astype(np.int64)).sum(1) * 128 + np.abs(w[lop["bias"]].astype(np.int64))
+    lop["quant"]["ax_bound"] = int(bound.max())
+    # io: re-encode the float sample
+    smp = model_mod.get_sample_input()
+    xs = np.asarray(smp[xi_graph], np.float64).reshape(-1)
+    old = io["input"].reshape(-1).astype(np.int8)
+    off = e0["byte_offset"]
+    codes = np.array([np.clip(torch.round(torch.tensor(xs[k] / s)).item(), -127, 127) for k, s in enc], np.int8)
+    io["input"] = np.concatenate([old[:off], codes, old[off + nx:]]).reshape(1, -1).astype(io["input"].dtype)
+    log(f"[lower_lstm_seg] {lstm_name} (digits): {input_name}[{nx}] -> {rep}[{n_rep}] (copies per feature "
+        f"{np.bincount([k for k, _ in enc], minlength=nx).tolist()}); W_ih IS {col0} -> {col0 + n_rep}; "
+        f"concat scale {s_in:.6g}, W_ih s={s_w:.6g}; |A_x| <= {lop['quant']['ax_bound']}")
+    return ir, w, io
 
 
 if __name__ == "__main__":
