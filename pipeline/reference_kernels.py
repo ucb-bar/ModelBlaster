@@ -125,6 +125,11 @@ class AlgorithmCandidate:
     # See docs/IR_TENSOR_LAYOUT_DESIGN.md; this is stage 2, which is inert until
     # a graph actually carries a non-default tensor layout.
     act_layouts: tuple[str, ...] = ("nchw",)
+    # Opt-in only: the reference path never picks this algorithm on its own,
+    # only through generate_kernels --pin-algorithm. For accelerator lowerings
+    # (the hardware may be absent) and numerics variants (a build must not
+    # change arithmetic because a file appeared in kernels/<backend>/).
+    pin_only: bool = False
 
 
 # The Gemmini backend family, spelled as the EXACT strings the affinity filter
