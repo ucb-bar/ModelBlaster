@@ -3738,23 +3738,6 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
-        elif op["op"] == "lstm_s8":
-            x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"], backend)
-            whh = _weight_name(model_name, op["weight_hh"], backend)
-            b = _weight_name(model_name, op["bias"], backend)
-            _h_key, _c_key = _lstm_state_keys(op)
-            h_ptr = ptr_for(_h_key, "in")
-            c_ptr = ptr_for(_c_key, "in")
-            sh = op["shape"]
-            q = op["quant"]
-            call = (
-                f"kernel_lstm_s8({x_ptr}, {wih}, {whh}, {b}, "
-                f"{h_ptr}, {c_ptr}, {out_ptr}, "
-                f"{sh['in_size']}, {sh['H']}, "
-                f"{_f32(q['s_x'])}, {_f32(q['s_wih'])}, {_f32(q['s_whh'])}, "
-                f"{_f32(q['s_h'])}, {_f32(q['s_c'])})"
-            )
         elif op["op"] == "lstm":
             x_ptr = ptr_for(op["inputs"][0], "in")
             wih = _weight_name(model_name, op["weight_ih"], backend)
