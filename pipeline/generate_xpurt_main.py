@@ -322,7 +322,16 @@ def _emit(networks: list[str], schedule_name: str,
             bs_select_lines.append(
                 f'            {kw} (strcmp(e_->impl, "{kind}") == 0) {{\n'
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
+                f"#ifdef MB_TL_ON\n"
+                f"                MB_TL_CUR(my_hart, i_);\n"
+                f"                MB_TL_ENT(i_, start);\n"
+                f"#endif\n"
                 f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&dispatch_state_{mid});\n"
+                f"#ifdef MB_TL_ON\n"
+                f"                MB_TL_ENT(i_, end);\n"
+                f"                MB_TL_CUR(my_hart, -1);\n"
+                f"                mb_tl_ent[i_].flags = 1u;\n"
+                f"#endif\n"
                 f"                __asm__ volatile(\"fence rw,rw\" ::: \"memory\");\n"
                 f"            }}"
             )
@@ -348,6 +357,10 @@ def _emit(networks: list[str], schedule_name: str,
             f"             * but still post the completion sem so any\n"
             f"             * dependents downstream unblock. */\n"
             f"            if (e_->dispatch_id < 0) {{\n"
+            f"#ifdef MB_TL_ON\n"
+            f"                mb_tl_ent[i_].flags = 3u;\n"
+            f"                MB_TL_ENT(i_, give);\n"
+            f"#endif\n"
             f"                /* Phase G2d producer-side fanout: give this\n"
             f"                 * entry's sem once per downstream consumer\n"
             f"                 * (data dep + time dep, dedup'd at ingest).\n"
@@ -356,6 +369,9 @@ def _emit(networks: list[str], schedule_name: str,
             f"                for (int _f = 0; _f < e_->n_fanout; _f++) {{\n"
             f"                    k_sem_give(&completion_sems[i_]);\n"
             f"                }}\n"
+            f"#ifdef MB_TL_ON\n"
+            f"                MB_TL_ENT(i_, post);\n"
+            f"#endif\n"
             f"                prev_iter_end = (uint64_t)k_cycle_get_64();\n"
             f"                g_hart_acc[my_acc_idx].entries_done++;\n"
             f"                continue;\n"
@@ -366,6 +382,13 @@ def _emit(networks: list[str], schedule_name: str,
                 for bs in backends
             ) + "\n"
             f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n"
+            f"#ifdef MB_TL_ON\n"
+            f"                if (e_->instance == 0) {{\n"
+            f"                    mb_tl_hdr.frame_start_cyc = MB_TL_RDCYCLE();\n"
+            f"                    mb_tl_hdr.frame_start_hart = my_hart;\n"
+            f"                    mb_tl_hdr.frame_start_mtime = wall_start_{mid}[0];\n"
+            f"                }}\n"
+            f"#endif\n"
             f"            }}\n"
             f"            model_{mid}_state_t dispatch_state_{mid} = {{\n"
             + _state_input_inits(
@@ -445,8 +468,18 @@ def _emit(networks: list[str], schedule_name: str,
             f"                &completed_dispatches_{mid}[e_->instance], 1,\n"
             f"                __ATOMIC_ACQ_REL);\n"
             f"            if (_model_done == MODEL_{umid}_OP_COUNT) {{\n"
+            f"#ifdef MB_TL_ON\n"
+            f"                const uint64_t _tl_done = MB_TL_RDCYCLE();\n"
+            f"#endif\n"
             f"                wall_cycles_{mid}[e_->instance] =\n"
             f"                    (uint64_t)k_cycle_get_64() - wall_start_{mid}[e_->instance];\n"
+            f"#ifdef MB_TL_ON\n"
+            f"                if (e_->instance == 0) {{\n"
+            f"                    mb_tl_hdr.frame_done_cyc = _tl_done;\n"
+            f"                    mb_tl_hdr.frame_done_hart = my_hart;\n"
+            f"                    mb_tl_hdr.frame_done_mtime = wall_start_{mid}[0] + wall_cycles_{mid}[0];\n"
+            f"                }}\n"
+            f"#endif\n"
             f"                /* Capture instance 0 before a stateful model's\n"
             f"                 * later invocations advance its state. The baked\n"
             f"                 * golden is a one-invocation golden. */\n"
@@ -472,9 +505,15 @@ def _emit(networks: list[str], schedule_name: str,
             f"             * consumer-side take loop does NOT re-give (saves\n"
             f"             * one sem op per dep edge). Leaf entries skip the\n"
             f"             * give entirely. */\n"
+            f"#ifdef MB_TL_ON\n"
+            f"            MB_TL_ENT(i_, give);\n"
+            f"#endif\n"
             f"            for (int _f = 0; _f < e_->n_fanout; _f++) {{\n"
             f"                k_sem_give(&completion_sems[i_]);\n"
             f"            }}\n"
+            f"#ifdef MB_TL_ON\n"
+            f"            MB_TL_ENT(i_, post);\n"
+            f"#endif\n"
             f"            uint64_t t_iter_end = (uint64_t)k_cycle_get_64();\n"
             f"            g_hart_acc[my_acc_idx].sync_overhead += (t_iter_end - t_disp1);\n"
             f"            prev_iter_end = t_iter_end;\n"
@@ -668,6 +707,15 @@ def _emit(networks: list[str], schedule_name: str,
 
 {chr(10).join(inc_lines)}
 #include "{dispatch_table_header}"
+#if defined(MB_TIMELINE) && !defined(MODELBLASTER_PLATFORM_LINUX)
+/* Opt-in mcycle timeline (runtime/mb_timeline.h): per-entry stamps, kernel events,
+ * cross-hart alignment. Compiled out unless the build defines MB_TIMELINE. */
+#define MB_TL_DEFINE_STORAGE 1
+#define MB_TL_N_ENTRIES {upper}_N_ENTRIES
+#include "mb_timeline.h"
+static int mb_tl_distinct;   /* every worker on its own hart (ping-pong alignment is valid) */
+#define MB_TL_ON 1
+#endif
 
 /* Note (2026-05-28): we previously tried several memory-fence and
  * cache-invalidation strategies to fix `dronet_hetero` verify-fail
@@ -1024,6 +1072,16 @@ static void *xpurt_worker(void *arg)
     }}
 #endif
 
+#ifdef MB_TL_ON
+    /* Timeline: pre-touch this worker's entry slots (one writer per slot), then barrier + alignment. */
+    for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
+        const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
+        if (strcmp(e_->core_kind, my_kind) != 0) continue;
+        if (e_->hart >= 0 ? (e_->hart != my_hart) : !my_claims_unbound) continue;
+        mb_tl_zero(&mb_tl_ent[i_], sizeof mb_tl_ent[i_]);
+    }}
+    mb_tl_worker_sync(my_acc_idx, my_hart, g_n_workers, mb_tl_distinct);
+#endif
     uint64_t worker_t0 = (uint64_t)k_cycle_get_64();
     uint64_t prev_iter_end = worker_t0;
     /* Take entries that match `my_kind` AND `my_hart`, in start_time
@@ -1057,6 +1115,9 @@ static void *xpurt_worker(void *arg)
         }}
 
         uint64_t t_iter_start = (uint64_t)k_cycle_get_64();
+#ifdef MB_TL_ON
+        MB_TL_ENT_CLAIM(i_, my_hart, my_acc_idx);
+#endif
         if (g_hart_acc[my_acc_idx].entries_done > 0) {{
             g_hart_acc[my_acc_idx].hart_idle +=
                 (t_iter_start - prev_iter_end);
@@ -1086,6 +1147,9 @@ static void *xpurt_worker(void *arg)
             }}
         }}
         uint64_t t_deps_done = (uint64_t)k_cycle_get_64();
+#ifdef MB_TL_ON
+        MB_TL_ENT(i_, deps);
+#endif
         g_hart_acc[my_acc_idx].dep_wait += (t_deps_done - t_iter_start);
 
         /* Every dispatch has an absolute schedule-issued earliest start.
@@ -1102,6 +1166,9 @@ static void *xpurt_worker(void *arg)
         }}
         g_hart_acc[my_acc_idx].target_gate_spin +=
             ((uint64_t)k_cycle_get_64() - t_gate0);
+#ifdef MB_TL_ON
+        MB_TL_ENT(i_, gate);
+#endif
 
 {dispatch_branch}
         printf("xpurt: WARN unknown network %s in entry %d\\n",
@@ -1117,6 +1184,9 @@ static void *xpurt_worker(void *arg)
     }}
     g_hart_acc[my_acc_idx].wall_total =
         (uint64_t)k_cycle_get_64() - worker_t0;
+#ifdef MB_TL_ON
+    mb_tl_worker_exit(my_hart);
+#endif
     return NULL;
 }}
 
@@ -1291,6 +1361,15 @@ int main(void)
     /* Run baseline for both the trace and the periodic-start-time gate.
      * Captured just before workers spawn so it's the moment "t=0" of the
      * schedule maps to. */
+#ifdef MB_TL_ON
+    mb_tl_distinct = 1;
+    for (int w = 0; w < g_n_workers; w++) {{
+        if (g_workers[w].hart < 0) mb_tl_distinct = 0;
+        for (int v = 0; v < w; v++)
+            if (g_workers[v].hart == g_workers[w].hart) mb_tl_distinct = 0;
+    }}
+    mb_tl_init(g_n_workers);
+#endif
     run_t0 = (uint64_t)k_cycle_get_64();
 
     for (int w = 0; w < g_n_workers; w++) {{
@@ -1338,6 +1417,12 @@ int main(void)
         pthread_join(tids[w], NULL);
         pthread_attr_destroy(&attrs[w].a);
     }}
+#ifdef MB_TL_ON
+    /* Kernel/device state read after the frame (e.g. a device's per-stage counters), outside the timed
+     * region. Weak: defined only by kernels that have something to add. */
+    {{ extern void mb_tl_post_run(void) __attribute__((weak));
+      if (mb_tl_post_run) mb_tl_post_run(); }}
+#endif
 
     /* Now safe to flush the spawn diagnostics — workers are done, so
      * nothing pinned to hart 0 is competing with main for UART time.
