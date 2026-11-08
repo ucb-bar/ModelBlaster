@@ -3589,6 +3589,40 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "add_q_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_add_q_s8({a_ptr}, {b_ptr}, {out_ptr}, {n}, "
+                f"{q['ma']}, {q['mb']}, {q['shift']}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "batchnorm2d_q_s8":
+            # (outer, C, inner) from the DECLARED layout of the activation; the
+            # kernel indexes ((o*C + c)*inner + i), so this is the only place
+            # the axis order enters. Input and output must agree.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            _lays = _actlay.op_layouts(ir, op)
+            if len(_lays) != 1:
+                raise SystemExit(f"{op.get('name')}: batchnorm2d_q_s8 mixes "
+                                 f"layouts {sorted(_lays)}")
+            sh = op["shape"]
+            q = op["quant"]
+            fw = op["fold_weights"]
+            if next(iter(_lays)) == _actlay.NHWC:
+                outer, inner = sh["N"] * sh["H"] * sh["W"], 1
+            else:
+                outer, inner = sh["N"], sh["H"] * sh["W"]
+            call = (
+                f"kernel_batchnorm2d_q_s8({in_ptr}, "
+                f"{_weight_name(model_name, fw['m'], backend)}, "
+                f"{_weight_name(model_name, fw['bp'], backend)}, "
+                f"{_weight_name(model_name, fw['s'], backend)}, {out_ptr}, "
+                f"{outer}, {sh['C']}, {inner}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
         elif op["op"] == "batchnorm2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             s = _weight_name(model_name, op["weight"], backend)

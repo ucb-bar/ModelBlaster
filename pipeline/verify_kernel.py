@@ -351,6 +351,29 @@ def _gen_inputs_batchnorm2d_s8(shape: dict, rng: np.random.Generator):
     return inp, scale, bias, out
 
 
+def _gen_inputs_batchnorm2d_q_s8(shape: dict, rng: np.random.Generator):
+    outer, C, inner = shape["outer"], shape["C"], shape["inner"]
+    inp = rng.integers(-128, 128, size=(outer * C * inner,), dtype=np.int8)
+    S = rng.integers(2, 25, size=(C,)).astype(np.int16)
+    M = rng.integers(-(1 << 21), 1 << 21, size=(C,)).astype(np.int32)
+    B = rng.integers(-(1 << 23), 1 << 23, size=(C,)).astype(np.int64)
+    BP = (B + (np.int64(1) << (S.astype(np.int64) - 1))).astype(np.int32)
+    out = np.zeros_like(inp)
+    lo = int(rng.choice([0, -128, -60]))
+    return inp, M, BP, S, out, np.array([lo, 127], np.int64)
+
+
+def _gen_inputs_add_q_s8(shape: dict, rng: np.random.Generator):
+    n = shape["n"]
+    a = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    b = rng.integers(-128, 128, size=(n,), dtype=np.int8)
+    S = int(rng.integers(1, 25))
+    lim = ((1 << 31) - (1 << (S - 1))) // 256
+    q = np.array([int(rng.integers(-lim, lim)), int(rng.integers(-lim, lim)), S,
+                  int(rng.choice([0, -128])), 127], np.int64)
+    return a, b, np.zeros((n,), dtype=np.int8), q
+
+
 def _gen_inputs_sigmoid_s8(shape: dict, rng: np.random.Generator):
     n = shape["n"]
     inp = rng.integers(-128, 128, size=(n,), dtype=np.int8)
@@ -503,7 +526,21 @@ def _i32p(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
 
 
+def _i16p(arr: np.ndarray):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int16))
+
+
 def _run_kernel(fn, op: str, shape: dict, inputs):
+    if op == "batchnorm2d_q_s8":
+        inp, M, BP, S, out, q = inputs
+        fn(_i8p(inp), _i32p(M), _i32p(BP), _i16p(S), _i8p(out),
+           shape["outer"], shape["C"], shape["inner"], int(q[0]), int(q[1]))
+        return out
+    if op == "add_q_s8":
+        a, b, out, q = inputs
+        fn(_i8p(a), _i8p(b), _i8p(out), shape["n"], int(q[0]), int(q[1]), int(q[2]),
+           int(q[3]), int(q[4]))
+        return out
     if op == "linear":
         inp, w, b, out = inputs
         fn(_fp(inp), _fp(w), _fp(b), _fp(out),
@@ -802,7 +839,8 @@ _INTEGER_OPS = {"nchw_to_nhwc_s8", "nhwc_to_nchw_s8",
                 "matmul_s8", "softmax_s8",
                 "depthwise_conv2d_s8", "slice_c_s8",
                 # patches/0100
-                "tanh_s8", "groupnorm_s8", "rope_s8"}
+                "tanh_s8", "groupnorm_s8", "rope_s8",
+                "batchnorm2d_q_s8", "add_q_s8"}
 
 
 @dataclass
@@ -921,6 +959,10 @@ def verify(
                     inputs_ref = _gen_inputs_batchnorm2d_s8(shape, rng)
                 elif op == "sigmoid_s8":
                     inputs_ref = _gen_inputs_sigmoid_s8(shape, rng)
+                elif op == "batchnorm2d_q_s8":
+                    inputs_ref = _gen_inputs_batchnorm2d_q_s8(shape, rng)
+                elif op == "add_q_s8":
+                    inputs_ref = _gen_inputs_add_q_s8(shape, rng)
                 elif op == "silu_s8":
                     inputs_ref = _gen_inputs_silu_s8(shape, rng)
                 elif op == "upsample_nearest_s8":
