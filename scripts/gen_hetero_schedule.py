@@ -55,6 +55,15 @@ _PLACEHOLDER_CYCLES = {
     ("rvv_opu", "sigmoid_s8"):     5_000,
 }
 _DEFAULT_CYCLES = 5_000
+
+# Ops that pipeline/fold_quant_consts.py rewrote keep their original's placement
+# and placeholder cost: folding constants must not move anything in the schedule
+# (the start times are release gates in the generated runtime).
+_FOLDED_FROM = {"batchnorm2d_q_s8": "batchnorm2d_s8", "add_q_s8": "add_s8"}
+
+
+def _kind(op: dict) -> str:
+    return _FOLDED_FROM.get(op["op"], op["op"])
 _CLOCK_HZ = 1_000_000_000.0  # 1 GHz nominal -- duration in ms
 
 
@@ -84,7 +93,7 @@ def _gemmini_main_opu_skip(ops: list[dict[str, Any]]
              if op.get("dispatch_id") is not None}
     skip_ids: set[int] = set()
     for op in ops:
-        if op["op"] != "add_s8":
+        if _kind(op) != "add_s8":
             continue
         deps = op.get("depends_on", [])
         if len(deps) < 2:
@@ -96,7 +105,7 @@ def _gemmini_main_opu_skip(ops: list[dict[str, Any]]
         d = op.get("dispatch_id")
         if d is None:
             continue
-        op_kind = op["op"]
+        op_kind = _kind(op)
         if op_kind in _GEMMINI_CAPABLE:
             placement[d] = "CPU_E#0" if d in skip_ids else "CPU_P#0"
         else:
@@ -160,7 +169,7 @@ def gen_schedule(graph_path: Path, *, job_name: str,
         # real (kind, hart) resolution happens in ingest via the
         # cores registry + cpu_*_kind env vars.
         kind = {"CPU_P#0": "gemmini", "CPU_E#0": "rvv_opu"}.get(slot, "rvv_opu")
-        dur_ms = _placeholder_duration_ms(kind, op["op"])
+        dur_ms = _placeholder_duration_ms(kind, _kind(op))
         entry = {
             "id": int(d),
             "ordinal": 1,

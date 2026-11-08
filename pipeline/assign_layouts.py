@@ -58,7 +58,9 @@ NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8", "conv2d_pool_s8",
 #: force a conversion and never need a variant. They join an island for free.
 LAYOUT_AGNOSTIC = {"add_s8", "relu_s8", "mul_s8", "sigmoid_s8", "silu_s8",
                    "relu6_s8", "gelu_s8", "add_f16", "relu_f16", "mul_f16",
-                   "tanh_s8"}   # patches/0105: already agnostic in act_layout.py
+                   "tanh_s8",   # patches/0105: already agnostic in act_layout.py
+                   # fold_quant_consts.py outputs; see act_layout.LAYOUT_AGNOSTIC_OPS
+                   "add_q_s8", "batchnorm2d_q_s8"}
 
 #: Ops that must never be inside an island even though they look harmless.
 #: `view` is a codegen alias and stays layout-preserving -- but the thing it
