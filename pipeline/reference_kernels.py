@@ -15452,6 +15452,46 @@ void kernel_add_q_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
 )
 
 
+# ── Table concat (pipeline/fold_quant_consts.py --ops cat3_c1_s8) ─────────────
+def _cat3_lut_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, ctypes.c_int, i8p, ctypes.c_int, i8p, ctypes.c_int, i8p, i8p]
+
+
+CAT3_LUT_S8 = KernelSpec(
+    op="cat3_lut_s8",
+    signature=(
+        "void kernel_cat3_lut_s8(const int8_t *in0, int n0, const int8_t *in1, int n1, "
+        "const int8_t *in2, int n2, const int8_t *lut, int8_t *output)"
+    ),
+    semantics=(
+        "cat3_c1_s8 (N=1) with each input's requantize folded into a 256-entry\n"
+        "int8 table: output = [lut[0][in0+128] | lut[1][in1+128] | lut[2][in2+128]],\n"
+        "lut[i] at lut + 256*i. The tables are kernel_cat3_c1_s8's float32\n"
+        "results for every input code, so the op is exact by construction."
+    ),
+    reference_impl="""\\
+void kernel_cat3_lut_s8(const int8_t *in0, int n0, const int8_t *in1, int n1,
+                        const int8_t *in2, int n2, const int8_t *lut, int8_t *output) {
+    const int8_t *ins[3] = { in0, in1, in2 };
+    const int ns[3] = { n0, n1, n2 };
+    for (int i = 0; i < 3; i++) {
+        const int8_t *t = lut + 256 * i + 128;
+        for (int k = 0; k < ns[i]; k++) *output++ = t[ins[i][k]];
+    }
+}
+""",
+    extra_shapes=[{"n_inputs": [512, 64, 21]}],
+    argtypes_factory=_cat3_lut_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(name="direct", description="Table lookups.",
+                           reference_impl="(the KernelSpec reference_impl)",
+                           accuracy_class=AccuracyClass.BIT_EXACT),
+    ],
+)
+
+
 # ── Integer LSTM cell (pipeline/lower_lstm_int.py: lstm_s8 -> lstm_q_s8) ─────
 # Same int8 weights, int32 biases and int8 h/c state as lstm_s8; the float64 cell
 # is replaced by exact int32 gate accumulators, one Q.16 requantize per gate,
@@ -15629,6 +15669,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'batchnorm2d_q_s8': BATCHNORM2D_Q_S8,
     'add_q_s8': ADD_Q_S8,
     'lstm_q_s8': LSTM_Q_S8,
+    'cat3_lut_s8': CAT3_LUT_S8,
     'sigmoid_s8': SIGMOID_S8,
     'relu_f16': RELU_F16,
     'sigmoid_f16': SIGMOID_F16,

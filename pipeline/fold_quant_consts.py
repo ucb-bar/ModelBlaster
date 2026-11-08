@@ -51,6 +51,9 @@ import sys
 import numpy as np
 
 FOLDABLE = ("batchnorm2d_s8", "add_s8")
+# Opt-in only (not in the default --ops): a 3-input concat whose per-input requantize is replaced by
+# one 256-entry int8 table per input (cat3_c1_s8 -> cat3_lut_s8).
+OPT_IN = ("cat3_c1_s8",)
 F32 = np.float32
 
 
@@ -190,9 +193,35 @@ def fold_add(op, require_exact, log):
     return new_op
 
 
+def fold_cat(op, weights, log):
+    """cat3_c1_s8 -> cat3_lut_s8: table row i, entry x+128 = kernel_cat3_c1_s8's float32 result for code x.
+
+    The table is the C expression evaluated once per input code in IEEE single precision (the same operations
+    and rounding as the kernel: f = (float)x * s_in; roundf(f / s_out); clamp), so it is exact by construction.
+    N must be 1: the NCHW concat is then a concat of the flattened inputs."""
+    sh, q = op["shape"], op["quant"]
+    if sh.get("N", 1) != 1:
+        log(f"  {op['name']}: N={sh['N']} != 1, kept as cat3_c1_s8")
+        return None
+    x = np.arange(-128, 128).astype(F32)
+    rows = []
+    for s_in in q["scales_in"]:
+        f = (x * _f32(s_in)).astype(F32)
+        rows.append(_clamp(_float_round((f / _f32(q["scale_out"])).astype(F32)),
+                           q["activation_min"], q["activation_max"]))
+    lut = np.concatenate(rows).astype(np.int8)
+    key = f"{op['name']}.cat_lut"
+    hw = sh.get("H", 1) * sh.get("W", 1)
+    new = dict(op, op="cat3_lut_s8", lut=key,
+               shape=dict(sh, n_inputs=[c * hw for c in sh["C_inputs"]]))
+    nz = [int((r != 0).sum()) for r in rows]
+    log(f"  {op['name']}: cat3_c1_s8 -> cat3_lut_s8 (3 x 256 table; nonzero codes per input {nz})")
+    return new, {key: lut}
+
+
 def fold(ir, weights, ops=FOLDABLE, require_exact=False, log=print):
     weights = dict(weights)
-    out_ops, dropped, n = [], set(), {"batchnorm2d_s8": 0, "add_s8": 0}
+    out_ops, dropped, n = [], set(), {"batchnorm2d_s8": 0, "add_s8": 0, "cat3_c1_s8": 0}
     for op in ir["ops"]:
         kind = op.get("op")
         if kind == "batchnorm2d_s8" and kind in ops:
@@ -202,6 +231,13 @@ def fold(ir, weights, ops=FOLDABLE, require_exact=False, log=print):
                 weights.update(new_w)
                 dropped.update(old)
                 out_ops.append(new_op)
+                n[kind] += 1
+                continue
+        elif kind == "cat3_c1_s8" and kind in ops:
+            r = fold_cat(op, weights, log)
+            if r is not None:
+                out_ops.append(r[0])
+                weights.update(r[1])
                 n[kind] += 1
                 continue
         elif kind == "add_s8" and kind in ops:
@@ -243,9 +279,9 @@ def main():
                          "in the int8 input domain")
     a = ap.parse_args()
     ops = tuple(o.strip() for o in a.ops.split(",") if o.strip())
-    bad = set(ops) - set(FOLDABLE)
+    bad = set(ops) - set(FOLDABLE) - set(OPT_IN)
     if bad:
-        sys.exit(f"[fold_quant_consts] cannot fold {sorted(bad)}; foldable: {FOLDABLE}")
+        sys.exit(f"[fold_quant_consts] cannot fold {sorted(bad)}; foldable: {FOLDABLE + OPT_IN}")
     ir = json.load(open(a.graph))
     w = dict(np.load(a.weights))
     print(f"[fold_quant_consts] {a.graph}")

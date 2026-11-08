@@ -85,6 +85,18 @@ def simulate(ir, w, inputs, state, conv_numerics="reference"):
                                   / np.float32(q["scale_out"])), q["activation_min"], q["activation_max"])
                      for n, si in zip(op["inputs"], q["scales_in"])]
             T[o] = np.concatenate(parts).astype(np.int8)
+        elif k == "cat3_lut_s8":
+            lut = w[op["lut"]].astype(np.int8).reshape(3, 256)
+            T[o] = np.concatenate([lut[i][T[n].reshape(-1).astype(np.int64) + 128]
+                                   for i, n in enumerate(op["inputs"])]).astype(np.int8)
+        elif k == "batchnorm2d_q_s8":
+            fw = op["fold_weights"]
+            M, BP = w[fw["m"]].astype(np.int64), w[fw["bp"]].astype(np.int64)
+            Sh = w[fw["s"]].astype(np.int64)
+            a = x.reshape(sh["C"], -1).astype(np.int64) * M[:, None] + BP[:, None]
+            rnd = (np.int64(1) << (Sh - 1))[:, None]
+            v = (a - (a < rnd)) >> Sh[:, None]
+            T[o] = np.clip(v, max(-128, q["activation_min"]), min(127, q["activation_max"])).astype(np.int8)
         elif k == "batchnorm2d_s8":
             fv = x.reshape(sh["C"], -1).astype(np.float32) * np.float32(q["scale_in"])
             y = (w[op["weight"]].astype(np.float32)[:, None] * fv + w[op["bias"]].astype(np.float32)[:, None])
