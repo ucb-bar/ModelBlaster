@@ -1361,7 +1361,10 @@ int main(void)
     /* Run baseline for both the trace and the periodic-start-time gate.
      * Captured just before workers spawn so it's the moment "t=0" of the
      * schedule maps to. */
+    run_t0 = (uint64_t)k_cycle_get_64();
 #ifdef MB_TL_ON
+    /* After run_t0: with --seq this sits inside the tick loop, so every tick re-arms the capture and the
+     * readback holds the LAST tick (mb_tl_hdr._pad counts the re-arms: tick index). */
     mb_tl_distinct = 1;
     for (int w = 0; w < g_n_workers; w++) {{
         if (g_workers[w].hart < 0) mb_tl_distinct = 0;
@@ -1370,7 +1373,6 @@ int main(void)
     }}
     mb_tl_init(g_n_workers);
 #endif
-    run_t0 = (uint64_t)k_cycle_get_64();
 
     for (int w = 0; w < g_n_workers; w++) {{
         pthread_attr_init(&attrs[w].a);
@@ -1558,11 +1560,20 @@ def _apply_seq(src: str, seq: dict[str, dict], backends: list[str]) -> str:
         src = sub(f"                .input = model_{mid}_test_input,\n",
                   f"                .input = xpurt_cur_input_{mid},\n", src)
         resets = "\n".join(f"                model_{mid}_reset_profile_{bs}();" for bs in backends)
+        tl_start = (f"#ifdef MB_TL_ON\n"
+                    f"                if (e_->instance == 0) {{\n"
+                    f"                    mb_tl_hdr.frame_start_cyc = MB_TL_RDCYCLE();\n"
+                    f"                    mb_tl_hdr.frame_start_hart = my_hart;\n"
+                    f"                    mb_tl_hdr.frame_start_mtime = wall_start_{mid}[0];\n"
+                    f"                }}\n"
+                    f"#endif\n")
+        if tl_start not in src:
+            tl_start = ""          # generator without the timeline hooks
         src = sub(f"            if (e_->dispatch_id == 0) {{\n{resets}\n"
-                  f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n            }}\n",
+                  f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n{tl_start}            }}\n",
                   f"            /* --seq: the tick starts at its FIRST dispatch, whichever root that is. */\n"
-                  f"            if (__atomic_exchange_n(&wall_started_{mid}, 1, __ATOMIC_ACQ_REL) == 0)\n"
-                  f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n", src)
+                  f"            if (__atomic_exchange_n(&wall_started_{mid}, 1, __ATOMIC_ACQ_REL) == 0) {{\n"
+                  f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n{tl_start}            }}\n", src)
         pre += [f"        xpurt_cur_input_{mid} = seq_in_{mid}[xpurt_tick];",
                 f"        completed_dispatches_{mid}[0] = 0;",
                 f"        wall_started_{mid} = 0;"]
@@ -1577,8 +1588,8 @@ def _apply_seq(src: str, seq: dict[str, dict], backends: list[str]) -> str:
             f"    for (int _t = 0; _t < seq_ticks_done_{mid}; _t++)\n"
             f"        printf(\"=== MODELBLASTER_TICK [{net}#%d] === wall=%lu mismatch=%d\\n\", _t,\n"
             f"               (unsigned long)tick_wall_{mid}[_t], tick_mism_{mid}[_t]);\n")
-    src = sub("                if (e_->instance == 0) {\n",
-              "                if (e_->instance == 0 && xpurt_tick_now == 0) {\n", src)
+    src = sub("                if (e_->instance == 0) {\n                    __asm__ volatile(\"fence rw, rw\"",
+              "                if (e_->instance == 0 && xpurt_tick_now == 0) {\n                    __asm__ volatile(\"fence rw, rw\"", src)
     src = sub("static int g_n_workers;\n", "static int g_n_workers;\n" + "\n".join(decls) + "\n", src)
     src = sub("    run_t0 = (uint64_t)k_cycle_get_64();\n",
               "    for (int xpurt_tick = 0; xpurt_tick < XPURT_TICKS; xpurt_tick++) {\n"

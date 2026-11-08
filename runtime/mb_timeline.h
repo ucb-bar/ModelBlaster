@@ -133,6 +133,7 @@ static inline void mb_tl_zero(volatile void *p, unsigned long bytes)
 /* main(), before any worker exists. */
 static inline void mb_tl_init(int n_workers)
 {
+    static int32_t runs;                /* re-arms so far (a multi-run main re-arms once per run) */
     mb_tl_zero(&mb_tl_hdr, sizeof mb_tl_hdr);
     mb_tl_zero(mb_tl_ent, sizeof mb_tl_ent);
     mb_tl_zero(mb_tl_hs, sizeof mb_tl_hs);
@@ -147,6 +148,7 @@ static inline void mb_tl_init(int n_workers)
     mb_tl_hdr.n_workers = (uint32_t)n_workers;
     mb_tl_hdr.frame_start_hart = mb_tl_hdr.frame_done_hart = -1;
     mb_tl_hdr.sync_master_hart = -1;
+    mb_tl_hdr._pad = runs++;            /* run index of this capture (0 = first run of the boot) */
     for (int h = 0; h < MB_TL_MAX_HARTS; h++) mb_tl_hdr.sync_peer_hart[h] = -1;
     __asm__ volatile("fence rw, rw" ::: "memory");
     mb_tl_hdr.magic = MB_TL_MAGIC;      /* last: a readback that sees the magic sees a consistent header */
