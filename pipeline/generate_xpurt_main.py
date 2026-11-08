@@ -194,7 +194,8 @@ def _emit(networks: list[str], schedule_name: str,
           n_instances: dict[str, int],
           platform: str = "zephyr",
           gen_dir: str | None = None,
-          model_gen_dirs: dict[str, str] | None = None) -> str:
+          model_gen_dirs: dict[str, str] | None = None,
+          seq: dict[str, dict] | None = None) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -610,7 +611,7 @@ def _emit(networks: list[str], schedule_name: str,
         raise SystemExit(f"--platform must be one of {sorted(_PROLOGUES)}, "
                          f"got {platform!r}")
 
-    return f"""{HEADER}
+    src = f"""{HEADER}
 {platform_top}/*
  * Schedule-driven multi-network entry point with per-(core_kind, hart)
  * worker threads and HETEROGENEOUS per-backend dispatch tables. One
@@ -1426,6 +1427,84 @@ int main(void)
     return 0;
 }}
 """
+    if seq:
+        src = _apply_seq(src, seq, backends)
+    return src
+
+
+def _carr2(rows) -> str:
+    return "{" + ",\n".join("{" + ",".join(str(int(v)) for v in r) + "}" for r in rows) + "}"
+
+
+def _apply_seq(src: str, seq: dict[str, dict], backends: list[str]) -> str:
+    """Multi-tick mode (--seq NET=SEQ.npz): run the whole schedule T times per boot on T different inputs.
+
+    A stateful model (an LSTM's h/c buffers persist across run_model calls) needs a steady-state number, not a
+    first-call-from-reset one, and needs its carried state checked. Per tick t the walker's input pointer is
+    seq_in_<net>[t]; after the workers drain, main records the tick's wall time (first dispatch start to last
+    dispatch end), its output, and the number of output bytes that differ from the sequence golden (SEQ.npz
+    `outputs`, from pipeline/lower_lstm_int.py). The baked-golden verify runs on tick 0 only (tick 0's input is
+    the baked one), and the per-op profile is the last tick's. Single-input models only. Every edit below must
+    match exactly once; without --seq the source is not touched.
+    """
+    def sub(old, new, s):
+        if s.count(old) != 1:
+            raise SystemExit(f"--seq: generator template changed, cannot apply: {old[:70]!r}")
+        return s.replace(old, new)
+    T = max(len(v["inputs"]) for v in seq.values())
+    decls, pre, post, prints = [f"#define XPURT_TICKS {T}", "static volatile int xpurt_tick_now;"], [], [], []
+    for net, d in seq.items():
+        mid = _c_ident(net); umid = mid.upper()
+        ins, outs = d["inputs"], d["outputs"]
+        if len(ins) != T or len(outs) != T:
+            raise SystemExit(f"--seq {net}: {len(ins)} inputs / {len(outs)} outputs, expected {T}")
+        decls += [
+            f"static const int8_t seq_in_{mid}[{T}][{len(ins[0])}] = {_carr2(ins)};",
+            f"static const int8_t seq_gold_{mid}[{T}][{len(outs[0])}] = {_carr2(outs)};",
+            f"_Static_assert(sizeof(seq_in_{mid}[0]) == MODEL_{umid}_INPUT_SIZE, \"seq input size\");",
+            f"_Static_assert(sizeof(seq_gold_{mid}[0]) == MODEL_{umid}_OUTPUT_SIZE, \"seq output size\");",
+            f"static uint64_t tick_wall_{mid}[{T}];",
+            f"static int8_t tick_out_{mid}[{T}][{len(outs[0])}];",
+            f"static int tick_mism_{mid}[{T}];",
+            f"static int seq_ticks_done_{mid};",
+            f"static int wall_started_{mid};",
+            f"static const model_{mid}_input_t *xpurt_cur_input_{mid} = seq_in_{mid}[0];",
+        ]
+        src = sub(f"                .input = model_{mid}_test_input,\n",
+                  f"                .input = xpurt_cur_input_{mid},\n", src)
+        resets = "\n".join(f"                model_{mid}_reset_profile_{bs}();" for bs in backends)
+        src = sub(f"            if (e_->dispatch_id == 0) {{\n{resets}\n"
+                  f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n            }}\n",
+                  f"            /* --seq: the tick starts at its FIRST dispatch, whichever root that is. */\n"
+                  f"            if (__atomic_exchange_n(&wall_started_{mid}, 1, __ATOMIC_ACQ_REL) == 0)\n"
+                  f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n", src)
+        pre += [f"        xpurt_cur_input_{mid} = seq_in_{mid}[xpurt_tick];",
+                f"        completed_dispatches_{mid}[0] = 0;",
+                f"        wall_started_{mid} = 0;"]
+        pre += [f"        model_{mid}_reset_profile_{bs}();" for bs in backends]
+        post += [f"        tick_wall_{mid}[xpurt_tick] = wall_cycles_{mid}[0];",
+                 f"        {{ int _d = 0; for (int _i = 0; _i < MODEL_{umid}_OUTPUT_SIZE; _i++) {{",
+                 f"              tick_out_{mid}[xpurt_tick][_i] = (int8_t)out_{mid}[_i];",
+                 f"              _d += (int8_t)out_{mid}[_i] != seq_gold_{mid}[xpurt_tick][_i]; }}",
+                 f"          tick_mism_{mid}[xpurt_tick] = _d; }}",
+                 f"        seq_ticks_done_{mid} = xpurt_tick + 1;"]
+        prints.append(
+            f"    for (int _t = 0; _t < seq_ticks_done_{mid}; _t++)\n"
+            f"        printf(\"=== MODELBLASTER_TICK [{net}#%d] === wall=%lu mismatch=%d\\n\", _t,\n"
+            f"               (unsigned long)tick_wall_{mid}[_t], tick_mism_{mid}[_t]);\n")
+    src = sub("                if (e_->instance == 0) {\n",
+              "                if (e_->instance == 0 && xpurt_tick_now == 0) {\n", src)
+    src = sub("static int g_n_workers;\n", "static int g_n_workers;\n" + "\n".join(decls) + "\n", src)
+    src = sub("    run_t0 = (uint64_t)k_cycle_get_64();\n",
+              "    for (int xpurt_tick = 0; xpurt_tick < XPURT_TICKS; xpurt_tick++) {\n"
+              "        xpurt_tick_now = xpurt_tick;\n" + "\n".join(pre) + "\n"
+              "    run_t0 = (uint64_t)k_cycle_get_64();\n", src)
+    src = sub("        pthread_join(tids[w], NULL);\n        pthread_attr_destroy(&attrs[w].a);\n    }\n",
+              "        pthread_join(tids[w], NULL);\n        pthread_attr_destroy(&attrs[w].a);\n    }\n"
+              + "\n".join(post) + "\n    }  /* --seq tick loop */\n", src)
+    src = sub("    for (int p = 0; p < g_n_entry_pools; p++) {\n        modelblaster_pool_destroy",
+              "".join(prints) + "    for (int p = 0; p < g_n_entry_pools; p++) {\n        modelblaster_pool_destroy", src)
+    return src
 
 
 def main() -> None:
@@ -1455,6 +1534,10 @@ def main() -> None:
                          "forward-declares MODEL_<UMID>_DISPATCH_FNS_<BS> for "
                          "each backend and dispatches by core_kind. "
                          "Defaults to --core-kinds.")
+    ap.add_argument("--seq", action="append", default=[],
+                    help="NET=SEQ.npz: run the schedule once per tick of SEQ.npz `inputs` [T, input_bytes] and "
+                         "check each tick's output against `outputs` [T, output_bytes] (stateful models: "
+                         "steady-state timing and carried-state check). Single-input networks.")
     ap.add_argument("--model-gen-dir", action="append", default=[],
                     metavar="NET=PATH",
                     help="per-network generated dir (repeatable). Used to read "
@@ -1584,12 +1667,22 @@ def main() -> None:
             pool_sizes_map[k] = n_harts if n_harts >= 2 else 0
     pool_sizes = [pool_sizes_map.get(k, 0) for k in core_kinds]
 
+    seq = None
+    if args.seq:
+        import numpy as _np
+        seq = {}
+        for kv in args.seq:
+            net, path = kv.split("=", 1)
+            z = _np.load(path)
+            seq[net] = {"inputs": z["inputs"].astype(_np.int8).tolist(),
+                        "outputs": z["outputs"].astype(_np.int8).tolist()}
     src = _emit(networks, args.name, args.dispatch_table_header,
                 core_kinds, backends, pool_sizes, n_instances,
                 platform=args.platform,
                 gen_dir=os.path.dirname(args.out),
                 model_gen_dirs=dict(
-                    kv.split("=", 1) for kv in args.model_gen_dir if "=" in kv))
+                    kv.split("=", 1) for kv in args.model_gen_dir if "=" in kv),
+                seq=seq)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
