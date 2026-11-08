@@ -15440,6 +15440,24 @@ void kernel_add_q_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
 )
 
 
+# ── Numerics variant: the Gemmini Q31 ACC_SCALE arithmetic on the scalar backend ─
+# A Gemmini build with MODELBLASTER_GEMMINI_Q31_ACC_SCALE requantizes conv2d_s8
+# with one folded Q0.31 scale sq = (M + 2^(s-1)) >> s and bias + 1 (the beta=1
+# compensation), y = sat8((acc*sq + 2^30) >> 31), clamp -- not the reference's
+# two-stage requantize, so the two disagree on some bytes. A CPU-only image that
+# must reproduce such a Gemmini build's tensors byte for byte pins this. Same
+# fallback predicate as the Gemmini kernel (non-square, offsets, shift outside
+# [0, 30]: reference arithmetic).
+CONV2D_S8.algorithms.append(AlgorithmCandidate(
+    name="q31_acc_scale",
+    target_affinity=("scalar",),
+    accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+    pin_only=True,
+    description="Scalar NCHW conv2d_s8 with the Gemmini Q31 ACC_SCALE requantize.",
+    reference_impl="",
+))
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     'linear': LINEAR,
     'matmul': MATMUL,
