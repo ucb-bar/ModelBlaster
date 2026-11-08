@@ -3976,6 +3976,12 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_h'])}, {_f32(q['scale_c'])}, "
                 f"{q['has_bias']})"
             )
+        elif op["op"] == "cat3_lut_s8":
+            # cat3_c1_s8 after fold_quant_consts --ops cat3_c1_s8 (N=1, flattened inputs).
+            n_in = op["shape"]["n_inputs"]
+            ins = ", ".join(f"{ptr_for(t, 'in')}, {n}" for t, n in zip(op["inputs"], n_in))
+            call = (f"kernel_cat3_lut_s8({ins}, "
+                    f"{_weight_name(model_name, op['lut'], backend)}, {out_ptr})")
         elif op["op"] == "lstm_q_s8":
             # lstm_s8 after pipeline/lower_lstm_int.py: same buffers and weights,
             # integer cell constants instead of float scales.
