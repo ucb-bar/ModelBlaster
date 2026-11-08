@@ -118,12 +118,21 @@ def simulate(ir, w, inputs, state, conv_numerics="reference"):
             else:
                 s_, d = np.sum(wins, axis=0), sh["KH"] * sh["KW"]
                 T[o] = np.clip(np.where(s_ >= 0, (s_ + d // 2) // d, -((-s_ + d // 2) // d)), -128, 127).astype(np.int8)
+        elif k == "linear_seg_s32":
+            # pipeline/lower_lstm_seg.py: out = (sum_p (W_p . x_p) * M_p + 2^(R-1)) >> R, int64 products
+            R = q["R"]
+            acc = np.zeros(sh["N"], np.int64)
+            for p_ in op["passes"]:
+                acc += (w[p_["weight"]].astype(np.int64) @ T[p_["input"]].reshape(-1).astype(np.int64)) * p_["M"]
+            T[o] = ((acc + (1 << (R - 1))) >> R).astype(np.int32)
         elif k in ("lstm_s8", "lstm_q_s8"):
             H, IS = sh["hidden_size"], sh["input_size"]
             hn, cn = op["state"]
             h = state.get(hn, np.zeros(H, np.int8))
             c = state.get(cn, np.zeros(H, np.int8))
             wi, wh, bi, bh = w[op["weight"]], w[op["weight_hh"]], w[op["bias"]], w[op["bias_hh"]]
+            if op.get("bias_hh_input"):            # per-tick b_hh from an int32 tensor (lower_lstm_seg)
+                bh = T[op["inputs"][1]].reshape(-1).astype(np.int64)
             xv = x.reshape(-1)[:IS]
             if k == "lstm_q_s8":
                 h2, c2 = lstm_q.step(xv, wi, wh, bi, bh, h, c, q["Mx"], q["Mh"], q["S"], q["has_bias"])

@@ -15601,6 +15601,68 @@ LSTM_Q_S8 = KernelSpec(
 )
 
 
+
+# ── Segmented int8 matvec into an int32 bias (pipeline/lower_lstm_seg.py) ────
+# Up to 4 passes; each is an int8 matvec W_p [N, K_p] . x_p [K_p] (exact int32), scaled by its own int32
+# multiplier, summed in int64, and rounded by one shift R (half up). Unused passes have K_p = 0.
+
+def _linear_seg_s32_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [ctypes.c_int, ctypes.c_int] + [i8p, i8p, ctypes.c_int, ctypes.c_int] * 4 + [i32p]
+
+
+def _linear_seg_s32_reference() -> str:
+    return r"""#include <stdint.h>
+#include <stddef.h>
+/* Plain loops: may be built into a Gemmini backend's translation unit with a vector -march for a core
+ * that has none, so the vectorizer stays off. */
+__attribute__((optimize("no-tree-vectorize")))
+void kernel_linear_seg_s32(int N, int R,
+                           const int8_t *x0, const int8_t *w0, int k0, int m0,
+                           const int8_t *x1, const int8_t *w1, int k1, int m1,
+                           const int8_t *x2, const int8_t *w2, int k2, int m2,
+                           const int8_t *x3, const int8_t *w3, int k3, int m3,
+                           int32_t *out) {
+    const int8_t *xs[4] = {x0, x1, x2, x3};
+    const int8_t *ws[4] = {w0, w1, w2, w3};
+    const int ks[4] = {k0, k1, k2, k3};
+    const int ms[4] = {m0, m1, m2, m3};
+    for (int j = 0; j < N; j++) {
+        int64_t acc = 0;
+        for (int p = 0; p < 4; p++) {
+            const int K = ks[p];
+            if (K <= 0) continue;
+            const int8_t *wr = ws[p] + (size_t)j * K;
+            int32_t a = 0;
+            for (int k = 0; k < K; k++) a += (int32_t)wr[k] * (int32_t)xs[p][k];
+            acc += (int64_t)a * ms[p];
+        }
+        out[j] = (int32_t)((acc + ((int64_t)1 << (R - 1))) >> R);
+    }
+}
+"""
+
+
+LINEAR_SEG_S32 = KernelSpec(
+    op="linear_seg_s32",
+    signature=(
+        "void kernel_linear_seg_s32(int N, int R, "
+        "const int8_t *x0, const int8_t *w0, int k0, int m0, "
+        "const int8_t *x1, const int8_t *w1, int k1, int m1, "
+        "const int8_t *x2, const int8_t *w2, int k2, int m2, "
+        "const int8_t *x3, const int8_t *w3, int k3, int m3, int32_t *out)"
+    ),
+    semantics=(
+        "Segmented int8 matvec into an int32 vector (pipeline/lower_lstm_seg.py):\n"
+        "  out[j] = (sum_p (sum_k w_p[j*k_p + k] * x_p[k]) * m_p + 2^(R-1)) >> R\n"
+        "for passes p = 0..3 with k_p > 0; int32 dot products, int64 sum, arithmetic shift."
+    ),
+    reference_impl=_linear_seg_s32_reference(),
+    argtypes_factory=_linear_seg_s32_argtypes,
+)
+
 # ── Numerics variant: the Gemmini Q31 ACC_SCALE arithmetic on the scalar backend ─
 # A Gemmini build with MODELBLASTER_GEMMINI_Q31_ACC_SCALE requantizes conv2d_s8
 # with one folded Q0.31 scale sq = (M + 2^(s-1)) >> s and bias + 1 (the beta=1
@@ -15669,6 +15731,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'batchnorm2d_q_s8': BATCHNORM2D_Q_S8,
     'add_q_s8': ADD_Q_S8,
     'lstm_q_s8': LSTM_Q_S8,
+    'linear_seg_s32': LINEAR_SEG_S32,
     'cat3_lut_s8': CAT3_LUT_S8,
     'sigmoid_s8': SIGMOID_S8,
     'relu_f16': RELU_F16,
