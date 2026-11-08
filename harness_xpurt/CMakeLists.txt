@@ -261,6 +261,16 @@ if(MODELBLASTER_XPURT_TRACE)
     target_compile_definitions(app PRIVATE MODELBLASTER_XPURT_TRACE=1)
 endif()
 
+# Optional mcycle timeline (runtime/mb_timeline.h). When ON, the generated main records per-entry
+# claim/deps/start/end/give stamps, frame start/done and a cross-hart alignment, and kernels may log
+# their own events with MB_TL_EV. Defined on zephyr_interface so it reaches
+# the app AND every per-(model, backend) kernel OBJECT lib. Read back over JTAG; nothing is printed.
+if(MB_TIMELINE)
+    zephyr_compile_definitions(MB_TIMELINE=1)
+    zephyr_include_directories("${CMAKE_CURRENT_LIST_DIR}/../runtime")
+    message(STATUS "harness_xpurt: MB_TIMELINE=ON")
+endif()
+
 # Link every (model, backend) OBJECT lib + each backend's own weights
 # OBJECT lib + the per-model buffers OBJECT lib into the final binary.
 # Weights are per-backend (see where _weights_tgt is declared above);
