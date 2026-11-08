@@ -209,6 +209,8 @@ def fold_cat(op, weights, log):
         f = (x * _f32(s_in)).astype(F32)
         rows.append(_clamp(_float_round((f / _f32(q["scale_out"])).astype(F32)),
                            q["activation_min"], q["activation_max"]))
+    while len(rows) < 3:                  # cat2_c1_s8: the third input is empty (n2 = 0)
+        rows.append(np.zeros(256, np.int8))
     lut = np.concatenate(rows).astype(np.int8)
     key = f"{op['name']}.cat_lut"
     hw = sh.get("H", 1) * sh.get("W", 1)
@@ -233,12 +235,12 @@ def fold(ir, weights, ops=FOLDABLE, require_exact=False, log=print):
                 out_ops.append(new_op)
                 n[kind] += 1
                 continue
-        elif kind == "cat3_c1_s8" and kind in ops:
+        elif kind in ("cat2_c1_s8", "cat3_c1_s8") and "cat3_c1_s8" in ops:
             r = fold_cat(op, weights, log)
             if r is not None:
                 out_ops.append(r[0])
                 weights.update(r[1])
-                n[kind] += 1
+                n["cat3_c1_s8"] += 1
                 continue
         elif kind == "add_s8" and kind in ops:
             r = fold_add(op, require_exact, log)

@@ -3989,9 +3989,22 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         elif op["op"] == "cat3_lut_s8":
             # cat3_c1_s8 after fold_quant_consts --ops cat3_c1_s8 (N=1, flattened inputs).
             n_in = op["shape"]["n_inputs"]
-            ins = ", ".join(f"{ptr_for(t, 'in')}, {n}" for t, n in zip(op["inputs"], n_in))
+            ins = ", ".join([f"{ptr_for(t, 'in')}, {n}" for t, n in zip(op["inputs"], n_in)]
+                            + ["0, 0"] * (3 - len(op["inputs"])))   # a folded cat2: empty third input
             call = (f"kernel_cat3_lut_s8({ins}, "
                     f"{_weight_name(model_name, op['lut'], backend)}, {out_ptr})")
+        elif op["op"] == "linear_seg_s32":
+            # pipeline/lower_lstm_seg.py: up to 4 int8 matvec passes into one int32 vector
+            ps = op["passes"]
+            if len(ps) > 4:
+                raise ValueError(f"{op['name']}: linear_seg_s32 supports at most 4 passes")
+            args = []
+            for p_ in ps:
+                args.append(f"{ptr_for(p_['input'], 'in')}, {_weight_name(model_name, p_['weight'], backend)}, "
+                            f"{p_['K']}, {p_['M']}")
+            args += ["0, 0, 0, 0"] * (4 - len(ps))
+            call = (f"kernel_linear_seg_s32({op['shape']['N']}, {op['quant']['R']}, " + ", ".join(args)
+                    + f", (int32_t *){out_ptr})")
         elif op["op"] == "lstm_q_s8":
             # lstm_s8 after pipeline/lower_lstm_int.py: same buffers and weights,
             # integer cell constants instead of float scales.
@@ -4000,12 +4013,15 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             _h_key, _c_key = _lstm_state_keys(op)
             h_ptr = ptr_for(_h_key, "inout")
             c_ptr = ptr_for(_c_key, "inout")
+            # lower_lstm_seg: b_hh is a per-tick int32 tensor (the op's second input), not a weight
+            bhh = (f"(const int32_t *){ptr_for(op['inputs'][1], 'in')}" if op.get("bias_hh_input")
+                   else _weight_name(model_name, op['bias_hh'], backend))
             call = (
                 f"kernel_lstm_q_s8({in_ptr}, "
                 f"{_weight_name(model_name, _lstm_weight_keys(op)[0], backend)}, "
                 f"{_weight_name(model_name, _lstm_weight_keys(op)[1], backend)}, "
                 f"{_weight_name(model_name, op['bias'], backend)}, "
-                f"{_weight_name(model_name, op['bias_hh'], backend)}, "
+                f"{bhh}, "
                 f"{h_ptr}, {c_ptr}, {out_ptr}, "
                 f"{_lstm_dims(op)[0]}, {_lstm_dims(op)[1]}, "
                 f"{q['Mx']}, {q['Mh']}, {q['S']}, {q['has_bias']})"
