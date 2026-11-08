@@ -2120,6 +2120,14 @@ def emit_weights(
     if tile_extra:
         weights = {**{k: v for k, v in weights.items() if k not in tile_drop},
                    **tile_extra}
+    # K-axis permutation for linears that read an NHWC tensor through a flatten
+    # (assign_layouts --flatten-into-linear sets op["weight_perm"]). Applied to
+    # the logical [N, K] array before any backend packing, so every backend's
+    # weights.c agrees: the activation is one buffer shared by all of them.
+    perms = _linear_weight_perms(ir)
+    if perms:
+        weights = {k: (_apply_linear_weight_perm(v, perms[k]) if k in perms else v)
+                   for k, v in weights.items()}
     keys = sorted(weights.keys())
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
@@ -2160,6 +2168,47 @@ def emit_weights(
         c_lines.append("")
     with open(os.path.join(out_dir, "weights.c"), "w") as f:
         f.write("\n".join(c_lines))
+
+
+def _linear_weight_perms(ir: Optional[dict[str, Any]]) -> dict[str, dict]:
+    """weight key -> weight_perm, for every linear op carrying one.
+
+    A weight shared by ops that disagree is refused rather than packed one way.
+    """
+    perms: dict[str, dict] = {}
+    if not ir:
+        return perms
+    plain: set[str] = set()
+    for op in ir.get("ops", []) or []:
+        k = op.get("weight")
+        if not k:
+            continue
+        p = op.get("weight_perm")
+        if p is None:
+            plain.add(k)
+            continue
+        if p.get("kind") != "nhwc_flatten":
+            raise SystemExit(f"{op.get('name')}: unknown weight_perm {p!r}")
+        if k in perms and perms[k] != p:
+            raise SystemExit(f"weight {k!r}: conflicting weight_perm across ops")
+        perms[k] = p
+    both = plain & set(perms)
+    if both:
+        raise SystemExit(f"weights {sorted(both)} are read both permuted and "
+                         f"unpermuted; give the ops separate weight tensors")
+    return perms
+
+
+def _apply_linear_weight_perm(w: np.ndarray, p: dict) -> np.ndarray:
+    """[N, C*H*W] in NCHW-flatten order -> [N, H*W*C] in NHWC-flatten order:
+    w'[n, (h*W + w)*C + c] = w[n, (c*H + h)*W + w]."""
+    C, H, W = int(p["C"]), int(p["H"]), int(p["W"])
+    if w.ndim != 2 or w.shape[1] != C * H * W:
+        raise SystemExit(f"weight_perm {p!r} does not fit a weight of shape {w.shape}")
+    return np.ascontiguousarray(
+        w.reshape(w.shape[0], C, H, W).transpose(0, 2, 3, 1).reshape(w.shape[0], -1))
+
+
 
 
 def _shape_str(op: dict) -> str:
@@ -2397,7 +2446,9 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             name = aliases[name]
         return name
     for op in ir["ops"]:
-        if op["op"] == "view":
+        if op["op"] == "view" or op.get("elided"):
+            # An elided relayout (assign_layouts --elide-relayouts) is a
+            # dispatch with no body whose output is its input's buffer.
             aliases[op["outputs"][0]] = op["inputs"][0]
         elif op["op"] in ("chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"):
             # Two outputs: first half at offset 0, second half at offset
@@ -2850,6 +2901,25 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         if op["op"] in _zero_cost_ops:
             # view / chunk2_c1: no kernel call. Aliases were set up above
             # (plain aliases for view, offset aliases for chunk2_c1).
+            continue
+        if op.get("elided"):
+            # Kept only so the dispatch list (and so the schedule) matches a
+            # graph that still had this relayout; the data never moves.
+            dispatch_id = op["dispatch_id"]
+            dispatch_fns.append(
+                f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
+                f"    unsigned long _s = rdcycle();\n"
+                f"    (void)s; /* elided {op['op']}: the consumer reads this layout directly */\n"
+                f"    unsigned long _e = rdcycle();\n"
+                f"    int slot = (n_++) % MODEL_{umid}_OP_COUNT;\n"
+                f'    records_[slot].dispatch_id = {dispatch_id};\n'
+                f'    records_[slot].name   = "{op["name"]}";\n'
+                f'    records_[slot].op     = "{op["op"]}";\n'
+                f'    records_[slot].shape  = "{_shape_str(op)}";\n'
+                f"    records_[slot].cycles = _e - _s;\n"
+                f"}}"
+            )
+            invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
             continue
         if op["op"].startswith("__fused__"):
             # axis-C realization (see pipeline/apply_fusion_hint.py).
