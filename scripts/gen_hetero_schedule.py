@@ -59,7 +59,7 @@ _DEFAULT_CYCLES = 5_000
 # Ops that pipeline/fold_quant_consts.py rewrote keep their original's placement
 # and placeholder cost: folding constants must not move anything in the schedule
 # (the start times are release gates in the generated runtime).
-_FOLDED_FROM = {"batchnorm2d_q_s8": "batchnorm2d_s8", "add_q_s8": "add_s8"}
+_FOLDED_FROM = {"batchnorm2d_q_s8": "batchnorm2d_s8", "add_q_s8": "add_s8", "lstm_q_s8": "lstm_s8"}
 
 
 def _kind(op: dict) -> str:

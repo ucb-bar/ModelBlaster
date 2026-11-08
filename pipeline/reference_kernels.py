@@ -15452,6 +15452,115 @@ void kernel_add_q_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
 )
 
 
+# ── Integer LSTM cell (pipeline/lower_lstm_int.py: lstm_s8 -> lstm_q_s8) ─────
+# Same int8 weights, int32 biases and int8 h/c state as lstm_s8; the float64 cell
+# is replaced by exact int32 gate accumulators, one Q.16 requantize per gate,
+# interpolated 513-entry sigmoid/tanh tables and an integer cell update
+# (pipeline/lstm_q.py has the formulas and the numpy model). Every backend's
+# kernel shares the post stage (lstm_q.C_POST); only the matvecs differ.
+
+def _lstm_q_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i8p, i32p, i32p, i8p, i8p, i8p] + [ctypes.c_int] * 6
+
+
+def _lstm_q_s8_reference() -> str:
+    from modelblaster.pipeline import lstm_q as _lq
+    return ("#include <stdint.h>\n#include <string.h>\n" + _lq.c_tables() + _lq.C_POST + r"""
+#ifndef MB_LSTM_Q_MAX_HIDDEN
+#define MB_LSTM_Q_MAX_HIDDEN 1024
+#endif
+/* Plain loops: this file may be built into a Gemmini backend's translation unit
+ * with a vector -march for a core that has none, so the vectorizer stays off. */
+__attribute__((optimize("no-tree-vectorize")))
+void kernel_lstm_q_s8(const int8_t *input, const int8_t *w_ih, const int8_t *w_hh,
+                      const int32_t *b_ih, const int32_t *b_hh,
+                      int8_t *h_state, int8_t *c_state, int8_t *output,
+                      int input_size, int hidden_size, int Mx, int Mh, int S,
+                      int has_bias) {
+    const int H = hidden_size, IS = input_size;
+    static int8_t h_new[MB_LSTM_Q_MAX_HIDDEN];
+    if (H > MB_LSTM_Q_MAX_HIDDEN) return;
+    for (int t = 0; t < H; t++) {
+        int32_t ax[4], ah[4];
+        for (int q = 0; q < 4; q++) {
+            const int j = q * H + t;
+            const int8_t *wr = w_ih + (size_t)j * IS;
+            const int8_t *hr = w_hh + (size_t)j * H;
+            int32_t a = has_bias ? b_ih[j] + b_hh[j] : 0;
+            for (int k = 0; k < IS; k++) a += (int32_t)wr[k] * (int32_t)input[k];
+            int32_t b = 0;
+            for (int k = 0; k < H; k++) b += (int32_t)hr[k] * (int32_t)h_state[k];
+            ax[q] = a; ah[q] = b;
+        }
+        mb_lstm_q_cell(ax[0], ax[1], ax[2], ax[3], ah[0], ah[1], ah[2], ah[3],
+                       Mx, Mh, S, c_state, h_new, t);
+    }
+    for (int t = 0; t < H; t++) { h_state[t] = h_new[t]; output[t] = h_new[t]; }
+}
+""")
+
+
+LSTM_Q_S8 = KernelSpec(
+    op="lstm_q_s8",
+    signature=(
+        "void kernel_lstm_q_s8(const int8_t *input, const int8_t *w_ih, "
+        "const int8_t *w_hh, const int32_t *b_ih, const int32_t *b_hh, "
+        "int8_t *h_state, int8_t *c_state, int8_t *output, "
+        "int input_size, int hidden_size, int Mx, int Mh, int S, int has_bias)"
+    ),
+    semantics=(
+        "One timestep of a single-layer LSTM cell with an all-integer cell\n"
+        "(lstm_s8 after pipeline/lower_lstm_int.py). Gate order [i, f, g, o].\n"
+        "  A_x = b_ih + b_hh + W_ih @ x,  A_h = W_hh @ h_prev        (int32, exact)\n"
+        "  G   = clamp((A_x*Mx + A_h*Mh + 2^(S-1)) >> S, +-2^19)     (Q.16)\n"
+        "  gates via 513-entry interpolated sigmoid/tanh tables (Q0.15),\n"
+        "  integer cell update; h_state/c_state updated in place (int8, scales\n"
+        "  1/127 and 8/127), output = new h. See pipeline/lstm_q.py."
+    ),
+    reference_impl=_lstm_q_s8_reference(),
+    extra_shapes=[
+        {"input_size": 8, "hidden_size": 4},
+        {"input_size": 597, "hidden_size": 128},
+    ],
+    argtypes_factory=_lstm_q_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            description="Scalar loops, one hidden unit (4 gate rows) at a time.",
+            reference_impl="(the KernelSpec reference_impl)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+        AlgorithmCandidate(
+            name="gemmini_full_c",
+            description=(
+                "Both matvecs on Gemmini (tiled_matmul_auto, full_C: the raw "
+                "int32 accumulators come back unscaled), then the shared integer "
+                "cell on the CPU. Exact by construction: the post stage only sees "
+                "the integer accumulators."
+            ),
+            reference_impl="(kernels/gemmini_q31_rvv/, kernels/gemmini_q31/)",
+            target_affinity=("gemmini_q31", "gemmini_q31_rvv", "gemmini_q31_softfp"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            pin_only=True,
+        ),
+        AlgorithmCandidate(
+            name="rvv_dot",
+            description=(
+                "RVV int8 dot products (vwmul/vwredsum) for the gate rows, then "
+                "the shared integer cell."
+            ),
+            reference_impl="(kernels/rvv/rvv_lstm_q_s8_rvv_dot.c)",
+            target_affinity=("rvv",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            pin_only=True,
+        ),
+    ],
+)
+
+
 # ── Numerics variant: the Gemmini Q31 ACC_SCALE arithmetic on the scalar backend ─
 # A Gemmini build with MODELBLASTER_GEMMINI_Q31_ACC_SCALE requantizes conv2d_s8
 # with one folded Q0.31 scale sq = (M + 2^(s-1)) >> s and bias + 1 (the beta=1
@@ -15519,6 +15628,7 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'batchnorm2d_s8': BATCHNORM2D_S8,
     'batchnorm2d_q_s8': BATCHNORM2D_Q_S8,
     'add_q_s8': ADD_Q_S8,
+    'lstm_q_s8': LSTM_Q_S8,
     'sigmoid_s8': SIGMOID_S8,
     'relu_f16': RELU_F16,
     'sigmoid_f16': SIGMOID_F16,

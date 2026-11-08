@@ -3976,6 +3976,24 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_h'])}, {_f32(q['scale_c'])}, "
                 f"{q['has_bias']})"
             )
+        elif op["op"] == "lstm_q_s8":
+            # lstm_s8 after pipeline/lower_lstm_int.py: same buffers and weights,
+            # integer cell constants instead of float scales.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            q = op["quant"]
+            _h_key, _c_key = _lstm_state_keys(op)
+            h_ptr = ptr_for(_h_key, "inout")
+            c_ptr = ptr_for(_c_key, "inout")
+            call = (
+                f"kernel_lstm_q_s8({in_ptr}, "
+                f"{_weight_name(model_name, _lstm_weight_keys(op)[0], backend)}, "
+                f"{_weight_name(model_name, _lstm_weight_keys(op)[1], backend)}, "
+                f"{_weight_name(model_name, op['bias'], backend)}, "
+                f"{_weight_name(model_name, op['bias_hh'], backend)}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, "
+                f"{_lstm_dims(op)[0]}, {_lstm_dims(op)[1]}, "
+                f"{q['Mx']}, {q['Mh']}, {q['S']}, {q['has_bias']})"
+            )
         elif op["op"] == "leaky_relu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]

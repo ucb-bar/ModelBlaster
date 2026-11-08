@@ -30,7 +30,7 @@ def test_lstm_model_lowers(tmp_path):
     assert r.returncode == 0, r.stderr[-2000:]
     ops = [o["op"] for o in json.load(open(gen / "graph.json"))["ops"]]
     assert ops.count("lstm_s8") == 2
-    for lower in (False,):
+    for lower in (False, True):
         out = tmp_path / ("q" if lower else "f")
         if lower:
             r = _run(["pipeline/lower_lstm_int.py", str(gen / "graph.json"), str(gen / "weights.npz"),
