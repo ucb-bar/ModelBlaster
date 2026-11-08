@@ -44,8 +44,9 @@ def host_compile(c_source: str, label: str, workdir: str) -> str:
     src_path = os.path.join(workdir, f"{label}.c")
     so_path = os.path.join(workdir, f"{label}.so")
     with open(src_path, "w") as f:
-        if "#include" not in c_source:
-            f.write(_HOST_PROLOGUE)
+        # Always: the prologue is include-guarded headers only, and a source
+        # that includes one header (e.g. <limits.h>) still needs <stdint.h>.
+        f.write(_HOST_PROLOGUE)
         f.write(c_source)
     cmd = [HOST_CC, "-O2", "-fPIC", "-shared", "-Wno-unused-result",
            src_path, "-o", so_path, "-lm"]
@@ -351,6 +352,27 @@ def _gen_inputs_batchnorm2d_s8(shape: dict, rng: np.random.Generator):
     return inp, scale, bias, out
 
 
+def _gen_inputs_conv2d_pool_s8(shape: dict, rng: np.random.Generator):
+    N, IC, IH, IW, OC = shape["N"], shape["IC"], shape["IH"], shape["IW"], shape["OC"]
+    KH, KW = shape["KH"], shape["KW"]
+    OH, OW = _conv2d_oh_ow(shape)
+    pKH, pKW = shape.get("pool_KH", 1), shape.get("pool_KW", 1)
+    pSH, pSW = shape.get("pool_SH", 1), shape.get("pool_SW", 1)
+    pPH, pPW = shape.get("pool_PH", 0), shape.get("pool_PW", 0)
+    pDH, pDW = shape.get("pool_DH", 1), shape.get("pool_DW", 1)
+    OHp = (OH + 2 * pPH - pDH * (pKH - 1) - 1) // pSH + 1
+    OWp = (OW + 2 * pPW - pDW * (pKW - 1) - 1) // pSW + 1
+    inp = rng.integers(-128, 128, size=(N, IC, IH, IW), dtype=np.int8)
+    w = rng.integers(-128, 128, size=(OC, IC, KH, KW), dtype=np.int8)
+    b = rng.integers(-4096, 4096, size=(OC,), dtype=np.int32)
+    out = np.zeros((N, OC, OHp, OWp), dtype=np.int8)
+    # requant: the shape may pin it (an IR op's quant), else random positive Q0.31
+    q = np.array([shape.get("output_multiplier", int(rng.integers(1 << 29, (1 << 31) - 1))),
+                  shape.get("output_shift", int(rng.integers(0, 12))),
+                  shape.get("activation_min", -128), shape.get("activation_max", 127)], np.int64)
+    return inp, w, b, out, q
+
+
 def _gen_inputs_batchnorm2d_q_s8(shape: dict, rng: np.random.Generator):
     outer, C, inner = shape["outer"], shape["C"], shape["inner"]
     inp = rng.integers(-128, 128, size=(outer * C * inner,), dtype=np.int8)
@@ -531,6 +553,17 @@ def _i16p(arr: np.ndarray):
 
 
 def _run_kernel(fn, op: str, shape: dict, inputs):
+    if op == "conv2d_pool_s8":
+        inp, w, b, out, q = inputs
+        fn(_i8p(inp), _i8p(w), _i32p(b), _i8p(out),
+           shape["N"], shape["IC"], shape["IH"], shape["IW"], shape["OC"],
+           shape["KH"], shape["KW"], shape["SH"], shape["SW"], shape["PH"], shape["PW"],
+           0, 0, 0, int(q[0]), int(q[1]), int(q[2]), int(q[3]),
+           shape.get("pool_KH", 1), shape.get("pool_KW", 1),
+           shape.get("pool_SH", 1), shape.get("pool_SW", 1),
+           shape.get("pool_PH", 0), shape.get("pool_PW", 0),
+           shape.get("pool_DH", 1), shape.get("pool_DW", 1))
+        return out
     if op == "batchnorm2d_q_s8":
         inp, M, BP, S, out, q = inputs
         fn(_i8p(inp), _i32p(M), _i32p(BP), _i16p(S), _i8p(out),
@@ -840,7 +873,7 @@ _INTEGER_OPS = {"nchw_to_nhwc_s8", "nhwc_to_nchw_s8",
                 "depthwise_conv2d_s8", "slice_c_s8",
                 # patches/0100
                 "tanh_s8", "groupnorm_s8", "rope_s8",
-                "batchnorm2d_q_s8", "add_q_s8"}
+                "conv2d_pool_s8", "batchnorm2d_q_s8", "add_q_s8"}
 
 
 @dataclass
@@ -865,6 +898,8 @@ def verify(
     atol: float = 1e-4,
     rtol: float = 1e-3,
     seed: int = 0,
+    act_layout: str = "nchw",
+    weight_layout: str = "oihw",
 ) -> VerifyResult:
     """Compile the candidate, run it alongside the reference at each shape, and
     return whether numerics match within tolerance.
@@ -959,6 +994,8 @@ def verify(
                     inputs_ref = _gen_inputs_batchnorm2d_s8(shape, rng)
                 elif op == "sigmoid_s8":
                     inputs_ref = _gen_inputs_sigmoid_s8(shape, rng)
+                elif op == "conv2d_pool_s8":
+                    inputs_ref = _gen_inputs_conv2d_pool_s8(shape, rng)
                 elif op == "batchnorm2d_q_s8":
                     inputs_ref = _gen_inputs_batchnorm2d_q_s8(shape, rng)
                 elif op == "add_q_s8":
@@ -1014,10 +1051,22 @@ def verify(
                 else:
                     return VerifyResult(False, f"unsupported op {op}")
                 inputs_cand = tuple(a.copy() for a in inputs_ref)
+                # A candidate that declares NHWC activations / HWIO weights is
+                # handed the same data in its own layouts and its output is
+                # permuted back, so the NCHW/OIHW reference_impl stays the oracle.
+                if op == "conv2d_pool_s8" and (act_layout, weight_layout) != ("nchw", "oihw"):
+                    if weight_layout != "hwio" or act_layout != "nhwc":
+                        return VerifyResult(False, f"unsupported layouts {act_layout}/{weight_layout}")
+                    ci, cw, cb, co, cq = inputs_cand
+                    inputs_cand = (np.ascontiguousarray(ci.transpose(0, 2, 3, 1)),
+                                   np.ascontiguousarray(cw.transpose(2, 3, 1, 0)), cb,
+                                   np.ascontiguousarray(co.transpose(0, 2, 3, 1)), cq)
 
                 try:
                     out_ref = _run_kernel(ref_fn, op, shape, inputs_ref)
                     out_cand = _run_kernel(cand_fn, op, shape, inputs_cand)
+                    if op == "conv2d_pool_s8" and act_layout == "nhwc":
+                        out_cand = np.ascontiguousarray(out_cand.transpose(0, 3, 1, 2))
                 except Exception as e:  # ctypes / segfault wrapper
                     return VerifyResult(
                         False,
@@ -1079,3 +1128,60 @@ def verify(
     finally:
         with contextlib.suppress(OSError):
             shutil.rmtree(workdir)
+
+
+def main() -> None:
+    """Host-verify one curated kernel against its KernelSpec reference_impl.
+
+      python -m modelblaster.pipeline.verify_kernel --op OP --algorithm ALGO
+             [--target BACKEND] [--file F.c | --curated-dir ROOTS]
+             [--ir graph.json] [--trials N]
+
+    The file defaults to the curated path for (target, op, algorithm), looked up
+    in --curated-dir (default: this repository's kernels/; an os.pathsep list
+    like generate_kernels --global-curated-dir). Shapes are the spec's
+    extra_shapes plus every IR op of this kind (with its quant), and the
+    candidate gets inputs in the algorithm's declared act/weight layouts.
+    Kernels with target intrinsics cannot run here; a driver for an accelerator
+    can, if it falls back to a functional model of the device when built
+    without __riscv.
+    """
+    import argparse, json, sys
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--op", required=True)
+    ap.add_argument("--algorithm", required=True)
+    ap.add_argument("--target", default="gemmini_q31_rvv")
+    ap.add_argument("--file", default=None)
+    ap.add_argument("--curated-dir", default=None)
+    ap.add_argument("--ir", default=None)
+    ap.add_argument("--trials", type=int, default=3)
+    a = ap.parse_args()
+    spec = KERNEL_SPECS[a.op]
+    algo = next(x for x in spec.algorithms if x.name == a.algorithm)
+    path = a.file
+    if path is None:
+        from modelblaster.pipeline.generate_kernels import _curated_path
+        roots = a.curated_dir or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kernels")
+        path = _curated_path(roots, a.target, a.op, a.algorithm)
+        if path is None:
+            sys.exit(f"[verify_kernel] no curated {a.target}_{a.op}_{a.algorithm}.c "
+                     f"under {roots}")
+    shapes = [dict(s) for s in spec.extra_shapes]
+    if a.ir:
+        for o in json.load(open(a.ir))["ops"]:
+            if o.get("op") == a.op:
+                sh = dict(o["shape"])
+                for k in ("output_multiplier", "output_shift", "activation_min", "activation_max"):
+                    if k in (o.get("quant") or {}):
+                        sh[k] = o["quant"][k]
+                shapes.append(sh)
+    r = verify(spec, open(path).read(), shapes, n_trials=a.trials,
+               act_layout=(algo.act_layouts or ("nchw",))[0], weight_layout=algo.weight_layout)
+    print(f"[verify_kernel] {a.op}/{a.algorithm} {path}: {'PASS' if r.ok else 'FAIL'} -- {r.message}")
+    sys.exit(0 if r.ok else 1)
+
+
+if __name__ == "__main__":
+    main()
