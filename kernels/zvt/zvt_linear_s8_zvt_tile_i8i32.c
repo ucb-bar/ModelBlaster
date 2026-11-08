@@ -22,9 +22,19 @@
  * vl = cols without a vsetvli (a vsetvli would clear mtype). The K
  * remainder (K % 4) is added in the scalar tail.
  *
- * ONE ASM BLOCK PER TILE: config, zero, K-loop and read-out are a single
- * asm statement, so no compiler-generated vector code (e.g. the
- * requantize loop, if auto-vectorized) can land between tile ops.
+ * SIZE-AGNOSTIC: the tile edge T is whatever the hart grants for
+ * msettm/msettn (min(TE, 2*VLEN/8) for i8->i32), capped at MB_ZVT_TMAX,
+ * so one binary adapts to any instance of the tile-unit generator.
+ *
+ * ASM BLOCKS: the tile config (mtype) only has to survive *within* one
+ * asm statement -- any compiler-emitted vsetvl between statements clears
+ * it, but never touches tile contents. So config + zero + K-loop is one
+ * statement, and each read-out row is its own statement that starts by
+ * re-establishing the config.
+ *
+ * SMALL N (< MB_ZVT_MIN_N, e.g. DroNet's 2048->1 heads) uses RVV dot
+ * products instead: a near-empty tile wastes the engine. The requantize
+ * tail is RVV too (zvt_requant_s8, bit-exact int64 lanes).
  *
  * OFFSETS. vtmms multiplies raw int8; nonzero input/filter offsets are
  * folded in with the usual sum correction (zero across this tree's
@@ -34,12 +44,52 @@
  * the harness calls arch_riscv_zvt_enable() under CONFIG_RISCV_ISA_EXT_ZVT.
  */
 
-#ifndef MB_ZVT_TILE
-#define MB_ZVT_TILE 32 /* min(TE, 2*VLEN/8): zvt32t, VLEN=128 */
+#ifndef MB_ZVT_MIN_N
+#define MB_ZVT_MIN_N 8 /* below this, a GEMV (RVV dot) beats the tile */
 #endif
+
+#ifndef MB_ZVT_TMAX
+#define MB_ZVT_TMAX 128 /* cap on the granted tile edge (stack row buffer) */
+#endif
+
+/* Re-establish e8+altfmt / widen=4 / tk=4 / tm=mr / vl=tn=nc. */
+#define ZVT_LIN_CFG \
+    "vsetvl %[tmp], x0, %[vt]\n\t" \
+    ZVT_S_MSETMTYPE("%[mt]", "%[vt]") \
+    ZVT_S_MSETTM("%[tmp]", "%[mr]") \
+    ZVT_S_MSETTN("%[tmp]", "%[nc]")
 
 void kernel_linear_s8(const int8_t *input, const int8_t *weight, const int32_t *bias, int8_t *output, int M, int K, int N, int input_offset, int filter_offset, int output_offset, int output_multiplier, int output_shift, int activation_min, int activation_max) {
     if (M <= 0 || N <= 0) {
+        return;
+    }
+
+    if (N < MB_ZVT_MIN_N) {
+        /* Too few output columns to fill a tile (B loads would run at
+         * vl = N and each vtmms would do 4*N MACs per row): contiguous-K
+         * RVV dot products instead. */
+        const int has_off_g = input_offset != 0 || filter_offset != 0;
+        for (int m = 0; m < M; m++) {
+            const int8_t *in_row = input + (size_t)m * (size_t)K;
+            int32_t in_sum = 0;
+            if (has_off_g) {
+                for (int k = 0; k < K; k++) in_sum += in_row[k];
+            }
+            for (int n = 0; n < N; n++) {
+                const int8_t *w_row = weight + (size_t)n * (size_t)K;
+                int32_t acc = zvt_vdot8(in_row, w_row, K);
+                if (has_off_g) {
+                    int32_t w_sum = 0;
+                    for (int k = 0; k < K; k++) w_sum += w_row[k];
+                    acc += input_offset * w_sum + filter_offset * in_sum +
+                           K * input_offset * filter_offset;
+                }
+                zvt_requant_s8(output + (size_t)m * (size_t)N + (size_t)n, &acc,
+                               NULL, 0, NULL, 0, bias != NULL ? bias[n] : 0, 1,
+                               output_multiplier, output_shift, output_offset,
+                               activation_min, activation_max);
+            }
+        }
         return;
     }
 
@@ -48,12 +98,12 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight, const int32_t *
     const long k_steps = K / 4;
     const int k_main = (int)k_steps * 4;
     const long stride = K;
-    int32_t tile_out[MB_ZVT_TILE * MB_ZVT_TILE];
+    int32_t row_out[MB_ZVT_TMAX];
 
     /* Granted tile edge: msettm/msettn clamp to min(LMUL*VLEN/8, TE). */
     unsigned long T;
     {
-        unsigned long want = MB_ZVT_TILE, gm, gn, tmp;
+        unsigned long want = MB_ZVT_TMAX, gm, gn, tmp;
         __asm__ volatile(
             "vsetvl %[tmp], x0, %[vt]\n\t"
             ZVT_S_MSETMTYPE("%[mt]", "%[vt]")
@@ -73,15 +123,10 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight, const int32_t *
             const int8_t *pa = input + (size_t)m0 * (size_t)K;
             const int8_t *pb = weight + (size_t)n0 * (size_t)K;
             long ks = k_steps;
-            int32_t *po = tile_out;
-            unsigned long row_bytes = T * 4, tmp;
+            unsigned long tmp;
 
             __asm__ volatile(
-                /* configure: e8+altfmt, widen=4, tk=4, tm=mr, vl=tn=nc */
-                "vsetvl %[tmp], x0, %[vt]\n\t"
-                ZVT_S_MSETMTYPE("%[mt]", "%[vt]")
-                ZVT_S_MSETTM("%[tmp]", "%[mr]")
-                ZVT_S_MSETTN("%[tmp]", "%[nc]")
+                ZVT_LIN_CFG
                 ZVT_S_VTZERO(0)
                 "beqz %[ks], 2f\n"
                 "1:\n\t"
@@ -107,27 +152,17 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight, const int32_t *
                 "addi %[ks], %[ks], -1\n\t"
                 "bnez %[ks], 1b\n"
                 "2:\n\t"
-                /* read out mr rows of nc int32 (vl == nc) */
-                "li t2, 0\n"
-                "3:\n\t"
-                "bgeu t2, %[mr], 4f\n\t"
-                ZVT_S_VTSE32("%[po]", "t2")
-                "add %[po], %[po], %[rb]\n\t"
-                "addi t2, t2, 1\n\t"
-                "j 3b\n"
-                "4:\n\t"
-                : [pa] "+r"(pa), [pb] "+r"(pb), [ks] "+r"(ks), [po] "+r"(po),
-                  [tmp] "=&r"(tmp)
+                : [pa] "+r"(pa), [pb] "+r"(pb), [ks] "+r"(ks), [tmp] "=&r"(tmp)
                 : [mt] "r"(mtype), [vt] "r"(vtype), [mr] "r"(mr), [nc] "r"(nc),
-                  [st] "r"(stride), [rb] "r"(row_bytes)
-                : "t1", "t2", "memory",
+                  [st] "r"(stride)
+                : "t1", "memory",
                   "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
                   "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15");
 
             /* Offset correction terms, hoisted per tile: O((mr+nc)*K)
              * instead of O(mr*nc*K). Only needed for asymmetric quant. */
             const int has_off = input_offset != 0 || filter_offset != 0;
-            int32_t row_sum[MB_ZVT_TILE], col_sum[MB_ZVT_TILE];
+            int32_t row_sum[MB_ZVT_TMAX], col_sum[MB_ZVT_TMAX];
             if (has_off) {
                 for (int i = 0; i < (int)mr; i++) {
                     const int8_t *r = input + (size_t)(m0 + i) * (size_t)K;
@@ -146,38 +181,31 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight, const int32_t *
             for (int i = 0; i < (int)mr; i++) {
                 int m = m0 + i;
                 const int8_t *in_row = input + (size_t)m * (size_t)K;
+                unsigned long tss = (unsigned long)i; /* tile 0, row i */
 
-                for (int j = 0; j < (int)nc; j++) {
-                    int n = n0 + j;
-                    const int8_t *w_row = weight + (size_t)n * (size_t)K;
-                    int32_t acc = tile_out[(size_t)i * T + (size_t)j];
+                __asm__ volatile(
+                    ZVT_LIN_CFG
+                    ZVT_S_VTSE32("%[po]", "%[tss]")
+                    : [tmp] "=&r"(tmp)
+                    : [mt] "r"(mtype), [vt] "r"(vtype), [mr] "r"(mr), [nc] "r"(nc),
+                      [po] "r"(row_out), [tss] "r"(tss)
+                    : "memory");
 
-                    for (int k = k_main; k < K; k++) {
-                        acc += (int32_t)in_row[k] * (int32_t)w_row[k];
+                if (k_main < K) { /* K % 4 remainder */
+                    for (int jj = 0; jj < (int)nc; jj++) {
+                        const int8_t *w_row = weight + (size_t)(n0 + jj) * (size_t)K;
+                        for (int k = k_main; k < K; k++) {
+                            row_out[jj] += (int32_t)in_row[k] * (int32_t)w_row[k];
+                        }
                     }
-                    if (has_off) {
-                        acc += input_offset * col_sum[j] + filter_offset * row_sum[i] +
-                               K * input_offset * filter_offset;
-                    }
-                    if (bias != NULL) {
-                        acc += bias[n];
-                    }
-
-                    /* Requantize exactly as the linear_s8 reference does,
-                     * including its int32 truncation points. */
-                    int64_t prod = (int64_t)acc * (int64_t)output_multiplier;
-                    prod = (prod + (1LL << 30)) >> 31;
-                    int32_t scaled = (int32_t)prod;
-                    if (output_shift > 0) {
-                        scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (output_shift - 1))) >> output_shift);
-                    } else if (output_shift < 0) {
-                        scaled = scaled << (-output_shift);
-                    }
-                    scaled += output_offset;
-                    if (scaled < activation_min) scaled = activation_min;
-                    if (scaled > activation_max) scaled = activation_max;
-                    output[(size_t)m * (size_t)N + (size_t)n] = (int8_t)scaled;
                 }
+                zvt_requant_s8(output + (size_t)m * (size_t)N + (size_t)n0, row_out,
+                               bias != NULL ? bias + n0 : NULL, 1,
+                               has_off ? col_sum : NULL, input_offset,
+                               has_off ? filter_offset * row_sum[i] +
+                                             K * input_offset * filter_offset : 0,
+                               (int)nc, output_multiplier, output_shift, output_offset,
+                               activation_min, activation_max);
             }
         }
     }

@@ -624,6 +624,29 @@ void kernel_linear(const float *input, const float *weight, const float *bias,
         {"M": 4, "K": 17, "N": 23},     # batch > 1
         {"M": 1, "K": 64, "N": 64},     # power-of-two
     ],
+    algorithms=[
+        AlgorithmCandidate(
+            name="zvt_tile_f32",
+            target_affinity=("zvt",),
+            # Bit-exact only against a reference built WITHOUT FMA
+            # contraction (vtfmm rounds the multiply and the add
+            # separately); vs a contracted (fmadd) build it drifts by
+            # rounding. Hence numeric_drift.
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Zvt fp32 LINEAR via vtfmm.tvv (mtype widen=1, tk=1, vtype "
+                "e32): a rank-1 tile update acc[m][n] += A[m]*B[n] per k, "
+                "multiply and add separately rounded, in k order. A = input "
+                "column k (vlse32, stride 4K bytes) in v0, B = weight column "
+                "k in v8. The accumulator tile is seeded with the bias row "
+                "(vtle32 per tile row) so the add order matches the "
+                "reference, and results are vtse32'd straight to output "
+                "rows. Tile edge = granted msettm/msettn. Whole tile in one "
+                "asm block. Encodings: cores/zvt/include/zvt_insn.h."
+            ),
+            reference_impl="(use the curated kernel zvt/zvt_linear_zvt_tile_f32.c)",
+        ),
+    ],
     argtypes_factory=_linear_argtypes,
 )
 
@@ -2552,6 +2575,27 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "(use the curated kernel "
                 "pext/pext_conv2d_s8_pext_patch_dot8.c)"
             ),
+        ),
+        AlgorithmCandidate(
+            name="zvt_igemm_i8i32",
+            target_affinity=("zvt",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            # OIHW: weight[oc*K + k] is K-contiguous per output channel,
+            # which is exactly a strided vlse8 A-column over oc.
+            weight_layout="oihw",
+            description=(
+                "Zvt int8 CONV2D as implicit GEMM on the vtmms tile MAC "
+                "(e8+altfmt, widen=4, tk=4): M=OC (A K-columns are OIHW "
+                "weight rows, vlse8 stride K), N=OH*OW (B K-columns are a "
+                "4-column im2col strip packed per K-step, zeros at padding), "
+                "K=IC*KH*KW. Up to 4 int32 accumulator tiles (0/4/8/12) are "
+                "live, so each strip feeds 4*T output channels. Last K-step: "
+                "B columns k>=K are 0 and A addresses clamp to K-1 (no OOB). "
+                "Rows read out with vtse32 and requantized exactly as the "
+                "reference; offsets via sum correction. Encodings: "
+                "cores/zvt/include/zvt_insn.h."
+            ),
+            reference_impl="(use the curated kernel zvt/zvt_conv2d_s8_zvt_igemm_i8i32.c)",
         ),
         AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
