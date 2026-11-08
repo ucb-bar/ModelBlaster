@@ -40,18 +40,15 @@ _DEFAULT_CKPT = os.path.join(
 # Trained config: 3-channel input at 112x112.
 #
 # MODELBLASTER_DRONET_INPUT rescales the input for SCALED VARIANTS used in
-# scheduling / performance studies. The trained checkpoint only fits the
-# default 112, so a rescaled model is left at its seeded random init: the
-# golden is generated from those same weights, so bit-exactness still checks
-# and the compute SHAPE is what the variant exists to vary. Its predictions
-# are meaningless -- never quote a scaled variant as an accuracy result.
-# MODELBLASTER_DRONET_CHANNELS selects the input channel count for GRAYSCALE /
-# performance variants (default 3 = the trained RGB config, unchanged). A
-# non-3 channel count cannot match the trained checkpoint's conv0 shape, so it
-# is handled exactly like a rescaled geometry below: seeded random init, golden
-# generated from the same weights, so correctness still checks and the compute
-# SHAPE (grayscale = 1ch conv0) is what the variant exists to vary. Never quote
-# a grayscale/scaled variant as an accuracy result.
+# scheduling / performance studies, and MODELBLASTER_DRONET_CHANNELS selects
+# the input channel count for GRAYSCALE variants (default 3 = the trained RGB
+# config, unchanged). Neither fits the default checkpoint, so such a geometry
+# loads a checkpoint only when MODELBLASTER_DRONET_CKPT names one trained for
+# it (strictly: every key and shape must match, see _load_matched_checkpoint),
+# and is otherwise left at its seeded random init. The golden is generated
+# from whichever weights the model holds, so bit-exactness checks either way,
+# but a random-init variant's predictions are meaningless: never quote one as
+# an accuracy result.
 _IMG_CHANNELS = int(os.environ.get("MODELBLASTER_DRONET_CHANNELS", "3"))
 _IMG_H = int(os.environ.get("MODELBLASTER_DRONET_INPUT", "112"))
 _IMG_W = _IMG_H
