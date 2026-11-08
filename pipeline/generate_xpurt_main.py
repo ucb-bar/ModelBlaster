@@ -1546,9 +1546,15 @@ def _apply_seq(src: str, seq: dict[str, dict], backends: list[str]) -> str:
         if len(ins) != T or len(outs) != T:
             raise SystemExit(f"--seq {net}: {len(ins)} inputs / {len(outs)} outputs, expected {T}")
         decls += [
-            f"static const int8_t seq_in_{mid}[{T}][{len(ins[0])}] = {_carr2(ins)};",
+            # Rows padded to 64 bytes and the array 64-byte aligned: every tick's input is as aligned as a
+            # deployment's input buffer would be. With unpadded rows of an odd size, most ticks' inputs are
+            # misaligned, and a kernel that copies or DMAs its input pays for it (measured: a byte-wise memcpy
+            # on 14 of 16 ticks).
+            f"static const int8_t seq_in_{mid}[{T}][{-(-len(ins[0]) // 64) * 64}] __attribute__((aligned(64))) = "
+            f"{_carr2(ins)};",
             f"static const int8_t seq_gold_{mid}[{T}][{len(outs[0])}] = {_carr2(outs)};",
-            f"_Static_assert(sizeof(seq_in_{mid}[0]) == MODEL_{umid}_INPUT_SIZE, \"seq input size\");",
+            f"_Static_assert(sizeof(seq_in_{mid}[0]) >= MODEL_{umid}_INPUT_SIZE && sizeof(seq_in_{mid}[0]) < "
+            f"MODEL_{umid}_INPUT_SIZE + 64, \"seq input size\");",
             f"_Static_assert(sizeof(seq_gold_{mid}[0]) == MODEL_{umid}_OUTPUT_SIZE, \"seq output size\");",
             f"static uint64_t tick_wall_{mid}[{T}];",
             f"static int8_t tick_out_{mid}[{T}][{len(outs[0])}];",
