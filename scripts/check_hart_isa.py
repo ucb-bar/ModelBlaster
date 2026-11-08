@@ -63,6 +63,11 @@ def main():
         if m:
             funcs[cur].append((m.group(1), m.group(2), m.group(3), m.group(4)))
     missing = sorted(r for r in roots if r not in funcs)
+    if len(missing) == len(roots):
+        # Not one root links: the --model or --impl-backend mapping is wrong, and the walk
+        # would check nothing and pass.
+        sys.exit(f"[check_hart_isa] FAIL: none of the {len(roots)} hart-{a.hart} kernel roots is in "
+                 f"the ELF (wrong --model or --impl-backend?): {missing}")
     seen, todo, bad = set(), sorted(r for r in roots if r in funcs), []
     while todo:
         f = todo.pop()
