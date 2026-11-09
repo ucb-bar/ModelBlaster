@@ -173,3 +173,32 @@ class CodeCopyScaleTests(unittest.TestCase):
                                  w.tensors_meta[i]["quant"]["scale"])
                 checked += 1
         self.assertEqual(checked, 2)
+
+
+class DepthwisePerChannelTests(unittest.TestCase):
+
+    def _walk_dw(self, pc_dw):
+        m = torch.nn.Sequential(torch.nn.Conv2d(4, 4, 3, padding=1, groups=4)).eval()
+        with torch.no_grad():
+            m[0].weight.mul_(torch.tensor([1.0, 10.0, 0.1, 3.0]).view(4, 1, 1, 1))
+        x = torch.randn(1, 4, 6, 6)
+        ep = torch.export.export(m, (x,))
+        names = [s.arg.name for s in ep.graph_signature.input_specs if s.kind.name == "USER_INPUT"]
+        w = ege._ExportWalker(ep, [{names[0]: x}], names, per_channel=True, quant="int8",
+                              op_precision={}, per_channel_depthwise=pc_dw)
+        w.calibrate()
+        w.emit()
+        return w
+
+    def test_default_stays_per_tensor(self):
+        w = self._walk_dw(False)
+        self.assertEqual([op["op"] for op in w.ops], ["depthwise_conv2d_s8"])
+
+    def test_opt_in_is_per_channel(self):
+        w = self._walk_dw(True)
+        op = w.ops[0]
+        self.assertEqual(op["op"], "depthwise_conv2d_s8_pc")
+        wq = w.weights_blob[op["weight"]]
+        # every channel uses the full int8 range despite the 100x magnitude spread
+        self.assertTrue(all(abs(int(wq[c].min())) == 127 or int(wq[c].max()) == 127 for c in range(4)))
+        self.assertEqual(len(w.weights_blob[op["quant"]["output_multiplier_per_oc_key"]]), 4)
