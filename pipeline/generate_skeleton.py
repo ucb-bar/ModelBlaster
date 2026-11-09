@@ -4088,6 +4088,31 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{mult}, {shift}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "depthwise_conv2d_s8_pc":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
+            # An OC tile of a depthwise conv would also have to move its
+            # INPUT channels, which _oc_tile_operands does not do.
+            if (op.get("split_from") or {}).get("axis") == "OC":
+                raise SystemExit(
+                    f"{op.get('name')}: OC tiles of depthwise_conv2d_s8_pc "
+                    f"are not supported (the input channels move too)")
+            C = sh.get("OC") or sh.get("C") or sh.get("groups")
+            call = (
+                f"kernel_depthwise_conv2d_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {C}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{mult}, {shift}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
         # ---- ViNT s8 ops ----
         elif op["op"] == "depthwise_conv2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")

@@ -232,7 +232,8 @@ class _ExportWalker:
     def __init__(self, ep, calibration_tensors: list[dict[str, torch.Tensor]],
                  input_order: list[str], per_channel: bool = False,
                  quant: str = "int8",
-                 op_precision: Optional[dict[str, str]] = None):
+                 op_precision: Optional[dict[str, str]] = None,
+                 per_channel_depthwise: bool = False):
         self.ep = ep
         self.gm = ep.graph_module
         # When True, conv2d / linear / matmul emit their per-channel
@@ -240,6 +241,10 @@ class _ExportWalker:
         # output channel) instead of the per-tensor form. Activations
         # remain per-tensor symmetric.
         self.per_channel = per_channel
+        # Extends per_channel to depthwise convs (depthwise_conv2d_s8_pc).
+        # A separate opt-in so IRs extracted with per_channel alone stay
+        # byte-identical.
+        self.per_channel_depthwise = per_channel_depthwise
         # Default precision for ops without an explicit override:
         #   "int8" — existing PTQ path
         #   "fp16" — half-precision (weights cast to float16, op records
@@ -1582,7 +1587,8 @@ class _ExportWalker:
         # accept per-channel arrays and it's a smaller accuracy win
         # (per-channel matters most where output dim is large; depthwise
         # outputs are typically small after the channel mix).
-        use_pc = self.per_channel and not is_depthwise
+        use_pc = self.per_channel and (
+            not is_depthwise or self.per_channel_depthwise)
         if use_pc:
             # Per-OC max_abs over the (IC, KH, KW) dims that contribute
             # to each OC.
@@ -1592,7 +1598,7 @@ class _ExportWalker:
             w_q = np.empty_like(w_np, dtype=np.int8)
             for oc in range(OC):
                 w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)
-            op_kind = "conv2d_s8_pc"
+            op_kind = "depthwise_conv2d_s8_pc" if is_depthwise else "conv2d_s8_pc"
             w_key = f"{n.name}.weights"
             self.weights_blob[w_key] = w_q
             b_key = None
@@ -2830,6 +2836,16 @@ def main():
                         "node names; matching ops are promoted to fp16. "
                         "Additive to --fp16-ops and the model's spec. "
                         "Example: --fp16-patterns 'layer_norm_*'")
+    p.add_argument("--per-channel-depthwise", action="store_true",
+                   default=os.environ.get("MB_INT8_PC_DEPTHWISE", "0") == "1",
+                   help="Extend --per-channel to depthwise convs (emits "
+                        "depthwise_conv2d_s8_pc). A separate opt-in so IRs "
+                        "extracted with --per-channel alone keep reproducing "
+                        "byte for byte. After BN folding a depthwise layer's "
+                        "channels differ in magnitude by orders of magnitude, "
+                        "so one scale leaves most of them a few codes (ViNT: "
+                        "421 of 17,920 channels use <= 8 levels). Also "
+                        "MB_INT8_PC_DEPTHWISE=1.")
     p.add_argument("--precision-spec", default="model",
                    help="Per-op precision spec: 'model' (default) uses the "
                         "model module's get_precision_spec(); 'none' uses "
@@ -2931,6 +2947,7 @@ def main():
 
     walker = _ExportWalker(ep, calib_dicts, input_order,
                            per_channel=args.per_channel,
+                           per_channel_depthwise=args.per_channel_depthwise,
                            quant=args.quant,
                            op_precision=op_precision)
     print(f"[extract_export] calibrating + capturing intermediates ...",
