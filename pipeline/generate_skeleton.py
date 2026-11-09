@@ -2158,7 +2158,10 @@ def emit_weights(
                 f"/* {ident}: shape {tuple(arr_in.shape)} OIHW → "
                 f"{tuple(arr_out.shape)} {layout_tag} */"
             )
-        c_lines.append(f"const {c_type} {ident}[{arr_out.size}] = {{")
+        # graph.json "weight_align": {key: bytes}: arrays a device reads in place (e.g. an accelerator's DMA)
+        _al = ((ir or {}).get("weight_align") or {}).get(k)
+        _attr = f" __attribute__((aligned({int(_al)})))" if _al else ""
+        c_lines.append(f"const {c_type} {ident}[{arr_out.size}]{_attr} = {{")
         if arr_out.dtype == np.float64:
             # repr() round-trips a double exactly
             flat = arr_out.reshape(-1)
