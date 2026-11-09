@@ -4788,21 +4788,41 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 .replace("(output + ", "(s->output + "))
             if out_ptr_for_inspect in ("input", "output"):
                 out_ptr_for_inspect = f"s->{out_ptr_for_inspect}"
-            if t_dtype == "i8":
-                cast = "int8_t"
-            elif t_dtype == "f16":
-                cast = "_Float16"
+            _int_c = {"i8": "int8_t", "i16": "int16_t", "i32": "int32_t",
+                      "i64": "int64_t"}
+            if t_dtype in _int_c:
+                # Integer codes print exactly (an int64 accumulator does not
+                # survive a trip through float).
+                cast = _int_c[t_dtype]
+                _pr = 'printf("%lld\\n", (long long)_p[_i]);'
             else:
-                cast = "float"
+                cast = "_Float16" if t_dtype == "f16" else "float"
+                _pr = 'printf("%g\\n", (double)(float)_p[_i]);'
             inspect_block += (
                 f'    printf("=== MODELBLASTER_INSPECT_BEGIN [{out_t}] === '
                 f'scale=%g dtype={t_dtype} n=%d\\n", '
                 f'{_f32(t_scale)}, {n_elems});\n'
                 f"    {{ const {cast} *_p = (const {cast} *){out_ptr_for_inspect};\n"
                 f"      for (int _i = 0; _i < {n_elems}; _i++) "
-                f'printf("%g\\n", (double)(float)_p[_i]); }}\n'
+                f'{_pr} }}\n'
                 f'    printf("=== MODELBLASTER_INSPECT_END [{out_t}] ===\\n");\n'
             )
+        # Per-layer golden check (generate(..., layer_golden=...)): after the
+        # LAST op that writes a checked tensor, hash its bytes and compare with
+        # the golden's. One line per tensor; nothing is emitted without a
+        # layer golden, so such builds are unchanged.
+        for out_t in op.get("outputs", []):
+            _lc = (ir.get("_layer_check") or {}).get(out_t)
+            if _lc is None or _lc["last_writer"] != op["name"]:
+                continue
+            _p = (ptr_for(out_t, "out")
+                  .replace("(input + ", "(s->input + ")
+                  .replace("(output + ", "(s->output + "))
+            if _p in ("input", "output"):
+                _p = f"s->{_p}"
+            inspect_block += (
+                f'    mb_layer_check_{mid}("{out_t}", (const void *){_p}, '
+                f'{_lc["nbytes"]}UL, 0x{_lc["crc32"]:08x}UL);\n')
         dispatch_fns.append(
             f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
             f"    unsigned long _s = rdcycle();\n"
@@ -5022,7 +5042,7 @@ static int n_;
  * from k_cycle_get_64() (mtime). Cross-hart correct, lower resolution
  * than per-op rdcycle. */
 static unsigned long wall_cycles_;
-
+{_layer_check_src(mid) if ir.get("_layer_check") else ""}
 /* ---------- per-dispatch invoke fns (one per non-view IR op) ----------- */
 {layout_scratch_src}{chr(10).join(shard_tables)}
 
@@ -5257,6 +5277,54 @@ def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
         f.write("\n".join(h_lines))
 
 
+def _layer_check_src(mid: str) -> str:
+    # CRC-32 (zlib's: reflected, polynomial 0xEDB88320), bitwise: a few lines,
+    # no table, and the host side is zlib.crc32.
+    return (
+        "#include <stdio.h>\n"
+        f"static void mb_layer_check_{mid}(const char *name, const void *p, "
+        "unsigned long n, unsigned long exp)\n{\n"
+        "    const unsigned char *b = (const unsigned char *)p;\n"
+        "    unsigned long c = 0xffffffffUL;\n"
+        "    for (unsigned long i = 0; i < n; i++) {\n"
+        "        c ^= b[i];\n"
+        "        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xedb88320UL & (0UL - (c & 1UL)));\n"
+        "    }\n"
+        "    c = (c ^ 0xffffffffUL) & 0xffffffffUL;\n"
+        '    printf("=== MODELBLASTER_LAYER [%s] %s %08lx %08lx ===\\n", name,\n'
+        '           c == exp ? "ok" : "BAD", c, exp);\n}\n')
+
+
+def attach_layer_golden(ir: dict, path: str) -> int:
+    """Attach a per-layer golden (an npz of IR tensor name -> expected array, in
+    the tensor's IR layout and dtype) to `ir` for emit_model. Refuses an array
+    whose size or dtype differs from the tensor's."""
+    import zlib
+    gold = np.load(path)
+    last = {}
+    for op in ir["ops"]:
+        if op.get("dispatch_id") is None:
+            continue
+        for t in op.get("outputs", []):
+            last[t] = op["name"]
+    _np_dt = {"i8": np.int8, "i16": np.int16, "i32": np.int32, "i64": np.int64,
+              "f16": np.float16, "f32": np.float32}
+    chk = {}
+    for t in gold.files:
+        meta = ir["tensors"].get(t)
+        if meta is None or t not in last:
+            raise SystemExit(f"layer golden: {t!r} is not a tensor an op writes")
+        a = gold[t]
+        n = _prod(meta["shape"])
+        if a.size != n or a.dtype != _np_dt[meta.get("dtype", "i8")]:
+            raise SystemExit(f"layer golden: {t!r} is {a.dtype}[{a.size}], the "
+                             f"IR tensor {meta.get('dtype')}[{n}]")
+        b = np.ascontiguousarray(a).tobytes()
+        chk[t] = {"nbytes": len(b), "crc32": zlib.crc32(b), "last_writer": last[t]}
+    ir["_layer_check"] = chk
+    return len(chk)
+
+
 def generate(
     ir_path: str,
     weights_path: str,
@@ -5264,10 +5332,13 @@ def generate(
     out_dir: str,
     backend: Optional[str] = None,
     platform: str = "zephyr",
+    layer_golden: Optional[str] = None,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
         ir = json.load(f)
+    if layer_golden:
+        print(f"layer golden: {attach_layer_golden(ir, layer_golden)} tensors checked")
     weights = dict(np.load(weights_path))
     model_name = ir["name"]
 
@@ -5308,9 +5379,15 @@ def main() -> None:
                          "(int8 arithmetic is exact, so max_abs_err is "
                          "architecture-independent) and its cycle counts are "
                          "host nanoseconds -- never a cost input.")
+    ap.add_argument("--layer-golden", default=None,
+                    help="npz of IR tensor name -> expected array (IR layout and "
+                         "dtype). Each listed tensor is hashed after the last op "
+                         "that writes it and compared with the golden's hash; the "
+                         "model prints one MODELBLASTER_LAYER line per tensor. "
+                         "Without it nothing changes in the generated code.")
     args = ap.parse_args()
     generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend,
-             platform=args.platform)
+             platform=args.platform, layer_golden=args.layer_golden)
 
 
 if __name__ == "__main__":

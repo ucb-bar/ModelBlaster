@@ -15924,4 +15924,8 @@ def load_extensions(paths: Optional[str] = None) -> list[str]:
     return loaded
 
 
+# Integer-closed op kinds (integer_kernels.py) register themselves here, before
+# any extension, so every stage that imports this module sees them.
+from . import integer_kernels as _integer_kernels  # noqa: E402,F401
+
 load_extensions()
