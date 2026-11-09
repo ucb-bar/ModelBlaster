@@ -265,19 +265,56 @@ LINEAR_Q = rk.KernelSpec(
     semantics="out[m,n] = sat_out(requant(bias[n] + sum_k x[m,k]*w[n,k], mult[n], shift[n])) in int64, then "
               "max(., 0) if relu. out_bits = 64 writes the raw accumulator (no requant; mult/shift unused).",
     reference_impl=_src(r"""
+/* Exact dot products, typed by the input width, four output channels per pass (each input code is loaded once
+ * for four weight rows). |x*w| < 2^22 (int16 x int8 weights in [-127, 127]), so int32 partial sums over 256 terms
+ * cannot overflow; they are added into int64 accumulators: the same integer sum as the plain loop. */
+#define MBI_LIN_CHUNK 256
+#define MBI_LIN_BODY(T)                                                                                   \
+    {                                                                                                     \
+        const T *x = (const T *)input + (long)m * K;                                                      \
+        for (int k0 = 0; k0 < K; k0 += MBI_LIN_CHUNK) {                                                   \
+            int k1 = k0 + MBI_LIN_CHUNK < K ? k0 + MBI_LIN_CHUNK : K;                                     \
+            int32_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;                                                       \
+            if (nn == 4) {                                                                                \
+                for (int k = k0; k < k1; k++) {                                                           \
+                    int32_t xv = x[k];                                                                    \
+                    p0 += xv * w0[k]; p1 += xv * w1[k]; p2 += xv * w2[k]; p3 += xv * w3[k];               \
+                }                                                                                         \
+            } else {                                                                                      \
+                for (int k = k0; k < k1; k++) {                                                           \
+                    int32_t xv = x[k];                                                                    \
+                    p0 += xv * w0[k];                                                                     \
+                    if (nn > 1) p1 += xv * w1[k];                                                         \
+                    if (nn > 2) p2 += xv * w2[k];                                                         \
+                }                                                                                         \
+            }                                                                                             \
+            acc[0] += p0; acc[1] += p1; acc[2] += p2; acc[3] += p3;                                       \
+        }                                                                                                 \
+    }
 void kernel_linear_q(const void *input, int in_bits, const int8_t *weight, const int32_t *bias,
                      void *output, int out_bits, int M, int K, int N, const int32_t *mult, const int32_t *shift,
                      int relu) {
     for (int m = 0; m < M; m++)
-        for (int n = 0; n < N; n++) {
-            int64_t acc = bias ? bias[n] : 0;
-            for (int k = 0; k < K; k++)
-                acc += mbi_ld(input, in_bits, (long)m * K + k) * (int64_t)weight[(long)n * K + k];
-            if (out_bits < 64) {
-                acc = mbi_sat(mbi_requant(acc, mult[n], shift[n]), out_bits);
-                if (relu && acc < 0) acc = 0;
+        for (int n0 = 0; n0 < N; n0 += 4) {
+            int nn = N - n0 < 4 ? N - n0 : 4;
+            int64_t acc[4] = {0, 0, 0, 0};
+            const int8_t *w0 = weight + (long)n0 * K;
+            const int8_t *w1 = nn > 1 ? w0 + K : w0, *w2 = nn > 2 ? w0 + 2L * K : w0, *w3 = nn > 3 ? w0 + 3L * K : w0;
+            if (in_bits == 8) MBI_LIN_BODY(int8_t)
+            else if (in_bits == 15 || in_bits == 16) MBI_LIN_BODY(int16_t)
+            else
+                for (int j = 0; j < nn; j++)
+                    for (int k = 0; k < K; k++)
+                        acc[j] += mbi_ld(input, in_bits, (long)m * K + k) * (int64_t)weight[(long)(n0 + j) * K + k];
+            for (int j = 0; j < nn; j++) {
+                int n = n0 + j;
+                int64_t a = acc[j] + (bias ? bias[n] : 0);
+                if (out_bits < 64) {
+                    a = mbi_sat(mbi_requant(a, mult[n], shift[n]), out_bits);
+                    if (relu && a < 0) a = 0;
+                }
+                mbi_st(output, out_bits, (long)m * N + n, a);
             }
-            mbi_st(output, out_bits, (long)m * N + n, acc);
         }
 }
 """),
