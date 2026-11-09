@@ -115,6 +115,26 @@ class KernelTests(unittest.TestCase):
         v = (a.astype(np.int64) * ma[r, None] + b[r].astype(np.int64) * mb + (1 << (S - 1))) >> S
         np.testing.assert_array_equal(y, sat(v, 16))
 
+    def test_linear_q_tile_edges(self):
+        """Every tile shape (rows 1-4 and 2-channel remainders), int32 chunk boundaries, raw and requant+ReLU."""
+        rng = np.random.default_rng(6)
+        for bits, dt in ((8, np.int8), (16, np.int16)):
+            for M, N, K in ((1, 1, 1), (3, 3, 255), (5, 20, 256), (7, 3, 257), (9, 2, 700)):
+                x = rng.integers(np.iinfo(dt).min, np.iinfo(dt).max, (M, K)).astype(dt)
+                w = rng.integers(-127, 128, (N, K)).astype(np.int8)
+                b = rng.integers(-2 ** 30, 2 ** 30, N).astype(np.int32)
+                Mm = rng.integers(2 ** 30, 2 ** 31, N).astype(np.int32)
+                sh = rng.integers(8, 20, N).astype(np.int32)
+                acc = x.astype(np.int64) @ w.astype(np.int64).T + b
+                yr = np.zeros((M, N), np.int64)
+                lib().kernel_linear_q(P(x), bits, P(w), P(b), P(yr), 64, M, K, N, None, None, 0)
+                np.testing.assert_array_equal(yr, acc)
+                y = np.zeros((M, N), np.int16)
+                lib().kernel_linear_q(P(x), bits, P(w), P(b), P(y), 16, M, K, N, P(Mm), P(sh), 1)
+                exp = np.array([[max(0, int(sat(requant_ref([acc[i, j]], Mm[j], sh[j]), 16)[0]))
+                                 for j in range(N)] for i in range(M)])
+                np.testing.assert_array_equal(y, exp)
+
     def test_lut_s8(self):
         x = np.arange(-128, 128, dtype=np.int8)
         T = ic.lut8_table(ic._silu, 0.05, 0.03)
