@@ -901,6 +901,18 @@ def _verify(
         # only an explicit statement that N LSB is acceptable for this build.
         # Unset by default, so the exact kernel stays the default everywhere.
         _drift_atol = os.environ.get("MB_DRIFT_ATOL")
+        from modelblaster.pipeline.profile_kernel import io_is_exact
+        _exact = io_is_exact(io_path)
+        if _exact:
+            # An integer golden (io.npz `exact`, or an integer output) is the
+            # reference itself: every candidate must reproduce it bit for bit,
+            # whatever the backend's float-golden tolerance. Only a candidate
+            # that DECLARES numeric drift may be let through by MB_DRIFT_ATOL.
+            _atol, _rtol_override = 0.0, 0.0
+            if _drift_atol and accuracy_class != AccuracyClass.NUMERIC_DRIFT:
+                print(f"  [{spec.op}] MB_DRIFT_ATOL ignored: integer golden and a "
+                      f"{getattr(accuracy_class, 'value', accuracy_class)} candidate")
+                _drift_atol = None
         if _drift_atol:
             try:
                 _da = float(_drift_atol)
@@ -927,6 +939,14 @@ def _verify(
             )
         except ProfileError as e:
             return VerifyResult(False, f"spike-harness build/run failed:\n{e}")
+        if res.golden_ok is False and res.layers_bad:
+            return VerifyResult(
+                False,
+                f"per-layer golden: {res.layers_bad} tensor(s) differ, the first "
+                f"{res.first_bad_layer!r} ({res.layers_ok} match)",
+                max_abs_err=res.golden_max_abs_err,
+                max_rel_err=res.golden_max_rel_err,
+            )
         if res.golden_ok is False:
             # Decode where the divergence happened so the LLM has something
             # actionable to fix on retry.

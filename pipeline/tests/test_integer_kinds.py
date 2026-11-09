@@ -171,6 +171,39 @@ class ApplyQparamsTests(unittest.TestCase):
                 aq.apply(ir, w, patch, arrays)
 
 
+def _mb(module):
+    """Import modelblaster.pipeline.<module> (the package name the pipeline imports through)."""
+    import importlib
+    try:
+        return importlib.import_module(f"modelblaster.pipeline.{module}")
+    except ModuleNotFoundError:
+        pkg = tempfile.mkdtemp()
+        os.symlink(_ROOT, os.path.join(pkg, "modelblaster"))
+        sys.path.insert(0, pkg)
+        return importlib.import_module(f"modelblaster.pipeline.{module}")
+
+
+class IntegerGateTests(unittest.TestCase):
+
+    def test_parse_layers(self):
+        pk = _mb("profile_kernel")
+        out = ("=== MODELBLASTER_LAYER [a] ok 1 1 ===\nnoise\n=== MODELBLASTER_LAYER [b.c] BAD 2 3 ===\n"
+               "=== MODELBLASTER_LAYER [d] BAD 4 5 ===\n")
+        self.assertEqual(pk.parse_layers(out), (1, 2, "b.c"))
+        self.assertEqual(pk.parse_layers("nothing"), (0, 0, None))
+
+    def test_io_is_exact(self):
+        pk = _mb("profile_kernel")
+        d = tempfile.mkdtemp()
+        cases = {"f.npz": (dict(output=np.zeros(3, np.float32)), False),
+                 "i.npz": (dict(output=np.zeros(3, np.int64)), True),
+                 "x.npz": (dict(output=np.zeros(3, np.float32), exact=np.array(1)), True)}
+        for name, (arrs, want) in cases.items():
+            np.savez(os.path.join(d, name), input=np.zeros(1, np.int8), **arrs)
+            self.assertEqual(pk.io_is_exact(os.path.join(d, name)), want, name)
+        self.assertFalse(pk.io_is_exact(None))
+
+
 class LayerCheckTests(unittest.TestCase):
 
     def test_crc_matches_zlib(self):
