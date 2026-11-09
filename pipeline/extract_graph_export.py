@@ -1786,6 +1786,16 @@ class _ExportWalker:
             "quant": quant,
         })
 
+    def _carry_input_scale(self, in_name, out_name) -> float:
+        """Give out_name in_name's scale, for an op whose kernel moves or
+        clamps codes without requantizing them, and return that scale."""
+        scale_in = self.scales.get(in_name, 1e-8)
+        self.scales[out_name] = scale_in
+        if out_name in self.tensors_meta and \
+                isinstance(self.tensors_meta[out_name].get("quant"), dict):
+            self.tensors_meta[out_name]["quant"]["scale"] = scale_in
+        return scale_in
+
     def _emit_relu(self, n):
         in_name = self._resolve_input(n.args[0])
         out_name = n.name
@@ -1798,9 +1808,14 @@ class _ExportWalker:
             "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
         }
         if q == "int8":
+            # kernel_relu_s8 clamps codes and takes no scales, so the output
+            # must carry the input's scale. Its own captured max-abs is the
+            # positive max only, which differs whenever the input's largest
+            # magnitude is negative (ViNT's head MLP: up to 1.46x).
+            scale_in = self._carry_input_scale(in_name, out_name)
             rec["quant"] = {
-                "scale_in":  self.scales.get(in_name, 1e-8),
-                "scale_out": self.scales.get(out_name, 1e-8),
+                "scale_in":  scale_in,
+                "scale_out": scale_in,
                 "activation_min": 0,  # int8: 0 maps to symmetric -128 + 128
                 "activation_max": 127,
             }
@@ -2446,9 +2461,15 @@ class _ExportWalker:
             },
         }
         if q == "int8":
+            # kernel_pad_s8 copies bytes and takes no scales, so its output
+            # holds the input's codes: it must carry the input's scale. Its
+            # own captured scale (from the export node, not the producer)
+            # differs by up to 4x on ViNT; consumers that read the pad at
+            # that scale saw every stride-2 block's input mis-scaled.
+            scale_in = self._carry_input_scale(in_name, out_name)
             rec["quant"] = {
-                "scale_in":  self.scales.get(in_name, 1e-8),
-                "scale_out": self.scales.get(out_name, 1e-8),
+                "scale_in":  scale_in,
+                "scale_out": scale_in,
                 "pad_value": 0,  # zero-pad in int8 domain
             }
         self.ops.append(rec)
