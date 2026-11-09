@@ -626,7 +626,11 @@ class _ExportWalker:
         that reads out of bounds.
         """
         out_shape = None
-        if hasattr(n, "meta") and "val" in n.meta:
+        # split.Tensor's meta["val"] is a list of tensors, one per piece; it
+        # has no single shape. Its getitems are handled as pieces
+        # (_visit_split_piece), so the split node itself is a plain alias.
+        if hasattr(n, "meta") and "val" in n.meta \
+                and hasattr(n.meta["val"], "shape"):
             out_shape = tuple(int(x) for x in n.meta["val"].shape)
         elif n.name in self.tensors:
             out_shape = tuple(int(x) for x in self.tensors[n.name].shape)
@@ -2106,6 +2110,16 @@ class _ExportWalker:
         """Emit permute4_s8 for a reordering transpose/permute."""
         q = self._quant_for(n)
         rank = len(in_shape)
+        if rank > 4:
+            # Unit axes carry no data, so dropping them (and renumbering the
+            # permutation over the axes that are left) moves exactly the same
+            # bytes. nn.MultiheadAttention's packed in-projection transposes
+            # a (1, L, B, 3, E) view, which is rank 4 without its unit axis.
+            keep = [i for i, d in enumerate(in_shape) if int(d) != 1]
+            new_idx = {old: k for k, old in enumerate(keep)}
+            perm = [new_idx[px] for px in perm if px in new_idx]
+            in_shape = [int(in_shape[i]) for i in keep]
+            rank = len(in_shape)
         if rank > 4:
             raise NotImplementedError(
                 f"{_op_name(n)} at {n.name}: rank {rank} > 4; permute4_s8 "
