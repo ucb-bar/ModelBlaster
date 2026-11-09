@@ -239,7 +239,7 @@ class LayerCheckTests(unittest.TestCase):
             os.symlink(_ROOT, os.path.join(pkg, "modelblaster"))
             sys.path.insert(0, pkg)
             gs = importlib.import_module("modelblaster.pipeline.generate_skeleton")
-        src = gs._layer_check_src("t").replace("static void", "void")
+        src = gs._layer_check_src("t", 4).replace("static void", "void")
         d = tempfile.mkdtemp()
         c, so = os.path.join(d, "l.c"), os.path.join(d, "l.so")
         open(c, "w").write(src)
@@ -252,6 +252,7 @@ class LayerCheckTests(unittest.TestCase):
         os.dup2(w, 1)
         L.mb_layer_check_t(b"a", P(data), ctypes.c_ulong(data.size), ctypes.c_ulong(crc))
         L.mb_layer_check_t(b"b", P(data), ctypes.c_ulong(data.size), ctypes.c_ulong(crc ^ 1))
+        L.model_t_layer_report()          # results are printed after the run, not during it
         ctypes.CDLL(None).fflush(None)
         os.dup2(saved, 1)
         os.close(w)

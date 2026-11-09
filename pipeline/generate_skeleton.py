@@ -5052,7 +5052,7 @@ static int n_;
  * from k_cycle_get_64() (mtime). Cross-hart correct, lower resolution
  * than per-op rdcycle. */
 static unsigned long wall_cycles_;
-{_layer_check_src(mid) if ir.get("_layer_check") else ""}
+{_layer_check_src(mid, len(ir["_layer_check"])) if ir.get("_layer_check") else ""}
 /* ---------- per-dispatch invoke fns (one per non-view IR op) ----------- */
 {layout_scratch_src}{chr(10).join(shard_tables)}
 
@@ -5083,7 +5083,7 @@ void run_model_{mid}({input_sig_params}model_{mid}_output_t *output,
         MODEL_{umid}_DISPATCH_FNS[i](&s);
     }}
     wall_cycles_ = (unsigned long)mb_wall_ticks() - _wall_s;
-}}
+{"    model_" + mid + "_layer_report();   /* after the timed window */" + chr(10) if ir.get("_layer_check") else ""}}}
 
 const model_{mid}_op_record_t *model_{mid}_profile_records(int *count) {{
     /* Clamp to OP_COUNT — the per-dispatch n_++ is non-atomic across
@@ -5287,11 +5287,16 @@ def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
         f.write("\n".join(h_lines))
 
 
-def _layer_check_src(mid: str) -> str:
+def _layer_check_src(mid: str, n_checks: int) -> str:
     # CRC-32 (zlib's: reflected, polynomial 0xEDB88320), bitwise: a few lines,
-    # no table, and the host side is zlib.crc32.
+    # no table, and the host side is zlib.crc32. The results are kept and
+    # printed by model_<mid>_layer_report() after the run, so the console
+    # (115200 baud: ~5 ms a line) stays out of the timed window.
     return (
         "#include <stdio.h>\n"
+        f"static const char *mb_lc_name_{mid}[{n_checks}];\n"
+        f"static unsigned long mb_lc_got_{mid}[{n_checks}], mb_lc_exp_{mid}[{n_checks}];\n"
+        f"static int mb_lc_n_{mid};\n"
         f"static void mb_layer_check_{mid}(const char *name, const void *p, "
         "unsigned long n, unsigned long exp)\n{\n"
         "    const unsigned char *b = (const unsigned char *)p;\n"
@@ -5301,8 +5306,15 @@ def _layer_check_src(mid: str) -> str:
         "        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xedb88320UL & (0UL - (c & 1UL)));\n"
         "    }\n"
         "    c = (c ^ 0xffffffffUL) & 0xffffffffUL;\n"
-        '    printf("=== MODELBLASTER_LAYER [%s] %s %08lx %08lx ===\\n", name,\n'
-        '           c == exp ? "ok" : "BAD", c, exp);\n}\n')
+        f"    if (mb_lc_n_{mid} < {n_checks}) {{ mb_lc_name_{mid}[mb_lc_n_{mid}] = name; "
+        f"mb_lc_got_{mid}[mb_lc_n_{mid}] = c; mb_lc_exp_{mid}[mb_lc_n_{mid}++] = exp; }}\n}}\n"
+        f"void model_{mid}_layer_report(void)\n{{\n"
+        f"    for (int i = 0; i < mb_lc_n_{mid}; i++)\n"
+        '        printf("=== MODELBLASTER_LAYER [%s] %s %08lx %08lx ===\\n", '
+        f"mb_lc_name_{mid}[i],\n"
+        f'               mb_lc_got_{mid}[i] == mb_lc_exp_{mid}[i] ? "ok" : "BAD", '
+        f"mb_lc_got_{mid}[i], mb_lc_exp_{mid}[i]);\n"
+        f"    mb_lc_n_{mid} = 0;\n}}\n")
 
 
 def attach_layer_golden(ir: dict, path: str) -> int:
