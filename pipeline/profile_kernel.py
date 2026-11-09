@@ -40,6 +40,35 @@ class HarnessResult:
     golden_max_abs_err: float = 0.0
     golden_max_rel_err: float = 0.0
     raw_stdout: str = ""
+    # Per-layer golden check (generate_skeleton --layer-golden): tensors that
+    # matched / did not, and the first that did not, in dispatch order.
+    layers_ok: int = 0
+    layers_bad: int = 0
+    first_bad_layer: Optional[str] = None
+
+
+def parse_layers(stdout: str) -> tuple[int, int, Optional[str]]:
+    """Count MODELBLASTER_LAYER lines: (ok, bad, first bad tensor)."""
+    import re as _re
+    ok = bad = 0
+    first = None
+    for m in _re.finditer(r"=== MODELBLASTER_LAYER \[([^\]]+)\] (ok|BAD) ", stdout):
+        if m.group(2) == "ok":
+            ok += 1
+        else:
+            bad += 1
+            first = first or m.group(1)
+    return ok, bad, first
+
+
+def io_is_exact(io_path: Optional[str]) -> bool:
+    """True when io.npz holds an integer golden: its `exact` flag, or an integer output."""
+    if not io_path:
+        return False
+    d = np.load(io_path)
+    if "exact" in d.files:
+        return bool(int(d["exact"]))
+    return np.issubdtype(d["output"].dtype, np.integer)
 
 
 class ProfileError(RuntimeError):
@@ -292,6 +321,7 @@ def build_and_run(
         output=actual if actual is not None else np.empty(0, dtype=np.float32),
         raw_stdout=out,
     )
+    result.layers_ok, result.layers_bad, result.first_bad_layer = parse_layers(out)
 
     if io_path:
         import math as _math
@@ -341,6 +371,9 @@ def build_and_run(
                     verify["max_abs_err"] <= eff_atol
                     or verify["max_rel_err"] <= eff_rtol
                 )
+                if io_is_exact(io_path):
+                    # An integer golden is exact: no rtol escape hatch.
+                    result.golden_ok = bool(verify["max_abs_err"] <= eff_atol)
         else:
             # Legacy per-element path. Identical to before this branch
             # was added; kept for older harness binaries / int8 paths
@@ -358,6 +391,13 @@ def build_and_run(
                 result.golden_ok = bool(
                     np.all(abs_err <= eff_atol + eff_rtol * np.abs(golden))
                 )
+                if io_is_exact(io_path):
+                    result.golden_ok = bool(np.array_equal(
+                        np.asarray(actual).reshape(-1), np.asarray(raw_golden).reshape(-1)))
+        if result.layers_bad and not eff_atol:
+            # Per-layer goldens are exact; a build that explicitly accepts drift
+            # (atol > 0) is judged on its output alone.
+            result.golden_ok = False
 
     return result
 
