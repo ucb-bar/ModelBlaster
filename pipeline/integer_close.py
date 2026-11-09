@@ -391,6 +391,15 @@ class Closer:
                     out.append(rec)
                     self._count("linear_wide")
                     continue
+            if k == "repeat_q":
+                # a move: the copies keep the source's grid and width
+                self.set_scale(op["outputs"][0], self.scale(op["inputs"][0]))
+                b_in = self.bits(op["inputs"][0])
+                if b_in != self.bits(op["outputs"][0]):
+                    self.widths[op["outputs"][0]] = b_in
+                    self.meta(op["outputs"][0])["dtype"] = DTYPE[b_in]
+                out.append(op)
+                continue
             if k in ("slice_c_s8", "permute4_s8") and "moves" in passes:
                 # a pure move of codes: the output keeps the input's grid and width, and no float scale reaches
                 # the kernel
