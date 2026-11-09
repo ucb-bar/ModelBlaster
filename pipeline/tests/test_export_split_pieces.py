@@ -109,6 +109,29 @@ class SplitPieceTests(unittest.TestCase):
         self.assertEqual(conv["inputs"], sl["outputs"])
 
 
+class _ConstSplit(torch.nn.Module):
+    """A piece of a constant buffer: folded at extract time, never a runtime copy."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("table", torch.randn(1, 6, 4, 5))
+        self.conv = torch.nn.Conv2d(3, 4, 1)
+
+    def forward(self, x):
+        return self.conv(x + torch.split(self.table, 3, dim=1)[1])
+
+
+class ConstSplitTests(unittest.TestCase):
+
+    def test_constant_piece_is_folded(self):
+        w = _walk(_ConstSplit(), torch.randn(1, 3, 4, 5))
+        self.assertNotIn("slice_c_s8", [op["op"] for op in w.ops])
+        add = next(op for op in w.ops if op["op"].startswith("add"))
+        piece = [t for t in add["inputs"] if t != "x"][0]
+        self.assertEqual(w.tensors_meta[piece]["quant"]["kind"], "constant_buffer")
+        self.assertEqual(tuple(w.tensors_meta[piece]["shape"]), (1, 3, 4, 5))
+
+
 class _NormTail(torch.nn.Module):
     def __init__(self, reuse_norm=False):
         super().__init__()

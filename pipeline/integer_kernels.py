@@ -519,7 +519,67 @@ void kernel_copy_q(const void *src, void *dst, int n, int bits) {
 )
 
 
-SPECS = [COPY_Q, LUT_S8, GAP_Q, MUL_C1_Q, ADD_Q, CONV2D_Q, LINEAR_Q, GATE_Q16, LAYER_NORM_Q16, MATMUL_B_Q_S8,
+# ------------------------------------------------------------------------------------------ slice_c_q, permute4_q
+def _emit_slice_c_q(op, ctx):
+    sh = op["shape"]
+    i = op["inputs"][0]
+    return (f"kernel_slice_c_q({ctx.ptr_for(i, 'in')}, {ctx.out_ptr}, {_tbits(ctx, op, i)}, {sh['N']}, {sh['IC']}, "
+            f"{sh['C_start']}, {sh['C_end']}, {sh['H'] * sh['W']})", [])
+
+
+SLICE_C_Q = rk.KernelSpec(
+    op="slice_c_q",
+    signature="void kernel_slice_c_q(const void *input, void *output, int bits, int N, int IC, int C_start, int C_end, "
+              "int HW)",
+    semantics="out[n, c - C_start, hw] = in[n, c, hw] for c in [C_start, C_end): a pure move of codes (the output "
+              "keeps the input's grid).",
+    reference_impl=_src(r"""
+void kernel_slice_c_q(const void *input, void *output, int bits, int N, int IC, int C_start, int C_end, int HW) {
+    int OC = C_end - C_start;
+    for (int n = 0; n < N; n++)
+        for (long i = 0; i < (long)OC * HW; i++)
+            mbi_st(output, bits, (long)n * OC * HW + i, mbi_ld(input, bits, ((long)n * IC + C_start) * HW + i));
+}
+"""),
+    emit_call=_emit_slice_c_q,
+)
+
+
+def _emit_permute4_q(op, ctx):
+    sh = op["shape"]
+    i = op["inputs"][0]
+    d = ", ".join(str(sh[f"d{k}"]) for k in range(4))
+    p = ", ".join(str(sh[f"p{k}"]) for k in range(4))
+    return f"kernel_permute4_q({ctx.ptr_for(i, 'in')}, {ctx.out_ptr}, {_tbits(ctx, op, i)}, {d}, {p})", []
+
+
+PERMUTE4_Q = rk.KernelSpec(
+    op="permute4_q",
+    signature="void kernel_permute4_q(const void *input, void *output, int bits, int d0, int d1, int d2, int d3, "
+              "int p0, int p1, int p2, int p3)",
+    semantics="Rank-4 axis permutation as a pure move of codes: output[o0,o1,o2,o3] = input[i] with i[p_k] = o_k; "
+              "d0..d3 are the input extents (permute4_s8's convention).",
+    reference_impl=_src(r"""
+void kernel_permute4_q(const void *input, void *output, int bits, int d0, int d1, int d2, int d3,
+                       int p0, int p1, int p2, int p3) {
+    const int din[4] = { d0, d1, d2, d3 };
+    const long sin[4] = { (long)d1 * d2 * d3, (long)d2 * d3, d3, 1 };
+    const int perm[4] = { p0, p1, p2, p3 };
+    int od[4]; long os[4];
+    for (int k = 0; k < 4; k++) { od[k] = din[perm[k]]; os[k] = sin[perm[k]]; }
+    long w = 0;
+    for (int a = 0; a < od[0]; a++)
+        for (int b = 0; b < od[1]; b++)
+            for (int c = 0; c < od[2]; c++)
+                for (int e = 0; e < od[3]; e++)
+                    mbi_st(output, bits, w++, mbi_ld(input, bits, a * os[0] + b * os[1] + c * os[2] + e * os[3]));
+}
+"""),
+    emit_call=_emit_permute4_q,
+)
+
+
+SPECS = [COPY_Q, SLICE_C_Q, PERMUTE4_Q, LUT_S8, GAP_Q, MUL_C1_Q, ADD_Q, CONV2D_Q, LINEAR_Q, GATE_Q16, LAYER_NORM_Q16, MATMUL_B_Q_S8,
          SOFTMAX_Q_S8, CAT2_C1_Q, VINT_ACTION_POST_ACC]
 for _s in SPECS:
     if _s.op not in rk.KERNEL_SPECS:

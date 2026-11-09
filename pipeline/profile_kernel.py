@@ -62,13 +62,12 @@ def parse_layers(stdout: str) -> tuple[int, int, Optional[str]]:
 
 
 def io_is_exact(io_path: Optional[str]) -> bool:
-    """True when io.npz holds an integer golden: its `exact` flag, or an integer output."""
+    """True when io.npz declares an integer golden (its `exact` flag). Opt-in only: an int8 model's output is an
+    integer too, and its io.npz holds the quantized FP32 output, which the existing tolerances are for."""
     if not io_path:
         return False
     d = np.load(io_path)
-    if "exact" in d.files:
-        return bool(int(d["exact"]))
-    return np.issubdtype(d["output"].dtype, np.integer)
+    return "exact" in d.files and bool(int(d["exact"]))
 
 
 class ProfileError(RuntimeError):

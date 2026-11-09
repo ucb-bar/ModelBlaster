@@ -2297,6 +2297,11 @@ class _ExportWalker:
         split, dim, start, end = self._split_piece_range(n)
         src_name = self._resolve_input(split.args[0])
         self._record_tensor(n.name)
+        if (self.tensors_meta.get(src_name, {}).get("quant") or {}).get("kind") == "constant_buffer":
+            # A piece of a constant is folded at extract time, as any
+            # size-changing alias of a constant is (_materialize_or_alias).
+            self._materialize_or_alias(n, src_name)
+            return
         if not n.users:
             return  # an unused piece: nothing reads it, so nothing copies it
         if all(self._cat_reassembles_split(u) for u in n.users):
