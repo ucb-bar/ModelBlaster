@@ -260,6 +260,24 @@ class Closer:
                             "shape": {"N": int(sh["N"]), "C": int(sh["C"]), "HW": hw}, "quant": {"M": M, "s": s}})
                 self._count("gap")
                 continue
+            if k == "cat3_c1_s8" and "concat" in passes and len(set(self.scale(t) for t in op["inputs"])) == 1 \
+                    and len(set(self.bits(t) for t in op["inputs"] + op["outputs"])) == 1:
+                # three inputs on one grid (e.g. one tensor repeated for a batch): two placement concats
+                a, b, c = op["inputs"]
+                y = op["outputs"][0]
+                sh = op["shape"]
+                ca, cb, cc = sh["C_inputs"]
+                mid = f"{op['name']}__ab"
+                self.ir["tensors"][mid] = {"shape": [sh["N"], ca + cb, sh["H"], sh["W"]],
+                                           "dtype": self.meta(y)["dtype"], "quant": {"scale": self.scale(a)}}
+                self.set_scale(y, self.scale(a))
+                geo = {"N": sh["N"], "H": sh["H"], "W": sh["W"]}
+                out.append({"name": f"{op['name']}__0", "op": "cat2_c1_q", "inputs": [a, b], "outputs": [mid],
+                            "shape": {**geo, "C_inputs": [ca, cb]}, "quant": {}})
+                out.append({"name": op["name"], "op": "cat2_c1_q", "inputs": [mid, c], "outputs": [y],
+                            "shape": {**geo, "C_inputs": [ca + cb, cc]}, "quant": {}})
+                self._count("concat")
+                continue
             if k == "cat2_c1_s8" and "concat" in passes:
                 a, b = op["inputs"]
                 y = op["outputs"][0]
@@ -269,31 +287,38 @@ class Closer:
                 if same:
                     self.set_scale(y, self.scale(a))
                 cons = self.consumers(y)
-                feeds_add = len(cons) == 1 and cons[0]["op"] == "add_s8" and cons[0]["inputs"][0] == y \
-                    and "add" in passes and y not in outputs
+                feeds_add = len(cons) == 1 and "add" in passes and y not in outputs and (
+                    (cons[0]["op"] == "add_s8" and cons[0]["inputs"][0] == y)
+                    or (cons[0]["op"] == "add_tile_s8" and cons[0]["inputs"][1] == y))
                 if same or feeds_add:
                     sh = op["shape"]
                     rec = {"name": op["name"], "op": "cat2_c1_q", "inputs": [a, b], "outputs": [y],
                            "shape": {"N": sh["N"], "H": sh["H"], "W": sh["W"], "C_inputs": list(sh["C_inputs"])},
                            "quant": {}}
                     if feeds_add:
+                        # one multiplier per row of the concat (repeating per batch item N); a row is H*W codes
                         rec["row_scales"] = ([self.scale(a)] * sh["C_inputs"][0] + [self.scale(b)] * sh["C_inputs"][1])
+                        rec["row_cols"] = int(sh["H"]) * int(sh["W"])
                     out.append(rec)
                     self._count("concat")
                     continue
-            if k == "add_s8" and "add" in passes:
+            if k in ("add_s8", "add_tile_s8") and "add" in passes:
                 a, b = op["inputs"]
+                if k == "add_tile_s8":
+                    b, a = a, b          # add_tile_s8 is (tile, x): the tile is the broadcast operand
                 y = op["outputs"][0]
                 cat = next((o for o in out if a in o["outputs"] and o.get("row_scales")), None)
+                if cat is None and k == "add_tile_s8":
+                    raise SystemExit(f"integer_close: {op['name']}: add_tile_s8 only after a placement concat")
                 if cat is not None:
                     rs = cat["row_scales"]
-                    rows = len(rs)
-                    n = int(op["shape"]["n"])
-                    cols = n // rows
+                    cols = cat["row_cols"]
+                    n = int(np.prod(self.meta(y)["shape"]))
+                    rows = n // cols
                     ms, S = add_mults([r / self.scale(y) for r in rs] + [self.scale(b) / self.scale(y)])
-                    ma, mb = ms[:rows], ms[rows]
+                    ma, mb = ms[:len(rs)], ms[len(rs)]
                     b_rows = int(np.prod(self.meta(b)["shape"])) // cols
-                    shape = {"rows": rows, "cols": cols, "n_ma": rows, "b_rows": b_rows}
+                    shape = {"rows": rows, "cols": cols, "n_ma": len(rs), "b_rows": b_rows}
                 else:
                     (m0, mb), S = add_mults([self.scale(a) / self.scale(y), self.scale(b) / self.scale(y)])
                     ma = [m0]
@@ -367,8 +392,13 @@ class Closer:
                     self._count("linear_wide")
                     continue
             if k in ("slice_c_s8", "permute4_s8") and "moves" in passes:
-                # a pure move of codes: the output keeps the input's grid, and no float scale reaches the kernel
+                # a pure move of codes: the output keeps the input's grid and width, and no float scale reaches
+                # the kernel
                 self.set_scale(op["outputs"][0], self.scale(op["inputs"][0]))
+                b_in = self.bits(op["inputs"][0])
+                if b_in != self.bits(op["outputs"][0]):
+                    self.widths[op["outputs"][0]] = b_in
+                    self.meta(op["outputs"][0])["dtype"] = DTYPE[b_in]
                 out.append({"name": op["name"], "op": "slice_c_q" if k == "slice_c_s8" else "permute4_q",
                             "inputs": list(op["inputs"]), "outputs": list(op["outputs"]),
                             "shape": dict(op["shape"]), "quant": {}})
@@ -430,6 +460,7 @@ class Closer:
             out.append(op)
         for op in out:
             op.pop("row_scales", None)
+            op.pop("row_cols", None)
             if op["op"] == "pad_s8" and self.bits(op["inputs"][0]) != 8:
                 raise SystemExit(f"integer_close: {op['name']}: a pad of a {self.bits(op['inputs'][0])}-bit tensor "
                                  f"that no conv absorbs")

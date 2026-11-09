@@ -2616,22 +2616,27 @@ def _emit_vint_post_op(walker, out_dir):
     in_dist_int8 = _quantize_per_tensor_sym(linear_23_t, scale_dist).ravel()
     in_deltas_int8 = _quantize_per_tensor_sym(
         linear_24_t, scale_deltas).ravel()
-    deq_deltas = in_deltas_int8.astype(np.float32).reshape(5, 4) * scale_deltas
-    waypts = np.zeros_like(deq_deltas)
-    waypts[:, 0] = np.cumsum(deq_deltas[:, 0])
-    waypts[:, 1] = np.cumsum(deq_deltas[:, 1])
-    norms = np.linalg.norm(deq_deltas[:, 2:], axis=1, keepdims=True)
-    norms = np.clip(norms, 1e-12, None)
-    waypts[:, 2:] = deq_deltas[:, 2:] / norms
-    deq_dist = float(in_dist_int8[0]) * scale_dist
-    out_combined = np.concatenate([
-        np.array([deq_dist], dtype=np.float32),
-        waypts.ravel().astype(np.float32),
-    ])
+    # n_goals > 1: a batch of candidate goals, one [dist, 5 x 4 waypoints] record per goal
+    n_goals = int(in_dist_int8.size)
+    recs = []
+    for gi in range(n_goals):
+        deq_deltas = in_deltas_int8.astype(np.float32).reshape(n_goals, 5, 4)[gi] * scale_deltas
+        waypts = np.zeros_like(deq_deltas)
+        waypts[:, 0] = np.cumsum(deq_deltas[:, 0])
+        waypts[:, 1] = np.cumsum(deq_deltas[:, 1])
+        norms = np.linalg.norm(deq_deltas[:, 2:], axis=1, keepdims=True)
+        norms = np.clip(norms, 1e-12, None)
+        waypts[:, 2:] = deq_deltas[:, 2:] / norms
+        deq_dist = float(in_dist_int8[gi]) * scale_dist
+        recs.append(np.concatenate([
+            np.array([deq_dist], dtype=np.float32),
+            waypts.ravel().astype(np.float32),
+        ]))
+    out_combined = np.concatenate(recs)
 
     out_name = "vint_combined_output"
     walker.tensors_meta[out_name] = {
-        "shape": [21],
+        "shape": [21 * n_goals],
         "dtype": "f32",
         "quant": {"scale": 1.0, "zero_point": 0,
                   "kind": "app_op_composite"},
@@ -2642,7 +2647,7 @@ def _emit_vint_post_op(walker, out_dir):
         "op": "vint_action_post",
         "inputs": ["linear_23", "linear_24"],
         "outputs": [out_name],
-        "shape": {"n_wp": 5, "n_dim": 4},
+        "shape": {"n_wp": 5, "n_dim": 4, **({"n_goals": n_goals} if n_goals > 1 else {})},
         "quant": {
             "scale_dist":   float(scale_dist),
             "scale_deltas": float(scale_deltas),

@@ -517,14 +517,15 @@ void kernel_cat2_c1_q(const void *a, int a_bits, int Ca, const void *b, int b_bi
 VINT_ACTION_POST_ACC = rk.KernelSpec(
     op="vint_action_post_acc",
     signature="void kernel_vint_action_post_acc(const int64_t *dist_acc, const double *dist_scale, "
-              "const int64_t *act_acc, const double *act_scale, float *out)",
-    semantics="ViNT's CPU tail on raw accumulators, in double: dist = acc*scale; the 5x(dx, dy, cos, sin) actions = acc*scale "
+              "const int64_t *act_acc, const double *act_scale, float *out, int n_goals)",
+    semantics="ViNT's CPU tail on raw accumulators, in double, for each of n_goals goals (records of 21): dist = acc*scale; the 5x(dx, dy, cos, sin) actions = acc*scale "
               "per output; out = [dist, 5 x (cumsum dx, cumsum dy, (cos, sin)/max(norm, 1e-12))]. The only float "
               "op left in an integer-closed ViNT graph, by design (the tail runs on the CPU).",
     reference_impl=r"""
 #include <math.h>
 void kernel_vint_action_post_acc(const int64_t *dist_acc, const double *dist_scale,
-                                 const int64_t *act_acc, const double *act_scale, float *out) {
+                                 const int64_t *act_acc, const double *act_scale, float *out, int n_goals) {
+  for (int gi = 0; gi < n_goals; gi++, dist_acc += 1, act_acc += 20, out += 21) {
     out[0] = (float)((double)dist_acc[0] * dist_scale[0]);
     double x = 0.0, y = 0.0;
     for (int i = 0; i < 5; i++) {
@@ -536,12 +537,14 @@ void kernel_vint_action_post_acc(const int64_t *dist_acc, const double *dist_sca
         out[1 + i * 4 + 0] = (float)x; out[1 + i * 4 + 1] = (float)y;
         out[1 + i * 4 + 2] = (float)(d[2] / nrm); out[1 + i * 4 + 3] = (float)(d[3] / nrm);
     }
+  }
 }
 """,
     emit_call=lambda op, ctx: (
         f"kernel_vint_action_post_acc({ctx.ptr_for(op['inputs'][0], 'in')}, "
         f"{ctx.weight_name(op['quant']['dist_scale_key'])}, {ctx.ptr_for(op['inputs'][1], 'in')}, "
-        f"{ctx.weight_name(op['quant']['act_scale_key'])}, (float *){ctx.out_ptr})", []),
+        f"{ctx.weight_name(op['quant']['act_scale_key'])}, (float *){ctx.out_ptr}, "
+        f"{int(op['shape'].get('n_goals', 1))})", []),
 )
 
 

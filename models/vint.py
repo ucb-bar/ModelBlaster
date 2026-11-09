@@ -285,6 +285,11 @@ def variant() -> str:
     return os.environ.get("MODELBLASTER_VINT_VARIANT", "stateless")
 
 
+def n_goals() -> int:
+    """MODELBLASTER_VINT_GOALS: candidate goals per step in the cached variant (default 1)."""
+    return int(os.environ.get("MODELBLASTER_VINT_GOALS", "1"))
+
+
 class ViNTCached(torch.nn.Module):
     """ViNT forward for one new frame, with the 5 previous obs tokens as an explicit input and output."""
 
@@ -294,19 +299,25 @@ class ViNTCached(torch.nn.Module):
 
     def forward(self, obs_new, goal_img, token_cache):
         m = self.m
-        g = m.goal_encoder.extract_features(torch.cat([obs_new, goal_img], dim=1))
+        G = goal_img.shape[0]
+        # G candidate goals share the frame: the goal encoder sees (frame, goal_g) for each, the obs encoder runs once
+        frame = obs_new if G == 1 else torch.cat([obs_new] * G, dim=0)
+        g = m.goal_encoder.extract_features(torch.cat([frame, goal_img], dim=1))
         g = m.goal_encoder._avg_pooling(g)
         g = m.goal_encoder._dropout(g.flatten(start_dim=1))
-        g = m.compress_goal_enc(g).unsqueeze(1)                      # (1, 1, 512)
+        g = m.compress_goal_enc(g).unsqueeze(1)                      # (G, 1, 512)
         o = m.obs_encoder.extract_features(obs_new)
         o = m.obs_encoder._avg_pooling(o)
         o = m.obs_encoder._dropout(o.flatten(start_dim=1))
         o = m.compress_obs_enc(o)                                     # (1, 512)
         obs_tokens = torch.cat([token_cache, o], dim=0)               # (6, 512), oldest first
-        tokens = torch.cat([obs_tokens.unsqueeze(0), g], dim=1)       # (1, 7, 512)
+        ot = obs_tokens.unsqueeze(0)
+        if G > 1:                                                     # the same obs tokens for every goal
+            ot = torch.cat([ot] * G, dim=0)
+        tokens = torch.cat([ot, g], dim=1)                            # (G, 7, 512)
         final = m.decoder(tokens)
         dist = m.dist_predictor(final)
-        action = m.action_predictor(final).reshape((1, m.len_trajectory_pred, m.num_action_params))
+        action = m.action_predictor(final).reshape((G, m.len_trajectory_pred, m.num_action_params))
         action[:, :, :2] = torch.cumsum(action[:, :, :2], dim=1)
         if m.learn_angle:
             action[:, :, 2:] = torch.nn.functional.normalize(action[:, :, 2:].clone(), dim=-1)
@@ -327,7 +338,8 @@ def _cached_samples(stateless_samples):
             o = m.obs_encoder.extract_features(frames[:5])
             o = m.obs_encoder._avg_pooling(o).flatten(start_dim=1)
             cache = m.compress_obs_enc(o)                             # (5, 512)
-            out.append((frames[5:6].contiguous(), goal, cache))
+            goals = goal if n_goals() == 1 else torch.cat([goal] * n_goals(), dim=0)
+            out.append((frames[5:6].contiguous(), goals, cache))
     return out
 
 
@@ -346,7 +358,8 @@ def get_sample_input():  # noqa: F811
     if variant() != "cached":
         return obs, goal
     g = torch.Generator().manual_seed(1)
-    return obs[:, -3:].contiguous(), goal, torch.randn(5, 512, generator=g)
+    goals = goal if n_goals() == 1 else torch.cat([goal] * n_goals(), dim=0)
+    return obs[:, -3:].contiguous(), goals, torch.randn(5, 512, generator=g)
 
 
 def get_calibration_spec(num_samples: int = 16):  # noqa: F811
