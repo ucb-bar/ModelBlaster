@@ -301,7 +301,7 @@ class ViNTCached(torch.nn.Module):
         m = self.m
         G = goal_img.shape[0]
         # G candidate goals share the frame: the goal encoder sees (frame, goal_g) for each, the obs encoder runs once
-        frame = obs_new if G == 1 else torch.cat([obs_new] * G, dim=0)
+        frame = obs_new if G == 1 else obs_new.expand(G, -1, -1, -1)
         g = m.goal_encoder.extract_features(torch.cat([frame, goal_img], dim=1))
         g = m.goal_encoder._avg_pooling(g)
         g = m.goal_encoder._dropout(g.flatten(start_dim=1))
@@ -313,7 +313,7 @@ class ViNTCached(torch.nn.Module):
         obs_tokens = torch.cat([token_cache, o], dim=0)               # (6, 512), oldest first
         ot = obs_tokens.unsqueeze(0)
         if G > 1:                                                     # the same obs tokens for every goal
-            ot = torch.cat([ot] * G, dim=0)
+            ot = ot.expand(G, -1, -1)
         tokens = torch.cat([ot, g], dim=1)                            # (G, 7, 512)
         final = m.decoder(tokens)
         dist = m.dist_predictor(final)

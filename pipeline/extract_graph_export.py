@@ -111,7 +111,7 @@ _ALIAS = {
     "view.default", "transpose.int", "slice.Tensor", "select.int",
     "unsqueeze.default", "unflatten.int", "squeeze.dim",
     "contiguous.default", "permute.default", "reshape.default",
-    "flatten.using_ints", "split.Tensor", "expand_as.default",
+    "flatten.using_ints", "split.Tensor", "expand_as.default", "expand.default",
     "clone.default",
 }
 
@@ -687,6 +687,25 @@ class _ExportWalker:
             # Under this node's own name, so nothing else that reads
             # src_name is disturbed and no name_map entry is needed.
             self._record_constant(n.name, val)
+            return
+        # leading-axis replication: out = (G, *rest) with rest the source's data (the source either has a unit
+        # leading axis or lacks the batch axis altogether, as after an aliased unsqueeze)
+        if len(out_shape) >= 2 and out_shape[0] > 1 \
+                and int(np.prod(out_shape[1:])) == int(np.prod(src_shape)) \
+                and (len(src_shape) < len(out_shape) or src_shape[0] == 1):
+            # A batch of copies of one activation (x.expand(G, ...)): ViNT's
+            # frame and obs tokens shared by G candidate goals. A repeat_q
+            # writes the source's codes G times, on the source's grid.
+            self._record_tensor(n.name)
+            if src_name in self.scales:
+                self.scales[n.name] = self.scales[src_name]
+                q_meta = self.tensors_meta.get(n.name, {}).get("quant")
+                if isinstance(q_meta, dict):
+                    q_meta["scale"] = self.scales[src_name]
+            self.ops.append({"name": str(n.name), "op": "repeat_q", "inputs": [src_name],
+                             "outputs": [n.name],
+                             "shape": {"n": int(np.prod(src_shape)), "times": int(out_shape[0])},
+                             "quant": {}})
             return
         raise NotImplementedError(
             f"extract_graph_export: {_op_name(n)} at {n.name} broadcasts "

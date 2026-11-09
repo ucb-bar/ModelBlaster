@@ -630,7 +630,24 @@ void kernel_permute4_q(const void *input, void *output, int bits, int d0, int d1
 )
 
 
-SPECS = [COPY_Q, SLICE_C_Q, PERMUTE4_Q, LUT_S8, GAP_Q, MUL_C1_Q, ADD_Q, CONV2D_Q, LINEAR_Q, GATE_Q16, LAYER_NORM_Q16, MATMUL_B_Q_S8,
+# ------------------------------------------------------------------------------------------------------------ repeat_q
+REPEAT_Q = rk.KernelSpec(
+    op="repeat_q",
+    signature="void kernel_repeat_q(const void *src, void *dst, int n, int times, int bits)",
+    semantics="dst[t*n + i] = src[i] for t < times: a batch of copies of one tensor (codes of one width, the same grid).",
+    reference_impl=_src(r"""
+void kernel_repeat_q(const void *src, void *dst, int n, int times, int bits) {
+    for (int t = 0; t < times; t++)
+        for (long i = 0; i < n; i++) mbi_st(dst, bits, (long)t * n + i, mbi_ld(src, bits, i));
+}
+"""),
+    emit_call=lambda op, ctx: (
+        f"kernel_repeat_q({ctx.ptr_for(op['inputs'][0], 'in')}, {ctx.out_ptr}, {op['shape']['n']}, "
+        f"{op['shape']['times']}, {_tbits(ctx, op, op['inputs'][0])})", []),
+)
+
+
+SPECS = [COPY_Q, REPEAT_Q, SLICE_C_Q, PERMUTE4_Q, LUT_S8, GAP_Q, MUL_C1_Q, ADD_Q, CONV2D_Q, LINEAR_Q, GATE_Q16, LAYER_NORM_Q16, MATMUL_B_Q_S8,
          SOFTMAX_Q_S8, CAT2_C1_Q, VINT_ACTION_POST_ACC]
 for _s in SPECS:
     if _s.op not in rk.KERNEL_SPECS:
