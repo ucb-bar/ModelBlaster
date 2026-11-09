@@ -468,25 +468,25 @@ void kernel_cat2_c1_q(const void *a, int a_bits, int Ca, const void *b, int b_bi
 # ------------------------------------------------------------------------------------------- vint_action_post_acc
 VINT_ACTION_POST_ACC = rk.KernelSpec(
     op="vint_action_post_acc",
-    signature="void kernel_vint_action_post_acc(const int64_t *dist_acc, const float *dist_scale, "
-              "const int64_t *act_acc, const float *act_scale, float *out)",
-    semantics="ViNT's CPU tail on raw accumulators: dist = acc*scale; the 5x(dx, dy, cos, sin) actions = acc*scale "
+    signature="void kernel_vint_action_post_acc(const int64_t *dist_acc, const double *dist_scale, "
+              "const int64_t *act_acc, const double *act_scale, float *out)",
+    semantics="ViNT's CPU tail on raw accumulators, in double: dist = acc*scale; the 5x(dx, dy, cos, sin) actions = acc*scale "
               "per output; out = [dist, 5 x (cumsum dx, cumsum dy, (cos, sin)/max(norm, 1e-12))]. The only float "
               "op left in an integer-closed ViNT graph, by design (the tail runs on the CPU).",
     reference_impl=r"""
 #include <math.h>
-void kernel_vint_action_post_acc(const int64_t *dist_acc, const float *dist_scale,
-                                 const int64_t *act_acc, const float *act_scale, float *out) {
-    out[0] = (float)dist_acc[0] * dist_scale[0];
-    float x = 0.0f, y = 0.0f;
+void kernel_vint_action_post_acc(const int64_t *dist_acc, const double *dist_scale,
+                                 const int64_t *act_acc, const double *act_scale, float *out) {
+    out[0] = (float)((double)dist_acc[0] * dist_scale[0]);
+    double x = 0.0, y = 0.0;
     for (int i = 0; i < 5; i++) {
-        float d[4];
-        for (int j = 0; j < 4; j++) d[j] = (float)act_acc[i * 4 + j] * act_scale[i * 4 + j];
+        double d[4];
+        for (int j = 0; j < 4; j++) d[j] = (double)act_acc[i * 4 + j] * act_scale[i * 4 + j];
         x += d[0]; y += d[1];
-        float nrm = sqrtf(d[2] * d[2] + d[3] * d[3]);
-        float inv = 1.0f / (nrm > 1e-12f ? nrm : 1e-12f);
-        out[1 + i * 4 + 0] = x; out[1 + i * 4 + 1] = y;
-        out[1 + i * 4 + 2] = d[2] * inv; out[1 + i * 4 + 3] = d[3] * inv;
+        double nrm = sqrt(d[2] * d[2] + d[3] * d[3]);
+        if (nrm < 1e-12) nrm = 1e-12;
+        out[1 + i * 4 + 0] = (float)x; out[1 + i * 4 + 1] = (float)y;
+        out[1 + i * 4 + 2] = (float)(d[2] / nrm); out[1 + i * 4 + 3] = (float)(d[3] / nrm);
     }
 }
 """,

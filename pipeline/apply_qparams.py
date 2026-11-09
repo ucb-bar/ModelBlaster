@@ -11,11 +11,13 @@ PATCH.json:
   {"ops": {"<ir op name>": {"op": "<expected kind>",             # refuse if the op's kind differs
                             "arrays": {"<field>": "<npz key>"},   # weight / bias / quant *_key fields: replace
                             "quant": {"<field>": <int>}}},        #   the array they name; set scalar quant fields
+   "constants": {"<ir constant tensor>": "<npz key>"},           # replace a constant input's data
    "tensors": {"<ir tensor>": {"scale": <float>}}}                # metadata (no kernel reads it)
 
 <field> in "arrays" is "weight", "bias", or a quant field holding a weight key ("table_key", "ma_key",
 "output_multiplier_per_oc_key", ...). The new array must have the old array's shape (a reshape of the same size is
-refused too) and an integer dtype; it is stored with the old array's dtype after a range check. A scalar quant field
+refused too); integers go into integer arrays after a range check, floats only into float arrays (a CPU tail's
+output scales). A scalar quant field
 must already exist. Unknown op or tensor names are an error.
 """
 from __future__ import annotations
@@ -29,6 +31,20 @@ import numpy as np
 
 class QparamsError(ValueError):
     pass
+
+
+def _cast(new: np.ndarray, old: np.ndarray, what: str) -> np.ndarray:
+    """new in old's dtype: integer into integer with a range check, float into float; nothing else."""
+    if np.issubdtype(old.dtype, np.floating):
+        if not np.issubdtype(new.dtype, np.floating):
+            raise QparamsError(f"{what}: {new.dtype} for a float array")
+        return new.astype(old.dtype)
+    if not np.issubdtype(new.dtype, np.integer):
+        raise QparamsError(f"{what}: {new.dtype} is not an integer type")
+    info = np.iinfo(old.dtype)
+    if new.size and (new.min() < info.min or new.max() > info.max):
+        raise QparamsError(f"{what}: values outside {old.dtype}")
+    return new.astype(old.dtype)
 
 
 def apply(ir: dict, weights: dict, patch: dict, arrays: dict) -> dict:
@@ -52,12 +68,7 @@ def apply(ir: dict, weights: dict, patch: dict, arrays: dict) -> dict:
             old = np.asarray(w[wkey])
             if new.shape != old.shape:
                 raise QparamsError(f"{name}.{field}: shape {new.shape} != graph's {old.shape}")
-            if not np.issubdtype(new.dtype, np.integer):
-                raise QparamsError(f"{name}.{field}: {new.dtype} is not an integer type")
-            info = np.iinfo(old.dtype)
-            if new.size and (new.min() < info.min or new.max() > info.max):
-                raise QparamsError(f"{name}.{field}: values outside {old.dtype}")
-            w[wkey] = new.astype(old.dtype)
+            w[wkey] = _cast(new, old, f"{name}.{field}")
             n_arr += 1
         for field, val in p.get("quant", {}).items():
             q = op.get("quant")
@@ -67,6 +78,15 @@ def apply(ir: dict, weights: dict, patch: dict, arrays: dict) -> dict:
                 raise QparamsError(f"{name}: quant field {field!r} is not an integer field")
             q[field] = int(val)
             n_q += 1
+    for t, akey in patch.get("constants", {}).items():
+        meta = ir["tensors"].get(t)
+        if meta is None or (meta.get("quant") or {}).get("kind") != "constant_buffer" or t not in w:
+            raise QparamsError(f"patch names constant {t!r}, which is not a constant tensor of the graph")
+        new = np.asarray(arrays[akey])
+        if new.shape != np.asarray(w[t]).shape:
+            raise QparamsError(f"constant {t}: shape {new.shape} != graph's {np.asarray(w[t]).shape}")
+        w[t] = _cast(new, np.asarray(w[t]), f"constant {t}")
+        n_arr += 1
     for t, p in patch.get("tensors", {}).items():
         meta = ir["tensors"].get(t)
         if meta is None:

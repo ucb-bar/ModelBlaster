@@ -124,6 +124,8 @@ def _np_to_c_dtype(np_dtype) -> tuple[str, str]:
     """(c_type, ir_dtype_tag) for a numpy weight blob's dtype."""
     if np_dtype == np.float32:
         return "float", "f32"
+    if np_dtype == np.float64:
+        return "double", "f64"
     if np_dtype == np.float16:
         return "_Float16", "f16"
     if np_dtype == np.int8:
@@ -2157,7 +2159,12 @@ def emit_weights(
                 f"{tuple(arr_out.shape)} {layout_tag} */"
             )
         c_lines.append(f"const {c_type} {ident}[{arr_out.size}] = {{")
-        if arr_out.dtype in (np.float32, np.float16):
+        if arr_out.dtype == np.float64:
+            # repr() round-trips a double exactly
+            flat = arr_out.reshape(-1)
+            c_lines += ["    " + ", ".join(repr(float(v)) for v in flat[i:i + 4]) + ","
+                        for i in range(0, len(flat), 4)]
+        elif arr_out.dtype in (np.float32, np.float16):
             # fp16 weights: widen to fp32 for the literal text (lossless),
             # implicit narrow happens at compile time when initializing the
             # _Float16 array.
