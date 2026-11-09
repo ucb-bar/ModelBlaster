@@ -904,7 +904,7 @@ def _verify(
         from modelblaster.pipeline.profile_kernel import io_is_exact
         _exact = io_is_exact(io_path)
         if _exact:
-            # An integer golden (io.npz `exact`, or an integer output) is the
+            # An integer golden (io.npz declares `exact`) is the
             # reference itself: every candidate must reproduce it bit for bit,
             # whatever the backend's float-golden tolerance. Only a candidate
             # that DECLARES numeric drift may be let through by MB_DRIFT_ATOL.

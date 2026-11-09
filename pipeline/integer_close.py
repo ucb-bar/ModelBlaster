@@ -26,7 +26,8 @@ Passes (all on by default):
            an add (which then absorbs the row scales)
   wide     conv / depthwise / linear touching a non-int8 tensor -> conv2d_q / linear_q (a preceding pad is folded
            into the conv's pads); a ReLU after such a linear is fused into it
-  attn     matmul_b_s8 -> matmul_b_q_s8, softmax_s8 -> softmax_q_s8; slice_c_s8 becomes a pure copy
+  attn     matmul_b_s8 -> matmul_b_q_s8, softmax_s8 -> softmax_q_s8
+  moves    slice_c_s8 / permute4_s8 -> slice_c_q / permute4_q, pure moves (the output keeps the input's grid)
   norm     layer_norm_s8 with int16 in and out -> layer_norm_q16
   raw      vint_action_post on raw (64-bit) linear outputs -> vint_action_post_acc
   dce      ops whose outputs nothing reads (and that are not graph outputs) are removed
@@ -45,7 +46,7 @@ from pathlib import Path
 
 import numpy as np
 
-PASSES = ("swish", "lut", "mul_c1", "gap", "add", "concat", "wide", "attn", "norm", "raw", "dce")
+PASSES = ("swish", "lut", "mul_c1", "gap", "add", "concat", "wide", "attn", "moves", "norm", "raw", "dce")
 DTYPE = {8: "i8", 15: "i16", 16: "i16", 32: "i32", 64: "i64"}
 NPDT = {"i8": np.int8, "i16": np.int16, "i32": np.int32, "i64": np.int64}
 
@@ -365,13 +366,13 @@ class Closer:
                     out.append(rec)
                     self._count("linear_wide")
                     continue
-            if k == "slice_c_s8" and "attn" in passes:
-                op = dict(op)
-                q = dict(op["quant"])
-                q["scale_out"] = q["scale_in"] = self.scale(op["inputs"][0])
-                op["quant"] = q
-                self.set_scale(op["outputs"][0], q["scale_in"])
-                out.append(op)
+            if k in ("slice_c_s8", "permute4_s8") and "moves" in passes:
+                # a pure move of codes: the output keeps the input's grid, and no float scale reaches the kernel
+                self.set_scale(op["outputs"][0], self.scale(op["inputs"][0]))
+                out.append({"name": op["name"], "op": "slice_c_q" if k == "slice_c_s8" else "permute4_q",
+                            "inputs": list(op["inputs"]), "outputs": list(op["outputs"]),
+                            "shape": dict(op["shape"]), "quant": {}})
+                self._count("moves")
                 continue
             if k == "matmul_b_s8" and "attn" in passes:
                 a, b = op["inputs"]

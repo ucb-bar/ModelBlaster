@@ -196,7 +196,8 @@ class IntegerGateTests(unittest.TestCase):
         pk = _mb("profile_kernel")
         d = tempfile.mkdtemp()
         cases = {"f.npz": (dict(output=np.zeros(3, np.float32)), False),
-                 "i.npz": (dict(output=np.zeros(3, np.int64)), True),
+                 "i.npz": (dict(output=np.zeros(3, np.int64)), False),   # opt-in only
+                 "z.npz": (dict(output=np.zeros(3, np.int8), exact=np.array(0)), False),
                  "x.npz": (dict(output=np.zeros(3, np.float32), exact=np.array(1)), True)}
         for name, (arrs, want) in cases.items():
             np.savez(os.path.join(d, name), input=np.zeros(1, np.int8), **arrs)
