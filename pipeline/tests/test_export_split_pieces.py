@@ -141,3 +141,35 @@ class TailTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PadRelu(torch.nn.Module):
+    """Ops whose kernels move or clamp codes without requantizing."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(8, 8)
+        with torch.no_grad():
+            self.fc.bias.fill_(-3.0)  # largest |relu input| is negative
+        self.conv0 = torch.nn.Conv2d(2, 2, 1)
+        self.conv = torch.nn.Conv2d(2, 2, 3, stride=2)
+
+    def forward(self, x, img):
+        y = torch.relu(self.fc(x))
+        z = self.conv(F.pad(self.conv0(img), (0, 1, 0, 1)))
+        return y, z
+
+
+class CodeCopyScaleTests(unittest.TestCase):
+
+    def test_pad_and_relu_carry_their_input_scale(self):
+        w = _walk(_PadRelu(), torch.randn(3, 8), torch.randn(1, 2, 8, 8))
+        checked = 0
+        for op in w.ops:
+            if op["op"] in ("pad_s8", "relu_s8"):
+                i, o = op["inputs"][0], op["outputs"][0]
+                self.assertEqual(op["quant"]["scale_in"], op["quant"]["scale_out"])
+                self.assertEqual(w.tensors_meta[o]["quant"]["scale"],
+                                 w.tensors_meta[i]["quant"]["scale"])
+                checked += 1
+        self.assertEqual(checked, 2)
