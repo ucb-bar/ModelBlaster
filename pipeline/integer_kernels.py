@@ -497,7 +497,29 @@ void kernel_vint_action_post_acc(const int64_t *dist_acc, const double *dist_sca
 )
 
 
-SPECS = [LUT_S8, GAP_Q, MUL_C1_Q, ADD_Q, CONV2D_Q, LINEAR_Q, GATE_Q16, LAYER_NORM_Q16, MATMUL_B_Q_S8,
+# ------------------------------------------------------------------------------------------------------------ copy_q
+def _emit_copy_q(op, ctx):
+    i, o = op["inputs"][0], op["outputs"][0]
+    return (f"kernel_copy_q({ctx.ptr_for(i, 'in')}, {ctx.ptr_for(o, 'in')}, {op['shape']['n']}, "
+            f"{_tbits(ctx, op, i)})", [])
+
+
+COPY_Q = rk.KernelSpec(
+    op="copy_q",
+    signature="void kernel_copy_q(const void *src, void *dst, int n, int bits)",
+    semantics="dst[i] = src[i] for n codes of the given width. The state update of a stateful graph: the last op "
+              "writes the next value of a state tensor into the state's buffer, after everything that read the old "
+              "value has run.",
+    reference_impl=_src(r"""
+void kernel_copy_q(const void *src, void *dst, int n, int bits) {
+    for (long i = 0; i < n; i++) mbi_st(dst, bits, i, mbi_ld(src, bits, i));
+}
+"""),
+    emit_call=_emit_copy_q,
+)
+
+
+SPECS = [COPY_Q, LUT_S8, GAP_Q, MUL_C1_Q, ADD_Q, CONV2D_Q, LINEAR_Q, GATE_Q16, LAYER_NORM_Q16, MATMUL_B_Q_S8,
          SOFTMAX_Q_S8, CAT2_C1_Q, VINT_ACTION_POST_ACC]
 for _s in SPECS:
     if _s.op not in rk.KERNEL_SPECS:

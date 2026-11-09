@@ -2898,8 +2898,9 @@ def main():
     # hooks (get_calibration_spec, get_precision_spec, ...). Cheap; the
     # actual model weights have already been loaded by _load_model.
     mod = _import_model_module(args.model)
+    _spec_fn = getattr(mod, "get_calibration_spec", None)
     if args.num_calibration > 1:
-        if hasattr(mod, "get_calibration_spec"):
+        if _spec_fn is not None and _spec_fn(args.num_calibration) is not None:
             from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             calib_spec = mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_export] resolving calibration spec "
@@ -3005,6 +3006,12 @@ def main():
     # first calibration sample for sizing / golden capture.
     calib_sample = calib_dicts[0]
     input_names = list(calib_sample.keys())
+    # State (a model's get_state_spec: {input name: forward-output index}):
+    # the input and the output that is its next value become ONE tensor the
+    # generated model keeps between calls. The input leaves the packed input,
+    # and a copy_q at the end of the graph writes the next value into it.
+    state_spec = (mod.get_state_spec() if hasattr(mod, "get_state_spec") else None) or {}
+    state_records = []
     for k in input_names:
         walker._record_tensor(k)
     sig = ep.graph_signature
@@ -3017,6 +3024,23 @@ def main():
     # those slots un-written. The aliased name still appears in
     # walker.tensors_meta with the same shape, so downstream wiring works.
     output_names = [walker.name_map.get(n, n) for n in output_names]
+    for s_in, s_idx in state_spec.items():
+        s_out = output_names[s_idx]
+        walker._record_tensor(s_in)
+        # one quantity, one grid: the state input takes its next value's scale
+        if s_out in walker.scales and args.quant == "int8":
+            walker.scales[s_in] = walker.scales[s_out]
+            walker.tensors_meta[s_in]["quant"]["scale"] = walker.scales[s_out]
+        n_el = int(np.prod(walker.tensors_meta[s_in]["shape"]))
+        if n_el != int(np.prod(walker.tensors_meta[s_out]["shape"])):
+            raise SystemExit(f"state {s_in}: {n_el} elements, its next value {s_out} has a different count")
+        walker.ops.append({"name": f"{s_in}__update", "op": "copy_q", "inputs": [s_out], "outputs": [s_in],
+                           "shape": {"n": n_el}, "quant": {}})
+        state_records.append({"input": s_in, "output": s_out})
+    if state_records:
+        drop_out = {r["output"] for r in state_records}
+        output_names = [n for n in output_names if n not in drop_out]
+        input_names = [n for n in input_names if n not in state_spec]
 
     # Match the IR shape generate_skeleton consumes (see
     # extract_graph::extract_int8 for the canonical form):
@@ -3091,6 +3115,8 @@ def main():
         "dispatches": dispatches,
         "inspect_tensors": inspect_tensors,
     }
+    if state_records:
+        ir["state"] = state_records
 
     graph_path = out_dir / "graph.json"
     with open(graph_path, "w") as f:

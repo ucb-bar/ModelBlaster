@@ -267,6 +267,94 @@ def get_calibration_samples(
     that don't want to plumb the spec themselves.
     """
     from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
-    spec = get_calibration_spec(n_samples)
+    spec = _get_calibration_spec_stateless(n_samples)
     materialized = materialize_calibration_samples(spec)
-    return [(d["obs_img"], d["goal_img"]) for d in materialized]
+    samples = [(d["obs_img"], d["goal_img"]) for d in materialized]
+    return _cached_samples(samples) if variant() == "cached" else samples
+
+
+# ---------------------------------------------------------------------------------------------- token-cache variant
+# MODELBLASTER_VINT_VARIANT=cached exports ViNT for a stream of frames. The obs encoder is per frame, so the 5 past
+# compressed obs tokens can be carried between steps instead of re-encoding all 6 frames every step (191.6 M of the
+# 359 M MACs of a stateless G=1 step). The variant's forward takes the new frame, the goal and the 5 cached tokens
+# (oldest first), and returns the outputs plus the next cache. The extractor binds the cache input and the
+# next-cache output into one state tensor (graph.json "state"), so the generated model keeps it between calls.
+# Its outputs equal the stateless model's on the same 6 frames (the positional encoding is added after the concat).
+
+def variant() -> str:
+    return os.environ.get("MODELBLASTER_VINT_VARIANT", "stateless")
+
+
+class ViNTCached(torch.nn.Module):
+    """ViNT forward for one new frame, with the 5 previous obs tokens as an explicit input and output."""
+
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self, obs_new, goal_img, token_cache):
+        m = self.m
+        g = m.goal_encoder.extract_features(torch.cat([obs_new, goal_img], dim=1))
+        g = m.goal_encoder._avg_pooling(g)
+        g = m.goal_encoder._dropout(g.flatten(start_dim=1))
+        g = m.compress_goal_enc(g).unsqueeze(1)                      # (1, 1, 512)
+        o = m.obs_encoder.extract_features(obs_new)
+        o = m.obs_encoder._avg_pooling(o)
+        o = m.obs_encoder._dropout(o.flatten(start_dim=1))
+        o = m.compress_obs_enc(o)                                     # (1, 512)
+        obs_tokens = torch.cat([token_cache, o], dim=0)               # (6, 512), oldest first
+        tokens = torch.cat([obs_tokens.unsqueeze(0), g], dim=1)       # (1, 7, 512)
+        final = m.decoder(tokens)
+        dist = m.dist_predictor(final)
+        action = m.action_predictor(final).reshape((1, m.len_trajectory_pred, m.num_action_params))
+        action[:, :, :2] = torch.cumsum(action[:, :, :2], dim=1)
+        if m.learn_angle:
+            action[:, :, 2:] = torch.nn.functional.normalize(action[:, :, 2:].clone(), dim=-1)
+        return dist, action, obs_tokens[1:]
+
+
+#: graph.json "state" for the cached variant: user input -> the output that is its next value.
+STATE = {"token_cache": 2}          # input name -> index of the forward output that updates it
+
+
+def _cached_samples(stateless_samples):
+    """(obs (1, 18, H, W), goal) windows -> (newest frame, goal, cache of the 5 previous obs tokens)."""
+    m = _get_model_stateless()
+    out = []
+    with torch.no_grad():
+        for obs, goal in stateless_samples:
+            frames = torch.cat(torch.split(obs, 3, dim=1), dim=0)    # (6, 3, H, W)
+            o = m.obs_encoder.extract_features(frames[:5])
+            o = m.obs_encoder._avg_pooling(o).flatten(start_dim=1)
+            cache = m.compress_obs_enc(o)                             # (5, 512)
+            out.append((frames[5:6].contiguous(), goal, cache))
+    return out
+
+
+_get_model_stateless = get_model
+_get_sample_input_stateless = get_sample_input
+_get_calibration_spec_stateless = get_calibration_spec
+
+
+def get_model() -> torch.nn.Module:  # noqa: F811
+    m = _get_model_stateless()
+    return ViNTCached(m).eval() if variant() == "cached" else m
+
+
+def get_sample_input():  # noqa: F811
+    obs, goal = _get_sample_input_stateless()
+    if variant() != "cached":
+        return obs, goal
+    g = torch.Generator().manual_seed(1)
+    return obs[:, -3:].contiguous(), goal, torch.randn(5, 512, generator=g)
+
+
+def get_calibration_spec(num_samples: int = 16):  # noqa: F811
+    """The cached variant has no declarative spec (its cache input is computed): None sends the extractor to
+    get_calibration_samples."""
+    return _get_calibration_spec_stateless(num_samples) if variant() != "cached" else None
+
+
+def get_state_spec():
+    """{state input name: index of the forward output holding its next value}, or None (stateless)."""
+    return dict(STATE) if variant() == "cached" else None
