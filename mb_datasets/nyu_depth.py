@@ -24,6 +24,16 @@ Spec fields:
     path:        "<dir of *.h5>"        (one of path / npz is required)
     npz:         "<bank.npz>"
     image_size:  [W, H]                 (h5 only; default [224, 224])
+    crop:        "square" | "valid"     (h5 only; default "square").
+                 "square" is the original centre square of the full frame.
+                 "valid" first restricts the frame to VALID_ROWS x VALID_COLS,
+                 the region where the TRAINING depth exists: the raw training
+                 frames have no depth in their top 9 rows and outer columns
+                 (and the RGB has a ~6 px white frame there), so a network
+                 trained on the full frame never learns those output pixels.
+                 4:3 sizes take the whole valid region (456x608), square sizes
+                 its centre square. Must match the crop the checkpoint was
+                 trained with.
     normalize:   "imagenet" | "none"    (h5 only; default "imagenet")
     n_take:      int                    (optional, default all)
     spread:      bool                   (h5 only, default True) -- take n_take
@@ -51,7 +61,34 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def _preprocess(rgb_chw_u8, image_size, normalize: str) -> torch.Tensor:
+#: Rows/cols of the 480x640 NYU frame with training depth (see `crop`).
+VALID_ROWS = (12, 468)
+VALID_COLS = (16, 624)
+
+
+def crop_box(src_h: int, src_w: int, out_h: int, out_w: int, crop: str):
+    """(r0, r1, c0, c1) source window for an out_h x out_w network input."""
+    if crop == "square":
+        c = min(src_h, src_w)
+        y0, x0 = (src_h - c) // 2, (src_w - c) // 2
+        return y0, y0 + c, x0, x0 + c
+    if crop != "valid":
+        raise ValueError(f"crop={crop!r} not in {{square, valid}}")
+    if (src_h, src_w) != (480, 640):
+        raise ValueError(f"crop='valid' is defined for 480x640 NYU frames, got {src_h}x{src_w}")
+    r0, r1 = VALID_ROWS
+    c0, c1 = VALID_COLS
+    if out_h * (c1 - c0) == out_w * (r1 - r0):      # same aspect as the region
+        return r0, r1, c0, c1
+    if out_h == out_w:
+        s = min(r1 - r0, c1 - c0)
+        cc = (c0 + c1) // 2
+        return r0, r0 + s, cc - s // 2, cc - s // 2 + s
+    raise ValueError(f"crop='valid' supports square or 4:3 sizes, got {out_h}x{out_w}")
+
+
+def _preprocess(rgb_chw_u8, image_size, normalize: str,
+                crop: str = "square") -> torch.Tensor:
     """uint8 [3, H, W] -> float32 [3, Hout, Wout], the training preprocessing.
 
     Square centre crop first, THEN resize: the NYU frames are 640x480 and a
@@ -69,9 +106,8 @@ def _preprocess(rgb_chw_u8, image_size, normalize: str) -> torch.Tensor:
     # would mean the "reproducible" source did not in fact reproduce the bank.
     a = np.asarray(rgb_chw_u8, dtype=np.float32).transpose(1, 2, 0) / 255.0
     h, w = a.shape[:2]
-    c = min(h, w)
-    y0, x0 = (h - c) // 2, (w - c) // 2
-    t = torch.from_numpy(a[y0:y0 + c, x0:x0 + c]).permute(2, 0, 1)[None]
+    y0, y1, x0, x1 = crop_box(h, w, H, W, crop)
+    t = torch.from_numpy(a[y0:y1, x0:x1]).permute(2, 0, 1)[None]
     t = F.interpolate(t, (H, W), mode="bilinear", align_corners=False)[0]
     if normalize == "imagenet":
         mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
@@ -116,11 +152,12 @@ def _load_h5(spec: dict) -> list[DatasetItem]:
         files = [files[i] for i in idx]
     image_size = spec.get("image_size", [224, 224])
     normalize = spec.get("normalize", "imagenet")
+    crop = spec.get("crop", "square")
     out: list[DatasetItem] = []
     for fp in files:
         with h5py.File(fp, "r") as f:
             rgb = np.asarray(f["rgb"])          # uint8 [3, H, W]
-        out.append(DatasetItem(data=_preprocess(rgb, image_size, normalize),
+        out.append(DatasetItem(data=_preprocess(rgb, image_size, normalize, crop),
                                meta={"source": str(fp)}))
     return out
 

@@ -6,10 +6,13 @@
 #   EXTRACTOR    "fx" (default, extract_graph) or "export"
 #                (extract_graph_export). Only set this when the model
 #                cannot be fx-traced -- see the export branch below.
-#   EXTRACT_EXTRA_ARGS  extra flags for the EXTRACTOR=export stage, e.g.
-#                "--per-channel" (per-output-channel weight scales) or
-#                "--inspect a,b,c" (runtime dumps for staged accuracy
-#                debugging). Word-split on purpose.
+#   EXTRACT_EXTRA_ARGS  extra flags for the extract stage (both EXTRACTOR=fx
+#                and =export), e.g. "--per-channel" (per-output-channel
+#                weight scales), "--per-channel-depthwise" (fx: extend that
+#                to depthwise convs; FastDepth needs it, see
+#                examples/fastdepth/run.sh) or "--inspect a,b,c" (export:
+#                runtime dumps for staged accuracy debugging). Word-split
+#                on purpose.
 #   EXTRA_KERNEL_CFLAGS  ';'-separated cflags appended to the backend's
 #                kernel cflags, e.g. "-ffp-contract=off" to make two
 #                targets bit-comparable (see where it is applied).
@@ -158,7 +161,8 @@ else
         --quant "${QUANT}" \
         --num-calibration "${NUM_CALIBRATION:-1}" \
         --fusion-target "${TARGET}" \
-        ${MB_NO_BN_FOLDING:+--no-bn-folding}
+        ${MB_NO_BN_FOLDING:+--no-bn-folding} \
+        ${EXTRACT_EXTRA_ARGS:-}
 fi
 _mb_stage_end extract
 

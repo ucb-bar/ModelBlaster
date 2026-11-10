@@ -19,6 +19,15 @@ Shape/size knobs, same convention as the other models here:
                                      five times, and the decoder's five
                                      nearest-neighbour upsamples have to land
                                      back on the input resolution exactly.
+  MODELBLASTER_FASTDEPTH_INPUT_HW    "HxW", e.g. "96x128"; overrides _INPUT for
+                                     a non-square input (both sides multiples
+                                     of 32). 96x128 is the 4:3 aspect of the
+                                     HM01B0's 320x240 and of NYU's 640x480.
+  MODELBLASTER_FASTDEPTH_NYU_CROP    "square" (default) or "valid": the crop
+                                     the NYU calibration frames get (see
+                                     mb_datasets/nyu_depth.py). Must match the
+                                     crop the checkpoint was TRAINED with; the
+                                     fastdepth_rb checkpoints use "valid".
   MODELBLASTER_FASTDEPTH_WIDTH_MULT  default 0.25, matching mobilenet_v2.py --
                                      keeps weights small enough for the SoC's
                                      DRAM budget and the int8 calibration fast.
@@ -73,16 +82,21 @@ import torch
 import torch.nn as nn
 
 
-def _cfg() -> tuple[int, float, int]:
-    input_size = int(os.environ.get("MODELBLASTER_FASTDEPTH_INPUT", 128))
+def _cfg() -> tuple[int, int, float, int]:
+    """(input_h, input_w, width_mult, dec_ch)."""
+    hw = os.environ.get("MODELBLASTER_FASTDEPTH_INPUT_HW", "")
+    if hw:
+        h, w = (int(v) for v in hw.lower().split("x"))
+    else:
+        h = w = int(os.environ.get("MODELBLASTER_FASTDEPTH_INPUT", 128))
     width_mult = float(os.environ.get("MODELBLASTER_FASTDEPTH_WIDTH_MULT", 0.25))
     dec_ch = int(os.environ.get("MODELBLASTER_FASTDEPTH_DECODER_CH", 64))
-    if input_size % 32:
+    if h % 32 or w % 32:
         raise ValueError(
-            f"MODELBLASTER_FASTDEPTH_INPUT={input_size} must be a multiple of 32: "
+            f"FastDepth input {h}x{w}: both sides must be multiples of 32: "
             f"the encoder downsamples 5x and the decoder upsamples 5x, so anything "
             f"else lands the output on a different resolution than the input.")
-    return input_size, width_mult, dec_ch
+    return h, w, width_mult, dec_ch
 
 
 def _sep_conv(cin: int, cout: int) -> nn.Sequential:
@@ -183,7 +197,7 @@ class FastDepth(nn.Module):
 
 def get_model(seed: int = 0):
     torch.manual_seed(seed)
-    _input_size, width_mult, dec_ch = _cfg()
+    _h, _w, width_mult, dec_ch = _cfg()
     m = FastDepth(width_mult=width_mult, dec_ch=dec_ch,
                   skips=os.environ.get("MODELBLASTER_FASTDEPTH_SKIPS", "0") == "1",
                   pretrained=os.environ.get("MODELBLASTER_FASTDEPTH_PRETRAINED", "0") == "1")
@@ -248,12 +262,13 @@ def get_calibration_spec(num_samples: int = 8) -> "dict | None":
     the measured sweet spot; the default is small deliberately.
     """
     import os  # noqa: PLC0415
-    _input_size, _wm, _dc = _cfg()
+    _h, _w, _wm, _dc = _cfg()
     nyu_dir = os.environ.get("MODELBLASTER_FASTDEPTH_NYU_DIR", "")
     calib = os.environ.get("MODELBLASTER_FASTDEPTH_CALIB", "")
     if nyu_dir:
         src = {"path": nyu_dir,
-               "image_size": [_input_size, _input_size],
+               "image_size": [_w, _h],          # loader convention is [W, H]
+               "crop": os.environ.get("MODELBLASTER_FASTDEPTH_NYU_CROP", "square"),
                "normalize": "imagenet", "spread": True}
     elif calib:
         # The bank is already cropped, resized and ImageNet-normalised, so it
@@ -287,7 +302,7 @@ def get_calibration_samples(n: int = 8):
 
 
 def get_sample_input(seed: int = 1) -> torch.Tensor:
-    input_size, _wm, _dc = _cfg()
+    h, w, _wm, _dc = _cfg()
     spec = get_calibration_spec(1)
     if spec is not None:
         # A trained model's golden should be a real frame: randn would pin the
@@ -297,4 +312,4 @@ def get_sample_input(seed: int = 1) -> torch.Tensor:
         from modelblaster.mb_datasets.base import materialize_calibration_samples  # noqa: PLC0415
         return materialize_calibration_samples(spec)[0]["x"]
     g = torch.Generator().manual_seed(seed)
-    return torch.randn(1, 3, input_size, input_size, generator=g)
+    return torch.randn(1, 3, h, w, generator=g)
