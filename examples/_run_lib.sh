@@ -69,7 +69,9 @@ if [[ "${QUANT}" == "fp16" ]]; then
     GEN_TARGET="${TARGET}_f16"
 fi
 
-EXAMPLE_DIR_REL="examples/${MODEL_NAME}"
+# EXAMPLE_NAME lets several configurations of one model (e.g. FastDepth at
+# 224x224 and 96x128) keep separate IR/build trees; defaults to MODEL_NAME.
+EXAMPLE_DIR_REL="examples/${EXAMPLE_NAME:-${MODEL_NAME}}"
 EXAMPLE_DIR="${REPO_ROOT}/${EXAMPLE_DIR_REL}"
 
 cd "${REPO_ROOT}"

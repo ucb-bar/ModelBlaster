@@ -3972,6 +3972,33 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{q['output_multiplier']}, {q['output_shift']}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "depthwise_conv2d_s8_pc":
+            # Per-channel-weight-scale depthwise (extract_graph
+            # --per-channel-depthwise). 23c1bce added the op to the extractor
+            # and a reference kernel, but not here, so an IR that used it
+            # could not be lowered to C at all. Same call as
+            # depthwise_conv2d_s8 with the scalar multiplier/shift replaced
+            # by the per-channel arrays, exactly as conv2d_s8_pc does for
+            # conv2d_s8. Never OC-tiled (not in _OC_SLICEABLE_CONV_OPS), so
+            # the arrays are passed whole, indexed by channel from 0.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            C = sh.get("OC") or sh.get("C") or sh.get("groups")
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
+            call = (
+                f"kernel_depthwise_conv2d_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {C}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{mult}, {shift}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
         elif op["op"] == "mul_s8":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")
