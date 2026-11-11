@@ -235,6 +235,38 @@ class AskingForAnImplTheBuildLacksIsFatal(unittest.TestCase):
         self.assertIn("sched_getscheduler(0)", src)
         self.assertIn("observed_sched_policy=", src)
 
+    def _emit_platform(self, platform):
+        from pipeline import generate_xpurt_main as gen
+        return gen._emit(
+            networks=["m"], schedule_name="s",
+            dispatch_table_header="t.h", core_kinds=["rvv"],
+            backends=["rvv_x60"], pool_sizes=[1], n_instances={"m": 1},
+            platform=platform)
+
+    def test_linux_workers_place_themselves_rather_than_use_attr_affinity(self):
+        src = self._emit_platform("linux")
+        self.assertIn('#include "mb_placement.h"', src)
+        worker = src[src.index("static void *xpurt_worker"):src.index("int main(void)")]
+        # First action of the worker, before anything else touches the hart.
+        self.assertIn("mb_place_current_thread(my_hart)", worker)
+        self.assertLess(worker.index("mb_place_current_thread"),
+                        worker.index("wa->observed_cpu = sched_getcpu()"))
+        # Main pins itself off the AI CPUs before the pools are created.
+        self.assertLess(src.index("mb_pin_self_to_first_non_ai_cpu()"),
+                        src.index("int entry_runtime_rc = init_entry_runtime()"))
+        # pthread_attr_setaffinity_np survives only on the Zephyr-only arm.
+        self.assertEqual(src.count("= pthread_attr_setaffinity_np(&attrs"), 1)
+        guard = src[:src.index("= pthread_attr_setaffinity_np(&attrs")].rsplit("#if", 1)[1]
+        self.assertIn("CONFIG_POSIX_THREADS_AFFINITY", guard)
+        self.assertIn("!defined(MODELBLASTER_PLATFORM_LINUX)", guard)
+
+    def test_zephyr_emit_does_not_pull_in_placement(self):
+        src = self._emit_platform("zephyr")
+        self.assertNotIn('#include "mb_placement.h"', src)
+        self.assertNotIn("#define MODELBLASTER_PLATFORM_LINUX 1", src)
+        self.assertIn("#include <zephyr/kernel.h>", src)
+        self.assertIn("pthread_attr_setaffinity_np(&attrs[w].a", src)
+
 
 if __name__ == "__main__":
     unittest.main()

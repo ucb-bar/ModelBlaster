@@ -1,0 +1,242 @@
+{
+  "system": "spacemit-k3-x100-a100",
+  "description": "SpaceMiT K3: 16 riscv64 harts on shared memory. X100 = harts 0-7 (VLEN=256), A100 = harts 8-15 (VLEN=1024). Facts below were measured on the board.",
+  "default_dispatch_target": "any",
+  "ai_thread_cpus": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "notes": {
+    "clusters": "X100 = CPUs 0-7, A100 = CPUs 8-15. L2 is shared per group of 4 cores (0-3 and 8-11 confirmed by measurement). /proc/cpuinfo reports the same ISA string on all 16 harts, so the core type is not discoverable from it.",
+    "vlen": "X100 vlenb=32 (VLEN 256); A100 vlenb=128 (VLEN 1024). Both are legal for zvl256b, which is only a lower bound.",
+    "a100_isa": "The A100 is deliberately treated as X100-ISA-only for now: same capability list, same rvv_k3 backend (-march=rv64gcv_zvl256b_zfh_zvfh). Correctness on VLEN=1024 depends on every kernel being VL-agnostic and is checked by golden runs pinned to harts 8-15, not assumed.",
+    "ai_thread_cpus": "Threads that run on the A100 must write their TID to /proc/set_ai_thread (done by the runtime, never from a shell). Registration is ONE-WAY: there is no unregister, so a thread that has joined the A100 pool stays there. The process itself starts on the X100 (taskset -c 0-7) and A100 worker threads self-register. `ai_thread_cpus` lists the harts that need this; build scripts pass it as AI_CPUS= / -DMODELBLASTER_AI_CPUS= in compact form (e.g. 8-15).",
+    "clock": "rdtime is unprivileged and runs at 24 MHz, same as the K1. Timing must convert with 24 MHz, never the core clock.",
+    "core_kind": "X100 and A100 are DISTINCT kinds (x100 / a100) even though they share one capability list and one backend. `kind` is what _resolve_target uses to pick a hart -- the n-th core OF THAT KIND -- so one shared kind would make CPU_E#n alias CPU_P#n and double-book harts 0-7 (see the K1 notes). Here CPU_P = x100, CPU_E = a100.",
+    "ime": "No ime_* capability is declared: the K3 IME has not been characterised, and the K1 smt.vmadot facts do not transfer."
+  },
+  "cores": [
+    {
+      "name": "x100_core0",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        0
+      ],
+      "cluster": 0,
+      "description": "X100, VLEN=256 (vlenb=32). L2 domain shared with harts 0-3. RVV only; no IME capability.",
+      "capabilities": [
+        "linear",
+        "conv2d",
+        "linear_s8",
+        "conv2d_s8",
+        "matmul_s8",
+        "relu",
+        "leaky_relu_s8",
+        "elu",
+        "add",
+        "add_s8",
+        "mul",
+        "maxpool2d",
+        "maxpool2d_s8",
+        "avgpool2d_s8",
+        "batchnorm2d",
+        "sigmoid",
+        "silu",
+        "gelu_s8",
+        "softmax_s8",
+        "layernorm_s8",
+        "rmsnorm_s8",
+        "lstm_s8",
+        "sin_s8",
+        "cos_s8",
+        "cat",
+        "upsample_nearest_s8"
+      ]
+    },
+    {
+      "name": "x100_core1",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        1
+      ],
+      "cluster": 0,
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core2",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        2
+      ],
+      "cluster": 0,
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core3",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        3
+      ],
+      "cluster": 0,
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core4",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        4
+      ],
+      "cluster": 1,
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core5",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        5
+      ],
+      "cluster": 1,
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core6",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        6
+      ],
+      "cluster": 1,
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core7",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        7
+      ],
+      "cluster": 1,
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "a100_core8",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        8
+      ],
+      "cluster": 2,
+      "description": "A100, VLEN=1024 (vlenb=128). L2 domain shared with harts 8-11. Treated as X100-ISA-only (zvl256b) for now; kernels must be VL-agnostic.",
+      "capabilities": [
+        "linear",
+        "conv2d",
+        "linear_s8",
+        "conv2d_s8",
+        "matmul_s8",
+        "relu",
+        "leaky_relu_s8",
+        "elu",
+        "add",
+        "add_s8",
+        "mul",
+        "maxpool2d",
+        "maxpool2d_s8",
+        "avgpool2d_s8",
+        "batchnorm2d",
+        "sigmoid",
+        "silu",
+        "gelu_s8",
+        "softmax_s8",
+        "layernorm_s8",
+        "rmsnorm_s8",
+        "lstm_s8",
+        "sin_s8",
+        "cos_s8",
+        "cat",
+        "upsample_nearest_s8"
+      ]
+    },
+    {
+      "name": "a100_core9",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        9
+      ],
+      "cluster": 2,
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core10",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        10
+      ],
+      "cluster": 2,
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core11",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        11
+      ],
+      "cluster": 2,
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core12",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        12
+      ],
+      "cluster": 3,
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core13",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        13
+      ],
+      "cluster": 3,
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core14",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        14
+      ],
+      "cluster": 3,
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core15",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl256b",
+      "harts": [
+        15
+      ],
+      "cluster": 3,
+      "capabilities_ref": "a100_core8"
+    }
+  ]
+}

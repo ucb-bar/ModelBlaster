@@ -34,6 +34,11 @@
 #   -DMODELBLASTER_XPURT_STREAM=ON        emit one JSON line per dispatch END,
 #                                         live, for streaming_feedback.py
 #   -DMODELBLASTER_POOL_THREADS=N         parallel-for pool size
+#   -DMODELBLASTER_AI_CPUS=8-15           Linux CPUs that are K3 A100 cores
+#                                         (threads there must register with
+#                                         /proc/set_ai_thread before pinning;
+#                                         see runtime/mb_placement.h). Empty /
+#                                         unset = none, i.e. K1 behaviour.
 
 cmake_minimum_required(VERSION 3.16)
 project(modelblaster_harness_xpurt_linux C ASM)
@@ -67,8 +72,18 @@ find_package(Threads REQUIRED)
 
 # The parallel-for pool. Built here directly rather than via its own
 # CMakeLists, which links zephyr_interface.
+#
+# mb_placement.c lives in the same library: both the pool helpers and the
+# generated walker's workers place themselves through it, and the AI-CPU set
+# is a compile definition of THIS one object so it cannot disagree between
+# callers.
+set(MODELBLASTER_AI_CPUS "" CACHE STRING
+    "Linux CPUs that are K3 A100 cores, e.g. 8-15 (empty = none, K1 behaviour)")
 add_library(modelblaster_pool_linux STATIC
-    "${_RUNTIME_DIR}/modelblaster_pool/modelblaster_pool.c")
+    "${_RUNTIME_DIR}/modelblaster_pool/modelblaster_pool.c"
+    "${_RUNTIME_DIR}/mb_placement.c")
+target_compile_definitions(modelblaster_pool_linux PRIVATE
+    "MODELBLASTER_AI_CPUS=\"${MODELBLASTER_AI_CPUS}\"")
 target_include_directories(modelblaster_pool_linux PUBLIC
     "${_RUNTIME_DIR}/modelblaster_pool" "${_RUNTIME_DIR}")
 target_compile_definitions(modelblaster_pool_linux PUBLIC

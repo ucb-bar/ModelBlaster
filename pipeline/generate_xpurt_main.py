@@ -76,6 +76,7 @@ _PROLOGUE_ZEPHYR = """#include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem *
 
 _PROLOGUE_LINUX = """#define MODELBLASTER_PLATFORM_LINUX 1
 #include "mb_posix_compat.h"   /* k_cycle_get_64, k_sem, sys_reboot on POSIX */
+#include "mb_placement.h"      /* mb_place_current_thread: K3 A100-aware pinning */
 
 #define XPURT_TICKS_PER_SEC  MB_POSIX_TICKS_PER_SEC
 #define XPURT_BOARD_TARGET   "linux/riscv64"
@@ -545,7 +546,10 @@ def _emit(networks: list[str], schedule_name: str,
  * it holds for one worker per (kind, hart) exactly as it did for one
  * worker per kind.
  *
- * Workers are pinned to harts via pthread_attr_setaffinity_np. Composite
+ * Workers are pinned to harts via pthread_attr_setaffinity_np on Zephyr; on
+ * Linux each worker places ITSELF with mb_place_current_thread() as its first
+ * action (a K3 A100 thread must register its own TID before it may pin, and
+ * attr affinity runs before any TID exists). Composite
  * entries reserve every hart in their machine combination under ordered
  * per-hart locks and select a persistent modelblaster_pool pinned to that
  * exact set. Scheduler workers on helper harts sleep on the locks while the
@@ -798,10 +802,22 @@ static void *xpurt_worker(void *arg)
     int my_acc_idx = wa->worker_idx;
     int my_claims_unbound = wa->claims_unbound;
 #ifdef MODELBLASTER_PLATFORM_LINUX
-    /* Record where the scheduler ACTUALLY put us. pthread_attr_setaffinity_np
-     * failing (or being compiled out) is silent otherwise, and an unpinned
-     * worker makes every per-hart number in this trace a fiction. main()
-     * prints observed_cpu next to the requested hart after the join. */
+    /* FIRST ACTION: place this thread on its hart. On a K3 an A100 CPU is
+     * reachable only after the thread writes its own TID to
+     * /proc/set_ai_thread, so this cannot be done by the creator through
+     * pthread_attr_setaffinity_np (no TID exists yet). mb_place_current_thread
+     * registers if needed, pins, and verifies sched_getcpu(). Failure is fatal:
+     * an unplaced worker makes every per-hart number in this trace a fiction.
+     * Unbound workers (hart < 0) are deliberately left floating. */
+    if (my_hart >= 0 && mb_place_current_thread(my_hart) != 0) {{
+        printf("FATAL: mb_place_current_thread worker=%d kind=%s hart=%d -- "
+               "refusing to run unpinned, every per-hart number in the trace "
+               "would be fiction\\n", my_acc_idx, my_kind, my_hart);
+        sys_reboot(SYS_REBOOT_COLD);
+        return NULL;
+    }}
+    /* Record where the scheduler ACTUALLY put us; main() prints observed_cpu
+     * next to the requested hart after the join. */
     wa->observed_cpu = sched_getcpu();
 #else
     wa->observed_cpu = -1;
@@ -1060,6 +1076,18 @@ int main(void)
     /* Build one pool for each distinct composite target. This preserves both
      * the exact width and exact harts selected by XPU-RT. Singleton entries
      * deliberately receive NULL and execute on their owning worker. */
+#ifdef MODELBLASTER_PLATFORM_LINUX
+    /* Pin main to the first non-AI CPU in its allowed mask BEFORE the pools
+     * exist: pool helpers inherit main's mask, so they start X100-masked and
+     * then place themselves. (A no-op when no AI CPUs are configured, i.e. on
+     * a K1.) main must never itself register as an AI thread -- registration
+     * is one-way and main would lose the X100 cores. */
+    if (mb_pin_self_to_first_non_ai_cpu() != 0) {{
+        printf("FATAL: cannot pin main thread off the AI CPUs\\n");
+        sys_reboot(SYS_REBOOT_COLD);
+        return -1;
+    }}
+#endif
     int entry_runtime_rc = init_entry_runtime();
     if (entry_runtime_rc != 0) {{
         printf("FATAL: composite-target runtime init failed rc=%d\\n",
@@ -1120,9 +1148,12 @@ int main(void)
          * symbol that the harness_xpurt_linux CMake never defines -- so on
          * the K1 every worker floated across all 8 harts and the
          * "pinned_hart=N" line printed at exit was a claim about an
-         * attribute nobody had set. glibc needs _GNU_SOURCE (emitted at
-         * the top of this file) plus the same call. */
-#if defined(CONFIG_POSIX_THREADS_AFFINITY) || defined(MODELBLASTER_PLATFORM_LINUX)
+         * attribute nobody had set. It is now done BY the worker
+         * (mb_place_current_thread, first thing in xpurt_worker) because a
+         * K3 A100 thread must register its own TID before it may pin; attr
+         * affinity at create time cannot do that. So this block is
+         * Zephyr-only. */
+#if defined(CONFIG_POSIX_THREADS_AFFINITY) && !defined(MODELBLASTER_PLATFORM_LINUX)
         if (g_workers[w].hart >= 0) {{
             cpu_set_t cs;
             CPU_ZERO(&cs);

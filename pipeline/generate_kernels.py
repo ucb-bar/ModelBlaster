@@ -395,7 +395,7 @@ LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
 
 #: Backends whose whole point is a vector unit. A curated kernel for one of
 #: these that contains no vector instruction is a mistake, not a style.
-_VECTOR_BACKENDS = {"rvv", "rvv_x60", "rvv_f16", "rvv_opu", "ime"}
+_VECTOR_BACKENDS = {"rvv", "rvv_x60", "rvv_k3", "rvv_f16", "rvv_opu", "ime"}
 
 
 def _count_vector_insns(obj_path: str, cross: str) -> int:

@@ -24,13 +24,27 @@
 #   scripts/run_xpurt_k1.sh --schedule <scheduled_*.json> \
 #       [--models mlp_control,dronet] [--backends scalar] [--quant int8]
 #
+# Board selection: MODELBLASTER_BOARD=k1 (default) | k3 changes only the
+# defaults (host, remote root, registry, core kinds, backends, output root);
+# explicit env vars and flags still win. scripts/run_xpurt_k3.sh sets it.
+# On k3 the binary is launched under `taskset -c 0-7` (X100); A100 threads
+# register themselves with the kernel inside the runtime, and the registry's
+# ai_thread_cpus are handed to cmake as MODELBLASTER_AI_CPUS.
+#
 # No credentials are read or written. Board access comes from the ssh config
-# entry named by MODELBLASTER_K1_HOST (default "k1").
+# entry named by MODELBLASTER_K1_HOST (default "k1"; k3: MODELBLASTER_K3_HOST,
+# default "spacemitk3").
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+
+# Board defaults (stdlib-only helper; BOARD_* names stay out of the MB_/
+# MODELBLASTER_ extraction-config scan below).
+BOARD_CFG="$(python3 "${REPO_ROOT}/validation/board_config.py" \
+    --board "${MODELBLASTER_BOARD:-k1}" shell)" || exit 2
+eval "${BOARD_CFG}"
 
 SCHEDULE=""
 MODELS="mlp_control,dronet"
@@ -51,7 +65,7 @@ MODELS="mlp_control,dronet"
 # `.staged_from` -- deliberately NOT `.extract_config`, so a staged graph can
 # never be mistaken for an extracted one by the reuse check.
 STAGED_IRS=""
-BACKENDS="rvv_x60,rvv_x60"
+BACKENDS="${BOARD_BACKEND},${BOARD_BACKEND}"
 QUANT="int8"
 # reference = curated/hand-written kernels, no LLM. Codex is only for NEW kernel
 # bodies and must be requested explicitly; there is no Bedrock path here.
@@ -60,7 +74,7 @@ KERNEL_BACKEND="${BACKEND:-reference}"
 export LLM_PROVIDER="${LLM_PROVIDER:-codex}"
 # The K1 registry is measured, not assumed -- cluster 0 carries IME, cluster 1
 # traps on it. See cores/spacemit_k1.json.
-REGISTRY="${REGISTRY:-cores/spacemit_k1.json}"
+REGISTRY="${REGISTRY:-${BOARD_REGISTRY}}"
 # Both K1 clusters are RVV-capable and measured equivalent (0.996 ratio), so a
 # single backend kind covers both; the cluster distinction is a placement
 # constraint, not a codegen one.
@@ -70,15 +84,15 @@ REGISTRY="${REGISTRY:-cores/spacemit_k1.json}"
 # a 4+4 config silently double-books cluster 0 while never touching cluster 1.
 # The two clusters run the same ISA and measure equivalent (0.996), so this is
 # a placement-pool distinction, not a codegen one: both compile rvv_x60.
-CPU_P_KIND="${CPU_P_KIND:-rvv}"
-CPU_E_KIND="${CPU_E_KIND:-rvv_c1}"
+CPU_P_KIND="${CPU_P_KIND:-${BOARD_CPU_P_KIND}}"
+CPU_E_KIND="${CPU_E_KIND:-${BOARD_CPU_E_KIND}}"
 # core_kind (what the SCHEDULE says, and what the walker matches on) is distinct
 # from the backend tag (what the BINARY was built as). rvv_x60 is a K1-specific
 # build of the same rvv kind; conflating them makes every worker refuse every
 # entry -- strcmp("rvv_x60","rvv") != 0 -- and the run completes having executed
 # nothing, with entries_done=0 and an all-zero trace.
 CORE_KINDS="${CORE_KINDS:-}"
-OUT_ROOT="build/k1_xpurt"
+OUT_ROOT="${BOARD_OUT_ROOT_XPURT}"
 TRACE=1
 # Per-dispatch-END JSON lines on stdout, for xpu-rt/streaming_feedback.py.
 # Off by default: the trace block at exit is enough to EXPLAIN a run, and
@@ -89,10 +103,28 @@ STREAM="${MB_XPURT_STREAM:-0}"
 CPU_IDS=""
 JOBS="$(nproc)"
 
-HOST="${MODELBLASTER_K1_HOST:-k1}"
-REMOTE_ROOT="${MODELBLASTER_K1_REMOTE_ROOT:-/root/mb_k1}"
-RT_PRIORITY="${MODELBLASTER_K1_RT_PRIORITY:-}"
-CROSS="${CROSS:-/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-}"
+HOST="${BOARD_HOST}"
+REMOTE_ROOT="${BOARD_REMOTE_ROOT}"
+_rt_var="MODELBLASTER_$(tr '[:lower:]' '[:upper:]' <<<"${BOARD_NAME}")_RT_PRIORITY"
+RT_PRIORITY="${!_rt_var:-}"
+# No hardcoded chipyard default any more: that was gcc 13.2, which miscompiles
+# the RVV vsetvl intrinsics (SIGILL on the board) and lived under another
+# user's home. Take CROSS from the environment, else the SpaceMiT toolchain
+# (gcc>=14) that XPU-RT's setup script provides.
+if [[ -z "${CROSS:-}" ]]; then
+    _tc="${SETUP_TOOLCHAIN:-${REPO_ROOT}/../XPU-RT/scripts/setup_spacemit_toolchain.sh}"
+    # Never trigger the script's 800 MB download implicitly: only use it when
+    # the toolchain is already unpacked; otherwise say how to fetch it.
+    _tcroot="${SPACEMIT_TOOLCHAIN_ROOT:-$(dirname "${_tc}")/../tools/riscv-tools-spacemit}"
+    if [[ -x "${_tc}" ]] && compgen -G "${_tcroot}/*/bin/riscv64-unknown-linux-gnu-gcc" >/dev/null \
+            && CROSS="$("${_tc}" --path)"; then :; else
+        echo "CROSS is not set and the SpaceMiT toolchain fallback failed:" >&2
+        echo "  tried ${_tc} --path" >&2
+        echo "Set CROSS to a gcc>=14 riscv64-unknown-linux-gnu- prefix, e.g." >&2
+        echo "  eval \"\$(XPU-RT/scripts/setup_spacemit_toolchain.sh)\"" >&2
+        exit 2
+    fi
+fi
 PY="${PY:-python3}"
 # Same import root the single-model runner uses.
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -245,6 +277,10 @@ for model in "${MODEL_LIST[@]}"; do
         # it in the extraction key needlessly rebuilt every model when an
         # experiment switched between SCHED_OTHER and SCHED_FIFO.
         [[ "${_v}" == "MODELBLASTER_K1_RT_PRIORITY" ]] && continue
+        # Same reasoning for the board selector and the k3 equivalents.
+        case "${_v}" in
+            MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE) continue ;;
+        esac
         _cfg="${_cfg} ${_v}=${!_v}"
     done
     if [[ "${_skip_extract}" == "1" ]]; then
@@ -405,6 +441,10 @@ done
 # scripts/run_model_k1.sh, so the standalone and scheduled paths agree.
 # Unset by default; see harness_xpurt_linux/CMakeLists.txt for why it is an
 # explicit opt-in rather than a search.
+# A100 harts to register with the kernel (registry ai_thread_cpus). Only when
+# non-empty, so K1 configure lines are unchanged.
+_ai="$(${PY} "${REPO_ROOT}/pipeline/core_registry.py" "${REGISTRY}" --ai-cpus)" || exit 2
+[[ -n "${_ai}" ]] && CMAKE_ARGS+=("-DMODELBLASTER_AI_CPUS=${_ai}")
 [[ -n "${MODELBLASTER_KERNEL_CC:-}" ]] && \
     CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CC=${MODELBLASTER_KERNEL_CC}")
 
@@ -417,10 +457,27 @@ BIN="${BUILD_DIR}/xpurt_harness"
 echo "  $(file -b "${BIN}" | cut -c1-70)"
 
 echo "=== 5/5 deploy and run on ${HOST} ==="
-ssh "${HOST}" "mkdir -p ${REMOTE_ROOT}/xpurt"
-scp -q "${BIN}" "${HOST}:${REMOTE_ROOT}/xpurt/${SCHED_NAME}"
+# k3's ssh is flaky: generous handshake timeout, and retry the idempotent
+# setup/copy/fetch steps (never the run itself). k1 keeps plain ssh/scp.
+SSH_OPTS=()
+RETRIES=1
+if [[ "${BOARD_NAME}" != "k1" ]]; then SSH_OPTS=(-o ConnectTimeout=60); RETRIES=4; fi
+# Optional ssh config file (e.g. a tunnel); same knob as validation/k1_runner.py.
+if [[ -n "${MODELBLASTER_SSH_CONFIG:-}" ]]; then SSH_OPTS=(-F "${MODELBLASTER_SSH_CONFIG}" "${SSH_OPTS[@]}"); fi
+_retry() { local i; for ((i = 1; i <= RETRIES; i++)); do "$@" && return 0; [[ $i -lt ${RETRIES} ]] && sleep 5; done; return 1; }
+_retry ssh "${SSH_OPTS[@]}" "${HOST}" "mkdir -p ${REMOTE_ROOT}/xpurt"
+_retry scp "${SSH_OPTS[@]}" -q "${BIN}" "${HOST}:${REMOTE_ROOT}/xpurt/${SCHED_NAME}"
 RUN="cd ${REMOTE_ROOT}/xpurt && ulimit -n 8192 &&"
-[[ -n "${CPU_IDS}" ]] && RUN="${RUN} taskset -c ${CPU_IDS}"
+if [[ -n "${BOARD_LAUNCH_CPUS}" ]]; then
+    # k3: always START on the X100. Widening to the A100 is the runtime's job
+    # (threads register + set their own affinity); a wider mask here would let
+    # the main thread land on an unregistered A100 core.
+    [[ -n "${CPU_IDS}" && "${CPU_IDS}" != "${BOARD_LAUNCH_CPUS}" ]] && \
+        echo "  note: --cpu-ids ${CPU_IDS} ignored on ${BOARD_NAME}; launching under taskset -c ${BOARD_LAUNCH_CPUS}" >&2
+    RUN="${RUN} taskset -c ${BOARD_LAUNCH_CPUS}"
+elif [[ -n "${CPU_IDS}" ]]; then
+    RUN="${RUN} taskset -c ${CPU_IDS}"
+fi
 RUNNER_POLICY="SCHED_OTHER"
 RUNNER_PRIORITY=0
 if [[ -n "${RT_PRIORITY}" ]]; then
@@ -447,10 +504,10 @@ OUT="${GEN_DIR}/${SCHED_NAME}_stdout.txt"
 # program's own.
 REMOTE_LOG="${REMOTE_ROOT}/xpurt/${SCHED_NAME}_stdout.txt"
 set +e
-ssh "${HOST}" \
+ssh "${SSH_OPTS[@]}" "${HOST}" \
     "printf '%s\\n' 'xpurt_runner: sched_policy=${RUNNER_POLICY} priority=${RUNNER_PRIORITY}' >${REMOTE_LOG}; ${RUN} >>${REMOTE_LOG} 2>&1; echo \$? >${REMOTE_LOG}.rc"
-scp -q "${HOST}:${REMOTE_LOG}" "${OUT}"
-rc=$(ssh "${HOST}" "cat ${REMOTE_LOG}.rc" 2>/dev/null || echo 255)
+_retry scp "${SSH_OPTS[@]}" -q "${HOST}:${REMOTE_LOG}" "${OUT}"
+rc=$(_retry ssh "${SSH_OPTS[@]}" "${HOST}" "cat ${REMOTE_LOG}.rc" 2>/dev/null || echo 255)
 set -e
 echo "  exit=${rc}  stdout -> ${OUT}"
 grep -E 'MODELBLASTER_VERIFY|max_abs_err|FAIL|PASS' "${OUT}" | head -20 || true

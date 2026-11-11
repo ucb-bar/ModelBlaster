@@ -197,6 +197,33 @@ RVV_X60 = Backend(
 )
 
 
+# SpaceMiT K3 (X100 + A100). Cloned from rvv_x60: same curated kernels
+# (alias `rvv` -> kernels/rvv), same IHWOC weight layout, same cross-compile
+# verify. Every curated kernel's `target_affinity` lists this name next to
+# rvv_x60 -- the picker matches it by exact name, so a missing entry would
+# silently fall back to the scalar reference.
+#
+# `zvl256b` is a LOWER BOUND on VLEN, so one binary is legal on both core types:
+# the X100 has VLEN=256 (vlenb=32) and the A100 has VLEN=1024 (vlenb=128).
+# CAVEAT: the A100 is deliberately treated as X100-ISA-only for now. Its
+# correctness depends on every kernel being VL-agnostic (vsetvl-driven, no
+# hard-coded 256-bit lane count); that is NOT proven by construction and is
+# checked by golden runs pinned to the A100 harts.
+RVV_K3 = Backend(
+    name="rvv_k3",
+    description="SpaceMiT K3: rv64gcv zvl256b (X100 VLEN=256; the A100's "
+                "VLEN=1024 is covered by the zvl256b lower bound). Verified "
+                "on the board.",
+    kernel_cflags=RVV_X60.kernel_cflags,
+    kernel_includes=RVV_X60.kernel_includes,
+    prj_conf_overlay=RVV_X60.prj_conf_overlay,
+    spike_args=RVV_X60.spike_args,
+    optimization_guide=RVV_X60.optimization_guide,
+    curated_aliases=RVV_X60.curated_aliases,
+    verify_method=RVV_X60.verify_method,
+)
+
+
 # fp16 variants: same shape as scalar/rvv but with Zfh (and Zvfh on rvv)
 # enabled. The Kconfig overlay (scalar_f16.conf / rvv_f16.conf) tells
 # Zephyr to context-switch the half-precision register state and tells
@@ -500,6 +527,7 @@ BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
     RVV_X60.name: RVV_X60,
+    RVV_K3.name: RVV_K3,
     RVV_HETERO.name: RVV_HETERO,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,

@@ -42,9 +42,21 @@ INCLUDES  := -I src -I $(MODEL_DIR)
 # linux uses to emit rdtime instead of rdcycle, so the pool's tick source and
 # the model's agree by construction.
 POOL ?= 0
-ifeq ($(POOL),1)
 POOL_DIR    := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))/../runtime
-INCLUDES    += -I $(POOL_DIR) -I $(POOL_DIR)/modelblaster_pool
+
+# Thread placement (runtime/mb_placement.c) is linked ALWAYS: main.c places the
+# main thread through it even in a single-core build, and on a K3 an A100 CPU
+# cannot be reached by plain sched_setaffinity (the thread must register with
+# /proc/set_ai_thread first). AI_CPUS names the A100 CPUs for the target, e.g.
+# AI_CPUS=8-15 for K3; empty (the default) means none, i.e. K1 behaviour.
+# MODELBLASTER_PLATFORM_LINUX is applied to just main.o and mb_placement.o in
+# the non-pool build, so the default build's other objects are unchanged.
+AI_CPUS ?=
+INCLUDES    += -I $(POOL_DIR)
+PLACE_FLAGS := -DMODELBLASTER_PLATFORM_LINUX -DMODELBLASTER_AI_CPUS=\"$(AI_CPUS)\"
+SRCS_PLACE  := $(POOL_DIR)/mb_placement.c
+ifeq ($(POOL),1)
+INCLUDES    += -I $(POOL_DIR)/modelblaster_pool
 CFLAGS      += -DMODELBLASTER_USE_POOL -DMODELBLASTER_PLATFORM_LINUX -pthread
 SRCS_POOL   := $(POOL_DIR)/modelblaster_pool/modelblaster_pool.c
 LDLIBS_POOL := -pthread
@@ -52,6 +64,7 @@ else
 SRCS_POOL   :=
 LDLIBS_POOL :=
 endif
+# mb_placement uses pthread_once; link -pthread unconditionally.
 
 # Auto-generated header dependencies. Without them a rule's only prerequisite
 # is its .c file, so a change to the GENERATED headers -- model.h, test_io.h --
@@ -70,7 +83,7 @@ endif
 DEPFLAGS := -MMD -MP
 
 OBJDIR := $(OUT).objs
-SRCS_PLAIN := src/main.c $(MODEL_DIR)/model.c $(MODEL_DIR)/weights.c $(MODEL_DIR)/buffers.c $(SRCS_POOL)
+SRCS_PLAIN := src/main.c $(MODEL_DIR)/model.c $(MODEL_DIR)/weights.c $(MODEL_DIR)/buffers.c $(SRCS_PLACE) $(SRCS_POOL)
 OBJS_PLAIN := $(addprefix $(OBJDIR)/,$(notdir $(SRCS_PLAIN:.c=.o)))
 OBJ_KERNELS := $(OBJDIR)/kernels.o
 OBJ_TESTIO  := $(OBJDIR)/test_io.o
@@ -82,13 +95,15 @@ $(OBJDIR):
 	@mkdir -p $(OBJDIR)
 
 $(OBJDIR)/main.o: src/main.c | $(OBJDIR)
-	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(PLACE_FLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 $(OBJDIR)/model.o: $(MODEL_DIR)/model.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 $(OBJDIR)/weights.o: $(MODEL_DIR)/weights.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 $(OBJDIR)/buffers.o: $(MODEL_DIR)/buffers.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+$(OBJDIR)/mb_placement.o: $(POOL_DIR)/mb_placement.c | $(OBJDIR)
+	$(CC) $(CFLAGS) $(PLACE_FLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 ifeq ($(POOL),1)
 $(OBJDIR)/modelblaster_pool.o: $(POOL_DIR)/modelblaster_pool/modelblaster_pool.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
@@ -111,7 +126,7 @@ $(OBJ_TESTIO): $(MODEL_DIR)/test_io.S | $(OBJDIR)
 
 $(OUT): $(OBJS_PLAIN) $(OBJ_KERNELS) $(OBJ_TESTIO)
 	@mkdir -p $(dir $(OUT))
-	$(CC) $(CFLAGS) $^ -o $@ -lm $(LDLIBS_POOL)
+	$(CC) $(CFLAGS) $^ -o $@ -lm $(LDLIBS_POOL) -pthread
 	@echo "built $(OUT)"
 
 clean:
