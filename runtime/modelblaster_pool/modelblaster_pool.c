@@ -15,6 +15,9 @@
  *     run slice 0 itself              run slice wid
  *     k_sem_take(done[1..N-1])  <---  k_sem_give(done[wid])
  *
+ * (On Linux each helper first places itself -- see mb_placement.h -- and
+ * reports to the creator through a per-helper `ready` sem before looping.)
+ *
  * Workers loop forever waiting on `start`; on shutdown, master sets
  * `quit=1` then gives every start sem so each worker wakes, sees the
  * flag, and returns from its top-level fn (then pthread_join collects
@@ -26,14 +29,18 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef MB_PLATFORM_POSIX
 #include "mb_posix.h"   /* hosted Linux: k_sem -> sem_t, see runtime/mb_posix.h */
+#elif defined(MODELBLASTER_PLATFORM_LINUX)
+#include "mb_posix_compat.h"  /* Agustin's K1 harness build */
 #else
 #include <zephyr/kernel.h>
 #endif
+#include "mb_placement.h"  /* self-placement of helpers on hosted Linux (K3 A100) */
 
 /* Hard cap so we can size the embedded sem arrays without dynamic
  * malloc per worker. The bench under modelblaster/microbench/threadpool/
@@ -63,6 +70,14 @@ struct modelblaster_pool_state {
 	pthread_attr_t attrs[MODELBLASTER_POOL_MAX_WORKERS];
 	struct k_sem   start[MODELBLASTER_POOL_MAX_WORKERS];
 	struct k_sem   done[MODELBLASTER_POOL_MAX_WORKERS];
+#if MB_PLACEMENT_LINUX
+	/* Per-helper placement handshake (Linux only). A helper places ITSELF
+	 * (it needs its own TID to register on a K3 A100 CPU), so the creator
+	 * must wait for the verdict: `ready[w]` is given once the helper has
+	 * finished mb_place_current_thread, `place_rc[w]` holds its result. */
+	struct k_sem   ready[MODELBLASTER_POOL_MAX_WORKERS];
+	int            place_rc[MODELBLASTER_POOL_MAX_WORKERS];
+#endif
 };
 
 /* Worker arg packs (pool_state*, my worker index) without forcing the
@@ -71,6 +86,7 @@ struct modelblaster_pool_state {
 struct modelblaster_pool_worker_arg {
 	struct modelblaster_pool_state *pool;
 	int wid;
+	int hart;   /* CPU this helper must place itself on (Linux path) */
 };
 
 static void *modelblaster_pool_worker_fn(void *arg_)
@@ -78,6 +94,22 @@ static void *modelblaster_pool_worker_fn(void *arg_)
 	struct modelblaster_pool_worker_arg *wa = (struct modelblaster_pool_worker_arg *)arg_;
 	struct modelblaster_pool_state *p = wa->pool;
 	int wid = wa->wid;
+
+#if MB_PLACEMENT_LINUX
+	/* Place first, then tell the creator how it went. Not via
+	 * pthread_attr_setaffinity_np: on K3 an A100 thread must write its own
+	 * TID to /proc/set_ai_thread BEFORE it may pin, and there is no TID until
+	 * the thread runs. A failed helper exits without entering the loop; the
+	 * creator joins it. Fail loud: a helper left on the wrong core would make
+	 * every multi-core number a fiction. */
+	int prc = mb_place_current_thread(wa->hart);
+	p->place_rc[wid] = prc;
+	k_sem_give(&p->ready[wid]);
+	if (prc != 0) {
+		free(wa);
+		return NULL;
+	}
+#endif
 
 	for (;;) {
 		k_sem_take(&p->start[wid], K_FOREVER);
@@ -110,6 +142,19 @@ static void *modelblaster_pool_worker_fn(void *arg_)
 
 modelblaster_pool_t modelblaster_pool_create(int n_workers)
 {
+	if (n_workers <= 0 || n_workers > MODELBLASTER_POOL_MAX_WORKERS) {
+		return NULL;
+	}
+	int harts[MODELBLASTER_POOL_MAX_WORKERS];
+	for (int w = 0; w < n_workers; w++) {
+		harts[w] = w;
+	}
+	return modelblaster_pool_create_on_harts(n_workers, harts);
+}
+
+modelblaster_pool_t modelblaster_pool_create_on_harts(int n_workers,
+						      const int *harts)
+{
 	if (n_workers <= 0) {
 		/* Match pthreadpool_create(0) behavior: caller treats NULL
 		 * as "no pool, run sequentially". */
@@ -131,6 +176,9 @@ modelblaster_pool_t modelblaster_pool_create(int n_workers)
 	for (int w = 1; w < n_workers; w++) {
 		k_sem_init(&p->start[w], 0, 1);
 		k_sem_init(&p->done[w], 0, 1);
+#if MB_PLACEMENT_LINUX
+		k_sem_init(&p->ready[w], 0, 1);
+#endif
 	}
 
 	/* Spawn helpers, each pinned to hart `w`. Master is responsible
@@ -146,15 +194,16 @@ modelblaster_pool_t modelblaster_pool_create(int n_workers)
 		}
 		wa->pool = p;
 		wa->wid = w;
+		wa->hart = harts[w];
 
 		if (pthread_attr_init(&p->attrs[w]) != 0) {
 			free(wa);
 			goto fail;
 		}
-#ifdef CONFIG_POSIX_THREADS_AFFINITY
+#if defined(CONFIG_POSIX_THREADS_AFFINITY) && !MB_PLACEMENT_LINUX
 		cpu_set_t cs;
 		CPU_ZERO(&cs);
-		CPU_SET(w, &cs);
+		CPU_SET(harts[w], &cs);
 		if (pthread_attr_setaffinity_np(&p->attrs[w], sizeof(cs), &cs) != 0) {
 			pthread_attr_destroy(&p->attrs[w]);
 			free(wa);
@@ -168,6 +217,18 @@ modelblaster_pool_t modelblaster_pool_create(int n_workers)
 			goto fail;
 		}
 		spawned++;
+#if MB_PLACEMENT_LINUX
+		/* Wait for this helper's placement verdict. On failure the
+		 * helper has already exited its function (and freed `wa`);
+		 * the fail path below joins it like any other. */
+		k_sem_take(&p->ready[w], K_FOREVER);
+		if (p->place_rc[w] != 0) {
+			fprintf(stderr, "modelblaster_pool: helper %d could not be "
+					"placed on cpu %d; aborting pool create\n",
+				w, harts[w]);
+			goto fail;
+		}
+#endif
 	}
 	return p;
 

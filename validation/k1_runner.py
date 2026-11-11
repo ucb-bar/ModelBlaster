@@ -24,43 +24,95 @@ remember.
 
 No credentials appear here. The host comes from --host / MODELBLASTER_K1_HOST
 and authentication is whatever ssh is already configured to do.
+
+The same runner serves the SpaceMiT K3 (MODELBLASTER_BOARD=k3): host, remote
+root, profile target and clock come from validation/board_config.py, and the
+binary is launched under `taskset -c 0-7` (X100) so that any A100 worker
+threads are registered by the runtime itself. Nothing here writes
+/proc/set_ai_thread.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
+import time
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from modelblaster.validation import board_config  # noqa: E402
 from modelblaster.validation.runner_common import (  # noqa: E402
     IREEProfileArgs, report_pool_sweep_run, report_run,
 )
 
-DEFAULT_CLOCK_MHZ = 24.0  # rdtime, measured on the K1
+DEFAULT_CLOCK_MHZ = 24.0  # rdtime, measured on the K1 (K3 is the same; board_config owns the per-board value)
+
+
+def _retrying(cmd: list[str], *, flaky: bool, **kw) -> "subprocess.CompletedProcess":
+    """subprocess.run, retried on ssh's connection-failure status (255) when the
+    board's link is known flaky (K3). K1 keeps its single attempt, unchanged.
+
+    A hung connection is the other failure shape on the K3 link: ssh gets past
+    TCP connect and then stalls, so ConnectTimeout never fires and the
+    subprocess timeout does. That is the same transport fault as 255 and is
+    retried the same way (after a pause, so a board that dropped off for a
+    minute has time to come back); the last attempt re-raises."""
+    attempts = 4 if flaky else 1
+    for i in range(attempts):
+        last = i == attempts - 1
+        try:
+            proc = subprocess.run(cmd, **kw)
+        except subprocess.TimeoutExpired:
+            if last:
+                raise
+            print(f"k1: {cmd[0]} timed out, retry {i + 1}/{attempts - 1}", file=sys.stderr)
+            time.sleep(30)
+            continue
+        if proc.returncode != 255 or last:
+            return proc
+        print(f"k1: {cmd[0]} exit 255, retry {i + 1}/{attempts - 1}", file=sys.stderr)
+        time.sleep(30)
+    return proc  # unreachable
 
 
 def deploy_and_run(host: str, elf: str, remote_root: str, *,
                    cpu: str | None, timeout: float,
-                   env: dict[str, str] | None = None) -> str:
+                   env: dict[str, str] | None = None,
+                   launch_cpus: str | None = None) -> str:
     """scp the harness to the board, run it, return its stdout."""
     name = os.path.basename(elf)
     remote_bin = f"{remote_root}/bin/{name}"
-    subprocess.run(["ssh", host, f"mkdir -p {shlex.quote(remote_root)}/bin"],
-                   check=True, timeout=120)
-    subprocess.run(["scp", "-q", elf, f"{host}:{remote_bin}"],
-                   check=True, timeout=timeout)
+    flaky = board_config.resolve().name != "k1"
+    # K3's ssh drops connections; give the handshake room (K1: ssh defaults).
+    opts = ["-o", "ConnectTimeout=60"] if flaky else []
+    # MODELBLASTER_SSH_CONFIG: an ssh config file (passed as -F to ssh AND scp)
+    # for boards reached some way the user's ~/.ssh/config does not describe,
+    # e.g. a port-forwarded tunnel. Unset = ssh's normal config lookup.
+    ssh_cfg = os.environ.get("MODELBLASTER_SSH_CONFIG")
+    if ssh_cfg:
+        opts = ["-F", ssh_cfg, *opts]
+    _retrying(["ssh", *opts, host, f"mkdir -p {shlex.quote(remote_root)}/bin"],
+              flaky=flaky, timeout=120).check_returncode()
+    _retrying(["scp", *opts, "-q", elf, f"{host}:{remote_bin}"],
+              flaky=flaky, timeout=timeout).check_returncode()
     prefix = ""
     if cpu:
         prefix += f"MODELBLASTER_CPU={shlex.quote(cpu)} "
     for k, v in (env or {}).items():
         prefix += f"{k}={shlex.quote(v)} "
-    cmd = f"chmod +x {shlex.quote(remote_bin)} && {prefix}{shlex.quote(remote_bin)}"
-    proc = subprocess.run(["ssh", host, cmd], capture_output=True, text=True,
-                          timeout=timeout)
+    # launch_cpus (K3: "0-7"): the process STARTS on those CPUs. taskset sits
+    # after the env assignments so MODELBLASTER_CPU still reaches the binary.
+    launcher = f"taskset -c {shlex.quote(launch_cpus)} " if launch_cpus else ""
+    cmd = (f"chmod +x {shlex.quote(remote_bin)} && "
+           f"{prefix}{launcher}{shlex.quote(remote_bin)}")
+    # A retry here would re-RUN the harness, so only the setup steps above
+    # retry; the run itself is a single attempt on every board.
+    proc = subprocess.run(["ssh", *opts, host, cmd], capture_output=True,
+                          text=True, timeout=timeout)
     if proc.returncode != 0:
         # Print rather than raise: a harness that ran and then failed its own
         # verify still produced parseable markers worth reporting.
@@ -72,11 +124,11 @@ def deploy_and_run(host: str, elf: str, remote_root: str, *,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    cfg = board_config.resolve()
     ap.add_argument("--elf", required=True, help="harness binary to deploy")
-    ap.add_argument("--host", default=os.environ.get("MODELBLASTER_K1_HOST", "k1"))
+    ap.add_argument("--host", default=cfg.host)
     ap.add_argument("--remote-root",
-                    default=os.environ.get("MODELBLASTER_K1_REMOTE_ROOT",
-                                           "/root/mb_k1"))
+                    default=cfg.remote_root)
     ap.add_argument("--cpu", default=os.environ.get("MODELBLASTER_K1_CPU"),
                     help="physical core to pin to (0-3 = cluster 0 with IME, "
                          "4-7 = cluster 1 without)")
@@ -89,12 +141,20 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--profile-csv", default=None)
     ap.add_argument("--profile-out-root", default=None)
-    ap.add_argument("--profile-source", default="k1")
-    ap.add_argument("--profile-cpu", default="spacemit_x60")
+    ap.add_argument("--profile-source", default=cfg.name)
+    ap.add_argument("--profile-cpu", default=cfg.profile_cpu)
+    ap.add_argument("--profile-hw-name", default=os.environ.get("PROFILE_HW_NAME"),
+                    help="the <hw> level of the profile tree (default: the "
+                         "backend name). Lets X100 and A100 runs of one backend "
+                         "land in separate trees, e.g. rvv_k3_x100 / "
+                         "rvv_k3_a100.")
+    ap.add_argument("--launch-cpus", default=cfg.launch_cpus or None,
+                    help="taskset mask the binary is started under "
+                         "(K3: 0-7 = X100)")
     ap.add_argument("--profile-backend", default=None)
     ap.add_argument("--profile-cores", default=None,
                     help="topology label for the profile tree; defaults to --cpu")
-    ap.add_argument("--profile-clock-mhz", type=float, default=DEFAULT_CLOCK_MHZ,
+    ap.add_argument("--profile-clock-mhz", type=float, default=cfg.clock_mhz,
                     help="rdtime frequency, NOT the core clock (default 24 MHz)")
     ap.add_argument("--gen-dir", default=None,
                     help="build dir holding kernel_picks.json. Records WHAT "
@@ -140,7 +200,7 @@ def main() -> int:
         board_env["MODELBLASTER_ITERS"] = str(args.iters)
     out = deploy_and_run(args.host, args.elf, args.remote_root,
                          cpu=args.cpu, timeout=args.timeout,
-                         env=board_env or None)
+                         env=board_env or None, launch_cpus=args.launch_cpus)
     if args.save_output:
         with open(args.save_output, "w") as f:
             f.write(out)
@@ -164,19 +224,36 @@ def main() -> int:
         quant=args.quant,
         gen_dir=args.gen_dir,
     )
+    # --profile-cores is the (possibly width-relative) topology label; --cpu is
+    # where the process really ran. Keep the real list next to the build so a
+    # topo_0_1_2_3 profile can still be traced to harts 8-11.
+    if args.gen_dir and cfg.name != "k1":  # K1 output stays as it was
+        try:
+            with open(os.path.join(args.gen_dir, "run_meta.json"), "w") as f:
+                json.dump({"board": cfg.name, "host": args.host,
+                           "pinned_cpus": args.cpu,
+                           "launch_cpus": args.launch_cpus,
+                           "topo_label": iree_args.profile_cores,
+                           "profile_hw_name": args.profile_hw_name,
+                           "profile_cpu": args.profile_cpu}, f, indent=1)
+        except OSError as e:
+            print(f"k1: could not write run_meta.json: {e}", file=sys.stderr)
     models_list = args.models.split(",") if args.models else None
+    # The <hw> tree level IS the backend tag in profile_writer.output_path, so
+    # an hw-name override is applied by substituting it here.
+    backend_tag = args.profile_hw_name or args.profile_backend
     if args.pool_sizes:
         ok = report_pool_sweep_run(
             out, models=models_list,
             pool_sizes=[int(p) for p in args.pool_sizes.split(",") if p.strip()],
             quant=args.quant, atol=args.atol, rtol=args.rtol,
-            iree_args=iree_args, backend_tag=args.profile_backend,
+            iree_args=iree_args, backend_tag=backend_tag,
             repo_root=repo_root)
     else:
         ok = report_run(
             out, models=models_list, io_path=args.io, quant=args.quant,
             atol=args.atol, rtol=args.rtol, profile_csv=args.profile_csv,
-            iree_args=iree_args, backend_tag=args.profile_backend,
+            iree_args=iree_args, backend_tag=backend_tag,
             repo_root=repo_root, model_name=args.model_name)
     return 0 if ok else 1
 

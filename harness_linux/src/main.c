@@ -41,40 +41,42 @@
 #ifdef MODELBLASTER_USE_POOL
 #include "modelblaster_pool.h"
 #endif
+#include "mb_placement.h"
 
 static model_output_t model_output[MODEL_OUTPUT_SIZE];
 
-/* MODELBLASTER_CPU pins the process. Accepts one id ("3"), a list ("0,1,2,3")
- * or an inclusive range ("0-3").
+/* MODELBLASTER_CPU names the CPUs this run uses. Accepts one id ("3"), a list
+ * ("0,1,2,3") or an inclusive range ("0-3"); ORDER MATTERS: cpu[0] is the
+ * calling (main) thread, which runs slice 0 of every parallel-for, and
+ * cpu[i] is pool helper i.
  *
- * WHY A SET AND NOT AN ID. It was one id, which is right for a single-core
- * profile and makes a multi-core one impossible: the pool's helper threads
- * inherit the creating process's affinity mask, so a mask of {0} would have
- * pinned every worker onto hart 0 and the "4-core" run would have been four
- * threads time-slicing one core. That does not fail -- it produces a number,
- * and the number looks like poor scaling.
+ * WHY AN ORDERED LIST AND NOT A MASK. It used to be a process-wide mask that
+ * the pool's helpers inherited, with modelblaster_pool_create(n) then
+ * putting helpers on CPUs 1..n-1 regardless of it -- so MB_CORES=8-11 ran
+ * its helpers on 1-3 while the topo tag said 8-11. That does not fail; it
+ * produces a number. Now the list is handed to
+ * modelblaster_pool_create_on_harts() verbatim, and the main thread places
+ * itself with mb_placement (which, on a K3 A100 CPU, registers the thread
+ * with /proc/set_ai_thread first -- fine here: this single-model profiling
+ * harness's main thread IS slice 0, so it is meant to be an A100 thread).
  *
- * Returns how many cpus are in the mask, so the pool can be sized from the
- * same source of truth rather than from a second environment variable that
- * can disagree with it.
+ * Returns how many CPUs are in the list (0 = MODELBLASTER_CPU unset, nothing
+ * pinned). A malformed list is fatal for the same reason a failed placement
+ * is: running "somewhere" and filing it under the requested CPUs is the
+ * bookkeeping fiction this project exists to keep out of the cost database.
  */
-static int pin_from_env(void)
-{
-    const char *s = getenv("MODELBLASTER_CPU");
-    if (!s || !*s)
-        return 0;
+#define MAX_CPUS 16
 
-    cpu_set_t set;
-    CPU_ZERO(&set);
+static int parse_cpu_list(const char *s, int *cpus)
+{
     int n = 0;
     const char *p = s;
     while (*p) {
         char *end = NULL;
         long lo = strtol(p, &end, 10);
         if (end == p) {
-            fprintf(stderr, "MODELBLASTER_CPU=%s is not a cpu list; "
-                            "not pinning\n", s);
-            return 0;
+            fprintf(stderr, "MODELBLASTER_CPU=%s is not a cpu list\n", s);
+            return -1;
         }
         long hi = lo;
         p = end;
@@ -82,29 +84,46 @@ static int pin_from_env(void)
             p++;
             hi = strtol(p, &end, 10);
             if (end == p) {
-                fprintf(stderr, "MODELBLASTER_CPU=%s: range with no end; "
-                                "not pinning\n", s);
-                return 0;
+                fprintf(stderr, "MODELBLASTER_CPU=%s: range with no end\n", s);
+                return -1;
             }
             p = end;
         }
         if (lo < 0 || hi < lo) {
-            fprintf(stderr, "MODELBLASTER_CPU=%s: bad range; not pinning\n", s);
-            return 0;
+            fprintf(stderr, "MODELBLASTER_CPU=%s: bad range\n", s);
+            return -1;
         }
         for (long c = lo; c <= hi; c++) {
-            if (c >= CPU_SETSIZE) continue;
-            if (!CPU_ISSET((int)c, &set)) { CPU_SET((int)c, &set); n++; }
+            for (int i = 0; i < n; i++)
+                if (cpus[i] == (int)c) goto dup;
+            if (n >= MAX_CPUS) {
+                fprintf(stderr, "MODELBLASTER_CPU=%s: more than %d cpus\n",
+                        s, MAX_CPUS);
+                return -1;
+            }
+            cpus[n++] = (int)c;
+dup:        ;
         }
         while (*p == ',' || *p == ' ') p++;
     }
+    return n;
+}
+
+static int pin_from_env(int *cpus)
+{
+    const char *s = getenv("MODELBLASTER_CPU");
+    if (!s || !*s)
+        return 0;
+    int n = parse_cpu_list(s, cpus);
+    if (n < 0)
+        exit(3);
     if (n == 0)
         return 0;
-    if (sched_setaffinity(0, sizeof set, &set) != 0) {
-        perror("sched_setaffinity");
-        return 0;
+    if (mb_place_current_thread(cpus[0]) != 0) {
+        fprintf(stderr, "modelblaster harness: cannot place main thread on "
+                        "cpu %d (MODELBLASTER_CPU=%s)\n", cpus[0], s);
+        exit(3);
     }
-    sched_yield();
     printf("modelblaster harness: pinned to cpu %s (%d core(s), running on %d)\n",
            s, n, sched_getcpu());
     return n;
@@ -112,7 +131,8 @@ static int pin_from_env(void)
 
 int main(void)
 {
-    int n_pinned = pin_from_env();
+    int cpus[MAX_CPUS];
+    int n_pinned = pin_from_env(cpus);
 
     printf("modelblaster harness: model=%s in=%d out=%d\n",
            MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE);
@@ -128,11 +148,22 @@ int main(void)
         const char *e = getenv("MODELBLASTER_POOL_THREADS");
         if (e && *e) {
             long v = strtol(e, NULL, 10);
-            if (v > 0) threads = v;
+            /* The helpers go on the listed CPUs, so a different count has no
+             * CPUs to run on (or leaves some unused). Guessing which is the
+             * failure this override used to hide; refuse instead. */
+            if (n_pinned > 0 ? v != n_pinned : v < 1) {
+                fprintf(stderr, "modelblaster harness: MODELBLASTER_POOL_THREADS="
+                                "%s disagrees with MODELBLASTER_CPU (%d cpus); "
+                                "refusing to guess\n", e, n_pinned);
+                return 3;
+            }
+            threads = v;
         }
     }
     if (threads > 1) {
-        pool = (void *)modelblaster_pool_create((int)threads);
+        pool = (void *)(n_pinned > 0
+            ? modelblaster_pool_create_on_harts((int)threads, cpus)
+            : modelblaster_pool_create((int)threads));
         if (pool == NULL) {
             /* Loud, and fatal. A NULL pool is the wrappers' "run serially"
              * signal, so a silent fallback would file a serial measurement

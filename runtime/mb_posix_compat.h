@@ -34,6 +34,16 @@
 
 /* ---- 64-bit tick counter ------------------------------------------------ */
 
+/* 24 MHz rdtime on the SpaceMiT K1 (measured; also
+ * /proc/device-tree/cpus/timebase-frequency). Override for another board. */
+#ifndef MB_POSIX_TICKS_PER_SEC
+#define MB_POSIX_TICKS_PER_SEC 24000000ull
+#endif
+
+#if !defined(__riscv)
+#include <time.h>
+#endif
+
 static inline uint64_t mb_posix_rdtime(void)
 {
 #if defined(__riscv)
@@ -50,16 +60,6 @@ static inline uint64_t mb_posix_rdtime(void)
 	       (uint64_t)ts.tv_nsec * MB_POSIX_TICKS_PER_SEC / 1000000000ull;
 #endif
 }
-
-/* 24 MHz rdtime on the SpaceMiT K1 (measured; also
- * /proc/device-tree/cpus/timebase-frequency). Override for another board. */
-#ifndef MB_POSIX_TICKS_PER_SEC
-#define MB_POSIX_TICKS_PER_SEC 24000000ull
-#endif
-
-#if !defined(__riscv)
-#include <time.h>
-#endif
 
 #define k_cycle_get_64() mb_posix_rdtime()
 
