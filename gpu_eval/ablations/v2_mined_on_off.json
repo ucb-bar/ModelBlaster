@@ -1,0 +1,18 @@
+{
+ "_": "Needs MB_KB_ROOT and MB_ABLATE_PROBLEMS. The mined evidence in data/kernelblaster/knowledge/mined.json includes earlier runs on these problems: this measures how much of v2's result it explains.",
+ "name": "v2_mined_on_off",
+ "description": "Knowledge v2 seeded with vs without the mined evidence (prebuilt knowledge.db per arm, copied into every run).",
+ "entry": "multislot",
+ "kb": "${MB_KB_ROOT}",
+ "inputs": ["${MB_ABLATE_PROBLEMS}/p_12_Gemm_Multiply_LeakyReLU", "${MB_ABLATE_PROBLEMS}/p_57_Conv2d_ReLU_HardSwish"],
+ "flags": {"--model": "us.anthropic.claude-haiku-5-5", "--reflect-model": "us.anthropic.claude-haiku-5-5",
+           "--knowledge": "v2", "--rollouts": 2, "--steps": 3, "--max-fix": 1},
+ "env": {"KERNELBLASTER_ALLOW_SHARED_GPU": "1", "BEDROCK_MAX_TOKENS": "16384"},
+ "path_exclude": "xilinx", "path_prepend": ["/usr/local/cuda/bin"],
+ "gpu_model": "NVIDIA TITAN RTX",
+ "seeds": [0, 1, 2], "max_parallel": 2,
+ "budget": {"usd": 3.0, "est_usd_per_run": 0.3, "who": "ablate",
+            "ledger": "/scratch/dima/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+ "arms": {"mined": {"knowledge": {"mined": true, "prebuild": true}},
+          "no_mined": {"knowledge": {"mined": false, "prebuild": true}}}
+}

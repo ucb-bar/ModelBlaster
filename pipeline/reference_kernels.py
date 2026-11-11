@@ -328,8 +328,8 @@ def _elu_argtypes():
 def _conv2d_argtypes():
     import ctypes
     fp = ctypes.POINTER(ctypes.c_float)
-    # input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW
-    return [fp, fp, fp, fp] + [ctypes.c_int] * 11
+    # input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW, DH, DW
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 13
 
 
 def _maxpool2d_argtypes():
@@ -1269,32 +1269,42 @@ CONV2D = KernelSpec(
         "void kernel_conv2d(const float *input, const float *weight, "
         "const float *bias, float *output, "
         "int N, int IC, int IH, int IW, int OC, "
-        "int KH, int KW, int SH, int SW, int PH, int PW)"
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
     ),
     semantics=(
-        "2D convolution matching torch.nn.Conv2d semantics with groups=1, "
-        "dilation=1.\n"
+        "2D convolution matching torch.nn.Conv2d semantics with groups=1 "
+        "and dilation (DH, DW).\n"
         "Layout (row-major, NCHW for activations / OIHW for weights):\n"
         "  input:  [N, IC, IH, IW]\n"
         "  weight: [OC, IC, KH, KW]\n"
         "  bias:   [OC] (may be NULL — treat as zeros)\n"
         "  output: [N, OC, OH, OW]  with\n"
-        "    OH = (IH + 2*PH - KH) / SH + 1\n"
-        "    OW = (IW + 2*PW - KW) / SW + 1\n"
+        "    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n"
+        "    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n"
         "Definition (zero-padding implied by PH, PW):\n"
         "  output[n, oc, oh, ow] = bias[oc] + sum over ic, kh, kw of\n"
-        "    input[n, ic, oh*SH - PH + kh, ow*SW - PW + kw]\n"
+        "    input[n, ic, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW]\n"
         "    * weight[oc, ic, kh, kw]\n"
         "  with input reads outside [0, IH) x [0, IW) treated as 0.\n"
         "All tensors are float32."
     ),
     reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -1302,13 +1312,13 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                     float acc = bias ? bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
-                                float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
                                 acc += v * w;
                             }
                         }
@@ -1319,6 +1329,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         }
     }
 }
+#undef MB_CONV2D_W
 """,
     extra_shapes=[
         # LeNet
@@ -1355,12 +1366,22 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "checks make vectorization awkward."
             ),
             reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -1368,13 +1389,13 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                     float acc = bias ? bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
-                                float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
                                 acc += v * w;
                             }
                         }
@@ -1385,6 +1406,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         }
     }
 }
+#undef MB_CONV2D_W
 """,
         ),
         AlgorithmCandidate(
@@ -1439,7 +1461,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "      vfloat32m1_t va = __riscv_vle32_v_f32m1(\n"
                 "          &im2col_buf[row * K + k], vl);\n"
                 "      vfloat32m1_t vw = __riscv_vle32_v_f32m1(\n"
-                "          &weight[oc * K + k], vl);\n"
+                "          &weight[MB_CONV2D_W(oc, k / (KH*KW), (k / KW) % KH, k % KW)], vl);\n"
                 "      vacc = __riscv_vfmacc_vv_f32m1(vacc, va, vw, vl);\n"
                 "  }\n"
                 "  vfloat32m1_t vinit = __riscv_vfmv_s_f_f32m1(0.0f, 1);\n"
@@ -1461,12 +1483,22 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "that double-counts."
             ),
             reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     int M = OH * OW;
     int K = IC * KH * KW;
 
@@ -1480,9 +1512,9 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 int row = oh * OW + ow;
                 for (int ic = 0; ic < IC; ic++) {
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh * SH - PH + kh;
+                        int ih = oh * SH - PH + kh * DH;
                         for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PW + kw;
+                            int iw = ow * SW - PW + kw * DW;
                             int col = (ic * KH + kh) * KW + kw;
                             float v = 0.0f;
                             if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
@@ -1502,13 +1534,14 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
             for (int row = 0; row < M; row++) {
                 float acc = b;
                 for (int k = 0; k < K; k++) {
-                    acc += im2col_buf[row * K + k] * weight[oc * K + k];
+                    acc += im2col_buf[row * K + k] * weight[MB_CONV2D_W(oc, k / (KH*KW), (k / KW) % KH, k % KW)];
                 }
                 output[(n * OC + oc) * M + row] = acc;
             }
         }
     }
 }
+#undef MB_CONV2D_W
 """,
         ),
         AlgorithmCandidate(
@@ -1569,12 +1602,22 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "indexing cheap."
             ),
             reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     /* Tile so one OC-slab of weights fits in ~24 KB of L1D.
      * For OC=128 IC=128 K=3: 4 * 128 * 9 * 4 = 18 KB. */
     const int TILE_OC = 4;
@@ -1590,13 +1633,13 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                         float acc = bias ? bias[oc] : 0.0f;
                         for (int ic = 0; ic < IC; ic++) {
                             for (int kh = 0; kh < KH; kh++) {
-                                int ih = oh * SH - PH + kh;
+                                int ih = oh * SH - PH + kh * DH;
                                 if (ih < 0 || ih >= IH) continue;
                                 for (int kw = 0; kw < KW; kw++) {
-                                    int iw = ow * SW - PW + kw;
+                                    int iw = ow * SW - PW + kw * DW;
                                     if (iw < 0 || iw >= IW) continue;
                                     float v = input[((n*IC + ic)*IH + ih)*IW + iw];
-                                    float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                    float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
                                     acc += v * w;
                                 }
                             }
@@ -1608,6 +1651,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         }
     }
 }
+#undef MB_CONV2D_W
 """,
             # OC-blocked is only worth the loop-restructure cost when
             # the weight tensor is too large to stay in L1D. Skip on
@@ -1616,6 +1660,9 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         ),
     ],
 )
+for _s in CONV2D.extra_shapes:
+    _s.setdefault("DH", 1)
+    _s.setdefault("DW", 1)
 
 
 MAXPOOL2D = KernelSpec(
@@ -4835,6 +4882,12 @@ CONV2D_DW = KernelSpec(
         "All tensors are float32."
     ),
     reference_impl="""\
+/* depthwise weight [C,1,KH,KW]; packed (IHWOC/HWIO) both put C innermost */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_DW_W(c, kh, kw) (((long)(kh)*KW + (kw))*C + (c))
+#else
+#define MB_CONV2D_DW_W(c, kh, kw) (((long)(c)*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d_dw(const float *input, const float *weight, const float *bias,
                       float *output,
                       int N, int C, int IH, int IW,
@@ -4853,7 +4906,7 @@ void kernel_conv2d_dw(const float *input, const float *weight, const float *bias
                             int iw = ow * SW - PW + kw;
                             if (iw < 0 || iw >= IW) continue;
                             float v = input[((n*C + c)*IH + ih)*IW + iw];
-                            float w = weight[(c*KH + kh)*KW + kw];
+                            float w = weight[MB_CONV2D_DW_W(c, kh, kw)];
                             acc += v * w;
                         }
                     }
@@ -4863,6 +4916,7 @@ void kernel_conv2d_dw(const float *input, const float *weight, const float *bias
         }
     }
 }
+#undef MB_CONV2D_DW_W
 """,
     extra_shapes=[
         # MobileNetV2 width_mult=0.25 first-block 3x3 stride=1 dw conv
@@ -6396,14 +6450,15 @@ void kernel_layer_norm_f16(const _Float16 *input, const _Float16 *gamma,
                            const _Float16 *beta, _Float16 *output,
                            int M, int K, float eps) {
     for (int m = 0; m < M; m++) {
+        /* two-pass: E[x^2] - mean^2 cancels when |mean| >> std */
         float sum = 0.0f, sqsum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            float v = (float)input[m*K + k];
-            sum += v;
-            sqsum += v * v;
-        }
+        for (int k = 0; k < K; k++) sum += (float)input[m*K + k];
         float mean = sum / (float)K;
-        float var  = sqsum / (float)K - mean * mean;
+        for (int k = 0; k < K; k++) {
+            float d = (float)input[m*K + k] - mean;
+            sqsum += d * d;
+        }
+        float var  = sqsum / (float)K;
         float inv_sigma = 1.0f / sqrtf(var + eps);
         for (int k = 0; k < K; k++) {
             float v = (float)input[m*K + k];
@@ -13397,18 +13452,32 @@ void kernel_group_norm(const float *input, const float *gamma,
     long cnt = (long)cpg * HW;
     for (int n = 0; n < N; n++) {
         for (int g = 0; g < G; g++) {
-            float sum = 0.0f, sqsum = 0.0f;
+            /* Two-pass (E[x^2] - mean^2 cancels when |mean| >> std, e.g.
+             * GroupNorm after a sigmoid), each with Kahan-compensated fp32
+             * sums: a group can hold ~1e6 elements, where a plain running
+             * sum drifts ~1e-3. No fp64 needed. */
+            float sum = 0.0f, comp = 0.0f;
             for (int cc = 0; cc < cpg; cc++) {
-                int c = g*cpg + cc;
-                const float *p = input + ((long)(n*C + c))*HW;
+                const float *p = input + ((long)(n*C + g*cpg + cc))*HW;
                 for (int i = 0; i < HW; i++) {
-                    float v = p[i];
-                    sum += v;
-                    sqsum += v * v;
+                    float y = p[i] - comp, t = sum + y;
+                    comp = (t - sum) - y;
+                    sum = t;
                 }
             }
             float mean = sum / (float)cnt;
-            float var  = sqsum / (float)cnt - mean * mean;
+            float sqsum = 0.0f;
+            comp = 0.0f;
+            for (int cc = 0; cc < cpg; cc++) {
+                const float *p = input + ((long)(n*C + g*cpg + cc))*HW;
+                for (int i = 0; i < HW; i++) {
+                    float d = p[i] - mean;
+                    float y = d * d - comp, t = sqsum + y;
+                    comp = (t - sqsum) - y;
+                    sqsum = t;
+                }
+            }
+            float var  = sqsum / (float)cnt;
             float inv_sigma = 1.0f / sqrtf(var + eps);
             for (int cc = 0; cc < cpg; cc++) {
                 int c = g*cpg + cc;
@@ -14345,14 +14414,15 @@ void kernel_layer_norm(const float *input, const float *gamma,
                        const float *beta, float *output,
                        int M, int K, float eps) {
     for (int m = 0; m < M; m++) {
+        /* two-pass: E[x^2] - mean^2 cancels when |mean| >> std */
         float sum = 0.0f, sqsum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            float v = input[m*K + k];
-            sum += v;
-            sqsum += v * v;
-        }
+        for (int k = 0; k < K; k++) sum += input[m*K + k];
         float mean = sum / (float)K;
-        float var  = sqsum / (float)K - mean * mean;
+        for (int k = 0; k < K; k++) {
+            float d = input[m*K + k] - mean;
+            sqsum += d * d;
+        }
+        float var  = sqsum / (float)K;
         float inv_sigma = 1.0f / sqrtf(var + eps);
         for (int k = 0; k < K; k++) {
             float v = input[m*K + k];
@@ -15471,26 +15541,68 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
 }
 
 
-def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
-    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec.
+# Shape-generic fallback ops (strided_copy, ewise2, reduce, ...); see
+# reference_kernels_ext.py.
+from modelblaster.pipeline.reference_kernels_ext import ext_specs as _ext_specs  # noqa: E402
+KERNEL_SPECS.update(_ext_specs(KernelSpec))
+# fp16 <-> fp32 casts at precision-policy island boundaries (precision_casts.py; only policy IRs use them)
+from modelblaster.pipeline.precision_casts import cast_specs as _cast_specs  # noqa: E402
+KERNEL_SPECS.update(_cast_specs(KernelSpec))
 
-    The transformation is purely mechanical: rename kernel_<op> -> kernel_<op>_f16
-    and change every float POINTER (`const float *` / `float *`, in both the
-    signature and the body's pointer locals) to `_Float16 *`. Scalar `float`
-    params (eps, scale, beta, margin) and `float` locals / `(float)` casts stay
-    — loads widen `_Float16`->float and stores narrow float->`_Float16`
-    implicitly, so the math still runs in fp32. Mirrors the hand-written _f16
-    kernels (relu_f16, softmax_f16, ...)."""
+
+def _cast_spec(src: str, dst: str) -> "KernelSpec":
+    """`cast_<src>_to_<dst>`: the dtype conversion a mixed IR (`--quant native`,
+    docs/tensor_dtypes.md) inserts where a tensor's dtype differs from what its
+    op reads or writes. Float -> float rounds once (round-to-nearest-even);
+    an integer / bool source converts exactly (ints are integer-valued f32
+    inside the graph, exact below 2^24); f32 -> integer truncates toward zero,
+    -> bool (b8) is `!= 0`."""
+    from modelblaster.pipeline.cuda_dtypes import CTYPE, cast_kind
+    cs, cd = CTYPE[src][0], CTYPE[dst][0]
+    op = cast_kind(src, dst)
+    if dst == "b8":
+        body, rule = "out[i] = (float)in[i] != 0.0f;", "out[i] = in[i] != 0 (bool, one byte)"
+    elif dst in ("i64", "i32", "u8"):
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})in[i] (truncation toward zero)"
+    else:
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})(float)in[i] (one rounding to {dst})"
+    sig = f"void kernel_{op}(const {cs} *in, {cd} *out, int n)"
+    return KernelSpec(
+        op=op,
+        signature=sig,
+        semantics=(f"Convert a {src} tensor to {dst}, elementwise over n elements:\n  {rule}\n"
+                   "Inserted by extraction where a tensor's dtype differs from the dtype its op "
+                   "reads or writes (per-tensor dtypes, docs/tensor_dtypes.md)."),
+        reference_impl=(f"{sig} {{\n    for (int i = 0; i < n; i++) {{\n        {body}\n    }}\n}}\n"),
+        extra_shapes=[{"n": 1}, {"n": 257}],
+    )
+
+
+def _cast_specs() -> dict:
+    from modelblaster.pipeline.cuda_dtypes import CASTS
+    return {s.op: s for s in (_cast_spec(a, b) for a, b in CASTS)}
+
+
+KERNEL_SPECS.update(_cast_specs())
+
+
+def _make_reduced_variant(spec: "KernelSpec", suffix: str, ctype: str, label: str) -> "KernelSpec":
+    """Synthesize the `<op><suffix>` storage variant of an fp32 KernelSpec:
+    rename kernel_<op> -> kernel_<op><suffix> and change every float POINTER
+    (`const float *` / `float *`, in both the signature and the body's pointer
+    locals) to `ctype *`. Scalar `float` params (eps, scale, beta, margin) and
+    `float` locals / `(float)` casts stay -- loads widen to float and stores
+    narrow from float implicitly, so the math still runs in fp32."""
     import ctypes
 
     def _c(s: str) -> str:
-        s = s.replace("const float *", "const _Float16 *")
-        s = s.replace("float *", "_Float16 *")
-        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}_f16(")
+        s = s.replace("const float *", f"const {ctype} *")
+        s = s.replace("float *", f"{ctype} *")
+        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}{suffix}(")
         return s
 
     _fp = ctypes.POINTER(ctypes.c_float)
-    _hp = ctypes.POINTER(ctypes.c_uint16)  # _Float16 has no ctypes type; use u16
+    _hp = ctypes.POINTER(ctypes.c_uint16)  # 2-byte float types have no ctypes type; use u16
 
     def _argtypes(_orig=spec.argtypes_factory):
         if _orig is None:
@@ -15498,23 +15610,40 @@ def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
         return [_hp if a is _fp else a for a in _orig()]
 
     return KernelSpec(
-        op=spec.op + "_f16",
+        op=spec.op + suffix,
         signature=_c(spec.signature),
-        semantics="(fp16) " + spec.semantics,
+        semantics=f"({label}) " + spec.semantics,
         reference_impl=_c(spec.reference_impl),
         extra_shapes=list(spec.extra_shapes),
         argtypes_factory=(None if spec.argtypes_factory is None else _argtypes),
     )
 
 
-for _op_name in list(KERNEL_SPECS):
-    if _op_name.endswith("_f16") or _op_name.endswith("_s8"):
-        continue
-    if _op_name.startswith("cast_"):
-        continue
+def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec:
+    `_Float16` storage, fp32 math (see _make_reduced_variant). Mirrors the
+    hand-written _f16 kernels (relu_f16, softmax_f16, ...)."""
+    return _make_reduced_variant(spec, "_f16", "_Float16", "fp16")
+
+
+def _make_bf16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the bfloat16 (`_bf16`) counterpart of an fp32 KernelSpec:
+    `__bf16` storage (GCC/Clang's bfloat16; `__nv_bfloat16` in the CUDA
+    spelling, cuda_dtypes.cuda_signature), fp32 math, one rounding per store
+    (docs/bf16_cuda.md). Every `_bf16` spec is derived from the fp32 one --
+    including the ops with hand-written `_f16` specs -- so its signature and
+    argument binding are the fp32 op's."""
+    return _make_reduced_variant(spec, "_bf16", "__bf16", "bf16")
+
+
+_FP32_OPS = [_op_name for _op_name in KERNEL_SPECS
+             if not (_op_name.endswith(("_f16", "_bf16", "_s8")) or _op_name.startswith("cast_"))]
+for _op_name in _FP32_OPS:
     _f16_name = _op_name + "_f16"
     if _f16_name not in KERNEL_SPECS:
         KERNEL_SPECS[_f16_name] = _make_f16_variant(KERNEL_SPECS[_op_name])
+for _op_name in _FP32_OPS:
+    KERNEL_SPECS[_op_name + "_bf16"] = _make_bf16_variant(KERNEL_SPECS[_op_name])
 
 
 def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:

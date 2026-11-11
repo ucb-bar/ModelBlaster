@@ -33,12 +33,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from typing import Any
 
 import numpy as np
 import torch
 import torch.fx
 from torch.fx.passes.shape_prop import ShapeProp
+
+# precision_policy.extract sets this to a list to receive the fp32 golden output (A2); None = off
+GOLDEN_SINK = None
 
 
 
@@ -130,6 +134,35 @@ def _collapse_attention(ops: list[dict]) -> list[int]:
     return fused
 
 
+# What the last trace evaluated at trace time on value-specialized inputs (concrete_trace.py); written to graph.json
+_VALUE_SPECIALIZED: list = [None]
+
+# The fx node extract() is lowering; read by its generic-lowering retry.
+_LOWERING_NODE: list = [None]
+
+
+def _trace(model: torch.nn.Module, sample_inputs) -> torch.fx.GraphModule:
+    """fx-trace `model`, specializing shape-dependent Python to the sample
+    inputs (see pipeline/concrete_trace.py). MB_FX_TRACER=symbolic restores
+    plain torch.fx.symbolic_trace."""
+    # Models that declare an mb_fx_leaf module, and MB_FX_TRACER=symbolic,
+    # take _mb_symbolic_trace (plain symbolic_trace unless a leaf exists).
+    if (os.environ.get("MB_FX_TRACER") == "symbolic"
+            or any(getattr(m, "mb_fx_leaf", False) for m in model.modules())):
+        return _mb_symbolic_trace(model)
+    from modelblaster.pipeline.concrete_trace import concrete_trace
+    gm = concrete_trace(model, sample_inputs)
+    _VALUE_SPECIALIZED[0] = gm.meta.get("value_specialized")
+    if _VALUE_SPECIALIZED[0]:
+        vs = _VALUE_SPECIALIZED[0]
+        print(f"[extract] note: DATA-SPECIALIZED IR: {vs['n']} data-dependent op(s) {vs['ops']} evaluated at trace time on "
+              f"input(s) {[i['name'] for i in vs['inputs']]} (graph.json data_specialized)")
+    if gm.meta.get("value_branches"):
+        print(f"[extract] note: control flow specialized to the sample input "
+              f"at {gm.meta['value_branches']}")
+    return gm
+
+
 def _annotate_dispatches(ops: list[dict]) -> list[int]:
     """Promote each non-view op to a first-class dispatch.
 
@@ -202,6 +235,36 @@ def _round_half_away(x):
     """
     import numpy as _np
     return _np.sign(x) * _np.floor(_np.abs(x) + 0.5)
+
+
+def _check_traced_shapes(gm, tensors) -> None:
+    """Every IR tensor named after an fx node must have the traced shape.
+
+    The per-op branches compute output shapes by hand; one that is wrong
+    but has the right numel (a dropped keepdim, say) produces correct
+    buffers until a later op reads the shape, then silently wrong output.
+    Some branches squeeze on purpose (LSTM's [1, H] for a traced [1, 1, H]),
+    so this warns; MB_STRICT_SHAPES=1 makes it an error.
+    """
+    strict = os.environ.get("MB_STRICT_SHAPES") == "1"
+    for node in gm.graph.nodes:
+        meta = node.meta.get("tensor_meta")
+        t = tensors.get(node.name)
+        if t is None or not hasattr(meta, "shape"):
+            continue
+        want = [int(d) for d in meta.shape]
+        if list(t["shape"]) != want and int(np.prod(t["shape"])) == int(np.prod(want)):
+            msg = f"IR tensor {node.name} has shape {list(t['shape'])}, traced {want}"
+            if strict:
+                raise RuntimeError(msg)
+            print(f"[extract_graph] warning: {msg}", file=sys.stderr)
+
+
+def _keepdim_arg(node) -> bool:
+    """keepdim of a torch.max/min(x, dim, keepdim) call (positional or kw)."""
+    if "keepdim" in (node.kwargs or {}):
+        return bool(node.kwargs["keepdim"])
+    return len(node.args) > 2 and bool(node.args[2])
 
 
 def _find_getitem_consumer(node, index: int):
@@ -758,7 +821,7 @@ def _tensor_meta(node: torch.fx.Node) -> dict[str, Any]:
         raise RuntimeError(f"missing tensor_meta on node {node.name}; ShapeProp failed")
     shape = list(tm.shape)
     dtype = {torch.float32: "f32", torch.float16: "f16", torch.int8: "i8",
-             torch.int32: "i32", torch.int64: "i64"}.get(tm.dtype)
+             torch.int32: "i32", torch.int64: "i64", torch.bool: "b8"}.get(tm.dtype)
     if dtype is None:
         raise RuntimeError(f"unsupported dtype {tm.dtype} on {node.name}")
     return {"shape": shape, "dtype": dtype, "quant": None}
@@ -1667,7 +1730,7 @@ def extract_int8(
     else:
         sample_inputs = [sample_input]
 
-    gm = _mb_symbolic_trace(model)
+    gm = _trace(model, sample_inputs)
     # Graph-level BN folding, BEFORE ShapeProp/calibration/quantization —
     # a folded model has no batchnorm2d nodes at all, so everything
     # downstream (activation calibration, op emission) just never sees them.
@@ -4443,6 +4506,281 @@ def extract_int8(
 # fp32 extractor (unchanged path)
 # ---------------------------------------------------------------------------
 
+class _SortedTopk(torch.overrides.TorchFunctionMode):
+    """topk(sorted=False) returns its k results in an unspecified order; the
+    IR's topk sorts them, so compute the golden with the same (legal) order."""
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = dict(kwargs or {})
+        if func in (torch.topk, torch.Tensor.topk):
+            if len(args) > 4:
+                args = tuple(args[:4]) + (True,) + tuple(args[5:])
+            else:
+                kwargs["sorted"] = True
+        return func(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# per-tensor dtypes (--quant native, docs/tensor_dtypes.md)
+# ---------------------------------------------------------------------------
+
+# torch dtype of a traced node -> IR tensor dtype (MB has no float64 storage:
+# a float64 tensor is stored f32; int8 / int16 never reach a graph input --
+# the SOL port refuses that storage -- and are carried as integer-valued f32)
+_IR_DTYPE = {torch.float32: "f32", torch.float64: "f32", torch.bfloat16: "bf16", torch.float16: "f16",
+             torch.int64: "i64", torch.int32: "i32", torch.int16: "i32", torch.int8: "i32",
+             torch.uint8: "u8", torch.bool: "b8"}
+_INT_IR = ("i64", "i32", "b8", "u8")
+_FLOAT_IR = ("f32", "bf16", "f16")
+# data movement: an output the lowering made (no traced node of its own) keeps
+# its inputs' float dtype instead of widening to f32
+_VALUE_MOVES = {"strided_copy", "strided_scatter", "gather", "gather_dim", "index_select", "cat2_c1",
+                "cat3_c1", "cat4_c1", "catn", "flip", "upsample_nearest"}
+_ALIAS = ("view", "chunk2_c1")
+_TO_FP32_METHODS = {"bfloat16": "float", "half": "float", "double": "float"}
+
+
+def _fp32_twin(gm: "torch.fx.GraphModule") -> None:
+    """Turn a graph traced at the model's own dtypes into its fp32 twin (in
+    place): every bf16 / fp16 / fp64 dtype argument becomes float32
+    (``x.to(torch.bfloat16)``, ``torch.zeros(..., dtype=...)``), ``.bfloat16()``
+    / ``.half()`` / ``.double()`` become ``.float()``, and float parameters,
+    buffers and constants are widened (exactly). This is the SOL port's fp32
+    rewrite done on the traced graph, so the lowering sees the graph it always
+    sees, while the dtypes of the original trace are kept apart."""
+    low = (torch.bfloat16, torch.float16, torch.float64)
+
+    def sub(a):
+        return torch.float32 if isinstance(a, torch.dtype) and a in low else a
+    for n in gm.graph.nodes:
+        n.args = torch.fx.node.map_aggregate(n.args, sub)
+        n.kwargs = torch.fx.node.map_aggregate(n.kwargs, sub)
+        if n.op == "call_method" and n.target in _TO_FP32_METHODS:
+            n.target = _TO_FP32_METHODS[n.target]
+    gm.float()
+    for n in gm.graph.nodes:
+        if n.op != "get_attr":
+            continue
+        *path, leaf = str(n.target).split(".")
+        obj = gm
+        for p in path:
+            obj = getattr(obj, p)
+        v = getattr(obj, leaf, None)
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != torch.float32:
+            if isinstance(v, torch.nn.Parameter):
+                v.data = v.data.float()
+            elif leaf in getattr(obj, "_buffers", {}):
+                obj._buffers[leaf] = v.float()
+            else:
+                setattr(obj, leaf, v.float())
+    gm.recompile()
+
+
+def _native_trace(model: torch.nn.Module, sample_inputs: list):
+    """--quant native: trace ``model`` on ``sample_inputs`` at their own dtypes,
+    record every node's dtype (``gm.meta["mb_native_dtypes"]``: node name ->
+    IR dtype), then make the graph its fp32 twin (``_fp32_twin``) for the
+    lowering -> (gm, reference, the inputs with float tensors widened to
+    float32). ``reference`` is the twin before the compound-activation /
+    loss rewrites (whose marker nodes do not compute): the golden's model."""
+    gm = _trace(model, sample_inputs)
+    ShapeProp(gm).propagate(*sample_inputs)
+    native = {}
+    for n in gm.graph.nodes:
+        tm = n.meta.get("tensor_meta")
+        dt = getattr(tm, "dtype", None)
+        if dt is not None:
+            if dt not in _IR_DTYPE:
+                # (the wording extract-failure classifiers match, as _f_cast's)
+                raise NotImplementedError(f"{n.name}: {dt}: no fp8/fp4 storage in the IR"
+                                          if "float8" in str(dt) or "float4" in str(dt) else
+                                          f"{n.name}: no IR storage for {dt}")
+            native[n.name] = _IR_DTYPE[dt]
+    _fp32_twin(gm)
+    f32 = [t.float() if torch.is_tensor(t) and t.is_floating_point() else t for t in sample_inputs]
+    ShapeProp(gm).propagate(*f32)
+    import copy
+    ref = copy.deepcopy(gm)
+    _maybe_fuse_compound_activation(gm)
+    _maybe_fuse_loss(gm)
+    gm.meta["mb_native_dtypes"] = native
+    return gm, ref, f32
+
+
+def _native_storage(ops, tensors, weights, input_names, output_names, native, ints) -> dict:
+    """Storage dtype of every IR tensor of a mixed IR (docs/tensor_dtypes.md):
+
+    * graph inputs and outputs: the source's dtype (integer / bool ones as
+      real integers: i64 / i32 / b8 / u8);
+    * every other tensor of a traced node: its float dtype; integer-valued
+      ones (indices, masks) are exact f32 inside the graph, as in an fp32 IR;
+    * argmax / argmin outputs: i64 (their kernels write int64_t);
+    * float constants: their traced dtype; integer constants keep their array;
+    * tensors the lowering made (no node of their own): an alias' or a data
+      movement's keeps its input's dtype, a computed one is f32 -- a torch op
+      on bf16 computes in fp32 and rounds once, at its output."""
+    S = {}
+    for t, m in tensors.items():
+        nat = native.get(t)
+        if m.get("const"):
+            arr = weights.get(m["const"])
+            S[t] = None if arr is not None and arr.dtype.kind in "iub" else \
+                (nat if nat in _FLOAT_IR else "f32")
+        elif t in ints:
+            S[t] = "i64"
+        elif t in input_names or t in output_names:
+            S[t] = nat or "f32"
+        elif nat is not None:
+            S[t] = nat if nat in _FLOAT_IR else "f32"
+    for o in ops:                         # lowering-made tensors, in op order
+        for t in o["outputs"]:
+            if t in S:
+                continue
+            fl = {S.get(i) for i in o["inputs"] if S.get(i) in _FLOAT_IR}
+            if (o["op"] in _ALIAS or o["op"] in _VALUE_MOVES) and len(fl) == 1:
+                S[t] = fl.pop()
+            else:
+                S[t] = "f32"
+    for t in tensors:
+        S.setdefault(t, None if tensors[t].get("const") else "f32")
+    return S
+
+
+def _cast_path(src: str, dst: str) -> list:
+    from modelblaster.pipeline.cuda_dtypes import CASTS
+    if (src, dst) in CASTS:
+        return [(src, dst)]
+    return [(src, "f32"), ("f32", dst)]
+
+
+class _Retyper:
+    """Rebuilds a mixed IR's op list with the casts its dtypes need."""
+
+    def __init__(self, tensors, S):
+        self.tensors, self.S, self.ops, self.memo = tensors, S, [], {}
+
+    def _new(self, base: str, dt: str) -> str:
+        name, k = f"{base}__{dt}", 1
+        while name in self.tensors:
+            name, k = f"{base}__{dt}{k}", k + 1
+        self.tensors[name] = {"shape": list(self.tensors[base]["shape"]), "dtype": dt, "quant": None}
+        self.S[name] = dt
+        return name
+
+    def cast(self, src: str, dst_t: str) -> None:
+        """Append the cast(s) writing tensor dst_t from tensor src."""
+        from modelblaster.pipeline.cuda_dtypes import cast_kind
+        steps = _cast_path(self.S[src], self.S[dst_t])
+        cur = src
+        for k, (a, b) in enumerate(steps):
+            out = dst_t if k == len(steps) - 1 else self._new(src, b)
+            n = int(np.prod(self.tensors[src]["shape"])) if self.tensors[src]["shape"] else 1
+            self.ops.append({"name": f"{out}__cast", "op": cast_kind(a, b), "inputs": [cur], "outputs": [out],
+                             "shape": {"n": n}})
+            cur = out
+
+    def as_dtype(self, t: str, dt: str) -> str:
+        """Tensor t at storage dt (a cast, made once per (t, dt))."""
+        if self.S.get(t) in (None, dt):
+            return t
+        if (t, dt) not in self.memo:
+            out = self._new(t, dt)
+            self.cast(t, out)
+            self.memo[(t, dt)] = out
+        return self.memo[(t, dt)]
+
+
+def _native_views(ops, tensors, S, input_names) -> list:
+    """First pass of the retyping (before output views are materialized): the
+    integer graph inputs are read through an f32 copy, and an alias whose two
+    sides differ in dtype (a traced ``.to()`` / ``.float()`` lowers to a view)
+    becomes a cast -- of its window when it is not the whole input."""
+    R = _Retyper(tensors, S)
+    int_in = {t for t in input_names if S.get(t) in _INT_IR}
+    for o in ops:
+        o["inputs"] = [R.as_dtype(t, "f32") if t in int_in else t for t in o["inputs"]]
+        if o["op"] not in _ALIAS:
+            R.ops.append(o)
+            continue
+        src = o["inputs"][0]
+        bad = [t for t in o["outputs"] if S[t] != S[src]]
+        if not bad:
+            R.ops.append(o)
+            continue
+        n_src = int(np.prod(tensors[src]["shape"])) if tensors[src]["shape"] else 1
+        if o["op"] == "view" and not o.get("offset") and o["shape"].get("n") == n_src:
+            R.cast(src, o["outputs"][0])          # a pure dtype conversion
+            continue
+        ren = {}
+        for t in bad:
+            ren[t] = R._new(t, S[src])
+        o["outputs"] = [ren.get(t, t) for t in o["outputs"]]
+        R.ops.append(o)
+        for t, tmp in ren.items():
+            R.cast(tmp, t)
+    return R.ops
+
+
+def _native_ops(ops, tensors, S, weight_roles, ints=frozenset()) -> tuple[list, dict]:
+    """Second pass: every kernel op gets one float storage dtype. When all of
+    its float tensors share bf16 / fp16 it becomes that op's `_bf16` / `_f16`
+    kind; otherwise (fp32 tensors, integer-valued operands, a mix) it runs as
+    the fp32 op, reading its bf16 / fp16 inputs through exact casts to f32 and
+    writing f32, cast once to each output's dtype. An integer graph output that
+    other ops also read (topk indices fed to a gather) is read through its f32
+    copy, as an integer input is. -> (ops, weight key -> dtype)."""
+    from modelblaster.pipeline.cuda_dtypes import SUFFIX, FLOAT_TENSOR
+    R = _Retyper(tensors, S)
+    wdt = {}
+    for o in ops:
+        if o["op"] in _ALIAS or o["op"].startswith("cast_"):
+            R.ops.append(o)
+            continue
+        o["inputs"] = [R.as_dtype(t, "f32") if S.get(t) in _INT_IR and t not in ints else t
+                       for t in o["inputs"]]
+        fl = [t for t in o["inputs"] + o["outputs"] if S.get(t) in _FLOAT_IR]
+        dts = {S[t] for t in fl}
+        st = FLOAT_TENSOR[dts.pop()] if len(dts) == 1 else "fp32"
+        for role in weight_roles:
+            if isinstance(o.get(role), str):
+                wdt[o[role]] = {"fp32": "f32", "fp16": "f16", "bf16": "bf16"}[st]
+        if st in SUFFIX:
+            o["op"] = o["op"] + SUFFIX[st]
+            R.ops.append(o)
+            continue
+        o["inputs"] = [R.as_dtype(t, "f32") if S.get(t) in ("bf16", "f16") else t for t in o["inputs"]]
+        ren = {t: R._new(t, "f32") for t in o["outputs"] if S.get(t) not in (None, "f32", "i64")
+               or (S.get(t) == "i64" and not o["op"].startswith(("argmax", "argmin")))}
+        o["outputs"] = [ren.get(t, t) for t in o["outputs"]]
+        for k, v in list((o.get("state") or {}).items()):
+            o["state"][k] = ren.get(v, v)
+        R.ops.append(o)
+        for t, tmp in ren.items():
+            R.cast(tmp, t)
+    for t, m in tensors.items():
+        if S.get(t) is not None:
+            m["dtype"] = S[t]
+    return R.ops, wdt
+
+
+def _lowering_signature(node: "torch.fx.Node"):
+    """What extract()'s specific branches look at: op, target, each argument's
+    kind and shape (or literal value), and the output shape."""
+    def arg(a):
+        if isinstance(a, torch.fx.Node):
+            tm = a.meta.get("tensor_meta")
+            return (a.op, tuple(tm.shape) if hasattr(tm, "shape") else None)
+        if isinstance(a, (tuple, list)):
+            return tuple(arg(x) for x in a)
+        if isinstance(a, dict):
+            return tuple(sorted((k, arg(v)) for k, v in a.items()))
+        if isinstance(a, slice):
+            return ("slice", arg(a.start), arg(a.stop), arg(a.step))
+        return repr(a)
+    tm = node.meta.get("tensor_meta")
+    return (node.op, node.target, arg(node.args), arg(node.kwargs),
+            tuple(tm.shape) if hasattr(tm, "shape") else None)
+
+
 def extract(
     model: torch.nn.Module,
     sample_input: "torch.Tensor | list[torch.Tensor]",
@@ -4458,6 +4796,8 @@ def extract(
     fusion_target: "str | None" = None,
     fold_conv_bn: bool = True,
     weight_bits: int = _WEIGHT_BITS_DEFAULT,
+    _generic: "set[str] | None" = None,
+    _gm: "torch.fx.GraphModule | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
 
@@ -4477,6 +4817,24 @@ def extract(
     variants. The golden is recomputed via `model.half()` on
     `input.half()` so we're comparing genuine fp16 numerics, not
     fp32-traced numerics down-cast at the boundary.
+
+    bf16 mode (docs/bf16_cuda.md): extracted exactly like fp32 (same trace,
+    same shapes, fp32 weight folding), then op kinds get a "_bf16" suffix,
+    float tensors dtype "bf16", and every float weight, the inputs and the
+    golden are rounded to bfloat16. numpy has no bfloat16, so the npz arrays
+    are float32 holding bf16-exact values (cuda_dtypes.round_bf16). The
+    golden is the fp32 model on the bf16-rounded inputs, stored as bf16.
+
+    native mode (per-tensor dtypes, docs/tensor_dtypes.md): `model` and
+    `sample_input` are the model at its own dtypes (bf16 / fp32 / integer
+    tensors as the source has them). It is traced at those dtypes (each
+    node's dtype is recorded), then lowered as its fp32 twin (_fp32_twin).
+    Every tensor keeps the source's dtype (_native_storage), each op gets one
+    float storage dtype and casts are inserted where they differ
+    (_native_views, _native_ops). Integer graph inputs / outputs are real
+    integer tensors. io.npz holds each input / output at its own dtype
+    (`in.<name>`, `out.<name>`) next to the flat float32 `input` / `output`;
+    the golden is the fp32 twin on the inputs, each output stored at its dtype.
     """
     if quant == "int8":
         return extract_int8(
@@ -4495,12 +4853,16 @@ def extract(
         raise NotImplementedError(
             f"weight_bits={weight_bits!r} is an int8-path option; it has no "
             f"meaning for quant={quant!r}")
-    if quant not in ("fp32", "fp16"):
+    if quant not in ("fp32", "fp16", "bf16", "native"):
         raise NotImplementedError(
-            f"quant={quant!r} not supported (have: fp32, fp16, int8)"
+            f"quant={quant!r} not supported (have: fp32, fp16, bf16, native, int8)"
         )
+    native = quant == "native"
+    # bf16: everything below runs as fp32; the bf16 rounding is applied when
+    # the artifacts are written (numpy has no bfloat16)
     weight_dtype = np.float16 if quant == "fp16" else np.float32
-    op_suffix = "_f16" if quant == "fp16" else ""
+    op_suffix = {"fp16": "_f16", "bf16": "_bf16"}.get(quant, "")
+    store_dtype = {"fp16": "f16", "bf16": "bf16"}.get(quant)
     os.makedirs(out_dir, exist_ok=True)
     model = model.eval()
 
@@ -4511,8 +4873,50 @@ def extract(
     else:
         sample_inputs = list(sample_input)
 
-    gm = torch.fx.symbolic_trace(model)
-    ShapeProp(gm).propagate(*sample_inputs)
+    if native and _gm is None:
+        # trace at the model's own dtypes; lower (and compute the golden on)
+        # its fp32 twin, which then stands in for the model
+        gm, ref, f32_inputs = _native_trace(model, sample_inputs)
+        return extract(ref, f32_inputs, name, out_dir, quant=quant, _gm=gm)
+    if _gm is not None:
+        gm = _gm
+    else:
+        gm = _trace(model, sample_inputs)
+        ShapeProp(gm).propagate(*sample_inputs)
+        _maybe_fuse_compound_activation(gm)
+        _maybe_fuse_loss(gm)
+
+    if _generic is None:
+        # Lower every node with its specific branch below; a node that branch
+        # rejects is retried through generic_lowering (shape-generic ops)
+        # when that can express it. Graphs that extracted before are
+        # unchanged. Each retry re-runs the lowering loop on the same traced
+        # graph, so only nodes that actually fail pay for it.
+        from modelblaster.pipeline.generic_lowering import GenericLowering
+        probe = GenericLowering(gm, {}, [], {}, weight_dtype, set())
+        generic = {n.name for n in gm.graph.nodes if probe.obviously_generic(n)}
+        while True:
+            _LOWERING_NODE[0] = None
+            try:
+                return extract(model, sample_input, name, out_dir, quant=quant,
+                               calibration_samples=calibration_samples,
+                               input_dtypes=input_dtypes,
+                               fp16_op_names=fp16_op_names,
+                               per_channel=per_channel, _generic=generic, _gm=gm)
+            except (NotImplementedError, AttributeError, TypeError, KeyError,
+                    IndexError, ValueError):
+                node = _LOWERING_NODE[0]
+                if node is None or node.name in generic or not probe.can_lower(node):
+                    raise
+                # the specific branches decide from op, target, shapes and
+                # argument kinds, so a node's structural twins (one per step
+                # of an unrolled loop) would be rejected the same way: route
+                # them together rather than paying one re-lowering each
+                sig = _lowering_signature(node)
+                generic.update(n.name for n in gm.graph.nodes
+                               if n.name not in generic and _lowering_signature(n) == sig
+                               and probe.can_lower(n))
+                generic.add(node.name)
 
     # KernelBench Phase 2 has a few compound activations that don't
     # appear as a single FX node — they're hand-rolled with primitive
@@ -4522,9 +4926,7 @@ def extract(
     # rewrites the FX graph in place by replacing the multi-node
     # subgraph with a single call to a stub `_agents_compound_<name>`
     # marker function. The per-node iteration below then sees that
-    # marker and emits a clean single-op IR.
-    _maybe_fuse_compound_activation(gm)
-    _maybe_fuse_loss(gm)
+    # marker and emits a clean single-op IR. (Applied right after tracing.)
 
     tensors: dict[str, dict] = {}
     ops: list[dict] = []
@@ -4567,8 +4969,15 @@ def extract(
                       and getattr(_arg.target, "__name__", "") == "diag"):
                     _skip_nodes.add(_arg)
 
+    from modelblaster.pipeline.generic_lowering import GenericLowering
+    _gl = GenericLowering(gm, tensors, ops, weights, weight_dtype, _skip_nodes)
+
     for node in gm.graph.nodes:
         if node in _skip_nodes:
+            continue
+        _LOWERING_NODE[0] = node
+        if node.name in _generic:
+            _gl.lower(node)
             continue
         if node.op == "placeholder":
             input_names.append(node.name)
@@ -4899,6 +5308,12 @@ def extract(
                 SH, SW = _pair(mod.stride)
                 PH, PW = _pair(mod.padding)
                 DH, DW = _pair(mod.dilation)
+                if (OH != (IH + 2 * PH - DH * (KH - 1) - 1) // SH + 1 or
+                        OW != (IW + 2 * PW - DW * (KW - 1) - 1) // SW + 1):
+                    # ceil_mode=True: kernel_maxpool2d derives OH/OW with
+                    # floor and would mis-index; maxpool2d_ex takes them.
+                    raise NotImplementedError(
+                        f"MaxPool2d ceil_mode at {node.name}")
                 ops.append({
                     "name": str(node.target),
                     "op": "maxpool2d",
@@ -5261,6 +5676,12 @@ def extract(
                 # run_model calls, BSS-zeroed => correct step-0 init).
                 if mod.bidirectional:
                     raise NotImplementedError("fp32 LSTM: bidirectional unsupported")
+                if (len(node.args) > 1 or node.kwargs or
+                        int(np.prod(tensors[in_name]["shape"][:-1])) > 1):
+                    # This branch is the streaming (seq-len-1, batch-1,
+                    # persistent-state) cell; whole sequences / explicit
+                    # (h0, c0) go to generic_lowering's lstm_seq.
+                    raise NotImplementedError(f"sequence LSTM at {node.name}")
                 L = int(mod.num_layers)
                 H = int(mod.hidden_size)
                 in_size0 = int(tensors[in_name]["shape"][-1])
@@ -5700,7 +6121,10 @@ def extract(
             elif tname == "sum" or target is torch.sum:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -5712,7 +6136,10 @@ def extract(
             elif tname == "mean" or target is torch.mean:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -5724,7 +6151,10 @@ def extract(
             elif tname == "prod" or target is torch.prod:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -5736,7 +6166,10 @@ def extract(
             elif tname == "argmax" or target is torch.argmax:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -5748,7 +6181,10 @@ def extract(
             elif tname == "argmin" or target is torch.argmin:
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -5769,7 +6205,10 @@ def extract(
                     and (len(node.args) > 1 or "dim" in (node.kwargs or {})):
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -5785,7 +6224,10 @@ def extract(
                 _skip_nodes.add(gi)
                 # Compute output shape: drop the reduced dim from input.
                 out_shape = list(in_shape)
-                del out_shape[dim]
+                if _keepdim_arg(node):
+                    out_shape[dim] = 1
+                else:
+                    del out_shape[dim]
                 tensors[values_name] = {"shape": out_shape, "dtype": "f32",
                                         "quant": None}
                 ops.append({
@@ -5797,7 +6239,10 @@ def extract(
                     and (len(node.args) > 1 or "dim" in (node.kwargs or {})):
                 in_name = node.args[0].name
                 in_shape = list(tensors[in_name]["shape"])
-                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0))
+                if "dim" not in node.kwargs and len(node.args) < 2:
+                    # full reduction (x.sum()): not a single-axis op
+                    raise NotImplementedError(f"{tname} at {node.name}: no dim")
+                dim = int(node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else 0)) % len(in_shape)
                 outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
                 reduce = int(in_shape[dim])
                 inner = int(np.prod(in_shape[dim+1:])) if dim + 1 < len(in_shape) else 1
@@ -5809,7 +6254,10 @@ def extract(
                 values_name = gi.name
                 _skip_nodes.add(gi)
                 out_shape = list(in_shape)
-                del out_shape[dim]
+                if _keepdim_arg(node):
+                    out_shape[dim] = 1
+                else:
+                    del out_shape[dim]
                 tensors[values_name] = {"shape": out_shape, "dtype": "f32",
                                         "quant": None}
                 ops.append({
@@ -5981,6 +6429,12 @@ def extract(
                     b_node = arg_b_node.args[0] if trans_b else arg_b_node
                     a_shape = list(tensors[a_node.name]["shape"])
                     b_shape = list(tensors[b_node.name]["shape"])
+                    if len(b_shape) != 2 or (trans_a and len(a_shape) != 2):
+                        # Batched B ([..., K, N]) is a bmm with broadcasting —
+                        # flattening only A's leading dims would be wrong.
+                        raise NotImplementedError(
+                            f"matmul at {node.name}: batched operands "
+                            f"{a_shape} @ {b_shape}")
                     # N-D @ 2D: flatten A's leading dims into M (contiguous
                     # row-major, so the matmul kernel sees a plain [M,K]). This
                     # covers torch.matmul(A_3d/4d, B_2d) (KernelBench 10) and the
@@ -6010,6 +6464,10 @@ def extract(
                 b_name = node.args[1].name
                 a_shape = list(tensors[a_name]["shape"])
                 b_shape = list(tensors[b_name]["shape"])
+                if (len(a_shape) != 3 or len(b_shape) != 3
+                        or a_shape[0] != b_shape[0]):
+                    raise NotImplementedError(
+                        f"bmm at {node.name}: {a_shape} @ {b_shape}")
                 ops.append({
                     "name": node.name, "op": "bmm",
                     "inputs": [a_name, b_name],
@@ -6228,20 +6686,60 @@ def extract(
         else:
             raise NotImplementedError(f"unhandled fx op {node.op} at {node.name}")
 
+    _LOWERING_NODE[0] = None
     if not input_names or not output_names:
         raise RuntimeError("graph missing input/output")
+    # The fp32 pipeline carries integer / bool tensors (indices, masks) as
+    # exact float values: io.npz packs every input as float32 and the kernels
+    # read them through float pointers (also via views). The exception is
+    # what argmax/argmin write: an int64_t buffer.
+    ints = {t for o in ops if o["op"] in ("argmax_dim", "argmin_dim")
+            for t in o["inputs"] + o["outputs"]}
+    grew = True
+    while grew:   # a view shares its base's buffer
+        grew = False
+        for o in ops:
+            io_ = set(o["inputs"] + o["outputs"])
+            if o["op"] == "view" and io_ & ints and not io_ <= ints:
+                ints |= io_
+                grew = True
+    for tname_, tmeta in tensors.items():
+        if tmeta.get("dtype") in ("i64", "i32", "b8") and tname_ not in ints:
+            tmeta["dtype"] = "f32"
+    _check_traced_shapes(gm, tensors)
+    if native:
+        S = _native_storage(ops, tensors, weights, input_names, output_names,
+                            gm.meta.get("mb_native_dtypes", {}), ints)
+        ops[:] = _native_views(ops, tensors, S, input_names)
+    from modelblaster.pipeline.generic_lowering import materialize_output_views
+    materialize_output_views(ops, tensors, input_names, output_names)
+    # constants nothing reads (a value snapshotted before an in-place write
+    # that DCE then dropped) would still be baked into weights
+    used = {t for o in ops for t in o["inputs"] + o["outputs"]} | set(input_names) | set(output_names)
+    refs = {v for o in ops for v in o.values() if isinstance(v, str)}
+    for t in [t for t, m in tensors.items() if m.get("const") and t not in used]:
+        key = tensors.pop(t)["const"]
+        if key not in refs:
+            weights.pop(key, None)
 
     # In fp16 mode, suffix every op name (and update tensor dtypes) so
     # downstream stages pick the half-precision kernel variants without
     # touching the otherwise-identical graph extraction logic. Done as
     # a post-pass to keep the per-module branches dtype-agnostic.
+    weight_dtypes: dict = {}
+    if native:
+        from modelblaster.pipeline.kernel_abi import WEIGHT_ROLES
+        ops[:], weight_dtypes = _native_ops(ops, tensors, S, set(WEIGHT_ROLES.values()), ints)
+        for tname, tmeta in tensors.items():
+            if tmeta.get("const") and weights[tmeta["const"]].dtype.kind == "f":
+                weight_dtypes[tmeta["const"]] = tmeta["dtype"]
     if op_suffix:
         for op in ops:
             if op["op"] != "view":
                 op["op"] = op["op"] + op_suffix
         for tname, tmeta in tensors.items():
             if tmeta.get("dtype") == "f32":
-                tmeta["dtype"] = "f16"
+                tmeta["dtype"] = store_dtype
 
     _collapse_attention(ops)
     dispatches = _annotate_dispatches(ops)
@@ -6275,6 +6773,13 @@ def extract(
         "ops": ops,
         "dispatches": dispatches,
     }
+    if _VALUE_SPECIALIZED[0]:
+        # the IR is only valid for these input values (indptr / page tables baked as slice bounds and loop counts)
+        ir["data_specialized"] = _VALUE_SPECIALIZED[0]
+    if native:
+        # weights.npz arrays of a mixed IR: bf16 ones are float32 holding
+        # bf16-exact values, so the dtype is named here
+        ir["weight_dtypes"] = {k: v for k, v in sorted(weight_dtypes.items()) if k in weights}
 
     # Run reference to capture golden I/O. fp16 mode runs `model.half()`
     # on `input.half()` so the golden reflects genuine half-precision
@@ -6298,11 +6803,31 @@ def extract(
                                for t in sample_inputs]
             torch_dtype = torch.float16
             out = model.float()(*ref_inputs_exec)
+        elif quant == "bf16":
+            # as fp16: the fp32 model on the bf16-rounded inputs (every tensor
+            # input, ints included, round-trips through the bf16 io buffer;
+            # bf16 holds integers exactly only up to 256), stored as bf16
+            ref_inputs_exec = [t.to(torch.bfloat16).to(t.dtype)
+                               if torch.is_tensor(t) else t
+                               for t in sample_inputs]
+            torch_dtype = torch.bfloat16
+            torch.manual_seed(0)
+            with _SortedTopk():
+                out = model.float()(*ref_inputs_exec)
         else:
             ref_inputs_exec = list(sample_inputs)
             ref_model = model
             torch_dtype = torch.float32
-            out = ref_model(*ref_inputs_exec)
+            # same draws as the trace for tensors sampled inside forward
+            torch.manual_seed(0)
+            with _SortedTopk():
+                out = ref_model(*ref_inputs_exec)
+
+    # precision_policy (A2): the fp32 model output before the storage cast (fp16 storage overflows to inf for
+    # e.g. Mamba2); None (default) = no-op
+    if GOLDEN_SINK is not None:
+        GOLDEN_SINK.append(np.concatenate([o.detach().cpu().float().numpy().reshape(-1) for o in out])
+                           if isinstance(out, (tuple, list)) else out.detach().cpu().float().numpy().reshape(-1))
 
     # Multi-output models return a tuple; flatten in IR-output order so the
     # downstream comparator just needs to do an elementwise compare.
@@ -6319,6 +6844,25 @@ def extract(
         t.detach().cpu().numpy().astype(weight_dtype).reshape(-1)
         for t in ref_inputs_exec
     ])
+    if quant == "bf16":
+        from modelblaster.pipeline.cuda_dtypes import round_bf16
+        flat, flat_input = round_bf16(flat), round_bf16(flat_input)
+        weights = {k: round_bf16(v) if v.dtype.kind == "f" else v for k, v in weights.items()}
+    per_tensor = {}
+    if native:
+        # every graph input / output at its own dtype; the flat float32 arrays
+        # hold the same values (integers exact below 2^24)
+        from modelblaster.pipeline.cuda_dtypes import np_storage
+        outs = list(out) if isinstance(out, (tuple, list)) else [out]
+        for pre, names, vals in (("in.", input_names, ref_inputs_exec), ("out.", output_names, outs)):
+            for nm, v in zip(names, vals):
+                per_tensor[pre + nm] = np_storage(v.detach().cpu().numpy(), tensors[nm]["dtype"])
+        flat_input = np.concatenate([per_tensor["in." + nm].astype(np.float32).reshape(-1)
+                                     for nm in input_names])
+        flat = np.concatenate([per_tensor["out." + nm].astype(np.float32).reshape(-1)
+                               for nm in output_names])
+        weights = {k: np_storage(v, weight_dtypes[k]) if k in weight_dtypes and v.dtype.kind == "f" else v
+                   for k, v in weights.items()}
 
     ir_path = os.path.join(out_dir, "graph.json")
     weights_path = os.path.join(out_dir, "weights.npz")
@@ -6331,6 +6875,7 @@ def extract(
         io_path,
         input=flat_input,
         output=flat,
+        **per_tensor,
     )
 
     print(f"wrote {ir_path}")
@@ -6343,10 +6888,11 @@ import contextlib
 
 
 @contextlib.contextmanager
-def _cpu_fp32_tensor_creation():
+def _cpu_fp32_tensor_creation(keep_dtype: bool = False):
     """Patch torch tensor-creation ops so benches that hard-code
     device='cuda' and/or dtype=float16 in get_inputs (e.g. 97 SDPA) still
-    materialize on CPU in fp32. Restores the originals on exit."""
+    materialize on CPU in fp32. Restores the originals on exit.
+    ``keep_dtype`` (--quant native): only the device is patched."""
     names = ["rand", "randn", "zeros", "ones", "empty", "full", "randint",
              "arange", "tensor", "eye", "linspace"]
     saved = {n: getattr(torch, n) for n in names if hasattr(torch, n)}
@@ -6355,7 +6901,7 @@ def _cpu_fp32_tensor_creation():
         def inner(*args, **kwargs):
             if kwargs.get("device") is not None:
                 kwargs["device"] = "cpu"
-            if kwargs.get("dtype") == torch.float16:
+            if not keep_dtype and kwargs.get("dtype") in (torch.float16, torch.bfloat16):
                 kwargs["dtype"] = torch.float32
             return fn(*args, **kwargs)
         return inner
@@ -6444,6 +6990,7 @@ def _shrink_for_flops(mod, target_flops: int,
     instead of pinning a tiny-io / huge-FLOP shape. Falls back to a byte cap if
     FLOPs can't be counted; reverts any shrink that makes the forward invalid."""
     order = ["batch", "spatial", "channel"]
+    frozen: set = set()   # dims whose halving broke the forward
     for _ in range(400):
         try:
             fl = _kb_flops(mod)
@@ -6455,7 +7002,8 @@ def _shrink_for_flops(mod, target_flops: int,
         if fl <= target_flops and (target_bytes is None or fp <= target_bytes):
             return
         ints = {k: v for k, v in vars(mod).items()
-                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+                if isinstance(v, int) and v > 1 and not k.startswith("_")
+                and k not in frozen}
         cand = None
         for grp in order:
             pool = {k: v for k, v in ints.items()
@@ -6471,8 +7019,9 @@ def _shrink_for_flops(mod, target_flops: int,
         try:
             _kb_footprint_bytes(mod)   # validate the new dims forward-pass
         except Exception:
+            # e.g. num_channels tied to embed_dim: keep it, try the next dim
             setattr(mod, cand, oldv)
-            return
+            frozen.add(cand)
 
 
 def _shrink_for_utilization(mod, target_bytes: int) -> None:
@@ -6481,6 +7030,7 @@ def _shrink_for_utilization(mod, target_bytes: int) -> None:
     still exercises the vector/GEMM units). Reverts any shrink that makes the
     forward invalid."""
     order = ["batch", "spatial", "channel"]
+    frozen: set = set()   # dims whose halving broke the forward
     for _ in range(200):
         try:
             fp = _kb_footprint_bytes(mod)
@@ -6489,7 +7039,8 @@ def _shrink_for_utilization(mod, target_bytes: int) -> None:
         if fp <= target_bytes:
             return
         ints = {k: v for k, v in vars(mod).items()
-                if isinstance(v, int) and v > 1 and not k.startswith("_")}
+                if isinstance(v, int) and v > 1 and not k.startswith("_")
+                and k not in frozen}
         cand = None
         for grp in order:
             pool = {k: v for k, v in ints.items()
@@ -6505,14 +7056,58 @@ def _shrink_for_utilization(mod, target_bytes: int) -> None:
         try:
             _kb_footprint_bytes(mod)   # validate the new dims forward-pass
         except Exception:
+            # e.g. num_channels tied to embed_dim: keep it, try the next dim
             setattr(mod, cand, oldv)
+            frozen.add(cand)
+
+
+def _kb_param_bytes(mod) -> int:
+    """fp32 bytes of the Model's parameters + buffers at the current dims."""
+    ia = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
+    m = mod.Model(*ia)
+    return 4 * sum(t.numel() for t in list(m.parameters()) + list(m.buffers()))
+
+
+def _shrink_for_weights(mod, target_bytes: int) -> None:
+    """Halve the largest non-structural dim — including list-valued globals
+    such as `layer_sizes = [16384, 16384]`, which the io-based policies never
+    touch — until parameters fit `target_bytes` (level3 MLPs / VanillaRNN ship
+    2-8 GB of weights). Reverts a shrink that breaks the forward."""
+    def is_int(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+    for _ in range(200):
+        try:
+            if _kb_param_bytes(mod) <= target_bytes:
+                return
+        except Exception:
+            return
+        cands = {}
+        for k, v in vars(mod).items():
+            if k.startswith("_") or _kb_attr_group(k) is None:
+                continue
+            if is_int(v) and v > 1:
+                cands[k] = v
+            elif isinstance(v, list) and v and all(is_int(x) for x in v) and max(v) > 1:
+                cands[k] = max(v)
+        if not cands:
+            return
+        k = max(cands, key=cands.get)
+        old = vars(mod)[k]
+        new = [max(1, x // 2) for x in old] if isinstance(old, list) else max(1, old // 2)
+        setattr(mod, k, new)
+        try:
+            _kb_footprint_bytes(mod)
+        except Exception:
+            setattr(mod, k, old)
             return
 
 
 def _load_kernelbench(bench_path: str,
                       max_elements: "int | None" = None,
                       target_bytes: "int | None" = None,
-                      target_flops: "int | None" = None
+                      target_flops: "int | None" = None,
+                      target_weight_bytes: "int | None" = None,
+                      native: bool = False,
                       ) -> "tuple[torch.nn.Module, torch.Tensor, str]":
     """Load a KernelBench level1 file (single-input variant only).
 
@@ -6534,6 +7129,12 @@ def _load_kernelbench(bench_path: str,
     Multi-input forwards are threaded through extract()'s packed_inputs path.
     Loss-style benches (preds+targets → scalar) load but fail later at the
     unsupported loss op. See modelblaster/notes/kernelbench_rvv_port_plan.md.
+
+    ``native`` (--quant native): the model and inputs at the source's own
+    dtypes -- the bench's ``NativeModel`` / ``get_native_inputs()`` when it
+    defines them (the SOL-ExecBench port: the original reference on the
+    definition's dtypes), else ``Model`` / ``get_inputs()``, with creation
+    dtypes left as written.
     """
     import importlib.util
     if not os.path.isfile(bench_path):
@@ -6548,7 +7149,7 @@ def _load_kernelbench(bench_path: str,
     if not hasattr(mod, "get_inputs"):
         raise RuntimeError(f"{bench_path} missing get_inputs()")
 
-    with _cpu_fp32_tensor_creation():
+    with _cpu_fp32_tensor_creation(keep_dtype=native):
         if max_elements is not None and max_elements > 0:
             SHAPE_ATTRS_BLOCKLIST = {"num_classes"}  # not a spatial dim
             ints = {k: v for k, v in vars(mod).items()
@@ -6600,46 +7201,59 @@ def _load_kernelbench(bench_path: str,
             # Default policy: cap the baked-io footprint while protecting the
             # channel/feature dims that drive vector/GEMM utilization.
             _shrink_for_utilization(mod, target_bytes)
+        if target_weight_bytes:
+            _shrink_for_weights(mod, target_weight_bytes)
 
         init_args = mod.get_init_inputs() if hasattr(mod, "get_init_inputs") else []
-        model = mod.Model(*init_args)
+        model = (mod.NativeModel if native and hasattr(mod, "NativeModel") else mod.Model)(*init_args)
         model.eval()
-        inputs = mod.get_inputs()
+        inputs = (mod.get_native_inputs if native and hasattr(mod, "get_native_inputs") else mod.get_inputs)()
+        if isinstance(inputs, tuple):
+            inputs = list(inputs)
         if not isinstance(inputs, list) or not inputs:
             raise RuntimeError(f"{bench_path} get_inputs() must return non-empty list")
-    # Bool masks (e.g. masked_cumsum) become float in the model anyway
-    # (x * bool == x * float); cast them so the fp32 pipeline can carry them.
-    # Integer class-index targets (cross_entropy) are left alone.
-    inputs = [t.float() if (torch.is_tensor(t) and t.dtype == torch.bool) else t
-              for t in inputs]
+    # Bool masks stay bool for the trace and the golden (`~mask`, `x[mask]`
+    # need real bools); like integer index inputs they are packed into io.npz
+    # as exact float32 values and carried as f32 in the IR.
 
     # Bind non-tensor (scalar) forward args as constants so only tensors are
-    # graph inputs (KernelBench 5: `A * s` with s a Python float). The trace
-    # then sees `A * <const>`, extracted as a mul_scalar op. Only a single
-    # tensor input is supported here (fx can't trace a *args wrapper).
+    # graph inputs (KernelBench 5: `A * s` with s a Python float; SOL-ExecBench
+    # passes eps / flags / None next to several tensors). The trace then sees
+    # `A * <const>`, extracted as a mul_scalar op. fx can't trace a *args
+    # wrapper, so the wrapper's forward gets one named parameter per tensor.
+    _inputs_before_bind = list(inputs)
     if any(not torch.is_tensor(t) for t in inputs):
         _tensor_pos = [i for i, t in enumerate(inputs) if torch.is_tensor(t)]
-        if len(_tensor_pos) != 1:
-            raise NotImplementedError(
-                f"{bench_path}: scalar forward args are only supported with a "
-                f"single tensor input (got {len(_tensor_pos)})")
-        _pos0 = _tensor_pos[0]
-        _full = list(inputs)  # concrete scalars + placeholder slot for the tensor
+        if not _tensor_pos:
+            raise NotImplementedError(f"{bench_path}: forward takes no tensor inputs")
+        _full = list(inputs)  # concrete scalars + placeholder slots for the tensors
         _orig = model
+        # one tensor input is `x`, as the single-input path names it
+        _params = ["x"] if len(_tensor_pos) == 1 else [f"x{i}" for i in range(len(_tensor_pos))]
+        _ns: dict = {}
+        exec(f"def forward(self, {', '.join(_params)}):\n"
+             f"    args = list(self._full)\n"
+             + "".join(f"    args[{p}] = {nm}\n" for p, nm in zip(_tensor_pos, _params))
+             + "    return self.m(*args)\n", _ns)
 
         class _ScalarBind(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.m = _orig
+                self._full = _full
 
-            def forward(self, x):
-                args = list(_full)
-                args[_pos0] = x
-                return self.m(*args)
+            forward = _ns["forward"]
 
         model = _ScalarBind()
         model.eval()
-        inputs = [inputs[_pos0]]
+        inputs = [inputs[i] for i in _tensor_pos]
+
+    # inputs whose VALUES the workload fixes (SOL: the integer index inputs, MB_VALUE_SPECIALIZED_INPUTS = positions in
+    # get_inputs()): data-dependent ops on them are evaluated at trace time (concrete_trace.py, graph.json data_specialized)
+    _spec_pos = list(getattr(mod, "MB_VALUE_SPECIALIZED_INPUTS", None) or [])
+    if _spec_pos:
+        _tp = [i for i, t in enumerate(_inputs_before_bind) if torch.is_tensor(t)]
+        model.mb_value_specialized = sorted({_tp.index(i) for i in _spec_pos if i in _tp})
 
     base = os.path.splitext(os.path.basename(bench_path))[0]
     name = "kb_" + "".join(ch if (ch.isalnum() or ch == "_") else "_"
@@ -6669,6 +7283,10 @@ def main() -> None:
                          "to this many MiB, shrinking batch->spatial and "
                          "protecting channel/feature dims for good HW "
                          "utilization (default 256). 0 = stock dims.")
+    ap.add_argument("--bench-target-weights-mb", type=int, default=0,
+                    help="if >0, also cap the bench's parameter bytes to this "
+                         "many MiB (shrinks the largest dims, including "
+                         "list-valued ones). 0 = off.")
     ap.add_argument("--bench-max-elements", type=int, default=0,
                     help="LEGACY override: if >0, cap total input ELEMENTS by "
                          "halving the largest int attr (the old tiny-toy policy). "
@@ -6682,11 +7300,17 @@ def main() -> None:
                          "--bench-target-mb stays an io ceiling. Overridden by "
                          "--bench-max-elements. Env: BENCH_TARGET_GFLOPS.")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "int8"],
+    ap.add_argument("--quant", default="fp32", choices=["fp32", "fp16", "bf16", "native", "int8"],
                     help="quantization mode. fp32 = stock float, fp16 = "
                          "half precision (uses torch.float16 model + "
                          "_Float16 C kernels, validated against half-cast "
-                         "torch golden), int8 = symmetric per-tensor PTQ.")
+                         "torch golden), bf16 = bfloat16 storage with fp32 "
+                         "math (CUDA path only; docs/bf16_cuda.md; shapes as "
+                         "fp32), native = per-tensor dtypes from the source "
+                         "(each tensor at the model's own dtype: bf16 / fp32 / "
+                         "integer; a bench's get_native_inputs() / NativeModel "
+                         "when it has them; CUDA path only; "
+                         "docs/tensor_dtypes.md), int8 = symmetric per-tensor PTQ.")
     ap.add_argument("--weight-bits", type=int, default=_WEIGHT_BITS_DEFAULT,
                     choices=list(_WEIGHT_BITS_SUPPORTED),
                     help="int8 only: WEIGHT grid width for nn.Linear. 8 (default) "
@@ -6801,7 +7425,9 @@ def main() -> None:
             args.bench_file,
             max_elements=(args.bench_max_elements or None),
             target_bytes=_tgt,
-            target_flops=_tflops)
+            target_flops=_tflops,
+            target_weight_bytes=(args.bench_target_weights_mb * 2**20 or None),
+            native=args.quant == "native")
     else:
         if args.model == "mlp_generic":
             from modelblaster.models import mlp_generic as model_mod
@@ -6918,6 +7544,21 @@ def main() -> None:
             fold_conv_bn=getattr(args, "fold_conv_bn", True),
             weight_bits=getattr(args, "weight_bits", _WEIGHT_BITS_DEFAULT),
             fusion_target=getattr(args, "fusion_target", None))
+
+    if args.bench_file is not None:
+        # a SOL-ExecBench bench (SOL_TOLERANCE at module level): its tolerance goes into graph.json (sol_tolerance;
+        # docs/sol_gate.md) -- nothing happens for a KernelBench file. $MB_SOL_REF=1 also writes sol_ref.npz: SOL's
+        # reference outputs, run on the GPU if this host has one (what the SOL gate compares against).
+        try:
+            from modelblaster.pipeline import sol_tolerance
+            rec = sol_tolerance.record_in_ir(args.out_dir, args.bench_file)
+            if rec is not None:
+                print(f"[extract_graph] sol_tolerance recorded: {rec['outputs'][0]}", flush=True)
+                if os.environ.get("MB_SOL_REF", "").strip().lower() in ("1", "on", "true", "yes", "gpu", "auto"):
+                    p = sol_tolerance.ensure_reference(args.out_dir, args.bench_file)
+                    print(f"[extract_graph] SOL reference outputs: {p}", flush=True)
+        except Exception as e:  # noqa: BLE001 -- metadata only: the extraction stands
+            print(f"[extract_graph] WARN: sol_tolerance not recorded: {type(e).__name__}: {e}", flush=True)
 
     if args.core_registry:
         from modelblaster.pipeline import core_registry

@@ -262,6 +262,34 @@ def _n_tile_operands(op, sh, w, b):
     if b != "NULL":
         b = f"({b} + {off_n})"
     return w, b
+#: Ops whose call is derived from KernelSpec.signature by kernel_abi.bind
+#: rather than a hand-written branch below (see reference_kernels_ext).
+_GENERIC_ABI_OPS = {"strided_copy", "gather", "catn", "ewise1", "ewise2",
+                    "ewise_scalar", "reduce", "softmax_dim", "conv2d_grouped",
+                    "maxpool2d_ex", "lstm_seq", "gru_seq", "index_select",
+                    "gather_dim", "scatter_dim", "topk", "convnd", "strided_scatter",
+                    "bmm_strided", "attention"}
+
+
+def _generic_call(op: dict, ptr_for, model_name: str, backend) -> str:
+    from modelblaster.pipeline.kernel_abi import bind, parse_signature
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    fn, params = parse_signature(KERNEL_SPECS[op["op"]].signature)
+    parts = []
+    for a in bind(op, params):
+        if a.kind == "out":
+            parts.append(ptr_for(a.value, "out"))
+        elif a.kind == "in":
+            parts.append(ptr_for(a.value, "in"))
+        elif a.kind == "weight":
+            parts.append(_weight_name(model_name, a.value, backend))
+        elif a.kind == "null":
+            parts.append("NULL")
+        elif a.param.base_type == "float":
+            parts.append(_f32(a.value))
+        else:
+            parts.append(str(int(a.value)))
+    return f"{fn}({', '.join(parts)})"
 
 # fp16 ops that have a bespoke `_f16` skeleton branch (some with different args,
 # e.g. softmax_f16's input_scale). These route to their own branch unchanged.
@@ -2134,8 +2162,10 @@ def emit_weights(
     for k in keys:
         ident = _weight_name(model_name, k, backend)
         arr_in = weights[k]
-        arr_out, layout_tag = _backend_pack_weight(
-            arr_in, backend, owners.get(k), ir_known=bool(owners))
+        arr_out, layout_tag = ((arr_in, None) if k.startswith("const.")
+                               else _backend_pack_weight(
+                                   arr_in, backend, owners.get(k),
+                                   ir_known=bool(owners)))
         c_type, _ = _np_to_c_dtype(arr_out.dtype)
         if layout_tag:
             c_lines.append(
@@ -2252,9 +2282,27 @@ def _lstm_state_keys(op: dict[str, Any]) -> tuple[str, str]:
     return st[0], st[1]
 
 
+def refuse_unsupported_quant(ir: dict[str, Any]) -> None:
+    """bf16 IRs are CUDA-only (docs/bf16_cuda.md): the host / Zephyr C codegen
+    has no `__bf16` path (RISC-V GCC has no bfloat16 arithmetic before
+    Zfbfmin), so refuse rather than emit float code for bf16 buffers. So are
+    mixed IRs (--quant native, docs/tensor_dtypes.md)."""
+    if ir.get("quant") == "native":
+        raise SystemExit(
+            f"{ir.get('name', 'IR')}: quant=native (per-tensor dtypes, docs/tensor_dtypes.md) is "
+            "supported on the CUDA path only (gpu_eval walkers, kb_export); the C/RVV codegen "
+            "has one storage dtype per IR. Re-extract with --quant fp32 or fp16 for this target.")
+    if ir.get("quant") == "bf16":
+        raise SystemExit(
+            f"{ir.get('name', 'IR')}: quant=bf16 is supported on the CUDA path only "
+            "(gpu_eval walkers, kb_export); the C/RVV codegen handles fp32, fp16 and "
+            "int8. Re-extract with --quant fp16 or fp32 for this target.")
+
+
 def emit_model(ir: dict[str, Any], out_dir: str,
                platform: str = "zephyr",
                backend: Optional[str] = None) -> None:
+    refuse_unsupported_quant(ir)
     # `backend` reaches the codegen for exactly one reason: the conv weight
     # LAYOUT is a per-backend codegen decision (_backend_pack_weight), and a
     # split conv's tile pointers depend on it. Without it here, the conv2d_s8
@@ -2391,7 +2439,11 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             name = aliases[name]
         return name
     for op in ir["ops"]:
-        if op["op"] == "view":
+        if op["op"] == "view" and op.get("offset"):
+            # Contiguous window into the input (slice / split / select of the
+            # leading dims): a pointer offset, no copy.
+            offset_aliases[op["outputs"][0]] = (op["inputs"][0], int(op["offset"]))
+        elif op["op"] == "view":
             aliases[op["outputs"][0]] = op["inputs"][0]
         elif op["op"] in ("chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"):
             # Two outputs: first half at offset 0, second half at offset
@@ -2657,6 +2709,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         t for t in tensors
         if t not in input_names_set and t not in out_tensor_set
         and t not in aliases and t not in offset_aliases
+        and not tensors[t].get("const")
     ]
     buf_defs: list[str] = []   # for buffers.c (definitions, no `static`)
     buf_externs: list[str] = []  # for model.c (declarations)
@@ -2709,6 +2762,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         tensor = resolve_alias(tensor)
         if tensor in _shim_override:
             return _shim_override[tensor]
+        if tensors.get(tensor, {}).get("const"):
+            # Folded constant (get_attr / parameter-only subgraph): lives in
+            # weights.c under its weights.npz key.
+            return _weight_name(model_name, tensors[tensor]["const"], backend)
         if tensor in offset_aliases:
             base, off = offset_aliases[tensor]
             base_ptr = ptr_for(base, role)
@@ -4429,7 +4486,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_adaptive_avg_pool2d_f16({in_ptr}, {out_ptr}, "
                 f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['OH']}, {sh['OW']})"
+                # the IR's adaptive_avg_pool2d is the global pool and carries
+                # no OH/OW (a bench-file fp16 extract raised KeyError here)
+                f"{sh.get('OH', 1)}, {sh.get('OW', 1)})"
             )
         elif op["op"] == "slice_c_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
@@ -4526,6 +4585,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, "
                 f"{sh['batch']}, {sh['M']}, {sh['K']}, {sh['N']})"
             )
+        elif op["op"] in _GENERIC_ABI_OPS:
+            call = _generic_call(op, ptr_for, model_name, backend)
         else:
             raise NotImplementedError(f"unsupported op {op['op']}")
         # Mangle the kernel call: every kernels.c emits kernel_<op>_<mid>
@@ -5069,6 +5130,7 @@ def generate(
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
         ir = json.load(f)
+    refuse_unsupported_quant(ir)
     weights = dict(np.load(weights_path))
     model_name = ir["name"]
 

@@ -1,0 +1,20 @@
+{
+ "format": "mb-graph-priors-standard/1",
+ "note": "Hand-set confidence CLASSES for standard fusion patterns, from general GPU-kernel knowledge only. NO number here comes from any run, sweep or experiment on these problems. Patterns are L1 stage-family keys (graph_priors.fusion_keys[1]): conv/dwconv/gconv, bn, ln, gn, linear, gemm, ewise (binary add/mul/...), sewise (scalar ops), relu etc. are their own names. Anything not listed is class 'unknown' (decided by measurement). Only class 'high' is eligible for pre-apply (elementwise-tail chains: the fused kernel reads and writes the same bytes once and cannot be slower than the chain); 'medium' (conv/GEMM heads with an epilogue) goes through the early rung decisions; structural kinds (attention, layout fold, siblings, split) are always 'unknown'.",
+ "classes": {
+  "high": {"p_mean": 0.9, "lb": 0.8, "why": "elementwise tail only: saves the intermediate round trips and launches, no change of the heavy op"},
+  "medium": {"p_mean": 0.6, "lb": 0.3, "why": "heavy head (conv / GEMM) with an elementwise epilogue: usually a gain, but the fused head can lose the tuned kernel"},
+  "unknown": {"p_mean": 0.5, "lb": 0.1, "why": "no general rule: measure"}
+ },
+ "patterns": {
+  "bn+relu": "high", "bn+relu6": "high", "bn+ewise": "high", "bn+ewise+relu": "high", "bn+relu+ewise": "high",
+  "bn+sigmoid": "high", "bn+sewise": "high",
+  "ewise+relu": "high", "ewise+relu6": "high", "ewise+ewise": "high", "ewise+sewise": "high", "sewise+ewise": "high",
+  "sewise+relu": "high", "relu+ewise": "high", "relu+sewise": "high", "sigmoid+ewise": "high", "gelu+ewise": "high",
+  "conv+bn": "medium", "conv+bn+relu": "medium", "conv+bn+relu6": "medium", "conv+bn+ewise": "medium",
+  "conv+bn+ewise+relu": "medium", "conv+relu": "medium", "conv+relu6": "medium", "conv+sigmoid": "medium",
+  "dwconv+bn": "medium", "dwconv+bn+relu": "medium", "dwconv+bn+relu6": "medium",
+  "linear+relu": "medium", "linear+ewise": "medium", "linear+sigmoid": "medium", "linear+ewise+relu": "medium",
+  "gemm+ewise": "medium", "gemm+sewise": "medium", "gemm+sewise+ewise": "medium"
+ }
+}
