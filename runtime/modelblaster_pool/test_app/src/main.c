@@ -27,8 +27,16 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef MB_PLATFORM_POSIX
+#include "mb_posix.h"
+#include <unistd.h>
+#define CONFIG_MP_MAX_NUM_CPUS ((int)sysconf(_SC_NPROCESSORS_ONLN))
+#define PERF_UNIT "ns"
+#else
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
+#define PERF_UNIT "cycles"
+#endif
 
 #define TEST_RANGE 1024
 #define TEST_REPS  16
@@ -72,11 +80,17 @@ static void bucket_fn(void *ctx_, size_t i)
 	c->bucket[wid] += (unsigned long long)i;
 }
 
+/* Zephyr: the hart's cycle counter. POSIX: rdcycle is usually not
+ * readable from user mode, so use the monotonic clock (ns). */
 static inline uint64_t rdcycle64(void)
 {
+#ifdef MB_PLATFORM_POSIX
+	return k_cycle_get_64();
+#else
 	uint64_t v;
 	__asm__ volatile("rdcycle %0" : "=r"(v));
 	return v;
+#endif
 }
 
 int main(void)
@@ -180,7 +194,7 @@ int main(void)
 	} else {
 		printf("PASS: 3/3 sub-tests passed\n");
 	}
-	printf("PERF: range=32 N=%d reps=%d per_call_cycles min=%llu avg=%llu\n",
+	printf("PERF: range=32 N=%d reps=%d per_call_" PERF_UNIT " min=%llu avg=%llu\n",
 	       N, TEST_REPS,
 	       (unsigned long long)per_call_min,
 	       (unsigned long long)per_call_avg);
