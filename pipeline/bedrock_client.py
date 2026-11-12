@@ -77,8 +77,11 @@ class BedrockClient:
         max_usd: Optional[float] = None,
         pricing: Optional[dict] = None,
     ):
+        # BEDROCK_MODEL first: run_model_k1.sh reuses MODEL for the network
+        # name, so MODEL cannot carry a Bedrock model id through that script.
         self.model_id = _normalize_model_id(
-            model_id or os.environ.get("MODEL", DEFAULT_MODEL)
+            model_id or os.environ.get("BEDROCK_MODEL")
+            or os.environ.get("MODEL", DEFAULT_MODEL)
         )
         self.region = region or os.environ.get("AWS_REGION", DEFAULT_REGION)
         self.token = token or os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
@@ -94,6 +97,14 @@ class BedrockClient:
         # env when max_usd kwarg is None.
         self.budget = BudgetTracker(max_usd=max_usd, pricing=pricing,
                                      label="bedrock")
+        # A cap is only enforced for models priced in pricing.yaml; for any
+        # other model every call costs "unknown" and the cap never trips.
+        if (self.budget.max_usd is not None
+                and self.budget._rates_for_model(self.model_id) is None):
+            raise RuntimeError(
+                f"MODELBLASTER_MAX_USD is set but {self.model_id} has no "
+                f"rates in benchmarks/config/pricing.yaml, so the cap "
+                f"could never trip. Add its rates there first.")
 
     def converse(
         self,
@@ -119,6 +130,10 @@ class BedrockClient:
         # crossed the cap. Cheaper to fail fast than to make another
         # paid call.
         self.budget.check_before_call()
+        # Some models allow fewer output tokens than the generator asks for
+        # (Kimi K2.5: 16K); BEDROCK_MAX_TOKENS lowers the request to fit.
+        if os.environ.get("BEDROCK_MAX_TOKENS"):
+            max_tokens = min(max_tokens, int(os.environ["BEDROCK_MAX_TOKENS"]))
         url = f"{self.endpoint}/model/{self.model_id}/converse"
         body = {
             "messages": [{"role": "user", "content": [{"text": user}]}],

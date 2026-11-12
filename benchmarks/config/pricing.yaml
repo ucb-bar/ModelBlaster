@@ -197,6 +197,19 @@ models:
     provider: bedrock
     placeholder: true
 
+  # ──────────── AWS Bedrock — Moonshot Kimi ────────────
+  # Kimi K2.5 (1T parameters, 32B active), in-Region only (no us. prefix),
+  # max 16K output tokens (set BEDROCK_MAX_TOKENS=16000). Rates are the
+  # Standard tier in us-east-1 / us-east-2 / us-west-2 from
+  # https://aws.amazon.com/bedrock/pricing/, read 2026-10-27; other Regions
+  # differ slightly.
+  moonshotai.kimi-k2.5:
+    input_uncached:        0.60
+    cache_read:            null
+    output:                3.00
+    provider: bedrock
+    verified: true
+
   # Google Gemini API (Arm B-gemini). Rates per https://ai.google.dev/pricing.
   # `cache_read` is Google's "context caching" hit rate; cache writes have
   # no separate billing line on Gemini today, so cache_write_* are unset.
