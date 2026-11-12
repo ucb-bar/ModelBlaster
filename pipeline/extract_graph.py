@@ -1998,6 +1998,10 @@ def extract_int8(
     # below covers it; extending to "conv -(folded relu)-> maxpool"
     # chains is a documented follow-up, not attempted here.
     fused_conv2d_pool: set[str] = set()
+    # Subset of fused_conv2d_relu / fused_linear_relu whose absorbed node is a
+    # ReLU6 (clamp at round(6/s) as well as at 0).
+    fused_relu6: set[str] = set()
+    _fuse_relu6 = os.environ.get("MB_INT8_FUSE_RELU6", "0") == "1"
     # Extended fusion only actually fires when BOTH the opt-in flag is set
     # AND the eventual target is in the safe set (see _fusion_target_is_safe)
     # -- computed once here, used at both gate points below.
@@ -2012,6 +2016,30 @@ def extract_int8(
             or (nxt.op == "call_function" and nxt.target in (
                 torch.relu, torch.nn.functional.relu))
         )
+        # Conv2d/Linear -> ReLU6 absorption (opt-in, MB_INT8_FUSE_RELU6=1).
+        # relu6_s8 keeps its input's scale and clamps the codes to
+        # [0, round(6/s)], so producer-clamp-then-relu6 equals the producer
+        # clamping straight to [0, round(6/s)]: the fused IR's golden is
+        # bit-identical to the unfused one, minus one elementwise pass per
+        # site. Opt-in only so existing extracts (FastDepth's
+        # MobileNetV2 relu6 sites) stay byte-for-byte reproducible.
+        is_next_relu6 = (
+            _fuse_relu6
+            and ((nxt.op == "call_module"
+                  and isinstance(gm.get_submodule(nxt.target), torch.nn.ReLU6))
+                 or (nxt.op == "call_function"
+                     and nxt.target is torch.nn.functional.relu6))
+        )
+        if (is_next_relu6 and len(nxt.args) == 1 and nxt.args[0] is node
+                and node.op == "call_module"
+                and isinstance(gm.get_submodule(node.target),
+                               (torch.nn.Conv2d, torch.nn.Linear))):
+            if isinstance(gm.get_submodule(node.target), torch.nn.Linear):
+                fused_linear_relu.add(nxt.name)
+            else:
+                fused_conv2d_relu.add(nxt.name)
+            fused_relu6.add(nxt.name)
+            continue
         is_next_silu = (
             (nxt.op == "call_module"
              and isinstance(gm.get_submodule(nxt.target), torch.nn.SiLU))
@@ -2185,6 +2213,8 @@ def extract_int8(
                              and next_node.name in fused_relu_after)
                 act_min = 0 if fuse_relu else -128
                 act_max = 127
+                if fuse_relu and next_node.name in fused_relu6:
+                    act_max = max(1, min(127, int(round(6.0 / out_scale))))
                 in_shape = tensors_meta[in_name]["shape"]
                 out_shape = tensors_meta[node.name]["shape"]
                 M = int(np.prod(in_shape[:-1]))
@@ -2242,6 +2272,8 @@ def extract_int8(
                 })
 
             elif isinstance(mod, torch.nn.ReLU6):
+                if node.name in fused_relu_after:
+                    continue  # absorbed into its Conv2d/Linear producer
                 # Standalone ReLU6: clamp real values to [0, 6]. Keep the
                 # output at the input's scale (like relu_s8 keeps scale for
                 # plain relu) and express the 6.0 ceiling in int8 units:
@@ -2481,6 +2513,8 @@ def extract_int8(
                              and next_node.name in fused_conv2d_pool)
                 act_min = 0 if fuse_relu else -128
                 act_max = 127
+                if fuse_relu and next_node.name in fused_relu6:
+                    act_max = max(1, min(127, int(round(6.0 / out_scale))))
                 in_shape = tensors_meta[in_name]["shape"]
                 out_shape = tensors_meta[node.name]["shape"]
                 N_, IC, IH, IW = (int(s) for s in in_shape)
@@ -2623,9 +2657,11 @@ def extract_int8(
                 tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
                 scales[node.name] = scales[in_name]
 
-            elif isinstance(mod, torch.nn.Dropout):
+            elif isinstance(mod, (torch.nn.Dropout, torch.nn.Flatten)):
                 # Eval-mode dropout is a view; alias is handled by the
-                # skeleton via op="view".
+                # skeleton via op="view". nn.Flatten (the module form of
+                # torch.flatten, already a view here) is the same contiguous
+                # NCHW buffer, so it aliases too.
                 _record(node.name, dtype="i8")
                 # Same scale as input.
                 tensors_meta[node.name]["quant"]["scale"] = scales[in_name]
@@ -3356,6 +3392,8 @@ def extract_int8(
                               "activation_min": -128, "activation_max": 127},
                 })
             elif tname == "relu6" or target is torch.nn.functional.relu6:
+                if node.name in fused_relu_after:
+                    continue  # absorbed into its Conv2d/Linear producer
                 in_name = node.args[0].name
                 in_scale = scales[in_name]
                 scales[node.name] = in_scale       # relu6 preserves scale
@@ -5144,7 +5182,7 @@ def extract(
                     "shape": {"B": B, "F": Feat},
                 })
 
-            elif isinstance(mod, torch.nn.Dropout):
+            elif isinstance(mod, (torch.nn.Dropout, torch.nn.Flatten)):
                 # Eval-mode dropout is identity. Record as a view: the output
                 # tensor aliases the input.
                 ops.append({
