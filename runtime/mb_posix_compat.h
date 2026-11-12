@@ -30,6 +30,8 @@
 #include <semaphore.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ---- 64-bit tick counter ------------------------------------------------ */
@@ -109,6 +111,43 @@ static inline int k_sem_take(struct k_sem *p, int timeout)
 static inline void k_yield(void)
 {
 	sched_yield();
+}
+
+/* ---- schedule-start gate (opt-in: MB_XPURT_GATE_SLEEP=1) ---------------- */
+
+/* The walker waits for an entry's absolute start time by spinning on k_yield.
+ * A worker whose entries are far apart therefore never sleeps, and its core is
+ * also a helper core of the split (pool) groups that contain it: on the K3
+ * (2026-11-03, 50 Hz shard run under ftrace) the worker on cpu 2 ran 16 entries,
+ * spun 288 ms and slept 0.3 ms, while the pool helpers pinned to cpu 2 waited
+ * 16-20 ms for that core -- stalling whole 8-core layers by milliseconds.
+ * With MB_XPURT_GATE_SLEEP set (and not "0") the wait sleeps until
+ * MB_POSIX_GATE_SPIN_US before the target, then yields as before; unset keeps
+ * the original spin exactly. Read once per process. */
+#ifndef MB_POSIX_GATE_SPIN_US
+#define MB_POSIX_GATE_SPIN_US 200ull
+#endif
+#define MB_HAVE_GATE_WAIT 1
+static inline void mb_posix_gate_wait(uint64_t target)
+{
+	static int mode = -1;
+	const uint64_t spin = MB_POSIX_GATE_SPIN_US * MB_POSIX_TICKS_PER_SEC / 1000000ull;
+	if (mode < 0) {
+		const char *e = getenv("MB_XPURT_GATE_SLEEP");
+		mode = (e && e[0] && !(e[0] == '0' && e[1] == 0)) ? 1 : 0;
+	}
+	for (;;) {
+		uint64_t now = mb_posix_rdtime();
+		if (now >= target)
+			return;
+		if (mode && target - now > spin) {
+			uint64_t ns = (target - now - spin) * 1000000000ull / MB_POSIX_TICKS_PER_SEC;
+			struct timespec ts = { (time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull) };
+			nanosleep(&ts, NULL);
+		} else {
+			sched_yield();
+		}
+	}
 }
 
 /* ---- abort ------------------------------------------------------------- */

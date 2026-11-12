@@ -86,6 +86,9 @@ TRACE=1
 # run through `tee` when you turn this on -- the lines are interleaved with
 # the harness's normal output by design, so one stream carries both.
 STREAM="${MB_XPURT_STREAM:-0}"
+# Placement block (cpu each entry ran on, and its backend) for
+# scripts/check_k3_placement.py. Off by default.
+PLACEMENT="${MB_XPURT_PLACEMENT:-0}"
 CPU_IDS=""
 JOBS="$(nproc)"
 
@@ -370,7 +373,8 @@ done
 ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
     --schedule "${SCHEDULE}" --registry "${REGISTRY}" \
     "${IR_ARGS[@]}" --out "${SCHED_C}" --name "${SCHED_NAME}" \
-    --cpu-p-kind "${CPU_P_KIND}" --cpu-e-kind "${CPU_E_KIND}"
+    --cpu-p-kind "${CPU_P_KIND}" --cpu-e-kind "${CPU_E_KIND}" \
+    --added-op-target "${ADDED_OP_TARGET:-CPU_E#0}"
 [[ -f "${SCHED_C}" ]] || { echo "ingest produced no dispatch table" >&2; exit 1; }
 echo "  ${SCHED_C}"
 
@@ -406,6 +410,7 @@ print(' '.join(get('${bs}').resolved_kernel_cflags('${REPO_ROOT}')))
 done
 [[ "${TRACE}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_TRACE=ON")
 [[ "${STREAM}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_STREAM=ON")
+[[ "${PLACEMENT}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_PLACEMENT=ON")
 # Compile kernels.c with a different compiler than the rest. Needed for the
 # Zvfh fp16 kernels, whose intrinsics do not exist in GCC 13.2 -- the only
 # riscv64-unknown-linux-gnu compiler here. Same variable and same meaning as
@@ -467,5 +472,11 @@ if [[ "${TRACE}" == "1" ]] && grep -q 'MODELBLASTER_XPURT_TRACE_BEGIN' "${OUT}";
     awk '/MODELBLASTER_XPURT_TRACE_BEGIN/{f=1;next} /MODELBLASTER_XPURT_TRACE_END/{f=0} f' \
         "${OUT}" > "${TRACE_CSV}"
     echo "  trace -> ${TRACE_CSV} ($(($(wc -l <"${TRACE_CSV}") - 1)) rows)"
+fi
+if [[ "${PLACEMENT}" == "1" ]] && grep -q 'MODELBLASTER_XPURT_PLACEMENT_BEGIN' "${OUT}"; then
+    PLACEMENT_CSV="${GEN_DIR}/${SCHED_NAME}_placement.csv"
+    awk '/MODELBLASTER_XPURT_PLACEMENT_BEGIN/{f=1;next} /MODELBLASTER_XPURT_PLACEMENT_END/{f=0} f' \
+        "${OUT}" > "${PLACEMENT_CSV}"
+    echo "  placement -> ${PLACEMENT_CSV} ($(($(wc -l <"${PLACEMENT_CSV}") - 1)) rows)"
 fi
 exit "${rc}"

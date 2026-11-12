@@ -204,7 +204,16 @@ class AskingForAnImplTheBuildLacksIsFatal(unittest.TestCase):
             backends=["rvv_x60"], pool_sizes=[4], n_instances={"m": 1},
             platform="linux")
         gate = src.index("uint64_t target_start = run_t0")
-        network_branch = src.index('strcmp(e_->network, "m") == 0')
+        # The untimed warm-start pass (g_xpurt_warm) runs each network's
+        # instance-0 entries before the timed walk and is not gated; its
+        # branch comes first in the source. The gate is for the timed walk.
+        warm_pass = src.index("if (g_xpurt_warm)")
+        branches = [i for i in range(len(src))
+                    if src.startswith('strcmp(e_->network, "m") == 0', i)]
+        self.assertEqual(len(branches), 2, "one warm and one timed branch")
+        warm_branch, network_branch = branches
+        self.assertLess(warm_pass, warm_branch)
+        self.assertLess(warm_branch, gate)
         zero_cost_branch = src.index("if (e_->dispatch_id < 0)")
         self.assertLess(gate, network_branch)
         self.assertLess(gate, zero_cost_branch,

@@ -184,14 +184,44 @@ def _resolve_targets(core_labels: str,
     return core_name, core_kind, hart, harts
 
 
+def _check_impl_legal(key: str, impl: str, core_kind: str,
+                      harts: tuple[int, ...],
+                      reg: core_registry.CoreRegistry) -> None:
+    """Refuse an implementation a core cannot run, before it is built in.
+
+    On the K3 both matrix engines use the same instruction encoding with
+    different tiles: an X100 `ime` kernel on an A100 gives wrong answers
+    rather than a trap, and an A100 `ime2` kernel traps on an X100. The
+    registry's per-core `impls` says which is legal where. `impl == core_kind`
+    is the no-choice default (an entry the schedule gave no impl, or one this
+    pass added) and runs the kind's own backend, so it is always legal. Cores
+    without `impls` (every K1 registry) are not checked.
+    """
+    if impl == core_kind:
+        return
+    for core in reg.cores:
+        if not core.impls or not set(core.harts) & set(harts):
+            continue
+        if impl not in core.impls:
+            raise ValueError(
+                f"schedule entry {key!r}: impl {impl!r} is not legal on {core.name} "
+                f"(kind {core.kind!r}, harts {list(core.harts)}; legal: {list(core.impls)})")
+
+
 def load(schedule_path: str,
          irs_by_network: dict[str, dict],
          reg: core_registry.CoreRegistry,
          *,
          cpu_p_kind: str = "rvv",
-         cpu_e_kind: str = "scalar") -> list[XpurtEntry]:
+         cpu_e_kind: str = "scalar",
+         added_op_target: str = "CPU_E#0") -> list[XpurtEntry]:
     """Parse, validate, and order an XPU-RT schedule. Returns entries
-    sorted by start_time, with cross-references resolved to entry_ids."""
+    sorted by start_time, with cross-references resolved to entry_ids.
+
+    `added_op_target` is the machine slot that the scalar-FP ops this pass
+    adds (activations the schedule never placed) are pinned to. CPU_E#0 is
+    the K1 choice; on the K3 CPU_E is the A100 kind, and those ops go to an
+    X100 instead (CPU_P#0), keeping the A100s for the matrix work."""
     with open(schedule_path) as f:
         doc = json.load(f)
     raw = doc.get("dispatches")
@@ -346,7 +376,7 @@ def load(schedule_path: str,
             "silu_s8", "elu_s8", "relu_s8", "sigmoid_s8", "tanh_s8",
             "gelu_s8", "hardswish_s8", "softmax_s8",
         }
-        _CPU_E_LABEL = "CPU_E#0"
+        _ADDED_FP_OP_LABEL = added_op_target
 
         synthesized: list[tuple[str, int, str]] = []
         for job_name, scheduled_dids in list(sched_jobs.items()):
@@ -385,7 +415,7 @@ def load(schedule_path: str,
                 if producer_target is None:
                     producer_target = "CPU_P#0"
                 if op_kind in _SCALAR_FP_OPS:
-                    producer_target = _CPU_E_LABEL
+                    producer_target = _ADDED_FP_OP_LABEL
                 new_key = f"{job_name}_dispatch_{did}"
                 raw[new_key] = {
                     "id": did,
@@ -565,6 +595,7 @@ def load(schedule_path: str,
         # pre-`enable_impls` schedule means, so those keep producing the
         # byte-identical table they always did.
         impl = str(d.get("impl") or core_kind)
+        _check_impl_legal(key, impl, core_kind, harts, reg)
 
         # Resolve deps (intra-job data deps) + time_dep (cross-job edge)
         # to in-table entry_ids. The walker's deadlock-freedom argument
@@ -800,6 +831,10 @@ def _main() -> None:
                     help="registry kind that CPU_P slots map to (default: rvv)")
     ap.add_argument("--cpu-e-kind", default="scalar",
                     help="registry kind that CPU_E slots map to (default: scalar)")
+    ap.add_argument("--added-op-target", default="CPU_E#0",
+                    help="machine slot for the scalar-FP ops ingest adds "
+                         "(default CPU_E#0, the K1 choice; CPU_P#0 on the K3, "
+                         "where CPU_E is the A100 kind)")
     ap.add_argument("--name", default=None,
                     help="schedule name (used for #define prefix); "
                          "defaults to the basename of --out without extension")
@@ -815,7 +850,8 @@ def _main() -> None:
     reg = core_registry.load(args.registry)
     entries = load(args.schedule, irs, reg,
                    cpu_p_kind=args.cpu_p_kind,
-                   cpu_e_kind=args.cpu_e_kind)
+                   cpu_e_kind=args.cpu_e_kind,
+                   added_op_target=args.added_op_target)
 
     schedule_name = args.name or os.path.splitext(os.path.basename(args.out))[0]
     emit_table(entries, args.out, schedule_name)

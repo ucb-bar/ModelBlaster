@@ -76,6 +76,7 @@ _PROLOGUE_ZEPHYR = """#include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem *
 
 _PROLOGUE_LINUX = """#define MODELBLASTER_PLATFORM_LINUX 1
 #include "mb_posix_compat.h"   /* k_cycle_get_64, k_sem, sys_reboot on POSIX */
+#include "mb_ai_task.h"        /* K3: A100 workers label themselves AI tasks */
 
 #define XPURT_TICKS_PER_SEC  MB_POSIX_TICKS_PER_SEC
 #define XPURT_BOARD_TARGET   "linux/riscv64"
@@ -152,6 +153,7 @@ def _emit(networks: list[str], schedule_name: str,
     forward_decls: list[str] = []
     reset_calls: list[str] = []
     branch_lines: list[str] = []
+    warm_branch_lines: list[str] = []
     print_blocks: list[str] = []
     wall_decls: list[str] = []
 
@@ -291,6 +293,9 @@ def _emit(networks: list[str], schedule_name: str,
             f"                .pool = (void *)pool_for_entry(e_),\n"
             f"            }};\n"
             f"            lock_entry_harts(e_);\n"
+            f"#if defined(MODELBLASTER_XPURT_PLACEMENT) && defined(MODELBLASTER_PLATFORM_LINUX)\n"
+            f"            xpurt_place[i_].cpu_before = sched_getcpu();\n"
+            f"#endif\n"
             f"            uint64_t t_disp0 = (uint64_t)k_cycle_get_64();\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].start_cycles = t_disp0 - run_t0;\n"
@@ -314,6 +319,9 @@ def _emit(networks: list[str], schedule_name: str,
             f"#endif\n"
             f"{bs_select}\n"
             f"            uint64_t t_disp1 = (uint64_t)k_cycle_get_64();\n"
+            f"#if defined(MODELBLASTER_XPURT_PLACEMENT) && defined(MODELBLASTER_PLATFORM_LINUX)\n"
+            f"            xpurt_place[i_].cpu_after = sched_getcpu();\n"
+            f"#endif\n"
             f"            unlock_entry_harts(e_);\n"
             f"            g_hart_acc[my_acc_idx].kernel += (t_disp1 - t_disp0);\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
@@ -394,6 +402,30 @@ def _emit(networks: list[str], schedule_name: str,
             f"            g_hart_acc[my_acc_idx].sync_overhead += (t_iter_end - t_disp1);\n"
             f"            prev_iter_end = t_iter_end;\n"
             f"            g_hart_acc[my_acc_idx].entries_done++;\n"
+            f"            continue;\n"
+            f"        }}"
+        )
+
+        # Warm-start branch (k3-work TASK-013, 2026-11-04): the same kernel
+        # call as the timed branch, with none of its bookkeeping (no trace,
+        # wall cycles, completion counts or verification), signalling the
+        # separate warm_sems so the timed run's semaphores stay untouched.
+        warm_branch_lines.append(
+            f'        if (e_->network[0] == \'{net[0]}\' && '
+            f'strcmp(e_->network, "{net}") == 0) {{\n'
+            f"            if (e_->dispatch_id >= 0) {{\n"
+            f"            model_{mid}_state_t dispatch_state_{mid} = {{\n"
+            f"                .input = model_{mid}_test_input,\n"
+            f"                .output = out_{mid},\n"
+            f"                .pool = (void *)pool_for_entry(e_),\n"
+            f"            }};\n"
+            f"            lock_entry_harts(e_);\n"
+            f"{bs_select}\n"
+            f"            unlock_entry_harts(e_);\n"
+            f"            }}\n"
+            f"            for (int _f = 0; _f < e_->n_fanout; _f++) {{\n"
+            f"                k_sem_give(&warm_sems[i_]);\n"
+            f"            }}\n"
             f"            continue;\n"
             f"        }}"
         )
@@ -492,12 +524,14 @@ def _emit(networks: list[str], schedule_name: str,
 
     # Build the per-(network, instance, dispatch_id) dispatch branch.
     dispatch_branch = "\n".join(branch_lines)
+    warm_branch = "\n".join(warm_branch_lines)
 
     # One Zephyr worker thread per distinct core_kind. Each pins itself
     # to a hart (the entry's .hart) and pulls only entries whose
     # core_kind matches.
     n_kinds = len(core_kinds)
     kind_strs = ", ".join(f'"{k}"' for k in core_kinds)
+    backend_strs = ", ".join(f'"{b}"' for b in backends)
     if len(pool_sizes) != n_kinds:
         raise SystemExit(
             f"pool_sizes length ({len(pool_sizes)}) must match core_kinds "
@@ -568,6 +602,9 @@ def _emit(networks: list[str], schedule_name: str,
 #include <unistd.h>
 #include "modelblaster_pool.h"
 {platform_prologue}
+#ifndef MB_THREAD_MOVER
+#define MB_THREAD_MOVER  /* Zephyr: a worker never changes core kind */
+#endif
 
 {chr(10).join(inc_lines)}
 #include "{dispatch_table_header}"
@@ -648,6 +685,18 @@ static struct xpurt_hart_acc g_hart_acc[XPURT_MAX_WORKERS];
  * Used by the worker to (a) honor every entry's absolute schedule-issued
  * start time and (b) tag actual_start/end_cycles in the trace. */
 static uint64_t run_t0;
+#ifdef MODELBLASTER_PLATFORM_LINUX
+/* Warm start (k3-work TASK-013, Director 2026-11-04: benchmarks always start
+ * warm). Before run_t0, every worker runs its own instance-0 entries once, in
+ * the schedule's order and with their data dependencies: one untimed frame of
+ * every network on the cores the schedule chose. First-call costs (kernels'
+ * kept tables, cold caches, first-touch pages) then stay out of frame 0, as
+ * they stay out of the profiles, which drop iteration 0. MB_XPURT_WARM=0 turns
+ * it off (cold start, as every run before 2026-11-04). */
+static int g_xpurt_warm = 1;
+static struct k_sem warm_sems[{upper}_N_ENTRIES];
+static pthread_barrier_t xpurt_warm_done, xpurt_warm_go;
+#endif
 #define XPURT_CYCLES_PER_MS \\
     ((uint64_t)(XPURT_TICKS_PER_SEC / 1000))
 
@@ -674,6 +723,19 @@ struct xpurt_trace_slot {{
     int      worker_hart;       /* hart the executing worker was pinned to */
 }};
 static struct xpurt_trace_slot xpurt_trace[{upper}_N_ENTRIES];
+#endif
+
+#if defined(MODELBLASTER_XPURT_PLACEMENT) && defined(MODELBLASTER_PLATFORM_LINUX)
+/* Placement evidence (opt-in, -DMODELBLASTER_XPURT_PLACEMENT=ON): the cpu the
+ * executing worker was on just before and just after its kernel, sampled
+ * OUTSIDE the timed window, plus the backend the entry's impl selected. On the
+ * K3 this is what shows an A100 entry really ran on cpus 8-15 with the A100
+ * kernel (scripts/check_k3_placement.py). -1 = the entry never ran. Kept apart
+ * from the trace CSV, whose columns many scripts parse. */
+struct xpurt_place_slot {{ int cpu_before; int cpu_after; }};
+static struct xpurt_place_slot xpurt_place[{upper}_N_ENTRIES];
+static const char *const xpurt_impl_names[] = {{ {kind_strs} }};
+static const char *const xpurt_impl_backends[] = {{ {backend_strs} }};
 #endif
 
 struct xpurt_worker_arg {{
@@ -789,7 +851,8 @@ static void unlock_entry_harts(const xpurt_sched_entry_t *e)
         pthread_mutex_unlock(&g_hart_locks[ordered[i]]);
 }}
 
-static void *xpurt_worker(void *arg)
+/* MB_THREAD_MOVER: an A100 worker moves itself there below (mb_ai_task.h). */
+static MB_THREAD_MOVER void *xpurt_worker(void *arg)
 {{
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
     const char *my_kind = wa->kind;
@@ -798,6 +861,34 @@ static void *xpurt_worker(void *arg)
     int my_acc_idx = wa->worker_idx;
     int my_claims_unbound = wa->claims_unbound;
 #ifdef MODELBLASTER_PLATFORM_LINUX
+    /* K3 A100 (AI) core, cpus 8-15. The kernel lets a thread onto those cpus
+     * only after it has labelled itself an AI task (mb_ai_task.h), so main()
+     * cannot pin it at creation; it labels and pins itself here, the same way
+     * the pool's helpers do. Never true on the K1 (cpus 0-7). Nothing runs
+     * unless it worked: a worker left on an X100 would be measured as an A100. */
+    if (my_hart >= 0 && mb_ai_task_wanted(my_hart)) {{
+        cpu_set_t cs_;
+        CPU_ZERO(&cs_);
+        CPU_SET(my_hart, &cs_);
+        if (mb_ai_task_label_self() != 0) {{
+            printf("FATAL: worker kind=%s hart=%d cannot label itself an AI task "
+                   "via %s: %s\\n", my_kind, my_hart, MB_AI_TASK_FILE, strerror(errno));
+            fflush(stdout);
+            sys_reboot(SYS_REBOOT_COLD);
+        }}
+        if (sched_setaffinity(0, sizeof(cs_), &cs_) != 0) {{
+            printf("FATAL: worker kind=%s cannot pin itself to cpu %d: %s\\n",
+                   my_kind, my_hart, strerror(errno));
+            fflush(stdout);
+            sys_reboot(SYS_REBOOT_COLD);
+        }}
+        if (sched_getcpu() != my_hart) {{
+            printf("FATAL: worker kind=%s pinned to cpu %d but running on cpu %d\\n",
+                   my_kind, my_hart, sched_getcpu());
+            fflush(stdout);
+            sys_reboot(SYS_REBOOT_COLD);
+        }}
+    }}
     /* Record where the scheduler ACTUALLY put us. pthread_attr_setaffinity_np
      * failing (or being compiled out) is silent otherwise, and an unpinned
      * worker makes every per-hart number in this trace a fiction. main()
@@ -844,6 +935,32 @@ static void *xpurt_worker(void *arg)
     }}
 #endif
 
+#ifdef MODELBLASTER_PLATFORM_LINUX
+    if (g_xpurt_warm) {{
+        for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
+            const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
+            if (strcmp(e_->core_kind, my_kind) != 0) continue;
+            if (e_->hart >= 0) {{
+                if (e_->hart != my_hart) continue;
+            }} else if (!my_claims_unbound) {{
+                continue;
+            }}
+            if (e_->instance != 0) continue;
+            /* Data dependencies only: they stay inside one instance, so all
+             * of them are instance-0 entries run in this pass. Time-dep edges
+             * and the release gate are for the timed run. */
+            for (int d = 0; d < e_->n_deps; d++) {{
+                k_sem_take(&warm_sems[e_->deps[d]], K_FOREVER);
+            }}
+{warm_branch}
+            for (int _f = 0; _f < e_->n_fanout; _f++) {{
+                k_sem_give(&warm_sems[i_]);
+            }}
+        }}
+        pthread_barrier_wait(&xpurt_warm_done);
+        pthread_barrier_wait(&xpurt_warm_go);   /* main sets run_t0 in between */
+    }}
+#endif
     uint64_t worker_t0 = (uint64_t)k_cycle_get_64();
     uint64_t prev_iter_end = worker_t0;
     /* Take entries that match `my_kind` AND `my_hart`, in start_time
@@ -917,9 +1034,13 @@ static void *xpurt_worker(void *arg)
             (uint64_t)((double)e_->start_time_ms *
                        (double)XPURT_CYCLES_PER_MS);
         uint64_t t_gate0 = (uint64_t)k_cycle_get_64();
+#ifdef MB_HAVE_GATE_WAIT
+        mb_posix_gate_wait(target_start);   /* sleeps when MB_XPURT_GATE_SLEEP=1 */
+#else
         while ((uint64_t)k_cycle_get_64() < target_start) {{
             k_yield();
         }}
+#endif
         g_hart_acc[my_acc_idx].target_gate_spin +=
             ((uint64_t)k_cycle_get_64() - t_gate0);
 
@@ -1081,6 +1202,19 @@ int main(void)
     for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
         k_sem_init(&completion_sems[i], 0, 32);
     }}
+#ifdef MODELBLASTER_PLATFORM_LINUX
+    {{
+        const char *warm_env_ = getenv("MB_XPURT_WARM");
+        g_xpurt_warm = !(warm_env_ && warm_env_[0] == '0');
+    }}
+    if (g_xpurt_warm) {{
+        for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+            k_sem_init(&warm_sems[i], 0, 32);
+        }}
+        pthread_barrier_init(&xpurt_warm_done, NULL, (unsigned)g_n_workers + 1u);
+        pthread_barrier_init(&xpurt_warm_go, NULL, (unsigned)g_n_workers + 1u);
+    }}
+#endif
 
     /* One worker per (core_kind, hart) pair, discovered above. Each pins
      * itself to its own hart, so the schedule's placement decision is the
@@ -1107,13 +1241,23 @@ int main(void)
         xpurt_trace[i].worker_hart = -1;
     }}
 #endif
+#if defined(MODELBLASTER_XPURT_PLACEMENT) && defined(MODELBLASTER_PLATFORM_LINUX)
+    for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+        xpurt_place[i].cpu_before = -1;
+        xpurt_place[i].cpu_after = -1;
+    }}
+#endif
 
     /* Run baseline for both the trace and the periodic-start-time gate.
      * Captured just before workers spawn so it's the moment "t=0" of the
      * schedule maps to. */
     run_t0 = (uint64_t)k_cycle_get_64();
     /* Absolute origin of the trace's cycle columns, so an out-of-band sampler
-     * (per-core /proc/stat) can be aligned to the run. */
+     * (per-core /proc/stat) can be aligned to the run. With a warm start the
+     * origin is set (and printed) after the warm-up frame instead. */
+#ifdef MODELBLASTER_PLATFORM_LINUX
+    if (!g_xpurt_warm)
+#endif
     printf("xpurt: run_t0_rdtime=%llu\\n", (unsigned long long)run_t0);
 
     for (int w = 0; w < g_n_workers; w++) {{
@@ -1126,7 +1270,13 @@ int main(void)
          * attribute nobody had set. glibc needs _GNU_SOURCE (emitted at
          * the top of this file) plus the same call. */
 #if defined(CONFIG_POSIX_THREADS_AFFINITY) || defined(MODELBLASTER_PLATFORM_LINUX)
-        if (g_workers[w].hart >= 0) {{
+        int self_pins_ = 0;
+#ifdef MODELBLASTER_PLATFORM_LINUX
+        /* An A100 worker is not yet an AI task, so the kernel would refuse
+         * this mask; it pins itself in xpurt_worker() instead. */
+        self_pins_ = g_workers[w].hart >= 0 && mb_ai_task_wanted(g_workers[w].hart);
+#endif
+        if (g_workers[w].hart >= 0 && !self_pins_) {{
             cpu_set_t cs;
             CPU_ZERO(&cs);
             CPU_SET(g_workers[w].hart, &cs);
@@ -1155,6 +1305,20 @@ int main(void)
          * The (kind, hart) info is already in g_workers[w]; print at the
          * end so it doesn't perturb the schedule's actual_start cycles. */
     }}
+
+#ifdef MODELBLASTER_PLATFORM_LINUX
+    if (g_xpurt_warm) {{
+        uint64_t warm_t0_ = run_t0;
+        pthread_barrier_wait(&xpurt_warm_done);   /* every worker ran its warm entries */
+        run_t0 = (uint64_t)k_cycle_get_64();
+        printf("xpurt: warm start: one untimed frame of every network took %.3f ms\\n",
+               (double)(run_t0 - warm_t0_) / (double)XPURT_CYCLES_PER_MS);
+        printf("xpurt: run_t0_rdtime=%llu\\n", (unsigned long long)run_t0);
+        pthread_barrier_wait(&xpurt_warm_go);
+    }} else {{
+        printf("xpurt: cold start (MB_XPURT_WARM=0)\\n");
+    }}
+#endif
 
     /* Wait for every worker to drain. */
     for (int w = 0; w < g_n_workers; w++) {{
@@ -1225,6 +1389,30 @@ int main(void)
                (unsigned long long)xpurt_trace[i].end_cycles);
     }}
     printf("=== MODELBLASTER_XPURT_TRACE_END ===\\n");
+#endif
+
+#if defined(MODELBLASTER_XPURT_PLACEMENT) && defined(MODELBLASTER_PLATFORM_LINUX)
+    printf("=== MODELBLASTER_XPURT_PLACEMENT_BEGIN ===\\n");
+    printf("entry_id,network,instance,dispatch_id,op,core_kind,impl,backend,hart,"
+           "harts,cpu_before,cpu_after\\n");
+    for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+        const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
+        const char *be = "?";
+        for (size_t k = 0; k < sizeof xpurt_impl_names / sizeof xpurt_impl_names[0]; k++) {{
+            if (strcmp(e->impl, xpurt_impl_names[k]) == 0) {{ be = xpurt_impl_backends[k]; break; }}
+        }}
+        char harts[64];
+        int off = 0;
+        harts[0] = '\\0';
+        for (int h = 0; h < e->n_harts && off < (int)sizeof harts - 4; h++) {{
+            off += snprintf(harts + off, sizeof harts - (size_t)off, h ? ";%d" : "%d", e->harts[h]);
+        }}
+        printf("%d,%s,%d,%d,%s,%s,%s,%s,%d,%s,%d,%d\\n",
+               e->entry_id, e->network, e->instance, e->dispatch_id, e->op,
+               e->core_kind, e->impl, be, e->hart, harts,
+               xpurt_place[i].cpu_before, xpurt_place[i].cpu_after);
+    }}
+    printf("=== MODELBLASTER_XPURT_PLACEMENT_END ===\\n");
 #endif
 
 {chr(10).join(print_blocks)}

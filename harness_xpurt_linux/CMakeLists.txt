@@ -31,6 +31,8 @@
 #   -DMODELBLASTER_KERNEL_CC=<abs path>   compile every kernels.c with THIS
 #                                         compiler instead of CMAKE_C_COMPILER
 #   -DMODELBLASTER_XPURT_TRACE=ON         emit the trace CSV block at exit
+#   -DMODELBLASTER_XPURT_PLACEMENT=ON     emit the placement CSV block at exit
+#                                         (cpu each entry ran on, its backend)
 #   -DMODELBLASTER_XPURT_STREAM=ON        emit one JSON line per dispatch END,
 #                                         live, for streaming_feedback.py
 #   -DMODELBLASTER_POOL_THREADS=N         parallel-for pool size
@@ -103,6 +105,9 @@ endif()
 
 if(MODELBLASTER_XPURT_TRACE)
     target_compile_definitions(xpurt_harness PRIVATE MODELBLASTER_XPURT_TRACE=1)
+endif()
+if(MODELBLASTER_XPURT_PLACEMENT)
+    target_compile_definitions(xpurt_harness PRIVATE MODELBLASTER_XPURT_PLACEMENT=1)
 endif()
 
 math(EXPR _last "${_n_bases} - 1")
