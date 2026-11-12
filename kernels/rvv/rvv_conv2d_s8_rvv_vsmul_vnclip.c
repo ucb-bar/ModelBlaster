@@ -1,5 +1,16 @@
 /* source: curated */
 /* algorithm: rvv_vsmul_vnclip */
+/* accuracy_class: bit_exact */
+/* (racing-nets, 2026-11-11) Declared bit_exact so a MAX_ACCURACY_CLASS=bit_exact
+ * build can select it at all; the spec-level default (numeric_drift) made every
+ * strict RVV build run conv2d_s8 on the scalar reference. Basis: the default
+ * build is the tiled-direct path only (MB_NO_IGEMM_1X1, see below), an exact
+ * int32 accumulate followed by vsmul(RNU) == (acc*mult + 2^30) >> 31 and
+ * vnclip(RNU) == (x + 2^(s-1)) >> s, i.e. the reference requantize; measured
+ * max_abs_err 0 on FPGA (yolov8n job 188, FastDepth jobs 3982/3985). The
+ * whole-model verify gate still runs at MB_DRIFT_ATOL=0, so a shape where this
+ * does not hold is rejected, not shipped. -DMB_IGEMM_1X1 / -DMB_FORCE_IGEMM are
+ * NOT bit-exact on hardware and void this declaration. */
 /*
  * ============================================================================
  * SHAPE-CONDITIONAL conv2d_s8: tiled-direct for KH*KW > 1, iGEMM for 1x1.
