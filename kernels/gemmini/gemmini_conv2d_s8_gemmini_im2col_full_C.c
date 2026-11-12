@@ -51,8 +51,17 @@ enum { MB_GEM_IM2C_WS_SLOTS = 1 };
 #define MB_GEM_IM2C_WS_SLOT 0
 #endif
 
+/* racing-nets (2026-11-11): PAD_BYTES 256 KB -> 1 MiB (overridable). A conv
+ * whose padded NHWC input exceeds PAD_BYTES takes the SCALAR loop below with no
+ * trace in kernel_picks.json or the log. 256 KB was sized for yolov8 at 160x160;
+ * the racing gate detector at 192x256 (decoder conv on 24 ch x 96x128 = 315 KB
+ * padded) silently ran its largest convs on the CPU. 1 MiB covers the detector
+ * up to 240x320 at width "l" (972 KB). Cost: MB_GEM_IM2C_WS_SLOTS x 1 MiB BSS. */
+#ifndef MB_GEM_IM2C_PAD_BYTES
+#define MB_GEM_IM2C_PAD_BYTES (1024 * 1024)
+#endif
 enum {
-    PAD_BYTES  = 256 * 1024,  /* zero-padded NHWC activation (yolov8 max 105 KB) */
+    PAD_BYTES  = MB_GEM_IM2C_PAD_BYTES, /* zero-padded NHWC activation */
     PART_ELEMS = 16 * 1024,   /* int32 partial-sum tile: rows*OC (yolov8 max 6 KB) */
 };
 

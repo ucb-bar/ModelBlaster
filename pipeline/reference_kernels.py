@@ -9044,6 +9044,27 @@ def _cat_gemmini_mvin_scale_algorithm(n_inputs: int) -> AlgorithmCandidate:
     )
 
 
+def _cat_per_input_lut_algorithm(n_inputs: int) -> AlgorithmCandidate:
+    """CPU 256-entry table per input for catN_c1_s8 on the pure-Gemmini target
+    (no V on that build, and Gemmini's MVIN_SCALE path rounds ties to even, so
+    it is NUMERIC_DRIFT). Each table entry is the reference's own float32
+    expression, so the op is bit-exact by construction; the per-element loop
+    is a load + table lookup + store instead of a float multiply, divide and
+    roundf. kernels/gemmini/gemmini_cat{n}_c1_s8_per_input_lut.c."""
+    return AlgorithmCandidate(
+        name="per_input_lut",
+        target_affinity=("gemmini",),
+        accuracy_class=AccuracyClass.BIT_EXACT,
+        description=(
+            "Build one 256-entry int8 table per input from the reference's "
+            "float32 expression (roundf((v * scale_i) / scale_out), clamped), "
+            "then copy each input's contiguous [c_i*H*W] run through its "
+            "table; memcpy when the table is the identity."
+        ),
+        reference_impl="",  # the curated file supplies the impl
+    )
+
+
 CAT2_C1_S8 = KernelSpec(
     op="cat2_c1_s8",
     signature=(
@@ -9089,6 +9110,7 @@ CAT2_C1_S8 = KernelSpec(
             ),
         ),
         _cat_gemmini_mvin_scale_algorithm(2),
+        _cat_per_input_lut_algorithm(2),
         # T4's LUT LANE.  Registered for this op and NOT for silu_s8, and the difference is
         # measured rather than stylistic: cat2_c1_s8 is 62.3 % table build with a builder that
         # costs 221 cycles/entry (a multiply, a divide, a round -- no transcendental), so the
@@ -9142,7 +9164,8 @@ CAT3_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [16, 32, 16], "C_total": 64},
     ],
     argtypes_factory=_cat3_c1_s8_argtypes,
-    algorithms=[_cat_gemmini_mvin_scale_algorithm(3)],
+    algorithms=[_cat_gemmini_mvin_scale_algorithm(3),
+                _cat_per_input_lut_algorithm(3)],
 )
 
 CAT4_C1_S8 = KernelSpec(
@@ -9167,7 +9190,8 @@ CAT4_C1_S8 = KernelSpec(
         {"N": 1, "H": 8, "W": 8, "C_inputs": [8, 16, 16, 8],   "C_total": 48},
     ],
     argtypes_factory=_cat4_c1_s8_argtypes,
-    algorithms=[_cat_gemmini_mvin_scale_algorithm(4)],
+    algorithms=[_cat_gemmini_mvin_scale_algorithm(4),
+                _cat_per_input_lut_algorithm(4)],
 )
 
 
