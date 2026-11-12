@@ -1,0 +1,98 @@
+{
+ "summary": {
+  "board": "k3",
+  "backend": "rvv_k3",
+  "cpu": 0,
+  "core_type": "x100",
+  "op": "conv2d_batchnorm2d_s8",
+  "kernel": "kernels/rvv/rvv_conv2d_batchnorm2d_s8_rvv_oc_blocked_bn_epilogue.c",
+  "baseline": null,
+  "baseline_backend": null,
+  "cases": 3,
+  "max_abs_err": 0,
+  "total_med_us": 998.625,
+  "baseline_total_med_us": null,
+  "reps": 3,
+  "returncode": 0
+ },
+ "rows": [
+  {
+   "tag": "dronet:conv_modules.1",
+   "dims": "N1 IC32 OC32 IH27 IW27 KH3 KW3 SH2 PH1",
+   "regime": "full",
+   "n_out": 6272,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 485.7916666666667,
+   "min_us": 484.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:conv_modules.1",
+   "dims": "N1 IC32 OC32 IH27 IW27 KH3 KW3 SH2 PH1",
+   "regime": "small",
+   "n_out": 6272,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:conv_modules.4",
+   "dims": "N1 IC32 OC64 IH14 IW14 KH3 KW3 SH2 PH1",
+   "regime": "full",
+   "n_out": 3136,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 250.25,
+   "min_us": 249.54166666666666,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:conv_modules.4",
+   "dims": "N1 IC32 OC64 IH14 IW14 KH3 KW3 SH2 PH1",
+   "regime": "small",
+   "n_out": 3136,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:conv_modules.7",
+   "dims": "N1 IC64 OC128 IH7 IW7 KH3 KW3 SH2 PH1",
+   "regime": "full",
+   "n_out": 2048,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 262.5833333333333,
+   "min_us": 260.625,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:conv_modules.7",
+   "dims": "N1 IC64 OC128 IH7 IW7 KH3 KW3 SH2 PH1",
+   "regime": "small",
+   "n_out": 2048,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  }
+ ]
+}

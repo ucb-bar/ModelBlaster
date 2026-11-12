@@ -1,0 +1,26 @@
+riscv64-unknown-linux-gnu-gcc (g56971dcbea2) 14.3.0
+== cross rv64gcv_zvl1024b
+exit=0
+== cross rv64gcv_zvl1024b_xsmtvdotii
+riscv64-unknown-linux-gnu-gcc: error: '-march=rv64gcv_zvl1024b_xsmtvdotii': extension 'xsmtvdotii' starts with 'x' but is unsupported non-standard extension
+exit=1
+== cross rv64gcv_xsmtvdot
+riscv64-unknown-linux-gnu-gcc: error: '-march=rv64gcv_xsmtvdot': extension 'xsmtvdot' starts with 'x' but is unsupported non-standard extension
+exit=1
+== cross rv64gcv_xsmti8i32mm
+riscv64-unknown-linux-gnu-gcc: error: '-march=rv64gcv_xsmti8i32mm': extension 'xsmti8i32mm' starts with 'x' but is unsupported non-standard extension
+exit=1
+== cross rv64gcv_zvl1024b_zfh_zvfh
+exit=0
+gcc (Bianbu 15.2.0-16ubuntu1bb3) 15.2.0
+== board rv64gcv_zvl1024b
+exit=0
+== board rv64gcv_zvl1024b_xsmtvdotii
+exit=0
+== board rv64gcv_xsmtvdot
+exit=0
+== board rv64gcv_xsmti8i32mm
+gcc: error: ‘-march=rv64gcv_xsmti8i32mm’: extension ‘xsmti8i32mm’ starts with 'x' but is unsupported non-standard extension
+exit=1
+== board rv64gcv_zvl1024b_zfh_zvfh
+exit=0

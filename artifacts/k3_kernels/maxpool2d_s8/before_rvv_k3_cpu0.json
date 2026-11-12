@@ -1,0 +1,68 @@
+{
+ "summary": {
+  "board": "k3",
+  "backend": "rvv_k3",
+  "cpu": 0,
+  "core_type": "x100",
+  "op": "maxpool2d_s8",
+  "kernel": "kernels/rvv/rvv_maxpool2d_s8_direct.c",
+  "baseline": null,
+  "baseline_backend": null,
+  "cases": 2,
+  "max_abs_err": 0,
+  "total_med_us": 892.625,
+  "baseline_total_med_us": null,
+  "reps": 21,
+  "returncode": 0
+ },
+ "rows": [
+  {
+   "tag": "dronet:maxpool1",
+   "regime": "full",
+   "n_out": 23328,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 437.375,
+   "min_us": 437.2083333333333,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:maxpool1",
+   "regime": "small",
+   "n_out": 23328,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l9.m1",
+   "regime": "full",
+   "n_out": 3200,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 455.25,
+   "min_us": 454.3333333333333,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l9.m1",
+   "regime": "small",
+   "n_out": 3200,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  }
+ ]
+}

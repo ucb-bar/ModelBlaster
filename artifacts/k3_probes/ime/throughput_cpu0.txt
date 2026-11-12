@@ -1,0 +1,9 @@
+cpu=0 vlenb=32 int8 MACs/vmadot=128
+dependent chain (1 acc): 2.279 ns/vmadot (latency)  [56.2 MAC/ns]
+2 indep accs: 1.139 ns [112.3 MAC/ns] | 4 accs: 0.570 ns [224.7] | 8 accs: 0.488 ns [262.1]
+8 accs unsigned (f3=0): 0.488 ns [262.1 MAC/ns]
+8 accs, vl=32 (K3 ignores vl?): 0.488 ns [262.1 MAC/ns]
+2x2-blocked microkernel, 4 loads per 4 vmadot (L1): 1.139 ns/vmadot [112.3 MAC/ns]; load-only 0.448 ns/vmadot-equiv
+2x4-blocked microkernel (6 loads per 8 vmadot, L1): 0.854 ns/vmadot [149.8 MAC/ns]
+2x4-blocked, whole-reg loads vl2re8+vl4re8 (2 loads per 8 vmadot, L1): 0.977 ns/vmadot [131.1 MAC/ns]
+vl4re8 load: 2.686 ns each (47.7 B/ns)

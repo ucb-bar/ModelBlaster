@@ -3618,8 +3618,17 @@ unsigned long model_{mid}_wall_cycles(void) {{
  */
 
 #include <stdint.h>
+#include <string.h>
 
 {chr(10).join(buf_defs)}
+
+/* Restore every intermediate buffer to its initial (.bss == all-zero) state.
+ * Used by the schedule runner's warm-up pass to undo the warm-up's writes,
+ * including the recurrent h/c state of stateful networks (lstm), which lives
+ * in these buffers. */
+void model_{mid}_zero_buffers(void) {{
+{chr(10).join(f"    memset({_buf_name(mid, t)}, 0, sizeof({_buf_name(mid, t)}));" for t in intermediates)}
+}}
 """
     with open(os.path.join(out_dir, "buffers.c"), "w") as f:
         f.write(buf_c)

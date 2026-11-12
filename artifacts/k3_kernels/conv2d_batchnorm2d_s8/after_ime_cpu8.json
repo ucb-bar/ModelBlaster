@@ -1,0 +1,98 @@
+{
+ "summary": {
+  "board": "k3",
+  "backend": "ime_k3_a100",
+  "cpu": 8,
+  "core_type": "a100",
+  "op": "conv2d_batchnorm2d_s8",
+  "kernel": "kernels/ime_k3_a100/ime_k3_a100_conv2d_batchnorm2d_s8_ime_vmadot_8x16x8.c",
+  "baseline": "kernels/rvv/rvv_conv2d_batchnorm2d_s8_rvv_oc_blocked_bn_epilogue.c",
+  "baseline_backend": "rvv_k3_a100",
+  "cases": 3,
+  "max_abs_err": 0,
+  "total_med_us": 154.79166666666666,
+  "baseline_total_med_us": 2700.0,
+  "reps": 7,
+  "returncode": 0
+ },
+ "rows": [
+  {
+   "tag": "dronet:conv_modules.1",
+   "dims": "N1 IC32 OC32 IH27 IW27 KH3 KW3 SH2 PH1",
+   "regime": "full",
+   "n_out": 6272,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 73.5,
+   "min_us": 72.91666666666667,
+   "base_max_abs_err": 0,
+   "base_med_us": 1728.2083333333333,
+   "base_min_us": 1723.5
+  },
+  {
+   "tag": "dronet:conv_modules.1",
+   "dims": "N1 IC32 OC32 IH27 IW27 KH3 KW3 SH2 PH1",
+   "regime": "small",
+   "n_out": 6272,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:conv_modules.4",
+   "dims": "N1 IC32 OC64 IH14 IW14 KH3 KW3 SH2 PH1",
+   "regime": "full",
+   "n_out": 3136,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 34.375,
+   "min_us": 34.25,
+   "base_max_abs_err": 0,
+   "base_med_us": 571.9166666666666,
+   "base_min_us": 571.8333333333334
+  },
+  {
+   "tag": "dronet:conv_modules.4",
+   "dims": "N1 IC32 OC64 IH14 IW14 KH3 KW3 SH2 PH1",
+   "regime": "small",
+   "n_out": 3136,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:conv_modules.7",
+   "dims": "N1 IC64 OC128 IH7 IW7 KH3 KW3 SH2 PH1",
+   "regime": "full",
+   "n_out": 2048,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 46.916666666666664,
+   "min_us": 46.833333333333336,
+   "base_max_abs_err": 0,
+   "base_med_us": 399.875,
+   "base_min_us": 396.7083333333333
+  },
+  {
+   "tag": "dronet:conv_modules.7",
+   "dims": "N1 IC64 OC128 IH7 IW7 KH3 KW3 SH2 PH1",
+   "regime": "small",
+   "n_out": 2048,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  }
+ ]
+}

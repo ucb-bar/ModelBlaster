@@ -94,6 +94,131 @@ _TOP_LINUX = "#define _GNU_SOURCE 1  /* cpu_set_t, pthread_attr_setaffinity_np *
 _TOPS = {"zephyr": "", "linux": _TOP_LINUX}
 
 
+def _warmup_blocks(upper: str, warm_branches: list[str],
+                   warm_restore: list[str]) -> tuple[str, str, str, str]:
+    """C fragments for the optional pre-t0 warm-up pass (Linux only).
+
+    WHY: the first execution of a dispatch on a core pays for page faults on
+    its weights, cold L1/L2/icache and, for a composite entry, waking the pool
+    helpers. Measured on the K3 baseline run: dronet instance 0 dispatches 3
+    and 8 took 3.8 / 7.4 ms against ~0.5 / 1 ms warm, and mlp_control missed 4
+    deadlines, all because the first instance of each network ran cold INSIDE
+    the timed window. The schedule's predicted durations are warm numbers.
+
+    HOW:
+      * It runs on the same worker (hence the same hart / cache / pool) that
+        will run the entry, because caches and pool helpers are per core --
+        warming from main would warm the wrong core.
+      * Strictly serialised in table order through a ticket (g_warm_cursor).
+        Entry ids are a topological order, so every dispatch reads inputs its
+        producers already wrote (no garbage activations, no data race between
+        workers on the shared per-model buffers).
+      * One run per distinct (core_kind, hart, network, dispatch_id, impl,
+        hart set): later instances of a network hit the same code and weights.
+      * Two pthread barriers (workers + main): barrier 1 = everybody warmed;
+        main then restores state and captures run_t0; barrier 2 releases the
+        workers, which read run_t0 only after it. So t0 is taken after warm-up
+        and the warm-up never appears in the trace (it bypasses the trace,
+        hart accounting, wall counters and completion sems).
+
+    STATE RESTORED before t0: every per-model intermediate buffer is zeroed
+    (model_<m>_zero_buffers, from buffers.c: they are .bss, so zero is exactly
+    their initial state -- this is what resets stateful networks such as the
+    lstm h/c pair, which live in those buffers), the per-network output
+    buffers are zeroed, and the profile counters are reset. The golden INPUTS
+    need no re-staging: dispatch state points at the const model_<m>_test_input
+    in rodata, which no kernel writes. Completion sems, wall_start_*,
+    completed_dispatches_* are never touched by the warm-up.
+    """
+    branches = "\n".join(warm_branches)
+    restore = "\n".join(warm_restore)
+    defs = r'''
+/* ---- warm-up pass (--warmup): see _warmup_blocks in generate_xpurt_main.py */
+static pthread_barrier_t g_warm_b1, g_warm_b2;
+static int g_warm_order[@UPPER@_N_ENTRIES];
+static int g_n_warm;
+static int g_warm_cursor;
+
+static void xpurt_warm_entry(const xpurt_sched_entry_t *e_)
+{
+@BRANCHES@
+    printf("xpurt: WARN warmup: unknown network %s in entry %d\n",
+           e_->network, e_->entry_id);
+}
+
+/* The worker-claim predicate, same as the walker's. */
+static int warm_claims(const struct xpurt_worker_arg *wa,
+                       const xpurt_sched_entry_t *e_)
+{
+    if (strcmp(e_->core_kind, wa->kind) != 0) return 0;
+    if (e_->hart >= 0) return e_->hart == wa->hart;
+    return wa->claims_unbound;
+}
+
+static int warm_same_entry(const xpurt_sched_entry_t *a,
+                           const xpurt_sched_entry_t *b)
+{
+    if (a->hart != b->hart || a->dispatch_id != b->dispatch_id ||
+        a->n_harts != b->n_harts) return 0;
+    for (int i = 0; i < a->n_harts; i++)
+        if (a->harts[i] != b->harts[i]) return 0;
+    return strcmp(a->core_kind, b->core_kind) == 0 &&
+           strcmp(a->impl, b->impl) == 0 &&
+           strcmp(a->network, b->network) == 0;
+}
+'''.replace("@UPPER@", upper).replace("@BRANCHES@", branches)
+
+    worker = r'''
+    /* Warm-up: runs after this worker placed itself (above) and before the
+     * timed run. Serialised in table order via g_warm_cursor. */
+    for (int k_ = 0; k_ < g_n_warm; k_++) {
+        const xpurt_sched_entry_t *we_ = &@UPPER@_TABLE[g_warm_order[k_]];
+        if (!warm_claims(wa, we_)) continue;
+        while (__atomic_load_n(&g_warm_cursor, __ATOMIC_ACQUIRE) != k_)
+            usleep(20);
+        xpurt_warm_entry(we_);
+        __atomic_store_n(&g_warm_cursor, k_ + 1, __ATOMIC_RELEASE);
+    }
+    pthread_barrier_wait(&g_warm_b1);   /* everyone warmed */
+    pthread_barrier_wait(&g_warm_b2);   /* main restored state + set run_t0 */
+'''.replace("@UPPER@", upper)
+
+    pre = r'''
+    /* Warm-up plan: the distinct entries, in table order. Built before any
+     * worker exists so the list is immutable while they read it. */
+    g_n_warm = 0;
+    for (int i = 0; i < @UPPER@_N_ENTRIES; i++) {
+        const xpurt_sched_entry_t *e = &@UPPER@_TABLE[i];
+        if (e->dispatch_id < 0) continue;   /* zero-cost op: no kernel */
+        int dup = 0;
+        for (int j = 0; j < g_n_warm && !dup; j++)
+            dup = warm_same_entry(&@UPPER@_TABLE[g_warm_order[j]], e);
+        if (!dup) g_warm_order[g_n_warm++] = i;
+    }
+    if (pthread_barrier_init(&g_warm_b1, NULL, (unsigned)g_n_workers + 1) != 0 ||
+        pthread_barrier_init(&g_warm_b2, NULL, (unsigned)g_n_workers + 1) != 0) {
+        printf("FATAL: warm-up barrier init failed\n");
+        sys_reboot(SYS_REBOOT_COLD);
+        return -1;
+    }
+    uint64_t warm_t0 = (uint64_t)k_cycle_get_64();
+'''.replace("@UPPER@", upper)
+
+    post = r'''
+    {
+        pthread_barrier_wait(&g_warm_b1);   /* all workers warmed */
+        uint64_t warm_t1 = (uint64_t)k_cycle_get_64();
+@RESTORE@
+        __asm__ volatile("fence rw, rw" ::: "memory");
+        printf("xpurt: warmup done %d entries in %.3f ms\n", g_n_warm,
+               (double)(warm_t1 - warm_t0) * 1000.0 / (double)XPURT_TICKS_PER_SEC);
+        run_t0 = (uint64_t)k_cycle_get_64();   /* the REAL t=0 */
+        pthread_barrier_wait(&g_warm_b2);
+    }
+'''.replace("@RESTORE@", restore)
+    return defs, worker, pre, post
+
+
 def _split_job_name(job: str, known: set[str] | None = None) -> tuple[str, int]:
     if known:
         for base in sorted(known, key=len, reverse=True):
@@ -122,7 +247,8 @@ def _emit(networks: list[str], schedule_name: str,
           backends: list[str],
           pool_sizes: list[int],
           n_instances: dict[str, int],
-          platform: str = "zephyr") -> str:
+          platform: str = "zephyr",
+          warmup: bool = False) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -143,11 +269,21 @@ def _emit(networks: list[str], schedule_name: str,
                    create one persistent pool for their exact ordered hart
                    set. Per-hart locks prevent scheduler workers and pool
                    helpers from oversubscribing the same physical hart.
+    `warmup`       Linux only. Before the timed t0, run each distinct
+                   (network, dispatch, impl, hart set) the schedule uses ONCE,
+                   untimed, on the worker/pool that will run it in the timed
+                   run (see _warmup_blocks), then restore every piece of
+                   state the timed run depends on.
     `n_instances`  per-network instance count (max instance index + 1).
                    Sized arrays for wall-cycle bookkeeping so periodic
                    instances of the same network don't clobber each
                    other's start/elapsed scalars."""
 
+    if warmup and platform != "linux":
+        raise SystemExit("--warmup is Linux-only (needs pthread barriers and a "
+                         "hosted OS); the Zephyr walker has no warm-up pass")
+    warm_branches: list[str] = []
+    warm_restore: list[str] = []
     inc_lines: list[str] = []
     output_buf_decls: list[str] = []
     forward_decls: list[str] = []
@@ -256,6 +392,23 @@ def _emit(networks: list[str], schedule_name: str,
             "            }"
         )
         bs_select = "\n".join(bs_select_lines)
+        if warmup:
+            warm_branches.append(
+                f'    if (strcmp(e_->network, "{net}") == 0) {{\n'
+                f"        model_{mid}_state_t dispatch_state_{mid} = {{\n"
+                f"            .input = model_{mid}_test_input,\n"
+                f"            .output = out_{mid},\n"
+                f"            .pool = (void *)pool_for_entry(e_),\n"
+                f"        }};\n"
+                f"        lock_entry_harts(e_);\n"
+                f"{bs_select}\n"
+                f"        unlock_entry_harts(e_);\n"
+                f"        return;\n"
+                f"    }}")
+            forward_decls.append(f"void model_{mid}_zero_buffers(void);")
+            warm_restore.append(
+                f"        model_{mid}_zero_buffers();\n"
+                f"        memset(out_{mid}, 0, sizeof out_{mid});")
 
         branch_lines.append(
             f'        if (e_->network[0] == \'{net[0]}\' && '
@@ -514,6 +667,9 @@ def _emit(networks: list[str], schedule_name: str,
     except KeyError:
         raise SystemExit(f"--platform must be one of {sorted(_PROLOGUES)}, "
                          f"got {platform!r}")
+
+    warm_defs, warm_worker, warm_main_pre, warm_main_post = _warmup_blocks(
+        upper, warm_branches, warm_restore + reset_calls) if warmup else ("", "", "", "")
 
     return f"""{HEADER}
 {platform_top}/*
@@ -793,6 +949,7 @@ static void unlock_entry_harts(const xpurt_sched_entry_t *e)
         pthread_mutex_unlock(&g_hart_locks[ordered[i]]);
 }}
 
+{warm_defs}
 static void *xpurt_worker(void *arg)
 {{
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
@@ -860,6 +1017,7 @@ static void *xpurt_worker(void *arg)
     }}
 #endif
 
+{warm_worker}
     uint64_t worker_t0 = (uint64_t)k_cycle_get_64();
     uint64_t prev_iter_end = worker_t0;
     /* Take entries that match `my_kind` AND `my_hart`, in start_time
@@ -1136,9 +1294,11 @@ int main(void)
     }}
 #endif
 
+{warm_main_pre}
     /* Run baseline for both the trace and the periodic-start-time gate.
      * Captured just before workers spawn so it's the moment "t=0" of the
-     * schedule maps to. */
+     * schedule maps to. With --warmup it is captured AGAIN, after the
+     * warm-up barrier, and that later value is the one workers read. */
     run_t0 = (uint64_t)k_cycle_get_64();
 
     for (int w = 0; w < g_n_workers; w++) {{
@@ -1184,6 +1344,7 @@ int main(void)
          * end so it doesn't perturb the schedule's actual_start cycles. */
     }}
 
+{warm_main_post}
     /* Wait for every worker to drain. */
     for (int w = 0; w < g_n_workers; w++) {{
         pthread_join(tids[w], NULL);
@@ -1297,6 +1458,12 @@ def main() -> None:
                     help="zephyr: k_cycle_get_64/k_sem/sys_reboot as-is. "
                          "linux: rdtime + POSIX semaphores, for a hosted "
                          "riscv64 board such as the SpaceMiT K1.")
+    ap.add_argument("--warmup", action="store_true",
+                    help="Linux only: run every distinct (network, dispatch, "
+                         "impl, hart set) once, untimed, before t0, then "
+                         "restore state. Removes first-instance cold-start "
+                         "from the timed window. Off by default (K1); "
+                         "run_xpurt_k1.sh turns it on for k3.")
     ap.add_argument("--core-kinds", default="rvv,scalar",
                     help="comma list of distinct core_kind values the schedule "
                          "uses. One worker thread is spawned per kind. "
@@ -1430,14 +1597,15 @@ def main() -> None:
 
     src = _emit(networks, args.name, args.dispatch_table_header,
                 core_kinds, backends, pool_sizes, n_instances,
-                platform=args.platform)
+                platform=args.platform, warmup=args.warmup)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
     print(f"wrote {args.out}  (platform: {args.platform} "
           f"networks: {networks} "
           f"instances: {n_instances} kinds: {core_kinds} "
-          f"backends: {backends} pool_sizes: {pool_sizes})")
+          f"backends: {backends} pool_sizes: {pool_sizes} "
+          f"warmup: {args.warmup})")
 
 
 if __name__ == "__main__":

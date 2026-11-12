@@ -65,7 +65,9 @@ MODELS="mlp_control,dronet"
 # `.staged_from` -- deliberately NOT `.extract_config`, so a staged graph can
 # never be mistaken for an extracted one by the reuse check.
 STAGED_IRS=""
-BACKENDS="${BOARD_BACKEND},${BOARD_BACKEND}"
+# One backend per core kind (parallel to CORE_KINDS below): k1 = rvv_x60 twice,
+# k3 = rvv_k3 (x100) + rvv_k3_a100 (a100, zvl1024b).
+BACKENDS="${BOARD_BACKEND_P},${BOARD_BACKEND_E}"
 QUANT="int8"
 # reference = curated/hand-written kernels, no LLM. Codex is only for NEW kernel
 # bodies and must be requested explicitly; there is no Bedrock path here.
@@ -279,7 +281,7 @@ for model in "${MODEL_LIST[@]}"; do
         [[ "${_v}" == "MODELBLASTER_K1_RT_PRIORITY" ]] && continue
         # Same reasoning for the board selector and the k3 equivalents.
         case "${_v}" in
-            MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE) continue ;;
+            MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE|MB_XPURT_WARMUP) continue ;;
         esac
         _cfg="${_cfg} ${_v}=${!_v}"
     done
@@ -403,13 +405,21 @@ ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
 [[ -f "${SCHED_C}" ]] || { echo "ingest produced no dispatch table" >&2; exit 1; }
 echo "  ${SCHED_C}"
 
+# Warm-up pass (untimed first run of every distinct dispatch before t0).
+# On by default on k3, where the cold first instance of each network lands
+# inside the timed window and shows up as deadline misses; off on k1.
+# MB_XPURT_WARMUP=0/1 overrides.
+if [[ "${BOARD_NAME}" == "k3" ]]; then _warm_def=1; else _warm_def=0; fi
+WARMUP_ARGS=()
+[[ "${MB_XPURT_WARMUP:-${_warm_def}}" == "1" ]] && WARMUP_ARGS+=(--warmup)
+
 echo "=== 3/5 generate the walker (platform linux) ==="
 MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
 ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --schedule "${SCHEDULE}" --out "${MAIN_C}" --name "${SCHED_NAME}" \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
     --platform linux --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
-    --networks "${MODELS}" --registry "${REGISTRY}"
+    --networks "${MODELS}" --registry "${REGISTRY}" "${WARMUP_ARGS[@]}"
 
 echo "=== 4/5 cross-build ==="
 CMAKE_ARGS=(

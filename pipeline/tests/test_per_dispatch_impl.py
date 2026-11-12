@@ -267,6 +267,51 @@ class AskingForAnImplTheBuildLacksIsFatal(unittest.TestCase):
         self.assertIn("#include <zephyr/kernel.h>", src)
         self.assertIn("pthread_attr_setaffinity_np(&attrs[w].a", src)
 
+    def _emit_warm(self, warmup, platform="linux"):
+        from pipeline import generate_xpurt_main as gen
+        return gen._emit(
+            networks=["m"], schedule_name="s",
+            dispatch_table_header="t.h", core_kinds=["rvv"],
+            backends=["rvv_x60"], pool_sizes=[1], n_instances={"m": 1},
+            platform=platform, warmup=warmup)
+
+    def test_warmup_block_present_only_when_enabled(self):
+        on, off = self._emit_warm(True), self._emit_warm(False)
+        for needle in ("xpurt_warm_entry", "g_warm_order", "warmup done",
+                       "pthread_barrier_wait", "model_m_zero_buffers"):
+            self.assertIn(needle, on)
+            self.assertNotIn(needle, off)
+
+    def test_warmup_runs_before_the_timed_t0_and_restores_state(self):
+        src = self._emit_warm(True)
+        worker = src[src.index("static void *xpurt_worker"):src.index("int main(void)")]
+        # after placement, before the worker's own timing base
+        self.assertLess(worker.index("mb_place_current_thread(my_hart)"),
+                        worker.index("xpurt_warm_entry(we_)"))
+        self.assertLess(worker.index("xpurt_warm_entry(we_)"),
+                        worker.index("uint64_t worker_t0"))
+        main = src[src.index("int main(void)"):]
+        # state restore + profile reset happen between the two barriers, and
+        # the real run_t0 is captured after the restore
+        b1 = main.index("pthread_barrier_wait(&g_warm_b1)")
+        b2 = main.index("pthread_barrier_wait(&g_warm_b2)")
+        zero = main.index("model_m_zero_buffers();")
+        reset = main.index("model_m_reset_profile_rvv_x60();", b1)
+        t0 = main.index("run_t0 = (uint64_t)k_cycle_get_64();   /* the REAL t=0", b1)
+        self.assertTrue(b1 < zero < t0 < b2 and b1 < reset < t0 < b2)
+        # warm-up never touches the trace / completion sems / accounting
+        warm = src[src.index("static void xpurt_warm_entry"):src.index("static int warm_claims")]
+        for forbidden in ("xpurt_trace", "k_sem_give", "g_hart_acc",
+                          "wall_start_"):
+            self.assertNotIn(forbidden, warm)
+        # it must still lock the harts and use the exact pool, like the walker
+        self.assertIn("lock_entry_harts(e_)", warm)
+        self.assertIn("pool_for_entry(e_)", warm)
+
+    def test_warmup_is_linux_only(self):
+        with self.assertRaises(SystemExit):
+            self._emit_warm(True, platform="zephyr")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,4 @@
+cpu=6 vlenb=32
+cpu=6 vl=32: s8=EXEC u8=EXEC us8=EXEC su8=EXEC s4(0x61)=SIGILL s8_lmul2=SIGILL
+cpu=6 vl=32: s8=EXEC u8=EXEC us8=EXEC su8=EXEC s4(0x61)=SIGILL s8_lmul2=SIGILL
+cpu=6 vl=64: s8=EXEC u8=EXEC us8=EXEC su8=EXEC s4(0x61)=SIGILL s8_lmul2=SIGILL

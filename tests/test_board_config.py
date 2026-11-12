@@ -70,6 +70,35 @@ def test_hw_name_k3():
         bc.derive_hw_name(k3, [16], "rvv_k3")
 
 
+def test_hw_name_core_type_target_used_as_is():
+    k3 = bc.resolve("k3", {})
+    assert bc.derive_hw_name(k3, [8, 9], "rvv_k3_a100") == "rvv_k3_a100"
+    assert bc.derive_hw_name(k3, [0], "rvv_k3_x100") == "rvv_k3_x100"
+    assert bc.derive_hw_name(k3, [8], "rvv_k3_a100", explicit="c") == "c"
+
+
+def test_hw_name_a100_target_on_x100_cpus_is_error():
+    k3 = bc.resolve("k3", {})
+    with pytest.raises(ValueError, match="illegal on the X100"):
+        bc.derive_hw_name(k3, [0, 1], "rvv_k3_a100")
+    with pytest.raises(ValueError):
+        bc.derive_hw_name(k3, [8], "rvv_k3_x100")
+    with pytest.raises(ValueError):  # mixed set, even with an _a100 target
+        bc.derive_hw_name(k3, [7, 8], "rvv_k3_a100")
+
+
+def test_k3_per_core_type_backends():
+    c = bc.resolve("k3", {})
+    assert bc.backend_for_core_type(c, "x100") == "rvv_k3"
+    assert bc.backend_for_core_type(c, "a100") == "ime_k3_a100"
+    assert bc.backend_for_core_type(bc.resolve("k1", {}), "rvv_c1") == "rvv_x60"
+    out = bc.shell_exports(c)
+    assert "BOARD_BACKEND_P=rvv_k3\n" in out + "\n"
+    assert "BOARD_BACKEND_E=ime_k3_a100" in out
+    k1 = bc.shell_exports(bc.resolve("k1", {}))
+    assert "BOARD_BACKEND_P=rvv_x60" in k1 and "BOARD_BACKEND_E=rvv_x60" in k1
+
+
 def test_hw_name_k1_is_none():
     assert bc.derive_hw_name(bc.resolve("k1", {}), [0, 5], "rvv_x60") is None
 
@@ -78,8 +107,12 @@ def test_core_types_match_registry():
     from modelblaster.pipeline import core_registry as cr
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     reg = cr.load(os.path.join(repo, "cores", "spacemit_k3.json"))
-    for kind, harts in bc.resolve("k3", {}).core_types:
+    cfg = bc.resolve("k3", {})
+    for kind, harts in cfg.core_types:
         assert tuple(h for c in reg.by_kind[kind] for h in c.harts) == harts
+        # the registry's per-core backend must agree with the board default
+        assert {c.backend for c in reg.by_kind[kind]} == {
+            bc.backend_for_core_type(cfg, kind)}
 
 
 def test_shell_exports_roundtrip():

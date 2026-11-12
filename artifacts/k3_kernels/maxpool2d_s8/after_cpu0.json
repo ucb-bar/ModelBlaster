@@ -1,0 +1,72 @@
+{
+ "summary": {
+  "board": "k3",
+  "backend": "rvv_k3",
+  "cpu": 0,
+  "core_type": "x100",
+  "op": "maxpool2d_s8",
+  "kernel": "kernels/rvv_k3_a100/rvv_k3_a100_maxpool2d_s8_direct.c",
+  "baseline": null,
+  "baseline_backend": null,
+  "cases": 2,
+  "max_abs_err": 0,
+  "total_med_us": 105.0,
+  "baseline_total_med_us": null,
+  "reps": 21,
+  "returncode": 0
+ },
+ "rows": [
+  {
+   "tag": "dronet:maxpool1",
+   "dims": "N1 C32 IH56 IW56 KH3 KW3 SH2 PH0",
+   "regime": "full",
+   "n_out": 23328,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 64.45833333333333,
+   "min_us": 64.33333333333333,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "dronet:maxpool1",
+   "dims": "N1 C32 IH56 IW56 KH3 KW3 SH2 PH0",
+   "regime": "small",
+   "n_out": 23328,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l9.m1",
+   "dims": "N1 C128 IH5 IW5 KH5 KW5 SH1 PH2",
+   "regime": "full",
+   "n_out": 3200,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 40.541666666666664,
+   "min_us": 40.458333333333336,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l9.m1",
+   "dims": "N1 C128 IH5 IW5 KH5 KW5 SH1 PH2",
+   "regime": "small",
+   "n_out": 3200,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  }
+ ]
+}

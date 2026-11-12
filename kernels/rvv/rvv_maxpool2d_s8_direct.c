@@ -21,6 +21,7 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
                 /* Vectorize over OW dimension */
                 for (; ow < OW; ow += vl) {
                     vl = __riscv_vsetvl_e8m4(OW - ow);
+                    if (vl > 256) vl = 256; /* tmp[256] below must never overflow (VLEN>=1024) */
 
                     /* Initialize accumulator with INT8_MIN */
                     vint8m4_t vacc = __riscv_vmv_v_x_i8m4((int8_t)(-128), vl);

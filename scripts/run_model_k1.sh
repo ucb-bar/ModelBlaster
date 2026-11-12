@@ -21,6 +21,10 @@
 # registry's ai_thread_cpus are passed to make as AI_CPUS=, the profile is
 # filed under topo_0..n-1 (MB_TOPO_RELATIVE) and under a per-core-type <hw>
 # directory (PROFILE_HW_NAME, derived rvv_k3_x100 / rvv_k3_a100 from the cpus).
+# A target that already names its core type (rvv_k3_a100) is used as the <hw>
+# name unchanged and must run on cpus of that type: zvl1024b code on the X100
+# (cpus 0-7) is an illegal instruction stream, so that combination is refused.
+# Profile A100 cpus with target rvv_k3_a100, X100 cpus with rvv_k3.
 #
 # Env:
 #   MODELBLASTER_K1_HOST         board ssh host      (default: k1)
@@ -40,8 +44,10 @@
 #                                the physical CPUs (XPU-RT looks profiles up by
 #                                WIDTH). Default: 1 on k3, 0 on k1.
 #   PROFILE_HW_NAME              the <hw> level of the profile tree. Default on
-#                                k3: <target>_x100 / <target>_a100 from the
-#                                cpus (a mixed set is an error); unset on k1.
+#                                k3: <target> if it ends _a100/_x100, else
+#                                <target>_x100 / <target>_a100 from the cpus
+#                                (a mixed set, or an _a100 target on X100
+#                                cpus, is an error); unset on k1.
 #   MB_SHARD_FACTOR              OC shards per conv, at CODEGEN time (the
 #                                weights are re-packed per shard, so it cannot
 #                                be a runtime knob). Only meaningful with

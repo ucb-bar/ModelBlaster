@@ -61,6 +61,43 @@ def test_rvv_k3_backend_matches_x60():
     assert k3.verify_method == x60.verify_method
 
 
+def test_rvv_k3_a100_backend():
+    from modelblaster.pipeline.backends import BACKENDS
+    a100, k3 = BACKENDS["rvv_k3_a100"], BACKENDS["rvv_k3"]
+    assert "-march=rv64gcv_zvl1024b_zfh_zvfh" in a100.kernel_cflags
+    assert not any("zvl256b" in f for f in a100.kernel_cflags)
+    # every other flag identical to rvv_k3
+    rest = lambda b: [f for f in b.kernel_cflags if not f.startswith("-march=")]
+    assert rest(a100) == rest(k3)
+    assert a100.curated_aliases == ("rvv",)
+    assert a100.verify_method == k3.verify_method
+
+
+def test_registry_core_backends():
+    reg = cr.load(K3)
+    assert {c.backend for c in reg.by_kind["x100"]} == {"rvv_k3"}
+    assert {c.backend for c in reg.by_kind["a100"]} == {"ime_k3_a100"}
+    assert {c.backend for c in cr.load(K1).cores} == {""}
+
+
+def test_registry_rejects_mixed_backends_in_one_kind(tmp_path):
+    import json
+    import pytest
+    doc = {"cores": [
+        {"name": "a", "kind": "k", "capabilities": ["x"], "backend": "b1"},
+        {"name": "b", "kind": "k", "capabilities": ["x"], "backend": "b2"}]}
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="different backends"):
+        cr.load(str(p))
+
+
+def test_a100_target_dir_and_vector_backend():
+    from modelblaster.pipeline import generate_kernels as gk
+    assert "rvv_k3_a100" in gk._VECTOR_BACKENDS
+    assert os.path.isdir(os.path.join(REPO, "kernels", "rvv_k3_a100"))
+
+
 def test_every_x60_affined_algorithm_is_k3_affined():
     # The picker matches target_affinity by exact backend name; a miss silently
     # selects the scalar reference.
@@ -69,3 +106,70 @@ def test_every_x60_affined_algorithm_is_k3_affined():
         for a in spec.algorithms:
             if "rvv_x60" in a.target_affinity:
                 assert "rvv_k3" in a.target_affinity, (spec.op, a.name)
+                assert "rvv_k3_a100" in a.target_affinity, (spec.op, a.name)
+
+
+def test_ime_k3_a100_backend():
+    from modelblaster.pipeline.backends import BACKENDS, backend_lineage
+    ime, a100 = BACKENDS["ime_k3_a100"], BACKENDS["rvv_k3_a100"]
+    assert "-march=rv64gcv_zvl1024b_zfh_zvfh" in ime.kernel_cflags
+    assert not any("zvl256b" in f for f in ime.kernel_cflags)
+    assert backend_lineage("ime_k3_a100") == ("ime_k3_a100", "rvv_k3_a100", "rvv")
+    assert ime.verify_method == a100.verify_method
+    assert os.path.isdir(os.path.join(REPO, "kernels", "ime_k3_a100"))
+
+
+def test_ime_k3_a100_algorithms_and_layout():
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    from modelblaster.pipeline.generate_skeleton import _conv_weight_layout_for_backend
+    for op in ("conv2d_batchnorm2d_silu_s8", "conv2d_batchnorm2d_s8",
+               "conv2d_s8", "linear_s8", "matmul_s8"):
+        names = [a.name for a in KERNEL_SPECS[op].algorithms
+                 if "ime_k3_a100" in a.target_affinity]
+        assert names == ["ime_vmadot_8x16x8"], op
+    # conv weights stay IHWOC (inherited via the rvv lineage)
+    assert _conv_weight_layout_for_backend("ime_k3_a100") == \
+        _conv_weight_layout_for_backend("rvv_k3_a100") == "ihwoc"
+
+
+_IME_CONV_OPS = ("conv2d_batchnorm2d_silu_s8", "conv2d_batchnorm2d_s8", "conv2d_s8")
+
+
+def test_ime_k3_a100_conv_kernels_exist():
+    for op in _IME_CONV_OPS:
+        p = os.path.join(REPO, "kernels", "ime_k3_a100",
+                         f"ime_k3_a100_{op}_ime_vmadot_8x16x8.c")
+        assert os.path.exists(p), p
+    assert os.path.exists(os.path.join(
+        REPO, "kernels", "ime_k3_a100", "ime_k3_a100_common.h"))
+
+
+def test_ime_k3_a100_includes_own_dir():
+    from modelblaster.pipeline.backends import BACKENDS
+    flags = BACKENDS["ime_k3_a100"].resolved_kernel_cflags(REPO)
+    assert f"-I{REPO}/kernels/ime_k3_a100" in flags
+    # the shared rvv include dir (mb_rvv_vxrm_compat.h) is still there
+    assert f"-I{REPO}/kernels/rvv" in flags
+
+
+def test_ime_conv_kernels_cross_compile_without_whole_register_spills(tmp_path):
+    """The IME conv kernels must compile at zvl1024b and contain no
+    vs*r.v / vl*r.v whole-register spills (Phase B hazard on the A100)."""
+    import re
+    import shutil
+    import subprocess
+    cross = os.environ.get("CROSS", "")
+    gcc = (cross + "gcc") if cross else shutil.which("riscv64-unknown-linux-gnu-gcc")
+    if not gcc or not shutil.which(gcc):
+        import pytest
+        pytest.skip("no riscv cross gcc")
+    from modelblaster.pipeline.backends import BACKENDS
+    flags = list(BACKENDS["ime_k3_a100"].resolved_kernel_cflags(REPO))
+    for op in _IME_CONV_OPS:
+        src = os.path.join(REPO, "kernels", "ime_k3_a100",
+                           f"ime_k3_a100_{op}_ime_vmadot_8x16x8.c")
+        obj = str(tmp_path / f"{op}.o")
+        subprocess.run([gcc, "-O2", *flags, "-c", src, "-o", obj], check=True)
+        dis = subprocess.run([gcc.replace("gcc", "objdump"), "-d", obj],
+                             check=True, capture_output=True, text=True).stdout
+        assert not re.search(r"\bvs\dr\.v\b|\bvl\dre?\d*\.v\b", dis), op

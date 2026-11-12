@@ -1,0 +1,22 @@
+cpu=8 vlenb=128 int32 outputs over vd,vd+1 = 64
+derived from scan: pa=0 couples to 8 B-bytes (first at 0, stride 16) => N=8 K=16 M=128/K=8
+TILE M=8 K=16 N=8 (int8); layout hypothesis A[i*K+k], B[j*K+k], C[i*N+j] (vd|vd+1 concatenated): scan mismatches=0 of 16384, multi-hit=0, nonunit=0
+variant s(f3=3): matches over 20000 trials (accum onto random C0): [A=u,B=u]=0 [A=s,B=u]=2500 [A=u,B=s]=0 [A=s,B=s]=20000
+variant u(f3=0): matches over 20000 trials (accum onto random C0): [A=u,B=u]=20000 [A=s,B=u]=0 [A=u,B=s]=2500 [A=s,B=s]=0
+variant us(f3=1): matches over 20000 trials (accum onto random C0): [A=u,B=u]=2500 [A=s,B=u]=0 [A=u,B=s]=20000 [A=s,B=s]=0
+variant su(f3=2): matches over 20000 trials (accum onto random C0): [A=u,B=u]=0 [A=s,B=u]=20000 [A=u,B=s]=0 [A=s,B=s]=2500
+accumulate twice (neg values) == 2x ref: YES
+vl=128: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=96: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=64: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=48: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=32: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=16: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=8: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=4: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=1: exec (matches full-vl ref 200/200, all-zero out 0)
+vl=32 as K1-style 4x4x8 (C[0..15], rest zero): match=0/200, upper outputs zero=0/200
+LMUL=2: SIGILL
+odd vd (x9): SIGILL
+C0 passthrough with zero operands (C index e<32 in vd, rest in vd+1): YES
+int4 f7=0x61: exec; matches 8x32x8 nibble-model (low nibble first, signed): 5000/5000

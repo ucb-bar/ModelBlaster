@@ -1,0 +1,98 @@
+{
+ "summary": {
+  "board": "k3",
+  "backend": "rvv_k3",
+  "cpu": 0,
+  "core_type": "x100",
+  "op": "conv2d_batchnorm2d_silu_s8",
+  "kernel": "kernels/rvv/rvv_conv2d_batchnorm2d_silu_s8_rvv_oc_blocked_bn_silu_epilogue.c",
+  "baseline": null,
+  "baseline_backend": null,
+  "cases": 3,
+  "max_abs_err": 0,
+  "total_med_us": 6381.500000000001,
+  "baseline_total_med_us": null,
+  "reps": 7,
+  "returncode": 0
+ },
+ "rows": [
+  {
+   "tag": "yolov8_nano:detect.cv3_0_1.conv",
+   "dims": "N1 IC80 OC80 IH20 IW20 KH3 KW3 SH1 PH1",
+   "regime": "full",
+   "n_out": 32000,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 5222.666666666667,
+   "min_us": 5203.708333333333,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:detect.cv3_0_1.conv",
+   "dims": "N1 IC80 OC80 IH20 IW20 KH3 KW3 SH1 PH1",
+   "regime": "small",
+   "n_out": 32000,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l15.m0.cv1.conv",
+   "dims": "N1 IC32 OC32 IH20 IW20 KH3 KW3 SH1 PH1",
+   "regime": "full",
+   "n_out": 12800,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 872.0416666666666,
+   "min_us": 864.375,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l15.m0.cv1.conv",
+   "dims": "N1 IC32 OC32 IH20 IW20 KH3 KW3 SH1 PH1",
+   "regime": "small",
+   "n_out": 12800,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l9.cv1.conv",
+   "dims": "N1 IC256 OC128 IH5 IW5 KH1 KW1 SH1 PH0",
+   "regime": "full",
+   "n_out": 3200,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 286.7916666666667,
+   "min_us": 286.7916666666667,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  },
+  {
+   "tag": "yolov8_nano:l9.cv1.conv",
+   "dims": "N1 IC256 OC128 IH5 IW5 KH1 KW1 SH1 PH0",
+   "regime": "small",
+   "n_out": 3200,
+   "max_abs_err": 0,
+   "n_diff": 0,
+   "med_us": 0.0,
+   "min_us": 0.0,
+   "base_max_abs_err": 0,
+   "base_med_us": 0.0,
+   "base_min_us": 0.0
+  }
+ ]
+}

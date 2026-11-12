@@ -1,0 +1,9 @@
+cpu=0 vlenb=32 vlmax_e8m1=32
+(a) 2048 elems/pass: vle8 e8m1 125.0 ns (16.38 elem/ns) | vle8 e8m4 41.7 ns (49.15) | vlse8 s2 m1 708.3 ns (2.89) | vlse8 s2 m4 833.3 ns (2.46)
+    per-instr ns: vle8m1 1.95 vle8m4 2.60 vlse8m1 11.07 vlse8m4 52.08
+(b) vredsum e32 ns/op: m1 lat(vlmax) 2.28 | m4 lat(vlmax) 5.05 | m1 lat(vl16) 2.28 | m4 lat(vl16) 5.05 | m1 thr 0.65 | m4 thr 1.30
+(c) per 32B group ns: vse8+scalar scatter(stride64) 62.50 | vsse8 stride64 57.94 | vse8+scalar reload 18.23 | vse8 only 1.30
+(d) vsetvli ns/instr: const 0.90 | alt e8m1<->e32m4 0.90 | alt+vadd 1.14 | const+vadd 0.90
+(e) vwmacc ns/instr (MAC/ns): i8->i16 vlmax(vl=32) 0.936 (34.2) | vl=32 0.936 (34.2) | vl=16 0.936 (17.1) | chained vlmax 1.383
+    i16->i32 vlmax(vl=16) 0.936 (17.1) | vl=16 0.936 (17.1) | vl=16 0.936 (17.1)
+(f) scalar int8 MAC loop: 0.854 ns/MAC (1.17 MAC/ns)

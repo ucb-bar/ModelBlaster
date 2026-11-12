@@ -1,0 +1,8 @@
+== z256 rvv_conv2d_batchnorm2d_silu_s8_rvv_oc_blocked_bn_silu_epilogue: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: b5010113 addi sp,sp,-1200;
+== z256 rvv_conv2d_s8_rvv_vsmul_vnclip: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: da010113 addi sp,sp,-608;
+== z256 rvv_maxpool2d_s8_direct: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: db010113 addi sp,sp,-592;
+== z256 rvv_linear_s8_direct: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: 7135 addi sp,sp,-160;
+== z1024 rvv_conv2d_batchnorm2d_silu_s8_rvv_oc_blocked_bn_silu_epilogue: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: b6010113 addi sp,sp,-1184;
+== z1024 rvv_conv2d_s8_rvv_vsmul_vnclip: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: da010113 addi sp,sp,-608;
+== z1024 rvv_maxpool2d_s8_direct: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: db010113 addi sp,sp,-592;
+== z1024 rvv_linear_s8_direct: spills(vs?r.v)=0 fills(vl?re*.v)=0 vlenb_reads=0 sp_adj= 0: 7135 addi sp,sp,-160;
