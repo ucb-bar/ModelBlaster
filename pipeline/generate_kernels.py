@@ -317,11 +317,33 @@ def emit_kernels_h(specs: list[KernelSpec], out_dir: str,
 _BASE_KERNEL_INCLUDES = ("<stddef.h>", "<float.h>", "<stdint.h>", "<math.h>")
 
 
+def _check_tiled_weights(impls: dict[str, str], out_dir: str) -> None:
+    """Weights the skeleton packed as A100 tiles need a kernel that reads them.
+
+    generate_skeleton writes weight_layouts.json when an ime2_a100 build emits
+    some weights in the matrix tile order (behind an "MBIME2TW" header). A
+    kernel that does not check for that header would read the tiles as plain
+    weights and compute garbage, so refuse to emit it instead.
+    """
+    path = os.path.join(out_dir, "weight_layouts.json")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        ops = json.load(f).get("ime2_tile", {}).get("ops", [])
+    bad = sorted(op for op in ops if "MBIME2TW" not in (impls.get(op) or ""))
+    if bad:
+        raise SystemExit(
+            f"{path}: weights of {bad} were packed as A100 matrix tiles, but the "
+            f"kernel chosen for them does not read that layout (no MBIME2TW check). "
+            f"Use the curated kernels/ime2_a100 kernel, or regenerate the skeleton.")
+
+
 def emit_kernels_c(
     impls: dict[str, str], source_label: str, out_dir: str,
     backend: Optional[Backend] = None,
     model_name: Optional[str] = None,
 ) -> None:
+    _check_tiled_weights(impls, out_dir)
     parts = [HEADER, f"/* source: {source_label} */"]
     # Universal headers (FLT_MAX/INT64_MAX/size_t are kernel-friendly and free).
     for inc in _BASE_KERNEL_INCLUDES:
@@ -588,6 +610,10 @@ _ALGORITHM_REQUIRED_SUBSTRINGS: dict[str, tuple[str, ...]] = {
     # expression is evaluated verbatim, at most 256 times, and never
     # approximated -- so require the table and the gather that reads it.
     "rvv_memo_lut_gather": ("table", "vluxei8"),
+    # ime2_vmadot_8x8x16 (A100 matrix engine): must issue smt.vmadot and
+    # refuse non-A100 cores; otherwise a plain RVV kernel passes cross-compile
+    # under the matrix-engine name.
+    "ime2_vmadot_8x8x16": (".insn r 0x2b, 3, 0x71", "vlenb"),
     # im2col_gemm: must allocate and populate the im2col buffer.
     "im2col_gemm": ("im2col_buf",),
     # oc_blocked: must have an outer OC tile loop. Looking for the
@@ -929,10 +955,14 @@ def generate_one_llm(
                 f"none of this op's algorithms "
                 f"{[a.name for a in spec.algorithms]}; falling back to all")
             candidates = list(spec.algorithms)
-    # Also drop algorithms whose target_affinity excludes this backend.
+    # Also drop algorithms whose target_affinity excludes this backend
+    # (or, for a backend with llm_reuses_curated, all of its aliases).
+    names = (backend.name,)
+    if getattr(backend, "llm_reuses_curated", False):
+        names += tuple(backend.curated_aliases)
     candidates = [
         a for a in candidates
-        if not a.target_affinity or backend.name in a.target_affinity
+        if not a.target_affinity or any(n in a.target_affinity for n in names)
     ]
     if not candidates:
         log(f"  [{spec.op}] no algorithms remain after target_affinity "
@@ -955,16 +985,18 @@ def generate_one_llm(
     # high fraction of cycles in vsetvl/broadcast). Bias the algorithm
     # selection toward target-affined kernels and let real-HW (FireSim)
     # rank them when re-rank is enabled.
-    has_target_affined = any(
-        a.target_affinity and backend.name in a.target_affinity
-        for a in candidates
-    )
-    if has_target_affined:
+    # With llm_reuses_curated, algorithms tagged for the backend itself come
+    # before alias ones, so a new ime2_a100 candidate is generated rather than
+    # replaced by the RVV kernel its alias folder already holds.
+    own = [a for a in candidates
+           if a.target_affinity and backend.name in a.target_affinity]
+    affined = own or [
+        a for a in candidates
+        if a.target_affinity and any(n in a.target_affinity for n in names)
+    ]
+    if affined:
         before = [a.name for a in candidates]
-        candidates = [
-            a for a in candidates
-            if a.target_affinity and backend.name in a.target_affinity
-        ]
+        candidates = affined
         dropped = [n for n in before if n not in (a.name for a in candidates)]
         if dropped:
             log(f"  [{spec.op}] target-affinity preference: dropped "
@@ -1007,10 +1039,13 @@ def generate_one_llm(
             )
 
             # --- curated probe (subset: only algorithms that have a file) ---
-            curated_path = (
-                os.path.join(global_curated_dir, backend.name, filename)
-                if global_curated_dir else None
-            )
+            curated_path = None
+            for n in names if global_curated_dir else ():
+                p = os.path.join(global_curated_dir, n,
+                                 f"{n}_{spec.op}_{algorithm.name}.c")
+                if os.path.exists(p):
+                    curated_path = p
+                    break
             if curated_path and os.path.exists(curated_path):
                 curated = open(curated_path).read()
                 # If the curated header declares a stricter class than the
@@ -1537,7 +1572,9 @@ def generate(
                 # records that it is not table-guided (kernel_picks.json), and
                 # nothing else about it changes: the kernel is still verified,
                 # and smt.vmadot still only executes on cluster 0.
-                if source_label.startswith("curated[ime"):
+                # K1 only: the table holds K1 IME-vs-RVV measurements, which say
+                # nothing about the A100's engine (curated[ime2]).
+                if source_label == "curated[ime]":
                     try:
                         shapes = collect_shapes(ir, spec.op, spec)
                         win, why = ime_cost.ime_useful(spec.op, shapes)

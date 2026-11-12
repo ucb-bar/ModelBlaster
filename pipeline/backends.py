@@ -77,6 +77,10 @@ class Backend:
     # build_and_run.
     atol_override: float | None = None
     rtol_override: float | None = None
+    # BACKEND=llm normally looks only in kernels/<name>/ before calling the
+    # LLM. True: also look in the curated_aliases folders (as BACKEND=reference
+    # does), so an existing, verified kernel is reused instead of regenerated.
+    llm_reuses_curated: bool = False
 
     def resolved_kernel_cflags(self, repo_root: str) -> tuple[str, ...]:
         """kernel_cflags with `<repo_root>` and `<gemmini_config>`
@@ -316,6 +320,72 @@ IME = Backend(
 )
 
 
+# SpaceMiT K3 X100 matrix engine: the same smt.vmadot encoding and 4x8x4 tile as
+# the K1 (ime_x60), and on all eight X100 cores (cpus 0-7). A K3-only backend so
+# the K3's X100 kernels can be tuned for speed without changing the K1 build
+# (Director, 2026-10-29): kernels/ime_x100/ holds ours (the 2x4-blocked fused
+# conv and linear first); every other op falls back to the K1 matrix kernels in
+# kernels/ime/ and then the RVV set, exactly as ime_x60. Kernels found in the
+# backend's own folder are not gated by the K1 IME-vs-RVV table (ime_cost),
+# which holds K1 measurements; the per-layer choice is XPU-RT's, from K3 profiles.
+IME_X100 = Backend(
+    name="ime_x100",
+    description=(
+        "SpaceMiT K3 X100 int8 matrix engine (smt.vmadot, 4x8x4 tile, VLEN=256): "
+        "the K1-compatible engine with K3-tuned kernels. X100 cores (cpus 0-7) only."
+    ),
+    kernel_cflags=IME.kernel_cflags,
+    kernel_includes=IME.kernel_includes,
+    prj_conf_overlay=IME.prj_conf_overlay,
+    spike_args=IME.spike_args,
+    optimization_guide=IME.optimization_guide,
+    curated_aliases=("ime", "rvv"),
+    verify_method=VERIFY_CROSS_COMPILE,
+)
+
+# SpaceMiT K3 A100 matrix engine (SpacemiT's "IME2"). Same smt.vmadot encoding
+# as the K1, but the A100 tile is FIXED at M x K x N = 8 x 16 x 8 int8 (1024
+# multiply-adds per instruction) and the instruction reads whole 128-byte
+# registers whatever vl is (SpacemiT docs-ai ime_extension.md 2.1.2, 5.1.3).
+# So the K1 kernels in kernels/ime/ must NOT be used here: on an A100 core they
+# run without trapping and return wrong answers (measured 2026-10-19, ffn_block
+# max_abs_err 48). Hence its own kernel directory, kernels/ime2_a100/, and no "ime"
+# alias.
+#
+# A100 cores only (cpus 8-15, thread labelled an AI task: the harness does it
+# for MB_CORES/cpu >= 8). Every ime2 kernel checks vlenb == 128 and aborts on
+# an X100 core rather than compute a wrong answer. Every other op falls
+# through to the RVV curated set, which is VLEN-agnostic and verified on the
+# A100 (ffn_block rvv_x60 on cpu 8, max_abs_err 0); the same -march as rvv_x60
+# keeps those kernels byte-identical to what was verified.
+IME2_A100 = Backend(
+    name="ime2_a100",
+    description=(
+        "SpaceMiT K3 A100 int8 matrix engine (smt.vmadot, fixed 8x16x8 tile, "
+        "VLEN=1024) layered on rv64gcv. A100 cores (cpus 8-15) only."
+    ),
+    kernel_cflags=(
+        "-march=rv64gcv_zvl256b_zfh_zvfh",
+        "-mabi=lp64d",
+        "-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1",
+        "-I<repo_root>/kernels/rvv",
+    ),
+    kernel_includes=("<riscv_vector.h>", '"mb_rvv_vxrm_compat.h"'),
+    prj_conf_overlay="rvv.conf",
+    spike_args=("--isa=rv64gcv_zicntr",),
+    optimization_guide="optimization_guide_ime2_a100.md",
+    # A100 matrix kernels live in kernels/ime2_a100/, the backend's own
+    # folder, which both BACKEND=reference and BACKEND=llm search first;
+    # "rvv" covers everything else (reference mode only). The lineage also
+    # makes conv weights IHWOC, matching the -D above.
+    curated_aliases=("rvv",),
+    verify_method=VERIFY_CROSS_COMPILE,
+    # LLM runs write only ops with no kernel anywhere (e.g. new A100 matrix
+    # ops); gelu/layernorm/add keep their board-verified RVV kernels.
+    llm_reuses_curated=True,
+)
+
+
 RVV_OPU = Backend(
     name="rvv_opu",
     description=(
@@ -505,6 +575,8 @@ BACKENDS: dict[str, Backend] = {
     RVV_F16.name: RVV_F16,
     RVV_OPU.name: RVV_OPU,
     IME.name: IME,
+    IME_X100.name: IME_X100,
+    IME2_A100.name: IME2_A100,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,
 }

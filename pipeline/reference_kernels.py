@@ -1575,6 +1575,26 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
             ),
         ),
         AlgorithmCandidate(
+            name="ime2_vmadot_8x8x16",
+            target_affinity=("ime2_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 int8 LINEAR via smt.vmadot. Same structure "
+                "as ime_vmadot_4x4x8, with the A100's FIXED tile: A = 8 rows x "
+                "16 int8 (one 128-byte register), B = 8 output columns x 16 "
+                "(rows n of weight[N][K], no transpose), C = 8x8 int32 "
+                "row-major across (vd, vd+1). Load whole registers "
+                "(vsetvli zero, e8, m1); vl does not change the tile. Pack the "
+                "input once, each 8-column weight strip once, zero-pad M/N to "
+                "8 and K to 16. Check vlenb == 128 and refuse otherwise: on an "
+                "X100 the same encoding is the 4x8x4 tile.\n"
+                "MUST be bit-exact to the linear_s8 reference."
+            ),
+            reference_impl=(
+                "/* curated: kernels/ime2_a100/ime2_a100_linear_s8_ime2_vmadot_8x8x16.c */\n"
+            ),
+        ),
+        AlgorithmCandidate(
             name="gemmini_tiled_matmul",
             target_affinity=("gemmini", "gemmini_q31"),
             # Bit-exact accumulator (gemmini's 32-bit acc with full_C
@@ -2046,6 +2066,79 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "Verify+bench: scripts/ime_conv_verify_bench.py."
             ),
             reference_impl="",  # curated: kernels/ime/ime_conv2d_s8_ime_vmadot_4x4x8.c
+        ),
+        AlgorithmCandidate(
+            name="ime2_vmadot_8x8x16",
+            target_affinity=("ime2_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            # This target stores conv weights IHWOC (-DMODELBLASTER_RVV_IHWOC_WEIGHTS).
+            weight_layout="ihwoc",
+            description=(
+                "SpaceMiT K3 A100 int8 CONV2D via im2col -> smt.vmadot GEMM, "
+                "the K1 ime_vmadot_4x4x8 lowering with the A100 tile. The "
+                "target guide gives the instruction, the fixed 8 x 16 x 8 "
+                "tile, the register rules, the vlenb check and a complete "
+                "linear_s8 example.\n\n"
+                "A = the im2col matrix [M = OH*OW, K = IC*KH*KW] of one image "
+                "n, built on the fly into 8 x 16 A tiles: packed row i is "
+                "output pixel m = oh*OW + ow, packed column q is filter tap "
+                "k = (ic*KH + kh)*KW + kw; read "
+                "input[((n*IC + ic)*IH + ih)*IW + iw] with ih = oh*SH - PH + "
+                "kh, iw = ow*SW - PW + kw, and write 0 when (ih, iw) is out "
+                "of bounds, m >= OH*OW or k >= K.\n\n"
+                "B = the weights. On this target they arrive IHWOC, "
+                "weight[k*OC + oc] (not the OIHW the semantics describe), so "
+                "B[j][q] for channel oc = n0 + j is weight[(k0 + q)*OC + oc]: "
+                "a gather with stride OC into each 128-byte B tile, i.e. the "
+                "matmul transpose_b == 0 case with N = OC. Pack each 8-channel "
+                "panel once.\n\n"
+                "OUTPUT IS NCHW: result C[i][j] (pixel m, channel oc) goes to "
+                "output[((n*OC + oc)*OH + oh)*OW + ow], not row-major "
+                "[m][oc].\n\n"
+                "SYMMETRIC ONLY on the engine: input_offset == filter_offset "
+                "== 0 (true for every conv in dronet and yolov8_nano). If "
+                "either offset is nonzero, compute that call with the "
+                "reference's scalar loop instead: padding makes the offset "
+                "correction differ per pixel.\n\n"
+                "TAIL: the reference's integer Q0.31 path, exactly: acc = "
+                "tile + bias[oc] (if bias), then ((int64)acc * "
+                "output_multiplier + (1<<30)) >> 31, rounding right shift for "
+                "output_shift > 0, left shift for < 0, + output_offset, "
+                "clamp.\n\n"
+                "MUST be bit-exact to the conv2d_s8 reference."
+            ),
+            reference_impl=r"""
+/* Fragments: what differs from the target guide's linear_s8 example. The
+ * vlenb check and the vmadot K-loop asm are the same. One image n;
+ * OH = (IH + 2*PH - KH)/SH + 1, OW likewise, M = OH*OW, K = IC*KH*KW. */
+
+/* A tile (row tile mt, slab ks): im2col on the fly, zero outside. */
+for (int i = 0; i < 8; i++) {
+    int m = mt * 8 + i, oh = m / OW, ow = m % OW;
+    for (int q = 0; q < 16; q++) {
+        int k = ks * 16 + q;
+        int8_t v = 0;
+        if (m < OH * OW && k < K) {
+            int ic = k / (KH * KW), kh = (k / KW) % KH, kw = k % KW;
+            int ih = oh * SH - PH + kh, iw = ow * SW - PW + kw;
+            if (ih >= 0 && ih < IH && iw >= 0 && iw < IW)
+                v = input[(((size_t)n * IC + ic) * IH + ih) * IW + iw];
+        }
+        a_tile[i * 16 + q] = v;
+    }
+}
+
+/* B tile (channels n0..n0+7, slab ks): IHWOC weights, stride OC. */
+for (int j = 0; j < 8; j++) {
+    for (int q = 0; q < 16; q++) {
+        int k = ks * 16 + q, oc = n0 + j;
+        b_tile[j * 16 + q] = (oc < OC && k < K) ? weight[(size_t)k * OC + oc] : 0;
+    }
+}
+
+/* Write-back: C[i][j] is pixel m = mt*8 + i, channel oc = n0 + j; NCHW. */
+output[(((size_t)n * OC + oc) * OH + oh) * OW + ow] = (int8_t)scaled;
+""",
         ),
         AlgorithmCandidate(
             name="indir_gemm",
@@ -7157,6 +7250,85 @@ void kernel_conv2d_batchnorm2d_silu_s8(
             reference_impl="(use the curated kernel in kernels/ime/)",
             accuracy_class=AccuracyClass.BIT_EXACT,
         ),
+        AlgorithmCandidate(
+            name="ime2_vmadot_8x8x16",
+            target_affinity=("ime2_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            # This target stores conv weights IHWOC (-DMODELBLASTER_RVV_IHWOC_WEIGHTS).
+            weight_layout="ihwoc",
+            description=(
+                "SpaceMiT K3 A100 fused CONV2D + BATCHNORM + SILU via im2col "
+                "-> smt.vmadot GEMM. The MAC core is exactly conv2d_s8's "
+                "ime2_vmadot_8x8x16 (see the target guide for the "
+                "instruction, the fixed 8 x 16 x 8 tile, the register rules, "
+                "the vlenb check and a complete linear_s8 example); only the "
+                "per-output tail differs.\n\n"
+                "A = the im2col matrix [M = OH*OW, K = IC*KH*KW] of one image "
+                "n, built on the fly into 8 x 16 A tiles: packed row i is "
+                "output pixel m = oh*OW + ow, packed column q is filter tap "
+                "k = (ic*KH + kh)*KW + kw; read "
+                "input[((n*IC + ic)*IH + ih)*IW + iw] with ih = oh*SH - PH + "
+                "kh, iw = ow*SW - PW + kw, and write 0 when (ih, iw) is out "
+                "of bounds, m >= OH*OW or k >= K.\n\n"
+                "B = the weights, IHWOC on this target: weight[k*OC + oc] "
+                "(including in any scalar fallback). B[j][q] for channel oc = "
+                "n0 + j is weight[(k0 + q)*OC + oc], a gather with stride OC. "
+                "Pack each 8-channel panel once.\n\n"
+                "SYMMETRIC ONLY on the engine: input_offset == filter_offset "
+                "== 0 (true for every yolov8_nano conv). If either is nonzero, "
+                "compute that call with the reference's scalar loop.\n\n"
+                "TAIL, per output (pixel m, channel oc), all scalar and "
+                "TEXTUALLY the reference's, in this order: (1) conv: acc = "
+                "tile + bias[oc] (if bias), Q0.31 multiply by "
+                "conv_output_multiplier, rounding shift by conv_output_shift, "
+                "+ conv_output_offset, clamp to conv_activation_min/max, cast "
+                "to int8; (2) batchnorm: float fv = (float)conv_int8 * "
+                "bn_scale_in; float y = bn_scale[oc] * fv + bn_bias[oc]; "
+                "roundf(y / bn_scale_out), clamp, int8; (3) silu: float fbv = "
+                "(float)bn_int8 * silu_scale_in; float sy = fbv / (1.0f + "
+                "expf(-fbv)); roundf(sy / silu_scale_out), clamp; store to "
+                "output[((n*OC + oc)*OH + oh)*OW + ow] (NCHW). roundf rounds "
+                "halves away from zero and expf must be the libm call: no "
+                "vector float, no approximations, no reordering. (Both float "
+                "stages map int8 to int8, so a per-channel 256-entry table of "
+                "exactly these expressions is also bit-exact; optional.)\n\n"
+                "MUST be bit-exact to the conv2d_batchnorm2d_silu_s8 "
+                "reference."
+            ),
+            reference_impl=r"""
+/* Fragments. The A tiles, B tiles and vmadot K-loop are exactly those of
+ * conv2d_s8's ime2_vmadot_8x8x16 (im2col A, IHWOC B with stride OC).
+ * What is new is the tail, per valid result (pixel m, channel oc): */
+int32_t acc = tile[i * 8 + j];
+if (bias) acc += bias[oc];
+int64_t prod = (int64_t)acc * (int64_t)conv_output_multiplier;
+prod = (prod + (1LL << 30)) >> 31;
+int32_t scaled = (int32_t)prod;
+if (conv_output_shift > 0)
+    scaled = (int32_t)(((int64_t)scaled + ((int64_t)1 << (conv_output_shift - 1)))
+                       >> conv_output_shift);
+else if (conv_output_shift < 0)
+    scaled = scaled << (-conv_output_shift);
+scaled += conv_output_offset;
+if (scaled < conv_activation_min) scaled = conv_activation_min;
+if (scaled > conv_activation_max) scaled = conv_activation_max;
+int8_t conv_int8 = (int8_t)scaled;
+
+float fv = (float)conv_int8 * bn_scale_in;                 /* batchnorm */
+float y = bn_scale[oc] * fv + bn_bias[oc];
+int32_t bv = (int32_t)roundf(y / bn_scale_out);
+if (bv < bn_activation_min) bv = bn_activation_min;
+if (bv > bn_activation_max) bv = bn_activation_max;
+int8_t bn_int8 = (int8_t)bv;
+
+float fbv = (float)bn_int8 * silu_scale_in;                /* silu */
+float sy = fbv / (1.0f + expf(-fbv));
+int32_t v = (int32_t)roundf(sy / silu_scale_out);
+if (v < silu_activation_min) v = silu_activation_min;
+if (v > silu_activation_max) v = silu_activation_max;
+output[(((size_t)n * OC + oc) * OH + oh) * OW + ow] = (int8_t)v;
+""",
+        ),
     ],
 )
 
@@ -8231,6 +8403,61 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
                 "        : \"t0\", \"memory\", \"v0\", \"v4\", \"v8\", \"v9\");\n"
                 "}\n"
             ),
+        ),
+        AlgorithmCandidate(
+            name="ime2_vmadot_8x8x16",
+            target_affinity=("ime2_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 int8 MATMUL via smt.vmadot. The target "
+                "guide gives the instruction, the fixed 8 x 16 x 8 tile, the "
+                "register rules, the vlenb check and a complete linear_s8 "
+                "example; this kernel has the same structure. What differs:\n\n"
+                "B LAYOUT. transpose_b != 0: b is [N][K], so output column j "
+                "is the contiguous row b[j*K ..], already B's [j][k] layout "
+                "(as linear's weight). transpose_b == 0: b is [K][N], so "
+                "B[j][q] = b[(k0+q)*N + n0+j]: gather/transpose each tile into "
+                "a 128-byte scratch tile. Feeding a [k][j] tile computes the "
+                "wrong product, silently.\n\n"
+                "PACK ONCE: all of A up front, loop 8-column B panels "
+                "outermost, pack each panel once and reuse it for every row "
+                "tile. Zero-pad M and N to 8 and K to 16.\n\n"
+                "NO OFFSETS: matmul_s8 has no zero points; the raw int32 dot "
+                "product is acc.\n\n"
+                "THE TAIL IS FLOAT: keep it scalar and textually the "
+                "reference's. Compute float total = (scale_a * scale_b) / "
+                "(scale_out * scale_div); once, then per output "
+                "(int32_t)roundf((float)acc * total) and clamp. roundf rounds "
+                "halves away from zero; RVV float-to-int conversion rounds "
+                "them to even, so a vector tail is not bit-exact. Do not "
+                "reorder the float expression.\n\n"
+                "MUST be bit-exact to the matmul_s8 reference."
+            ),
+            reference_impl=r"""
+/* Fragments: what differs from the target guide's linear_s8 example. The
+ * vlenb check, packing A and the vmadot K-loop asm are the same. */
+
+/* B panel for output columns n0..n0+7, slab ks; zero outside N x K. */
+for (int j = 0; j < 8; j++) {
+    int col = n0 + j;
+    for (int q = 0; q < 16; q++) {
+        int k = ks * 16 + q;
+        int8_t v = 0;
+        if (col < N && k < K)
+            v = transpose_b ? b[(size_t)col * K + k]     /* [N][K]: a row    */
+                            : b[(size_t)k * N + col];    /* [K][N]: a gather */
+        packed_b[(size_t)ks * 128 + j * 16 + q] = v;
+    }
+}
+
+/* Tail: float, scalar, textually the reference's. */
+float total = (scale_a * scale_b) / (scale_out * scale_div);   /* once */
+/* ... per valid output (m0+i, n0+j) of the 8x8 result tile: */
+int32_t v = (int32_t)roundf((float)tile[i * 8 + j] * total);
+if (v < activation_min) v = activation_min;
+if (v > activation_max) v = activation_max;
+output[(size_t)(m0 + i) * N + (n0 + j)] = (int8_t)v;
+""",
         ),
         AlgorithmCandidate(
             name="rvv_k_reduce_n_lanes",

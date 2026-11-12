@@ -59,6 +59,10 @@ class Core:
     capabilities: tuple[str, ...]
     isa: str = ""
     description: str = ""
+    # Kernel implementations legal on this core (e.g. K3 x100: rvv, ime;
+    # a100: rvv, ime2). Empty = not declared, nothing is checked (every K1
+    # registry). Read by the ingest legality check.
+    impls: tuple[str, ...] = ()
 
 
 @dataclass
@@ -96,6 +100,14 @@ class CoreRegistry:
             return tuple(c for c in self.by_kind[hardware_target]
                          if op in c.capabilities)
         return ()
+
+
+def _impls(path: str, entry: dict) -> tuple[str, ...]:
+    raw = entry.get("impls", [])
+    if not isinstance(raw, list) or not all(isinstance(i, str) and i for i in raw):
+        raise ValueError(f"{path}: core {entry['name']!r}: 'impls' must be a list of "
+                         f"implementation names, got {raw!r}")
+    return tuple(raw)
 
 
 def load(path: str) -> CoreRegistry:
@@ -143,6 +155,7 @@ def load(path: str) -> CoreRegistry:
             capabilities=tuple(caps),
             isa=entry.get("isa", ""),
             description=entry.get("description", ""),
+            impls=_impls(path, entry),
         ))
 
     by_name = {c.name: c for c in cores}

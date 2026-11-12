@@ -1,0 +1,285 @@
+{
+  "system": "spacemit-k3",
+  "description": "SpacemiT K3: 8 X100 cores (cpus 0-7, VLEN 256) and 8 A100 AI cores (cpus 8-15, VLEN 1024). Facts measured on our board; see k3-work/experiments/k3-measurements.md.",
+  "default_dispatch_target": "any",
+  "notes": {
+    "kinds": "kind 'x100' = cpus 0-7, kind 'a100' = cpus 8-15. Ingest maps XPU-RT's CPU_P to x100 and CPU_E to a100 (--cpu-p-kind x100 --cpu-e-kind a100).",
+    "ime": "smt.vmadot runs on ALL 8 X100 cores (K1 kernels bit-exact on cpus 0-7, 2026-10-19; unlike the K1, where only 0-3 have it) with the 4x8x4 tile, and on the A100 cores with the 8x16x8 tile. The same encoding means different tiles: K1 (ime_x60) kernels on an A100 return wrong answers (max_abs_err=48); ime2_a100 kernels trap on an X100 (vlenb check).",
+    "impls": "Per-core 'impls' lists the kernel families that are legal on that kind: x100 rvv + ime (ime_x60), a100 rvv + ime2 (ime2_a100). Read by the ingest legality check.",
+    "ai_label": "Pinning a thread to cpus 8-15 fails (EINVAL) until it writes its tid to /proc/set_ai_thread; after that its allowed set is 8-15 and new threads inherit the permission. Never label a thread that must run on an X100.",
+    "tensor_pairs": "cpus 8 and 9 each ran at 0.89 of solo speed when both used the matrix unit (one shared tensor unit per pair, as the K3 paper says); other pairs are untested.",
+    "clock": "rdtime runs at 24 MHz on both kinds; X100 2.2 GHz, A100 1.8 GHz."
+  },
+  "cores": [
+    {
+      "name": "x100_core0",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        0
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities": [
+        "linear",
+        "conv2d",
+        "linear_s8",
+        "conv2d_s8",
+        "matmul_s8",
+        "relu",
+        "leaky_relu_s8",
+        "elu",
+        "add",
+        "add_s8",
+        "mul",
+        "maxpool2d",
+        "maxpool2d_s8",
+        "avgpool2d_s8",
+        "batchnorm2d",
+        "sigmoid",
+        "silu",
+        "gelu_s8",
+        "softmax_s8",
+        "layernorm_s8",
+        "rmsnorm_s8",
+        "lstm_s8",
+        "sin_s8",
+        "cos_s8",
+        "cat",
+        "upsample_nearest_s8",
+        "ime_matmul_s8",
+        "ime_linear_s8"
+      ],
+      "description": "X100 core: RVV 1.0 at VLEN 256 and the K1-compatible smt.vmadot 4x8x4 tile (ime_x60 kernels)."
+    },
+    {
+      "name": "x100_core1",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        1
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core2",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        2
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core3",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        3
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core4",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        4
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core5",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        5
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core6",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        6
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "x100_core7",
+      "kind": "x100",
+      "isa": "rv64gcv_zvl256b_xsmtvdot",
+      "harts": [
+        7
+      ],
+      "impls": [
+        "rvv",
+        "ime"
+      ],
+      "capabilities_ref": "x100_core0"
+    },
+    {
+      "name": "a100_core8",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        8
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities": [
+        "linear",
+        "conv2d",
+        "linear_s8",
+        "conv2d_s8",
+        "matmul_s8",
+        "relu",
+        "leaky_relu_s8",
+        "elu",
+        "add",
+        "add_s8",
+        "mul",
+        "maxpool2d",
+        "maxpool2d_s8",
+        "avgpool2d_s8",
+        "batchnorm2d",
+        "sigmoid",
+        "silu",
+        "gelu_s8",
+        "softmax_s8",
+        "layernorm_s8",
+        "rmsnorm_s8",
+        "lstm_s8",
+        "sin_s8",
+        "cos_s8",
+        "cat",
+        "upsample_nearest_s8",
+        "ime2_matmul_s8",
+        "ime2_linear_s8",
+        "ime2_conv2d_s8",
+        "ime2_conv2d_batchnorm2d_silu_s8"
+      ],
+      "description": "A100 AI core: RVV 1.0 at VLEN 1024 and smt.vmadot with the fixed 8x16x8 tile (ime2_a100 kernels). A thread must write its tid to /proc/set_ai_thread before it can be pinned here."
+    },
+    {
+      "name": "a100_core9",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        9
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core10",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        10
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core11",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        11
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core12",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        12
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core13",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        13
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core14",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        14
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities_ref": "a100_core8"
+    },
+    {
+      "name": "a100_core15",
+      "kind": "a100",
+      "isa": "rv64gcv_zvl1024b_xsmtvdot",
+      "harts": [
+        15
+      ],
+      "impls": [
+        "rvv",
+        "ime2"
+      ],
+      "capabilities_ref": "a100_core8"
+    }
+  ]
+}

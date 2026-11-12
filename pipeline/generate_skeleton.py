@@ -1418,6 +1418,107 @@ def _oc_tile_operands(
     return w, b, [f"({nm} + {oc0})" for nm in per_oc]
 
 
+# ---------------------------------------------------------------------------
+# ime2_a100: weights packed at build time in the A100 matrix tile order
+# ---------------------------------------------------------------------------
+# The ime2_a100 linear, conv and fused-conv kernels used to repack their weights
+# into 8x16 matrix tiles on every call. For these ops an ime2_a100 build now
+# emits the weights already in that order, behind a 64-byte header the kernel
+# checks ("MBIME2TW", rows, K); see MB_IME2_TW in the kernels. Weights of every
+# other op, and of split/sharded/shared ops, keep the backend's usual layout, and
+# the kernels still accept plain weights (no header) as before.
+
+#: op -> tile family. Linear tiles are [ceil(N/32)][k_slabs][4][8][16]; conv
+#: tiles are [ceil(OC/8)][k_slabs][8][16] with k = (ic*KH + kh)*KW + kw.
+_IME2_TILE_OPS = {"linear_s8": "linear", "conv2d_s8": "conv",
+                  "conv2d_batchnorm2d_silu_s8": "conv"}
+_IME2_TILE_MAGIC = b"MBIME2TW"
+#: Header size = the tiles' alignment: magic, rows, K (uint32 LE), then zeros.
+_IME2_TILE_HEADER = 64
+#: Written next to weights.c; generate_kernels refuses a kernel that cannot read it.
+WEIGHT_LAYOUTS_JSON = "weight_layouts.json"
+
+
+def _ime2_kernel_reads_tiles(op_type: str) -> bool:
+    """Does the installed ime2_a100 kernel for `op_type` look for the tile header?"""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "kernels", "ime2_a100", f"ime2_a100_{op_type}_ime2_vmadot_8x8x16.c")
+    try:
+        with open(path) as f:
+            return _IME2_TILE_MAGIC.decode() in f.read()
+    except OSError:
+        return False
+
+
+def ime2_tile_plan(ir: Optional[dict[str, Any]], backend: Optional[str],
+                   exclude_ids: frozenset = frozenset()) -> dict[str, tuple[str, str, int, int]]:
+    """`{weight: (op, family, rows, K)}` for the weights an ime2_a100 build tiles.
+
+    Only unsplit, unsharded ops whose weight has a single reader, whose installed
+    kernel reads tiles, and which the kernel does not route to its scalar paths
+    (a linear with M*N <= 16; asymmetric quantization, nonzero input or filter
+    offset; any weight under 16 bytes, which the kernel never checks for a
+    header). On those paths a tiled weight would be unpacked on every call.
+    Never a batch-1 linear (M == 1): a multi-core pool splits those by columns,
+    handing the kernel `w + n0*K`, which is not a tiled weight.
+    MODELBLASTER_IME2_TILES=0 turns tiling off (plain weights, packed per call).
+    """
+    if backend != "ime2_a100" or ir is None or os.environ.get("MODELBLASTER_IME2_TILES", "1") == "0":
+        return {}
+    ops = ir.get("ops", [])
+    readers: dict[str, int] = {}
+    for op in ops:
+        for w in {op.get("weight"), _conv_weight_of(op)} - {None}:
+            readers[w] = readers.get(w, 0) + 1
+    plan: dict[str, tuple[str, str, int, int]] = {}
+    for op in ops:
+        fam = _IME2_TILE_OPS.get(op.get("op"))
+        if fam is None or op.get("split_from") or op.get("dispatch_id") in exclude_ids:
+            continue
+        quant = op.get("quant") or next(
+            (sub.get("quant") or {} for sub in (op.get("sub_ops") or ())
+             if sub.get("op", "").startswith("conv2d")), {})
+        if int(quant.get("input_offset", 0)) or int(quant.get("filter_offset", 0)):
+            continue
+        if fam == "linear":
+            w, sh = op.get("weight"), op.get("shape", {})
+            rows, k = int(sh.get("N", 0)), int(sh.get("K", 0))
+            if int(sh.get("M", 0)) <= 1 or int(sh.get("M", 0)) * rows <= 16:
+                continue
+        else:
+            w = _conv_weight_of(op)
+            sh = op.get("shape") or next(
+                (sub.get("shape", {}) for sub in (op.get("sub_ops") or ())
+                 if sub.get("op", "").startswith("conv2d")), {})
+            rows = int(sh.get("OC", 0))
+            k = int(sh.get("IC", 0)) * int(sh.get("KH", 0)) * int(sh.get("KW", 0))
+        if not w or readers.get(w) != 1 or rows * k < 16:
+            continue
+        if not _ime2_kernel_reads_tiles(op["op"]):
+            continue
+        plan[w] = (op["op"], fam, rows, k)
+    return plan
+
+
+def ime2_tile_pack(arr: np.ndarray, fam: str, rows: int, k: int) -> np.ndarray:
+    """`arr` (linear [N][K], conv OIHW) in A100 tile order behind the 64-byte header."""
+    w = np.asarray(arr, dtype=np.int8).reshape(rows, k)
+    ks = (k + 15) // 16
+    if fam == "linear":
+        groups = (rows + 31) // 32
+        pad = np.zeros((groups * 32, ks * 16), np.int8)
+        pad[:rows, :k] = w
+        tiles = pad.reshape(groups, 4, 8, ks, 16).transpose(0, 3, 1, 2, 4)
+    else:
+        otiles = (rows + 7) // 8
+        pad = np.zeros((otiles * 8, ks * 16), np.int8)
+        pad[:rows, :k] = w
+        tiles = pad.reshape(otiles, 8, ks, 16).transpose(0, 2, 1, 3)
+    header = np.frombuffer(_IME2_TILE_MAGIC + np.array([rows, k], "<u4").tobytes()
+                           + bytes(_IME2_TILE_HEADER - 16), np.int8)
+    return np.concatenate([header, np.ascontiguousarray(tiles).reshape(-1)])
+
+
 def emit_weights(
     model_name: str,
     weights: dict[str, np.ndarray],
@@ -1431,9 +1532,11 @@ def emit_weights(
     # there are no tiles to plan for.
     tile_extra: dict[str, np.ndarray] = {}
     tile_drop: set[str] = set()
+    shard_ids: frozenset = frozenset()
     if ir is not None:
         plan = split_conv_tile_weights(ir, backend)
         shard_plan = shard_conv_weights(ir, backend, shard_factor())
+        shard_ids = frozenset(shard_plan)
         if plan:
             tile_extra, tile_drop = _apply_tile_weight_plan(weights, plan)
         if shard_plan:
@@ -1473,13 +1576,32 @@ def emit_weights(
         weights = {**{k: v for k, v in weights.items() if k not in tile_drop},
                    **tile_extra}
     keys = sorted(weights.keys())
+    # ime2_a100: some weights go out in the A100 tile order (see ime2_tile_plan).
+    tw_plan = ime2_tile_plan(ir, backend, shard_ids)
+    packed: dict[str, tuple[np.ndarray, Optional[str]]] = {}
+    for k in keys:
+        if k in tw_plan:
+            _op, fam, rows, kk = tw_plan[k]
+            packed[k] = (ime2_tile_pack(weights[k], fam, rows, kk),
+                         f"A100 {fam} tiles, rows={rows} K={kk}, 64-byte MBIME2TW header")
+        else:
+            packed[k] = _backend_pack_weight(weights[k], backend)
+    layouts_path = os.path.join(out_dir, WEIGHT_LAYOUTS_JSON)
+    if tw_plan:
+        with open(layouts_path, "w") as f:
+            json.dump({"ime2_tile": {
+                "ops": sorted({v[0] for v in tw_plan.values()}),
+                "weights": {w: {"op": v[0], "family": v[1], "rows": v[2], "K": v[3]}
+                            for w, v in sorted(tw_plan.items())}}}, f, indent=1)
+    elif os.path.exists(layouts_path):
+        os.remove(layouts_path)   # a stale manifest would fail the kernel check
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
                "", "#ifdef __cplusplus", 'extern "C" {', "#endif", ""]
     for k in keys:
         ident = _weight_name(model_name, k, backend)
-        c_type, _ = _np_to_c_dtype(weights[k].dtype)
-        size = weights[k].size
+        c_type, _ = _np_to_c_dtype(packed[k][0].dtype)
+        size = packed[k][0].size
         h_lines.append(f"extern const {c_type} {ident}[{size}];")
     h_lines += ["", "#ifdef __cplusplus", "}", "#endif", ""]
     with open(os.path.join(out_dir, "weights.h"), "w") as f:
@@ -1492,14 +1614,20 @@ def emit_weights(
     for k in keys:
         ident = _weight_name(model_name, k, backend)
         arr_in = weights[k]
-        arr_out, layout_tag = _backend_pack_weight(arr_in, backend)
+        arr_out, layout_tag = packed[k]
         c_type, _ = _np_to_c_dtype(arr_out.dtype)
-        if layout_tag:
+        if k in tw_plan:
+            c_lines.append(f"/* {ident}: shape {tuple(arr_in.shape)} → {layout_tag} */")
+        elif layout_tag:
             c_lines.append(
                 f"/* {ident}: shape {tuple(arr_in.shape)} OIHW → "
                 f"{tuple(arr_out.shape)} {layout_tag} */"
             )
-        c_lines.append(f"const {c_type} {ident}[{arr_out.size}] = {{")
+        # Tiled weights are loaded in place, tile by tile: keep the tiles on a
+        # cache line (array 64-aligned, 64-byte header). 8-byte-aligned tiles
+        # made the A100 linear 2.2x slower (TASK-008).
+        align = f"__attribute__((aligned({_IME2_TILE_HEADER}))) " if k in tw_plan else ""
+        c_lines.append(f"{align}const {c_type} {ident}[{arr_out.size}] = {{")
         if arr_out.dtype in (np.float32, np.float16):
             # fp16 weights: widen to fp32 for the literal text (lossless),
             # implicit narrow happens at compile time when initializing the
