@@ -27,6 +27,8 @@
 
 #include "modelblaster_pool.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -37,8 +39,12 @@
 /* Hosted riscv64 (SpaceMiT K1). The pool is already pthreads-based; this
  * supplies only k_sem and the tick counter. See runtime/mb_posix_compat.h. */
 #include "mb_posix_compat.h"
+#include "mb_ai_task.h"
 #else
 #include <zephyr/kernel.h>
+#endif
+#ifndef MB_THREAD_MOVER
+#define MB_THREAD_MOVER   /* Zephyr: a worker never changes core kind */
 #endif
 
 /* Hard cap so we can size the embedded sem arrays without dynamic
@@ -83,6 +89,8 @@ struct modelblaster_pool_state {
 struct modelblaster_pool_worker_arg {
 	struct modelblaster_pool_state *pool;
 	int wid;
+	int hart;      /* cpu this worker belongs on */
+	int self_pin;  /* A100 core: label + pin from inside the thread */
 };
 
 /* Record one executed slice. Lock-free: reserve a slot, then fill it. Slots past the
@@ -107,11 +115,35 @@ static inline void mb_pool_trace_slice(struct modelblaster_pool_state *p, int wi
 	r->i0 = (unsigned long)i0; r->i1 = (unsigned long)i1;
 }
 
-static void *modelblaster_pool_worker_fn(void *arg_)
+/* MB_THREAD_MOVER: an A100 helper moves itself there below (mb_ai_task.h). */
+static MB_THREAD_MOVER void *modelblaster_pool_worker_fn(void *arg_)
 {
 	struct modelblaster_pool_worker_arg *wa = (struct modelblaster_pool_worker_arg *)arg_;
 	struct modelblaster_pool_state *p = wa->pool;
 	int wid = wa->wid;
+
+#if defined(MODELBLASTER_PLATFORM_LINUX)
+	if (wa->self_pin) {
+		/* A100 (AI) core: the thread has to be labelled an AI task before the
+		 * kernel will let it run there, and whether the label survives
+		 * pthread_create is not known, so each helper labels itself and
+		 * then pins itself. Nothing is served until this has succeeded: a
+		 * helper left on an X100 core would be measured as an A100 one. */
+		cpu_set_t cs;
+		CPU_ZERO(&cs);
+		CPU_SET(wa->hart, &cs);
+		if (mb_ai_task_label_self() != 0) {
+			fprintf(stderr, "modelblaster pool: worker %d cannot label itself an AI "
+					"task via %s: %s\n", wid, MB_AI_TASK_FILE, strerror(errno));
+			exit(4);
+		}
+		if (sched_setaffinity(0, sizeof(cs), &cs) != 0) {
+			fprintf(stderr, "modelblaster pool: worker %d cannot pin to cpu %d: %s\n",
+				wid, wa->hart, strerror(errno));
+			exit(4);
+		}
+	}
+#endif
 
 	for (;;) {
 		k_sem_take(&p->start[wid], K_FOREVER);
@@ -196,19 +228,30 @@ modelblaster_pool_t modelblaster_pool_create_on_harts(
 		}
 		wa->pool = p;
 		wa->wid = w;
+		wa->hart = harts[w];
+#if defined(MODELBLASTER_PLATFORM_LINUX)
+		wa->self_pin = mb_ai_task_wanted(harts[w]);
+#else
+		wa->self_pin = 0;
+#endif
 
 		if (pthread_attr_init(&p->attrs[w]) != 0) {
 			free(wa);
 			goto fail;
 		}
 #if defined(CONFIG_POSIX_THREADS_AFFINITY) || defined(MODELBLASTER_PLATFORM_LINUX)
-		cpu_set_t cs;
-		CPU_ZERO(&cs);
-		CPU_SET(harts[w], &cs);
-		if (pthread_attr_setaffinity_np(&p->attrs[w], sizeof(cs), &cs) != 0) {
-			pthread_attr_destroy(&p->attrs[w]);
-			free(wa);
-			goto fail;
+		/* An A100 helper cannot be pinned here: it is not yet labelled an AI
+		 * task, so the kernel would refuse. It labels and pins itself instead
+		 * (modelblaster_pool_worker_fn). */
+		if (!wa->self_pin) {
+			cpu_set_t cs;
+			CPU_ZERO(&cs);
+			CPU_SET(harts[w], &cs);
+			if (pthread_attr_setaffinity_np(&p->attrs[w], sizeof(cs), &cs) != 0) {
+				pthread_attr_destroy(&p->attrs[w]);
+				free(wa);
+				goto fail;
+			}
 		}
 #endif
 		if (pthread_create(&p->tids[w], &p->attrs[w],

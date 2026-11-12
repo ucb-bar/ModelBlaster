@@ -240,6 +240,12 @@ PROFILE_ARGS=()
 if [[ -n "${ITERS:-}" ]]; then
     PROFILE_ARGS+=(--iters "${ITERS}")
 fi
+# PROFILE_CPU labels the profile with the core type it was measured on
+# (default spacemit_x60, the K1). Set it for K3 runs so X100/A100 numbers are
+# never filed under the K1's name: PROFILE_CPU=spacemit_a100.
+if [[ -n "${PROFILE_CPU:-}" ]]; then
+    PROFILE_ARGS+=(--profile-cpu "${PROFILE_CPU}")
+fi
 if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
     PROFILE_ARGS+=(--profile-out-root "${PROFILE_OUT_ROOT}"
                    --profile-backend "${TARGET}")

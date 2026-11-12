@@ -29,6 +29,9 @@ KERNEL_CC ?= $(CC)
 CFLAGS    ?= -O2 -static
 KERNEL_CFLAGS ?=
 INCLUDES  := -I src -I $(MODEL_DIR)
+# mb_ai_task.h (K3 A100 thread labelling) lives in runtime/ and main.c includes it
+# in every build, pool or not.
+INCLUDES  += -I $(abspath $(dir $(lastword $(MAKEFILE_LIST))))/../runtime
 
 # POOL=1 builds the multi-core flavour: link modelblaster_pool and define
 # MODELBLASTER_USE_POOL, which is what makes the generated `parallel_<op>`

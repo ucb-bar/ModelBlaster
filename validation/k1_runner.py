@@ -138,6 +138,10 @@ def main() -> int:
     board_env = {}
     if args.iters and args.iters > 1:
         board_env["MODELBLASTER_ITERS"] = str(args.iters)
+    # Opt-in placement audit of multi-core runs (harness_linux MODELBLASTER_POOL_TRACE):
+    # forwarded only when set, so every existing run is unchanged.
+    if os.environ.get("MODELBLASTER_POOL_TRACE"):
+        board_env["MODELBLASTER_POOL_TRACE"] = os.environ["MODELBLASTER_POOL_TRACE"]
     out = deploy_and_run(args.host, args.elf, args.remote_root,
                          cpu=args.cpu, timeout=args.timeout,
                          env=board_env or None)
