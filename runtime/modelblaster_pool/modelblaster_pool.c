@@ -21,10 +21,6 @@
  * them in destroy).
  */
 
-#if defined(MODELBLASTER_PLATFORM_LINUX) && !defined(_GNU_SOURCE)
-#define _GNU_SOURCE 1
-#endif
-
 #include "modelblaster_pool.h"
 
 #include <pthread.h>
@@ -33,10 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(MODELBLASTER_PLATFORM_LINUX)
-/* Hosted riscv64 (SpaceMiT K1). The pool is already pthreads-based; this
- * supplies only k_sem and the tick counter. See runtime/mb_posix_compat.h. */
-#include "mb_posix_compat.h"
+#ifdef MB_PLATFORM_POSIX
+#include "mb_posix.h"   /* hosted Linux: k_sem -> sem_t, see runtime/mb_posix.h */
 #else
 #include <zephyr/kernel.h>
 #endif
@@ -114,8 +108,7 @@ static void *modelblaster_pool_worker_fn(void *arg_)
 	}
 }
 
-modelblaster_pool_t modelblaster_pool_create_on_harts(
-    int n_workers, const int *harts)
+modelblaster_pool_t modelblaster_pool_create(int n_workers)
 {
 	if (n_workers <= 0) {
 		/* Match pthreadpool_create(0) behavior: caller treats NULL
@@ -124,19 +117,6 @@ modelblaster_pool_t modelblaster_pool_create_on_harts(
 	}
 	if (n_workers > MODELBLASTER_POOL_MAX_WORKERS) {
 		return NULL;
-	}
-	if (harts == NULL) {
-		return NULL;
-	}
-	for (int i = 0; i < n_workers; i++) {
-		if (harts[i] < 0) {
-			return NULL;
-		}
-		for (int j = 0; j < i; j++) {
-			if (harts[i] == harts[j]) {
-				return NULL;
-			}
-		}
 	}
 
 	struct modelblaster_pool_state *p = calloc(1, sizeof(*p));
@@ -171,10 +151,10 @@ modelblaster_pool_t modelblaster_pool_create_on_harts(
 			free(wa);
 			goto fail;
 		}
-#if defined(CONFIG_POSIX_THREADS_AFFINITY) || defined(MODELBLASTER_PLATFORM_LINUX)
+#ifdef CONFIG_POSIX_THREADS_AFFINITY
 		cpu_set_t cs;
 		CPU_ZERO(&cs);
-		CPU_SET(harts[w], &cs);
+		CPU_SET(w, &cs);
 		if (pthread_attr_setaffinity_np(&p->attrs[w], sizeof(cs), &cs) != 0) {
 			pthread_attr_destroy(&p->attrs[w]);
 			free(wa);
@@ -206,18 +186,6 @@ fail:
 	}
 	free(p);
 	return NULL;
-}
-
-modelblaster_pool_t modelblaster_pool_create(int n_workers)
-{
-	int harts[MODELBLASTER_POOL_MAX_WORKERS];
-	if (n_workers > MODELBLASTER_POOL_MAX_WORKERS) {
-		return NULL;
-	}
-	for (int w = 0; w < n_workers; w++) {
-		harts[w] = w;
-	}
-	return modelblaster_pool_create_on_harts(n_workers, harts);
 }
 
 void modelblaster_pool_destroy(modelblaster_pool_t pool)
