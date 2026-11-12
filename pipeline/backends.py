@@ -224,6 +224,54 @@ RVV_K3 = Backend(
 )
 
 
+# SpaceMiT K3 A100 cores ONLY (CPUs 8-15, VLEN=1024). Same kernels as rvv_k3
+# (alias `rvv`), but built at zvl1024b. WHY a separate backend instead of the
+# zvl256b lower bound: GCC at zvl256b may emit whole-register spills
+# (vs1r.v / vl1r.v) into stack slots sized for VLEN=256, which overrun on a
+# VLEN=1024 core. Compiling at zvl1024b sizes those slots for 1024. The flip
+# side: this code is ILLEGAL on the X100 (VLEN=256 < 1024), so it must only
+# ever run on harts 8-15 (enforced by validation/board_config.py and
+# verify_kernel_on_board.py). Tuned A100 kernels go in kernels/rvv_k3_a100/
+# as rvv_k3_a100_<op>_<algo>.c; everything else falls back to kernels/rvv.
+RVV_K3_A100 = Backend(
+    name="rvv_k3_a100",
+    description="SpaceMiT K3 A100: rv64gcv zvl1024b (VLEN=1024). Illegal on "
+                "the X100; falls back to the shared rvv kernels.",
+    kernel_cflags=tuple(
+        "-march=rv64gcv_zvl1024b_zfh_zvfh" if f.startswith("-march=") else f
+        for f in RVV_X60.kernel_cflags),
+    kernel_includes=RVV_X60.kernel_includes,
+    prj_conf_overlay=RVV_X60.prj_conf_overlay,
+    spike_args=RVV_X60.spike_args,
+    optimization_guide=RVV_X60.optimization_guide,
+    curated_aliases=("rvv",),
+    verify_method=RVV_X60.verify_method,
+)
+
+
+# SpaceMiT K3 A100 IME (smt.vmadot int8, 8x16x8 tile at VLEN=1024). A100 cores
+# only (CPUs 8-15): illegal on the X100. Same flags as rvv_k3_a100 (zvl1024b);
+# the vmadot is emitted via `.insn r 0x2b, 3, 0x71` (the cross GCC rejects the
+# mnemonic). Hand-written IME kernels live in kernels/ime_k3_a100/ as
+# ime_k3_a100_<op>_ime_vmadot_8x16x8.c; the lineage is ime_k3_a100 ->
+# rvv_k3_a100 -> rvv, so every op without an IME kernel falls through to the
+# tuned A100 RVV kernels and then the shared rvv set. Conv weight layout is
+# inherited from `rvv` (IHWOC) through that lineage.
+IME_K3_A100 = Backend(
+    name="ime_k3_a100",
+    description="SpaceMiT K3 A100: zvl1024b RVV + IME int8 vmadot 8x16x8. "
+                "Illegal on the X100; falls back to rvv_k3_a100 then rvv.",
+    kernel_cflags=RVV_K3_A100.kernel_cflags + (
+        "-I<repo_root>/kernels/ime_k3_a100",),
+    kernel_includes=RVV_K3_A100.kernel_includes,
+    prj_conf_overlay=RVV_K3_A100.prj_conf_overlay,
+    spike_args=RVV_K3_A100.spike_args,
+    optimization_guide=RVV_K3_A100.optimization_guide,
+    curated_aliases=("rvv_k3_a100", "rvv"),
+    verify_method=RVV_K3_A100.verify_method,
+)
+
+
 # fp16 variants: same shape as scalar/rvv but with Zfh (and Zvfh on rvv)
 # enabled. The Kconfig overlay (scalar_f16.conf / rvv_f16.conf) tells
 # Zephyr to context-switch the half-precision register state and tells
@@ -795,6 +843,8 @@ BACKENDS: dict[str, Backend] = {
     RVV.name: RVV,
     RVV_X60.name: RVV_X60,
     RVV_K3.name: RVV_K3,
+    RVV_K3_A100.name: RVV_K3_A100,
+    IME_K3_A100.name: IME_K3_A100,
     RVV_HETERO.name: RVV_HETERO,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,

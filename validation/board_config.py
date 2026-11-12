@@ -43,6 +43,9 @@ class BoardConfig:
     # core-type name -> harts, for deriving a per-core-type profile tree.
     # Empty = one core type, no derivation.
     core_types: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    # core-type name -> default backend (K3: the A100 needs its own zvl1024b
+    # build, the X100 must NOT run it). Empty = `backend` for every core.
+    core_backends: tuple[tuple[str, str], ...] = ()
 
 
 _DEFAULTS: dict[str, BoardConfig] = {
@@ -66,6 +69,7 @@ _DEFAULTS: dict[str, BoardConfig] = {
         # touches /proc/set_ai_thread.
         launch_cpus="0-7",
         core_types=(("x100", tuple(range(0, 8))), ("a100", tuple(range(8, 16)))),
+        core_backends=(("x100", "rvv_k3"), ("a100", "ime_k3_a100")),
     ),
 }
 
@@ -148,11 +152,32 @@ def core_type_of(cfg: BoardConfig, cores: Sequence[int]) -> str | None:
     return found.pop()
 
 
+def backend_for_core_type(cfg: BoardConfig, core_type: str | None) -> str:
+    """Default backend for a core type (the board default if it has no entry)."""
+    return dict(cfg.core_backends).get(core_type or "", cfg.backend)
+
+
 def derive_hw_name(cfg: BoardConfig, cores: Sequence[int], target: str,
                    explicit: str | None = None) -> str | None:
     """The `<hw>` level of the profile tree, or None = leave the writer's
     default (backend name). Explicit wins; otherwise on a multi-core-type board
-    it is `<target>_<core type>` (rvv_k3_x100 / rvv_k3_a100)."""
+    a target that already names its core type (`..._a100` / `..._x100`) is used
+    as-is (so it is not double-suffixed), and any other target becomes
+    `<target>_<core type>` (rvv_k3_x100 / rvv_k3_a100).
+
+    A `_<type>` target run on the wrong core type is an error: rvv_k3_a100 is
+    built at zvl1024b, which is an illegal instruction stream on the X100
+    (VLEN=256), and the converse would file X100 kernels under the A100 name.
+    """
+    for tname, _ in cfg.core_types:
+        if target.endswith("_" + tname):
+            t = core_type_of(cfg, cores)
+            if tname != t:
+                raise ValueError(
+                    f"target {target!r} is built for {tname} cores but cores "
+                    f"{sorted(cores)} are {t}; zvl1024b code is illegal on "
+                    f"the X100 and a mislabelled profile misleads the scheduler")
+            return explicit or target
     if explicit:
         return explicit
     t = core_type_of(cfg, cores)
@@ -164,7 +189,10 @@ def shell_exports(cfg: BoardConfig) -> str:
         "BOARD_NAME": cfg.name, "BOARD_HOST": cfg.host,
         "BOARD_REMOTE_ROOT": cfg.remote_root, "BOARD_REGISTRY": cfg.registry,
         "BOARD_CPU_P_KIND": cfg.cpu_p_kind, "BOARD_CPU_E_KIND": cfg.cpu_e_kind,
-        "BOARD_BACKEND": cfg.backend, "BOARD_PROFILE_CPU": cfg.profile_cpu,
+        "BOARD_BACKEND": cfg.backend,
+        # Default backend per core kind, parallel to (cpu_p_kind, cpu_e_kind).
+        "BOARD_BACKEND_P": backend_for_core_type(cfg, cfg.cpu_p_kind),
+        "BOARD_BACKEND_E": backend_for_core_type(cfg, cfg.cpu_e_kind), "BOARD_PROFILE_CPU": cfg.profile_cpu,
         "BOARD_OUT_ROOT_SINGLE": cfg.out_root_single,
         "BOARD_OUT_ROOT_XPURT": cfg.out_root_xpurt,
         "BOARD_CLOCK_MHZ": f"{cfg.clock_mhz:g}",

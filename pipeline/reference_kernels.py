@@ -2004,6 +2004,20 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
             ),
         ),
         AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+        ),
+        AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
             target_affinity=("ime", "ime_x60"),
             accuracy_class=AccuracyClass.BIT_EXACT,
@@ -2670,6 +2684,21 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "Verify+bench: scripts/ime_conv_verify_bench.py."
             ),
             reference_impl="",  # curated: kernels/ime/ime_conv2d_s8_ime_vmadot_4x4x8.c
+        ),
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="ihwoc",
         ),
         AlgorithmCandidate(
             name="indir_gemm",
@@ -4601,7 +4630,7 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_add_s8_rvv_frm_rmm.c
         AlgorithmCandidate(
             name="rvv_frm_rmm",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The reference expression issued on the vector unit, "
                 "including its rounding mode.\n\n"
@@ -4816,7 +4845,7 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The expensive part of this op is the expf, not the "
                 "datapath width: ~140 cycles per element on this core, "
@@ -6186,7 +6215,7 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
         # Kernel: kernels/rvv/rvv_linear_f16_narrow.c
         AlgorithmCandidate(
             name="narrow",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "RVV+Zvfh fp16 linear with PURE-fp16 accumulation. The "
                 "K-reduction uses vfmacc.vv (fp16 multiply-accumulate) and "
@@ -8157,7 +8186,7 @@ void kernel_elu_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_elu_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The expensive part of this op is the expf, not the "
                 "datapath width: ~140 cycles per element on this core, "
@@ -8457,6 +8486,21 @@ void kernel_conv2d_batchnorm2d_s8(
     ],
     argtypes_factory=_conv2d_batchnorm2d_s8_argtypes,
     algorithms=[
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="ihwoc",
+        ),
         # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
         # Q0.31 requantize -> int8) then BN affine as scalar epilogue.
         # Single-stage Q0.31 -> numeric_drift; picked first when it stays
@@ -8515,7 +8559,7 @@ void kernel_conv2d_batchnorm2d_s8(
         # _rvv_oc_blocked_bn_epilogue.c
         AlgorithmCandidate(
             name="rvv_oc_blocked_bn_epilogue",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             weight_layout="ihwoc",
             description=(
                 "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
@@ -8673,6 +8717,21 @@ void kernel_conv2d_batchnorm2d_silu_s8(
     ],
     argtypes_factory=_conv2d_batchnorm2d_silu_s8_argtypes,
     algorithms=[
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="ihwoc",
+        ),
         # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
         # Q0.31 requantize -> int8) then BN affine + SiLU as scalar epilogue.
         # Single-stage Q0.31 -> numeric_drift; picked first when within
@@ -8726,7 +8785,7 @@ void kernel_conv2d_batchnorm2d_silu_s8(
         # _rvv_oc_blocked_bn_silu_epilogue.c
         AlgorithmCandidate(
             name="rvv_oc_blocked_bn_silu_epilogue",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             weight_layout="ihwoc",
             description=(
                 "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
@@ -9311,7 +9370,7 @@ void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
         # it and diffs.
         AlgorithmCandidate(
             name="rvv_frm_rmm",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The reference expression issued on the vector unit, "
                 "including its rounding mode. Structurally identical to "
@@ -9448,7 +9507,7 @@ void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
             # same op on gemmini_q31 once that arm got its LUT (861,508).
             # rvv_f16 is rv64gcv_zfh_zvfh, a superset of rvv's rv64gcv, so
             # the kernel is unchanged; kernels/rvv_f16/ symlinks it.
-            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "The expensive part of this op is the erff, not the "
                 "datapath width. One call per element, no vector erff "
@@ -10503,7 +10562,7 @@ void kernel_adaptive_avg_pool2d_s8(const int8_t *input, int8_t *output,
         # Kernel: kernels/rvv/rvv_adaptive_avg_pool2d_s8_rvv_window_sum.c
         AlgorithmCandidate(
             name="rvv_window_sum",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The window accumulator is `int32_t acc` over int8 inputs, "
                 "and integer addition is associative -- so any reduction "
@@ -10701,6 +10760,20 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
             ),
         ),
         AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+        ),
+        AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
             target_affinity=("ime", "ime_x60"),
             accuracy_class=AccuracyClass.BIT_EXACT,
@@ -10832,7 +10905,7 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
             # + rvv_f16: see gelu_s8's rvv_memo_lut_gather for why the _f16
             # backend variant has to be spelled out for a mixed-precision
             # graph. kernels/rvv_f16/ symlinks the same file.
-            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "Plain RVV int8 matmul for the SpaceMiT X60 (VLEN=256, "
@@ -11837,7 +11910,7 @@ void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
         # Kernel: kernels/rvv/rvv_depthwise_conv2d_s8_rvv_ow_lanes_taps.c
         AlgorithmCandidate(
             name="rvv_ow_lanes_taps",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "One vector is a run of OUTPUT COLUMNS of one (n, c, oh). "
                 "Everything up to the store is integer -- `acc += iv*wv` in "
@@ -12174,7 +12247,7 @@ void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
         AlgorithmCandidate(
             name="rvv_cached_exp",
             # + rvv_f16: see gelu_s8's rvv_memo_lut_gather.
-            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "The reference calls expf TWICE per element with the SAME "
                 "argument -- once to build the denominator, once to "
@@ -12336,7 +12409,7 @@ void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_leaky_relu_s8_rvv_frm_rmm.c
         AlgorithmCandidate(
             name="rvv_frm_rmm",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "Same shape as add_s8's rvv_frm_rmm: the reference "
                 "expression on the vector unit, with roundf() spelled "
@@ -12438,7 +12511,7 @@ void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
         # Kernel: kernels/rvv/rvv_avgpool2d_s8_rvv_ow_lanes.c
         AlgorithmCandidate(
             name="rvv_ow_lanes",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "One vector = a run of output columns of one (n, c, "
                 "oh). Output is contiguous along ow and input is "
@@ -12604,7 +12677,7 @@ void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
         # Kernel: kernels/rvv/rvv_lstm_s8_rvv_gate_int_dot.c
         AlgorithmCandidate(
             name="rvv_gate_int_dot",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "Move the gate reductions onto the INTEGER vector unit "
                 "and leave the cell update alone.\n\n"
@@ -12735,7 +12808,7 @@ void kernel_layernorm_s8(const int8_t *input, const float *gamma,
         # Kernel: kernels/rvv/rvv_layernorm_s8_rvv_f64_tail.c
         AlgorithmCandidate(
             name="rvv_f64_tail",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "Three passes per row. The first two accumulate mu and var "
                 "as SEQUENTIAL DOUBLE SUMS and must stay scalar: a vector "
@@ -12916,7 +12989,7 @@ void kernel_sin_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_sin_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "Memoized 256-entry LUT plus an RVV byte gather -- the same "
@@ -12996,7 +13069,7 @@ void kernel_cos_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_cos_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "Memoized 256-entry LUT plus an RVV byte gather -- the same "
@@ -13142,7 +13215,7 @@ void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih,
         # Kernel: kernels/rvv/rvv_lstm_f16_rvv_gate_f16_dot.c
         AlgorithmCandidate(
             name="rvv_gate_f16_dot",
-            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "Vectorize the two gate GEMVs per unit -- x . w_ih[g] over "
                 "in_size and h . w_hh[g] over H -- with unit-stride fp16 loads, "

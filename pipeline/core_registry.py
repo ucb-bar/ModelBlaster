@@ -25,7 +25,8 @@ JSON schema (informal):
           "isa": "<isa string>",          // optional, for documentation
           "harts": [<int>...],            // hart ids this core covers
           "capabilities": ["<op>", ...],   // op kinds the core can execute
-          "capabilities_ref": "<core-name>" // optional alias to share with another core
+          "capabilities_ref": "<core-name>", // optional alias to share with another core
+          "backend": "<backend>"          // optional: codegen backend this core runs
         },
         ...
       ]
@@ -59,6 +60,10 @@ class Core:
     capabilities: tuple[str, ...]
     isa: str = ""
     description: str = ""
+    # Codegen backend this core's kind executes (e.g. K3: x100 -> rvv_k3,
+    # a100 -> rvv_k3_a100). "" = the registry does not say (older registries);
+    # callers then fall back to their board default.
+    backend: str = ""
 
 
 @dataclass
@@ -166,6 +171,7 @@ def load(path: str) -> CoreRegistry:
             capabilities=tuple(caps),
             isa=entry.get("isa", ""),
             description=entry.get("description", ""),
+            backend=entry.get("backend", ""),
         ))
 
     ai_cpus = doc.get("ai_thread_cpus", [])
@@ -176,6 +182,13 @@ def load(path: str) -> CoreRegistry:
     if stray:
         raise ValueError(
             f"{path}: ai_thread_cpus {stray} are not harts of any core")
+
+    for kind in {c.kind for c in cores}:
+        bs = {c.backend for c in cores if c.kind == kind}
+        if len(bs) > 1:
+            raise ValueError(
+                f"{path}: cores of kind {kind!r} declare different backends "
+                f"{sorted(bs)}; a kind is one placement pool with one backend")
 
     by_name = {c.name: c for c in cores}
     by_kind: dict[str, list[Core]] = {}
