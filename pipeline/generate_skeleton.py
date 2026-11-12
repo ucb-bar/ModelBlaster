@@ -4843,7 +4843,11 @@ static inline unsigned long long mb_wall_ticks(void)
     else:
         timer_preamble = """#include <stddef.h>
 #include <stdint.h>
+#ifdef MB_PLATFORM_POSIX
+#include "mb_posix.h"        /* hosted Linux: k_cycle_get_64() in ns */
+#else
 #include <zephyr/kernel.h>   /* for k_cycle_get_64() \u2014 static inline in this header */
+#endif
 #include "model.h"
 #include "kernels.h"
 #include "weights.h"
@@ -4855,10 +4859,12 @@ static inline unsigned long long mb_wall_ticks(void)
  * with the HOST compiler -- `rdcycle` is not an x86 instruction and the
  * assembler rejects it, which is the whole native_sim path failing on the
  * first timed dispatch. The RISC-V branch is unchanged, so every board
- * build still emits a byte-identical mcycle read. */
+ * build still emits a byte-identical mcycle read. MB_PLATFORM_POSIX (hosted
+ * Linux, runtime/mb_posix.h) takes the k_cycle_get_64 path too: user-mode
+ * rdcycle traps there, and k_cycle_get_64 is the monotonic clock in ns. */
 static inline unsigned long rdcycle(void)
 {
-#if defined(__riscv)
+#if defined(__riscv) && !defined(MB_PLATFORM_POSIX)
     unsigned long cc;
     __asm__ volatile("rdcycle %0" : "=r"(cc));
     return cc;
