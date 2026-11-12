@@ -1355,14 +1355,47 @@ def _promote_ops_to_fp16(ops, fp16_names, tensors_meta, weights_blob,
     an op that is not in the graph is reported rather than silently ignored).
     """
     promoted: list[str] = []
+    out_ops: list[dict] = []
     for op in ops:
+        out_ops.append(op)
         if op["name"] not in fp16_names:
             op.setdefault("precision", "int8")
             continue
+        # A ReLU absorbed into this int8 op lives only in its requantize clamp
+        # (activation_min = 0). The fp16 kernels have no clamp, so renaming
+        # the op alone silently DROPPED the ReLU, in the golden and the C alike
+        # (measured on the racing planner stand-in: promoting trunk.0/trunk.2
+        # to fp16 took trajectory ADE 0.31 -> 1.36 m). Re-materialise it as an
+        # explicit relu_f16 after the promoted op.
+        _q = op.get("quant") or {}
+        _fused_relu = (op["op"].endswith("_s8")
+                       and _q.get("activation_min") == 0)
+        if _fused_relu and _q.get("activation_max", 127) != 127:
+            raise NotImplementedError(
+                f"fp16 promotion of {op['name']!r}: it carries a fused "
+                f"ReLU6-style clamp [0, {_q.get('activation_max')}] and there "
+                f"is no relu6_f16 op; promote a different op or extract "
+                f"without MB_INT8_FUSE_RELU6")
         op["precision"] = "fp16"
         if op["op"].endswith("_s8"):
             op["op"] = op["op"][:-3] + "_f16"
         promoted.append(op["name"])
+        if _fused_relu:
+            final = op["outputs"][0]
+            pre = f"{final}__pre_relu"
+            tensors_meta[pre] = dict(tensors_meta[final])
+            op["outputs"] = [pre] + list(op["outputs"][1:])
+            n = 1
+            for d in tensors_meta[final]["shape"]:
+                n *= int(d)
+            out_ops.append({
+                "name": f"{op['name']}__relu",
+                "op": "relu_f16",
+                "precision": "fp16",
+                "inputs": [pre],
+                "outputs": [final],
+                "shape": {"n": n},
+            })
 
         if op["op"] == "lstm_f16":
             # The int8 cell carries separate int32-quantized b_ih / b_hh in the
@@ -1392,12 +1425,15 @@ def _promote_ops_to_fp16(ops, fp16_names, tensors_meta, weights_blob,
             touched += [v for v in st.values() if v]
         elif isinstance(st, (list, tuple)):
             touched += [v for v in st if v]
+        if _fused_relu:
+            touched.append(out_ops[-1]["outputs"][0])
         for t in touched:
             if t in tensors_meta:
                 meta = dict(tensors_meta[t])
                 meta["dtype"] = "f16"
                 meta["quant"] = None
                 tensors_meta[t] = meta
+    ops[:] = out_ops
     return promoted
 
 
