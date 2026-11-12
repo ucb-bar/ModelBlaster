@@ -681,6 +681,16 @@ def _run_kernel(fn, op: str, shape: dict, inputs):
         fn(_i8p(inp), _i8p(out),
            shape["N"], shape["C"], shape["IH"], shape["IW"], shape["scale"])
         return out
+    if op in ("cat2_c1_s8_copy", "cat3_c1_s8_copy", "cat4_c1_s8_copy"):
+        n_inputs = int(op[3])
+        cs = list(shape["C_inputs"])
+        ins = inputs[:n_inputs]
+        out = inputs[n_inputs]
+        flat_args = []
+        for src, c in zip(ins, cs):
+            flat_args += [_i8p(src), c]
+        fn(*flat_args, _i8p(out), shape["N"], shape["H"], shape["W"])
+        return out
     if op in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
         n_inputs = int(op[3])
         cs = list(shape["C_inputs"]) if "C_inputs" in shape else [shape[f"c{i}"] for i in range(n_inputs)]
@@ -796,6 +806,7 @@ _INTEGER_OPS = {"nchw_to_nhwc_s8", "nhwc_to_nchw_s8",
                 "add_s8", "batchnorm2d_s8", "sigmoid_s8",
                 "silu_s8", "elu_s8", "upsample_nearest_s8",
                 "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8",
+                "cat2_c1_s8_copy", "cat3_c1_s8_copy", "cat4_c1_s8_copy",
                 # ViNT s8 ops (Phase A.2)
                 "mul_s8", "gelu_s8", "pad_s8",
                 "adaptive_avg_pool2d_s8", "layer_norm_s8",
@@ -925,7 +936,8 @@ def verify(
                     inputs_ref = _gen_inputs_silu_s8(shape, rng)
                 elif op == "upsample_nearest_s8":
                     inputs_ref = _gen_inputs_upsample_nearest_s8(shape, rng)
-                elif op in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
+                elif op in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8",
+                            "cat2_c1_s8_copy", "cat3_c1_s8_copy", "cat4_c1_s8_copy"):
                     inputs_ref = _gen_inputs_cat_c1_s8(shape, rng, int(op[3]))
                 elif op == "mul_s8":
                     inputs_ref = _gen_inputs_mul_s8(shape, rng)

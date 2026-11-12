@@ -9065,6 +9065,55 @@ def _cat_per_input_lut_algorithm(n_inputs: int) -> AlgorithmCandidate:
     )
 
 
+def _cat_c1_s8_copy_argtypes(n_inputs: int):
+    def f():
+        import ctypes
+        i8p = ctypes.POINTER(ctypes.c_int8)
+        return [t for _ in range(n_inputs) for t in (i8p, ctypes.c_int)] + [
+            i8p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    return f
+
+
+def _cat_c1_s8_copy_reference(n_inputs: int) -> str:
+    sig = ", ".join(f"const int8_t *in{i}, int c{i}" for i in range(n_inputs))
+    tot = " + ".join(f"c{i}" for i in range(n_inputs))
+    body = "".join(
+        f"        for (int k = 0; k < c{i} * hw; k++) o[k] = in{i}[n * c{i} * hw + k];\n"
+        f"        o += c{i} * hw;\n" for i in range(n_inputs))
+    return (f"void kernel_cat{n_inputs}_c1_s8_copy({sig},\n"
+            f"                    int8_t *output, int N, int H, int W) {{\n"
+            f"    /* Channel concat of int8 tensors that share ONE scale (extract with\n"
+            f"     * MB_INT8_CAT_SHARED_SCALE=1): a byte copy, integer-only, no requantize. */\n"
+            f"    int hw = H * W;\n"
+            f"    for (int n = 0; n < N; n++) {{\n"
+            f"        int8_t *o = output + (size_t)n * ({tot}) * hw;\n"
+            f"{body}"
+            f"    }}\n"
+            f"}}\n")
+
+
+def _cat_c1_s8_copy_spec(n_inputs: int) -> "KernelSpec":
+    sig = ", ".join(f"const int8_t *in{i}, int c{i}" for i in range(n_inputs))
+    return KernelSpec(
+        op=f"cat{n_inputs}_c1_s8_copy",
+        signature=(f"void kernel_cat{n_inputs}_c1_s8_copy({sig}, "
+                   "int8_t *output, int N, int H, int W)"),
+        semantics=(
+            f"Concatenate {n_inputs} NCHW int8 tensors along the channel axis. All inputs and the "
+            "output share one quantisation scale, so this is a pure byte copy (no requantize, "
+            "integer-only). Input i has shape (N, ci, H, W)."),
+        reference_impl=_cat_c1_s8_copy_reference(n_inputs),
+        extra_shapes=[{"N": 1, "H": 4, "W": 4, "C_inputs": [8, 8][:n_inputs] + [4] * max(0, n_inputs - 2),
+                       "C_total": 16 + 4 * max(0, n_inputs - 2)}],
+        argtypes_factory=_cat_c1_s8_copy_argtypes(n_inputs),
+    )
+
+
+CAT2_C1_S8_COPY = _cat_c1_s8_copy_spec(2)
+CAT3_C1_S8_COPY = _cat_c1_s8_copy_spec(3)
+CAT4_C1_S8_COPY = _cat_c1_s8_copy_spec(4)
+
+
 CAT2_C1_S8 = KernelSpec(
     op="cat2_c1_s8",
     signature=(
@@ -15437,6 +15486,9 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'cat2_c1_s8': CAT2_C1_S8,
     'cat3_c1_s8': CAT3_C1_S8,
     'cat4_c1_s8': CAT4_C1_S8,
+    'cat2_c1_s8_copy': CAT2_C1_S8_COPY,
+    'cat3_c1_s8_copy': CAT3_C1_S8_COPY,
+    'cat4_c1_s8_copy': CAT4_C1_S8_COPY,
     'mul_s8': MUL_S8,
     'gelu_s8': GELU_S8,
     'tanh_s8': TANH_S8,

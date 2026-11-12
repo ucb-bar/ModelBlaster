@@ -68,6 +68,7 @@ LAYOUT_AGNOSTIC = {"add_s8", "relu_s8", "mul_s8", "sigmoid_s8", "silu_s8",
 #: exactly what NHWC removes. Design doc section 10.
 ISLAND_FORBIDDEN = {"view", "chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8",
                     "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8",
+                    "cat2_c1_s8_copy", "cat3_c1_s8_copy", "cat4_c1_s8_copy",
                     "cat2_c1_f16", "slice_c_s8", "slice_c_f16",
                     "linear_s8", "linear", "linear_s8_pc"}
 

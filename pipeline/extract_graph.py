@@ -1956,6 +1956,59 @@ def extract_int8(
                   flush=True)
             max_abs[nm] = _pin
 
+    # Opt-in (MB_INT8_CAT_SHARED_SCALE=1): integer-only channel concat. Every input of a
+    # torch.cat gets the cat's own (largest) range, walked back through scale-preserving
+    # nodes (ReLU/ReLU6, upsample, flatten/view, dropout, maxpool) to the producer that
+    # requantises (conv / linear, integer multiplier + shift). The cat then has
+    # scales_in == scale_out and is lowered to catN_c1_s8_copy: a byte copy with no
+    # requantise, so no float op sits between int8 layers. Default off: stock IR unchanged.
+    # Cost: each cat input is quantised on the coarser of the shared grids (which the
+    # stock cat already did at its requantise for the finer input), and a tensor that also
+    # feeds another op (a U-Net skip) reaches that op on the coarser grid too.
+    _cat_shared = os.environ.get("MB_INT8_CAT_SHARED_SCALE", "0") == "1"
+    _cat_copy_nodes: set[str] = set()
+    if _cat_shared:
+        _SP_MODS = (torch.nn.ReLU, torch.nn.ReLU6, torch.nn.Upsample, torch.nn.Dropout,
+                    torch.nn.Flatten, torch.nn.MaxPool2d, torch.nn.Identity)
+        _SP_FUNCS = {"relu", "relu6", "flatten", "interpolate", "upsample_nearest2d",
+                     "dropout", "max_pool2d"}
+        _SP_METHODS = {"view", "reshape", "flatten", "relu", "contiguous"}
+        _mods = dict(gm.named_modules())
+
+        def _chain(n):
+            """n and every scale-preserving ancestor up to (incl.) the requantising producer."""
+            out = [n]
+            while True:
+                tr = False
+                if n.op == "call_module" and isinstance(_mods.get(n.target), _SP_MODS):
+                    tr = True
+                elif n.op == "call_function" and getattr(n.target, "__name__", "") in _SP_FUNCS:
+                    tr = True
+                elif n.op == "call_method" and n.target in _SP_METHODS:
+                    tr = True
+                if not tr or not n.args or not isinstance(n.args[0], torch.fx.Node):
+                    return out
+                n = n.args[0]
+                out.append(n)
+
+        _cats = [n for n in gm.graph.nodes if n.op == "call_function"
+                 and (n.target is torch.cat or getattr(n.target, "__name__", "") == "cat")]
+        for _it in range(16):          # fixed point (a tensor may feed several cats)
+            changed = False
+            for c in _cats:
+                groups = [_chain(t) for t in c.args[0]]
+                names = [c.name] + [x.name for g in groups for x in g]
+                m = max(max_abs.get(nm, 0.0) for nm in names)
+                for nm in names:
+                    if nm in max_abs and max_abs[nm] != m:
+                        max_abs[nm] = m
+                        changed = True
+            if not changed:
+                break
+        _cat_copy_nodes = {c.name for c in _cats}
+        print(f"[extract_int8] MB_INT8_CAT_SHARED_SCALE: {len(_cats)} cat(s) share their "
+              f"inputs' scale (lowered to catN_c1_s8_copy)", flush=True)
+
     scales: dict[str, float] = {
         k: max(v, 1e-8) / _INT8_RANGE for k, v in max_abs.items()
     }
@@ -3529,6 +3582,12 @@ def extract_int8(
                         f"inputs; only 2/3/4-input cat is supported."
                     )
                 op_kind = f"cat{n_inputs}_c1_s8"
+                if _cat_shared and node.name in _cat_copy_nodes:
+                    if any(scales[n] != scales[node.name] for n in in_names):
+                        raise RuntimeError(
+                            f"MB_INT8_CAT_SHARED_SCALE: cat {node.name} inputs did not get the "
+                            f"shared scale: {[scales[n] for n in in_names]} vs {scales[node.name]}")
+                    op_kind = f"cat{n_inputs}_c1_s8_copy"
                 _record(node.name, dtype="i8")
                 ops.append({
                     "name": node.name, "op": op_kind,
@@ -4366,6 +4425,12 @@ def extract_int8(
                 for ow in range(OW):
                     out[:, :, oh, ow] = in_4d[:, :, oh // scale, ow // scale]
             activations[out_name] = out
+        elif op["op"] in ("cat2_c1_s8_copy", "cat3_c1_s8_copy", "cat4_c1_s8_copy"):
+            sh = op["shape"]
+            N_, H_, W_ = sh["N"], sh["H"], sh["W"]
+            activations[out_name] = np.concatenate(
+                [activations[nm].reshape(N_, c, H_, W_).astype(np.int8)
+                 for nm, c in zip(op["inputs"], sh["C_inputs"])], axis=1)
         elif op["op"] in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
             sh = op["shape"]
             q = op["quant"]

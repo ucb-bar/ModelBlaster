@@ -3893,6 +3893,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['scale']})"
             )
+        elif op["op"] in ("cat2_c1_s8_copy", "cat3_c1_s8_copy", "cat4_c1_s8_copy"):
+            sh = op["shape"]
+            in_ptrs = [ptr_for(inp, "in") for inp in op["inputs"]]
+            call = (
+                f"kernel_{op['op']}("
+                + ", ".join(f"{p}, {c}" for p, c in zip(in_ptrs, sh["C_inputs"]))
+                + f", {out_ptr}, {sh['N']}, {sh['H']}, {sh['W']})"
+            )
         elif op["op"] in ("cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"):
             sh = op["shape"]
             q = op["quant"]
