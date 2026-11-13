@@ -132,6 +132,77 @@ def _buf_name(mid: str, tensor: str) -> str:
 # modelblaster_pool.h out of model.c so the harness has no POSIX dep.
 _PARALLELIZED_OPS = {"linear", "conv2d", "linear_s8", "conv2d_s8"}
 
+#: Linear kinds that apply_split_hint may tile along N. The output offset alias
+#: keys off THIS set: a kind registered in apply_split_hint without being here
+#: now fails the build (see the `raise` in the alias block) instead of
+#: emitting tiles that all write at offset 0.
+_N_SLICEABLE_LINEAR_OPS = {"linear_s8"}
+
+#: Conv kinds that can be emitted as an OH (output ROW) split tile; see
+#: `_OH_TILE_HELPER` and `apply_split_hint._split_conv2d_s8_oh`. Fused convs are
+#: deliberately absent (no row-window emitter).
+#:
+#: Same warning as `_N_SLICEABLE_LINEAR_OPS`, and it applies harder here: an OH
+#: tile that reaches the generic path gets the parent's input pointer, the
+#: parent's IH/PH and an output alias at offset 0, i.e. every tile recomputes
+#: the parent's FIRST `tile_oh` rows over the whole tensor and overwrites the
+#: others. That builds, links, and produces a plausible-looking wrong answer.
+#: The `raise` in the alias block below is what stops it.
+_OH_SLICEABLE_CONV_OPS = {"conv2d_s8"}
+
+#: Pointwise kinds that can be emitted as an E (flat element range) split tile.
+#:
+#: Unlike the three sets above, this one needs no per-kind emitter: every
+#: pointwise branch in the dispatch chain already reads `op["shape"]["n"]`
+#: (which the splitter narrows) and takes each operand through `ptr_for`
+#: (which the E block below redirects). So the set exists for exactly one
+#: reason -- to make the `raise` in the alias block reachable, so that a kind
+#: registered in `apply_split_hint._POINTWISE_KINDS` and NOT here fails the
+#: build instead of emitting tiles that all write at offset 0.
+#:
+#: Kept as an independent literal rather than imported from apply_split_hint on
+#: purpose: two lists that must agree is a check, one list shared between them
+#: is an assumption. `tests/test_apply_split_hint.py` asserts they agree.
+_E_SLICEABLE_ELTWISE_OPS = {
+    "add", "add_f16", "add_s8", "cast_f16_to_i8",
+    "cast_i8_to_f16", "elu", "elu_f16", "elu_s8",
+    "gelu", "gelu_exact", "gelu_exact_f16", "gelu_f16",
+    "gelu_s8", "hardsigmoid", "hardsigmoid_f16", "hardtanh",
+    "hardtanh_f16", "leaky_relu", "leaky_relu_f16", "leaky_relu_s8",
+    "log", "log_f16", "mul", "mul_f16",
+    "mul_s8", "relu", "relu6", "relu6_f16",
+    "relu6_s8", "relu_f16", "relu_s8", "selu",
+    "selu_f16", "sigmoid", "sigmoid_f16", "sigmoid_s8",
+    "silu", "silu_f16", "silu_s8", "softplus",
+    "softplus_f16", "softsign", "softsign_f16", "swish",
+    "swish_f16", "tanh", "tanh_f16",
+}
+
+#: Pooling kinds that can be emitted as a C (channel range) split tile. The
+#: pool's own emitter offsets the INPUT pointer (by `c0*IH*IW`, which differs
+#: from the output's `c0*OH*OW` whenever the pool subsamples), so unlike the E
+#: set this one does need its emitter kept in step.
+_C_SLICEABLE_POOL_OPS = {"maxpool2d_s8"}
+
+
+def _c_tile_in_offset(op, sh, in_ptr):
+    """Advance a C-split pool tile's INPUT pointer to its own channel planes.
+
+    The output pointer is handled by the tile's offset alias, and it is a
+    DIFFERENT offset: the output planes are `OH*OW` and the input planes are
+    `IH*IW`. A pool with SH>1 subsamples, so using one offset for both -- the
+    obvious simplification -- reads from the wrong channel by a factor of the
+    stride squared. DroNet's maxpool is 56x56 -> 27x27, where that is a 4.3x
+    error in the source address.
+    """
+    sf = op.get("split_from") or {}
+    if sf.get("axis") != "C":
+        return in_ptr
+    c0 = int(sf.get("tile_offset_C", 0))
+    if not c0:
+        return in_ptr
+    return f"({in_ptr} + {c0 * int(sh['IH']) * int(sh['IW'])})"
+
 #: Ops whose call is derived from KernelSpec.signature by kernel_abi.bind
 #: rather than a hand-written branch below (see reference_kernels_ext).
 _GENERIC_ABI_OPS = {"strided_copy", "gather", "catn", "ewise1", "ewise2",
@@ -1154,9 +1225,139 @@ def split_conv_tile_weights(
             "tile": int(sf.get("tile", 0)),
             "n_splits": int(sf.get("n_splits", 1)),
             "tile_oc": int(sh.get("OC", 0)),
+            # First OC row this tile owns (splitter's record; `tile * tile_oc`
+            # is only right for an even partition).
+            "oc0": int(sf.get("tile_offset_OC", int(sf.get("tile", 0))
+                              * int(sh.get("OC", 0)))),
             "layout": layout,
         }
     return plan
+
+
+def oh_tile_plan(ir: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """`{dispatch_id: geometry}` for every conv tile split along OH.
+
+    Everything here is READ from what `apply_split_hint._split_conv2d_s8_oh`
+    recorded, never recomputed: the splitter owns the partition, and a second
+    derivation of `in_row_lo` from `tile * tile_oh` would be wrong the moment
+    anyone asks for an uneven one (the OC path has already been bitten by
+    exactly that, twice -- see `tile_offset_OC`).
+
+    Returns `{}` for every graph without an OH tile, which is every graph that
+    existed before this axis did, so nothing else changes shape.
+    """
+    plan: dict[int, dict[str, Any]] = {}
+    for op in ir.get("ops", []):
+        sf = op.get("split_from") or {}
+        if sf.get("axis") != "OH":
+            continue
+        did = op.get("dispatch_id")
+        if did is None:
+            continue
+        if op.get("op") not in _OH_SLICEABLE_CONV_OPS:
+            raise SystemExit(
+                f"{op.get('name')}: axis=OH tile on op kind {op.get('op')!r}, "
+                f"which has no row-window emitter (see "
+                f"_OH_SLICEABLE_CONV_OPS)")
+        sh = op["shape"]
+        PW = int(sf["parent_PW"])
+        plan[did] = {
+            "IC": int(sh["IC"]), "OC": int(sh["OC"]), "OW": int(sh["OW"]),
+            "KH": int(sh["KH"]), "KW": int(sh["KW"]),
+            "SH": int(sh["SH"]), "SW": int(sh["SW"]),
+            "parent_IH": int(sf["parent_IH"]), "parent_IW": int(sf["parent_IW"]),
+            "parent_OH": int(sf["parent_OH"]), "parent_PW": PW,
+            "win_rows": int(sf["window_rows"]),
+            "in_row_lo": int(sf["in_row_lo"]),
+            "oh0": int(sf["tile_offset_OH"]),
+            "oh_rows": int(sf["tile_oh"]),
+            # Scratch element counts. The window is stored PRE-PADDED in both
+            # dimensions (see the helper), so its width is IW + 2*PW.
+            "ws_in_elems": int(sh["IC"]) * int(sf["window_rows"])
+                           * (int(sf["parent_IW"]) + 2 * PW),
+            "ws_out_elems": int(sh["OC"]) * int(sf["tile_oh"]) * int(sh["OW"]),
+        }
+    return plan
+
+
+_OH_TILE_HELPER = """
+/* ---- conv2d_s8 OH row-tile (apply_split_hint axis="OH") ------------------ */
+/* Computes output rows [oh0, oh0+oh_rows) of a conv whose output is NCHW
+ * [1, OC, OH, OW].
+ *
+ * Why this is a gather/kernel/scatter and not a pointer offset like the OC
+ * split: in NCHW neither end of a row band is contiguous. The input rows this
+ * tile needs are a run of `win_rows` rows INSIDE each of IC channel planes,
+ * and the output rows it produces are a run of `oh_rows` rows inside each of
+ * OC planes. Only a per-plane copy expresses either.
+ *
+ * The gather also materialises the tile's share of the conv's zero padding --
+ * rows AND columns -- so the kernel below runs with PH == PW == 0. Two
+ * reasons, and the second is the load-bearing one:
+ *   1. Per-tile padding is asymmetric (top padding for the first tile, bottom
+ *      for the last, none in between) and the kernel signature has ONE PH that
+ *      pads both ends. Materialising it sidesteps that entirely.
+ *   2. gemmini's curated conv falls back to a scalar loop unless PH == PW
+ *      (gemmini_conv2d_s8_gemmini_tiled_conv.c). A tile with PH=0, PW=1 would
+ *      build, verify, and quietly leave the systolic array idle.
+ * A materialised zero row is EXACTLY the kernel's own out-of-bounds
+ * contribution: the kernel adds `input_offset` for an OOB tap and
+ * `0 + input_offset` for a stored zero. Equivalent by construction, at any
+ * input_offset, on every backend -- not just where quantization is symmetric.
+ */
+static void mb_ohtile_conv2d_s8_{mid}(
+        const int8_t *in, const int8_t *w, const int32_t *b, int8_t *out,
+        int8_t *ws_in, int8_t *ws_out,
+        int IC, int IH, int IW, int OC, int OH, int OW,
+        int KH, int KW, int SH, int SW, int PW,
+        int win_rows, int in_row_lo, int oh0, int oh_rows,
+        int input_offset, int filter_offset, int output_offset,
+        int output_multiplier, int output_shift,
+        int activation_min, int activation_max)
+{{
+    const int IWP = IW + 2 * PW;                 /* pre-padded window width */
+    for (int ic = 0; ic < IC; ic++) {{
+        for (int j = 0; j < win_rows; j++) {{
+            int8_t *d = ws_in + ((size_t)ic * (size_t)win_rows + (size_t)j)
+                                * (size_t)IWP;
+            int ih = in_row_lo + j;              /* parent row; may be < 0 */
+            if (ih < 0 || ih >= IH) {{
+                memset(d, 0, (size_t)IWP);
+            }} else {{
+                if (PW) memset(d, 0, (size_t)PW);
+                memcpy(d + PW, in + ((size_t)ic * (size_t)IH + (size_t)ih)
+                                    * (size_t)IW, (size_t)IW);
+                if (PW) memset(d + PW + IW, 0, (size_t)PW);
+            }}
+        }}
+    }}
+    kernel_conv2d_s8_{mid}(ws_in, w, b, ws_out,
+                           1, IC, win_rows, IWP, OC, KH, KW, SH, SW, 0, 0,
+                           input_offset, filter_offset, output_offset,
+                           output_multiplier, output_shift,
+                           activation_min, activation_max);
+    for (int oc = 0; oc < OC; oc++)
+        memcpy(out + ((size_t)oc * (size_t)OH + (size_t)oh0) * (size_t)OW,
+               ws_out + (size_t)oc * (size_t)oh_rows * (size_t)OW,
+               (size_t)oh_rows * (size_t)OW);
+}}
+"""
+
+
+
+def _oh_tile_helper_for(backend: str, mid: str, out_dir: str = "") -> str:
+    """Portable gather/kernel/scatter OH helper (the only variant ported to k3;
+    the merge branch's gemmini zero-copy variant is deliberately absent)."""
+    return _OH_TILE_HELPER.format(mid=mid)
+
+
+def _oh_ws_name(mid: str, did: int, which: str) -> str:
+    """Scratch symbol for one OH tile. PER TILE, not shared: the whole point of
+    splitting is that the tiles can run on different harts at the same time, and
+    a shared window buffer would make that a data race that only shows up under
+    a schedule that actually overlaps them."""
+    return f"buf_{mid}_ohtile_{which}_d{did}"
+
 
 
 #: Per-shard weight symbols for an intra-op sharded conv. Same hazard as
@@ -1376,19 +1577,20 @@ def _apply_tile_weight_plan(
         if arr is None or arr.ndim != 4:
             continue
         t, tile_oc = spec["tile"], spec["tile_oc"]
-        if tile_oc <= 0 or (t + 1) * tile_oc > arr.shape[0]:
+        oc0 = int(spec.get("oc0", t * tile_oc))
+        if tile_oc <= 0 or oc0 + tile_oc > arr.shape[0]:
             raise SystemExit(
                 f"split tile weight slice out of range: {wk} has OC="
                 f"{arr.shape[0]}, tile {t} of {spec['n_splits']} wants "
-                f"[{t * tile_oc}, {(t + 1) * tile_oc})")
+                f"[{oc0}, {oc0 + tile_oc})")
         extra[_tile_key(wk, t)] = np.ascontiguousarray(
-            arr[t * tile_oc:(t + 1) * tile_oc])
+            arr[oc0:oc0 + tile_oc])
         drop.add(wk)
         bk = spec.get("bias")
         if bk and bk in weights:
             b = weights[bk]
             extra[_tile_key(bk, t)] = np.ascontiguousarray(
-                b[t * tile_oc:(t + 1) * tile_oc])
+                b[oc0:oc0 + tile_oc])
             drop.add(bk)
     return extra, drop
 
@@ -1427,7 +1629,9 @@ def _oc_tile_operands(
             f"would be wrong for every n > 0.")
     tile_idx = int(sf.get("tile", 0))
     tile_oc = int(sh.get("OC", 0))
-    oc0 = tile_idx * tile_oc
+    # First OC row this tile owns, from the splitter's record: `tile_idx *
+    # tile_oc` reproduces it only for an EVEN partition.
+    oc0 = int(sf.get("tile_offset_OC", tile_idx * tile_oc))
     spec = tile_w_plan.get(op.get("dispatch_id"))
     if spec is not None:
         # Backend packs conv weights away from OIHW (IHWOC for rvv), so an OC
@@ -1794,16 +1998,35 @@ def emit_model(ir: dict[str, Any], out_dir: str,
                 tile_oc = int(sh.get("OC", 0))
                 OH = int(sh.get("OH", 0))
                 OW = int(sh.get("OW", 0))
-                elem_offset = tile_idx * tile_oc * OH * OW
-            elif axis == "N" and op["op"] == "linear_s8":
+                oc0 = int(sf.get("tile_offset_OC", tile_idx * tile_oc))
+                elem_offset = oc0 * OH * OW
+            elif axis == "N" and op["op"] in _N_SLICEABLE_LINEAR_OPS:
                 # Output buffer shape [M, N]; tile slice is tile_n cols
                 # at offset tile_idx * tile_n (M=1 typical).
                 tile_n = int(sh.get("N", 0))
-                elem_offset = tile_idx * tile_n
-            else:
-                # Unknown split axis / op kind — leave offset 0; tile
-                # measurement will surface the verify FAIL clearly.
+                elem_offset = int(sf.get("tile_offset_N", tile_idx * tile_n))
+            elif axis == "OH" and op["op"] in _OH_SLICEABLE_CONV_OPS:
+                # NCHW row band is OC runs, one per plane: no single offset.
+                # The tile aliases the parent at 0 and the emitted call
+                # scatters the bands itself (_OH_TILE_HELPER).
                 elem_offset = 0
+            elif axis == "C" and op["op"] in _C_SLICEABLE_POOL_OPS:
+                # Pool output [N, C, OH, OW]: tile_c whole planes at c0*OH*OW.
+                OH = int(sh.get("OH", 0))
+                OW = int(sh.get("OW", 0))
+                c0 = int(sf.get("tile_offset_C", 0))
+                elem_offset = c0 * OH * OW
+            elif axis == "E" and op["op"] in _E_SLICEABLE_ELTWISE_OPS:
+                # Flat element range: the offset IS the element offset.
+                elem_offset = int(sf.get("tile_offset_E", 0))
+            else:
+                # A tile whose (axis, op kind) has no emitter would build and
+                # silently write over tile 0's output: refuse.
+                raise SystemExit(
+                    f"{op.get('name')}: split tile with axis={axis!r} on op "
+                    f"kind {op['op']!r} has no codegen path. Add the kind to "
+                    f"the matching _*_SLICEABLE_* set in generate_skeleton and "
+                    f"give it an operand/offset emitter.")
             offset_aliases[tile_out] = (base, elem_offset)
 
     # Number of ops that actually emit a kernel call (used to size the profile
@@ -1949,8 +2172,26 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         buf_defs.append(f"{c_type} {_buf_name(mid, t)}[{size}];")
         buf_externs.append(f"extern {c_type} {_buf_name(mid, t)}[{size}];")
 
+    # OH row-tile scratch: pre-padded input window and the tile's own output
+    # band, one pair per tile (per tile so concurrent tiles never share it).
+    oh_plan = oh_tile_plan(ir)
+    for did in sorted(oh_plan):
+        g = oh_plan[did]
+        for which, n in (("in", g["ws_in_elems"]), ("out", g["ws_out_elems"])):
+            nm = _oh_ws_name(mid, did, which)
+            buf_defs.append(f"int8_t {nm}[{n}];")
+            buf_externs.append(f"extern int8_t {nm}[{n}];")
+
+    # Per-op operand pointer overrides (E-split tiles shift their inputs).
+    # Routed through ptr_for so every pointwise emitter stays unaware.
+    _shim_override: dict[str, str] = {}
+
     def ptr_for(tensor: str, role: str) -> str:
+        if tensor in _shim_override:
+            return _shim_override[tensor]
         tensor = resolve_alias(tensor)
+        if tensor in _shim_override:
+            return _shim_override[tensor]
         if tensors.get(tensor, {}).get("const"):
             # Folded constant (get_attr / parameter-only subgraph): lives in
             # weights.c under its weights.npz key.
@@ -2094,6 +2335,20 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             )
             invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
             continue
+        # E (flat element range) split tile: shift every INPUT pointer once
+        # here instead of in each pointwise emitter. The output pointer is
+        # already offset by the tile's alias and shape["n"] is narrowed.
+        _shim_override.clear()
+        _sf_e = op.get("split_from") or {}
+        if _sf_e.get("axis") == "E":
+            _e_off = int(_sf_e.get("tile_offset_E", 0))
+            if _e_off:
+                # Resolve EVERY base before installing ANY override so a binary
+                # op whose inputs alias each other is not offset twice.
+                _bases = {nm: ptr_for(nm, "in")
+                          for nm in dict.fromkeys(op.get("inputs") or [])}
+                for _nm, _base in _bases.items():
+                    _shim_override[_nm] = f"({_base} + {_e_off})"
         out_ptr = ptr_for(op["outputs"][0], "out")
         shape_lit = _shape_str(op)
         if op["op"] == "linear":
@@ -2549,8 +2804,31 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # signature on the first dronet split attempt).
             w, b, _ = _oc_tile_operands(op, sh, tile_w_plan, model_name, w, b,
                                         backend=backend)
-            sspec = shard_w_plan.get(op.get("dispatch_id"))
-            if sspec is not None:
+            # OH row-tile: in_ptr is the PARENT input, out_ptr the parent
+            # output aliased at 0; the helper gathers the pre-padded window,
+            # calls the ordinary kernel, and scatters the band back. Weights
+            # are the parent's (every tile computes every output channel).
+            ohspec = oh_plan.get(op.get("dispatch_id"))
+            sspec = (None if ohspec is not None
+                     else shard_w_plan.get(op.get("dispatch_id")))
+            if ohspec is not None:
+                g = ohspec
+                call = (
+                    f"mb_ohtile_conv2d_s8_{mid}({in_ptr}, {w}, {b}, {out_ptr}, "
+                    f"{_oh_ws_name(mid, op['dispatch_id'], 'in')}, "
+                    f"{_oh_ws_name(mid, op['dispatch_id'], 'out')}, "
+                    f"{g['IC']}, {g['parent_IH']}, {g['parent_IW']}, "
+                    f"{g['OC']}, {g['parent_OH']}, {g['OW']}, "
+                    f"{g['KH']}, {g['KW']}, {g['SH']}, {g['SW']}, "
+                    f"{g['parent_PW']}, "
+                    f"{g['win_rows']}, {g['in_row_lo']}, "
+                    f"{g['oh0']}, {g['oh_rows']}, "
+                    f"{q['input_offset']}, {q['filter_offset']}, "
+                    f"{q['output_offset']}, "
+                    f"{q['output_multiplier']}, {q['output_shift']}, "
+                    f"{q['activation_min']}, {q['activation_max']})"
+                )
+            elif sspec is not None:
                 # Sharded: a static table of the per-shard arrays, and the
                 # entry point that reads shard i from element 0. The parent
                 # weight symbol is not emitted for this conv at all.
@@ -2587,6 +2865,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         elif op["op"] == "maxpool2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             sh = op["shape"]
+            # C-split tile: its own input planes (sh["C"] is already narrowed).
+            in_ptr = _c_tile_in_offset(op, sh, in_ptr)
             PH, PW = sh.get("PH", 0), sh.get("PW", 0)
             DH, DW = sh.get("DH", 1), sh.get("DW", 1)
             call = (
@@ -3530,10 +3810,15 @@ static inline unsigned long long mb_wall_ticks(void)
     return k_cycle_get_64();
 }"""
 
+    # Only when the graph has an OH tile, so other models emit a
+    # byte-identical model.c.
+    oh_helper_src = ("\n#include <string.h>\n"
+                     + _oh_tile_helper_for(backend, mid)) if oh_plan else ""
+
     c = f"""{HEADER}
 {timer_preamble}
 
-{_emit_parallel_wrappers(mid, used_ops, backend, bool(shard_w_plan))}
+{_emit_parallel_wrappers(mid, used_ops, backend, bool(shard_w_plan))}{oh_helper_src}
 
 /* Per-model intermediate buffers. Defined in a sibling buffers.c (one
  * TU per model, NOT per backend) so the heterogeneous harness's two
