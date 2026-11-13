@@ -74,15 +74,18 @@ def build_graph(ir: dict) -> dict:
 
 
 def output_path(out_root: str, model: str, target: str, hw: str,
-                quant: str) -> str:
-    basename = f"{model}.{quant}"
+                quant: str, suffix: str = "") -> str:
+    # `suffix` distinguishes a rewritten (e.g. split) IR's graph from the
+    # baseline's: <model>.<suffix>.<quant>, so the two never overwrite.
+    basename = f"{model}.{suffix}.{quant}" if suffix else f"{model}.{quant}"
     return os.path.join(
         out_root, model, target, hw, basename,
         f"{basename}_dispatch_graph.json",
     )
 
 
-def emit(ir_path: str, out_root: str, target: str, hw: str) -> str:
+def emit(ir_path: str, out_root: str, target: str, hw: str,
+         suffix: str = "") -> str:
     with open(ir_path) as f:
         ir = json.load(f)
     if not ir.get("ops"):
@@ -95,7 +98,10 @@ def emit(ir_path: str, out_root: str, target: str, hw: str) -> str:
 
     graph = build_graph(ir)
     quant = ir.get("quant", "fp32")
-    out_path = output_path(out_root, ir["name"], target, hw, quant)
+    # NB: the graph deliberately carries no `id_remap` / `split_from` even for
+    # a split IR (build_graph only reads dispatch ids + depends_on): a split
+    # graph is profiled directly, keyed by its own ids.
+    out_path = output_path(out_root, ir["name"], target, hw, quant, suffix)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(graph, f, indent=2)
@@ -111,8 +117,10 @@ def main() -> None:
                     help="target HW label, e.g. generic_riscv64, spacemit_x60")
     ap.add_argument("--hw", required=True,
                     help="HW backend, e.g. RVV, scalar")
+    ap.add_argument("--suffix", default="",
+                    help="basename infix, e.g. 'split' -> <model>.split.<quant>")
     args = ap.parse_args()
-    out_path = emit(args.ir, args.out_root, args.target, args.hw)
+    out_path = emit(args.ir, args.out_root, args.target, args.hw, args.suffix)
     print(f"wrote {out_path}")
 
 
