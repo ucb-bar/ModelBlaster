@@ -9,7 +9,7 @@ one binary with explicit core pinning and inter-network synchronization.
 > **Full canonical pipeline diagram (workload JSON → scheduler → codegen
 > → FireSim → trace plot):** `modelblaster/notes/pipeline_overview.md`.
 > **Parent-repo cross-link** to the XPURT side of the same flow:
-> `../../docs/end_to_end_xpurt_firesim.md`.
+> [`XPU-RT/docs/end_to_end_xpurt_firesim.md`](https://github.com/ucb-bar/XPU-RT/blob/main/docs/end_to_end_xpurt_firesim.md).
 
 ## Origin: built on KernelBlaster
 
@@ -37,8 +37,8 @@ candidates, the cached-kernel reuse model), read the KernelBlaster paper:
 
 ModelBlaster compiles and runs; XPU-RT schedules. They form a closed loop, and
 recent work landed in **both repos together** — read
-[`XPU-RT/docs/the_loop.md`](../docs/the_loop.md) for which script owns which
-arrow, and [`XPU-RT/docs/k1_board.md`](../docs/k1_board.md) to run any of it on
+`XPU-RT/docs/the_loop.md` for which script owns which
+arrow, and `XPU-RT/docs/k1_board.md` to run any of it on
 hardware. The complete composite-target contract is in
 [`docs/xpurt_schedule_sharding.md`](docs/xpurt_schedule_sharding.md).
 
@@ -70,7 +70,7 @@ Three things worth knowing before changing any of them:
   through the wrong layout — dronet at `max_abs_err=51`, no link error. Any new
   emitter must pass `backend`.
 
-Environment: [`XPU-RT/docs/environment.md`](../docs/environment.md). Run this
+Environment: `XPU-RT/docs/environment.md`. Run this
 repo's tests **from this directory** (the curated-kernel verify cross-compiles
 with repo-relative includes), with `CROSS` exported:
 
