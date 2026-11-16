@@ -86,12 +86,42 @@ that kind mode serialises, that hart mode overlaps independent harts and is
 faster, that every hart gets a pinned worker, and that the default emission is
 unchanged. It needs only a C compiler and runs on Linux and macOS.
 
+## Targets whose core kinds are not backend names
+
+On Chipyard a core kind is named after its backend (`rvv`, `gemmini`). On the
+K1/K3 it is not: the K1 registry's kinds are `rvv`/`rvv_c1`, both run by the
+`rvv_x60` backend; the K3's are `x100`/`a100`. When `--backends` has one entry
+per `--core-kinds` entry and the names differ, entry *i* runs kind *i*:
+
+```bash
+--core-kinds rvv,rvv_c1 --backends rvv_x60,rvv_x60
+```
+
+In every other case the emitted walker is unchanged (byte-identical across the
+schedule fixtures). Without this pairing every dispatch on such a target is
+skipped with a `WARN unknown core_kind` and the run still exits 0.
+
+Composite targets (`CPU_P#4+CPU_P#5+...`, one dispatch over several harts) are
+accepted by `ingest_xpurt_schedule` and run on their **first** hart; ingest
+prints how many there were. Spreading such a dispatch over its harts is not
+implemented.
+
+For a static or cross build pass `LDFLAGS=-static` (and `CC=`) to
+`build_posix.sh`; QEMU user mode and board deploys need a static binary.
+
+## Verified
+
+- x86-64 Linux host, real ingest and generator, a real 3-model schedule (826
+  dispatches, 46 instances), both worker modes: every dispatch ran, outputs
+  bit-exact against the golden for `mlp_control`/`dronet`.
+- riscv64 under QEMU user mode (`-cpu max,vlen=256`) and on a SpacemiT K1
+  (Bianbu, Linux 6.6), static cross build with the `rvv_x60` backend, both
+  worker modes: exit 0, 46/46 instances, outputs bit-exact for all three
+  networks.
+
 ## What is not covered yet
 
-- **Not run on a K1 or any Linux machine from this change.** The host test ran
-  on macOS (no thread affinity there, so the pinning path is exercised only by
-  compilation). The original walker + `mb_posix.h` was run on x86-64 and a K1
-  by its author; the per-hart mode and the portable semaphore are new.
+- **Composite targets run on one hart** (see above).
 - **Intermediate buffers are still shared per model**, as in the original
   walker: overlapping periodic instances of one network can race on them. A
   fix belongs in `generate_skeleton.py` (per-instance buffers), not here.
