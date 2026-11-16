@@ -17,7 +17,7 @@
 #   MODEL_NAMES=mlp_control MODEL_DIRS_BASE=/.../generated \
 #   MODEL_BACKENDS=scalar XPURT_SCHEDULE_C=/.../sched.c XPURT_MAIN_C=/.../sched_main.c \
 #   XPURT_INCLUDE_DIR=/.../ OUT=/.../walker \
-#   [CC=gcc] [CFLAGS_COMMON=-O2] [KERNEL_CFLAGS_<BACKEND>="-march=..."] \
+#   [CC=gcc] [CFLAGS_COMMON=-O2] [LDFLAGS=-static] [KERNEL_CFLAGS_<BACKEND>="-march=..."] \
 #   [MODELBLASTER_POOL_THREADS=N] [MODELBLASTER_XPURT_TRACE=1] \
 #       bash harness_xpurt/build_posix.sh
 set -euo pipefail
@@ -103,5 +103,6 @@ MAIN_DEFS=()
 cc "${WORK}/xpurt_sched.o" "${XPURT_SCHEDULE_C}" -iquote "${STAGE}" -iquote "${XPURT_INCLUDE_DIR}"
 cc "${WORK}/xpurt_main.o"  "${XPURT_MAIN_C}"     -iquote "${STAGE}" -iquote "${XPURT_INCLUDE_DIR}" "${MAIN_DEFS[@]}"
 
-"${CC}" "${OBJS[@]}" -pthread -lm -o "${OUT}"
+# shellcheck disable=SC2086  # LDFLAGS is a deliberate word list
+"${CC}" "${OBJS[@]}" ${LDFLAGS:-} -pthread -lm -o "${OUT}"
 echo "build_posix: wrote ${OUT}"
