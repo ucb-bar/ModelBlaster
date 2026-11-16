@@ -115,6 +115,12 @@ def _emit(networks: list[str], schedule_name: str,
     for k in list(core_kinds) + list(backends):
         if k not in all_kinds:
             all_kinds.append(k)
+    # Which backend runs each kind. Original behaviour (kind == backend tag)
+    # unless the two lists line up one-to-one and name different things.
+    if len(backends) == len(core_kinds) and list(backends) != list(core_kinds):
+        kind_backend_pairs = list(zip(core_kinds, backends))
+    else:
+        kind_backend_pairs = [(bs, bs) for bs in backends]
     inc_lines: list[str] = []
     state_decls: list[str] = []
     state_inits: list[str] = []
@@ -176,7 +182,7 @@ def _emit(networks: list[str], schedule_name: str,
         # dispatch table + the renamed profile API. The harness CMakeLists
         # builds a separate OBJECT lib per pair so these live in distinct
         # TUs and link without collision.
-        for bs in backends:
+        for bs in dict.fromkeys(backends):
             BS = bs.upper()
             forward_decls.append(
                 f"extern const model_{mid}_dispatch_fn "
@@ -190,16 +196,18 @@ def _emit(networks: list[str], schedule_name: str,
             reset_calls.append(f"    model_{mid}_reset_profile_{bs}();")
 
         # Build the per-backend selection inside the dispatch branch.
-        # core_kind comes from the schedule and matches the backend tag;
-        # we dispatch with the per-(network, kind) state struct so
-        # `.pool` is the running kind's, with no per-dispatch write.
+        # core_kind comes from the schedule; we dispatch with the
+        # per-(network, kind) state struct so `.pool` is the running
+        # kind's, with no per-dispatch write. On Chipyard the kind IS the
+        # backend tag. Where they differ (K1/K3: kinds x100/a100, backends
+        # rvv_k3/ime_k3_a100) --backends pairs with --core-kinds by position.
         bs_select_lines: list[str] = []
-        for i, bs in enumerate(backends):
+        for i, (kind, bs) in enumerate(kind_backend_pairs):
             BS = bs.upper()
             kw = "if" if i == 0 else "else if"
             bs_select_lines.append(
-                f'            {kw} (strcmp(e_->core_kind, "{bs}") == 0) {{\n'
-                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{bs});\n"
+                f'            {kw} (strcmp(e_->core_kind, "{kind}") == 0) {{\n'
+                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{kind});\n"
                 f"            }}"
             )
         bs_select_lines.append(
@@ -717,6 +725,9 @@ def main() -> None:
                          "for (== per-model OBJECT-lib suffixes). The walker "
                          "forward-declares MODEL_<UMID>_DISPATCH_FNS_<BS> for "
                          "each backend and dispatches by core_kind. "
+                         "If it has one entry per --core-kinds entry and the "
+                         "names differ, entry i runs kind i (e.g. kinds "
+                         "x100,a100 with backends rvv_k3,ime_k3_a100). "
                          "Defaults to --core-kinds.")
     ap.add_argument("--registry", default=None,
                     help="path to the cores/*.json registry that drove the "
