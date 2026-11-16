@@ -94,7 +94,19 @@ def _resolve_target(core_label: str,
     tells us which kind in the registry corresponds to each slot
     (e.g. CPU_P -> rvv, CPU_E -> scalar). We then pick the n-th core of
     that kind.
+
+    A composite target ("CPU_P#4+CPU_P#5+...", one dispatch spread over
+    several harts) runs on its FIRST hart: this walker has no per-dispatch
+    multi-hart execution. Every part must resolve, and to the same kind.
     """
+    if "+" in core_label:
+        parts = [p.strip() for p in core_label.split("+")]
+        resolved = [_resolve_target(p, cpu_p_kind, cpu_e_kind, reg) for p in parts]
+        kinds = {k for _, k, _ in resolved}
+        if len(kinds) != 1:
+            raise ValueError(f"composite target {core_label!r} mixes core kinds "
+                             f"{sorted(kinds)}; one dispatch must stay on one kind")
+        return resolved[0]
     label, _, idx_str = core_label.partition("#")
     idx = int(idx_str) if idx_str else 0
     if label.upper() == "CPU_P":
@@ -449,6 +461,11 @@ def _main() -> None:
     for e in entries:
         by_kind[e.core_kind] = by_kind.get(e.core_kind, 0) + 1
     print(f"by core kind: {dict(sorted(by_kind.items()))}")
+    with open(args.schedule) as f:
+        n_comp = sum("+" in d.get("hardware_target", "")
+                     for d in json.load(f).get("dispatches", {}).values())
+    if n_comp:
+        print(f"note: {n_comp} composite (multi-hart) targets run on their first hart")
     by_net: dict[str, int] = {}
     for e in entries:
         by_net[e.job_name] = by_net.get(e.job_name, 0) + 1
