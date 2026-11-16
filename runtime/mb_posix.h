@@ -30,15 +30,25 @@
 #ifndef MB_POSIX_H_
 #define MB_POSIX_H_
 
-#ifndef _GNU_SOURCE
-#error "mb_posix.h needs _GNU_SOURCE (pthread_setaffinity_np, CPU_SET); \
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#error "mb_posix.h needs _GNU_SOURCE on Linux (pthread_setaffinity_np, CPU_SET); \
 define it before the first #include, e.g. -D_GNU_SOURCE"
+#endif
+
+/* Linux is the target (host x86-64/aarch64 and boards such as the SpacemiT
+ * K1). Other POSIX hosts (macOS) are supported only so the walker can be
+ * built and unit-tested there: no thread affinity, and semaphores built on a
+ * mutex and condition variable because macOS has no unnamed sem_t. */
+#if defined(__linux__)
+#define MB_POSIX_LINUX 1
 #endif
 
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#ifdef MB_POSIX_LINUX
 #include <semaphore.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,7 +69,7 @@ define it before the first #include, e.g. -D_GNU_SOURCE"
 #endif
 /* Pinning is always available on Linux; the pool keys its affinity code
  * off this Zephyr symbol. */
-#ifndef CONFIG_POSIX_THREADS_AFFINITY
+#if defined(MB_POSIX_LINUX) && !defined(CONFIG_POSIX_THREADS_AFFINITY)
 #define CONFIG_POSIX_THREADS_AFFINITY 1
 #endif
 
@@ -75,6 +85,7 @@ typedef struct {
  * uses limit-1 semaphores as one-shot start/done signals between a fixed
  * producer and consumer, where a give is never issued twice without an
  * intervening take, so the check below only guards against misuse. */
+#ifdef MB_POSIX_LINUX
 struct k_sem {
 	sem_t s;
 	unsigned int limit;
@@ -127,6 +138,69 @@ static inline void k_sem_give(struct k_sem *sem)
 	}
 	sem_post(&sem->s);
 }
+#else /* portable fallback: mutex + condition variable */
+struct k_sem {
+	pthread_mutex_t m;
+	pthread_cond_t c;
+	unsigned int count;
+	unsigned int limit;
+};
+
+static inline int k_sem_init(struct k_sem *sem, unsigned int initial,
+			     unsigned int limit)
+{
+	sem->limit = limit;
+	sem->count = initial;
+	if (pthread_mutex_init(&sem->m, NULL) != 0) {
+		return -EINVAL;
+	}
+	return pthread_cond_init(&sem->c, NULL) == 0 ? 0 : -EINVAL;
+}
+
+static inline int k_sem_take(struct k_sem *sem, k_timeout_t t)
+{
+	int rc = 0;
+	pthread_mutex_lock(&sem->m);
+	if (t.ns == 0) {
+		if (sem->count == 0) {
+			rc = -EBUSY;
+		}
+	} else if (t.ns > 0) {
+		struct timespec dl;
+		clock_gettime(CLOCK_REALTIME, &dl);
+		dl.tv_sec += t.ns / 1000000000LL;
+		dl.tv_nsec += t.ns % 1000000000LL;
+		if (dl.tv_nsec >= 1000000000L) {
+			dl.tv_sec++;
+			dl.tv_nsec -= 1000000000L;
+		}
+		while (sem->count == 0 && rc == 0) {
+			if (pthread_cond_timedwait(&sem->c, &sem->m, &dl) != 0) {
+				rc = -EAGAIN;
+			}
+		}
+	} else {
+		while (sem->count == 0) {
+			pthread_cond_wait(&sem->c, &sem->m);
+		}
+	}
+	if (rc == 0) {
+		sem->count--;
+	}
+	pthread_mutex_unlock(&sem->m);
+	return rc;
+}
+
+static inline void k_sem_give(struct k_sem *sem)
+{
+	pthread_mutex_lock(&sem->m);
+	if (sem->count < sem->limit) { /* saturate, as Zephyr does */
+		sem->count++;
+		pthread_cond_signal(&sem->c);
+	}
+	pthread_mutex_unlock(&sem->m);
+}
+#endif /* MB_POSIX_LINUX */
 
 /* ---- time ----------------------------------------------------------- */
 static inline uint64_t k_cycle_get_64(void)
@@ -183,11 +257,17 @@ static inline void k_yield(void)
  * mask. Returns 0 or a negative errno, as Zephyr does. */
 static inline int k_thread_cpu_pin(k_tid_t thread, int cpu)
 {
+#ifdef MB_POSIX_LINUX
 	cpu_set_t cs;
 	CPU_ZERO(&cs);
 	CPU_SET(cpu, &cs);
 	int r = pthread_setaffinity_np(thread, sizeof(cs), &cs);
 	return r == 0 ? 0 : -r;
+#else
+	(void)thread; /* no affinity API on this host; ordering is unaffected */
+	(void)cpu;
+	return 0;
+#endif
 }
 
 /* On Zephyr these stop the scheduler preempting the current thread while it
