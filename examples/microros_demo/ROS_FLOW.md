@@ -68,7 +68,7 @@ Behavioural knobs (build-time `-D` flags forwarded from env):
 
 Prereqs:
 ```bash
-cd /scratch2/dima/misc_sw/FreshScheduler/zephyr-chipyard-sw
+cd <XPU-RT>/zephyr-chipyard-sw
 source tools/miniforge3/etc/profile.d/conda.sh && conda activate zephyr
 source scripts/set_envvars_sdk.sh
 ```
@@ -92,7 +92,7 @@ bash modelblaster/examples/microros_demo/run.sh
 
 Analyze:
 ```bash
-cp /scratch2/dima/chipyard-fsim/sims/firesim/firesim_rundir/sim_slot_0/uartlog \
+cp $CHIPYARD_ROOT/sims/firesim/firesim_rundir/sim_slot_0/uartlog \
    data/microros_3net_q31_firesim_configB.txt
 
 python3 scripts/plot_microros_trace.py \
@@ -129,7 +129,7 @@ These are things that get done by hand each time and would benefit from
 either being baked into `run.sh`, a new helper script, or `firesim_runner.py`.
 
 1. **uartlog snapshot.** After every successful run we manually `cp
-   /scratch2/dima/chipyard-fsim/.../uartlog
+   $CHIPYARD_ROOT/.../uartlog
    data/microros_<config>.txt`. The runner could optionally save its
    uartlog under `data/` with a `--snapshot-label` flag.
 

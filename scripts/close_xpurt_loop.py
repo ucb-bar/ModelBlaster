@@ -43,7 +43,7 @@ def _resolve_xpurt_root() -> Path:
     two entry points this script calls: xpu-rt/advisor.py and
     xpu-rt/plot_gantt.py.
 
-    Replaces a hardcoded /scratch2/<user>/XPU-RT, which made this script
+    Replaces a hardcoded absolute XPU-RT path, which made this script
     runnable by exactly one person.
     """
     env = os.environ.get("XPURT_ROOT")

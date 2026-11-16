@@ -280,7 +280,7 @@ def main():
     p.add_argument("--ir-dir",
                    default="modelblaster/examples/yolov8_nano/int8/generated")
     p.add_argument("--spike",
-                   default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
+                   default="spike")
     # A string, not an int: MODELBLASTER_YOLOV8N_INPUT accepts `96` or the
     # rectangular `64x96` (H x W), and int() would reject the latter with a
     # ValueError from argparse's default rather than a useful message.

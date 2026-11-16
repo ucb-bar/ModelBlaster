@@ -53,7 +53,7 @@ simultaneous ROS nodes.
 
 ### Prerequisites
 ```bash
-cd /scratch2/dima/misc_sw/FreshScheduler/zephyr-chipyard-sw
+cd <XPU-RT>/zephyr-chipyard-sw
 source tools/miniforge3/etc/profile.d/conda.sh && conda activate zephyr
 source scripts/set_envvars_sdk.sh
 ```

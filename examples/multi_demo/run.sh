@@ -183,8 +183,8 @@ print(' '.join(b.spike_args))
     done
     SPIKE_BIN_FLAGS=()
     if [[ "${TARGET}" == "gemmini" ]]; then
-        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-${RISCV:-}/bin/spike}"
+        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-${RISCV:-}/lib}"
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
             export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"

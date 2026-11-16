@@ -7,7 +7,7 @@
 # Env: BENCH_FILE (required, level1 .py path); TARGET={scalar,rvv} (default rvv);
 #      BACKEND={reference,llm} (default reference); QUANT={fp32} (default fp32);
 #      RUNNER={spike,firesim,native} (default spike);
-#      MB_KB_DATA_ROOT (default /scratch/dima/mb_kb; set empty to disable) —
+#      MB_KB_DATA_ROOT (default empty = disabled; set to a roomy disk) —
 #        the per-bench generated/build data (which reaches many GB at stock
 #        dims) is placed here via a symlink so it lands on a roomy/fast disk
 #        instead of filling the repo's partition; parallel-safe (per-bench dir).
@@ -21,8 +21,8 @@ _BASE="$(basename "${BENCH_FILE}" .py)"
 KB_NAME="kb_$(echo "${_BASE}" | sed 's/[^A-Za-z0-9_]/_/g; s/__*/_/g; s/^_//; s/_$//')"
 MODEL_NAME="kernelbench/${KB_NAME}"
 
-# Redirect the heavy per-bench data dir onto a roomy disk (default: /scratch).
-: "${MB_KB_DATA_ROOT:=/scratch/dima/mb_kb}"
+# Redirect the heavy per-bench data dir onto a roomy disk when MB_KB_DATA_ROOT is set.
+: "${MB_KB_DATA_ROOT:=}"
 if [[ -n "${MB_KB_DATA_ROOT}" ]]; then
     _kb_local="${REPO_ROOT}/modelblaster/examples/kernelbench/${KB_NAME}"
     _kb_data="${MB_KB_DATA_ROOT}/${KB_NAME}"

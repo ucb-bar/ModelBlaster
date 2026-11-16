@@ -13,7 +13,7 @@ import json, os, subprocess, sys, textwrap
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CROSS = os.environ.get("CROSS",
-    "/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-")
+    "riscv64-unknown-linux-gnu-")
 HOST = os.environ.get("MODELBLASTER_K1_HOST", "k1")
 REMOTE = os.environ.get("MODELBLASTER_K1_REMOTE_ROOT", "/root/mb_k1") + "/ime_conv"
 OUT = os.path.join(REPO, "artifacts", "ime_conv")

@@ -72,7 +72,7 @@ paths are relative to the spec file, and `${VAR}` is expanded; an unset variable
  "knowledge": {"mined": false},
  "seeds": [0, 1, 2], "max_parallel": 2,
  "budget": {"usd": 3.0, "est_usd_per_run": 0.3, "who": "ablate",
-            "ledger": "/scratch/dima/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+            "ledger": "../work/llm_budget/ledger.jsonl"},
  "arms": {"v1": {"flags": {"--knowledge": "v1"}},
           "v2": {"flags": {"--knowledge": "v2"}}}
 }

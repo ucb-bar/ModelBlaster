@@ -85,10 +85,6 @@ if [[ -z "${MODELBLASTER_OCTO_BRIDGE:-}" ]]; then
         [[ "${_d}" == "/" ]] && break
     done
 fi
-if [[ -z "${MODELBLASTER_OCTO_BRIDGE:-}"       && -f /scratch2/dima/misc_sw/octo_work/bridge_episodes.pkl ]]; then
-    # The port's own working tree, outside the repo. Read-only.
-    export MODELBLASTER_OCTO_BRIDGE=/scratch2/dima/misc_sw/octo_work/bridge_episodes.pkl
-fi
 if [[ -n "${MODELBLASTER_OCTO_BRIDGE:-}" ]]; then
     echo "  octo calibration: ${MODELBLASTER_OCTO_BRIDGE}"
     NUM_CALIBRATION="${NUM_CALIBRATION:-8}"

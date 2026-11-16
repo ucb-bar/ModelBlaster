@@ -583,14 +583,14 @@ print(' '.join(b.spike_args))
     fi
     # Gemmini backend (incl. Q31 variant) needs the chipyard spike (has
     # --extension=gemmini support + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE
-    # env if set, else chipyard path. The Q31 acc_scale variant uses the same
+    # env if set, else $RISCV/bin/spike (Chipyard's env.sh sets RISCV). The Q31 acc_scale variant uses the same
     # spike binary; MODELBLASTER_GEMMINI_LIB_DIR is normally per-config under
     # cores/gemmini/include/per_config/<sub>/libgemmini.so — see
     # modelblaster/scripts/validate_q31_matrix.sh.
     SPIKE_BIN_FLAGS=()
     if [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" || "${GEN_TARGET}" == "gemmini_q31_rvv" ]]; then
-        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-${RISCV:-}/bin/spike}"
+        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-${RISCV:-}/lib}"
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
             export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
@@ -599,11 +599,11 @@ print(' '.join(b.spike_args))
     # rvv_opu backend needs the OPU-extended spike from
     # hw/chipyard/toolchains/riscv-tools/riscv-isa-sim (built via
     # customext/saturn_opu.cc). Use MODELBLASTER_OPU_SPIKE env if set, else
-    # the local chipyard-tree path. The customext .so lives next to
+    # $RISCV/bin/spike from a Chipyard tree built with the OPU extension. The customext .so lives next to
     # the binary so LD_LIBRARY_PATH points at the same install lib dir.
     if [[ "${GEN_TARGET}" == "rvv_opu" ]]; then
-        _OPU_SPIKE="${MODELBLASTER_OPU_SPIKE:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/bin/spike}"
-        _OPU_LIB_DIR="${MODELBLASTER_OPU_LIB_DIR:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/lib}"
+        _OPU_SPIKE="${MODELBLASTER_OPU_SPIKE:-${RISCV:-}/bin/spike}"
+        _OPU_LIB_DIR="${MODELBLASTER_OPU_LIB_DIR:-${RISCV:-}/lib}"
         if [[ -f "${_OPU_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_OPU_SPIKE}")
             export LD_LIBRARY_PATH="${_OPU_LIB_DIR}:${LD_LIBRARY_PATH:-}"

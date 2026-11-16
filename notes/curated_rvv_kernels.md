@@ -56,9 +56,9 @@ See also: `notes/mixed_precision_plan.md`, and the project memory
 ## 1. Environment
 
 ```bash
-MB=/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/ModelBlaster
-ZCS=/scratch/dima/rose-infra/RoSE/soc/sw/xpu-rt/zephyr-chipyard-sw
-PY=/scratch2/dima/miniforge3/envs/xpurt/bin/python     # has torch + requests
+MB=<path>/ModelBlaster
+ZCS=<path>/zephyr-chipyard-sw
+PY=python3     # an env with torch + requests
 
 cd $ZCS
 source scripts/activate_conda.sh      # conda env 'zephyr' -> provides west

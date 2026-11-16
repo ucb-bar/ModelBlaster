@@ -131,13 +131,12 @@ def _west_build(
 
 def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
     # Gemmini backend needs a spike binary with --extension=gemmini support
-    # (the default /scratch2/dima/misc_sw/spike doesn't have it). Check
-    # MODELBLASTER_GEMMINI_SPIKE first, then fall back to the chipyard toolchain.
-    _GEMMINI_SPIKE_FALLBACK = (
-        "/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike"
-    )
+    # (a stock spike doesn't have it). Check MODELBLASTER_GEMMINI_SPIKE first,
+    # then fall back to the Chipyard toolchain under $RISCV.
+    _riscv = os.environ.get("RISCV", "")
+    _GEMMINI_SPIKE_FALLBACK = os.path.join(_riscv, "bin", "spike") if _riscv else ""
     _GEMMINI_LIB_FALLBACK = (
-        "/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so"
+        os.path.join(_riscv, "lib", "libgemmini.so") if _riscv else ""
     )
     if "--extension=gemmini" in backend.spike_args:
         spike = os.environ.get("MODELBLASTER_GEMMINI_SPIKE")
@@ -151,9 +150,10 @@ def _spike_run(elf: str, backend: Backend, timeout: float) -> tuple[bool, str]:
             os.environ.get("MODELBLASTER_GEMMINI_LIB", _GEMMINI_LIB_FALLBACK)
         )
         _env = os.environ.copy()
-        _env["LD_LIBRARY_PATH"] = (
-            _lib_dir + ":" + _env.get("LD_LIBRARY_PATH", "")
-        ).rstrip(":")
+        if _lib_dir:
+            _env["LD_LIBRARY_PATH"] = (
+                _lib_dir + ":" + _env.get("LD_LIBRARY_PATH", "")
+            ).rstrip(":")
     elif backend.name == "zvt":
         # Zvt needs an upstream spike with "Add Zvt support"
         # (riscv-isa-sim >= 72958551); the default spike rejects

@@ -92,7 +92,7 @@ JOBS="$(nproc)"
 HOST="${MODELBLASTER_K1_HOST:-k1}"
 REMOTE_ROOT="${MODELBLASTER_K1_REMOTE_ROOT:-/root/mb_k1}"
 RT_PRIORITY="${MODELBLASTER_K1_RT_PRIORITY:-}"
-CROSS="${CROSS:-/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-}"
+CROSS="${CROSS:-riscv64-unknown-linux-gnu-}"
 PY="${PY:-python3}"
 # Same import root the single-model runner uses.
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"

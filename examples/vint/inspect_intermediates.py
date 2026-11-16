@@ -72,7 +72,7 @@ def main():
     p.add_argument("--ir-dir",
                    default="modelblaster/examples/vint/int8/generated")
     p.add_argument("--spike",
-                   default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
+                   default="spike")
     p.add_argument("--spike-isa", default="rv64gcv_zicntr",
                    help="ISA passed via --isa= to spike. Use "
                         "rv64gcv_zicntr_zfh for fp16 binaries — without "

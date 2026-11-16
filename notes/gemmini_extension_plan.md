@@ -225,7 +225,7 @@ which is how the disassembler renders the custom-3 R-type opcode 0x07b
 **Runtime blocked by libgemmini.so / vendored-headers config drift**:
 
 ```
-$ /scratch2/dima/misc_sw/spike --extension=gemmini ...
+$ spike --extension=gemmini ...
 *** Booting Zephyr OS build ***
 modelblaster harness: model=dronet in=37632 out=2
 terminate called after throwing an instance of 'std::out_of_range'

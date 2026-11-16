@@ -234,8 +234,8 @@ if [[ "${RUNNER}" == "spike" ]]; then
     if [[ -z "${SPIKE_BIN}" ]]; then
         if [[ ",${BACKENDS}," == *,gemmini,* || ",${BACKENDS}," == *,gemmini_q31,* ]]; then
             # gemmini ROCC ops → chipyard spike with --extension=gemmini
-            SPIKE_BIN="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-            export LD_LIBRARY_PATH="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}:${LD_LIBRARY_PATH:-}"
+            SPIKE_BIN="${MODELBLASTER_GEMMINI_SPIKE:-${RISCV:-}/bin/spike}"
+            export LD_LIBRARY_PATH="${MODELBLASTER_GEMMINI_LIB_DIR:-${RISCV:-}/lib}:${LD_LIBRARY_PATH:-}"
         fi
     fi
     SPIKE_CMD=()

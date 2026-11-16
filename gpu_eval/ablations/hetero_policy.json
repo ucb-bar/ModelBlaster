@@ -13,7 +13,7 @@
  "knowledge": {"mined": false},
  "seeds": [0, 1], "max_parallel": 2,
  "budget": {"usd": 5.0, "est_usd_per_run": 0.6, "who": "ablate",
-            "ledger": "/scratch/dima/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+            "ledger": "../work/llm_budget/ledger.jsonl"},
  "arms": {"haiku": {"flags": {"--hetero-policy": "never"}},
           "category": {"flags": {"--model-hard": "us.anthropic.claude-sonnet-5-5",
                                  "--hetero-policy": "category,fix-escalate"}},

@@ -549,7 +549,7 @@ decodes them. Two existing paths:
 
 - **gemmini** — chipyard ships a `--extension=gemmini` spike fork.
   `modelblaster/examples/_run_lib.sh` finds it via `MODELBLASTER_GEMMINI_SPIKE`
-  env, defaults to `/scratch2/dima/chipyard-fsim/.conda-env/...`.
+  env, defaults to `$RISCV/bin/spike` (Chipyard's `env.sh` sets `RISCV`).
 - **rvv_opu** — custom spike extension at
   `hw/chipyard/toolchains/riscv-tools/riscv-isa-sim/customext/saturn_opu.cc`
   (in-repo functional model of `VOPACC` / `OPMVINBCAST` / `VMV_VR` /

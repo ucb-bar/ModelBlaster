@@ -44,7 +44,7 @@ from modelblaster.pipeline.reference_kernels import (  # noqa: E402
 
 CROSS = os.environ.get(
     "CROSS",
-    "/scratch2/agustin/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-",
+    "riscv64-unknown-linux-gnu-",
 )
 HOST = os.environ.get("MODELBLASTER_K1_HOST", "k1")
 REMOTE_ROOT = os.environ.get("MODELBLASTER_K1_REMOTE_ROOT", "/root/mb_k1")

@@ -9,14 +9,13 @@
 #   - benchmarks/arms/arm_*          (uses both)
 #
 # Designed to be idempotent: re-sourcing in an already-activated shell is
-# harmless. Paths are pinned to the host this repo lives on; if they move,
-# edit the constants below.
+# harmless. Set CHIPYARD_ROOT, ZEPHYR_BASE and ZEPHYR_SDK_INSTALL_DIR first.
 
-# ---- pinned paths (host-specific) -----------------------------------------
+# ---- host paths (from the environment) ------------------------------------
 
-_MB_CHIPYARD_CONDA="/scratch2/agustin/chipyard/.conda-env"
-_MB_ZEPHYR_BASE="/scratch2/agustin/zephyr-chipyard-sw/zephyr_ws/zephyr"
-_MB_ZEPHYR_SDK="/scratch2/dima/zephyr-chipyard-sw-fresh/tools-manual/zephyr-sdk-1.0.0-beta1"
+_MB_CHIPYARD_CONDA="${CHIPYARD_ROOT:-}/.conda-env"
+_MB_ZEPHYR_BASE="${ZEPHYR_BASE:-}"
+_MB_ZEPHYR_SDK="${ZEPHYR_SDK_INSTALL_DIR:-}"
 
 # ---- resolve repo root (no matter where you sourced from) -----------------
 
@@ -63,18 +62,13 @@ fi
 # Both are skipped silently when their prerequisites aren't present so
 # spike-only sessions don't hit avoidable warnings.
 
-_MB_FIRESIM_DIR="/scratch2/agustin/chipyard/sims/firesim"
+_MB_FIRESIM_DIR="${FIRESIM_ROOT:-${CHIPYARD_ROOT:-}/sims/firesim}"
 _MB_FIRESIM_SSH_KEY="${HOME}/.ssh/firesim"
 
-# Point validation/firesim_runner.py at OUR install (agustin's) -- the
-# bitstream there is alveo_u250_firesim_shuttle_gemmini_opu (the
-# GemminiAndOPUShuttleConfig hetero, tile 0 Gemmini RoCC + tile 1 Saturn
-# OPU). dima's install has dual-rocket-saturn-gemmini-q31 but the logs
-# dir under that tree is not writable by us, so firesim CLI invocations
-# from this user can't complete there. Override via FIRESIM_ROOT /
-# FIRESIM_ENV if pointing at a different chipyard install.
+# Point validation/firesim_runner.py at the Chipyard install's FireSim.
+# Override via FIRESIM_ROOT / FIRESIM_ENV for a different install.
 export FIRESIM_ROOT="${FIRESIM_ROOT:-${_MB_FIRESIM_DIR}}"
-export FIRESIM_ENV="${FIRESIM_ENV:-/scratch2/agustin/chipyard/env.sh}"
+export FIRESIM_ENV="${FIRESIM_ENV:-${CHIPYARD_ROOT:-}/env.sh}"
 
 if [ -f "${_MB_FIRESIM_DIR}/sourceme-manager.sh" ]; then
     # sourceme-manager appends ${dir}/deploy to PATH so the `firesim`

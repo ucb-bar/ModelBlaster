@@ -370,7 +370,7 @@ print(' '.join(out))
             exit 1
         fi
     fi
-    SPIKE_BIN_DEFAULT="/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike"
+    SPIKE_BIN_DEFAULT="${RISCV:-}/bin/spike"
     if [[ ",${BACKENDS}," == *,gemmini,* && -z "${SPIKE_BIN:-}" ]]; then
         if [[ -x "${SPIKE_BIN_DEFAULT}" ]]; then
             SPIKE_BIN="${SPIKE_BIN_DEFAULT}"

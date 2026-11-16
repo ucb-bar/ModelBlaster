@@ -71,7 +71,7 @@ def _resolve_xpurt_root() -> Path:
     In order: an explicit `XPURT_ROOT`; the parent directory, which is where
     it is when ModelBlaster is the `XPU-RT/ModelBlaster` submodule (the normal
     case); then a sibling checkout. This used to be a hardcoded
-    /scratch2/<user>/XPU-RT, so the loop only ran for one person on one box.
+    absolute XPU-RT path, so the loop only ran for one person on one box.
 
     Returns the best candidate even when nothing validates, so the caller
     fails on a path it actually tried rather than on an empty string.

@@ -39,7 +39,7 @@ if [[ "${FORCE_EXTRACT:-0}" == "1" \
       || ! -f "${IR_DIR}/io.npz" ]]; then
     echo "[vint] extract_graph_export (xpurt env) -> ${IR_DIR}"
     mkdir -p "${IR_DIR}"
-    XPURT_PY="${XPURT_PY:-/scratch2/dima/miniforge3/envs/xpurt/bin/python}"
+    XPURT_PY="${XPURT_PY:-python3}"
     EXTRA_ARGS=()
     if [[ "${PC_FLAG}" == "1" ]]; then EXTRA_ARGS+=(--per-channel); fi
     PYTHONPATH="${REPO_ROOT}" "${XPURT_PY}" -m modelblaster.pipeline.extract_graph_export \

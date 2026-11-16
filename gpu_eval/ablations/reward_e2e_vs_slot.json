@@ -13,7 +13,7 @@
  "knowledge": {"mined": false},
  "seeds": [0, 1, 2], "max_parallel": 2,
  "budget": {"usd": 3.0, "est_usd_per_run": 0.25, "who": "ablate",
-            "ledger": "/scratch/dima/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+            "ledger": "../work/llm_budget/ledger.jsonl"},
  "arms": {"e2e": {"flags": {"--reward": "e2e"}},
           "slot": {"flags": {"--reward": "slot"}}}
 }

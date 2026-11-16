@@ -5,7 +5,7 @@ Loads the deployable v12 CNN checkpoint into ``FusedSensorNet(vision_encoder=
 exposes the two single-input feed-forward sub-branches (vision, depth) as plain
 conv/relu/linear wrappers that ModelBlaster can lower like DroNet.
 
-The collaborator's files under /scratch/agustin are NOT modified; we only add
+The ViT-Fly sources (MODELBLASTER_VITFLY_MODELS) are NOT modified; we only add
 their directory to sys.path so ``fused_model`` and its ``ViTsubmodules`` import
 resolve.
 """
@@ -19,12 +19,9 @@ import sys
 import torch
 import torch.nn as nn
 
-_VITFLY_MODELS = "/scratch/agustin/projects/DIMA/vitfly/models"
+_VITFLY_MODELS = os.environ.get("MODELBLASTER_VITFLY_MODELS", "vitfly/models")
 _FUSED_SRC = os.path.join(_VITFLY_MODELS, "fused_model.py")
-_CKPT = (
-    "/scratch/agustin/projects/DIMA/train_out/"
-    "fused_bc_warehouse_v12_mixed_cnn/2026-08-03_19-51-49/best.pt"
-)
+_CKPT = "fused_bc_warehouse_v12_mixed_cnn/best.pt"  # set MODELBLASTER_FUSED_CKPT
 
 
 def _load_fused_module():

@@ -111,7 +111,7 @@ def main():
     p.add_argument("--ir-dir",
                    default="modelblaster/examples/vint/int8/generated")
     p.add_argument("--spike",
-                   default="/scratch2/dima/miniforge3/envs/zephyr/bin/spike")
+                   default="spike")
     p.add_argument("--waypoint-idx", type=int, default=2)
     p.add_argument("--omega-gain", type=float, default=2.0)
     p.add_argument("--onnx-int8", default=str(

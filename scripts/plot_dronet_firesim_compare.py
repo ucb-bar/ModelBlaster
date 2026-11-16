@@ -15,6 +15,7 @@ ET per-op : /tmp/et_fs_dronet_prof.uartlog  — an XNNPACK-profiling FireSim run
             polluted by HTIF logging, which is why the full-model total comes
             from the separate profiling-off run — see FULL_* below).
 """
+import os
 import csv
 import re
 import sys
@@ -23,7 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-REPO = "/scratch2/dima/misc_sw/FreshScheduler/zephyr-chipyard-sw"
+REPO = os.environ.get("ZCS_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 MB_CSV = f"{REPO}/modelblaster/examples/dronet/int8/generated/profile.csv"
 ET_LOG = "/tmp/et_fs_dronet_prof.uartlog"
 OUT = f"{REPO}/plots/dronet_firesim_compare.png"

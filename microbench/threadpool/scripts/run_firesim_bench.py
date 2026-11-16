@@ -21,9 +21,9 @@ import sys
 import time
 
 DEFAULT_FIRESIM_ROOT = os.environ.get(
-    "FIRESIM_ROOT", "/scratch2/dima/chipyard-fsim/sims/firesim")
+    "FIRESIM_ROOT", os.path.expandvars("$CHIPYARD_ROOT/sims/firesim"))
 DEFAULT_FIRESIM_ENV = os.environ.get(
-    "FIRESIM_ENV", "/scratch2/dima/chipyard-fsim/env.sh")
+    "FIRESIM_ENV", os.path.expandvars("$CHIPYARD_ROOT/env.sh"))
 DEFAULT_FIRESIM_SLOT = os.environ.get(
     "FIRESIM_SLOT", "firesim_rundir/sim_slot_0")
 DEFAULT_FIRESIM_BINARY_BASENAME = "zephyr0-zephyr.elf"
@@ -45,7 +45,6 @@ def _firesim_cmd(firesim_env: str, firesim_root: str,
         f"set -e; "
         f"unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER "
         f"      CONDA_PYTHON_EXE CONDA_SHLVL CONDA_EXE _CE_M _CE_CONDA; "
-        f"export PATH=/scratch2/dima/miniforge3/condabin:$PATH; "
         f"source {firesim_env}; "
         f"cd {firesim_root}; "
         f"source ./sourceme-manager.sh --skip-ssh-setup; "

@@ -12,7 +12,7 @@
  "knowledge": {"mined": false},
  "seeds": [0, 1], "max_parallel": 2,
  "budget": {"usd": 4.0, "est_usd_per_run": 0.8, "who": "ablate",
-            "ledger": "/scratch/dima/BlasterMerge/gpu_eval/work/llm_budget/ledger.jsonl"},
+            "ledger": "../work/llm_budget/ledger.jsonl"},
  "arms": {"ncu_off": {"flags": {}},
           "ncu_best": {"flags": {"--ncu": "best"}}}
 }

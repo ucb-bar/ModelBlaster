@@ -393,8 +393,8 @@ def execute_run_sh(
                 f"workload {workload.id!r} targets {workload.target} but "
                 f"its row in workloads.yaml has no xpurt_schedule_path. "
                 f"Generate a schedule via FreshScheduler "
-                f"(/scratch2/dima/misc_sw/FreshScheduler/scripts/"
-                f"run_xpurt_schedule.py) and point the workload at it."
+                f"(XPU-RT's scripts/run_xpurt_schedule.py) and point the "
+                f"workload at it."
             )
         hetero_env_overlay(workload, env)
         run_sh = xpurt_demo_run_sh()

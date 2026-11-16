@@ -13,7 +13,7 @@ Source format -- a pickle holding a list of episodes, each a dict:
      "actions": ndarray (T, action_dim) float32}
 
 which is what the upstream Octo benchmarks used
-(`/scratch2/dima/misc_sw/octo_work/bridge_episodes.pkl`).
+(set `MODELBLASTER_OCTO_BRIDGE` to its path).
 
 Spec fields:
     loader:      "bridge_episodes"        (required)
