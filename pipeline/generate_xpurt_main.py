@@ -68,7 +68,8 @@ def _emit(networks: list[str], schedule_name: str,
           core_kinds: list[str],
           backends: list[str],
           pool_sizes: list[int],
-          n_instances: dict[str, int]) -> str:
+          n_instances: dict[str, int],
+          per_hart_workers: bool = False) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -91,7 +92,16 @@ def _emit(networks: list[str], schedule_name: str,
     `n_instances`  per-network instance count (max instance index + 1).
                    Sized arrays for wall-cycle bookkeeping so periodic
                    instances of the same network don't clobber each
-                   other's start/elapsed scalars."""
+                   other's start/elapsed scalars.
+    `per_hart_workers`  False (default, the original Chipyard behaviour): one
+                   scheduler worker per core_kind, which owns every entry of
+                   that kind and gets an intra-op pool. True: one worker per
+                   distinct (core_kind, hart) pair found in the dispatch
+                   table, each pinned to its own hart and taking only the
+                   entries scheduled on that hart. Needed on hosted Linux
+                   targets (e.g. a K1) where one kind spans several harts that
+                   the schedule drives independently. Pools are not used in
+                   this mode (every hart already has its own worker)."""
 
     # State structs are emitted per (network, kind) so each worker's
     # `s.pool` is fixed at main() time. Without this, two workers that
@@ -351,6 +361,60 @@ def _emit(networks: list[str], schedule_name: str,
             f"length ({n_kinds})")
     pool_size_strs = ", ".join(str(s) for s in pool_sizes)
 
+    # Worker-model fragments. The kind-granular values reproduce the original
+    # emitted text exactly; only per_hart_workers changes the generated C.
+    max_workers_define = ""
+    if per_hart_workers:
+        max_workers_define = "#define XPURT_MAX_WORKERS 64\n"
+        hart_match = " || e_->hart != wa->hart"
+        n_workers_max = "XPURT_MAX_WORKERS"
+        loop_bound = "n_workers"
+        worker_discovery = f"""
+
+    /* Per-hart workers: one per distinct (core_kind, hart) in the table. */
+    int n_workers = 0;
+    for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
+        const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
+        int w_ = 0;
+        for (; w_ < n_workers; w_++) {{
+            if (wargs[w_].hart == e_->hart &&
+                strcmp(wargs[w_].kind, e_->core_kind) == 0) break;
+        }}
+        if (w_ < n_workers) continue;
+        if (n_workers == XPURT_MAX_WORKERS) {{
+            printf("FATAL: more than %d distinct (kind, hart) workers\\n",
+                   XPURT_MAX_WORKERS);
+            sys_reboot(SYS_REBOOT_COLD);
+            return -1;
+        }}
+        int ki_ = 0;
+        for (; ki_ < {n_kinds}; ki_++) {{
+            if (strcmp(kinds[ki_], e_->core_kind) == 0) break;
+        }}
+        wargs[n_workers].kind     = e_->core_kind;
+        wargs[n_workers].hart     = e_->hart;
+        wargs[n_workers].kind_idx = (ki_ < {n_kinds}) ? ki_ : 0;
+        n_workers++;
+    }}"""
+        spawn_prelude = "        int pinned_hart = wargs[k].hart;\n"
+    else:
+        hart_match = ""
+        n_workers_max = str(n_kinds)
+        loop_bound = str(n_kinds)
+        worker_discovery = ""
+        spawn_prelude = f"""\
+        int pinned_hart = -1;
+        for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
+            if (strcmp({upper}_TABLE[i_].core_kind, kinds[k]) == 0) {{
+                pinned_hart = {upper}_TABLE[i_].hart;
+                break;
+            }}
+        }}
+        wargs[k].kind = kinds[k];
+        wargs[k].hart = pinned_hart;
+        wargs[k].kind_idx = k;
+"""
+
     # Forward decls go right after the model headers — they reference
     # types from those headers (model_<mid>_dispatch_fn etc.).
     forward_decl_block = "\n".join(forward_decls)
@@ -380,7 +444,7 @@ def _emit(networks: list[str], schedule_name: str,
  */
 
 #define MODELBLASTER_DISABLE_UNMANGLED
-
+{max_workers_define}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -473,7 +537,7 @@ static void *xpurt_worker(void *arg)
     /* Take entries that match `my_kind`, in start_time order. */
     for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
         const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
-        if (strcmp(e_->core_kind, my_kind) != 0) continue;
+        if (strcmp(e_->core_kind, my_kind) != 0{hart_match}) continue;
 
         /* Wait for all data deps + the time_dep edge to complete. */
         for (int d = 0; d < e_->n_deps; d++) {{
@@ -549,28 +613,18 @@ int main(void)
      * adjacent wargs[k]. Pad each slot to 64 bytes so the cast stays in
      * its lane. */
     static const char *kinds[] = {{ {kind_strs} }};
-    static struct xpurt_worker_arg wargs[{n_kinds}];
-    static pthread_t tids[{n_kinds}];
+    static struct xpurt_worker_arg wargs[{n_workers_max}];
+    static pthread_t tids[{n_workers_max}];
     union xpurt_attr_slot {{ pthread_attr_t a; char _pad[64]; }};
-    static union xpurt_attr_slot attrs[{n_kinds}];
+    static union xpurt_attr_slot attrs[{n_workers_max}];{worker_discovery}
 
     /* Run baseline for both the trace and the periodic-start-time gate.
      * Captured just before workers spawn so it's the moment "t=0" of the
      * schedule maps to. */
     run_t0 = (uint64_t)k_cycle_get_64();
 
-    for (int k = 0; k < {n_kinds}; k++) {{
-        int pinned_hart = -1;
-        for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
-            if (strcmp({upper}_TABLE[i_].core_kind, kinds[k]) == 0) {{
-                pinned_hart = {upper}_TABLE[i_].hart;
-                break;
-            }}
-        }}
-        wargs[k].kind = kinds[k];
-        wargs[k].hart = pinned_hart;
-        wargs[k].kind_idx = k;
-
+    for (int k = 0; k < {loop_bound}; k++) {{
+{spawn_prelude}
         pthread_attr_init(&attrs[k].a);
 #ifdef CONFIG_POSIX_THREADS_AFFINITY
         if (pinned_hart >= 0) {{
@@ -595,14 +649,14 @@ int main(void)
     }}
 
     /* Wait for every worker to drain. */
-    for (int k = 0; k < {n_kinds}; k++) {{
+    for (int k = 0; k < {loop_bound}; k++) {{
         pthread_join(tids[k], NULL);
         pthread_attr_destroy(&attrs[k].a);
     }}
 
     /* Now safe to flush the spawn diagnostics — workers are done, so
      * nothing pinned to hart 0 is competing with main for UART time. */
-    for (int k = 0; k < {n_kinds}; k++) {{
+    for (int k = 0; k < {loop_bound}; k++) {{
         printf("xpurt: worker[%d] kind=%s pinned_hart=%d\\n",
                k, wargs[k].kind, wargs[k].hart);
     }}
@@ -675,6 +729,14 @@ def main() -> None:
                     help='explicit per-kind pool helper-thread count, '
                          'e.g. "rvv:0,scalar:0". Overrides --registry. '
                          "Use 0 for kinds with one hart (NULL pool).")
+    ap.add_argument("--worker-granularity", choices=("kind", "hart"),
+                    default="kind",
+                    help="kind (default, original Chipyard walker): one worker "
+                         "per core_kind with an intra-op pool. hart: one "
+                         "pinned worker per distinct (core_kind, hart) in the "
+                         "dispatch table; pools are disabled. Use hart for "
+                         "hosted-Linux targets whose kinds span several "
+                         "independently scheduled harts (e.g. SpacemiT K1).")
     args = ap.parse_args()
 
     with open(args.schedule) as f:
@@ -728,9 +790,15 @@ def main() -> None:
             # a degenerate pool with no helpers.
             pool_sizes_map[k] = n_harts if n_harts >= 2 else 0
     pool_sizes = [pool_sizes_map.get(k, 0) for k in core_kinds]
+    per_hart = args.worker_granularity == "hart"
+    if per_hart and any(pool_sizes):
+        print("note: --worker-granularity hart disables intra-op pools "
+              f"(was {pool_sizes})")
+        pool_sizes = [0] * len(core_kinds)
 
     src = _emit(networks, args.name, args.dispatch_table_header,
-                core_kinds, backends, pool_sizes, n_instances)
+                core_kinds, backends, pool_sizes, n_instances,
+                per_hart_workers=per_hart)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
