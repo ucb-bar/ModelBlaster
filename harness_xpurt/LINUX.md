@@ -102,10 +102,35 @@ In every other case the emitted walker is unchanged (byte-identical across the
 schedule fixtures). Without this pairing no backend runs the target's core
 kinds, and the run stops at the first such dispatch (see below).
 
-Composite targets (`CPU_P#4+CPU_P#5+...`, one dispatch over several harts) are
-accepted by `ingest_xpurt_schedule` and run on their **first** hart; ingest
-prints how many there were. Spreading such a dispatch over its harts is not
-implemented.
+## Composite targets
+
+A composite target (`CPU_P#4+CPU_P#5+...`) is one dispatch over several harts.
+`ingest_xpurt_schedule` records the whole hart set (`.n_harts`, `.harts`, the
+first hart first). With `--worker-granularity hart`:
+
+- the worker of the first hart runs the dispatch on an intra-op pool created
+  at start-up on exactly that hart set (one pool per distinct set; helpers
+  place themselves, so A100 sets work too);
+- every entry locks the harts it runs on, in ascending order, around its
+  kernel call, so a composite dispatch has its harts to itself and two
+  composites cannot deadlock.
+
+A dispatch spreads over its harts only if its kernel has a pool path
+(`parallel_<op>`): `linear`, `linear_s8`, `conv2d`, `conv2d_s8`. On the RVV
+backends, whose conv weights are packed IHWOC, `parallel_conv2d_s8` shards a
+repacked copy of the weights (built once per weight tensor and pool size), so
+the result stays bit-exact. Other ops run on the first hart while the rest of
+the set is held. In kind mode a composite dispatch uses its kind's pool.
+
+## Per-instance buffers
+
+Every intermediate buffer has `MB_N_BUF_SETS` copies (`buffers.c`), and a
+dispatch uses copy `s->buf_set`. The walker passes
+`instance % model_<m>_n_buf_sets`, and `build_posix.sh` builds each network
+with one copy per instance in the schedule (ingest writes
+`XPURT_N_INSTANCES_<NET>` into the table header). So overlapping instances of
+one network never share scratch. Builds that do not set `MB_N_BUF_SETS`
+(Zephyr, the single-model harness) keep one shared set.
 
 ## SpaceMiT K3 (X100 + A100)
 
@@ -167,8 +192,8 @@ samples):
 
 ## What is not covered yet
 
-- **Composite targets run on one hart** (see above); their other harts are not
-  reserved.
+- **Composite speedup depends on the kernel**: only ops with a pool path
+  spread over the hart set (see "Composite targets").
 - **One implementation per core kind**: the kernel is chosen by the entry's
   core kind, so a schedule cannot pick a different implementation (e.g. IME
   vs RVV) per dispatch on the same core.
@@ -179,8 +204,5 @@ samples):
   ported, so each network's first instance runs cold inside the timed window.
 - **Output check**: the walker prints the output markers; the runners compare
   them against the golden. There is no in-binary golden check.
-- **Intermediate buffers are still shared per model**, as in the original
-  walker: overlapping periodic instances of one network can race on them. A
-  fix belongs in `generate_skeleton.py` (per-instance buffers), not here.
 - No runner script that builds and executes in one step, or copies to a board.
   Steps 1 to 4 are manual.

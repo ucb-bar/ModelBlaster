@@ -67,6 +67,10 @@ class XpurtEntry:
     duration_ms: float
     deps_entry_ids: tuple[int, ...]   # in-table entry_ids of intra-job deps
     time_dep_entry_id: int            # cross-job edge, -1 if none
+    # Every hart the dispatch runs on, `hart` first. One element for a plain
+    # target; several for a composite ("CPU_P#0+CPU_P#1"), whose dispatch
+    # reserves all of them and runs on a pool spanning them.
+    harts: tuple[int, ...] = ()
 
 
 # ---------- parsing helpers --------------------------------------------------
@@ -85,6 +89,17 @@ def _split_job_name(job: str) -> tuple[str, int]:
     return base, idx
 
 
+def _target_harts(core_label: str, cpu_p_kind: str, cpu_e_kind: str,
+                  reg: core_registry.CoreRegistry) -> tuple[int, ...]:
+    """All harts of a target, in label order, first part first, no repeats."""
+    out: list[int] = []
+    for p in core_label.split("+"):
+        h = _resolve_target(p.strip(), cpu_p_kind, cpu_e_kind, reg)[2]
+        if h >= 0 and h not in out:
+            out.append(h)
+    return tuple(out)
+
+
 def _resolve_target(core_label: str,
                     cpu_p_kind: str, cpu_e_kind: str,
                     reg: core_registry.CoreRegistry) -> tuple[str, str, int]:
@@ -96,8 +111,8 @@ def _resolve_target(core_label: str,
     that kind.
 
     A composite target ("CPU_P#4+CPU_P#5+...", one dispatch spread over
-    several harts) runs on its FIRST hart: this walker has no per-dispatch
-    multi-hart execution. Every part must resolve, and to the same kind.
+    several harts) resolves to its FIRST part; `_target_harts` gives the
+    whole set. Every part must resolve, and to the same kind.
     """
     if "+" in core_label:
         parts = [p.strip() for p in core_label.split("+")]
@@ -260,6 +275,7 @@ def load(schedule_path: str,
 
         core_name, core_kind, hart = _resolve_target(
             d["hardware_target"], cpu_p_kind, cpu_e_kind, reg)
+        harts = _target_harts(d["hardware_target"], cpu_p_kind, cpu_e_kind, reg)
 
         # Resolve deps (intra-job data deps) + time_dep (cross-job edge)
         # to in-table entry_ids. The walker's deadlock-freedom argument
@@ -316,6 +332,7 @@ def load(schedule_path: str,
             duration_ms=float(d.get("duration", 0.0) or 0.0),
             deps_entry_ids=tuple(deps_ids),
             time_dep_entry_id=time_dep_id,
+            harts=harts,
         ))
     return entries
 
@@ -340,9 +357,24 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
                 f"static const int sched_{e.entry_id}_deps[] = {{ {arr} }};"
             )
 
+    harts_arrays: list[str] = []
+    for e in entries:
+        if len(e.harts) > 1:
+            harts_arrays.append(
+                f"static const int sched_{e.entry_id}_harts[] = {{ {', '.join(str(h) for h in e.harts)} }};")
+    # Instances per network, for sizing per-instance buffer sets.
+    n_inst: dict[str, int] = {}
+    for e in entries:
+        n_inst[e.network] = max(n_inst.get(e.network, 0), e.instance + 1)
+    inst_defines = "\n".join(
+        f"#define XPURT_N_INSTANCES_{re.sub(r'[^A-Za-z0-9]', '_', n).upper()} {k}"
+        for n, k in sorted(n_inst.items()))
+
     rows: list[str] = []
     for e in entries:
         n_deps = len(e.deps_entry_ids)
+        n_harts = len(e.harts) if len(e.harts) > 1 else 1
+        harts_ref = f"sched_{e.entry_id}_harts" if len(e.harts) > 1 else "NULL"
         deps_ref = (f"sched_{e.entry_id}_deps" if n_deps else "NULL")
         rows.append(
             f'    {{ .entry_id = {e.entry_id}, '
@@ -355,7 +387,8 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
             f'.start_time_ms = {e.start_time_ms!r}f, '
             f'.duration_ms = {e.duration_ms!r}f, '
             f'.n_deps = {n_deps}, .deps = {deps_ref}, '
-            f'.time_dep_entry_id = {e.time_dep_entry_id} }},'
+            f'.time_dep_entry_id = {e.time_dep_entry_id}, '
+            f'.n_harts = {n_harts}, .harts = {harts_ref} }},'
         )
 
     h = f"""{HEADER}
@@ -386,9 +419,14 @@ typedef struct {{
     int            n_deps;
     const int     *deps;           /* in-table entry_ids of intra-job data deps */
     int            time_dep_entry_id; /* cross-job ordering edge, -1 if none */
+    int            n_harts;        /* harts this dispatch runs on (1 unless composite) */
+    const int     *harts;          /* the n_harts harts, `hart` first; NULL if n_harts == 1 */
 }} xpurt_sched_entry_t;
 
 #define {upper}_N_ENTRIES   {len(entries)}
+
+/* Instances of each network in this schedule. */
+{inst_defines}
 
 extern const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES];
 
@@ -402,6 +440,7 @@ extern const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES];
 #include "{os.path.basename(h_path)}"
 
 {chr(10).join(deps_arrays) if deps_arrays else "/* (no entries with deps) */"}
+{chr(10).join(harts_arrays)}
 
 const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES] = {{
 {chr(10).join(rows)}
@@ -465,7 +504,8 @@ def _main() -> None:
         n_comp = sum("+" in d.get("hardware_target", "")
                      for d in json.load(f).get("dispatches", {}).values())
     if n_comp:
-        print(f"note: {n_comp} composite (multi-hart) targets run on their first hart")
+        print(f"note: {n_comp} composite (multi-hart) targets; with "
+              f"--worker-granularity hart each reserves all of its harts")
     by_net: dict[str, int] = {}
     for e in entries:
         by_net[e.job_name] = by_net.get(e.job_name, 0) + 1

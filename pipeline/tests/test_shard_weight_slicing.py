@@ -91,24 +91,24 @@ class TheCheckedProperty(unittest.TestCase):
 
 class ConvShardingOnAPackedBackend(unittest.TestCase):
 
-    def test_the_pool_path_is_compiled_out_for_conv(self):
-        src = _emit("rvv_x60")
-        self.assertIn(_GUARD, src)
-        self.assertNotIn("#ifdef MODELBLASTER_USE_POOL", _conv_section(src),
-                         "the conv wrapper must not reach the pool path on a "
-                         "backend whose OC slice is strided")
-
-    def test_the_oihw_offset_never_runs_there(self):
-        """The specific arithmetic that would read the wrong bytes.
-
-        `per_filter` is the OIHW stride `IC*KH*KW`. It lives in the shard
-        worker, which is emitted BEFORE its caller, so it is not enough to
-        guard the call: the worker itself must be inside a disabled region.
-        """
+    def test_the_pool_path_shards_a_repacked_copy_never_the_packed_weight(self):
+        """On an IHWOC backend the OC-split pool path is enabled (hosted POSIX
+        builds) but hands the shard worker a repacked copy whose OC chunks are
+        contiguous, never the packed weight itself."""
         conv = _conv_section(_emit("rvv_x60"))
-        self.assertIn("per_filter", conv, "sanity: the arithmetic is emitted")
-        self.assertLess(conv.index(_GUARD), conv.index("per_filter"),
-                        "the guard must precede the offset arithmetic")
+        self.assertNotIn(_GUARD, conv)
+        self.assertIn("#if defined(MODELBLASTER_USE_POOL) && defined(MB_PLATFORM_POSIX)", conv)
+        self.assertIn(".w = wpk,", conv)
+        self.assertNotIn(".w = w,", conv)
+        self.assertLess(conv.index("mb_ihwoc_shards_m("), conv.index(".w = wpk,"))
+
+    def test_the_repack_puts_each_chunk_where_the_oihw_offset_points(self):
+        """The shard worker still computes `w + oc0 * per_filter`; the repack
+        must lay chunk [oc0, oc1) out exactly there, OC-innermost with stride
+        oc1 - oc0."""
+        conv = _conv_section(_emit("rvv_x60"))
+        self.assertIn("int8_t *dst = p + per_filter * (size_t)oc0;", conv)
+        self.assertIn("memcpy(dst + f * (size_t)ocn, w + f * (size_t)OC + oc0, (size_t)ocn);", conv)
 
     def test_the_public_entry_point_still_exists(self):
         """model.c calls `parallel_conv2d_s8` unconditionally, so disabling
@@ -117,6 +117,82 @@ class ConvShardingOnAPackedBackend(unittest.TestCase):
         self.assertIn("static inline void parallel_conv2d_s8(", conv)
         self.assertIn("kernel_conv2d_s8_m(", conv,
                       "the serial arm must still call the kernel")
+
+    def test_the_repacked_shards_are_bit_exact_with_the_serial_call(self):
+        """Compile the emitted rvv_x60 wrapper with a reference IHWOC conv
+        kernel and run it on pools of 1..4 threads against the serial call."""
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if cc is None or sys.platform != "linux":
+            self.skipTest("needs a C compiler on Linux")
+        root = Path(__file__).resolve().parents[2]
+        kernel = r"""
+#include <stdint.h>
+#include <stddef.h>
+/* reference conv over IHWOC weights [IC][KH][KW][OC], NCHW activations */
+void kernel_conv2d_s8_m(const int8_t *in, const int8_t *w, const int32_t *b, int8_t *out,
+    int N, int IC, int IH, int IW, int OC, int KH, int KW, int SH, int SW, int PH, int PW,
+    int in_off, int f_off, int out_off, int mult, int shift, int amin, int amax) {
+    (void)N; (void)mult;
+    int OH = (IH + 2*PH - KH)/SH + 1, OW = (IW + 2*PW - KW)/SW + 1;
+    for (int oc = 0; oc < OC; oc++) for (int oh = 0; oh < OH; oh++) for (int ow = 0; ow < OW; ow++) {
+        int32_t acc = b ? b[oc] : 0;
+        for (int ic = 0; ic < IC; ic++) for (int kh = 0; kh < KH; kh++) for (int kw = 0; kw < KW; kw++) {
+            int ih = oh*SH - PH + kh, iw = ow*SW - PW + kw;
+            if (ih < 0 || ih >= IH || iw < 0 || iw >= IW) continue;
+            acc += (in[(ic*IH + ih)*IW + iw] + in_off) * (w[((ic*KH + kh)*KW + kw)*OC + oc] + f_off);
+        }
+        acc = (acc >> shift) + out_off;
+        out[(oc*OH + oh)*OW + ow] = (int8_t)(acc < amin ? amin : acc > amax ? amax : acc);
+    }
+}
+"""
+        main = r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include "modelblaster_pool.h"
+void kernel_conv2d_s8_m(const int8_t *, const int8_t *, const int32_t *, int8_t *,
+    int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int);
+@WRAPPER@
+int main(void) {
+    enum { IC = 5, IH = 9, IW = 7, OC = 13, KH = 3, KW = 3 };
+    static int8_t in[IC*IH*IW], w[IC*KH*KW*OC], ref[OC*IH*IW], got[OC*IH*IW];
+    static int32_t b[OC];
+    for (int i = 0; i < (int)sizeof in; i++) in[i] = (int8_t)(i * 37 % 251 - 125);
+    for (int i = 0; i < (int)sizeof w; i++) w[i] = (int8_t)(i * 53 % 241 - 120);
+    for (int i = 0; i < OC; i++) b[i] = i * 17 - 90;
+    parallel_conv2d_s8(NULL, in, w, b, ref, 1, IC, IH, IW, OC, KH, KW, 1, 1, 1, 1, 3, -2, 1, 0, 6, -128, 127);
+    for (int t = 1; t <= 4; t++) {
+        modelblaster_pool_t p = modelblaster_pool_create(t);
+        memset(got, 0, sizeof got);
+        parallel_conv2d_s8(p, in, w, b, got, 1, IC, IH, IW, OC, KH, KW, 1, 1, 1, 1, 3, -2, 1, 0, 6, -128, 127);
+        if (memcmp(ref, got, sizeof ref) != 0) { printf("MISMATCH T=%d\n", t); return 1; }
+        if (p) modelblaster_pool_destroy(p);
+    }
+    printf("OK\n");
+    return 0;
+}
+""".replace("@WRAPPER@", generate_skeleton._emit_parallel_wrappers("m", {"conv2d_s8"}, "rvv_x60"))
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "k.c").write_text(kernel)
+            (d / "m.c").write_text(main)
+            exe = d / "t"
+            r = subprocess.run([cc, "-O1", "-pthread", "-D_GNU_SOURCE", "-DMB_PLATFORM_POSIX",
+                                "-DMODELBLASTER_USE_POOL=1", f"-I{root / 'runtime'}",
+                                f"-I{root / 'runtime' / 'modelblaster_pool'}", "-o", str(exe),
+                                str(d / "m.c"), str(d / "k.c"),
+                                str(root / "runtime" / "modelblaster_pool" / "modelblaster_pool.c"),
+                                str(root / "runtime" / "mb_placement.c")],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.stdout.strip(), "OK", r.stdout + r.stderr)
 
     def test_a_backend_without_repacking_keeps_its_shard_path(self):
         src = _emit("scalar")

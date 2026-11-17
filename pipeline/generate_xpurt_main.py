@@ -208,7 +208,10 @@ def _emit(networks: list[str], schedule_name: str,
             kw = "if" if i == 0 else "else if"
             bs_select_lines.append(
                 f'            {kw} (strcmp(e_->core_kind, "{kind}") == 0) {{\n'
-                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{kind});\n"
+                f"                model_{mid}_state_t st_ = s_{mid}_{kind};\n"
+                f"                st_.buf_set = e_->instance % model_{mid}_n_buf_sets;\n"
+                f"                if (xpurt_entry_pool[i_] != NULL) st_.pool = xpurt_entry_pool[i_];\n"
+                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&st_);\n"
                 f"            }}"
             )
         # A dispatch whose core kind has no backend in this build cannot run;
@@ -258,7 +261,9 @@ def _emit(networks: list[str], schedule_name: str,
             f"            xpurt_trace[i_].start_cycles =\n"
             f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
             f"#endif\n"
+            f"            XPURT_LOCK_ENTRY(e_);\n"
             f"{bs_select}\n"
+            f"            XPURT_UNLOCK_ENTRY(e_);\n"
             f"#ifdef MODELBLASTER_XPURT_TRACE\n"
             f"            xpurt_trace[i_].end_cycles =\n"
             f"                (uint64_t)k_cycle_get_64() - run_t0;\n"
@@ -462,6 +467,92 @@ def _emit(networks: list[str], schedule_name: str,
     # types from those headers (model_<mid>_dispatch_fn etc.).
     forward_decl_block = "\n".join(forward_decls)
 
+    # Hart reservation and composite pools (hart mode). Every entry locks the
+    # harts it runs on, in ascending order, around its kernel call: a plain
+    # entry its own hart, a composite entry all of its harts. So a composite
+    # dispatch has its harts to itself (their workers wait), and two
+    # composites cannot deadlock. No lock is held across a dependency wait.
+    if per_hart_workers:
+        hart_lock_decl = r'''
+#define XPURT_MAX_HARTS 64
+static pthread_mutex_t xpurt_hart_lock[XPURT_MAX_HARTS];
+static int xpurt_entry_harts(const xpurt_sched_entry_t *e, int *hs)
+{
+    int n = 0;
+    if (e->n_harts > 1 && e->harts != NULL) {
+        for (int k = 0; k < e->n_harts && n < XPURT_MAX_HARTS; k++) hs[n++] = e->harts[k];
+    } else if (e->hart >= 0) {
+        hs[n++] = e->hart;
+    }
+    for (int a = 1; a < n; a++)            /* ascending: one global lock order */
+        for (int b = a; b > 0 && hs[b - 1] > hs[b]; b--) {
+            int t = hs[b]; hs[b] = hs[b - 1]; hs[b - 1] = t;
+        }
+    return n;
+}
+static void xpurt_lock_entry(const xpurt_sched_entry_t *e)
+{
+    int hs[XPURT_MAX_HARTS], n = xpurt_entry_harts(e, hs);
+    for (int k = 0; k < n; k++)
+        if (hs[k] < XPURT_MAX_HARTS) pthread_mutex_lock(&xpurt_hart_lock[hs[k]]);
+}
+static void xpurt_unlock_entry(const xpurt_sched_entry_t *e)
+{
+    int hs[XPURT_MAX_HARTS], n = xpurt_entry_harts(e, hs);
+    for (int k = n - 1; k >= 0; k--)
+        if (hs[k] < XPURT_MAX_HARTS) pthread_mutex_unlock(&xpurt_hart_lock[hs[k]]);
+}
+#define XPURT_LOCK_ENTRY(e)   xpurt_lock_entry(e)
+#define XPURT_UNLOCK_ENTRY(e) xpurt_unlock_entry(e)
+'''
+        composite_setup = f"""\
+    /* Hart locks, and one intra-op pool per distinct composite hart set, owned
+     * by the set's first hart (the worker that runs those entries). Helpers
+     * place themselves, so an A100 hart set works the same way. */
+    for (int h_ = 0; h_ < XPURT_MAX_HARTS; h_++)
+        pthread_mutex_init(&xpurt_hart_lock[h_], NULL);
+    {{
+        static void *cpools_[{upper}_N_ENTRIES];
+        static const xpurt_sched_entry_t *ckeys_[{upper}_N_ENTRIES];
+        int n_cp_ = 0;
+        for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
+            const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
+            if (e_->n_harts < 2 || e_->dispatch_id < 0) continue;
+            int j_ = 0;
+            for (; j_ < n_cp_; j_++) {{
+                const xpurt_sched_entry_t *k_ = ckeys_[j_];
+                if (k_->n_harts != e_->n_harts) continue;
+                int same_ = 1;
+                for (int h_ = 0; h_ < e_->n_harts && same_; h_++)
+                    same_ = (k_->harts[h_] == e_->harts[h_]);
+                if (same_) break;
+            }}
+            if (j_ == n_cp_) {{
+                if (e_->n_harts > MODELBLASTER_POOL_MAX_WORKERS) {{
+                    printf("FATAL: composite entry %d spans %d harts (max %d)\\n",
+                           i_, e_->n_harts, MODELBLASTER_POOL_MAX_WORKERS);
+                    XPURT_FATAL_EXIT();
+                    return -1;
+                }}
+                cpools_[n_cp_] = (void *)modelblaster_pool_create_on_harts(
+                    e_->n_harts, e_->harts);
+                if (cpools_[n_cp_] == NULL) {{
+                    printf("FATAL: composite pool on %d harts (first %d) failed\\n",
+                           e_->n_harts, e_->harts[0]);
+                    XPURT_FATAL_EXIT();
+                    return -1;
+                }}
+                ckeys_[n_cp_++] = e_;
+            }}
+            xpurt_entry_pool[i_] = cpools_[j_];
+        }}
+        printf("xpurt: %d composite pools\\n", n_cp_);
+    }}
+"""
+    else:
+        hart_lock_decl = "#define XPURT_LOCK_ENTRY(e)   ((void)0)\n#define XPURT_UNLOCK_ENTRY(e) ((void)0)\n"
+        composite_setup = ""
+
     return f"""{HEADER}
 /*
  * Schedule-driven multi-network entry point with per-core-kind worker
@@ -552,6 +643,10 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
  * now. */
 static void *pools[{n_kinds}] = {{ NULL }};
 {pool_harts_decl}
+/* Per-entry intra-op pool: set for composite entries (hart mode), else NULL
+ * and the entry uses its kind's pool. */
+static void *xpurt_entry_pool[{upper}_N_ENTRIES];
+{hart_lock_decl}
 
 /* mtime baseline for the run, captured immediately before workers spawn.
  * Used by the worker to (a) honor per-instance schedule start times for
@@ -671,6 +766,7 @@ int main(void)
 
 {chr(10).join(reset_calls)}
 
+{composite_setup}
     /* Init completion sems — limit > 1 so multi-consumer give/take
      * doesn't bottleneck. */
     for (int i = 0; i < {upper}_N_ENTRIES; i++) {{

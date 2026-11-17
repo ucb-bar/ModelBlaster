@@ -81,6 +81,12 @@ cc "${WORK}/mb_placement.o" "${MB_ROOT}/runtime/mb_placement.c"
 
 for i in "${!NAMES[@]}"; do
     name="${NAMES[$i]}"; base="${BASES[$i]}"; pdir="${base}/${PRIMARY}"
+    # One copy of the intermediate buffers per instance of this network in the
+    # schedule (ingest writes XPURT_N_INSTANCES_<NAME> into the table header),
+    # so overlapping instances never share scratch. 1 if the header says nothing.
+    n_inst="$(grep -hs "^#define XPURT_N_INSTANCES_${name^^} " "${XPURT_INCLUDE_DIR}"/*.h | awk '{print $3}' | head -1)"
+    BUFSETS=(-DMB_N_BUF_SETS="${n_inst:-1}")
+    echo "build_posix: ${name} buffer sets: ${n_inst:-1}"
     for f in model.h test_io.h weights.c buffers.c; do
         [[ -f "${pdir}/$f" ]] || { echo "build_posix: ${pdir} missing $f" >&2; exit 1; }
     done
@@ -113,14 +119,14 @@ for i in "${!NAMES[@]}"; do
         fi
         echo "build_posix: ${name}/${bs} kernel flags: ${KFLAGS[*]:-(none)}"
         cc "${WORK}/${name}_${bs}_model.o"   "${bdir}/model.c"   -I"${bdir}" \
-            -DMODELBLASTER_USE_POOL=1 "${RENAME[@]}"
+            -DMODELBLASTER_USE_POOL=1 "${BUFSETS[@]}" "${RENAME[@]}"
         cc "${WORK}/${name}_${bs}_kernels.o" "${bdir}/kernels.c" -I"${bdir}" \
             -DMODELBLASTER_USE_POOL=1 "${RENAME[@]}" "${KFLAGS[@]}"
         # Weights are backend-suffixed at codegen (each backend may pack
         # them differently), so every backend links its own weights.c.
         cc "${WORK}/${name}_${bs}_weights.o" "${bdir}/weights.c" -I"${bdir}"
     done
-    cc "${WORK}/${name}_buffers.o" "${pdir}/buffers.c" -I"${pdir}"
+    cc "${WORK}/${name}_buffers.o" "${pdir}/buffers.c" -I"${pdir}" "${BUFSETS[@]}"
     if [[ -f "${pdir}/test_io.S" ]]; then
         # test_io.S .incbin's the input/golden blobs by the absolute path they
         # were generated at; strip it so the model dir can be built anywhere.

@@ -4,16 +4,17 @@ The walker is `generate_xpurt_main.py` plus `ingest_xpurt_schedule.py`; it runs
 on Chipyard (Zephyr) and on Linux (host, QEMU, SpacemiT K1/K3). These tests pin:
 
   * a composite target (one dispatch over several harts) stays on one core
-    kind, and runs on its first hart;
+    kind, keeps its first hart as its home, and in hart mode reserves every
+    hart of its set and runs on a pool over them;
+  * each instance's dispatches use that instance's buffer set;
   * each model instance waits for its schedule-issued start time;
   * a core kind with no backend in the build stops the run (non-zero exit on
     Linux) instead of skipping its dispatches and reporting a wrong runtime;
   * core kinds that are not backend names pair with --backends by position.
 
 Not provided by this walker (see harness_xpurt/LINUX.md): a per-dispatch
-`impl` choice, reserving every hart of a composite target, start-gating every
-DAG root, and an in-binary golden check (the runners compare the output
-markers against the golden instead).
+`impl` choice, start-gating every DAG root, and an in-binary golden check (the
+runners compare the output markers against the golden instead).
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ class CompositeTargets(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mixes core kinds"):
             _load({0: "CPU_P#0+CPU_E#0"})
 
-    def test_a_composite_target_runs_on_its_first_hart(self):
+    def test_a_composite_target_is_homed_on_its_first_hart(self):
         single = _load({0: "CPU_P#1"})[0]
         composite = _load({0: "CPU_P#1+CPU_P#2"})[0]
         self.assertEqual(composite.core_kind, "rvv")
@@ -119,7 +120,8 @@ class KindBackendPairing(unittest.TestCase):
                     pool_sizes=[0, 0])
         self.assertIn('strcmp(e_->core_kind, "rvv") == 0', src)
         self.assertIn('strcmp(e_->core_kind, "rvv_c1") == 0', src)
-        self.assertIn("MODEL_M_DISPATCH_FNS_RVV_X60[e_->dispatch_id](&s_m_rvv_c1)", src)
+        self.assertIn("model_m_state_t st_ = s_m_rvv_c1;", src)
+        self.assertIn("MODEL_M_DISPATCH_FNS_RVV_X60[e_->dispatch_id](&st_)", src)
         self.assertEqual(src.count("extern const model_m_dispatch_fn MODEL_M_DISPATCH_FNS_RVV_X60"), 1)
 
 
@@ -151,3 +153,54 @@ class K3Placement(unittest.TestCase):
         # without hart lists the pool keeps the 0..n-1 default
         self.assertIn("modelblaster_pool_create(pool_sizes[k])",
                       _emit(pool_sizes=[2]))
+
+
+class PerInstanceBuffers(unittest.TestCase):
+    def test_each_dispatch_uses_its_instances_buffer_set(self):
+        src = _emit()
+        self.assertIn("st_.buf_set = e_->instance % model_m_n_buf_sets;", src)
+        self.assertIn("if (xpurt_entry_pool[i_] != NULL) st_.pool = xpurt_entry_pool[i_];", src)
+
+    def test_ingest_records_instances_per_network(self):
+        entries = _load({})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "t.c"
+            ingest.emit_table(entries, str(out), schedule_name="s")
+            h = out.with_suffix(".h").read_text()
+        self.assertIn("#define XPURT_N_INSTANCES_M 1", h)
+        self.assertIn("int            n_harts;", h)
+
+
+class CompositeAcrossHarts(unittest.TestCase):
+    def test_ingest_keeps_every_hart_of_a_composite_target_first_hart_first(self):
+        e = _load({0: "CPU_P#2+CPU_P#0+CPU_P#1"})[0]
+        single = _load({0: "CPU_P#2"})[0]
+        self.assertEqual(e.hart, single.hart)
+        self.assertEqual(len(e.harts), 3)
+        self.assertEqual(e.harts[0], e.hart)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "t.c"
+            ingest.emit_table(_load({0: "CPU_P#2+CPU_P#0+CPU_P#1"}), str(out), schedule_name="s")
+            c = out.read_text()
+        self.assertIn(f"sched_0_harts[] = {{ {', '.join(str(h) for h in e.harts)} }};", c)
+        self.assertIn(".n_harts = 3, .harts = sched_0_harts", c)
+        self.assertIn(".n_harts = 1, .harts = NULL", c)
+
+    def test_hart_mode_reserves_harts_and_builds_composite_pools(self):
+        src = _emit(per_hart_workers=True)
+        body = src[src.index("static void *xpurt_worker(void *arg)"):]
+        lock, call, unlock = (body.index("XPURT_LOCK_ENTRY(e_);"),
+                              body.index("MODEL_M_DISPATCH_FNS_RVV[e_->dispatch_id](&st_);"),
+                              body.index("XPURT_UNLOCK_ENTRY(e_);"))
+        self.assertLess(lock, call)
+        self.assertLess(call, unlock)
+        self.assertIn("#define XPURT_LOCK_ENTRY(e)   xpurt_lock_entry(e)", src)
+        self.assertIn("modelblaster_pool_create_on_harts(\n                    e_->n_harts, e_->harts);", src)
+        main = src[src.index("int main(void)"):]
+        self.assertLess(main.index("xpurt_entry_pool[i_] = cpools_[j_];"),
+                        main.index("pthread_create(&tids[k]"))
+
+    def test_kind_mode_takes_no_hart_locks(self):
+        src = _emit()
+        self.assertIn("#define XPURT_LOCK_ENTRY(e)   ((void)0)", src)
+        self.assertNotIn("xpurt_lock_entry", src)

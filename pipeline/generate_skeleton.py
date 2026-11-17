@@ -144,6 +144,39 @@ def _prod(shape: list[int]) -> int:
     return n
 
 
+def _index_buffers_by_set(c_src: str, mid: str) -> str:
+    """Make every dispatch function use buffer copy `s->buf_set`.
+
+    Buffers are declared `buf_<mid>_x[MB_N_BUF_SETS][n]`; inside a dispatch
+    function each reference `buf_<mid>_x` becomes `buf_<mid>_x[s->buf_set]`,
+    which has the old type and size (so `+ off`, `&` and `sizeof` keep their
+    meaning). Outside the dispatch functions only the extern declarations may
+    name a buffer; anything else would silently keep using set 0, so it is an
+    error.
+    """
+    ref = re.compile(r"\b(buf_" + re.escape(mid) + r"_[A-Za-z0-9_]+)\b(?!\s*\[s->buf_set\])")
+    start = re.compile(r"^static void dispatch_" + re.escape(mid) + r"_\d+\(model_"
+                       + re.escape(mid) + r"_state_t \*s\)")
+    out, inside, stray = [], False, []
+    for line in c_src.split("\n"):
+        if not inside and start.match(line):
+            inside = True
+        if inside:
+            out.append(ref.sub(r"\1[s->buf_set]", line))
+            if line == "}":
+                inside = False
+            continue
+        code = line.split("//")[0]
+        if (ref.search(code) and not code.lstrip().startswith(("extern ", "*", "/*"))):
+            stray.append(line)
+        out.append(line)
+    if stray:
+        raise RuntimeError(
+            f"generate_skeleton: buffer references outside a dispatch function "
+            f"cannot select a buffer set: {stray[:3]}")
+    return "\n".join(out)
+
+
 def _buf_name(mid: str, tensor: str) -> str:
     """Intermediate-buffer symbol name. Mangled with the model id so
     multiple models can have a `buf_x` and still link without collision
@@ -963,6 +996,85 @@ static inline void parallel_conv2d_s8_sharded(
 """
 
 
+def _conv2d_s8_ihwoc_wrapper() -> str:
+    """`_CONV2D_S8_WRAPPER` for a backend that packs conv weights IHWOC.
+
+    IHWOC is (IC, KH, KW, OC), so an OC slice is strided. The wrapper keeps one
+    repacked copy of each weight tensor per pool size T, laid out so that chunk
+    c's slice [oc0, oc1) is contiguous at `per_filter * oc0` with row stride
+    oc1 - oc0 -- the offset the OIHW wrapper already uses, and the layout an
+    IHWOC kernel expects when it is handed OC = oc1 - oc0. Each output channel
+    is computed independently, so the result is bit-exact with the serial call.
+    The copy is built on first use and kept for the run. Hosted POSIX builds
+    only (it allocates); elsewhere the call stays serial, as before.
+    """
+    t = _CONV2D_S8_WRAPPER
+    helper = """
+#if defined(MODELBLASTER_USE_POOL) && defined(MB_PLATFORM_POSIX)
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#define MB_IHWOC_CACHE_MAX 256
+static struct {{ const int8_t *w; int T; int8_t *packed; }} mb_ihwoc_cache_{mid}[MB_IHWOC_CACHE_MAX];
+static int mb_ihwoc_n_{mid};
+static pthread_mutex_t mb_ihwoc_lock_{mid} = PTHREAD_MUTEX_INITIALIZER;
+
+/* IHWOC weights repacked into T contiguous OC chunks (see the wrapper below).
+ * NULL if the cache is full or malloc fails: the caller then runs serially. */
+static const int8_t *mb_ihwoc_shards_{mid}(const int8_t *w, size_t per_filter,
+                                           int OC, int T) {{
+    int8_t *p = NULL;
+    pthread_mutex_lock(&mb_ihwoc_lock_{mid});
+    for (int i = 0; i < mb_ihwoc_n_{mid}; i++) {{
+        if (mb_ihwoc_cache_{mid}[i].w == w && mb_ihwoc_cache_{mid}[i].T == T) {{
+            p = mb_ihwoc_cache_{mid}[i].packed;
+            pthread_mutex_unlock(&mb_ihwoc_lock_{mid});
+            return p;
+        }}
+    }}
+    if (mb_ihwoc_n_{mid} < MB_IHWOC_CACHE_MAX
+            && (p = (int8_t *)malloc(per_filter * (size_t)OC)) != NULL) {{
+        int oc_per = (OC + T - 1) / T;
+        for (int oc0 = 0; oc0 < OC; oc0 += oc_per) {{
+            int ocn = (OC - oc0 < oc_per) ? OC - oc0 : oc_per;
+            int8_t *dst = p + per_filter * (size_t)oc0;
+            for (size_t f = 0; f < per_filter; f++)
+                memcpy(dst + f * (size_t)ocn, w + f * (size_t)OC + oc0, (size_t)ocn);
+        }}
+        mb_ihwoc_cache_{mid}[mb_ihwoc_n_{mid}].w = w;
+        mb_ihwoc_cache_{mid}[mb_ihwoc_n_{mid}].T = T;
+        mb_ihwoc_cache_{mid}[mb_ihwoc_n_{mid}].packed = p;
+        mb_ihwoc_n_{mid}++;
+    }}
+    pthread_mutex_unlock(&mb_ihwoc_lock_{mid});
+    return p;
+}}
+#endif
+"""
+    marker = "/* MB_SHARD_MACHINERY_END */"
+    assert t.count(marker) == 1
+    t = t.replace(marker, helper + marker)
+    guard = "#ifdef MODELBLASTER_USE_POOL\n    modelblaster_pool_t pool"
+    assert t.count(guard) == 1
+    t = t.replace(guard, "#if defined(MODELBLASTER_USE_POOL) && defined(MB_PLATFORM_POSIX)\n"
+                         "    modelblaster_pool_t pool")
+    ctx = "    parallel_conv2d_s8_ctx_t ctx = {{\n        .in = in, .w = w,"
+    assert t.count(ctx) == 1
+    t = t.replace(ctx, """    const int8_t *wpk = mb_ihwoc_shards_{mid}(
+        w, (size_t)IC * (size_t)KH * (size_t)KW, OC, (int)T);
+    if (wpk == NULL) {{
+        kernel_conv2d_s8_{mid}(in, w, b, out, N, IC, IH, IW,
+                               OC, KH, KW, SH, SW, PH, PW,
+                               input_offset, filter_offset, output_offset,
+                               output_multiplier, output_shift,
+                               activation_min, activation_max);
+        return;
+    }}
+    parallel_conv2d_s8_ctx_t ctx = {{
+        .in = in, .w = wpk,""")
+    return t
+
+
 _PARALLEL_WRAPPER_TEMPLATES = {
     "linear":    _LINEAR_WRAPPER,
     "conv2d":    _CONV2D_WRAPPER,
@@ -1033,6 +1145,10 @@ def _emit_parallel_wrappers(mid: str, used_ops: set[str],
         # wrapper below is compiled out.
         parts.append(_CONV2D_S8_SHARD_WRAPPER.format(mid=mid))
     for op in sorted(_PARALLELIZED_OPS & used_ops):
+        if layout == "ihwoc" and op == "conv2d_s8":
+            # Strided OC slice: shard on a repacked copy of the weights.
+            parts.append(_conv2d_s8_ihwoc_wrapper().format(mid=mid))
+            continue
         if not oc_slice_is_contiguous and op in _OC_WEIGHT_SLICING_OPS:
             parts.append(
                 f"\n/* parallel_{op}: NO pool path on this backend.\n"
@@ -2638,7 +2754,14 @@ typedef struct {{
 {input_state_fields}
     model_{mid}_output_t      *output;
     void                       *pool;
+    /* Which copy of the intermediate buffers this dispatch uses
+     * (0 .. model_{mid}_n_buf_sets-1). Zero-initialised callers get set 0. */
+    int                         buf_set;
 }} model_{mid}_state_t;
+
+/* Number of intermediate-buffer copies this model was built with
+ * (MB_N_BUF_SETS when buffers.c was compiled). */
+extern const int model_{mid}_n_buf_sets;
 
 typedef void (*model_{mid}_dispatch_fn)(model_{mid}_state_t *);
 
@@ -2736,8 +2859,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     for t in intermediates:
         size = _prod(tensors[t]["shape"])
         c_type = _dtype_to_c(tensors[t]["dtype"])
-        buf_defs.append(f"{c_type} {_buf_name(mid, t)}[{size}]{_buf_align};")
-        buf_externs.append(f"extern {c_type} {_buf_name(mid, t)}[{size}];")
+        buf_defs.append(f"{c_type} {_buf_name(mid, t)}[MB_N_BUF_SETS][{size}]{_buf_align};")
+        buf_externs.append(f"extern {c_type} {_buf_name(mid, t)}[MB_N_BUF_SETS][{size}];")
     # OH row-tile scratch: the pre-padded input window and the tile's own
     # output band, one pair per tile. They live in buffers.c with the
     # intermediates (defined once per MODEL, not per backend) so a
@@ -2747,8 +2870,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         g = oh_plan[did]
         for which, n in (("in", g["ws_in_elems"]), ("out", g["ws_out_elems"])):
             nm = _oh_ws_name(mid, did, which)
-            buf_defs.append(f"int8_t {nm}[{n}];")
-            buf_externs.append(f"extern int8_t {nm}[{n}];")
+            buf_defs.append(f"int8_t {nm}[MB_N_BUF_SETS][{n}];")
+            buf_externs.append(f"extern int8_t {nm}[MB_N_BUF_SETS][{n}];")
 
     # Set per-op by the activation-layout shim below: while a shimmed call is
     # being emitted, the kernel must see the SCRATCH copies, not the tensors
@@ -4896,7 +5019,15 @@ static inline unsigned long long mb_wall_ticks(void)
  * model.c TUs (rvv + scalar) share the same scratch — otherwise each
  * backend's file-static buf_* would shadow the other and cross-backend
  * dispatches would read zeroed scratch. Names are mangled with the
- * model id (buf_<mid>_*) so different models don't collide at link. */
+ * model id (buf_<mid>_*) so different models don't collide at link.
+ *
+ * Each buffer has MB_N_BUF_SETS copies and a dispatch uses copy
+ * s->buf_set, so a schedule runner can give overlapping instances of one
+ * network their own scratch (build with -DMB_N_BUF_SETS=<instances>). The
+ * default is one copy and buf_set 0, i.e. one shared set as before. */
+#ifndef MB_N_BUF_SETS
+#define MB_N_BUF_SETS 1
+#endif
 {chr(10).join(buf_externs)}
 
 /* File-static — invisible across TUs, no need to mangle. Locals to this .c. */
@@ -4955,6 +5086,7 @@ unsigned long model_{mid}_wall_cycles(void) {{
     return wall_cycles_;
 }}
 """
+    c = _index_buffers_by_set(c, mid)
     with open(os.path.join(out_dir, "model.c"), "w") as f:
         f.write(c)
 
@@ -4975,6 +5107,12 @@ unsigned long model_{mid}_wall_cycles(void) {{
 
 #include <stdint.h>
 #include <string.h>
+
+/* MB_N_BUF_SETS copies of every buffer (see model.c); one by default. */
+#ifndef MB_N_BUF_SETS
+#define MB_N_BUF_SETS 1
+#endif
+const int model_{mid}_n_buf_sets = MB_N_BUF_SETS;
 
 {chr(10).join(buf_defs)}
 
@@ -5000,7 +5138,7 @@ void model_{mid}_zero_buffers(void) {{
     # curated kernel silently fell back to reference_impl.
     _fp_bytes = 0
     for _d in buf_defs:
-        _m = re.match(r"\s*(\S+)\s+\S+\[(\d+)\]", _d)
+        _m = re.match(r"\s*(\S+)\s+\S+?(?:\[MB_N_BUF_SETS\])?\[(\d+)\]", _d)
         if _m:
             _fp_bytes += int(_m.group(2)) * _C_TYPE_BYTES.get(_m.group(1), 1)
     with open(os.path.join(out_dir, "footprint.json"), "w") as f:

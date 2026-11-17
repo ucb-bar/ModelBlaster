@@ -54,7 +54,9 @@ typedef struct {
     const float *input;
     model_synth_output_t *output;
     void *pool;
+    int buf_set;
 } model_synth_state_t;
+extern const int model_synth_n_buf_sets;
 typedef void (*model_synth_dispatch_fn)(model_synth_state_t *);
 typedef struct {
     int dispatch_id;
@@ -108,6 +110,8 @@ static void op1(model_synth_state_t *s)
 
 const model_synth_dispatch_fn MODEL_SYNTH_DISPATCH_FNS_{BS}[MODEL_SYNTH_OP_COUNT] = {{ op0, op1 }};
 void model_synth_reset_profile_{bs}(void) {{}}
+/* buffers.c's count; weak so two backends' fixture files can both carry it */
+__attribute__((weak)) const int model_synth_n_buf_sets = 1;
 const model_synth_op_record_t *model_synth_profile_records_{bs}(int *count)
 {{
     *count = 0;
