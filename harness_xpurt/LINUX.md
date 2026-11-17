@@ -47,8 +47,9 @@ the distinct `(core_kind, hart)` pairs in the dispatch table at start-up and
 spawn one pinned worker for each. Each worker takes only the entries scheduled
 on its hart; dependency waits, the start-time gate, tracing and output are the
 same code. Intra-op pools are not used in this mode (every hart already has its
-own worker). The default, `--worker-granularity kind`, emits **exactly** the
-original walker, byte for byte.
+own worker). The default, `--worker-granularity kind`, emits the original
+walker; the only difference is how it stops on an error (see "Errors stop the
+run" below).
 
 A hart is whatever the registry says: `ingest_xpurt_schedule` resolves
 `CPU_P#n` to the n-th registry core of the mapped kind and records that core's
@@ -98,13 +99,23 @@ per `--core-kinds` entry and the names differ, entry *i* runs kind *i*:
 ```
 
 In every other case the emitted walker is unchanged (byte-identical across the
-schedule fixtures). Without this pairing every dispatch on such a target is
-skipped with a `WARN unknown core_kind` and the run still exits 0.
+schedule fixtures). Without this pairing no backend runs the target's core
+kinds, and the run stops at the first such dispatch (see below).
 
 Composite targets (`CPU_P#4+CPU_P#5+...`, one dispatch over several harts) are
 accepted by `ingest_xpurt_schedule` and run on their **first** hart; ingest
 prints how many there were. Spreading such a dispatch over its harts is not
 implemented.
+
+## Errors stop the run
+
+A dispatch whose core kind has no backend in the build prints
+`FATAL: xpurt: no backend built for core_kind '<kind>' (...)` and stops the
+run, as do the walker's other fatal errors (too many workers, a failed pool or
+thread create). On Linux they exit with status 2; on Zephyr they reboot, as
+before. A skipped dispatch would otherwise report the runtime of a different
+workload. `--core-kinds` and `--backends` that do not cover the schedule are
+the usual cause.
 
 For a static or cross build pass `LDFLAGS=-static` (and `CC=`) to
 `build_posix.sh`; QEMU user mode and board deploys need a static binary.
@@ -121,7 +132,16 @@ For a static or cross build pass `LDFLAGS=-static` (and `CC=`) to
 
 ## What is not covered yet
 
-- **Composite targets run on one hart** (see above).
+- **Composite targets run on one hart** (see above); their other harts are not
+  reserved.
+- **One implementation per core kind**: the kernel is chosen by the entry's
+  core kind, so a schedule cannot pick a different implementation (e.g. IME
+  vs RVV) per dispatch on the same core.
+- **Start gate**: each instance's first dispatch waits for its scheduled start;
+  later dispatches, including other DAG roots, start when their dependencies
+  finish.
+- **Output check**: the walker prints the output markers; the runners compare
+  them against the golden. There is no in-binary golden check.
 - **Intermediate buffers are still shared per model**, as in the original
   walker: overlapping periodic instances of one network can race on them. A
   fix belongs in `generate_skeleton.py` (per-instance buffers), not here.

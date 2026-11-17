@@ -255,3 +255,46 @@ def test_default_output_unchanged_by_hart_option():
     assert mod._emit(**a, per_hart_workers=False) == base
     assert mod._emit(**a, per_hart_workers=True) != base
     assert "XPURT_MAX_WORKERS" not in base
+
+
+def test_a_core_kind_without_a_backend_stops_the_run(tmp_path):
+    """--core-kinds rvv with --backends rvv_x60,scalar does not pair (the lists
+    differ in length), so no backend runs kind rvv: the walker must stop with a
+    non-zero exit rather than skip every dispatch and exit 0."""
+    w = tmp_path
+    pkg = w / "pkg"
+    pkg.mkdir()
+    os.symlink(ROOT, pkg / "modelblaster")
+    env = dict(os.environ, PYTHONPATH=str(pkg))
+    _write(w / "schedule.json", json.dumps(_schedule()))
+    _write(w / "registry.json", json.dumps(_registry()))
+    _write(w / "graph.json", json.dumps({"ops": [
+        {"dispatch_id": 0, "op": "synth_a", "name": "a"},
+        {"dispatch_id": 1, "op": "synth_b", "name": "b"}]}))
+    _write(w / "synth_model.h", _model_header())
+    _write(w / "synth_test_io.h",
+           "static const float model_synth_test_input[1] = { 0.0f };\n")
+    for bs in ("rvv_x60", "scalar"):
+        _write(w / f"kernels_{bs}.c", _kernels(bs))
+    for a in (("modelblaster.pipeline.ingest_xpurt_schedule",
+               "--schedule", "schedule.json", "--registry", "registry.json",
+               "--ir", "synth:graph.json", "--out", str(w / "demo_table.c"),
+               "--name", "demo"),
+              ("modelblaster.pipeline.generate_xpurt_main",
+               "--schedule", "schedule.json", "--out", str(w / "main.c"),
+               "--name", "demo", "--dispatch-table-header", "demo_table.h",
+               "--core-kinds", "rvv", "--backends", "rvv_x60,scalar")):
+        r = subprocess.run([sys.executable, "-m", *a], cwd=w, env=env,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"{a[0]} failed:\n{r.stdout}\n{r.stderr}"
+    exe = w / "walker"
+    cmd = [CC, "-O1", "-pthread", "-DMB_PLATFORM_POSIX", "-D_GNU_SOURCE",
+           f"-I{ROOT / 'runtime'}", f"-I{ROOT / 'runtime' / 'modelblaster_pool'}",
+           f"-I{w}", "-o", str(exe), "main.c", "demo_table.c",
+           "kernels_rvv_x60.c", "kernels_scalar.c",
+           str(ROOT / "runtime" / "modelblaster_pool" / "modelblaster_pool.c")]
+    r = subprocess.run(cmd, cwd=w, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2, r.stdout[-2000:]
+    assert "FATAL: xpurt: no backend built for core_kind 'rvv'" in r.stdout

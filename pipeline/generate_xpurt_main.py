@@ -210,9 +210,12 @@ def _emit(networks: list[str], schedule_name: str,
                 f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&s_{mid}_{kind});\n"
                 f"            }}"
             )
+        # A dispatch whose core kind has no backend in this build cannot run;
+        # skipping it would report the runtime of a different workload, so stop.
         bs_select_lines.append(
             "            else {\n"
-            f'                printf("xpurt: WARN unknown core_kind \'%s\' for {net}\\n", e_->core_kind);\n'
+            f'                printf("FATAL: xpurt: no backend built for core_kind \'%s\' ({net} dispatch %d)\\n", e_->core_kind, e_->dispatch_id);\n'
+            "                XPURT_FATAL_EXIT();\n"
             "            }"
         )
         bs_select = "\n".join(bs_select_lines)
@@ -392,7 +395,7 @@ def _emit(networks: list[str], schedule_name: str,
         if (n_workers == XPURT_MAX_WORKERS) {{
             printf("FATAL: more than %d distinct (kind, hart) workers\\n",
                    XPURT_MAX_WORKERS);
-            sys_reboot(SYS_REBOOT_COLD);
+            XPURT_FATAL_EXIT();
             return -1;
         }}
         int ki_ = 0;
@@ -464,6 +467,14 @@ def _emit(networks: list[str], schedule_name: str,
 #else
 #include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem */
 #include <zephyr/sys/reboot.h>
+#endif
+
+/* Stop on a fatal error. On hosted Linux sys_reboot is a clean exit(0), so a
+ * fatal error exits non-zero there; on Zephyr it reboots, as before. */
+#ifdef MB_PLATFORM_POSIX
+#define XPURT_FATAL_EXIT() do {{ fflush(stdout); exit(2); }} while (0)
+#else
+#define XPURT_FATAL_EXIT() sys_reboot(SYS_REBOOT_COLD)
 #endif
 
 {chr(10).join(inc_lines)}
@@ -585,7 +596,7 @@ int main(void)
             if (pools[k] == NULL) {{
                 printf("FATAL: modelblaster_pool_create kind=%d size=%d failed\\n",
                        k, pool_sizes[k]);
-                sys_reboot(SYS_REBOOT_COLD);
+                XPURT_FATAL_EXIT();
                 return -1;
             }}
         }}
@@ -645,7 +656,7 @@ int main(void)
         int rc = pthread_create(&tids[k], &attrs[k].a, xpurt_worker, &wargs[k]);
         if (rc != 0) {{
             printf("FATAL: pthread_create kind=%s rc=%d\\n", kinds[k], rc);
-            sys_reboot(SYS_REBOOT_COLD);
+            XPURT_FATAL_EXIT();
             return -1;
         }}
         /* Per-worker spawn diagnostic deferred to after pthread_join.

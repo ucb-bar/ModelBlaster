@@ -2,8 +2,8 @@
 # Execute an XPU-RT schedule as a multi-model periodic workload on the K1,
 # entirely through ModelBlaster.
 #
-# This replaces merlin's merlin-dispatch-scheduler. That runner executes IREE
-# VMFBs, which meant every measurement went through the IREE path and that
+# This replaces the earlier IREE-based dispatch scheduler. That runner executed
+# IREE VMFBs, which meant every measurement went through the IREE path and that
 # ModelBlaster's own generated-C kernels were never what the scheduler placed.
 # It also made baseline B3 unreachable: apply_split_hint / apply_fusion_hint
 # rewrite ModelBlaster's IR, and a rewritten IR has no VMFB, so a runner that

@@ -528,7 +528,7 @@ def _sigmoid_f16_argtypes():
 def _conv2d_f16_argtypes():
     import ctypes
     h = ctypes.POINTER(ctypes.c_uint16)
-    return [h, h, h, h] + [ctypes.c_int] * 11
+    return [h, h, h, h] + [ctypes.c_int] * 13
 
 
 def _maxpool2d_f16_argtypes():
@@ -5881,10 +5881,10 @@ CONV2D_F16 = KernelSpec(
         "void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight, "
         "const _Float16 *bias, _Float16 *output, "
         "int N, int IC, int IH, int IW, int OC, "
-        "int KH, int KW, int SH, int SW, int PH, int PW)"
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
     ),
     semantics=(
-        "Half-precision 2D convolution. groups=1, dilation=1.\n"
+        "Half-precision 2D convolution. groups=1, dilation (DH, DW).\n"
         "Storage is _Float16 for input/weight/bias/output, but the inner\n"
         "accumulator is fp32 to avoid catastrophic cancellation when summing\n"
         "many partial products — same pattern as Tensor Cores and what\n"
@@ -5895,9 +5895,10 @@ CONV2D_F16 = KernelSpec(
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -5905,10 +5906,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                     float acc = bias ? (float)bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = (float)input[((n*IC + ic)*IH + ih)*IW + iw];
                                 float w = (float)weight[((oc*IC + ic)*KH + kh)*KW + kw];
@@ -5990,10 +5991,11 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW)
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW)
 {
-    const int OH = (IH + 2*PH - KH) / SH + 1;
-    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    const int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     const size_t vlmax_e32m4 = __riscv_vsetvlmax_e32m4();
     const ptrdiff_t in_ic_stride_bytes = (ptrdiff_t)IH * IW * sizeof(_Float16);
     const ptrdiff_t w_ic_stride_bytes  = (ptrdiff_t)KH * KW * sizeof(_Float16);
@@ -6004,10 +6006,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                 for (int ow = 0; ow < OW; ow++) {
                     vfloat32m4_t vacc = __riscv_vfmv_v_f_f32m4(0.0f, vlmax_e32m4);
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh*SH - PH + kh;
+                        int ih = oh*SH - PH + kh*DH;
                         if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow*SW - PW + kw;
+                            int iw = ow*SW - PW + kw*DW;
                             if (iw < 0 || iw >= IW) continue;
                             const _Float16 *in_base = input + ((size_t)n * IC * IH + ih) * IW + iw;
                             const _Float16 *w_base  = w_oc + (size_t)kh * KW + kw;
@@ -12513,8 +12515,8 @@ LSTM_S8 = KernelSpec(
 /* Upper bound on hidden_size, so the h_prev snapshot is a fixed stack buffer
    rather than a VLA. VitFly's LSTM is 395; 1024 leaves headroom without being
    a meaningful stack cost (1 KB). */
-#ifndef MERLIN_LSTM_MAX_HIDDEN
-#define MERLIN_LSTM_MAX_HIDDEN 1024
+#ifndef MB_LSTM_MAX_HIDDEN
+#define MB_LSTM_MAX_HIDDEN 1024
 #endif
 
 void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
@@ -12533,8 +12535,8 @@ void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
      * would read the newly-written h[t] instead of the previous timestep's --
      * the recurrence would consume its own output mid-step. That is not a
      * rounding difference; it produced answers off by up to 12 LSB. */
-    int8_t h_prev[MERLIN_LSTM_MAX_HIDDEN];
-    if (H > MERLIN_LSTM_MAX_HIDDEN) {
+    int8_t h_prev[MB_LSTM_MAX_HIDDEN];
+    if (H > MB_LSTM_MAX_HIDDEN) {
         /* Refuse rather than silently truncate the state. */
         return;
     }

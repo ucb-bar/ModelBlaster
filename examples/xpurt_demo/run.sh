@@ -355,7 +355,7 @@ print(' '.join(out))
     # binary needs --extension=gemmini support, which only the
     # chipyard-built spike has. Default-pick that one if it exists;
     # SPIKE_BIN env var overrides explicitly.
-    # spike-hetero is the merlin-side wrapper that loads BOTH the
+    # spike-hetero is a spike wrapper that loads BOTH the
     # Gemmini and Saturn-OPU extensions into one spike process; it is
     # the only spike build capable of running hetero workloads where
     # BACKENDS contains both gemmini and rvv_opu. The arm driver's

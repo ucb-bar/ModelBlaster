@@ -226,18 +226,17 @@ def hetero_env_overlay(workload: Workload, env: dict[str, str]) -> None:
     if cpu_e:
         env.setdefault("CPU_E_KIND", cpu_e)
 
-    # spike-hetero is the merlin-side wrapper that loads both Gemmini
-    # and Saturn-OPU extensions into one spike process. Point at it so
+    # spike-hetero is a spike wrapper that loads both the Gemmini and
+    # Saturn-OPU extensions into one spike process. Use it from PATH so
     # `examples/xpurt_demo/run.sh` picks it up for the hetero target;
     # the user can override by setting MODELBLASTER_HETERO_SPIKE
     # themselves before invoking the driver.
     if (workload.target == "hetero_gemmini_opu"
             and workload.runner == "spike"
             and "MODELBLASTER_HETERO_SPIKE" not in env):
-        _merlin = os.environ.get("MERLIN_DIR", str(Path(__file__).resolve().parents[3] / "merlin"))
-        candidate = Path(_merlin) / "tools/spike-hetero/spike-hetero"
-        if candidate.exists():
-            env["MODELBLASTER_HETERO_SPIKE"] = str(candidate)
+        candidate = shutil.which("spike-hetero")
+        if candidate:
+            env["MODELBLASTER_HETERO_SPIKE"] = candidate
 
     # Turn on the harness's per-entry execution trace so the aggregator
     # has makespan / per-tile utilization metrics to read. The trace

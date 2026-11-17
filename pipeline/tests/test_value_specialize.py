@@ -162,7 +162,9 @@ def get_init_inputs():
 
 def _extract(tmp_path, src, quant="native"):
     (tmp_path / "b.py").write_text(src)
-    env = {**os.environ, "PYTHONPATH": str(MB.parent)}
+    # src/ holds the `modelblaster` shim, so the import works whatever this checkout is called;
+    # MB.parent keeps the submodule layout (<parent>/modelblaster) working as before.
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(MB / "src"), str(MB.parent)])}
     return subprocess.run([sys.executable, "-m", "modelblaster.pipeline.extract_graph", "--bench-file",
                            str(tmp_path / "b.py"), "--bench-target-mb", "0", "--out-dir", str(tmp_path / "ir"),
                            "--quant", quant], capture_output=True, text=True, timeout=600, env=env)

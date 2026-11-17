@@ -528,12 +528,14 @@ CUDA_ONLY = {"bmm_strided", "bmm_strided_f16", "attention", "attention_f16",
 
 def all_entries(dtype: str = "fp32") -> dict[str, str]:
     """entry -> op for every fp32 (or `_f16`) KernelSpec: the target set of the seeds. The
-    per-tensor casts of a mixed IR (`cast_<src>_to_<dst>`) are CUDA-only and not in it."""
+    per-tensor casts of a mixed IR (`cast_<src>_to_<dst>`) are CUDA-only and not in it, and
+    neither are the quantized integer ops (int8 and int16), which the OpenCL path does not run."""
     from .cuda_dtypes import op_dtype, parse_cast
     from .reference_kernels import KERNEL_SPECS
     out = {}
     for op, spec in KERNEL_SPECS.items():
-        if op in CUDA_ONLY or any(s in op for s in ("_s8", "_i8")) or "int8_t" in spec.signature or op_dtype(op) != dtype \
+        if op in CUDA_ONLY or any(s in op for s in ("_s8", "_i8", "_s16")) \
+                or any(t in spec.signature for t in ("int8_t", "int16_t")) or op_dtype(op) != dtype \
                 or parse_cast(op):
             continue
         out.setdefault(parse_signature(spec.signature)[0], op)

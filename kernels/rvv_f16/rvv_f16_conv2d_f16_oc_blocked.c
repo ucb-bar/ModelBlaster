@@ -59,7 +59,7 @@
  * *register* tiling avoids that because the vector lane is still OC,
  * never OW.)
  *
- * Since `ih = oh*SH - PH + kh` does not depend on `ow`, the KH bounds
+ * Since `ih = oh*SH - PH + kh*DH` does not depend on `ow`, the KH bounds
  * check is still a single per-row test shared by the whole tile. Only
  * the KW/IW bounds check needs a per-tile-width test (`iw0`/`iw_last`
  * for the first/last pixel in the tile at this kw); a fully-in-bounds
@@ -174,10 +174,11 @@ static inline void mb_f16_store_pixel(_Float16 *output,
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW)
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW)
 {
-    const int OH = (IH + 2*PH - KH) / SH + 1;
-    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    const int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     const ptrdiff_t w_oc_stride_bytes = (ptrdiff_t)IC * KH * KW * sizeof(_Float16);
     const ptrdiff_t out_oc_stride_bytes = (ptrdiff_t)OH * OW * sizeof(_Float16);
 
@@ -226,10 +227,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                         }
 
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw0 = ow * SW - PW + kw;
+                                int iw0 = ow * SW - PW + kw * DW;
                                 int iw_last = iw0 + (MB_CONV_F16_TILE - 1) * SW;
                                 if (iw_last < 0 || iw0 >= IW) continue;
                                 int all_in = (iw0 >= 0 && iw_last < IW);
@@ -311,10 +312,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                         }
 
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw0 = ow * SW - PW + kw;
+                                int iw0 = ow * SW - PW + kw * DW;
                                 int iw1 = iw0 + SW;
                                 if (iw1 < 0 || iw0 >= IW) continue;
                                 int all_in = (iw0 >= 0 && iw1 < IW);
@@ -374,10 +375,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                         }
 
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 for (int ic = 0; ic < IC; ic++) {
                                     _Float16 x = input[((size_t)n * IC + ic) * IH * IW

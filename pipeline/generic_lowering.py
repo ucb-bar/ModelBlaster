@@ -412,7 +412,10 @@ class GenericLowering:
                            {"n": _prod(self._shape(src))})
                 return
             return self._lower_minmax_item(node, k)
+        # tuple_items keys are (name, int); checking the index type first keeps a
+        # slice index (unhashable before Python 3.12) out of the dict lookup.
         if n == "getitem" and isinstance(node.args[0], torch.fx.Node) and \
+                isinstance(node.args[1], int) and \
                 (node.args[0].name, node.args[1]) in self.tuple_items:
             src = self.tuple_items[(node.args[0].name, node.args[1])]
             if isinstance(src, list):  # nested tuple, e.g. LSTM (h_n, c_n)
