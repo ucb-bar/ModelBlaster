@@ -156,5 +156,48 @@ class AskingForAnImplTheBuildLacksIsFatal(unittest.TestCase):
         self.assertIn("e_->impl", src)
 
 
+class OneCoreTwoImplementations(unittest.TestCase):
+    """The K3 A100 runs a dispatch on IME or on its vector unit; the schedule's
+    `impl` picks which, through --impl-backends."""
+
+    def _src(self):
+        from pipeline import generate_xpurt_main as gen
+        return gen._emit(
+            networks=["m"], schedule_name="s",
+            dispatch_table_header="t.h", core_kinds=["x100", "a100"],
+            backends=["rvv_k3", "ime_k3_a100"], pool_sizes=[0, 0],
+            n_instances={"m": 1}, per_hart_workers=True,
+            impl_backends=[("a100", "ime", "ime_k3_a100"),
+                           ("a100", "rvv", "rvv_k3_a100"),
+                           ("x100", "rvv", "rvv_k3")])
+
+    def test_kind_and_impl_together_select_the_backend(self):
+        src = self._src()
+        guard = 'strcmp(e_->core_kind, "a100") == 0 && strcmp(e_->impl, "rvv") == 0'
+        self.assertIn(guard, src)
+        branch = src[src.index(guard):]
+        branch = branch[:branch.index("}")]
+        # the kernel follows the implementation, the state (pool) the core
+        self.assertIn("st_ = s_m_a100;", branch)
+        self.assertIn("MODEL_M_DISPATCH_FNS_RVV_K3_A100[e_->dispatch_id](&st_)", branch)
+
+    def test_triples_come_before_the_kind_pairing(self):
+        src = self._src()
+        self.assertLess(src.index('strcmp(e_->impl, "ime") == 0'),
+                        src.index('strcmp(e_->impl, "x100") == 0'))
+
+    def test_every_mapped_backend_is_linked_profiled_and_reset(self):
+        src = self._src()
+        for bs in ("rvv_k3", "ime_k3_a100", "rvv_k3_a100"):
+            BS = bs.upper()
+            self.assertEqual(src.count(
+                f"extern const model_m_dispatch_fn MODEL_M_DISPATCH_FNS_{BS}[MODEL_M_OP_COUNT];"), 1)
+            # reset at start-up and at each instance's first dispatch, like
+            # a paired backend
+            self.assertEqual(src.count(f"model_m_reset_profile_{bs}();"),
+                             src.count("model_m_reset_profile_rvv_k3();"))
+            self.assertEqual(src.count(f"model_m_profile_records_{bs}(&n_records)"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

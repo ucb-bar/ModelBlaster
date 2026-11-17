@@ -82,13 +82,22 @@ def _emit(networks: list[str], schedule_name: str,
           pool_sizes: list[int],
           n_instances: dict[str, int],
           per_hart_workers: bool = False,
-          pool_harts: list[list[int]] | None = None) -> str:
+          pool_harts: list[list[int]] | None = None,
+          impl_backends: list[tuple[str, str, str]] | None = None) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
                    schedule references.
     `core_kinds`   is the ordered list of distinct core_kind values; one
                    scheduler-worker thread is spawned per kind.
+    `impl_backends` lists (core_kind, impl, backend) triples: on a core of
+                   that kind, a dispatch whose schedule entry names that
+                   impl runs that backend. It is how one core runs two
+                   implementations, e.g. a K3 A100 core running GEMMs on IME
+                   (ime_k3_a100) and the rest on its vector unit
+                   (rvv_k3_a100). Entries not covered fall back to the
+                   kind -> backend pairing below, with impl defaulting to
+                   core_kind.
     `backends`     is the ordered list of HW backends compiled into the
                    binary (== the per-model OBJECT-lib suffixes). Usually
                    identical to `core_kinds`, but separated to allow
@@ -124,8 +133,9 @@ def _emit(networks: list[str], schedule_name: str,
     # actually selects on; we union with backends for the (rare) case
     # where a backend has no matching kind in this schedule, so all
     # `s_<m>_<bs>` references in the bs_select branches resolve.
+    impl_backends = list(impl_backends or [])
     all_kinds: list[str] = []
-    for k in list(core_kinds) + list(backends):
+    for k in list(core_kinds) + list(backends) + [t[0] for t in impl_backends]:
         if k not in all_kinds:
             all_kinds.append(k)
     # Which backend runs each kind. Original behaviour (kind == backend tag)
@@ -134,6 +144,10 @@ def _emit(networks: list[str], schedule_name: str,
         kind_backend_pairs = list(zip(core_kinds, backends))
     else:
         kind_backend_pairs = [(bs, bs) for bs in backends]
+    # Every backend the binary links: the paired ones plus any that only an
+    # (kind, impl) triple names.
+    all_backends = list(dict.fromkeys(
+        list(backends) + [t[2] for t in impl_backends]))
     inc_lines: list[str] = []
     state_decls: list[str] = []
     state_inits: list[str] = []
@@ -195,7 +209,7 @@ def _emit(networks: list[str], schedule_name: str,
         # dispatch table + the renamed profile API. The harness CMakeLists
         # builds a separate OBJECT lib per pair so these live in distinct
         # TUs and link without collision.
-        for bs in dict.fromkeys(backends):
+        for bs in all_backends:
             BS = bs.upper()
             forward_decls.append(
                 f"extern const model_{mid}_dispatch_fn "
@@ -218,10 +232,26 @@ def _emit(networks: list[str], schedule_name: str,
         # kind IS the backend tag. Where they differ (K1/K3: kinds x100/a100,
         # backends rvv_k3/ime_k3_a100) --backends pairs with --core-kinds by
         # position.
+        #
+        # Explicit (core_kind, impl) -> backend triples are tried first. They
+        # keep the CORE's state struct, so `.pool` follows the core while the
+        # kernel follows the implementation.
         bs_select_lines: list[str] = []
-        for i, (kind, bs) in enumerate(kind_backend_pairs):
+        for kind, impl, bs in impl_backends:
             BS = bs.upper()
-            kw = "if" if i == 0 else "else if"
+            kw = "if" if not bs_select_lines else "else if"
+            bs_select_lines.append(
+                f'            {kw} (strcmp(e_->core_kind, "{kind}") == 0 && '
+                f'strcmp(e_->impl, "{impl}") == 0) {{\n'
+                f"                model_{mid}_state_t st_ = s_{mid}_{kind};\n"
+                f"                st_.buf_set = e_->instance % model_{mid}_n_buf_sets;\n"
+                f"                if (xpurt_entry_pool[i_] != NULL) st_.pool = xpurt_entry_pool[i_];\n"
+                f"                MODEL_{umid}_DISPATCH_FNS_{BS}[e_->dispatch_id](&st_);\n"
+                f"            }}"
+            )
+        for kind, bs in kind_backend_pairs:
+            BS = bs.upper()
+            kw = "if" if not bs_select_lines else "else if"
             bs_select_lines.append(
                 f'            {kw} (strcmp(e_->impl, "{kind}") == 0) {{\n'
                 f"                model_{mid}_state_t st_ = s_{mid}_{kind};\n"
@@ -235,7 +265,7 @@ def _emit(networks: list[str], schedule_name: str,
         bs_select_lines.append(
             "            else {\n"
             f'                printf("FATAL: xpurt: entry %d of {net} asks for impl \'%s\', '
-            f'which this binary was not built with (has: {"/".join(k for k, _ in kind_backend_pairs)}). '
+            f'which this binary was not built with (has: {"/".join([k for k, _ in kind_backend_pairs] + [f"{k}:{i}" for k, i, _ in impl_backends])}). '
             f'Either the schedule chose a per-dispatch implementation the build '
             f'lacks, or the kind->backend pairing is wrong at codegen; see '
             f'pipeline/generate_xpurt_main.py\\n", e_->entry_id, e_->impl);\n'
@@ -273,7 +303,7 @@ def _emit(networks: list[str], schedule_name: str,
             f"                }}\n"
             + "\n".join(
                 f"                model_{mid}_reset_profile_{bs}();"
-                for bs in backends
+                for bs in all_backends
             ) + "\n"
             f"                wall_start_{mid}[e_->instance] = (uint64_t)k_cycle_get_64();\n"
             f"            }}\n"
@@ -303,7 +333,7 @@ def _emit(networks: list[str], schedule_name: str,
         # We tag rows with the backend so the host can split per-op cost
         # by backend.
         per_bs_profile_blocks: list[str] = []
-        for bs in backends:
+        for bs in all_backends:
             per_bs_profile_blocks.append(f"""\
         {{
             int n_records = 0;
@@ -916,6 +946,14 @@ def main() -> None:
                          "names differ, entry i runs kind i (e.g. kinds "
                          "x100,a100 with backends rvv_k3,ime_k3_a100). "
                          "Defaults to --core-kinds.")
+    ap.add_argument("--impl-backends", default=None,
+                    help="comma list of core_kind:impl=backend triples for "
+                         "schedules that choose a per-dispatch implementation "
+                         "(XPU-RT scheduler.enable_impls writes `impl` on each "
+                         "dispatch), e.g. a100:ime=ime_k3_a100,"
+                         "a100:rvv=rvv_k3_a100,x100:rvv=rvv_k3. Tried before "
+                         "the --core-kinds/--backends pairing; every backend "
+                         "named here must also be compiled into the harness.")
     ap.add_argument("--registry", default=None,
                     help="path to the cores/*.json registry that drove the "
                          "schedule. Used to derive each kind's pool size as "
@@ -959,6 +997,18 @@ def main() -> None:
         if not backends:
             raise SystemExit("--backends must be a non-empty comma list")
 
+    impl_backends: list[tuple[str, str, str]] = []
+    for item in (args.impl_backends or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        lhs, eq, bs = item.partition("=")
+        kind, colon, impl = lhs.partition(":")
+        if not (eq and colon and kind and impl and bs):
+            raise SystemExit(f"--impl-backends: bad entry {item!r} "
+                             "(want core_kind:impl=backend)")
+        impl_backends.append((kind.strip(), impl.strip(), bs.strip()))
+
     # Pool size resolution:
     #   1. explicit --pool-sizes wins
     #   2. else --registry: harts_of_kind - 1 per kind
@@ -996,13 +1046,15 @@ def main() -> None:
                   if harts_per_kind and any(pool_sizes) else None)
     src = _emit(networks, args.name, args.dispatch_table_header,
                 core_kinds, backends, pool_sizes, n_instances,
-                per_hart_workers=per_hart, pool_harts=pool_harts)
+                per_hart_workers=per_hart, pool_harts=pool_harts,
+                impl_backends=impl_backends)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
     print(f"wrote {args.out}  (networks: {networks} "
           f"instances: {n_instances} kinds: {core_kinds} "
-          f"backends: {backends} pool_sizes: {pool_sizes})")
+          f"backends: {backends} impl_backends: {impl_backends} "
+          f"pool_sizes: {pool_sizes})")
 
 
 if __name__ == "__main__":

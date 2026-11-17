@@ -23,6 +23,12 @@
 # Usage:
 #   scripts/run_xpurt_k1.sh --schedule <scheduled_*.json> \
 #       [--models mlp_control,dronet] [--backends scalar] [--quant int8]
+#       [--impl-backends a100:ime=ime_k3_a100,a100:rvv=rvv_k3_a100,x100:rvv=rvv_k3]
+#
+# --impl-backends serves schedules that choose a per-dispatch implementation
+# (XPU-RT `scheduler.enable_impls` writes `impl` on each dispatch): on a core
+# of kind K, a dispatch with impl I runs backend B for each K:I=B. Every
+# backend named there is built too.
 #
 # Board selection: MODELBLASTER_BOARD=k1 (default) | k3 changes only the
 # defaults (host, remote root, registry, core kinds, backends, output root);
@@ -151,6 +157,7 @@ while [[ $# -gt 0 ]]; do
         --models)    MODELS="$2"; shift 2 ;;
         --staged-ir) STAGED_IRS="${STAGED_IRS:+${STAGED_IRS},}$2"; shift 2 ;;
         --backends)  BACKENDS="$2"; shift 2 ;;
+        --impl-backends) IMPL_BACKENDS="$2"; shift 2 ;;
         --quant)     QUANT="$2"; shift 2 ;;
         --out-root)  OUT_ROOT="$2"; shift 2 ;;
         --cpu-ids)   CPU_IDS="$2"; shift 2 ;;
@@ -178,7 +185,15 @@ IFS=',' read -r -a CORE_KIND_LIST <<< "${CORE_KINDS}"
 # same ISA, so both pools compile rvv_x60. The GENERATOR needs the per-kind
 # list (kind k is executed by backend k); CMake needs the deduped set, or it
 # would try to declare the same OBJECT-library target twice.
-UNIQUE_BACKENDS="$(printf '%s\n' "${BACKEND_LIST[@]}" | awk '!seen[$0]++' | paste -sd, -)"
+# Backends that only an --impl-backends triple names are built as well.
+IMPL_BACKENDS="${IMPL_BACKENDS:-}"
+IMPL_BS=()
+if [[ -n "${IMPL_BACKENDS}" ]]; then
+    IFS=',' read -r -a _ib <<< "${IMPL_BACKENDS}"
+    for t in "${_ib[@]}"; do IMPL_BS+=("${t#*=}"); done
+fi
+UNIQUE_BACKENDS="$(printf '%s\n' "${BACKEND_LIST[@]}" "${IMPL_BS[@]}" | awk 'NF && !seen[$0]++' | paste -sd, -)"
+IFS=',' read -r -a BUILD_BACKEND_LIST <<< "${UNIQUE_BACKENDS}"
 if [[ ${#CORE_KIND_LIST[@]} -ne ${#BACKEND_LIST[@]} ]]; then
     echo "core-kinds (${CORE_KINDS}) and backends (${BACKENDS}) must be" >&2
     echo "parallel lists: kind k is executed by backend k." >&2
@@ -318,7 +333,7 @@ for model in "${MODEL_LIST[@]}"; do
         --ir "${base}/graph.json" --schedule "${SCHEDULE}" \
         --network "${model}" --out "${CODEGEN_IR}"
 
-    for bs in "${BACKEND_LIST[@]}"; do
+    for bs in "${BUILD_BACKEND_LIST[@]}"; do
         bdir="${base}/${bs}"
         if [[ -f "${bdir}/kernels.c" && -f "${bdir}/model.c" ]]; then
             # Existence is NOT enough. generate_kernels.py inlines the curated
@@ -371,7 +386,7 @@ for model in "${MODEL_LIST[@]}"; do
     # 0.81x against the scalar build (i.e. SLOWER) purely because the fused
     # conv2d_batchnorm2d_silu_s8 had no curated RVV kernel and nothing said so.
     # Catch it here, before the board time is spent.
-    for bs in "${BACKEND_LIST[@]}"; do
+    for bs in "${BUILD_BACKEND_LIST[@]}"; do
         [[ "${bs}" == "scalar" ]] && continue
         if ! ${PY} "${REPO_ROOT}/scripts/check_kernel_coverage.py" "${base}/${bs}"; then
             if [[ "${MB_KERNEL_COVERAGE:-strict}" == "warn" ]]; then
@@ -422,6 +437,7 @@ ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --schedule "${SCHEDULE}" --out "${MAIN_C}" --name "${SCHED_NAME}" \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
     --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
+    ${IMPL_BACKENDS:+--impl-backends "${IMPL_BACKENDS}"} \
     --registry "${REGISTRY}" --worker-granularity "${WORKERS}"
 
 echo "=== 4/5 cross-build (harness_xpurt/build_posix.sh) ==="

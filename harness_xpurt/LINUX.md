@@ -102,6 +102,29 @@ In every other case the emitted walker is unchanged (byte-identical across the
 schedule fixtures). Without this pairing no backend runs the target's core
 kinds, and the run stops at the first such dispatch (see below).
 
+## Per-dispatch implementations
+
+A schedule solved with XPU-RT's `scheduler.enable_impls` writes an `impl` on
+each dispatch (`"rvv"`, `"ime"`): `hardware_target` names the core a dispatch
+runs on, `impl` the implementation it runs with. Ingest carries `impl` into
+the dispatch table (it defaults to the entry's core kind), and the walker picks
+the kernel table by it. This is how one K3 A100 core runs a GEMM on IME and the
+next op on its vector unit.
+
+Map each (core kind, impl) to a backend with `--impl-backends`; every backend
+named there must be built as well:
+
+```bash
+--core-kinds x100,a100 --backends rvv_k3,ime_k3_a100 \
+--impl-backends a100:ime=ime_k3_a100,a100:rvv=rvv_k3_a100,x100:rvv=rvv_k3
+```
+
+A matched dispatch keeps its core's state, so its pool follows the core and its
+kernel follows the implementation. Dispatches without a match fall back to the
+`--core-kinds`/`--backends` pairing, with `impl` compared against the kind
+names; a schedule without `impl` therefore runs as before. The one-step runners
+take the same `--impl-backends` and build the extra backends.
+
 ## Composite targets
 
 A composite target (`CPU_P#4+CPU_P#5+...`) is one dispatch over several harts.
@@ -183,13 +206,13 @@ rewritten one, instead of extracting it.
 
 ## Errors stop the run
 
-A dispatch whose core kind has no backend in the build prints
-`FATAL: xpurt: no backend built for core_kind '<kind>' (...)` and stops the
-run, as do the walker's other fatal errors (too many workers, a failed pool or
+A dispatch whose implementation has no backend in the build prints
+`FATAL: xpurt: entry <n> of <network> asks for impl '<impl>', which this
+binary was not built with (has: ...)` and stops the run, as do the walker's other fatal errors (too many workers, a failed pool or
 thread create). On Linux they exit with status 2; on Zephyr they reboot, as
 before. A skipped dispatch would otherwise report the runtime of a different
-workload. `--core-kinds` and `--backends` that do not cover the schedule are
-the usual cause.
+workload. `--core-kinds`, `--backends` and `--impl-backends` that do not cover
+the schedule are the usual cause.
 
 For a static or cross build pass `LDFLAGS=-static` (and `CC=`) to
 `build_posix.sh`; QEMU user mode and board deploys need a static binary.
@@ -211,6 +234,12 @@ samples):
   `rvv_k3` on the X100 with either `ime_k3_a100` or `rvv_k3_a100` on the A100:
   46/46 instances, all three networks bit-exact, outputs identical to the K1.
   The A100 workers run on CPUs 8-15 after registering their own TIDs.
+- SpacemiT K3 with per-dispatch implementations: the same 1054-dispatch
+  schedule with `impl` set (A100 dispatches alternating `ime` and `rvv`, a
+  third of the X100 dispatches `rvv`, the rest unset), built with `rvv_k3`,
+  `ime_k3_a100` and `rvv_k3_a100`: both worker modes exit 0, 46/46 instances,
+  all three networks bit-exact. Every profile row's backend is the one the
+  schedule chose for that dispatch, and both A100 backends ran in the same run.
 - The one-step runners, end to end on the K1 and the K3 with the same three
   networks and a 1054-dispatch schedule (554 composite targets): exit 0,
   1054 trace rows, all three networks bit-exact.
@@ -219,9 +248,6 @@ samples):
 
 - **Composite speedup depends on the kernel**: only ops with a pool path
   spread over the hart set (see "Composite targets").
-- **One implementation per core kind**: the kernel is chosen by the entry's
-  core kind, so a schedule cannot pick a different implementation (e.g. IME
-  vs RVV) per dispatch on the same core.
 - **Start gate**: each instance's first dispatch waits for its scheduled start;
   later dispatches, including other DAG roots, start when their dependencies
   finish.

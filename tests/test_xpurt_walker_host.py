@@ -357,3 +357,82 @@ def test_hart_mode_worker_on_an_ai_cpu_registers_its_own_tid(tmp_path):
     tids = [int(t) for t in reg.read_text().split()]
     assert len(tids) == 1, f"exactly the hart-1 worker registers: {tids}"
     assert tids[0] != os.getpid(), "a worker thread registers, never the process"
+
+
+def _impl_kernels(backend: str) -> str:
+    """Fixture backend that reports which backend ran each dispatch."""
+    BS = backend.upper()
+    return f"""\
+#include <stdio.h>
+#include "synth_model.h"
+static void op0(model_synth_state_t *s) {{ (void)s; printf("RAN {backend} 0\\n"); fflush(stdout); }}
+static void op1(model_synth_state_t *s) {{ (void)s; printf("RAN {backend} 1\\n"); fflush(stdout); }}
+const model_synth_dispatch_fn MODEL_SYNTH_DISPATCH_FNS_{BS}[MODEL_SYNTH_OP_COUNT] = {{ op0, op1 }};
+void model_synth_reset_profile_{backend}(void) {{}}
+__attribute__((weak)) const int model_synth_n_buf_sets = 1;
+const model_synth_op_record_t *model_synth_profile_records_{backend}(int *count)
+{{ *count = 0; return NULL; }}
+"""
+
+
+def _build_impl_walker(w: Path, impls: dict[int, str], impl_backends: str) -> Path:
+    pkg = w / "pkg"
+    pkg.mkdir()
+    os.symlink(ROOT, pkg / "modelblaster")
+    env = dict(os.environ, PYTHONPATH=str(pkg))
+    sched = _schedule()
+    for d in sched["dispatches"].values():
+        d["impl"] = impls[d["id"]]
+    _write(w / "schedule.json", json.dumps(sched))
+    _write(w / "registry.json", json.dumps(_registry()))
+    _write(w / "graph.json", json.dumps({"ops": [
+        {"dispatch_id": 0, "op": "synth_a", "name": "a"},
+        {"dispatch_id": 1, "op": "synth_b", "name": "b"}]}))
+    _write(w / "synth_model.h", _model_header())
+    _write(w / "synth_test_io.h",
+           "static const float model_synth_test_input[1] = { 0.0f };\n")
+    for bs in ("rvv_vec", "rvv_mac"):
+        _write(w / f"kernels_{bs}.c", _impl_kernels(bs))
+    for a in (("modelblaster.pipeline.ingest_xpurt_schedule",
+               "--schedule", "schedule.json", "--registry", "registry.json",
+               "--ir", "synth:graph.json", "--out", str(w / "demo_table.c"),
+               "--name", "demo"),
+              ("modelblaster.pipeline.generate_xpurt_main",
+               "--schedule", "schedule.json", "--out", str(w / "main.c"),
+               "--name", "demo", "--dispatch-table-header", "demo_table.h",
+               "--core-kinds", "rvv", "--backends", "rvv_vec",
+               "--impl-backends", impl_backends,
+               "--worker-granularity", "hart")):
+        r = subprocess.run([sys.executable, "-m", *a], cwd=w, env=env,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"{a[0]} failed:\n{r.stdout}\n{r.stderr}"
+    exe = w / "walker"
+    cmd = [CC, "-O1", "-pthread", "-DMB_PLATFORM_POSIX", "-D_GNU_SOURCE",
+           f"-I{ROOT / 'runtime'}", f"-I{ROOT / 'runtime' / 'modelblaster_pool'}",
+           f"-I{w}", "-o", str(exe), "main.c", "demo_table.c",
+           "kernels_rvv_vec.c", "kernels_rvv_mac.c",
+           str(ROOT / "runtime" / "modelblaster_pool" / "modelblaster_pool.c"),
+           str(ROOT / "runtime" / "mb_placement.c")]
+    r = subprocess.run(cmd, cwd=w, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    return exe
+
+
+def test_one_core_runs_the_impl_each_dispatch_asks_for(tmp_path):
+    """Per-dispatch implementation on one core kind (the K3 A100 case: IME for
+    one GEMM, the vector unit for the next): every op0 asks for `ime`, every
+    op1 for `rvv`, and each must run the backend --impl-backends maps it to."""
+    exe = _build_impl_walker(tmp_path, {0: "ime", 1: "rvv"},
+                             "rvv:ime=rvv_mac,rvv:rvv=rvv_vec")
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout[-2000:]
+    ran = re.findall(r"^RAN (\w+) (\d)$", r.stdout, re.M)
+    assert sorted(ran) == sorted([("rvv_mac", "0")] * N_JOBS + [("rvv_vec", "1")] * N_JOBS), ran
+
+
+def test_an_impl_the_build_lacks_stops_the_run(tmp_path):
+    exe = _build_impl_walker(tmp_path, {0: "ime", 1: "npu"},
+                             "rvv:ime=rvv_mac,rvv:rvv=rvv_vec")
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2, r.stdout[-2000:]
+    assert "asks for impl 'npu'" in r.stdout
