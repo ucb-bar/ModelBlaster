@@ -48,9 +48,18 @@
 #include <zephyr/kernel.h>
 enum { MB_RVV_F16DWS8_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
 #define MB_RVV_F16DWS8_WS_SLOT ((int)arch_proc_id())
+#elif defined(__linux__) || defined(__APPLE__)
+/* Hosted: one workspace per THREAD. A hosted walker runs several worker and
+ * pool threads at once, and a shared slot races exactly as described above. */
+enum { MB_RVV_F16DWS8_WS_SLOTS = 1 };
+#define MB_RVV_F16DWS8_WS_SLOT 0
+#define MB_RVV_F16DWS8_WS_TLS _Thread_local
 #else
 enum { MB_RVV_F16DWS8_WS_SLOTS = 1 };
 #define MB_RVV_F16DWS8_WS_SLOT 0
+#endif
+#ifndef MB_RVV_F16DWS8_WS_TLS
+#define MB_RVV_F16DWS8_WS_TLS
 #endif
 
 /* ONE SLOT PER HART. mb_dws8_acc is THIS call's accumulator drain buffer
@@ -59,7 +68,7 @@ enum { MB_RVV_F16DWS8_WS_SLOTS = 1 };
  * in this campaign's four networks selects this kernel. Corrected because
  * the same shape in the gemmini im2col conv kernel WAS reached and cost
  * max_abs_err=89 on yolov8_nano over a gemmini pair. */
-static int32_t mb_dws8_acc_all[MB_RVV_F16DWS8_WS_SLOTS][MB_DWS8_TILE] __attribute__((aligned(64)));
+static MB_RVV_F16DWS8_WS_TLS int32_t mb_dws8_acc_all[MB_RVV_F16DWS8_WS_SLOTS][MB_DWS8_TILE] __attribute__((aligned(64)));
 
 static inline int32_t mb_dws8_requant(int32_t x, int32_t mult, int32_t shift) {
     int64_t prod = (int64_t)x * (int64_t)mult;

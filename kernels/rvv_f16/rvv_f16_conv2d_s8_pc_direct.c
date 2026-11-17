@@ -52,9 +52,18 @@
 #include <zephyr/kernel.h>
 enum { MB_RVV_F16CONVPC_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
 #define MB_RVV_F16CONVPC_WS_SLOT ((int)arch_proc_id())
+#elif defined(__linux__) || defined(__APPLE__)
+/* Hosted: one workspace per THREAD. A hosted walker runs several worker and
+ * pool threads at once, and a shared slot races exactly as described above. */
+enum { MB_RVV_F16CONVPC_WS_SLOTS = 1 };
+#define MB_RVV_F16CONVPC_WS_SLOT 0
+#define MB_RVV_F16CONVPC_WS_TLS _Thread_local
 #else
 enum { MB_RVV_F16CONVPC_WS_SLOTS = 1 };
 #define MB_RVV_F16CONVPC_WS_SLOT 0
+#endif
+#ifndef MB_RVV_F16CONVPC_WS_TLS
+#define MB_RVV_F16CONVPC_WS_TLS
 #endif
 
 /* ONE SLOT PER HART. mb_wt holds THIS call's transposed weight matrix,
@@ -69,9 +78,9 @@ enum { MB_RVV_F16CONVPC_WS_SLOTS = 1 };
  * this correction is unmeasured. It is made because the defect class is
  * proven: the identical shape in the gemmini im2col conv kernel WAS
  * reached and cost max_abs_err=89 on yolov8_nano over a gemmini pair. */
-static int8_t  mb_wt_all   [MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_WT_MAX];
-static int8_t  mb_patch_all[MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_TILE * MB_CONV_PATCH_MAX];
-static int32_t mb_drain_all[MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_OC_MAX];
+static MB_RVV_F16CONVPC_WS_TLS int8_t  mb_wt_all   [MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_WT_MAX];
+static MB_RVV_F16CONVPC_WS_TLS int8_t  mb_patch_all[MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_TILE * MB_CONV_PATCH_MAX];
+static MB_RVV_F16CONVPC_WS_TLS int32_t mb_drain_all[MB_RVV_F16CONVPC_WS_SLOTS][MB_CONV_OC_MAX];
 
 static inline int32_t mb_q31_requant_pc(int32_t x, int32_t mult, int32_t shift) {
     int64_t prod = (int64_t)x * (int64_t)mult;
