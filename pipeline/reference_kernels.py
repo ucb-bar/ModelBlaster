@@ -2686,6 +2686,22 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             reference_impl="",  # curated: kernels/ime/ime_conv2d_s8_ime_vmadot_4x4x8.c
         ),
         AlgorithmCandidate(
+            name="x100_vmadot_4x4x8",
+            target_affinity=("ime_k3_x100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            # IHWOC like rvv_k3, or build-time "MBX100TW" tiles (k3_weight_tiles).
+            weight_layout="ihwoc",
+            description=(
+                "SpaceMiT K3 X100 int8 CONV2D via smt.vmadot (4x8x4 tile at "
+                "VLEN=256): 2 m-tile x 4 panel core, Q0.31 tail in vector "
+                "registers, implicit or indirect NCHW A packing per layer. "
+                "Reads IHWOC weights or the build's X100 tiles. Symmetric "
+                "int8 only; X100 cores only. Hand-written in "
+                "kernels/ime_k3_x100/ (k3-work TASK-014); must be bit-exact."
+            ),
+            reference_impl="",  # curated: kernels/ime_k3_x100/ime_k3_x100_conv2d_s8_x100_vmadot_4x4x8.c
+        ),
+        AlgorithmCandidate(
             name="ime_vmadot_8x16x8",
             target_affinity=("ime_k3_a100",),
             accuracy_class=AccuracyClass.BIT_EXACT,

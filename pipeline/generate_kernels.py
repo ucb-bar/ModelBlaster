@@ -462,6 +462,8 @@ def emit_kernels_c(
     backend: Optional[Backend] = None,
     model_name: Optional[str] = None,
 ) -> None:
+    from modelblaster.pipeline import k3_weight_tiles
+    k3_weight_tiles.check_kernels_read_tiles(impls, out_dir)
     parts = [HEADER, f"/* source: {source_label} */"]
     # Universal headers (FLT_MAX/INT64_MAX/size_t are kernel-friendly and free).
     for inc in _BASE_KERNEL_INCLUDES:

@@ -272,6 +272,30 @@ IME_K3_A100 = Backend(
 )
 
 
+# SpaceMiT K3 X100 IME (smt.vmadot int8, 4x8x4 tile at VLEN=256). X100 cores
+# (CPUs 0-7). Cloned from rvv_k3 (zvl256b, IHWOC conv weights, cross-compile
+# verify); the vmadot is emitted as `.insn r 0x2b, 3, 0x71`. Hand-written X100
+# kernels (k3-work TASK-014 conv2d_s8 and the TASK-013 maxpool as a K3-only
+# copy; TASK-015 measured both faster than rvv_k3 in yolov8_nano) live in
+# kernels/ime_k3_x100/ as ime_k3_x100_<op>_<algo>.c; every other op (linear_s8
+# included: our X100 linear lost to rvv on batch-1 layers) falls through to
+# rvv_k3, i.e. the shared rvv set. No `ime` alias: the
+# K1 kernels in kernels/ime/ are not used on the K3. The conv kernel takes
+# build-time "MBX100TW" weight tiles (pipeline/k3_weight_tiles.py) or plain IHWOC.
+IME_K3_X100 = Backend(
+    name="ime_k3_x100",
+    description="SpaceMiT K3 X100: zvl256b RVV + IME int8 vmadot 4x8x4. "
+                "X100 cores only; falls back to rvv_k3 then rvv.",
+    kernel_cflags=RVV_K3.kernel_cflags,
+    kernel_includes=RVV_K3.kernel_includes,
+    prj_conf_overlay=RVV_K3.prj_conf_overlay,
+    spike_args=RVV_K3.spike_args,
+    optimization_guide=RVV_K3.optimization_guide,
+    curated_aliases=("rvv_k3", "rvv"),
+    verify_method=RVV_K3.verify_method,
+)
+
+
 # fp16 variants: same shape as scalar/rvv but with Zfh (and Zvfh on rvv)
 # enabled. The Kconfig overlay (scalar_f16.conf / rvv_f16.conf) tells
 # Zephyr to context-switch the half-precision register state and tells
@@ -845,6 +869,7 @@ BACKENDS: dict[str, Backend] = {
     RVV_K3.name: RVV_K3,
     RVV_K3_A100.name: RVV_K3_A100,
     IME_K3_A100.name: IME_K3_A100,
+    IME_K3_X100.name: IME_K3_X100,
     RVV_HETERO.name: RVV_HETERO,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,

@@ -1024,6 +1024,11 @@ static pthread_mutex_t mb_ihwoc_lock_{mid} = PTHREAD_MUTEX_INITIALIZER;
 static const int8_t *mb_ihwoc_shards_{mid}(const int8_t *w, size_t per_filter,
                                            int OC, int T) {{
     int8_t *p = NULL;
+    /* Matrix-tile weights (K3 IME, pipeline/k3_weight_tiles.py) are not IHWOC
+     * and cannot be OC-sliced: run serially. */
+    if (per_filter * (size_t)OC >= 64 && (memcmp(w, "MBX100TW", 8) == 0
+            || memcmp(w, "MBIME2TW", 8) == 0))
+        return NULL;
     pthread_mutex_lock(&mb_ihwoc_lock_{mid});
     for (int i = 0; i < mb_ihwoc_n_{mid}; i++) {{
         if (mb_ihwoc_cache_{mid}[i].w == w && mb_ihwoc_cache_{mid}[i].T == T) {{
@@ -2205,9 +2210,11 @@ def emit_weights(
     # that ran before this existed emits byte-identical weights.
     tile_extra: dict[str, np.ndarray] = {}
     tile_drop: set[str] = set()
+    shard_ids: frozenset = frozenset()
     if ir is not None:
         plan = split_conv_tile_weights(ir, backend)
         shard_plan = shard_conv_weights(ir, backend, shard_factor())
+        shard_ids = frozenset(shard_plan)
         if plan:
             tile_extra, tile_drop = _apply_tile_weight_plan(weights, plan)
         if shard_plan:
@@ -2259,13 +2266,17 @@ def emit_weights(
         weights = {**{k: v for k, v in weights.items() if k not in tile_drop},
                    **tile_extra}
     keys = sorted(weights.keys())
+    # K3 IME backends: some conv weights go out as matrix tiles (k3_weight_tiles).
+    from modelblaster.pipeline import k3_weight_tiles
+    k3_tiled = k3_weight_tiles.pack_weights(ir, backend, weights, out_dir, shard_ids)
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
                "", "#ifdef __cplusplus", 'extern "C" {', "#endif", ""]
     for k in keys:
         ident = _weight_name(model_name, k, backend)
-        c_type, _ = _np_to_c_dtype(weights[k].dtype)
-        size = weights[k].size
+        arr = k3_tiled[k][0] if k in k3_tiled else weights[k]
+        c_type, _ = _np_to_c_dtype(arr.dtype)
+        size = arr.size
         h_lines.append(f"extern const {c_type} {ident}[{size}];")
     h_lines += ["", "#ifdef __cplusplus", "}", "#endif", ""]
     with open(os.path.join(out_dir, "weights.h"), "w") as f:
@@ -2278,17 +2289,24 @@ def emit_weights(
     for k in keys:
         ident = _weight_name(model_name, k, backend)
         arr_in = weights[k]
-        arr_out, layout_tag = ((arr_in, None) if k.startswith("const.")
-                               else _backend_pack_weight(
-                                   arr_in, backend, owners.get(k),
-                                   ir_known=bool(owners)))
+        if k in k3_tiled:
+            arr_out, layout_tag = k3_tiled[k]
+        else:
+            arr_out, layout_tag = ((arr_in, None) if k.startswith("const.")
+                                   else _backend_pack_weight(
+                                       arr_in, backend, owners.get(k),
+                                       ir_known=bool(owners)))
         c_type, _ = _np_to_c_dtype(arr_out.dtype)
-        if layout_tag:
+        if k in k3_tiled:
+            c_lines.append(f"/* {ident}: shape {tuple(arr_in.shape)} → {layout_tag} */")
+        elif layout_tag:
             c_lines.append(
                 f"/* {ident}: shape {tuple(arr_in.shape)} OIHW → "
                 f"{tuple(arr_out.shape)} {layout_tag} */"
             )
-        c_lines.append(f"const {c_type} {ident}[{arr_out.size}] = {{")
+        # Tiles are loaded in place: keep them on a cache line (64-byte header).
+        align = "__attribute__((aligned(64))) " if k in k3_tiled else ""
+        c_lines.append(f"{align}const {c_type} {ident}[{arr_out.size}] = {{")
         if arr_out.dtype in (np.float32, np.float16):
             # fp16 weights: widen to fp32 for the literal text (lossless),
             # implicit narrow happens at compile time when initializing the
