@@ -159,6 +159,28 @@ backends at `zvl1024b`, which is illegal on the X100, so they must only run on
 CPUs 8-15. `KERNEL_CFLAGS_<BACKEND>` overrides. On the K1 and the host
 `MODELBLASTER_AI_CPUS` is unset and placement is a plain pin.
 
+## One-step board runs
+
+`scripts/run_xpurt_k1.sh` (K1) and `scripts/run_xpurt_k3.sh` (K3) run every
+step above for a schedule: generate each (network, backend), ingest, generate
+the walker, cross-build a static binary with `build_posix.sh`, copy it to the
+board, run it, and pull back stdout and the trace CSV.
+
+```bash
+eval "$(../XPU-RT/scripts/setup_spacemit_toolchain.sh)"     # sets CROSS
+scripts/run_xpurt_k1.sh --schedule <sched.json> --models mlp_control,dronet,yolov8_nano
+MODELBLASTER_K3_HOST=k3 scripts/run_xpurt_k3.sh --schedule <sched.json> \
+    --models mlp_control,dronet,yolov8_nano
+```
+
+The board is reached through the ssh host `MODELBLASTER_K1_HOST` (default
+`k1`) or `MODELBLASTER_K3_HOST` (default `spacemitk3`). The K3 runner builds
+`rvv_k3` for the X100 and `ime_k3_a100` for the A100, takes
+`MODELBLASTER_AI_CPUS` from the registry, and launches under `taskset -c 0-7`.
+`MB_XPURT_WORKERS=kind` selects kind workers (default `hart`);
+`--staged-ir <network>:<dir>` uses an IR that is already built, such as a
+rewritten one, instead of extracting it.
+
 ## Errors stop the run
 
 A dispatch whose core kind has no backend in the build prints
@@ -189,6 +211,9 @@ samples):
   `rvv_k3` on the X100 with either `ime_k3_a100` or `rvv_k3_a100` on the A100:
   46/46 instances, all three networks bit-exact, outputs identical to the K1.
   The A100 workers run on CPUs 8-15 after registering their own TIDs.
+- The one-step runners, end to end on the K1 and the K3 with the same three
+  networks and a 1054-dispatch schedule (554 composite targets): exit 0,
+  1054 trace rows, all three networks bit-exact.
 
 ## What is not covered yet
 
@@ -204,5 +229,3 @@ samples):
   ported, so each network's first instance runs cold inside the timed window.
 - **Output check**: the walker prints the output markers; the runners compare
   them against the golden. There is no in-binary golden check.
-- No runner script that builds and executes in one step, or copies to a board.
-  Steps 1 to 4 are manual.

@@ -16,8 +16,8 @@
 #      kernels, staged as <base>/<backend>/ which is the layout the harness
 #      CMake wants (one weights TU per backend; buffers shared per model).
 #   2. ingest the XPU-RT schedule -> dispatch_table.{c,h}
-#   3. generate xpurt_main.c with --platform linux (rdtime + POSIX semaphores)
-#   4. cross-build harness_xpurt_linux
+#   3. generate xpurt_main.c (--worker-granularity, default hart)
+#   4. cross-build a static executable with harness_xpurt/build_posix.sh
 #   5. scp to the board, run pinned, pull back stdout + the trace CSV
 #
 # Usage:
@@ -29,7 +29,7 @@
 # explicit env vars and flags still win. scripts/run_xpurt_k3.sh sets it.
 # On k3 the binary is launched under `taskset -c 0-7` (X100); A100 threads
 # register themselves with the kernel inside the runtime, and the registry's
-# ai_thread_cpus are handed to cmake as MODELBLASTER_AI_CPUS.
+# ai_thread_cpus are handed to build_posix.sh as MODELBLASTER_AI_CPUS.
 #
 # No credentials are read or written. Board access comes from the ssh config
 # entry named by MODELBLASTER_K1_HOST (default "k1"; k3: MODELBLASTER_K3_HOST,
@@ -186,9 +186,7 @@ if [[ ${#CORE_KIND_LIST[@]} -ne ${#BACKEND_LIST[@]} ]]; then
 fi
 
 SCHED_NAME="$(basename "${SCHEDULE}" .json)"
-# Absolute: CMake resolves relative source paths against its own source dir,
-# not the invoking cwd, so a relative XPURT_MAIN_C is looked up under
-# harness_xpurt_linux/ and not found.
+# Absolute: build_posix.sh runs from its own directory.
 GEN_DIR="${REPO_ROOT}/${OUT_ROOT}/_gen/${SCHED_NAME}"
 BUILD_DIR="${REPO_ROOT}/${OUT_ROOT}/_build/${SCHED_NAME}"
 mkdir -p "${GEN_DIR}" "${BUILD_DIR}"
@@ -356,11 +354,12 @@ for model in "${MODEL_LIST[@]}"; do
         fi
         echo "  [${model}/${bs}] skeleton + kernels"
         mkdir -p "${bdir}"
-        # --platform linux swaps rdcycle (SIGILLs here) for rdtime.
+        # Default platform: build_posix.sh compiles with MB_PLATFORM_POSIX,
+        # which times dispatches with CLOCK_MONOTONIC (rdcycle SIGILLs here).
         ${PY} -m modelblaster.pipeline.generate_skeleton \
             --ir "${CODEGEN_IR}" --weights "${base}/weights.npz" \
             --io "${base}/io.npz" --out-dir "${bdir}" \
-            --backend "${bs}" --platform linux
+            --backend "${bs}"
         ${PY} -m modelblaster.pipeline.generate_kernels \
             --ir "${CODEGEN_IR}" --out-dir "${bdir}" \
             --target "${bs}" --backend "${KERNEL_BACKEND}" --quant "${QUANT}" \
@@ -405,64 +404,41 @@ ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
 [[ -f "${SCHED_C}" ]] || { echo "ingest produced no dispatch table" >&2; exit 1; }
 echo "  ${SCHED_C}"
 
-# Warm-up pass (untimed first run of every distinct dispatch before t0).
-# On by default on k3, where the cold first instance of each network lands
-# inside the timed window and shows up as deadline misses; off on k1.
-# MB_XPURT_WARMUP=0/1 overrides.
-if [[ "${BOARD_NAME}" == "k3" ]]; then _warm_def=1; else _warm_def=0; fi
-WARMUP_ARGS=()
-[[ "${MB_XPURT_WARMUP:-${_warm_def}}" == "1" ]] && WARMUP_ARGS+=(--warmup)
+# The walker has no warm-up pass or live JSON stream yet (see
+# harness_xpurt/LINUX.md); say so rather than silently ignoring the knob.
+[[ "${MB_XPURT_WARMUP:-0}" == "1" ]] && \
+    echo "note: MB_XPURT_WARMUP=1 ignored: the walker has no warm-up pass" >&2
+[[ "${STREAM}" == "1" ]] && \
+    echo "note: MB_XPURT_STREAM=1 ignored: the walker has no live stream" >&2
+# One pinned worker per (kind, hart) by default: the schedule places
+# dispatches on individual harts, and composite targets need hart mode to
+# reserve their whole hart set. MB_XPURT_WORKERS=kind gives one worker per
+# kind with an intra-op pool over the kind's harts.
+WORKERS="${MB_XPURT_WORKERS:-hart}"
 
-echo "=== 3/5 generate the walker (platform linux) ==="
+echo "=== 3/5 generate the walker (--worker-granularity ${WORKERS}) ==="
 MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
 ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --schedule "${SCHEDULE}" --out "${MAIN_C}" --name "${SCHED_NAME}" \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
-    --platform linux --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
-    --networks "${MODELS}" --registry "${REGISTRY}" "${WARMUP_ARGS[@]}"
+    --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
+    --registry "${REGISTRY}" --worker-granularity "${WORKERS}"
 
-echo "=== 4/5 cross-build ==="
-CMAKE_ARGS=(
-    "-DCMAKE_C_COMPILER=${CROSS}gcc"
-    "-DCMAKE_C_FLAGS=-O2 -static"
-    "-DCMAKE_SYSTEM_NAME=Linux"
-    "-DCMAKE_SYSTEM_PROCESSOR=riscv64"
-    "-DPYTHON_EXECUTABLE=${PY}"
-    "-DMODEL_BACKENDS=${UNIQUE_BACKENDS}"
-    "-DMODEL_NAMES=${MODEL_NAMES}"
-    "-DMODEL_DIRS_BASE=${MODEL_DIRS_BASE}"
-    "-DXPURT_SCHEDULE_C=${SCHED_C}"
-    "-DXPURT_MAIN_C=${MAIN_C}"
-    "-DXPURT_INCLUDE_DIR=${GEN_DIR}"
-)
-for bs in "${BACKEND_LIST[@]}"; do
-    BS_UPPER=$(echo "${bs}" | tr '[:lower:]' '[:upper:]')
-    KF=$(${PY} -c "
-from modelblaster.pipeline.backends import get
-print(' '.join(get('${bs}').resolved_kernel_cflags('${REPO_ROOT}')))
-" 2>/dev/null || echo "")
-    [[ -n "${KF}" ]] && CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CFLAGS_${BS_UPPER}=${KF}")
-done
-[[ "${TRACE}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_TRACE=ON")
-[[ "${STREAM}" == "1" ]] && CMAKE_ARGS+=("-DMODELBLASTER_XPURT_STREAM=ON")
-# Compile kernels.c with a different compiler than the rest. Needed for the
-# Zvfh fp16 kernels, whose intrinsics do not exist in GCC 13.2 -- the only
-# riscv64-unknown-linux-gnu compiler here. Same variable and same meaning as
-# scripts/run_model_k1.sh, so the standalone and scheduled paths agree.
-# Unset by default; see harness_xpurt_linux/CMakeLists.txt for why it is an
-# explicit opt-in rather than a search.
-# A100 harts to register with the kernel (registry ai_thread_cpus). Only when
-# non-empty, so K1 configure lines are unchanged.
+echo "=== 4/5 cross-build (harness_xpurt/build_posix.sh) ==="
+# A100 harts that must register with the kernel (registry ai_thread_cpus);
+# empty on the K1. Kernel flags come from each backend's kernel_cflags.
 _ai="$(${PY} "${REPO_ROOT}/pipeline/core_registry.py" "${REGISTRY}" --ai-cpus)" || exit 2
-[[ -n "${_ai}" ]] && CMAKE_ARGS+=("-DMODELBLASTER_AI_CPUS=${_ai}")
 [[ -n "${MODELBLASTER_KERNEL_CC:-}" ]] && \
-    CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CC=${MODELBLASTER_KERNEL_CC}")
-
-cmake -S harness_xpurt_linux -B "${BUILD_DIR}" "${CMAKE_ARGS[@]}" >"${BUILD_DIR}/cmake.log" 2>&1 \
-    || { echo "cmake configure failed; tail of ${BUILD_DIR}/cmake.log:" >&2; tail -30 "${BUILD_DIR}/cmake.log" >&2; exit 1; }
-cmake --build "${BUILD_DIR}" -j "${JOBS}" >"${BUILD_DIR}/build.log" 2>&1 \
-    || { echo "build failed; tail of ${BUILD_DIR}/build.log:" >&2; tail -40 "${BUILD_DIR}/build.log" >&2; exit 1; }
+    echo "note: MODELBLASTER_KERNEL_CC ignored: build_posix.sh builds everything with CROSS" >&2
+mkdir -p "${BUILD_DIR}"
 BIN="${BUILD_DIR}/xpurt_harness"
+MODEL_NAMES="${MODEL_NAMES}" MODEL_DIRS_BASE="${MODEL_DIRS_BASE}" \
+MODEL_BACKENDS="${UNIQUE_BACKENDS}" \
+XPURT_SCHEDULE_C="${SCHED_C}" XPURT_MAIN_C="${MAIN_C}" XPURT_INCLUDE_DIR="${GEN_DIR}" \
+OUT="${BIN}" CC="${CROSS}gcc" LDFLAGS=-static PYTHON="${PY}" \
+MODELBLASTER_AI_CPUS="${_ai}" MODELBLASTER_XPURT_TRACE="${TRACE}" \
+    bash "${REPO_ROOT}/harness_xpurt/build_posix.sh" >"${BUILD_DIR}/build.log" 2>&1 \
+    || { echo "build failed; tail of ${BUILD_DIR}/build.log:" >&2; tail -40 "${BUILD_DIR}/build.log" >&2; exit 1; }
 [[ -x "${BIN}" ]] || { echo "no binary at ${BIN}" >&2; exit 1; }
 echo "  $(file -b "${BIN}" | cut -c1-70)"
 

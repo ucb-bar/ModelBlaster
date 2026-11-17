@@ -3,8 +3,7 @@
 # selection" note at the top of run_xpurt_k1.sh for what MODELBLASTER_BOARD=k3 changes.
 #
 # Defaults here: --backends rvv_k3,rvv_k3_a100 (parallel to core kinds x100,a100;
-# the A100 build is zvl1024b and must only run on CPUs 8-15), and the walker
-# gets the pre-timing warm-up pass (generate_xpurt_main --warmup).
+# the A100 build is zvl1024b and must only run on CPUs 8-15).
 #
 # SCHEDULING (XPU-RT side, not done by this script): solve K3 schedules with
 #   XPURT_CODEGEN_CONTRACT=<ModelBlaster>/cores/codegen_contract.json \
