@@ -198,7 +198,7 @@ def test_outer_lowers(tmp_path):
     """torch.outer / Tensor.outer (SOL Quant/014's rope frequencies) lower as einsum i,j->ij."""
     import subprocess
     (tmp_path / "outer.py").write_text(OUTER)
-    env = {**__import__("os").environ, "PYTHONPATH": str(MB.parent)}
+    env = {**__import__("os").environ, "PYTHONPATH": __import__("os").pathsep.join([str(MB / "src"), str(MB.parent)])}
     cp = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.extract_graph", "--bench-file",
                          str(tmp_path / "outer.py"), "--out-dir", str(tmp_path / "ir"), "--quant", "fp32"],
                         capture_output=True, text=True, timeout=300, env=env)
@@ -228,7 +228,7 @@ def test_fp8_cast_is_refused(tmp_path):
     drops the rounding."""
     import subprocess
     (tmp_path / "fp8.py").write_text(FP8)
-    env = {**__import__("os").environ, "PYTHONPATH": str(MB.parent)}
+    env = {**__import__("os").environ, "PYTHONPATH": __import__("os").pathsep.join([str(MB / "src"), str(MB.parent)])}
     cp = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.extract_graph", "--bench-file",
                          str(tmp_path / "fp8.py"), "--out-dir", str(tmp_path / "ir"), "--quant", "fp32"],
                         capture_output=True, text=True, timeout=300, env=env)

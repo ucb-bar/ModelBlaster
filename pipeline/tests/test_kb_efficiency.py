@@ -209,7 +209,7 @@ class TelemetryTest(unittest.TestCase):
 
 class CliTest(unittest.TestCase):
     def test_generated_flags(self):
-        env = {**os.environ, "PYTHONPATH": str(ROOT.parent)}
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), str(ROOT.parent)])}
         out = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.kb_graph_opt", "--help"], env=env,
                              capture_output=True, text=True, timeout=120).stdout
         for flag in ("--efficiency-rules", "--stop-patience", "--plan-min-share-late"):

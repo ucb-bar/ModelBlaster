@@ -89,7 +89,9 @@ class RefusalTest(_Env):
             r = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.kb_graph_opt", t, "--work", t + "/w", "--kb", t,
                                 "--target", "opencl", "--board-host", "root@rb5", "--remote-dir", "/root/mb", "--arch", "adreno650",
                                 "--region-loop", "on", "--region-windows", "auto"], capture_output=True, text=True, timeout=120,
-                               env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[3])})
+                               env={**os.environ, "PYTHONPATH": os.pathsep.join([
+                                   str(Path(__file__).resolve().parents[2] / "src"),
+                                   str(Path(__file__).resolve().parents[3])])})
         self.assertEqual(r.returncode, 2, r.stderr[-500:])
         self.assertIn("--target opencl does not support", r.stderr)
         self.assertIn("--region-loop", r.stderr)

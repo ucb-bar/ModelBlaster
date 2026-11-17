@@ -310,7 +310,7 @@ class RunTest(Base):
         self.assertAlmostEqual(rows[0]["est_usd"], 0.09)
         out = subprocess.run([sys.executable, "-m", "modelblaster.pipeline.kb_ablate", "status", str(root)],
                              capture_output=True, text=True, cwd=ROOT.parent,
-                             env={**os.environ, "PYTHONPATH": str(ROOT.parent)})
+                             env={**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), str(ROOT.parent)])})
         self.assertIn("budget", out.stdout)
         # the ablation continues with a bigger cap: done runs are skipped
         self.assertEqual(self.run_cli("run", p, "--root", root, "--budget-usd", 1), 0)
@@ -337,7 +337,7 @@ class RunTest(Base):
     def _start(self, p, root):
         return subprocess.Popen([sys.executable, "-m", "modelblaster.pipeline.kb_ablate", "run", str(p), "--root",
                                  str(root)], cwd=ROOT.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                env={**os.environ, "PYTHONPATH": str(ROOT.parent)}, start_new_session=True)
+                                env={**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), str(ROOT.parent)])}, start_new_session=True)
 
     def _wait_running(self, root, n=1, timeout=60):
         t = time.time() + timeout
