@@ -149,13 +149,21 @@ For a static or cross build pass `LDFLAGS=-static` (and `CC=`) to
 
 ## Verified
 
-- x86-64 Linux host, real ingest and generator, a real 3-model schedule (826
-  dispatches, 46 instances), both worker modes: every dispatch ran, outputs
-  bit-exact against the golden for `mlp_control`/`dronet`.
-- riscv64 under QEMU user mode (`-cpu max,vlen=256`) and on a SpacemiT K1
-  (Bianbu, Linux 6.6), static cross build with the `rvv_x60` backend, both
-  worker modes: exit 0, 46/46 instances, outputs bit-exact for all three
-  networks.
+Three int8 networks (`mlp_control`, `dronet`, `yolov8_nano`), extracted and
+generated with this repo's pipeline, 46 instances, both worker modes. Outputs
+are compared with each network's golden (`yolov8_nano` on its 16 printed
+samples):
+
+- x86-64 Linux host: the walker tests in `tests/test_xpurt_walker_host.py`,
+  including a run with one CPU treated as an AI CPU.
+- riscv64 under QEMU user mode (`-cpu max,vlen=256`), static cross build,
+  `rvv_x60`: 46/46 instances, all three networks bit-exact.
+- SpacemiT K1 (Bianbu, Linux 6.6), the same binaries: bit-exact, outputs
+  identical to QEMU.
+- SpacemiT K3 (Bianbu, Linux 6.18), X100 + A100 (`MODELBLASTER_AI_CPUS=8-15`),
+  `rvv_k3` on the X100 with either `ime_k3_a100` or `rvv_k3_a100` on the A100:
+  46/46 instances, all three networks bit-exact, outputs identical to the K1.
+  The A100 workers run on CPUs 8-15 after registering their own TIDs.
 
 ## What is not covered yet
 
