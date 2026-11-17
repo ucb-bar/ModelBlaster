@@ -107,6 +107,33 @@ accepted by `ingest_xpurt_schedule` and run on their **first** hart; ingest
 prints how many there were. Spreading such a dispatch over its harts is not
 implemented.
 
+## SpaceMiT K3 (X100 + A100)
+
+The K3 has 16 CPUs: X100 = 0-7 (VLEN 256), A100 = 8-15 (VLEN 1024). A thread may
+run on an A100 CPU only after writing its own TID to `/proc/set_ai_thread`, and
+that registration is one-way. `runtime/mb_placement.{h,c}` (Sam Bai) handles it:
+
+- Every worker places itself on its hart as its first action
+  (`mb_place_current_thread`: register if the CPU is an AI CPU, pin, verify).
+  Pthread-attribute affinity cannot do this, so on Linux it is not used.
+- `main` pins itself to the first non-AI CPU before any thread exists, so pools
+  and workers start on the X100 cluster and main never registers.
+- Pool helpers place themselves the same way, and a kind's pool runs on that
+  kind's harts from the registry (`--registry`), so an A100 pool uses 8-15.
+
+Build with `MODELBLASTER_AI_CPUS=8-15` and the K3 backends paired with the
+registry's kinds (`cores/spacemit_k3.json`):
+
+```bash
+--core-kinds x100,a100 --backends rvv_k3,rvv_k3_a100     # or ime_k3_a100 for the A100
+```
+
+`build_posix.sh` compiles each backend's kernels with its `kernel_cflags` from
+`pipeline/backends.py` when `CC` targets RISC-V: `rvv_k3` at `zvl256b`, the A100
+backends at `zvl1024b`, which is illegal on the X100, so they must only run on
+CPUs 8-15. `KERNEL_CFLAGS_<BACKEND>` overrides. On the K1 and the host
+`MODELBLASTER_AI_CPUS` is unset and placement is a plain pin.
+
 ## Errors stop the run
 
 A dispatch whose core kind has no backend in the build prints
@@ -140,6 +167,8 @@ For a static or cross build pass `LDFLAGS=-static` (and `CC=`) to
 - **Start gate**: each instance's first dispatch waits for its scheduled start;
   later dispatches, including other DAG roots, start when their dependencies
   finish.
+- **Warm-up**: Sam's pre-timing warm-up pass (`--warmup` on his branch) is not
+  ported, so each network's first instance runs cold inside the timed window.
 - **Output check**: the walker prints the output markers; the runners compare
   them against the golden. There is no in-binary golden check.
 - **Intermediate buffers are still shared per model**, as in the original

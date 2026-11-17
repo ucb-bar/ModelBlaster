@@ -125,3 +125,29 @@ class KindBackendPairing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class K3Placement(unittest.TestCase):
+    """On hosted Linux every worker places itself (a K3 A100 thread must
+    register its own TID before it may pin), and main stays off the AI CPUs."""
+
+    def test_workers_place_themselves_and_main_stays_off_the_ai_cpus(self):
+        src = _emit()
+        self.assertIn('#include "mb_placement.h"', src)
+        worker = src[src.index("static void *xpurt_worker(void *arg)"):]
+        self.assertIn("mb_place_current_thread(wa->hart)", worker[:1500])
+        main = src[src.index("int main(void)"):]
+        self.assertLess(main.index("mb_pin_self_to_first_non_ai_cpu()"),
+                        main.index("modelblaster_pool_create"),
+                        "main must leave the AI CPUs before any pool helper exists")
+        # attribute affinity cannot reach an A100 CPU: Zephyr only
+        self.assertIn("#if defined(CONFIG_POSIX_THREADS_AFFINITY) && !MB_PLACEMENT_LINUX", src)
+
+    def test_a_kinds_pool_runs_on_that_kinds_harts(self):
+        src = _emit(core_kinds=["x100", "a100"], backends=["rvv_k3", "rvv_k3_a100"],
+                    pool_sizes=[8, 8], pool_harts=[list(range(8)), list(range(8, 16))])
+        self.assertIn("static const int xpurt_pool_harts_1[] = { 8, 9, 10, 11, 12, 13, 14, 15 };", src)
+        self.assertIn("modelblaster_pool_create_on_harts(nh_, hs_)", src)
+        # without hart lists the pool keeps the 0..n-1 default
+        self.assertIn("modelblaster_pool_create(pool_sizes[k])",
+                      _emit(pool_sizes=[2]))

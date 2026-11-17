@@ -69,7 +69,8 @@ def _emit(networks: list[str], schedule_name: str,
           backends: list[str],
           pool_sizes: list[int],
           n_instances: dict[str, int],
-          per_hart_workers: bool = False) -> str:
+          per_hart_workers: bool = False,
+          pool_harts: list[list[int]] | None = None) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -371,6 +372,37 @@ def _emit(networks: list[str], schedule_name: str,
             f"pool_sizes length ({len(pool_sizes)}) must match core_kinds "
             f"length ({n_kinds})")
     pool_size_strs = ", ".join(str(s) for s in pool_sizes)
+    # Per-kind hart lists for the intra-op pools (from the registry). Without
+    # them a pool's helpers go on harts 0..n-1, which is wrong for a kind whose
+    # harts are elsewhere (the K3 A100 cluster is 8..15).
+    if pool_harts is not None and len(pool_harts) != n_kinds:
+        raise ValueError("pool_harts must be parallel to core_kinds")
+    if pool_harts is not None and any(pool_harts):
+        pool_harts_decl = "\n".join(
+            f"static const int xpurt_pool_harts_{k}[] = {{ {', '.join(str(h) for h in hs) or '-1'} }};"
+            for k, hs in enumerate(pool_harts)) + (
+            "\nstatic const int *const xpurt_pool_harts[" + str(n_kinds) + "] = { "
+            + ", ".join(f"xpurt_pool_harts_{k}" for k in range(n_kinds)) + " };"
+            "\nstatic const int xpurt_pool_n_harts[" + str(n_kinds) + "] = { "
+            + ", ".join(str(len(hs)) for hs in pool_harts) + " };")
+        pool_create = f"""\
+            /* The pool runs on this kind's harts, the worker's own hart first
+             * (it is the pool master): see xpurt_pool_harts. */
+            int first_ = -1;
+            for (int i_ = 0; i_ < {upper}_N_ENTRIES && first_ < 0; i_++)
+                if (strcmp({upper}_TABLE[i_].core_kind, kinds[k]) == 0)
+                    first_ = {upper}_TABLE[i_].hart;
+            int hs_[MODELBLASTER_POOL_MAX_WORKERS];
+            int nh_ = 0;
+            if (first_ >= 0) hs_[nh_++] = first_;
+            for (int j_ = 0; j_ < xpurt_pool_n_harts[k] && nh_ < pool_sizes[k]
+                             && nh_ < MODELBLASTER_POOL_MAX_WORKERS; j_++)
+                if (xpurt_pool_harts[k][j_] != first_) hs_[nh_++] = xpurt_pool_harts[k][j_];
+            pools[k] = (void *)modelblaster_pool_create_on_harts(nh_, hs_);"""
+    else:
+        pool_harts_decl = ""
+        pool_create = "            pools[k] = (void *)modelblaster_pool_create(pool_sizes[k]);"
+
 
     # Worker-model fragments. The kind-granular values reproduce the original
     # emitted text exactly; only per_hart_workers changes the generated C.
@@ -468,6 +500,7 @@ def _emit(networks: list[str], schedule_name: str,
 #include <zephyr/kernel.h>      /* k_cycle_get_64, k_sem */
 #include <zephyr/sys/reboot.h>
 #endif
+#include "mb_placement.h"       /* thread placement incl. the K3 A100 cluster (Linux) */
 
 /* Stop on a fatal error. On hosted Linux sys_reboot is a clean exit(0), so a
  * fatal error exits non-zero there; on Zephyr it reboots, as before. */
@@ -518,6 +551,7 @@ static struct k_sem completion_sems[{upper}_N_ENTRIES];
  * backend-agnostic during the migration; modelblaster_pool is the only path
  * now. */
 static void *pools[{n_kinds}] = {{ NULL }};
+{pool_harts_decl}
 
 /* mtime baseline for the run, captured immediately before workers spawn.
  * Used by the worker to (a) honor per-instance schedule start times for
@@ -553,6 +587,18 @@ static void *xpurt_worker(void *arg)
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
     const char *my_kind = wa->kind;
     int my_kind_idx = wa->kind_idx;
+#if MB_PLACEMENT_LINUX
+    /* First action: place this thread on its hart. On a K3 an A100 CPU can be
+     * reached only after the thread writes its own TID to /proc/set_ai_thread,
+     * so the creator cannot do it through the pthread attributes. An unplaced
+     * worker would make every per-hart number a fiction, so failure is fatal. */
+    if (wa->hart >= 0 && mb_place_current_thread(wa->hart) != 0) {{
+        printf("FATAL: worker kind=%s cannot be placed on hart %d\\n",
+               my_kind, wa->hart);
+        XPURT_FATAL_EXIT();
+        return NULL;
+    }}
+#endif
     /* Take entries that match `my_kind`, in start_time order. */
     for (int i_ = 0; i_ < {upper}_N_ENTRIES; i_++) {{
         const xpurt_sched_entry_t *e_ = &{upper}_TABLE[i_];
@@ -589,10 +635,22 @@ int main(void)
      * the calling scheduler worker. We never oversubscribe a backend's
      * harts; on real silicon this maps each pool's helper threads onto
      * the kind's idle harts. */
+#if MB_PLACEMENT_LINUX
+    /* Put main on the first non-AI CPU before any thread exists: pools and
+     * workers inherit its mask, start on the X100 cluster and then place
+     * themselves. main itself must never register as an A100 thread
+     * (registration is one-way). A no-op without AI CPUs (K1, host). */
+    if (mb_pin_self_to_first_non_ai_cpu() != 0) {{
+        printf("FATAL: cannot pin main thread off the AI CPUs\\n");
+        XPURT_FATAL_EXIT();
+        return -1;
+    }}
+#endif
+    static const char *kinds[] = {{ {kind_strs} }};
     static const int pool_sizes[{n_kinds}] = {{ {pool_size_strs} }};
     for (int k = 0; k < {n_kinds}; k++) {{
         if (pool_sizes[k] > 0) {{
-            pools[k] = (void *)modelblaster_pool_create(pool_sizes[k]);
+{pool_create}
             if (pools[k] == NULL) {{
                 printf("FATAL: modelblaster_pool_create kind=%d size=%d failed\\n",
                        k, pool_sizes[k]);
@@ -631,7 +689,6 @@ int main(void)
      * pthread_attr_setaffinity_np(&attrs[k+1]) silently corrupts the
      * adjacent wargs[k]. Pad each slot to 64 bytes so the cast stays in
      * its lane. */
-    static const char *kinds[] = {{ {kind_strs} }};
     static struct xpurt_worker_arg wargs[{n_workers_max}];
     static pthread_t tids[{n_workers_max}];
     union xpurt_attr_slot {{ pthread_attr_t a; char _pad[64]; }};
@@ -645,7 +702,7 @@ int main(void)
     for (int k = 0; k < {loop_bound}; k++) {{
 {spawn_prelude}
         pthread_attr_init(&attrs[k].a);
-#ifdef CONFIG_POSIX_THREADS_AFFINITY
+#if defined(CONFIG_POSIX_THREADS_AFFINITY) && !MB_PLACEMENT_LINUX
         if (pinned_hart >= 0) {{
             cpu_set_t cs;
             CPU_ZERO(&cs);
@@ -788,6 +845,13 @@ def main() -> None:
     #   2. else --registry: harts_of_kind - 1 per kind
     #   3. else default 0 per kind (NULL pool, no intra-op fanout)
     pool_sizes_map: dict[str, int] = {}
+    harts_per_kind: dict[str, set[int]] = {}
+    if args.registry:
+        with open(args.registry) as f:
+            reg = json.load(f)
+        for c in reg.get("cores", []):
+            if c.get("kind") is not None:
+                harts_per_kind.setdefault(c["kind"], set()).update(c.get("harts", []) or [])
     if args.pool_sizes:
         for kv in args.pool_sizes.split(","):
             k, _, v = kv.strip().partition(":")
@@ -795,15 +859,6 @@ def main() -> None:
                 raise SystemExit(f"--pool-sizes: bad entry '{kv}'")
             pool_sizes_map[k] = int(v)
     elif args.registry:
-        with open(args.registry) as f:
-            reg = json.load(f)
-        harts_per_kind: dict[str, set[int]] = {}
-        for c in reg.get("cores", []):
-            kind = c.get("kind")
-            harts = c.get("harts", []) or []
-            if kind is None:
-                continue
-            harts_per_kind.setdefault(kind, set()).update(harts)
         for k in core_kinds:
             n_harts = len(harts_per_kind.get(k, set()))
             # modelblaster_pool_create(N) makes a pool of N threads INCLUDING
@@ -818,9 +873,11 @@ def main() -> None:
               f"(was {pool_sizes})")
         pool_sizes = [0] * len(core_kinds)
 
+    pool_harts = ([sorted(harts_per_kind.get(k, set())) for k in core_kinds]
+                  if harts_per_kind and any(pool_sizes) else None)
     src = _emit(networks, args.name, args.dispatch_table_header,
                 core_kinds, backends, pool_sizes, n_instances,
-                per_hart_workers=per_hart)
+                per_hart_workers=per_hart, pool_harts=pool_harts)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)

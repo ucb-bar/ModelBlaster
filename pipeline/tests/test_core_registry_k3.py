@@ -93,8 +93,11 @@ def test_registry_rejects_mixed_backends_in_one_kind(tmp_path):
 
 
 def test_a100_target_dir_and_vector_backend():
-    from modelblaster.pipeline import generate_kernels as gk
-    assert "rvv_k3_a100" in gk._VECTOR_BACKENDS
+    # generate_kernels probes a backend's curated_aliases after its own
+    # kernels/<backend>/ dir; without "rvv" here every op the A100 has no tuned
+    # kernel for would fall back to the scalar reference.
+    from modelblaster.pipeline.backends import BACKENDS
+    assert "rvv" in BACKENDS["rvv_k3_a100"].curated_aliases
     assert os.path.isdir(os.path.join(REPO, "kernels", "rvv_k3_a100"))
 
 

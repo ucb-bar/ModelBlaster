@@ -18,6 +18,7 @@
 #   MODEL_BACKENDS=scalar XPURT_SCHEDULE_C=/.../sched.c XPURT_MAIN_C=/.../sched_main.c \
 #   XPURT_INCLUDE_DIR=/.../ OUT=/.../walker \
 #   [CC=gcc] [CFLAGS_COMMON=-O2] [LDFLAGS=-static] [KERNEL_CFLAGS_<BACKEND>="-march=..."] \
+#   [MODELBLASTER_AI_CPUS=8-15] \
 #   [MODELBLASTER_POOL_THREADS=N] [MODELBLASTER_XPURT_TRACE=1] \
 #       bash harness_xpurt/build_posix.sh
 set -euo pipefail
@@ -45,6 +46,23 @@ STAGE="${WORK}/stage"
 rm -rf "${WORK}"; mkdir -p "${STAGE}"
 
 DEFS=(-D_GNU_SOURCE -DMB_PLATFORM_POSIX -DMODELBLASTER_DISABLE_UNMANGLED)
+# CPUs whose threads must register before they may run there (the K3 A100
+# cluster, "8-15"); see runtime/mb_placement.h. Empty on the K1 and the host.
+[[ -n "${MODELBLASTER_AI_CPUS:-}" ]] && DEFS+=(-DMODELBLASTER_AI_CPUS="\"${MODELBLASTER_AI_CPUS}\"")
+# Kernel flags default to the backend's kernel_cflags (pipeline/backends.py)
+# when the compiler targets RISC-V: they set -march (zvl1024b for the K3 A100
+# backends, whose code is illegal on the X100) and the weight-layout define that
+# must match weights.c. KERNEL_CFLAGS_<BACKEND> overrides.
+RISCV_TARGET=0
+[[ "$("${CC}" -dumpmachine 2>/dev/null)" == riscv* ]] && RISCV_TARGET=1
+backend_cflags() {
+    PYTHONPATH="${PKG_ROOT}" "${PYTHON}" -c "
+import sys
+from modelblaster.pipeline.backends import BACKENDS
+b = BACKENDS.get(sys.argv[1])
+print(' '.join(f.replace('<repo_root>', sys.argv[2]) for f in (b.kernel_cflags if b else ())))
+" "$1" "${MB_ROOT}"
+}
 INC=(-I"${MB_ROOT}/runtime" -I"${MB_ROOT}/runtime/modelblaster_pool")
 OBJS=()
 
@@ -56,6 +74,7 @@ cc() {  # cc <out.o> <src> [extra flags...]
 }
 
 cc "${WORK}/modelblaster_pool.o" "${MB_ROOT}/runtime/modelblaster_pool/modelblaster_pool.c"
+cc "${WORK}/mb_placement.o" "${MB_ROOT}/runtime/mb_placement.c"
 
 for i in "${!NAMES[@]}"; do
     name="${NAMES[$i]}"; base="${BASES[$i]}"; pdir="${base}/${PRIMARY}"
@@ -76,7 +95,14 @@ for i in "${!NAMES[@]}"; do
         read -ra RENAME <<< "$(PYTHONPATH="${PKG_ROOT}" "${PYTHON}" -m modelblaster.pipeline.backend_rename \
             --ir "${base}/graph.json" --backend "${bs}" --separator ' ')"
         kvar="KERNEL_CFLAGS_${bs^^}"
-        read -ra KFLAGS <<< "${!kvar:-}"
+        if [[ -n "${!kvar+x}" ]]; then
+            read -ra KFLAGS <<< "${!kvar}"
+        elif [[ "${RISCV_TARGET}" == 1 ]]; then
+            read -ra KFLAGS <<< "$(backend_cflags "${bs}")"
+        else
+            KFLAGS=()
+        fi
+        echo "build_posix: ${name}/${bs} kernel flags: ${KFLAGS[*]:-(none)}"
         cc "${WORK}/${name}_${bs}_model.o"   "${bdir}/model.c"   -I"${bdir}" \
             -DMODELBLASTER_USE_POOL=1 "${RENAME[@]}"
         cc "${WORK}/${name}_${bs}_kernels.o" "${bdir}/kernels.c" -I"${bdir}" \
