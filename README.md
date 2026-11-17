@@ -30,8 +30,8 @@ candidates, the cached-kernel reuse model), read the KernelBlaster paper:
 - **Paper:** *KernelBlaster: Continual Cross-Task CUDA Optimization via
   Memory-Augmented In-Context Reinforcement Learning* —
   https://arxiv.org/abs/2602.14293
-- **Source:** vendored here as a git submodule under `third_party/KernelBlaster/`
-  (NVlabs/KernelBlaster).
+- **Source:** vendored here as a git submodule under `third_party/KernelBlaster/`,
+  from https://github.com/kris-dong/KernelBlaster, branch `mb-kb-integration`.
 
 ## Working with XPU-RT (the scheduler)
 
