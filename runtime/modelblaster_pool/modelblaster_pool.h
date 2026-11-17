@@ -65,6 +65,10 @@
 extern "C" {
 #endif
 
+/* Most threads one pool can hold, the master included. Public so callers can
+ * size the hart list they pass to modelblaster_pool_create_on_harts. */
+#define MODELBLASTER_POOL_MAX_WORKERS 16
+
 struct modelblaster_pool_state;
 typedef struct modelblaster_pool_state *modelblaster_pool_t;
 

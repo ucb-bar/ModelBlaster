@@ -48,7 +48,7 @@
  * build); pick a generous bound — 16 covers any plausible Chipyard
  * hwconfig we'd build for. Pools that ask for more than this fail
  * create() returning NULL. */
-#define MODELBLASTER_POOL_MAX_WORKERS 16
+/* MODELBLASTER_POOL_MAX_WORKERS (16) is defined in modelblaster_pool.h. */
 
 struct modelblaster_pool_state {
 	int n_workers;          /* total thread count (master + helpers) */

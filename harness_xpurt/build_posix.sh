@@ -25,7 +25,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MB_ROOT="$(cd "${HERE}/.." && pwd)"
-PKG_ROOT="$(cd "${MB_ROOT}/.." && pwd)"   # makes `python -m modelblaster.*` resolve
+PKG_ROOT="$(cd "${MB_ROOT}/.." && pwd)"
+# src/ holds the `modelblaster` shim, so `python -m modelblaster.*` resolves
+# whatever this checkout is called; PKG_ROOT keeps the submodule layout working.
+MB_PYTHONPATH="${MB_ROOT}/src:${PKG_ROOT}"
 
 for v in MODEL_NAMES MODEL_DIRS_BASE MODEL_BACKENDS XPURT_SCHEDULE_C XPURT_MAIN_C XPURT_INCLUDE_DIR OUT; do
     [[ -n "${!v:-}" ]] || { echo "build_posix: $v is required" >&2; exit 2; }
@@ -56,7 +59,7 @@ DEFS=(-D_GNU_SOURCE -DMB_PLATFORM_POSIX -DMODELBLASTER_DISABLE_UNMANGLED)
 RISCV_TARGET=0
 [[ "$("${CC}" -dumpmachine 2>/dev/null)" == riscv* ]] && RISCV_TARGET=1
 backend_cflags() {
-    PYTHONPATH="${PKG_ROOT}" "${PYTHON}" -c "
+    PYTHONPATH="${MB_PYTHONPATH}" "${PYTHON}" -c "
 import sys
 from modelblaster.pipeline.backends import BACKENDS
 b = BACKENDS.get(sys.argv[1])
@@ -92,13 +95,19 @@ for i in "${!NAMES[@]}"; do
         for f in model.c kernels.c weights.c; do
             [[ -f "${bdir}/$f" ]] || { echo "build_posix: ${bdir} missing $f" >&2; exit 1; }
         done
-        read -ra RENAME <<< "$(PYTHONPATH="${PKG_ROOT}" "${PYTHON}" -m modelblaster.pipeline.backend_rename \
-            --ir "${base}/graph.json" --backend "${bs}" --separator ' ')"
+        # A failed helper would otherwise leave RENAME or KFLAGS empty and the
+        # build would go on with wrong symbols or flags, so stop instead.
+        rename_out="$(PYTHONPATH="${MB_PYTHONPATH}" "${PYTHON}" -m modelblaster.pipeline.backend_rename \
+            --ir "${base}/graph.json" --backend "${bs}" --separator ' ')" \
+            || { echo "build_posix: backend_rename failed for ${name}/${bs}" >&2; exit 1; }
+        read -ra RENAME <<< "${rename_out}"
         kvar="KERNEL_CFLAGS_${bs^^}"
         if [[ -n "${!kvar+x}" ]]; then
             read -ra KFLAGS <<< "${!kvar}"
         elif [[ "${RISCV_TARGET}" == 1 ]]; then
-            read -ra KFLAGS <<< "$(backend_cflags "${bs}")"
+            kflags_out="$(backend_cflags "${bs}")" \
+                || { echo "build_posix: cannot read kernel_cflags of ${bs}" >&2; exit 1; }
+            read -ra KFLAGS <<< "${kflags_out}"
         else
             KFLAGS=()
         fi
