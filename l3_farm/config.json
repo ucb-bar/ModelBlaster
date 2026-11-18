@@ -1,0 +1,56 @@
+{
+ "host": "computelab",
+ "partition_match": "l40s",
+ "alloc_query": "gpu.product_name=\"*L40S*\"",
+ "alloc_time": "10:00:00",
+ "max_nodes": 18,
+ "ignore_jobs": [
+  5282436
+ ],
+ "min_left_min": 60,
+ "problem_timeout_h": 7,
+ "max_attempts": 3,
+ "sync_min": 15,
+ "tick_s": 90,
+ "level": 3,
+ "include": [],
+ "exclude": [],
+ "kb": {
+  "model": "azure/anthropic/claude-opus-5-5",
+  "rounds": 3,
+  "rollouts": 4,
+  "steps": 4,
+  "variant_steps": 2,
+  "max_variants": 4,
+  "min_gain_pct": 0.5,
+  "arch": 89,
+  "relay_concurrency": 12,
+  "relay_budget_usd": 150,
+  "plan_top_k": 32,
+  "plan_min_share": 0.002
+ },
+ "alloc_gap_s": 60,
+ "global_knowledge": {
+  "enabled": true,
+  "path": "~/Documents/ModelBlaster-clone/knowledge_global",
+  "mode": "readwrite",
+  "merge_on": "final",
+  "merge_failed": true,
+  "dtype": "fp16",
+  "snapshot_keep": 10,
+  "python": "python3",
+  "policy": {
+   "share": "strict",
+   "seed_max_claims": 1500,
+   "seed_max_open_hyp": 150,
+   "seed_max_closed_hyp": 150,
+   "stale_merges": 100,
+   "half_life_merges": 100,
+   "max_active_claims": 4000,
+   "max_local_claims_per_problem": 400,
+   "impl_min_speedup": 1.02,
+   "seed_fresh_merges": 10,
+   "seed_fresh_max": 400
+  }
+ }
+}

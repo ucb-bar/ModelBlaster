@@ -1,0 +1,3 @@
+. /tmp/krisd/venv/bin/activate; CUDA_N=/home/scratch.svc_compute_arch/release/cuda_toolkit/public/12.6.1/x86_64/u22.04; export PATH=$CUDA_N/bin:$PATH CUDA_HOME=$CUDA_N; cd /tmp/krisd/mc/mb3/ModelBlaster; export PYTHONPATH=/tmp/krisd/mc/mb3:/tmp/krisd/mc/ip/pylib
+for grp in "test_graph_search.py test_graph_prune.py test_experiments_flag.py" "test_kb_efficiency.py test_cuda_learnings.py" "test_graphopt_remote.py test_kb_graph_opt_parallel.py" "test_kb_resume.py test_kb_plan.py test_kb_global.py test_kb_global_a5.py"; do
+ echo "== $grp"; python -m pytest $(for f in $grp; do echo pipeline/tests/$f; done) pipeline/tests/test_kb_trace.py -q -p no:cacheprovider -k "not test_graph_search_flow" 2>&1 | grep -E "^FAILED|passed|failed|KeyError"; done; echo DONE

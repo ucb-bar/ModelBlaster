@@ -1,0 +1,98 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def forward_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: int,
+    padding: int,
+    dilation: int,
+) -> torch.Tensor:
+    """
+    Performs a 3D transposed convolution operation with square input and square kernel, and supports padding, dilation, and stride.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        weight (torch.Tensor): Weight tensor.
+        bias (torch.Tensor): Bias tensor.
+        stride (int): Stride of the convolution.
+        padding (int): Padding of the convolution.
+        dilation (int): Dilation of the convolution.
+
+    Returns:
+        torch.Tensor: Output tensor.
+    """
+    return F.conv_transpose3d(
+        x,
+        weight,
+        bias=bias,
+        stride=(stride, stride, stride),
+        padding=(padding, padding, padding),
+        dilation=(dilation, dilation, dilation),
+    )
+
+
+class Model(nn.Module):
+    """
+    Performs a 3D transposed convolution operation with square input and square kernel, and supports padding, dilation, and stride.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 32,
+        out_channels: int = 64,
+        kernel_size: int = 3,
+        stride: int = 2,
+        padding: int = 1,
+        dilation: int = 2,
+        bias: bool = False,
+    ):
+        super(Model, self).__init__()
+        conv = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size=(kernel_size, kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+
+        # Copy the initialized parameters
+        self.weight = nn.Parameter(conv.weight.clone())
+        self.bias = nn.Parameter(conv.bias.clone()) if bias else None
+
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x: torch.Tensor, fn=forward_fn) -> torch.Tensor:
+        """
+        Performs the 3D transposed convolution.
+        """
+        return fn(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+        )
+
+
+def get_inputs(
+    batch_size: int = 16,
+    in_channels: int = 32,
+    depth: int = 16,
+    height: int = 32,
+    width: int = 32,
+):
+    x = torch.randn(batch_size, in_channels, depth, height, width)
+    return [x]
+
+
+
+input_names = ['x']

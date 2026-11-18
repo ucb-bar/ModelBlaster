@@ -1,0 +1,1 @@
+cd /tmp/krisd/cl/flows/F11/r00/variants; ls; for d in */; do echo "== $d"; grep -h "baseline\|seed" $d/run.log 2>/dev/null | cut -c1-400 | head -4; grep -h "_commit_step" $d/run.log 2>/dev/null | cut -c90-330 | tail -8; done; ls /tmp/krisd/cl/flows/F11/r00/variants/*/variant/slots 2>/dev/null | head -30

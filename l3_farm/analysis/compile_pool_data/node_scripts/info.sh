@@ -1,0 +1,1 @@
+hostname; nproc; free -g | head -2; nvidia-smi --query-gpu=index,name,clocks.max.mem,clocks.mem,clocks.max.sm,driver_version,memory.used --format=csv,noheader; cat /tmp/krisd/cpool/setup.status 2>&1; ls /tmp/krisd; command -v flock rsync ionice nice

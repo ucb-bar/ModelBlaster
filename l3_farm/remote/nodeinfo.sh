@@ -1,0 +1,7 @@
+echo "host=$(hostname)"
+echo "gpu=$(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader,nounits | head -1)"
+echo "procs=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)"
+echo "pyprocs=$(pgrep -fa 'kb_graph_opt|run_multislot|remote_bench|bench.py|solution|torch_posthoc|python' | grep -v nodeinfo | wc -l)"
+echo "cmds=$(pgrep -fa 'kb_graph_opt|run_multislot|remote_bench|torch_posthoc|nsys|ncu|extract_graph|llm_server' | grep -v pgrep | sed 's/--work //' | cut -c1-110 | awk '{print $2,$3,$4,$5}' | sort | uniq -c | head -4 | tr '\n' ';')"
+echo "recent=$(ls -t /tmp/krisd 2>/dev/null | head -6 | tr '\n' ' ')"
+echo "newest=$(find /tmp/krisd -maxdepth 3 -type f -mmin -5 2>/dev/null | sed 's#/tmp/krisd/##' | cut -d/ -f1-2 | sort | uniq -c | sort -rn | head -3 | tr '\n' ';')"

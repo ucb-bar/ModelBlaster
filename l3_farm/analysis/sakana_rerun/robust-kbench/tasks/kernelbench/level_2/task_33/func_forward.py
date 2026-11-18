@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def forward_fn(
+    x: torch.Tensor,
+    eps: float,
+    momentum: float,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    gemm_weight: torch.Tensor,
+    gemm_bias: torch.Tensor,
+    scale: torch.Tensor,
+    bn_weight: torch.Tensor,
+    bn_bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Performs matrix multiplication, scaling and batch normalization.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape (batch_size, in_features)
+        eps (float): Small constant for numerical stability in batch norm
+        momentum (float): Momentum for batch norm running stats
+        running_mean (torch.Tensor): Batch norm running mean of shape (out_features,)
+        running_var (torch.Tensor): Batch norm running variance of shape (out_features,)
+        gemm_weight (torch.Tensor): Weight matrix of shape (out_features, in_features)
+        gemm_bias (torch.Tensor): Bias vector of shape (out_features,)
+        scale (torch.Tensor): Scale parameter of shape (out_features,)
+        bn_weight (torch.Tensor): Batch norm weight of shape (out_features,)
+        bn_bias (torch.Tensor): Batch norm bias of shape (out_features,)
+
+    Returns:
+        torch.Tensor: Output tensor of shape (batch_size, out_features)
+    """
+    x = F.linear(x, gemm_weight, gemm_bias)
+    x = x * scale
+    x = F.batch_norm(
+        x,
+        running_mean,
+        running_var,
+        bn_weight,
+        bn_bias,
+        training=True,
+        momentum=momentum,
+        eps=eps,
+    )
+    return x
+
+
+class Model(nn.Module):
+    """
+    Simple model that performs a GEMM (general matrix multiplication), applies scaling,
+    and then batch normalization.
+    """
+
+    def __init__(
+        self,
+        in_features: int = 1024,
+        out_features: int = 512,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+    ):
+        super(Model, self).__init__()
+        linear = nn.Linear(in_features, out_features)
+        # Expose everything so we can feed them to the functional call
+        self.gemm_weight = nn.Parameter(linear.weight)
+        self.gemm_bias = nn.Parameter(linear.bias)
+        scale_shape = (out_features,)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+        self.bn_weight = nn.Parameter(bn.weight)
+        self.bn_bias = nn.Parameter(bn.bias)
+        self.register_buffer("running_mean", torch.zeros(out_features))
+        self.register_buffer("running_var", torch.ones(out_features))
+        self.eps = eps
+        self.momentum = momentum
+
+    def forward(self, x, fn=forward_fn):
+        return fn(
+            x,
+            self.eps,
+            self.momentum,
+            self.running_mean,
+            self.running_var,
+            self.gemm_weight,
+            self.gemm_bias,
+            self.scale,
+            self.bn_weight,
+            self.bn_bias,
+        )
+
+
+def get_inputs(batch_size: int = 128, in_features: int = 1024):
+    x = torch.randn(batch_size, in_features)
+    return [x]
+
+
+input_names = ["x"]

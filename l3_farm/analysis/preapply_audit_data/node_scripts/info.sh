@@ -1,0 +1,1 @@
+hostname; nvidia-smi --query-gpu=name,clocks.max.mem,clocks.mem,driver_version,memory.used --format=csv,noheader; cat /tmp/krisd/pa/setup.status 2>&1; ls /tmp/krisd; ls /tmp/krisd/venv/bin/python 2>&1; df -h /tmp | tail -1; squeue --me -h -o '%i|%T|%N' 2>/dev/null | head
