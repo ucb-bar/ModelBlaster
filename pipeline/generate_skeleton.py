@@ -1988,6 +1988,15 @@ _B_SLICEABLE_CONV_OPS = {
 #: documents itself in those terms.
 _SHARDABLE_CONV_OPS = _OC_SLICEABLE_CONV_OPS
 
+#: Sliceable conv kinds with no pool (shard) entry point: their dispatch is emitted as
+#: one plain kernel call, so `shard_conv_weights` must not replace their weight with
+#: per-shard arrays (the call would name a parent array that is no longer emitted -- a
+#: build break for ViNT's per-channel convs at MB_SHARD_FACTOR > 1 on any repacking
+#: backend). They run on one core; they are not in `shareable_ops()` either. A pool path
+#: for conv2d_s8_pc would slice its multiplier / shift lists with the channels (k3-work
+#: TASK-019).
+_NO_SHARD_PATH_CONV_OPS = {"conv2d_s8_pc"}
+
 #: Conv kinds whose weights stay OIHW on EVERY backend. An OIHW OC slice is
 #: contiguous, so these tiles take the pointer-offset path into the parent array
 #: rather than a repacked per-tile array -- which is what the call emitter
@@ -2094,6 +2103,7 @@ def shard_conv_weights(
     """
     ops = [op for op in ir.get("ops", [])
            if op.get("op") in _SHARDABLE_CONV_OPS
+           and op.get("op") not in _NO_SHARD_PATH_CONV_OPS
            and _conv_weight_of(op)
            and not (op.get("split_from") or {})]
     # PER-OP WIDTH, model-wide default. `factor` is MB_SHARD_FACTOR, which
