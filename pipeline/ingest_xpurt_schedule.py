@@ -80,18 +80,29 @@ class XpurtEntry:
 
 # ---------- parsing helpers --------------------------------------------------
 
-_INSTANCE_RE = re.compile(r"^(?P<base>.+?)(?P<idx>\d+)$")
+# "<network><instance>" -> (network, instance), longest known name first; one
+# rule shared with the walker generator (and mirrored by XPU-RT's job_names).
+from modelblaster.pipeline.generate_xpurt_main import _split_job_name  # noqa: E402
 
 
-def _split_job_name(job: str) -> tuple[str, int]:
-    """Split a job_name like "mlp_control3" into ("mlp_control", 3); a name
-    without a trailing instance index returns (job, 0)."""
-    m = _INSTANCE_RE.match(job)
-    if not m:
-        return job, 0
-    base = m.group("base")
-    idx = int(m.group("idx"))
-    return base, idx
+def _check_impl_legal(key: str, impl: str, core_kind: str,
+                      harts: tuple[int, ...],
+                      reg: core_registry.CoreRegistry) -> None:
+    """Refuse an implementation a core cannot run, before it is built in.
+
+    The registry may list per core the implementations it runs (`impls`). A
+    kernel for another core's matrix engine is not always a trap: the K3's X100
+    and A100 engines share an encoding with different tiles, so the wrong one
+    can return wrong numbers instead. `impl == core_kind` is the default (no
+    choice made) and always legal; cores without `impls` are not checked.
+    """
+    if impl == core_kind:
+        return
+    for core in reg.cores:
+        if core.impls and set(core.harts) & set(harts) and impl not in core.impls:
+            raise ValueError(
+                f"schedule entry {key!r}: impl {impl!r} is not legal on {core.name} "
+                f"(kind {core.kind!r}; legal: {list(core.impls)})")
 
 
 def _target_harts(core_label: str, cpu_p_kind: str, cpu_e_kind: str,
@@ -266,7 +277,7 @@ def load(schedule_path: str,
     for entry_id, key in enumerate(sorted_keys):
         d = raw[key]
         job = d["job_name"]
-        network, instance = _split_job_name(job)
+        network, instance = _split_job_name(job, irs_by_network)
         if network not in irs_by_network:
             raise ValueError(
                 f"schedule entry {key!r} references unknown network {network!r}; "
@@ -293,6 +304,7 @@ def load(schedule_path: str,
         # pre-`enable_impls` schedule means, so those keep producing the
         # byte-identical table they always did.
         impl = str(d.get("impl") or core_kind)
+        _check_impl_legal(key, impl, core_kind, harts or ((hart,) if hart >= 0 else ()), reg)
 
         # Resolve deps (intra-job data deps) + time_dep (cross-job edge)
         # to in-table entry_ids. The walker's deadlock-freedom argument

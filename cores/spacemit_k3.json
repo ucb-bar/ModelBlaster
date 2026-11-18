@@ -62,6 +62,9 @@
         "cos_s8",
         "cat",
         "upsample_nearest_s8"
+      ],
+      "impls": [
+        "rvv"
       ]
     },
     {
@@ -73,7 +76,10 @@
         1
       ],
       "cluster": 0,
-      "capabilities_ref": "x100_core0"
+      "capabilities_ref": "x100_core0",
+      "impls": [
+        "rvv"
+      ]
     },
     {
       "name": "x100_core2",
@@ -84,7 +90,10 @@
         2
       ],
       "cluster": 0,
-      "capabilities_ref": "x100_core0"
+      "capabilities_ref": "x100_core0",
+      "impls": [
+        "rvv"
+      ]
     },
     {
       "name": "x100_core3",
@@ -95,7 +104,10 @@
         3
       ],
       "cluster": 0,
-      "capabilities_ref": "x100_core0"
+      "capabilities_ref": "x100_core0",
+      "impls": [
+        "rvv"
+      ]
     },
     {
       "name": "x100_core4",
@@ -106,7 +118,10 @@
         4
       ],
       "cluster": 1,
-      "capabilities_ref": "x100_core0"
+      "capabilities_ref": "x100_core0",
+      "impls": [
+        "rvv"
+      ]
     },
     {
       "name": "x100_core5",
@@ -117,7 +132,10 @@
         5
       ],
       "cluster": 1,
-      "capabilities_ref": "x100_core0"
+      "capabilities_ref": "x100_core0",
+      "impls": [
+        "rvv"
+      ]
     },
     {
       "name": "x100_core6",
@@ -128,7 +146,10 @@
         6
       ],
       "cluster": 1,
-      "capabilities_ref": "x100_core0"
+      "capabilities_ref": "x100_core0",
+      "impls": [
+        "rvv"
+      ]
     },
     {
       "name": "x100_core7",
@@ -139,7 +160,10 @@
         7
       ],
       "cluster": 1,
-      "capabilities_ref": "x100_core0"
+      "capabilities_ref": "x100_core0",
+      "impls": [
+        "rvv"
+      ]
     },
     {
       "name": "a100_core8",
@@ -178,6 +202,10 @@
         "cos_s8",
         "cat",
         "upsample_nearest_s8"
+      ],
+      "impls": [
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -189,7 +217,11 @@
         9
       ],
       "cluster": 2,
-      "capabilities_ref": "a100_core8"
+      "capabilities_ref": "a100_core8",
+      "impls": [
+        "rvv",
+        "ime"
+      ]
     },
     {
       "name": "a100_core10",
@@ -200,7 +232,11 @@
         10
       ],
       "cluster": 2,
-      "capabilities_ref": "a100_core8"
+      "capabilities_ref": "a100_core8",
+      "impls": [
+        "rvv",
+        "ime"
+      ]
     },
     {
       "name": "a100_core11",
@@ -211,7 +247,11 @@
         11
       ],
       "cluster": 2,
-      "capabilities_ref": "a100_core8"
+      "capabilities_ref": "a100_core8",
+      "impls": [
+        "rvv",
+        "ime"
+      ]
     },
     {
       "name": "a100_core12",
@@ -222,7 +262,11 @@
         12
       ],
       "cluster": 3,
-      "capabilities_ref": "a100_core8"
+      "capabilities_ref": "a100_core8",
+      "impls": [
+        "rvv",
+        "ime"
+      ]
     },
     {
       "name": "a100_core13",
@@ -233,7 +277,11 @@
         13
       ],
       "cluster": 3,
-      "capabilities_ref": "a100_core8"
+      "capabilities_ref": "a100_core8",
+      "impls": [
+        "rvv",
+        "ime"
+      ]
     },
     {
       "name": "a100_core14",
@@ -244,7 +292,11 @@
         14
       ],
       "cluster": 3,
-      "capabilities_ref": "a100_core8"
+      "capabilities_ref": "a100_core8",
+      "impls": [
+        "rvv",
+        "ime"
+      ]
     },
     {
       "name": "a100_core15",
@@ -255,7 +307,11 @@
         15
       ],
       "cluster": 3,
-      "capabilities_ref": "a100_core8"
+      "capabilities_ref": "a100_core8",
+      "impls": [
+        "rvv",
+        "ime"
+      ]
     }
   ]
 }

@@ -294,7 +294,7 @@ for model in "${MODEL_LIST[@]}"; do
         [[ "${_v}" == "MODELBLASTER_K1_RT_PRIORITY" ]] && continue
         # Same reasoning for the board selector and the k3 equivalents.
         case "${_v}" in
-            MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE|MB_XPURT_WARMUP) continue ;;
+            MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE|MB_XPURT_*) continue ;;
         esac
         _cfg="${_cfg} ${_v}=${!_v}"
     done
@@ -419,12 +419,13 @@ ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
 [[ -f "${SCHED_C}" ]] || { echo "ingest produced no dispatch table" >&2; exit 1; }
 echo "  ${SCHED_C}"
 
-# The walker has no warm-up pass or live JSON stream yet (see
-# harness_xpurt/LINUX.md); say so rather than silently ignoring the knob.
-[[ "${MB_XPURT_WARMUP:-0}" == "1" ]] && \
-    echo "note: MB_XPURT_WARMUP=1 ignored: the walker has no warm-up pass" >&2
-[[ "${STREAM}" == "1" ]] && \
-    echo "note: MB_XPURT_STREAM=1 ignored: the walker has no live stream" >&2
+# Board-side walker knobs, forwarded to the run: MB_XPURT_WARM=0 starts cold
+# (the walker runs one untimed frame of every network first by default) and
+# MB_XPURT_GATE_SLEEP=1 sleeps at the release gate instead of spinning.
+WALKER_ENV=""
+for _v in MB_XPURT_WARM MB_XPURT_GATE_SLEEP; do
+    [[ -n "${!_v:-}" ]] && WALKER_ENV="${WALKER_ENV} ${_v}=${!_v}"
+done
 # One pinned worker per (kind, hart) by default: the schedule places
 # dispatches on individual harts, and composite targets need hart mode to
 # reserve their whole hart set. MB_XPURT_WORKERS=kind gives one worker per
@@ -453,6 +454,7 @@ MODEL_BACKENDS="${UNIQUE_BACKENDS}" \
 XPURT_SCHEDULE_C="${SCHED_C}" XPURT_MAIN_C="${MAIN_C}" XPURT_INCLUDE_DIR="${GEN_DIR}" \
 OUT="${BIN}" CC="${CROSS}gcc" LDFLAGS=-static PYTHON="${PY}" \
 MODELBLASTER_AI_CPUS="${_ai}" MODELBLASTER_XPURT_TRACE="${TRACE}" \
+MODELBLASTER_XPURT_STREAM="${STREAM}" \
     bash "${REPO_ROOT}/harness_xpurt/build_posix.sh" >"${BUILD_DIR}/build.log" 2>&1 \
     || { echo "build failed; tail of ${BUILD_DIR}/build.log:" >&2; tail -40 "${BUILD_DIR}/build.log" >&2; exit 1; }
 [[ -x "${BIN}" ]] || { echo "no binary at ${BIN}" >&2; exit 1; }
@@ -489,7 +491,7 @@ if [[ -n "${RT_PRIORITY}" ]]; then
     RUNNER_POLICY="SCHED_FIFO"
     RUNNER_PRIORITY="${RT_PRIORITY}"
 fi
-RUN="${RUN} ./${SCHED_NAME}"
+RUN="${RUN}${WALKER_ENV:+ env${WALKER_ENV}} ./${SCHED_NAME}"
 OUT="${GEN_DIR}/${SCHED_NAME}_stdout.txt"
 # Redirect ON THE BOARD and scp the file back, rather than streaming stdout
 # through ssh. A three-model schedule emits ~1600 trace rows, and streaming that

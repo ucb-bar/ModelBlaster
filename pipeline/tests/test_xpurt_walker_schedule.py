@@ -91,8 +91,9 @@ class StartGate(unittest.TestCase):
         src = _emit()
         self.assertEqual(src.count("uint64_t target_start = run_t0"), 1)
         gate = src.index("uint64_t target_start = run_t0")
-        first = src.index("if (e_->dispatch_id == 0)")
-        self.assertLess(first, gate, "the gate belongs to an instance's first dispatch")
+        first = src.index("if (e_->dispatch_id == 0 && !warm_)")
+        self.assertLess(first, gate, "the gate belongs to an instance's first dispatch, "
+                                     "and only to the timed pass")
         self.assertIn("e_->start_time_ms", src[gate:gate + 300])
 
 
@@ -123,6 +124,81 @@ class KindBackendPairing(unittest.TestCase):
         self.assertIn("model_m_state_t st_ = s_m_rvv_c1;", src)
         self.assertIn("MODEL_M_DISPATCH_FNS_RVV_X60[e_->dispatch_id](&st_)", src)
         self.assertEqual(src.count("extern const model_m_dispatch_fn MODEL_M_DISPATCH_FNS_RVV_X60"), 1)
+
+
+class JobNames(unittest.TestCase):
+    """A network whose name ends in digits keeps its name."""
+
+    def test_longest_known_name_wins(self):
+        known = {"yolov8_nano", "yolov8_nano_64x96"}
+        self.assertEqual(gen._split_job_name("yolov8_nano_64x96", known), ("yolov8_nano_64x96", 0))
+        self.assertEqual(gen._split_job_name("yolov8_nano_64x963", known), ("yolov8_nano_64x96", 3))
+        self.assertEqual(gen._split_job_name("yolov8_nano7", known), ("yolov8_nano", 7))
+
+    def test_without_names_the_trailing_digits_are_the_instance(self):
+        self.assertEqual(gen._split_job_name("dronet12"), ("dronet", 12))
+        self.assertEqual(gen._split_job_name("dronet"), ("dronet", 0))
+
+    def test_the_schedule_names_its_networks(self):
+        ds = [{"module_name": "yolov8_nano_64x96$dispatch_0_rvv"}, {"module_name": "m$dispatch_1"},
+              {"module_name": ""}]
+        self.assertEqual(gen.networks_of(ds), {"yolov8_nano_64x96", "m"})
+
+
+class WarmStart(unittest.TestCase):
+    def test_the_warm_pass_runs_before_t0_and_the_timed_pass_after(self):
+        src = _emit()
+        worker = src[src.index("static void *xpurt_worker(void *arg)"):]
+        self.assertLess(worker.index("xpurt_walk(wa, 1);"), worker.index("xpurt_walk(wa, 0);"))
+        main = src[src.index("int main(void)"):]
+        self.assertLess(main.index("k_sem_take(&xpurt_warm_done"), main.index("k_sem_give(&xpurt_warm_go"))
+        between = main[main.index("k_sem_take(&xpurt_warm_done"):main.index("k_sem_give(&xpurt_warm_go")]
+        self.assertIn("run_t0 = (uint64_t)k_cycle_get_64();", between)
+        self.assertIn('getenv("MB_XPURT_WARM")', main)
+
+    def test_the_warm_pass_is_instance_zero_data_deps_only_and_untimed(self):
+        src = _emit()
+        walk = src[src.index("static void xpurt_walk("):src.index("static void *xpurt_worker(")]
+        self.assertIn("if (warm_ && e_->instance != 0) continue;", walk)
+        self.assertIn("if (!warm_ && e_->time_dep_entry_id >= 0)", walk)
+        self.assertIn("struct k_sem *sems_ = warm_ ? warm_sems : completion_sems;", walk)
+        self.assertNotIn("completion_sems[", walk.replace("warm_sems : completion_sems", ""))
+        timed = walk[walk.index("if (!warm_) {"):]
+        for what in ("xpurt_trace[i_].start_cycles", "XPURT_STREAM_EVENT", "wall_cycles_m["):
+            self.assertIn(what, timed[:900])
+
+
+class GateAndStream(unittest.TestCase):
+    def test_the_gate_can_sleep_on_linux(self):
+        src = _emit()
+        self.assertIn("XPURT_GATE_WAIT(target_start);", src)
+        self.assertIn('getenv("MB_XPURT_GATE_SLEEP")', src)
+        self.assertIn("nanosleep(", src)
+
+    def test_the_stream_line_carries_what_xpurt_reads(self):
+        src = _emit()
+        block = src[src.index("#ifdef MODELBLASTER_XPURT_STREAM"):]
+        block = block[:block.index("#endif")]
+        for field in ("entry_id", "network", "instance", "dispatch_id", "impl", "hart",
+                      "predicted_start_ms", "predicted_duration_ms", "start_ticks",
+                      "end_ticks", "ticks_per_s"):
+            self.assertIn(f'\\"{field}\\"', block)
+
+
+class ImplLegality(unittest.TestCase):
+    _K3 = core_registry.load(str(_ROOT / "cores" / "spacemit_k3.json"))
+
+    def test_an_impl_the_core_does_not_list_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "not legal on x100_core0"):
+            ingest._check_impl_legal("k", "ime", "x100", (0,), self._K3)
+        with self.assertRaisesRegex(ValueError, "not legal"):
+            ingest._check_impl_legal("k", "ime", "x100", (0, 1), self._K3)
+
+    def test_listed_impls_and_the_default_pass(self):
+        ingest._check_impl_legal("k", "ime", "a100", (8, 9), self._K3)
+        ingest._check_impl_legal("k", "rvv", "x100", (0,), self._K3)
+        ingest._check_impl_legal("k", "x100", "x100", (0,), self._K3)
+        ingest._check_impl_legal("k", "ime", "rvv", (0,), _REG)   # K1: no impls, unchecked
 
 
 if __name__ == "__main__":
@@ -188,7 +264,7 @@ class CompositeAcrossHarts(unittest.TestCase):
 
     def test_hart_mode_reserves_harts_and_builds_composite_pools(self):
         src = _emit(per_hart_workers=True)
-        body = src[src.index("static void *xpurt_worker(void *arg)"):]
+        body = src[src.index("static void xpurt_walk("):]
         lock, call, unlock = (body.index("XPURT_LOCK_ENTRY(e_);"),
                               body.index("MODEL_M_DISPATCH_FNS_RVV[e_->dispatch_id](&st_);"),
                               body.index("XPURT_UNLOCK_ENTRY(e_);"))

@@ -204,6 +204,29 @@ The board is reached through the ssh host `MODELBLASTER_K1_HOST` (default
 `--staged-ir <network>:<dir>` uses an IR that is already built, such as a
 rewritten one, instead of extracting it.
 
+## Warm start, release gate and live stream
+
+- **Warm start** (on by default on Linux; `MB_XPURT_WARM=0` starts cold). Before
+  t=0 every worker runs its instance-0 entries once, in table order and with
+  their data dependencies, on the cores the schedule chose. Nothing in that pass
+  is gated, timed or traced, so first-call costs (kernel tables filled on first
+  use, cold caches, first-touch pages) stay out of frame 0, as they stay out of
+  the profiles. The walker prints `xpurt: warm start: ... took N ms`. Zephyr
+  builds start cold unless compiled with `-DMODELBLASTER_XPURT_WARM=1`.
+- **Release gate** (`MB_XPURT_GATE_SLEEP=1`). A worker waiting for an instance's
+  start time spins by default, which keeps the release exact but holds its core.
+  With the knob set it sleeps until 100 us before the release and spins only the
+  rest, leaving the core to pool helpers that share it.
+- **Live stream** (`MB_XPURT_STREAM=1` in the runners,
+  `MODELBLASTER_XPURT_STREAM=1` for `build_posix.sh`). One JSON line per dispatch
+  end on stdout, with `ticks_per_s` (1e9 on Linux) so XPU-RT's
+  `streaming_feedback.py` converts the ticks without being told the clock.
+- **Implementations a core can run.** A registry core may list `impls`
+  (`cores/spacemit_k3.json`: x100 `rvv`; a100 `rvv`, `ime`). Ingest refuses a
+  schedule that picks an implementation the core does not list: the K3's two
+  matrix engines share an encoding with different tiles, so a kernel on the
+  wrong one can return wrong numbers instead of trapping.
+
 ## Errors stop the run
 
 A dispatch whose implementation has no backend in the build prints
@@ -251,7 +274,5 @@ samples):
 - **Start gate**: each instance's first dispatch waits for its scheduled start;
   later dispatches, including other DAG roots, start when their dependencies
   finish.
-- **Warm-up**: Sam's pre-timing warm-up pass (`--warmup` on his branch) is not
-  ported, so each network's first instance runs cold inside the timed window.
 - **Output check**: the walker prints the output markers; the runners compare
   them against the golden. There is no in-binary golden check.

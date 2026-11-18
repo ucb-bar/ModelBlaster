@@ -64,6 +64,10 @@ class Core:
     # a100 -> rvv_k3_a100). "" = the registry does not say (older registries);
     # callers then fall back to their board default.
     backend: str = ""
+    # Implementations this core can run, when it has a choice (K3: x100 runs
+    # rvv; a100 runs rvv or ime). Empty = the registry does not say, and
+    # nothing is checked. Ingest refuses a schedule that picks one not listed.
+    impls: tuple[str, ...] = ()
 
 
 @dataclass
@@ -172,6 +176,7 @@ def load(path: str) -> CoreRegistry:
             isa=entry.get("isa", ""),
             description=entry.get("description", ""),
             backend=entry.get("backend", ""),
+            impls=tuple(entry.get("impls", ())),
         ))
 
     ai_cpus = doc.get("ai_thread_cpus", [])
