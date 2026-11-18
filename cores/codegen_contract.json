@@ -26,10 +26,25 @@
         "conv2d_batchnorm2d_silu_s8",
         "conv2d_silu_s8"
       ],
-      "statement": "The core width must divide the op's OC exactly.",
+      "statement": "The core width must divide the op's OC exactly when the op is split by output channels. A conv2d_s8 split by output rows (conv_split_axis) is exempt.",
       "why": "Each shard receives its own OC slice of the packed weights; a remainder has nowhere to go.",
-      "enforced_by": "pipeline/schedule_shards.py (raises 'not divisible')",
+      "enforced_by": "pipeline/schedule_shards.py via pipeline/conv_split.py::width_buildable (raises 'not buildable')",
       "checkable_from": "schedule (OC is in module_name)"
+    },
+    "conv_split_axis": {
+      "severity": "none",
+      "applies_to_ops": [
+        "conv2d_s8"
+      ],
+      "backend_prefixes": [
+        "rvv_k3",
+        "ime_k3"
+      ],
+      "min_pixels": 36,
+      "statement": "On a K3 backend (name starting with one of backend_prefixes; XPU-RT reads the same prefix in module_name), a conv2d_s8 given width w > 1 is split by output rows when OH >= w and OH*OW >= min_pixels, else by output channels (which then needs w | OC). The fused conv ops, and every other backend, keep the output-channel split.",
+      "why": "Measured on the K3 (k3-work TASK-016 step 3): the channel split repeats the kernels' input-side setup on every core and, on the A100's 1024-bit vectors, leaves the RVV kernel's OC-wide lanes idle; the row split shares neither problem and scaled 1.7-4.1x at width 8 against 0.7-1.9x. It loses where a layer has too few output pixels for the width; min_pixels = 36 kept every K3 backend within 10% of the per-layer best.",
+      "enforced_by": "pipeline/conv_split.py (generate_skeleton, schedule_shards, k3_weight_tiles)",
+      "checkable_from": "schedule (OH, OW and OC are in module_name)"
     },
     "runtime_sliceable_ops": {
       "severity": "none",

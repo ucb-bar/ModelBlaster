@@ -996,6 +996,111 @@ static inline void parallel_conv2d_s8_sharded(
 """
 
 
+_CONV2D_S8_ROWS_WRAPPER = """
+/* ---- conv2d_s8, split over the pool by OUTPUT ROWS (k3-work TASK-016) ----
+ * Slice t of T computes output rows [t*OH/T, (t+1)*OH/T) for every channel.
+ * Its input rows (plus the KH-SH halo, and zero rows for the vertical padding)
+ * are copied into a per-thread contiguous [IC][rows_in][IW] band, the
+ * ordinary kernel runs on the band with PH = 0 (a stored zero row is exactly
+ * the kernel's own out-of-bounds contribution, at any input_offset), and the
+ * band's output rows are copied into each NCHW channel plane. The weights are
+ * the full, unsliced array (any packing, including build-time tiles), so no
+ * per-shard weights exist. Chosen per layer by pipeline/conv_split.py; the
+ * channel split repeats the kernel's input-side setup on every core, the row
+ * split divides it. Bit-exact with the serial call: rows are an output axis. */
+#if defined(MODELBLASTER_USE_POOL) && (defined(MB_PLATFORM_POSIX) || defined(MODELBLASTER_PLATFORM_LINUX))
+#include <stdlib.h>
+#include <string.h>
+static __thread int8_t *mb_rows_ws_{mid};
+static __thread size_t mb_rows_cap_{mid};
+
+typedef struct {{
+    const int8_t *in; const int8_t *w; const int32_t *b; int8_t *out;
+    int IC, IH, IW, OC, KH, KW, SH, SW, PH, PW, OH, OW, T;
+    int input_offset, filter_offset, output_offset;
+    int output_multiplier, output_shift, activation_min, activation_max;
+    volatile int failed;
+}} parallel_conv2d_s8_rows_ctx_t;
+
+static void parallel_conv2d_s8_rows_fn(void *ctx_, size_t i) {{
+    parallel_conv2d_s8_rows_ctx_t *c = (parallel_conv2d_s8_rows_ctx_t *)ctx_;
+    int oh0 = (int)((size_t)c->OH * i / (size_t)c->T);
+    int oh1 = (int)((size_t)c->OH * (i + 1) / (size_t)c->T);
+    int rows = oh1 - oh0;
+    if (rows <= 0) return;
+    int rin = (rows - 1) * c->SH + c->KH;
+    size_t nin = (size_t)c->IC * (size_t)rin * (size_t)c->IW;
+    size_t nout = (size_t)c->OC * (size_t)rows * (size_t)c->OW;
+    size_t need = ((nin + 64 + 63) & ~(size_t)63) + nout + 64;
+    if (mb_rows_cap_{mid} < need) {{
+        free(mb_rows_ws_{mid});
+        mb_rows_ws_{mid} = (int8_t *)aligned_alloc(64, (need + 63) & ~(size_t)63);
+        mb_rows_cap_{mid} = mb_rows_ws_{mid} ? need : 0;
+    }}
+    int8_t *band = mb_rows_ws_{mid};
+    if (band == NULL) {{ c->failed = 1; return; }}
+    int8_t *bout = band + ((nin + 64 + 63) & ~(size_t)63);
+    for (int ic = 0; ic < c->IC; ic++) {{
+        const int8_t *src = c->in + (size_t)ic * (size_t)c->IH * (size_t)c->IW;
+        int8_t *dst = band + (size_t)ic * (size_t)rin * (size_t)c->IW;
+        for (int r = 0; r < rin; r++) {{
+            int ih = oh0 * c->SH - c->PH + r;
+            if (ih < 0 || ih >= c->IH) memset(dst + (size_t)r * c->IW, 0, (size_t)c->IW);
+            else memcpy(dst + (size_t)r * c->IW, src + (size_t)ih * c->IW, (size_t)c->IW);
+        }}
+    }}
+    memset(band + nin, 0, 64);   /* kernels may over-read the last row */
+    kernel_conv2d_s8_{mid}(band, c->w, c->b, bout,
+                           1, c->IC, rin, c->IW, c->OC, c->KH, c->KW,
+                           c->SH, c->SW, 0, c->PW,
+                           c->input_offset, c->filter_offset, c->output_offset,
+                           c->output_multiplier, c->output_shift,
+                           c->activation_min, c->activation_max);
+    size_t plane = (size_t)c->OH * (size_t)c->OW, bplane = (size_t)rows * (size_t)c->OW;
+    for (int oc = 0; oc < c->OC; oc++)
+        memcpy(c->out + (size_t)oc * plane + (size_t)oh0 * (size_t)c->OW,
+               bout + (size_t)oc * bplane, bplane);
+}}
+#endif
+
+static inline void parallel_conv2d_s8_rows(void *pool_,
+        const int8_t *in, const int8_t *w, const int32_t *b, int8_t *out,
+        int N, int IC, int IH, int IW, int OC, int KH, int KW,
+        int SH, int SW, int PH, int PW,
+        int input_offset, int filter_offset, int output_offset,
+        int output_multiplier, int output_shift,
+        int activation_min, int activation_max) {{
+#if defined(MODELBLASTER_USE_POOL) && (defined(MB_PLATFORM_POSIX) || defined(MODELBLASTER_PLATFORM_LINUX))
+    modelblaster_pool_t pool = (modelblaster_pool_t)pool_;
+    size_t T = pool ? modelblaster_pool_get_threads_count(pool) : 1;
+    int OH = (IH + 2 * PH - KH) / SH + 1;
+    int OW = (IW + 2 * PW - KW) / SW + 1;
+    if (pool != NULL && N == 1 && T > 1 && (size_t)OH >= T) {{
+        parallel_conv2d_s8_rows_ctx_t ctx = {{
+            .in = in, .w = w, .b = b, .out = out,
+            .IC = IC, .IH = IH, .IW = IW, .OC = OC, .KH = KH, .KW = KW,
+            .SH = SH, .SW = SW, .PH = PH, .PW = PW, .OH = OH, .OW = OW, .T = (int)T,
+            .input_offset = input_offset, .filter_offset = filter_offset,
+            .output_offset = output_offset,
+            .output_multiplier = output_multiplier, .output_shift = output_shift,
+            .activation_min = activation_min, .activation_max = activation_max,
+            .failed = 0,
+        }};
+        modelblaster_pool_parallelize_1d(pool, parallel_conv2d_s8_rows_fn, &ctx, T, 0);
+        if (!ctx.failed) return;
+        /* a slice had no memory for its band: redo the whole conv serially */
+    }}
+#else
+    (void)pool_;
+#endif
+    kernel_conv2d_s8_{mid}(in, w, b, out, N, IC, IH, IW, OC, KH, KW,
+                           SH, SW, PH, PW, input_offset, filter_offset,
+                           output_offset, output_multiplier, output_shift,
+                           activation_min, activation_max);
+}}
+"""
+
+
 def _conv2d_s8_ihwoc_wrapper() -> str:
     """`_CONV2D_S8_WRAPPER` for a backend that packs conv weights IHWOC.
 
@@ -1101,7 +1206,8 @@ _OC_WEIGHT_SLICING_OPS = {"conv2d", "conv2d_s8"}
 
 def _emit_parallel_wrappers(mid: str, used_ops: set[str],
                             backend: Optional[str] = None,
-                            sharded: bool = False) -> str:
+                            sharded: bool = False,
+                            row_split: bool = False) -> str:
     """Emit static parallel_for wrappers ONLY for ops the model actually uses.
 
     Emitting for every parallelizable op leaks `kernel_<op>_<mid>` references
@@ -1149,6 +1255,9 @@ def _emit_parallel_wrappers(mid: str, used_ops: set[str],
         # pre-packed array. So it is emitted even where the offset-based
         # wrapper below is compiled out.
         parts.append(_CONV2D_S8_SHARD_WRAPPER.format(mid=mid))
+    if row_split and "conv2d_s8" in used_ops:
+        # Convs split by output rows (row_split_convs): full weights, no shards.
+        parts.append(_CONV2D_S8_ROWS_WRAPPER.format(mid=mid))
     for op in sorted(_PARALLELIZED_OPS & used_ops):
         if layout == "ihwoc" and op == "conv2d_s8":
             # Strided OC slice: shard on a repacked copy of the weights.
@@ -2004,6 +2113,7 @@ def shard_conv_weights(
     layout = _conv_weight_layout_for_backend(backend)
     if layout in (None, "oihw"):
         return {}
+    from modelblaster.pipeline import conv_split
     plan: dict[int, dict[str, Any]] = {}
     for op in ops:
         did = op.get("dispatch_id")
@@ -2011,10 +2121,39 @@ def shard_conv_weights(
         oc = int(_conv_shape_of(op).get("OC", 0))
         if did is None or f <= 1 or oc <= 0 or oc % f != 0:
             continue
+        # Split by output rows instead (row_split_convs): no per-shard weights.
+        if conv_split.split_axis(op.get("op"), _conv_shape_of(op), f, backend) == "row":
+            continue
         plan[did] = {"weight": _conv_weight_of(op), "op": op.get("op"),
                      "oc_per": oc // f, "n_shards": f,
                      "layout": layout}
     return plan
+
+
+def row_split_convs(
+    ir: dict[str, Any], backend: Optional[str], factor: int,
+) -> dict[int, int]:
+    """`{dispatch_id: width}` for the convs split over the pool by output rows.
+
+    Same width source as `shard_conv_weights` (the op's `shard_factor`, else
+    MB_SHARD_FACTOR); which axis a width takes is `conv_split.split_axis`. A
+    row-split conv keeps its single full weight array (no shard arrays), and
+    is called through `parallel_conv2d_s8_rows`.
+    """
+    from modelblaster.pipeline import conv_split
+    out: dict[int, int] = {}
+    for op in ir.get("ops", []):
+        if (op.get("op") not in _SHARDABLE_CONV_OPS or not _conv_weight_of(op)
+                or (op.get("split_from") or {}) or op.get("dispatch_id") is None):
+            continue
+        try:
+            f = max(1, int(op.get("shard_factor") or factor))
+        except (TypeError, ValueError):
+            raise SystemExit(f"dispatch {op.get('dispatch_id')} has a non-integer "
+                             f"shard_factor {op.get('shard_factor')!r}")
+        if f > 1 and conv_split.split_axis(op.get("op"), _conv_shape_of(op), f, backend) == "row":
+            out[op["dispatch_id"]] = f
+    return out
 
 
 def _shard_key(base_key: str, shard: int) -> str:
@@ -2448,6 +2587,8 @@ def emit_model(ir: dict[str, Any], out_dir: str,
     # MB_SHARD_FACTOR > 1 AND the backend repacks conv weights; see
     # `shard_conv_weights`.
     shard_w_plan = shard_conv_weights(ir, backend, shard_factor())
+    # Convs split by output rows instead (conv_split.py): no shard weights.
+    row_plan = row_split_convs(ir, backend, shard_factor())
     in_tensor = ir["input"]["tensor"]   # first (or only) input name
     out_field = ir["output"]
     out_tensors_list: list[str] = (
@@ -3636,7 +3777,20 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             ohspec = oh_plan.get(op.get("dispatch_id"))
             sspec = (None if ohspec is not None
                      else shard_w_plan.get(op.get("dispatch_id")))
-            if ohspec is not None:
+            rspec = (None if ohspec is not None or sspec is not None
+                     else row_plan.get(op.get("dispatch_id")))
+            if rspec is not None:
+                call = (
+                    f"parallel_conv2d_s8_rows(pool, {in_ptr}, {w}, {b}, {out_ptr}, "
+                    f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
+                    f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
+                    f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                    f"{q['input_offset']}, {q['filter_offset']}, "
+                    f"{q['output_offset']}, "
+                    f"{q['output_multiplier']}, {q['output_shift']}, "
+                    f"{q['activation_min']}, {q['activation_max']})"
+                )
+            elif ohspec is not None:
                 g = ohspec
                 call = (
                     f"mb_ohtile_conv2d_s8_{mid}({in_ptr}, {w}, {b}, {out_ptr}, "
@@ -5030,7 +5184,7 @@ static inline unsigned long long mb_wall_ticks(void)
     c = f"""{HEADER}
 {timer_preamble}
 
-{_emit_parallel_wrappers(mid, used_ops, backend, bool(shard_w_plan))}{oh_helper_src}
+{_emit_parallel_wrappers(mid, used_ops, backend, bool(shard_w_plan), bool(row_plan))}{oh_helper_src}
 
 /* Per-model intermediate buffers. Defined in a sibling buffers.c (one
  * TU per model, NOT per backend) so the heterogeneous harness's two

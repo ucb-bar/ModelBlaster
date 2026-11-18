@@ -332,7 +332,7 @@ for model in "${MODEL_LIST[@]}"; do
     CODEGEN_IR="${base}/graph.xpurt_schedule.json"
     ${PY} -m modelblaster.pipeline.schedule_shards \
         --ir "${base}/graph.json" --schedule "${SCHEDULE}" \
-        --network "${model}" --out "${CODEGEN_IR}"
+        --network "${model}" --out "${CODEGEN_IR}" --backends "${UNIQUE_BACKENDS}"
 
     for bs in "${BUILD_BACKEND_LIST[@]}"; do
         bdir="${base}/${bs}"

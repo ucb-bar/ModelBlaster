@@ -42,8 +42,18 @@ def _output_channels(op: dict[str, Any]) -> int:
     return 0
 
 
+def _conv_shape(op: dict[str, Any]) -> dict[str, Any]:
+    if "OC" in (op.get("shape") or {}):
+        return op.get("shape") or {}
+    for sub in op.get("sub_ops") or []:
+        if str(sub.get("op", "")).startswith("conv2d"):
+            return sub.get("shape") or {}
+    return {}
+
+
 def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
-                          network: str) -> tuple[dict[str, Any], list[dict]]:
+                          network: str, backends: tuple[str, ...] = ()
+                          ) -> tuple[dict[str, Any], list[dict]]:
     """Return an IR whose packed-weight ops match scheduled core widths.
 
     All periodic instances of one dispatch must choose one width: generated
@@ -82,11 +92,22 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
         if width <= 1:
             continue
         oc = _output_channels(op)
-        if oc <= 0 or oc % width:
+        # A conv2d_s8 the width splits by output rows needs no OC slicing
+        # (conv_split.py, k3-work TASK-016); a channel split needs width | OC.
+        try:
+            from . import conv_split
+        except ImportError:   # run as a script
+            from modelblaster.pipeline import conv_split
+        shape = _conv_shape(op)
+        axes = sorted({conv_split.split_axis(op.get("op"), shape, width, b)
+                       for b in backends} or {"oc"})
+        axis = "/".join(axes)
+        if oc <= 0 or not conv_split.width_buildable(op.get("op"), shape, width, backends):
             raise ValueError(
                 f"{network} dispatch {did} ({op.get('op')}) has OC={oc}, "
-                f"not divisible by scheduled width {width}; codegen would "
-                "silently run a serial implementation")
+                f"not divisible by scheduled width {width}, and is not split "
+                "by rows at that width; codegen would silently run a serial "
+                "implementation (not buildable)")
         explicit = op.get("shard_factor")
         if explicit is not None and int(explicit) != width:
             raise ValueError(
@@ -95,7 +116,7 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
         op["shard_factor"] = width
         op[_MARKER] = True
         applied.append({"dispatch_id": int(did), "op": op["op"],
-                        "oc": oc, "n_shards": width})
+                        "oc": oc, "n_shards": width, "axis": axis})
 
     rewrite = out.setdefault("_rewrite", {})
     rewrite["xpurt_schedule_shards"] = {
@@ -111,11 +132,16 @@ def main() -> int:
     ap.add_argument("--schedule", required=True)
     ap.add_argument("--network", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--backends", default="",
+                    help="comma list of the backends this IR is built for; a K3 "
+                         "backend may split a conv by output rows (conv_split.py), "
+                         "so its width need not divide OC")
     args = ap.parse_args()
 
     ir = json.loads(Path(args.ir).read_text())
     schedule = json.loads(Path(args.schedule).read_text())
-    out, applied = apply_schedule_shards(ir, schedule, args.network)
+    backends = tuple(b for b in (x.strip() for x in args.backends.split(",")) if b)
+    out, applied = apply_schedule_shards(ir, schedule, args.network, backends)
     text = json.dumps(out, indent=1) + "\n"
     destination = Path(args.out)
     if not destination.exists() or destination.read_text() != text:
