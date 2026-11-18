@@ -1,0 +1,42 @@
+{
+ "format": "mb-cuda-cache/1",
+ "entries": [
+  {
+   "op": "conv2d_s8",
+   "entry": "kernel_conv2d_s8",
+   "signature_sha": "2769f001094f",
+   "dtype": "fp32",
+   "arch": "ime_k3_x100",
+   "shape_guard": [
+    "{\"IC\": 128, \"IH\": 4, \"IW\": 4, \"KH\": 3, \"KW\": 3, \"N\": 1, \"OC\": 128, \"OH\": 4, \"OW\": 4, \"PH\": 1, \"PW\": 1, \"SH\": 1, \"SW\": 1}",
+    "{\"IC\": 3, \"IH\": 112, \"IW\": 112, \"KH\": 3, \"KW\": 3, \"N\": 1, \"OC\": 32, \"OH\": 56, \"OW\": 56, \"PH\": 1, \"PW\": 1, \"SH\": 2, \"SW\": 2}",
+    "{\"IC\": 32, \"IH\": 14, \"IW\": 14, \"KH\": 1, \"KW\": 1, \"N\": 1, \"OC\": 64, \"OH\": 7, \"OW\": 7, \"PH\": 0, \"PW\": 0, \"SH\": 2, \"SW\": 2}",
+    "{\"IC\": 32, \"IH\": 14, \"IW\": 14, \"KH\": 3, \"KW\": 3, \"N\": 1, \"OC\": 32, \"OH\": 14, \"OW\": 14, \"PH\": 1, \"PW\": 1, \"SH\": 1, \"SW\": 1}",
+    "{\"IC\": 32, \"IH\": 14, \"IW\": 14, \"KH\": 3, \"KW\": 3, \"N\": 1, \"OC\": 64, \"OH\": 7, \"OW\": 7, \"PH\": 1, \"PW\": 1, \"SH\": 2, \"SW\": 2}",
+    "{\"IC\": 32, \"IH\": 27, \"IW\": 27, \"KH\": 1, \"KW\": 1, \"N\": 1, \"OC\": 32, \"OH\": 14, \"OW\": 14, \"PH\": 0, \"PW\": 0, \"SH\": 2, \"SW\": 2}",
+    "{\"IC\": 32, \"IH\": 27, \"IW\": 27, \"KH\": 3, \"KW\": 3, \"N\": 1, \"OC\": 32, \"OH\": 14, \"OW\": 14, \"PH\": 1, \"PW\": 1, \"SH\": 2, \"SW\": 2}",
+    "{\"IC\": 64, \"IH\": 7, \"IW\": 7, \"KH\": 1, \"KW\": 1, \"N\": 1, \"OC\": 128, \"OH\": 4, \"OW\": 4, \"PH\": 0, \"PW\": 0, \"SH\": 2, \"SW\": 2}",
+    "{\"IC\": 64, \"IH\": 7, \"IW\": 7, \"KH\": 3, \"KW\": 3, \"N\": 1, \"OC\": 128, \"OH\": 4, \"OW\": 4, \"PH\": 1, \"PW\": 1, \"SH\": 2, \"SW\": 2}",
+    "{\"IC\": 64, \"IH\": 7, \"IW\": 7, \"KH\": 3, \"KW\": 3, \"N\": 1, \"OC\": 64, \"OH\": 7, \"OW\": 7, \"PH\": 1, \"PW\": 1, \"SH\": 1, \"SW\": 1}"
+   ],
+   "slot_us": 967.6,
+   "speedup": 1.1006,
+   "impl_id": "k3rd-t016-x100-dronet-conv-1",
+   "file": "src/88b68a1865500b03cd0fd3ee6228000f0ab5b501.c",
+   "source": {
+    "run_id": "k3-work TASK-016 step 3 bench (results/base, t016_x100, cpu 0, w1)",
+    "problem_id": "dronet conv2d_s8 x10 on ime_k3_x100",
+    "techniques": [
+     "per-shape kernel choice (rvv_vsmul_vnclip on 3 shapes)",
+     "tile unpack for the RVV path"
+    ],
+    "algorithm": "x100_vmadot_4x4x8"
+   },
+   "model_verified": [
+    "dronet"
+   ],
+   "rejected": [],
+   "target": "riscv"
+  }
+ ]
+}

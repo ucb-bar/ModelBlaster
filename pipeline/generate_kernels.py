@@ -1701,6 +1701,20 @@ def generate(
                 f"{len(curated_seed)} curated kernel(s): "
                 f"{sorted(curated_seed)}")
 
+        # KernelBlaster RISC-V winners before everything else (k3-work
+        # TASK-016, pipeline/kb_riscv.py): a cached source for this backend is
+        # used only when its shape guard covers every instance shape of the op
+        # here; otherwise nothing changes. Skipped entirely when the backend
+        # has no riscv entry (every non-K3 build) or MB_KB_RISCV=0.
+        from modelblaster.pipeline import kb_riscv
+        if kb_riscv.has_entries(target.name):
+            _probe_swap(
+                kb_riscv.SOURCE_LABEL,
+                str(kb_riscv.DEFAULT_RISCV_CACHE),
+                lambda spec, algorithm: kb_riscv.codegen_source(
+                    target.name, spec, algorithm.name,
+                    shapes_from_ir(ir, spec.op), ir.get("name")),
+            )
         # Per-model LLM cache first (vetted for THIS model by a prior
         # BACKEND=llm run). Files at <cache_dir>/<target>_<op>_<algo>.c
         # — note the flat layout (no <target>/ subdir) since cache_dir
