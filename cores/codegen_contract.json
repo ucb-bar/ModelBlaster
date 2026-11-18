@@ -11,10 +11,22 @@
         "conv2d_s8",
         "conv2d_batchnorm2d_s8",
         "conv2d_batchnorm2d_silu_s8",
-        "conv2d_silu_s8"
+        "conv2d_silu_s8",
+        "add_s8",
+        "batchnorm2d_s8",
+        "cat2_c1_s8",
+        "cat3_c1_s8",
+        "cat4_c1_s8",
+        "elu_s8",
+        "maxpool2d_s8",
+        "mul_s8",
+        "relu_s8",
+        "sigmoid_s8",
+        "silu_s8",
+        "upsample_nearest_s8"
       ],
       "statement": "Every periodic instance of one dispatch must be given the same core width.",
-      "why": "The packed weight array is emitted per shard at skeleton-generation time, so one generated model cannot carry two layouts for one dispatch.",
+      "why": "The packed weight array is emitted per shard at skeleton-generation time, so one generated model cannot carry two layouts for one dispatch. The K3 simple-layer pool ops (k3-work TASK-017) carry no packed weights, but schedule_shards takes one width per dispatch for every dispatch it is given, so they are pinned too.",
       "enforced_by": "pipeline/schedule_shards.py::apply_schedule_shards",
       "checkable_from": "schedule"
     },
@@ -113,18 +125,80 @@
     "shareable_ops": {
       "severity": "refuse",
       "ops": [
+        "add_s8",
+        "batchnorm2d_s8",
+        "cat2_c1_s8",
+        "cat3_c1_s8",
+        "cat4_c1_s8",
         "conv2d",
         "conv2d_batchnorm2d_s8",
         "conv2d_batchnorm2d_silu_s8",
         "conv2d_s8",
+        "elu_s8",
         "linear",
-        "linear_s8"
+        "linear_s8",
+        "maxpool2d_s8",
+        "mul_s8",
+        "relu_s8",
+        "sigmoid_s8",
+        "silu_s8",
+        "upsample_nearest_s8"
       ],
-      "statement": "Only these ops can be spread over several cores; every other op runs on the first core of a multi-core group while the rest wait. A scheduler must not offer any other op more than one core.",
-      "why": "An op spreads only if ModelBlaster has a pool path for it (a parallel_<op> wrapper in pipeline/generate_skeleton.py). A multi-core profile of any other op measures the same single-core code, so a 'faster' wider width there is noise, not a gain (k3-work TASK-016).",
-      "derived_from": "pipeline/generate_skeleton.py::shareable_ops (pipeline/tests/test_conv_row_split.py keeps this list equal to it)",
+      "statement": "Only these ops can be spread over several cores; every other op runs on the first core of a multi-core group while the rest wait. An op listed under backend_prefixes is shareable only on a backend whose name starts with one of its prefixes (XPU-RT reads the backend in module_name). A scheduler must not offer any other op, or any op on another backend, more than one core.",
+      "why": "An op spreads only if ModelBlaster has a pool path for it (a parallel_<op> wrapper in pipeline/generate_skeleton.py, or an mbp_<op> wrapper from pipeline/k3_pool_ops.py on the K3 backends, k3-work TASK-017). A multi-core profile of any other op measures the same single-core code, so a 'faster' wider width there is noise, not a gain (k3-work TASK-016).",
+      "derived_from": "pipeline/generate_skeleton.py::shareable_ops and ::shareable_op_backends (pipeline/tests/test_conv_row_split.py keeps this rule equal to them)",
       "enforced_by": "xpu-rt/codegen_contract.py::apply_to_workload",
-      "checkable_from": "schedule (op kind in module_name)"
+      "checkable_from": "schedule (op kind in module_name)",
+      "backend_prefixes": {
+        "add_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "batchnorm2d_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "cat2_c1_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "cat3_c1_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "cat4_c1_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "elu_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "maxpool2d_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "mul_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "relu_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "sigmoid_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "silu_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ],
+        "upsample_nearest_s8": [
+          "rvv_k3",
+          "ime_k3"
+        ]
+      }
     }
   }
 }

@@ -169,4 +169,8 @@ def test_shareable_ops_match_code():
     import json
     contract = json.loads((ROOT / "cores" / "codegen_contract.json").read_text())
     assert contract["rules"]["shareable_ops"]["ops"] == gs.shareable_ops()
-    assert "conv2d_s8" in gs.shareable_ops() and "silu_s8" not in gs.shareable_ops()
+    assert contract["rules"]["shareable_ops"]["backend_prefixes"] == gs.shareable_op_backends()
+    assert "conv2d_s8" in gs.shareable_ops() and "gelu_s8" not in gs.shareable_ops()
+    # k3-work TASK-017: the simple layers are shareable on the K3 backends only
+    assert "silu_s8" in gs.shareable_ops() and "conv2d_s8" not in gs.shareable_op_backends()
+    assert gs.shareable_op_backends()["silu_s8"] == ["rvv_k3", "ime_k3"]
