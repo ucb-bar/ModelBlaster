@@ -113,6 +113,9 @@ _ALIAS = {
     "contiguous.default", "permute.default", "reshape.default",
     "flatten.using_ints", "split.Tensor", "expand_as.default",
     "clone.default",
+    # A slice that covers the whole tensor (ViNT's pos_enc[:, :L, :] at full
+    # length) is exported as aten.alias: same storage, same shape.
+    "alias.default",
 }
 
 # Ops whose getitems are pieces of one source tensor (_visit_split_piece).
