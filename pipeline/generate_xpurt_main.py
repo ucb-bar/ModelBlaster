@@ -88,6 +88,174 @@ def _c_ident(name: str) -> str:
     return name.replace(".", "_").replace("-", "_")
 
 
+
+# ---- Dynamic walker C fragments (see _emit's `dynamic_walker`). Plain strings
+# with @PLACEHOLDERS@, not f-strings, so C braces stay single.
+_DYN_DECL = r'''
+/* ---- Dynamic walker -------------------------------------------------------
+ * A task whose inputs are ready but whose own core is still busy with (or
+ * waiting on) an earlier task may run on an idle core of the same kind. The
+ * idle core takes it only if XPURT_SAFETY_BOUNDARY x the task's planned
+ * duration ends before the idle core's own next task is due; if that task is
+ * already overdue, it takes nothing. Order on each core is kept, no task is
+ * preempted, composite (multi-hart) entries never move, and each task runs
+ * once: whoever claims it first (atomic flag) runs it, the other skips it.
+ * XPURT_SAFETY_BOUNDARY is the knob a later feedback step will raise. */
+#include <stdatomic.h>
+#ifndef XPURT_SAFETY_BOUNDARY
+#define XPURT_SAFETY_BOUNDARY @SAFETY@
+#endif
+static atomic_int xpurt_claimed[@UPPER@_N_ENTRIES];   /* 1 once a core has taken it */
+static atomic_int xpurt_done[@UPPER@_N_ENTRIES];      /* 1 once it has finished */
+static atomic_int xpurt_refused[@UPPER@_N_ENTRIES];   /* 1 if a move was ever refused */
+static int xpurt_ran_on[@UPPER@_N_ENTRIES];           /* hart that actually ran it */
+static atomic_int xpurt_pos[XPURT_MAX_HARTS];         /* entry each core's own walk is on */
+static atomic_int xpurt_n_done, xpurt_n_moved, xpurt_n_refused, xpurt_scan_lo;
+#define XPURT_POST(i) do { \
+    k_sem_give(&sems_[i]); \
+    if (!warm_) { atomic_store(&xpurt_done[i], 1); atomic_fetch_add(&xpurt_n_done, 1); } \
+} while (0)
+static void xpurt_lock_run(const xpurt_sched_entry_t *e, int run_hart)
+{
+    if (run_hart == e->hart) xpurt_lock_entry(e);
+    else if (run_hart >= 0 && run_hart < XPURT_MAX_HARTS) pthread_mutex_lock(&xpurt_hart_lock[run_hart]);
+}
+static void xpurt_unlock_run(const xpurt_sched_entry_t *e, int run_hart)
+{
+    if (run_hart == e->hart) xpurt_unlock_entry(e);
+    else if (run_hart >= 0 && run_hart < XPURT_MAX_HARTS) pthread_mutex_unlock(&xpurt_hart_lock[run_hart]);
+}
+#define XPURT_LOCK_RUN(e, h)   xpurt_lock_run(e, h)
+#define XPURT_UNLOCK_RUN(e, h) xpurt_unlock_run(e, h)
+static int xpurt_deps_done(const xpurt_sched_entry_t *e)
+{
+    for (int d = 0; d < e->n_deps; d++)
+        if (!atomic_load(&xpurt_done[e->deps[d]])) return 0;
+    return 1;
+}
+static uint64_t xpurt_release(const xpurt_sched_entry_t *e)
+{
+    return run_t0 + (uint64_t)((double)e->start_time_ms * (double)XPURT_CYCLES_PER_MS);
+}
+'''
+
+_DYN_FUNCS = r'''
+/* Run entry i_ on run_hart_ (its own hart, or the idle hart that took it). */
+static void xpurt_run_entry(struct xpurt_worker_arg *wa, int i_, int warm_,
+                            struct k_sem *sems_, int run_hart_)
+{
+    const xpurt_sched_entry_t *e_ = &@UPPER@_TABLE[i_];
+    int my_kind_idx = wa->kind_idx;
+    (void)my_kind_idx;
+    if (!warm_) xpurt_ran_on[i_] = run_hart_;
+    do {
+@RUN_BODY@
+        printf("xpurt: WARN unknown network %s in entry %d\n",
+               e_->network, e_->entry_id);
+        XPURT_POST(i_);
+    } while (0);
+}
+
+/* Is entry c held: its own core is still on an earlier entry, or is at c but
+ * waiting for c's ordering edge (the task planned before it on that core). */
+static int xpurt_is_held(const xpurt_sched_entry_t *e, int c)
+{
+    if (e->hart < 0 || e->hart >= XPURT_MAX_HARTS) return 0;
+    int p = atomic_load(&xpurt_pos[e->hart]);
+    if (p < 0) return 0;                       /* owner not walking yet */
+    if (p < c) return 1;
+    return p == c && e->time_dep_entry_id >= 0 &&
+           !atomic_load(&xpurt_done[e->time_dep_entry_id]);
+}
+
+/* Called by an idle worker. next_own is the next entry on its own list, or -1
+ * if it has none left. Takes at most one task; returns 1 if it ran one. */
+static int xpurt_try_steal(struct xpurt_worker_arg *wa, int next_own)
+{
+    uint64_t now = (uint64_t)k_cycle_get_64();
+    uint64_t limit = UINT64_MAX;
+    if (next_own >= 0) {
+        limit = xpurt_release(&@UPPER@_TABLE[next_own]);
+        if (limit <= now) return 0;            /* own next task overdue: take nothing */
+    }
+    int lo = atomic_load(&xpurt_scan_lo);
+    while (lo < @UPPER@_N_ENTRIES && atomic_load(&xpurt_done[lo])) lo++;
+    atomic_store(&xpurt_scan_lo, lo);
+    for (int c = lo; c < @UPPER@_N_ENTRIES; c++) {
+        const xpurt_sched_entry_t *e = &@UPPER@_TABLE[c];
+        if (e->dispatch_id < 0 || e->n_harts > 1 || e->hart == wa->hart) continue;
+        if (strcmp(e->core_kind, wa->kind) != 0) continue;
+        if (atomic_load(&xpurt_claimed[c])) continue;
+        if (!xpurt_deps_done(e)) continue;
+        if (e->dispatch_id == 0 && now < xpurt_release(e)) continue;
+        if (!xpurt_is_held(e, c)) continue;
+        uint64_t need = (uint64_t)((double)XPURT_SAFETY_BOUNDARY *
+                                   (double)e->duration_ms * (double)XPURT_CYCLES_PER_MS);
+        if (limit != UINT64_MAX && now + need > limit) {
+            if (!atomic_exchange(&xpurt_refused[c], 1)) atomic_fetch_add(&xpurt_n_refused, 1);
+            continue;
+        }
+        int z = 0;
+        if (!atomic_compare_exchange_strong(&xpurt_claimed[c], &z, 1)) continue;
+        atomic_fetch_add(&xpurt_n_moved, 1);
+        xpurt_run_entry(wa, c, 0, completion_sems, wa->hart);
+        return 1;
+    }
+    return 0;
+}
+
+/* Timed pass, dynamic. Same order as the static walk on this core; while its
+ * next own task is not ready, the worker may take a held task from another
+ * core of its kind. After its own list it keeps taking tasks until all done. */
+static void xpurt_walk_dynamic(struct xpurt_worker_arg *wa)
+{
+    for (int i_ = 0; i_ < @UPPER@_N_ENTRIES; i_++) {
+        const xpurt_sched_entry_t *e_ = &@UPPER@_TABLE[i_];
+        if (strcmp(e_->core_kind, wa->kind) != 0 || e_->hart != wa->hart) continue;
+        atomic_store(&xpurt_pos[wa->hart], i_);
+        for (;;) {
+            if (atomic_load(&xpurt_claimed[i_])) break;          /* another core took it */
+            int ready = xpurt_deps_done(e_) &&
+                (e_->time_dep_entry_id < 0 || atomic_load(&xpurt_done[e_->time_dep_entry_id])) &&
+                (e_->dispatch_id != 0 || (uint64_t)k_cycle_get_64() >= xpurt_release(e_));
+            if (ready) break;
+            if (!xpurt_try_steal(wa, i_)) k_yield();
+        }
+        int z = 0;
+        if (!atomic_compare_exchange_strong(&xpurt_claimed[i_], &z, 1)) continue;
+        xpurt_run_entry(wa, i_, 0, completion_sems, wa->hart);
+    }
+    atomic_store(&xpurt_pos[wa->hart], @UPPER@_N_ENTRIES);
+    while (atomic_load(&xpurt_n_done) < @UPPER@_N_ENTRIES)
+        if (!xpurt_try_steal(wa, -1)) k_yield();
+}
+'''
+
+_DYN_EXTRA_WORKERS = r'''
+    /* Dynamic walker: one more worker on every hart of a kind the table
+     * never uses, so wholly idle cores can take held tasks. */
+    for (int h_ = 0; h_ < XPURT_MAX_HARTS; h_++) atomic_store(&xpurt_pos[h_], -1);
+#define add_idle_harts_(KI, HS, NH) do { \
+        for (int j_ = 0; j_ < (NH); j_++) { \
+            int w_ = 0; \
+            for (; w_ < n_workers; w_++) \
+                if (wargs[w_].hart == (HS)[j_]) break; \
+            if (w_ < n_workers || n_workers == XPURT_MAX_WORKERS) continue; \
+            wargs[n_workers].kind = kinds[KI]; \
+            wargs[n_workers].hart = (HS)[j_]; \
+            wargs[n_workers].kind_idx = (KI); \
+            n_workers++; \
+        } \
+    } while (0)
+@EXTRA@
+#undef add_idle_harts_'''
+
+_DYN_SUMMARY = r'''
+    printf("xpurt: dynamic walker safety_boundary=%.3f moved=%d refused_safety=%d\n",
+           (double)XPURT_SAFETY_BOUNDARY, atomic_load(&xpurt_n_moved),
+           atomic_load(&xpurt_n_refused));'''
+
+
 def _emit(networks: list[str], schedule_name: str,
           dispatch_table_header: str,
           core_kinds: list[str],
@@ -96,7 +264,10 @@ def _emit(networks: list[str], schedule_name: str,
           n_instances: dict[str, int],
           per_hart_workers: bool = False,
           pool_harts: list[list[int]] | None = None,
-          impl_backends: list[tuple[str, str, str]] | None = None) -> str:
+          impl_backends: list[tuple[str, str, str]] | None = None,
+          dynamic_walker: bool = False,
+          safety_boundary: float = 1.5,
+          idle_harts: list[list[int]] | None = None) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -136,7 +307,20 @@ def _emit(networks: list[str], schedule_name: str,
                    entries scheduled on that hart. Needed on hosted Linux
                    targets (e.g. a K1) where one kind spans several harts that
                    the schedule drives independently. Pools are not used in
-                   this mode (every hart already has its own worker)."""
+                   this mode (every hart already has its own worker).
+    `dynamic_walker`  hart mode only. A task whose inputs are ready but whose
+                   own core is still busy (or waiting) may run on an idle core
+                   of the SAME kind, if `safety_boundary` x its planned
+                   duration ends before that idle core's next own task is due.
+                   Order on each core is unchanged; nothing is preempted.
+    `safety_boundary`  the factor above (default 1.5). A later feedback step
+                   is meant to raise it when moved tasks are seen to delay the
+                   idle core's own work; nothing writes it yet.
+    `idle_harts`   parallel to core_kinds: every hart of that kind (from the
+                   registry). Dynamic mode starts a worker on each one the
+                   table never uses, so wholly idle cores can take tasks."""
+    if dynamic_walker and not per_hart_workers:
+        raise ValueError("dynamic_walker needs per_hart_workers (--worker-granularity hart)")
 
     # State structs are emitted per (network, kind) so each worker's
     # `s.pool` is fixed at main() time. Without this, two workers that
@@ -430,6 +614,35 @@ def _emit(networks: list[str], schedule_name: str,
     # Build the per-(network, instance, dispatch_id) dispatch branch.
     dispatch_branch = "\n".join(branch_lines)
 
+    # Dynamic walker (opt-in). Everything below is empty unless enabled, so
+    # the static walker's generated C is unchanged.
+    dyn_decl = dyn_funcs = dyn_extra_workers = dyn_summary = ""
+    timed_walk = "xpurt_walk(wa, 0);"
+    trace_cols = trace_fmt = trace_args = ""
+    if dynamic_walker:
+        # The run body, shared by an entry's own core and a core that took it.
+        # It is the static branch with three substitutions: completion also
+        # sets the entry's done flag, and the hart lock and the telemetry hart
+        # are the core it RUNS on (run_hart_), not the one it was planned on.
+        run_body = (dispatch_branch
+                    .replace("k_sem_give(&sems_[i_]);", "XPURT_POST(i_);")
+                    .replace("XPURT_LOCK_ENTRY(e_)", "XPURT_LOCK_RUN(e_, run_hart_)")
+                    .replace("XPURT_UNLOCK_ENTRY(e_)", "XPURT_UNLOCK_RUN(e_, run_hart_)")
+                    .replace("XPURT_STREAM_EVENT(e_, wa->hart,", "XPURT_STREAM_EVENT(e_, run_hart_,"))
+        dyn_decl = _DYN_DECL.replace("@UPPER@", upper).replace(
+            "@SAFETY@", repr(float(safety_boundary))) + "\n"
+        dyn_funcs = _DYN_FUNCS.replace("@UPPER@", upper).replace("@RUN_BODY@", run_body) + "\n"
+        timed_walk = "xpurt_walk_dynamic(wa);"
+        extra = [f"    {{ static const int hs_[] = {{ {', '.join(str(h) for h in hs)} }}; "
+                 f"add_idle_harts_({k}, hs_, {len(hs)}); }}"
+                 for k, hs in enumerate(idle_harts or []) if hs]
+        dyn_extra_workers = _DYN_EXTRA_WORKERS.replace("@EXTRA@", "\n".join(extra))
+        dyn_summary = _DYN_SUMMARY
+        trace_cols = ",ran_on_hart,moved"
+        trace_fmt = ",%d,%d"
+        trace_args = (",\n               xpurt_ran_on[i], "
+                      "xpurt_ran_on[i] != e->hart && e->dispatch_id >= 0")
+
     # One Zephyr worker thread per distinct core_kind. Each pins itself
     # to a hart (the entry's .hart) and pulls only entries whose
     # core_kind matches.
@@ -722,7 +935,7 @@ static uint64_t run_t0;
 #define XPURT_CYCLES_PER_MS \\
     ((uint64_t)(CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC / 1000))
 
-/* Warm start. Before t=0 every worker runs its instance-0 entries once, in
+{dyn_decl}/* Warm start. Before t=0 every worker runs its instance-0 entries once, in
  * table order and honouring their data dependencies, on the cores the schedule
  * chose; nothing in that pass is gated, timed or traced. First-call costs
  * (kernel tables filled on first use, cold caches, first-touch pages) then stay
@@ -848,7 +1061,7 @@ static void xpurt_walk(struct xpurt_worker_arg *wa, int warm_)
     }}
 }}
 
-static void *xpurt_worker(void *arg)
+{dyn_funcs}static void *xpurt_worker(void *arg)
 {{
     struct xpurt_worker_arg *wa = (struct xpurt_worker_arg *)arg;
     const char *my_kind = wa->kind;
@@ -870,7 +1083,7 @@ static void *xpurt_worker(void *arg)
         k_sem_give(&xpurt_warm_done);
         k_sem_take(&xpurt_warm_go, K_FOREVER);   /* main sets t=0 in between */
     }}
-    xpurt_walk(wa, 0);
+    {timed_walk}
     return NULL;
 }}
 
@@ -959,7 +1172,7 @@ int main(void)
     static struct xpurt_worker_arg wargs[{n_workers_max}];
     static pthread_t tids[{n_workers_max}];
     union xpurt_attr_slot {{ pthread_attr_t a; char _pad[64]; }};
-    static union xpurt_attr_slot attrs[{n_workers_max}];{worker_discovery}
+    static union xpurt_attr_slot attrs[{n_workers_max}];{worker_discovery}{dyn_extra_workers}
 
     /* Run baseline for both the trace and the periodic-start-time gate.
      * Captured just before workers spawn so it's the moment "t=0" of the
@@ -1014,7 +1227,7 @@ int main(void)
     for (int k = 0; k < {loop_bound}; k++) {{
         printf("xpurt: worker[%d] kind=%s pinned_hart=%d\\n",
                k, wargs[k].kind, wargs[k].hart);
-    }}
+    }}{dyn_summary}
 
 #ifdef MODELBLASTER_XPURT_TRACE
     /* Trace dump — one CSV row per scheduled entry, with the actual
@@ -1024,16 +1237,16 @@ int main(void)
     printf("=== MODELBLASTER_XPURT_TRACE_BEGIN ===\\n");
     printf("entry_id,network,instance,dispatch_id,op,name,core_kind,hart,"
            "predicted_start_ms,predicted_duration_ms,worker_kind_idx,"
-           "actual_start_cycles,actual_end_cycles\\n");
+           "actual_start_cycles,actual_end_cycles{trace_cols}\\n");
     for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
         const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
-        printf("%d,%s,%d,%d,%s,%s,%s,%d,%.6f,%.6f,%d,%llu,%llu\\n",
+        printf("%d,%s,%d,%d,%s,%s,%s,%d,%.6f,%.6f,%d,%llu,%llu{trace_fmt}\\n",
                e->entry_id, e->network, e->instance, e->dispatch_id,
                e->op, e->name, e->core_kind, e->hart,
                (double)e->start_time_ms, (double)e->duration_ms,
                xpurt_trace[i].worker_kind_idx,
                (unsigned long long)xpurt_trace[i].start_cycles,
-               (unsigned long long)xpurt_trace[i].end_cycles);
+               (unsigned long long)xpurt_trace[i].end_cycles{trace_args});
     }}
     printf("=== MODELBLASTER_XPURT_TRACE_END ===\\n");
 #endif
@@ -1103,6 +1316,17 @@ def main() -> None:
                          "dispatch table; pools are disabled. Use hart for "
                          "hosted-Linux targets whose kinds span several "
                          "independently scheduled harts (e.g. SpacemiT K1).")
+    ap.add_argument("--dynamic-walker", action="store_true",
+                    help="hart mode only: a task whose inputs are ready but "
+                         "whose own core is busy may run on an idle core of "
+                         "the same kind, subject to --safety-boundary. Also "
+                         "starts a worker on every registry hart the schedule "
+                         "leaves unused.")
+    ap.add_argument("--safety-boundary", type=float, default=1.5,
+                    help="dynamic walker: an idle core takes a task only if "
+                         "this many times the task's planned duration ends "
+                         "before the idle core's own next task is due "
+                         "(default 1.5). Meant to be raised by feedback.")
     args = ap.parse_args()
 
     with open(args.schedule) as f:
@@ -1175,17 +1399,26 @@ def main() -> None:
 
     pool_harts = ([sorted(harts_per_kind.get(k, set())) for k in core_kinds]
                   if harts_per_kind and any(pool_sizes) else None)
+    if args.dynamic_walker and not per_hart:
+        raise SystemExit("--dynamic-walker needs --worker-granularity hart")
+    if args.safety_boundary < 1.0:
+        raise SystemExit("--safety-boundary must be >= 1.0")
     src = _emit(networks, args.name, args.dispatch_table_header,
                 core_kinds, backends, pool_sizes, n_instances,
                 per_hart_workers=per_hart, pool_harts=pool_harts,
-                impl_backends=impl_backends)
+                impl_backends=impl_backends,
+                dynamic_walker=args.dynamic_walker,
+                safety_boundary=args.safety_boundary,
+                idle_harts=[sorted(harts_per_kind.get(k, set())) for k in core_kinds])
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
     print(f"wrote {args.out}  (networks: {networks} "
           f"instances: {n_instances} kinds: {core_kinds} "
           f"backends: {backends} impl_backends: {impl_backends} "
-          f"pool_sizes: {pool_sizes})")
+          f"pool_sizes: {pool_sizes}"
+          + (f" dynamic_walker safety_boundary={args.safety_boundary}"
+             if args.dynamic_walker else "") + ")")
 
 
 if __name__ == "__main__":

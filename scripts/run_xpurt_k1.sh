@@ -431,6 +431,19 @@ done
 # reserve their whole hart set. MB_XPURT_WORKERS=kind gives one worker per
 # kind with an intra-op pool over the kind's harts.
 WORKERS="${MB_XPURT_WORKERS:-hart}"
+# MB_XPURT_DYNAMIC=1: dynamic walker (held tasks may move to an idle core of the
+# same kind); MB_XPURT_SAFETY_BOUNDARY sets its safety factor (default 1.5).
+DYNAMIC_ARGS=()
+# MB_XPURT_SAFETY_FILE=<walker_safety.json> (scripts/walker_safety_feedback.py)
+# supplies the value instead, so feedback-driven runs pick up the latest one.
+if [[ "${MB_XPURT_DYNAMIC:-0}" == "1" ]]; then
+    _safety="${MB_XPURT_SAFETY_BOUNDARY:-1.5}"
+    if [[ -n "${MB_XPURT_SAFETY_FILE:-}" ]]; then
+        _safety="$(${PY} -c 'import json,sys; print(json.load(open(sys.argv[1]))["safety_boundary"])' "${MB_XPURT_SAFETY_FILE}")" || exit 2
+        echo "dynamic walker: safety boundary ${_safety} from ${MB_XPURT_SAFETY_FILE}"
+    fi
+    DYNAMIC_ARGS=(--dynamic-walker --safety-boundary "${_safety}")
+fi
 
 echo "=== 3/5 generate the walker (--worker-granularity ${WORKERS}) ==="
 MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
@@ -439,7 +452,7 @@ ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
     --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
     ${IMPL_BACKENDS:+--impl-backends "${IMPL_BACKENDS}"} \
-    --registry "${REGISTRY}" --worker-granularity "${WORKERS}"
+    --registry "${REGISTRY}" --worker-granularity "${WORKERS}" "${DYNAMIC_ARGS[@]}"
 
 echo "=== 4/5 cross-build (harness_xpurt/build_posix.sh) ==="
 # A100 harts that must register with the kernel (registry ai_thread_cpus);

@@ -456,3 +456,139 @@ def test_an_impl_the_build_lacks_stops_the_run(tmp_path):
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
     assert r.returncode == 2, r.stdout[-2000:]
     assert "asks for impl 'npu'" in r.stdout
+
+
+# ---- Dynamic walker ---------------------------------------------------------
+# A task whose inputs are ready but whose own core is busy may run on an idle
+# core of the same kind, if safety_boundary x its planned duration ends before
+# that idle core's own next task is due.
+
+def _build_custom(w: Path, schedule: dict, n_harts: int, gen_extra: list[str],
+                  cflags: list[str], name: str) -> Path:
+    pkg = w / "pkg"
+    if not pkg.exists():
+        pkg.mkdir()
+        os.symlink(ROOT, pkg / "modelblaster")
+    env = dict(os.environ, PYTHONPATH=str(pkg))
+    reg = {"system": f"host{n_harts}", "description": "independent rvv harts",
+           "default_dispatch_target": "any",
+           "cores": [{"name": f"rvv{h}", "kind": "rvv", "harts": [h],
+                      "capabilities": ["synth_a", "synth_b"]} for h in range(n_harts)]}
+    _write(w / "schedule.json", json.dumps(schedule))
+    _write(w / "registry.json", json.dumps(reg))
+    _write(w / "graph.json", json.dumps({"ops": [
+        {"dispatch_id": 0, "op": "synth_a", "name": "a"},
+        {"dispatch_id": 1, "op": "synth_b", "name": "b"}]}))
+    _write(w / "synth_model.h", _model_header())
+    _write(w / "synth_test_io.h",
+           "static const float model_synth_test_input[1] = { 0.0f };\n")
+    _write(w / "kernels_rvv.c", _kernels("rvv"))
+    for a in (("modelblaster.pipeline.ingest_xpurt_schedule",
+               "--schedule", "schedule.json", "--registry", "registry.json",
+               "--ir", "synth:graph.json", "--out", str(w / "demo_table.c"),
+               "--name", "demo"),
+              ("modelblaster.pipeline.generate_xpurt_main",
+               "--schedule", "schedule.json", "--out", str(w / f"main_{name}.c"),
+               "--name", "demo", "--dispatch-table-header", "demo_table.h",
+               "--core-kinds", "rvv", "--registry", "registry.json",
+               "--worker-granularity", "hart", *gen_extra)):
+        r = subprocess.run([sys.executable, "-m", *a], cwd=w, env=env,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"{a[0]} failed:\n{r.stdout}\n{r.stderr}"
+    exe = w / f"walker_{name}"
+    cmd = [CC, "-O1", "-pthread", "-DMB_PLATFORM_POSIX", "-D_GNU_SOURCE",
+           "-DMODELBLASTER_XPURT_TRACE", *cflags,
+           f"-I{ROOT / 'runtime'}", f"-I{ROOT / 'runtime' / 'modelblaster_pool'}",
+           f"-I{w}", "-o", str(exe), f"main_{name}.c", "demo_table.c", "kernels_rvv.c",
+           str(ROOT / "runtime" / "modelblaster_pool" / "modelblaster_pool.c"),
+           str(ROOT / "runtime" / "mb_placement.c")]
+    r = subprocess.run(cmd, cwd=w, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    subprocess.run([str(exe)], capture_output=True, timeout=60, env=COLD)
+    return exe
+
+
+def _entry(job: int, op: int, hart: int, start: float) -> tuple[str, dict]:
+    return f"synth{job}_dispatch_{op}", {
+        "id": op, "ordinal": op + 1, "total": 2,
+        "dependencies": [f"synth{job}_dispatch_0"] if op == 1 else [],
+        "hardware_target": f"CPU_P#{hart}", "start_time": start,
+        "duration": OP_US / 1000.0, "job_name": f"synth{job}", "module_name": "synth"}
+
+
+def _dyn_stats(out: str) -> dict:
+    m = re.search(r"dynamic walker safety_boundary=([\d.]+) moved=(\d+) refused_safety=(\d+)", out)
+    assert m, out[-1500:]
+    return {"safety": float(m.group(1)), "moved": int(m.group(2)), "refused": int(m.group(3))}
+
+
+def _trace_rows(out: str) -> list[dict]:
+    import csv
+    import io
+    body = out.split("=== MODELBLASTER_XPURT_TRACE_BEGIN ===\n", 1)[1].split(
+        "=== MODELBLASTER_XPURT_TRACE_END ===", 1)[0]
+    return list(csv.DictReader(io.StringIO(body)))
+
+
+def test_dynamic_walker_moves_held_tasks_to_idle_cores(tmp_path):
+    """Every task is planned on hart 0; harts 1-3 have nothing. The static walker
+    runs all 8 ops one after another; the dynamic walker lets the idle harts take
+    the op0s whose inputs are ready, and dependencies still hold."""
+    d = dict(_entry(j, op, 0, 0.0 if op == 0 else 40.0 * (j + 1))
+             for j in range(N_JOBS) for op in range(2))
+    sched = {"dot_file": "synth.dot", "dispatches": d}
+    static = _build_custom(tmp_path, sched, N_JOBS, [], [], "static")
+    dyn = _build_custom(tmp_path, sched, N_JOBS, ["--dynamic-walker"], [], "dyn")
+
+    out_s, dt_s = _run(static)
+    out_d, dt_d = _run(dyn)
+    for out in (out_s, out_d):
+        r = _result(out)
+        assert r["done0"] == N_JOBS and r["done1"] == N_JOBS, r
+        assert r["violations"] == 0, "op1 ran before its op0"
+    st = _dyn_stats(out_d)
+    assert st["safety"] == 1.5 and st["moved"] >= 1, st
+    assert dt_d < dt_s * 0.8, f"no gain: static {dt_s:.3f}s dynamic {dt_d:.3f}s"
+    rows = _trace_rows(out_d)
+    moved = [r for r in rows if r["moved"] == "1"]
+    assert len(moved) == st["moved"]
+    assert all(r["hart"] == "0" and r["ran_on_hart"] in ("1", "2", "3") for r in moved), moved
+    assert "ran_on_hart" not in out_s, "static trace format must be unchanged"
+
+
+def test_dynamic_walker_safety_boundary_refuses_a_move_that_would_overrun(tmp_path):
+    """Hart 1's own next task is due at 50 ms. A held 40 ms task on hart 0 needs
+    1.5 x 40 = 60 ms > 50 ms, so hart 1 refuses it; at 1.0 (40 ms) it fits."""
+    d = dict([_entry(0, 0, 0, 0.0), _entry(1, 0, 0, 0.0), _entry(0, 1, 0, 40.0),
+              _entry(2, 0, 1, 50.0), _entry(1, 1, 0, 80.0), _entry(2, 1, 1, 90.0)])
+    sched = {"dot_file": "synth.dot", "dispatches": d}
+    safe = _build_custom(tmp_path, sched, 2, ["--dynamic-walker"], [], "safe")
+    loose = _build_custom(tmp_path, sched, 2, ["--dynamic-walker"],
+                          ["-DXPURT_SAFETY_BOUNDARY=1.0"], "loose")
+
+    out, _ = _run(safe)
+    st = _dyn_stats(out)
+    assert st["safety"] == 1.5 and st["moved"] == 0 and st["refused"] >= 1, st
+    assert _result(out)["violations"] == 0
+
+    out, _ = _run(loose)
+    st = _dyn_stats(out)
+    assert st["safety"] == 1.0 and st["moved"] == 1, st
+    moved = [r for r in _trace_rows(out) if r["moved"] == "1"]
+    assert [(r["name"], r["instance"], r["ran_on_hart"]) for r in moved] == [("a", "1", "1")], moved
+    assert _result(out)["violations"] == 0
+
+
+def test_dynamic_walker_needs_hart_mode():
+    sys.path.insert(0, str(ROOT.parent))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "gxm", ROOT / "pipeline" / "generate_xpurt_main.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    a = dict(networks=["n"], schedule_name="s", dispatch_table_header="s.h",
+             core_kinds=["rvv"], backends=["rvv"], pool_sizes=[0], n_instances={"n": 1})
+    with pytest.raises(ValueError):
+        mod._emit(**a, dynamic_walker=True)
+    assert mod._emit(**a, per_hart_workers=True, dynamic_walker=True) != \
+        mod._emit(**a, per_hart_workers=True)
