@@ -260,6 +260,11 @@ def test_default_output_unchanged_by_hart_option():
     assert mod._emit(**a, per_hart_workers=False) == base
     assert mod._emit(**a, per_hart_workers=True) != base
     assert "XPURT_MAX_WORKERS" not in base
+    # The hosted-Linux opt-ins change nothing unless asked for.
+    assert mod._emit(**a, warmup=False, placement=False) == base
+    for hart in (False, True):
+        assert "xpurt_warm" not in mod._emit(**a, per_hart_workers=hart)
+        assert "XPURT_PLACEMENT" not in mod._emit(**a, per_hart_workers=hart)
 
 
 def test_a_core_kind_without_a_backend_stops_the_run(tmp_path):
@@ -436,3 +441,64 @@ def test_an_impl_the_build_lacks_stops_the_run(tmp_path):
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
     assert r.returncode == 2, r.stdout[-2000:]
     assert "asks for impl 'npu'" in r.stdout
+
+
+def test_warmup_pass_and_placement_record(tmp_path):
+    """--warmup runs every entry twice (untimed pass, then the timed one) with
+    dependencies honoured in both; --placement prints one row per entry with
+    the cpu the kernel ran on (its pinned hart on Linux, -1 elsewhere)."""
+    w = tmp_path
+    pkg = w / "pkg"
+    pkg.mkdir()
+    os.symlink(ROOT, pkg / "modelblaster")
+    env = dict(os.environ, PYTHONPATH=str(pkg))
+    _write(w / "schedule.json", json.dumps(_schedule()))
+    _write(w / "registry.json", json.dumps(_registry()))
+    _write(w / "graph.json", json.dumps({"ops": [
+        {"dispatch_id": 0, "op": "synth_a", "name": "a"},
+        {"dispatch_id": 1, "op": "synth_b", "name": "b"}]}))
+    _write(w / "synth_model.h", _model_header())
+    _write(w / "synth_test_io.h",
+           "static const float model_synth_test_input[1] = { 0.0f };\n")
+    _write(w / "kernels_rvv.c", _kernels("rvv"))
+
+    def run(*a):
+        r = subprocess.run([sys.executable, "-m", *a], cwd=w, env=env,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"{a[0]} failed:\n{r.stdout}\n{r.stderr}"
+
+    run("modelblaster.pipeline.ingest_xpurt_schedule",
+        "--schedule", "schedule.json", "--registry", "registry.json",
+        "--ir", "synth:graph.json", "--out", str(w / "demo_table.c"),
+        "--name", "demo")
+    for mode in ("kind", "hart"):
+        run("modelblaster.pipeline.generate_xpurt_main",
+            "--schedule", "schedule.json", "--out", str(w / f"main_{mode}.c"),
+            "--name", "demo", "--dispatch-table-header", "demo_table.h",
+            "--core-kinds", "rvv", "--worker-granularity", mode,
+            "--warmup", "--placement")
+        exe = w / f"walker_{mode}"
+        cmd = [CC, "-O1", "-pthread", "-DMB_PLATFORM_POSIX", "-D_GNU_SOURCE",
+               f"-I{ROOT / 'runtime'}", f"-I{ROOT / 'runtime' / 'modelblaster_pool'}",
+               f"-I{w}", "-o", str(exe), f"main_{mode}.c", "demo_table.c",
+               "kernels_rvv.c",
+               str(ROOT / "runtime" / "modelblaster_pool" / "modelblaster_pool.c"),
+               str(ROOT / "runtime" / "mb_placement.c")]
+        r = subprocess.run(cmd, cwd=w, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-3000:]
+        out, _ = _run(exe)
+        res = _result(out)
+        assert res["done0"] == 2 * N_JOBS and res["done1"] == 2 * N_JOBS, res
+        assert res["violations"] == 0, "dependency broken in a pass"
+        assert "xpurt: warm-up pass on" in out
+        m = re.search(r"=== MODELBLASTER_XPURT_PLACEMENT_BEGIN ===\n(.*?)"
+                      r"=== MODELBLASTER_XPURT_PLACEMENT_END ===", out, re.S)
+        assert m, out[-1500:]
+        rows = [l.split(",") for l in m.group(1).strip().splitlines()[1:]]
+        assert len(rows) == 2 * N_JOBS
+        for row in rows:
+            hart, before, after = int(row[6]), int(row[9]), int(row[10])
+            if sys.platform.startswith("linux") and mode == "hart":
+                assert before == after == hart, row
+            else:
+                assert before >= -1 and after >= -1, row
