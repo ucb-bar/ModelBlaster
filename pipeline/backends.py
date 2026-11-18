@@ -275,11 +275,11 @@ IME_K3_A100 = Backend(
 # SpaceMiT K3 X100 IME (smt.vmadot int8, 4x8x4 tile at VLEN=256). X100 cores
 # (CPUs 0-7). Cloned from rvv_k3 (zvl256b, IHWOC conv weights, cross-compile
 # verify); the vmadot is emitted as `.insn r 0x2b, 3, 0x71`. Hand-written X100
-# kernels (k3-work TASK-014 conv2d_s8 and the TASK-013 maxpool as a K3-only
-# copy; TASK-015 measured both faster than rvv_k3 in yolov8_nano) live in
-# kernels/ime_k3_x100/ as ime_k3_x100_<op>_<algo>.c; every other op (linear_s8
-# included: our X100 linear lost to rvv on batch-1 layers) falls through to
-# rvv_k3, i.e. the shared rvv set. No `ime` alias: the
+# kernels (k3-work TASK-014 conv2d_s8, measured faster than rvv_k3 in
+# yolov8_nano by TASK-015) live in kernels/ime_k3_x100/ as
+# ime_k3_x100_<op>_<algo>.c; every other op (linear_s8 included: our X100
+# linear lost to rvv on batch-1 layers) falls through to rvv_k3: the K3 tuned
+# kernels in kernels/rvv_k3/ (TASK-017 simple layers), then the shared rvv set. No `ime` alias: the
 # K1 kernels in kernels/ime/ are not used on the K3. The conv kernel takes
 # build-time "MBX100TW" weight tiles (pipeline/k3_weight_tiles.py) or plain IHWOC.
 IME_K3_X100 = Backend(
