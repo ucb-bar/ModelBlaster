@@ -109,6 +109,22 @@
       },
       "enforced_by": "scripts/run_xpurt_k1.sh --staged-ir",
       "checkable_from": "workload spec"
+    },
+    "shareable_ops": {
+      "severity": "refuse",
+      "ops": [
+        "conv2d",
+        "conv2d_batchnorm2d_s8",
+        "conv2d_batchnorm2d_silu_s8",
+        "conv2d_s8",
+        "linear",
+        "linear_s8"
+      ],
+      "statement": "Only these ops can be spread over several cores; every other op runs on the first core of a multi-core group while the rest wait. A scheduler must not offer any other op more than one core.",
+      "why": "An op spreads only if ModelBlaster has a pool path for it (a parallel_<op> wrapper in pipeline/generate_skeleton.py). A multi-core profile of any other op measures the same single-core code, so a 'faster' wider width there is noise, not a gain (k3-work TASK-016).",
+      "derived_from": "pipeline/generate_skeleton.py::shareable_ops (pipeline/tests/test_conv_row_split.py keeps this list equal to it)",
+      "enforced_by": "xpu-rt/codegen_contract.py::apply_to_workload",
+      "checkable_from": "schedule (op kind in module_name)"
     }
   }
 }

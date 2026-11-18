@@ -161,3 +161,12 @@ def test_plans():
     # K1: the channel split, unchanged
     assert gs.row_split_convs(_ir(20, 8, 4), "rvv_x60", 1) == {}
     assert set(gs.shard_conv_weights(_ir(20, 8, 4), "rvv_x60", 1)) == {0}
+
+
+def test_shareable_ops_match_code():
+    """cores/codegen_contract.json's shareable_ops is what generate_skeleton
+    can actually spread over a pool; a new parallel_<op> must update both."""
+    import json
+    contract = json.loads((ROOT / "cores" / "codegen_contract.json").read_text())
+    assert contract["rules"]["shareable_ops"]["ops"] == gs.shareable_ops()
+    assert "conv2d_s8" in gs.shareable_ops() and "silu_s8" not in gs.shareable_ops()

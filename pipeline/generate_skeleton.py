@@ -2156,6 +2156,20 @@ def row_split_convs(
     return out
 
 
+#: Fused conv kinds with an output-channel-sharded pool entry point
+#: (parallel_conv2d_bn_s8_sharded / parallel_conv2d_bn_silu_s8_sharded).
+_SHARDED_FUSED_CONV_OPS = {"conv2d_batchnorm2d_s8", "conv2d_batchnorm2d_silu_s8"}
+
+
+def shareable_ops() -> list[str]:
+    """Ops a modelblaster_pool can spread over several cores: those with a
+    `parallel_<op>` pool path in this file. Exported as
+    cores/codegen_contract.json rules.shareable_ops (a test keeps the two
+    equal), and XPU-RT gives no other op a multi-core option: anything else
+    runs on the first core of its group while the rest wait."""
+    return sorted(_PARALLELIZED_OPS | _SHARDED_FUSED_CONV_OPS)
+
+
 def _shard_key(base_key: str, shard: int) -> str:
     return f"{base_key}{_SHARD_W_SUFFIX}{shard}"
 
