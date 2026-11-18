@@ -372,48 +372,53 @@ static const int8_t *xf1x_pad_nhwc(const int8_t *in, int IC, int IH, int IW, int
     return b;
 }
 
-/* IND: one pointer per (pixel, k), k up to the slab-rounded K (the extra k point at
- * zeros). Built once per (input buffer, shape) and kept; slots are claimed once
- * (0 free -> 1 building -> 2 ready) and never freed, so threads of a split layer share
- * one table; a call that finds the slot being built, no slot or no memory gets NULL and
+/* IND: one entry per (pixel, k), k up to the slab-rounded K: the tap's offset from the
+ * start of the input image ((ic*IH + ih)*IW + iw), or -1 for a padding tap and for the
+ * extra k (both read as zero). Offsets, not pointers, so a table depends only on the
+ * layer's shape: built once per shape and shared by every input buffer (the walker's
+ * per-instance buffer sets) and every row-split band of that shape (k3-work TASK-017;
+ * keyed by input pointer before, a walker build needed 300-1100 tables and ran out of
+ * the 128 slots). Slots are claimed once (0 free -> 1 building -> 2 ready) and never
+ * freed; a call that finds the slot being built, no slot or no memory gets NULL and
  * packs the IMP way instead. */
 #define XF1X_TABS 128
-typedef struct { int state; const int8_t *in; int key[10]; const int8_t **tab; } xf1x_tab_t;
+typedef struct { int state; int key[10]; const int32_t *tab; } xf1x_tab_t;
 static xf1x_tab_t xf1x_tabs[XF1X_TABS];
-static const int8_t xf1x_zeros[64] __attribute__((aligned(64)));
-static __attribute__((noinline)) const int8_t *const *xf1x_table(const int8_t *in, int IC, int IH, int IW,
+static __attribute__((noinline)) const int32_t *xf1x_table(int IC, int IH, int IW,
         int KH, int KW, int SH, int SW, int PH, int PW, int OH, int OW, int K, int Kp)
 {
     int key[10] = {IC, IH, IW, KH, KW, SH, SW, PH, PW, Kp};
-    size_t h = ((uintptr_t)in >> 4) * 0x9E3779B97F4A7C15ull >> 57;
+    uint64_t hk = 1469598103934665603ull;
+    for (int i = 0; i < 10; i++) hk = (hk ^ (uint32_t)key[i]) * 1099511628211ull;
+    size_t h = (size_t)(hk >> 57);
     for (int i = 0; i < XF1X_TABS; i++) {
         xf1x_tab_t *S = &xf1x_tabs[(h + (size_t)i) % XF1X_TABS];
         int st = __atomic_load_n(&S->state, __ATOMIC_ACQUIRE);
         if (st == 2) {
-            if (S->in == in && !memcmp(S->key, key, sizeof key)) return (const int8_t *const *)S->tab;
+            if (!memcmp(S->key, key, sizeof key)) return S->tab;
             continue;
         }
         if (st == 1) return NULL;
         int zero = 0;
         if (!__atomic_compare_exchange_n(&S->state, &zero, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { i--; continue; }
         size_t M = (size_t)OH * OW;
-        const int8_t **tab = malloc(sizeof(*tab) * M * (size_t)Kp);
+        int32_t *tab = malloc(sizeof(*tab) * M * (size_t)Kp);
         if (!tab) { __atomic_store_n(&S->state, 0, __ATOMIC_RELEASE); return NULL; }
         for (size_t m = 0; m < M; m++) {
             int oh = (int)(m / OW), ow = (int)(m % OW);
             for (int k = 0; k < Kp; k++) {
-                const int8_t *p = xf1x_zeros;
+                int32_t o = -1;
                 if (k < K) {
                     int ic = k / (KH * KW), rem = k % (KH * KW);
                     int ih = oh * SH - PH + rem / KW, iw = ow * SW - PW + rem % KW;
-                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) p = in + ((size_t)ic * IH + ih) * IW + iw;
+                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) o = (int32_t)(((size_t)ic * IH + ih) * IW + iw);
                 }
-                tab[m * Kp + k] = p;
+                tab[m * Kp + k] = o;
             }
         }
-        S->in = in; memcpy(S->key, key, sizeof key); S->tab = tab;
+        memcpy(S->key, key, sizeof key); S->tab = tab;
         __atomic_store_n(&S->state, 2, __ATOMIC_RELEASE);
-        return (const int8_t *const *)tab;
+        return tab;
     }
     return NULL;
 }
@@ -508,8 +513,8 @@ static inline __attribute__((always_inline)) void xf1x_core(const int path, cons
     for (int n = 0; n < N; n++) {
         const int8_t *in_n = input + (size_t)n * IC * IH * IW;
         int8_t *out = output + (size_t)n * OC * M;
-        const int8_t *const *tab = path == XF1X_IND
-            ? xf1x_table(in_n, IC, IH, IW, KH, KW, SH, SW, PH, PW, OH, OW, K, Kp) : NULL;
+        const int32_t *tab = path == XF1X_IND
+            ? xf1x_table(IC, IH, IW, KH, KW, SH, SW, PH, PW, OH, OW, K, Kp) : NULL;
         const int8_t *base_in = NULL;
         if (path == XF1X_NHWC) {
             base_in = xf1x_pad_nhwc(in_n, IC, IH, IW, PH, PW);
@@ -528,12 +533,20 @@ static inline __attribute__((always_inline)) void xf1x_core(const int path, cons
             if (path == XF1X_IND && tab) {
                 if (rows & 3) memset(packed_a, 0, (size_t)k_slabs * a_slab_stride);
                 for (int m = m_lo; m < m_hi; m++) {
-                    const int8_t *const *tp = tab + (size_t)m * Kp;
+                    const int32_t *tp = tab + (size_t)m * Kp;
                     int8_t *d = packed_a + (size_t)(m - m_lo) * 8u;
                     for (int ks = 0; ks < k_slabs; ks++) {
-                        const int8_t *const *t = tp + ks * 8;
+                        const int32_t *t = tp + ks * 8;
                         uint64_t v = 0;
-                        for (int q = 0; q < 8; q++) v |= (uint64_t)(uint8_t)*t[q] << (8 * q);
+                        /* scalar on purpose: GCC turns this 8-step loop into short
+                         * vectors with an indexed load, 2x slower (TASK-017 bench) */
+#pragma GCC unroll 8
+#pragma GCC novector
+                        for (int q = 0; q < 8; q++) {
+                            /* o < 0 (padding / extra k): read byte 0, mask it to zero */
+                            int32_t o = t[q], neg = o >> 31;
+                            v |= (uint64_t)((uint8_t)in_n[o & ~neg] & (uint8_t)~neg) << (8 * q);
+                        }
                         xf1x_sd8(d + (size_t)ks * a_slab_stride, v);
                     }
                 }
