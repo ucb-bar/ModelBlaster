@@ -46,13 +46,26 @@ def test_conv_weights_ihwoc_like_rvv_k3():
 
 @pytest.mark.parametrize("op,algo", [
     ("conv2d_s8", "x100_vmadot_4x4x8"),
-    ("maxpool2d_s8", "direct"),
 ])
 def test_curated_probe_finds_our_kernels(op, algo):
     path = kt.selected_kernel_path("ime_k3_x100", op)
     assert path is not None and path.endswith(f"ime_k3_x100_{op}_{algo}.c")
     src = open(path).read()
     assert f"/* algorithm: {algo} */" in src
+
+
+@pytest.mark.parametrize("op,algo", [
+    ("maxpool2d_s8", "direct"), ("silu_s8", "direct"), ("upsample_nearest_s8", "direct"),
+    ("elu_s8", "rvv_memo_lut_gather"), ("cat2_c1_s8", "direct"),
+])
+def test_x100_simple_layers_come_from_rvv_k3(op, algo):
+    # k3-work TASK-017: the K3 simple-layer kernels live in kernels/rvv_k3/ and reach
+    # ime_k3_x100 through its lineage (ime_k3_x100 -> rvv_k3 -> rvv); its own folder
+    # no longer has a maxpool.
+    assert kt.selected_kernel_path("ime_k3_x100", op) is None
+    path = kt.selected_kernel_path("rvv_k3", op)
+    assert path is not None and path.endswith(f"rvv_k3_{op}_{algo}.c")
+    assert f"/* algorithm: {algo} */" in open(path).read()
 
 
 def test_no_x100_linear():
