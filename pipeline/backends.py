@@ -398,8 +398,10 @@ IME = Backend(
     # The backend is `ime_x60` (matching the profile tree's rvv_x60 / scalar
     # convention, which is what the scheduler's combo_hw swap keys on) while
     # the kernels live in kernels/ime/ -- the alias is what bridges the two,
-    # exactly as rvv_x60 reaches kernels/rvv/.
-    curated_aliases=("ime", "rvv"),
+    # exactly as rvv_x60 reaches kernels/rvv/. "rvv_f16" last, as on rvv_x60:
+    # the X60 has zvfh, so fp16 ops get vector kernels instead of the scalar
+    # reference.
+    curated_aliases=("ime", "rvv", "rvv_f16"),
     # Same reasoning as rvv_x60: the host is x86 and no simulator models
     # smt.vmadot, so generation cross-compiles and the board settles numerics.
     verify_method=VERIFY_CROSS_COMPILE,
