@@ -113,7 +113,32 @@ _ALIAS = {
     "contiguous.default", "permute.default", "reshape.default",
     "flatten.using_ints", "split.Tensor", "expand_as.default",
     "clone.default",
+    # torch >= 2.15's export emits aten.alias for some identity views (ViNT, k3-work
+    # TASK-019): same data, same shape, so the same pass-through as clone.
+    "alias.default",
 }
+
+def _bias_safe_scales(w_scales, b, in_scale):
+    """Per-channel weight scales, raised for any channel whose int32 bias
+    b / (in_scale * w_scale) would not fit (k3-work TASK-019). That happens only for a
+    filter of all-zero or tiny weights (scale floor 1e-8/127) with a bias: its weights
+    still quantize to 0, and its bias now fits instead of overflowing (NumPy 2 raises,
+    NumPy 1 wrapped silently). Every other channel is unchanged."""
+    if b is None:
+        return w_scales
+    need = np.abs(b.detach().cpu().numpy().astype(np.float64)) / (float(in_scale) * float(2**31 - 1024))
+    return np.maximum(w_scales, need)
+
+
+class _ArgsView:
+    """An fx node seen with other args: a split's getitem emitted as the slice it is."""
+
+    def __init__(self, node, args):
+        self._node, self.args = node, args
+
+    def __getattr__(self, k):
+        return getattr(self._node, k)
+
 
 def _perm_preserves_order(perm, shape) -> bool:
     """True iff permuting `shape` by `perm` leaves the flat element order
@@ -728,6 +753,34 @@ class _ExportWalker:
                 "dtype": eff_dtype,
             }
 
+    @staticmethod
+    def _split_cat_source(n):
+        """The split source if `n` is cat(dim=0) of all pieces, in order, of one
+        split.Tensor along dim 1 of a batch-1 tensor (a reshape), else None."""
+        if _op_name(n) not in ("cat.default", "concat.default") or not n.args:
+            return None
+        pieces = n.args[0]
+        dim = n.args[1] if len(n.args) > 1 else n.kwargs.get("dim", 0)
+        if int(dim) != 0 or not isinstance(pieces, (list, tuple)) or not pieces:
+            return None
+        sp = None
+        for i, t in enumerate(pieces):
+            if not (isinstance(t, torch.fx.Node) and _op_name(t) == "<built-in function getitem>"
+                    and isinstance(t.args[0], torch.fx.Node)
+                    and _op_name(t.args[0]) == "split.Tensor" and int(t.args[1]) == i):
+                return None
+            if sp is None:
+                sp = t.args[0]
+            elif t.args[0] is not sp:
+                return None
+        src = sp.args[0]
+        sdim = int(sp.args[2]) if len(sp.args) > 2 else 0
+        val = sp.meta.get("val")
+        if (sdim != 1 or not isinstance(val, (list, tuple)) or len(pieces) != len(val)
+                or int(src.meta["val"].shape[0]) != 1):
+            return None
+        return src
+
     def _visit(self, n):
         # Skip structural nodes — those don't represent computation.
         # Placeholders are param/buffer/user_input declarations;
@@ -737,6 +790,35 @@ class _ExportWalker:
         # Hand-tagged dispatch on op kind. Keep cases short and
         # delegate complex emit to dedicated helpers.
         op_kind = _op_name(n)
+        # torch >= 2.15's export keeps torch.split as one split.Tensor node with a list
+        # value, read through getitem (k3-work TASK-019: ViNT's 6-frame observation).
+        # Each getitem is the slice [i*size, min((i+1)*size, extent)) along `dim`, so it
+        # is emitted as that slice; the split node itself emits nothing.
+        if op_kind == "split.Tensor" and isinstance(n.meta.get("val"), (list, tuple)):
+            return
+        # split along dim 1 of a batch-1 tensor, then cat of all its pieces in order along
+        # dim 0, is a reshape (1, k*C, ...) -> (k, C, ...): the same bytes in the same order
+        # (ViNT's 6-frame observation -> a batch of 6). The cat aliases the source and the
+        # pieces emit nothing.
+        src = self._split_cat_source(n)
+        if src is not None:
+            self._record_tensor(n.name)
+            self.name_map[n.name] = self._resolve_input(src)
+            return
+        if (op_kind == "<built-in function getitem>" and n.users
+                and all(self._split_cat_source(u) is not None for u in n.users)):
+            self._record_tensor(n.name)
+            return
+        if (op_kind == "<built-in function getitem>" and n.args
+                and isinstance(n.args[0], torch.fx.Node)
+                and _op_name(n.args[0]) == "split.Tensor"):
+            sp = n.args[0]
+            src, size = sp.args[0], int(sp.args[1])
+            dim = int(sp.args[2]) if len(sp.args) > 2 else 0
+            extent = int(src.meta["val"].shape[dim])
+            start = int(n.args[1]) * size
+            self._emit_slice_c(_ArgsView(n, (src, dim, start, min(start + size, extent), 1)))
+            return
         cls = _classify(op_kind)
         if cls in ("noop", "tail", "alias"):
             # Special case: slice.Tensor along an NCHW channel dim
@@ -792,7 +874,14 @@ class _ExportWalker:
                 # is (1,3,1,1).expand_as((2,3,256,256)), and the cat that
                 # consumes it then read 393216 elements out of a
                 # 3-element buffer.
-                self._materialize_or_alias(n, src_name)
+                if cls == "tail":
+                    # The output tail (cumsum / F.normalize) is elided from the IR and
+                    # applied after the run; nothing in the IR reads it, so only its name
+                    # must resolve to the pre-tail tensor, whatever its size (ViNT's norm,
+                    # (1,5,2) -> (1,5,1); k3-work TASK-019).
+                    self.name_map[n.name] = src_name
+                else:
+                    self._materialize_or_alias(n, src_name)
             return
         if cls == "fold":
             # Walker fuses these into the preceding op; nothing emitted.
@@ -1545,7 +1634,7 @@ class _ExportWalker:
             # to each OC.
             w_np = w.detach().cpu().numpy()
             per_oc_max = np.abs(w_np).reshape(OC, -1).max(axis=1)
-            w_scales_per_oc = np.maximum(per_oc_max, 1e-8) / 127.0
+            w_scales_per_oc = _bias_safe_scales(np.maximum(per_oc_max, 1e-8) / 127.0, b, in_scale)
             w_q = np.empty_like(w_np, dtype=np.int8)
             for oc in range(OC):
                 w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)
@@ -1686,7 +1775,7 @@ class _ExportWalker:
         if self.per_channel:
             w_np = w.detach().cpu().numpy()
             per_oc_max = np.abs(w_np).reshape(OF, -1).max(axis=1)
-            w_scales_per_oc = np.maximum(per_oc_max, 1e-8) / 127.0
+            w_scales_per_oc = _bias_safe_scales(np.maximum(per_oc_max, 1e-8) / 127.0, b, in_scale)
             w_q = np.empty_like(w_np, dtype=np.int8)
             for oc in range(OF):
                 w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)
@@ -2106,6 +2195,15 @@ class _ExportWalker:
         """Emit permute4_s8 for a reordering transpose/permute."""
         q = self._quant_for(n)
         rank = len(in_shape)
+        if rank > 4:
+            # Unit axes move no data: drop them (keeping the order of the rest) until the
+            # permutation fits four axes. torch >= 2.15's attention in-projection transposes
+            # a (1, L, N, 3, E) tensor (k3-work TASK-019, ViNT).
+            keep = [ax for ax in range(rank) if int(in_shape[ax]) > 1]
+            if len(keep) <= 4:
+                in_shape = [int(in_shape[ax]) for ax in keep]
+                perm = [keep.index(int(ax)) for ax in perm if int(ax) in keep]
+                rank = len(in_shape)
         if rank > 4:
             raise NotImplementedError(
                 f"{_op_name(n)} at {n.name}: rank {rank} > 4; permute4_s8 "
