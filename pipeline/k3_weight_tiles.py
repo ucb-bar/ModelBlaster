@@ -33,7 +33,8 @@ import numpy as np
 
 #: backend -> {op: tile family}. Every other backend: no tiles.
 TILE_OPS: dict[str, dict[str, str]] = {
-    "ime_k3_x100": {"conv2d_s8": "x100_conv"},
+    # conv2d_s8_pc: the per-channel X100 conv reads the same tiles (k3-work TASK-019)
+    "ime_k3_x100": {"conv2d_s8": "x100_conv", "conv2d_s8_pc": "x100_conv"},
     "ime_k3_a100": {"conv2d_s8": "a100_conv"},
 }
 TILE_MAGIC = {"x100_conv": b"MBX100TW", "a100_conv": b"MBIME2TW"}
