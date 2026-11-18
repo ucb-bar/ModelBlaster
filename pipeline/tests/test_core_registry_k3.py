@@ -57,7 +57,8 @@ def test_rvv_k3_backend_matches_x60():
     from modelblaster.pipeline.backends import BACKENDS
     k3, x60 = BACKENDS["rvv_k3"], BACKENDS["rvv_x60"]
     assert k3.kernel_cflags == x60.kernel_cflags
-    assert k3.curated_aliases == ("rvv",)
+    # Both cores have zvfh, so both inherit kernels/rvv then kernels/rvv_f16.
+    assert k3.curated_aliases == x60.curated_aliases == ("rvv", "rvv_f16")
     assert k3.verify_method == x60.verify_method
 
 

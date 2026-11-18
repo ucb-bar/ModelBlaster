@@ -180,8 +180,10 @@ RVV_X60 = Backend(
     spike_args=("--isa=rv64gcv_zicntr",),
     optimization_guide="optimization_guide_rvv.md",
     # Same ISA family as rvv, just with VLEN pinned -- so it inherits every
-    # curated kernel in kernels/rvv/.
-    curated_aliases=("rvv",),
+    # curated kernel in kernels/rvv/. The X60 also has zvfh, so the fp16
+    # kernels in kernels/rvv_f16/ apply; they come second, so an op with a
+    # kernels/rvv/ kernel keeps it and only fp16 ops gain a vector kernel.
+    curated_aliases=("rvv", "rvv_f16"),
     # NOT host_ctypes. The host is x86 and cannot compile `vint32m4_t` or
     # `__riscv_vle8_v_i8m1`, so host_ctypes verify fails on every candidate
     # with "unknown type name" -- which the generator reads as the LLM being
