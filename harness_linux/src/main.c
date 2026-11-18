@@ -175,6 +175,13 @@ int main(void)
             return 3;
         }
         printf("modelblaster harness: pool of %ld thread(s)\n", threads);
+        if (n_pinned > 0 && threads == n_pinned) {
+            /* Where the workers were asked to run; the slice trace below
+             * (MODELBLASTER_POOL_TRACE=1) shows where the work ran. */
+            printf("modelblaster harness: pool cpus:");
+            for (int i = 0; i < n_pinned; i++) printf(" %d", cpus[i]);
+            printf(" (master on %d)\n", cpus[0]);
+        }
     } else {
         printf("modelblaster harness: no pool (1 core)\n");
     }
@@ -208,6 +215,28 @@ int main(void)
             if (v > 0) iters = v;
         }
     }
+
+#ifdef MODELBLASTER_USE_POOL
+    /* Placement audit (opt-in, MODELBLASTER_POOL_TRACE=1): arm the pool's
+     * slice trace so every slice of every split layer records the cpu it
+     * really ran on (sched_getcpu). Off by default: no allocation. */
+    struct modelblaster_pool_shard *mb_audit = NULL;
+    unsigned mb_audit_cap = 0;
+    {
+        const char *e = getenv("MODELBLASTER_POOL_TRACE");
+        if (pool && e && *e && *e != '0') {
+            mb_audit_cap = 1u << 20;
+            mb_audit = calloc(mb_audit_cap, sizeof *mb_audit);
+            if (mb_audit == NULL) {
+                fprintf(stderr, "modelblaster harness: pool trace buffer "
+                                "allocation failed\n");
+                return 3;
+            }
+            modelblaster_pool_trace_arm((modelblaster_pool_t)pool, mb_audit,
+                                        mb_audit_cap);
+        }
+    }
+#endif
 
     for (long it = 0; it < iters; it++) {
         run_model(model_test_input, model_output, pool);
@@ -286,6 +315,44 @@ int main(void)
     printf("=== MODELBLASTER_WALL_CYCLES === %lu\n", model_wall_cycles());
 
 #ifdef MODELBLASTER_USE_POOL
+    if (pool && n_pinned > 0 && threads == n_pinned)
+        printf("modelblaster harness: master finished on cpu %d\n", sched_getcpu());
+    if (mb_audit) {
+        /* One line per worker: the cpus its slices ran on and how many.
+         * Worker w was placed on cpus[w] (master = worker 0). FAIL if any
+         * slice ran elsewhere or the buffer filled up. A worker with no
+         * slice is reported (idle_workers), not failed. */
+        unsigned n = modelblaster_pool_trace_count((modelblaster_pool_t)pool);
+        int pinned = n_pinned > 0 && threads == n_pinned;
+        int ok = n < mb_audit_cap && pinned;
+        int idle = 0;
+        printf("=== MODELBLASTER_POOL_AUDIT_BEGIN === slices=%u cap=%u workers=%ld\n",
+               n, mb_audit_cap, threads);
+        for (long w = 0; w < threads; w++) {
+            unsigned cnt = 0, off = 0;
+            int seen[MAX_CPUS + 64];
+            int nseen = 0;
+            for (unsigned i = 0; i < n; i++) {
+                if (mb_audit[i].wid != (int)w) continue;
+                cnt++;
+                int h = mb_audit[i].hart, dup = 0;
+                if (pinned && h != cpus[w]) off++;
+                for (int k = 0; k < nseen; k++) dup |= seen[k] == h;
+                if (!dup && nseen < (int)(sizeof seen / sizeof seen[0]))
+                    seen[nseen++] = h;
+            }
+            printf("worker %ld expected_cpu %d slices %u off_cpu %u cpus", w,
+                   pinned ? cpus[w] : -1, cnt, off);
+            for (int k = 0; k < nseen; k++) printf(" %d", seen[k]);
+            printf("\n");
+            if (off != 0) ok = 0;
+            if (cnt == 0) idle++;
+        }
+        printf("=== MODELBLASTER_POOL_AUDIT_END === %s idle_workers=%d\n",
+               ok ? "PASS" : "FAIL", idle);
+        modelblaster_pool_trace_arm((modelblaster_pool_t)pool, NULL, 0);
+        free(mb_audit);
+    }
     if (pool)
         modelblaster_pool_destroy((modelblaster_pool_t)pool);
 #endif

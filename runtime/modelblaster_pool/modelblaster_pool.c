@@ -24,6 +24,11 @@
  * them in destroy).
  */
 
+/* sched_getcpu() for the opt-in slice trace (hosted Linux only). */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 #include "modelblaster_pool.h"
 
 #include <pthread.h>
@@ -63,6 +68,13 @@ struct modelblaster_pool_state {
 	size_t range;
 	int n_active_slices;    /* may be < n_workers if range < n_workers */
 
+	/* Per-slice trace (opt-in, off unless armed; see
+	 * modelblaster_pool_trace_arm). */
+	struct modelblaster_pool_shard *tr_buf;
+	unsigned                        tr_cap;
+	unsigned                        tr_n;    /* appended via __atomic_fetch_add */
+	unsigned long                   tr_call; /* parallelize_1d invocation counter */
+
 	/* Per-helper state. Index 0 is unused (= master); index w in
 	 * [1..n_workers-1] is the w'th helper. Sized for the max so we
 	 * can place the structs in a single allocation. */
@@ -88,6 +100,31 @@ struct modelblaster_pool_worker_arg {
 	int wid;
 	int hart;   /* CPU this helper must place itself on (Linux path) */
 };
+
+/* Record one executed slice (only while a trace is armed). Lock-free: reserve
+ * a slot, then fill it. Slots past the buffer are dropped rather than wrapped,
+ * so a trace is a prefix of the run, never a mixture of two. */
+static inline void mb_pool_trace_slice(struct modelblaster_pool_state *p, int wid,
+				       unsigned long long t0, unsigned long long t1,
+				       size_t i0, size_t i1)
+{
+	unsigned slot = __atomic_fetch_add(&p->tr_n, 1u, __ATOMIC_RELAXED);
+	if (slot >= p->tr_cap) {
+		return;
+	}
+	struct modelblaster_pool_shard *r = &p->tr_buf[slot];
+	r->t0 = t0;
+	r->t1 = t1;
+#if MB_PLACEMENT_LINUX
+	r->hart = sched_getcpu();
+#else
+	r->hart = -1;
+#endif
+	r->wid = wid;
+	r->call = p->tr_call;
+	r->i0 = (unsigned long)i0;
+	r->i1 = (unsigned long)i1;
+}
 
 static void *modelblaster_pool_worker_fn(void *arg_)
 {
@@ -131,8 +168,14 @@ static void *modelblaster_pool_worker_fn(void *arg_)
 			size_t s = (size_t)wid * per +
 				   (size_t)(wid < (int)rem ? wid : (int)rem);
 			size_t e = s + per + (wid < (int)rem ? 1 : 0);
+			int tr = p->tr_buf != NULL && p->tr_cap != 0;
+			unsigned long long t0 = tr ? (unsigned long long)k_cycle_get_64() : 0;
 			for (size_t i = s; i < e; i++) {
 				p->fn(p->ctx, i);
+			}
+			if (tr) {
+				mb_pool_trace_slice(p, wid, t0,
+						    (unsigned long long)k_cycle_get_64(), s, e);
 			}
 		}
 
@@ -306,6 +349,7 @@ void modelblaster_pool_parallelize_1d(modelblaster_pool_t pool,
 	/* Publish the job. Plain stores: the sem-give below is the
 	 * happens-before edge and forces these to be visible to helpers
 	 * before they wake. */
+	pool->tr_call++;   /* one invocation = one op's fanout; groups a trace's slices */
 	pool->fn = fn;
 	pool->ctx = ctx;
 	pool->range = range;
@@ -322,13 +366,47 @@ void modelblaster_pool_parallelize_1d(modelblaster_pool_t pool,
 		size_t rem = range % (size_t)n_slices;
 		size_t s = 0;
 		size_t e = per + (0 < (int)rem ? 1 : 0);
+		int tr = pool->tr_buf != NULL && pool->tr_cap != 0;
+		unsigned long long t0 = tr ? (unsigned long long)k_cycle_get_64() : 0;
 		for (size_t i = s; i < e; i++) {
 			fn(ctx, i);
+		}
+		if (tr) {   /* the master's slice too: a trace covers every cpu the op used */
+			mb_pool_trace_slice(pool, 0, t0,
+					    (unsigned long long)k_cycle_get_64(), s, e);
 		}
 	}
 
 	/* Gather the helpers. */
 	for (int w = 1; w < n_slices; w++) {
 		k_sem_take(&pool->done[w], K_FOREVER);
+	}
+}
+
+/* ---- per-slice trace (harness_linux placement audit, MODELBLASTER_POOL_TRACE) ---- */
+void modelblaster_pool_trace_arm(modelblaster_pool_t pool,
+				 struct modelblaster_pool_shard *buf, unsigned n)
+{
+	if (pool == NULL) {
+		return;
+	}
+	pool->tr_buf = (n == 0) ? NULL : buf;
+	pool->tr_cap = (buf == NULL) ? 0u : n;
+	__atomic_store_n(&pool->tr_n, 0u, __ATOMIC_RELAXED);
+}
+
+unsigned modelblaster_pool_trace_count(modelblaster_pool_t pool)
+{
+	if (pool == NULL || pool->tr_buf == NULL) {
+		return 0u;
+	}
+	unsigned n = __atomic_load_n(&pool->tr_n, __ATOMIC_RELAXED);
+	return (n > pool->tr_cap) ? pool->tr_cap : n;
+}
+
+void modelblaster_pool_trace_reset(modelblaster_pool_t pool)
+{
+	if (pool != NULL) {
+		__atomic_store_n(&pool->tr_n, 0u, __ATOMIC_RELAXED);
 	}
 }
