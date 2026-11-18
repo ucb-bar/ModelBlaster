@@ -208,9 +208,16 @@ def build(tmp_path_factory):
     return exes
 
 
-def _run(exe: Path) -> tuple[str, float]:
+#: These tests count kernel calls and time the run, so they start cold: the
+#: walker's warm start (on by default on Linux) adds one untimed frame of
+#: instance 0, which test_warm_start_runs_instance_zero_once_more checks.
+COLD = dict(os.environ, MB_XPURT_WARM="0")
+
+
+def _run(exe: Path, env=None) -> tuple[str, float]:
     t0 = time.monotonic()
-    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60,
+                       env=env or COLD)
     dt = time.monotonic() - t0
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
     return r.stdout, dt
@@ -231,6 +238,19 @@ def test_kind_mode_is_serial_and_correct(build):
     assert "worker[0] kind=rvv" in out and "worker[1]" not in out
     assert "=== MODELBLASTER_OUTPUT_BEGIN [synth] ===" in out
     assert dt >= 2 * N_JOBS * OP_US / 1e6 * 0.9
+
+
+def test_warm_start_runs_instance_zero_once_more(build):
+    """Default on Linux: one untimed frame of instance 0 before t=0, in
+    dependency order, then the schedule itself."""
+    for mode in ("kind", "hart"):
+        out, _ = _run(build[mode], env=dict(os.environ))
+        r = _result(out)
+        assert r["done0"] == N_JOBS + 1 and r["done1"] == N_JOBS + 1, (mode, r)
+        assert r["violations"] == 0, (mode, r)
+        assert "xpurt: warm start:" in out, mode
+    out, _ = _run(build["hart"])
+    assert "xpurt: cold start" in out
 
 
 def test_hart_mode_runs_harts_concurrently_and_correct(build):
@@ -350,7 +370,7 @@ def test_hart_mode_worker_on_an_ai_cpu_registers_its_own_tid(tmp_path):
     reg = w / "set_ai_thread"
     reg.write_text("")
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60,
-                       env=dict(os.environ, MODELBLASTER_AI_THREAD_PATH=str(reg)))
+                       env=dict(COLD, MODELBLASTER_AI_THREAD_PATH=str(reg)))
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
     res = _result(r.stdout)
     assert res["done0"] == N_JOBS and res["done1"] == N_JOBS and res["violations"] == 0
@@ -424,7 +444,7 @@ def test_one_core_runs_the_impl_each_dispatch_asks_for(tmp_path):
     op1 for `rvv`, and each must run the backend --impl-backends maps it to."""
     exe = _build_impl_walker(tmp_path, {0: "ime", 1: "rvv"},
                              "rvv:ime=rvv_mac,rvv:rvv=rvv_vec")
-    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60, env=COLD)
     assert r.returncode == 0, r.stdout[-2000:]
     ran = re.findall(r"^RAN (\w+) (\d)$", r.stdout, re.M)
     assert sorted(ran) == sorted([("rvv_mac", "0")] * N_JOBS + [("rvv_vec", "1")] * N_JOBS), ran
