@@ -4,9 +4,13 @@ TASK-016 gave conv2d_s8 a row split over a modelblaster_pool; every simple layer
 between the convs (SiLU, add, maxpool, upsample, concat, ELU, batchnorm, ...) still
 ran on the first core of its group while the others waited. This module emits a
 `mbp_<op>_<mid>(pool, <the kernel's own arguments>)` wrapper per op for model.c.
-generate_skeleton routes a K3 backend's call through it; the pool's thread count
-at run time is the width (as for parallel_linear_s8), and a NULL or one-thread pool,
-or a build without MODELBLASTER_USE_POOL, makes the plain kernel call.
+generate_skeleton routes a K3 backend's call through it when the layer was given a
+width at codegen (its `shard_factor`, set by schedule_shards from the schedule, else
+MB_SHARD_FACTOR), as for the conv row split; the pool's thread count at run time is
+the width, and a NULL or one-thread pool, or a build without MODELBLASTER_USE_POOL,
+makes the plain kernel call. Measured (TASK-017): with the K3 kernels most simple
+layers take 1-25 us, less than the pool's 14-41 us fork-join, so only some layers
+gain; the 10% rule in XPU-RT decides which.
 
 How each op is cut, always on the OUTPUT bytes and always at absolute 64-byte line
 boundaries (`mbp_cut`), so no two cores ever write the same cache line:

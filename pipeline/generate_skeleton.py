@@ -2608,6 +2608,7 @@ def emit_model(ir: dict[str, Any], out_dir: str,
     tile_w_plan = split_conv_tile_weights(ir, backend)
     # K3 simple-layer pool paths (pipeline/k3_pool_ops.py); none on other backends.
     k3_pool = _k3_pool_ops.enabled(backend)
+    k3_pool_factor = shard_factor()
     k3_pool_used: set[str] = set()
     # Intra-op OC shards with pre-packed per-shard weights. Empty unless
     # MB_SHARD_FACTOR > 1 AND the backend repacks conv weights; see
@@ -4921,10 +4922,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_{op['op']}(", f"kernel_{op['op']}{_ksfx}_{mid}(", 1
             )
         # K3 simple layers: through their pool wrapper (pipeline/k3_pool_ops.py),
-        # which splits over the dispatch's pool and calls the same kernel. Graph-split
-        # tiles keep the plain call.
+        # which splits over the dispatch's pool and calls the same kernel -- only
+        # when the layer was given a width (its shard_factor from schedule_shards,
+        # else MB_SHARD_FACTOR, as for the conv row split). Without one the call
+        # stays plain, so a walker whose every dispatch gets its kind's whole pool
+        # does not split them. Graph-split tiles keep the plain call.
         if (k3_pool and not _ksfx and op["op"] in _k3_pool_ops.OPS
-                and not (op.get("split_from") or {})):
+                and not (op.get("split_from") or {})
+                and int(op.get("shard_factor") or k3_pool_factor) > 1):
             call = call.replace(f"kernel_{op['op']}_{mid}(", f"mbp_{op['op']}_{mid}(pool, ", 1)
             k3_pool_used.add(op["op"])
         # dispatch_id comes from the IR (assigned by extract_graph's

@@ -59,5 +59,27 @@ class ScheduleShardTests(unittest.TestCase):
         self.assertEqual(out["ops"][0]["shard_factor"], 4)
 
 
+    def test_k3_simple_layer_gets_its_scheduled_width(self):
+        # k3-work TASK-017: generate_skeleton splits a simple layer only where it has one
+        ir = {"name": "dronet", "ops": [
+            {"dispatch_id": 0, "op": "add_s8", "shape": {"n": 6272}},
+            {"dispatch_id": 1, "op": "silu_s8", "shape": {"n": 64}},
+        ]}
+        sched = _schedule([4, 4])
+        for e in sched["dispatches"].values():      # dispatch 1 stays on one core
+            if e["id"] == 1:
+                e["hardware_target"] = "CPU_P#0"
+        out, applied = apply_schedule_shards(ir, sched, "dronet", ("ime_k3_x100", "rvv_k3"))
+        self.assertEqual(out["ops"][0]["shard_factor"], 4)
+        self.assertNotIn("shard_factor", out["ops"][1])
+        self.assertEqual([x["dispatch_id"] for x in applied], [0])
+
+    def test_simple_layer_on_several_cores_needs_a_k3_backend(self):
+        ir = {"name": "dronet", "ops": [{"dispatch_id": 0, "op": "add_s8", "shape": {"n": 64}},
+                                        {"dispatch_id": 1, "op": "relu_s8", "shape": {"n": 64}}]}
+        with self.assertRaisesRegex(ValueError, "pool path"):
+            apply_schedule_shards(ir, _schedule([2]), "dronet", ("rvv_x60",))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,22 @@ _PACKED_WEIGHT_SHARD_OPS = {
 _MARKER = "_xpurt_schedule_shard_factor"
 
 
+def _simple_pool_ops() -> frozenset:
+    try:
+        from . import k3_pool_ops
+    except ImportError:   # run as a script
+        from modelblaster.pipeline import k3_pool_ops
+    return k3_pool_ops.OPS
+
+
+def _k3_pool_backend(backend: str) -> bool:
+    try:
+        from . import k3_pool_ops
+    except ImportError:   # run as a script
+        from modelblaster.pipeline import k3_pool_ops
+    return k3_pool_ops.enabled(backend)
+
+
 def _is_instance(job_name: str, network: str) -> bool:
     if job_name == network:
         return True
@@ -59,7 +75,9 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
     All periodic instances of one dispatch must choose one width: generated
     weight layout is per dispatch, not per invocation.  Linear operations do
     not need annotations because their row-major weights can be sliced at
-    runtime using the exact entry pool width.
+    runtime using the exact entry pool width.  The K3 simple layers
+    (k3_pool_ops.OPS) get their width too: generate_skeleton routes them
+    through their pool wrapper only when they carry one.
     """
     out = copy.deepcopy(ir)
     widths: dict[int, set[int]] = {}
@@ -86,7 +104,25 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
         if op.pop(_MARKER, False):
             op.pop("shard_factor", None)
         did = op.get("dispatch_id")
-        if did is None or op.get("op") not in _PACKED_WEIGHT_SHARD_OPS:
+        if did is None:
+            continue
+        if op.get("op") in _simple_pool_ops():
+            # k3-work TASK-017: a simple layer is split over its pool only where
+            # its dispatch carries a width (generate_skeleton's mbp_ wrappers).
+            width = next(iter(widths.get(int(did), {1})))
+            if width <= 1:
+                continue
+            if not any(_k3_pool_backend(b) for b in backends):
+                raise ValueError(
+                    f"{network} dispatch {did} ({op.get('op')}) is scheduled on "
+                    f"{width} cores, but none of the backends {list(backends)} has "
+                    "its pool path (K3 backends only; not buildable)")
+            op["shard_factor"] = width
+            op[_MARKER] = True
+            applied.append({"dispatch_id": int(did), "op": op["op"],
+                            "oc": 0, "n_shards": width, "axis": "output bytes"})
+            continue
+        if op.get("op") not in _PACKED_WEIGHT_SHARD_OPS:
             continue
         width = next(iter(widths.get(int(did), {1})))
         if width <= 1:

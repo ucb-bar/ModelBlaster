@@ -1,6 +1,7 @@
 """K3 simple-layer pool paths (pipeline/k3_pool_ops.py, k3-work TASK-017).
 
-* Only the K3 backends get them; K1 and every other backend keep the plain call.
+* Only the K3 backends get them, and only for layers given a width at codegen
+  (shard_factor, else MB_SHARD_FACTOR); K1 and every other backend keep the plain call.
 * Each `mbp_<op>` wrapper, compiled on the host with the real modelblaster_pool and
   scalar kernels, gives exactly the serial kernel's output at widths 1/2/3/4/8, for
   network shapes and odd ones (lengths that are not multiples of 64 or of the width,
@@ -71,7 +72,8 @@ def _mini_ir():
 
 @pytest.mark.parametrize("backend", ["ime_k3_x100", "rvv_k3", "rvv_k3_a100", "ime_k3_a100",
                                      "rvv_x60", "ime_x60"])
-def test_codegen_routes_k3_only(tmp_path, backend):
+def test_codegen_routes_k3_only(tmp_path, monkeypatch, backend):
+    monkeypatch.setenv("MB_SHARD_FACTOR", "4")
     gs.emit_model(_mini_ir(), str(tmp_path), platform="linux", backend=backend)
     src = (tmp_path / "model.c").read_text()
     ops = ["silu_s8", "add_s8", "maxpool2d_s8", "upsample_nearest_s8", "cat2_c1_s8", "batchnorm2d_s8",
@@ -84,6 +86,23 @@ def test_codegen_routes_k3_only(tmp_path, backend):
         assert "mbp_" not in src
         for op in ops:
             assert f"kernel_{op}_m(" in src, op
+
+
+def test_codegen_splits_only_layers_given_a_width(tmp_path, monkeypatch):
+    # No MB_SHARD_FACTOR and no shard_factor: plain calls even on a K3 backend, so a
+    # walker that hands every dispatch its kind's whole pool does not split them.
+    monkeypatch.delenv("MB_SHARD_FACTOR", raising=False)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    gs.emit_model(_mini_ir(), str(tmp_path / "a"), platform="linux", backend="ime_k3_a100")
+    assert "mbp_" not in (tmp_path / "a" / "model.c").read_text()
+    # A schedule-given width on one dispatch (schedule_shards' shard_factor): only it.
+    ir = _mini_ir()
+    ir["ops"][0]["shard_factor"] = 2           # the silu
+    gs.emit_model(ir, str(tmp_path / "b"), platform="linux", backend="ime_k3_a100")
+    src = (tmp_path / "b" / "model.c").read_text()
+    assert "mbp_silu_s8_m(s->pool, " in src and "kernel_add_s8_m(" in src
+    assert "mbp_add_s8" not in src
 
 
 REF = r"""
