@@ -42,7 +42,6 @@ TILE_LABEL = {"x100_conv": "X100 conv", "a100_conv": "A100 conv"}
 HEADER_BYTES = 64
 #: Written next to weights.c; generate_kernels refuses a kernel that cannot read it.
 WEIGHT_LAYOUTS_JSON = "weight_layouts.json"
-_SHARD_MARKER = "_xpurt_schedule_shard_factor"
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -79,9 +78,23 @@ def _conv_weight(op: dict[str, Any]) -> Optional[str]:
     return None
 
 
+#: Shard arrays of an output-channel-split conv: "<weight>.shard_<t>"
+#: (generate_skeleton._shard_key).
+_SHARD_SUFFIX = ".shard_"
+
+
 def tile_plan(ir: Optional[dict[str, Any]], backend: Optional[str],
-              exclude_ids: frozenset = frozenset()) -> dict[str, tuple[str, str, int, int]]:
-    """`{weight: (op, family, rows, K)}` for the weights this build tiles."""
+              exclude_ids: frozenset = frozenset(),
+              weights: Optional[dict[str, np.ndarray]] = None) -> dict[str, tuple[str, str, int, int]]:
+    """`{weight: (op, family, rows, K)}` for the weights this build tiles.
+
+    `exclude_ids` are the convs split by output channels (shard_conv_weights):
+    their parent weight is replaced by one array per shard. With `weights`
+    given, those shard arrays are tiled instead (one tile set per shard, rows =
+    the shard's channels; k3-work TASK-016: 1.09-1.31x on the X100's
+    channel-split layers). A conv split by output rows keeps its full weight
+    and is tiled like an unsplit one. MODELBLASTER_K3_SHARD_TILES=0 leaves
+    shard arrays plain (IHWOC)."""
     tile_ops = TILE_OPS.get(backend or "")
     if not tile_ops or ir is None or os.environ.get("MODELBLASTER_IME2_TILES", "1") == "0":
         return {}
@@ -93,8 +106,7 @@ def tile_plan(ir: Optional[dict[str, Any]], backend: Optional[str],
     plan: dict[str, tuple[str, str, int, int]] = {}
     for op in ops:
         fam = tile_ops.get(op.get("op"))
-        if (fam is None or op.get("split_from") or op.get("dispatch_id") in exclude_ids
-                or int(op.get(_SHARD_MARKER) or 1) > 1 or int(op.get("shard_factor") or 1) > 1):
+        if fam is None or op.get("split_from"):
             continue
         quant = op.get("quant") or {}
         if int(quant.get("input_offset", 0)) or int(quant.get("filter_offset", 0)):
@@ -105,6 +117,15 @@ def tile_plan(ir: Optional[dict[str, Any]], backend: Optional[str],
         if not w or readers.get(w) != 1 or rows * k < 16:
             continue
         if not _kernel_reads(backend, op["op"], TILE_MAGIC[fam]):
+            continue
+        if op.get("dispatch_id") in exclude_ids:
+            if weights is None or os.environ.get("MODELBLASTER_K3_SHARD_TILES", "1") == "0":
+                continue
+            t = 0
+            while f"{w}{_SHARD_SUFFIX}{t}" in weights:
+                sk = f"{w}{_SHARD_SUFFIX}{t}"
+                plan[sk] = (op["op"], fam, int(weights[sk].shape[0]), k)
+                t += 1
             continue
         plan[w] = (op["op"], fam, rows, k)
     return plan
@@ -134,7 +155,7 @@ def pack_weights(ir: Optional[dict[str, Any]], backend: Optional[str],
                  weights: dict[str, np.ndarray], out_dir: str,
                  exclude_ids: frozenset = frozenset()) -> dict[str, tuple[np.ndarray, str]]:
     """`{weight: (tiled array, comment)}`; writes or clears weight_layouts.json."""
-    plan = tile_plan(ir, backend, exclude_ids)
+    plan = tile_plan(ir, backend, exclude_ids, weights)
     path = os.path.join(out_dir, WEIGHT_LAYOUTS_JSON)
     if not plan:
         if os.path.exists(path):

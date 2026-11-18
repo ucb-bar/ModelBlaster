@@ -108,7 +108,7 @@ def _ir():
     return {"name": "m", "ops": [
         _conv(0, "c.w"),                                                  # tiled
         _conv(1, "split.w", split_from={"axis": "OC", "tile": 0}),        # split: plain
-        _conv(2, "sched.w", _xpurt_schedule_shard_factor=4),              # composite: plain
+        _conv(2, "sched.w", _xpurt_schedule_shard_factor=4),              # composite: tiled unless OC-sharded
         _conv(3, "shared.w"), _conv(4, "shared.w"),                       # two readers: plain
         _conv(5, "asym.w", quant={"input_offset": -3, "filter_offset": 0}),   # asymmetric: plain
         _conv(6, "small.w", oc=1, ic=1),                                  # 9 bytes: plain
@@ -118,7 +118,23 @@ def _ir():
 
 
 def test_plan():
-    assert kt.tile_plan(_ir(), "ime_k3_x100") == {"c.w": ("conv2d_s8", "x100_conv", 32, 144)}
+    # A composite conv split by output rows keeps its full weight: tiled (TASK-016).
+    assert kt.tile_plan(_ir(), "ime_k3_x100") == {"c.w": ("conv2d_s8", "x100_conv", 32, 144),
+                                                  "sched.w": ("conv2d_s8", "x100_conv", 32, 144)}
+
+
+def test_plan_tiles_each_shard_of_a_channel_split_conv(monkeypatch):
+    """An output-channel-split conv (in exclude_ids) has one array per shard:
+    each shard is tiled with rows = its channels; the parent is not."""
+    ws = {f"sched.w.shard_{t}": np.zeros((8, 16, 3, 3), np.int8) for t in range(4)}
+    plan = kt.tile_plan(_ir(), "ime_k3_x100", frozenset({2}), ws)
+    assert "sched.w" not in plan
+    assert {k: v for k, v in plan.items() if k.startswith("sched.w")} == {
+        f"sched.w.shard_{t}": ("conv2d_s8", "x100_conv", 8, 144) for t in range(4)}
+    assert kt.tile_plan(_ir(), "ime_k3_x100", frozenset({2})) == {
+        "c.w": ("conv2d_s8", "x100_conv", 32, 144)}               # no weights: shards plain
+    monkeypatch.setenv("MODELBLASTER_K3_SHARD_TILES", "0")
+    assert not any(k.startswith("sched.w") for k in kt.tile_plan(_ir(), "ime_k3_x100", frozenset({2}), ws))
 
 
 def test_plan_other_backends_and_off_switch(monkeypatch):
@@ -146,10 +162,11 @@ def test_emit_weights_tiles_and_manifest(tmp_path):
     n_tiled = 64 + ((144 + 7) // 8) * (32 // 4) * 32
     assert f"[{n_tiled}];" in h
     assert "__attribute__((aligned(64))) const int8_t" in c
-    assert c.count("MBX100TW header") == 1
+    # c.w and sched.w (its marker alone does not split it: it runs whole)
+    assert c.count("MBX100TW header") == 2
     man = json.loads((tmp_path / kt.WEIGHT_LAYOUTS_JSON).read_text())["k3_tiles"]
     assert man["op_magic"] == {"conv2d_s8": ["MBX100TW"]}
-    assert list(man["weights"]) == ["c.w"]
+    assert list(man["weights"]) == ["c.w", "sched.w"]
 
 
 def test_rvv_k3_weights_unchanged_and_off_switch(tmp_path, monkeypatch):
