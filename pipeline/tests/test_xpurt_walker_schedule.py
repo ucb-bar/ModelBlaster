@@ -185,6 +185,27 @@ class GateAndStream(unittest.TestCase):
             self.assertIn(f'\\"{field}\\"', block)
 
 
+class TimeDepsYieldToDataDeps(unittest.TestCase):
+    def test_a_time_dep_that_closes_a_cycle_is_dropped(self):
+        # m_dispatch_1 data-depends on m_dispatch_0; a time_dependency of 0 on
+        # 1 contradicts that. The table must still order, with 0 first.
+        sched = {"dot_file": "m.dot", "dispatches": {}}
+        for did in (0, 1):
+            sched["dispatches"][f"m_dispatch_{did}"] = {
+                "id": did, "ordinal": 1, "total": 1,
+                "dependencies": [] if did == 0 else ["m_dispatch_0"],
+                "hardware_target": "CPU_P#0", "start_time": 0.0, "duration": 1.0,
+                "job_name": "m", "module_name": f"m$dispatch_{did}"}
+        sched["dispatches"]["m_dispatch_0"]["time_dependency"] = "m_dispatch_1"
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "s.json"
+            p.write_text(json.dumps(sched))
+            es = ingest.load(str(p), {"m": _ir()}, _REG, cpu_p_kind="rvv", cpu_e_kind="rvv_c1")
+        self.assertEqual([e.dispatch_id for e in es], [0, 1])
+        self.assertEqual(es[0].time_dep_entry_id, -1)
+        self.assertEqual(es[1].deps_entry_ids, (0,))
+
+
 class ImplLegality(unittest.TestCase):
     _K3 = core_registry.load(str(_ROOT / "cores" / "spacemit_k3.json"))
 

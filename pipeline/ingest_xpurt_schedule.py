@@ -235,20 +235,42 @@ def load(schedule_path: str,
     from collections import defaultdict
     adj: dict[str, list[str]] = defaultdict(list)
     indeg: dict[str, int] = {k: 0 for k in raw}
+    # Data deps first: they come from the IR and are acyclic by construction.
     for k, d in raw.items():
-        # Both data deps and time_dep are ordering edges and must
-        # appear before this entry in the table walk.
-        edges = list(d.get("dependencies", []) or [])
-        time_dep_key = d.get("time_dependency")
-        if time_dep_key:
-            edges.append(time_dep_key)
-        for dep in edges:
+        for dep in (d.get("dependencies", []) or []):
             if dep not in raw:
                 # Will be flagged later when we resolve to entry_ids;
                 # don't bookkeep an edge to a non-existent node here.
                 continue
             adj[dep].append(k)
             indeg[k] += 1
+
+    # Then each time_dependency, unless it closes a cycle. A time_dep is an
+    # ordering hint XPU-RT derived from the start times it scheduled, not a
+    # data edge; when it contradicts the data deps (ops the scheduler never
+    # saw, equal start times) honouring it makes the table unorderable, while
+    # dropping it loses nothing: the data deps still force every real order.
+    def _reaches(src: str, dst: str) -> bool:
+        seen, stack = {src}, [src]
+        while stack:
+            for nxt in adj[stack.pop()]:
+                if nxt == dst:
+                    return True
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return False
+
+    dropped_time_deps: set[str] = set()
+    for k in sorted(raw):
+        dep = raw[k].get("time_dependency")
+        if not dep or dep not in raw:
+            continue
+        if dep == k or _reaches(k, dep):
+            dropped_time_deps.add(k)
+            continue
+        adj[dep].append(k)
+        indeg[k] += 1
 
     heap: list[tuple[float, str]] = []
     for k, n in indeg.items():
@@ -272,6 +294,9 @@ def load(schedule_path: str,
             f"Stuck entries (first 10): {unscheduled[:10]}"
         )
     key_to_entry_id = {k: i for i, k in enumerate(sorted_keys)}
+    if dropped_time_deps:
+        print(f"note: dropped {len(dropped_time_deps)} time_dependency edge(s) that "
+              f"contradict the data deps: {sorted(dropped_time_deps)[:5]}")
 
     entries: list[XpurtEntry] = []
     for entry_id, key in enumerate(sorted_keys):
@@ -330,6 +355,8 @@ def load(schedule_path: str,
             deps_ids.append(dep_id)
         time_dep_id = -1
         time_dep_key = d.get("time_dependency")
+        if key in dropped_time_deps:
+            time_dep_key = None
         if time_dep_key:
             if time_dep_key not in key_to_entry_id:
                 raise ValueError(
