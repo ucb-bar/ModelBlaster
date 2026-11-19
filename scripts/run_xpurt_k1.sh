@@ -434,6 +434,9 @@ WORKERS="${MB_XPURT_WORKERS:-hart}"
 # MB_XPURT_DYNAMIC=1: dynamic walker (held tasks may move to an idle core of the
 # same kind); MB_XPURT_SAFETY_BOUNDARY sets its safety factor (default 1.5).
 DYNAMIC_ARGS=()
+# MB_XPURT_POOL="net[:period_ms],...": those networks' entries are served from a
+# global ready queue by any idle core of their kind (soft / non-periodic work).
+# Works with or without MB_XPURT_DYNAMIC (which also moves periodic entries).
 # MB_XPURT_SAFETY_FILE=<walker_safety.json> (scripts/walker_safety_feedback.py)
 # supplies the value instead, so feedback-driven runs pick up the latest one.
 if [[ "${MB_XPURT_DYNAMIC:-0}" == "1" ]]; then
@@ -443,6 +446,14 @@ if [[ "${MB_XPURT_DYNAMIC:-0}" == "1" ]]; then
         echo "dynamic walker: safety boundary ${_safety} from ${MB_XPURT_SAFETY_FILE}"
     fi
     DYNAMIC_ARGS=(--dynamic-walker --safety-boundary "${_safety}")
+fi
+if [[ -n "${MB_XPURT_POOL:-}" ]]; then
+    if [[ "${WORKERS}" != "hart" ]]; then
+        echo "ERROR: MB_XPURT_POOL needs --worker-granularity hart (got ${WORKERS})" >&2; exit 2
+    fi
+    DYNAMIC_ARGS+=(--pool-networks "${MB_XPURT_POOL}")
+    [[ "${MB_XPURT_DYNAMIC:-0}" == "1" ]] || DYNAMIC_ARGS+=(--safety-boundary "${MB_XPURT_SAFETY_BOUNDARY:-1.0}")
+    echo "walker pool: ${MB_XPURT_POOL}"
 fi
 
 echo "=== 3/5 generate the walker (--worker-granularity ${WORKERS}) ==="
@@ -473,6 +484,10 @@ MODELBLASTER_XPURT_STREAM="${STREAM}" \
 [[ -x "${BIN}" ]] || { echo "no binary at ${BIN}" >&2; exit 1; }
 echo "  $(file -b "${BIN}" | cut -c1-70)"
 
+if [[ "${MB_XPURT_BUILD_ONLY:-0}" == "1" ]]; then
+    echo "MB_XPURT_BUILD_ONLY=1: built ${BIN}; not deploying"
+    exit 0
+fi
 echo "=== 5/5 deploy and run on ${HOST} ==="
 # k3's ssh is flaky: generous handshake timeout, and retry the idempotent
 # setup/copy/fetch steps (never the run itself). k1 keeps plain ssh/scp.

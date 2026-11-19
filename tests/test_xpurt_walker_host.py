@@ -592,3 +592,70 @@ def test_dynamic_walker_needs_hart_mode():
         mod._emit(**a, dynamic_walker=True)
     assert mod._emit(**a, per_hart_workers=True, dynamic_walker=True) != \
         mod._emit(**a, per_hart_workers=True)
+
+
+# ---- Global pool (--pool-networks) -------------------------------------------
+# Entries of pooled networks have no home core: any idle core of their kind takes
+# the oldest ready one, released at instance * period, and data deps still hold.
+
+def _pool_stats(out: str) -> dict:
+    m = re.search(r"moved=(\d+) refused_safety=(\d+) pooled_taken=(\d+) steal_periodic=(\d)", out)
+    assert m, out[-1500:]
+    return dict(zip(("moved", "refused", "pooled", "steal_periodic"), map(int, m.groups())))
+
+
+def test_pool_runs_soft_work_on_idle_cores_without_waiting_for_planned_starts(tmp_path):
+    """Everything is planned on hart 0 with op1s spread out to 160 ms. Pooled, the
+    four jobs run on four harts as soon as their inputs are ready."""
+    d = dict(_entry(j, op, 0, 0.0 if op == 0 else 40.0 * (j + 1))
+             for j in range(N_JOBS) for op in range(2))
+    sched = {"dot_file": "synth.dot", "dispatches": d}
+    static = _build_custom(tmp_path, sched, N_JOBS, [], [], "static")
+    pool = _build_custom(tmp_path, sched, N_JOBS, ["--pool-networks", "synth"], [], "pool")
+
+    out_s, dt_s = _run(static)
+    out_p, dt_p = _run(pool)
+    for out in (out_s, out_p):
+        r = _result(out)
+        assert r["done0"] == N_JOBS and r["done1"] == N_JOBS, r
+        assert r["violations"] == 0, "op1 ran before its op0"
+    st = _pool_stats(out_p)
+    assert st["pooled"] == 2 * N_JOBS and st["steal_periodic"] == 0, st
+    assert _result(out_p)["maxpar"] >= 2
+    assert dt_p < dt_s * 0.6, f"no gain: static {dt_s:.3f}s pool {dt_p:.3f}s"
+    rows = _trace_rows(out_p)
+    assert all(r["pooled"] == "1" for r in rows), rows[:2]
+    assert len({r["ran_on_hart"] for r in rows}) >= 2
+
+
+def test_pool_honours_instance_release_from_the_period(tmp_path):
+    """With a 100 ms period, instance j may not start before j * 100 ms even though
+    every op0 is planned at t=0 and a core is free."""
+    d = dict(_entry(j, op, 0, 0.0) for j in range(3) for op in range(2))
+    sched = {"dot_file": "synth.dot", "dispatches": d}
+    exe = _build_custom(tmp_path, sched, 2, ["--pool-networks", "synth:100"], [], "rel")
+    out, _ = _run(exe)
+    assert _result(out)["violations"] == 0
+    first = {}
+    for r in _trace_rows(out):
+        if r["name"] == "a":
+            first[int(r["instance"])] = int(r["actual_start_cycles"]) / 1e6   # ns -> ms
+    assert sorted(first) == [0, 1, 2], first
+    for j, t in first.items():
+        assert t >= 100.0 * j - 1.0, f"instance {j} started at {t:.1f} ms, release {100 * j} ms"
+
+
+def test_pool_networks_must_exist_and_need_hart_mode():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "gxm2", ROOT / "pipeline" / "generate_xpurt_main.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    a = dict(networks=["n"], schedule_name="s", dispatch_table_header="s.h",
+             core_kinds=["rvv"], backends=["rvv"], pool_sizes=[0], n_instances={"n": 1})
+    with pytest.raises(ValueError):
+        mod._emit(**a, pool_networks={"n": 0.0})
+    with pytest.raises(ValueError):
+        mod._emit(**a, per_hart_workers=True, pool_networks={"missing": 0.0})
+    src = mod._emit(**a, per_hart_workers=True, pool_networks={"n": 5.0})
+    assert '{ "n", 5.0 }' in src and "#define XPURT_STEAL_PERIODIC 0" in src

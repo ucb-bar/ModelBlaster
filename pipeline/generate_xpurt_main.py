@@ -137,6 +137,41 @@ static uint64_t xpurt_release(const xpurt_sched_entry_t *e)
 {
     return run_t0 + (uint64_t)((double)e->start_time_ms * (double)XPURT_CYCLES_PER_MS);
 }
+
+/* ---- Global pool of soft / non-periodic work (--pool-networks) ------------
+ * Entries of pooled networks have no home core. They wait in one ready queue
+ * (table order) and any worker of their kind takes the oldest ready one when
+ * it fits before that worker's own next task (same safety factor). A pooled
+ * instance is released at instance * period (0 for aperiodic work), not at its
+ * planned start, so it may run early. Ordering edges into or out of the pool
+ * are ignored -- pooled work has no slot to order against -- while data deps
+ * still hold. Periodic entries keep their AOT core; they are only moved if
+ * XPURT_STEAL_PERIODIC (--dynamic-walker). */
+#ifndef XPURT_STEAL_PERIODIC
+#define XPURT_STEAL_PERIODIC @STEAL@
+#endif
+static unsigned char xpurt_pooled[@UPPER@_N_ENTRIES];
+static double xpurt_pool_period_ms[@UPPER@_N_ENTRIES];
+static atomic_int xpurt_n_pooled_taken;
+static void xpurt_pool_init(void)
+{
+    static const struct { const char *net; double period_ms; } pool_[] = { @POOL@ };
+    for (int i = 0; i < @UPPER@_N_ENTRIES; i++)
+        for (unsigned j = 0; j < sizeof(pool_) / sizeof(pool_[0]); j++)
+            if (pool_[j].net && strcmp(@UPPER@_TABLE[i].network, pool_[j].net) == 0) {
+                xpurt_pooled[i] = 1;
+                xpurt_pool_period_ms[i] = pool_[j].period_ms;
+            }
+}
+#define XPURT_IS_POOLED(i) (xpurt_pooled[(i)])
+/* An ordering edge binds only AOT-placed work. */
+#define XPURT_TDEP_DONE(e) ((e)->time_dep_entry_id < 0 || xpurt_pooled[(e)->time_dep_entry_id] || \
+                            atomic_load(&xpurt_done[(e)->time_dep_entry_id]))
+static uint64_t xpurt_pool_release(const xpurt_sched_entry_t *e, int i)
+{
+    return run_t0 + (uint64_t)((double)e->instance * xpurt_pool_period_ms[i] *
+                               (double)XPURT_CYCLES_PER_MS);
+}
 '''
 
 _DYN_FUNCS = r'''
@@ -164,8 +199,7 @@ static int xpurt_is_held(const xpurt_sched_entry_t *e, int c)
     int p = atomic_load(&xpurt_pos[e->hart]);
     if (p < 0) return 0;                       /* owner not walking yet */
     if (p < c) return 1;
-    return p == c && e->time_dep_entry_id >= 0 &&
-           !atomic_load(&xpurt_done[e->time_dep_entry_id]);
+    return p == c && !XPURT_TDEP_DONE(e);
 }
 
 /* Called by an idle worker. next_own is the next entry on its own list, or -1
@@ -183,6 +217,27 @@ static int xpurt_try_steal(struct xpurt_worker_arg *wa, int next_own)
     atomic_store(&xpurt_scan_lo, lo);
     for (int c = lo; c < @UPPER@_N_ENTRIES; c++) {
         const xpurt_sched_entry_t *e = &@UPPER@_TABLE[c];
+        if (xpurt_pooled[c]) {
+            if (atomic_load(&xpurt_claimed[c]) || e->n_harts > 1) continue;
+            /* a pooled view op only posts its completion: any worker does it */
+            if (e->dispatch_id >= 0 && strcmp(e->core_kind, wa->kind) != 0) continue;
+            if (!xpurt_deps_done(e)) continue;
+            if (e->dispatch_id == 0 && now < xpurt_pool_release(e, c)) continue;
+            if (e->dispatch_id >= 0 && limit != UINT64_MAX) {
+                uint64_t need_p = (uint64_t)((double)XPURT_SAFETY_BOUNDARY *
+                                             (double)e->duration_ms * (double)XPURT_CYCLES_PER_MS);
+                if (now + need_p > limit) {
+                    if (!atomic_exchange(&xpurt_refused[c], 1)) atomic_fetch_add(&xpurt_n_refused, 1);
+                    continue;
+                }
+            }
+            int zp = 0;
+            if (!atomic_compare_exchange_strong(&xpurt_claimed[c], &zp, 1)) continue;
+            if (e->dispatch_id >= 0) atomic_fetch_add(&xpurt_n_pooled_taken, 1);
+            xpurt_run_entry(wa, c, 0, completion_sems, wa->hart);
+            return 1;
+        }
+        if (!XPURT_STEAL_PERIODIC) continue;
         if (e->dispatch_id < 0 || e->n_harts > 1 || e->hart == wa->hart) continue;
         if (strcmp(e->core_kind, wa->kind) != 0) continue;
         if (atomic_load(&xpurt_claimed[c])) continue;
@@ -212,11 +267,11 @@ static void xpurt_walk_dynamic(struct xpurt_worker_arg *wa)
     for (int i_ = 0; i_ < @UPPER@_N_ENTRIES; i_++) {
         const xpurt_sched_entry_t *e_ = &@UPPER@_TABLE[i_];
         if (strcmp(e_->core_kind, wa->kind) != 0 || e_->hart != wa->hart) continue;
+        if (xpurt_pooled[i_]) continue;                          /* the pool owns it */
         atomic_store(&xpurt_pos[wa->hart], i_);
         for (;;) {
             if (atomic_load(&xpurt_claimed[i_])) break;          /* another core took it */
-            int ready = xpurt_deps_done(e_) &&
-                (e_->time_dep_entry_id < 0 || atomic_load(&xpurt_done[e_->time_dep_entry_id])) &&
+            int ready = xpurt_deps_done(e_) && XPURT_TDEP_DONE(e_) &&
                 (e_->dispatch_id != 0 || (uint64_t)k_cycle_get_64() >= xpurt_release(e_));
             if (ready) break;
             if (!xpurt_try_steal(wa, i_)) k_yield();
@@ -251,9 +306,11 @@ _DYN_EXTRA_WORKERS = r'''
 #undef add_idle_harts_'''
 
 _DYN_SUMMARY = r'''
-    printf("xpurt: dynamic walker safety_boundary=%.3f moved=%d refused_safety=%d\n",
+    printf("xpurt: dynamic walker safety_boundary=%.3f moved=%d refused_safety=%d "
+           "pooled_taken=%d steal_periodic=%d\n",
            (double)XPURT_SAFETY_BOUNDARY, atomic_load(&xpurt_n_moved),
-           atomic_load(&xpurt_n_refused));'''
+           atomic_load(&xpurt_n_refused), atomic_load(&xpurt_n_pooled_taken),
+           XPURT_STEAL_PERIODIC);'''
 
 
 def _emit(networks: list[str], schedule_name: str,
@@ -267,7 +324,8 @@ def _emit(networks: list[str], schedule_name: str,
           impl_backends: list[tuple[str, str, str]] | None = None,
           dynamic_walker: bool = False,
           safety_boundary: float = 1.5,
-          idle_harts: list[list[int]] | None = None) -> str:
+          idle_harts: list[list[int]] | None = None,
+          pool_networks: dict[str, float] | None = None) -> str:
     """Render xpurt_main.c source.
 
     `networks`     is the ordered list of distinct network names the
@@ -318,9 +376,19 @@ def _emit(networks: list[str], schedule_name: str,
                    idle core's own work; nothing writes it yet.
     `idle_harts`   parallel to core_kinds: every hart of that kind (from the
                    registry). Dynamic mode starts a worker on each one the
-                   table never uses, so wholly idle cores can take tasks."""
-    if dynamic_walker and not per_hart_workers:
-        raise ValueError("dynamic_walker needs per_hart_workers (--worker-granularity hart)")
+                   table never uses, so wholly idle cores can take tasks.
+    `pool_networks`  {network: period_ms (0 = aperiodic)}. Those networks'
+                   entries go to one global ready queue that any idle worker of
+                   the right kind serves, released at instance * period and
+                   taken only when they fit before the worker's own next task.
+                   Uses the dynamic walker's machinery; periodic entries move
+                   only if `dynamic_walker` is also set."""
+    if (dynamic_walker or pool_networks) and not per_hart_workers:
+        raise ValueError("dynamic_walker / pool_networks need per_hart_workers "
+                         "(--worker-granularity hart)")
+    unknown = sorted(set(pool_networks or {}) - set(networks))
+    if unknown:
+        raise ValueError(f"pool_networks not in this schedule: {unknown}")
 
     # State structs are emitted per (network, kind) so each worker's
     # `s.pool` is fixed at main() time. Without this, two workers that
@@ -619,7 +687,7 @@ def _emit(networks: list[str], schedule_name: str,
     dyn_decl = dyn_funcs = dyn_extra_workers = dyn_summary = ""
     timed_walk = "xpurt_walk(wa, 0);"
     trace_cols = trace_fmt = trace_args = ""
-    if dynamic_walker:
+    if dynamic_walker or pool_networks:
         # The run body, shared by an entry's own core and a core that took it.
         # It is the static branch with three substitutions: completion also
         # sets the entry's done flag, and the hart lock and the telemetry hart
@@ -628,20 +696,29 @@ def _emit(networks: list[str], schedule_name: str,
                     .replace("k_sem_give(&sems_[i_]);", "XPURT_POST(i_);")
                     .replace("XPURT_LOCK_ENTRY(e_)", "XPURT_LOCK_RUN(e_, run_hart_)")
                     .replace("XPURT_UNLOCK_ENTRY(e_)", "XPURT_UNLOCK_RUN(e_, run_hart_)")
-                    .replace("XPURT_STREAM_EVENT(e_, wa->hart,", "XPURT_STREAM_EVENT(e_, run_hart_,"))
-        dyn_decl = _DYN_DECL.replace("@UPPER@", upper).replace(
-            "@SAFETY@", repr(float(safety_boundary))) + "\n"
+                    .replace("XPURT_STREAM_EVENT(e_, wa->hart,", "XPURT_STREAM_EVENT(e_, run_hart_,")
+                    # Pooled work was gated at its release when it was taken; it
+                    # must not then wait for its planned start on the core that took it.
+                    .replace("XPURT_GATE_WAIT(target_start);",
+                             "if (!XPURT_IS_POOLED(i_)) XPURT_GATE_WAIT(target_start);"))
+        pool_init = ", ".join(f'{{ "{n}", {float(pm)!r} }}'
+                              for n, pm in sorted((pool_networks or {}).items()))
+        dyn_decl = (_DYN_DECL.replace("@UPPER@", upper)
+                    .replace("@SAFETY@", repr(float(safety_boundary)))
+                    .replace("@STEAL@", "1" if dynamic_walker else "0")
+                    .replace("@POOL@", pool_init or "{ 0, 0.0 }")) + "\n"
         dyn_funcs = _DYN_FUNCS.replace("@UPPER@", upper).replace("@RUN_BODY@", run_body) + "\n"
         timed_walk = "xpurt_walk_dynamic(wa);"
         extra = [f"    {{ static const int hs_[] = {{ {', '.join(str(h) for h in hs)} }}; "
                  f"add_idle_harts_({k}, hs_, {len(hs)}); }}"
                  for k, hs in enumerate(idle_harts or []) if hs]
-        dyn_extra_workers = _DYN_EXTRA_WORKERS.replace("@EXTRA@", "\n".join(extra))
+        dyn_extra_workers = ("\n    xpurt_pool_init();"
+                             + _DYN_EXTRA_WORKERS.replace("@EXTRA@", "\n".join(extra)))
         dyn_summary = _DYN_SUMMARY
-        trace_cols = ",ran_on_hart,moved"
-        trace_fmt = ",%d,%d"
+        trace_cols = ",ran_on_hart,moved,pooled"
+        trace_fmt = ",%d,%d,%d"
         trace_args = (",\n               xpurt_ran_on[i], "
-                      "xpurt_ran_on[i] != e->hart && e->dispatch_id >= 0")
+                      "xpurt_ran_on[i] != e->hart && e->dispatch_id >= 0, (int)xpurt_pooled[i]")
 
     # One Zephyr worker thread per distinct core_kind. Each pins itself
     # to a hart (the entry's .hart) and pulls only entries whose
@@ -1322,6 +1399,12 @@ def main() -> None:
                          "the same kind, subject to --safety-boundary. Also "
                          "starts a worker on every registry hart the schedule "
                          "leaves unused.")
+    ap.add_argument("--pool-networks", default="",
+                    help="comma list NET[:PERIOD_MS]: these networks' entries go "
+                         "to a global ready queue served by any idle core of "
+                         "their kind (soft / non-periodic work). PERIOD_MS sets "
+                         "the instance release (default 0 = aperiodic). Needs "
+                         "--worker-granularity hart.")
     ap.add_argument("--safety-boundary", type=float, default=1.5,
                     help="dynamic walker: an idle core takes a task only if "
                          "this many times the task's planned duration ends "
@@ -1399,8 +1482,12 @@ def main() -> None:
 
     pool_harts = ([sorted(harts_per_kind.get(k, set())) for k in core_kinds]
                   if harts_per_kind and any(pool_sizes) else None)
-    if args.dynamic_walker and not per_hart:
-        raise SystemExit("--dynamic-walker needs --worker-granularity hart")
+    pool_networks = {}
+    for tok in filter(None, (t.strip() for t in args.pool_networks.split(","))):
+        n_, _, pm_ = tok.partition(":")
+        pool_networks[n_] = float(pm_) if pm_ else 0.0
+    if (args.dynamic_walker or pool_networks) and not per_hart:
+        raise SystemExit("--dynamic-walker / --pool-networks need --worker-granularity hart")
     if args.safety_boundary < 1.0:
         raise SystemExit("--safety-boundary must be >= 1.0")
     src = _emit(networks, args.name, args.dispatch_table_header,
@@ -1409,7 +1496,8 @@ def main() -> None:
                 impl_backends=impl_backends,
                 dynamic_walker=args.dynamic_walker,
                 safety_boundary=args.safety_boundary,
-                idle_harts=[sorted(harts_per_kind.get(k, set())) for k in core_kinds])
+                idle_harts=[sorted(harts_per_kind.get(k, set())) for k in core_kinds],
+                pool_networks=pool_networks or None)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)
