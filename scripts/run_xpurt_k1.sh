@@ -295,7 +295,7 @@ for model in "${MODEL_LIST[@]}"; do
         # Same reasoning for the board selector and the k3 equivalents.
         case "${_v}" in
             MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE|MB_XPURT_WARMUP) continue ;;
-            MB_XPURT_PLACEMENT|MB_XPURT_REPEATS) continue ;;
+            MB_XPURT_PLACEMENT|MB_XPURT_REPEATS|MB_XPURT_STAMPS) continue ;;
         esac
         _cfg="${_cfg} ${_v}=${!_v}"
     done
@@ -427,10 +427,13 @@ echo "  ${SCHED_C}"
 #                         saved as <sched>_placement.csv (--placement)
 #   MB_XPURT_REPEATS=N    run the deployed binary N times (default 1); with N>1
 #                         each run's stdout/trace/placement get an _r<k> suffix
+#   MB_XPURT_STAMPS=1     two more trace columns per entry, got_cores_cycles and
+#                         kernel_end_cycles (--stamps)
 WALKER_OPTS=()
 [[ "${MB_XPURT_WARMUP:-0}" == "1" ]] && WALKER_OPTS+=(--warmup)
 PLACEMENT="${MB_XPURT_PLACEMENT:-0}"
 [[ "${PLACEMENT}" == "1" ]] && WALKER_OPTS+=(--placement)
+[[ "${MB_XPURT_STAMPS:-0}" == "1" ]] && WALKER_OPTS+=(--stamps)
 REPEATS="${MB_XPURT_REPEATS:-1}"
 [[ "${REPEATS}" =~ ^[1-9][0-9]*$ ]] || { echo "MB_XPURT_REPEATS must be a positive integer" >&2; exit 2; }
 # The walker has no live JSON stream yet; say so rather than ignoring the knob.

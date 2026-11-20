@@ -85,11 +85,13 @@ def _emit(networks: list[str], schedule_name: str,
           pool_harts: list[list[int]] | None = None,
           impl_backends: list[tuple[str, str, str]] | None = None,
           warmup: bool = False,
-          placement: bool = False) -> str:
+          placement: bool = False,
+          stamps: bool = False) -> str:
     """Render xpurt_main.c source.
 
     `warmup` / `placement` are hosted-Linux opt-ins (see `_add_warmup` and
-    `_add_placement`); off, the emitted text is unchanged.
+    `_add_placement`); off, the emitted text is unchanged. `stamps` is the
+    same kind of opt-in for two more trace stamps per entry (`_add_stamps`).
 
     `networks`     is the ordered list of distinct network names the
                    schedule references.
@@ -928,6 +930,8 @@ int main(void)
         src = _add_warmup(src, upper, loop_bound)
     if placement:
         src = _add_placement(src, upper)
+    if stamps:
+        src = _add_stamps(src)
     return src
 
 
@@ -1041,6 +1045,54 @@ struct xpurt_worker_arg {{""")
     return src
 
 
+def _add_stamps(src: str) -> str:
+    """Two more trace stamps per entry: `got_cores` and `kernel_end`.
+
+    The trace's start stamp is taken before the entry locks its harts and its
+    end stamp after it unlocks them, so a wait for a hart that another entry
+    still holds (a multi-core dispatch) sits inside start -> end and reads as
+    the kernel running slowly. With the two extra stamps one entry splits into
+
+        start -> got_cores      waiting for its harts (0 unless one is held)
+        got_cores -> kernel_end the dispatch function itself
+        kernel_end -> end       unlocking (and the placement read, if on)
+
+    `got_cores` is taken right after XPURT_LOCK_ENTRY and `kernel_end` right
+    after the dispatch function returns: both inside the placement reads when
+    --placement is on, hence applied after `_add_placement`. Each stamp goes
+    into the entry's own trace slot (no shared state), and the two are printed
+    as the LAST two trace columns so existing readers of the trace keep
+    working. Needs MODELBLASTER_XPURT_TRACE, like the trace itself.
+    """
+    src = _sub1(src, "    uint64_t end_cycles;\n",
+                "    uint64_t end_cycles;\n"
+                "    uint64_t got_cores_cycles;    /* --stamps: all harts locked */\n"
+                "    uint64_t kernel_end_cycles;   /* --stamps: dispatch fn returned */\n")
+    src = _sub1(src, "            XPURT_LOCK_ENTRY(e_);\n",
+                "            XPURT_LOCK_ENTRY(e_);\n"
+                "#ifdef MODELBLASTER_XPURT_TRACE\n"
+                "            xpurt_trace[i_].got_cores_cycles =\n"
+                "                (uint64_t)k_cycle_get_64() - run_t0;\n"
+                "#endif\n", 0)
+    after_kernel = "            xpurt_place[i_].cpu_after = XPURT_CPU();\n"
+    if after_kernel not in src:
+        after_kernel = "            XPURT_UNLOCK_ENTRY(e_);\n"
+    src = _sub1(src, after_kernel,
+                "#ifdef MODELBLASTER_XPURT_TRACE\n"
+                "            xpurt_trace[i_].kernel_end_cycles =\n"
+                "                (uint64_t)k_cycle_get_64() - run_t0;\n"
+                "#endif\n" + after_kernel, 0)
+    src = _sub1(src, '"actual_start_cycles,actual_end_cycles\\n");',
+                '"actual_start_cycles,actual_end_cycles,"\n'
+                '           "got_cores_cycles,kernel_end_cycles\\n");')
+    src = _sub1(src, '%.6f,%.6f,%d,%llu,%llu\\n",', '%.6f,%.6f,%d,%llu,%llu,%llu,%llu\\n",')
+    src = _sub1(src, "(unsigned long long)xpurt_trace[i].end_cycles);",
+                "(unsigned long long)xpurt_trace[i].end_cycles,\n"
+                "               (unsigned long long)xpurt_trace[i].got_cores_cycles,\n"
+                "               (unsigned long long)xpurt_trace[i].kernel_end_cycles);")
+    return src
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--schedule", required=True,
@@ -1100,6 +1152,10 @@ def main() -> None:
                     help="record the cpu each entry's kernel ran on and print "
                          "a MODELBLASTER_XPURT_PLACEMENT block (see "
                          "_add_placement)")
+    ap.add_argument("--stamps", action="store_true",
+                    help="two more trace stamps per entry, as the last two "
+                         "trace columns: got_cores (all its harts locked) and "
+                         "kernel_end (dispatch returned); see _add_stamps")
     args = ap.parse_args()
 
     with open(args.schedule) as f:
@@ -1175,7 +1231,8 @@ def main() -> None:
                 core_kinds, backends, pool_sizes, n_instances,
                 per_hart_workers=per_hart, pool_harts=pool_harts,
                 impl_backends=impl_backends,
-                warmup=args.warmup, placement=args.placement)
+                warmup=args.warmup, placement=args.placement,
+                stamps=args.stamps)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)

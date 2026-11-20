@@ -206,7 +206,7 @@ rewritten one, instead of extracting it.
 
 ## Warm-up, placement record, repeated runs (hosted Linux, opt-in)
 
-The runners take three knobs; each is off by default and leaves the emitted
+The runners take four knobs; each is off by default and leaves the emitted
 walker unchanged when off.
 
 - `MB_XPURT_WARMUP=1` (`generate_xpurt_main --warmup`): every worker runs its
@@ -220,6 +220,14 @@ walker unchanged when off.
   cpu_before,cpu_after`). XPU-RT's `scripts/check_k3_placement.py` checks it.
 - `MB_XPURT_REPEATS=N`: run the deployed binary N times; with N > 1 each run's
   stdout, trace and placement files get an `_r<k>` suffix.
+- `MB_XPURT_STAMPS=1` (`--stamps`): two more stamps per entry, printed as the
+  last two trace columns. `got_cores_cycles` is taken right after the entry has
+  locked all its harts, `kernel_end_cycles` right after its dispatch function
+  returns. The trace's start stamp is taken before the hart locks and its end
+  stamp after the unlock, so without these a wait for a hart that a multi-core
+  entry still holds reads as the kernel running slowly. With them:
+  start to got_cores = waiting for harts, got_cores to kernel_end = the
+  dispatch itself, kernel_end to end = unlocking.
 
 ## Errors stop the run
 
