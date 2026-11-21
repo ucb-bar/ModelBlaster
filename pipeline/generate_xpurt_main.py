@@ -86,12 +86,15 @@ def _emit(networks: list[str], schedule_name: str,
           impl_backends: list[tuple[str, str, str]] | None = None,
           warmup: bool = False,
           placement: bool = False,
-          stamps: bool = False) -> str:
+          stamps: bool = False,
+          own_lines: bool = False) -> str:
     """Render xpurt_main.c source.
 
     `warmup` / `placement` are hosted-Linux opt-ins (see `_add_warmup` and
     `_add_placement`); off, the emitted text is unchanged. `stamps` is the
-    same kind of opt-in for two more trace stamps per entry (`_add_stamps`).
+    same kind of opt-in for two more trace stamps per entry (`_add_stamps`),
+    and `own_lines` gives each worker the list of its own entries
+    (`_add_own_lines`).
 
     `networks`     is the ordered list of distinct network names the
                    schedule references.
@@ -932,6 +935,8 @@ int main(void)
         src = _add_placement(src, upper)
     if stamps:
         src = _add_stamps(src)
+    if own_lines:
+        src = _add_own_lines(src)
     return src
 
 
@@ -1093,6 +1098,63 @@ def _add_stamps(src: str) -> str:
     return src
 
 
+_WORKER_LOOP = re.compile(
+    r"    for \(int i_ = 0; i_ < (?P<n>\w+_N_ENTRIES); i_\+\+\) \{\n"
+    r"        const xpurt_sched_entry_t \*e_ = &(?P<t>\w+_TABLE)\[i_\];\n"
+    r"        if \((?P<match>strcmp\(e_->core_kind, my_kind\) != 0[^\n]*)\) continue;\n")
+
+
+def _add_own_lines(src: str) -> str:
+    """Each worker walks only its own entries instead of the whole table.
+
+    Without it every worker reads every line of the dispatch table and skips
+    the ones it does not lead. Skipping never sleeps or yields, so on hosted
+    Linux with every walker and pool thread at the same SCHED_FIFO priority,
+    a worker that is reading thousands of lines before its first entry, after
+    its last one or across a long gap keeps its core, and a pool helper woken
+    on that core for another worker's multi-core entry cannot run until the
+    reading ends (0.3-0.9 ms on the K3 for ~25,000 lines).
+
+    With it each worker collects the indices of its own entries once, before
+    its first pass (before the untimed warm-up pass when --warmup is on), and
+    then visits only those, in the same order; after its last entry it returns
+    at once. Entries, order, dependency waits, hart locks and outputs are
+    unchanged. Hosted Linux (malloc for the index list).
+    """
+    m = _WORKER_LOOP.search(src)
+    if m is None or len(_WORKER_LOOP.findall(src)) != 1:
+        raise AssertionError("walker template changed: worker entry loop not found once")
+    n, table, match = m.group("n"), m.group("t"), m.group("match")
+    collect = (
+        "    /* --own-lines: this worker's own entries, collected once before it\n"
+        "     * runs any of them (generate_xpurt_main --own-lines). */\n"
+        f"    int *xpurt_own = (int *)malloc(sizeof(int) * {n});\n"
+        "    int xpurt_own_n = 0;\n"
+        "    if (xpurt_own == NULL) {\n"
+        "        printf(\"FATAL: worker kind=%s: no memory for its entry list\\n\", my_kind);\n"
+        "        XPURT_FATAL_EXIT();\n"
+        "        return NULL;\n"
+        "    }\n"
+        f"    for (int i_ = 0; i_ < {n}; i_++) {{\n"
+        f"        const xpurt_sched_entry_t *e_ = &{table}[i_];\n"
+        f"        if ({match}) continue;\n"
+        "        xpurt_own[xpurt_own_n++] = i_;\n"
+        "    }\n")
+    first = ("    for (int pass_ = 0; pass_ < 2; pass_++) {\n"
+             if "    for (int pass_ = 0; pass_ < 2; pass_++) {\n" in src
+             else "    /* Take entries that match `my_kind`, in start_time order. */\n")
+    # the walk first (it is the only such loop), then the collection before it:
+    # the collection starts with the same three lines as the walk
+    src = _sub1(src, m.group(0),
+                "    for (int j_ = 0; j_ < xpurt_own_n; j_++) {\n"
+                "        const int i_ = xpurt_own[j_];\n"
+                f"        const xpurt_sched_entry_t *e_ = &{table}[i_];\n")
+    src = _sub1(src, first, collect + first)
+    src = _sub1(src, "    return NULL;\n}\n\nint main(void)",
+                "    free(xpurt_own);\n    return NULL;\n}\n\nint main(void)")
+    return src
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--schedule", required=True,
@@ -1156,6 +1218,9 @@ def main() -> None:
                     help="two more trace stamps per entry, as the last two "
                          "trace columns: got_cores (all its harts locked) and "
                          "kernel_end (dispatch returned); see _add_stamps")
+    ap.add_argument("--own-lines", action="store_true",
+                    help="each worker visits only its own entries instead of "
+                         "reading the whole table; see _add_own_lines")
     args = ap.parse_args()
 
     with open(args.schedule) as f:
@@ -1232,7 +1297,7 @@ def main() -> None:
                 per_hart_workers=per_hart, pool_harts=pool_harts,
                 impl_backends=impl_backends,
                 warmup=args.warmup, placement=args.placement,
-                stamps=args.stamps)
+                stamps=args.stamps, own_lines=args.own_lines)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)

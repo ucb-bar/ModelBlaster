@@ -277,6 +277,21 @@ def test_default_output_unchanged_by_hart_option():
                 assert "kernel_end_cycles" not in off
                 on = mod._emit(**a, **kw, stamps=True)
                 assert on != off and "got_cores_cycles" in on
+    # --own-lines off: unchanged, whatever the other options are; on: the
+    # worker visits its collected list instead of the whole table.
+    for hart in (False, True):
+        for warm in (False, True):
+            for stamps in (False, True):
+                kw = dict(per_hart_workers=hart, warmup=warm, placement=True, stamps=stamps)
+                off = mod._emit(**a, **kw)
+                assert mod._emit(**a, **kw, own_lines=False) == off
+                assert "xpurt_own" not in off
+                on = mod._emit(**a, **kw, own_lines=True)
+                assert "for (int j_ = 0; j_ < xpurt_own_n; j_++)" in on
+                assert on.count("strcmp(e_->core_kind, my_kind)") == 1
+                # collected before the warm-up pass, never inside the timed one
+                if warm:
+                    assert on.index("xpurt_own[xpurt_own_n++]") < on.index("for (int pass_ = 0;")
 
 
 def test_a_core_kind_without_a_backend_stops_the_run(tmp_path):
@@ -629,3 +644,74 @@ def test_stamps_are_ordered_and_the_core_wait_is_outside_the_run(tmp_path, extra
     for key in ((0, 0), (1, 0)):                  # nothing to wait for
         s, g, k, e = ns[key]
         assert (g - s) / 1e6 < 5.0, (key, s, g)
+
+
+# --- each worker visits only its own entries (generate_xpurt_main --own-lines) ---
+@pytest.mark.parametrize("mode", ["kind", "hart"])
+def test_own_lines_runs_the_same_entries_correctly(tmp_path, mode):
+    """--own-lines changes how a worker finds its entries, not what runs: the
+    same results, no dependency violation, and in hart mode the harts still
+    overlap."""
+    w = tmp_path
+    pkg = w / "pkg"
+    pkg.mkdir()
+    os.symlink(ROOT, pkg / "modelblaster")
+    env = dict(os.environ, PYTHONPATH=str(pkg))
+    _write(w / "schedule.json", json.dumps(_schedule()))
+    _write(w / "registry.json", json.dumps(_registry()))
+    _write(w / "graph.json", json.dumps({"ops": [
+        {"dispatch_id": 0, "op": "synth_a", "name": "a"},
+        {"dispatch_id": 1, "op": "synth_b", "name": "b"}]}))
+    _write(w / "synth_model.h", _model_header())
+    _write(w / "synth_test_io.h",
+           "static const float model_synth_test_input[1] = { 0.0f };\n")
+    _write(w / "kernels_rvv.c", _kernels("rvv"))
+    for a in (("modelblaster.pipeline.ingest_xpurt_schedule",
+               "--schedule", "schedule.json", "--registry", "registry.json",
+               "--ir", "synth:graph.json", "--out", str(w / "demo_table.c"),
+               "--name", "demo"),
+              ("modelblaster.pipeline.generate_xpurt_main",
+               "--schedule", "schedule.json", "--out", str(w / "main.c"),
+               "--name", "demo", "--dispatch-table-header", "demo_table.h",
+               "--core-kinds", "rvv", "--worker-granularity", mode, "--own-lines")):
+        r = subprocess.run([sys.executable, "-m", *a], cwd=w, env=env,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"{a[0]} failed:\n{r.stdout}\n{r.stderr}"
+    exe = w / "walker"
+    cmd = [CC, "-O1", "-pthread", "-DMB_PLATFORM_POSIX", "-D_GNU_SOURCE",
+           f"-I{ROOT / 'runtime'}", f"-I{ROOT / 'runtime' / 'modelblaster_pool'}",
+           f"-I{w}", "-o", str(exe), "main.c", "demo_table.c", "kernels_rvv.c",
+           str(ROOT / "runtime" / "modelblaster_pool" / "modelblaster_pool.c"),
+           str(ROOT / "runtime" / "mb_placement.c")]
+    r = subprocess.run(cmd, cwd=w, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    out, _ = _run(exe)
+    res = _result(out)
+    assert res["done0"] == N_JOBS and res["done1"] == N_JOBS
+    assert res["violations"] == 0
+    assert "=== MODELBLASTER_OUTPUT_BEGIN [synth] ===" in out
+    if mode == "hart":
+        assert res["maxpar"] >= 2, "independent harts should still overlap"
+    else:
+        assert res["maxpar"] == 1
+
+
+@pytest.mark.parametrize("extra", [
+    pytest.param((), id="own-lines+stamps"),
+    pytest.param(("--warmup", "--placement"), id="own-lines+stamps+warmup+placement",
+                 marks=pytest.mark.skipif(sys.platform == "darwin",
+                                          reason="--warmup needs pthread_barrier (Linux)")),
+])
+def test_own_lines_keeps_the_multi_core_known_answer(tmp_path, extra, monkeypatch):
+    """The --stamps known answer (a multi-core entry waiting ~60 ms for a hart
+    another entry holds) holds unchanged with --own-lines: hart locks and
+    dependency waits are untouched."""
+    real_run = subprocess.run
+
+    def run_with_own_lines(cmd, *a, **k):
+        if isinstance(cmd, list) and "modelblaster.pipeline.generate_xpurt_main" in cmd:
+            cmd = cmd + ["--own-lines"]
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(subprocess, "run", run_with_own_lines)
+    test_stamps_are_ordered_and_the_core_wait_is_outside_the_run(tmp_path, extra)
