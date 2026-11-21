@@ -295,6 +295,7 @@ for model in "${MODEL_LIST[@]}"; do
         # Same reasoning for the board selector and the k3 equivalents.
         case "${_v}" in
             MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE|MB_XPURT_WARMUP) continue ;;
+            MB_XPURT_PLACEMENT|MB_XPURT_REPEATS|MB_XPURT_STAMPS|MB_XPURT_OWN_LINES) continue ;;
         esac
         _cfg="${_cfg} ${_v}=${!_v}"
     done
@@ -331,7 +332,7 @@ for model in "${MODEL_LIST[@]}"; do
     CODEGEN_IR="${base}/graph.xpurt_schedule.json"
     ${PY} -m modelblaster.pipeline.schedule_shards \
         --ir "${base}/graph.json" --schedule "${SCHEDULE}" \
-        --network "${model}" --out "${CODEGEN_IR}"
+        --network "${model}" --out "${CODEGEN_IR}" --backends "${UNIQUE_BACKENDS}"
 
     for bs in "${BUILD_BACKEND_LIST[@]}"; do
         bdir="${base}/${bs}"
@@ -419,10 +420,26 @@ ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
 [[ -f "${SCHED_C}" ]] || { echo "ingest produced no dispatch table" >&2; exit 1; }
 echo "  ${SCHED_C}"
 
-# The walker has no warm-up pass or live JSON stream yet (see
-# harness_xpurt/LINUX.md); say so rather than silently ignoring the knob.
-[[ "${MB_XPURT_WARMUP:-0}" == "1" ]] && \
-    echo "note: MB_XPURT_WARMUP=1 ignored: the walker has no warm-up pass" >&2
+# Hosted-Linux walker opt-ins (harness_xpurt/LINUX.md):
+#   MB_XPURT_WARMUP=1     one untimed pass of the whole schedule before the
+#                         timed one (generate_xpurt_main --warmup)
+#   MB_XPURT_PLACEMENT=1  record the cpu each entry's kernel ran on; the block is
+#                         saved as <sched>_placement.csv (--placement)
+#   MB_XPURT_REPEATS=N    run the deployed binary N times (default 1); with N>1
+#                         each run's stdout/trace/placement get an _r<k> suffix
+#   MB_XPURT_STAMPS=1     two more trace columns per entry, got_cores_cycles and
+#                         kernel_end_cycles (--stamps)
+#   MB_XPURT_OWN_LINES=1  each worker visits only its own entries instead of
+#                         reading the whole table (--own-lines)
+WALKER_OPTS=()
+[[ "${MB_XPURT_WARMUP:-0}" == "1" ]] && WALKER_OPTS+=(--warmup)
+PLACEMENT="${MB_XPURT_PLACEMENT:-0}"
+[[ "${PLACEMENT}" == "1" ]] && WALKER_OPTS+=(--placement)
+[[ "${MB_XPURT_STAMPS:-0}" == "1" ]] && WALKER_OPTS+=(--stamps)
+[[ "${MB_XPURT_OWN_LINES:-0}" == "1" ]] && WALKER_OPTS+=(--own-lines)
+REPEATS="${MB_XPURT_REPEATS:-1}"
+[[ "${REPEATS}" =~ ^[1-9][0-9]*$ ]] || { echo "MB_XPURT_REPEATS must be a positive integer" >&2; exit 2; }
+# The walker has no live JSON stream yet; say so rather than ignoring the knob.
 [[ "${STREAM}" == "1" ]] && \
     echo "note: MB_XPURT_STREAM=1 ignored: the walker has no live stream" >&2
 # One pinned worker per (kind, hart) by default: the schedule places
@@ -438,7 +455,8 @@ ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
     --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
     ${IMPL_BACKENDS:+--impl-backends "${IMPL_BACKENDS}"} \
-    --registry "${REGISTRY}" --worker-granularity "${WORKERS}"
+    --registry "${REGISTRY}" --worker-granularity "${WORKERS}" \
+    ${WALKER_OPTS[@]+"${WALKER_OPTS[@]}"}
 
 echo "=== 4/5 cross-build (harness_xpurt/build_posix.sh) ==="
 # A100 harts that must register with the kernel (registry ai_thread_cpus);
@@ -490,7 +508,6 @@ if [[ -n "${RT_PRIORITY}" ]]; then
     RUNNER_PRIORITY="${RT_PRIORITY}"
 fi
 RUN="${RUN} ./${SCHED_NAME}"
-OUT="${GEN_DIR}/${SCHED_NAME}_stdout.txt"
 # Redirect ON THE BOARD and scp the file back, rather than streaming stdout
 # through ssh. A three-model schedule emits ~1600 trace rows, and streaming that
 # volume reproducibly killed the board's ssh daemon:
@@ -504,7 +521,13 @@ OUT="${GEN_DIR}/${SCHED_NAME}_stdout.txt"
 # exactly like a crash in the run being measured. Writing to a file first makes
 # the run's completion independent of the link, and the exit status is the
 # program's own.
-REMOTE_LOG="${REMOTE_ROOT}/xpurt/${SCHED_NAME}_stdout.txt"
+final_rc=0
+for ((rep = 1; rep <= REPEATS; rep++)); do
+sfx=""
+(( REPEATS > 1 )) && sfx="_r${rep}"
+OUT="${GEN_DIR}/${SCHED_NAME}_stdout${sfx}.txt"
+REMOTE_LOG="${REMOTE_ROOT}/xpurt/${SCHED_NAME}_stdout${sfx}.txt"
+(( REPEATS > 1 )) && echo "  --- run ${rep}/${REPEATS} ---"
 set +e
 ssh "${SSH_OPTS[@]}" "${HOST}" \
     "printf '%s\\n' 'xpurt_runner: sched_policy=${RUNNER_POLICY} priority=${RUNNER_PRIORITY}' >${REMOTE_LOG}; ${RUN} >>${REMOTE_LOG} 2>&1; echo \$? >${REMOTE_LOG}.rc"
@@ -515,9 +538,17 @@ echo "  exit=${rc}  stdout -> ${OUT}"
 grep -E 'MODELBLASTER_VERIFY|max_abs_err|FAIL|PASS' "${OUT}" | head -20 || true
 
 if [[ "${TRACE}" == "1" ]] && grep -q 'MODELBLASTER_XPURT_TRACE_BEGIN' "${OUT}"; then
-    TRACE_CSV="${GEN_DIR}/${SCHED_NAME}_trace.csv"
+    TRACE_CSV="${GEN_DIR}/${SCHED_NAME}_trace${sfx}.csv"
     awk '/MODELBLASTER_XPURT_TRACE_BEGIN/{f=1;next} /MODELBLASTER_XPURT_TRACE_END/{f=0} f' \
         "${OUT}" > "${TRACE_CSV}"
     echo "  trace -> ${TRACE_CSV} ($(($(wc -l <"${TRACE_CSV}") - 1)) rows)"
 fi
-exit "${rc}"
+if [[ "${PLACEMENT}" == "1" ]] && grep -q 'MODELBLASTER_XPURT_PLACEMENT_BEGIN' "${OUT}"; then
+    PLACEMENT_CSV="${GEN_DIR}/${SCHED_NAME}_placement${sfx}.csv"
+    awk '/MODELBLASTER_XPURT_PLACEMENT_BEGIN/{f=1;next} /MODELBLASTER_XPURT_PLACEMENT_END/{f=0} f' \
+        "${OUT}" > "${PLACEMENT_CSV}"
+    echo "  placement -> ${PLACEMENT_CSV} ($(($(wc -l <"${PLACEMENT_CSV}") - 1)) rows)"
+fi
+[[ "${rc}" == "0" ]] || final_rc="${rc}"
+done
+exit "${final_rc}"

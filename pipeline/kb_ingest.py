@@ -10,6 +10,9 @@ Cache layout (``--cache``, default ``kernels/cuda/kb_cache``)::
     index.json        {"format": "mb-cuda-cache/1", "entries": [...]}
     src/<sha>.cu      slot sources (entry function + helpers, MB signature)
     src/<sha>.cpp     OpenCL slot sources (``target: "opencl"`` entries)
+    src/<sha>.c       RISC-V kernel sources (``target: "riscv"``; own cache root
+                      kernels/riscv/kb_cache, arch = ModelBlaster backend name;
+                      codegen and board re-verify in pipeline/kb_riscv.py)
 
 The cache serves one slot target (``CudaCache(root, target=)``: ``cuda``, the
 default, or ``opencl``): entries carry it (absent = ``cuda``) and their
@@ -55,6 +58,8 @@ from .kernel_abi import parse_signature
 
 MB_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CACHE = MB_ROOT / "kernels" / "cuda" / "kb_cache"
+#: RISC-V winners (k3-work TASK-016): a separate root, so the CUDA index is untouched.
+DEFAULT_RISCV_CACHE = MB_ROOT / "kernels" / "riscv" / "kb_cache"
 FORMAT = "mb-cuda-cache/1"
 
 
@@ -67,7 +72,8 @@ def _shape_key(shape: dict) -> str:
     return json.dumps(shape, sort_keys=True)
 
 
-TARGETS = ("cuda", "opencl")
+TARGETS = ("cuda", "opencl", "riscv")
+_EXT = {"cuda": ".cu", "opencl": ".cpp", "riscv": ".c"}
 
 
 def arch_key(arch, target: str = "cuda") -> str:
@@ -102,7 +108,7 @@ class CudaCache:
     def add(self, *, op: str, entry: str, signature: str, arch: str, shapes: list, code: str,
             slot_us: float, speedup, impl_id: str, source: dict, dtype: str | None = None) -> tuple[dict, str]:
         sha = hashlib.sha1(code.encode()).hexdigest()
-        ext = ".cu" if self.target == "cuda" else ".cpp"
+        ext = _EXT[self.target]
         (self.root / "src").mkdir(parents=True, exist_ok=True)
         (self.root / "src" / f"{sha}{ext}").write_text(code)
         guard = sorted({_shape_key(s) for s in shapes})
@@ -163,7 +169,7 @@ class CudaCache:
         same guard), marked ``reuse`` -- the pass supersedes the entries it replaces for the IR it measured."""
         sha = hashlib.sha1(code.encode()).hexdigest()
         (self.root / "src").mkdir(parents=True, exist_ok=True)
-        ext = ".cu" if self.target == "cuda" else ".cpp"
+        ext = _EXT[self.target]
         (self.root / "src" / f"{sha}{ext}").write_text(code)
         new = {"op": op, "entry": entry, "signature_sha": signature_sha(cuda_signature(signature)),
                "dtype": dtype or op_dtype(op), "arch": arch, "shape_guard": sorted({_shape_key(s) for s in shapes}),
@@ -215,7 +221,9 @@ def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float
                           shapes=r["shapes"], code=(base / r["file"]).read_text(), slot_us=r["slot_us"],
                           speedup=sp, impl_id=r["id"], dtype=r.get("dtype"),
                           source={"run_id": r.get("run_id"), "problem_id": r.get("problem_id"),
-                                  "techniques": r.get("techniques", [])})
+                                  "techniques": r.get("techniques", []),
+                                  # riscv winners name the curated algorithm they stand in for
+                                  **({"algorithm": r["algorithm"]} if r.get("algorithm") else {})})
         report.append({"op": r["op"], "impl_id": r["id"], "status": st, "speedup": sp})
     cache.save()
     from . import kb_trace
@@ -467,9 +475,10 @@ def main():
     ap.add_argument("--cache", default=str(DEFAULT_CACHE))
     ap.add_argument("--verify", nargs="*", default=[], help="IR dirs to verify at model level")
     ap.add_argument("--arch", default="75", help="SM number (CUDA) or device label (OpenCL, e.g. adreno650)")
-    ap.add_argument("--target", default="cuda", choices=["cuda", "opencl"],
+    ap.add_argument("--target", default="cuda", choices=["cuda", "opencl", "riscv"],
                     help="slot target of the cache: only its winners are ingested (opencl: --verify runs with "
-                         "--evaluator board|local)")
+                         "--evaluator board|local; riscv: default cache kernels/riscv/kb_cache, arch = the "
+                         "ModelBlaster backend, model-level verify is a board run, see pipeline/kb_riscv.py)")
     ap.add_argument("--hints", "--fusion-registry", dest="hints", default=None,
                     help="graph hints file: accepted fusions are applied and known ops "
                          "(default kernels/cuda/graph_hints.json)")
@@ -483,6 +492,12 @@ def main():
     from .reference_kernels import KERNEL_SPECS
 
     specs = {**KERNEL_SPECS, **accepted_fused_specs(Path(a.hints or DEFAULT_REGISTRY), KERNEL_SPECS)}
+    if a.target == "riscv":
+        if a.verify:
+            raise SystemExit("riscv entries are verified at model level by a board run: "
+                             "python -m modelblaster.pipeline.kb_riscv mark ...")
+        if a.cache == str(DEFAULT_CACHE):
+            a.cache = str(DEFAULT_RISCV_CACHE)
     cache = CudaCache(Path(a.cache), target=a.target)
     if a.winners:
         for r in ingest(Path(a.winners), cache, specs):
