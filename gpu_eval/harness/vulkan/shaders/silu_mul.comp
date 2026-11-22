@@ -1,0 +1,13 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_silu_mul (pipeline/int8_mixed.py fuse_swiglu): y = silu(a) * b, silu as ewise1's (x / (1 + exp(-x)))
+layout(push_constant, scalar) uniform PC { F32 a; F32 b; F32 y; int n; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= int64_t(pc.n)) return;
+    int i = int(gi);
+    float x = pc.a.v[i];
+    float s = x / (1.0 + exp(-x));
+    pc.y.v[i] = s * pc.b.v[i];
+}

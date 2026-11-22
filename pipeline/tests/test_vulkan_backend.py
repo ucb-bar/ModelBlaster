@@ -554,6 +554,9 @@ def test_smolvla_split_int8_mixed_on_vulkan(vk, refc, split_irs, tmp_path):
             assert kinds.count("rope_half") >= (2 if part == "prefix" else 3), part
             assert "rms_norm" in kinds and not any(op.get("fn") == "rsqrt" and op["op"] == "ewise1"
                                                    for op in g["ops"]), part
+            # SwiGLU: silu + mul -> silu_mul in every layer's MLP (the step's time MLP keeps its lone silu)
+            n_silu = sum(op["op"] == "ewise1" and op.get("opc") == 14 for op in g["ops"])
+            assert kinds.count("silu_mul") >= 1 and n_silu == (1 if part == "step" else 0), (part, n_silu)
         rec = walk_vulkan.evaluate(str(tmp_path / part), ks, reps=1, ref_lib=str(refc.lib._name))
         assert rec["ok"] and not rec["missing"] and rec["n_s8_ops_not_bit_exact"] == 0, (part, rec)
         assert rec["ref_c_mismatches_by_op"].get("linear_dq_s8") == 0
@@ -818,3 +821,18 @@ def test_linear_dq_add_s8_bit_exact(vk, refc, M, K, N, packed):
         f(c(x), c(rs), c(w), c(b) if bias else None, c(ws), c(r), c(ref), M, K, N)
         assert np.array_equal(np.array(y), ref), (bias, (np.array(y) != ref).sum())
     vk.release(m)
+
+
+def test_silu_mul_kernel(vk):
+    """silu_mul (int8_mixed fuse_swiglu) = silu(a) * b within fp32 rounding, incl. large |a|."""
+    rng = np.random.default_rng(11)
+    n = 102400 + 3
+    a = (rng.standard_normal(n) * 4).astype(np.float32)
+    a[:4] = [0.0, -90.0, 90.0, 1e-30]
+    b = rng.standard_normal(n).astype(np.float32)
+    A, B, Y = vk.upload(a), vk.upload(b), vk.array((n,))
+    vk.lib.kernel_silu_mul(_p(vk, A), _p(vk, B), _p(vk, Y), n)
+    vk.sync()
+    ref = torch.nn.functional.silu(torch.from_numpy(a).double()) * torch.from_numpy(b).double()
+    y = np.array(Y)
+    assert np.isfinite(y).all() and np.abs(y - ref.numpy()).max() <= 1e-6 * max(1.0, float(ref.abs().max()))

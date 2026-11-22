@@ -716,6 +716,13 @@ void kernel_rope_half(const float *input, const float *cos_t, const float *sin_t
     pc.p(input).p(cos_t).p(sin_t).p(output).i(R).i(H).i(half);
     mb_vk_launch1d(pipe, (long)R * H * half, pc);
 }
+// SwiGLU's silu + mul -> one op (int8_mixed fuse_swiglu)
+void kernel_silu_mul(const float *a, const float *b, float *output, int n) {
+    PIPE("silu_mul");
+    mb_pc pc;
+    pc.p(a).p(b).p(output).i(n);
+    mb_vk_launch1d(pipe, n, pc);
+}
 // int8_mixed IRs (pipeline/int8_mixed.py): dynamic per-row quantization and the int8 linear with an
 // fp32 (dequantized) output
 void kernel_quantize_rows_s8(const float *input, const float *col_inv, int8_t *output, float *row_scale, int M,
