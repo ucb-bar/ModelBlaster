@@ -1116,34 +1116,84 @@ void kernel_lstm(const float *x, const float *w_ih, const float *w_hh, const flo
     mb_copy(h, out, (size_t)H * sizeof(float));
 }
 
-// ---------------------------------------------------------------- integer-closed kinds: PLACEHOLDERS
-// pipeline/integer_kernels.py's kinds (int8/int16/int64 codes, integer requantisation) have no OpenCL kernel yet.
-// The launchers below are placeholders, not seeds to measure: each has its KernelSpec's exact signature, so a
-// problem that contains the kind exports and builds, and running it reports MB_ERROR instead of returning wrong
-// data. The spec's reference_impl is the contract a real kernel must meet bit-exactly.
-
-// PLACEHOLDER: no OpenCL kernel for copy_q; reports MB_ERROR (see the integer-closed section note).
+// ---------------------------------------------------------------- integer-closed kinds
+// pipeline/integer_kernels.py's kinds: integer codes of 8, 15/16, 32 or 64 bits (`bits`; 15-bit codes are held in
+// int16). The data-movement kinds below are naive seeds, one work-item per output element, that load and store
+// the codes exactly as the spec's reference_impl does (mbi_ld / mbi_st: sign-extend on load, truncate on store),
+// so they are bit-exact by construction. The arithmetic kinds after them are placeholders (MB_ERROR).
+static mb_program cl_intq_move = MB_CL(R"CL(
+long mbq_ld(__global const char *p, int bits, long i) {
+    if (bits == 8) return p[i];
+    if (bits == 15 || bits == 16) return ((__global const short *)p)[i];
+    if (bits == 32) return ((__global const int *)p)[i];
+    return ((__global const long *)p)[i];
+}
+void mbq_st(__global char *p, int bits, long i, long v) {
+    if (bits == 8) p[i] = (char)v;
+    else if (bits == 15 || bits == 16) ((__global short *)p)[i] = (short)v;
+    else if (bits == 32) ((__global int *)p)[i] = (int)v;
+    else ((__global long *)p)[i] = v;
+}
+__kernel void k_copy_q(__global const char *x, __global char *y, long n, int bits) {
+    long i = MB_TID; if (i < n) mbq_st(y, bits, i, mbq_ld(x, bits, i));
+}
+__kernel void k_repeat_q(__global const char *x, __global char *y, long n, long tot, int bits) {
+    long i = MB_TID; if (i < tot) mbq_st(y, bits, i, mbq_ld(x, bits, i % n));
+}
+__kernel void k_slice_c_q(__global const char *x, __global char *y, int bits, int IC, int C0, long ohw, int HW,
+                          long tot) {
+    long i = MB_TID; if (i >= tot) return;
+    long n = i / ohw, r = i % ohw;
+    mbq_st(y, bits, i, mbq_ld(x, bits, (n * IC + C0) * HW + r));
+}
+__kernel void k_permute4_q(__global const char *x, __global char *y, int bits, int od1, int od2, int od3,
+                           long os0, long os1, long os2, long os3, long tot) {
+    long i = MB_TID; if (i >= tot) return;
+    long e = i % od3, r = i / od3; long c = r % od2; r /= od2; long b = r % od1; long a = r / od1;
+    mbq_st(y, bits, i, mbq_ld(x, bits, a * os0 + b * os1 + c * os2 + e * os3));
+}
+__kernel void k_cat2_c1_q(__global const char *a, int a_bits, int Ca, __global const char *b, int b_bits, int Cb,
+                          __global char *y, int out_bits, int HW, long tot) {
+    long i = MB_TID; if (i >= tot) return;
+    long chw = (long)(Ca + Cb) * HW, n = i / chw, r = i % chw;
+    long v = r < (long)Ca * HW ? mbq_ld(a, a_bits, n * Ca * HW + r) : mbq_ld(b, b_bits, n * Cb * HW + r - (long)Ca * HW);
+    mbq_st(y, out_bits, i, v);
+}
+)CL");
 void kernel_copy_q(const void *src, void *dst, int n, int bits) {
-    (void)src; (void)dst; (void)n; (void)bits;
-    mb_error("kernel_copy_q: placeholder OpenCL seed, the integer-closed kind has no OpenCL kernel");
+    mb_launch(MB_KERNEL(cl_intq_move, k_copy_q), mb_grid(n), src, dst, (long)n, bits);
 }
-// PLACEHOLDER: no OpenCL kernel for repeat_q; reports MB_ERROR (see the integer-closed section note).
 void kernel_repeat_q(const void *src, void *dst, int n, int times, int bits) {
-    (void)src; (void)dst; (void)n; (void)times; (void)bits;
-    mb_error("kernel_repeat_q: placeholder OpenCL seed, the integer-closed kind has no OpenCL kernel");
+    long tot = (long)n * times;
+    if (tot > 0) mb_launch(MB_KERNEL(cl_intq_move, k_repeat_q), mb_grid(tot), src, dst, (long)n, tot, bits);
 }
-// PLACEHOLDER: no OpenCL kernel for slice_c_q; reports MB_ERROR (see the integer-closed section note).
 void kernel_slice_c_q(const void *input, void *output, int bits, int N, int IC, int C_start, int C_end, int HW) {
-    (void)input; (void)output; (void)bits; (void)N; (void)IC; (void)C_start; (void)C_end; (void)HW;
-    mb_error("kernel_slice_c_q: placeholder OpenCL seed, the integer-closed kind has no OpenCL kernel");
+    long ohw = (long)(C_end - C_start) * HW, tot = (long)N * ohw;
+    if (tot > 0) mb_launch(MB_KERNEL(cl_intq_move, k_slice_c_q), mb_grid(tot), input, output, bits, IC, C_start, ohw,
+                           HW, tot);
 }
-// PLACEHOLDER: no OpenCL kernel for permute4_q; reports MB_ERROR (see the integer-closed section note).
 void kernel_permute4_q(const void *input, void *output, int bits, int d0, int d1, int d2, int d3,
                        int p0, int p1, int p2, int p3) {
-    (void)input; (void)output; (void)bits; (void)d0; (void)d1; (void)d2; (void)d3;
-    (void)p0; (void)p1; (void)p2; (void)p3;
-    mb_error("kernel_permute4_q: placeholder OpenCL seed, the integer-closed kind has no OpenCL kernel");
+    const int din[4] = { d0, d1, d2, d3 }, perm[4] = { p0, p1, p2, p3 };
+    const long sin[4] = { (long)d1 * d2 * d3, (long)d2 * d3, d3, 1 };
+    int od[4]; long os[4];
+    for (int k = 0; k < 4; k++) { od[k] = din[perm[k]]; os[k] = sin[perm[k]]; }
+    long tot = (long)d0 * d1 * d2 * d3;
+    if (tot > 0) mb_launch(MB_KERNEL(cl_intq_move, k_permute4_q), mb_grid(tot), input, output, bits, od[1], od[2],
+                           od[3], os[0], os[1], os[2], os[3], tot);
 }
+void kernel_cat2_c1_q(const void *a, int a_bits, int Ca, const void *b, int b_bits, int Cb, void *output,
+                      int out_bits, int N, int HW) {
+    long tot = (long)N * (Ca + Cb) * HW;
+    if (tot > 0) mb_launch(MB_KERNEL(cl_intq_move, k_cat2_c1_q), mb_grid(tot), a, a_bits, Ca, b, b_bits, Cb, output,
+                           out_bits, HW, tot);
+}
+
+// PLACEHOLDERS: the arithmetic integer-closed kinds (integer requantisation, int64/int128 products) have no OpenCL
+// kernel yet. Each launcher has its KernelSpec's exact signature, so a problem that contains the kind exports and
+// builds, and running it reports MB_ERROR instead of returning wrong data. The spec's reference_impl is the
+// contract a real kernel must meet bit-exactly.
+
 // PLACEHOLDER: no OpenCL kernel for gap_q; reports MB_ERROR (see the integer-closed section note).
 void kernel_gap_q(const void *input, int in_bits, void *output, int out_bits, int N, int C, int HW,
                   int32_t M, int32_t s) {
@@ -1163,13 +1213,6 @@ void kernel_add_q(const void *a, int a_bits, const void *b, int b_bits, void *ou
     (void)a; (void)a_bits; (void)b; (void)b_bits; (void)output; (void)out_bits;
     (void)rows; (void)cols; (void)ma; (void)n_ma; (void)mb; (void)b_rows; (void)S;
     mb_error("kernel_add_q: placeholder OpenCL seed, the integer-closed kind has no OpenCL kernel");
-}
-// PLACEHOLDER: no OpenCL kernel for cat2_c1_q; reports MB_ERROR (see the integer-closed section note).
-void kernel_cat2_c1_q(const void *a, int a_bits, int Ca, const void *b, int b_bits, int Cb, void *output,
-                      int out_bits, int N, int HW) {
-    (void)a; (void)a_bits; (void)Ca; (void)b; (void)b_bits; (void)Cb; (void)output; (void)out_bits;
-    (void)N; (void)HW;
-    mb_error("kernel_cat2_c1_q: placeholder OpenCL seed, the integer-closed kind has no OpenCL kernel");
 }
 // PLACEHOLDER: no OpenCL kernel for vint_action_post_acc; reports MB_ERROR (see the integer-closed section note).
 void kernel_vint_action_post_acc(const int64_t *dist_acc, const double *dist_scale, const int64_t *act_acc,
