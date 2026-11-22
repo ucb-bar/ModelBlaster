@@ -49,9 +49,10 @@ Also: ``--platform linux`` (the file selects hosted POSIX itself),
 ``--model-gen-dir`` (multi-input models' state members), ``--networks``
 (the known set for the job-name split), ``--seq`` (T ticks per boot with a
 per-tick output check, for stateful models), the opt-in MB_TIMELINE stamps
-(runtime/mb_timeline.h), each model's one-time init, and on Zephyr a guard
-around every kernel call (mstatus.VS re-arm, scheduler lock / IRQ mask,
-fences) plus a per-hart V enable at worker start; see the header comments in
+(runtime/mb_timeline.h), each model's one-time init, a per-hart V enable at
+worker start on Zephyr, and an opt-in Zephyr guard around every kernel call
+(-DXPURT_DISPATCH_IRQ_GUARD=1: VS re-arm, scheduler lock / IRQ mask;
+-DXPURT_DISPATCH_FENCE=1: fences), off by default; see the header comments in
 the emitted file.
 """
 
@@ -1187,31 +1188,30 @@ static void xpurt_unlock_entry(const xpurt_sched_entry_t *e)
 {chr(10).join(inc_lines)}
 #include "{dispatch_table_header}"
 
-/* Kernel-call guard (Zephyr on RISC-V only; compiled out on hosted POSIX).
- * Around each single kernel call -- never across a dependency wait:
- *   - mstatus.VS re-armed to Initial. Zephyr enables V from the BOOT hart's
- *     misa, and its context-switch V save/restore can leave VS Off on a hart
- *     that has V; the first vsetvli then traps. A no-op on harts without V.
- *   - XPURT_DISPATCH_IRQ_GUARD (default 1): k_sched_lock(), plus this hart's
- *     interrupts masked (arch_irq_lock) when the call has no intra-op pool to
- *     wait on. On the Saturn RVV configs a thread switch inside a vector
- *     kernel can fault in z_riscv_vstate_restore_thread. Not irq_lock(): under
- *     CONFIG_SMP that is Zephyr's global lock and serialises every worker.
- *   - XPURT_DISPATCH_FENCE (default 1): fence rw,rw before and after, so a
- *     RoCC accelerator (Gemmini DMA) and the CPU harts see each other's data.
- * Build with -DXPURT_DISPATCH_IRQ_GUARD=0 / -DXPURT_DISPATCH_FENCE=0 to drop
- * either. */
-#if !defined(MB_PLATFORM_POSIX) && defined(__riscv)
+/* Kernel-call guard: OFF by default (Zephyr on RISC-V only; never on hosted
+ * POSIX). Around each single kernel call -- never across a dependency wait:
+ *   - -DXPURT_DISPATCH_IRQ_GUARD=1: mstatus.VS re-armed to Initial (Zephyr's
+ *     context-switch V save/restore can leave VS Off on a hart that has V),
+ *     k_sched_lock(), and this hart's interrupts masked (arch_irq_lock) when
+ *     the call has no intra-op pool to wait on. It masked faults seen on the
+ *     Saturn RVV configs (a thread switch inside a vector kernel faulting in
+ *     z_riscv_vstate_restore_thread), which may be a Saturn bug rather than a
+ *     software one, so it is opt-in. Not irq_lock(): under CONFIG_SMP that is
+ *     Zephyr's global lock and serialises every worker.
+ *   - -DXPURT_DISPATCH_FENCE=1: fence rw,rw before and after, so a RoCC
+ *     accelerator (Gemmini DMA) and the CPU harts see each other's data.
+ * With both 0 (the default) the call is emitted bare, as on main. */
 #ifndef XPURT_DISPATCH_IRQ_GUARD
-#define XPURT_DISPATCH_IRQ_GUARD 1
+#define XPURT_DISPATCH_IRQ_GUARD 0
 #endif
 #ifndef XPURT_DISPATCH_FENCE
-#define XPURT_DISPATCH_FENCE 1
+#define XPURT_DISPATCH_FENCE 0
 #endif
+#if !defined(MB_PLATFORM_POSIX) && defined(__riscv) && (XPURT_DISPATCH_IRQ_GUARD || XPURT_DISPATCH_FENCE)
 #define XPURT_KERNEL_ENTER(pool_) \\
     unsigned int xk_key_ = 0; \\
     const int xk_mask_ = XPURT_DISPATCH_IRQ_GUARD && (pool_) == NULL; \\
-    __asm__ volatile("csrs mstatus, %0" : : "r"(1UL << 9)); \\
+    if (XPURT_DISPATCH_IRQ_GUARD) __asm__ volatile("csrs mstatus, %0" : : "r"(1UL << 9)); \\
     if (xk_mask_) xk_key_ = arch_irq_lock(); \\
     if (XPURT_DISPATCH_IRQ_GUARD) k_sched_lock(); \\
     if (XPURT_DISPATCH_FENCE) __asm__ volatile("fence rw,rw" ::: "memory")

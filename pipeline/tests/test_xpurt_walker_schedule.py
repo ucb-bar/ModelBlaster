@@ -331,16 +331,20 @@ class PortedOptions(unittest.TestCase):
         self.assertIn("#ifdef MODEL_M_HAS_INIT", main)
         self.assertLess(main.index("model_m_init_rvv();"), main.index("pthread_create("))
 
-    def test_kernel_call_is_guarded_on_zephyr_only(self):
+    def test_kernel_call_guard_is_opt_in_and_zephyr_only(self):
         src = _emit()
         call = src.index("MODEL_M_DISPATCH_FNS_RVV[e_->dispatch_id](&st_);")
         self.assertLess(src.rindex("XPURT_KERNEL_ENTER(st_.pool);", 0, call), call)
         self.assertGreater(src.index("XPURT_KERNEL_EXIT();", call), call)
-        guard = src[src.index("#if !defined(MB_PLATFORM_POSIX) && defined(__riscv)"):]
-        self.assertIn("k_sched_lock()", guard[:2000])
-        self.assertIn("#define XPURT_KERNEL_ENTER(pool_) do { } while (0)", src)
+        # off unless the build asks: both switches default to 0, and with both 0 the macros are empty
+        self.assertIn("#define XPURT_DISPATCH_IRQ_GUARD 0", src)
+        self.assertIn("#define XPURT_DISPATCH_FENCE 0", src)
+        guard = src[src.index("#if !defined(MB_PLATFORM_POSIX) && defined(__riscv) && "
+                              "(XPURT_DISPATCH_IRQ_GUARD || XPURT_DISPATCH_FENCE)"):]
+        self.assertIn("k_sched_lock()", guard[:1500])
+        self.assertIn("#define XPURT_KERNEL_ENTER(pool_) do { } while (0)", guard[:1500])
         worker = src[src.index("static void *xpurt_worker(void *arg)"):]
-        self.assertIn('csrr %0, misa', worker[:2500])
+        self.assertIn('csrr %0, misa', worker[:2500])      # the worker-start V enable is not part of the guard
 
     def test_timeline_hooks_are_compiled_out_by_default_and_follow_the_dynamic_run_hart(self):
         src = _emit()
