@@ -28,6 +28,10 @@ linears -- to int8:
   the residual stream, RoPE, attention, softmax and the norms stay fp32 and
   never see an int8 grid.
 * ops named in ``keep_fp32`` (fnmatch patterns over IR op names) stay fp32.
+* ``outliers`` ({pattern: n}): for the linears it names, the n input columns with the
+  largest calibrated |x| leave the int8 product and run as an fp32 linear on an
+  ``index_select`` of them, added to the int8 part (LLM.int8()-style decomposition).
+* ``alpha_by`` ({pattern: a}): the smoothing strength of the tensors those linears read.
 * constants stay the fp32 constant tensors of the fp32 lowering (no linear
   reads one in these graphs; one that did would be quantized like any
   activation, its row scales computed by quantize_rows_s8 on the device).
@@ -132,14 +136,39 @@ _SPECS = [
 ]
 
 
+_ROPE = ("rope_half",
+         "void kernel_rope_half(const float *input, const float *cos_t, const float *sin_t, float *output, "
+         "int R, int H, int half)",
+         "Rotary position embedding, non-interleaved halves (lerobot / Llama apply_rope), fp32:\n"
+         "  input / output [R, H, 2*half] (R positions, H heads), cos_t / sin_t [R, half]\n"
+         "  x1 = input[r, h, :half], x2 = input[r, h, half:]\n"
+         "  output[r, h, :half] = x1 * cos - x2 * sin;  output[r, h, half:] = x2 * cos + x1 * sin\n"
+         "(each product and sum rounded to fp32). The int8_mixed pass fuses the generic lowering's\n"
+         "two slices, four multiplies, sub, add and cat into it.",
+         "void kernel_rope_half(const float *input, const float *cos_t, const float *sin_t, float *output,\n"
+         "                      int R, int H, int half) {\n"
+         "    for (int r = 0; r < R; r++)\n"
+         "        for (int h = 0; h < H; h++)\n"
+         "            for (int j = 0; j < half; j++) {\n"
+         "                const float *x = input + ((size_t)r * H + h) * 2 * half;\n"
+         "                float *y = output + ((size_t)r * H + h) * 2 * half;\n"
+         "                const float c = cos_t[(size_t)r * half + j], s = sin_t[(size_t)r * half + j];\n"
+         "                const float a = x[j] * c, b = x[half + j] * s, d = x[half + j] * c, e = x[j] * s;\n"
+         "                y[j] = a - b;\n"
+         "                y[half + j] = d + e;\n"
+         "            }\n}\n",
+         [{"R": 3, "H": 2, "half": 4}])
+
+
 def kernel_specs(kernel_spec_cls) -> dict:
     """KernelSpecs of the int8_mixed kinds (reference_kernels registers them)."""
     i8p, fp = ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_float)
     argt = {"quantize_rows_s8": [fp, fp, i8p, fp, ctypes.c_int, ctypes.c_int],
             "linear_dq_s8": [i8p, fp, i8p, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]}
+    argt["rope_half"] = [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     return {op: kernel_spec_cls(op=op, signature=sig, semantics=sem, reference_impl=impl, extra_shapes=shapes,
                                 argtypes_factory=(lambda a=argt[op]: list(a)))
-            for op, sig, sem, impl, shapes in _SPECS}
+            for op, sig, sem, impl, shapes in _SPECS + [_ROPE]}
 
 
 # ------------------------------------------------------------------ the int8 kinds on the CPU (bit-exact)
@@ -180,7 +209,16 @@ def _r_linear_dq(ir, op, ins):
     return [y]
 
 
-TORCH_RULES = {"quantize_rows_s8": _r_quantize_rows, "linear_dq_s8": _r_linear_dq}
+def _r_rope_half(ir, op, ins):
+    sh = op["shape"]
+    R, H, d = sh["R"], sh["H"], sh["half"]
+    x = ins[0].reshape(R, H, 2 * d).float()
+    c, s_ = ins[1].reshape(R, 1, d).float(), ins[2].reshape(R, 1, d).float()
+    x1, x2 = x[..., :d], x[..., d:]
+    return [torch.cat([x1 * c - x2 * s_, x2 * c + x1 * s_], dim=-1)]
+
+
+TORCH_RULES = {"quantize_rows_s8": _r_quantize_rows, "linear_dq_s8": _r_linear_dq, "rope_half": _r_rope_half}
 
 
 # ------------------------------------------------------------------ IR walk on the CPU
@@ -305,18 +343,30 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
     cols = _calib_col_ranges(ir, samples, {x: rd[0]["shape"]["K"] for x, rd in readers.items()})
 
     # SmoothQuant factors, one per quantized tensor (shared by all of its int8 readers)
-    col_inv = {}
+    col_inv, outl = {}, {}
     for x, rd in readers.items():
         K = rd[0]["shape"]["K"]
         wmax = np.zeros(K)
         for op in rd:
             wmax = np.maximum(wmax, np.abs(np.asarray(ir.weights[op["weight"]], np.float64)).max(axis=0))
         xmax = cols[x].numpy() if x in cols else np.ones(K)
+        a = alpha
+        for pat, v in pol.get("alpha_by", {}).items():
+            if any(fnmatch.fnmatchcase(op["name"], pat) for op in rd):
+                a = float(v)
         sm = np.ones(K)
-        if alpha > 0:
-            sm = np.maximum(xmax, 1e-5) ** alpha / np.maximum(wmax, 1e-5) ** (1.0 - alpha)
+        if a > 0:
+            sm = np.maximum(xmax, 1e-5) ** a / np.maximum(wmax, 1e-5) ** (1.0 - a)
             sm = np.where(np.isfinite(sm) & (sm > 0), sm, 1.0)
         col_inv[x] = (1.0 / sm).astype(np.float32)
+        # outlier columns (LLM.int8()-style decomposition): the n columns with the largest calibrated
+        # |x| leave the int8 product (col_inv 0, their weight columns 0) and run as a small fp32 linear
+        n_out = max([int(v) for op in rd for pat, v in pol.get("outliers", {}).items()
+                     if fnmatch.fnmatchcase(op["name"], pat)] or [0])
+        if n_out > 0:
+            cols_x = np.sort(np.argsort(-xmax, kind="stable")[:min(n_out, K)])
+            outl[x] = cols_x
+            col_inv[x][cols_x] = 0.0
 
     sel_ids = {id(op) for op in sel}
     qname: dict[str, tuple[str, str]] = {}
@@ -338,8 +388,17 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
             ops.append({"name": q, "op": "quantize_rows_s8", "inputs": [x, ci], "outputs": [q, s],
                         "shape": {"M": M, "K": K}})
         q, s = qname[x]
-        # W' = W * sm, with sm = 1 / col_inv as stored (so x' W'^T = x W^T up to the fp32 x')
-        w = np.asarray(ir.weights[op["weight"]], np.float64) / col_inv[x].astype(np.float64)[None, :]
+        if x in outl and f"{x}__outl" not in tensors:
+            cols_x, xo, xi = outl[x], f"{x}__outl", f"{x}__outl_idx"
+            weights[f"const.{xi}"] = cols_x.astype(np.float32)
+            tensors[xi] = {"shape": [len(cols_x)], "dtype": "f32", "quant": None, "const": f"const.{xi}"}
+            tensors[xo] = {"shape": [M, len(cols_x)], "dtype": "f32", "quant": None}
+            ops.append({"name": xo, "op": "index_select", "inputs": [x, xi], "outputs": [xo],
+                        "shape": {"outer": M, "A": K, "J": len(cols_x), "inner": 1}})
+        # W' = W * sm, with sm = 1 / col_inv as stored (so x' W'^T = x W^T up to the fp32 x');
+        # outlier columns (col_inv 0) get zero weight columns here and their own fp32 linear below
+        ci64 = col_inv[x].astype(np.float64)
+        w = np.asarray(ir.weights[op["weight"]], np.float64) / np.where(ci64 > 0, ci64, np.inf)[None, :]
         ws = (np.maximum(np.abs(w).max(axis=1), 1e-30) / QMAX).astype(np.float32)
         wq = _round_half_away(torch.from_numpy(w / ws.astype(np.float64)[:, None]))
         wkey, skey = f"{op['weight']}.q8", f"{op['weight']}.wscale"
@@ -347,7 +406,24 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
         weights[skey] = ws
         new = {k: v for k, v in op.items() if k not in ("dispatch_id", "depends_on", "hardware_target")}
         new.update(op="linear_dq_s8", inputs=[q, s], weight=wkey, w_scale=skey)
-        ops.append(new)
+        if x in outl:
+            y, N = op["outputs"][0], int(sh["N"])
+            yq, yo, okey = f"{y}__i8part", f"{y}__outlpart", f"{op['weight']}.outl"
+            weights[okey] = np.ascontiguousarray(np.asarray(ir.weights[op["weight"]], np.float32)[:, outl[x]])
+            for t in (yq, yo):
+                tensors[t] = {"shape": list(tensors[y]["shape"]), "dtype": "f32", "quant": None}
+            new["outputs"] = [yq]
+            ops.append(new)
+            ops.append({"name": yo, "op": "linear", "inputs": [f"{x}__outl"], "outputs": [yo], "weight": okey,
+                        "bias": None, "shape": {"M": M, "K": len(outl[x]), "N": N}})
+            ops.append({"name": f"{y}__sum", "op": "add", "inputs": [yq, yo], "outputs": [y],
+                        "shape": {"n": M * N}})
+        else:
+            ops.append(new)
+    if pol.get("fuse_norm", True):
+        ops = _fuse_rms_norm(ops, tensors, weights, set(ir.output_names()))
+    if pol.get("fuse_rope", True):
+        ops = _fuse_rope(ops, tensors, weights, set(ir.output_names()))
     # the fp32 weights of the linears that went to int8 leave the IR (unless something else reads them)
     used = {op.get(r) for op in ops for r in ("weight", "bias", "w_scale", "gamma_key", "beta_key")}
     gone = {op["weight"] for op in sel} - used
@@ -363,10 +439,157 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
     report = {"policy": pol, "n_calibration": len(samples),
               "op_kinds": dict(sorted(kinds.items(), key=lambda kv: -kv[1])),
               "n_int8_linears": len(sel),
-              "n_fp32_linears": sum(1 for op in ops if op["op"] == "linear"),
-              "fp32_linears": [op["name"] for op in ops if op["op"] == "linear"]}
+              "n_fp32_linears": sum(1 for op in ops if op["op"] == "linear" and not op["name"].endswith("__outlpart")),
+              "fp32_linears": [op["name"] for op in ops if op["op"] == "linear" and not op["name"].endswith("__outlpart")],
+              "outlier_columns": {x: len(c) for x, c in outl.items()}}
     g["int8_mixed"] = dict(report)
     return g, weights, report
+
+
+def _fuse_rms_norm(ops: list, tensors: dict, weights: dict, outputs: set) -> list:
+    """The generic lowering's RMSNorm chain feeding quantize_rows_s8 --
+        square -> mean -> + eps -> rsqrt -> x * r -> w * (.)  -> quantize_rows_s8(col_inv)
+    -- becomes rms_norm (one fp32 row kernel) -> quantize_rows_s8 with col_inv * w: the norm's weight
+    folds into the per-column factor (the weighted tensor is read by nothing else). 6 launches -> 1;
+    with an fp32 reader the weight multiply stays (6 -> 2).
+    The fp32 values move by fp32 rounding only (rms_norm divides by sqrt instead of multiplying
+    by rsqrt; one multiply fewer), within the fp32 bound; the golden is this IR's own walk."""
+    prod = {t: i for i, op in enumerate(ops) for t in op["outputs"]}
+    users: dict = {}
+    for i, op in enumerate(ops):
+        for t in op["inputs"]:
+            users.setdefault(t, []).append(i)
+
+    def only(t, kind, fn=None):
+        u = users.get(t, [])
+        if len(u) != 1 or t in outputs:
+            return None
+        op = ops[u[0]]
+        return u[0] if op["op"] == kind and (fn is None or op.get("fn") == fn) else None
+
+    drop, new_at = set(), {}
+    for i, sq in enumerate(ops):
+        if sq["op"] != "ewise1" or sq.get("fn") != "square":
+            continue
+        x = sq["inputs"][0]
+        im = only(sq["outputs"][0], "reduce", "mean")
+        if im is None or ops[im]["shape"].get("inner") != 1:
+            continue
+        ie = only(ops[im]["outputs"][0], "ewise_scalar", "add")
+        ir_ = only(ops[ie]["outputs"][0], "ewise1", "rsqrt") if ie is not None else None
+        imul = only(ops[ir_]["outputs"][0], "ewise2", "mul") if ir_ is not None else None
+        if imul is None or ops[imul]["inputs"] != [x, ops[ir_]["outputs"][0]]:
+            continue
+        nrm = ops[imul]["outputs"][0]
+        iw = only(nrm, "ewise2", "mul")
+        if iw is None:
+            continue
+        wname = ops[iw]["inputs"][0]
+        y = ops[iw]["outputs"][0]
+        if not tensors.get(wname, {}).get("const") or ops[iw]["inputs"][1] != nrm or y in outputs:
+            continue
+        qs = users.get(y, [])
+        M, K = int(ops[im]["shape"]["outer"]), int(ops[im]["shape"]["R"])
+        wv = np.asarray(weights[tensors[wname]["const"]], np.float32).reshape(-1)
+        if wv.size != K:
+            continue
+        new_at[i] = {"name": f"{nrm}__rms", "op": "rms_norm", "inputs": [x], "outputs": [nrm],
+                     "eps": float(ops[ie]["c"]), "shape": {"outer": M, "reduce": K, "inner": 1}}
+        drop |= {im, ie, ir_, imul}
+        if not qs or any(ops[j]["op"] != "quantize_rows_s8" for j in qs):
+            continue                     # (an fp32 reader: the weight multiply stays)
+        drop.add(iw)
+        for j in qs:
+            q = ops[j]
+            ci = q["inputs"][1]
+            key = f"const.{ci}__w"
+            weights[key] = (np.asarray(weights[tensors[ci]["const"]], np.float32) * wv).astype(np.float32)
+            tensors[f"{ci}__w"] = dict(tensors[ci], const=key)
+            ops[j] = dict(q, inputs=[nrm, f"{ci}__w"])
+    out = []
+    for i, op in enumerate(ops):
+        if i in new_at:
+            out.append(new_at[i])
+        elif i not in drop:
+            out.append(op)
+    used = {t for op in out for t in op["inputs"] + op["outputs"]} | outputs
+    for t in [t for t in tensors if t not in used and t in prod]:
+        del tensors[t]
+    for t in [t for t, v in tensors.items() if v.get("const") and t not in used]:
+        weights.pop(tensors[t]["const"], None)
+        del tensors[t]
+    return out
+
+
+def _fuse_rope(ops: list, tensors: dict, weights: dict, outputs: set) -> list:
+    """The generic lowering's RoPE (two strided slices of x [R*H, 2d], x1*cos, x2*sin, sub, x2*cos,
+    x1*sin, add, cat) -> one rope_half: 9 launches -> 1. Same fp32 products and sums."""
+    prod = {t: i for i, op in enumerate(ops) for t in op["outputs"]}
+    users: dict = {}
+    for i, op in enumerate(ops):
+        for t in op["inputs"]:
+            users.setdefault(t, []).append(i)
+
+    def const(t):
+        m = tensors.get(t, {})
+        return np.asarray(weights[m["const"]], np.float32) if m.get("const") else None
+
+    def mul_of(t):                       # t = ewise2 mul(slice, const) -> (slice, const array, broadcast dims)
+        i = prod.get(t)
+        if i is None or ops[i]["op"] != "ewise2" or ops[i].get("fn") != "mul" or len(users.get(t, [])) != 1:
+            return None
+        a, b = ops[i]["inputs"]
+        cb = const(b)
+        return (i, a, cb, ops[i]["shape"]) if cb is not None else None
+
+    drop, new_at = set(), {}
+    for ic, cat in enumerate(ops):
+        sh = cat["shape"]
+        if cat["op"] != "catn" or sh.get("n_in") != 2 or sh.get("inner") != 1 or sh.get("c0") != sh.get("c1"):
+            continue
+        d, rows = int(sh["c0"]), int(sh["outer"])
+        A, B = cat["inputs"]
+        ia, ib = prod.get(A), prod.get(B)
+        if ia is None or ib is None or len(users.get(A, [])) != 1 or len(users.get(B, [])) != 1:
+            continue
+        if not (ops[ia]["op"] == "ewise2" and ops[ia].get("fn") == "sub" and ops[ib]["op"] == "add"):
+            continue
+        P, Q = (mul_of(t) for t in ops[ia]["inputs"])
+        Rm, Sm = (mul_of(t) for t in ops[ib]["inputs"])
+        if None in (P, Q, Rm, Sm):
+            continue
+        x1, x2 = P[1], Q[1]
+        if Rm[1] != x2 or Sm[1] != x1 or not (np.array_equal(P[2], Rm[2]) and np.array_equal(Q[2], Sm[2])):
+            continue
+        i1, i2 = prod.get(x1), prod.get(x2)
+        if i1 is None or i2 is None or ops[i1]["op"] != "strided_copy" or ops[i2]["op"] != "strided_copy":
+            continue
+        s1, s2 = ops[i1]["shape"], ops[i2]["shape"]
+        src = ops[i1]["inputs"][0]
+        if (ops[i2]["inputs"][0] != src or s1["off"] != 0 or s2["off"] != d
+                or any(s[k] != v for s in (s1, s2) for k, v in (("d4", rows), ("d5", d), ("s4", 2 * d), ("s5", 1)))
+                or any(s[f"d{k}"] != 1 for s in (s1, s2) for k in range(4))
+                or len(users.get(x1, [])) != 2 or len(users.get(x2, [])) != 2):
+            continue
+        m = P[3]                         # broadcast of the table: [R, H, d] against [R, 1, d]
+        R, H = int(m["d3"]), int(m["d4"])
+        if R * H != rows or m["d5"] != d or m["sb4"] != 0 or P[2].size != R * d or Q[2].size != R * d:
+            continue
+        cn, sn = f"{cat['outputs'][0]}__cos", f"{cat['outputs'][0]}__sin"
+        for nm, arr in ((cn, P[2]), (sn, Q[2])):
+            weights[f"const.{nm}"] = np.ascontiguousarray(arr.reshape(R, d))
+            tensors[nm] = {"shape": [R, d], "dtype": "f32", "quant": None, "const": f"const.{nm}"}
+        new_at[ic] = {"name": f"{cat['outputs'][0]}__rope", "op": "rope_half", "inputs": [src, cn, sn],
+                      "outputs": cat["outputs"], "shape": {"R": R, "H": H, "half": d}}
+        drop |= {i1, i2, P[0], Q[0], Rm[0], Sm[0], ia, ib}
+    out = [new_at.get(i, op) for i, op in enumerate(ops) if i not in drop]
+    used = {t for op in out for t in op["inputs"] + op["outputs"]} | outputs
+    for t in [t for t in tensors if t not in used and t in prod]:
+        del tensors[t]
+    for t in [t for t, v in tensors.items() if v.get("const") and t not in used]:
+        weights.pop(tensors[t]["const"], None)
+        del tensors[t]
+    return out
 
 
 def inputs_of(ir, sample) -> dict:

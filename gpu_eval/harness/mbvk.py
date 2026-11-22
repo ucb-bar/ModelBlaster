@@ -53,6 +53,7 @@ class VkBackend:
             ("mb_vk_replay", None, [ctypes.c_int]), ("mb_vk_graph_cbs", ctypes.c_int, [ctypes.c_int]),
             ("mb_vk_set_packed", None, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]),
             ("mb_vk_packed_count", ctypes.c_int, []),
+            ("mb_vk_no_barrier_next", None, []), ("mb_vk_barriers_skipped", ctypes.c_long, []),
         ]:
             if not hasattr(L, name):        # an older library
                 continue

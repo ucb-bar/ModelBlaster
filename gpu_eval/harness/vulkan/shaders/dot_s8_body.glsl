@@ -5,13 +5,23 @@
 //   sum (x + io)(w + fo) = sum xw + fo * sum x + io * sum w + K * io * fo
 // in int32 (two's-complement wraparound, as the reference's int32 accumulator),
 // the sums of x and w being dot products with 0x01010101.
-// A 256-wide workgroup computes a BM x BN = 32 x 64 output tile: K moves
-// through LDS 64 bytes (16 dwords) at a time, loaded coalesced (zero-filled past
+// A 256-wide workgroup computes a BM x BN output tile (32 x 64 by default; DOT_RM / DOT_RN /
+// DOT_BKQ select others): K moves through LDS 4 * BKQ bytes at a time, loaded coalesced (zero-filled past
 // K and clamped past M / N); invocation (ty, tx) owns rows 2ty.. and columns
 // 4tx... K % 4 == 0 and 4-byte aligned operands (launcher-checked).
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
-const int RM = 2, RN = 4, BM = 32, BN = 64, BKQ = 16;
+#ifndef DOT_RM
+#define DOT_RM 2
+#endif
+#ifndef DOT_RN
+#define DOT_RN 4
+#endif
+#ifndef DOT_BKQ
+#define DOT_BKQ 16
+#endif
+// a 16 x 16 thread grid; invocation (ty, tx) owns rows ty*RM.. and columns tx*RN.. of the tile
+const int RM = DOT_RM, RN = DOT_RN, BM = 16 * RM, BN = 16 * RN, BKQ = DOT_BKQ;
 layout(local_size_x = 256) in;
 shared int Xs[BM][BKQ + 1];
 shared int Ws[BN][BKQ + 1];

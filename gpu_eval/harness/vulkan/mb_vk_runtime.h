@@ -64,6 +64,11 @@ uint32_t mb_vk_max_group_x(void);           // per-dimension workgroup-count lim
 // either buffer.
 void mb_vk_set_packed(const void *w, const void *p, int f16);
 int mb_vk_packed_count(void);
+// Barrier elision: the next launch's first dispatch skips its compute barrier (the caller knows it
+// reads / writes nothing written since the last barrier); a launch using scratch after another
+// one that did keeps it. mb_vk_barriers_skipped counts the skipped ones.
+void mb_vk_no_barrier_next(void);
+long mb_vk_barriers_skipped(void);
 int mb_vk_has_int_dot(void);                // packed int8 dot products enabled (VK_KHR_shader_integer_dot_product)
 
 #ifdef __cplusplus
