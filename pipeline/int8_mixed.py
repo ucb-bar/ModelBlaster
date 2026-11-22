@@ -636,7 +636,7 @@ def _fold_attention_scale(ops: list, weights: dict, outputs: set) -> list:
         for t in op["inputs"]:
             readers[t] = readers.get(t, 0) + 1
     prod = {t: op for op in ops for t in op["outputs"]}
-    drop, rename, new = set(), {}, {}
+    drop, rename, new, replaced = set(), {}, {}, set()
     for op in ops:
         if op["op"] != "mul_scalar" or op["outputs"][0] in outputs:
             continue
@@ -675,16 +675,19 @@ def _fold_attention_scale(ops: list, weights: dict, outputs: set) -> list:
         else:
             lo, hi = 0, None
         if lin["op"] == "linear":
+            replaced.add(lin["weight"])
             wk = f"{lin['weight']}.x{c:g}"
             weights[wk] = (np.asarray(weights[lin["weight"]], np.float32) * np.float32(c)).astype(np.float32)
             lin["weight"] = wk
         else:
+            replaced.add(lin["w_scale"])
             wk = f"{lin['w_scale']}.x{c:g}_{j}"
             ws = np.array(weights[lin["w_scale"]], np.float32)
             ws[lo:hi] = ws[lo:hi] * np.float32(c)
             weights[wk] = ws
             lin["w_scale"] = wk
         if lin.get("bias"):
+            replaced.add(lin["bias"])
             bk = f"{lin['bias']}.x{c:g}_{j}"
             b = np.array(weights[lin["bias"]], np.float32)
             b[lo:hi] = b[lo:hi] * np.float32(c)
@@ -700,6 +703,9 @@ def _fold_attention_scale(ops: list, weights: dict, outputs: set) -> list:
         if any(t in rename for t in op["inputs"]):
             op = dict(op, inputs=[rename.get(t, t) for t in op["inputs"]])
         out.append(op)
+    used = {op.get(r) for op in out for r in ("weight", "bias", "w_scale")}
+    for k in replaced - used:                          # the unscaled copies nothing reads any more
+        weights.pop(k, None)
     return out
 
 
