@@ -451,6 +451,39 @@ def test_smolvla_split_on_vulkan(vk, specs, split_irs):
     assert _rel(out, ref) < 1e-4
 
 
+def test_smolvla_split_int8_mixed_on_vulkan(vk, refc, split_irs, tmp_path):
+    """The tiny split graphs as int8_mixed IRs: walker gates (int8 kernels = reference C, fp32 ops in
+    bound, golden) and the chained flow loop against the CPU reference walk of the same IRs."""
+    import walk_vulkan
+    from smolvla_vulkan import SmolVLAVulkan
+    from modelblaster.pipeline import int8_mixed as I8
+    tmp, S, c, parts, x = split_irs
+    full = {op: {"signature": s.signature, "reference_impl": s.reference_impl} for op, s in KERNEL_SPECS.items()}
+    ks = walk_vulkan.VkKernelSet(full, vk)
+    for part in ("vision", "prefix", "step"):
+        I8.extract_mixed(str(tmp / part), str(tmp_path / part), None)
+        rec = walk_vulkan.evaluate(str(tmp_path / part), ks, reps=1, ref_lib=str(refc.lib._name))
+        assert rec["ok"] and not rec["missing"] and rec["n_s8_ops_not_bit_exact"] == 0, (part, rec)
+        assert rec["ref_c_mismatches_by_op"].get("linear_dq_s8") == 0
+    m = vk.mark()
+    model = SmolVLAVulkan(tmp_path, vk, full)
+    out = model.sample_actions(x["pixels"].numpy(), x["lang"].numpy(), x["state"].numpy(), x["noise"].numpy(), 3)
+    vk.release(m)
+    # the same IRs chained on the CPU (int8 kinds bit-exact as the reference C, fp32 ops as walk_torch)
+    from mbir import load_ir
+    irs = {p: load_ir(tmp_path / p) for p in ("vision", "prefix", "step")}
+    run = lambda p, *xs: I8.walk(irs[p], I8.inputs_of(irs[p], list(xs)))[irs[p].output_names()[0]]
+    kv = run("prefix", run("vision", x["pixels"]), x["lang"], x["state"])
+    xt = x["noise"].clone()
+    for s_ in range(3):
+        xt = xt + (-1 / 3) * run("step", kv, xt, S.time_embedding(1.0 - s_ / 3, c)).reshape(xt.shape)
+    assert _rel(out, xt.numpy()) < 1e-3
+    # and the int8 graphs still compute the (random-weight, tiny) model
+    ref = parts.sample_actions(x["pixels"], x["lang"], x["state"], x["noise"].clone(), 3).numpy()
+    o, r = out.reshape(-1).astype(np.float64), ref.reshape(-1).astype(np.float64)
+    assert o @ r / (np.linalg.norm(o) * np.linalg.norm(r)) > 0.99
+
+
 # ------------------------------------------------------------------ int8 (`_s8`): bit-exact vs the reference C
 @pytest.fixture(scope="module")
 def refc():
@@ -458,7 +491,8 @@ def refc():
     if not shutil.which(os.environ.get("CC", "cc")) and not os.environ.get("MB_REF_LIB"):
         pytest.skip("no C compiler for the reference kernels (or $MB_REF_LIB)")
     specs = {op: {"signature": s.signature, "reference_impl": s.reference_impl} for op, s in KERNEL_SPECS.items()}
-    ops = ["linear_s8", "matmul_s8", "softmax_s8", "layernorm_s8", "rmsnorm_s8", "gelu_s8", "sin_s8", "cos_s8", "mul_s8"]
+    ops = ["linear_s8", "matmul_s8", "softmax_s8", "layernorm_s8", "rmsnorm_s8", "gelu_s8", "sin_s8", "cos_s8", "mul_s8",
+           "quantize_rows_s8", "linear_dq_s8"]
     return walk_vulkan.RefC(specs, ops, os.environ.get("MB_REF_LIB"))
 
 
@@ -482,11 +516,28 @@ def _s8_case(op, rng):
         return args
     if op == "mul_s8":
         return [i8(4096), i8(4096), np.zeros(4096, np.int8), 4096, f(0.0078), f(0.0121), f(0.0049), -128, 127]
+    if op == "quantize_rows_s8":
+        # rows with outliers, an all-zero row, a row of exact ties (x' * inv == k + 0.5), +-inf and NaN
+        M, K = 37, 963
+        x = (rng.standard_normal((M, K)) * 3).astype(f)
+        x[1, 5], x[2, :] = 900.0, 0.0
+        x[3, :] = 0.0
+        x[3, :64] = (np.arange(64) - 32 + 0.5).astype(f)
+        x[3, 100] = f(127.0)
+        x[4, 7], x[5, 9], x[6, 11] = np.inf, -np.inf, np.nan
+        ci = (rng.random(K) * 2 + 0.25).astype(f)
+        ci[:64] = 1.0
+        ci[100] = 1.0
+        return [x, ci, np.zeros((M, K), np.int8), np.zeros(M, f), M, K]
+    if op == "linear_dq_s8":
+        M, K, N = 50, 720, 320
+        return [i8(M, K), (rng.random(M) * 0.05 + 1e-4).astype(f), i8(N, K), rng.standard_normal(N).astype(f),
+                (rng.random(N) * 1e-3 + 1e-5).astype(f), np.zeros((M, N), f), M, K, N]
     return [i8(4096), np.zeros(4096, np.int8), 4096, f(0.023), f(0.0071), -128, 127]     # gelu / sin / cos
 
 
 @pytest.mark.parametrize("op", ["linear_s8", "matmul_s8", "softmax_s8", "layernorm_s8", "rmsnorm_s8", "gelu_s8",
-                                "sin_s8", "cos_s8", "mul_s8"])
+                                "sin_s8", "cos_s8", "mul_s8", "quantize_rows_s8", "linear_dq_s8"])
 def test_s8_kernels_bit_exact(vk, refc, op):
     rng = np.random.default_rng(abs(hash(op)) % 2**32)
     _run_s8(vk, refc, op, _s8_case(op, rng))
@@ -501,6 +552,13 @@ def _s8_dot_cases():
                               (1, 32, 960, 128, -128)]:
         out.append(("linear_s8", [i8(M, K), i8(N, K), rng.integers(-2**20, 2**20, N, dtype=np.int32),
                                   np.zeros((M, N), np.int8), M, K, N, io, fo, -6, 1518500250, 10, -128, 127]))
+    for (M, K, N) in [(31, 960, 2560), (256, 768, 3072), (16, 12288, 96), (5, 36, 9), (3, 37, 5)]:
+        out.append(("linear_dq_s8", [i8(M, K), (rng.random(M) * 0.05 + 1e-4).astype(np.float32), i8(N, K),
+                                     rng.standard_normal(N).astype(np.float32),
+                                     (rng.random(N) * 1e-3 + 1e-6).astype(np.float32), np.zeros((M, N), np.float32),
+                                     M, K, N]))
+        if M == 5:                                   # no bias
+            out[-1][1][3] = None
     for (M, K, N, tb) in [(75, 64, 81, 1), (30, 31, 64, 1), (45, 64, 81, 0)]:
         b = i8(N, K) if tb else i8(K, N)
         out.append(("matmul_s8", [i8(M, K), b, np.zeros((M, N), np.int8), M, K, N, np.float32(0.011),

@@ -16,6 +16,10 @@ gelu / linear / matmul / softmax / mul / sin / cos) are held to bit-exactness:
 the output must equal the io.npz golden, and every kernel's output must equal
 ModelBlaster's reference C implementation (KernelSpec.reference_impl, built
 with the host C compiler, or given prebuilt with --ref-lib) on the same inputs.
+int8_mixed IRs (`--quant int8 --int8-mixed`, pipeline/int8_mixed.py: int8 linears
+in an fp32 graph) are held to both: every int8 kernel equal to the reference C
+and every fp32 kernel within the fp32 bound, in isolation on the CPU reference
+walk's inputs; the output within MIXED_GOLDEN_REL of the golden.
 An op without a Vulkan launcher is reported in `missing`.
 """
 from __future__ import annotations
@@ -58,6 +62,24 @@ def bindable(op: dict) -> dict:
 
 def is_int8(ir: IR) -> bool:
     return ir.graph.get("quant") == "int8"
+
+
+def is_int8_mixed(ir: IR) -> bool:
+    """An int8 IR with fp32 islands (pipeline/int8_mixed.py): f32 and i8 tensors side by side."""
+    return ir.graph.get("quant") == "int8_mixed"
+
+
+def _int8_mixed():
+    """pipeline/int8_mixed.py, loaded by path (numpy + torch only at import), like mbir's cuda_dtypes."""
+    import importlib.util
+    from pathlib import Path
+    if "mb_int8_mixed" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "mb_int8_mixed", Path(__file__).resolve().parents[2] / "pipeline" / "int8_mixed.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["mb_int8_mixed"] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules["mb_int8_mixed"]
 
 
 def _weight_array(a: np.ndarray) -> np.ndarray:
@@ -157,7 +179,7 @@ class Weights:
         for op, k in plan:
             if k is None:
                 continue
-            for role in ("weight", "bias", "gamma_key", "beta_key"):
+            for role in ("weight", "bias", "gamma_key", "beta_key", "w_scale"):
                 if op.get(role):
                     self.ptr(op[role])
             if self.pack:
@@ -305,6 +327,105 @@ def evaluate_int8(ir: IR, plan, ks: "VkKernelSet", reps: int, ref_lib: str | Non
     return rec
 
 
+# end-to-end bound of an int8_mixed IR against its golden (relative to the golden's range): the fp32
+# ops agree with the CPU only to fp32 rounding, and a row whose value lands that close to a rounding
+# boundary of quantize_rows_s8 moves one int8 step
+MIXED_GOLDEN_REL = 2e-2
+
+
+def evaluate_int8_mixed(ir: IR, plan, ks: "VkKernelSet", reps: int, ref_lib: str | None, rec: dict,
+                        isolation: bool = True) -> dict:
+    """Gates of an int8_mixed IR: the output against the golden (MIXED_GOLDEN_REL of its range); in
+    isolation on the CPU reference walk's inputs (pipeline/int8_mixed.walk), every int8 kernel equal
+    to the reference C and every fp32 kernel within the fp32 per-slot bound; replay; timing."""
+    vk = ks.vk
+    base = vk.mark()
+    weights = Weights(ir, vk)
+    weights.preload(plan)
+    consts = ir.const_tensors("cpu", int_dtype=torch.int32)
+    m = vk.mark()
+    out, env, _ = run(ir, plan, vk, weights, consts=consts)
+    out = out.copy()
+    g = ir.golden_out.reshape(-1).astype(np.float64)
+    o = out.astype(np.float64)
+    d = np.abs(o - g)
+    rec.update(golden_max_abs_err=float(d.max()), golden_rel_to_range=float(d.max()) / max(float(np.abs(g).max()), 1e-12),
+               golden_cosine=float(o @ g / max(np.linalg.norm(o) * np.linalg.norm(g), 1e-300)))
+    ok = bool(np.isfinite(out).all() and rec["golden_rel_to_range"] <= MIXED_GOLDEN_REL)
+    vk.release(m)
+    if isolation:
+        names = {t for op in ir.ops for t in op["inputs"] + op["outputs"]}
+        ref = _int8_mixed().walk(ir, ir.input_tensors("cpu"), keep=names)
+        try:
+            refc = RefC(ks.specs, [op["op"] for op, k in plan if k and op["op"].endswith("_s8")], ref_lib)
+        except (FileNotFoundError, OSError, subprocess.CalledProcessError) as e:
+            refc, rec["isolation_s8"] = None, f"skipped: {e}"
+        m = vk.mark()
+        _, iso, _ = run(ir, plan, vk, weights, feed=ref, consts=consts)
+        w = {k: _weight_array(v) for k, v in ir.weights.items()}
+        s8_bad, f32_bad, worst, first_bad = {}, 0, 0.0, None
+        for op, k in plan:
+            if k is None:
+                continue
+            if op["op"].endswith("_s8"):
+                if refc is None:
+                    continue
+                f, params = refc.fn(op["op"])
+                ins = {t: np.ascontiguousarray(ref[t].numpy().astype(_tdtype(ir, t))) for t in op["inputs"]}
+                outs = {t: np.zeros(ir.tshape(t), _tdtype(ir, t)) for t in op["outputs"]}
+                f(*bind(bindable(op), params, lambda t: (outs[t] if t in outs else ins[t]).ctypes.data,
+                        lambda kk: w[kk].ctypes.data))
+                n = sum(int((np.asarray(iso[t]) != outs[t]).sum()) for t in op["outputs"])
+                s8_bad[op["op"]] = s8_bad.get(op["op"], 0) + n
+                if n and first_bad is None:
+                    first_bad = f"{op['name']} ({op['op']}): {n} differ from the reference C"
+                continue
+            for t in op["outputs"]:
+                a = torch.from_numpy(np.array(iso[t])).float()
+                b = ref[t].float()
+                dd = torch.where(a == b, torch.zeros_like(a), (a - b).abs())
+                scale = 0.0
+                for v in [b] + [ref[i] for i in op["inputs"] if i in ref and ref[i].is_floating_point()]:
+                    fin = v.float()[torch.isfinite(v.float())]
+                    scale = max(scale, fin.abs().max().item() if fin.numel() else 0.0)
+                e = dd.max().item() / max(scale, 1e-12) if dd.numel() else 0.0
+                worst = max(worst, e)
+                tol = cuda_dtypes.TOLERANCE[cuda_dtypes.op_dtype(op["op"])]
+                if (dd.numel() and dd.max().item() > tol["slot_rel"] * scale + tol["slot_abs"]) or \
+                        not (torch.isfinite(a) == torch.isfinite(b)).all():
+                    f32_bad += 1
+                    if first_bad is None:
+                        first_bad = f"{op['name']} ({op['op']}) rel_err={e:.2e}"
+        vk.release(m)
+        rec.update(ref_c_mismatches_by_op=s8_bad, n_s8_ops_not_bit_exact=sum(1 for v in s8_bad.values() if v),
+                   worst_fp32_intermediate_rel_err=worst, n_fp32_ops_over_slot_bound=f32_bad,
+                   first_divergent_op=first_bad)
+        ok = ok and f32_bad == 0 and not any(s8_bad.values())
+    walls = []
+    for _ in range(reps):
+        m = vk.mark()
+        t0 = time.perf_counter()
+        run(ir, plan, vk, weights, consts=consts)
+        walls.append(time.perf_counter() - t0)
+        vk.release(m)
+    rec["model_ms"] = 1e3 * float(np.median(walls)) if walls else None
+    m = vk.mark()
+    gr = VkGraph(ir, plan, vk, weights, consts=consts)
+    ins = [t.numpy() for t in ir.input_tensors("cpu").values()]
+    o2 = np.concatenate([x.reshape(-1).astype(np.float32) for x in gr(*ins)])
+    rec["replay_equal"] = bool(np.array_equal(o2, out))
+    walls = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        gr(*ins)
+        walls.append(time.perf_counter() - t0)
+    rec["model_ms_replay"] = 1e3 * float(np.median(walls)) if walls else None
+    vk.release(m)
+    vk.release(base)
+    rec["ok"] = bool(ok and rec["replay_equal"])
+    return rec
+
+
 class VkGraph:
     """An IR recorded once as a replayable Vulkan graph (mb_vk_capture_*), the
     deployment path: every tensor has a fixed buffer, ``__call__`` writes the
@@ -345,6 +466,9 @@ def evaluate(d: str, ks: VkKernelSet, reps: int, isolation: bool = True, ref_lib
         return rec
     if is_int8(ir):
         return evaluate_int8(ir, plan, ks, reps, ref_lib, rec)
+    if is_int8_mixed(ir):
+        rec["dtype"] = "int8_mixed"
+        return evaluate_int8_mixed(ir, plan, ks, reps, ref_lib, rec, isolation=isolation)
     if ir.dtype != "fp32":
         rec.update(ok=False, why=f"{ir.dtype} IR: the Vulkan backend runs fp32 IRs")
         return rec

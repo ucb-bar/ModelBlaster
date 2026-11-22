@@ -39,6 +39,9 @@ checkpoint (lerobot + HF cache), else random weights;
 ``MB_SMOLVLA_IMG`` (256), ``MB_SMOLVLA_LANG`` (prompt tokens, 16),
 ``MB_SMOLVLA_LAYERS`` (16) shrink it; ``MB_SMOLVLA_INPUTS`` (a torch.save'd
 observation, see get_sample_input) makes the goldens a real observation's.
+``--quant int8`` is an int8 IR with fp32 islands (get_int8_mixed_policy), its
+smoothing calibrated on ``--num-calibration N`` observations from
+``MB_SMOLVLA_CALIB`` (get_calibration_samples).
 """
 from __future__ import annotations
 
@@ -482,6 +485,73 @@ def get_sample_input():
                   torch.randn(1, c.lang, c.hidden, generator=g) * 0.05 * math.sqrt(c.hidden),
                   torch.randn(1, c.state_dim, generator=g)).detach()
     return [kv, torch.randn(1, c.chunk, c.action_dim, generator=g), time_embedding(1.0, c)]
+
+
+def _fit_lang(lang: torch.Tensor, L: int) -> torch.Tensor:
+    """A prompt embedding [1, L', hidden] cycled / cut to the graphs' L tokens (calibration only:
+    the shapes are fixed at build time, and the activation ranges need representative tokens,
+    not this exact prompt)."""
+    return lang[:, torch.arange(L) % lang.shape[1]]
+
+
+def _calib_obs(n: int) -> list[dict]:
+    """MB_SMOLVLA_CALIB: a directory of torch.save'd observations (as MB_SMOLVLA_INPUTS; *.pt,
+    sorted), or none: n seeded random ones."""
+    c = _parts().cfg
+    src = os.environ.get("MB_SMOLVLA_CALIB")
+    if src:
+        from pathlib import Path
+        files = sorted(Path(src).glob("*.pt"))[:n]
+        if not files:
+            raise SystemExit(f"MB_SMOLVLA_CALIB={src}: no *.pt observations")
+        return [torch.load(f) for f in files]
+    out = []
+    for i in range(n):
+        g = torch.Generator().manual_seed(1000 + i)
+        out.append({"pixels": torch.rand(1, 3, c.img, c.img, generator=g) * 2 - 1,
+                    "lang": torch.randn(1, c.lang, c.hidden, generator=g) * 0.05 * math.sqrt(c.hidden),
+                    "state": torch.randn(1, c.state_dim, generator=g),
+                    "noise": torch.randn(1, c.chunk, c.action_dim, generator=g)})
+    return out
+
+
+def get_calibration_samples(n: int) -> list:
+    """int8 calibration inputs of the current part (MB_SMOLVLA_PART) from n observations
+    (_calib_obs): vision -> pixels; prefix -> [image tokens, prompt, state]; step -> one sample
+    per flow step of each observation's own fp32 trajectory ([kv, x_t, time_emb(t)]), so every
+    time t the deployed loop visits is calibrated (MB_SMOLVLA_STEPS, default 5)."""
+    p, part = _parts(), _part()
+    c = p.cfg
+    steps = int(os.environ.get("MB_SMOLVLA_STEPS", 5))
+    out = []
+    with torch.no_grad():
+        for r in _calib_obs(n):
+            pix = r["pixels"].float().reshape(1, 3, c.img, c.img)
+            if part == "vision":
+                out.append(pix)
+                continue
+            lang, state = _fit_lang(r["lang"].float(), c.lang), r["state"].float()
+            img = p.vision(pix)
+            if part == "prefix":
+                out.append([img, lang, state])
+                continue
+            kv = p.prefix(img, lang, state)
+            dt, x = -1.0 / steps, r["noise"].float()
+            for s_ in range(steps):
+                te = time_embedding(1.0 + s_ * dt, c)
+                out.append([kv, x.clone(), te])
+                x = x + dt * p.step(kv, x, te)
+    return out
+
+
+# extract_graph --quant int8: every linear int8 (dynamic per-token activations, SmoothQuant,
+# per-channel weights; pipeline/int8_mixed.py) except the ones measured to cost accuracy
+INT8_POLICY = {"base": "linear", "alpha": 0.5, "keep_fp32": []}
+
+
+def get_int8_mixed_policy():
+    """The int8 IR's policy (pipeline/int8_mixed.py); MB_SMOLVLA_INT8 (a name or JSON dict) overrides it."""
+    return os.environ.get("MB_SMOLVLA_INT8") or dict(INT8_POLICY)
 
 
 def load_policy(img: int = 256, model_id: str = "lerobot/smolvla_base"):

@@ -1,0 +1,20 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_linear_dq_s8 (pipeline/int8_mixed.py), bit-exact: exact int32 accumulation, then
+// (float)((double)acc * ((double)row_scale[m] * (double)w_scale[n])) + bias[n]. One invocation per output.
+layout(push_constant, scalar) uniform PC { I8 x; F32 rs; I8 w; F32 bias; F32 ws; F32 y; int M; int K; int N; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= int64_t(pc.M) * pc.N) return;
+    int m = int(gi) / pc.N, n = int(gi) % pc.N;
+    int acc = 0;
+    int xo = m * pc.K, wo = n * pc.K;
+    for (int k = 0; k < pc.K; k++) acc += int(pc.x.v[xo + k]) * int(pc.w.v[wo + k]);
+    precise double s = double(pc.rs.v[m]) * double(pc.ws.v[n]);
+    precise double d = double(acc) * s;
+    precise float yv = float(d);
+    if (uint64_t(pc.bias) != 0ul) yv = yv + pc.bias.v[n];
+    pc.y.v[int(gi)] = yv;
+}

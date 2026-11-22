@@ -16166,6 +16166,9 @@ KERNEL_SPECS.update(_ext_specs(KernelSpec))
 # fp16 <-> fp32 casts at precision-policy island boundaries (precision_casts.py; only policy IRs use them)
 from modelblaster.pipeline.precision_casts import cast_specs as _cast_specs  # noqa: E402
 KERNEL_SPECS.update(_cast_specs(KernelSpec))
+# dynamic per-row quantization and the dequantizing int8 linear of int8_mixed IRs (int8_mixed.py)
+from modelblaster.pipeline.int8_mixed import kernel_specs as _int8_mixed_specs  # noqa: E402
+KERNEL_SPECS.update(_int8_mixed_specs(KernelSpec))
 
 
 def _cast_spec(src: str, dst: str) -> "KernelSpec":
