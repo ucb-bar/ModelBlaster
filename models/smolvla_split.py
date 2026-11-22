@@ -13,7 +13,11 @@ ewise / strided_copy / catn / conv2d ...):
   prefix  image tokens, language embeddings [1, L, 960] (embedding lookup
           * sqrt(960), done on the host), state [1, 32]
           -> KV cache [2 * n_layers, P, 320] (layer l: rows 2l = K after
-          RoPE, 2l+1 = V), P = Ni + L + 1
+          RoPE, 2l+1 = V), P = Ni + L + 1. With ``Cfg.hoist_cross_kv`` (the
+          default; ``MB_SMOLVLA_HOIST_KV=0`` turns it off) the rows of the
+          expert's cross-attention layers already hold the expert's K / V
+          projections of the cache (they are the same for every flow step,
+          so they run once per chunk here instead of in every step)
   step    KV cache, x_t [1, 50, 32], time embedding [1, 720] (sinusoid of the
           flow time, host) -> v_t [1, 50, 32]
 
@@ -82,6 +86,7 @@ class Cfg:
     rope_base: float = 10000.0
     min_period: float = 4e-3
     max_period: float = 4.0
+    hoist_cross_kv: bool = True       # the expert's cross-attention K / V projections run in the prefix graph
 
     @property
     def n_img(self) -> int:
@@ -255,6 +260,7 @@ class Prefix(nn.Module):
         bias = torch.zeros(P, P)
         bias[:P - 1, P - 1] = float("-inf")
         self.register_buffer("bias", bias, persistent=False)
+        self.cross_kv = None          # hoist_cross_kv: {k<i>, v<i>: the expert's layer-i K / V projections} (build())
 
     def forward(self, img_emb, lang_emb, state):
         c = self.c
@@ -267,7 +273,11 @@ class Prefix(nn.Module):
             q = apply_rope(a.q_proj(h).reshape(1, P, c.heads, c.head_dim), self.cos, self.sin, dh)
             k = apply_rope(a.k_proj(h).reshape(1, P, c.kv_heads, c.head_dim), self.cos, self.sin, dh)
             v = a.v_proj(h)
-            kv += [k.reshape(1, P, c.kv_dim), v.reshape(1, P, c.kv_dim)]
+            if self.cross_kv is not None and f"k{i}" in self.cross_kv:
+                # the expert's cross-attention layer i reads only cache_proj(cache): flow-time invariant
+                kv += [self.cross_kv[f"k{i}"](k.reshape(1, P, c.kv_dim)), self.cross_kv[f"v{i}"](v.reshape(1, P, c.kv_dim))]
+            else:
+                kv += [k.reshape(1, P, c.kv_dim), v.reshape(1, P, c.kv_dim)]
             if i == len(self.layers) - 1:
                 break               # the last layer's output feeds nothing the expert reads
             o = gqa_attention(q, k, v.reshape(1, P, c.kv_heads, c.head_dim), c.heads, c.kv_heads, c.head_dim, self.bias)
@@ -323,8 +333,12 @@ class Step(nn.Module):
                                   v.reshape(1, P + A, c.kv_heads, c.head_dim), c.heads, c.kv_heads, c.head_dim, self.bias)
             else:
                 q = apply_rope(a.q_proj(h).reshape(1, A, c.heads, c.head_dim), self.cos_ca, self.sin_ca, dh)
-                k = a.k_proj(k_cache).reshape(1, P, c.kv_heads, c.head_dim)
-                v = a.v_proj(v_cache).reshape(1, P, c.kv_heads, c.head_dim)
+                if c.hoist_cross_kv:          # projected once per chunk by the prefix graph
+                    k = k_cache.reshape(1, P, c.kv_heads, c.head_dim)
+                    v = v_cache.reshape(1, P, c.kv_heads, c.head_dim)
+                else:
+                    k = a.k_proj(k_cache).reshape(1, P, c.kv_heads, c.head_dim)
+                    v = a.v_proj(v_cache).reshape(1, P, c.kv_heads, c.head_dim)
                 o = gqa_attention(q, k, v, c.heads, c.kv_heads, c.head_dim)
             x = x + a.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))
@@ -421,6 +435,9 @@ def build(policy=None, cfg: Cfg | None = None, seed: int = 0) -> Parts:
                 if isinstance(m, nn.Linear):
                     m.weight.mul_(0.5)
     vision.finalize()
+    if c.hoist_cross_kv:              # shared modules: the prefix graph runs the expert's cross K / V projections
+        prefix.cross_kv = nn.ModuleDict({f"{kv}{i}": getattr(step.layers[i].self_attn, f"{kv}_proj")
+                                         for i in range(c.layers) if not step._is_sa(i) for kv in "kv"})
     for m in (vision, prefix, step):
         m.eval()
     return Parts(c, vision, prefix, step, embed)
@@ -433,6 +450,8 @@ def _env_cfg() -> Cfg:
         c = replace(c, layers=int(os.environ["MB_SMOLVLA_LAYERS"]))
     if os.environ.get("MB_SMOLVLA_VLAYERS"):
         c = replace(c, v_layers=int(os.environ["MB_SMOLVLA_VLAYERS"]))
+    if os.environ.get("MB_SMOLVLA_HOIST_KV", "1") == "0":
+        c = replace(c, hoist_cross_kv=False)
     return c
 
 
@@ -444,7 +463,7 @@ def _parts() -> Parts:
         c = _env_cfg()
         if os.environ.get("MB_SMOLVLA_REAL"):
             policy = load_policy(c.img)
-            _CACHE["p"] = build(policy, cfg_from_policy(policy, c.img, c.lang))
+            _CACHE["p"] = build(policy, replace(cfg_from_policy(policy, c.img, c.lang), hoist_cross_kv=c.hoist_cross_kv))
         else:
             _CACHE["p"] = build(None, c)
     return _CACHE["p"]

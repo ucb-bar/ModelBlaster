@@ -278,9 +278,10 @@ def test_cli_with_model_policy(tmp_path, monkeypatch):
     monkeypatch.delenv("MB_SMOLVLA_CALIB", raising=False)
     S._CACHE.clear()
     try:
-        for env, n_int8 in (("all", 1 + 7 + 2), (None, 0)):
+        for env, n_int8 in (("all", 1 + 7 + 2 + 2), (None, 0)):
             # all: state_proj + layer 0's 7 + the last layer's k / v (its q feeds nothing the expert
-            # reads); the default policy keeps the prefix fp32 (models/smolvla_split.INT8_POLICY)
+            # reads) + the expert's cross-attention K / V projections of layer 1 (hoist_cross_kv);
+            # the default policy keeps the prefix fp32 (models/smolvla_split.INT8_POLICY)
             if env:
                 monkeypatch.setenv("MB_SMOLVLA_INT8", env)
             else:
