@@ -1,0 +1,18 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// cumsum (Kahan-compensated) / cumprod along the middle axis of [outer, A, inner], one invocation per line
+layout(push_constant, scalar) uniform PC { F32 x; F32 y; int rows; int A; int inner; int prod; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.rows) return;
+    int o = int(gi) / pc.inner, i = int(gi) % pc.inner;
+    float s = pc.prod != 0 ? 1.0 : 0.0, c = 0.0;
+    for (int a = 0; a < pc.A; a++) {
+        int idx = (o * pc.A + a) * pc.inner + i;
+        float v = pc.x.v[idx];
+        if (pc.prod != 0) s *= v;
+        else { float yv = v - c; float t = s + yv; c = (t - s) - yv; s = t; }
+        pc.y.v[idx] = s;
+    }
+}

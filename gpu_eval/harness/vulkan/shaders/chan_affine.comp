@@ -1,0 +1,11 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// y = x * s[c] + b[c] over NCHW (folded batchnorm2d)
+layout(push_constant, scalar) uniform PC { F32 x; F32 s; F32 b; F32 y; int n; int C; int HW; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int i = int(gi), c = (i / pc.HW) % pc.C;
+    pc.y.v[i] = pc.x.v[i] * pc.s.v[c] + pc.b.v[c];
+}

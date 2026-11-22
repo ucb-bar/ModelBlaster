@@ -1,0 +1,28 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int VEC = 1;   // 4: one vec4 per invocation (n % 4 == 0, 16-byte aligned)
+layout(constant_id = 1) const int OPC = 0;   // the opcode (pc.opc is ignored)
+layout(push_constant, scalar) uniform PC { F32 x; F32 y; int n; int opc; float c; } pc;
+float es(float v, float c, int opc) {
+    switch (opc) {
+    case 0: return v + c;  case 1: return v - c;  case 2: return c - v;
+    case 3: return v * c;  case 4: return v / c;  case 5: return c / v;
+    case 6: return pow(v, c);  case 7: return pow(c, v);
+    case 8: return (v > c || isnan(v)) ? v : c;  case 9: return (v < c || isnan(v)) ? v : c;
+    case 10: return float(v == c);  case 11: return float(v != c);  case 12: return float(v < c);
+    case 13: return float(v <= c);  case 14: return float(v > c);  case 15: return float(v >= c);
+    default: return v;
+    }
+}
+void main() {
+    int i = int(MB_GID) * VEC;
+    if (i >= pc.n) return;
+    if (VEC == 4) {
+        vec4 x = MB_V4(pc.x, i), z;
+        for (int j = 0; j < 4; j++) z[j] = es(x[j], pc.c, OPC);
+        MB_V4(pc.y, i) = z;
+    } else {
+        pc.y.v[i] = es(pc.x.v[i], pc.c, OPC);
+    }
+}

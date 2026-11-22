@@ -1,0 +1,23 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_linear_s8 (pipeline/reference_kernels.py), bit-exact: int32 accumulation of
+// (x + input_offset) * (w + filter_offset) + bias, Q0.31 rounding multiply, rounding shift,
+// output offset, clamp. One invocation per output.
+layout(push_constant, scalar) uniform PC {
+    I8 x; I8 w; I32 bias; I8 y; int M; int K; int N; int in_off; int f_off; int out_off; int mult; int shift; int amin; int amax;
+} pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= int64_t(pc.M) * pc.N) return;
+    int m = int(gi) / pc.N, n = int(gi) % pc.N;
+    int acc = uint64_t(pc.bias) != 0ul ? pc.bias.v[n] : 0;
+    int xo = m * pc.K, wo = n * pc.K;
+    for (int k = 0; k < pc.K; k++) acc += (int(pc.x.v[xo + k]) + pc.in_off) * (int(pc.w.v[wo + k]) + pc.f_off);
+    int64_t prod = (int64_t(acc) * int64_t(pc.mult) + (int64_t(1) << 30)) >> 31;
+    int scaled = int(prod);
+    if (pc.shift > 0) scaled = int((int64_t(scaled) + (int64_t(1) << (pc.shift - 1))) >> pc.shift);
+    else if (pc.shift < 0) scaled = scaled << (-pc.shift);
+    pc.y.v[int(gi)] = int8_t(mb_clampi(scaled + pc.out_off, pc.amin, pc.amax));
+}

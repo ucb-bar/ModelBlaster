@@ -1,0 +1,28 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// mode 0 max (fmax), 1 max (NaN-propagating, maxpool2d_ex), 2 avg (/ KH*KW)
+layout(push_constant, scalar) uniform PC {
+    F32 x; F32 y; int n; int IH; int IW; int OH; int OW; int KH; int KW;
+    int SH; int SW; int PH; int PW; int DH; int DW; int mode;
+} pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int i = int(gi);
+    int ow = i % pc.OW, oh = (i / pc.OW) % pc.OH, nc = i / (pc.OW * pc.OH);
+    float m = pc.mode == 2 ? 0.0 : -1.0 / 0.0;
+    for (int kh = 0; kh < pc.KH; kh++) {
+        int ih = oh * pc.SH - pc.PH + kh * pc.DH;
+        if (ih < 0 || ih >= pc.IH) continue;
+        for (int kw = 0; kw < pc.KW; kw++) {
+            int iw = ow * pc.SW - pc.PW + kw * pc.DW;
+            if (iw < 0 || iw >= pc.IW) continue;
+            float v = pc.x.v[(nc * pc.IH + ih) * pc.IW + iw];
+            if (pc.mode == 2) m += v;
+            else if (pc.mode == 1) { if (v > m || isnan(v)) m = v; }
+            else m = max(m, v);
+        }
+    }
+    pc.y.v[i] = pc.mode == 2 ? m * (1.0 / float(pc.KH * pc.KW)) : m;
+}

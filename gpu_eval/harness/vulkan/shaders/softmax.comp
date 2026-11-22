@@ -1,0 +1,40 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// softmax / log-softmax over the middle axis of [outer, R, inner]: one
+// workgroup per (o, j) line; inner == 1 is the row softmax (kernel_softmax)
+layout(push_constant, scalar) uniform PC { F32 x; F32 y; int outer; int R; int inner; int log_out; float in_scale; } pc;
+shared float sv[256];
+float tree(float v, bool is_max) {
+    uint t = gl_LocalInvocationID.x;
+    sv[t] = v;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (t < s) sv[t] = is_max ? max(sv[t], sv[t + s]) : sv[t] + sv[t + s];
+        barrier();
+    }
+    float r = sv[0];
+    barrier();
+    return r;
+}
+void main() {
+    int line = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    if (line >= pc.outer * pc.inner) return;
+    int o = line / pc.inner, j = line % pc.inner;
+    int base = o * pc.R * pc.inner + j;
+    int t = int(gl_LocalInvocationID.x);
+    float sc = pc.in_scale;
+    float m = -1.0 / 0.0;
+    for (int r = t; r < pc.R; r += 256) m = max(m, pc.x.v[base + r * pc.inner] * sc);
+    m = tree(m, true);
+    float s = 0.0;
+    for (int r = t; r < pc.R; r += 256) s += exp(pc.x.v[base + r * pc.inner] * sc - m);
+    s = tree(s, false);
+    if (pc.log_out != 0) {
+        float ls = log(s);
+        for (int r = t; r < pc.R; r += 256) { int k = base + r * pc.inner; pc.y.v[k] = (pc.x.v[k] * sc - m) - ls; }
+    } else {
+        float inv = 1.0 / s;
+        for (int r = t; r < pc.R; r += 256) { int k = base + r * pc.inner; pc.y.v[k] = exp(pc.x.v[k] * sc - m) * inv; }
+    }
+}

@@ -1,0 +1,14 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// float indices (negative wrap): mode 0 index_select y[o, j, i] = x[o, idx[j], i];
+// mode 1 gather_dim y[o, j, i] = x[o, idx[o, j, i], i]
+layout(push_constant, scalar) uniform PC { F32 x; F32 idx; F32 y; int n; int A; int J; int inner; int mode; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int k = int(gi), i = k % pc.inner, r = k / pc.inner, j = r % pc.J, o = r / pc.J;
+    int a = int(pc.idx.v[pc.mode == 0 ? j : k]);
+    if (a < 0) a += pc.A;
+    pc.y.v[k] = pc.x.v[(o * pc.A + a) * pc.inner + i];
+}
