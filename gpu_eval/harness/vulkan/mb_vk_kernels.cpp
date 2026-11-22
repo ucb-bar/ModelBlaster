@@ -270,7 +270,7 @@ static void gemm(const float *A, const float *B, float *C, const float *bias, in
     static int use_skinny = env_int("MB_VK_SKINNY", 1);
     if (use_skinny && batch == 1 && M <= 64 && vecA == 1 && sBk == 1 && sBn == K && K % 16 == 0) {
         const mb_packed *pw = find_packed(B);
-        if (pw && skinny(A, *pw, C, bias, M, N, K, sAm, alpha)) return;
+        if (pw && pw->f16 != 2 && skinny(A, *pw, C, bias, M, N, K, sAm, alpha)) return;
     }
     uint32_t gx = (uint32_t)((N + GV[v].bn - 1) / GV[v].bn), gy = (uint32_t)((M + GV[v].bm - 1) / GV[v].bm);
     long tiles = (long)gx * gy * batch;
@@ -677,13 +677,59 @@ void kernel_rmsnorm_s8(const int8_t *input, const float *gamma, int8_t *output, 
 // fp32 (dequantized) output
 void kernel_quantize_rows_s8(const float *input, const float *col_inv, int8_t *output, float *row_scale, int M,
                              int K) {
-    PIPE("quantize_rows_s8");
     mb_pc pc;
     pc.p(input).p(col_inv).p(output).p(row_scale).i(M).i(K);
+    if (K % 4 == 0 && al16(input) && al16(col_inv) && (mb_vk_devaddr(output) & 3) == 0) {
+        static int v4 = -1;
+        if (v4 < 0) v4 = mb_vk_pipeline("quantize_rows_s8_v4");
+        lines(v4, M, pc);
+        return;
+    }
+    PIPE("quantize_rows_s8");
     lines(pipe, M, pc);
+}
+// linear_dq_s8 of M <= 64 rows on a packed int8 weight (mb_vk_set_packed(w, p, 2),
+// walk_vulkan.pack_weight_s8): shaders/skinny_s8.comp, K split over workgroups until ~MB_VK_SKINNY_WG
+// (default 64) waves run, the int32 partials summed by linear_dq_s8_epi.comp.
+static bool skinny_s8(const int8_t *x, const float *rs, const mb_packed &W, const float *bias, const float *ws,
+                      float *y, int M, int K, int N) {
+    if ((mb_vk_devaddr(x) & 15) || K % 16) return false;
+    int consts[1] = {M};
+    int pipe = mb_vk_pipeline_spec("skinny_s8", consts, 1);
+    if (pipe < 0) return false;
+    int gx = (N + 63) / 64;
+    static int target = env_int("MB_VK_SKINNY_WG", 64);
+    int nsplit = gx < target ? (target + gx - 1) / gx : 1;
+    int maxs = K / 64;                          // >= 4 16-k steps per split
+    if (nsplit > maxs) nsplit = maxs;
+    if (nsplit > 64) nsplit = 64;
+    if (nsplit < 1) nsplit = 1;
+    int kchunk = ((K + nsplit - 1) / nsplit + 15) / 16 * 16;
+    nsplit = (K + kchunk - 1) / kchunk;
+    int32_t *part = nullptr;
+    if (nsplit > 1) {
+        part = (int32_t *)mb_vk_scratch(0, (size_t)nsplit * M * N * sizeof(int32_t));
+        if (!part) return true;
+    }
+    mb_pc pc;
+    pc.p(x).p(rs).p(W.p).p(bias).p(ws).p(y).p(part).i(M).i(K).i(N).i(kchunk).i(nsplit > 1 ? 1 : 0);
+    mb_vk_dispatch(pipe, (uint32_t)gx, (uint32_t)nsplit, 1, pc);
+    if (nsplit > 1) {
+        static int epi = -1;
+        if (epi < 0) epi = mb_vk_pipeline("linear_dq_s8_epi");
+        mb_pc pe;
+        pe.p(part).p(rs).p(bias).p(ws).p(y).i(M).i(N).i(nsplit);
+        mb_vk_launch1d(epi, (long)M * N, pe);
+    }
+    return true;
 }
 void kernel_linear_dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight, const float *bias,
                          const float *w_scale, float *output, int M, int K, int N) {
+    static int use_skinny = env_int("MB_VK_SKINNY", 1);
+    if (use_skinny && M <= 64) {
+        const mb_packed *pw = find_packed(weight);
+        if (pw && pw->f16 == 2 && skinny_s8(input, row_scale, *pw, bias, w_scale, output, M, K, N)) return;
+    }
     mb_pc pc;
     pc.p(input).p(row_scale).p(weight).p(bias).p(w_scale).p(output).i(M).i(K).i(N);
     if (use_dot4(input, weight, K)) {

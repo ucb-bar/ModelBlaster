@@ -142,6 +142,16 @@ def pack_weight(w: np.ndarray, dtype=np.float32) -> np.ndarray:
     return np.ascontiguousarray(p.reshape(npad // 64, 64, k // 4, 4).transpose(0, 2, 1, 3))
 
 
+def pack_weight_s8(w: np.ndarray) -> np.ndarray:
+    """An [N, K] int8 linear_dq_s8 weight in skinny_s8.comp's layout: [ceil(N/64), K/16, 64, 16] --
+    per 64-column block and 16-k chunk, the 64 columns' 16 bytes contiguous; columns zero-padded."""
+    n, k = w.shape
+    npad = -(-n // 64) * 64
+    p = np.zeros((npad, k), np.int8)
+    p[:n] = w
+    return np.ascontiguousarray(p.reshape(npad // 64, 64, k // 16, 16).transpose(0, 2, 1, 3))
+
+
 class Weights:
     """weights.npz entries uploaded once (they outlive every run's arena mark).
 
@@ -165,6 +175,12 @@ class Weights:
 
     def _pack(self, op):
         key, sh = op.get("weight"), op.get("shape") or {}
+        if (op["op"] == "linear_dq_s8" and key and key not in self.packed and hasattr(self.vk.lib, "mb_vk_set_packed")
+                and sh.get("M", SKINNY_MAX_M + 1) <= SKINNY_MAX_M and sh.get("K", 1) % 16 == 0):
+            p = self.vk.upload(pack_weight_s8(np.asarray(self.ir.weights[key], np.int8)))
+            self.packed[key] = p
+            self.vk.lib.mb_vk_set_packed(ctypes.c_void_p(self.ptr(key)), ctypes.c_void_p(self.vk.ptr(p)), 2)
+            return
         if (op["op"] != "linear" or not key or key in self.packed or is_int8(self.ir)
                 or not hasattr(self.vk.lib, "mb_vk_set_packed")):
             return
@@ -421,9 +437,26 @@ def evaluate_int8_mixed(ir: IR, plan, ks: "VkKernelSet", reps: int, ref_lib: str
         walls.append(time.perf_counter() - t0)
     rec["model_ms_replay"] = 1e3 * float(np.median(walls)) if walls else None
     vk.release(m)
+    rec.update(_op_times(ir, plan, vk, weights, consts))
     vk.release(base)
     rec["ok"] = bool(ok and rec["replay_equal"])
     return rec
+
+
+def _op_times(ir, plan, vk, weights, consts) -> dict:
+    """Per-op-type GPU time of one walk (Vulkan timestamps)."""
+    vk.lib.mb_vk_timestamps(1)
+    vk.lib.mb_vk_ts_reset()
+    m = vk.mark()
+    _, _, per_op = run(ir, plan, vk, weights, consts=consts, time_ops=True)
+    vk.release(m)
+    vk.lib.mb_vk_timestamps(0)
+    by_type, gpu = {}, 0.0
+    for op, a, b in per_op:
+        dt = (vk.lib.mb_vk_ts_ns(b) - vk.lib.mb_vk_ts_ns(a)) / 1e6
+        by_type[op["op"]] = by_type.get(op["op"], 0.0) + dt
+        gpu += dt
+    return {"gpu_ms": gpu, "ms_by_op_type": {k: round(v, 4) for k, v in sorted(by_type.items(), key=lambda kv: -kv[1])}}
 
 
 class VkGraph:
@@ -548,19 +581,7 @@ def evaluate(d: str, ks: VkKernelSet, reps: int, isolation: bool = True, ref_lib
     rec["replay_ok"] = rep["ok"]
     rec["model_ms_replay"] = 1e3 * float(np.median(walls))
     rec["ok"] = bool(rec["ok"] and rep["ok"])
-    vk.lib.mb_vk_timestamps(1)
-    vk.lib.mb_vk_ts_reset()
-    m = vk.mark()
-    _, _, per_op = run(ir, plan, vk, weights, consts=consts, time_ops=True)
-    vk.release(m)
-    vk.lib.mb_vk_timestamps(0)
-    by_type, gpu = {}, 0.0
-    for op, a, b in per_op:
-        dt = (vk.lib.mb_vk_ts_ns(b) - vk.lib.mb_vk_ts_ns(a)) / 1e6
-        by_type[op["op"]] = by_type.get(op["op"], 0.0) + dt
-        gpu += dt
-    rec["gpu_ms"] = gpu
-    rec["ms_by_op_type"] = {k: round(v, 4) for k, v in sorted(by_type.items(), key=lambda kv: -kv[1])}
+    rec.update(_op_times(ir, plan, vk, weights, consts))
     vk.release(base)
     return rec
 

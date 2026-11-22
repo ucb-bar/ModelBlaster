@@ -57,9 +57,11 @@ int mb_vk_graph_cbs(int graph);             // command buffers in a graph (-1: n
 uint32_t mb_vk_max_group_x(void);           // per-dimension workgroup-count limit
 // Packed weights: register p (an mb_vk_alloc buffer) as the [N, K] weight w laid
 // out for the skinny GEMM (per 64-column block and k-quad, the 64 columns' 4
-// values contiguous: shaders/skinny_body.glsl, walk_vulkan.pack_weight), fp32,
-// or fp16 when f16 != 0. p == NULL unregisters. A registration is dropped when
-// mb_vk_release frees either buffer.
+// values contiguous: shaders/skinny_body.glsl, walk_vulkan.pack_weight), fp32
+// (f16 == 0) or fp16 (f16 == 1); f16 == 2: an int8 weight of linear_dq_s8 in
+// skinny_s8.comp's layout (16-byte k-chunks, walk_vulkan.pack_weight_s8).
+// p == NULL unregisters. A registration is dropped when mb_vk_release frees
+// either buffer.
 void mb_vk_set_packed(const void *w, const void *p, int f16);
 int mb_vk_packed_count(void);
 int mb_vk_has_int_dot(void);                // packed int8 dot products enabled (VK_KHR_shader_integer_dot_product)

@@ -1,0 +1,48 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// kernel_quantize_rows_s8, the vec4 variant (K % 4 == 0, x / col_inv 16-byte and y 4-byte aligned;
+// the launcher checks): the same arithmetic as quantize_rows_s8.comp per element, 4 elements per
+// invocation and step, the 4 int8 results stored as one 32-bit word.
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer V4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U1 { uint v[]; };
+layout(push_constant, scalar) uniform PC { V4 x; V4 ci; U1 y; F32 rs; int M; int K; } pc;
+shared float red[64];
+uint q8(float v, float inv) {
+    precise float t = v * inv;
+    float q = mb_roundf(t);
+    if (!(q >= -127.0)) q = -127.0;
+    if (q > 127.0) q = 127.0;
+    return uint(int(q)) & 0xffu;
+}
+void main() {
+    int row = int(gl_WorkGroupID.y) * int(gl_NumWorkGroups.x) + int(gl_WorkGroupID.x);
+    if (row >= pc.M) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int K4 = pc.K >> 2, base = row * K4;
+    float a = 0.0;
+    for (int k = tid; k < K4; k += 64) {
+        precise vec4 v = pc.x.v[base + k] * pc.ci.v[k];
+        vec4 av = abs(v);
+        if (av.x > a) a = av.x;
+        if (av.y > a) a = av.y;
+        if (av.z > a) a = av.z;
+        if (av.w > a) a = av.w;
+    }
+    a = subgroupMax(a);
+    if (gl_NumSubgroups > 1) {
+        if (subgroupElect()) red[gl_SubgroupID] = a;
+        barrier();
+        a = red[0];
+        for (uint i = 1; i < gl_NumSubgroups; i++) a = max(a, red[i]);
+    }
+    float s = a > 0.0 ? mb_fdiv(a, 127.0) : 1.0;
+    float inv = mb_fdiv(1.0, s);
+    if (tid == 0) pc.rs.v[row] = s;
+    for (int k = tid; k < K4; k += 64) {
+        precise vec4 v = pc.x.v[base + k] * pc.ci.v[k];
+        pc.y.v[base + k] = q8(v.x, inv) | (q8(v.y, inv) << 8) | (q8(v.z, inv) << 16) | (q8(v.w, inv) << 24);
+    }
+}
