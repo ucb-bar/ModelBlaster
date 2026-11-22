@@ -554,17 +554,21 @@ INT8_POLICY = {
     "prefix": {"base": "linear", "alpha": 0.8, "keep_fp32": ["*"]},
     "step": {"base": "linear", "alpha": 0.65, "keep_fp32": []},
 }
+# MB_SMOLVLA_INT8=fast: SigLIP's fc2 int8 too, its 256 largest input columns (of 3072) as an fp32
+# outlier linear (int8_mixed "outliers"), smoothing 0.5 there -- docs/vulkan_amd.md
+INT8_FAST = dict(INT8_POLICY, vision={"base": "linear", "alpha": 0.8, "alpha_by": {"*.fc2": 0.5},
+                                      "outliers": {"*.fc2": 256}})
 # every linear int8 (MB_SMOLVLA_INT8=all): the fastest mix, measured too
 INT8_ALL = {"vision": {"base": "linear", "alpha": 0.8}, "prefix": {"base": "linear", "alpha": 0.65},
             "step": {"base": "linear", "alpha": 0.65}}
 
 
 def get_int8_mixed_policy():
-    """The current part's int8 policy (pipeline/int8_mixed.py). MB_SMOLVLA_INT8: 'all' (INT8_ALL),
+    """The current part's int8 policy (pipeline/int8_mixed.py). MB_SMOLVLA_INT8: 'fast' (INT8_FAST), 'all' (INT8_ALL),
     or a policy (name / JSON dict) for this part."""
     env = os.environ.get("MB_SMOLVLA_INT8")
-    if env == "all":
-        return dict(INT8_ALL[_part()])
+    if env in ("all", "fast"):
+        return dict((INT8_ALL if env == "all" else INT8_FAST)[_part()])
     return env or dict(INT8_POLICY[_part()])
 
 

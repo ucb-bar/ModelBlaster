@@ -32,6 +32,10 @@ linears -- to int8:
   largest calibrated |x| leave the int8 product and run as an fp32 linear on an
   ``index_select`` of them, added to the int8 part (LLM.int8()-style decomposition).
 * ``alpha_by`` ({pattern: a}): the smoothing strength of the tensors those linears read.
+* fp32 fusions that cut launches (on by default; ``fuse_norm`` / ``fuse_rope`` /
+  ``fold_layout`` false to skip): the RMSNorm chain -> ``rms_norm`` (its weight folded
+  into the quantizer's column factor), RoPE -> ``rope_half``, and attention's permute
+  copies folded into ``bmm_strided`` operands (``layout_fold``).
 * constants stay the fp32 constant tensors of the fp32 lowering (no linear
   reads one in these graphs; one that did would be quantized like any
   activation, its row scales computed by quantize_rows_s8 on the device).
@@ -431,6 +435,11 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
     from modelblaster.pipeline.extract_graph import _annotate_dispatches  # noqa: PLC0415
     g = dict(ir.graph)
     g.update(quant=MIXED, ops=ops, tensors=tensors)
+    if pol.get("fold_layout", True):
+        # attention's permute copies folded into strided bmm operands (pipeline/layout_fold.py)
+        from modelblaster.pipeline.layout_fold import fold  # noqa: PLC0415
+        g, frep = fold(g)
+        ops, tensors = g["ops"], g["tensors"]
     g["dispatches"] = _annotate_dispatches(ops)
     kinds = {}
     for op in ops:
