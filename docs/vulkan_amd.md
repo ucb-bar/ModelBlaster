@@ -269,7 +269,8 @@ activation's 16 bytes as uniform loads into `dotPacked4x8EXT`, K split over
 workgroups with exact int32 partials (`linear_dq_s8_epi.comp`). All
 bit-exact with the reference C on RADV and Intel (tests).
 
-The quantization mix, chosen on 13 held-out observations (real HM01B0 drone
+The quantization mix as first chosen on 13 held-out observations (the 193-observation validation
+below revises it: SigLIP layer 0 now has outlier columns) (real HM01B0 drone
 frames and synthetic images, 14-token prompts; calibration: 8 other frames
 and prompts), action chunk vs lerobot's `sample_actions` (same observation and
 noise; |actions| ~1), CPU reference walk of the IRs (bit-exact int8):
@@ -347,9 +348,110 @@ Where the time is now (walker timestamps, slower clocks than the replay; step
 graph): `linear_dq_s8` ~66%, strided bmm ~10%, quantize ~7%, softmax ~5%. The
 int8 GEMMs run at ~1.0-1.6 Tops (skinny, 31-50 rows) and ~1.2-1.35 Tops (tile,
 256 rows) against an int8 dot4 peak of ~6.5 Tops at 1.6 GHz; at the Deck's
-15 W cap the clock sits lower. The next levers: hoisting the 8 cross-attention
-layers' K / V projections of the (constant) prefix cache out of the flow loop
-(~0.5 ms per step), and a GEMM kernel that keeps more of the dot4 rate.
+15 W cap the clock sits lower (1.04 GHz measured under this load). The cross-attention K / V
+hoist and the launch fusions of round 3 (below) came next.
+
+### Numerics validation on 193 held-out observations (2026-11-22)
+
+The 13-observation numbers above were optimistic. `scripts/smolvla_int8/` holds the validation:
+`make_heldout.py` builds a larger held-out set (prompts that tokenize to the IRs' 14 tokens; lerobot
+`sample_actions` reference actions for each), `validate.py` runs int8 mixes on it with the CPU
+reference walk (int8 bit-exact, fp32 ops as walk_torch) -- action metrics (`metrics`), per-linear
+local error, accumulator and saturation headroom (`local`), keep-fp32 group attribution (`groups`),
+extracted IRs as they are (`irs`) -- and `summarize.py` tabulates. 193 observations: the 13
+before, the 11 riskybird frames not used for calibration (each also mirrored, darkened to 0.55 and
+brightened to 1.4: 33 augmented), 120 HM01B0 frames of the PULP-DroNet v3 set (other drones, other
+rooms, grayscale) and 16 synthetic scenes, each with its own state and noise. Actions in the
+model's normalized space (|actions| ~1); per-joint = action dims 0-5.
+
+| mix (Deck chunk, ms) | cosine mean | median | p5 | min | # < 0.999 | max abs err mean / p95 / max | per-joint max err, mean over obs (dims 0-5) |
+|---|---|---|---|---|---|---|---|
+| fp32 IRs (209.6) | 1.0 | 1.0 | 1.0 | 1.0 (1e-12) | 0 | < 2e-6 | -- |
+| old default (119.5) | 0.99917 | 0.99963 | 0.99794 | 0.96716 | 27 | 0.053 / 0.107 / 0.368 | .032 .036 .037 .028 .025 .038 |
+| old fast (109.2) | 0.99889 | 0.99953 | 0.99729 | 0.95419 | 41 | 0.061 / 0.134 / 0.431 | .037 .039 .042 .031 .028 .041 |
+| **new default** (110.9) | **0.99951** | 0.99971 | 0.99857 | **0.99391** | 19 | 0.045 / 0.097 / 0.148 | .027 .030 .031 .022 .022 .031 |
+| **new fast** (100.5) | 0.99932 | 0.99964 | 0.99791 | 0.99425 | 40 | 0.052 / 0.110 / 0.176 | .032 .037 .036 .025 .025 .034 |
+| `MB_SMOLVLA_INT8=accurate` (118.2) | 0.99966 | 0.99977 | 0.99907 | 0.99420 | 7 | 0.036 / 0.062 / 0.139 | .024 .025 .026 .019 .019 .026 |
+| SigLIP fp32, step int8 (~139) | 0.99979 | 0.99983 | 0.99955 | 0.99920 | 0 | 0.030 / 0.054 / 0.088 | .017 .021 .022 .017 .016 .022 |
+
+(CPU reference walk of the IRs. New = the IRs deployed on the Deck: hoisted cross K / V, merged siblings, fused epilogues, below;
+SigLIP layer 0 with 64 fp32 outlier columns; fast also has fc2 in int8; accurate gives every SigLIP
+layer 64 outlier columns. Chunk times: one Deck session, median of 20, interleaved.) By source, the
+new default: HM01B0 frames mean 0.99951 (min 0.99391), riskybird frames 0.99965 (0.99907),
+augmented 0.99950 (0.99801), synthetic 0.99939 (0.99596). Only SigLIP in fp32 keeps every
+observation >= 0.999, at +28 ms.
+
+What drives the error (worst 30 observations of the old default, one group kept fp32 at a time,
+cosine mean / min; base 0.99725 / 0.978): SigLIP fp32 0.99972 / 0.99926; the step graph fp32
+0.99749 / 0.978 (the expert is not the problem); SigLIP layers 0-3 fp32 0.99954 / 0.99895, layers
+4-7 or 8-11 no change; layer 0 alone 0.99902 / 0.99687, layer 1, 2 or 3 alone no change. Layer 0's
+int8 error is what 11 more layers and 5 flow steps amplify. Its 64 largest input columns as fp32
+outlier linears recover most of keeping it fp32 for +0.9 ms (keeping it fp32: +2 ms); smoothing
+alpha 0.65 / 0.9 / 1.0 for SigLIP, or a broader calibration set (36 observations incl. darkened /
+brightened frames and HM01B0 frames) did not. The worst observations are sensitive, not broken:
+the same int8 IRs walked on the CPU with 10 instead of 12 threads (fp32 reassociation, a few int8
+roundings flip) move the worst one between 0.967 and 0.978.
+
+Local error per int8 linear (13 observations, its int8 output vs the fp32 linear on the same input,
+relative L2): SigLIP median 1.1% (fc1 0.6%, k / v / out_proj 1.2%), expert median 0.9%, the MLP
+down_proj worst (1.5-1.9%); flat over depth. Accumulators and saturation: max |int32 acc| over all
+linears and observations 996,030 (action_time_mlp_in) -- 11.1 bits below int32 overflow, 23% of the
+K * 127 * 127 bound, which itself stays < 2^31 for every K here (largest K = 12288: 2^27.6);
+quantize_rows_s8 never clamps (0 of 3.5e8 values beyond +-127.5 before the clamp; 0.11% land on
++-127, the row maxima). The dequantization is fp32 (no int8 requant), so nothing saturates there.
+
+On the Deck (`smolvla_eval_set.py`, the new default IRs, all 193 observations, 3 runs each): every
+action chunk bit-identical across runs (and graph replays); vs lerobot cosine mean 0.99946, median
+0.99971, min 0.99027, 22 below 0.999, max abs err mean 0.047 / max 0.150 -- statistically the CPU
+golden's (0.99951 / 0.99971 / 0.99391 / 19); device vs the CPU golden of the same IRs: cosine mean
+0.99974, min 0.99901, max abs err mean 0.032 (the device's fp32 reassociation flips a few int8
+roundings, which the layers amplify; bit-identical end to end is not expected, as the walker's
+golden bound says). Bit-exactness: the walker gates on the Deck (int8 IRs
+of all three graphs): every quantize_rows_s8 / linear_dq_s8 / linear3_dq_s8 / linear_dq_add_s8
+equal to the reference C (0 mismatches), every fp32 op within its slot bound, replay equal; the
+Vulkan test file on the Deck (RADV) and on garden's NVIDIA TITAN RTX (Vulkan): all int8 kernels
+bit-exact against the reference C on every path (skinny + split-K, dot4 tiles, scalar);
+the CPU rules equal the reference C (test_int8_mixed).
+
+### Optimizing the int8 chunk, round 3 (Deck)
+
+Measured one change at a time against the previous step, interleaved in one session (median of
+20 chunks, 3 rounds; the Deck's clock moves the absolute numbers by ~4% between sessions, so
+each row is its own A/B). All bit-exact: the action chunk of the reference observation is
+unchanged by every row except the policy change.
+
+| change | effect (Deck) |
+|---|---|
+| hoist the expert's cross-attention K / V projections into the prefix (`hoist_cross_kv`, models/smolvla_split.py): 16 linears per step run once per chunk, in fp32 | denoise -1.4, prefix +0.2: chunk -1.2 ms |
+| sibling linears as one product (`linear3_dq_s8`: q / k / v, gate / up; no split-K at N = 4096) | denoise 54.0 -> 48.9: -5.1 ms |
+| residual adds in the linear epilogue (`linear_dq_add_s8`) | -1.2 ms |
+| SwiGLU silu + mul -> `silu_mul` (fp32) | prefix -0.4, denoise -0.9: -1.3 ms |
+| attention's 1/8 score scale folded into the query projection (`fold_attn_scale`) | vision -1.0, denoise -0.5: -1.5 ms |
+| step graph | 444 -> 316 kernel launches (prefix 372 -> 358, vision 189 -> 177) |
+| SigLIP layer 0 with 64 fp32 outlier columns (policy; accuracy above) | +0.9 ms |
+| **new default vs old default, same session** | **119.5 -> 110.9 ms** (fp32 209.6: 1.89x) |
+| **new fast vs old fast** | **109.2 -> 100.5 ms** (2.09x) |
+
+Tried and dropped (bench_dq-style microbenchmarks with a bit-exactness check, then the chunk):
+- The skinny int8 GEMM's instruction stream is not its limit. Repeating the dot loop 16x on the
+  same registers costs ~44 us per pass for 50x720x2048 against ~150 us for the whole launch, so
+  ~2/3 of a launch is fixed cost (launch, ramp, split-K partials, epilogue). Variants that change
+  the loop measured no better or worse: K split over 2-4 waves of a workgroup with an LDS sum
+  (2-4x slower), 64-byte activation loads (`s_load_dwordx16`), interleaving 2-8 rows' dot
+  products (no back-to-back accumulator dependency), 2-4-deep weight prefetch (slower), more
+  split-K waves.
+- The dequantization without fp64 (fp32 error-free products with an exact fallback near rounding
+  midpoints; verified bit-exact on 8e7 random and adversarial cases and on the Deck): no faster --
+  the fp64 epilogue is not the bottleneck either, and the larger code was slower in small launches.
+- An in-kernel split-K fixup (the last split of a column block sums the others' partials, via
+  int32 atomics and an arrival counter; bit-exact) instead of the epilogue launch: +1 ms per chunk.
+- Microbenchmarks of single shapes on the Deck move by up to 1.5x between runs (clock); only the
+  interleaved chunk A/B resolves ~0.3 ms.
+
+Where the time is now (new default, Deck): vision ~45 ms (fp32 fc2 ~half of it), prefix ~17 ms
+(fp32), 5 flow steps ~45 ms (~9 ms per step, 316 launches). The levers left: SigLIP fc2 (int8 with
+outliers is the fast mix, at an accuracy cost), the remaining small launches (KV concat, permute
+copies before quantize, rms_norm + quantize), and the per-launch fixed cost of the skinny GEMM.
 
 ## Not done / limits
 
