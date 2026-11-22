@@ -1,0 +1,72 @@
+#version 460
+#include "mb_common.glsl"
+// kernel_attention (reference_kernels_ext.ATTENTION), fp32, flash-style: no [M, N] score matrix.
+// One workgroup per (64 query rows, b0, b1); invocation = one query row, its q and output
+// accumulator (DM = specialization constant >= D, DV) in registers. K / V go through LDS TN keys
+// at a time; per tile the TN scores are computed first, then the running max / sum are rescaled
+// once (online softmax). act 0: softmax, 1: relu (no normalisation). Offsets are pre-applied by
+// the launcher (push-constant budget).
+#extension GL_EXT_control_flow_attributes : require
+layout(constant_id = 0) const int DM = 64;
+layout(constant_id = 1) const int TN = 32;
+layout(local_size_x = 64) in;
+layout(push_constant, scalar) uniform PC {
+    F32 q; F32 k; F32 v; F32 o;
+    int B1; int M; int N; int D; int DV;
+    int q_s0; int q_s1; int q_sm; int k_s0; int k_s1; int k_sn; int v_s0; int v_s1; int v_sn;
+    int o_s0; int o_s1; int o_sm; int causal; int act; float scale;
+} pc;
+shared float Ks[TN][DM];
+shared float Vs[TN][DM];
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int m = int(gl_WorkGroupID.x) * 64 + tid;
+    int bz = int(gl_WorkGroupID.y), b0 = bz / pc.B1, b1 = bz % pc.B1;
+    int D = pc.D, DV = pc.DV, N = pc.N;
+    bool live = m < pc.M;
+    int qb = b0 * pc.q_s0 + b1 * pc.q_s1 + (live ? m : 0) * pc.q_sm;
+    int kb = b0 * pc.k_s0 + b1 * pc.k_s1, vb = b0 * pc.v_s0 + b1 * pc.v_s1;
+    float qv[DM], acc[DM];
+    [[unroll]] for (int d = 0; d < DM; d++) { qv[d] = d < D ? pc.q.v[qb + d] * pc.scale : 0.0; acc[d] = 0.0; }
+    float mx = -1.0 / 0.0, l = 0.0;
+    int nend = (pc.causal != 0) ? min(N, int(gl_WorkGroupID.x) * 64 + 64) : N;   // keys any row of the block sees
+    for (int n0 = 0; n0 < nend; n0 += TN) {
+        barrier();
+        for (int e = tid; e < TN * DM; e += 64) {
+            int j = e / DM, d = e % DM, n = n0 + j;
+            Ks[j][d] = (n < N && d < D) ? pc.k.v[kb + n * pc.k_sn + d] : 0.0;
+            Vs[j][d] = (n < N && d < DV) ? pc.v.v[vb + n * pc.v_sn + d] : 0.0;
+        }
+        barrier();
+        float s[TN];
+        float tmax = mx;
+        [[unroll]] for (int j = 0; j < TN; j++) {
+            float t = 0.0;
+            [[unroll]] for (int d = 0; d < DM; d++) t = fma(qv[d], Ks[j][d], t);
+            int n = n0 + j;
+            bool ok = n < N && !(pc.causal != 0 && n > m);
+            s[j] = ok ? t : -1.0 / 0.0;
+            tmax = max(tmax, s[j]);
+        }
+        if (pc.act == 0) {
+            float corr = (tmax == -1.0 / 0.0) ? 1.0 : exp(mx - tmax);
+            l *= corr;
+            [[unroll]] for (int d = 0; d < DM; d++) acc[d] *= corr;
+            [[unroll]] for (int j = 0; j < TN; j++) {
+                float p = s[j] == -1.0 / 0.0 ? 0.0 : exp(s[j] - tmax);
+                l += p;
+                [[unroll]] for (int d = 0; d < DM; d++) acc[d] = fma(p, Vs[j][d], acc[d]);
+            }
+            mx = tmax;
+        } else {
+            [[unroll]] for (int j = 0; j < TN; j++) {
+                float p = max(s[j], 0.0);
+                [[unroll]] for (int d = 0; d < DM; d++) acc[d] = fma(p, Vs[j][d], acc[d]);
+            }
+        }
+    }
+    if (!live) return;
+    float inv = (pc.act == 0) ? 1.0 / l : 1.0;
+    int ob = b0 * pc.o_s0 + b1 * pc.o_s1 + m * pc.o_sm;
+    [[unroll]] for (int d = 0; d < DM; d++) if (d < DV) pc.o.v[ob + d] = acc[d] * inv;
+}

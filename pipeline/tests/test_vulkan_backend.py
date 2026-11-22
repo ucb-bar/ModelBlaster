@@ -300,6 +300,33 @@ def test_bmm_and_patch_conv(vk):
     assert _rel(y2, ref2.numpy()) < 1e-5
 
 
+@pytest.mark.parametrize("D,causal,act", [(64, 0, 0), (32, 1, 0), (100, 0, 1), (64, 1, 1)])
+def test_attention_flash(vk, D, causal, act):
+    """kernel_attention (flash-style): heads interleaved in the rows (strided q / k / v / o)."""
+    rng = np.random.default_rng(D + causal)
+    B0, B1, M, N, DV = 2, 3, 70, 70 if causal else 45, D
+    q = rng.standard_normal((B0, M, B1, D), dtype=np.float32)       # [b0][m][b1][d]
+    k = rng.standard_normal((B0, N, B1, D), dtype=np.float32)
+    v = rng.standard_normal((B0, N, B1, DV), dtype=np.float32)
+    Q, K, V = vk.upload(q), vk.upload(k), vk.upload(v)
+    O = vk.array((B0, M, B1, DV))
+    sc = 1.0 / np.sqrt(D)
+    vk.lib.kernel_attention(_p(vk, Q), _p(vk, K), _p(vk, V), _p(vk, O), B0, B1, M, N, D, DV,
+                            0, M * B1 * D, D, B1 * D, 0, N * B1 * D, D, B1 * D, 0, N * B1 * DV, DV, B1 * DV,
+                            0, M * B1 * DV, DV, B1 * DV, causal, act, ctypes.c_float(sc))
+    vk.sync()
+    s_ = np.einsum("xmyd,xnyd->xymn", q.astype(np.float64), k.astype(np.float64)) * sc
+    if causal:
+        s_ = np.where(np.triu(np.ones((M, N), bool), 1), -np.inf, s_)
+    if act == 0:
+        p_ = np.exp(s_ - s_.max(-1, keepdims=True))
+        p_ /= p_.sum(-1, keepdims=True)
+    else:
+        p_ = np.maximum(s_, 0)
+    ref = np.einsum("xymn,xnye->xmye", p_, v.astype(np.float64))
+    assert _rel(O, ref) < 1e-5
+
+
 @pytest.mark.parametrize("cmajor", ["row", "col"])
 def test_bmm_strided(vk, cmajor):
     """layout_fold's strided bmm: [B0, B1] batches, permuted operands, a row- or column-major result."""
@@ -486,7 +513,11 @@ def test_smolvla_split_int8_mixed_on_vulkan(vk, refc, split_irs, tmp_path):
     for part in ("vision", "prefix", "step"):
         I8.extract_mixed(str(tmp / part), str(tmp_path / part), None)
         g = json.loads((tmp_path / part / "graph.json").read_text())
-        assert any(op["op"] == "bmm_strided" for op in g["ops"]), part      # permutes folded into attention
+        kinds = [op["op"] for op in g["ops"]]
+        if part == "vision":     # unmasked multi-head attention -> one flash-style op per layer
+            assert "attention" in kinds and "softmax" not in kinds, kinds
+        else:                    # masked / grouped-query attention: permutes folded into strided bmms
+            assert "bmm_strided" in kinds, part
         if part != "vision":    # the RMSNorm chains are one rms_norm each, RoPE one rope_half
             kinds = [op["op"] for op in g["ops"]]
             assert kinds.count("rope_half") >= (2 if part == "prefix" else 3), part
