@@ -33,9 +33,10 @@ linears -- to int8:
   ``index_select`` of them, added to the int8 part (LLM.int8()-style decomposition).
 * ``alpha_by`` ({pattern: a}): the smoothing strength of the tensors those linears read.
 * fp32 fusions that cut launches (on by default; ``fuse_norm`` / ``fuse_rope`` /
-  ``fold_layout`` false to skip): the RMSNorm chain -> ``rms_norm`` (its weight folded
-  into the quantizer's column factor), RoPE -> ``rope_half``, and attention's permute
-  copies folded into ``bmm_strided`` operands (``layout_fold``).
+  ``fuse_attention`` / ``fold_layout`` false to skip): the RMSNorm chain -> ``rms_norm``
+  (its weight folded into the quantizer's column factor), RoPE -> ``rope_half``, unmasked
+  attention -> one flash-style ``attention`` op (``attention_fuse``), and the remaining
+  attention's permute copies folded into ``bmm_strided`` operands (``layout_fold``).
 * constants stay the fp32 constant tensors of the fp32 lowering (no linear
   reads one in these graphs; one that did would be quantized like any
   activation, its row scales computed by quantize_rows_s8 on the device).
@@ -435,6 +436,9 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
     from modelblaster.pipeline.extract_graph import _annotate_dispatches  # noqa: PLC0415
     g = dict(ir.graph)
     g.update(quant=MIXED, ops=ops, tensors=tensors)
+    if pol.get("fuse_attention", True):
+        g = _fuse_attention_fp32(g)
+        ops, tensors = g["ops"], g["tensors"]
     if pol.get("fold_layout", True):
         # attention's permute copies folded into strided bmm operands (pipeline/layout_fold.py)
         from modelblaster.pipeline.layout_fold import fold  # noqa: PLC0415
@@ -599,6 +603,31 @@ def _fuse_rope(ops: list, tensors: dict, weights: dict, outputs: set) -> list:
         weights.pop(tensors[t]["const"], None)
         del tensors[t]
     return out
+
+
+_ATT_KINDS = ("bmm", "mul_scalar", "ewise_scalar", "ewise2", "softmax", "softmax_dim", "relu", "ewise1")
+
+
+def _fuse_attention_fp32(g: dict) -> dict:
+    """attention_fuse (written for the fp16 kinds) on this fp32 graph: bmm -> scale -> softmax -> bmm
+    chains (the permute copies around them folded into strides) -> one fp32 ``attention`` op, the
+    flash-style kernel (no score matrix). Chains with an additive mask are left alone."""
+    import copy  # noqa: PLC0415
+    from modelblaster.pipeline import attention_fuse  # noqa: PLC0415
+    h = copy.deepcopy(g)
+    for op in h["ops"]:
+        if op["op"] in _ATT_KINDS:
+            op["op"] += "_f16"
+    h, rep = attention_fuse.fuse(h)
+    if not rep["fused"]:
+        return g
+    for op in h["ops"]:
+        if op["op"] == attention_fuse.KIND:
+            op["op"] = "attention"
+            op.pop("approx", None)
+        elif op["op"].endswith("_f16") and op["op"][:-4] in _ATT_KINDS:
+            op["op"] = op["op"][:-4]
+    return h
 
 
 def inputs_of(ir, sample) -> dict:

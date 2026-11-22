@@ -326,6 +326,21 @@ void kernel_matmul_tatb(const float *A, const float *B, float *C, int M, int K, 
 void kernel_bmm(const float *A, const float *B, float *C, int batch, int M, int K, int N) {
     gemm(A, B, C, nullptr, batch, M, N, K, M * K, K, 1, K * N, N, 1);
 }
+// attention_fuse's fused attention (fp32), flash-style (shaders/attention.comp)
+void kernel_attention(const float *Q, const float *K, const float *V, float *O, int B0, int B1, int M, int N, int D,
+                      int DV, int q_off, int q_s0, int q_s1, int q_sm, int k_off, int k_s0, int k_s1, int k_sn,
+                      int v_off, int v_s0, int v_s1, int v_sn, int o_off, int o_s0, int o_s1, int o_sm, int causal,
+                      int act, float scale) {
+    int dmax = D > DV ? D : DV;
+    int dm = dmax <= 64 ? 64 : dmax <= 128 ? 128 : 256;
+    int consts[2] = {dm, dm <= 64 ? 32 : dm <= 128 ? 16 : 8};
+    int pipe = mb_vk_pipeline_spec("attention", consts, 2);
+    if (pipe < 0) return;
+    mb_pc pc;
+    pc.p(Q + q_off).p(K + k_off).p(V + v_off).p(O + o_off).i(B1).i(M).i(N).i(D).i(DV).i(q_s0).i(q_s1).i(q_sm)
+        .i(k_s0).i(k_s1).i(k_sn).i(v_s0).i(v_s1).i(v_sn).i(o_s0).i(o_s1).i(o_sm).i(causal).i(act).f(scale);
+    mb_vk_dispatch(pipe, (uint32_t)((M + 63) / 64), (uint32_t)(B0 * B1), 1, pc);
+}
 // layout_fold's bmm with strided operands: one tiled GEMM per b0 with b1 as its batch; a row-major C
 // (c_sn == 1) directly, a column-major one (c_sm == 1) as C^T = B^T A^T
 void kernel_bmm_strided(const float *A, const float *B, float *C, int B0, int B1, int M, int K, int N, int a_off,
