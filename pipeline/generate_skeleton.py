@@ -125,6 +125,8 @@ def _np_to_c_dtype(np_dtype) -> tuple[str, str]:
     """(c_type, ir_dtype_tag) for a numpy weight blob's dtype."""
     if np_dtype == np.float32:
         return "float", "f32"
+    if np_dtype == np.float64:
+        return "double", "f64"
     if np_dtype == np.float16:
         return "_Float16", "f16"
     if np_dtype == np.int8:
@@ -1368,6 +1370,12 @@ def _weight_name(model_name: str, weight_key: str,
     return ident
 
 
+def _affined(target_affinity, backend: Optional[str]) -> bool:
+    """backends.affined, imported lazily (see _conv_weight_layout_for_backend)."""
+    from modelblaster.pipeline.backends import affined
+    return affined(target_affinity, backend)
+
+
 def _conv_weight_layout_for_backend(backend: Optional[str]) -> Optional[str]:
     """Derive the conv weight layout for a backend from its algorithm declarations.
 
@@ -1467,7 +1475,7 @@ def _check_conv_family_layout_agreement(backend: Optional[str], s8_layout: Optio
         other_layouts = {
             algo.weight_layout
             for algo in spec.algorithms
-            if algo.target_affinity and backend in algo.target_affinity
+            if _affined(algo.target_affinity, backend)
         }
         if not other_layouts:
             continue
@@ -1533,7 +1541,7 @@ def _conv_weight_layout_for_op(op_name: Optional[str],
     declared = {
         algo.weight_layout
         for algo in spec.algorithms
-        if algo.target_affinity and backend in algo.target_affinity
+        if _affined(algo.target_affinity, backend)
     }
     if len(declared) > 1:
         raise SystemExit(
@@ -2444,6 +2452,14 @@ def emit_weights(
     if tile_extra:
         weights = {**{k: v for k, v in weights.items() if k not in tile_drop},
                    **tile_extra}
+    # K-axis permutation for linears that read an NHWC tensor through a flatten
+    # (assign_layouts --flatten-into-linear sets op["weight_perm"]). Applied to
+    # the logical [N, K] array before any backend packing, so every backend's
+    # weights.c agrees: the activation is one buffer shared by all of them.
+    perms = _linear_weight_perms(ir)
+    if perms:
+        weights = {k: (_apply_linear_weight_perm(v, perms[k]) if k in perms else v)
+                   for k, v in weights.items()}
     keys = sorted(weights.keys())
     # K3 IME backends: some conv weights go out as matrix tiles (k3_weight_tiles).
     from modelblaster.pipeline import k3_weight_tiles
@@ -2484,9 +2500,18 @@ def emit_weights(
                 f"{tuple(arr_out.shape)} {layout_tag} */"
             )
         # Tiles are loaded in place: keep them on a cache line (64-byte header).
-        align = "__attribute__((aligned(64))) " if k in k3_tiled else ""
-        c_lines.append(f"{align}const {c_type} {ident}[{arr_out.size}] = {{")
-        if arr_out.dtype in (np.float32, np.float16):
+        # graph.json "weight_align": {key: bytes}: arrays a device reads in place.
+        _al = ((ir or {}).get("weight_align") or {}).get(k)
+        if k in k3_tiled:
+            _al = max(64, int(_al or 0))
+        _attr = f" __attribute__((aligned({int(_al)})))" if _al else ""
+        c_lines.append(f"const {c_type} {ident}[{arr_out.size}]{_attr} = {{")
+        if arr_out.dtype == np.float64:
+            # repr() round-trips a double exactly
+            flat = arr_out.reshape(-1)
+            c_lines += ["    " + ", ".join(repr(float(v)) for v in flat[i:i + 4]) + ","
+                        for i in range(0, len(flat), 4)]
+        elif arr_out.dtype in (np.float32, np.float16):
             # fp16 weights: widen to fp32 for the literal text (lossless),
             # implicit narrow happens at compile time when initializing the
             # _Float16 array.
@@ -2497,6 +2522,58 @@ def emit_weights(
         c_lines.append("")
     with open(os.path.join(out_dir, "weights.c"), "w") as f:
         f.write("\n".join(c_lines))
+
+
+def _linear_weight_perms(ir: Optional[dict[str, Any]]) -> dict[str, dict]:
+    """weight key -> weight_perm, for every linear op carrying one.
+
+    A weight shared by ops that disagree is refused rather than packed one way.
+    """
+    perms: dict[str, dict] = {}
+    if not ir:
+        return perms
+    plain: set[str] = set()
+    for op in ir.get("ops", []) or []:
+        k = op.get("weight")
+        if not k:
+            continue
+        p = op.get("weight_perm")
+        if p is None:
+            plain.add(k)
+            continue
+        if p.get("kind") != "nhwc_flatten":
+            raise SystemExit(f"{op.get('name')}: unknown weight_perm {p!r}")
+        if k in perms and perms[k] != p:
+            raise SystemExit(f"weight {k!r}: conflicting weight_perm across ops")
+        perms[k] = p
+    both = plain & set(perms)
+    if both:
+        raise SystemExit(f"weights {sorted(both)} are read both permuted and "
+                         f"unpermuted; give the ops separate weight tensors")
+    return perms
+
+
+def _apply_linear_weight_perm(w: np.ndarray, p: dict) -> np.ndarray:
+    """[N, C*H*W] in NCHW-flatten order -> [N, H*W*C] in NHWC-flatten order:
+    w'[n, (h*W + w)*C + c] = w[n, (c*H + h)*W + w]."""
+    C, H, W = int(p["C"]), int(p["H"]), int(p["W"])
+    if w.ndim != 2 or w.shape[1] != C * H * W:
+        raise SystemExit(f"weight_perm {p!r} does not fit a weight of shape {w.shape}")
+    return np.ascontiguousarray(
+        w.reshape(w.shape[0], C, H, W).transpose(0, 2, 3, 1).reshape(w.shape[0], -1))
+
+
+def _ops_with_model_init() -> set[str]:
+    """Op kinds whose KernelSpec asks for one-time setup in model_<mid>_init()."""
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    return {k for k, sp in KERNEL_SPECS.items() if getattr(sp, "has_model_init", False)}
+
+
+class _EmitContext:
+    """What a KernelSpec.emit_call sees of the skeleton while emitting one op."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
 
 def _shape_str(op: dict) -> str:
@@ -2762,7 +2839,10 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             # Contiguous window into the input (slice / split / select of the
             # leading dims): a pointer offset, no copy.
             offset_aliases[op["outputs"][0]] = (op["inputs"][0], int(op["offset"]))
-        elif op["op"] == "view":
+        elif op["op"] == "view" or op.get("elided"):
+            # A plain view, or an elided relayout (assign_layouts
+            # --elide-relayouts): a dispatch with no body whose output is its
+            # input's buffer.
             aliases[op["outputs"][0]] = op["inputs"][0]
         elif op["op"] in ("chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"):
             # Two outputs: first half at offset 0, second half at offset
@@ -3023,6 +3103,15 @@ typedef model_{mid}_state_t       model_state_t;
 typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 #endif
 """
+    # One-time model setup (see model_init_calls). Declared only for graphs that
+    # need it; the xpurt main calls it before its timed region under this macro.
+    _init_ops = _ops_with_model_init()
+    if any(o.get("op") in _init_ops for o in ir["ops"]):
+        h = h.rstrip("\n") + (
+            f"\n\n/* One-time setup before the first inference (e.g. loading an accelerator's\n"
+            f" * weights); the schedule-driven runtime calls it outside its timed region. */\n"
+            f"#define MODEL_{umid}_HAS_INIT 1\n"
+            f"void model_{mid}_init(void);\n")
     with open(os.path.join(out_dir, "model.h"), "w") as f:
         f.write(h)
 
@@ -3128,6 +3217,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         return _buf_name(mid, tensor)
 
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
+    # Per-model one-time setup calls (model_<mid>_init). Only ops that need one
+    # add to it, and model.h/model.c gain the init entry point only then, so a
+    # graph without such an op generates exactly what it did before.
+    model_init_calls: list[str] = []
     dispatch_fns: list[str] = []
     # File-scope `static const` tables of per-shard weight pointers, one per
     # sharded conv. File scope rather than inside the dispatch function so the
@@ -3227,6 +3320,25 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         if op["op"] in _zero_cost_ops:
             # view / chunk2_c1: no kernel call. Aliases were set up above
             # (plain aliases for view, offset aliases for chunk2_c1).
+            continue
+        if op.get("elided"):
+            # Kept only so the dispatch list (and so the schedule) matches a
+            # graph that still had this relayout; the data never moves.
+            dispatch_id = op["dispatch_id"]
+            dispatch_fns.append(
+                f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
+                f"    unsigned long _s = rdcycle();\n"
+                f"    (void)s; /* elided {op['op']}: the consumer reads this layout directly */\n"
+                f"    unsigned long _e = rdcycle();\n"
+                f"    int slot = (n_++) % MODEL_{umid}_OP_COUNT;\n"
+                f'    records_[slot].dispatch_id = {dispatch_id};\n'
+                f'    records_[slot].name   = "{op["name"]}";\n'
+                f'    records_[slot].op     = "{op["op"]}";\n'
+                f'    records_[slot].shape  = "{_shape_str(op)}";\n'
+                f"    records_[slot].cycles = _e - _s;\n"
+                f"}}"
+            )
+            invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
             continue
         if op["op"].startswith("__fused__"):
             # axis-C realization (see pipeline/apply_fusion_hint.py).
@@ -3893,8 +4005,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             # (and few enough) that OC-parallelizing this call too is a
             # follow-up, not required for correctness or the measured win.
             in_ptr = ptr_for(op["inputs"][0], "in")
-            w = _weight_name(model_name, op["weight"])
-            b = _weight_name(model_name, op["bias"]) if op.get("bias") else "NULL"
+            # Backend-suffixed packed-weight symbol name, same as conv2d_s8 /
+            # conv2d_silu_s8: the HWIO-packed weight blob is emitted as
+            # <model>_<key>_<backend>, so the fused call must reference that
+            # name too (without `backend` it names the unpacked OIHW symbol,
+            # which for a curated gemmini build is never emitted -> undefined
+            # reference at compile).
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
             sh = op["shape"]
             q = op["quant"]
             call = (
@@ -3973,6 +4091,40 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "add_q_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_add_q_s8({a_ptr}, {b_ptr}, {out_ptr}, {n}, "
+                f"{q['ma']}, {q['mb']}, {q['shift']}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "batchnorm2d_q_s8":
+            # (outer, C, inner) from the DECLARED layout of the activation; the
+            # kernel indexes ((o*C + c)*inner + i), so this is the only place
+            # the axis order enters. Input and output must agree.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            _lays = _actlay.op_layouts(ir, op)
+            if len(_lays) != 1:
+                raise SystemExit(f"{op.get('name')}: batchnorm2d_q_s8 mixes "
+                                 f"layouts {sorted(_lays)}")
+            sh = op["shape"]
+            q = op["quant"]
+            fw = op["fold_weights"]
+            if next(iter(_lays)) == _actlay.NHWC:
+                outer, inner = sh["N"] * sh["H"] * sh["W"], 1
+            else:
+                outer, inner = sh["N"], sh["H"] * sh["W"]
+            call = (
+                f"kernel_batchnorm2d_q_s8({in_ptr}, "
+                f"{_weight_name(model_name, fw['m'], backend)}, "
+                f"{_weight_name(model_name, fw['bp'], backend)}, "
+                f"{_weight_name(model_name, fw['s'], backend)}, {out_ptr}, "
+                f"{outer}, {sh['C']}, {inner}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
         elif op["op"] == "batchnorm2d_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             s = _weight_name(model_name, op["weight"], backend)
@@ -3993,23 +4145,6 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_sigmoid_s8({in_ptr}, {out_ptr}, {n}, "
                 f"{_f32(q['scale_in'])}, {_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
-            )
-        elif op["op"] == "lstm_s8":
-            x_ptr = ptr_for(op["inputs"][0], "in")
-            wih = _weight_name(model_name, op["weight_ih"], backend)
-            whh = _weight_name(model_name, op["weight_hh"], backend)
-            b = _weight_name(model_name, op["bias"], backend)
-            _h_key, _c_key = _lstm_state_keys(op)
-            h_ptr = ptr_for(_h_key, "in")
-            c_ptr = ptr_for(_c_key, "in")
-            sh = op["shape"]
-            q = op["quant"]
-            call = (
-                f"kernel_lstm_s8({x_ptr}, {wih}, {whh}, {b}, "
-                f"{h_ptr}, {c_ptr}, {out_ptr}, "
-                f"{sh['in_size']}, {sh['H']}, "
-                f"{_f32(q['s_x'])}, {_f32(q['s_wih'])}, {_f32(q['s_whh'])}, "
-                f"{_f32(q['s_h'])}, {_f32(q['s_c'])})"
             )
         elif op["op"] == "lstm":
             x_ptr = ptr_for(op["inputs"][0], "in")
@@ -4249,6 +4384,46 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_h'])}, {_f32(q['scale_c'])}, "
                 f"{q['has_bias']})"
             )
+        elif op["op"] == "cat3_lut_s8":
+            # cat3_c1_s8 after fold_quant_consts --ops cat3_c1_s8 (N=1, flattened inputs).
+            n_in = op["shape"]["n_inputs"]
+            ins = ", ".join([f"{ptr_for(t, 'in')}, {n}" for t, n in zip(op["inputs"], n_in)]
+                            + ["0, 0"] * (3 - len(op["inputs"])))   # a folded cat2: empty third input
+            call = (f"kernel_cat3_lut_s8({ins}, "
+                    f"{_weight_name(model_name, op['lut'], backend)}, {out_ptr})")
+        elif op["op"] == "linear_seg_s32":
+            # pipeline/lower_lstm_seg.py: up to 4 int8 matvec passes into one int32 vector
+            ps = op["passes"]
+            if len(ps) > 4:
+                raise ValueError(f"{op['name']}: linear_seg_s32 supports at most 4 passes")
+            args = []
+            for p_ in ps:
+                args.append(f"{ptr_for(p_['input'], 'in')}, {_weight_name(model_name, p_['weight'], backend)}, "
+                            f"{p_['K']}, {p_['M']}")
+            args += ["0, 0, 0, 0"] * (4 - len(ps))
+            call = (f"kernel_linear_seg_s32({op['shape']['N']}, {op['quant']['R']}, " + ", ".join(args)
+                    + f", (int32_t *){out_ptr})")
+        elif op["op"] == "lstm_q_s8":
+            # lstm_s8 after pipeline/lower_lstm_int.py: same buffers and weights,
+            # integer cell constants instead of float scales.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            q = op["quant"]
+            _h_key, _c_key = _lstm_state_keys(op)
+            h_ptr = ptr_for(_h_key, "inout")
+            c_ptr = ptr_for(_c_key, "inout")
+            # lower_lstm_seg: b_hh is a per-tick int32 tensor (the op's second input), not a weight
+            bhh = (f"(const int32_t *){ptr_for(op['inputs'][1], 'in')}" if op.get("bias_hh_input")
+                   else _weight_name(model_name, op['bias_hh'], backend))
+            call = (
+                f"kernel_lstm_q_s8({in_ptr}, "
+                f"{_weight_name(model_name, _lstm_weight_keys(op)[0], backend)}, "
+                f"{_weight_name(model_name, _lstm_weight_keys(op)[1], backend)}, "
+                f"{_weight_name(model_name, op['bias'], backend)}, "
+                f"{bhh}, "
+                f"{h_ptr}, {c_ptr}, {out_ptr}, "
+                f"{_lstm_dims(op)[0]}, {_lstm_dims(op)[1]}, "
+                f"{q['Mx']}, {q['Mh']}, {q['S']}, {q['has_bias']})"
+            )
         elif op["op"] == "leaky_relu_s8":
             in_ptr = ptr_for(op["inputs"][0], "in")
             n = op["shape"]["n"]
@@ -4332,6 +4507,31 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_linear_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['M']}, {sh['K']}, {sh['N']}, "
+                f"{q['input_offset']}, {q['filter_offset']}, "
+                f"{q['output_offset']}, "
+                f"{mult}, {shift}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "depthwise_conv2d_s8_pc":
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            w = _weight_name(model_name, op["weight"], backend)
+            b = _weight_name(model_name, op["bias"], backend) if op.get("bias") else "NULL"
+            sh = op["shape"]
+            q = op["quant"]
+            mult = _weight_name(model_name, q["output_multiplier_per_oc_key"], backend)
+            shift = _weight_name(model_name, q["output_shift_per_oc_key"], backend)
+            # An OC tile of a depthwise conv would also have to move its
+            # INPUT channels, which _oc_tile_operands does not do.
+            if (op.get("split_from") or {}).get("axis") == "OC":
+                raise SystemExit(
+                    f"{op.get('name')}: OC tiles of depthwise_conv2d_s8_pc "
+                    f"are not supported (the input channels move too)")
+            C = sh.get("OC") or sh.get("C") or sh.get("groups")
+            call = (
+                f"kernel_depthwise_conv2d_s8_pc({in_ptr}, {w}, {b}, {out_ptr}, "
+                f"{sh['N']}, {C}, {sh['IH']}, {sh['IW']}, "
+                f"{sh['KH']}, {sh['KW']}, "
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
                 f"{q['input_offset']}, {q['filter_offset']}, "
                 f"{q['output_offset']}, "
                 f"{mult}, {shift}, "
@@ -4919,7 +5119,18 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         elif op["op"] in _GENERIC_ABI_OPS:
             call = _generic_call(op, ptr_for, model_name, backend)
         else:
-            raise NotImplementedError(f"unsupported op {op['op']}")
+            # An op kind with no built-in arm: its KernelSpec may say how to
+            # call it (reference_kernels.KernelSpec.emit_call; extensions).
+            from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+            _spec = KERNEL_SPECS.get(op["op"])
+            _emit = getattr(_spec, "emit_call", None)
+            if _emit is None:
+                raise NotImplementedError(f"unsupported op {op['op']}")
+            call, _init = _emit(op, _EmitContext(
+                mid=mid, model_name=model_name, backend=backend, tensors=tensors,
+                out_ptr=out_ptr, ptr_for=ptr_for,
+                weight_name=lambda key: _weight_name(model_name, key, backend)))
+            model_init_calls.extend(_init)
         # Mangle the kernel call: every kernels.c emits kernel_<op>_<mid>
         # (set via emit_kernels_h/c's model_name arg) so multiple models can
         # link side-by-side without colliding on bare kernel_<op> symbols.
@@ -5008,21 +5219,41 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 .replace("(output + ", "(s->output + "))
             if out_ptr_for_inspect in ("input", "output"):
                 out_ptr_for_inspect = f"s->{out_ptr_for_inspect}"
-            if t_dtype == "i8":
-                cast = "int8_t"
-            elif t_dtype == "f16":
-                cast = "_Float16"
+            _int_c = {"i8": "int8_t", "i16": "int16_t", "i32": "int32_t",
+                      "i64": "int64_t"}
+            if t_dtype in _int_c:
+                # Integer codes print exactly (an int64 accumulator does not
+                # survive a trip through float).
+                cast = _int_c[t_dtype]
+                _pr = 'printf("%lld\\n", (long long)_p[_i]);'
             else:
-                cast = "float"
+                cast = "_Float16" if t_dtype == "f16" else "float"
+                _pr = 'printf("%g\\n", (double)(float)_p[_i]);'
             inspect_block += (
                 f'    printf("=== MODELBLASTER_INSPECT_BEGIN [{out_t}] === '
                 f'scale=%g dtype={t_dtype} n=%d\\n", '
                 f'{_f32(t_scale)}, {n_elems});\n'
                 f"    {{ const {cast} *_p = (const {cast} *){out_ptr_for_inspect};\n"
                 f"      for (int _i = 0; _i < {n_elems}; _i++) "
-                f'printf("%g\\n", (double)(float)_p[_i]); }}\n'
+                f'{_pr} }}\n'
                 f'    printf("=== MODELBLASTER_INSPECT_END [{out_t}] ===\\n");\n'
             )
+        # Per-layer golden check (generate(..., layer_golden=...)): after the
+        # LAST op that writes a checked tensor, hash its bytes and compare with
+        # the golden's. One line per tensor; nothing is emitted without a
+        # layer golden, so such builds are unchanged.
+        for out_t in op.get("outputs", []):
+            _lc = (ir.get("_layer_check") or {}).get(out_t)
+            if _lc is None or _lc["last_writer"] != op["name"]:
+                continue
+            _p = (ptr_for(out_t, "out")
+                  .replace("(input + ", "(s->input + ")
+                  .replace("(output + ", "(s->output + "))
+            if _p in ("input", "output"):
+                _p = f"s->{_p}"
+            inspect_block += (
+                f'    mb_layer_check_{mid}("{out_t}", (const void *){_p}, '
+                f'{_lc["nbytes"]}UL, 0x{_lc["crc32"]:08x}UL);\n')
         dispatch_fns.append(
             f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
             f"    unsigned long _s = rdcycle();\n"
@@ -5256,7 +5487,7 @@ static int n_;
  * from k_cycle_get_64() (mtime). Cross-hart correct, lower resolution
  * than per-op rdcycle. */
 static unsigned long wall_cycles_;
-
+{_layer_check_src(mid, len(ir["_layer_check"])) if ir.get("_layer_check") else ""}
 /* ---------- per-dispatch invoke fns (one per non-view IR op) ----------- */
 {layout_scratch_src}{chr(10).join(shard_tables)}
 
@@ -5287,7 +5518,7 @@ void run_model_{mid}({input_sig_params}model_{mid}_output_t *output,
         MODEL_{umid}_DISPATCH_FNS[i](&s);
     }}
     wall_cycles_ = (unsigned long)mb_wall_ticks() - _wall_s;
-}}
+{"    model_" + mid + "_layer_report();   /* after the timed window */" + chr(10) if ir.get("_layer_check") else ""}}}
 
 const model_{mid}_op_record_t *model_{mid}_profile_records(int *count) {{
     /* Clamp to OP_COUNT — the per-dispatch n_++ is non-atomic across
@@ -5305,6 +5536,10 @@ unsigned long model_{mid}_wall_cycles(void) {{
     return wall_cycles_;
 }}
 """
+    if model_init_calls:
+        c = c.rstrip("\n") + (
+            f"\n\nvoid model_{mid}_init(void) {{\n"
+            + "".join(f"    {x}\n" for x in model_init_calls) + "}\n")
     c = _index_buffers_by_set(c, mid)
     with open(os.path.join(out_dir, "model.c"), "w") as f:
         f.write(c)
@@ -5416,8 +5651,20 @@ def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
     ]
 
     def _s_blob(sym, bin_abs):
+        # BASENAME, not the absolute path it was generated at. GNU as resolves
+        # .incbin through its include search path, and the harness already puts
+        # MODEL_DIR on it (target_include_directories(app PRIVATE ... MODEL_DIR)
+        # applies to the ASM source too), so the bare name resolves wherever the
+        # directory is.
+        #
+        # Baking the absolute path made a generated directory unmovable: copied
+        # or published to another machine, the build fails at
+        #   Error: file not found: /<build host>/.../test_input.bin
+        # even though the .bin sits right beside the .S that names it. That is
+        # the whole obstacle to shipping a verified codegen to a bench machine
+        # which cannot run the verification gate itself.
         return [f"    .globl  {sym}", f"    .type   {sym}, @object",
-                f"{sym}:", f'    .incbin "{bin_abs}"',
+                f"{sym}:", f'    .incbin "{os.path.basename(bin_abs)}"',
                 f"    .size   {sym}, . - {sym}", "    .align 4", ""]
 
     h_input_decls: list[str] = []       # extern + LEN macros (mangled)
@@ -5491,6 +5738,66 @@ def emit_test_io(ir: dict[str, Any], io_npz: str, out_dir: str) -> None:
         f.write("\n".join(h_lines))
 
 
+def _layer_check_src(mid: str, n_checks: int) -> str:
+    # CRC-32 (zlib's: reflected, polynomial 0xEDB88320), bitwise: a few lines,
+    # no table, and the host side is zlib.crc32. The results are kept and
+    # printed by model_<mid>_layer_report() after the run, so the console
+    # (115200 baud: ~5 ms a line) stays out of the timed window.
+    return (
+        "#include <stdio.h>\n"
+        f"static const char *mb_lc_name_{mid}[{n_checks}];\n"
+        f"static unsigned long mb_lc_got_{mid}[{n_checks}], mb_lc_exp_{mid}[{n_checks}];\n"
+        f"static int mb_lc_n_{mid};\n"
+        f"static void mb_layer_check_{mid}(const char *name, const void *p, "
+        "unsigned long n, unsigned long exp)\n{\n"
+        "    const unsigned char *b = (const unsigned char *)p;\n"
+        "    unsigned long c = 0xffffffffUL;\n"
+        "    for (unsigned long i = 0; i < n; i++) {\n"
+        "        c ^= b[i];\n"
+        "        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xedb88320UL & (0UL - (c & 1UL)));\n"
+        "    }\n"
+        "    c = (c ^ 0xffffffffUL) & 0xffffffffUL;\n"
+        f"    if (mb_lc_n_{mid} < {n_checks}) {{ mb_lc_name_{mid}[mb_lc_n_{mid}] = name; "
+        f"mb_lc_got_{mid}[mb_lc_n_{mid}] = c; mb_lc_exp_{mid}[mb_lc_n_{mid}++] = exp; }}\n}}\n"
+        f"void model_{mid}_layer_report(void)\n{{\n"
+        f"    for (int i = 0; i < mb_lc_n_{mid}; i++)\n"
+        '        printf("=== MODELBLASTER_LAYER [%s] %s %08lx %08lx ===\\n", '
+        f"mb_lc_name_{mid}[i],\n"
+        f'               mb_lc_got_{mid}[i] == mb_lc_exp_{mid}[i] ? "ok" : "BAD", '
+        f"mb_lc_got_{mid}[i], mb_lc_exp_{mid}[i]);\n"
+        f"    mb_lc_n_{mid} = 0;\n}}\n")
+
+
+def attach_layer_golden(ir: dict, path: str) -> int:
+    """Attach a per-layer golden (an npz of IR tensor name -> expected array, in
+    the tensor's IR layout and dtype) to `ir` for emit_model. Refuses an array
+    whose size or dtype differs from the tensor's."""
+    import zlib
+    gold = np.load(path)
+    last = {}
+    for op in ir["ops"]:
+        if op.get("dispatch_id") is None:
+            continue
+        for t in op.get("outputs", []):
+            last[t] = op["name"]
+    _np_dt = {"i8": np.int8, "i16": np.int16, "i32": np.int32, "i64": np.int64,
+              "f16": np.float16, "f32": np.float32}
+    chk = {}
+    for t in gold.files:
+        meta = ir["tensors"].get(t)
+        if meta is None or t not in last:
+            raise SystemExit(f"layer golden: {t!r} is not a tensor an op writes")
+        a = gold[t]
+        n = _prod(meta["shape"])
+        if a.size != n or a.dtype != _np_dt[meta.get("dtype", "i8")]:
+            raise SystemExit(f"layer golden: {t!r} is {a.dtype}[{a.size}], the "
+                             f"IR tensor {meta.get('dtype')}[{n}]")
+        b = np.ascontiguousarray(a).tobytes()
+        chk[t] = {"nbytes": len(b), "crc32": zlib.crc32(b), "last_writer": last[t]}
+    ir["_layer_check"] = chk
+    return len(chk)
+
+
 def generate(
     ir_path: str,
     weights_path: str,
@@ -5498,11 +5805,14 @@ def generate(
     out_dir: str,
     backend: Optional[str] = None,
     platform: str = "zephyr",
+    layer_golden: Optional[str] = None,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
         ir = json.load(f)
     refuse_unsupported_quant(ir)
+    if layer_golden:
+        print(f"layer golden: {attach_layer_golden(ir, layer_golden)} tensors checked")
     weights = dict(np.load(weights_path))
     model_name = ir["name"]
 
@@ -5543,9 +5853,15 @@ def main() -> None:
                          "(int8 arithmetic is exact, so max_abs_err is "
                          "architecture-independent) and its cycle counts are "
                          "host nanoseconds -- never a cost input.")
+    ap.add_argument("--layer-golden", default=None,
+                    help="npz of IR tensor name -> expected array (IR layout and "
+                         "dtype). Each listed tensor is hashed after the last op "
+                         "that writes it and compared with the golden's hash; the "
+                         "model prints one MODELBLASTER_LAYER line per tensor. "
+                         "Without it nothing changes in the generated code.")
     args = ap.parse_args()
     generate(args.ir, args.weights, args.io, args.out_dir, backend=args.backend,
-             platform=args.platform)
+             platform=args.platform, layer_golden=args.layer_golden)
 
 
 if __name__ == "__main__":

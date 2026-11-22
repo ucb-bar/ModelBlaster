@@ -40,6 +40,34 @@ class HarnessResult:
     golden_max_abs_err: float = 0.0
     golden_max_rel_err: float = 0.0
     raw_stdout: str = ""
+    # Per-layer golden check (generate_skeleton --layer-golden): tensors that
+    # matched / did not, and the first that did not, in dispatch order.
+    layers_ok: int = 0
+    layers_bad: int = 0
+    first_bad_layer: Optional[str] = None
+
+
+def parse_layers(stdout: str) -> tuple[int, int, Optional[str]]:
+    """Count MODELBLASTER_LAYER lines: (ok, bad, first bad tensor)."""
+    import re as _re
+    ok = bad = 0
+    first = None
+    for m in _re.finditer(r"=== MODELBLASTER_LAYER \[([^\]]+)\] (ok|BAD) ", stdout):
+        if m.group(2) == "ok":
+            ok += 1
+        else:
+            bad += 1
+            first = first or m.group(1)
+    return ok, bad, first
+
+
+def io_is_exact(io_path: Optional[str]) -> bool:
+    """True when io.npz declares an integer golden (its `exact` flag). Opt-in only: an int8 model's output is an
+    integer too, and its io.npz holds the quantized FP32 output, which the existing tolerances are for."""
+    if not io_path:
+        return False
+    d = np.load(io_path)
+    return "exact" in d.files and bool(int(d["exact"]))
 
 
 class ProfileError(RuntimeError):
@@ -74,7 +102,7 @@ def _west_build(
     if pristine:
         cmd.insert(2, "-p")
     cmd += ["--",
-            f"-DMODEL_DIR={model_dir}",
+            f"-DMODEL_DIR={os.path.abspath(model_dir)}",
             f"-DMODELBLASTER_BACKEND={backend.name}"]
     if backend.kernel_cflags:
         # Resolve <repo_root> placeholders (gemmini's -isystem paths use
@@ -83,6 +111,20 @@ def _west_build(
         # verify path's equivalent.
         cflags = backend.resolved_kernel_cflags(repo_root)
         cmd.append(f"-DMODELBLASTER_KERNEL_CFLAGS={';'.join(cflags)}")
+        # The verify image must share the kernel's float ABI or the two do not
+        # link. spike_riscv64 and harness/prj.conf are CONFIG_FPU=y (lp64d);
+        # a soft-float kernel (-mabi=lp64 / ilp32) needs a CONFIG_FPU=n image,
+        # which Zephyr then builds lp64 with no f/d in -march. spike's --isa is
+        # a superset, so the soft-float image runs there unchanged -- and the
+        # object that is gated is the object the no-FPU shell will run.
+        abi = next((f.split("=", 1)[1] for f in cflags
+                    if f.startswith("-mabi=")), None)
+        # Stated in both directions: a -D CONFIG_ symbol is cached in the build
+        # directory, so a soft-float verify must not leave FPU=n behind for
+        # the next hard-float one sharing that directory.
+        if abi is not None:
+            hard = abi.endswith(("f", "d", "q"))
+            cmd.append(f"-DCONFIG_FPU={'y' if hard else 'n'}")
     # Extra cmake args, from the caller or from
     # MODELBLASTER_EXTRA_CMAKE_ARGS (';'-separated) so a wrapper script can
     # set them without threading a parameter through every verify call site.
@@ -100,6 +142,12 @@ def _west_build(
         extra = [a for a in _env_extra.split(";") if a.strip()]
     cmd += extra
     env = os.environ.copy()
+    # Default the Zephyr SDK toolchain variant when the caller has not
+    # already chosen one, so the west verify build resolves the CPP (CMake's
+    # Zephyr-sdk package registry can otherwise pick a stale/broken SDK).
+    # ZEPHYR_SDK_INSTALL_DIR / ZEPHYR_BASE are intentionally NOT hardcoded here --
+    # activate your west workspace (or export them) in the calling environment.
+    env.setdefault("ZEPHYR_TOOLCHAIN_VARIANT", "zephyr")
     # Ensure cmake is found (Vitis puts a broken cmake first in $PATH).
     # Also ensure west is findable via MODELBLASTER_WEST or the miniforge zephyr env.
     _WEST_FALLBACK = os.path.join(
@@ -278,6 +326,7 @@ def build_and_run(
         output=actual if actual is not None else np.empty(0, dtype=np.float32),
         raw_stdout=out,
     )
+    result.layers_ok, result.layers_bad, result.first_bad_layer = parse_layers(out)
 
     if io_path:
         import math as _math
@@ -327,6 +376,9 @@ def build_and_run(
                     verify["max_abs_err"] <= eff_atol
                     or verify["max_rel_err"] <= eff_rtol
                 )
+                if io_is_exact(io_path):
+                    # An integer golden is exact: no rtol escape hatch.
+                    result.golden_ok = bool(verify["max_abs_err"] <= eff_atol)
         else:
             # Legacy per-element path. Identical to before this branch
             # was added; kept for older harness binaries / int8 paths
@@ -344,6 +396,13 @@ def build_and_run(
                 result.golden_ok = bool(
                     np.all(abs_err <= eff_atol + eff_rtol * np.abs(golden))
                 )
+                if io_is_exact(io_path):
+                    result.golden_ok = bool(np.array_equal(
+                        np.asarray(actual).reshape(-1), np.asarray(raw_golden).reshape(-1)))
+        if result.layers_bad and not eff_atol:
+            # Per-layer goldens are exact; a build that explicitly accepts drift
+            # (atol > 0) is judged on its output alone.
+            result.golden_ok = False
 
     return result
 

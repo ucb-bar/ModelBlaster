@@ -64,6 +64,7 @@ def rename_defs(model_name: str, used_ops: Iterable[str], backend: str
         f"model_{mid}_reset_profile",
         f"model_{mid}_wall_cycles",
         f"model_{mid}_set_wall_cycles",
+        f"model_{mid}_init",
         f"model_{mid}_profile_records",
     ):
         defs.append(f"-D{fn}={fn}_{bs}")
@@ -106,6 +107,14 @@ def _main() -> None:
     with open(args.ir) as f:
         ir = json.load(f)
     used = {op["op"] for op in ir.get("ops", []) if op.get("op") != "view"}
+    # A graph with NHWC tensors can carry relayout KERNELS in kernels.c with no
+    # relayout OP in the graph: generate_kernels adds them for the layout shims
+    # (an NCHW kernel on an NHWC tensor), and assign_layouts --alias-c1 /
+    # --flatten-into-linear can leave an island with no boundary dispatch at all.
+    # Unrenamed, two backends' copies collide at link time. Renaming a symbol a
+    # TU does not define is a no-op, so add them whenever NHWC is present.
+    if any((t or {}).get("layout") == "nhwc" for t in (ir.get("tensors") or {}).values()):
+        used |= {"nchw_to_nhwc_s8", "nhwc_to_nchw_s8"}
     flags = rename_defs(ir["name"], used, args.backend)
     print(args.separator.join(flags))
 

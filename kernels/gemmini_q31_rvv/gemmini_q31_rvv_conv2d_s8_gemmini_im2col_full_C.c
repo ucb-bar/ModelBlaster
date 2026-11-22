@@ -212,31 +212,38 @@ static inline void gq31_vzero_i8(elem_t *dst, size_t n)
  * the scalar '+ (1<<(shift-1)) >> shift'). Structurally the same
  * construction as kernels/rvv/rvv_conv2d_s8_rvv_vsmul_vnclip.c's
  * mb_requant_i32m4. */
-static inline vint8m1_t gq31_requant_i32m4(vint32m4_t vacc,
+/* TACIT tuning (kernel_opt: requant vl-widening): the requant chain was the
+ * single hottest phase of dronet conv (vnclip @ this helper ~30% of the whole
+ * inference on the At35 NoLoopConv+TACIT bitstream). It was e32m4 (VLMAX=16 on
+ * VLEN=128), so OC channels needed ceil(OC/16) short calls each paying the
+ * vsetvl + vsmul->vnclip dependency-chain latency. Widen the whole chain to
+ * e32m8 (VLMAX=32): identical per-element arithmetic (bit-exact), half the
+ * calls, dependency-chain latency amortized over 2x the elements. */
+static inline vint8m2_t gq31_requant_i32m8(vint32m8_t vacc,
                                            int output_multiplier, int output_shift,
                                            int output_offset,
                                            int activation_min, int activation_max,
                                            size_t vl)
 {
-    vint32m4_t vscaled = __riscv_vsmul_vx_i32m4(
+    vint32m8_t vscaled = __riscv_vsmul_vx_i32m8(
         vacc, output_multiplier, __RISCV_VXRM_RNU, vl);
-    vint16m2_t vout16;
+    vint16m4_t vout16;
     if (output_shift < 0) {
-        vint32m4_t vsh = __riscv_vsll_vx_i32m4(vscaled, (size_t)(-output_shift), vl);
-        vout16 = __riscv_vnclip_wx_i16m2(vsh, 0, __RISCV_VXRM_RNU, vl);
+        vint32m8_t vsh = __riscv_vsll_vx_i32m8(vscaled, (size_t)(-output_shift), vl);
+        vout16 = __riscv_vnclip_wx_i16m4(vsh, 0, __RISCV_VXRM_RNU, vl);
     } else if (output_shift < 32) {
-        vout16 = __riscv_vnclip_wx_i16m2(vscaled, (size_t)output_shift,
+        vout16 = __riscv_vnclip_wx_i16m4(vscaled, (size_t)output_shift,
                                          __RISCV_VXRM_RNU, vl);
     } else {
         int sa2 = output_shift - 31;
         if (sa2 > 31) sa2 = 31;
-        vint32m4_t v2 = __riscv_vsra_vx_i32m4(vscaled, 31, vl);
-        vout16 = __riscv_vnclip_wx_i16m2(v2, (size_t)sa2, __RISCV_VXRM_RNU, vl);
+        vint32m8_t v2 = __riscv_vsra_vx_i32m8(vscaled, 31, vl);
+        vout16 = __riscv_vnclip_wx_i16m4(v2, (size_t)sa2, __RISCV_VXRM_RNU, vl);
     }
-    vout16 = __riscv_vadd_vx_i16m2(vout16, (int16_t)output_offset, vl);
-    vout16 = __riscv_vmax_vx_i16m2(vout16, (int16_t)activation_min, vl);
-    vout16 = __riscv_vmin_vx_i16m2(vout16, (int16_t)activation_max, vl);
-    return __riscv_vnsra_wx_i8m1(vout16, 0, vl);
+    vout16 = __riscv_vadd_vx_i16m4(vout16, (int16_t)output_offset, vl);
+    vout16 = __riscv_vmax_vx_i16m4(vout16, (int16_t)activation_min, vl);
+    vout16 = __riscv_vmin_vx_i16m4(vout16, (int16_t)activation_max, vl);
+    return __riscv_vnsra_wx_i8m2(vout16, 0, vl);
 }
 
 void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
@@ -265,9 +272,15 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
     static elem_t ws_input_all  [MB_GEM_GQRVIM_WS_SLOTS][WS_BYTES]     __attribute__((aligned(64)));
     static elem_t ws_im2col_all [MB_GEM_GQRVIM_WS_SLOTS][IM2COL_ELEMS] __attribute__((aligned(64)));
     static acc_t  ws_acc_out_all[MB_GEM_GQRVIM_WS_SLOTS][ACC_ELEMS]    __attribute__((aligned(64)));
-    elem_t *const ws_input   = ws_input_all  [MB_GEM_GQRVIM_WS_SLOT];
-    elem_t *const ws_im2col  = ws_im2col_all [MB_GEM_GQRVIM_WS_SLOT];
-    acc_t  *const ws_acc_out = ws_acc_out_all[MB_GEM_GQRVIM_WS_SLOT];
+    /* NHWC int8 requant scratch: one tile's [DIM rows x OC] output, row-major
+     * (channel-minor), so the requant store is unit-stride; a separate bulk
+     * pass transposes it to the strided NCHW output. Same DIM*OC bound as the
+     * accumulator, so the existing OC*DIM > ACC_ELEMS guard covers it. */
+    static elem_t ws_out_nhwc_all[MB_GEM_GQRVIM_WS_SLOTS][ACC_ELEMS]    __attribute__((aligned(64)));
+    elem_t *const ws_input    = ws_input_all   [MB_GEM_GQRVIM_WS_SLOT];
+    elem_t *const ws_im2col   = ws_im2col_all  [MB_GEM_GQRVIM_WS_SLOT];
+    acc_t  *const ws_acc_out  = ws_acc_out_all [MB_GEM_GQRVIM_WS_SLOT];
+    elem_t *const ws_out_nhwc = ws_out_nhwc_all[MB_GEM_GQRVIM_WS_SLOT];
 
     int OH = (IH + 2*PH - KH) / SH + 1;
     int OW = (IW + 2*PW - KW) / SW + 1;
@@ -475,29 +488,51 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
         gemmini_fence();
         gemmini_flush(0);
 
-        /* RVV Q0.31 requantize: int32 accumulator -> int8, written
-         * straight into `output`'s NCHW layout (stride OH*OW elements
-         * between consecutive oc) via a strided vector store. No NHWC
-         * staging buffer, no separate transpose pass (kernel_opt_log
-         * id 304's fix, applied here too). */
+        /* RVV Q0.31 requantize, split into two passes (TACIT tuning:
+         * requant-store decoupling). TACIT showed the requant phase was
+         * store/throughput-bound: the per-row STRIDED NCHW store (vsse8, stride
+         * OH*OW) interleaved with the vsmul->vnclip chain stalls the next row's
+         * vector ops on the store buffer.
+         *   Pass 1: requant every row UNIT-stride into an NHWC scratch
+         *           (ws_out_nhwc[i*OC + oc]) -- the vector chain never waits on
+         *           a strided store.
+         *   Pass 2: one bulk transpose of the tile, unit-load from the scratch +
+         *           strided store to the NCHW output, with no vector compute in
+         *           the loop to stall.
+         * Bit-exact: same requant arithmetic, same bytes at the same NCHW
+         * addresses. Wrap-counters (from the prior change) drive the NCHW
+         * address in pass 2. */
+        /* pass 1: requant -> NHWC scratch (unit-stride store) */
         for (int i = 0; i < tile_rows; i++) {
-            int out_idx = tile_i + i;
-            int ow_idx  = out_idx % OW;
-            int oh_idx  = (out_idx / OW) % OH;
-            int n_idx   = out_idx / (OH * OW);
-            int8_t *dst0 = output + (((size_t)n_idx * OC) * OH + oh_idx) * OW + ow_idx;
-            ptrdiff_t oc_stride_bytes = (ptrdiff_t)OH * OW;  /* elem_t is 1 byte */
+            elem_t *nh = ws_out_nhwc + (size_t)i * OC;
             int oc = 0;
             while (oc < OC) {
-                size_t vl = __riscv_vsetvl_e32m4((size_t)(OC - oc));
-                vint32m4_t vacc = __riscv_vle32_v_i32m4(&ws_acc_out[i * OC + oc], vl);
-                vint8m1_t vout = gq31_requant_i32m4(
+                size_t vl = __riscv_vsetvl_e32m8((size_t)(OC - oc));
+                vint32m8_t vacc = __riscv_vle32_v_i32m8(&ws_acc_out[i * OC + oc], vl);
+                vint8m2_t vout = gq31_requant_i32m8(
                     vacc, output_multiplier, output_shift, output_offset,
                     activation_min, activation_max, vl);
-                __riscv_vsse8_v_i8m1(dst0 + (size_t)oc * OH * OW,
-                                     oc_stride_bytes, vout, vl);
+                __riscv_vse8_v_i8m2(nh + oc, vout, vl);
                 oc += (int)vl;
             }
+        }
+        /* pass 2: bulk NHWC scratch -> NCHW output (unit-load, strided store) */
+        int owc = tile_i % OW;
+        int ohc = (tile_i / OW) % OH;
+        int nc  = tile_i / (OH * OW);
+        ptrdiff_t oc_stride_bytes = (ptrdiff_t)OH * OW;  /* elem_t is 1 byte */
+        for (int i = 0; i < tile_rows; i++) {
+            int8_t *dst0 = output + (((size_t)nc * OC) * OH + ohc) * OW + owc;
+            elem_t *nh = ws_out_nhwc + (size_t)i * OC;
+            int oc = 0;
+            while (oc < OC) {
+                size_t vl = __riscv_vsetvl_e8m2((size_t)(OC - oc));
+                vint8m2_t v = __riscv_vle8_v_i8m2(nh + oc, vl);
+                __riscv_vsse8_v_i8m2(dst0 + (size_t)oc * OH * OW,
+                                     oc_stride_bytes, v, vl);
+                oc += (int)vl;
+            }
+            if (++owc == OW) { owc = 0; if (++ohc == OH) { ohc = 0; ++nc; } }
         }
     }
 }

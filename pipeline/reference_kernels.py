@@ -125,6 +125,11 @@ class AlgorithmCandidate:
     # See docs/IR_TENSOR_LAYOUT_DESIGN.md; this is stage 2, which is inert until
     # a graph actually carries a non-default tensor layout.
     act_layouts: tuple[str, ...] = ("nchw",)
+    # Opt-in only: the reference path never picks this algorithm on its own,
+    # only through generate_kernels --pin-algorithm. For accelerator lowerings
+    # (the hardware may be absent) and numerics variants (a build must not
+    # change arithmetic because a file appeared in kernels/<backend>/).
+    pin_only: bool = False
 
 
 # The Gemmini backend family, spelled as the EXACT strings the affinity filter
@@ -221,6 +226,18 @@ class KernelSpec:
     # `reference_impl` is synthesized, preserving the previous single-seed
     # behavior.
     algorithms: list[AlgorithmCandidate] = field(default_factory=list)
+    # For op kinds generate_skeleton has no built-in call for (normally ones an
+    # extension adds; see load_extensions below). Called as
+    # emit_call(op, ctx) -> (call, init_calls): `call` is the kernel call with
+    # the plain kernel_<op>( name, which the skeleton mangles like any other;
+    # `init_calls` are complete C statements for model_<mid>_init(), the
+    # one-time setup the schedule-driven runtime runs before its timed region.
+    # ctx carries mid, model_name, backend, tensors, out_ptr, ptr_for(tensor,
+    # role) and weight_name(key).
+    emit_call: Optional[Callable[[dict, Any], tuple[str, list[str]]]] = None
+    # True when emit_call returns init calls, so model.h declares
+    # model_<mid>_init() for any graph that contains this op.
+    has_model_init: bool = False
 
     def __post_init__(self):
         # Synthesize a "direct" algorithm seeded from `reference_impl`
@@ -4234,7 +4251,7 @@ void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
     algorithms=[
         AlgorithmCandidate(
             name="gemmini_tiled_conv_pool",
-            target_affinity=("gemmini", "gemmini_q31"),
+            target_affinity=("gemmini", "gemmini_q31", "gemmini_q31_rvv"),
             weight_layout="hwio",
             accuracy_class=AccuracyClass.NUMERIC_DRIFT,
             description=(
@@ -4247,6 +4264,27 @@ void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
                 "gemmini's scalar pool params; anything else falls back "
                 "to the scalar reference (conv then a separate pool "
                 "pass)."
+            ),
+            reference_impl="",  # the curated .c file supplies the impl
+        ),
+        # ── NHWC fused conv+maxpool (integrated stack) ──────────────────────
+        # NHWC-native counterpart of gemmini_tiled_conv_pool: the conv is
+        # transpose-free (reads/writes NHWC) AND the maxpool rides the HW mvout
+        # pool tail, so both the per-conv transpose and the standalone maxpool
+        # (+ its boundary relayouts) are gone. Same pool constraints/exactness.
+        # Curated file:
+        # kernels/gemmini_q31_rvv/gemmini_q31_rvv_conv2d_pool_s8_gemmini_tiled_conv_pool_nhwc.c
+        AlgorithmCandidate(
+            name="gemmini_tiled_conv_pool_nhwc",
+            target_affinity=GEMMINI_TARGETS,
+            act_layouts=("nhwc",),
+            weight_layout="hwio",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "NHWC fused conv2d+maxpool: tiled_conv_auto with its pool tail "
+                "on NHWC activations, no NCHW<->NHWC transpose on either side. "
+                "Same square/unpadded pool constraints as gemmini_tiled_conv_"
+                "pool; anything else -> scalar NHWC conv-then-pool fallback."
             ),
             reference_impl="",  # the curated .c file supplies the impl
         ),
@@ -4493,6 +4531,55 @@ void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
 }
 """,
         ),
+        # ── NHWC RVV maxpool (fast STANDALONE) ──────────────────────────────
+        # gemmini_tiled_conv_pool_nhwc above reaches the HW pooler through
+        # tiled_conv_auto -- great when the pool is FUSED into a conv mvout, but
+        # run standalone it materialises a whole conv (measured 1.78 M cyc on
+        # dronet's one maxpool vs 89 K for the NCHW RVV direct). NHWC puts the
+        # channel innermost, so a pooling tap is a contiguous C-run and the whole
+        # window max is unit-stride vle8 + vmax over channels -- no gather.
+        # Curated file:
+        # kernels/gemmini_q31_rvv/gemmini_q31_rvv_maxpool2d_s8_direct_nhwc.c
+        AlgorithmCandidate(
+            name="direct_nhwc",
+            target_affinity=GEMMINI_TARGETS,
+            act_layouts=("nhwc",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Vectorised NHWC maxpool: vle8+vmax over the contiguous channel "
+                "dimension, unit stride everywhere (no gather). The right "
+                "standalone maxpool for an NHWC island; the HW-pool nhwc kernel "
+                "is only efficient fused into a conv mvout."
+            ),
+            reference_impl="""\
+void kernel_maxpool2d_s8(const int8_t *input, int8_t *output,
+                         int N, int C, int IH, int IW,
+                         int KH, int KW, int SH, int SW,
+                         int PH, int PW, int DH, int DW)
+{
+    /* NHWC seed: [N,H,W,C] on both sides. */
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    for (int n = 0; n < N; n++)
+    for (int oh = 0; oh < OH; oh++)
+    for (int ow = 0; ow < OW; ow++)
+    for (int c = 0; c < C; c++) {
+        int8_t m = INT8_MIN;
+        for (int kh = 0; kh < KH; kh++) {
+            int ih = oh*SH - PH + kh*DH;
+            if (ih < 0 || ih >= IH) continue;
+            for (int kw = 0; kw < KW; kw++) {
+                int iw = ow*SW - PW + kw*DW;
+                if (iw < 0 || iw >= IW) continue;
+                int8_t v = input[((n*IH+ih)*IW+iw)*C+c];
+                if (v > m) m = v;
+            }
+        }
+        output[((n*OH+oh)*OW+ow)*C+c] = m;
+    }
+}
+""",
+        ),
     ],
 )
 
@@ -4672,6 +4759,34 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
             ),
             reference_impl="(use the curated kernel in kernels/rvv/)",
             accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+        # The gemmini_q31_rvv entry (fast-conv DroNet path). Same gap as
+        # rvv_frm_rmm above but for the hetero gemmini_q31_rvv backend: the
+        # curated kernel kernels/gemmini_q31_rvv/gemmini_q31_rvv_add_s8_rvv.c
+        # (committed in 3414ec6) had no AlgorithmCandidate whose name+affinity
+        # the curated-file probe (<target>_<op>_<algo>.c) could match, so on
+        # this backend add_s8 silently fell back to the scalar reference
+        # (gemmini_q31_rvv_add_s8_direct.c) even after 3414ec6 landed -- this
+        # is the ladder's S2-vs-S7 double-count note (PERF_LADDER.md §2):
+        # the RVV add measured a real op-level win but the fast-conv E2E
+        # build kept running the scalar add until this affinity gap was
+        # closed. Registering it here is a pure wiring fix, no kernel change.
+        AlgorithmCandidate(
+            name="rvv",
+            target_affinity=("gemmini_q31_rvv",),
+            description=(
+                "Saturn RVV two-scale integer rescale, the gemmini_q31_rvv "
+                "counterpart of rvv_frm_rmm. DroNet's residual adds have "
+                "asymmetric input scales (a_ratio ~ 0.20) so gemmini_resadd's "
+                "float mvin-scale traps on this misa.F=0 core; this kernel "
+                "instead vectorises the SAME fixed-point rescale as the "
+                "scalar gemmini_q31_rvv_add_s8_direct.c fallback (fold "
+                "scale_a/scale_out, scale_b/scale_out into Q(S) integer "
+                "multipliers, vmul/vmacc + branch-free round-half-away, "
+                "e32m8) -- no floating point in the element loop."
+            ),
+            reference_impl="(use the curated kernel in kernels/gemmini_q31_rvv/)",
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
         ),
     ],
 )
@@ -14996,7 +15111,7 @@ void kernel_nchw_to_nhwc_s8(const int8_t *input, int8_t *output,
         # winner, and the pick was decided by list position.
         AlgorithmCandidate(
             name='rvv_seg',
-            target_affinity=('rvv',),
+            target_affinity=('rvv', 'gemmini_q31_rvv'),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "RVV segment load/store (vlseg/vsseg and their strided forms, "
@@ -15169,7 +15284,7 @@ void kernel_nhwc_to_nchw_s8(const int8_t *input, int8_t *output,
         # winner, and the pick was decided by list position.
         AlgorithmCandidate(
             name='rvv_seg',
-            target_affinity=('rvv',),
+            target_affinity=('rvv', 'gemmini_q31_rvv'),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "RVV segment load/store (vlseg/vsseg and their strided forms, "
@@ -15504,6 +15619,368 @@ for _op, _spec, _algo, _cls, _desc in (
 del _op, _spec, _algo, _cls, _desc
 
 
+# ── Build-time-folded integer requantization (pipeline/fold_quant_consts.py) ──
+# The two ops below exist only in graphs that ran fold_quant_consts. They are the
+# INTEGER semantics the curated rvv kernels already used for batchnorm2d_s8 /
+# add_s8 (rvv_batchnorm2d_s8_direct.c, rvv_add_s8_rvv_frm_rmm.c), with the per-call
+# float constant derivation moved to build time, so the reference_impl below is
+# the oracle for every backend, not just rvv.
+
+def _batchnorm2d_q_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i16p = ctypes.POINTER(ctypes.c_int16)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, M, BP, S, output, outer, C, inner, activation_min, activation_max
+    return [i8p, i32p, i32p, i16p, i8p] + [ctypes.c_int] * 5
+
+
+def _add_q_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # a, b, output, n, ma, mb, S, activation_min, activation_max
+    return [i8p, i8p, i8p] + [ctypes.c_int] * 6
+
+
+BATCHNORM2D_Q_S8 = KernelSpec(
+    op="batchnorm2d_q_s8",
+    signature=(
+        "void kernel_batchnorm2d_q_s8(const int8_t *input, const int32_t *M, "
+        "const int32_t *BP, const int16_t *S, int8_t *output, "
+        "int outer, int C, int inner, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-channel integer affine with build-time constants (a folded\n"
+        "batchnorm2d_s8). Element (o, c, i) lives at ((o*C + c)*inner + i):\n"
+        "NCHW passes outer=N, inner=H*W; NHWC passes outer=N*H*W, inner=1, so\n"
+        "one kernel serves both activation layouts.\n"
+        "  a   = input*M[c] + BP[c]            (int32; BP = B + 2^(S[c]-1))\n"
+        "  v   = (a - (a < 2^(S[c]-1))) >> S[c] (= round_half_away((x*M+B) / 2^S))\n"
+        "  out = clamp(v, activation_min, activation_max) (clamp range inside int8)\n"
+        "fold_quant_consts guarantees 128*|M| + |B| + 2^(S-1) < 2^31."
+    ),
+    reference_impl="""\
+void kernel_batchnorm2d_q_s8(const int8_t *input, const int32_t *M,
+                             const int32_t *BP, const int16_t *S, int8_t *output,
+                             int outer, int C, int inner,
+                             int activation_min, int activation_max) {
+    const int32_t lo = activation_min < -128 ? -128 : (activation_min > 127 ? 127 : activation_min);
+    const int32_t hi = activation_max < -128 ? -128 : (activation_max > 127 ? 127 : activation_max);
+    for (int o = 0; o < outer; o++) {
+        for (int c = 0; c < C; c++) {
+            const int32_t rnd = (int32_t)1 << (S[c] - 1);
+            for (int i = 0; i < inner; i++) {
+                const size_t idx = ((size_t)o * C + c) * inner + i;
+                int32_t a = (int32_t)input[idx] * M[c] + BP[c];
+                int32_t v = (a - (a < rnd ? 1 : 0)) >> S[c];
+                if (v < lo) v = lo;
+                if (v > hi) v = hi;
+                output[idx] = (int8_t)v;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "C": 32, "inner": 196},     # NCHW plane
+        {"outer": 729, "C": 32, "inner": 1},     # NHWC, dronet bn0
+        {"outer": 49, "C": 64, "inner": 1},      # NHWC, dronet bn4
+        {"outer": 7, "C": 40, "inner": 1},       # NHWC, C not a multiple of VLMAX
+    ],
+    argtypes_factory=_batchnorm2d_q_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            description=(
+                "Folded integer batchnorm. The curated rvv file "
+                "(kernels/rvv/rvv_batchnorm2d_q_s8_direct.c) takes the NHWC "
+                "case (inner == 1) channel-strip outer, pixels inner, so one "
+                "strip's M/BP/S are loaded into vector registers once rather "
+                "than once per pixel: on a core whose vector memory goes to DRAM "
+                "the constants would otherwise cost more bytes than the data."
+            ),
+            reference_impl="(the KernelSpec reference_impl; rvv: kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+ADD_Q_S8 = KernelSpec(
+    op="add_q_s8",
+    signature=(
+        "void kernel_add_q_s8(const int8_t *a, const int8_t *b, int8_t *output, "
+        "int n, int ma, int mb, int S, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Elementwise int8 add with build-time integer rescale (a folded add_s8):\n"
+        "  acc = a*ma + b*mb                     (int32)\n"
+        "  v   = round_half_away(acc / 2^S) = (acc + 2^(S-1) + (acc >> 31)) >> S\n"
+        "  out = clamp(v, activation_min, activation_max)\n"
+        "fold_quant_consts guarantees 128*(|ma|+|mb|) + 2^(S-1) < 2^31."
+    ),
+    reference_impl="""\
+void kernel_add_q_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
+                     int ma, int mb, int S, int activation_min, int activation_max) {
+    const int32_t lo = activation_min < -128 ? -128 : (activation_min > 127 ? 127 : activation_min);
+    const int32_t hi = activation_max < -128 ? -128 : (activation_max > 127 ? 127 : activation_max);
+    const int32_t rnd = (int32_t)1 << (S - 1);
+    for (int i = 0; i < n; i++) {
+        int32_t acc = (int32_t)a[i] * ma + (int32_t)b[i] * mb;
+        int32_t v = (acc + rnd + (acc < 0 ? -1 : 0)) >> S;
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 6272}],
+    argtypes_factory=_add_q_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            description=(
+                "Folded integer add. The curated rvv file "
+                "(kernels/rvv/rvv_add_q_s8_direct.c) does the round-half-away "
+                "with vnclip under vxrm=rdn: 8 m8 operations per strip instead "
+                "of the 13 of the abs/shift/re-sign sequence."
+            ),
+            reference_impl="(the KernelSpec reference_impl; rvv: kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+# ── Table concat (pipeline/fold_quant_consts.py --ops cat3_c1_s8) ─────────────
+def _cat3_lut_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    return [i8p, ctypes.c_int, i8p, ctypes.c_int, i8p, ctypes.c_int, i8p, i8p]
+
+
+CAT3_LUT_S8 = KernelSpec(
+    op="cat3_lut_s8",
+    signature=(
+        "void kernel_cat3_lut_s8(const int8_t *in0, int n0, const int8_t *in1, int n1, "
+        "const int8_t *in2, int n2, const int8_t *lut, int8_t *output)"
+    ),
+    semantics=(
+        "cat3_c1_s8 (N=1) with each input's requantize folded into a 256-entry\n"
+        "int8 table: output = [lut[0][in0+128] | lut[1][in1+128] | lut[2][in2+128]],\n"
+        "lut[i] at lut + 256*i. The tables are kernel_cat3_c1_s8's float32\n"
+        "results for every input code, so the op is exact by construction."
+    ),
+    reference_impl="""\\
+void kernel_cat3_lut_s8(const int8_t *in0, int n0, const int8_t *in1, int n1,
+                        const int8_t *in2, int n2, const int8_t *lut, int8_t *output) {
+    const int8_t *ins[3] = { in0, in1, in2 };
+    const int ns[3] = { n0, n1, n2 };
+    for (int i = 0; i < 3; i++) {
+        const int8_t *t = lut + 256 * i + 128;
+        for (int k = 0; k < ns[i]; k++) *output++ = t[ins[i][k]];
+    }
+}
+""",
+    extra_shapes=[{"n_inputs": [512, 64, 21]}],
+    argtypes_factory=_cat3_lut_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(name="direct", description="Table lookups.",
+                           reference_impl="(the KernelSpec reference_impl)",
+                           accuracy_class=AccuracyClass.BIT_EXACT),
+    ],
+)
+
+
+# ── Integer LSTM cell (pipeline/lower_lstm_int.py: lstm_s8 -> lstm_q_s8) ─────
+# Same int8 weights, int32 biases and int8 h/c state as lstm_s8; the float64 cell
+# is replaced by exact int32 gate accumulators, one Q.16 requantize per gate,
+# interpolated 513-entry sigmoid/tanh tables and an integer cell update
+# (pipeline/lstm_q.py has the formulas and the numpy model). Every backend's
+# kernel shares the post stage (lstm_q.C_POST); only the matvecs differ.
+
+def _lstm_q_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [i8p, i8p, i8p, i32p, i32p, i8p, i8p, i8p] + [ctypes.c_int] * 6
+
+
+def _lstm_q_s8_reference() -> str:
+    from modelblaster.pipeline import lstm_q as _lq
+    return ("#include <stdint.h>\n#include <string.h>\n" + _lq.c_tables() + _lq.C_POST + r"""
+#ifndef MB_LSTM_Q_MAX_HIDDEN
+#define MB_LSTM_Q_MAX_HIDDEN 1024
+#endif
+/* Plain loops: this file may be built into a Gemmini backend's translation unit
+ * with a vector -march for a core that has none, so the vectorizer stays off. */
+__attribute__((optimize("no-tree-vectorize")))
+void kernel_lstm_q_s8(const int8_t *input, const int8_t *w_ih, const int8_t *w_hh,
+                      const int32_t *b_ih, const int32_t *b_hh,
+                      int8_t *h_state, int8_t *c_state, int8_t *output,
+                      int input_size, int hidden_size, int Mx, int Mh, int S,
+                      int has_bias) {
+    const int H = hidden_size, IS = input_size;
+    static int8_t h_new[MB_LSTM_Q_MAX_HIDDEN];
+    if (H > MB_LSTM_Q_MAX_HIDDEN) return;
+    for (int t = 0; t < H; t++) {
+        int32_t ax[4], ah[4];
+        for (int q = 0; q < 4; q++) {
+            const int j = q * H + t;
+            const int8_t *wr = w_ih + (size_t)j * IS;
+            const int8_t *hr = w_hh + (size_t)j * H;
+            int32_t a = has_bias ? b_ih[j] + b_hh[j] : 0;
+            for (int k = 0; k < IS; k++) a += (int32_t)wr[k] * (int32_t)input[k];
+            int32_t b = 0;
+            for (int k = 0; k < H; k++) b += (int32_t)hr[k] * (int32_t)h_state[k];
+            ax[q] = a; ah[q] = b;
+        }
+        mb_lstm_q_cell(ax[0], ax[1], ax[2], ax[3], ah[0], ah[1], ah[2], ah[3],
+                       Mx, Mh, S, c_state, h_new, t);
+    }
+    for (int t = 0; t < H; t++) { h_state[t] = h_new[t]; output[t] = h_new[t]; }
+}
+""")
+
+
+LSTM_Q_S8 = KernelSpec(
+    op="lstm_q_s8",
+    signature=(
+        "void kernel_lstm_q_s8(const int8_t *input, const int8_t *w_ih, "
+        "const int8_t *w_hh, const int32_t *b_ih, const int32_t *b_hh, "
+        "int8_t *h_state, int8_t *c_state, int8_t *output, "
+        "int input_size, int hidden_size, int Mx, int Mh, int S, int has_bias)"
+    ),
+    semantics=(
+        "One timestep of a single-layer LSTM cell with an all-integer cell\n"
+        "(lstm_s8 after pipeline/lower_lstm_int.py). Gate order [i, f, g, o].\n"
+        "  A_x = b_ih + b_hh + W_ih @ x,  A_h = W_hh @ h_prev        (int32, exact)\n"
+        "  G   = clamp((A_x*Mx + A_h*Mh + 2^(S-1)) >> S, +-2^19)     (Q.16)\n"
+        "  gates via 513-entry interpolated sigmoid/tanh tables (Q0.15),\n"
+        "  integer cell update; h_state/c_state updated in place (int8, scales\n"
+        "  1/127 and 8/127), output = new h. See pipeline/lstm_q.py."
+    ),
+    reference_impl=_lstm_q_s8_reference(),
+    extra_shapes=[
+        {"input_size": 8, "hidden_size": 4},
+        {"input_size": 597, "hidden_size": 128},
+    ],
+    argtypes_factory=_lstm_q_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            description="Scalar loops, one hidden unit (4 gate rows) at a time.",
+            reference_impl="(the KernelSpec reference_impl)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+        AlgorithmCandidate(
+            name="gemmini_full_c",
+            description=(
+                "Both matvecs on Gemmini (tiled_matmul_auto, full_C: the raw "
+                "int32 accumulators come back unscaled), then the shared integer "
+                "cell on the CPU. Exact by construction: the post stage only sees "
+                "the integer accumulators."
+            ),
+            reference_impl="(kernels/gemmini_q31_rvv/, kernels/gemmini_q31/)",
+            target_affinity=("gemmini_q31", "gemmini_q31_rvv", "gemmini_q31_softfp"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            pin_only=True,
+        ),
+        AlgorithmCandidate(
+            name="rvv_dot",
+            description=(
+                "RVV int8 dot products (vwmul/vwredsum) for the gate rows, then "
+                "the shared integer cell."
+            ),
+            reference_impl="(kernels/rvv/rvv_lstm_q_s8_rvv_dot.c)",
+            target_affinity=("rvv",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            pin_only=True,
+        ),
+    ],
+)
+
+
+
+# ── Segmented int8 matvec into an int32 bias (pipeline/lower_lstm_seg.py) ────
+# Up to 4 passes; each is an int8 matvec W_p [N, K_p] . x_p [K_p] (exact int32), scaled by its own int32
+# multiplier, summed in int64, and rounded by one shift R (half up). Unused passes have K_p = 0.
+
+def _linear_seg_s32_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    return [ctypes.c_int, ctypes.c_int] + [i8p, i8p, ctypes.c_int, ctypes.c_int] * 4 + [i32p]
+
+
+def _linear_seg_s32_reference() -> str:
+    return r"""#include <stdint.h>
+#include <stddef.h>
+/* Plain loops: may be built into a Gemmini backend's translation unit with a vector -march for a core
+ * that has none, so the vectorizer stays off. */
+__attribute__((optimize("no-tree-vectorize")))
+void kernel_linear_seg_s32(int N, int R,
+                           const int8_t *x0, const int8_t *w0, int k0, int m0,
+                           const int8_t *x1, const int8_t *w1, int k1, int m1,
+                           const int8_t *x2, const int8_t *w2, int k2, int m2,
+                           const int8_t *x3, const int8_t *w3, int k3, int m3,
+                           int32_t *out) {
+    const int8_t *xs[4] = {x0, x1, x2, x3};
+    const int8_t *ws[4] = {w0, w1, w2, w3};
+    const int ks[4] = {k0, k1, k2, k3};
+    const int ms[4] = {m0, m1, m2, m3};
+    for (int j = 0; j < N; j++) {
+        int64_t acc = 0;
+        for (int p = 0; p < 4; p++) {
+            const int K = ks[p];
+            if (K <= 0) continue;
+            const int8_t *wr = ws[p] + (size_t)j * K;
+            int32_t a = 0;
+            for (int k = 0; k < K; k++) a += (int32_t)wr[k] * (int32_t)xs[p][k];
+            acc += (int64_t)a * ms[p];
+        }
+        out[j] = (int32_t)((acc + ((int64_t)1 << (R - 1))) >> R);
+    }
+}
+"""
+
+
+LINEAR_SEG_S32 = KernelSpec(
+    op="linear_seg_s32",
+    signature=(
+        "void kernel_linear_seg_s32(int N, int R, "
+        "const int8_t *x0, const int8_t *w0, int k0, int m0, "
+        "const int8_t *x1, const int8_t *w1, int k1, int m1, "
+        "const int8_t *x2, const int8_t *w2, int k2, int m2, "
+        "const int8_t *x3, const int8_t *w3, int k3, int m3, int32_t *out)"
+    ),
+    semantics=(
+        "Segmented int8 matvec into an int32 vector (pipeline/lower_lstm_seg.py):\n"
+        "  out[j] = (sum_p (sum_k w_p[j*k_p + k] * x_p[k]) * m_p + 2^(R-1)) >> R\n"
+        "for passes p = 0..3 with k_p > 0; int32 dot products, int64 sum, arithmetic shift."
+    ),
+    reference_impl=_linear_seg_s32_reference(),
+    argtypes_factory=_linear_seg_s32_argtypes,
+)
+
+# ── Numerics variant: the Gemmini Q31 ACC_SCALE arithmetic on the scalar backend ─
+# A Gemmini build with MODELBLASTER_GEMMINI_Q31_ACC_SCALE requantizes conv2d_s8
+# with one folded Q0.31 scale sq = (M + 2^(s-1)) >> s and bias + 1 (the beta=1
+# compensation), y = sat8((acc*sq + 2^30) >> 31), clamp -- not the reference's
+# two-stage requantize, so the two disagree on some bytes. A CPU-only image that
+# must reproduce such a Gemmini build's tensors byte for byte pins this. Same
+# fallback predicate as the Gemmini kernel (non-square, offsets, shift outside
+# [0, 30]: reference arithmetic).
+CONV2D_S8.algorithms.append(AlgorithmCandidate(
+    name="q31_acc_scale",
+    target_affinity=("scalar",),
+    accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+    pin_only=True,
+    description="Scalar NCHW conv2d_s8 with the Gemmini Q31 ACC_SCALE requantize.",
+    reference_impl="",
+))
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     'linear': LINEAR,
     'matmul': MATMUL,
@@ -15551,6 +16028,11 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'maxpool2d_s8': MAXPOOL2D_S8,
     'add_s8': ADD_S8,
     'batchnorm2d_s8': BATCHNORM2D_S8,
+    'batchnorm2d_q_s8': BATCHNORM2D_Q_S8,
+    'add_q_s8': ADD_Q_S8,
+    'lstm_q_s8': LSTM_Q_S8,
+    'linear_seg_s32': LINEAR_SEG_S32,
+    'cat3_lut_s8': CAT3_LUT_S8,
     'sigmoid_s8': SIGMOID_S8,
     'relu_f16': RELU_F16,
     'sigmoid_f16': SIGMOID_F16,
@@ -15804,3 +16286,68 @@ def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:
         seen.add(key)
         out.append(dict(shape))
     return out
+
+
+# ── Extensions: kernel specs and algorithms from outside this repository ─────
+# A downstream project (an SoC with its own accelerators, say) can add op kinds,
+# algorithms and their curated kernels without editing ModelBlaster:
+#
+#   MODELBLASTER_EXTENSIONS=/path/a.py:/path/b.py   (os.pathsep-separated)
+#
+# Each file is imported once, when this module is, and must define
+# register(rk), which receives this module. It typically calls
+# rk.add_algorithm(op, AlgorithmCandidate(..., pin_only=True)) or
+# rk.register_kernel_spec(KernelSpec(..., emit_call=...)). Every pipeline stage
+# imports this module, so the same environment gives every stage the same
+# library. The curated sources for the new algorithms go in a second
+# --global-curated-dir root (generate_kernels), laid out like kernels/.
+EXTENSIONS_ENV = "MODELBLASTER_EXTENSIONS"
+
+
+def register_kernel_spec(spec: KernelSpec) -> KernelSpec:
+    """Add a new op kind. Refuses to replace a built-in one."""
+    if spec.op in KERNEL_SPECS:
+        raise ValueError(f"register_kernel_spec: {spec.op!r} already exists; "
+                         f"add an algorithm to it instead")
+    KERNEL_SPECS[spec.op] = spec
+    return spec
+
+
+def add_algorithm(op: str, algorithm: AlgorithmCandidate) -> AlgorithmCandidate:
+    """Append an algorithm to an existing op kind. Names must stay unique."""
+    spec = KERNEL_SPECS[op]
+    if any(a.name == algorithm.name for a in spec.algorithms):
+        raise ValueError(f"add_algorithm: {op} already has an algorithm "
+                         f"{algorithm.name!r}")
+    spec.algorithms.append(algorithm)
+    return algorithm
+
+
+def load_extensions(paths: Optional[str] = None) -> list[str]:
+    """Import every extension file named in `paths` (default: $MODELBLASTER_EXTENSIONS)."""
+    import importlib.util
+    import os
+    import sys
+    raw = os.environ.get(EXTENSIONS_ENV, "") if paths is None else paths
+    loaded = []
+    for i, path in enumerate(p for p in raw.split(os.pathsep) if p):
+        if not os.path.isfile(path):
+            raise SystemExit(f"{EXTENSIONS_ENV}: no such file {path!r}")
+        stem = os.path.splitext(os.path.basename(path))[0]
+        modspec = importlib.util.spec_from_file_location(
+            f"_modelblaster_extension_{i}_{stem}", path)
+        mod = importlib.util.module_from_spec(modspec)
+        modspec.loader.exec_module(mod)
+        register = getattr(mod, "register", None)
+        if not callable(register):
+            raise SystemExit(f"{EXTENSIONS_ENV}: {path} defines no register(rk)")
+        register(sys.modules[__name__])
+        loaded.append(path)
+    return loaded
+
+
+# Integer-closed op kinds (integer_kernels.py) register themselves here, before
+# any extension, so every stage that imports this module sees them.
+from . import integer_kernels as _integer_kernels  # noqa: E402,F401
+
+load_extensions()

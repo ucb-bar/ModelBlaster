@@ -75,5 +75,10 @@ harness_linux/build/
 # against costs nothing else can see.
 gen/profile_mb/
 
+# per-config spike libs (binary, regenerable)
+cores/gemmini/include/per_config/*/libgemmini.so
 # per-example Zephyr build trees
 examples/**/vbuild*/
+
+# Vulkan backend build output (gpu_eval/harness/vulkan/build.py)
+gpu_eval/harness/vulkan/build/
