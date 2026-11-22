@@ -22,7 +22,9 @@ from dataclasses import dataclass
 from typing import Any
 
 WEIGHT_ROLES = {"weight": "weight", "scale": "weight", "bias": "bias",
-                "gamma": "gamma_key", "beta": "beta_key"}
+                "gamma": "gamma_key", "beta": "beta_key",
+                # per-output-channel weight scales of linear_dq_s8 (pipeline/int8_mixed.py)
+                "w_scale": "w_scale"}
 _DEFAULTS = {"DH": 1, "DW": 1, "alpha": 1.0}
 # hand-written `_f16` specs with extra parameters (the values generate_skeleton
 # passes): softmax_f16's fused input scale, and the output size of

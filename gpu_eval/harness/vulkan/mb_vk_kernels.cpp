@@ -673,6 +673,28 @@ void kernel_rmsnorm_s8(const int8_t *input, const float *gamma, int8_t *output, 
                        float scale_out, float eps, int activation_min, int activation_max) {
     norm_s8(input, gamma, nullptr, output, M, K, scale_in, scale_out, eps, activation_min, activation_max, 1);
 }
+// int8_mixed IRs (pipeline/int8_mixed.py): dynamic per-row quantization and the int8 linear with an
+// fp32 (dequantized) output
+void kernel_quantize_rows_s8(const float *input, const float *col_inv, int8_t *output, float *row_scale, int M,
+                             int K) {
+    PIPE("quantize_rows_s8");
+    mb_pc pc;
+    pc.p(input).p(col_inv).p(output).p(row_scale).i(M).i(K);
+    lines(pipe, M, pc);
+}
+void kernel_linear_dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight, const float *bias,
+                         const float *w_scale, float *output, int M, int K, int N) {
+    mb_pc pc;
+    pc.p(input).p(row_scale).p(weight).p(bias).p(w_scale).p(output).i(M).i(K).i(N);
+    if (use_dot4(input, weight, K)) {
+        static int dp = -1;
+        if (dp < 0) dp = mb_vk_pipeline("linear_dq_s8_dot");
+        dot4_dispatch(dp, M, N, pc);
+        return;
+    }
+    PIPE("linear_dq_s8");
+    mb_vk_launch1d(pipe, (long)M * N, pc);
+}
 void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n, float scale_a, float scale_b,
                    float scale_out, int activation_min, int activation_max) {
     PIPE("mul_s8");

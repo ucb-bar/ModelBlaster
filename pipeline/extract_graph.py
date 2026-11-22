@@ -4867,10 +4867,18 @@ def extract(
     fusion_target: "str | None" = None,
     fold_conv_bn: bool = True,
     weight_bits: int = _WEIGHT_BITS_DEFAULT,
+    int8_mixed: "str | dict | None" = None,
     _generic: "set[str] | None" = None,
     _gm: "torch.fx.GraphModule | None" = None,
 ) -> dict[str, Any]:
     """Trace `model`, dump IR + weights + I/O into `out_dir`.
+
+    int8 with `int8_mixed` (a policy name, JSON string or dict;
+    pipeline/int8_mixed.py): the model is lowered by the fp32 path
+    (constants, broadcasts, slices and every generic op as fp32), then the
+    policy's ops (the linears) move to int8 -- an int8 IR with fp32 islands
+    (`quant: int8_mixed`) for models the all-int8 extractor cannot lower
+    (SmolVLA). calibration_samples (model samples) set the smoothing factors.
 
     `quant` is recorded in the IR top-level field so downstream stages (and
     cache-key naming) can branch on it. Supported: fp32, fp16, int8.
@@ -4907,6 +4915,16 @@ def extract(
     (`in.<name>`, `out.<name>`) next to the flat float32 `input` / `output`;
     the golden is the fp32 twin on the inputs, each output stored at its dtype.
     """
+    if quant == "int8" and int8_mixed:
+        import shutil
+        import tempfile
+        from modelblaster.pipeline import int8_mixed as _i8m
+        tmp = tempfile.mkdtemp(prefix="mb_int8_mixed_fp32_")
+        try:
+            extract(model, sample_input, name, tmp, quant="fp32")
+            return _i8m.extract_mixed(tmp, out_dir, calibration_samples, int8_mixed)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     if quant == "int8":
         return extract_int8(
             model, sample_input, name, out_dir,
@@ -5060,6 +5078,12 @@ def extract(
                 raise NotImplementedError(
                     f"unsupported module {type(mod).__name__} at node {node.name}"
                 )
+            if type(mod).__name__ == "RMSNorm":
+                # nn.RMSNorm has no branch of its own below: lower it as F.rms_norm
+                # is (it used to fall through every branch and emit nothing, leaving
+                # its output a tensor no op writes)
+                _gl.lower(node)
+                continue
             in_name = node.args[0].name
             out_name = node.name
             # nn.LSTM returns a tuple (output, (h,c)); _tensor_meta can't read a
@@ -7396,6 +7420,14 @@ def main() -> None:
                          "applied downstream: restacking deployed int8 codes to "
                          "63 levels costs +0.740 WER points more than quantising "
                          "the float weights direct (Lab B75).")
+    ap.add_argument("--int8-mixed", default=None,
+                    help="int8 only: an int8 IR with fp32 islands (pipeline/int8_mixed.py) instead "
+                         "of the all-int8 FX extractor: the model is lowered by the fp32 path and "
+                         "the policy's ops go to int8 (dynamic per-row activations, calibrated "
+                         "SmoothQuant factors, per-channel weights). POLICY: 'linear' or a JSON "
+                         "dict, e.g. '{\"base\": \"linear\", \"alpha\": 0.5, \"keep_fp32\": "
+                         "[\"action_out_proj\"]}'. Default: the model's get_int8_mixed_policy(), "
+                         "if it has one.")
     ap.add_argument("--fp16-ops", default=None,
                     help="comma-separated IR op names to promote to fp16 in an "
                          "int8 extract (mixed precision). Additive to the "
@@ -7544,6 +7576,12 @@ def main() -> None:
         sample = model_mod.get_sample_input()
         name = args.model
 
+    int8_mixed = args.int8_mixed
+    if (args.quant == "int8" and int8_mixed is None and model_mod is not None
+            and hasattr(model_mod, "get_int8_mixed_policy")):
+        int8_mixed = model_mod.get_int8_mixed_policy()
+        print(f"[extract_graph] int8 with fp32 islands, the model's policy: {int8_mixed}", flush=True)
+
     calibration_samples = None
     if model_mod is not None and args.quant == "int8" and args.num_calibration > 1:
         # A model may define get_calibration_spec and still decline to
@@ -7573,7 +7611,10 @@ def main() -> None:
                   f"get_calibration_samples ...", flush=True)
             calibration_samples = list(model_mod.get_calibration_samples(
                 args.num_calibration))
-            sample = calibration_samples[0]
+            if not int8_mixed:
+                # (an int8_mixed IR keeps get_sample_input() as its golden: the
+                # calibration set only sets the smoothing factors)
+                sample = calibration_samples[0]
         else:
             print(f"[extract_graph] WARN: --num-calibration "
                   f"{args.num_calibration} requested but {args.model} "
@@ -7614,7 +7655,8 @@ def main() -> None:
             enable_fusion=getattr(args, "enable_fusion", False),
             fold_conv_bn=getattr(args, "fold_conv_bn", True),
             weight_bits=getattr(args, "weight_bits", _WEIGHT_BITS_DEFAULT),
-            fusion_target=getattr(args, "fusion_target", None))
+            fusion_target=getattr(args, "fusion_target", None),
+            int8_mixed=int8_mixed if args.quant == "int8" else None)
 
     if args.bench_file is not None:
         # a SOL-ExecBench bench (SOL_TOLERANCE at module level): its tolerance goes into graph.json (sol_tolerance;

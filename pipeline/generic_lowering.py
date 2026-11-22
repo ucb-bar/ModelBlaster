@@ -1576,6 +1576,25 @@ def _f_rms_norm(g: GenericLowering, node):
     _affine_tail(g, node, y, w, None, ns, g._out(node))
 
 
+def _m_rms_norm(g: GenericLowering, node, mod):
+    """nn.RMSNorm: the F.rms_norm lowering, its weight (if any) a constant of the graph."""
+    x = g._tensor_arg(node.args[0])
+    ns = [int(v) for v in mod.normalized_shape]
+    eps = mod.eps if mod.eps is not None else torch.finfo(torch.float32).eps
+    xs = g._shape(x)
+    K = _prod(ns)
+    x2 = g.reshape(node.name, x, [_prod(xs) // K, K])
+    ms = g.reduce(node.name, g.ewise1(node.name, x2, "square"), [1], "mean", keepdim=True)
+    r = g.ewise1(node.name, g.ewise_scalar(node.name, ms, "add", float(eps)), "rsqrt")
+    y = g.reshape(node.name, g.ewise2(node.name, x2, r, "mul"), xs)
+    out = g._out(node)
+    if mod.weight is None:
+        g.reshape(node.name, y, xs, out)
+        return
+    w = g.reshape(node.name, g._const(f"{node.name}_weight", mod.weight.detach()), ns)
+    g.ewise2(node.name, y, w, "mul", 1.0, out)
+
+
 def _f_vector_norm(g: GenericLowering, node):
     x = g._tensor_arg(node.args[0])
     ord_ = _arg(node, 1, "ord", 2)
@@ -2001,6 +2020,7 @@ _MODULES = {
     "InstanceNorm1d": _m_instance_norm, "InstanceNorm3d": _m_instance_norm,
     "Hardswish": _m_act("hardswish"), "Mish": _m_act("mish"),
     "Hardtanh": _m_act("clamp", "min_val", "max_val"),
+    "RMSNorm": _m_rms_norm,
 }
 
 
