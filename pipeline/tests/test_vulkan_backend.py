@@ -128,6 +128,25 @@ def test_smolvla_split_mask_and_rope_buffers():
     assert p.step.cos_sa.shape == (A, 1, c.head_dim // 2)
 
 
+def test_smolvla_split_hoisted_cross_kv():
+    """hoist_cross_kv (the expert's cross-attention K / V projections run once, in the prefix graph) is
+    the same model: same weights, the same action chunk as projecting in every flow step."""
+    from dataclasses import replace
+    S, c = _tiny_cfg()
+    assert c.hoist_cross_kv
+    p_h = S.build(None, c, seed=5)
+    p_n = S.build(None, replace(c, hoist_cross_kv=False), seed=5)
+    assert p_n.prefix.cross_kv is None and len(p_h.prefix.cross_kv) == 2 * sum(not p_h.step._is_sa(i) for i in range(c.layers))
+    g = torch.Generator().manual_seed(9)
+    pixels = torch.rand(1, 3, c.img, c.img, generator=g) * 2 - 1
+    lang = torch.randn(1, c.lang, c.hidden, generator=g)
+    state = torch.randn(1, c.state_dim, generator=g)
+    noise = torch.randn(1, c.chunk, c.action_dim, generator=g)
+    a_h = p_h.sample_actions(pixels, lang, state, noise.clone(), 3)
+    a_n = p_n.sample_actions(pixels, lang, state, noise.clone(), 3)
+    assert (a_h - a_n).abs().max() < 1e-5 * max(1.0, float(a_n.abs().max()))
+
+
 @pytest.mark.skipif(not os.environ.get("MB_SMOLVLA_TEST_REAL"), reason="MB_SMOLVLA_TEST_REAL=1: lerobot + HF cache")
 def test_smolvla_split_matches_lerobot():
     from modelblaster.models import smolvla_split as S
