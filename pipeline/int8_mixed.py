@@ -33,10 +33,10 @@ linears -- to int8:
   ``index_select`` of them, added to the int8 part (LLM.int8()-style decomposition).
 * ``alpha_by`` ({pattern: a}): the smoothing strength of the tensors those linears read.
 * fp32 fusions that cut launches (on by default; ``fuse_norm`` / ``fuse_rope`` /
-  ``fuse_attention`` / ``fold_layout`` false to skip): the RMSNorm chain -> ``rms_norm``
-  (its weight folded into the quantizer's column factor), RoPE -> ``rope_half``, unmasked
-  attention -> one flash-style ``attention`` op (``attention_fuse``), and the remaining
-  attention's permute copies folded into ``bmm_strided`` operands (``layout_fold``).
+  ``fold_layout`` false to skip): the RMSNorm chain -> ``rms_norm`` (its weight folded
+  into the quantizer's column factor), RoPE -> ``rope_half``, and attention's permute
+  copies folded into ``bmm_strided`` operands (``layout_fold``). ``fuse_attention`` (off:
+  slower on the Deck) makes unmasked attention one flash-style ``attention`` op.
 * constants stay the fp32 constant tensors of the fp32 lowering (no linear
   reads one in these graphs; one that did would be quantized like any
   activation, its row scales computed by quantize_rows_s8 on the device).
@@ -436,7 +436,7 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
     from modelblaster.pipeline.extract_graph import _annotate_dispatches  # noqa: PLC0415
     g = dict(ir.graph)
     g.update(quant=MIXED, ops=ops, tensors=tensors)
-    if pol.get("fuse_attention", True):
+    if pol.get("fuse_attention", False):
         g = _fuse_attention_fp32(g)
         ops, tensors = g["ops"], g["tensors"]
     if pol.get("fold_layout", True):
