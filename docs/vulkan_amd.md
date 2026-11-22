@@ -45,6 +45,15 @@ library), and cannot wedge the GPU in the ways ROCm-on-unsupported-APU does
   resubmits them. Push constants hold GPU addresses, so a replay reads whatever
   the host last wrote into the same buffers: no per-op Python or launch work.
 - Low queue priority (a compositor sharing the GPU is not starved).
+- **Specialization constants** (`mb_vk_pipeline_spec(name, consts, n)`): one
+  pipeline per value set, cached. Used for the skinny GEMM's row count, the
+  elementwise kernels' opcode and vec4 width.
+- **Packed weights** (`mb_vk_set_packed(w, p, f16)`): registers a copy `p` of
+  the `[N, K]` weight `w` in the skinny GEMM's layout (fp32, or fp16); a linear
+  of <= 64 rows whose weight has one runs the skinny GEMM on it. A
+  registration is dropped when `mb_vk_release` frees either buffer.
+- `VK_KHR_shader_integer_dot_product` is enabled when the device has it
+  (`mb_vk_has_int_dot`; `int_dot=` in `mb_vk_info`).
 
 ## Kernels (`mb_vk_kernels.cpp`, `shaders/*.comp`)
 
@@ -66,9 +75,36 @@ leaky_relu / hardtanh / softplus / selu / hardsigmoid / softsign / log),
 - Every dense product is one tiled GEMM (`gemm_body.glsl`): 256 invocations per
   workgroup, 5 tile shapes (16x256, 32x128, 64x64, 64x128, 128x128) picked by M,
   N and K (`MB_VK_GEMM` forces one), vec4 loads when the operand is 16-byte
-  aligned, a register-prefetched K loop (32 per step), and split-K when the
-  output has few tiles over a long K (a linear over <= 64 tokens; partials
-  summed by `splitk_reduce`).
+  aligned, a register-prefetched K loop (32 per step, the loop over a tile
+  unrolled by 8 so the LDS reads are issued ahead), and split-K when the
+  output has few tiles over a long K (partials summed by `splitk_reduce`) --
+  except a linear of <= 64 rows on a packed weight, which takes the skinny GEMM.
+- **Skinny GEMM** (`skinny_body.glsl`; `skinny.comp`, `skinny_h.comp` for fp16
+  weights): the prefix's 31-row and the action expert's 50-row linears. One
+  invocation per output column holding all M rows in registers (M is a
+  specialization constant); the activation's k-slice is the same for the
+  whole wave, so it is read with scalar loads (RDNA `s_load`, no VGPRs, no
+  LDS) and enters the FMAs as a scalar operand; each weight is loaded once,
+  one k-step (32) ahead, and used M times. The weight is pre-packed
+  (`walk_vulkan.pack_weight`: per 64-column block and k-quad, the 64 columns'
+  4 values contiguous), so one wave-wide vec4 load is one contiguous 1 KiB:
+  at M = 1 it streams weights at 82 GB/s (the Deck's LPDDR5 peak is ~88). Two
+  waves per workgroup take alternate k-steps (summed through LDS), and K is
+  split over workgroups until ~64 waves run. `MB_VK_SKINNY=0` turns it off;
+  `MB_VK_SKINNY_KW` / `_WG` / `_KU` are the tuning knobs (defaults measured on
+  the Deck). `walk_vulkan.Weights` packs every such weight by default
+  (`MB_VK_PACK=0`: don't); `Weights(f16=True)` / `smolvla_vulkan.py
+  --f16-weights` packs them as fp16 (fp32 activations and accumulation:
+  half the weight bytes; an approximation, off by default and outside the
+  fp32 gates).
+- Elementwise / data movement (`ewise1`, `ewise2`, `ewise_scalar`,
+  `strided_copy`, `cat_slab`): the opcode is a specialization constant (a
+  run-time `switch` compiled to a chain of scalar compares per element), a
+  vec4 variant (one vec4 per invocation: twice the bytes in flight; a
+  one-float-per-invocation stream reached only ~40 GB/s) when sizes and
+  16-byte alignment allow, and `ewise2` / `strided_copy` coalesce their 6-d
+  iteration space on the host (drop size-1 dims, merge contiguous ones) so
+  the shader divides only by the active dims.
 - A patchify `conv2d` (stride == kernel, no padding, N == 1: the ViT patch
   embedding) is im2col (one `strided_copy`) + GEMM; other convs are direct.
 
@@ -82,6 +118,16 @@ fp64 arithmetic in the reference's summation order. An op whose output is a
 function of one int8 input (gelu / sin / cos) is a 256-entry table that the
 launcher fills with the reference's own expression and libm; `softmax_s8`'s
 `expf` of the 256 possible differences comes from the same libm.
+
+`linear_s8` and `matmul_s8` (with `transpose_b`) run on packed int8 dot
+products when the device has `VK_KHR_shader_integer_dot_product`, K % 4 == 0
+and the operands are 4-byte aligned (`dot_s8_body.glsl`: a 32x64 output tile
+per workgroup, K through LDS 64 bytes at a time, one `dotPacked4x8EXT` per 4
+multiply-adds; `MB_VK_INT_DOT=0` forces the scalar kernels). The input /
+filter offsets are folded in exactly, `sum (x+io)(w+fo) = sum xw + fo sum x +
+io sum w + K io fo` in int32 with the reference accumulator's wraparound, so
+the results stay bit-exact. Deck: `linear_s8` 50x960x320 2245 -> 90 us,
+31x960x2560 22.9 -> 0.21 ms, 256x768x768 40.5 -> 0.25 ms (1.2 Tops).
 
 ## Gates (`walk_vulkan.py`)
 
@@ -124,24 +170,63 @@ into the GEMM rows. The prompt is the unpadded token sequence (lerobot pads to
 48 with masked tokens; dropping them is exact, since padded tokens are never
 attended and positions are cumulative over real tokens).
 
-Results: see the table below (Deck, 1 camera at 256 px, 5 flow steps, the
+Results: see the tables below (Deck, 1 camera at 256 px, 5 flow steps, the
 `smolvla_bench.py` drone configuration).
 
 Measured on the Deck, 2026-11-21 (RADV VANGOGH; CPU baseline = `smolvla_bench.py
---cams 1 --img 256 --steps 5 --dtype fp32 --threads 3`, lerobot 0.4.4 / torch 2.10, same session):
+--cams 1 --img 256 --steps 5 --dtype fp32 --threads 3`, lerobot 0.4.4 / torch 2.10;
+GPU = `smolvla_vulkan.py --reps 20`, median of 20 chunks, replayed graphs):
 
-| component | PyTorch CPU (3 threads) | Vulkan GPU (replayed graphs) | speedup |
-|---|---|---|---|
-| vision (SigLIP + connector) | 471 ms (`embed_prefix`) | 85 ms | 5.5x |
-| VLM prefix (KV cache) | ~300 ms | 30 ms | 10x |
-| denoise, 5 flow steps | 818 ms | 170 ms (34 ms / step) | 4.8x |
-| **chunk of 50 actions** | **1597 ms** (median of 5) | **284 ms** (median of 20) | **5.6x** |
+| component | PyTorch CPU (3 threads) | Vulkan, first version | Vulkan, now (fp32) | now, `--f16-weights` |
+|---|---|---|---|---|
+| vision (SigLIP + connector) | 471 ms (`embed_prefix`) | 84.6 ms | 78.2 ms | 78.1 ms |
+| VLM prefix (KV cache) | ~300 ms | 29.7 ms | 18.2 ms | 15.7 ms |
+| denoise, 5 flow steps | 818 ms | 169.6 ms (33.9 / step) | 107.1 ms (21.4 / step) | 94.0 ms (18.8 / step) |
+| **chunk of 50 actions** | **1597 ms** | **283.9 ms** (5.6x) | **203.5 ms** (7.8x) | **187.7 ms** (8.5x) |
 
 Action chunk vs lerobot's own `sample_actions` (same observation, same noise):
-cosine 0.99999999999953, max |err| 1.3e-6 (|actions| <= 1.01). Per graph, the
-walker's gates pass: golden rel. error 1e-6 / 7e-7 / 4e-7 (vision / prefix /
-step), every kernel within the per-slot bound (worst 1.3e-6). GPU time is about
-85% linears (GEMM).
+fp32 cosine 0.999999999999606, max |err| 1.07e-6 (|actions| <= 1.01; the
+first version: 0.99999999999953 / 1.3e-6); with fp16 weights cosine
+0.99999996, max |err| 3.0e-4. Per graph, the walker's fp32 gates pass with the
+skinny GEMM and the new elementwise kernels: golden rel. error 9.5e-7 / 4.8e-7
+/ 5.5e-7 (vision / prefix / step), every kernel within the per-slot bound
+(worst 1.26e-6), int8 proxies bit-exact. Host suite: 1134 passed (29 new),
+the 5 known KernelBlaster-submodule failures, 97 skipped.
+
+Where the 203.5 ms go (fp32; by dropping op kinds from the replayed graphs):
+
+| | vision | prefix | 5 steps | chunk | first version |
+|---|---|---|---|---|---|
+| linears | 59.2 | 14.0 | 78.7 | 151.9 ms | ~214 ms |
+| bmm (attention) | 6.9 | 0.6 | 5.5 | 12.3 ms | |
+| everything else (small ops: ~600 in the prefix and in each step) | 12.2 | 3.5 | 22.9 | 39.4 ms | 70 ms (incl. bmm) |
+
+What changed, measured one at a time on the Deck (chunk, median of 20):
+skinny GEMM on packed weights 283 -> 231 ms (prefix linears 1.6x, expert
+linears 1.6x); vec4 elementwise 231 -> 211 ms; opcode as a specialization
+constant 211 -> 205 ms; tiled-GEMM k-loop unroll 205 -> 203.5 ms. Tried and
+dropped: two columns per invocation in the skinny GEMM (slower), waves on
+different column blocks instead of alternate k-steps (no gain), wave32 for every compute shader (`RADV_PERFTEST=cswave32`: 2% slower),
+a compute-only barrier between dispatches (no change: a barrier costs ~2.5 us,
+the kernel time dominates).
+
+Linear microbenchmarks (Deck, 4-32 launches over distinct weights per replay,
+warm clocks; includes the split-K reduce; weight GB/s = weight bytes / time):
+
+| M x K x N (count per chunk) | tiled GEMM | skinny, fp32 | skinny, fp16 weights |
+|---|---|---|---|
+| 31x960x2560 (30, prefix MLP) | 443 us, 344 GFLOPS | 302 us, 505 GFLOPS | 292 us |
+| 31x2560x960 (15, prefix MLP) | 709 us, 215 | 291 us, 523 | 280 us |
+| 31x960x960 (30, prefix attention) | 184 us, 311 | 123 us, 465 | 116 us |
+| 50x720x2048 (160, expert MLP) | 436 us, 338 | 321 us, 460 | 302 us |
+| 50x2048x720 (80, expert MLP) | 462 us, 319 | 312 us, 473 | 302 us |
+| 50x720x960 (80, expert attention) | 238 us, 290 | 192 us, 361 | 133 us |
+| 16x12288x960 (1, connector) | 1505 us, 251 (31 GB/s) | 907 us, 416 (52 GB/s) | 720 us (33 GB/s at 2 B) |
+
+At M = 1 the skinny GEMM moves weights at 82 GB/s, so at 31-50 rows it is
+compute-bound: ~460-520 GFLOPS against the 1.6 TFLOPS fp32 peak at 1.6 GHz
+(the GPU clock sits at 1.0-1.6 GHz under the Deck's 15 W APU power cap), and
+fp16 weights save only 12-14% end to end (prefix and steps).
 
 ## Not done / limits
 
@@ -152,10 +237,14 @@ step), every kernel within the per-slot bound (worst 1.3e-6). GPU time is about
   no fp32/int8 lowering of the generic ops. The int8 kernels are validated on
   MB's int8 SmolVLA proxies (`models/attn_block.py`, `models/norm_block.py`)
   and at SmolVLA sizes against the reference C.
-- fp16 (`_f16`) IRs are not implemented (RDNA2 has packed fp16; the shaders
-  would read 16-bit storage).
+- fp16 (`_f16`) IRs are not implemented. fp16 is used only as an opt-in
+  weight format of the skinny GEMM (`--f16-weights`); RDNA2's 2x-rate packed
+  fp16 math (`v_dot2_f32_f16`) is not used: it would need fp16 activations as
+  well (accuracy) and a way to reach the instruction from SPIR-V.
 - No KernelBlaster integration (`kb_export --target vulkan`): the backend is
   the walker path, like `walk_cuda.py`, not the multi-slot problem export.
-- The GEMM reaches roughly a third of the Deck's 1.6 TFLOPS fp32 peak on the
-  vision encoder's shapes and less on the 31- to 50-row linears of the prefix
-  and the expert, which dominate the flow loop.
+- The GEMMs reach 30-45% of the Deck's fp32 peak (vision linears ~550-730
+  GFLOPS, skinny ~460-520 GFLOPS); linears are still ~75% of the chunk. The
+  ~600 small ops of the prefix and of each step cost ~6-8 us each (launch,
+  barrier, latency) -- operator fusion (e.g. the RMSNorm chains) is the next
+  lever there.
