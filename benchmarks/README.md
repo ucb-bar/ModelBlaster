@@ -146,7 +146,7 @@ gate that lets the boot hart skip V save/restore when V isn't present).
 Without it, eager-V context-switch traps on hart 0. Update with:
 
 ```bash
-cd /scratch2/agustin/zephyr-chipyard-sw   # or wherever ZEPHYR_BASE/../.. lives
+cd "$ZEPHYR_BASE/../.."   # the zephyr-chipyard-sw checkout
 git pull origin dev && git submodule update --init --recursive
 ```
 

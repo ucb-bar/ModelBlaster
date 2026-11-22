@@ -68,50 +68,52 @@ class XpurtEntry:
                                 # written before `scheduler.enable_impls`
                                 # existed means. See `load()`.
     hart: int                   # preferred hart (from registry); -1 if unbound
-    harts: tuple[int, ...]      # every hart reserved by hardware_target;
-                                # first element is the dispatch-owning master
     start_time_ms: float
     duration_ms: float
     deps_entry_ids: tuple[int, ...]   # in-table entry_ids of intra-job deps
     time_dep_entry_id: int            # cross-job edge, -1 if none
-    # Producer-side fanout (Phase G2d): list of entry_ids that consume
-    # *this* entry's output, via either a data-dep edge (their
-    # deps_entry_ids includes self.entry_id) or a time-dep edge
-    # (their time_dep_entry_id == self.entry_id). Computed by load()
-    # after deps are resolved. The walker uses this to k_sem_give() a
-    # consumer's completion sem once per fanout edge, instead of the
-    # old multi-consumer take/re-give dance — saves one sem op per
-    # edge and eliminates the 64-deep limit-over-provisioning.
-    fanout_entry_ids: tuple[int, ...] = ()
+    # Every hart the dispatch runs on, `hart` first. One element for a plain
+    # target; several for a composite ("CPU_P#0+CPU_P#1"), whose dispatch
+    # reserves all of them and runs on a pool spanning them.
+    harts: tuple[int, ...] = ()
 
 
 # ---------- parsing helpers --------------------------------------------------
 
-_INSTANCE_RE = re.compile(r"^(?P<base>.+?)(?P<idx>\d+)$")
+# "<network><instance>" -> (network, instance), longest known name first; one
+# rule shared with the walker generator (and mirrored by XPU-RT's job_names).
+from modelblaster.pipeline.generate_xpurt_main import _split_job_name  # noqa: E402
 
 
-def _split_job_name(job: str, known: set[str] | None = None) -> tuple[str, int]:
-    """Split a job_name like "mlp_control3" into ("mlp_control", 3); a name
-    without a trailing instance index returns (job, 0).
+def _check_impl_legal(key: str, impl: str, core_kind: str,
+                      harts: tuple[int, ...],
+                      reg: core_registry.CoreRegistry) -> None:
+    """Refuse an implementation a core cannot run, before it is built in.
 
-    When `known` is provided, longest-prefix match against the known
-    network names wins — this disambiguates models whose name ends in
-    a digit (e.g. "yolov8_nano_640" → ("yolov8_nano_64", 0), not
-    ("yolov8_nano_", 640))."""
-    if known:
-        for base in sorted(known, key=len, reverse=True):
-            if job == base:
-                return base, 0
-            if job.startswith(base):
-                rest = job[len(base):]
-                if rest.isdigit():
-                    return base, int(rest)
-    m = _INSTANCE_RE.match(job)
-    if not m:
-        return job, 0
-    base = m.group("base")
-    idx = int(m.group("idx"))
-    return base, idx
+    The registry may list per core the implementations it runs (`impls`). A
+    kernel for another core's matrix engine is not always a trap: the K3's X100
+    and A100 engines share an encoding with different tiles, so the wrong one
+    can return wrong numbers instead. `impl == core_kind` is the default (no
+    choice made) and always legal; cores without `impls` are not checked.
+    """
+    if impl == core_kind:
+        return
+    for core in reg.cores:
+        if core.impls and set(core.harts) & set(harts) and impl not in core.impls:
+            raise ValueError(
+                f"schedule entry {key!r}: impl {impl!r} is not legal on {core.name} "
+                f"(kind {core.kind!r}; legal: {list(core.impls)})")
+
+
+def _target_harts(core_label: str, cpu_p_kind: str, cpu_e_kind: str,
+                  reg: core_registry.CoreRegistry) -> tuple[int, ...]:
+    """All harts of a target, in label order, first part first, no repeats."""
+    out: list[int] = []
+    for p in core_label.split("+"):
+        h = _resolve_target(p.strip(), cpu_p_kind, cpu_e_kind, reg)[2]
+        if h >= 0 and h not in out:
+            out.append(h)
+    return tuple(out)
 
 
 def _resolve_target(core_label: str,
@@ -123,7 +125,19 @@ def _resolve_target(core_label: str,
     tells us which kind in the registry corresponds to each slot
     (e.g. CPU_P -> rvv, CPU_E -> scalar). We then pick the n-th core of
     that kind.
+
+    A composite target ("CPU_P#4+CPU_P#5+...", one dispatch spread over
+    several harts) resolves to its FIRST part; `_target_harts` gives the
+    whole set. Every part must resolve, and to the same kind.
     """
+    if "+" in core_label:
+        parts = [p.strip() for p in core_label.split("+")]
+        resolved = [_resolve_target(p, cpu_p_kind, cpu_e_kind, reg) for p in parts]
+        kinds = {k for _, k, _ in resolved}
+        if len(kinds) != 1:
+            raise ValueError(f"composite target {core_label!r} mixes core kinds "
+                             f"{sorted(kinds)}; one dispatch must stay on one kind")
+        return resolved[0]
     label, _, idx_str = core_label.partition("#")
     idx = int(idx_str) if idx_str else 0
     if label.upper() == "CPU_P":
@@ -148,42 +162,6 @@ def _resolve_target(core_label: str,
     return c.name, c.kind, hart
 
 
-def _resolve_targets(core_labels: str,
-                     cpu_p_kind: str, cpu_e_kind: str,
-                     reg: core_registry.CoreRegistry,
-                     ) -> tuple[str, str, int, tuple[int, ...]]:
-    """Resolve a singleton or ``+``-joined XPU-RT machine combination.
-
-    The first target owns the dispatch and participates as shard 0.  Remaining
-    targets are the helper harts reserved for the dispatch's whole execution
-    window.  A ModelBlaster pool is homogeneous, so a combination that crosses
-    runtime kinds is rejected instead of being flattened into a false pool.
-    """
-    labels = [x.strip() for x in str(core_labels).split("+") if x.strip()]
-    if not labels:
-        raise ValueError(f"empty hardware_target {core_labels!r}")
-    resolved = [
-        _resolve_target(label, cpu_p_kind, cpu_e_kind, reg)
-        for label in labels
-    ]
-    kinds = {kind for _name, kind, _hart in resolved}
-    if len(kinds) != 1:
-        raise ValueError(
-            f"composite target {core_labels!r} must use the same runtime kind; "
-            f"resolved kinds are {sorted(kinds)}")
-    harts = tuple(hart for _name, _kind, hart in resolved)
-    if len(set(harts)) != len(harts):
-        raise ValueError(
-            f"composite target {core_labels!r} resolves the same hart twice: "
-            f"{harts}")
-    if len(harts) > 1 and any(hart < 0 for hart in harts):
-        raise ValueError(
-            f"composite target {core_labels!r} contains an unbound hart; "
-            "multi-hart execution requires explicit physical harts")
-    core_name, core_kind, hart = resolved[0]
-    return core_name, core_kind, hart, harts
-
-
 def load(schedule_path: str,
          irs_by_network: dict[str, dict],
          reg: core_registry.CoreRegistry,
@@ -197,70 +175,6 @@ def load(schedule_path: str,
     raw = doc.get("dispatches")
     if not isinstance(raw, dict) or not raw:
         raise ValueError(f"{schedule_path}: 'dispatches' missing or empty")
-
-    # PDB-content-hash guard. The fixture (when produced by a recent
-    # solver) carries `metadata.pdb_hash` and `metadata.pdb_files` —
-    # the SHA256 over the profile CSVs the solver actually read. We
-    # recompute the hash for the SAME paths now, before any dispatch
-    # parsing, and warn (or refuse) on mismatch.
-    #
-    # Knob: MB_INGEST_STRICT_PDB_CHECK=1 turns the warning into a
-    # hard error. Off by default to avoid breaking fixtures emitted by
-    # solver versions that pre-date this metadata field — but on a
-    # hash MISmatch we always emit a loud, named warning so the trap
-    # is at least visible in the run log.
-    meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
-    fixture_hash = meta.get("pdb_hash")
-    fixture_files = meta.get("pdb_files") or []
-    if fixture_hash and fixture_files:
-        try:
-            import hashlib as _hashlib
-            _h = _hashlib.sha256()
-            _used: list[str] = []
-            for _p in sorted(set(fixture_files)):
-                if not _p:
-                    continue
-                try:
-                    with open(_p, "rb") as _f:
-                        _data = _f.read()
-                except OSError:
-                    continue
-                _h.update(_p.encode("utf-8"))
-                _h.update(b"\0")
-                _h.update(len(_data).to_bytes(8, "little"))
-                _h.update(_data)
-                _used.append(_p)
-            current_hash = _h.hexdigest()
-            if current_hash != fixture_hash:
-                import os as _os
-                _msg = (
-                    f"!! STALE-FIXTURE WARNING [{schedule_path}]\n"
-                    f"   fixture pdb_hash = sha256:{fixture_hash[:16]}... "
-                    f"(over {len(fixture_files)} CSV(s))\n"
-                    f"   current pdb_hash = sha256:{current_hash[:16]}... "
-                    f"(over {len(_used)} CSV(s) hashed)\n"
-                    f"   The profile CSVs the solver used have changed on "
-                    f"disk since this fixture was emitted. Predicted "
-                    f"durations may not reflect what the runtime will "
-                    f"actually execute.\n"
-                    f"   Re-solve the workload (scripts/run_xpurt_schedule.py)\n"
-                    f"   or set MB_INGEST_STRICT_PDB_CHECK=0 to acknowledge."
-                )
-                print(_msg)
-                if _os.environ.get("MB_INGEST_STRICT_PDB_CHECK", "0") in (
-                    "1", "true", "True",
-                ):
-                    raise RuntimeError(
-                        f"{schedule_path}: PDB content hash mismatch "
-                        f"(MB_INGEST_STRICT_PDB_CHECK=1)."
-                    )
-        except RuntimeError:
-            raise
-        except Exception as _e:
-            # Never let the hash check itself break a load; if hashing
-            # fails (e.g., permissions), print a one-line note and
-            # continue with the unverified fixture.
-            print(f"  (info) pdb_hash recompute skipped: {_e}")
 
     # Build dispatch_id index per network IR + remap from IR-space
     # dispatch_id to codegen-space dispatch table index.
@@ -306,133 +220,6 @@ def load(schedule_path: str,
         network_op_by_did[net] = idx
         network_remap[net] = remap
 
-    # ---------- IR-completion: synthesize missing IR ops ----------
-    # Toggle: set MB_INGEST_SKIP_IR_COMPLETION=1 to disable the
-    # synthesis pass (useful for control tests / bisecting failures).
-    _skip_ir_completion = (
-        os.environ.get("MB_INGEST_SKIP_IR_COMPLETION", "0") == "1")
-    if _skip_ir_completion:
-        print("ingest: IR-completion DISABLED via MB_INGEST_SKIP_IR_COMPLETION=1")
-    if not _skip_ir_completion:
-        # XPU-RT's scheduler drops IR ops whose profile-DB cost is zero
-        # (relu_s8 fused into the prior BN at profile time, sigmoid_s8
-        # not measured separately, etc.). Those ops still need to
-        # dispatch on the harness — the generated model_<m>.c chains
-        # buffers through them, so the consumer of a dropped op reads
-        # stale / zero memory. Symptom before this fix: dronet output
-        # stuck at zero or partial; mlp_control had only 1-2 of 7 IR
-        # ops in the schedule, so the final-writeback op never fired
-        # and `state.output` stayed at static zero-init.
-        #
-        # Fix: walk each (job_name, IR) pair. For every IR dispatch_id
-        # missing from the schedule for that job, synthesize a raw
-        # entry mirroring the XPU-RT schema, then thread its
-        # dependencies into the topological sort. Activation ops
-        # (silu/relu/elu/sigmoid/...) are pinned to the rvv_opu hart
-        # since they're pure scalar FP — placing them on the gemmini
-        # hart triggers a bitstream-side issue not exercised by v2.
-        known_networks = set(irs_by_network)
-        sched_jobs: dict[str, set[int]] = {}
-        job_net_inst: dict[str, tuple[str, int]] = {}
-        for k, d in raw.items():
-            job = d["job_name"]
-            sched_jobs.setdefault(job, set()).add(int(d["id"]))
-            if job not in job_net_inst:
-                net, inst = _split_job_name(job, known_networks)
-                if net in known_networks:
-                    job_net_inst[job] = (net, inst)
-
-        _SCALAR_FP_OPS = {
-            "silu_s8", "elu_s8", "relu_s8", "sigmoid_s8", "tanh_s8",
-            "gelu_s8", "hardswish_s8", "softmax_s8",
-        }
-        _CPU_E_LABEL = "CPU_E#0"
-
-        synthesized: list[tuple[str, int, str]] = []
-        for job_name, scheduled_dids in list(sched_jobs.items()):
-            if job_name not in job_net_inst:
-                continue
-            network, _instance = job_net_inst[job_name]
-            ir_dids = network_dispatches.get(network, set())
-            missing_dids = sorted(ir_dids - scheduled_dids)
-            if not missing_dids:
-                continue
-            for did in missing_dids:
-                op = network_op_by_did[network][did]
-                op_kind = op.get("op", "")
-                depends_on = op.get("depends_on", []) or []
-                dep_keys: list[str] = []
-                producer_max_end = 0.0
-                producer_target = None
-                for prod_did in depends_on:
-                    prod_key = f"{job_name}_dispatch_{prod_did}"
-                    if prod_key in raw:
-                        dep_keys.append(prod_key)
-                        pr = raw[prod_key]
-                        pr_end = float(pr.get("start_time", 0.0) or 0.0) + \
-                                 float(pr.get("duration", 0.0) or 0.0)
-                        if pr_end > producer_max_end:
-                            producer_max_end = pr_end
-                        if producer_target is None:
-                            producer_target = pr.get("hardware_target")
-                if producer_target is None:
-                    for k2, d2 in raw.items():
-                        if d2.get("job_name") == job_name:
-                            producer_target = d2.get("hardware_target")
-                            producer_max_end = float(
-                                d2.get("start_time", 0.0) or 0.0)
-                            break
-                if producer_target is None:
-                    producer_target = "CPU_P#0"
-                if op_kind in _SCALAR_FP_OPS:
-                    producer_target = _CPU_E_LABEL
-                new_key = f"{job_name}_dispatch_{did}"
-                raw[new_key] = {
-                    "id": did,
-                    "ordinal": 1,
-                    "total": 1,
-                    "dependencies": dep_keys,
-                    "hardware_target": producer_target,
-                    "start_time": producer_max_end,
-                    "duration": 0.0,
-                    "job_name": job_name,
-                    "module_name": op.get("name", f"dispatch_{did}"),
-                    "_synthesized": True,
-                }
-                scheduled_dids.add(did)
-                synthesized.append((job_name, did, new_key))
-
-            # Thread synthesized entries into consumers' dependencies.
-            synth_dids_this_job = {did for (jn, did, _k) in synthesized
-                                   if jn == job_name}
-            for op in irs_by_network[network].get("ops", []):
-                cdid = op.get("dispatch_id")
-                if cdid is None:
-                    continue
-                consumer_key = f"{job_name}_dispatch_{cdid}"
-                if consumer_key not in raw:
-                    continue
-                consumer = raw[consumer_key]
-                existing_deps = list(consumer.get("dependencies", []) or [])
-                changed = False
-                for pd in op.get("depends_on", []) or []:
-                    if pd in synth_dids_this_job:
-                        pk = f"{job_name}_dispatch_{pd}"
-                        if pk not in existing_deps:
-                            existing_deps.append(pk)
-                            changed = True
-                if changed:
-                    consumer["dependencies"] = existing_deps
-
-        if synthesized:
-            by_job: dict[str, list[int]] = {}
-            for jn, did, _k in synthesized:
-                by_job.setdefault(jn, []).append(did)
-            parts = ", ".join(f"{j}: {sorted(ds)}"
-                              for j, ds in sorted(by_job.items()))
-            print(f"ingest: synthesized {len(synthesized)} missing IR ops -> {parts}")
-    # ---------- end IR-completion ----------
-
     # In-table order: priority topological sort, where the priority
     # key is start_time. Pure start_time-then-alphabetical sort breaks
     # down for zero-cost ops — the scheduler legitimately gives a
@@ -446,28 +233,9 @@ def load(schedule_path: str,
     # whenever the priority queue has multiple runnable entries.
     import heapq
     from collections import defaultdict
-
-    # Data dependencies first, on their own.
-    #
-    # Data deps come from the IR and are ground truth. `time_dependency` is a
-    # different kind of edge: a hardware-serialisation hint that XPU-RT derived
-    # from the *start times* of the dispatches it actually scheduled. Those two
-    # can disagree, and the IR-completion pass above is exactly what makes them
-    # disagree -- it inserts zero-cost ops the scheduler never saw, so the
-    # scheduler's ordering could not have accounted for their edges.
-    #
-    # Observed on the 4-MLP + 2-DroNet + 1-YOLO fixture: dispatch_16 is placed
-    # at 60.306 ms and data-depends on the synthesized dispatch_14, which lands
-    # at 60.467 ms behind 13 &lt;- 12; meanwhile 12 carries time_dependency on 16
-    # because 16 finished on CPU_P#0 the instant 12 started. That closes a
-    # 12 -&gt; 16 -&gt; 14 -&gt; 13 -&gt; 12 loop and made the whole ingest fail.
-    #
-    # So: build the DAG from data deps, which are acyclic by construction, then
-    # admit each time_dep edge only if it does not close a cycle. Dropping an
-    # ordering hint costs nothing correctness-wise -- the data deps still force
-    # every real ordering -- whereas honouring it makes the graph unsortable.
     adj: dict[str, list[str]] = defaultdict(list)
     indeg: dict[str, int] = {k: 0 for k in raw}
+    # Data deps first: they come from the IR and are acyclic by construction.
     for k, d in raw.items():
         for dep in (d.get("dependencies", []) or []):
             if dep not in raw:
@@ -477,12 +245,13 @@ def load(schedule_path: str,
             adj[dep].append(k)
             indeg[k] += 1
 
+    # Then each time_dependency, unless it closes a cycle. A time_dep is an
+    # ordering hint XPU-RT derived from the start times it scheduled, not a
+    # data edge; when it contradicts the data deps (ops the scheduler never
+    # saw, equal start times) honouring it makes the table unorderable, while
+    # dropping it loses nothing: the data deps still force every real order.
     def _reaches(src: str, dst: str) -> bool:
-        """Is dst reachable from src along edges admitted so far?"""
-        if src == dst:
-            return True
-        seen = {src}
-        stack = [src]
+        seen, stack = {src}, [src]
         while stack:
             for nxt in adj[stack.pop()]:
                 if nxt == dst:
@@ -492,25 +261,16 @@ def load(schedule_path: str,
                     stack.append(nxt)
         return False
 
-    dropped_time_deps: list[tuple[str, str]] = []
-    for k, d in sorted(raw.items()):
-        time_dep_key = d.get("time_dependency")
-        if not time_dep_key or time_dep_key not in raw:
+    dropped_time_deps: set[str] = set()
+    for k in sorted(raw):
+        dep = raw[k].get("time_dependency")
+        if not dep or dep not in raw:
             continue
-        # Edge time_dep_key -> k. It closes a cycle iff k already reaches
-        # time_dep_key.
-        if _reaches(k, time_dep_key):
-            dropped_time_deps.append((k, time_dep_key))
+        if dep == k or _reaches(k, dep):
+            dropped_time_deps.add(k)
             continue
-        adj[time_dep_key].append(k)
+        adj[dep].append(k)
         indeg[k] += 1
-
-    if dropped_time_deps:
-        shown = ", ".join(f"{k} <- {t}" for k, t in dropped_time_deps[:4])
-        print(f"ingest: dropped {len(dropped_time_deps)} time_dependency "
-              f"edge(s) that contradicted the IR data-dependency DAG "
-              f"(data deps win): {shown}"
-              + (", ..." if len(dropped_time_deps) > 4 else ""))
 
     heap: list[tuple[float, str]] = []
     for k, n in indeg.items():
@@ -534,12 +294,15 @@ def load(schedule_path: str,
             f"Stuck entries (first 10): {unscheduled[:10]}"
         )
     key_to_entry_id = {k: i for i, k in enumerate(sorted_keys)}
+    if dropped_time_deps:
+        print(f"note: dropped {len(dropped_time_deps)} time_dependency edge(s) that "
+              f"contradict the data deps: {sorted(dropped_time_deps)[:5]}")
 
     entries: list[XpurtEntry] = []
     for entry_id, key in enumerate(sorted_keys):
         d = raw[key]
         job = d["job_name"]
-        network, instance = _split_job_name(job, set(irs_by_network))
+        network, instance = _split_job_name(job, irs_by_network)
         if network not in irs_by_network:
             raise ValueError(
                 f"schedule entry {key!r} references unknown network {network!r}; "
@@ -551,8 +314,9 @@ def load(schedule_path: str,
                 f"network {network!r} (IR has {sorted(network_dispatches[network])[:8]}...)")
         op_record = network_op_by_did[network][did]
 
-        core_name, core_kind, hart, harts = _resolve_targets(
+        core_name, core_kind, hart = _resolve_target(
             d["hardware_target"], cpu_p_kind, cpu_e_kind, reg)
+        harts = _target_harts(d["hardware_target"], cpu_p_kind, cpu_e_kind, reg)
 
         # PER-DISPATCH IMPLEMENTATION. With `scheduler.enable_impls` on,
         # XPU-RT emits every core-group combination once per legal
@@ -565,6 +329,7 @@ def load(schedule_path: str,
         # pre-`enable_impls` schedule means, so those keep producing the
         # byte-identical table they always did.
         impl = str(d.get("impl") or core_kind)
+        _check_impl_legal(key, impl, core_kind, harts or ((hart,) if hart >= 0 else ()), reg)
 
         # Resolve deps (intra-job data deps) + time_dep (cross-job edge)
         # to in-table entry_ids. The walker's deadlock-freedom argument
@@ -590,6 +355,8 @@ def load(schedule_path: str,
             deps_ids.append(dep_id)
         time_dep_id = -1
         time_dep_key = d.get("time_dependency")
+        if key in dropped_time_deps:
+            time_dep_key = None
         if time_dep_key:
             if time_dep_key not in key_to_entry_id:
                 raise ValueError(
@@ -618,45 +385,12 @@ def load(schedule_path: str,
             core_kind=core_kind,
             impl=impl,
             hart=hart,
-            harts=harts,
             start_time_ms=float(d.get("start_time", 0.0) or 0.0),
             duration_ms=float(d.get("duration", 0.0) or 0.0),
-            # Dedup deps_entry_ids. Two consequences of the Phase G2d
-            # producer-side fanout: (a) the consumer's take loop calls
-            # k_sem_take once per dep entry, so duplicates would mean
-            # multiple takes from the same producer's sem; (b) the
-            # producer side dedups fanout per unique consumer. If a
-            # producer ended up as both fanout[c] = c-once but the
-            # consumer's deps had it twice, take/give wouldn't
-            # balance and the worker deadlocks. Dedup at both ends
-            # keeps the invariant 1-give = 1-take for every unique
-            # (producer, consumer) edge.
-            deps_entry_ids=tuple(sorted(set(deps_ids))),
+            deps_entry_ids=tuple(deps_ids),
             time_dep_entry_id=time_dep_id,
+            harts=harts,
         ))
-
-    # ---------- Phase G2d: producer-side fanout -----------
-    # For each entry, build the set of consumers that wait on its
-    # completion sem. A consumer C waits on producer P's sem when
-    # either (a) P ∈ C.deps_entry_ids (data dep) or (b)
-    # C.time_dep_entry_id == P (cross-job ordering). The walker uses
-    # this to give the consumer's sem exactly once per fanout edge,
-    # instead of having every consumer take-then-re-give. Net effect:
-    # one fewer sem op per dep edge.
-    fanout: list[list[int]] = [[] for _ in entries]
-    for c in entries:
-        for d in c.deps_entry_ids:
-            if 0 <= d < len(fanout):
-                fanout[d].append(c.entry_id)
-        if 0 <= c.time_dep_entry_id < len(fanout):
-            fanout[c.time_dep_entry_id].append(c.entry_id)
-    for e in entries:
-        # Sort + dedup so codegen is deterministic and a single
-        # consumer connected by both a data-dep and a time-dep edge
-        # only appears once in the fanout list (otherwise the walker
-        # would over-signal it).
-        e.fanout_entry_ids = tuple(sorted(set(fanout[e.entry_id])))
-
     return entries
 
 
@@ -671,30 +405,34 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
 
     upper = schedule_name.replace(".", "_").replace("-", "_").upper()
 
-    # Build per-entry deps + fanout arrays + interned strings.
+    # Build per-entry deps arrays + interned strings.
     deps_arrays: list[str] = []
     for e in entries:
-        harts = ", ".join(str(h) for h in e.harts)
-        deps_arrays.append(
-            f"static const int sched_{e.entry_id}_harts[] = {{ {harts} }};"
-        )
         if e.deps_entry_ids:
             arr = ", ".join(str(d) for d in e.deps_entry_ids)
             deps_arrays.append(
                 f"static const int sched_{e.entry_id}_deps[] = {{ {arr} }};"
             )
-        if e.fanout_entry_ids:
-            arr = ", ".join(str(d) for d in e.fanout_entry_ids)
-            deps_arrays.append(
-                f"static const int sched_{e.entry_id}_fanout[] = {{ {arr} }};"
-            )
+
+    harts_arrays: list[str] = []
+    for e in entries:
+        if len(e.harts) > 1:
+            harts_arrays.append(
+                f"static const int sched_{e.entry_id}_harts[] = {{ {', '.join(str(h) for h in e.harts)} }};")
+    # Instances per network, for sizing per-instance buffer sets.
+    n_inst: dict[str, int] = {}
+    for e in entries:
+        n_inst[e.network] = max(n_inst.get(e.network, 0), e.instance + 1)
+    inst_defines = "\n".join(
+        f"#define XPURT_N_INSTANCES_{re.sub(r'[^A-Za-z0-9]', '_', n).upper()} {k}"
+        for n, k in sorted(n_inst.items()))
 
     rows: list[str] = []
     for e in entries:
         n_deps = len(e.deps_entry_ids)
+        n_harts = len(e.harts) if len(e.harts) > 1 else 1
+        harts_ref = f"sched_{e.entry_id}_harts" if len(e.harts) > 1 else "NULL"
         deps_ref = (f"sched_{e.entry_id}_deps" if n_deps else "NULL")
-        n_fanout = len(e.fanout_entry_ids)
-        fanout_ref = (f"sched_{e.entry_id}_fanout" if n_fanout else "NULL")
         rows.append(
             f'    {{ .entry_id = {e.entry_id}, '
             f'.network = "{e.network}", .instance = {e.instance}, '
@@ -704,12 +442,11 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
             f'.core_name = "{e.core_name}", .core_kind = "{e.core_kind}", '
             f'.impl = "{e.impl}", '
             f'.hart = {e.hart}, '
-            f'.n_harts = {len(e.harts)}, .harts = sched_{e.entry_id}_harts, '
             f'.start_time_ms = {e.start_time_ms!r}f, '
             f'.duration_ms = {e.duration_ms!r}f, '
             f'.n_deps = {n_deps}, .deps = {deps_ref}, '
             f'.time_dep_entry_id = {e.time_dep_entry_id}, '
-            f'.n_fanout = {n_fanout}, .fanout = {fanout_ref} }},'
+            f'.n_harts = {n_harts}, .harts = {harts_ref} }},'
         )
 
     h = f"""{HEADER}
@@ -738,23 +475,19 @@ typedef struct {{
                                     * equals core_kind unless the schedule
                                     * chose per-dispatch implementations */
     int            hart;           /* preferred hart, -1 if unbound */
-    int            n_harts;        /* full reserved machine-combination width */
-    const int     *harts;           /* master first, followed by helper harts */
     float          start_time_ms;  /* XPU-RT-issued start time (ms) */
     float          duration_ms;    /* XPU-RT-modeled duration (ms) */
     int            n_deps;
     const int     *deps;           /* in-table entry_ids of intra-job data deps */
     int            time_dep_entry_id; /* cross-job ordering edge, -1 if none */
-    /* Producer-side fanout: entry_ids of consumers that wait on this
-     * entry's completion sem (data-dep or time-dep). The walker uses
-     * .n_fanout to k_sem_give() the consumer's sem exactly once per
-     * consumer at producer-side, instead of the old multi-consumer
-     * take/re-give pattern. */
-    int            n_fanout;
-    const int     *fanout;
+    int            n_harts;        /* harts this dispatch runs on (1 unless composite) */
+    const int     *harts;          /* the n_harts harts, `hart` first; NULL if n_harts == 1 */
 }} xpurt_sched_entry_t;
 
 #define {upper}_N_ENTRIES   {len(entries)}
+
+/* Instances of each network in this schedule. */
+{inst_defines}
 
 extern const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES];
 
@@ -768,6 +501,7 @@ extern const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES];
 #include "{os.path.basename(h_path)}"
 
 {chr(10).join(deps_arrays) if deps_arrays else "/* (no entries with deps) */"}
+{chr(10).join(harts_arrays)}
 
 const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES] = {{
 {chr(10).join(rows)}
@@ -827,6 +561,12 @@ def _main() -> None:
     for e in entries:
         by_kind[e.core_kind] = by_kind.get(e.core_kind, 0) + 1
     print(f"by core kind: {dict(sorted(by_kind.items()))}")
+    with open(args.schedule) as f:
+        n_comp = sum("+" in d.get("hardware_target", "")
+                     for d in json.load(f).get("dispatches", {}).values())
+    if n_comp:
+        print(f"note: {n_comp} composite (multi-hart) targets; with "
+              f"--worker-granularity hart each reserves all of its harts")
     by_net: dict[str, int] = {}
     for e in entries:
         by_net[e.job_name] = by_net.get(e.job_name, 0) + 1

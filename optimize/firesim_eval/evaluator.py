@@ -60,9 +60,9 @@ class FiresimEvalConfig:
     overridable for portability.
     """
     firesim_root: str = os.environ.get(
-        "FIRESIM_ROOT", "/scratch2/dima/chipyard-fsim/sims/firesim")
+        "FIRESIM_ROOT", os.path.expandvars("$CHIPYARD_ROOT/sims/firesim"))
     firesim_env: str = os.environ.get(
-        "FIRESIM_ENV", "/scratch2/dima/chipyard-fsim/env.sh")
+        "FIRESIM_ENV", os.path.expandvars("$CHIPYARD_ROOT/env.sh"))
     firesim_slot: str = os.environ.get(
         "FIRESIM_SLOT", "firesim_rundir/sim_slot_0")
     # Per-run wall-time budget for the firesim_runner.run_firesim() call.

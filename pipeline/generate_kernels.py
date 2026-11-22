@@ -23,16 +23,13 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import tempfile
 from typing import Optional
 
 from modelblaster.pipeline import backends as backends_mod
 from modelblaster.pipeline.backends import (
-    Backend, VERIFY_CROSS_COMPILE, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
+    Backend, VERIFY_HOST_CTYPES, VERIFY_SPIKE_HARNESS,
 )
-from modelblaster.pipeline.bedrock_client import extract_code_block
-from modelblaster.pipeline.llm_client import LLMClient, make_llm_client
+from modelblaster.pipeline.bedrock_client import BedrockClient, extract_code_block
 from modelblaster.pipeline.reference_kernels import (
     AccuracyClass, ACCURACY_CLASS_ATOL,
     KERNEL_SPECS, KernelSpec, shapes_from_ir,
@@ -540,158 +537,8 @@ def emit_kernels_c(
 
 
 # ---------------------------------------------------------------------------
-# Per-backend op skip lists for the LLM optimize loop AND the initial
-# BACKEND=llm kernel-gen pass.
-#
-# Ops listed here are KEPT at their reference/curated impl when running with
-# BACKEND=llm + OPTIMIZE=1; we don't ask Sonnet to (re)write them. The motive
-# for each entry is empirical: a measured Arm B-bedrock matrix capture where
-# the LLM tripped verify on every attempt for that (target, op) pair while
-# the curated/reference impl was already correct. See
-# benchmarks/reports/baseline-dronet-arm-b-matrix-2026-05-26/methodology.md
-# for the gemmini maxpool / relu / etc. failure traces.
-#
-# Keyed by target name (the str), not the Backend object. Lookup with
-# .get(backend.name, set()).
-LLM_SKIP_OPS_PER_TARGET: dict[str, set[str]] = {
-    # Gemmini doesn't accelerate elementwise / pooling / activation ops
-    # natively. The curated path routes maxpool through tiled_conv_dw_auto
-    # + mvout pool, but LLM attempts to rewrite as a "Gemmini matmul"
-    # consistently trip verify (max_abs_err=12..56 across attempts). For
-    # the other ops gemmini RoCC has no special instruction so the LLM
-    # has nothing to win against the scalar reference; let it fall
-    # through to reference_impl rather than burning budget on retries.
-    "gemmini":     {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
-                    "add_s8", "sigmoid_s8"},
-    "gemmini_q31": {"maxpool2d_s8", "relu_s8", "batchnorm2d_s8",
-                    "add_s8", "sigmoid_s8"},
-    # Plain rvv: the elementwise / normalization ops have no working
-    # curated kernel (add_s8 has none at all; batchnorm2d_s8 / cat*_c1_s8
-    # exist but trip verify with linf=82 / rel_err=5.1e+13 on yolov8n
-    # smoke shapes, suggesting an OOB / scale-mismatch bug in those
-    # files). Arm A transparently falls back to reference for them;
-    # Arm B's LLM attempts trip verify on every retry. Skip these ops
-    # so the seed reference_impl holds, same as the gemmini pattern.
-    # conv2d_s8 was previously here too -- that workaround was for the
-    # IHWOC layout permutation bug (fixed in
-    # generate_skeleton.py:_LAYOUT_PERMUTATION); conv2d now works
-    # bit-exact via rvv_vsmul_vnclip and gives ~16-17× speedup.
-    "rvv":         {"add_s8", "batchnorm2d_s8", "sigmoid_s8",
-                    "cat2_c1_s8", "cat3_c1_s8", "cat4_c1_s8"},
-}
-
-
-# ---------------------------------------------------------------------------
 # Verify routing — backend dictates host_ctypes vs spike_harness
 # ---------------------------------------------------------------------------
-
-#: Backends whose whole point is a vector unit. A curated kernel for one of
-#: these that contains no vector instruction is a mistake, not a style.
-_VECTOR_BACKENDS = {"rvv", "rvv_x60", "rvv_f16", "rvv_opu", "ime"}
-
-
-def _count_vector_insns(obj_path: str, cross: str) -> int:
-    """How many RVV instructions an object file actually contains.
-
-    Reads the OBJECT, not the source: an intrinsic can appear in the C and be
-    optimised away, and `.insn`-encoded instructions (IME's vmadot) never look
-    like intrinsics in the first place. Returns -1 when objdump is unavailable,
-    which callers must treat as "unknown", never as zero.
-    """
-    objdump = f"{cross}objdump"
-    if shutil.which(objdump) is None:
-        return -1
-    proc = subprocess.run([objdump, "-d", obj_path], capture_output=True,
-                          text=True)
-    if proc.returncode != 0:
-        return -1
-    n = 0
-    for line in proc.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        mnemonic = parts[2].split()[0] if parts[2].split() else ""
-        # vsetvli alone does not make a kernel vector code; it is the data
-        # instructions that count. `.insn`-encoded customs disassemble as
-        # `.insn` or an unknown mnemonic, so count those too.
-        if mnemonic.startswith("v") and not mnemonic.startswith("vsetvl"):
-            n += 1
-        elif mnemonic.startswith(".insn"):
-            n += 1
-    return n
-
-
-def cross_compile_verify(spec: KernelSpec, candidate: str, backend: Backend,
-                         repo_root: Optional[str]) -> VerifyResult:
-    """Compile the candidate for the target ISA. Do not run it.
-
-    For a backend whose intrinsics the host cannot compile and whose ISA no
-    available simulator runs usefully, this is the strongest check that can be
-    made off the board. It catches every error the compiler can see -- unknown
-    vector types, misspelled intrinsics, an LMUL that does not match the
-    element width, a widening op under the wrong vtype -- which is the bulk of
-    what an LLM gets wrong about RVV.
-
-    IT DOES NOT CHECK NUMERICS, and the caller must not report that it does.
-    The kernel is correct when the on-board golden compare says so.
-
-    The alternative in place until now was to declare `host_ctypes`, whose
-    x86 `cc` cannot parse `vint8m1_t` at all: every candidate "failed", the
-    retry budget was spent, and the generator emitted the scalar seed under a
-    vector target's name.
-    """
-    cross = os.environ.get("CROSS", "")
-    cc = f"{cross}gcc" if cross else None
-    if not cc or shutil.which(cc) is None:
-        return VerifyResult(
-            False,
-            "cross-compile verify needs a target toolchain: set CROSS to a "
-            "riscv64 prefix (`eval \"$(scripts/setup_spacemit_toolchain.sh)\"`). "
-            "Refusing to accept an unbuilt kernel.")
-
-    flags = list(backend.resolved_kernel_cflags(repo_root or "."))
-    includes = "\n".join(f"#include {inc}" for inc in backend.kernel_includes)
-    src = (f"#include <stddef.h>\n#include <stdint.h>\n#include <math.h>\n"
-           f"{includes}\n\n{candidate}\n")
-
-    with tempfile.TemporaryDirectory(prefix="xverify_") as d:
-        cpath = os.path.join(d, f"cand_{spec.op}.c")
-        with open(cpath, "w") as f:
-            f.write(src)
-        cmd = [cc, "-O2", "-c", cpath, "-o", os.path.join(d, "cand.o")] + flags
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            return VerifyResult(
-                False,
-                "candidate failed to cross-compile for "
-                f"{backend.name}:\n  cmd: {' '.join(cmd)}\n"
-                f"  stderr:\n{proc.stderr}")
-
-        # A "vector" kernel that compiled to no vector instructions is the
-        # same class of silent failure as the seed fallback, one level up:
-        # it builds, it verifies, it is bit-exact, and it is scalar. It
-        # happened -- asking for the generic `direct` algorithm on this
-        # backend produced four transformer kernels with zero intrinsics
-        # between them, each of which would have been committed as a curated
-        # RVV kernel. The object file settles it; the source does not, since
-        # an intrinsic can be present and optimised away.
-        if _VECTOR_BACKENDS.intersection(backends_mod.backend_lineage(
-                backend.name)):
-            vec = _count_vector_insns(os.path.join(d, "cand.o"), cross)
-            if vec == 0:
-                return VerifyResult(
-                    False,
-                    f"candidate compiled for {backend.name} but emitted NO "
-                    f"vector instructions -- it is scalar code wearing a "
-                    f"vector target's name. Use the RVV intrinsics "
-                    f"(__riscv_vsetvl_*, vle8/vwmul/vredsum ...); a kernel "
-                    f"that only happens to build is not a port.")
-
-    return VerifyResult(
-        True,
-        f"cross-compiled for {backend.name}; NOT executed -- numeric "
-        f"correctness is established by the on-board golden compare")
-
 
 def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
     """Cheap lexical check that the candidate contains the expected function
@@ -735,18 +582,6 @@ def _check_signature(candidate: str, spec: KernelSpec) -> Optional[str]:
 # slow verify path which still works; the goal is just to fail FAST when
 # Llama is obviously not following the algorithm.
 _ALGORITHM_REQUIRED_SUBSTRINGS: dict[str, tuple[str, ...]] = {
-    # rvv_memo_lut_gather: must actually build a table and GATHER from it.
-    #
-    # Without this gate the model writes a plausible-looking hybrid instead --
-    # vector loads, then a scalar loop calling the transcendental per element,
-    # then vector stores. It passed cross-compile, emitted plenty of vector
-    # instructions, and even measured max_abs_err=0 on the board. It was still
-    # wrong: it called `cosf`/`roundf` where the reference uses `cos`/`round`
-    # in DOUBLE, so its bit-exactness was a property of the test data rather
-    # than of the kernel. The whole point of the LUT is that the reference
-    # expression is evaluated verbatim, at most 256 times, and never
-    # approximated -- so require the table and the gather that reads it.
-    "rvv_memo_lut_gather": ("table", "vluxei8"),
     # im2col_gemm: must allocate and populate the im2col buffer.
     "im2col_gemm": ("im2col_buf",),
     # oc_blocked: must have an outer OC tile loop. Looking for the
@@ -832,9 +667,6 @@ def _verify(
 
     if backend.verify_method == VERIFY_HOST_CTYPES:
         return host_verify(spec, candidate, shapes)
-
-    if backend.verify_method == VERIFY_CROSS_COMPILE:
-        return cross_compile_verify(spec, candidate, backend, repo_root)
 
     if backend.verify_method == VERIFY_SPIKE_HARNESS:
         # Build the full harness with this candidate substituted, run on
@@ -995,7 +827,7 @@ def _generate_one_llm_for_algorithm(
     spec: KernelSpec,
     algorithm,  # AlgorithmCandidate
     shapes: list[dict],
-    client: LLMClient,
+    client: BedrockClient,
     backend: Backend,
     correctness_system: str,
     max_retries: int,
@@ -1052,8 +884,7 @@ def _generate_one_llm_for_algorithm(
         # 2048 cap got hit on sigmoid_f16 / conv2d_f16 mid-expression and
         # produced unparseable truncations.
         res = client.converse(user=user, system=correctness_system,
-                              max_tokens=32768, temperature=temp,
-                              phase=f"synth:{spec.op}")
+                              max_tokens=32768, temperature=temp)
         log(f"  [{spec.op}/{algorithm.name}] tokens "
             f"in={res.input_tokens} out={res.output_tokens} "
             f"stop={res.stop_reason}")
@@ -1092,7 +923,7 @@ def _generate_one_llm_for_algorithm(
 def generate_one_llm(
     spec: KernelSpec,
     shapes: list[dict],
-    client: LLMClient,
+    client: BedrockClient,
     backend: Backend,
     correctness_system: str,
     max_retries: int,
@@ -1347,7 +1178,7 @@ def beam_search_optimize(
     impls: dict[str, str],
     specs: list[KernelSpec],
     backend: Backend,
-    client: LLMClient,
+    client: BedrockClient,
     optimize_system: str,
     repo_root: str,
     model_dir: str,
@@ -1392,26 +1223,12 @@ def beam_search_optimize(
                 res = client.converse(
                     user=user, system=optimize_system,
                     max_tokens=32768, temperature=0.5,
-                    phase=f"optimize:{spec.op}",
                 )
                 log(f"      tokens in={res.input_tokens} out={res.output_tokens}")
-                # Token usage attaches to every history record produced
-                # for this call, regardless of how the candidate exits
-                # (duplicate / build_fail / verify_fail / ok). Lets the
-                # trajectory log answer "how much did we pay per
-                # successful candidate?" without re-joining JSONL logs.
-                tokens_in = int(res.input_tokens or 0)
-                tokens_out = int(res.output_tokens or 0)
                 candidate = extract_code_block(res.text, lang="c")
                 key = _normalize(candidate)
                 if key in seen:
                     log(f"      duplicate, skip")
-                    history.append({
-                        "iter": it, "parent_idx": parent_idx,
-                        "exp_idx": exp, "parent_cycles": parent_cycles,
-                        "result": "duplicate",
-                        "tokens_in": tokens_in, "tokens_out": tokens_out,
-                    })
                     continue
                 seen.add(key)
 
@@ -1438,10 +1255,8 @@ def beam_search_optimize(
                     for ln in head:
                         log(f"        {ln[:300]}")
                     history.append({
-                        "iter": it, "parent_idx": parent_idx,
-                        "exp_idx": exp, "parent_cycles": parent_cycles,
+                        "iter": it, "parent_cycles": parent_cycles,
                         "result": "build_fail",
-                        "tokens_in": tokens_in, "tokens_out": tokens_out,
                         "diag": " | ".join(head)[:2000],
                     })
                     continue
@@ -1450,10 +1265,8 @@ def beam_search_optimize(
                     log(f"      verify FAIL: golden mismatch "
                         f"(max_abs_err={hres.golden_max_abs_err:.3g})")
                     history.append({
-                        "iter": it, "parent_idx": parent_idx,
-                        "exp_idx": exp, "parent_cycles": parent_cycles,
+                        "iter": it, "parent_cycles": parent_cycles,
                         "result": "verify_fail",
-                        "tokens_in": tokens_in, "tokens_out": tokens_out,
                         "diag": f"golden mismatch ({hres.golden_max_abs_err:.3g})",
                     })
                     continue
@@ -1466,10 +1279,8 @@ def beam_search_optimize(
                     if not vres.ok:
                         log(f"      host verify FAIL: {vres.message.splitlines()[0]}")
                         history.append({
-                            "iter": it, "parent_idx": parent_idx,
-                            "exp_idx": exp, "parent_cycles": parent_cycles,
+                            "iter": it, "parent_cycles": parent_cycles,
                             "result": "verify_fail",
-                            "tokens_in": tokens_in, "tokens_out": tokens_out,
                             "diag": vres.message.splitlines()[0],
                         })
                         continue
@@ -1478,10 +1289,8 @@ def beam_search_optimize(
                 log(f"      {parent_cycles} -> {new_cycles} cyc"
                     f" ({(parent_cycles-new_cycles)/parent_cycles*100:+.1f}%)")
                 history.append({
-                    "iter": it, "parent_idx": parent_idx,
-                    "exp_idx": exp, "parent_cycles": parent_cycles,
+                    "iter": it, "parent_cycles": parent_cycles,
                     "result": "ok", "cycles": new_cycles,
-                    "tokens_in": tokens_in, "tokens_out": tokens_out,
                 })
                 proposals.append((candidate, new_cycles))
                 all_viable.append((candidate, new_cycles))
@@ -1651,6 +1460,7 @@ def generate(
         raise SystemExit(
             f"quant={quant!r} not implemented in generate_kernels yet "
             f"(have: fp32, fp16, int8)."
+            + (" bf16 is CUDA-only (docs/bf16_cuda.md)." if quant == "bf16" else "")
         )
 
     target = backends_mod.get(target_name)
@@ -1763,8 +1573,7 @@ def generate(
         # instructions at all.
         curated_verify = (
             os.environ.get("MODELBLASTER_CURATED_VERIFY", "1") == "1"
-            and (needs_harness_paths
-                 or target.verify_method == VERIFY_CROSS_COMPILE)
+            and needs_harness_paths
         )
 
         def _probe_swap(source_label: str, dir_path: Optional[str],
@@ -2046,7 +1855,7 @@ def generate(
             kernel_picks[_op]["pinned"] = True
             log(f"  [{_op}] pinned to algorithm {_al}")
     elif backend_name == "llm":
-        # Lazy proxy: the LLM client is only instantiated when actually needed
+        # Lazy proxy: BedrockClient() is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
         # runs that hit all curated kernels don't require AWS credentials.
         class _LazyClient:
@@ -2055,7 +1864,7 @@ def generate(
             def __getattr__(self_, name):
                 real = object.__getattribute__(self_, '_real')
                 if real is None:
-                    real = make_llm_client()
+                    real = BedrockClient()
                     object.__setattr__(self_, '_real', real)
                 return getattr(real, name)
         client = _LazyClient()
@@ -2069,19 +1878,7 @@ def generate(
         # First pass: write reference + emit so the harness can build at all.
         emit_kernels_h(specs, out_dir, model_name=ir["name"])
         emit_kernels_c(impls, "seed", out_dir, backend=target, model_name=ir["name"])
-        _llm_skip = LLM_SKIP_OPS_PER_TARGET.get(target.name, set())
         for spec in specs:
-            if spec.op in _llm_skip:
-                log(f"  [{spec.op}] target={target.name} -> "
-                    f"LLM-gen skip (curated/reference is best known); "
-                    f"keeping reference_impl from seed step")
-                kernel_picks[spec.op] = {
-                    "source": "reference",
-                    "algorithm": None,
-                    "path": None,
-                }
-                chosen_algo[spec.op] = "direct"
-                continue
             shapes = collect_shapes(ir, spec.op, spec)
             log(f"  [{spec.op}] verify shapes={shapes}")
             result = generate_one_llm(
@@ -2189,14 +1986,14 @@ def generate(
     # it also won't penalize one, and FireSim re-rank (when active)
     # picks it up. `cache_aware_prompt=False` opts out for cases where
     # the user wants a strictly flat-memory prompt.
-    _CACHE_AWARE_TARGETS = {"rvv", "rvv_f16", "rvv_opu", "scalar", "scalar_f16"}
+    _CACHE_AWARE_TARGETS = {"rvv", "rvv_f16", "rvv_opu", "zvt", "scalar", "scalar_f16"}
     if cache_aware_prompt or target.name in _CACHE_AWARE_TARGETS:
         from modelblaster.optimize.firesim_eval import memory_model_stanza
         stanza = memory_model_stanza()
         optimize_system = optimize_system + "\n\n" + stanza
         log(f"optimize: prompt enriched with target memory-hierarchy stanza "
             f"(target={target.name})")
-    client = make_llm_client()
+    client = BedrockClient()
 
     # Pre-instantiate the firesim evaluator (one per generate() call). It
     # reuses a separate chipyard build dir from the spike build_dir so
@@ -2218,15 +2015,8 @@ def generate(
         log(f"optimize: firesim re-rank ENABLED "
             f"(top_k={firesim_top_k}, build_dir={firesim_build_dir})")
 
-    # See module-level LLM_SKIP_OPS_PER_TARGET for the rationale.
-    _skip = LLM_SKIP_OPS_PER_TARGET.get(target.name, set())
-
     optimize_summary: dict[str, dict] = {}
     for spec in specs:
-        if spec.op in _skip:
-            log(f"  [{spec.op}] target={target} -> "
-                f"optimize-skip (curated/reference is best known)")
-            continue
         baseline_op = baseline_cycles_by_op.get(spec.op, 0)
         if baseline_op <= 0:
             log(f"  [{spec.op}] no baseline cycles, skipping")
@@ -2355,21 +2145,6 @@ def generate(
     with open(summary_path, "w") as f:
         json.dump(optimize_summary, f, indent=2)
     log(f"wrote {summary_path}")
-
-    # beam_search_trajectory.jsonl: one line per candidate (across
-    # every op + iter + parent + expansion in this optimize call) so
-    # the harness can answer "did we plateau early?" / "how much did
-    # we pay per surviving candidate?" / "what was the best-of-K
-    # curve?" without re-parsing the nested summary.
-    trajectory_path = os.path.join(out_dir, "beam_search_trajectory.jsonl")
-    with open(trajectory_path, "w") as f:
-        for op, entry in optimize_summary.items():
-            baseline = entry.get("baseline")
-            for rec in entry.get("history") or []:
-                line = {"spec": op, "baseline_cycles": baseline}
-                line.update(rec)
-                f.write(json.dumps(line) + "\n")
-    log(f"wrote {trajectory_path}")
     log("")
     log("optimize summary:")
     for op, s in sorted(optimize_summary.items()):

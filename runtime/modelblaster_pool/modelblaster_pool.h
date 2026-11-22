@@ -21,17 +21,25 @@
  *
  * Implementation notes:
  *
- *  - Workers are POSIX pthreads spawned at create time and pinned via
- *    pthread_attr_setaffinity_np (vendored Phase A patch — see
- *    modelblaster/harness_multi/zephyr_patches/posix-affinity.patch). We use
+ *  - Workers are POSIX pthreads spawned at create time. On Zephyr they are
+ *    pinned via pthread_attr_setaffinity_np (vendored Phase A patch — see
+ *    modelblaster/harness_multi/zephyr_patches/posix-affinity.patch). On
+ *    Linux each helper places ITSELF with mb_place_current_thread() (which
+ *    also registers it for the K3 A100 cluster) and reports success to the
+ *    creator before create returns. We use
  *    pthreads, not k_thread, so the API stays portable to non-Zephyr
  *    builds; the bench measured the POSIX layer cost as essentially
  *    zero on top of k_thread.
  *
- *  - Zephyr uses `k_sem` for the rendezvous because the bench harness measured
- *    it as the cheapest cross-hart wakeup primitive there. Hosted Linux uses
- *    mutexes and condition variables behind the same API. Both ports pin
- *    helpers to the explicit hart set supplied by the schedule runtime.
+ *  - We use Zephyr `k_sem` (not POSIX sem_t) for the rendezvous because
+ *    the bench harness measured it as the cheapest cross-hart wakeup
+ *    primitive available on the platform. The pool object is therefore
+ *    Zephyr-only at runtime; any non-Zephyr port would swap k_sem for
+ *    a POSIX equivalent and rely on the bench's "POSIX layer is free"
+ *    finding. That port is runtime/mb_posix.h: build with
+ *    -DMB_PLATFORM_POSIX -D_GNU_SOURCE and k_sem becomes sem_t.
+ *    On hosted Linux each helper places itself (runtime/mb_placement.h) so
+ *    it can register as a K3 A100 thread before pinning.
  *
  *  - Master participates in its own slice (slice index 0). The master
  *    posts start sems for workers 1..N-1, runs slice 0, then takes done
@@ -57,12 +65,16 @@
 extern "C" {
 #endif
 
+/* Most threads one pool can hold, the master included. Public so callers can
+ * size the hart list they pass to modelblaster_pool_create_on_harts. */
+#define MODELBLASTER_POOL_MAX_WORKERS 16
+
 struct modelblaster_pool_state;
 typedef struct modelblaster_pool_state *modelblaster_pool_t;
 
 /* Create a pool with `n_workers` total threads (caller participates as
- * worker 0; n_workers-1 helper threads are spawned and pinned via
- * pthread_attr_setaffinity_np to harts 1..n_workers-1).
+ * worker 0; n_workers-1 helper threads are spawned and pinned to harts
+ * 1..n_workers-1).
  *
  * Returns NULL on n_workers==0 (callers treat NULL as "run sequentially")
  * or on hard failure (out of memory, pthread_create failed). On any
@@ -72,9 +84,9 @@ modelblaster_pool_t modelblaster_pool_create(int n_workers);
 
 /* Create the same pool on an explicit ordered hart set. ``harts[0]`` is the
  * calling/master thread (the caller is responsible for already being pinned
- * there); helper w is pinned to ``harts[w]``. This is the schedule-runtime
- * form: a shard on CPU_E#0..#3 must use physical harts 4..7, not the legacy
- * implicit 0..3 mapping. */
+ * there); helper w is pinned to ``harts[w]``. On a K3 this is how a pool on the
+ * A100 cluster gets harts 8..15. On hosted Linux it returns NULL if any helper
+ * fails to place itself. modelblaster_pool_create(n) is this with 0..n-1. */
 modelblaster_pool_t modelblaster_pool_create_on_harts(
     int n_workers, const int *harts);
 

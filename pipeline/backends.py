@@ -180,8 +180,10 @@ RVV_X60 = Backend(
     spike_args=("--isa=rv64gcv_zicntr",),
     optimization_guide="optimization_guide_rvv.md",
     # Same ISA family as rvv, just with VLEN pinned -- so it inherits every
-    # curated kernel in kernels/rvv/.
-    curated_aliases=("rvv",),
+    # curated kernel in kernels/rvv/. The X60 also has zvfh, so the fp16
+    # kernels in kernels/rvv_f16/ apply; they come second, so an op with a
+    # kernels/rvv/ kernel keeps it and only fp16 ops gain a vector kernel.
+    curated_aliases=("rvv", "rvv_f16"),
     # NOT host_ctypes. The host is x86 and cannot compile `vint32m4_t` or
     # `__riscv_vle8_v_i8m1`, so host_ctypes verify fails on every candidate
     # with "unknown type name" -- which the generator reads as the LLM being
@@ -194,6 +196,81 @@ RVV_X60 = Backend(
     # correctness to the on-board golden compare, which is where this
     # backend's docstring already says correctness is established.
     verify_method=VERIFY_CROSS_COMPILE,
+)
+
+
+# SpaceMiT K3 (X100 + A100). Cloned from rvv_x60: same curated kernels
+# (alias `rvv` -> kernels/rvv), same IHWOC weight layout, same cross-compile
+# verify. Every curated kernel's `target_affinity` lists this name next to
+# rvv_x60 -- the picker matches it by exact name, so a missing entry would
+# silently fall back to the scalar reference.
+#
+# `zvl256b` is a LOWER BOUND on VLEN, so one binary is legal on both core types:
+# the X100 has VLEN=256 (vlenb=32) and the A100 has VLEN=1024 (vlenb=128).
+# CAVEAT: the A100 is deliberately treated as X100-ISA-only for now. Its
+# correctness depends on every kernel being VL-agnostic (vsetvl-driven, no
+# hard-coded 256-bit lane count); that is NOT proven by construction and is
+# checked by golden runs pinned to the A100 harts.
+RVV_K3 = Backend(
+    name="rvv_k3",
+    description="SpaceMiT K3: rv64gcv zvl256b (X100 VLEN=256; the A100's "
+                "VLEN=1024 is covered by the zvl256b lower bound). Verified "
+                "on the board.",
+    kernel_cflags=RVV_X60.kernel_cflags,
+    kernel_includes=RVV_X60.kernel_includes,
+    prj_conf_overlay=RVV_X60.prj_conf_overlay,
+    spike_args=RVV_X60.spike_args,
+    optimization_guide=RVV_X60.optimization_guide,
+    curated_aliases=RVV_X60.curated_aliases,
+    verify_method=RVV_X60.verify_method,
+)
+
+
+# SpaceMiT K3 A100 cores ONLY (CPUs 8-15, VLEN=1024). Same kernels as rvv_k3
+# (alias `rvv`), but built at zvl1024b. WHY a separate backend instead of the
+# zvl256b lower bound: GCC at zvl256b may emit whole-register spills
+# (vs1r.v / vl1r.v) into stack slots sized for VLEN=256, which overrun on a
+# VLEN=1024 core. Compiling at zvl1024b sizes those slots for 1024. The flip
+# side: this code is ILLEGAL on the X100 (VLEN=256 < 1024), so it must only
+# ever run on harts 8-15 (enforced by validation/board_config.py and
+# verify_kernel_on_board.py). Tuned A100 kernels go in kernels/rvv_k3_a100/
+# as rvv_k3_a100_<op>_<algo>.c; everything else falls back to kernels/rvv.
+RVV_K3_A100 = Backend(
+    name="rvv_k3_a100",
+    description="SpaceMiT K3 A100: rv64gcv zvl1024b (VLEN=1024). Illegal on "
+                "the X100; falls back to the shared rvv kernels.",
+    kernel_cflags=tuple(
+        "-march=rv64gcv_zvl1024b_zfh_zvfh" if f.startswith("-march=") else f
+        for f in RVV_X60.kernel_cflags),
+    kernel_includes=RVV_X60.kernel_includes,
+    prj_conf_overlay=RVV_X60.prj_conf_overlay,
+    spike_args=RVV_X60.spike_args,
+    optimization_guide=RVV_X60.optimization_guide,
+    curated_aliases=("rvv",),
+    verify_method=RVV_X60.verify_method,
+)
+
+
+# SpaceMiT K3 A100 IME (smt.vmadot int8, 8x16x8 tile at VLEN=1024). A100 cores
+# only (CPUs 8-15): illegal on the X100. Same flags as rvv_k3_a100 (zvl1024b);
+# the vmadot is emitted via `.insn r 0x2b, 3, 0x71` (the cross GCC rejects the
+# mnemonic). Hand-written IME kernels live in kernels/ime_k3_a100/ as
+# ime_k3_a100_<op>_ime_vmadot_8x16x8.c; the lineage is ime_k3_a100 ->
+# rvv_k3_a100 -> rvv, so every op without an IME kernel falls through to the
+# tuned A100 RVV kernels and then the shared rvv set. Conv weight layout is
+# inherited from `rvv` (IHWOC) through that lineage.
+IME_K3_A100 = Backend(
+    name="ime_k3_a100",
+    description="SpaceMiT K3 A100: zvl1024b RVV + IME int8 vmadot 8x16x8. "
+                "Illegal on the X100; falls back to rvv_k3_a100 then rvv.",
+    kernel_cflags=RVV_K3_A100.kernel_cflags + (
+        "-I<repo_root>/kernels/ime_k3_a100",),
+    kernel_includes=RVV_K3_A100.kernel_includes,
+    prj_conf_overlay=RVV_K3_A100.prj_conf_overlay,
+    spike_args=RVV_K3_A100.spike_args,
+    optimization_guide=RVV_K3_A100.optimization_guide,
+    curated_aliases=("rvv_k3_a100", "rvv"),
+    verify_method=RVV_K3_A100.verify_method,
 )
 
 
@@ -321,8 +398,10 @@ IME = Backend(
     # The backend is `ime_x60` (matching the profile tree's rvv_x60 / scalar
     # convention, which is what the scheduler's combo_hw swap keys on) while
     # the kernels live in kernels/ime/ -- the alias is what bridges the two,
-    # exactly as rvv_x60 reaches kernels/rvv/.
-    curated_aliases=("ime", "rvv"),
+    # exactly as rvv_x60 reaches kernels/rvv/. "rvv_f16" last, as on rvv_x60:
+    # the X60 has zvfh, so fp16 ops get vector kernels instead of the scalar
+    # reference.
+    curated_aliases=("ime", "rvv", "rvv_f16"),
     # Same reasoning as rvv_x60: the host is x86 and no simulator models
     # smt.vmadot, so generation cross-compiles and the board settles numerics.
     verify_method=VERIFY_CROSS_COMPILE,
@@ -368,6 +447,45 @@ RVV_OPU = Backend(
     spike_args=("--extension=saturn_opu", "--isa=rv64gcv_zicntr"),
     optimization_guide="optimization_guide_rvv.md",
     verify_method=VERIFY_SPIKE_HARNESS,
+)
+
+
+# zvt backend: RVV + the draft RISC-V vector-matrix tile extension (Zvt), as
+# implemented in upstream riscv-isa-sim 72958551 ("Add Zvt support"). Same
+# programming model the Saturn OPU is moving to (VME). Unlike rvv_opu this
+# needs no customext: it is a stock upstream spike (built from
+# riscv-software-src/riscv-isa-sim >= 72958551), selected via
+# MODELBLASTER_ZVT_SPIKE in _run_lib.sh.
+#
+# Tile context: the harness opts its kernel thread in with
+# arch_riscv_zvt_enable() (ucb-bar/zephyr branch zvt-matrix-context,
+# CONFIG_RISCV_ISA_EXT_ZVT), so tile state survives preemption and the
+# kernels need no irq_lock. Kernels must keep each tile computation in ONE
+# asm block -- a compiler vsetvli in between clears mtype.
+ZVT = Backend(
+    name="zvt",
+    description=(
+        "rv64gcv + Zvt draft vector-matrix tile extension (vtmms i8xi8->i32 "
+        "tile MAC, vtfmm fp). Encoded via .insn/.word from zvt_insn.h; runs "
+        "on upstream spike with --isa=..._zvtbase_zvt32t_zvt8e_zvti8i32mm."
+    ),
+    kernel_cflags=(
+        "-march=rv64gcv",
+        "-mabi=lp64d",
+        "-isystem<repo_root>/cores/zvt/include",
+        "-DMODELBLASTER_ZVT=1",
+        # Like rvv_opu: no IHWOC flag until a zvt conv2d algorithm declares
+        # its weight layout.
+    ),
+    kernel_includes=("<riscv_vector.h>", "\"zvt_insn.h\""),
+    prj_conf_overlay="zvt.conf",
+    # TE=32 tiles (zvt32t) with VLEN=128 gives 32x32 int8 tiles; must match
+    # CONFIG_RISCV_ZVT_TE in harness/backends/zvt.conf.
+    spike_args=("--isa=rv64gcv_zicntr_zvtbase_zvt32t_zvt8e_zvti8i32mm_zvtfmm",),
+    optimization_guide="optimization_guide_rvv.md",
+    verify_method=VERIFY_SPIKE_HARNESS,
+    # Fall back to the curated RVV kernels for ops with no zvt algorithm.
+    curated_aliases=("zvt", "rvv"),
 )
 
 
@@ -874,10 +992,14 @@ BACKENDS: dict[str, Backend] = {
     SCALAR.name: SCALAR,
     RVV.name: RVV,
     RVV_X60.name: RVV_X60,
+    RVV_K3.name: RVV_K3,
+    RVV_K3_A100.name: RVV_K3_A100,
+    IME_K3_A100.name: IME_K3_A100,
     RVV_HETERO.name: RVV_HETERO,
     SCALAR_F16.name: SCALAR_F16,
     RVV_F16.name: RVV_F16,
     RVV_OPU.name: RVV_OPU,
+    ZVT.name: ZVT,
     IME.name: IME,
     GEMMINI.name: GEMMINI,
     GEMMINI_Q31.name: GEMMINI_Q31,

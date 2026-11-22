@@ -243,7 +243,7 @@ hierarchical utilization reports without place/route.
 ## Verification recipe
 
 ```bash
-cd /scratch2/dima/chipyard-fsim
+cd $CHIPYARD_ROOT
 source env.sh
 
 # FP32-only
@@ -265,20 +265,20 @@ grep "riscv,isa\b" $DIR/*.dts   # rv64imacb_..._zve64f_zvfh_zfh_...
 VCU118 area sweep (re-runs all three syntheses in parallel):
 
 ```bash
-cd /scratch2/dima/chipyard-fsim/fpga
+cd $CHIPYARD_ROOT/fpga
 source ../env.sh
 for cfg in REFV128D128Rocket{,NoFP64,NoFP32}VCU118Config; do
   make SUB_PROJECT=vcu118 CONFIG=$cfg CONFIG_PACKAGE=chipyard.fpga.vcu118 synth-only-report &
 done
 wait
-python3 /scratch2/dima/misc_sw/FreshScheduler/scripts/plot_fpga_lut_breakdown.py \
+python3 <XPU-RT>/scripts/plot_fpga_lut_breakdown.py \
   --report 'Vanilla\n(FP64+FP32+FP16)' \
     generated-src/chipyard.fpga.vcu118.VCU118FPGATestHarness.REFV128D128RocketVCU118Config/obj/report/utilization.txt \
   --report 'No FP64\n(FP32+FP16)' \
     generated-src/chipyard.fpga.vcu118.VCU118FPGATestHarness.REFV128D128RocketNoFP64VCU118Config/obj/report/utilization.txt \
   --report 'FP16-only\n(no FP32/64)' \
     generated-src/chipyard.fpga.vcu118.VCU118FPGATestHarness.REFV128D128RocketNoFP32VCU118Config/obj/report/utilization.txt \
-  --out /scratch2/dima/misc_sw/FreshScheduler/plots/saturn_fp_area_v128d128.png
+  --out <XPU-RT>/plots/saturn_fp_area_v128d128.png
 ```
 
 ## Toolchain notes

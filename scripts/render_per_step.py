@@ -14,6 +14,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import argparse
 import json
 import subprocess
@@ -22,7 +23,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[1]
-XPURT = Path("/scratch2/agustin/XPU-RT")
+XPURT = Path(os.environ.get("XPURT_ROOT", Path(__file__).resolve().parents[2] / "XPU-RT"))
 
 
 def _render_predicted(fixture: Path, out: Path, deadline_ms: float | None,

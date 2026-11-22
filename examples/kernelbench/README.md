@@ -68,7 +68,7 @@ export PYTHONPATH="$REPO:${PYTHONPATH:-}"                 # so `modelblaster` im
 > ⚠️ **Disk / `TMPDIR`.** On this box `/` (which holds `/tmp`) runs near-full.
 > `cc1`, FireSim bitstream extraction, etc. write to `/tmp` and fail with ENOSPC
 > (FireSim shows `tar xvf ... rc=2`). Redirect temp to a roomy disk:
-> `export TMPDIR=/scratch/$USER/tmp` (create it first). `/scratch` has TBs free.
+> `export TMPDIR=<large-disk>/$USER/tmp` (create it first).
 
 ---
 
@@ -102,7 +102,7 @@ BENCHES="$(cd modelblaster/bench/level1 && ls *.py | sed 's/\.py$//' | paste -sd
 
 ### Fused: N ops, one ELF, one run (best for FireSim)
 ```bash
-export TMPDIR=/scratch/$USER/fs_tmp                          # see disk note above
+export TMPDIR=<large-disk>/$USER/fs_tmp                          # see disk note above
 BENCHES="19_ReLU,31_ELU,63_conv_standard_2D__square_input__square_kernel,95_CrossEntropyLoss" \
   TARGET=rvv QUANT=fp32 RUNNER=firesim FORCE_EXTRACT=1 FIRESIM_TIMEOUT=1800 \
   bash modelblaster/examples/kernelbench/run_multi.sh
@@ -127,13 +127,13 @@ each against its `io.npz` golden (passed via `--io-paths`, since the flat
 | `CMODEL_LARGE` | `0` | `1` = build with the RISC-V **large** code model (`CONFIG_RISCV_CMODEL_LARGE=y`). Lifts the ±2 GiB medany PC-relative (`R_RISCV_PCREL_HI20`) span limit so stock-dim baked io >2 GB can link. Needs SDK gcc ≥14. Verified PASS on spike + FireSim. |
 | `JOBS` | `1` | (run_all) concurrent benches. Forced to 1 on firesim (shared FPGA). |
 | `FORCE_EXTRACT` | `1` (multi/all) | Re-run extract even if `generated/` exists. |
-| `MB_KB_DATA_ROOT` | `/scratch/dima/mb_kb` | Symlink target for the heavy per-bench dir (keeps it off the repo partition; parallel-safe). Set empty to disable. |
+| `MB_KB_DATA_ROOT` | unset (disabled) | Symlink target for the heavy per-bench dir (keeps it off the repo partition; parallel-safe). |
 | `SPIKE_HARTS` | `4` | spike `-p` core count. |
 | `SPIKE_RAM_SIZE` | — | Hex 32-bit byte count for the `ram0` DTS region (base stays `0x80000000`). Needed for stock dims on spike. |
 | `SPIKE_MEM_MB` | — | spike `-m` memory size (MiB). Must be ≥ `SPIKE_RAM_SIZE`. |
 | `SPIKE_TIMEOUT` | `1200` | spike run timeout (s). |
 | `FIRESIM_TIMEOUT` | runner default | FireSim run timeout (s). |
-| `TMPDIR` | system | **Set to `/scratch/...`** — see disk note. |
+| `TMPDIR` | system | **Set to a large disk** — see disk note. |
 
 ---
 

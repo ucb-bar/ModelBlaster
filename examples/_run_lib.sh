@@ -136,6 +136,7 @@ elif [[ -n "${BENCH_FILE:-}" ]]; then
         --quant "${QUANT}" \
         --bench-target-mb "${BENCH_TARGET_MB:-256}" \
         --bench-target-gflops "${BENCH_TARGET_GFLOPS:-0}" \
+        --bench-target-weights-mb "${BENCH_TARGET_WEIGHTS_MB:-0}" \
         --bench-max-elements "${BENCH_MAX_ELEMENTS:-0}"
 elif [[ "${EXTRACTOR:-fx}" == "export" ]]; then
     # torch.export path. Some models cannot be traced by torch.fx at all:
@@ -476,6 +477,13 @@ if [[ "${RUNNER}" == "firesim" ]]; then
     WEST_BUILD_EXTRA+=(
         -DEXTRA_CONF_FILE="${FS_CONF}"
     )
+    # PIN_HART: which hart main() pins to. Default (unset) keeps the
+    # harness's own default of 1, which is right for the dual bitstreams.
+    # The quad-hetero bitstream needs 2 or 3 for any vector backend --
+    # harts 0,1 have Gemmini and no V there.
+    if [[ -n "${PIN_HART:-}" ]]; then
+        WEST_BUILD_EXTRA+=(-DMODELBLASTER_PIN_HART="${PIN_HART}")
+    fi
 elif [[ "${RUNNER}" == "spike" && "${ET_SMP:-0}" != "1" ]]; then
     # Default spike to a 1-core, 1-thread INLINE pthreadpool (+ unbuffered HTIF for
     # live markers). The harness prj.conf is MP_MAX_NUM_CPUS=4, which on spike is
@@ -575,14 +583,14 @@ print(' '.join(b.spike_args))
     fi
     # Gemmini backend (incl. Q31 variant) needs the chipyard spike (has
     # --extension=gemmini support + libgemmini.so). Use MODELBLASTER_GEMMINI_SPIKE
-    # env if set, else chipyard path. The Q31 acc_scale variant uses the same
+    # env if set, else $RISCV/bin/spike (Chipyard's env.sh sets RISCV). The Q31 acc_scale variant uses the same
     # spike binary; MODELBLASTER_GEMMINI_LIB_DIR is normally per-config under
     # cores/gemmini/include/per_config/<sub>/libgemmini.so — see
     # modelblaster/scripts/validate_q31_matrix.sh.
     SPIKE_BIN_FLAGS=()
     if [[ "${GEN_TARGET}" == "gemmini" || "${GEN_TARGET}" == "gemmini_q31" || "${GEN_TARGET}" == "gemmini_q31_rvv" ]]; then
-        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib}"
+        _GEMMINI_SPIKE="${MODELBLASTER_GEMMINI_SPIKE:-${RISCV:-}/bin/spike}"
+        _GEMMINI_LIB_DIR="${MODELBLASTER_GEMMINI_LIB_DIR:-${RISCV:-}/lib}"
         if [[ -f "${_GEMMINI_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_GEMMINI_SPIKE}")
             export LD_LIBRARY_PATH="${_GEMMINI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
@@ -591,14 +599,24 @@ print(' '.join(b.spike_args))
     # rvv_opu backend needs the OPU-extended spike from
     # hw/chipyard/toolchains/riscv-tools/riscv-isa-sim (built via
     # customext/saturn_opu.cc). Use MODELBLASTER_OPU_SPIKE env if set, else
-    # the local chipyard-tree path. The customext .so lives next to
+    # $RISCV/bin/spike from a Chipyard tree built with the OPU extension. The customext .so lives next to
     # the binary so LD_LIBRARY_PATH points at the same install lib dir.
     if [[ "${GEN_TARGET}" == "rvv_opu" ]]; then
-        _OPU_SPIKE="${MODELBLASTER_OPU_SPIKE:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/bin/spike}"
-        _OPU_LIB_DIR="${MODELBLASTER_OPU_LIB_DIR:-/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/.conda-env/riscv-tools/lib}"
+        _OPU_SPIKE="${MODELBLASTER_OPU_SPIKE:-${RISCV:-}/bin/spike}"
+        _OPU_LIB_DIR="${MODELBLASTER_OPU_LIB_DIR:-${RISCV:-}/lib}"
         if [[ -f "${_OPU_SPIKE}" ]]; then
             SPIKE_BIN_FLAGS+=(--spike "${_OPU_SPIKE}")
             export LD_LIBRARY_PATH="${_OPU_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+        fi
+    fi
+    # zvt backend needs an upstream spike with Zvt (riscv-isa-sim >= 72958551,
+    # "Add Zvt support"). No customext. Set MODELBLASTER_ZVT_SPIKE to it.
+    if [[ "${GEN_TARGET}" == "zvt" ]]; then
+        if [[ -n "${MODELBLASTER_ZVT_SPIKE:-}" && -f "${MODELBLASTER_ZVT_SPIKE}" ]]; then
+            SPIKE_BIN_FLAGS+=(--spike "${MODELBLASTER_ZVT_SPIKE}")
+        else
+            echo "WARNING: TARGET=zvt but MODELBLASTER_ZVT_SPIKE is unset/missing;" \
+                 "the default spike likely lacks Zvt (riscv-isa-sim >= 72958551)." >&2
         fi
     fi
     python -m modelblaster.validation.spike_runner \

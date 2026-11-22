@@ -61,7 +61,7 @@ def _resolve_xpurt_root() -> Path:
     """Locate the XPU-RT checkout; see the same helper in
     `scripts/decision_loop.py` and `scripts/close_xpurt_loop.py`. Identified
     by `schedules/`, which is the directory this script resolves fixtures
-    against. Replaces a hardcoded /scratch2/<user>/XPU-RT.
+    against. Replaces a hardcoded absolute XPU-RT path.
     """
     env = os.environ.get("XPURT_ROOT")
     if env:
@@ -261,7 +261,7 @@ def _find_uartlog(stdout_log: Path, job_started_at: float) -> Path | None:
     """
     import re
     text = stdout_log.read_text(errors="replace") if stdout_log.is_file() else ""
-    results_root = Path("/scratch2/agustin/chipyard/sims/firesim/deploy/results-workload")
+    results_root = Path(os.environ.get("FIRESIM_ROOT", os.path.expandvars("$CHIPYARD_ROOT/sims/firesim"))) / "deploy/results-workload"
 
     m = re.search(r"firesim: reading per-run uartlog at (\S+)", text)
     if m:

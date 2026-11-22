@@ -1,7 +1,7 @@
 """DroNet model definition (PyTorch).
 
-Vendored from the top-level repo's qnn_models/dronet.py (itself copied from
-merlin/models/dronet/dronet.py with SMALL flag parameterized), so this
+Vendored from the top-level repo's qnn_models/dronet.py (the original DroNet
+with its SMALL flag parameterized), so this
 submodule doesn't depend on a specific parent-repo layout to find its own
 model architecture. Keep in sync if the upstream copy changes.
 """

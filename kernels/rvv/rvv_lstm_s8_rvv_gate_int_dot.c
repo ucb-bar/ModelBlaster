@@ -86,8 +86,8 @@
 
 /* Upper bound on hidden_size, so the h_prev snapshot is a fixed stack buffer
    rather than a VLA -- same bound and same reason as the reference. */
-#ifndef MERLIN_LSTM_MAX_HIDDEN
-#define MERLIN_LSTM_MAX_HIDDEN 1024
+#ifndef MB_LSTM_MAX_HIDDEN
+#define MB_LSTM_MAX_HIDDEN 1024
 #endif
 
 /* Exact int8 dot product.
@@ -170,8 +170,8 @@ void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
      * the WHOLE previous hidden vector while the loop below overwrites
      * h_state[t] as it goes. Dropping this makes the recurrence consume its
      * own output mid-step (the reference measured that at up to 12 LSB). */
-    int8_t h_prev[MERLIN_LSTM_MAX_HIDDEN];
-    if (H > MERLIN_LSTM_MAX_HIDDEN) {
+    int8_t h_prev[MB_LSTM_MAX_HIDDEN];
+    if (H > MB_LSTM_MAX_HIDDEN) {
         /* Refuse rather than silently truncate the state. */
         return;
     }

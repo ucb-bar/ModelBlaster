@@ -1,8 +1,0 @@
-backend,dispatch_id,name,op,shape,cycles
-scalar,0,mlp.0,linear,M=1;K=16;N=256,46329
-scalar,1,mlp.1,elu,n=256,25095
-scalar,2,mlp.2,linear,M=1;K=256;N=128,318415
-scalar,3,mlp.3,elu,n=128,15451
-scalar,4,mlp.4,linear,M=1;K=128;N=64,81598
-scalar,5,mlp.5,elu,n=64,6538
-scalar,6,mlp.6,linear,M=1;K=64;N=4,2554

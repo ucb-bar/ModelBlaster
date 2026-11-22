@@ -69,8 +69,8 @@ case "${RUNNER}" in
     firesim)
         echo "[microbench] firesim runworkload"
         # Use the same conda + sourceme prologue as firesim_runner.py.
-        FIRESIM_ROOT="${FIRESIM_ROOT:-/scratch2/dima/chipyard-fsim/sims/firesim}"
-        FIRESIM_ENV="${FIRESIM_ENV:-/scratch2/dima/chipyard-fsim/env.sh}"
+        FIRESIM_ROOT="${FIRESIM_ROOT:-${CHIPYARD_ROOT:?set CHIPYARD_ROOT or FIRESIM_ROOT}/sims/firesim}"
+        FIRESIM_ENV="${FIRESIM_ENV:-${CHIPYARD_ROOT:?set CHIPYARD_ROOT or FIRESIM_ENV}/env.sh}"
         FIRESIM_SLOT="${FIRESIM_SLOT:-firesim_rundir/sim_slot_0}"
         FIRESIM_TIMEOUT="${FIRESIM_TIMEOUT:-900}"
         # Coordination: politely wait if another FireSim run is active.

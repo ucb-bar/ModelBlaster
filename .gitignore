@@ -77,3 +77,5 @@ gen/profile_mb/
 
 # per-config spike libs (binary, regenerable)
 cores/gemmini/include/per_config/*/libgemmini.so
+# per-example Zephyr build trees
+examples/**/vbuild*/

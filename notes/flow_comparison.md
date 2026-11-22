@@ -330,9 +330,9 @@ sources makes `make` report "Nothing to be done" and reuse the
 bitstream-matching driver — no source/config change, survives reboot.
 
 **Correct run path = the shared job queue.** This is a shared single-FPGA host
-(`/scratch2/agustin/firesim_queue`, per-user fair share, daemon holds
+(`firesim-queue`, per-user fair share, daemon holds
 `fpga.lock`). Run via `firesim-queue runworkload-full --chipyard
-/scratch2/dima/chipyard-fsim --workload zephyr --stage-from <elf>` (see
+$CHIPYARD_ROOT --workload zephyr --stage-from <elf>` (see
 `scripts/firesim_submit.sh`). NEVER run raw `firesim infrasetup` outside the
 queue: doing so contended with the daemon and its FPGA-reprogram
 (`firesim-fpga-util.py --bitstream`) dropped the Alveo off PCIe, needing a

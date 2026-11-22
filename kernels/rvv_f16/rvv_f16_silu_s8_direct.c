@@ -79,9 +79,18 @@
 #include <zephyr/kernel.h>
 enum { MB_RVV_F16SILU_WS_SLOTS = CONFIG_MP_MAX_NUM_CPUS };
 #define MB_RVV_F16SILU_WS_SLOT ((int)arch_proc_id())
+#elif defined(__linux__) || defined(__APPLE__)
+/* Hosted: one workspace per THREAD. A hosted walker runs several worker and
+ * pool threads at once, and a shared slot races exactly as described above. */
+enum { MB_RVV_F16SILU_WS_SLOTS = 1 };
+#define MB_RVV_F16SILU_WS_SLOT 0
+#define MB_RVV_F16SILU_WS_TLS _Thread_local
 #else
 enum { MB_RVV_F16SILU_WS_SLOTS = 1 };
 #define MB_RVV_F16SILU_WS_SLOT 0
+#endif
+#ifndef MB_RVV_F16SILU_WS_TLS
+#define MB_RVV_F16SILU_WS_TLS
 #endif
 
 struct mb_rvvf16_silu_memo {
@@ -106,7 +115,7 @@ void kernel_silu_s8(const int8_t *input, int8_t *output, int n,
      * alternating the same op now each build their own table instead of
      * sharing one. Making that back into a shared cache would need real
      * synchronisation and is a separate, measurable change. */
-    static struct mb_rvvf16_silu_memo mb_rvvf16_silu_memo_all[MB_RVV_F16SILU_WS_SLOTS];
+    static MB_RVV_F16SILU_WS_TLS struct mb_rvvf16_silu_memo mb_rvvf16_silu_memo_all[MB_RVV_F16SILU_WS_SLOTS];
     struct mb_rvvf16_silu_memo *const mb_memo = &mb_rvvf16_silu_memo_all[MB_RVV_F16SILU_WS_SLOT];
     int8_t *const lut = mb_memo->lut;
 

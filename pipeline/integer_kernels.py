@@ -652,3 +652,23 @@ SPECS = [COPY_Q, REPEAT_Q, SLICE_C_Q, PERMUTE4_Q, LUT_S8, GAP_Q, MUL_C1_Q, ADD_Q
 for _s in SPECS:
     if _s.op not in rk.KERNEL_SPECS:
         rk.register_kernel_spec(_s)
+
+
+# `_bf16` names. reference_kernels derives a `_bf16` spec from every fp32-named spec (the CUDA bf16 path,
+# docs/bf16_cuda.md), but these kinds register after that pass and have names without `_s8`, so they would be the
+# only fp32-named kinds without one. They get the same derivation (_make_bf16_variant: float POINTERS become
+# __bf16, nothing else changes). For every kind here except vint_action_post_acc there is no float pointer, so the
+# `_bf16` spec is the integer kernel itself under the `_bf16` name: an identity, with the same integer codes and
+# numerics. vint_action_post_acc stores its float output as bf16. The int8 kinds above are not changed.
+def _bf16_name(spec):
+    b = rk._make_bf16_variant(spec)
+    note = ("integer-closed kind: no float storage, so this is the integer kernel unchanged under the _bf16 name. "
+            if "__bf16" not in b.signature else
+            "integer-closed kind: only the float output is stored as bf16; the integer inputs are unchanged. ")
+    b.semantics = "(bf16) " + note + spec.semantics
+    return b
+
+
+for _s in SPECS:
+    if "_s8" not in _s.op and _s.op + "_bf16" not in rk.KERNEL_SPECS:
+        rk.register_kernel_spec(_bf16_name(rk.KERNEL_SPECS[_s.op]))

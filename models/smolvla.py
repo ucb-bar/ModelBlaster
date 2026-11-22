@@ -6,10 +6,9 @@ cache). Two upstream packages are consumed off-tree:
 
 * ``Understanding-PI0`` at ``PI0_ROOT`` / ``UNDERSTANDING_PI0_ROOT``,
   shipping the SmolVLA loader + the no-cache wrapper.
-* ``lerobot`` at ``LEROBOT_ROOT`` (the canonical clone is the merlin
-  sibling checkout at ``$MERLIN_DIR/third_party/lerobot``, default
-  ``../merlin/third_party/lerobot``), shipping the ``SmolVLAPolicy``
-  class and constant names.
+* ``lerobot`` at ``LEROBOT_ROOT`` (default: a sibling checkout at
+  ``../lerobot``), shipping the ``SmolVLAPolicy`` class and constant
+  names.
 
 Both are pulled in via ``sys.path`` injection rather than as pip
 dependencies; the upstream pyproject deps would force diffusers /
@@ -62,12 +61,12 @@ _DEFAULT_PROMPT_LEN = 8
 _DEFAULT_IMAGE_HW = (256, 256)
 _DEFAULT_DEVICE = "cpu"
 
-# Canonical sibling clones on this dev box. Used as fallbacks when the
+# Sibling checkouts next to this repo. Used as fallbacks when the
 # corresponding *_ROOT env vars are not set. Both are real upstream
 # checkouts, not vendored copies.
-_MERLIN_ROOT = Path(os.environ.get("MERLIN_DIR", str(Path(__file__).resolve().parents[2] / "merlin")))
-_FALLBACK_PI0_ROOT = _MERLIN_ROOT / "third_party" / "Understanding-PI0"
-_FALLBACK_LEROBOT_ROOT = _MERLIN_ROOT / "third_party" / "lerobot"
+_SIBLINGS = Path(__file__).resolve().parents[2]
+_FALLBACK_PI0_ROOT = _SIBLINGS / "Understanding-PI0"
+_FALLBACK_LEROBOT_ROOT = _SIBLINGS / "lerobot"
 _FALLBACK_HF_HOME = Path.home() / ".cache" / "huggingface"
 
 

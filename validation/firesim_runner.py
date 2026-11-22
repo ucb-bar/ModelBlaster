@@ -8,8 +8,8 @@ FireSim sim-slot, run `firesim runworkload`, and tail the uartlog until
 the OUTPUT_END marker(s) we expect arrive (or a timeout fires).
 
 Pre-conditions (one-time per session, same as the manual flow):
-    cd /scratch2/dima/chipyard-fsim/sims/firesim
-    source /scratch2/dima/chipyard-fsim/env.sh
+    cd $CHIPYARD_ROOT/sims/firesim
+    source $CHIPYARD_ROOT/env.sh
     source ./sourceme-manager.sh --skip-ssh-setup
     firesim infrasetup       # only when the FPGA bitstream is stale
 
@@ -44,20 +44,20 @@ from modelblaster.validation.runner_common import (
 )
 
 
-# Defaults match the user's fixed FireSim install layout. All overridable
-# via env vars / CLI flags so the runner stays portable.
+# Defaults follow the Chipyard layout under $CHIPYARD_ROOT. All overridable
+# via env vars / CLI flags.
 DEFAULT_FIRESIM_ROOT = os.environ.get(
-    "FIRESIM_ROOT", "/scratch2/dima/chipyard-fsim/sims/firesim")
+    "FIRESIM_ROOT", os.path.expandvars("$CHIPYARD_ROOT/sims/firesim"))
 DEFAULT_FIRESIM_ENV = os.environ.get(
-    "FIRESIM_ENV", "/scratch2/dima/chipyard-fsim/env.sh")
+    "FIRESIM_ENV", os.path.expandvars("$CHIPYARD_ROOT/env.sh"))
 DEFAULT_FIRESIM_SLOT = os.environ.get(
     "FIRESIM_SLOT", "firesim_rundir/sim_slot_0")
 # config_runtime.yaml's recipe_arg_overrides::default_simulation_dir
 # decides where the simulator actually runs (it copies the staged binary
 # into <default_simulation_dir>/sim_slot_<N>/, writes uartlog there, etc.).
 # When unset / commented out, it defaults to firesim_rundir/sim_slot_<N>
-# under the firesim install. On this host it's overridden to
-# /scratch2/agustin/FIRESIM_RUNS_DIR. We read it dynamically rather than
+# under the firesim install. An install may override it; we read it
+# dynamically rather than
 # hard-coding so the integration follows whatever the user has wired up.
 DEFAULT_FIRESIM_SIM_DIR_ENV = "FIRESIM_SIM_DIR"
 
@@ -100,7 +100,7 @@ def _firesim_paths(root: str, slot: str) -> dict:
     """Return all paths the runner cares about.
 
     `root` is the firesim install root (e.g.
-    `/scratch2/agustin/chipyard/sims/firesim`). `slot` is the trailing
+    `$CHIPYARD_ROOT/sims/firesim`). `slot` is the trailing
     sim_slot path relative to the actual simulation dir
     (which comes from config_runtime.yaml::default_simulation_dir).
 
@@ -160,7 +160,6 @@ def _firesim_cmd(firesim_env: str, firesim_root: str, sub_cmd: str) -> list[str]
         # Defensively make sure conda itself is still callable (the
         # parent env's bin is likely first; condabin contains the
         # `conda` shim that env.sh's `type conda` test relies on).
-        f"export PATH=/scratch2/dima/miniforge3/condabin:$PATH; "
         f"source {firesim_env}; "
         f"cd {firesim_root}; "
         f"source ./sourceme-manager.sh --skip-ssh-setup; "
@@ -316,8 +315,7 @@ def _firesim_infrasetup(firesim_env: str, firesim_root: str,
 
 
 FIRESIM_QUEUE_BIN = os.environ.get(
-    "FIRESIM_QUEUE_BIN",
-    "/scratch2/agustin/firesim_queue/bin/firesim-queue")
+    "FIRESIM_QUEUE_BIN", "firesim-queue")
 
 
 def _use_firesim_queue() -> bool:

@@ -25,7 +25,8 @@ JSON schema (informal):
           "isa": "<isa string>",          // optional, for documentation
           "harts": [<int>...],            // hart ids this core covers
           "capabilities": ["<op>", ...],   // op kinds the core can execute
-          "capabilities_ref": "<core-name>" // optional alias to share with another core
+          "capabilities_ref": "<core-name>", // optional alias to share with another core
+          "backend": "<backend>"          // optional: codegen backend this core runs
         },
         ...
       ]
@@ -59,6 +60,14 @@ class Core:
     capabilities: tuple[str, ...]
     isa: str = ""
     description: str = ""
+    # Codegen backend this core's kind executes (e.g. K3: x100 -> rvv_k3,
+    # a100 -> rvv_k3_a100). "" = the registry does not say (older registries);
+    # callers then fall back to their board default.
+    backend: str = ""
+    # Implementations this core can run, when it has a choice (K3: x100 runs
+    # rvv; a100 runs rvv or ime). Empty = the registry does not say, and
+    # nothing is checked. Ingest refuses a schedule that picks one not listed.
+    impls: tuple[str, ...] = ()
 
 
 @dataclass
@@ -72,6 +81,15 @@ class CoreRegistry:
     # the work.
     by_name: dict[str, Core] = field(default_factory=dict)
     by_kind: dict[str, tuple[Core, ...]] = field(default_factory=dict)
+    # Harts whose threads must register with the kernel as "AI" threads (K3
+    # A100 cores, via /proc/set_ai_thread). Empty for every registry that has
+    # no such requirement, so existing boards are unaffected.
+    ai_thread_cpus: tuple[int, ...] = ()
+
+    def ai_cpus_str(self) -> str:
+        """`ai_thread_cpus` as a compact cpulist ("8-15", "0,2,8-9"); empty
+        string when none. This is the spelling make/cmake take."""
+        return compact_cpulist(self.ai_thread_cpus)
 
     def kinds(self) -> set[str]:
         return set(self.by_kind.keys())
@@ -96,6 +114,20 @@ class CoreRegistry:
             return tuple(c for c in self.by_kind[hardware_target]
                          if op in c.capabilities)
         return ()
+
+
+def compact_cpulist(cpus: Iterable[int]) -> str:
+    """[8,9,10,11] -> "8-11"; [0,2,3] -> "0,2-3"; [] -> ""."""
+    xs = sorted(set(int(c) for c in cpus))
+    out: list[str] = []
+    i = 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+            j += 1
+        out.append(str(xs[i]) if j == i else f"{xs[i]}-{xs[j]}")
+        i = j + 1
+    return ",".join(out)
 
 
 def load(path: str) -> CoreRegistry:
@@ -143,7 +175,25 @@ def load(path: str) -> CoreRegistry:
             capabilities=tuple(caps),
             isa=entry.get("isa", ""),
             description=entry.get("description", ""),
+            backend=entry.get("backend", ""),
+            impls=tuple(entry.get("impls", ())),
         ))
+
+    ai_cpus = doc.get("ai_thread_cpus", [])
+    if not isinstance(ai_cpus, list) or not all(isinstance(c, int) for c in ai_cpus):
+        raise ValueError(f"{path}: 'ai_thread_cpus' must be a list of ints")
+    all_harts = {h for c in cores for h in c.harts}
+    stray = [c for c in ai_cpus if c not in all_harts]
+    if stray:
+        raise ValueError(
+            f"{path}: ai_thread_cpus {stray} are not harts of any core")
+
+    for kind in {c.kind for c in cores}:
+        bs = {c.backend for c in cores if c.kind == kind}
+        if len(bs) > 1:
+            raise ValueError(
+                f"{path}: cores of kind {kind!r} declare different backends "
+                f"{sorted(bs)}; a kind is one placement pool with one backend")
 
     by_name = {c.name: c for c in cores}
     by_kind: dict[str, list[Core]] = {}
@@ -157,6 +207,7 @@ def load(path: str) -> CoreRegistry:
         cores=tuple(cores),
         by_name=by_name,
         by_kind={k: tuple(v) for k, v in by_kind.items()},
+        ai_thread_cpus=tuple(ai_cpus),
     )
 
 
@@ -194,11 +245,17 @@ def _main() -> None:
     ap = argparse.ArgumentParser(
         description="Inspect / validate an modelblaster/cores/*.json registry")
     ap.add_argument("registry", help="path to a registry JSON")
+    ap.add_argument("--ai-cpus", action="store_true",
+                    help="print ONLY ai_thread_cpus as a compact cpulist "
+                         "(e.g. 8-15; empty line if none) for shell scripts")
     ap.add_argument("--ir", default=None,
                     help="optional graph.json — checks every dispatch's "
                          "hardware_target is realisable on this registry")
     args = ap.parse_args()
     reg = load(args.registry)
+    if args.ai_cpus:
+        print(reg.ai_cpus_str())
+        return
     print(f"system: {reg.system}")
     print(f"  default_dispatch_target: {reg.default_dispatch_target}")
     print(f"  {len(reg.cores)} cores in {len(reg.kinds())} kinds: "

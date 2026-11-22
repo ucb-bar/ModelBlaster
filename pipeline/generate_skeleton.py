@@ -146,6 +146,39 @@ def _prod(shape: list[int]) -> int:
     return n
 
 
+def _index_buffers_by_set(c_src: str, mid: str) -> str:
+    """Make every dispatch function use buffer copy `s->buf_set`.
+
+    Buffers are declared `buf_<mid>_x[MB_N_BUF_SETS][n]`; inside a dispatch
+    function each reference `buf_<mid>_x` becomes `buf_<mid>_x[s->buf_set]`,
+    which has the old type and size (so `+ off`, `&` and `sizeof` keep their
+    meaning). Outside the dispatch functions only the extern declarations may
+    name a buffer; anything else would silently keep using set 0, so it is an
+    error.
+    """
+    ref = re.compile(r"\b(buf_" + re.escape(mid) + r"_[A-Za-z0-9_]+)\b(?!\s*\[s->buf_set\])")
+    start = re.compile(r"^static void dispatch_" + re.escape(mid) + r"_\d+\(model_"
+                       + re.escape(mid) + r"_state_t \*s\)")
+    out, inside, stray = [], False, []
+    for line in c_src.split("\n"):
+        if not inside and start.match(line):
+            inside = True
+        if inside:
+            out.append(ref.sub(r"\1[s->buf_set]", line))
+            if line == "}":
+                inside = False
+            continue
+        code = line.split("//")[0]
+        if (ref.search(code) and not code.lstrip().startswith(("extern ", "*", "/*"))):
+            stray.append(line)
+        out.append(line)
+    if stray:
+        raise RuntimeError(
+            f"generate_skeleton: buffer references outside a dispatch function "
+            f"cannot select a buffer set: {stray[:3]}")
+    return "\n".join(out)
+
+
 def _buf_name(mid: str, tensor: str) -> str:
     """Intermediate-buffer symbol name. Mangled with the model id so
     multiple models can have a `buf_x` and still link without collision
@@ -264,6 +297,34 @@ def _n_tile_operands(op, sh, w, b):
     if b != "NULL":
         b = f"({b} + {off_n})"
     return w, b
+#: Ops whose call is derived from KernelSpec.signature by kernel_abi.bind
+#: rather than a hand-written branch below (see reference_kernels_ext).
+_GENERIC_ABI_OPS = {"strided_copy", "gather", "catn", "ewise1", "ewise2",
+                    "ewise_scalar", "reduce", "softmax_dim", "conv2d_grouped",
+                    "maxpool2d_ex", "lstm_seq", "gru_seq", "index_select",
+                    "gather_dim", "scatter_dim", "topk", "convnd", "strided_scatter",
+                    "bmm_strided", "attention"}
+
+
+def _generic_call(op: dict, ptr_for, model_name: str, backend) -> str:
+    from modelblaster.pipeline.kernel_abi import bind, parse_signature
+    from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    fn, params = parse_signature(KERNEL_SPECS[op["op"]].signature)
+    parts = []
+    for a in bind(op, params):
+        if a.kind == "out":
+            parts.append(ptr_for(a.value, "out"))
+        elif a.kind == "in":
+            parts.append(ptr_for(a.value, "in"))
+        elif a.kind == "weight":
+            parts.append(_weight_name(model_name, a.value, backend))
+        elif a.kind == "null":
+            parts.append("NULL")
+        elif a.param.base_type == "float":
+            parts.append(_f32(a.value))
+        else:
+            parts.append(str(int(a.value)))
+    return f"{fn}({', '.join(parts)})"
 
 # fp16 ops that have a bespoke `_f16` skeleton branch (some with different args,
 # e.g. softmax_f16's input_scale). These route to their own branch unchanged.
@@ -937,6 +998,85 @@ static inline void parallel_conv2d_s8_sharded(
 """
 
 
+def _conv2d_s8_ihwoc_wrapper() -> str:
+    """`_CONV2D_S8_WRAPPER` for a backend that packs conv weights IHWOC.
+
+    IHWOC is (IC, KH, KW, OC), so an OC slice is strided. The wrapper keeps one
+    repacked copy of each weight tensor per pool size T, laid out so that chunk
+    c's slice [oc0, oc1) is contiguous at `per_filter * oc0` with row stride
+    oc1 - oc0 -- the offset the OIHW wrapper already uses, and the layout an
+    IHWOC kernel expects when it is handed OC = oc1 - oc0. Each output channel
+    is computed independently, so the result is bit-exact with the serial call.
+    The copy is built on first use and kept for the run. Hosted POSIX builds
+    only (it allocates); elsewhere the call stays serial, as before.
+    """
+    t = _CONV2D_S8_WRAPPER
+    helper = """
+#if defined(MODELBLASTER_USE_POOL) && defined(MB_PLATFORM_POSIX)
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#define MB_IHWOC_CACHE_MAX 256
+static struct {{ const int8_t *w; int T; int8_t *packed; }} mb_ihwoc_cache_{mid}[MB_IHWOC_CACHE_MAX];
+static int mb_ihwoc_n_{mid};
+static pthread_mutex_t mb_ihwoc_lock_{mid} = PTHREAD_MUTEX_INITIALIZER;
+
+/* IHWOC weights repacked into T contiguous OC chunks (see the wrapper below).
+ * NULL if the cache is full or malloc fails: the caller then runs serially. */
+static const int8_t *mb_ihwoc_shards_{mid}(const int8_t *w, size_t per_filter,
+                                           int OC, int T) {{
+    int8_t *p = NULL;
+    pthread_mutex_lock(&mb_ihwoc_lock_{mid});
+    for (int i = 0; i < mb_ihwoc_n_{mid}; i++) {{
+        if (mb_ihwoc_cache_{mid}[i].w == w && mb_ihwoc_cache_{mid}[i].T == T) {{
+            p = mb_ihwoc_cache_{mid}[i].packed;
+            pthread_mutex_unlock(&mb_ihwoc_lock_{mid});
+            return p;
+        }}
+    }}
+    if (mb_ihwoc_n_{mid} < MB_IHWOC_CACHE_MAX
+            && (p = (int8_t *)malloc(per_filter * (size_t)OC)) != NULL) {{
+        int oc_per = (OC + T - 1) / T;
+        for (int oc0 = 0; oc0 < OC; oc0 += oc_per) {{
+            int ocn = (OC - oc0 < oc_per) ? OC - oc0 : oc_per;
+            int8_t *dst = p + per_filter * (size_t)oc0;
+            for (size_t f = 0; f < per_filter; f++)
+                memcpy(dst + f * (size_t)ocn, w + f * (size_t)OC + oc0, (size_t)ocn);
+        }}
+        mb_ihwoc_cache_{mid}[mb_ihwoc_n_{mid}].w = w;
+        mb_ihwoc_cache_{mid}[mb_ihwoc_n_{mid}].T = T;
+        mb_ihwoc_cache_{mid}[mb_ihwoc_n_{mid}].packed = p;
+        mb_ihwoc_n_{mid}++;
+    }}
+    pthread_mutex_unlock(&mb_ihwoc_lock_{mid});
+    return p;
+}}
+#endif
+"""
+    marker = "/* MB_SHARD_MACHINERY_END */"
+    assert t.count(marker) == 1
+    t = t.replace(marker, helper + marker)
+    guard = "#ifdef MODELBLASTER_USE_POOL\n    modelblaster_pool_t pool"
+    assert t.count(guard) == 1
+    t = t.replace(guard, "#if defined(MODELBLASTER_USE_POOL) && defined(MB_PLATFORM_POSIX)\n"
+                         "    modelblaster_pool_t pool")
+    ctx = "    parallel_conv2d_s8_ctx_t ctx = {{\n        .in = in, .w = w,"
+    assert t.count(ctx) == 1
+    t = t.replace(ctx, """    const int8_t *wpk = mb_ihwoc_shards_{mid}(
+        w, (size_t)IC * (size_t)KH * (size_t)KW, OC, (int)T);
+    if (wpk == NULL) {{
+        kernel_conv2d_s8_{mid}(in, w, b, out, N, IC, IH, IW,
+                               OC, KH, KW, SH, SW, PH, PW,
+                               input_offset, filter_offset, output_offset,
+                               output_multiplier, output_shift,
+                               activation_min, activation_max);
+        return;
+    }}
+    parallel_conv2d_s8_ctx_t ctx = {{
+        .in = in, .w = wpk,""")
+    return t
+
+
 _PARALLEL_WRAPPER_TEMPLATES = {
     "linear":    _LINEAR_WRAPPER,
     "conv2d":    _CONV2D_WRAPPER,
@@ -1007,6 +1147,10 @@ def _emit_parallel_wrappers(mid: str, used_ops: set[str],
         # wrapper below is compiled out.
         parts.append(_CONV2D_S8_SHARD_WRAPPER.format(mid=mid))
     for op in sorted(_PARALLELIZED_OPS & used_ops):
+        if layout == "ihwoc" and op == "conv2d_s8":
+            # Strided OC slice: shard on a repacked copy of the weights.
+            parts.append(_conv2d_s8_ihwoc_wrapper().format(mid=mid))
+            continue
         if not oc_slice_is_contiguous and op in _OC_WEIGHT_SLICING_OPS:
             parts.append(
                 f"\n/* parallel_{op}: NO pool path on this backend.\n"
@@ -2150,8 +2294,10 @@ def emit_weights(
     for k in keys:
         ident = _weight_name(model_name, k, backend)
         arr_in = weights[k]
-        arr_out, layout_tag = _backend_pack_weight(
-            arr_in, backend, owners.get(k), ir_known=bool(owners))
+        arr_out, layout_tag = ((arr_in, None) if k.startswith("const.")
+                               else _backend_pack_weight(
+                                   arr_in, backend, owners.get(k),
+                                   ir_known=bool(owners)))
         c_type, _ = _np_to_c_dtype(arr_out.dtype)
         if layout_tag:
             c_lines.append(
@@ -2328,9 +2474,27 @@ def _lstm_state_keys(op: dict[str, Any]) -> tuple[str, str]:
     return st[0], st[1]
 
 
+def refuse_unsupported_quant(ir: dict[str, Any]) -> None:
+    """bf16 IRs are CUDA-only (docs/bf16_cuda.md): the host / Zephyr C codegen
+    has no `__bf16` path (RISC-V GCC has no bfloat16 arithmetic before
+    Zfbfmin), so refuse rather than emit float code for bf16 buffers. So are
+    mixed IRs (--quant native, docs/tensor_dtypes.md)."""
+    if ir.get("quant") == "native":
+        raise SystemExit(
+            f"{ir.get('name', 'IR')}: quant=native (per-tensor dtypes, docs/tensor_dtypes.md) is "
+            "supported on the CUDA path only (gpu_eval walkers, kb_export); the C/RVV codegen "
+            "has one storage dtype per IR. Re-extract with --quant fp32 or fp16 for this target.")
+    if ir.get("quant") == "bf16":
+        raise SystemExit(
+            f"{ir.get('name', 'IR')}: quant=bf16 is supported on the CUDA path only "
+            "(gpu_eval walkers, kb_export); the C/RVV codegen handles fp32, fp16 and "
+            "int8. Re-extract with --quant fp16 or fp32 for this target.")
+
+
 def emit_model(ir: dict[str, Any], out_dir: str,
                platform: str = "zephyr",
                backend: Optional[str] = None) -> None:
+    refuse_unsupported_quant(ir)
     # `backend` reaches the codegen for exactly one reason: the conv weight
     # LAYOUT is a per-backend codegen decision (_backend_pack_weight), and a
     # split conv's tile pointers depend on it. Without it here, the conv2d_s8
@@ -2467,9 +2631,14 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             name = aliases[name]
         return name
     for op in ir["ops"]:
-        if op["op"] == "view" or op.get("elided"):
-            # An elided relayout (assign_layouts --elide-relayouts) is a
-            # dispatch with no body whose output is its input's buffer.
+        if op["op"] == "view" and op.get("offset"):
+            # Contiguous window into the input (slice / split / select of the
+            # leading dims): a pointer offset, no copy.
+            offset_aliases[op["outputs"][0]] = (op["inputs"][0], int(op["offset"]))
+        elif op["op"] == "view" or op.get("elided"):
+            # A plain view, or an elided relayout (assign_layouts
+            # --elide-relayouts): a dispatch with no body whose output is its
+            # input's buffer.
             aliases[op["outputs"][0]] = op["inputs"][0]
         elif op["op"] in ("chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"):
             # Two outputs: first half at offset 0, second half at offset
@@ -2664,7 +2833,14 @@ typedef struct {{
 {input_state_fields}
     model_{mid}_output_t      *output;
     void                       *pool;
+    /* Which copy of the intermediate buffers this dispatch uses
+     * (0 .. model_{mid}_n_buf_sets-1). Zero-initialised callers get set 0. */
+    int                         buf_set;
 }} model_{mid}_state_t;
+
+/* Number of intermediate-buffer copies this model was built with
+ * (MB_N_BUF_SETS when buffers.c was compiled). */
+extern const int model_{mid}_n_buf_sets;
 
 typedef void (*model_{mid}_dispatch_fn)(model_{mid}_state_t *);
 
@@ -2744,6 +2920,7 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         t for t in tensors
         if t not in input_names_set and t not in out_tensor_set
         and t not in aliases and t not in offset_aliases
+        and not tensors[t].get("const")
     ]
     buf_defs: list[str] = []   # for buffers.c (definitions, no `static`)
     buf_externs: list[str] = []  # for model.c (declarations)
@@ -2770,8 +2947,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
     for t in intermediates:
         size = _prod(tensors[t]["shape"])
         c_type = _dtype_to_c(tensors[t]["dtype"])
-        buf_defs.append(f"{c_type} {_buf_name(mid, t)}[{size}]{_buf_align};")
-        buf_externs.append(f"extern {c_type} {_buf_name(mid, t)}[{size}];")
+        buf_defs.append(f"{c_type} {_buf_name(mid, t)}[MB_N_BUF_SETS][{size}]{_buf_align};")
+        buf_externs.append(f"extern {c_type} {_buf_name(mid, t)}[MB_N_BUF_SETS][{size}];")
     # OH row-tile scratch: the pre-padded input window and the tile's own
     # output band, one pair per tile. They live in buffers.c with the
     # intermediates (defined once per MODEL, not per backend) so a
@@ -2781,8 +2958,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         g = oh_plan[did]
         for which, n in (("in", g["ws_in_elems"]), ("out", g["ws_out_elems"])):
             nm = _oh_ws_name(mid, did, which)
-            buf_defs.append(f"int8_t {nm}[{n}];")
-            buf_externs.append(f"extern int8_t {nm}[{n}];")
+            buf_defs.append(f"int8_t {nm}[MB_N_BUF_SETS][{n}];")
+            buf_externs.append(f"extern int8_t {nm}[MB_N_BUF_SETS][{n}];")
 
     # Set per-op by the activation-layout shim below: while a shimmed call is
     # being emitted, the kernel must see the SCRATCH copies, not the tensors
@@ -2796,6 +2973,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         tensor = resolve_alias(tensor)
         if tensor in _shim_override:
             return _shim_override[tensor]
+        if tensors.get(tensor, {}).get("const"):
+            # Folded constant (get_attr / parameter-only subgraph): lives in
+            # weights.c under its weights.npz key.
+            return _weight_name(model_name, tensors[tensor]["const"], backend)
         if tensor in offset_aliases:
             base, off = offset_aliases[tensor]
             base_ptr = ptr_for(base, role)
@@ -4506,21 +4687,13 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             w, b, _ = _oc_tile_operands(op, sh, tile_w_plan, model_name, w, b,
                                         backend=backend)
             call = (
-                # No dilation args: kernel_conv2d_f16 takes 15 parameters in
-                # BOTH lineages -- reference_kernels' CONV2D_F16 spec and the
-                # curated rvv_f16 kernels, ours and origin/main's alike, all
-                # stop at PW. origin/main's skeleton appends DH/DW anyway,
-                # which no spec or kernel in either tree accepts; it is latent
-                # there and became a hard build error here ("too many arguments
-                # to function 'kernel_conv2d_f16_vint_rvv_f16'") the first time
-                # a f16 model was rebuilt after the merge. Every conv2d_f16 and
-                # depthwise_conv2d_f16 op in this tree is DH=DW=1, so nothing
-                # needs the arguments; add them to the SPEC and the kernels
-                # first if dilated f16 conv is ever wanted.
+                # Dilation is part of the conv2d_f16 contract: the spec, the
+                # reference and both curated rvv_f16 kernels take DH, DW.
                 f"kernel_conv2d_f16({in_ptr}, {w}, {b}, {out_ptr}, "
                 f"{sh['N']}, {sh['IC']}, {sh['IH']}, {sh['IW']}, "
                 f"{sh['OC']}, {sh['KH']}, {sh['KW']}, "
-                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']})"
+                f"{sh['SH']}, {sh['SW']}, {sh['PH']}, {sh['PW']}, "
+                f"{sh.get('DH', 1)}, {sh.get('DW', 1)})"
             )
         # ---- Mixed-precision cast kernels ----
         elif op["op"] == "cast_i8_to_f16":
@@ -4627,7 +4800,9 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             call = (
                 f"kernel_adaptive_avg_pool2d_f16({in_ptr}, {out_ptr}, "
                 f"{sh['N']}, {sh['C']}, {sh['IH']}, {sh['IW']}, "
-                f"{sh['OH']}, {sh['OW']})"
+                # the IR's adaptive_avg_pool2d is the global pool and carries
+                # no OH/OW (a bench-file fp16 extract raised KeyError here)
+                f"{sh.get('OH', 1)}, {sh.get('OW', 1)})"
             )
         elif op["op"] == "slice_c_f16":
             in_ptr = ptr_for(op["inputs"][0], "in")
@@ -4724,6 +4899,8 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_{op['op']}({a_ptr}, {b_ptr}, {out_ptr}, "
                 f"{sh['batch']}, {sh['M']}, {sh['K']}, {sh['N']})"
             )
+        elif op["op"] in _GENERIC_ABI_OPS:
+            call = _generic_call(op, ptr_for, model_name, backend)
         else:
             # An op kind with no built-in arm: its KernelSpec may say how to
             # call it (reference_kernels.KernelSpec.emit_call; extensions).
@@ -5011,7 +5188,11 @@ static inline unsigned long long mb_wall_ticks(void)
     else:
         timer_preamble = """#include <stddef.h>
 #include <stdint.h>
+#ifdef MB_PLATFORM_POSIX
+#include "mb_posix.h"        /* hosted Linux: k_cycle_get_64() in ns */
+#else
 #include <zephyr/kernel.h>   /* for k_cycle_get_64() \u2014 static inline in this header */
+#endif
 #include "model.h"
 #include "kernels.h"
 #include "weights.h"
@@ -5023,10 +5204,12 @@ static inline unsigned long long mb_wall_ticks(void)
  * with the HOST compiler -- `rdcycle` is not an x86 instruction and the
  * assembler rejects it, which is the whole native_sim path failing on the
  * first timed dispatch. The RISC-V branch is unchanged, so every board
- * build still emits a byte-identical mcycle read. */
+ * build still emits a byte-identical mcycle read. MB_PLATFORM_POSIX (hosted
+ * Linux, runtime/mb_posix.h) takes the k_cycle_get_64 path too: user-mode
+ * rdcycle traps there, and k_cycle_get_64 is the monotonic clock in ns. */
 static inline unsigned long rdcycle(void)
 {
-#if defined(__riscv)
+#if defined(__riscv) && !defined(MB_PLATFORM_POSIX)
     unsigned long cc;
     __asm__ volatile("rdcycle %0" : "=r"(cc));
     return cc;
@@ -5058,7 +5241,15 @@ static inline unsigned long long mb_wall_ticks(void)
  * model.c TUs (rvv + scalar) share the same scratch — otherwise each
  * backend's file-static buf_* would shadow the other and cross-backend
  * dispatches would read zeroed scratch. Names are mangled with the
- * model id (buf_<mid>_*) so different models don't collide at link. */
+ * model id (buf_<mid>_*) so different models don't collide at link.
+ *
+ * Each buffer has MB_N_BUF_SETS copies and a dispatch uses copy
+ * s->buf_set, so a schedule runner can give overlapping instances of one
+ * network their own scratch (build with -DMB_N_BUF_SETS=<instances>). The
+ * default is one copy and buf_set 0, i.e. one shared set as before. */
+#ifndef MB_N_BUF_SETS
+#define MB_N_BUF_SETS 1
+#endif
 {chr(10).join(buf_externs)}
 
 /* File-static — invisible across TUs, no need to mangle. Locals to this .c. */
@@ -5121,6 +5312,7 @@ unsigned long model_{mid}_wall_cycles(void) {{
         c = c.rstrip("\n") + (
             f"\n\nvoid model_{mid}_init(void) {{\n"
             + "".join(f"    {x}\n" for x in model_init_calls) + "}\n")
+    c = _index_buffers_by_set(c, mid)
     with open(os.path.join(out_dir, "model.c"), "w") as f:
         f.write(c)
 
@@ -5140,8 +5332,23 @@ unsigned long model_{mid}_wall_cycles(void) {{
  */
 
 #include <stdint.h>
+#include <string.h>
+
+/* MB_N_BUF_SETS copies of every buffer (see model.c); one by default. */
+#ifndef MB_N_BUF_SETS
+#define MB_N_BUF_SETS 1
+#endif
+const int model_{mid}_n_buf_sets = MB_N_BUF_SETS;
 
 {chr(10).join(buf_defs)}
+
+/* Restore every intermediate buffer to its initial (.bss == all-zero) state.
+ * Used by the schedule runner's warm-up pass to undo the warm-up's writes,
+ * including the recurrent h/c state of stateful networks (lstm), which lives
+ * in these buffers. */
+void model_{mid}_zero_buffers(void) {{
+{chr(10).join(f"    memset({_buf_name(mid, t)}, 0, sizeof({_buf_name(mid, t)}));" for t in intermediates)}
+}}
 """
     with open(os.path.join(out_dir, "buffers.c"), "w") as f:
         f.write(buf_c)
@@ -5157,7 +5364,7 @@ unsigned long model_{mid}_wall_cycles(void) {{
     # curated kernel silently fell back to reference_impl.
     _fp_bytes = 0
     for _d in buf_defs:
-        _m = re.match(r"\s*(\S+)\s+\S+\[(\d+)\]", _d)
+        _m = re.match(r"\s*(\S+)\s+\S+?(?:\[MB_N_BUF_SETS\])?\[(\d+)\]", _d)
         if _m:
             _fp_bytes += int(_m.group(2)) * _C_TYPE_BYTES.get(_m.group(1), 1)
     with open(os.path.join(out_dir, "footprint.json"), "w") as f:
@@ -5375,6 +5582,7 @@ def generate(
     os.makedirs(out_dir, exist_ok=True)
     with open(ir_path) as f:
         ir = json.load(f)
+    refuse_unsupported_quant(ir)
     if layer_golden:
         print(f"layer golden: {attach_layer_golden(ir, layer_golden)} tensors checked")
     weights = dict(np.load(weights_path))

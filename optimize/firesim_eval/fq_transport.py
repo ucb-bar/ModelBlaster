@@ -3,7 +3,7 @@
 Why this exists
 ---------------
 `modelblaster.validation.firesim_runner` drives a *local* FireSim install
-(`FIRESIM_ROOT`, default `/scratch2/dima/chipyard-fsim`). On this host that
+(`FIRESIM_ROOT`, default `$CHIPYARD_ROOT/sims/firesim`). On a lab host that
 install is wired to `externally_provisioned` + `localhost` +
 XilinxAlveoU250InstanceDeployManager -- i.e. garden's single local U250.
 Using it for kernel re-ranking (a) serialises every candidate behind one

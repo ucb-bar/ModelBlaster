@@ -1,1 +1,0 @@
-../gemmini/gemmini_conv2d_s8_gemmini_im2col_full_C.c

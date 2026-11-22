@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 OUT=artifacts/bundle/walkthrough
 mkdir -p "${OUT}"
 
-XPURT=/scratch2/agustin/XPU-RT
+XPURT="${XPURT_ROOT:-$(pwd)/../XPU-RT}"
 
 python3 scripts/render_annotated_gantt.py \
   --fixture "${XPURT}/schedules/scheduled__iter_baseline_decomposed_profiled.json" \

@@ -345,8 +345,8 @@ def _elu_argtypes():
 def _conv2d_argtypes():
     import ctypes
     fp = ctypes.POINTER(ctypes.c_float)
-    # input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW
-    return [fp, fp, fp, fp] + [ctypes.c_int] * 11
+    # input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW, DH, DW
+    return [fp, fp, fp, fp] + [ctypes.c_int] * 13
 
 
 def _maxpool2d_argtypes():
@@ -545,7 +545,7 @@ def _sigmoid_f16_argtypes():
 def _conv2d_f16_argtypes():
     import ctypes
     h = ctypes.POINTER(ctypes.c_uint16)
-    return [h, h, h, h] + [ctypes.c_int] * 11
+    return [h, h, h, h] + [ctypes.c_int] * 13
 
 
 def _maxpool2d_f16_argtypes():
@@ -640,6 +640,29 @@ void kernel_linear(const float *input, const float *weight, const float *bias,
         {"M": 1, "K": 7, "N": 13},      # primes, no padding alignment
         {"M": 4, "K": 17, "N": 23},     # batch > 1
         {"M": 1, "K": 64, "N": 64},     # power-of-two
+    ],
+    algorithms=[
+        AlgorithmCandidate(
+            name="zvt_tile_f32",
+            target_affinity=("zvt",),
+            # Bit-exact only against a reference built WITHOUT FMA
+            # contraction (vtfmm rounds the multiply and the add
+            # separately); vs a contracted (fmadd) build it drifts by
+            # rounding. Hence numeric_drift.
+            accuracy_class=AccuracyClass.NUMERIC_DRIFT,
+            description=(
+                "Zvt fp32 LINEAR via vtfmm.tvv (mtype widen=1, tk=1, vtype "
+                "e32): a rank-1 tile update acc[m][n] += A[m]*B[n] per k, "
+                "multiply and add separately rounded, in k order. A = input "
+                "column k (vlse32, stride 4K bytes) in v0, B = weight column "
+                "k in v8. The accumulator tile is seeded with the bias row "
+                "(vtle32 per tile row) so the add order matches the "
+                "reference, and results are vtse32'd straight to output "
+                "rows. Tile edge = granted msettm/msettn. Whole tile in one "
+                "asm block. Encodings: cores/zvt/include/zvt_insn.h."
+            ),
+            reference_impl="(use the curated kernel zvt/zvt_linear_zvt_tile_f32.c)",
+        ),
     ],
     argtypes_factory=_linear_argtypes,
 )
@@ -1263,32 +1286,42 @@ CONV2D = KernelSpec(
         "void kernel_conv2d(const float *input, const float *weight, "
         "const float *bias, float *output, "
         "int N, int IC, int IH, int IW, int OC, "
-        "int KH, int KW, int SH, int SW, int PH, int PW)"
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
     ),
     semantics=(
-        "2D convolution matching torch.nn.Conv2d semantics with groups=1, "
-        "dilation=1.\n"
+        "2D convolution matching torch.nn.Conv2d semantics with groups=1 "
+        "and dilation (DH, DW).\n"
         "Layout (row-major, NCHW for activations / OIHW for weights):\n"
         "  input:  [N, IC, IH, IW]\n"
         "  weight: [OC, IC, KH, KW]\n"
         "  bias:   [OC] (may be NULL — treat as zeros)\n"
         "  output: [N, OC, OH, OW]  with\n"
-        "    OH = (IH + 2*PH - KH) / SH + 1\n"
-        "    OW = (IW + 2*PW - KW) / SW + 1\n"
+        "    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n"
+        "    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n"
         "Definition (zero-padding implied by PH, PW):\n"
         "  output[n, oc, oh, ow] = bias[oc] + sum over ic, kh, kw of\n"
-        "    input[n, ic, oh*SH - PH + kh, ow*SW - PW + kw]\n"
+        "    input[n, ic, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW]\n"
         "    * weight[oc, ic, kh, kw]\n"
         "  with input reads outside [0, IH) x [0, IW) treated as 0.\n"
         "All tensors are float32."
     ),
     reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -1296,13 +1329,13 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                     float acc = bias ? bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
-                                float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
                                 acc += v * w;
                             }
                         }
@@ -1313,6 +1346,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         }
     }
 }
+#undef MB_CONV2D_W
 """,
     extra_shapes=[
         # LeNet
@@ -1349,12 +1383,22 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "checks make vectorization awkward."
             ),
             reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -1362,13 +1406,13 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                     float acc = bias ? bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = input[((n*IC + ic)*IH + ih)*IW + iw];
-                                float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
                                 acc += v * w;
                             }
                         }
@@ -1379,6 +1423,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         }
     }
 }
+#undef MB_CONV2D_W
 """,
         ),
         AlgorithmCandidate(
@@ -1433,7 +1478,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "      vfloat32m1_t va = __riscv_vle32_v_f32m1(\n"
                 "          &im2col_buf[row * K + k], vl);\n"
                 "      vfloat32m1_t vw = __riscv_vle32_v_f32m1(\n"
-                "          &weight[oc * K + k], vl);\n"
+                "          &weight[MB_CONV2D_W(oc, k / (KH*KW), (k / KW) % KH, k % KW)], vl);\n"
                 "      vacc = __riscv_vfmacc_vv_f32m1(vacc, va, vw, vl);\n"
                 "  }\n"
                 "  vfloat32m1_t vinit = __riscv_vfmv_s_f_f32m1(0.0f, 1);\n"
@@ -1455,12 +1500,22 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "that double-counts."
             ),
             reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     int M = OH * OW;
     int K = IC * KH * KW;
 
@@ -1474,9 +1529,9 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 int row = oh * OW + ow;
                 for (int ic = 0; ic < IC; ic++) {
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh * SH - PH + kh;
+                        int ih = oh * SH - PH + kh * DH;
                         for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PW + kw;
+                            int iw = ow * SW - PW + kw * DW;
                             int col = (ic * KH + kh) * KW + kw;
                             float v = 0.0f;
                             if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
@@ -1496,13 +1551,14 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
             for (int row = 0; row < M; row++) {
                 float acc = b;
                 for (int k = 0; k < K; k++) {
-                    acc += im2col_buf[row * K + k] * weight[oc * K + k];
+                    acc += im2col_buf[row * K + k] * weight[MB_CONV2D_W(oc, k / (KH*KW), (k / KW) % KH, k % KW)];
                 }
                 output[(n * OC + oc) * M + row] = acc;
             }
         }
     }
 }
+#undef MB_CONV2D_W
 """,
         ),
         AlgorithmCandidate(
@@ -1563,12 +1619,22 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                 "indexing cheap."
             ),
             reference_impl="""\
+/* conv weights are OIHW unless the backend packed them (generate_skeleton
+ * _backend_pack_weight): IHWOC for RVV, HWIO for Gemmini. */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(kh)*KW + (kw))*IC + (ic))*OC + (oc))
+#elif defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(ic)*KH + (kh))*KW + (kw))*OC + (oc))
+#else
+#define MB_CONV2D_W(oc, ic, kh, kw) ((((long)(oc)*IC + (ic))*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d(const float *input, const float *weight, const float *bias,
                    float *output,
                    int N, int IC, int IH, int IW, int OC,
-                   int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                   int KH, int KW, int SH, int SW, int PH, int PW,
+                   int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     /* Tile so one OC-slab of weights fits in ~24 KB of L1D.
      * For OC=128 IC=128 K=3: 4 * 128 * 9 * 4 = 18 KB. */
     const int TILE_OC = 4;
@@ -1584,13 +1650,13 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
                         float acc = bias ? bias[oc] : 0.0f;
                         for (int ic = 0; ic < IC; ic++) {
                             for (int kh = 0; kh < KH; kh++) {
-                                int ih = oh * SH - PH + kh;
+                                int ih = oh * SH - PH + kh * DH;
                                 if (ih < 0 || ih >= IH) continue;
                                 for (int kw = 0; kw < KW; kw++) {
-                                    int iw = ow * SW - PW + kw;
+                                    int iw = ow * SW - PW + kw * DW;
                                     if (iw < 0 || iw >= IW) continue;
                                     float v = input[((n*IC + ic)*IH + ih)*IW + iw];
-                                    float w = weight[((oc*IC + ic)*KH + kh)*KW + kw];
+                                    float w = weight[MB_CONV2D_W(oc, ic, kh, kw)];
                                     acc += v * w;
                                 }
                             }
@@ -1602,6 +1668,7 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         }
     }
 }
+#undef MB_CONV2D_W
 """,
             # OC-blocked is only worth the loop-restructure cost when
             # the weight tensor is too large to stay in L1D. Skip on
@@ -1610,6 +1677,9 @@ void kernel_conv2d(const float *input, const float *weight, const float *bias,
         ),
     ],
 )
+for _s in CONV2D.extra_shapes:
+    _s.setdefault("DH", 1)
+    _s.setdefault("DW", 1)
 
 
 MAXPOOL2D = KernelSpec(
@@ -1926,6 +1996,43 @@ void kernel_linear_s8(const int8_t *input, const int8_t *weight,
                 "(use the curated kernel "
                 "pext/pext_linear_s8_pext_row_dot8.c)"
             ),
+        ),
+        AlgorithmCandidate(
+            name="zvt_tile_i8i32",
+            target_affinity=("zvt",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "Zvt (draft RISC-V vector-matrix tile extension) int8 LINEAR via "
+                "vtmms.tvv, mtype widen=4, vtype e8+altfmt (signed x signed): "
+                "acc[m][n] += sum_{ki<4} A_ki[m]*B_ki[n] into a 32x32 int32 tile. "
+                "A_ki / B_ki are K-columns held in v0,v2,v4,v6 / v8,v10,v12,v14 "
+                "(LMUL=2). input [M,K] and weight [N,K] are both row-major, so "
+                "every K-column is one strided load (vlse8, stride K) -- no "
+                "packing. msettm/msettn shrink edge tiles (msettn also sets vl, "
+                "avoiding a vsetvli that would clear mtype). K%4 and the Q0.31 "
+                "requantize are a scalar tail mirroring the reference, so the "
+                "kernel is bit-exact by construction. Config, vtzero, K-loop and "
+                "vtse32 read-out MUST be one asm block per tile. Encodings come "
+                "from cores/zvt/include/zvt_insn.h."
+            ),
+            reference_impl=(
+                "(use the curated kernel "
+                "zvt/zvt_linear_s8_zvt_tile_i8i32.c)"
+            ),
+        ),
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
         ),
         AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
@@ -2546,6 +2653,69 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
                 "(use the curated kernel "
                 "pext/pext_conv2d_s8_pext_patch_dot8.c)"
             ),
+        ),
+        AlgorithmCandidate(
+            name="zvt_igemm_i8i32",
+            target_affinity=("zvt",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            # OIHW: weight[oc*K + k] is K-contiguous per output channel,
+            # which is exactly a strided vlse8 A-column over oc.
+            weight_layout="oihw",
+            description=(
+                "Zvt int8 CONV2D as implicit GEMM on the vtmms tile MAC "
+                "(e8+altfmt, widen=4, tk=4): M=OC (A K-columns are OIHW "
+                "weight rows, vlse8 stride K), N=OH*OW (B K-columns are a "
+                "4-column im2col strip packed per K-step, zeros at padding), "
+                "K=IC*KH*KW. Up to 4 int32 accumulator tiles (0/4/8/12) are "
+                "live, so each strip feeds 4*T output channels. Last K-step: "
+                "B columns k>=K are 0 and A addresses clamp to K-1 (no OOB). "
+                "Rows read out with vtse32 and requantized exactly as the "
+                "reference; offsets via sum correction. Encodings: "
+                "cores/zvt/include/zvt_insn.h."
+            ),
+            reference_impl="(use the curated kernel zvt/zvt_conv2d_s8_zvt_igemm_i8i32.c)",
+        ),
+        AlgorithmCandidate(
+            name="ime_vmadot_4x4x8",
+            target_affinity=("ime", "ime_x60"),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K1 IME conv2d_s8 via im2col -> smt.vmadot GEMM.\n"
+                "Builds the im2col matrix A[M=OH*OW, K=IC*KH*KW] on the fly\n"
+                "directly into the 4x8 A-tiles and reuses the board-proven\n"
+                "vmadot 4x4x8 MAC (see ime_matmul_s8_ime_vmadot_4x4x8). Weights\n"
+                "are consumed in their native IHWOC layout (= the matmul's\n"
+                "transpose_b==0 branch). SYMMETRIC int8 ONLY (input/filter\n"
+                "offset 0 -- true for every dronet/yolov8_nano conv); vmadot's\n"
+                "raw product is then the conv MAC, no offset correction. The\n"
+                "requantize tail is the conv's scalar Q0.31 (bias add, Q0.31\n"
+                "multiply, rounding shift, clamp) -- NOT the matmul float tail.\n"
+                "CLUSTER 0 ONLY (harts 4-7 SIGILL on smt.vmadot).\n\n"
+                "MEASURED ON THE K1: bit-exact vs an independent scalar oracle\n"
+                "AND vs the RVV conv on all 50 unique dronet/yolov8_nano conv\n"
+                "shapes (max_abs_err=0). It is an ALTERNATIVE the picker takes\n"
+                "ONLY where it beats RVV: wins on large-channel convs (1x1 and\n"
+                "big-IC 3x3) up to 2.85x -- yolov8_nano 20/40 layers, 20.6%\n"
+                "conv-cycle reduction taking IME-where-it-wins; loses on small\n"
+                "convs (dronet 1/10). Asymmetric convs stay on RVV.\n"
+                "Verify+bench: scripts/ime_conv_verify_bench.py."
+            ),
+            reference_impl="",  # curated: kernels/ime/ime_conv2d_s8_ime_vmadot_4x4x8.c
+        ),
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="ihwoc",
         ),
         AlgorithmCandidate(
             name="indir_gemm",
@@ -4547,7 +4717,7 @@ void kernel_add_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_add_s8_rvv_frm_rmm.c
         AlgorithmCandidate(
             name="rvv_frm_rmm",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The reference expression issued on the vector unit, "
                 "including its rounding mode.\n\n"
@@ -4790,7 +4960,7 @@ void kernel_sigmoid_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_sigmoid_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The expensive part of this op is the expf, not the "
                 "datapath width: ~140 cycles per element on this core, "
@@ -4856,6 +5026,12 @@ CONV2D_DW = KernelSpec(
         "All tensors are float32."
     ),
     reference_impl="""\
+/* depthwise weight [C,1,KH,KW]; packed (IHWOC/HWIO) both put C innermost */
+#if defined(MODELBLASTER_GEMMINI_HWIO_WEIGHTS) || defined(MODELBLASTER_RVV_IHWOC_WEIGHTS)
+#define MB_CONV2D_DW_W(c, kh, kw) (((long)(kh)*KW + (kw))*C + (c))
+#else
+#define MB_CONV2D_DW_W(c, kh, kw) (((long)(c)*KH + (kh))*KW + (kw))
+#endif
 void kernel_conv2d_dw(const float *input, const float *weight, const float *bias,
                       float *output,
                       int N, int C, int IH, int IW,
@@ -4874,7 +5050,7 @@ void kernel_conv2d_dw(const float *input, const float *weight, const float *bias
                             int iw = ow * SW - PW + kw;
                             if (iw < 0 || iw >= IW) continue;
                             float v = input[((n*C + c)*IH + ih)*IW + iw];
-                            float w = weight[(c*KH + kh)*KW + kw];
+                            float w = weight[MB_CONV2D_DW_W(c, kh, kw)];
                             acc += v * w;
                         }
                     }
@@ -4884,6 +5060,7 @@ void kernel_conv2d_dw(const float *input, const float *weight, const float *bias
         }
     }
 }
+#undef MB_CONV2D_DW_W
 """,
     extra_shapes=[
         # MobileNetV2 width_mult=0.25 first-block 3x3 stride=1 dw conv
@@ -5848,10 +6025,10 @@ CONV2D_F16 = KernelSpec(
         "void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight, "
         "const _Float16 *bias, _Float16 *output, "
         "int N, int IC, int IH, int IW, int OC, "
-        "int KH, int KW, int SH, int SW, int PH, int PW)"
+        "int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)"
     ),
     semantics=(
-        "Half-precision 2D convolution. groups=1, dilation=1.\n"
+        "Half-precision 2D convolution. groups=1, dilation (DH, DW).\n"
         "Storage is _Float16 for input/weight/bias/output, but the inner\n"
         "accumulator is fp32 to avoid catastrophic cancellation when summing\n"
         "many partial products — same pattern as Tensor Cores and what\n"
@@ -5862,9 +6039,10 @@ CONV2D_F16 = KernelSpec(
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW) {
-    int OH = (IH + 2*PH - KH) / SH + 1;
-    int OW = (IW + 2*PW - KW) / SW + 1;
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW) {
+    int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int oh = 0; oh < OH; oh++) {
@@ -5872,10 +6050,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                     float acc = bias ? (float)bias[oc] : 0.0f;
                     for (int ic = 0; ic < IC; ic++) {
                         for (int kh = 0; kh < KH; kh++) {
-                            int ih = oh * SH - PH + kh;
+                            int ih = oh * SH - PH + kh * DH;
                             if (ih < 0 || ih >= IH) continue;
                             for (int kw = 0; kw < KW; kw++) {
-                                int iw = ow * SW - PW + kw;
+                                int iw = ow * SW - PW + kw * DW;
                                 if (iw < 0 || iw >= IW) continue;
                                 float v = (float)input[((n*IC + ic)*IH + ih)*IW + iw];
                                 float w = (float)weight[((oc*IC + ic)*KH + kh)*KW + kw];
@@ -5957,10 +6135,11 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
 void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                        const _Float16 *bias, _Float16 *output,
                        int N, int IC, int IH, int IW, int OC,
-                       int KH, int KW, int SH, int SW, int PH, int PW)
+                       int KH, int KW, int SH, int SW, int PH, int PW,
+                       int DH, int DW)
 {
-    const int OH = (IH + 2*PH - KH) / SH + 1;
-    const int OW = (IW + 2*PW - KW) / SW + 1;
+    const int OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    const int OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
     const size_t vlmax_e32m4 = __riscv_vsetvlmax_e32m4();
     const ptrdiff_t in_ic_stride_bytes = (ptrdiff_t)IH * IW * sizeof(_Float16);
     const ptrdiff_t w_ic_stride_bytes  = (ptrdiff_t)KH * KW * sizeof(_Float16);
@@ -5971,10 +6150,10 @@ void kernel_conv2d_f16(const _Float16 *input, const _Float16 *weight,
                 for (int ow = 0; ow < OW; ow++) {
                     vfloat32m4_t vacc = __riscv_vfmv_v_f_f32m4(0.0f, vlmax_e32m4);
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh*SH - PH + kh;
+                        int ih = oh*SH - PH + kh*DH;
                         if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow*SW - PW + kw;
+                            int iw = ow*SW - PW + kw*DW;
                             if (iw < 0 || iw >= IW) continue;
                             const _Float16 *in_base = input + ((size_t)n * IC * IH + ih) * IW + iw;
                             const _Float16 *w_base  = w_oc + (size_t)kh * KW + kw;
@@ -6151,7 +6330,7 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
         # Kernel: kernels/rvv/rvv_linear_f16_narrow.c
         AlgorithmCandidate(
             name="narrow",
-            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "RVV+Zvfh fp16 linear with PURE-fp16 accumulation. The "
                 "K-reduction uses vfmacc.vv (fp16 multiply-accumulate) and "
@@ -6417,14 +6596,15 @@ void kernel_layer_norm_f16(const _Float16 *input, const _Float16 *gamma,
                            const _Float16 *beta, _Float16 *output,
                            int M, int K, float eps) {
     for (int m = 0; m < M; m++) {
+        /* two-pass: E[x^2] - mean^2 cancels when |mean| >> std */
         float sum = 0.0f, sqsum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            float v = (float)input[m*K + k];
-            sum += v;
-            sqsum += v * v;
-        }
+        for (int k = 0; k < K; k++) sum += (float)input[m*K + k];
         float mean = sum / (float)K;
-        float var  = sqsum / (float)K - mean * mean;
+        for (int k = 0; k < K; k++) {
+            float d = (float)input[m*K + k] - mean;
+            sqsum += d * d;
+        }
+        float var  = sqsum / (float)K;
         float inv_sigma = 1.0f / sqrtf(var + eps);
         for (int k = 0; k < K; k++) {
             float v = (float)input[m*K + k];
@@ -8121,7 +8301,7 @@ void kernel_elu_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_elu_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The expensive part of this op is the expf, not the "
                 "datapath width: ~140 cycles per element on this core, "
@@ -8421,6 +8601,21 @@ void kernel_conv2d_batchnorm2d_s8(
     ],
     argtypes_factory=_conv2d_batchnorm2d_s8_argtypes,
     algorithms=[
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="ihwoc",
+        ),
         # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
         # Q0.31 requantize -> int8) then BN affine as scalar epilogue.
         # Single-stage Q0.31 -> numeric_drift; picked first when it stays
@@ -8479,7 +8674,7 @@ void kernel_conv2d_batchnorm2d_s8(
         # _rvv_oc_blocked_bn_epilogue.c
         AlgorithmCandidate(
             name="rvv_oc_blocked_bn_epilogue",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             weight_layout="ihwoc",
             description=(
                 "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
@@ -8637,6 +8832,21 @@ void kernel_conv2d_batchnorm2d_silu_s8(
     ],
     argtypes_factory=_conv2d_batchnorm2d_silu_s8_argtypes,
     algorithms=[
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+            weight_layout="ihwoc",
+        ),
         # FAST variant: HW im2col via tiled_conv_auto (systolic MAC + HW
         # Q0.31 requantize -> int8) then BN affine + SiLU as scalar epilogue.
         # Single-stage Q0.31 -> numeric_drift; picked first when within
@@ -8690,7 +8900,7 @@ void kernel_conv2d_batchnorm2d_silu_s8(
         # _rvv_oc_blocked_bn_silu_epilogue.c
         AlgorithmCandidate(
             name="rvv_oc_blocked_bn_silu_epilogue",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             weight_layout="ihwoc",
             description=(
                 "rvv_oc_blocked's conv2d_s8 (OC in the vector lanes, "
@@ -9275,7 +9485,7 @@ void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
         # it and diffs.
         AlgorithmCandidate(
             name="rvv_frm_rmm",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The reference expression issued on the vector unit, "
                 "including its rounding mode. Structurally identical to "
@@ -9412,7 +9622,7 @@ void kernel_gelu_s8(const int8_t *input, int8_t *output, int n,
             # same op on gemmini_q31 once that arm got its LUT (861,508).
             # rvv_f16 is rv64gcv_zfh_zvfh, a superset of rvv's rv64gcv, so
             # the kernel is unchanged; kernels/rvv_f16/ symlinks it.
-            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "The expensive part of this op is the erff, not the "
                 "datapath width. One call per element, no vector erff "
@@ -10467,7 +10677,7 @@ void kernel_adaptive_avg_pool2d_s8(const int8_t *input, int8_t *output,
         # Kernel: kernels/rvv/rvv_adaptive_avg_pool2d_s8_rvv_window_sum.c
         AlgorithmCandidate(
             name="rvv_window_sum",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "The window accumulator is `int32_t acc` over int8 inputs, "
                 "and integer addition is associative -- so any reduction "
@@ -10665,6 +10875,20 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
             ),
         ),
         AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "SpaceMiT K3 A100 IME int8 (smt.vmadot, 8x16x8 tile at "
+                "VLEN=1024: A=vs1 [8][16], B=vs2 [8][16] (B[j*16+k]), "
+                "C=int32 in (vd,vd+1) row-major C[i*8+j]; LMUL=1 only, vl "
+                "ignored). Encoding: .insn r 0x2b, 3, 0x71, vd, vs1, vs2. "
+                "See artifacts/k3_probes/ime/summary.md. Hand-written in "
+                "kernels/ime_k3_a100/; must be bit-exact (max_abs_err=0)."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+        ),
+        AlgorithmCandidate(
             name="ime_vmadot_4x4x8",
             target_affinity=("ime", "ime_x60"),
             accuracy_class=AccuracyClass.BIT_EXACT,
@@ -10796,7 +11020,7 @@ void kernel_matmul_s8(const int8_t *a, const int8_t *b, int8_t *output,
             # + rvv_f16: see gelu_s8's rvv_memo_lut_gather for why the _f16
             # backend variant has to be spelled out for a mixed-precision
             # graph. kernels/rvv_f16/ symlinks the same file.
-            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "Plain RVV int8 matmul for the SpaceMiT X60 (VLEN=256, "
@@ -11801,7 +12025,7 @@ void kernel_depthwise_conv2d_s8(const int8_t *input, const int8_t *weight,
         # Kernel: kernels/rvv/rvv_depthwise_conv2d_s8_rvv_ow_lanes_taps.c
         AlgorithmCandidate(
             name="rvv_ow_lanes_taps",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "One vector is a run of OUTPUT COLUMNS of one (n, c, oh). "
                 "Everything up to the store is integer -- `acc += iv*wv` in "
@@ -12138,7 +12362,7 @@ void kernel_softmax_s8(const int8_t *input, int8_t *output, int M, int K,
         AlgorithmCandidate(
             name="rvv_cached_exp",
             # + rvv_f16: see gelu_s8's rvv_memo_lut_gather.
-            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "The reference calls expf TWICE per element with the SAME "
                 "argument -- once to build the denominator, once to "
@@ -12300,7 +12524,7 @@ void kernel_leaky_relu_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_leaky_relu_s8_rvv_frm_rmm.c
         AlgorithmCandidate(
             name="rvv_frm_rmm",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "Same shape as add_s8's rvv_frm_rmm: the reference "
                 "expression on the vector unit, with roundf() spelled "
@@ -12402,7 +12626,7 @@ void kernel_avgpool2d_s8(const int8_t *input, int8_t *output,
         # Kernel: kernels/rvv/rvv_avgpool2d_s8_rvv_ow_lanes.c
         AlgorithmCandidate(
             name="rvv_ow_lanes",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "One vector = a run of output columns of one (n, c, "
                 "oh). Output is contiguous along ow and input is "
@@ -12479,8 +12703,8 @@ LSTM_S8 = KernelSpec(
 /* Upper bound on hidden_size, so the h_prev snapshot is a fixed stack buffer
    rather than a VLA. VitFly's LSTM is 395; 1024 leaves headroom without being
    a meaningful stack cost (1 KB). */
-#ifndef MERLIN_LSTM_MAX_HIDDEN
-#define MERLIN_LSTM_MAX_HIDDEN 1024
+#ifndef MB_LSTM_MAX_HIDDEN
+#define MB_LSTM_MAX_HIDDEN 1024
 #endif
 
 void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
@@ -12499,8 +12723,8 @@ void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
      * would read the newly-written h[t] instead of the previous timestep's --
      * the recurrence would consume its own output mid-step. That is not a
      * rounding difference; it produced answers off by up to 12 LSB. */
-    int8_t h_prev[MERLIN_LSTM_MAX_HIDDEN];
-    if (H > MERLIN_LSTM_MAX_HIDDEN) {
+    int8_t h_prev[MB_LSTM_MAX_HIDDEN];
+    if (H > MB_LSTM_MAX_HIDDEN) {
         /* Refuse rather than silently truncate the state. */
         return;
     }
@@ -12568,7 +12792,7 @@ void kernel_lstm_s8(const int8_t *input, const int8_t *w_ih,
         # Kernel: kernels/rvv/rvv_lstm_s8_rvv_gate_int_dot.c
         AlgorithmCandidate(
             name="rvv_gate_int_dot",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "Move the gate reductions onto the INTEGER vector unit "
                 "and leave the cell update alone.\n\n"
@@ -12699,7 +12923,7 @@ void kernel_layernorm_s8(const int8_t *input, const float *gamma,
         # Kernel: kernels/rvv/rvv_layernorm_s8_rvv_f64_tail.c
         AlgorithmCandidate(
             name="rvv_f64_tail",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             description=(
                 "Three passes per row. The first two accumulate mu and var "
                 "as SEQUENTIAL DOUBLE SUMS and must stay scalar: a vector "
@@ -12880,7 +13104,7 @@ void kernel_sin_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_sin_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "Memoized 256-entry LUT plus an RVV byte gather -- the same "
@@ -12960,7 +13184,7 @@ void kernel_cos_s8(const int8_t *input, int8_t *output, int n,
         # Kernel: kernels/rvv/rvv_cos_s8_rvv_memo_lut_gather.c
         AlgorithmCandidate(
             name="rvv_memo_lut_gather",
-            target_affinity=("rvv", "rvv_x60"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100"),
             accuracy_class=AccuracyClass.BIT_EXACT,
             description=(
                 "Memoized 256-entry LUT plus an RVV byte gather -- the same "
@@ -13106,7 +13330,7 @@ void kernel_lstm_f16(const _Float16 *x, const _Float16 *w_ih,
         # Kernel: kernels/rvv/rvv_lstm_f16_rvv_gate_f16_dot.c
         AlgorithmCandidate(
             name="rvv_gate_f16_dot",
-            target_affinity=("rvv", "rvv_x60", "rvv_f16"),
+            target_affinity=("rvv", "rvv_x60", "rvv_k3", "rvv_k3_a100", "rvv_f16"),
             description=(
                 "Vectorize the two gate GEMVs per unit -- x . w_ih[g] over "
                 "in_size and h . w_hh[g] over H -- with unit-stride fp16 loads, "
@@ -13418,18 +13642,32 @@ void kernel_group_norm(const float *input, const float *gamma,
     long cnt = (long)cpg * HW;
     for (int n = 0; n < N; n++) {
         for (int g = 0; g < G; g++) {
-            float sum = 0.0f, sqsum = 0.0f;
+            /* Two-pass (E[x^2] - mean^2 cancels when |mean| >> std, e.g.
+             * GroupNorm after a sigmoid), each with Kahan-compensated fp32
+             * sums: a group can hold ~1e6 elements, where a plain running
+             * sum drifts ~1e-3. No fp64 needed. */
+            float sum = 0.0f, comp = 0.0f;
             for (int cc = 0; cc < cpg; cc++) {
-                int c = g*cpg + cc;
-                const float *p = input + ((long)(n*C + c))*HW;
+                const float *p = input + ((long)(n*C + g*cpg + cc))*HW;
                 for (int i = 0; i < HW; i++) {
-                    float v = p[i];
-                    sum += v;
-                    sqsum += v * v;
+                    float y = p[i] - comp, t = sum + y;
+                    comp = (t - sum) - y;
+                    sum = t;
                 }
             }
             float mean = sum / (float)cnt;
-            float var  = sqsum / (float)cnt - mean * mean;
+            float sqsum = 0.0f;
+            comp = 0.0f;
+            for (int cc = 0; cc < cpg; cc++) {
+                const float *p = input + ((long)(n*C + g*cpg + cc))*HW;
+                for (int i = 0; i < HW; i++) {
+                    float d = p[i] - mean;
+                    float y = d * d - comp, t = sqsum + y;
+                    comp = (t - sqsum) - y;
+                    sqsum = t;
+                }
+            }
+            float var  = sqsum / (float)cnt;
             float inv_sigma = 1.0f / sqrtf(var + eps);
             for (int cc = 0; cc < cpg; cc++) {
                 int c = g*cpg + cc;
@@ -14366,14 +14604,15 @@ void kernel_layer_norm(const float *input, const float *gamma,
                        const float *beta, float *output,
                        int M, int K, float eps) {
     for (int m = 0; m < M; m++) {
+        /* two-pass: E[x^2] - mean^2 cancels when |mean| >> std */
         float sum = 0.0f, sqsum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            float v = input[m*K + k];
-            sum += v;
-            sqsum += v * v;
-        }
+        for (int k = 0; k < K; k++) sum += input[m*K + k];
         float mean = sum / (float)K;
-        float var  = sqsum / (float)K - mean * mean;
+        for (int k = 0; k < K; k++) {
+            float d = input[m*K + k] - mean;
+            sqsum += d * d;
+        }
+        float var  = sqsum / (float)K;
         float inv_sigma = 1.0f / sqrtf(var + eps);
         for (int k = 0; k < K; k++) {
             float v = input[m*K + k];
@@ -15859,26 +16098,68 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
 }
 
 
-def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
-    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec.
+# Shape-generic fallback ops (strided_copy, ewise2, reduce, ...); see
+# reference_kernels_ext.py.
+from modelblaster.pipeline.reference_kernels_ext import ext_specs as _ext_specs  # noqa: E402
+KERNEL_SPECS.update(_ext_specs(KernelSpec))
+# fp16 <-> fp32 casts at precision-policy island boundaries (precision_casts.py; only policy IRs use them)
+from modelblaster.pipeline.precision_casts import cast_specs as _cast_specs  # noqa: E402
+KERNEL_SPECS.update(_cast_specs(KernelSpec))
 
-    The transformation is purely mechanical: rename kernel_<op> -> kernel_<op>_f16
-    and change every float POINTER (`const float *` / `float *`, in both the
-    signature and the body's pointer locals) to `_Float16 *`. Scalar `float`
-    params (eps, scale, beta, margin) and `float` locals / `(float)` casts stay
-    — loads widen `_Float16`->float and stores narrow float->`_Float16`
-    implicitly, so the math still runs in fp32. Mirrors the hand-written _f16
-    kernels (relu_f16, softmax_f16, ...)."""
+
+def _cast_spec(src: str, dst: str) -> "KernelSpec":
+    """`cast_<src>_to_<dst>`: the dtype conversion a mixed IR (`--quant native`,
+    docs/tensor_dtypes.md) inserts where a tensor's dtype differs from what its
+    op reads or writes. Float -> float rounds once (round-to-nearest-even);
+    an integer / bool source converts exactly (ints are integer-valued f32
+    inside the graph, exact below 2^24); f32 -> integer truncates toward zero,
+    -> bool (b8) is `!= 0`."""
+    from modelblaster.pipeline.cuda_dtypes import CTYPE, cast_kind
+    cs, cd = CTYPE[src][0], CTYPE[dst][0]
+    op = cast_kind(src, dst)
+    if dst == "b8":
+        body, rule = "out[i] = (float)in[i] != 0.0f;", "out[i] = in[i] != 0 (bool, one byte)"
+    elif dst in ("i64", "i32", "u8"):
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})in[i] (truncation toward zero)"
+    else:
+        body, rule = f"out[i] = ({cd})(float)in[i];", f"out[i] = ({cd})(float)in[i] (one rounding to {dst})"
+    sig = f"void kernel_{op}(const {cs} *in, {cd} *out, int n)"
+    return KernelSpec(
+        op=op,
+        signature=sig,
+        semantics=(f"Convert a {src} tensor to {dst}, elementwise over n elements:\n  {rule}\n"
+                   "Inserted by extraction where a tensor's dtype differs from the dtype its op "
+                   "reads or writes (per-tensor dtypes, docs/tensor_dtypes.md)."),
+        reference_impl=(f"{sig} {{\n    for (int i = 0; i < n; i++) {{\n        {body}\n    }}\n}}\n"),
+        extra_shapes=[{"n": 1}, {"n": 257}],
+    )
+
+
+def _cast_specs() -> dict:
+    from modelblaster.pipeline.cuda_dtypes import CASTS
+    return {s.op: s for s in (_cast_spec(a, b) for a, b in CASTS)}
+
+
+KERNEL_SPECS.update(_cast_specs())
+
+
+def _make_reduced_variant(spec: "KernelSpec", suffix: str, ctype: str, label: str) -> "KernelSpec":
+    """Synthesize the `<op><suffix>` storage variant of an fp32 KernelSpec:
+    rename kernel_<op> -> kernel_<op><suffix> and change every float POINTER
+    (`const float *` / `float *`, in both the signature and the body's pointer
+    locals) to `ctype *`. Scalar `float` params (eps, scale, beta, margin) and
+    `float` locals / `(float)` casts stay -- loads widen to float and stores
+    narrow from float implicitly, so the math still runs in fp32."""
     import ctypes
 
     def _c(s: str) -> str:
-        s = s.replace("const float *", "const _Float16 *")
-        s = s.replace("float *", "_Float16 *")
-        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}_f16(")
+        s = s.replace("const float *", f"const {ctype} *")
+        s = s.replace("float *", f"{ctype} *")
+        s = s.replace(f"kernel_{spec.op}(", f"kernel_{spec.op}{suffix}(")
         return s
 
     _fp = ctypes.POINTER(ctypes.c_float)
-    _hp = ctypes.POINTER(ctypes.c_uint16)  # _Float16 has no ctypes type; use u16
+    _hp = ctypes.POINTER(ctypes.c_uint16)  # 2-byte float types have no ctypes type; use u16
 
     def _argtypes(_orig=spec.argtypes_factory):
         if _orig is None:
@@ -15886,23 +16167,40 @@ def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
         return [_hp if a is _fp else a for a in _orig()]
 
     return KernelSpec(
-        op=spec.op + "_f16",
+        op=spec.op + suffix,
         signature=_c(spec.signature),
-        semantics="(fp16) " + spec.semantics,
+        semantics=f"({label}) " + spec.semantics,
         reference_impl=_c(spec.reference_impl),
         extra_shapes=list(spec.extra_shapes),
         argtypes_factory=(None if spec.argtypes_factory is None else _argtypes),
     )
 
 
-for _op_name in list(KERNEL_SPECS):
-    if _op_name.endswith("_f16") or _op_name.endswith("_s8"):
-        continue
-    if _op_name.startswith("cast_"):
-        continue
+def _make_f16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the fp16 (`_f16`) counterpart of an fp32 KernelSpec:
+    `_Float16` storage, fp32 math (see _make_reduced_variant). Mirrors the
+    hand-written _f16 kernels (relu_f16, softmax_f16, ...)."""
+    return _make_reduced_variant(spec, "_f16", "_Float16", "fp16")
+
+
+def _make_bf16_variant(spec: "KernelSpec") -> "KernelSpec":
+    """Synthesize the bfloat16 (`_bf16`) counterpart of an fp32 KernelSpec:
+    `__bf16` storage (GCC/Clang's bfloat16; `__nv_bfloat16` in the CUDA
+    spelling, cuda_dtypes.cuda_signature), fp32 math, one rounding per store
+    (docs/bf16_cuda.md). Every `_bf16` spec is derived from the fp32 one --
+    including the ops with hand-written `_f16` specs -- so its signature and
+    argument binding are the fp32 op's."""
+    return _make_reduced_variant(spec, "_bf16", "__bf16", "bf16")
+
+
+_FP32_OPS = [_op_name for _op_name in KERNEL_SPECS
+             if not (_op_name.endswith(("_f16", "_bf16", "_s8")) or _op_name.startswith("cast_"))]
+for _op_name in _FP32_OPS:
     _f16_name = _op_name + "_f16"
     if _f16_name not in KERNEL_SPECS:
         KERNEL_SPECS[_f16_name] = _make_f16_variant(KERNEL_SPECS[_op_name])
+for _op_name in _FP32_OPS:
+    KERNEL_SPECS[_op_name + "_bf16"] = _make_bf16_variant(KERNEL_SPECS[_op_name])
 
 
 def shapes_from_ir(ir: dict, op: str) -> list[dict[str, int]]:

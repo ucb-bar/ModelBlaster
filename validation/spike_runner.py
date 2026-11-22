@@ -45,7 +45,9 @@ __all__ = [
 ]
 
 
-DEFAULT_SPIKE_FALLBACK = "/scratch2/dima/misc_sw/spike"
+DEFAULT_SPIKE_FALLBACK = (
+    os.path.join(os.environ["RISCV"], "bin", "spike") if os.environ.get("RISCV") else ""
+)
 
 
 def find_spike(explicit: Optional[str] = None) -> str:

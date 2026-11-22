@@ -13,6 +13,19 @@
 # identities and the stdout marker protocol stay common, which is what actually
 # needs to be shared.
 #
+# Board selection: MODELBLASTER_BOARD=k1 (default) | k3. It only changes the
+# DEFAULTS below (host, remote root, registry, backend-less profile target,
+# output root, topo-tag policy, launch mask); every explicit env var still
+# wins. scripts/run_model_k3.sh is just `MODELBLASTER_BOARD=k3` + this script.
+# K3 extras: the process is launched under `taskset -c 0-7` (X100), the
+# registry's ai_thread_cpus are passed to make as AI_CPUS=, the profile is
+# filed under topo_0..n-1 (MB_TOPO_RELATIVE) and under a per-core-type <hw>
+# directory (PROFILE_HW_NAME, derived rvv_k3_x100 / rvv_k3_a100 from the cpus).
+# A target that already names its core type (rvv_k3_a100) is used as the <hw>
+# name unchanged and must run on cpus of that type: zvl1024b code on the X100
+# (cpus 0-7) is an illegal instruction stream, so that combination is refused.
+# Profile A100 cpus with target rvv_k3_a100, X100 cpus with rvv_k3.
+#
 # Env:
 #   MODELBLASTER_K1_HOST         board ssh host      (default: k1)
 #   MODELBLASTER_K1_REMOTE_ROOT  board staging dir   (default: /root/mb_k1)
@@ -27,6 +40,14 @@
 #                                it, and files the profile under topo_0_1_2_3
 #                                instead of topo_0. Unset = the single-core
 #                                path, byte-identical to before.
+#   MB_TOPO_RELATIVE             1 = file the profile under topo_0..n-1 whatever
+#                                the physical CPUs (XPU-RT looks profiles up by
+#                                WIDTH). Default: 1 on k3, 0 on k1.
+#   PROFILE_HW_NAME              the <hw> level of the profile tree. Default on
+#                                k3: <target> if it ends _a100/_x100, else
+#                                <target>_x100 / <target>_a100 from the cpus
+#                                (a mixed set, or an _a100 target on X100
+#                                cpus, is an error); unset on k1.
 #   MB_SHARD_FACTOR              OC shards per conv, at CODEGEN time (the
 #                                weights are re-packed per shard, so it cannot
 #                                be a runtime knob). Only meaningful with
@@ -37,6 +58,14 @@
 # configured to do.
 
 set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Board defaults. board_config.py is stdlib-only so it runs before PYTHONPATH
+# exists; names are BOARD_* so they never enter the MB_/MODELBLASTER_ env scan.
+BOARD_CFG="$("${PY:-python3}" "${REPO_ROOT}/validation/board_config.py" \
+    --board "${MODELBLASTER_BOARD:-k1}" shell)" || exit 2
+eval "${BOARD_CFG}"
+TOPO_RELATIVE="${MB_TOPO_RELATIVE:-${BOARD_TOPO_RELATIVE}}"
 
 MODEL="${1:-mlp_control}"
 QUANT="${2:-int8}"
@@ -57,33 +86,44 @@ if [[ -n "${MB_CORES:-}" ]]; then
     # "0-3" and "0,1,2,3" both become the tag "0_1_2_3": the profile tree keys
     # on the hart LIST, and two spellings of one core set must not produce two
     # trees.
-    TOPO_CORES="$("${PY:-python3}" - "${MB_CORES}" <<'PYEOF'
-import sys
-out = []
-for part in sys.argv[1].replace(" ", "").split(","):
-    if not part:
-        continue
-    if "-" in part:
-        lo, hi = part.split("-", 1)
-        out.extend(range(int(lo), int(hi) + 1))
-    else:
-        out.append(int(part))
-seen = []
-for c in out:
-    if c not in seen:
-        seen.append(c)
-print("_".join(str(c) for c in sorted(seen)))
-PYEOF
-)"
+    TOPO_CORES="$("${PY:-python3}" "${REPO_ROOT}/validation/board_config.py" \
+        --board "${BOARD_NAME}" topo "${MB_CORES}" --relative "${TOPO_RELATIVE}")" || exit 2
     PROFILE_CORES_ARGS+=(--profile-cores "${TOPO_CORES}")
     BIN_SUFFIX="_pool${TOPO_CORES}"
     echo "=== multi-core run: cores ${MB_CORES} -> topo_${TOPO_CORES}, MB_SHARD_FACTOR=${MB_SHARD_FACTOR:-1} ==="
+elif [[ "${BOARD_NAME}" != "k1" ]]; then
+    # Single-core run on a non-K1 board: still file under the width-relative
+    # tag (topo_0), not topo_<physical cpu>.
+    TOPO_CORES="$("${PY:-python3}" "${REPO_ROOT}/validation/board_config.py" \
+        --board "${BOARD_NAME}" topo "${CPU}" --relative "${TOPO_RELATIVE}")" || exit 2
+    PROFILE_CORES_ARGS+=(--profile-cores "${TOPO_CORES}")
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/build/k1}"
-CROSS="${CROSS:-riscv64-unknown-linux-gnu-}"
-HOST="${MODELBLASTER_K1_HOST:-k1}"
+# Per-core-type profile tree (empty on k1). A mixed X100+A100 set is a hard
+# error from board_config: its timing belongs to neither type.
+HW_NAME="$("${PY:-python3}" "${REPO_ROOT}/validation/board_config.py" \
+    --board "${BOARD_NAME}" hw-name "${RUN_CPU}" --target "${TARGET}" \
+    ${PROFILE_HW_NAME:+--explicit "${PROFILE_HW_NAME}"})" || exit 2
+HW_ARGS=()
+[[ -n "${HW_NAME}" ]] && HW_ARGS+=(--profile-hw-name "${HW_NAME}")
+
+OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/${BOARD_OUT_ROOT_SINGLE}}"
+HOST="${BOARD_HOST}"
+if [[ "${BOARD_NAME}" == "k1" ]]; then
+    CROSS="${CROSS:-riscv64-unknown-linux-gnu-}"
+elif [[ -z "${CROSS:-}" ]]; then
+    # K3 needs the gcc>=14 SpaceMiT toolchain (13.x miscompiles the RVV vsetvl
+    # intrinsics -> SIGILL on the board); a bare PATH lookup could pick 13.
+    _tc="${REPO_ROOT}/../XPU-RT/scripts/setup_spacemit_toolchain.sh"
+    # Only when already unpacked: never trigger the script's 800 MB download
+    # implicitly.
+    _tcroot="${SPACEMIT_TOOLCHAIN_ROOT:-$(dirname "${_tc}")/../tools/riscv-tools-spacemit}"
+    [[ -x "${_tc}" ]] && compgen -G "${_tcroot}/*/bin/riscv64-unknown-linux-gnu-gcc" >/dev/null \
+        && CROSS="$("${_tc}" --path)" || {
+        echo "CROSS is not set and ${_tc} is unavailable/failed." >&2
+        echo "Set CROSS to a gcc>=14 riscv64-unknown-linux-gnu- prefix." >&2
+        exit 2; }
+fi
 PY="${PY:-python3}"
 # Kernel synthesis on the K1 path goes to Codex, never Bedrock, and there is no
 # fallback: if Codex is unavailable the kernel step must fail loudly rather than
@@ -206,13 +246,20 @@ b = backends.get(sys.argv[1])
 print(" ".join(b.resolved_kernel_cflags(sys.argv[2])))
 PYEOF
 )" || KERNEL_CFLAGS=""
+# Registry-declared A100 harts that must self-register with the kernel; the
+# runtime does the registering, the build only has to know which CPUs. Passed
+# only when non-empty so K1 build lines are unchanged.
+AI_ARGS=()
+_ai="$("${PY}" "${REPO_ROOT}/pipeline/core_registry.py" \
+    "${REPO_ROOT}/${BOARD_REGISTRY}" --ai-cpus)" || exit 2
+[[ -n "${_ai}" ]] && AI_ARGS+=(AI_CPUS="${_ai}")
 # MODELBLASTER_KERNEL_CC: compile kernels.c with a different compiler than the
 # rest of the harness. Needed only for a model with an fp16 island on this box,
 # where the curated Zvfh kernels use RVV fp16 intrinsics that GCC 13.2 -- the
 # only riscv64-unknown-linux-gnu compiler installed -- does not have. See the
 # KERNEL_CC comment in harness_linux/Makefile. Unset by default.
 make -s -C "${REPO_ROOT}/harness_linux" \
-    MODEL_DIR="${GEN}/generated" CROSS="${CROSS}" "${POOL_ARGS[@]}" \
+    MODEL_DIR="${GEN}/generated" CROSS="${CROSS}" "${POOL_ARGS[@]}" "${AI_ARGS[@]}" \
     ${MODELBLASTER_KERNEL_CC:+KERNEL_CC="${MODELBLASTER_KERNEL_CC}"} \
     KERNEL_CFLAGS="${KERNEL_CFLAGS}" OUT="${BIN}"
 
@@ -230,7 +277,7 @@ if command -v "${CROSS}objdump" >/dev/null 2>&1; then
     fi
 fi
 
-echo "=== 5/5 deploy + run on ${HOST} (pinned to cpu ${RUN_CPU}) ==="
+echo "=== 5/5 deploy + run on ${HOST} (pinned to cpu ${RUN_CPU}${BOARD_LAUNCH_CPUS:+, launched under taskset ${BOARD_LAUNCH_CPUS}}${HW_NAME:+, hw ${HW_NAME}}) ==="
 PROFILE_ARGS=()
 # ITERS: repetitions on the board, median per dispatch, iteration 0 dropped as
 # warmup. Leave unset for the historical one-sample behaviour. For a stateful
@@ -246,7 +293,7 @@ if [[ -n "${PROFILE_OUT_ROOT:-}" ]]; then
 fi
 "${PY}" -m modelblaster.validation.k1_runner \
     --elf "${BIN}" --host "${HOST}" --cpu "${RUN_CPU}" \
-    "${PROFILE_CORES_ARGS[@]}" \
+    "${PROFILE_CORES_ARGS[@]}" "${HW_ARGS[@]}" \
     --io "${GEN}/io.npz" --quant "${QUANT}" \
     --profile-csv "${GEN}/profile_k1.csv" --model-name "${MODEL}" \
     --gen-dir "${GEN}/generated" \

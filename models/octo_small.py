@@ -1085,7 +1085,7 @@ def get_calibration_spec(num_samples: int = 8) -> "dict | None":
     what `torch.randint(0,256)` produces, and per-tensor scales fitted to noise
     would still verify bit-exact against their own golden while being the wrong
     scales. `MODELBLASTER_OCTO_BRIDGE` should point at the BridgeData episodes
-    (`/scratch2/dima/misc_sw/octo_work/bridge_episodes.pkl` is the pickle the
+    (`MODELBLASTER_OCTO_BRIDGE` names the pickle the
     upstream benchmarks used); returning None is the honest answer when it is
     unset, rather than silently calibrating on noise.
     """

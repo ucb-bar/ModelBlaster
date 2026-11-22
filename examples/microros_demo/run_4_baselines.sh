@@ -89,7 +89,7 @@ for entry in "${PLACEMENTS[@]}"; do
     bash modelblaster/examples/microros_demo/run.sh || rc=$?
 
     LOG_DST="${BASELINES_DIR}/${TAG}.uartlog.log"
-    SRC_LOG="/scratch2/dima/chipyard-fsim/sims/firesim/firesim_rundir/sim_slot_0/uartlog"
+    SRC_LOG="${FIRESIM_ROOT:-${CHIPYARD_ROOT:-}/sims/firesim}/firesim_rundir/sim_slot_0/uartlog"
     if [[ -f "${SRC_LOG}" ]]; then
         cp "${SRC_LOG}" "${LOG_DST}"
         cp "${SRC_LOG}" "/tmp/microros_baseline_${TAG}.log"

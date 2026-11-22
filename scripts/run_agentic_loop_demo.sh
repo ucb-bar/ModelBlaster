@@ -25,7 +25,7 @@ REPO_ROOT="$(pwd)"
 INCLUDE="${1:-baseline,A1,A2,A3,A4}"
 DEADLINE_US="${DEADLINE_US:-65}"
 
-XPURT_ROOT="${XPURT_ROOT:-/scratch2/agustin/XPU-RT}"
+XPURT_ROOT="${XPURT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/XPU-RT}"
 BATCH="${XPURT_ROOT}/artifacts/iterate/firesim_batch.json"
 HINT="${XPURT_ROOT}/artifacts/iterate/granularity_hint.json"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/artifacts/bundle}"

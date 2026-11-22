@@ -1,0 +1,497 @@
+"""Write KernelBlaster winners back into ModelBlaster's CUDA kernel cache.
+
+KernelBlaster's implementation store exports ``winners.json`` (format
+``kb-winners/1``): per (op, signature, arch, shape set) the fastest verified
+slot source. Ingest copies them into the cache and re-verifies at model
+level before they are used.
+
+Cache layout (``--cache``, default ``kernels/cuda/kb_cache``)::
+
+    index.json        {"format": "mb-cuda-cache/1", "entries": [...]}
+    src/<sha>.cu      slot sources (entry function + helpers, MB signature)
+    src/<sha>.cpp     OpenCL slot sources (``target: "opencl"`` entries)
+
+The cache serves one slot target (``CudaCache(root, target=)``: ``cuda``, the
+default, or ``opencl``): entries carry it (absent = ``cuda``) and their
+``arch`` -- ``sm_<N>`` for CUDA, the device label for OpenCL (``adreno650``,
+KernelBlaster's ``--arch``; :func:`arch_key`) -- and adds, lookups and the
+ingest only ever see the cache's target, so a CUDA and an OpenCL winner of
+the same op and shape never stand in for each other, even in one index.
+
+An entry carries a **shape guard**: the instance shapes it was verified on.
+:func:`lookup` returns an entry for an op only if every instance shape the
+caller needs is in the guard (exact match), so a kernel tuned or only
+tested at one shape is never silently used at another. Entries are keyed by
+the KernelSpec signature hash too: a spec change makes old entries stale.
+The hash is of the CUDA spelling of the signature (`_Float16` -> `__half`,
+what the slot defines), and every entry carries its storage dtype (fp32 /
+fp16): an `_f16` op has its own kind and signature, and lookups also match
+the dtype, so fp16 and fp32 kernels never stand in for each other.
+
+Model-level verification exports the whole IR as one partition -- accepted
+graph hints applied, the cached winners as slot sources (``cache_plan``,
+which also splits a slot whose instances only some winners cover) -- and
+runs its driver (golden + every op in isolation). Entries that pass are
+marked ``model_verified`` for that IR; a failing slot marks its entry
+``rejected`` for that IR. The references are computed here at export (CPU)
+and linked into the problem, so the run can go to another GPU: with
+``--ssh-host`` (or ``--evaluator local``) through KernelBlaster's evaluator.
+
+    python -m modelblaster.pipeline.kb_ingest WINNERS.json [--cache DIR] \\
+        [--verify IR_DIR ...] [--hints graph_hints.json] [--arch 75] [--target cuda|opencl] \\
+        [--ssh-host H --remote-dir D [--cuda-visible-devices ids] | --evaluator local] [--gpu-model M]
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
+from .cuda_dtypes import cuda_signature, op_dtype
+from .kernel_abi import parse_signature
+
+MB_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CACHE = MB_ROOT / "kernels" / "cuda" / "kb_cache"
+FORMAT = "mb-cuda-cache/1"
+
+
+def signature_sha(sig: str) -> str:
+    """Same key KernelBlaster's ImplStore uses."""
+    return hashlib.sha1(" ".join(sig.split()).encode()).hexdigest()[:12]
+
+
+def _shape_key(shape: dict) -> str:
+    return json.dumps(shape, sort_keys=True)
+
+
+TARGETS = ("cuda", "opencl")
+
+
+def arch_key(arch, target: str = "cuda") -> str:
+    """The cache's (and KernelBlaster's winners') arch string: ``sm_<N>`` for CUDA (``75`` /
+    ``sm_75``), the device label as given for OpenCL (``adreno650``)."""
+    a = str(arch)
+    if target == "cuda":
+        return a if a.startswith("sm_") else f"sm_{a}"
+    return a
+
+
+class CudaCache:
+    def __init__(self, root: Path = DEFAULT_CACHE, target: str = "cuda"):
+        if target not in TARGETS:
+            raise ValueError(f"unknown slot target {target!r} ({'|'.join(TARGETS)})")
+        self.target = target
+        self.root = Path(root)
+        self.index_path = self.root / "index.json"
+        self.entries: list[dict] = []
+        if self.index_path.exists():
+            d = json.loads(self.index_path.read_text())
+            assert d.get("format") == FORMAT, f"{self.index_path}: not {FORMAT}"
+            self.entries = d["entries"]
+
+    def save(self):
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        self.index_path.write_text(json.dumps({"format": FORMAT, "entries": self.entries}, indent=1))
+
+    def code(self, e: dict) -> str:
+        return (self.root / e["file"]).read_text()
+
+    def add(self, *, op: str, entry: str, signature: str, arch: str, shapes: list, code: str,
+            slot_us: float, speedup, impl_id: str, source: dict, dtype: str | None = None) -> tuple[dict, str]:
+        sha = hashlib.sha1(code.encode()).hexdigest()
+        ext = ".cu" if self.target == "cuda" else ".cpp"
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        (self.root / "src" / f"{sha}{ext}").write_text(code)
+        guard = sorted({_shape_key(s) for s in shapes})
+        new = {"op": op, "entry": entry, "signature_sha": signature_sha(cuda_signature(signature)),
+               # a slot's own storage dtype (never a mixed problem's "mixed": the op's then)
+               "dtype": dtype if dtype in ("fp32", "fp16", "bf16") else op_dtype(op), "arch": arch,
+               "shape_guard": guard, "slot_us": slot_us, "speedup": speedup, "impl_id": impl_id,
+               "file": f"src/{sha}{ext}", "source": source, "model_verified": [], "rejected": []}
+        if self.target != "cuda":
+            new["target"] = self.target
+        key = (new["op"], new["signature_sha"], new["dtype"], new["arch"], guard)
+        same = [i for i, e in enumerate(self.entries)
+                if self.mine(e)
+                and (e["op"], e["signature_sha"], e.get("dtype", "fp32"), e["arch"], e["shape_guard"]) == key]
+        if not same:
+            self.entries.append(new)
+            return new, "added"
+        beside = BESIDE_REJECTED()
+        for i in same:                                   # the same code again (a cumulative winners file): no change
+            if beside and self.entries[i]["file"] == new["file"]:
+                return self.entries[i], "kept-existing"
+        live = [i for i in same if not self.entries[i].get("rejected")]
+        i = min(live or same, key=lambda j: self.entries[j]["slot_us"]) if beside else same[0]     # legacy: first
+        e = self.entries[i]
+        if slot_us < e["slot_us"]:
+            self.entries[i] = new
+            return new, "replaced"
+        if beside and not live:
+            # every faster entry of these shapes failed in some whole model: the slower winner must still be usable
+            # there (lookup / cache_plan skip a rejected entry per IR); before this, a re-optimized winner of a rejected
+            # shape was dropped as "kept-existing" and the shape stayed on its seed (search fixes; kill switch
+            # MB_CACHE_BESIDE_REJECTED=0, set by --fallback-repair off)
+            self.entries.append(new)
+            return new, "added-beside-rejected"
+        return e, "kept-existing"
+
+    def mine(self, e: dict) -> bool:
+        """Is ``e`` an entry of this cache's slot target?"""
+        return e.get("target", "cuda") == self.target
+
+    def lookup(self, entry: str, signature: str, arch: str, shapes: list, ir_name: str | None = None):
+        """Best entry for a C entry point whose guard covers every shape (and
+        that wasn't rejected on ir_name). Keyed by entry, not op kind: op
+        kinds sharing an entry (sum_dim / max_dim -> kernel_reduce) share code."""
+        need = {_shape_key(s) for s in shapes}
+        sig = signature_sha(cuda_signature(signature))
+        dtype = op_dtype(entry)                      # kernel_<op>_f16 entries are fp16
+        ok = [e for e in self.entries
+              if self.mine(e) and e["entry"] == entry and e["signature_sha"] == sig and e["arch"] == arch
+              and e.get("dtype", "fp32") == dtype
+              and need <= set(e["shape_guard"]) and (ir_name is None or ir_name not in e["rejected"])
+              and not superseded(e, ir_name)]
+        return min(ok, key=lambda e: (ir_name not in e["model_verified"], e["slot_us"]), default=None)
+
+    def add_reuse(self, *, op: str, entry: str, signature: str, arch: str, shapes: list, code: str, slot_us: float,
+                  impl_id: str, source: dict, dtype: str | None = None) -> dict:
+        """A cross-application winner (kb_reuse): always a new entry (never merged with an existing one of the
+        same guard), marked ``reuse`` -- the pass supersedes the entries it replaces for the IR it measured."""
+        sha = hashlib.sha1(code.encode()).hexdigest()
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        ext = ".cu" if self.target == "cuda" else ".cpp"
+        (self.root / "src" / f"{sha}{ext}").write_text(code)
+        new = {"op": op, "entry": entry, "signature_sha": signature_sha(cuda_signature(signature)),
+               "dtype": dtype or op_dtype(op), "arch": arch, "shape_guard": sorted({_shape_key(s) for s in shapes}),
+               "slot_us": slot_us, "speedup": None, "impl_id": impl_id, "file": f"src/{sha}{ext}", "source": source,
+               "model_verified": [], "rejected": [], "reuse": True}
+        if self.target != "cuda":
+            new["target"] = self.target
+        self.entries.append(new)
+        return new
+
+
+def BESIDE_REJECTED() -> bool:
+    """CudaCache.add keeps a new winner next to a faster same-guard entry that was rejected for some IR (default on)."""
+    import os
+    return os.getenv("MB_CACHE_BESIDE_REJECTED", "1") != "0"
+
+
+def superseded(e: dict, ir_name: str | None) -> bool:
+    """An entry a cross-application pass (kb_reuse) replaced for this IR: not used there (absent field: never)."""
+    return bool(ir_name is not None and ir_name in (e.get("superseded") or ()))
+
+
+def ingest(winners_json: Path, cache: CudaCache, specs: dict, min_speedup: float = 1.05) -> list[dict]:
+    w = json.loads(Path(winners_json).read_text())
+    assert w.get("format") == "kb-winners/1", "not a KernelBlaster winners file"
+    base = Path(winners_json).parent
+    report = []
+    for r in w["winners"]:
+        if r.get("target", "cuda") != cache.target:       # winners of another slot target never enter
+            report.append({"op": r["op"], "impl_id": r["id"], "status": "other-target", "target": r.get("target")})
+            continue
+        spec = specs.get(r["op"])
+        if spec is None and r["op"].startswith("region__"):       # region slots: built by this process's exports
+            from .region_slots import known_spec
+            spec = known_spec(r["op"])
+        if spec is None:
+            st = "fusion-not-accepted" if r["op"].startswith("fused__") else "unknown-op"
+            report.append({"op": r["op"], "impl_id": r["id"], "status": st})
+            continue
+        if signature_sha(cuda_signature(spec.signature)) != r["signature_sha"]:
+            report.append({"op": r["op"], "impl_id": r["id"], "status": "stale-signature"})
+            continue
+        sp = r.get("speedup_vs_seed")
+        if sp is None or sp < min_speedup:
+            report.append({"op": r["op"], "impl_id": r["id"], "status": "below-min-speedup", "speedup": sp})
+            continue
+        entry, _ = parse_signature(spec.signature)
+        e, st = cache.add(op=r["op"], entry=entry, signature=spec.signature, arch=r["arch"],
+                          shapes=r["shapes"], code=(base / r["file"]).read_text(), slot_us=r["slot_us"],
+                          speedup=sp, impl_id=r["id"], dtype=r.get("dtype"),
+                          source={"run_id": r.get("run_id"), "problem_id": r.get("problem_id"),
+                                  "techniques": r.get("techniques", [])})
+        report.append({"op": r["op"], "impl_id": r["id"], "status": st, "speedup": sp})
+    cache.save()
+    from . import kb_trace
+    kb_trace.record("ingest", mb_stage="ingest", winners=str(winners_json), report=report,
+                    files=kb_trace.files({"winners.json": winners_json}))
+    return report
+
+
+def cache_plan(graph: dict, cache: CudaCache, arch: str, specs: dict, *, split: bool = True) -> dict:
+    """Which cached sources an IR can use, per slot.
+
+    A slot (C entry, or a split variant of one) takes the best entry whose
+    shape guard covers every instance. When no entry covers them all but some
+    cover a part (winners tuned on one partition's shapes), ``split`` makes
+    ModelBlaster's own decision to give those instances their own slot: a
+    ``split_slot`` hint (source ``mb-cache``) with one group per covering
+    entry plus one for the rest (hand kernel), applied to the graph. Fused
+    slots without an entry of their own get cached stage kernels guarded on
+    the stages' shapes (``sub_sources``) for their seed; a fused slot is also
+    split by which first-stage winner covers its instances, so fusing ops
+    whose kernels were tuned per shape keeps those kernels.
+
+    -> {"graph", "sources" {slot id: code}, "tags", "used" {slot id: entry},
+        "sub_sources" {fused slot id: {stage kind: code}}, "hints" [split hints]}"""
+    from . import graph_hints as gh
+    from .kb_export import ALIAS_OPS, slot_id_of
+    from .kb_proposals import with_fused_specs
+
+    g = gh.unique_names(json.loads(json.dumps(graph)))
+    specs = with_fused_specs(g, specs)
+    ir_name = g["name"]
+    slots: dict[str, list[dict]] = {}
+    for o in g["ops"]:
+        if o["op"] in specs and o["op"] not in ALIAS_OPS:
+            slots.setdefault(slot_id_of(o, specs), []).append(o)
+
+    def entry_sig(kind):
+        return parse_signature(specs[kind].signature)[0], specs[kind].signature
+
+    def usable(entry, sig):
+        # entries store the sha of the CUDA-side signature (``cuda_signature``: _Float16 -> __half, ...),
+        # exactly as ``CudaCache.lookup`` and ``ingest`` compare it; the raw signature never matches an fp16 entry
+        sig_sha, dtype = signature_sha(cuda_signature(sig)), op_dtype(entry)
+        return [e for e in cache.entries if cache.mine(e) and e["entry"] == entry and e["signature_sha"] == sig_sha
+                and e["arch"] == arch and e.get("dtype", "fp32") == dtype and ir_name not in e["rejected"]
+                and not superseded(e, ir_name)]
+
+    def own_key(o):
+        return _shape_key(o.get("shape", {}))
+
+    def stage0_key(o):
+        return _shape_key(o["sub_ops"][0].get("shape", {}))
+
+    src, tags, used, hints = {}, {}, {}, []
+    for sid, ops in slots.items():
+        entry, sig = entry_sig(ops[0]["op"])
+        e = cache.lookup(entry, sig, arch, [o.get("shape", {}) for o in ops], ir_name=ir_name)
+        if e is not None:
+            src[sid], tags[sid], used[sid] = cache.code(e), f"cache:{e['impl_id']}", e
+            continue
+        # the same source verified on different shape sets (e.g. one winner taken by
+        # several windows of a model) whose guards together cover every instance
+        need = {own_key(o) for o in ops}
+        by_code: dict[str, list[dict]] = {}
+        for c in usable(entry, sig):
+            by_code.setdefault(c["file"], []).append(c)
+        whole = [cs for cs in by_code.values() if need <= set().union(*(set(c["shape_guard"]) for c in cs))]
+        if whole:
+            cs = min(whole, key=lambda cs: min(c["slot_us"] for c in cs))
+            src[sid], tags[sid], used[sid] = cache.code(cs[0]), "cache:" + "+".join(sorted({c["impl_id"] for c in cs})), cs[0]
+            continue
+        if not split or any(o.get("slot_variant") for o in ops) or len(ops) < 2:
+            continue
+        # covering candidates: the slot's own winners; for a fused slot also
+        # its first stage's (the dominant kernel), which seed it via sub_sources
+        cands = [(c, own_key, True) for c in usable(entry, sig)]
+        if "sub_ops" in ops[0]:
+            k0 = ops[0]["sub_ops"][0]["op"]
+            e0 = cache.lookup(*entry_sig(k0), arch, [o["sub_ops"][0].get("shape", {}) for o in ops], ir_name=ir_name)
+            if e0 is None:                                 # else every instance gets it as a stage seed
+                cands += [(c, stage0_key, False) for c in usable(*entry_sig(k0))]
+        left, parts = list(ops), []
+        while left:
+            def score(cand):
+                c, key, own = cand
+                n = sum(1 for o in left if key(o) in c["shape_guard"])
+                return (n, own, ir_name in c["model_verified"], -c["slot_us"])
+            live = [x for x in cands if score(x)[0]]
+            if not live:
+                break
+            best = max(live, key=score)
+            covered = [o for o in left if best[1](o) in best[0]["shape_guard"]]
+            parts.append((best, covered))
+            left = [o for o in left if o not in covered]
+        if not parts or (len(parts) == 1 and not left and not parts[0][0][2]):
+            continue                                       # one stage cover for all: plain sub_sources
+        groups = [{"ops": [o["name"] for o in cov], "cache": c["impl_id"], "as": "slot" if own else "stage"}
+                  for (c, _, own), cov in parts]
+        if left:
+            groups.append({"ops": [o["name"] for o in left], "cache": None})
+        hints.append({"id": f"split:{sid}", "kind": "split_slot", "target": cache.target, "slot": sid,
+                      "by": "cache", "groups": groups, "status": "accepted",
+                      "source": [{"by": "mb-cache", "ir": ir_name}], "evidence": []})
+        for k, ((c, _, own), _) in enumerate(parts):
+            if own:
+                src[f"{sid}__v{k}"], tags[f"{sid}__v{k}"], used[f"{sid}__v{k}"] = \
+                    cache.code(c), f"cache:{c['impl_id']}", c
+    if hints:
+        g, _, _ = gh.apply_hints(g, hints, specs, target=cache.target)
+    sub_sources: dict[str, dict[str, str]] = {}
+    for o in g["ops"]:
+        sid = slot_id_of(o, specs) if o["op"] in specs else None
+        if "sub_ops" not in o or sid in src or sid in sub_sources:
+            continue
+        mine = [x for x in g["ops"] if x["op"] in specs and slot_id_of(x, specs) == sid]
+        subs = {}
+        for i, st in enumerate(o["sub_ops"]):
+            if st["op"] not in specs:                      # an alias stage (view / reshape ...) has no slot kernel to look up
+                continue
+            entry, sig = entry_sig(st["op"])
+            shapes = [x["sub_ops"][i].get("shape", {}) for x in mine]
+            e = cache.lookup(entry, sig, arch, shapes, ir_name=ir_name)
+            if e is not None:
+                subs[st["op"]] = cache.code(e)
+                used[f"{sid}/{st['op']}"] = e
+        sub_sources[sid] = subs
+    return {"graph": g, "sources": src, "tags": tags, "used": used, "sub_sources": sub_sources, "hints": hints}
+
+
+def verify_ir(ir_dir: Path, cache: CudaCache, *, arch: str, specs: dict, work: Path | None = None,
+              hints: Path | None = None, fusion_registry: Path | None = None, kbeval=None,
+              gpu_model: str | None = None, allow_gpu_mismatch: bool = False) -> dict:
+    """Whole-IR export with the accepted graph hints applied and the cached
+    winners as sources (``cache_plan``), build and run; mark entries.
+
+    The export is self-contained and checked: the reference walk runs here,
+    at export, on the CPU (``walk_torch``), and its inputs, weights and every
+    op's reference output are linked into the problem, whose driver checks
+    the partition outputs and every op in isolation against them on the GPU.
+    So only the composed CUDA side needs a GPU: with ``kbeval`` (a
+    :class:`kb_eval.KBEval`) that run goes through KernelBlaster's evaluator
+    (local GPU pool or the ``--ssh-host`` GPUs) on one GPU of ``gpu_model``
+    (none there: ``HardwareMismatch`` unless ``allow_gpu_mismatch``); without
+    it, it is built and run here on the default GPU. ``device`` records the GPU.
+    The slot target is the cache's (``cache.target``): an OpenCL cache exports
+    OpenCL slots, and its run needs ``kbeval`` (the board or an OpenCL GPU)."""
+    from . import graph_hints as gh
+    from . import kb_telemetry as kbt
+    from .kb_eval import builtin_device, run_problem
+    from .kb_export import build_and_run, export_problem
+    from .kb_proposals import write_variant_ir
+
+    ir_dir = Path(ir_dir)
+    target = cache.target
+    sm = arch.removeprefix("sm_") if target == "cuda" else arch
+    if target != "cuda" and kbeval is None:
+        raise ValueError(f"{target} verification runs through KernelBlaster's evaluator (kbeval): ModelBlaster's "
+                         "builtin runs are CUDA-only")
+    g = json.loads((ir_dir / "graph.json").read_text())
+    specs = dict(specs)
+    hpath = hints or fusion_registry
+    applied, hint_ids = [], []
+    if hpath is not None:
+        g, added, prov = gh.apply_hints(g, gh.load(Path(hpath))["hints"], specs, target=target)
+        specs.update(added)
+        applied = [a["op"] for a in prov["applied"] if a["kind"] == "fuse"]
+        hint_ids = sorted({a["id"] for a in prov["applied"]})
+    plan = cache_plan(g, cache, arch_key(sm, target), specs)
+    if not plan["used"]:
+        return {"ir": ir_dir.name, "status": "no-cache-entries"}
+    tmp = Path(work or tempfile.mkdtemp(prefix="mb_verify_", dir=str(MB_ROOT / "tmp")
+                                       if (MB_ROOT / "tmp").exists() else None))
+    try:
+        vir = write_variant_ir(ir_dir, plan["graph"], tmp / "ir")
+        d = export_problem(vir, tmp / "problem", slot_sources=plan["sources"], slot_source_tags=plan["tags"],
+                           sub_sources=plan["sub_sources"], specs=specs, strategy="whole", target=target)
+        from . import kb_trace
+        with kbt.get().span("mb.verify.run", ir=ir_dir.name,
+                            evaluator=kbeval.evaluator if kbeval is not None else "builtin") as sp, \
+                kb_trace.get().scope(mb_stage="verify", ir=ir_dir.name):
+            if kbeval is not None:
+                res = run_problem(kbeval, d, arch=sm, work=tmp / "kb_time", reps=1, gpu_model=gpu_model,
+                                  allow_mismatch=allow_gpu_mismatch, name="verify")
+                shutil.rmtree(tmp / "kb_time" / "verify_kbwork", ignore_errors=True)
+            else:
+                res = build_and_run(d, arch=sm, graph=True)
+                res["device"] = builtin_device(sm)
+            dev = res.get("device") or {}
+            if sp is not None and hasattr(sp, "set"):
+                sp.set(device=dev.get("label"), gpu=dev.get("name"), host=dev.get("host"), passed=res.get("passed"))
+        man = json.loads((d / "manifest.json").read_text())
+        ir_name = man["ir_name"]
+        out = {"ir": ir_name, "passed": res.get("passed"), "partition_us": res.get("partition_us"),
+               "e2e_us": res.get("e2e_us"), "e2e_basis": res.get("e2e_basis"),
+               "fused": applied, "hints": hint_ids, "cache_split": [h["id"] for h in plan["hints"]],
+               "slots": {}, "device": res.get("device"),
+               "evaluator": res.get("evaluator") or {"evaluator": "builtin", "runtime": "process"}}
+        if res.get("hw_warnings"):
+            out["hw_warnings"] = res["hw_warnings"]
+        if res.get("sol"):                         # a SOL-gated export (sol_tolerance.py): the outputs' verdicts
+            out["sol"] = res["sol"]
+        for key, e in plan["used"].items():
+            sid = key.split("/")[0]
+            sc = res.get("slots", {}).get(sid, {})
+            good = bool(res.get("passed")) or bool(sc.get("ok"))
+            lst = e["model_verified"] if good else e["rejected"]
+            if ir_name not in lst:
+                lst.append(ir_name)
+            out["slots"][key] = {"impl_id": e["impl_id"], "ok": good, "rel_err": sc.get("rel_err"),
+                                 "slot_us": res.get("slot_us", {}).get(sid)}
+        out["ops"] = verify_ops(man, plan["graph"], res, specs)
+        if not res.get("passed"):
+            out["log"] = res.get("log", "")[-1500:]
+        cache.save()
+        kb_trace.record("verify", mb_stage="verify", ir=ir_name, passed=out["passed"], result=out,
+                        log=kb_trace.get().put(res.get("log")) if res.get("log") else None,
+                        files=kb_trace.files({"manifest.json": d / "manifest.json", "graph.json": vir / "graph.json"}))
+        return out
+    finally:
+        if work is None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def verify_ops(man: dict, graph: dict, res: dict, specs: dict) -> list[dict]:
+    """Per-op record of a whole-model run (search_fixes' final-model guard): name, kind, slot, the slot's source tag
+    (``hand`` = the seed kernel, ``cache:<id>`` = a cached winner, ``fused-seed...``), the op's GPU time (CUPTI
+    attribution, else events), and its plan-item identity (entry, signature hash, shape)."""
+    seed = {s["id"]: s.get("seed_source") for s in man.get("slots", [])}
+    attr, ev = res.get("attr_op_us") or {}, res.get("op_us") or {}
+    shapes = {o["name"]: o.get("shape", {}) for o in graph.get("ops", [])}
+    out = []
+    for r in man.get("ops", []):
+        rec = {"name": r["name"], "op": r["op"], "slot": r["slot"], "seed_source": seed.get(r["slot"]),
+               "us": attr.get(r["name"], ev.get(r["name"])), "shape": shapes.get(r["name"], {})}
+        spec = specs.get(r["op"])
+        if spec is not None:
+            try:
+                rec["entry"] = parse_signature(spec.signature)[0]
+                rec["signature_sha"] = signature_sha(spec.signature)
+            except Exception:  # noqa: BLE001
+                pass
+        out.append(rec)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("winners", nargs="?", help="KernelBlaster winners.json")
+    ap.add_argument("--cache", default=str(DEFAULT_CACHE))
+    ap.add_argument("--verify", nargs="*", default=[], help="IR dirs to verify at model level")
+    ap.add_argument("--arch", default="75", help="SM number (CUDA) or device label (OpenCL, e.g. adreno650)")
+    ap.add_argument("--target", default="cuda", choices=["cuda", "opencl"],
+                    help="slot target of the cache: only its winners are ingested (opencl: --verify runs with "
+                         "--evaluator board|local)")
+    ap.add_argument("--hints", "--fusion-registry", dest="hints", default=None,
+                    help="graph hints file: accepted fusions are applied and known ops "
+                         "(default kernels/cuda/graph_hints.json)")
+    ap.add_argument("--gpu-model", help="the GPU model the verification must run on (KernelBlaster evaluator)")
+    ap.add_argument("--allow-gpu-mismatch", action="store_true")
+    from . import kb_eval as ke
+    ke.add_args(ap, prefix_help="where --verify runs", local_default="builtin")
+    a = ap.parse_args()
+    kbeval = ke.from_args(a, local_default="builtin")
+    from .kb_proposals import DEFAULT_REGISTRY, accepted_fused_specs
+    from .reference_kernels import KERNEL_SPECS
+
+    specs = {**KERNEL_SPECS, **accepted_fused_specs(Path(a.hints or DEFAULT_REGISTRY), KERNEL_SPECS)}
+    cache = CudaCache(Path(a.cache), target=a.target)
+    if a.winners:
+        for r in ingest(Path(a.winners), cache, specs):
+            print(json.dumps(r))
+    for d in a.verify:
+        print(json.dumps(verify_ir(Path(d), cache, arch=a.arch, specs=specs,
+                                   hints=Path(a.hints or DEFAULT_REGISTRY), kbeval=kbeval,
+                                   gpu_model=a.gpu_model, allow_gpu_mismatch=a.allow_gpu_mismatch)))
+
+
+if __name__ == "__main__":
+    main()

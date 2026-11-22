@@ -1,0 +1,749 @@
+"""Harness 1: walk a ModelBlaster IR on the GPU with PyTorch ops.
+
+Answers "is graph.json + weights.npz enough to run the model on a GPU?"
+independently of any CUDA kernel work, and doubles as the per-op oracle
+walk_cuda.py diffs against.
+
+An `_f16` op runs its fp32 rule and rounds every output to fp16 (and the
+recurrent state of lstm_seq/gru_seq every step): the fp16 contract is fp16
+storage with fp32 math, so this is the value an exact fp16 kernel stores.
+A `_bf16` op does the same with bfloat16 (docs/bf16_cuda.md). A mixed IR
+(`--quant native`, docs/tensor_dtypes.md) is walked op by op the same way:
+each op rounds to its own kind's dtype, and its `cast_<src>_to_<dst>` ops
+convert (one rounding to a float dtype, truncation to an integer one). Every
+value is held as float32 (integers exact below 2^24).
+
+    python walk_torch.py IR_DIR [IR_DIR ...] [--json out.json] [--device cpu]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+import torch
+import torch.nn.functional as F
+
+from mbir import IR, compare, cuda_dtypes, load_ir, sol_for, strict_fp32
+
+
+def _round_f16(t):
+    """The binary16 value an fp16 kernel stores for an fp32 result (RNE; inf past 65504)."""
+    return t.half().to(t.dtype) if t.is_floating_point() else t
+
+
+def _round_bf16(t):
+    """The bfloat16 value a bf16 kernel stores for an fp32 result (RNE)."""
+    return t.to(torch.bfloat16).to(t.dtype) if t.is_floating_point() else t
+
+
+def _identity(t):
+    return t
+
+
+def _store_rounding(kind: str):
+    """What a kernel of this kind stores for an fp32 result: fp16 / bf16 rounding
+    for `_f16` / `_bf16` kinds, else the value itself."""
+    if kind.endswith("_bf16"):
+        return _round_bf16
+    return _round_f16 if kind.endswith("_f16") else _identity
+
+
+def _state_rounding(op):
+    return _store_rounding(op["op"])
+
+
+def _unary(fn):
+    return lambda ir, op, ins, dev: [fn(ins[0], op)]
+
+
+def _pool_is_ceil(sh) -> bool:
+    floor_oh = (sh["IH"] + 2 * sh.get("PH", 0) - sh.get("DH", 1) * (sh["KH"] - 1) - 1) // sh["SH"] + 1
+    return sh.get("OH", floor_oh) > floor_oh
+
+
+OPS = {
+    "relu": _unary(lambda x, op: F.relu(x)),
+    "relu6": _unary(lambda x, op: x.clamp(0.0, 6.0)),
+    "silu": _unary(lambda x, op: F.silu(x)),
+    "sigmoid": _unary(lambda x, op: torch.sigmoid(x)),
+    "elu": _unary(lambda x, op: F.elu(x, alpha=op.get("alpha", 1.0))),
+    "add": lambda ir, op, ins, dev: [ins[0] + ins[1]],
+    # a view with `offset` is a contiguous window into its input
+    "view": lambda ir, op, ins, dev: [ins[0].reshape(-1)[
+        op.get("offset", 0):op.get("offset", 0) + op["shape"]["n"]].reshape(ir.tshape(op["outputs"][0]))],
+    # conv1d is extracted as conv2d with IH=1 on a 3-D tensor: shape from the op
+    "conv2d": lambda ir, op, ins, dev: [F.conv2d(
+        _nchw(ins[0], op["shape"]), ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+        stride=(op["shape"]["SH"], op["shape"]["SW"]),
+        padding=(op["shape"]["PH"], op["shape"]["PW"]),
+        dilation=(op["shape"].get("DH", 1), op["shape"].get("DW", 1)))],
+    "conv2d_dw": lambda ir, op, ins, dev: [F.conv2d(
+        ins[0], ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+        stride=(op["shape"]["SH"], op["shape"]["SW"]),
+        padding=(op["shape"]["PH"], op["shape"]["PW"]), groups=op["shape"]["C"])],
+    # extract_graph drops ceil_mode but records the ceil-mode OH/OW; infer it.
+    "maxpool2d": lambda ir, op, ins, dev: [F.max_pool2d(
+        ins[0], (op["shape"]["KH"], op["shape"]["KW"]),
+        (op["shape"]["SH"], op["shape"]["SW"]),
+        (op["shape"].get("PH", 0), op["shape"].get("PW", 0)),
+        (op["shape"].get("DH", 1), op["shape"].get("DW", 1)),
+        ceil_mode=_pool_is_ceil(op["shape"]))],
+    # ModelBlaster folds BN at extract time: y = x * scale[c] + bias_fused[c].
+    "batchnorm2d": lambda ir, op, ins, dev: [
+        ins[0] * ir.weight(op["weight"], dev).view(1, -1, 1, 1)
+        + ir.weight(op["bias"], dev).view(1, -1, 1, 1)],
+    "linear": lambda ir, op, ins, dev: [F.linear(
+        ins[0].reshape(op["shape"]["M"], op["shape"]["K"]),
+        ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev))],
+    "matmul": lambda ir, op, ins, dev: [
+        ins[0].reshape(op["shape"]["M"], op["shape"]["K"]) @ ins[1].reshape(op["shape"]["K"], op["shape"]["N"])],
+    "softmax": lambda ir, op, ins, dev: [torch.softmax(
+        ins[0].reshape(op["shape"]["M"], op["shape"]["K"]), dim=-1)],
+    "layer_norm": lambda ir, op, ins, dev: [F.layer_norm(
+        ins[0].reshape(op["shape"]["M"], op["shape"]["K"]), (op["shape"]["K"],),
+        ir.weight(op["gamma_key"], dev), ir.weight(op["beta_key"], dev), op.get("eps", 1e-5))],
+    "sdpa": lambda ir, op, ins, dev: [F.scaled_dot_product_attention(
+        *[t.reshape(op["shape"]["BH"], op["shape"]["S"], op["shape"]["D"]) for t in ins])],
+    # MB reference divides by KH*KW unconditionally == count_include_pad=True
+    "avgpool2d": lambda ir, op, ins, dev: [F.avg_pool2d(
+        ins[0], (op["shape"]["KH"], op["shape"]["KW"]), (op["shape"]["SH"], op["shape"]["SW"]),
+        (op["shape"].get("PH", 0), op["shape"].get("PW", 0)), count_include_pad=True)],
+    "adaptive_avg_pool2d": lambda ir, op, ins, dev: [ins[0].mean(dim=(2, 3), keepdim=True)],
+    "chunk2_c1": lambda ir, op, ins, dev: list(ins[0].split(op["shape"]["c_each"], dim=1)),
+    "cat2_c1": lambda ir, op, ins, dev: [torch.cat(ins, dim=1)],
+    "cat3_c1": lambda ir, op, ins, dev: [torch.cat(ins, dim=1)],
+    "cat4_c1": lambda ir, op, ins, dev: [torch.cat(ins, dim=1)],
+    "upsample_nearest": lambda ir, op, ins, dev: [F.interpolate(
+        ins[0], scale_factor=op["shape"]["scale"], mode="nearest")],
+}
+
+
+# ---- generic ops (modelblaster/pipeline/reference_kernels_ext.py) ---------
+_R6 = range(6)
+
+
+def _d6(sh, p="d"):
+    return [sh[f"{p}{i}"] for i in _R6]
+
+
+def _strided_index(sh, p="s", dev="cpu"):
+    """off + sum_k i_k * s_k over the [d0..d5] box (strides may be negative,
+    which torch.as_strided rejects: a flip is an affine copy too)."""
+    d = _d6(sh)
+    idx = torch.full(d, sh.get("off", 0), dtype=torch.long, device=dev)
+    for k, (n, st) in enumerate(zip(d, _d6(sh, p))):
+        idx = idx + (torch.arange(n, device=dev) * st).reshape([n if j == k else 1 for j in range(6)])
+    return idx
+
+
+def _strided_copy(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(-1)
+    return [x[_strided_index(sh, dev=x.device)]]
+
+
+def _gather(ir, op, ins, dev):
+    x, idx = ins[0].reshape(-1), ins[1].reshape(-1).long()
+    return [torch.where(idx >= 0, x[idx.clamp(min=0)], torch.zeros((), device=x.device))]
+
+
+def _strided_scatter(ir, op, ins, dev):
+    sh = op["shape"]
+    y = ins[0].reshape(-1).clone()
+    y[_strided_index(sh, dev=y.device).reshape(-1)] = ins[1].reshape(-1)
+    return [y]
+
+
+def _wrap(idx, A):
+    idx = idx.long()
+    return torch.where(idx < 0, idx + A, idx)
+
+
+def _index_select(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(sh["outer"], sh["A"], sh["inner"])
+    return [torch.index_select(x, 1, _wrap(ins[1].reshape(-1), sh["A"]))]
+
+
+def _gather_dim(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(sh["outer"], sh["A"], sh["inner"])
+    idx = _wrap(ins[1].reshape(sh["outer"], sh["J"], sh["inner"]), sh["A"])
+    return [torch.gather(x, 1, idx)]
+
+
+def _scatter_dim(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(sh["outer"], sh["A"], sh["inner"])
+    idx = _wrap(ins[1].reshape(sh["outer"], sh["J"], sh["inner"]), sh["A"])
+    src = ins[2].reshape(sh["outer"], sh["J"], sh["inner"])
+    return [x.scatter_add(1, idx, src) if sh["mode"] else x.scatter(1, idx, src)]
+
+
+def _topk(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(sh["outer"], sh["A"], sh["inner"])
+    # stable sort: ties keep the lower index first, like the kernels
+    v, i = torch.sort(x, dim=1, descending=bool(sh["largest"]), stable=True)
+    return [v[:, :sh["K"]], i[:, :sh["K"]].float()]
+
+
+def _convnd(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(sh["N"], sh["IC"], sh["ID"], sh["IH"], sh["IW"])
+    w = ins[1].reshape(sh["OC"], sh["IC"] // sh["G"], sh["KD"], sh["KH"], sh["KW"])
+    b = ins[2].reshape(-1) if len(ins) > 2 else None
+    return [F.conv3d(x, w, b, (sh["SD"], sh["SH"], sh["SW"]), (sh["PD"], sh["PH"], sh["PW"]),
+                     (sh["DD"], sh["DH"], sh["DW"]), sh["G"])]
+
+
+def _catn(ir, op, ins, dev):
+    sh = op["shape"]
+    parts = [t.reshape(sh["outer"], sh[f"c{k}"], sh["inner"]) for k, t in enumerate(ins)]
+    return [torch.cat(parts, dim=1)]
+
+
+_E1 = {0: torch.neg, 1: torch.exp, 2: torch.log, 3: torch.sqrt, 4: torch.rsqrt, 5: torch.abs,
+       6: torch.tanh, 7: torch.sigmoid, 8: F.relu, 9: torch.sin, 10: torch.cos, 11: torch.erf,
+       12: F.gelu, 13: lambda x: F.gelu(x, approximate="tanh"), 14: F.silu,
+       16: torch.reciprocal, 17: torch.square, 18: F.softplus, 21: F.hardswish,
+       22: F.hardsigmoid, 23: torch.log1p, 24: torch.expm1, 25: torch.sign, 26: torch.floor,
+       27: torch.ceil, 28: torch.round, 29: lambda x: (x == 0).float(), 30: lambda x: x,
+       31: F.mish}
+
+
+def _ewise1(ir, op, ins, dev):
+    c, x = op["opc"], ins[0]
+    if c == 15:
+        return [x.clamp(op["p0"], op["p1"])]
+    if c == 19:
+        return [F.leaky_relu(x, op["p0"])]
+    if c == 20:
+        return [F.elu(x, op["p0"])]
+    return [_E1[c](x)]
+
+
+_E2 = {0: lambda a, b, al: a + al * b, 1: lambda a, b, al: a - al * b,
+       2: lambda a, b, al: a * b, 3: lambda a, b, al: a / b,
+       4: lambda a, b, al: torch.maximum(a, b), 5: lambda a, b, al: torch.minimum(a, b),
+       6: lambda a, b, al: torch.pow(a, b),
+       7: lambda a, b, al: torch.where(b != 0, torch.full_like(a, al), a),
+       8: lambda a, b, al: (a == b).float(), 9: lambda a, b, al: (a != b).float(),
+       10: lambda a, b, al: (a < b).float(), 11: lambda a, b, al: (a <= b).float(),
+       12: lambda a, b, al: (a > b).float(), 13: lambda a, b, al: (a >= b).float()}
+
+
+def _ewise2(ir, op, ins, dev):
+    sh = op["shape"]
+    d = _d6(sh)
+    a = torch.as_strided(ins[0].reshape(-1), d, _d6(sh, "sa"))
+    b = torch.as_strided(ins[1].reshape(-1), d, _d6(sh, "sb"))
+    return [_E2[op["opc"]](a, b, op.get("alpha", 1.0)).contiguous()]
+
+
+_ES = {0: lambda x, c: x + c, 1: lambda x, c: x - c, 2: lambda x, c: c - x,
+       3: lambda x, c: x * c, 4: lambda x, c: x / c, 5: lambda x, c: c / x,
+       6: lambda x, c: torch.pow(x, c), 7: lambda x, c: torch.pow(torch.full_like(x, c), x),
+       8: lambda x, c: x.clamp(min=c), 9: lambda x, c: x.clamp(max=c),
+       10: lambda x, c: (x == c).float(), 11: lambda x, c: (x != c).float(),
+       12: lambda x, c: (x < c).float(), 13: lambda x, c: (x <= c).float(),
+       14: lambda x, c: (x > c).float(), 15: lambda x, c: (x >= c).float()}
+
+
+def _reduce(ir, op, ins, dev):
+    sh, c = op["shape"], op["opc"]
+    x = ins[0].reshape(sh["outer"], sh["R"], sh["inner"])
+    r = {0: lambda: x.sum(1), 1: lambda: x.mean(1), 2: lambda: x.amax(1), 3: lambda: x.amin(1),
+         4: lambda: x.prod(1), 5: lambda: (x * x).sum(1), 6: lambda: x.norm(dim=1),
+         7: lambda: x.argmax(1).float(), 8: lambda: x.argmin(1).float(),
+         9: lambda: x.var(1, unbiased=False), 10: lambda: x.var(1, unbiased=True)}[c]()
+    return [r]
+
+
+def _softmax_dim(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(sh["outer"], sh["R"], sh["inner"])
+    return [(torch.log_softmax if op.get("log_out") else torch.softmax)(x, dim=1)]
+
+
+def _conv2d_grouped(ir, op, ins, dev):
+    sh = op["shape"]
+    return [F.conv2d(ins[0].reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"]), ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+                     (sh["SH"], sh["SW"]), (sh["PH"], sh["PW"]), (sh["DH"], sh["DW"]), sh["G"])]
+
+
+def _maxpool2d_ex(ir, op, ins, dev):
+    sh = op["shape"]
+    y = F.max_pool2d(ins[0], (sh["KH"], sh["KW"]), (sh["SH"], sh["SW"]), (sh["PH"], sh["PW"]),
+                     (sh["DH"], sh["DW"]), ceil_mode=True)
+    return [y[:, :, :sh["OH"], :sh["OW"]]]
+
+
+def _nchw(x, sh):
+    return x.reshape(sh["N"], sh["IC"], sh["IH"], sh["IW"])
+
+
+def _conv_transpose2d(ir, op, ins, dev):
+    sh = op["shape"]
+    opad = tuple(max(0, _out_pad(sh["I" + a], sh["O" + a], sh["K" + a], sh["S" + a], sh["P" + a],
+                                 sh["D" + a])) for a in "HW")
+    y = F.conv_transpose2d(_nchw(ins[0], sh), ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+                           (sh["SH"], sh["SW"]), (sh["PH"], sh["PW"]), opad, groups=sh["G"],
+                           dilation=(sh["DH"], sh["DW"]))
+    return [y[:, :, :sh["OH"], :sh["OW"]]]
+
+
+def _out_pad(i, o, k, s, p, d):
+    return o - ((i - 1) * s - 2 * p + d * (k - 1) + 1)
+
+
+def _conv3d(ir, op, ins, dev):
+    sh = op["shape"]
+    return [F.conv3d(ins[0], ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+                     (sh["SD"], sh["SH"], sh["SW"]), (sh["PD"], sh["PH"], sh["PW"]),
+                     (sh["DD"], sh["DH"], sh["DW"]), sh["G"])]
+
+
+def _conv_transpose3d(ir, op, ins, dev):
+    sh = op["shape"]
+    opad = tuple(_out_pad(sh["I" + a], sh["O" + a], sh["K" + a], sh["S" + a], sh["P" + a], sh["D" + a])
+                 for a in "DHW")
+    return [F.conv_transpose3d(ins[0], ir.weight(op["weight"], dev), ir.weight(op.get("bias"), dev),
+                               (sh["SD"], sh["SH"], sh["SW"]), (sh["PD"], sh["PH"], sh["PW"]),
+                               opad, sh["G"], (sh["DD"], sh["DH"], sh["DW"]))]
+
+
+def _pool3d_ceil(sh) -> bool:
+    floor_od = (sh["ID"] + 2 * sh["PD"] - sh.get("DD", 1) * (sh["KD"] - 1) - 1) // sh["SD"] + 1
+    return sh["OD"] > floor_od or _pool_is_ceil(sh)
+
+
+def _maxpool3d(ir, op, ins, dev):
+    sh = op["shape"]
+    return [F.max_pool3d(ins[0], (sh["KD"], sh["KH"], sh["KW"]), (sh["SD"], sh["SH"], sh["SW"]),
+                         (sh["PD"], sh["PH"], sh["PW"]), (sh["DD"], sh["DH"], sh["DW"]),
+                         ceil_mode=_pool3d_ceil(sh))]
+
+
+def _avgpool3d(ir, op, ins, dev):  # MB divides by KD*KH*KW (count_include_pad)
+    sh = op["shape"]
+    return [F.avg_pool3d(ins[0], (sh["KD"], sh["KH"], sh["KW"]), (sh["SD"], sh["SH"], sh["SW"]),
+                         (sh["PD"], sh["PH"], sh["PW"]), ceil_mode=_pool3d_ceil(sh),
+                         count_include_pad=True, divisor_override=sh["KD"] * sh["KH"] * sh["KW"])]
+
+
+def _group_norm(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(sh["N"], sh["C"], sh["HW"])
+    y = F.group_norm(x, sh["G"], ir.weight(op["gamma_key"], dev).reshape(-1),
+                     ir.weight(op["beta_key"], dev).reshape(-1), op.get("eps", 1e-5))
+    return [y.reshape(ins[0].shape)]
+
+
+def _lstm_seq(ir, op, ins, dev):
+    x, h, c, w_ih, w_hh, bg = ins
+    sh = op["shape"]
+    B, T, H = sh["B"], sh["T"], sh["H"]
+    x = x.reshape(B, T, sh["I"])
+    h, c = h.reshape(B, H).clone(), c.reshape(B, H).clone()
+    y = torch.empty(B, T, H, device=x.device)
+    q = _state_rounding(op)                 # fp16: h and c are stored every step
+    for s_ in range(T):
+        t = T - 1 - s_ if sh["reverse"] else s_
+        g = x[:, t] @ w_ih.T + h @ w_hh.T + bg
+        i, f, gg, o = g.chunk(4, dim=1)
+        c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(gg)
+        h = q(torch.sigmoid(o) * torch.tanh(c))
+        c = q(c)
+        y[:, t] = h
+    return [y, h, c]
+
+
+def _gru_seq(ir, op, ins, dev):
+    x, h, w_ih, w_hh, b_ih, b_hh = ins
+    sh = op["shape"]
+    B, T, H = sh["B"], sh["T"], sh["H"]
+    x = x.reshape(B, T, sh["I"])
+    h = h.reshape(B, H).clone()
+    y = torch.empty(B, T, H, device=x.device)
+    q = _state_rounding(op)
+    for s_ in range(T):
+        t = T - 1 - s_ if sh["reverse"] else s_
+        gi = x[:, t] @ w_ih.T + b_ih
+        gh = h @ w_hh.T + b_hh
+        r = torch.sigmoid(gi[:, :H] + gh[:, :H])
+        z = torch.sigmoid(gi[:, H:2 * H] + gh[:, H:2 * H])
+        n = torch.tanh(gi[:, 2 * H:] + r * gh[:, 2 * H:])
+        h = q((1 - z) * n + z * h)
+        y[:, t] = h
+    return [y, h]
+
+
+def _reduce3(fn):
+    def rule(ir, op, ins, dev):
+        sh = op["shape"]
+        R = sh.get("reduce", sh.get("R"))
+        return [fn(ins[0].reshape(sh["outer"], R, sh["inner"]))]
+    return rule
+
+
+OPS.update({
+    "lstm_seq": _lstm_seq, "gru_seq": _gru_seq,
+    "gelu": _unary(lambda x, op: F.gelu(x)),
+    "sum_dim": _reduce3(lambda x: x.sum(1)), "mean_dim": _reduce3(lambda x: x.mean(1)),
+    "max_dim": _reduce3(lambda x: x.amax(1)), "min_dim": _reduce3(lambda x: x.amin(1)),
+    "strided_copy": _strided_copy, "gather": _gather, "catn": _catn,
+    "ewise1": _ewise1, "ewise2": _ewise2,
+    "ewise_scalar": lambda ir, op, ins, dev: [_ES[op["opc"]](ins[0], op["c"])],
+    "reduce": _reduce, "softmax_dim": _softmax_dim, "conv2d_grouped": _conv2d_grouped,
+    "maxpool2d_ex": _maxpool2d_ex, "conv_transpose2d": _conv_transpose2d,
+    "bmm": lambda ir, op, ins, dev: [torch.bmm(
+        ins[0].reshape(op["shape"]["batch"], op["shape"]["M"], op["shape"]["K"]),
+        ins[1].reshape(op["shape"]["batch"], op["shape"]["K"], op["shape"]["N"]))],
+    "mul_scalar": lambda ir, op, ins, dev: [ins[0] * op["scalar"]],
+    "mul": lambda ir, op, ins, dev: [ins[0] * ins[1]],
+    "tanh": _unary(lambda x, op: torch.tanh(x)),
+    "leaky_relu": _unary(lambda x, op: F.leaky_relu(x, op.get("negative_slope", 0.01))),
+    "hardtanh": _unary(lambda x, op: x.clamp(op.get("min_val", -1.0), op.get("max_val", 1.0))),
+    "softplus": _unary(lambda x, op: F.softplus(x)),
+    "conv3d": _conv3d, "conv_transpose3d": _conv_transpose3d,
+    "maxpool3d": _maxpool3d, "avgpool3d": _avgpool3d, "group_norm": _group_norm,
+    # C = A.T @ B with A stored (K, M); C = A @ B.T with B stored (N, K)
+    "matmul_ta": lambda ir, op, ins, dev: [
+        ins[0].reshape(op["shape"]["K"], op["shape"]["M"]).t() @ ins[1].reshape(op["shape"]["K"], op["shape"]["N"])],
+    "matmul_tb": lambda ir, op, ins, dev: [
+        ins[0].reshape(op["shape"]["M"], op["shape"]["K"]) @ ins[1].reshape(op["shape"]["N"], op["shape"]["K"]).t()],
+    "index_select": _index_select, "gather_dim": _gather_dim, "scatter_dim": _scatter_dim,
+    "topk": _topk, "convnd": _convnd, "strided_scatter": _strided_scatter,
+    # MB's `gelu_exact` is the tanh (MinGPT) form; `gelu` is the erf form
+    "gelu_exact": _unary(lambda x, op: F.gelu(x, approximate="tanh")),
+    "cumsum": lambda ir, op, ins, dev: [torch.cumsum(
+        ins[0].reshape(op["shape"]["outer"], op["shape"]["axis"], op["shape"]["inner"]), dim=1)],
+    "cumprod": lambda ir, op, ins, dev: [torch.cumprod(
+        ins[0].reshape(op["shape"]["outer"], op["shape"]["axis"], op["shape"]["inner"]), dim=1)],
+})
+
+
+def _bmm_strided(ir, op, ins, dev):
+    """layout_fold's bmm with strided operands (reference_kernels_ext.BMM_STRIDED)."""
+    sh = op["shape"]
+    a, b = ins[0].reshape(-1), ins[1].reshape(-1)
+    A = torch.as_strided(a, (sh["B0"], sh["B1"], sh["M"], sh["K"]),
+                         (sh["a_s0"], sh["a_s1"], sh["a_sm"], sh["a_sk"]), sh["a_off"])
+    B = torch.as_strided(b, (sh["B0"], sh["B1"], sh["K"], sh["N"]),
+                         (sh["b_s0"], sh["b_s1"], sh["b_sk"], sh["b_sn"]), sh["b_off"])
+    n = 1
+    for d in ir.graph["tensors"][op["outputs"][0]]["shape"]:
+        n *= int(d)
+    c = torch.zeros(n, dtype=a.dtype, device=a.device)
+    torch.as_strided(c, (sh["B0"], sh["B1"], sh["M"], sh["N"]),
+                     (sh["c_s0"], sh["c_s1"], sh["c_sm"], sh["c_sn"]), sh["c_off"]).copy_(A @ B)
+    return [c]
+
+
+OPS["bmm_strided"] = _bmm_strided
+
+
+def _attention(ir, op, ins, dev):
+    """attention_fuse's fused attention (reference_kernels_ext.ATTENTION): EXACT fp32 math (no rounding of the
+    scores / probabilities; walk rounds the output once), rows in chunks so the score matrix stays ~1 GB."""
+    sh = op["shape"]
+    B0, B1, M, N, D, DV = (int(sh[k]) for k in ("B0", "B1", "M", "N", "D", "DV"))
+    q, k, v = (t.reshape(-1).float() for t in ins[:3])
+    Q = torch.as_strided(q, (B0, B1, M, D), (sh["q_s0"], sh["q_s1"], sh["q_sm"], 1), sh["q_off"])
+    K = torch.as_strided(k, (B0, B1, N, D), (sh["k_s0"], sh["k_s1"], sh["k_sn"], 1), sh["k_off"])
+    V = torch.as_strided(v, (B0, B1, N, DV), (sh["v_s0"], sh["v_s1"], sh["v_sn"], 1), sh["v_off"])
+    n = 1
+    for d in ir.graph["tensors"][op["outputs"][0]]["shape"]:
+        n *= int(d)
+    out = torch.zeros(n, dtype=torch.float32, device=q.device)
+    O = torch.as_strided(out, (B0, B1, M, DV), (sh["o_s0"], sh["o_s1"], sh["o_sm"], 1), sh["o_off"])
+    step = max(1, (1 << 28) // max(1, B0 * B1 * N))
+    kt = K.transpose(-1, -2)
+    for m0 in range(0, M, step):
+        m1 = min(M, m0 + step)
+        s = (Q[:, :, m0:m1] @ kt) * float(op["scale"])
+        if sh.get("causal"):
+            rows = torch.arange(m0, m1, device=s.device)[:, None]
+            s = s.masked_fill(torch.arange(N, device=s.device)[None, :] > rows, float("-inf"))
+        p = torch.relu(s) if sh.get("act") == 1 else torch.softmax(s, -1)
+        O[:, :, m0:m1] = p @ V
+    return [out]
+
+
+OPS["attention"] = _attention
+def _cast_rule(dst: str):
+    """`cast_<src>_to_<dst>`: the value as float32 (an f16 / bf16 destination is
+    rounded by _store_rounding, as every op of that kind); integer destinations
+    truncate toward zero, bool is `!= 0`."""
+    def val(x):                    # a float keeps its dtype (float64 in the exact walk)
+        return x if x.is_floating_point() else x.float()
+    if dst == "b8":
+        return lambda ir, op, ins, dev: [(val(ins[0]) != 0).float()]
+    if dst in ("i64", "i32", "u8"):
+        return lambda ir, op, ins, dev: [torch.trunc(val(ins[0]))]
+    return lambda ir, op, ins, dev: [val(ins[0])]
+
+
+OPS.update({cuda_dtypes.cast_kind(a, b): _cast_rule(b) for a, b in cuda_dtypes.CASTS})
+
+
+# precision-policy casts (pipeline/precision_casts.py): values pass through; cast_f32_to_f16 ends in _f16, so the
+# walk rounds its output to fp16 like any fp16 op
+OPS["cast_f16_to_f32"] = lambda ir, op, ins, dev: [ins[0].reshape(-1).clone()]
+OPS["cast_f32_to_f16"] = lambda ir, op, ins, dev: [ins[0].reshape(-1).clone()]
+
+def _rule(kind: str):
+    """An `_f16` / `_bf16` kind runs its fp32 rule (walk rounds the outputs)."""
+    if kind in OPS:
+        return OPS[kind]
+    for sfx in ("_bf16", "_f16"):
+        if kind.endswith(sfx):
+            return OPS.get(kind[:-len(sfx)])
+    return None
+
+
+# ---- Level1-only ops (losses, norms, index ops); semantics as their KernelSpecs
+def _orit(sh, x):
+    return x.reshape(sh["outer"], sh.get("reduce", sh.get("axis", sh.get("R"))), sh["inner"])
+
+
+def _excl_cumsum(ir, op, ins, dev):
+    sh = op["shape"]
+    x = ins[0].reshape(-1, sh["N"])[:sh["Bout"]]
+    return [torch.cat([torch.zeros(sh["Bout"], 1, dtype=x.dtype, device=x.device), x.cumsum(1)], dim=1)]
+
+
+OPS.update({
+    "hinge_loss": lambda ir, op, ins, dev: [torch.clamp(
+        1 - ins[0].reshape(-1, op["shape"]["targ_len"]) * ins[1].reshape(1, -1), min=0).mean()],
+    "diag_matmul": lambda ir, op, ins, dev: [ins[0].reshape(-1, 1) * ins[1].reshape(op["shape"]["N"], op["shape"]["M"])],
+    "triu": lambda ir, op, ins, dev: [torch.triu(ins[0].reshape(op["shape"]["M"], op["shape"]["N"]),
+                                                op["shape"].get("diagonal", 0))],
+    "tril": lambda ir, op, ins, dev: [torch.tril(ins[0].reshape(op["shape"]["M"], op["shape"]["N"]),
+                                                op["shape"].get("diagonal", 0))],
+    "matmul_tatb": lambda ir, op, ins, dev: [
+        ins[0].reshape(op["shape"]["K"], op["shape"]["M"]).T @ ins[1].reshape(op["shape"]["N"], op["shape"]["K"]).T],
+    "log_softmax": lambda ir, op, ins, dev: [torch.log_softmax(
+        ins[0].reshape(op["shape"]["M"], op["shape"]["K"]), dim=-1)],
+    "swish": _unary(lambda x, op: x * torch.sigmoid(x)),
+    "selu": _unary(lambda x, op: F.selu(x)),
+    "hardsigmoid": _unary(lambda x, op: F.hardsigmoid(x)),
+    "softsign": _unary(lambda x, op: x / (1 + x.abs())),
+    "log": _unary(lambda x, op: torch.log(x)),
+    "rms_norm": lambda ir, op, ins, dev: [(lambda x: x / torch.sqrt((x * x).mean(1, keepdim=True) + op["eps"]))(
+        _orit(op["shape"], ins[0]))],
+    "frobenius_norm": lambda ir, op, ins, dev: [ins[0] / torch.sqrt((ins[0] * ins[0]).sum())],
+    "mean_abs_norm": lambda ir, op, ins, dev: [(lambda x: x / x.abs().mean(1, keepdim=True))(_orit(op["shape"], ins[0]))],
+    "l2_norm": lambda ir, op, ins, dev: [(lambda x: x / torch.sqrt((x * x).sum(1, keepdim=True)))(_orit(op["shape"], ins[0]))],
+    "argmax_dim": lambda ir, op, ins, dev: [_orit(op["shape"], ins[0]).argmax(1)],
+    "argmin_dim": lambda ir, op, ins, dev: [_orit(op["shape"], ins[0]).argmin(1)],
+    "flip": lambda ir, op, ins, dev: [_orit(op["shape"], ins[0]).flip(1)],
+    "exclusive_cumsum": _excl_cumsum,
+    "mse_loss": lambda ir, op, ins, dev: [((ins[0].reshape(-1) - ins[1].reshape(-1)) ** 2).mean()],
+    "cross_entropy_loss": lambda ir, op, ins, dev: [F.cross_entropy(
+        ins[0].reshape(op["shape"]["N"], op["shape"]["C"]), ins[1].reshape(-1).long())],
+    "huber_loss": lambda ir, op, ins, dev: [F.smooth_l1_loss(
+        ins[0].reshape(-1), ins[1].reshape(-1), beta=op.get("beta", 1.0))],
+    "kldiv_loss": lambda ir, op, ins, dev: [F.kl_div(
+        ins[0].reshape(op["shape"]["N"], op["shape"]["C"]), ins[1].reshape(op["shape"]["N"], op["shape"]["C"]),
+        reduction="batchmean")],
+    "triplet_loss": lambda ir, op, ins, dev: [F.triplet_margin_loss(
+        *(t.reshape(op["shape"]["B"], op["shape"]["F"]) for t in ins), margin=op.get("margin", 1.0), p=2)],
+})
+
+
+class _Cast:
+    """``ir`` with every float input / constant / weight cast to ``dtype`` (the exact-math walk)."""
+
+    def __init__(self, ir: IR, dtype):
+        self._ir, self._dt = ir, dtype
+
+    def __getattr__(self, k):
+        return getattr(self._ir, k)
+
+    def _c(self, t):
+        return t.to(self._dt) if t is not None and t.is_floating_point() else t
+
+    def input_tensors(self, device):
+        return {k: self._c(v) for k, v in self._ir.input_tensors(device).items()}
+
+    def const_tensors(self, device, **kw):
+        return {k: self._c(v) for k, v in self._ir.const_tensors(device, **kw).items()}
+
+    def weight(self, key, device):
+        return self._c(self._ir.weight(key, device))
+
+
+def walk(ir: IR, dev="cuda", keep_all=False, *, dtype=None, store_rounding=True, keep=None):
+    """Returns (output_flat, env) — env maps every IR tensor to its value.
+
+    ``dtype`` (e.g. torch.float64) runs the math in that dtype: float inputs,
+    constants, weights and every op's float outputs are cast to it;
+    ``store_rounding=False`` drops the `_f16` / `_bf16` store rounding (with
+    float64: the exact value the reference approximates). ``keep``: a set of
+    tensor names -- every other tensor leaves env after its last use (the
+    graph outputs are always kept), so the walk holds only its live set."""
+    if dtype is not None:
+        ir = _Cast(ir, dtype)
+    env = ir.input_tensors(dev)
+    env.update(ir.const_tensors(dev))
+    if keep is not None:
+        keep = set(keep) | set(ir.output_names())
+        last = {}
+        for k, op in enumerate(ir.ops):
+            for t in op["inputs"]:
+                last[t] = k
+    def run_op(op):
+        if "sub_ops" in op:                    # fused op (kb_proposals): its parts in order
+            for sub in op["sub_ops"]:
+                run_op(sub)
+            return
+        fn = _rule(op["op"])
+        if fn is None:
+            raise NotImplementedError(op["op"])
+        outs = fn(ir, op, [env[t] for t in op["inputs"]], dev)
+        rnd = _store_rounding(op["op"]) if store_rounding else _identity
+        if rnd is not _identity:
+            outs = [rnd(v) for v in outs]
+        if dtype is not None:
+            outs = [v.to(dtype) if v.is_floating_point() else v for v in outs]
+        for name, val in zip(op["outputs"], outs):
+            env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
+
+    try:
+        for k, op in enumerate(ir.ops):
+            run_op(op)
+            if keep is not None:
+                for t in [*op["inputs"], *op["outputs"], *op.get("internal", []),
+                          *(t for s in op.get("sub_ops", []) for t in s["outputs"])]:
+                    if t not in keep and last.get(t, -1) <= k:
+                        env.pop(t, None)
+        # integer outputs (a mixed IR's i64 io) as float; floats keep their dtype (float64 walk)
+        out = torch.cat([env[t].reshape(-1) if env[t].is_floating_point() else env[t].reshape(-1).float()
+                         for t in ir.output_names()])
+    finally:
+        run_op = None      # break the closure<->cell reference cycle (run_op calls itself): it pins `env`
+    return out, env
+
+
+def walk_free(ir: IR, dev="cuda", *, dtype=None, store_rounding=True, grab=None, skip=None, cpu_fallback=True):
+    """``walk`` with the memory discipline of a verifier: every intermediate leaves the environment after its last
+    reader (``walk``'s ``keep`` pruning, but also for the sampled tensors), tensors in ``grab`` are copied to host the
+    moment they are produced, ops whose index is in ``skip`` (dead ops, graph_prune) do not run, and a CUDA
+    out-of-memory error is retried on the CPU. Same op rules, same store rounding, same float64 option as ``walk`` --
+    the values are identical (pipeline/tests/test_graph_rewrite.py compares them bit for bit).
+
+    -> (output_flat, got): ``got`` maps each name in ``grab`` that the walk produced to its value on the CPU (a copy;
+    float tensors keep the walk's dtype, so float64 in the exact walk)."""
+    try:
+        return _walk_free(ir, dev, dtype, store_rounding, grab, skip)
+    except (torch.cuda.OutOfMemoryError, MemoryError):
+        if not cpu_fallback or dev == "cpu":
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return _walk_free(ir, "cpu", dtype, store_rounding, grab, skip)
+
+
+def _walk_free(ir, dev, dtype, store_rounding, grab, skip):
+    if dtype is not None:
+        ir = _Cast(ir, dtype)
+    grab, skip = set(grab or ()), set(skip or ())
+    env = ir.input_tensors(dev)
+    consts = ir.const_tensors(dev)
+    env.update(consts)
+    outs = list(ir.output_names())
+    keep = set(outs) | set(consts)
+    last = {}
+    for k, op in enumerate(ir.ops):
+        if k in skip:
+            continue
+        for t in op["inputs"]:
+            last[t] = k
+    got = {}
+
+    def run_op(op):
+        if "sub_ops" in op:
+            for sub in op["sub_ops"]:
+                run_op(sub)
+            return
+        fn = _rule(op["op"])
+        if fn is None:
+            raise NotImplementedError(op["op"])
+        res = fn(ir, op, [env[t] for t in op["inputs"]], dev)
+        rnd = _store_rounding(op["op"]) if store_rounding else _identity
+        if rnd is not _identity:
+            res = [rnd(v) for v in res]
+        if dtype is not None:
+            res = [v.to(dtype) if v.is_floating_point() else v for v in res]
+        for name, val in zip(op["outputs"], res):
+            env[name] = val.reshape(ir.tshape(name)) if name in ir.graph["tensors"] else val
+
+    try:
+        for k, op in enumerate(ir.ops):
+            if k in skip:
+                continue
+            run_op(op)
+            names = [*op["inputs"], *op["outputs"], *op.get("internal", []),
+                     *(t for s in op.get("sub_ops", []) for t in s["outputs"])]
+            for t in names:
+                if t in grab and t not in got and t in env and t not in op["inputs"]:
+                    got[t] = env[t].detach().cpu().clone()
+            for t in names:
+                if t not in keep and last.get(t, -1) <= k:
+                    env.pop(t, None)
+        out = torch.cat([env[t].reshape(-1) if env[t].is_floating_point() else env[t].reshape(-1).float()
+                         for t in outs])
+    finally:
+        run_op = None      # break the closure<->cell reference cycle (run_op calls itself): it pins `env`
+    return out, got
+
+
+def run_one(d: str, dev="cuda") -> dict:
+    ir = load_ir(d)
+    ops = sorted({o["op"] for o in ir.ops})
+    missing = [o for o in ops if _rule(o) is None]
+    rec = {"ir": ir.name, "n_ops": len(ir.ops), "op_types": ops, "unsupported": missing}
+    if missing:
+        rec["ok"] = False
+        return rec
+    with torch.no_grad():
+        out, _ = walk(ir, dev)
+        rec.update(compare(out, ir.golden_out, ir.dtype, sol=sol_for(ir)))
+        if dev == "cuda":
+            # warm timing of the whole walk (eager, includes launch overhead)
+            torch.cuda.synchronize()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(10):
+                walk(ir, dev)
+            end.record()
+            torch.cuda.synchronize()
+            rec["eager_ms"] = start.elapsed_time(end) / 10
+    return rec
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("irs", nargs="+")
+    ap.add_argument("--json")
+    ap.add_argument("--device", default="cuda")
+    a = ap.parse_args()
+    strict_fp32()
+    results = []
+    for d in a.irs:
+        try:
+            r = run_one(d, dev=a.device)
+        except Exception as e:  # report and keep going
+            r = {"ir": d, "ok": False, "error": f"{type(e).__name__}: {e}"}
+        results.append(r)
+        print(json.dumps(r))
+    if a.json:
+        json.dump(results, open(a.json, "w"), indent=1)
+    sys.exit(0 if all(r.get("ok") for r in results) else 1)
+
+
+if __name__ == "__main__":
+    main()

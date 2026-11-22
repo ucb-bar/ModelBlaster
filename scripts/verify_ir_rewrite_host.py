@@ -88,6 +88,21 @@ def _tile_names(rewritten: dict, tensor: str) -> list[str]:
     permutation of the right data and report a false difference.
     """
     have = {t for op in rewritten.get("ops", []) for t in op.get("outputs", [])}
+    # An OH (row-band) tile is not a contiguous slice of its parent in NCHW, so
+    # concatenating tiles in tile order would compare a permutation of the right
+    # data. Tiles alias the parent buffer at 0 and scatter into it; inspect the
+    # PARENT, which is what the consumers read.
+    rt = (rewritten.get("tensors") or {})
+    row_tiles = sorted(
+        (n for n in have if n.startswith(f"{tensor}.tile_")
+         and (rt.get(n) or {}).get("alias_kind") == "row_window"),
+        key=lambda n: int(n.rsplit("_", 1)[1]))
+    if row_tiles:
+        # Inspection fires on an op's OUTPUT tensor, and the parent has no
+        # producer. Every tile's output aliases the parent at 0, so the LAST
+        # tile's tensor (widened to the parent's shape by main()) dumps the
+        # whole parent once every band has been scattered.
+        return [row_tiles[-1]]
     tiles = sorted(
         (n for n in have if n.startswith(f"{tensor}.tile_")),
         key=lambda n: int(n.rsplit("_", 1)[1]))
@@ -180,6 +195,11 @@ def main(argv=None) -> int:
     names = _tile_names(new_ir, a.tensor)
     base_ir = {**base_ir, "inspect_tensors": [a.tensor]}
     new_ir = {**new_ir, "inspect_tensors": names}
+    rt = new_ir.get("tensors") or {}
+    if len(names) == 1 and (rt.get(names[0]) or {}).get("alias_kind") == "row_window":
+        tens = {k: dict(v) for k, v in rt.items()}
+        tens[names[0]]["shape"] = list(tens[a.tensor]["shape"])
+        new_ir["tensors"] = tens
 
     base_err, base_insp = _build_and_run(base_ir, "baseline", a, work)
     new_err, new_insp = _build_and_run(new_ir, "rewritten", a, work)

@@ -22,7 +22,7 @@
     }
   ],
   "notes": [
-    "FireSim bitstream for this exact 2-tile topology is not yet built; spike via the merlin/tools/spike-hetero wrapper is the functional simulator today. spike-hetero loads both Gemmini and Saturn OPU extensions into one binary so a 2-hart ELF can decode RoCC custom-3 and OP-V instructions side-by-side.",
+    "FireSim bitstream for this exact 2-tile topology is not yet built; spike via the spike-hetero wrapper is the functional simulator today. spike-hetero loads both Gemmini and Saturn OPU extensions into one binary so a 2-hart ELF can decode RoCC custom-3 and OP-V instructions side-by-side.",
     "spike-hetero is functional-only — both extensions execute atomically with no microarchitectural pipeline model. Cycle counts from spike on this target are NOT authoritative; use FireSim once the matching bitstream lands."
   ]
 }
