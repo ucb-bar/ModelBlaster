@@ -544,14 +544,28 @@ def get_calibration_samples(n: int) -> list:
     return out
 
 
-# extract_graph --quant int8: every linear int8 (dynamic per-token activations, SmoothQuant,
-# per-channel weights; pipeline/int8_mixed.py) except the ones measured to cost accuracy
-INT8_POLICY = {"base": "linear", "alpha": 0.5, "keep_fp32": []}
+# extract_graph --quant int8 (pipeline/int8_mixed.py: linears -> dynamic per-token int8 activations,
+# SmoothQuant factors, per-channel int8 weights). Chosen on 13 held-out observations against
+# lerobot's sample_actions (docs/vulkan_amd.md, "int8"): the prefix's KV cache feeds every layer of
+# every flow step, and int8 there costs the most accuracy for the least time (its linears are ~7%
+# of the chunk), so it stays fp32; SigLIP's fc2 (input: the GELU output, outlier channels) too.
+INT8_POLICY = {
+    "vision": {"base": "linear", "alpha": 0.8, "keep_fp32": ["*.fc2"]},
+    "prefix": {"base": "linear", "alpha": 0.8, "keep_fp32": ["*"]},
+    "step": {"base": "linear", "alpha": 0.65, "keep_fp32": []},
+}
+# every linear int8 (MB_SMOLVLA_INT8=all): the fastest mix, measured too
+INT8_ALL = {"vision": {"base": "linear", "alpha": 0.8}, "prefix": {"base": "linear", "alpha": 0.65},
+            "step": {"base": "linear", "alpha": 0.65}}
 
 
 def get_int8_mixed_policy():
-    """The int8 IR's policy (pipeline/int8_mixed.py); MB_SMOLVLA_INT8 (a name or JSON dict) overrides it."""
-    return os.environ.get("MB_SMOLVLA_INT8") or dict(INT8_POLICY)
+    """The current part's int8 policy (pipeline/int8_mixed.py). MB_SMOLVLA_INT8: 'all' (INT8_ALL),
+    or a policy (name / JSON dict) for this part."""
+    env = os.environ.get("MB_SMOLVLA_INT8")
+    if env == "all":
+        return dict(INT8_ALL[_part()])
+    return env or dict(INT8_POLICY[_part()])
 
 
 def load_policy(img: int = 256, model_id: str = "lerobot/smolvla_base"):
