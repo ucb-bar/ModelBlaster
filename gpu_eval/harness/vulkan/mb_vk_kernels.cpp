@@ -258,7 +258,11 @@ static bool skinny(const float *A, const mb_packed &W, float *C, const float *bi
 }
 
 static void gemm(const float *A, const float *B, float *C, const float *bias, int batch, int M, int N, int K,
-                 int sAb, int sAm, int sAk, int sBb, int sBk, int sBn, float alpha = 1.0f) {
+                 int sAb, int sAm, int sAk, int sBb, int sBk, int sBn, float alpha = 1.0f, int sCb = -1,
+                 int sCm = -1) {
+    bool cdense = (sCb < 0 || sCb == M * N) && (sCm < 0 || sCm == N);   // strided C: no skinny / split-K
+    if (sCb < 0) sCb = M * N;
+    if (sCm < 0) sCm = N;
     static int pipes[5] = {-1, -1, -1, -1, -1};
     if (M <= 0 || N <= 0 || batch <= 0) return;
     int v = gemm_pick(M, N, K);
@@ -269,14 +273,14 @@ static void gemm(const float *A, const float *B, float *C, const float *bias, in
              : (sBn == 1 && N % 4 == 0 && sBk % 4 == 0 && sBb % 4 == 0 && al16(B)) ? 2 : 0;
     if (getenv("MB_VK_NOVEC")) vecA = vecB = 0;
     static int use_skinny = env_int("MB_VK_SKINNY", 1);
-    if (use_skinny && batch == 1 && M <= 64 && vecA == 1 && sBk == 1 && sBn == K && K % 16 == 0) {
+    if (cdense && use_skinny && batch == 1 && M <= 64 && vecA == 1 && sBk == 1 && sBn == K && K % 16 == 0) {
         const mb_packed *pw = find_packed(B);
         if (pw && pw->f16 != 2 && skinny(A, *pw, C, bias, M, N, K, sAm, alpha)) return;
     }
     uint32_t gx = (uint32_t)((N + GV[v].bn - 1) / GV[v].bn), gy = (uint32_t)((M + GV[v].bm - 1) / GV[v].bm);
     long tiles = (long)gx * gy * batch;
     int nsplit = 1, target = splitk_target();
-    if (target > 0 && tiles < target && K >= 512) {
+    if (cdense && target > 0 && tiles < target && K >= 512) {
         nsplit = (int)((target + tiles - 1) / tiles);
         int maxs = K / 256;                       // keep >= 256 k per split
         if (nsplit > maxs) nsplit = maxs;
@@ -300,7 +304,7 @@ static void gemm(const float *A, const float *B, float *C, const float *bias, in
         return;
     }
     mb_pc pc;
-    pc.p(A).p(B).p(C).p(bias).i(M).i(N).i(K).i(sAb).i(sAm).i(sAk).i(sBb).i(sBk).i(sBn).i(M * N).i(N).f(alpha)
+    pc.p(A).p(B).p(C).p(bias).i(M).i(N).i(K).i(sAb).i(sAm).i(sAk).i(sBb).i(sBk).i(sBn).i(sCb).i(sCm).f(alpha)
         .i(1).i(K).i(vecA).i(vecB);
     mb_vk_dispatch(pipe, gx, gy, (uint32_t)batch, pc);
 }
@@ -321,6 +325,21 @@ void kernel_matmul_tatb(const float *A, const float *B, float *C, int M, int K, 
 }
 void kernel_bmm(const float *A, const float *B, float *C, int batch, int M, int K, int N) {
     gemm(A, B, C, nullptr, batch, M, N, K, M * K, K, 1, K * N, N, 1);
+}
+// layout_fold's bmm with strided operands: one tiled GEMM per b0 with b1 as its batch; a row-major C
+// (c_sn == 1) directly, a column-major one (c_sm == 1) as C^T = B^T A^T
+void kernel_bmm_strided(const float *A, const float *B, float *C, int B0, int B1, int M, int K, int N, int a_off,
+                        int a_s0, int a_s1, int a_sm, int a_sk, int b_off, int b_s0, int b_s1, int b_sk, int b_sn,
+                        int c_off, int c_s0, int c_s1, int c_sm, int c_sn) {
+    for (int b0 = 0; b0 < B0; b0++) {
+        const float *a = A + a_off + (long)b0 * a_s0;
+        const float *b = B + b_off + (long)b0 * b_s0;
+        float *c = C + c_off + (long)b0 * c_s0;
+        if (c_sn == 1)
+            gemm(a, b, c, nullptr, B1, M, N, K, a_s1, a_sm, a_sk, b_s1, b_sk, b_sn, 1.0f, c_s1, c_sm);
+        else
+            gemm(b, a, c, nullptr, B1, N, M, K, b_s1, b_sn, b_sk, a_s1, a_sk, a_sm, 1.0f, c_s1, c_sn);
+    }
 }
 
 // ------------------------------------------------------------------ conv / pool

@@ -300,6 +300,29 @@ def test_bmm_and_patch_conv(vk):
     assert _rel(y2, ref2.numpy()) < 1e-5
 
 
+@pytest.mark.parametrize("cmajor", ["row", "col"])
+def test_bmm_strided(vk, cmajor):
+    """layout_fold's strided bmm: [B0, B1] batches, permuted operands, a row- or column-major result."""
+    rng = np.random.default_rng(5)
+    B0, B1, M, K, N = 2, 3, 18, 40, 7
+    A = rng.standard_normal((M, B0, B1, K), dtype=np.float32)        # A[b0,b1] = A[:, b0, b1, :]
+    Bm = rng.standard_normal((B1, N, B0, K), dtype=np.float32)       # B[b0,b1][k, n] = Bm[b1, n, b0, k]
+    a, b = vk.upload(A), vk.upload(Bm)
+    c = vk.array((B0 * B1 * M * N + 5,))
+    ref = np.einsum("mxyk,ynxk->xymn", A.astype(np.float64), Bm.astype(np.float64))
+    if cmajor == "row":    # C stored [B1, M, B0, N]
+        cs = (N, B0 * N * M, B0 * N, 1)
+    else:                  # C stored [B0, B1, N, M] (column-major per matrix)
+        cs = (B1 * N * M, N * M, 1, M)
+    vk.lib.kernel_bmm_strided(_p(vk, a), _p(vk, b), _p(vk, c), B0, B1, M, K, N,
+                              0, B1 * K, K, B0 * B1 * K, 1,
+                              0, K, N * B0 * K, 1, B0 * K,
+                              5, *cs)
+    vk.sync()
+    got = np.lib.stride_tricks.as_strided(np.array(c)[5:], (B0, B1, M, N), [4 * v for v in cs])
+    assert _rel(got, ref) < 1e-5
+
+
 def test_row_ops(vk):
     rng = np.random.default_rng(2)
     L = vk.lib
@@ -463,6 +486,7 @@ def test_smolvla_split_int8_mixed_on_vulkan(vk, refc, split_irs, tmp_path):
     for part in ("vision", "prefix", "step"):
         I8.extract_mixed(str(tmp / part), str(tmp_path / part), None)
         g = json.loads((tmp_path / part / "graph.json").read_text())
+        assert any(op["op"] == "bmm_strided" for op in g["ops"]), part      # permutes folded into attention
         if part != "vision":    # the RMSNorm chains are one rms_norm each, RoPE one rope_half
             kinds = [op["op"] for op in g["ops"]]
             assert kinds.count("rope_half") >= (2 if part == "prefix" else 3), part
