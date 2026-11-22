@@ -1,5 +1,6 @@
 #version 460
 #include "mb_common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 // x / d along the middle axis of [outer, R, inner], one workgroup per line:
 // kind 0 rms (sqrt(mean(x^2) + eps)), 1 mean|x|, 2 l2
@@ -12,10 +13,13 @@ void main() {
     int base = o * pc.R * pc.inner + j, t = int(gl_LocalInvocationID.x);
     float a = 0.0;
     for (int r = t; r < pc.R; r += 256) { float v = pc.x.v[base + r * pc.inner]; a += pc.kind == 1 ? abs(v) : v * v; }
-    sv[t] = a;
-    barrier();
-    for (int s = 128; s > 0; s >>= 1) { if (t < s) sv[t] += sv[t + s]; barrier(); }
-    a = sv[0];
+    a = subgroupAdd(a);            // workgroup sum: per subgroup, then across the partials
+    if (gl_NumSubgroups > 1) {
+        if (subgroupElect()) sv[gl_SubgroupID] = a;
+        barrier();
+        a = sv[0];
+        for (uint i = 1; i < gl_NumSubgroups; i++) a += sv[i];
+    }
     float d = pc.kind == 0 ? sqrt(a / float(pc.R) + pc.eps) : pc.kind == 1 ? a / float(pc.R) : sqrt(a);
     float inv = 1.0 / d;
     for (int r = t; r < pc.R; r += 256) { int k = base + r * pc.inner; pc.y.v[k] = pc.x.v[k] * inv; }

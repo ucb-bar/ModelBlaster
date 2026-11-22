@@ -3,13 +3,15 @@
 layout(local_size_x = 256) in;
 // One workgroup per row of [M, K]: two-pass mean / biased variance (torch).
 layout(push_constant, scalar) uniform PC { F32 x; F32 g; F32 b; F32 y; int M; int K; float eps; } pc;
+#extension GL_KHR_shader_subgroup_arithmetic : require
 shared float sv[256];
-float tree(float v) {
-    uint t = gl_LocalInvocationID.x;
-    sv[t] = v;
+float tree(float v) {          // workgroup sum: per subgroup, then across the subgroup partials
+    v = subgroupAdd(v);
+    if (gl_NumSubgroups == 1) return v;
+    if (subgroupElect()) sv[gl_SubgroupID] = v;
     barrier();
-    for (uint s = 128; s > 0; s >>= 1) { if (t < s) sv[t] += sv[t + s]; barrier(); }
     float r = sv[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++) r += sv[i];
     barrier();
     return r;
 }
