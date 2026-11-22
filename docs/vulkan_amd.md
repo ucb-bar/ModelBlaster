@@ -228,15 +228,96 @@ compute-bound: ~460-520 GFLOPS against the 1.6 TFLOPS fp32 peak at 1.6 GHz
 (the GPU clock sits at 1.0-1.6 GHz under the Deck's 15 W APU power cap), and
 fp16 weights save only 12-14% end to end (prefix and steps).
 
+## int8 SmolVLA (int8 IRs with fp32 islands)
+
+`extract_graph --model smolvla_split --quant int8` (the model's
+`get_int8_mixed_policy()`; `--int8-mixed POLICY` for any model) lowers each
+graph with the fp32 FX path -- so the `get_attr` constants (additive -inf
+masks, RoPE tables, SigLIP position rows) are fp32 constant tensors and
+`expand` is a zero-stride `strided_copy`, exactly as in the fp32 IR -- and
+then `pipeline/int8_mixed.py` moves the linears to int8 (`quant: int8_mixed`:
+f32 and i8 tensors side by side):
+
+- `quantize_rows_s8`: the linear's fp32 input, times a per-column SmoothQuant
+  factor (`col_inv`, a constant), quantized **per row at run time** (row scale
+  = max |x'| / 127, round half away, +-127). q / k / v (and gate / up) share
+  one quantized tensor.
+- `linear_dq_s8`: int8 x int8 (weights per output channel, `W * sm`: the
+  smoothing moves into the weight exactly), int32 accumulation, **fp32
+  output** `(float)((double)acc * row_scale[m] * w_scale[n]) + bias`. Nothing
+  downstream sees an int8 grid: residuals, RoPE, attention, softmax (so the
+  -inf masks keep exp(-inf) = 0 exactly) and the norms are the fp32 ops.
+- Calibration (MB's rule, `--num-calibration N`, `MB_SMOLVLA_CALIB` = a
+  directory of observations) sets the smoothing factors: per-column max |x|
+  over the set, sm = max|x|^a / max|W|^(1-a). The step graph is calibrated on
+  every flow step's (x_t, t) of each observation's own trajectory.
+- The golden is the IR walked on the CPU (`int8_mixed.walk`: fp32 ops as
+  `walk_torch`, the int8 kinds by CPU rules that are bit-exact with their
+  reference C, tested). `walk_vulkan` gates an int8_mixed IR with both
+  regimes: in isolation on that walk's inputs, every int8 kernel equal to the
+  reference C and every fp32 kernel within the fp32 per-slot bound; the
+  end-to-end output within 2% of the golden's range (or the IR's own
+  int8-vs-fp32 error if larger: fp32 reassociation on the device flips int8
+  roundings, and 16 layers amplify them).
+
+Kernels: `quantize_rows_s8` (one 64-wide workgroup per row, `subgroupMax`,
+vec4 variant); `linear_dq_s8` on the dot4 tile (vision, 256 rows) or, for
+<= 64 rows on a weight registered with `mb_vk_set_packed(w, p, 2)`
+(`walk_vulkan.pack_weight_s8`: per 64 columns, 16-byte k-chunks contiguous),
+`skinny_s8.comp`: one column per invocation and every row in registers, the
+activation's 16 bytes as uniform loads into `dotPacked4x8EXT`, K split over
+workgroups with exact int32 partials (`linear_dq_s8_epi.comp`). All
+bit-exact with the reference C on RADV and Intel (tests).
+
+The quantization mix, chosen on 13 held-out observations (real HM01B0 drone
+frames and synthetic images, 14-token prompts; calibration: 8 other frames
+and prompts), action chunk vs lerobot's `sample_actions` (same observation and
+noise; |actions| ~1), CPU reference walk of the IRs (bit-exact int8):
+
+| mix (`models/smolvla_split.py`) | int8 linears (vision / prefix / step) | cosine mean (min) | max abs err mean (max) |
+|---|---|---|---|
+| fp32 | 0 / 0 / 0 | 1.0 (to 1e-12) | < 2e-6 |
+| **default** `INT8_POLICY`: vision a = 0.8 with `fc2` fp32, prefix fp32, step a = 0.65 | 61 / 0 / 116 | **0.99950 (0.99901)** | **0.042 (0.074)** |
+| every linear (`MB_SMOLVLA_INT8=all`; a = 0.8 / 0.65 / 0.65) | 73 / 108 / 116 | 0.99607 (0.96661) | 0.077 (0.147) |
+| one graph int8 at a time (a = 0.5): vision / prefix / step | | 0.99834 / 0.99770 / 0.99969 (min 0.985 / 0.983 / 0.9991) | 0.054 / 0.075 / 0.026 |
+
+What the sweeps showed: the prefix is the fragile graph (its KV cache feeds
+every layer of every flow step; no single group or layer kept fp32 rescued
+it, and its linears are ~7% of the fp32 chunk, so it stays fp32); in SigLIP,
+`fc2` (input: the GELU output, a few huge channels) carries most of the
+vision error; a = 0.5 -> 0.8 helps vision, hurts the prefix; the step graph is
+robust (cosine 0.9997 alone). Per-tensor static activation scales (MB's
+`extract_int8` scheme) were far worse than per-row + smoothing on these
+graphs (fake-quant study on the fp32 IRs: vision cosine 0.969 vs 0.999).
+
+Deck (same session, `smolvla_vulkan.py --reps 20`, observation = the fp32
+table's; fp32 measured 213.0 ms in this session vs 203.5 ms earlier -- clock /
+thermal state):
+
+| | vision | prefix | 5 steps | chunk | vs lerobot: cosine, max abs err |
+|---|---|---|---|---|---|
+| fp32 | 79.0 | 20.6 | 113.4 (22.7 / step) | **213.0 ms** | 0.999999999999606, 1.1e-6 |
+| int8, default mix | 56.4 | 20.2 | 65.9 (13.2 / step) | **142.5 ms** (1.50x) | 0.99978, 0.019 |
+| int8, every linear | 48.2 | 10.7 | 65.1 (13.0 / step) | **123.8 ms** (1.72x) | 0.99864, 0.074 |
+
+Walker gates on the Deck (`walk_vulkan.py --ref-lib`): every
+`quantize_rows_s8` / `linear_dq_s8` equal to the reference C (0 mismatches),
+every fp32 op within its slot bound, golden 0.9% / 0.9% of range (vision /
+step, default mix; 2.2% / 1.5% / 0.9% for every-linear), replay equal. Step
+graph per-op GPU time: `linear_dq_s8` 9.5 ms (fp32 linears ~15.7), the dot4
+tile kernel alone 17.6 ms -- the skinny int8 path is what makes int8 pay at 50
+rows; `quantize_rows_s8` ~10-18 us each.
+
 ## Not done / limits
 
-- **int8 SmolVLA end to end**: the int8 kernels are there and bit-exact, but
-  MB's FX int8 extractor does not lower these graphs (`get_attr` constants:
-  "int8 extract: get_attr _tensor_constant0 not supported"; `expand`:
-  "unsupported call_method 'expand'"), and the export (torch.export) path has
-  no fp32/int8 lowering of the generic ops. The int8 kernels are validated on
-  MB's int8 SmolVLA proxies (`models/attn_block.py`, `models/norm_block.py`)
-  and at SmolVLA sizes against the reference C.
+- int8 SmolVLA: only the linears are int8 (above). Attention (`bmm`), softmax, the
+  norms and the residual stream stay fp32: the existing `matmul_s8` /
+  `softmax_s8` / `rmsnorm_s8` kernels would need static per-tensor scales on
+  exactly the tensors that measured fragile, and the time is not there (bmm is
+  ~6% of the chunk). The all-int8 extractor (`extract_int8`) still rejects
+  these graphs (`get_attr`, `expand`); its errors now point to `--int8-mixed`.
+  The prefix is fp32 in the default mix (accuracy); an int8 prefix with a
+  better activation scheme (e.g. outlier channels kept fp32) is untried.
 - fp16 (`_f16`) IRs are not implemented. fp16 is used only as an opt-in
   weight format of the skinny GEMM (`--f16-weights`); RDNA2's 2x-rate packed
   fp16 math (`v_dot2_f32_f16`) is not used: it would need fp16 activations as

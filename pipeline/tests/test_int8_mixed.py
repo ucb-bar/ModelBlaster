@@ -243,13 +243,20 @@ def test_cli_with_model_policy(tmp_path, monkeypatch):
     monkeypatch.delenv("MB_SMOLVLA_REAL", raising=False)
     monkeypatch.delenv("MB_SMOLVLA_CALIB", raising=False)
     S._CACHE.clear()
-    monkeypatch.setattr(sys, "argv", ["extract_graph", "--model", "smolvla_split", "--quant", "int8",
-                                      "--num-calibration", "2", "--out-dir", str(tmp_path)])
     try:
-        EG.main()
+        for env, n_int8 in (("all", 1 + 7 + 2), (None, 0)):
+            # all: state_proj + layer 0's 7 + the last layer's k / v (its q feeds nothing the expert
+            # reads); the default policy keeps the prefix fp32 (models/smolvla_split.INT8_POLICY)
+            if env:
+                monkeypatch.setenv("MB_SMOLVLA_INT8", env)
+            else:
+                monkeypatch.delenv("MB_SMOLVLA_INT8", raising=False)
+            out = tmp_path / str(env)
+            monkeypatch.setattr(sys, "argv", ["extract_graph", "--model", "smolvla_split", "--quant", "int8",
+                                              "--num-calibration", "2", "--out-dir", str(out)])
+            EG.main()
+            g = json.loads((out / "graph.json").read_text())
+            assert g["quant"] == "int8_mixed" and g["int8_mixed"]["n_calibration"] == 2
+            assert g["int8_mixed"]["n_int8_linears"] == n_int8, env
     finally:
         S._CACHE.clear()
-    g = json.loads((tmp_path / "graph.json").read_text())
-    assert g["quant"] == "int8_mixed" and g["int8_mixed"]["n_calibration"] == 2
-    # state_proj + layer 0's 7 + the last layer's k / v (its q feeds nothing the expert reads)
-    assert g["int8_mixed"]["n_int8_linears"] == 1 + 7 + 2

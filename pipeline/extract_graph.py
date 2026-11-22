@@ -3687,7 +3687,8 @@ def extract_int8(
             else:
                 raise NotImplementedError(
                     f"int8 extract: unsupported call_method "
-                    f"'{target_name}' at {node.name}"
+                    f"'{target_name}' at {node.name} (the all-int8 extractor; "
+                    f"--int8-mixed lowers every generic op, expand included, as fp32)"
                 )
 
         elif node.op == "output":
@@ -3704,7 +3705,10 @@ def extract_int8(
                 output_names_multi = None
 
         elif node.op == "get_attr":
-            raise NotImplementedError(f"int8 extract: get_attr {node.name} not supported")
+            raise NotImplementedError(
+                f"int8 extract: get_attr {node.name} not supported by the all-int8 extractor; "
+                f"--int8-mixed (pipeline/int8_mixed.py) lowers graph constants as fp32 constant "
+                f"tensors and quantizes the linears")
 
     if not input_names or output_name is None:
         raise RuntimeError("int8 extract: graph missing input/output")
