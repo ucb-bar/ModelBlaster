@@ -93,6 +93,49 @@ def test_linear_dq_rule_is_the_reference_c(refc):
         assert np.abs(y - exact).max() <= 1e-5 * np.abs(exact).max()
 
 
+def test_linear3_dq_rule_is_the_reference_c(refc):
+    rng = np.random.default_rng(3)
+    M, K, Ns = 9, 720, (40, 24, 8)
+    N = sum(Ns)
+    x = rng.integers(-127, 128, (M, K), dtype=np.int8)
+    w = rng.integers(-127, 128, (N, K), dtype=np.int8)
+    rs = (rng.random(M) * 0.3 + 1e-4).astype(np.float32)
+    ws = (rng.random(N) * 1e-2 + 1e-6).astype(np.float32)
+    b = rng.standard_normal(N).astype(np.float32)
+    ir = I8.as_ir({"name": "t", "tensors": {}, "ops": [], "input": {"tensor": "x"}, "output": {"tensor": "y"}},
+                  {"w": w, "ws": ws, "b": b})
+    for bias in ("b", None):
+        outs = [np.zeros((M, n), np.float32) for n in Ns]
+        refc.kernel_linear3_dq_s8(_p(x), _p(rs), _p(w), _p(b if bias else None), _p(ws), *[_p(o) for o in outs], M, K, *Ns)
+        op = {"op": "linear3_dq_s8", "shape": {"M": M, "K": K, "N0": Ns[0], "N1": Ns[1], "N2": Ns[2]}, "weight": "w",
+              "w_scale": "ws", "bias": bias, "outputs": ["a", "b", "c"]}
+        got = I8._r_linear3_dq(ir, op, [torch.from_numpy(x), torch.from_numpy(rs)])
+        y = np.zeros((M, N), np.float32)
+        refc.kernel_linear_dq_s8(_p(x), _p(rs), _p(w), _p(b if bias else None), _p(ws), _p(y), M, K, N)
+        for t, o, lo, hi in zip(got, outs, (0, Ns[0], Ns[0] + Ns[1]), (Ns[0], Ns[0] + Ns[1], N)):
+            assert np.array_equal(t.numpy(), o) and np.array_equal(o, y[:, lo:hi])
+
+
+def test_linear_dq_add_rule_is_the_reference_c(refc):
+    rng = np.random.default_rng(4)
+    M, K, N = 7, 2048, 45
+    x = rng.integers(-127, 128, (M, K), dtype=np.int8)
+    w = rng.integers(-127, 128, (N, K), dtype=np.int8)
+    rs = (rng.random(M) * 0.3 + 1e-4).astype(np.float32)
+    ws = (rng.random(N) * 1e-2 + 1e-6).astype(np.float32)
+    b = rng.standard_normal(N).astype(np.float32)
+    r = (rng.standard_normal((M, N)) * 10).astype(np.float32)
+    ir = I8.as_ir({"name": "t", "tensors": {}, "ops": [], "input": {"tensor": "x"}, "output": {"tensor": "y"}},
+                  {"w": w, "ws": ws, "b": b})
+    for bias in ("b", None):
+        y, y0 = np.zeros((M, N), np.float32), np.zeros((M, N), np.float32)
+        refc.kernel_linear_dq_add_s8(_p(x), _p(rs), _p(w), _p(b if bias else None), _p(ws), _p(r), _p(y), M, K, N)
+        refc.kernel_linear_dq_s8(_p(x), _p(rs), _p(w), _p(b if bias else None), _p(ws), _p(y0), M, K, N)
+        op = {"op": "linear_dq_add_s8", "shape": {"M": M, "K": K, "N": N}, "weight": "w", "w_scale": "ws", "bias": bias}
+        (t,) = I8._r_linear_dq_add(ir, op, [torch.from_numpy(x), torch.from_numpy(rs), torch.from_numpy(r)])
+        assert np.array_equal(t.numpy(), y) and np.array_equal(y, r + y0)
+
+
 class _Block(nn.Module):
     """An attention block with SmolVLA's extraction obstacles: an nn.RMSNorm module, buffers
     (get_attr constants: an additive -inf causal mask and a cos table), expand of a time vector."""
@@ -171,13 +214,17 @@ def test_int8_mixed_block(tmp_path):
     g = ir.graph
     assert g["quant"] == "int8_mixed" and rep["n_int8_linears"] == 7 and rep["n_fp32_linears"] == 0
     kinds = {op["op"] for op in ir.ops}
-    assert {"linear_dq_s8", "quantize_rows_s8", "strided_copy", "softmax"} <= kinds and "linear" not in kinds
+    assert {"linear_dq_s8", "linear3_dq_s8", "quantize_rows_s8", "strided_copy", "softmax"} <= kinds and "linear" not in kinds
+    (m3,) = [op for op in ir.ops if op["op"] == "linear3_dq_s8"]          # q / k / v: one merged product
+    assert len(m3["outputs"]) == 3 and m3["shape"]["N2"] == m3["shape"]["N0"]
+    # the two residual adds ride in their linears' epilogues (o, down)
+    assert sum(op["op"] == "linear_dq_add_s8" for op in ir.ops) == 2
     # q / k / v read one quantized tensor
     assert sum(op["op"] == "quantize_rows_s8" for op in ir.ops) == 5
     consts = {k: v for k, v in g["tensors"].items() if v.get("const")}
     assert any(np.isinf(ir.weights[v["const"]]).any() for v in consts.values())      # the -inf mask, fp32
     for op in ir.ops:
-        if op["op"] == "linear_dq_s8":
+        if op["op"] in ("linear_dq_s8", "linear3_dq_s8", "linear_dq_add_s8"):
             assert ir.weights[op["weight"]].dtype == np.int8 and ir.weights[op["w_scale"]].dtype == np.float32
             assert g["tensors"][op["inputs"][0]]["dtype"] == "i8"
     out = I8.walk(ir, ir.input_tensors("cpu"))

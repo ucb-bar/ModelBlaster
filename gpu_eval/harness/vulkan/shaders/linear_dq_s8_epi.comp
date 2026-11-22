@@ -4,7 +4,8 @@
 layout(local_size_x = 256) in;
 // split-K epilogue of skinny_s8.comp: acc = sum of the int32 partials (exact), then linear_dq_s8's
 // dequantization: (float)((double)acc * ((double)row_scale[m] * (double)w_scale[n])) + bias[n]
-layout(push_constant, scalar) uniform PC { I32 part; F32 rs; F32 bias; F32 ws; F32 y; int M; int N; int nsplit; } pc;
+layout(push_constant, scalar) uniform PC { I32 part; F32 rs; F32 bias; F32 ws; F32 y; F32 y1; F32 y2; F32 add; int M; int N; int nsplit;
+    int N0; int N1; } pc;
 void main() {
     int64_t gi = MB_GID;
     int MN = pc.M * pc.N;
@@ -16,5 +17,6 @@ void main() {
     precise double d = double(acc) * sc;
     precise float yv = float(d);
     if (uint64_t(pc.bias) != 0ul) yv = yv + pc.bias.v[n];
-    pc.y.v[i] = yv;
+    if (uint64_t(pc.add) != 0ul) yv = pc.add.v[i] + yv;
+    MB_DQ_STORE(pc.y, pc.y1, pc.y2, pc.N, pc.N0, pc.N1, m, n, yv);
 }

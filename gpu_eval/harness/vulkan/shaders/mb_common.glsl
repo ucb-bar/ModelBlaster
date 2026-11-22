@@ -23,6 +23,12 @@ int mb_clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 // a / b rounded as IEEE fp32 division (the reference's float division): the
 // double quotient of two floats rounds to the correctly rounded float
 float mb_fdiv(float a, float b) { return float(double(a) / double(b)); }
+// linear_dq_s8 / linear3_dq_s8 output column n of row m: columns [0, N0) -> y0 [M, N0], [N0, N0+N1) -> y1,
+// the rest -> y2 [M, N - N0 - N1] (linear_dq_s8: N0 = N)
+#define MB_DQ_STORE(y0, y1, y2, N, N0, N1, m, n, val) { \
+    if ((n) < (N0)) (y0).v[(m) * (N0) + (n)] = (val); \
+    else if ((n) < (N0) + (N1)) (y1).v[(m) * (N1) + (n) - (N0)] = (val); \
+    else (y2).v[(m) * ((N) - (N0) - (N1)) + (n) - (N0) - (N1)] = (val); }
 #endif
 
 // 1-D global id over a grid folded into (x, y) by mb_vk_launch1d

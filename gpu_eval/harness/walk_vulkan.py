@@ -175,7 +175,7 @@ class Weights:
 
     def _pack(self, op):
         key, sh = op.get("weight"), op.get("shape") or {}
-        if (op["op"] == "linear_dq_s8" and key and key not in self.packed and hasattr(self.vk.lib, "mb_vk_set_packed")
+        if (op["op"] in ("linear_dq_s8", "linear3_dq_s8", "linear_dq_add_s8") and key and key not in self.packed and hasattr(self.vk.lib, "mb_vk_set_packed")
                 and sh.get("M", SKINNY_MAX_M + 1) <= SKINNY_MAX_M and sh.get("K", 1) % 16 == 0):
             p = self.vk.upload(pack_weight_s8(np.asarray(self.ir.weights[key], np.int8)))
             self.packed[key] = p
