@@ -462,6 +462,12 @@ def test_smolvla_split_int8_mixed_on_vulkan(vk, refc, split_irs, tmp_path):
     ks = walk_vulkan.VkKernelSet(full, vk)
     for part in ("vision", "prefix", "step"):
         I8.extract_mixed(str(tmp / part), str(tmp_path / part), None)
+        g = json.loads((tmp_path / part / "graph.json").read_text())
+        if part != "vision":    # the RMSNorm chains are one rms_norm each, RoPE one rope_half
+            kinds = [op["op"] for op in g["ops"]]
+            assert kinds.count("rope_half") >= (2 if part == "prefix" else 3), part
+            assert "rms_norm" in kinds and not any(op.get("fn") == "rsqrt" and op["op"] == "ewise1"
+                                                   for op in g["ops"]), part
         rec = walk_vulkan.evaluate(str(tmp_path / part), ks, reps=1, ref_lib=str(refc.lib._name))
         assert rec["ok"] and not rec["missing"] and rec["n_s8_ops_not_bit_exact"] == 0, (part, rec)
         assert rec["ref_c_mismatches_by_op"].get("linear_dq_s8") == 0

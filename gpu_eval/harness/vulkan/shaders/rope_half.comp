@@ -1,0 +1,23 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_rope_half (pipeline/int8_mixed.py): non-interleaved RoPE over [R, H, 2*half] with
+// [R, half] cos / sin tables; one invocation per (r, h, j) pair, each product rounded (precise).
+layout(push_constant, scalar) uniform PC { F32 x; F32 c; F32 s; F32 y; int R; int H; int half_; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    int d = pc.half_;
+    if (gi >= int64_t(pc.R) * pc.H * d) return;
+    int i = int(gi), j = i % d, rh = i / d, r = rh / pc.H;
+    int base = rh * 2 * d;
+    float x1 = pc.x.v[base + j], x2 = pc.x.v[base + d + j];
+    float cv = pc.c.v[r * d + j], sv = pc.s.v[r * d + j];
+    precise float a = x1 * cv;
+    precise float b = x2 * sv;
+    precise float e = x2 * cv;
+    precise float f = x1 * sv;
+    precise float y0 = a - b;
+    precise float y1 = e + f;
+    pc.y.v[base + j] = y0;
+    pc.y.v[base + d + j] = y1;
+}

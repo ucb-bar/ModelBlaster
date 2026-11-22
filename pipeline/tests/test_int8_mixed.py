@@ -223,6 +223,40 @@ def test_keep_fp32_and_smoothing(tmp_path):
     assert errs[0.5] < 0.5 * errs[0.0], errs
 
 
+def test_outlier_columns(tmp_path):
+    """outliers: the largest-|x| columns run as an fp32 linear on an index_select of them; with
+    an outlier channel the decomposition beats int8 for every column, and the CPU walk is exact."""
+    from mbir import load_ir
+
+    class Lin(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.Linear(64, 16)
+
+        def forward(self, x):
+            return self.l(x)
+
+    torch.manual_seed(3)
+    lin = Lin().eval()
+    x = torch.randn(8, 64)
+    x[:, 5] *= 300.0
+    x[:, 40] *= 80.0
+    extract(lin, x, name="lin", out_dir=str(tmp_path / "lin"), quant="fp32")
+    li = load_ir(tmp_path / "lin")
+    errs = {}
+    for n in (0, 2):
+        g, w, rep = I8.quantize_graph(li, [I8.inputs_of(li, x)], {"base": "linear", "alpha": 0.0, "outliers": {"l": n}})
+        kinds = [op["op"] for op in g["ops"]]
+        assert ("index_select" in kinds) == (n > 0) and rep["n_fp32_linears"] == 0
+        y = I8.walk(I8.as_ir(g, w), I8.inputs_of(li, x))[li.output_names()[0]]
+        errs[n] = float((y - lin(x).detach()).abs().max())
+        if n:
+            assert rep["outlier_columns"] == {"x": 2}
+            sel = next(op for op in g["ops"] if op["op"] == "index_select")
+            assert sorted(w[g["tensors"][sel["inputs"][1]]["const"]].tolist()) == [5.0, 40.0]
+    assert errs[2] < 0.25 * errs[0], errs
+
+
 def test_policy_resolution():
     assert I8.resolve_policy("linear")["alpha"] == 0.5
     p = I8.resolve_policy('{"base": "linear", "keep_fp32": ["a*"], "alpha": 0.25}')

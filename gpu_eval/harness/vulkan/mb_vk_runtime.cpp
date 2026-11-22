@@ -78,6 +78,10 @@ static struct {
     VkQueryPool qpool = VK_NULL_HANDLE;
     uint32_t qcap = 0, qused = 0;            // queries in the current command buffer
     int recording = 0;
+    // barrier elision (mb_vk_no_barrier_next): the next launch's first dispatch may skip its
+    // barrier; scratch_* keep two launches that both use launcher scratch ordered
+    int skip_next = 0, scratch_pending = 0, scratch_dirty = 0;
+    long n_skipped = 0;
     long n_in_cb = 0, n_total = 0;
     long flush_every = 4096;
     int ts_on = 0;
@@ -381,6 +385,7 @@ static int new_chunk(size_t bytes) {
 
 extern "C" void *mb_vk_scratch(int slot, size_t bytes) {
     if (mb_vk_init() || slot < 0) return nullptr;
+    R.scratch_pending = 1;
     if ((int)R.scratch.size() <= slot) R.scratch.resize(slot + 1);
     Chunk &c = R.scratch[slot];
     if (c.size < bytes) {
@@ -430,6 +435,11 @@ extern "C" void mb_vk_set_packed(const void *w, const void *p, int f16) {
     else R.packed.erase(w);
 }
 extern "C" int mb_vk_packed_count(void) { return (int)R.packed.size(); }
+// The caller (walk_vulkan, which knows the IR's data flow) asserts that the next launch reads and
+// writes nothing a launch since the last barrier wrote: its first dispatch then needs no barrier.
+// Launch-internal dispatches keep theirs; two launches that both use scratch stay ordered.
+extern "C" void mb_vk_no_barrier_next(void) { R.skip_next = 1; }
+extern "C" long mb_vk_barriers_skipped(void) { return R.n_skipped; }
 extern "C" int mb_vk_has_int_dot(void) { return mb_vk_init() ? 0 : R.int_dot; }
 const mb_packed *mb_vk_find_packed(const void *w) {
     if (R.packed.empty()) return nullptr;
@@ -635,8 +645,16 @@ void mb_vk_dispatch(int pipe, uint32_t gx, uint32_t gy, uint32_t gz, const mb_pc
     if (gx == 0 || gy == 0 || gz == 0) return;
     if (R.recording && R.n_in_cb >= R.flush_every) mb_vk_sync();
     begin_cb();
-    if (R.n_in_cb > 0)
+    int skip = R.skip_next && !(R.scratch_pending && R.scratch_dirty);
+    R.skip_next = 0;
+    if (R.n_in_cb > 0 && !skip) {
         barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        R.scratch_dirty = 0;
+    } else if (R.n_in_cb > 0) {
+        R.n_skipped++;
+    }
+    if (R.scratch_pending) R.scratch_dirty = 1;
+    R.scratch_pending = 0;
     VkPipeline p = R.pipes[pipe];
     if (p != R.last_pipe) {
         vkCmdBindPipeline(R.cb_cur, VK_PIPELINE_BIND_POINT_COMPUTE, p);

@@ -222,7 +222,22 @@ def run(ir: IR, plan, vk: VkBackend, weights: Weights, feed=None, time_ops=False
     for t, v in (consts if consts is not None else ir.const_tensors("cpu", int_dtype=torch.int32)).items():
         env[t] = vk.upload(v.numpy())
     per_op = []
+    # barrier elision (default on; $MB_VK_ELIDE=0: off): an op none of whose inputs was written since the last
+    # barrier needs none before it (every op writes fresh arena buffers, so only RAW hazards exist;
+    # the runtime keeps scratch-sharing launches ordered). Views inherit their base's state.
+    elide = bool(getattr(vk.lib, "mb_vk_no_barrier_next", None)) and not time_ops and feed is None and \
+        os.environ.get("MB_VK_ELIDE", "1") != "0"
+    pending: set = set()
     for op, k in plan:
+        if op["op"] in ("view", "chunk2_c1"):
+            if any(t in pending for t in op["inputs"]):
+                pending.update(op["outputs"])
+        elif elide:
+            if any(t in pending for t in op["inputs"]):
+                pending = set(op["outputs"])
+            else:
+                vk.lib.mb_vk_no_barrier_next()
+                pending.update(op["outputs"])
         if op["op"] == "view":
             off, n = op.get("offset", 0), op["shape"]["n"]
             env[op["outputs"][0]] = env[op["inputs"][0]].reshape(-1)[off:off + n].reshape(ir.tshape(op["outputs"][0]))

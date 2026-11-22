@@ -12,6 +12,7 @@
 // product goes through one tiled GEMM (shaders/gemm.comp).
 #include "mb_vk_runtime.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -673,6 +674,14 @@ void kernel_rmsnorm_s8(const int8_t *input, const float *gamma, int8_t *output, 
                        float scale_out, float eps, int activation_min, int activation_max) {
     norm_s8(input, gamma, nullptr, output, M, K, scale_in, scale_out, eps, activation_min, activation_max, 1);
 }
+// fp32 fusions of the int8_mixed pass: RoPE (two slices, four multiplies, sub, add, cat -> one op)
+void kernel_rope_half(const float *input, const float *cos_t, const float *sin_t, float *output, int R, int H,
+                      int half) {
+    PIPE("rope_half");
+    mb_pc pc;
+    pc.p(input).p(cos_t).p(sin_t).p(output).i(R).i(H).i(half);
+    mb_vk_launch1d(pipe, (long)R * H * half, pc);
+}
 // int8_mixed IRs (pipeline/int8_mixed.py): dynamic per-row quantization and the int8 linear with an
 // fp32 (dequantized) output
 void kernel_quantize_rows_s8(const float *input, const float *col_inv, int8_t *output, float *row_scale, int M,
@@ -694,10 +703,11 @@ void kernel_quantize_rows_s8(const float *input, const float *col_inv, int8_t *o
 static bool skinny_s8(const int8_t *x, const float *rs, const mb_packed &W, const float *bias, const float *ws,
                       float *y, int M, int K, int N) {
     if ((mb_vk_devaddr(x) & 15) || K % 16) return false;
-    int consts[1] = {M};
-    int pipe = mb_vk_pipeline_spec("skinny_s8", consts, 1);
+    static int nc = env_int("MB_VK_SKINNY_S8_NC", 1);
+    int consts[2] = {M, nc};
+    int pipe = mb_vk_pipeline_spec("skinny_s8", consts, 2);
     if (pipe < 0) return false;
-    int gx = (N + 63) / 64;
+    int gx = ((N + 63) / 64 + nc - 1) / nc;
     static int target = env_int("MB_VK_SKINNY_WG", 64);
     int nsplit = gx < target ? (target + gx - 1) / gx : 1;
     int maxs = K / 64;                          // >= 4 16-k steps per split
@@ -733,9 +743,16 @@ void kernel_linear_dq_s8(const int8_t *input, const float *row_scale, const int8
     mb_pc pc;
     pc.p(input).p(row_scale).p(weight).p(bias).p(w_scale).p(output).i(M).i(K).i(N);
     if (use_dot4(input, weight, K)) {
-        static int dp = -1;
-        if (dp < 0) dp = mb_vk_pipeline("linear_dq_s8_dot");
-        dot4_dispatch(dp, M, N, pc);
+        // the tile: 128 x 64 for >= 128 rows (the vision linears: 1.2-1.4x the 32 x 64 tile's 0.84-0.91
+        // Tops on the Deck), 64 x 64 for >= 48, else 32 x 64. $MB_VK_DQ_TILE = 24 | 44 | 84 forces one.
+        // (Tried: 64 x 128, and 128-bit LDS reads with register prefetch: slower.)
+        static int forced = getenv("MB_VK_DQ_TILE") ? atoi(getenv("MB_VK_DQ_TILE")) : 0;
+        static int pipes[3] = {-1, -1, -1};
+        static const char *names[3] = {"linear_dq_s8_dot", "linear_dq_s8_dot44_16", "linear_dq_s8_dot84_16"};
+        int t = forced == 84 ? 2 : forced == 44 ? 1 : forced == 24 ? 0 : (M >= 128 ? 2 : M >= 48 ? 1 : 0);
+        if (pipes[t] < 0) pipes[t] = mb_vk_pipeline(names[t]);
+        int dp = pipes[t], rm = t == 2 ? 8 : t == 1 ? 4 : 2, rn = 4;
+        mb_vk_dispatch(dp, (uint32_t)((N + 16 * rn - 1) / (16 * rn)), (uint32_t)((M + 16 * rm - 1) / (16 * rm)), 1, pc);
         return;
     }
     PIPE("linear_dq_s8");
