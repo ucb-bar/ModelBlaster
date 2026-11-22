@@ -1,0 +1,68 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+// kernel_linear_dq_s8 for M <= 64 rows on a PRE-PACKED int8 weight (walk_vulkan.pack_weight_s8):
+// for each block of 64 columns nb and each 16-k chunk kq, the 64 columns' 16 bytes are contiguous,
+//     P[((nb * K/16 + kq) * 64 + c) * 16 + i] = W[nb*64 + c, 16*kq + i]   (N zero-padded to 64),
+// so one wave's uvec4 load is one contiguous 1 KiB: int8 weights stream at the DRAM rate.
+// One invocation per output column, all M rows in registers (MT, specialization constant 0);
+// the activation's 16 bytes per row are the same for the whole wave (uniform address: scalar
+// loads) and enter packed 4 x int8 dot products. K is split over gl_WorkGroupID.y: with split != 0
+// each split writes raw int32 partial sums to part + s*M*N and linear_dq_s8_epi.comp adds them
+// (exact) and dequantizes; with split == 0 the dequantizing epilogue runs here. Bit-exact either way:
+// the int32 sum is the reference's (two's-complement addition is associative).
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+layout(constant_id = 0) const int MT = 32;
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer U4 { uvec4 v[]; };
+layout(push_constant, scalar) uniform PC {
+    I8 x; F32 rs; I8 w; F32 bias; F32 ws; F32 y; I32 part; int M; int K; int N; int kchunk; int split;
+} pc;
+void main() {
+    const int K = pc.K, N = pc.N;
+    int c = int(gl_LocalInvocationID.x);
+    int nb = int(gl_WorkGroupID.x);
+    int n = nb * 64 + c;
+    int s = int(gl_WorkGroupID.y);
+    int kbeg = s * pc.kchunk, kend = min(K, kbeg + pc.kchunk);
+    int acc[MT];
+    [[unroll]] for (int m = 0; m < MT; m++) acc[m] = 0;
+    uint64_t wp = uint64_t(pc.w) + ((uint64_t(nb) * uint64_t(K >> 4) + uint64_t(kbeg >> 4)) * 64ul + uint64_t(c)) * 16ul;
+    uint64_t xp = uint64_t(pc.x) + uint64_t(kbeg);
+    int steps = (kend - kbeg) >> 4;
+    uvec4 wv = steps > 0 ? U4(wp).v[0] : uvec4(0);
+    for (int it = 0; it < steps; it++) {
+        uvec4 wn = it + 1 < steps ? U4(wp + 1024ul).v[0] : wv;          // next chunk in flight
+        uint64_t xr = xp;
+        [[unroll]] for (int m = 0; m < MT; m++) {
+            uvec4 a = U4(xr).v[0];
+            int t = acc[m];
+            t += dotPacked4x8EXT(int(a.x), int(wv.x));
+            t += dotPacked4x8EXT(int(a.y), int(wv.y));
+            t += dotPacked4x8EXT(int(a.z), int(wv.z));
+            t += dotPacked4x8EXT(int(a.w), int(wv.w));
+            acc[m] = t;
+            xr += uint64_t(K);
+        }
+        wv = wn;
+        wp += 1024ul;
+        xp += 16ul;
+    }
+    if (n >= N) return;
+    if (pc.split != 0) {
+        int cb = s * MT * N + n;
+        [[unroll]] for (int m = 0; m < MT; m++) pc.part.v[cb + m * N] = acc[m];
+        return;
+    }
+    bool hb = uint64_t(pc.bias) != 0ul;
+    double wsn = double(pc.ws.v[n]);
+    float b = hb ? pc.bias.v[n] : 0.0;
+    [[unroll]] for (int m = 0; m < MT; m++) {
+        precise double sc = double(pc.rs.v[m]) * wsn;
+        precise double d = double(acc[m]) * sc;
+        precise float yv = float(d);
+        if (hb) yv = yv + b;
+        pc.y.v[m * N + n] = yv;
+    }
+}

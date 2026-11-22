@@ -599,6 +599,53 @@ def _run_s8(vk, refc, op, args):
     vk.release(m)
 
 
+@pytest.mark.parametrize("M,K", [(50, 720), (31, 2560), (256, 768), (3, 12288)])
+def test_quantize_rows_s8_vec4_bit_exact(vk, refc, M, K):
+    """The vec4 path of quantize_rows_s8 (K % 4 == 0, aligned) at SmolVLA shapes, with ties and specials."""
+    rng = np.random.default_rng(M + K)
+    x = (rng.standard_normal((M, K)) * rng.random((M, 1)) * 30).astype(np.float32)
+    x[0, :64] = (np.arange(64) - 32 + 0.5).astype(np.float32)
+    x[0, 64:] = 0.0
+    x[0, 70] = 127.0
+    if M > 2:
+        x[1, 3], x[2, 4] = np.nan, np.inf
+    ci = (rng.random(K) * 2 + 0.25).astype(np.float32)
+    ci[:71] = 1.0
+    _run_s8(vk, refc, "quantize_rows_s8", [x, ci, np.zeros((M, K), np.int8), np.zeros(M, np.float32), M, K])
+
+
+@pytest.mark.parametrize("M,K,N", [(1, 32, 960), (31, 960, 2560), (50, 720, 2048), (50, 2048, 720), (64, 1440, 70),
+                                   (16, 12288, 960), (7, 48, 5)])
+def test_linear_dq_s8_skinny_bit_exact(vk, refc, M, K, N):
+    """linear_dq_s8 of <= 64 rows on a packed int8 weight (skinny_s8.comp, split-K + epilogue) = reference C."""
+    from walk_vulkan import pack_weight_s8
+    rng = np.random.default_rng(M * 13 + K)
+    x = rng.integers(-127, 128, (M, K), dtype=np.int8)
+    w = rng.integers(-127, 128, (N, K), dtype=np.int8)
+    rs = (rng.random(M) * 0.05 + 1e-4).astype(np.float32)
+    ws = (rng.random(N) * 1e-3 + 1e-6).astype(np.float32)
+    b = rng.standard_normal(N).astype(np.float32)
+    m = vk.mark()
+    W = vk.upload(w)
+    P = vk.upload(pack_weight_s8(w))
+    vk.lib.mb_vk_set_packed(vk.ptr(W), vk.ptr(P), 2)
+    args = [x, rs, W, b, ws, np.zeros((M, N), np.float32), M, K, N]
+    gpu = [vk.upload(a) if isinstance(a, np.ndarray) else a for a in args]
+    gpu[2] = W
+    ptr = lambda a: ctypes.c_void_p(vk.ptr(a)) if isinstance(a, np.ndarray) else a
+    vk.lib.kernel_linear_dq_s8(*[ptr(a) for a in gpu])
+    y0 = vk.array((M, N))
+    vk.lib.kernel_linear_dq_s8(ptr(gpu[0]), ptr(gpu[1]), ptr(W), None, ptr(gpu[4]), ptr(y0), M, K, N)   # no bias
+    vk.sync()
+    f, _ = refc.fn("linear_dq_s8")
+    y, yr0 = np.zeros((M, N), np.float32), np.zeros((M, N), np.float32)
+    c = lambda a: ctypes.c_void_p(a.ctypes.data)
+    f(c(x), c(rs), c(w), c(b), c(ws), c(y), M, K, N)
+    f(c(x), c(rs), c(w), None, c(ws), c(yr0), M, K, N)
+    assert np.array_equal(np.array(gpu[5]), y) and np.array_equal(np.array(y0), yr0)
+    vk.release(m)
+
+
 @pytest.mark.parametrize("model", ["attn_block", "norm_block"])
 def test_s8_ir_walk_bit_exact(vk, refc, specs, model, tmp_path):
     """MB's int8 SmolVLA proxies (attention + RoPE, norms + GELU) from the FX int8 path."""

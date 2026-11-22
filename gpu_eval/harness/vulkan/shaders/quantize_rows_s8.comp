@@ -1,33 +1,35 @@
 #version 460
 #define MB_INT8
 #include "mb_common.glsl"
-layout(local_size_x = 256) in;
-// kernel_quantize_rows_s8 (pipeline/int8_mixed.py), bit-exact: one workgroup per row.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+// kernel_quantize_rows_s8 (pipeline/int8_mixed.py), bit-exact: one 64-wide workgroup per row.
 // x' = x * col_inv[k] (fp32), amax = max |x'| (exact in any order; NaN never wins),
 // s = amax / 127 and inv = 1 / s as IEEE fp32 divisions (mb_fdiv), q = roundf(x' * inv) clamped to +-127.
 layout(push_constant, scalar) uniform PC { F32 x; F32 ci; I8 y; F32 rs; int M; int K; } pc;
-shared float red[256];
+shared float red[64];
 void main() {
     int row = int(gl_WorkGroupID.y) * int(gl_NumWorkGroups.x) + int(gl_WorkGroupID.x);
     if (row >= pc.M) return;
     int tid = int(gl_LocalInvocationID.x);
     int base = row * pc.K;
     float a = 0.0;
-    for (int k = tid; k < pc.K; k += 256) {
+    for (int k = tid; k < pc.K; k += 64) {
         precise float v = abs(pc.x.v[base + k] * pc.ci.v[k]);
         if (v > a) a = v;
     }
-    red[tid] = a;
-    barrier();
-    for (int st = 128; st > 0; st >>= 1) {
-        if (tid < st && red[tid + st] > red[tid]) red[tid] = red[tid + st];
+    a = subgroupMax(a);                     // (a >= 0: NaN never entered)
+    if (gl_NumSubgroups > 1) {              // waves narrower than 64 (Intel): combine through LDS
+        if (subgroupElect()) red[gl_SubgroupID] = a;
         barrier();
+        a = red[0];
+        for (uint i = 1; i < gl_NumSubgroups; i++) a = max(a, red[i]);
     }
-    float amax = red[0];
+    float amax = a;
     float s = amax > 0.0 ? mb_fdiv(amax, 127.0) : 1.0;
     float inv = mb_fdiv(1.0, s);
     if (tid == 0) pc.rs.v[row] = s;
-    for (int k = tid; k < pc.K; k += 256) {
+    for (int k = tid; k < pc.K; k += 64) {
         precise float v = pc.x.v[base + k] * pc.ci.v[k];
         precise float t = v * inv;
         float q = mb_roundf(t);
