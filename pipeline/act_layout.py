@@ -47,6 +47,12 @@ LAYOUT_AGNOSTIC_OPS = {
     "add_s8", "relu_s8", "relu6_s8", "sigmoid_s8", "silu_s8", "gelu_s8",
     "mul_s8", "elu_s8", "leaky_relu_s8", "tanh_s8",
     "add_f16", "relu_f16", "mul_f16", "sigmoid_f16", "silu_f16",
+    # Folded integer ops (fold_quant_consts.py). add_q_s8 is flat. batchnorm2d_q_s8
+    # is per-channel but its signature takes (outer, C, inner) strides rather than
+    # an axis order, and generate_skeleton derives them from the tensor's declared
+    # layout (NCHW: outer=N, inner=H*W; NHWC: outer=N*H*W, inner=1), so the same C
+    # is correct in either layout and needs neither a variant nor a shim.
+    "add_q_s8", "batchnorm2d_q_s8",
 }
 
 
@@ -104,6 +110,7 @@ def native_layouts(kind: str, backend_name: Optional[str]) -> set[str]:
     KernelSpec.__post_init__ guarantees the algorithm queue is never empty.
     """
     from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+    from modelblaster.pipeline.backends import affined as _affined
     lays = {NCHW}
     if kind in LAYOUT_AGNOSTIC_OPS:
         return {NCHW, NHWC}
@@ -113,7 +120,7 @@ def native_layouts(kind: str, backend_name: Optional[str]) -> set[str]:
     if spec is None or not backend_name:
         return lays
     for a in spec.algorithms:
-        if not a.target_affinity or backend_name not in a.target_affinity:
+        if not _affined(a.target_affinity, backend_name):
             continue
         lays |= set(getattr(a, "act_layouts", None) or (NCHW,))
     return lays

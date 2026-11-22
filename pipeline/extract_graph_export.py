@@ -111,7 +111,7 @@ _ALIAS = {
     "view.default", "transpose.int", "slice.Tensor", "select.int",
     "unsqueeze.default", "unflatten.int", "squeeze.dim",
     "contiguous.default", "permute.default", "reshape.default",
-    "flatten.using_ints", "split.Tensor", "expand_as.default",
+    "flatten.using_ints", "split.Tensor", "expand_as.default", "expand.default",
     "clone.default",
     # A slice that covers the whole tensor (ViNT's pos_enc[:, :L, :] at full
     # length) is exported as aten.alias: same storage, same shape.
@@ -235,7 +235,8 @@ class _ExportWalker:
     def __init__(self, ep, calibration_tensors: list[dict[str, torch.Tensor]],
                  input_order: list[str], per_channel: bool = False,
                  quant: str = "int8",
-                 op_precision: Optional[dict[str, str]] = None):
+                 op_precision: Optional[dict[str, str]] = None,
+                 per_channel_depthwise: bool = False):
         self.ep = ep
         self.gm = ep.graph_module
         # When True, conv2d / linear / matmul emit their per-channel
@@ -243,6 +244,10 @@ class _ExportWalker:
         # output channel) instead of the per-tensor form. Activations
         # remain per-tensor symmetric.
         self.per_channel = per_channel
+        # Extends per_channel to depthwise convs (depthwise_conv2d_s8_pc).
+        # A separate opt-in so IRs extracted with per_channel alone stay
+        # byte-identical.
+        self.per_channel_depthwise = per_channel_depthwise
         # Default precision for ops without an explicit override:
         #   "int8" — existing PTQ path
         #   "fp16" — half-precision (weights cast to float16, op records
@@ -685,6 +690,25 @@ class _ExportWalker:
             # Under this node's own name, so nothing else that reads
             # src_name is disturbed and no name_map entry is needed.
             self._record_constant(n.name, val)
+            return
+        # leading-axis replication: out = (G, *rest) with rest the source's data (the source either has a unit
+        # leading axis or lacks the batch axis altogether, as after an aliased unsqueeze)
+        if len(out_shape) >= 2 and out_shape[0] > 1 \
+                and int(np.prod(out_shape[1:])) == int(np.prod(src_shape)) \
+                and (len(src_shape) < len(out_shape) or src_shape[0] == 1):
+            # A batch of copies of one activation (x.expand(G, ...)): ViNT's
+            # frame and obs tokens shared by G candidate goals. A repeat_q
+            # writes the source's codes G times, on the source's grid.
+            self._record_tensor(n.name)
+            if src_name in self.scales:
+                self.scales[n.name] = self.scales[src_name]
+                q_meta = self.tensors_meta.get(n.name, {}).get("quant")
+                if isinstance(q_meta, dict):
+                    q_meta["scale"] = self.scales[src_name]
+            self.ops.append({"name": str(n.name), "op": "repeat_q", "inputs": [src_name],
+                             "outputs": [n.name],
+                             "shape": {"n": int(np.prod(src_shape)), "times": int(out_shape[0])},
+                             "quant": {}})
             return
         raise NotImplementedError(
             f"extract_graph_export: {_op_name(n)} at {n.name} broadcasts "
@@ -1585,7 +1609,8 @@ class _ExportWalker:
         # accept per-channel arrays and it's a smaller accuracy win
         # (per-channel matters most where output dim is large; depthwise
         # outputs are typically small after the channel mix).
-        use_pc = self.per_channel and not is_depthwise
+        use_pc = self.per_channel and (
+            not is_depthwise or self.per_channel_depthwise)
         if use_pc:
             # Per-OC max_abs over the (IC, KH, KW) dims that contribute
             # to each OC.
@@ -1595,7 +1620,7 @@ class _ExportWalker:
             w_q = np.empty_like(w_np, dtype=np.int8)
             for oc in range(OC):
                 w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)
-            op_kind = "conv2d_s8_pc"
+            op_kind = "depthwise_conv2d_s8_pc" if is_depthwise else "conv2d_s8_pc"
             w_key = f"{n.name}.weights"
             self.weights_blob[w_key] = w_q
             b_key = None
@@ -1789,6 +1814,16 @@ class _ExportWalker:
             "quant": quant,
         })
 
+    def _carry_input_scale(self, in_name, out_name) -> float:
+        """Give out_name in_name's scale, for an op whose kernel moves or
+        clamps codes without requantizing them, and return that scale."""
+        scale_in = self.scales.get(in_name, 1e-8)
+        self.scales[out_name] = scale_in
+        if out_name in self.tensors_meta and \
+                isinstance(self.tensors_meta[out_name].get("quant"), dict):
+            self.tensors_meta[out_name]["quant"]["scale"] = scale_in
+        return scale_in
+
     def _emit_relu(self, n):
         in_name = self._resolve_input(n.args[0])
         out_name = n.name
@@ -1801,9 +1836,14 @@ class _ExportWalker:
             "shape": {"n": int(np.prod(self.tensors[out_name].shape))},
         }
         if q == "int8":
+            # kernel_relu_s8 clamps codes and takes no scales, so the output
+            # must carry the input's scale. Its own captured max-abs is the
+            # positive max only, which differs whenever the input's largest
+            # magnitude is negative (ViNT's head MLP: up to 1.46x).
+            scale_in = self._carry_input_scale(in_name, out_name)
             rec["quant"] = {
-                "scale_in":  self.scales.get(in_name, 1e-8),
-                "scale_out": self.scales.get(out_name, 1e-8),
+                "scale_in":  scale_in,
+                "scale_out": scale_in,
                 "activation_min": 0,  # int8: 0 maps to symmetric -128 + 128
                 "activation_max": 127,
             }
@@ -2279,6 +2319,11 @@ class _ExportWalker:
         split, dim, start, end = self._split_piece_range(n)
         src_name = self._resolve_input(split.args[0])
         self._record_tensor(n.name)
+        if (self.tensors_meta.get(src_name, {}).get("quant") or {}).get("kind") == "constant_buffer":
+            # A piece of a constant is folded at extract time, as any
+            # size-changing alias of a constant is (_materialize_or_alias).
+            self._materialize_or_alias(n, src_name)
+            return
         if not n.users:
             return  # an unused piece: nothing reads it, so nothing copies it
         if all(self._cat_reassembles_split(u) for u in n.users):
@@ -2449,9 +2494,15 @@ class _ExportWalker:
             },
         }
         if q == "int8":
+            # kernel_pad_s8 copies bytes and takes no scales, so its output
+            # holds the input's codes: it must carry the input's scale. Its
+            # own captured scale (from the export node, not the producer)
+            # differs by up to 4x on ViNT; consumers that read the pad at
+            # that scale saw every stride-2 block's input mis-scaled.
+            scale_in = self._carry_input_scale(in_name, out_name)
             rec["quant"] = {
-                "scale_in":  self.scales.get(in_name, 1e-8),
-                "scale_out": self.scales.get(out_name, 1e-8),
+                "scale_in":  scale_in,
+                "scale_out": scale_in,
                 "pad_value": 0,  # zero-pad in int8 domain
             }
         self.ops.append(rec)
@@ -2587,22 +2638,27 @@ def _emit_vint_post_op(walker, out_dir):
     in_dist_int8 = _quantize_per_tensor_sym(linear_23_t, scale_dist).ravel()
     in_deltas_int8 = _quantize_per_tensor_sym(
         linear_24_t, scale_deltas).ravel()
-    deq_deltas = in_deltas_int8.astype(np.float32).reshape(5, 4) * scale_deltas
-    waypts = np.zeros_like(deq_deltas)
-    waypts[:, 0] = np.cumsum(deq_deltas[:, 0])
-    waypts[:, 1] = np.cumsum(deq_deltas[:, 1])
-    norms = np.linalg.norm(deq_deltas[:, 2:], axis=1, keepdims=True)
-    norms = np.clip(norms, 1e-12, None)
-    waypts[:, 2:] = deq_deltas[:, 2:] / norms
-    deq_dist = float(in_dist_int8[0]) * scale_dist
-    out_combined = np.concatenate([
-        np.array([deq_dist], dtype=np.float32),
-        waypts.ravel().astype(np.float32),
-    ])
+    # n_goals > 1: a batch of candidate goals, one [dist, 5 x 4 waypoints] record per goal
+    n_goals = int(in_dist_int8.size)
+    recs = []
+    for gi in range(n_goals):
+        deq_deltas = in_deltas_int8.astype(np.float32).reshape(n_goals, 5, 4)[gi] * scale_deltas
+        waypts = np.zeros_like(deq_deltas)
+        waypts[:, 0] = np.cumsum(deq_deltas[:, 0])
+        waypts[:, 1] = np.cumsum(deq_deltas[:, 1])
+        norms = np.linalg.norm(deq_deltas[:, 2:], axis=1, keepdims=True)
+        norms = np.clip(norms, 1e-12, None)
+        waypts[:, 2:] = deq_deltas[:, 2:] / norms
+        deq_dist = float(in_dist_int8[gi]) * scale_dist
+        recs.append(np.concatenate([
+            np.array([deq_dist], dtype=np.float32),
+            waypts.ravel().astype(np.float32),
+        ]))
+    out_combined = np.concatenate(recs)
 
     out_name = "vint_combined_output"
     walker.tensors_meta[out_name] = {
-        "shape": [21],
+        "shape": [21 * n_goals],
         "dtype": "f32",
         "quant": {"scale": 1.0, "zero_point": 0,
                   "kind": "app_op_composite"},
@@ -2613,7 +2669,7 @@ def _emit_vint_post_op(walker, out_dir):
         "op": "vint_action_post",
         "inputs": ["linear_23", "linear_24"],
         "outputs": [out_name],
-        "shape": {"n_wp": 5, "n_dim": 4},
+        "shape": {"n_wp": 5, "n_dim": 4, **({"n_goals": n_goals} if n_goals > 1 else {})},
         "quant": {
             "scale_dist":   float(scale_dist),
             "scale_deltas": float(scale_deltas),
@@ -2812,6 +2868,16 @@ def main():
                         "node names; matching ops are promoted to fp16. "
                         "Additive to --fp16-ops and the model's spec. "
                         "Example: --fp16-patterns 'layer_norm_*'")
+    p.add_argument("--per-channel-depthwise", action="store_true",
+                   default=os.environ.get("MB_INT8_PC_DEPTHWISE", "0") == "1",
+                   help="Extend --per-channel to depthwise convs (emits "
+                        "depthwise_conv2d_s8_pc). A separate opt-in so IRs "
+                        "extracted with --per-channel alone keep reproducing "
+                        "byte for byte. After BN folding a depthwise layer's "
+                        "channels differ in magnitude by orders of magnitude, "
+                        "so one scale leaves most of them a few codes (ViNT: "
+                        "421 of 17,920 channels use <= 8 levels). Also "
+                        "MB_INT8_PC_DEPTHWISE=1.")
     p.add_argument("--precision-spec", default="model",
                    help="Per-op precision spec: 'model' (default) uses the "
                         "model module's get_precision_spec(); 'none' uses "
@@ -2864,8 +2930,9 @@ def main():
     # hooks (get_calibration_spec, get_precision_spec, ...). Cheap; the
     # actual model weights have already been loaded by _load_model.
     mod = _import_model_module(args.model)
+    _spec_fn = getattr(mod, "get_calibration_spec", None)
     if args.num_calibration > 1:
-        if hasattr(mod, "get_calibration_spec"):
+        if _spec_fn is not None and _spec_fn(args.num_calibration) is not None:
             from modelblaster.mb_datasets import materialize_calibration_samples  # noqa: PLC0415
             calib_spec = mod.get_calibration_spec(args.num_calibration)
             print(f"[extract_export] resolving calibration spec "
@@ -2913,6 +2980,7 @@ def main():
 
     walker = _ExportWalker(ep, calib_dicts, input_order,
                            per_channel=args.per_channel,
+                           per_channel_depthwise=args.per_channel_depthwise,
                            quant=args.quant,
                            op_precision=op_precision)
     print(f"[extract_export] calibrating + capturing intermediates ...",
@@ -2970,6 +3038,12 @@ def main():
     # first calibration sample for sizing / golden capture.
     calib_sample = calib_dicts[0]
     input_names = list(calib_sample.keys())
+    # State (a model's get_state_spec: {input name: forward-output index}):
+    # the input and the output that is its next value become ONE tensor the
+    # generated model keeps between calls. The input leaves the packed input,
+    # and a copy_q at the end of the graph writes the next value into it.
+    state_spec = (mod.get_state_spec() if hasattr(mod, "get_state_spec") else None) or {}
+    state_records = []
     for k in input_names:
         walker._record_tensor(k)
     sig = ep.graph_signature
@@ -2982,6 +3056,23 @@ def main():
     # those slots un-written. The aliased name still appears in
     # walker.tensors_meta with the same shape, so downstream wiring works.
     output_names = [walker.name_map.get(n, n) for n in output_names]
+    for s_in, s_idx in state_spec.items():
+        s_out = output_names[s_idx]
+        walker._record_tensor(s_in)
+        # one quantity, one grid: the state input takes its next value's scale
+        if s_out in walker.scales and args.quant == "int8":
+            walker.scales[s_in] = walker.scales[s_out]
+            walker.tensors_meta[s_in]["quant"]["scale"] = walker.scales[s_out]
+        n_el = int(np.prod(walker.tensors_meta[s_in]["shape"]))
+        if n_el != int(np.prod(walker.tensors_meta[s_out]["shape"])):
+            raise SystemExit(f"state {s_in}: {n_el} elements, its next value {s_out} has a different count")
+        walker.ops.append({"name": f"{s_in}__update", "op": "copy_q", "inputs": [s_out], "outputs": [s_in],
+                           "shape": {"n": n_el}, "quant": {}})
+        state_records.append({"input": s_in, "output": s_out})
+    if state_records:
+        drop_out = {r["output"] for r in state_records}
+        output_names = [n for n in output_names if n not in drop_out]
+        input_names = [n for n in input_names if n not in state_spec]
 
     # Match the IR shape generate_skeleton consumes (see
     # extract_graph::extract_int8 for the canonical form):
@@ -3056,6 +3147,8 @@ def main():
         "dispatches": dispatches,
         "inspect_tensors": inspect_tensors,
     }
+    if state_records:
+        ir["state"] = state_records
 
     graph_path = out_dir / "graph.json"
     with open(graph_path, "w") as f:

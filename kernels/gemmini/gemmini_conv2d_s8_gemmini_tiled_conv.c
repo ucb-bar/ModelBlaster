@@ -417,6 +417,7 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
      * effective_scale = output_multiplier * 2^(-(31 + output_shift)). f32
      * has ~24 bits of mantissa precision; loses ~1 LSB per layer. */
     float scale = ldexpf((float)output_multiplier, -(31 + output_shift));
+    const acc_t *bias_used = bias;
 #endif
 
     /* RELU (1) clamps to [0, INT8_MAX]; NO_ACTIVATION (0) allows full range. */

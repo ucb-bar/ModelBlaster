@@ -323,14 +323,19 @@ int mb_cl_init() {
     cl_uint np = 0;
     if (clGetPlatformIDs(16, plats, &np) != CL_SUCCESS || np == 0) { mb_error("no OpenCL platform"); return 1; }
     int pi = pe ? atoi(pe) : -1, di = de ? atoi(de) : 0;
+    // MB_CL_DEVICE_TYPE=cpu|all: also accept a CPU device (e.g. PoCL) -- for checking seeds on a host without
+    // an OpenCL GPU. The default stays GPU-only: timings from a CPU device are not the target's.
+    const char *te = getenv("MB_CL_DEVICE_TYPE");
+    cl_device_type dtype = !te ? CL_DEVICE_TYPE_GPU : !strcmp(te, "cpu") ? CL_DEVICE_TYPE_CPU
+                         : !strcmp(te, "all") ? CL_DEVICE_TYPE_ALL : CL_DEVICE_TYPE_GPU;
     for (cl_uint p = 0; p < np && !mb_rt.device; ++p) {
         if (pi >= 0 && (int)p != pi) continue;
         cl_device_id devs[16];
         cl_uint nd = 0;
-        if (clGetDeviceIDs(plats[p], CL_DEVICE_TYPE_GPU, 16, devs, &nd) != CL_SUCCESS || nd == 0) continue;
+        if (clGetDeviceIDs(plats[p], dtype, 16, devs, &nd) != CL_SUCCESS || nd == 0) continue;
         if (di < (int)nd) { mb_rt.platform = plats[p]; mb_rt.device = devs[di]; }
     }
-    if (!mb_rt.device) { mb_error("no OpenCL GPU device (MB_CL_PLATFORM/MB_CL_DEVICE)"); return 1; }
+    if (!mb_rt.device) { mb_error("no OpenCL %s device (MB_CL_PLATFORM/MB_CL_DEVICE/MB_CL_DEVICE_TYPE)", te ? te : "GPU"); return 1; }
     cl_int e;
     mb_rt.ctx = clCreateContext(NULL, 1, &mb_rt.device, NULL, NULL, &e);
     if (e != CL_SUCCESS) { mb_error("clCreateContext: %d", e); return 1; }

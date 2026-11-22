@@ -36,6 +36,28 @@
 #include <zephyr/arch/cpu.h>
 #endif
 
+/* Opt-in HARDWARE TACIT capture of the inference via raw MMIO (independent of
+ * the spike-oriented MB_TACIT_TRACE_MODEL / l_trace path above). Build with
+ * -DMB_TACIT_HW=1. Programs the TACIT encoder controller + DMA trace sink to
+ * stream the branch trace into a DDR region clear of the app/data, brackets
+ * exactly model_run_test(), then disables + flushes the sink and reports the
+ * byte count on the console. Register map matches the validated trace_test
+ * recipe (encoder ctrl @0x3000000, DMA sink @0x3010000). */
+#if defined(MB_TACIT_HW)
+#ifndef MB_TACIT_TRACE_BUF
+#define MB_TACIT_TRACE_BUF 0x90000000UL   /* 256 MiB into DDR, clear of app */
+#endif
+#define MB_TACIT_CTRL    0x3000000UL      /* +0x00 control: bit1=enable bit0=active */
+#define MB_TACIT_TARGET  0x3000020UL      /* trace sink target id */
+#define MB_TACIT_BPMODE  0x3000024UL      /* branch-predictor mode (0 = branch-target) */
+#define MB_TACIT_DMA_FLUSH 0x3010000UL    /* write 1 -> flush FIFO */
+#define MB_TACIT_DMA_DONE  0x3010004UL    /* read  1 -> flush drained */
+#define MB_TACIT_DMA_START 0x3010008UL    /* 64-bit dma_start_addr */
+#define MB_TACIT_DMA_BYTES 0x3010010UL    /* 64-bit addr_counter (bytes written) */
+#define MB_MMIO32(a) (*(volatile unsigned int  *)(a))
+#define MB_MMIO64(a) (*(volatile unsigned long *)(a))
+#endif
+
 static model_output_t model_output[MODEL_OUTPUT_SIZE];
 
 int main(void)
@@ -78,6 +100,22 @@ int main(void)
 
     printf("modelblaster harness: model=%s in=%d out=%d\n",
            MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE);
+
+    /* MODELBLASTER_PROFILE_ITERS: opt-in repeat loop for real-hardware
+     * per-op profiling (board mcycle counts). Iteration 0 is a WARMUP
+     * (I-cache/scratch/DMA-descriptor cold-start effects) and is tagged
+     * as such on every printed line so the host-side consumer can
+     * discard it and average the steady-state iterations that follow.
+     * Default 1 (single-shot, identical to the original behavior) so
+     * every other build of this harness (spike verify, single-run
+     * FireSim, etc.) is unaffected unless this is explicitly overridden
+     * at configure time (-DMODELBLASTER_PROFILE_ITERS=N). */
+#ifndef MODELBLASTER_PROFILE_ITERS
+#define MODELBLASTER_PROFILE_ITERS 1
+#endif
+    for (int mb_prof_iter = 0; mb_prof_iter < MODELBLASTER_PROFILE_ITERS; mb_prof_iter++) {
+    printf("=== MODELBLASTER_PROFILE_ITER === %d %s\n", mb_prof_iter,
+           mb_prof_iter == 0 ? "WARMUP" : "STEADY");
 
     /* Single-model harness has no thread pool — pass NULL. The
      * generated kernel bodies ignore it; only the parallel-for wrapper
@@ -127,7 +165,78 @@ int main(void)
     unsigned int mb_irq_key = irq_lock();
 #endif
 
+#if defined(CONFIG_RISCV_ISA_EXT_V)
+    /* ------------------------------------------------------------------
+     * Turn the vector unit on for a Zve*-only core (misa.V = 0).
+     *
+     * This Zephyr enables mstatus.VS in exactly two places, and both miss a
+     * core that implements Zve64x but not full V:
+     *   - arch/riscv/core/thread.c sets MSTATUS_VS_INIT in a new thread's
+     *     mstatus only under CONFIG_RISCV_ISA_EXT_V_LAZY (the harness
+     *     overlays use LAZY=n);
+     *   - the eager path, z_riscv_vstate_restore_thread() in
+     *     arch/riscv/core/v.c, sets VS_CLEAN on context switch, but it
+     *     returns first unless HAS_V(), i.e. misa bit 'V'.
+     * Rocket sets misa.V only when vLen >= 128 && eLen >= 64 && vfLen >= 64
+     * (rocket-chip tile/Core.scala hasV), so an integer-only Saturn
+     * (intOnlyParams: zve64x) has misa.V = 0, while mstatus.VS is still
+     * writable (CSR.scala formVS keys on usingVector). Result, measured on
+     * an FPGA Rocket + integer-only Saturn shell: the first vsetvli in a
+     * kernel traps illegal-instruction with VS = Off. There is no Kconfig for
+     * Zve-without-V here (arch/riscv/Kconfig.isa has only RISCV_ISA_EXT_V).
+     *
+     * Where misa.V = 1 (the FP16 Saturn shell, spike's rv64gcv) Zephyr has
+     * already done this and the branch is not taken. On a core with no vector
+     * unit at all the write is a no-op (VS is hardwired Off) and behaviour is
+     * unchanged.
+     *
+     * SINGLE-THREAD ONLY. With misa.V = 0 Zephyr's HAS_V() also skips every
+     * vector save/restore, so vector registers are NOT preserved across a
+     * context switch or an ISR. This harness runs one thread and, by default,
+     * the whole inference under irq_lock() above, which is what makes this
+     * safe. A multi-threaded or IRQ-enabled RVV workload on such a core needs
+     * Zephyr's HAS_V() taught about Zve instead.
+     * ------------------------------------------------------------------ */
+    {
+        unsigned long mb_misa;
+        __asm__ volatile("csrr %0, misa" : "=r"(mb_misa));
+        if (!(mb_misa & (1UL << ('V' - 'A')))) {
+            /* mstatus.VS = Initial (bits 10:9 = 01) */
+            __asm__ volatile("csrs mstatus, %0" :: "r"(1UL << 9) : "memory");
+        }
+    }
+#endif
+
+#if defined(MB_TACIT_HW)
+    /* Program + enable the encoder immediately before the inference so the
+     * FSync lands on a real inference PC and the trace holds only model
+     * control flow (boot / verify / print are outside the window). */
+    unsigned long mb_tacit_bytes = 0;
+    MB_MMIO64(MB_TACIT_DMA_BYTES) = 0UL;               /* reset byte counter */
+    MB_MMIO64(MB_TACIT_DMA_START) = MB_TACIT_TRACE_BUF; /* dma start addr */
+    MB_MMIO32(MB_TACIT_TARGET)    = 1u;                 /* DMA sink (target id 1) */
+    MB_MMIO32(MB_TACIT_BPMODE)    = 0u;                 /* branch-target mode */
+    __asm__ volatile("fence" ::: "memory");
+    MB_MMIO32(MB_TACIT_CTRL)      = 3u;                 /* enable=1, active=1 */
+    __asm__ volatile("fence" ::: "memory");
+#endif
+
     model_run_test(model_output, NULL);
+
+#if defined(MB_TACIT_HW)
+    __asm__ volatile("fence" ::: "memory");
+    MB_MMIO32(MB_TACIT_CTRL) = 1u;                      /* disable tracing */
+    __asm__ volatile("fence" ::: "memory");
+    MB_MMIO32(MB_TACIT_DMA_FLUSH) = 1u;                 /* drain FIFO -> DDR */
+    /* FIFO is 32 bytes; a few thousand cycles is plenty. Poll done with a
+     * bounded spin (done_reg latches and cannot be cleared from SW, so also
+     * fall through after the delay regardless). */
+    for (volatile int _d = 0; _d < 200000; _d++) {
+        if (MB_MMIO32(MB_TACIT_DMA_DONE) & 1u) break;
+    }
+    __asm__ volatile("fence" ::: "memory");
+    mb_tacit_bytes = MB_MMIO64(MB_TACIT_DMA_BYTES);
+#endif
 #if defined(MB_TACIT_TRACE_MODEL)
     l_trace_encoder_stop(_tacit_enc);
     for (int _i = 0; _i < 16; _i++) { __asm__ volatile("nop"); } /* flush */
@@ -151,6 +260,11 @@ int main(void)
 
 #if MODELBLASTER_MASK_IRQ_DURING_RUN
     irq_unlock(mb_irq_key);
+#endif
+
+#if defined(MB_TACIT_HW)
+    printf("=== MB_TACIT_HW === trace_buf=0x%lx bytes=%lu\n",
+           (unsigned long)MB_TACIT_TRACE_BUF, mb_tacit_bytes);
 #endif
 
     /* In-binary golden compare.
@@ -216,6 +330,7 @@ int main(void)
      * runner reads this line to get the cross-hart-correct number;
      * per-op rdcycle deltas above are used for relative comparisons. */
     printf("=== MODELBLASTER_WALL_CYCLES === %lu\n", model_wall_cycles());
+    } /* end MODELBLASTER_PROFILE_ITERS loop */
 
 #ifdef CONFIG_ARCH_POSIX
     /* native_sim: no HTIF/reboot — terminate the host process cleanly so the
