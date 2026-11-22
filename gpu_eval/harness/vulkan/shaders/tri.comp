@@ -1,0 +1,21 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// triu / tril (upper), diag_matmul (mode 2: y = a[i / N2] * b[i]), flip (mode 3)
+layout(push_constant, scalar) uniform PC { F32 x; F32 b; F32 y; int n; int M; int N; int d; int mode; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int i = int(gi);
+    if (pc.mode <= 1) {
+        int r = i / pc.N, c = i % pc.N;
+        bool keep = pc.mode == 1 ? c >= r + pc.d : c <= r + pc.d;
+        pc.y.v[i] = keep ? pc.x.v[i] : 0.0;
+    } else if (pc.mode == 2) {
+        pc.y.v[i] = pc.x.v[i / pc.N] * pc.b.v[i];
+    } else {
+        // flip: M = axis length, N = inner
+        int j = i % pc.N, a = (i / pc.N) % pc.M, o = i / (pc.N * pc.M);
+        pc.y.v[i] = pc.x.v[(o * pc.M + (pc.M - 1 - a)) * pc.N + j];
+    }
+}

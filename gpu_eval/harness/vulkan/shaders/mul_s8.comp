@@ -1,0 +1,15 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_mul_s8: ((a*sa) * (b*sb)) / so in IEEE fp32, roundf
+layout(push_constant, scalar) uniform PC { I8 a; I8 b; I8 y; int n; float sa; float sb; float so; int amin; int amax; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int i = int(gi);
+    precise float fa = float(pc.a.v[i]) * pc.sa;
+    precise float fb = float(pc.b.v[i]) * pc.sb;
+    precise float pr = fa * fb;
+    pc.y.v[i] = int8_t(mb_clampi(int(mb_roundf(mb_fdiv(pr, pc.so))), pc.amin, pc.amax));
+}

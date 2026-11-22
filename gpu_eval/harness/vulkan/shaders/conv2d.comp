@@ -1,0 +1,30 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// direct grouped + dilated conv2d, one invocation per output (NCHW, OIHW weights)
+layout(push_constant, scalar) uniform PC {
+    F32 x; F32 w; F32 b; F32 y;
+    int n; int IC; int IH; int IW; int OC; int OH; int OW; int KH; int KW;
+    int SH; int SW; int PH; int PW; int DH; int DW; int G;
+} pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int i = int(gi);
+    int ow = i % pc.OW, oh = (i / pc.OW) % pc.OH, oc = (i / (pc.OW * pc.OH)) % pc.OC, nb = i / (pc.OW * pc.OH * pc.OC);
+    int ICg = pc.IC / pc.G, ic0 = (oc / (pc.OC / pc.G)) * ICg;
+    float acc = mb_nonnull(pc.b) ? pc.b.v[oc] : 0.0;
+    for (int ic = 0; ic < ICg; ic++)
+        for (int kh = 0; kh < pc.KH; kh++) {
+            int ih = oh * pc.SH - pc.PH + kh * pc.DH;
+            if (ih < 0 || ih >= pc.IH) continue;
+            int xrow = ((nb * pc.IC + ic0 + ic) * pc.IH + ih) * pc.IW;
+            int wrow = ((oc * ICg + ic) * pc.KH + kh) * pc.KW;
+            for (int kw = 0; kw < pc.KW; kw++) {
+                int iw = ow * pc.SW - pc.PW + kw * pc.DW;
+                if (iw < 0 || iw >= pc.IW) continue;
+                acc = fma(pc.x.v[xrow + iw], pc.w.v[wrow + kw], acc);
+            }
+        }
+    pc.y.v[i] = acc;
+}

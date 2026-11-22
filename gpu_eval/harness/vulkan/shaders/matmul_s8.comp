@@ -1,0 +1,16 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_matmul_s8: int32 dot, then roundf((float)acc * total) with total computed on the host
+layout(push_constant, scalar) uniform PC { I8 a; I8 b; I8 y; int M; int K; int N; int tb; float total; int amin; int amax; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= int64_t(pc.M) * pc.N) return;
+    int i = int(gi) / pc.N, j = int(gi) % pc.N;
+    int acc = 0;
+    for (int k = 0; k < pc.K; k++)
+        acc += int(pc.a.v[i * pc.K + k]) * int(pc.tb != 0 ? pc.b.v[j * pc.K + k] : pc.b.v[k * pc.N + j]);
+    precise float v = float(acc) * pc.total;
+    pc.y.v[int(gi)] = int8_t(mb_clampi(int(mb_roundf(v)), pc.amin, pc.amax));
+}

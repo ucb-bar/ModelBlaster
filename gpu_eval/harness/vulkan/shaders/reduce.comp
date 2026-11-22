@@ -1,0 +1,75 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// One workgroup per output (o, j) of [outer, R, inner]: threads stride over R,
+// then a shared-memory tree. opc as kernel_reduce: 0 sum 1 mean 2 max 3 min
+// 4 prod 5 sumsq 6 l2 7 argmax 8 argmin 9 var 10 var(unbiased)
+layout(push_constant, scalar) uniform PC { F32 x; F32 y; int outer; int R; int inner; int opc; } pc;
+shared float sv[256];
+shared int si[256];
+float comb(float a, float b, int opc) {
+    if (opc == 2) return (a > b || isnan(a)) ? a : b;
+    if (opc == 3) return (a < b || isnan(a)) ? a : b;
+    if (opc == 4) return a * b;
+    return a + b;
+}
+float tree(float v, int opc) {
+    uint t = gl_LocalInvocationID.x;
+    sv[t] = v;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (t < s) sv[t] = comb(sv[t], sv[t + s], opc);
+        barrier();
+    }
+    float r = sv[0];
+    barrier();
+    return r;
+}
+void main() {
+    int out_i = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    if (out_i >= pc.outer * pc.inner) return;
+    int o = out_i / pc.inner, j = out_i % pc.inner;
+    int base = o * pc.R * pc.inner + j;
+    int t = int(gl_LocalInvocationID.x);
+    int opc = pc.opc;
+    float res;
+    if (opc == 7 || opc == 8) {
+        float bv = 0.0; int bi = -1;
+        for (int r = t; r < pc.R; r += 256) {
+            float v = pc.x.v[base + r * pc.inner];
+            if (bi < 0 || (opc == 7 ? v > bv : v < bv)) { bv = v; bi = r; }
+        }
+        sv[t] = bv; si[t] = bi;
+        barrier();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (t < s) {
+                float v = sv[t + s]; int i2 = si[t + s];
+                if (i2 >= 0 && (si[t] < 0 || (opc == 7 ? v > sv[t] : v < sv[t]) || (v == sv[t] && i2 < si[t]))) { sv[t] = v; si[t] = i2; }
+            }
+            barrier();
+        }
+        res = float(si[0]);
+    } else if (opc == 9 || opc == 10) {
+        float a = 0.0;
+        for (int r = t; r < pc.R; r += 256) a += pc.x.v[base + r * pc.inner];
+        float m = tree(a, 0) / float(pc.R);
+        float q = 0.0;
+        for (int r = t; r < pc.R; r += 256) { float d = pc.x.v[base + r * pc.inner] - m; q += d * d; }
+        q = tree(q, 0);
+        res = q / float(opc == 10 ? pc.R - 1 : pc.R);
+    } else {
+        bool mm = (opc == 2 || opc == 3);
+        float id = mm ? pc.x.v[base] : (opc == 4 ? 1.0 : 0.0);
+        float a = id;
+        for (int r = t; r < pc.R; r += 256) {
+            float v = pc.x.v[base + r * pc.inner];
+            if (opc == 5 || opc == 6) v = v * v;
+            a = comb(a, v, opc);
+        }
+        a = tree(a, opc);
+        if (opc == 1) a /= float(pc.R);
+        if (opc == 6) a = sqrt(a);
+        res = a;
+    }
+    if (t == 0) pc.y.v[out_i] = res;
+}

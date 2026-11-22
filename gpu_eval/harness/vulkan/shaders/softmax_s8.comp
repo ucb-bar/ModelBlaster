@@ -1,0 +1,23 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_softmax_s8, one invocation per row in the reference's order: e[d] =
+// expf(d * scale_in) for d = x - rowmax in [-255, 0] comes from a host LUT
+// (the reference's own expf), the sum is sequential fp32, the divisions are
+// IEEE fp32 (mb_fdiv), roundf exact.
+layout(push_constant, scalar) uniform PC { I8 x; I8 y; F32 lut; int M; int K; float scale_out; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.M) return;
+    int base = int(gi) * pc.K;
+    int mx = int(pc.x.v[base]);
+    for (int k = 1; k < pc.K; k++) mx = max(mx, int(pc.x.v[base + k]));
+    precise float sum = 0.0;
+    for (int k = 0; k < pc.K; k++) sum += pc.lut.v[mx - int(pc.x.v[base + k])];
+    for (int k = 0; k < pc.K; k++) {
+        float p = mb_fdiv(pc.lut.v[mx - int(pc.x.v[base + k])], sum);
+        int v = int(mb_roundf(mb_fdiv(p, pc.scale_out)));
+        pc.y.v[base + k] = int8_t(mb_clampi(v, -128, 127));
+    }
+}

@@ -1,0 +1,53 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 64) in;
+// softmax(Q K^T / sqrt(D)) V, one workgroup per (bh, query row); [BH, S, D]
+layout(push_constant, scalar) uniform PC { F32 Q; F32 K; F32 V; F32 O; int BH; int S; int D; } pc;
+shared float sv[64];
+shared float sc[4096];
+float tree(float v, bool is_max) {
+    uint t = gl_LocalInvocationID.x;
+    sv[t] = v;
+    barrier();
+    for (uint s = 32; s > 0; s >>= 1) { if (t < s) sv[t] = is_max ? max(sv[t], sv[t + s]) : sv[t] + sv[t + s]; barrier(); }
+    float r = sv[0];
+    barrier();
+    return r;
+}
+void main() {
+    int r = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    if (r >= pc.BH * pc.S) return;
+    int bh = r / pc.S, t = int(gl_LocalInvocationID.x);
+    int q = r * pc.D, kb = bh * pc.S * pc.D;
+    float scale = inversesqrt(float(pc.D));
+    float m = -1.0 / 0.0;
+    for (int j = t; j < pc.S; j += 64) {
+        float s = 0.0;
+        for (int d = 0; d < pc.D; d++) s = fma(pc.Q.v[q + d], pc.K.v[kb + j * pc.D + d], s);
+        s *= scale;
+        if (j < 4096) sc[j] = s;
+        m = max(m, s);
+    }
+    m = tree(m, true);
+    float sum = 0.0;
+    for (int j = t; j < pc.S; j += 64) {
+        float s;
+        if (j < 4096) s = sc[j];
+        else { s = 0.0; for (int d = 0; d < pc.D; d++) s = fma(pc.Q.v[q + d], pc.K.v[kb + j * pc.D + d], s); s *= scale; }
+        float p = exp(s - m);
+        if (j < 4096) sc[j] = p;
+        sum += p;
+    }
+    sum = tree(sum, false);
+    barrier();
+    for (int d = t; d < pc.D; d += 64) {
+        float o = 0.0;
+        for (int j = 0; j < pc.S; j++) {
+            float p;
+            if (j < 4096) p = sc[j];
+            else { float s = 0.0; for (int e = 0; e < pc.D; e++) s = fma(pc.Q.v[q + e], pc.K.v[kb + j * pc.D + e], s); p = exp(s * scale - m); }
+            o = fma(p, pc.V.v[kb + j * pc.D + d], o);
+        }
+        pc.O.v[q + d] = o / sum;
+    }
+}

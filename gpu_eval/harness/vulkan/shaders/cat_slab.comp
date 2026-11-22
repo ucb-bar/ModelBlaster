@@ -1,0 +1,13 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int VEC = 1;   // 4: vec4s (slab, ytot, ybase % 4 == 0, 16-byte aligned)
+// y[o * ytot + ybase + j] = x[o * slab + j]  (one concat input)
+layout(push_constant, scalar) uniform PC { F32 x; F32 y; int n; int slab; int ytot; int ybase; } pc;
+void main() {
+    int i = int(MB_GID) * VEC;
+    if (i >= pc.n) return;
+    int o = i / pc.slab, j = i - o * pc.slab;
+    if (VEC == 4) MB_V4(pc.y, o * pc.ytot + pc.ybase + j) = MB_V4(pc.x, i);
+    else pc.y.v[o * pc.ytot + pc.ybase + j] = pc.x.v[i];
+}

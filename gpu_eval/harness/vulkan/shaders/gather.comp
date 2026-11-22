@@ -1,0 +1,10 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant, scalar) uniform PC { F32 x; I32 idx; F32 y; int n; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int j = pc.idx.v[int(gi)];
+    pc.y.v[int(gi)] = j >= 0 ? pc.x.v[j] : 0.0;
+}

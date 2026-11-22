@@ -1,0 +1,21 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+// kernel_matmul_s8 with transpose_b (b is [N, K]) on packed int8 dot products
+// (dot_s8_body.glsl); epilogue as matmul_s8.comp
+layout(push_constant, scalar) uniform PC { I32 a; I32 b; I8 y; int M; int K; int N; float total; int amin; int amax; } pc;
+#include "dot_s8_body.glsl"
+void main() {
+    int acc[RM][RN], m0, n0;
+    dot_s8(pc.a, pc.b, pc.M, pc.K, pc.N, 0, 0, acc, m0, n0);
+    [[unroll]] for (int i = 0; i < RM; i++) {
+        int m = m0 + i;
+        if (m >= pc.M) break;
+        [[unroll]] for (int j = 0; j < RN; j++) {
+            int n = n0 + j;
+            if (n >= pc.N) break;
+            precise float v = float(acc[i][j]) * pc.total;
+            pc.y.v[m * pc.N + n] = int8_t(mb_clampi(int(mb_roundf(v)), pc.amin, pc.amax));
+        }
+    }
+}
