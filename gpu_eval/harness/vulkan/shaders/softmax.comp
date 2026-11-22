@@ -4,16 +4,16 @@ layout(local_size_x = 256) in;
 // softmax / log-softmax over the middle axis of [outer, R, inner]: one
 // workgroup per (o, j) line; inner == 1 is the row softmax (kernel_softmax)
 layout(push_constant, scalar) uniform PC { F32 x; F32 y; int outer; int R; int inner; int log_out; float in_scale; } pc;
+#extension GL_KHR_shader_subgroup_arithmetic : require
 shared float sv[256];
+// workgroup max / sum: within each subgroup, then across the (<= 256 / subgroup size) partials
 float tree(float v, bool is_max) {
-    uint t = gl_LocalInvocationID.x;
-    sv[t] = v;
+    v = is_max ? subgroupMax(v) : subgroupAdd(v);
+    if (gl_NumSubgroups == 1) return v;
+    if (subgroupElect()) sv[gl_SubgroupID] = v;
     barrier();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (t < s) sv[t] = is_max ? max(sv[t], sv[t + s]) : sv[t] + sv[t + s];
-        barrier();
-    }
     float r = sv[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++) r = is_max ? max(r, sv[i]) : r + sv[i];
     barrier();
     return r;
 }
