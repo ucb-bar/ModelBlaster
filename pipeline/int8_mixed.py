@@ -32,8 +32,8 @@ linears -- to int8:
   largest calibrated |x| leave the int8 product and run as an fp32 linear on an
   ``index_select`` of them, added to the int8 part (LLM.int8()-style decomposition).
 * ``alpha_by`` ({pattern: a}): the smoothing strength of the tensors those linears read.
-* fp32 fusions that cut launches (on by default; ``fuse_norm`` / ``fuse_rope`` /
-  ``fold_layout`` false to skip): the RMSNorm chain -> ``rms_norm`` (its weight folded
+* fp32 fusions that cut launches (on by default; ``fuse_norm`` / ``fuse_rope`` / ``fuse_swiglu`` /
+  ``fold_layout`` false to skip): SwiGLU's silu + mul -> ``silu_mul``, the RMSNorm chain -> ``rms_norm`` (its weight folded
   into the quantizer's column factor), RoPE -> ``rope_half``, and attention's permute
   copies folded into ``bmm_strided`` operands (``layout_fold``). ``fuse_attention`` (off:
   slower on the Deck) makes unmasked attention one flash-style ``attention`` op.
@@ -214,6 +214,20 @@ _ROPE = ("rope_half",
          [{"R": 3, "H": 2, "half": 4}])
 
 
+_SILU_MUL = ("silu_mul",
+             "void kernel_silu_mul(const float *a, const float *b, float *output, int n)",
+             "SwiGLU's gate: output[i] = silu(a[i]) * b[i], silu(x) = x / (1 + exp(-x)), fp32 (each step\n"
+             "rounded to fp32). The int8_mixed pass fuses the generic lowering's silu (ewise1) and the mul\n"
+             "that reads it into it (fuse_swiglu).",
+             "void kernel_silu_mul(const float *a, const float *b, float *output, int n) {\n"
+             "    for (int i = 0; i < n; i++) {\n"
+             "        const float x = a[i];\n"
+             "        const float s = x / (1.0f + expf(-x));\n"
+             "        output[i] = s * b[i];\n"
+             "    }\n}\n",
+             [{"n": 37}])
+
+
 def kernel_specs(kernel_spec_cls) -> dict:
     """KernelSpecs of the int8_mixed kinds (reference_kernels registers them)."""
     i8p, fp = ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_float)
@@ -222,9 +236,10 @@ def kernel_specs(kernel_spec_cls) -> dict:
             "linear3_dq_s8": [i8p, fp, i8p, fp, fp, fp, fp, fp] + [ctypes.c_int] * 5,
             "linear_dq_add_s8": [i8p, fp, i8p, fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]}
     argt["rope_half"] = [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    argt["silu_mul"] = [fp, fp, fp, ctypes.c_int]
     return {op: kernel_spec_cls(op=op, signature=sig, semantics=sem, reference_impl=impl, extra_shapes=shapes,
                                 argtypes_factory=(lambda a=argt[op]: list(a)))
-            for op, sig, sem, impl, shapes in _SPECS + [_ROPE]}
+            for op, sig, sem, impl, shapes in _SPECS + [_ROPE, _SILU_MUL]}
 
 
 # ------------------------------------------------------------------ the int8 kinds on the CPU (bit-exact)
@@ -277,6 +292,10 @@ def _r_linear_dq_add(ir, op, ins):
     return [ins[2].reshape(y.shape).float() + y]
 
 
+def _r_silu_mul(ir, op, ins):
+    return [torch.nn.functional.silu(ins[0].float()) * ins[1].reshape(ins[0].shape).float()]
+
+
 def _r_rope_half(ir, op, ins):
     sh = op["shape"]
     R, H, d = sh["R"], sh["H"], sh["half"]
@@ -287,7 +306,7 @@ def _r_rope_half(ir, op, ins):
 
 
 TORCH_RULES = {"quantize_rows_s8": _r_quantize_rows, "linear_dq_s8": _r_linear_dq, "linear3_dq_s8": _r_linear3_dq,
-               "linear_dq_add_s8": _r_linear_dq_add, "rope_half": _r_rope_half}
+               "linear_dq_add_s8": _r_linear_dq_add, "rope_half": _r_rope_half, "silu_mul": _r_silu_mul}
 
 
 # ------------------------------------------------------------------ IR walk on the CPU
@@ -493,6 +512,8 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
         ops = _merge_siblings(ops, tensors, weights, int(pol.get("merge_max_rows", 1 << 30)))
     if pol.get("fuse_residual", True):
         ops = _fuse_residual(ops, tensors, set(ir.output_names()))
+    if pol.get("fuse_swiglu", True):
+        ops = _fuse_silu_mul(ops, set(ir.output_names()))
     if pol.get("fuse_norm", True):
         ops = _fuse_rms_norm(ops, tensors, weights, set(ir.output_names()))
     if pol.get("fuse_rope", True):
@@ -595,6 +616,31 @@ def _fuse_residual(ops: list, tensors: dict, outputs: set) -> list:
                        name=lin["name"])
             fused[id(op)] = new
             drop.add(id(lin))
+            break
+    return [fused.get(id(op), op) for op in ops if id(op) not in drop]
+
+
+def _fuse_silu_mul(ops: list, outputs: set) -> list:
+    """mul(silu(g), u) (SwiGLU: ewise1 silu, then the mul that alone reads it) -> one silu_mul:
+    one launch and one round trip less per MLP. The same fp32 expressions (fp32 tolerance)."""
+    readers: dict[str, int] = {}
+    for op in ops:
+        for t in op["inputs"]:
+            readers[t] = readers.get(t, 0) + 1
+    silu = {op["outputs"][0]: op for op in ops if op["op"] == "ewise1" and op.get("opc") == 14}
+    fused, drop = {}, set()
+    for op in ops:
+        if op["op"] != "mul" or len(op["inputs"]) != 2:
+            continue
+        for j in (0, 1):
+            t, u = op["inputs"][j], op["inputs"][1 - j]
+            sop = silu.get(t)
+            if sop is None or readers.get(t) != 1 or t in outputs or t == u \
+                    or int(sop["shape"]["n"]) != int(op["shape"]["n"]):
+                continue
+            fused[id(op)] = {"name": f"{op['name']}__swiglu", "op": "silu_mul", "inputs": [sop["inputs"][0], u],
+                             "outputs": list(op["outputs"]), "shape": {"n": int(op["shape"]["n"])}}
+            drop.add(id(sop))
             break
     return [fused.get(id(op), op) for op in ops if id(op) not in drop]
 
