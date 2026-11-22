@@ -76,7 +76,7 @@ POLICIES = {
     # every linear -> quantize_rows_s8 + linear_dq_s8; everything else fp32
     "linear": {"int8_kinds": ["linear"], "alpha": 0.5},
 }
-KINDS = ("quantize_rows_s8", "linear_dq_s8")
+KINDS = ("quantize_rows_s8", "linear_dq_s8", "linear3_dq_s8", "linear_dq_add_s8")
 
 # ------------------------------------------------------------------ kernel specs
 _SPECS = [
@@ -138,6 +138,55 @@ _SPECS = [
      "        }\n"
      "    }\n}\n",
      [{"M": 1, "K": 16, "N": 8}, {"M": 5, "K": 36, "N": 9}]),
+    ("linear3_dq_s8",
+     "void kernel_linear3_dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight, "
+     "const float *bias, const float *w_scale, float *out0, float *out1, float *out2, int M, int K, "
+     "int N0, int N1, int N2)",
+     "Sibling linear_dq_s8 ops that read the same quantized input, as one product (the int8_mixed\n"
+     "pass's merge_siblings: q / k / v, gate / up): weight int8 [N0+N1+N2, K] (the siblings' weights\n"
+     "stacked), w_scale / bias [N0+N1+N2] (bias NULL or stacked), and the output columns split back:\n"
+     "  y[m, n] = linear_dq_s8(input, row_scale, weight, bias, w_scale)[m, n]   (exactly as there)\n"
+     "  out0[m, n] = y[m, n] (n < N0);  out1[m, n - N0] = y[m, n] (N0 <= n < N0+N1);\n"
+     "  out2[m, n - N0 - N1] = y[m, n] (the rest; out2 NULL when N2 == 0)",
+     "void kernel_linear3_dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight,\n"
+     "                          const float *bias, const float *w_scale, float *out0, float *out1, float *out2,\n"
+     "                          int M, int K, int N0, int N1, int N2) {\n"
+     "    const int N = N0 + N1 + N2;\n"
+     "    for (int m = 0; m < M; m++) {\n"
+     "        for (int n = 0; n < N; n++) {\n"
+     "            int32_t acc = 0;\n"
+     "            for (int k = 0; k < K; k++)\n"
+     "                acc += (int32_t)input[(size_t)m * K + k] * (int32_t)weight[(size_t)n * K + k];\n"
+     "            const double s = (double)row_scale[m] * (double)w_scale[n];\n"
+     "            float y = (float)((double)acc * s);\n"
+     "            if (bias) y = y + bias[n];\n"
+     "            if (n < N0) out0[(size_t)m * N0 + n] = y;\n"
+     "            else if (n < N0 + N1) out1[(size_t)m * N1 + (n - N0)] = y;\n"
+     "            else out2[(size_t)m * N2 + (n - N0 - N1)] = y;\n"
+     "        }\n"
+     "    }\n}\n",
+     [{"M": 1, "K": 16, "N0": 8, "N1": 4, "N2": 0}, {"M": 5, "K": 36, "N0": 9, "N1": 3, "N2": 6}]),
+    ("linear_dq_add_s8",
+     "void kernel_linear_dq_add_s8(const int8_t *input, const float *row_scale, const int8_t *weight, "
+     "const float *bias, const float *w_scale, const float *addend, float *output, int M, int K, int N)",
+     "linear_dq_s8 followed by the residual add that reads it (the int8_mixed pass's fuse_residual):\n"
+     "  output[m, n] = addend[m, n] + linear_dq_s8(input, row_scale, weight, bias, w_scale)[m, n]\n"
+     "(the linear's fp32 result exactly as linear_dq_s8 rounds it, then one fp32 add).",
+     "void kernel_linear_dq_add_s8(const int8_t *input, const float *row_scale, const int8_t *weight,\n"
+     "                             const float *bias, const float *w_scale, const float *addend, float *output,\n"
+     "                             int M, int K, int N) {\n"
+     "    for (int m = 0; m < M; m++) {\n"
+     "        for (int n = 0; n < N; n++) {\n"
+     "            int32_t acc = 0;\n"
+     "            for (int k = 0; k < K; k++)\n"
+     "                acc += (int32_t)input[(size_t)m * K + k] * (int32_t)weight[(size_t)n * K + k];\n"
+     "            const double s = (double)row_scale[m] * (double)w_scale[n];\n"
+     "            float y = (float)((double)acc * s);\n"
+     "            if (bias) y = y + bias[n];\n"
+     "            output[(size_t)m * N + n] = addend[(size_t)m * N + n] + y;\n"
+     "        }\n"
+     "    }\n}\n",
+     [{"M": 1, "K": 16, "N": 8}, {"M": 5, "K": 36, "N": 9}]),
 ]
 
 
@@ -169,7 +218,9 @@ def kernel_specs(kernel_spec_cls) -> dict:
     """KernelSpecs of the int8_mixed kinds (reference_kernels registers them)."""
     i8p, fp = ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_float)
     argt = {"quantize_rows_s8": [fp, fp, i8p, fp, ctypes.c_int, ctypes.c_int],
-            "linear_dq_s8": [i8p, fp, i8p, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]}
+            "linear_dq_s8": [i8p, fp, i8p, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+            "linear3_dq_s8": [i8p, fp, i8p, fp, fp, fp, fp, fp] + [ctypes.c_int] * 5,
+            "linear_dq_add_s8": [i8p, fp, i8p, fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]}
     argt["rope_half"] = [fp, fp, fp, fp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     return {op: kernel_spec_cls(op=op, signature=sig, semantics=sem, reference_impl=impl, extra_shapes=shapes,
                                 argtypes_factory=(lambda a=argt[op]: list(a)))
@@ -214,6 +265,18 @@ def _r_linear_dq(ir, op, ins):
     return [y]
 
 
+def _r_linear3_dq(ir, op, ins):
+    sh = op["shape"]
+    (y,) = _r_linear_dq(ir, {**op, "shape": {"M": sh["M"], "K": sh["K"], "N": sh["N0"] + sh["N1"] + sh["N2"]}}, ins)
+    outs = [y[:, :sh["N0"]], y[:, sh["N0"]:sh["N0"] + sh["N1"]], y[:, sh["N0"] + sh["N1"]:]]
+    return [o.contiguous() for o in outs[:len(op["outputs"])]]
+
+
+def _r_linear_dq_add(ir, op, ins):
+    (y,) = _r_linear_dq(ir, op, ins[:2])
+    return [ins[2].reshape(y.shape).float() + y]
+
+
 def _r_rope_half(ir, op, ins):
     sh = op["shape"]
     R, H, d = sh["R"], sh["H"], sh["half"]
@@ -223,7 +286,8 @@ def _r_rope_half(ir, op, ins):
     return [torch.cat([x1 * c - x2 * s_, x2 * c + x1 * s_], dim=-1)]
 
 
-TORCH_RULES = {"quantize_rows_s8": _r_quantize_rows, "linear_dq_s8": _r_linear_dq, "rope_half": _r_rope_half}
+TORCH_RULES = {"quantize_rows_s8": _r_quantize_rows, "linear_dq_s8": _r_linear_dq, "linear3_dq_s8": _r_linear3_dq,
+               "linear_dq_add_s8": _r_linear_dq_add, "rope_half": _r_rope_half}
 
 
 # ------------------------------------------------------------------ IR walk on the CPU
@@ -425,6 +489,10 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
                         "shape": {"n": M * N}})
         else:
             ops.append(new)
+    if pol.get("merge_siblings", True):
+        ops = _merge_siblings(ops, tensors, weights, int(pol.get("merge_max_rows", 1 << 30)))
+    if pol.get("fuse_residual", True):
+        ops = _fuse_residual(ops, tensors, set(ir.output_names()))
     if pol.get("fuse_norm", True):
         ops = _fuse_rms_norm(ops, tensors, weights, set(ir.output_names()))
     if pol.get("fuse_rope", True):
@@ -457,6 +525,78 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
               "outlier_columns": {x: len(c) for x, c in outl.items()}}
     g["int8_mixed"] = dict(report)
     return g, weights, report
+
+
+def _merge_siblings(ops: list, tensors: dict, weights: dict, max_rows: int) -> list:
+    """linear_dq_s8 ops reading the same quantized input (q / k / v; gate / up) -> one linear3_dq_s8
+    per group of up to 3: the weights / scales / biases stacked, one launch instead of 2-3 (and a
+    wider product: no split-K on the Deck's skinny path). Bit-exact: every output column is computed
+    exactly as before. Placed where the first sibling was (its input exists there already)."""
+    groups: dict[tuple, list] = {}
+    for op in ops:
+        if op["op"] == "linear_dq_s8" and int(op["shape"]["M"]) <= max_rows:
+            groups.setdefault((op["inputs"][0], op["inputs"][1]), []).append(op)
+    replace, drop = {}, set()
+    for (q, s), sib in groups.items():
+        for g0 in range(0, len(sib) - 1, 3):
+            grp = sib[g0:g0 + 3]
+            if len(grp) < 2:
+                continue
+            Ns = [int(op["shape"]["N"]) for op in grp]
+            name = "+".join(op["name"] for op in grp)
+            wkey, skey, bkey = f"{name}.q8", f"{name}.wscale", None
+            weights[wkey] = np.ascontiguousarray(np.concatenate([np.asarray(weights[op["weight"]]) for op in grp], 0))
+            weights[skey] = np.ascontiguousarray(np.concatenate([np.asarray(weights[op["w_scale"]], np.float32) for op in grp]))
+            if any(op.get("bias") for op in grp):
+                bkey = f"{name}.bias"
+                weights[bkey] = np.concatenate([np.asarray(weights[op["bias"]], np.float32) if op.get("bias")
+                                                else np.zeros(n, np.float32) for op, n in zip(grp, Ns)])
+            sh = {"M": grp[0]["shape"]["M"], "K": grp[0]["shape"]["K"], "N0": Ns[0], "N1": Ns[1],
+                  "N2": Ns[2] if len(Ns) > 2 else 0}
+            replace[id(grp[0])] = {"name": name, "op": "linear3_dq_s8", "inputs": [q, s],
+                                   "outputs": [op["outputs"][0] for op in grp], "weight": wkey, "w_scale": skey,
+                                   "bias": bkey, "shape": sh, "merged": [op["name"] for op in grp]}
+            drop |= {id(op) for op in grp[1:]}
+    out = []
+    for op in ops:
+        if id(op) in drop:
+            continue
+        out.append(replace.get(id(op), op))
+    used = {op.get(r) for op in out for r in ("weight", "bias", "w_scale")}
+    for k in [k for k in weights if (k.endswith(".q8") or k.endswith(".wscale")) and k not in used]:
+        del weights[k]
+    return out
+
+
+def _fuse_residual(ops: list, tensors: dict, outputs: set) -> list:
+    """add(r, linear_dq_s8(..)) whose linear output nothing else reads -> linear_dq_add_s8 (the residual
+    add in the linear's epilogue): one launch and one [M, N] round trip less per residual. Bit-exact
+    (the same fp32 add). The fused op sits where the add was (the residual exists there)."""
+    readers: dict[str, int] = {}
+    for op in ops:
+        for t in op["inputs"]:
+            readers[t] = readers.get(t, 0) + 1
+    prod = {op["outputs"][0]: op for op in ops if op["op"] == "linear_dq_s8"}
+    fused, drop = {}, set()
+    for op in ops:
+        if op["op"] != "add" or len(op["inputs"]) != 2:
+            continue
+        for j in (0, 1):
+            t, r = op["inputs"][j], op["inputs"][1 - j]
+            lin = prod.get(t)
+            if lin is None or id(lin) in drop or readers.get(t) != 1 or t in outputs or t == r:
+                continue
+            n = int(lin["shape"]["M"]) * int(lin["shape"]["N"])
+            if int(op["shape"].get("n", -1)) != n or tensors.get(r, {}).get("shape") is None \
+                    or int(np.prod(tensors[r]["shape"])) != n:
+                continue
+            new = dict(lin)
+            new.update(op="linear_dq_add_s8", inputs=list(lin["inputs"]) + [r], outputs=list(op["outputs"]),
+                       name=lin["name"])
+            fused[id(op)] = new
+            drop.add(id(lin))
+            break
+    return [fused.get(id(op), op) for op in ops if id(op) not in drop]
 
 
 def _fuse_rms_norm(ops: list, tensors: dict, weights: dict, outputs: set) -> list:

@@ -5,7 +5,8 @@ hand-written call in generate_skeleton's per-op chain, but the binding is
 mechanical, so ops without one (the generic ops in reference_kernels_ext,
 and any CUDA walker) derive the call from (signature, op):
 
-  * non-const pointer      -> the op's next output tensor
+  * non-const pointer      -> the op's next output tensor; `out<k>` params past the
+    last output bind NULL (optional outputs)
   * const pointer named weight/scale/bias/gamma/beta, when the op has the
     matching weight field -> that weights.npz key (None = NULL)
   * any other const pointer -> the op's next input tensor; `in<k>` params
@@ -86,6 +87,9 @@ def bind(op: dict, params: list[Param]) -> list[Arg]:
     args: list[Arg] = []
     for p in params:
         if p.is_ptr and not p.is_const_ptr:
+            if not outs and re.fullmatch(r"out\d+", p.name):
+                args.append(Arg("null", None, p))      # optional outputs (linear3_dq_s8's out2)
+                continue
             if not outs:
                 raise BindError(f"{op['op']}: no output left for {p.name}")
             args.append(Arg("out", outs.pop(0), p))

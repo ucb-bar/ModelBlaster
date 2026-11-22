@@ -19,7 +19,8 @@ layout(constant_id = 1) const int NC = 1;   // 64-column blocks per workgroup (e
 layout(local_size_x = 64) in;
 layout(buffer_reference, std430, buffer_reference_align = 16) restrict readonly buffer U4 { uvec4 v[]; };
 layout(push_constant, scalar) uniform PC {
-    I8 x; F32 rs; I8 w; F32 bias; F32 ws; F32 y; I32 part; int M; int K; int N; int kchunk; int split;
+    I8 x; F32 rs; I8 w; F32 bias; F32 ws; F32 y; F32 y1; F32 y2; F32 add; I32 part; int M; int K; int N; int kchunk; int split;
+    int N0; int N1;
 } pc;
 void main() {
     const int K = pc.K, N = pc.N;
@@ -57,7 +58,7 @@ void main() {
         wp += 1024ul;
         xp += 16ul;
     }
-    bool hb = uint64_t(pc.bias) != 0ul;
+    bool hb = uint64_t(pc.bias) != 0ul, ha = uint64_t(pc.add) != 0ul;
     [[unroll]] for (int b = 0; b < NC; b++) {
         int n = (nb0 + b) * 64 + c;
         if (n >= N) break;
@@ -73,7 +74,8 @@ void main() {
             precise double d = double(acc[b][m]) * sc;
             precise float yv = float(d);
             if (hb) yv = yv + bv;
-            pc.y.v[m * N + n] = yv;
+            if (ha) yv = pc.add.v[m * N + n] + yv;
+            MB_DQ_STORE(pc.y, pc.y1, pc.y2, N, pc.N0, pc.N1, m, n, yv);
         }
     }
 }

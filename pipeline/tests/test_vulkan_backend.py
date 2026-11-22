@@ -584,7 +584,7 @@ def refc():
         pytest.skip("no C compiler for the reference kernels (or $MB_REF_LIB)")
     specs = {op: {"signature": s.signature, "reference_impl": s.reference_impl} for op, s in KERNEL_SPECS.items()}
     ops = ["linear_s8", "matmul_s8", "softmax_s8", "layernorm_s8", "rmsnorm_s8", "gelu_s8", "sin_s8", "cos_s8", "mul_s8",
-           "quantize_rows_s8", "linear_dq_s8"]
+           "quantize_rows_s8", "linear_dq_s8", "linear3_dq_s8", "linear_dq_add_s8"]
     return walk_vulkan.RefC(specs, ops, os.environ.get("MB_REF_LIB"))
 
 
@@ -750,3 +750,71 @@ def test_s8_ir_walk_bit_exact(vk, refc, specs, model, tmp_path):
     ks = walk_vulkan.VkKernelSet(full, vk)
     rec = walk_vulkan.evaluate(str(tmp_path / "ir"), ks, reps=1, ref_lib=str(refc.lib._name))
     assert rec["ok"] and rec["golden_mismatches"] == 0 and rec["n_ops_not_bit_exact"] == 0, rec
+
+
+@pytest.mark.parametrize("M,K,Ns,packed", [(50, 720, (960, 320, 320), True), (50, 720, (2048, 2048, 0), True),
+                                           (31, 320, (320, 320, 0), True), (50, 2048, (70, 64, 5), True),
+                                           (256, 768, (768, 768, 768), False), (5, 36, (9, 3, 6), False),
+                                           (3, 37, (5, 4, 0), False)])
+def test_linear3_dq_s8_bit_exact(vk, refc, M, K, Ns, packed):
+    """linear3_dq_s8 (merged sibling linears, int8_mixed merge_siblings) = reference C on every path:
+    skinny (packed weight, split-K + epilogue), dot4 tiles, scalar; with and without bias."""
+    from walk_vulkan import pack_weight_s8
+    rng = np.random.default_rng(M + K + sum(Ns))
+    N = sum(Ns)
+    x = rng.integers(-127, 128, (M, K), dtype=np.int8)
+    w = rng.integers(-127, 128, (N, K), dtype=np.int8)
+    rs = (rng.random(M) * 0.05 + 1e-4).astype(np.float32)
+    ws = (rng.random(N) * 1e-3 + 1e-6).astype(np.float32)
+    b = rng.standard_normal(N).astype(np.float32)
+    f, _ = refc.fn("linear3_dq_s8")
+    c = lambda a: ctypes.c_void_p(a.ctypes.data) if a is not None else None
+    m = vk.mark()
+    W = vk.upload(w)
+    if packed:
+        P = vk.upload(pack_weight_s8(w))
+        vk.lib.mb_vk_set_packed(vk.ptr(W), vk.ptr(P), 2)
+    g = lambda a: ctypes.c_void_p(vk.ptr(a))
+    X, RS, WS, B = vk.upload(x), vk.upload(rs), vk.upload(ws), vk.upload(b)
+    for bias in (True, False):
+        outs = [vk.array((M, n)) if n else None for n in Ns]
+        vk.lib.kernel_linear3_dq_s8(g(X), g(RS), g(W), g(B) if bias else None, g(WS),
+                                    *[g(o) if o is not None else None for o in outs], M, K, *Ns)
+        vk.sync()
+        ref = [np.zeros((M, n), np.float32) if n else None for n in Ns]
+        f(c(x), c(rs), c(w), c(b) if bias else None, c(ws), *[c(r) for r in ref], M, K, *Ns)
+        for o, r in zip(outs, ref):
+            if r is not None:
+                assert np.array_equal(np.array(o), r), (bias, (np.array(o) != r).sum())
+    vk.release(m)
+
+
+@pytest.mark.parametrize("M,K,N,packed", [(50, 960, 720, True), (50, 2048, 720, True), (16, 12288, 960, True),
+                                          (256, 768, 768, False), (5, 36, 9, False), (3, 37, 5, False)])
+def test_linear_dq_add_s8_bit_exact(vk, refc, M, K, N, packed):
+    """linear_dq_add_s8 (residual add in the epilogue, int8_mixed fuse_residual) = reference C on every path."""
+    from walk_vulkan import pack_weight_s8
+    rng = np.random.default_rng(M * 7 + K + N)
+    x = rng.integers(-127, 128, (M, K), dtype=np.int8)
+    w = rng.integers(-127, 128, (N, K), dtype=np.int8)
+    rs = (rng.random(M) * 0.05 + 1e-4).astype(np.float32)
+    ws = (rng.random(N) * 1e-3 + 1e-6).astype(np.float32)
+    b = rng.standard_normal(N).astype(np.float32)
+    r = (rng.standard_normal((M, N)) * 5).astype(np.float32)
+    f, _ = refc.fn("linear_dq_add_s8")
+    c = lambda a: ctypes.c_void_p(a.ctypes.data) if a is not None else None
+    m = vk.mark()
+    W = vk.upload(w)
+    if packed:
+        P = vk.upload(pack_weight_s8(w))
+        vk.lib.mb_vk_set_packed(vk.ptr(W), vk.ptr(P), 2)
+    g = lambda a: ctypes.c_void_p(vk.ptr(a))
+    X, RS, WS, B, R = vk.upload(x), vk.upload(rs), vk.upload(ws), vk.upload(b), vk.upload(r)
+    for bias in (True, False):
+        y = vk.array((M, N))
+        vk.lib.kernel_linear_dq_add_s8(g(X), g(RS), g(W), g(B) if bias else None, g(WS), g(R), g(y), M, K, N)
+        vk.sync()
+        ref = np.zeros((M, N), np.float32)
+        f(c(x), c(rs), c(w), c(b) if bias else None, c(ws), c(r), c(ref), M, K, N)
+        assert np.array_equal(np.array(y), ref), (bias, (np.array(y) != ref).sum())
+    vk.release(m)

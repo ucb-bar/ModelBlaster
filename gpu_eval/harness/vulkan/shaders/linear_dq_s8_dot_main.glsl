@@ -2,12 +2,13 @@
 #define MB_INT8
 #include "mb_common.glsl"
 // kernel_linear_dq_s8 on packed int8 dot products (dot_s8_body.glsl); epilogue as linear_dq_s8.comp
-layout(push_constant, scalar) uniform PC { I32 x; F32 rs; I32 w; F32 bias; F32 ws; F32 y; int M; int K; int N; } pc;
+layout(push_constant, scalar) uniform PC { I32 x; F32 rs; I32 w; F32 bias; F32 ws; F32 y; F32 y1; F32 y2; F32 add; int M; int K; int N;
+    int N0; int N1; } pc;
 #include "dot_s8_body.glsl"
 void main() {
     int acc[RM][RN], m0, n0;
     dot_s8(pc.x, pc.w, pc.M, pc.K, pc.N, 0, 0, acc, m0, n0);
-    bool hb = uint64_t(pc.bias) != 0ul;
+    bool hb = uint64_t(pc.bias) != 0ul, ha = uint64_t(pc.add) != 0ul;
     [[unroll]] for (int i = 0; i < RM; i++) {
         int m = m0 + i;
         if (m >= pc.M) break;
@@ -19,7 +20,8 @@ void main() {
             precise double d = double(acc[i][j]) * s;
             precise float yv = float(d);
             if (hb) yv = yv + pc.bias.v[n];
-            pc.y.v[m * pc.N + n] = yv;
+            if (ha) yv = pc.add.v[m * pc.N + n] + yv;
+            MB_DQ_STORE(pc.y, pc.y1, pc.y2, pc.N, pc.N0, pc.N1, m, n, yv);
         }
     }
 }

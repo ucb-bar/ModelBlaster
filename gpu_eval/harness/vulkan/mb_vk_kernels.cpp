@@ -735,7 +735,7 @@ void kernel_quantize_rows_s8(const float *input, const float *col_inv, int8_t *o
 // walk_vulkan.pack_weight_s8): shaders/skinny_s8.comp, K split over workgroups until ~MB_VK_SKINNY_WG
 // (default 64) waves run, the int32 partials summed by linear_dq_s8_epi.comp.
 static bool skinny_s8(const int8_t *x, const float *rs, const mb_packed &W, const float *bias, const float *ws,
-                      float *y, int M, int K, int N) {
+                      float *y, float *y1, float *y2, const float *add, int M, int K, int N, int N0, int N1) {
     if ((mb_vk_devaddr(x) & 15) || K % 16) return false;
     static int nc = env_int("MB_VK_SKINNY_S8_NC", 1);
     int consts[2] = {M, nc};
@@ -756,26 +756,30 @@ static bool skinny_s8(const int8_t *x, const float *rs, const mb_packed &W, cons
         if (!part) return true;
     }
     mb_pc pc;
-    pc.p(x).p(rs).p(W.p).p(bias).p(ws).p(y).p(part).i(M).i(K).i(N).i(kchunk).i(nsplit > 1 ? 1 : 0);
+    pc.p(x).p(rs).p(W.p).p(bias).p(ws).p(y).p(y1).p(y2).p(add).p(part).i(M).i(K).i(N).i(kchunk).i(nsplit > 1 ? 1 : 0)
+        .i(N0).i(N1);
     mb_vk_dispatch(pipe, (uint32_t)gx, (uint32_t)nsplit, 1, pc);
     if (nsplit > 1) {
         static int epi = -1;
         if (epi < 0) epi = mb_vk_pipeline("linear_dq_s8_epi");
         mb_pc pe;
-        pe.p(part).p(rs).p(bias).p(ws).p(y).i(M).i(N).i(nsplit);
+        pe.p(part).p(rs).p(bias).p(ws).p(y).p(y1).p(y2).p(add).i(M).i(N).i(nsplit).i(N0).i(N1);
         mb_vk_launch1d(epi, (long)M * N, pe);
     }
     return true;
 }
-void kernel_linear_dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight, const float *bias,
-                         const float *w_scale, float *output, int M, int K, int N) {
+// linear_dq_s8 with its output columns split over up to three tensors (linear3_dq_s8; N0 = N: one)
+static void dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight, const float *bias,
+                  const float *w_scale, float *output, float *out1, float *out2, const float *add, int M, int K, int N,
+                  int N0, int N1) {
     static int use_skinny = env_int("MB_VK_SKINNY", 1);
     if (use_skinny && M <= 64) {
         const mb_packed *pw = find_packed(weight);
-        if (pw && pw->f16 == 2 && skinny_s8(input, row_scale, *pw, bias, w_scale, output, M, K, N)) return;
+        if (pw && pw->f16 == 2 && skinny_s8(input, row_scale, *pw, bias, w_scale, output, out1, out2, add, M, K, N, N0, N1))
+            return;
     }
     mb_pc pc;
-    pc.p(input).p(row_scale).p(weight).p(bias).p(w_scale).p(output).i(M).i(K).i(N);
+    pc.p(input).p(row_scale).p(weight).p(bias).p(w_scale).p(output).p(out1).p(out2).p(add).i(M).i(K).i(N).i(N0).i(N1);
     if (use_dot4(input, weight, K)) {
         // the tile: 128 x 64 for >= 128 rows (the vision linears: 1.2-1.4x the 32 x 64 tile's 0.84-0.91
         // Tops on the Deck), 64 x 64 for >= 48, else 32 x 64. $MB_VK_DQ_TILE = 24 | 44 | 84 forces one.
@@ -791,6 +795,21 @@ void kernel_linear_dq_s8(const int8_t *input, const float *row_scale, const int8
     }
     PIPE("linear_dq_s8");
     mb_vk_launch1d(pipe, (long)M * N, pc);
+}
+void kernel_linear_dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight, const float *bias,
+                         const float *w_scale, float *output, int M, int K, int N) {
+    dq_s8(input, row_scale, weight, bias, w_scale, output, nullptr, nullptr, nullptr, M, K, N, N, 0);
+}
+// linear_dq_s8 + the residual add that reads it: pipeline/int8_mixed.py fuse_residual
+void kernel_linear_dq_add_s8(const int8_t *input, const float *row_scale, const int8_t *weight, const float *bias,
+                             const float *w_scale, const float *addend, float *output, int M, int K, int N) {
+    dq_s8(input, row_scale, weight, bias, w_scale, output, nullptr, nullptr, addend, M, K, N, N, 0);
+}
+// sibling linears (q / k / v, gate / up) as one product: pipeline/int8_mixed.py merge_siblings
+void kernel_linear3_dq_s8(const int8_t *input, const float *row_scale, const int8_t *weight, const float *bias,
+                          const float *w_scale, float *out0, float *out1, float *out2, int M, int K, int N0, int N1,
+                          int N2) {
+    dq_s8(input, row_scale, weight, bias, w_scale, out0, out1, out2, nullptr, M, K, N0 + N1 + N2, N0, N1);
 }
 void kernel_mul_s8(const int8_t *a, const int8_t *b, int8_t *output, int n, float scale_a, float scale_b,
                    float scale_out, int activation_min, int activation_max) {
