@@ -147,6 +147,27 @@ def test_smolvla_split_hoisted_cross_kv():
     assert (a_h - a_n).abs().max() < 1e-5 * max(1.0, float(a_n.abs().max()))
 
 
+def test_fold_attention_scale_is_exact(split_irs):
+    """int8_mixed fold_attn_scale (attention's 1/8 score scale moved into the query projection) gives
+    bit-identical outputs on the CPU walk and removes every attention mul_scalar."""
+    from mbir import load_ir
+    from modelblaster.pipeline import int8_mixed as I8
+    tmp = split_irs[0]
+    for part in ("vision", "prefix", "step"):
+        ir = load_ir(tmp / part)
+        cal = [ir.input_tensors("cpu")]
+        outs, n_ms = [], []
+        for fold in (True, False):
+            g, w, _ = I8.quantize_graph(ir, cal, {"base": "linear", "fold_attn_scale": fold})
+            q = I8.as_ir(g, w)
+            n_ms.append(sum(op["op"] == "mul_scalar" for op in q.ops))
+            o = I8.walk(q, ir.input_tensors("cpu"))
+            outs.append(torch.cat([o[t].reshape(-1) for t in q.output_names()]))
+        assert torch.equal(outs[0], outs[1]), part
+        n_attn = sum(op["op"] == "softmax" for op in ir.ops)
+        assert n_ms[1] - n_ms[0] == n_attn, (part, n_ms, n_attn)
+
+
 @pytest.mark.skipif(not os.environ.get("MB_SMOLVLA_TEST_REAL"), reason="MB_SMOLVLA_TEST_REAL=1: lerobot + HF cache")
 def test_smolvla_split_matches_lerobot():
     from modelblaster.models import smolvla_split as S

@@ -35,7 +35,8 @@ linears -- to int8:
 * fp32 fusions that cut launches (on by default; ``fuse_norm`` / ``fuse_rope`` / ``fuse_swiglu`` /
   ``fold_layout`` false to skip): SwiGLU's silu + mul -> ``silu_mul``, the RMSNorm chain -> ``rms_norm`` (its weight folded
   into the quantizer's column factor), RoPE -> ``rope_half``, and attention's permute
-  copies folded into ``bmm_strided`` operands (``layout_fold``). ``fuse_attention`` (off:
+  copies folded into ``bmm_strided`` operands (``layout_fold``); attention's power-of-two score
+  scale moves into the query projection (``fold_attn_scale``, bit-exact). ``fuse_attention`` (off:
   slower on the Deck) makes unmasked attention one flash-style ``attention`` op.
 * constants stay the fp32 constant tensors of the fp32 lowering (no linear
   reads one in these graphs; one that did would be quantized like any
@@ -518,6 +519,8 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
         ops = _fuse_rms_norm(ops, tensors, weights, set(ir.output_names()))
     if pol.get("fuse_rope", True):
         ops = _fuse_rope(ops, tensors, weights, set(ir.output_names()))
+    if pol.get("fold_attn_scale", True):
+        ops = _fold_attention_scale(ops, weights, set(ir.output_names()))
     # the fp32 weights of the linears that went to int8 leave the IR (unless something else reads them)
     used = {op.get(r) for op in ops for r in ("weight", "bias", "w_scale", "gamma_key", "beta_key")}
     gone = {op["weight"] for op in sel} - used
@@ -618,6 +621,86 @@ def _fuse_residual(ops: list, tensors: dict, outputs: set) -> list:
             drop.add(id(lin))
             break
     return [fused.get(id(op), op) for op in ops if id(op) not in drop]
+
+
+def _fold_attention_scale(ops: list, weights: dict, outputs: set) -> list:
+    """mul_scalar(bmm(q, k), c) with c a power of two -> bmm(q', k), q' = the query projection's output
+    times c: c moves into the projection (its weight / w_scale and bias columns), so the scores come
+    out of the bmm already scaled and the mul_scalar launch goes. Bit-exact for c = 2^e (no
+    over / underflow): every fp32 / double rounding on the way (the dequantization, the bias add,
+    RoPE's products and sums, the bmm's products and sums) commutes with an exact power-of-two
+    scale. The query path from the projection to the bmm may only hold views, strided copies and
+    rope_half, each read by nothing else."""
+    readers: dict[str, int] = {}
+    for op in ops:
+        for t in op["inputs"]:
+            readers[t] = readers.get(t, 0) + 1
+    prod = {t: op for op in ops for t in op["outputs"]}
+    drop, rename, new = set(), {}, {}
+    for op in ops:
+        if op["op"] != "mul_scalar" or op["outputs"][0] in outputs:
+            continue
+        c = float(op.get("scalar", 0.0))
+        m, e = np.frexp(c)
+        if c <= 0.0 or m != 0.5:                       # a power of two
+            continue
+        bmm = prod.get(op["inputs"][0])
+        if bmm is None or bmm["op"] != "bmm" or readers.get(op["inputs"][0]) != 1:
+            continue
+        t = bmm["inputs"][0]
+        lin, ok = None, True
+        while True:
+            src = prod.get(t)
+            if src is None or readers.get(t) != 1 or t in outputs:
+                ok = False
+                break
+            if src["op"] in ("view", "strided_copy") or (src["op"] == "rope_half" and src["inputs"][0] != t):
+                t = src["inputs"][0]
+                continue
+            if src["op"] in ("linear", "linear_dq_s8", "linear3_dq_s8"):
+                lin = src
+            else:
+                ok = False
+            break
+        if not ok or lin is None or id(lin) in new:
+            continue
+        j = lin["outputs"].index(t)
+        key = id(lin)
+        lin = dict(lin)                                # (op dicts may be shared with the fp32 IR)
+        new[key] = lin
+        if lin["op"] == "linear3_dq_s8":
+            sh = lin["shape"]
+            lo = [0, sh["N0"], sh["N0"] + sh["N1"]][j]
+            hi = lo + [sh["N0"], sh["N1"], sh["N2"]][j]
+        else:
+            lo, hi = 0, None
+        if lin["op"] == "linear":
+            wk = f"{lin['weight']}.x{c:g}"
+            weights[wk] = (np.asarray(weights[lin["weight"]], np.float32) * np.float32(c)).astype(np.float32)
+            lin["weight"] = wk
+        else:
+            wk = f"{lin['w_scale']}.x{c:g}_{j}"
+            ws = np.array(weights[lin["w_scale"]], np.float32)
+            ws[lo:hi] = ws[lo:hi] * np.float32(c)
+            weights[wk] = ws
+            lin["w_scale"] = wk
+        if lin.get("bias"):
+            bk = f"{lin['bias']}.x{c:g}_{j}"
+            b = np.array(weights[lin["bias"]], np.float32)
+            b[lo:hi] = b[lo:hi] * np.float32(c)
+            weights[bk] = b
+            lin["bias"] = bk
+        rename[op["outputs"][0]] = op["inputs"][0]
+        drop.add(id(op))
+    out = []
+    for op in ops:
+        if id(op) in drop:
+            continue
+        op = new.get(id(op), op)
+        if any(t in rename for t in op["inputs"]):
+            op = dict(op, inputs=[rename.get(t, t) for t in op["inputs"]])
+        out.append(op)
+    return out
 
 
 def _fuse_silu_mul(ops: list, outputs: set) -> list:
