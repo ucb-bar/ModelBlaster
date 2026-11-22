@@ -501,6 +501,21 @@ def test_smolvla_split_on_vulkan(vk, specs, split_irs):
     assert _rel(out, ref) < 1e-4
 
 
+def test_int8_mixed_attention_fusion_on_vulkan(vk, refc, split_irs, tmp_path):
+    """fuse_attention (opt-in): the vision graph's unmasked attention becomes one flash-style op,
+    held to the fp32 gates."""
+    import walk_vulkan
+    from modelblaster.pipeline import int8_mixed as I8
+    tmp = split_irs[0]
+    full = {op: {"signature": s.signature, "reference_impl": s.reference_impl} for op, s in KERNEL_SPECS.items()}
+    I8.extract_mixed(str(tmp / "vision"), str(tmp_path / "vision"), None, {"base": "linear", "fuse_attention": True})
+    g = json.loads((tmp_path / "vision" / "graph.json").read_text())
+    assert "attention" in [op["op"] for op in g["ops"]] and "softmax" not in [op["op"] for op in g["ops"]]
+    rec = walk_vulkan.evaluate(str(tmp_path / "vision"), walk_vulkan.VkKernelSet(full, vk), reps=1,
+                               ref_lib=str(refc.lib._name))
+    assert rec["ok"] and rec["n_s8_ops_not_bit_exact"] == 0, rec
+
+
 def test_smolvla_split_int8_mixed_on_vulkan(vk, refc, split_irs, tmp_path):
     """The tiny split graphs as int8_mixed IRs: walker gates (int8 kernels = reference C, fp32 ops in
     bound, golden) and the chained flow loop against the CPU reference walk of the same IRs."""
@@ -514,10 +529,7 @@ def test_smolvla_split_int8_mixed_on_vulkan(vk, refc, split_irs, tmp_path):
         I8.extract_mixed(str(tmp / part), str(tmp_path / part), None)
         g = json.loads((tmp_path / part / "graph.json").read_text())
         kinds = [op["op"] for op in g["ops"]]
-        if part == "vision":     # unmasked multi-head attention -> one flash-style op per layer
-            assert "attention" in kinds and "softmax" not in kinds, kinds
-        else:                    # masked / grouped-query attention: permutes folded into strided bmms
-            assert "bmm_strided" in kinds, part
+        assert "bmm_strided" in kinds, part      # attention's permutes folded into strided bmms
         if part != "vision":    # the RMSNorm chains are one rms_norm each, RoPE one rope_half
             kinds = [op["op"] for op in g["ops"]]
             assert kinds.count("rope_half") >= (2 if part == "prefix" else 3), part

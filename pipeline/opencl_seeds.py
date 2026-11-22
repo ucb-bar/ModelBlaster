@@ -522,8 +522,10 @@ class OpenCLSeeds:
 
 
 # kinds that only CUDA graph hints create (graph_hints.CUDA_KINDS fold_layout / fuse_attention): no OpenCL seed
+# (also the int8_mixed fusions' rope_half, which only the Vulkan / CUDA walkers' graphs contain)
 CUDA_ONLY = {"bmm_strided", "bmm_strided_f16", "attention", "attention_f16",
-             "cast_f16_to_f32", "cast_f32_to_f16"}           # precision-policy casts (CUDA path only)
+             "cast_f16_to_f32", "cast_f32_to_f16",           # precision-policy casts (CUDA path only)
+             "rope_half", "rope_half_f16", "rope_half_bf16"}
 
 
 def all_entries(dtype: str = "fp32") -> dict[str, str]:

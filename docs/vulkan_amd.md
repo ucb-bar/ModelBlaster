@@ -308,6 +308,49 @@ graph per-op GPU time: `linear_dq_s8` 9.5 ms (fp32 linears ~15.7), the dot4
 tile kernel alone 17.6 ms -- the skinny int8 path is what makes int8 pay at 50
 rows; `quantize_rows_s8` ~10-18 us each.
 
+### Optimizing the int8 chunk (Deck)
+
+Measured one change at a time on the Deck (`smolvla_vulkan.py --reps 20`, median
+chunk; differences under ~2 ms are within run-to-run clock noise; every change
+keeps the int8 kernels bit-exact with the reference C and the fp32 ops within
+their bound -- walker gates and tests re-run):
+
+| change | chunk (default mix) |
+|---|---|
+| baseline (the table above, same session as the rows below) | 141.0 ms |
+| `linear_dq_s8` dot4 tile 32x64 -> 128x64 for >= 128 rows (vision: 0.84-0.91 -> 1.18-1.35 Tops) | 133.2 (vision 56.4 -> 50.4) |
+| barrier elision (walker data flow: an op whose inputs were complete at the last barrier skips its own; `MB_VK_ELIDE=0` off) | 131.8 |
+| RMSNorm chain -> `rms_norm` with the norm weight folded into `quantize_rows_s8`'s column factor (6 launches -> 1), RoPE -> `rope_half` (9 -> 1): step 749 -> 476 launches, prefix 774 -> 402 | 125.2 (step 12.3 -> 11.2) |
+| attention permutes folded into `bmm_strided` (layout_fold; Vulkan launcher; a non-fitting operand keeps its copy, so grouped-query K / V still fold) + subgroup reductions in softmax / layer_norm / rms_norm | **119.2** (vision 46.3) |
+| `--f16-weights` (the prefix's fp32 linears read fp16 weights) | 116.4 (prefix -2 ms; opt-in) |
+| `MB_SMOLVLA_INT8=fast`: SigLIP `fc2` int8 too, its 256 largest input columns as an fp32 outlier linear (`outliers`), smoothing 0.5 there | **108.5** (vision 36.2) |
+
+Final, same session: fp32 208.6 ms; **default int8 119.2 ms (1.75x fp32)**,
+action chunk vs lerobot cosine 0.99968, max abs err 0.025 on this observation;
+**fast 108.5 ms (1.92x)**, 0.99966 / 0.028. On the 13 held-out observations (CPU
+reference walk, bit-exact int8): default cosine mean 0.99948 (min 0.99868), max
+abs err mean 0.042 (max 0.080); fast 0.99921 (min 0.99682), 0.055 (0.119). The
+fusions move fp32 values by rounding only (default before them: 0.99950 /
+0.99901).
+
+Tried and dropped: 128-bit LDS reads with register prefetch in the dot4 tile
+(0.7-0.95 Tops: slower), 64 x 128 tiles, two columns per lane in `skinny_s8`
+(register pressure: slower), a flash-style fused fp32 `attention` for SigLIP
+(`fuse_attention`, kept as an option and tested: +8 ms on the vision graph --
+160 live registers per invocation on RDNA2), more split-K waves for the
+skinny path. Accuracy experiments that did not make the cut (13 observations):
+the prefix in int8 with 8-96 fp32 outlier columns per linear (cosine mean
+0.9978-0.9991, min 0.992-0.997), step outlier columns (+0.0001 cosine for ~190
+more launches per step), SigLIP fc2 smoothing 0.95.
+
+Where the time is now (walker timestamps, slower clocks than the replay; step
+graph): `linear_dq_s8` ~66%, strided bmm ~10%, quantize ~7%, softmax ~5%. The
+int8 GEMMs run at ~1.0-1.6 Tops (skinny, 31-50 rows) and ~1.2-1.35 Tops (tile,
+256 rows) against an int8 dot4 peak of ~6.5 Tops at 1.6 GHz; at the Deck's
+15 W cap the clock sits lower. The next levers: hoisting the 8 cross-attention
+layers' K / V projections of the (constant) prefix cache out of the flow loop
+(~0.5 ms per step), and a GEMM kernel that keeps more of the dot4 rate.
+
 ## Not done / limits
 
 - int8 SmolVLA: only the linears are int8 (above). Attention (`bmm`), softmax, the
@@ -316,8 +359,8 @@ rows; `quantize_rows_s8` ~10-18 us each.
   exactly the tensors that measured fragile, and the time is not there (bmm is
   ~6% of the chunk). The all-int8 extractor (`extract_int8`) still rejects
   these graphs (`get_attr`, `expand`); its errors now point to `--int8-mixed`.
-  The prefix is fp32 in the default mix (accuracy); an int8 prefix with a
-  better activation scheme (e.g. outlier channels kept fp32) is untried.
+  The prefix is fp32 in the default mix (accuracy): int8 there with up to 96 fp32
+  outlier columns per linear did not reach a 0.999 chunk cosine.
 - fp16 (`_f16`) IRs are not implemented. fp16 is used only as an opt-in
   weight format of the skinny GEMM (`--f16-weights`); RDNA2's 2x-rate packed
   fp16 math (`v_dot2_f32_f16`) is not used: it would need fp16 activations as
@@ -325,7 +368,7 @@ rows; `quantize_rows_s8` ~10-18 us each.
 - No KernelBlaster integration (`kb_export --target vulkan`): the backend is
   the walker path, like `walk_cuda.py`, not the multi-slot problem export.
 - The GEMMs reach 30-45% of the Deck's fp32 peak (vision linears ~550-730
-  GFLOPS, skinny ~460-520 GFLOPS); linears are still ~75% of the chunk. The
-  ~600 small ops of the prefix and of each step cost ~6-8 us each (launch,
-  barrier, latency) -- operator fusion (e.g. the RMSNorm chains) is the next
-  lever there.
+  GFLOPS, skinny ~460-520 GFLOPS); linears are still ~75% of the fp32 chunk.
+  The int8 path fuses the RMSNorm and RoPE chains and folds attention's
+  permutes (above); the fp32 FX lowering itself still emits them as generic
+  op chains.
