@@ -19,7 +19,7 @@
     "ai_thread_cpus": "Threads that run on the A100 must write their TID to /proc/set_ai_thread (done by the runtime, never from a shell). Registration is ONE-WAY: there is no unregister, so a thread that has joined the A100 pool stays there. The process itself starts on the X100 (taskset -c 0-7) and A100 worker threads self-register. `ai_thread_cpus` lists the harts that need this; build scripts pass it as AI_CPUS= / -DMODELBLASTER_AI_CPUS= in compact form (e.g. 8-15).",
     "clock": "rdtime is unprivileged and runs at 24 MHz, same as the K1. Timing must convert with 24 MHz, never the core clock.",
     "core_kind": "X100 and A100 are DISTINCT kinds (x100 / a100) even though they share one capability list (their backends differ: x100 -> rvv_k3, a100 -> ime_k3_a100). `kind` is what _resolve_target uses to pick a hart -- the n-th core OF THAT KIND -- so one shared kind would make CPU_E#n alias CPU_P#n and double-book harts 0-7 (see the K1 notes). Here CPU_P = x100, CPU_E = a100.",
-    "ime": "IME is chosen per core through `impls` (a100: rvv, ime), not through ime_* capabilities. The K1 smt.vmadot facts do not transfer: tile and vl rules differ (ime_presence, ime_tile_a100). The X100 executes vmadot, but the K1-style 4x4x8 kernels lost to RVV on every yolov8_nano conv (190 vs 69 ms per frame, measured 2026-11-17), so x100 cores list rvv only.",
+    "ime": "IME is chosen per core through `impls` (a100: rvv, ime), not through ime_* capabilities. The K1 smt.vmadot facts do not transfer: tile and vl rules differ (ime_presence, ime_tile_a100). The X100 executes vmadot, but the K1-style 4x4x8 kernels lost to RVV on every yolov8_nano conv (190 vs 69 ms per frame, measured 2026-11-17), so the X100 `ime` impl is the X100-specific kernel set of backend ime_k3_x100 (kernels/ime_k3_x100/, bit-exact on the board), not those; x100 and a100 cores both list rvv and ime.",
     "ime_presence": "Measured 2026-11 (scripts/k3_ime_presence_probe.c, artifacts/k3_probes/ime/): vmadot (.insn r 0x2b,f3,0x71) EXECUTES on ALL 16 CPUs (X100 0-7 and A100 8-15): signed/unsigned/us/su all execute. int4 (funct7 0x61) executes on A100 only (SIGILL on X100). LMUL=2 and odd vd trap (SIGILL) everywhere. vl is ignored (any vl 1..VLMAX gives the full-tile result), unlike K1 which needed vl=32.",
     "ime_tile_a100": "A100 (vlenb 128) int8 tile M=8,K=16,N=8; X100 (vlenb 32) tile M=4,K=8,N=4. Layout verified bit-exact (20000 random trials x 4 sign variants, accumulate onto nonzero C): A[i*K+k] (vs1, v-reg bytes row-major MxK), B[j*K+k] (vs2, N x K i.e. B transposed), C[i*N+j] int32 row-major across concatenated (vd | vd+1), vd even, C += A.B^T. funct3 3=s*s, 0=u*u, 1=A unsigned*B signed, 2=A signed*B unsigned. int4 (A100 f7=0x61): 8x32x8, signed nibbles, low nibble = lower k. See artifacts/k3_probes/ime/summary.md.",
     "ime_throughput": "vmadot int8 peak (8 independent accumulator pairs, regs preloaded): A100 0.69 ns/instr = 1480 MAC/ns (int4 ~3000), latency 4.5 ns (chain); X100 0.49 ns = 262 MAC/ns, latency 2.3 ns. vs vwmacc i8->i16 57 (A100) / 34 (X100) MAC/ns: 26x / 7.7x at peak. With L1 operand loads in the loop A100 is load-bound (vle8 128B ~5.3 ns, ~25 B/ns): 2x4 tile blocking gives ~213-265 MAC/ns (A100), ~150 (X100). Need >=4 independent accumulators."
@@ -64,7 +64,8 @@
         "upsample_nearest_s8"
       ],
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -78,7 +79,8 @@
       "cluster": 0,
       "capabilities_ref": "x100_core0",
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -92,7 +94,8 @@
       "cluster": 0,
       "capabilities_ref": "x100_core0",
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -106,7 +109,8 @@
       "cluster": 0,
       "capabilities_ref": "x100_core0",
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -120,7 +124,8 @@
       "cluster": 1,
       "capabilities_ref": "x100_core0",
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -134,7 +139,8 @@
       "cluster": 1,
       "capabilities_ref": "x100_core0",
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -148,7 +154,8 @@
       "cluster": 1,
       "capabilities_ref": "x100_core0",
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
@@ -162,7 +169,8 @@
       "cluster": 1,
       "capabilities_ref": "x100_core0",
       "impls": [
-        "rvv"
+        "rvv",
+        "ime"
       ]
     },
     {
