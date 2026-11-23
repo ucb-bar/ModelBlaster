@@ -78,7 +78,13 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
     runtime using the exact entry pool width.  The K3 simple layers
     (k3_pool_ops.OPS) get their width too: generate_skeleton routes them
     through their pool wrapper only when they carry one.
+
+    Without a K3 backend in `backends` (a K1 build, or none given) the rules,
+    the records and the errors are the pre-K3 ones: a simple layer on several
+    cores is left alone (it runs on its first core) and a conv width must
+    divide OC.
     """
+    k3_build = any(_k3_pool_backend(b) for b in backends)
     out = copy.deepcopy(ir)
     widths: dict[int, set[int]] = {}
     for entry in (schedule.get("dispatches") or {}).values():
@@ -107,16 +113,19 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
         if did is None:
             continue
         if op.get("op") in _simple_pool_ops():
+            if not k3_build:
+                continue   # no pool path anywhere: it runs on one core, as before
             # k3-work TASK-017: a simple layer is split over its pool only where
             # its dispatch carries a width (generate_skeleton's mbp_ wrappers).
             width = next(iter(widths.get(int(did), {1})))
             if width <= 1:
                 continue
-            if not any(_k3_pool_backend(b) for b in backends):
+            no_pool = [b for b in backends if not _k3_pool_backend(b)]
+            if no_pool:
                 raise ValueError(
                     f"{network} dispatch {did} ({op.get('op')}) is scheduled on "
-                    f"{width} cores, but none of the backends {list(backends)} has "
-                    "its pool path (K3 backends only; not buildable)")
+                    f"{width} cores, but the backends {no_pool} have no pool path "
+                    "for it (K3 backends only; not buildable)")
             op["shard_factor"] = width
             op[_MARKER] = True
             applied.append({"dispatch_id": int(did), "op": op["op"],
@@ -128,22 +137,30 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
         if width <= 1:
             continue
         oc = _output_channels(op)
-        # A conv2d_s8 the width splits by output rows needs no OC slicing
-        # (conv_split.py, k3-work TASK-016); a channel split needs width | OC.
-        try:
-            from . import conv_split
-        except ImportError:   # run as a script
-            from modelblaster.pipeline import conv_split
-        shape = _conv_shape(op)
-        axes = sorted({conv_split.split_axis(op.get("op"), shape, width, b)
-                       for b in backends} or {"oc"})
-        axis = "/".join(axes)
-        if oc <= 0 or not conv_split.width_buildable(op.get("op"), shape, width, backends):
-            raise ValueError(
-                f"{network} dispatch {did} ({op.get('op')}) has OC={oc}, "
-                f"not divisible by scheduled width {width}, and is not split "
-                "by rows at that width; codegen would silently run a serial "
-                "implementation (not buildable)")
+        axis = None
+        if not k3_build:
+            if oc <= 0 or oc % width:
+                raise ValueError(
+                    f"{network} dispatch {did} ({op.get('op')}) has OC={oc}, "
+                    f"not divisible by scheduled width {width}; codegen would "
+                    "silently run a serial implementation")
+        else:
+            # A conv2d_s8 the width splits by output rows needs no OC slicing
+            # (conv_split.py, k3-work TASK-016); a channel split needs width | OC.
+            try:
+                from . import conv_split
+            except ImportError:   # run as a script
+                from modelblaster.pipeline import conv_split
+            shape = _conv_shape(op)
+            axes = sorted({conv_split.split_axis(op.get("op"), shape, width, b)
+                           for b in backends} or {"oc"})
+            axis = "/".join(axes)
+            if oc <= 0 or not conv_split.width_buildable(op.get("op"), shape, width, backends):
+                raise ValueError(
+                    f"{network} dispatch {did} ({op.get('op')}) has OC={oc}, "
+                    f"not divisible by scheduled width {width}, and is not split "
+                    "by rows at that width; codegen would silently run a serial "
+                    "implementation (not buildable)")
         explicit = op.get("shard_factor")
         if explicit is not None and int(explicit) != width:
             raise ValueError(
@@ -151,8 +168,10 @@ def apply_schedule_shards(ir: dict[str, Any], schedule: dict[str, Any],
                 f"{explicit}, but the schedule reserves width {width}")
         op["shard_factor"] = width
         op[_MARKER] = True
-        applied.append({"dispatch_id": int(did), "op": op["op"],
-                        "oc": oc, "n_shards": width, "axis": axis})
+        rec = {"dispatch_id": int(did), "op": op["op"], "oc": oc, "n_shards": width}
+        if axis is not None:   # K3 builds record which way the conv is split
+            rec["axis"] = axis
+        applied.append(rec)
 
     rewrite = out.setdefault("_rewrite", {})
     rewrite["xpurt_schedule_shards"] = {
