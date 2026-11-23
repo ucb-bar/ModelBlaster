@@ -294,8 +294,7 @@ for model in "${MODEL_LIST[@]}"; do
         [[ "${_v}" == "MODELBLASTER_K1_RT_PRIORITY" ]] && continue
         # Same reasoning for the board selector and the k3 equivalents.
         case "${_v}" in
-            MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE|MB_XPURT_WARMUP) continue ;;
-            MB_XPURT_PLACEMENT|MB_XPURT_REPEATS|MB_XPURT_STAMPS|MB_XPURT_OWN_LINES) continue ;;
+            MODELBLASTER_BOARD|MODELBLASTER_K3_*|MODELBLASTER_SSH_CONFIG|MB_TOPO_RELATIVE|MB_XPURT_*) continue ;;
         esac
         _cfg="${_cfg} ${_v}=${!_v}"
     done
@@ -420,9 +419,17 @@ ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
 [[ -f "${SCHED_C}" ]] || { echo "ingest produced no dispatch table" >&2; exit 1; }
 echo "  ${SCHED_C}"
 
-# Hosted-Linux walker opt-ins (harness_xpurt/LINUX.md):
+# Board-side walker knobs, forwarded to the run: MB_XPURT_WARM=0 starts cold
+# (the walker runs one untimed frame of every network first by default) and
+# MB_XPURT_GATE_SLEEP=1 sleeps at the release gate instead of spinning.
+WALKER_ENV=""
+for _v in MB_XPURT_WARM MB_XPURT_GATE_SLEEP; do
+    [[ -n "${!_v:-}" ]] && WALKER_ENV="${WALKER_ENV} ${_v}=${!_v}"
+done
+# Hosted-Linux walker opt-ins (harness_xpurt/LINUX.md), all off by default:
 #   MB_XPURT_WARMUP=1     one untimed pass of the whole schedule before the
-#                         timed one (generate_xpurt_main --warmup)
+#                         timed one (generate_xpurt_main --warmup); it runs after
+#                         the default warm start unless MB_XPURT_WARM=0
 #   MB_XPURT_PLACEMENT=1  record the cpu each entry's kernel ran on; the block is
 #                         saved as <sched>_placement.csv (--placement)
 #   MB_XPURT_REPEATS=N    run the deployed binary N times (default 1); with N>1
@@ -439,14 +446,35 @@ PLACEMENT="${MB_XPURT_PLACEMENT:-0}"
 [[ "${MB_XPURT_OWN_LINES:-0}" == "1" ]] && WALKER_OPTS+=(--own-lines)
 REPEATS="${MB_XPURT_REPEATS:-1}"
 [[ "${REPEATS}" =~ ^[1-9][0-9]*$ ]] || { echo "MB_XPURT_REPEATS must be a positive integer" >&2; exit 2; }
-# The walker has no live JSON stream yet; say so rather than ignoring the knob.
-[[ "${STREAM}" == "1" ]] && \
-    echo "note: MB_XPURT_STREAM=1 ignored: the walker has no live stream" >&2
 # One pinned worker per (kind, hart) by default: the schedule places
 # dispatches on individual harts, and composite targets need hart mode to
 # reserve their whole hart set. MB_XPURT_WORKERS=kind gives one worker per
 # kind with an intra-op pool over the kind's harts.
 WORKERS="${MB_XPURT_WORKERS:-hart}"
+# MB_XPURT_DYNAMIC=1: dynamic walker (held tasks may move to an idle core of the
+# same kind); MB_XPURT_SAFETY_BOUNDARY sets its safety factor (default 1.5).
+DYNAMIC_ARGS=()
+# MB_XPURT_POOL="net[:period_ms],...": those networks' entries are served from a
+# global ready queue by any idle core of their kind (soft / non-periodic work).
+# Works with or without MB_XPURT_DYNAMIC (which also moves periodic entries).
+# MB_XPURT_SAFETY_FILE=<walker_safety.json> (scripts/walker_safety_feedback.py)
+# supplies the value instead, so feedback-driven runs pick up the latest one.
+if [[ "${MB_XPURT_DYNAMIC:-0}" == "1" ]]; then
+    _safety="${MB_XPURT_SAFETY_BOUNDARY:-1.5}"
+    if [[ -n "${MB_XPURT_SAFETY_FILE:-}" ]]; then
+        _safety="$(${PY} -c 'import json,sys; print(json.load(open(sys.argv[1]))["safety_boundary"])' "${MB_XPURT_SAFETY_FILE}")" || exit 2
+        echo "dynamic walker: safety boundary ${_safety} from ${MB_XPURT_SAFETY_FILE}"
+    fi
+    DYNAMIC_ARGS=(--dynamic-walker --safety-boundary "${_safety}")
+fi
+if [[ -n "${MB_XPURT_POOL:-}" ]]; then
+    if [[ "${WORKERS}" != "hart" ]]; then
+        echo "ERROR: MB_XPURT_POOL needs --worker-granularity hart (got ${WORKERS})" >&2; exit 2
+    fi
+    DYNAMIC_ARGS+=(--pool-networks "${MB_XPURT_POOL}")
+    [[ "${MB_XPURT_DYNAMIC:-0}" == "1" ]] || DYNAMIC_ARGS+=(--safety-boundary "${MB_XPURT_SAFETY_BOUNDARY:-1.0}")
+    echo "walker pool: ${MB_XPURT_POOL}"
+fi
 
 echo "=== 3/5 generate the walker (--worker-granularity ${WORKERS}) ==="
 MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
@@ -455,7 +483,7 @@ ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
     --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
     ${IMPL_BACKENDS:+--impl-backends "${IMPL_BACKENDS}"} \
-    --registry "${REGISTRY}" --worker-granularity "${WORKERS}" \
+    --registry "${REGISTRY}" --worker-granularity "${WORKERS}" "${DYNAMIC_ARGS[@]}" \
     ${WALKER_OPTS[@]+"${WALKER_OPTS[@]}"}
 
 echo "=== 4/5 cross-build (harness_xpurt/build_posix.sh) ==="
@@ -471,11 +499,16 @@ MODEL_BACKENDS="${UNIQUE_BACKENDS}" \
 XPURT_SCHEDULE_C="${SCHED_C}" XPURT_MAIN_C="${MAIN_C}" XPURT_INCLUDE_DIR="${GEN_DIR}" \
 OUT="${BIN}" CC="${CROSS}gcc" LDFLAGS=-static PYTHON="${PY}" \
 MODELBLASTER_AI_CPUS="${_ai}" MODELBLASTER_XPURT_TRACE="${TRACE}" \
+MODELBLASTER_XPURT_STREAM="${STREAM}" \
     bash "${REPO_ROOT}/harness_xpurt/build_posix.sh" >"${BUILD_DIR}/build.log" 2>&1 \
     || { echo "build failed; tail of ${BUILD_DIR}/build.log:" >&2; tail -40 "${BUILD_DIR}/build.log" >&2; exit 1; }
 [[ -x "${BIN}" ]] || { echo "no binary at ${BIN}" >&2; exit 1; }
 echo "  $(file -b "${BIN}" | cut -c1-70)"
 
+if [[ "${MB_XPURT_BUILD_ONLY:-0}" == "1" ]]; then
+    echo "MB_XPURT_BUILD_ONLY=1: built ${BIN}; not deploying"
+    exit 0
+fi
 echo "=== 5/5 deploy and run on ${HOST} ==="
 # k3's ssh is flaky: generous handshake timeout, and retry the idempotent
 # setup/copy/fetch steps (never the run itself). k1 keeps plain ssh/scp.
@@ -507,7 +540,7 @@ if [[ -n "${RT_PRIORITY}" ]]; then
     RUNNER_POLICY="SCHED_FIFO"
     RUNNER_PRIORITY="${RT_PRIORITY}"
 fi
-RUN="${RUN} ./${SCHED_NAME}"
+RUN="${RUN}${WALKER_ENV:+ env${WALKER_ENV}} ./${SCHED_NAME}"
 # Redirect ON THE BOARD and scp the file back, rather than streaming stdout
 # through ssh. A three-model schedule emits ~1600 trace rows, and streaming that
 # volume reproducibly killed the board's ssh daemon:

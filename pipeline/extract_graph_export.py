@@ -113,8 +113,8 @@ _ALIAS = {
     "contiguous.default", "permute.default", "reshape.default",
     "flatten.using_ints", "split.Tensor", "expand_as.default",
     "clone.default",
-    # torch >= 2.15's export emits aten.alias for some identity views (ViNT, k3-work
-    # TASK-019): same data, same shape, so the same pass-through as clone.
+    # A slice that covers the whole tensor (ViNT's pos_enc[:, :L, :] at full
+    # length) is exported as aten.alias: same storage, same shape.
     "alias.default",
 }
 
@@ -130,14 +130,8 @@ def _bias_safe_scales(w_scales, b, in_scale):
     return np.maximum(w_scales, need)
 
 
-class _ArgsView:
-    """An fx node seen with other args: a split's getitem emitted as the slice it is."""
-
-    def __init__(self, node, args):
-        self._node, self.args = node, args
-
-    def __getattr__(self, k):
-        return getattr(self._node, k)
+# Ops whose getitems are pieces of one source tensor (_visit_split_piece).
+_SPLIT_OPS = {"split.Tensor", "split_with_sizes.default"}
 
 
 def _perm_preserves_order(perm, shape) -> bool:
@@ -315,6 +309,10 @@ class _ExportWalker:
         self.name_map: dict[str, str] = {}
         # transpose nodes folded into a matmul's transpose_b flag.
         self.transpose_b_nodes: set[str] = set()
+        # Tail nodes (and the aliases that read them) that change the element
+        # count. The composite post-process op re-does the tail, so nothing
+        # is emitted for them; no emitted op may read one (checked in emit).
+        self.elided: set[str] = set()
 
     # ------------------------------------------------------------------
     # Phase 1: run the model, capture every tensor's value distribution,
@@ -530,6 +528,14 @@ class _ExportWalker:
         # Walk in topological order (already true for fx Graph).
         for n in self.gm.graph.nodes:
             self._visit(n)
+        for op in self.ops:
+            bad = [t for t in op.get("inputs", []) if t in self.elided]
+            if bad:
+                raise NotImplementedError(
+                    f"extract_graph_export: {op['name']} ({op['op']}) reads "
+                    f"{bad}, the output of a tail op that changes the element "
+                    f"count. Tail ops are elided (the model's composite "
+                    f"post-process re-does them), so nothing computes it.")
 
     # ------------------------------------------------------------------
     # Auto-cast pass: for each op, if its declared precision (from the
@@ -651,7 +657,11 @@ class _ExportWalker:
         that reads out of bounds.
         """
         out_shape = None
-        if hasattr(n, "meta") and "val" in n.meta:
+        # split.Tensor's meta["val"] is a list of tensors, one per piece; it
+        # has no single shape. Its getitems are handled as pieces
+        # (_visit_split_piece), so the split node itself is a plain alias.
+        if hasattr(n, "meta") and "val" in n.meta \
+                and hasattr(n.meta["val"], "shape"):
             out_shape = tuple(int(x) for x in n.meta["val"].shape)
         elif n.name in self.tensors:
             out_shape = tuple(int(x) for x in self.tensors[n.name].shape)
@@ -753,34 +763,6 @@ class _ExportWalker:
                 "dtype": eff_dtype,
             }
 
-    @staticmethod
-    def _split_cat_source(n):
-        """The split source if `n` is cat(dim=0) of all pieces, in order, of one
-        split.Tensor along dim 1 of a batch-1 tensor (a reshape), else None."""
-        if _op_name(n) not in ("cat.default", "concat.default") or not n.args:
-            return None
-        pieces = n.args[0]
-        dim = n.args[1] if len(n.args) > 1 else n.kwargs.get("dim", 0)
-        if int(dim) != 0 or not isinstance(pieces, (list, tuple)) or not pieces:
-            return None
-        sp = None
-        for i, t in enumerate(pieces):
-            if not (isinstance(t, torch.fx.Node) and _op_name(t) == "<built-in function getitem>"
-                    and isinstance(t.args[0], torch.fx.Node)
-                    and _op_name(t.args[0]) == "split.Tensor" and int(t.args[1]) == i):
-                return None
-            if sp is None:
-                sp = t.args[0]
-            elif t.args[0] is not sp:
-                return None
-        src = sp.args[0]
-        sdim = int(sp.args[2]) if len(sp.args) > 2 else 0
-        val = sp.meta.get("val")
-        if (sdim != 1 or not isinstance(val, (list, tuple)) or len(pieces) != len(val)
-                or int(src.meta["val"].shape[0]) != 1):
-            return None
-        return src
-
     def _visit(self, n):
         # Skip structural nodes — those don't represent computation.
         # Placeholders are param/buffer/user_input declarations;
@@ -790,37 +772,31 @@ class _ExportWalker:
         # Hand-tagged dispatch on op kind. Keep cases short and
         # delegate complex emit to dedicated helpers.
         op_kind = _op_name(n)
-        # torch >= 2.15's export keeps torch.split as one split.Tensor node with a list
-        # value, read through getitem (k3-work TASK-019: ViNT's 6-frame observation).
-        # Each getitem is the slice [i*size, min((i+1)*size, extent)) along `dim`, so it
-        # is emitted as that slice; the split node itself emits nothing.
-        if op_kind == "split.Tensor" and isinstance(n.meta.get("val"), (list, tuple)):
-            return
-        # split along dim 1 of a batch-1 tensor, then cat of all its pieces in order along
-        # dim 0, is a reshape (1, k*C, ...) -> (k, C, ...): the same bytes in the same order
-        # (ViNT's 6-frame observation -> a batch of 6). The cat aliases the source and the
-        # pieces emit nothing.
-        src = self._split_cat_source(n)
-        if src is not None:
-            self._record_tensor(n.name)
-            self.name_map[n.name] = self._resolve_input(src)
-            return
-        if (op_kind == "<built-in function getitem>" and n.users
-                and all(self._split_cat_source(u) is not None for u in n.users)):
-            self._record_tensor(n.name)
-            return
-        if (op_kind == "<built-in function getitem>" and n.args
-                and isinstance(n.args[0], torch.fx.Node)
-                and _op_name(n.args[0]) == "split.Tensor"):
-            sp = n.args[0]
-            src, size = sp.args[0], int(sp.args[1])
-            dim = int(sp.args[2]) if len(sp.args) > 2 else 0
-            extent = int(src.meta["val"].shape[dim])
-            start = int(n.args[1]) * size
-            self._emit_slice_c(_ArgsView(n, (src, dim, start, min(start + size, extent), 1)))
-            return
         cls = _classify(op_kind)
         if cls in ("noop", "tail", "alias"):
+            if op_kind == "<built-in function getitem>" \
+                    and isinstance(n.args[0], torch.fx.Node) \
+                    and _op_name(n.args[0]) in _SPLIT_OPS:
+                self._visit_split_piece(n)
+                return
+            # The data operand of an alias / tail op is its first argument
+            # (expand_as's second is only a shape). If that is elided, so is
+            # this node.
+            # Elided nodes still get their tensors_meta entry, as every
+            # visited alias does, so the IR keeps its shape.
+            first = n.args[0] if n.args else None
+            if isinstance(first, torch.fx.Node) and \
+                    self.name_map.get(first.name, first.name) in self.elided:
+                self._record_tensor(n.name)
+                self.elided.add(n.name)
+                return
+            if cls == "tail" and self._changes_element_count(n):
+                # e.g. F.normalize's linalg_vector_norm (..., 2) -> (..., 1).
+                # Aliasing it to its input would give consumers a tensor of
+                # the wrong size; the composite post-process op computes it.
+                self._record_tensor(n.name)
+                self.elided.add(n.name)
+                return
             # Special case: slice.Tensor along an NCHW channel dim
             # (dim=1) of a 4-D tensor that has a downstream cat
             # consumer. We CAN'T alias-collapse it because doing so
@@ -874,14 +850,7 @@ class _ExportWalker:
                 # is (1,3,1,1).expand_as((2,3,256,256)), and the cat that
                 # consumes it then read 393216 elements out of a
                 # 3-element buffer.
-                if cls == "tail":
-                    # The output tail (cumsum / F.normalize) is elided from the IR and
-                    # applied after the run; nothing in the IR reads it, so only its name
-                    # must resolve to the pre-tail tensor, whatever its size (ViNT's norm,
-                    # (1,5,2) -> (1,5,1); k3-work TASK-019).
-                    self.name_map[n.name] = src_name
-                else:
-                    self._materialize_or_alias(n, src_name)
+                self._materialize_or_alias(n, src_name)
             return
         if cls == "fold":
             # Walker fuses these into the preceding op; nothing emitted.
@@ -2021,6 +1990,10 @@ class _ExportWalker:
         # same upstream tensor name (e.g. ViNT's split-then-concat that
         # shuffles obs_img's leading dims). When the underlying memory
         # is byte-identical, emit an alias and skip the kernel call.
+        # Pieces of a torch.split alias their source only when this cat is a
+        # byte-identical reassembly (_visit_split_piece decided that); any
+        # other cat of pieces reads their slice_c copies, which have their
+        # own names, so the check below cannot fire for them.
         if all(nm == names[0] for nm in names) and names[0] in self.tensors:
             src_size = int(np.prod(self.tensors[names[0]].shape))
             out_size = int(np.prod(self.tensors[out_name].shape))
@@ -2196,14 +2169,15 @@ class _ExportWalker:
         q = self._quant_for(n)
         rank = len(in_shape)
         if rank > 4:
-            # Unit axes move no data: drop them (keeping the order of the rest) until the
-            # permutation fits four axes. torch >= 2.15's attention in-projection transposes
-            # a (1, L, N, 3, E) tensor (k3-work TASK-019, ViNT).
-            keep = [ax for ax in range(rank) if int(in_shape[ax]) > 1]
-            if len(keep) <= 4:
-                in_shape = [int(in_shape[ax]) for ax in keep]
-                perm = [keep.index(int(ax)) for ax in perm if int(ax) in keep]
-                rank = len(in_shape)
+            # Unit axes carry no data, so dropping them (and renumbering the
+            # permutation over the axes that are left) moves exactly the same
+            # bytes. nn.MultiheadAttention's packed in-projection transposes
+            # a (1, L, B, 3, E) view, which is rank 4 without its unit axis.
+            keep = [i for i, d in enumerate(in_shape) if int(d) != 1]
+            new_idx = {old: k for k, old in enumerate(keep)}
+            perm = [new_idx[px] for px in perm if px in new_idx]
+            in_shape = [int(in_shape[i]) for i in keep]
+            rank = len(in_shape)
         if rank > 4:
             raise NotImplementedError(
                 f"{_op_name(n)} at {n.name}: rank {rank} > 4; permute4_s8 "
@@ -2240,6 +2214,95 @@ class _ExportWalker:
                 "activation_min": -128, "activation_max": 127,
             }
         self.ops.append(rec)
+
+    @staticmethod
+    def _changes_element_count(n) -> bool:
+        """True iff n's output has a different element count than its first
+        argument's (both read from the export meta)."""
+        src = n.args[0] if n.args else None
+        if not (isinstance(src, torch.fx.Node) and "val" in src.meta
+                and hasattr(src.meta["val"], "shape")
+                and "val" in n.meta and hasattr(n.meta["val"], "shape")):
+            return False
+        return int(np.prod(tuple(src.meta["val"].shape))) != \
+            int(np.prod(tuple(n.meta["val"].shape)))
+
+    @staticmethod
+    def _split_piece_range(n):
+        """(split node, dim, start, end) of a getitem of a split."""
+        split = n.args[0]
+        idx = int(n.args[1])
+        src_shape = tuple(int(x) for x in split.args[0].meta["val"].shape)
+        dim = int(split.args[2]) if len(split.args) > 2 else int(
+            split.kwargs.get("dim", 0))
+        if dim < 0:
+            dim += len(src_shape)
+        sizes = [int(t.shape[dim]) for t in split.meta["val"]]
+        start = sum(sizes[:idx])
+        return split, dim, start, start + sizes[idx]
+
+    @staticmethod
+    def _cat_reassembles_split(cat) -> bool:
+        """True iff `cat` concatenates every piece of one split, in order,
+        and its output is byte-identical to the split's source.
+
+        torch.split + torch.cat is how ViNT turns its (1, 18, H, W) frame
+        stack into (6, 3, H, W). Both tensors are contiguous; the bytes agree
+        exactly when (1) each piece is a contiguous run of the source, i.e.
+        the dims before the split dim have product 1, and (2) the cat output
+        is the pieces laid end to end, i.e. the dims of a piece before the
+        cat dim have product 1. With a batch of 2 (1) fails: the pieces
+        interleave, and aliasing would read the frames in the wrong order.
+        """
+        if _op_name(cat) not in ("cat.default", "concat.default"):
+            return False
+        pieces = cat.args[0]
+        if not pieces or not all(
+                isinstance(t, torch.fx.Node)
+                and _op_name(t) == "<built-in function getitem>"
+                and isinstance(t.args[0], torch.fx.Node)
+                and _op_name(t.args[0]) in _SPLIT_OPS for t in pieces):
+            return False
+        split = pieces[0].args[0]
+        if any(t.args[0] is not split for t in pieces):
+            return False
+        if [int(t.args[1]) for t in pieces] != list(range(len(split.meta["val"]))):
+            return False
+        _, dim, _, _ = _ExportWalker._split_piece_range(pieces[0])
+        src_shape = tuple(int(x) for x in split.args[0].meta["val"].shape)
+        if int(np.prod(src_shape[:dim])) != 1:
+            return False
+        piece_shape = tuple(int(x) for x in pieces[0].meta["val"].shape)
+        cdim = int(cat.args[1]) if len(cat.args) > 1 else int(
+            cat.kwargs.get("dim", 0))
+        if cdim < 0:
+            cdim += len(piece_shape)
+        return int(np.prod(piece_shape[:cdim])) == 1
+
+    def _visit_split_piece(self, n):
+        """A getitem of torch.split: one piece of the source along one dim.
+
+        If every consumer is a cat that puts the whole split back together
+        byte for byte, the piece is an alias of the source and the cat
+        collapses to an alias too (_emit_cat). Otherwise the piece is a
+        copy of its range: a slice_c record, carrying the source's scale so
+        the copy is exact.
+        """
+        split, dim, start, end = self._split_piece_range(n)
+        src_name = self._resolve_input(split.args[0])
+        self._record_tensor(n.name)
+        if not n.users:
+            return  # an unused piece: nothing reads it, so nothing copies it
+        if all(self._cat_reassembles_split(u) for u in n.users):
+            self.name_map[n.name] = src_name
+            return
+        src_shape = tuple(int(x) for x in split.args[0].meta["val"].shape)
+        if self._quant_for(n) == "int8" and src_name in self.scales:
+            self.scales[n.name] = self.scales[src_name]
+            meta_q = self.tensors_meta.get(n.name, {}).get("quant")
+            if isinstance(meta_q, dict):
+                meta_q["scale"] = self.scales[src_name]
+        self._emit_slice_range(n, src_name, src_shape, dim, start, end)
 
     def _slice_changes_extent(self, n) -> bool:
         """True iff this slice/select actually drops elements.
@@ -2336,6 +2399,12 @@ class _ExportWalker:
             C_end += IC
         C_start = max(0, min(C_start, IC))
         C_end = max(C_start, min(C_end, IC))
+        self._emit_slice_range(n, src_name, src_shape, dim, C_start, C_end)
+
+    def _emit_slice_range(self, n, src_name, src_shape, dim, C_start, C_end):
+        """The slice_c record for [C_start, C_end) along `dim` of src."""
+        rank = len(src_shape)
+        IC = src_shape[dim]
         if rank == 4 and dim == 1:
             H, W = src_shape[2], src_shape[3]
             N = src_shape[0]
@@ -2598,8 +2667,25 @@ def _emit_vint_post_op(walker, out_dir):
     return out_name
 
 
+def _load_precision_spec(model_mod, choice: str):
+    """The precision spec selected by ``--precision-spec``.
+
+    ``model`` (default): the model module's ``get_precision_spec()``, if any.
+    ``none``: no spec, so every op follows ``--quant``.
+    Anything else is a JSON file holding a spec of the same shape.
+    """
+    if choice == "model":
+        return (model_mod.get_precision_spec()
+                if hasattr(model_mod, "get_precision_spec") else None)
+    if choice == "none":
+        return None
+    with open(choice) as f:
+        return json.load(f)
+
+
 def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
-                          fp16_patterns_cli: str, default: str) -> dict[str, str]:
+                          fp16_patterns_cli: str, default: str,
+                          precision_spec: str = "model") -> dict[str, str]:
     """Resolve per-op precision overrides into a {node_name: 'fp16'|'int8'}
     map. Sources, in order (later wins on conflict):
 
@@ -2622,8 +2708,7 @@ def _resolve_op_precision(ep, model_mod, fp16_ops_cli: str,
     node_by_name = {n.name: n for n in nodes}
     explicit_fp16: set[str] = set()
     explicit_int8: set[str] = set()
-    spec = (model_mod.get_precision_spec()
-            if hasattr(model_mod, "get_precision_spec") else None)
+    spec = _load_precision_spec(model_mod, precision_spec)
 
     def _upstream(target_name: str) -> set[str]:
         """All ancestor aten node names of `target_name`, traversed
@@ -2739,6 +2824,12 @@ def main():
                         "node names; matching ops are promoted to fp16. "
                         "Additive to --fp16-ops and the model's spec. "
                         "Example: --fp16-patterns 'layer_norm_*'")
+    p.add_argument("--precision-spec", default="model",
+                   help="Per-op precision spec: 'model' (default) uses the "
+                        "model module's get_precision_spec(); 'none' uses "
+                        "none, so every op follows --quant; any other value "
+                        "is a JSON file with a spec of the same shape. "
+                        "--fp16-ops / --fp16-patterns add to it.")
     args = p.parse_args()
 
     if args.quant == "fp32":
@@ -2823,7 +2914,8 @@ def main():
     # node names, (c) --fp16-patterns fnmatch globs against aten node
     # names. Empty spec ⇒ all ops follow --quant (single-mode behavior).
     op_precision = _resolve_op_precision(
-        ep, mod, args.fp16_ops, args.fp16_patterns, default=args.quant)
+        ep, mod, args.fp16_ops, args.fp16_patterns, default=args.quant,
+        precision_spec=args.precision_spec)
     if op_precision:
         n_fp16 = sum(1 for q in op_precision.values() if q == "fp16")
         n_int8 = sum(1 for q in op_precision.values() if q == "int8")
