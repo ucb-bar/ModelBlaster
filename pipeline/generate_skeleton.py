@@ -1102,7 +1102,7 @@ static inline void parallel_conv2d_s8_rows(void *pool_,
 """
 
 
-def _conv2d_s8_ihwoc_wrapper() -> str:
+def _conv2d_s8_ihwoc_wrapper(k3_tiles: bool = False) -> str:
     """`_CONV2D_S8_WRAPPER` for a backend that packs conv weights IHWOC.
 
     IHWOC is (IC, KH, KW, OC), so an OC slice is strided. The wrapper keeps one
@@ -1113,6 +1113,10 @@ def _conv2d_s8_ihwoc_wrapper() -> str:
     is computed independently, so the result is bit-exact with the serial call.
     The copy is built on first use and kept for the run. Hosted POSIX builds
     only (it allocates); elsewhere the call stays serial, as before.
+
+    `k3_tiles` (K3 backends): a weight that went out as K3 matrix tiles
+    (pipeline/k3_weight_tiles.py) is recognised by its magic and run serially.
+    Off, the text is the pre-K3 wrapper.
     """
     t = _CONV2D_S8_WRAPPER
     helper = """
@@ -1130,12 +1134,7 @@ static pthread_mutex_t mb_ihwoc_lock_{mid} = PTHREAD_MUTEX_INITIALIZER;
 static const int8_t *mb_ihwoc_shards_{mid}(const int8_t *w, size_t per_filter,
                                            int OC, int T) {{
     int8_t *p = NULL;
-    /* Matrix-tile weights (K3 IME, pipeline/k3_weight_tiles.py) are not IHWOC
-     * and cannot be OC-sliced: run serially. */
-    if (per_filter * (size_t)OC >= 64 && (memcmp(w, "MBX100TW", 8) == 0
-            || memcmp(w, "MBIME2TW", 8) == 0))
-        return NULL;
-    pthread_mutex_lock(&mb_ihwoc_lock_{mid});
+@K3_TILE_CHECK@    pthread_mutex_lock(&mb_ihwoc_lock_{mid});
     for (int i = 0; i < mb_ihwoc_n_{mid}; i++) {{
         if (mb_ihwoc_cache_{mid}[i].w == w && mb_ihwoc_cache_{mid}[i].T == T) {{
             p = mb_ihwoc_cache_{mid}[i].packed;
@@ -1162,6 +1161,13 @@ static const int8_t *mb_ihwoc_shards_{mid}(const int8_t *w, size_t per_filter,
 }}
 #endif
 """
+    k3_check = ("""    /* Matrix-tile weights (K3 IME, pipeline/k3_weight_tiles.py) are not IHWOC
+     * and cannot be OC-sliced: run serially. */
+    if (per_filter * (size_t)OC >= 64 && (memcmp(w, "MBX100TW", 8) == 0
+            || memcmp(w, "MBIME2TW", 8) == 0))
+        return NULL;
+""" if k3_tiles else "")
+    helper = helper.replace("@K3_TILE_CHECK@", k3_check)
     marker = "/* MB_SHARD_MACHINERY_END */"
     assert t.count(marker) == 1
     t = t.replace(marker, helper + marker)
@@ -1262,7 +1268,8 @@ def _emit_parallel_wrappers(mid: str, used_ops: set[str],
     for op in sorted(_PARALLELIZED_OPS & used_ops):
         if layout == "ihwoc" and op == "conv2d_s8":
             # Strided OC slice: shard on a repacked copy of the weights.
-            parts.append(_conv2d_s8_ihwoc_wrapper().format(mid=mid))
+            parts.append(_conv2d_s8_ihwoc_wrapper(
+                k3_tiles=_k3_pool_ops.enabled(backend)).format(mid=mid))
             continue
         if not oc_slice_is_contiguous and op in _OC_WEIGHT_SLICING_OPS:
             parts.append(

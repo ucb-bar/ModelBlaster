@@ -214,6 +214,12 @@ def test_kernel_check_refuses_kernel_without_header(tmp_path):
 
 
 def test_ihwoc_pool_wrapper_never_slices_tiles():
-    src = gs._conv2d_s8_ihwoc_wrapper()
+    src = gs._conv2d_s8_ihwoc_wrapper(k3_tiles=True)
     assert 'memcmp(w, "MBX100TW", 8) == 0' in src
     assert 'memcmp(w, "MBIME2TW", 8) == 0' in src
+    # Only K3 backends carry the check; a K1 backend gets the pre-K3 wrapper.
+    for bs in ("ime_k3_x100", "rvv_k3", "rvv_k3_a100"):
+        assert "MBX100TW" in gs._emit_parallel_wrappers("m", {"conv2d_s8"}, backend=bs), bs
+    for bs in ("rvv_x60", "ime_x60"):
+        assert "MBX100TW" not in gs._emit_parallel_wrappers("m", {"conv2d_s8"}, backend=bs), bs
+    assert "MBX100TW" not in gs._conv2d_s8_ihwoc_wrapper()
