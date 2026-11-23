@@ -19,7 +19,7 @@
 #   XPURT_INCLUDE_DIR=/.../ OUT=/.../walker \
 #   [CC=gcc] [CFLAGS_COMMON=-O2] [LDFLAGS=-static] [KERNEL_CFLAGS_<BACKEND>="-march=..."] \
 #   [MODELBLASTER_AI_CPUS=8-15] \
-#   [MODELBLASTER_POOL_THREADS=N] [MODELBLASTER_XPURT_TRACE=1] \
+#   [MODELBLASTER_POOL_THREADS=N] [MODELBLASTER_XPURT_TRACE=1] [MODELBLASTER_XPURT_STREAM=1] \
 #       bash harness_xpurt/build_posix.sh
 set -euo pipefail
 
@@ -140,6 +140,8 @@ done
 MAIN_DEFS=()
 [[ -n "${MODELBLASTER_POOL_THREADS:-}" ]] && MAIN_DEFS+=(-DMODELBLASTER_POOL_THREADS="${MODELBLASTER_POOL_THREADS}")
 [[ "${MODELBLASTER_XPURT_TRACE:-0}" == 1 ]] && MAIN_DEFS+=(-DMODELBLASTER_XPURT_TRACE=1)
+# One JSON line per dispatch end, for XPU-RT's streaming_feedback.py.
+[[ "${MODELBLASTER_XPURT_STREAM:-0}" == 1 ]] && MAIN_DEFS+=(-DMODELBLASTER_XPURT_STREAM=1)
 # -iquote keeps these dirs from shadowing system headers such as <sched.h>.
 cc "${WORK}/xpurt_sched.o" "${XPURT_SCHEDULE_C}" -iquote "${STAGE}" -iquote "${XPURT_INCLUDE_DIR}"
 cc "${WORK}/xpurt_main.o"  "${XPURT_MAIN_C}"     -iquote "${STAGE}" -iquote "${XPURT_INCLUDE_DIR}" "${MAIN_DEFS[@]}"

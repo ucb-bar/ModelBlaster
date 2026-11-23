@@ -180,8 +180,10 @@ RVV_X60 = Backend(
     spike_args=("--isa=rv64gcv_zicntr",),
     optimization_guide="optimization_guide_rvv.md",
     # Same ISA family as rvv, just with VLEN pinned -- so it inherits every
-    # curated kernel in kernels/rvv/.
-    curated_aliases=("rvv",),
+    # curated kernel in kernels/rvv/. The X60 also has zvfh, so the fp16
+    # kernels in kernels/rvv_f16/ apply; they come second, so an op with a
+    # kernels/rvv/ kernel keeps it and only fp16 ops gain a vector kernel.
+    curated_aliases=("rvv", "rvv_f16"),
     # NOT host_ctypes. The host is x86 and cannot compile `vint32m4_t` or
     # `__riscv_vle8_v_i8m1`, so host_ctypes verify fails on every candidate
     # with "unknown type name" -- which the generator reads as the LLM being
@@ -420,8 +422,10 @@ IME = Backend(
     # The backend is `ime_x60` (matching the profile tree's rvv_x60 / scalar
     # convention, which is what the scheduler's combo_hw swap keys on) while
     # the kernels live in kernels/ime/ -- the alias is what bridges the two,
-    # exactly as rvv_x60 reaches kernels/rvv/.
-    curated_aliases=("ime", "rvv"),
+    # exactly as rvv_x60 reaches kernels/rvv/. "rvv_f16" last, as on rvv_x60:
+    # the X60 has zvfh, so fp16 ops get vector kernels instead of the scalar
+    # reference.
+    curated_aliases=("ime", "rvv", "rvv_f16"),
     # Same reasoning as rvv_x60: the host is x86 and no simulator models
     # smt.vmadot, so generation cross-compiles and the board settles numerics.
     verify_method=VERIFY_CROSS_COMPILE,
