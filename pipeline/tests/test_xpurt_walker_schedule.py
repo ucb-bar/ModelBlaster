@@ -211,9 +211,9 @@ class ImplLegality(unittest.TestCase):
 
     def test_an_impl_the_core_does_not_list_is_refused(self):
         with self.assertRaisesRegex(ValueError, "not legal on x100_core0"):
-            ingest._check_impl_legal("k", "ime", "x100", (0,), self._K3)
+            ingest._check_impl_legal("k", "npu", "x100", (0,), self._K3)
         with self.assertRaisesRegex(ValueError, "not legal"):
-            ingest._check_impl_legal("k", "ime", "x100", (0, 1), self._K3)
+            ingest._check_impl_legal("k", "npu", "x100", (0, 1), self._K3)
 
     def test_listed_impls_and_the_default_pass(self):
         ingest._check_impl_legal("k", "ime", "a100", (8, 9), self._K3)

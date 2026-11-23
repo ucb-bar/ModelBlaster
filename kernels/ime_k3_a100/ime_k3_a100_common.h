@@ -223,10 +223,28 @@ typedef struct {
     float *bn;            /* OC scale floats then OC bias floats */
     int8_t *lut;          /* OC*256 */
 } mb_lut_ent_t;
-enum { MB_LUT_ENTS = 96 };
-static mb_lut_ent_t mb_lut_cache[MB_LUT_ENTS];
-static int mb_lut_n;
+/* Grow-only tables (k3-work TASK-016): a model split over w cores asks for up to
+ * w entries per layer (one per channel slice), so a fixed table (96 / 160) overflowed
+ * on yolov8 at width >= 4 and every later call rebuilt its table or packed weights.
+ * The tables now double under their lock up to MB_CACHE_MAX entries; lookups scan
+ * under the same lock and copy the result out, so a moved table is never read. */
+enum { MB_LUT_ENTS0 = 96, MB_WP_ENTS0 = 160, MB_CACHE_MAX = 1 << 16 };
+static mb_lut_ent_t *mb_lut_cache;
+static int mb_lut_n, mb_lut_cap;
 static int mb_lut_lock;
+
+/* Room for one more entry in a grow-only table (caller holds its lock): 1 or 0. */
+static int mb_cache_room(void **tab, int *cap, int n, size_t ent, int cap0)
+{
+    if (n < *cap) return 1;
+    if (*cap >= MB_CACHE_MAX) return 0;
+    int nc = *cap ? *cap * 2 : cap0;
+    void *t = realloc(*tab, (size_t)nc * ent);
+    if (!t) return 0;
+    *tab = t;
+    *cap = nc;
+    return 1;
+}
 
 static inline void mb_spin_lock(int *l)
 {
@@ -270,7 +288,8 @@ static const int8_t *mb_get_lut(const float *bn_scale, const float *bn_bias, int
     memcpy(bn, bn_scale, (size_t)OC * 4);
     memcpy(bn + OC, bn_bias, (size_t)OC * 4);
     mb_spin_lock(&mb_lut_lock);
-    if (mb_lut_n < MB_LUT_ENTS) {
+    if (mb_cache_room((void **)&mb_lut_cache, &mb_lut_cap, mb_lut_n, sizeof *mb_lut_cache,
+                      MB_LUT_ENTS0)) {
         mb_lut_ent_t *e = &mb_lut_cache[mb_lut_n];
         e->OC = OC; e->mode = mode; e->sin_ = sin_; e->sout = sout;
         e->bamin = bamin; e->bamax = bamax; e->ssin = ssin; e->ssout = ssout;
@@ -294,9 +313,8 @@ typedef struct {
     int8_t samp[4][64];
     int8_t *packed;
 } mb_wp_ent_t;
-enum { MB_WP_ENTS = 160 };
-static mb_wp_ent_t mb_wp_cache[MB_WP_ENTS];
-static int mb_wp_n;
+static mb_wp_ent_t *mb_wp_cache;   /* grow-only, see MB_CACHE_MAX */
+static int mb_wp_n, mb_wp_cap;
 static int mb_wp_lock;
 
 static void mb_wp_sample(int8_t samp[4][64], const int8_t *w, size_t n)
@@ -363,7 +381,9 @@ static const int8_t *mb_get_wp(const int8_t *weight, int IC, int OC, int KH, int
         if (mb_wp_cache[i].w == weight && mb_wp_cache[i].IC == IC &&
             mb_wp_cache[i].OC == OC && mb_wp_cache[i].KH == KH &&
             mb_wp_cache[i].KW == KW) { slot = i; break; }
-    if (slot < 0 && mb_wp_n < MB_WP_ENTS) slot = mb_wp_n++;
+    if (slot < 0 && mb_cache_room((void **)&mb_wp_cache, &mb_wp_cap, mb_wp_n,
+                                  sizeof *mb_wp_cache, MB_WP_ENTS0))
+        slot = mb_wp_n++;
     if (slot >= 0) {
         mb_wp_ent_t *e = &mb_wp_cache[slot];
         /* the stale buffer is intentionally leaked: another thread may still be

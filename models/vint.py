@@ -219,7 +219,14 @@ def get_precision_spec() -> dict:
     (when its downstream consumer is back in int8 land).
 
     The CLI ``--fp16-ops a,b,c`` flag is additive to this spec.
+
+    ``MODELBLASTER_VINT_ALL_INT8=1`` returns an all-int8 spec instead (every op on the
+    int8 kernel path), for targets whose kernels are int8, e.g. the SpaceMiT K3 (k3-work
+    TASK-019; ported from k3-r 643e09c). Its accuracy is the all-int8 row of
+    ``notes/vint_mixed_precision_experiments.md``, not the deployed mixed one.
     """
+    if os.environ.get("MODELBLASTER_VINT_ALL_INT8", "") not in ("", "0"):
+        return {"default": "int8", "fp16_upstream_of": [], "fp16_ops": []}
     return {
         "default": "int8",
         # Promote the entire goal-encoder subgraph (everything upstream

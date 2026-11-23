@@ -2686,6 +2686,22 @@ void kernel_conv2d_s8(const int8_t *input, const int8_t *weight,
             reference_impl="",  # curated: kernels/ime/ime_conv2d_s8_ime_vmadot_4x4x8.c
         ),
         AlgorithmCandidate(
+            name="x100_vmadot_4x4x8",
+            target_affinity=("ime_k3_x100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            # IHWOC like rvv_k3, or build-time "MBX100TW" tiles (k3_weight_tiles).
+            weight_layout="ihwoc",
+            description=(
+                "SpaceMiT K3 X100 int8 CONV2D via smt.vmadot (4x8x4 tile at "
+                "VLEN=256): 2 m-tile x 4 panel core, Q0.31 tail in vector "
+                "registers, implicit or indirect NCHW A packing per layer. "
+                "Reads IHWOC weights or the build's X100 tiles. Symmetric "
+                "int8 only; X100 cores only. Hand-written in "
+                "kernels/ime_k3_x100/ (k3-work TASK-014); must be bit-exact."
+            ),
+            reference_impl="",  # curated: kernels/ime_k3_x100/ime_k3_x100_conv2d_s8_x100_vmadot_4x4x8.c
+        ),
+        AlgorithmCandidate(
             name="ime_vmadot_8x16x8",
             target_affinity=("ime_k3_a100",),
             accuracy_class=AccuracyClass.BIT_EXACT,
@@ -11470,6 +11486,37 @@ void kernel_conv2d_s8_pc(const int8_t *input, const int8_t *weight,
                 "Per-channel twin of conv2d_s8's gemmini_im2col_full_C. Gemmini's mvin DMA does the im2col gather and tiled_matmul_auto(full_C=true) drains raw int32; per-channel quantisation changes ONLY the CPU requantize tail, indexing (multiplier, shift) by oc. Gemmini's ACC_SCALE is one scalar per matmul, so a hardware-scaled mvout can never express per-channel scales -- the int32 drain is the only bit-exact route, and it is free here because the per-tensor kernel already pays that cost."
             ),
         ),
+        # SpaceMiT K3 IME, per-channel twins of conv2d_s8's x100_vmadot_4x4x8 and
+        # ime_vmadot_8x16x8 (k3-work TASK-019): the same kernels with one multiplier
+        # and one shift per output channel in the requantize step; the per-layer files
+        # are unchanged. IHWOC weights like their per-layer originals (and the X100
+        # one also reads build-time "MBX100TW" tiles, pipeline/k3_weight_tiles.py).
+        AlgorithmCandidate(
+            name="x100_vmadot_4x4x8",
+            target_affinity=("ime_k3_x100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="ihwoc",
+            description=(
+                "conv2d_s8's x100_vmadot_4x4x8 (SpaceMiT K3 X100 smt.vmadot) with "
+                "per-output-channel (output_multiplier, output_shift): the same A / B "
+                "packing and 2 m-tile x 4 panel loop, the vector requantize tail with "
+                "per-lane multiplier and shift vectors. Symmetric int8 only; X100 "
+                "cores only."
+            ),
+            reference_impl="",  # curated: kernels/ime_k3_x100/ime_k3_x100_conv2d_s8_pc_x100_vmadot_4x4x8.c
+        ),
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            weight_layout="ihwoc",
+            description=(
+                "conv2d_s8's ime_vmadot_8x16x8 (SpaceMiT K3 A100 smt.vmadot, implicit "
+                "GEMM over NHWC16) with per-output-channel (output_multiplier, "
+                "output_shift) in the epilogue. A100 cores only."
+            ),
+            reference_impl="(use the scalar reference_impl)",
+        ),
     ],
 )
 
@@ -11559,6 +11606,20 @@ void kernel_linear_s8_pc(const int8_t *input, const int8_t *weight,
                 "(use the curated kernel "
                 "pext/pext_linear_s8_pc_pext_row_dot8_pc.c)"
             ),
+        ),
+        # SpaceMiT K3 A100 IME, the per-channel twin of linear_s8's ime_vmadot_8x16x8
+        # (k3-work TASK-019); the per-layer file is unchanged.
+        AlgorithmCandidate(
+            name="ime_vmadot_8x16x8",
+            target_affinity=("ime_k3_a100",),
+            accuracy_class=AccuracyClass.BIT_EXACT,
+            description=(
+                "linear_s8's ime_vmadot_8x16x8 (SpaceMiT K3 A100 smt.vmadot; direct, "
+                "k64, diag, rvv and packed paths) with per-output-feature "
+                "(output_multiplier[n], output_shift[n]) in the requantize step. "
+                "A100 cores only."
+            ),
+            reference_impl="(use the scalar reference_impl)",
         ),
         AlgorithmCandidate(
             name="gemmini_tiled_matmul",

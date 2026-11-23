@@ -118,6 +118,18 @@ _ALIAS = {
     "alias.default",
 }
 
+def _bias_safe_scales(w_scales, b, in_scale):
+    """Per-channel weight scales, raised for any channel whose int32 bias
+    b / (in_scale * w_scale) would not fit (k3-work TASK-019). That happens only for a
+    filter of all-zero or tiny weights (scale floor 1e-8/127) with a bias: its weights
+    still quantize to 0, and its bias now fits instead of overflowing (NumPy 2 raises,
+    NumPy 1 wrapped silently). Every other channel is unchanged."""
+    if b is None:
+        return w_scales
+    need = np.abs(b.detach().cpu().numpy().astype(np.float64)) / (float(in_scale) * float(2**31 - 1024))
+    return np.maximum(w_scales, need)
+
+
 # Ops whose getitems are pieces of one source tensor (_visit_split_piece).
 _SPLIT_OPS = {"split.Tensor", "split_with_sizes.default"}
 
@@ -1591,7 +1603,7 @@ class _ExportWalker:
             # to each OC.
             w_np = w.detach().cpu().numpy()
             per_oc_max = np.abs(w_np).reshape(OC, -1).max(axis=1)
-            w_scales_per_oc = np.maximum(per_oc_max, 1e-8) / 127.0
+            w_scales_per_oc = _bias_safe_scales(np.maximum(per_oc_max, 1e-8) / 127.0, b, in_scale)
             w_q = np.empty_like(w_np, dtype=np.int8)
             for oc in range(OC):
                 w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)
@@ -1732,7 +1744,7 @@ class _ExportWalker:
         if self.per_channel:
             w_np = w.detach().cpu().numpy()
             per_oc_max = np.abs(w_np).reshape(OF, -1).max(axis=1)
-            w_scales_per_oc = np.maximum(per_oc_max, 1e-8) / 127.0
+            w_scales_per_oc = _bias_safe_scales(np.maximum(per_oc_max, 1e-8) / 127.0, b, in_scale)
             w_q = np.empty_like(w_np, dtype=np.int8)
             for oc in range(OF):
                 w_q[oc] = np.round(w_np[oc] / w_scales_per_oc[oc]).clip(-127, 127).astype(np.int8)

@@ -325,8 +325,19 @@ def _emit(networks: list[str], schedule_name: str,
           dynamic_walker: bool = False,
           safety_boundary: float = 1.5,
           idle_harts: list[list[int]] | None = None,
-          pool_networks: dict[str, float] | None = None) -> str:
+          pool_networks: dict[str, float] | None = None,
+          warmup: bool = False,
+          placement: bool = False,
+          stamps: bool = False,
+          own_lines: bool = False) -> str:
     """Render xpurt_main.c source.
+
+    `warmup` / `placement` are hosted-Linux opt-ins (see `_add_warmup` and
+    `_add_placement`); off, the emitted text is unchanged. `stamps` is the
+    same kind of opt-in for two more trace stamps per entry (`_add_stamps`),
+    and `own_lines` gives each worker the list of its own entries
+    (`_add_own_lines`). None of the four combines with `dynamic_walker` or
+    `pool_networks`.
 
     `networks`     is the ordered list of distinct network names the
                    schedule references.
@@ -389,6 +400,9 @@ def _emit(networks: list[str], schedule_name: str,
     unknown = sorted(set(pool_networks or {}) - set(networks))
     if unknown:
         raise ValueError(f"pool_networks not in this schedule: {unknown}")
+    if (dynamic_walker or pool_networks) and (warmup or placement or stamps or own_lines):
+        raise ValueError("warmup / placement / stamps / own_lines are not "
+                         "combined with dynamic_walker / pool_networks")
 
     # State structs are emitted per (network, kind) so each worker's
     # `s.pool` is fixed at main() time. Without this, two workers that
@@ -906,7 +920,7 @@ static void xpurt_unlock_entry(const xpurt_sched_entry_t *e)
         hart_lock_decl = "#define XPURT_LOCK_ENTRY(e)   ((void)0)\n#define XPURT_UNLOCK_ENTRY(e) ((void)0)\n"
         composite_setup = ""
 
-    return f"""{HEADER}
+    src = f"""{HEADER}
 /*
  * Schedule-driven multi-network entry point with per-core-kind worker
  * threads and HETEROGENEOUS per-backend dispatch tables. Each worker:
@@ -1339,6 +1353,239 @@ int main(void)
     return 0;
 }}
 """
+    if warmup:
+        src = _add_warmup(src, upper, loop_bound)
+    if placement:
+        src = _add_placement(src, upper)
+    if stamps:
+        src = _add_stamps(src)
+    if own_lines:
+        src = _add_own_lines(src)
+    return src
+
+
+def _sub1(src: str, old: str, new: str, count: int = 1) -> str:
+    """Replace `old` exactly `count` times (0 = at least once), or fail."""
+    n = src.count(old)
+    if (count and n != count) or n == 0:
+        raise AssertionError(f"walker template changed: {old[:60]!r} found {n}x")
+    return src.replace(old, new)
+
+
+def _add_warmup(src: str, upper: str, loop_bound: str) -> str:
+    """One untimed pass of the whole schedule before the timed one.
+
+    Without it each network's first instance runs cold inside the timed
+    window: first-touch page faults on its buffers, empty caches, and kernels
+    that build per-weight state on first use (the K3 A100 conv packs and
+    caches its weights on the first call). Sam Bai's `--warmup` idea, ported
+    for the hosted-Linux walker (harness_xpurt/LINUX.md listed it as missing).
+
+    Pass 0 runs every entry in schedule order with dependencies honoured but
+    without the start-time gate. Then every worker meets at a barrier; one of
+    them drains the completion semaphores, resets `run_t0` and opens the gate,
+    and pass 1 runs exactly as the walker without warm-up does. The trace,
+    wall-cycle and profile records are overwritten by pass 1, so every
+    reported number is from the timed pass; pass 0 sends no stream events.
+
+    The template's own warm start (instance 0 only, MB_XPURT_WARM, on by
+    default on hosted Linux) still runs first; MB_XPURT_WARM=0 leaves only
+    this pass. Not for the dynamic walker (its claim flags are not reset).
+    """
+    src = _sub1(src, "static uint64_t run_t0;\n", f"""static uint64_t run_t0;
+
+/* Warm-up (generate_xpurt_main --warmup): pass 0 is untimed, see
+ * _add_warmup in the generator. */
+static pthread_barrier_t xpurt_warm_bar;
+static volatile int xpurt_timed;   /* 0 during the warm-up pass */
+static void xpurt_warmup_sync(void)
+{{
+    if (pthread_barrier_wait(&xpurt_warm_bar) == PTHREAD_BARRIER_SERIAL_THREAD) {{
+        for (int i = 0; i < {upper}_N_ENTRIES; i++)
+            while (k_sem_take(&completion_sems[i], K_NO_WAIT) == 0) {{ }}
+        run_t0 = (uint64_t)k_cycle_get_64();
+        xpurt_timed = 1;
+    }}
+    pthread_barrier_wait(&xpurt_warm_bar);
+}}
+""")
+    src = _sub1(src, "    xpurt_walk(wa, 0);\n    return NULL;\n}\n\nint main(void)",
+                "    for (int pass_ = 0; pass_ < 2; pass_++) {   /* --warmup: pass 0 untimed */\n"
+                "        if (pass_ == 1) xpurt_warmup_sync();\n"
+                "        xpurt_walk(wa, 0);\n"
+                "    }\n    return NULL;\n}\n\nint main(void)")
+    src = _sub1(src, "XPURT_GATE_WAIT(target_start);",
+                "if (xpurt_timed) XPURT_GATE_WAIT(target_start);", 0)
+    src = _sub1(src, "XPURT_STREAM_EVENT(e_, wa->hart,",
+                "if (xpurt_timed) XPURT_STREAM_EVENT(e_, wa->hart,", 0)
+    src = _sub1(src, "    run_t0 = (uint64_t)k_cycle_get_64();\n\n    for (int k = 0;",
+                f"    if (pthread_barrier_init(&xpurt_warm_bar, NULL, (unsigned)({loop_bound})) != 0) {{\n"
+                f"        printf(\"FATAL: warm-up barrier init failed\\n\");\n"
+                f"        XPURT_FATAL_EXIT();\n"
+                f"        return -1;\n"
+                f"    }}\n"
+                f"    printf(\"xpurt: warm-up pass on (pass 0 untimed)\\n\");\n"
+                f"    run_t0 = (uint64_t)k_cycle_get_64();\n\n    for (int k = 0;")
+    return src
+
+
+def _add_placement(src: str, upper: str) -> str:
+    """Record the cpu each entry's kernel started and ended on.
+
+    The after-the-fact evidence that a dispatch ran where the schedule put it
+    (XPU-RT scripts/check_k3_placement.py): on the K3 a thread that was never
+    registered as an A100 thread stays on an X100 and its timings would be
+    filed as A100 timings. -1 = the entry ran no kernel (view/chunk ops).
+    Hosted Linux only (sched_getcpu); -1 everywhere elsewhere.
+    """
+    src = _sub1(src, "struct xpurt_worker_arg {{".replace("{{", "{"), f"""/* Placement evidence (generate_xpurt_main --placement). */
+struct xpurt_place_slot {{ int cpu_before; int cpu_after; }};
+static struct xpurt_place_slot xpurt_place[{upper}_N_ENTRIES];
+#if MB_PLACEMENT_LINUX
+#define XPURT_CPU() sched_getcpu()
+#else
+#define XPURT_CPU() (-1)
+#endif
+
+struct xpurt_worker_arg {{""")
+    src = _sub1(src, "            XPURT_LOCK_ENTRY(e_);\n",
+                "            XPURT_LOCK_ENTRY(e_);\n"
+                "            xpurt_place[i_].cpu_before = XPURT_CPU();\n", 0)
+    src = _sub1(src, "            XPURT_UNLOCK_ENTRY(e_);\n",
+                "            xpurt_place[i_].cpu_after = XPURT_CPU();\n"
+                "            XPURT_UNLOCK_ENTRY(e_);\n", 0)
+    src = _sub1(src, "    run_t0 = (uint64_t)k_cycle_get_64();\n\n    for (int k = 0;",
+                f"    for (int i = 0; i < {upper}_N_ENTRIES; i++)\n"
+                f"        xpurt_place[i].cpu_before = xpurt_place[i].cpu_after = -1;\n"
+                f"    run_t0 = (uint64_t)k_cycle_get_64();\n\n    for (int k = 0;")
+    block = f"""    printf("=== MODELBLASTER_XPURT_PLACEMENT_BEGIN ===\\n");
+    printf("entry_id,network,instance,dispatch_id,core_kind,impl,hart,n_harts,"
+           "harts,cpu_before,cpu_after\\n");
+    for (int i = 0; i < {upper}_N_ENTRIES; i++) {{
+        const xpurt_sched_entry_t *e = &{upper}_TABLE[i];
+        printf("%d,%s,%d,%d,%s,%s,%d,%d,", e->entry_id, e->network, e->instance,
+               e->dispatch_id, e->core_kind, e->impl, e->hart, e->n_harts);
+        if (e->n_harts > 1 && e->harts != NULL)
+            for (int h = 0; h < e->n_harts; h++)
+                printf("%s%d", h ? " " : "", e->harts[h]);
+        else
+            printf("%d", e->hart);
+        printf(",%d,%d\\n", xpurt_place[i].cpu_before, xpurt_place[i].cpu_after);
+    }}
+    printf("=== MODELBLASTER_XPURT_PLACEMENT_END ===\\n");
+"""
+    src = _sub1(src, "#ifdef MODELBLASTER_XPURT_TRACE\n    /* Trace dump",
+                block + "#ifdef MODELBLASTER_XPURT_TRACE\n    /* Trace dump")
+    return src
+
+
+def _add_stamps(src: str) -> str:
+    """Two more trace stamps per entry: `got_cores` and `kernel_end`.
+
+    The trace's start stamp is taken before the entry locks its harts and its
+    end stamp after it unlocks them, so a wait for a hart that another entry
+    still holds (a multi-core dispatch) sits inside start -> end and reads as
+    the kernel running slowly. With the two extra stamps one entry splits into
+
+        start -> got_cores      waiting for its harts (0 unless one is held)
+        got_cores -> kernel_end the dispatch function itself
+        kernel_end -> end       unlocking (and the placement read, if on)
+
+    `got_cores` is taken right after XPURT_LOCK_ENTRY and `kernel_end` right
+    after the dispatch function returns: both inside the placement reads when
+    --placement is on, hence applied after `_add_placement`. Each stamp goes
+    into the entry's own trace slot (no shared state), and the two are printed
+    as the LAST two trace columns so existing readers of the trace keep
+    working. Needs MODELBLASTER_XPURT_TRACE, like the trace itself.
+    """
+    src = _sub1(src, "    uint64_t end_cycles;\n",
+                "    uint64_t end_cycles;\n"
+                "    uint64_t got_cores_cycles;    /* --stamps: all harts locked */\n"
+                "    uint64_t kernel_end_cycles;   /* --stamps: dispatch fn returned */\n")
+    src = _sub1(src, "            XPURT_LOCK_ENTRY(e_);\n",
+                "            XPURT_LOCK_ENTRY(e_);\n"
+                "#ifdef MODELBLASTER_XPURT_TRACE\n"
+                "            xpurt_trace[i_].got_cores_cycles =\n"
+                "                (uint64_t)k_cycle_get_64() - run_t0;\n"
+                "#endif\n", 0)
+    after_kernel = "            xpurt_place[i_].cpu_after = XPURT_CPU();\n"
+    if after_kernel not in src:
+        after_kernel = "            XPURT_UNLOCK_ENTRY(e_);\n"
+    src = _sub1(src, after_kernel,
+                "#ifdef MODELBLASTER_XPURT_TRACE\n"
+                "            xpurt_trace[i_].kernel_end_cycles =\n"
+                "                (uint64_t)k_cycle_get_64() - run_t0;\n"
+                "#endif\n" + after_kernel, 0)
+    src = _sub1(src, '"actual_start_cycles,actual_end_cycles\\n");',
+                '"actual_start_cycles,actual_end_cycles,"\n'
+                '           "got_cores_cycles,kernel_end_cycles\\n");')
+    src = _sub1(src, '%.6f,%.6f,%d,%llu,%llu\\n",', '%.6f,%.6f,%d,%llu,%llu,%llu,%llu\\n",')
+    src = _sub1(src, "(unsigned long long)xpurt_trace[i].end_cycles);",
+                "(unsigned long long)xpurt_trace[i].end_cycles,\n"
+                "               (unsigned long long)xpurt_trace[i].got_cores_cycles,\n"
+                "               (unsigned long long)xpurt_trace[i].kernel_end_cycles);")
+    return src
+
+
+_WORKER_LOOP = re.compile(
+    r"    for \(int i_ = 0; i_ < (?P<n>\w+_N_ENTRIES); i_\+\+\) \{\n"
+    r"        const xpurt_sched_entry_t \*e_ = &(?P<t>\w+_TABLE)\[i_\];\n"
+    r"        if \((?P<match>strcmp\(e_->core_kind, my_kind\) != 0[^\n]*)\) continue;\n")
+
+
+def _add_own_lines(src: str) -> str:
+    """Each worker walks only its own entries instead of the whole table.
+
+    Without it every worker reads every line of the dispatch table and skips
+    the ones it does not lead. Skipping never sleeps or yields, so on hosted
+    Linux with every walker and pool thread at the same SCHED_FIFO priority,
+    a worker that is reading thousands of lines before its first entry, after
+    its last one or across a long gap keeps its core, and a pool helper woken
+    on that core for another worker's multi-core entry cannot run until the
+    reading ends (0.3-0.9 ms on the K3 for ~25,000 lines).
+
+    With it each worker collects the indices of its own entries once, before
+    its first pass (before the warm start and the --warmup pass), keeps them in
+    its xpurt_worker_arg, and every pass of xpurt_walk visits only those, in
+    the same order; after its last entry it returns at once. Entries, order,
+    dependency waits, hart locks and outputs are unchanged. Hosted Linux
+    (malloc for the index list). Not for the dynamic walker, which has its
+    own walk.
+    """
+    m = _WORKER_LOOP.search(src)
+    if m is None or len(_WORKER_LOOP.findall(src)) != 1:
+        raise AssertionError("walker template changed: worker entry loop not found once")
+    n, table, match = m.group("n"), m.group("t"), m.group("match")
+    collect = (
+        "    /* --own-lines: this worker's own entries, collected once before it\n"
+        "     * runs any of them (generate_xpurt_main --own-lines). */\n"
+        f"    wa->own = (int *)malloc(sizeof(int) * {n});\n"
+        "    wa->own_n = 0;\n"
+        "    if (wa->own == NULL) {\n"
+        "        printf(\"FATAL: worker kind=%s: no memory for its entry list\\n\", my_kind);\n"
+        "        XPURT_FATAL_EXIT();\n"
+        "        return NULL;\n"
+        "    }\n"
+        f"    for (int i_ = 0; i_ < {n}; i_++) {{\n"
+        f"        const xpurt_sched_entry_t *e_ = &{table}[i_];\n"
+        f"        if ({match}) continue;\n"
+        "        wa->own[wa->own_n++] = i_;\n"
+        "    }\n")
+    first = "    if (g_xpurt_warm) {\n        xpurt_walk(wa, 1);\n"
+    src = _sub1(src, "    int kind_idx;\n};\n",
+                "    int kind_idx;\n"
+                "    int *own;    /* --own-lines: this worker's entries, in table order */\n"
+                "    int own_n;\n};\n")
+    # the walk first (it is the only such loop), then the collection before the
+    # first pass: the collection starts with the same three lines as the walk
+    src = _sub1(src, m.group(0),
+                "    for (int j_ = 0; j_ < wa->own_n; j_++) {\n"
+                "        const int i_ = wa->own[j_];\n"
+                f"        const xpurt_sched_entry_t *e_ = &{table}[i_];\n")
+    src = _sub1(src, first, collect + first)
+    src = _sub1(src, "    return NULL;\n}\n\nint main(void)",
+                "    free(wa->own);\n    return NULL;\n}\n\nint main(void)")
+    return src
 
 
 def main() -> None:
@@ -1410,6 +1657,20 @@ def main() -> None:
                          "this many times the task's planned duration ends "
                          "before the idle core's own next task is due "
                          "(default 1.5). Meant to be raised by feedback.")
+    ap.add_argument("--warmup", action="store_true",
+                    help="hosted Linux: run the whole schedule once, untimed, "
+                         "before the timed pass (see _add_warmup)")
+    ap.add_argument("--placement", action="store_true",
+                    help="record the cpu each entry's kernel ran on and print "
+                         "a MODELBLASTER_XPURT_PLACEMENT block (see "
+                         "_add_placement)")
+    ap.add_argument("--stamps", action="store_true",
+                    help="two more trace stamps per entry, as the last two "
+                         "trace columns: got_cores (all its harts locked) and "
+                         "kernel_end (dispatch returned); see _add_stamps")
+    ap.add_argument("--own-lines", action="store_true",
+                    help="each worker visits only its own entries instead of "
+                         "reading the whole table; see _add_own_lines")
     args = ap.parse_args()
 
     with open(args.schedule) as f:
@@ -1490,6 +1751,10 @@ def main() -> None:
         raise SystemExit("--dynamic-walker / --pool-networks need --worker-granularity hart")
     if args.safety_boundary < 1.0:
         raise SystemExit("--safety-boundary must be >= 1.0")
+    if (args.dynamic_walker or pool_networks) and (
+            args.warmup or args.placement or args.stamps or args.own_lines):
+        raise SystemExit("--warmup / --placement / --stamps / --own-lines do not "
+                         "combine with --dynamic-walker / --pool-networks")
     src = _emit(networks, args.name, args.dispatch_table_header,
                 core_kinds, backends, pool_sizes, n_instances,
                 per_hart_workers=per_hart, pool_harts=pool_harts,
@@ -1497,7 +1762,9 @@ def main() -> None:
                 dynamic_walker=args.dynamic_walker,
                 safety_boundary=args.safety_boundary,
                 idle_harts=[sorted(harts_per_kind.get(k, set())) for k in core_kinds],
-                pool_networks=pool_networks or None)
+                pool_networks=pool_networks or None,
+                warmup=args.warmup, placement=args.placement,
+                stamps=args.stamps, own_lines=args.own_lines)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(src)

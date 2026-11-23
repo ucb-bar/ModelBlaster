@@ -227,6 +227,35 @@ rewritten one, instead of extracting it.
   matrix engines share an encoding with different tiles, so a kernel on the
   wrong one can return wrong numbers instead of trapping.
 
+## Warm-up, placement record, repeated runs (hosted Linux, opt-in)
+
+The runners take four knobs; each is off by default and leaves the emitted
+walker unchanged when off.
+The generator refuses `--warmup`, `--placement`, `--stamps` and `--own-lines`
+together with `--dynamic-walker` or `--pool-networks`.
+
+- `MB_XPURT_WARMUP=1` (`generate_xpurt_main --warmup`): every worker runs all
+  its entries once, untimed and without the start-time gate, then all workers
+  meet at a barrier, the completion semaphores are drained, `run_t0` is reset and
+  the timed pass runs as before. Trace, wall-cycle and profile records come
+  from the timed pass. (Sam Bai's `--warmup` idea.) It runs after the warm
+  start above, which covers instance 0 only; `MB_XPURT_WARM=0` leaves just this
+  pass.
+- `MB_XPURT_PLACEMENT=1` (`--placement`): each entry records `sched_getcpu()`
+  before and after its kernel; the block is saved as `<sched>_placement.csv`
+  (`entry_id,network,instance,dispatch_id,core_kind,impl,hart,n_harts,harts,
+  cpu_before,cpu_after`). XPU-RT's `scripts/check_k3_placement.py` checks it.
+- `MB_XPURT_REPEATS=N`: run the deployed binary N times; with N > 1 each run's
+  stdout, trace and placement files get an `_r<k>` suffix.
+- `MB_XPURT_STAMPS=1` (`--stamps`): two more stamps per entry, printed as the
+  last two trace columns. `got_cores_cycles` is taken right after the entry has
+  locked all its harts, `kernel_end_cycles` right after its dispatch function
+  returns. The trace's start stamp is taken before the hart locks and its end
+  stamp after the unlock, so without these a wait for a hart that a multi-core
+  entry still holds reads as the kernel running slowly. With them:
+  start to got_cores = waiting for harts, got_cores to kernel_end = the
+  dispatch itself, kernel_end to end = unlocking.
+
 ## Errors stop the run
 
 A dispatch whose implementation has no backend in the build prints
