@@ -53,6 +53,7 @@
 struct modelblaster_pool_state {
 	int n_workers;          /* total thread count (master + helpers) */
 	int quit;               /* set on destroy; workers re-read after wake */
+	int is_gang;            /* 1: no threads; helpers are gang_serve() callers */
 
 	/* Job descriptor — published by master under no lock; helpers only
 	 * read it after their start sem fires (sem-give is the
@@ -138,6 +139,149 @@ static void *modelblaster_pool_worker_fn(void *arg_)
 
 		k_sem_give(&p->done[wid]);
 	}
+}
+
+/* ---- static gangs: see modelblaster_pool.h ---------------------------------
+ * Shared state is one cache-line-aligned block per gang: the job descriptor
+ * (written by the master only), one event word (sequence number + waiter
+ * flag: an eventcount; a futex on Linux, spun on under Zephyr -- see
+ * xs_os.h), and one done sequence per helper (each written by its helper
+ * only). Portable since 2026-11-26 (xs_os.h). */
+#include <stdatomic.h>
+#include "xs_os.h"
+
+#ifndef MB_GANG_SPIN_ITERS
+#define MB_GANG_SPIN_ITERS 20000      /* about 100 us before a waiter sleeps */
+#endif
+
+struct mb_gang {
+	_Alignas(64) _Atomic unsigned long long open_tok;
+	_Atomic unsigned long long closed_tok;
+	_Atomic unsigned long long job_tok;
+	_Atomic uint32_t job_seq;
+	_Alignas(64) _Atomic uint32_t evt;       /* futex word */
+	_Atomic uint32_t waiters;
+	struct { _Alignas(64) _Atomic uint32_t done_seq; uint32_t served; }
+		h[MODELBLASTER_POOL_MAX_WORKERS];
+};
+
+static inline struct mb_gang *mb_gang_of(struct modelblaster_pool_state *p)
+{
+	return (struct mb_gang *)(void *)(p + 1);
+}
+
+static inline void mb_gang_signal(struct mb_gang *g)
+{
+	atomic_fetch_add(&g->evt, 1);
+	if (atomic_load(&g->waiters) != 0)
+		xs_os_evt_wake(&g->evt, 1);
+}
+
+/* Wait until cond(g) holds: spin `spin` iterations, then sleep on the event
+ * word. The waiter count is raised BEFORE the last check and the signaller
+ * bumps the word BEFORE reading the count, so a change is never missed. */
+#define MB_GANG_WAIT(g, cond, spin)                                            \
+	do {                                                                   \
+		long sp_ = (spin);                                             \
+		while (!(cond)) {                                              \
+			if (sp_-- > 0) continue;                               \
+			uint32_t s_ = atomic_load(&(g)->evt);                  \
+			atomic_fetch_add(&(g)->waiters, 1);                    \
+			if (!(cond))                                           \
+				(void)xs_os_evt_wait(&(g)->evt, s_, 0);        \
+			atomic_fetch_sub(&(g)->waiters, 1);                    \
+		}                                                              \
+	} while (0)
+
+modelblaster_pool_t modelblaster_pool_create_gang(int n_workers)
+{
+	if (n_workers <= 1 || n_workers > MODELBLASTER_POOL_MAX_WORKERS)
+		return NULL;
+	size_t sz = sizeof(struct modelblaster_pool_state) + sizeof(struct mb_gang) + 64;
+	struct modelblaster_pool_state *p = NULL;
+	p = aligned_alloc(64, (sz + 63) & ~(size_t)63);
+	if (p == NULL)
+		return NULL;
+	memset(p, 0, sz);
+	p->n_workers = n_workers;
+	p->is_gang = 1;
+	return p;
+}
+
+void modelblaster_pool_gang_open(modelblaster_pool_t p, unsigned long long token)
+{
+	struct mb_gang *g = mb_gang_of(p);
+	atomic_store(&g->open_tok, token);
+	mb_gang_signal(g);
+}
+
+void modelblaster_pool_gang_close(modelblaster_pool_t p, unsigned long long token)
+{
+	struct mb_gang *g = mb_gang_of(p);
+	atomic_store(&g->closed_tok, token);
+	mb_gang_signal(g);
+}
+
+static void mb_gang_run_slice(struct modelblaster_pool_state *p, int wid)
+{
+	if (wid >= p->n_active_slices)
+		return;
+	size_t per = p->range / (size_t)p->n_active_slices;
+	size_t rem = p->range % (size_t)p->n_active_slices;
+	size_t s = (size_t)wid * per + (size_t)(wid < (int)rem ? wid : (int)rem);
+	size_t e = s + per + (wid < (int)rem ? 1 : 0);
+	for (size_t i = s; i < e; i++)
+		p->fn(p->ctx, i);
+}
+
+void modelblaster_pool_gang_serve(modelblaster_pool_t p, int wid,
+				  unsigned long long token, int spin_first)
+{
+	struct mb_gang *g = mb_gang_of(p);
+	/* the master has not reached this entry yet: wait for it */
+	MB_GANG_WAIT(g, atomic_load(&g->open_tok) >= token ||
+			atomic_load(&g->closed_tok) >= token,
+		     spin_first ? MB_GANG_SPIN_ITERS : 0);
+	for (;;) {
+		uint32_t j = atomic_load(&g->job_seq);
+		if (j != g->h[wid].served && atomic_load(&g->job_tok) == token) {
+			mb_gang_run_slice(p, wid);
+			g->h[wid].served = j;
+			atomic_store(&g->h[wid].done_seq, j);
+			mb_gang_signal(g);
+			continue;
+		}
+		if (atomic_load(&g->closed_tok) >= token)
+			return;
+		MB_GANG_WAIT(g, (atomic_load(&g->job_seq) != g->h[wid].served &&
+				 atomic_load(&g->job_tok) == token) ||
+				atomic_load(&g->closed_tok) >= token,
+			     MB_GANG_SPIN_ITERS);
+	}
+}
+
+static void mb_gang_parallelize(struct modelblaster_pool_state *p,
+				void (*fn)(void *, size_t), void *ctx, size_t range)
+{
+	struct mb_gang *g = mb_gang_of(p);
+	int n_slices = (range < (size_t)p->n_workers) ? (int)range : p->n_workers;
+	if (n_slices <= 1) {
+		for (size_t i = 0; i < range; i++)
+			fn(ctx, i);
+		return;
+	}
+	p->fn = fn;
+	p->ctx = ctx;
+	p->range = range;
+	p->n_active_slices = n_slices;
+	atomic_store(&g->job_tok, atomic_load(&g->open_tok));
+	uint32_t j = atomic_fetch_add(&g->job_seq, 1) + 1;
+	mb_gang_signal(g);
+	mb_gang_run_slice(p, 0);
+	/* Every helper acknowledges every job (also one it has no slice of),
+	 * so the next job never overwrites a descriptor still being read. */
+	for (int w = 1; w < p->n_workers; w++)
+		MB_GANG_WAIT(g, atomic_load(&g->h[w].done_seq) == j, MB_GANG_SPIN_ITERS);
 }
 
 modelblaster_pool_t modelblaster_pool_create(int n_workers)
@@ -254,6 +398,10 @@ void modelblaster_pool_destroy(modelblaster_pool_t pool)
 	if (pool == NULL) {
 		return;
 	}
+	if (pool->is_gang) {
+		free(pool);
+		return;
+	}
 	pool->quit = 1;
 	for (int w = 1; w < pool->n_workers; w++) {
 		k_sem_give(&pool->start[w]);
@@ -281,6 +429,10 @@ void modelblaster_pool_parallelize_1d(modelblaster_pool_t pool,
 {
 	(void)flags;
 	if (range == 0) {
+		return;
+	}
+	if (pool != NULL && pool->is_gang) {
+		mb_gang_parallelize(pool, fn, ctx, range);
 		return;
 	}
 	if (pool == NULL || pool->n_workers <= 1) {

@@ -107,6 +107,11 @@ def deploy_and_run(host: str, elf: str, remote_root: str, *,
     # launch_cpus (K3: "0-7"): the process STARTS on those CPUs. taskset sits
     # after the env assignments so MODELBLASTER_CPU still reaches the binary.
     launcher = f"taskset -c {shlex.quote(launch_cpus)} " if launch_cpus else ""
+    # xpurt_fix local change: MODELBLASTER_REMOTE_WRAP is a board-side wrapper
+    # (shared-board lock + idle gate + env log) put in front of the launcher.
+    _wrap = os.environ.get("MODELBLASTER_REMOTE_WRAP", "")
+    if _wrap:
+        launcher = f"{_wrap} {launcher}"
     cmd = (f"chmod +x {shlex.quote(remote_bin)} && "
            f"{prefix}{launcher}{shlex.quote(remote_bin)}")
     # A retry here would re-RUN the harness, so only the setup steps above

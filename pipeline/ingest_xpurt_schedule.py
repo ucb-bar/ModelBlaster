@@ -416,9 +416,14 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
 
     harts_arrays: list[str] = []
     for e in entries:
-        if len(e.harts) > 1:
+        # xpurt_fix local change: every entry gets its harts array (master
+        # first), as on the k3-walker-fixes base, because the static-program
+        # walker reads harts[] for single-hart entries too. Main's walker only
+        # reads it when n_harts > 1, so this does not change its behaviour.
+        _hs = tuple(e.harts) if len(e.harts) >= 1 else ((e.hart,) if e.hart >= 0 else ())
+        if _hs:
             harts_arrays.append(
-                f"static const int sched_{e.entry_id}_harts[] = {{ {', '.join(str(h) for h in e.harts)} }};")
+                f"static const int sched_{e.entry_id}_harts[] = {{ {', '.join(str(h) for h in _hs)} }};")
     # Instances per network, for sizing per-instance buffer sets.
     n_inst: dict[str, int] = {}
     for e in entries:
@@ -427,11 +432,27 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
         f"#define XPURT_N_INSTANCES_{re.sub(r'[^A-Za-z0-9]', '_', n).upper()} {k}"
         for n, k in sorted(n_inst.items()))
 
+    # xpurt_fix local change: producer-side fanout (consumers of each entry, data
+    # deps + time dep, deduplicated), for the static-program walker of
+    # generate_xpurt_main_static.py. Main's own walker does not read it.
+    fanout: list[list[int]] = [[] for _ in entries]
+    for c in entries:
+        for d in c.deps_entry_ids:
+            if 0 <= d < len(fanout):
+                fanout[d].append(c.entry_id)
+        if 0 <= c.time_dep_entry_id < len(fanout):
+            fanout[c.time_dep_entry_id].append(c.entry_id)
+    fan_arrays: list[str] = []
+    for e in entries:
+        fo = sorted(set(fanout[e.entry_id]))
+        if fo:
+            fan_arrays.append(f"static const int sched_{e.entry_id}_fanout[] = {{ {', '.join(str(x) for x in fo)} }};")
     rows: list[str] = []
     for e in entries:
         n_deps = len(e.deps_entry_ids)
+        _fo = sorted(set(fanout[e.entry_id]))
         n_harts = len(e.harts) if len(e.harts) > 1 else 1
-        harts_ref = f"sched_{e.entry_id}_harts" if len(e.harts) > 1 else "NULL"
+        harts_ref = (f"sched_{e.entry_id}_harts" if (len(e.harts) >= 1 or e.hart >= 0) else "NULL")
         deps_ref = (f"sched_{e.entry_id}_deps" if n_deps else "NULL")
         rows.append(
             f'    {{ .entry_id = {e.entry_id}, '
@@ -446,7 +467,8 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
             f'.duration_ms = {e.duration_ms!r}f, '
             f'.n_deps = {n_deps}, .deps = {deps_ref}, '
             f'.time_dep_entry_id = {e.time_dep_entry_id}, '
-            f'.n_harts = {n_harts}, .harts = {harts_ref} }},'
+            f'.n_harts = {n_harts}, .harts = {harts_ref}, '
+            f'.n_fanout = {len(_fo)}, .fanout = {("sched_%d_fanout" % e.entry_id) if _fo else "NULL"} }},'
         )
 
     h = f"""{HEADER}
@@ -482,6 +504,8 @@ typedef struct {{
     int            time_dep_entry_id; /* cross-job ordering edge, -1 if none */
     int            n_harts;        /* harts this dispatch runs on (1 unless composite) */
     const int     *harts;          /* the n_harts harts, `hart` first; NULL if n_harts == 1 */
+    int            n_fanout;       /* xpurt_fix: consumers of this entry (static walker) */
+    const int     *fanout;
 }} xpurt_sched_entry_t;
 
 #define {upper}_N_ENTRIES   {len(entries)}
@@ -502,6 +526,7 @@ extern const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES];
 
 {chr(10).join(deps_arrays) if deps_arrays else "/* (no entries with deps) */"}
 {chr(10).join(harts_arrays)}
+{chr(10).join(fan_arrays)}
 
 const xpurt_sched_entry_t {upper}_TABLE[{upper}_N_ENTRIES] = {{
 {chr(10).join(rows)}
@@ -537,6 +562,19 @@ def _main() -> None:
     ap.add_argument("--name", default=None,
                     help="schedule name (used for #define prefix); "
                          "defaults to the basename of --out without extension")
+    ap.add_argument("--static-program-json", default=None,
+                    help="also write the per-worker static program "
+                         "(pipeline/xpurt_static_program.py) for "
+                         "generate_xpurt_main --walker static")
+    ap.add_argument("--static-cyclic", action="store_true",
+                    help="static program: the table is replayed every "
+                         "hyperperiod (adds last-instance -> first-instance "
+                         "edges across epochs)")
+    ap.add_argument("--static-no-gang", action="store_true",
+                    help="static program: keep composite entries on the "
+                         "thread pool + hart locks instead of static gangs")
+    ap.add_argument("--static-alt-window", type=int, default=8)
+    ap.add_argument("--static-spin-ms", type=float, default=0.05)
     args = ap.parse_args()
 
     irs: dict[str, dict] = {}
@@ -553,6 +591,16 @@ def _main() -> None:
 
     schedule_name = args.name or os.path.splitext(os.path.basename(args.out))[0]
     emit_table(entries, args.out, schedule_name)
+    if args.static_program_json:
+        from modelblaster.pipeline import xpurt_static_program as _sp
+        prog = _sp.build(entries, gang=not args.static_no_gang,
+                         cyclic=args.static_cyclic,
+                         alt_window=args.static_alt_window,
+                         spin_ms=args.static_spin_ms)
+        with open(args.static_program_json, "w") as f:
+            json.dump(prog, f)
+        print(_sp.format_stats(prog))
+        print(f"wrote {args.static_program_json}")
     print(f"ingested {len(entries)} entries from {args.schedule}")
     print(f"wrote {args.out}")
     print(f"wrote {args.out[:-2]}.h" if args.out.endswith(".c") else args.out + ".h")
