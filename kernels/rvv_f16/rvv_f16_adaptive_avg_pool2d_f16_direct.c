@@ -43,7 +43,7 @@ void kernel_adaptive_avg_pool2d_f16(const _Float16 *input, _Float16 *output,
                             vfloat32m1_t z =
                                 __riscv_vfmv_v_f_f32m1(0.0f, 1);
                             vfloat32m1_t r =
-                                __riscv_vfwredusum_vs_f16m4_f32m1(v, z, vl);
+                                __riscv_vfwredosum_vs_f16m4_f32m1(v, z, vl);
                             sum += __riscv_vfmv_f_s_f32m1_f32(r);
                         }
                     }

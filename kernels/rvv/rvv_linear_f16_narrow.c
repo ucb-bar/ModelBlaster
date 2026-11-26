@@ -53,7 +53,7 @@ static inline _Float16 mb_linear_f16_one(const _Float16 *in_row, const _Float16 
         vacc = __riscv_vfmacc_vv_f16m4(vacc, va, vb, vl);
     }
     vfloat16m1_t vs = __riscv_vfmv_s_f_f16m1((_Float16)0.0f, 1);
-    vs = __riscv_vfredusum_vs_f16m4_f16m1(vacc, vs, vlmax);
+    vs = __riscv_vfredosum_vs_f16m4_f16m1(vacc, vs, vlmax);
     return __riscv_vfmv_f_s_f16m1_f16(vs);
 }
 
@@ -98,10 +98,10 @@ void kernel_linear_f16(const _Float16 *input, const _Float16 *weight,
             vfloat16m1_t vs1 = __riscv_vfmv_s_f_f16m1((_Float16)0.0f, 1);
             vfloat16m1_t vs2 = __riscv_vfmv_s_f_f16m1((_Float16)0.0f, 1);
             vfloat16m1_t vs3 = __riscv_vfmv_s_f_f16m1((_Float16)0.0f, 1);
-            vs0 = __riscv_vfredusum_vs_f16m4_f16m1(vacc0, vs0, vlmax);
-            vs1 = __riscv_vfredusum_vs_f16m4_f16m1(vacc1, vs1, vlmax);
-            vs2 = __riscv_vfredusum_vs_f16m4_f16m1(vacc2, vs2, vlmax);
-            vs3 = __riscv_vfredusum_vs_f16m4_f16m1(vacc3, vs3, vlmax);
+            vs0 = __riscv_vfredosum_vs_f16m4_f16m1(vacc0, vs0, vlmax);
+            vs1 = __riscv_vfredosum_vs_f16m4_f16m1(vacc1, vs1, vlmax);
+            vs2 = __riscv_vfredosum_vs_f16m4_f16m1(vacc2, vs2, vlmax);
+            vs3 = __riscv_vfredosum_vs_f16m4_f16m1(vacc3, vs3, vlmax);
 
             _Float16 acc0 = __riscv_vfmv_f_s_f16m1_f16(vs0);
             _Float16 acc1 = __riscv_vfmv_f_s_f16m1_f16(vs1);
