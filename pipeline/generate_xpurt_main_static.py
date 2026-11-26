@@ -873,6 +873,23 @@ _Static_assert(XS_N_WORKERS <= 64, "S7a wake mask is 64 bits");
 static uint64_t g_xs_gate_spin_ticks, g_xs_spin_ticks, g_xs_stall_ticks;
 static int g_rt_prio = XS_RT_PRIO_DEFAULT, g_rt_active;
 static uint64_t g_xs_gate_ticks[@N@];
+/* G1 gang-aware run-ahead (2026-11-26): an alternative may run ahead of a
+ * blocked head only if its planned duration ends before the planned start of
+ * the worker's next gang item (slice or master). XPURT_RA_GANG=0: off. */
+static int g_xs_ra_gang = 1;
+static uint64_t g_xs_dur_ticks[@N@];
+static int16_t *g_xs_ng[XS_N_WORKERS];
+static uint64_t g_xs_ra_gang_refused;
+static inline int xs_gang_ok(int xw, int head, const xs_item_t *c, uint64_t cyc_base, uint64_t now)
+{
+    if (!g_xs_ra_gang || !g_xs_ng[xw]) return 1;
+    int ng = g_xs_ng[xw][head];
+    if (ng < 0) return 1;
+    const xs_item_t *g = &XS_WORKERS[xw].items[ng];
+    if (now + g_xs_dur_ticks[c->entry] <= cyc_base + g_xs_gate_ticks[g->entry]) return 1;
+    __atomic_add_fetch(&g_xs_ra_gang_refused, 1, __ATOMIC_RELAXED);
+    return 0;
+}
 
 static long xs_env_long(const char *name, long dflt)
 {
@@ -1109,6 +1126,7 @@ static void xs_event_wait(struct xs_wstate *me, const xs_worker_t *pw, const xs_
         if (done[q_]) continue;
         const xs_item_t *c_ = &pw->items[q_];
         if (g_xs_gate_all && cyc_base + g_xs_gate_ticks[c_->entry] > tnow) continue;
+        if (!xs_gang_ok(self, (int)(it - pw->items), c_, cyc_base, tnow)) continue;
         const xs_dep_t *miss_ = NULL; int own_ = 0;
         for (int d_ = 0; d_ < c_->n_full; d_++) {
             const xs_dep_t *fd_ = &c_->full[d_];
@@ -1252,6 +1270,7 @@ static int xs_init_locks_only(void)
                         if (done_[q_]) continue;
                         const xs_item_t *c_ = &pw_->items[q_];
                         if (g_xs_gate_all && cyc_base_ + g_xs_gate_ticks[c_->entry] > t_iter_) continue;
+                        if (!xs_gang_ok(xw_, head_, c_, cyc_base_, t_iter_)) continue;
                         int ok_ = 1;
                         for (int d_ = 0; d_ < c_->n_full && ok_; d_++) {
                             const xs_dep_t *fd_ = &c_->full[d_];
@@ -1288,6 +1307,7 @@ static int xs_init_locks_only(void)
                     for (int q_ = head_ + 1; q_ < n_ && alt_ < 0; q_++) {
                         const xs_item_t *c_ = &pw_->items[q_];
                         if (done_[q_] || c_->kind != 0 || c_->gated) continue;
+                        if (!xs_gang_ok(xw_, head_, c_, cyc_base_, (uint64_t)k_cycle_get_64())) continue;
                         if (g_xs_gate_all &&
                             cyc_base_ + g_xs_gate_ticks[c_->entry] > (uint64_t)k_cycle_get_64()) continue;
                         int ok_ = 1;
@@ -1394,9 +1414,24 @@ static int xs_init_locks_only(void)
         g_xs_gate_spin_ticks = (uint64_t)xs_env_long("XPURT_GATE_SPIN_US", 50) * tpus_;
         g_xs_spin_ticks = (uint64_t)xs_env_long("XPURT_SPIN_US", 100) * tpus_;
         g_xs_stall_ticks = (uint64_t)xs_env_long("XPURT_STALL_US", 250) * tpus_;
-        for (int i = 0; i < @N@; i++)
+        for (int i = 0; i < @N@; i++) {
             g_xs_gate_ticks[i] = (uint64_t)((double)@T@[i].start_time_ms *
                                             (double)XPURT_TICKS_PER_SEC / 1000.0);
+            g_xs_dur_ticks[i] = (uint64_t)((double)@T@[i].duration_ms *
+                                           (double)XPURT_TICKS_PER_SEC / 1000.0);
+        }
+        g_xs_ra_gang = (int)xs_env_long("XPURT_RA_GANG", 1) != 0;
+        for (int x_ = 0; x_ < XS_N_WORKERS; x_++) {
+            int n_ = XS_WORKERS[x_].n, nx_ = -1;
+            g_xs_ng[x_] = malloc(((size_t)n_ + 1) * sizeof(int16_t));
+            if (!g_xs_ng[x_]) continue;
+            for (int p_ = n_ - 1; p_ >= 0; p_--) {
+                if (XS_WORKERS[x_].items[p_].kind != 0) nx_ = p_;
+                g_xs_ng[x_][p_] = (int16_t)nx_;
+            }
+            g_xs_ng[x_][n_] = -1;
+        }
+        printf("xpurt: static ra_gang=%d\n", g_xs_ra_gang);
         /* Map the program's workers onto the discovered ones; a worker that is
          * only ever a gang helper has no table entry of its own and is added. */
         for (int w = 0; w < XPURT_MAX_WORKERS; w++) g_xs_of_worker[w] = -1;
@@ -1469,6 +1504,7 @@ static int xs_init_locks_only(void)
                    (unsigned long long)s_->wakes_sent, (unsigned long long)s_->stall_scans,
                    (unsigned long long)s_->ev_timeouts);
         }
+        printf("xpurt: static ra_gang_refused=%llu\n", (unsigned long long)g_xs_ra_gang_refused);
 #ifdef MODELBLASTER_XPURT_TRACE
         for (int x = 0; x < XS_N_WORKERS; x++)
             for (int p = 0; p < XS_WORKERS[x].n; p++)

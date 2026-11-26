@@ -411,7 +411,8 @@ class StaticWalker(unittest.TestCase):
                  dict(XPURT_WAKE="all", XPURT_RUNAHEAD_WAIT="poll", XPURT_WAIT="sleep"),
                  dict(XPURT_WAIT="sleep"), dict(XPURT_WAKE="doorbell_sem"), dict(XPURT_WAKE="doorbell_futex"),
                  dict(XPURT_WAKE="doorbell_sem", XPURT_WAIT="sleep"), dict(XPURT_WAKE="doorbell_futex", XPURT_WAIT="sleep"),
-                 dict(XPURT_WAKE="doorbell_futex", XPURT_RUNAHEAD_WAIT="poll", XPURT_WAIT="sleep")]
+                 dict(XPURT_WAKE="doorbell_futex", XPURT_RUNAHEAD_WAIT="poll", XPURT_WAIT="sleep"),
+                 dict(XPURT_RA_GANG="0")]
         for wseed in range(4):
             rng = random.Random(2000 + wseed)
             nets = _random_workload(rng)
